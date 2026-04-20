@@ -1,0 +1,8 @@
+_vanguard_engine_create
+_vanguard_engine_destroy
+_vanguard_engine_add_video_node
+_vanguard_engine_add_bitmap_overlay
+_vanguard_engine_add_audio_node
+_vanguard_engine_set_node_duration
+_vanguard_engine_set_playhead
+_vanguard_engine_get_duration

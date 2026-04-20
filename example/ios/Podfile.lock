@@ -1,0 +1,25 @@
+PODS:
+  - Flutter (1.0.0)
+  - vanguard_media_engine (0.0.1):
+    - Flutter
+  - vanguard_media_engine/Tests (0.0.1):
+    - Flutter
+
+DEPENDENCIES:
+  - Flutter (from `Flutter`)
+  - vanguard_media_engine (from `.symlinks/plugins/vanguard_media_engine/ios`)
+  - vanguard_media_engine/Tests (from `.symlinks/plugins/vanguard_media_engine/ios`)
+
+EXTERNAL SOURCES:
+  Flutter:
+    :path: Flutter
+  vanguard_media_engine:
+    :path: ".symlinks/plugins/vanguard_media_engine/ios"
+
+SPEC CHECKSUMS:
+  Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
+  vanguard_media_engine: c9ce5c186a0ef7225246b4e3a34ff88b104445a6
+
+PODFILE CHECKSUM: c9aa25593c023c6b66ecbc93a82a5c9ff243db51
+
+COCOAPODS: 1.16.2

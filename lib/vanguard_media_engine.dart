@@ -1,0 +1,686 @@
+import 'dart:ffi';
+import 'dart:io';
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
+import 'package:ffi/ffi.dart';
+
+export 'vanguard_texture_view.dart';
+export 'vanguard_media_preparer.dart';
+
+
+const String _libName = 'vanguard_media_engine';
+
+/// The dynamic library in which the symbols for [VanguardMediaEngineBindings] can be found.
+final DynamicLibrary _dylib = () {
+  if (Platform.isIOS) {
+    // On iOS, the C++ code is statically linked into the Runner binary by CocoaPods.
+    // DynamicLibrary.process() searches all symbols already loaded in the process.
+    return DynamicLibrary.process();
+  }
+  if (Platform.isMacOS) {
+    return DynamicLibrary.open('$_libName.framework/$_libName');
+  }
+  if (Platform.isAndroid || Platform.isLinux) {
+    return DynamicLibrary.open('lib$_libName.so');
+  }
+  if (Platform.isWindows) {
+    return DynamicLibrary.open('$_libName.dll');
+  }
+  throw UnsupportedError('Unknown platform: ${Platform.operatingSystem}');
+}();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FFI Typedefs
+// ─────────────────────────────────────────────────────────────────────────────
+
+typedef _c_engine_create = Pointer<Void> Function(Int32 mode);
+typedef _EngineCreate = Pointer<Void> Function(int mode);
+
+typedef _c_engine_destroy = Void Function(Pointer<Void> engine);
+typedef _EngineDestroy = void Function(Pointer<Void> engine);
+
+typedef _c_add_video_node = Void Function(Pointer<Void> engine, Pointer<Utf8> path, Double startTime, Int32 layerId);
+typedef _AddVideoNode = void Function(Pointer<Void> engine, Pointer<Utf8> path, double startTime, int layerId);
+
+typedef _c_add_bitmap_overlay = Void Function(Pointer<Void> engine, Pointer<Utf8> id, Double startTime, Double duration, Int32 layerId);
+typedef _AddBitmapOverlay = void Function(Pointer<Void> engine, Pointer<Utf8> id, double startTime, double duration, int layerId);
+
+typedef _c_add_audio_node = Void Function(Pointer<Void> engine, Pointer<Utf8> path, Double startTime);
+typedef _AddAudioNode = void Function(Pointer<Void> engine, Pointer<Utf8> path, double startTime);
+
+typedef _c_set_node_duration = Void Function(Pointer<Void> engine, Pointer<Utf8> path, Double duration);
+typedef _SetNodeDuration = void Function(Pointer<Void> engine, Pointer<Utf8> path, double duration);
+
+typedef _c_set_playhead = Void Function(Pointer<Void> engine, Double timeSec);
+typedef _SetPlayhead = void Function(Pointer<Void> engine, double timeSec);
+
+typedef _c_get_duration = Double Function(Pointer<Void> engine);
+typedef _GetDuration = double Function(Pointer<Void> engine);
+
+// T10: Error introspection — check after any FFI call on Android to detect silent failures.
+typedef _c_last_error = Int32 Function(Pointer<Void> unused);
+typedef _LastError = int Function(Pointer<Void> unused);
+
+class _VanguardFFI {
+  static final _EngineCreate create = _dylib.lookupFunction<_c_engine_create, _EngineCreate>('vanguard_engine_create');
+  static final _EngineDestroy destroy = _dylib.lookupFunction<_c_engine_destroy, _EngineDestroy>('vanguard_engine_destroy');
+  static final _AddVideoNode addVideoNode = _dylib.lookupFunction<_c_add_video_node, _AddVideoNode>('vanguard_engine_add_video_node');
+  static final _AddBitmapOverlay addBitmapOverlay = _dylib.lookupFunction<_c_add_bitmap_overlay, _AddBitmapOverlay>('vanguard_engine_add_bitmap_overlay');
+  static final _AddAudioNode addAudioNode = _dylib.lookupFunction<_c_add_audio_node, _AddAudioNode>('vanguard_engine_add_audio_node');
+  static final _SetNodeDuration setNodeDuration = _dylib.lookupFunction<_c_set_node_duration, _SetNodeDuration>('vanguard_engine_set_node_duration');
+  static final _SetPlayhead setPlayhead = _dylib.lookupFunction<_c_set_playhead, _SetPlayhead>('vanguard_engine_set_playhead');
+  static final _GetDuration getDuration = _dylib.lookupFunction<_c_get_duration, _GetDuration>('vanguard_engine_get_duration');
+  static final _LastError lastError = _dylib.lookupFunction<_c_last_error, _LastError>('vanguard_engine_last_error');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Public API
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum VanguardMode {
+  nleOffline,
+  livestream,
+}
+
+class VanguardEngine {
+  // G-01: Hot-reload protection.
+  // In debug mode, a static reference to the last-created instance is kept.
+  // When a new VanguardEngine is constructed (which happens on hot-reload because
+  // widget init runs again), the previous instance is disposed before creating
+  // a new one. This prevents C++ engine leaks and orphaned texture IDs.
+  // In release builds kDebugMode = false so this path is compiled out entirely.
+  static VanguardEngine? _devInstance;
+
+  late final Pointer<Void> _enginePtr;
+  final MethodChannel _channel = const MethodChannel('vanguard_media_engine');
+
+  // Guards against double-dispose. Both dispose() and _disposeSync() check
+  // this flag and no-op early if already called. Critical for integration tests
+  // where T2's factory constructor would otherwise call _disposeSync() on a
+  // T1 engine whose await dispose() has already run (use-after-free crash).
+  bool _disposed = false;
+
+  // ── Camera API — static so no C++ engine is allocated for camera use ─────────
+  // Camera operations use the same native method channel as the engine but do
+  // NOT require a Vanguard timeline engine. Using a static channel avoids the
+  // _devInstance hot-reload dispose side-effect and C++ FFI allocation.
+  static const _cameraChannel = MethodChannel('vanguard_media_engine');
+
+  // Tracks textureId → videoPath to allow management of multiple renderers
+  final Map<int, String> _activeRenderers = {};
+
+  /// Optional callbacks from the UI
+  void Function(String path, double duration)? onNodeDurationProbed;
+  void Function(int textureId)? onPlaybackComplete;
+  void Function(double progress)? onExportProgress;
+
+  // G-01: Factory constructor enables hot-reload protection without changing
+  // the public API call site. In release builds this is identical to a plain
+  // constructor (kDebugMode is a compile-time constant = false).
+  factory VanguardEngine({VanguardMode mode = VanguardMode.nleOffline}) {
+    if (kDebugMode && _devInstance != null) {
+      // Hot-reload detected: dispose the previous C++ engine synchronously.
+      // This cannot be truly awaited in a factory, but dispose() can be called
+      // eagerly to release native resources before the next instance is created.
+      // The Dart GC may finalize the old instance later, but native destruction
+      // happens now via the sync portion of dispose().
+      _devInstance!._disposeSync();
+    }
+    final instance = VanguardEngine._internal(mode);
+    if (kDebugMode) _devInstance = instance;
+    return instance;
+  }
+
+  VanguardEngine._internal(VanguardMode mode) {
+    _enginePtr = _VanguardFFI.create(mode.index);
+    // Listen for native → Dart callbacks
+    _channel.setMethodCallHandler(_handleNativeCallback);
+  }
+
+  /// Synchronous native teardown — called during hot-reload when a new instance
+  /// is being created before the old one's async dispose() completes.
+  /// Does NOT await channel calls (fire-and-forget to avoid deadlock in factory).
+  void _disposeSync() {
+    if (_disposed) return; // already fully disposed by await dispose() — skip
+    _disposed = true;
+    for (final id in _activeRenderers.keys) {
+      _channel.invokeMethod('dispose', {'textureId': id}); // fire-and-forget
+    }
+    _activeRenderers.clear();
+    _VanguardFFI.destroy(_enginePtr);
+  }
+
+  /// T10: Reads the last error code from the C++ layer.
+  /// Returns 0 on success, non-zero on error.
+  /// Useful after FFI calls on Android to detect silent OOM or null-arg failures.
+  int get lastNativeError => _VanguardFFI.lastError(_enginePtr);
+
+  Future<dynamic> _handleNativeCallback(MethodCall call) async {
+    switch (call.method) {
+      case 'onNodeDurationProbed':
+        final path     = call.arguments['path']     as String;
+        final duration = call.arguments['duration'] as double;
+        // Update C++ TimelineManager with the real probed duration
+        final pathPtr = path.toNativeUtf8();
+        _VanguardFFI.setNodeDuration(_enginePtr, pathPtr, duration);
+        calloc.free(pathPtr);
+        onNodeDurationProbed?.call(path, duration);
+        break;
+
+      case 'onPlaybackComplete':
+        // Find which textureId completed and notify the UI
+        // (for single-renderer use, just take the first entry)
+        if (_activeRenderers.isNotEmpty) {
+          onPlaybackComplete?.call(_activeRenderers.keys.first);
+        }
+        break;
+
+      case 'onExportProgress':
+        final pct = (call.arguments as num).toDouble();
+        onExportProgress?.call(pct);
+        break;
+    }
+  }
+
+  /// G-02: Returns the current masterClock position in seconds from the native engine.
+  /// Used by the A/V sync integration test to measure audio-vs-wall-clock drift.
+  /// In production this is not called per-frame — only for testing and diagnostics.
+  Future<double> getMasterClockSeconds() async {
+    final seconds = await _channel.invokeMethod<double>('getMasterClock');
+    return seconds ?? 0.0;
+  }
+
+  /// G-02-T3: Native-backed settle for post-seek stabilisation (test-only).
+  ///
+  /// Sleeps [ms] milliseconds on a native background thread and delivers
+  /// result() when done.  More reliable than [Future.delayed] for the
+  /// post-seek settle window because the Dart event loop can enter a degraded
+  /// state after 50+ rapid MethodChannel calls.  The native bg-thread sleep
+  /// has zero Dart event-loop dependency and zero iOS main-RunLoop interaction
+  /// during the wait; result() is delivered at T+ms when the RunLoop is clear.
+  Future<void> settleMs(int ms) async {
+    await _channel.invokeMethod<void>('settleMs', {'ms': ms});
+  }
+
+  /// G-02-T3: Suppress all AVAssetImageGenerator activity (test-only).
+  ///
+  /// Call BEFORE a seek storm (while the iOS main thread is idle) to prevent
+  /// any internal AVFoundation XPC dispatch from blocking the main thread
+  /// during the critical settle / measurement window.  Suppression has zero
+  /// effect on masterClock, audio, or playback frame delivery.
+  Future<void> pauseSeekPreviews() async {
+    await _channel.invokeMethod<void>('pauseSeekPreviews');
+  }
+
+  /// G-02-T3: Restore seek-preview generation after a paused window (test-only).
+  Future<void> resumeSeekPreviews() async {
+    await _channel.invokeMethod<void>('resumeSeekPreviews');
+  }
+
+  /// Creates a native GPU texture for a video file and registers it with Flutter.
+  /// Returns a record with [textureId], [width], and [height] (the actual display
+  /// dimensions of the video after applying preferredTransform).
+  /// Use [textureId] with [VanguardTextureView] and pass [width]/[height] to it
+  /// so the preview container sizes correctly for both portrait and landscape video.
+  Future<({int textureId, int width, int height})> createVideoTexture(String path, {required double startTime, int layerId = 0}) async {
+    // Register node in C++ timeline
+    addVideoNode(path, startTime: startTime, layerId: layerId);
+
+    // Initialize native render pass (AVAssetReader/MediaCodec) and get textureId + renderSize
+    final raw = await _channel.invokeMethod<Map>('createTexture', {'path': path});
+    if (raw == null) {
+      throw Exception('[Vanguard] Failed to create texture for: $path');
+    }
+    final id = (raw['textureId'] as num?)?.toInt() ?? -1;
+    if (id < 0) {
+      throw Exception('[Vanguard] Failed to create texture for: $path');
+    }
+    final w = (raw['width']  as num?)?.toInt() ?? 1080;
+    final h = (raw['height'] as num?)?.toInt() ?? 1920;
+    _activeRenderers[id] = path;
+    return (textureId: id, width: w, height: h);
+  }
+
+
+  Future<void> play(int textureId) async {
+    await _channel.invokeMethod('play', {'textureId': textureId});
+  }
+
+  Future<void> pause(int textureId) async {
+    await _channel.invokeMethod('pause', {'textureId': textureId});
+  }
+
+  Future<void> seekTo(int textureId, double seconds) async {
+    setPlayhead(seconds);
+    await _channel.invokeMethod('seekTo', {'textureId': textureId, 'seconds': seconds});
+  }
+
+  Future<void> disposeTexture(int textureId) async {
+    await _channel.invokeMethod('dispose', {'textureId': textureId});
+    _activeRenderers.remove(textureId);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Camera API (Phase 1–3) — static: no VanguardEngine instance required
+  // ─────────────────────────────────────────────────────────────────────
+
+  /// Starts the native camera session and registers a GPU preview texture.
+  /// Returns the Flutter textureId. Display it with [Texture(textureId: id)].
+  ///
+  /// [position]: 1 = back (default), 2 = front.
+  /// [fps]: target frame rate (30 recommended for all devices).
+  ///
+  /// The _videoCallback is wired to the renderer BEFORE the capture session
+  /// starts, eliminating any callback-arrival-before-wire race.
+  static Future<int> startCamera({int position = 1, int fps = 30}) async {
+    final id = await _cameraChannel.invokeMethod<int>(
+      'startCamera',
+      {'position': position, 'fps': fps},
+    );
+    if (id == null || id < 0) {
+      throw StateError('[Vanguard] startCamera: native returned no texture id');
+    }
+    return id;
+  }
+
+  /// Stops the camera session and unregisters the preview texture.
+  /// Call in the widget's dispose() or on back-navigation.
+  static Future<void> stopCamera() async {
+    await _cameraChannel.invokeMethod<void>('stopCamera');
+  }
+
+  /// Swaps to the given sensor without tearing down the session (~150 ms).
+  /// The texture id returned by [startCamera] remains valid — no widget rebuild.
+  ///
+  /// [position]: 1 = back, 2 = front.
+  ///
+  /// Throws [PlatformException] with code 'RECORDING_ACTIVE' if called while
+  /// a recording is active. Guard by disabling the button in recording state.
+  static Future<void> switchCamera({int position = 1}) async {
+    await _cameraChannel.invokeMethod<void>(
+      'switchCamera',
+      {'position': position},
+    );
+  }
+
+  /// Sets zoom level. 1.0 = no zoom; clamped to device max on native side.
+  /// Throttle callers to ≤30 Hz from pinch gesture handlers:
+  ///   onScaleUpdate: (d) { if (/* 33ms elapsed */) VanguardEngine.setZoom(d.scale * base); }
+  static Future<void> setZoom(double factor) async {
+    await _cameraChannel.invokeMethod<void>('setZoom', {'factor': factor});
+  }
+
+  /// Tap-to-focus and tap-to-expose. [x] and [y] are normalised (0.0–1.0).
+  /// Map a tap's local offset on the Texture widget:
+  ///   x = tapOffset.dx / textureWidth, y = tapOffset.dy / textureHeight.
+  static Future<void> setFocusPoint(double x, double y) async {
+    await _cameraChannel.invokeMethod<void>('setFocusPoint', {'x': x, 'y': y});
+  }
+
+  /// Toggles the continuous video torch. [mode]: 'on' | 'off'.
+  /// Named setTorchMode — this controls the video torch, not the photo flash.
+  /// No-op on devices without a torch (most front cameras, simulator).
+  static Future<void> setTorchMode(String mode) async {
+    await _cameraChannel.invokeMethod<void>('setTorchMode', {'mode': mode});
+  }
+
+  /// Captures the current live camera frame as a JPEG and writes it to [path].
+  ///
+  /// [path] must be a writable absolute path with a .jpg extension.
+  /// Safe to call while a video recording is active — does not affect the
+  /// ongoing AVAssetWriter write.
+  ///
+  /// Returns the absolute path of the written file on success.
+  ///
+  /// Throws [PlatformException] with one of:
+  ///   'NO_FRAME'    — camera started but no frame delivered yet (~100ms window)
+  ///   'SWITCHING'   — a camera switch is in progress (~150ms window)
+  ///   'ENCODE_FAIL' — JPEG encoding or disk write failed
+  ///   'NO_CAMERA'   — startCamera was not called
+  static Future<String> takePhoto(String path) async {
+    final filePath = await _cameraChannel.invokeMethod<String>(
+      'takePhoto',
+      {'path': path},
+    );
+    if (filePath == null) {
+      throw PlatformException(
+        code: 'ENCODE_FAIL',
+        message: 'takePhoto returned null path',
+      );
+    }
+    return filePath;
+  }
+
+  /// Loads a local image file (JPEG / PNG / HEIC / WebP) into the Vanguard GPU
+  /// pipeline and returns a [textureId] for display via [VanguardTextureView].
+  ///
+  /// [path] must be a readable absolute path to an existing image file.
+  ///
+  /// The image is decoded to a [CVPixelBuffer] and held in the renderer's
+  /// [_latestPixelBuffer]. It is re-fired on every [seek] call (the image
+  /// source re-fires its single frame rather than advancing). All
+  /// [VanguardFilterNode] filters (LUT, beauty, ML segmentation) are active
+  /// on the image frame — identical behaviour to a video frame.
+  ///
+  /// Obeys the max-1-renderer rule: any existing texture (video or image) is
+  /// disposed before this one is created.
+  ///
+  /// Throws [PlatformException] with:
+  ///   'INVALID_ARG'    — path argument missing
+  ///   'FILE_NOT_FOUND' — file does not exist at the given path
+  static Future<int> createImageTexture(String path) async {
+    final textureId = await _cameraChannel.invokeMethod<int>(
+      'createImageTexture',
+      {'path': path},
+    );
+    if (textureId == null) {
+      throw PlatformException(
+        code: 'ENCODE_FAIL',
+        message: 'createImageTexture returned null textureId',
+      );
+    }
+    return textureId;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────
+  // Recording API (Phase 4) — also static (camera-mode only, no C++ engine)
+  // ─────────────────────────────────────────────────────────────────────
+
+  /// Begins video recording to [path]. Must be called after [startCamera].
+  /// [path] must be a writable local path with a .mp4 extension.
+  static Future<void> startRecording(String path) async {
+    await _cameraChannel.invokeMethod<void>(
+      'startRecording',
+      {'path': path},
+    );
+  }
+
+  /// Stops recording and finalises the MP4.
+  /// Returns a map with keys:
+  ///   'filePath'     (String)  — the completed file
+  ///   'droppedFrames' (int)    — frames the hardware dropped
+  ///   'totalFrames'  (int)     — total frames presented
+  ///   'dropRate'     (double)  — droppedFrames / totalFrames
+  static Future<Map<String, dynamic>> stopRecording() async {
+    final raw = await _cameraChannel.invokeMethod<Map>('stopRecording');
+    return Map<String, dynamic>.from(raw ?? {});
+  }
+
+  /// Exports the timeline as a single .mp4 using hardware encoding.
+  ///
+  /// - [clips]: ordered list of clip specs with path + trim range
+  /// - [outputPath]: destination .mp4 path
+  /// - [audioPath]: optional external audio track (mp3/m4a) to mix in
+  /// - [audioStart]: trim start within the audio track (seconds)
+  /// - [bitrate]: target video bitrate in bps (default: 4,000,000)
+  /// - [maxSeconds]: hard duration cap (default: 30s)
+  ///
+  /// Each clip map must contain: { 'path', 'trimStart', 'trimEnd' }.
+  /// Progress events fire [onExportProgress] (0.0 → 1.0).
+  /// Returns the output file path on success.
+  Future<String> startExport({
+    required List<Map<String, dynamic>> clips,
+    required String outputPath,
+    String? audioPath,
+    double audioStart = 0.0,
+    int bitrate = 4000000,
+    double maxSeconds = 30.0,
+  }) async {
+    final result = await _channel.invokeMethod<Map>('startExport', {
+      'clips':      clips,
+      'outputPath': outputPath,
+      'audioPath':  audioPath,
+      'audioStart': audioStart,
+      'bitrate':    bitrate,
+      'maxSeconds': maxSeconds,
+    });
+    final success = result?['success'] as bool? ?? false;
+    if (!success) throw Exception('[Vanguard] Export failed for: $outputPath');
+    return result!['outputPath'] as String;
+  }
+
+  /// Cancels any in-progress export. The [startExport] Future will resolve
+  /// with a FlutterError rather than hanging indefinitely.
+  Future<void> cancelExport() async {
+    await _channel.invokeMethod('cancelExport');
+  }
+
+  /// Extracts the audio track from a video file to a .m4a file.
+  /// Uses AVFoundation — no FFmpeg required.
+  ///
+  /// - [videoPath]: source video (mp4/mov/any AVFoundation-supported)
+  /// - [outputPath]: destination .m4a path
+  /// - [trimStart] / [trimEnd]: optional time range within the source audio
+  ///
+  /// Returns the path to the extracted .m4a file.
+  Future<String> extractAudio({
+    required String videoPath,
+    required String outputPath,
+    double trimStart = 0.0,
+    double? trimEnd,
+  }) async {
+    final result = await _channel.invokeMethod<String>('extractAudio', {
+      'videoPath':  videoPath,
+      'outputPath': outputPath,
+      'trimStart':  trimStart,
+      'trimEnd':    trimEnd ?? double.infinity,
+    });
+    if (result == null) throw Exception('[Vanguard] Audio extraction failed for: $videoPath');
+    return result;
+  }
+
+  /// Probes the native duration of a video file using AVURLAsset.
+  ///
+  /// Uses a lightweight native AVURLAsset.duration read — no renderer, no
+  /// decoder pipeline, no FFmpeg. Safe to call for any local video path.
+  ///
+  /// Returns the duration in seconds, or `null` if the asset cannot be loaded
+  /// (e.g. missing file, unrecognised codec — caller should fall back).
+  ///
+  /// This replaces `VideoPlayerController.file` as the I-5-compliant duration
+  /// probing path. (Phase A2-S1 validation fix.)
+  static Future<double?> probeVideoDuration(String videoPath) async {
+    final result = await _cameraChannel.invokeMethod<double>('probeVideoDuration', {
+      'path': videoPath,
+    });
+    if (result == null || result < 0) return null;
+    return result;
+  }
+
+  /// Returns duration + pixel dimensions for a video file — native replacement
+  /// for FFmpegKit metadata probes in [story_export_service.dart].
+  ///
+  /// Returns a map with keys:
+  ///   `duration` — seconds as double, or -1.0 on failure
+  ///   `width`    — pixel width as int (0 on failure)
+  ///   `height`   — pixel height as int (0 on failure)
+  ///
+  /// Does NOT call FFmpegKit. Uses MediaMetadataRetriever (Android) and
+  /// AVURLAsset / AVAssetTrack.naturalSize (iOS).
+  static Future<Map<String, dynamic>?> probeVideoInfo(String videoPath) async {
+    final raw = await _cameraChannel.invokeMethod<Map>('probeVideoInfo', {
+      'path': videoPath,
+    });
+    if (raw == null) return null;
+    return {
+      'duration': (raw['duration'] as num?)?.toDouble() ?? -1.0,
+      'width':    (raw['width']    as num?)?.toInt()    ?? 0,
+      'height':   (raw['height']   as num?)?.toInt()    ?? 0,
+    };
+  }
+
+  /// Phase 3A: iOS-native static-image-to-video exporter.
+  ///
+  /// Converts a PNG image + audio source to a [durationSeconds] MP4.
+  /// Uses AVAssetWriter + CVPixelBuffer frame pump on iOS — no FFmpegKit.
+  ///
+  /// - [imagePath]:         Local path to source PNG
+  /// - [audioPath]:         Local path to audio source (.m4a / .mp3 / .wav)
+  /// - [audioStartSeconds]: Seek offset into audio source (default 0)
+  /// - [outputPath]:        Destination MP4 path (must be writable)
+  /// - [durationSeconds]:   Target output duration (default 15.0)
+  ///
+  /// Returns the output file path on success, or null on failure.
+  ///
+  /// Platform: iOS only. Use StoryExportService._flattenImageToVideoFFmpeg on Android.
+  static Future<String?> flattenImageToVideo({
+    required String imagePath,
+    required String audioPath,
+    double audioStartSeconds = 0.0,
+    required String outputPath,
+    double durationSeconds = 15.0,
+  }) async {
+    final raw = await _cameraChannel.invokeMethod<Map>('flattenImageToVideo', {
+      'imagePath':         imagePath,
+      'audioPath':         audioPath,
+      'audioStartSeconds': audioStartSeconds,
+      'outputPath':        outputPath,
+      'durationSeconds':   durationSeconds,
+    });
+    if (raw?['success'] == true) {
+      return raw!['outputPath'] as String?;
+    }
+    return null;
+  }
+
+  /// Phase 3B: iOS-native flattenVideo — PNG overlay + optional audio mix.
+  ///
+  /// Composites a full-frame PNG (rendered text stickers / filters) over a
+  /// video clip and optionally mixes in external music.
+  ///
+  /// - [videoPath]:         Source video path
+  /// - [overlayPNGPath]:    Full-frame overlay PNG file
+  /// - [audioPath]:         Optional music file. If null, video audio passes through.
+  /// - [audioStartSeconds]: Seek offset into external audio (default 0)
+  /// - [outputPath]:        Destination MP4 path
+  /// - [durationSeconds]:   Target output duration (default 15.0)
+  ///
+  /// Returns the output file path on success, or null on failure.
+  ///
+  /// Platform: iOS only. Use StoryExportService._flattenVideoFFmpeg on Android.
+  static Future<String?> flattenVideo({
+    required String videoPath,
+    required String overlayPNGPath,
+    String? audioPath,
+    double audioStartSeconds = 0.0,
+    required String outputPath,
+    double durationSeconds = 15.0,
+  }) async {
+    final raw = await _cameraChannel.invokeMethod<Map>('flattenVideo', {
+      'videoPath':         videoPath,
+      'overlayPNGPath':    overlayPNGPath,
+      'audioPath':         audioPath,
+      'audioStartSeconds': audioStartSeconds,
+      'outputPath':        outputPath,
+      'durationSeconds':   durationSeconds,
+    });
+    if (raw?['success'] == true) {
+      return raw!['outputPath'] as String?;
+    }
+    return null;
+  }
+
+  /// Phase 3C: iOS-native compositeDualCamera — back cam fullscreen + front cam PiP
+  /// with rounded corners and fill-mode scale.
+  ///
+  /// Composites [backPath] (full-frame background, downscaled from 4K) +
+  /// [frontPath] (bottom-right PiP, 35% width, 24px corner radius).
+  ///
+  /// All PiP geometry is computed natively from AVAssetTrack — no geometry
+  /// arguments in the method channel. Dart passes only file paths.
+  ///
+  /// Audio: back camera audio only (front mic discarded — matches FFmpeg -map 0:a?).
+  /// Duration: min(back, front) clip length, capped at 15s.
+  ///
+  /// Returns the output file path on success, or null on failure.
+  ///
+  /// Platform: iOS only. Use StoryExportService._compositeDualCameraFFmpeg on Android.
+  static Future<String?> compositeDualCamera({
+    required String backPath,
+    required String frontPath,
+    required String outputPath,
+  }) async {
+    final raw = await _cameraChannel.invokeMethod<Map>('compositeDualCamera', {
+      'backPath':   backPath,
+      'frontPath':  frontPath,
+      'outputPath': outputPath,
+    });
+    if (raw?['success'] == true) {
+      return raw!['outputPath'] as String?;
+    }
+    return null;
+  }
+
+  /// Generates evenly-spaced JPEG thumbnail frames from a video for the filmstrip UI.
+
+
+  ///
+  /// - [videoPath]: source video
+  /// - [count]: number of thumbnails to generate (typically 8–10 per clip)
+  /// - [duration]: native duration of the clip in seconds
+  ///
+  /// Returns a list of JPEG bytes for each thumbnail.
+  Future<List<Uint8List>> generateThumbnails({
+    required String videoPath,
+    required int count,
+    required double duration,
+  }) async {
+    final result = await _channel.invokeMethod<List>('generateThumbnails', {
+      'videoPath': videoPath,
+      'count':     count,
+      'duration':  duration,
+    });
+    if (result == null) return [];
+    return result
+        .whereType<Uint8List>()
+        .toList();
+  }
+
+  // ── C++ Timeline API ──────────────────────────────────────────────────────
+
+  void addVideoNode(String path, {required double startTime, int layerId = 0}) {
+    final ptr = path.toNativeUtf8();
+    _VanguardFFI.addVideoNode(_enginePtr, ptr, startTime, layerId);
+    calloc.free(ptr);
+  }
+
+  void addBitmapOverlay(String overlayId, {required double startTime, required double duration, int layerId = 10}) {
+    final ptr = overlayId.toNativeUtf8();
+    _VanguardFFI.addBitmapOverlay(_enginePtr, ptr, startTime, duration, layerId);
+    calloc.free(ptr);
+  }
+
+  void addAudioNode(String path, {required double startTime}) {
+    final ptr = path.toNativeUtf8();
+    _VanguardFFI.addAudioNode(_enginePtr, ptr, startTime);
+    calloc.free(ptr);
+  }
+
+  void setPlayhead(double timeSec) {
+    _VanguardFFI.setPlayhead(_enginePtr, timeSec);
+  }
+
+  double get duration => _VanguardFFI.getDuration(_enginePtr);
+
+  /// T4: dispose() is now async and awaits each 'dispose' channel call.
+  /// Previously it fire-and-forgot the channel calls, meaning the native texture
+  /// could be unregistered AFTER vanguard_engine_destroy() ran, causing
+  /// a use-after-free in VanguardMediaEnginePlugin.renderers[textureId].
+  Future<void> dispose() async {
+    if (_disposed) return; // idempotent — guard against double-dispose
+    _disposed = true;
+    // Clear _devInstance NOW — before awaiting — so that if T2's factory
+    // constructor runs during our await, it won't call _disposeSync() on us.
+    if (kDebugMode) _devInstance = null;
+    final ids = List<int>.from(_activeRenderers.keys);
+    for (final id in ids) {
+      // Await each call — ensures the native renderer is fully disposed
+      // (CADisplayLink invalidated, CVPixelBufferPool released, texture unregistered)
+      // before we destroy the C++ engine.
+      await _channel.invokeMethod('dispose', {'textureId': id});
+    }
+    _activeRenderers.clear();
+    _VanguardFFI.destroy(_enginePtr);
+  }
+}
