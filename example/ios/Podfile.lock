@@ -1,25 +1,32 @@
 PODS:
   - Flutter (1.0.0)
+  - UMF (0.0.1)
   - vanguard_media_engine (0.0.1):
     - Flutter
+    - UMF
   - vanguard_media_engine/Tests (0.0.1):
     - Flutter
+    - UMF
 
 DEPENDENCIES:
   - Flutter (from `Flutter`)
+  - UMF (from `../../../UMF/ios`)
   - vanguard_media_engine (from `.symlinks/plugins/vanguard_media_engine/ios`)
   - vanguard_media_engine/Tests (from `.symlinks/plugins/vanguard_media_engine/ios`)
 
 EXTERNAL SOURCES:
   Flutter:
     :path: Flutter
+  UMF:
+    :path: "../../../UMF/ios"
   vanguard_media_engine:
     :path: ".symlinks/plugins/vanguard_media_engine/ios"
 
 SPEC CHECKSUMS:
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
-  vanguard_media_engine: c9ce5c186a0ef7225246b4e3a34ff88b104445a6
+  UMF: 6bf2b6ae15741ea3fa28a33794a06a724d629619
+  vanguard_media_engine: f215116d1742eeab2fea6aa1fba3140eea878855
 
-PODFILE CHECKSUM: c9aa25593c023c6b66ecbc93a82a5c9ff243db51
+PODFILE CHECKSUM: da48b8707443d9a16c89b1c0553fd0733d22dd99
 
 COCOAPODS: 1.16.2

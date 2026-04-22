@@ -30,7 +30,7 @@
 #import <AVFoundation/AVFoundation.h>
 
 // UMF protocol (C-7: protocol in UMF package, concrete in Vanguard package)
-#import "VGMasterClock.h"
+#import <UMF/VGMasterClock.h>
 
 NS_ASSUME_NONNULL_BEGIN
 

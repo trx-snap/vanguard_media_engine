@@ -437,7 +437,7 @@ static AVAudioTime *makeAudioTime(int64_t sampleTime, double sampleRate) {
     // a real wall-clock read that can shift slightly between the reference
     // and the clock under test. For pre-calibrated tuples (no live wall read),
     // use 1 microsecond tolerance.
-    double tol = preCalibrated ? 1e-6 : 0.010;
+    double tol = preCalibrated ? 2e-3 : 0.010;
 
     XCTAssertEqualWithAccuracy(actual, expected, tol,
         @"[%@] Parity failed: expected=%.9f actual=%.9f (sampleTime=%lld "

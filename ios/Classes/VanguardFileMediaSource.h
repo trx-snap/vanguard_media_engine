@@ -10,7 +10,7 @@
 
 #import "VanguardMediaSource.h"
 #import "VanguardAudioEngine.h"
-#import "VGMediaNode.h"
+#import <UMF/VGMediaNode.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
 

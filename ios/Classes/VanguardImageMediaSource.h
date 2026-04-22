@@ -8,7 +8,7 @@
 
 #import "VanguardMediaSource.h"
 #import "VanguardImageProcessor.h"
-#import "VGMediaNode.h"
+#import <UMF/VGMediaNode.h>
 #import <AVFoundation/AVFoundation.h>
 
 NS_ASSUME_NONNULL_BEGIN

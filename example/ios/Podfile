@@ -36,6 +36,7 @@ target 'Runner' do
   pod 'vanguard_media_engine',
       :path      => '.symlinks/plugins/vanguard_media_engine/ios',
       :testspecs => ['Tests']
+  pod 'UMF', :path => '../../../UMF/ios'
   target 'RunnerTests' do
     inherit! :search_paths
   end
