@@ -25,6 +25,7 @@
 #import "VanguardFileMediaSource.h"
 #import "VanguardAudioEngine.h"
 #import "VanguardMasterClock.h"  // P1A-04: concrete clock extracted from this file
+#import <UMF/VGResourceAllocator.h>
 #import <AVFoundation/AVFoundation.h>
 #include <mach/mach_time.h> // mach_absolute_time, mach_timebase_info — P5-A latency
 #include <os/lock.h>
@@ -195,6 +196,13 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
   _Atomic(BOOL) _invalidated;
   NSString *_nodeId;   // NSUUID assigned at init; immutable
   NSString *_nodeType; // always @"VanguardFileMediaSource"
+
+  // ── Phase 2: audio role state ─────────────────────────────────────────
+  // Resolved by VanguardGraphRuntime after allocator arbitration.
+  // Defaults to VGAudioRoleActive so Phase 1 / convenience-init paths are
+  // unchanged.
+  VGAudioRole _effectiveAudioRole; // read in _setupAudioEngine early-return gate
+  __weak id _owningRuntime;        // weak; used only for relinquishAudioActivation:
 }
 
 // VanguardAudioEngine protocol's masterClock is computed; dynamically returned.
@@ -207,6 +215,8 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
 @synthesize videoDecodeQueue = _videoDecodeQueue;
 @synthesize nodeId = _nodeId;
 @synthesize nodeType = _nodeType;
+@synthesize effectiveAudioRole = _effectiveAudioRole;
+@synthesize owningRuntime = _owningRuntime;
 
 + (void)initialize {
   if (self == [VanguardFileMediaSource class]) {
@@ -218,12 +228,26 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
 #pragma mark - Init
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Convenience initialiser — Phase 1 compatible. Defaults to VGAudioRoleActive.
 - (instancetype)initWithURL:(NSURL *)url
             pixelBufferPool:(CVPixelBufferPoolRef _Nullable)pixelBufferPool {
+  return [self initWithURL:url
+           pixelBufferPool:pixelBufferPool
+          desiredAudioRole:VGAudioRoleActive];
+}
+
+/// Designated initialiser — Phase 2.
+/// desiredAudioRole is stored immediately. VanguardGraphRuntime may then set
+/// effectiveAudioRole before calling activateAudioIfNeeded to downgrade a
+/// session to Muted after allocator contention.
+- (instancetype)initWithURL:(NSURL *)url
+            pixelBufferPool:(CVPixelBufferPoolRef _Nullable)pixelBufferPool
+           desiredAudioRole:(VGAudioRole)role {
   self = [super init];
   if (!self)
     return nil;
 
+  _effectiveAudioRole = role;
   _url = url;
   _pixelBufferPool = pixelBufferPool;
   _playbackRate = 1.0;
@@ -1030,6 +1054,12 @@ static dispatch_once_t sAudioSessionOnce;
 }
 
 - (void)_setupAudioEngine {
+  // Phase 2 role gate — only permitted change at the top of this method.
+  // When effectiveAudioRole == Active, all code below runs behaviorally
+  // identical to Phase 1. No reordering, no added side effects, no removed
+  // operations within the existing logic.
+  if (_effectiveAudioRole != VGAudioRoleActive) { return; }
+
   // Guard: _teardownAudioEngine sets _audioEngineReady = NO so stop+replay
   // re-enters.
   if (_audioEngineReady)
@@ -1416,6 +1446,11 @@ static const NSInteger kAudioChunkFrames =
 }
 
 - (void)_teardownAudioEngine {
+  // Phase 2: relinquish the audio activation slot before any engine teardown.
+  // Must be the first call — frees the slot for the next createSession
+  // immediately, regardless of how long the remaining teardown takes.
+  [[VGResourceAllocator sharedInstance] relinquishAudioActivation:_owningRuntime];
+
   // Signal any in-flight background _setupAudioEngine to abort BEFORE we touch
   // engine state — this prevents the race between teardown and async audio
   // setup.
@@ -1434,6 +1469,35 @@ static const NSInteger kAudioChunkFrames =
   _timePitchNode = nil;
   _pcmFormat = nil;
   _audioEngine = nil;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+#pragma mark - Phase 2 public audio lifecycle wrappers
+// ───────────────────────────────────────────────────────────────────────────────
+
+/// Public wrapper over _setupAudioEngine. Called by VanguardGraphRuntime
+/// after it has acquired the allocator slot. The role gate inside
+/// _setupAudioEngine enforces the muted no-op; the caller does not need to
+/// check effectiveAudioRole before calling.
+- (void)activateAudioIfNeeded {
+  [self _setupAudioEngine];
+}
+
+/// Public wrapper over _teardownAudioEngine. Called by VanguardGraphRuntime
+/// during demotion and before invalidate. Idempotent: safe to call when no
+/// audio engine is active (all _teardownAudioEngine paths guard on state).
+- (void)deactivateAudioIfNeeded {
+  [self _teardownAudioEngine];
+}
+
+// Phase 2 limitation:
+// This drains only _videoDecodeQueue (video frame pipeline).
+// It does NOT guarantee _decodeQueue (audio chunk reads) is drained.
+// Full audio+video quiescence is handled in later phases if required.
+- (void)awaitDecoderDrainWithCompletion:(dispatch_block_t)completion {
+  dispatch_async(_videoDecodeQueue, ^{
+    if (completion) completion();
+  });
 }
 
 // ───────────────────────────────────────────────────────────────────────────────

@@ -51,11 +51,13 @@ Pod::Spec.new do |s|
   s.test_spec 'Tests' do |ts|
     ts.requires_app_host = true
     ts.source_files  = [
-      # Phase 1A test files only — other Tests/ files have pre-existing
-      # compile errors (missing imports) and are excluded from this bundle.
+      # Phase 1A test files
       'Tests/VGMasterClockTest.m',
       'Tests/VGResourceAllocatorTest.m',
-      'Tests/VGMediaNodeConformanceTest.m'
+      'Tests/VGMediaNodeConformanceTest.m',
+      # Phase 1B test files (P1B-02: ObjC runtime lifecycle, P1B-04: Swift registry)
+      'Tests/VGGraphRuntimeLifecycleTest.m',
+      'Tests/VGSessionRegistryTest.swift'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'

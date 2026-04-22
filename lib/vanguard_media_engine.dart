@@ -5,6 +5,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:ffi/ffi.dart';
 
+// P1B-09: Dart layer for the opt-in graph-runtime path.
+import 'vg_playback_client.dart';
+import 'vg_playback_session.dart';
+
 export 'vanguard_texture_view.dart';
 export 'vanguard_media_preparer.dart';
 
@@ -109,6 +113,11 @@ class VanguardEngine {
 
   // Tracks textureId → videoPath to allow management of multiple renderers
   final Map<int, String> _activeRenderers = {};
+
+  // P1B-09: Tracks textureId → VGPlaybackSession for the opt-in graph-runtime path.
+  // Populated in createVideoTexture; cleared in disposeTexture and dispose().
+  // Keys always mirror _activeRenderers so both maps stay in sync.
+  final Map<int, VGPlaybackSession> _sessions = {};
 
   /// Optional callbacks from the UI
   void Function(String path, double duration)? onNodeDurationProbed;
@@ -227,37 +236,70 @@ class VanguardEngine {
     // Register node in C++ timeline
     addVideoNode(path, startTime: startTime, layerId: layerId);
 
-    // Initialize native render pass (AVAssetReader/MediaCodec) and get textureId + renderSize
-    final raw = await _channel.invokeMethod<Map>('createTexture', {'path': path});
-    if (raw == null) {
-      throw Exception('[Vanguard] Failed to create texture for: $path');
-    }
-    final id = (raw['textureId'] as num?)?.toInt() ?? -1;
+    // P1B-09: Route through VGPlaybackClient which normalises both the legacy
+    // Map return and the new graph-runtime Map return into a VGPlaybackSession.
+    // _activeRenderers is still populated for dispose() and hot-reload safety.
+    //
+    // Width/height: VGPlaybackClient.createSession() calls `createTexture` and
+    // returns both a parsed VGPlaybackSession and the raw map via a record so
+    // we can extract dimensions without a second channel call.
+    final (session: session, raw: rawMap) =
+        await VGPlaybackClient.createSessionRaw(path);
+    final id = session.textureId;
     if (id < 0) {
       throw Exception('[Vanguard] Failed to create texture for: $path');
     }
-    final w = (raw['width']  as num?)?.toInt() ?? 1080;
-    final h = (raw['height'] as num?)?.toInt() ?? 1920;
     _activeRenderers[id] = path;
+    _sessions[id] = session;
+
+    final w = (rawMap?['width']  as num?)?.toInt() ?? 1080;
+    final h = (rawMap?['height'] as num?)?.toInt() ?? 1920;
     return (textureId: id, width: w, height: h);
   }
 
 
   Future<void> play(int textureId) async {
-    await _channel.invokeMethod('play', {'textureId': textureId});
+    // P1B-09: Delegate to session if one exists; fall back to raw channel call
+    // so callers that bypassed VGPlaybackClient (e.g. camera renderer IDs) still
+    // work identically to before.
+    final session = _sessions[textureId];
+    if (session != null) {
+      await session.play();
+    } else {
+      await _channel.invokeMethod('play', {'textureId': textureId});
+    }
   }
 
   Future<void> pause(int textureId) async {
-    await _channel.invokeMethod('pause', {'textureId': textureId});
+    // P1B-09: Delegate to session if one exists.
+    final session = _sessions[textureId];
+    if (session != null) {
+      await session.pause();
+    } else {
+      await _channel.invokeMethod('pause', {'textureId': textureId});
+    }
   }
 
   Future<void> seekTo(int textureId, double seconds) async {
     setPlayhead(seconds);
-    await _channel.invokeMethod('seekTo', {'textureId': textureId, 'seconds': seconds});
+    // P1B-09: Delegate to session if one exists.
+    final session = _sessions[textureId];
+    if (session != null) {
+      await session.seekTo(seconds);
+    } else {
+      await _channel.invokeMethod('seekTo', {'textureId': textureId, 'seconds': seconds});
+    }
   }
 
   Future<void> disposeTexture(int textureId) async {
-    await _channel.invokeMethod('dispose', {'textureId': textureId});
+    // P1B-09: Delegate to session if one exists; disposes native resources and
+    // marks the session as disposed (idempotent guard on VGPlaybackSession).
+    final session = _sessions.remove(textureId);
+    if (session != null) {
+      await session.dispose();
+    } else {
+      await _channel.invokeMethod('dispose', {'textureId': textureId});
+    }
     _activeRenderers.remove(textureId);
   }
 

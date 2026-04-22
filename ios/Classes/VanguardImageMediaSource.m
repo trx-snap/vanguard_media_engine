@@ -50,27 +50,43 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 - (void)start {
-    // Decode the image synchronously (images are small; acceptable on init path).
-    // Phase 4: move to background dispatch if images are HEIC > 12MP.
-    CGImageSourceRef src = CGImageSourceCreateWithURL(
-        (__bridge CFURLRef)_imageURL, nil);
-    if (!src) {
-        NSLog(@"[VanguardImageSource] Cannot open: %@", _imageURL.lastPathComponent);
-        return;
-    }
-    CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, nil);
-    CFRelease(src);
-    if (!img) return;
+    // Preflight H2: decode is always dispatched off the calling thread.
+    // Caller context (main, channel, or background) is irrelevant —
+    // the dispatch is unconditional. Guards RR-08.
+    __weak __typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        __strong __typeof(weakSelf) s = weakSelf;
+        if (!s) return;
 
-    if (_buffer) { CVPixelBufferRelease(_buffer); _buffer = NULL; }
-    _buffer = [_processor pixelBufferFromCGImage:img];
-    CGImageRelease(img);
+        // Guard 1 — pre-decode: abort if invalidated before we begin.
+        if (atomic_load_explicit(&s->_invalidated, memory_order_acquire)) { return; }
 
-    // Fire immediately — renderer displays the image as soon as start is called.
-    if (_videoCallback && _buffer) {
-        _videoCallback(CVPixelBufferRetain(_buffer), kCMTimeZero);
-        CVPixelBufferRelease(_buffer); // balance the retain above
-    }
+        CGImageSourceRef src = CGImageSourceCreateWithURL(
+            (__bridge CFURLRef)s->_imageURL, nil);
+        if (!src) {
+            NSLog(@"[VanguardImageSource] Cannot open: %@", s->_imageURL.lastPathComponent);
+            return;
+        }
+        CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, nil);
+        CFRelease(src);
+        if (!img) return;
+
+        if (s->_buffer) { CVPixelBufferRelease(s->_buffer); s->_buffer = NULL; }
+        s->_buffer = [s->_processor pixelBufferFromCGImage:img];
+        CGImageRelease(img);
+
+        // Guard 2 — pre-callback: if invalidated during decode, discard and return.
+        if (atomic_load_explicit(&s->_invalidated, memory_order_acquire)) {
+            if (s->_buffer) { CVPixelBufferRelease(s->_buffer); s->_buffer = NULL; }
+            return;
+        }
+
+        // Fire immediately — renderer displays the image as soon as start is called.
+        if (s->_videoCallback && s->_buffer) {
+            s->_videoCallback(CVPixelBufferRetain(s->_buffer), kCMTimeZero);
+            CVPixelBufferRelease(s->_buffer); // balance the retain above
+        }
+    });
 }
 
 - (void)stop {

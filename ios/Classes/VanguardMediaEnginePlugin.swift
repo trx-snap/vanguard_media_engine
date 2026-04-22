@@ -94,6 +94,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     private var cameraSource: VanguardCameraMediaSource?
     private var streamingEncoder: VanguardVideoToolboxEncoder?
 
+    // Phase 2 Step 6: session registry is the unconditional playback path.
+    // All createTexture / play / pause / seekTo / dispose calls route here.
+    // Camera and export continue to use `renderers` exclusively.
+    private let sessionRegistry = VGSessionRegistry()
+
     // ─── Registration ─────────────────────────────────────────────────────────
 
     public static func register(with registrar: FlutterPluginRegistrar) {
@@ -103,6 +108,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         instance.registrar = registrar
         instance.channel   = channel
         registrar.addMethodCallDelegate(instance, channel: channel)
+
+        // Phase 2 Step 6: sessionRegistry is now a let constant on the instance;
+        // no explicit instantiation needed here.
 
         // P3-T4: Register camera PlatformView factory
         let cameraFactory = VanguardCameraViewFactory()
@@ -259,8 +267,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     private func teardownCurrentMode() {
         switch currentMode {
         case .editor:
-            renderers.values.forEach { $0.dispose() }
-            renderers.removeAll()
+            // Phase 2 Step 6: playback sessions are owned by the registry.
+            // Legacy renderer map has no playback entries; dispose all registry sessions.
+            sessionRegistry.disposeAll()
         case .export:
             activeExportSession?.cancel()
             activeExportSession = nil
@@ -273,10 +282,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             streamingEncoder?.finish()
             streamingEncoder?.invalidate()
             streamingEncoder = nil
-            // Phase 1: dispose camera preview renderer if one was registered.
-            // cameraSource is nil'd above but renderer._source still holds a
-            // strong reference; renderer.dispose() calls [_source stop] again —
-            // AVCaptureSession.stopRunning is idempotent and safe to call twice.
+            // Dispose camera preview renderer(s) — renderers dict is camera-only here.
             for (id, renderer) in renderers {
                 registrar.textures().unregisterTexture(id)
                 renderer.dispose()
@@ -405,63 +411,37 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(FlutterError(code: "INVALID_ARG", message: "path required", details: nil))
                 return
             }
-            // P1-T4: Switch to editor mode (tears down any active export/camera).
-            // PATCH-2: If current mode is camera, use async teardown so that
-            // stopRecordingWithCompletion: does not block the main thread.
-            // The renderer is created inside the completion to maintain the
-            // sequential setup order.
-            if currentMode == .camera {
-                teardownCameraAsync { [weak self] in
-                    guard let self = self else { return }
-                    self.currentMode = .editor
-                    if !self.renderers.isEmpty {
-                        for (id, renderer) in self.renderers {
-                            // Unregister BEFORE dispose: stops raster-thread copyPixelBuffer
-                            // callbacks for this id before the Metal/AV state is torn down.
-                            self.registrar.textures().unregisterTexture(id)
-                            renderer.dispose()
+
+            // Phase 2 Step 6: all playback creation routes through VGSessionRegistry.
+            // Camera teardown runs first if needed so AVAudioSession is free.
+            let _createTextureViaRegistry = { [weak self] in
+                guard let self else { return }
+                let url = URL(fileURLWithPath: path)
+                _ = self.sessionRegistry.createSession(
+                    url:             url,
+                    textureRegistry: self.registrar.textures(),
+                    methodChannel:   self.channel,
+                    desiredAudioRole: .active
+                ) { textureId, renderSize in
+                    DispatchQueue.main.async {
+                        guard textureId >= 0 else {
+                            result(FlutterError(code: "PREPARE_FAILED",
+                                                message: "createTexture: prepare failed",
+                                                details: nil))
+                            return
                         }
-                        self.renderers.removeAll()
+                        let w = renderSize.width  > 0 ? Int(renderSize.width)  : 1080
+                        let h = renderSize.height > 0 ? Int(renderSize.height) : 1920
+                        result(["textureId": textureId, "width": w, "height": h])
                     }
-                    let renderer = VanguardMetalRenderer(videoPath: path,
-                                                         textureRegistry: self.registrar.textures(),
-                                                         methodChannel: self.channel)
-                    self.renderers[renderer.textureId] = renderer
-                    // Return renderSize alongside textureId so VanguardTextureView
-                    // can size itself to the actual video dimensions (not hardcoded 1080×1920).
-                    // outputTextureWidth/Height are sourced from _renderSize (set during _probeAsset)
-                    // and are therefore portrait-swapped for portrait .mov files.
-                    let w = renderer.outputTextureWidth  > 0 ? renderer.outputTextureWidth  : 1080
-                    let h = renderer.outputTextureHeight > 0 ? renderer.outputTextureHeight : 1920
-                    result(["textureId": renderer.textureId, "width": w, "height": h])
                 }
-                return
             }
 
-            switchToMode(.editor)
-
-            // P1-T7: Enforce max 1 full renderer — dispose any existing one first.
-            // Full renderers hold AVAssetReader + CVPixelBufferPool + CADisplayLink.
-            // Multiple concurrent renderers exhaust GPU memory (5 clips × 24MB = 120MB+).
-            if !renderers.isEmpty {
-                for (id, renderer) in renderers {
-                    // Unregister BEFORE dispose: stops raster-thread copyPixelBuffer
-                    // callbacks for this id before the Metal/AV state is torn down.
-                    registrar.textures().unregisterTexture(id)
-                    renderer.dispose()
-                }
-                renderers.removeAll()
+            if currentMode == .camera {
+                teardownCameraAsync { _createTextureViaRegistry() }
+            } else {
+                _createTextureViaRegistry()
             }
-
-            let renderer = VanguardMetalRenderer(videoPath: path,
-                                                 textureRegistry: registrar.textures(),
-                                                 methodChannel: channel)
-            renderers[renderer.textureId] = renderer
-            // Return renderSize alongside textureId so VanguardTextureView
-            // can size itself to the actual video dimensions (not hardcoded 1080×1920).
-            let w = renderer.outputTextureWidth  > 0 ? renderer.outputTextureWidth  : 1080
-            let h = renderer.outputTextureHeight > 0 ? renderer.outputTextureHeight : 1920
-            result(["textureId": renderer.textureId, "width": w, "height": h])
 
         // ── Image texture (Phase A1-S1) ────────────────────────────────────────
         // Creates a VanguardMetalRenderer backed by VanguardImageMediaSource.
@@ -495,16 +475,34 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 return
             }
 
-            // Tear down any active camera session first (mirrors createTexture behaviour).
-            if currentMode == .camera {
-                teardownCameraAsync { [weak self] in
-                    guard let self = self else { return }
-                    self._createImageRenderer(url: imageURL, result: result)
+            // Phase 2 Step 6: image creation also routes through VGSessionRegistry.
+            let _createImageViaRegistry = { [weak self] in
+                guard let self else { return }
+                _ = self.sessionRegistry.createSession(
+                    url:             imageURL,
+                    textureRegistry: self.registrar.textures(),
+                    methodChannel:   self.channel,
+                    desiredAudioRole: .muted
+                ) { textureId, renderSize in
+                    DispatchQueue.main.async {
+                        guard textureId >= 0 else {
+                            result(FlutterError(code: "PREPARE_FAILED",
+                                                message: "createImageTexture: prepare failed",
+                                                details: nil))
+                            return
+                        }
+                        let w = renderSize.width  > 0 ? Int(renderSize.width)  : 1080
+                        let h = renderSize.height > 0 ? Int(renderSize.height) : 1920
+                        result(["textureId": textureId, "width": w, "height": h])
+                    }
                 }
-                return
             }
 
-            _createImageRenderer(url: imageURL, result: result)
+            if currentMode == .camera {
+                teardownCameraAsync { _createImageViaRegistry() }
+            } else {
+                _createImageViaRegistry()
+            }
 
         // ── Video duration probe (Phase A2-S1) ────────────────────────────────────
         // Lightweight AVURLAsset.duration read — no renderer, no decoder, no FFmpeg.
@@ -586,7 +584,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     "mkv": "mkv", "webm": "webm", "avi": "avi",
                     "m4a": "m4a", "aac": "aac", "mp3": "mp3",
                     "jpeg": "jpeg", "jpg": "jpeg", "png": "png",
-                    "heic": "heic", "webp": "webp", "gif": "gif",
+                    "heic": "heic", "heif": "heif", "webp": "webp", "gif": "gif",
                 ]
                 let container = containerMap[ext] ?? ext
 
@@ -664,7 +662,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 let hasMoovAtFront = false
 
                 // MediaKind
-                let imageExts: Set<String> = ["jpeg", "jpg", "png", "heic", "webp", "gif", "bmp", "tiff"]
+                let imageExts: Set<String> = ["jpeg", "jpg", "png", "heic", "heif", "webp", "gif", "bmp", "tiff"]
                 let audioExts: Set<String> = ["m4a", "aac", "mp3", "wav", "flac", "ogg"]
                 let kind: String
                 if imageExts.contains(ext)     { kind = "image" }
@@ -937,14 +935,20 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             guard let textureId = (args?["textureId"] as? NSNumber)?.int64Value else {
                 result(FlutterError(code: "BAD_ARGS", message: "play requires textureId", details: nil)); return
             }
-            renderers[textureId]?.play()
+            // Phase 2 Step 6: all playback via registry.
+            if sessionRegistry.runtime(forTextureId: textureId)?.play() == nil {
+                NSLog("[VanguardPlugin] runtime not found for textureId %lld", textureId)
+            }
             result(nil)
 
         case "pause":
             guard let textureId = (args?["textureId"] as? NSNumber)?.int64Value else {
                 result(FlutterError(code: "BAD_ARGS", message: "pause requires textureId", details: nil)); return
             }
-            renderers[textureId]?.pause()
+            // Phase 2 Step 6: all playback via registry.
+            if sessionRegistry.runtime(forTextureId: textureId)?.pause() == nil {
+                NSLog("[VanguardPlugin] runtime not found for textureId %lld", textureId)
+            }
             result(nil)
 
         case "seekTo":
@@ -953,7 +957,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(FlutterError(code: "BAD_ARGS", message: "seekTo requires textureId and seconds", details: nil))
                 return
             }
-            renderers[textureId]?.seek(seconds)
+            // Phase 2 Step 6: all playback via registry.
+            if sessionRegistry.runtime(forTextureId: textureId)?.seek(to: seconds) == nil {
+                NSLog("[VanguardPlugin] runtime not found for textureId %lld", textureId)
+            }
             result(nil)
 
         // G-02: Exposes the native masterClock for the A/V sync integration test.
@@ -962,8 +969,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // ~25,000/sec during the settle poll loop; any blocking log call will
         // saturate logd's XPC buffer and hang the settle on the second call.
         case "getMasterClock":
-            if let source = renderers.values.first?.currentTimeSeconds {
-                result(source)
+            // Phase 2 Step 6: playback sessions are registry-owned; renderers holds
+            // no playback entries. Read master clock from the first active runtime.
+            if let clock = sessionRegistry.allRuntimes().first?.masterClock?.currentTime {
+                result(CMTimeGetSeconds(clock))
             } else {
                 result(0.0)
             }
@@ -994,11 +1003,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // is free). resumeSeekPreviews() restores normal behaviour after the
         // measurement is complete.  Both are no-ops in production — test-only.
         case "pauseSeekPreviews":
-            renderers.values.forEach { $0.seekPreviewPaused = true }
+            // Phase 2 Step 6: seek-preview state forwarded through registry runtimes.
+            sessionRegistry.allRuntimes().forEach { $0.setSeekPreviewPaused(true) }
             result(nil)
 
         case "resumeSeekPreviews":
-            renderers.values.forEach { $0.seekPreviewPaused = false }
+            sessionRegistry.allRuntimes().forEach { $0.setSeekPreviewPaused(false) }
             result(nil)
 
         // ── P5: Test-only native helpers ────────────────────────────────────────
@@ -1085,7 +1095,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                   let rate      = (args?["rate"] as? NSNumber)?.doubleValue else {
                 result(FlutterError(code: "BAD_ARGS", message: "setPlaybackRate requires textureId and rate", details: nil)); return
             }
-            renderers[textureId]?.setPlaybackRate(rate)
+            // Phase 2 Step 6: playback rate forwarded through runtime.
+            if sessionRegistry.runtime(forTextureId: textureId)?.setPlaybackRate(rate) == nil {
+                NSLog("[VanguardPlugin] runtime not found for textureId %lld", textureId)
+            }
             result(nil)
 
         case "dispose":
@@ -1094,23 +1107,17 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
             let id = textureId.int64Value
 
-            // Unregister texture and remove from map immediately so no new frames are
-            // scheduled. The renderer's GPU / Metal state is torn down synchronously
-            // inside disposeAsync, followed by an async decodeQueue drain.
-            registrar.textures().unregisterTexture(id)
-            let renderer = renderers.removeValue(forKey: id)
-            if renderers.isEmpty { currentMode = .idle }
-
-            // KEY FIX — G-02-T2: disposeAsync defers result(nil) until the source's
-            // decodeQueue is fully drained. This guarantees T1's mediaserverd hardware
-            // decoder session is released BEFORE Dart can call createTexture for T2,
-            // breaking the circular-wait deadlock that caused the test stall.
-            if let renderer = renderer {
-                renderer.disposeAsync {
-                    NSLog("[VanguardPlugin] dispose complete for textureId=\(id) — Dart unblocked")
+            // Phase 2 Step 6: remove from maps, then drain async before unblocking Dart.
+            // removeFromMaps returns the runtime without calling invalidate — we call
+            // invalidateAsync so the decode queue drains before result(nil) fires.
+            // This preserves the G-02-T2 safety guarantee from the legacy disposeAsync path.
+            if let runtime = sessionRegistry.removeFromMaps(textureId: id) {
+                runtime.invalidateAsync {
+                    NSLog("[VanguardPlugin] dispose complete for textureId=%lld — Dart unblocked", id)
                     result(nil)
                 }
             } else {
+                NSLog("[VanguardPlugin] runtime not found for textureId %lld", id)
                 result(nil)
             }
 
