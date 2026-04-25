@@ -24,9 +24,9 @@
 
 #import "VanguardFileMediaSource.h"
 #import "VanguardAudioEngine.h"
-#import "VanguardMasterClock.h"  // P1A-04: concrete clock extracted from this file
-#import <UMF/VGResourceAllocator.h>
+#import "VanguardMasterClock.h" // P1A-04: concrete clock extracted from this file
 #import <AVFoundation/AVFoundation.h>
+#import <UMF/VGResourceAllocator.h>
 #include <mach/mach_time.h> // mach_absolute_time, mach_timebase_info — P5-A latency
 #include <os/lock.h>
 #include <os/signpost.h>
@@ -35,6 +35,25 @@
 // Permanent signpost log — same subsystem as renderer for unified Instruments
 // view
 static os_log_t _sourceLog;
+
+// ── Shared audio-teardown serial queue ─────────────────────────────────────
+// All [AVAudioEngine stop] calls and CVPixelBufferPoolRelease calls are
+// serialized through this queue. This prevents the kernel-level deadlock where
+// coreaudiod holds an IOSurface lock (for audio I/O buffer access) while the
+// pool release is simultaneously trying to reclaim IOSurface memory. The serial
+// ordering guarantees: audio stops → coreaudiod releases lock → pool reclaims.
+//
+// Package-internal linkage: declared extern in VanguardGraphRuntime.m.
+dispatch_queue_t VanguardAudioTeardownQueue(void) {
+  static dispatch_queue_t q;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    q = dispatch_queue_create("com.vanguard.media.audio_teardown",
+                              DISPATCH_QUEUE_SERIAL);
+  });
+  return q;
+}
+
 
 // ── ML enhancement budget ───────────────────────────────────────────────────
 // 1024 samples at 48kHz = 21.3ms window; ML must complete in < 5ms
@@ -161,8 +180,9 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
   //   instead of 67+ (which would flood the run loop and stall Future.delayed).
   double _videoSeekTargetSecs;
 
-  // _audioClockReady, _audioBaseTimeCalibrated: moved to VanguardMasterClock (P1A-04).
-  // See VanguardMasterClock.h for the detailed G-02-T3 and calibration comments.
+  // _audioClockReady, _audioBaseTimeCalibrated: moved to VanguardMasterClock
+  // (P1A-04). See VanguardMasterClock.h for the detailed G-02-T3 and
+  // calibration comments.
 
   // G-02-T3 FIX: deferred audio-engine startup.
   // _setupAudioEngine (which calls [_audioEngine startAndReturnError:]) fires
@@ -201,8 +221,9 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
   // Resolved by VanguardGraphRuntime after allocator arbitration.
   // Defaults to VGAudioRoleActive so Phase 1 / convenience-init paths are
   // unchanged.
-  VGAudioRole _effectiveAudioRole; // read in _setupAudioEngine early-return gate
-  __weak id _owningRuntime;        // weak; used only for relinquishAudioActivation:
+  VGAudioRole
+      _effectiveAudioRole;  // read in _setupAudioEngine early-return gate
+  __weak id _owningRuntime; // weak; used only for relinquishAudioActivation:
 }
 
 // VanguardAudioEngine protocol's masterClock is computed; dynamically returned.
@@ -264,7 +285,7 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
 
   // P1A-06: VGMediaNode identity and invalidation flag.
   atomic_store_explicit(&_invalidated, NO, memory_order_relaxed);
-  _nodeId   = [NSUUID UUID].UUIDString;
+  _nodeId = [NSUUID UUID].UUIDString;
   _nodeType = @"VanguardFileMediaSource";
 
   [self _probeAsset];
@@ -464,9 +485,12 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
   // synchronous blocking call on the main thread. stale completions are already
   // discarded via _seekGeneration comparison.
   //
-  // _drainAndCancelAssetReader cancels the AVAssetReader.  Because setup now
-  // runs on _videoDecodeQueue (see start above), teardown must also run there
-  // to avoid a race where cancel races with the still-running startReading.
+  // cancelReading is thread-safe (Apple docs). Call it synchronously here so
+  // that any copyNextSampleBuffer currently blocking _videoDecodeQueue (e.g.
+  // waiting for a VideoToolbox slot held by a second session) is interrupted
+  // immediately. _drainAndCancelAssetReader then runs on _videoDecodeQueue for
+  // final nil-out and cleanup after the cancellation takes effect.
+  [_assetReader cancelReading];
   __weak __typeof(self) weakSelf = self;
   dispatch_async(_videoDecodeQueue, ^{
     [weakSelf _drainAndCancelAssetReader];
@@ -481,14 +505,18 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
 // start()/stop() or any other production path (C-1).
 // Neither method is called anywhere in production code.
 
-- (void)prepareWithCompletion:(void (^)(NSError * _Nullable))completion {
+- (void)prepareWithCompletion:(void (^)(NSError *_Nullable))completion {
   // Guard: already invalidated — fire completion with an error immediately
   // on a background queue (never synchronously on the caller's thread).
   if (atomic_load_explicit(&_invalidated, memory_order_acquire)) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-      completion([NSError errorWithDomain:@"VGMediaNode" code:-1
-                                userInfo:@{NSLocalizedDescriptionKey:
-                                    @"prepareWithCompletion: called after invalidate"}]);
+      completion([NSError
+          errorWithDomain:@"VGMediaNode"
+                     code:-1
+                 userInfo:@{
+                   NSLocalizedDescriptionKey :
+                       @"prepareWithCompletion: called after invalidate"
+                 }]);
     });
     return;
   }
@@ -499,9 +527,13 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
   dispatch_async(_videoDecodeQueue, ^{
     __strong __typeof(weakSelf) s = weakSelf;
     if (!s || atomic_load_explicit(&s->_invalidated, memory_order_acquire)) {
-      completion([NSError errorWithDomain:@"VGMediaNode" code:-2
-                                userInfo:@{NSLocalizedDescriptionKey:
-                                    @"prepareWithCompletion: invalidated before execution"}]);
+      completion([NSError
+          errorWithDomain:@"VGMediaNode"
+                     code:-2
+                 userInfo:@{
+                   NSLocalizedDescriptionKey :
+                       @"prepareWithCompletion: invalidated before execution"
+                 }]);
       return;
     }
     // _setupAssetReader is idempotent: no-ops if the reader is already ready.
@@ -515,9 +547,9 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
   // CAS ensures only the first caller proceeds: NO → YES.
   // Second and subsequent calls return immediately (idempotent).
   BOOL expected = NO;
-  if (!atomic_compare_exchange_strong_explicit(
-          &_invalidated, &expected, YES,
-          memory_order_acq_rel, memory_order_acquire)) {
+  if (!atomic_compare_exchange_strong_explicit(&_invalidated, &expected, YES,
+                                               memory_order_acq_rel,
+                                               memory_order_acquire)) {
     return;
   }
   // Flag is now YES. Safe to release pre-warmed resources.
@@ -604,7 +636,8 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
   _videoSeekTargetSecs =
       CMTimeGetSeconds(time); // fast-forward gate for readNextFrameForPlayback
   _masterClockImpl.wallOffsetAtPause = time;
-  _masterClockImpl.lastMasterClockSecs = CMTimeGetSeconds(time); // advance floor to seek point
+  _masterClockImpl.lastMasterClockSecs =
+      CMTimeGetSeconds(time); // advance floor to seek point
 
   if (_isPlaying) {
     // MUST reset wall-clock anchor, otherwise masterClock fallback immediately
@@ -983,10 +1016,32 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
 - (CMTime)masterClock {
   // P1A-04: audioEngineReady gating stays here (engine lifecycle is not clock
   // logic). Forward the playing state so the clock's wall-clock fallback knows
-  // whether to advance. The clock guards its own audio path via audioClockReady.
+  // whether to advance. The clock guards its own audio path via
+  // audioClockReady.
   _masterClockImpl.isPlaying = _isPlaying;
   return [_masterClockImpl currentTime];
 }
+
+// ── VGMasterClock protocol — forwarding to _masterClockImpl ──────────────────
+// VanguardFileMediaSource now formally conforms to VGMasterClock so that
+// VanguardGraphRuntime.masterClock is correctly wired (conformsToProtocol:
+// returns YES → runtime.masterClock = source → getMasterClock channel reads
+// runtime.masterClock.currentTime correctly).
+
+- (CMTime)currentTime {
+  // Phase 2: delegates to the master clock (audio or wall-clock fallback).
+  // Also satisfies VGMasterClock.currentTime requirement.
+  return [self masterClock];
+}
+
+- (double)rate {
+  return _masterClockImpl.rate;
+}
+
+- (double)hostTimeAtOrigin {
+  return _masterClockImpl.hostTimeAtOrigin;
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - VanguardMediaSource — Callbacks
@@ -1004,10 +1059,6 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
 #pragma mark - VanguardMediaSource — State Properties
 // ─────────────────────────────────────────────────────────────────────────────
 
-- (CMTime)currentTime {
-  // Phase 2: delegates to the master clock (audio or wall-clock fallback)
-  return [self masterClock];
-}
 
 - (CMTime)duration {
   if (_durationSecs <= 0)
@@ -1058,7 +1109,9 @@ static dispatch_once_t sAudioSessionOnce;
   // When effectiveAudioRole == Active, all code below runs behaviorally
   // identical to Phase 1. No reordering, no added side effects, no removed
   // operations within the existing logic.
-  if (_effectiveAudioRole != VGAudioRoleActive) { return; }
+  if (_effectiveAudioRole != VGAudioRoleActive) {
+    return;
+  }
 
   // Guard: _teardownAudioEngine sets _audioEngineReady = NO so stop+replay
   // re-enters.
@@ -1202,8 +1255,9 @@ static dispatch_once_t sAudioSessionOnce;
       //
       // FIX: capture offset now — sampleTime=0 corresponds to THIS instant,
       //   so (offset + 0) matches the floor exactly and there is no freeze.
-      double wallElapsedAfterPlay = (CACurrentMediaTime() - _masterClockImpl.wallStartTime) +
-                                    CMTimeGetSeconds(_masterClockImpl.wallOffsetAtPause);
+      double wallElapsedAfterPlay =
+          (CACurrentMediaTime() - _masterClockImpl.wallStartTime) +
+          CMTimeGetSeconds(_masterClockImpl.wallOffsetAtPause);
       _masterClockImpl.audioBaseTimeOffset =
           MAX(wallElapsedAfterPlay, CMTimeGetSeconds(_currentTime));
       // [_playerNode play] has returned — the internal AVAudioPlayerNode lock
@@ -1446,16 +1500,25 @@ static const NSInteger kAudioChunkFrames =
 }
 
 - (void)_teardownAudioEngine {
+  // Signal any in-flight _setupAudioEngine to abort UNCONDITIONALLY — before
+  // the guard below. If _audioEngineReady is still NO (setup not yet complete),
+  // the guard would return early and skip this signal, allowing _setupAudioEngine
+  // to complete, set _audioEngine to a live instance, and set _audioEngineReady=YES.
+  // dealloc would then call _teardownAudioEngine again with a live engine,
+  // dispatching [engineToStop stop] to background → 3+ minute kernel suspension.
+  atomic_store_explicit(&_audioSetupCancelled, YES, memory_order_relaxed);
+  atomic_store_explicit(&_schedulingChunks, NO, memory_order_relaxed);
+
+  // Idempotency guard: _audioEngineReady is set NO at the end of the first
+  // call. dealloc and any redundant callers return immediately here.
+  if (!_audioEngineReady) return;
+
   // Phase 2: relinquish the audio activation slot before any engine teardown.
   // Must be the first call — frees the slot for the next createSession
   // immediately, regardless of how long the remaining teardown takes.
-  [[VGResourceAllocator sharedInstance] relinquishAudioActivation:_owningRuntime];
+  [[VGResourceAllocator sharedInstance]
+      relinquishAudioActivation:_owningRuntime];
 
-  // Signal any in-flight background _setupAudioEngine to abort BEFORE we touch
-  // engine state — this prevents the race between teardown and async audio
-  // setup.
-  atomic_store_explicit(&_audioSetupCancelled, YES, memory_order_relaxed);
-  atomic_store_explicit(&_schedulingChunks, NO, memory_order_relaxed);
   // Reset clock guard — audio is no longer playing. (P1A-04: via clock object)
   _masterClockImpl.audioClockReady = NO;
   _masterClockImpl.lastMasterClockSecs = 0.0;
@@ -1463,12 +1526,21 @@ static const NSInteger kAudioChunkFrames =
     [_timePitchNode removeTapOnBus:0];
   } @catch (NSException *e) { /* tap wasn't installed */
   }
-  [_audioEngine stop];
+  // Mark engine as inactive and nil ivars BEFORE dispatching stop.
+  // [AVAudioEngine stop] issues XPC to coreaudiod. Moving stop off _prepareQueue
+  // lets the drain sentinel fire and result(nil) reach Dart without waiting for
+  // coreaudiod.
+  AVAudioEngine *engineToStop = _audioEngine;
   _audioEngineReady = NO;
   _playerNode = nil;
   _timePitchNode = nil;
   _pcmFormat = nil;
   _audioEngine = nil;
+  if (engineToStop) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      [engineToStop stop];
+    });
+  }
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -1496,7 +1568,8 @@ static const NSInteger kAudioChunkFrames =
 // Full audio+video quiescence is handled in later phases if required.
 - (void)awaitDecoderDrainWithCompletion:(dispatch_block_t)completion {
   dispatch_async(_videoDecodeQueue, ^{
-    if (completion) completion();
+    if (completion)
+      completion();
   });
 }
 
@@ -1663,9 +1736,6 @@ static const NSInteger kAudioChunkFrames =
 // ─────────────────────────────────────────────────────────────────────────────
 
 - (void)_setupAssetReader {
-  NSLog(@"[VDR-ENTRY] _setupAssetReader entered: assetReader=%@ cachedAsset=%@",
-        _assetReader ? @"set" : @"nil",
-        _cachedAsset ? @"set" : @"nil");
   // Guard: pre-warm in initWithURL: may have already completed setup.
   // _drainAndCancelAssetReader sets _assetReader = nil, so stop+replay
   // re-enters correctly.
@@ -1729,10 +1799,7 @@ static const NSInteger kAudioChunkFrames =
 
   _videoOutput = output;
   [_assetReader addOutput:_videoOutput];
-  BOOL started = [_assetReader startReading];
-  NSLog(@"[VDR-DIAG] _setupAssetReader: started=%d status=%ld error=%@",
-        started, (long)_assetReader.status,
-        _assetReader.error.localizedDescription ?: @"(none)");
+  [_assetReader startReading];
 }
 
 /// T2: Drain all CMSampleBuffers before cancelReading.
@@ -1750,16 +1817,9 @@ static const NSInteger kAudioChunkFrames =
   // stop()
   AVAssetReader *reader = _assetReader;
   AVAssetReaderOutput *output = _videoOutput;
-  NSLog(@"[VDR-ENTRY] readNextFrame entered: reader=%@ status=%ld output=%@",
-        reader ? @"set" : @"nil",
-        reader ? (long)reader.status : -1L,
-        output ? @"set" : @"nil");
+  // [VDR-ENTRY]/[SRC1] removed — per-frame, high-frequency
 
   if (!reader || reader.status != AVAssetReaderStatusReading || !output) {
-    NSLog(@"[VDR-DIAG] readNextFrame: early-exit reader=%@ status=%ld output=%@",
-          reader ? @"set" : @"nil",
-          reader ? (long)reader.status : -1L,
-          output ? @"set" : @"nil");
     return NO;
   }
 
@@ -1783,18 +1843,13 @@ static const NSInteger kAudioChunkFrames =
 
   CMSampleBufferRef sampleBuffer = [output copyNextSampleBuffer];
   if (!sampleBuffer) {
-    NSLog(@"[VDR-DIAG] readNextFrame: copyNextSampleBuffer=NULL reader.status=%ld",
-          (long)reader.status);
+    // No sample — check EOF
+    if (reader.status == AVAssetReaderStatusCompleted) {
+      // [SRC4] EOF — reader finished normally
+    }
     return NO;
   }
-  {
-    static BOOL _firstSample = YES;
-    if (_firstSample) {
-      _firstSample = NO;
-      double pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer));
-      NSLog(@"[VDR-DIAG] readNextFrame: first sample PTS=%.4fs", pts);
-    }
-  }
+  // First-sample first-PTS logging removed (playback confirmed stable)
 
   if (targetSecs > 0) {
     // Fast-forward: discard frames below the seek target.
@@ -1807,6 +1862,9 @@ static const NSInteger kAudioChunkFrames =
       CFRelease(sampleBuffer);
       sampleBuffer = [output copyNextSampleBuffer];
       if (!sampleBuffer) {
+        NSLog(@"[TRACE][SRC4] EOF during fast-forward seek: skipped=%ld "
+              @"targetSecs=%.4f status=%ld",
+              (long)skipped, targetSecs, (long)reader.status);
         return NO;
       }
     }
@@ -1817,6 +1875,7 @@ static const NSInteger kAudioChunkFrames =
   if (pixelBuffer && _videoCallback) {
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
     _currentTime = pts;
+    // [SRC2] per-frame pts log removed — high-frequency
     // Audio startup handled by the 1200ms dispatch_after in start().
     // No trigger here — avoids firing coreaudiod IPC at T+20ms which
     // races with getMasterClockSeconds at T+25ms (T3 settle-start deadlock).

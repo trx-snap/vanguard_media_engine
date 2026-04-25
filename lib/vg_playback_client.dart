@@ -1,23 +1,19 @@
 // vg_playback_client.dart
-// Vanguard Media Engine — Phase 1B, P1B-08
+// Vanguard Media Engine — Phase 1B, P1B-08 / Phase 2 Step 0
 //
 // Factory for [VGPlaybackSession]. Calls the `createTexture` method channel and
-// safely normalises both the legacy integer return and the new map return into a
-// [VGPlaybackSession].
+// safely normalises the returned map into a [VGPlaybackSession].
 //
 // Design constraints honoured:
 //   C-2 — Not exported from the public barrel file yet.
 //   C-4 — No changes to any existing production code path.
 //   C-6 — Zero reference to VanguardMetalRenderer or C++ FFI bindings.
 //
-// Return-type flexibility:
-//   Legacy path (useGraphRuntime = false): native returns a Map with at minimum
-//     { 'textureId': int }; may also have 'width' and 'height'.
-//   New graph-runtime path (useGraphRuntime = true): same Map shape with an
-//     additional 'sessionId' String key.
-//   In both cases this client constructs a VGPlaybackSession. When sessionId is
-//   absent (legacy path), a synthetic placeholder is used so the VGPlaybackSession
-//   contract (non-null sessionId) is always satisfied.
+// Phase 2 Step 0: VGPhase1Config.useGraphRuntime deleted. The registry path
+// (VGSessionRegistry + VanguardGraphRuntime) is now unconditional. Native
+// always returns a Map with {textureId, sessionId, width, height}. The
+// synthetic 'legacy-{textureId}' sessionId fallback is retained defensively
+// for any call site that may omit sessionId, but is not expected to be reached.
 
 import 'package:flutter/services.dart';
 import 'vg_playback_session.dart';
@@ -46,20 +42,32 @@ abstract final class VGPlaybackClient {
   ///   - New graph-runtime path: `{ 'textureId': int, 'sessionId': String, ...}`
   ///   - Legacy renderer path:   `{ 'textureId': int, 'width': int, 'height': int }`
   ///
+  /// When [muted] is true the native session is created with [VGAudioRole.muted],
+  /// so it never contends for the active audio slot. Defaults to false (active).
+  ///
   /// Throws a [PlatformException] or [StateError] if the native side fails to
   /// create the texture (e.g. file not found, GPU out of memory).
-  static Future<VGPlaybackSession> createSession(String url) async {
-    final (:session, raw: _) = await createSessionRaw(url);
+  static Future<VGPlaybackSession> createSession(
+    String url, {
+    bool muted = false,
+  }) async {
+    final (:session, raw: _) = await createSessionRaw(url, muted: muted);
     return session;
   }
 
   /// Like [createSession] but also returns the raw native map so callers can
   /// extract extra fields (e.g. `width`, `height`) without a second channel call.
   ///
+  /// [muted] is forwarded to the native `createTexture` handler as the
+  /// `muted` key. See [createSession] for the full contract.
+  ///
   /// Returns a record `({VGPlaybackSession session, Map<Object?, Object?>? raw})`.
   static Future<({VGPlaybackSession session, Map<Object?, Object?>? raw})>
-      createSessionRaw(String url) async {
-    final raw = await _channel.invokeMethod<Object>('createTexture', {'path': url});
+      createSessionRaw(String url, {bool muted = false}) async {
+    final raw = await _channel.invokeMethod<Object>(
+      'createTexture',
+      {'path': url, 'muted': muted},
+    );
 
     if (raw == null) {
       throw StateError('[VGPlaybackClient] createTexture returned null for: $url');

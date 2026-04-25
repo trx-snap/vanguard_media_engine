@@ -18,6 +18,7 @@
 #import "VanguardAudioEngine.h"
 #import "VanguardPlaybackTypes.h"   // VGAudioRole — shared enum (single definition)
 #import <UMF/VGMediaNode.h>
+#import <UMF/VGMasterClock.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
 
@@ -28,7 +29,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// whose AVAudioPlayerNode provides the master clock for video synchronisation.
 /// When effectiveAudioRole == Muted the audio engine is not started and the
 /// source runs on the wall-clock fallback path.
-@interface VanguardFileMediaSource : NSObject <VanguardMediaSource, VanguardAudioEngine, VGMediaNode>
+@interface VanguardFileMediaSource : NSObject <VanguardMediaSource, VanguardAudioEngine, VGMediaNode, VGMasterClock>
 
 /// Designated initialiser — preferred for Phase 2 multi-instance use.
 /// @param url               Local file URL (must be reachable while source is active)

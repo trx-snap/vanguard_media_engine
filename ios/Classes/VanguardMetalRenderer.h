@@ -78,6 +78,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// T1's mediaserverd hardware decoder session is still live.
 - (void)disposeAsync:(dispatch_block_t)completion;
 
+/// Unregisters the Flutter texture from the registry.
+/// Must be called on the main thread AFTER result(nil) has been sent to Dart.
+/// Separated from -dispose so that -dispose can complete synchronously on
+/// _prepareQueue without blocking on Flutter's raster-thread latch.
+- (void)doUnregisterTexture;
+
 // ─── Flutter Texture ──────────────────────────────────────────────────────
 
 @property (readonly, nonatomic) int64_t textureId;

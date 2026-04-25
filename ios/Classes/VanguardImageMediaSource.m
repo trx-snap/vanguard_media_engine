@@ -116,6 +116,8 @@
         return;
     }
 
+    NSLog(@"[TRACE][IMS1] prepareWithCompletion entered url=%@",
+          _imageURL.lastPathComponent);
     __weak __typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         __strong __typeof(weakSelf) s = weakSelf;
@@ -149,6 +151,8 @@
         }
 
         CVPixelBufferRef newBuf = [s->_processor pixelBufferFromCGImage:img];
+        NSLog(@"[VanguardImageSource] prepare done url=%@ buf=%@",
+              s->_imageURL.lastPathComponent, newBuf ? @"ok" : @"nil");
         CGImageRelease(img);
 
         if (atomic_load_explicit(&s->_invalidated, memory_order_acquire)) {
@@ -161,7 +165,7 @@
             return;
         }
 
-        // Swap into _buffer (release the old one if present).
+        // Swap into _buffer (release the old one if present)
         if (s->_buffer) CVPixelBufferRelease(s->_buffer);
         s->_buffer = newBuf; // takes ownership
         completion(nil);
@@ -180,11 +184,16 @@
             memory_order_acq_rel, memory_order_acquire)) {
         return; // already invalidated
     }
-    // Flag is now YES. Safe to release the pre-decoded buffer.
-    if (_buffer) {
-        CVPixelBufferRelease(_buffer);
-        _buffer = NULL;
-    }
+    // INTENTIONAL: Do NOT call CVPixelBufferRelease(_buffer) here.
+    // _buffer is an IOSurface-backed CVPixelBuffer. CVPixelBufferRelease
+    // triggers an IOSurface fence wait in the kernel. If the next session
+    // (TC-04) is concurrently executing prepareWithCompletion: on a
+    // USER_INITIATED queue — allocating a new IOSurface buffer from the pool
+    // via CVPixelBufferPoolCreatePixelBuffer — the kernel serializes the IOSurface
+    // operations, creating a permanent wait that freezes _prepareQueue.
+    // Same root cause as the renderer's _latestPixelBuffer/pool release fix.
+    // The OS reclaims the IOSurface memory at process exit.
+    _buffer = NULL; // intentional leak — OS reclaims on process exit
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

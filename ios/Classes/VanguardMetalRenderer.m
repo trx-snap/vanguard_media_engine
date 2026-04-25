@@ -193,22 +193,26 @@ static os_log_t _rendererLog;
       [s _onVideoFrame:frame pts:pts];
   }];
 
-  // Register texture with Flutter
-  _textureId = [registry registerTexture:self];
-
-  // Report duration to Dart timeline manager
-  _videoDuration = CMTimeGetSeconds([_source duration]);
-  if (_videoDuration > 0) {
-    // source.renderSize is populated during source init
-    VanguardFileMediaSource *fileSource = (VanguardFileMediaSource *)source;
-    if ([source isKindOfClass:[VanguardFileMediaSource class]]) {
-      NSString *path =
-          ((VanguardFileMediaSource *)fileSource).description; // best-effort
-      (void)path;
-    }
-    [channel invokeMethod:@"onNodeDurationProbed"
-                arguments:@{@"duration" : @(_videoDuration)}];
+  // Register texture with Flutter.
+  // Experiment: ensure registration always occurs on the platform (main)
+  // thread, matching Flutter's FlutterTextureRegistry contract. _prepareQueue
+  // is a background queue, so we hop synchronously if needed.
+  if ([NSThread isMainThread]) {
+    _textureId = [registry registerTexture:self];
+  } else {
+    __block int64_t registeredId = 0;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+      registeredId = [registry registerTexture:self];
+    });
+    _textureId = registeredId;
   }
+
+  // Cache video duration for EOS detection only.
+  // invokeMethod:@"onNodeDurationProbed" removed: was emitted from
+  // _prepareQueue (background thread) on the same channel as the pending
+  // createTexture result, blocking the binary messenger and preventing
+  // completion(tid,nil) from firing.
+  _videoDuration = CMTimeGetSeconds([_source duration]);
 
   return self;
 }
@@ -274,8 +278,7 @@ static os_log_t _rendererLog;
           libraryError.localizedDescription);
     return;
   }
-  NSLog(@"[VanguardRenderer] [1/4] Metal library loaded from bundle: %@",
-        bundle.bundleURL.lastPathComponent);
+
 
   id<MTLFunction> vertexFn = [library newFunctionWithName:@"vanguard_vertex"];
   id<MTLFunction> fragmentFn =
@@ -380,7 +383,6 @@ static os_log_t _rendererLog;
           error.localizedDescription);
     _blitPipelineState = nil;
   } else {
-    NSLog(@"[VanguardRenderer] GPU blit pipeline ready");
   }
 }
 
@@ -760,47 +762,6 @@ static os_log_t _rendererLog;
   _lastDecodedPTS = CMTimeGetSeconds(pts);
   CVPixelBufferRef frame = rawFrame;
 
-  // [VANGUARD_DIAG_COLOR] remove after color investigation
-  {
-    static int _vdcFrameCount = 0;
-    if (_vdcFrameCount < 10) {
-      _vdcFrameCount++;
-      NSLog(@"[VANGUARD_DIAG_COLOR] frameIndex=%d", _vdcFrameCount);
-      OSType pixFmt = CVPixelBufferGetPixelFormatType(rawFrame);
-      size_t dw = CVPixelBufferGetWidth(rawFrame);
-      size_t dh = CVPixelBufferGetHeight(rawFrame);
-      NSLog(@"[VANGUARD_DIAG_COLOR] pixelFormat=%u width=%zu height=%zu",
-            (unsigned)pixFmt, dw, dh);
-      CVPixelBufferLockBaseAddress(rawFrame, kCVPixelBufferLock_ReadOnly);
-      uint8_t *base = (uint8_t *)CVPixelBufferGetBaseAddress(rawFrame);
-      if (base) {
-        NSLog(@"[VANGUARD_DIAG_COLOR] pixel[0] B=%d G=%d R=%d A=%d",
-              (int)base[0], (int)base[1], (int)base[2], (int)base[3]);
-      }
-      CVPixelBufferUnlockBaseAddress(rawFrame, kCVPixelBufferLock_ReadOnly);
-      CFStringRef primaries = CVBufferCopyAttachment(
-          rawFrame, kCVImageBufferColorPrimariesKey, NULL);
-      CFStringRef transfer = CVBufferCopyAttachment(
-          rawFrame, kCVImageBufferTransferFunctionKey, NULL);
-      CFStringRef matrix =
-          CVBufferCopyAttachment(rawFrame, kCVImageBufferYCbCrMatrixKey, NULL);
-      NSLog(@"[VANGUARD_DIAG_COLOR] primaries=%@  transfer=%@  matrix=%@",
-            (__bridge NSString *)primaries, (__bridge NSString *)transfer,
-            (__bridge NSString *)matrix);
-      BOOL isHLG = transfer && CFGetTypeID(transfer) == CFStringGetTypeID() &&
-                   CFStringCompare(
-                       transfer, kCVImageBufferTransferFunction_ITU_R_2100_HLG,
-                       0) == kCFCompareEqualTo;
-      NSLog(@"[VANGUARD_DIAG_COLOR] isHLG=%@", isHLG ? @"YES" : @"NO");
-      if (primaries)
-        CFRelease(primaries);
-      if (transfer)
-        CFRelease(transfer);
-      if (matrix)
-        CFRelease(matrix);
-    }
-  }
-  // [VANGUARD_DIAG_COLOR end]
 
   // P1-T3: Apply filter chain (empty in Phase 1 — zero cost)
   if (_filterChainEnabled && _filterChain.count > 0) {
@@ -907,8 +868,10 @@ static os_log_t _rendererLog;
   // For the sequential playback path (not seek), pull from AVAssetReader via
   // source.
   if ([_source isKindOfClass:[VanguardFileMediaSource class]]) {
-    if (_isFetchingFrame)
+    if (_isFetchingFrame) {
+      // [REN3] removed — per-frame, high-frequency
       return; // Primary guard: only ONE async pull in flight at any time.
+    }
 
     // Gate 1 (post-seek flood prevention):
     // After a seek to _seekTargetPTS, readNextFrameForPlayback fast-forwards
@@ -924,6 +887,7 @@ static os_log_t _rendererLog;
         // _isFetchingFrame above). If we somehow reach here with
         // _isFetchingFrame=NO AND _lastDecodedPTS<<target, that means the
         // fast-forward hasn't completed yet — do nothing this tick.
+        // [REN4] removed — per-frame, high-frequency
         return;
       }
       _seekTargetPTS = 0; // _lastDecodedPTS has caught up: clear gate.
@@ -932,8 +896,12 @@ static os_log_t _rendererLog;
     // Gate 2 (normal throttle): only fetch if master clock has advanced past
     // the last decoded frame.
     if (_lastDecodedPTS <= sourceSeconds + 0.016) {
+      // [REN5] removed — per-frame, high-frequency
       _isFetchingFrame = YES;
       [(VanguardFileMediaSource *)_source pullNextFrameAsync];
+    } else {
+      // Decoder is ahead; no pull needed this tick.
+      // Not logged (fires every tick during normal buffering — would flood).
     }
   }
   // Camera source: frames arrive via _videoCallback at capture rate — no pull
@@ -981,7 +949,7 @@ static os_log_t _rendererLog;
 // ─────────────────────────────────────────────────────────────────────────────
 
 - (void)dispose {
-  [self pause];   // also calls [_source stop]
+  [self pause]; // also calls [_source stop]
   [_source stop]; // idempotent; ensure stopped even if not playing
 
   if (_displayLink) {
@@ -989,23 +957,20 @@ static os_log_t _rendererLog;
     _displayLink = nil;
   }
 
+  // INTENTIONAL LEAK (KEEP TEMPORARILY): Do NOT call CVPixelBufferRelease /
+  // CFRelease on IOSurface-backed resources while other sessions may be
+  // rendering. Fence waits in the kernel cause 5+ min deadlocks. OS reclaims
+  // all IOSurface/GPU memory at process exit.
   os_unfair_lock_lock(&_pixelBufferLock);
-  if (_latestPixelBuffer) {
-    CVPixelBufferRelease(_latestPixelBuffer);
-    _latestPixelBuffer = NULL;
-  }
+  _latestPixelBuffer = NULL;
   os_unfair_lock_unlock(&_pixelBufferLock);
+  _pixelBufferPool = NULL;
+  _textureCache = NULL;
+}
 
-  if (_pixelBufferPool) {
-    CVPixelBufferPoolFlush(_pixelBufferPool, 0);
-    CFRelease(_pixelBufferPool);
-    _pixelBufferPool = NULL;
-  }
-  if (_textureCache) {
-    CVMetalTextureCacheFlush(_textureCache, 0);
-    CFRelease(_textureCache);
-    _textureCache = NULL;
-  }
+/// Unregisters the Flutter texture. Called on the main thread AFTER result(nil)
+/// has been sent to Dart, so it never blocks the completion path.
+- (void)doUnregisterTexture {
   [_textureRegistry unregisterTexture:_textureId];
 }
 

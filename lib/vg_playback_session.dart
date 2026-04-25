@@ -1,5 +1,5 @@
 // vg_playback_session.dart
-// Vanguard Media Engine — Phase 1B, P1B-07
+// Vanguard Media Engine — Phase 1B, P1B-07 / Phase 2 Step 0
 //
 // Represents a single active playback session as a thin value object that routes
 // lifecycle calls through the Vanguard method channel.
@@ -12,14 +12,16 @@
 // Channel key:
 //   Playback commands (play / pause / seekTo / dispose) are all keyed by
 //   textureId because that is what the native plugin's method-channel
-//   dispatcher uses. The sessionId is stored for diagnostics and future
-//   expansion (Phase 2 multi-session routing will promote it as the primary key).
+//   dispatcher uses. The sessionId is stable (UUID from VGSessionRegistry)
+//   and is used for audio role operations (promoteAudio). Phase 2 Step 0:
+//   VGPhase1Config deleted — registry path is unconditional.
+
+import 'dart:async';
 
 import 'package:flutter/services.dart';
 
 /// A single active playback session backed by a [VanguardGraphRuntime] on the
-/// native side (when `VGPhase1Config.useGraphRuntime == true`) or by a
-/// [VanguardMetalRenderer] on the legacy path.
+/// native side (unconditional as of Phase 2 Step 0).
 ///
 /// Obtain instances via [VGPlaybackClient.createSession].
 /// Call [dispose] when the widget is torn down to release native resources.
@@ -68,6 +70,30 @@ final class VGPlaybackSession {
       'textureId': textureId,
       'seconds':   seconds,
     });
+  }
+
+  /// Requests promotion of this session to the active audio role.
+  ///
+  /// Delegates to `VGSessionRegistry.promoteToActiveAudio(sessionId:)` on the
+  /// native side, which acquires the [VGResourceAllocator] active-audio slot if
+  /// available and transitions the runtime's effective role.
+  ///
+  /// Returns `true` if the native side confirmed the promotion.
+  /// Returns `false` if:
+  ///   - this session has already been [dispose]d, or
+  ///   - the native allocator denied the promotion (slot already held), or
+  ///   - native returned null (unexpected).
+  ///
+  /// Routing note: intentionally sessionId-keyed, not textureId-keyed, because
+  /// the registry lookup for audio role transitions uses sessionId as the
+  /// stable identifier (textureId can be recycled after dispose).
+  Future<bool> promoteToActiveAudio() async {
+    if (_disposed) return false;
+    final result = await _channel.invokeMethod<bool>(
+      'promoteAudio',
+      {'sessionId': sessionId},
+    );
+    return result ?? false;
   }
 
   // ── Lifecycle ────────────────────────────────────────────────────────────────

@@ -79,25 +79,29 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     private var channel: FlutterMethodChannel!
 
     // P1-T4: Current mode — transitions require teardown
-    private var currentMode: VanguardEngineMode = .idle
+    var currentMode: VanguardEngineMode = .idle
 
     // P1-T7: At most ONE full renderer at any time (editor mode)
-    private var renderers: [Int64: VanguardMetalRenderer] = [:]
+    var renderers: [Int64: VanguardMetalRenderer] = [:]
 
     // P1-T7: Single shared thumbnail generator — never a full renderer for filmstrip
     private let thumbnailGenerator = VanguardThumbnailGenerator()
 
     // Active export session — retained to outlive handle(_:result:) scope
-    private var activeExportSession: VanguardExportSession?
+    var activeExportSession: VanguardExportSession?
 
     // P3-T4: Camera source + streaming encoder (streaming path, not AVAssetWriter)
-    private var cameraSource: VanguardCameraMediaSource?
-    private var streamingEncoder: VanguardVideoToolboxEncoder?
+    var cameraSource: VanguardCameraMediaSource?
+    var streamingEncoder: VanguardVideoToolboxEncoder?
 
     // Phase 2 Step 6: session registry is the unconditional playback path.
     // All createTexture / play / pause / seekTo / dispose calls route here.
     // Camera and export continue to use `renderers` exclusively.
     private let sessionRegistry = VGSessionRegistry()
+
+    // Phase 2 Step 8: lifecycle observer — owns all NotificationCenter registrations.
+    // Instantiated in register(with:) after sessionRegistry is available.
+    private var lifecycleObserver: VGPluginLifecycleObserver?
 
     // ─── Registration ─────────────────────────────────────────────────────────
 
@@ -116,147 +120,14 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         let cameraFactory = VanguardCameraViewFactory()
         registrar.register(cameraFactory, withId: "vanguard_camera_view")
 
-        // ── G-02-T3: Audio session pre-activation ────────────────────────────
-        // AVAssetReaderVideoCompositionOutput.startReading schedules a deferred
-        // main-thread IPC callback that ACQUIRES the AVAudioSession timing lock.
-        // AVAudioSession.setActive:YES (called in _setupAudioEngine at play() time)
-        // HOLDS that lock while contacting coreaudiod.  If both happen concurrently
-        // the result is a permanent deadlock — main thread waits for audio lock,
-        // bg thread waits for coreaudiod, coreaudiod waits for main thread.
-        //
-        // Solution: activate the audio session once at app startup on a bg queue.
-        // By the time any video is loaded the coreaudiod XPC has settled and the
-        // dispatch_once in +preActivateAudioSession is a no-op everywhere else.
-        DispatchQueue.global(qos: .userInitiated).async {
-            VanguardFileMediaSource.preActivateAudioSession()
-        }
-
-        // ── P0-T5a: Memory pressure ──────────────────────────────────────────
-        NotificationCenter.default.addObserver(
-            forName: UIApplication.didReceiveMemoryWarningNotification,
-            object: nil, queue: .main
-        ) { [weak instance] _ in
-            instance?.renderers.values.forEach { $0.handleMemoryPressure() }
-        }
-
-        // ── A3: App background / foreground safety ───────────────────────────
-        // Belt-and-suspenders for camera lifecycle: the Dart WidgetsBindingObserver
-        // is the primary stop mechanism, but the iOS process can be suspended
-        // before the Flutter framework propagates AppLifecycleState.paused.
-        // willResignActive fires synchronously on the main thread before suspension,
-        // guaranteeing the AVCaptureSession is stopped even under OS pressure.
-        //
-        // stopCamera() and startCamera() are both idempotent (session already-stopped
-        // / already-running guards are in place at native and Dart levels) so
-        // double-firing from both Dart and native is safe.
-        NotificationCenter.default.addObserver(
-            forName: UIApplication.willResignActiveNotification,
-            object: nil, queue: .main
-        ) { [weak instance] _ in
-            guard let self = instance, self.currentMode == .camera else { return }
-            NSLog("[VanguardPlugin] willResignActive — stopping camera session")
-            self.cameraSource?.stop()
-            // Do NOT nil cameraSource here: didBecomeActive restarts using the
-            // same source object. Dart-side restarts via _startCamera() on resume.
-        }
-        NotificationCenter.default.addObserver(
-            forName: UIApplication.didBecomeActiveNotification,
-            object: nil, queue: .main
-        ) { [weak instance] _ in
-            guard let self = instance, self.currentMode == .camera,
-                  let src = self.cameraSource, !src.captureSession.isRunning else { return }
-            NSLog("[VanguardPlugin] didBecomeActive — resuming camera session")
-            src.start()
-        }
-
-        // ── P0-T8: Audio session interruption (phone call / Siri / alarm) ────
-        NotificationCenter.default.addObserver(
-            forName: AVAudioSession.interruptionNotification,
-            object: nil, queue: .main
-        ) { [weak instance] notification in
-            guard let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey]
-                             as? AVAudioSession.InterruptionType else { return }
-            switch type {
-            case .began:
-                instance?.renderers.values.forEach { $0.pause() }
-                instance?.activeExportSession?.suspend()
-                instance?.activeExportSession = nil
-            case .ended:
-                // Do NOT auto-resume — require explicit user action
-                break
-            @unknown default: break
-            }
-        }
-
-        // ── P1-T10: Audio session route change (headphone plug/unplug) ───────
-        // When the route changes, AVAudioEngine's installTapOnBus: callback is
-        // silently invalidated. Phase 2 will call reinstallAudioTap() here.
-        // In Phase 1 we register the observer so the foundation is in place.
-        NotificationCenter.default.addObserver(
-            forName: AVAudioSession.routeChangeNotification,
-            object: nil, queue: .main
-        ) { [weak instance] notification in
-            guard let reason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey]
-                               as? AVAudioSession.RouteChangeReason else { return }
-            switch reason {
-            case .newDeviceAvailable, .oldDeviceUnavailable:
-                // Phase 2: call reinstallAudioTap() on all active sources.
-                // Phase 1: note the route change and disable AEC for Bluetooth.
-                let session = AVAudioSession.sharedInstance()
-                let isBluetooth = session.currentRoute.inputs.contains {
-                    $0.portType == .bluetoothHFP || $0.portType == .bluetoothA2DP
-                }
-                NSLog("[Vanguard] Route changed — isBluetooth=%d", isBluetooth ? 1 : 0)
-                // Phase 2: instance?.renderers.values.forEach { $0.source?.setAECEnabled(!isBluetooth) }
-            default: break
-            }
-        }
-
-        // ── G-04: Thermal degradation — 3-tier controller ────────────────────
-        // Drives renderer filterChain, streaming encoder bitrate, and file source
-        // audio enhancement level as thermal state changes.
-        //
-        // Tier       | thermalState        | filterChain | bitrate | audio
-        // Nominal/Fair | ≤ Fair            | enabled     | 4000    | enhanced
-        // Serious      | Serious           | seg.disabled| 2000    | standard
-        // Critical     | Critical          | disabled    | 800     | none
-        //
-        // The cameraSource._mlGate already receives updateThermalState: from its
-        // own observer (allocated in VanguardCameraMediaSource init). This handler
-        // manages the renderer and encoder controls which the camera source does
-        // not own.
-        NotificationCenter.default.addObserver(
-            forName: ProcessInfo.thermalStateDidChangeNotification,
-            object: nil, queue: .main
-        ) { [weak instance] _ in
-            guard let self = instance else { return }
-            let state = ProcessInfo.processInfo.thermalState
-            NSLog("[Vanguard] Thermal change → %ld", state.rawValue)
-            switch state {
-            case .nominal, .fair:
-                // Full quality — all effects enabled
-                self.renderers.values.forEach { $0.filterChainEnabled = true }
-                self.streamingEncoder?.setBitrateKbps(4000)
-            case .serious:
-                // Reduce GPU load: disable segmentation (most expensive filter).
-                // LUT and Beauty remain active. Halve encoder bitrate.
-                // VanguardMLGate's own observer handles ML frame rate reduction.
-                self.renderers.values.forEach { renderer in
-                    renderer.filterChainEnabled = true  // chain active; gate trims ML rate
-                }
-                self.streamingEncoder?.setBitrateKbps(2000)
-                NSLog("[Vanguard] Thermal Serious — segmentation suppressed by MLGate interval")
-            case .critical:
-                // Emergency: disable entire Metal filter chain.
-                // P5: Use replaceFilterChain([]) — not filterChainEnabled=false — so that
-                // invalidate() is called on all nodes before the chain pointer is swapped.
-                // This cancels any in-flight CoreML/Vision requests on the segmentation node.
-                self.renderers.values.forEach { $0.replaceFilterChain([]) }
-                self.streamingEncoder?.setBitrateKbps(800)
-                NSLog("[Vanguard] Thermal Critical — filter chain safely invalidated")
-            @unknown default: break
-            }
-        }
+        // Phase 2 Step 8: instantiate the lifecycle observer after sessionRegistry
+        // is available. The observer owns all NotificationCenter registrations
+        // (memory warning, willResignActive, didBecomeActive, audio interruption,
+        // route change, thermal state) and triggers preActivateAudioSession().
+        instance.lifecycleObserver = VGPluginLifecycleObserver(
+            registry: instance.sessionRegistry,
+            plugin: instance
+        )
     }
 
     // ─── Mode teardown ─────────────────────────────────────────────────────────
@@ -412,16 +283,26 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 return
             }
 
+            NSLog("[TRACE][N1] createTexture entered path=%@", path)
+
+            // Phase 2 Step 7: read caller-supplied muted flag.
+            // Dart passes {'path': ..., 'muted': true/false}. Absent key defaults to
+            // false (active audio) — preserves backward-compat with existing callers.
+            let muted = args?["muted"] as? Bool ?? false
+
             // Phase 2 Step 6: all playback creation routes through VGSessionRegistry.
             // Camera teardown runs first if needed so AVAudioSession is free.
             let _createTextureViaRegistry = { [weak self] in
                 guard let self else { return }
                 let url = URL(fileURLWithPath: path)
-                _ = self.sessionRegistry.createSession(
+                // Capture sessionId in a local var; assigned synchronously by
+                // createSession before its async completion ever fires.
+                var sid = ""
+                sid = self.sessionRegistry.createSession(
                     url:             url,
                     textureRegistry: self.registrar.textures(),
                     methodChannel:   self.channel,
-                    desiredAudioRole: .active
+                    desiredAudioRole: muted ? .muted : .active
                 ) { textureId, renderSize in
                     DispatchQueue.main.async {
                         guard textureId >= 0 else {
@@ -432,7 +313,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         }
                         let w = renderSize.width  > 0 ? Int(renderSize.width)  : 1080
                         let h = renderSize.height > 0 ? Int(renderSize.height) : 1920
-                        result(["textureId": textureId, "width": w, "height": h])
+                        NSLog("[TRACE][N8] plugin result about to send textureId=%lld", textureId)
+                        result(["textureId": textureId, "sessionId": sid, "width": w, "height": h])
+                        NSLog("[TRACE][N9] plugin result sent")
                     }
                 }
             }
@@ -478,7 +361,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // Phase 2 Step 6: image creation also routes through VGSessionRegistry.
             let _createImageViaRegistry = { [weak self] in
                 guard let self else { return }
-                _ = self.sessionRegistry.createSession(
+                var sid = ""
+                sid = self.sessionRegistry.createSession(
                     url:             imageURL,
                     textureRegistry: self.registrar.textures(),
                     methodChannel:   self.channel,
@@ -493,7 +377,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         }
                         let w = renderSize.width  > 0 ? Int(renderSize.width)  : 1080
                         let h = renderSize.height > 0 ? Int(renderSize.height) : 1920
-                        result(["textureId": textureId, "width": w, "height": h])
+                        result(["textureId": textureId, "sessionId": sid, "width": w, "height": h])
                     }
                 }
             }
@@ -969,12 +853,25 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // ~25,000/sec during the settle poll loop; any blocking log call will
         // saturate logd's XPC buffer and hang the settle on the second call.
         case "getMasterClock":
-            // Phase 2 Step 6: playback sessions are registry-owned; renderers holds
-            // no playback entries. Read master clock from the first active runtime.
-            if let clock = sessionRegistry.allRuntimes().first?.masterClock?.currentTime {
-                result(CMTimeGetSeconds(clock))
+            // G-02: Exposes the native masterClock for the A/V sync integration test.
+            // Not called in production code — diagnostic/testing path only.
+            // NOTE: do NOT log here — this is called at ~25,000/sec during the
+            // G-02-T2 settle poll loop; any blocking call saturates logd's XPC buffer.
+            //
+            // Phase 2 Step 7 contract:
+            //   • If textureId is provided and resolves to a registry runtime with a
+            //     masterClock, return CMTimeGetSeconds of that clock.
+            //   • Otherwise preserve the pre-Phase-2 renderer fallback:
+            //     renderers.values.first?.currentTimeSeconds ?? 0.0
+            //     (renderers holds camera/export renderers; their currentTimeSeconds
+            //     is wall-clock-based and is a valid fallback for legacy callers.)
+            let tid = (args?["textureId"] as? NSNumber)?.int64Value ?? -1
+            if tid >= 0,
+               let rt = sessionRegistry.runtime(forTextureId: tid),
+               let clock = rt.masterClock {
+                result(CMTimeGetSeconds(clock.currentTime))
             } else {
-                result(0.0)
+                result(renderers.values.first?.currentTimeSeconds ?? 0.0)
             }
 
         // G-02-T3: Native-backed post-seek settle (test-only).
@@ -1003,12 +900,18 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // is free). resumeSeekPreviews() restores normal behaviour after the
         // measurement is complete.  Both are no-ops in production — test-only.
         case "pauseSeekPreviews":
-            // Phase 2 Step 6: seek-preview state forwarded through registry runtimes.
+            // Phase 2 Step 7: forward to all registry runtimes AND all renderers
+            // (camera/export renderers also carry seekPreviewPaused; they must be
+            // silenced during the G-02-T3 seek storm to prevent AVFoundation XPC
+            // dispatch from blocking the main thread during the measurement window).
             sessionRegistry.allRuntimes().forEach { $0.setSeekPreviewPaused(true) }
+            renderers.values.forEach { $0.seekPreviewPaused = true }
             result(nil)
 
         case "resumeSeekPreviews":
+            // Phase 2 Step 7: mirror pauseSeekPreviews — both maps must be reset.
             sessionRegistry.allRuntimes().forEach { $0.setSeekPreviewPaused(false) }
+            renderers.values.forEach { $0.seekPreviewPaused = false }
             result(nil)
 
         // ── P5: Test-only native helpers ────────────────────────────────────────
@@ -1095,9 +998,14 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                   let rate      = (args?["rate"] as? NSNumber)?.doubleValue else {
                 result(FlutterError(code: "BAD_ARGS", message: "setPlaybackRate requires textureId and rate", details: nil)); return
             }
-            // Phase 2 Step 6: playback rate forwarded through runtime.
-            if sessionRegistry.runtime(forTextureId: textureId)?.setPlaybackRate(rate) == nil {
-                NSLog("[VanguardPlugin] runtime not found for textureId %lld", textureId)
+            // Phase 2 Step 7: try registry runtime first (playback sessions);
+            // fall back to renderers dict for camera/export renderers.
+            if sessionRegistry.runtime(forTextureId: textureId)?.setPlaybackRate(rate) != nil {
+                // handled by registry
+            } else if let renderer = renderers[textureId] {
+                renderer.setPlaybackRate(rate)
+            } else {
+                NSLog("[VanguardPlugin] setPlaybackRate: no runtime or renderer for textureId %lld", textureId)
             }
             result(nil)
 
@@ -1106,19 +1014,41 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(FlutterError(code: "BAD_ARGS", message: "dispose requires textureId", details: nil)); return
             }
             let id = textureId.int64Value
+            NSLog("[TRACE][DPS1] dispose entered textureId=%lld", id)
 
             // Phase 2 Step 6: remove from maps, then drain async before unblocking Dart.
             // removeFromMaps returns the runtime without calling invalidate — we call
             // invalidateAsync so the decode queue drains before result(nil) fires.
             // This preserves the G-02-T2 safety guarantee from the legacy disposeAsync path.
             if let runtime = sessionRegistry.removeFromMaps(textureId: id) {
+                NSLog("[TRACE][DPS2] removeFromMaps returned runtime=%@", runtime)
                 runtime.invalidateAsync {
+                    NSLog("[TRACE][DPS3] invalidateAsync completion fired textureId=%lld", id)
                     NSLog("[VanguardPlugin] dispose complete for textureId=%lld — Dart unblocked", id)
+                    NSLog("[TRACE][DPS4] plugin result(nil) sent textureId=%lld", id)
                     result(nil)
                 }
             } else {
+                NSLog("[TRACE][DPS2] removeFromMaps returned runtime=nil textureId=%lld", id)
                 NSLog("[VanguardPlugin] runtime not found for textureId %lld", id)
                 result(nil)
+            }
+
+        // ── Audio promotion (Phase 2 Step 7) ──────────────────────────────────
+        // Promotes sessionId to the active audio role via a serialised
+        // demotion → slot-acquire → activation transaction in VGSessionRegistry.
+        // sessionId is stable (UUID) and was returned synchronously by createTexture
+        // via VGSessionRegistry.createSession. The result is a Bool on the main queue.
+
+        case "promoteAudio":
+            guard let sessionId = args?["sessionId"] as? String else {
+                result(FlutterError(code: "BAD_ARGS",
+                                    message: "promoteAudio requires sessionId",
+                                    details: nil))
+                return
+            }
+            sessionRegistry.promoteToActiveAudio(sessionId: sessionId) { success in
+                DispatchQueue.main.async { result(success) }
             }
 
         // ── Export ─────────────────────────────────────────────────────────────

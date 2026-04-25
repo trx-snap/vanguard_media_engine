@@ -195,8 +195,13 @@ class VanguardEngine {
   /// G-02: Returns the current masterClock position in seconds from the native engine.
   /// Used by the A/V sync integration test to measure audio-vs-wall-clock drift.
   /// In production this is not called per-frame — only for testing and diagnostics.
-  Future<double> getMasterClockSeconds() async {
-    final seconds = await _channel.invokeMethod<double>('getMasterClock');
+  ///
+  /// Phase 2 Step 7: pass [textureId] to route through the registry runtime for
+  /// that specific session. Omit (or pass null) to use the renderer fallback
+  /// (pre-Phase-2 behaviour — valid for legacy callers and camera/export paths).
+  Future<double> getMasterClockSeconds({int? textureId}) async {
+    final args = textureId != null ? {'textureId': textureId} : null;
+    final seconds = await _channel.invokeMethod<double>('getMasterClock', args);
     return seconds ?? 0.0;
   }
 
@@ -233,9 +238,6 @@ class VanguardEngine {
   /// Use [textureId] with [VanguardTextureView] and pass [width]/[height] to it
   /// so the preview container sizes correctly for both portrait and landscape video.
   Future<({int textureId, int width, int height})> createVideoTexture(String path, {required double startTime, int layerId = 0}) async {
-    // Register node in C++ timeline
-    addVideoNode(path, startTime: startTime, layerId: layerId);
-
     // P1B-09: Route through VGPlaybackClient which normalises both the legacy
     // Map return and the new graph-runtime Map return into a VGPlaybackSession.
     // _activeRenderers is still populated for dispose() and hot-reload safety.
@@ -245,6 +247,11 @@ class VanguardEngine {
     // we can extract dimensions without a second channel call.
     final (session: session, raw: rawMap) =
         await VGPlaybackClient.createSessionRaw(path);
+
+    // Register node in C++ timeline — moved after await so the synchronous
+    // FFI call does not freeze the Dart isolate before createSessionRaw can
+    // complete. (Experiment: confirms addVideoNode was the isolate-blocking cause.)
+    addVideoNode(path, startTime: startTime, layerId: layerId);
     final id = session.textureId;
     if (id < 0) {
       throw Exception('[Vanguard] Failed to create texture for: $path');
@@ -412,14 +419,17 @@ class VanguardEngine {
   ///   'INVALID_ARG'    — path argument missing
   ///   'FILE_NOT_FOUND' — file does not exist at the given path
   static Future<int> createImageTexture(String path) async {
-    final textureId = await _cameraChannel.invokeMethod<int>(
+    // Native returns {"textureId": N, "width": W, "height": H} — a Map, not a
+    // bare int. Unpack it the same way createVideoTexture does.
+    final rawMap = await _cameraChannel.invokeMethod<Map<Object?, Object?>>(
       'createImageTexture',
       {'path': path},
     );
-    if (textureId == null) {
+    final textureId = (rawMap?['textureId'] as num?)?.toInt();
+    if (textureId == null || textureId < 0) {
       throw PlatformException(
         code: 'ENCODE_FAIL',
-        message: 'createImageTexture returned null textureId',
+        message: 'createImageTexture returned null or invalid textureId',
       );
     }
     return textureId;

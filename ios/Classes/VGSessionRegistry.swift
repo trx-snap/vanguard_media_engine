@@ -91,6 +91,7 @@ import Foundation
 
         // Generate a stable, unique session identifier.
         let sessionId = UUID().uuidString
+        NSLog("[TRACE][N2] registry.createSession start session=%@", sessionId)
 
         // Construct the runtime — fast, synchronous, no I/O.
         // Phase 2: use the 3-arg designated initialiser to pass the desired role.
@@ -110,6 +111,8 @@ import Foundation
         // Kick off async preparation. The reverse map entry is added atomically
         // under the lock once preparation succeeds.
         runtime.prepare(with: url) { [weak self, weak runtime] textureId, error in
+            NSLog("[TRACE][N7] registry completion fired textureId=%lld error=%@",
+                  textureId, error?.localizedDescription ?? "none")
             guard let self, let runtime else {
                 completion(-1, .zero)
                 return
