@@ -23,12 +23,7 @@ NS_ASSUME_NONNULL_BEGIN
 // imported directly in VanguardMetalRenderer.m where the full types are needed.
 @protocol VanguardMediaSource;
 @protocol VanguardFilterNode;
-// P3-3 TRANSITIONAL — remove in Phase 4 (DEC-50, RR-31)
-// VGMetalFilterNode is the UMF protocol for runtime-owned filter nodes.
-// The renderer temporarily executes the runtime-owned chain here because it
-// still owns the source video callback, frame pull state, and texture
-// lifecycle.
-@protocol VGMetalFilterNode;
+
 
 @interface VanguardMetalRenderer : NSObject <FlutterTexture>
 
@@ -83,21 +78,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// Thread-safe: may be called from any thread.
 - (void)replaceFilterChain:(NSArray<id<VanguardFilterNode>> *)newChain;
 
-/// P3-3 TRANSITIONAL — remove in Phase 4 (DEC-50, RR-31).
-///
-/// Sets the runtime-owned UMF filter chain. When non-nil and non-empty, this
-/// chain is executed via VGMetalFilterNode.processEnvelope:device: INSTEAD of
-/// the legacy VanguardFilterNode chain. This prevents double filtering.
-///
-/// Swap safety: uses the same dispatch_barrier_async on videoDecodeQueue as
-/// replaceFilterChain:. Arrays are copied defensively before the barrier.
-///
-/// Called exclusively by VanguardGraphRuntime.setFilterChain:. Do NOT add
-/// further callers — doing so triggers the RR-31 monitor condition.
-///
-/// Pass nil or empty array to revert to legacy filter chain behaviour.
-/// Thread-safe: may be called from any thread.
-- (void)setRuntimeFilterChain:(nullable NSArray<id<VGMetalFilterNode>> *)chain;
+
 
 // ─── Memory Pressure ──────────────────────────────────────────────────────
 

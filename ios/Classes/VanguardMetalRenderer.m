@@ -17,11 +17,7 @@
 #import "VanguardFileMediaSource.h"
 #import "VanguardFilterNode.h"  // Full protocol
 #import "VanguardMediaSource.h" // Full protocol
-// P3-3 TRANSITIONAL — remove in Phase 4 (DEC-50, RR-31)
-#import <AVFoundation/AVFoundation.h>
-#import <CoreVideo/CoreVideo.h>
-#import <UMF/VGFrameEnvelope.h>   // VGFrameEnvelope struct for UMF filter nodes
-#import <UMF/VGMetalFilterNode.h> // runtime-owned UMF filter node protocol
+
 // P4-5: VGFrameDelegate — scheduler frame-forwarding protocol
 #import "VGFrameDelegate.h"
 #include <os/lock.h>
@@ -58,12 +54,6 @@ static os_log_t _rendererLog;
   NSArray<id<VanguardFilterNode>> *_filterChain;
   BOOL _filterChainEnabled;
 
-  // P3-3 TRANSITIONAL — remove in Phase 4 (DEC-50, RR-31)
-  // Runtime-owned UMF filter chain. When non-nil and non-empty,
-  // _runtimeFilterChain is executed via
-  // VGMetalFilterNode.processEnvelope:device: INSTEAD of _filterChain. This
-  // prevents double filtering. See setRuntimeFilterChain:.
-  NSArray<id<VGMetalFilterNode>> *_runtimeFilterChain;
 
   // ── Playback clock (P1-T5 rate-aware _timeProvider) ─────────────────────
   CADisplayLink *_displayLink;
@@ -773,35 +763,6 @@ static os_log_t _rendererLog;
   }
 }
 
-// P3-3 TRANSITIONAL — remove in Phase 4 (DEC-50, RR-31)
-/// Sets the runtime-owned UMF filter chain atomically on the video decode
-/// queue. Uses the same dispatch_barrier_async pattern as replaceFilterChain:
-/// (RR-26). Does NOT call invalidate on removed nodes — the runtime owns
-/// lifecycle; VanguardGraphRuntime.setFilterChain: is responsible for calling
-/// invalidate on nodes being dropped from the chain.
-- (void)setRuntimeFilterChain:(NSArray<id<VGMetalFilterNode>> *)chain {
-  // Defensive copy before the barrier — caller must not mutate the array
-  // after this call, but we cannot enforce that contract on an NSArray copy.
-  NSArray<id<VGMetalFilterNode>> *safeChain = chain ? [chain copy] : @[];
-
-  dispatch_queue_t decodeQ = nil;
-  if ([_source isKindOfClass:[VanguardFileMediaSource class]]) {
-    decodeQ = ((VanguardFileMediaSource *)_source).videoDecodeQueue;
-  }
-
-  if (decodeQ) {
-    // dispatch_barrier_async ensures _onVideoFrame: is not mid-execution
-    // during the swap. Mirrors the replaceFilterChain: pattern (RR-26).
-    dispatch_barrier_async(decodeQ, ^{
-      self->_runtimeFilterChain = safeChain;
-    });
-  } else {
-    // No videoDecodeQueue (camera source or unknown) — caller is on main
-    // thread. Runtime-owned chain is playback-only, so this path should not be
-    // reached. Assign synchronously as a safe fallback.
-    _runtimeFilterChain = safeChain;
-  }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Frame Callbacks from Source
@@ -844,51 +805,14 @@ static os_log_t _rendererLog;
   // RR-35: Debug assertion — unexpected nil delegate on a live (non-disposed)
   // renderer. This fires if P4-5 wiring is incomplete or the scheduler was
   // deallocated prematurely while the renderer is still running.
-  NSAssert(_disposed || _filterChainEnabled || _runtimeFilterChain.count == 0 ||
-               _frameDelegate != nil,
+  NSAssert(_disposed || _filterChainEnabled || _frameDelegate != nil,
            @"[RR-35] Renderer._onVideoFrame: frameDelegate is nil on a "
             "non-disposed, non-camera renderer — P4-5 wiring may be missing.");
 
   _lastDecodedPTS = CMTimeGetSeconds(pts);
   CVPixelBufferRef frame = rawFrame;
 
-  // P3-3 TRANSITIONAL: if the runtime has installed a UMF filter chain, execute
-  // it via VGMetalFilterNode.processEnvelope:device: and bypass the legacy
-  // VanguardFilterNode chain to prevent double filtering (DEC-50, RR-26).
-  //
-  // If _runtimeFilterChain is nil or empty, fall through to the legacy chain.
-  // This preserves the legacy filter path for non-runtime callers (camera
-  // renderer, tests) and matches RR-27 audit findings.
-  NSArray<id<VGMetalFilterNode>> *runtimeChain = _runtimeFilterChain;
-  if (runtimeChain.count > 0) {
-    // Build a VGFrameEnvelope for the raw frame.
-    VGFrameEnvelope envelope;
-    memset(&envelope, 0, sizeof(VGFrameEnvelope));
-    envelope.payload.videoBuffer =
-        rawFrame; // raw frame — not retained by envelope
-    envelope.pts = pts;
-    envelope.generation =
-        0; // no generation counter in P3-3 (runtime-level concern)
-
-    for (id<VGMetalFilterNode> node in runtimeChain) {
-      VGFrameEnvelope result = [node processEnvelope:envelope device:_device];
-      // NULL output payload signals filter failure (memory pressure,
-      // invalidated). On failure: release any non-raw intermediate and revert
-      // to rawFrame.
-      if (!result.payload.videoBuffer) {
-        if (frame != rawFrame)
-          CVPixelBufferRelease(frame); // release dangling intermediate
-        frame = rawFrame;              // revert to unfiltered frame
-        break; // skip remaining nodes; deliver raw frame
-      }
-      // Release the previous intermediate before advancing (avoids leak).
-      if (frame != rawFrame)
-        CVPixelBufferRelease(frame);
-      frame = result.payload.videoBuffer; // result is retained by the node
-      // Update envelope for the next node in the chain.
-      envelope = result;
-    }
-  } else if (_filterChainEnabled && _filterChain.count > 0) {
+  if (_filterChainEnabled && _filterChain.count > 0) {
     // Legacy VanguardFilterNode path — only executed when runtime chain is
     // absent.
     for (id<VanguardFilterNode> node in _filterChain) {

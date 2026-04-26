@@ -69,7 +69,9 @@ Pod::Spec.new do |s|
       # Phase 4 P4-5: Scheduler frame delivery gate (P4-5 mandatory gate)
       'Tests/VGSchedulerFrameDeliveryTest.m',
       # Phase 4 P4-5: Scheduler filter execution gate (P4-5 mandatory gate)
-      'Tests/VGSchedulerFilterExecutionTest.m'
+      'Tests/VGSchedulerFilterExecutionTest.m',
+      # Phase 4 P4-6: Legacy renderer path smoke test (camera smoke substitute)
+      'Tests/VGRendererLegacyPathSmokeTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'
