@@ -166,7 +166,8 @@ static const NSTimeInterval kP46Timeout = 2.0;
   _renderer = [[VanguardMetalRenderer alloc]
       initWithSource:_source
      textureRegistry:_registry
-       methodChannel:(FlutterMethodChannel *)channelStub];
+       methodChannel:(FlutterMethodChannel *)channelStub
+         sessionPool:NULL]; // tests: no runtime-managed session pool
 
   XCTAssertNotNil(_renderer, @"Renderer must initialise with mock dependencies");
 

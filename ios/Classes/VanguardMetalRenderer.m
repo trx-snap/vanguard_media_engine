@@ -49,6 +49,9 @@ static os_log_t _rendererLog;
   // P0-T1: Shared pool supplied to the source; 3 IOSurface-backed Metal
   // buffers.
   CVPixelBufferPoolRef _pixelBufferPool;
+  // P4-7 Q2: session pool injected by VanguardGraphRuntime — borrowed reference.
+  // The runtime (via VGResourceAllocator) owns the +1; renderer must NOT release.
+  CVPixelBufferPoolRef _sessionPixelBufferPool;
 
   // ── Filter chain (P1-T3) — empty array in Phase 1 ──────────────────────
   NSArray<id<VanguardFilterNode>> *_filterChain;
@@ -131,7 +134,8 @@ static os_log_t _rendererLog;
 
 - (instancetype)initWithSource:(id<VanguardMediaSource>)source
                textureRegistry:(id<FlutterTextureRegistry>)registry
-                 methodChannel:(FlutterMethodChannel *)channel {
+                 methodChannel:(FlutterMethodChannel *)channel
+                   sessionPool:(CVPixelBufferPoolRef _Nullable)sessionPool {
   self = [super init];
   if (!self)
     return nil;
@@ -157,6 +161,8 @@ static os_log_t _rendererLog;
   _currentTime = 0.0;
   _filterChain = @[];
   _filterChainEnabled = YES;
+
+  _sessionPixelBufferPool = sessionPool; // borrowed — runtime owns the +1
 
   [self _setupMetal];
   [self _setupPixelBufferPoolFromSource:source];
@@ -241,7 +247,8 @@ static os_log_t _rendererLog;
       [[VanguardFileMediaSource alloc] initWithURL:url pixelBufferPool:nil];
   self = [self initWithSource:source
               textureRegistry:registry
-                methodChannel:channel];
+                methodChannel:channel
+                  sessionPool:NULL]; // camera/export: no runtime-managed session pool
   if (!self)
     return nil;
 
@@ -404,7 +411,7 @@ static os_log_t _rendererLog;
 /// in the Metal completion handler — this method captures that retained ref.
 - (CVPixelBufferRef _Nullable)_rotatePixelBufferGPU:(CVPixelBufferRef)src
                                               isHLG:(uint32_t)isHLG {
-  if (!_blitPipelineState || !_pixelBufferPool || !_textureCache ||
+  if (!_blitPipelineState || !_sessionPixelBufferPool || !_textureCache ||
       !_commandQueue) {
     return NULL;
   }
@@ -412,7 +419,7 @@ static os_log_t _rendererLog;
   // Allocate destination from pool (IOSurface-backed, display-correct size).
   CVPixelBufferRef dst = NULL;
   CVReturn pstat = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault,
-                                                      _pixelBufferPool, &dst);
+                                                      _sessionPixelBufferPool, &dst);
   if (pstat != kCVReturnSuccess || !dst) {
     NSLog(@"[VanguardRenderer] GPU blit: pool exhausted");
     return NULL;

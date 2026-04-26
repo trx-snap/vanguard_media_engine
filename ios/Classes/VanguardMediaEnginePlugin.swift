@@ -205,69 +205,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         }
     }
 
-    // ─── Image Renderer Helper (Phase A1-S1) ──────────────────────────────────
-
-    /// Creates a VanguardMetalRenderer backed by VanguardImageMediaSource and
-    /// delivers the resulting textureId via `result`.
-    ///
-    /// Called from the `createImageTexture` method channel case — extracted here
-    /// to be reusable from both the direct path and the async camera-teardown path.
-    ///
-    /// Contract:
-    ///  1. Any existing renderer is torn down first (max-1-renderer invariant).
-    ///  2. Mode transitions to .editor.
-    ///  3. VanguardImageProcessor is initialised with the renderer's pool (nil at
-    ///     construction; wired back after initWithSource: creates the pool) — the
-    ///     same backfill pattern used in VanguardMetalRenderer.initWithVideoPath:.
-    ///  4. source.start() fires immediately — the single CVPixelBuffer lands in
-    ///     _latestPixelBuffer and is held for the lifetime of the renderer.
-    ///  5. result(textureId) is delivered synchronously on the main thread.
-    ///
-    /// Threading: MUST be called on the main thread (MethodChannel guarantee).
-    private func _createImageRenderer(url: URL, result: @escaping FlutterResult) {
-        // Enforce max-1-renderer: tear down any existing editor renderer first.
-        if !renderers.isEmpty {
-            for (id, renderer) in renderers {
-                // Unregister before dispose to stop raster-thread copyPixelBuffer
-                // callbacks before Metal state is torn down.
-                registrar.textures().unregisterTexture(id)
-                renderer.dispose()
-            }
-            renderers.removeAll()
-        }
-
-        currentMode = .editor
-
-        // Build source with nil processor pool — pool does not exist until the
-        // renderer creates its CVPixelBufferPool in initWithSource:.
-        // NOTE: VanguardImageProcessor.init requires a device + pool.
-        // We pass the device upfront and backfill the pool after renderer init.
-        let device = MTLCreateSystemDefaultDevice()!
-        // Allocate processor with a temporary nil pool; backfilled below.
-        // The processor's pixelBufferFromCGImage: path is called by source.start(),
-        // which is deferred until AFTER the backfill.
-        let processor = VanguardImageProcessor(device: device, pool: nil)
-        let source = VanguardImageMediaSource(url: url, processor: processor)
-
-        let renderer = VanguardMetalRenderer(source: source,
-                                             textureRegistry: registrar.textures(),
-                                             methodChannel: channel)
-
-        // Backfill the pool: renderer created the CVPixelBufferPool in initWithSource:.
-        // Wire it to the processor so pixelBufferFromCGImage: allocates Metal-compatible
-        // IOSurface buffers from the shared pool (zero VM round-trips on re-display).
-        if let pool = renderer.pixelBufferPool {
-            processor.pool = pool
-        }
-
-        // Now that the pool is wired, start the source — fires one CVPixelBuffer
-        // via _videoCallback into the renderer's _latestPixelBuffer.
-        source.start()
-
-        renderers[renderer.textureId] = renderer
-        result(renderer.textureId)
-    }
-
     // ─── Method Channel Dispatch ───────────────────────────────────────────────
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -1196,7 +1133,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     // prevents crash) but avoids the theoretical concurrent-read race entirely.
                     let renderer = VanguardMetalRenderer(source: src,
                                                         textureRegistry: self.registrar.textures(),
-                                                        methodChannel: self.channel)
+                                                        methodChannel: self.channel,
+                                                        sessionPool: nil)
                     self.renderers[renderer.textureId] = renderer
                     src.start()
                     result(renderer.textureId)
@@ -1236,7 +1174,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // _videoCallback is wired before any camera frames arrive.
             let renderer = VanguardMetalRenderer(source: src,
                                                  textureRegistry: registrar.textures(),
-                                                 methodChannel: channel)
+                                                 methodChannel: channel,
+                                                 sessionPool: nil)
             renderers[renderer.textureId] = renderer
             src.start()
             result(renderer.textureId)

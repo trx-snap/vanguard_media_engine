@@ -35,6 +35,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (instancetype)initWithSource:(id<VanguardMediaSource>)source
                textureRegistry:(id<FlutterTextureRegistry>)registry
                  methodChannel:(FlutterMethodChannel *)channel
+                   sessionPool:(CVPixelBufferPoolRef _Nullable)sessionPool
     NS_DESIGNATED_INITIALIZER;
 
 /// Convenience initialiser for backward-compat — creates a

@@ -310,7 +310,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
     VanguardMetalRenderer *renderer =
         [[VanguardMetalRenderer alloc] initWithSource:self.source
                                       textureRegistry:self.textureRegistry
-                                        methodChannel:self.methodChannel];
+                                        methodChannel:self.methodChannel
+                                          sessionPool:self.sessionPool];
 
     if (!renderer || self->_invalidated) {
       NSLog(@"[VanguardGraphRuntime] FATAL: renderer nil or invalidated — "

@@ -166,7 +166,8 @@ static VanguardMetalRenderer *makeRenderer(VGP44MockTextureRegistry **outRegistr
   return [[VanguardMetalRenderer alloc]
       initWithSource:source
      textureRegistry:registry
-       methodChannel:(FlutterMethodChannel *)channelStub];
+       methodChannel:(FlutterMethodChannel *)channelStub
+         sessionPool:NULL]; // tests: no runtime-managed session pool
 }
 
 /// Builds a VGFrameEnvelope wrapping the given CVPixelBuffer.
