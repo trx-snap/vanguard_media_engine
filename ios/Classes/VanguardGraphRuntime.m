@@ -22,10 +22,10 @@
 
 // Vanguard concrete classes
 #import "VanguardFileMediaSource.h"
+#import "VanguardGraphScheduler.h" // P4-3
 #import "VanguardImageMediaSource.h"
 #import "VanguardImageProcessor.h"
 #import "VanguardMetalRenderer.h"
-#import "VanguardGraphScheduler.h" // P4-3
 
 // UMF shared infrastructure
 #import <UMF/VGResourceAllocator.h>
@@ -108,6 +108,20 @@ static BOOL VGRIsImageURL(NSURL *url) {
   // Atomic invalidation flag. Written exactly once (YES) in -invalidate.
   // Declared in .m so it is not part of the frozen public header.
   _Atomic(BOOL) _invalidated;
+
+  // P4-8: Idempotency guard for pool release.
+  // Written exactly once (YES) by whichever release path fires first —
+  // GPU fence addCompletedHandler or dispatch_after fallback.
+  // Prevents double-CVPixelBufferPoolRelease and double-reportPoolReleased:.
+  // (RR-37 mitigation — DEC-59)
+  _Atomic(BOOL) _poolReleased;
+
+  // P4-8: Byte count reserved via canAllocatePoolBytes: at prepare time.
+  // poolBytes is a block-local variable in prepareWithURL: and is out of
+  // scope at teardown. Storing it here is the only way to pass the correct
+  // value to reportPoolReleased: in invalidateAsync and _releaseSessionPool.
+  // Zero when no budget was reserved (budget denied or pool creation failed).
+  NSUInteger _sessionPoolBytes;
 }
 
 @synthesize state = _vg_state;
@@ -140,6 +154,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
   _vg_state = VGRuntimeStateIdle;
   _vg_textureId = -1;
   _invalidated = NO;
+  _poolReleased = NO;    // P4-8: reset per-session on each new runtime instance
+  _sessionPoolBytes = 0; // P4-8: populated in prepareWithURL: after pool creation
   _renderSize = CGSizeZero;
 
   // Serial FIFO queue for source/renderer setup and post-prepare operations.
@@ -343,16 +359,18 @@ static BOOL VGRIsImageURL(NSURL *url) {
     }
 
     // (d) Create the session pool from the allocator (replaces old pre-prepare
-    // hardcoded 1080×1920 allocation; addresses P4-7 plan "use actual renderSize").
+    // hardcoded 1080×1920 allocation; addresses P4-7 plan "use actual
+    // renderSize").
     CVPixelBufferPoolRef pool =
         [allocator pixelBufferPoolWithWidth:poolW
                                      height:poolH
                                      format:kCVPixelFormatType_32BGRA
-                        minimumBufferCount:desiredCount];
+                         minimumBufferCount:desiredCount];
 
     if (!pool && budgetReserved) {
-      // Pool creation failed after budget was reserved — release the reservation
-      // so the allocator's byte counter does not drift (P4-7A contract).
+      // Pool creation failed after budget was reserved — release the
+      // reservation so the allocator's byte counter does not drift (P4-7A
+      // contract).
       [allocator reportPoolReleased:poolBytes];
       budgetReserved = NO;
       NSLog(@"[VanguardGraphRuntime] P4-7B: pool creation failed (w=%zu h=%zu "
@@ -369,11 +387,16 @@ static BOOL VGRIsImageURL(NSURL *url) {
     // pixelBufferPoolWithWidth). sessionPool is declared `assign` — it does NOT
     // add a CF retain. Do NOT call CVPixelBufferPoolRelease here: that would
     // immediately free the pool, leaving self.sessionPool as a dangling pointer
-    // for the entire session. The +1 is kept alive intentionally; it is
-    // consumed (noop'd as intentional leak) in invalidateAsync's
-    // afterCompletion block (IOSurface fence safety — P4-8 will replace with
-    // GPU fence deferred release).
+    // for the entire session. The +1 is held for the session lifetime and
+    // released via GPU fence deferred release in invalidateAsync (P4-8).
     self.sessionPool = pool;
+
+    // P4-8: Store pool byte count as ivar so teardown paths can call
+    // reportPoolReleased: with the exact reserved amount. poolBytes is a local
+    // variable in this block and will be out of scope at invalidation time.
+    // Only store when a budget reservation was actually made — if budgetReserved
+    // is NO we must not later decrement a budget we never incremented.
+    self->_sessionPoolBytes = budgetReserved ? poolBytes : 0;
 
     // (e) Backfill pool to source now that both source and pool exist.
     // VanguardFileMediaSource.pixelBufferPool is an `assign` property — setting
@@ -387,7 +410,6 @@ static BOOL VGRIsImageURL(NSURL *url) {
     if (imageProcessor && pool) {
       imageProcessor.pool = pool;
     }
-
 
     VanguardMetalRenderer *renderer =
         [[VanguardMetalRenderer alloc] initWithSource:self.source
@@ -433,10 +455,11 @@ static BOOL VGRIsImageURL(NSURL *url) {
     self.scheduler = [[VanguardGraphScheduler alloc] init];
 
     // P4-5: Wire the scheduler–renderer handoff.
-    //   scheduler.sink = renderer — scheduler delivers to renderer via presentEnvelope:
-    //   renderer.frameDelegate = scheduler — renderer forwards raw frames to scheduler
+    //   scheduler.sink = renderer — scheduler delivers to renderer via
+    //   presentEnvelope: renderer.frameDelegate = scheduler — renderer forwards
+    //   raw frames to scheduler
     // Both are weak refs; runtime owns both objects for the session lifetime.
-    self.scheduler.sink    = renderer;
+    self.scheduler.sink = renderer;
     renderer.frameDelegate = self.scheduler;
 
     // P4-5: Start the scheduler — supplies clock and Metal device via the
@@ -582,13 +605,15 @@ static BOOL VGRIsImageURL(NSURL *url) {
   // the pre-invalidate values for the drain step and post-completion cleanup.
   id<VanguardMediaSource, VGMediaNode> capturedSource = _source;
   VanguardMetalRenderer *capturedRenderer = _renderer;
-  // Capture the session pool HERE, before invalidate nils _sessionPool via
-  // _releaseSessionPool. We release it AFTER result(nil) reaches Dart so that
-  // the IOSurface kernel reclamation cannot freeze the process before Dart
-  // unblocks. _releaseSessionPool is skipped inside invalidate (see comment
-  // at INV_C).
-  CVPixelBufferPoolRef capturedPool = _sessionPool;
-  _sessionPool = NULL;
+
+  // P4-8: Capture pool + reserved byte count atomically before dispatch.
+  // Zeroing both ivars immediately prevents a concurrent second invalidateAsync
+  // call from capturing the same pool pointer (invalidateAsync is idempotent
+  // via _invalidated, but defence-in-depth here costs nothing).
+  CVPixelBufferPoolRef capturedPool  = _sessionPool;
+  NSUInteger capturedBytes           = _sessionPoolBytes;
+  _sessionPool      = NULL;
+  _sessionPoolBytes = 0;
 
   dispatch_async(_prepareQueue, ^{
     NSLog(@"[TRACE][IA1] invalidate started on prepareQueue");
@@ -599,17 +624,77 @@ static BOOL VGRIsImageURL(NSURL *url) {
         if (completion)
           completion();
         [capturedRenderer doUnregisterTexture];
-        if (capturedPool) {
-          // INTENTIONAL LEAK (KEEP TEMPORARILY): Do NOT call
-          // CVPixelBufferPoolRelease. CVPixelBufferPoolRelease triggers
-          // IOSurface fence wait in the kernel. When concurrent session is
-          // rendering via Metal, fence waits 5+ min. OS reclaims IOSurface/GPU
-          // memory at process exit.
-          NSLog(@"[VanguardGraphRuntime] pool=%p deferred to process exit "
-                @"(IOSurface fence safety)",
-                capturedPool);
-          (void)capturedPool;
+
+        // ── P4-8: GPU-fence deferred pool release ──────────────────────────
+        //
+        // Design (RR-37, DEC-59):
+        //   Primary  — sentinel MTLCommandBuffer on a fresh queue created from
+        //              the allocator's shared Metal device. addCompletedHandler:
+        //              fires after the GPU drains all preceding IOSurface work.
+        //   Fallback — dispatch_after(5s) fires unconditionally. If the fence
+        //              handler already ran, the _poolReleased CAS makes this a
+        //              no-op. If the device was lost, this is the only path.
+        //   Guard    — _Atomic(BOOL) _poolReleased: first atomic_exchange wins;
+        //              second is a silent no-op. Prevents double-release and
+        //              double reportPoolReleased:. (DEC-59 idempotency rule)
+        //
+        // Note: we create a NEW command queue from allocator.metalDevice rather
+        // than accessing the renderer's private _commandQueue ivar (which is not
+        // exposed in VanguardMetalRenderer.h). The allocator uses the same
+        // system default MTLDevice — the sentinel drains the same GPU timeline.
+
+        if (!capturedPool) {
+          return; // No pool allocated this session — nothing to release.
         }
+
+        id<MTLDevice> device = [VGResourceAllocator sharedInstance].metalDevice;
+        id<MTLCommandQueue> sentinelQueue = device ? [device newCommandQueue] : nil;
+        id<MTLCommandBuffer> sentinelBuf  = sentinelQueue
+                                           ? [sentinelQueue commandBuffer]
+                                           : nil;
+
+        if (sentinelBuf) {
+          // Primary path: GPU fence via addCompletedHandler:.
+          [sentinelBuf addCompletedHandler:^(id<MTLCommandBuffer> __unused cb) {
+            BOOL already = atomic_exchange(&self->_poolReleased, YES);
+            if (!already) {
+              CVPixelBufferPoolRelease(capturedPool);
+              if (capturedBytes > 0) {
+                [[VGResourceAllocator sharedInstance]
+                    reportPoolReleased:capturedBytes];
+              }
+              NSLog(@"[VanguardGraphRuntime] P4-8: pool=%p released via "
+                    @"GPU fence", capturedPool);
+            }
+          }];
+          [sentinelBuf commit];
+        } else {
+          // Device unavailable — fence cannot be submitted. The dispatch_after
+          // fallback below is the only release path. Log for diagnostics.
+          NSLog(@"[VanguardGraphRuntime] P4-8: pool=%p Metal device unavailable "
+                @"— relying on dispatch_after fallback", capturedPool);
+        }
+
+        // Fallback: unconditional 5-second timer (RR-37 mitigation).
+        // Fires regardless of whether a fence was submitted. If the fence
+        // handler already ran, the CAS makes this a no-op (zero cost).
+        // If the device was lost and the fence never fires, this reclaims.
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+            dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0),
+            ^{
+              BOOL already = atomic_exchange(&self->_poolReleased, YES);
+              if (!already) {
+                CVPixelBufferPoolRelease(capturedPool);
+                if (capturedBytes > 0) {
+                  [[VGResourceAllocator sharedInstance]
+                      reportPoolReleased:capturedBytes];
+                }
+                NSLog(@"[VanguardGraphRuntime] P4-8: GPU fence timeout — "
+                      @"pool=%p released via dispatch_after fallback",
+                      capturedPool);
+              }
+            });
       });
     };
 
@@ -759,13 +844,42 @@ static BOOL VGRIsImageURL(NSURL *url) {
 // ─── Private helpers
 // ──────────────────────────────────────────────────────────
 
+// P4-8: Dealloc-path pool release.
+//
+// Called ONLY from -dealloc (abnormal teardown — caller skipped -invalidate).
+//
+// Per RR-37 mitigation 3: MUST NOT submit an MTLCommandBuffer from dealloc.
+// Metal objects (device, command queue) may already be partially torn down.
+// dispatch_after(5s) gives in-flight GPU work time to drain before the
+// IOSurface is reclaimed by the OS — no active fence needed in this path.
+//
+// Uses reportPoolReleased: directly (not via fence) because dealloc never
+// calls the fence path, so there is no in-flight fence count to coordinate.
+//
+// _Atomic(BOOL) _poolReleased CAS guards against the edge case where
+// invalidateAsync was called and raced with dealloc on the same pool pointer.
 - (void)_releaseSessionPool {
   if (_sessionPool) {
     CVPixelBufferPoolRef poolToRelease = _sessionPool;
-    _sessionPool = NULL;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-      CVPixelBufferPoolRelease(poolToRelease);
-    });
+    NSUInteger bytesToRelease          = _sessionPoolBytes;
+    _sessionPool      = NULL;
+    _sessionPoolBytes = 0;
+
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+        dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0),
+        ^{
+          BOOL already = atomic_exchange(&self->_poolReleased, YES);
+          if (!already) {
+            CVPixelBufferPoolRelease(poolToRelease);
+            if (bytesToRelease > 0) {
+              [[VGResourceAllocator sharedInstance]
+                  reportPoolReleased:bytesToRelease];
+            }
+            NSLog(@"[VanguardGraphRuntime] P4-8 dealloc: pool=%p released "
+                  @"via dispatch_after fallback", poolToRelease);
+          }
+        });
   }
 }
 

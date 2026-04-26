@@ -77,7 +77,13 @@ Pod::Spec.new do |s|
       'Tests/VGPoolSizingTest.m',
       'Tests/VGPoolBudgetTest.m',
       # Phase 4 P4-7D: Pool pressure behavior hardening gate
-      'Tests/VGPoolPressureBehaviorTest.m'
+      'Tests/VGPoolPressureBehaviorTest.m',
+      # Phase 4 P4-8A: Pool drain / GPU fence budget accounting gate
+      'Tests/VGPoolDrainTest.m',
+      # Phase 4 P4-8B: GPU fence release timing gate (plan:200)
+      'Tests/VGPoolReleaseTimingTest.m',
+      # Phase 4 P4-8B: 10-cycle churn + phys_footprint leak gate (plan:200, RR-29)
+      'Tests/VGSessionChurnPoolLeakTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'
