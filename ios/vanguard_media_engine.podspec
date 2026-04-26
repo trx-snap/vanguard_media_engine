@@ -65,7 +65,11 @@ Pod::Spec.new do |s|
       # Phase 4 P4-2: Scheduler skeleton lifecycle gate (P4-5 precondition)
       'Tests/VGGraphSchedulerSkeletonTest.m',
       # Phase 4 P4-2: Scheduler chain swap gate (P4-5 precondition)
-      'Tests/VGSchedulerChainSwapTest.m'
+      'Tests/VGSchedulerChainSwapTest.m',
+      # Phase 4 P4-5: Scheduler frame delivery gate (P4-5 mandatory gate)
+      'Tests/VGSchedulerFrameDeliveryTest.m',
+      # Phase 4 P4-5: Scheduler filter execution gate (P4-5 mandatory gate)
+      'Tests/VGSchedulerFilterExecutionTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'
