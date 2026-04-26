@@ -19,6 +19,7 @@
 import 'dart:async';
 
 import 'package:flutter/services.dart';
+import 'vg_filter_spec.dart';
 
 /// A single active playback session backed by a [VanguardGraphRuntime] on the
 /// native side (unconditional as of Phase 2 Step 0).
@@ -68,7 +69,31 @@ final class VGPlaybackSession {
     if (_disposed) return;
     await _channel.invokeMethod<void>('seekTo', {
       'textureId': textureId,
-      'seconds':   seconds,
+      'seconds': seconds,
+    });
+  }
+
+  /// Applies a new filter chain to this session.
+  ///
+  /// [filters] is an ordered list of [VGFilterSpec] describing the filters to
+  /// install. The native side assembles the actual [VGMetalFilterNode] graph
+  /// from the received specs.
+  ///
+  /// An empty list removes all filters (passthrough).
+  ///
+  /// Routing note: intentionally sessionId-keyed (not textureId-keyed) because
+  /// the native runtime registry lookup uses sessionId as the stable identifier.
+  /// textureId can be recycled after dispose; sessionId is UUID-stable for the
+  /// session lifetime.
+  ///
+  /// No-op if this session has already been [dispose]d.
+  Future<void> setFilterChain(List<VGFilterSpec> filters) async {
+    if (_disposed) return;
+    await _channel.invokeMethod<void>('setFilterChain', {
+      'sessionId': sessionId,
+      'filters': List<Map<String, Object?>>.unmodifiable(
+        filters.map((f) => f.toJson()).toList(),
+      ),
     });
   }
 
@@ -89,10 +114,9 @@ final class VGPlaybackSession {
   /// stable identifier (textureId can be recycled after dispose).
   Future<bool> promoteToActiveAudio() async {
     if (_disposed) return false;
-    final result = await _channel.invokeMethod<bool>(
-      'promoteAudio',
-      {'sessionId': sessionId},
-    );
+    final result = await _channel.invokeMethod<bool>('promoteAudio', {
+      'sessionId': sessionId,
+    });
     return result ?? false;
   }
 

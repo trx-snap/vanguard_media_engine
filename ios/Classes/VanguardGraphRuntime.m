@@ -25,6 +25,7 @@
 #import "VanguardImageMediaSource.h"
 #import "VanguardImageProcessor.h"
 #import "VanguardMetalRenderer.h"
+#import "VanguardGraphScheduler.h" // P4-3
 
 // UMF shared infrastructure
 #import <UMF/VGResourceAllocator.h>
@@ -35,7 +36,6 @@
 // Defined in VanguardFileMediaSource.m; extern linkage keeps them on the
 // same queue without requiring a shared header.
 extern dispatch_queue_t VanguardAudioTeardownQueue(void);
-
 
 // ─── Image-type UTI helpers
 // ─────────────────────────────────────────────────── A lightweight set of
@@ -82,6 +82,15 @@ static BOOL VGRIsImageURL(NSURL *url) {
 
 // Preparation + post-prepare serial queue.
 @property(nonatomic, strong) dispatch_queue_t prepareQueue;
+
+// P3-3 TRANSITIONAL — remove in Phase 4 (DEC-50, RR-31).
+// Logical owner of the runtime filter chain. Forwarded to renderer on mutation.
+@property(nonatomic, strong, nullable)
+    NSArray<id<VGMetalFilterNode>> *filterChainStorage;
+
+// P4-3: Dormant scheduler. Created in prepareWithURL:, torn down in
+// invalidate/dealloc. Does NOT drive frame execution (that is P4-5+).
+@property(nonatomic, strong, nullable) VanguardGraphScheduler *scheduler;
 
 @end
 
@@ -185,12 +194,13 @@ static BOOL VGRIsImageURL(NSURL *url) {
         [allocator pixelBufferPoolWithWidth:1080
                                      height:1920
                                      format:kCVPixelFormatType_32BGRA];
-    // pool carries a +1 retain (CF_RETURNS_RETAINED from pixelBufferPoolWithWidth).
-    // sessionPool is declared `assign` — it does NOT add a CF retain.
-    // Do NOT call CVPixelBufferPoolRelease here: that would immediately free the
-    // pool, leaving self.sessionPool as a dangling pointer for the entire session.
-    // The +1 is kept alive intentionally; it is consumed (noop'd as intentional
-    // leak) in invalidateAsync's afterCompletion block (IOSurface fence safety).
+    // pool carries a +1 retain (CF_RETURNS_RETAINED from
+    // pixelBufferPoolWithWidth). sessionPool is declared `assign` — it does NOT
+    // add a CF retain. Do NOT call CVPixelBufferPoolRelease here: that would
+    // immediately free the pool, leaving self.sessionPool as a dangling pointer
+    // for the entire session. The +1 is kept alive intentionally; it is
+    // consumed (noop'd as intentional leak) in invalidateAsync's
+    // afterCompletion block (IOSurface fence safety).
     self.sessionPool = pool;
 
     // ── 1.5 Resolve effective audio role through VGResourceAllocator ──────
@@ -273,7 +283,6 @@ static BOOL VGRIsImageURL(NSURL *url) {
       return;
     }
 
-
     // ── 3.5 Phase 2 migration glue ─────────────────────────────────────────
     //
     // Push owning runtime reference into source so _teardownAudioEngine can
@@ -298,14 +307,14 @@ static BOOL VGRIsImageURL(NSURL *url) {
           (sz.width > 0 && sz.height > 0) ? sz : CGSizeMake(1080.0, 1920.0);
     }
 
-
     VanguardMetalRenderer *renderer =
         [[VanguardMetalRenderer alloc] initWithSource:self.source
                                       textureRegistry:self.textureRegistry
                                         methodChannel:self.methodChannel];
 
     if (!renderer || self->_invalidated) {
-      NSLog(@"[VanguardGraphRuntime] FATAL: renderer nil or invalidated — aborting prepare");
+      NSLog(@"[VanguardGraphRuntime] FATAL: renderer nil or invalidated — "
+            @"aborting prepare");
       NSError *err =
           [NSError errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
                               code:3
@@ -316,7 +325,6 @@ static BOOL VGRIsImageURL(NSURL *url) {
       completion(-1, err);
       return;
     }
-
 
     self.renderer = renderer;
 
@@ -338,6 +346,25 @@ static BOOL VGRIsImageURL(NSURL *url) {
 
     // ── 6. Transition state ───────────────────────────────────────────────
 
+    // P4-3: Create scheduler. P4-5: Wire sink and delegate, then start.
+    self.scheduler = [[VanguardGraphScheduler alloc] init];
+
+    // P4-5: Wire the scheduler–renderer handoff.
+    //   scheduler.sink = renderer — scheduler delivers to renderer via presentEnvelope:
+    //   renderer.frameDelegate = scheduler — renderer forwards raw frames to scheduler
+    // Both are weak refs; runtime owns both objects for the session lifetime.
+    self.scheduler.sink    = renderer;
+    renderer.frameDelegate = self.scheduler;
+
+    // P4-5: Start the scheduler — supplies clock and Metal device via the
+    // VGGraphScheduler protocol (VGGraphScheduler.h:16). The device is the
+    // same allocator.metalDevice already used for the pixel buffer pool.
+    // clock may be nil for image sources; startWithClock:device: guards this.
+    id<MTLDevice> schedulerDevice = allocator.metalDevice;
+    if (schedulerDevice) {
+      [self.scheduler startWithClock:self.masterClock device:schedulerDevice];
+    }
+
     self.state = VGRuntimeStatePrepared;
     completion(tid, nil);
   });
@@ -349,7 +376,9 @@ static BOOL VGRIsImageURL(NSURL *url) {
 - (void)play {
   NSAssert([NSThread isMainThread],
            @"VanguardGraphRuntime.play must be called on the main thread.");
-  if (_invalidated || !_renderer) { return; }
+  if (_invalidated || !_renderer) {
+    return;
+  }
   [_renderer play];
   self.state = VGRuntimeStateRunning;
 }
@@ -357,7 +386,9 @@ static BOOL VGRIsImageURL(NSURL *url) {
 - (void)pause {
   NSAssert([NSThread isMainThread],
            @"VanguardGraphRuntime.pause must be called on the main thread.");
-  if (_invalidated || !_renderer) { return; }
+  if (_invalidated || !_renderer) {
+    return;
+  }
   [_renderer pause];
   self.state = VGRuntimeStatePaused;
 }
@@ -402,6 +433,11 @@ static BOOL VGRIsImageURL(NSURL *url) {
   [source invalidate];
   // Pool release deferred to invalidateAsync's post-completion callback.
   // (See INV_C comment — IOSurface fence safety.)
+
+  // P4-3: Tear down dormant scheduler.
+  [self.scheduler invalidate];
+  self.scheduler = nil;
+
   self.state = VGRuntimeStateIdle;
 }
 
@@ -481,11 +517,14 @@ static BOOL VGRIsImageURL(NSURL *url) {
           completion();
         [capturedRenderer doUnregisterTexture];
         if (capturedPool) {
-          // INTENTIONAL LEAK (KEEP TEMPORARILY): Do NOT call CVPixelBufferPoolRelease.
-          // CVPixelBufferPoolRelease triggers IOSurface fence wait in the kernel.
-          // When concurrent session is rendering via Metal, fence waits 5+ min.
-          // OS reclaims IOSurface/GPU memory at process exit.
-          NSLog(@"[VanguardGraphRuntime] pool=%p deferred to process exit (IOSurface fence safety)", capturedPool);
+          // INTENTIONAL LEAK (KEEP TEMPORARILY): Do NOT call
+          // CVPixelBufferPoolRelease. CVPixelBufferPoolRelease triggers
+          // IOSurface fence wait in the kernel. When concurrent session is
+          // rendering via Metal, fence waits 5+ min. OS reclaims IOSurface/GPU
+          // memory at process exit.
+          NSLog(@"[VanguardGraphRuntime] pool=%p deferred to process exit "
+                @"(IOSurface fence safety)",
+                capturedPool);
           (void)capturedPool;
         }
       });
@@ -532,6 +571,108 @@ static BOOL VGRIsImageURL(NSURL *url) {
   return _renderer.seekPreviewPaused;
 }
 
+// ─── P3-3 TRANSITIONAL filter chain ownership ────────────────────────────────
+// Remove in Phase 4 when VGGraphScheduler owns callback interception (DEC-50).
+
+/// Stores the runtime-owned UMF filter chain and forwards it to the renderer
+/// via the narrow Option-B adapter seam (setRuntimeFilterChain:).
+///
+/// Lifecycle: nodes being removed from the chain have -invalidate called
+/// synchronously on the caller thread BEFORE the new chain is forwarded to
+/// the renderer. This mirrors the invalidate-before-swap guarantee in
+/// replaceFilterChain: (RR-26).
+///
+/// If the renderer is not yet prepared (nil), the chain is stored and will be
+/// applied when prepare completes.
+- (void)setFilterChain:(NSArray<id<VGMetalFilterNode>> *)chain {
+  NSArray<id<VGMetalFilterNode>> *newChain = chain ? [chain copy] : @[];
+
+  // Invalidate nodes being removed from the chain BEFORE forwarding.
+  // This mirrors the replaceFilterChain: invalidate-before-swap guarantee.
+  NSArray<id<VGMetalFilterNode>> *current = self.filterChainStorage ?: @[];
+  NSSet<id<VGMetalFilterNode>> *newSet = [NSSet setWithArray:newChain];
+  for (id<VGMetalFilterNode> node in current) {
+    if (![newSet containsObject:node]) {
+      [node invalidate];
+    }
+  }
+
+  // Store as logical owner.
+  self.filterChainStorage = newChain;
+
+  // Forward to scheduler ONLY (P4-5: renderer no longer executes filters).
+  // RR-31 CLOSED: setRuntimeFilterChain: renderer forward removed.
+  [self.scheduler setFilterChain:newChain];
+}
+
+// ─── P3-4 Thermal back-pressure
+// ────────────────────────────────────────────────
+
+/// Applies the 3-tier thermal degradation policy to all VGMetalFilterNode
+/// objects in filterChainStorage. Does NOT swap or invalidate the chain — only
+/// toggles node.enabled to adjust GPU load.
+///
+/// Tier policy (mirrors VGPluginLifecycleObserver G-04 handler):
+///   nominal / fair   → all nodes enabled
+///   serious          → segmentation node(s) disabled; LUT and Beauty remain
+///   active critical         → all nodes disabled (chain stays in place; zero
+///   GPU work)
+///
+/// Thread-safety: called from main thread via VGPluginLifecycleObserver
+/// (registered with queue: .main). node.enabled is @property (nonatomic,
+/// assign), but since the runtime chain is always accessed from the renderer's
+/// videoDecodeQueue for reads, and we only write from main here, the window for
+/// a data race is identical to the pre-existing _filterChainEnabled pattern
+/// in VanguardMetalRenderer (same queue contract). Acceptable in P3-3/P3-4;
+/// Phase 4 scheduler will own this coordination.
+- (void)setRuntimeThermalState:(NSProcessInfoThermalState)state {
+  NSArray<id<VGMetalFilterNode>> *chain = self.filterChainStorage;
+  if (!chain.count)
+    return; // no runtime chain — nothing to degrade
+
+  switch (state) {
+  case NSProcessInfoThermalStateNominal:
+  case NSProcessInfoThermalStateFair:
+    // Full quality: enable all runtime filter nodes.
+    for (id<VGMetalFilterNode> node in chain) {
+      node.enabled = YES;
+    }
+    NSLog(@"[VanguardGraphRuntime] Thermal ≤Fair → all filter nodes enabled");
+    break;
+
+  case NSProcessInfoThermalStateSerious:
+    // Reduce GPU load: disable expensive nodes (segmentation: Vision + Metal
+    // ≤5ms). Non-expensive nodes (LUT ≤2ms, Beauty ≤3ms) remain active. Node
+    // cost is declared via the isExpensive protocol property
+    // (VGMetalFilterNode.h). VanguardMLGate handles its own interval step-up
+    // independently.
+    for (id<VGMetalFilterNode> node in chain) {
+      node.enabled = !node.isExpensive;
+    }
+    NSLog(@"[VanguardGraphRuntime] Thermal Serious → expensive filter nodes "
+          @"disabled");
+    break;
+
+  case NSProcessInfoThermalStateCritical:
+    // Emergency: disable ALL nodes. Chain stays installed (no invalidate, no
+    // swap). Frame delivery continues with passthrough — no frame drop.
+    // Recovery (nominal/fair above) re-enables nodes without chain re-install.
+    for (id<VGMetalFilterNode> node in chain) {
+      node.enabled = NO;
+    }
+    NSLog(
+        @"[VanguardGraphRuntime] Thermal Critical → all filter nodes disabled");
+    break;
+
+  default:
+    break;
+  }
+
+  // P4-3: Dual-forward to dormant scheduler. Scheduler stores state only;
+  // no execution. Renderer/node logic above remains sole active path.
+  [self.scheduler applyThermalState:state];
+}
+
 // ─── Private helpers
 // ──────────────────────────────────────────────────────────
 
@@ -539,10 +680,9 @@ static BOOL VGRIsImageURL(NSURL *url) {
   if (_sessionPool) {
     CVPixelBufferPoolRef poolToRelease = _sessionPool;
     _sessionPool = NULL;
-    dispatch_async(
-        dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
-          CVPixelBufferPoolRelease(poolToRelease);
-        });
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+      CVPixelBufferPoolRelease(poolToRelease);
+    });
   }
 }
 
@@ -557,6 +697,11 @@ static BOOL VGRIsImageURL(NSURL *url) {
     [_renderer dispose];
     [_source invalidate];
     [self _releaseSessionPool];
+  }
+  // P4-3: Safety net for scheduler regardless of _invalidated path.
+  // invalidate is idempotent so double-call is safe.
+  if (self.scheduler) {
+    [self.scheduler invalidate];
   }
 }
 

@@ -57,7 +57,15 @@ Pod::Spec.new do |s|
       'Tests/VGMediaNodeConformanceTest.m',
       # Phase 1B test files (P1B-02: ObjC runtime lifecycle, P1B-04: Swift registry)
       'Tests/VGGraphRuntimeLifecycleTest.m',
-      'Tests/VGSessionRegistryTest.swift'
+      'Tests/VGSessionRegistryTest.swift',
+      # Phase 4 P4-3: Runtime scheduler integration gate
+      'Tests/VGRuntimeSchedulerIntegrationTest.m',
+      # Phase 4 P4-4: Renderer GPU-sink entry point gate
+      'Tests/VGRendererPresentEnvelopeTest.m',
+      # Phase 4 P4-2: Scheduler skeleton lifecycle gate (P4-5 precondition)
+      'Tests/VGGraphSchedulerSkeletonTest.m',
+      # Phase 4 P4-2: Scheduler chain swap gate (P4-5 precondition)
+      'Tests/VGSchedulerChainSwapTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'

@@ -17,10 +17,16 @@
 #import "VanguardFileMediaSource.h"
 #import "VanguardFilterNode.h"  // Full protocol
 #import "VanguardMediaSource.h" // Full protocol
+// P3-3 TRANSITIONAL — remove in Phase 4 (DEC-50, RR-31)
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
+#import <UMF/VGFrameEnvelope.h>   // VGFrameEnvelope struct for UMF filter nodes
+#import <UMF/VGMetalFilterNode.h> // runtime-owned UMF filter node protocol
+// P4-5: VGFrameDelegate — scheduler frame-forwarding protocol
+#import "VGFrameDelegate.h"
 #include <os/lock.h>
 #include <os/signpost.h>
+#include <stdatomic.h>
 
 static os_log_t _rendererLog;
 
@@ -52,6 +58,13 @@ static os_log_t _rendererLog;
   NSArray<id<VanguardFilterNode>> *_filterChain;
   BOOL _filterChainEnabled;
 
+  // P3-3 TRANSITIONAL — remove in Phase 4 (DEC-50, RR-31)
+  // Runtime-owned UMF filter chain. When non-nil and non-empty,
+  // _runtimeFilterChain is executed via
+  // VGMetalFilterNode.processEnvelope:device: INSTEAD of _filterChain. This
+  // prevents double filtering. See setRuntimeFilterChain:.
+  NSArray<id<VGMetalFilterNode>> *_runtimeFilterChain;
+
   // ── Playback clock (P1-T5 rate-aware _timeProvider) ─────────────────────
   CADisplayLink *_displayLink;
   double _playbackStartWall; // wall time of t=0 (recalibrated on rate change)
@@ -78,6 +91,11 @@ static os_log_t _rendererLog;
   double _seekTargetPTS; // gate: don't pull sequential frames until masterClock
                          // >= this
   BOOL _isFetchingFrame;
+
+  // P4-5: RR-35 — set to YES in dispose() so that any in-flight
+  // _onVideoFrame: on _videoDecodeQueue returns immediately rather than
+  // falling through to the legacy path on a partially-disposed renderer.
+  _Atomic(BOOL) _disposed;
 }
 
 @synthesize textureId = _textureId;
@@ -86,6 +104,10 @@ static os_log_t _rendererLog;
 @synthesize filterChainEnabled = _filterChainEnabled;
 // Phase A1-S1: expose pool for backfill into VanguardImageProcessor
 @synthesize pixelBufferPool = _pixelBufferPool;
+// P4-5: frameDelegate — weak ref to VGGraphScheduler; managed by ARC.
+// No manual synthesize needed for weak object properties unless name differs.
+// Explicit synthesize prevents accidental shadowing by a subclass.
+@synthesize frameDelegate = _frameDelegate;
 
 /// G-02: currentTimeSeconds — diagnostic accessor for A/V sync test.
 - (double)currentTimeSeconds {
@@ -278,7 +300,6 @@ static os_log_t _rendererLog;
           libraryError.localizedDescription);
     return;
   }
-
 
   id<MTLFunction> vertexFn = [library newFunctionWithName:@"vanguard_vertex"];
   id<MTLFunction> fragmentFn =
@@ -752,6 +773,36 @@ static os_log_t _rendererLog;
   }
 }
 
+// P3-3 TRANSITIONAL — remove in Phase 4 (DEC-50, RR-31)
+/// Sets the runtime-owned UMF filter chain atomically on the video decode
+/// queue. Uses the same dispatch_barrier_async pattern as replaceFilterChain:
+/// (RR-26). Does NOT call invalidate on removed nodes — the runtime owns
+/// lifecycle; VanguardGraphRuntime.setFilterChain: is responsible for calling
+/// invalidate on nodes being dropped from the chain.
+- (void)setRuntimeFilterChain:(NSArray<id<VGMetalFilterNode>> *)chain {
+  // Defensive copy before the barrier — caller must not mutate the array
+  // after this call, but we cannot enforce that contract on an NSArray copy.
+  NSArray<id<VGMetalFilterNode>> *safeChain = chain ? [chain copy] : @[];
+
+  dispatch_queue_t decodeQ = nil;
+  if ([_source isKindOfClass:[VanguardFileMediaSource class]]) {
+    decodeQ = ((VanguardFileMediaSource *)_source).videoDecodeQueue;
+  }
+
+  if (decodeQ) {
+    // dispatch_barrier_async ensures _onVideoFrame: is not mid-execution
+    // during the swap. Mirrors the replaceFilterChain: pattern (RR-26).
+    dispatch_barrier_async(decodeQ, ^{
+      self->_runtimeFilterChain = safeChain;
+    });
+  } else {
+    // No videoDecodeQueue (camera source or unknown) — caller is on main
+    // thread. Runtime-owned chain is playback-only, so this path should not be
+    // reached. Assign synchronously as a safe fallback.
+    _runtimeFilterChain = safeChain;
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Frame Callbacks from Source
 // ─────────────────────────────────────────────────────────────────────────────
@@ -759,12 +810,87 @@ static os_log_t _rendererLog;
 /// Fired by the source on its decode queue (not main thread).
 - (void)_onVideoFrame:(CVPixelBufferRef)rawFrame pts:(CMTime)pts {
   __weak __typeof(self) weakSelf = self;
+
+  // ── P4-5: RR-35 guard ───────────────────────────────────────────────────
+  // If dispose() has already run, _disposed = YES. Any in-flight callback
+  // on _videoDecodeQueue must drop the frame and return immediately.
+  if (atomic_load(&_disposed)) {
+    CVPixelBufferRelease(rawFrame);
+    return;
+  }
+
+  // ── P4-5: A/B branch ────────────────────────────────────────────────────
+  // When a frameDelegate is installed (scheduler active), forward the raw
+  // frame and return. The scheduler owns all filter execution and sink
+  // delivery for this frame cycle. The legacy path is NOT executed.
+  id<VGFrameDelegate> delegate = _frameDelegate; // load weak ref once
+  if (delegate) {
+    // Build VGFrameEnvelope for the raw frame. generation is 0 here;
+    // the scheduler increments its own generation counter independently.
+    VGFrameEnvelope rawEnvelope;
+    memset(&rawEnvelope, 0, sizeof(VGFrameEnvelope));
+    rawEnvelope.payload.videoBuffer = rawFrame;
+    rawEnvelope.pts                 = pts;
+    rawEnvelope.generation          = 0;
+    // Forward synchronously on this queue (_videoDecodeQueue). The delegate
+    // will call [sink presentEnvelope:] before returning (RR-36 sync rule).
+    [delegate didReceiveRawFrame:rawEnvelope];
+    // Caller retained rawFrame before passing it here; release our ref now
+    // that the delegate has had its chance to retain via presentEnvelope:.
+    CVPixelBufferRelease(rawFrame);
+    return;
+  }
+
+  // RR-35: Debug assertion — unexpected nil delegate on a live (non-disposed)
+  // renderer. This fires if P4-5 wiring is incomplete or the scheduler was
+  // deallocated prematurely while the renderer is still running.
+  NSAssert(_disposed || _filterChainEnabled || _runtimeFilterChain.count == 0 ||
+               _frameDelegate != nil,
+           @"[RR-35] Renderer._onVideoFrame: frameDelegate is nil on a "
+            "non-disposed, non-camera renderer — P4-5 wiring may be missing.");
+
   _lastDecodedPTS = CMTimeGetSeconds(pts);
   CVPixelBufferRef frame = rawFrame;
 
+  // P3-3 TRANSITIONAL: if the runtime has installed a UMF filter chain, execute
+  // it via VGMetalFilterNode.processEnvelope:device: and bypass the legacy
+  // VanguardFilterNode chain to prevent double filtering (DEC-50, RR-26).
+  //
+  // If _runtimeFilterChain is nil or empty, fall through to the legacy chain.
+  // This preserves the legacy filter path for non-runtime callers (camera
+  // renderer, tests) and matches RR-27 audit findings.
+  NSArray<id<VGMetalFilterNode>> *runtimeChain = _runtimeFilterChain;
+  if (runtimeChain.count > 0) {
+    // Build a VGFrameEnvelope for the raw frame.
+    VGFrameEnvelope envelope;
+    memset(&envelope, 0, sizeof(VGFrameEnvelope));
+    envelope.payload.videoBuffer =
+        rawFrame; // raw frame — not retained by envelope
+    envelope.pts = pts;
+    envelope.generation =
+        0; // no generation counter in P3-3 (runtime-level concern)
 
-  // P1-T3: Apply filter chain (empty in Phase 1 — zero cost)
-  if (_filterChainEnabled && _filterChain.count > 0) {
+    for (id<VGMetalFilterNode> node in runtimeChain) {
+      VGFrameEnvelope result = [node processEnvelope:envelope device:_device];
+      // NULL output payload signals filter failure (memory pressure,
+      // invalidated). On failure: release any non-raw intermediate and revert
+      // to rawFrame.
+      if (!result.payload.videoBuffer) {
+        if (frame != rawFrame)
+          CVPixelBufferRelease(frame); // release dangling intermediate
+        frame = rawFrame;              // revert to unfiltered frame
+        break; // skip remaining nodes; deliver raw frame
+      }
+      // Release the previous intermediate before advancing (avoids leak).
+      if (frame != rawFrame)
+        CVPixelBufferRelease(frame);
+      frame = result.payload.videoBuffer; // result is retained by the node
+      // Update envelope for the next node in the chain.
+      envelope = result;
+    }
+  } else if (_filterChainEnabled && _filterChain.count > 0) {
+    // Legacy VanguardFilterNode path — only executed when runtime chain is
+    // absent.
     for (id<VanguardFilterNode> node in _filterChain) {
       if (!node.enabled)
         continue;
@@ -925,6 +1051,53 @@ static os_log_t _rendererLog;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - P4-4: GPU-Sink Entry Point
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Renderer-sink work only. See header for full ownership contract (RR-36).
+/// Not called in P4-4 — additive and dormant until P4-5 wires it.
+- (void)presentEnvelope:(VGFrameEnvelope)envelope {
+  // RR-36 debug guard: a NULL payload is a scheduler-side ownership bug.
+  NSAssert(envelope.payload.videoBuffer != NULL,
+           @"[VanguardRenderer] presentEnvelope: received NULL videoBuffer "
+           @"(RR-36 buffer ownership violation — check scheduler release order)");
+  if (!envelope.payload.videoBuffer) {
+    return;
+  }
+
+  // RR-36 ownership rule: retain before storing.
+  // Correct for both origins:
+  //   • Source-owned (no filters): source holds its own +1; renderer adds +1 here.
+  //   • Scheduler-produced (filters ran): scheduler holds filter-output +1;
+  //     renderer adds +1 here; scheduler releases its +1 after we return.
+  // Net result: renderer holds sole +1 after scheduler cleanup, matching the
+  // behaviour of _onVideoFrame: line 908 (CVPixelBufferRetain(frame)).
+  CVPixelBufferRef incoming = CVPixelBufferRetain(
+      (CVPixelBufferRef)envelope.payload.videoBuffer);
+
+  // P0-T7: swap _latestPixelBuffer — identical to _onVideoFrame: tail (L904).
+  CVPixelBufferRef old = NULL;
+  os_unfair_lock_lock(&_pixelBufferLock);
+  old = _latestPixelBuffer;
+  _latestPixelBuffer = incoming;
+  os_unfair_lock_unlock(&_pixelBufferLock);
+  if (old)
+    CVPixelBufferRelease(old);
+
+  // Signal Flutter — async to main, mirroring _onVideoFrame: tail (L926).
+  // _isFetchingFrame is NOT cleared here: it belongs to the renderer's own
+  // source-pull path (_renderFrameAtSourceTime:) and must not be touched by
+  // this scheduler-facing sink.
+  __weak __typeof(self) weakSelf = self;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    __strong __typeof(weakSelf) strong = weakSelf;
+    if (!strong)
+      return;
+    [strong->_textureRegistry textureFrameAvailable:strong->_textureId];
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Memory Pressure (P0-T5)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -949,7 +1122,11 @@ static os_log_t _rendererLog;
 // ─────────────────────────────────────────────────────────────────────────────
 
 - (void)dispose {
-  [self pause]; // also calls [_source stop]
+  // P4-5: RR-35 — mark renderer as disposed so any in-flight _onVideoFrame:
+  // callbacks on _videoDecodeQueue drop frames safely.
+  atomic_store(&_disposed, YES);
+
+  [self pause];   // also calls [_source stop]
   [_source stop]; // idempotent; ensure stopped even if not playing
 
   if (_displayLink) {

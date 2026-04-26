@@ -11,7 +11,7 @@ import 'vg_playback_session.dart';
 
 export 'vanguard_texture_view.dart';
 export 'vanguard_media_preparer.dart';
-
+export 'vg_filter_spec.dart';
 
 const String _libName = 'vanguard_media_engine';
 
@@ -44,17 +44,47 @@ typedef _EngineCreate = Pointer<Void> Function(int mode);
 typedef _c_engine_destroy = Void Function(Pointer<Void> engine);
 typedef _EngineDestroy = void Function(Pointer<Void> engine);
 
-typedef _c_add_video_node = Void Function(Pointer<Void> engine, Pointer<Utf8> path, Double startTime, Int32 layerId);
-typedef _AddVideoNode = void Function(Pointer<Void> engine, Pointer<Utf8> path, double startTime, int layerId);
+typedef _c_add_video_node =
+    Void Function(
+      Pointer<Void> engine,
+      Pointer<Utf8> path,
+      Double startTime,
+      Int32 layerId,
+    );
+typedef _AddVideoNode =
+    void Function(
+      Pointer<Void> engine,
+      Pointer<Utf8> path,
+      double startTime,
+      int layerId,
+    );
 
-typedef _c_add_bitmap_overlay = Void Function(Pointer<Void> engine, Pointer<Utf8> id, Double startTime, Double duration, Int32 layerId);
-typedef _AddBitmapOverlay = void Function(Pointer<Void> engine, Pointer<Utf8> id, double startTime, double duration, int layerId);
+typedef _c_add_bitmap_overlay =
+    Void Function(
+      Pointer<Void> engine,
+      Pointer<Utf8> id,
+      Double startTime,
+      Double duration,
+      Int32 layerId,
+    );
+typedef _AddBitmapOverlay =
+    void Function(
+      Pointer<Void> engine,
+      Pointer<Utf8> id,
+      double startTime,
+      double duration,
+      int layerId,
+    );
 
-typedef _c_add_audio_node = Void Function(Pointer<Void> engine, Pointer<Utf8> path, Double startTime);
-typedef _AddAudioNode = void Function(Pointer<Void> engine, Pointer<Utf8> path, double startTime);
+typedef _c_add_audio_node =
+    Void Function(Pointer<Void> engine, Pointer<Utf8> path, Double startTime);
+typedef _AddAudioNode =
+    void Function(Pointer<Void> engine, Pointer<Utf8> path, double startTime);
 
-typedef _c_set_node_duration = Void Function(Pointer<Void> engine, Pointer<Utf8> path, Double duration);
-typedef _SetNodeDuration = void Function(Pointer<Void> engine, Pointer<Utf8> path, double duration);
+typedef _c_set_node_duration =
+    Void Function(Pointer<Void> engine, Pointer<Utf8> path, Double duration);
+typedef _SetNodeDuration =
+    void Function(Pointer<Void> engine, Pointer<Utf8> path, double duration);
 
 typedef _c_set_playhead = Void Function(Pointer<Void> engine, Double timeSec);
 typedef _SetPlayhead = void Function(Pointer<Void> engine, double timeSec);
@@ -67,25 +97,47 @@ typedef _c_last_error = Int32 Function(Pointer<Void> unused);
 typedef _LastError = int Function(Pointer<Void> unused);
 
 class _VanguardFFI {
-  static final _EngineCreate create = _dylib.lookupFunction<_c_engine_create, _EngineCreate>('vanguard_engine_create');
-  static final _EngineDestroy destroy = _dylib.lookupFunction<_c_engine_destroy, _EngineDestroy>('vanguard_engine_destroy');
-  static final _AddVideoNode addVideoNode = _dylib.lookupFunction<_c_add_video_node, _AddVideoNode>('vanguard_engine_add_video_node');
-  static final _AddBitmapOverlay addBitmapOverlay = _dylib.lookupFunction<_c_add_bitmap_overlay, _AddBitmapOverlay>('vanguard_engine_add_bitmap_overlay');
-  static final _AddAudioNode addAudioNode = _dylib.lookupFunction<_c_add_audio_node, _AddAudioNode>('vanguard_engine_add_audio_node');
-  static final _SetNodeDuration setNodeDuration = _dylib.lookupFunction<_c_set_node_duration, _SetNodeDuration>('vanguard_engine_set_node_duration');
-  static final _SetPlayhead setPlayhead = _dylib.lookupFunction<_c_set_playhead, _SetPlayhead>('vanguard_engine_set_playhead');
-  static final _GetDuration getDuration = _dylib.lookupFunction<_c_get_duration, _GetDuration>('vanguard_engine_get_duration');
-  static final _LastError lastError = _dylib.lookupFunction<_c_last_error, _LastError>('vanguard_engine_last_error');
+  static final _EngineCreate create = _dylib
+      .lookupFunction<_c_engine_create, _EngineCreate>(
+        'vanguard_engine_create',
+      );
+  static final _EngineDestroy destroy = _dylib
+      .lookupFunction<_c_engine_destroy, _EngineDestroy>(
+        'vanguard_engine_destroy',
+      );
+  static final _AddVideoNode addVideoNode = _dylib
+      .lookupFunction<_c_add_video_node, _AddVideoNode>(
+        'vanguard_engine_add_video_node',
+      );
+  static final _AddBitmapOverlay addBitmapOverlay = _dylib
+      .lookupFunction<_c_add_bitmap_overlay, _AddBitmapOverlay>(
+        'vanguard_engine_add_bitmap_overlay',
+      );
+  static final _AddAudioNode addAudioNode = _dylib
+      .lookupFunction<_c_add_audio_node, _AddAudioNode>(
+        'vanguard_engine_add_audio_node',
+      );
+  static final _SetNodeDuration setNodeDuration = _dylib
+      .lookupFunction<_c_set_node_duration, _SetNodeDuration>(
+        'vanguard_engine_set_node_duration',
+      );
+  static final _SetPlayhead setPlayhead = _dylib
+      .lookupFunction<_c_set_playhead, _SetPlayhead>(
+        'vanguard_engine_set_playhead',
+      );
+  static final _GetDuration getDuration = _dylib
+      .lookupFunction<_c_get_duration, _GetDuration>(
+        'vanguard_engine_get_duration',
+      );
+  static final _LastError lastError = _dylib
+      .lookupFunction<_c_last_error, _LastError>('vanguard_engine_last_error');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
-enum VanguardMode {
-  nleOffline,
-  livestream,
-}
+enum VanguardMode { nleOffline, livestream }
 
 class VanguardEngine {
   // G-01: Hot-reload protection.
@@ -168,7 +220,7 @@ class VanguardEngine {
   Future<dynamic> _handleNativeCallback(MethodCall call) async {
     switch (call.method) {
       case 'onNodeDurationProbed':
-        final path     = call.arguments['path']     as String;
+        final path = call.arguments['path'] as String;
         final duration = call.arguments['duration'] as double;
         // Update C++ TimelineManager with the real probed duration
         final pathPtr = path.toNativeUtf8();
@@ -237,7 +289,11 @@ class VanguardEngine {
   /// dimensions of the video after applying preferredTransform).
   /// Use [textureId] with [VanguardTextureView] and pass [width]/[height] to it
   /// so the preview container sizes correctly for both portrait and landscape video.
-  Future<({int textureId, int width, int height})> createVideoTexture(String path, {required double startTime, int layerId = 0}) async {
+  Future<({int textureId, int width, int height})> createVideoTexture(
+    String path, {
+    required double startTime,
+    int layerId = 0,
+  }) async {
     // P1B-09: Route through VGPlaybackClient which normalises both the legacy
     // Map return and the new graph-runtime Map return into a VGPlaybackSession.
     // _activeRenderers is still populated for dispose() and hot-reload safety.
@@ -259,11 +315,10 @@ class VanguardEngine {
     _activeRenderers[id] = path;
     _sessions[id] = session;
 
-    final w = (rawMap?['width']  as num?)?.toInt() ?? 1080;
+    final w = (rawMap?['width'] as num?)?.toInt() ?? 1080;
     final h = (rawMap?['height'] as num?)?.toInt() ?? 1920;
     return (textureId: id, width: w, height: h);
   }
-
 
   Future<void> play(int textureId) async {
     // P1B-09: Delegate to session if one exists; fall back to raw channel call
@@ -294,7 +349,10 @@ class VanguardEngine {
     if (session != null) {
       await session.seekTo(seconds);
     } else {
-      await _channel.invokeMethod('seekTo', {'textureId': textureId, 'seconds': seconds});
+      await _channel.invokeMethod('seekTo', {
+        'textureId': textureId,
+        'seconds': seconds,
+      });
     }
   }
 
@@ -323,10 +381,10 @@ class VanguardEngine {
   /// The _videoCallback is wired to the renderer BEFORE the capture session
   /// starts, eliminating any callback-arrival-before-wire race.
   static Future<int> startCamera({int position = 1, int fps = 30}) async {
-    final id = await _cameraChannel.invokeMethod<int>(
-      'startCamera',
-      {'position': position, 'fps': fps},
-    );
+    final id = await _cameraChannel.invokeMethod<int>('startCamera', {
+      'position': position,
+      'fps': fps,
+    });
     if (id == null || id < 0) {
       throw StateError('[Vanguard] startCamera: native returned no texture id');
     }
@@ -347,10 +405,9 @@ class VanguardEngine {
   /// Throws [PlatformException] with code 'RECORDING_ACTIVE' if called while
   /// a recording is active. Guard by disabling the button in recording state.
   static Future<void> switchCamera({int position = 1}) async {
-    await _cameraChannel.invokeMethod<void>(
-      'switchCamera',
-      {'position': position},
-    );
+    await _cameraChannel.invokeMethod<void>('switchCamera', {
+      'position': position,
+    });
   }
 
   /// Sets zoom level. 1.0 = no zoom; clamped to device max on native side.
@@ -388,10 +445,9 @@ class VanguardEngine {
   ///   'ENCODE_FAIL' — JPEG encoding or disk write failed
   ///   'NO_CAMERA'   — startCamera was not called
   static Future<String> takePhoto(String path) async {
-    final filePath = await _cameraChannel.invokeMethod<String>(
-      'takePhoto',
-      {'path': path},
-    );
+    final filePath = await _cameraChannel.invokeMethod<String>('takePhoto', {
+      'path': path,
+    });
     if (filePath == null) {
       throw PlatformException(
         code: 'ENCODE_FAIL',
@@ -442,10 +498,7 @@ class VanguardEngine {
   /// Begins video recording to [path]. Must be called after [startCamera].
   /// [path] must be a writable local path with a .mp4 extension.
   static Future<void> startRecording(String path) async {
-    await _cameraChannel.invokeMethod<void>(
-      'startRecording',
-      {'path': path},
-    );
+    await _cameraChannel.invokeMethod<void>('startRecording', {'path': path});
   }
 
   /// Stops recording and finalises the MP4.
@@ -480,11 +533,11 @@ class VanguardEngine {
     double maxSeconds = 30.0,
   }) async {
     final result = await _channel.invokeMethod<Map>('startExport', {
-      'clips':      clips,
+      'clips': clips,
       'outputPath': outputPath,
-      'audioPath':  audioPath,
+      'audioPath': audioPath,
       'audioStart': audioStart,
-      'bitrate':    bitrate,
+      'bitrate': bitrate,
       'maxSeconds': maxSeconds,
     });
     final success = result?['success'] as bool? ?? false;
@@ -513,12 +566,13 @@ class VanguardEngine {
     double? trimEnd,
   }) async {
     final result = await _channel.invokeMethod<String>('extractAudio', {
-      'videoPath':  videoPath,
+      'videoPath': videoPath,
       'outputPath': outputPath,
-      'trimStart':  trimStart,
-      'trimEnd':    trimEnd ?? double.infinity,
+      'trimStart': trimStart,
+      'trimEnd': trimEnd ?? double.infinity,
     });
-    if (result == null) throw Exception('[Vanguard] Audio extraction failed for: $videoPath');
+    if (result == null)
+      throw Exception('[Vanguard] Audio extraction failed for: $videoPath');
     return result;
   }
 
@@ -533,9 +587,10 @@ class VanguardEngine {
   /// This replaces `VideoPlayerController.file` as the I-5-compliant duration
   /// probing path. (Phase A2-S1 validation fix.)
   static Future<double?> probeVideoDuration(String videoPath) async {
-    final result = await _cameraChannel.invokeMethod<double>('probeVideoDuration', {
-      'path': videoPath,
-    });
+    final result = await _cameraChannel.invokeMethod<double>(
+      'probeVideoDuration',
+      {'path': videoPath},
+    );
     if (result == null || result < 0) return null;
     return result;
   }
@@ -557,8 +612,8 @@ class VanguardEngine {
     if (raw == null) return null;
     return {
       'duration': (raw['duration'] as num?)?.toDouble() ?? -1.0,
-      'width':    (raw['width']    as num?)?.toInt()    ?? 0,
-      'height':   (raw['height']   as num?)?.toInt()    ?? 0,
+      'width': (raw['width'] as num?)?.toInt() ?? 0,
+      'height': (raw['height'] as num?)?.toInt() ?? 0,
     };
   }
 
@@ -584,11 +639,11 @@ class VanguardEngine {
     double durationSeconds = 15.0,
   }) async {
     final raw = await _cameraChannel.invokeMethod<Map>('flattenImageToVideo', {
-      'imagePath':         imagePath,
-      'audioPath':         audioPath,
+      'imagePath': imagePath,
+      'audioPath': audioPath,
       'audioStartSeconds': audioStartSeconds,
-      'outputPath':        outputPath,
-      'durationSeconds':   durationSeconds,
+      'outputPath': outputPath,
+      'durationSeconds': durationSeconds,
     });
     if (raw?['success'] == true) {
       return raw!['outputPath'] as String?;
@@ -620,12 +675,12 @@ class VanguardEngine {
     double durationSeconds = 15.0,
   }) async {
     final raw = await _cameraChannel.invokeMethod<Map>('flattenVideo', {
-      'videoPath':         videoPath,
-      'overlayPNGPath':    overlayPNGPath,
-      'audioPath':         audioPath,
+      'videoPath': videoPath,
+      'overlayPNGPath': overlayPNGPath,
+      'audioPath': audioPath,
       'audioStartSeconds': audioStartSeconds,
-      'outputPath':        outputPath,
-      'durationSeconds':   durationSeconds,
+      'outputPath': outputPath,
+      'durationSeconds': durationSeconds,
     });
     if (raw?['success'] == true) {
       return raw!['outputPath'] as String?;
@@ -654,8 +709,8 @@ class VanguardEngine {
     required String outputPath,
   }) async {
     final raw = await _cameraChannel.invokeMethod<Map>('compositeDualCamera', {
-      'backPath':   backPath,
-      'frontPath':  frontPath,
+      'backPath': backPath,
+      'frontPath': frontPath,
       'outputPath': outputPath,
     });
     if (raw?['success'] == true) {
@@ -665,7 +720,6 @@ class VanguardEngine {
   }
 
   /// Generates evenly-spaced JPEG thumbnail frames from a video for the filmstrip UI.
-
 
   ///
   /// - [videoPath]: source video
@@ -680,13 +734,11 @@ class VanguardEngine {
   }) async {
     final result = await _channel.invokeMethod<List>('generateThumbnails', {
       'videoPath': videoPath,
-      'count':     count,
-      'duration':  duration,
+      'count': count,
+      'duration': duration,
     });
     if (result == null) return [];
-    return result
-        .whereType<Uint8List>()
-        .toList();
+    return result.whereType<Uint8List>().toList();
   }
 
   // ── C++ Timeline API ──────────────────────────────────────────────────────
@@ -697,9 +749,20 @@ class VanguardEngine {
     calloc.free(ptr);
   }
 
-  void addBitmapOverlay(String overlayId, {required double startTime, required double duration, int layerId = 10}) {
+  void addBitmapOverlay(
+    String overlayId, {
+    required double startTime,
+    required double duration,
+    int layerId = 10,
+  }) {
     final ptr = overlayId.toNativeUtf8();
-    _VanguardFFI.addBitmapOverlay(_enginePtr, ptr, startTime, duration, layerId);
+    _VanguardFFI.addBitmapOverlay(
+      _enginePtr,
+      ptr,
+      startTime,
+      duration,
+      layerId,
+    );
     calloc.free(ptr);
   }
 

@@ -44,7 +44,7 @@ private final class MockTextureRegistry: NSObject, FlutterTextureRegistry {
     private(set) var unregisterCount = 0
     private var nextId: Int64 = 100
 
-    func registerTexture(_ texture: FlutterTexture) -> Int64 {
+    func register(_ texture: FlutterTexture) -> Int64 {
         registerCount += 1
         defer { nextId += 1 }
         return nextId
@@ -130,7 +130,7 @@ final class VGSessionRegistryTest: XCTestCase {
             url:             stubVideoURL,
             textureRegistry: texReg,
             methodChannel:   channel
-        ) { _ in /* ignored */ }
+        ) { _, _ in /* ignored */ }
 
         // Second call — Phase 1 constraint will evict the first session first,
         // but both sessionIds are generated before any eviction races occur.
@@ -138,7 +138,7 @@ final class VGSessionRegistryTest: XCTestCase {
             url:             stubVideoURL,
             textureRegistry: texReg,
             methodChannel:   channel
-        ) { _ in /* ignored */ }
+        ) { _, _ in /* ignored */ }
 
         XCTAssertFalse(id1.isEmpty,
             "First sessionId must be non-empty")
@@ -172,7 +172,7 @@ final class VGSessionRegistryTest: XCTestCase {
             url:             stubVideoURL,
             textureRegistry: texReg,
             methodChannel:   channel
-        ) { _ in completionFired = true }
+        ) { _, _ in completionFired = true }
 
         // At this point createSession has returned but completion has not yet fired
         // (it fires on a background queue).
@@ -208,7 +208,7 @@ final class VGSessionRegistryTest: XCTestCase {
             url:             pngURL,
             textureRegistry: texReg,
             methodChannel:   channel
-        ) { tid in
+        ) { tid, _ in
             deliveredTextureId = tid
             prepExp.fulfill()
         }
@@ -261,7 +261,7 @@ final class VGSessionRegistryTest: XCTestCase {
             url:             stubVideoURL,
             textureRegistry: texReg,
             methodChannel:   channel
-        ) { _ in /* await not needed here */ }
+        ) { _, _ in /* await not needed here */ }
 
         // Synchronous read — primary map is set before createSession returns.
         let rt = reg.runtime(forSessionId: sessionId)
@@ -312,7 +312,7 @@ final class VGSessionRegistryTest: XCTestCase {
             url:             pngURL,
             textureRegistry: texReg,
             methodChannel:   channel
-        ) { tid in
+        ) { tid, _ in
             textureId = tid
             prepExp.fulfill()
         }
@@ -370,7 +370,7 @@ final class VGSessionRegistryTest: XCTestCase {
         let prepExp = expectation(description: "prepare")
         var textureId: Int64 = -1
 
-        reg.createSession(url: pngURL, textureRegistry: texReg, methodChannel: channel) { tid in
+        reg.createSession(url: pngURL, textureRegistry: texReg, methodChannel: channel) { tid, _ in
             textureId = tid
             prepExp.fulfill()
         }
@@ -406,7 +406,7 @@ final class VGSessionRegistryTest: XCTestCase {
             url:             stubVideoURL,
             textureRegistry: texReg,
             methodChannel:   channel
-        ) { _ in /* ignored */ }
+        ) { _, _ in /* ignored */ }
 
         // Pre-condition: primary map has one entry right after createSession.
         XCTAssertEqual(reg.sessionCount, 1,
@@ -436,7 +436,7 @@ final class VGSessionRegistryTest: XCTestCase {
             url:             stubVideoURL,
             textureRegistry: texReg,
             methodChannel:   channel
-        ) { _ in }
+        ) { _, _ in }
 
         XCTAssertEqual(reg.sessionCount, 1)
 
@@ -480,7 +480,7 @@ final class VGSessionRegistryTest: XCTestCase {
             url:             stubVideoURL,
             textureRegistry: texReg,
             methodChannel:   channel
-        ) { _ in /* ignored */ }
+        ) { _, _ in /* ignored */ }
 
         // Synchronous post-condition: primary map has exactly one entry.
         XCTAssertEqual(reg.sessionCount, 1,
@@ -493,7 +493,7 @@ final class VGSessionRegistryTest: XCTestCase {
             url:             stubVideoURL,
             textureRegistry: texReg,
             methodChannel:   channel
-        ) { _ in /* ignored */ }
+        ) { _, _ in /* ignored */ }
 
         // The two sessionIds must be different.
         XCTAssertNotEqual(sessionId1, sessionId2,
@@ -525,11 +525,11 @@ final class VGSessionRegistryTest: XCTestCase {
         let (reg, texReg, channel) = makeRegistry()
 
         let sid1 = reg.createSession(url: stubVideoURL, textureRegistry: texReg,
-                                     methodChannel: channel) { _ in }
+                                     methodChannel: channel) { _, _ in }
         let sid2 = reg.createSession(url: stubVideoURL, textureRegistry: texReg,
-                                     methodChannel: channel) { _ in }
+                                     methodChannel: channel) { _, _ in }
         let sid3 = reg.createSession(url: stubVideoURL, textureRegistry: texReg,
-                                     methodChannel: channel) { _ in }
+                                     methodChannel: channel) { _, _ in }
 
         XCTAssertNil(reg.runtime(forSessionId: sid1),
             "Session 1 must be evicted after session 2 is created")
@@ -551,12 +551,12 @@ final class VGSessionRegistryTest: XCTestCase {
         let (reg, texReg, channel) = makeRegistry()
 
         reg.createSession(url: stubVideoURL, textureRegistry: texReg,
-                          methodChannel: channel) { _ in }
+                          methodChannel: channel) { _, _ in }
         reg.invalidateAll()
         XCTAssertEqual(reg.sessionCount, 0, "After invalidateAll, count must be 0")
 
         let newSid = reg.createSession(url: stubVideoURL, textureRegistry: texReg,
-                                       methodChannel: channel) { _ in }
+                                       methodChannel: channel) { _, _ in }
         XCTAssertEqual(reg.sessionCount, 1, "New session after invalidateAll must restore count to 1")
         XCTAssertNotNil(reg.runtime(forSessionId: newSid))
 
@@ -578,7 +578,7 @@ final class VGSessionRegistryTest: XCTestCase {
             group.enter()
             DispatchQueue.global(qos: .userInitiated).async {
                 reg.createSession(url: self.stubURL(), textureRegistry: texReg,
-                                  methodChannel: channel) { _ in }
+                                  methodChannel: channel) { _, _ in }
                 group.leave()
             }
         }

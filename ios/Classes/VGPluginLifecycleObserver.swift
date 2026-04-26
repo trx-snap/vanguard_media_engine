@@ -168,11 +168,15 @@ final class VGPluginLifecycleObserver: NSObject {
         // own observer (allocated in VanguardCameraMediaSource init). This handler
         // manages the renderer and encoder controls which the camera source does
         // not own.
+        //
+        // P3-4: Also fans the state to all VanguardGraphRuntime instances so that
+        // runtime-owned VGMetalFilterNode chains degrade consistently with the
+        // legacy renderer filter chain.
         NotificationCenter.default.addObserver(
             forName: ProcessInfo.thermalStateDidChangeNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
-            guard let self, let plugin = self.plugin else { return }
+            guard let self, let plugin = self.plugin, let registry = self.registry else { return }
             let state = ProcessInfo.processInfo.thermalState
             NSLog("[Vanguard] Thermal change → %ld", state.rawValue)
             switch state {
@@ -180,6 +184,8 @@ final class VGPluginLifecycleObserver: NSObject {
                 // Full quality — all effects enabled.
                 plugin.renderers.values.forEach { $0.filterChainEnabled = true }
                 plugin.streamingEncoder?.setBitrateKbps(4000)
+                // P3-4: fan to runtime-owned filter chains.
+                registry.allRuntimes().forEach { $0.setRuntimeThermalState(state) }
             case .serious:
                 // Reduce GPU load: disable segmentation (most expensive filter).
                 // LUT and Beauty remain active. Halve encoder bitrate.
@@ -189,6 +195,8 @@ final class VGPluginLifecycleObserver: NSObject {
                 }
                 plugin.streamingEncoder?.setBitrateKbps(2000)
                 NSLog("[Vanguard] Thermal Serious — segmentation suppressed by MLGate interval")
+                // P3-4: fan to runtime-owned filter chains.
+                registry.allRuntimes().forEach { $0.setRuntimeThermalState(state) }
             case .critical:
                 // Emergency: disable entire Metal filter chain.
                 // P5: Use replaceFilterChain([]) — not filterChainEnabled=false — so that
@@ -197,6 +205,8 @@ final class VGPluginLifecycleObserver: NSObject {
                 plugin.renderers.values.forEach { $0.replaceFilterChain([]) }
                 plugin.streamingEncoder?.setBitrateKbps(800)
                 NSLog("[Vanguard] Thermal Critical — filter chain safely invalidated")
+                // P3-4: fan to runtime-owned filter chains.
+                registry.allRuntimes().forEach { $0.setRuntimeThermalState(state) }
             @unknown default: break
             }
         }

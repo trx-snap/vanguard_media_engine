@@ -11,11 +11,19 @@
 
 #pragma once
 #import "VanguardFilterNode.h"
+// Phase 3 (P3-1) — VGMetalFilterNode conformance (additive; existing VanguardFilterNode retained)
+#import "VGMetalFilterNode.h"
 #import <Metal/Metal.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface VanguardLUTFilterNode : NSObject <VanguardFilterNode>
+@interface VanguardLUTFilterNode : NSObject <VanguardFilterNode, VGMetalFilterNode>
+
+// ─── VGMediaNode (additive — P3-1) ────────────────────────────────────────────
+/// Stable node identifier. Set to a UUID string at init time.
+@property (nonatomic, readonly, copy) NSString *nodeId;
+/// Node type tag for logging. Value: @"VGLUTFilterNode".
+@property (nonatomic, readonly, copy) NSString *nodeType;
 
 /// Human-readable name. Default: "LUT".
 @property (readonly, nonatomic, copy) NSString *filterName;

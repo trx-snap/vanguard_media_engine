@@ -5,14 +5,18 @@
 // classes. Satisfies the VGGraphRuntime public interface frozen in UMF.
 //
 // PUBLIC INTERFACE — do not modify without a charter update (C-5).
-// Internals will be replaced in Phase 2. (C-2: not wired to any production path.)
+// Internals will be replaced in Phase 2. (C-2: not wired to any production
+// path.)
 //
-// Depends on: VGGraphRuntime (UMF), VanguardMetalRenderer, VanguardFileMediaSource,
+// Depends on: VGGraphRuntime (UMF), VanguardMetalRenderer,
+// VanguardFileMediaSource,
 //             VanguardImageMediaSource, VGResourceAllocator.
 
-#import <UMF/VGGraphRuntime.h>
+#import "VanguardPlaybackTypes.h" // VGAudioRole — required for Phase 2 audio role APIs
 #import <Flutter/Flutter.h>
-#import "VanguardPlaybackTypes.h"   // VGAudioRole — required for Phase 2 audio role APIs
+#import <UMF/VGGraphRuntime.h>
+// P3-3 TRANSITIONAL — remove in Phase 4 (DEC-50, RR-31)
+#import <UMF/VGMetalFilterNode.h> // runtime-owned UMF filter node protocol
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -31,36 +35,45 @@ NS_ASSUME_NONNULL_BEGIN
 @interface VanguardGraphRuntime : VGGraphRuntime
 
 /// Phase 2 designated initialiser — stores the caller's desired audio role.
-/// @param registry  Flutter texture registry (owned by the plugin; must outlive this object).
-/// @param channel   Method channel for onPlaybackComplete / onNodeDurationProbed callbacks.
-/// @param role      Desired audio role. Resolved against VGResourceAllocator during prepare;
-///                  actual effective role may be Muted if the slot is already held.
+/// @param registry  Flutter texture registry (owned by the plugin; must outlive
+/// this object).
+/// @param channel   Method channel for onPlaybackComplete /
+/// onNodeDurationProbed callbacks.
+/// @param role      Desired audio role. Resolved against VGResourceAllocator
+/// during prepare;
+///                  actual effective role may be Muted if the slot is already
+///                  held.
 - (instancetype)initWithTextureRegistry:(id<FlutterTextureRegistry>)registry
                           methodChannel:(FlutterMethodChannel *)channel
-                       desiredAudioRole:(VGAudioRole)role NS_DESIGNATED_INITIALIZER;
+                       desiredAudioRole:(VGAudioRole)role
+    NS_DESIGNATED_INITIALIZER;
 
 /// Phase 1 compatible convenience initialiser. Defaults to VGAudioRoleActive.
 - (instancetype)initWithTextureRegistry:(id<FlutterTextureRegistry>)registry
                           methodChannel:(FlutterMethodChannel *)channel;
 
-/// Unavailable — use initWithTextureRegistry:methodChannel: or the three-argument form.
+/// Unavailable — use initWithTextureRegistry:methodChannel: or the
+/// three-argument form.
 - (instancetype)init NS_UNAVAILABLE;
 
 // ─── Phase 2 audio role properties ───────────────────────────────────────────
 
 /// The audio role requested by the caller at initialisation time.
-/// Fixed after init; may differ from effectiveAudioRole after allocator arbitration.
-@property (nonatomic, readonly) VGAudioRole desiredAudioRole;
+/// Fixed after init; may differ from effectiveAudioRole after allocator
+/// arbitration.
+@property(nonatomic, readonly) VGAudioRole desiredAudioRole;
 
-/// The audio role resolved by VGResourceAllocator during prepareWithURL:completion:.
-/// Updated in-place by transitionToRole:completion:.
-@property (atomic, readonly) VGAudioRole effectiveAudioRole;
+/// The audio role resolved by VGResourceAllocator during
+/// prepareWithURL:completion:. Updated in-place by
+/// transitionToRole:completion:.
+@property(atomic, readonly) VGAudioRole effectiveAudioRole;
 
 /// The natural pixel dimensions of the source.
 /// Zero until prepareWithURL:completion: completes successfully.
-@property (nonatomic, readonly) CGSize renderSize;
+@property(nonatomic, readonly) CGSize renderSize;
 
-// ─── Phase 2 lifecycle methods ─────────────────────────────────────────────────
+// ─── Phase 2 lifecycle methods
+// ─────────────────────────────────────────────────
 
 /// Transitions this runtime to the given audio role.
 /// Acquires or relinquishes the VGResourceAllocator slot as needed.
@@ -69,12 +82,13 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)transitionToRole:(VGAudioRole)role
               completion:(nullable void (^)(BOOL success))completion;
 
-/// Invalidates the runtime then drains pending decode work before calling completion.
-/// completion is always delivered on the main queue.
-/// Required for G-02-T2 safe teardown.
+/// Invalidates the runtime then drains pending decode work before calling
+/// completion. completion is always delivered on the main queue. Required for
+/// G-02-T2 safe teardown.
 - (void)invalidateAsync:(dispatch_block_t)completion;
 
-// ─── Phase 2 forwarding methods ────────────────────────────────────────────────
+// ─── Phase 2 forwarding methods
+// ────────────────────────────────────────────────
 
 /// Forwards playback rate to the renderer/source.
 - (void)setPlaybackRate:(double)rate;
@@ -84,6 +98,49 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Reads seek-preview pause state from the source.
 - (BOOL)seekPreviewPaused;
+
+// ─── P3-3 TRANSITIONAL filter chain ownership
+// ────────────────────────────────── Remove in Phase 4 when VGGraphScheduler
+// owns callback interception (DEC-50, RR-31).
+
+/// Sets the runtime-owned UMF filter chain.
+///
+/// The runtime stores the chain (logical ownership) and forwards it to the
+/// renderer via -[VanguardMetalRenderer setRuntimeFilterChain:] (physical
+/// execution). This is the sole public interface for filter chain control in
+/// P3-3.
+///
+/// Swap safety: renderer uses dispatch_barrier_async on videoDecodeQueue.
+/// Arrays are copied defensively. Nodes removed from the chain have
+/// -[VGMetalFilterNode invalidate] called before the chain is forwarded.
+///
+/// Pass nil or empty array to clear the runtime chain (renderer reverts to
+/// legacy VanguardFilterNode path if any is installed).
+/// Thread-safe: may be called from any thread.
+- (void)setFilterChain:(nullable NSArray<id<VGMetalFilterNode>> *)chain;
+
+// ─── P3-4 Thermal back-pressure
+// ──────────────────────────────────────────────── Receives thermal state from
+// VGPluginLifecycleObserver and applies the 3-tier degradation policy to the
+// runtime-owned filter chain (DEC-40).
+//
+// Tier policy (matches VGPluginLifecycleObserver thermal handler tiers):
+//   nominal / fair   → all nodes enabled
+//   serious          → non-LUT nodes disabled (segmentation most expensive)
+//   critical         → all nodes disabled (chain present; zero GPU work)
+//
+// Thread-safe: may be called from any thread (main queue in practice via
+// VGPluginLifecycleObserver which uses queue: .main).
+// Does NOT modify the chain array — only mutates node.enabled on existing
+// nodes. Nodes added or replaced via setFilterChain: after this call inherit
+// the last-applied thermal state on the NEXT setRuntimeThermalState: call.
+
+/// Applies thermal degradation policy to all VGMetalFilterNode objects
+/// currently in the runtime-owned filter chain.
+///
+/// @param state  The current NSProcessInfoThermalState from ProcessInfo.
+- (void)setRuntimeThermalState:(NSProcessInfoThermalState)state
+    NS_SWIFT_NAME(setRuntimeThermalState(_:));
 
 @end
 

@@ -14,6 +14,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vg_playback_session.dart';
 import 'package:vanguard_media_engine/vg_playback_client.dart';
+import 'package:vanguard_media_engine/vg_filter_spec.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mock channel harness
@@ -32,27 +33,26 @@ void _installMock() {
   _createTextureResponse = null;
 
   TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-      .setMockMethodCallHandler(
-    const MethodChannel('vanguard_media_engine'),
-    (MethodCall call) async {
-      _log.add(call);
-      switch (call.method) {
-        case 'createTexture':
-          return _createTextureResponse;
-        default:
-          return null; // play / pause / seekTo / dispose all return void
-      }
-    },
-  );
+      .setMockMethodCallHandler(const MethodChannel('vanguard_media_engine'), (
+        MethodCall call,
+      ) async {
+        _log.add(call);
+        switch (call.method) {
+          case 'createTexture':
+            return _createTextureResponse;
+          default:
+            return null; // play / pause / seekTo / dispose all return void
+        }
+      });
 }
 
 /// Removes the mock handler. Call in tearDown().
 void _removeMock() {
   TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
       .setMockMethodCallHandler(
-    const MethodChannel('vanguard_media_engine'),
-    null,
-  );
+        const MethodChannel('vanguard_media_engine'),
+        null,
+      );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -60,9 +60,10 @@ void _removeMock() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Finds the first recorded call with [name].
-MethodCall _call(String name) =>
-    _log.firstWhere((c) => c.method == name,
-        orElse: () => throw TestFailure('No "$name" call recorded. Log: $_log'));
+MethodCall _call(String name) => _log.firstWhere(
+  (c) => c.method == name,
+  orElse: () => throw TestFailure('No "$name" call recorded. Log: $_log'),
+);
 
 /// Counts how many recorded calls have [name].
 int _callCount(String name) => _log.where((c) => c.method == name).length;
@@ -89,33 +90,37 @@ void main() {
       _createTextureResponse = {
         'textureId': 42,
         'sessionId': 'test-uuid',
-        'width':     1080,
-        'height':    1920,
+        'width': 1080,
+        'height': 1920,
       };
 
       // Act
       final session = await VGPlaybackClient.createSession('/fake/video.mp4');
 
       // Assert: VGPlaybackSession fields match the map.
-      expect(session.sessionId, equals('test-uuid'),
-          reason: 'sessionId must match the native map value');
-      expect(session.textureId, equals(42),
-          reason: 'textureId must match the native map value');
+      expect(
+        session.sessionId,
+        equals('test-uuid'),
+        reason: 'sessionId must match the native map value',
+      );
+      expect(
+        session.textureId,
+        equals(42),
+        reason: 'textureId must match the native map value',
+      );
 
       // Assert: exactly one createTexture call was made.
       expect(_callCount('createTexture'), equals(1));
-      expect(_call('createTexture').arguments['path'],
-          equals('/fake/video.mp4'));
+      expect(
+        _call('createTexture').arguments['path'],
+        equals('/fake/video.mp4'),
+      );
     });
 
     test('falls back to a synthesised sessionId when map has no sessionId '
         '(legacy renderer path)', () async {
       // Arrange: legacy path — no sessionId key.
-      _createTextureResponse = {
-        'textureId': 77,
-        'width':     1080,
-        'height':    1920,
-      };
+      _createTextureResponse = {'textureId': 77, 'width': 1080, 'height': 1920};
 
       final session = await VGPlaybackClient.createSession('/fake/legacy.mp4');
 
@@ -158,16 +163,17 @@ void main() {
       _createTextureResponse = {
         'textureId': 55,
         'sessionId': 'raw-uuid',
-        'width':     720,
-        'height':    1280,
+        'width': 720,
+        'height': 1280,
       };
 
-      final (:session, :raw) =
-          await VGPlaybackClient.createSessionRaw('/fake/raw.mp4');
+      final (:session, :raw) = await VGPlaybackClient.createSessionRaw(
+        '/fake/raw.mp4',
+      );
 
       expect(session.textureId, equals(55));
       expect(session.sessionId, equals('raw-uuid'));
-      expect(raw?['width'],  equals(720));
+      expect(raw?['width'], equals(720));
       expect(raw?['height'], equals(1280));
     });
   });
@@ -187,8 +193,11 @@ void main() {
     test('play() invokes "play" with correct textureId', () async {
       await session.play();
 
-      expect(_callCount('play'), equals(1),
-          reason: 'play() must fire exactly one channel call');
+      expect(
+        _callCount('play'),
+        equals(1),
+        reason: 'play() must fire exactly one channel call',
+      );
       expect(_call('play').arguments['textureId'], equals(42));
     });
 
@@ -199,13 +208,16 @@ void main() {
       expect(_call('pause').arguments['textureId'], equals(42));
     });
 
-    test('seekTo() invokes "seekTo" with correct textureId and seconds', () async {
-      await session.seekTo(3.75);
+    test(
+      'seekTo() invokes "seekTo" with correct textureId and seconds',
+      () async {
+        await session.seekTo(3.75);
 
-      expect(_callCount('seekTo'), equals(1));
-      expect(_call('seekTo').arguments['textureId'], equals(42));
-      expect(_call('seekTo').arguments['seconds'],   closeTo(3.75, 1e-9));
-    });
+        expect(_callCount('seekTo'), equals(1));
+        expect(_call('seekTo').arguments['textureId'], equals(42));
+        expect(_call('seekTo').arguments['seconds'], closeTo(3.75, 1e-9));
+      },
+    );
 
     test('dispose() invokes "dispose" with correct textureId', () async {
       await session.dispose();
@@ -238,9 +250,13 @@ void main() {
       await session.dispose();
       await session.dispose(); // second call must be a no-op
 
-      expect(_callCount('dispose'), equals(1),
-          reason: 'dispose() must be idempotent: channel fires exactly once '
-              'regardless of how many times dispose() is called');
+      expect(
+        _callCount('dispose'),
+        equals(1),
+        reason:
+            'dispose() must be idempotent: channel fires exactly once '
+            'regardless of how many times dispose() is called',
+      );
     });
 
     test('calling dispose() three times fires the channel only once', () async {
@@ -261,8 +277,11 @@ void main() {
 
       await session.play();
 
-      expect(_callCount('play'), equals(0),
-          reason: 'play() on a disposed session must not fire the channel');
+      expect(
+        _callCount('play'),
+        equals(0),
+        reason: 'play() on a disposed session must not fire the channel',
+      );
     });
 
     test('pause() after dispose() does NOT invoke the channel', () async {
@@ -273,8 +292,11 @@ void main() {
 
       await session.pause();
 
-      expect(_callCount('pause'), equals(0),
-          reason: 'pause() on a disposed session must not fire the channel');
+      expect(
+        _callCount('pause'),
+        equals(0),
+        reason: 'pause() on a disposed session must not fire the channel',
+      );
     });
 
     test('seekTo() after dispose() does NOT invoke the channel', () async {
@@ -285,8 +307,11 @@ void main() {
 
       await session.seekTo(5.0);
 
-      expect(_callCount('seekTo'), equals(0),
-          reason: 'seekTo() on a disposed session must not fire the channel');
+      expect(
+        _callCount('seekTo'),
+        equals(0),
+        reason: 'seekTo() on a disposed session must not fire the channel',
+      );
     });
   });
 
@@ -313,38 +338,54 @@ void main() {
   // ───────────────────────────────────────────────────────────────────────────
 
   group('Step 7 — createTexture muted arg', () {
-    test('createSession without muted sends muted=false (Step 9: key always present)', () async {
-      _createTextureResponse = {
-        'textureId': 10,
-        'sessionId': 'uuid-active',
-        'width': 1080,
-        'height': 1920,
-      };
-      await VGPlaybackClient.createSession('/fake/active.mp4');
-      final call = _call('createTexture');
-      // Step 9 always includes the muted key with value false.
-      expect(call.arguments.containsKey('muted'), isTrue,
-          reason: 'Step 9: muted key must always be present in createTexture payload');
-      expect(call.arguments['muted'], isFalse,
-          reason: 'Default createSession must send muted=false');
-    });
+    test(
+      'createSession without muted sends muted=false (Step 9: key always present)',
+      () async {
+        _createTextureResponse = {
+          'textureId': 10,
+          'sessionId': 'uuid-active',
+          'width': 1080,
+          'height': 1920,
+        };
+        await VGPlaybackClient.createSession('/fake/active.mp4');
+        final call = _call('createTexture');
+        // Step 9 always includes the muted key with value false.
+        expect(
+          call.arguments.containsKey('muted'),
+          isTrue,
+          reason:
+              'Step 9: muted key must always be present in createTexture payload',
+        );
+        expect(
+          call.arguments['muted'],
+          isFalse,
+          reason: 'Default createSession must send muted=false',
+        );
+      },
+    );
 
-    test('createTexture channel with muted=true is recorded correctly', () async {
-      _createTextureResponse = {
-        'textureId': 20,
-        'sessionId': 'uuid-muted',
-        'width': 1080,
-        'height': 1920,
-      };
-      const ch = MethodChannel('vanguard_media_engine');
-      await ch.invokeMethod<Object>('createTexture', {
-        'path': '/fake/muted.mp4',
-        'muted': true,
-      });
-      final call = _call('createTexture');
-      expect(call.arguments['muted'], isTrue,
-          reason: 'muted=true must survive the channel round-trip');
-    });
+    test(
+      'createTexture channel with muted=true is recorded correctly',
+      () async {
+        _createTextureResponse = {
+          'textureId': 20,
+          'sessionId': 'uuid-muted',
+          'width': 1080,
+          'height': 1920,
+        };
+        const ch = MethodChannel('vanguard_media_engine');
+        await ch.invokeMethod<Object>('createTexture', {
+          'path': '/fake/muted.mp4',
+          'muted': true,
+        });
+        final call = _call('createTexture');
+        expect(
+          call.arguments['muted'],
+          isTrue,
+          reason: 'muted=true must survive the channel round-trip',
+        );
+      },
+    );
   });
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -355,58 +396,78 @@ void main() {
     setUp(() {
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(
-        const MethodChannel('vanguard_media_engine'),
-        (MethodCall call) async {
-          _log.add(call);
-          if (call.method == 'getMasterClock') {
-            final tid = (call.arguments as Map?)?['textureId'] as int?;
-            return tid != null ? 1.234 : 0.0;
-          }
-          return null;
-        },
-      );
+            const MethodChannel('vanguard_media_engine'),
+            (MethodCall call) async {
+              _log.add(call);
+              if (call.method == 'getMasterClock') {
+                final tid = (call.arguments as Map?)?['textureId'] as int?;
+                return tid != null ? 1.234 : 0.0;
+              }
+              return null;
+            },
+          );
     });
 
-    test('no-arg getMasterClock sends null args (renderer-fallback branch)', () async {
-      const ch = MethodChannel('vanguard_media_engine');
-      final result = await ch.invokeMethod<double>('getMasterClock');
-      final call = _call('getMasterClock');
-      expect(call.arguments, isNull,
-          reason: 'No-arg call must send null args — renderer fallback path');
-      expect(result, equals(0.0));
-    });
+    test(
+      'no-arg getMasterClock sends null args (renderer-fallback branch)',
+      () async {
+        const ch = MethodChannel('vanguard_media_engine');
+        final result = await ch.invokeMethod<double>('getMasterClock');
+        final call = _call('getMasterClock');
+        expect(
+          call.arguments,
+          isNull,
+          reason: 'No-arg call must send null args — renderer fallback path',
+        );
+        expect(result, equals(0.0));
+      },
+    );
 
-    test('getMasterClock with textureId sends arg and gets registry clock', () async {
-      const ch = MethodChannel('vanguard_media_engine');
-      final result =
-          await ch.invokeMethod<double>('getMasterClock', {'textureId': 42});
-      final call = _call('getMasterClock');
-      expect(call.arguments['textureId'], equals(42),
-          reason: 'textureId must be forwarded to native getMasterClock');
-      expect(result, closeTo(1.234, 1e-6));
-    });
+    test(
+      'getMasterClock with textureId sends arg and gets registry clock',
+      () async {
+        const ch = MethodChannel('vanguard_media_engine');
+        final result = await ch.invokeMethod<double>('getMasterClock', {
+          'textureId': 42,
+        });
+        final call = _call('getMasterClock');
+        expect(
+          call.arguments['textureId'],
+          equals(42),
+          reason: 'textureId must be forwarded to native getMasterClock',
+        );
+        expect(result, closeTo(1.234, 1e-6));
+      },
+    );
 
-    test('two sessions return independent clocks (no registry bleeding)', () async {
-      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(
-        const MethodChannel('vanguard_media_engine'),
-        (MethodCall call) async {
-          _log.add(call);
-          if (call.method == 'getMasterClock') {
-            final tid = (call.arguments as Map?)?['textureId'] as int?;
-            if (tid == 1) return 1.0;
-            if (tid == 2) return 2.5;
-            return 0.0;
-          }
-          return null;
-        },
-      );
-      const ch = MethodChannel('vanguard_media_engine');
-      final c1 = await ch.invokeMethod<double>('getMasterClock', {'textureId': 1});
-      final c2 = await ch.invokeMethod<double>('getMasterClock', {'textureId': 2});
-      expect(c1, closeTo(1.0, 1e-6));
-      expect(c2, closeTo(2.5, 1e-6));
-    });
+    test(
+      'two sessions return independent clocks (no registry bleeding)',
+      () async {
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('vanguard_media_engine'),
+              (MethodCall call) async {
+                _log.add(call);
+                if (call.method == 'getMasterClock') {
+                  final tid = (call.arguments as Map?)?['textureId'] as int?;
+                  if (tid == 1) return 1.0;
+                  if (tid == 2) return 2.5;
+                  return 0.0;
+                }
+                return null;
+              },
+            );
+        const ch = MethodChannel('vanguard_media_engine');
+        final c1 = await ch.invokeMethod<double>('getMasterClock', {
+          'textureId': 1,
+        });
+        final c2 = await ch.invokeMethod<double>('getMasterClock', {
+          'textureId': 2,
+        });
+        expect(c1, closeTo(1.0, 1e-6));
+        expect(c2, closeTo(2.5, 1e-6));
+      },
+    );
   });
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -417,32 +478,39 @@ void main() {
     setUp(() {
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(
-        const MethodChannel('vanguard_media_engine'),
-        (MethodCall call) async {
-          _log.add(call);
-          if (call.method == 'promoteAudio') {
-            final sid = ((call.arguments as Map?)?['sessionId']) as String?;
-            return sid != null;
-          }
-          return null;
-        },
-      );
+            const MethodChannel('vanguard_media_engine'),
+            (MethodCall call) async {
+              _log.add(call);
+              if (call.method == 'promoteAudio') {
+                final sid = ((call.arguments as Map?)?['sessionId']) as String?;
+                return sid != null;
+              }
+              return null;
+            },
+          );
     });
 
-    test('promoteAudio forwards sessionId to native and returns true', () async {
-      const ch = MethodChannel('vanguard_media_engine');
-      final result = await ch.invokeMethod<bool>(
-          'promoteAudio', {'sessionId': 'test-session-uuid'});
-      final call = _call('promoteAudio');
-      expect(call.arguments['sessionId'], equals('test-session-uuid'));
-      expect(result, isTrue);
-    });
+    test(
+      'promoteAudio forwards sessionId to native and returns true',
+      () async {
+        const ch = MethodChannel('vanguard_media_engine');
+        final result = await ch.invokeMethod<bool>('promoteAudio', {
+          'sessionId': 'test-session-uuid',
+        });
+        final call = _call('promoteAudio');
+        expect(call.arguments['sessionId'], equals('test-session-uuid'));
+        expect(result, isTrue);
+      },
+    );
 
-    test('promoteAudio without sessionId returns false (BAD_ARGS path)', () async {
-      const ch = MethodChannel('vanguard_media_engine');
-      final result = await ch.invokeMethod<bool>('promoteAudio', {});
-      expect(result, isFalse);
-    });
+    test(
+      'promoteAudio without sessionId returns false (BAD_ARGS path)',
+      () async {
+        const ch = MethodChannel('vanguard_media_engine');
+        final result = await ch.invokeMethod<bool>('promoteAudio', {});
+        expect(result, isFalse);
+      },
+    );
   });
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -460,8 +528,11 @@ void main() {
       await VGPlaybackClient.createSession('/fake/s9_active.mp4');
       final call = _call('createTexture');
       expect(call.arguments['path'], equals('/fake/s9_active.mp4'));
-      expect(call.arguments['muted'], isFalse,
-          reason: 'Omitting muted must produce muted=false in the payload');
+      expect(
+        call.arguments['muted'],
+        isFalse,
+        reason: 'Omitting muted must produce muted=false in the payload',
+      );
     });
 
     test('createSession(muted: true) sends muted=true', () async {
@@ -473,8 +544,11 @@ void main() {
       };
       await VGPlaybackClient.createSession('/fake/s9_muted.mp4', muted: true);
       final call = _call('createTexture');
-      expect(call.arguments['muted'], isTrue,
-          reason: 'muted: true must be forwarded to native createTexture');
+      expect(
+        call.arguments['muted'],
+        isTrue,
+        reason: 'muted: true must be forwarded to native createTexture',
+      );
     });
 
     test('createSession(muted: false) is identical to the default', () async {
@@ -484,7 +558,10 @@ void main() {
         'width': 1080,
         'height': 1920,
       };
-      await VGPlaybackClient.createSession('/fake/s9_explicit.mp4', muted: false);
+      await VGPlaybackClient.createSession(
+        '/fake/s9_explicit.mp4',
+        muted: false,
+      );
       final call = _call('createTexture');
       expect(call.arguments['muted'], isFalse);
     });
@@ -496,12 +573,17 @@ void main() {
         'width': 1080,
         'height': 1920,
       };
-      final (:session, :raw) =
-          await VGPlaybackClient.createSessionRaw('/fake/raw.mp4', muted: true);
+      final (:session, :raw) = await VGPlaybackClient.createSessionRaw(
+        '/fake/raw.mp4',
+        muted: true,
+      );
       expect(session.textureId, equals(33));
       final call = _call('createTexture');
-      expect(call.arguments['muted'], isTrue,
-          reason: 'createSessionRaw must forward muted to the channel');
+      expect(
+        call.arguments['muted'],
+        isTrue,
+        reason: 'createSessionRaw must forward muted to the channel',
+      );
     });
   });
 
@@ -513,101 +595,284 @@ void main() {
     setUp(() {
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
           .setMockMethodCallHandler(
-        const MethodChannel('vanguard_media_engine'),
-        (MethodCall call) async {
-          _log.add(call);
-          if (call.method == 'promoteAudio') {
-            final sid = (call.arguments as Map)['sessionId'] as String?;
-            return sid != null; // true when sessionId present, false otherwise
-          }
-          return null;
-        },
+            const MethodChannel('vanguard_media_engine'),
+            (MethodCall call) async {
+              _log.add(call);
+              if (call.method == 'promoteAudio') {
+                final sid = (call.arguments as Map)['sessionId'] as String?;
+                return sid !=
+                    null; // true when sessionId present, false otherwise
+              }
+              return null;
+            },
+          );
+    });
+
+    test(
+      'promoteToActiveAudio sends sessionId and returns true on success',
+      () async {
+        final session = VGPlaybackSession(
+          sessionId: 'promote-uuid-123',
+          textureId: 99,
+        );
+        final result = await session.promoteToActiveAudio();
+        final call = _call('promoteAudio');
+        expect(
+          call.arguments['sessionId'],
+          equals('promote-uuid-123'),
+          reason:
+              'promoteToActiveAudio must be sessionId-keyed, not textureId-keyed',
+        );
+        expect(result, isTrue, reason: 'Must return the native Bool result');
+      },
+    );
+
+    test(
+      'promoteToActiveAudio returns false when session is disposed',
+      () async {
+        final session = VGPlaybackSession(
+          sessionId: 'disposed-uuid',
+          textureId: 100,
+        );
+        // Install mock that would return true to ensure the guard fires first.
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('vanguard_media_engine'),
+              (MethodCall call) async {
+                _log.add(call);
+                return true;
+              },
+            );
+        await session.dispose();
+        _log.clear(); // ignore the dispose call
+        final result = await session.promoteToActiveAudio();
+        expect(
+          result,
+          isFalse,
+          reason: 'Disposed session must return false without calling native',
+        );
+        expect(
+          _log.where((c) => c.method == 'promoteAudio').isEmpty,
+          isTrue,
+          reason: 'No promoteAudio channel call must fire after dispose',
+        );
+      },
+    );
+
+    test(
+      'promoteToActiveAudio returns false when native returns null',
+      () async {
+        // Override mock to return null (unexpected native response).
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('vanguard_media_engine'),
+              (MethodCall call) async {
+                _log.add(call);
+                return null; // simulate unexpected null
+              },
+            );
+        final session = VGPlaybackSession(
+          sessionId: 'null-response-uuid',
+          textureId: 101,
+        );
+        final result = await session.promoteToActiveAudio();
+        expect(
+          result,
+          isFalse,
+          reason: 'Null native response must coerce to false via ?? false',
+        );
+      },
+    );
+
+    test(
+      'play/pause/seekTo/dispose remain textureId-keyed after Step 9',
+      () async {
+        // Regression: Step 9 must not migrate playback commands to sessionId.
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('vanguard_media_engine'),
+              (MethodCall call) async {
+                _log.add(call);
+                return null;
+              },
+            );
+        final session = VGPlaybackSession(
+          sessionId: 'routing-uuid',
+          textureId: 77,
+        );
+        await session.play();
+        await session.pause();
+        await session.seekTo(1.5);
+        for (final name in ['play', 'pause', 'seekTo']) {
+          final call = _call(name);
+          expect(
+            call.arguments['textureId'],
+            equals(77),
+            reason: '$name must remain textureId-keyed in Step 9',
+          );
+          expect(
+            call.arguments.containsKey('sessionId'),
+            isFalse,
+            reason: '$name must not be migrated to sessionId in Step 9',
+          );
+        }
+      },
+    );
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // P3-5: VGFilterSpec — value type serialisation
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGFilterSpec.toJson', () {
+    test('serialises type, enabled=true, and empty parameters correctly', () {
+      const spec = VGFilterSpec(type: 'lut');
+      final json = spec.toJson();
+
+      expect(json['type'], equals('lut'));
+      expect(json['enabled'], equals(true));
+      expect(json['parameters'], equals(<String, Object?>{}));
+    });
+
+    test('serialises enabled=false correctly', () {
+      const spec = VGFilterSpec(type: 'segmentation', enabled: false);
+      expect(spec.toJson()['enabled'], equals(false));
+    });
+
+    test('preserves parameters map verbatim', () {
+      const spec = VGFilterSpec(
+        type: 'beauty',
+        parameters: {'intensity': 0.7, 'radius': 3.0},
+      );
+      final json = spec.toJson();
+
+      expect(json['parameters'], equals({'intensity': 0.7, 'radius': 3.0}));
+    });
+
+    test('toJson produces exactly three keys: type, enabled, parameters', () {
+      const spec = VGFilterSpec(type: 'lut');
+      expect(
+        spec.toJson().keys.toSet(),
+        equals({'type', 'enabled', 'parameters'}),
+      );
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // P3-5: VGPlaybackSession.setFilterChain — channel contract
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGPlaybackSession.setFilterChain', () {
+    late VGPlaybackSession session;
+
+    setUp(() {
+      session = VGPlaybackSession(sessionId: 'sess-abc', textureId: 55);
+    });
+
+    test('invokes the channel exactly once', () async {
+      await session.setFilterChain([const VGFilterSpec(type: 'lut')]);
+
+      expect(
+        _callCount('setFilterChain'),
+        equals(1),
+        reason: 'setFilterChain must fire exactly one channel call',
       );
     });
 
-    test('promoteToActiveAudio sends sessionId and returns true on success',
-        () async {
-      final session = VGPlaybackSession(
-        sessionId: 'promote-uuid-123',
-        textureId: 99,
-      );
-      final result = await session.promoteToActiveAudio();
-      final call = _call('promoteAudio');
-      expect(call.arguments['sessionId'], equals('promote-uuid-123'),
-          reason: 'promoteToActiveAudio must be sessionId-keyed, not textureId-keyed');
-      expect(result, isTrue,
-          reason: 'Must return the native Bool result');
+    test('method name is exactly "setFilterChain"', () async {
+      await session.setFilterChain([const VGFilterSpec(type: 'lut')]);
+
+      // _call() throws TestFailure if method not found — absence = fail.
+      final call = _call('setFilterChain');
+      expect(call.method, equals('setFilterChain'));
     });
 
-    test('promoteToActiveAudio returns false when session is disposed', () async {
-      final session = VGPlaybackSession(
-        sessionId: 'disposed-uuid',
-        textureId: 100,
+    test('payload includes the correct sessionId', () async {
+      await session.setFilterChain([const VGFilterSpec(type: 'lut')]);
+
+      final args = _call('setFilterChain').arguments as Map;
+      expect(
+        args['sessionId'],
+        equals('sess-abc'),
+        reason: 'setFilterChain must be sessionId-keyed',
       );
-      // Install mock that would return true to ensure the guard fires first.
-      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(
-        const MethodChannel('vanguard_media_engine'),
-        (MethodCall call) async {
-          _log.add(call);
-          return true;
-        },
-      );
-      await session.dispose();
-      _log.clear(); // ignore the dispose call
-      final result = await session.promoteToActiveAudio();
-      expect(result, isFalse,
-          reason: 'Disposed session must return false without calling native');
-      expect(_log.where((c) => c.method == 'promoteAudio').isEmpty, isTrue,
-          reason: 'No promoteAudio channel call must fire after dispose');
     });
 
-    test('promoteToActiveAudio returns false when native returns null', () async {
-      // Override mock to return null (unexpected native response).
-      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(
-        const MethodChannel('vanguard_media_engine'),
-        (MethodCall call) async {
-          _log.add(call);
-          return null; // simulate unexpected null
-        },
+    test('payload does NOT include textureId', () async {
+      await session.setFilterChain([const VGFilterSpec(type: 'lut')]);
+
+      final args = _call('setFilterChain').arguments as Map;
+      expect(
+        args.containsKey('textureId'),
+        isFalse,
+        reason: 'setFilterChain must be sessionId-keyed, not textureId-keyed',
       );
-      final session = VGPlaybackSession(
-        sessionId: 'null-response-uuid',
-        textureId: 101,
-      );
-      final result = await session.promoteToActiveAudio();
-      expect(result, isFalse,
-          reason: 'Null native response must coerce to false via ?? false');
     });
 
-    test('play/pause/seekTo/dispose remain textureId-keyed after Step 9', () async {
-      // Regression: Step 9 must not migrate playback commands to sessionId.
-      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(
-        const MethodChannel('vanguard_media_engine'),
-        (MethodCall call) async { _log.add(call); return null; },
-      );
-      final session = VGPlaybackSession(
-        sessionId: 'routing-uuid',
-        textureId: 77,
-      );
-      await session.play();
-      await session.pause();
-      await session.seekTo(1.5);
-      for (final name in ['play', 'pause', 'seekTo']) {
-        final call = _call(name);
-        expect(call.arguments['textureId'], equals(77),
-            reason: '$name must remain textureId-keyed in Step 9');
-        expect(call.arguments.containsKey('sessionId'), isFalse,
-            reason: '$name must not be migrated to sessionId in Step 9');
-      }
+    test('filters are serialised in order', () async {
+      await session.setFilterChain([
+        const VGFilterSpec(type: 'lut', parameters: {'intensity': 0.8}),
+        const VGFilterSpec(type: 'beauty', parameters: {'intensity': 0.5}),
+      ]);
+
+      final args = _call('setFilterChain').arguments as Map;
+      final filters = args['filters'] as List;
+
+      expect(filters.length, equals(2));
+      expect((filters[0] as Map)['type'], equals('lut'));
+      expect((filters[1] as Map)['type'], equals('beauty'));
     });
+
+    test('filter parameters are preserved in the payload', () async {
+      await session.setFilterChain([
+        const VGFilterSpec(
+          type: 'lut',
+          enabled: false,
+          parameters: {'intensity': 0.42},
+        ),
+      ]);
+
+      final args = _call('setFilterChain').arguments as Map;
+      final filter = (args['filters'] as List)[0] as Map;
+
+      expect(filter['type'], equals('lut'));
+      expect(filter['enabled'], equals(false));
+      expect((filter['parameters'] as Map)['intensity'], equals(0.42));
+    });
+
+    test('empty filter list sends an empty filters array', () async {
+      await session.setFilterChain([]);
+
+      final args = _call('setFilterChain').arguments as Map;
+      final filters = args['filters'] as List;
+
+      expect(
+        filters,
+        isEmpty,
+        reason: 'Empty list must still invoke channel with empty filters array',
+      );
+    });
+
+    test(
+      'setFilterChain after dispose() does NOT invoke the channel',
+      () async {
+        await session.dispose();
+        _log.clear(); // clear the dispose() call
+
+        await session.setFilterChain([const VGFilterSpec(type: 'lut')]);
+
+        expect(
+          _callCount('setFilterChain'),
+          equals(0),
+          reason: 'setFilterChain after dispose must be a silent no-op',
+        );
+      },
+    );
   });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AC coverage summary (updated for Step 9)
+// AC coverage summary (updated for P3-5)
 // ─────────────────────────────────────────────────────────────────────────────
 //
 //  AC-11  TestDefaultBinaryMessengerBinding: used in every test via setUp.
@@ -630,3 +895,17 @@ void main() {
 //  S9-06  promoteToActiveAudio returns false when session is disposed (no channel call).
 //  S9-07  promoteToActiveAudio returns false when native returns null.
 //  S9-08  play/pause/seekTo remain textureId-keyed (no Step 9 migration regression).
+//
+//  P3-5 additions:
+//  P35-01  VGFilterSpec.toJson() serialises type, enabled, parameters correctly.
+//  P35-02  VGFilterSpec.toJson() serialises enabled=false.
+//  P35-03  VGFilterSpec.toJson() preserves parameters map verbatim.
+//  P35-04  VGFilterSpec.toJson() produces exactly three keys.
+//  P35-05  setFilterChain() invokes channel exactly once.
+//  P35-06  setFilterChain() method name is exactly "setFilterChain".
+//  P35-07  setFilterChain() payload includes correct sessionId.
+//  P35-08  setFilterChain() payload does NOT include textureId.
+//  P35-09  setFilterChain() filters serialised in order.
+//  P35-10  setFilterChain() filter parameters preserved in payload.
+//  P35-11  setFilterChain() empty list sends empty filters array.
+//  P35-12  setFilterChain() after dispose() is a silent no-op.

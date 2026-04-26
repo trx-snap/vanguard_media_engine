@@ -54,7 +54,6 @@ dispatch_queue_t VanguardAudioTeardownQueue(void) {
   return q;
 }
 
-
 // ── ML enhancement budget ───────────────────────────────────────────────────
 // 1024 samples at 48kHz = 21.3ms window; ML must complete in < 5ms
 static const AVAudioFrameCount kMLFrameCount = 1024;
@@ -238,6 +237,9 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
 @synthesize nodeType = _nodeType;
 @synthesize effectiveAudioRole = _effectiveAudioRole;
 @synthesize owningRuntime = _owningRuntime;
+
+// P4-2: VGMediaNode topology role — frame source.
+- (VGNodeRole)nodeRole { return VGNodeRoleSource; }
 
 + (void)initialize {
   if (self == [VanguardFileMediaSource class]) {
@@ -1042,7 +1044,6 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
   return _masterClockImpl.hostTimeAtOrigin;
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - VanguardMediaSource — Callbacks
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1058,7 +1059,6 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - VanguardMediaSource — State Properties
 // ─────────────────────────────────────────────────────────────────────────────
-
 
 - (CMTime)duration {
   if (_durationSecs <= 0)
@@ -1502,16 +1502,18 @@ static const NSInteger kAudioChunkFrames =
 - (void)_teardownAudioEngine {
   // Signal any in-flight _setupAudioEngine to abort UNCONDITIONALLY — before
   // the guard below. If _audioEngineReady is still NO (setup not yet complete),
-  // the guard would return early and skip this signal, allowing _setupAudioEngine
-  // to complete, set _audioEngine to a live instance, and set _audioEngineReady=YES.
-  // dealloc would then call _teardownAudioEngine again with a live engine,
-  // dispatching [engineToStop stop] to background → 3+ minute kernel suspension.
+  // the guard would return early and skip this signal, allowing
+  // _setupAudioEngine to complete, set _audioEngine to a live instance, and set
+  // _audioEngineReady=YES. dealloc would then call _teardownAudioEngine again
+  // with a live engine, dispatching [engineToStop stop] to background → 3+
+  // minute kernel suspension.
   atomic_store_explicit(&_audioSetupCancelled, YES, memory_order_relaxed);
   atomic_store_explicit(&_schedulingChunks, NO, memory_order_relaxed);
 
   // Idempotency guard: _audioEngineReady is set NO at the end of the first
   // call. dealloc and any redundant callers return immediately here.
-  if (!_audioEngineReady) return;
+  if (!_audioEngineReady)
+    return;
 
   // Phase 2: relinquish the audio activation slot before any engine teardown.
   // Must be the first call — frees the slot for the next createSession
@@ -1527,9 +1529,9 @@ static const NSInteger kAudioChunkFrames =
   } @catch (NSException *e) { /* tap wasn't installed */
   }
   // Mark engine as inactive and nil ivars BEFORE dispatching stop.
-  // [AVAudioEngine stop] issues XPC to coreaudiod. Moving stop off _prepareQueue
-  // lets the drain sentinel fire and result(nil) reach Dart without waiting for
-  // coreaudiod.
+  // [AVAudioEngine stop] issues XPC to coreaudiod. Moving stop off
+  // _prepareQueue lets the drain sentinel fire and result(nil) reach Dart
+  // without waiting for coreaudiod.
   AVAudioEngine *engineToStop = _audioEngine;
   _audioEngineReady = NO;
   _playerNode = nil;
