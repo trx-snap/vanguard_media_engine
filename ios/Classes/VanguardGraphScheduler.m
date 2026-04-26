@@ -1,14 +1,19 @@
 // VanguardGraphScheduler.m
-// vanguard_media_engine — Phase 4, P4-2
+// vanguard_media_engine — Phase 4, P4-2 / P4-5 / P4-9
 //
-// Dormant scheduler skeleton. All methods log and return only.
-// No frame processing, no GPU calls, no dispatch execution logic.
-// Activation begins in P4-5.
+// P4-2: Scheduler skeleton — lifecycle (start/pause/resume/seekTo/
+//       setFilterChain/invalidate). applyThermalState: dormant stub.
+// P4-5: Frame delegate — receives raw frames, executes filter chain,
+//       delivers processed envelope to sink.
+// P4-9: Cost-budget thermal policy — applyThermalState: activated.
+//       Replaces binary isExpensive runtime policy with scalar
+//       estimatedGPUCostMs greedy-disable algorithm. Closes RR-33.
 
 #import "VanguardGraphScheduler.h"
 #import "VanguardMetalRenderer.h"   // P4-5: sink type for presentEnvelope:
 #import <os/log.h>
 #import <os/lock.h>
+#include <float.h>                  // P4-9: FLT_MAX for Nominal/Fair tier budget
 #include <stdatomic.h>
 
 static os_log_t sSchedulerLog;
@@ -98,9 +103,88 @@ static os_log_t sSchedulerLog;
 }
 
 - (void)applyThermalState:(NSProcessInfoThermalState)state {
+  // P4-9: Cost-budget thermal policy (RR-33 closure).
+  // Replaces binary isExpensive runtime iteration with scalar estimatedGPUCostMs
+  // greedy-disable.  Lock is held ONLY for the chain pointer snapshot, released
+  // before any node.enabled write or sort operation (DEC-54).
+
   if (atomic_load(&_invalidated)) return;
+
+  // ── 1. Snapshot chain under lock ──────────────────────────────────────────
+  NSArray<id<VGMetalFilterNode>> *chain = nil;
+  os_unfair_lock_lock(&_chainLock);
+  chain = _filterChain; // ARC-retained snapshot; lock released immediately
+  os_unfair_lock_unlock(&_chainLock);
+
+  if (!chain.count) {
+    os_log_debug(sSchedulerLog,
+        "[VGScheduler] applyThermalState:%ld — empty chain, nothing to throttle",
+        (long)state);
+    return;
+  }
+
+  // ── 2. Select tier budget (ms) ────────────────────────────────────────────
+  // Calibrated for Phase 3 behavioral equivalence with the current 3-node set
+  // (LUT=2ms, Beauty=3ms, Segmentation=5ms):
+  //   Nominal/Fair  → FLT_MAX — all nodes always on
+  //   Serious       → 5.0 ms  — allows LUT(2)+Beauty(3)=5ms, disables Seg(5ms)
+  //   Critical      → 0.0 ms  — all nodes off
+  // N-node scaling is correct: greedy-disable from most expensive until
+  // totalCost ≤ budget, regardless of node count.
+  float budgetMs;
+  switch (state) {
+  case NSProcessInfoThermalStateNominal:
+  case NSProcessInfoThermalStateFair:
+    budgetMs = FLT_MAX;
+    break;
+  case NSProcessInfoThermalStateSerious:
+    budgetMs = 5.0f;
+    break;
+  case NSProcessInfoThermalStateCritical:
+    budgetMs = 0.0f;
+    break;
+  default:
+    os_log_debug(sSchedulerLog,
+        "[VGScheduler] applyThermalState: unknown state %ld — no-op", (long)state);
+    return;
+  }
+
+  // ── 3. Enable all nodes (lock NOT held — node.enabled write) ─────────────
+  for (id<VGMetalFilterNode> node in chain) {
+    node.enabled = YES;
+  }
+
+  // ── 4. Compute total estimated GPU cost ───────────────────────────────────
+  float totalCostMs = 0.0f;
+  for (id<VGMetalFilterNode> node in chain) {
+    totalCostMs += node.estimatedGPUCostMs;
+  }
+
+  // ── 5. Greedy disable: most expensive first until totalCost ≤ budget ──────
+  if (totalCostMs > budgetMs) {
+    // Sort descending by estimatedGPUCostMs (most expensive first).
+    // Lock NOT held during sort or node.enabled writes.
+    NSArray<id<VGMetalFilterNode>> *sorted =
+        [chain sortedArrayUsingComparator:^NSComparisonResult(
+            id<VGMetalFilterNode> a, id<VGMetalFilterNode> b) {
+          float costA = a.estimatedGPUCostMs;
+          float costB = b.estimatedGPUCostMs;
+          if (costA > costB) return NSOrderedAscending;  // a before b = most expensive first
+          if (costA < costB) return NSOrderedDescending;
+          return NSOrderedSame;
+        }];
+
+    for (id<VGMetalFilterNode> node in sorted) {
+      if (totalCostMs <= budgetMs) break;
+      node.enabled = NO;
+      totalCostMs -= node.estimatedGPUCostMs;
+    }
+  }
+
   os_log_debug(sSchedulerLog,
-      "[VGScheduler] applyThermalState:%ld (dormant P4-2)", (long)state);
+      "[VGScheduler] applyThermalState:%ld budget=%.1fms remaining=%.1fms "
+      "nodes=%lu",
+      (long)state, budgetMs, totalCostMs, (unsigned long)chain.count);
 }
 
 - (void)invalidate {

@@ -794,50 +794,10 @@ static BOOL VGRIsImageURL(NSURL *url) {
 /// in VanguardMetalRenderer (same queue contract). Acceptable in P3-3/P3-4;
 /// Phase 4 scheduler will own this coordination.
 - (void)setRuntimeThermalState:(NSProcessInfoThermalState)state {
-  NSArray<id<VGMetalFilterNode>> *chain = self.filterChainStorage;
-  if (!chain.count)
-    return; // no runtime chain — nothing to degrade
-
-  switch (state) {
-  case NSProcessInfoThermalStateNominal:
-  case NSProcessInfoThermalStateFair:
-    // Full quality: enable all runtime filter nodes.
-    for (id<VGMetalFilterNode> node in chain) {
-      node.enabled = YES;
-    }
-    NSLog(@"[VanguardGraphRuntime] Thermal ≤Fair → all filter nodes enabled");
-    break;
-
-  case NSProcessInfoThermalStateSerious:
-    // Reduce GPU load: disable expensive nodes (segmentation: Vision + Metal
-    // ≤5ms). Non-expensive nodes (LUT ≤2ms, Beauty ≤3ms) remain active. Node
-    // cost is declared via the isExpensive protocol property
-    // (VGMetalFilterNode.h). VanguardMLGate handles its own interval step-up
-    // independently.
-    for (id<VGMetalFilterNode> node in chain) {
-      node.enabled = !node.isExpensive;
-    }
-    NSLog(@"[VanguardGraphRuntime] Thermal Serious → expensive filter nodes "
-          @"disabled");
-    break;
-
-  case NSProcessInfoThermalStateCritical:
-    // Emergency: disable ALL nodes. Chain stays installed (no invalidate, no
-    // swap). Frame delivery continues with passthrough — no frame drop.
-    // Recovery (nominal/fair above) re-enables nodes without chain re-install.
-    for (id<VGMetalFilterNode> node in chain) {
-      node.enabled = NO;
-    }
-    NSLog(
-        @"[VanguardGraphRuntime] Thermal Critical → all filter nodes disabled");
-    break;
-
-  default:
-    break;
-  }
-
-  // P4-3: Dual-forward to dormant scheduler. Scheduler stores state only;
-  // no execution. Renderer/node logic above remains sole active path.
+  // P4-9: Thermal policy now owned by VanguardGraphScheduler (cost-budget
+  // model, DEC-55 / RR-33 closure). Runtime delegates unconditionally.
+  // The scheduler snapshots the chain, selects a tier budget, and disables
+  // nodes via estimatedGPUCostMs greedy-disable. No node iteration here.
   [self.scheduler applyThermalState:state];
 }
 

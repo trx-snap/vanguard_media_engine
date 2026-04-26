@@ -83,7 +83,11 @@ Pod::Spec.new do |s|
       # Phase 4 P4-8B: GPU fence release timing gate (plan:200)
       'Tests/VGPoolReleaseTimingTest.m',
       # Phase 4 P4-8B: 10-cycle churn + phys_footprint leak gate (plan:200, RR-29)
-      'Tests/VGSessionChurnPoolLeakTest.m'
+      'Tests/VGSessionChurnPoolLeakTest.m',
+      # Phase 4 P4-9: Cost-budget thermal policy gate — 3-node Phase 3 equivalence (plan:365, RR-33)
+      'Tests/VGCostBudgetThermalTest.m',
+      # Phase 4 P4-9: Cost-budget future-node scaling gate (plan:366, RR-33)
+      'Tests/VGCostBudgetFutureNodeTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'
