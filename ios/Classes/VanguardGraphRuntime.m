@@ -26,6 +26,10 @@
 #import "VanguardImageMediaSource.h"
 #import "VanguardImageProcessor.h"
 #import "VanguardMetalRenderer.h"
+// P4-10: filter node classes — required by setFilterChainFromSpecs: (RR-34)
+#import "VanguardLUTFilterNode.h"
+#import "VanguardBeautyFilterNode.h"
+#import "VanguardSegmentationFilterNode.h"
 
 // UMF shared infrastructure
 #import <UMF/VGResourceAllocator.h>
@@ -771,6 +775,97 @@ static BOOL VGRIsImageURL(NSURL *url) {
   // Forward to scheduler ONLY (P4-5: renderer no longer executes filters).
   // RR-31 CLOSED: setRuntimeFilterChain: renderer forward removed.
   [self.scheduler setFilterChain:newChain];
+}
+
+// P4-10: Spec-based filter chain construction (RR-34 closure).
+//
+// All three filter node classes (VanguardLUTFilterNode, VanguardBeautyFilterNode,
+// VanguardSegmentationFilterNode) declare `init` NS_UNAVAILABLE — they must be
+// constructed with initWithPool:device:. The Swift plugin layer has no access to
+// the runtime-owned CVPixelBufferPool or MTLDevice, so construction must happen
+// here where both resources are available (post-prepare).
+//
+// The method validates all type strings FIRST, then constructs + applies the chain
+// atomically via -setFilterChain: on success. On any unknown type it returns NO
+// and sets *unknown without mutating the chain.
+- (BOOL)setFilterChainFromSpecs:(NSArray<NSDictionary *> *)specs
+                        unknown:(NSString *__autoreleasing *_Nullable)unknown {
+  if (unknown) *unknown = nil;
+
+  CVPixelBufferPoolRef pool = self.sessionPool;
+  id<MTLDevice> device     = [VGResourceAllocator sharedInstance].metalDevice;
+
+  // If the session pool or device is not yet available (called before prepare),
+  // apply an empty chain. Callers should not invoke before prepare completes,
+  // but we degrade gracefully rather than crashing.
+  if (!pool || !device) {
+    NSLog(@"[VGRuntime] setFilterChainFromSpecs: pool or device nil (called before prepare?)");
+    [self setFilterChain:@[]];
+    return YES; // not an unknown-type error
+  }
+
+  // ── 1. Validate all types before constructing any nodes ───────────────────
+  static NSSet<NSString *> *knownTypes;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    knownTypes = [NSSet setWithObjects:@"lut", @"beauty", @"segmentation", nil];
+  });
+
+  for (NSDictionary *spec in specs) {
+    NSString *type = spec[@"type"];
+    if (![type isKindOfClass:[NSString class]] || ![knownTypes containsObject:type]) {
+      if (unknown) *unknown = type ?: @"(nil)";
+      return NO;
+    }
+  }
+
+  // ── 2. Construct nodes (all types validated) ───────────────────────────────
+  NSMutableArray<id<VGMetalFilterNode>> *nodes =
+      [NSMutableArray arrayWithCapacity:specs.count];
+
+  for (NSDictionary *spec in specs) {
+    NSString *type       = spec[@"type"];
+    NSDictionary *params = spec[@"parameters"];
+    BOOL enabled         = [spec[@"enabled"] boolValue]; // nil → NO → fixed below
+    // Default enabled=YES when the key is absent (Dart default is true).
+    if (spec[@"enabled"] == nil) enabled = YES;
+
+    id<VGMetalFilterNode> node = nil;
+
+    if ([type isEqualToString:@"lut"]) {
+      VanguardLUTFilterNode *lut =
+          [[VanguardLUTFilterNode alloc] initWithPool:pool device:device];
+      if ([params[@"intensity"] isKindOfClass:[NSNumber class]]) {
+        lut.intensity = [params[@"intensity"] floatValue];
+      }
+      lut.enabled = enabled;
+      node = lut;
+
+    } else if ([type isEqualToString:@"beauty"]) {
+      VanguardBeautyFilterNode *beauty =
+          [[VanguardBeautyFilterNode alloc] initWithPool:pool device:device];
+      if ([params[@"intensity"] isKindOfClass:[NSNumber class]]) {
+        beauty.intensity = [params[@"intensity"] floatValue];
+      }
+      if ([params[@"radius"] isKindOfClass:[NSNumber class]]) {
+        beauty.radius = [params[@"radius"] intValue];
+      }
+      beauty.enabled = enabled;
+      node = beauty;
+
+    } else if ([type isEqualToString:@"segmentation"]) {
+      VanguardSegmentationFilterNode *seg =
+          [[VanguardSegmentationFilterNode alloc] initWithPool:pool device:device];
+      seg.enabled = enabled;
+      node = seg;
+    }
+
+    if (node) [nodes addObject:node];
+  }
+
+  // ── 3. Apply via the existing thread-safe setter ──────────────────────────
+  [self setFilterChain:[nodes copy]];
+  return YES;
 }
 
 // ─── P3-4 Thermal back-pressure

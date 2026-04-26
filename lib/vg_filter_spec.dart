@@ -119,3 +119,73 @@ bool _mapEquals(Map<String, Object?> a, Map<String, Object?> b) {
   }
   return true;
 }
+
+// ── P4-10: Typed constructors + validation (DEC-42, closes RR-34) ────────────
+
+/// Allowlist of native-recognised filter type strings.
+///
+/// The native plugin's `setFilterChain` handler maps each type to a concrete
+/// filter node class. Extend this set when a new filter node is added to both
+/// the native handler and the UMF protocol conformers.
+const Set<String> _validTypes = {'lut', 'beauty', 'segmentation'};
+
+/// Typed factory constructors and validation for [VGFilterSpec].
+///
+/// Preferred over raw `VGFilterSpec(type: 'lut', ...)` because the factories
+/// guarantee the correct type string and default parameters without relying on
+/// caller-supplied string literals.
+///
+/// ```dart
+/// await session.setFilterChain([
+///   VGFilterSpecs.lut(intensity: 0.8),
+///   VGFilterSpecs.beauty(intensity: 0.5, radius: 3.0),
+///   VGFilterSpecs.segmentation(),
+/// ]);
+/// ```
+extension VGFilterSpecs on VGFilterSpec {
+  /// Creates a LUT colour-grading filter.
+  ///
+  /// [intensity] controls the blend between the identity and the loaded LUT
+  /// [0.0, 1.0]. Defaults to 1.0 (full LUT).
+  static VGFilterSpec lut({double intensity = 1.0}) => VGFilterSpec(
+        type: 'lut',
+        parameters: {'intensity': intensity},
+      );
+
+  /// Creates a beauty (bilateral skin-smoothing) filter.
+  ///
+  /// [intensity] maps to sigma_color in the bilateral kernel [0.0, 1.0].
+  /// Defaults to 1.0.
+  ///
+  /// [radius] is the kernel half-size in pixels [1, 4]. Defaults to 2.0.
+  static VGFilterSpec beauty({double intensity = 1.0, double radius = 2.0}) =>
+      VGFilterSpec(
+        type: 'beauty',
+        parameters: {'intensity': intensity, 'radius': radius},
+      );
+
+  /// Creates a person-segmentation composite filter.
+  ///
+  /// No parameters in Phase 4. Reads the current [VanguardMaskStore] snapshot
+  /// on the native side.
+  static VGFilterSpec segmentation() =>
+      const VGFilterSpec(type: 'segmentation');
+
+  /// Asserts that this spec's [type] is recognised by the native plugin.
+  ///
+  /// Throws an [AssertionError] in debug mode if [type] is not in the
+  /// allowlist ([_validTypes]). No-op in release mode (Dart `assert` is elided
+  /// by the compiler when asserts are disabled).
+  ///
+  /// [VGPlaybackSession.setFilterChain] calls this automatically for every
+  /// spec before dispatching to native, so callers do not need to call it
+  /// manually unless they are constructing specs outside [setFilterChain].
+  void assertValid() {
+    assert(
+      _validTypes.contains(type),
+      'VGFilterSpec.assertValid: unrecognised filter type "$type". '
+      'Valid types: $_validTypes. '
+      'Add a native handler case and update _validTypes to introduce a new filter.',
+    );
+  }
+}

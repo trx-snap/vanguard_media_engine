@@ -119,6 +119,27 @@ NS_ASSUME_NONNULL_BEGIN
 /// Thread-safe: may be called from any thread.
 - (void)setFilterChain:(nullable NSArray<id<VGMetalFilterNode>> *)chain;
 
+/// P4-10: Constructs a filter chain from an ordered array of spec dictionaries
+/// and applies it via -setFilterChain:.
+///
+/// Each spec dictionary must contain:
+///   - `"type"` (NSString): one of `"lut"`, `"beauty"`, `"segmentation"`.
+///   - `"enabled"` (NSNumber/BOOL, optional): node enable state. Defaults YES.
+///   - `"parameters"` (NSDictionary, optional): per-node tuning params.
+///     Recognised keys per type:
+///       lut/beauty → `"intensity"` (float). beauty → `"radius"` (int).
+///
+/// @param specs   Ordered array of spec dicts (Dart → native method-channel payload).
+/// @param unknown Set to the first unrecognised type string on return, or nil.
+///
+/// @return YES if all types were recognised and the chain was applied.
+///         NO  if any type was unrecognised (*unknown is set); chain NOT applied.
+///
+/// Thread-safe: delegates to -setFilterChain: which is already thread-safe.
+- (BOOL)setFilterChainFromSpecs:(NSArray<NSDictionary *> *)specs
+                        unknown:(NSString *_Nullable *_Nullable)unknown
+    NS_SWIFT_NAME(setFilterChain(fromSpecs:unknown:));
+
 // ─── P3-4 Thermal back-pressure
 // ──────────────────────────────────────────────── Receives thermal state from
 // VGPluginLifecycleObserver and applies the 3-tier degradation policy to the

@@ -89,6 +89,13 @@ final class VGPlaybackSession {
   /// No-op if this session has already been [dispose]d.
   Future<void> setFilterChain(List<VGFilterSpec> filters) async {
     if (_disposed) return;
+    // P4-10: Validate all specs against the native allowlist before dispatch.
+    // assertValid() is a debug-mode assert (no-op in release). Catches typos
+    // and unknown type strings early — before the method-channel round-trip
+    // (RR-34 closure, DEC-42).
+    for (final filter in filters) {
+      filter.assertValid();
+    }
     await _channel.invokeMethod<void>('setFilterChain', {
       'sessionId': sessionId,
       'filters': List<Map<String, Object?>>.unmodifiable(

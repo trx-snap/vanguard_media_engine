@@ -988,6 +988,65 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 DispatchQueue.main.async { result(success) }
             }
 
+        // ── P4-10: Filter chain dispatch ────────────────────────────────────
+        // Receives a Dart setFilterChain payload:
+        //   { "sessionId": String, "filters": [[String: Any]] }
+        // Validates each filter type against the native allowlist, then delegates
+        // node construction to the runtime (which owns the pool + Metal device).
+        // Returns FlutterError(UNKNOWN_FILTER) for any unrecognised type string.
+        // Closes RR-34.
+        case "setFilterChain":
+            guard
+                let sessionId = args?["sessionId"] as? String,
+                let filterDicts = args?["filters"] as? [[String: Any]]
+            else {
+                result(FlutterError(code: "BAD_ARGS",
+                                    message: "setFilterChain requires sessionId and filters",
+                                    details: nil))
+                return
+            }
+
+            guard let runtime = sessionRegistry.runtime(forSessionId: sessionId) else {
+                result(FlutterError(code: "SESSION_NOT_FOUND",
+                                    message: "setFilterChain: no runtime for sessionId \(sessionId)",
+                                    details: nil))
+                return
+            }
+
+            // Pre-validate type strings before touching the runtime.
+            // Mirrors the Dart-side assertValid() allowlist; provides server-side
+            // error reporting for release-mode callers where assert is elided.
+            let knownTypes: Set<String> = ["lut", "beauty", "segmentation"]
+            for dict in filterDicts {
+                let type = dict["type"] as? String ?? ""
+                if !knownTypes.contains(type) {
+                    result(FlutterError(
+                        code: "UNKNOWN_FILTER",
+                        message: "Unknown filter type: \(type)",
+                        details: nil
+                    ))
+                    return
+                }
+            }
+
+            // Delegate node construction + chain swap to the runtime, which owns
+            // the CVPixelBufferPool and MTLDevice required by filter node initialisers.
+            var unknownType: NSString? = nil
+            let applied = runtime.setFilterChain(fromSpecs: filterDicts, unknown: &unknownType)
+
+            if applied {
+                result(nil)
+            } else {
+                // Double-check: should not reach here (pre-validated above), but guard
+                // in case the runtime's allowlist diverges from the Swift one.
+                let badType = unknownType ?? "(nil)"
+                result(FlutterError(
+                    code: "UNKNOWN_FILTER",
+                    message: "Unknown filter type (runtime): \(badType)",
+                    details: nil
+                ))
+            }
+
         // ── Export ─────────────────────────────────────────────────────────────
 
         case "startExport":
