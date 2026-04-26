@@ -46,9 +46,8 @@ static os_log_t _rendererLog;
   CVPixelBufferRef _latestPixelBuffer;
   os_unfair_lock _pixelBufferLock;
 
-  // P0-T1: Shared pool supplied to the source; 3 IOSurface-backed Metal
-  // buffers.
-  CVPixelBufferPoolRef _pixelBufferPool;
+  // P4-7C: Renderer-owned pool deleted. Renderer uses only the session pool
+  // injected by VanguardGraphRuntime via initWithSource:sessionPool:.
   // P4-7 Q2: session pool injected by VanguardGraphRuntime — borrowed reference.
   // The runtime (via VGResourceAllocator) owns the +1; renderer must NOT release.
   CVPixelBufferPoolRef _sessionPixelBufferPool;
@@ -95,8 +94,7 @@ static os_log_t _rendererLog;
 @synthesize videoDuration = _videoDuration;
 @synthesize filterChain = _filterChain;
 @synthesize filterChainEnabled = _filterChainEnabled;
-// Phase A1-S1: expose pool for backfill into VanguardImageProcessor
-@synthesize pixelBufferPool = _pixelBufferPool;
+// P4-7C: @synthesize pixelBufferPool deleted — renderer-owned pool removed.
 // P4-5: frameDelegate — weak ref to VGGraphScheduler; managed by ARC.
 // No manual synthesize needed for weak object properties unless name differs.
 // Explicit synthesize prevents accidental shadowing by a subclass.
@@ -165,7 +163,8 @@ static os_log_t _rendererLog;
   _sessionPixelBufferPool = sessionPool; // borrowed — runtime owns the +1
 
   [self _setupMetal];
-  [self _setupPixelBufferPoolFromSource:source];
+  // P4-7C: _setupPixelBufferPoolFromSource: deleted — renderer no longer creates
+  // its own pool. Session pool is injected by runtime (see _sessionPixelBufferPool).
   [self _allocateOutputTexture];
 
   // Derive rotation index and render size once from source preferredTransform.
@@ -252,14 +251,9 @@ static os_log_t _rendererLog;
   if (!self)
     return nil;
 
-  // PATCH-8: Wire the renderer's CVPixelBufferPool to the source now that
-  // initWithSource: has created the pool. Seek frames
-  // (_pixelBufferFromCGImage:) will use pool allocation instead of
-  // CVPixelBufferCreate, eliminating one VM round-trip per seek frame during
-  // scrubbing.
-  if (_pixelBufferPool) {
-    source.pixelBufferPool = _pixelBufferPool;
-  }
+  // P4-7C: Renderer pool backfill removed. Pool is owned by runtime and
+  // injected post-prepare via source.pixelBufferPool = sessionPool in
+  // VanguardGraphRuntime (P4-7B). Renderer-owned _pixelBufferPool deleted.
 
   // Report duration with path (convenience init has the path)
   _videoDuration = CMTimeGetSeconds([source duration]);
@@ -344,18 +338,10 @@ static os_log_t _rendererLog;
   [self _setupBlitPipeline:library];
 }
 
-- (void)_setupPixelBufferPoolFromSource:(id<VanguardMediaSource>)source {
-  CGSize size = CGSizeMake(1080, 1920); // fallback
-
-  if ([source isKindOfClass:[VanguardFileMediaSource class]]) {
-    CGSize s = ((VanguardFileMediaSource *)source).renderSize;
-    if (s.width > 0 && s.height > 0)
-      size = s;
-  }
-
-  [self _setupPixelBufferPoolWithWidth:(size_t)size.width
-                                height:(size_t)size.height];
-}
+// P4-7C: _setupPixelBufferPoolFromSource: deleted — renderer no longer owns
+// a pixel buffer pool. Pool creation moved to VanguardGraphRuntime post-prepare
+// (P4-7B), sized from actual source renderSize, budget-checked via
+// VGResourceAllocator.canAllocatePoolBytes: (RR-25, RR-29).
 
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - GPU Rotation Blit
@@ -405,8 +391,9 @@ static os_log_t _rendererLog;
 }
 
 /// Applies GPU rotation to `src` using `_blitPipelineState`.
-/// Returns a retained CVPixelBuffer from `_pixelBufferPool` containing the
-/// rotated frame, or NULL on failure (caller must fall back to `src`).
+/// Returns a retained CVPixelBuffer from `_sessionPixelBufferPool` (injected
+/// by VanguardGraphRuntime) containing the rotated frame, or NULL on failure
+/// (caller must fall back to `src`).
 /// The caller must independently retain `src` before calling and release it
 /// in the Metal completion handler — this method captures that retained ref.
 - (CVPixelBufferRef _Nullable)_rotatePixelBufferGPU:(CVPixelBufferRef)src
@@ -540,35 +527,10 @@ static os_log_t _rendererLog;
   return dst; // retained; caller takes ownership
 }
 
-// P0-T1: Creates a pool of 3 Metal-compatible BGRA pixel buffers.
-- (void)_setupPixelBufferPoolWithWidth:(size_t)w height:(size_t)h {
-  if (_pixelBufferPool) {
-    CVPixelBufferPoolFlush(_pixelBufferPool, 0);
-    CFRelease(_pixelBufferPool);
-    _pixelBufferPool = NULL;
-  }
-  NSDictionary *poolAttrs = @{(id)kCVPixelBufferPoolMinimumBufferCountKey : @3};
-  NSDictionary *bufAttrs = @{
-    (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
-    (id)kCVPixelBufferWidthKey : @(w),
-    (id)kCVPixelBufferHeightKey : @(h),
-    (id)kCVPixelBufferMetalCompatibilityKey : @YES,
-    (id)kCVPixelBufferCGImageCompatibilityKey : @YES,
-    (id)kCVPixelBufferCGBitmapContextCompatibilityKey : @YES,
-    // IOSurface backing required for Flutter's Metal texture-cache upload path.
-    // Without this key Flutter cannot map the CVPixelBuffer to an MTLTexture
-    // and renders a black frame even when copyPixelBuffer returns a valid
-    // buffer.
-    (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
-  };
-  CVReturn status = CVPixelBufferPoolCreate(
-      kCFAllocatorDefault, (__bridge CFDictionaryRef)poolAttrs,
-      (__bridge CFDictionaryRef)bufAttrs, &_pixelBufferPool);
-  if (status != kCVReturnSuccess) {
-    NSLog(@"[VanguardRenderer] CVPixelBufferPool creation failed: %d", status);
-    _pixelBufferPool = NULL;
-  }
-}
+// P4-7C: _setupPixelBufferPoolWithWidth:height: deleted — renderer-owned pool
+// creation removed. Pool is created and owned exclusively by VanguardGraphRuntime
+// via VGResourceAllocator.pixelBufferPoolWithWidth:height:format:minimumBufferCount:
+// after source prepare (P4-7B). Closes dual-pool issue (P4-7 plan).
 
 - (void)_allocateOutputTexture {
   CGSize size = CGSizeMake(1080, 1920); // fallback
@@ -1042,10 +1004,8 @@ static os_log_t _rendererLog;
   }
   os_unfair_lock_unlock(&_pixelBufferLock);
 
-  if (_pixelBufferPool) {
-    CVPixelBufferPoolFlush(_pixelBufferPool,
-                           kCVPixelBufferPoolFlushExcessBuffers);
-  }
+  // P4-7C: renderer-owned pool flush removed — _pixelBufferPool deleted.
+  // Runtime owns the session pool; memory pressure flush is runtime's concern.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1072,7 +1032,7 @@ static os_log_t _rendererLog;
   os_unfair_lock_lock(&_pixelBufferLock);
   _latestPixelBuffer = NULL;
   os_unfair_lock_unlock(&_pixelBufferLock);
-  _pixelBufferPool = NULL;
+  // P4-7C: _pixelBufferPool = NULL removed — renderer-owned pool deleted.
   _textureCache = NULL;
 }
 

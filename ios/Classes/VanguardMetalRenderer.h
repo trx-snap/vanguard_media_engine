@@ -109,14 +109,11 @@ NS_ASSUME_NONNULL_BEGIN
 @property(readonly, nonatomic) int64_t textureId;
 @property(readonly, nonatomic) double videoDuration;
 
-/// Phase A1-S1: Exposes the renderer's CVPixelBufferPool for pool backfill.
-/// Used by VanguardMediaEnginePlugin._createImageRenderer to wire the pool
-/// into VanguardImageProcessor after initWithSource: returns.
-/// Never NULL after a successful initWithSource: call (pool creation is
-/// performed unconditionally in _setupPixelBufferPoolFromSource:).
-/// Caller MUST NOT release this reference — the renderer owns the pool
-/// lifetime.
-@property(readonly, nonatomic, nullable) CVPixelBufferPoolRef pixelBufferPool;
+// P4-7C: pixelBufferPool property deleted. Renderer no longer owns or exposes
+// a pixel buffer pool. Pool is created by VanguardGraphRuntime post-prepare
+// and injected into the renderer at init via sessionPool: (P4-7B).
+// Source pool backfill also performed by runtime (not renderer).
+
 
 /// P4-4: GPU-sink entry point. Not called in P4-4 — additive, dormant until
 /// P4-5 wires it from VGGraphScheduler.

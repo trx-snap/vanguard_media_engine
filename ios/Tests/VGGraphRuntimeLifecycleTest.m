@@ -250,10 +250,13 @@
         [allocator pixelBufferPoolWithWidth:1080
                                      height:1920
                                      format:kCVPixelFormatType_32BGRA];
-    self.capturedPool = pool;
+    self.capturedPool = pool;  // retains +1 — released in dealloc
     source.receivedPool = pool;
-    if (pool)
-      CVPixelBufferPoolRelease(pool);
+    // Do NOT release pool here: capturedPool holds the +1 for the test's
+    // lifetime, mirroring the production runtime's own pool ownership model
+    // (the runtime keeps the +1 alive until invalidateAsync's afterCompletion
+    // block). Releasing here was the root cause of testPoolSourcing hanging
+    // on CVPixelBufferPoolCreatePixelBuffer (dangling pointer — P4-7B fix).
 
     // ── Call prepareWithCompletion: on mock source ─────────────────────────
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -283,6 +286,16 @@
 
     completion(fakeTextureId, nil);
   });
+}
+
+- (void)dealloc {
+  // Release the pool +1 kept alive in capturedPool (assign property — no ARC).
+  // Symmetric with the removal of CVPixelBufferPoolRelease in the pool recording
+  // block above (P4-7B fix — pool must stay valid until after test assertions).
+  if (_capturedPool) {
+    CVPixelBufferPoolRelease(_capturedPool);
+    _capturedPool = NULL;
+  }
 }
 
 // play / pause / seekTo: / invalidate — all inherited from

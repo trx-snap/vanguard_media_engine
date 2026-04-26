@@ -71,7 +71,13 @@ Pod::Spec.new do |s|
       # Phase 4 P4-5: Scheduler filter execution gate (P4-5 mandatory gate)
       'Tests/VGSchedulerFilterExecutionTest.m',
       # Phase 4 P4-6: Legacy renderer path smoke test (camera smoke substitute)
-      'Tests/VGRendererLegacyPathSmokeTest.m'
+      'Tests/VGRendererLegacyPathSmokeTest.m',
+      # Phase 4 P4-7D: Pool unification, sizing, and budget validation gates
+      'Tests/VGPoolUnificationTest.m',
+      'Tests/VGPoolSizingTest.m',
+      'Tests/VGPoolBudgetTest.m',
+      # Phase 4 P4-7D: Pool pressure behavior hardening gate
+      'Tests/VGPoolPressureBehaviorTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'

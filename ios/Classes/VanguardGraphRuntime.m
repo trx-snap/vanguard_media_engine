@@ -184,50 +184,44 @@ static BOOL VGRIsImageURL(NSURL *url) {
       return;
     }
 
-    // ── 1. Source the pixel buffer pool from VGResourceAllocator ──────────
+    // ── 1. Resolve effective audio role ───────────────────────────────────
     //
-    //    We obtain a pool sized for a common video canvas (1080 × 1920 BGRA).
-    //    In Phase 2 this will be driven by the actual source render size.
-    //    The pool is held by the runtime for the session lifetime.
+    // Audio role must be resolved before source construction so the resolved
+    // role can be passed into VanguardFileMediaSource via the 3-arg designated
+    // initialiser. (Step-enforced blocker RR-06 is satisfied by the
+    // prepareQueue dispatch above.)
     VGResourceAllocator *allocator = [VGResourceAllocator sharedInstance];
-    CVPixelBufferPoolRef pool =
-        [allocator pixelBufferPoolWithWidth:1080
-                                     height:1920
-                                     format:kCVPixelFormatType_32BGRA];
-    // pool carries a +1 retain (CF_RETURNS_RETAINED from
-    // pixelBufferPoolWithWidth). sessionPool is declared `assign` — it does NOT
-    // add a CF retain. Do NOT call CVPixelBufferPoolRelease here: that would
-    // immediately free the pool, leaving self.sessionPool as a dangling pointer
-    // for the entire session. The +1 is kept alive intentionally; it is
-    // consumed (noop'd as intentional leak) in invalidateAsync's
-    // afterCompletion block (IOSurface fence safety).
-    self.sessionPool = pool;
 
-    // ── 1.5 Resolve effective audio role through VGResourceAllocator ──────
-    //
-    // This must happen before source construction so the resolved role can be
-    // passed into VanguardFileMediaSource via the 3-arg designated initialiser.
-    // (Step-enforced blocker RR-06 is satisfied by the prepareQueue dispatch
-    // above.)
     VGAudioRole resolvedRole;
     if (self->_desiredAudioRole == VGAudioRoleActive) {
-      BOOL granted =
-          [[VGResourceAllocator sharedInstance] requestAudioActivation:self];
+      BOOL granted = [allocator requestAudioActivation:self];
       resolvedRole = granted ? VGAudioRoleActive : VGAudioRoleMuted;
     } else {
       resolvedRole = VGAudioRoleMuted;
     }
     self.effectiveAudioRole = resolvedRole; // atomic setter
 
-    // ── 2. Construct the appropriate source class ─────────────────────────
+    // ── 2. Construct the appropriate source class (nil pool for now) ───────
+    //
+    // P4-7B: Pool is NOT created yet — we need the actual source renderSize
+    // which is only available after prepareWithCompletion: completes.
+    // VanguardFileMediaSource.pixelBufferPool is nullable; passing nil here
+    // is safe — the source does not dereference the pool until decode begins,
+    // which happens only after start() is called (always post-prepare).
+    // VanguardImageProcessor also accepts a nil pool at construction; we
+    // backfill it below after pool creation (same pattern as before P4-7B).
 
     NSError *sourceError = nil;
+    // Retain processor for image path so we can backfill its pool post-prepare.
+    __block VanguardImageProcessor *imageProcessor = nil;
 
     if (VGRIsImageURL(url)) {
       // ── Image source ──────────────────────────────────────────────────
+      // Pool not yet created — processor receives nil pool; backfilled below.
       VanguardImageProcessor *processor =
           [[VanguardImageProcessor alloc] initWithDevice:allocator.metalDevice
-                                                    pool:self.sessionPool];
+                                                    pool:nil];
+      imageProcessor = processor;
       VanguardImageMediaSource *imageSrc =
           [[VanguardImageMediaSource alloc] initWithURL:url
                                               processor:processor];
@@ -236,11 +230,10 @@ static BOOL VGRIsImageURL(NSURL *url) {
     } else {
       // ── File / video source ───────────────────────────────────────────
       // Phase 2: use 3-arg init to pass resolved role at construction time.
-      // This ensures _setupAudioEngine role gate is correctly set before
-      // prepareWithCompletion: runs any AVFoundation setup.
+      // Pool is nil here; backfilled after prepare (P4-7B).
       VanguardFileMediaSource *fileSrc =
           [[VanguardFileMediaSource alloc] initWithURL:url
-                                       pixelBufferPool:self.sessionPool
+                                       pixelBufferPool:nil
                                       desiredAudioRole:resolvedRole];
       self.source = (id<VanguardMediaSource, VGMediaNode>)fileSrc;
     }
@@ -296,16 +289,105 @@ static BOOL VGRIsImageURL(NSURL *url) {
       [(id)self.source setEffectiveAudioRole:resolvedRole];
     }
 
-    // Capture render size from source now that preparation has completed.
-    // Falls back to a safe 1080×1920 default for sources that do not expose it.
-    {
-      CGSize sz = CGSizeZero;
-      if ([self.source respondsToSelector:@selector(renderSize)]) {
-        sz = [(id)self.source renderSize];
-      }
-      self->_renderSize =
-          (sz.width > 0 && sz.height > 0) ? sz : CGSizeMake(1080.0, 1920.0);
+    // ── 3.6 P4-7B: Capture render size and create budget-aware session pool ─
+    //
+    // Now that prepareWithCompletion: has completed, the source has probed
+    // the asset and populated renderSize. We use the actual source dimensions
+    // rather than a hardcoded 1080×1920 fallback.
+
+    // (a) Read actual render size — fall back to 1080×1920 if unavailable.
+    CGSize renderSz = CGSizeZero;
+    if ([self.source respondsToSelector:@selector(renderSize)]) {
+      renderSz = [(id)self.source renderSize];
     }
+    if (renderSz.width <= 0 || renderSz.height <= 0) {
+      NSLog(@"[VanguardGraphRuntime] P4-7B: source renderSize unavailable — "
+            @"falling back to 1080×1920");
+      renderSz = CGSizeMake(1080.0, 1920.0);
+    }
+    self->_renderSize = renderSz;
+
+    const size_t poolW = (size_t)renderSz.width;
+    const size_t poolH = (size_t)renderSz.height;
+    const NSUInteger kBytesPerPixel = 4; // BGRA (ADR-006)
+
+    // (b) Choose initial desired buffer count (DEC-39).
+    // Transitional rule: active-audio runtimes may later acquire a filter chain
+    // (count=5 is pre-allocated conservatively). Muted runtimes always use 3.
+    // Filter-chain-aware sizing is deferred to the P4-9 cost-budget step.
+    NSUInteger desiredCount = (resolvedRole == VGAudioRoleActive) ? 5 : 3;
+
+    // (c) Budget check — consult VGResourceAllocator before allocating (RR-29).
+    NSUInteger poolBytes = poolW * poolH * kBytesPerPixel * desiredCount;
+    BOOL budgetReserved = NO;
+
+    if ([allocator canAllocatePoolBytes:poolBytes]) {
+      budgetReserved = YES; // bytes reserved; must create pool or release them
+    } else if (desiredCount == 5) {
+      // Budget denied at count=5 — try count=3 (RR-25 / DEC-39 fallback).
+      NSLog(@"[VanguardGraphRuntime] P4-7B: budget denied at count=5; "
+            @"falling back to count=3");
+      desiredCount = 3;
+      poolBytes = poolW * poolH * kBytesPerPixel * desiredCount;
+      if ([allocator canAllocatePoolBytes:poolBytes]) {
+        budgetReserved = YES;
+      } else {
+        // Budget denied at count=3 too. Allocate anyway (session must start)
+        // but log clearly. Do NOT crash — product must remain functional.
+        NSLog(@"[VanguardGraphRuntime] P4-7B: WARNING — budget denied at "
+              @"count=3 (tracked=%lu budget=150MB); proceeding without "
+              @"budget reservation",
+              (unsigned long)[allocator estimatedPoolMemoryBytes]);
+        budgetReserved = NO;
+      }
+    }
+
+    // (d) Create the session pool from the allocator (replaces old pre-prepare
+    // hardcoded 1080×1920 allocation; addresses P4-7 plan "use actual renderSize").
+    CVPixelBufferPoolRef pool =
+        [allocator pixelBufferPoolWithWidth:poolW
+                                     height:poolH
+                                     format:kCVPixelFormatType_32BGRA
+                        minimumBufferCount:desiredCount];
+
+    if (!pool && budgetReserved) {
+      // Pool creation failed after budget was reserved — release the reservation
+      // so the allocator's byte counter does not drift (P4-7A contract).
+      [allocator reportPoolReleased:poolBytes];
+      budgetReserved = NO;
+      NSLog(@"[VanguardGraphRuntime] P4-7B: pool creation failed (w=%zu h=%zu "
+            @"count=%lu) — session will proceed without a session pool",
+            poolW, poolH, (unsigned long)desiredCount);
+    }
+
+    NSLog(@"[VanguardGraphRuntime] P4-7B: pool created pool=%p size=%zux%zu "
+          @"count=%lu bytes=%luMB budgetReserved=%d",
+          pool, poolW, poolH, (unsigned long)desiredCount,
+          (unsigned long)(poolBytes / (1024 * 1024)), budgetReserved);
+
+    // pool carries a +1 retain (CF_RETURNS_RETAINED from
+    // pixelBufferPoolWithWidth). sessionPool is declared `assign` — it does NOT
+    // add a CF retain. Do NOT call CVPixelBufferPoolRelease here: that would
+    // immediately free the pool, leaving self.sessionPool as a dangling pointer
+    // for the entire session. The +1 is kept alive intentionally; it is
+    // consumed (noop'd as intentional leak) in invalidateAsync's
+    // afterCompletion block (IOSurface fence safety — P4-8 will replace with
+    // GPU fence deferred release).
+    self.sessionPool = pool;
+
+    // (e) Backfill pool to source now that both source and pool exist.
+    // VanguardFileMediaSource.pixelBufferPool is an `assign` property — setting
+    // it here is safe because the source does not read it until start() is
+    // called, which always follows prepare.
+    if ([self.source respondsToSelector:@selector(setPixelBufferPool:)]) {
+      [(id)self.source setPixelBufferPool:pool];
+    }
+    // Image path: backfill the processor's pool directly (mirroring the old
+    // plugin-side backfill that was removed in P4-7 Step 1).
+    if (imageProcessor && pool) {
+      imageProcessor.pool = pool;
+    }
+
 
     VanguardMetalRenderer *renderer =
         [[VanguardMetalRenderer alloc] initWithSource:self.source
