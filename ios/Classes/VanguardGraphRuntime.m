@@ -30,6 +30,8 @@
 #import "VanguardLUTFilterNode.h"
 #import "VanguardBeautyFilterNode.h"
 #import "VanguardSegmentationFilterNode.h"
+// Phase 4B: Beauty V2 — opt-in only, never the default (Step 4 controlled wiring)
+#import "BeautyV2FilterGroup.h"
 
 // UMF shared infrastructure
 #import <UMF/VGResourceAllocator.h>
@@ -91,6 +93,12 @@ static BOOL VGRIsImageURL(NSURL *url) {
 // Logical owner of the runtime filter chain. Forwarded to renderer on mutation.
 @property(nonatomic, strong, nullable)
     NSArray<id<VGMetalFilterNode>> *filterChainStorage;
+
+// Image-path filter support: stored during prepare for image sessions only.
+// Both are nil for video sessions. Used by setFilterChain: to re-push the
+// filtered image buffer to the renderer without touching the video path.
+@property(nonatomic, strong, nullable) VanguardImageProcessor *imageProcessor;
+@property(nonatomic, weak, nullable) VanguardImageMediaSource *imageSrc;
 
 // P4-3: Dormant scheduler. Created in prepareWithURL:, torn down in
 // invalidate/dealloc. Does NOT drive frame execution (that is P4-5+).
@@ -246,6 +254,9 @@ static BOOL VGRIsImageURL(NSURL *url) {
           [[VanguardImageMediaSource alloc] initWithURL:url
                                               processor:processor];
       self.source = (id<VanguardMediaSource, VGMediaNode>)imageSrc;
+      // Store for setFilterChain: image re-apply.
+      self.imageProcessor = processor;
+      self.imageSrc = imageSrc;
 
     } else {
       // ── File / video source ───────────────────────────────────────────
@@ -775,6 +786,44 @@ static BOOL VGRIsImageURL(NSURL *url) {
   // Forward to scheduler ONLY (P4-5: renderer no longer executes filters).
   // RR-31 CLOSED: setRuntimeFilterChain: renderer forward removed.
   [self.scheduler setFilterChain:newChain];
+
+  // ── Image-path re-apply (image sessions only) ──────────────────────────────
+  // Independent of the video/scheduler path. Nil for video sessions.
+  // Reads original raw buffer from imageSrc (not renderer) to prevent
+  // cumulative filter accumulation across repeated taps.
+  VanguardImageProcessor *imgProc = self.imageProcessor;
+  VanguardImageMediaSource *imgSrc = self.imageSrc;
+  VanguardMetalRenderer *rend = self.renderer;
+  id<MTLDevice> dev = [VGResourceAllocator sharedInstance].metalDevice;
+
+  if (imgProc && imgSrc && rend && dev) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+      // Always read from the original unfiltered image buffer, not from the
+      // renderer's current display buffer. This prevents cumulative filter
+      // accumulation (Beauty+Beauty+Beauty) and makes Clear correctly restore
+      // the original image by applying an empty chain to the raw source buffer.
+      CVPixelBufferRef raw = [imgSrc copyRawBuffer]; // +1 retain
+      if (!raw) return;
+
+      CVPixelBufferRef filtered = [imgProc applyFilterChain:newChain
+                                                   toBuffer:raw
+                                                     atTime:kCMTimeZero
+                                                     device:dev];
+      // Push filtered buffer to renderer via the public GPU-sink API.
+      VGFrameEnvelope envelope;
+      memset(&envelope, 0, sizeof(envelope));
+      envelope.mediaType        = VGMediaTypeVideo;
+      envelope.pts              = kCMTimeZero;
+      envelope.payload.videoBuffer = (void *)filtered;
+      [rend presentEnvelope:envelope];
+
+      // Balance the extra +1 if the filter produced a new buffer.
+      if (filtered != raw) {
+        CVPixelBufferRelease(filtered);
+      }
+      CVPixelBufferRelease(raw); // balance copyRawBuffer
+    });
+  }
 }
 
 // P4-10: Spec-based filter chain construction (RR-34 closure).
@@ -842,16 +891,192 @@ static BOOL VGRIsImageURL(NSURL *url) {
       node = lut;
 
     } else if ([type isEqualToString:@"beauty"]) {
-      VanguardBeautyFilterNode *beauty =
-          [[VanguardBeautyFilterNode alloc] initWithPool:pool device:device];
-      if ([params[@"intensity"] isKindOfClass:[NSNumber class]]) {
-        beauty.intensity = [params[@"intensity"] floatValue];
+      // ── Beauty version switch (Phase 4B Step 4) ─────────────────────────────
+      // V2 is opt-in only. V1 is the default for all existing and new specs.
+      // Select V2 when params contain:
+      //   "beautyVersion": 2   (preferred canonical key)
+      //   "version": 2         (alternative accepted key)
+      // Any other value, or no version key at all, selects V1 (RR-45 safe).
+      BOOL wantV2 = NO;
+      if ([params[@"beautyVersion"] isKindOfClass:[NSNumber class]]) {
+        wantV2 = ([params[@"beautyVersion"] integerValue] == 2);
+      } else if ([params[@"version"] isKindOfClass:[NSNumber class]]) {
+        wantV2 = ([params[@"version"] integerValue] == 2);
       }
-      if ([params[@"radius"] isKindOfClass:[NSNumber class]]) {
-        beauty.radius = [params[@"radius"] intValue];
+
+      if (wantV2) {
+        // ── Beauty V2 path ───────────────────────────────────────────────────
+        // BeautyV2FilterGroup owns node-local intermediate pools;
+        // it borrows the runtime session pool (pool) for final output only.
+        // Sanitization (clamp) is performed inside processEnvelope: — do NOT
+        // sanitize values here; pass them through as-is (RR-38 §sanitization).
+        BeautyV2FilterGroup *v2 =
+            [[BeautyV2FilterGroup alloc] initWithPool:pool device:device];
+        if (v2) {
+          v2.enabled = enabled;
+
+          // ── Optional param mapping (Phase 4B Step 6B) ────────────────────
+          // Parameter precedence contract:
+          //   intensity alone  → useIntensityRamp=YES  (ramp drives all 5 params)
+          //   any granular key → useIntensityRamp=NO   (ramp disabled, explicit wins)
+          //
+          // Default: useIntensityRamp=YES (set in initWithPool:device:)
+          // so absent keys leave the ramp active at intensity=0.75.
+          if ([params[@"intensity"] isKindOfClass:[NSNumber class]]) {
+            v2.intensity = [params[@"intensity"] floatValue];
+            // Keep useIntensityRamp=YES (default) — intensity drives the ramp.
+          }
+          // Granular params: each one disables the ramp and takes direct effect.
+          BOOL hasGranular = NO;
+          if ([params[@"radius"] isKindOfClass:[NSNumber class]]) {
+            v2.radius = [params[@"radius"] intValue];
+            hasGranular = YES;
+          }
+          if ([params[@"sigma"] isKindOfClass:[NSNumber class]]) {
+            v2.sigma = [params[@"sigma"] floatValue];
+            hasGranular = YES;
+          }
+          if ([params[@"smoothStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.smoothStrength = [params[@"smoothStrength"] floatValue];
+            hasGranular = YES;
+          }
+          if ([params[@"sharpenStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.sharpenStrength = [params[@"sharpenStrength"] floatValue];
+            hasGranular = YES;
+          }
+          if ([params[@"theta"] isKindOfClass:[NSNumber class]]) {
+            v2.theta = [params[@"theta"] floatValue];
+            hasGranular = YES;
+          }
+          // Phase 4B.5 (DEC-59): range sigma override — disables intensity ramp.
+          // Dart callers do not send this key; reserved for advanced dev/QA use.
+          if ([params[@"rangeSigma"] isKindOfClass:[NSNumber class]]) {
+            v2.rangeSigma = [params[@"rangeSigma"] floatValue];
+            hasGranular = YES;
+          }
+          // Phase 4B.6 (DEC-60): perceptual composite param overrides.
+          // Step 1: CPU-plumbed only — values are stored on the ObjC node but
+          // not yet consumed by the GPU composite kernel (BeautyCompositeParams
+          // struct unchanged until Step 2).
+          if ([params[@"detailDamping"] isKindOfClass:[NSNumber class]]) {
+            v2.detailDamping = [params[@"detailDamping"] floatValue];
+            hasGranular = YES;
+          }
+          if ([params[@"toneStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.toneStrength = [params[@"toneStrength"] floatValue];
+            hasGranular = YES;
+          }
+          if ([params[@"midtoneLift"] isKindOfClass:[NSNumber class]]) {
+            v2.midtoneLift = [params[@"midtoneLift"] floatValue];
+            hasGranular = YES;
+          }
+          // Phase 4C (DEC-61/63): face-aware beauty DEV toggle.
+          // Independent of the intensity ramp — does NOT set hasGranular.
+          // When absent, default remains NO (exact Phase 4B.6 behavior).
+          if ([params[@"faceAwareEnabled"] isKindOfClass:[NSNumber class]]) {
+            v2.faceAwareEnabled = [params[@"faceAwareEnabled"] boolValue];
+          }
+          // Phase 4C.1 (DEC-66/67): face-weighted boost param overrides.
+          // Independent of the intensity ramp — do NOT set hasGranular.
+          // When absent, ObjC defaults are used (0.40, 0.12, 0.025, 0.15).
+          if ([params[@"faceSmoothBoost"] isKindOfClass:[NSNumber class]]) {
+            v2.faceSmoothBoost = [params[@"faceSmoothBoost"] floatValue];
+          }
+          if ([params[@"faceToneBoost"] isKindOfClass:[NSNumber class]]) {
+            v2.faceToneBoost = [params[@"faceToneBoost"] floatValue];
+          }
+          if ([params[@"faceLiftBoost"] isKindOfClass:[NSNumber class]]) {
+            v2.faceLiftBoost = [params[@"faceLiftBoost"] floatValue];
+          }
+          if ([params[@"faceDampingReduce"] isKindOfClass:[NSNumber class]]) {
+            v2.faceDampingReduce = [params[@"faceDampingReduce"] floatValue];
+          }
+          // Phase 4C.2 (DEC-70/71): color aesthetic param overrides.
+          // Independent of the intensity ramp — do NOT set hasGranular.
+          // When absent, ObjC defaults are used (0.30, 0.25, 0.35, 0.20).
+          if ([params[@"faceWhitenStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.faceWhitenStrength = [params[@"faceWhitenStrength"] floatValue];
+          }
+          if ([params[@"faceRosyStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.faceRosyStrength = [params[@"faceRosyStrength"] floatValue];
+          }
+          if ([params[@"faceToneUnifyStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.faceToneUnifyStrength = [params[@"faceToneUnifyStrength"] floatValue];
+          }
+          if ([params[@"faceGlowStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.faceGlowStrength = [params[@"faceGlowStrength"] floatValue];
+          }
+          // Phase 4C.3 (DEC-76/78): feature protection & enhancement overrides.
+          // Independent of the intensity ramp — do NOT set hasGranular.
+          // When absent, ObjC defaults are used (0.40, 0.35, 0.25, 0.20).
+          if ([params[@"featureRestoreStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.featureRestoreStrength = [params[@"featureRestoreStrength"] floatValue];
+          }
+          if ([params[@"featureDetailRestore"] isKindOfClass:[NSNumber class]]) {
+            v2.featureDetailRestore = [params[@"featureDetailRestore"] floatValue];
+          }
+          if ([params[@"featureContrastBoost"] isKindOfClass:[NSNumber class]]) {
+            v2.featureContrastBoost = [params[@"featureContrastBoost"] floatValue];
+          }
+          if ([params[@"featureSatBoost"] isKindOfClass:[NSNumber class]]) {
+            v2.featureSatBoost = [params[@"featureSatBoost"] floatValue];
+          }
+          // Phase 4D (DEC-82/84): perceptual feature enhancement overrides.
+          // Independent of the intensity ramp — do NOT set hasGranular.
+          // When absent, ObjC defaults are used (0.0 — 4D disabled).
+          if ([params[@"eyeEnhanceStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.eyeEnhanceStrength = [params[@"eyeEnhanceStrength"] floatValue];
+          }
+          if ([params[@"lipEnhanceStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.lipEnhanceStrength = [params[@"lipEnhanceStrength"] floatValue];
+          }
+          if ([params[@"browEnhanceStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.browEnhanceStrength = [params[@"browEnhanceStrength"] floatValue];
+          }
+          // Phase 4E (DEC-90/92): tone polish layer overrides.
+          // Independent of the intensity ramp — do NOT set hasGranular.
+          // When absent, ObjC defaults are used (0.0 — 4E disabled).
+          if ([params[@"polishGlowStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.polishGlowStrength = [params[@"polishGlowStrength"] floatValue];
+          }
+          if ([params[@"polishSmoothStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.polishSmoothStrength = [params[@"polishSmoothStrength"] floatValue];
+          }
+          if ([params[@"polishWarmthStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.polishWarmthStrength = [params[@"polishWarmthStrength"] floatValue];
+          }
+          if ([params[@"polishBloomStrength"] isKindOfClass:[NSNumber class]]) {
+            v2.polishBloomStrength = [params[@"polishBloomStrength"] floatValue];
+          }
+          if (hasGranular) {
+            // Explicit granular params present — disable ramp so they survive
+            // every processEnvelope: call without being overwritten.
+            v2.useIntensityRamp = NO;
+          }
+
+          node = v2;
+          NSLog(@"[VGRuntime] Beauty V2 selected (beautyVersion=2)");
+        } else {
+          // V2 allocation failed — fall back to V1 silently.
+          NSLog(@"[VGRuntime] Beauty V2 alloc failed — falling back to V1");
+          wantV2 = NO; // fall through to V1 block below
+        }
       }
-      beauty.enabled = enabled;
-      node = beauty;
+
+      if (!wantV2) {
+        // ── Beauty V1 path (default) ─────────────────────────────────────────
+        // Exactly as before Step 4 — no behavioral change.
+        VanguardBeautyFilterNode *beauty =
+            [[VanguardBeautyFilterNode alloc] initWithPool:pool device:device];
+        if ([params[@"intensity"] isKindOfClass:[NSNumber class]]) {
+          beauty.intensity = [params[@"intensity"] floatValue];
+        }
+        if ([params[@"radius"] isKindOfClass:[NSNumber class]]) {
+          beauty.radius = [params[@"radius"] intValue];
+        }
+        beauty.enabled = enabled;
+        node = beauty;
+      }
 
     } else if ([type isEqualToString:@"segmentation"]) {
       VanguardSegmentationFilterNode *seg =

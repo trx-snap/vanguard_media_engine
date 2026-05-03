@@ -33,13 +33,19 @@ typedef struct {
 // P3-4: isExpensive — NO because LUT is a fast GPU lookup (≤2ms).
 // Not disabled at thermal Serious tier; only disabled at Critical (all nodes
 // off).
-- (BOOL)isExpensive { return NO; }
+- (BOOL)isExpensive {
+  return NO;
+}
 
 // P4-2: VGMediaNode topology role.
-- (VGNodeRole)nodeRole { return VGNodeRoleFilter; }
+- (VGNodeRole)nodeRole {
+  return VGNodeRoleFilter;
+}
 
 // P4-2: Scalar GPU cost estimate (A14, nominal thermal, 1080p BGRA).
-- (float)estimatedGPUCostMs { return 2.0f; }
+- (float)estimatedGPUCostMs {
+  return 2.0f;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: Init
@@ -362,7 +368,14 @@ typedef struct {
 // ─────────────────────────────────────────────────────────────────────────────
 
 - (void)_compilePSO {
-  id<MTLLibrary> lib = [_device newDefaultLibrary];
+  NSBundle *bundle = [NSBundle bundleForClass:[self class]];
+  NSError *error = nil;
+  id<MTLLibrary> lib = [_device newDefaultLibraryWithBundle:bundle error:&error];
+  if (!lib) {
+    NSLog(@"[VGFilter] Failed to load Metal library from bundle %@: %@",
+          bundle.bundlePath, error);
+    return;
+  }
   id<MTLFunction> fn = [lib newFunctionWithName:@"vanguard_lut_apply"];
   if (!fn) {
     NSLog(@"[VanguardLUT] vanguard_lut_apply not found in default library");
@@ -375,36 +388,47 @@ typedef struct {
 }
 
 - (void)_buildDefaultLUT {
-  // 2³ identity LUT used when passthrough must go through the shader path.
-  // Normally enabled=NO will blit instead; this is the safety default.
-  const NSInteger N = 2;
+  // 16³ identity LUT: 4096 voxels, each mapping (R,G,B) → (R,G,B) exactly.
+  // A 2³ LUT only has 8 corner samples; trilinear interpolation on mid-tone
+  // pixels produces visible colour shifts. 16³ gives smooth neutral passthrough.
+  const NSInteger N = 16;
   MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
   desc.textureType = MTLTextureType3D;
   desc.pixelFormat = MTLPixelFormatRGBA8Unorm;
-  desc.width = N;
+  desc.width  = N;
   desc.height = N;
-  desc.depth = N;
-  desc.usage = MTLTextureUsageShaderRead;
+  desc.depth  = N;
+  desc.usage       = MTLTextureUsageShaderRead;
   desc.storageMode = MTLStorageModeShared;
   _defaultLUT = [_device newTextureWithDescriptor:desc];
-  if (!_defaultLUT)
-    return;
-  UInt8 px[2 * 2 * 2 * 4];
-  for (int b = 0; b < N; b++)
-    for (int g = 0; g < N; g++)
+  if (!_defaultLUT) return;
+
+  // Build identity: voxel at grid position (r, g, b) stores colour (r, g, b).
+  // N=16: step = 255/(N-1) ≈ 17 per slot → covers full 0–255 range linearly.
+  NSUInteger total = (NSUInteger)(N * N * N * 4);
+  UInt8 *px = (UInt8 *)malloc(total);
+  if (!px) return;
+
+  for (int b = 0; b < N; b++) {
+    for (int g = 0; g < N; g++) {
       for (int r = 0; r < N; r++) {
-        int i = (b * 4 + g * 2 + r) * 4;
-        px[i] = (UInt8)(r * 255);
-        px[i + 1] = (UInt8)(g * 255);
-        px[i + 2] = (UInt8)(b * 255);
-        px[i + 3] = 255;
+        int i = (b * N * N + g * N + r) * 4;
+        px[i + 0] = (UInt8)roundf(r * 255.0f / (N - 1)); // R stored in component 0
+        px[i + 1] = (UInt8)roundf(g * 255.0f / (N - 1)); // G
+        px[i + 2] = (UInt8)roundf(b * 255.0f / (N - 1)); // B
+        px[i + 3] = 255;                                   // A
       }
+    }
+  }
+
   [_defaultLUT replaceRegion:MTLRegionMake3D(0, 0, 0, N, N, N)
                  mipmapLevel:0
                        slice:0
                    withBytes:px
-                 bytesPerRow:N * 4
-               bytesPerImage:N * N * 4];
+                 bytesPerRow:(NSUInteger)(N * 4)
+               bytesPerImage:(NSUInteger)(N * N * 4)];
+  free(px);
 }
+
 
 @end

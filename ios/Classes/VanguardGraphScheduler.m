@@ -10,23 +10,23 @@
 //       estimatedGPUCostMs greedy-disable algorithm. Closes RR-33.
 
 #import "VanguardGraphScheduler.h"
-#import "VanguardMetalRenderer.h"   // P4-5: sink type for presentEnvelope:
-#import <os/log.h>
+#import "VanguardMetalRenderer.h" // P4-5: sink type for presentEnvelope:
+#include <float.h>                // P4-9: FLT_MAX for Nominal/Fair tier budget
 #import <os/lock.h>
-#include <float.h>                  // P4-9: FLT_MAX for Nominal/Fair tier budget
+#import <os/log.h>
 #include <stdatomic.h>
 
 static os_log_t sSchedulerLog;
 
 @implementation VanguardGraphScheduler {
-  dispatch_queue_t _schedulerQueue;  // serial; reserved for P4-5 activation
-  os_unfair_lock   _chainLock;       // guards _filterChain swap
+  dispatch_queue_t _schedulerQueue; // serial; reserved for P4-5 activation
+  os_unfair_lock _chainLock;        // guards _filterChain swap
   NSArray<id<VGMetalFilterNode>> *_filterChain;
-  _Atomic(BOOL)    _invalidated;
-  BOOL             _isRunning;
+  _Atomic(BOOL) _invalidated;
+  BOOL _isRunning;
   // P4-5: Metal device stored at startWithClock:device: for use in
   // didReceiveRawFrame: filter loop.
-  id<MTLDevice>    _device;
+  id<MTLDevice> _device;
 }
 
 + (void)initialize {
@@ -37,13 +37,14 @@ static os_log_t sSchedulerLog;
 
 - (instancetype)init {
   self = [super init];
-  if (!self) return nil;
-  _schedulerQueue = dispatch_queue_create(
-      "com.vanguard.scheduler.serial", DISPATCH_QUEUE_SERIAL);
-  _chainLock   = OS_UNFAIR_LOCK_INIT;
+  if (!self)
+    return nil;
+  _schedulerQueue = dispatch_queue_create("com.vanguard.scheduler.serial",
+                                          DISPATCH_QUEUE_SERIAL);
+  _chainLock = OS_UNFAIR_LOCK_INIT;
   _filterChain = nil;
   atomic_store(&_invalidated, NO);
-  _isRunning   = NO;
+  _isRunning = NO;
   os_log_debug(sSchedulerLog, "[VGScheduler] init");
   return self;
 }
@@ -51,39 +52,44 @@ static os_log_t sSchedulerLog;
 // ─── VGGraphScheduler ────────────────────────────────────────────────────────
 
 - (void)startWithClock:(id<VGMasterClock>)clock device:(id<MTLDevice>)device {
-  if (atomic_load(&_invalidated)) return;
-  _device    = device; // P4-5: retain device for filter execution
+  if (atomic_load(&_invalidated))
+    return;
+  _device = device; // P4-5: retain device for filter execution
   _isRunning = YES;
   os_log_debug(sSchedulerLog, "[VGScheduler] startWithClock: (P4-5)");
 }
 
 - (void)pause {
-  if (atomic_load(&_invalidated)) return;
+  if (atomic_load(&_invalidated))
+    return;
   _isRunning = NO;
   os_log_debug(sSchedulerLog, "[VGScheduler] pause (dormant P4-2)");
 }
 
 - (void)resume {
-  if (atomic_load(&_invalidated)) return;
+  if (atomic_load(&_invalidated))
+    return;
   _isRunning = YES;
   os_log_debug(sSchedulerLog, "[VGScheduler] resume (dormant P4-2)");
 }
 
 - (void)seekTo:(double)seconds generation:(uint64_t)generation {
-  if (atomic_load(&_invalidated)) return;
+  if (atomic_load(&_invalidated))
+    return;
   os_log_debug(sSchedulerLog,
-      "[VGScheduler] seekTo:%.3f generation:%llu (dormant P4-2)",
-      seconds, (unsigned long long)generation);
+               "[VGScheduler] seekTo:%.3f generation:%llu (dormant P4-2)",
+               seconds, (unsigned long long)generation);
 }
 
 - (void)setFilterChain:(nullable NSArray<id<VGMetalFilterNode>> *)chain {
-  if (atomic_load(&_invalidated)) return;
+  if (atomic_load(&_invalidated))
+    return;
 
   // Snapshot old chain before the lock-protected swap.
   NSArray<id<VGMetalFilterNode>> *oldChain = nil;
 
   os_unfair_lock_lock(&_chainLock);
-  oldChain     = [_filterChain copy];
+  oldChain = [_filterChain copy];
   _filterChain = chain ? [chain copy] : nil;
   os_unfair_lock_unlock(&_chainLock);
 
@@ -98,17 +104,19 @@ static os_log_t sSchedulerLog;
   }
 
   os_log_debug(sSchedulerLog,
-      "[VGScheduler] setFilterChain: count=%lu (dormant P4-2)",
-      (unsigned long)chain.count);
+               "[VGScheduler] setFilterChain: count=%lu (dormant P4-2)",
+               (unsigned long)chain.count);
 }
 
 - (void)applyThermalState:(NSProcessInfoThermalState)state {
   // P4-9: Cost-budget thermal policy (RR-33 closure).
-  // Replaces binary isExpensive runtime iteration with scalar estimatedGPUCostMs
-  // greedy-disable.  Lock is held ONLY for the chain pointer snapshot, released
-  // before any node.enabled write or sort operation (DEC-54).
+  // Replaces binary isExpensive runtime iteration with scalar
+  // estimatedGPUCostMs greedy-disable.  Lock is held ONLY for the chain pointer
+  // snapshot, released before any node.enabled write or sort operation
+  // (DEC-54).
 
-  if (atomic_load(&_invalidated)) return;
+  if (atomic_load(&_invalidated))
+    return;
 
   // ── 1. Snapshot chain under lock ──────────────────────────────────────────
   NSArray<id<VGMetalFilterNode>> *chain = nil;
@@ -118,8 +126,9 @@ static os_log_t sSchedulerLog;
 
   if (!chain.count) {
     os_log_debug(sSchedulerLog,
-        "[VGScheduler] applyThermalState:%ld — empty chain, nothing to throttle",
-        (long)state);
+                 "[VGScheduler] applyThermalState:%ld — empty chain, nothing "
+                 "to throttle",
+                 (long)state);
     return;
   }
 
@@ -145,7 +154,8 @@ static os_log_t sSchedulerLog;
     break;
   default:
     os_log_debug(sSchedulerLog,
-        "[VGScheduler] applyThermalState: unknown state %ld — no-op", (long)state);
+                 "[VGScheduler] applyThermalState: unknown state %ld — no-op",
+                 (long)state);
     return;
   }
 
@@ -166,22 +176,26 @@ static os_log_t sSchedulerLog;
     // Lock NOT held during sort or node.enabled writes.
     NSArray<id<VGMetalFilterNode>> *sorted =
         [chain sortedArrayUsingComparator:^NSComparisonResult(
-            id<VGMetalFilterNode> a, id<VGMetalFilterNode> b) {
+                   id<VGMetalFilterNode> a, id<VGMetalFilterNode> b) {
           float costA = a.estimatedGPUCostMs;
           float costB = b.estimatedGPUCostMs;
-          if (costA > costB) return NSOrderedAscending;  // a before b = most expensive first
-          if (costA < costB) return NSOrderedDescending;
+          if (costA > costB)
+            return NSOrderedAscending; // a before b = most expensive first
+          if (costA < costB)
+            return NSOrderedDescending;
           return NSOrderedSame;
         }];
 
     for (id<VGMetalFilterNode> node in sorted) {
-      if (totalCostMs <= budgetMs) break;
+      if (totalCostMs <= budgetMs)
+        break;
       node.enabled = NO;
       totalCostMs -= node.estimatedGPUCostMs;
     }
   }
 
-  os_log_debug(sSchedulerLog,
+  os_log_debug(
+      sSchedulerLog,
       "[VGScheduler] applyThermalState:%ld budget=%.1fms remaining=%.1fms "
       "nodes=%lu",
       (long)state, budgetMs, totalCostMs, (unsigned long)chain.count);
@@ -190,7 +204,8 @@ static os_log_t sSchedulerLog;
 - (void)invalidate {
   // Idempotent: only the first call executes teardown.
   BOOL expected = NO;
-  if (!atomic_compare_exchange_strong(&_invalidated, &expected, YES)) return;
+  if (!atomic_compare_exchange_strong(&_invalidated, &expected, YES))
+    return;
 
   os_unfair_lock_lock(&_chainLock);
   NSArray<id<VGMetalFilterNode>> *chain = _filterChain;
@@ -226,10 +241,12 @@ static os_log_t sSchedulerLog;
 ///   - _chainLock held ONLY for the pointer copy (nanoseconds).
 ///   - Released before any processEnvelope:device: call.
 - (void)didReceiveRawFrame:(VGFrameEnvelope)envelope {
-  if (atomic_load(&_invalidated)) return;
+  if (atomic_load(&_invalidated))
+    return;
 
   VanguardMetalRenderer *sink = self.sink;
-  if (!sink) return; // no renderer wired yet — drop frame safely
+  if (!sink)
+    return; // no renderer wired yet — drop frame safely
 
   // ── 1. Snapshot filter chain under lock (DEC-54: nanoseconds only) ────────
   NSArray<id<VGMetalFilterNode>> *chain = nil;
@@ -240,14 +257,15 @@ static os_log_t sSchedulerLog;
   // ── 2. Execute filter loop ─────────────────────────────────────────────────
   // 'frame' tracks the current buffer through the chain.
   // 'deliveredBufferIsSchedulerOwned' tracks whether we own the final buffer.
-  CVPixelBufferRef rawBuffer   = envelope.payload.videoBuffer;
-  CVPixelBufferRef frame       = rawBuffer; // start: source-owned
-  BOOL schedulerOwnedDelivered = NO;        // RR-36 ownership flag
-  VGFrameEnvelope currentEnvelope          = envelope;
+  CVPixelBufferRef rawBuffer = envelope.payload.videoBuffer;
+  CVPixelBufferRef frame = rawBuffer; // start: source-owned
+  BOOL schedulerOwnedDelivered = NO;  // RR-36 ownership flag
+  VGFrameEnvelope currentEnvelope = envelope;
 
   if (chain.count > 0) {
     for (id<VGMetalFilterNode> node in chain) {
-      if (!node.enabled) continue; // DEC-55: pass disabled nodes through
+      if (!node.enabled)
+        continue; // DEC-55: pass disabled nodes through
 
       VGFrameEnvelope result = [node processEnvelope:currentEnvelope
                                               device:_device];
@@ -258,18 +276,19 @@ static os_log_t sSchedulerLog;
           CVPixelBufferRelease(frame);
           schedulerOwnedDelivered = NO;
         }
-        frame          = rawBuffer; // revert to source-owned buffer
-        currentEnvelope = envelope;  // revert envelope
-        break;                       // skip remaining nodes
+        frame = rawBuffer;          // revert to source-owned buffer
+        currentEnvelope = envelope; // revert envelope
+        break;                      // skip remaining nodes
       }
 
-      // Release previous intermediate if we own it (not the original source buf).
+      // Release previous intermediate if we own it (not the original source
+      // buf).
       if (schedulerOwnedDelivered) {
         CVPixelBufferRelease(frame);
       }
-      frame                    = result.payload.videoBuffer;
-      schedulerOwnedDelivered  = YES; // filter output: scheduler owns +1
-      currentEnvelope          = result;
+      frame = result.payload.videoBuffer;
+      schedulerOwnedDelivered = YES; // filter output: scheduler owns +1
+      currentEnvelope = result;
     }
   }
 
@@ -294,8 +313,8 @@ static os_log_t sSchedulerLog;
   // next copyNextSampleBuffer cycle. No double-release.
 
   os_log_debug(sSchedulerLog,
-      "[VGScheduler] didReceiveRawFrame: chain=%lu schedulerOwned=%d",
-      (unsigned long)chain.count, (int)schedulerOwnedDelivered);
+               "[VGScheduler] didReceiveRawFrame: chain=%lu schedulerOwned=%d",
+               (unsigned long)chain.count, (int)schedulerOwnedDelivered);
 }
 
 - (BOOL)isRunning {

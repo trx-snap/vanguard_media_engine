@@ -25,13 +25,19 @@ typedef struct {
 // P3-4: isExpensive — NO because Beauty is a bilateral filter (≤3ms).
 // Not disabled at thermal Serious tier; only disabled at Critical (all nodes
 // off).
-- (BOOL)isExpensive { return NO; }
+- (BOOL)isExpensive {
+  return NO;
+}
 
 // P4-2: VGMediaNode topology role.
-- (VGNodeRole)nodeRole { return VGNodeRoleFilter; }
+- (VGNodeRole)nodeRole {
+  return VGNodeRoleFilter;
+}
 
 // P4-2: Scalar GPU cost estimate (A14, nominal thermal, 1080p BGRA).
-- (float)estimatedGPUCostMs { return 3.0f; }
+- (float)estimatedGPUCostMs {
+  return 3.0f;
+}
 
 - (instancetype)initWithPool:(CVPixelBufferPoolRef)pool
                       device:(id<MTLDevice>)device {
@@ -43,7 +49,7 @@ typedef struct {
   _queue = [device newCommandQueue];
   _enabled = YES;
   _intensity = 0.5f;
-  _radius = 2;
+  _radius = 4;
   _filterName = @"Beauty";
   // Phase 3 (P3-1) — VGMediaNode identity
   _nodeId = [[NSUUID UUID] UUIDString];
@@ -107,10 +113,8 @@ typedef struct {
     return input;
   }
 
-  // Map intensity [0,1] → sigmaColor [0.001, 0.3]
-  // At intensity=0: sigmaColor=0.001 (near-identity, satisfies P4-FN-5).
-  float sigmaColor = 0.001f + _intensity * 0.299f;
-  float sigmaSpace = 2.0f; // fixed spatial Gaussian
+  float sigmaColor = 0.001f + _intensity * 0.299f; // [0.001, 0.3]
+  float sigmaSpace = 5.0f;
   BilateralParams params = {sigmaSpace, sigmaColor, _radius};
 
   id<MTLBuffer> paramsBuf =
@@ -194,7 +198,14 @@ typedef struct {
 }
 
 - (void)_compilePSO {
-  id<MTLLibrary> lib = [_device newDefaultLibrary];
+  NSBundle *bundle = [NSBundle bundleForClass:[self class]];
+  NSError *error = nil;
+  id<MTLLibrary> lib = [_device newDefaultLibraryWithBundle:bundle error:&error];
+  if (!lib) {
+    NSLog(@"[VGFilter] Failed to load Metal library from bundle %@: %@",
+          bundle.bundlePath, error);
+    return;
+  }
   id<MTLFunction> fn = [lib newFunctionWithName:@"vanguard_bilateral_filter"];
   if (!fn) {
     NSLog(@"[VanguardBeauty] bilateral kernel not found");

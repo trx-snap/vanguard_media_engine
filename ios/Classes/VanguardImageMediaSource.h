@@ -21,6 +21,19 @@ NS_ASSUME_NONNULL_BEGIN
                   processor:(VanguardImageProcessor *)processor NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
 
+/// Display-correct pixel dimensions of the decoded image.
+/// Set during prepareWithCompletion: from UIImage.size, which already applies EXIF
+/// orientation. Zero until prepareWithCompletion: succeeds.
+/// Read by VanguardGraphRuntime to size the session pixel buffer pool at the correct
+/// aspect ratio (avoiding the 1080×1920 fallback for non-9:16 photos).
+@property (nonatomic, readonly) CGSize renderSize;
+
+/// Returns a +1 retained copy of the original unfiltered image buffer.
+/// Returns NULL if the buffer has not yet been decoded (start not called) or
+/// if the source has been invalidated.
+/// Caller MUST CVPixelBufferRelease the returned buffer.
+- (nullable CVPixelBufferRef)copyRawBuffer;
+
 @end
 
 NS_ASSUME_NONNULL_END

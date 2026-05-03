@@ -158,11 +158,148 @@ extension VGFilterSpecs on VGFilterSpec {
   /// Defaults to 1.0.
   ///
   /// [radius] is the kernel half-size in pixels [1, 4]. Defaults to 2.0.
-  static VGFilterSpec beauty({double intensity = 1.0, double radius = 2.0}) =>
-      VGFilterSpec(
-        type: 'beauty',
-        parameters: {'intensity': intensity, 'radius': radius},
-      );
+  /// For V2, omit this param to use the intensity ramp; supply it only to
+  /// override specific granular control (disables the ramp).
+  ///
+  /// [beautyVersion] selects the native implementation:
+  /// - `1` (default): selects Beauty V1 — the production bilateral filter.
+  ///   This is the default and must remain unchanged for all existing callers.
+  /// - `2`: selects Beauty V2 — the Phase 4B 4-pass GPUPixel-style pipeline.
+  ///   **Dev/test only. Not for production use until Phase 4B is signed off.**
+  ///
+  /// DEV tuning params (V2 only, nullable). When any of these is non-null
+  /// the intensity ramp is disabled and all parameters are applied directly.
+  /// When all are null (default), the intensity ramp runs as normal.
+  /// These are engineering-only controls — not for product UI.
+  ///
+  /// - [sigma]          Spatial Gaussian std-dev [1.0, 10.0]
+  /// - [rangeSigma]     Colour-similarity gate   [0.01, 0.30]  (Phase 4B.5)
+  /// - [smoothStrength] Smooth blend factor      [0.0,  2.0]
+  /// - [theta]          Composite edge threshold [0.01, 0.08]
+  /// - [sharpenStrength] Detail add-back amount  [0.0,  0.5]
+  /// - [detailDamping]  Texture attenuation      [0.0,  1.0]   (Phase 4B.6)
+  /// - [toneStrength]   Tone compression         [0.0,  1.0]   (Phase 4B.6)
+  /// - [midtoneLift]    Midtone luminance lift   [0.0,  0.15]  (Phase 4B.6)
+  ///
+  /// Phase 4C: Face-aware beauty (DEC-61/63)
+  /// - [faceAwareEnabled]  When `true`, enables Vision face detection + skin
+  ///   mask generation. Beauty is applied selectively to skin regions only.
+  ///   When `false` (default), global beauty (Phase 4B.6 behavior).
+  ///   **DEV/test only.** Does NOT affect the intensity ramp.
+  static VGFilterSpec beauty({
+    double intensity = 1.0,
+    double radius = 2.0,
+    int beautyVersion = 1, // 1 = V1 (default/production), 2 = V2 (dev/test)
+    // DEV-only V2 granular overrides — null means "use intensity ramp".
+    double? sigma,
+    double? rangeSigma,
+    double? smoothStrength,
+    double? theta,
+    double? sharpenStrength,
+    // Phase 4B.6 (DEC-60) — perceptual composite DEV overrides.
+    // Step 1: CPU-plumbed only; GPU wiring in Step 2.
+    double? detailDamping,
+    double? toneStrength,
+    double? midtoneLift,
+    // Phase 4C (DEC-61/63) — face-aware beauty DEV toggle.
+    bool faceAwareEnabled = false,
+    // Phase 4C.1 (DEC-66/67) — face-weighted boost DEV overrides.
+    // Only active when faceAwareEnabled=true. Null = use ObjC defaults.
+    // Independent of the intensity ramp — do NOT trigger hasGranular.
+    double? faceSmoothBoost,
+    double? faceToneBoost,
+    double? faceLiftBoost,
+    double? faceDampingReduce,
+    // Phase 4C.2 (DEC-70/71) — color aesthetic DEV overrides.
+    // Only active when faceAwareEnabled=true. Null = use ObjC defaults.
+    // Independent of the intensity ramp — do NOT trigger hasGranular.
+    double? faceWhitenStrength,
+    double? faceRosyStrength,
+    double? faceToneUnifyStrength,
+    double? faceGlowStrength,
+    // Phase 4C.3 (DEC-76/78) — feature protection & enhancement DEV overrides.
+    // Only active when faceAwareEnabled=true. Null = use ObjC defaults.
+    // Independent of the intensity ramp — do NOT trigger hasGranular.
+    double? featureRestoreStrength,
+    double? featureDetailRestore,
+    double? featureContrastBoost,
+    double? featureSatBoost,
+    // Phase 4D (DEC-82/84) — perceptual feature enhancement DEV overrides.
+    // Only active when faceAwareEnabled=true. Null = use ObjC defaults (0.0 = disabled).
+    // Independent of the intensity ramp — do NOT trigger hasGranular.
+    double? eyeEnhanceStrength,
+    double? lipEnhanceStrength,
+    double? browEnhanceStrength,
+    // Phase 4E (DEC-90/92) — tone polish layer DEV overrides.
+    // Only active when faceAwareEnabled=true. Null = use ObjC defaults (0.0 = disabled).
+    // Independent of the intensity ramp — do NOT trigger hasGranular.
+    double? polishGlowStrength,
+    double? polishSmoothStrength,
+    double? polishWarmthStrength,
+    double? polishBloomStrength,
+  }) {
+    // Only include the version key when V2 is explicitly requested.
+    // Omitting the key from V1 calls preserves the exact existing wire format
+    // and guarantees native falls through to the V1 branch (Step 4 gate).
+    //
+    // Step 6B: For V2, radius is only included when the caller explicitly
+    // overrides it (i.e. differs from the Dart default of 2.0). This prevents
+    // the default value from triggering hasGranular=YES in the runtime, which
+    // would disable the intensity ramp unintentionally.
+    // V1 always includes radius — the V1 bilateral kernel needs it.
+    //
+    // DEV params: included only when non-null AND V2 is selected. Each one
+    // presence causes hasGranular=YES on native side → intensity ramp off.
+    final bool isV2 = beautyVersion != 1;
+    final params = <String, Object?>{
+      'intensity': intensity,
+      if (!isV2) 'radius': radius,              // V1: always send radius
+      if (isV2 && radius != 2.0) 'radius': radius, // V2: only when overridden
+      if (isV2) 'beautyVersion': beautyVersion,
+      // DEV granular overrides (V2 only):
+      if (isV2 && sigma          != null) 'sigma':          sigma,
+      if (isV2 && rangeSigma     != null) 'rangeSigma':     rangeSigma,
+      if (isV2 && smoothStrength != null) 'smoothStrength': smoothStrength,
+      if (isV2 && theta          != null) 'theta':          theta,
+      if (isV2 && sharpenStrength!= null) 'sharpenStrength':sharpenStrength,
+      // Phase 4B.6 (DEC-60) DEV overrides:
+      if (isV2 && detailDamping  != null) 'detailDamping':  detailDamping,
+      if (isV2 && toneStrength   != null) 'toneStrength':   toneStrength,
+      if (isV2 && midtoneLift    != null) 'midtoneLift':    midtoneLift,
+      // Phase 4C (DEC-61/63): only send when true — omit = default NO on native.
+      if (isV2 && faceAwareEnabled) 'faceAwareEnabled': true,
+      // Phase 4C.1 (DEC-66/67): face-boost overrides (V2 only, null-safe).
+      // Independent of hasGranular — do not disable intensity ramp.
+      if (isV2 && faceSmoothBoost   != null) 'faceSmoothBoost':   faceSmoothBoost,
+      if (isV2 && faceToneBoost     != null) 'faceToneBoost':     faceToneBoost,
+      if (isV2 && faceLiftBoost     != null) 'faceLiftBoost':     faceLiftBoost,
+      if (isV2 && faceDampingReduce != null) 'faceDampingReduce': faceDampingReduce,
+      // Phase 4C.2 (DEC-70/71): color aesthetic overrides (V2 only, null-safe).
+      // Independent of hasGranular — do not disable intensity ramp.
+      if (isV2 && faceWhitenStrength    != null) 'faceWhitenStrength':    faceWhitenStrength,
+      if (isV2 && faceRosyStrength      != null) 'faceRosyStrength':      faceRosyStrength,
+      if (isV2 && faceToneUnifyStrength != null) 'faceToneUnifyStrength': faceToneUnifyStrength,
+      if (isV2 && faceGlowStrength      != null) 'faceGlowStrength':      faceGlowStrength,
+      // Phase 4C.3 (DEC-76/78): feature protection & enhancement overrides (V2 only, null-safe).
+      // Independent of hasGranular — do not disable intensity ramp.
+      if (isV2 && featureRestoreStrength != null) 'featureRestoreStrength': featureRestoreStrength,
+      if (isV2 && featureDetailRestore   != null) 'featureDetailRestore':   featureDetailRestore,
+      if (isV2 && featureContrastBoost   != null) 'featureContrastBoost':   featureContrastBoost,
+      if (isV2 && featureSatBoost        != null) 'featureSatBoost':        featureSatBoost,
+      // Phase 4D (DEC-82/84): perceptual feature enhancement overrides (V2 only, null-safe).
+      // Independent of hasGranular — do not disable intensity ramp.
+      if (isV2 && eyeEnhanceStrength  != null) 'eyeEnhanceStrength':  eyeEnhanceStrength,
+      if (isV2 && lipEnhanceStrength  != null) 'lipEnhanceStrength':  lipEnhanceStrength,
+      if (isV2 && browEnhanceStrength != null) 'browEnhanceStrength': browEnhanceStrength,
+      // Phase 4E (DEC-90/92): tone polish layer overrides (V2 only, null-safe).
+      // Independent of hasGranular — do not disable intensity ramp.
+      if (isV2 && polishGlowStrength   != null) 'polishGlowStrength':   polishGlowStrength,
+      if (isV2 && polishSmoothStrength != null) 'polishSmoothStrength': polishSmoothStrength,
+      if (isV2 && polishWarmthStrength != null) 'polishWarmthStrength': polishWarmthStrength,
+      if (isV2 && polishBloomStrength  != null) 'polishBloomStrength':  polishBloomStrength,
+    };
+    return VGFilterSpec(type: 'beauty', parameters: params);
+  }
 
   /// Creates a person-segmentation composite filter.
   ///

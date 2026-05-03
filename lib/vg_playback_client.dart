@@ -106,4 +106,78 @@ abstract final class VGPlaybackClient {
     final session = VGPlaybackSession(sessionId: sessionId, textureId: textureId);
     return (session: session, raw: map);
   }
+
+  // ── P4-10: Gallery image session factory ──────────────────────────────────
+
+  /// Creates a [VGPlaybackSession] for a gallery-picked or local image file.
+  ///
+  /// Calls the native `createImageTexture` handler, which:
+  ///   1. Allocates a [VGResourceAllocator] pixel-buffer pool for the image.
+  ///   2. Registers the runtime in [VGSessionRegistry] under a stable UUID.
+  ///   3. Returns `{textureId, sessionId, width, height}`.
+  ///
+  /// Unlike [VanguardEngine.createImageTexture] (which discards `sessionId`),
+  /// this factory preserves both identifiers so the caller can invoke
+  /// [VGPlaybackSession.setFilterChain] on the resulting session — the primary
+  /// use case for P4-10 gallery image filtering.
+  ///
+  /// The existing [VanguardEngine.createImageTexture] static method is
+  /// **unchanged** — existing callers that only need a `textureId` continue
+  /// to work identically (backward-compatible, additive).
+  ///
+  /// Throws [StateError] or [PlatformException] if the native side fails.
+  ///
+  /// Usage:
+  /// ```dart
+  /// final session = await VGPlaybackClient.createImageSession(path);
+  /// await session.setFilterChain([VGFilterSpecs.beauty()]);
+  /// // Display: Texture(textureId: session.textureId)
+  /// ```
+  static Future<({VGPlaybackSession session, int width, int height})>
+      createImageSession(String path) async {
+    final raw = await _channel.invokeMethod<Object>(
+      'createImageTexture',
+      {'path': path},
+    );
+
+    if (raw == null) {
+      throw StateError(
+          '[VGPlaybackClient] createImageTexture returned null for: $path');
+    }
+
+    final Map<Object?, Object?> map;
+    if (raw is Map) {
+      map = raw;
+    } else {
+      // Bare int fallback — legacy path (should not occur with current plugin).
+      final legacyId = (raw as num?)?.toInt() ?? -1;
+      if (legacyId < 0) {
+        throw StateError(
+            '[VGPlaybackClient] createImageTexture returned invalid id for: $path');
+      }
+      final session = VGPlaybackSession(
+        sessionId: 'legacy-img-$legacyId',
+        textureId: legacyId,
+      );
+      return (session: session, width: 0, height: 0);
+    }
+
+    final textureId = (map['textureId'] as num?)?.toInt() ?? -1;
+    if (textureId < 0) {
+      throw StateError(
+          '[VGPlaybackClient] createImageTexture returned textureId=$textureId for: $path');
+    }
+
+    // sessionId is present because the plugin routes createImageTexture through
+    // VGSessionRegistry.createSession (plugin:302). Fallback to a synthetic id
+    // only on unexpected legacy shapes.
+    final sessionId =
+        (map['sessionId'] as String?) ?? 'legacy-img-$textureId';
+
+    final w = (map['width'] as num?)?.toInt() ?? 0;
+    final h = (map['height'] as num?)?.toInt() ?? 0;
+
+    final session = VGPlaybackSession(sessionId: sessionId, textureId: textureId);
+    return (session: session, width: w, height: h);
+  }
 }

@@ -92,6 +92,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// AVAssetReader requests to prevent global-queue race condition deadlocks.
 - (void)pullNextFrameAsync;
 
+/// Same as pullNextFrameAsync but calls `completion(didProduce)` on the main
+/// thread after the decode attempt. `didProduce` is YES if a CVPixelBuffer was
+/// delivered to _videoCallback, NO otherwise (reader rebuilt, EOF, or nil).
+/// Used by VanguardMetalRenderer to clear _isFetchingFrame on failure paths.
+- (void)pullNextFrameAsyncWithCompletion:(void (^_Nullable)(BOOL didProduce))completion;
+
 // ── Teardown synchronization ───────────────────────────────────────────────
 
 /// The serial GCD queue used for audio chunk reads and audio asset reader operations.

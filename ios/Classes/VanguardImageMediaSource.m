@@ -8,9 +8,18 @@
 @implementation VanguardImageMediaSource {
   NSURL *_imageURL;
   VanguardImageProcessor *_processor;
-  CVPixelBufferRef _buffer; // retained; released in dealloc
+  CVPixelBufferRef _buffer;    // retained; released in dealloc; used for display callbacks
+  CVPixelBufferRef _rawBuffer; // independent +1 retain of the original decoded image;
+                               // used ONLY by copyRawBuffer; never handed to the renderer
   VanguardVideoFrameCallback _videoCallback;
   VanguardPlaybackRate _playbackRate; // always 1.0 — images have no rate
+
+  // Display-correct image dimensions set in prepareWithCompletion: after UIImage
+  // decode. UIImage.size already accounts for EXIF orientation, so for a portrait
+  // photo captured in landscape orientation this is {w, h} with w < h.
+  // Read by VanguardGraphRuntime.prepareWithURL after the semaphore wait to size
+  // the session pixel buffer pool at the correct aspect ratio.
+  CGSize _renderSize;
 
   // P1A-07: VGMediaNode protocol state.
   // _Atomic so any thread can safely read without a lock (guards RR-3).
@@ -23,6 +32,7 @@
 @synthesize playbackRate = _playbackRate;
 @synthesize nodeId = _nodeId;
 @synthesize nodeType = _nodeType;
+@synthesize renderSize = _renderSize;
 
 // P4-2: VGMediaNode topology role — frame source.
 - (VGNodeRole)nodeRole { return VGNodeRoleSource; }
@@ -43,6 +53,10 @@
 }
 
 - (void)dealloc {
+  if (_rawBuffer) {
+    CVPixelBufferRelease(_rawBuffer);
+    _rawBuffer = NULL;
+  }
   if (_buffer) {
     CVPixelBufferRelease(_buffer);
     _buffer = NULL;
@@ -68,27 +82,47 @@
       return;
     }
 
-    CGImageSourceRef src =
-        CGImageSourceCreateWithURL((__bridge CFURLRef)s->_imageURL, nil);
-    if (!src) {
-      NSLog(@"[VanguardImageSource] Cannot open: %@",
+    // UIImage respects EXIF imageOrientation; CGImageSourceCreateImageAtIndex
+    // does NOT. Using UIImage + pixelBufferFromUIImage: ensures gallery photos
+    // (which carry EXIF orientation 6 for back-camera portrait) are drawn
+    // upright instead of appearing rotated 90°.
+    NSData *imgData = [NSData dataWithContentsOfURL:s->_imageURL];
+    if (!imgData) {
+      NSLog(@"[VanguardImageSource] Cannot read data: %@",
             s->_imageURL.lastPathComponent);
       return;
     }
-    CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, nil);
-    CFRelease(src);
-    if (!img)
+    UIImage *uiImg = [UIImage imageWithData:imgData];
+    if (!uiImg) {
+      NSLog(@"[VanguardImageSource] Cannot decode UIImage: %@",
+            s->_imageURL.lastPathComponent);
       return;
+    }
 
     if (s->_buffer) {
       CVPixelBufferRelease(s->_buffer);
       s->_buffer = NULL;
     }
-    s->_buffer = [s->_processor pixelBufferFromCGImage:img];
-    CGImageRelease(img);
+    s->_buffer = [s->_processor pixelBufferFromUIImage:uiImg];
+
+    // Set _rawBuffer as an independent retain of the original decoded image.
+    // _rawBuffer is used exclusively by copyRawBuffer and is never handed to
+    // the renderer, ensuring it cannot be freed when the renderer swaps its
+    // _latestPixelBuffer on a subsequent filter tap.
+    if (s->_rawBuffer) {
+      CVPixelBufferRelease(s->_rawBuffer);
+      s->_rawBuffer = NULL;
+    }
+    if (s->_buffer) {
+      s->_rawBuffer = CVPixelBufferRetain(s->_buffer);
+    }
 
     // Guard 2 — pre-callback: if invalidated during decode, discard and return.
     if (atomic_load_explicit(&s->_invalidated, memory_order_acquire)) {
+      if (s->_rawBuffer) {
+        CVPixelBufferRelease(s->_rawBuffer);
+        s->_rawBuffer = NULL;
+      }
       if (s->_buffer) {
         CVPixelBufferRelease(s->_buffer);
         s->_buffer = NULL;
@@ -151,37 +185,43 @@
       return;
     }
 
-    // Decode the image to a CVPixelBuffer and cache it in _buffer.
-    // Mirrors the synchronous decode in start(), but on a background queue.
-    CGImageSourceRef src =
-        CGImageSourceCreateWithURL((__bridge CFURLRef)s->_imageURL, nil);
-    if (!src) {
+    // Decode via UIImage so EXIF imageOrientation is respected (same rationale
+    // as start() — gallery JPEG pixels are raw sensor orientation; UIImage
+    // applies the EXIF transform via drawInRect: / UIGraphicsPushContext).
+    NSData *imgData = [NSData dataWithContentsOfURL:s->_imageURL];
+    if (!imgData) {
       completion([NSError
           errorWithDomain:@"VGMediaNode"
                      code:-3
                  userInfo:@{
                    NSLocalizedDescriptionKey :
-                       @"prepareWithCompletion: cannot open image URL"
+                       @"prepareWithCompletion: cannot read image data"
                  }]);
       return;
     }
-    CGImageRef img = CGImageSourceCreateImageAtIndex(src, 0, nil);
-    CFRelease(src);
-    if (!img) {
+    UIImage *uiImg = [UIImage imageWithData:imgData];
+    if (!uiImg) {
       completion([NSError
           errorWithDomain:@"VGMediaNode"
                      code:-4
                  userInfo:@{
                    NSLocalizedDescriptionKey :
-                       @"prepareWithCompletion: cannot decode image"
+                       @"prepareWithCompletion: cannot decode UIImage"
                  }]);
       return;
     }
 
-    CVPixelBufferRef newBuf = [s->_processor pixelBufferFromCGImage:img];
+    // Capture display-correct dimensions before any further async work.
+    // UIImage.size is already orientation-adjusted (e.g. a 4032×3024 sensor photo
+    // picked in portrait returns size = {3024, 4032}). This value is read by
+    // VanguardGraphRuntime after the semaphore wait to size the session pool.
+    s->_renderSize = CGSizeMake(uiImg.size.width, uiImg.size.height);
+    NSLog(@"[VanguardImageSource] renderSize=%.0fx%.0f url=%@",
+          s->_renderSize.width, s->_renderSize.height, s->_imageURL.lastPathComponent);
+
+    CVPixelBufferRef newBuf = [s->_processor pixelBufferFromUIImage:uiImg];
     NSLog(@"[VanguardImageSource] prepare done url=%@ buf=%@",
           s->_imageURL.lastPathComponent, newBuf ? @"ok" : @"nil");
-    CGImageRelease(img);
 
     if (atomic_load_explicit(&s->_invalidated, memory_order_acquire)) {
       // Invalidated during decode — discard decoded buffer, do not store.
@@ -197,10 +237,19 @@
       return;
     }
 
-    // Swap into _buffer (release the old one if present)
+    // Swap into _buffer (release the old one if present).
+    // Also update _rawBuffer to the new decoded image so copyRawBuffer stays
+    // in sync with the most recently prepared picture.
+    if (s->_rawBuffer) {
+      CVPixelBufferRelease(s->_rawBuffer);
+      s->_rawBuffer = NULL;
+    }
     if (s->_buffer)
       CVPixelBufferRelease(s->_buffer);
     s->_buffer = newBuf; // takes ownership
+    if (s->_buffer) {
+      s->_rawBuffer = CVPixelBufferRetain(s->_buffer);
+    }
     completion(nil);
   });
 }
@@ -226,7 +275,8 @@
   // IOSurface operations, creating a permanent wait that freezes _prepareQueue.
   // Same root cause as the renderer's _latestPixelBuffer/pool release fix.
   // The OS reclaims the IOSurface memory at process exit.
-  _buffer = NULL; // intentional leak — OS reclaims on process exit
+  _rawBuffer = NULL; // matches _buffer intentional-leak policy
+  _buffer = NULL;    // intentional leak — OS reclaims on process exit
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -268,6 +318,20 @@
 - (void)setAudioCallback:(nullable VanguardAudioBufferCallback)callback {
   // Static images have no audio.
   (void)callback;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Raw buffer access
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns a +1 retained copy of the original unfiltered image buffer.
+/// Uses _rawBuffer — an independent retain that is never handed to the renderer
+/// and cannot be freed when presentEnvelope: swaps _latestPixelBuffer.
+/// The caller MUST CVPixelBufferRelease the returned buffer when done.
+/// Returns NULL before start is called or after invalidation.
+- (nullable CVPixelBufferRef)copyRawBuffer {
+  if (!_rawBuffer) return NULL;
+  return CVPixelBufferRetain(_rawBuffer);
 }
 
 @end

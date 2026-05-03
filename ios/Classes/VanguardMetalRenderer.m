@@ -48,14 +48,14 @@ static os_log_t _rendererLog;
 
   // P4-7C: Renderer-owned pool deleted. Renderer uses only the session pool
   // injected by VanguardGraphRuntime via initWithSource:sessionPool:.
-  // P4-7 Q2: session pool injected by VanguardGraphRuntime — borrowed reference.
-  // The runtime (via VGResourceAllocator) owns the +1; renderer must NOT release.
+  // P4-7 Q2: session pool injected by VanguardGraphRuntime — borrowed
+  // reference. The runtime (via VGResourceAllocator) owns the +1; renderer must
+  // NOT release.
   CVPixelBufferPoolRef _sessionPixelBufferPool;
 
   // ── Filter chain (P1-T3) — empty array in Phase 1 ──────────────────────
   NSArray<id<VanguardFilterNode>> *_filterChain;
   BOOL _filterChainEnabled;
-
 
   // ── Playback clock (P1-T5 rate-aware _timeProvider) ─────────────────────
   CADisplayLink *_displayLink;
@@ -163,8 +163,9 @@ static os_log_t _rendererLog;
   _sessionPixelBufferPool = sessionPool; // borrowed — runtime owns the +1
 
   [self _setupMetal];
-  // P4-7C: _setupPixelBufferPoolFromSource: deleted — renderer no longer creates
-  // its own pool. Session pool is injected by runtime (see _sessionPixelBufferPool).
+  // P4-7C: _setupPixelBufferPoolFromSource: deleted — renderer no longer
+  // creates its own pool. Session pool is injected by runtime (see
+  // _sessionPixelBufferPool).
   [self _allocateOutputTexture];
 
   // Derive rotation index and render size once from source preferredTransform.
@@ -244,10 +245,11 @@ static os_log_t _rendererLog;
   // reference after setup.
   VanguardFileMediaSource *source =
       [[VanguardFileMediaSource alloc] initWithURL:url pixelBufferPool:nil];
-  self = [self initWithSource:source
-              textureRegistry:registry
-                methodChannel:channel
-                  sessionPool:NULL]; // camera/export: no runtime-managed session pool
+  self = [self
+       initWithSource:source
+      textureRegistry:registry
+        methodChannel:channel
+          sessionPool:NULL]; // camera/export: no runtime-managed session pool
   if (!self)
     return nil;
 
@@ -405,8 +407,8 @@ static os_log_t _rendererLog;
 
   // Allocate destination from pool (IOSurface-backed, display-correct size).
   CVPixelBufferRef dst = NULL;
-  CVReturn pstat = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault,
-                                                      _sessionPixelBufferPool, &dst);
+  CVReturn pstat = CVPixelBufferPoolCreatePixelBuffer(
+      kCFAllocatorDefault, _sessionPixelBufferPool, &dst);
   if (pstat != kCVReturnSuccess || !dst) {
     NSLog(@"[VanguardRenderer] GPU blit: pool exhausted");
     return NULL;
@@ -528,8 +530,9 @@ static os_log_t _rendererLog;
 }
 
 // P4-7C: _setupPixelBufferPoolWithWidth:height: deleted — renderer-owned pool
-// creation removed. Pool is created and owned exclusively by VanguardGraphRuntime
-// via VGResourceAllocator.pixelBufferPoolWithWidth:height:format:minimumBufferCount:
+// creation removed. Pool is created and owned exclusively by
+// VanguardGraphRuntime via
+// VGResourceAllocator.pixelBufferPoolWithWidth:height:format:minimumBufferCount:
 // after source prepare (P4-7B). Closes dual-pool issue (P4-7 plan).
 
 - (void)_allocateOutputTexture {
@@ -732,7 +735,6 @@ static os_log_t _rendererLog;
   }
 }
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Frame Callbacks from Source
 // ─────────────────────────────────────────────────────────────────────────────
@@ -755,19 +757,86 @@ static os_log_t _rendererLog;
   // delivery for this frame cycle. The legacy path is NOT executed.
   id<VGFrameDelegate> delegate = _frameDelegate; // load weak ref once
   if (delegate) {
-    // Build VGFrameEnvelope for the raw frame. generation is 0 here;
-    // the scheduler increments its own generation counter independently.
+    // Update PTS before forwarding so _renderFrameAtSourceTime Gate 2
+    // (_lastDecodedPTS <= sourceSeconds + 0.016) advances correctly and the
+    // decode loop does not run unconstrained after the first frame.
+    _lastDecodedPTS = CMTimeGetSeconds(pts);
+
+    // ── GPU rotation for scheduler path ─────────────────────────────────────
+    // AVAssetReaderTrackOutput delivers frames at naturalSize in the encoded
+    // sensor orientation — it does NOT honour preferredTransform. The legacy
+    // path (below, line ~849) rotates via _rotatePixelBufferGPU: before storing
+    // in _latestPixelBuffer. The scheduler path must do the same, or portrait
+    // video arrives at the scheduler and then Flutter as a landscape buffer,
+    // producing a squished/rotated image even though the Dart AspectRatio
+    // widget is correct (portrait).
+    //
+    // Ownership:
+    //   rawFrame     — retained by caller; released unconditionally below.
+    //   frameToDeliver — either rawFrame (no new retain needed) or the rotated
+    //     buffer returned by _rotatePixelBufferGPU: (CF_RETURNS_RETAINED).
+    //     Released after [delegate didReceiveRawFrame:] if it is not rawFrame.
+    CVPixelBufferRef frameToDeliver = rawFrame;
+
+    // Detect HLG on the scheduler path (mirrors legacy path lines 830-840).
+    CFStringRef hlgTransfer = CVBufferCopyAttachment(
+        rawFrame, kCVImageBufferTransferFunctionKey, NULL);
+    uint32_t isHLGFrame =
+        (hlgTransfer &&
+         CFStringCompare(hlgTransfer,
+                         kCVImageBufferTransferFunction_ITU_R_2100_HLG,
+                         0) == kCFCompareEqualTo)
+            ? 1
+            : 0;
+    if (hlgTransfer)
+      CFRelease(hlgTransfer);
+
+    if ((_rotationIndex != 0 || isHLGFrame) && _renderSize.width > 0) {
+      size_t fw = CVPixelBufferGetWidth(rawFrame);
+      size_t fh = CVPixelBufferGetHeight(rawFrame);
+      BOOL alreadyDisplaySized =
+          (fw == (size_t)_renderSize.width && fh == (size_t)_renderSize.height);
+      if (!alreadyDisplaySized || (isHLGFrame && _rotationIndex == 0)) {
+        CVPixelBufferRef rotated = [self _rotatePixelBufferGPU:rawFrame
+                                                         isHLG:isHLGFrame];
+        if (rotated) {
+          frameToDeliver = rotated; // retained by _rotatePixelBufferGPU:
+        }
+        // On GPU failure, fall through with rawFrame (safe degraded output).
+      }
+    }
+
+    // Build VGFrameEnvelope — use rotated buffer if available.
+    // generation is 0 here; scheduler increments its own counter independently.
     VGFrameEnvelope rawEnvelope;
     memset(&rawEnvelope, 0, sizeof(VGFrameEnvelope));
-    rawEnvelope.payload.videoBuffer = rawFrame;
-    rawEnvelope.pts                 = pts;
-    rawEnvelope.generation          = 0;
+    rawEnvelope.payload.videoBuffer = frameToDeliver;
+    rawEnvelope.pts = pts;
+    rawEnvelope.generation = 0;
+
     // Forward synchronously on this queue (_videoDecodeQueue). The delegate
     // will call [sink presentEnvelope:] before returning (RR-36 sync rule).
     [delegate didReceiveRawFrame:rawEnvelope];
-    // Caller retained rawFrame before passing it here; release our ref now
-    // that the delegate has had its chance to retain via presentEnvelope:.
+
+    // Release rotated buffer if one was created (it is no longer needed after
+    // the delegate has retained it via presentEnvelope:).
+    if (frameToDeliver != rawFrame)
+      CVPixelBufferRelease(frameToDeliver);
+
+    // Release rawFrame — caller retained it before passing here.
     CVPixelBufferRelease(rawFrame);
+
+    // Reset fetch gate on main queue — mirrors the legacy path (line ~875).
+    // Without this, _isFetchingFrame stays YES after the first frame and all
+    // subsequent display-link ticks skip the frame pull permanently.
+    dispatch_async(dispatch_get_main_queue(), ^{
+      __strong __typeof(weakSelf) strong = weakSelf;
+      if (!strong)
+        return;
+      strong->_isFetchingFrame = NO;
+      // Do NOT call textureFrameAvailable here — the scheduler path notifies
+      // Flutter through its own sink (presentEnvelope:), not the renderer.
+    });
     return;
   }
 
@@ -916,8 +985,21 @@ static os_log_t _rendererLog;
     // the last decoded frame.
     if (_lastDecodedPTS <= sourceSeconds + 0.016) {
       // [REN5] removed — per-frame, high-frequency
+      __weak __typeof(self) weakSelf = self;
       _isFetchingFrame = YES;
-      [(VanguardFileMediaSource *)_source pullNextFrameAsync];
+      [(VanguardFileMediaSource *)_source
+          pullNextFrameAsyncWithCompletion:^(BOOL didProduce) {
+            // Called on main thread after the decode attempt.
+            // If no frame was produced (reader rebuilt after EOF restart,
+            // copyNextSampleBuffer nil, etc.) _onVideoFrame: never fires and
+            // _isFetchingFrame would stay YES forever — freeze the video.
+            // Clear it here so the next CADisplayLink tick can retry.
+            if (!didProduce) {
+              __strong __typeof(weakSelf) s = weakSelf;
+              if (s)
+                s->_isFetchingFrame = NO;
+            }
+          }];
     } else {
       // Decoder is ahead; no pull needed this tick.
       // Not logged (fires every tick during normal buffering — would flood).
@@ -951,22 +1033,24 @@ static os_log_t _rendererLog;
 /// Not called in P4-4 — additive and dormant until P4-5 wires it.
 - (void)presentEnvelope:(VGFrameEnvelope)envelope {
   // RR-36 debug guard: a NULL payload is a scheduler-side ownership bug.
-  NSAssert(envelope.payload.videoBuffer != NULL,
-           @"[VanguardRenderer] presentEnvelope: received NULL videoBuffer "
-           @"(RR-36 buffer ownership violation — check scheduler release order)");
+  NSAssert(
+      envelope.payload.videoBuffer != NULL,
+      @"[VanguardRenderer] presentEnvelope: received NULL videoBuffer "
+      @"(RR-36 buffer ownership violation — check scheduler release order)");
   if (!envelope.payload.videoBuffer) {
     return;
   }
 
   // RR-36 ownership rule: retain before storing.
   // Correct for both origins:
-  //   • Source-owned (no filters): source holds its own +1; renderer adds +1 here.
-  //   • Scheduler-produced (filters ran): scheduler holds filter-output +1;
+  //   • Source-owned (no filters): source holds its own +1; renderer adds +1
+  //   here. • Scheduler-produced (filters ran): scheduler holds filter-output
+  //   +1;
   //     renderer adds +1 here; scheduler releases its +1 after we return.
   // Net result: renderer holds sole +1 after scheduler cleanup, matching the
   // behaviour of _onVideoFrame: line 908 (CVPixelBufferRetain(frame)).
-  CVPixelBufferRef incoming = CVPixelBufferRetain(
-      (CVPixelBufferRef)envelope.payload.videoBuffer);
+  CVPixelBufferRef incoming =
+      CVPixelBufferRetain((CVPixelBufferRef)envelope.payload.videoBuffer);
 
   // P0-T7: swap _latestPixelBuffer — identical to _onVideoFrame: tail (L904).
   CVPixelBufferRef old = NULL;

@@ -12,6 +12,9 @@ import 'vg_playback_session.dart';
 export 'vanguard_texture_view.dart';
 export 'vanguard_media_preparer.dart';
 export 'vg_filter_spec.dart';
+// P4-10: expose session factory and session type for filter-chain callers.
+export 'vg_playback_client.dart';
+export 'vg_playback_session.dart';
 
 const String _libName = 'vanguard_media_engine';
 
@@ -170,6 +173,11 @@ class VanguardEngine {
   // Populated in createVideoTexture; cleared in disposeTexture and dispose().
   // Keys always mirror _activeRenderers so both maps stay in sync.
   final Map<int, VGPlaybackSession> _sessions = {};
+
+  // P4-10: Narrow public accessor so playground/filter callers can retrieve
+  // the session for an active textureId without exposing the full map.
+  // Returns null if the textureId was created via the legacy path or camera.
+  VGPlaybackSession? sessionForTexture(int textureId) => _sessions[textureId];
 
   /// Optional callbacks from the UI
   void Function(String path, double duration)? onNodeDurationProbed;

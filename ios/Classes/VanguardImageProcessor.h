@@ -12,6 +12,7 @@
 #import <CoreVideo/CoreVideo.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <AVFoundation/AVFoundation.h>
+#import <UIKit/UIKit.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -40,12 +41,23 @@ NS_ASSUME_NONNULL_BEGIN
 /// Returns nil if the pool is exhausted or the image cannot be drawn.
 - (nullable CVPixelBufferRef)pixelBufferFromCGImage:(CGImageRef)image;
 
-/// Apply a GPU filter chain to a buffer. Phase 4 populates this.
-/// Phase 2: passthrough — returns inputBuffer unchanged (no filterChain nodes yet).
-/// Caller does NOT need to retain/release — the returned buffer is the same as input.
+/// Convert a UIImage to a pool-backed CVPixelBufferRef, honouring imageOrientation.
+/// Use this instead of pixelBufferFromCGImage: whenever EXIF orientation must be
+/// respected (e.g. gallery photos picked via image_picker). UIGraphicsImageRenderer
+/// automatically applies the UIImage's imageOrientation transform during draw.
+/// Synchronous. Caller must CVPixelBufferRelease the returned buffer.
+/// Returns nil on pool exhaustion or draw failure.
+- (nullable CVPixelBufferRef)pixelBufferFromUIImage:(UIImage *)image;
+
+/// Apply a GPU filter chain to a buffer. Phase 4: iterates filter nodes.
+/// Ownership contract:
+///   - If chain is empty or all nodes passthrough → returns input unchanged (no extra retain).
+///   - If a node produces a new buffer → returns it with +1 retain; caller must CVPixelBufferRelease.
+///   - Caller always checks: if (output != input) CVPixelBufferRelease(output) after use.
 - (CVPixelBufferRef)applyFilterChain:(NSArray *)chain
                             toBuffer:(CVPixelBufferRef)input
-                              atTime:(CMTime)t;
+                              atTime:(CMTime)t
+                              device:(id<MTLDevice>)device;
 
 /// Async batch processor for filmstrip thumbnail generation.
 /// Calls completion on a background queue with an array of CVPixelBufferRefs.

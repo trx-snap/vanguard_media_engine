@@ -21,8 +21,8 @@ Pod::Spec.new do |s|
   s.dependency       'UMF'
   s.platform         = :ios, '14.0'
 
-  # Frameworks required for the GPU pipeline
-  s.frameworks       = 'Metal', 'MetalKit', 'AVFoundation', 'CoreVideo', 'CoreMedia', 'VideoToolbox'
+  # Frameworks required for the GPU pipeline + Vision (Phase 4C face detection, DEC-61)
+  s.frameworks       = 'Metal', 'MetalKit', 'AVFoundation', 'CoreVideo', 'CoreMedia', 'VideoToolbox', 'Vision'
 
   s.pod_target_xcconfig = {
     'DEFINES_MODULE'                                          => 'YES',

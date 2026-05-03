@@ -31,13 +31,19 @@
 // P3-4: isExpensive — YES because segmentation runs Vision inference + Metal
 // composite (≤5ms). VanguardGraphRuntime uses this flag to disable this node at
 // thermal Serious tier.
-- (BOOL)isExpensive { return YES; }
+- (BOOL)isExpensive {
+  return YES;
+}
 
 // P4-2: VGMediaNode topology role.
-- (VGNodeRole)nodeRole { return VGNodeRoleFilter; }
+- (VGNodeRole)nodeRole {
+  return VGNodeRoleFilter;
+}
 
 // P4-2: Scalar GPU cost estimate (A14, nominal thermal, 1080p BGRA).
-- (float)estimatedGPUCostMs { return 5.0f; }
+- (float)estimatedGPUCostMs {
+  return 5.0f;
+}
 
 - (instancetype)initWithPool:(CVPixelBufferPoolRef)pool
                       device:(id<MTLDevice>)device {
@@ -281,7 +287,14 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 - (void)_compilePSO {
-  id<MTLLibrary> lib = [_device newDefaultLibrary];
+  NSBundle *bundle = [NSBundle bundleForClass:[self class]];
+  NSError *error = nil;
+  id<MTLLibrary> lib = [_device newDefaultLibraryWithBundle:bundle error:&error];
+  if (!lib) {
+    NSLog(@"[VGFilter] Failed to load Metal library from bundle %@: %@",
+          bundle.bundlePath, error);
+    return;
+  }
   id<MTLFunction> fn =
       [lib newFunctionWithName:@"vanguard_segmentation_composite"];
   if (!fn) {

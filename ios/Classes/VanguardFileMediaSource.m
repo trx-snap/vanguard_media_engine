@@ -115,6 +115,19 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
   void *_ablScratch;          // heap buffer for AudioBufferList
   size_t _ablScratchCapacity; // current allocated byte size
 
+  // P-CARRY: per-channel PCM float carry-over buffer.
+  // When an oversized packet overflows the chunk boundary, we memcpy the
+  // fitting portion into the current pcmBuffer and the leftover portion into
+  // these owned float arrays. The next _scheduleNextAudioChunk call drains
+  // _carryFrameCount frames from here before reading a new CMSampleBuffer,
+  // achieving zero sample loss without CF ownership across call boundaries.
+  // _carryBufCapacity is in frames (not bytes). Cleared to 0 on seek/stop;
+  // freed only in dealloc.
+  float    *_carryBuf0;        // ch0 leftover PCM samples
+  float    *_carryBuf1;        // ch1 leftover PCM samples (NULL for mono)
+  NSInteger _carryFrameCount;  // valid frames at index 0 of _carryBuf0/1
+  NSInteger _carryBufCapacity; // allocated capacity in frames
+
   // P1A-04: Clock state extracted into VanguardMasterClock.
   // _audioBaseTimeOffset, _audioClockReady, _audioBaseTimeCalibrated,
   // _wallStartTime, _wallOffsetAtPause, _lastMasterClockSecs all live there.
@@ -179,6 +192,12 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
   //   instead of 67+ (which would flood the run loop and stall Future.delayed).
   double _videoSeekTargetSecs;
 
+  // Companion flag for _videoSeekTargetSecs.
+  // YES while a video reader rebuild is pending (set main, cleared _videoDecodeQueue).
+  // Needed because _videoSeekTargetSecs == 0.0 is a valid restart-to-zero target
+  // and cannot be used as a "no seek pending" sentinel on its own.
+  BOOL _hasVideoSeekPending;
+
   // _audioClockReady, _audioBaseTimeCalibrated: moved to VanguardMasterClock
   // (P1A-04). See VanguardMasterClock.h for the detailed G-02-T3 and
   // calibration comments.
@@ -239,7 +258,9 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
 @synthesize owningRuntime = _owningRuntime;
 
 // P4-2: VGMediaNode topology role — frame source.
-- (VGNodeRole)nodeRole { return VGNodeRoleSource; }
+- (VGNodeRole)nodeRole {
+  return VGNodeRoleSource;
+}
 
 + (void)initialize {
   if (self == [VanguardFileMediaSource class]) {
@@ -359,6 +380,11 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
   // PATCH-6: Release the reusable ABL scratch buffer.
   free(_ablScratch);
   _ablScratch = NULL;
+  // P-CARRY: release owned carry float buffers.
+  free(_carryBuf0);
+  free(_carryBuf1);
+  _carryBuf0 = NULL;
+  _carryBuf1 = NULL;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -676,6 +702,39 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
     }
   }
 
+  // Video AVAssetReader rebuild for any seek (including restart-to-zero).
+  // AVAssetReader is forward-only: it cannot rewind to a position behind its
+  // current output position.  seekToTime: sets _videoSeekTargetSecs but does
+  // not touch the reader, so without this block the reader continues from its
+  // old position, fires _videoCallback with a stale high-PTS frame, and
+  // freezes the display until the master clock catches up.
+  //
+  // Mirror of the audio _rebuildAudioReaderForSecs: pattern:
+  //   1. cancelReading synchronously on main (thread-safe per Apple docs) —
+  //      interrupts any in-flight copyNextSampleBuffer immediately.
+  //   2. dispatch_async to _videoDecodeQueue: drain + rebuild from seekSecs.
+  //   3. readNextFrameForPlayback uses _hasVideoSeekPending to drive the
+  //      fast-forward loop once the new reader is ready.
+  {
+    double videoSeekSecs = CMTimeGetSeconds(time);
+    if (_assetReader && _assetReader.status == AVAssetReaderStatusReading) {
+      _hasVideoSeekPending = YES;
+      [_assetReader cancelReading]; // thread-safe; interrupts in-flight decode
+      __weak __typeof(self) weakSelf = self;
+      dispatch_async(_videoDecodeQueue, ^{
+        __strong __typeof(weakSelf) s = weakSelf;
+        if (!s) return;
+        [s _drainAndCancelAssetReader];
+        [s _rebuildVideoReaderForSecs:videoSeekSecs];
+      });
+    } else if (_assetReader && _assetReader.status == AVAssetReaderStatusCompleted) {
+      // Video finished (EOF) — reader cannot be cancelled (already done).
+      // Set the pending flag so readNextFrameForPlayback's inline rebuild
+      // at L2041 fires on the next decode-queue pull.
+      _hasVideoSeekPending = YES;
+    }
+  }
+
   // Fire seek via AVAssetImageGenerator for the video frame.
   // DEBOUNCE: if there is already a request in flight, record the pending seek
   // position so the completion handler can re-fire for the final destination.
@@ -889,6 +948,9 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
   AVAssetReader *oldReader = _audioAssetReader;
   _audioAssetReader = nil;
   _audioReaderOutput = nil;
+  // P-CARRY: discard stale carry from the old reader position. Data is now
+  // invalid (different timeline). Buffer stays allocated for reuse.
+  _carryFrameCount = 0;
 
   __weak __typeof(self) weakSelf = self;
 
@@ -933,29 +995,58 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
         ms->_audioReaderRebuildInFlight = NO;
 
         if (ms->_isPlaying && ms->_audioAssetReader) {
-          atomic_store_explicit(&ms->_schedulingChunks, YES,
-                                memory_order_relaxed);
-          [ms _scheduleNextAudioChunk];
-
-          // Step 4: play() off the main thread.
-          // After play() returns (50–200ms IPC), bounce _audioClockReady = YES
-          // back to the main thread so masterClock is safe to enter the audio
-          // clock path without contending the internal AVAudioPlayerNode lock.
+          // Step 4: play() off the main thread — BEFORE scheduling any buffers.
+          //
+          // CRACKLING FIX (MP4 / 44.1 kHz):
+          // AVAudioEngine inserts a software resampler between _playerNode and
+          // _timePitchNode when the source sample rate (44100 Hz) differs from
+          // the hardware output rate (48000 Hz).  [_playerNode stop] discards
+          // the resampler's internal filter history.  If buffers are scheduled
+          // while the node is stopped (previous ordering: _scheduleNextAudioChunk
+          // on main, then play() on global bg), the resampler receives the first
+          // PCM block with empty state → audible click / crackle on playback
+          // start.  48 kHz sources (MOV) have no resampler so are unaffected.
+          //
+          // FIX: call prepareWithFrameCount: + play() FIRST, let the render
+          // graph fully initialise (resampler state populated from silence),
+          // THEN schedule the first chunk.  This way the resampler always has
+          // valid history when the first real sample arrives.
+          //
+          // prepareWithFrameCount: pre-allocates the hardware render buffers and
+          // warms the resampler without producing audible output.  Using
+          // kAudioChunkFrames (16384) matches our chunk size so no allocation
+          // occurs inside the first render callback.
           AVAudioPlayerNode *node = ms->_playerNode;
           __weak __typeof(weakSelf) ws2 = weakSelf;
           dispatch_async(
               dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+                // Warm the render graph (resampler, timePitch) before
+                // scheduling any PCM data.  Safe to call while node is stopped.
+                [node prepareWithFrameCount:(AVAudioFrameCount)kAudioChunkFrames];
+
                 @try {
                   if (!node.isPlaying)
                     [node play];
                 } @catch (NSException *e) {
                   NSLog(@"[VanguardAudio] bg play threw: %@", e);
                 }
-                // play() returned — internal lock released. Safe to use audio
-                // clock.
+
+                // play() returned — resampler is live, render graph is running.
+                // NOW schedule the first two chunks.  The resampler has valid
+                // state from the prepareWithFrameCount: warm-up above, so the
+                // first real PCM block is processed cleanly with no click.
                 dispatch_async(dispatch_get_main_queue(), ^{
                   __strong __typeof(ws2) final = ws2;
-                  if (final && node.isPlaying) {
+                  if (!final) return;
+
+                  if (node.isPlaying) {
+                    // Enable scheduling and pre-fill two chunks (~740ms at
+                    // 44.1kHz) to avoid underrun on the first render callback.
+                    atomic_store_explicit(&final->_schedulingChunks, YES,
+                                         memory_order_relaxed);
+                    [final _scheduleNextAudioChunk];
+                    [final _scheduleNextAudioChunk];
+
                     final->_masterClockImpl.audioBaseTimeCalibrated =
                         NO; // reset for seek-play re-calibration
                     final->_masterClockImpl.audioClockReady = YES;
@@ -1348,7 +1439,9 @@ static dispatch_once_t sAudioSessionOnce;
 /// eliminating the NSMutableData intermediaries and the two post-loop memcpy
 /// calls (two full 65KB traversals per chunk).
 static const NSInteger kAudioChunkFrames =
-    8192; // ~186ms at 44.1kHz / ~170ms at 48kHz — glitch-free look-ahead
+    16384; // ~371ms at 44.1kHz / ~341ms at 48kHz — accommodates 4096+8192+4096
+           // packet pattern from 44100 Hz MP4 (AVAssetReaderTrackOutput) without
+           // triggering the overflow guard. 48kHz: 16 × 1024 = 16384 exactly.
 
 - (void)_scheduleNextAudioChunk {
   if (!_audioEngineReady ||
@@ -1387,37 +1480,36 @@ static const NSInteger kAudioChunkFrames =
         if (!atomic_load_explicit(&strongSelf->_schedulingChunks,
                                   memory_order_relaxed))
           break; // abort if cancelled
+
+        // ── P-CARRY DRAIN ───────────────────────────────────────────────────
+        // If the previous iteration left carry samples (overflow clamped),
+        // drain them into the current pcmBuffer before reading a new packet.
+        // _carryFrameCount is zeroed immediately — no replay possible.
+        if (strongSelf->_carryFrameCount > 0) {
+          NSInteger c = strongSelf->_carryFrameCount;
+          // Clamp in case capacity shrank (should not happen, but defensive).
+          if (frameOffset + c > kAudioChunkFrames)
+            c = kAudioChunkFrames - frameOffset;
+          memcpy(ch0 + frameOffset, strongSelf->_carryBuf0,
+                 (size_t)c * sizeof(float));
+          if (ch1 && strongSelf->_carryBuf1)
+            memcpy(ch1 + frameOffset, strongSelf->_carryBuf1,
+                   (size_t)c * sizeof(float));
+          frameOffset += c;
+          strongSelf->_carryFrameCount = 0; // consumed — cleared before continue
+          continue; // re-evaluate while condition; may now be full
+        }
+
         CMSampleBufferRef buf = [aOutput copyNextSampleBuffer];
         if (!buf)
           break; // end of stream
 
         CMItemCount n = CMSampleBufferGetNumSamples(buf);
 
-        // OVERFLOW GUARD: the while condition checks frameOffset <
-        // kAudioChunkFrames at loop entry but does NOT check after n is added.
-        // When the source audio sample rate differs from the requested 44100 Hz
-        // (e.g. 48 kHz recording via AirPods/Bluetooth routing),
-        // AVAssetReaderTrackOutput resamples and the output chunk size no
-        // longer divides evenly into kAudioChunkFrames. The last iteration can
-        // push frameOffset past frameCapacity, causing:
-        //   (a) a heap memcpy overflow in the block below, and
-        //   (b) [AVAudioPCMBuffer setFrameLength:] crash at line 1188.
-        // Fix: discard the overshoot packet and stop filling this chunk.
-        if (frameOffset + n > kAudioChunkFrames) {
-          // QA sentinel: this should never fire after the _sourceSampleRate
-          // fix. If it appears in logs, the source clip has a non-standard
-          // packet size (e.g. AAC priming frames, partial EOS packet, or
-          // unexpected SRC output).
-          NSLog(@"[VanguardAudio] overflow guard fired — frameOffset=%ld n=%ld "
-                @"capacity=%ld rate=%.0f",
-                (long)frameOffset, (long)n, (long)kAudioChunkFrames,
-                _sourceSampleRate);
-          CFRelease(buf);
-          break;
-        }
-
-        // PATCH-6: Query required ABL byte size (first call) then reuse
-        // or grow the scratch buffer — no malloc per iteration.
+        // ── ABL extraction ───────────────────────────────────────────────────
+        // PATCH-6: Extract ABL BEFORE the overflow check so that raw PCM data
+        // is available to save into the carry buffer if the packet overflows.
+        // Reuses/grows _ablScratch — no per-iteration malloc.
         size_t ablByteSize = 0;
         CMBlockBufferRef sizeBlock = nil;
         CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
@@ -1463,6 +1555,77 @@ static const NSInteger kAudioChunkFrames =
                   @"corrupt",
                   ablPtr->mNumberBuffers);
 
+        // ── OVERFLOW / CARRY GUARD ───────────────────────────────────────────
+        // When frameOffset + n would overflow the pcmBuffer capacity:
+        //   1. Copy the fitting portion (remaining frames) into pcmBuffer.
+        //   2. Copy the leftover portion into _carryBuf0/1 (owned PCM floats).
+        //   3. Set _carryFrameCount = leftover.
+        //   4. Release buf and break — the carry is drained at the top of the
+        //      next _scheduleNextAudioChunk loop, achieving zero sample loss.
+        //
+        // Previously the whole packet was discarded here (CFRelease; break),
+        // losing ~1024 frames every chunk and causing audible choppiness.
+        if (frameOffset + n > kAudioChunkFrames) {
+          NSInteger remaining = kAudioChunkFrames - frameOffset;
+          NSInteger leftover  = n - remaining;
+
+          // ── (1) Copy the fitting portion into pcmBuffer ──────────────────
+          if (status == noErr && ablPtr->mNumberBuffers >= 2) {
+            memcpy(ch0 + frameOffset, ablPtr->mBuffers[0].mData,
+                   (size_t)remaining * sizeof(float));
+            if (ch1)
+              memcpy(ch1 + frameOffset, ablPtr->mBuffers[1].mData,
+                     (size_t)remaining * sizeof(float));
+          } else if (status == noErr && ablPtr->mNumberBuffers == 1) {
+            memcpy(ch0 + frameOffset, ablPtr->mBuffers[0].mData,
+                   (size_t)remaining * sizeof(float));
+            if (ch1)
+              memcpy(ch1 + frameOffset, ablPtr->mBuffers[0].mData,
+                     (size_t)remaining * sizeof(float));
+          }
+          frameOffset += remaining;
+
+          // ── (2) Grow carry buffers if needed ─────────────────────────────
+          if (leftover > strongSelf->_carryBufCapacity) {
+            free(strongSelf->_carryBuf0);
+            free(strongSelf->_carryBuf1);
+            strongSelf->_carryBuf0 = malloc((size_t)leftover * sizeof(float));
+            strongSelf->_carryBuf1 = malloc((size_t)leftover * sizeof(float));
+            strongSelf->_carryBufCapacity =
+                (strongSelf->_carryBuf0 && strongSelf->_carryBuf1)
+                    ? leftover : 0;
+          }
+
+          // ── (3) Copy leftover portion into carry ─────────────────────────
+          if (strongSelf->_carryBufCapacity >= leftover && leftover > 0) {
+            if (status == noErr && ablPtr->mNumberBuffers >= 2) {
+              memcpy(strongSelf->_carryBuf0,
+                     (float *)ablPtr->mBuffers[0].mData + remaining,
+                     (size_t)leftover * sizeof(float));
+              memcpy(strongSelf->_carryBuf1,
+                     (float *)ablPtr->mBuffers[1].mData + remaining,
+                     (size_t)leftover * sizeof(float));
+            } else if (status == noErr && ablPtr->mNumberBuffers == 1) {
+              // Mono — duplicate into both carry channels for symmetric drain.
+              memcpy(strongSelf->_carryBuf0,
+                     (float *)ablPtr->mBuffers[0].mData + remaining,
+                     (size_t)leftover * sizeof(float));
+              if (strongSelf->_carryBuf1)
+                memcpy(strongSelf->_carryBuf1,
+                       (float *)ablPtr->mBuffers[0].mData + remaining,
+                       (size_t)leftover * sizeof(float));
+            }
+            strongSelf->_carryFrameCount = leftover; // ── (3) done
+          }
+          // malloc failure: _carryFrameCount stays 0 → leftover silently
+          // discarded this chunk only (better than crashing).
+
+          if (block) CFRelease(block);
+          CFRelease(buf); // ── (4) release — no CF stored across calls
+          break;
+        }
+
+        // ── Normal path: packet fits entirely ───────────────────────────────
         // PATCH-7: Write directly into pcmBuffer channel pointers.
         // No NSMutableData — no intermediate allocation, no post-loop memcpy.
         if (status == noErr && ablPtr->mNumberBuffers >= 2) {
@@ -1509,6 +1672,8 @@ static const NSInteger kAudioChunkFrames =
   // minute kernel suspension.
   atomic_store_explicit(&_audioSetupCancelled, YES, memory_order_relaxed);
   atomic_store_explicit(&_schedulingChunks, NO, memory_order_relaxed);
+  // P-CARRY: engine is stopping; any in-flight carry is stale.
+  _carryFrameCount = 0;
 
   // Idempotency guard: _audioEngineReady is set NO at the end of the first
   // call. dealloc and any redundant callers return immediately here.
@@ -1813,6 +1978,55 @@ static const NSInteger kAudioChunkFrames =
   _videoOutput = nil;
 }
 
+/// Rebuilds the video AVAssetReader starting at `startSecs`.
+/// Must be called on _videoDecodeQueue after _drainAndCancelAssetReader.
+/// Sets a timeRange on the new reader so it begins at the nearest keyframe
+/// at or before startSecs — the fast-forward loop in readNextFrameForPlayback
+/// then discards frames until the exact target PTS.
+/// For startSecs == 0 no timeRange is needed (reader starts at the beginning).
+- (void)_rebuildVideoReaderForSecs:(double)startSecs {
+  if (!_cachedAsset)
+    return;
+
+  AVAssetTrack *videoTrack =
+      [_cachedAsset tracksWithMediaType:AVMediaTypeVideo].firstObject;
+  if (!videoTrack) {
+    NSLog(@"[VanguardSource] _rebuildVideoReaderForSecs: no video track");
+    return;
+  }
+
+  NSError *error = nil;
+  _assetReader = [AVAssetReader assetReaderWithAsset:_cachedAsset error:&error];
+  if (error || !_assetReader) {
+    NSLog(@"[VanguardSource] _rebuildVideoReaderForSecs: reader error: %@", error);
+    return;
+  }
+
+  // Set timeRange so the reader starts near the seek position, matching the
+  // audio path (_setupAudioReaderFromTime:).  For startSecs == 0 the full
+  // asset is read (no timeRange needed — reader starts at frame 0).
+  if (startSecs > 0 && _durationSecs > startSecs) {
+    _assetReader.timeRange = CMTimeRangeMake(
+        CMTimeMakeWithSeconds(startSecs, 600),
+        CMTimeMakeWithSeconds(_durationSecs - startSecs, 600));
+  }
+
+  NSDictionary *outputSettings = @{
+    (id)kCVPixelBufferPixelFormatTypeKey : @(kCVPixelFormatType_32BGRA),
+    (id)kCVPixelBufferMetalCompatibilityKey : @YES,
+    (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+  };
+  AVAssetReaderTrackOutput *output =
+      [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack
+                                       outputSettings:outputSettings];
+  output.alwaysCopiesSampleData = NO;
+  _videoOutput = output;
+  [_assetReader addOutput:_videoOutput];
+  [_assetReader startReading];
+  NSLog(@"[VanguardSource] video reader rebuilt from %.2fs — status=%ld",
+        startSecs, (long)_assetReader.status);
+}
+
 /// Called by the renderer's CADisplayLink to pull the next sequential frame.
 - (BOOL)readNextFrameForPlayback {
   // Retain locally to prevent bad access if main thread nulls ivars during
@@ -1822,39 +2036,49 @@ static const NSInteger kAudioChunkFrames =
   // [VDR-ENTRY]/[SRC1] removed — per-frame, high-frequency
 
   if (!reader || reader.status != AVAssetReaderStatusReading || !output) {
+    // EOF case: reader is Completed (reached end of stream) and a seek arrived
+    // (e.g. restart after playback finished).  seekToTime: cannot rebuild the
+    // reader because it dispatches to _videoDecodeQueue which is this thread.
+    // Rebuild inline here instead, then return NO — the renderer retries on
+    // the next CADisplayLink tick with the fresh reader.
+    // Guard: _hasVideoSeekPending ensures we only rebuild when a real seek is
+    // pending, not after every natural EOF.
+    if (reader && reader.status == AVAssetReaderStatusCompleted
+        && _hasVideoSeekPending) {
+      double rebuildTarget = _videoSeekTargetSecs;
+      _hasVideoSeekPending = NO; // consumed here
+      _videoSeekTargetSecs = 0;
+      [self _drainAndCancelAssetReader];
+      [self _rebuildVideoReaderForSecs:rebuildTarget];
+    }
     return NO;
   }
 
   // ── Sequential-reader fast-forward after seek ──────────────────────────
-  // After a seek to time T, the sequential AVAssetReader is still at its
-  // current position P (which may be << T). Without fast-forward:
-  //   • _lastDecodedPTS drops from T to ~P (~0.0s after the first pull)
-  //   • The condition _lastDecodedPTS <= masterClock+0.016 is permanently
-  //     true until the reader catches up (~67 frames for a 2.45s seek).
-  //   • Each of those 67 frames dispatches _isFetchingFrame=NO +
-  //     textureFrameAvailable to the main queue, flooding the iOS run loop
-  //     and starving the Dart event loop → Future.delayed timers never fire.
+  // After a seek where the reader was rebuilt from startSecs, the reader
+  // delivers the nearest keyframe <= seekTarget first.  Discard frames below
+  // the exact target so only the landing frame fires _videoCallback.
   //
-  // FIX: snapshot _videoSeekTargetSecs on this bg thread. If non-zero,
-  // discard frames in a tight loop until PTS >= targetSecs - 0.05s.
-  // Only the FINAL frame is passed to _videoCallback (one main dispatch).
-  // The loop runs entirely on the video decode queue — no main-thread work
-  // during the skip — so the Dart event loop stays free.
-  double targetSecs = _videoSeekTargetSecs;
-  _videoSeekTargetSecs = 0; // clear so normal reads don't skip
+  // _hasVideoSeekPending flags that a rebuild just completed (set by
+  // seekToTime: / EOF rebuild, cleared here).  For seek-to-zero the target is
+  // 0.0 and the loop does not run (reader already at frame 0 — correct).
+  BOOL hasPendingSeek = _hasVideoSeekPending;
+  double targetSecs   = _videoSeekTargetSecs;
+  _hasVideoSeekPending = NO;  // consumed — clear before any return below
+  _videoSeekTargetSecs = 0;   // clear so normal reads don't skip
 
   CMSampleBufferRef sampleBuffer = [output copyNextSampleBuffer];
   if (!sampleBuffer) {
-    // No sample — check EOF
-    if (reader.status == AVAssetReaderStatusCompleted) {
-      // [SRC4] EOF — reader finished normally
-    }
+    // No sample — EOF or cancelled.
     return NO;
   }
   // First-sample first-PTS logging removed (playback confirmed stable)
 
-  if (targetSecs > 0) {
+  if (hasPendingSeek && targetSecs > 0) {
     // Fast-forward: discard frames below the seek target.
+    // Runs only when a reader rebuild was dispatched and the target is > 0.
+    // For seek-to-zero (targetSecs == 0) the rebuilt reader starts at frame 0
+    // — no skipping needed.
     NSInteger skipped = 0;
     double firstPTS =
         CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer));
@@ -1903,10 +2127,24 @@ static const NSInteger kAudioChunkFrames =
 }
 
 - (void)pullNextFrameAsync {
+  [self pullNextFrameAsyncWithCompletion:nil];
+}
+
+/// Variant of pullNextFrameAsync that calls `completion(didProduce)` on the
+/// MAIN thread after the decode attempt, where `didProduce` is YES if a
+/// CVPixelBuffer was delivered via _videoCallback, NO otherwise.
+/// Used by the renderer to clear _isFetchingFrame when no frame arrives
+/// (reader rebuilt after EOF restart, or copyNextSampleBuffer returned nil).
+- (void)pullNextFrameAsyncWithCompletion:(void (^_Nullable)(BOOL didProduce))completion {
   __weak __typeof(self) weakSelf = self;
   dispatch_async(_videoDecodeQueue, ^{
     @autoreleasepool {
-      [weakSelf readNextFrameForPlayback];
+      BOOL produced = [weakSelf readNextFrameForPlayback];
+      if (completion) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+          completion(produced);
+        });
+      }
     }
   });
 }
