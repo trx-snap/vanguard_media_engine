@@ -25,8 +25,8 @@
 //   _pool             — borrowed (no CFRetain). Caller (runtime) owns lifetime.
 
 #import "BeautyV2FilterGroup.h"
-#import "VGFaceDetectionProvider.h"
-#import "VGSkinMaskGenerator.h"
+#import "VGSegmentationNode.h"
+#import "VGSkinMaskGenerator.h"  // Phase 4F: VGSkinMask type for metadata consumption
 #import <os/lock.h>
 #import <os/log.h>
 
@@ -116,28 +116,13 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     float _toneStrength;     // [0, 1]    — tone compression intensity
     float _midtoneLift;      // [0, 0.15] — midtone luminance boost
 
-    // ── Phase 4C face detection (DEC-61) ──────────────────────────────────
-    // Async provider — runs on a private serial queue, never blocks GPU.
-    // Disabled by default. Enable via faceAwareEnabled property (future Step 4).
-    VGFaceDetectionProvider *_faceDetectionProvider;
-
-    // ── Phase 4C skin mask (DEC-62/64) ──────────────────────────────────
-    // Quarter-res R8 mask generated on CPU from detection results.
-    // Cached for future GPU consumption (Step 3).
-    VGSkinMaskGenerator *_skinMaskGenerator;
-    // Track which detection result was last used for mask generation,
-    // so we only regenerate when detection produces a new result.
-    CFAbsoluteTime _lastMaskDetectionTime;
-
-    // ── Phase 4C mask texture cache (DEC-62/63) ──────────────────────────
-    // Reusable R8Unorm Metal texture for uploading the latest CPU mask.
+    // ── Phase 4F: mask texture cache (migrated from internal ownership) ────
+    // Reusable R8Unorm Metal texture for uploading skin mask received
+    // via VGFrameEnvelope.metadata from upstream VGSegmentationNode.
     // Recreated only when mask dimensions change.
     id<MTLTexture> _maskTexture;
     size_t _maskTexWidth;
     size_t _maskTexHeight;
-    // Track which VGSkinMask was last uploaded to avoid redundant replaceRegion:
-    // calls. Identity check (pointer) is sufficient because VGSkinMask is immutable.
-    VGSkinMask *_lastUploadedMask;
 
     // ── Phase 4C Step 4: temporal fade + dropout (RR-57) ─────────────────
     // Smooth fade of maskStrength: ramps toward 1.0 when a valid mask exists,
@@ -246,11 +231,9 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     _toneStrength     = 0.25f;  // Phase 4B.6: tone compression (DEC-60)
     _midtoneLift      = 0.045f; // Phase 4B.6: midtone lift (DEC-60) — tuned baseline
 
-    // Phase 4C (DEC-61): async face detection provider.
-    // Created at init but DISABLED — detection does not run until explicitly
-    // enabled by a future face-aware beauty flag. Zero cost when disabled.
-    _faceDetectionProvider = [[VGFaceDetectionProvider alloc] initWithCadenceFrames:3];
-    _faceDetectionProvider.enabled = NO; // 4C: dormant until faceAwareEnabled=YES
+    // Phase 4F (DEC-100): face detection and mask generation are now owned by
+    // VGSegmentationNode. BeautyV2FilterGroup consumes mask data from
+    // envelope.metadata — no internal detection/generation provider.
 
     // Phase 4C: face-aware mode OFF by default — production behavior is 4B.6.
     _faceAwareEnabled = NO;
@@ -292,12 +275,6 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     _polishSmoothStrength = 0.0f;
     _polishWarmthStrength = 0.0f;
     _polishBloomStrength  = 0.0f;
-
-    // Phase 4C (DEC-62/64): CPU skin mask generator.
-    // Generates quarter-res R8 mask from detection results. Created at init,
-    // but only produces masks when face detection is enabled and has results.
-    _skinMaskGenerator = [[VGSkinMaskGenerator alloc] init];
-    _lastMaskDetectionTime = 0;
 
     // Phase 4C Step 4 (RR-57): temporal fade state — starts at 0 (no mask).
     _currentMaskStrength = 0.0f;
@@ -429,19 +406,15 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     _poolsReady = NO;
     os_unfair_lock_unlock(&_prepareLock);
 
-    // Phase 4C (DEC-61): cancel any in-flight face detection.
-    [_faceDetectionProvider invalidate];
-    _faceDetectionProvider = nil;
-
-    // Phase 4C (DEC-62/64): release mask generator buffers.
-    [_skinMaskGenerator invalidate];
-    _skinMaskGenerator = nil;
+    // Phase 4F (DEC-100): face detection and mask generation are now owned by
+    // VGSegmentationNode — no teardown needed here.
 
     // Phase 4C (DEC-63): release cached mask texture.
     _maskTexture = nil;
     _maskTexWidth = 0;
     _maskTexHeight = 0;
-    _lastUploadedMask = nil;
+
+
 }
 
 // ---------------------------------------------------------------------------
@@ -556,29 +529,10 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
         }
     }
 
-    // ── Phase 4C: async face detection (DEC-61) ──────────────────────────────────
-    // Only run detection + mask generation when faceAwareEnabled is YES.
-    // When NO, the provider stays disabled → no masks → hasMask=0 → exact 4B.6.
-    _faceDetectionProvider.enabled = _faceAwareEnabled;
-
-    if (_faceAwareEnabled) {
-        // Submit the input frame for async detection. This NEVER blocks — the provider
-        // internally throttles and skips if detection is in-flight or disabled.
-        // Results are cached for later mask generation (Step 2).
-        [_faceDetectionProvider detectInPixelBuffer:input pts:envelope.pts];
-
-        // ── Phase 4C: async mask generation from latest detection (DEC-62/64) ─────
-        // If the provider has a newer detection result than our last mask, submit
-        // it for async generation on the mask generator's private queue.
-        // submitResult: returns immediately — NEVER blocks the render thread.
-        VGFaceDetectionResult *detectionResult = _faceDetectionProvider.latestResult;
-        if (detectionResult && detectionResult.completionTime > _lastMaskDetectionTime) {
-            [_skinMaskGenerator submitResult:detectionResult
-                                 sourceWidth:w
-                                sourceHeight:h];
-            _lastMaskDetectionTime = detectionResult.completionTime;
-        }
-    }
+    // ── Phase 4F: mask metadata consumption from VGSegmentationNode (DEC-100) ──
+    // Face detection and mask generation are now owned by VGSegmentationNode.
+    // When faceAwareEnabled=YES, read mask data from envelope.metadata.
+    // When NO, hasMask=0 → exact 4B.6 output (no mask influence).
 
     // ── Intensity → parameter mapping (Step 6B) ──────────────────────────────────
     // Runs ONLY when useIntensityRamp == YES (playground slider path).
@@ -653,49 +607,109 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
         .rangeSigma = rangeSigma,           // Phase 4B.5: wired to bilateral kernel
     };
 
-    // ── Phase 4C: upload cached skin mask to GPU (DEC-62/63) ──────────────────
-    // Read the latest mask snapshot. If valid, upload to a reusable R8Unorm texture.
-    // Phase 4C Step 4 (RR-57): temporal fade-in/fade-out + dropout hold.
+    // ── Phase 4F: read mask from envelope.metadata (DEC-100/101/102) ──────────
+    // Mask data is produced by VGSegmentationNode and attached to the envelope
+    // as an NSDictionary. We read it here for GPU upload.
     //
-    // Fade constants (internal-only — not exposed to UI):
-    //   kMaskFadeSpeed     — per-frame ramp step (~0.15 → 7 frames = ~230ms at 30fps)
-    //   kMaskHoldDurationS — grace period before fade-out after face lost (150ms)
+    // Phase 4C Step 4 (RR-57): temporal fade-in/fade-out + dropout hold.
     static const float kMaskFadeSpeed      = 0.15f;
     static const float kMaskHoldDurationS  = 0.15f;  // 150ms
 
-    VGSkinMask *currentMask = _skinMaskGenerator.latestMask;
-    BOOL maskValid = (currentMask &&
-                      currentMask.width > 0 &&
-                      currentMask.height > 0 &&
-                      currentMask.data != NULL &&
-                      currentMask.faceCount > 0);
+    // ── Extract mask from metadata ───────────────────────────────────────────
+    // maskValid: set to YES if a usable mask was found and texture was uploaded.
+    // maskFaceCount: used for temporal fade logic below.
+    BOOL maskValid = NO;
+    NSInteger maskFaceCount = 0;
+
+    if (_faceAwareEnabled && envelope.metadata != NULL) {
+        NSDictionary *meta = (__bridge NSDictionary *)envelope.metadata;
+        if ([meta isKindOfClass:[NSDictionary class]]) {
+            NSInteger fc = [meta[VGSegmentationMetadataKeyFaceCount] integerValue];
+
+            // ── Primary path: CVPixelBufferRef R8 (DEC-121) ─────────────────
+            // VGSegmentationNode now produces a CVPixelBufferRef under
+            // VGSegmentationMetadataKeySkinMaskBuffer. Read and upload inside
+            // the lock so maskData is never accessed after unlock.
+            id maskBufObj = meta[VGSegmentationMetadataKeySkinMaskBuffer];
+            if (maskBufObj) {
+                CVPixelBufferRef maskBuf = (__bridge CVPixelBufferRef)maskBufObj;
+                size_t bufW = CVPixelBufferGetWidth(maskBuf);
+                size_t bufH = CVPixelBufferGetHeight(maskBuf);
+                if (bufW > 0 && bufH > 0 && fc > 0) {
+                    CVPixelBufferLockBaseAddress(maskBuf, kCVPixelBufferLock_ReadOnly);
+                    const uint8_t *baseAddr =
+                        (const uint8_t *)CVPixelBufferGetBaseAddress(maskBuf);
+                    size_t bpr = CVPixelBufferGetBytesPerRow(maskBuf);
+                    if (baseAddr) {
+                        // Recreate texture inside lock if dimensions changed.
+                        if (!_maskTexture || _maskTexWidth != bufW || _maskTexHeight != bufH) {
+                            MTLTextureDescriptor *desc = [MTLTextureDescriptor
+                                texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                            width:bufW
+                                                           height:bufH
+                                                        mipmapped:NO];
+                            desc.usage = MTLTextureUsageShaderRead;
+                            desc.storageMode = MTLStorageModeShared;
+                            _maskTexture = [device newTextureWithDescriptor:desc];
+                            _maskTexWidth = bufW;
+                            _maskTexHeight = bufH;
+                        }
+                        // Upload — replaceRegion: copies bytes synchronously.
+                        // maskData is valid here: we are inside the lock.
+                        if (_maskTexture) {
+                            [_maskTexture replaceRegion:MTLRegionMake2D(0, 0, bufW, bufH)
+                                           mipmapLevel:0
+                                             withBytes:baseAddr
+                                           bytesPerRow:bpr];
+                        }
+                        maskValid = (_maskTexture != nil);
+                        maskFaceCount = fc;
+                    }
+                    CVPixelBufferUnlockBaseAddress(maskBuf, kCVPixelBufferLock_ReadOnly);
+                }
+
+            } else {
+                // ── Legacy fallback: VGSkinMask * (DEC-110) ─────────────────
+                // Used when the new key is absent (CVPixelBuffer creation failure
+                // path, or pre-migration consumers).
+                VGSkinMask *skinMask = meta[VGSegmentationMetadataKeySkinMask];
+                if (skinMask && [skinMask isKindOfClass:[VGSkinMask class]]) {
+                    if (skinMask.width > 0 && skinMask.height > 0 &&
+                        skinMask.data != NULL && skinMask.faceCount > 0) {
+                        // Recreate texture if dimensions changed.
+                        if (!_maskTexture ||
+                            _maskTexWidth  != skinMask.width ||
+                            _maskTexHeight != skinMask.height) {
+                            MTLTextureDescriptor *desc = [MTLTextureDescriptor
+                                texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
+                                                            width:skinMask.width
+                                                           height:skinMask.height
+                                                        mipmapped:NO];
+                            desc.usage = MTLTextureUsageShaderRead;
+                            desc.storageMode = MTLStorageModeShared;
+                            _maskTexture = [device newTextureWithDescriptor:desc];
+                            _maskTexWidth  = skinMask.width;
+                            _maskTexHeight = skinMask.height;
+                        }
+                        if (_maskTexture) {
+                            [_maskTexture replaceRegion:MTLRegionMake2D(
+                                                    0, 0, skinMask.width, skinMask.height)
+                                           mipmapLevel:0
+                                             withBytes:skinMask.data
+                                           bytesPerRow:skinMask.bytesPerRow];
+                        }
+                        maskValid = (_maskTexture != nil);
+                        maskFaceCount = skinMask.faceCount;
+                    }
+                }
+            }
+        }
+    }
 
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
 
     if (maskValid) {
-        // ── Valid mask: upload texture + ramp strength toward 1.0 ──────────
-        size_t mw = currentMask.width;
-        size_t mh = currentMask.height;
-        // Recreate texture only if dimensions changed.
-        if (!_maskTexture || _maskTexWidth != mw || _maskTexHeight != mh) {
-            MTLTextureDescriptor *desc = [MTLTextureDescriptor
-                texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
-                                            width:mw
-                                           height:mh
-                                        mipmapped:NO];
-            desc.usage = MTLTextureUsageShaderRead;
-            desc.storageMode = MTLStorageModeShared;
-            _maskTexture = [device newTextureWithDescriptor:desc];
-            _maskTexWidth = mw;
-            _maskTexHeight = mh;
-        }
-        if (_maskTexture && currentMask != _lastUploadedMask) {
-            [_maskTexture replaceRegion:MTLRegionMake2D(0, 0, mw, mh)
-                           mipmapLevel:0
-                             withBytes:currentMask.data
-                           bytesPerRow:currentMask.bytesPerRow];
-            _lastUploadedMask = currentMask;
-        }
+        // ── Valid mask: texture already uploaded above ─────────────────────
         _lastValidMaskTime = now;
         _hadMaskLastFrame = YES;
 

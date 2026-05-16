@@ -186,6 +186,11 @@
   CVPixelBufferRef current = input;
   BOOL ownsCurrentBuffer = NO;
 
+  // Phase 4F: track metadata from the last filter's output envelope so it can be
+  // propagated to the next filter's input envelope. This allows VGSegmentationNode
+  // to attach mask metadata that BeautyV2FilterGroup reads downstream.
+  void *currentMetadata = NULL; // starts NULL — no metadata from source
+
   for (id node in chain) {
     if (![node conformsToProtocol:@protocol(VGMetalFilterNode)]) {
       continue;
@@ -198,6 +203,9 @@
     inEnvelope.mediaType         = VGMediaTypeVideo;
     inEnvelope.pts               = t;
     inEnvelope.payload.videoBuffer = (void *)current;
+    // Phase 4F: carry forward metadata from previous filter's output.
+    // This allows VGSegmentationNode → BeautyV2FilterGroup metadata flow.
+    inEnvelope.metadata          = currentMetadata;
 
     // processEnvelope:device: returns either:
     //   - an envelope with a NEW videoBuffer (+1 owned by the scheduler contract), or
@@ -220,6 +228,26 @@
       ownsCurrentBuffer = YES;
     }
     // If result == current, filter was a passthrough — no ownership change.
+
+    // Phase 4F: capture metadata from this filter's output for the next filter.
+    // Note: we do NOT retain/release here — the metadata lifetime is managed by
+    // the producing filter (VGSegmentationNode retains it in CopyWithMetadata)
+    // and we release it once at the end of the chain.
+    currentMetadata = outEnvelope.metadata;
+  }
+
+  // Phase 4F (DEC-102): release any metadata that was attached to the final
+  // envelope. The metadata NSDictionary was CFRetained by VGSegmentationNode's
+  // VGFrameEnvelopeCopyWithMetadata; we release it here after all consumers
+  // (BeautyV2FilterGroup) have read it.
+  // NOTE: use a stack envelope wrapper so VGFrameEnvelopeReleaseMetadata can
+  // NULL the pointer — mandatory per DEC-102 (no direct CFRelease).
+  if (currentMetadata) {
+    VGFrameEnvelope cleanupEnv;
+    memset(&cleanupEnv, 0, sizeof(cleanupEnv));
+    cleanupEnv.metadata = currentMetadata;
+    VGFrameEnvelopeReleaseMetadata(&cleanupEnv);
+    currentMetadata = NULL;
   }
 
   return current;

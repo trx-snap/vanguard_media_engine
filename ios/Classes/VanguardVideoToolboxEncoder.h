@@ -5,17 +5,16 @@
 // them directly on the Apple Neural Engine / VideoToolbox hardware.
 // No libx264. No CPU re-compression. Just the silicon Apple built into the SoC.
 
-#import <Foundation/Foundation.h>
-#import <VideoToolbox/VideoToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <Foundation/Foundation.h>
+#import <VideoToolbox/VideoToolbox.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
-typedef void (^VanguardEncodedPacketHandler)(NSData* _Nullable nalData,
-                                              CMTime pts,
-                                              BOOL isKeyFrame,
-                                              NSError* _Nullable error);
+typedef void (^VanguardEncodedPacketHandler)(NSData *_Nullable nalData,
+                                             CMTime pts, BOOL isKeyFrame,
+                                             NSError *_Nullable error);
 
 @interface VanguardVideoToolboxEncoder : NSObject
 
@@ -24,17 +23,20 @@ typedef void (^VanguardEncodedPacketHandler)(NSData* _Nullable nalData,
 /// Initialise the hardware encoder.
 /// @param width   Frame width in pixels (e.g. 1080)
 /// @param height  Frame height in pixels (e.g. 1920)
-/// @param bitrate Target average bitrate in bits/second (e.g. 1_200_000 for 1.2Mbps)
+/// @param bitrate Target average bitrate in bits/second (e.g. 1_200_000
+/// for 1.2Mbps)
 /// @param fps     Frame rate (e.g. 30)
 /// @param handler Called for each encoded NAL unit — use it to feed the muxer
 - (instancetype)initWithWidth:(int)width
                        height:(int)height
                       bitrate:(int)bitrate
                           fps:(int)fps
-               packetHandler:(VanguardEncodedPacketHandler)handler;
+                packetHandler:(VanguardEncodedPacketHandler)handler;
 
-/// Submit a decoded frame (from AVAssetReader or Metal render pass) for encoding.
-- (void)encodePixelBuffer:(CVPixelBufferRef)pixelBuffer presentationTime:(CMTime)pts;
+/// Submit a decoded frame (from AVAssetReader or Metal render pass) for
+/// encoding.
+- (void)encodePixelBuffer:(CVPixelBufferRef)pixelBuffer
+         presentationTime:(CMTime)pts;
 
 /// Finalise and flush the encoder. Call before releasing.
 - (void)finish;
@@ -48,8 +50,9 @@ typedef void (^VanguardEncodedPacketHandler)(NSData* _Nullable nalData,
 - (void)setBitrateKbps:(int)kbps;
 
 /// P3-T3: Pre-warms the VTCompressionSession without submitting any frames.
-/// Call at startCamera so the hardware encoder is ready before the user taps Record.
-/// Idempotent. The first 5 real encode calls are discarded automatically.
+/// Call at startCamera so the hardware encoder is ready before the user taps
+/// Record. Idempotent. The first 5 real encode calls are discarded
+/// automatically.
 - (void)prewarm;
 
 /// Internal: called by the VTCompressionOutputCallback C function.
@@ -61,8 +64,8 @@ typedef void (^VanguardEncodedPacketHandler)(NSData* _Nullable nalData,
 /// Atomically readable from any thread.
 @property(atomic, readonly) int64_t vtCallbackCount;
 
-/// P5-C: Reset the vtCallbackCount to zero before starting a flush-completeness test.
-/// Call before startRecording to get a per-session count.
+/// P5-C: Reset the vtCallbackCount to zero before starting a flush-completeness
+/// test. Call before startRecording to get a per-session count.
 - (void)resetCallbackCount;
 
 @end

@@ -32,6 +32,8 @@
 #import "VanguardSegmentationFilterNode.h"
 // Phase 4B: Beauty V2 — opt-in only, never the default (Step 4 controlled wiring)
 #import "BeautyV2FilterGroup.h"
+// Phase 4F: VGSegmentationNode — face detection + mask generation (DEC-100)
+#import "VGSegmentationNode.h"
 
 // UMF shared infrastructure
 #import <UMF/VGResourceAllocator.h>
@@ -1088,8 +1090,32 @@ static BOOL VGRIsImageURL(NSURL *url) {
     if (node) [nodes addObject:node];
   }
 
+  // ── Phase 4F (DEC-100, DEC-109 UPDATE): always insert VGSegmentationNode ──
+  // Always insert VGSegmentationNode before BeautyV2FilterGroup, with enabled
+  // mirrored from beauty.faceAwareEnabled. This supports runtime toggling
+  // without requiring a graph rebuild:
+  //   enabled=YES → face detection + mask gen + metadata attachment (normal)
+  //   enabled=NO  → true passthrough: no face detection, no CPU work, no
+  //                  metadata (processEnvelope: returns envelope unchanged)
+  NSMutableArray<id<VGMetalFilterNode>> *finalNodes =
+      [NSMutableArray arrayWithCapacity:nodes.count + 1];
+  BOOL segInserted = NO;
+  for (id<VGMetalFilterNode> n in nodes) {
+    if (!segInserted && [n isKindOfClass:[BeautyV2FilterGroup class]]) {
+      BeautyV2FilterGroup *beauty = (BeautyV2FilterGroup *)n;
+      VGSegmentationNode *segNode =
+          [[VGSegmentationNode alloc] initWithPool:pool device:device];
+      segNode.enabled = beauty.faceAwareEnabled;
+      [finalNodes addObject:segNode];
+      segInserted = YES;
+      NSLog(@"[VGRuntime] VGSegmentationNode auto-inserted before BeautyV2 "
+             "(Phase 4F, enabled=%d)", (int)beauty.faceAwareEnabled);
+    }
+    [finalNodes addObject:n];
+  }
+
   // ── 3. Apply via the existing thread-safe setter ──────────────────────────
-  [self setFilterChain:[nodes copy]];
+  [self setFilterChain:[finalNodes copy]];
   return YES;
 }
 

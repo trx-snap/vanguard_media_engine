@@ -3,8 +3,9 @@
 //
 // Concrete scheduler. Implements VGGraphScheduler and VGFrameDelegate.
 //
-// P4-2: Skeleton lifecycle (start/pause/resume/seekTo/setFilterChain/invalidate).
-// P4-5: Frame delegate — receives raw frames from VanguardMetalRenderer,
+// P4-2: Skeleton lifecycle
+// (start/pause/resume/seekTo/setFilterChain/invalidate). P4-5: Frame delegate —
+// receives raw frames from VanguardMetalRenderer,
 //       executes filter chain, delivers processed envelope to sink.
 //
 // Threading:
@@ -13,9 +14,9 @@
 //   didReceiveRawFrame: executes on _videoDecodeQueue (source serial queue).
 //   _schedulerQueue (serial) created but unused for execution in Phase 4.
 
-#import <Foundation/Foundation.h>
 #import "UMF/VGGraphScheduler.h"
 #import "VGFrameDelegate.h"
+#import <Foundation/Foundation.h>
 
 // Forward declaration — avoids circular import. Full type imported in .m.
 @class VanguardMetalRenderer;

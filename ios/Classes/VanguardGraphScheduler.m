@@ -276,8 +276,11 @@ static os_log_t sSchedulerLog;
           CVPixelBufferRelease(frame);
           schedulerOwnedDelivered = NO;
         }
+        // Phase 4F: release metadata before reverting to source envelope.
+        // Without this, metadata from VGSegmentationNode leaks on revert.
+        VGFrameEnvelopeReleaseMetadata(&currentEnvelope);
         frame = rawBuffer;          // revert to source-owned buffer
-        currentEnvelope = envelope; // revert envelope
+        currentEnvelope = envelope; // revert envelope (metadata=NULL)
         break;                      // skip remaining nodes
       }
 
@@ -287,7 +290,18 @@ static os_log_t sSchedulerLog;
         CVPixelBufferRelease(frame);
       }
       frame = result.payload.videoBuffer;
-      schedulerOwnedDelivered = YES; // filter output: scheduler owns +1
+      // RR-36: only mark scheduler-owned if the node produced a NEW buffer.
+      // Passthrough nodes (e.g. VGSegmentationNode) return the same pointer
+      // without adding a retain — treating that as scheduler-owned would cause
+      // the next CVPixelBufferRelease(frame) call to free the source-owned
+      // buffer prematurely, crashing the renderer when it releases it at
+      // _onVideoFrame: line 824 (double-free of frameToDeliver).
+      if (frame != currentEnvelope.payload.videoBuffer) {
+        schedulerOwnedDelivered = YES; // new buffer: scheduler owns +1
+      }
+      // else: same buffer returned (passthrough) — schedulerOwnedDelivered
+      // retains its previous value (NO if this is the first node, or unchanged
+      // if a prior node already produced an owned intermediate).
       currentEnvelope = result;
     }
   }
@@ -307,6 +321,14 @@ static os_log_t sSchedulerLog;
   if (schedulerOwnedDelivered) {
     CVPixelBufferRelease(frame); // release scheduler's +1 on filter output
   }
+
+  // Phase 4F (DEC-102): release metadata attached by upstream nodes (e.g.
+  // VGSegmentationNode). The metadata NSDictionary was CFRetained by
+  // VGFrameEnvelopeCopyWithMetadata; we must release it here after the
+  // final consumer (BeautyV2FilterGroup) has read it. The renderer sink
+  // does not use metadata — it only stores the pixel buffer.
+  VGFrameEnvelopeReleaseMetadata(&currentEnvelope);
+
   // Note: rawBuffer (source-owned) is NOT released here. VanguardMetalRenderer
   // released it when it called CVPixelBufferRelease(rawFrame) BEFORE forwarding
   // to this delegate. The source's own +1 is separate and persists until the
