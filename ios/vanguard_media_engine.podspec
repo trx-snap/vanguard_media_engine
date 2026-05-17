@@ -90,7 +90,9 @@ Pod::Spec.new do |s|
       'Tests/VGCostBudgetFutureNodeTest.m',
       # Phase 4 Pre-4A: Pixel parity test infrastructure
       'Tests/VGSchedulerParityTest.m',
-      'Tests/VGAdapterParityTest.m'
+      'Tests/VGAdapterParityTest.m',
+      # Phase 4 Batch 4B: V2 setFilterChain hot-swap gate
+      'Tests/VGSchedulerV2ChainSwapTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'

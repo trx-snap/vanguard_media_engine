@@ -902,12 +902,108 @@ static BOOL VGRIsImageURL(NSURL *url) {
   // RR-31 CLOSED: setRuntimeFilterChain: renderer forward removed.
   [self.scheduler setFilterChain:newChain];
 
-  // Phase 4 Batch 3 note: V2 graph rebuild on filter chain change is deferred
-  // to Batch 4. The V2 scheduler operates with the filter chain snapshot from
-  // prepare time. Hot-swap filter chain changes take effect on the V1 scheduler
-  // path only ([self.scheduler setFilterChain:newChain] above).
-  // When VG_USE_V2_GRAPH=1 and schedulerV2 is active, self.scheduler is nil,
-  // so the V1 setFilterChain: forward above is a no-op.
+  // Phase 4B: V2 graph hot-swap implemented below.
+  // When VG_USE_V2_GRAPH=1 and schedulerV2 is active, rebuild the entire V2
+  // graph from the new filter chain and atomically swap the scheduler.
+  //
+  // Design: build-then-swap (no invalidation of old scheduler).
+  //   1. Build new graph via VGPlaybackGraphFactory.
+  //   2. Create new VGGraphExecutionContext + VGGraphSchedulerV2.
+  //   3. Wire sink and start new scheduler BEFORE delegate swap.
+  //   4. Atomically reassign renderer.frameDelegate to new scheduler.
+  //   5. ARC releases old scheduler when self.schedulerV2 is overwritten.
+  //
+  // NOTE: old scheduler is NOT invalidated. Invalidating it would call
+  // [_sourceNode stopProducing] on the same underlying VanguardFileMediaSource
+  // that the new graph shares, killing frame delivery. We rely on ARC + weak
+  // frameDelegate: after step 4 no new frames route to the old scheduler.
+  // _running on the old scheduler becomes irrelevant once frameDelegate is swapped.
+  //
+  // On rebuild failure: old scheduler kept active. No V1 fallback.
+#if VG_USE_V2_GRAPH
+  if (self.schedulerV2) {
+    // Guard: bail out if source or renderer is nil (pre-prepare or invalidated).
+    if (!self.source || !self.renderer) {
+      NSLog(@"[VanguardGraphRuntime] V2 hot-swap skipped: "
+            @"source=%@ renderer=%@ (pre-prepare or invalidated)",
+            self.source, self.renderer);
+    } else {
+      NSError *rebuildError = nil;
+      NSDictionary<NSString *, id> *newGraph =
+          [VGPlaybackGraphFactory buildGraphWithSource:self.source
+                                           filterChain:newChain
+                                              renderer:self.renderer
+                                                 error:&rebuildError];
+
+      if (!newGraph) {
+        // Rebuild failed — keep old V2 scheduler. Do NOT fall back to V1.
+        NSLog(@"[VanguardGraphRuntime] V2 graph rebuild failed: %@ "
+              @"— keeping current V2 scheduler", rebuildError);
+      } else {
+        // Rebuild succeeded — construct and wire new scheduler.
+        VGGraphDescriptor                  *newDesc    = newGraph[@"descriptor"];
+        NSDictionary<NSString *, id<VGNode>> *newNodes  = newGraph[@"nodes"];
+        VGExecutionPlan                    *newPlan    = newGraph[@"plan"];
+        VGResourceAllocator                *allocator  =
+            [VGResourceAllocator sharedInstance];
+
+        // Create new execution context.
+        VGGraphExecutionContext *newCtx =
+            [[VGGraphExecutionContext alloc] initWithDescriptor:newDesc
+                                                          plan:newPlan
+                                                         nodes:newNodes
+                                                         clock:self.masterClock
+                                             resourceAllocator:allocator];
+
+        // Create new V2 scheduler.
+        VGGraphSchedulerV2 *newScheduler =
+            [[VGGraphSchedulerV2 alloc] initWithPlan:newPlan
+                                               nodes:newNodes
+                                             context:newCtx];
+
+        // Wire sink: find VGFrameSink node in new node map.
+        id<VGFrameSink> newSink = nil;
+        for (id<VGNode> node in newNodes.allValues) {
+          if ([node conformsToProtocol:@protocol(VGFrameSink)]) {
+            newSink = (id<VGFrameSink>)node;
+            break;
+          }
+        }
+
+        if (!newSink) {
+          // No sink found — treat as rebuild failure. Old scheduler survives.
+          NSLog(@"[VanguardGraphRuntime] V2 hot-swap: no VGFrameSink in new graph "
+                @"— keeping current V2 scheduler");
+        } else {
+          newScheduler.sink = newSink;
+
+          // Start new scheduler (_running = YES) BEFORE swapping frameDelegate.
+          // startWithClock: sets _running=YES and calls [_sourceNode startProducing].
+          // VanguardFileMediaSource.start is idempotent (_started flag guard);
+          // safe to call while source is already running via old scheduler.
+          [newScheduler startWithClock:self.masterClock];
+
+          // ── ATOMIC SWAP ───────────────────────────────────────────────────
+          // renderer.frameDelegate is a weak property (VanguardMetalRenderer.h:147).
+          // ARC weak property assignment is atomic on ARM64 — thread-safe against
+          // a concurrent _onVideoFrame: call that loads _frameDelegate once.
+          //
+          // After this point, new frames route to newScheduler.
+          // Old scheduler receives no new frames (frameDelegate no longer points to it).
+          // Old scheduler released by ARC when self.schedulerV2 is overwritten below.
+          self.schedulerV2    = newScheduler;
+          self.executionContext = newCtx;
+          self.renderer.frameDelegate = newScheduler;
+          // (old scheduler and old context released by ARC here)
+
+          NSLog(@"[VanguardGraphRuntime] V2 graph hot-swapped "
+                @"(newExecOrderCount=%lu)",
+                (unsigned long)newPlan.topologicalOrder.count);
+        }
+      }
+    }
+  }
+#endif
 
   // ── Image-path re-apply (image sessions only) ──────────────────────────────
   // Independent of the video/scheduler path. Nil for video sessions.
