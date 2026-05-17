@@ -1345,26 +1345,119 @@ static BOOL VGRIsImageURL(NSURL *url) {
 /// Tier policy (mirrors VGPluginLifecycleObserver G-04 handler):
 ///   nominal / fair   → all nodes enabled
 ///   serious          → segmentation node(s) disabled; LUT and Beauty remain
-///   active critical         → all nodes disabled (chain stays in place; zero
-///   GPU work)
+///   critical         → all nodes disabled (chain stays in place; zero GPU work)
 ///
 /// Thread-safety: called from main thread via VGPluginLifecycleObserver
 /// (registered with queue: .main). node.enabled is @property (nonatomic,
 /// assign), but since the runtime chain is always accessed from the renderer's
 /// videoDecodeQueue for reads, and we only write from main here, the window for
 /// a data race is identical to the pre-existing _filterChainEnabled pattern
-/// in VanguardMetalRenderer (same queue contract). Acceptable in P3-3/P3-4;
-/// Phase 4 scheduler will own this coordination.
+/// in VanguardMetalRenderer (same queue contract). Acceptable in P3-3/P3-4.
+///
+/// Phase 4C: V2 path applies the identical algorithm directly to
+/// filterChainStorage nodes because VGLegacyFilterAdapter.enabled delegates
+/// to the wrapped VGMetalFilterNode, and VGGraphSchedulerV2 checks
+/// transform.enabled before processing (DEC-55). No graph rebuild required.
 - (void)setRuntimeThermalState:(NSProcessInfoThermalState)state {
-  // P4-9: Thermal policy now owned by VanguardGraphScheduler (cost-budget
+#if VG_USE_V2_GRAPH
+  if (self.schedulerV2) {
+    // Phase 4C: V2 thermal policy.
+    // Apply cost-budget directly to filterChainStorage nodes.
+    // VGGraphSchedulerV2 checks transform.enabled via VGLegacyFilterAdapter
+    // passthrough (VGGraphSchedulerV2.m:300, VGLegacyFilterAdapter.m:71-76).
+    // No graph rebuild or scheduler hot-swap is required.
+    [self _applyThermalBudgetToChain:self.filterChainStorage state:state];
+    return;
+  }
+#endif
+  // V1 path unchanged.
+  // P4-9: Thermal policy owned by VanguardGraphScheduler (cost-budget
   // model, DEC-55 / RR-33 closure). Runtime delegates unconditionally.
-  // The scheduler snapshots the chain, selects a tier budget, and disables
-  // nodes via estimatedGPUCostMs greedy-disable. No node iteration here.
   [self.scheduler applyThermalState:state];
 }
 
 // ─── Private helpers
 // ──────────────────────────────────────────────────────────
+
+// Phase 4C: V2 thermal cost-budget helper.
+//
+// Implements the identical 5-step algorithm from
+// VanguardGraphScheduler.applyThermalState: (lines 111-202), operating
+// directly on the VGMetalFilterNode objects in filterChainStorage.
+//
+// V2 path: VGLegacyFilterAdapter.enabled delegates to wrapped filter.enabled.
+// VGGraphSchedulerV2 checks transform.enabled and skips disabled nodes (DEC-55).
+//
+// Algorithm:
+//   1. Empty chain → no-op.
+//   2. Budget: Nominal/Fair → FLT_MAX, Serious → 5.0ms, Critical → 0.0ms.
+//   3. Enable all nodes.
+//   4. Compute totalCostMs.
+//   5. Greedy-disable most expensive first until totalCostMs <= budget.
+//
+// Thread-safety: same main-thread write / _videoDecodeQueue read window as V1.
+// No lock required — identical race profile to VanguardGraphScheduler.m:121-125.
+- (void)_applyThermalBudgetToChain:(NSArray<id<VGMetalFilterNode>> *)chain
+                             state:(NSProcessInfoThermalState)state {
+  if (!chain.count) {
+    NSLog(@"[VanguardGraphRuntime] V2 applyThermalBudget: empty chain — no-op");
+    return;
+  }
+
+  // ── 1. Select tier budget ────────────────────────────────────────────────
+  // Thresholds identical to VanguardGraphScheduler.m (P4-9, RR-33).
+  float budgetMs;
+  switch (state) {
+  case NSProcessInfoThermalStateNominal:
+  case NSProcessInfoThermalStateFair:
+    budgetMs = FLT_MAX;
+    break;
+  case NSProcessInfoThermalStateSerious:
+    budgetMs = 5.0f;
+    break;
+  case NSProcessInfoThermalStateCritical:
+    budgetMs = 0.0f;
+    break;
+  default:
+    NSLog(@"[VanguardGraphRuntime] V2 applyThermalBudget: unknown state %ld — no-op",
+          (long)state);
+    return;
+  }
+
+  // ── 2. Enable all nodes ──────────────────────────────────────────────────
+  for (id<VGMetalFilterNode> node in chain) {
+    node.enabled = YES;
+  }
+
+  // ── 3. Compute total estimated GPU cost ──────────────────────────────────
+  float totalCostMs = 0.0f;
+  for (id<VGMetalFilterNode> node in chain) {
+    totalCostMs += node.estimatedGPUCostMs;
+  }
+
+  // ── 4. Greedy disable: most expensive first until totalCost <= budget ────
+  if (totalCostMs > budgetMs) {
+    NSArray<id<VGMetalFilterNode>> *sorted =
+        [chain sortedArrayUsingComparator:^NSComparisonResult(
+                   id<VGMetalFilterNode> a, id<VGMetalFilterNode> b) {
+          float costA = a.estimatedGPUCostMs;
+          float costB = b.estimatedGPUCostMs;
+          if (costA > costB) return NSOrderedAscending;  // most expensive first
+          if (costA < costB) return NSOrderedDescending;
+          return NSOrderedSame;
+        }];
+
+    for (id<VGMetalFilterNode> node in sorted) {
+      if (totalCostMs <= budgetMs) break;
+      node.enabled  = NO;
+      totalCostMs  -= node.estimatedGPUCostMs;
+    }
+  }
+
+  NSLog(@"[VanguardGraphRuntime] V2 applyThermalBudget: state=%ld "
+        @"budget=%.1fms remaining=%.1fms nodes=%lu",
+        (long)state, budgetMs, totalCostMs, (unsigned long)chain.count);
+}
 
 // P4-8: Dealloc-path pool release.
 //

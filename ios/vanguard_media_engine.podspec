@@ -92,7 +92,9 @@ Pod::Spec.new do |s|
       'Tests/VGSchedulerParityTest.m',
       'Tests/VGAdapterParityTest.m',
       # Phase 4 Batch 4B: V2 setFilterChain hot-swap gate
-      'Tests/VGSchedulerV2ChainSwapTest.m'
+      'Tests/VGSchedulerV2ChainSwapTest.m',
+      # Phase 4C: V2 thermal policy gate
+      'Tests/VGSchedulerV2ThermalTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'
