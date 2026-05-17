@@ -35,6 +35,16 @@
 // Phase 4F: VGSegmentationNode — face detection + mask generation (DEC-100)
 #import "VGSegmentationNode.h"
 
+// Phase 4 Batch 3: V2 graph scheduler feature gate.
+// VGUseV2Graph.h is imported OUTSIDE any #if guard so the preprocessor can
+// read VG_USE_V2_GRAPH before encountering the guarded imports below.
+#import "VGUseV2Graph.h"
+#if VG_USE_V2_GRAPH
+#import "VGPlaybackGraphFactory.h"
+#import "VGGraphSchedulerV2.h"
+#import <UMF/VGGraphExecutionContext.h>
+#endif
+
 // UMF shared infrastructure
 #import <UMF/VGResourceAllocator.h>
 #import <stdatomic.h>
@@ -105,6 +115,14 @@ static BOOL VGRIsImageURL(NSURL *url) {
 // P4-3: Dormant scheduler. Created in prepareWithURL:, torn down in
 // invalidate/dealloc. Does NOT drive frame execution (that is P4-5+).
 @property(nonatomic, strong, nullable) VanguardGraphScheduler *scheduler;
+
+// Phase 4 Batch 3: V2 scheduler and execution context.
+// Only compiled and used when VG_USE_V2_GRAPH=1.
+// Both properties remain nil on the V1 path (VG_USE_V2_GRAPH=0).
+#if VG_USE_V2_GRAPH
+@property(nonatomic, strong, nullable) VGGraphSchedulerV2 *schedulerV2;
+@property(nonatomic, strong, nullable) VGGraphExecutionContext *executionContext;
+#endif
 
 @end
 
@@ -468,6 +486,90 @@ static BOOL VGRIsImageURL(NSURL *url) {
 
     // ── 6. Transition state ───────────────────────────────────────────────
 
+    // ── Phase 4 Batch 3: V2/V1 scheduler wiring gate ─────────────────────────
+    //
+    // When VG_USE_V2_GRAPH=1: try to build the V2 graph via VGPlaybackGraphFactory.
+    //   On success: wire VGGraphSchedulerV2 as renderer.frameDelegate and start.
+    //   On failure: fall back to V1 VanguardGraphScheduler (same as #else below).
+    // When VG_USE_V2_GRAPH=0: V1 path compiled exclusively (pre-Batch-3 behavior).
+#if VG_USE_V2_GRAPH
+    NSError *v2GraphError = nil;
+    NSDictionary<NSString *, id> *v2GraphResult =
+        [VGPlaybackGraphFactory buildGraphWithSource:self.source
+                                         filterChain:self.filterChainStorage
+                                            renderer:renderer
+                                               error:&v2GraphError];
+
+    if (v2GraphResult) {
+      // ── V2 SUCCESS: wire V2 scheduler ───────────────────────────────────
+      VGGraphDescriptor                  *v2Descriptor = v2GraphResult[@"descriptor"];
+      NSDictionary<NSString *, id<VGNode>> *v2Nodes    = v2GraphResult[@"nodes"];
+      VGExecutionPlan                    *v2Plan        = v2GraphResult[@"plan"];
+
+      // Create execution context (pure data container — no lifecycle calls).
+      VGGraphExecutionContext *v2Context =
+          [[VGGraphExecutionContext alloc] initWithDescriptor:v2Descriptor
+                                                        plan:v2Plan
+                                                       nodes:v2Nodes
+                                                       clock:self.masterClock
+                                           resourceAllocator:allocator];
+      self.executionContext = v2Context;
+
+      // Create V2 scheduler.
+      VGGraphSchedulerV2 *v2Scheduler =
+          [[VGGraphSchedulerV2 alloc] initWithPlan:v2Plan
+                                             nodes:v2Nodes
+                                           context:v2Context];
+      self.schedulerV2 = v2Scheduler;
+
+      // Wire sink: find the VGFrameSink node in the nodes map.
+      // VGRendererSinkAdapter conforms to VGFrameSink; found by protocol check.
+      for (id<VGNode> node in v2Nodes.allValues) {
+        if ([node conformsToProtocol:@protocol(VGFrameSink)]) {
+          v2Scheduler.sink = (id<VGFrameSink>)node;
+          break;
+        }
+      }
+
+      // Wire: renderer delivers raw frames to V2 scheduler.
+      renderer.frameDelegate = v2Scheduler;
+
+      // Start the V2 scheduler so _running = YES before the first frame arrives.
+      //
+      // startWithClock: sets _running=YES, calls [sourceNode startProducing],
+      // and transitions context to VGGraphStateRunning.
+      //
+      // startProducing → VGFileSourceAdapter → [source start].
+      // VanguardFileMediaSource.start is guarded by _started flag (idempotent).
+      // Frame delivery does NOT begin until VanguardMetalRenderer.play wires the
+      // CADisplayLink (_displayLinkFired → _renderFrameAtSourceTime:). So
+      // calling startWithClock: here is safe — no frame can arrive before play.
+      [v2Scheduler startWithClock:self.masterClock];
+
+      // V1 scheduler is NOT created on the V2 success path.
+      self.scheduler = nil;
+
+      NSLog(@"[VanguardGraphRuntime] V2 graph scheduler activated "
+            @"(VG_USE_V2_GRAPH=1, execOrderCount=%lu)",
+            (unsigned long)v2Plan.topologicalOrder.count);
+
+    } else {
+      // ── V2 FAILED: fall back to V1 scheduler ────────────────────────────
+      // VGPlaybackGraphFactory returned nil (validation or planning failure).
+      // Log and create the V1 scheduler identically to the #else path below.
+      NSLog(@"[VanguardGraphRuntime] V2 graph construction failed: %@ "
+            @"— falling back to V1 scheduler", v2GraphError);
+
+      self.scheduler = [[VanguardGraphScheduler alloc] init];
+      self.scheduler.sink = renderer;
+      renderer.frameDelegate = self.scheduler;
+      id<MTLDevice> schedulerDevice = allocator.metalDevice;
+      if (schedulerDevice) {
+        [self.scheduler startWithClock:self.masterClock device:schedulerDevice];
+      }
+    }
+#else
+    // ── V1 path (unchanged from pre-Batch-3) ─────────────────────────────
     // P4-3: Create scheduler. P4-5: Wire sink and delegate, then start.
     self.scheduler = [[VanguardGraphScheduler alloc] init];
 
@@ -487,6 +589,7 @@ static BOOL VGRIsImageURL(NSURL *url) {
     if (schedulerDevice) {
       [self.scheduler startWithClock:self.masterClock device:schedulerDevice];
     }
+#endif
 
     self.state = VGRuntimeStatePrepared;
     completion(tid, nil);
@@ -560,6 +663,16 @@ static BOOL VGRIsImageURL(NSURL *url) {
   // P4-3: Tear down dormant scheduler.
   [self.scheduler invalidate];
   self.scheduler = nil;
+
+  // Phase 4 Batch 3: Tear down V2 scheduler if active.
+  // When V1 path is active (VG_USE_V2_GRAPH=0 or V2 fallback), schedulerV2 is
+  // nil and [nil invalidate] is a no-op. When V2 path is active, scheduler is
+  // nil. Both teardown calls are unconditional — no runtime path check needed.
+#if VG_USE_V2_GRAPH
+  [self.schedulerV2 invalidate];
+  self.schedulerV2 = nil;
+  self.executionContext = nil;
+#endif
 
   self.state = VGRuntimeStateIdle;
 }
@@ -788,6 +901,13 @@ static BOOL VGRIsImageURL(NSURL *url) {
   // Forward to scheduler ONLY (P4-5: renderer no longer executes filters).
   // RR-31 CLOSED: setRuntimeFilterChain: renderer forward removed.
   [self.scheduler setFilterChain:newChain];
+
+  // Phase 4 Batch 3 note: V2 graph rebuild on filter chain change is deferred
+  // to Batch 4. The V2 scheduler operates with the filter chain snapshot from
+  // prepare time. Hot-swap filter chain changes take effect on the V1 scheduler
+  // path only ([self.scheduler setFilterChain:newChain] above).
+  // When VG_USE_V2_GRAPH=1 and schedulerV2 is active, self.scheduler is nil,
+  // so the V1 setFilterChain: forward above is a no-op.
 
   // ── Image-path re-apply (image sessions only) ──────────────────────────────
   // Independent of the video/scheduler path. Nil for video sessions.
@@ -1206,6 +1326,12 @@ static BOOL VGRIsImageURL(NSURL *url) {
   if (self.scheduler) {
     [self.scheduler invalidate];
   }
+  // Phase 4 Batch 3: V2 scheduler safety net.
+#if VG_USE_V2_GRAPH
+  if (self.schedulerV2) {
+    [self.schedulerV2 invalidate];
+  }
+#endif
 }
 
 @end
