@@ -87,7 +87,10 @@ Pod::Spec.new do |s|
       # Phase 4 P4-9: Cost-budget thermal policy gate — 3-node Phase 3 equivalence (plan:365, RR-33)
       'Tests/VGCostBudgetThermalTest.m',
       # Phase 4 P4-9: Cost-budget future-node scaling gate (plan:366, RR-33)
-      'Tests/VGCostBudgetFutureNodeTest.m'
+      'Tests/VGCostBudgetFutureNodeTest.m',
+      # Phase 4 Pre-4A: Pixel parity test infrastructure
+      'Tests/VGSchedulerParityTest.m',
+      'Tests/VGAdapterParityTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'
