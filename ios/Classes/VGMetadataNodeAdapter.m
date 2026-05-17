@@ -40,10 +40,16 @@
 // ─── VGNode — Port declaration ────────────────────────────────────────────────
 
 - (NSArray<VGMediaPort *> *)declaredPorts {
+    // Phase 3 corrective patch: added video_out.
+    // VGMetadataNodeAdapter is an inline video passthrough: enrichEnvelope:device:
+    // returns the same video payload with metadata enriched (§2.7 of Core DAG
+    // Architecture). video_out is required for valid VGGraphConnection chains.
     return @[
         [VGMediaPort inputPort:@"video_in"
                     mediaType:VGMediaTypeVideo
                      required:YES],
+        [VGMediaPort outputPort:@"video_out"
+                    mediaType:VGMediaTypeVideo],
         [VGMediaPort metadataOutputPort:@"metadata_out"
                                     key:@"com.vanguard.mask.skin"],
     ];
