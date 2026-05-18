@@ -106,7 +106,9 @@ Pod::Spec.new do |s|
       # Phase 5C-4: Pull export encoder sink gate
       'Tests/VGVideoEncoderSinkNodeTest.m',
       # Phase 5C-5: Full video export session integration
-      'Tests/VGVideoExportSessionTest.m'
+      'Tests/VGVideoExportSessionTest.m',
+      # Phase 5D-2: Image encoder sink gate
+      'Tests/VGImageEncoderSinkNodeTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'
