@@ -102,7 +102,9 @@ Pod::Spec.new do |s|
       # Phase 5C-2: Pull export file source gate
       'Tests/VGExportFileSourceNodePullTest.m',
       # Phase 5C-3: Pull export graph factory gate
-      'Tests/VGExportGraphFactoryTest.m'
+      'Tests/VGExportGraphFactoryTest.m',
+      # Phase 5C-4: Pull export encoder sink gate
+      'Tests/VGVideoEncoderSinkNodeTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'
