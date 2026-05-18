@@ -96,7 +96,9 @@ Pod::Spec.new do |s|
       # Phase 4C: V2 thermal policy gate
       'Tests/VGSchedulerV2ThermalTest.m',
       # Phase 5B: Encoder backward compatibility and hardening gate
-      'Tests/VGEncoderBackwardCompatTest.m'
+      'Tests/VGEncoderBackwardCompatTest.m',
+      # Phase 5C-1: Pull export scheduler skeleton gate
+      'Tests/VGExportSchedulerPullLoopTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'
