@@ -94,7 +94,9 @@ Pod::Spec.new do |s|
       # Phase 4 Batch 4B: V2 setFilterChain hot-swap gate
       'Tests/VGSchedulerV2ChainSwapTest.m',
       # Phase 4C: V2 thermal policy gate
-      'Tests/VGSchedulerV2ThermalTest.m'
+      'Tests/VGSchedulerV2ThermalTest.m',
+      # Phase 5B: Encoder backward compatibility and hardening gate
+      'Tests/VGEncoderBackwardCompatTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'
