@@ -100,7 +100,9 @@ Pod::Spec.new do |s|
       # Phase 5C-1: Pull export scheduler skeleton gate
       'Tests/VGExportSchedulerPullLoopTest.m',
       # Phase 5C-2: Pull export file source gate
-      'Tests/VGExportFileSourceNodePullTest.m'
+      'Tests/VGExportFileSourceNodePullTest.m',
+      # Phase 5C-3: Pull export graph factory gate
+      'Tests/VGExportGraphFactoryTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO'
     ts.dependency    'UMF'
