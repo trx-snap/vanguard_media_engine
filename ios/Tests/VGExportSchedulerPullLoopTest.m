@@ -58,6 +58,56 @@ static CVPixelBufferRef VGES_MakeBuffer(uint8_t fill) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - VGES_SlowInfinitePullSource
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A pull source that sleeps 0.5ms per frame and never terminates naturally.
+/// Used in cancel/invalidate tests to guarantee the cancel dispatch (50ms) fires
+/// while the loop is still running, even on fast hardware.
+@interface VGES_SlowInfinitePullSource : NSObject <VGSourceNode>
+// Buffer is test-owned (+1), not retained by this source.
+@end
+
+@implementation VGES_SlowInfinitePullSource {
+    NSString        *_nodeId;
+    CVPixelBufferRef _buffer; // +1 owned by test; this class does not retain/release
+}
+- (instancetype)initWithBuffer:(CVPixelBufferRef)buf {
+    self = [super init];
+    _nodeId = @"vges_slow_source";
+    _buffer = buf;
+    return self;
+}
+- (NSString *)nodeId    { return _nodeId; }
+- (NSString *)nodeClass { return @"VGES_SlowInfinitePullSource"; }
+- (VGNodeRole)nodeRole  { return VGNodeRoleSource; }
+- (NSArray<VGMediaPort *> *)declaredPorts {
+    return @[ [VGMediaPort outputPort:@"video_out" mediaType:VGMediaTypeVideo] ];
+}
+- (void)prepareWithContext:(VGGraphExecutionContext *)ctx
+                completion:(void (^)(NSError *_Nullable))c {
+    if (c) c(nil);
+}
+- (void)invalidate {}
+- (nullable VGMediaFormat *)negotiateFormatForPort:(NSString *)p
+                                       inputFormats:(NSDictionary<NSString *, VGMediaFormat *> *)f { return nil; }
+- (void)startProducing {}
+- (void)stopProducing  {}
+- (void)seekTo:(CMTime)t generation:(uint64_t)g {}
+- (VGFrameResult *)pullFrame:(VGFrameRequest *)request {
+    if (request.isCancelled) return [VGFrameResult skippedWithGeneration:request.generation];
+    usleep(500); // 0.5ms — guarantees 50ms cancel fires before ~100 frames
+    VGFrameEnvelope env;
+    memset(&env, 0, sizeof(env));
+    env.payload.videoBuffer = _buffer;
+    env.mediaType           = VGMediaTypeVideo;
+    env.pts                 = kCMTimeZero;
+    env.generation          = request.generation;
+    return [VGFrameResult deliveredWithEnvelope:env generation:request.generation];
+}
+@end
+
+// ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - VGES_MockPullSource
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -234,7 +284,7 @@ static CVPixelBufferRef VGES_MakeBuffer(uint8_t fill) {
 
 /// Build a VGExportScheduler with the given mock components.
 /// topoOrder: source nodeId → transform nodeIds → metadata nodeIds → sink nodeId
-static VGExportScheduler *VGES_BuildScheduler(VGES_MockPullSource *source,
+static VGExportScheduler *VGES_BuildScheduler(id<VGSourceNode> source,
                                                NSArray<VGES_MockTransform *> *transforms,
                                                NSArray<VGES_MockMetadataNode *> *metaNodes,
                                                VGES_SinkSpy *sink,
@@ -253,7 +303,12 @@ static VGExportScheduler *VGES_BuildScheduler(VGES_MockPullSource *source,
 
     VGExecutionPlan *plan = [[VGExecutionPlan alloc] initWithTopologicalOrder:topo
                                                                parallelGroups:@[]];
-    VGGraphDescriptor *desc = [[VGGraphDescriptor alloc] init];
+    VGGraphDescriptor *desc = [[VGGraphDescriptor alloc]
+        initWithGraphId:@"vges_testGraph"
+                  nodes:@[]
+            connections:@[]
+            clockPolicy:VGClockPolicyPull
+           audioSidecar:nil];
     VGGraphExecutionContext *ctx =
         [[VGGraphExecutionContext alloc] initWithDescriptor:desc
                                                        plan:plan
@@ -398,15 +453,10 @@ static VGExportScheduler *VGES_BuildScheduler(VGES_MockPullSource *source,
 // ─── TC-5C1-5: cancelExport stops loop and completion fires ──────────────────
 
 - (void)testTC5C1_5_cancelExportStopsLoopAndCompletionFires {
-    VGES_MockPullSource *source = [VGES_MockPullSource new];
-    // 1000 delivered results — enough to keep the loop running.
-    NSMutableArray *results = [NSMutableArray new];
-    for (int i = 0; i < 1000; i++) {
-        [results addObject:[VGES_MockPullSource deliveredResultWithBuffer:_testBuffer
-                                                                generation:1]];
-    }
-    source.results = results;
-
+    // VGES_SlowInfinitePullSource sleeps 0.5ms per pull — guarantees the 50ms
+    // cancel dispatch fires while the loop is running on any hardware.
+    VGES_SlowInfinitePullSource *source = [[VGES_SlowInfinitePullSource alloc]
+                                           initWithBuffer:_testBuffer];
     VGES_SinkSpy *sink = [VGES_SinkSpy new];
     VGExportScheduler *sched = VGES_BuildScheduler(source, @[], @[], sink, 30);
 
@@ -434,13 +484,10 @@ static VGExportScheduler *VGES_BuildScheduler(VGES_MockPullSource *source,
 // ─── TC-5C1-6: invalidate is idempotent and prevents double completion ────────
 
 - (void)testTC5C1_6_invalidateIsIdempotentAndPreventsDoubleCompletion {
-    VGES_MockPullSource *source = [VGES_MockPullSource new];
-    NSMutableArray *results = [NSMutableArray new];
-    for (int i = 0; i < 1000; i++) {
-        [results addObject:[VGES_MockPullSource deliveredResultWithBuffer:_testBuffer
-                                                                generation:1]];
-    }
-    source.results = results;
+    // VGES_SlowInfinitePullSource sleeps 0.5ms per pull — guarantees the 50ms
+    // invalidate dispatch fires while the loop is still running.
+    VGES_SlowInfinitePullSource *source = [[VGES_SlowInfinitePullSource alloc]
+                                           initWithBuffer:_testBuffer];
 
     VGES_SinkSpy *sink = [VGES_SinkSpy new];
     VGExportScheduler *sched = VGES_BuildScheduler(source, @[], @[], sink, 30);

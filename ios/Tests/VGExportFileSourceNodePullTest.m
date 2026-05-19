@@ -142,24 +142,24 @@ static NSURL * _Nullable VGEFS_CreateTestAsset(NSUInteger frameCount,
 static VGGraphExecutionContext * _Nullable VGEFS_MakeContext(void) {
     // Build a minimal descriptor (pull-mode; no nodes needed for source tests).
     VGGraphDescriptor *desc = [[VGGraphDescriptor alloc]
-        initWithClockPolicy:VGClockPolicyPull
-           admissionPolicies:@{}
-                  layoutHint:VGGraphLayoutHintLinear];
+        initWithGraphId:@"vgefs_testGraph"
+                  nodes:@[]
+            connections:@[]
+            clockPolicy:VGClockPolicyPull
+           audioSidecar:nil];
 
     VGExecutionPlan *plan = [[VGExecutionPlan alloc]
         initWithTopologicalOrder:@[]
                   parallelGroups:@[]];
-
-    VGResourceAllocator *alloc = [[VGResourceAllocator alloc]
-        initWithDevice:nil poolConfig:nil];
 
     return [[VGGraphExecutionContext alloc]
         initWithDescriptor:desc
                       plan:plan
                      nodes:@{}
                      clock:nil
-         resourceAllocator:alloc];
+         resourceAllocator:[VGResourceAllocator sharedInstance]];
 }
+
 
 /// Creates a VGFrameRequest for pull-mode tests with generation 0.
 static VGFrameRequest *VGEFS_MakeRequest(uint64_t generation, BOOL cancelled) {

@@ -23,7 +23,7 @@
 #import <UMF/VGGraphDescriptor.h>
 #import <UMF/VGExecutionPlan.h>
 #import <UMF/VGResourceAllocator.h>
-#import <UMF/VGMasterClock.h>
+#import <UMF/VGRetainedBuffer.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Test fixtures
@@ -69,24 +69,22 @@ static VGGraphExecutionContext *VGESN_MakeContext(void) {
            audioSidecar:nil];
     VGExecutionPlan *plan = [[VGExecutionPlan alloc]
         initWithTopologicalOrder:@[]
-                    sinkNodeIds:@[]
-                  sourceNodeIds:@[]];
-    VGResourceAllocator *alloc = [[VGResourceAllocator alloc] init];
-    VGMasterClock *clock = [[VGMasterClock alloc] init];
+                  parallelGroups:@[]];
     return [[VGGraphExecutionContext alloc]
         initWithDescriptor:desc
-                      plan:plan
-         resourceAllocator:alloc
-               masterClock:clock];
+                       plan:plan
+                      nodes:@{}
+                      clock:nil
+          resourceAllocator:[VGResourceAllocator sharedInstance]];
 }
 
-/// Makes a minimal offline VGExportProfile for 16×16 testing.
+/// Makes a minimal offline VGExportProfile for 128×128 testing.
 static VGExportProfile *VGESN_MakeProfile(void) {
     return [[VGExportProfile alloc]
         initWithCodecType:kCMVideoCodecType_H264
-             profileLevel:(__bridge NSString *)kVTProfileLevel_H264_Baseline_4_0
-                    width:16
-                   height:16
+             profileLevel:(__bridge NSString *)kVTProfileLevel_H264_High_AutoLevel
+                    width:128
+                   height:128
                bitrateBps:100000
                       fps:30
       maxKeyFrameInterval:0
@@ -228,7 +226,7 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
     // Node not prepared — invalidate immediately, then present.
     [_sut invalidate];
 
-    CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(16, 16);
+    CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(128, 128);
     VGFrameEnvelope env = VGESN_MakeEnvelope(pb, 0);
     XCTAssertNoThrow([_sut presentEnvelope:env],
                      @"TC-5C4-09: presentEnvelope on invalidated node must not crash");
@@ -248,7 +246,7 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
     }];
     [self waitForExpectationsWithTimeout:5.0 handler:nil];
 
-    CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(16, 16);
+    CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(128, 128);
     VGFrameEnvelope env = VGESN_MakeEnvelope(pb, 0);
     [_sut presentEnvelope:env];
     if (pb) CVPixelBufferRelease(pb);
@@ -272,7 +270,7 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
     [self waitForExpectationsWithTimeout:5.0 handler:nil];
 
     NSInteger before = _sut.framesSubmitted;
-    CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(16, 16);
+    CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(128, 128);
     VGFrameEnvelope env = VGESN_MakeEnvelope(pb, 0);
 
     // presentEnvelope: is synchronous and blocking — by the time it returns,
@@ -299,7 +297,7 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
 
     const NSInteger kFrameCount = 5;
     for (NSInteger i = 0; i < kFrameCount; i++) {
-        CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(16, 16);
+        CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(128, 128);
         VGFrameEnvelope env = VGESN_MakeEnvelope(pb, (int)i);
         [_sut presentEnvelope:env];
         if (pb) CVPixelBufferRelease(pb);
@@ -315,7 +313,7 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
 
 - (void)testTC_5C4_13_VGRetainedBufferImported {
     // VGRetainedBuffer must be importable and usable (proves DEC-V2-010 compliance).
-    CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(16, 16);
+    CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(128, 128);
     XCTAssertNotEqual(pb, (CVPixelBufferRef)NULL, @"TC-5C4-13: fixture must return non-NULL buffer");
     // Wrap it directly to verify VGRetainedBuffer is available.
     VGRetainedBuffer *retained __attribute__((objc_precise_lifetime)) =
@@ -327,8 +325,6 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
     // retained released by ARC — verifies +1 retain pattern
 }
 
-// Import VGRetainedBuffer for TC-5C4-13
-#import <UMF/VGRetainedBuffer.h>
 
 // ─── TC-5C4-14: no double-signal on success ───────────────────────────────────
 // After one presentEnvelope: the framesSubmitted count is exactly 1.
@@ -346,13 +342,13 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
     [self waitForExpectationsWithTimeout:5.0 handler:nil];
 
     // Submit frame 0.
-    CVPixelBufferRef pb0 = VGESN_CreateTestPixelBuffer(16, 16);
+    CVPixelBufferRef pb0 = VGESN_CreateTestPixelBuffer(128, 128);
     [_sut presentEnvelope:VGESN_MakeEnvelope(pb0, 0)];
     CVPixelBufferRelease(pb0);
     XCTAssertEqual(_sut.framesSubmitted, 1, @"TC-5C4-14: After frame 0: count=1");
 
     // Submit frame 1 — if semaphore leaked, this would return before timeout.
-    CVPixelBufferRef pb1 = VGESN_CreateTestPixelBuffer(16, 16);
+    CVPixelBufferRef pb1 = VGESN_CreateTestPixelBuffer(128, 128);
     [_sut presentEnvelope:VGESN_MakeEnvelope(pb1, 1)];
     CVPixelBufferRelease(pb1);
     XCTAssertEqual(_sut.framesSubmitted, 2, @"TC-5C4-14: After frame 1: count=2");
@@ -371,7 +367,7 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
 
     // Submit a few frames.
     for (int i = 0; i < 3; i++) {
-        CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(16, 16);
+        CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(128, 128);
         [_sut presentEnvelope:VGESN_MakeEnvelope(pb, i)];
         CVPixelBufferRelease(pb);
     }
@@ -393,7 +389,7 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
     [self waitForExpectationsWithTimeout:5.0 handler:nil];
 
     for (int i = 0; i < 3; i++) {
-        CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(16, 16);
+        CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(128, 128);
         [_sut presentEnvelope:VGESN_MakeEnvelope(pb, i)];
         CVPixelBufferRelease(pb);
     }
@@ -415,7 +411,7 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
     [self waitForExpectationsWithTimeout:5.0 handler:nil];
 
     for (int i = 0; i < 3; i++) {
-        CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(16, 16);
+        CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(128, 128);
         [_sut presentEnvelope:VGESN_MakeEnvelope(pb, i)];
         CVPixelBufferRelease(pb);
     }
@@ -437,7 +433,7 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
     [self waitForExpectationsWithTimeout:5.0 handler:nil];
 
     for (int i = 0; i < 3; i++) {
-        CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(16, 16);
+        CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(128, 128);
         [_sut presentEnvelope:VGESN_MakeEnvelope(pb, i)];
         CVPixelBufferRelease(pb);
     }
@@ -446,8 +442,8 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
     VGExportManifest *manifest = [_sut finalizeExportWithError:&err];
     XCTAssertNotNil(manifest, @"TC-5C4-18: manifest must not be nil: %@", err);
     XCTAssertEqualObjects(manifest.codec, @"h264", @"TC-5C4-18: codec must be h264");
-    XCTAssertEqual(manifest.width, 16, @"TC-5C4-18: width must match profile");
-    XCTAssertEqual(manifest.height, 16, @"TC-5C4-18: height must match profile");
+    XCTAssertEqual(manifest.width, 128, @"TC-5C4-18: width must match profile");
+    XCTAssertEqual(manifest.height, 128, @"TC-5C4-18: height must match profile");
 }
 
 // ─── TC-5C4-19: no VGGraphSchedulerV2 coupling ───────────────────────────────
@@ -481,7 +477,7 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
     [self waitForExpectationsWithTimeout:5.0 handler:nil];
 
     for (int i = 0; i < 5; i++) {
-        CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(16, 16);
+        CVPixelBufferRef pb = VGESN_CreateTestPixelBuffer(128, 128);
         [_sut presentEnvelope:VGESN_MakeEnvelope(pb, i)];
         CVPixelBufferRelease(pb);
     }

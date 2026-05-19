@@ -7,6 +7,7 @@
 #import <XCTest/XCTest.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
+#import <VideoToolbox/VideoToolbox.h>
 
 #import "VGVideoExportSession.h"
 #import <UMF/VGExportProfile.h>
@@ -94,13 +95,13 @@ static NSURL *VGVES_TempOutputURL(void) {
     return [NSURL fileURLWithPath:path];
 }
 
-/// Makes a minimal offline VGExportProfile for 16×16 testing.
+/// Makes a minimal offline VGExportProfile for 128×128 testing.
 static VGExportProfile *VGVES_MakeProfile(void) {
     return [[VGExportProfile alloc]
         initWithCodecType:kCMVideoCodecType_H264
-             profileLevel:(__bridge NSString *)kVTProfileLevel_H264_Baseline_4_0
-                    width:16
-                   height:16
+             profileLevel:(__bridge NSString *)kVTProfileLevel_H264_High_AutoLevel
+                    width:128
+                   height:128
                bitrateBps:100000
                       fps:30
       maxKeyFrameInterval:0
@@ -149,7 +150,7 @@ static VGExportManifest * _Nullable VGVES_RunExportSync(VGVideoExportSession *se
     [super setUp];
     _dstURL    = VGVES_TempOutputURL();
     _profile   = VGVES_MakeProfile();
-    _srcURL    = VGVES_CreateTestAsset(3, CGSizeMake(16, 16), 30.0);
+    _srcURL    = VGVES_CreateTestAsset(3, CGSizeMake(128, 128), 30.0);
     if (_srcURL) {
         _testAsset = [AVURLAsset URLAssetWithURL:_srcURL options:nil];
     }
@@ -308,8 +309,8 @@ static VGExportManifest * _Nullable VGVES_RunExportSync(VGVideoExportSession *se
     VGExportManifest *manifest = VGVES_RunExportSync(s, nil);
 
     XCTAssertNotNil(manifest, @"TC-5C5-11: manifest required");
-    XCTAssertEqual(manifest.width,  16, @"TC-5C5-11: width must be 16");
-    XCTAssertEqual(manifest.height, 16, @"TC-5C5-11: height must be 16");
+    XCTAssertEqual(manifest.width,  128, @"TC-5C5-11: width must be 128");
+    XCTAssertEqual(manifest.height, 128, @"TC-5C5-11: height must be 128");
 }
 
 // ─── TC-5C5-12: manifest fps matches profile ──────────────────────────────────

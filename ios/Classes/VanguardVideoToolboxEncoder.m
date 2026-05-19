@@ -269,7 +269,12 @@ static void vtOutputCallback(void *outputCallbackRefCon,
     CFRelease(secLimit);
     CFRelease(dataRateLimits);
 
-    VTCompressionSessionPrepareToEncodeFrames(_session);
+    OSStatus prepErr = VTCompressionSessionPrepareToEncodeFrames(_session);
+    if (prepErr != noErr) {
+        NSLog(@"[VanguardEncoder] VTCompressionSessionPrepareToEncodeFrames failed: %d (dims=%dx%d)",
+              (int)prepErr, _width, _height);
+        return prepErr;
+    }
     return noErr;
 }
 
