@@ -83,8 +83,9 @@
     // [_session startRunning] on the AVCaptureSession. The session then
     // begins delivering frames via captureOutput:didOutputSampleBuffer:
     // on _captureQueue (.userInteractive, serial).
-    // VanguardCameraMediaSource.start asserts the session is not already running
-    // (I-2 guard) — the caller must ensure stop was called before re-starting.
+    // VanguardCameraMediaSource.start is idempotent.
+    // During V2 graph hot-swap, a new source adapter may call start on the already-running shared source.
+    // That call is expected to be a safe no-op.
     [self.source start];
 }
 

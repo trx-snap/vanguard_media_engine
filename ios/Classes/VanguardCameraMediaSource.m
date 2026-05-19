@@ -317,16 +317,11 @@ static const char kCaptureQueueKey = 0;
 #pragma mark - VanguardMediaSource — start / stop
 
 - (void)start {
-  // I-2 GUARD: exactly one AVCaptureSession may run at a time.
-  // If _session is already running a second start() call indicates a lifecycle
-  // bug — the previous camera was not stopped before creating a new one.
-  NSAssert(!_session.isRunning,
-      @"[VanguardCamera] INVARIANT I-2 VIOLATION: start() called on a session "
-      @"that is already running. Stop the previous camera before starting a new one.");
   if (_session.isRunning) {
-    NSLog(@"[VanguardCamera] WARNING: start() called on running session — ignored.");
+    NSLog(@"[VanguardCamera] start — session already running, idempotent no-op.");
     return;
   }
+
   NSLog(@"[VanguardCamera] start — session initialising");
   [_session startRunning];
   NSLog(@"[VanguardCamera] start — session running=%d", _session.isRunning);
