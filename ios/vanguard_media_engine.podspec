@@ -35,7 +35,13 @@ Pod::Spec.new do |s|
     'OTHER_LDFLAGS'                                           => '$(inherited) -weak_framework Flutter',
     # Compile C++ as C++17
     'OTHER_CPLUSPLUSFLAGS'                                    => '$(inherited) -std=c++17',
-    'EXCLUDED_ARCHS[sdk=iphonesimulator*]'                    => 'i386'
+    'EXCLUDED_ARCHS[sdk=iphonesimulator*]'                    => 'i386',
+    # Tie Objective-C and Swift camera graph flags together with standard Xcode resolution
+    'VG_USE_CAMERA_GRAPH'                                     => '0',
+    'GCC_PREPROCESSOR_DEFINITIONS'                            => '$(inherited) VG_USE_CAMERA_GRAPH=$(VG_USE_CAMERA_GRAPH)',
+    'OTHER_SWIFT_FLAGS_0'                                     => '$(inherited)',
+    'OTHER_SWIFT_FLAGS_1'                                     => '$(inherited) -DVG_USE_CAMERA_GRAPH',
+    'OTHER_SWIFT_FLAGS'                                       => '$(OTHER_SWIFT_FLAGS_$(VG_USE_CAMERA_GRAPH))'
   }
 
   # user_target_xcconfig: UMF header search path removed — UMF headers now
@@ -117,7 +123,9 @@ Pod::Spec.new do |s|
       'Tests/VGAudioOnlyExporterTest.m',
       # Phase 6A-1: Camera graph foundation unit tests
       'Tests/VGFanOutSinkTest.m',
-      'Tests/VGCameraGraphFactoryTest.m'
+      'Tests/VGCameraGraphFactoryTest.m',
+      # Phase 6A-2: Camera graph session unit tests
+      'Tests/VGCameraGraphSessionTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage'
     ts.dependency    'UMF'

@@ -113,6 +113,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // P3-T4: Camera source + streaming encoder (streaming path, not AVAssetWriter)
     var cameraSource: VanguardCameraMediaSource?
     var streamingEncoder: VanguardVideoToolboxEncoder?
+    #if VG_USE_CAMERA_GRAPH
+    var cameraGraphSession: VGCameraGraphSession?
+    #endif
 
     // Phase 2 Step 6: session registry is the unconditional playback path.
     // All createTexture / play / pause / seekTo / dispose calls route here.
@@ -168,7 +171,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // Synchronous camera teardown path — used only when no recording
             // is active (e.g. startCamera teardown). If a recording is active,
             // callers MUST use teardownCameraAsync(completion:) instead.
+            #if VG_USE_CAMERA_GRAPH
+            if let session = cameraGraphSession {
+                session.invalidate()
+                cameraGraphSession = nil
+            } else {
+                cameraSource?.stop()
+            }
+            #else
             cameraSource?.stop()
+            #endif
             cameraSource = nil
             streamingEncoder?.finish()
             streamingEncoder?.invalidate()
@@ -215,7 +227,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 self?.channel.invokeMethod("onRecordingError",
                                            arguments: ["message": error.localizedDescription])
             }
+            #if VG_USE_CAMERA_GRAPH
+            if let session = self?.cameraGraphSession {
+                session.invalidate()
+                self?.cameraGraphSession = nil
+            } else {
+                source.stop()
+            }
+            #else
             source.stop()
+            #endif
             self?.cameraSource = nil
             encoder?.finish()
             encoder?.invalidate()
@@ -1224,7 +1245,22 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                                                         methodChannel: self.channel,
                                                         sessionPool: nil)
                     self.renderers[renderer.textureId] = renderer
+                    #if VG_USE_CAMERA_GRAPH
+                    var graphStarted = false
+                    do {
+                        let session = try VGCameraGraphSession(source: src, renderer: renderer)
+                        self.cameraGraphSession = session
+                        graphStarted = true
+                        NSLog("[VanguardPlugin] VGCameraGraphSession initialized and started successfully.")
+                    } catch {
+                        NSLog("[VanguardPlugin] VGCameraGraphSession initialization failed: \(error.localizedDescription)")
+                    }
+                    if !graphStarted {
+                        src.start()
+                    }
+                    #else
                     src.start()
+                    #endif
                     result(renderer.textureId)
                 }
                 return
@@ -1265,7 +1301,22 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                                                  methodChannel: channel,
                                                  sessionPool: nil)
             renderers[renderer.textureId] = renderer
+            #if VG_USE_CAMERA_GRAPH
+            var graphStarted = false
+            do {
+                let session = try VGCameraGraphSession(source: src, renderer: renderer)
+                cameraGraphSession = session
+                graphStarted = true
+                NSLog("[VanguardPlugin] VGCameraGraphSession initialized and started successfully.")
+            } catch {
+                NSLog("[VanguardPlugin] VGCameraGraphSession initialization failed: \(error.localizedDescription)")
+            }
+            if !graphStarted {
+                src.start()
+            }
+            #else
             src.start()
+            #endif
             result(renderer.textureId)
 
         case "stopCamera":
@@ -1282,7 +1333,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(nil)
                 return
             }
+            #if VG_USE_CAMERA_GRAPH
+            if let session = cameraGraphSession {
+                session.invalidate()
+                cameraGraphSession = nil
+            } else {
+                cameraSource?.stop()
+            }
+            #else
             cameraSource?.stop()
+            #endif
             cameraSource = nil
             streamingEncoder?.invalidate()
             streamingEncoder = nil
