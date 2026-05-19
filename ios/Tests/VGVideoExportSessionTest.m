@@ -17,7 +17,7 @@
 #pragma mark - Test fixtures
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Creates a tiny H.264 16x16 MP4 with frameCount solid-color frames at fps.
+/// Creates a tiny H.264 128×128 MP4 with frameCount solid-color frames at fps.
 /// AVAssetWriter is test-only — not used in production code.
 static NSURL * _Nullable VGVES_CreateTestAsset(NSUInteger frameCount,
                                                 CGSize size,

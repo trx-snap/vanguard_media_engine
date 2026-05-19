@@ -117,7 +117,7 @@ static NSString * const kSinkNodeId   = @"imageSink";
     void (^_completion)(VGImageExportManifest * _Nullable, NSError * _Nullable);
     _Atomic(int32_t) _completionFired;   // 0 → 1 via CAS
     _Atomic(BOOL)    _cancelledAtomic;
-    _Atomic(BOOL)    _startedAtomic;
+    _Atomic(int32_t) _startedAtomic;  // 0 → 1 via CAS (int32_t matches _completionFired pattern)
     _Atomic(BOOL)    _finishedAtomic;
 }
 
@@ -141,7 +141,7 @@ static NSString * const kSinkNodeId   = @"imageSink";
 
     atomic_init(&_completionFired,  0);
     atomic_init(&_cancelledAtomic,  NO);
-    atomic_init(&_startedAtomic,    NO);
+    atomic_init(&_startedAtomic,    0);
     atomic_init(&_finishedAtomic,   NO);
 
     _exportQueue = dispatch_queue_create(
@@ -180,7 +180,7 @@ static NSString * const kSinkNodeId   = @"imageSink";
 
     // Single-use gate: CAS 0→1.
     int32_t expected = 0;
-    if (!atomic_compare_exchange_strong(&_startedAtomic, (BOOL *)&expected, YES)) {
+    if (!atomic_compare_exchange_strong(&_startedAtomic, &expected, 1)) {
         // Already started — do not fire completion again.
         return;
     }

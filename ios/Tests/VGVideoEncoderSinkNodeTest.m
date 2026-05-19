@@ -465,7 +465,7 @@ static VGFrameEnvelope VGESN_MakeEnvelope(CVPixelBufferRef pb, int frameIndex) {
 
 // ─── TC-5C4-20: sourceFormatHint used (lazy writer input pattern) ─────────────
 // Structural: verifies that the output file's video track format matches
-// the encoder config (H.264 16x16). If sourceFormatHint were missing or wrong,
+// the encoder config (H.264 128×128). If sourceFormatHint were missing or wrong,
 // the output format would be inconsistent.
 
 - (void)testTC_5C4_20_outputVideoTrackPresent {

@@ -64,12 +64,9 @@ static NSURL *VGAOE_CreateSineWave(double durationSec, float sampleRate, int cha
     CMBlockBufferRef bb = NULL;
     CMBlockBufferCreateWithMemoryBlock(NULL, buf, dataSize, kCFAllocatorNull,
                                        NULL, 0, dataSize, 0, &bb);
-    CMSampleBufferRef sb = NULL;
-    CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-        NULL, bb, CMAudioFormatDescriptionCreate(NULL, &asbd, 0, NULL, 0, NULL, NULL, NULL) ? nil : nil,
-        numSamples, kCMTimeZero, NULL, &sb);
 
     // Simpler: use CMSampleBufferCreate
+
     CMFormatDescriptionRef fmt = NULL;
     CMAudioFormatDescriptionCreate(NULL, &asbd, 0, NULL, 0, NULL, NULL, &fmt);
     CMSampleTimingInfo timing = { CMTimeMake(1, (int32_t)sampleRate), kCMTimeZero, kCMTimeInvalid };
