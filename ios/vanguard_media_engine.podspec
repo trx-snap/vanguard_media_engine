@@ -114,7 +114,10 @@ Pod::Spec.new do |s|
       # Phase 5D-3: Image export session integration gate
       'Tests/VGImageExportSessionTest.m',
       # Phase 5E-2: Audio-only export gate
-      'Tests/VGAudioOnlyExporterTest.m'
+      'Tests/VGAudioOnlyExporterTest.m',
+      # Phase 6A-1: Camera graph foundation unit tests
+      'Tests/VGFanOutSinkTest.m',
+      'Tests/VGCameraGraphFactoryTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage'
     ts.dependency    'UMF'
