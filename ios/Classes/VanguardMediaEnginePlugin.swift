@@ -1319,6 +1319,58 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             #endif
             result(renderer.textureId)
 
+        case "setCameraFilterChain":
+            #if VG_USE_CAMERA_GRAPH
+            guard let session = cameraGraphSession else {
+                result(FlutterError(
+                    code: "NO_CAMERA_GRAPH",
+                    message: "Camera graph session is not running.",
+                    details: nil
+                ))
+                return
+            }
+
+            guard let filterDicts = args?["filters"] as? [[String: Any]] else {
+                result(FlutterError(
+                    code: "BAD_ARGS",
+                    message: "setCameraFilterChain expects filters: [[String: Any]].",
+                    details: nil
+                ))
+                return
+            }
+
+            if filterDicts.isEmpty {
+                session.setCameraFilterChain(nil)
+                result(nil)
+                return
+            }
+
+            let knownTypes: Set<String> = ["lut", "beauty", "segmentation"]
+            for dict in filterDicts {
+                let type = dict["type"] as? String ?? ""
+                if !knownTypes.contains(type) {
+                    result(FlutterError(
+                        code: "UNKNOWN_FILTER",
+                        message: "Unknown filter type: \(type)",
+                        details: nil
+                    ))
+                    return
+                }
+            }
+
+            result(FlutterError(
+                code: "UNSUPPORTED_CAMERA_FILTER_RESOURCE_CONTRACT",
+                message: "No camera filter can be safely constructed without a resource/dimension contract.",
+                details: nil
+            ))
+            #else
+            result(FlutterError(
+                code: "GRAPH_MODE_DISABLED",
+                message: "Camera graph mode is disabled. Build with VG_USE_CAMERA_GRAPH=1.",
+                details: nil
+            ))
+            #endif
+
         case "stopCamera":
             // IDEMPOTENCY FIX: stopCamera may be called a second time by
             // VanguardCameraView.dispose() after navigation to the story editor

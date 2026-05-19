@@ -8,6 +8,7 @@ import 'package:ffi/ffi.dart';
 // P1B-09: Dart layer for the opt-in graph-runtime path.
 import 'vg_playback_client.dart';
 import 'vg_playback_session.dart';
+import 'vg_filter_spec.dart';
 
 export 'vanguard_texture_view.dart';
 export 'vanguard_media_preparer.dart';
@@ -403,6 +404,24 @@ class VanguardEngine {
   /// Call in the widget's dispose() or on back-navigation.
   static Future<void> stopCamera() async {
     await _cameraChannel.invokeMethod<void>('stopCamera');
+  }
+
+  /// Sets the active camera filter chain.
+  ///
+  /// Requires VG_USE_CAMERA_GRAPH=1.
+  /// Empty list clears filters (swaps back to passthrough).
+  /// Current step may return UNSUPPORTED_CAMERA_FILTER_RESOURCE_CONTRACT if no safe no-pool filter exists.
+  ///
+  /// PlatformException codes:
+  /// - 'GRAPH_MODE_DISABLED' if camera graph mode is disabled.
+  /// - 'NO_CAMERA_GRAPH' if the camera graph session is not running.
+  /// - 'BAD_ARGS' if filters parameters are malformed.
+  /// - 'UNKNOWN_FILTER' if the filter type is unrecognized.
+  /// - 'UNSUPPORTED_CAMERA_FILTER_RESOURCE_CONTRACT' if a filter cannot be safely constructed without a resource/dimension contract.
+  static Future<void> setCameraFilterChain(List<VGFilterSpec> filters) async {
+    await _cameraChannel.invokeMethod<void>('setCameraFilterChain', {
+      'filters': filters.map((f) => f.toJson()).toList(),
+    });
   }
 
   /// Swaps to the given sensor without tearing down the session (~150 ms).
