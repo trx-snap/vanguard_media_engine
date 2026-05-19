@@ -119,6 +119,9 @@
             return;
         }
 
+        NSLog(@"[VGCameraGraphSession] setCameraFilterChain: filterChain.count=%lu",
+              (unsigned long)(filterChain.count ?: 0));
+
         VanguardMetalRenderer *renderer = self->_renderer;
         if (!self->_source || !renderer) {
             NSLog(@"[VGCameraGraphSession] setCameraFilterChain skipped — source=%@ renderer=%@",

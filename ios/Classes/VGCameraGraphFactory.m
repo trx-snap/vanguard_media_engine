@@ -24,6 +24,7 @@
 #import <UMF/VGSinkAdmissionPolicy.h>
 #import <UMF/VGNode.h>
 #import <UMF/VGValidationError.h>
+#import <UMF/VGMetalFilterNode.h>
 
 // ─── Wrapped V1 classes ───────────────────────────────────────────────────────
 #import "VGSegmentationNode.h"
@@ -71,10 +72,15 @@
             VGMetadataNodeAdapter *mAdapter =
                 [[VGMetadataNodeAdapter alloc] initWithSegmentationNode:(VGSegmentationNode *)filter];
             [filterAdapters addObject:mAdapter];
-        } else {
+        } else if ([filter conformsToProtocol:@protocol(VGMetalFilterNode)] ||
+                   [filter respondsToSelector:@selector(processEnvelope:device:)]) {
             VGLegacyFilterAdapter *lAdapter =
                 [[VGLegacyFilterAdapter alloc] initWithFilter:filter];
             [filterAdapters addObject:lAdapter];
+        } else {
+            NSLog(@"[VGCameraGraphFactory] buildCameraGraph: skipping unrecognised "
+                  @"filter (class=%@) — does not conform to VGMetalFilterNode or "
+                  @"VGSegmentationNode", [filter class]);
         }
     }
 
