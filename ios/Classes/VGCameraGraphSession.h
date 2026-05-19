@@ -40,6 +40,31 @@ NS_ASSUME_NONNULL_BEGIN
 /// state, and releases retained graph resources.
 - (void)invalidate;
 
+/// Rebuilds the camera graph with the given filter chain and swaps the active
+/// scheduler.
+///
+/// Phase 6A-3A structural proof only:
+/// - intended for unit-level graph rebuild/hot-swap validation
+/// - not yet exposed to Flutter/Dart
+/// - not yet product-proven for live camera filter effects
+///
+/// Uses build-then-swap:
+/// 1. constructs a new graph via VGCameraGraphFactory
+/// 2. creates a new VGGraphSchedulerV2
+/// 3. wires the fan_out_sink
+/// 4. starts the new scheduler
+/// 5. swaps renderer.frameDelegate to the new scheduler
+///
+/// The old scheduler is NOT invalidated because it shares the underlying camera
+/// source. Invalidating it would stop the shared AVCaptureSession.
+///
+/// Thread-safe: serialized internally via a dedicated dispatch queue.
+/// No-op after invalidate has been called.
+///
+/// @param filterChain Ordered list of filter nodes. nil or empty means
+///                    passthrough graph.
+- (void)setCameraFilterChain:(nullable NSArray *)filterChain;
+
 /// Static helper mapping the compile-time feature flag VG_USE_CAMERA_GRAPH to a runtime check.
 + (BOOL)isGraphModeEnabled;
 

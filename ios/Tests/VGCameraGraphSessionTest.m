@@ -117,4 +117,59 @@
     XCTAssertEqual(err2.code, 100);
 }
 
+- (void)testCameraFilterChainHotSwap {
+    NSError *error = nil;
+    VGCameraGraphSession *session = [[VGCameraGraphSession alloc]
+        initWithSource:(VanguardCameraMediaSource *)_mockSource
+              renderer:(VanguardMetalRenderer *)_mockRenderer
+                  error:&error];
+
+    XCTAssertNotNil(session, @"Session creation must succeed");
+    XCTAssertNil(error);
+
+    // 1. session initializes, 2. initial frameDelegate exists
+    id<VGFrameDelegate> initialDelegate = _mockRenderer.frameDelegate;
+    XCTAssertNotNil(initialDelegate, @"Initial frameDelegate must exist");
+    
+    // Verify source started initially
+    XCTAssertTrue(_mockSource.startCalled, @"Source must be started initially");
+    XCTAssertFalse(_mockSource.stopCalled, @"Source must not be stopped initially");
+    
+    // Reset mock tracking flags to check that hot-swap doesn't stop the source
+    _mockSource.startCalled = NO;
+    _mockSource.stopCalled = NO;
+
+    // 3. setCameraFilterChain:nil hot-swaps to a new delegate/scheduler
+    [session setCameraFilterChain:nil];
+    id<VGFrameDelegate> secondDelegate = _mockRenderer.frameDelegate;
+    XCTAssertNotNil(secondDelegate, @"Second frameDelegate must exist after hot-swap with nil");
+    XCTAssertNotEqual(initialDelegate, secondDelegate, @"Hot-swap with nil must produce a new delegate");
+    
+    // Verify mock source was NOT stopped during hot-swap
+    XCTAssertFalse(_mockSource.stopCalled, @"Mock source must not be stopped during hot-swap");
+
+    // 4. setCameraFilterChain:@[] hot-swaps again
+    [session setCameraFilterChain:@[]];
+    id<VGFrameDelegate> thirdDelegate = _mockRenderer.frameDelegate;
+    XCTAssertNotNil(thirdDelegate, @"Third frameDelegate must exist after hot-swap with empty array");
+    XCTAssertNotEqual(secondDelegate, thirdDelegate, @"Hot-swap with empty array must produce a new delegate");
+    
+    // 5. multiple hot-swaps produce distinct delegates/schedulers
+    XCTAssertNotEqual(initialDelegate, thirdDelegate, @"Multiple hot-swaps must produce distinct delegates");
+    XCTAssertFalse(_mockSource.stopCalled, @"Mock source must not be stopped during second hot-swap");
+
+    // 6. after invalidate, setCameraFilterChain is a no-op and does not crash
+    [session invalidate];
+    XCTAssertNil(_mockRenderer.frameDelegate, @"Renderer's frameDelegate must be cleared after invalidate");
+    XCTAssertTrue(_mockSource.stopCalled, @"Mock source must be stopped on invalidate");
+
+    // Reset stopCalled to check no-op behavior
+    _mockSource.stopCalled = NO;
+    
+    // Hot-swap after invalidate
+    XCTAssertNoThrow([session setCameraFilterChain:nil], @"Hot-swap after invalidate must not crash");
+    XCTAssertNil(_mockRenderer.frameDelegate, @"Renderer's frameDelegate must remain nil after invalidate");
+    XCTAssertFalse(_mockSource.stopCalled, @"Source stop must not be called again");
+}
+
 @end

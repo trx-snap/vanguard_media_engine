@@ -25,6 +25,7 @@
     VGGraphExecutionContext *_context;
     NSDictionary<NSString *, id<VGNode>> *_nodes;
     _Atomic(BOOL) _invalidated;
+    dispatch_queue_t _sessionQueue;
 }
 
 - (nullable instancetype)initWithSource:(VanguardCameraMediaSource *)source
@@ -51,6 +52,8 @@
     _source = source;
     _renderer = renderer;
     atomic_init(&_invalidated, NO);
+    _sessionQueue = dispatch_queue_create("com.vanguard.cameraGraphSession",
+                                          DISPATCH_QUEUE_SERIAL);
 
     // ── (b) Build the camera graph via factory ────────────────────────────────
     NSError *graphError = nil;
@@ -110,28 +113,91 @@
     return self;
 }
 
-- (void)invalidate {
-    // Thread-safe and idempotent guard
-    if (atomic_exchange(&_invalidated, YES)) {
-        return;
-    }
-
-    // Clear renderer's frameDelegate to prevent any further frame callbacks to the scheduler.
-    VanguardMetalRenderer *renderer = _renderer;
-    if (renderer) {
-        if (renderer.frameDelegate == _scheduler) {
-            renderer.frameDelegate = nil;
+- (void)setCameraFilterChain:(nullable NSArray *)filterChain {
+    dispatch_sync(_sessionQueue, ^{
+        if (atomic_load(&self->_invalidated)) {
+            return;
         }
-    }
 
-    // Invalidate the scheduler (stops frame production, invalidates nodes)
-    [_scheduler invalidate];
+        VanguardMetalRenderer *renderer = self->_renderer;
+        if (!self->_source || !renderer) {
+            NSLog(@"[VGCameraGraphSession] setCameraFilterChain skipped — source=%@ renderer=%@",
+                  self->_source, renderer);
+            return;
+        }
 
-    // Break retain cycles and release resources
-    _scheduler = nil;
-    _context = nil;
-    _nodes = nil;
-    _source = nil;
+        NSError *rebuildError = nil;
+        NSDictionary<NSString *, id> *newGraph =
+            [VGCameraGraphFactory buildCameraGraphWithSource:self->_source
+                                                 filterChain:filterChain
+                                                    renderer:renderer
+                                                       error:&rebuildError];
+        if (!newGraph) {
+            NSLog(@"[VGCameraGraphSession] setCameraFilterChain rebuild failed: %@ — keeping current scheduler",
+                  rebuildError);
+            return;
+        }
+
+        VGGraphDescriptor *newDesc = newGraph[@"descriptor"];
+        NSDictionary<NSString *, id<VGNode>> *newNodes = newGraph[@"nodes"];
+        VGExecutionPlan *newPlan = newGraph[@"plan"];
+
+        id<VGFrameSink> newSink = (id<VGFrameSink>)newNodes[@"fan_out_sink"];
+        if (!newSink) {
+            NSLog(@"[VGCameraGraphSession] setCameraFilterChain fan_out_sink missing — keeping current scheduler");
+            return;
+        }
+
+        VGGraphExecutionContext *newCtx =
+            [[VGGraphExecutionContext alloc] initWithDescriptor:newDesc
+                                                           plan:newPlan
+                                                          nodes:newNodes
+                                                          clock:nil
+                                              resourceAllocator:[VGResourceAllocator sharedInstance]];
+
+        VGGraphSchedulerV2 *newScheduler =
+            [[VGGraphSchedulerV2 alloc] initWithPlan:newPlan
+                                               nodes:newNodes
+                                             context:newCtx];
+        newScheduler.sink = newSink;
+
+        // Structural proof only. startWithClock:nil starts the new scheduler.
+        // Do NOT invalidate the old scheduler here because it would stop the
+        // shared camera source.
+        [newScheduler startWithClock:nil];
+
+        renderer.frameDelegate = newScheduler;
+
+        self->_scheduler = newScheduler;
+        self->_context = newCtx;
+        self->_nodes = newNodes;
+
+        NSLog(@"[VGCameraGraphSession] setCameraFilterChain hot-swap complete (filterCount=%lu execOrder=%lu)",
+              (unsigned long)(filterChain.count ?: 0),
+              (unsigned long)newPlan.topologicalOrder.count);
+    });
+}
+
+- (void)invalidate {
+    dispatch_sync(_sessionQueue, ^{
+        if (atomic_exchange(&self->_invalidated, YES)) {
+            return;
+        }
+
+        VanguardMetalRenderer *renderer = self->_renderer;
+        if (renderer) {
+            if (renderer.frameDelegate == self->_scheduler) {
+                renderer.frameDelegate = nil;
+            }
+        }
+
+        [self->_scheduler invalidate];
+
+        self->_scheduler = nil;
+        self->_context = nil;
+        self->_nodes = nil;
+        self->_source = nil;
+    });
 }
 
 + (BOOL)isGraphModeEnabled {
