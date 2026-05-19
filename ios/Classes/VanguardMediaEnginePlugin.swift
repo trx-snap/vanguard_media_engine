@@ -72,6 +72,26 @@ final class VanguardThumbnailGenerator {
     }
 }
 
+// ─── P4-Remote: URL resolver ──────────────────────────────────────────────────
+// Resolves a caller-supplied path string into a URL for Vanguard playback.
+//   http:// | https:// | file://  → URL(string:) — preserves the scheme
+//   bare local path               → URL(fileURLWithPath:) — unchanged behaviour
+// Returns nil for an empty or syntactically invalid remote string, which the
+// call-site surfaces as FlutterError(code:"INVALID_URL",...) so the caller
+// receives a clean failure rather than a silently corrupted file:// URL.
+internal extension URL {
+    static func resolveVanguardPath(_ path: String) -> URL? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.hasPrefix("http://") ||
+           trimmed.hasPrefix("https://") ||
+           trimmed.hasPrefix("file://") {
+            return URL(string: trimmed)
+        }
+        return URL(fileURLWithPath: trimmed)
+    }
+}
+
 // ─── Plugin ───────────────────────────────────────────────────────────────────
 
 public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
@@ -231,7 +251,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // Camera teardown runs first if needed so AVAudioSession is free.
             let _createTextureViaRegistry = { [weak self] in
                 guard let self else { return }
-                let url = URL(fileURLWithPath: path)
+                // P4-Remote: resolve local paths and http(s):// remote URLs.
+                // URL(fileURLWithPath:) would silently corrupt a remote URL string
+                // into an invalid file:// path. resolveVanguardPath preserves the
+                // scheme for remote URLs while leaving local paths unchanged.
+                guard let url = URL.resolveVanguardPath(path) else {
+                    result(FlutterError(code: "INVALID_URL",
+                                        message: "createTexture: invalid or empty URL: \(path)",
+                                        details: nil))
+                    return
+                }
                 // Capture sessionId in a local var; assigned synchronously by
                 // createSession before its async completion ever fires.
                 var sid = ""

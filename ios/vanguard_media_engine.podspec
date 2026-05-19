@@ -58,6 +58,8 @@ Pod::Spec.new do |s|
       # Phase 1B test files (P1B-02: ObjC runtime lifecycle, P1B-04: Swift registry)
       'Tests/VGGraphRuntimeLifecycleTest.m',
       'Tests/VGSessionRegistryTest.swift',
+      # Phase 4 P4-Remote: URL resolution unit tests
+      'Tests/VanguardURLResolutionTest.swift',
       # Phase 4 P4-3: Runtime scheduler integration gate
       'Tests/VGRuntimeSchedulerIntegrationTest.m',
       # Phase 4 P4-4: Renderer GPU-sink entry point gate
