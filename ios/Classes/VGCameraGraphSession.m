@@ -17,6 +17,14 @@
 #import <UMF/VGNode.h>
 #import <UMF/VGFrameSink.h>
 #import <stdatomic.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreMedia/CoreMedia.h>
+
+@interface VGCameraGraphSession ()
+- (BOOL)_queryDimensionsWidth:(size_t *)outWidth height:(size_t *)outHeight;
+- (id)_sessionPool;
+- (NSUInteger)_sessionPoolBytes;
+@end
 
 @implementation VGCameraGraphSession {
     VanguardCameraMediaSource *_source;
@@ -26,6 +34,8 @@
     NSDictionary<NSString *, id<VGNode>> *_nodes;
     _Atomic(BOOL) _invalidated;
     dispatch_queue_t _sessionQueue;
+    CVPixelBufferPoolRef _sessionPool;
+    NSUInteger _sessionPoolBytes;
 }
 
 - (nullable instancetype)initWithSource:(VanguardCameraMediaSource *)source
@@ -54,6 +64,30 @@
     atomic_init(&_invalidated, NO);
     _sessionQueue = dispatch_queue_create("com.vanguard.cameraGraphSession",
                                           DISPATCH_QUEUE_SERIAL);
+    _sessionPool = NULL;
+    _sessionPoolBytes = 0;
+
+    size_t width = 0;
+    size_t height = 0;
+    if ([self _queryDimensionsWidth:&width height:&height]) {
+        VGResourceAllocator *allocator = [VGResourceAllocator sharedInstance];
+        NSUInteger poolBytes = width * height * 4 * 3;
+        BOOL budgetReserved = [allocator canAllocatePoolBytes:poolBytes];
+        if (budgetReserved) {
+            _sessionPoolBytes = poolBytes;
+        } else {
+            NSLog(@"[VGCameraGraphSession] WARNING: Budget reservation of %lu bytes failed. Creating pool anyway.", (unsigned long)poolBytes);
+            _sessionPoolBytes = 0;
+        }
+        _sessionPool = [allocator pixelBufferPoolWithWidth:width
+                                                    height:height
+                                                    format:kCVPixelFormatType_32BGRA
+                                        minimumBufferCount:3];
+    } else {
+        NSLog(@"[VGCameraGraphSession] No camera dimensions available from source.");
+        _sessionPool = NULL;
+        _sessionPoolBytes = 0;
+    }
 
     // ── (b) Build the camera graph via factory ────────────────────────────────
     NSError *graphError = nil;
@@ -196,11 +230,101 @@
 
         [self->_scheduler invalidate];
 
+        if (self->_sessionPool) {
+            CVPixelBufferPoolRelease(self->_sessionPool);
+            self->_sessionPool = NULL;
+        }
+        if (self->_sessionPoolBytes > 0) {
+            [[VGResourceAllocator sharedInstance] reportPoolReleased:self->_sessionPoolBytes];
+            self->_sessionPoolBytes = 0;
+        }
+
         self->_scheduler = nil;
         self->_context = nil;
         self->_nodes = nil;
         self->_source = nil;
     });
+}
+
+- (void)dealloc {
+    if (_sessionPool) {
+        CVPixelBufferPoolRelease(_sessionPool);
+        _sessionPool = NULL;
+    }
+    if (_sessionPoolBytes > 0) {
+        [[VGResourceAllocator sharedInstance] reportPoolReleased:_sessionPoolBytes];
+        _sessionPoolBytes = 0;
+    }
+}
+
+- (BOOL)_queryDimensionsWidth:(size_t *)outWidth height:(size_t *)outHeight {
+    if (![_source respondsToSelector:@selector(captureSession)]) {
+        return NO;
+    }
+    AVCaptureSession *session = _source.captureSession;
+    if (!session) {
+        return NO;
+    }
+    
+    AVCaptureDevice *device = nil;
+    for (AVCaptureInput *input in session.inputs) {
+        if ([input isKindOfClass:[AVCaptureDeviceInput class]]) {
+            AVCaptureDeviceInput *deviceInput = (AVCaptureDeviceInput *)input;
+            if ([deviceInput.device hasMediaType:AVMediaTypeVideo]) {
+                device = deviceInput.device;
+                break;
+            }
+        }
+    }
+    if (!device) {
+        return NO;
+    }
+    
+    AVCaptureVideoDataOutput *videoOutput = nil;
+    for (AVCaptureOutput *output in session.outputs) {
+        if ([output isKindOfClass:[AVCaptureVideoDataOutput class]]) {
+            videoOutput = (AVCaptureVideoDataOutput *)output;
+            break;
+        }
+    }
+    if (!videoOutput) {
+        return NO;
+    }
+    
+    CMVideoFormatDescriptionRef formatDesc = device.activeFormat.formatDescription;
+    if (!formatDesc) {
+        return NO;
+    }
+    
+    CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(formatDesc);
+    size_t width = dims.width;
+    size_t height = dims.height;
+    
+    AVCaptureConnection *connection = [videoOutput connectionWithMediaType:AVMediaTypeVideo];
+    if (connection) {
+        if (connection.videoOrientation == AVCaptureVideoOrientationPortrait ||
+            connection.videoOrientation == AVCaptureVideoOrientationPortraitUpsideDown) {
+            size_t temp = width;
+            width = height;
+            height = temp;
+        }
+    }
+    
+    if (width == 0 || height == 0) {
+        return NO;
+    }
+    
+    if (outWidth) *outWidth = width;
+    if (outHeight) *outHeight = height;
+    return YES;
+}
+
+- (id)_sessionPool {
+    return (__bridge id)_sessionPool;
+}
+
+- (NSUInteger)_sessionPoolBytes {
+    return _sessionPoolBytes;
 }
 
 + (BOOL)isGraphModeEnabled {
