@@ -1,8 +1,9 @@
 // VGCameraGraphSession.m
-// vanguard_media_engine — Phase 6A-2
+// vanguard_media_engine — Phase 6A-2 / Phase 6A-3D-2
 //
 // Implementation of VGCameraGraphSession.
-//
+// Phase 6A-3D-2 adds setCameraFilterChainFromSpecs:error: — Beauty V1 construction
+// from Dart/plugin specs using the session-owned pool and Metal device.
 
 #import "VGCameraGraphSession.h"
 #import "VGUseCameraGraph.h"
@@ -11,6 +12,7 @@
 #import "VGFanOutSink.h"
 #import "VanguardCameraMediaSource.h"
 #import "VanguardMetalRenderer.h"
+#import "VanguardBeautyFilterNode.h"
 
 #import <UMF/VGGraphExecutionContext.h>
 #import <UMF/VGResourceAllocator.h>
@@ -213,6 +215,166 @@
               (unsigned long)(filterChain.count ?: 0),
               (unsigned long)newPlan.topologicalOrder.count);
     });
+}
+
+// ─── Phase 6A-3D-2: Spec-driven filter construction ──────────────────────────
+//
+// Three-pass atomic validation:
+//   Pass 1 — resource contract: pool and Metal device must exist.
+//   Pass 2 — known-type check: every spec type must be in {beauty, lut, segmentation}.
+//   Pass 3 — constructable check: type must be camera-constructable in this phase.
+// Only after all three passes succeed are nodes constructed and the graph mutated.
+//
+// Known-but-unsupported types (lut, segmentation, beautyVersion:2) return
+// UNSUPPORTED_FILTER_TYPE without mutating the graph.
+// Unknown types return UNKNOWN_FILTER.
+// Missing pool/device returns UNSUPPORTED_CAMERA_FILTER_RESOURCE_CONTRACT.
+
+- (BOOL)setCameraFilterChainFromSpecs:(NSArray<NSDictionary *> *)specs
+                                error:(NSError * _Nullable * _Nullable)outError
+{
+    if (outError) *outError = nil;
+
+    // ── Empty specs: clear to passthrough ────────────────────────────────────
+    if (!specs || specs.count == 0) {
+        [self setCameraFilterChain:nil];
+        return YES;
+    }
+
+    // ── Pass 1: resource contract ─────────────────────────────────────────────
+    id<MTLDevice> metalDevice = [VGResourceAllocator sharedInstance].metalDevice;
+    if (_sessionPool == NULL || !metalDevice) {
+        if (outError) {
+            *outError = [NSError
+                errorWithDomain:@"UNSUPPORTED_CAMERA_FILTER_RESOURCE_CONTRACT"
+                           code:1
+                       userInfo:@{
+                NSLocalizedDescriptionKey:
+                    @"Camera filter construction requires a session pool and Metal device. "
+                     "Pool or device is unavailable."
+            }];
+        }
+        NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: resource contract "
+               "not satisfied (pool=%p device=%@)", _sessionPool, metalDevice);
+        return NO;
+    }
+
+    // ── Pass 2: known-type check ──────────────────────────────────────────────
+    static NSSet<NSString *> *knownTypes;
+    static dispatch_once_t knownTypesToken;
+    dispatch_once(&knownTypesToken, ^{
+        knownTypes = [NSSet setWithObjects:@"beauty", @"lut", @"segmentation", nil];
+    });
+
+    for (NSDictionary *spec in specs) {
+        NSString *type = spec[@"type"];
+        if (![type isKindOfClass:[NSString class]] || ![knownTypes containsObject:type]) {
+            NSString *badType = [type isKindOfClass:[NSString class]] ? type : @"(nil)";
+            if (outError) {
+                *outError = [NSError
+                    errorWithDomain:@"UNKNOWN_FILTER"
+                               code:2
+                           userInfo:@{
+                    NSLocalizedDescriptionKey:
+                        [NSString stringWithFormat:@"Unknown filter type: %@", badType]
+                }];
+            }
+            NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: unknown type '%@'",
+                  badType);
+            return NO;
+        }
+    }
+
+    // ── Pass 3: constructable check ───────────────────────────────────────────
+    //
+    // Phase 6A-3D-2: only beauty V1 is constructable.
+    // lut and segmentation are known but deferred.
+    // beauty with beautyVersion:2 is known but deferred.
+    for (NSDictionary *spec in specs) {
+        NSString *type = spec[@"type"];
+        NSDictionary *params = spec[@"parameters"];
+
+        if ([type isEqualToString:@"lut"]) {
+            if (outError) {
+                *outError = [NSError
+                    errorWithDomain:@"UNSUPPORTED_FILTER_TYPE"
+                               code:3
+                           userInfo:@{
+                    NSLocalizedDescriptionKey:
+                        @"Filter type 'lut' is not yet supported for the camera graph."
+                }];
+            }
+            NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: lut deferred");
+            return NO;
+        }
+
+        if ([type isEqualToString:@"segmentation"]) {
+            if (outError) {
+                *outError = [NSError
+                    errorWithDomain:@"UNSUPPORTED_FILTER_TYPE"
+                               code:3
+                           userInfo:@{
+                    NSLocalizedDescriptionKey:
+                        @"Filter type 'segmentation' is not yet supported for the camera graph."
+                }];
+            }
+            NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: segmentation deferred");
+            return NO;
+        }
+
+        if ([type isEqualToString:@"beauty"]) {
+            // beautyVersion:2 is deferred.
+            if ([params[@"beautyVersion"] isKindOfClass:[NSNumber class]] &&
+                [params[@"beautyVersion"] integerValue] == 2) {
+                if (outError) {
+                    *outError = [NSError
+                        errorWithDomain:@"UNSUPPORTED_FILTER_TYPE"
+                                   code:3
+                               userInfo:@{
+                        NSLocalizedDescriptionKey:
+                            @"Beauty V2 is not yet supported for the camera graph."
+                    }];
+                }
+                NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: beautyV2 deferred");
+                return NO;
+            }
+            // beauty V1 — will be constructed below.
+        }
+    }
+
+    // ── All specs valid: construct nodes ──────────────────────────────────────
+    //
+    // Only reached after all three validation passes succeed.
+    NSMutableArray<id<VGMetalFilterNode>> *nodes =
+        [NSMutableArray arrayWithCapacity:specs.count];
+
+    for (NSDictionary *spec in specs) {
+        NSString *type   = spec[@"type"];
+        NSDictionary *params = spec[@"parameters"];
+
+        // Default enabled=YES when key is absent (Dart default).
+        BOOL enabled = (spec[@"enabled"] != nil) ? [spec[@"enabled"] boolValue] : YES;
+
+        if ([type isEqualToString:@"beauty"]) {
+            VanguardBeautyFilterNode *beauty =
+                [[VanguardBeautyFilterNode alloc] initWithPool:_sessionPool
+                                                        device:metalDevice];
+            if ([params[@"intensity"] isKindOfClass:[NSNumber class]]) {
+                beauty.intensity = [params[@"intensity"] floatValue];
+            }
+            beauty.enabled = enabled;
+            [nodes addObject:(id<VGMetalFilterNode>)beauty];
+        }
+        // Additional constructable types will be added in future phases.
+    }
+
+    NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: constructed %lu node(s)",
+          (unsigned long)nodes.count);
+
+    // Delegate to the existing hot-swap method — it handles graph rebuild,
+    // scheduler swap, and renderer delegate rewiring.
+    [self setCameraFilterChain:nodes];
+    return YES;
 }
 
 - (void)invalidate {

@@ -65,6 +65,39 @@ NS_ASSUME_NONNULL_BEGIN
 ///                    passthrough graph.
 - (void)setCameraFilterChain:(nullable NSArray *)filterChain;
 
+/// Constructs filter nodes from Dart/plugin specs and applies them to the camera graph.
+///
+/// Validates all specs atomically before constructing any nodes.
+/// If any spec fails validation the method returns NO and does NOT mutate the graph.
+///
+/// Supported:
+///   - "beauty" (V1 only — no beautyVersion key, or beautyVersion:1).
+///
+/// Known but unsupported (returns UNSUPPORTED_FILTER_TYPE):
+///   - "beauty" with beautyVersion:2
+///   - "lut"
+///   - "segmentation"
+///
+/// Unknown (returns UNKNOWN_FILTER):
+///   - Any type string not in {beauty, lut, segmentation}.
+///
+/// Resource unavailable (returns UNSUPPORTED_CAMERA_FILTER_RESOURCE_CONTRACT):
+///   - _sessionPool is NULL or metalDevice is nil at call time.
+///
+/// Empty specs array clears the filter chain (passthrough). Returns YES.
+///
+/// Validation is atomic: the graph is mutated only when every spec passes.
+///
+/// @param specs    Array of filter spec dictionaries. Each must contain "type" (NSString).
+///                 Optional keys: "parameters" (NSDictionary), "enabled" (NSNumber/BOOL).
+/// @param outError On failure, set to an NSError whose domain is the error code string:
+///                   "UNKNOWN_FILTER"
+///                   "UNSUPPORTED_FILTER_TYPE"
+///                   "UNSUPPORTED_CAMERA_FILTER_RESOURCE_CONTRACT"
+/// @return YES on success (filter chain applied or cleared), NO on any validation failure.
+- (BOOL)setCameraFilterChainFromSpecs:(NSArray<NSDictionary *> *)specs
+                                error:(NSError * _Nullable * _Nullable)outError;
+
 /// Static helper mapping the compile-time feature flag VG_USE_CAMERA_GRAPH to a runtime check.
 + (BOOL)isGraphModeEnabled;
 
