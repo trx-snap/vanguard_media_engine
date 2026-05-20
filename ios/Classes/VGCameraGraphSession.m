@@ -13,6 +13,7 @@
 #import "VanguardCameraMediaSource.h"
 #import "VanguardMetalRenderer.h"
 #import "VanguardBeautyFilterNode.h"
+#import "BeautyV2FilterGroup.h"
 
 #import <UMF/VGGraphExecutionContext.h>
 #import <UMF/VGResourceAllocator.h>
@@ -323,22 +324,8 @@
         }
 
         if ([type isEqualToString:@"beauty"]) {
-            // beautyVersion:2 is deferred.
-            if ([params[@"beautyVersion"] isKindOfClass:[NSNumber class]] &&
-                [params[@"beautyVersion"] integerValue] == 2) {
-                if (outError) {
-                    *outError = [NSError
-                        errorWithDomain:@"UNSUPPORTED_FILTER_TYPE"
-                                   code:3
-                               userInfo:@{
-                        NSLocalizedDescriptionKey:
-                            @"Beauty V2 is not yet supported for the camera graph."
-                    }];
-                }
-                NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: beautyV2 deferred");
-                return NO;
-            }
-            // beauty V1 — will be constructed below.
+            // beautyVersion:2 is now constructable in Phase 6A-3E-V2.
+            // beauty V1 (default/no key) remains the production path.
         }
     }
 
@@ -356,14 +343,34 @@
         BOOL enabled = (spec[@"enabled"] != nil) ? [spec[@"enabled"] boolValue] : YES;
 
         if ([type isEqualToString:@"beauty"]) {
-            VanguardBeautyFilterNode *beauty =
-                [[VanguardBeautyFilterNode alloc] initWithPool:_sessionPool
-                                                        device:metalDevice];
-            if ([params[@"intensity"] isKindOfClass:[NSNumber class]]) {
-                beauty.intensity = [params[@"intensity"] floatValue];
+            BOOL wantV2 = [params[@"beautyVersion"] isKindOfClass:[NSNumber class]] &&
+                          [params[@"beautyVersion"] integerValue] == 2;
+
+            if (wantV2) {
+                // ── Beauty V2 path (Phase 6A-3E-V2) ──────────────────────────
+                // BeautyV2FilterGroup owns its own intermediate pools;
+                // borrows _sessionPool for final output only (matches runtime pattern).
+                BeautyV2FilterGroup *v2 =
+                    [[BeautyV2FilterGroup alloc] initWithPool:_sessionPool
+                                                       device:metalDevice];
+                if (v2) {
+                    if ([params[@"intensity"] isKindOfClass:[NSNumber class]]) {
+                        v2.intensity = [params[@"intensity"] floatValue];
+                    }
+                    v2.enabled = enabled;
+                    [nodes addObject:(id<VGMetalFilterNode>)v2];
+                }
+            } else {
+                // ── Beauty V1 path (default) ──────────────────────────────────
+                VanguardBeautyFilterNode *beauty =
+                    [[VanguardBeautyFilterNode alloc] initWithPool:_sessionPool
+                                                            device:metalDevice];
+                if ([params[@"intensity"] isKindOfClass:[NSNumber class]]) {
+                    beauty.intensity = [params[@"intensity"] floatValue];
+                }
+                beauty.enabled = enabled;
+                [nodes addObject:(id<VGMetalFilterNode>)beauty];
             }
-            beauty.enabled = enabled;
-            [nodes addObject:(id<VGMetalFilterNode>)beauty];
         }
         // Additional constructable types will be added in future phases.
     }

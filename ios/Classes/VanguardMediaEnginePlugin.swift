@@ -1361,18 +1361,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // Phase 6A-3D-2: delegate non-empty specs to session for atomic
             // validation and Beauty V1 construction. The session method returns
             // an NSError whose domain is the FlutterError code string.
-            let specs = filterDicts.map { $0 as NSDictionary }
-            var constructionError: NSError?
-            let success = session.setCameraFilterChainFromSpecs(
-                specs,
-                error: &constructionError
-            )
-            if success {
+            do {
+                try session.setCameraFilterChainFromSpecs(filterDicts)
                 result(nil)
-            } else {
-                let code = constructionError?.domain ?? "FILTER_CONSTRUCTION_FAILED"
-                let message = constructionError?.localizedDescription
-                    ?? "Unknown filter construction error."
+            } catch {
+                let nsError = error as NSError
+                let code = nsError.domain
+                let message = nsError.localizedDescription
                 result(FlutterError(code: code, message: message, details: nil))
             }
             #else
