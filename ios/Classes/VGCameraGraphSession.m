@@ -1,9 +1,35 @@
 // VGCameraGraphSession.m
-// vanguard_media_engine — Phase 6A-2 / Phase 6A-3D-2
+// vanguard_media_engine — Phase 6A-2 / Phase 6A-3D-2 / Phase 6A-3G-C
 //
 // Implementation of VGCameraGraphSession.
 // Phase 6A-3D-2 adds setCameraFilterChainFromSpecs:error: — Beauty V1 construction
 // from Dart/plugin specs using the session-owned pool and Metal device.
+//
+// Phase 6A-3G-C: Async camera graph handoff.
+// VGCameraGraphSession now acts as the renderer.frameDelegate (not _scheduler).
+// Its didReceiveRawFrame: retains the incoming buffer, checks an atomic in-flight
+// flag (drop-latest backpressure), and dispatches the real graph traversal
+// asynchronously onto com.vanguard.cameraGraphExecution, returning immediately
+// to the capture delegate queue.
+//
+// Ownership contract for the async path:
+//   capture queue retains buffer (line ~461 in VanguardCameraMediaSource.m).
+//   _onVideoFrame: passes frameToDeliver (+0 or +1 rotated) to us.
+//   We call CVPixelBufferRetain to add our own +1 for the async block.
+//   After we return, _onVideoFrame: releases its references (rawFrame + rotated).
+//   Inside the async block: we call [scheduler didReceiveRawFrame:] which treats
+//   the buffer as source-owned (does not release it). After the scheduler returns
+//   we CVPixelBufferRelease our +1.
+//
+// Scheduler hot-swap safety:
+//   The async block captures the *current* scheduler at enqueue time as a local
+//   strong reference. Even if setCameraFilterChain: swaps _scheduler on the
+//   session queue while a block is queued, the block executes against the
+//   scheduler it was enqueued for — no stale-pointer risk.
+//
+// Thread safety of _graphInFlight:
+//   _graphInFlight is _Atomic(BOOL). The in-flight check uses atomic_compare_
+//   exchange_strong so concurrent calls from the serial capture queue are safe.
 
 #import "VGCameraGraphSession.h"
 #import "VGUseCameraGraph.h"
@@ -16,14 +42,19 @@
 #import "BeautyV2FilterGroup.h"
 
 #import <UMF/VGGraphExecutionContext.h>
+#import <UMF/VGFrameDelegate.h>
 #import <UMF/VGResourceAllocator.h>
 #import <UMF/VGNode.h>
 #import <UMF/VGFrameSink.h>
+#import <UMF/VGFrameEnvelope.h>
 #import <stdatomic.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
 
-@interface VGCameraGraphSession ()
+// 3G-C: VGCameraGraphSession adopts VGFrameDelegate so it can act as the
+// renderer.frameDelegate instead of _scheduler. This gives the session full
+// control over the async handoff boundary.
+@interface VGCameraGraphSession () <VGFrameDelegate>
 - (BOOL)_queryDimensionsWidth:(size_t *)outWidth height:(size_t *)outHeight;
 - (id)_sessionPool;
 - (NSUInteger)_sessionPoolBytes;
@@ -39,6 +70,13 @@
     dispatch_queue_t _sessionQueue;
     CVPixelBufferPoolRef _sessionPool;
     NSUInteger _sessionPoolBytes;
+
+    // 3G-C: dedicated serial queue for graph execution (off capture delegate queue).
+    dispatch_queue_t _graphExecutionQueue;
+    // 3G-C: drop-latest backpressure flag. Set when a graph block is in-flight;
+    // cleared when that block finishes. Subsequent raw frames are dropped until
+    // the in-flight block completes.
+    _Atomic(BOOL) _graphInFlight;
 }
 
 - (nullable instancetype)initWithSource:(VanguardCameraMediaSource *)source
@@ -65,8 +103,18 @@
     _source = source;
     _renderer = renderer;
     atomic_init(&_invalidated, NO);
+    atomic_init(&_graphInFlight, NO);
     _sessionQueue = dispatch_queue_create("com.vanguard.cameraGraphSession",
                                           DISPATCH_QUEUE_SERIAL);
+    // 3G-C: serial execution queue for graph traversal.
+    // QoS userInteractive to match the AVCaptureVideoDataOutput priority; the
+    // graph must keep up with camera frame delivery or the in-flight flag will
+    // drop frames (expected and intentional backpressure).
+    _graphExecutionQueue =
+        dispatch_queue_create("com.vanguard.cameraGraphExecution",
+                              dispatch_queue_attr_make_with_qos_class(
+                                  DISPATCH_QUEUE_SERIAL,
+                                  QOS_CLASS_USER_INTERACTIVE, 0));
     _sessionPool = NULL;
     _sessionPoolBytes = 0;
 
@@ -139,10 +187,10 @@
     _nodes = nodes;
 
     // ── (e) Wire and start ────────────────────────────────────────────────────
-    // Wire the scheduler as the frameDelegate of the renderer. When non-nil,
-    // the renderer will forward raw camera frames to the scheduler's
-    // didReceiveRawFrame: delegate method instead of executing the legacy filter path.
-    renderer.frameDelegate = _scheduler;
+    // 3G-C: Wire the SESSION as the frameDelegate of the renderer (not _scheduler
+    // directly). The session's didReceiveRawFrame: provides the async boundary that
+    // moves graph traversal off the capture delegate queue.
+    renderer.frameDelegate = self;
 
     // Start frame dispatch
     [_scheduler startWithClock:nil];
@@ -206,8 +254,11 @@
         // shared camera source.
         [newScheduler startWithClock:nil];
 
-        renderer.frameDelegate = newScheduler;
-
+        // 3G-C: The session remains the permanent renderer.frameDelegate.
+        // Only _scheduler is swapped. Async blocks enqueued after this point
+        // will capture newScheduler because they read _scheduler at enqueue time
+        // inside the session queue, which is serialized with this swap.
+        // renderer.frameDelegate is NOT changed here — the session stays wired.
         self->_scheduler = newScheduler;
         self->_context = newCtx;
         self->_nodes = newNodes;
@@ -390,9 +441,12 @@
             return;
         }
 
+        // 3G-C: Clear renderer.frameDelegate while still on the session queue.
+        // The session is the frameDelegate; clearing it prevents _onVideoFrame:
+        // from calling our didReceiveRawFrame: after teardown begins.
         VanguardMetalRenderer *renderer = self->_renderer;
         if (renderer) {
-            if (renderer.frameDelegate == self->_scheduler) {
+            if (renderer.frameDelegate == self) {
                 renderer.frameDelegate = nil;
             }
         }
@@ -412,6 +466,18 @@
         self->_context = nil;
         self->_nodes = nil;
         self->_source = nil;
+    });
+
+    // 3G-C: After the session queue has cleared frameDelegate (preventing new
+    // enqueues), drain the graph execution queue synchronously. This ensures any
+    // in-flight async block that captured a scheduler reference has finished and
+    // released its retained buffer before invalidate returns.
+    //
+    // We must NOT hold _sessionQueue while doing this (deadlock risk if the
+    // async block tries to dispatch_sync back). The dispatch_sync here is on a
+    // *different* queue (_graphExecutionQueue), which is safe.
+    dispatch_sync(_graphExecutionQueue, ^{
+        // Intentionally empty — just draining any queued or in-flight block.
     });
 }
 
@@ -502,6 +568,82 @@
 #else
     return NO;
 #endif
+}
+
+// ─── VGFrameDelegate (Phase 6A-3G-C) ─────────────────────────────────────────
+//
+// This is the async boundary between the AVCapture delegate queue
+// (com.vanguard.capture) and the graph execution queue
+// (com.vanguard.cameraGraphExecution).
+//
+// Called by VanguardMetalRenderer._onVideoFrame: on com.vanguard.capture
+// (a serial queue). Must return quickly — no GPU work, no filter execution.
+//
+// Ownership:
+//   envelope.payload.videoBuffer: source-owned (+1). We add our own +1 via
+//   CVPixelBufferRetain before the async dispatch so the buffer stays alive
+//   after _onVideoFrame: releases its references. The async block releases
+//   our +1 after [scheduler didReceiveRawFrame:] returns.
+//
+// Backpressure:
+//   If _graphInFlight is already YES (previous frame still processing),
+//   we drop the incoming frame and return immediately. This prevents frame
+//   backlog on the execution queue and matches the AVFoundation drop-latest
+//   model (alwaysDiscardsLateVideoFrames companion on the CPU side).
+- (void)didReceiveRawFrame:(VGFrameEnvelope)envelope {
+    // ── Guard: invalidated ────────────────────────────────────────────────────
+    if (atomic_load(&_invalidated)) return;
+
+    // ── Guard: no buffer ──────────────────────────────────────────────────────
+    CVPixelBufferRef rawBuffer = envelope.payload.videoBuffer;
+    if (!rawBuffer) return;
+
+    // ── Backpressure: drop-latest ─────────────────────────────────────────────
+    // Atomically set in-flight from NO→YES. If it was already YES, a block is
+    // already executing — drop this frame.
+    BOOL expected = NO;
+    if (!atomic_compare_exchange_strong(&_graphInFlight, &expected, YES)) {
+        // Frame dropped — graph execution is busy.
+        return;
+    }
+
+    // ── Retain buffer for async lifetime ─────────────────────────────────────
+    // _onVideoFrame: will release its references to rawFrame / frameToDeliver
+    // after we return. We must hold our own +1 until the async block finishes.
+    CVPixelBufferRetain(rawBuffer);
+
+    // ── Capture scheduler at enqueue time ────────────────────────────────────
+    // Read _scheduler under no explicit lock — assignment is done on
+    // _sessionQueue which is separate from the capture queue. On ARM64, object
+    // pointer reads are atomic. The strong local reference prevents dealloc
+    // before the block executes.
+    VGGraphSchedulerV2 *scheduler = _scheduler;
+
+    // Build a retained envelope for the async block. The buffer pointer is the
+    // same rawBuffer we just retained; everything else copies by value.
+    VGFrameEnvelope asyncEnvelope = envelope;
+    asyncEnvelope.payload.videoBuffer = rawBuffer; // already +1 from our retain
+
+    __weak __typeof(self) weakSelf = self;
+    dispatch_async(_graphExecutionQueue, ^{
+        __strong __typeof(weakSelf) strongSelf = weakSelf;
+
+        // ── Execute graph if session is still live ─────────────────────────
+        // scheduler may be nil if invalidate was called between enqueue and here.
+        if (strongSelf && !atomic_load(&strongSelf->_invalidated) && scheduler) {
+            [scheduler didReceiveRawFrame:asyncEnvelope];
+        }
+
+        // ── Release our +1 retain ─────────────────────────────────────────
+        // The scheduler has already called presentEnvelope: (synchronously),
+        // which retained the buffer for the renderer. We now release our +1.
+        CVPixelBufferRelease(rawBuffer);
+
+        // ── Clear in-flight flag ──────────────────────────────────────────
+        if (strongSelf) {
+            atomic_store(&strongSelf->_graphInFlight, NO);
+        }
+    });
 }
 
 @end
