@@ -37,7 +37,7 @@ Pod::Spec.new do |s|
     'OTHER_CPLUSPLUSFLAGS'                                    => '$(inherited) -std=c++17',
     'EXCLUDED_ARCHS[sdk=iphonesimulator*]'                    => 'i386',
     # Tie Objective-C and Swift camera graph flags together with standard Xcode resolution
-    'VG_USE_CAMERA_GRAPH'                                     => '0',
+    'VG_USE_CAMERA_GRAPH'                                     => '1',
     'GCC_PREPROCESSOR_DEFINITIONS'                            => '$(inherited) VG_USE_CAMERA_GRAPH=$(VG_USE_CAMERA_GRAPH)',
     'OTHER_SWIFT_FLAGS_0'                                     => '$(inherited)',
     'OTHER_SWIFT_FLAGS_1'                                     => '$(inherited) -DVG_USE_CAMERA_GRAPH',
