@@ -921,8 +921,8 @@ static const char kCaptureQueueKey = 0;
     return;
 
   // Guard photo capture: reject takePhotoToURL: calls arriving during the
-  // ~150ms reconfiguration window. Both this flag and takePhotoToURL: are
-  // accessed on the main thread only — no lock needed.
+  // reconfiguration window. Both this flag and takePhotoToURL: are accessed
+  // on the main thread only — no lock needed.
   _isSwitching = YES;
 
   [_session beginConfiguration];
@@ -942,20 +942,24 @@ static const char kCaptureQueueKey = 0;
       [_session addInput:_videoInput];
   }
 
-  [_session commitConfiguration];
-
-  // Re-apply orientation and mirroring on the updated connection.
-  // After commitConfiguration the connection properties may have been reset
-  // to their defaults (landscapeRight, unmirrored) by the session
-  // reconfiguration.
+  // Phase 6A-3F-R2B: Set orientation and mirroring inside the configuration
+  // block so AVFoundation batches all mutations into the single
+  // commitConfiguration call. Setting these properties outside commitConfiguration
+  // triggers a separate per-setter ISP reconfiguration (~500–2000ms extra
+  // latency). Mirrors the _configureSession pattern (lines 267–274).
   AVCaptureConnection *vidConn =
       [_videoOutput connectionWithMediaType:AVMediaTypeVideo];
   if (vidConn.isVideoOrientationSupported) {
     vidConn.videoOrientation = AVCaptureVideoOrientationPortrait;
   }
   if (vidConn.isVideoMirroringSupported) {
+    // Disable automatic mirroring before setting explicit value so the
+    // session does not override our choice after commit.
+    vidConn.automaticallyAdjustsVideoMirroring = NO;
     vidConn.videoMirrored = (_position == AVCaptureDevicePositionFront);
   }
+
+  [_session commitConfiguration];
 
   // Reconfiguration complete — photo capture allowed again.
   _isSwitching = NO;
