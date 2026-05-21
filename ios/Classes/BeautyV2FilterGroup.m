@@ -480,12 +480,34 @@ _VGBeautyCreatePool(size_t width, size_t height) {
 // ---------------------------------------------------------------------------
 
 /// Wraps an IOSurface-backed CVPixelBuffer as a Metal texture.
-/// Returns nil if the buffer has no IOSurface (passthrough/failure guard).
+/// Returns nil if the buffer has no IOSurface or if its dimensions/stride
+/// cannot support the requested w×h BGRA8 texture (Phase 6A-3F-R1 guard).
 static id<MTLTexture> _Nullable
 _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
                MTLTextureUsage usage, size_t w, size_t h) {
     IOSurfaceRef surf = CVPixelBufferGetIOSurface(buf);
     if (!surf) return nil;
+
+    // ── Phase 6A-3F-R1: IOSurface dimension preflight ────────────────────────
+    // Metal aborts if bytesPerRow of the IOSurface is less than what the
+    // requested texture descriptor requires. Validate before calling Metal.
+    OSType fmt       = CVPixelBufferGetPixelFormatType(buf);
+    size_t bufW      = CVPixelBufferGetWidth(buf);
+    size_t bufH      = CVPixelBufferGetHeight(buf);
+    size_t bufBPR    = CVPixelBufferGetBytesPerRow(buf);
+    // Guard against overflow: w * 4 must not wrap.
+    size_t reqBPR    = (w <= (SIZE_MAX / 4)) ? (w * 4) : SIZE_MAX;
+
+    if (fmt != kCVPixelFormatType_32BGRA ||
+        bufW < w || bufH < h || bufBPR < reqBPR) {
+        os_log_error(OS_LOG_DEFAULT,
+            "[BeautyV2-3F-R1] IOSurface stride mismatch — refusing texture creation. "
+            "requested: %zu×%zu reqBPR=%zu | buffer: %zu×%zu bpr=%zu fmt=0x%X",
+            w, h, reqBPR, bufW, bufH, bufBPR, (unsigned)fmt);
+        return nil;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     MTLTextureDescriptor *td =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                            width:w
@@ -874,8 +896,10 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
     if (!texIn || !texA || !texB || !texC || !texOut) {
         CVPixelBufferRelease(bufA); CVPixelBufferRelease(bufB);
         CVPixelBufferRelease(bufC); CVPixelBufferRelease(output);
-        os_log_error(OS_LOG_DEFAULT, "[BeautyV2] texture creation failed (IOSurface missing)");
-        VGFrameEnvelope f = envelope; f.payload.videoBuffer = NULL; return f;
+        // Return original envelope as passthrough so the preview continues.
+        // The stride-mismatch case (camera switch) is already logged by
+        // _VGMakeTexture with [BeautyV2-3F-R1]; no additional log here.
+        return envelope;
     }
 
     // ── GPU uniform buffers ───────────────────────────────────────────────────
