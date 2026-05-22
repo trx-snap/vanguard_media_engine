@@ -36,6 +36,7 @@
 #import "VGCameraGraphFactory.h"
 #import "VGGraphSchedulerV2.h"
 #import "VGFanOutSink.h"
+#import "VGPlatformViewSinkAdapter.h"
 #import "VanguardCameraMediaSource.h"
 #import "VanguardMetalRenderer.h"
 #import "VanguardBeautyFilterNode.h"
@@ -77,6 +78,14 @@
     // cleared when that block finishes. Subsequent raw frames are dropped until
     // the in-flight block completes.
     _Atomic(BOOL) _graphInFlight;
+
+    // POC2: optional platform view sink. Set by connectPlatformViewReceiver:.
+    // Retained strongly — the VGPlatformViewSinkAdapter itself holds _receiver weakly.
+    VGPlatformViewSinkAdapter *_platformViewSink;
+
+    // POC2: cache the most recent filter chain so connectPlatformViewReceiver:
+    // can trigger a rebuild that preserves the current filter state.
+    NSArray *_currentFilterChain;
 }
 
 - (nullable instancetype)initWithSource:(VanguardCameraMediaSource *)source
@@ -192,7 +201,7 @@
     // moves graph traversal off the capture delegate queue.
     renderer.frameDelegate = self;
 
-    // Start frame dispatch
+    // Start frame dispatch.
     [_scheduler startWithClock:nil];
 
     return self;
@@ -214,11 +223,18 @@
             return;
         }
 
+        // POC2: persist current filter chain so connectPlatformViewReceiver: can
+        // trigger a rebuild that preserves filter state.
+        // Defensive copy: caller may pass NSMutableArray; copy ensures the cached
+        // value cannot be mutated behind our back.
+        self->_currentFilterChain = [filterChain copy];
+
         NSError *rebuildError = nil;
         NSDictionary<NSString *, id> *newGraph =
             [VGCameraGraphFactory buildCameraGraphWithSource:self->_source
                                                  filterChain:filterChain
                                                     renderer:renderer
+                                            platformViewSink:self->_platformViewSink
                                                        error:&rebuildError];
         if (!newGraph) {
             NSLog(@"[VGCameraGraphSession] setCameraFilterChain rebuild failed: %@ — keeping current scheduler",
@@ -267,6 +283,100 @@
               (unsigned long)(filterChain.count ?: 0),
               (unsigned long)newPlan.topologicalOrder.count);
     });
+}
+
+// ─── POC2: connectPlatformViewReceiver: ───────────────────────────────────────
+//
+// Wires a VanguardCameraFrameReceiver into the graph as a second VGFanOutSink child.
+//
+// Strategy: store a VGPlatformViewSinkAdapter as _platformViewSink ivar, then
+// trigger a full graph rebuild via setCameraFilterChain: (reusing _currentFilterChain)
+// so the factory builds a two-child VGFanOutSink.
+//
+// Also disables POC1 raw direct forwarding on the camera source to prevent
+// double delivery: raw (POC1 path) + graph-processed (POC2 path).
+//
+// REMOVE before Phase 7 / production.
+- (BOOL)connectPlatformViewReceiver:(id<VanguardCameraFrameReceiver>)receiver {
+    __block BOOL success = NO;
+    dispatch_sync(_sessionQueue, ^{
+        if (atomic_load(&self->_invalidated)) {
+            NSLog(@"[Vanguard] POC2: connectPlatformViewReceiver — session is invalidated");
+            return;
+        }
+        if (!receiver) {
+            NSLog(@"[Vanguard] POC2: connectPlatformViewReceiver — receiver is nil");
+            return;
+        }
+
+        // Create (or replace) the platform view sink adapter.
+        self->_platformViewSink = [[VGPlatformViewSinkAdapter alloc] initWithReceiver:receiver];
+        NSLog(@"[Vanguard] POC2: VGPlatformViewSinkAdapter created — will rebuild graph");
+
+        // ── Disable POC1 raw direct forwarding ────────────────────────────────
+        // POC1 raw delivery must not run while POC2 graph fan-out is active.
+        // Setting platformViewRawForwardingEnabled=NO prevents captureOutput: from
+        // calling [_frameReceiver onFrame:pixelBuffer pts:pts] directly, so the
+        // MTKView receives only graph-processed frames from VGFanOutSink.
+        if (self->_source) {
+            self->_source.platformViewRawForwardingEnabled = NO;
+            NSLog(@"[Vanguard] POC2: POC1 raw forwarding DISABLED on camera source ✓");
+        }
+
+        // ── Trigger graph rebuild with two-child VGFanOutSink ─────────────────
+        // setCameraFilterChain: is called on _sessionQueue (we are already on it),
+        // so we cannot dispatch_sync again — call the inner implementation directly.
+        VanguardMetalRenderer *renderer = self->_renderer;
+        if (!self->_source || !renderer) {
+            NSLog(@"[Vanguard] POC2: connectPlatformViewReceiver — source or renderer nil");
+            return;
+        }
+
+        NSError *rebuildError = nil;
+        NSDictionary<NSString *, id> *newGraph =
+            [VGCameraGraphFactory buildCameraGraphWithSource:self->_source
+                                                 filterChain:self->_currentFilterChain
+                                                    renderer:renderer
+                                            platformViewSink:self->_platformViewSink
+                                                       error:&rebuildError];
+        if (!newGraph) {
+            NSLog(@"[Vanguard] POC2: connectPlatformViewReceiver graph rebuild failed: %@",
+                  rebuildError);
+            return;
+        }
+
+        VGGraphDescriptor *newDesc = newGraph[@"descriptor"];
+        NSDictionary<NSString *, id<VGNode>> *newNodes = newGraph[@"nodes"];
+        VGExecutionPlan *newPlan = newGraph[@"plan"];
+
+        id<VGFrameSink> newSink = (id<VGFrameSink>)newNodes[@"fan_out_sink"];
+        if (!newSink) {
+            NSLog(@"[Vanguard] POC2: connectPlatformViewReceiver — fan_out_sink missing after rebuild");
+            return;
+        }
+
+        VGGraphExecutionContext *newCtx =
+            [[VGGraphExecutionContext alloc] initWithDescriptor:newDesc
+                                                           plan:newPlan
+                                                          nodes:newNodes
+                                                          clock:nil
+                                              resourceAllocator:[VGResourceAllocator sharedInstance]];
+
+        VGGraphSchedulerV2 *newScheduler =
+            [[VGGraphSchedulerV2 alloc] initWithPlan:newPlan
+                                               nodes:newNodes
+                                             context:newCtx];
+        newScheduler.sink = newSink;
+        [newScheduler startWithClock:nil];
+
+        self->_scheduler = newScheduler;
+        self->_context = newCtx;
+        self->_nodes = newNodes;
+
+        NSLog(@"[Vanguard] POC2: graph rebuilt with two-child VGFanOutSink — PlatformView wired ✓");
+        success = YES;
+    });
+    return success;
 }
 
 // ─── Phase 6A-3D-2: Spec-driven filter construction ──────────────────────────

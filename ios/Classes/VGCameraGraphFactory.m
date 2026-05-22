@@ -11,6 +11,7 @@
 #import "VGFanOutSink.h"
 #import "VGLegacyFilterAdapter.h"
 #import "VGMetadataNodeAdapter.h"
+#import "VGPlatformViewSinkAdapter.h"
 
 // ─── UMF types ────────────────────────────────────────────────────────────────
 #import <UMF/VGGraphDescriptor.h>
@@ -37,6 +38,21 @@
     buildCameraGraphWithSource:(VanguardCameraMediaSource *)source
                    filterChain:(nullable NSArray *)filterChain
                       renderer:(VanguardMetalRenderer *)renderer
+                         error:(NSError * _Nullable * _Nullable)outError
+{
+    // Convenience overload — preserves original single-renderer fan-out behaviour.
+    return [self buildCameraGraphWithSource:source
+                                filterChain:filterChain
+                                   renderer:renderer
+                           platformViewSink:nil
+                                      error:outError];
+}
+
++ (nullable NSDictionary<NSString *, id> *)
+    buildCameraGraphWithSource:(VanguardCameraMediaSource *)source
+                   filterChain:(nullable NSArray *)filterChain
+                      renderer:(VanguardMetalRenderer *)renderer
+             platformViewSink:(nullable id<VGFrameSink>)platformViewSink
                          error:(NSError * _Nullable * _Nullable)outError
 {
     // ── (a) Guard inputs ──────────────────────────────────────────────────────
@@ -86,7 +102,21 @@
 
     // ── (d) Wrap renderer and construct composite VGFanOutSink ─────────────────
     VGRendererSinkAdapter *rendererSinkAdapter = [[VGRendererSinkAdapter alloc] initWithRenderer:renderer];
-    VGFanOutSink *fanOutSink = [[VGFanOutSink alloc] initWithNodeId:@"fan_out_sink" sinks:@[ rendererSinkAdapter ]];
+
+    // POC2: when platformViewSink is provided, include it as a second child of
+    // VGFanOutSink so graph output (post-Beauty-V2) reaches the MTKView PlatformView.
+    // When nil: original single-child behaviour is preserved exactly.
+    NSArray<id<VGFrameSink>> *sinkChildren;
+    if (platformViewSink) {
+        sinkChildren = @[ rendererSinkAdapter, platformViewSink ];
+        NSLog(@"[VGCameraGraphFactory] POC2: building two-child VGFanOutSink "
+               "(renderer + platformView)");
+    } else {
+        sinkChildren = @[ rendererSinkAdapter ];
+    }
+
+    VGFanOutSink *fanOutSink = [[VGFanOutSink alloc] initWithNodeId:@"fan_out_sink"
+                                                               sinks:sinkChildren];
     if (!fanOutSink) {
         if (outError) {
             *outError = [NSError errorWithDomain:@"VGCameraGraphFactory"

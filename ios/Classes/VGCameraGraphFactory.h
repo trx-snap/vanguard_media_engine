@@ -18,6 +18,7 @@ NS_ASSUME_NONNULL_BEGIN
 // Forward declarations
 @class VanguardCameraMediaSource;
 @class VanguardMetalRenderer;
+@protocol VGFrameSink;
 
 /// Pure graph-construction factory for the V2 camera pipeline.
 @interface VGCameraGraphFactory : NSObject
@@ -27,18 +28,31 @@ NS_ASSUME_NONNULL_BEGIN
 /// Builds a linear camera graph:
 ///   - Source: wrapped in VGCameraSourceAdapter
 ///   - Filters: wrapped in VGLegacyFilterAdapter / VGMetadataNodeAdapter
-///   - Sink: composite VGFanOutSink wrapping the VGRendererSinkAdapter as the initial child
+///   - Sink: composite VGFanOutSink wrapping the VGRendererSinkAdapter as the initial child.
+///           When platformViewSink is non-nil, it is added as a second child of VGFanOutSink.
 ///
 /// Edge policy:
 ///   - Intermediate transform-to-transform edges: synchronous, no admission policy.
 ///   - Final edge to composite sink: synchronous with VGSinkAdmissionPolicy dropLatest.
 ///
-/// @param source      The camera media source. Must not be nil.
-/// @param filterChain Optional ordered list of id<VanguardFilterNode> (or VGSegmentationNode).
-///                    nil treated as empty.
-/// @param renderer    The Metal renderer sink. Must not be nil.
-/// @param outError    On failure, set to a descriptive NSError.
+/// @param source            The camera media source. Must not be nil.
+/// @param filterChain       Optional ordered list of id<VanguardFilterNode> (or VGSegmentationNode).
+///                          nil treated as empty.
+/// @param renderer          The Metal renderer sink. Must not be nil.
+/// @param platformViewSink  Optional VGFrameSink for PlatformView delivery (POC2).
+///                          When nil: single-child VGFanOutSink (original behaviour).
+///                          When non-nil: two-child VGFanOutSink — renderer first, then platform view.
+/// @param outError          On failure, set to a descriptive NSError.
 /// @return A dictionary containing keys @"descriptor", @"nodes", and @"plan" on success, or nil on failure.
++ (nullable NSDictionary<NSString *, id> *)
+    buildCameraGraphWithSource:(VanguardCameraMediaSource *)source
+                   filterChain:(nullable NSArray *)filterChain
+                      renderer:(VanguardMetalRenderer *)renderer
+              platformViewSink:(nullable id<VGFrameSink>)platformViewSink
+                         error:(NSError * _Nullable * _Nullable)outError;
+
+/// Convenience overload without platformViewSink (original single-renderer fan-out behaviour).
+/// Calls buildCameraGraphWithSource:filterChain:renderer:platformViewSink:error: with nil.
 + (nullable NSDictionary<NSString *, id> *)
     buildCameraGraphWithSource:(VanguardCameraMediaSource *)source
                    filterChain:(nullable NSArray *)filterChain

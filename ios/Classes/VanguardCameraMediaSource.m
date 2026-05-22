@@ -98,6 +98,7 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
   CVPixelBufferPoolRef _mlInputPool; // 256x256 BGRA pool owned by this source
   dispatch_queue_t _mlQueue;
   id _thermalObserver; // NSNotificationCenter token
+  id _orientationObserver; // UIDevice orientation change token
 
   // ── Device controls & camera switching (Phases 2–3) ──────────────────────
   // _captureDevice: retained reference to the active video device; used by
@@ -217,8 +218,31 @@ static const char kCaptureQueueKey = 0;
                       (long)state);
               }];
 
+  // ── Phase 6A-3J-F: Device orientation observer ────────────────────────────
+  // AVCaptureConnection.videoOrientation does NOT auto-update when the device
+  // physically rotates (Apple docs). We must re-apply the orientation contract
+  // whenever the device orientation changes so the ISP delivers correctly
+  // oriented pixels matching the physical device angle.
+  [[UIDevice currentDevice] beginGeneratingDeviceOrientationNotifications];
+  _orientationObserver = [NSNotificationCenter.defaultCenter
+      addObserverForName:UIDeviceOrientationDidChangeNotification
+                  object:nil
+                   queue:[NSOperationQueue mainQueue]
+            usingBlock:^(NSNotification *_) {
+              typeof(self) strongSelf = weakSelf;
+              if (!strongSelf || !strongSelf->_session.isRunning)
+                return;
+              [strongSelf _applyConnectionOrientationContract];
+            }];
+
   _session = [[AVCaptureSession alloc] init];
   [self _configureSession];
+
+  // POC2: raw forwarding gate defaults to YES (POC1 path active by default).
+  // Set to NO by VGCameraGraphSession.connectPlatformViewReceiver: when the
+  // two-child VGFanOutSink is installed to prevent raw+processed double delivery.
+  self.platformViewRawForwardingEnabled = YES;
+
   return self;
 }
 
@@ -264,14 +288,10 @@ static const char kCaptureQueueKey = 0;
   if ([_session canAddOutput:_videoOutput])
     [_session addOutput:_videoOutput];
 
-  // Orientation lock: always portrait; mirror front camera for preview only
-  AVCaptureConnection *vidConn =
-      [_videoOutput connectionWithMediaType:AVMediaTypeVideo];
-  if (vidConn.isVideoOrientationSupported)
-    vidConn.videoOrientation = AVCaptureVideoOrientationPortrait;
-  if (_position == AVCaptureDevicePositionFront &&
-      vidConn.isVideoMirroringSupported)
-    vidConn.videoMirrored = YES;
+  // Orientation + mirroring: follow physical device orientation.
+  // Uses shared helper (Phase 6A-3J-F) for consistency with
+  // moveCameraToPosition: and the device-orientation observer.
+  [self _applyConnectionOrientationContract];
 
   // Frame rate
   [cam lockForConfiguration:nil];
@@ -459,6 +479,28 @@ static const char kCaptureQueueKey = 0;
   //   _onVideoFrame:514.
   if (_videoCallback)
     _videoCallback(CVPixelBufferRetain(pixelBuffer), pts);
+
+  // ── POC 1: raw frame forwarding → VanguardCameraPlatformView ────────────
+  // Delivers the raw (pre-graph) CVPixelBuffer directly to the PlatformView's
+  // onFrame:pts: so POC 1 can prove live camera rendering without the graph.
+  //
+  // Ownership: pixelBuffer is +0 here (owned by CMSampleBuffer until return).
+  // VanguardCameraPlatformView.onFrame:pts: (Swift) retains via ARC on
+  // assignment to latestBuffer — no extra CVPixelBufferRetain needed here.
+  //
+  // POC2 gate: when platformViewRawForwardingEnabled is NO (set by
+  // VGCameraGraphSession.connectPlatformViewReceiver:), this block is bypassed
+  // so the MTKView receives only graph-processed frames from VGFanOutSink.
+  //
+  // REMOVE before Phase 7 / production.
+  id<VanguardCameraFrameReceiver> receiver = _frameReceiver; // strong local, atomic read
+  if (receiver && self.platformViewRawForwardingEnabled) {
+    static dispatch_once_t _poc1FirstFrameOnce;
+    dispatch_once(&_poc1FirstFrameOnce, ^{
+      NSLog(@"[Vanguard] POC1: first raw frame forwarded to frameReceiver ✓");
+    });
+    [receiver onFrame:pixelBuffer pts:pts];
+  }
 
   // ── Recording path ────────────────────────────────────────────────────────
   if (_recordingState != VanguardRecordingStateWriting)
@@ -942,22 +984,10 @@ static const char kCaptureQueueKey = 0;
       [_session addInput:_videoInput];
   }
 
-  // Phase 6A-3F-R2B: Set orientation and mirroring inside the configuration
+  // Phase 6A-3J-F: Set orientation and mirroring inside the configuration
   // block so AVFoundation batches all mutations into the single
-  // commitConfiguration call. Setting these properties outside commitConfiguration
-  // triggers a separate per-setter ISP reconfiguration (~500–2000ms extra
-  // latency). Mirrors the _configureSession pattern (lines 267–274).
-  AVCaptureConnection *vidConn =
-      [_videoOutput connectionWithMediaType:AVMediaTypeVideo];
-  if (vidConn.isVideoOrientationSupported) {
-    vidConn.videoOrientation = AVCaptureVideoOrientationPortrait;
-  }
-  if (vidConn.isVideoMirroringSupported) {
-    // Disable automatic mirroring before setting explicit value so the
-    // session does not override our choice after commit.
-    vidConn.automaticallyAdjustsVideoMirroring = NO;
-    vidConn.videoMirrored = (_position == AVCaptureDevicePositionFront);
-  }
+  // commitConfiguration call. Uses shared helper for consistency.
+  [self _applyConnectionOrientationContract];
 
   [_session commitConfiguration];
 
@@ -1075,6 +1105,12 @@ static const char kCaptureQueueKey = 0;
 
 - (void)dealloc {
   [self _stopWatchdog];
+  // Phase 6A-3J-F: Remove orientation observer.
+  if (_orientationObserver) {
+    [NSNotificationCenter.defaultCenter removeObserver:_orientationObserver];
+    _orientationObserver = nil;
+  }
+  [[UIDevice currentDevice] endGeneratingDeviceOrientationNotifications];
   // G-04: Remove thermal observer before our strong references go away.
   if (_thermalObserver) {
     [NSNotificationCenter.defaultCenter removeObserver:_thermalObserver];
@@ -1092,6 +1128,69 @@ static const char kCaptureQueueKey = 0;
     _latestBuffer = NULL;
   }
   os_unfair_lock_unlock(&_latestBufferLock);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Connection Orientation Contract (Phase 6A-3J-F)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Orientation-adaptive connection contract.
+///
+/// Maps the current UIDeviceOrientation to AVCaptureVideoOrientation so the
+/// ISP delivers pixels matching the physical device angle.
+///
+/// Apple UIDeviceOrientation -> AVCaptureVideoOrientation mapping
+/// (per Apple AVCam sample code -- landscape axes are INVERTED):
+///   UIDeviceOrientationPortrait            -> AVCaptureVideoOrientationPortrait
+///   UIDeviceOrientationPortraitUpsideDown  -> AVCaptureVideoOrientationPortraitUpsideDown
+///   UIDeviceOrientationLandscapeLeft       -> AVCaptureVideoOrientationLandscapeRight
+///   UIDeviceOrientationLandscapeRight      -> AVCaptureVideoOrientationLandscapeLeft
+///   FaceUp / FaceDown / Unknown            -> Portrait fallback
+///
+/// Mirroring contract:
+///   automaticallyAdjustsVideoMirroring = NO
+///   videoMirrored = YES for front camera, NO for back
+///
+/// Called from:
+///   _configureSession       -- initial session setup
+///   moveCameraToPosition:   -- inside beginConfiguration/commitConfiguration
+///   UIDeviceOrientationDidChangeNotification -- re-apply after physical rotation
+- (void)_applyConnectionOrientationContract {
+  AVCaptureConnection *vidConn =
+      [_videoOutput connectionWithMediaType:AVMediaTypeVideo];
+  if (!vidConn)
+    return;
+
+  if (vidConn.isVideoOrientationSupported) {
+    UIDeviceOrientation devOrientation = UIDevice.currentDevice.orientation;
+    AVCaptureVideoOrientation vidOrientation;
+
+    switch (devOrientation) {
+      case UIDeviceOrientationPortraitUpsideDown:
+        vidOrientation = AVCaptureVideoOrientationPortraitUpsideDown;
+        break;
+      case UIDeviceOrientationLandscapeLeft:
+        // Device rotated left (home button right) -> landscape right
+        vidOrientation = AVCaptureVideoOrientationLandscapeRight;
+        break;
+      case UIDeviceOrientationLandscapeRight:
+        // Device rotated right (home button left) -> landscape left
+        vidOrientation = AVCaptureVideoOrientationLandscapeLeft;
+        break;
+      case UIDeviceOrientationPortrait:
+      default:
+        // Portrait, FaceUp, FaceDown, Unknown -> portrait fallback
+        vidOrientation = AVCaptureVideoOrientationPortrait;
+        break;
+    }
+
+    vidConn.videoOrientation = vidOrientation;
+  }
+
+  if (vidConn.isVideoMirroringSupported) {
+    vidConn.automaticallyAdjustsVideoMirroring = NO;
+    vidConn.videoMirrored = (_position == AVCaptureDevicePositionFront);
+  }
 }
 
 @end

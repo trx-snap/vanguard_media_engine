@@ -9,6 +9,7 @@
 #pragma once
 
 #import <Foundation/Foundation.h>
+#import "VanguardCameraMediaSource.h"  // VanguardCameraFrameReceiver
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -100,6 +101,26 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Static helper mapping the compile-time feature flag VG_USE_CAMERA_GRAPH to a runtime check.
 + (BOOL)isGraphModeEnabled;
+
+// ─── POC2: Platform View graph delivery ──────────────────────────────────────
+
+/// Wires a VanguardCameraFrameReceiver (typically VanguardCameraPlatformView) as
+/// a second child of the VGFanOutSink so graph-processed frames (including
+/// Beauty V2 output) are delivered to the MTKView PlatformView.
+///
+/// Behaviour:
+///   - Creates a VGPlatformViewSinkAdapter wrapping the receiver.
+///   - Triggers a graph rebuild via setCameraFilterChain: (preserving the
+///     current filter chain) so the two-child VGFanOutSink is installed.
+///   - POC1 raw direct forwarding is disabled on the camera source
+///     (platformViewRawForwardingEnabled = NO) to prevent double delivery.
+///
+/// Returns YES on success, NO if the session is invalidated or rebuild fails.
+///
+/// Thread-safe: serialized on _sessionQueue.
+///
+/// POC2 ONLY — Remove before Phase 7 / production.
+- (BOOL)connectPlatformViewReceiver:(id<VanguardCameraFrameReceiver>)receiver;
 
 @end
 

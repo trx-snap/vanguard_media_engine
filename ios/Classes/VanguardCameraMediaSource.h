@@ -68,6 +68,22 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, weak, nullable) id<VanguardCameraFrameReceiver>
     frameReceiver;
 
+// ── POC2: Raw forwarding gate ─────────────────────────────────────────────────
+// When YES (default), the POC1 raw direct delivery path in captureOutput: is
+// active: each camera frame is forwarded to frameReceiver.onFrame:pts: directly
+// (pre-graph, raw pixel data).
+//
+// When NO, the raw forwarding block is skipped. Set to NO by
+// VGCameraGraphSession.connectPlatformViewReceiver: when the two-child
+// VGFanOutSink is installed, so the MTKView PlatformView receives only
+// graph-processed frames and not a second raw copy.
+//
+// Thread-safe: atomic property; written once from _sessionQueue, read from
+// _captureQueue (both serial — no races for a single BOOL).
+//
+// POC2 ONLY — Remove before Phase 7 / production.
+@property(atomic, assign) BOOL platformViewRawForwardingEnabled;
+
 // ── Recording state
 // ───────────────────────────────────────────────────────────
 

@@ -113,6 +113,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // P3-T4: Camera source + streaming encoder (streaming path, not AVAssetWriter)
     var cameraSource: VanguardCameraMediaSource?
     var streamingEncoder: VanguardVideoToolboxEncoder?
+    // POC 1: retain cameraFactory so we can read latestInstance in connectPlatformViewToCamera.
+    // POC-only — remove or restructure before Phase 7 / production.
+    var cameraFactory: VanguardCameraViewFactory?
     #if VG_USE_CAMERA_GRAPH
     var cameraGraphSession: VGCameraGraphSession?
     #endif
@@ -140,7 +143,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // no explicit instantiation needed here.
 
         // P3-T4: Register camera PlatformView factory
+        // POC 1: retain factory on instance so connectPlatformViewToCamera can read latestInstance.
         let cameraFactory = VanguardCameraViewFactory()
+        instance.cameraFactory = cameraFactory
         registrar.register(cameraFactory, withId: "vanguard_camera_view")
 
         // Phase 2 Step 8: instantiate the lifecycle observer after sessionRegistry
@@ -1318,6 +1323,68 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             src.start()
             #endif
             result(renderer.textureId)
+
+        // ── POC 1: Connect active camera source → active PlatformView ─────────
+        // POC-only method.  Dart calls this after UiKitView is mounted so that
+        // VanguardCameraMediaSource delivers raw frames to VanguardCameraPlatformView.
+        //
+        // Returns a String result:
+        //   "connected_graph"   — POC2: graph fan-out wired, raw forwarding disabled.
+        //   "connected_raw"     — POC1: raw direct forwarding wired (graph mode off
+        //                         or no active graph session).
+        //   "no_camera_source"  — startCamera was not called first.
+        //   "no_platform_view"  — UiKitView has not been mounted yet.
+        //   "no_graph_session"  — Graph mode enabled but no active session (fallback
+        //                         to raw).
+        //   "connect_failed"    — session.connectPlatformViewReceiver returned NO.
+        //
+        // Safety:
+        //   • Does NOT start/stop camera.
+        //   • Does NOT switch camera.
+        //   • Does NOT recreate texture.
+        //   • Does NOT touch scheduler, Beauty V2, or VGGraphSchedulerV2.
+        //
+        // POC2 ONLY — Remove before Phase 7 / production.
+        case "connectPlatformViewToCamera":
+            guard let src = cameraSource else {
+                NSLog("[Vanguard] POC2: connectPlatformViewToCamera — no active camera source (startCamera first)")
+                result("no_camera_source")
+                return
+            }
+            guard let view = cameraFactory?.latestInstance else {
+                NSLog("[Vanguard] POC2: connectPlatformViewToCamera — no active PlatformView instance (mount UiKitView first)")
+                result("no_platform_view")
+                return
+            }
+
+            #if VG_USE_CAMERA_GRAPH
+            // POC2 graph path: wire the PlatformView as a second VGFanOutSink child.
+            // The session creates a VGPlatformViewSinkAdapter and triggers a graph
+            // rebuild so graph-processed (post-Beauty-V2) frames reach the MTKView.
+            if let session = cameraGraphSession {
+                let connected = session.connectPlatformViewReceiver(view)
+                if connected {
+                    // Disable raw forwarding — MTKView now receives graph frames only.
+                    src.platformViewRawForwardingEnabled = false
+                    NSLog("[Vanguard] POC2: connectPlatformViewToCamera — graph fan-out wired ✓ (raw forwarding disabled)")
+                    result("connected_graph")
+                } else {
+                    NSLog("[Vanguard] POC2: connectPlatformViewToCamera — connectPlatformViewReceiver returned NO")
+                    result("connect_failed")
+                }
+                return
+            }
+            // No active graph session: fall through to raw path with a log.
+            NSLog("[Vanguard] POC2: connectPlatformViewToCamera — no active graph session, falling back to raw POC1 wiring")
+            src.frameReceiver = view
+            result("no_graph_session")
+            #else
+            // Non-graph mode: POC1 raw direct forwarding.
+            src.frameReceiver = view
+            NSLog("[Vanguard] POC1: connectPlatformViewToCamera — raw frameReceiver wired ✓ (cameraSource=%@, platformView=%@)",
+                  "\(src)", "\(view)")
+            result("connected_raw")
+            #endif
 
         case "setCameraFilterChain":
             #if VG_USE_CAMERA_GRAPH
