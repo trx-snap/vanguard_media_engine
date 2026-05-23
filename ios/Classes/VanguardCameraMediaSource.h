@@ -68,10 +68,11 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, weak, nullable) id<VanguardCameraFrameReceiver>
     frameReceiver;
 
-// ── POC2: Raw forwarding gate ─────────────────────────────────────────────────
-// When YES (default), the POC1 raw direct delivery path in captureOutput: is
-// active: each camera frame is forwarded to frameReceiver.onFrame:pts: directly
-// (pre-graph, raw pixel data).
+// ── POC2: Raw forwarding gate
+// ───────────────────────────────────────────────── When YES (default), the
+// POC1 raw direct delivery path in captureOutput: is active: each camera frame
+// is forwarded to frameReceiver.onFrame:pts: directly (pre-graph, raw pixel
+// data).
 //
 // When NO, the raw forwarding block is skipped. Set to NO by
 // VGCameraGraphSession.connectPlatformViewReceiver: when the two-child
@@ -118,6 +119,21 @@ NS_ASSUME_NONNULL_BEGIN
 /// ObjC-bridge translating 'switch' to a reserved keyword.
 - (void)moveCameraToPosition:(AVCaptureDevicePosition)position;
 
+// ── Phase 6C: Preview orientation lock ──────────────────────────────────────
+
+/// Forces AVCaptureConnection.videoOrientation = portrait for the duration of
+/// native camera preview. Suppresses orientation-change updates that would flip
+/// buffer dimensions. moveCameraToPosition: re-applies the lock automatically
+/// if called while the lock is active.
+///
+/// Typical caller: VGNativeCameraViewController at openNativeCamera time.
+/// Paired with unlockPreviewOrientation on VC dismissal.
+- (void)lockPreviewOrientationToPortrait;
+
+/// Removes the portrait orientation lock and restores normal
+/// _applyConnectionOrientationContract behaviour.
+- (void)unlockPreviewOrientation;
+
 // ── Photo Capture (Phase 4) ──────────────────────────────────────────────────
 
 /// Captures the current live frame as a JPEG and writes it atomically to url.
@@ -132,7 +148,8 @@ NS_ASSUME_NONNULL_BEGIN
 ///   2  ENCODE_FAIL — CIContext JPEG encoding returned nil
 ///   3  SWITCHING  — moveCameraToPosition: reconfiguration in progress
 - (void)takePhotoToURL:(NSURL *)url
-            completion:(void (^)(NSURL *_Nullable, NSError *_Nullable))completion;
+            completion:
+                (void (^)(NSURL *_Nullable, NSError *_Nullable))completion;
 
 @end
 

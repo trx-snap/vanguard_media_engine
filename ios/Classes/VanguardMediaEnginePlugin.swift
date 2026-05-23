@@ -116,6 +116,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // POC 1: retain cameraFactory so we can read latestInstance in connectPlatformViewToCamera.
     // POC-only — remove or restructure before Phase 7 / production.
     var cameraFactory: VanguardCameraViewFactory?
+    // Phase 6C: native VC that owns orientation decisions for the [POC6C] Native Camera screen.
+    // Weak: the VC is retained by UIKit while presented; this is just a back-reference.
+    weak var nativeCameraVC: VGNativeCameraViewController?
     #if VG_USE_CAMERA_GRAPH
     var cameraGraphSession: VGCameraGraphSession?
     #endif
@@ -1716,6 +1719,61 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
             }
 
+        // -- Phase 6C Option B: Native Camera VC (orientation owner) --
+
+        case "openNativeCamera":
+            // Phase 6C Option B: self-contained native camera screen.
+            // Creates its own VanguardCameraPlatformView natively -- does NOT
+            // require connectPlatformViewToCamera / UiKitView to be called first.
+            //
+            // Requires startCamera so cameraSource exists (no camera = NO_CAMERA).
+            // If VG_USE_CAMERA_GRAPH and no graph session = NO_GRAPH_SESSION.
+            guard let src = cameraSource else {
+                result(FlutterError(code: "NO_CAMERA",
+                                    message: "openNativeCamera: startCamera must be called first",
+                                    details: nil))
+                return
+            }
+            #if VG_USE_CAMERA_GRAPH
+            guard let graphSession = cameraGraphSession else {
+                result(FlutterError(code: "NO_GRAPH_SESSION",
+                                    message: "openNativeCamera: no active graph session (startCamera with VG_USE_CAMERA_GRAPH required)",
+                                    details: nil))
+                return
+            }
+            #endif
+            // Create a native VanguardCameraPlatformView for this VC.
+            // CGRect.zero is fine -- the VC will resize it in viewDidLoad.
+            let nativePlatformView = VanguardCameraPlatformView(frame: .zero)
+            let nativeVC = VGNativeCameraViewController(
+                cameraSource: src,
+                platformView: nativePlatformView,
+                graphSession: cameraGraphSession
+            )
+            nativeCameraVC = nativeVC
+            // Present on the root VC so it can receive viewWillTransition.
+            if let rootVC = UIApplication.shared.keyWindow?.rootViewController {
+                nativeVC.modalPresentationStyle = .overCurrentContext
+                rootVC.present(nativeVC, animated: false) {
+                    result(nil)
+                }
+            } else {
+                result(FlutterError(code: "NO_ROOT_VC",
+                                    message: "openNativeCamera: could not find root view controller",
+                                    details: nil))
+            }
+
+        case "closeNativeCamera":
+            // Dismisses the native camera VC and unlocks capture orientation.
+            if let vc = nativeCameraVC {
+                vc.dismiss(animated: false) {
+                    self.nativeCameraVC = nil
+                    result(nil)
+                }
+            } else {
+                result(nil)
+            }
+
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -1724,7 +1782,370 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
 
 
-// ─── P5: VanguardP5TestRunner ─────────────────────────────────────────────────
+// -- Phase 6C Option B: VGNativeCameraViewController --------------------------
+//
+// Self-contained native camera screen. Creates its own VanguardCameraPlatformView
+// and connects it to the existing VGCameraGraphSession (graph fan-out path).
+// Does NOT require connectPlatformViewToCamera / Flutter UiKitView to be opened.
+//
+// Contract:
+//   - Presented by openNativeCamera after camera is running.
+//   - Creates VanguardCameraPlatformView natively in viewDidLoad.
+//   - Connects that view as graph receiver in viewDidAppear.
+//   - Locks VanguardCameraMediaSource to portrait on viewDidAppear.
+//   - Receives viewWillTransition from UIKit (NOT UIDeviceOrientation).
+//   - Derives displayRotationIndex from windowScene.interfaceOrientation.
+//   - On dismiss: unlocks capture orientation + re-enables raw forwarding.
+//
+// Hard rules enforced:
+//   - Does NOT observe UIDeviceOrientation.
+//   - Does NOT invalidate or stop the graph session or camera.
+//   - VanguardCameraPlatformView is renderer-only: no orientation logic inside it.
+
+final class VGNativeCameraViewController: UIViewController {
+
+    private weak var cameraSource: VanguardCameraMediaSource?
+    // Strong: we created this view natively; the VC owns it.
+    private var ownedPlatformView: VanguardCameraPlatformView?
+    // Weak reference to the graph session -- do NOT invalidate on dismiss.
+    private weak var graphSession: VGCameraGraphSession?
+
+    // Cached position for mirror correction logging.
+    private var currentPosition: AVCaptureDevice.Position = .back
+    // Cached landscape direction for early rotation push when UIDevice orientation is ambiguous.
+    // Default 1 (landscapeLeft). Overwritten on each successful landscape transition.
+    private var _lastLandscapeRotationIndex: UInt32 = 1
+
+    // POC6C overlay state.
+    private var _beautyActive: Bool = false
+    private weak var _beautyButton: UIButton?
+
+    init(cameraSource: VanguardCameraMediaSource,
+         platformView: VanguardCameraPlatformView,
+         graphSession: VGCameraGraphSession?) {
+        self.cameraSource        = cameraSource
+        self.ownedPlatformView   = platformView
+        self.graphSession        = graphSession
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("VGNativeCameraViewController: init(coder:) not supported") }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        guard let pv = ownedPlatformView else { return }
+        let pvView = pv.view()
+        pvView.frame = view.bounds
+        pvView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(pvView)
+        NSLog("[Vanguard][6C] VGNativeCameraViewController: MTKView added to view hierarchy")
+        _addPOC6COverlay()
+    }
+
+    // -- POC6C minimal overlay ------------------------------------------------
+    // Adds Close (top-left), Switch (bottom-left), Beauty V2 (bottom-center),
+    // and Clear (bottom-right) buttons over the camera preview.
+    // Pure UIKit layout via NSLayoutConstraint anchors — no autoresizingMask
+    // conflicts. Respects safeAreaLayoutGuide in all orientations.
+    private func _addPOC6COverlay() {
+        // -- Shared style helper --------------------------------------------
+        func makeButton(title: String, action: Selector) -> UIButton {
+            let btn = UIButton(type: .system)
+            btn.setTitle(title, for: .normal)
+            btn.titleLabel?.font = UIFont.systemFont(ofSize: 14, weight: .semibold)
+            btn.setTitleColor(.white, for: .normal)
+            btn.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+            btn.layer.cornerRadius = 8
+            btn.contentEdgeInsets = UIEdgeInsets(top: 8, left: 14, bottom: 8, right: 14)
+            btn.addTarget(self, action: action, for: .touchUpInside)
+            btn.translatesAutoresizingMaskIntoConstraints = false
+            return btn
+        }
+
+        let safe = view.safeAreaLayoutGuide
+
+        // -- Close (top-left) -----------------------------------------------
+        let closeBtn = makeButton(title: "✕ Close", action: #selector(_poc6cClose))
+        view.addSubview(closeBtn)
+        NSLayoutConstraint.activate([
+            closeBtn.topAnchor.constraint(equalTo: safe.topAnchor, constant: 12),
+            closeBtn.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 16),
+        ])
+
+        // -- Bottom bar container -------------------------------------------
+        // A horizontal stack pinned to the bottom-safe area. No height set —
+        // it wraps its content so Safe-Area inset differences are transparent.
+        let bottomStack = UIStackView()
+        bottomStack.axis = .horizontal
+        bottomStack.distribution = .equalSpacing
+        bottomStack.alignment = .center
+        bottomStack.spacing = 12
+        bottomStack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(bottomStack)
+        NSLayoutConstraint.activate([
+            bottomStack.leadingAnchor.constraint(equalTo: safe.leadingAnchor, constant: 16),
+            bottomStack.trailingAnchor.constraint(equalTo: safe.trailingAnchor, constant: -16),
+            bottomStack.bottomAnchor.constraint(equalTo: safe.bottomAnchor, constant: -16),
+        ])
+
+        // -- Switch (left) --------------------------------------------------
+        let switchBtn = makeButton(title: "⇄ Switch", action: #selector(_poc6cSwitch))
+        bottomStack.addArrangedSubview(switchBtn)
+
+        // -- Beauty V2 (center) --------------------------------------------
+        let beautyBtn = makeButton(title: "Beauty OFF", action: #selector(_poc6cBeauty))
+        bottomStack.addArrangedSubview(beautyBtn)
+        _beautyButton = beautyBtn
+
+        // -- Clear (right) -------------------------------------------------
+        let clearBtn = makeButton(title: "Clear", action: #selector(_poc6cClear))
+        bottomStack.addArrangedSubview(clearBtn)
+    }
+
+    // -- POC6C overlay actions -----------------------------------------------
+
+    @objc private func _poc6cClose() {
+        // viewWillDisappear already handles orientation unlock + raw forwarding.
+        dismiss(animated: false)
+        NSLog("[Vanguard][6C] POC6C overlay: Close tapped — dismissing")
+    }
+
+    @objc private func _poc6cSwitch() {
+        guard let src = cameraSource else {
+            NSLog("[Vanguard][6C] POC6C overlay: Switch — no cameraSource")
+            return
+        }
+        let newPosition: AVCaptureDevice.Position = (currentPosition == .back) ? .front : .back
+        src.moveCamera(to: newPosition)
+        NSLog("[Vanguard][6C] POC6C overlay: Switch → %@",
+              newPosition == .front ? "front" : "back")
+        updateCameraPosition(newPosition)
+    }
+
+    @objc private func _poc6cBeauty() {
+        #if VG_USE_CAMERA_GRAPH
+        guard let session = graphSession else {
+            NSLog("[Vanguard][6C] POC6C overlay: Beauty — no graphSession")
+            return
+        }
+        if _beautyActive {
+            // Toggle OFF: clear filter chain.
+            session.setCameraFilterChain(nil)
+            _beautyActive = false
+            _beautyButton?.setTitle("Beauty OFF", for: .normal)
+            NSLog("[Vanguard][6C] POC6C overlay: Beauty V2 OFF (cleared)")
+        } else {
+            // Toggle ON: apply Beauty V2 at intensity 0.75.
+            let spec: [String: Any] = [
+                "type": "beauty",
+                "parameters": ["beautyVersion": 2, "intensity": 0.75]
+            ]
+            let didApply = (try? session.setCameraFilterChainFromSpecs([spec])) != nil
+            _ = didApply
+            _beautyActive = true
+            _beautyButton?.setTitle("Beauty ON", for: .normal)
+            NSLog("[Vanguard][6C] POC6C overlay: Beauty V2 ON (intensity=0.75)")
+        }
+        #else
+        NSLog("[Vanguard][6C] POC6C overlay: Beauty — VG_USE_CAMERA_GRAPH not enabled")
+        #endif
+    }
+
+    @objc private func _poc6cClear() {
+        #if VG_USE_CAMERA_GRAPH
+        guard let session = graphSession else {
+            NSLog("[Vanguard][6C] POC6C overlay: Clear — no graphSession")
+            return
+        }
+        session.setCameraFilterChain(nil)
+        _beautyActive = false
+        _beautyButton?.setTitle("Beauty OFF", for: .normal)
+        NSLog("[Vanguard][6C] POC6C overlay: Clear — filter chain cleared")
+        #else
+        NSLog("[Vanguard][6C] POC6C overlay: Clear — VG_USE_CAMERA_GRAPH not enabled")
+        #endif
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        guard let src = cameraSource, let pv = ownedPlatformView else { return }
+
+        // Lock capture buffers to portrait -- stable 1080x1920.
+        src.lockPreviewOrientationToPortrait()
+
+        // Connect the native platform view to the graph session (graph fan-out path).
+        // This mirrors the POC2 connectPlatformViewToCamera wiring exactly.
+        #if VG_USE_CAMERA_GRAPH
+        if let session = graphSession {
+            let connected = session.connectPlatformViewReceiver(pv)
+            if connected {
+                src.platformViewRawForwardingEnabled = false
+                NSLog("[Vanguard][6C] VGNativeCameraViewController: graph fan-out wired to native MTKView ✓ (connected_graph)")
+            } else {
+                // Fallback: raw forwarding if graph connect fails.
+                src.frameReceiver = pv
+                NSLog("[Vanguard][6C] VGNativeCameraViewController: graph connect failed, fell back to raw forwarding")
+            }
+        } else {
+            // No graph session: raw forwarding path.
+            src.frameReceiver = pv
+            NSLog("[Vanguard][6C] VGNativeCameraViewController: no graph session, using raw frameReceiver")
+        }
+        #else
+        src.frameReceiver = pv
+        NSLog("[Vanguard][6C] VGNativeCameraViewController: raw frameReceiver wired ✓")
+        #endif
+
+        // Sync the platform view to the current interface orientation.
+        _pushCurrentOrientationFinal()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        guard let src = cameraSource else { return }
+        // Unlock orientation so normal camera path resumes.
+        src.unlockPreviewOrientation()
+        // Re-enable raw forwarding so the playground texture path works again.
+        // The VGPlatformViewSinkAdapter in the graph session holds ownedPlatformView
+        // weakly -- when this VC is deallocated, the adapter silently drops frames.
+        // We set platformViewRawForwardingEnabled back to YES so the legacy
+        // Texture path (playground preview) can receive frames if re-wired.
+        src.platformViewRawForwardingEnabled = true
+        NSLog("[Vanguard][6C] VGNativeCameraViewController: dismissed — orientation unlocked, raw forwarding re-enabled")
+    }
+
+    // Called by UIKit before the interface rotates.
+    // UIKit resizes the MTKView drawable at the START of this call, so we must
+    // push displayRotationIndex IMMEDIATELY using the target `size`, not wait
+    // for the coordinator completion block (~300ms later).
+    override func viewWillTransition(to size: CGSize,
+                                      with coordinator: UIViewControllerTransitionCoordinator) {
+        super.viewWillTransition(to: size, with: coordinator)
+
+        // -- EARLY PUSH: derive target rotationIndex from the incoming size --------
+        // size is the POST-rotation logical bounds of the VC view.
+        // We push immediately so the Metal draw(in:) uses the correct rotationIndex
+        // as soon as the drawable resizes -- no ~300ms lag.
+        let earlyIndex = _earlyRotationIndex(for: size)
+        let isFront    = (currentPosition == .front)
+        let earlyMirror = (isFront && earlyIndex != 0)
+        NSLog("[Vanguard][6C] transition target size=%.0fx%.0f earlyDisplayRotationIndex=%d",
+              size.width, size.height, earlyIndex)
+        if let pv = ownedPlatformView {
+            pv.displayRotationIndex    = earlyIndex
+            pv.isFrontCamera           = isFront
+            pv.mirrorCorrectionEnabled = earlyMirror
+        }
+
+        // -- FINAL SYNC: authoritative windowScene read after animation ends -------
+        // Keeps the rotationIndex accurate if the early size-based guess was wrong.
+        coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+            self?._pushCurrentOrientationFinal()
+        }
+    }
+
+    // Derives rotationIndex from the transition target size.
+    //   portrait  (h > w) → 0
+    //   landscape (w > h) → read UIDevice.current.orientation first (most reliable
+    //                        at viewWillTransition time), fall back to last known
+    //                        landscape direction if device orientation is ambiguous.
+    private func _earlyRotationIndex(for size: CGSize) -> UInt32 {
+        if size.height >= size.width {
+            // Target is portrait.
+            return 0
+        }
+        // Target is landscape -- determine direction.
+        let deviceOrientation = UIDevice.current.orientation
+        switch deviceOrientation {
+        case .landscapeLeft:
+            // Physical device rotated LEFT → UIInterfaceOrientation.landscapeRight → index 2
+            _lastLandscapeRotationIndex = 2
+            return 2
+        case .landscapeRight:
+            // Physical device rotated RIGHT → UIInterfaceOrientation.landscapeLeft → index 1
+            _lastLandscapeRotationIndex = 1
+            return 1
+        default:
+            break
+        }
+        // Device orientation ambiguous (face up/down/unknown) — fall back to
+        // windowScene if available, otherwise use cached last landscape direction.
+        if #available(iOS 13.0, *) {
+            if let scene = view.window?.windowScene {
+                switch scene.interfaceOrientation {
+                case .landscapeLeft:  _lastLandscapeRotationIndex = 1; return 1
+                case .landscapeRight: _lastLandscapeRotationIndex = 2; return 2
+                default: break
+                }
+            }
+        }
+        return _lastLandscapeRotationIndex
+    }
+
+    // -- Orientation mapping ---------------------------------------------------
+
+    // Final authoritative orientation push — reads windowScene.interfaceOrientation.
+    // Called from viewDidAppear, viewWillTransition completion, and updateCameraPosition.
+    // NOT called from the early transition push (which uses _earlyRotationIndex(for:)).
+    private func _pushCurrentOrientationFinal() {
+        let uiOrientation = _currentInterfaceOrientation()
+        let rotationIndex = _rotationIndex(for: uiOrientation)
+        let isFront       = (currentPosition == .front)
+        let mirrorNeeded  = (isFront && rotationIndex != 0)
+
+        NSLog("[Vanguard][6C] final uiOrientation=%@ displayRotationIndex=%d front=%@ mirrorCorrection=%@",
+              _orientationName(uiOrientation),
+              rotationIndex,
+              isFront ? "YES" : "NO",
+              mirrorNeeded ? "YES" : "NO")
+
+        if let pv = ownedPlatformView {
+            pv.displayRotationIndex    = rotationIndex
+            pv.isFrontCamera           = isFront
+            pv.mirrorCorrectionEnabled = mirrorNeeded
+        }
+    }
+
+    private func _currentInterfaceOrientation() -> UIInterfaceOrientation {
+        if #available(iOS 13.0, *) {
+            if let scene = view.window?.windowScene {
+                return scene.interfaceOrientation
+            }
+        }
+        return UIApplication.shared.statusBarOrientation
+    }
+
+    private func _rotationIndex(for orientation: UIInterfaceOrientation) -> UInt32 {
+        switch orientation {
+        case .landscapeLeft:  return 1
+        case .landscapeRight: return 2
+        default:              return 0
+        }
+    }
+
+    private func _orientationName(_ o: UIInterfaceOrientation) -> String {
+        switch o {
+        case .portrait:            return "portrait"
+        case .portraitUpsideDown:  return "portraitUpsideDown"
+        case .landscapeLeft:       return "landscapeLeft"
+        case .landscapeRight:      return "landscapeRight"
+        default:                   return "unknown"
+        }
+    }
+
+    func updateCameraPosition(_ position: AVCaptureDevice.Position) {
+        currentPosition = position
+        _pushCurrentOrientationFinal()
+    }
+}
+
+// -- Phase 6C: Beauty spec safety -------------------------------------------
+// VGNativeCameraViewController does NOT touch BeautyV2FilterGroup.
+// ---------------------------------------------------------------------------
+
+
+// --- P5: VanguardP5TestRunner --------------------------------------------------------
 //
 // Runs named P5 assertions in-process without XCTest. Called from the
 // runNativeTest method channel case above. Lives in this file so it is

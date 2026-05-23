@@ -17,9 +17,9 @@
 
 #import "VanguardCameraMediaSource.h"
 #import "VanguardMLGate.h"
+#import <ImageIO/ImageIO.h>
 #import <mach/mach.h>
 #import <os/lock.h>
-#import <ImageIO/ImageIO.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Internal recording state
@@ -97,7 +97,7 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
   VanguardMLGate *_mlGate;
   CVPixelBufferPoolRef _mlInputPool; // 256x256 BGRA pool owned by this source
   dispatch_queue_t _mlQueue;
-  id _thermalObserver; // NSNotificationCenter token
+  id _thermalObserver;     // NSNotificationCenter token
   id _orientationObserver; // UIDevice orientation change token
 
   // ── Device controls & camera switching (Phases 2–3) ──────────────────────
@@ -116,6 +116,14 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
   //   window. Read and written exclusively on the main thread — no lock needed.
   dispatch_queue_t _photoQueue;
   BOOL _isSwitching;
+
+  // ── Phase 6C: Preview orientation lock ───────────────────────────────────
+  // When YES, _applyConnectionOrientationContract forces portrait orientation
+  // and suppresses the device-rotation-triggered updates so capture buffers
+  // remain stable at 1080x1920 while native camera preview is displayed.
+  // Written on main thread only; read on main thread (orientation observer
+  // fires on main queue). No lock needed.
+  BOOL _previewOrientationLocked;
 }
 
 @synthesize captureSession = _session;
@@ -165,7 +173,7 @@ static const char kCaptureQueueKey = 0;
   _photoQueue = dispatch_queue_create(
       "com.vanguard.photo",
       dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
-                                             QOS_CLASS_USER_INITIATED, 0));
+                                              QOS_CLASS_USER_INITIATED, 0));
 
   // Create the raw CVPixelBufferPool that VanguardMLGate requires.
   // VanguardMLGate.initWithMLQueue:inputPool: takes a CVPixelBufferPoolRef
@@ -228,19 +236,20 @@ static const char kCaptureQueueKey = 0;
       addObserverForName:UIDeviceOrientationDidChangeNotification
                   object:nil
                    queue:[NSOperationQueue mainQueue]
-            usingBlock:^(NSNotification *_) {
-              typeof(self) strongSelf = weakSelf;
-              if (!strongSelf || !strongSelf->_session.isRunning)
-                return;
-              [strongSelf _applyConnectionOrientationContract];
-            }];
+              usingBlock:^(NSNotification *_) {
+                typeof(self) strongSelf = weakSelf;
+                if (!strongSelf || !strongSelf->_session.isRunning)
+                  return;
+                [strongSelf _applyConnectionOrientationContract];
+              }];
 
   _session = [[AVCaptureSession alloc] init];
   [self _configureSession];
 
   // POC2: raw forwarding gate defaults to YES (POC1 path active by default).
   // Set to NO by VGCameraGraphSession.connectPlatformViewReceiver: when the
-  // two-child VGFanOutSink is installed to prevent raw+processed double delivery.
+  // two-child VGFanOutSink is installed to prevent raw+processed double
+  // delivery.
   self.platformViewRawForwardingEnabled = YES;
 
   return self;
@@ -338,7 +347,8 @@ static const char kCaptureQueueKey = 0;
 
 - (void)start {
   if (_session.isRunning) {
-    NSLog(@"[VanguardCamera] start — session already running, idempotent no-op.");
+    NSLog(
+        @"[VanguardCamera] start — session already running, idempotent no-op.");
     return;
   }
 
@@ -493,7 +503,8 @@ static const char kCaptureQueueKey = 0;
   // so the MTKView receives only graph-processed frames from VGFanOutSink.
   //
   // REMOVE before Phase 7 / production.
-  id<VanguardCameraFrameReceiver> receiver = _frameReceiver; // strong local, atomic read
+  id<VanguardCameraFrameReceiver> receiver =
+      _frameReceiver; // strong local, atomic read
   if (receiver && self.platformViewRawForwardingEnabled) {
     static dispatch_once_t _poc1FirstFrameOnce;
     dispatch_once(&_poc1FirstFrameOnce, ^{
@@ -991,8 +1002,52 @@ static const char kCaptureQueueKey = 0;
 
   [_session commitConfiguration];
 
+  // Phase 6C: re-apply portrait lock if it was active before the switch.
+  // _applyConnectionOrientationContract above already enforces portrait when
+  // locked, but calling the public method logs the event for diagnostics.
+  if (_previewOrientationLocked) {
+    NSLog(@"[Vanguard][6C] moveCameraToPosition: re-applying portrait lock after camera switch");
+    // Lock already enforced by _applyConnectionOrientationContract; no further work.
+  }
+
   // Reconfiguration complete — photo capture allowed again.
   _isSwitching = NO;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Phase 6C: Preview Orientation Lock
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These methods are called by VGNativeCameraViewController (inside
+// VanguardMediaEnginePlugin.swift) to bracket native camera preview.
+//
+// lockPreviewOrientationToPortrait:
+//   - Sets _previewOrientationLocked = YES.
+//   - Immediately forces videoOrientation = portrait on the active connection.
+//   - Future _applyConnectionOrientationContract calls will skip the
+//     device-orientation switch and keep portrait locked.
+//
+// unlockPreviewOrientation:
+//   - Clears _previewOrientationLocked.
+//   - Calls _applyConnectionOrientationContract to re-sync orientation with
+//     the current device orientation.
+
+- (void)lockPreviewOrientationToPortrait {
+  _previewOrientationLocked = YES;
+  // Force portrait immediately on the active video connection.
+  AVCaptureConnection *vidConn =
+      [_videoOutput connectionWithMediaType:AVMediaTypeVideo];
+  if (vidConn && vidConn.isVideoOrientationSupported) {
+    vidConn.videoOrientation = AVCaptureVideoOrientationPortrait;
+  }
+  NSLog(@"[Vanguard][6C] preview orientation locked to portrait");
+}
+
+- (void)unlockPreviewOrientation {
+  _previewOrientationLocked = NO;
+  // Restore orientation to match current device angle.
+  [self _applyConnectionOrientationContract];
+  NSLog(@"[Vanguard][6C] preview orientation unlocked");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1008,7 +1063,8 @@ static const char kCaptureQueueKey = 0;
 //   _captureQueue and AVAssetWriter state are never touched.
 
 - (void)takePhotoToURL:(NSURL *)url
-            completion:(void (^)(NSURL *_Nullable, NSError *_Nullable))completion {
+            completion:
+                (void (^)(NSURL *_Nullable, NSError *_Nullable))completion {
 
   // Step 1 — Reject during camera-switch reconfiguration window.
   // _isSwitching and this call are both on the main thread; no lock required.
@@ -1038,9 +1094,7 @@ static const char kCaptureQueueKey = 0;
     NSError *err = [NSError
         errorWithDomain:@"VanguardCamera"
                    code:1
-               userInfo:@{
-                 NSLocalizedDescriptionKey : @"No frame available"
-               }];
+               userInfo:@{NSLocalizedDescriptionKey : @"No frame available"}];
     dispatch_async(dispatch_get_main_queue(), ^{
       completion(nil, err);
     });
@@ -1080,12 +1134,12 @@ static const char kCaptureQueueKey = 0;
     }
 
     if (!jpegData) {
-      NSError *err = [NSError
-          errorWithDomain:@"VanguardCamera"
-                     code:2
-                 userInfo:@{
-                   NSLocalizedDescriptionKey : @"JPEG encoding failed"
-                 }];
+      NSError *err =
+          [NSError errorWithDomain:@"VanguardCamera"
+                              code:2
+                          userInfo:@{
+                            NSLocalizedDescriptionKey : @"JPEG encoding failed"
+                          }];
       dispatch_async(dispatch_get_main_queue(), ^{
         completion(nil, err);
       });
@@ -1141,11 +1195,13 @@ static const char kCaptureQueueKey = 0;
 ///
 /// Apple UIDeviceOrientation -> AVCaptureVideoOrientation mapping
 /// (per Apple AVCam sample code -- landscape axes are INVERTED):
-///   UIDeviceOrientationPortrait            -> AVCaptureVideoOrientationPortrait
-///   UIDeviceOrientationPortraitUpsideDown  -> AVCaptureVideoOrientationPortraitUpsideDown
-///   UIDeviceOrientationLandscapeLeft       -> AVCaptureVideoOrientationLandscapeRight
-///   UIDeviceOrientationLandscapeRight      -> AVCaptureVideoOrientationLandscapeLeft
-///   FaceUp / FaceDown / Unknown            -> Portrait fallback
+///   UIDeviceOrientationPortrait            ->
+///   AVCaptureVideoOrientationPortrait UIDeviceOrientationPortraitUpsideDown ->
+///   AVCaptureVideoOrientationPortraitUpsideDown
+///   UIDeviceOrientationLandscapeLeft       ->
+///   AVCaptureVideoOrientationLandscapeRight UIDeviceOrientationLandscapeRight
+///   -> AVCaptureVideoOrientationLandscapeLeft FaceUp / FaceDown / Unknown ->
+///   Portrait fallback
 ///
 /// Mirroring contract:
 ///   automaticallyAdjustsVideoMirroring = NO
@@ -1154,7 +1210,8 @@ static const char kCaptureQueueKey = 0;
 /// Called from:
 ///   _configureSession       -- initial session setup
 ///   moveCameraToPosition:   -- inside beginConfiguration/commitConfiguration
-///   UIDeviceOrientationDidChangeNotification -- re-apply after physical rotation
+///   UIDeviceOrientationDidChangeNotification -- re-apply after physical
+///   rotation
 - (void)_applyConnectionOrientationContract {
   AVCaptureConnection *vidConn =
       [_videoOutput connectionWithMediaType:AVMediaTypeVideo];
@@ -1162,10 +1219,16 @@ static const char kCaptureQueueKey = 0;
     return;
 
   if (vidConn.isVideoOrientationSupported) {
-    UIDeviceOrientation devOrientation = UIDevice.currentDevice.orientation;
-    AVCaptureVideoOrientation vidOrientation;
+    // Phase 6C: when the preview orientation is locked, always force portrait
+    // so capture buffers remain stable at 1080x1920 regardless of device angle.
+    // The VC+MTKView presenter handles the visual rotation instead.
+    if (_previewOrientationLocked) {
+      vidConn.videoOrientation = AVCaptureVideoOrientationPortrait;
+    } else {
+      UIDeviceOrientation devOrientation = UIDevice.currentDevice.orientation;
+      AVCaptureVideoOrientation vidOrientation;
 
-    switch (devOrientation) {
+      switch (devOrientation) {
       case UIDeviceOrientationPortraitUpsideDown:
         vidOrientation = AVCaptureVideoOrientationPortraitUpsideDown;
         break;
@@ -1182,9 +1245,10 @@ static const char kCaptureQueueKey = 0;
         // Portrait, FaceUp, FaceDown, Unknown -> portrait fallback
         vidOrientation = AVCaptureVideoOrientationPortrait;
         break;
-    }
+      }
 
-    vidConn.videoOrientation = vidOrientation;
+      vidConn.videoOrientation = vidOrientation;
+    }
   }
 
   if (vidConn.isVideoMirroringSupported) {

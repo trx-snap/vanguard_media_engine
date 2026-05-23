@@ -167,3 +167,70 @@ fragment float4 vanguard_blit_rotated(
 
     return float4(color, sampled.a);
 }
+
+// --- Fragment Shader: Rotated Blit with Crop + Mirror Correction (Phase 6C) ---
+//
+// Extends vanguard_blit_rotated with aspect-fill crop and front-camera mirror
+// correction. Existing callers of vanguard_blit_rotated are UNAFFECTED.
+//
+// Buffer layout:
+//   buffer(0) -> rotationIndex:     uint   (0=identity, 1=+90, 2=-90, 3=180)
+//   buffer(1) -> isHLG:             uint   (0=SDR, 1=HLG colour correction)
+//   buffer(2) -> cropUniforms:      float4 (offsetU, offsetV, scaleU, scaleV)
+//                 offsetU/V: UV origin of the visible crop window (centre crop)
+//                 scaleU/V:  UV scale of the visible crop window (<= 1.0)
+//   buffer(3) -> mirrorCorrection:  uint   (0=off, 1=flip tex.y after rotation)
+//
+// UV pipeline (all in [0,1] space):
+//   1. Apply crop: uv = offset + uv * scale   (select central window)
+//   2. Apply rotation: remap uv per rotationIndex
+//   3. Apply mirror: flip uv.y if mirrorCorrection == 1
+//
+// Preserves existing vanguard_vertex + vertex descriptor -- no vertex changes.
+
+fragment float4 vanguard_blit_rotated_ex(
+    VertexOut in                    [[stage_in]],
+    texture2d<float> srcTexture     [[texture(0)]],
+    constant uint&   rotationIndex  [[buffer(0)]],
+    constant uint&   isHLG          [[buffer(1)]],
+    constant float4& cropUniforms   [[buffer(2)]],  // (offsetU, offsetV, scaleU, scaleV)
+    constant uint&   mirrorCorrection [[buffer(3)]]
+) {
+    constexpr sampler s(mag_filter::linear, min_filter::linear,
+                        address::clamp_to_edge);
+
+    float2 uv = in.texCoord;
+
+    // Step 1: apply aspect-fill crop (select central visible window).
+    float2 cropOffset = float2(cropUniforms.x, cropUniforms.y);
+    float2 cropScale  = float2(cropUniforms.z, cropUniforms.w);
+    uv = cropOffset + uv * cropScale;
+
+    // Step 2: apply rotation (same mapping as vanguard_blit_rotated).
+    if      (rotationIndex == 1) uv = float2(uv.y, 1.0 - uv.x);        // +90 CW
+    else if (rotationIndex == 2) uv = float2(1.0 - uv.y, uv.x);        // -90 CCW
+    else if (rotationIndex == 3) uv = float2(1.0 - uv.x, 1.0 - uv.y); // 180
+
+    // Step 3: mirror correction -- flip tex.y to correct front-camera
+    // portrait-space horizontal mirror becoming a display vertical flip
+    // after 90° rotation into landscape.
+    if (mirrorCorrection != 0) {
+        uv.y = 1.0 - uv.y;
+    }
+
+    float4 sampled = srcTexture.sample(s, uv);
+    float3 color   = sampled.rgb;
+
+    if (isHLG != 0) {
+        float3 bt2020Linear = hlgInverseOETF(max(color, float3(0.0)));
+        float3x3 M = float3x3(
+            float3( 1.6605, -0.1246, -0.0182),
+            float3(-0.5876,  1.1329, -0.1006),
+            float3(-0.0728, -0.0083,  1.1187)
+        );
+        float3 bt709Linear = clamp(M * bt2020Linear, 0.0, 1.0);
+        color = sRGBEncode(bt709Linear);
+    }
+
+    return float4(color, sampled.a);
+}
