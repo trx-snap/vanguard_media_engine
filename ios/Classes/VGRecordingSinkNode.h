@@ -1,5 +1,5 @@
 // VGRecordingSinkNode.h
-// vanguard_media_engine — Phase 6E.1A / Phase 6E.1B
+// vanguard_media_engine — Phase 6E.1A / Phase 6E.1B / Phase 6E.1C
 //
 // VGRecordingSinkNode is the graph-aware recording terminal sink.
 // When wired as a child of VGFanOutSink, it will receive processed
@@ -15,15 +15,18 @@
 //     the writer; the sink only forwards frames when enabled.
 //   - Future Phase 6E.1 steps will add bounded async handoff and processed-frame recording.
 //
-// Current status — Phase 6E.1B (WIRED, DISABLED):
+// Current status — Phase 6E.1C (FORWARDING PATH):
 //   - Included as last child of VGFanOutSink via VGCameraGraphFactory.
-//   - presentEnvelope: remains an immediate no-op (sink is disabled).
-//   - No frames are forwarded, retained, or encoded.
+//   - presentEnvelope: forwards processed frames to VanguardCameraMediaSource
+//     via appendProcessedVideoFrame:pts: when ready and enabled.
+//   - The sink itself remains disabled (enabled defaults NO).
+//   - graphRecordingEnabled on the source also defaults to NO.
+//   - As a result, appendProcessedVideoFrame:pts: is a no-op at runtime.
+//   - No frames are recorded via the graph path in this phase.
 //   - Runtime recording behavior is unchanged.
 //
 // Future steps will:
-//   6E.1C — Implement frame forwarding to VanguardCameraMediaSource.
-//   6E.1D — Enable by default; remove raw-path recording from VanguardCameraMediaSource.
+//   6E.1D — Enable by default at startRecording; gate raw-path recording.
 //
 // PORTABLE: VGFrameSink contract is platform-agnostic.
 // PLATFORM: iOS — CoreMedia, CoreVideo. AVFoundation is owned by the delegate.
@@ -46,7 +49,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// Graph terminal sink that receives processed camera frames and delegates
 /// encoding to VanguardCameraMediaSource (Option A delegated architecture).
 ///
-/// Phase 6E.1A: Skeleton only. presentEnvelope: is a no-op while disabled.
+/// Phase 6E.1C: presentEnvelope: forwards to VanguardCameraMediaSource
+/// appendProcessedVideoFrame:pts: when enabled. Sink and graphRecordingEnabled
+/// both default to NO, so the forwarding path is unreachable at runtime.
 @interface VGRecordingSinkNode : NSObject <VGFrameSink>
 
 // ─── Properties ───────────────────────────────────────────────────────────────

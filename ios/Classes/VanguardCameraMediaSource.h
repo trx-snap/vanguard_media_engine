@@ -1,5 +1,5 @@
 // VanguardCameraMediaSource.h
-// Phase 3: Camera source implementing VanguardMediaSource protocol.
+// Phase 3 / Phase 6E.1C: Camera source implementing VanguardMediaSource protocol.
 // Preview: AVCaptureVideoDataOutput → CVPixelBuffer → videoCallback → MTKView
 // (Metal) Recording: AVAssetWriter (internal H.264) +
 // AVAssetWriterInputPixelBufferAdaptor Audio: AVCaptureAudioDataOutput added at
@@ -85,6 +85,20 @@ NS_ASSUME_NONNULL_BEGIN
 // POC2 ONLY — Remove before Phase 7 / production.
 @property(atomic, assign) BOOL platformViewRawForwardingEnabled;
 
+// ── Phase 6E.1C: Graph-backed recording gate
+// ─────────────────────────────────────────────
+//
+// When YES, VGRecordingSinkNode forwards processed graph frames to the writer
+// via appendProcessedVideoFrame:pts:. Defaults to NO — raw recording path
+// remains the sole active write path.
+//
+// Phase 6E.1D will set this to YES at startRecording time and gate the raw
+// append path behind !graphRecordingEnabled.
+//
+// Thread-safe: atomic BOOL; written once at session start, read on the graph
+// execution queue (com.vanguard.cameraGraphExecution).
+@property(atomic, assign) BOOL graphRecordingEnabled;
+
 // ── Recording state
 // ───────────────────────────────────────────────────────────
 
@@ -150,6 +164,31 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)takePhotoToURL:(NSURL *)url
             completion:
                 (void (^)(NSURL *_Nullable, NSError *_Nullable))completion;
+
+// ── Phase 6E.1C: Processed-frame append entry point ─────────────────────────
+
+/// Appends a processed (effects-applied) video frame to the active AVAssetWriter.
+///
+/// Called by VGRecordingSinkNode.presentEnvelope: on the graph execution queue
+/// (com.vanguard.cameraGraphExecution). Internally dispatches to _captureQueue
+/// to share the existing recording state machine, backpressure accounting,
+/// and AVAssetWriter access.
+///
+/// No-op when:
+///   - graphRecordingEnabled is NO (default in Phase 6E.1C)
+///   - _recordingState != VanguardRecordingStateWriting
+///   - pixelBuffer is NULL
+///
+/// Buffer ownership: caller passes +0. This method retains the buffer
+/// across the async dispatch to _captureQueue and releases after append.
+///
+/// Phase 6E.1C: graphRecordingEnabled defaults to NO. No current code sets
+/// it to YES — this method is unreachable at runtime in this phase.
+/// Phase 6E.1D will enable graph recording and gate the raw append path.
+///
+/// @param pixelBuffer The processed CVPixelBuffer from graph output.
+/// @param pts         Presentation timestamp from the original VGFrameEnvelope.
+- (void)appendProcessedVideoFrame:(CVPixelBufferRef)pixelBuffer pts:(CMTime)pts;
 
 @end
 

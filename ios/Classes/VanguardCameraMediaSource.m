@@ -833,6 +833,89 @@ static const char kCaptureQueueKey = 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Phase 6E.1C — Graph-backed recording append
+
+/// Appends a processed (effects-applied) graph frame to the active AVAssetWriter.
+///
+/// Threading: Called from VGRecordingSinkNode.presentEnvelope: on the graph
+/// execution queue (com.vanguard.cameraGraphExecution). Dispatches internally
+/// to _captureQueue so all writer state is always accessed on a single serial
+/// queue. Retains pixelBuffer before dispatch; releases unconditionally on
+/// every exit path inside the block.
+///
+/// Behavior is a no-op in Phase 6E.1C because graphRecordingEnabled defaults
+/// to NO. No caller sets it to YES in this phase.
+- (void)appendProcessedVideoFrame:(CVPixelBufferRef)pixelBuffer pts:(CMTime)pts {
+  // Gate 1: graph recording must be explicitly enabled (defaults NO in 6E.1C).
+  if (!self.graphRecordingEnabled) return;
+
+  // Gate 2: buffer must be valid.
+  if (!pixelBuffer) return;
+
+  // Gate 3: fast-path recording state check (non-authoritative; re-checked on
+  // _captureQueue below to avoid a race on _recordingState).
+  if (_recordingState != VanguardRecordingStateWriting) return;
+
+  // Retain buffer across the async boundary. Released unconditionally inside
+  // the block below.
+  CVPixelBufferRetain(pixelBuffer);
+
+  dispatch_async(_captureQueue, ^{
+    // Re-check state on the owning queue (authoritative).
+    if (self->_recordingState != VanguardRecordingStateWriting) {
+      CVPixelBufferRelease(pixelBuffer);
+      return;
+    }
+
+    // First-frame: start the AVAssetWriter session at this PTS. Mirrors the
+    // raw append path so the timeline origin is consistent regardless of which
+    // path delivers the first frame.
+    if (!self->_sessionStarted) {
+      [self->_assetWriter startSessionAtSourceTime:pts];
+      self->_sessionStarted = YES;
+      self->_windowStart = CACurrentMediaTime();
+    }
+
+    // Backpressure: isReadyForMoreMediaData gate. Mirrors the raw path counters
+    // so stats reported via stopRecordingWithCompletion: remain accurate.
+    if (!self->_videoWriterInput.isReadyForMoreMediaData) {
+      int32_t dropped = ++self->_droppedFrameCount;
+      int32_t consec  = ++self->_consecutiveDropCount;
+      self->_windowDrops++;
+      int32_t total = ++self->_totalFrameCount;
+      (void)dropped;
+      (void)consec;
+      [self _evaluateBackpressureWithTotal:total];
+      CVPixelBufferRelease(pixelBuffer);
+      return;
+    }
+    self->_consecutiveDropCount = 0;
+
+    int32_t total = ++self->_totalFrameCount;
+
+    // Append the processed frame. AVAssetWriterInputPixelBufferAdaptor is
+    // synchronous — buffer consumed before this returns.
+    [self->_pixelBufferAdaptor appendPixelBuffer:pixelBuffer
+                              withPresentationTime:pts];
+
+    // Window bookkeeping — mirrors raw path exactly.
+    self->_windowFrames++;
+    NSTimeInterval elapsed = CACurrentMediaTime() - self->_windowStart;
+    if (elapsed >= 2.0) {
+      [self _evaluateBackpressureWithTotal:total];
+      self->_windowDrops  = 0;
+      self->_windowFrames = 0;
+      self->_windowStart  = CACurrentMediaTime();
+    }
+
+    // No Tier-2 frame-skip here. The graph execution queue already provides
+    // drop-latest backpressure via VGCameraGraphSession._graphInFlight.
+
+    CVPixelBufferRelease(pixelBuffer);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Watchdog (mediaserverd stall detection)
 
 - (void)_startWatchdog {

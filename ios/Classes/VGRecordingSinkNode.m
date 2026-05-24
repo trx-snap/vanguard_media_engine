@@ -1,10 +1,11 @@
 // VGRecordingSinkNode.m
-// vanguard_media_engine — Phase 6E.1A / Phase 6E.1B
+// vanguard_media_engine — Phase 6E.1A / Phase 6E.1B / Phase 6E.1C
 //
-// Phase 6E.1B: Wired into VGFanOutSink via VGCameraGraphFactory (disabled).
-// All VGFrameSink/VGNode protocol methods remain behavior-neutral.
-// presentEnvelope: returns immediately unless ready and enabled.
-// No frames are forwarded, retained, or encoded in this step.
+// Phase 6E.1C: Forwarding path wired to VanguardCameraMediaSource.
+// presentEnvelope: forwards the processed CVPixelBuffer to the source via
+// appendProcessedVideoFrame:pts: when the sink is enabled.
+// The sink remains disabled by default (enabled = NO) and graphRecordingEnabled
+// on the source also defaults to NO, so this path is unreachable at runtime.
 
 #import "VGRecordingSinkNode.h"
 #import "VanguardCameraMediaSource.h"
@@ -90,12 +91,34 @@
 // ─── VGFrameSink Protocol Frame Presentation ──────────────────────────────────
 
 - (void)presentEnvelope:(VGFrameEnvelope)envelope {
-    // Phase 6E.1A: Return immediately unless ready and enabled.
-    // No frames are forwarded, retained, or encoded in this step.
-    // Future Phase 6E.1 steps will add bounded async handoff and processed-frame recording.
+    // Return immediately unless the sink is ready and enabled.
+    // The sink defaults to disabled (enabled = NO set in init).
+    // VGCameraGraphSession has not set enabled = YES in this phase.
     if (!_ready || !self.isEnabled) {
         return;
     }
+
+    // Phase 6E.1C: Extract the processed video buffer from the graph envelope.
+    // Envelope payload is +0 — owned by the graph runtime for the duration
+    // of this synchronous call. appendProcessedVideoFrame:pts: retains the
+    // buffer internally across its own async dispatch to _captureQueue.
+    CVPixelBufferRef processedBuffer = envelope.payload.videoBuffer;
+    if (!processedBuffer) {
+        return;
+    }
+
+    // Strongify the weak source reference. _source is __weak; strongifying
+    // prevents the source from being deallocated between the nil-check and
+    // the method call.
+    VanguardCameraMediaSource *source = _source;
+    if (!source) {
+        return;
+    }
+
+    // Delegate encoding to the source. The source gates on graphRecordingEnabled
+    // (defaults NO) and _recordingState internally, then dispatches to
+    // _captureQueue. No retain or dispatch happens in this node.
+    [source appendProcessedVideoFrame:processedBuffer pts:envelope.pts];
 }
 
 // ─── State ────────────────────────────────────────────────────────────────────
