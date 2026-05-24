@@ -102,6 +102,29 @@ NS_ASSUME_NONNULL_BEGIN
 /// Static helper mapping the compile-time feature flag VG_USE_CAMERA_GRAPH to a runtime check.
 + (BOOL)isGraphModeEnabled;
 
+// ─── Phase 6E.1D: Graph-backed recording control ─────────────────────────────
+
+/// Enables or disables the graph-backed recording path.
+///
+/// When YES:
+///   - VGRecordingSinkNode.enabled is set to YES (sink starts forwarding frames).
+///   - source.graphRecordingEnabled is set to YES (raw video append path is gated).
+///   Sink is enabled FIRST so there is no window where the raw path is off
+///   but the graph path is not yet ready.
+///
+/// When NO:
+///   - source.graphRecordingEnabled is set to NO FIRST (raw path resumes
+///     immediately, preventing zero-coverage windows).
+///   - VGRecordingSinkNode.enabled is then set to NO.
+///
+/// If the recording sink node is not found in the current node map when enabling,
+/// the source flag is NOT set (raw recording fallback is preserved silently).
+///
+/// Thread-safe: uses dispatch_sync on the internal _sessionQueue.
+/// MUST NOT be called from _sessionQueue — doing so will deadlock.
+/// No-op after invalidate has been called.
+- (void)setRecordingEnabled:(BOOL)enabled;
+
 // ─── POC2: Platform View graph delivery ──────────────────────────────────────
 
 /// Wires a VanguardCameraFrameReceiver (typically VanguardCameraPlatformView) as

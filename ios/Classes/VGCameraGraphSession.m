@@ -37,6 +37,7 @@
 #import "VGGraphSchedulerV2.h"
 #import "VGFanOutSink.h"
 #import "VGPlatformViewSinkAdapter.h"
+#import "VGRecordingSinkNode.h"
 #import "VanguardCameraMediaSource.h"
 #import "VanguardMetalRenderer.h"
 #import "VanguardBeautyFilterNode.h"
@@ -279,6 +280,18 @@
         self->_context = newCtx;
         self->_nodes = newNodes;
 
+        // Phase 6E.1D.1: If graph recording is currently active, propagate the
+        // enabled state onto the newly created VGRecordingSinkNode. Without this,
+        // the replacement node defaults to disabled=NO and silently drops all
+        // processed frames for the remainder of the active recording session.
+        if (self->_source.graphRecordingEnabled) {
+            VGRecordingSinkNode *newRecSink =
+                (VGRecordingSinkNode *)newNodes[@"camera_recording_sink"];
+            if (newRecSink) {
+                newRecSink.enabled = YES;
+            }
+        }
+
         NSLog(@"[VGCameraGraphSession] setCameraFilterChain hot-swap complete (filterCount=%lu execOrder=%lu)",
               (unsigned long)(filterChain.count ?: 0),
               (unsigned long)newPlan.topologicalOrder.count);
@@ -372,6 +385,18 @@
         self->_scheduler = newScheduler;
         self->_context = newCtx;
         self->_nodes = newNodes;
+
+        // Phase 6E.1D.1: Propagate recording-enabled state onto the new
+        // VGRecordingSinkNode after a POC2 platform-view graph rebuild, for the
+        // same reason as setCameraFilterChain: — the replacement node starts
+        // disabled and would silently drop frames during an active recording.
+        if (self->_source.graphRecordingEnabled) {
+            VGRecordingSinkNode *newRecSink =
+                (VGRecordingSinkNode *)newNodes[@"camera_recording_sink"];
+            if (newRecSink) {
+                newRecSink.enabled = YES;
+            }
+        }
 
         NSLog(@"[Vanguard] POC2: graph rebuilt with two-child VGFanOutSink — PlatformView wired ✓");
         success = YES;
@@ -545,6 +570,62 @@
     return YES;
 }
 
+// ─── Phase 6E.1D.1: Graph-backed recording control ───────────────────────────
+//
+// Enable ordering (Opus requirement §Q6):
+//   sink.enabled = YES first → then source.graphRecordingEnabled = YES
+//   This ensures the graph path is ready before the raw path is gated.
+//
+// Disable ordering (Opus requirement §Q6):
+//   source.graphRecordingEnabled = NO first → then sink.enabled = NO
+//   This allows the raw path to resume before the graph path is torn down,
+//   minimizing the zero-coverage window.
+//
+// Graph-rebuild safety: setCameraFilterChain: and connectPlatformViewReceiver:
+// propagate graphRecordingEnabled onto every newly created VGRecordingSinkNode
+// so that filter-chain hot-swaps during active recording do not silently revert
+// the recording sink to disabled.
+//
+// Thread-safety:
+//   Serialized via dispatch_sync on _sessionQueue.
+//   MUST NOT be called from _sessionQueue (deadlock).
+//   Properties graphRecordingEnabled and enabled are both atomic BOOLs —
+//   visible to readers on _captureQueue and _graphExecutionQueue immediately.
+- (void)setRecordingEnabled:(BOOL)enabled {
+    dispatch_sync(_sessionQueue, ^{
+        if (atomic_load(&self->_invalidated)) {
+            return;
+        }
+
+        VGRecordingSinkNode *recordingSink =
+            (VGRecordingSinkNode *)self->_nodes[@"camera_recording_sink"];
+
+        if (enabled) {
+            // ── Enable: sink first, then source gate ──────────────────────────
+            // The recording sink must be ready to receive frames before the raw
+            // path is gated off. If the sink is missing, do NOT gate the raw path
+            // so that raw recording remains the active fallback.
+            if (!recordingSink) {
+                NSLog(@"[VGCameraGraphSession] setRecordingEnabled:YES — "
+                       "camera_recording_sink not found in node map; "
+                       "raw path will remain active (fallback preserved)");
+                return;
+            }
+            recordingSink.enabled = YES;
+            self->_source.graphRecordingEnabled = YES;
+        } else {
+            // ── Disable: source gate first, then sink ─────────────────────────
+            // Clear the source flag before disabling the sink so that if the
+            // raw path resumes (e.g., next recording session), it can append
+            // without waiting for the sink to drain.
+            self->_source.graphRecordingEnabled = NO;
+            if (recordingSink) {
+                recordingSink.enabled = NO;
+            }
+        }
+    });
+}
+
 - (void)invalidate {
     dispatch_sync(_sessionQueue, ^{
         if (atomic_exchange(&self->_invalidated, YES)) {
@@ -574,6 +655,20 @@
 
         self->_scheduler = nil;
         self->_context = nil;
+
+        // Phase 6E.1D.1 (Opus §Issue3): Defensively clear the graph recording
+        // flag and disable the sink before nil-ing _source and _nodes. Prevents
+        // any in-flight processed frames from appending after teardown starts.
+        // Must be done before _nodes = nil (sink lookup) and _source = nil.
+        if (self->_source) {
+            self->_source.graphRecordingEnabled = NO;
+        }
+        VGRecordingSinkNode *recordingSink =
+            (VGRecordingSinkNode *)self->_nodes[@"camera_recording_sink"];
+        if (recordingSink) {
+            recordingSink.enabled = NO;
+        }
+
         self->_nodes = nil;
         self->_source = nil;
     });

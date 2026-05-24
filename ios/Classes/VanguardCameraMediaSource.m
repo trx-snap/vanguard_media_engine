@@ -517,6 +517,16 @@ static const char kCaptureQueueKey = 0;
   if (_recordingState != VanguardRecordingStateWriting)
     return;
 
+  // Phase 6E.1D.1: Graph-backed recording gate.
+  // When graphRecordingEnabled is YES, the processed graph path (via
+  // appendProcessedVideoFrame:pts:) is the active recording source. The raw
+  // hardware buffer must not also be appended — it would duplicate frames and
+  // corrupt the timeline. Defaults to NO so this guard is currently a no-op;
+  // the Swift plugin will set it to YES in Phase 6E.1D.2.
+  if (self.graphRecordingEnabled) {
+    return;
+  }
+
   // All access to these counters is on _captureQueue (serial) — plain ++ is
   // safe.
   int32_t total = ++_totalFrameCount;
@@ -757,6 +767,15 @@ static const char kCaptureQueueKey = 0;
       });
       return;
     }
+
+    // Phase 6E.1D.1: Clear the graph recording gate before transitioning to
+    // Finishing. This prevents any pending appendProcessedVideoFrame:pts:
+    // dispatch_async blocks that are queued on _captureQueue from appending
+    // after finishWritingWithCompletionHandler: is called. Those blocks will
+    // hit the !graphRecordingEnabled fast-exit path (Gate 1) and release
+    // their retained buffers cleanly.
+    self.graphRecordingEnabled = NO;
+
     self->_recordingState = VanguardRecordingStateFinishing;
 
     NSUInteger dropped = self->_droppedFrameCount;

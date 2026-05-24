@@ -147,6 +147,11 @@
         nodeMap[fa.nodeId] = fa;
     }
     nodeMap[fanOutSink.nodeId] = fanOutSink;
+    // Phase 6E.1D.1: expose the recording sink by its own nodeId so that
+    // VGCameraGraphSession can resolve it via _nodes[@"camera_recording_sink"]
+    // in setRecordingEnabled: and graph-rebuild propagation. The sink is already
+    // a child of fanOutSink — this entry does not affect graph topology.
+    nodeMap[recordingSink.nodeId] = recordingSink;
 
     // ── (f) Build VGGraphNodeDescriptors ─────────────────────────────────────
     NSMutableArray<VGGraphNodeDescriptor *> *nodeDescriptors = [NSMutableArray arrayWithCapacity:nodeMap.count];
