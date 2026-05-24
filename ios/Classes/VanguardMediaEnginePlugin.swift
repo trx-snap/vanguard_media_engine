@@ -181,6 +181,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // callers MUST use teardownCameraAsync(completion:) instead.
             #if VG_USE_CAMERA_GRAPH
             if let session = cameraGraphSession {
+                // Phase 6E.1D.2: Defensively disable graph recording before
+                // invalidation so no in-flight processed frames append after
+                // finishWritingWithCompletionHandler: is called.
+                session.setRecordingEnabled(false)
                 session.invalidate()
                 cameraGraphSession = nil
             } else {
@@ -237,6 +241,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
             #if VG_USE_CAMERA_GRAPH
             if let session = self?.cameraGraphSession {
+                // Phase 6E.1D.2: Defensively disable graph recording before
+                // invalidation so no in-flight processed frames append after
+                // finishWritingWithCompletionHandler: is called.
+                session.setRecordingEnabled(false)
                 session.invalidate()
                 self?.cameraGraphSession = nil
             } else {
@@ -1464,6 +1472,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
             #if VG_USE_CAMERA_GRAPH
             if let session = cameraGraphSession {
+                // Phase 6E.1D.2: Defensively disable graph recording before
+                // invalidation so no in-flight processed frames append after
+                // finishWritingWithCompletionHandler: is called.
+                session.setRecordingEnabled(false)
                 session.invalidate()
                 cameraGraphSession = nil
             } else {
@@ -1487,9 +1499,35 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(FlutterError(code: "NO_CAMERA", message: "Camera not started", details: nil))
                 return
             }
-            src.startRecording(to: URL(fileURLWithPath: path)) { error in
+            // Phase 6E.1D.2: Enable graph-backed recording when graph mode is
+            // compiled in and a graph session is active. The enable ordering
+            // (sink.enabled = YES → graphRecordingEnabled = YES) is encapsulated
+            // inside VGCameraGraphSession.setRecordingEnabled:.
+            // If the session is absent, raw recording falls through unchanged.
+            #if VG_USE_CAMERA_GRAPH
+            var graphRecordingEnabled = false
+            if let session = cameraGraphSession {
+                session.setRecordingEnabled(true)
+                graphRecordingEnabled = true
+                NSLog("[VanguardPlugin] startRecording: graph-backed recording enabled")
+            } else {
+                NSLog("[VanguardPlugin] startRecording: no graph session — falling back to raw recording")
+            }
+            #else
+            NSLog("[VanguardPlugin] startRecording: VG_USE_CAMERA_GRAPH disabled — using raw recording")
+            #endif
+            src.startRecording(to: URL(fileURLWithPath: path)) { [weak self] error in
                 DispatchQueue.main.async {
                     if let e = error {
+                        // Phase 6E.1D.2: Roll back graph recording enablement if
+                        // AVAssetWriter startup failed so the raw path remains
+                        // active for the next recording attempt.
+                        #if VG_USE_CAMERA_GRAPH
+                        if graphRecordingEnabled, let session = self?.cameraGraphSession {
+                            session.setRecordingEnabled(false)
+                            NSLog("[VanguardPlugin] startRecording: AVAssetWriter failed — graph recording rolled back")
+                        }
+                        #endif
                         result(FlutterError(code: "REC_FAIL",
                                             message: e.localizedDescription,
                                             details: nil))
@@ -1501,8 +1539,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
         case "stopRecording":
             guard let src = cameraSource else { result(nil); return }
-            src.stopRecording { url, dropped, total, error in
+            src.stopRecording { [weak self] url, dropped, total, error in
                 DispatchQueue.main.async {
+                    // Phase 6E.1D.2: Disable graph recording before returning
+                    // the result. The disable ordering (graphRecordingEnabled = NO
+                    // → sink.enabled = NO) is encapsulated inside setRecordingEnabled:.
+                    // Called on both success and error paths so the flag is
+                    // never left in an enabled state after stop completes.
+                    #if VG_USE_CAMERA_GRAPH
+                    self?.cameraGraphSession?.setRecordingEnabled(false)
+                    #endif
                     if let e = error {
                         result(FlutterError(code: "STOP_FAIL",
                                             message: e.localizedDescription,
@@ -1532,8 +1578,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(FlutterError(code: "NO_CAMERA", message: "Camera not started", details: nil))
                 return
             }
-            src.stopRecording { url, dropped, total, error in
+            src.stopRecording { [weak self] url, dropped, total, error in
                 DispatchQueue.main.async {
+                    // Phase 6E.1D.2: Disable graph recording before returning
+                    // flush stats. Mirrors the stopRecording disable path.
+                    #if VG_USE_CAMERA_GRAPH
+                    self?.cameraGraphSession?.setRecordingEnabled(false)
+                    #endif
                     if let e = error {
                         result(FlutterError(code: "STOP_FAIL", message: e.localizedDescription, details: nil))
                     } else {
