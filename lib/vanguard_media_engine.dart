@@ -16,6 +16,9 @@ export 'vg_filter_spec.dart';
 // P4-10: expose session factory and session type for filter-chain callers.
 export 'vg_playback_client.dart';
 export 'vg_playback_session.dart';
+// Phase 6D.1A: typed camera session + preview widget.
+export 'vg_camera_session.dart';
+export 'vg_camera_preview.dart';
 
 const String _libName = 'vanguard_media_engine';
 
