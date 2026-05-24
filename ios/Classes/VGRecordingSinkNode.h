@@ -1,5 +1,5 @@
 // VGRecordingSinkNode.h
-// vanguard_media_engine — Phase 6E.1A
+// vanguard_media_engine — Phase 6E.1A / Phase 6E.1B
 //
 // VGRecordingSinkNode is the graph-aware recording terminal sink.
 // When wired as a child of VGFanOutSink, it will receive processed
@@ -15,21 +15,13 @@
 //     the writer; the sink only forwards frames when enabled.
 //   - Future Phase 6E.1 steps will add bounded async handoff and processed-frame recording.
 //
-// Current status — Phase 6E.1A (SKELETON ONLY):
-//   - All protocol methods are declared and stubbed.
-//   - presentEnvelope: returns immediately unless ready and enabled.
-//   - No frames are forwarded, retained, or encoded in this step.
-//   - No encoder, no writer, no queue crossing in this step.
-//   - This file exists only to prove the type compiles alongside the
-//     rest of the graph infrastructure. Runtime behavior is unchanged.
-//
-// Forbidden in this step (6E.1A):
-//   - No frame appending or encoding.
-//   - No queue crossing.
-//   - No wiring into VGCameraGraphSession or VGCameraGraphFactory.
+// Current status — Phase 6E.1B (WIRED, DISABLED):
+//   - Included as last child of VGFanOutSink via VGCameraGraphFactory.
+//   - presentEnvelope: remains an immediate no-op (sink is disabled).
+//   - No frames are forwarded, retained, or encoded.
+//   - Runtime recording behavior is unchanged.
 //
 // Future steps will:
-//   6E.1B — Wire into VGFanOutSink via VGCameraGraphSession (inactive by default).
 //   6E.1C — Implement frame forwarding to VanguardCameraMediaSource.
 //   6E.1D — Enable by default; remove raw-path recording from VanguardCameraMediaSource.
 //
@@ -80,7 +72,7 @@ NS_ASSUME_NONNULL_BEGIN
 ///                 receive forwarded frames. Held weakly — the source owns
 ///                 the graph session and must outlive individual graph runs.
 /// @return An initialized instance, or nil if nodeId is invalid.
-- (instancetype)initWithNodeId:(NSString *)nodeId
+- (nullable instancetype)initWithNodeId:(NSString *)nodeId
                         source:(VanguardCameraMediaSource *)source NS_DESIGNATED_INITIALIZER;
 
 /// Unavailable. Use initWithNodeId:source:.

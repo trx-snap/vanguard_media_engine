@@ -1,5 +1,5 @@
 // VGCameraGraphFactory.h
-// vanguard_media_engine — Phase 6A-1
+// vanguard_media_engine — Phase 6A-1 / Phase 6E.1B
 //
 // VGCameraGraphFactory is a pure graph-construction utility for the push-mode
 // camera pipeline. It builds, validates, and plans a VGClockPolicyPush camera
@@ -28,8 +28,10 @@ NS_ASSUME_NONNULL_BEGIN
 /// Builds a linear camera graph:
 ///   - Source: wrapped in VGCameraSourceAdapter
 ///   - Filters: wrapped in VGLegacyFilterAdapter / VGMetadataNodeAdapter
-///   - Sink: composite VGFanOutSink wrapping the VGRendererSinkAdapter as the initial child.
-///           When platformViewSink is non-nil, it is added as a second child of VGFanOutSink.
+///   - Sink: composite VGFanOutSink wrapping:
+///       • VGRendererSinkAdapter (always, first child)
+///       • platformViewSink (optional, second child when non-nil)
+///       • VGRecordingSinkNode (always, last child, disabled — Phase 6E.1B)
 ///
 /// Edge policy:
 ///   - Intermediate transform-to-transform edges: synchronous, no admission policy.

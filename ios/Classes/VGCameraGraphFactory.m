@@ -12,6 +12,7 @@
 #import "VGLegacyFilterAdapter.h"
 #import "VGMetadataNodeAdapter.h"
 #import "VGPlatformViewSinkAdapter.h"
+#import "VGRecordingSinkNode.h"
 
 // ─── UMF types ────────────────────────────────────────────────────────────────
 #import <UMF/VGGraphDescriptor.h>
@@ -103,16 +104,27 @@
     // ── (d) Wrap renderer and construct composite VGFanOutSink ─────────────────
     VGRendererSinkAdapter *rendererSinkAdapter = [[VGRendererSinkAdapter alloc] initWithRenderer:renderer];
 
+    // Phase 6E.1B: Instantiate the recording sink. Disabled by default — presentEnvelope:
+    // is an immediate no-op in this step. Held as last child of VGFanOutSink so the
+    // topology is ready for Phase 6E.1C wiring without a graph rebuild.
+    VGRecordingSinkNode *recordingSink =
+        [[VGRecordingSinkNode alloc] initWithNodeId:@"camera_recording_sink"
+                                             source:source];
+    // recordingSink.enabled remains NO (the default). No frames are forwarded.
+
     // POC2: when platformViewSink is provided, include it as a second child of
     // VGFanOutSink so graph output (post-Beauty-V2) reaches the MTKView PlatformView.
     // When nil: original single-child behaviour is preserved exactly.
+    // Recording sink is always appended last and always disabled in this step.
     NSArray<id<VGFrameSink>> *sinkChildren;
     if (platformViewSink) {
-        sinkChildren = @[ rendererSinkAdapter, platformViewSink ];
-        NSLog(@"[VGCameraGraphFactory] POC2: building two-child VGFanOutSink "
-               "(renderer + platformView)");
+        sinkChildren = @[ rendererSinkAdapter, platformViewSink, recordingSink ];
+        NSLog(@"[VGCameraGraphFactory] Phase 6E.1B: building three-child VGFanOutSink "
+               "(renderer + platformView + recordingSink[disabled])");
     } else {
-        sinkChildren = @[ rendererSinkAdapter ];
+        sinkChildren = @[ rendererSinkAdapter, recordingSink ];
+        NSLog(@"[VGCameraGraphFactory] Phase 6E.1B: building two-child VGFanOutSink "
+               "(renderer + recordingSink[disabled])");
     }
 
     VGFanOutSink *fanOutSink = [[VGFanOutSink alloc] initWithNodeId:@"fan_out_sink"

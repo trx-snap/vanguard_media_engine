@@ -1,10 +1,10 @@
 // VGRecordingSinkNode.m
-// vanguard_media_engine — Phase 6E.1A
+// vanguard_media_engine — Phase 6E.1A / Phase 6E.1B
 //
-// Phase 6E.1A: Skeleton implementation only.
-// All VGFrameSink/VGNode protocol methods are implemented with safe,
-// behavior-neutral bodies. presentEnvelope: returns immediately unless
-// ready and enabled. No frames are forwarded, retained, or encoded.
+// Phase 6E.1B: Wired into VGFanOutSink via VGCameraGraphFactory (disabled).
+// All VGFrameSink/VGNode protocol methods remain behavior-neutral.
+// presentEnvelope: returns immediately unless ready and enabled.
+// No frames are forwarded, retained, or encoded in this step.
 
 #import "VGRecordingSinkNode.h"
 #import "VanguardCameraMediaSource.h"
