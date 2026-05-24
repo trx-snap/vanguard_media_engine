@@ -19,6 +19,8 @@ export 'vg_playback_session.dart';
 // Phase 6D.1A: typed camera session + preview widget.
 export 'vg_camera_session.dart';
 export 'vg_camera_preview.dart';
+// Phase 6D.3: typed recording result.
+export 'vg_recording_stats.dart';
 
 const String _libName = 'vanguard_media_engine';
 

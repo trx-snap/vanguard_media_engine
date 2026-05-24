@@ -25,6 +25,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'vg_filter_spec.dart';
+import 'vg_recording_stats.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Enums
@@ -259,19 +260,16 @@ final class VGCameraSession {
 
   /// Stops the active recording and finalises the MP4.
   ///
-  /// Returns a map with keys:
-  ///   `'filePath'`      — the completed output file path
-  ///   `'droppedFrames'` — frames dropped by the hardware encoder
-  ///   `'totalFrames'`   — total frames presented
-  ///   `'dropRate'`      — `droppedFrames / totalFrames`
+  /// Returns a typed [VGRecordingStats] result containing the output file path
+  /// and hardware-encoder frame statistics.
   ///
   /// Throws [StateError] if this session has been [dispose]d.
-  Future<Map<String, dynamic>> stopRecording() async {
+  Future<VGRecordingStats> stopRecording() async {
     if (_disposed) {
       throw StateError('[VGCameraSession] stopRecording called on a disposed session');
     }
     final raw = await _channel.invokeMethod<Map>('stopRecording');
-    return Map<String, dynamic>.from(raw ?? {});
+    return VGRecordingStats.fromMap(Map<String, dynamic>.from(raw ?? const {}));
   }
 
   // ── Native MTKView preview ───────────────────────────────────────────────────
