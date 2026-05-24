@@ -26,6 +26,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'vg_filter_spec.dart';
 import 'vg_recording_stats.dart';
+import 'vg_photo_capture_result.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Enums
@@ -139,10 +140,7 @@ final class VGCameraSession {
         '[VGCameraSession] startCamera: native returned no texture id',
       );
     }
-    return VGCameraSession._(
-      sessionId: 'camera-$id',
-      textureId: id,
-    );
+    return VGCameraSession._(sessionId: 'camera-$id', textureId: id);
   }
 
   // ── Camera control ───────────────────────────────────────────────────────────
@@ -158,7 +156,9 @@ final class VGCameraSession {
   Future<void> switchCamera(VGCameraPosition position) async {
     if (_disposed) return;
     final positionInt = position == VGCameraPosition.front ? 2 : 1;
-    await _channel.invokeMethod<void>('switchCamera', {'position': positionInt});
+    await _channel.invokeMethod<void>('switchCamera', {
+      'position': positionInt,
+    });
   }
 
   /// Sets the zoom level. `1.0` = no zoom; clamped to the device maximum on the
@@ -235,9 +235,13 @@ final class VGCameraSession {
   ///   `'NO_CAMERA'`   — native has no active camera source
   Future<String> takePhoto(String path) async {
     if (_disposed) {
-      throw StateError('[VGCameraSession] takePhoto called on a disposed session');
+      throw StateError(
+        '[VGCameraSession] takePhoto called on a disposed session',
+      );
     }
-    final filePath = await _channel.invokeMethod<String>('takePhoto', {'path': path});
+    final filePath = await _channel.invokeMethod<String>('takePhoto', {
+      'path': path,
+    });
     if (filePath == null) {
       throw PlatformException(
         code: 'ENCODE_FAIL',
@@ -245,6 +249,24 @@ final class VGCameraSession {
       );
     }
     return filePath;
+  }
+
+  /// Captures the current live camera frame as a JPEG and writes it to [path],
+  /// returning a typed [VGPhotoCaptureResult].
+  ///
+  /// This is the typed companion to [takePhoto]. It calls [takePhoto] internally
+  /// so all existing lifecycle guards (disposed check, null-path error) apply
+  /// identically. Callers that only need the file path should prefer [takePhoto].
+  ///
+  /// Metadata fields ([VGPhotoCaptureResult.width], [VGPhotoCaptureResult.height],
+  /// [VGPhotoCaptureResult.sizeBytes]) are `0` until the native handler is
+  /// enriched to return a metadata map in a future release.
+  ///
+  /// Throws [StateError] if this session has been [dispose]d.
+  /// Throws [PlatformException] with the same codes as [takePhoto].
+  Future<VGPhotoCaptureResult> takePhotoResult(String path) async {
+    final filePath = await takePhoto(path);
+    return VGPhotoCaptureResult.fromPath(filePath);
   }
 
   /// Begins hardware-encoded video recording to [path].
@@ -266,7 +288,9 @@ final class VGCameraSession {
   /// Throws [StateError] if this session has been [dispose]d.
   Future<VGRecordingStats> stopRecording() async {
     if (_disposed) {
-      throw StateError('[VGCameraSession] stopRecording called on a disposed session');
+      throw StateError(
+        '[VGCameraSession] stopRecording called on a disposed session',
+      );
     }
     final raw = await _channel.invokeMethod<Map>('stopRecording');
     return VGRecordingStats.fromMap(Map<String, dynamic>.from(raw ?? const {}));
@@ -292,7 +316,9 @@ final class VGCameraSession {
   /// (e.g. `'NO_CAMERA'`, `'NO_GRAPH_SESSION'`, `'NO_ROOT_VC'`).
   Future<void> openNativePreview() async {
     if (_disposed) {
-      throw StateError('[VGCameraSession] openNativePreview called on a disposed session');
+      throw StateError(
+        '[VGCameraSession] openNativePreview called on a disposed session',
+      );
     }
     await _channel.invokeMethod<void>('openNativeCamera');
   }
