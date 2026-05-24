@@ -32,7 +32,8 @@
     if (self) {
         _nodeId = [nodeId copy];
         _source = source;
-        _ready = NO;
+        // Live camera fan-out sinks are not prepared by the scheduler; this sink has no async setup.
+        _ready = YES;
         _enabled = NO;
     }
     return self;
