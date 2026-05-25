@@ -27,6 +27,8 @@ export 'vg_photo_capture_result.dart';
 export 'vg_parameter_descriptor.dart';
 export 'vg_effect_catalog.dart';
 export 'vg_preset_descriptor.dart';
+// Phase 6C.1B: Dart-only graph transaction engine.
+export 'vg_graph_transaction.dart';
 
 const String _libName = 'vanguard_media_engine';
 
