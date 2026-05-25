@@ -1456,6 +1456,83 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             ))
             #endif
 
+        case "applyGraphTransaction":
+            // Phase 6C.2A: Apply a validated VGGraphTransactionPayload to the
+            // active camera graph.  Only preset-only rebuild transactions are
+            // supported in this phase.  Any non-empty parameterUpdates are
+            // rejected with UNSUPPORTED_TRANSACTION_POLICY — never silently
+            // ignored — to prevent data loss from partially applied payloads.
+            #if VG_USE_CAMERA_GRAPH
+            guard let session = cameraGraphSession else {
+                result(FlutterError(
+                    code: "NO_CAMERA_GRAPH",
+                    message: "Camera graph session is not running.",
+                    details: nil
+                ))
+                return
+            }
+
+            // args is already [String: Any]? from the top of handle(_:result:).
+            guard let payload = args else {
+                result(FlutterError(
+                    code: "BAD_ARGS",
+                    message: "applyGraphTransaction expects a payload dictionary.",
+                    details: nil
+                ))
+                return
+            }
+
+            // ── C. Reject non-empty parameterUpdates ─────────────────────────
+            // Phase 6C.2A does not support in-place hot/warm parameter mutation.
+            // Rejecting here prevents silent data loss when callers pass a
+            // payload that coexists preset + parameterUpdates.
+            let parameterUpdates = payload["parameterUpdates"] as? [String: Any] ?? [:]
+            if !parameterUpdates.isEmpty {
+                result(FlutterError(
+                    code: "UNSUPPORTED_TRANSACTION_POLICY",
+                    message: "In-place parameter updates are not yet supported "
+                           + "in Phase 6C.2A. Use preset-only transactions.",
+                    details: nil
+                ))
+                return
+            }
+
+            // ── D. Rebuild handling ────────────────────────────────────────────
+            let requiresRebuild = payload["requiresRebuild"] as? Bool ?? false
+            if requiresRebuild {
+                guard let presetDict = payload["preset"] as? [String: Any],
+                      let filterStack = presetDict["filterStack"] as? [[String: Any]] else {
+                    result(FlutterError(
+                        code: "UNSUPPORTED_TRANSACTION_POLICY",
+                        message: "Rebuild transactions without a preset are not "
+                               + "supported in Phase 6C.2A.",
+                        details: nil
+                    ))
+                    return
+                }
+
+                do {
+                    try session.setCameraFilterChainFromSpecs(filterStack)
+                    result(nil)
+                } catch {
+                    let nsError = error as NSError
+                    let code = nsError.domain
+                    let message = nsError.localizedDescription
+                    result(FlutterError(code: code, message: message, details: nil))
+                }
+                return
+            }
+
+            // ── E. No-op success (requiresRebuild == false, parameterUpdates empty) ──
+            result(nil)
+            #else
+            result(FlutterError(
+                code: "GRAPH_MODE_DISABLED",
+                message: "Camera graph mode is disabled. Build with VG_USE_CAMERA_GRAPH=1.",
+                details: nil
+            ))
+            #endif
+
         case "stopCamera":
             // IDEMPOTENCY FIX: stopCamera may be called a second time by
             // VanguardCameraView.dispose() after navigation to the story editor

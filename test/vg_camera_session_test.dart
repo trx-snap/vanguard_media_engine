@@ -34,7 +34,9 @@
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vg_camera_session.dart';
+import 'package:vanguard_media_engine/vg_filter_spec.dart';
 import 'package:vanguard_media_engine/vg_graph_transaction.dart';
+import 'package:vanguard_media_engine/vg_preset_descriptor.dart';
 import 'package:vanguard_media_engine/vg_recording_stats.dart';
 import 'package:vanguard_media_engine/vg_photo_capture_result.dart';
 
@@ -712,7 +714,7 @@ void main() {
     );
   });
 
-  // ── Phase 6C.1C: transaction ergonomics ─────────────────────────────────────
+  // ── Phase 6C.2A: transaction dispatch ──────────────────────────────────────
   //
   // Acceptance criteria:
   //   TX-1   newTransaction() returns empty VGGraphTransaction
@@ -721,8 +723,10 @@ void main() {
   //   TX-4   prepareTransaction() clamps values through descriptors
   //   TX-5   prepareTransaction() makes zero calls to mock channel
   //   TX-6   prepareTransaction() propagates ArgumentError for invalid params
-  //   TX-7   applyTransaction() throws UnsupportedError
-  //   TX-8   applyTransaction() makes zero calls to mock channel
+  //   TX-7   applyTransaction() with preset-only payload dispatches applyGraphTransaction
+  //   TX-8   applyTransaction() with empty payload makes zero channel calls
+  //   TX-9   applyTransaction() propagates PlatformException from native
+  //   TX-10  applyTransaction() with hot-only payload still dispatches to channel
 
   group('VGCameraSession — transaction ergonomics (Phase 6C.1C)', () {
     // These tests do not require a real native session.  We call the transaction
@@ -833,43 +837,140 @@ void main() {
       },
     );
 
-    test('TX-7  applyTransaction() throws UnsupportedError', () async {
-      final session = await makeSession(106);
-      // Build a valid payload first.
-      final payload = session.prepareTransaction((tx) {
-        tx.setParameter('beauty', 'intensity', 0.6);
-      });
-      // applyTransaction must throw UnsupportedError synchronously.
-      expect(
-        () => session.applyTransaction(payload),
-        throwsUnsupportedError,
-        reason:
-            'applyTransaction() is a Phase 6C.2 stub and must always throw '
-            'UnsupportedError until native dispatch is implemented',
-      );
-      await session.dispose();
-    });
+    test(
+      'TX-7  applyTransaction() with preset-only payload dispatches applyGraphTransaction once',
+      () async {
+        final session = await makeSession(106);
+        // Build a preset-only payload (requiresRebuild=true, parameterUpdates empty).
+        final preset = VGPresetDescriptor(
+          id: 'test-preset',
+          name: 'Test Preset',
+          filterStack: [VGFilterSpecs.beauty(intensity: 0.6)],
+        );
+        final payload = session.prepareTransaction((tx) {
+          tx.applyPreset(preset);
+        });
+        expect(payload.requiresRebuild, isTrue);
+        expect(payload.parameterUpdates, isEmpty);
+
+        _log.clear(); // reset after create() + prepareTransaction()
+        // Mock returns null (success) for applyGraphTransaction.
+        _responses['applyGraphTransaction'] = null;
+        await session.applyTransaction(payload);
+
+        expect(
+          _log,
+          hasLength(1),
+          reason:
+              'applyTransaction() must invoke applyGraphTransaction exactly once',
+        );
+        expect(
+          _log.first.method,
+          equals('applyGraphTransaction'),
+          reason: 'The dispatched method must be applyGraphTransaction',
+        );
+        expect(
+          _log.first.arguments,
+          equals(payload.toJson()),
+          reason: 'The dispatched arguments must equal payload.toJson()',
+        );
+        await session.dispose();
+      },
+    );
 
     test(
-      'TX-8  applyTransaction() makes zero calls to the mock method channel',
+      'TX-8  applyTransaction() with empty payload makes zero channel calls',
       () async {
         final session = await makeSession(107);
-        final payload = session.prepareTransaction((tx) {
-          tx.setParameter('beauty', 'intensity', 0.6);
-        });
-        _log.clear(); // reset after create() + prepareTransaction()
-        try {
-          session.applyTransaction(payload);
-        } on UnsupportedError {
-          // expected
-        }
+        // An empty transaction: no preset, no parameters.
+        final tx = VGGraphTransaction();
+        final emptyPayload = tx.commit();
+        expect(emptyPayload.isEmpty, isTrue);
+
+        _log.clear(); // reset after create()
+        await session.applyTransaction(emptyPayload);
+
         expect(
           _log,
           isEmpty,
           reason:
-              'applyTransaction() must not invoke any method channel even '
-              'when throwing',
+              'applyTransaction() with an empty payload must not invoke any '
+              'method channel — it is a Dart-side no-op',
         );
+        await session.dispose();
+      },
+    );
+
+    test(
+      'TX-9  applyTransaction() propagates PlatformException from native',
+      () async {
+        final session = await makeSession(108);
+        final preset = VGPresetDescriptor(
+          id: 'bad-preset',
+          name: 'Bad Preset',
+          filterStack: [VGFilterSpecs.beauty(intensity: 0.5)],
+        );
+        final payload = session.prepareTransaction((tx) {
+          tx.applyPreset(preset);
+        });
+
+        // Mock native rejecting with UNSUPPORTED_TRANSACTION_POLICY.
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+              const MethodChannel('vanguard_media_engine'),
+              (MethodCall call) async {
+                _log.add(call);
+                if (call.method == 'applyGraphTransaction') {
+                  throw PlatformException(
+                    code: 'UNSUPPORTED_TRANSACTION_POLICY',
+                    message:
+                        'In-place parameter updates are not yet supported.',
+                  );
+                }
+                return _responses[call.method];
+              },
+            );
+
+        expect(
+          () async => session.applyTransaction(payload),
+          throwsA(
+            isA<PlatformException>().having(
+              (e) => e.code,
+              'code',
+              'UNSUPPORTED_TRANSACTION_POLICY',
+            ),
+          ),
+          reason:
+              'applyTransaction() must propagate PlatformException thrown by native',
+        );
+        await session.dispose();
+      },
+    );
+
+    test(
+      'TX-10 applyTransaction() with hot-only payload still dispatches to channel',
+      () async {
+        // Dart dispatches unconditionally for non-empty payloads.
+        // Policy rejection is owned by the native side, not Dart.
+        final session = await makeSession(109);
+        final payload = session.prepareTransaction((tx) {
+          tx.setParameter('beauty', 'intensity', 0.8); // hot policy
+        });
+        expect(payload.hasHotParameters, isTrue);
+        expect(payload.parameterUpdates, isNotEmpty);
+
+        _log.clear(); // reset after create() + prepareTransaction()
+        _responses['applyGraphTransaction'] = null;
+        await session.applyTransaction(payload);
+
+        expect(
+          _log,
+          hasLength(1),
+          reason:
+              'Dart must dispatch applyGraphTransaction even for hot-policy payloads; '
+              'native is responsible for rejecting unsupported policies',
+        );
+        expect(_log.first.method, equals('applyGraphTransaction'));
         await session.dispose();
       },
     );

@@ -335,19 +335,19 @@ final class VGCameraSession {
     await _channel.invokeMethod<void>('closeNativeCamera');
   }
 
-  // ── Transactions (Phase 6C.1C) ─────────────────────────────────────────────
+  // ── Transactions (Phase 6C.2A) ─────────────────────────────────────────────
 
   /// Returns a new, blank mutable [VGGraphTransaction] builder.
   ///
   /// This is a pure-Dart factory call.  It does not invoke any method channel
   /// or mutate the native graph state.  Use [prepareTransaction] for a
-  /// callback-style alternative, or [applyTransaction] (Phase 6C.2) once
-  /// native dispatch is available.
+  /// callback-style alternative, or [applyTransaction] to dispatch the
+  /// committed payload to the native camera graph.
   ///
   /// ```dart
   /// final tx = session.newTransaction();
   /// tx.setParameter('beauty', 'intensity', 0.8);
-  /// final payload = tx.commit(); // ready for future applyTransaction
+  /// final payload = tx.commit(); // ready for applyTransaction
   /// ```
   VGGraphTransaction newTransaction() => VGGraphTransaction();
 
@@ -366,7 +366,7 @@ final class VGCameraSession {
   ///   tx.setParameter('beauty', 'intensity', 0.8);
   ///   tx.setParameter('lut',    'intensity', 0.4);
   /// });
-  /// // payload is now ready for future applyTransaction (Phase 6C.2)
+  /// // payload is ready for applyTransaction
   /// ```
   VGGraphTransactionPayload prepareTransaction(
     void Function(VGGraphTransaction tx) builder,
@@ -376,20 +376,28 @@ final class VGCameraSession {
     return tx.commit();
   }
 
-  /// Stub for transaction application.  Always throws [UnsupportedError].
+  /// Applies a validated, committed [VGGraphTransactionPayload] to the active
+  /// native camera graph.
   ///
-  /// Native method-channel dispatch is not implemented in Phase 6C.1C.
-  /// This method exists to reserve the API surface and prevent product code
-  /// from accidentally calling an unimplemented path silently.  It will be
-  /// implemented in Phase 6C.2 when the native `applyGraphTransaction` handler
-  /// is added.
+  /// Phase 6C.2A supports **preset-only rebuild** transactions only:
+  ///   - Empty payload: successful Dart-side no-op (no channel call).
+  ///   - Preset-only (`requiresRebuild == true`, `parameterUpdates` empty):
+  ///     dispatches `applyGraphTransaction` and rebuilds the filter chain.
+  ///   - Non-empty `parameterUpdates`: dispatched to native, which rejects
+  ///     with `UNSUPPORTED_TRANSACTION_POLICY` ([PlatformException]).
   ///
-  /// Throws [UnsupportedError] always.
-  // ignore: avoid_returning_null_for_future
-  Future<void> applyTransaction(VGGraphTransactionPayload payload) {
-    throw UnsupportedError(
-      'VGCameraSession.applyTransaction: native transaction routing is not '
-      'yet supported. Native dispatch will be added in Phase 6C.2.',
+  /// Dart does not filter by policy — the native side owns policy rejection.
+  ///
+  /// Throws [PlatformException] if native reports an error (e.g.
+  ///   `NO_CAMERA_GRAPH`, `UNSUPPORTED_TRANSACTION_POLICY`,
+  ///   `GRAPH_MODE_DISABLED`).
+  Future<void> applyTransaction(VGGraphTransactionPayload payload) async {
+    if (payload.isEmpty) {
+      return;
+    }
+    await _channel.invokeMethod<void>(
+      'applyGraphTransaction',
+      payload.toJson(),
     );
   }
 
