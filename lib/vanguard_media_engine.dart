@@ -23,6 +23,10 @@ export 'vg_camera_preview.dart';
 export 'vg_recording_stats.dart';
 // Phase 6D.4: typed photo capture result.
 export 'vg_photo_capture_result.dart';
+// Phase 6C.1A: product-control descriptor schema (pure value objects).
+export 'vg_parameter_descriptor.dart';
+export 'vg_effect_catalog.dart';
+export 'vg_preset_descriptor.dart';
 
 const String _libName = 'vanguard_media_engine';
 
