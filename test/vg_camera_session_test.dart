@@ -34,6 +34,7 @@
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vg_camera_session.dart';
+import 'package:vanguard_media_engine/vg_graph_transaction.dart';
 import 'package:vanguard_media_engine/vg_recording_stats.dart';
 import 'package:vanguard_media_engine/vg_photo_capture_result.dart';
 
@@ -707,6 +708,169 @@ void main() {
         final res = VGPhotoCaptureResult.fromMap(source);
         source['width'] = 999;
         expect(res.raw['width'], equals(10));
+      },
+    );
+  });
+
+  // ── Phase 6C.1C: transaction ergonomics ─────────────────────────────────────
+  //
+  // Acceptance criteria:
+  //   TX-1   newTransaction() returns empty VGGraphTransaction
+  //   TX-2   newTransaction() makes zero calls to mock channel
+  //   TX-3   prepareTransaction() invokes builder and returns committed payload
+  //   TX-4   prepareTransaction() clamps values through descriptors
+  //   TX-5   prepareTransaction() makes zero calls to mock channel
+  //   TX-6   prepareTransaction() propagates ArgumentError for invalid params
+  //   TX-7   applyTransaction() throws UnsupportedError
+  //   TX-8   applyTransaction() makes zero calls to mock channel
+
+  group('VGCameraSession — transaction ergonomics (Phase 6C.1C)', () {
+    // These tests do not require a real native session.  We call the transaction
+    // helpers directly on a synthetically constructed session instance.
+    // The mock channel is already installed via setUp(_installMock).
+
+    // Build a session by going through the real create() path so we have a
+    // valid VGCameraSession without reflection.
+    Future<VGCameraSession> makeSession(int textureId) async {
+      _responses['startCamera'] = textureId;
+      return VGCameraSession.create();
+    }
+
+    test(
+      'TX-1  newTransaction() returns an empty VGGraphTransaction',
+      () async {
+        final session = await makeSession(100);
+        final tx = session.newTransaction();
+        expect(tx, isA<VGGraphTransaction>());
+        expect(tx.isEmpty, isTrue);
+        expect(tx.hasHotParameters, isFalse);
+        expect(tx.hasWarmParameters, isFalse);
+        expect(tx.requiresRebuild, isFalse);
+        await session.dispose();
+      },
+    );
+
+    test(
+      'TX-2  newTransaction() makes zero calls to the mock method channel',
+      () async {
+        final session = await makeSession(101);
+        _log.clear(); // reset after create()
+        session.newTransaction();
+        expect(
+          _log,
+          isEmpty,
+          reason: 'newTransaction() must not invoke any method channel',
+        );
+        await session.dispose();
+      },
+    );
+
+    test(
+      'TX-3  prepareTransaction() invokes builder and returns committed payload',
+      () async {
+        final session = await makeSession(102);
+        final payload = session.prepareTransaction((tx) {
+          tx.setParameter('beauty', 'intensity', 0.7);
+          tx.setParameter('lut', 'intensity', 0.3);
+        });
+        expect(payload, isA<VGGraphTransactionPayload>());
+        expect(payload.isEmpty, isFalse);
+        expect(payload.parameterUpdates.containsKey('beauty'), isTrue);
+        expect(payload.parameterUpdates.containsKey('lut'), isTrue);
+        expect(payload.parameterUpdates['beauty']!['intensity'], 0.7);
+        expect(payload.parameterUpdates['lut']!['intensity'], 0.3);
+        expect(payload.hasHotParameters, isTrue);
+        await session.dispose();
+      },
+    );
+
+    test(
+      'TX-4  prepareTransaction() clamps values through descriptor bounds',
+      () async {
+        final session = await makeSession(103);
+        final payload = session.prepareTransaction((tx) {
+          tx.setParameter('beauty', 'intensity', 9.9); // max 1.0
+        });
+        expect(
+          payload.parameterUpdates['beauty']!['intensity'],
+          equals(1.0),
+          reason: 'Values above max must be clamped to max by the descriptor',
+        );
+        await session.dispose();
+      },
+    );
+
+    test(
+      'TX-5  prepareTransaction() makes zero calls to the mock method channel',
+      () async {
+        final session = await makeSession(104);
+        _log.clear(); // reset after create()
+        session.prepareTransaction((tx) {
+          tx.setParameter('beauty', 'intensity', 0.5);
+        });
+        expect(
+          _log,
+          isEmpty,
+          reason: 'prepareTransaction() must not invoke any method channel',
+        );
+        await session.dispose();
+      },
+    );
+
+    test(
+      'TX-6  prepareTransaction() propagates ArgumentError for unknown params',
+      () async {
+        final session = await makeSession(105);
+        expect(
+          () => session.prepareTransaction((tx) {
+            tx.setParameter('ghostEffect', 'intensity', 0.5);
+          }),
+          throwsArgumentError,
+          reason:
+              'Unknown effect type must throw ArgumentError from the transaction',
+        );
+        await session.dispose();
+      },
+    );
+
+    test('TX-7  applyTransaction() throws UnsupportedError', () async {
+      final session = await makeSession(106);
+      // Build a valid payload first.
+      final payload = session.prepareTransaction((tx) {
+        tx.setParameter('beauty', 'intensity', 0.6);
+      });
+      // applyTransaction must throw UnsupportedError synchronously.
+      expect(
+        () => session.applyTransaction(payload),
+        throwsUnsupportedError,
+        reason:
+            'applyTransaction() is a Phase 6C.2 stub and must always throw '
+            'UnsupportedError until native dispatch is implemented',
+      );
+      await session.dispose();
+    });
+
+    test(
+      'TX-8  applyTransaction() makes zero calls to the mock method channel',
+      () async {
+        final session = await makeSession(107);
+        final payload = session.prepareTransaction((tx) {
+          tx.setParameter('beauty', 'intensity', 0.6);
+        });
+        _log.clear(); // reset after create() + prepareTransaction()
+        try {
+          session.applyTransaction(payload);
+        } on UnsupportedError {
+          // expected
+        }
+        expect(
+          _log,
+          isEmpty,
+          reason:
+              'applyTransaction() must not invoke any method channel even '
+              'when throwing',
+        );
+        await session.dispose();
       },
     );
   });

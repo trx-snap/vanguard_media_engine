@@ -25,6 +25,7 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'vg_filter_spec.dart';
+import 'vg_graph_transaction.dart';
 import 'vg_recording_stats.dart';
 import 'vg_photo_capture_result.dart';
 
@@ -332,6 +333,64 @@ final class VGCameraSession {
   Future<void> closeNativePreview() async {
     if (_disposed) return;
     await _channel.invokeMethod<void>('closeNativeCamera');
+  }
+
+  // ── Transactions (Phase 6C.1C) ─────────────────────────────────────────────
+
+  /// Returns a new, blank mutable [VGGraphTransaction] builder.
+  ///
+  /// This is a pure-Dart factory call.  It does not invoke any method channel
+  /// or mutate the native graph state.  Use [prepareTransaction] for a
+  /// callback-style alternative, or [applyTransaction] (Phase 6C.2) once
+  /// native dispatch is available.
+  ///
+  /// ```dart
+  /// final tx = session.newTransaction();
+  /// tx.setParameter('beauty', 'intensity', 0.8);
+  /// final payload = tx.commit(); // ready for future applyTransaction
+  /// ```
+  VGGraphTransaction newTransaction() => VGGraphTransaction();
+
+  /// Ergonomic builder that assembles a transaction in memory and returns the
+  /// frozen [VGGraphTransactionPayload] without dispatching to native.
+  ///
+  /// Internally creates a fresh [VGGraphTransaction], passes it to [builder],
+  /// then calls [VGGraphTransaction.commit].  Validation and clamping errors
+  /// thrown inside [builder] propagate normally to the caller.
+  ///
+  /// This is 100% side-effect-free.  It does not invoke any method channel or
+  /// mutate the native graph state.
+  ///
+  /// ```dart
+  /// final payload = session.prepareTransaction((tx) {
+  ///   tx.setParameter('beauty', 'intensity', 0.8);
+  ///   tx.setParameter('lut',    'intensity', 0.4);
+  /// });
+  /// // payload is now ready for future applyTransaction (Phase 6C.2)
+  /// ```
+  VGGraphTransactionPayload prepareTransaction(
+    void Function(VGGraphTransaction tx) builder,
+  ) {
+    final tx = VGGraphTransaction();
+    builder(tx);
+    return tx.commit();
+  }
+
+  /// Stub for transaction application.  Always throws [UnsupportedError].
+  ///
+  /// Native method-channel dispatch is not implemented in Phase 6C.1C.
+  /// This method exists to reserve the API surface and prevent product code
+  /// from accidentally calling an unimplemented path silently.  It will be
+  /// implemented in Phase 6C.2 when the native `applyGraphTransaction` handler
+  /// is added.
+  ///
+  /// Throws [UnsupportedError] always.
+  // ignore: avoid_returning_null_for_future
+  Future<void> applyTransaction(VGGraphTransactionPayload payload) {
+    throw UnsupportedError(
+      'VGCameraSession.applyTransaction: native transaction routing is not '
+      'yet supported. Native dispatch will be added in Phase 6C.2.',
+    );
   }
 
   // ── Lifecycle ────────────────────────────────────────────────────────────────
