@@ -13,6 +13,7 @@
 #import "VGMetadataNodeAdapter.h"
 #import "VGPlatformViewSinkAdapter.h"
 #import "VGRecordingSinkNode.h"
+#import "VGPhotoSinkNode.h"
 
 // ─── UMF types ────────────────────────────────────────────────────────────────
 #import <UMF/VGGraphDescriptor.h>
@@ -112,19 +113,26 @@
                                              source:source];
     // recordingSink.enabled remains NO (the default). No frames are forwarded.
 
+    // Phase 6E.2A: Instantiate the photo sink skeleton. presentEnvelope: is an
+    // unconditional no-op in this phase — no arming, encoding, or file I/O.
+    // Held as the final child of VGFanOutSink to reserve the topology slot
+    // for Phase 6E.2B one-shot capture wiring.
+    VGPhotoSinkNode *photoSink =
+        [[VGPhotoSinkNode alloc] initWithNodeId:@"camera_photo_sink"];
+
     // POC2: when platformViewSink is provided, include it as a second child of
     // VGFanOutSink so graph output (post-Beauty-V2) reaches the MTKView PlatformView.
     // When nil: original single-child behaviour is preserved exactly.
-    // Recording sink is always appended last and always disabled in this step.
+    // Recording sink and photo sink are always appended last.
     NSArray<id<VGFrameSink>> *sinkChildren;
     if (platformViewSink) {
-        sinkChildren = @[ rendererSinkAdapter, platformViewSink, recordingSink ];
-        NSLog(@"[VGCameraGraphFactory] Phase 6E.1B: building three-child VGFanOutSink "
-               "(renderer + platformView + recordingSink[disabled])");
+        sinkChildren = @[ rendererSinkAdapter, platformViewSink, recordingSink, photoSink ];
+        NSLog(@"[VGCameraGraphFactory] Phase 6E.2A: building four-child VGFanOutSink "
+               "(renderer + platformView + recordingSink + photoSink[skeleton])");
     } else {
-        sinkChildren = @[ rendererSinkAdapter, recordingSink ];
-        NSLog(@"[VGCameraGraphFactory] Phase 6E.1B: building two-child VGFanOutSink "
-               "(renderer + recordingSink[disabled])");
+        sinkChildren = @[ rendererSinkAdapter, recordingSink, photoSink ];
+        NSLog(@"[VGCameraGraphFactory] Phase 6E.2A: building three-child VGFanOutSink "
+               "(renderer + recordingSink + photoSink[skeleton])");
     }
 
     VGFanOutSink *fanOutSink = [[VGFanOutSink alloc] initWithNodeId:@"fan_out_sink"
@@ -152,6 +160,11 @@
     // in setRecordingEnabled: and graph-rebuild propagation. The sink is already
     // a child of fanOutSink — this entry does not affect graph topology.
     nodeMap[recordingSink.nodeId] = recordingSink;
+    // Phase 6E.2A: expose the photo sink by its own nodeId so that
+    // VGCameraGraphSession can resolve it via _nodes[@"camera_photo_sink"]
+    // in future Phase 6E.2B arming. The sink is already a child of fanOutSink
+    // — this entry does not affect graph topology.
+    nodeMap[photoSink.nodeId] = photoSink;
 
     // ── (f) Build VGGraphNodeDescriptors ─────────────────────────────────────
     NSMutableArray<VGGraphNodeDescriptor *> *nodeDescriptors = [NSMutableArray arrayWithCapacity:nodeMap.count];
