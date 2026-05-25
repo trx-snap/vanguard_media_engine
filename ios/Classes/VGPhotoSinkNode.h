@@ -18,14 +18,24 @@
 //   - Invalidation: invalidate cancels any pending request with a session-
 //     invalidated error.
 //
-// Current status — Phase 6E.2B (ARMING / LATCHING):
+// Current status — Phase 6E.2C (JPEG ENCODE / WRITE):
 //   - Included as last child of VGFanOutSink via VGCameraGraphFactory.
 //   - presentEnvelope: latches one frame when armed; no-op otherwise.
-//   - 6E.2B: completion fires with GRAPH_PHOTO_NOT_YET_ENCODED placeholder.
+//   - 6E.2C: completion encodes the latched CVPixelBuffer to JPEG via a
+//     persistent CIContext and writes atomically to the requested path.
 //   - takePhoto routing is unchanged (still uses raw _latestBuffer path).
 //
+// Error codes (domain: "VGPhotoSinkNode"):
+//   1  GRAPH_PHOTO_INVALID_PATH        — path is nil or empty
+//   2  GRAPH_PHOTO_NIL_COMPLETION      — completion block is nil (arming)
+//   3  GRAPH_PHOTO_ALREADY_PENDING     — duplicate arm while request in flight
+//   4  GRAPH_PHOTO_SESSION_INVALIDATED — session torn down during latch
+//   5  GRAPH_PHOTO_TIMEOUT             — no frame within 3 s (session timeout)
+//   6  GRAPH_PHOTO_ENCODE_FAILED       — CIContext JPEG encoding returned nil
+//   7  GRAPH_PHOTO_WRITE_FAILED        — NSData atomic write to path failed
+//   8  GRAPH_PHOTO_NULL_BUFFER         — envelope contained null CVPixelBuffer
+//
 // Future steps will:
-//   6E.2C — Add async JPEG encode/write in the latch completion path.
 //   6E.2D — Route takePhotoToURL through the graph path.
 //
 // PORTABLE: VGFrameSink contract is platform-agnostic.
@@ -43,10 +53,15 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Graph terminal sink that receives processed camera frames for photo capture.
 ///
-/// Phase 6E.2B: One-shot arming/latching. presentEnvelope: latches a single
-/// frame when armed and dispatches the completion on an internal serial queue.
-/// No JPEG encoding or file I/O in this phase — completion fires with a
-/// placeholder error (GRAPH_PHOTO_NOT_YET_ENCODED).
+/// Phase 6E.2C: One-shot arming/latching with real JPEG encode/write.
+/// presentEnvelope: latches a single frame when armed, retains the
+/// CVPixelBuffer, and dispatches JPEG encoding + atomic file write on an
+/// internal serial queue (_photoQueue). The persistent CIContext is allocated
+/// once at init and reused for every capture.
+///
+/// Apple CIImage lazy-evaluation: the CVPixelBuffer must remain retained until
+/// JPEGRepresentationOfImage:colorSpace:options: returns. It is released exactly
+/// once after encoding completes (or on each early-error exit path).
 @interface VGPhotoSinkNode : NSObject <VGFrameSink>
 
 // ─── Properties ───────────────────────────────────────────────────────────────

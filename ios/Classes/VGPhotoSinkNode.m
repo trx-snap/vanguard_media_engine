@@ -1,17 +1,28 @@
 // VGPhotoSinkNode.m
-// vanguard_media_engine — Phase 6E.2A / Phase 6E.2B
+// vanguard_media_engine — Phase 6E.2A / Phase 6E.2B / Phase 6E.2C
 //
-// Phase 6E.2B: One-shot arming/latching API.
+// Phase 6E.2C: Real async JPEG encode/write on _photoQueue.
 // presentEnvelope: latches one processed frame when armed, retains the buffer,
 // and dispatches the completion asynchronously on _photoQueue.
-// In this phase the completion fires with a placeholder error
-// (GRAPH_PHOTO_NOT_YET_ENCODED) — no JPEG encoding or file I/O is present.
-// Phase 6E.2C will replace the placeholder with CIContext JPEG encode/write.
+// On _photoQueue: CIContext JPEG encoding and atomic NSData file write.
+//
+// Apple CIImage lazy-evaluation contract (developer.apple.com/documentation/coreimage):
+//   CIImage does not render pixel data until a CIContext rendering call.
+//   CVPixelBuffer MUST remain alive until JPEGRepresentationOfImage:colorSpace:options:
+//   returns — do NOT release the buffer immediately after CIImage creation.
+//
+// Buffer retain/release contract:
+//   - presentEnvelope: retains processedBuffer under _requestLock.
+//   - _photoQueue block keeps processedBuffer alive through CIImage init AND
+//     through JPEGRepresentationOfImage:. Released exactly once after
+//     JPEGRepresentationOfImage: returns (or on early-exit error paths).
 
 #import "VGPhotoSinkNode.h"
 #import <UMF/VGGraphExecutionContext.h>
 #import <UMF/VGMediaFormat.h>
 #import <CoreVideo/CoreVideo.h>
+#import <CoreImage/CoreImage.h>
+#import <ImageIO/ImageIO.h>
 #import <os/lock.h>
 
 @implementation VGPhotoSinkNode {
@@ -26,6 +37,11 @@
     // Phase 6E.2B: Serial queue for completion dispatch.
     // Never dispatches on _graphExecutionQueue or _sessionQueue.
     dispatch_queue_t _photoQueue;
+
+    // Phase 6E.2C: Persistent CIContext for JPEG encoding.
+    // Created once at init; reused for every capture to avoid repeated
+    // Metal pipeline initialization overhead.
+    CIContext *_ciContext;
 }
 
 // ─── Initializers ─────────────────────────────────────────────────────────────
@@ -47,6 +63,10 @@
                                             dispatch_queue_attr_make_with_qos_class(
                                                 DISPATCH_QUEUE_SERIAL,
                                                 QOS_CLASS_USER_INITIATED, 0));
+        // Phase 6E.2C: Create the persistent CIContext once.
+        // contextWithOptions:nil selects the Metal GPU backend on iOS 9+.
+        // Reusing a single context avoids repeated Metal pipeline allocation.
+        _ciContext = [CIContext contextWithOptions:nil];
     }
     return self;
 }
@@ -134,25 +154,123 @@
 
     os_unfair_lock_unlock(&_requestLock);
 
-    // ── Dispatch completion asynchronously on _photoQueue ──────────────────
-    // Never blocks _graphExecutionQueue. In 6E.2C this block will encode
-    // the retained buffer to JPEG and write to `path` before calling completion.
+    // ── Dispatch JPEG encode/write asynchronously on _photoQueue ───────────
+    // Never blocks _graphExecutionQueue. presentEnvelope: has already retained
+    // processedBuffer (+1). The async block owns that retain and is responsible
+    // for exactly one CVPixelBufferRelease across all exit paths.
+    //
+    // Buffer lifetime rule (Apple CIImage lazy-evaluation):
+    //   processedBuffer MUST stay alive until JPEGRepresentationOfImage:
+    //   returns. Do NOT release immediately after CIImage creation.
     dispatch_async(_photoQueue, ^{
-        if (processedBuffer) {
-            // Phase 6E.2B: Placeholder — buffer latched but encoding not yet
-            // implemented. Release the buffer and fire a placeholder error.
-            // 6E.2C will replace this block with CIContext JPEG encode/write.
-            CVPixelBufferRelease(processedBuffer);
-        }
+        @autoreleasepool {
+            // ── Guard: null buffer ───────────────────────────────────────────
+            if (!processedBuffer) {
+                NSError *error = [NSError errorWithDomain:@"VGPhotoSinkNode"
+                                                     code:8
+                                                 userInfo:@{
+                    NSLocalizedDescriptionKey:
+                        @"GRAPH_PHOTO_NULL_BUFFER: "
+                        "Latched frame envelope contained a null pixel buffer."
+                }];
+                completion(nil, error);
+                return;
+            }
 
-        NSError *placeholderError = [NSError errorWithDomain:@"VGPhotoSinkNode"
-                                                        code:99
-                                                    userInfo:@{
-            NSLocalizedDescriptionKey: @"GRAPH_PHOTO_NOT_YET_ENCODED: "
-                                       "Frame latched but JPEG encoding is not implemented "
-                                       "until Phase 6E.2C."
-        }];
-        completion(nil, placeholderError);
+            // ── Guard: invalid/empty path ────────────────────────────────────
+            if (!path || path.length == 0) {
+                CVPixelBufferRelease(processedBuffer);
+                NSError *error = [NSError errorWithDomain:@"VGPhotoSinkNode"
+                                                     code:1
+                                                 userInfo:@{
+                    NSLocalizedDescriptionKey:
+                        @"GRAPH_PHOTO_INVALID_PATH: "
+                        "Destination path is nil or empty."
+                }];
+                completion(nil, error);
+                return;
+            }
+
+            NSURL *fileURL = [NSURL fileURLWithPath:path];
+
+            // ── Step 1: Wrap CVPixelBuffer in a CIImage ──────────────────────
+            // CIImage is lazily evaluated — no pixel data is read here.
+            // processedBuffer must remain retained until after encoding (below).
+            CIImage *ciImage = [CIImage imageWithCVPixelBuffer:processedBuffer];
+
+            // ── Step 2: Resolve color space ──────────────────────────────────
+            // Use the image's own color space when available (preserves
+            // Display P3 / sRGB tags). Fall back to DeviceRGB if absent.
+            // ownedCS tracks whether we must release the fallback space.
+            CGColorSpaceRef cs = ciImage.colorSpace;
+            BOOL ownedCS = NO;
+            if (!cs) {
+                cs = CGColorSpaceCreateDeviceRGB();
+                ownedCS = YES;
+            }
+
+            // ── Step 3: JPEG encode ──────────────────────────────────────────
+            // kCGImageDestinationLossyCompressionQuality @0.9 matches the raw
+            // capture path in VanguardCameraMediaSource.takePhotoToURL:.
+            // JPEGRepresentationOfImage: triggers CIContext rendering — the
+            // CIImage lazy recipe is evaluated and processedBuffer is consumed.
+            // processedBuffer MUST still be valid at this point.
+            NSDictionary *options = @{
+                (id)kCGImageDestinationLossyCompressionQuality: @0.9,
+            };
+            NSData *jpegData = [self->_ciContext
+                JPEGRepresentationOfImage:ciImage
+                               colorSpace:cs
+                                  options:options];
+
+            // Release pixel buffer now — CIContext rendering is complete.
+            // This is the one and only CVPixelBufferRelease for the retained +1.
+            CVPixelBufferRelease(processedBuffer);
+
+            // Release any fallback color space we created.
+            if (ownedCS) {
+                CGColorSpaceRelease(cs);
+            }
+
+            // ── Step 4: Guard: encoding failure ─────────────────────────────
+            if (!jpegData) {
+                NSError *error = [NSError errorWithDomain:@"VGPhotoSinkNode"
+                                                     code:6
+                                                 userInfo:@{
+                    NSLocalizedDescriptionKey:
+                        @"GRAPH_PHOTO_ENCODE_FAILED: "
+                        "CIContext JPEGRepresentationOfImage returned nil."
+                }];
+                completion(nil, error);
+                return;
+            }
+
+            // ── Step 5: Atomic file write ────────────────────────────────────
+            // NSDataWritingAtomic writes to a temp file first and renames;
+            // the destination is never left in a partial state.
+            NSError *writeError = nil;
+            BOOL written = [jpegData writeToURL:fileURL
+                                        options:NSDataWritingAtomic
+                                          error:&writeError];
+            if (!written) {
+                NSMutableDictionary *ui = [NSMutableDictionary dictionaryWithCapacity:2];
+                ui[NSLocalizedDescriptionKey] =
+                    [NSString stringWithFormat:
+                        @"GRAPH_PHOTO_WRITE_FAILED: Failed to write JPEG to %@",
+                        path];
+                if (writeError) {
+                    ui[NSUnderlyingErrorKey] = writeError;
+                }
+                NSError *error = [NSError errorWithDomain:@"VGPhotoSinkNode"
+                                                     code:7
+                                                 userInfo:[ui copy]];
+                completion(nil, error);
+                return;
+            }
+
+            // ── Success ──────────────────────────────────────────────────────
+            completion(path, nil);
+        }
     });
 }
 
