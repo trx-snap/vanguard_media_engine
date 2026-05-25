@@ -974,5 +974,162 @@ void main() {
         await session.dispose();
       },
     );
+
+    // ── Phase 6C.2B: hot parameter routing ─────────────────────────────────
+    //
+    // TX-11: hot-only beauty.intensity dispatches exactly once to channel.
+    // TX-12: warm param (beauty.radius) dispatches, mock rejects UNSUPPORTED_TRANSACTION_POLICY.
+    // TX-13: unknown effect (lut.intensity) dispatches, mock rejects UNSUPPORTED_TRANSACTION_POLICY.
+    //
+    // Dart does NOT locally filter by policy — that is native's responsibility.
+    // These tests verify Dart dispatch shape and PlatformException propagation.
+
+    test(
+      'TX-11 applyTransaction() with hot beauty.intensity dispatches once with correct payload',
+      () async {
+        final session = await makeSession(110);
+        // Construct a hot-only beauty.intensity payload.
+        final payload = session.prepareTransaction((tx) {
+          tx.setParameter('beauty', 'intensity', 0.65); // hot policy
+        });
+        expect(payload.hasHotParameters, isTrue);
+        expect(payload.requiresRebuild, isFalse);
+        expect(
+          payload.parameterUpdates,
+          equals({
+            'beauty': {'intensity': 0.65},
+          }),
+        );
+
+        _log.clear();
+        _responses['applyGraphTransaction'] = null; // mock: native succeeds
+        await session.applyTransaction(payload);
+
+        expect(
+          _log,
+          hasLength(1),
+          reason:
+              'applyTransaction() must dispatch applyGraphTransaction exactly once',
+        );
+        expect(_log.first.method, equals('applyGraphTransaction'));
+        // Payload must carry parameterUpdates with beauty.intensity.
+        final dispatched = _log.first.arguments as Map;
+        expect(dispatched['requiresRebuild'], isFalse);
+        expect(
+          (dispatched['parameterUpdates'] as Map)['beauty'],
+          equals({'intensity': 0.65}),
+          reason: 'parameterUpdates must carry beauty.intensity = 0.65',
+        );
+        await session.dispose();
+      },
+    );
+
+    test('TX-12 applyTransaction() with warm param (beauty.radius) dispatches and '
+        'propagates UNSUPPORTED_TRANSACTION_POLICY from native', () async {
+      final session = await makeSession(111);
+      // beauty.radius has warm policy — Dart will still dispatch it;
+      // native is expected to reject with UNSUPPORTED_TRANSACTION_POLICY.
+      final payload = session.prepareTransaction((tx) {
+        tx.setParameter('beauty', 'radius', 3.0); // warm policy
+      });
+      expect(payload.hasWarmParameters, isTrue);
+      expect(payload.requiresRebuild, isFalse);
+
+      // Install a mock that rejects the channel call with the expected error.
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('vanguard_media_engine'),
+            (MethodCall call) async {
+              _log.add(call);
+              if (call.method == 'applyGraphTransaction') {
+                throw PlatformException(
+                  code: 'UNSUPPORTED_TRANSACTION_POLICY',
+                  message:
+                      "applyHotParameterUpdates: only 'intensity' is a supported "
+                      'hot parameter for beauty in Phase 6C.2B.',
+                );
+              }
+              return _responses[call.method];
+            },
+          );
+
+      await expectLater(
+        () async => session.applyTransaction(payload),
+        throwsA(
+          isA<PlatformException>().having(
+            (e) => e.code,
+            'code',
+            'UNSUPPORTED_TRANSACTION_POLICY',
+          ),
+        ),
+        reason:
+            'applyTransaction() must propagate UNSUPPORTED_TRANSACTION_POLICY '
+            'from the native channel for warm parameters',
+      );
+
+      // Confirm Dart dispatched the channel call.
+      expect(
+        _log.where((c) => c.method == 'applyGraphTransaction').length,
+        equals(1),
+        reason:
+            'Dart must have dispatched applyGraphTransaction before rejection',
+      );
+      await session.dispose();
+    });
+
+    test('TX-13 applyTransaction() with unknown effect (lut.intensity) dispatches and '
+        'propagates UNSUPPORTED_TRANSACTION_POLICY from native', () async {
+      final session = await makeSession(112);
+      // lut.intensity has hot policy in the catalog, but native currently
+      // only supports beauty.intensity. Dart dispatches; native rejects.
+      final payload = session.prepareTransaction((tx) {
+        tx.setParameter(
+          'lut',
+          'intensity',
+          0.5,
+        ); // hot policy, but unsupported by 6C.2B native
+      });
+      expect(payload.hasHotParameters, isTrue);
+      expect(payload.requiresRebuild, isFalse);
+
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(
+            const MethodChannel('vanguard_media_engine'),
+            (MethodCall call) async {
+              _log.add(call);
+              if (call.method == 'applyGraphTransaction') {
+                throw PlatformException(
+                  code: 'UNSUPPORTED_TRANSACTION_POLICY',
+                  message:
+                      "applyHotParameterUpdates: only {beauty:{intensity}} is supported "
+                      'in Phase 6C.2B.',
+                );
+              }
+              return _responses[call.method];
+            },
+          );
+
+      await expectLater(
+        () async => session.applyTransaction(payload),
+        throwsA(
+          isA<PlatformException>().having(
+            (e) => e.code,
+            'code',
+            'UNSUPPORTED_TRANSACTION_POLICY',
+          ),
+        ),
+        reason:
+            'applyTransaction() must propagate UNSUPPORTED_TRANSACTION_POLICY '
+            'from the native channel for unsupported effect types',
+      );
+
+      expect(
+        _log.where((c) => c.method == 'applyGraphTransaction').length,
+        equals(1),
+        reason:
+            'Dart must have dispatched applyGraphTransaction before rejection',
+      );
+      await session.dispose();
+    });
   });
 }

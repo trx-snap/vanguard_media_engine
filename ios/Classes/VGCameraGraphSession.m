@@ -716,6 +716,147 @@
     return success;
 }
 
+// ─── Phase 6C.2B: In-place hot parameter updates ─────────────────────────────
+//
+// Validation: strictly enforces { "beauty": { "intensity": <number> } }.
+// Any other shape is rejected with UNSUPPORTED_TRANSACTION_POLICY before
+// touching the session queue.
+//
+// Node lookup: iterates _currentFilterChain which holds the live concrete
+// filter node instances (VanguardBeautyFilterNode or BeautyV2FilterGroup)
+// as constructed by setCameraFilterChainFromSpecs:. No VGLegacyFilterAdapter
+// unwrapping is needed or present — _currentFilterChain never contains adapters.
+//
+// Queue: all node access and intensity writes are serialized inside
+// dispatch_sync(_sessionQueue). This is mutually exclusive with graph rebuild,
+// teardown, recording enable/disable, and photo capture arming.
+//
+// MUST NOT be called from _sessionQueue — dispatch_sync would deadlock.
+
+- (BOOL)applyHotParameterUpdates:(NSDictionary<NSString *, NSDictionary<NSString *, id> *> *)updates
+                            error:(NSError * _Nullable * _Nullable)outError
+{
+    if (outError) *outError = nil;
+
+    // ── Empty updates: no-op success ──────────────────────────────────────────
+    // Swift caller handles empty-payload short-circuit before calling us,
+    // but guard here defensively.
+    if (!updates || updates.count == 0) {
+        return YES;
+    }
+
+    // ── Phase 6C.2B policy: exactly one effect key — "beauty" ─────────────────
+    if (updates.count != 1 || !updates[@"beauty"]) {
+        if (outError) {
+            NSString *badEffects = [updates.allKeys componentsJoinedByString:@", "];
+            *outError = [NSError
+                errorWithDomain:@"UNSUPPORTED_TRANSACTION_POLICY"
+                           code:1
+                       userInfo:@{
+                NSLocalizedDescriptionKey:
+                    [NSString stringWithFormat:
+                        @"applyHotParameterUpdates: only {beauty:{intensity}} is supported "
+                         "in Phase 6C.2B. Received effects: %@.", badEffects]
+            }];
+        }
+        return NO;
+    }
+
+    NSDictionary<NSString *, id> *beautyUpdates = updates[@"beauty"];
+
+    // ── Phase 6C.2B policy: exactly one param key — "intensity" ───────────────
+    if (beautyUpdates.count != 1 || !beautyUpdates[@"intensity"]) {
+        if (outError) {
+            NSString *badParams = [beautyUpdates.allKeys componentsJoinedByString:@", "];
+            *outError = [NSError
+                errorWithDomain:@"UNSUPPORTED_TRANSACTION_POLICY"
+                           code:2
+                       userInfo:@{
+                NSLocalizedDescriptionKey:
+                    [NSString stringWithFormat:
+                        @"applyHotParameterUpdates: only 'intensity' is a supported "
+                         "hot parameter for beauty in Phase 6C.2B. Received: %@.", badParams]
+            }];
+        }
+        return NO;
+    }
+
+    id rawIntensity = beautyUpdates[@"intensity"];
+
+    // ── Validate that the value is numeric ────────────────────────────────────
+    if (![rawIntensity respondsToSelector:@selector(floatValue)]) {
+        if (outError) {
+            *outError = [NSError
+                errorWithDomain:@"UNSUPPORTED_TRANSACTION_POLICY"
+                           code:3
+                       userInfo:@{
+                NSLocalizedDescriptionKey:
+                    @"applyHotParameterUpdates: beauty.intensity value must be numeric."
+            }];
+        }
+        return NO;
+    }
+
+    // ── Defensive clamp [0.0, 1.0] ───────────────────────────────────────────
+    // Dart already clamps via VGParameterDescriptor, but native must not assume
+    // callers are well-behaved (e.g. direct plugin calls, future bridging).
+    float clamped = fminf(1.0f, fmaxf(0.0f, [rawIntensity floatValue]));
+
+    // ── Serialize on session queue ────────────────────────────────────────────
+    __block BOOL success = NO;
+    __block NSError *innerError = nil;
+
+    dispatch_sync(_sessionQueue, ^{
+        // Guard: session must not be invalidated.
+        if (atomic_load(&self->_invalidated)) {
+            innerError = [NSError
+                errorWithDomain:@"HOT_UPDATE_FAIL"
+                           code:400
+                       userInfo:@{
+                NSLocalizedDescriptionKey:
+                    @"applyHotParameterUpdates: session is invalidated."
+            }];
+            return;
+        }
+
+        // ── Iterate _currentFilterChain ───────────────────────────────────────
+        // _currentFilterChain holds the concrete filter node instances
+        // (VanguardBeautyFilterNode or BeautyV2FilterGroup) — no adapter
+        // wrapping is needed. These are the exact same objects the render loop
+        // accesses through VGLegacyFilterAdapter, so writing intensity here is
+        // immediately visible to the next frame's processEnvelope: call.
+        BOOL foundBeautyNode = NO;
+        for (id node in self->_currentFilterChain) {
+            if ([node isKindOfClass:[VanguardBeautyFilterNode class]]) {
+                ((VanguardBeautyFilterNode *)node).intensity = clamped;
+                foundBeautyNode = YES;
+            } else if ([node isKindOfClass:[BeautyV2FilterGroup class]]) {
+                ((BeautyV2FilterGroup *)node).intensity = clamped;
+                foundBeautyNode = YES;
+            }
+        }
+
+        if (!foundBeautyNode) {
+            innerError = [NSError
+                errorWithDomain:@"HOT_UPDATE_FAIL"
+                           code:404
+                       userInfo:@{
+                NSLocalizedDescriptionKey:
+                    @"applyHotParameterUpdates: no active beauty filter node found "
+                     "in the current filter chain."
+            }];
+            return;
+        }
+
+        success = YES;
+    });
+
+    if (!success && outError && innerError) {
+        *outError = innerError;
+    }
+    return success;
+}
+
 - (void)invalidate {
     dispatch_sync(_sessionQueue, ^{
         if (atomic_exchange(&self->_invalidated, YES)) {

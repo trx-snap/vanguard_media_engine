@@ -153,6 +153,33 @@ NS_ASSUME_NONNULL_BEGIN
              completion:(void (^)(NSString *_Nullable outputPath, NSError *_Nullable error))completion
                   error:(NSError *_Nullable *_Nullable)outError;
 
+// ─── Phase 6C.2B: In-place hot parameter updates ─────────────────────────────
+
+/// Applies in-place hot parameter updates to active camera graph filter nodes.
+///
+/// Phase 6C.2B scope: supports ONLY the following payload shape:
+///   { "beauty": { "intensity": <number [0.0, 1.0]> } }
+///
+/// Any other effect type, parameter name, or payload shape is rejected with
+/// UNSUPPORTED_TRANSACTION_POLICY.  If no active beauty filter is found in the
+/// current filter chain, returns NO with HOT_UPDATE_FAIL.
+///
+/// Threading:
+///   - Safe to call from the main/plugin thread.
+///   - MUST NOT be called from `_sessionQueue` — doing so will deadlock.
+///   - Internally serializes node lookup and intensity write via dispatch_sync
+///     on `_sessionQueue`, preventing races with graph rebuild and teardown.
+///
+/// @param updates   Parameter update dictionary shaped as:
+///                    { effectType (NSString*): { paramName (NSString*): value (NSNumber*) } }
+/// @param outError  On failure, set to a descriptive NSError whose domain is
+///                  one of: "UNSUPPORTED_TRANSACTION_POLICY", "HOT_UPDATE_FAIL",
+///                  "VGCameraGraphSession".
+/// @return YES on success (intensity applied to all active beauty nodes), NO on
+///         any validation or session failure.
+- (BOOL)applyHotParameterUpdates:(NSDictionary<NSString *, NSDictionary<NSString *, id> *> *)updates
+                            error:(NSError * _Nullable * _Nullable)outError;
+
 // ─── POC2: Platform View graph delivery ──────────────────────────────────────
 
 /// Wires a VanguardCameraFrameReceiver (typically VanguardCameraPlatformView) as

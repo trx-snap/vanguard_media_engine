@@ -1457,11 +1457,18 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             #endif
 
         case "applyGraphTransaction":
-            // Phase 6C.2A: Apply a validated VGGraphTransactionPayload to the
-            // active camera graph.  Only preset-only rebuild transactions are
-            // supported in this phase.  Any non-empty parameterUpdates are
-            // rejected with UNSUPPORTED_TRANSACTION_POLICY — never silently
-            // ignored — to prevent data loss from partially applied payloads.
+            // Phase 6C.2A/6C.2B: Apply a validated VGGraphTransactionPayload to
+            // the active camera graph.
+            //
+            // Routing:
+            //   requiresRebuild == true  → 6C.2A preset rebuild path.
+            //     Mixed payloads (preset + parameterUpdates) are rejected:
+            //     the preset establishes the full filter state; overlaying hot
+            //     updates in the same transaction is ambiguous.
+            //   requiresRebuild == false, parameterUpdates non-empty →
+            //     6C.2B hot update path (beauty.intensity only).
+            //     Native applyHotParameterUpdates:error: enforces policy.
+            //   requiresRebuild == false, parameterUpdates empty → no-op success.
             #if VG_USE_CAMERA_GRAPH
             guard let session = cameraGraphSession else {
                 result(FlutterError(
@@ -1482,24 +1489,24 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 return
             }
 
-            // ── C. Reject non-empty parameterUpdates ─────────────────────────
-            // Phase 6C.2A does not support in-place hot/warm parameter mutation.
-            // Rejecting here prevents silent data loss when callers pass a
-            // payload that coexists preset + parameterUpdates.
-            let parameterUpdates = payload["parameterUpdates"] as? [String: Any] ?? [:]
-            if !parameterUpdates.isEmpty {
-                result(FlutterError(
-                    code: "UNSUPPORTED_TRANSACTION_POLICY",
-                    message: "In-place parameter updates are not yet supported "
-                           + "in Phase 6C.2A. Use preset-only transactions.",
-                    details: nil
-                ))
-                return
-            }
-
-            // ── D. Rebuild handling ────────────────────────────────────────────
             let requiresRebuild = payload["requiresRebuild"] as? Bool ?? false
+            let parameterUpdates = payload["parameterUpdates"] as? [String: [String: Any]] ?? [:]
+
+            // ── A. Rebuild path (6C.2A) ───────────────────────────────────────
             if requiresRebuild {
+                // Reject mixed preset + parameterUpdates: the preset establishes
+                // the full filter-chain state; hot overlays in the same rebuild
+                // transaction are unsupported and produce ambiguous results.
+                if !parameterUpdates.isEmpty {
+                    result(FlutterError(
+                        code: "UNSUPPORTED_TRANSACTION_POLICY",
+                        message: "Mixed rebuild+parameterUpdates transactions are not "
+                               + "supported. Use a preset-only rebuild transaction.",
+                        details: nil
+                    ))
+                    return
+                }
+
                 guard let presetDict = payload["preset"] as? [String: Any],
                       let filterStack = presetDict["filterStack"] as? [[String: Any]] else {
                     result(FlutterError(
@@ -1516,14 +1523,40 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     result(nil)
                 } catch {
                     let nsError = error as NSError
-                    let code = nsError.domain
-                    let message = nsError.localizedDescription
-                    result(FlutterError(code: code, message: message, details: nil))
+                    result(FlutterError(
+                        code: nsError.domain,
+                        message: nsError.localizedDescription,
+                        details: nil
+                    ))
                 }
                 return
             }
 
-            // ── E. No-op success (requiresRebuild == false, parameterUpdates empty) ──
+            // ── B. Hot parameter path (6C.2B) ─────────────────────────────────
+            // Supports only { "beauty": { "intensity": <number> } }.
+            // Native applyHotParameterUpdates:error: enforces the shape strictly
+            // and rejects any other effect type or parameter name.
+            //
+            // ObjC (BOOL)method:(NSDictionary<NSString*,NSDictionary<NSString*,id>*>*)x
+            //             error:(NSError**)outError
+            // imports into Swift as: func method(_ x: [String: [String: Any]]) throws
+            if !parameterUpdates.isEmpty {
+                do {
+                    try session.applyHotParameterUpdates(parameterUpdates)
+                    result(nil)
+                } catch {
+                    let nsError = error as NSError
+                    result(FlutterError(
+                        code: nsError.domain,
+                        message: nsError.localizedDescription,
+                        details: nil
+                    ))
+                }
+                return
+            }
+
+
+            // ── C. No-op success (requiresRebuild == false, parameterUpdates empty) ──
             result(nil)
             #else
             result(FlutterError(
