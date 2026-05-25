@@ -24,6 +24,7 @@
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'vg_camera_zoom_capabilities.dart';
 import 'vg_filter_spec.dart';
 import 'vg_graph_transaction.dart';
 import 'vg_recording_stats.dart';
@@ -172,6 +173,49 @@ final class VGCameraSession {
   Future<void> setZoom(double factor) async {
     if (_disposed) return;
     await _channel.invokeMethod<void>('setZoom', {'factor': factor});
+  }
+
+  /// Returns native zoom capabilities for the currently active camera device.
+  ///
+  /// Should be called after [create] succeeds. Internally queries the native
+  /// side for `minAvailableVideoZoomFactor`, `maxAvailableVideoZoomFactor`,
+  /// `displayVideoZoomFactorMultiplier` (iOS 18+; defaults to `1.0` on earlier
+  /// OS versions), and `virtualDeviceSwitchOverVideoZoomFactors` (iOS 13+).
+  ///
+  /// ## Wide-angle-first phase
+  /// In the current implementation, the native side is bound to
+  /// `builtInWideAngleCamera` only. The returned capabilities therefore
+  /// reflect only the wide-angle lens range:
+  ///   - [VGCameraZoomCapabilities.virtualDeviceSwitchOverZoomFactors] is `[]`.
+  ///   - [VGCameraZoomCapabilities.isVirtualDevice] is `false`.
+  ///   - [VGCameraZoomCapabilities.supportsUltraWide] is `false`.
+  ///   - [VGCameraZoomCapabilities.supportsTelephoto] is `false`.
+  ///
+  /// ## Android
+  /// Android zoom capability exposure is not yet implemented. On Android the
+  /// native handler is absent so [VGCameraZoomCapabilities.fallback] is
+  /// returned silently.
+  ///
+  /// ## Failure behaviour
+  /// Returns [VGCameraZoomCapabilities.fallback] on any of:
+  ///   - This session is disposed.
+  ///   - Native returns `null` (no active camera device).
+  ///   - A [PlatformException] is thrown (e.g. `NO_CAMERA`, `NO_DEVICE`,
+  ///     or `FlutterMethodNotImplemented` on Android).
+  ///
+  /// No-op if this session has been [dispose]d (returns fallback).
+  Future<VGCameraZoomCapabilities> getZoomCapabilities() async {
+    if (_disposed) return VGCameraZoomCapabilities.fallback;
+    try {
+      final raw =
+          await _channel.invokeMethod<Map>('getCameraZoomCapabilities');
+      if (raw == null) return VGCameraZoomCapabilities.fallback;
+      return VGCameraZoomCapabilities.fromMap(
+        Map<String, dynamic>.from(raw),
+      );
+    } on PlatformException {
+      return VGCameraZoomCapabilities.fallback;
+    }
   }
 
   /// Tap-to-focus and tap-to-expose at a normalised point.

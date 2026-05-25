@@ -114,6 +114,33 @@ NS_ASSUME_NONNULL_BEGIN
 /// activeFormat.videoMaxZoomFactor.
 - (void)setZoom:(CGFloat)factor;
 
+/// Returns a dictionary of zoom capability values from the active AVCaptureDevice.
+///
+/// Returns nil if no device is currently active (_captureDevice is nil).
+///
+/// Keys:
+///   minZoomFactor                     — minAvailableVideoZoomFactor (iOS 11+; 1.0 fallback)
+///   maxZoomFactor                     — RECOMMENDED quality-safe maximum for pinch-zoom clamping.
+///                                       Front camera: min(2.0, technicalMaxZoomFactor)
+///                                       Back camera:  min(upscaleThreshold × 2.5, 10.0)
+///                                       Both: clamped to technicalMaxZoomFactor.
+///   technicalMaxZoomFactor            — maxAvailableVideoZoomFactor (iOS 11+; videoMaxZoomFactor fallback)
+///                                       The absolute ceiling — may be 150× or higher. Do NOT use
+///                                       as UI zoom limit.
+///   upscaleThresholdZoomFactor        — activeFormat.videoZoomFactorUpscaleThreshold (iOS 11+; technicalMax fallback)
+///                                       Zoom factors above this threshold produce digitally upscaled output.
+///   defaultZoomFactor                 — always 1.0 in the wide-angle-first phase
+///   displayZoomFactorMultiplier       — displayVideoZoomFactorMultiplier (iOS 18+; 1.0 fallback)
+///   virtualDeviceSwitchOverZoomFactors — virtualDeviceSwitchOverVideoZoomFactors (iOS 13+; [] fallback)
+///   isVirtualDevice                   — YES if the device is a virtual multi-camera device (iOS 13+; NO fallback)
+///   cameraPosition                    — @"front" | @"back" | @"unknown"
+///
+/// Wide-angle-first: virtual multi-camera discovery is deferred. On the current
+/// wide-angle-only binding, virtualDeviceSwitchOverZoomFactors is always empty
+/// and isVirtualDevice is always NO.
+- (nullable NSDictionary *)zoomCapabilities;
+
+
 /// Tap-to-focus + tap-to-expose at normalised point (0.0–1.0, 0.0–1.0),
 /// AVFoundation coordinate space: x left→right, y top→bottom.
 /// Renamed applyFocusPoint: (not setFocusPoint:) to avoid the Swift ObjC-bridge

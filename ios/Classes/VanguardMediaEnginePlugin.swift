@@ -1726,6 +1726,28 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             cameraSource?.setZoom(CGFloat(factor))
             result(nil)
 
+        case "getCameraZoomCapabilities":
+            // Phase 6: continuous device-aware zoom capabilities.
+            // Returns native min/max zoom, display multiplier, and virtual-device
+            // switch-over factors from the currently active AVCaptureDevice.
+            // Wide-angle-first: virtual multi-camera discovery is deferred;
+            // virtualDeviceSwitchOverZoomFactors is always [] and isVirtualDevice
+            // is always false in this phase.
+            guard let src = cameraSource else {
+                result(FlutterError(code: "NO_CAMERA",
+                                    message: "getCameraZoomCapabilities: no active camera session",
+                                    details: nil))
+                return
+            }
+            guard let caps = src.zoomCapabilities() else {
+                result(FlutterError(code: "NO_DEVICE",
+                                    message: "getCameraZoomCapabilities: no active capture device",
+                                    details: nil))
+                return
+            }
+            result(caps)
+
+
         case "setFocusPoint":
             guard let x = args?["x"] as? Double, let y = args?["y"] as? Double else {
                 result(FlutterError(code: "INVALID_ARG", message: "x and y required", details: nil))

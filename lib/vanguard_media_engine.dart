@@ -19,6 +19,9 @@ export 'vg_playback_session.dart';
 // Phase 6D.1A: typed camera session + preview widget.
 export 'vg_camera_session.dart';
 export 'vg_camera_preview.dart';
+// Phase 6: continuous device-aware zoom capability model.
+export 'vg_camera_zoom_capabilities.dart';
+
 // Phase 6D.3: typed recording result.
 export 'vg_recording_stats.dart';
 // Phase 6D.4: typed photo capture result.

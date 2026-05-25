@@ -1000,6 +1000,130 @@ static const char kCaptureQueueKey = 0;
   }
 }
 
+/// Returns zoom capability values from the active AVCaptureDevice.
+///
+/// All reads are on read-only AVCaptureDevice properties — no
+/// lockForConfiguration required (Apple docs: only write operations need the
+/// configuration lock; read-only properties are freely accessible).
+///
+/// Wide-angle-first: device discovery is still bound to
+/// builtInWideAngleCamera. virtualDeviceSwitchOverZoomFactors is therefore
+/// always [] and isVirtualDevice is always NO in this phase. Virtual
+/// multi-camera discovery is deferred.
+///
+/// maxZoomFactor in the returned dictionary is the RECOMMENDED quality-safe
+/// maximum for pinch-zoom clamping. It is NOT the technical ceiling.
+/// Callers should use maxZoomFactor for UI/gesture clamping and
+/// technicalMaxZoomFactor only for diagnostics / developer tooling.
+- (nullable NSDictionary *)zoomCapabilities {
+  AVCaptureDevice *dev = _captureDevice;
+  if (!dev)
+    return nil;
+
+  // ── Camera position string ────────────────────────────────────────────────
+  NSString *positionStr;
+  switch (dev.position) {
+    case AVCaptureDevicePositionFront:
+      positionStr = @"front";
+      break;
+    case AVCaptureDevicePositionBack:
+      positionStr = @"back";
+      break;
+    default:
+      positionStr = @"unknown";
+      break;
+  }
+  BOOL isFront = (dev.position == AVCaptureDevicePositionFront);
+
+  // ── minZoomFactor ─────────────────────────────────────────────────────────
+  CGFloat minZoom = 1.0;
+  if (@available(iOS 11.0, *)) {
+    minZoom = dev.minAvailableVideoZoomFactor;
+  }
+
+  // ── technicalMaxZoomFactor ────────────────────────────────────────────────
+  // The absolute hardware/digital ceiling reported by AVFoundation.
+  // On modern wide-angle cameras this is typically 100× – 200×.
+  // Do NOT present this to users as a zoom limit.
+  CGFloat technicalMax = dev.activeFormat.videoMaxZoomFactor;
+  if (@available(iOS 11.0, *)) {
+    technicalMax = dev.maxAvailableVideoZoomFactor;
+  }
+
+  // ── upscaleThresholdZoomFactor ────────────────────────────────────────────
+  // Zoom factors above this threshold require digital upscaling (pixel
+  // interpolation). Below or at the threshold the output is a lossless
+  // sensor crop — no quality degradation.
+  // iOS 7+: videoZoomFactorUpscaleThreshold is available without availability
+  // annotation (it's on AVCaptureDevice.Format which is iOS 7+).
+  CGFloat upscaleThreshold = technicalMax; // safe fallback
+  CGFloat rawThreshold = dev.activeFormat.videoZoomFactorUpscaleThreshold;
+  if (rawThreshold > 1.0) {
+    // Threshold is well-defined: use it.
+    upscaleThreshold = rawThreshold;
+  }
+  // Guard against degenerate case where threshold exceeds technical max.
+  upscaleThreshold = MIN(upscaleThreshold, technicalMax);
+
+  // ── maxZoomFactor — RECOMMENDED quality-safe maximum ─────────────────────
+  //
+  // Policy:
+  //   Front camera: capped at 2.0× to preserve image fidelity (front sensors
+  //     have lower resolution and no telephoto option).
+  //   Back camera: up to 2.5× beyond the lossless sensor crop threshold,
+  //     capped at 10× (matches native iOS Camera back-camera experience),
+  //     but never exceeds the technical maximum.
+  //
+  // We allow a modest amount beyond the lossless threshold because modern iOS
+  // camera stacks apply spatial Quality/Noise Reduction algorithms that
+  // maintain acceptable quality for moderate digital zoom beyond the optical
+  // limit, similar to what iPhone Camera shows.
+  CGFloat recommendedMax;
+  if (isFront) {
+    recommendedMax = MIN(2.0, technicalMax);
+  } else {
+    // Back: upscaleThreshold * 2.5, capped at 10× product max.
+    recommendedMax = MIN(upscaleThreshold * 2.5, 10.0);
+    // Never exceed the technical ceiling.
+    recommendedMax = MIN(recommendedMax, technicalMax);
+  }
+  // Ensure recommendedMax is at least minZoom (degenerate device guard).
+  recommendedMax = MAX(recommendedMax, minZoom);
+
+  // ── defaultZoomFactor ─────────────────────────────────────────────────────
+  // Always 1.0 in the wide-angle-first phase. When virtual multi-camera
+  // discovery is implemented this may need to reflect the standard-lens
+  // factor on virtual devices.
+  CGFloat defaultZoom = 1.0;
+
+  // ── displayZoomFactorMultiplier ───────────────────────────────────────────
+  CGFloat displayMultiplier = 1.0;
+  if (@available(iOS 18.0, *)) {
+    displayMultiplier = dev.displayVideoZoomFactorMultiplier;
+  }
+
+  // ── virtualDeviceSwitchOverZoomFactors ────────────────────────────────────
+  NSArray<NSNumber *> *switchOvers = @[];
+  BOOL isVirtual = NO;
+  if (@available(iOS 13.0, *)) {
+    switchOvers = dev.virtualDeviceSwitchOverVideoZoomFactors ?: @[];
+    isVirtual = dev.isVirtualDevice;
+  }
+
+  return @{
+    @"minZoomFactor" : @(minZoom),
+    @"maxZoomFactor" : @(recommendedMax),      // recommended quality-safe max
+    @"technicalMaxZoomFactor" : @(technicalMax), // raw AVFoundation ceiling
+    @"upscaleThresholdZoomFactor" : @(upscaleThreshold), // lossless boundary
+    @"defaultZoomFactor" : @(defaultZoom),
+    @"displayZoomFactorMultiplier" : @(displayMultiplier),
+    @"virtualDeviceSwitchOverZoomFactors" : switchOvers,
+    @"isVirtualDevice" : @(isVirtual),
+    @"cameraPosition" : positionStr,
+  };
+}
+
+
 /// Sets tap-to-focus and tap-to-expose at a normalised point (0.0–1.0,
 /// 0.0–1.0). x = horizontal from left, y = vertical from top (AVFoundation
 /// coordinate space).

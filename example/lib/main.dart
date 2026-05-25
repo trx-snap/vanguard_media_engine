@@ -147,6 +147,10 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
   // Show zoom badge transiently after a pinch gesture.
   bool _zoomBadgeVisible = false;
   Timer? _zoomBadgeTimer;
+  // Device-native zoom capability bounds — loaded after session starts and
+  // reloaded after every camera switch. Falls back to 1.0–6.0 if the native
+  // query fails or the session is not yet ready.
+  VGCameraZoomCapabilities _zoomCapabilities = VGCameraZoomCapabilities.fallback;
 
   // ── Focus / expose overlay state ───────────────────────────────────────────
 
@@ -238,6 +242,20 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
         _session = session;
         _sessionStarting = false;
       });
+      // Load device-native zoom capabilities. Uses fallback (1.0–6.0) on
+      // any failure so pinch-zoom continues working regardless.
+      final caps = await session.getZoomCapabilities();
+      if (mounted) {
+        setState(() {
+          _zoomCapabilities = caps;
+          // Clamp current zoom factor into new capability range in case the
+          // capability max is tighter than the default 6.0 fallback.
+          _zoomFactor = _zoomFactor
+              .clamp(caps.minZoomFactor, caps.maxZoomFactor)
+              .toDouble();
+        });
+      }
+
     } on PlatformException catch (e) {
       if (!mounted) return;
       setState(() {
@@ -273,6 +291,21 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
         if (_position == VGCameraPosition.front && _torchOn) {
           _torchOn = false;
         }
+        // Reset zoom to 1× when switching cameras. The new camera may have a
+        // different range; we hold off clamping until capabilities are loaded.
+        _zoomFactor = 1.0;
+        _baseZoomFactor = 1.0;
+      });
+      // Reload zoom capabilities for the new camera. Front and back cameras
+      // have different recommended max zoom values — do not reuse stale caps.
+      final caps = await session.getZoomCapabilities();
+      if (!mounted) return;
+      setState(() {
+        _zoomCapabilities = caps;
+        // Clamp current zoom into the new range (1.0 is already safe, but
+        // guard in case future code changes _zoomFactor above).
+        _zoomFactor =
+            _zoomFactor.clamp(caps.minZoomFactor, caps.maxZoomFactor).toDouble();
       });
     } on PlatformException catch (e) {
       _showStatus('Flip failed: ${e.code}');
@@ -307,7 +340,10 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
     final session = _session;
     if (session == null) return;
 
-    final newZoom = (_baseZoomFactor * details.scale).clamp(1.0, 6.0);
+    final newZoom = (_baseZoomFactor * details.scale)
+        .clamp(_zoomCapabilities.minZoomFactor, _zoomCapabilities.maxZoomFactor)
+        .toDouble();
+
     if ((newZoom - _zoomFactor).abs() < 0.01) return; // dead-band
 
     // Throttle native calls to ~30 fps.
@@ -681,9 +717,8 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
   // ── Zoom badge ─────────────────────────────────────────────────────────────
 
   Widget _buildZoomBadge() {
-    final label = _zoomFactor >= 2.0
-        ? '${_zoomFactor.toStringAsFixed(1)}×'
-        : '${_zoomFactor.toStringAsFixed(2)}×';
+    final label = _zoomCapabilities.displayLabelFor(_zoomFactor);
+
     return Positioned(
       bottom: 200,
       left: 0,
