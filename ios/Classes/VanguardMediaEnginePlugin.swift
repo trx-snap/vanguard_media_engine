@@ -1653,6 +1653,75 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                                     details: nil))
                 return
             }
+            // ── Phase 6E.2D: Graph-backed photo capture ───────────────────────
+            // When VG_USE_CAMERA_GRAPH is active and a graph session is live,
+            // route through the graph photo sink so effects are baked into the
+            // captured JPEG.  Falls back to raw capture when:
+            //   • VG_USE_CAMERA_GRAPH is not compiled, or
+            //   • cameraGraphSession is nil (graph not started), or
+            //   • armPhotoCapture throws a structural error (session torn down,
+            //     sink missing — codes other than 3).
+            //
+            // Does NOT fall back for:
+            //   • Duplicate pending arm (code 3)  → ALREADY_PENDING returned.
+            //   • Async timeout/encode/write fail  → mapped FlutterError returned.
+            #if VG_USE_CAMERA_GRAPH
+            if let graphSession = cameraGraphSession {
+                // Completion dispatches the graph result back to the main thread
+                // so Flutter result is always called from the correct thread.
+                let graphCompletion: (String?, Error?) -> Void = { outputPath, error in
+                    DispatchQueue.main.async {
+                        if let error = error {
+                            let nsErr = error as NSError
+                            let code: String
+                            switch nsErr.code {
+                            case 4:  code = "NO_CAMERA"    // GRAPH_PHOTO_SESSION_INVALIDATED
+                            case 5:  code = "NO_FRAME"     // GRAPH_PHOTO_TIMEOUT
+                            case 6:  code = "ENCODE_FAIL"  // GRAPH_PHOTO_ENCODE_FAILED
+                            case 7:  code = "ENCODE_FAIL"  // GRAPH_PHOTO_WRITE_FAILED
+                            case 8:  code = "NO_FRAME"     // GRAPH_PHOTO_NULL_BUFFER
+                            default: code = "ENCODE_FAIL"
+                            }
+                            result(FlutterError(code: code,
+                                                message: error.localizedDescription,
+                                                details: nil))
+                        } else if let outputPath = outputPath {
+                            result(outputPath)
+                        } else {
+                            result(FlutterError(code: "ENCODE_FAIL",
+                                                message: "Capture completed without path or error",
+                                                details: nil))
+                        }
+                    }
+                }
+
+                do {
+                    // armPhotoCapture is synchronous for the arming step only.
+                    // The graphCompletion block is called asynchronously once
+                    // the frame is latched, encoded, and written.
+                    try graphSession.armPhotoCapture(path, completion: graphCompletion)
+                    // Arming succeeded — graph path owns this request.
+                    // Do NOT fall through to raw capture.
+                    return
+                } catch {
+                    let nsErr = error as NSError
+                    if nsErr.code == 3 {
+                        // GRAPH_PHOTO_ALREADY_PENDING: another request is in
+                        // flight. Return the error immediately; do not attempt
+                        // raw capture which would yield an unfiltered image.
+                        result(FlutterError(code: "ALREADY_PENDING",
+                                            message: "A photo capture request is already pending",
+                                            details: nil))
+                        return
+                    }
+                    // Structural arm failure (session invalidated, sink missing).
+                    // Fall through to raw capture below.
+                    NSLog("[VanguardPlugin] Graph photo arm failed (code: \(nsErr.code)); falling back to raw capture.")
+                }
+            }
+            #endif
+
+            // ── Raw fallback (Phase 4 / pre-graph path) ───────────────────────
             // Swift ObjC bridge: takePhotoToURL:completion: → takePhoto(to:completion:)
             // completion: is guaranteed on the main thread by takePhotoToURL:
             src.takePhoto(to: URL(fileURLWithPath: path)) { url, error in
