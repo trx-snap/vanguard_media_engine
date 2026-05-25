@@ -38,6 +38,7 @@
 #import "VGFanOutSink.h"
 #import "VGPlatformViewSinkAdapter.h"
 #import "VGRecordingSinkNode.h"
+#import "VGPhotoSinkNode.h"
 #import "VanguardCameraMediaSource.h"
 #import "VanguardMetalRenderer.h"
 #import "VanguardBeautyFilterNode.h"
@@ -624,6 +625,95 @@
             }
         }
     });
+}
+
+// ─── Phase 6E.2B: Graph-backed photo capture ─────────────────────────────────
+//
+// Arming protocol:
+//   1. Resolve "camera_photo_sink" from the current node map.
+//   2. Call armWithURL:completion:error: on the photo sink.
+//   3. Schedule a 3-second timeout via dispatch_after on _sessionQueue.
+//      If the timeout fires and the request is still pending, cancel it
+//      with GRAPH_PHOTO_TIMEOUT.
+//
+// Thread-safety:
+//   Serialized via dispatch_sync on _sessionQueue.
+//   MUST NOT be called from _sessionQueue (deadlock).
+//   The timeout block runs on _sessionQueue; it checks _invalidated before
+//   calling cancelPendingRequestWithError:.
+//
+// Graph-rebuild safety:
+//   After a rebuild, _nodes points to a fresh node map with a new
+//   VGPhotoSinkNode that has no pending request. The old node's pending
+//   request is cancelled by invalidate propagation through the old scheduler.
+
+- (BOOL)armPhotoCapture:(NSString *)path
+             completion:(void (^)(NSString *_Nullable, NSError *_Nullable))completion
+                  error:(NSError *_Nullable *_Nullable)outError {
+    __block BOOL success = NO;
+    __block NSError *innerError = nil;
+
+    dispatch_sync(_sessionQueue, ^{
+        if (atomic_load(&self->_invalidated)) {
+            innerError = [NSError errorWithDomain:@"VGCameraGraphSession"
+                                             code:200
+                                         userInfo:@{
+                NSLocalizedDescriptionKey: @"armPhotoCapture: session is invalidated."
+            }];
+            return;
+        }
+
+        VGPhotoSinkNode *photoSink =
+            (VGPhotoSinkNode *)self->_nodes[@"camera_photo_sink"];
+        if (!photoSink) {
+            innerError = [NSError errorWithDomain:@"VGCameraGraphSession"
+                                             code:201
+                                         userInfo:@{
+                NSLocalizedDescriptionKey: @"armPhotoCapture: camera_photo_sink "
+                                           "not found in node map."
+            }];
+            return;
+        }
+
+        NSError *armError = nil;
+        BOOL armed = [photoSink armWithURL:path
+                               completion:completion
+                                    error:&armError];
+        if (!armed) {
+            innerError = armError;
+            return;
+        }
+
+        // Schedule a 3-second timeout. If the latch has not fired by then,
+        // cancel the pending request with GRAPH_PHOTO_TIMEOUT.
+        // The timeout block captures photoSink strongly — even if a graph
+        // rebuild replaces _nodes, the timeout acts on the correct instance.
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+            self->_sessionQueue,
+            ^{
+                if (atomic_load(&self->_invalidated)) {
+                    return;
+                }
+                if (![photoSink hasPendingRequest]) {
+                    return;
+                }
+                NSError *timeoutError = [NSError errorWithDomain:@"VGPhotoSinkNode"
+                                                           code:5
+                                                       userInfo:@{
+                    NSLocalizedDescriptionKey: @"GRAPH_PHOTO_TIMEOUT: "
+                                               "No processed frame arrived within 3 seconds."
+                }];
+                [photoSink cancelPendingRequestWithError:timeoutError];
+            });
+
+        success = YES;
+    });
+
+    if (!success && outError && innerError) {
+        *outError = innerError;
+    }
+    return success;
 }
 
 - (void)invalidate {

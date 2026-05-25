@@ -125,6 +125,34 @@ NS_ASSUME_NONNULL_BEGIN
 /// No-op after invalidate has been called.
 - (void)setRecordingEnabled:(BOOL)enabled;
 
+// ─── Phase 6E.2B: Graph-backed photo capture ─────────────────────────────────
+
+/// Arms the graph photo sink to capture the next processed frame.
+///
+/// Resolves "camera_photo_sink" from the current node map and calls
+/// armWithURL:completion:error: on it. If the session is invalidated,
+/// the sink is missing, or a request is already pending, returns NO
+/// and populates outError.
+///
+/// A 3-second timeout is scheduled via dispatch_after on the internal
+/// session queue. If no frame is latched within 3s, the pending request
+/// is cancelled with GRAPH_PHOTO_TIMEOUT.
+///
+/// Thread-safe: serialized via dispatch_sync on _sessionQueue.
+/// MUST NOT be called from _sessionQueue — doing so will deadlock.
+///
+/// Phase 6E.2B only: the completion fires with a placeholder error
+/// (GRAPH_PHOTO_NOT_YET_ENCODED). Not yet routed from Swift.
+///
+/// @param path       Destination file path for the photo.
+/// @param completion Called with (outputPath, nil) on success or (nil, error).
+///                   Dispatched on VGPhotoSinkNode's internal serial queue.
+/// @param outError   On failure, set to a descriptive NSError.
+/// @return YES if the photo capture request was armed successfully.
+- (BOOL)armPhotoCapture:(NSString *)path
+             completion:(void (^)(NSString *_Nullable outputPath, NSError *_Nullable error))completion
+                  error:(NSError *_Nullable *_Nullable)outError;
+
 // ─── POC2: Platform View graph delivery ──────────────────────────────────────
 
 /// Wires a VanguardCameraFrameReceiver (typically VanguardCameraPlatformView) as

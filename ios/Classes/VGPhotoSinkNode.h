@@ -1,29 +1,35 @@
 // VGPhotoSinkNode.h
-// vanguard_media_engine — Phase 6E.2A
+// vanguard_media_engine — Phase 6E.2A / Phase 6E.2B
 //
 // VGPhotoSinkNode is the graph-aware photo capture terminal sink.
-// When wired as a child of VGFanOutSink, it will receive processed
-// (effects-applied) graph output frames. In Phase 6E.2A this node is
-// an idle skeleton — presentEnvelope: is an unconditional no-op.
+// When wired as a child of VGFanOutSink, it receives processed
+// (effects-applied) graph output frames.
 //
 // Architecture (Graph-Backed Photo Capture):
 //   - Conforms to VGFrameSink (extends VGNode). Role: VGNodeRoleSink.
 //   - Input port: "video_in" / VGMediaTypeVideo / required.
-//   - Does NOT arm, latch, encode, retain buffers, or write files in this phase.
-//   - Future Phase 6E.2B steps will add one-shot arming/latching and JPEG encoding.
+//   - One-shot arming: armWithURL:completion:error: arms the sink to latch
+//     the next processed frame. Only one request may be pending at a time.
+//   - Latch: presentEnvelope: checks for a pending request under os_unfair_lock.
+//     If armed, it retains the buffer, nils the pending state, and dispatches
+//     the completion asynchronously on an internal serial queue.
+//   - Cancel: cancelPendingRequestWithError: cancels any pending request and
+//     fires the completion with the supplied error.
+//   - Invalidation: invalidate cancels any pending request with a session-
+//     invalidated error.
 //
-// Current status — Phase 6E.2A (SKELETON / NO-OP):
+// Current status — Phase 6E.2B (ARMING / LATCHING):
 //   - Included as last child of VGFanOutSink via VGCameraGraphFactory.
-//   - presentEnvelope: is an unconditional no-op.
-//   - No runtime photo behavior is added in this phase.
+//   - presentEnvelope: latches one frame when armed; no-op otherwise.
+//   - 6E.2B: completion fires with GRAPH_PHOTO_NOT_YET_ENCODED placeholder.
 //   - takePhoto routing is unchanged (still uses raw _latestBuffer path).
 //
 // Future steps will:
-//   6E.2B — Add arming/latching and one-shot JPEG capture.
-//   6E.2C — Route takePhotoToURL through the graph path.
+//   6E.2C — Add async JPEG encode/write in the latch completion path.
+//   6E.2D — Route takePhotoToURL through the graph path.
 //
 // PORTABLE: VGFrameSink contract is platform-agnostic.
-// PLATFORM: iOS — no platform frameworks imported in this header.
+// PLATFORM: iOS — CoreVideo buffer ownership, os_unfair_lock.
 
 #pragma once
 
@@ -35,10 +41,12 @@ NS_ASSUME_NONNULL_BEGIN
 
 // ─── VGPhotoSinkNode ──────────────────────────────────────────────────────────
 
-/// Graph terminal sink that will receive processed camera frames for photo capture.
+/// Graph terminal sink that receives processed camera frames for photo capture.
 ///
-/// Phase 6E.2A: Skeleton only. presentEnvelope: is an unconditional no-op.
-/// No arming, buffer retention, encoding, or file I/O is present in this phase.
+/// Phase 6E.2B: One-shot arming/latching. presentEnvelope: latches a single
+/// frame when armed and dispatches the completion on an internal serial queue.
+/// No JPEG encoding or file I/O in this phase — completion fires with a
+/// placeholder error (GRAPH_PHOTO_NOT_YET_ENCODED).
 @interface VGPhotoSinkNode : NSObject <VGFrameSink>
 
 // ─── Properties ───────────────────────────────────────────────────────────────
@@ -52,6 +60,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// prepared by the scheduler; readiness is established at init time.
 @property (atomic, readonly, getter=isReady) BOOL ready;
 
+/// YES if a photo capture request has been armed and not yet completed or cancelled.
+@property (atomic, readonly, getter=hasPendingRequest) BOOL pendingRequest;
+
 // ─── Designated initializer ───────────────────────────────────────────────────
 
 /// Designated initializer.
@@ -62,6 +73,40 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Unavailable. Use initWithNodeId:.
 - (instancetype)init NS_UNAVAILABLE;
+
+// ─── Phase 6E.2B: One-shot arming API ─────────────────────────────────────────
+
+/// Arms the sink to latch the next processed frame.
+///
+/// On the next call to presentEnvelope:, the sink will:
+///   1. Retain the buffer (CVPixelBufferRetain).
+///   2. Clear the pending state (prevents double-completion).
+///   3. Dispatch the completion asynchronously on an internal serial queue.
+///
+/// Returns NO and populates outError if a request is already pending
+/// (GRAPH_PHOTO_ALREADY_PENDING).
+///
+/// Thread-safe: uses os_unfair_lock. May be called from any queue.
+///
+/// @param path       Destination file path for the photo. Stored for 6E.2C use.
+/// @param completion Called with (outputPath, nil) on success or (nil, error) on
+///                   failure. Dispatched on an internal serial queue, never on the
+///                   graph execution queue.
+/// @param outError   On failure, set to a descriptive NSError.
+/// @return YES if the request was armed successfully.
+- (BOOL)armWithURL:(NSString *)path
+        completion:(void (^)(NSString *_Nullable outputPath, NSError *_Nullable error))completion
+             error:(NSError *_Nullable *_Nullable)outError;
+
+/// Cancels any pending request with the supplied error.
+///
+/// Fires the pending completion on the internal serial queue with (nil, error).
+/// No-op if no request is pending.
+///
+/// Thread-safe: uses os_unfair_lock. May be called from any queue.
+///
+/// @param error The error to deliver to the pending completion.
+- (void)cancelPendingRequestWithError:(NSError *)error;
 
 @end
 
