@@ -1244,6 +1244,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     self.currentMode = .camera
                     let position: AVCaptureDevice.Position = positionInt == 2 ? .front : .back
                     let src = VanguardCameraMediaSource(position: position, frameRate: Int32(fps))
+                    // Flutter Texture portrait lock: prevents UIDeviceOrientationDidChangeNotification
+                    // from switching AVCaptureConnection.videoOrientation to landscape and delivering
+                    // 1920x1080 buffers to the graph. Beauty V1 lacks a stride guard so any dimension
+                    // change triggers a Metal abort. Lock here, before any frames arrive.
+                    src.lockPreviewOrientationToPortrait()
                     self.cameraSource = src
                     let enc = VanguardVideoToolboxEncoder(
                         width: 1080, height: 1920,
@@ -1300,6 +1305,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
             let position: AVCaptureDevice.Position = positionInt == 2 ? .front : .back
             let src = VanguardCameraMediaSource(position: position, frameRate: Int32(fps))
+            // Flutter Texture portrait lock: prevents UIDeviceOrientationDidChangeNotification
+            // from switching AVCaptureConnection.videoOrientation to landscape and delivering
+            // 1920x1080 buffers to the graph. Beauty V1 lacks a stride guard so any dimension
+            // change triggers a Metal abort. Lock here, before any frames arrive.
+            src.lockPreviewOrientationToPortrait()
             cameraSource = src
 
             // Prewarm streaming encoder (Phase 5+ streaming path, not AVAssetWriter)

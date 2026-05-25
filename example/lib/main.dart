@@ -20,6 +20,7 @@
 
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -63,8 +64,10 @@ class VanguardExampleApp extends StatelessWidget {
 
 /// Preset catalogue used by the preset selector strip.
 ///
-/// Each preset is a [VGPresetDescriptor] built from [VGFilterSpecs] helpers.
-/// The "None" preset carries an empty filterStack (clears filters on native).
+/// Only presets whose filter types are currently supported by the native
+/// camera graph path are included here. LUT and LUT-composite presets
+/// (Glow, LUT) are omitted: VGCameraGraphSession rejects \"lut\" specs with
+/// UNSUPPORTED_FILTER_TYPE. They will be restored once LUT is constructable.
 final List<_PresetEntry> _kPresets = [
   _PresetEntry(
     label: 'None',
@@ -82,27 +85,6 @@ final List<_PresetEntry> _kPresets = [
       id: 'soft',
       name: 'Soft',
       filterStack: [VGFilterSpecs.beauty(intensity: 0.5)],
-    ),
-  ),
-  _PresetEntry(
-    label: 'Glow',
-    emoji: '✧',
-    descriptor: VGPresetDescriptor(
-      id: 'glow',
-      name: 'Glow',
-      filterStack: [
-        VGFilterSpecs.beauty(intensity: 0.7),
-        VGFilterSpecs.lut(intensity: 0.4),
-      ],
-    ),
-  ),
-  _PresetEntry(
-    label: 'LUT',
-    emoji: '◈',
-    descriptor: VGPresetDescriptor(
-      id: 'lut-only',
-      name: 'LUT',
-      filterStack: [VGFilterSpecs.lut(intensity: 1.0)],
     ),
   ),
 ];
@@ -157,6 +139,21 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
       .filterStack
       .any((f) => f.type == 'beauty');
 
+  // ── Zoom state ─────────────────────────────────────────────────────────────
+
+  double _zoomFactor = 1.0;
+  double _baseZoomFactor = 1.0;
+  DateTime _lastZoomTime = DateTime.fromMillisecondsSinceEpoch(0);
+  // Show zoom badge transiently after a pinch gesture.
+  bool _zoomBadgeVisible = false;
+  Timer? _zoomBadgeTimer;
+
+  // ── Focus / expose overlay state ───────────────────────────────────────────
+
+  Offset? _focusTapPosition; // screen coords for indicator placement
+  bool _focusRingVisible = false;
+  Timer? _focusTimer;
+
   // ── Recording state ────────────────────────────────────────────────────────
 
   bool _recording = false;
@@ -179,14 +176,25 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
   @override
   void initState() {
     super.initState();
+    // ── Portrait orientation lock ──────────────────────────────────────────────
+    // This package reference screen is portrait-canonical. The 9:16 FittedBox
+    // preview layout and _mapPreviewTapToCameraPoint both assume portrait
+    // 1080×1920 capture buffers. Full landscape camera support (dynamic buffer
+    // dimensions, orientation-aware coordinate mapping) is explicitly deferred
+    // and is not part of this Phase 6 reference path.
+    SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     WidgetsBinding.instance.addObserver(this);
     _startSession();
   }
 
   @override
   void dispose() {
+    // Restore system default so other screens are not portrait-locked.
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     WidgetsBinding.instance.removeObserver(this);
     _statusTimer?.cancel();
+    _zoomBadgeTimer?.cancel();
+    _focusTimer?.cancel();
     _session?.dispose();
     super.dispose();
   }
@@ -287,12 +295,147 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
   }
 
   // ──────────────────────────────────────────────────────────────────────────
+  // Zoom gesture handlers
+  // ──────────────────────────────────────────────────────────────────────────
+
+  void _handleScaleStart(ScaleStartDetails details) {
+    _baseZoomFactor = _zoomFactor;
+  }
+
+  Future<void> _handleScaleUpdate(ScaleUpdateDetails details) async {
+    if (details.pointerCount < 2) return; // single-finger drag — ignore
+    final session = _session;
+    if (session == null) return;
+
+    final newZoom = (_baseZoomFactor * details.scale).clamp(1.0, 6.0);
+    if ((newZoom - _zoomFactor).abs() < 0.01) return; // dead-band
+
+    // Throttle native calls to ~30 fps.
+    final now = DateTime.now();
+    if (now.difference(_lastZoomTime).inMilliseconds < 33) return;
+    _lastZoomTime = now;
+
+    setState(() {
+      _zoomFactor = newZoom;
+      _zoomBadgeVisible = true;
+    });
+
+    // Show badge for 1.5 s after the last pinch movement.
+    _zoomBadgeTimer?.cancel();
+    _zoomBadgeTimer = Timer(const Duration(milliseconds: 1500), () {
+      if (mounted) setState(() => _zoomBadgeVisible = false);
+    });
+
+    try {
+      await session.setZoom(newZoom);
+    } catch (_) {
+      // Silently absorb — zoom badge already updated; don't break preview.
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Preview → camera coordinate mapping
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /// Maps a tap position in widget-local screen coordinates to a normalised
+  /// camera point in the range [0, 1] × [0, 1].
+  ///
+  /// [VGCameraPreview] renders the 9:16 (portrait) sensor feed with
+  /// aspect-fill (cover) semantics — whichever axis overflows the widget is
+  /// centre-cropped.  This helper recovers the correct sensor fraction by
+  /// computing the rendered dimensions, then shifts the tap into that space
+  /// before normalising and clamping.
+  ///
+  /// Front-camera output is mirrored horizontally on the preview so the
+  /// displayed image is a "mirror"; the sensor point is un-mirrored by
+  /// flipping `mappedX` before passing it to AVFoundation.
+  Offset _mapPreviewTapToCameraPoint({
+    required Offset localTap,
+    required Size widgetSize,
+    required bool isFrontCamera,
+  }) {
+    // The camera preview is always a 9:16 portrait feed.
+    const double previewAspectRatio = 9.0 / 16.0;
+
+    final double widgetAspectRatio = widgetSize.width / widgetSize.height;
+
+    double renderedWidth = widgetSize.width;
+    double renderedHeight = widgetSize.height;
+    double offsetX = 0.0;
+    double offsetY = 0.0;
+
+    if (widgetAspectRatio > previewAspectRatio) {
+      // Widget is wider than the preview — top/bottom are cropped.
+      renderedHeight = widgetSize.width / previewAspectRatio;
+      offsetY = (renderedHeight - widgetSize.height) / 2.0;
+    } else {
+      // Widget is taller than (or equal to) the preview — sides are cropped.
+      renderedWidth = widgetSize.height * previewAspectRatio;
+      offsetX = (renderedWidth - widgetSize.width) / 2.0;
+    }
+
+    final double mappedX =
+        ((localTap.dx + offsetX) / renderedWidth).clamp(0.0, 1.0);
+    final double mappedY =
+        ((localTap.dy + offsetY) / renderedHeight).clamp(0.0, 1.0);
+
+    // Mirror X for the front camera so the sensor point matches the
+    // un-mirrored sensor frame that AVFoundation expects.
+    final double cameraX = isFrontCamera ? 1.0 - mappedX : mappedX;
+    final double cameraY = mappedY;
+
+    return Offset(cameraX, cameraY);
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Tap-to-focus / tap-to-expose
+  // ──────────────────────────────────────────────────────────────────────────
+
+  Future<void> _handleTapDown(TapDownDetails details, BoxConstraints constraints) async {
+    final session = _session;
+    if (session == null) return;
+
+    final tapPos = details.localPosition;
+    final widgetSize = Size(constraints.maxWidth, constraints.maxHeight);
+
+    // Map the screen tap to normalised camera sensor coordinates using the
+    // cover-crop-aware helper.  The focus ring is kept at the original screen
+    // tap position so the visual feedback reflects where the user tapped.
+    final mapped = _mapPreviewTapToCameraPoint(
+      localTap: tapPos,
+      widgetSize: widgetSize,
+      isFrontCamera: _position == VGCameraPosition.front,
+    );
+
+    setState(() {
+      // Focus ring stays at screen-space tap position, not the mapped point.
+      _focusTapPosition = tapPos;
+      _focusRingVisible = true;
+    });
+
+    // Auto-hide the ring after 2 s.
+    _focusTimer?.cancel();
+    _focusTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _focusRingVisible = false);
+    });
+
+    try {
+      await session.setFocusPoint(mapped.dx, mapped.dy);
+    } catch (_) {
+      // Silently absorb — focus indicator is already shown.
+    }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
   // Preset application (Phase 6C.2A — rebuild transaction)
   // ──────────────────────────────────────────────────────────────────────────
 
   Future<void> _applyPreset(int index) async {
     final session = _session;
     if (session == null || _applyingPreset) return;
+    // Capture prior index so we can revert on failure — prevents the beauty
+    // slider from becoming sticky on an unapplied preset.
+    final previousIndex = _selectedPresetIndex;
     setState(() {
       _applyingPreset = true;
       _selectedPresetIndex = index;
@@ -304,12 +447,15 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
       });
       await session.applyTransaction(payload);
       if (!mounted) return;
-      // After preset change, clamp beauty slider if not supported.
       setState(() => _applyingPreset = false);
       _showStatus('Preset applied: ${preset.name}');
     } on PlatformException catch (e) {
       if (!mounted) return;
-      setState(() => _applyingPreset = false);
+      // Revert selection so slider visibility reflects the actual active preset.
+      setState(() {
+        _applyingPreset = false;
+        _selectedPresetIndex = previousIndex;
+      });
       _showStatus('Preset error: ${e.code}');
     }
   }
@@ -449,7 +595,40 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
   Widget _buildPreview() {
     final session = _session;
     if (session != null) {
-      return VGCameraPreview(session: session);
+      // Wrap the live preview in a LayoutBuilder so tap-to-focus can access
+      // the real widget dimensions for coordinate mapping.
+      return LayoutBuilder(
+        builder: (context, constraints) {
+          return GestureDetector(
+            onScaleStart: _handleScaleStart,
+            onScaleUpdate: (details) => _handleScaleUpdate(details),
+            onTapDown: (details) => _handleTapDown(details, constraints),
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                // 9:16 cover/crop layout — matches _mapPreviewTapToCameraPoint math.
+                // ClipRect clips overflow; FittedBox scales to fill the full-screen
+                // stack; SizedBox constrains the texture to 9:16 before scaling.
+                ClipRect(
+                  child: FittedBox(
+                    fit: BoxFit.cover,
+                    child: SizedBox(
+                      width: 9,
+                      height: 16,
+                      child: VGCameraPreview(session: session),
+                    ),
+                  ),
+                ),
+                // Zoom badge.
+                if (_zoomBadgeVisible) _buildZoomBadge(),
+                // Focus / expose ring.
+                if (_focusRingVisible && _focusTapPosition != null)
+                  _buildFocusRing(_focusTapPosition!),
+              ],
+            ),
+          );
+        },
+      );
     }
     if (_sessionStarting) {
       return const Center(
@@ -496,6 +675,53 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
           ],
         ),
       ),
+    );
+  }
+
+  // ── Zoom badge ─────────────────────────────────────────────────────────────
+
+  Widget _buildZoomBadge() {
+    final label = _zoomFactor >= 2.0
+        ? '${_zoomFactor.toStringAsFixed(1)}×'
+        : '${_zoomFactor.toStringAsFixed(2)}×';
+    return Positioned(
+      bottom: 200,
+      left: 0,
+      right: 0,
+      child: Center(
+        child: AnimatedOpacity(
+          opacity: _zoomBadgeVisible ? 1.0 : 0.0,
+          duration: const Duration(milliseconds: 180),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+            decoration: BoxDecoration(
+              color: Colors.black.withValues(alpha: 0.62),
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: Colors.white24, width: 1),
+            ),
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.5,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ── Focus ring ─────────────────────────────────────────────────────────────
+
+  Widget _buildFocusRing(Offset tapPos) {
+    const ringSize = 72.0;
+    return Positioned(
+      left: tapPos.dx - ringSize / 2,
+      top: tapPos.dy - ringSize / 2,
+      child: _FocusRingWidget(size: ringSize),
     );
   }
 
@@ -788,6 +1014,141 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
 // ──────────────────────────────────────────────────────────────────────────────
 // Composable sub-widgets
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// Animated focus / exposure ring.
+///
+/// Draws a yellow square ring that scales in, holds, then fades out.
+class _FocusRingWidget extends StatefulWidget {
+  const _FocusRingWidget({required this.size});
+  final double size;
+
+  @override
+  State<_FocusRingWidget> createState() => _FocusRingWidgetState();
+}
+
+class _FocusRingWidgetState extends State<_FocusRingWidget>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+  late final Animation<double> _scale;
+  late final Animation<double> _opacity;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 400),
+    );
+    // Scale from 1.4 → 1.0 (snap-in feel).
+    _scale = Tween<double>(begin: 1.4, end: 1.0).animate(
+      CurvedAnimation(parent: _ctrl, curve: Curves.easeOutCubic),
+    );
+    // Fade from 0 → 1 for the first 30% then hold.
+    _opacity = TweenSequence<double>([
+      TweenSequenceItem(
+        tween: Tween<double>(begin: 0.0, end: 1.0),
+        weight: 30,
+      ),
+      TweenSequenceItem(
+        tween: ConstantTween<double>(1.0),
+        weight: 70,
+      ),
+    ]).animate(_ctrl);
+    _ctrl.forward();
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _ctrl,
+      builder: (context, _) {
+        return Opacity(
+          opacity: _opacity.value,
+          child: Transform.scale(
+            scale: _scale.value,
+            child: SizedBox(
+              width: widget.size,
+              height: widget.size,
+              child: CustomPaint(
+                painter: _FocusRingPainter(),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+/// Draws a square focus-ring (four corner brackets) in yellow.
+class _FocusRingPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = const Color(0xFFFFD600) // vivid yellow
+      ..strokeWidth = 2.0
+      ..style = PaintingStyle.stroke;
+
+    final cornerLen = size.width * 0.28;
+    final r = 4.0; // corner radius
+    final l = 0.0;
+    final w = size.width;
+    final h = size.height;
+
+    // Top-left corner.
+    canvas.drawPath(
+      Path()
+        ..moveTo(l, l + cornerLen)
+        ..lineTo(l, l + r)
+        ..arcToPoint(Offset(l + r, l), radius: Radius.circular(r))
+        ..lineTo(l + cornerLen, l),
+      paint,
+    );
+    // Top-right corner.
+    canvas.drawPath(
+      Path()
+        ..moveTo(w - cornerLen, l)
+        ..lineTo(w - r, l)
+        ..arcToPoint(Offset(w, l + r), radius: Radius.circular(r))
+        ..lineTo(w, l + cornerLen),
+      paint,
+    );
+    // Bottom-right corner.
+    canvas.drawPath(
+      Path()
+        ..moveTo(w, h - cornerLen)
+        ..lineTo(w, h - r)
+        ..arcToPoint(Offset(w - r, h), radius: Radius.circular(r))
+        ..lineTo(w - cornerLen, h),
+      paint,
+    );
+    // Bottom-left corner.
+    canvas.drawPath(
+      Path()
+        ..moveTo(l + cornerLen, h)
+        ..lineTo(l + r, h)
+        ..arcToPoint(Offset(l, h - r), radius: Radius.circular(r))
+        ..lineTo(l, h - cornerLen),
+      paint,
+    );
+
+    // Centre cross-hair dot.
+    canvas.drawCircle(
+      Offset(w / 2, h / 2),
+      math.min(2.5, size.width * 0.04),
+      paint..style = PaintingStyle.fill,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
 
 /// Pulsing red "REC" pill shown while recording is active.
 class _RecordingPill extends StatefulWidget {
