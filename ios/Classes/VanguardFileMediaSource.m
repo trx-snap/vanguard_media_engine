@@ -596,17 +596,68 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
 - (void)play {
   _isPlaying = YES;
   if (_audioEngineReady && !_audioReaderRebuildInFlight) {
-    // Re-prime the chunk queue if it drained during the startup window
-    // (both pre-scheduled chunks may have been consumed before play: fires on
-    // slow devices)
-    if (!atomic_load_explicit(&_schedulingChunks, memory_order_relaxed)) {
+    BOOL schedulingWasOff =
+        !atomic_load_explicit(&_schedulingChunks, memory_order_relaxed);
+    BOOL nodeNeedsStart = !_playerNode.isPlaying;
+
+    if (schedulingWasOff && !nodeNeedsStart) {
+      // Chunks drained while the node was already playing (e.g. slow device
+      // startup window). Re-prime the scheduler — the player node is already
+      // running so no play() call needed.
       atomic_store_explicit(&_schedulingChunks, YES, memory_order_relaxed);
-      // Let the chunk scheduler start the player automatically once the first
-      // buffer safely lands on the queue. Calling play() on an empty node is
-      // fatal.
       [self _scheduleNextAudioChunk];
       [self _scheduleNextAudioChunk];
-    } else if (!_playerNode.isPlaying) {
+
+    } else if (schedulingWasOff && nodeNeedsStart) {
+      // FIX: paused-seek resume path.
+      //
+      // _rebuildAudioReaderForSecs: set _schedulingChunks=NO and did NOT
+      // call [_playerNode play] (because _isPlaying was NO at seek time).
+      // A new AVAssetReader is already installed at the seek position.
+      //
+      // We must restart the player node AND prime the chunk queue, following
+      // the same warm-up ordering used by _rebuildAudioReaderForSecs:step-4:
+      //   1. prepareWithFrameCount: warms the resampler graph off-main.
+      //   2. [node play] starts the render engine off-main (safe to block).
+      //   3. Only after play() returns, enable scheduling and fill two chunks.
+      //      This prevents the resampler click caused by scheduling into a
+      //      stopped node.
+      AVAudioPlayerNode *node = _playerNode;
+      __weak __typeof(self) ws = self;
+      dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0),
+                     ^{
+                       // Warm the resampler/timePitch graph before scheduling
+                       // any PCM data (mirrors _rebuildAudioReaderForSecs step 4).
+                       [node prepareWithFrameCount:(AVAudioFrameCount)kAudioChunkFrames];
+                       @try {
+                         if (!node.isPlaying)
+                           [node play];
+                       } @catch (NSException *e) {
+                         NSLog(@"[VanguardAudio] paused-seek bg play threw: %@", e);
+                       }
+                       // play() returned — resampler live, render graph running.
+                       // NOW enable scheduling and fill two chunks (crackle-free).
+                       dispatch_async(dispatch_get_main_queue(), ^{
+                         __strong __typeof(ws) f = ws;
+                         if (!f) return;
+                         if (node.isPlaying) {
+                           atomic_store_explicit(&f->_schedulingChunks, YES,
+                                                 memory_order_relaxed);
+                           [f _scheduleNextAudioChunk];
+                           [f _scheduleNextAudioChunk];
+                           // Reset calibration: the node was just stopped and
+                           // restarted (sample clock = 0). Stale calibration
+                           // from the previous play session would cause the
+                           // master clock to jump to the old paused time T.
+                           // Clearing here forces the first masterClock query
+                           // to re-anchor the offset from the seek target.
+                           f->_masterClockImpl.audioBaseTimeCalibrated = NO;
+                           f->_masterClockImpl.audioClockReady = YES;
+                         }
+                       });
+                     });
+
+    } else if (!schedulingWasOff && nodeNeedsStart) {
       // Node is pre-warmed and has buffers but play() was never called.
       // MUST be off the main thread — [_playerNode play] IPCs with coreaudiod
       // for 50–300ms; calling it on main blocks CADisplayLink and stalls
@@ -630,6 +681,8 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
                        });
                      });
     }
+    // Fourth quadrant (schedulingWasOff=NO, nodeNeedsStart=NO): both scheduler
+    // and player are already running — nothing to do.
   }
   // Reset wall-clock start and monotonic floor for fallback (P1A-04: via clock)
   _masterClockImpl.lastMasterClockSecs = 0.0;
@@ -942,6 +995,12 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
   // Reset clock-ready flag: the audio clock is not safe to query until
   // the new [_playerNode play] call (step 4) has fully returned.
   _masterClockImpl.audioClockReady = NO;
+  // Reset calibration: [_playerNode stop] (step 2) resets the node's sample
+  // clock to zero.  The offset computed at the previous play() is therefore
+  // stale and will cause a timeline jump if reused.  Clear the flag so the
+  // first masterClock query after the next play() re-derives the offset from
+  // the new seek position.  (Applies to both playing-seek and paused-seek.)
+  _masterClockImpl.audioBaseTimeCalibrated = NO;
 
   // Step 1b: Snapshot isPlaying and swap the reader on the main thread.
   BOOL wasPlaying = _playerNode.isPlaying;
@@ -964,7 +1023,15 @@ static const AVAudioFrameCount kMLFrameCount = 1024;
       return;
     }
 
-    if (wasPlaying) {
+    // Always stop the player node — not just when wasPlaying.
+    //
+    // [AVAudioPlayerNode pause] keeps the node's internal sample-clock and all
+    // scheduled buffers intact.  [AVAudioPlayerNode stop] resets the sample-
+    // clock to zero and discards queued buffers.  Without stop, a paused-seek
+    // leaves the node holding stale sample-time T; on the next [node play] the
+    // master clock reads that stale T instead of the seek target (0), producing
+    // the observed fast-forward / A-V desync.
+    if (s->_playerNode) {
       NSLog(@"[VanguardRebuild] decodeQueue: [_playerNode stop] BEGIN");
       @try {
         [s->_playerNode stop];
