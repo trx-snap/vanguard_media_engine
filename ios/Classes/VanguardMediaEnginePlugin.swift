@@ -996,6 +996,25 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 DispatchQueue.main.async { result(testResult) }
             }
 
+        // ── Phase 7 Stage 7.5B: Timeline execution proof ─────────────────────
+        // Triggers the native headless smoke test for VGTimelineCompositorNode.
+        // Runs on background queue; result delivered on main.
+        // In release builds the native stub returns a static error.
+        //
+        // Args (all optional):
+        //   clipAPath: String — absolute path to first clip (nil → synthetic)
+        //   clipBPath: String — absolute path to second clip (nil → synthetic)
+        //
+        // Returns: Dictionary with success, steps, logs, error.
+        case "dev_proveTimelineExecution":
+            let clipA = args?["clipAPath"] as? String
+            let clipB = args?["clipBPath"] as? String
+            DispatchQueue.global(qos: .userInitiated).async {
+                let testResults = VGTimelineCompositorSmokeTest.run(
+                    withClipAPath: clipA, clipBPath: clipB)
+                DispatchQueue.main.async { result(testResults) }
+            }
+
         case "setPlaybackRate":
             guard let textureId = (args?["textureId"] as? NSNumber)?.int64Value,
                   let rate      = (args?["rate"] as? NSNumber)?.doubleValue else {

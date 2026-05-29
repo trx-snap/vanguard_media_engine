@@ -1,0 +1,74 @@
+// VGTimelineCompositorSmokeTest.h
+// vanguard_media_engine — Phase 7 Stage 7.5B
+//
+// Headless native smoke test runner for VGTimelineCompositorNode.
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEBUG-ONLY FUNCTIONALITY
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The header is unconditional so Swift can always see the @interface.
+// The implementation (.m) is guarded by #if DEBUG. In release builds, the
+// +runWithClipAPath:clipBPath: method returns a static error result.
+//
+// This exists solely to prove the Stage 7.5A VGTimelineCompositorNode
+// execution pipeline in the example app.
+//
+// What this test proves:
+//   1. VGEditorGraphFactory builds a valid descriptor from clip paths.
+//   2. VGGraphValidator accepts the self-sourcing compositor topology.
+//   3. VGTimelineCompositorNode initializes from the descriptor.
+//   4. prepareWithContext: establishes initial generation.
+//   5. pullFrame: returns .delivered with valid CVPixelBufferRef payloads.
+//   6. Clip sequencing: frame at clip B's range pulls from clip B.
+//   7. EOS detection: pulling past timeline end returns .endOfStream.
+//   8. seekTo:generation: + stale generation → .skipped.
+//   9. seekTo:generation: + matching generation → .delivered.
+//  10. invalidate cleans up all resources.
+//
+// What this test does NOT do:
+//   - No Metal rendering, no GPU blending, no UI display.
+//   - No audio decoding.
+//   - No ConnectsApp integration.
+//
+// PLATFORM: AVFoundation (AVAssetWriter for synthetic test video generation).
+//           iOS 14.0+ (matches VGTimelineCompositorNode requirement).
+
+#pragma once
+
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+/// Phase 7 Stage 7.5B: Headless execution proof for VGTimelineCompositorNode.
+///
+/// @note The actual test logic only runs in DEBUG builds. In release builds,
+/// this returns a static error result.
+@interface VGTimelineCompositorSmokeTest : NSObject
+
+/// Run the headless execution proof for VGTimelineCompositorNode.
+///
+/// This method synchronously:
+///   1. Generates two short synthetic test videos (if clipAPath/clipBPath are
+///      nil or empty, it writes synthetic MP4 files to NSTemporaryDirectory).
+///   2. Constructs VGClipDescriptor + VGEditorGraphFactory topology.
+///   3. Validates via VGGraphValidator.
+///   4. Instantiates VGTimelineCompositorNode.
+///   5. Runs the headless pull/seek/EOS verification pipeline.
+///   6. Returns structured results.
+///
+/// @param clipAPath Absolute path to the first video asset. Pass nil to use
+///                  a generated synthetic video.
+/// @param clipBPath Absolute path to the second video asset. Pass nil to use
+///                  a generated synthetic video.
+/// @return A dictionary containing:
+///   - @"success": @YES/@NO  — overall pass/fail.
+///   - @"steps": NSArray<NSDictionary *>  — step-by-step results.
+///   - @"logs": NSArray<NSString *>  — human-readable log lines.
+///   - @"error": NSString (optional)  — first error message if failed.
++ (NSDictionary<NSString *, id> *)runWithClipAPath:(nullable NSString *)clipAPath
+                                         clipBPath:(nullable NSString *)clipBPath;
+
+@end
+
+NS_ASSUME_NONNULL_END

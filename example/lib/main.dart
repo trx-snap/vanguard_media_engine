@@ -28,6 +28,8 @@ import 'package:flutter/services.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 // Phase 7 Stage 7.3: timeline descriptor playground (engine/example only).
 import 'vanguard_timeline_playground.dart';
+// Phase 7 Stage 7.5B: timeline execution proof playground (engine/example only).
+import 'vanguard_timeline_execution_playground.dart';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Entry point
@@ -859,6 +861,23 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
                   );
                 },
                 tooltip: 'Timeline Playground (Phase 7)',
+              ),
+              // Phase 7 Stage 7.5B: timeline execution proof entry point.
+              const SizedBox(width: 8),
+              _CameraIconButton(
+                key: const ValueKey('timeline_execution_btn'),
+                icon: Icons.play_circle_outline,
+                active: false,
+                enabled: true,
+                onTap: () {
+                  Navigator.push<void>(
+                    context,
+                    MaterialPageRoute<void>(
+                      builder: (_) => const VanguardTimelineExecutionPlayground(),
+                    ),
+                  );
+                },
+                tooltip: 'Timeline Execution (Phase 7 Stage 7.5B)',
               ),
             ],
           ),
