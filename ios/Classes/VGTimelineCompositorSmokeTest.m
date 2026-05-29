@@ -739,6 +739,52 @@ static BOOL _generateSyntheticVideo(NSString *path,
     return result;
 }
 
+// ─── Phase 7 Stage 7.5C: generateSyntheticClipPaths ──────────────────────────
+//
+// Generates two solid-color synthetic MP4 clips to NSTemporaryDirectory for
+// use by the visual playback proof playground (dev_createTimelineTexture with
+// useSyntheticClips=YES). Files are named differently from the smoke test files
+// so the playback proof doesn't clash with the smoke test's files.
+//
+// Reuses the existing file-scope _generateSyntheticVideo helper.
+// File names:
+//   vg_playback_clip_A.mp4  — red,  320×240, 5s @ 30fps.
+//   vg_playback_clip_B.mp4  — blue, 320×240, 5s @ 30fps.
+//
+// Files are idempotent: regenerated only if absent.
+
++ (NSDictionary<NSString *, NSString *> *)generateSyntheticClipPaths {
+    NSString *tempDir = NSTemporaryDirectory();
+    NSString *pathA   = [tempDir stringByAppendingPathComponent:@"vg_playback_clip_A.mp4"];
+    NSString *pathB   = [tempDir stringByAppendingPathComponent:@"vg_playback_clip_B.mp4"];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // Clip A: red, 150 frames @ 30fps = 5.0s.
+    if (![fm fileExistsAtPath:pathA]) {
+        BOOL ok = _generateSyntheticVideo(pathA, 320, 240, 30, 150, 220, 50, 50);
+        if (!ok) {
+            os_log_error(sSmokeLog,
+                         "[7.5C] generateSyntheticClipPaths: failed to generate clip A");
+            return nil;
+        }
+    }
+
+    // Clip B: blue, 150 frames @ 30fps = 5.0s.
+    if (![fm fileExistsAtPath:pathB]) {
+        BOOL ok = _generateSyntheticVideo(pathB, 320, 240, 30, 150, 50, 50, 220);
+        if (!ok) {
+            os_log_error(sSmokeLog,
+                         "[7.5C] generateSyntheticClipPaths: failed to generate clip B");
+            return nil;
+        }
+    }
+
+    os_log(sSmokeLog,
+           "[7.5C] generateSyntheticClipPaths: A=%{public}@ B=%{public}@", pathA, pathB);
+    return @{ @"clipAPath": pathA, @"clipBPath": pathB };
+}
+
 @end
 
 #else // !DEBUG
@@ -760,6 +806,11 @@ static BOOL _generateSyntheticVideo(NSString *path,
         @"logs": @[@"Release build — smoke test disabled"],
         @"error": @"VGTimelineCompositorSmokeTest is DEBUG-only",
     };
+}
+
++ (nullable NSDictionary<NSString *, NSString *> *)generateSyntheticClipPaths {
+    // Synthetic video generation is DEBUG-only.
+    return nil;
 }
 
 @end

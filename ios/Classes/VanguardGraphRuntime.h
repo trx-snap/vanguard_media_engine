@@ -163,6 +163,55 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)setRuntimeThermalState:(NSProcessInfoThermalState)state
     NS_SWIFT_NAME(setRuntimeThermalState(_:));
 
+// ─── Phase 7 Stage 7.5C: Timeline Playback Proof ─────────────────────────────
+//
+// This section is only compiled when VG_USE_V2_GRAPH=1.
+// When VG_USE_V2_GRAPH=0, production V1 playback behavior is entirely unchanged.
+//
+// Design: a new, isolated preparation entry point that accepts a pre-initialized
+// VGTimelineCompositorNode and wires it through the existing Metal renderer and
+// Flutter texture path using a CADisplayLink-driven pull loop.
+//
+// This does NOT modify the existing prepareWithURL:completion: path.
+// This does NOT wrap the compositor in any V1 adapter.
+// This is example-playground-only in Stage 7.5C (no public Dart API surface).
+
+#if VG_USE_V2_GRAPH
+#import "VGUseV2Graph.h"
+
+@class VGTimelineCompositorNode;
+
+/// Phase 7 Stage 7.5C: Prepare the runtime for timeline playback.
+///
+/// Accepts a pre-initialized VGTimelineCompositorNode (a V2-native <VGSourceNode>),
+/// builds a two-node V2 graph via VGTimelinePlaybackGraphFactory, registers a
+/// Flutter texture, and wires a CADisplayLink-driven pull loop that calls
+/// pullFrame: on the compositor and delivers frames to VanguardMetalRenderer via
+/// VGRendererSinkAdapter.presentEnvelope:.
+///
+/// The existing prepareWithURL:completion: path (V1 and V2 push-mode) is
+/// completely unmodified when this method is used instead.
+///
+/// @param compositorNode  A fully initialized VGTimelineCompositorNode.
+///                        Must not be nil. Lifecycle is owned by the caller until
+///                        this runtime is invalidated.
+/// @param completion      Fires on the main queue with the registered Flutter
+///                        textureId on success, or -1 + error on failure.
+///                        Never called synchronously on the calling thread.
+- (void)prepareWithTimelineCompositorNode:(VGTimelineCompositorNode *)compositorNode
+                               completion:(void (^)(int64_t textureId,
+                                                    NSError *_Nullable error))completion
+    NS_SWIFT_NAME(prepareTimeline(compositorNode:completion:));
+
+/// Phase 7 Stage 7.5C: Seek the timeline compositor to the given PTS (seconds).
+///
+/// Wraps VGTimelineCompositorNode.seekTo:generation: using the runtime's
+/// current generation counter. Safe to call from the main thread.
+/// No-op if the runtime is not in the timeline playback state.
+- (void)seekTimelineTo:(double)seconds
+    NS_SWIFT_NAME(seekTimeline(to:));
+#endif // VG_USE_V2_GRAPH
+
 @end
 
 NS_ASSUME_NONNULL_END

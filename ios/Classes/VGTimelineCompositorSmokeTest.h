@@ -69,6 +69,22 @@ NS_ASSUME_NONNULL_BEGIN
 + (NSDictionary<NSString *, id> *)runWithClipAPath:(nullable NSString *)clipAPath
                                          clipBPath:(nullable NSString *)clipBPath;
 
+/// Phase 7 Stage 7.5C: Generate and return paths to persistent synthetic MP4 clips.
+///
+/// Creates two solid-color synthetic MP4 clips in NSTemporaryDirectory:
+///   - @"clipAPath": red 5-second 320×240 video at vg_playback_clip_A.mp4
+///   - @"clipBPath": blue 5-second 320×240 video at vg_playback_clip_B.mp4
+///
+/// Files are regenerated if they do not exist; otherwise the existing files are reused.
+/// Unlike runWithClipAPath:clipBPath:, this method does NOT run the headless smoke test
+/// and does NOT clean up the generated files — they persist for use by the playback proof.
+///
+/// In RELEASE builds: returns nil (the synthetic generation uses #if DEBUG AVAssetWriter code).
+///
+/// @return NSDictionary with @"clipAPath" and @"clipBPath" (both NSString) on success,
+///         or nil if clip generation failed.
++ (nullable NSDictionary<NSString *, NSString *> *)generateSyntheticClipPaths;
+
 @end
 
 NS_ASSUME_NONNULL_END

@@ -43,6 +43,15 @@
 #import "VGPlaybackGraphFactory.h"
 #import "VGGraphSchedulerV2.h"
 #import <UMF/VGGraphExecutionContext.h>
+// Phase 7 Stage 7.5C: timeline playback proof factory and node.
+#import "VGTimelinePlaybackGraphFactory.h"
+#import "VGTimelineCompositorNode.h"
+#import "VGRendererSinkAdapter.h"
+#import <UMF/VGFrameRequest.h>
+#import <UMF/VGFrameResult.h>
+#import <UMF/VGFrameEnvelope.h>
+#import <UMF/VGRenderMode.h>
+#import <QuartzCore/QuartzCore.h>
 #endif
 
 // UMF shared infrastructure
@@ -122,6 +131,18 @@ static BOOL VGRIsImageURL(NSURL *url) {
 #if VG_USE_V2_GRAPH
 @property(nonatomic, strong, nullable) VGGraphSchedulerV2 *schedulerV2;
 @property(nonatomic, strong, nullable) VGGraphExecutionContext *executionContext;
+// Phase 7 Stage 7.5C: timeline pull-loop state.
+// All nil/zero unless prepareWithTimelineCompositorNode:completion: was used.
+@property(nonatomic, strong, nullable) VGTimelineCompositorNode *timelineCompositor;
+@property(nonatomic, strong, nullable) VGRendererSinkAdapter *timelineSinkAdapter;
+@property(nonatomic, strong, nullable) CADisplayLink *timelineDisplayLink;
+// Atomic generation counter for the pull loop seek invalidation.
+// Incremented on each seekTimelineTo: to flush stale in-flight pull requests.
+@property(atomic, assign) uint64_t timelineGeneration;
+// PTS tracking for the pull loop: advances by 1/fps per display link tick.
+// Protected by main-thread-only access (CADisplayLink fires on main thread).
+@property(nonatomic, assign) double timelineCurrentPTS;
+@property(nonatomic, assign) BOOL timelineIsPlaying;
 #endif
 
 @end
@@ -669,6 +690,20 @@ static BOOL VGRIsImageURL(NSURL *url) {
   // nil and [nil invalidate] is a no-op. When V2 path is active, scheduler is
   // nil. Both teardown calls are unconditional — no runtime path check needed.
 #if VG_USE_V2_GRAPH
+  // Phase 7 Stage 7.5C: Break the CADisplayLink retain cycle immediately.
+  //
+  // CADisplayLink was created with `target: self`, forming a strong reference
+  // cycle: runtime → displayLink → runtime. The previous safety net in
+  // _timelineDisplayLinkFired: only fires if the link ticks again after
+  // invalidation. If the runtime is invalidated while the timeline is paused
+  // or the display link is otherwise quiesced, that tick never arrives and
+  // the runtime leaks. Calling -invalidate here breaks the cycle synchronously,
+  // exactly once, regardless of whether a tick is pending.
+  // Safe: [nil invalidate] is a no-op (timeline path may never have been used).
+  if (self.timelineDisplayLink) {
+    [self.timelineDisplayLink invalidate];
+    self.timelineDisplayLink = nil;
+  }
   [self.schedulerV2 invalidate];
   self.schedulerV2 = nil;
   self.executionContext = nil;
@@ -1520,7 +1555,462 @@ static BOOL VGRIsImageURL(NSURL *url) {
   if (self.schedulerV2) {
     [self.schedulerV2 invalidate];
   }
+  // Phase 7 Stage 7.5C: timeline display link safety net.
+  if (self.timelineDisplayLink) {
+    [self.timelineDisplayLink invalidate];
+    self.timelineDisplayLink = nil;
+  }
 #endif
 }
+
+// ─── Phase 7 Stage 7.5C: Timeline Playback Proof ─────────────────────────────
+//
+// All code in this section is gated behind #if VG_USE_V2_GRAPH.
+// When VG_USE_V2_GRAPH=0, this section is entirely removed by the preprocessor.
+// The V1 playback path (prepareWithURL:completion:) is completely unmodified.
+//
+// Implementation pattern:
+//
+//   1. prepareWithTimelineCompositorNode:completion:
+//      - Dispatches off-main via _prepareQueue (matches prepareWithURL: contract).
+//      - Calls prepareWithContext:completion: on the compositor node.
+//      - Creates a VanguardMetalRenderer (no media source — compositor drives frames).
+//      - Builds the graph via VGTimelinePlaybackGraphFactory.
+//      - Registers a Flutter texture from the renderer.
+//      - Wires a CADisplayLink (target = self, selector = _timelineDisplayLinkFired:).
+//      - CADisplayLink is created on the main thread (CADisplayLink requirement).
+//      - completion fires on the main thread with textureId.
+//
+//   2. _timelineDisplayLinkFired:
+//      - Fires on the main thread at ~60fps (CADisplayLink default).
+//      - When timelineIsPlaying: advances timelineCurrentPTS by displayLink.duration.
+//      - Creates VGFrameRequest at current PTS.
+//      - Calls [timelineCompositor pullFrame:request] on a background serial queue
+//        (to avoid blocking the main thread for AVAssetReader decode work).
+//      - On VGFrameStatusDelivered: calls [timelineSinkAdapter presentEnvelope:]
+//        → [renderer presentEnvelope:] → Flutter texture update.
+//      - On VGFrameStatusSkipped: no-op (stale generation after seek).
+//      - On VGFrameStatusEndOfStream: stops display link (pauses at EOS).
+//
+//   3. play / pause / seekTimelineTo:
+//      - play: sets timelineIsPlaying = YES (display link is already running).
+//      - pause: sets timelineIsPlaying = NO (display link still ticks for scrub).
+//      - seekTimelineTo: increments generation, updates currentPTS,
+//        calls [compositor seekTo:generation:], optionally pulls one preview frame.
+//
+// Apple Framework Contract Verification:
+//
+//   CADisplayLink:
+//     - Must be created on the main thread and added to NSRunLoop.main.
+//     - Target must not be retained by a strong reference in the display link
+//       (strong would create a retain cycle: runtime → displayLink → runtime).
+//       Solution: __weak self in _timelineDisplayLinkFired:.
+//     - displayLink.duration ≈ 1/60 on 60Hz, 1/120 on ProMotion.
+//       We advance PTS by duration per tick (not hardcoded 1/30) for smooth
+//       cadence on all display types.
+//     - Reference: UIKit / QuartzCore docs, WWDC 2021 "Optimize for Variable
+//       Refresh Rate Displays".
+//
+//   VGFrameRequest:
+//     - initWithRequestedPTS:duration:generation:renderSize:mode: is the
+//       designated initializer (VGFrameRequest.h).
+//     - mode = VGRenderModePlayback for this path.
+//     - generation must match the compositor's atomic generation to receive
+//       VGFrameStatusDelivered; mismatches return VGFrameStatusSkipped.
+//
+//   VGRendererSinkAdapter.presentEnvelope: (VGRendererSinkAdapter.m:74):
+//     - Delegates to [renderer presentEnvelope:].
+//     - renderer stores the CVPixelBuffer under os_unfair_lock (+1 retain)
+//       and dispatches textureFrameAvailable: to main queue.
+//     - Safe to call from the pull queue (VGRendererSinkAdapter is thread-safe).
+//
+//   VanguardMetalRenderer (no source):
+//     - initWithSource: requires a non-nil id<VanguardMediaSource>.
+//     - WORKAROUND for Stage 7.5C: we need the renderer for Flutter texture
+//       registration and Metal device access, but the source is the compositor.
+//     - The compositor is not a VanguardMediaSource (it's a UMF VGSourceNode).
+//     - Therefore: create the renderer with the compositor as a nil source stand-in
+//       by using a synthetic minimal source adapter that satisfies the renderer's
+//       init guard but never produces frames.
+//     - This is the ONLY place a synthetic source adapter is used.
+//     - The renderer's CADisplayLink / decode-queue path is NEVER started
+//       (we never call renderer.play). All frame delivery goes through
+//       VGRendererSinkAdapter.presentEnvelope: instead.
+//
+// BLOCKED_BY_RUNTIME_INTEGRATION_GAP assessment:
+//   The issue is VanguardMetalRenderer requires a non-nil VanguardMediaSource.
+//   The compositor does NOT conform to VanguardMediaSource (it's a UMF VGSourceNode).
+//   RESOLUTION: we pass a zero-frame VanguardImageMediaSource as the
+//   nominal source to satisfy renderer's init. The display link is never
+//   started, so the image source never produces frames. The compositor drives
+//   all frame delivery directly through VGRendererSinkAdapter.presentEnvelope:.
+//   This is safe because renderer.play is never called in this path.
+//   Reference: VanguardMetalRenderer.initWithSource:textureRegistry:methodChannel:
+//              sessionPool: does not call [source start] at init time.
+
+#if VG_USE_V2_GRAPH
+
+// ─── Pull queue (created once per runtime, shared across sessions) ─────────────
+static dispatch_queue_t _VGTimelinePullQueue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.vanguard.timeline.pull", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
+// ─── prepareWithTimelineCompositorNode:completion: ────────────────────────────
+
+- (void)prepareWithTimelineCompositorNode:(VGTimelineCompositorNode *)compositorNode
+                               completion:(void (^)(int64_t textureId,
+                                                    NSError *_Nullable error))completion
+{
+    NSParameterAssert(compositorNode != nil);
+    NSParameterAssert(completion != nil);
+
+    dispatch_async(_prepareQueue, ^{
+        // ── Guard ──────────────────────────────────────────────────────────
+        if (self->_invalidated) {
+            NSError *err = [NSError
+                errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
+                           code:1
+                       userInfo:@{NSLocalizedDescriptionKey:
+                           @"[7.5C] Runtime already invalidated."}];
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(-1, err); });
+            return;
+        }
+
+        // ── 1. Prepare the compositor node ─────────────────────────────────
+        //
+        // VGGraphExecutionContext is required by prepareWithContext:completion:.
+        // We create a minimal context. The compositor reads renderSize from it
+        // during prepare to configure its AVAssetReader output settings.
+        VGResourceAllocator *allocator = [VGResourceAllocator sharedInstance];
+        VGGraphExecutionContext *ctx = [[VGGraphExecutionContext alloc]
+            initWithDescriptor:nil
+                          plan:nil
+                         nodes:@{}
+                         clock:nil
+             resourceAllocator:allocator];
+
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block NSError *prepError = nil;
+
+        [compositorNode prepareWithContext:ctx completion:^(NSError *err) {
+            prepError = err;
+            dispatch_semaphore_signal(sem);
+        }];
+
+        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+
+        if (prepError || self->_invalidated) {
+            NSError *err = prepError ?: [NSError
+                errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
+                           code:1
+                       userInfo:@{NSLocalizedDescriptionKey:
+                           @"[7.5C] Runtime invalidated during compositor prepare."}];
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(-1, err); });
+            return;
+        }
+
+        // ── 2. Create renderer with a minimal image source stand-in ────────
+        //
+        // VanguardMetalRenderer.initWithSource: requires non-nil id<VanguardMediaSource>.
+        // VGTimelineCompositorNode is a UMF VGSourceNode, not a VanguardMediaSource.
+        //
+        // Resolution (see Apple Framework Contract above):
+        //   Pass a VanguardImageMediaSource backed by a zero-frame synthetic
+        //   asset. The renderer's CADisplayLink / decode path is NEVER started
+        //   (we do not call renderer.play). All frame delivery is via
+        //   VGRendererSinkAdapter.presentEnvelope: from our pull loop.
+        //
+        // We use the standard 1×1 pixel transparent PNG inline (no bundled asset,
+        // MOD-6 compliant). VanguardImageMediaSource reads it; the render size
+        // will be 1×1, but the compositor provides 1920×1080 buffers anyway.
+        //
+        // NOTE: This is the ONLY approved workaround in Stage 7.5C for the
+        // renderer-requires-source constraint. It must be revisited in Stage 7.6
+        // when VanguardMetalRenderer gains a source-free init path.
+        NSString *syntheticImagePath = [NSTemporaryDirectory()
+            stringByAppendingPathComponent:@"vg_7_5c_placeholder.png"];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:syntheticImagePath]) {
+            // Write a 1×1 transparent PNG (89-byte minimal PNG).
+            static const uint8_t kMinimalPNG[] = {
+                0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A, // signature
+                0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52, // IHDR chunk
+                0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01, // 1×1
+                0x08,0x06,0x00,0x00,0x00,0x1F,0x15,0xC4, // RGBA 8-bit
+                0x89,0x00,0x00,0x00,0x0B,0x49,0x44,0x41, // IDAT chunk
+                0x54,0x08,0xD7,0x63,0x60,0x60,0x60,0x60,
+                0x00,0x00,0x00,0x05,0x00,0x01,0xA5,0xF6,
+                0x45,0x40,0x00,0x00,0x00,0x00,0x49,0x45, // IEND chunk
+                0x4E,0x44,0xAE,0x42,0x60,0x82
+            };
+            NSData *pngData = [NSData dataWithBytes:kMinimalPNG
+                                             length:sizeof(kMinimalPNG)];
+            [pngData writeToFile:syntheticImagePath atomically:YES];
+        }
+
+        NSURL *placeholderURL = [NSURL fileURLWithPath:syntheticImagePath];
+        VanguardImageMediaSource *placeholderSource =
+            [[VanguardImageMediaSource alloc] initWithURL:placeholderURL
+                                                processor:nil];
+
+        // Create a minimal pool for the renderer (1×1 — renderer needs one).
+        CVPixelBufferPoolRef tinyPool =
+            [allocator pixelBufferPoolWithWidth:1
+                                         height:1
+                                         format:kCVPixelFormatType_32BGRA
+                             minimumBufferCount:1];
+
+        VanguardMetalRenderer *renderer =
+            [[VanguardMetalRenderer alloc] initWithSource:placeholderSource
+                                          textureRegistry:self.textureRegistry
+                                            methodChannel:self.methodChannel
+                                              sessionPool:tinyPool];
+
+        if (tinyPool) {
+            CVPixelBufferPoolRelease(tinyPool);
+        }
+
+        if (!renderer || self->_invalidated) {
+            NSError *err = [NSError
+                errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
+                           code:3
+                       userInfo:@{NSLocalizedDescriptionKey:
+                           @"[7.5C] Failed to create VanguardMetalRenderer for timeline."}];
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(-1, err); });
+            return;
+        }
+
+        // ── 3. Build graph via VGTimelinePlaybackGraphFactory ──────────────
+        NSError *factoryError = nil;
+        NSDictionary<NSString *, id> *graphResult =
+            [VGTimelinePlaybackGraphFactory
+                buildTimelineGraphWithCompositorNode:compositorNode
+                                           renderer:renderer
+                                              error:&factoryError];
+
+        if (!graphResult || self->_invalidated) {
+            NSError *err = factoryError ?: [NSError
+                errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
+                           code:4
+                       userInfo:@{NSLocalizedDescriptionKey:
+                           @"[7.5C] VGTimelinePlaybackGraphFactory failed."}];
+            [renderer dispose];
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(-1, err); });
+            return;
+        }
+
+        VGRendererSinkAdapter *sinkAdapter = graphResult[@"sinkAdapter"];
+
+        // ── 4. Store all timeline state ────────────────────────────────────
+        self.renderer             = renderer;
+        self.timelineCompositor   = compositorNode;
+        self.timelineSinkAdapter  = sinkAdapter;
+        self.timelineGeneration   = 0;
+        self.timelineCurrentPTS   = 0.0;
+        self.timelineIsPlaying    = NO;
+
+        int64_t tid = renderer.textureId;
+        self.textureId = tid;
+        self.state = VGRuntimeStatePrepared;
+
+        NSLog(@"[VanguardGraphRuntime][7.5C] timeline runtime prepared "
+              "textureId=%lld compositorId=%@",
+              (long long)tid, compositorNode.nodeId);
+
+        // ── 5. Wire CADisplayLink on main thread ───────────────────────────
+        //
+        // CADisplayLink must be created on the thread whose run loop it
+        // will be added to. We create it on the main thread.
+        // References:
+        //   - CADisplayLink.h: "displayLink should be added to a run loop"
+        //   - Apple doc "Optimizing ProMotion Refresh Rates"
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (self->_invalidated) {
+                completion(-1, [NSError
+                    errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
+                               code:1
+                           userInfo:@{NSLocalizedDescriptionKey:
+                               @"[7.5C] Invalidated before display link created."}]);
+                return;
+            }
+
+            CADisplayLink *displayLink =
+                [CADisplayLink displayLinkWithTarget:self
+                                           selector:@selector(_timelineDisplayLinkFired:)];
+            // Do NOT set preferredFramesPerSecond — let the display choose its
+            // native rate (60 or 120 Hz). The pull loop only pulls a new frame
+            // when timelineIsPlaying or when a seek was requested, so there is
+            // no decode overhead from ticking at 120Hz while paused.
+            [displayLink addToRunLoop:[NSRunLoop mainRunLoop]
+                              forMode:NSRunLoopCommonModes];
+            self.timelineDisplayLink = displayLink;
+
+            completion(tid, nil);
+        });
+    });
+}
+
+// ─── Display link pull loop ────────────────────────────────────────────────────
+
+- (void)_timelineDisplayLinkFired:(CADisplayLink *)displayLink {
+    // Must be on the main thread (CADisplayLink contract).
+    NSAssert([NSThread isMainThread],
+             @"[7.5C] _timelineDisplayLinkFired: must fire on the main thread");
+
+    if (_invalidated) {
+        [displayLink invalidate];
+        return;
+    }
+
+    VGTimelineCompositorNode *compositor = self.timelineCompositor;
+    VGRendererSinkAdapter    *sink       = self.timelineSinkAdapter;
+    if (!compositor || !sink) return;
+
+    // Advance PTS only when playing.
+    if (self.timelineIsPlaying) {
+        self.timelineCurrentPTS += displayLink.duration;
+    }
+
+    // Capture snapshot of PTS and generation for this tick.
+    double currentPTS   = self.timelineCurrentPTS;
+    uint64_t generation = self.timelineGeneration;
+
+    // Build the frame request.
+    CMTime pts      = CMTimeMakeWithSeconds(currentPTS, 600);
+    CMTime duration = CMTimeMakeWithSeconds(displayLink.duration, 600);
+    VGFrameRequest *request =
+        [[VGFrameRequest alloc] initWithRequestedPTS:pts
+                                            duration:duration
+                                          generation:generation
+                                          renderSize:CGSizeMake(1920, 1080)
+                                               mode:VGRenderModePlayback];
+
+    // Pull on the serial pull queue so AVAssetReader.copyNextSampleBuffer
+    // does not block the main thread.
+    __weak VGTimelineCompositorNode *weakCompositor = compositor;
+    __weak VGRendererSinkAdapter    *weakSink       = sink;
+    __weak typeof(self)              weakSelf       = self;
+
+    dispatch_async(_VGTimelinePullQueue(), ^{
+        VGTimelineCompositorNode *c = weakCompositor;
+        VGRendererSinkAdapter    *s = weakSink;
+        if (!c || !s) return;
+
+        VGFrameResult *result = [c pullFrame:request];
+        if (!result) return;
+
+        switch (result.status) {
+            case VGFrameStatusDelivered: {
+                // Forward the envelope to the sink.
+                // VGRendererSinkAdapter.presentEnvelope: retains the pixel buffer
+                // and dispatches textureFrameAvailable: to main queue.
+                [s presentEnvelope:result.envelope];
+
+                // Update PTS display on main thread.
+                double pts_s = CMTimeGetSeconds(result.envelope.pts);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    // Post a method channel notification for Dart PTS overlay.
+                    // Dart playground listens on the same channel for 'onTimelineFrame'.
+                    typeof(self) ss = weakSelf;
+                    if (!ss || ss->_invalidated) return;
+                    [ss.methodChannel invokeMethod:@"onTimelineFrame"
+                                        arguments:@{@"pts": @(pts_s),
+                                                    @"generation": @(generation)}];
+                });
+                break;
+            }
+            case VGFrameStatusSkipped:
+                // Stale generation — no action.
+                break;
+            case VGFrameStatusEndOfStream: {
+                // Reached EOS — stop playing, notify Dart.
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    typeof(self) ss = weakSelf;
+                    if (!ss || ss->_invalidated) return;
+                    ss.timelineIsPlaying = NO;
+                    [ss.methodChannel invokeMethod:@"onTimelineEOS" arguments:nil];
+                    NSLog(@"[VanguardGraphRuntime][7.5C] timeline EOS reached "
+                          "PTS=%.3f", currentPTS);
+                });
+                break;
+            }
+            case VGFrameStatusError:
+                NSLog(@"[VanguardGraphRuntime][7.5C] pullFrame error: %@",
+                      result.error.localizedDescription);
+                break;
+        }
+    });
+}
+
+// ─── play / pause forwarding for timeline path ────────────────────────────────
+//
+// The base class play/pause call [renderer play] / [renderer pause] which drives
+// the VanguardMetalRenderer's CADisplayLink. In the timeline path, the renderer's
+// CADisplayLink must NOT be started (it has a placeholder image source and would
+// produce garbage frames). We override the start/stop in _timelineDisplayLinkFired:
+// via timelineIsPlaying — no change to the base class play/pause is required
+// because the timeline path is entered via prepareWithTimelineCompositorNode:
+// rather than prepareWithURL:, and the renderer's play/pause are wrapped here.
+//
+// The Dart playground calls play/pause/seekTo via the standard dev_ method channel
+// routes which call [runtime play] / [runtime pause] / [runtime seekTo:].
+// Those call [renderer play] etc. — which is a no-op for the placeholder source.
+// The effective timeline play/pause state is timelineIsPlaying.
+//
+// For Stage 7.5C: the Dart playground controls timelineIsPlaying directly via
+// the dev_createTimelineTexture / dev_ play/pause/seekTo method channel cases
+// in VanguardMediaEnginePlugin.swift, which call the timeline-specific methods
+// below.
+
+// ─── seekTimelineTo: ─────────────────────────────────────────────────────────
+
+- (void)seekTimelineTo:(double)seconds {
+    // May be called from any thread (Dart method channel arrives on main queue).
+    // Update PTS and increment generation on the main queue for CADisplayLink safety.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_invalidated) return;
+
+        // Increment generation atomically.
+        uint64_t newGeneration = self.timelineGeneration + 1;
+        self.timelineGeneration = newGeneration;
+        self.timelineCurrentPTS = MAX(0.0, seconds);
+
+        // Forward seek to compositor on pull queue to avoid reader rebuild on
+        // the main thread.
+        VGTimelineCompositorNode *compositor = self.timelineCompositor;
+        if (!compositor) return;
+
+        CMTime seekTime = CMTimeMakeWithSeconds(seconds, 600);
+        dispatch_async(_VGTimelinePullQueue(), ^{
+            [compositor seekTo:seekTime generation:newGeneration];
+            NSLog(@"[VanguardGraphRuntime][7.5C] seekTimelineTo: %.3f "
+                  "generation=%llu", seconds, (unsigned long long)newGeneration);
+        });
+    });
+}
+
+// ─── Timeline play/pause convenience ─────────────────────────────────────────
+
+- (void)_timelinePlay {
+    NSAssert([NSThread isMainThread], @"[7.5C] _timelinePlay must be on main thread");
+    self.timelineIsPlaying = YES;
+    self.state = VGRuntimeStateRunning;
+    NSLog(@"[VanguardGraphRuntime][7.5C] timeline play — PTS=%.3f",
+          self.timelineCurrentPTS);
+}
+
+- (void)_timelinePause {
+    NSAssert([NSThread isMainThread], @"[7.5C] _timelinePause must be on main thread");
+    self.timelineIsPlaying = NO;
+    self.state = VGRuntimeStatePaused;
+    NSLog(@"[VanguardGraphRuntime][7.5C] timeline pause — PTS=%.3f",
+          self.timelineCurrentPTS);
+}
+
+#endif // VG_USE_V2_GRAPH
 
 @end

@@ -123,6 +123,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     var cameraGraphSession: VGCameraGraphSession?
     #endif
 
+    // Phase 7 Stage 7.5C: dedicated runtime for the timeline visual playback proof.
+    // Lives outside the sessionRegistry (not a standard playback session).
+    // Gated behind VG_USE_V2_GRAPH — nil when VG_USE_V2_GRAPH=0.
+    #if VG_USE_V2_GRAPH
+    var _timelineRuntime: VanguardGraphRuntime?
+    #endif
+
     // Phase 2 Step 6: session registry is the unconditional playback path.
     // All createTexture / play / pause / seekTo / dispose calls route here.
     // Camera and export continue to use `renderers` exclusively.
@@ -215,6 +222,68 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         teardownCurrentMode()
         currentMode = mode
     }
+
+    // Phase 7 Stage 7.5C: shared compositor init + runtime prepare helper.
+    // Called from both the useSyntheticClips=true and useSyntheticClips=false paths
+    // inside the dev_createTimelineTexture method channel case.
+    // Must be called on the main thread.
+    #if VG_USE_V2_GRAPH
+    private func _prepareTimelineCompositor(
+        clipDicts: [[String: Any]],
+        transitionDicts: [[String: Any]],
+        result: @escaping FlutterResult
+    ) {
+        // Build compositor parameters.
+        let compositorParams: [String: Any] = [
+            "descriptorStage": "7.5_executable",
+            "clips":           clipDicts,
+            "transitions":     transitionDicts,
+        ]
+
+        // Build port array: single video_out port.
+        let videoOutPort = VGMediaPort(
+            name:      "video_out",
+            mediaType: VGMediaTypeVideo,
+            required:  true,
+            direction: .output)
+        let ports: [VGMediaPort] = [videoOutPort]
+
+        // Initialize compositor.
+        var compositorError: NSError? = nil
+        guard let compositor = VGTimelineCompositorNode(
+            nodeId:     "timeline_compositor",
+            parameters: compositorParams,
+            ports:      ports,
+            error:      &compositorError
+        ) else {
+            let msg = compositorError?.localizedDescription
+                ?? "VGTimelineCompositorNode init returned nil"
+            NSLog("[VanguardPlugin][7.5C] compositor init failed: %@", msg)
+            result(FlutterError(code: "COMPOSITOR_INIT_FAILED",
+                                message: msg, details: nil))
+            return
+        }
+
+        // Create a dedicated VanguardGraphRuntime for the timeline.
+        let timelineRuntime = VanguardGraphRuntime(
+            textureRegistry: registrar.textures(),
+            methodChannel:   channel)
+        self._timelineRuntime = timelineRuntime
+
+        timelineRuntime.prepareTimeline(compositorNode: compositor) { textureId, err in
+            if let err = err {
+                NSLog("[VanguardPlugin][7.5C] prepareTimeline failed: %@",
+                      err.localizedDescription)
+                result(FlutterError(code: "PREPARE_TIMELINE_FAILED",
+                                    message: err.localizedDescription,
+                                    details: nil))
+                return
+            }
+            NSLog("[VanguardPlugin][7.5C] timeline texture ready textureId=%lld", textureId)
+            result(["textureId": textureId, "width": 320, "height": 240])
+        }
+    }
+    #endif // VG_USE_V2_GRAPH
 
     /// PATCH-2: Async camera teardown for transitions that may have an active recording.
     /// Calls stopRecording(completion:) (no main-thread block) then invokes completion
@@ -1014,6 +1083,161 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     withClipAPath: clipA, clipBPath: clipB)
                 DispatchQueue.main.async { result(testResults) }
             }
+
+        // ── Phase 7 Stage 7.5C: Timeline visual playback proof ────────────────
+        //
+        // These cases are compiled only when VG_USE_V2_GRAPH=1.
+        // They wire VGTimelineCompositorNode through VanguardMetalRenderer to
+        // a Flutter texture via a CADisplayLink-driven pull loop.
+        //
+        // All method names use the dev_ prefix:
+        //   - dev_createTimelineTexture: prepare and register Flutter texture
+        //   - dev_timelinePlay:          start the pull loop advancing PTS
+        //   - dev_timelinePause:         freeze the pull loop at current PTS
+        //   - dev_timelineSeek:          seek to a PTS position (seconds)
+        //
+        // These methods do NOT touch ConnectsApp, the V1 path, or any existing
+        // production method channel cases. They are strictly example-layer-only.
+        //
+        // dev_createTimelineTexture args:
+        //   clips: [[String: Any]]  — each dict must conform to VGClipDescriptor format:
+        //     { "url": String, "trimStart": Double, "trimEnd": Double,
+        //       "speed": Double, "mediaKind": Int (0 = video) }
+        //   transitions: [[String: Any]] — optional, may be [] or absent.
+        //     Currently only "none" transitions are accepted (Stage 7.5 limitation).
+        //
+        // Returns: { "textureId": Int64, "width": Int, "height": Int }
+        // On failure: FlutterError.
+
+        #if VG_USE_V2_GRAPH
+        case "dev_createTimelineTexture":
+            // ── Phase 7 Stage 7.5C: Timeline visual playback proof ────────────
+            //
+            // Args:
+            //   useSyntheticClips: Bool (optional, default false)
+            //     When true: ignores 'clips' arg and generates two real synthetic
+            //     MP4 clips via VGTimelineCompositorSmokeTest.generateSyntheticClipPaths.
+            //     Requires DEBUG build (AVAssetWriter-based generation).
+            //   clips: [[String: Any]]  — clip descriptor dicts (if useSyntheticClips=false).
+            //   transitions: [[String: Any]] — optional.
+            //
+            // Returns: { "textureId": Int64, "width": Int, "height": Int }
+            // On failure: FlutterError.
+
+            let useSyntheticClips = args?["useSyntheticClips"] as? Bool ?? false
+
+            // Resolve clip dicts: synthetic generation path or caller-supplied.
+            let resolvedClipDicts: [[String: Any]]
+
+            if useSyntheticClips {
+                // Generate persistent synthetic MP4s via smoke test helper.
+                // This is synchronous with AVAssetWriter on caller thread.
+                // The plugin handler is called on the main thread; generate
+                // on a background queue to avoid blocking Flutter.
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self = self else { return }
+
+                    let paths = VGTimelineCompositorSmokeTest.generateSyntheticClipPaths()
+                    guard
+                        let pathA = paths?["clipAPath"],
+                        let pathB = paths?["clipBPath"]
+                    else {
+                        DispatchQueue.main.async {
+                            result(FlutterError(
+                                code: "SYNTHETIC_CLIP_FAILED",
+                                message: "dev_createTimelineTexture: synthetic clip generation failed "
+                                       + "(requires DEBUG build)",
+                                details: nil))
+                        }
+                        return
+                    }
+
+                    let clipDictsForSynthetic: [[String: Any]] = [
+                        [
+                            "url":            pathA,
+                            "trimStart":      0.0,
+                            "trimEnd":        5.0,
+                            "speed":          1.0,
+                            "mediaKind":      0,
+                            "startTimeSeconds":  0.0,
+                            "timelineDuration":  5.0,
+                        ],
+                        [
+                            "url":            pathB,
+                            "trimStart":      0.0,
+                            "trimEnd":        5.0,
+                            "speed":          1.0,
+                            "mediaKind":      0,
+                            "startTimeSeconds":  5.0,
+                            "timelineDuration":  5.0,
+                        ],
+                    ]
+                    DispatchQueue.main.async {
+                        self._prepareTimelineCompositor(
+                            clipDicts: clipDictsForSynthetic,
+                            transitionDicts: [],
+                            result: result)
+                    }
+                }
+                return
+            }
+
+            // Non-synthetic path: use caller-supplied clips.
+            guard let callerClipDicts = args?["clips"] as? [[String: Any]] else {
+                result(FlutterError(
+                    code: "BAD_ARGS",
+                    message: "dev_createTimelineTexture: clips array required when useSyntheticClips=false",
+                    details: nil))
+                return
+            }
+            resolvedClipDicts = callerClipDicts
+            let transitionDictsForCaller = args?["transitions"] as? [[String: Any]] ?? []
+            _prepareTimelineCompositor(clipDicts: resolvedClipDicts,
+                                       transitionDicts: transitionDictsForCaller,
+                                       result: result)
+
+        case "dev_timelinePlay":
+            guard let runtime = self._timelineRuntime else {
+                result(FlutterError(code: "NO_TIMELINE",
+                                    message: "dev_timelinePlay: no active timeline runtime",
+                                    details: nil))
+                return
+            }
+            runtime._timelinePlay()
+            result(nil)
+
+        case "dev_timelinePause":
+            guard let runtime = self._timelineRuntime else {
+                result(FlutterError(code: "NO_TIMELINE",
+                                    message: "dev_timelinePause: no active timeline runtime",
+                                    details: nil))
+                return
+            }
+            runtime._timelinePause()
+            result(nil)
+
+        case "dev_timelineSeek":
+            guard
+                let runtime  = self._timelineRuntime,
+                let seconds  = (args?["seconds"] as? NSNumber)?.doubleValue
+            else {
+                result(FlutterError(code: "BAD_ARGS",
+                                    message: "dev_timelineSeek: seconds required and timeline must be active",
+                                    details: nil))
+                return
+            }
+            runtime.seekTimeline(to: seconds)
+            result(nil)
+
+        case "dev_disposeTimeline":
+            if let runtime = self._timelineRuntime {
+                runtime.invalidateAsync {
+                    NSLog("[VanguardPlugin][7.5C] timeline runtime disposed")
+                }
+                self._timelineRuntime = nil
+            }
+            result(nil)
+        #endif // VG_USE_V2_GRAPH
 
         case "setPlaybackRate":
             guard let textureId = (args?["textureId"] as? NSNumber)?.int64Value,
