@@ -136,12 +136,31 @@ static os_log_t sSchedulerV2Log;
     _executionOrder = [execOrder copy]; // immutable after this point
 
     // ── (c) Extract source node ───────────────────────────────────────────────
+    // Primary scan: standard VGNodeRoleSource node conforming to VGSourceNode.
+    // All Phase 3–6 graphs (camera, file playback, export) have such a node.
     for (NSString *nodeId in nodes) {
         id<VGNode> node = nodes[nodeId];
         if (node.nodeRole == VGNodeRoleSource &&
             [node conformsToProtocol:@protocol(VGSourceNode)]) {
             _sourceNode = (id<VGSourceNode>)node;
             break;
+        }
+    }
+
+    // Fallback scan: Phase 7 self-sourcing compositor.
+    // VGTimelineCompositorNode returns VGNodeRoleCompositor (to match the
+    // topology descriptor) but also conforms to <VGSourceNode> for pull-mode
+    // execution. This fallback is only reached when no standard source is found,
+    // so it is safe and backward-compatible with all existing graphs.
+    // MOD-1 (Opus Phase 7 Stage 7.5 validation).
+    if (!_sourceNode) {
+        for (NSString *nodeId in nodes) {
+            id<VGNode> node = nodes[nodeId];
+            if (node.nodeRole == VGNodeRoleCompositor &&
+                [node conformsToProtocol:@protocol(VGSourceNode)]) {
+                _sourceNode = (id<VGSourceNode>)node;
+                break;
+            }
         }
     }
 

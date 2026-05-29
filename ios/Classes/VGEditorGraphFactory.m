@@ -7,28 +7,40 @@
 // STAGE 7.4 — NON-EXECUTABLE DESCRIPTOR FACTORY
 // ═══════════════════════════════════════════════════════════════════════════════
 //
+// ═══════════════════════════════════════════════════════════════════════════════
+// STAGE 7.5 UPDATE — VALIDATOR ENABLED; PLANNER DEFERRED
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Stage 7.5 changes vs Stage 7.4:
+//   • descriptorStage changed to "7.5_executable" (MOD-3, Opus Stage 7.5).
+//     VGTimelineCompositorNode checks this key at init; Stage 7.4 descriptors
+//     are rejected at runtime.
+//   • VGGraphValidator is now called after building the descriptor (MOD-2, MOD-5).
+//     VGGraphValidator.m's NoSource check has been patched to accept self-sourcing
+//     compositor nodes (VGNodeRoleCompositor + zero incoming edges).
+//   • VGGraphPlanner is NOT called (MOD-5, Opus required modification):
+//     - The timeline topology is trivially [compositor → sink]; no BFS needed.
+//     - Schedulers discover the self-sourcing compositor via the Phase 7 fallback
+//       (MOD-1: VGGraphSchedulerV2.m + VGExportScheduler.m).
+//     - VGGraphPlanner integration deferred to Stage 7.6+ (overlays, filters).
+//
 // This factory does NOT:
-//   • Call VGGraphValidator or VGGraphPlanner (see MOD-1 / Opus validation).
-//     Rationale: VGTimelineCompositorNode is self-sourcing (no external input
-//     ports) and would fail VGGraphValidator's NoSource check.  Full validator
-//     integration is Stage 7.5 scope.
-//   • Instantiate VGTimelineCompositorNode (Stage 7.5).
+//   • Instantiate VGTimelineCompositorNode (the scheduler instantiates it).
 //   • Call prepare/start/invalidate on any node.
 //   • Invoke any runtime, scheduler, camera, export, or FFI code.
 //   • Import AVFoundation, CoreMedia, Metal, UIKit, or Flutter.
 //
-// Clock policy: VGClockPolicyHybrid (MOD-2).
+// Clock policy: VGClockPolicyHybrid (MOD-2 of Stage 7.4 Opus validation).
 //   Source-of-truth: VGClockPolicy.h ("Use for: file playback, timeline scrub")
 //   and UMF_V2_01_Core_DAG_Architecture.md §6.5 (clockPolicy: hybrid).
 //
-// Validation (MOD-3/4/5): see +validateTimelineWithClips:transitions:error:.
+// Validation (Stage 7.4 MOD-3/4/5): see +validateTimelineWithClips:transitions:error:.
 //   MOD-3: transition.durationSeconds <= min(fromClip, toClip).timelineDuration
 //   MOD-4: clips must be sorted by startTimeSeconds ascending; reject unsorted
 //   MOD-5: Stage 7.4 accepts VGClipMediaKindVideo and VGClipMediaKindImage only
 //
-// Non-executable documentation (MOD-6): see VGEditorGraphFactory.h.
-//
 // Imports: Foundation + UMF descriptor/graph headers only.
+
 
 #import "VGEditorGraphFactory.h"
 
@@ -45,6 +57,13 @@
 #import "VGSinkAdmissionPolicy.h"
 #import "VGMediaNode.h"
 #import "VGFrameEnvelope.h"
+
+// ─── VGGraphValidator (Stage 7.5: enabled after MOD-2 NoSource patch) ─────────
+// VGGraphPlanner is intentionally NOT imported. See MOD-5 / Opus Stage 7.5:
+//   The timeline topology is trivial (compositor → sink); schedulers use the
+//   Phase 7 self-sourcing-compositor fallback and do not require VGExecutionPlan.
+#import "VGGraphValidator.h"
+#import "VGValidationError.h"
 
 // ─── Error domain ────────────────────────────────────────────────────────────
 
@@ -409,14 +428,16 @@ static NSError *_VGEditorError(VGEditorGraphFactoryErrorCode code, NSString *mes
     // parameters:
     //   - "clips"         : serialized clip descriptor array
     //   - "transitions"   : serialized transition descriptor array
-    //   - "descriptorStage": "7.4_non_executable" for runtime safety guard
+    //   - "descriptorStage": "7.5_executable" (MOD-3, Opus Stage 7.5)
+    //     VGTimelineCompositorNode.initWithNodeId:parameters:ports:error:
+    //     checks this key and rejects the Stage 7.4 non-executable marker.
     VGMediaPort *timelineOutputPort =
         [VGMediaPort outputPort:@"video_out" mediaType:VGMediaTypeVideo];
 
     NSDictionary<NSString *, id> *timelineParameters = @{
         @"clips"          : [clipDicts copy],
         @"transitions"    : [transitionDicts copy],
-        @"descriptorStage": @"7.4_non_executable",
+        @"descriptorStage": @"7.5_executable",
     };
 
     VGGraphNodeDescriptor *timelineNode =
@@ -460,25 +481,49 @@ static NSError *_VGEditorError(VGEditorGraphFactoryErrorCode code, NSString *mes
                                           port:@"video_in"
                                admissionPolicy:[VGSinkAdmissionPolicy dropLatest]];
 
-    // ── (f) Build and return VGGraphDescriptor ────────────────────────────────
+    // ── (f) Build VGGraphDescriptor ───────────────────────────────────────────
     //
-    // graphId: "editorTimelineGraph_7_4" — includes the stage suffix so any
-    //   runtime guard can detect and reject non-executable Stage 7.4 descriptors.
+    // graphId: "editorTimelineGraph_7_5" — updated to Stage 7.5.
     //
-    // clockPolicy: VGClockPolicyHybrid (MOD-2, Opus required modification)
+    // clockPolicy: VGClockPolicyHybrid (MOD-2 of Stage 7.4 Opus validation)
     //   Source-of-truth: VGClockPolicy.h ("Use for: file playback, timeline scrub
     //   (hybrid clock-at-scrub-PTS)") and §6.5 (clockPolicy: hybrid).
     //
     // audioSidecar: nil — audio sidecar is Phase 8 scope.
-    //
-    // VGGraphValidator NOT called (MOD-1).
-    // VGGraphPlanner  NOT called (MOD-1).
     VGGraphDescriptor *descriptor =
-        [[VGGraphDescriptor alloc] initWithGraphId:@"editorTimelineGraph_7_4"
+        [[VGGraphDescriptor alloc] initWithGraphId:@"editorTimelineGraph_7_5"
                                              nodes:@[timelineNode, previewNode]
                                        connections:@[connection]
                                        clockPolicy:VGClockPolicyHybrid
                                       audioSidecar:nil];
+
+    // ── (g) Validate via VGGraphValidator (Stage 7.5: enabled) ───────────────
+    //
+    // VGGraphValidator.m CHECK 1 (NoSource) has been patched (MOD-2) to accept
+    // self-sourcing compositor nodes (VGNodeRoleCompositor + zero incoming edges).
+    // The timeline compositor qualifies: it has one output port (video_out) and
+    // no incoming connections, satisfying the self-sourcing compositor check.
+    //
+    // VGGraphPlanner is NOT called (MOD-5, Opus Stage 7.5 required modification):
+    //   - The timeline topology is trivially [compositor → sink].
+    //   - Schedulers use the Phase 7 self-sourcing-compositor fallback (MOD-1)
+    //     to discover the compositor as the pull source without VGExecutionPlan.
+    //   - VGGraphPlanner integration is deferred to Stage 7.6+ when overlays
+    //     and filter chain nodes are added to the timeline graph.
+    NSArray<VGValidationError *> *validationErrors = nil;
+    BOOL descriptorValid = [VGGraphValidator validateDescriptor:descriptor
+                                                         errors:&validationErrors];
+    if (!descriptorValid) {
+        if (outError) {
+            NSString *errorDesc = [NSString stringWithFormat:
+                @"VGEditorGraphFactory: VGGraphValidator rejected the timeline "
+                 "descriptor. Errors: %@", validationErrors];
+            *outError = [NSError errorWithDomain:VGEditorGraphFactoryErrorDomain
+                                            code:VGEditorGraphFactoryErrorInvalidClip
+                                        userInfo:@{NSLocalizedDescriptionKey: errorDesc}];
+        }
+        return nil;
+    }
 
     return descriptor;
 }
