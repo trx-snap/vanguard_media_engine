@@ -32,6 +32,9 @@ export 'vg_effect_catalog.dart';
 export 'vg_preset_descriptor.dart';
 // Phase 6C.1B: Dart-only graph transaction engine.
 export 'vg_graph_transaction.dart';
+// Phase 7 Stage 7.1: non-destructive timeline descriptor models (pure data).
+export 'vg_clip_descriptor.dart';
+export 'vg_transition_descriptor.dart';
 
 const String _libName = 'vanguard_media_engine';
 

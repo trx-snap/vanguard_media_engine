@@ -12,6 +12,7 @@
 //   - startRecording / stopRecording (MP4 to temp path)
 //
 // Scope: package example only. Zero production-app modifications.
+// Phase 7 Stage 7.3: adds VanguardTimelinePlayground navigation entry.
 // Constraints honoured:
 //   - No modification of connectsapp_app or connectsapp_* directories.
 //   - No native iOS/Android file edits.
@@ -25,6 +26,8 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+// Phase 7 Stage 7.3: timeline descriptor playground (engine/example only).
+import 'vanguard_timeline_playground.dart';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Entry point
@@ -839,6 +842,24 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
                     ),
                   ),
                 ),
+              // Phase 7 Stage 7.3: timeline playground entry point.
+              // Does not affect camera session, recording, or preview.
+              const SizedBox(width: 8),
+              _CameraIconButton(
+                key: const ValueKey('timeline_playground_btn'),
+                icon: Icons.timeline,
+                active: false,
+                enabled: true,
+                onTap: () {
+                  Navigator.push<void>(
+                    context,
+                    MaterialPageRoute<void>(
+                      builder: (_) => const VanguardTimelinePlayground(),
+                    ),
+                  );
+                },
+                tooltip: 'Timeline Playground (Phase 7)',
+              ),
             ],
           ),
         ),
