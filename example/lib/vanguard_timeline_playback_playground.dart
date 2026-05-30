@@ -1,9 +1,17 @@
 // vanguard_timeline_playback_playground.dart
-// Vanguard Media Engine — Phase 7 Stage 7.5D: Real Video Timeline Playback Proof
+// Vanguard Media Engine — Phase 7 Stage 7.5E: Real Video Timeline Export Proof
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// STAGE 7.5D — REAL VIDEO PROOF PLAYGROUND
+// STAGE 7.5E — REAL VIDEO EXPORT PROOF PLAYGROUND
 // ═══════════════════════════════════════════════════════════════════════════════
+//
+// Extends Stage 7.5D by adding a dev_timelineExport button that proves the
+// VGTimelineCompositorNode can be fully exported to a video-only H.264 MP4
+// via the VGExportScheduler pull loop.
+//
+// Stage 7.5D proof baseline still available (Synthetic / Real Video toggle).
+// Export runs independently of the playback runtime (separate compositor).
+//
 //
 // Extends Stage 7.5C by adding an opt-in "Real Video" source mode.
 // In Real Video mode the native layer generates true H.264 MP4 clips with a
@@ -26,7 +34,7 @@
 //   - Does NOT add public Dart API surface.
 //   - Does NOT implement still-image clips (Stage 7.5 limitation).
 //   - Does NOT implement fade/dissolve transitions (Stage 7.5 limitation).
-//   - Does NOT implement export (deferred to Stage 7.6+).
+//   - Stage 7.5E adds dev-only export proof (video-only H.264 MP4).
 //   - Does NOT touch ConnectsApp.
 //
 // VISUAL PROOF CRITERIA (from Opus 7.5C validation):
@@ -124,6 +132,20 @@ class _VanguardTimelinePlaybackPlaygroundState
   /// (vg_playback_real_clip_A.mp4 / _B.mp4) instead of solid-color synthetic ones.
   /// Default is false so Stage 7.5C baseline still works without toggling.
   bool _useRealVideo = false;
+
+  // ── Stage 7.5E export state ───────────────────────────────────────────────
+
+  /// Whether an export is currently running.
+  bool _exporting = false;
+
+  /// Path of the last successfully exported file. null until first success.
+  String? _exportResultPath;
+
+  /// Duration of the last successful export in seconds.
+  double _exportDurationSeconds = 0.0;
+
+  /// Human-readable export result message (success or error).
+  String? _exportResultMessage;
 
   // ── Live-scrub throttle state ─────────────────────────────────────────────
 
@@ -313,18 +335,80 @@ class _VanguardTimelinePlaybackPlaygroundState
     }
   }
 
+  /// Stage 7.5E: Runs a video-only offline export via [dev_timelineExport].
+  ///
+  /// Creates an independent compositor in the native layer — does NOT reuse
+  /// the playback runtime. Playback is paused before export for clean UX.
+  Future<void> _exportTimeline() async {
+    if (_textureId == null || _busy || _exporting) return;
+
+    // Pause playback before starting export (cleaner UX — avoids concurrent
+    // AVAssetReader reads from the same clip files by both playback and export).
+    if (_playing) await _pause();
+
+    setState(() {
+      _exporting = true;
+      _exportResultPath = null;
+      _exportResultMessage = null;
+      _status = 'Exporting timeline…';
+    });
+
+    try {
+      final result = await _channel.invokeMapMethod<String, dynamic>(
+        'dev_timelineExport',
+        {'useRealVideoClips': _useRealVideo},
+      );
+
+      if (!mounted) return;
+
+      final success = result?['success'] as bool? ?? false;
+      final path = result?['path'] as String?;
+      final duration = (result?['durationSeconds'] as num?)?.toDouble() ?? 0.0;
+
+      setState(() {
+        _exporting = false;
+        if (success && path != null) {
+          _exportResultPath = path;
+          _exportDurationSeconds = duration;
+          _exportResultMessage = null;
+          _status = 'Export complete';
+        } else {
+          _exportResultPath = null;
+          _exportResultMessage = 'Export failed: unexpected empty result';
+          _status = 'Export failed';
+        }
+      });
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _exporting = false;
+        _exportResultPath = null;
+        _exportResultMessage = 'Export error: ${e.message}';
+        _status = 'Export error';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _exporting = false;
+        _exportResultPath = null;
+        _exportResultMessage = 'Export error: $e';
+        _status = 'Export error';
+      });
+    }
+  }
+
   // ── Build ──────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar:   AppBar(
+      appBar: AppBar(
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
         title: const Text(
-          'Timeline Playback (7.5D)',
-          style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+          'Timeline Playback & Export (7.5E)',
+          style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
         ),
         actions: [
           // Stage tag badge.
@@ -336,7 +420,7 @@ class _VanguardTimelinePlaybackPlaygroundState
               borderRadius: BorderRadius.circular(8),
             ),
             child: const Text(
-              'STAGE 7.5D',
+              'STAGE 7.5E',
               style: TextStyle(
                 color: Colors.white,
                 fontSize: 10,
@@ -586,7 +670,7 @@ class _VanguardTimelinePlaybackPlaygroundState
                   ),
                   const SizedBox(height: 8),
 
-                  // Synthetic clip legend.
+                  // Clip legend.
                   const Row(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
@@ -595,6 +679,53 @@ class _VanguardTimelinePlaybackPlaygroundState
                       _ClipLegendBadge(label: 'Clip B', color: Colors.blue),
                     ],
                   ),
+
+                  const SizedBox(height: 12),
+
+                  // ── Stage 7.5E: Export button ──────────────────────────────
+                  _ControlButton(
+                    icon: _exporting
+                        ? Icons.hourglass_top
+                        : Icons.upload_file,
+                    enabled: _textureId != null && !_busy && !_exporting,
+                    onTap: _exportTimeline,
+                    tooltip: _exporting ? 'Exporting…' : 'Export Timeline',
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    _exporting ? 'Exporting…' : 'Export Timeline',
+                    style: TextStyle(
+                      color: _exporting ? const Color(0xFF6C63FF) : Colors.white38,
+                      fontSize: 10,
+                      fontWeight: _exporting
+                          ? FontWeight.w600
+                          : FontWeight.normal,
+                    ),
+                  ),
+
+                  // ── Export result card ─────────────────────────────────────
+                  if (_exportResultPath != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 12),
+                      child: _ExportResultCard(
+                        path: _exportResultPath!,
+                        durationSeconds: _exportDurationSeconds,
+                        isRealVideo: _useRealVideo,
+                      ),
+                    ),
+                  if (_exportResultMessage != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Text(
+                        _exportResultMessage!,
+                        style: const TextStyle(
+                          color: Colors.redAccent,
+                          fontSize: 10,
+                          fontFamily: 'monospace',
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
                 ],
               ),
             ),
@@ -811,6 +942,112 @@ class _ClipLegendBadge extends StatelessWidget {
           style: const TextStyle(color: Colors.white54, fontSize: 11),
         ),
       ],
+    );
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Stage 7.5E: Export Result Card
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Displays the result of a successful [dev_timelineExport] call.
+///
+/// Shows the output file path, duration, and source mode (Synthetic/Real).
+class _ExportResultCard extends StatelessWidget {
+  const _ExportResultCard({
+    required this.path,
+    required this.durationSeconds,
+    required this.isRealVideo,
+  });
+
+  final String path;
+  final double durationSeconds;
+  final bool isRealVideo;
+
+  @override
+  Widget build(BuildContext context) {
+    // Show just the filename, not the full temp path.
+    final filename = path.split('/').last;
+    final modeLabel = isRealVideo ? 'Real Video' : 'Synthetic';
+    final modeColor =
+        isRealVideo ? const Color(0xFF4CAF50) : const Color(0xFF6C63FF);
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1A2E),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFF2A2A4E), width: 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Header row.
+          Row(
+            children: [
+              const Icon(
+                Icons.check_circle_outline,
+                color: Color(0xFF4CAF50),
+                size: 14,
+              ),
+              const SizedBox(width: 6),
+              const Text(
+                'Export Complete',
+                style: TextStyle(
+                  color: Color(0xFF4CAF50),
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.4,
+                ),
+              ),
+              const Spacer(),
+              // Mode badge.
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: modeColor.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(4),
+                  border: Border.all(color: modeColor.withValues(alpha: 0.5)),
+                ),
+                child: Text(
+                  modeLabel,
+                  style: TextStyle(
+                    color: modeColor,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.3,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          // File path.
+          Text(
+            filename,
+            style: const TextStyle(
+              color: Colors.white70,
+              fontSize: 11,
+              fontFamily: 'monospace',
+            ),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+          const SizedBox(height: 4),
+          // Duration.
+          Text(
+            'Duration: ${durationSeconds.toStringAsFixed(2)}s',
+            style: const TextStyle(
+              color: Colors.white38,
+              fontSize: 10,
+              fontFamily: 'monospace',
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

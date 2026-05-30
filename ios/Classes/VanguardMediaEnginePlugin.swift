@@ -1356,6 +1356,131 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 self._timelineRuntime = nil
             }
             result(nil)
+
+        // ── Phase 7 Stage 7.5E: Timeline export proof ─────────────────────────
+        //
+        // Runs a video-only offline timeline export using the same real-video
+        // fixtures from Stage 7.5D. VGTimelineExportHelper builds an independent
+        // VGTimelineCompositorNode (does NOT touch _timelineRuntime or the
+        // playback texture) and drives a VGExportScheduler pull loop.
+        //
+        // VGExportProfile is constructed entirely inside VGTimelineExportHelper.m
+        // in Objective-C — this Swift case passes only primitive parameters.
+        //
+        // dev_timelineExport args:
+        //   useRealVideoClips: Bool (optional, default false)
+        //     true  → 640×360 moving-pattern real H.264 clips (7.5D fixtures)
+        //     false → 320×240 solid-color synthetic clips (7.5C fixtures)
+        //
+        // Returns: { "success": Bool, "path": String, "durationSeconds": Double }
+        // On failure: FlutterError.
+        case "dev_timelineExport":
+            let useRealVideoForExport = args?["useRealVideoClips"] as? Bool ?? false
+
+            // Choose dimensions based on source mode.
+            let exportWidth:  NSInteger = useRealVideoForExport ? 640 : 320
+            let exportHeight: NSInteger = useRealVideoForExport ? 360 : 240
+
+            // Output path: NSTemporaryDirectory/vg_timeline_export_proof.mp4.
+            let exportOutputPath = NSTemporaryDirectory() + "vg_timeline_export_proof.mp4"
+
+            // Run clip generation on a background queue (AVAssetWriter is synchronous
+            // and must not block the main thread). Same dispatch pattern as 7.5D.
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+
+                // Resolve clip paths.
+                let clipPaths: [String: String]?
+                let clipIdPrefix: String
+                if useRealVideoForExport {
+                    clipPaths = VGTimelineCompositorSmokeTest.generateRealVideoClipPaths()
+                    clipIdPrefix = "export_real_clip"
+                } else {
+                    clipPaths = VGTimelineCompositorSmokeTest.generateSyntheticClipPaths()
+                    clipIdPrefix = "export_synthetic_clip"
+                }
+
+                guard
+                    let pathA = clipPaths?["clipAPath"],
+                    let pathB = clipPaths?["clipBPath"]
+                else {
+                    DispatchQueue.main.async {
+                        result(FlutterError(
+                            code: "CLIP_GENERATION_FAILED",
+                            message: "dev_timelineExport: clip generation failed "
+                                   + "(requires DEBUG build)",
+                            details: nil))
+                    }
+                    return
+                }
+
+                // Build clip descriptor dictionaries — same wire contract as
+                // dev_createTimelineTexture (VGClipDescriptor.fromDictionary: keys).
+                let clipDicts: [[String: Any]] = [
+                    [
+                        "id":               "\(clipIdPrefix)_A",
+                        "sourcePath":       pathA,
+                        "mediaKind":        "video",
+                        "startTimeSeconds": 0.0,
+                        "durationSeconds":  5.0,
+                        "trimStartSeconds": 0.0,
+                        "trimEndSeconds":   5.0,
+                        "speed":            1.0,
+                    ],
+                    [
+                        "id":               "\(clipIdPrefix)_B",
+                        "sourcePath":       pathB,
+                        "mediaKind":        "video",
+                        "startTimeSeconds": 5.0,
+                        "durationSeconds":  5.0,
+                        "trimStartSeconds": 0.0,
+                        "trimEndSeconds":   5.0,
+                        "speed":            1.0,
+                    ],
+                ]
+
+                NSLog("[VanguardPlugin][7.5E] starting export — clips=%d width=%ld height=%ld path=%@",
+                      clipDicts.count,
+                      Int(exportWidth), Int(exportHeight),
+                      exportOutputPath)
+
+                // Delegate to VGTimelineExportHelper — VGExportProfile is
+                // constructed entirely in ObjC (MOD-1, MOD-2). Swift never
+                // touches VGExportProfile directly.
+                VGTimelineExportHelper.exportTimeline(
+                    withClips: clipDicts,
+                    outputPath: exportOutputPath,
+                    width: exportWidth,
+                    height: exportHeight,
+                    fps: 30,
+                    bitrateBps: 2_000_000
+                ) { success, outPath, duration, error in
+                    // Completion fires on a background queue (VGExportScheduler queue).
+                    // Marshal result back to main thread for Flutter.
+                    DispatchQueue.main.async {
+                        if success, let outPath = outPath {
+                            NSLog("[VanguardPlugin][7.5E] export success: %.2fs %@",
+                                  duration, outPath)
+                            result([
+                                "success":         true,
+                                "path":            outPath,
+                                "durationSeconds": duration,
+                                "width":           Int(exportWidth),
+                                "height":          Int(exportHeight),
+                                "fps":             30,
+                            ] as [String: Any])
+                        } else {
+                            let msg = error?.localizedDescription
+                                      ?? "Timeline export failed (unknown error)"
+                            NSLog("[VanguardPlugin][7.5E] export failed: %@", msg)
+                            result(FlutterError(
+                                code: "EXPORT_FAILED",
+                                message: msg,
+                                details: nil))
+                        }
+                    }
+                }
+            }
         #endif // VG_USE_V2_GRAPH
 
         case "setPlaybackRate":
