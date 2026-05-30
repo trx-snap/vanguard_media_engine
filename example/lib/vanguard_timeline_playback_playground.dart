@@ -1,9 +1,24 @@
 // vanguard_timeline_playback_playground.dart
-// Vanguard Media Engine — Phase 7 Stage 7.5E: Real Video Timeline Export Proof
+// Vanguard Media Engine — Phase 7 Stage 7.6: Trim-Only Timeline Modification Proof
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// STAGE 7.5E — REAL VIDEO EXPORT PROOF PLAYGROUND
+// STAGE 7.6 — TRIM-ONLY TIMELINE MODIFICATION PROOF
 // ═══════════════════════════════════════════════════════════════════════════════
+//
+// Extends Stage 7.5E by proving that the timeline can be modified at runtime:
+//   - Trim Clip A to 3s (trimStartSeconds=1.0, trimEndSeconds=4.0)
+//   - Reset trims back to 5s+5s baseline
+//   - dev_updateTimeline rebuilds compositor via tear-down-and-rebuild
+//   - Export after trim produces shorter MP4 (~8.0s)
+//
+// Stage 7.5E baseline (synthetic / real video playback + export) is unchanged.
+// Trim controls are additive and optional.
+//
+// NEW METHOD CHANNEL CALL:
+//   Call:    dev_updateTimeline({ useRealVideoClips: bool,
+//                                 trimAStart: double, trimAEnd: double,
+//                                 trimBStart: double, trimBEnd: double })
+//   Returns: { textureId: Int64, width: Int, height: Int, durationSeconds: Double }
 //
 // Extends Stage 7.5D by adding a dev_timelineExport button that proves the
 // VGTimelineCompositorNode can be fully exported to a video-only H.264 MP4
@@ -76,8 +91,7 @@ import 'package:flutter/services.dart';
 
 const MethodChannel _channel = MethodChannel('vanguard_media_engine');
 
-/// Total synthetic timeline duration (2 clips × 5 seconds each).
-const double _kTimelineDuration = 10.0;
+
 
 // ──────────────────────────────────────────────────────────────────────────────
 // VanguardTimelinePlaybackPlayground
@@ -146,6 +160,34 @@ class _VanguardTimelinePlaybackPlaygroundState
 
   /// Human-readable export result message (success or error).
   String? _exportResultMessage;
+
+  // ── Stage 7.6: Trim state ─────────────────────────────────────────────────
+  //
+  // Trim state is kept as simple booleans so the proof is minimal:
+  //   - _trimClipA=false: Clip A uses full [0.0, 5.0] window → 5.0s effective
+  //   - _trimClipA=true:  Clip A trimmed to [1.0, 4.0] window → 3.0s effective
+  //   - _trimClipB=false: Clip B uses full [0.0, 5.0] window → 5.0s effective
+  //   - _trimClipB=true:  Clip B trimmed to [1.0, 4.0] window → 3.0s effective
+  //
+  // Trim state is reset when a fresh prepare is triggered (source mode toggle).
+
+  /// Whether Clip A is trimmed to 3s. False = full 5s (7.5E baseline).
+  bool _trimClipA = false;
+
+  /// Whether Clip B is trimmed to 3s. False = full 5s (7.5E baseline).
+  bool _trimClipB = false;
+
+  /// Effective duration of Clip A in seconds, accounting for trim state.
+  double get _clipAEffectiveDuration => _trimClipA ? 3.0 : 5.0;
+
+  /// Effective duration of Clip B in seconds, accounting for trim state.
+  double get _clipBEffectiveDuration => _trimClipB ? 3.0 : 5.0;
+
+  /// Total timeline duration: Clip A effective + Clip B effective.
+  double get _timelineDuration => _clipAEffectiveDuration + _clipBEffectiveDuration;
+
+  /// Whether the timeline is currently being rebuilt after a trim update.
+  bool _rebuilding = false;
 
   // ── Live-scrub throttle state ─────────────────────────────────────────────
 
@@ -339,6 +381,9 @@ class _VanguardTimelinePlaybackPlaygroundState
   ///
   /// Creates an independent compositor in the native layer — does NOT reuse
   /// the playback runtime. Playback is paused before export for clean UX.
+  ///
+  /// Stage 7.6: Passes current trim state so the export uses the same trim
+  /// configuration as the currently active playback timeline.
   Future<void> _exportTimeline() async {
     if (_textureId == null || _busy || _exporting) return;
 
@@ -354,9 +399,18 @@ class _VanguardTimelinePlaybackPlaygroundState
     });
 
     try {
+      // Stage 7.6: pass trim state so native export uses current trim window.
       final result = await _channel.invokeMapMethod<String, dynamic>(
         'dev_timelineExport',
-        {'useRealVideoClips': _useRealVideo},
+        {
+          'useRealVideoClips': _useRealVideo,
+          // Clip A trim window.
+          'trimAStart': _trimClipA ? 1.0 : 0.0,
+          'trimAEnd':   _trimClipA ? 4.0 : 5.0,
+          // Clip B trim window.
+          'trimBStart': _trimClipB ? 1.0 : 0.0,
+          'trimBEnd':   _trimClipB ? 4.0 : 5.0,
+        },
       );
 
       if (!mounted) return;
@@ -397,6 +451,85 @@ class _VanguardTimelinePlaybackPlaygroundState
     }
   }
 
+  // ── Stage 7.6: Trim control helpers ──────────────────────────────────────
+
+  /// Calls [dev_updateTimeline] with the current trim state.
+  ///
+  /// Tears down and rebuilds the playback timeline via the native
+  /// tear-down-and-rebuild path (MOD-2). Does NOT mutate
+  /// [VGTimelineCompositorNode] in place.
+  ///
+  /// On success: texture/dimensions update, PTS resets to 0.0.
+  /// On failure: status updated with error, texture preserved.
+  Future<void> _updateTimeline() async {
+    if (_textureId == null || _busy || _rebuilding) return;
+
+    // Pause playback before rebuild.
+    if (_playing) await _pause();
+
+    setState(() {
+      _rebuilding = true;
+      _status = 'Rebuilding timeline…';
+      // Clear the texture so the stale frame disappears immediately.
+      _textureId = null;
+      _currentPTS = 0.0;
+      _atEOS = false;
+      _seekDragValue = null;
+      // Clear export result — it may no longer match the new trim state.
+      _exportResultPath = null;
+      _exportResultMessage = null;
+    });
+
+    try {
+      final result = await _channel.invokeMapMethod<String, dynamic>(
+        'dev_updateTimeline',
+        {
+          'useRealVideoClips': _useRealVideo,
+          // Clip A trim window.
+          'trimAStart': _trimClipA ? 1.0 : 0.0,
+          'trimAEnd':   _trimClipA ? 4.0 : 5.0,
+          // Clip B trim window.
+          'trimBStart': _trimClipB ? 1.0 : 0.0,
+          'trimBEnd':   _trimClipB ? 4.0 : 5.0,
+        },
+      );
+
+      if (!mounted) return;
+
+      final textureId = (result?['textureId'] as num?)?.toInt();
+      if (textureId == null || textureId < 0) {
+        setState(() {
+          _rebuilding = false;
+          _status = 'Rebuild failed: bad textureId=$textureId';
+        });
+        return;
+      }
+
+      final w = (result?['width']  as num?)?.toInt() ?? _width;
+      final h = (result?['height'] as num?)?.toInt() ?? _height;
+
+      setState(() {
+        _textureId = textureId;
+        _width     = w;
+        _height    = h;
+        _rebuilding = false;
+        _status = 'Timeline rebuilt — ${_timelineDuration.toStringAsFixed(1)}s — tap ▶ to play';
+      });
+    } on PlatformException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _rebuilding = false;
+        _status = 'Rebuild error: ${e.message}';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _rebuilding = false;
+        _status = 'Rebuild error: $e';
+      });
+    }
+  }
+
   // ── Build ──────────────────────────────────────────────────────────────────
 
   @override
@@ -407,7 +540,7 @@ class _VanguardTimelinePlaybackPlaygroundState
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
         title: const Text(
-          'Timeline Playback & Export (7.5E)',
+          'Timeline Playback & Export (7.6)',
           style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
         ),
         actions: [
@@ -420,7 +553,7 @@ class _VanguardTimelinePlaybackPlaygroundState
               borderRadius: BorderRadius.circular(8),
             ),
             child: const Text(
-              'STAGE 7.5E',
+              'STAGE 7.6',
               style: TextStyle(
                 color: Colors.white,
                 fontSize: 10,
@@ -495,7 +628,7 @@ class _VanguardTimelinePlaybackPlaygroundState
                       right: 12,
                       child: _PtsOverlay(
                         pts: _seekDragValue ?? _currentPTS,
-                        duration: _kTimelineDuration,
+                        duration: _timelineDuration,
                         atEOS: _atEOS,
                       ),
                     ),
@@ -507,6 +640,30 @@ class _VanguardTimelinePlaybackPlaygroundState
                       left: 12,
                       child: _ClipIndicator(
                         pts: _seekDragValue ?? _currentPTS,
+                        clipADuration: _clipAEffectiveDuration,
+                        isRealVideo: _useRealVideo,
+                      ),
+                    ),
+
+                  // Rebuilding overlay.
+                  if (_rebuilding)
+                    Container(
+                      color: Colors.black.withValues(alpha: 0.7),
+                      child: const Center(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            CircularProgressIndicator(color: Color(0xFFFF9800)),
+                            SizedBox(height: 12),
+                            Text(
+                              'Rebuilding timeline…',
+                              style: TextStyle(
+                                color: Colors.white70,
+                                fontSize: 13,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                 ],
@@ -583,9 +740,9 @@ class _VanguardTimelinePlaybackPlaygroundState
                   // onChanged    — move thumb immediately + throttled native seek.
                   // onChangeEnd  — final exact native seek + optional play resume.
                   _SeekSlider(
-                    value: _seekDragValue ?? _currentPTS,
-                    max: _kTimelineDuration,
-                    enabled: _textureId != null && !_busy,
+                    value: (_seekDragValue ?? _currentPTS).clamp(0.0, _timelineDuration),
+                    max: _timelineDuration,
+                    enabled: _textureId != null && !_busy && !_rebuilding,
                     onChangeStart: (v) {
                       if (_playing) {
                         _wasPlayingBeforeScrub = true;
@@ -626,7 +783,7 @@ class _VanguardTimelinePlaybackPlaygroundState
                         ),
                       ),
                       Text(
-                        _formatPTS(_kTimelineDuration),
+                        _formatPTS(_timelineDuration),
                         style: const TextStyle(
                           color: Colors.white38,
                           fontSize: 11,
@@ -644,7 +801,7 @@ class _VanguardTimelinePlaybackPlaygroundState
                       // Seek to start.
                       _ControlButton(
                         icon: Icons.skip_previous,
-                        enabled: _textureId != null && !_busy,
+                        enabled: _textureId != null && !_busy && !_rebuilding,
                         onTap: () => _seekTo(0.0),
                         tooltip: 'Seek to start',
                       ),
@@ -652,18 +809,18 @@ class _VanguardTimelinePlaybackPlaygroundState
                       // Play / Pause.
                       _ControlButton(
                         icon: _playing ? Icons.pause : Icons.play_arrow,
-                        enabled: _textureId != null && !_busy,
+                        enabled: _textureId != null && !_busy && !_rebuilding,
                         large: true,
                         primary: true,
                         onTap: _playing ? _pause : _play,
                         tooltip: _playing ? 'Pause' : 'Play',
                       ),
                       const SizedBox(width: 20),
-                      // Seek to end (5s remaining — to prove EOS path).
+                      // Seek to end (1s before EOS — to prove EOS path).
                       _ControlButton(
                         icon: Icons.skip_next,
-                        enabled: _textureId != null && !_busy,
-                        onTap: () => _seekTo(_kTimelineDuration - 1.0),
+                        enabled: _textureId != null && !_busy && !_rebuilding,
+                        onTap: () => _seekTo(_timelineDuration - 1.0),
                         tooltip: 'Seek near end',
                       ),
                     ],
@@ -682,12 +839,40 @@ class _VanguardTimelinePlaybackPlaygroundState
 
                   const SizedBox(height: 12),
 
+                  // ── Stage 7.6: Trim controls ───────────────────────────────
+                  //
+                  // Minimal proof: three buttons to trim/reset clips and
+                  // rebuild the timeline via dev_updateTimeline.
+                  // Does NOT use range sliders or waveform UI (MOD-3).
+                  _TrimControlRow(
+                    trimClipA: _trimClipA,
+                    trimClipB: _trimClipB,
+                    rebuilding: _rebuilding,
+                    enabled: _textureId != null && !_busy && !_rebuilding,
+                    onTrimA: () {
+                      setState(() => _trimClipA = true);
+                      _updateTimeline();
+                    },
+                    onTrimB: () {
+                      setState(() => _trimClipB = true);
+                      _updateTimeline();
+                    },
+                    onReset: () {
+                      setState(() {
+                        _trimClipA = false;
+                        _trimClipB = false;
+                      });
+                      _updateTimeline();
+                    },
+                  ),
+                  const SizedBox(height: 12),
+
                   // ── Stage 7.5E: Export button ──────────────────────────────
                   _ControlButton(
                     icon: _exporting
                         ? Icons.hourglass_top
                         : Icons.upload_file,
-                    enabled: _textureId != null && !_busy && !_exporting,
+                    enabled: _textureId != null && !_busy && !_exporting && !_rebuilding,
                     onTap: _exportTimeline,
                     tooltip: _exporting ? 'Exporting…' : 'Export Timeline',
                   ),
@@ -736,7 +921,7 @@ class _VanguardTimelinePlaybackPlaygroundState
   }
 
   String _formatPTS(double pts) {
-    final clamped = pts.clamp(0.0, _kTimelineDuration);
+    final clamped = pts.clamp(0.0, _timelineDuration);
     final m = (clamped ~/ 60).toString().padLeft(2, '0');
     final s = (clamped % 60).toStringAsFixed(2).padLeft(5, '0');
     return '$m:$s';
@@ -797,12 +982,19 @@ class _PtsOverlay extends StatelessWidget {
 }
 
 class _ClipIndicator extends StatelessWidget {
-  const _ClipIndicator({required this.pts});
+  const _ClipIndicator({
+    required this.pts,
+    required this.clipADuration,
+    required this.isRealVideo,
+  });
   final double pts;
+  final double clipADuration;
+  final bool isRealVideo;
 
   @override
   Widget build(BuildContext context) {
-    final isClipA = pts < 5.0;
+    final isClipA = pts < clipADuration;
+    final modeLabel = isRealVideo ? 'real' : 'synthetic';
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       decoration: BoxDecoration(
@@ -810,7 +1002,7 @@ class _ClipIndicator extends StatelessWidget {
         borderRadius: BorderRadius.circular(6),
       ),
       child: Text(
-        isClipA ? '● CLIP A (synthetic)' : '● CLIP B (synthetic)',
+        isClipA ? '● CLIP A ($modeLabel)' : '● CLIP B ($modeLabel)',
         style: const TextStyle(
           color: Colors.white,
           fontSize: 11,
@@ -942,6 +1134,150 @@ class _ClipLegendBadge extends StatelessWidget {
           style: const TextStyle(color: Colors.white54, fontSize: 11),
         ),
       ],
+    );
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Stage 7.6: Trim Control Row
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Minimal trim control row for Stage 7.6.
+///
+/// Three buttons:
+///   - "Trim A to 3s" — sets Clip A trim window to [1.0, 4.0] and rebuilds.
+///   - "Trim B to 3s" — sets Clip B trim window to [1.0, 4.0] and rebuilds.
+///   - "Reset trims"  — restores both clips to [0.0, 5.0] and rebuilds.
+///
+/// No range sliders, no waveform, no product-level UI (MOD-3).
+class _TrimControlRow extends StatelessWidget {
+  const _TrimControlRow({
+    required this.trimClipA,
+    required this.trimClipB,
+    required this.rebuilding,
+    required this.enabled,
+    required this.onTrimA,
+    required this.onTrimB,
+    required this.onReset,
+  });
+
+  final bool trimClipA;
+  final bool trimClipB;
+  final bool rebuilding;
+  final bool enabled;
+  final VoidCallback onTrimA;
+  final VoidCallback onTrimB;
+  final VoidCallback onReset;
+
+  @override
+  Widget build(BuildContext context) {
+    final anyTrimmed = trimClipA || trimClipB;
+    return Column(
+      children: [
+        // Section label.
+        const Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.content_cut, color: Color(0xFFFF9800), size: 12),
+            SizedBox(width: 4),
+            Text(
+              'Stage 7.6 — Trim Proof',
+              style: TextStyle(
+                color: Color(0xFFFF9800),
+                fontSize: 10,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.5,
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 6),
+        // Trim buttons row.
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            // Trim Clip A.
+            _TrimButton(
+              label: trimClipA ? 'Clip A: 3s ✓' : 'Trim A → 3s',
+              active: trimClipA,
+              enabled: enabled && !trimClipA,
+              onTap: onTrimA,
+              color: Colors.red,
+            ),
+            const SizedBox(width: 8),
+            // Trim Clip B.
+            _TrimButton(
+              label: trimClipB ? 'Clip B: 3s ✓' : 'Trim B → 3s',
+              active: trimClipB,
+              enabled: enabled && !trimClipB,
+              onTap: onTrimB,
+              color: Colors.blue,
+            ),
+            const SizedBox(width: 8),
+            // Reset.
+            _TrimButton(
+              label: 'Reset',
+              active: false,
+              enabled: enabled && anyTrimmed,
+              onTap: onReset,
+              color: const Color(0xFF6C63FF),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+/// Single trim action button used by [_TrimControlRow].
+class _TrimButton extends StatelessWidget {
+  const _TrimButton({
+    required this.label,
+    required this.active,
+    required this.enabled,
+    required this.onTap,
+    required this.color,
+  });
+
+  final String label;
+  final bool active;
+  final bool enabled;
+  final VoidCallback onTap;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: enabled ? onTap : null,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 150),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: active
+              ? color.withValues(alpha: 0.25)
+              : (enabled
+                  ? color.withValues(alpha: 0.08)
+                  : Colors.white.withValues(alpha: 0.03)),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(
+            color: active
+                ? color.withValues(alpha: 0.8)
+                : (enabled
+                    ? color.withValues(alpha: 0.4)
+                    : Colors.white.withValues(alpha: 0.08)),
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: active
+                ? color
+                : (enabled ? Colors.white70 : Colors.white24),
+            fontSize: 10,
+            fontWeight: active ? FontWeight.w700 : FontWeight.normal,
+          ),
+        ),
+      ),
     );
   }
 }

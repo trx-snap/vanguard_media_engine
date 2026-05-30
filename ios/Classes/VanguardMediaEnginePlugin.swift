@@ -1357,7 +1357,136 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
             result(nil)
 
-        // ── Phase 7 Stage 7.5E: Timeline export proof ─────────────────────────
+        // ── Phase 7 Stage 7.6: Timeline trim update (tear-down-and-rebuild) ──────
+        //
+        // dev_updateTimeline proves that the timeline can be modified at runtime
+        // by tearing down the existing playback compositor and rebuilding it
+        // from an updated set of clip descriptors (with new trim values).
+        //
+        // Design (MOD-2): tear-down-and-rebuild, NOT hot-update:
+        //   1. Invalidate current _timelineRuntime (and its compositor) async.
+        //   2. Nil _timelineRuntime before starting the new one.
+        //   3. Generate clip paths using the same smoke-test fixtures as 7.5D.
+        //   4. Apply caller-supplied trim windows to the clip dicts.
+        //   5. Rebuild via _prepareTimelineCompositorWithSize — the exact same
+        //      path as dev_createTimelineTexture (useRealVideoClips branch).
+        //
+        // VGTimelineCompositorNode is NOT mutated in place.
+        //
+        // dev_updateTimeline args:
+        //   useRealVideoClips: Bool (optional, default false)
+        //     true  → 640×360 moving-pattern real H.264 clips
+        //     false → 320×240 solid-color synthetic clips
+        //   trimAStart: Double (optional, default 0.0) — Clip A trimStartSeconds
+        //   trimAEnd:   Double (optional, default 5.0) — Clip A trimEndSeconds
+        //   trimBStart: Double (optional, default 0.0) — Clip B trimStartSeconds
+        //   trimBEnd:   Double (optional, default 5.0) — Clip B trimEndSeconds
+        //
+        // Returns: { "textureId": Int64, "width": Int, "height": Int }
+        // On failure: FlutterError.
+        case "dev_updateTimeline":
+            let useRealVideoForUpdate = args?["useRealVideoClips"] as? Bool ?? false
+
+            // Read trim windows from Dart. Defaults match the 7.5E untrimmed baseline.
+            let trimAStart = (args?["trimAStart"] as? NSNumber)?.doubleValue ?? 0.0
+            let trimAEnd   = (args?["trimAEnd"]   as? NSNumber)?.doubleValue ?? 5.0
+            let trimBStart = (args?["trimBStart"] as? NSNumber)?.doubleValue ?? 0.0
+            let trimBEnd   = (args?["trimBEnd"]   as? NSNumber)?.doubleValue ?? 5.0
+
+            // Derived durations from trim windows.
+            let clipAEffectiveDuration = trimAEnd - trimAStart
+            let clipBEffectiveDuration = trimBEnd - trimBStart
+            let clipBStartTime         = clipAEffectiveDuration
+
+            // Step 1: Invalidate the existing timeline runtime (MOD-2).
+            // This tears down the compositor and display link without blocking.
+            if let oldRuntime = self._timelineRuntime {
+                oldRuntime.invalidateAsync {
+                    NSLog("[VanguardPlugin][7.6] old timeline runtime torn down")
+                }
+                self._timelineRuntime = nil
+            }
+
+            // Step 2: Choose render dimensions matching the source mode.
+            let updateWidth  = useRealVideoForUpdate ? 640 : 320
+            let updateHeight = useRealVideoForUpdate ? 360 : 240
+
+            // Step 3: Generate clip paths on a background queue (AVAssetWriter is
+            // synchronous and must not block the main thread).
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+
+                // Reuse the same smoke-test fixtures as dev_createTimelineTexture.
+                let clipPaths: [String: String]?
+                let clipIdPrefix: String
+                if useRealVideoForUpdate {
+                    clipPaths = VGTimelineCompositorSmokeTest.generateRealVideoClipPaths()
+                    clipIdPrefix = "update_real_clip"
+                } else {
+                    clipPaths = VGTimelineCompositorSmokeTest.generateSyntheticClipPaths()
+                    clipIdPrefix = "update_synthetic_clip"
+                }
+
+                guard
+                    let pathA = clipPaths?["clipAPath"],
+                    let pathB = clipPaths?["clipBPath"]
+                else {
+                    DispatchQueue.main.async {
+                        result(FlutterError(
+                            code: "CLIP_GENERATION_FAILED",
+                            message: "dev_updateTimeline: clip generation failed "
+                                   + "(requires DEBUG build)",
+                            details: nil))
+                    }
+                    return
+                }
+
+                // Step 4: Build updated clip dicts with the caller-supplied trim windows.
+                // Wire keys are identical to dev_createTimelineTexture.
+                let updatedClipDicts: [[String: Any]] = [
+                    [
+                        "id":               "\(clipIdPrefix)_A",
+                        "sourcePath":       pathA,
+                        "mediaKind":        "video",
+                        "startTimeSeconds": 0.0,
+                        "durationSeconds":  clipAEffectiveDuration,
+                        "trimStartSeconds": trimAStart,
+                        "trimEndSeconds":   trimAEnd,
+                        "speed":            1.0,
+                    ],
+                    [
+                        "id":               "\(clipIdPrefix)_B",
+                        "sourcePath":       pathB,
+                        "mediaKind":        "video",
+                        "startTimeSeconds": clipBStartTime,
+                        "durationSeconds":  clipBEffectiveDuration,
+                        "trimStartSeconds": trimBStart,
+                        "trimEndSeconds":   trimBEnd,
+                        "speed":            1.0,
+                    ],
+                ]
+
+                NSLog("[VanguardPlugin][7.6] rebuilding timeline "
+                    + "clipA=[%.1f…%.1f] clipB=[%.1f…%.1f] "
+                    + "totalDuration=%.1fs w=%d h=%d",
+                    trimAStart, trimAEnd,
+                    trimBStart, trimBEnd,
+                    clipAEffectiveDuration + clipBEffectiveDuration,
+                    updateWidth, updateHeight)
+
+                // Step 5: Rebuild via the established WithSize helper (MOD-2).
+                // This creates a new VGTimelineCompositorNode from the updated dicts.
+                DispatchQueue.main.async {
+                    self._prepareTimelineCompositorWithSize(
+                        clipDicts: updatedClipDicts,
+                        transitionDicts: [],
+                        width: updateWidth,
+                        height: updateHeight,
+                        result: result)
+                }
+            }
+
+        // ── Phase 7 Stage 7.5E/7.6: Timeline export proof ────────────────────────
         //
         // Runs a video-only offline timeline export using the same real-video
         // fixtures from Stage 7.5D. VGTimelineExportHelper builds an independent
@@ -1371,11 +1500,26 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         //   useRealVideoClips: Bool (optional, default false)
         //     true  → 640×360 moving-pattern real H.264 clips (7.5D fixtures)
         //     false → 320×240 solid-color synthetic clips (7.5C fixtures)
+        //   trimAStart: Double (optional, default 0.0) — Clip A trimStartSeconds
+        //   trimAEnd:   Double (optional, default 5.0) — Clip A trimEndSeconds
+        //   trimBStart: Double (optional, default 0.0) — Clip B trimStartSeconds
+        //   trimBEnd:   Double (optional, default 5.0) — Clip B trimEndSeconds
         //
         // Returns: { "success": Bool, "path": String, "durationSeconds": Double }
         // On failure: FlutterError.
         case "dev_timelineExport":
             let useRealVideoForExport = args?["useRealVideoClips"] as? Bool ?? false
+
+            // Stage 7.6 (MOD-4): read trim windows — default to untrimmed 5s+5s baseline.
+            let exportTrimAStart = (args?["trimAStart"] as? NSNumber)?.doubleValue ?? 0.0
+            let exportTrimAEnd   = (args?["trimAEnd"]   as? NSNumber)?.doubleValue ?? 5.0
+            let exportTrimBStart = (args?["trimBStart"] as? NSNumber)?.doubleValue ?? 0.0
+            let exportTrimBEnd   = (args?["trimBEnd"]   as? NSNumber)?.doubleValue ?? 5.0
+
+            // Derived durations and Clip B start time.
+            let exportClipADuration = exportTrimAEnd - exportTrimAStart
+            let exportClipBDuration = exportTrimBEnd - exportTrimBStart
+            let exportClipBStart    = exportClipADuration
 
             // Choose dimensions based on source mode.
             let exportWidth:  NSInteger = useRealVideoForExport ? 640 : 320
@@ -1416,32 +1560,35 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
                 // Build clip descriptor dictionaries — same wire contract as
                 // dev_createTimelineTexture (VGClipDescriptor.fromDictionary: keys).
+                // Stage 7.6 (MOD-4): uses trim values from Dart (exportTrimA*/exportTrimB*).
                 let clipDicts: [[String: Any]] = [
                     [
                         "id":               "\(clipIdPrefix)_A",
                         "sourcePath":       pathA,
                         "mediaKind":        "video",
                         "startTimeSeconds": 0.0,
-                        "durationSeconds":  5.0,
-                        "trimStartSeconds": 0.0,
-                        "trimEndSeconds":   5.0,
+                        "durationSeconds":  exportClipADuration,
+                        "trimStartSeconds": exportTrimAStart,
+                        "trimEndSeconds":   exportTrimAEnd,
                         "speed":            1.0,
                     ],
                     [
                         "id":               "\(clipIdPrefix)_B",
                         "sourcePath":       pathB,
                         "mediaKind":        "video",
-                        "startTimeSeconds": 5.0,
-                        "durationSeconds":  5.0,
-                        "trimStartSeconds": 0.0,
-                        "trimEndSeconds":   5.0,
+                        "startTimeSeconds": exportClipBStart,
+                        "durationSeconds":  exportClipBDuration,
+                        "trimStartSeconds": exportTrimBStart,
+                        "trimEndSeconds":   exportTrimBEnd,
                         "speed":            1.0,
                     ],
                 ]
 
-                NSLog("[VanguardPlugin][7.5E] starting export — clips=%d width=%ld height=%ld path=%@",
+                NSLog("[VanguardPlugin][7.5E/7.6] starting export — clips=%d width=%ld height=%ld trimA=[%.1f…%.1f] trimB=[%.1f…%.1f] path=%@",
                       clipDicts.count,
                       Int(exportWidth), Int(exportHeight),
+                      exportTrimAStart, exportTrimAEnd,
+                      exportTrimBStart, exportTrimBEnd,
                       exportOutputPath)
 
                 // Delegate to VGTimelineExportHelper — VGExportProfile is
@@ -1459,7 +1606,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     // Marshal result back to main thread for Flutter.
                     DispatchQueue.main.async {
                         if success, let outPath = outPath {
-                            NSLog("[VanguardPlugin][7.5E] export success: %.2fs %@",
+                            NSLog("[VanguardPlugin][7.5E/7.6] export success: %.2fs %@",
                                   duration, outPath)
                             result([
                                 "success":         true,
@@ -1472,7 +1619,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         } else {
                             let msg = error?.localizedDescription
                                       ?? "Timeline export failed (unknown error)"
-                            NSLog("[VanguardPlugin][7.5E] export failed: %@", msg)
+                            NSLog("[VanguardPlugin][7.5E/7.6] export failed: %@", msg)
                             result(FlutterError(
                                 code: "EXPORT_FAILED",
                                 message: msg,
@@ -1482,6 +1629,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
             }
         #endif // VG_USE_V2_GRAPH
+
 
         case "setPlaybackRate":
             guard let textureId = (args?["textureId"] as? NSNumber)?.int64Value,
