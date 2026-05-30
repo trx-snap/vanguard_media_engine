@@ -785,6 +785,237 @@ static BOOL _generateSyntheticVideo(NSString *path,
     return @{ @"clipAPath": pathA, @"clipBPath": pathB };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Moving-pattern video generator (Stage 7.5D)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Generate a moving-pattern H.264 MP4 video at the given path.
+///
+/// Each frame is filled with a solid BGRA base color, then overlaid with a
+/// 30-pixel-wide vertical white stripe that advances 4 pixels per frame,
+/// proving true inter-frame motion in the compressed H.264 bitstream.
+///
+/// Pixel addressing:
+///   base + y * bytesPerRow + x * 4  (byte-level, no stride / 4 assumption).
+///   BGRA channel order: [0]=B  [1]=G  [2]=R  [3]=A.
+///
+/// This function is SEPARATE from _generateSyntheticVideo and must never be
+/// merged with or called from _generateSyntheticVideo. The 7.5C solid-color
+/// path must remain entirely untouched.
+///
+/// @param path       Absolute file path for the output MP4.
+/// @param width      Video width in pixels.
+/// @param height     Video height in pixels.
+/// @param fps        Frames per second (timescale for CMTime).
+/// @param frameCount Total number of frames to encode.
+/// @param baseR      Base background red channel (0–255).
+/// @param baseG      Base background green channel (0–255).
+/// @param baseB      Base background blue channel (0–255).
+/// @return YES on success, NO on failure.
+static BOOL _generateMovingPatternVideo(NSString *path,
+                                        int width, int height,
+                                        int fps, int frameCount,
+                                        uint8_t baseR, uint8_t baseG, uint8_t baseB)
+{
+    // Remove any existing file at path.
+    [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+
+    NSURL *outputURL = [NSURL fileURLWithPath:path];
+    NSError *error = nil;
+
+    AVAssetWriter *writer = [AVAssetWriter assetWriterWithURL:outputURL
+                                                      fileType:AVFileTypeMPEG4
+                                                         error:&error];
+    if (!writer) {
+        os_log_error(sSmokeLog,
+                     "[7.5D] _generateMovingPatternVideo: AVAssetWriter init failed: %{public}@",
+                     error.localizedDescription);
+        return NO;
+    }
+
+    NSDictionary *outputSettings = @{
+        AVVideoCodecKey:  AVVideoCodecTypeH264,
+        AVVideoWidthKey:  @(width),
+        AVVideoHeightKey: @(height),
+    };
+
+    AVAssetWriterInput *input =
+        [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
+                                          outputSettings:outputSettings];
+    input.expectsMediaDataInRealTime = NO;
+
+    NSDictionary *pixelBufferAttributes = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferWidthKey:          @(width),
+        (id)kCVPixelBufferHeightKey:         @(height),
+    };
+
+    AVAssetWriterInputPixelBufferAdaptor *adaptor =
+        [[AVAssetWriterInputPixelBufferAdaptor alloc]
+            initWithAssetWriterInput:input
+            sourcePixelBufferAttributes:pixelBufferAttributes];
+
+    if (![writer canAddInput:input]) {
+        os_log_error(sSmokeLog, "[7.5D] _generateMovingPatternVideo: cannot add input to writer");
+        return NO;
+    }
+    [writer addInput:input];
+
+    if (![writer startWriting]) {
+        os_log_error(sSmokeLog,
+                     "[7.5D] _generateMovingPatternVideo: startWriting failed: %{public}@",
+                     writer.error.localizedDescription);
+        return NO;
+    }
+    [writer startSessionAtSourceTime:kCMTimeZero];
+
+    // Half-width of the moving white stripe (pixels on each side of centre).
+    const int kStripeHalfWidth = 15;
+    // Pixels the stripe centre advances per frame.
+    const int kStripeStep = 4;
+
+    // Write frames.
+    for (int i = 0; i < frameCount; i++) {
+        // Wait until the input is ready.
+        while (!input.readyForMoreMediaData) {
+            [NSThread sleepForTimeInterval:0.01];
+        }
+
+        // Create pixel buffer.
+        CVPixelBufferRef pb = NULL;
+        CVReturn status = CVPixelBufferPoolCreatePixelBuffer(
+            NULL, adaptor.pixelBufferPool, &pb);
+        if (status != kCVReturnSuccess || !pb) {
+            os_log_error(sSmokeLog,
+                         "[7.5D] _generateMovingPatternVideo: CVPixelBuffer creation failed at frame %d",
+                         i);
+            return NO;
+        }
+
+        CVPixelBufferLockBaseAddress(pb, 0);
+        uint8_t *base     = (uint8_t *)CVPixelBufferGetBaseAddress(pb);
+        // bytesPerRow is used in bytes — no /4 division so alignment padding is
+        // handled correctly on all ARM64 hardware configurations.
+        size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pb);
+        size_t bufHeight   = CVPixelBufferGetHeight(pb);
+
+        // Compute stripe centre x for this frame (wraps around width).
+        int stripeCentreX = (i * kStripeStep) % width;
+
+        for (size_t y = 0; y < bufHeight; y++) {
+            for (int x = 0; x < width; x++) {
+                // Byte-level BGRA pixel pointer.
+                // BGRA layout: [0]=B  [1]=G  [2]=R  [3]=A
+                uint8_t *p = base + y * bytesPerRow + (size_t)x * 4;
+
+                // Distance from stripe centre, wrapping around the width.
+                int dist = abs(x - stripeCentreX);
+                // Also check wrap-around distance so the stripe appears
+                // smoothly at the left edge when it exits the right edge.
+                int distWrap = width - dist;
+                BOOL inStripe = (dist < kStripeHalfWidth) || (distWrap < kStripeHalfWidth);
+
+                if (inStripe) {
+                    // White stripe — fully opaque.
+                    p[0] = 255; // B
+                    p[1] = 255; // G
+                    p[2] = 255; // R
+                    p[3] = 255; // A
+                } else {
+                    // Solid background color (BGRA channel order).
+                    p[0] = baseB; // B
+                    p[1] = baseG; // G
+                    p[2] = baseR; // R
+                    p[3] = 255;   // A
+                }
+            }
+        }
+
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+
+        CMTime presentationTime = CMTimeMake(i, fps);
+        if (![adaptor appendPixelBuffer:pb withPresentationTime:presentationTime]) {
+            os_log_error(sSmokeLog,
+                         "[7.5D] _generateMovingPatternVideo: appendPixelBuffer failed at frame %d: %{public}@",
+                         i, writer.error.localizedDescription);
+            CVPixelBufferRelease(pb);
+            return NO;
+        }
+        CVPixelBufferRelease(pb);
+    }
+
+    // Finish writing synchronously.
+    [input markAsFinished];
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [writer finishWritingWithCompletionHandler:^{
+        dispatch_semaphore_signal(sem);
+    }];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW,
+                                                (int64_t)(30.0 * NSEC_PER_SEC)));
+
+    if (writer.status != AVAssetWriterStatusCompleted) {
+        os_log_error(sSmokeLog,
+                     "[7.5D] _generateMovingPatternVideo: writer did not complete: "
+                     "status=%ld error=%{public}@",
+                     (long)writer.status, writer.error.localizedDescription);
+        return NO;
+    }
+
+    os_log(sSmokeLog,
+           "[7.5D] _generateMovingPatternVideo: written %{public}@ (%d frames, %dx%d @ %dfps)",
+           path, frameCount, width, height, fps);
+    return YES;
+}
+
+// ─── Phase 7 Stage 7.5D: generateRealVideoClipPaths ──────────────────────────
+//
+// Generates two moving-pattern H.264 MP4 clips to NSTemporaryDirectory for
+// use by the real-video playback proof (dev_createTimelineTexture with
+// useRealVideoClips=YES). The generated videos contain true inter-frame motion
+// (a scrolling white vertical stripe on a solid background), proving that
+// AVAssetReader is decompressing genuine H.264 content rather than static frames.
+//
+// File names:
+//   vg_playback_real_clip_A.mp4 — red base + moving stripe, 640×360, 5s @ 30fps.
+//   vg_playback_real_clip_B.mp4 — blue base + moving stripe, 640×360, 5s @ 30fps.
+//
+// Files are idempotent: regenerated only if absent.
+// Always delete and regenerate to avoid stale files from prior runs.
+
++ (NSDictionary<NSString *, NSString *> *)generateRealVideoClipPaths {
+    NSString *tempDir = NSTemporaryDirectory();
+    NSString *pathA   = [tempDir stringByAppendingPathComponent:@"vg_playback_real_clip_A.mp4"];
+    NSString *pathB   = [tempDir stringByAppendingPathComponent:@"vg_playback_real_clip_B.mp4"];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // Clip A: red base + moving white stripe, 640×360, 150 frames @ 30fps = 5.0s.
+    if (![fm fileExistsAtPath:pathA]) {
+        // Red base: R=220, G=50, B=50.
+        BOOL ok = _generateMovingPatternVideo(pathA, 640, 360, 30, 150, 220, 50, 50);
+        if (!ok) {
+            os_log_error(sSmokeLog,
+                         "[7.5D] generateRealVideoClipPaths: failed to generate clip A");
+            return nil;
+        }
+    }
+
+    // Clip B: blue base + moving white stripe, 640×360, 150 frames @ 30fps = 5.0s.
+    if (![fm fileExistsAtPath:pathB]) {
+        // Blue base: R=50, G=50, B=220.
+        BOOL ok = _generateMovingPatternVideo(pathB, 640, 360, 30, 150, 50, 50, 220);
+        if (!ok) {
+            os_log_error(sSmokeLog,
+                         "[7.5D] generateRealVideoClipPaths: failed to generate clip B");
+            return nil;
+        }
+    }
+
+    os_log(sSmokeLog,
+           "[7.5D] generateRealVideoClipPaths: A=%{public}@ B=%{public}@", pathA, pathB);
+    return @{ @"clipAPath": pathA, @"clipBPath": pathB };
+}
+
 @end
 
 #else // !DEBUG
@@ -810,6 +1041,11 @@ static BOOL _generateSyntheticVideo(NSString *path,
 
 + (nullable NSDictionary<NSString *, NSString *> *)generateSyntheticClipPaths {
     // Synthetic video generation is DEBUG-only.
+    return nil;
+}
+
++ (nullable NSDictionary<NSString *, NSString *> *)generateRealVideoClipPaths {
+    // Moving-pattern video generation is DEBUG-only.
     return nil;
 }
 

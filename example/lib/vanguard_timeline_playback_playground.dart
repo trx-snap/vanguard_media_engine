@@ -1,5 +1,17 @@
 // vanguard_timeline_playback_playground.dart
-// Vanguard Media Engine — Phase 7 Stage 7.5C: Visual Timeline Playback Proof
+// Vanguard Media Engine — Phase 7 Stage 7.5D: Real Video Timeline Playback Proof
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+// STAGE 7.5D — REAL VIDEO PROOF PLAYGROUND
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Extends Stage 7.5C by adding an opt-in "Real Video" source mode.
+// In Real Video mode the native layer generates true H.264 MP4 clips with a
+// moving white stripe pattern (via _generateMovingPatternVideo) instead of
+// solid-color synthetic frames. This proves that AVAssetReader is decompressing
+// genuine inter-frame H.264 content in the timeline pull loop.
+//
+// DEFAULT REMAINS SYNTHETIC so the 7.5C baseline still passes by default.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // STAGE 7.5C — VISUAL PROOF PLAYGROUND
@@ -108,6 +120,11 @@ class _VanguardTimelinePlaybackPlaygroundState
   /// Whether an async operation (create or seek) is in progress.
   bool _busy = true;
 
+  /// Source mode: when true, native generates real H.264 moving-pattern clips
+  /// (vg_playback_real_clip_A.mp4 / _B.mp4) instead of solid-color synthetic ones.
+  /// Default is false so Stage 7.5C baseline still works without toggling.
+  bool _useRealVideo = false;
+
   // ── Live-scrub throttle state ─────────────────────────────────────────────
 
   /// Timestamp of the last throttled native seek sent while dragging.
@@ -197,13 +214,14 @@ class _VanguardTimelinePlaybackPlaygroundState
     });
 
     try {
-      // Use useSyntheticClips=true: native generates real MP4 clips via
-      // VGTimelineCompositorSmokeTest.generateSyntheticClipPaths (DEBUG only).
-      // No 'clips' array needed — native auto-generates 2 clips:
-      //   Clip A: red  320×240 5s   Clip B: blue 320×240 5s
+      // useSyntheticClips: true  → native solid-color 7.5C clips (default).
+      // useRealVideoClips: true  → native moving-pattern H.264 clips (7.5D opt-in).
       final result = await _channel.invokeMapMethod<String, dynamic>(
         'dev_createTimelineTexture',
-        {'useSyntheticClips': true},
+        {
+          'useSyntheticClips': !_useRealVideo,
+          'useRealVideoClips': _useRealVideo,
+        },
       );
 
       if (!mounted) return;
@@ -301,11 +319,11 @@ class _VanguardTimelinePlaybackPlaygroundState
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.black,
-      appBar: AppBar(
+      appBar:   AppBar(
         backgroundColor: Colors.black,
         foregroundColor: Colors.white,
         title: const Text(
-          'Timeline Playback (7.5C)',
+          'Timeline Playback (7.5D)',
           style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
         ),
         actions: [
@@ -318,7 +336,7 @@ class _VanguardTimelinePlaybackPlaygroundState
               borderRadius: BorderRadius.circular(8),
             ),
             child: const Text(
-              'STAGE 7.5C',
+              'STAGE 7.5D',
               style: TextStyle(
                 color: Colors.white,
                 fontSize: 10,
@@ -411,14 +429,60 @@ class _VanguardTimelinePlaybackPlaygroundState
               ),
             ),
 
-            // ── Controls panel ──────────────────────────────────────────────
+            // ── Controls panel ──────────────────────────────────────────────────────
             Container(
               color: const Color(0xFF0D0D1A),
               padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  // Status row.
+                  // Source mode toggle (7.5D).
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text(
+                        'Synthetic',
+                        style: TextStyle(
+                          color: !_useRealVideo ? Colors.white : Colors.white38,
+                          fontSize: 12,
+                          fontWeight: !_useRealVideo
+                              ? FontWeight.w600
+                              : FontWeight.normal,
+                        ),
+                      ),
+                      Switch(
+                        value: _useRealVideo,
+                        onChanged: _busy
+                            ? null
+                            : (v) {
+                                // Opus-required pattern: clear texture before
+                                // dispose so the stale frame disappears immediately.
+                                setState(() {
+                                  _useRealVideo = v;
+                                  _textureId = null;
+                                  _playing = false;
+                                  _currentPTS = 0.0;
+                                  _seekDragValue = null;
+                                  _status = 'Switching source…';
+                                });
+                                _disposeTimeline().then((_) => _prepare());
+                              },
+                        activeThumbColor: const Color(0xFF6C63FF),
+                      ),
+                      Text(
+                        'Real Video',
+                        style: TextStyle(
+                          color: _useRealVideo ? Colors.white : Colors.white38,
+                          fontSize: 12,
+                          fontWeight: _useRealVideo
+                              ? FontWeight.w600
+                              : FontWeight.normal,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+
                   Text(
                     _status,
                     style: const TextStyle(

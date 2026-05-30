@@ -85,6 +85,29 @@ NS_ASSUME_NONNULL_BEGIN
 ///         or nil if clip generation failed.
 + (nullable NSDictionary<NSString *, NSString *> *)generateSyntheticClipPaths;
 
+/// Phase 7 Stage 7.5D: Generate and return paths to real moving-pattern H.264 MP4 clips.
+///
+/// Creates two 5-second H.264 MP4 clips in NSTemporaryDirectory, each containing
+/// a moving white vertical stripe on a solid color background. The per-frame
+/// motion guarantees genuine inter-frame encoding, proving that AVAssetReader
+/// is decompressing real H.264 content in the timeline pull loop.
+///
+///   - @"clipAPath": red base + moving stripe, 640×360 at vg_playback_real_clip_A.mp4
+///   - @"clipBPath": blue base + moving stripe, 640×360 at vg_playback_real_clip_B.mp4
+///
+/// These are distinct from the 7.5C solid-color synthetic clips. The generation
+/// logic lives in _generateMovingPatternVideo, which is entirely separate from
+/// _generateSyntheticVideo. The 7.5C path is untouched.
+///
+/// Files are cached (not regenerated if already present). Regenerate by deleting
+/// the files from NSTemporaryDirectory.
+///
+/// In RELEASE builds: returns nil (generation uses #if DEBUG AVAssetWriter code).
+///
+/// @return NSDictionary with @"clipAPath" and @"clipBPath" (both NSString) on success,
+///         or nil if clip generation failed.
++ (nullable NSDictionary<NSString *, NSString *> *)generateRealVideoClipPaths;
+
 @end
 
 NS_ASSUME_NONNULL_END

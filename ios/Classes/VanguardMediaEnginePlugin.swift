@@ -283,7 +283,63 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             result(["textureId": textureId, "width": 320, "height": 240])
         }
     }
+
+    // Phase 7 Stage 7.5D: variant of _prepareTimelineCompositor that returns
+    // caller-supplied width/height in the result map so Dart can size its
+    // Texture widget correctly for non-320×240 fixture resolutions.
+    // The original _prepareTimelineCompositor is NOT modified.
+    private func _prepareTimelineCompositorWithSize(
+        clipDicts: [[String: Any]],
+        transitionDicts: [[String: Any]],
+        width: Int,
+        height: Int,
+        result: @escaping FlutterResult
+    ) {
+        let compositorParams: [String: Any] = [
+            "descriptorStage": "7.5_executable",
+            "clips":           clipDicts,
+            "transitions":     transitionDicts,
+        ]
+
+        let videoOutPort = VGMediaPort.outputPort("video_out", mediaType: .video)
+        let ports: [VGMediaPort] = [videoOutPort]
+
+        let compositor: VGTimelineCompositorNode
+        do {
+            compositor = try VGTimelineCompositorNode(
+                nodeId:     "timeline_compositor",
+                parameters: compositorParams,
+                ports:      ports
+            )
+        } catch {
+            let msg = error.localizedDescription
+            NSLog("[VanguardPlugin][7.5D] compositor init failed: %@", msg)
+            result(FlutterError(code: "COMPOSITOR_INIT_FAILED",
+                                message: msg, details: nil))
+            return
+        }
+
+        let timelineRuntime = VanguardGraphRuntime(
+            textureRegistry: registrar.textures(),
+            methodChannel:   channel)
+        self._timelineRuntime = timelineRuntime
+
+        timelineRuntime.prepareTimeline(compositorNode: compositor) { textureId, err in
+            if let err = err {
+                NSLog("[VanguardPlugin][7.5D] prepareTimeline failed: %@",
+                      err.localizedDescription)
+                result(FlutterError(code: "PREPARE_TIMELINE_FAILED",
+                                    message: err.localizedDescription,
+                                    details: nil))
+                return
+            }
+            NSLog("[VanguardPlugin][7.5D] timeline texture ready textureId=%lld w=%d h=%d",
+                  textureId, width, height)
+            result(["textureId": textureId, "width": width, "height": height])
+        }
+    }
     #endif // VG_USE_V2_GRAPH
+
 
     /// PATCH-2: Async camera teardown for transitions that may have an active recording.
     /// Calls stopRecording(completion:) (no main-thread block) then invokes completion
@@ -1125,6 +1181,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // On failure: FlutterError.
 
             let useSyntheticClips = args?["useSyntheticClips"] as? Bool ?? false
+            // Stage 7.5D: opt-in real moving-pattern video clips flag.
+            let useRealVideoClips = args?["useRealVideoClips"] as? Bool ?? false
 
             // Resolve clip dicts: synthetic generation path or caller-supplied.
             let resolvedClipDicts: [[String: Any]]
@@ -1186,7 +1244,64 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 return
             }
 
-            // Non-synthetic path: use caller-supplied clips.
+            if useRealVideoClips {
+                // Stage 7.5D: Generate real moving-pattern H.264 MP4s on a background
+                // queue (AVAssetWriter is synchronous — must not block the main thread).
+                // Same dispatch pattern as the useSyntheticClips path above.
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self = self else { return }
+
+                    let paths = VGTimelineCompositorSmokeTest.generateRealVideoClipPaths()
+                    guard
+                        let pathA = paths?["clipAPath"],
+                        let pathB = paths?["clipBPath"]
+                    else {
+                        DispatchQueue.main.async {
+                            result(FlutterError(
+                                code: "REAL_CLIP_FAILED",
+                                message: "dev_createTimelineTexture: real-video clip generation failed "
+                                       + "(requires DEBUG build)",
+                                details: nil))
+                        }
+                        return
+                    }
+
+                    // Clip dicts use 640×360 resolution (matching _generateMovingPatternVideo).
+                    // VGClipDescriptor wire keys are identical to the synthetic path.
+                    let clipDictsForReal: [[String: Any]] = [
+                        [
+                            "id":               "real_clip_A",
+                            "sourcePath":       pathA,
+                            "mediaKind":        "video",
+                            "startTimeSeconds": 0.0,
+                            "durationSeconds":  5.0,
+                            "trimStartSeconds": 0.0,
+                            "trimEndSeconds":   5.0,
+                            "speed":            1.0,
+                        ],
+                        [
+                            "id":               "real_clip_B",
+                            "sourcePath":       pathB,
+                            "mediaKind":        "video",
+                            "startTimeSeconds": 5.0,
+                            "durationSeconds":  5.0,
+                            "trimStartSeconds": 0.0,
+                            "trimEndSeconds":   5.0,
+                            "speed":            1.0,
+                        ],
+                    ]
+                    DispatchQueue.main.async {
+                        self._prepareTimelineCompositorWithSize(
+                            clipDicts: clipDictsForReal,
+                            transitionDicts: [],
+                            width: 640,
+                            height: 360,
+                            result: result)
+                    }
+                }
+                return
+            }
+
             guard let callerClipDicts = args?["clips"] as? [[String: Any]] else {
                 result(FlutterError(
                     code: "BAD_ARGS",
