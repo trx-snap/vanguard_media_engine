@@ -1,19 +1,30 @@
 // vg_editor_controller_test.dart
-// Vanguard Media Engine — Phase 7 Stage 7.7
+// Vanguard Media Engine — Phase 7 Stage 7.8
 //
 // Pure Dart unit tests for VGEditorController using a mock MethodChannel.
 //
+// Phase 7.8 changes:
+//   - Production routes (createTimelineTexture, updateTimeline, timelinePlay,
+//     timelinePause, timelineSeek, exportTimeline, disposeTimeline) replace
+//     the legacy dev_* route names in the controller.
+//   - initialize() sends { 'draft': draft.toMap() }.
+//   - updateDraft() sends { 'draft': draft.toMap() }.
+//   - export() sends { 'draft': draft.toMap(), ...request.toMap() }.
+//   - Legacy dev_* mock handlers retained in separate group tests to verify
+//     the controller no longer calls them on production paths.
+//
 // Tests:
-//   - initialize() → isReady=true, textureId set
-//   - play() / pause() state transitions
-//   - updateDraft() → draft replaced, PTS reset
-//   - export() → result parsed from mock map
+//   - initialize() → invokes createTimelineTexture, sends draft payload
+//   - play() / pause() → invoke timelinePlay / timelinePause
+//   - seek() → invokes timelineSeek
+//   - updateDraft() → invokes updateTimeline, sends draft payload, resets PTS
+//   - export() → invokes exportTimeline, includes draft map
+//   - dispose() → invokes disposeTimeline
 //   - handleNativeCallback() → PTS/EOS state updates
 //   - dispose() idempotency
 //   - disposeAsync() is safe if called multiple times
-//
-// Pattern: uses TestDefaultBinaryMessengerBinding to install a mock handler
-// for the 'vanguard_media_engine' channel, mirroring vg_playback_session_test.dart.
+//   - useRealVideoClips is still accepted by constructor (backward compat)
+//   - Production routes do NOT send useRealVideoClips
 
 import 'dart:async';
 
@@ -106,24 +117,58 @@ void main() {
       expect(controller.value.durationSeconds,
           closeTo(draft.durationSeconds, 0.001));
     });
+
+    test('EC-1b useRealVideoClips constructor param is accepted (deprecated)',
+        () {
+      // ignore: deprecated_member_use
+      final controller = VGEditorController(
+        initialDraft: _twoClipDraft(),
+        // ignore: deprecated_member_use
+        useRealVideoClips: false,
+      );
+      addTearDown(() => controller.dispose());
+      // Should construct without error — backward compat only.
+      expect(controller, isNotNull);
+    });
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // initialize()
+  // initialize() — production route
   // ───────────────────────────────────────────────────────────────────────────
 
-  group('VGEditorController — initialize()', () {
-    test('EC-3  initialize sets isReady=true and textureId', () async {
+  group('VGEditorController — initialize() [production route]', () {
+    test('EC-3  initialize invokes createTimelineTexture (not dev_)', () async {
+      String? capturedMethod;
+      dynamic capturedArgs;
+
       _setMockHandler((method, args) async {
-        if (method == 'dev_createTimelineTexture') {
+        capturedMethod = method;
+        capturedArgs = args;
+        if (method == 'createTimelineTexture') {
           return {'textureId': 42, 'width': 640, 'height': 360};
         }
-        if (method == 'dev_disposeTimeline') return null;
+        if (method == 'disposeTimeline') return null;
         return null;
       });
 
       final controller = VGEditorController(initialDraft: _twoClipDraft());
+      await controller.initialize();
 
+      expect(capturedMethod, 'createTimelineTexture');
+      expect(capturedArgs, isA<Map>());
+      addTearDown(() => controller.dispose());
+    });
+
+    test('EC-3b initialize sets isReady=true and textureId', () async {
+      _setMockHandler((method, args) async {
+        if (method == 'createTimelineTexture') {
+          return {'textureId': 42, 'width': 640, 'height': 360};
+        }
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      final controller = VGEditorController(initialDraft: _twoClipDraft());
       await controller.initialize();
 
       expect(controller.value.isReady, isTrue);
@@ -131,13 +176,66 @@ void main() {
       addTearDown(() => controller.dispose());
     });
 
+    test('EC-3c initialize sends draft.toMap() under draft key', () async {
+      dynamic capturedArgs;
+
+      _setMockHandler((method, args) async {
+        if (method == 'createTimelineTexture') {
+          capturedArgs = args;
+          return {'textureId': 7, 'width': 640, 'height': 360};
+        }
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      final draft = _twoClipDraft();
+      final controller = VGEditorController(initialDraft: draft);
+      await controller.initialize();
+
+      expect(capturedArgs, isA<Map>());
+      final argsMap = capturedArgs as Map;
+      expect(argsMap.containsKey('draft'), isTrue,
+          reason: 'Production route must send draft key');
+      expect(argsMap['draft'], isA<Map>(),
+          reason: 'draft value must be a Map');
+      // Draft map must NOT be empty.
+      expect((argsMap['draft'] as Map).isNotEmpty, isTrue);
+      // Must include clips key.
+      expect((argsMap['draft'] as Map).containsKey('clips'), isTrue);
+      addTearDown(() => controller.dispose());
+    });
+
+    test('EC-3d initialize does NOT send useRealVideoClips on production route',
+        () async {
+      dynamic capturedArgs;
+
+      _setMockHandler((method, args) async {
+        if (method == 'createTimelineTexture') {
+          capturedArgs = args;
+          return {'textureId': 7, 'width': 640, 'height': 360};
+        }
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      final controller = VGEditorController(initialDraft: _twoClipDraft());
+      await controller.initialize();
+
+      final argsMap = capturedArgs as Map;
+      expect(argsMap.containsKey('useRealVideoClips'), isFalse,
+          reason: 'Production route must not send useRealVideoClips');
+      expect(argsMap.containsKey('useSyntheticClips'), isFalse,
+          reason: 'Production route must not send useSyntheticClips');
+      addTearDown(() => controller.dispose());
+    });
+
     test('EC-4  initialize throws if native returns negative textureId',
         () async {
       _setMockHandler((method, args) async {
-        if (method == 'dev_createTimelineTexture') {
+        if (method == 'createTimelineTexture') {
           return {'textureId': -1};
         }
-        if (method == 'dev_disposeTimeline') return null;
+        if (method == 'disposeTimeline') return null;
         return null;
       });
 
@@ -153,20 +251,23 @@ void main() {
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // play() / pause()
+  // play() / pause() — production routes
   // ───────────────────────────────────────────────────────────────────────────
 
-  group('VGEditorController — play() / pause()', () {
+  group('VGEditorController — play() / pause() [production routes]', () {
     late VGEditorController controller;
+    final List<String> calledMethods = [];
 
     setUp(() async {
+      calledMethods.clear();
       _setMockHandler((method, args) async {
+        calledMethods.add(method);
         switch (method) {
-          case 'dev_createTimelineTexture':
+          case 'createTimelineTexture':
             return {'textureId': 99, 'width': 640, 'height': 360};
-          case 'dev_timelinePlay':
-          case 'dev_timelinePause':
-          case 'dev_disposeTimeline':
+          case 'timelinePlay':
+          case 'timelinePause':
+          case 'disposeTimeline':
             return null;
           default:
             return null;
@@ -178,12 +279,28 @@ void main() {
 
     tearDown(() => controller.dispose());
 
-    test('EC-5  play() sets isPlaying=true', () async {
+    test('EC-5  play() invokes timelinePlay (not dev_timelinePlay)', () async {
+      calledMethods.clear();
+      await controller.play();
+      expect(calledMethods, contains('timelinePlay'));
+      expect(calledMethods, isNot(contains('dev_timelinePlay')));
+    });
+
+    test('EC-5b play() sets isPlaying=true', () async {
       await controller.play();
       expect(controller.value.isPlaying, isTrue);
     });
 
-    test('EC-6  pause() sets isPlaying=false', () async {
+    test('EC-6  pause() invokes timelinePause (not dev_timelinePause)',
+        () async {
+      await controller.play();
+      calledMethods.clear();
+      await controller.pause();
+      expect(calledMethods, contains('timelinePause'));
+      expect(calledMethods, isNot(contains('dev_timelinePause')));
+    });
+
+    test('EC-6b pause() sets isPlaying=false', () async {
       await controller.play();
       await controller.pause();
       expect(controller.value.isPlaying, isFalse);
@@ -204,21 +321,63 @@ void main() {
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // updateDraft()
+  // seek() — production route
   // ───────────────────────────────────────────────────────────────────────────
 
-  group('VGEditorController — updateDraft()', () {
+  group('VGEditorController — seek() [production route]', () {
     late VGEditorController controller;
+    final List<String> calledMethods = [];
 
     setUp(() async {
+      calledMethods.clear();
       _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        if (method == 'createTimelineTexture') {
+          return {'textureId': 55, 'width': 640, 'height': 360};
+        }
+        return null;
+      });
+      controller = VGEditorController(initialDraft: _twoClipDraft());
+      await controller.initialize();
+    });
+
+    tearDown(() => controller.dispose());
+
+    test('EC-SK1 seek() invokes timelineSeek (not dev_timelineSeek)', () async {
+      calledMethods.clear();
+      await controller.seek(2.5);
+      expect(calledMethods, contains('timelineSeek'));
+      expect(calledMethods, isNot(contains('dev_timelineSeek')));
+    });
+
+    test('EC-SK2 seek() updates currentPTS', () async {
+      await controller.seek(3.7);
+      expect(controller.value.currentPTS, closeTo(3.7, 0.001));
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // updateDraft() — production route
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorController — updateDraft() [production route]', () {
+    late VGEditorController controller;
+    final List<String> calledMethods = [];
+    dynamic capturedUpdateArgs;
+
+    setUp(() async {
+      calledMethods.clear();
+      capturedUpdateArgs = null;
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
         switch (method) {
-          case 'dev_createTimelineTexture':
+          case 'createTimelineTexture':
             return {'textureId': 10, 'width': 640, 'height': 360};
-          case 'dev_updateTimeline':
+          case 'updateTimeline':
+            capturedUpdateArgs = args;
             return {'textureId': 11, 'width': 640, 'height': 360};
-          case 'dev_timelinePause':
-          case 'dev_disposeTimeline':
+          case 'timelinePause':
+          case 'disposeTimeline':
             return null;
           default:
             return null;
@@ -230,7 +389,46 @@ void main() {
 
     tearDown(() => controller.dispose());
 
-    test('EC-9  updateDraft replaces draft and resets PTS', () async {
+    test('EC-9  updateDraft invokes updateTimeline (not dev_updateTimeline)',
+        () async {
+      calledMethods.clear();
+      final trimmedDraft = VGEditorDraft(
+        id: 'draft-test',
+        clips: [_clip(id: 'clip-A', trimEnd: 4.0), _clip(id: 'clip-B')],
+      );
+      await controller.updateDraft(trimmedDraft);
+      expect(calledMethods, contains('updateTimeline'));
+      expect(calledMethods, isNot(contains('dev_updateTimeline')));
+    });
+
+    test('EC-9b updateDraft sends draft.toMap() under draft key', () async {
+      final trimmedDraft = VGEditorDraft(
+        id: 'draft-test',
+        clips: [_clip(id: 'clip-A', trimEnd: 4.0), _clip(id: 'clip-B')],
+      );
+      await controller.updateDraft(trimmedDraft);
+
+      expect(capturedUpdateArgs, isA<Map>());
+      final argsMap = capturedUpdateArgs as Map;
+      expect(argsMap.containsKey('draft'), isTrue,
+          reason: 'Production updateTimeline must send draft key');
+      expect(argsMap['draft'], isA<Map>());
+      expect((argsMap['draft'] as Map).containsKey('clips'), isTrue);
+    });
+
+    test('EC-9c updateDraft does NOT send useRealVideoClips', () async {
+      final trimmedDraft = VGEditorDraft(
+        id: 'draft-test',
+        clips: [_clip(id: 'clip-A', trimEnd: 4.0), _clip(id: 'clip-B')],
+      );
+      await controller.updateDraft(trimmedDraft);
+
+      final argsMap = capturedUpdateArgs as Map;
+      expect(argsMap.containsKey('useRealVideoClips'), isFalse,
+          reason: 'Production route must not send useRealVideoClips');
+    });
+
+    test('EC-9d updateDraft replaces draft and resets PTS', () async {
       // Simulate PTS progress via handleNativeCallback.
       await controller.handleNativeCallback(
         const MethodCall('onTimelineFrame', {'pts': 3.5}),
@@ -266,18 +464,24 @@ void main() {
   });
 
   // ───────────────────────────────────────────────────────────────────────────
-  // export()
+  // export() — production route
   // ───────────────────────────────────────────────────────────────────────────
 
-  group('VGEditorController — export()', () {
+  group('VGEditorController — export() [production route]', () {
     late VGEditorController controller;
+    final List<String> calledMethods = [];
+    dynamic capturedExportArgs;
 
     setUp(() async {
+      calledMethods.clear();
+      capturedExportArgs = null;
       _setMockHandler((method, args) async {
+        calledMethods.add(method);
         switch (method) {
-          case 'dev_createTimelineTexture':
+          case 'createTimelineTexture':
             return {'textureId': 5, 'width': 640, 'height': 360};
-          case 'dev_timelineExport':
+          case 'exportTimeline':
+            capturedExportArgs = args;
             return {
               'success': true,
               'path': '/tmp/vg_timeline_export_proof.mp4',
@@ -285,8 +489,8 @@ void main() {
               'width': 640,
               'height': 360,
             };
-          case 'dev_disposeTimeline':
-          case 'dev_timelinePause':
+          case 'disposeTimeline':
+          case 'timelinePause':
             return null;
           default:
             return null;
@@ -297,6 +501,33 @@ void main() {
     });
 
     tearDown(() => controller.dispose());
+
+    test('EC-EX1 export() invokes exportTimeline (not dev_timelineExport)',
+        () async {
+      calledMethods.clear();
+      await controller.export(const VGEditorExportRequest());
+      expect(calledMethods, contains('exportTimeline'));
+      expect(calledMethods, isNot(contains('dev_timelineExport')));
+    });
+
+    test('EC-EX2 export() sends draft map under draft key', () async {
+      await controller.export(const VGEditorExportRequest());
+
+      expect(capturedExportArgs, isA<Map>());
+      final argsMap = capturedExportArgs as Map;
+      expect(argsMap.containsKey('draft'), isTrue,
+          reason: 'exportTimeline must send draft key');
+      expect(argsMap['draft'], isA<Map>());
+      expect((argsMap['draft'] as Map).containsKey('clips'), isTrue);
+    });
+
+    test('EC-EX3 export() does NOT send useRealVideoClips', () async {
+      await controller.export(const VGEditorExportRequest());
+
+      final argsMap = capturedExportArgs as Map;
+      expect(argsMap.containsKey('useRealVideoClips'), isFalse,
+          reason: 'Production export must not send useRealVideoClips');
+    });
 
     test('EC-11 export returns VGEditorExportResult on success', () async {
       final result = await controller.export(const VGEditorExportRequest());
@@ -312,6 +543,81 @@ void main() {
       await controller.export(const VGEditorExportRequest());
       expect(controller.value.isExporting, isFalse);
     });
+
+    test('EC-EX4 export() merges request fields with draft', () async {
+      await controller.export(
+        const VGEditorExportRequest(
+          outputPath: '/tmp/custom.mp4',
+          bitrateBps: 8000000,
+        ),
+      );
+
+      final argsMap = capturedExportArgs as Map;
+      expect(argsMap.containsKey('outputPath'), isTrue);
+      expect(argsMap['outputPath'], '/tmp/custom.mp4');
+      expect(argsMap['bitrateBps'], 8000000);
+      // draft key must still be present
+      expect(argsMap.containsKey('draft'), isTrue);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // dispose() — production route
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorController — dispose() [production route]', () {
+    test('EC-D1 disposeAsync() invokes disposeTimeline (not dev_)', () async {
+      final List<String> called = [];
+      _setMockHandler((method, args) async {
+        called.add(method);
+        return null;
+      });
+      final controller = VGEditorController(initialDraft: _twoClipDraft());
+      await controller.disposeAsync();
+      controller.dispose();
+
+      expect(called, contains('disposeTimeline'));
+      expect(called, isNot(contains('dev_disposeTimeline')));
+    });
+
+    test('EC-18 dispose() is idempotent', () {
+      _setMockHandler((method, args) async {
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+      final controller = VGEditorController(initialDraft: _twoClipDraft());
+      controller.dispose();
+      expect(() => controller.dispose(), returnsNormally);
+    });
+
+    test('EC-19 methods throw StateError after dispose', () async {
+      _setMockHandler((method, args) async {
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+      final controller = VGEditorController(initialDraft: _twoClipDraft());
+      controller.dispose();
+
+      await expectLater(
+        controller.initialize(),
+        throwsA(isA<StateError>()),
+      );
+      await expectLater(
+        controller.play(),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('EC-20 disposeAsync() is safe to call multiple times', () async {
+      _setMockHandler((method, args) async {
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+      final controller = VGEditorController(initialDraft: _twoClipDraft());
+      await controller.disposeAsync();
+      await expectLater(controller.disposeAsync(), completes);
+      controller.dispose();
+    });
   });
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -323,7 +629,7 @@ void main() {
 
     setUp(() {
       _setMockHandler((method, args) async {
-        if (method == 'dev_disposeTimeline') return null;
+        if (method == 'disposeTimeline') return null;
         return null;
       });
       controller = VGEditorController(initialDraft: _twoClipDraft());
@@ -350,9 +656,6 @@ void main() {
     });
 
     test('EC-15 onTimelineEOS sets isPlaying=false', () async {
-      // Manually set isPlaying=true for the test.
-      // (We can't call play() here as native isn't initialized.)
-      // Instead verify via EOS callback.
       await controller.handleNativeCallback(
         const MethodCall('onTimelineEOS', null),
       );
@@ -377,51 +680,6 @@ void main() {
         ),
         completes,
       );
-    });
-  });
-
-  // ───────────────────────────────────────────────────────────────────────────
-  // dispose() idempotency
-  // ───────────────────────────────────────────────────────────────────────────
-
-  group('VGEditorController — dispose()', () {
-    test('EC-18 dispose() is idempotent', () {
-      _setMockHandler((method, args) async {
-        if (method == 'dev_disposeTimeline') return null;
-        return null;
-      });
-      final controller = VGEditorController(initialDraft: _twoClipDraft());
-      controller.dispose();
-      expect(() => controller.dispose(), returnsNormally);
-    });
-
-    test('EC-19 methods throw StateError after dispose', () async {
-      _setMockHandler((method, args) async {
-        if (method == 'dev_disposeTimeline') return null;
-        return null;
-      });
-      final controller = VGEditorController(initialDraft: _twoClipDraft());
-      controller.dispose();
-
-      await expectLater(
-        controller.initialize(),
-        throwsA(isA<StateError>()),
-      );
-      await expectLater(
-        controller.play(),
-        throwsA(isA<StateError>()),
-      );
-    });
-
-    test('EC-20 disposeAsync() is safe to call multiple times', () async {
-      _setMockHandler((method, args) async {
-        if (method == 'dev_disposeTimeline') return null;
-        return null;
-      });
-      final controller = VGEditorController(initialDraft: _twoClipDraft());
-      await controller.disposeAsync();
-      await expectLater(controller.disposeAsync(), completes);
-      controller.dispose();
     });
   });
 

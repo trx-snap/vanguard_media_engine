@@ -338,6 +338,135 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             result(["textureId": textureId, "width": width, "height": height])
         }
     }
+
+    // Phase 7.8: Swift preflight validation helpers.
+    // These helpers perform high-level validation only. They do NOT re-parse clip
+    // data into new native structures. After validation the original clip/transition
+    // dicts are passed directly to VGTimelineCompositorNode via ObjC fromDictionary:.
+    //
+    // Apple documentation:
+    //   - FileManager.isReadableFile(atPath:): returns true if file exists and
+    //     the current process has read access. Docs: "Returns a Boolean value that
+    //     indicates whether the invoking object appears able to read a specified file."
+    //     (Foundation.FileManager — Apple Developer Documentation)
+    //   - URL(fileURLWithPath:) must be used for local POSIX paths — URL(string:)
+    //     is for RFC 3986 URI strings and will return nil or produce wrong results
+    //     for paths with spaces or special characters.
+    //     (Foundation.URL — Apple Developer Documentation)
+
+    /// Validates a clip dictionaries array for Phase 7.8 production routes.
+    ///
+    /// Checks per clip:
+    ///   - Non-empty `id`
+    ///   - `mediaKind == "video"` (Phase 7.8: video-only hard-cut constraint)
+    ///   - Non-empty `sourcePath`
+    ///   - `FileManager.default.isReadableFile(atPath: sourcePath)` = true
+    ///   - `trimStartSeconds >= 0`
+    ///   - `trimEndSeconds > trimStartSeconds`
+    ///   - If `durationSeconds > 0`: `trimEndSeconds <= durationSeconds`
+    ///
+    /// Returns a `FlutterError` on the first validation failure, or `nil` if all clips pass.
+    private func _preflightClips(_ clipDicts: [[String: Any]]) -> FlutterError? {
+        for (idx, clip) in clipDicts.enumerated() {
+            let clipId = clip["id"] as? String ?? "<unknown>"
+
+            // Validate id.
+            guard let id = clip["id"] as? String, !id.isEmpty else {
+                return FlutterError(
+                    code: "MISSING_SOURCE_PATH",
+                    message: "clips[\(idx)]: missing or empty id",
+                    details: nil)
+            }
+
+            // Validate mediaKind — video-only in Phase 7.8.
+            let mediaKind = clip["mediaKind"] as? String ?? ""
+            guard mediaKind == "video" else {
+                return FlutterError(
+                    code: "UNSUPPORTED_MEDIA_KIND",
+                    message: "clips[\(idx)] id=\(clipId): mediaKind '\(mediaKind)' "
+                           + "is not supported in Phase 7.8 (video-only)",
+                    details: nil)
+            }
+
+            // Validate sourcePath.
+            guard let sourcePath = clip["sourcePath"] as? String, !sourcePath.isEmpty else {
+                return FlutterError(
+                    code: "MISSING_SOURCE_PATH",
+                    message: "clips[\(idx)] id=\(clipId): sourcePath is missing or empty",
+                    details: nil)
+            }
+
+            // File readability check.
+            // Use FileManager.isReadableFile — the recommended API for checking
+            // read access before attempting AVAssetReader initialization.
+            // Security-scoped resources not implemented in Phase 7.8.
+            guard FileManager.default.isReadableFile(atPath: sourcePath) else {
+                return FlutterError(
+                    code: "FILE_UNREADABLE",
+                    message: "clips[\(idx)] id=\(clipId): "
+                           + "file does not exist or is unreadable at path: \(sourcePath)",
+                    details: nil)
+            }
+
+            // Validate trim range.
+            let trimStart = (clip["trimStartSeconds"] as? NSNumber)?.doubleValue ?? 0.0
+            let trimEnd   = (clip["trimEndSeconds"]   as? NSNumber)?.doubleValue ?? 0.0
+            let duration  = (clip["durationSeconds"]  as? NSNumber)?.doubleValue ?? 0.0
+
+            guard trimStart >= 0.0 else {
+                return FlutterError(
+                    code: "INVALID_TRIM_RANGE",
+                    message: "clips[\(idx)] id=\(clipId): "
+                           + "trimStartSeconds (\(trimStart)) must be >= 0",
+                    details: nil)
+            }
+            guard trimEnd > trimStart else {
+                return FlutterError(
+                    code: "INVALID_TRIM_RANGE",
+                    message: "clips[\(idx)] id=\(clipId): "
+                           + "trimEndSeconds (\(trimEnd)) must be > trimStartSeconds (\(trimStart))",
+                    details: nil)
+            }
+            if duration > 0.0 {
+                guard trimEnd <= duration else {
+                    return FlutterError(
+                        code: "INVALID_TRIM_RANGE",
+                        message: "clips[\(idx)] id=\(clipId): "
+                               + "trimEndSeconds (\(trimEnd)) exceeds durationSeconds (\(duration))",
+                        details: nil)
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Validates a transition dictionaries array for Phase 7.8 production routes.
+    ///
+    /// Phase 7.8 supports only hard cuts: `type == "none"` or `durationSeconds == 0.0`.
+    /// Any non-hard-cut transition returns a `COMPOSITOR_INIT_FAILED` FlutterError.
+    ///
+    /// Returns a `FlutterError` on the first invalid transition, or `nil` if all pass.
+    private func _preflightTransitions(_ transitionDicts: [[String: Any]]) -> FlutterError? {
+        for (idx, t) in transitionDicts.enumerated() {
+            let tId         = t["id"] as? String ?? "<unknown>"
+            let typeStr     = t["type"] as? String ?? "none"
+            let durationSec = (t["durationSeconds"] as? NSNumber)?.doubleValue ?? 0.0
+
+            let isHardCut = (typeStr == "none") || (durationSec == 0.0)
+            guard isHardCut else {
+                return FlutterError(
+                    code: "COMPOSITOR_INIT_FAILED",
+                    message: "transitions[\(idx)] id=\(tId): "
+                           + "type '\(typeStr)' with durationSeconds=\(durationSec) "
+                           + "is not a hard cut. Phase 7.8 supports only hard cuts "
+                           + "(type='none' or durationSeconds=0). "
+                           + "Fade/dissolve GPU blending is Phase 7.5B+.",
+                    details: nil)
+            }
+        }
+        return nil
+    }
+
     #endif // VG_USE_V2_GRAPH
 
 
@@ -1628,6 +1757,277 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     }
                 }
             }
+        // ── Phase 7.8: Production timeline routes ─────────────────────────────────
+        //
+        // These routes replace the dev_* proof routes for production use (DEC-140).
+        // They consume the full VGEditorDraft.toMap() payload from Dart under the
+        // 'draft' key. No fixture generation. No useRealVideoClips flag.
+        //
+        // Swift preflight:
+        //   1. Extracts and validates the 'draft' map.
+        //   2. Validates each clip: non-empty sourcePath, mediaKind=video,
+        //      FileManager.isReadableFile, valid trim range.
+        //   3. Validates transitions are hard-cuts only.
+        //   4. Passes validated clip/transition dicts directly to ObjC compositor
+        //      via _prepareTimelineCompositorWithSize (no re-parsing).
+        //
+        // Apple documentation compliance:
+        //   - URL(fileURLWithPath:) used for local POSIX paths (never URL(string:)).
+        //   - FileManager.default.isReadableFile(atPath:) gates all AVAssetReader creation.
+        //   - Security-scoped resources NOT implemented in Phase 7.8.
+        //     Calling app must copy files to readable sandbox location first.
+        //
+        // Legacy dev_* routes above remain intact for playground/test compatibility.
+
+        case "createTimelineTexture":
+            // Phase 7.8 production route: initialize timeline from a full VGEditorDraft.
+            //
+            // Args: { 'draft': draftMap }
+            // draftMap keys: id, clips, transitions, canvasWidth, canvasHeight, fps
+            // Returns: { 'textureId': Int64, 'width': Int, 'height': Int }
+            // On failure: FlutterError with specific code.
+            guard let draftMap = args?["draft"] as? [String: Any] else {
+                result(FlutterError(
+                    code: "MISSING_DRAFT",
+                    message: "createTimelineTexture: args['draft'] is missing or wrong type",
+                    details: nil))
+                return
+            }
+
+            let canvasWidth  = (draftMap["canvasWidth"]  as? NSNumber)?.intValue ?? 640
+            let canvasHeight = (draftMap["canvasHeight"] as? NSNumber)?.intValue ?? 360
+            // fps is informational in Phase 7.8 — not enforced natively.
+            let _ = (draftMap["fps"] as? NSNumber)?.intValue ?? 30
+
+            guard let clipDicts78 = draftMap["clips"] as? [[String: Any]],
+                  !clipDicts78.isEmpty else {
+                result(FlutterError(
+                    code: "EMPTY_CLIPS",
+                    message: "createTimelineTexture: draft.clips is missing or empty",
+                    details: nil))
+                return
+            }
+
+            // Swift preflight: validate each clip.
+            if let preflightError = _preflightClips(clipDicts78) {
+                result(preflightError)
+                return
+            }
+
+            // Validate transitions — hard-cuts only in Phase 7.8.
+            let transitionDicts78 = draftMap["transitions"] as? [[String: Any]] ?? []
+            if let transitionError = _preflightTransitions(transitionDicts78) {
+                result(transitionError)
+                return
+            }
+
+            // Tear down any existing timeline runtime before creating a new one.
+            if let oldRuntime = self._timelineRuntime {
+                oldRuntime.invalidateAsync {
+                    NSLog("[VanguardPlugin][7.8] createTimelineTexture: old runtime torn down")
+                }
+                self._timelineRuntime = nil
+            }
+
+            NSLog("[VanguardPlugin][7.8] createTimelineTexture: clips=%d w=%d h=%d",
+                  clipDicts78.count, canvasWidth, canvasHeight)
+
+            // Delegate to existing ObjC compositor path — no re-parsing.
+            _prepareTimelineCompositorWithSize(
+                clipDicts: clipDicts78,
+                transitionDicts: transitionDicts78,
+                width: canvasWidth,
+                height: canvasHeight,
+                result: result)
+
+        case "updateTimeline":
+            // Phase 7.8 production route: rebuild timeline from updated VGEditorDraft.
+            //
+            // Args: { 'draft': draftMap }
+            // Returns: { 'textureId': Int64, 'width': Int, 'height': Int }
+            // On failure: FlutterError.
+            guard let draftMapU = args?["draft"] as? [String: Any] else {
+                result(FlutterError(
+                    code: "MISSING_DRAFT",
+                    message: "updateTimeline: args['draft'] is missing or wrong type",
+                    details: nil))
+                return
+            }
+
+            let updateWidth  = (draftMapU["canvasWidth"]  as? NSNumber)?.intValue ?? 640
+            let updateHeight = (draftMapU["canvasHeight"] as? NSNumber)?.intValue ?? 360
+
+            guard let clipDictsU = draftMapU["clips"] as? [[String: Any]],
+                  !clipDictsU.isEmpty else {
+                result(FlutterError(
+                    code: "EMPTY_CLIPS",
+                    message: "updateTimeline: draft.clips is missing or empty",
+                    details: nil))
+                return
+            }
+
+            if let preflightError = _preflightClips(clipDictsU) {
+                result(preflightError)
+                return
+            }
+
+            let transitionDictsU = draftMapU["transitions"] as? [[String: Any]] ?? []
+            if let transitionError = _preflightTransitions(transitionDictsU) {
+                result(transitionError)
+                return
+            }
+
+            // Tear down existing runtime (MOD-2: tear-down-and-rebuild).
+            if let oldRuntime = self._timelineRuntime {
+                oldRuntime.invalidateAsync {
+                    NSLog("[VanguardPlugin][7.8] updateTimeline: old runtime torn down")
+                }
+                self._timelineRuntime = nil
+            }
+
+            NSLog("[VanguardPlugin][7.8] updateTimeline: clips=%d w=%d h=%d",
+                  clipDictsU.count, updateWidth, updateHeight)
+
+            _prepareTimelineCompositorWithSize(
+                clipDicts: clipDictsU,
+                transitionDicts: transitionDictsU,
+                width: updateWidth,
+                height: updateHeight,
+                result: result)
+
+        case "timelinePlay":
+            // Phase 7.8 production route: start timeline playback.
+            guard let runtime = self._timelineRuntime else {
+                result(FlutterError(code: "NO_TIMELINE",
+                                    message: "timelinePlay: no active timeline runtime",
+                                    details: nil))
+                return
+            }
+            runtime._timelinePlay()
+            result(nil)
+
+        case "timelinePause":
+            // Phase 7.8 production route: pause timeline playback.
+            guard let runtime = self._timelineRuntime else {
+                result(FlutterError(code: "NO_TIMELINE",
+                                    message: "timelinePause: no active timeline runtime",
+                                    details: nil))
+                return
+            }
+            runtime._timelinePause()
+            result(nil)
+
+        case "timelineSeek":
+            // Phase 7.8 production route: seek to position in seconds.
+            guard
+                let runtime = self._timelineRuntime,
+                let seconds  = (args?["seconds"] as? NSNumber)?.doubleValue
+            else {
+                result(FlutterError(code: "BAD_ARGS",
+                                    message: "timelineSeek: seconds required and timeline must be active",
+                                    details: nil))
+                return
+            }
+            runtime.seekTimeline(to: seconds)
+            result(nil)
+
+        case "exportTimeline":
+            // Phase 7.8 production route: export timeline from full VGEditorDraft.
+            //
+            // Args: { 'draft': draftMap, optionally outputPath, bitrateBps, width, height, fps }
+            // Returns: { 'success': Bool, 'path': String, 'durationSeconds': Double,
+            //            'width': Int, 'height': Int, 'fps': Int }
+            // On failure: FlutterError.
+            guard let draftMapE = args?["draft"] as? [String: Any] else {
+                result(FlutterError(
+                    code: "MISSING_DRAFT",
+                    message: "exportTimeline: args['draft'] is missing or wrong type",
+                    details: nil))
+                return
+            }
+
+            guard let clipDictsE = draftMapE["clips"] as? [[String: Any]],
+                  !clipDictsE.isEmpty else {
+                result(FlutterError(
+                    code: "EMPTY_CLIPS",
+                    message: "exportTimeline: draft.clips is missing or empty",
+                    details: nil))
+                return
+            }
+
+            if let preflightError = _preflightClips(clipDictsE) {
+                result(preflightError)
+                return
+            }
+
+            let transitionDictsE = draftMapE["transitions"] as? [[String: Any]] ?? []
+            if let transitionError = _preflightTransitions(transitionDictsE) {
+                result(transitionError)
+                return
+            }
+
+            // Export dimensions: caller-supplied request fields override draft canvas.
+            let exportW:   NSInteger = (args?["width"]  as? NSNumber)?.intValue
+                                       ?? (draftMapE["canvasWidth"]  as? NSNumber)?.intValue
+                                       ?? 640
+            let exportH:   NSInteger = (args?["height"] as? NSNumber)?.intValue
+                                       ?? (draftMapE["canvasHeight"] as? NSNumber)?.intValue
+                                       ?? 360
+            let exportFps: NSInteger = (args?["fps"] as? NSNumber)?.intValue
+                                       ?? (draftMapE["fps"] as? NSNumber)?.intValue
+                                       ?? 30
+            let exportBitrate: NSInteger = (args?["bitrateBps"] as? NSNumber)?.intValue ?? 2_000_000
+            let exportOutputPath: String = (args?["outputPath"] as? String)
+                                           ?? (NSTemporaryDirectory() + "vg_timeline_export_prod.mp4")
+
+            NSLog("[VanguardPlugin][7.8] exportTimeline: clips=%d w=%ld h=%ld fps=%ld bitrate=%ld path=%@",
+                  clipDictsE.count, Int(exportW), Int(exportH),
+                  Int(exportFps), Int(exportBitrate), exportOutputPath)
+
+            // Delegate to ObjC VGTimelineExportHelper — same path as dev_timelineExport.
+            // VGExportProfile is constructed entirely in ObjC (MOD-1, MOD-2).
+            VGTimelineExportHelper.exportTimeline(
+                withClips: clipDictsE,
+                outputPath: exportOutputPath,
+                width: exportW,
+                height: exportH,
+                fps: exportFps,
+                bitrateBps: exportBitrate
+            ) { success, outPath, duration, error in
+                DispatchQueue.main.async {
+                    if success, let outPath = outPath {
+                        NSLog("[VanguardPlugin][7.8] exportTimeline success: %.2fs %@",
+                              duration, outPath)
+                        result([
+                            "success":         true,
+                            "path":            outPath,
+                            "durationSeconds": duration,
+                            "width":           Int(exportW),
+                            "height":          Int(exportH),
+                            "fps":             Int(exportFps),
+                        ] as [String: Any])
+                    } else {
+                        let msg = error?.localizedDescription
+                                  ?? "Production timeline export failed (unknown error)"
+                        NSLog("[VanguardPlugin][7.8] exportTimeline failed: %@", msg)
+                        result(FlutterError(
+                            code: "COMPOSITOR_INIT_FAILED",
+                            message: msg,
+                            details: nil))
+                    }
+                }
+            }
+
+        case "disposeTimeline":
+            // Phase 7.8 production route: tear down the active timeline runtime.
+            if let runtime = self._timelineRuntime {
+                runtime.invalidateAsync {
+                    NSLog("[VanguardPlugin][7.8] disposeTimeline: runtime disposed")
+                }
+                self._timelineRuntime = nil
+            }
+            result(nil)
+
         #endif // VG_USE_V2_GRAPH
 
 

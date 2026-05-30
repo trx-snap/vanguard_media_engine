@@ -1,16 +1,15 @@
 // vg_editor_controller.dart
-// Vanguard Media Engine — Phase 7 Stage 7.7
+// Vanguard Media Engine — Phase 7 Stage 7.8
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// STAGE 7.7 — EDITOR CONTROLLER API
+// STAGE 7.8 — NATIVE INGESTION & PRODUCTION ROUTE HARDENING
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // VGEditorController is the formal Dart-side coordinator for the Phase 7
-// timeline editor API. It wraps the proven Phase 7.6 dev_ MethodChannel routes
-// behind a typed, lifecycle-safe, ValueNotifier-based interface.
+// timeline editor API. It wraps MethodChannel routes behind a typed,
+// lifecycle-safe, ValueNotifier-based interface.
 //
 // DESIGN PRINCIPLES:
-//   - Zero native changes. All native routes are the existing dev_ proof routes.
 //   - Controller does NOT call setMethodCallHandler (Opus M1).
 //     The owning widget/playground sets the handler and delegates to:
 //       controller.handleNativeCallback(call)
@@ -20,24 +19,32 @@
 //   - Concurrent operations are guarded by _busy flag.
 //   - All methods throw StateError after dispose.
 //
-// NATIVE METHOD CHANNEL ROUTES (dev_ proof paths, DEC-138):
-//   dev_createTimelineTexture → initialize()
-//   dev_timelinePlay          → play()
-//   dev_timelinePause         → pause()
-//   dev_timelineSeek          → seek()
-//   dev_updateTimeline        → updateDraft()
-//   dev_timelineExport        → export()
-//   dev_disposeTimeline       → disposeAsync()
+// PRODUCTION NATIVE METHOD CHANNEL ROUTES (Phase 7.8, DEC-140):
+//   createTimelineTexture → initialize()
+//   timelinePlay          → play()
+//   timelinePause         → pause()
+//   timelineSeek          → seek()
+//   updateTimeline        → updateDraft()
+//   exportTimeline        → export()
+//   disposeTimeline       → disposeAsync() / dispose()
+//
+// LEGACY DEV ROUTES (retained for playground compatibility, DEC-138):
+//   dev_createTimelineTexture  (accessed via legacy VGEditorController path
+//   dev_timelinePlay            when useRealVideoClips is explicitly set for
+//   dev_timelinePause           playground use)
+//   dev_timelineSeek
+//   dev_updateTimeline
+//   dev_timelineExport
+//   dev_disposeTimeline
 //
 // NATIVE CALLBACKS (delegated from owning widget):
 //   onTimelineFrame → handleNativeCallback → updates currentPTS + ptsStream
 //   onTimelineEOS   → handleNativeCallback → sets isPlaying=false + eosStream
 //
-// TEMPORARY PROOF FLAG:
-//   useRealVideoClips — constructor parameter, marked as dev/proof-only.
-//   The native dev_ routes currently generate fixture clips based on this flag
-//   rather than using the draft's sourcePaths. This is a Stage 7.7 limitation
-//   that will be resolved when native routes consume full VGEditorDraft maps.
+// PAYLOAD CONTRACT (Phase 7.8):
+//   Production routes send: { 'draft': draft.toMap() }
+//   The full VGEditorDraft is serialized and consumed natively.
+//   No fixture-generation flags are sent on production routes.
 
 import 'dart:async';
 
@@ -51,7 +58,7 @@ import 'vg_editor_value.dart';
 
 /// The formal Dart-side controller for the Phase 7 timeline editor API.
 ///
-/// [VGEditorController] coordinates the native `dev_*` MethodChannel routes
+/// [VGEditorController] coordinates native MethodChannel routes
 /// behind a typed, lifecycle-safe, [ValueNotifier]-based interface.
 ///
 /// ## Usage
@@ -84,7 +91,7 @@ import 'vg_editor_value.dart';
 ///
 /// ## Disposal (Opus M3)
 ///
-/// - [disposeAsync] performs the async native teardown (`dev_disposeTimeline`).
+/// - [disposeAsync] performs the async native teardown (`disposeTimeline`).
 /// - [dispose] is synchronous — it closes streams and calls `super.dispose()`.
 /// - In the owning widget's `dispose()`, call `disposeAsync()` first (if
 ///   `mounted` context permits), then `dispose()`.
@@ -94,15 +101,20 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// [channel] defaults to the shared `vanguard_media_engine` MethodChannel.
   /// Inject a different channel in tests to mock native behaviour.
   ///
-  /// [useRealVideoClips] — **proof-only, dev-internal flag**.
-  /// When true, the native `dev_*` routes generate real H.264 moving-pattern
-  /// clips instead of solid-color synthetic clips. This flag is passed through
-  /// the wire args because the current native dev routes use fixture clip
-  /// generation rather than the draft's [VGClipDescriptor.sourcePath] values.
-  /// Will be removed once native routes consume full draft maps.
+  /// [useRealVideoClips] — **deprecated, dev-internal flag**.
+  /// Previously controlled whether the native `dev_*` routes generate real
+  /// H.264 clips or solid-color synthetic clips. Retained for backward
+  /// compatibility with legacy dev routes and existing tests. Production
+  /// routes ignore this parameter entirely; they always consume the full
+  /// [VGEditorDraft.clips] sourcePath values (Phase 7.8, DEC-140).
   VGEditorController({
     required VGEditorDraft initialDraft,
     MethodChannel? channel,
+    @Deprecated(
+      'Phase 7.8: production editor routes consume real VGEditorDraft '
+      'sourcePath values. This flag is retained only for legacy dev routes.',
+    )
+    // ignore: deprecated_member_use_from_same_package
     this.useRealVideoClips = true,
   })  : _channel = channel ?? const MethodChannel('vanguard_media_engine'),
         super(VGEditorValue.initial(initialDraft));
@@ -111,14 +123,19 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
   final MethodChannel _channel;
 
-  // ── Dev proof flag ─────────────────────────────────────────────────────────
+  // ── Dev proof flag (deprecated) ────────────────────────────────────────────
 
-  /// **Dev/proof-only.** Controls whether the native layer generates real H.264
-  /// moving-pattern clips (true) or solid-color synthetic clips (false).
+  /// **Deprecated — dev/proof-only.** Controls whether legacy `dev_*` routes
+  /// generate real H.264 moving-pattern clips (true) or solid-color synthetic
+  /// clips (false).
   ///
-  /// This is a Stage 7.7 limitation — the native dev_ routes do not yet
-  /// consume the draft's [VGClipDescriptor.sourcePath] values. Will be removed
-  /// in a future stage when the native layer fully hydrates from the draft.
+  /// Production routes introduced in Phase 7.8 (DEC-140) ignore this flag
+  /// entirely. It is retained only for backward compatibility with the legacy
+  /// `dev_*` playground and existing tests. Will be removed in a future stage.
+  @Deprecated(
+    'Phase 7.8: production editor routes consume real VGEditorDraft '
+    'sourcePath values. This flag is retained only for legacy dev routes.',
+  )
   // ignore: diagnostic_describe_all_properties
   final bool useRealVideoClips;
 
@@ -209,11 +226,13 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
   /// Initializes the native timeline texture using the current draft.
   ///
-  /// Maps to `dev_createTimelineTexture`. On success, [value.textureId] is set
-  /// and [value.isReady] becomes true.
+  /// Maps to `createTimelineTexture` (Phase 7.8 production route, DEC-140).
+  /// Sends the full [VGEditorDraft] serialized under the `'draft'` key.
+  /// On success, [value.textureId] is set and [value.isReady] becomes true.
   ///
   /// Throws [StateError] if already disposed.
-  /// Throws [PlatformException] on native failure.
+  /// Throws [PlatformException] on native failure (e.g. FILE_UNREADABLE,
+  /// MISSING_DRAFT, EMPTY_CLIPS, UNSUPPORTED_MEDIA_KIND).
   Future<void> initialize() async {
     _assertNotDisposed();
     if (_busy) return;
@@ -228,10 +247,9 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
     try {
       final result = await _channel.invokeMapMethod<String, dynamic>(
-        'dev_createTimelineTexture',
+        'createTimelineTexture',
         {
-          'useSyntheticClips': !useRealVideoClips,
-          'useRealVideoClips': useRealVideoClips,
+          'draft': value.draft.toMap(),
         },
       );
 
@@ -250,6 +268,13 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
         statusMessage: 'Ready — ${value.draft.durationSeconds.toStringAsFixed(1)}s',
       );
       notifyListeners();
+    } on PlatformException catch (e) {
+      value = value.copyWith(
+        isReady: false,
+        statusMessage: 'Initialize error [${e.code}]: ${e.message}',
+      );
+      notifyListeners();
+      rethrow;
     } finally {
       _busy = false;
     }
@@ -259,7 +284,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
   /// Starts or resumes timeline playback.
   ///
-  /// Maps to `dev_timelinePlay`. No-op if already playing, not ready, or busy.
+  /// Maps to `timelinePlay` (Phase 7.8 production route).
+  /// No-op if already playing, not ready, or busy.
   ///
   /// Throws [StateError] if disposed.
   Future<void> play() async {
@@ -267,7 +293,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     if (!value.isReady || _busy || value.isPlaying) return;
 
     try {
-      await _channel.invokeMethod<void>('dev_timelinePlay');
+      await _channel.invokeMethod<void>('timelinePlay');
       value = value.copyWith(isPlaying: true, statusMessage: 'Playing');
       notifyListeners();
     } on PlatformException catch (e) {
@@ -279,7 +305,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
   /// Pauses timeline playback.
   ///
-  /// Maps to `dev_timelinePause`. No-op if already paused, not ready, or busy.
+  /// Maps to `timelinePause` (Phase 7.8 production route).
+  /// No-op if already paused, not ready, or busy.
   ///
   /// Throws [StateError] if disposed.
   Future<void> pause() async {
@@ -287,7 +314,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     if (!value.isReady || _busy || !value.isPlaying) return;
 
     try {
-      await _channel.invokeMethod<void>('dev_timelinePause');
+      await _channel.invokeMethod<void>('timelinePause');
       value = value.copyWith(
         isPlaying: false,
         statusMessage:
@@ -303,7 +330,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
   /// Seeks the timeline to [seconds].
   ///
-  /// Maps to `dev_timelineSeek`. No-op if not ready.
+  /// Maps to `timelineSeek` (Phase 7.8 production route).
+  /// No-op if not ready.
   ///
   /// Throws [StateError] if disposed.
   Future<void> seek(double seconds) async {
@@ -312,7 +340,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
     try {
       await _channel.invokeMethod<void>(
-        'dev_timelineSeek',
+        'timelineSeek',
         {'seconds': seconds},
       );
       value = value.copyWith(
@@ -331,12 +359,9 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
   /// Replaces the active draft and rebuilds the native timeline.
   ///
-  /// Maps to `dev_updateTimeline` (tear-down-and-rebuild pattern from 7.6).
+  /// Maps to `updateTimeline` (Phase 7.8 production route, DEC-140).
+  /// Sends the full [nextDraft] serialized under the `'draft'` key.
   /// Pauses playback before rebuild. Resets [currentPTS] to 0.0 on success.
-  ///
-  /// The native route uses [useRealVideoClips] and extracts trim values from
-  /// the first two clips in the draft. This is a Stage 7.7 limitation —
-  /// full draft → native mapping is deferred to a future stage.
   ///
   /// Throws [StateError] if disposed or busy.
   Future<void> updateDraft(VGEditorDraft nextDraft) async {
@@ -359,16 +384,10 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     notifyListeners();
 
     try {
-      // Extract trim state from the first two clips for the dev_ route.
-      // Stage 7.7: native dev_updateTimeline uses these four trim values
-      // rather than parsing the full VGEditorDraft map.
-      final trimArgs = _buildTrimArgs(nextDraft);
-
       final result = await _channel.invokeMapMethod<String, dynamic>(
-        'dev_updateTimeline',
+        'updateTimeline',
         {
-          'useRealVideoClips': useRealVideoClips,
-          ...trimArgs,
+          'draft': nextDraft.toMap(),
         },
       );
 
@@ -386,6 +405,13 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
             'Timeline rebuilt — ${nextDraft.durationSeconds.toStringAsFixed(1)}s',
       );
       notifyListeners();
+    } on PlatformException catch (e) {
+      value = value.copyWith(
+        isReady: false,
+        statusMessage: 'Rebuild error [${e.code}]: ${e.message}',
+      );
+      notifyListeners();
+      rethrow;
     } catch (e) {
       value = value.copyWith(
         isReady: false,
@@ -402,8 +428,11 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
   /// Exports the current draft as an MP4 video file.
   ///
-  /// Maps to `dev_timelineExport`. Creates an independent native compositor —
-  /// does not reuse the playback runtime. Pauses playback before export.
+  /// Maps to `exportTimeline` (Phase 7.8 production route, DEC-140).
+  /// Sends the full active [VGEditorDraft] under `'draft'` plus export
+  /// configuration fields from [request]. Creates an independent native
+  /// compositor — does not reuse the playback runtime.
+  /// Pauses playback before export.
   ///
   /// Returns a [VGEditorExportResult] on success.
   /// Throws [StateError] if disposed, not ready, or another export is running.
@@ -428,13 +457,10 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     notifyListeners();
 
     try {
-      final trimArgs = _buildTrimArgs(value.draft);
-
       final result = await _channel.invokeMapMethod<String, dynamic>(
-        'dev_timelineExport',
+        'exportTimeline',
         {
-          'useRealVideoClips': useRealVideoClips,
-          ...trimArgs,
+          'draft': value.draft.toMap(),
           ...request.toMap(),
         },
       );
@@ -461,6 +487,13 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
       );
       notifyListeners();
       return exportResult;
+    } on PlatformException catch (e) {
+      value = value.copyWith(
+        isExporting: false,
+        statusMessage: 'Export error [${e.code}]: ${e.message}',
+      );
+      notifyListeners();
+      rethrow;
     } catch (e) {
       value = value.copyWith(
         isExporting: false,
@@ -475,13 +508,14 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
   /// Asynchronously tears down the native timeline.
   ///
-  /// Maps to `dev_disposeTimeline`. Safe to call multiple times (idempotent).
+  /// Maps to `disposeTimeline` (Phase 7.8 production route).
+  /// Safe to call multiple times (idempotent).
   ///
   /// Call this before [dispose] in the owning widget's dispose lifecycle.
   Future<void> disposeAsync() async {
     if (_disposed) return;
     try {
-      await _channel.invokeMethod<void>('dev_disposeTimeline');
+      await _channel.invokeMethod<void>('disposeTimeline');
     } catch (_) {
       // Best-effort — native may already be gone.
     }
@@ -504,8 +538,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     _eosController.close();
 
     // Fire-and-forget native teardown if disposeAsync() was not called.
-    // This matches VanguardEngine._disposeSync() pattern (line 233).
-    _channel.invokeMethod<void>('dev_disposeTimeline').catchError((_) {});
+    _channel.invokeMethod<void>('disposeTimeline').catchError((_) {});
 
     super.dispose();
   }
@@ -518,24 +551,6 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
         '[VGEditorController] method called after dispose()',
       );
     }
-  }
-
-  /// Extracts the trim wire args expected by the native dev_ routes from the
-  /// active draft's first two clips.
-  ///
-  /// Stage 7.7: the native dev_ routes expect explicit trim args rather than
-  /// parsing a full draft map. This adapter maps the draft's clip trim windows
-  /// into the established 7.6 wire format.
-  Map<String, double> _buildTrimArgs(VGEditorDraft draft) {
-    final clipA = draft.clips.isNotEmpty ? draft.clips[0] : null;
-    final clipB = draft.clips.length > 1 ? draft.clips[1] : null;
-
-    return {
-      'trimAStart': clipA?.trimStartSeconds ?? 0.0,
-      'trimAEnd': clipA?.trimEndSeconds ?? 5.0,
-      'trimBStart': clipB?.trimStartSeconds ?? 0.0,
-      'trimBEnd': clipB?.trimEndSeconds ?? 5.0,
-    };
   }
 
   // ── Debug ──────────────────────────────────────────────────────────────────
