@@ -35,6 +35,12 @@ export 'vg_graph_transaction.dart';
 // Phase 7 Stage 7.1: non-destructive timeline descriptor models (pure data).
 export 'vg_clip_descriptor.dart';
 export 'vg_transition_descriptor.dart';
+// Phase 7 Stage 7.7: formal editor draft recipe and controller API.
+export 'vg_editor_draft.dart';
+export 'vg_editor_value.dart';
+export 'vg_editor_controller.dart';
+export 'vg_editor_export_request.dart';
+export 'vg_editor_export_result.dart';
 
 const String _libName = 'vanguard_media_engine';
 
