@@ -29,5 +29,5 @@
 #pragma once
 
 #ifndef VG_USE_V2_GRAPH
-#define VG_USE_V2_GRAPH 0
+#define VG_USE_V2_GRAPH 1
 #endif

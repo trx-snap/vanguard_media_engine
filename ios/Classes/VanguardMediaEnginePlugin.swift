@@ -241,23 +241,23 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         ]
 
         // Build port array: single video_out port.
-        let videoOutPort = VGMediaPort(
-            name:      "video_out",
-            mediaType: VGMediaTypeVideo,
-            required:  true,
-            direction: .output)
+        // VGMediaPort exposes class factory methods only — no instance initializer.
+        // VGMediaTypeVideo imports as .video; direction is implied by outputPort.
+        let videoOutPort = VGMediaPort.outputPort("video_out", mediaType: .video)
         let ports: [VGMediaPort] = [videoOutPort]
 
         // Initialize compositor.
-        var compositorError: NSError? = nil
-        guard let compositor = VGTimelineCompositorNode(
-            nodeId:     "timeline_compositor",
-            parameters: compositorParams,
-            ports:      ports,
-            error:      &compositorError
-        ) else {
-            let msg = compositorError?.localizedDescription
-                ?? "VGTimelineCompositorNode init returned nil"
+        // nullable instancetype + NSError ** imports into Swift as a throwing
+        // initializer — the error: parameter is consumed by the throws mechanism.
+        let compositor: VGTimelineCompositorNode
+        do {
+            compositor = try VGTimelineCompositorNode(
+                nodeId:     "timeline_compositor",
+                parameters: compositorParams,
+                ports:      ports
+            )
+        } catch {
+            let msg = error.localizedDescription
             NSLog("[VanguardPlugin][7.5C] compositor init failed: %@", msg)
             result(FlutterError(code: "COMPOSITOR_INIT_FAILED",
                                 message: msg, details: nil))
@@ -1154,22 +1154,26 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
                     let clipDictsForSynthetic: [[String: Any]] = [
                         [
-                            "url":            pathA,
-                            "trimStart":      0.0,
-                            "trimEnd":        5.0,
-                            "speed":          1.0,
-                            "mediaKind":      0,
-                            "startTimeSeconds":  0.0,
-                            "timelineDuration":  5.0,
+                            // Keys match VGClipDescriptor.fromDictionary: wire contract
+                            // exactly (kVGCD* constants in VGClipDescriptor.m).
+                            "id":               "playback_clip_A",
+                            "sourcePath":       pathA,
+                            "mediaKind":        "video",
+                            "startTimeSeconds": 0.0,
+                            "durationSeconds":  5.0,
+                            "trimStartSeconds": 0.0,
+                            "trimEndSeconds":   5.0,
+                            "speed":            1.0,
                         ],
                         [
-                            "url":            pathB,
-                            "trimStart":      0.0,
-                            "trimEnd":        5.0,
-                            "speed":          1.0,
-                            "mediaKind":      0,
-                            "startTimeSeconds":  5.0,
-                            "timelineDuration":  5.0,
+                            "id":               "playback_clip_B",
+                            "sourcePath":       pathB,
+                            "mediaKind":        "video",
+                            "startTimeSeconds": 5.0,
+                            "durationSeconds":  5.0,
+                            "trimStartSeconds": 0.0,
+                            "trimEndSeconds":   5.0,
+                            "speed":            1.0,
                         ],
                     ]
                     DispatchQueue.main.async {

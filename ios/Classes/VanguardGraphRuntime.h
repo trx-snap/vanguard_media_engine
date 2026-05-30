@@ -13,10 +13,20 @@
 //             VanguardImageMediaSource, VGResourceAllocator.
 
 #import "VanguardPlaybackTypes.h" // VGAudioRole — required for Phase 2 audio role APIs
+// Phase 4 Batch 3 / Phase 7 Stage 7.5C: imported OUTSIDE any #if guard so the
+// preprocessor can read VG_USE_V2_GRAPH before the guarded declarations below.
+#import "VGUseV2Graph.h"
 #import <Flutter/Flutter.h>
 #import <UMF/VGGraphRuntime.h>
 // P3-3 TRANSITIONAL — remove in Phase 4 (DEC-50, RR-31)
 #import <UMF/VGMetalFilterNode.h> // runtime-owned UMF filter node protocol
+
+// Phase 7 Stage 7.5C: forward-declare at file scope so the @interface below
+// can reference VGTimelineCompositorNode in method signatures when V2 is enabled.
+// @class is not valid inside an @interface body — it must appear at file scope.
+#if VG_USE_V2_GRAPH
+@class VGTimelineCompositorNode;
+#endif
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -177,9 +187,6 @@ NS_ASSUME_NONNULL_BEGIN
 // This is example-playground-only in Stage 7.5C (no public Dart API surface).
 
 #if VG_USE_V2_GRAPH
-#import "VGUseV2Graph.h"
-
-@class VGTimelineCompositorNode;
 
 /// Phase 7 Stage 7.5C: Prepare the runtime for timeline playback.
 ///
@@ -210,6 +217,21 @@ NS_ASSUME_NONNULL_BEGIN
 /// No-op if the runtime is not in the timeline playback state.
 - (void)seekTimelineTo:(double)seconds
     NS_SWIFT_NAME(seekTimeline(to:));
+
+/// Phase 7 Stage 7.5C: Start the timeline pull loop.
+/// Sets timelineIsPlaying = YES. The CADisplayLink is already running;
+/// this flag causes it to advance PTS on each tick.
+/// Must be called on the main thread.
+- (void)_timelinePlay
+    NS_SWIFT_NAME(_timelinePlay());
+
+/// Phase 7 Stage 7.5C: Pause the timeline pull loop.
+/// Sets timelineIsPlaying = NO. The CADisplayLink continues ticking so
+/// a paused seek (scrub) still delivers frames on demand.
+/// Must be called on the main thread.
+- (void)_timelinePause
+    NS_SWIFT_NAME(_timelinePause());
+
 #endif // VG_USE_V2_GRAPH
 
 @end

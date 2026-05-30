@@ -25,7 +25,7 @@ EXTERNAL SOURCES:
 SPEC CHECKSUMS:
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
   UMF: 6bf2b6ae15741ea3fa28a33794a06a724d629619
-  vanguard_media_engine: d52d6b473b4843fbbae496fff1cba233ac101c9e
+  vanguard_media_engine: a756a42c7f5ae58bfbd572439c5e3229dcc6f099
 
 PODFILE CHECKSUM: e79bd32f28b51bcf9a92a0ba8da552bf1c6fa50b
 

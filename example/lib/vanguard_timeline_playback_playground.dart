@@ -108,6 +108,16 @@ class _VanguardTimelinePlaybackPlaygroundState
   /// Whether an async operation (create or seek) is in progress.
   bool _busy = true;
 
+  // ── Live-scrub throttle state ─────────────────────────────────────────────
+
+  /// Timestamp of the last throttled native seek sent while dragging.
+  /// Reset to null when the slider is released.
+  DateTime? _lastScrubSeekAt;
+
+  /// Whether the timeline was playing when the user began dragging the slider.
+  /// Used to restore play state after the user releases the thumb.
+  bool _wasPlayingBeforeScrub = false;
+
   // ── Method channel handler ─────────────────────────────────────────────────
 
   @override
@@ -155,6 +165,29 @@ class _VanguardTimelinePlaybackPlaygroundState
     return null;
   }
 
+  // ── Live-scrub helpers ────────────────────────────────────────────────────
+
+  /// Sends a native seek only if ≥ 80 ms have elapsed since the last one.
+  ///
+  /// This prevents spamming [dev_timelineSeek] → [seekTimelineTo:] on every
+  /// sub-pixel drag delta, while still providing fluid visual updates
+  /// (~12 seeks/s at 80 ms, well within the CADisplayLink tick budget).
+  ///
+  /// Does NOT update [_seekDragValue] — the caller controls that separately
+  /// for smooth slider-thumb positioning independent of the native rate.
+  ///
+  /// Fire-and-forget: errors are logged via [_seekTo] internally.
+  void _throttledScrubSeek(double seconds) {
+    final now = DateTime.now();
+    if (_lastScrubSeekAt == null ||
+        now.difference(_lastScrubSeekAt!) >= const Duration(milliseconds: 80)) {
+      _lastScrubSeekAt = now;
+      // Seek without clearing _seekDragValue so the slider thumb keeps moving.
+      _channel.invokeMethod<void>('dev_timelineSeek', {'seconds': seconds})
+          .catchError((_) {});
+    }
+  }
+
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
   Future<void> _prepare() async {
@@ -194,11 +227,11 @@ class _VanguardTimelinePlaybackPlaygroundState
         _busy      = false;
         _status    = 'Ready — tap ▶ to play';
       });
-    } on PlatformException catch (e) {
+    } catch (e) {
       if (!mounted) return;
       setState(() {
         _busy   = false;
-        _status = 'Prepare error: ${e.message}';
+        _status = 'Prepare error: $e';
       });
     }
   }
@@ -398,15 +431,36 @@ class _VanguardTimelinePlaybackPlaygroundState
                   const SizedBox(height: 12),
 
                   // Seek slider.
+                  // onChangeStart — pause if playing; remember state for restore.
+                  // onChanged    — move thumb immediately + throttled native seek.
+                  // onChangeEnd  — final exact native seek + optional play resume.
                   _SeekSlider(
                     value: _seekDragValue ?? _currentPTS,
                     max: _kTimelineDuration,
                     enabled: _textureId != null && !_busy,
+                    onChangeStart: (v) {
+                      if (_playing) {
+                        _wasPlayingBeforeScrub = true;
+                        _pause();
+                      } else {
+                        _wasPlayingBeforeScrub = false;
+                      }
+                    },
                     onChanged: (v) {
                       setState(() => _seekDragValue = v);
+                      _throttledScrubSeek(v);
                     },
                     onChangeEnd: (v) {
+                      // Always send the exact final position.
                       _seekTo(v);
+                      _lastScrubSeekAt = null;
+                      if (_wasPlayingBeforeScrub) {
+                        _wasPlayingBeforeScrub = false;
+                        // Small delay so the seek frame settles before play.
+                        Future.delayed(const Duration(milliseconds: 120), () {
+                          if (mounted) _play();
+                        });
+                      }
                     },
                   ),
                   const SizedBox(height: 8),
@@ -579,6 +633,7 @@ class _SeekSlider extends StatelessWidget {
     required this.enabled,
     required this.onChanged,
     required this.onChangeEnd,
+    this.onChangeStart,
   });
 
   final double value;
@@ -586,6 +641,10 @@ class _SeekSlider extends StatelessWidget {
   final bool enabled;
   final ValueChanged<double> onChanged;
   final ValueChanged<double> onChangeEnd;
+
+  /// Called when the user first touches the slider thumb.
+  /// Optional — if absent, no drag-start behaviour is applied.
+  final ValueChanged<double>? onChangeStart;
 
   @override
   Widget build(BuildContext context) {
@@ -604,6 +663,7 @@ class _SeekSlider extends StatelessWidget {
         value: value.clamp(0.0, max),
         min: 0.0,
         max: max,
+        onChangeStart: enabled ? onChangeStart : null,
         onChanged: enabled ? onChanged : null,
         onChangeEnd: enabled ? onChangeEnd : null,
       ),

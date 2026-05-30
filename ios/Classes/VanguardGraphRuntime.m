@@ -27,10 +27,11 @@
 #import "VanguardImageProcessor.h"
 #import "VanguardMetalRenderer.h"
 // P4-10: filter node classes — required by setFilterChainFromSpecs: (RR-34)
-#import "VanguardLUTFilterNode.h"
 #import "VanguardBeautyFilterNode.h"
+#import "VanguardLUTFilterNode.h"
 #import "VanguardSegmentationFilterNode.h"
-// Phase 4B: Beauty V2 — opt-in only, never the default (Step 4 controlled wiring)
+// Phase 4B: Beauty V2 — opt-in only, never the default (Step 4 controlled
+// wiring)
 #import "BeautyV2FilterGroup.h"
 // Phase 4F: VGSegmentationNode — face detection + mask generation (DEC-100)
 #import "VGSegmentationNode.h"
@@ -40,18 +41,18 @@
 // read VG_USE_V2_GRAPH before encountering the guarded imports below.
 #import "VGUseV2Graph.h"
 #if VG_USE_V2_GRAPH
-#import "VGPlaybackGraphFactory.h"
 #import "VGGraphSchedulerV2.h"
+#import "VGPlaybackGraphFactory.h"
 #import <UMF/VGGraphExecutionContext.h>
 // Phase 7 Stage 7.5C: timeline playback proof factory and node.
-#import "VGTimelinePlaybackGraphFactory.h"
-#import "VGTimelineCompositorNode.h"
 #import "VGRendererSinkAdapter.h"
+#import "VGTimelineCompositorNode.h"
+#import "VGTimelinePlaybackGraphFactory.h"
+#import <QuartzCore/QuartzCore.h>
+#import <UMF/VGFrameEnvelope.h>
 #import <UMF/VGFrameRequest.h>
 #import <UMF/VGFrameResult.h>
-#import <UMF/VGFrameEnvelope.h>
 #import <UMF/VGRenderMode.h>
-#import <QuartzCore/QuartzCore.h>
 #endif
 
 // UMF shared infrastructure
@@ -130,19 +131,31 @@ static BOOL VGRIsImageURL(NSURL *url) {
 // Both properties remain nil on the V1 path (VG_USE_V2_GRAPH=0).
 #if VG_USE_V2_GRAPH
 @property(nonatomic, strong, nullable) VGGraphSchedulerV2 *schedulerV2;
-@property(nonatomic, strong, nullable) VGGraphExecutionContext *executionContext;
+@property(nonatomic, strong, nullable)
+    VGGraphExecutionContext *executionContext;
 // Phase 7 Stage 7.5C: timeline pull-loop state.
 // All nil/zero unless prepareWithTimelineCompositorNode:completion: was used.
-@property(nonatomic, strong, nullable) VGTimelineCompositorNode *timelineCompositor;
-@property(nonatomic, strong, nullable) VGRendererSinkAdapter *timelineSinkAdapter;
+@property(nonatomic, strong, nullable)
+    VGTimelineCompositorNode *timelineCompositor;
+@property(nonatomic, strong, nullable)
+    VGRendererSinkAdapter *timelineSinkAdapter;
 @property(nonatomic, strong, nullable) CADisplayLink *timelineDisplayLink;
 // Atomic generation counter for the pull loop seek invalidation.
 // Incremented on each seekTimelineTo: to flush stale in-flight pull requests.
 @property(atomic, assign) uint64_t timelineGeneration;
-// PTS tracking for the pull loop: advances by 1/fps per display link tick.
+// PTS tracking for the pull loop.
 // Protected by main-thread-only access (CADisplayLink fires on main thread).
 @property(nonatomic, assign) double timelineCurrentPTS;
 @property(nonatomic, assign) BOOL timelineIsPlaying;
+// [7.5C] Wall-clock playback clock anchors.
+// timelinePlayStartTime: CACurrentMediaTime() captured at play (or seek-while-playing).
+// timelineBasePTS: timelineCurrentPTS captured at that same moment.
+// Used to compute timelineCurrentPTS = timelineBasePTS + (CACurrentMediaTime() - timelinePlayStartTime).
+@property(nonatomic, assign) double timelinePlayStartTime;
+@property(nonatomic, assign) double timelineBasePTS;
+// When YES the display link must pull exactly one preview frame even while
+// paused, then clear this flag. Set on prepare and every seekTimelineTo:.
+@property(nonatomic, assign) BOOL timelineNeedsPreviewFrame;
 #endif
 
 @end
@@ -207,8 +220,9 @@ static BOOL VGRIsImageURL(NSURL *url) {
   _vg_state = VGRuntimeStateIdle;
   _vg_textureId = -1;
   _invalidated = NO;
-  _poolReleased = NO;    // P4-8: reset per-session on each new runtime instance
-  _sessionPoolBytes = 0; // P4-8: populated in prepareWithURL: after pool creation
+  _poolReleased = NO; // P4-8: reset per-session on each new runtime instance
+  _sessionPoolBytes =
+      0; // P4-8: populated in prepareWithURL: after pool creation
   _renderSize = CGSizeZero;
 
   // Serial FIFO queue for source/renderer setup and post-prepare operations.
@@ -450,8 +464,9 @@ static BOOL VGRIsImageURL(NSURL *url) {
     // P4-8: Store pool byte count as ivar so teardown paths can call
     // reportPoolReleased: with the exact reserved amount. poolBytes is a local
     // variable in this block and will be out of scope at invalidation time.
-    // Only store when a budget reservation was actually made — if budgetReserved
-    // is NO we must not later decrement a budget we never incremented.
+    // Only store when a budget reservation was actually made — if
+    // budgetReserved is NO we must not later decrement a budget we never
+    // incremented.
     self->_sessionPoolBytes = budgetReserved ? poolBytes : 0;
 
     // (e) Backfill pool to source now that both source and pool exist.
@@ -509,10 +524,13 @@ static BOOL VGRIsImageURL(NSURL *url) {
 
     // ── Phase 4 Batch 3: V2/V1 scheduler wiring gate ─────────────────────────
     //
-    // When VG_USE_V2_GRAPH=1: try to build the V2 graph via VGPlaybackGraphFactory.
-    //   On success: wire VGGraphSchedulerV2 as renderer.frameDelegate and start.
-    //   On failure: fall back to V1 VanguardGraphScheduler (same as #else below).
-    // When VG_USE_V2_GRAPH=0: V1 path compiled exclusively (pre-Batch-3 behavior).
+    // When VG_USE_V2_GRAPH=1: try to build the V2 graph via
+    // VGPlaybackGraphFactory.
+    //   On success: wire VGGraphSchedulerV2 as renderer.frameDelegate and
+    //   start. On failure: fall back to V1 VanguardGraphScheduler (same as
+    //   #else below).
+    // When VG_USE_V2_GRAPH=0: V1 path compiled exclusively (pre-Batch-3
+    // behavior).
 #if VG_USE_V2_GRAPH
     NSError *v2GraphError = nil;
     NSDictionary<NSString *, id> *v2GraphResult =
@@ -523,17 +541,17 @@ static BOOL VGRIsImageURL(NSURL *url) {
 
     if (v2GraphResult) {
       // ── V2 SUCCESS: wire V2 scheduler ───────────────────────────────────
-      VGGraphDescriptor                  *v2Descriptor = v2GraphResult[@"descriptor"];
-      NSDictionary<NSString *, id<VGNode>> *v2Nodes    = v2GraphResult[@"nodes"];
-      VGExecutionPlan                    *v2Plan        = v2GraphResult[@"plan"];
+      VGGraphDescriptor *v2Descriptor = v2GraphResult[@"descriptor"];
+      NSDictionary<NSString *, id<VGNode>> *v2Nodes = v2GraphResult[@"nodes"];
+      VGExecutionPlan *v2Plan = v2GraphResult[@"plan"];
 
       // Create execution context (pure data container — no lifecycle calls).
       VGGraphExecutionContext *v2Context =
           [[VGGraphExecutionContext alloc] initWithDescriptor:v2Descriptor
-                                                        plan:v2Plan
-                                                       nodes:v2Nodes
-                                                       clock:self.masterClock
-                                           resourceAllocator:allocator];
+                                                         plan:v2Plan
+                                                        nodes:v2Nodes
+                                                        clock:self.masterClock
+                                            resourceAllocator:allocator];
       self.executionContext = v2Context;
 
       // Create V2 scheduler.
@@ -555,15 +573,16 @@ static BOOL VGRIsImageURL(NSURL *url) {
       // Wire: renderer delivers raw frames to V2 scheduler.
       renderer.frameDelegate = v2Scheduler;
 
-      // Start the V2 scheduler so _running = YES before the first frame arrives.
+      // Start the V2 scheduler so _running = YES before the first frame
+      // arrives.
       //
       // startWithClock: sets _running=YES, calls [sourceNode startProducing],
       // and transitions context to VGGraphStateRunning.
       //
       // startProducing → VGFileSourceAdapter → [source start].
       // VanguardFileMediaSource.start is guarded by _started flag (idempotent).
-      // Frame delivery does NOT begin until VanguardMetalRenderer.play wires the
-      // CADisplayLink (_displayLinkFired → _renderFrameAtSourceTime:). So
+      // Frame delivery does NOT begin until VanguardMetalRenderer.play wires
+      // the CADisplayLink (_displayLinkFired → _renderFrameAtSourceTime:). So
       // calling startWithClock: here is safe — no frame can arrive before play.
       [v2Scheduler startWithClock:self.masterClock];
 
@@ -579,7 +598,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
       // VGPlaybackGraphFactory returned nil (validation or planning failure).
       // Log and create the V1 scheduler identically to the #else path below.
       NSLog(@"[VanguardGraphRuntime] V2 graph construction failed: %@ "
-            @"— falling back to V1 scheduler", v2GraphError);
+            @"— falling back to V1 scheduler",
+            v2GraphError);
 
       self.scheduler = [[VanguardGraphScheduler alloc] init];
       self.scheduler.sink = renderer;
@@ -775,9 +795,9 @@ static BOOL VGRIsImageURL(NSURL *url) {
   // Zeroing both ivars immediately prevents a concurrent second invalidateAsync
   // call from capturing the same pool pointer (invalidateAsync is idempotent
   // via _invalidated, but defence-in-depth here costs nothing).
-  CVPixelBufferPoolRef capturedPool  = _sessionPool;
-  NSUInteger capturedBytes           = _sessionPoolBytes;
-  _sessionPool      = NULL;
+  CVPixelBufferPoolRef capturedPool = _sessionPool;
+  NSUInteger capturedBytes = _sessionPoolBytes;
+  _sessionPool = NULL;
   _sessionPoolBytes = 0;
 
   dispatch_async(_prepareQueue, ^{
@@ -794,8 +814,9 @@ static BOOL VGRIsImageURL(NSURL *url) {
         //
         // Design (RR-37, DEC-59):
         //   Primary  — sentinel MTLCommandBuffer on a fresh queue created from
-        //              the allocator's shared Metal device. addCompletedHandler:
-        //              fires after the GPU drains all preceding IOSurface work.
+        //              the allocator's shared Metal device.
+        //              addCompletedHandler: fires after the GPU drains all
+        //              preceding IOSurface work.
         //   Fallback — dispatch_after(5s) fires unconditionally. If the fence
         //              handler already ran, the _poolReleased CAS makes this a
         //              no-op. If the device was lost, this is the only path.
@@ -804,8 +825,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
         //              double reportPoolReleased:. (DEC-59 idempotency rule)
         //
         // Note: we create a NEW command queue from allocator.metalDevice rather
-        // than accessing the renderer's private _commandQueue ivar (which is not
-        // exposed in VanguardMetalRenderer.h). The allocator uses the same
+        // than accessing the renderer's private _commandQueue ivar (which is
+        // not exposed in VanguardMetalRenderer.h). The allocator uses the same
         // system default MTLDevice — the sentinel drains the same GPU timeline.
 
         if (!capturedPool) {
@@ -813,10 +834,10 @@ static BOOL VGRIsImageURL(NSURL *url) {
         }
 
         id<MTLDevice> device = [VGResourceAllocator sharedInstance].metalDevice;
-        id<MTLCommandQueue> sentinelQueue = device ? [device newCommandQueue] : nil;
-        id<MTLCommandBuffer> sentinelBuf  = sentinelQueue
-                                           ? [sentinelQueue commandBuffer]
-                                           : nil;
+        id<MTLCommandQueue> sentinelQueue =
+            device ? [device newCommandQueue] : nil;
+        id<MTLCommandBuffer> sentinelBuf =
+            sentinelQueue ? [sentinelQueue commandBuffer] : nil;
 
         if (sentinelBuf) {
           // Primary path: GPU fence via addCompletedHandler:.
@@ -829,15 +850,18 @@ static BOOL VGRIsImageURL(NSURL *url) {
                     reportPoolReleased:capturedBytes];
               }
               NSLog(@"[VanguardGraphRuntime] P4-8: pool=%p released via "
-                    @"GPU fence", capturedPool);
+                    @"GPU fence",
+                    capturedPool);
             }
           }];
           [sentinelBuf commit];
         } else {
           // Device unavailable — fence cannot be submitted. The dispatch_after
           // fallback below is the only release path. Log for diagnostics.
-          NSLog(@"[VanguardGraphRuntime] P4-8: pool=%p Metal device unavailable "
-                @"— relying on dispatch_after fallback", capturedPool);
+          NSLog(
+              @"[VanguardGraphRuntime] P4-8: pool=%p Metal device unavailable "
+              @"— relying on dispatch_after fallback",
+              capturedPool);
         }
 
         // Fallback: unconditional 5-second timer (RR-37 mitigation).
@@ -846,8 +870,7 @@ static BOOL VGRIsImageURL(NSURL *url) {
         // If the device was lost and the fence never fires, this reclaims.
         dispatch_after(
             dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-            dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0),
-            ^{
+            dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
               BOOL already = atomic_exchange(&self->_poolReleased, YES);
               if (!already) {
                 CVPixelBufferPoolRelease(capturedPool);
@@ -952,12 +975,14 @@ static BOOL VGRIsImageURL(NSURL *url) {
   // [_sourceNode stopProducing] on the same underlying VanguardFileMediaSource
   // that the new graph shares, killing frame delivery. We rely on ARC + weak
   // frameDelegate: after step 4 no new frames route to the old scheduler.
-  // _running on the old scheduler becomes irrelevant once frameDelegate is swapped.
+  // _running on the old scheduler becomes irrelevant once frameDelegate is
+  // swapped.
   //
   // On rebuild failure: old scheduler kept active. No V1 fallback.
 #if VG_USE_V2_GRAPH
   if (self.schedulerV2) {
-    // Guard: bail out if source or renderer is nil (pre-prepare or invalidated).
+    // Guard: bail out if source or renderer is nil (pre-prepare or
+    // invalidated).
     if (!self.source || !self.renderer) {
       NSLog(@"[VanguardGraphRuntime] V2 hot-swap skipped: "
             @"source=%@ renderer=%@ (pre-prepare or invalidated)",
@@ -973,22 +998,22 @@ static BOOL VGRIsImageURL(NSURL *url) {
       if (!newGraph) {
         // Rebuild failed — keep old V2 scheduler. Do NOT fall back to V1.
         NSLog(@"[VanguardGraphRuntime] V2 graph rebuild failed: %@ "
-              @"— keeping current V2 scheduler", rebuildError);
+              @"— keeping current V2 scheduler",
+              rebuildError);
       } else {
         // Rebuild succeeded — construct and wire new scheduler.
-        VGGraphDescriptor                  *newDesc    = newGraph[@"descriptor"];
-        NSDictionary<NSString *, id<VGNode>> *newNodes  = newGraph[@"nodes"];
-        VGExecutionPlan                    *newPlan    = newGraph[@"plan"];
-        VGResourceAllocator                *allocator  =
-            [VGResourceAllocator sharedInstance];
+        VGGraphDescriptor *newDesc = newGraph[@"descriptor"];
+        NSDictionary<NSString *, id<VGNode>> *newNodes = newGraph[@"nodes"];
+        VGExecutionPlan *newPlan = newGraph[@"plan"];
+        VGResourceAllocator *allocator = [VGResourceAllocator sharedInstance];
 
         // Create new execution context.
         VGGraphExecutionContext *newCtx =
             [[VGGraphExecutionContext alloc] initWithDescriptor:newDesc
-                                                          plan:newPlan
-                                                         nodes:newNodes
-                                                         clock:self.masterClock
-                                             resourceAllocator:allocator];
+                                                           plan:newPlan
+                                                          nodes:newNodes
+                                                          clock:self.masterClock
+                                              resourceAllocator:allocator];
 
         // Create new V2 scheduler.
         VGGraphSchedulerV2 *newScheduler =
@@ -1007,26 +1032,30 @@ static BOOL VGRIsImageURL(NSURL *url) {
 
         if (!newSink) {
           // No sink found — treat as rebuild failure. Old scheduler survives.
-          NSLog(@"[VanguardGraphRuntime] V2 hot-swap: no VGFrameSink in new graph "
+          NSLog(@"[VanguardGraphRuntime] V2 hot-swap: no VGFrameSink in new "
+                @"graph "
                 @"— keeping current V2 scheduler");
         } else {
           newScheduler.sink = newSink;
 
           // Start new scheduler (_running = YES) BEFORE swapping frameDelegate.
-          // startWithClock: sets _running=YES and calls [_sourceNode startProducing].
-          // VanguardFileMediaSource.start is idempotent (_started flag guard);
-          // safe to call while source is already running via old scheduler.
+          // startWithClock: sets _running=YES and calls [_sourceNode
+          // startProducing]. VanguardFileMediaSource.start is idempotent
+          // (_started flag guard); safe to call while source is already running
+          // via old scheduler.
           [newScheduler startWithClock:self.masterClock];
 
           // ── ATOMIC SWAP ───────────────────────────────────────────────────
-          // renderer.frameDelegate is a weak property (VanguardMetalRenderer.h:147).
-          // ARC weak property assignment is atomic on ARM64 — thread-safe against
-          // a concurrent _onVideoFrame: call that loads _frameDelegate once.
+          // renderer.frameDelegate is a weak property
+          // (VanguardMetalRenderer.h:147). ARC weak property assignment is
+          // atomic on ARM64 — thread-safe against a concurrent _onVideoFrame:
+          // call that loads _frameDelegate once.
           //
           // After this point, new frames route to newScheduler.
-          // Old scheduler receives no new frames (frameDelegate no longer points to it).
-          // Old scheduler released by ARC when self.schedulerV2 is overwritten below.
-          self.schedulerV2    = newScheduler;
+          // Old scheduler receives no new frames (frameDelegate no longer
+          // points to it). Old scheduler released by ARC when self.schedulerV2
+          // is overwritten below.
+          self.schedulerV2 = newScheduler;
           self.executionContext = newCtx;
           self.renderer.frameDelegate = newScheduler;
           // (old scheduler and old context released by ARC here)
@@ -1056,7 +1085,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
       // accumulation (Beauty+Beauty+Beauty) and makes Clear correctly restore
       // the original image by applying an empty chain to the raw source buffer.
       CVPixelBufferRef raw = [imgSrc copyRawBuffer]; // +1 retain
-      if (!raw) return;
+      if (!raw)
+        return;
 
       CVPixelBufferRef filtered = [imgProc applyFilterChain:newChain
                                                    toBuffer:raw
@@ -1065,8 +1095,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
       // Push filtered buffer to renderer via the public GPU-sink API.
       VGFrameEnvelope envelope;
       memset(&envelope, 0, sizeof(envelope));
-      envelope.mediaType        = VGMediaTypeVideo;
-      envelope.pts              = kCMTimeZero;
+      envelope.mediaType = VGMediaTypeVideo;
+      envelope.pts = kCMTimeZero;
       envelope.payload.videoBuffer = (void *)filtered;
       [rend presentEnvelope:envelope];
 
@@ -1081,27 +1111,30 @@ static BOOL VGRIsImageURL(NSURL *url) {
 
 // P4-10: Spec-based filter chain construction (RR-34 closure).
 //
-// All three filter node classes (VanguardLUTFilterNode, VanguardBeautyFilterNode,
-// VanguardSegmentationFilterNode) declare `init` NS_UNAVAILABLE — they must be
-// constructed with initWithPool:device:. The Swift plugin layer has no access to
-// the runtime-owned CVPixelBufferPool or MTLDevice, so construction must happen
-// here where both resources are available (post-prepare).
+// All three filter node classes (VanguardLUTFilterNode,
+// VanguardBeautyFilterNode, VanguardSegmentationFilterNode) declare `init`
+// NS_UNAVAILABLE — they must be constructed with initWithPool:device:. The
+// Swift plugin layer has no access to the runtime-owned CVPixelBufferPool or
+// MTLDevice, so construction must happen here where both resources are
+// available (post-prepare).
 //
-// The method validates all type strings FIRST, then constructs + applies the chain
-// atomically via -setFilterChain: on success. On any unknown type it returns NO
-// and sets *unknown without mutating the chain.
+// The method validates all type strings FIRST, then constructs + applies the
+// chain atomically via -setFilterChain: on success. On any unknown type it
+// returns NO and sets *unknown without mutating the chain.
 - (BOOL)setFilterChainFromSpecs:(NSArray<NSDictionary *> *)specs
                         unknown:(NSString *__autoreleasing *_Nullable)unknown {
-  if (unknown) *unknown = nil;
+  if (unknown)
+    *unknown = nil;
 
   CVPixelBufferPoolRef pool = self.sessionPool;
-  id<MTLDevice> device     = [VGResourceAllocator sharedInstance].metalDevice;
+  id<MTLDevice> device = [VGResourceAllocator sharedInstance].metalDevice;
 
   // If the session pool or device is not yet available (called before prepare),
   // apply an empty chain. Callers should not invoke before prepare completes,
   // but we degrade gracefully rather than crashing.
   if (!pool || !device) {
-    NSLog(@"[VGRuntime] setFilterChainFromSpecs: pool or device nil (called before prepare?)");
+    NSLog(@"[VGRuntime] setFilterChainFromSpecs: pool or device nil (called "
+          @"before prepare?)");
     [self setFilterChain:@[]];
     return YES; // not an unknown-type error
   }
@@ -1115,8 +1148,10 @@ static BOOL VGRIsImageURL(NSURL *url) {
 
   for (NSDictionary *spec in specs) {
     NSString *type = spec[@"type"];
-    if (![type isKindOfClass:[NSString class]] || ![knownTypes containsObject:type]) {
-      if (unknown) *unknown = type ?: @"(nil)";
+    if (![type isKindOfClass:[NSString class]] ||
+        ![knownTypes containsObject:type]) {
+      if (unknown)
+        *unknown = type ?: @"(nil)";
       return NO;
     }
   }
@@ -1126,11 +1161,12 @@ static BOOL VGRIsImageURL(NSURL *url) {
       [NSMutableArray arrayWithCapacity:specs.count];
 
   for (NSDictionary *spec in specs) {
-    NSString *type       = spec[@"type"];
+    NSString *type = spec[@"type"];
     NSDictionary *params = spec[@"parameters"];
-    BOOL enabled         = [spec[@"enabled"] boolValue]; // nil → NO → fixed below
+    BOOL enabled = [spec[@"enabled"] boolValue]; // nil → NO → fixed below
     // Default enabled=YES when the key is absent (Dart default is true).
-    if (spec[@"enabled"] == nil) enabled = YES;
+    if (spec[@"enabled"] == nil)
+      enabled = YES;
 
     id<VGMetalFilterNode> node = nil;
 
@@ -1144,9 +1180,9 @@ static BOOL VGRIsImageURL(NSURL *url) {
       node = lut;
 
     } else if ([type isEqualToString:@"beauty"]) {
-      // ── Beauty version switch (Phase 4B Step 4) ─────────────────────────────
-      // V2 is opt-in only. V1 is the default for all existing and new specs.
-      // Select V2 when params contain:
+      // ── Beauty version switch (Phase 4B Step 4)
+      // ───────────────────────────── V2 is opt-in only. V1 is the default for
+      // all existing and new specs. Select V2 when params contain:
       //   "beautyVersion": 2   (preferred canonical key)
       //   "version": 2         (alternative accepted key)
       // Any other value, or no version key at all, selects V1 (RR-45 safe).
@@ -1170,8 +1206,9 @@ static BOOL VGRIsImageURL(NSURL *url) {
 
           // ── Optional param mapping (Phase 4B Step 6B) ────────────────────
           // Parameter precedence contract:
-          //   intensity alone  → useIntensityRamp=YES  (ramp drives all 5 params)
-          //   any granular key → useIntensityRamp=NO   (ramp disabled, explicit wins)
+          //   intensity alone  → useIntensityRamp=YES  (ramp drives all 5
+          //   params) any granular key → useIntensityRamp=NO   (ramp disabled,
+          //   explicit wins)
           //
           // Default: useIntensityRamp=YES (set in initWithPool:device:)
           // so absent keys leave the ramp active at intensity=0.75.
@@ -1179,7 +1216,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
             v2.intensity = [params[@"intensity"] floatValue];
             // Keep useIntensityRamp=YES (default) — intensity drives the ramp.
           }
-          // Granular params: each one disables the ramp and takes direct effect.
+          // Granular params: each one disables the ramp and takes direct
+          // effect.
           BOOL hasGranular = NO;
           if ([params[@"radius"] isKindOfClass:[NSNumber class]]) {
             v2.radius = [params[@"radius"] intValue];
@@ -1201,8 +1239,9 @@ static BOOL VGRIsImageURL(NSURL *url) {
             v2.theta = [params[@"theta"] floatValue];
             hasGranular = YES;
           }
-          // Phase 4B.5 (DEC-59): range sigma override — disables intensity ramp.
-          // Dart callers do not send this key; reserved for advanced dev/QA use.
+          // Phase 4B.5 (DEC-59): range sigma override — disables intensity
+          // ramp. Dart callers do not send this key; reserved for advanced
+          // dev/QA use.
           if ([params[@"rangeSigma"] isKindOfClass:[NSNumber class]]) {
             v2.rangeSigma = [params[@"rangeSigma"] floatValue];
             hasGranular = YES;
@@ -1253,8 +1292,10 @@ static BOOL VGRIsImageURL(NSURL *url) {
           if ([params[@"faceRosyStrength"] isKindOfClass:[NSNumber class]]) {
             v2.faceRosyStrength = [params[@"faceRosyStrength"] floatValue];
           }
-          if ([params[@"faceToneUnifyStrength"] isKindOfClass:[NSNumber class]]) {
-            v2.faceToneUnifyStrength = [params[@"faceToneUnifyStrength"] floatValue];
+          if ([params[@"faceToneUnifyStrength"]
+                  isKindOfClass:[NSNumber class]]) {
+            v2.faceToneUnifyStrength =
+                [params[@"faceToneUnifyStrength"] floatValue];
           }
           if ([params[@"faceGlowStrength"] isKindOfClass:[NSNumber class]]) {
             v2.faceGlowStrength = [params[@"faceGlowStrength"] floatValue];
@@ -1262,14 +1303,20 @@ static BOOL VGRIsImageURL(NSURL *url) {
           // Phase 4C.3 (DEC-76/78): feature protection & enhancement overrides.
           // Independent of the intensity ramp — do NOT set hasGranular.
           // When absent, ObjC defaults are used (0.40, 0.35, 0.25, 0.20).
-          if ([params[@"featureRestoreStrength"] isKindOfClass:[NSNumber class]]) {
-            v2.featureRestoreStrength = [params[@"featureRestoreStrength"] floatValue];
+          if ([params[@"featureRestoreStrength"]
+                  isKindOfClass:[NSNumber class]]) {
+            v2.featureRestoreStrength =
+                [params[@"featureRestoreStrength"] floatValue];
           }
-          if ([params[@"featureDetailRestore"] isKindOfClass:[NSNumber class]]) {
-            v2.featureDetailRestore = [params[@"featureDetailRestore"] floatValue];
+          if ([params[@"featureDetailRestore"]
+                  isKindOfClass:[NSNumber class]]) {
+            v2.featureDetailRestore =
+                [params[@"featureDetailRestore"] floatValue];
           }
-          if ([params[@"featureContrastBoost"] isKindOfClass:[NSNumber class]]) {
-            v2.featureContrastBoost = [params[@"featureContrastBoost"] floatValue];
+          if ([params[@"featureContrastBoost"]
+                  isKindOfClass:[NSNumber class]]) {
+            v2.featureContrastBoost =
+                [params[@"featureContrastBoost"] floatValue];
           }
           if ([params[@"featureSatBoost"] isKindOfClass:[NSNumber class]]) {
             v2.featureSatBoost = [params[@"featureSatBoost"] floatValue];
@@ -1284,7 +1331,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
             v2.lipEnhanceStrength = [params[@"lipEnhanceStrength"] floatValue];
           }
           if ([params[@"browEnhanceStrength"] isKindOfClass:[NSNumber class]]) {
-            v2.browEnhanceStrength = [params[@"browEnhanceStrength"] floatValue];
+            v2.browEnhanceStrength =
+                [params[@"browEnhanceStrength"] floatValue];
           }
           // Phase 4E (DEC-90/92): tone polish layer overrides.
           // Independent of the intensity ramp — do NOT set hasGranular.
@@ -1292,14 +1340,19 @@ static BOOL VGRIsImageURL(NSURL *url) {
           if ([params[@"polishGlowStrength"] isKindOfClass:[NSNumber class]]) {
             v2.polishGlowStrength = [params[@"polishGlowStrength"] floatValue];
           }
-          if ([params[@"polishSmoothStrength"] isKindOfClass:[NSNumber class]]) {
-            v2.polishSmoothStrength = [params[@"polishSmoothStrength"] floatValue];
+          if ([params[@"polishSmoothStrength"]
+                  isKindOfClass:[NSNumber class]]) {
+            v2.polishSmoothStrength =
+                [params[@"polishSmoothStrength"] floatValue];
           }
-          if ([params[@"polishWarmthStrength"] isKindOfClass:[NSNumber class]]) {
-            v2.polishWarmthStrength = [params[@"polishWarmthStrength"] floatValue];
+          if ([params[@"polishWarmthStrength"]
+                  isKindOfClass:[NSNumber class]]) {
+            v2.polishWarmthStrength =
+                [params[@"polishWarmthStrength"] floatValue];
           }
           if ([params[@"polishBloomStrength"] isKindOfClass:[NSNumber class]]) {
-            v2.polishBloomStrength = [params[@"polishBloomStrength"] floatValue];
+            v2.polishBloomStrength =
+                [params[@"polishBloomStrength"] floatValue];
           }
           if (hasGranular) {
             // Explicit granular params present — disable ramp so they survive
@@ -1333,12 +1386,14 @@ static BOOL VGRIsImageURL(NSURL *url) {
 
     } else if ([type isEqualToString:@"segmentation"]) {
       VanguardSegmentationFilterNode *seg =
-          [[VanguardSegmentationFilterNode alloc] initWithPool:pool device:device];
+          [[VanguardSegmentationFilterNode alloc] initWithPool:pool
+                                                        device:device];
       seg.enabled = enabled;
       node = seg;
     }
 
-    if (node) [nodes addObject:node];
+    if (node)
+      [nodes addObject:node];
   }
 
   // ── Phase 4F (DEC-100, DEC-109 UPDATE): always insert VGSegmentationNode ──
@@ -1360,7 +1415,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
       [finalNodes addObject:segNode];
       segInserted = YES;
       NSLog(@"[VGRuntime] VGSegmentationNode auto-inserted before BeautyV2 "
-             "(Phase 4F, enabled=%d)", (int)beauty.faceAwareEnabled);
+             "(Phase 4F, enabled=%d)",
+            (int)beauty.faceAwareEnabled);
     }
     [finalNodes addObject:n];
   }
@@ -1380,7 +1436,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
 /// Tier policy (mirrors VGPluginLifecycleObserver G-04 handler):
 ///   nominal / fair   → all nodes enabled
 ///   serious          → segmentation node(s) disabled; LUT and Beauty remain
-///   critical         → all nodes disabled (chain stays in place; zero GPU work)
+///   critical         → all nodes disabled (chain stays in place; zero GPU
+///   work)
 ///
 /// Thread-safety: called from main thread via VGPluginLifecycleObserver
 /// (registered with queue: .main). node.enabled is @property (nonatomic,
@@ -1421,7 +1478,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
 // directly on the VGMetalFilterNode objects in filterChainStorage.
 //
 // V2 path: VGLegacyFilterAdapter.enabled delegates to wrapped filter.enabled.
-// VGGraphSchedulerV2 checks transform.enabled and skips disabled nodes (DEC-55).
+// VGGraphSchedulerV2 checks transform.enabled and skips disabled nodes
+// (DEC-55).
 //
 // Algorithm:
 //   1. Empty chain → no-op.
@@ -1431,7 +1489,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
 //   5. Greedy-disable most expensive first until totalCostMs <= budget.
 //
 // Thread-safety: same main-thread write / _videoDecodeQueue read window as V1.
-// No lock required — identical race profile to VanguardGraphScheduler.m:121-125.
+// No lock required — identical race profile to
+// VanguardGraphScheduler.m:121-125.
 - (void)_applyThermalBudgetToChain:(NSArray<id<VGMetalFilterNode>> *)chain
                              state:(NSProcessInfoThermalState)state {
   if (!chain.count) {
@@ -1454,7 +1513,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
     budgetMs = 0.0f;
     break;
   default:
-    NSLog(@"[VanguardGraphRuntime] V2 applyThermalBudget: unknown state %ld — no-op",
+    NSLog(@"[VanguardGraphRuntime] V2 applyThermalBudget: unknown state %ld — "
+          @"no-op",
           (long)state);
     return;
   }
@@ -1477,15 +1537,18 @@ static BOOL VGRIsImageURL(NSURL *url) {
                    id<VGMetalFilterNode> a, id<VGMetalFilterNode> b) {
           float costA = a.estimatedGPUCostMs;
           float costB = b.estimatedGPUCostMs;
-          if (costA > costB) return NSOrderedAscending;  // most expensive first
-          if (costA < costB) return NSOrderedDescending;
+          if (costA > costB)
+            return NSOrderedAscending; // most expensive first
+          if (costA < costB)
+            return NSOrderedDescending;
           return NSOrderedSame;
         }];
 
     for (id<VGMetalFilterNode> node in sorted) {
-      if (totalCostMs <= budgetMs) break;
-      node.enabled  = NO;
-      totalCostMs  -= node.estimatedGPUCostMs;
+      if (totalCostMs <= budgetMs)
+        break;
+      node.enabled = NO;
+      totalCostMs -= node.estimatedGPUCostMs;
     }
   }
 
@@ -1511,14 +1574,13 @@ static BOOL VGRIsImageURL(NSURL *url) {
 - (void)_releaseSessionPool {
   if (_sessionPool) {
     CVPixelBufferPoolRef poolToRelease = _sessionPool;
-    NSUInteger bytesToRelease          = _sessionPoolBytes;
-    _sessionPool      = NULL;
+    NSUInteger bytesToRelease = _sessionPoolBytes;
+    _sessionPool = NULL;
     _sessionPoolBytes = 0;
 
     dispatch_after(
         dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
-        dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0),
-        ^{
+        dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
           BOOL already = atomic_exchange(&self->_poolReleased, YES);
           if (!already) {
             CVPixelBufferPoolRelease(poolToRelease);
@@ -1527,7 +1589,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
                   reportPoolReleased:bytesToRelease];
             }
             NSLog(@"[VanguardGraphRuntime] P4-8 dealloc: pool=%p released "
-                  @"via dispatch_after fallback", poolToRelease);
+                  @"via dispatch_after fallback",
+                  poolToRelease);
           }
         });
   }
@@ -1572,31 +1635,40 @@ static BOOL VGRIsImageURL(NSURL *url) {
 // Implementation pattern:
 //
 //   1. prepareWithTimelineCompositorNode:completion:
-//      - Dispatches off-main via _prepareQueue (matches prepareWithURL: contract).
+//      - Dispatches off-main via _prepareQueue (matches prepareWithURL:
+//      contract).
 //      - Calls prepareWithContext:completion: on the compositor node.
-//      - Creates a VanguardMetalRenderer (no media source — compositor drives frames).
+//      - Creates a VanguardMetalRenderer (no media source — compositor drives
+//      frames).
 //      - Builds the graph via VGTimelinePlaybackGraphFactory.
 //      - Registers a Flutter texture from the renderer.
-//      - Wires a CADisplayLink (target = self, selector = _timelineDisplayLinkFired:).
-//      - CADisplayLink is created on the main thread (CADisplayLink requirement).
+//      - Wires a CADisplayLink (target = self, selector =
+//      _timelineDisplayLinkFired:).
+//      - CADisplayLink is created on the main thread (CADisplayLink
+//      requirement).
 //      - completion fires on the main thread with textureId.
 //
 //   2. _timelineDisplayLinkFired:
 //      - Fires on the main thread at ~60fps (CADisplayLink default).
-//      - When timelineIsPlaying: advances timelineCurrentPTS by displayLink.duration.
+//      - When timelineIsPlaying: advances timelineCurrentPTS by
+//      displayLink.duration.
 //      - Creates VGFrameRequest at current PTS.
-//      - Calls [timelineCompositor pullFrame:request] on a background serial queue
+//      - Calls [timelineCompositor pullFrame:request] on a background serial
+//      queue
 //        (to avoid blocking the main thread for AVAssetReader decode work).
-//      - On VGFrameStatusDelivered: calls [timelineSinkAdapter presentEnvelope:]
+//      - On VGFrameStatusDelivered: calls [timelineSinkAdapter
+//      presentEnvelope:]
 //        → [renderer presentEnvelope:] → Flutter texture update.
 //      - On VGFrameStatusSkipped: no-op (stale generation after seek).
 //      - On VGFrameStatusEndOfStream: stops display link (pauses at EOS).
 //
 //   3. play / pause / seekTimelineTo:
 //      - play: sets timelineIsPlaying = YES (display link is already running).
-//      - pause: sets timelineIsPlaying = NO (display link still ticks for scrub).
+//      - pause: sets timelineIsPlaying = NO (display link still ticks for
+//      scrub).
 //      - seekTimelineTo: increments generation, updates currentPTS,
-//        calls [compositor seekTo:generation:], optionally pulls one preview frame.
+//        calls [compositor seekTo:generation:], optionally pulls one preview
+//        frame.
 //
 // Apple Framework Contract Verification:
 //
@@ -1622,16 +1694,18 @@ static BOOL VGRIsImageURL(NSURL *url) {
 //     - Delegates to [renderer presentEnvelope:].
 //     - renderer stores the CVPixelBuffer under os_unfair_lock (+1 retain)
 //       and dispatches textureFrameAvailable: to main queue.
-//     - Safe to call from the pull queue (VGRendererSinkAdapter is thread-safe).
+//     - Safe to call from the pull queue (VGRendererSinkAdapter is
+//     thread-safe).
 //
 //   VanguardMetalRenderer (no source):
 //     - initWithSource: requires a non-nil id<VanguardMediaSource>.
 //     - WORKAROUND for Stage 7.5C: we need the renderer for Flutter texture
 //       registration and Metal device access, but the source is the compositor.
 //     - The compositor is not a VanguardMediaSource (it's a UMF VGSourceNode).
-//     - Therefore: create the renderer with the compositor as a nil source stand-in
-//       by using a synthetic minimal source adapter that satisfies the renderer's
-//       init guard but never produces frames.
+//     - Therefore: create the renderer with the compositor as a nil source
+//     stand-in
+//       by using a synthetic minimal source adapter that satisfies the
+//       renderer's init guard but never produces frames.
 //     - This is the ONLY place a synthetic source adapter is used.
 //     - The renderer's CADisplayLink / decode-queue path is NEVER started
 //       (we never call renderer.play). All frame delivery goes through
@@ -1639,327 +1713,383 @@ static BOOL VGRIsImageURL(NSURL *url) {
 //
 // BLOCKED_BY_RUNTIME_INTEGRATION_GAP assessment:
 //   The issue is VanguardMetalRenderer requires a non-nil VanguardMediaSource.
-//   The compositor does NOT conform to VanguardMediaSource (it's a UMF VGSourceNode).
-//   RESOLUTION: we pass a zero-frame VanguardImageMediaSource as the
-//   nominal source to satisfy renderer's init. The display link is never
+//   The compositor does NOT conform to VanguardMediaSource (it's a UMF
+//   VGSourceNode). RESOLUTION: we pass a zero-frame VanguardImageMediaSource as
+//   the nominal source to satisfy renderer's init. The display link is never
 //   started, so the image source never produces frames. The compositor drives
 //   all frame delivery directly through VGRendererSinkAdapter.presentEnvelope:.
 //   This is safe because renderer.play is never called in this path.
-//   Reference: VanguardMetalRenderer.initWithSource:textureRegistry:methodChannel:
+//   Reference:
+//   VanguardMetalRenderer.initWithSource:textureRegistry:methodChannel:
 //              sessionPool: does not call [source start] at init time.
 
 #if VG_USE_V2_GRAPH
 
-// ─── Pull queue (created once per runtime, shared across sessions) ─────────────
+// ─── Pull queue (created once per runtime, shared across sessions)
+// ─────────────
 static dispatch_queue_t _VGTimelinePullQueue(void) {
-    static dispatch_queue_t q;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        q = dispatch_queue_create("com.vanguard.timeline.pull", DISPATCH_QUEUE_SERIAL);
-    });
-    return q;
+  static dispatch_queue_t q;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    q = dispatch_queue_create("com.vanguard.timeline.pull",
+                              DISPATCH_QUEUE_SERIAL);
+  });
+  return q;
 }
 
-// ─── prepareWithTimelineCompositorNode:completion: ────────────────────────────
+// ─── prepareWithTimelineCompositorNode:completion:
+// ────────────────────────────
 
-- (void)prepareWithTimelineCompositorNode:(VGTimelineCompositorNode *)compositorNode
-                               completion:(void (^)(int64_t textureId,
-                                                    NSError *_Nullable error))completion
-{
-    NSParameterAssert(compositorNode != nil);
-    NSParameterAssert(completion != nil);
+- (void)
+    prepareWithTimelineCompositorNode:(VGTimelineCompositorNode *)compositorNode
+                           completion:
+                               (void (^)(int64_t textureId,
+                                         NSError *_Nullable error))completion {
+  NSParameterAssert(compositorNode != nil);
+  NSParameterAssert(completion != nil);
 
-    dispatch_async(_prepareQueue, ^{
-        // ── Guard ──────────────────────────────────────────────────────────
-        if (self->_invalidated) {
-            NSError *err = [NSError
+  dispatch_async(_prepareQueue, ^{
+    // ── Guard ──────────────────────────────────────────────────────────
+    if (self->_invalidated) {
+      NSError *err =
+          [NSError errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
+                              code:1
+                          userInfo:@{
+                            NSLocalizedDescriptionKey :
+                                @"[7.5C] Runtime already invalidated."
+                          }];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        completion(-1, err);
+      });
+      return;
+    }
+
+    // ── 1. Prepare the compositor node ─────────────────────────────────
+    //
+    // VGGraphExecutionContext is required by prepareWithContext:completion:.
+    // We create a minimal context. The compositor reads renderSize from it
+    // during prepare to configure its AVAssetReader output settings.
+    VGResourceAllocator *allocator = [VGResourceAllocator sharedInstance];
+    VGGraphExecutionContext *ctx =
+        [[VGGraphExecutionContext alloc] initWithDescriptor:nil
+                                                       plan:nil
+                                                      nodes:@{}
+                                                      clock:nil
+                                          resourceAllocator:allocator];
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block NSError *prepError = nil;
+
+    [compositorNode prepareWithContext:ctx
+                            completion:^(NSError *err) {
+                              prepError = err;
+                              dispatch_semaphore_signal(sem);
+                            }];
+
+    dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+
+    if (prepError || self->_invalidated) {
+      NSError *err =
+          prepError
+              ?: [NSError errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
+                                     code:1
+                                 userInfo:@{
+                                   NSLocalizedDescriptionKey :
+                                       @"[7.5C] Runtime invalidated during "
+                                       @"compositor prepare."
+                                 }];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        completion(-1, err);
+      });
+      return;
+    }
+
+    // ── 2. Create renderer with a minimal image source stand-in ────────
+    //
+    // VanguardMetalRenderer.initWithSource: requires non-nil
+    // id<VanguardMediaSource>. VGTimelineCompositorNode is a UMF VGSourceNode,
+    // not a VanguardMediaSource.
+    //
+    // Resolution (see Apple Framework Contract above):
+    //   Pass a VanguardImageMediaSource backed by a zero-frame synthetic
+    //   asset. The renderer's CADisplayLink / decode path is NEVER started
+    //   (we do not call renderer.play). All frame delivery is via
+    //   VGRendererSinkAdapter.presentEnvelope: from our pull loop.
+    //
+    // We use the standard 1×1 pixel transparent PNG inline (no bundled asset,
+    // MOD-6 compliant). VanguardImageMediaSource reads it; the render size
+    // will be 1×1, but the compositor provides 1920×1080 buffers anyway.
+    //
+    // NOTE: This is the ONLY approved workaround in Stage 7.5C for the
+    // renderer-requires-source constraint. It must be revisited in Stage 7.6
+    // when VanguardMetalRenderer gains a source-free init path.
+    NSString *syntheticImagePath = [NSTemporaryDirectory()
+        stringByAppendingPathComponent:@"vg_7_5c_placeholder.png"];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:syntheticImagePath]) {
+      // Write a 1×1 transparent PNG (89-byte minimal PNG).
+      static const uint8_t kMinimalPNG[] = {
+          0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // signature
+          0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+          0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1×1
+          0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, // RGBA 8-bit
+          0x89, 0x00, 0x00, 0x00, 0x0B, 0x49, 0x44, 0x41, // IDAT chunk
+          0x54, 0x08, 0xD7, 0x63, 0x60, 0x60, 0x60, 0x60,
+          0x00, 0x00, 0x00, 0x05, 0x00, 0x01, 0xA5, 0xF6,
+          0x45, 0x40, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, // IEND chunk
+          0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82};
+      NSData *pngData = [NSData dataWithBytes:kMinimalPNG
+                                       length:sizeof(kMinimalPNG)];
+      [pngData writeToFile:syntheticImagePath atomically:YES];
+    }
+
+    NSURL *placeholderURL = [NSURL fileURLWithPath:syntheticImagePath];
+    VanguardImageMediaSource *placeholderSource =
+        [[VanguardImageMediaSource alloc] initWithURL:placeholderURL
+                                            processor:nil];
+
+    // Create a minimal pool for the renderer (1×1 — renderer needs one).
+    CVPixelBufferPoolRef tinyPool =
+        [allocator pixelBufferPoolWithWidth:1
+                                     height:1
+                                     format:kCVPixelFormatType_32BGRA
+                         minimumBufferCount:1];
+
+    VanguardMetalRenderer *renderer =
+        [[VanguardMetalRenderer alloc] initWithSource:placeholderSource
+                                      textureRegistry:self.textureRegistry
+                                        methodChannel:self.methodChannel
+                                          sessionPool:tinyPool];
+
+    if (tinyPool) {
+      CVPixelBufferPoolRelease(tinyPool);
+    }
+
+    if (!renderer || self->_invalidated) {
+      NSError *err =
+          [NSError errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
+                              code:3
+                          userInfo:@{
+                            NSLocalizedDescriptionKey :
+                                @"[7.5C] Failed to create "
+                                @"VanguardMetalRenderer for timeline."
+                          }];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        completion(-1, err);
+      });
+      return;
+    }
+
+    // ── 3. Build graph via VGTimelinePlaybackGraphFactory ──────────────
+    NSError *factoryError = nil;
+    NSDictionary<NSString *, id> *graphResult = [VGTimelinePlaybackGraphFactory
+        buildTimelineGraphWithCompositorNode:compositorNode
+                                    renderer:renderer
+                                       error:&factoryError];
+
+    if (!graphResult || self->_invalidated) {
+      NSError *err =
+          factoryError
+              ?: [NSError errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
+                                     code:4
+                                 userInfo:@{
+                                   NSLocalizedDescriptionKey :
+                                       @"[7.5C] VGTimelinePlaybackGraphFactory "
+                                       @"failed."
+                                 }];
+      [renderer dispose];
+      dispatch_async(dispatch_get_main_queue(), ^{
+        completion(-1, err);
+      });
+      return;
+    }
+
+    VGRendererSinkAdapter *sinkAdapter = graphResult[@"sinkAdapter"];
+
+    // ── 4. Store all timeline state ────────────────────────────────────
+    self.renderer = renderer;
+    self.timelineCompositor = compositorNode;
+    self.timelineSinkAdapter = sinkAdapter;
+    self.timelineGeneration = 0;
+    self.timelineCurrentPTS = 0.0;
+    self.timelineIsPlaying = NO;
+    // [7.5C] Init wall-clock anchors.
+    self.timelinePlayStartTime = 0.0;
+    self.timelineBasePTS = 0.0;
+    self.timelineNeedsPreviewFrame = YES;
+
+    int64_t tid = renderer.textureId;
+    self.textureId = tid;
+    self.state = VGRuntimeStatePrepared;
+
+    NSLog(@"[VanguardGraphRuntime][7.5C] timeline runtime prepared "
+           "textureId=%lld compositorId=%@",
+          (long long)tid, compositorNode.nodeId);
+
+    // ── 5. Wire CADisplayLink on main thread ───────────────────────────
+    //
+    // CADisplayLink must be created on the thread whose run loop it
+    // will be added to. We create it on the main thread.
+    // References:
+    //   - CADisplayLink.h: "displayLink should be added to a run loop"
+    //   - Apple doc "Optimizing ProMotion Refresh Rates"
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (self->_invalidated) {
+        completion(
+            -1,
+            [NSError
                 errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
                            code:1
-                       userInfo:@{NSLocalizedDescriptionKey:
-                           @"[7.5C] Runtime already invalidated."}];
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(-1, err); });
-            return;
-        }
+                       userInfo:@{
+                         NSLocalizedDescriptionKey :
+                             @"[7.5C] Invalidated before display link created."
+                       }]);
+        return;
+      }
 
-        // ── 1. Prepare the compositor node ─────────────────────────────────
-        //
-        // VGGraphExecutionContext is required by prepareWithContext:completion:.
-        // We create a minimal context. The compositor reads renderSize from it
-        // during prepare to configure its AVAssetReader output settings.
-        VGResourceAllocator *allocator = [VGResourceAllocator sharedInstance];
-        VGGraphExecutionContext *ctx = [[VGGraphExecutionContext alloc]
-            initWithDescriptor:nil
-                          plan:nil
-                         nodes:@{}
-                         clock:nil
-             resourceAllocator:allocator];
+      CADisplayLink *displayLink = [CADisplayLink
+          displayLinkWithTarget:self
+                       selector:@selector(_timelineDisplayLinkFired:)];
+      // Do NOT set preferredFramesPerSecond — let the display choose its
+      // native rate (60 or 120 Hz). The pull loop only pulls a new frame
+      // when timelineIsPlaying or when a seek was requested, so there is
+      // no decode overhead from ticking at 120Hz while paused.
+      [displayLink addToRunLoop:[NSRunLoop mainRunLoop]
+                        forMode:NSRunLoopCommonModes];
+      self.timelineDisplayLink = displayLink;
 
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        __block NSError *prepError = nil;
-
-        [compositorNode prepareWithContext:ctx completion:^(NSError *err) {
-            prepError = err;
-            dispatch_semaphore_signal(sem);
-        }];
-
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-
-        if (prepError || self->_invalidated) {
-            NSError *err = prepError ?: [NSError
-                errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
-                           code:1
-                       userInfo:@{NSLocalizedDescriptionKey:
-                           @"[7.5C] Runtime invalidated during compositor prepare."}];
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(-1, err); });
-            return;
-        }
-
-        // ── 2. Create renderer with a minimal image source stand-in ────────
-        //
-        // VanguardMetalRenderer.initWithSource: requires non-nil id<VanguardMediaSource>.
-        // VGTimelineCompositorNode is a UMF VGSourceNode, not a VanguardMediaSource.
-        //
-        // Resolution (see Apple Framework Contract above):
-        //   Pass a VanguardImageMediaSource backed by a zero-frame synthetic
-        //   asset. The renderer's CADisplayLink / decode path is NEVER started
-        //   (we do not call renderer.play). All frame delivery is via
-        //   VGRendererSinkAdapter.presentEnvelope: from our pull loop.
-        //
-        // We use the standard 1×1 pixel transparent PNG inline (no bundled asset,
-        // MOD-6 compliant). VanguardImageMediaSource reads it; the render size
-        // will be 1×1, but the compositor provides 1920×1080 buffers anyway.
-        //
-        // NOTE: This is the ONLY approved workaround in Stage 7.5C for the
-        // renderer-requires-source constraint. It must be revisited in Stage 7.6
-        // when VanguardMetalRenderer gains a source-free init path.
-        NSString *syntheticImagePath = [NSTemporaryDirectory()
-            stringByAppendingPathComponent:@"vg_7_5c_placeholder.png"];
-        if (![[NSFileManager defaultManager] fileExistsAtPath:syntheticImagePath]) {
-            // Write a 1×1 transparent PNG (89-byte minimal PNG).
-            static const uint8_t kMinimalPNG[] = {
-                0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A, // signature
-                0x00,0x00,0x00,0x0D,0x49,0x48,0x44,0x52, // IHDR chunk
-                0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01, // 1×1
-                0x08,0x06,0x00,0x00,0x00,0x1F,0x15,0xC4, // RGBA 8-bit
-                0x89,0x00,0x00,0x00,0x0B,0x49,0x44,0x41, // IDAT chunk
-                0x54,0x08,0xD7,0x63,0x60,0x60,0x60,0x60,
-                0x00,0x00,0x00,0x05,0x00,0x01,0xA5,0xF6,
-                0x45,0x40,0x00,0x00,0x00,0x00,0x49,0x45, // IEND chunk
-                0x4E,0x44,0xAE,0x42,0x60,0x82
-            };
-            NSData *pngData = [NSData dataWithBytes:kMinimalPNG
-                                             length:sizeof(kMinimalPNG)];
-            [pngData writeToFile:syntheticImagePath atomically:YES];
-        }
-
-        NSURL *placeholderURL = [NSURL fileURLWithPath:syntheticImagePath];
-        VanguardImageMediaSource *placeholderSource =
-            [[VanguardImageMediaSource alloc] initWithURL:placeholderURL
-                                                processor:nil];
-
-        // Create a minimal pool for the renderer (1×1 — renderer needs one).
-        CVPixelBufferPoolRef tinyPool =
-            [allocator pixelBufferPoolWithWidth:1
-                                         height:1
-                                         format:kCVPixelFormatType_32BGRA
-                             minimumBufferCount:1];
-
-        VanguardMetalRenderer *renderer =
-            [[VanguardMetalRenderer alloc] initWithSource:placeholderSource
-                                          textureRegistry:self.textureRegistry
-                                            methodChannel:self.methodChannel
-                                              sessionPool:tinyPool];
-
-        if (tinyPool) {
-            CVPixelBufferPoolRelease(tinyPool);
-        }
-
-        if (!renderer || self->_invalidated) {
-            NSError *err = [NSError
-                errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
-                           code:3
-                       userInfo:@{NSLocalizedDescriptionKey:
-                           @"[7.5C] Failed to create VanguardMetalRenderer for timeline."}];
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(-1, err); });
-            return;
-        }
-
-        // ── 3. Build graph via VGTimelinePlaybackGraphFactory ──────────────
-        NSError *factoryError = nil;
-        NSDictionary<NSString *, id> *graphResult =
-            [VGTimelinePlaybackGraphFactory
-                buildTimelineGraphWithCompositorNode:compositorNode
-                                           renderer:renderer
-                                              error:&factoryError];
-
-        if (!graphResult || self->_invalidated) {
-            NSError *err = factoryError ?: [NSError
-                errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
-                           code:4
-                       userInfo:@{NSLocalizedDescriptionKey:
-                           @"[7.5C] VGTimelinePlaybackGraphFactory failed."}];
-            [renderer dispose];
-            dispatch_async(dispatch_get_main_queue(), ^{ completion(-1, err); });
-            return;
-        }
-
-        VGRendererSinkAdapter *sinkAdapter = graphResult[@"sinkAdapter"];
-
-        // ── 4. Store all timeline state ────────────────────────────────────
-        self.renderer             = renderer;
-        self.timelineCompositor   = compositorNode;
-        self.timelineSinkAdapter  = sinkAdapter;
-        self.timelineGeneration   = 0;
-        self.timelineCurrentPTS   = 0.0;
-        self.timelineIsPlaying    = NO;
-
-        int64_t tid = renderer.textureId;
-        self.textureId = tid;
-        self.state = VGRuntimeStatePrepared;
-
-        NSLog(@"[VanguardGraphRuntime][7.5C] timeline runtime prepared "
-              "textureId=%lld compositorId=%@",
-              (long long)tid, compositorNode.nodeId);
-
-        // ── 5. Wire CADisplayLink on main thread ───────────────────────────
-        //
-        // CADisplayLink must be created on the thread whose run loop it
-        // will be added to. We create it on the main thread.
-        // References:
-        //   - CADisplayLink.h: "displayLink should be added to a run loop"
-        //   - Apple doc "Optimizing ProMotion Refresh Rates"
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (self->_invalidated) {
-                completion(-1, [NSError
-                    errorWithDomain:@"VanguardGraphRuntimeErrorDomain"
-                               code:1
-                           userInfo:@{NSLocalizedDescriptionKey:
-                               @"[7.5C] Invalidated before display link created."}]);
-                return;
-            }
-
-            CADisplayLink *displayLink =
-                [CADisplayLink displayLinkWithTarget:self
-                                           selector:@selector(_timelineDisplayLinkFired:)];
-            // Do NOT set preferredFramesPerSecond — let the display choose its
-            // native rate (60 or 120 Hz). The pull loop only pulls a new frame
-            // when timelineIsPlaying or when a seek was requested, so there is
-            // no decode overhead from ticking at 120Hz while paused.
-            [displayLink addToRunLoop:[NSRunLoop mainRunLoop]
-                              forMode:NSRunLoopCommonModes];
-            self.timelineDisplayLink = displayLink;
-
-            completion(tid, nil);
-        });
+      completion(tid, nil);
     });
+  });
 }
 
-// ─── Display link pull loop ────────────────────────────────────────────────────
+// ─── Display link pull loop
+// ────────────────────────────────────────────────────
 
 - (void)_timelineDisplayLinkFired:(CADisplayLink *)displayLink {
-    // Must be on the main thread (CADisplayLink contract).
-    NSAssert([NSThread isMainThread],
-             @"[7.5C] _timelineDisplayLinkFired: must fire on the main thread");
+  // Must be on the main thread (CADisplayLink contract).
+  NSAssert([NSThread isMainThread],
+           @"[7.5C] _timelineDisplayLinkFired: must fire on the main thread");
 
-    if (_invalidated) {
-        [displayLink invalidate];
-        return;
+  if (_invalidated) {
+    [displayLink invalidate];
+    return;
+  }
+
+  // [7.5C] Suppress continuous pulls while paused.
+  // Only proceed if actively playing OR a one-shot preview frame is pending.
+  if (!self.timelineIsPlaying && !self.timelineNeedsPreviewFrame) {
+    return;
+  }
+  self.timelineNeedsPreviewFrame = NO;
+
+  VGTimelineCompositorNode *compositor = self.timelineCompositor;
+  VGRendererSinkAdapter *sink = self.timelineSinkAdapter;
+  if (!compositor || !sink)
+    return;
+
+  // [7.5C] Advance PTS using wall-clock elapsed time anchored at play start.
+  // Do NOT accumulate displayLink.duration — that path drifts at high display
+  // rates and was consuming frames during the paused window before play.
+  if (self.timelineIsPlaying) {
+    double elapsed = CACurrentMediaTime() - self.timelinePlayStartTime;
+    self.timelineCurrentPTS = self.timelineBasePTS + elapsed;
+  }
+
+  // Capture snapshot of PTS and generation for this tick.
+  double currentPTS = self.timelineCurrentPTS;
+  uint64_t generation = self.timelineGeneration;
+
+  // Build the frame request.
+  CMTime pts = CMTimeMakeWithSeconds(currentPTS, 600);
+  CMTime duration = CMTimeMakeWithSeconds(displayLink.duration, 600);
+  VGFrameRequest *request =
+      [[VGFrameRequest alloc] initWithRequestedPTS:pts
+                                          duration:duration
+                                        generation:generation
+                                        renderSize:CGSizeMake(1920, 1080)
+                                              mode:VGRenderModePreview];
+
+  // Pull on the serial pull queue so AVAssetReader.copyNextSampleBuffer
+  // does not block the main thread.
+  __weak VGTimelineCompositorNode *weakCompositor = compositor;
+  __weak VGRendererSinkAdapter *weakSink = sink;
+  __weak typeof(self) weakSelf = self;
+
+  dispatch_async(_VGTimelinePullQueue(), ^{
+    VGTimelineCompositorNode *c = weakCompositor;
+    VGRendererSinkAdapter *s = weakSink;
+    if (!c || !s)
+      return;
+
+    VGFrameResult *result = [c pullFrame:request];
+    if (!result)
+      return;
+
+    switch (result.status) {
+    case VGFrameStatusDelivered: {
+      // Forward the envelope to the sink.
+      // VGRendererSinkAdapter.presentEnvelope: retains the pixel buffer
+      // and dispatches textureFrameAvailable: to main queue.
+      [s presentEnvelope:result.envelope];
+
+      // Update PTS display on main thread.
+      double pts_s = CMTimeGetSeconds(result.envelope.pts);
+      dispatch_async(dispatch_get_main_queue(), ^{
+        // Post a method channel notification for Dart PTS overlay.
+        // Dart playground listens on the same channel for 'onTimelineFrame'.
+        typeof(self) ss = weakSelf;
+        if (!ss || ss->_invalidated)
+          return;
+        [ss.methodChannel invokeMethod:@"onTimelineFrame"
+                             arguments:@{
+                               @"pts" : @(pts_s),
+                               @"generation" : @(generation)
+                             }];
+      });
+      break;
     }
-
-    VGTimelineCompositorNode *compositor = self.timelineCompositor;
-    VGRendererSinkAdapter    *sink       = self.timelineSinkAdapter;
-    if (!compositor || !sink) return;
-
-    // Advance PTS only when playing.
-    if (self.timelineIsPlaying) {
-        self.timelineCurrentPTS += displayLink.duration;
+    case VGFrameStatusSkipped:
+      // Stale generation — no action.
+      break;
+    case VGFrameStatusEndOfStream: {
+      // Reached EOS — stop playing, notify Dart.
+      dispatch_async(dispatch_get_main_queue(), ^{
+        typeof(self) ss = weakSelf;
+        if (!ss || ss->_invalidated)
+          return;
+        ss.timelineIsPlaying = NO;
+        [ss.methodChannel invokeMethod:@"onTimelineEOS" arguments:nil];
+        NSLog(@"[VanguardGraphRuntime][7.5C] timeline EOS reached "
+               "PTS=%.3f",
+              currentPTS);
+      });
+      break;
     }
-
-    // Capture snapshot of PTS and generation for this tick.
-    double currentPTS   = self.timelineCurrentPTS;
-    uint64_t generation = self.timelineGeneration;
-
-    // Build the frame request.
-    CMTime pts      = CMTimeMakeWithSeconds(currentPTS, 600);
-    CMTime duration = CMTimeMakeWithSeconds(displayLink.duration, 600);
-    VGFrameRequest *request =
-        [[VGFrameRequest alloc] initWithRequestedPTS:pts
-                                            duration:duration
-                                          generation:generation
-                                          renderSize:CGSizeMake(1920, 1080)
-                                               mode:VGRenderModePlayback];
-
-    // Pull on the serial pull queue so AVAssetReader.copyNextSampleBuffer
-    // does not block the main thread.
-    __weak VGTimelineCompositorNode *weakCompositor = compositor;
-    __weak VGRendererSinkAdapter    *weakSink       = sink;
-    __weak typeof(self)              weakSelf       = self;
-
-    dispatch_async(_VGTimelinePullQueue(), ^{
-        VGTimelineCompositorNode *c = weakCompositor;
-        VGRendererSinkAdapter    *s = weakSink;
-        if (!c || !s) return;
-
-        VGFrameResult *result = [c pullFrame:request];
-        if (!result) return;
-
-        switch (result.status) {
-            case VGFrameStatusDelivered: {
-                // Forward the envelope to the sink.
-                // VGRendererSinkAdapter.presentEnvelope: retains the pixel buffer
-                // and dispatches textureFrameAvailable: to main queue.
-                [s presentEnvelope:result.envelope];
-
-                // Update PTS display on main thread.
-                double pts_s = CMTimeGetSeconds(result.envelope.pts);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    // Post a method channel notification for Dart PTS overlay.
-                    // Dart playground listens on the same channel for 'onTimelineFrame'.
-                    typeof(self) ss = weakSelf;
-                    if (!ss || ss->_invalidated) return;
-                    [ss.methodChannel invokeMethod:@"onTimelineFrame"
-                                        arguments:@{@"pts": @(pts_s),
-                                                    @"generation": @(generation)}];
-                });
-                break;
-            }
-            case VGFrameStatusSkipped:
-                // Stale generation — no action.
-                break;
-            case VGFrameStatusEndOfStream: {
-                // Reached EOS — stop playing, notify Dart.
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    typeof(self) ss = weakSelf;
-                    if (!ss || ss->_invalidated) return;
-                    ss.timelineIsPlaying = NO;
-                    [ss.methodChannel invokeMethod:@"onTimelineEOS" arguments:nil];
-                    NSLog(@"[VanguardGraphRuntime][7.5C] timeline EOS reached "
-                          "PTS=%.3f", currentPTS);
-                });
-                break;
-            }
-            case VGFrameStatusError:
-                NSLog(@"[VanguardGraphRuntime][7.5C] pullFrame error: %@",
-                      result.error.localizedDescription);
-                break;
-        }
-    });
+    case VGFrameStatusError:
+      NSLog(@"[VanguardGraphRuntime][7.5C] pullFrame error: %@",
+            result.error.localizedDescription);
+      break;
+    }
+  });
 }
 
-// ─── play / pause forwarding for timeline path ────────────────────────────────
+// ─── play / pause forwarding for timeline path
+// ────────────────────────────────
 //
-// The base class play/pause call [renderer play] / [renderer pause] which drives
-// the VanguardMetalRenderer's CADisplayLink. In the timeline path, the renderer's
-// CADisplayLink must NOT be started (it has a placeholder image source and would
-// produce garbage frames). We override the start/stop in _timelineDisplayLinkFired:
-// via timelineIsPlaying — no change to the base class play/pause is required
-// because the timeline path is entered via prepareWithTimelineCompositorNode:
-// rather than prepareWithURL:, and the renderer's play/pause are wrapped here.
+// The base class play/pause call [renderer play] / [renderer pause] which
+// drives the VanguardMetalRenderer's CADisplayLink. In the timeline path, the
+// renderer's CADisplayLink must NOT be started (it has a placeholder image
+// source and would produce garbage frames). We override the start/stop in
+// _timelineDisplayLinkFired: via timelineIsPlaying — no change to the base
+// class play/pause is required because the timeline path is entered via
+// prepareWithTimelineCompositorNode: rather than prepareWithURL:, and the
+// renderer's play/pause are wrapped here.
 //
-// The Dart playground calls play/pause/seekTo via the standard dev_ method channel
-// routes which call [runtime play] / [runtime pause] / [runtime seekTo:].
-// Those call [renderer play] etc. — which is a no-op for the placeholder source.
-// The effective timeline play/pause state is timelineIsPlaying.
+// The Dart playground calls play/pause/seekTo via the standard dev_ method
+// channel routes which call [runtime play] / [runtime pause] / [runtime
+// seekTo:]. Those call [renderer play] etc. — which is a no-op for the
+// placeholder source. The effective timeline play/pause state is
+// timelineIsPlaying.
 //
 // For Stage 7.5C: the Dart playground controls timelineIsPlaying directly via
 // the dev_createTimelineTexture / dev_ play/pause/seekTo method channel cases
@@ -1969,46 +2099,68 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
 // ─── seekTimelineTo: ─────────────────────────────────────────────────────────
 
 - (void)seekTimelineTo:(double)seconds {
-    // May be called from any thread (Dart method channel arrives on main queue).
-    // Update PTS and increment generation on the main queue for CADisplayLink safety.
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (self->_invalidated) return;
+  // May be called from any thread (Dart method channel arrives on main queue).
+  // Update PTS and increment generation on the main queue for CADisplayLink
+  // safety.
+  dispatch_async(dispatch_get_main_queue(), ^{
+    if (self->_invalidated)
+      return;
 
-        // Increment generation atomically.
-        uint64_t newGeneration = self.timelineGeneration + 1;
-        self.timelineGeneration = newGeneration;
-        self.timelineCurrentPTS = MAX(0.0, seconds);
+    // Increment generation atomically.
+    uint64_t newGeneration = self.timelineGeneration + 1;
+    self.timelineGeneration = newGeneration;
+    self.timelineCurrentPTS = MAX(0.0, seconds);
 
-        // Forward seek to compositor on pull queue to avoid reader rebuild on
-        // the main thread.
-        VGTimelineCompositorNode *compositor = self.timelineCompositor;
-        if (!compositor) return;
+    // [7.5C] Request one preview frame so the seek position is rendered
+    // even while paused. The display link normally returns early when
+    // paused (!timelineIsPlaying && !timelineNeedsPreviewFrame).
+    self.timelineNeedsPreviewFrame = YES;
 
-        CMTime seekTime = CMTimeMakeWithSeconds(seconds, 600);
-        dispatch_async(_VGTimelinePullQueue(), ^{
-            [compositor seekTo:seekTime generation:newGeneration];
-            NSLog(@"[VanguardGraphRuntime][7.5C] seekTimelineTo: %.3f "
-                  "generation=%llu", seconds, (unsigned long long)newGeneration);
-        });
+    // [7.5C] Re-anchor wall-clock if playing, so PTS doesn't jump after seek.
+    if (self.timelineIsPlaying) {
+      self.timelinePlayStartTime = CACurrentMediaTime();
+      self.timelineBasePTS = self.timelineCurrentPTS;
+    }
+
+    // Forward seek to compositor on pull queue to avoid reader rebuild on
+    // the main thread.
+    VGTimelineCompositorNode *compositor = self.timelineCompositor;
+    if (!compositor)
+      return;
+
+    CMTime seekTime = CMTimeMakeWithSeconds(seconds, 600);
+    dispatch_async(_VGTimelinePullQueue(), ^{
+      [compositor seekTo:seekTime generation:newGeneration];
+      NSLog(@"[VanguardGraphRuntime][7.5C] seekTimelineTo: %.3f "
+             "generation=%llu",
+            seconds, (unsigned long long)newGeneration);
     });
+  });
 }
 
 // ─── Timeline play/pause convenience ─────────────────────────────────────────
 
 - (void)_timelinePlay {
-    NSAssert([NSThread isMainThread], @"[7.5C] _timelinePlay must be on main thread");
-    self.timelineIsPlaying = YES;
-    self.state = VGRuntimeStateRunning;
-    NSLog(@"[VanguardGraphRuntime][7.5C] timeline play — PTS=%.3f",
-          self.timelineCurrentPTS);
+  NSAssert([NSThread isMainThread],
+           @"[7.5C] _timelinePlay must be on main thread");
+  // [7.5C] Anchor the wall-clock at the moment play is pressed.
+  // All subsequent PTS advances are computed as:
+  //   timelineCurrentPTS = timelineBasePTS + (CACurrentMediaTime() - timelinePlayStartTime)
+  self.timelinePlayStartTime = CACurrentMediaTime();
+  self.timelineBasePTS = self.timelineCurrentPTS;
+  self.timelineIsPlaying = YES;
+  self.state = VGRuntimeStateRunning;
+  NSLog(@"[VanguardGraphRuntime][7.5C] timeline play — PTS=%.3f",
+        self.timelineCurrentPTS);
 }
 
 - (void)_timelinePause {
-    NSAssert([NSThread isMainThread], @"[7.5C] _timelinePause must be on main thread");
-    self.timelineIsPlaying = NO;
-    self.state = VGRuntimeStatePaused;
-    NSLog(@"[VanguardGraphRuntime][7.5C] timeline pause — PTS=%.3f",
-          self.timelineCurrentPTS);
+  NSAssert([NSThread isMainThread],
+           @"[7.5C] _timelinePause must be on main thread");
+  self.timelineIsPlaying = NO;
+  self.state = VGRuntimeStatePaused;
+  NSLog(@"[VanguardGraphRuntime][7.5C] timeline pause — PTS=%.3f",
+        self.timelineCurrentPTS);
 }
 
 #endif // VG_USE_V2_GRAPH
