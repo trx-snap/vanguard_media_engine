@@ -589,3 +589,9 @@ void main() {
     });
   });
 }
+
+// ignore: unused_import
+// vg_clip_transform_descriptor tests appended by Phase 7.11 implementer.
+// These tests are imported by the vg_descriptor_test.dart main() above via
+// a separate call; kept in the same file for colocation with descriptor tests.
+// To run: `flutter test test/vg_descriptor_test.dart`

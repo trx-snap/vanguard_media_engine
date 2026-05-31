@@ -1,5 +1,8 @@
 // vanguard_manual_test_playground.dart
-// Vanguard Media Engine — Phase 7 Stage 7.10: Manual Test Playground
+// Vanguard Media Engine — Phase 7 Stage 7.10 / Phase 7.11: Manual Test Playground
+//
+// ════════════════════════════════════════════════════════════════════════════════
+// STAGES 7.10 + 7.11 — MANUAL TEST PLAYGROUND (HANIF DEVICE TEST TARGET)
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // STAGE 7.10 — MANUAL TEST PLAYGROUND (HANIF DEVICE TEST TARGET)
@@ -68,6 +71,26 @@ class _VanguardManualTestPlaygroundState
   double? _seekDragValue;
   DateTime? _lastScrubSeekAt;
 
+  // ── Phase 7.11: Per-clip transform state ──────────────────────────────────
+  // All fields default to identity. Sliders drive these; rebuild is debounced.
+  double _clipAScaleX     = 1.0;
+  double _clipAScaleY     = 1.0;
+  double _clipARotation   = 0.0; // radians
+  double _clipAOpacity    = 1.0;
+  double _clipATransX     = 0.0; // canvas pixels
+  double _clipATransY     = 0.0; // canvas pixels
+
+  double _clipBScaleX     = 1.0;
+  double _clipBScaleY     = 1.0;
+  double _clipBRotation   = 0.0;
+  double _clipBOpacity    = 1.0;
+  double _clipBTransX     = 0.0;
+  double _clipBTransY     = 0.0;
+
+  // Debounce timer: rebuild waits 500 ms after last slider change.
+  // (D7: debounced playground rebuild)
+  Timer? _transformDebounce;
+
   @override
   void initState() {
     super.initState();
@@ -76,10 +99,21 @@ class _VanguardManualTestPlaygroundState
 
   @override
   void dispose() {
+    _transformDebounce?.cancel();
     _channel.setMethodCallHandler(null);
     _controller?.disposeAsync().catchError((_) {});
     _controller?.dispose();
     super.dispose();
+  }
+
+  // Phase 7.11: debounced rebuild — waits 500 ms after last slider change
+  // before tearing down and rebuilding the native compositor. This prevents
+  // excessive teardown/rebuild during slider drag without blocking the UI.
+  void _debouncedRebuild() {
+    _transformDebounce?.cancel();
+    _transformDebounce = Timer(const Duration(milliseconds: 500), () {
+      if (mounted) _rebuildTimeline();
+    });
   }
 
   // ── Copy Assets and Prepare Timeline ────────────────────────────────────────
@@ -165,6 +199,19 @@ class _VanguardManualTestPlaygroundState
         durationSeconds: 5.06,
         trimStartSeconds: 0.0,
         trimEndSeconds: 5.06,
+        // Phase 7.11: apply clip A transform when non-identity.
+        transform: (_clipAScaleX != 1.0 || _clipAScaleY != 1.0 ||
+                    _clipARotation != 0.0 || _clipAOpacity != 1.0 ||
+                    _clipATransX != 0.0 || _clipATransY != 0.0)
+            ? VGClipTransformDescriptor(
+                scaleX: _clipAScaleX,
+                scaleY: _clipAScaleY,
+                rotation: _clipARotation,
+                opacity: _clipAOpacity,
+                translationX: _clipATransX,
+                translationY: _clipATransY,
+              )
+            : null,
       ),
       VGClipDescriptor(
         id: 'clip-B',
@@ -172,6 +219,19 @@ class _VanguardManualTestPlaygroundState
         durationSeconds: 5.56,
         trimStartSeconds: 0.0,
         trimEndSeconds: 5.56,
+        // Phase 7.11: apply clip B transform when non-identity.
+        transform: (_clipBScaleX != 1.0 || _clipBScaleY != 1.0 ||
+                    _clipBRotation != 0.0 || _clipBOpacity != 1.0 ||
+                    _clipBTransX != 0.0 || _clipBTransY != 0.0)
+            ? VGClipTransformDescriptor(
+                scaleX: _clipBScaleX,
+                scaleY: _clipBScaleY,
+                rotation: _clipBRotation,
+                opacity: _clipBOpacity,
+                translationX: _clipBTransX,
+                translationY: _clipBTransY,
+              )
+            : null,
       ),
     ];
 
@@ -301,15 +361,18 @@ class _VanguardManualTestPlaygroundState
 
   // ── Build UI ───────────────────────────────────────────────────────────────
 
+  String get _appBarTitle =>
+      'Phase 7.10 + 7.11 Manual Device Test';
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFF0F0E17),
       appBar: AppBar(
         backgroundColor: const Color(0xFF1F1E29),
-        title: const Text(
-          'Phase 7.10 Manual Device Test',
-          style: TextStyle(
+        title: Text(
+          _appBarTitle,
+          style: const TextStyle(
             fontSize: 16,
             fontWeight: FontWeight.w600,
             color: Colors.white,
@@ -335,6 +398,60 @@ class _VanguardManualTestPlaygroundState
 
                         // ── Transition & Canvas Controller Card ───────────────
                         _buildSetupControlsCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.11: Clip A Transform Controls ─────────────
+                        _buildTransformCard(
+                          clipLabel: 'CLIP A',
+                          accentColor: const Color(0xFF6C63FF),
+                          scaleX: _clipAScaleX,
+                          scaleY: _clipAScaleY,
+                          rotation: _clipARotation,
+                          opacity: _clipAOpacity,
+                          transX: _clipATransX,
+                          transY: _clipATransY,
+                          onScaleX: (v) { setState(() => _clipAScaleX = v); _debouncedRebuild(); },
+                          onScaleY: (v) { setState(() => _clipAScaleY = v); _debouncedRebuild(); },
+                          onRotation: (v) { setState(() => _clipARotation = v); _debouncedRebuild(); },
+                          onOpacity: (v) { setState(() => _clipAOpacity = v); _debouncedRebuild(); },
+                          onTransX: (v) { setState(() => _clipATransX = v); _debouncedRebuild(); },
+                          onTransY: (v) { setState(() => _clipATransY = v); _debouncedRebuild(); },
+                          onReset: () {
+                            setState(() {
+                              _clipAScaleX = 1.0; _clipAScaleY = 1.0;
+                              _clipARotation = 0.0; _clipAOpacity = 1.0;
+                              _clipATransX = 0.0; _clipATransY = 0.0;
+                            });
+                            _rebuildTimeline();
+                          },
+                        ),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.11: Clip B Transform Controls ─────────────
+                        _buildTransformCard(
+                          clipLabel: 'CLIP B',
+                          accentColor: const Color(0xFF00D4AA),
+                          scaleX: _clipBScaleX,
+                          scaleY: _clipBScaleY,
+                          rotation: _clipBRotation,
+                          opacity: _clipBOpacity,
+                          transX: _clipBTransX,
+                          transY: _clipBTransY,
+                          onScaleX: (v) { setState(() => _clipBScaleX = v); _debouncedRebuild(); },
+                          onScaleY: (v) { setState(() => _clipBScaleY = v); _debouncedRebuild(); },
+                          onRotation: (v) { setState(() => _clipBRotation = v); _debouncedRebuild(); },
+                          onOpacity: (v) { setState(() => _clipBOpacity = v); _debouncedRebuild(); },
+                          onTransX: (v) { setState(() => _clipBTransX = v); _debouncedRebuild(); },
+                          onTransY: (v) { setState(() => _clipBTransY = v); _debouncedRebuild(); },
+                          onReset: () {
+                            setState(() {
+                              _clipBScaleX = 1.0; _clipBScaleY = 1.0;
+                              _clipBRotation = 0.0; _clipBOpacity = 1.0;
+                              _clipBTransX = 0.0; _clipBTransY = 0.0;
+                            });
+                            _rebuildTimeline();
+                          },
+                        ),
                         const SizedBox(height: 12),
 
                         // ── Playback & Texture Preview ───────────────────────
@@ -653,6 +770,199 @@ class _VanguardManualTestPlaygroundState
       ),
     );
   }
+
+  // ─────────────────────────────────────────────────────────────────
+  // Phase 7.11: Transform Controls Card
+  // ─────────────────────────────────────────────────────────────────
+
+  Widget _buildTransformCard({
+    required String clipLabel,
+    required Color accentColor,
+    required double scaleX,
+    required double scaleY,
+    required double rotation,
+    required double opacity,
+    required double transX,
+    required double transY,
+    required ValueChanged<double> onScaleX,
+    required ValueChanged<double> onScaleY,
+    required ValueChanged<double> onRotation,
+    required ValueChanged<double> onOpacity,
+    required ValueChanged<double> onTransX,
+    required ValueChanged<double> onTransY,
+    required VoidCallback onReset,
+  }) {
+    final bool isIdentity = scaleX == 1.0 && scaleY == 1.0 &&
+        rotation == 0.0 && opacity == 1.0 && transX == 0.0 && transY == 0.0;
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: isIdentity ? Colors.white10 : accentColor.withValues(alpha: 0.5),
+          width: isIdentity ? 1.0 : 1.5,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header
+          Row(
+            children: [
+              Container(
+                width: 8, height: 8,
+                decoration: BoxDecoration(
+                  color: isIdentity ? Colors.white24 : accentColor,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(
+                '$clipLabel SPATIAL TRANSFORM (7.11)',
+                style: TextStyle(
+                  color: isIdentity ? const Color(0xFF6C7A9C) : accentColor,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 1.2,
+                ),
+              ),
+              const Spacer(),
+              if (!isIdentity)
+                GestureDetector(
+                  onTap: onReset,
+                  child: Text(
+                    'RESET',
+                    style: TextStyle(
+                      color: accentColor.withValues(alpha: 0.8),
+                      fontSize: 10,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 1.0,
+                    ),
+                  ),
+                ),
+              if (isIdentity)
+                const Text(
+                  'IDENTITY',
+                  style: TextStyle(
+                    color: Colors.white24,
+                    fontSize: 9,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.8,
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 10),
+
+          // Scale X
+          _buildSliderRow(
+            label: 'Scale X', value: scaleX,
+            min: 0.1, max: 3.0, displayDecimals: 2,
+            onChanged: onScaleX,
+            accentColor: accentColor,
+          ),
+          // Scale Y
+          _buildSliderRow(
+            label: 'Scale Y', value: scaleY,
+            min: 0.1, max: 3.0, displayDecimals: 2,
+            onChanged: onScaleY,
+            accentColor: accentColor,
+          ),
+          // Rotation (radians, display in degrees)
+          _buildSliderRow(
+            label: 'Rotation',
+            value: rotation,
+            min: -3.1416, max: 3.1416,
+            displayDecimals: 2,
+            displaySuffix: ' rad',
+            onChanged: onRotation,
+            accentColor: accentColor,
+          ),
+          // Opacity
+          _buildSliderRow(
+            label: 'Opacity', value: opacity,
+            min: 0.0, max: 1.0, displayDecimals: 2,
+            onChanged: onOpacity,
+            accentColor: accentColor,
+          ),
+          // Translation X
+          _buildSliderRow(
+            label: 'Trans X', value: transX,
+            min: -640.0, max: 640.0, displayDecimals: 0,
+            displaySuffix: 'px',
+            onChanged: onTransX,
+            accentColor: accentColor,
+          ),
+          // Translation Y
+          _buildSliderRow(
+            label: 'Trans Y', value: transY,
+            min: -360.0, max: 360.0, displayDecimals: 0,
+            displaySuffix: 'px',
+            onChanged: onTransY,
+            accentColor: accentColor,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSliderRow({
+    required String label,
+    required double value,
+    required double min,
+    required double max,
+    required int displayDecimals,
+    String displaySuffix = '',
+    required ValueChanged<double> onChanged,
+    required Color accentColor,
+  }) {
+    final displayValue = displayDecimals == 0
+        ? value.toStringAsFixed(0)
+        : value.toStringAsFixed(displayDecimals);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 62,
+            child: Text(
+              label,
+              style: const TextStyle(color: Colors.white54, fontSize: 10),
+            ),
+          ),
+          Expanded(
+            child: SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                activeTrackColor: accentColor,
+                inactiveTrackColor: Colors.white10,
+                thumbColor: accentColor,
+                overlayColor: accentColor.withValues(alpha: 0.15),
+                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                trackHeight: 2,
+              ),
+              child: Slider(
+                value: value.clamp(min, max),
+                min: min,
+                max: max,
+                onChanged: onChanged,
+              ),
+            ),
+          ),
+          SizedBox(
+            width: 52,
+            child: Text(
+              '$displayValue$displaySuffix',
+              style: TextStyle(color: accentColor, fontSize: 10, fontFamily: 'monospace'),
+              textAlign: TextAlign.right,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
 
   Widget _buildPreviewCard() {
     return ValueListenableBuilder<VGEditorValue>(

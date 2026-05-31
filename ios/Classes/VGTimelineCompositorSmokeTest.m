@@ -301,7 +301,8 @@ static BOOL _generateSyntheticVideo(NSString *path,
                                durationSeconds:5.0
                                trimStartSeconds:0.0
                                  trimEndSeconds:5.0
-                                           speed:1.0];
+                                           speed:1.0
+                                       transform:nil];
 
     // Clip B: 5.0s duration, starts at 5.0s on timeline, trim [0, 5], speed 1.0
     VGClipDescriptor *clipB =
@@ -312,7 +313,8 @@ static BOOL _generateSyntheticVideo(NSString *path,
                                durationSeconds:5.0
                                trimStartSeconds:0.0
                                  trimEndSeconds:5.0
-                                           speed:1.0];
+                                           speed:1.0
+                                       transform:nil];
 
     if (![clipA isValid] || ![clipB isValid]) {
         log(@"  ❌ Clip descriptor validation failed");

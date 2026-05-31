@@ -1,5 +1,5 @@
 // vg_editor_draft_test.dart
-// Vanguard Media Engine — Phase 7 Stage 7.7
+// Vanguard Media Engine — Phase 7 Stage 7.7 / Phase 7.11
 //
 // Pure Dart unit tests for VGEditorDraft.
 //
@@ -11,9 +11,11 @@
 //   - toMap / fromMap round-trip
 //   - copyWith mutations
 //   - equality / hashCode
+//   - Phase 7.11: sequentialWithTransitions preserves clip.transform (D6)
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vg_clip_descriptor.dart';
+import 'package:vanguard_media_engine/vg_clip_transform_descriptor.dart';
 import 'package:vanguard_media_engine/vg_transition_descriptor.dart';
 import 'package:vanguard_media_engine/vg_editor_draft.dart';
 
@@ -577,6 +579,89 @@ void main() {
       // Hard cut: no overlap subtracted
       expect(d.durationSeconds, closeTo(10.0, 0.001));
       expect(d.clips[1].startTimeSeconds, closeTo(5.0, 0.001));
+    });
+
+    // ── Phase 7.11 / D6: sequentialWithTransitions must preserve clip.transform ─
+    //
+    // Audit finding (Gemini Phase 7.11 mechanical audit): the implementation
+    // uses copyWith(startTimeSeconds: cursor) which — by design of the sentinel
+    // pattern — preserves all other fields including the nullable transform.
+    // This test is the explicit proof of that guarantee (DEC-144 / D6).
+    test('ED-46 (Phase 7.11 / D6) sequentialWithTransitions preserves clip.transform after startTimeSeconds adjustment', () {
+      // Non-identity transform applied to Clip B.
+      // All 8 fields deviate from their identity defaults.
+      const tdB = VGClipTransformDescriptor(
+        scaleX:       0.5,
+        scaleY:       0.5,
+        translationX: 100.0,
+        translationY: 50.0,
+        rotation:     0.785, // ~45° clockwise
+        opacity:      0.5,
+        anchorX:      0.5,
+        anchorY:      0.5,
+      );
+
+      // Clip A: no transform (null = identity pass-through).
+      final clipA = VGClipDescriptor(
+        id: 'clip-A-46',
+        sourcePath: '/tmp/clip_a_46.mp4',
+        durationSeconds: 5.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 5.0,
+      );
+
+      // Clip B: has the non-identity transform.
+      final clipB = VGClipDescriptor(
+        id: 'clip-B-46',
+        sourcePath: '/tmp/clip_b_46.mp4',
+        durationSeconds: 5.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 5.0,
+        transform: tdB,
+      );
+
+      // 1-second dissolve between A and B.
+      // Expected Clip B startTimeSeconds = 5.0 - 1.0 = 4.0.
+      final transition = VGTransitionDescriptor(
+        id: 'tr-46',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 1.0,
+        fromClipId: 'clip-A-46',
+        toClipId:   'clip-B-46',
+      );
+
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'test-46',
+        clips: [clipA, clipB],
+        transitions: [transition],
+      );
+
+      // ── Timeline layout assertions ──────────────────────────────────────────
+      // Clip A starts at time 0.
+      expect(draft.clips[0].startTimeSeconds, closeTo(0.0, 1e-9));
+      // Clip B is shifted back by the dissolve overlap.
+      expect(draft.clips[1].startTimeSeconds, closeTo(4.0, 1e-9));
+      // Total duration = 5 + 5 - 1 = 9 seconds.
+      expect(draft.durationSeconds, closeTo(9.0, 1e-9));
+
+      // ── Clip A transform is null (unchanged) ────────────────────────────────
+      expect(draft.clips[0].transform, isNull);
+
+      // ── D6: Clip B transform is non-null and field values are preserved ─────
+      final resultTransform = draft.clips[1].transform;
+      expect(resultTransform, isNotNull,
+          reason: 'sequentialWithTransitions must not drop clip.transform');
+      expect(resultTransform!.scaleX,       closeTo(0.5,   1e-9));
+      expect(resultTransform.scaleY,        closeTo(0.5,   1e-9));
+      expect(resultTransform.translationX,  closeTo(100.0, 1e-9));
+      expect(resultTransform.translationY,  closeTo(50.0,  1e-9));
+      expect(resultTransform.rotation,      closeTo(0.785, 1e-9));
+      expect(resultTransform.opacity,       closeTo(0.5,   1e-9));
+      expect(resultTransform.anchorX,       closeTo(0.5,   1e-9));
+      expect(resultTransform.anchorY,       closeTo(0.5,   1e-9));
+
+      // ── Equality check: the preserved descriptor equals the original ─────────
+      expect(resultTransform, equals(tdB));
     });
   });
 }

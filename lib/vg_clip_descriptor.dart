@@ -1,5 +1,5 @@
 // vg_clip_descriptor.dart
-// Vanguard Media Engine — Phase 7 Stage 7.1
+// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11
 //
 // Non-destructive clip descriptor for the UMF V2 timeline editor.
 //
@@ -12,6 +12,11 @@
 //   - In Stage 7.1 there is no native rendering of these values. The descriptor
 //     is used only for Dart-layer timeline math and playground validation.
 //
+// Phase 7.11 addition (DEC-144):
+//   - Optional [transform] field of type [VGClipTransformDescriptor].
+//   - Null means identity (no transform applied by the compositor).
+//   - Serialised in toMap() under key 'transform' only when non-null.
+//
 // Serialisation:
 //   toMap() produces a JSON-compatible map:
 //   {
@@ -23,7 +28,10 @@
 //     'trimStartSeconds': double,
 //     'trimEndSeconds': double,
 //     'speed': double,
+//     'transform': Map?,         // Phase 7.11: optional, omitted when null
 //   }
+
+import 'vg_clip_transform_descriptor.dart';
 
 /// A transport-safe, non-destructive description of a single media clip in a
 /// Phase 7 timeline arrangement.
@@ -73,6 +81,10 @@ final class VGClipDescriptor {
   ///
   /// [speed] is a speed multiplier applied to playback. 1.0 = normal speed.
   /// Must be > 0. Slow motion: 0 < speed < 1. Fast motion: speed > 1.
+  ///
+  /// [transform] is an optional static spatial transform applied to this clip
+  /// by the compositor (Phase 7.11, DEC-144). Null means identity — the clip
+  /// is rendered at full size with no transform applied (zero overhead).
   const VGClipDescriptor({
     required this.id,
     required this.sourcePath,
@@ -82,6 +94,7 @@ final class VGClipDescriptor {
     this.trimStartSeconds = 0.0,
     required this.trimEndSeconds,
     this.speed = 1.0,
+    this.transform,
   })  : assert(startTimeSeconds >= 0, 'startTimeSeconds must be >= 0'),
         assert(durationSeconds >= 0, 'durationSeconds must be >= 0'),
         assert(trimStartSeconds >= 0, 'trimStartSeconds must be >= 0'),
@@ -153,6 +166,22 @@ final class VGClipDescriptor {
   /// (Phase 7 Stage 7.5+). In Stage 7.1 this field is stored but not rendered.
   final double speed;
 
+  // ── Spatial transform (Phase 7.11) ────────────────────────────────────────
+
+  /// Optional static spatial transform applied to this clip by the compositor.
+  ///
+  /// When null, the clip renders at full size with no transform applied.
+  /// The native compositor skips the CoreImage filter chain entirely for
+  /// null transforms (identity optimisation, zero overhead).
+  ///
+  /// When non-null, [VGClipTransformDescriptor.isIdentity] is also checked
+  /// natively — a descriptor with all default field values is treated as
+  /// identity and skipped.
+  ///
+  /// **Phase 7.11 / DEC-144**: Keyframed transforms, crop, fit/fill, and
+  /// multi-layer overlay are deferred to later phases.
+  final VGClipTransformDescriptor? transform;
+
   // ── Derived helpers ────────────────────────────────────────────────────────
 
   /// The active duration of this clip after trimming, in source-asset seconds.
@@ -188,20 +217,29 @@ final class VGClipDescriptor {
   ///   "speed": 1.0
   /// }
   /// ```
-  Map<String, Object?> toMap() => <String, Object?>{
-        'id': id,
-        'sourcePath': sourcePath,
-        'mediaKind': mediaKind.value,
-        'startTimeSeconds': startTimeSeconds,
-        'durationSeconds': durationSeconds,
-        'trimStartSeconds': trimStartSeconds,
-        'trimEndSeconds': trimEndSeconds,
-        'speed': speed,
-      };
+  Map<String, Object?> toMap() {
+    final m = <String, Object?>{
+      'id': id,
+      'sourcePath': sourcePath,
+      'mediaKind': mediaKind.value,
+      'startTimeSeconds': startTimeSeconds,
+      'durationSeconds': durationSeconds,
+      'trimStartSeconds': trimStartSeconds,
+      'trimEndSeconds': trimEndSeconds,
+      'speed': speed,
+    };
+    // Phase 7.11: include transform only when non-null (omit when identity
+    // to keep wire payload minimal; native null-checks before parsing).
+    if (transform != null) {
+      m['transform'] = transform!.toMap();
+    }
+    return m;
+  }
 
   /// Deserialises a [VGClipDescriptor] from a map produced by [toMap].
   ///
   /// Returns `null` if any required field is missing or has the wrong type.
+  /// Returns `null` if the optional `transform` field is present but invalid.
   static VGClipDescriptor? fromMap(Map<Object?, Object?> map) {
     final id = map['id'];
     final sourcePath = map['sourcePath'];
@@ -224,6 +262,17 @@ final class VGClipDescriptor {
     if (trimEnd <= trimStart || speed <= 0 || startTime < 0 || duration < 0) {
       return null;
     }
+
+    // Phase 7.11: parse optional transform. A present but invalid transform
+    // (e.g. opacity out of range) causes fromMap to return null.
+    VGClipTransformDescriptor? transform;
+    final rawTransform = map['transform'];
+    if (rawTransform != null) {
+      if (rawTransform is! Map<Object?, Object?>) return null;
+      transform = VGClipTransformDescriptor.fromMap(rawTransform);
+      if (transform == null) return null; // invalid transform payload
+    }
+
     return VGClipDescriptor(
       id: id as String,
       sourcePath: sourcePath as String,
@@ -233,6 +282,7 @@ final class VGClipDescriptor {
       trimStartSeconds: trimStart,
       trimEndSeconds: trimEnd,
       speed: speed,
+      transform: transform,
     );
   }
 
@@ -250,6 +300,8 @@ final class VGClipDescriptor {
     double? trimStartSeconds,
     double? trimEndSeconds,
     double? speed,
+    // Use sentinel to allow explicit null assignment (clear transform).
+    Object? transform = _kClipNoValue,
   }) {
     return VGClipDescriptor(
       id: id ?? this.id,
@@ -260,6 +312,9 @@ final class VGClipDescriptor {
       trimStartSeconds: trimStartSeconds ?? this.trimStartSeconds,
       trimEndSeconds: trimEndSeconds ?? this.trimEndSeconds,
       speed: speed ?? this.speed,
+      transform: transform == _kClipNoValue
+          ? this.transform
+          : transform as VGClipTransformDescriptor?,
     );
   }
 
@@ -276,7 +331,8 @@ final class VGClipDescriptor {
           other.durationSeconds == durationSeconds &&
           other.trimStartSeconds == trimStartSeconds &&
           other.trimEndSeconds == trimEndSeconds &&
-          other.speed == speed;
+          other.speed == speed &&
+          other.transform == transform;
 
   @override
   int get hashCode => Object.hash(
@@ -288,6 +344,7 @@ final class VGClipDescriptor {
         trimStartSeconds,
         trimEndSeconds,
         speed,
+        transform,
       );
 
   @override
@@ -298,10 +355,15 @@ final class VGClipDescriptor {
       'start: ${startTimeSeconds}s, '
       'duration: ${durationSeconds}s, '
       'trim: [${trimStartSeconds}s → ${trimEndSeconds}s], '
-      'speed: $speed×)';
+      'speed: $speed×, '
+      'transform: $transform)';
 }
 
-// ── VGMediaKind ────────────────────────────────────────────────────────────────
+// ── Sentinel for copyWith nullable fields ─────────────────────────────────────────
+
+const _kClipNoValue = Object();
+
+// ── VGMediaKind ──────────────────────────────────────────────────────────────────
 
 /// The primary media stream type of a clip's source asset.
 ///

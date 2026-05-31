@@ -271,6 +271,153 @@ static CVPixelBufferRef _VGTCNBlendBuffers(CVPixelBufferRef outgoing,
   return out; // Caller owns +1 from CVPixelBufferCreate
 }
 
+// ─── Phase 7.11: Per-clip CoreImage transform + opacity helper ─────────────────
+//
+// _VGTCNApplyTransformAndOpacity: applies a VGClipTransformDescriptor to a
+//   CVPixelBuffer using CoreImage, returning a new buffer.
+//
+// Coordinate system notes (DEC-144 / D1):
+//   - Dart/UIKit: top-left origin, positive Y down, clockwise rotation positive.
+//   - CoreImage:  bottom-left origin, positive Y up, CCW rotation positive.
+//   Corrections applied here:
+//     anchorY_CI  = (1.0 - anchorY) * frameHeight    (D1: Y-axis flip)
+//     rotation_CI = -rotation                         (negate for CCW)
+//     translationY_CI = -translationY                 (negate for bottom-up)
+//
+// Identity optimisation (D4): caller checks isIdentity BEFORE calling here.
+//   This helper is only invoked for non-identity transforms.
+//
+// Returns a new retained CVPixelBufferRef (+1) on success.
+// Returns NULL with *outError on failure. No silent masking.
+//
+// RR-145: Each non-identity transform frame costs one CVPixelBufferCreate +
+//   CIAffineTransform render + optional CIColorMatrix. Monitor GPU budget.
+
+static CVPixelBufferRef _VGTCNApplyTransformAndOpacity(
+    CVPixelBufferRef sourceBuffer,
+    VGClipTransformDescriptor *td,
+    NSError **outError) {
+
+  size_t w = CVPixelBufferGetWidth(sourceBuffer);
+  size_t h = CVPixelBufferGetHeight(sourceBuffer);
+
+  // Build CoreImage source image.
+  CIImage *srcCI = [CIImage imageWithCVPixelBuffer:sourceBuffer];
+
+  // ─ Affine transform (scale + rotation + translation) ────────────────────────
+  //
+  // Pivot: anchor point in CoreImage coordinates.
+  //   anchorX_CI = anchorX * w
+  //   anchorY_CI = (1.0 - anchorY) * h   <- D1: Y-axis flip for CoreImage
+  //
+  // Logical transform order (left-to-right, applied to image point coordinates):
+  //   1. Translate to anchor: move anchor point to coordinate origin.
+  //   2. Scale around origin.
+  //   3. Rotate around origin (negated for CoreGraphics CCW-positive convention).
+  //   4. Translate back: restore anchor to its original canvas position.
+  //   5. Apply user translation (negate Y for CoreImage bottom-left).
+  //
+  // RR-147 (Phase 7.11 bugfix): Use CGAffineTransformConcat with individually
+  // constructed matrices. CGAffineTransformScale/Rotate/Translate helper functions
+  // concatenate such that coordinate transforms are applied in the REVERSE of
+  // code-written order (the helper post-multiplies). Using explicit Concat here
+  // preserves the intended left-to-right operation order, ensuring the anchor
+  // maps back to its original canvas position (not the CoreImage origin) after
+  // scale/rotation, fixing the TV-02 left/bottom-edge positioning failure.
+
+  CGFloat anchorX_CI = (CGFloat)(td.anchorX * (double)w);
+  CGFloat anchorY_CI = (CGFloat)((1.0 - td.anchorY) * (double)h); // D1
+
+  // Build each component transform independently.
+  CGAffineTransform t1 = CGAffineTransformMakeTranslation(-anchorX_CI, -anchorY_CI);
+  CGAffineTransform t2 = CGAffineTransformMakeScale((CGFloat)td.scaleX, (CGFloat)td.scaleY);
+  CGAffineTransform t3 = CGAffineTransformMakeRotation(-(CGFloat)td.rotation);
+  CGAffineTransform t4 = CGAffineTransformMakeTranslation(anchorX_CI, anchorY_CI);
+  CGAffineTransform t5 = CGAffineTransformMakeTranslation((CGFloat)td.translationX,
+                                                           -(CGFloat)td.translationY);
+
+  // Concatenate in logical left-to-right order: t = t1 · t2 · t3 · t4 · t5.
+  CGAffineTransform t = CGAffineTransformConcat(t1, t2);
+  t = CGAffineTransformConcat(t, t3);
+  t = CGAffineTransformConcat(t, t4);
+  t = CGAffineTransformConcat(t, t5);
+
+  CIFilter *affineFilter = [CIFilter filterWithName:@"CIAffineTransform"];
+  [affineFilter setValue:srcCI       forKey:kCIInputImageKey];
+  [affineFilter setValue:[NSValue valueWithBytes:&t
+                                        objCType:@encode(CGAffineTransform)]
+                  forKey:@"inputTransform"];
+  CIImage *transformedCI = affineFilter.outputImage;
+  if (!transformedCI) {
+    if (outError) {
+      *outError = _VGTCNError(
+          20, @"VGTimelineCompositorNode (Phase 7.11): CIAffineTransform "
+               "produced no output image.");
+    }
+    return NULL;
+  }
+
+  // Clamp to source frame extent so downstream renderer receives
+  // a buffer with defined pixel content outside the transformed region.
+  // CIConstantColorGenerator fills any uncovered pixels with black (transparent=0).
+  CIImage *black = [CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:0]];
+  CIFilter *composite = [CIFilter filterWithName:@"CISourceOverCompositing"];
+  [composite setValue:transformedCI forKey:kCIInputImageKey];
+  [composite setValue:[black imageByCroppingToRect:srcCI.extent]
+               forKey:kCIInputBackgroundImageKey];
+  CIImage *composited = composite.outputImage;
+  if (!composited) { composited = transformedCI; } // fallback: skip composite
+
+  // ─ Opacity via CIColorMatrix (alpha channel multiply) ────────────────────
+  //
+  // CIColorMatrix with identity RGB vectors and alpha vector (0,0,0,opacity)
+  // scales the alpha channel by opacity. This preserves RGB values and
+  // produces premultiplied-compatible output for subsequent blending.
+  CIImage *finalCI = composited;
+  if (td.opacity < 1.0) {
+    CIFilter *opacityFilter = [CIFilter filterWithName:@"CIColorMatrix"];
+    [opacityFilter setValue:composited forKey:kCIInputImageKey];
+    // Alpha vector: (0, 0, 0, opacity) — scales A channel by opacity.
+    CIVector *alphaVec = [CIVector vectorWithX:0 Y:0 Z:0 W:(CGFloat)td.opacity];
+    [opacityFilter setValue:alphaVec forKey:@"inputAVector"];
+    // Bias = 0 (no additive bias needed).
+    [opacityFilter setValue:[CIVector vectorWithX:0 Y:0 Z:0 W:0]
+                     forKey:@"inputBiasVector"];
+    CIImage *opacityOut = opacityFilter.outputImage;
+    if (opacityOut) { finalCI = opacityOut; }
+    // If filter fails, fall through with composited image (opacity not applied).
+  }
+
+  // ─ Render to new CVPixelBuffer (D5: use CVPixelBufferCreate) ─────────────
+  NSDictionary *attrs = @{
+    (id)kCVPixelBufferPixelFormatTypeKey    : @(kCVPixelFormatType_32BGRA),
+    (id)kCVPixelBufferMetalCompatibilityKey : @YES,
+    (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+  };
+  CVPixelBufferRef out = NULL;
+  CVReturn ret = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
+                                     kCVPixelFormatType_32BGRA,
+                                     (__bridge CFDictionaryRef)attrs, &out);
+  if (ret != kCVReturnSuccess || !out) {
+    if (outError) {
+      *outError = _VGTCNError(
+          21, @"VGTimelineCompositorNode (Phase 7.11): CVPixelBufferCreate "
+               "failed for transform output buffer.");
+    }
+    return NULL;
+  }
+
+  CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+  [_VGTCNSharedCIContext() render:finalCI
+                   toCVPixelBuffer:out
+                             bounds:srcCI.extent
+                         colorSpace:cs];
+  CGColorSpaceRelease(cs);
+
+  return out; // Caller owns +1 from CVPixelBufferCreate
+}
+
+
 // ─── os_log
 // ───────────────────────────────────────────────────────────────────
 static os_log_t sTimelineLog;
@@ -287,14 +434,51 @@ static os_log_t sTimelineLog;
 // AVAssetReaderVideoCompositionOutput is not an AVAssetReaderTrackOutput.
 // copyNextSampleBuffer is declared on AVAssetReaderOutput, so the existing
 // call site at pullFrame: continues to work without modification.
+//
+// Phase 7.11 RR-146 (playback-rate-exhaustion fix):
+//   Per-reader frame reuse cache eliminates the dual-reader frame exhaustion
+//   bug where the 60/120 Hz CADisplayLink consumed transition frames at display
+//   rate (not at the 30 fps clip rate), exhausting AVAssetReader prematurely.
+//   Each reader caches its last decoded/transformed CVPixelBuffer. If the
+//   requested asset time falls within the cached sample window, copyNextSampleBuffer
+//   is skipped and the cached buffer is returned (retained +1) to the caller.
+//   The cache is released safely in -dealloc via CVPixelBufferRelease.
 @interface _VGClipReader : NSObject
 @property(nonatomic) NSUInteger clipIndex; // index in _clips
 @property(nonatomic) AVAssetReader *reader;
 @property(nonatomic) AVAssetReaderOutput *trackOutput; // Phase 7.9: base type
 @property(nonatomic) double sourceFPS;                 // nominal frame rate
+// Phase 7.11 RR-146: per-reader frame reuse cache.
+// lastDeliveredBuffer: retained +1 by this reader; released in dealloc.
+// lastDeliveredAssetPTS:      asset-local PTS of the cached frame; -1.0 = empty.
+// lastDeliveredAssetDuration: asset-local sample duration of the cached frame.
+@property(nonatomic) CVPixelBufferRef lastDeliveredBuffer;      // nullable; +1
+@property(nonatomic) double lastDeliveredAssetPTS;              // -1.0 when empty
+@property(nonatomic) double lastDeliveredAssetDuration;
 @end
 
 @implementation _VGClipReader
+
+- (instancetype)init {
+  self = [super init];
+  if (self) {
+    _lastDeliveredBuffer = NULL;
+    _lastDeliveredAssetPTS = -1.0;
+    _lastDeliveredAssetDuration = 0.0;
+  }
+  return self;
+}
+
+- (void)dealloc {
+  // Release the per-reader cached buffer. This fires when the reader is
+  // torn down (clip switch, seek, or invalidate), ensuring no CVPixelBuffer
+  // outlives its owning AVAssetReader.
+  if (_lastDeliveredBuffer) {
+    CVPixelBufferRelease(_lastDeliveredBuffer);
+    _lastDeliveredBuffer = NULL;
+  }
+}
+
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -322,13 +506,18 @@ static os_log_t sTimelineLog;
   _VGClipReader *_outgoingReader; // nullable; non-nil during transition window
 
   // ── Buffer ownership (RR-36) ──────────────────────────────────────────────
-  // Retained +1 by this node. Released before each new pullFrame: decode
-  // and on seek/invalidate. VGFrameEnvelope carries +0.
-  CVPixelBufferRef _lastDeliveredBuffer; // nullable; +1
+  // _lastDeliveredBuffer: retained +1 by this node. Used ONLY to extend the
+  // CVPixelBuffer's lifetime through the VGFrameEnvelope delivery to the
+  // renderer sink (which retains it under its own lock before this is cleared).
+  // Frame decode pacing is now owned by _VGClipReader.lastDeliveredBuffer
+  // (Phase 7.11 RR-146) — not by these node-level fields.
+  // Released on seek and invalidate.
+  CVPixelBufferRef _lastDeliveredBuffer; // nullable; +1 (envelope lifetime)
 
-  // [7.5C] Frame reuse: asset-local PTS and duration of the last decoded frame.
-  // Used to skip copyNextSampleBuffer when tAsset is within the cached window.
-  // Reset on seek, clip switch, init, and invalidate.
+  // Node-level frame reuse fields — kept for seekTo: reset path.
+  // Phase 7.11 RR-146: actual decode pacing uses _VGClipReader per-reader cache.
+  // These are reset on seek to ensure stale values do not poison the per-reader
+  // cache after a reader rebuild.
   double _lastDeliveredAssetPTS;    // -1.0 when no cached frame
   double _lastDeliveredAssetDuration;
 
@@ -969,9 +1158,14 @@ static os_log_t sTimelineLog;
   // ── Phase 7.10: Transition blend path ─────────────────────────────────────
   // During a transition window pull from both _outgoingReader (outgoing clip)
   // and _activeReader (incoming clip) then blend via CoreImage.
+  //
+  // Phase 7.11 RR-146: Both readers now use -_pullBufferFromReader:atAssetTime:error:
+  // which enforces per-reader frame reuse. This prevents the 60/120 Hz
+  // CADisplayLink from consuming transition frames faster than the source clip
+  // frame rate, which previously caused premature AVAssetReader exhaustion.
   // Blend failure returns errorResult — no silent masking (DEC-143).
   if (inTransitionWindow) {
-    // Release last delivered buffer; the blend will produce a new one.
+    // Release node-level last delivered buffer; the blend will produce a new one.
     if (_lastDeliveredBuffer) {
       CVPixelBufferRelease(_lastDeliveredBuffer);
       _lastDeliveredBuffer = NULL;
@@ -981,26 +1175,30 @@ static os_log_t sTimelineLog;
         ? (float)(transitionElapsed / transitionDuration)
         : 1.0f;
 
-    // Pull incoming frame (_activeReader — incoming clip).
-    CMSampleBufferRef inSample =
-        [_activeReader.trackOutput copyNextSampleBuffer];
-    CVPixelBufferRef inPB =
-        inSample ? CMSampleBufferGetImageBuffer(inSample) : NULL;
-    if (inPB) CVPixelBufferRetain(inPB);
-    if (inSample) CFRelease(inSample);
+    // Compute outgoing clip asset-local time.
+    VGClipDescriptor *outgoingClipDesc = _clips[outgoingClipIndex];
+    double elapsedOut = requestedPTSSecs - outgoingClipDesc.startTimeSeconds;
+    double tAssetOut = outgoingClipDesc.trimStartSeconds +
+                       elapsedOut * outgoingClipDesc.speed;
+    tAssetOut = MAX(tAssetOut, outgoingClipDesc.trimStartSeconds);
+    tAssetOut = MIN(tAssetOut, outgoingClipDesc.trimEndSeconds);
 
-    // Pull outgoing frame (_outgoingReader — outgoing clip).
-    CMSampleBufferRef outSample =
-        [_outgoingReader.trackOutput copyNextSampleBuffer];
-    CVPixelBufferRef outPB =
-        outSample ? CMSampleBufferGetImageBuffer(outSample) : NULL;
-    if (outPB) CVPixelBufferRetain(outPB);
-    if (outSample) CFRelease(outSample);
+    // Pull outgoing frame with per-reader reuse guard + Phase 7.11 transform.
+    NSError *outErr = nil;
+    CVPixelBufferRef outPB = [self _pullBufferFromReader:_outgoingReader
+                                             atAssetTime:tAssetOut
+                                                   error:&outErr];
+
+    // Pull incoming frame with per-reader reuse guard + Phase 7.11 transform.
+    NSError *inErr = nil;
+    CVPixelBufferRef inPB = [self _pullBufferFromReader:_activeReader
+                                            atAssetTime:tAsset
+                                                  error:&inErr];
 
     CVPixelBufferRef blendedPB = NULL;
 
     if (inPB && outPB) {
-      // Both readers delivered: perform CoreImage blend.
+      // Both readers delivered: blend the (already transformed) buffers.
       NSError *blendErr = nil;
       blendedPB = _VGTCNBlendBuffers(outPB, inPB, transitionType,
                                      blendAlpha, &blendErr);
@@ -1017,15 +1215,24 @@ static os_log_t sTimelineLog;
         return [VGFrameResult errorResult:blendErr
                                generation:request.generation];
       }
-    } else if (inPB) {
+    } else if (inPB && !outPB) {
       // Outgoing reader exhausted early — deliver incoming frame unblended.
       [self _tearDownOutgoingReader];
       blendedPB = inPB;
-      inPB = NULL; // ownership transferred
-    } else if (outPB) {
+      inPB = NULL; // ownership transferred to blendedPB
+    } else if (outPB && !inPB) {
+      if (inErr) {
+        // Incoming reader error — report it.
+        CVPixelBufferRelease(outPB);
+        os_log_error(sTimelineLog,
+                     "[VGTCNode] transition: incoming reader error clip %lu: %{public}@",
+                     (unsigned long)activeClipIndex,
+                     inErr.localizedDescription);
+        return [VGFrameResult errorResult:inErr generation:request.generation];
+      }
       // Incoming reader not yet ready — deliver outgoing frame unblended.
       blendedPB = outPB;
-      outPB = NULL;
+      outPB = NULL; // ownership transferred
     } else {
       // Both readers exhausted — skip this frame.
       return [VGFrameResult skippedWithGeneration:request.generation];
@@ -1034,11 +1241,10 @@ static os_log_t sTimelineLog;
     if (inPB)  CVPixelBufferRelease(inPB);
     if (outPB) CVPixelBufferRelease(outPB);
 
-    // Store blended buffer (node holds +1). Disable frame-reuse for transition
-    // frames — each blend output is unique.
+    // Store blended buffer for node-level envelope lifetime (RR-36).
+    // Per-reader caches own decode pacing; node-level field is only for
+    // extending the blended buffer lifetime through the envelope delivery.
     _lastDeliveredBuffer = blendedPB;
-    _lastDeliveredAssetPTS = -1.0;
-    _lastDeliveredAssetDuration = 0.0;
 
     CMTime outputDur =
         CMTimeMakeWithSeconds(1.0 / _activeReader.sourceFPS, 600);
@@ -1064,52 +1270,39 @@ static os_log_t sTimelineLog;
                                      generation:request.generation];
   }
 
-  // [7.5C] Frame reuse guard: if the requested asset time falls within the
-  // window of the already-decoded frame, return the cached buffer directly
-  // without calling copyNextSampleBuffer. This prevents exhausting clip A's
-  // AVAssetReader during the paused pre-play period and prevents clip B from
-  // being decoded too fast during play.
-  if (_lastDeliveredBuffer != NULL && _activeReader != nil) {
-    if (tAsset >= _lastDeliveredAssetPTS &&
-        tAsset < _lastDeliveredAssetPTS + _lastDeliveredAssetDuration) {
-      VGFrameEnvelope env;
-      memset(&env, 0, sizeof(env));
-      env.mediaType = VGMediaTypeVideo;
-      env.payload.videoBuffer = (void *)_lastDeliveredBuffer; // +0; node holds +1
-      env.pts = request.requestedPTS;
-      env.dts = kCMTimeInvalid;
-      env.duration = CMTimeMakeWithSeconds(_lastDeliveredAssetDuration, 600);
-      env.generation = request.generation;
-      env.metadata = NULL;
-      return [VGFrameResult deliveredWithEnvelope:env generation:request.generation];
-    }
-  }
-
-  // ── Release last delivered buffer before next decode (RR-36) ─────────────
+  // ── Normal single-reader path (non-transition) ────────────────────────────
+  // Phase 7.11 RR-146: Use per-reader frame reuse helper.
+  // This replaces the former node-level _lastDeliveredBuffer reuse guard
+  // and the inline copyNextSampleBuffer + transform blocks.
+  //
+  // Release node-level buffer before pulling: the per-reader cache now owns
+  // decode pacing; the node-level field exists only to extend envelope lifetime.
   if (_lastDeliveredBuffer) {
     CVPixelBufferRelease(_lastDeliveredBuffer);
     _lastDeliveredBuffer = NULL;
   }
 
-  // ── Pull next sample from AVAssetReaderOutput (Phase 7.9: VideoCompositionOutput) ──
-  // copyNextSampleBuffer returns +1 CMSampleBufferRef.
-  // Returns NULL when exhausted (reader.status → Completed) or on error.
-  CMSampleBufferRef sample = [_activeReader.trackOutput copyNextSampleBuffer];
+  NSError *pullErr = nil;
+  CVPixelBufferRef pb = [self _pullBufferFromReader:_activeReader
+                                         atAssetTime:tAsset
+                                               error:&pullErr];
 
-  if (!sample) {
+  if (!pb) {
+    if (pullErr) {
+      // Error from reader or transform.
+      return [VGFrameResult errorResult:pullErr generation:request.generation];
+    }
+    // NULL without error: reader completed (EOS) or unknown status.
     AVAssetReaderStatus status = _activeReader.reader.status;
     if (status == AVAssetReaderStatusCompleted) {
-      // This clip is exhausted. If it's the last clip → EOS.
-      // If not the last clip, the next pullFrame: will switch to the next
-      // clip's reader (activeClipIndex will advance naturally).
       os_log(sTimelineLog,
              "[VGTCNode] clip %lu reader completed at requestedPTS=%.3fs",
              (unsigned long)activeClipIndex, requestedPTSSecs);
       if (activeClipIndex >= _clips.count - 1) {
         return [VGFrameResult endOfStreamWithGeneration:request.generation];
       }
-      // Not last clip — return skip. Scheduler will request the next PTS,
-      // which will fall in the next clip and build a new reader.
+      // Not last clip — return skip. Scheduler will request next PTS which
+      // falls in the next clip, building a new reader.
       return [VGFrameResult skippedWithGeneration:request.generation];
     } else if (status == AVAssetReaderStatusFailed) {
       NSError *readerErr =
@@ -1124,58 +1317,20 @@ static os_log_t sTimelineLog;
     return [VGFrameResult skippedWithGeneration:request.generation];
   }
 
-  // ── Extract pixel buffer from sample ─────────────────────────────────────
-  // CMSampleBufferGetImageBuffer returns +0 CVPixelBufferRef.
-  // Must retain before releasing the sample.
-  CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sample);
-  if (!pb) {
-    // Timing-only or non-image sample — skip.
-    CFRelease(sample);
-    return [VGFrameResult skippedWithGeneration:request.generation];
-  }
-
-  // Retain the pixel buffer BEFORE releasing the sample (Apple Framework
-  // Check). After CFRelease(sample), the CVPixelBuffer may be freed if not
-  // retained.
-  CVPixelBufferRetain(pb); // source now owns +1
-
-  // Extract timing from the sample.
-  CMTime samplePTS = CMSampleBufferGetPresentationTimeStamp(sample);
-  CMTime sampleDur = CMSampleBufferGetDuration(sample);
-
-  // [7.5C] Update frame reuse cache with asset-local PTS and duration.
-  // _lastDeliveredAssetPTS/Duration are used in the reuse guard above on
-  // subsequent pulls for the same decoded frame.
-  double sPTS = CMTimeGetSeconds(samplePTS);
-  double sDur = (CMTIME_IS_VALID(sampleDur) && !CMTIME_IS_INDEFINITE(sampleDur))
-      ? CMTimeGetSeconds(sampleDur)
-      : (1.0 / _activeReader.sourceFPS);
-  _lastDeliveredAssetPTS = sPTS;
-  _lastDeliveredAssetDuration = sDur;
-
-  // Release the sample buffer; pixel buffer is now independently retained.
-  CFRelease(sample);
-
-  // Compute output PTS: use the global timeline PTS from the request,
-  // not the asset-local sample PTS. This ensures downstream nodes
-  // (renderer, encoder) see monotonically increasing timeline timestamps.
-  CMTime outputPTS = request.requestedPTS;
-  CMTime outputDur =
-      CMTIME_IS_VALID(sampleDur) && !CMTIME_IS_INDEFINITE(sampleDur)
-          ? sampleDur
-          : CMTimeMakeWithSeconds(1.0 / _activeReader.sourceFPS, 600);
-
-  // ── Store retained buffer (RR-36: source owns +1) ─────────────────────────
+  // Store for node-level envelope lifetime (RR-36).
   _lastDeliveredBuffer = pb;
 
-  // ── Build VGFrameEnvelope ─────────────────────────────────────────────────
-  // payload.videoBuffer is +0 per VGFrameEnvelope.h contract.
-  // The buffer is valid until the next pullFrame: or invalidate.
+  // Use asset-local duration from per-reader cache for the output envelope.
+  double sDur = _activeReader.lastDeliveredAssetDuration;
+  CMTime outputDur = (sDur > 0.0)
+      ? CMTimeMakeWithSeconds(sDur, 600)
+      : CMTimeMakeWithSeconds(1.0 / _activeReader.sourceFPS, 600);
+
   VGFrameEnvelope env;
   memset(&env, 0, sizeof(env));
   env.mediaType = VGMediaTypeVideo;
   env.payload.videoBuffer = (void *)pb; // +0 in envelope; node holds +1
-  env.pts = outputPTS;
+  env.pts = request.requestedPTS;
   env.dts = kCMTimeInvalid;
   env.duration = outputDur;
   env.generation = request.generation;
@@ -1193,6 +1348,113 @@ static os_log_t sTimelineLog;
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Phase 7.11 RR-146: Per-reader frame pull with reuse guard, transform, and cache update.
+///
+/// This helper replaces the inline copyNextSampleBuffer + Phase 7.11 transform
+/// blocks that previously appeared in both the normal and transition paths of
+/// pullFrame:. By moving the reuse guard into the reader, the 60/120 Hz
+/// CADisplayLink no longer consumes frames faster than the source clip's frame
+/// rate, fixing the premature AVAssetReader exhaustion bug.
+///
+/// Ownership contract (caller must release the returned buffer):
+///   Returns a retained CVPixelBufferRef (+1) on success.
+///   Returns NULL with *outError set on error (transform or reader error).
+///   Returns NULL with *outError = nil when reader completed (EOS/exhausted).
+///     In the EOS case, the caller must check reader.status to distinguish
+///     AVAssetReaderStatusCompleted from AVAssetReaderStatusFailed.
+///
+/// Per-reader cache behavior:
+///   If reader.lastDeliveredBuffer is non-NULL and tAsset falls within
+///   [reader.lastDeliveredAssetPTS, reader.lastDeliveredAssetPTS + reader.lastDeliveredAssetDuration),
+///   the cached buffer is returned (retained +1) WITHOUT calling copyNextSampleBuffer.
+///   Otherwise, the previous cache is released, copyNextSampleBuffer is called,
+///   Phase 7.11 transform is applied if non-identity, and the cache is updated.
+///
+/// Thread safety: must be called on the serial pull queue (_VGTimelinePullQueue).
+- (CVPixelBufferRef)_pullBufferFromReader:(_VGClipReader *)reader
+                               atAssetTime:(double)tAsset
+                                     error:(NSError **)outError {
+  NSParameterAssert(reader != nil);
+
+  // ── 1. Per-reader reuse guard ──────────────────────────────────────────────
+  if (reader.lastDeliveredBuffer != NULL) {
+    if (tAsset >= reader.lastDeliveredAssetPTS &&
+        tAsset <  reader.lastDeliveredAssetPTS + reader.lastDeliveredAssetDuration) {
+      // Requested asset time is within the cached sample window.
+      // Retain and return cached buffer without decoding a new sample.
+      CVPixelBufferRetain(reader.lastDeliveredBuffer);
+      os_log_debug(sTimelineLog,
+                   "[VGTCNode] reader cache hit: clip=%lu tAsset=%.3fs "
+                   "cacheWindow=[%.3f, %.3f)",
+                   (unsigned long)reader.clipIndex, tAsset,
+                   reader.lastDeliveredAssetPTS,
+                   reader.lastDeliveredAssetPTS + reader.lastDeliveredAssetDuration);
+      return reader.lastDeliveredBuffer; // caller owns +1
+    }
+    // Cache miss: release previous buffer before decoding a new sample.
+    CVPixelBufferRelease(reader.lastDeliveredBuffer);
+    reader.lastDeliveredBuffer = NULL;
+    reader.lastDeliveredAssetPTS = -1.0;
+    reader.lastDeliveredAssetDuration = 0.0;
+  }
+
+  // ── 2. Decode next sample ──────────────────────────────────────────────────
+  // copyNextSampleBuffer returns +1 CMSampleBufferRef.
+  // Returns NULL when exhausted (reader.status → Completed) or on error.
+  CMSampleBufferRef sample = [reader.trackOutput copyNextSampleBuffer];
+  if (!sample) {
+    // NULL without error — caller inspects reader.reader.status for EOS/fail.
+    if (outError) *outError = nil;
+    return NULL;
+  }
+
+  // ── 3. Extract pixel buffer ────────────────────────────────────────────────
+  // CMSampleBufferGetImageBuffer returns +0. Retain before releasing sample.
+  CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sample);
+  if (!pb) {
+    CFRelease(sample);
+    if (outError) *outError = nil;
+    return NULL; // timing-only sample — caller treats as skip
+  }
+  CVPixelBufferRetain(pb); // pb is now +1
+
+  // ── 4. Apply Phase 7.11 per-clip transform (identity optimization: skip if identity) ──
+  VGClipTransformDescriptor *td = _clips[reader.clipIndex].transform;
+  if (td && !td.isIdentity) {
+    NSError *tfErr = nil;
+    CVPixelBufferRef transformedPB = _VGTCNApplyTransformAndOpacity(pb, td, &tfErr);
+    CVPixelBufferRelease(pb); // release un-transformed original
+    if (!transformedPB) {
+      CFRelease(sample);
+      os_log_error(sTimelineLog,
+                   "[VGTCNode] _pullBufferFromReader: transform clip %lu: %{public}@",
+                   (unsigned long)reader.clipIndex,
+                   tfErr.localizedDescription);
+      if (outError) *outError = tfErr;
+      return NULL;
+    }
+    pb = transformedPB; // +1 owned by this scope
+  }
+
+  // ── 5. Read timing and update per-reader cache ────────────────────────────
+  CMTime samplePTS = CMSampleBufferGetPresentationTimeStamp(sample);
+  CMTime sampleDur = CMSampleBufferGetDuration(sample);
+  double sPTS = CMTimeGetSeconds(samplePTS);
+  double sDur = (CMTIME_IS_VALID(sampleDur) && !CMTIME_IS_INDEFINITE(sampleDur))
+      ? CMTimeGetSeconds(sampleDur)
+      : (1.0 / reader.sourceFPS);
+
+  // Cache owns +1; returned pb also owns +1 — two independent retains.
+  reader.lastDeliveredAssetPTS      = sPTS;
+  reader.lastDeliveredAssetDuration = sDur;
+  reader.lastDeliveredBuffer        = pb;
+  CVPixelBufferRetain(pb); // cache takes its own +1
+
+  CFRelease(sample); // done with sample; pb is independently retained
+
+  return pb; // caller owns +1
+}
 
 /// Build an AVAssetReader and AVAssetReaderVideoCompositionOutput for the clip
 /// at `clipIndex`, starting at asset-local time `startTimeSecs`.
