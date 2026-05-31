@@ -1,16 +1,17 @@
 // vg_editor_draft.dart
-// Vanguard Media Engine — Phase 7 Stage 7.7 / Stage 7.10 / Stage 7.13
+// Vanguard Media Engine — Phase 7 Stage 7.7 / Stage 7.10 / Stage 7.13 / Stage 7.14
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // STAGE 7.7  — EDITOR DRAFT RECIPE
 // STAGE 7.10 — TRANSITION-AWARE LAYOUT FACTORY
 // STAGE 7.13 — NON-DESTRUCTIVE TRIM EDITING API
+// STAGE 7.14 — NON-DESTRUCTIVE SPLIT EDITING API
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // VGEditorDraft is the immutable, non-destructive composition recipe that
 // describes a complete timeline editing session.
 //
-// Design rules (Phase 7.7 / 7.10 / 7.13 / Opus M4):
+// Design rules (Phase 7.7 / 7.10 / 7.13 / 7.14 / Opus M4):
 //   - Pure Dart value type. No rendering logic, no channel calls.
 //   - The clips list is non-destructive: source files are never modified.
 //   - All fields are validated at construction time via asserts.
@@ -31,6 +32,15 @@
 //     validates the new trim range, replaces the target clip, and recomputes
 //     the sequential layout via sequentialWithTransitions. Dart is the single
 //     source of truth for trim validation and start-time cascade (DEC-146).
+//
+// Phase 7.14 additions (DEC-147):
+//   - VGEditorDraft.splitClip(...) is a non-destructive split-editing helper that
+//     divides a clip at a source-local playhead position (splitSeconds) into two
+//     adjacent clips. The left clip retains the original ID; the right clip gets
+//     a deterministic unique ID. Outgoing transitions are rebound to the right
+//     clip. The sequential layout is recomputed via sequentialWithTransitions.
+//     Dart is the single source of truth for split math, ID generation, and
+//     transition rebinding (DEC-147).
 //
 // Consumed by VGEditorController (Stage 7.7) to coordinate channel calls.
 //
@@ -400,6 +410,176 @@ final class VGEditorDraft {
       id: id,
       clips: updatedClips,
       transitions: transitions,
+      canvasWidth: canvasWidth,
+      canvasHeight: canvasHeight,
+      fps: fps,
+    );
+  }
+
+  // ── Split editing (Phase 7.14 / DEC-147) ──────────────────────────────────
+
+  /// Returns a new copy of this draft with [clipId] split into two adjacent
+  /// clips at [splitSeconds] (measured in absolute source-local seconds).
+  ///
+  /// The split divides the clip's active trim window:
+  /// - **Left Clip**: retains the original [clipId], keeps [VGClipDescriptor.trimStartSeconds],
+  ///   and sets its [VGClipDescriptor.trimEndSeconds] = [splitSeconds].
+  /// - **Right Clip**: assigned a deterministic unique id (`${clipId}-split-1`,
+  ///   incrementing the suffix if there is a collision), sets
+  ///   [VGClipDescriptor.trimStartSeconds] = [splitSeconds], and retains the
+  ///   original [VGClipDescriptor.trimEndSeconds].
+  ///
+  /// Both clips inherit the original [VGClipDescriptor.sourcePath],
+  /// [VGClipDescriptor.mediaKind], [VGClipDescriptor.durationSeconds],
+  /// [VGClipDescriptor.speed], and [VGClipDescriptor.transform].
+  ///
+  /// **Transition rebinding (DEC-147):**
+  /// - Outgoing transitions (`fromClipId == clipId`) are rebound to depart
+  ///   from the new right clip ID.
+  /// - Incoming transitions (`toClipId == clipId`) remain bound to the left
+  ///   clip ID.
+  /// - The split boundary between left and right is a hard cut — no transition
+  ///   is inserted at the boundary.
+  ///
+  /// The sequential layout (all `startTimeSeconds`) is recomputed via
+  /// [VGEditorDraft.sequentialWithTransitions] after the split.
+  ///
+  /// **Dart is the single source of truth for split math, ID generation, and
+  /// transition rebinding (DEC-147).** The rebuilt draft is forwarded to the
+  /// native timeline via `VGEditorController.updateDraft` → `updateTimeline`.
+  ///
+  /// Throws [ArgumentError] if:
+  /// - [clipId] is not found in this draft.
+  /// - [splitSeconds] is not strictly within the clip's active trim window
+  ///   (`trimStartSeconds < splitSeconds < trimEndSeconds`).
+  /// - Either resulting clip's active duration is below 0.1 s (minimum).
+  /// - The left clip's resulting `timelineDuration` is less than its incoming
+  ///   non-hard-cut transition overlap (would collapse transition window).
+  /// - The right clip's resulting `timelineDuration` is less than its outgoing
+  ///   non-hard-cut transition overlap (would collapse transition window).
+  ///
+  /// ```dart
+  /// final split = draft.splitClip(
+  ///   clipId: 'clip-A',
+  ///   splitSeconds: 3.0,
+  /// );
+  /// // split.clips[0].id              == 'clip-A'
+  /// // split.clips[0].trimEndSeconds  == 3.0
+  /// // split.clips[1].id              == 'clip-A-split-1'
+  /// // split.clips[1].trimStartSeconds == 3.0
+  /// ```
+  VGEditorDraft splitClip({
+    required String clipId,
+    required double splitSeconds,
+  }) {
+    // 1. Locate the target clip.
+    final targetIndex = clips.indexWhere((c) => c.id == clipId);
+    if (targetIndex == -1) {
+      throw ArgumentError(
+        'VGEditorDraft.splitClip: clip "$clipId" not found in draft "$id".',
+      );
+    }
+    final targetClip = clips[targetIndex];
+
+    // 2. Validate: splitSeconds must be strictly within the active trim window.
+    if (splitSeconds <= targetClip.trimStartSeconds ||
+        splitSeconds >= targetClip.trimEndSeconds) {
+      throw ArgumentError(
+        'VGEditorDraft.splitClip: splitSeconds ($splitSeconds) must be '
+        'strictly between trimStartSeconds (${targetClip.trimStartSeconds}) '
+        'and trimEndSeconds (${targetClip.trimEndSeconds}) '
+        'for clip "$clipId".',
+      );
+    }
+
+    // 3. Validate minimum active duration for both resulting clips.
+    final leftDuration = splitSeconds - targetClip.trimStartSeconds;
+    final rightDuration = targetClip.trimEndSeconds - splitSeconds;
+    if (leftDuration < _kMinTrimDurationSeconds ||
+        rightDuration < _kMinTrimDurationSeconds) {
+      throw ArgumentError(
+        'VGEditorDraft.splitClip: resulting clip active durations '
+        '($leftDuration s / $rightDuration s) must each be >= '
+        '$_kMinTrimDurationSeconds s. Do not silently clamp.',
+      );
+    }
+
+    // 4. Generate a deterministic unique ID for the right-hand split clip.
+    //    Starts at "${clipId}-split-1" and increments until unique.
+    final existingIds = clips.map((c) => c.id).toSet();
+    var splitIndex = 1;
+    var rightId = '$clipId-split-$splitIndex';
+    while (existingIds.contains(rightId)) {
+      splitIndex++;
+      rightId = '$clipId-split-$splitIndex';
+    }
+
+    // 5. Validate transition-overlap safety.
+    //    Left clip timeline duration must satisfy incoming transition overlap.
+    //    Right clip timeline duration must satisfy outgoing transition overlap.
+    final prevClipId = targetIndex > 0 ? clips[targetIndex - 1].id : null;
+    final nextClipId =
+        targetIndex < clips.length - 1 ? clips[targetIndex + 1].id : null;
+
+    double overlapIn = 0.0;
+    double overlapOut = 0.0;
+    for (final t in transitions) {
+      if (t.isHardCut) continue;
+      if (t.toClipId == targetClip.id && t.fromClipId == prevClipId) {
+        overlapIn += t.durationSeconds;
+      }
+      if (t.fromClipId == targetClip.id && t.toClipId == nextClipId) {
+        overlapOut += t.durationSeconds;
+      }
+    }
+
+    final leftTimelineDuration = leftDuration / targetClip.speed;
+    final rightTimelineDuration = rightDuration / targetClip.speed;
+    if (leftTimelineDuration < overlapIn) {
+      throw ArgumentError(
+        'VGEditorDraft.splitClip: resulting left clip timelineDuration '
+        '($leftTimelineDuration s) for clip "$clipId" is less than its '
+        'incoming transition overlap ($overlapIn s). '
+        'Split would collapse transition window.',
+      );
+    }
+    if (rightTimelineDuration < overlapOut) {
+      throw ArgumentError(
+        'VGEditorDraft.splitClip: resulting right clip timelineDuration '
+        '($rightTimelineDuration s) for clip "$clipId" is less than its '
+        'outgoing transition overlap ($overlapOut s). '
+        'Split would collapse transition window.',
+      );
+    }
+
+    // 6. Build left and right clip descriptors.
+    //    Left clip: retain original id, update trimEnd only.
+    //    Right clip: new id, update trimStart only. All other fields inherited.
+    final leftClip = targetClip.copyWith(trimEndSeconds: splitSeconds);
+    final rightClip = targetClip.copyWith(
+      id: rightId,
+      trimStartSeconds: splitSeconds,
+    );
+
+    // 7. Assemble updated clip list: replace target, insert right clip after.
+    final updatedClips = List<VGClipDescriptor>.of(clips);
+    updatedClips[targetIndex] = leftClip;
+    updatedClips.insert(targetIndex + 1, rightClip);
+
+    // 8. Rebind outgoing transitions from the original clip to the right clip.
+    //    Incoming transitions remain bound to the left clip (its ID is unchanged).
+    final updatedTransitions = transitions.map((t) {
+      if (t.fromClipId == targetClip.id) {
+        return t.copyWith(fromClipId: rightId);
+      }
+      return t;
+    }).toList();
+
+    // 9. Rebuild the sequential layout (propagates startTimeSeconds cascade).
+    return VGEditorDraft.sequentialWithTransitions(
+      id: id,
+      clips: updatedClips,
+      transitions: updatedTransitions,
       canvasWidth: canvasWidth,
       canvasHeight: canvasHeight,
       fps: fps,

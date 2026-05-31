@@ -1130,4 +1130,107 @@ void main() {
           reason: 'ArgumentError from draft validation must not reach channel');
     });
   });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // splitClip() — Phase 7.14 / DEC-147
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorController — splitClip() (Phase 7.14)', () {
+    late VGEditorController controller;
+    final List<String> calledMethods = [];
+    dynamic capturedUpdateArgs;
+
+    setUp(() async {
+      calledMethods.clear();
+      capturedUpdateArgs = null;
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        switch (method) {
+          case 'createTimelineTexture':
+            return {'textureId': 30, 'width': 640, 'height': 360};
+          case 'updateTimeline':
+            capturedUpdateArgs = args;
+            return {'textureId': 31, 'width': 640, 'height': 360};
+          case 'timelinePause':
+          case 'disposeTimeline':
+            return null;
+          default:
+            return null;
+        }
+      });
+      controller = VGEditorController(initialDraft: _twoClipDraft());
+      await controller.initialize();
+    });
+
+    tearDown(() => controller.dispose());
+
+    test('TR-SEC1 splitClip invokes updateTimeline exactly once', () async {
+      calledMethods.clear();
+      await controller.splitClip(
+        clipId: 'clip-A',
+        splitSeconds: 3.0,
+      );
+
+      expect(
+        calledMethods.where((m) => m == 'updateTimeline').length,
+        1,
+        reason: 'splitClip must invoke updateTimeline exactly once',
+      );
+    });
+
+    test('TR-SEC2 splitClip updates draft value notifier and resets currentPTS to 0.0', () async {
+      // Advance PTS via callback.
+      await controller.handleNativeCallback(
+        const MethodCall('onTimelineFrame', {'pts': 2.5}),
+      );
+      expect(controller.value.currentPTS, closeTo(2.5, 0.001));
+
+      await controller.splitClip(
+        clipId: 'clip-A',
+        splitSeconds: 3.0,
+      );
+
+      // PTS must reset to 0.
+      expect(controller.value.currentPTS, closeTo(0.0, 0.001));
+      // Controller must be ready again.
+      expect(controller.value.isReady, isTrue);
+      // Draft must now have 3 clips.
+      expect(controller.draft.clips.length, 3);
+      // Left clip retains original ID.
+      expect(controller.draft.clips[0].id, 'clip-A');
+      // Right clip has generated ID.
+      expect(controller.draft.clips[1].id, 'clip-A-split-1');
+      // updateTimeline payload must contain the updated draft.
+      expect(capturedUpdateArgs, isA<Map>());
+      final argsMap = capturedUpdateArgs as Map;
+      expect(argsMap.containsKey('draft'), isTrue);
+    });
+
+    test('TR-SEC3 splitClip throws StateError after dispose', () async {
+      controller.dispose();
+      await expectLater(
+        controller.splitClip(
+          clipId: 'clip-A',
+          splitSeconds: 3.0,
+        ),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('TR-SEC4 splitClip propagates ArgumentError without calling updateTimeline',
+        () async {
+      calledMethods.clear();
+      await expectLater(
+        controller.splitClip(
+          clipId: 'clip-A',
+          splitSeconds: 99.0, // out of [trimStart, trimEnd] range → ArgumentError
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      // updateTimeline must NOT have been called.
+      expect(calledMethods, isNot(contains('updateTimeline')),
+          reason: 'ArgumentError from draft validation must not reach channel');
+    });
+  });
 }
+

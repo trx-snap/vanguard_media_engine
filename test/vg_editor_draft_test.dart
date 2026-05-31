@@ -857,4 +857,190 @@ void main() {
       expect(trimmed.durationSeconds, closeTo(6.5, 1e-9));
     });
   });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // splitClip (Phase 7.14 / DEC-147)
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorDraft — splitClip (Phase 7.14)', () {
+    // Shared fixture: two 5-second clips, no transitions (hard-cut baseline).
+    VGEditorDraft makeSplitDraft() => VGEditorDraft.sequentialWithTransitions(
+          id: 'draft-split',
+          clips: [
+            _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+            _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+          ],
+        );
+
+    // Transition fixture: clip A (5s) → dissolve (1s) → clip B (5s).
+    VGEditorDraft makeTransitionSplitDraft() {
+      final tr = VGTransitionDescriptor(
+        id: 'tr-AB',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 1.0,
+        fromClipId: 'clip-A',
+        toClipId: 'clip-B',
+      );
+      return VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-split-dissolve',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        transitions: [tr],
+      );
+    }
+
+    test('TR-SP1 valid split returns new draft; original is unchanged', () {
+      final draft = makeSplitDraft();
+      final split = draft.splitClip(clipId: 'clip-A', splitSeconds: 3.0);
+
+      // Original draft is immutable — unchanged.
+      expect(draft.clips.length, 2);
+      expect(draft.clips[0].trimEndSeconds, closeTo(5.0, 1e-9));
+
+      // Returned draft has 3 clips (A, A-split-1, B).
+      expect(split.clips.length, 3);
+    });
+
+    test('TR-SP2 left clip retains ID and updates trimEnd; right clip gets new ID and correct trimStart', () {
+      final draft = makeSplitDraft();
+      final split = draft.splitClip(clipId: 'clip-A', splitSeconds: 3.0);
+
+      // Left clip: original ID, trimEnd = splitSeconds.
+      final left = split.clips[0];
+      expect(left.id, 'clip-A');
+      expect(left.trimStartSeconds, closeTo(0.0, 1e-9));
+      expect(left.trimEndSeconds, closeTo(3.0, 1e-9));
+
+      // Right clip: deterministic ID, trimStart = splitSeconds, trimEnd unchanged.
+      final right = split.clips[1];
+      expect(right.id, 'clip-A-split-1');
+      expect(right.trimStartSeconds, closeTo(3.0, 1e-9));
+      expect(right.trimEndSeconds, closeTo(5.0, 1e-9));
+
+      // Both clips inherit sourcePath and mediaKind.
+      expect(right.sourcePath, left.sourcePath);
+      expect(right.mediaKind, left.mediaKind);
+      expect(right.durationSeconds, closeTo(left.durationSeconds, 1e-9));
+    });
+
+    test('TR-SP3 start-time cascade is correct after split', () {
+      // Clip A (5s) split at 3s → left=3s, right=2s; then Clip B (5s).
+      // Expected: left@0.0, right@3.0, B@5.0. Total = 10s.
+      final draft = makeSplitDraft();
+      final split = draft.splitClip(clipId: 'clip-A', splitSeconds: 3.0);
+
+      expect(split.clips[0].startTimeSeconds, closeTo(0.0, 1e-9));
+      expect(split.clips[1].startTimeSeconds, closeTo(3.0, 1e-9));
+      expect(split.clips[2].startTimeSeconds, closeTo(5.0, 1e-9));
+      // Total duration is preserved: 3 + 2 + 5 = 10s (hard cut, no overlap lost).
+      expect(split.durationSeconds, closeTo(10.0, 1e-9));
+    });
+
+    test('TR-SP4 outgoing transition is rebound to right clip; incoming stays on left', () {
+      // Dissolve A→B: after split, dissolve should be rebound to A-split-1→B.
+      final draft = makeTransitionSplitDraft();
+      final split = draft.splitClip(clipId: 'clip-A', splitSeconds: 3.0);
+
+      // The transition's fromClipId must now be the right clip ID.
+      expect(split.transitions.length, 1);
+      final t = split.transitions[0];
+      expect(t.fromClipId, 'clip-A-split-1',
+          reason: 'Outgoing transition must be rebound to right split clip');
+      expect(t.toClipId, 'clip-B',
+          reason: 'Transition target must remain clip-B');
+    });
+
+    test('TR-SP5 still-image clip split preserves mediaKind', () {
+      // A still-image clip (VGMediaKind.image) can be split — display hold window divides.
+      final stillClip = VGClipDescriptor(
+        id: 'still-A',
+        sourcePath: '/tmp/still_a.png',
+        mediaKind: VGMediaKind.image,
+        durationSeconds: 5.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 5.0,
+      );
+      final draft = VGEditorDraft(
+        id: 'draft-still-split',
+        clips: [stillClip],
+      );
+      final split = draft.splitClip(clipId: 'still-A', splitSeconds: 2.5);
+
+      expect(split.clips.length, 2);
+      expect(split.clips[0].mediaKind, VGMediaKind.image,
+          reason: 'Left clip must retain image mediaKind');
+      expect(split.clips[1].mediaKind, VGMediaKind.image,
+          reason: 'Right clip must retain image mediaKind');
+      expect(split.clips[0].trimEndSeconds, closeTo(2.5, 1e-9));
+      expect(split.clips[1].trimStartSeconds, closeTo(2.5, 1e-9));
+    });
+
+    test('TR-SP6 out-of-bounds splitSeconds throws ArgumentError', () {
+      final draft = makeSplitDraft();
+
+      // Below trimStartSeconds (== 0.0).
+      expect(
+        () => draft.splitClip(clipId: 'clip-A', splitSeconds: -1.0),
+        throwsA(isA<ArgumentError>()),
+      );
+
+      // Equal to trimStartSeconds.
+      expect(
+        () => draft.splitClip(clipId: 'clip-A', splitSeconds: 0.0),
+        throwsA(isA<ArgumentError>()),
+      );
+
+      // Equal to trimEndSeconds.
+      expect(
+        () => draft.splitClip(clipId: 'clip-A', splitSeconds: 5.0),
+        throwsA(isA<ArgumentError>()),
+      );
+
+      // Beyond trimEndSeconds.
+      expect(
+        () => draft.splitClip(clipId: 'clip-A', splitSeconds: 6.0),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
+
+    test('TR-SP7 resulting clips below 0.1 s minimum throw ArgumentError', () {
+      final draft = makeSplitDraft();
+
+      // Left clip would be 0.05s (below minimum).
+      expect(
+        () => draft.splitClip(clipId: 'clip-A', splitSeconds: 0.05),
+        throwsA(isA<ArgumentError>()),
+      );
+
+      // Right clip would be 0.05s (below minimum).
+      expect(
+        () => draft.splitClip(clipId: 'clip-A', splitSeconds: 4.95),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
+
+    test('TR-SP8 split violating transition overlap boundary throws ArgumentError', () {
+      // Dissolve A→B is 1s. Splitting clip A at 0.5s → right clip = 4.5s
+      // wall-clock, which is fine for the outgoing transition (4.5 >= 1.0).
+      // But splitting at 4.9s → right clip = 0.1s exactly ≥ min duration,
+      // but right timeline duration (0.1s / 1.0 speed = 0.1s) < overlapOut (1.0s).
+      final draft = makeTransitionSplitDraft();
+
+      // Split creates right clip with only 0.1s, which is < 1.0s outgoing overlap.
+      expect(
+        () => draft.splitClip(clipId: 'clip-A', splitSeconds: 4.9),
+        throwsA(isA<ArgumentError>()),
+        reason: 'Right clip timelineDuration must be >= outgoing transition overlap',
+      );
+
+      // Unknown clip ID throws ArgumentError.
+      expect(
+        () => draft.splitClip(clipId: 'clip-UNKNOWN', splitSeconds: 2.0),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
+  });
 }
+

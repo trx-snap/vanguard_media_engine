@@ -80,6 +80,10 @@ class _VanguardManualTestPlaygroundState
   // true once _trimClipA() succeeds; resets when timeline is rebuilt.
   bool _trimApplied = false;
 
+  // ── Phase 7.14: Split Debug State ──────────────────────────────────────────
+  // true once _splitClipA() succeeds; resets when timeline is rebuilt.
+  bool _splitApplied = false;
+
   // ── Seek scrub throttle ────────────────────────────────────────────────────
   double? _seekDragValue;
   DateTime? _lastScrubSeekAt;
@@ -312,6 +316,8 @@ class _VanguardManualTestPlaygroundState
       _controller = controller;
       _seekDragValue = null;
       _exportResult = null;
+      _trimApplied = false;
+      _splitApplied = false;
     });
 
     try {
@@ -367,6 +373,33 @@ class _VanguardManualTestPlaygroundState
       if (mounted) setState(() => _status = 'Trim rejected: $e');
     } catch (e) {
       if (mounted) setState(() => _status = 'Trim error: $e');
+    }
+  }
+
+  // Phase 7.14: split debug trigger — splits Clip A at 3.0s into
+  // Clip A [0s → 3.0s] and Clip A-split-1 [3.0s → 5.06s].
+  // Verifies splitClip calls updateTimeline and increases clip count.
+  Future<void> _splitClipA() async {
+    final c = _controller;
+    if (c == null || !c.isReady || _exporting) return;
+
+    try {
+      await c.splitClip(
+        clipId: 'clip-A',
+        splitSeconds: 3.0,
+      );
+      if (mounted) {
+        setState(() {
+          _splitApplied = true;
+          _status = 'Split OK — Clip A split at 3.0s. '
+              'Clips: ${c.draft.clips.length}, '
+              'Duration: ${c.draft.durationSeconds.toStringAsFixed(2)}s';
+        });
+      }
+    } on ArgumentError catch (e) {
+      if (mounted) setState(() => _status = 'Split rejected: $e');
+    } catch (e) {
+      if (mounted) setState(() => _status = 'Split error: $e');
     }
   }
 
@@ -517,6 +550,10 @@ class _VanguardManualTestPlaygroundState
 
                         // ── Phase 7.13: Trim Debug Card ────────────────────────
                         _buildTrimDebugCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.14: Split Debug Card ───────────────────────
+                        _buildSplitDebugCard(),
                         const SizedBox(height: 24),
                       ],
                     ),
@@ -1327,4 +1364,57 @@ class _VanguardManualTestPlaygroundState
       ),
     );
   }
+
+  // ── Phase 7.14: Split Debug Card ─────────────────────────────────────────────
+
+  Widget _buildSplitDebugCard() {
+    final ready = _controller?.isReady == true && !_exporting;
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Text(
+            'PHASE 7.14 — SPLIT EDITING DEBUG',
+            style: TextStyle(
+              color: Color(0xFF6C7A9C),
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.2,
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Tap to split Clip A at 3.0s into two clips. '
+            'Verifies updateTimeline is called and clip count increases.',
+            style: TextStyle(color: Colors.white38, fontSize: 10),
+          ),
+          const SizedBox(height: 10),
+          ElevatedButton.icon(
+            onPressed: ready ? _splitClipA : null,
+            icon: _splitApplied
+                ? const Icon(Icons.check_circle_outline, size: 16)
+                : const Icon(Icons.cut_outlined, size: 16),
+            label: Text(
+              _splitApplied
+                  ? 'Split Applied — tap to re-apply'
+                  : 'Split Clip A @ 3.0s',
+            ),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF3D7AEB),
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
+

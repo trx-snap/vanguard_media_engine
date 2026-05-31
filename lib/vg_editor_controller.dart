@@ -1,5 +1,5 @@
 // vg_editor_controller.dart
-// Vanguard Media Engine — Phase 7 Stage 7.8 / Stage 7.13
+// Vanguard Media Engine — Phase 7 Stage 7.8 / Stage 7.13 / Stage 7.14
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // STAGE 7.8 — NATIVE INGESTION & PRODUCTION ROUTE HARDENING
@@ -486,6 +486,47 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
       clipId: clipId,
       trimStartSeconds: trimStartSeconds,
       trimEndSeconds: trimEndSeconds,
+    );
+
+    // Push to native via updateDraft (handles busy-lock, pause, and state).
+    await updateDraft(newDraft);
+  }
+
+  // ── Split editing (Phase 7.14 / DEC-147) ────────────────────────────────
+
+  /// Splits [clipId] at [splitSeconds] (absolute source-local seconds) and
+  /// pushes the rebuilt timeline to the native renderer.
+  ///
+  /// Delegates split math, ID generation, and transition rebinding to
+  /// [VGEditorDraft.splitClip]. On success, calls [updateDraft] which sends
+  /// the rebuilt draft to the `updateTimeline` native route, resets
+  /// [currentPTS] to 0.0, and notifies listeners.
+  ///
+  /// [splitSeconds] must be strictly within the clip's active trim window
+  /// (`trimStartSeconds < splitSeconds < trimEndSeconds`).
+  ///
+  /// Throws [StateError] if the controller is disposed or currently busy with
+  /// another operation.
+  /// Throws [ArgumentError] (from [VGEditorDraft.splitClip]) if the split
+  /// position is invalid. The [ArgumentError] is propagated without invoking
+  /// the MethodChannel.
+  Future<void> splitClip({
+    required String clipId,
+    required double splitSeconds,
+  }) async {
+    _assertNotDisposed();
+    if (_busy) {
+      throw StateError(
+        '[VGEditorController] splitClip: controller is busy with another operation.',
+      );
+    }
+
+    // Compute the new draft first (throws ArgumentError on invalid position).
+    // Do this BEFORE setting _busy so the caller can catch ArgumentError
+    // without affecting the busy-lock state.
+    final newDraft = value.draft.splitClip(
+      clipId: clipId,
+      splitSeconds: splitSeconds,
     );
 
     // Push to native via updateDraft (handles busy-lock, pause, and state).
