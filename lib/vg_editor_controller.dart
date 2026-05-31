@@ -1,5 +1,5 @@
 // vg_editor_controller.dart
-// Vanguard Media Engine — Phase 7 Stage 7.8 / Stage 7.13 / Stage 7.14
+// Vanguard Media Engine — Phase 7 Stage 7.8 / Stage 7.13 / Stage 7.14 / Stage 7.15
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // STAGE 7.8 — NATIVE INGESTION & PRODUCTION ROUTE HARDENING
@@ -533,7 +533,66 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     await updateDraft(newDraft);
   }
 
-  // ── Export ─────────────────────────────────────────────────────────────────
+  // ── Reorder editing (Phase 7.15 / DEC-148) ───────────────────────────────
+
+  /// Moves the clip at [fromIndex] to [toIndex] in the timeline and pushes
+  /// the rebuilt timeline to the native renderer.
+  ///
+  /// Delegates reorder logic and **Option D boundary-slot transition
+  /// relinking** to [VGEditorDraft.reorderClip]. On success, calls
+  /// [updateDraft] which sends the fully resolved draft to the `updateTimeline`
+  /// native route, resets [currentPTS] to 0.0, and notifies listeners.
+  /// No native ObjC/Swift changes are involved — native receives the rebuilt
+  /// draft via the existing `updateTimeline` MethodChannel route.
+  ///
+  /// **Option D transition policy**: Transitions are treated as boundary-slot
+  /// effects. For a timeline with N clips there are N-1 boundary slots. After
+  /// the move, each slot retains its original transition — but `fromClipId` and
+  /// `toClipId` are rewritten to the new adjacent clip pair at that slot while
+  /// `id`, `type`, `durationSeconds`, and `curve` are preserved intact.
+  /// Transitions therefore remain visible after a reorder rather than being
+  /// silently dropped (Phase 7.15 / DEC-148).
+  ///
+  /// **No-op guard**: If [fromIndex] == [toIndex], [VGEditorDraft.reorderClip]
+  /// returns the same instance. The controller detects this via identity check
+  /// (`identical`) and returns immediately without calling the MethodChannel.
+  /// Controller state (textureId, currentPTS, isReady) is left unchanged.
+  ///
+  /// Throws [StateError] if the controller is disposed or currently busy with
+  /// another operation.
+  /// Throws [ArgumentError] (from [VGEditorDraft.reorderClip]) if the indices
+  /// are out of range or if a relinked transition's `durationSeconds` exceeds
+  /// either new adjacent clip's `timelineDuration`. The [ArgumentError] is
+  /// propagated without invoking the MethodChannel.
+  Future<void> reorderClip({
+    required int fromIndex,
+    required int toIndex,
+  }) async {
+    _assertNotDisposed();
+    if (_busy) {
+      throw StateError(
+        '[VGEditorController] reorderClip: controller is busy with another operation.',
+      );
+    }
+
+    // Compute the new draft first (throws ArgumentError on invalid indices).
+    // Do this BEFORE setting _busy so the caller can catch ArgumentError
+    // without affecting the busy-lock state.
+    final newDraft = value.draft.reorderClip(
+      fromIndex: fromIndex,
+      toIndex: toIndex,
+    );
+
+    // No-op guard: draft.reorderClip returns the same instance when
+    // fromIndex == toIndex. Skip the MethodChannel to avoid a spurious
+    // updateTimeline call that would reset currentPTS and flicker the UI.
+    if (identical(newDraft, value.draft)) return;
+
+    // Push to native via updateDraft (handles busy-lock, pause, and state).
+    await updateDraft(newDraft);
+  }
+
+  // ── Export ───────────────────────────────────────────────────────────────────────
 
   /// Exports the current draft as an MP4 video file.
   ///

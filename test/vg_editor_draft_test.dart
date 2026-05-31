@@ -1042,5 +1042,428 @@ void main() {
       );
     });
   });
-}
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // reorderClip (Phase 7.15 / DEC-148)
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorDraft — reorderClip (Phase 7.15)', () {
+    // Shared fixtures.
+    // Three 5-second clips, no transitions (hard-cut baseline).
+    VGEditorDraft makeThreeClipDraft() => VGEditorDraft.sequentialWithTransitions(
+          id: 'draft-reorder',
+          clips: [
+            _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+            _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+            _clip(id: 'clip-C', trimStart: 0.0, trimEnd: 5.0),
+          ],
+        );
+
+    // Three clips with dissolve A→B and dissolve B→C (1s each).
+    VGEditorDraft makeTransitionThreeClipDraft() {
+      final trAB = VGTransitionDescriptor(
+        id: 'tr-AB',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 1.0,
+        fromClipId: 'clip-A',
+        toClipId: 'clip-B',
+      );
+      final trBC = VGTransitionDescriptor(
+        id: 'tr-BC',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 1.0,
+        fromClipId: 'clip-B',
+        toClipId: 'clip-C',
+      );
+      return VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-reorder-dissolve',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-C', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        transitions: [trAB, trBC],
+      );
+    }
+
+    test('RO-DR1 valid reorder moves clip and returns new draft; original is unchanged', () {
+      final draft = makeThreeClipDraft();
+      // Move clip-A (index 0) to index 2 → [B, C, A].
+      final reordered = draft.reorderClip(fromIndex: 0, toIndex: 2);
+
+      // Original draft is immutable — unchanged.
+      expect(draft.clips[0].id, 'clip-A');
+      expect(draft.clips.length, 3);
+
+      // Reordered draft has clips in new order.
+      expect(reordered.clips.length, 3);
+      expect(reordered.clips[0].id, 'clip-B');
+      expect(reordered.clips[1].id, 'clip-C');
+      expect(reordered.clips[2].id, 'clip-A');
+    });
+
+    test('RO-DR2 reorder forward: [A, B, C] → move index 0 to 1 → [B, A, C]', () {
+      final draft = makeThreeClipDraft();
+      final reordered = draft.reorderClip(fromIndex: 0, toIndex: 1);
+
+      expect(reordered.clips[0].id, 'clip-B');
+      expect(reordered.clips[1].id, 'clip-A');
+      expect(reordered.clips[2].id, 'clip-C');
+    });
+
+    test('RO-DR3 reorder backward: [A, B, C] → move index 2 to 0 → [C, A, B]', () {
+      final draft = makeThreeClipDraft();
+      final reordered = draft.reorderClip(fromIndex: 2, toIndex: 0);
+
+      expect(reordered.clips[0].id, 'clip-C');
+      expect(reordered.clips[1].id, 'clip-A');
+      expect(reordered.clips[2].id, 'clip-B');
+    });
+
+    test('RO-DR4 startTimeSeconds are recomputed sequentially after reorder (no transitions)', () {
+      // Three 5s clips → after reorder, starts must still be 0, 5, 10.
+      final draft = makeThreeClipDraft();
+      final reordered = draft.reorderClip(fromIndex: 0, toIndex: 2);
+
+      expect(reordered.clips[0].startTimeSeconds, closeTo(0.0, 1e-9));
+      expect(reordered.clips[1].startTimeSeconds, closeTo(5.0, 1e-9));
+      expect(reordered.clips[2].startTimeSeconds, closeTo(10.0, 1e-9));
+      // Total duration is unchanged: 15s.
+      expect(reordered.durationSeconds, closeTo(15.0, 1e-9));
+    });
+
+    test('RO-DR5 Option D: two-clip swap relinks slot-0 transition from A→B to B→A', () {
+      // [A, B] with fade A→B (slot 0). Swap → [B, A].
+      // Option D: slot 0 now spans B→A → relink tr-AB to (from:B, to:A).
+      // Transition id/type/duration/curve must be preserved.
+      final trAB = VGTransitionDescriptor(
+        id: 'tr-AB',
+        type: VGTransitionType.fade,
+        durationSeconds: 1.0,
+        fromClipId: 'clip-A',
+        toClipId: 'clip-B',
+        curve: VGTransitionCurve.easeInOut,
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-ro5',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        transitions: [trAB],
+      );
+      final reordered = draft.reorderClip(fromIndex: 0, toIndex: 1);
+
+      // Clip order swapped.
+      expect(reordered.clips[0].id, 'clip-B');
+      expect(reordered.clips[1].id, 'clip-A');
+
+      // Transition relinked — not dropped.
+      expect(reordered.transitions.length, 1,
+          reason: 'Slot-0 fade must survive; Option D relinks rather than drops');
+      final t = reordered.transitions[0];
+      expect(t.id, 'tr-AB', reason: 'Transition ID must be preserved');
+      expect(t.type, VGTransitionType.fade,
+          reason: 'Transition type must be preserved');
+      expect(t.durationSeconds, closeTo(1.0, 1e-9),
+          reason: 'Transition duration must be preserved');
+      expect(t.curve, VGTransitionCurve.easeInOut,
+          reason: 'Transition curve must be preserved');
+      // fromClipId/toClipId rewritten to new adjacency.
+      expect(t.fromClipId, 'clip-B',
+          reason: 'fromClipId rewritten to new slot-0 left clip (B)');
+      expect(t.toClipId, 'clip-A',
+          reason: 'toClipId rewritten to new slot-0 right clip (A)');
+    });
+
+    test('RO-DR6 Option D: three-clip reorder relinks both slots', () {
+      // [A, B, C] with dissolve A→B (slot 0) and dissolve B→C (slot 1).
+      // Move A (index 0) to index 2 → [B, C, A].
+      // Slot 0 was A→B → now spans B→C → relinked to (from:B, to:C).
+      // Slot 1 was B→C → now spans C→A → relinked to (from:C, to:A).
+      final draft = makeTransitionThreeClipDraft();
+      final reordered = draft.reorderClip(fromIndex: 0, toIndex: 2);
+
+      // Clip order: [B, C, A].
+      expect(reordered.clips[0].id, 'clip-B');
+      expect(reordered.clips[1].id, 'clip-C');
+      expect(reordered.clips[2].id, 'clip-A');
+
+      // Both transitions survive (relinked).
+      expect(reordered.transitions.length, 2,
+          reason: 'Both slot transitions must be relinked, not dropped');
+
+      // Slot 0: was tr-AB (A→B), now relinked to B→C.
+      final t0 = reordered.transitions[0];
+      expect(t0.id, 'tr-AB', reason: 'Slot-0 transition ID preserved');
+      expect(t0.type, VGTransitionType.dissolve);
+      expect(t0.fromClipId, 'clip-B',
+          reason: 'Slot-0 relinked to new left clip B');
+      expect(t0.toClipId, 'clip-C',
+          reason: 'Slot-0 relinked to new right clip C');
+
+      // Slot 1: was tr-BC (B→C), now relinked to C→A.
+      final t1 = reordered.transitions[1];
+      expect(t1.id, 'tr-BC', reason: 'Slot-1 transition ID preserved');
+      expect(t1.type, VGTransitionType.dissolve);
+      expect(t1.fromClipId, 'clip-C',
+          reason: 'Slot-1 relinked to new left clip C');
+      expect(t1.toClipId, 'clip-A',
+          reason: 'Slot-1 relinked to new right clip A');
+    });
+
+    test('RO-DR7 Option D: reorder with only slot-0 transition relinks to new slot-0 pair', () {
+      // [A, B, C] with dissolve A→B (slot 0 only).
+      // Move B (index 1) to index 0 → [B, A, C].
+      // Slot 0 was A→B → now spans B→A → relinked to (from:B, to:A).
+      // Slot 1 had no transition → no transition emitted for slot 1.
+      final trAB = VGTransitionDescriptor(
+        id: 'tr-AB',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 1.0,
+        fromClipId: 'clip-A',
+        toClipId: 'clip-B',
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-ro7',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-C', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        transitions: [trAB],
+      );
+      final reordered = draft.reorderClip(fromIndex: 1, toIndex: 0);
+
+      expect(reordered.clips[0].id, 'clip-B');
+      expect(reordered.clips[1].id, 'clip-A');
+      expect(reordered.clips[2].id, 'clip-C');
+
+      // Slot 0 transition relinked B→A (not dropped).
+      expect(reordered.transitions.length, 1,
+          reason: 'Slot-0 dissolve must be relinked to new B→A adjacency');
+      expect(reordered.transitions[0].id, 'tr-AB',
+          reason: 'Transition ID preserved after relink');
+      expect(reordered.transitions[0].fromClipId, 'clip-B',
+          reason: 'Slot-0 left clip is now B');
+      expect(reordered.transitions[0].toClipId, 'clip-A',
+          reason: 'Slot-0 right clip is now A');
+    });
+
+    test('RO-DR8 Option D: relinked transitions recompute startTimeSeconds correctly', () {
+      // [A, B, C] with dissolve A→B (1s, slot 0) and dissolve B→C (1s, slot 1).
+      // Move A (index 0) to index 2 → [B, C, A].
+      // Both slots survive with relinked fromClipId/toClipId.
+      // Layout: B@0, C@(5-1)=4s (slot-0 overlap 1s), A@(4+5-1)=8s (slot-1 overlap 1s).
+      // Total = 8 + 5 = 13s (two 1s overlaps → 15 - 2 = 13s).
+      final draft = makeTransitionThreeClipDraft();
+      final reordered = draft.reorderClip(fromIndex: 0, toIndex: 2);
+
+      expect(reordered.clips[0].startTimeSeconds, closeTo(0.0, 1e-9));
+      expect(reordered.clips[1].startTimeSeconds, closeTo(4.0, 1e-9));
+      expect(reordered.clips[2].startTimeSeconds, closeTo(8.0, 1e-9));
+      // Total duration: 13s (both 1s overlaps preserved).
+      expect(reordered.durationSeconds, closeTo(13.0, 1e-9));
+      // Both transitions present.
+      expect(reordered.transitions.length, 2);
+    });
+
+    test('RO-DR9 clip fields are fully preserved after reorder (sourcePath, transform, speed)', () {
+      // Ensure reorderClip does not lose clip metadata.
+      const tdA = VGClipTransformDescriptor(scaleX: 0.5, scaleY: 0.5, opacity: 0.8);
+      final clipA = VGClipDescriptor(
+        id: 'clip-A',
+        sourcePath: '/tmp/clip_a.mp4',
+        durationSeconds: 5.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 5.0,
+        transform: tdA,
+      );
+      final clipB = VGClipDescriptor(
+        id: 'clip-B',
+        sourcePath: '/tmp/clip_b.mp4',
+        durationSeconds: 5.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 5.0,
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-ro9',
+        clips: [clipA, clipB],
+      );
+      // Move A to index 1 → [B, A].
+      final reordered = draft.reorderClip(fromIndex: 0, toIndex: 1);
+
+      expect(reordered.clips[0].id, 'clip-B');
+      expect(reordered.clips[1].id, 'clip-A');
+      // Clip A's transform must survive the move.
+      expect(reordered.clips[1].transform, isNotNull);
+      expect(reordered.clips[1].transform!.scaleX, closeTo(0.5, 1e-9));
+      expect(reordered.clips[1].transform!.opacity, closeTo(0.8, 1e-9));
+      expect(reordered.clips[1].transform, equals(tdA));
+    });
+
+    test('RO-DR10 fromIndex == toIndex is a no-op: returns same instance, does not throw', () {
+      final draft = makeThreeClipDraft();
+      final result = draft.reorderClip(fromIndex: 1, toIndex: 1);
+      // Must be the identical object — no unnecessary rebuild.
+      expect(identical(result, draft), isTrue,
+          reason: 'No-op reorder must return the same draft instance');
+      // Clips are unmodified.
+      expect(result.clips[0].id, 'clip-A');
+      expect(result.clips[1].id, 'clip-B');
+      expect(result.clips[2].id, 'clip-C');
+    });
+
+    test('RO-DR11 fromIndex out of range throws ArgumentError', () {
+      final draft = makeThreeClipDraft();
+      // Too low.
+      expect(
+        () => draft.reorderClip(fromIndex: -1, toIndex: 0),
+        throwsA(isA<ArgumentError>()),
+      );
+      // Too high.
+      expect(
+        () => draft.reorderClip(fromIndex: 3, toIndex: 0),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
+
+    test('RO-DR12 toIndex out of range throws ArgumentError', () {
+      final draft = makeThreeClipDraft();
+      // Too low.
+      expect(
+        () => draft.reorderClip(fromIndex: 0, toIndex: -1),
+        throwsA(isA<ArgumentError>()),
+      );
+      // Too high (3 clips → max index = 2).
+      expect(
+        () => draft.reorderClip(fromIndex: 0, toIndex: 3),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
+
+    test('RO-DR13 two-clip swap: [A, B] → [B, A]', () {
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-ro13',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 4.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 3.0),
+        ],
+      );
+      final reordered = draft.reorderClip(fromIndex: 0, toIndex: 1);
+
+      expect(reordered.clips[0].id, 'clip-B');
+      expect(reordered.clips[1].id, 'clip-A');
+      expect(reordered.clips[0].startTimeSeconds, closeTo(0.0, 1e-9));
+      expect(reordered.clips[1].startTimeSeconds, closeTo(3.0, 1e-9));
+      // Total: 3 + 4 = 7s (same total as before, just different order).
+      expect(reordered.durationSeconds, closeTo(7.0, 1e-9));
+    });
+
+    test('RO-DR14 null-ref transitions (Stage 7.1 compat) are discarded by Option D', () {
+      // A transition with null fromClipId / toClipId cannot be matched to a
+      // boundary slot and is therefore discarded by Option D.
+      // (Under Option B they were retained; Option D intentionally changes this.)
+      final nullRefTransition = VGTransitionDescriptor(
+        id: 'tr-null',
+        type: VGTransitionType.none,
+        durationSeconds: 0.0,
+        // fromClipId and toClipId are null (Stage 7.1 compat).
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-ro14',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        transitions: [nullRefTransition],
+      );
+      final reordered = draft.reorderClip(fromIndex: 0, toIndex: 1);
+
+      // Null-ref transition has no slot match → discarded.
+      expect(reordered.transitions, isEmpty,
+          reason: 'Option D discards null-ref transitions that cannot be '
+              'slot-matched. Callers must re-add after reorder if needed.');
+    });
+
+    test(
+        'RO-DR15 relinked transition duration exceeding new adjacent clip '
+        'timelineDuration throws ArgumentError',
+        () {
+      // Slot-0 has a 4s dissolve. After reorder, slot-0 lands between clips
+      // of only 2s each → 4s > 2s → ArgumentError before any channel call.
+      final longTransition = VGTransitionDescriptor(
+        id: 'tr-long',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 4.0,
+        fromClipId: 'clip-A',
+        toClipId: 'clip-B',
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-ro15',
+        clips: [
+          // clip-A: 10s timeline (large enough to hold 4s transition originally)
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 10.0),
+          // clip-B: 2s timeline (too short to hold 4s after relink)
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 2.0),
+          _clip(id: 'clip-C', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        transitions: [longTransition],
+      );
+      // Move clip-C to index 0 → [C, A, B].
+      // Slot 0 was clip-A→clip-B (tr-long, 4s). New slot 0 spans C(5s)→A(10s).
+      // 4s <= 5s and 4s <= 10s → this relink is SAFE. No throw.
+      final safeReorder = draft.reorderClip(fromIndex: 2, toIndex: 0);
+      expect(safeReorder.transitions.length, 1,
+          reason: 'C(5s)→A(10s): 4s fits both clips; must relink successfully');
+
+      // Now move clip-A to index 2 → [B, C, A].
+      // Slot 0 was clip-A→clip-B (tr-long, 4s). New slot 0 spans B(2s)→C(5s).
+      // 4s > 2s (clip-B timeline) → ArgumentError.
+      expect(
+        () => draft.reorderClip(fromIndex: 0, toIndex: 2),
+        throwsA(isA<ArgumentError>()),
+        reason: 'B(2s)→C(5s): 4s exceeds B.timelineDuration; must throw');
+    });
+
+    test(
+        'RO-DR16 Option D: no transition created for boundary that had none',
+        () {
+      // [A, B, C] — slot 0 has dissolve A→B; slot 1 has no transition.
+      // Move C (index 2) to index 0 → [C, A, B].
+      // Slot 0 had tr-AB → relinked to C→A.
+      // Slot 1 had no transition → still no transition.
+      final trAB = VGTransitionDescriptor(
+        id: 'tr-AB',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 1.0,
+        fromClipId: 'clip-A',
+        toClipId: 'clip-B',
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-ro16',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-C', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        transitions: [trAB],
+      );
+      final reordered = draft.reorderClip(fromIndex: 2, toIndex: 0);
+
+      // New order: [C, A, B].
+      expect(reordered.clips[0].id, 'clip-C');
+      expect(reordered.clips[1].id, 'clip-A');
+      expect(reordered.clips[2].id, 'clip-B');
+
+      // Exactly 1 transition: slot-0 relinked C→A.
+      expect(reordered.transitions.length, 1,
+          reason: 'Only slot 0 had a transition; slot 1 must stay empty');
+      expect(reordered.transitions[0].id, 'tr-AB');
+      expect(reordered.transitions[0].fromClipId, 'clip-C',
+          reason: 'Slot-0 relinked to new left clip C');
+      expect(reordered.transitions[0].toClipId, 'clip-A',
+          reason: 'Slot-0 relinked to new right clip A');
+    });
+  });
+}

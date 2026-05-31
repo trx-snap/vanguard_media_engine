@@ -1,17 +1,18 @@
 // vg_editor_draft.dart
-// Vanguard Media Engine — Phase 7 Stage 7.7 / Stage 7.10 / Stage 7.13 / Stage 7.14
+// Vanguard Media Engine — Phase 7 Stage 7.7 / Stage 7.10 / Stage 7.13 / Stage 7.14 / Stage 7.15
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // STAGE 7.7  — EDITOR DRAFT RECIPE
 // STAGE 7.10 — TRANSITION-AWARE LAYOUT FACTORY
 // STAGE 7.13 — NON-DESTRUCTIVE TRIM EDITING API
 // STAGE 7.14 — NON-DESTRUCTIVE SPLIT EDITING API
+// STAGE 7.15 — NON-DESTRUCTIVE REORDER EDITING API
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // VGEditorDraft is the immutable, non-destructive composition recipe that
 // describes a complete timeline editing session.
 //
-// Design rules (Phase 7.7 / 7.10 / 7.13 / 7.14 / Opus M4):
+// Design rules (Phase 7.7 / 7.10 / 7.13 / 7.14 / 7.15 / Opus M4):
 //   - Pure Dart value type. No rendering logic, no channel calls.
 //   - The clips list is non-destructive: source files are never modified.
 //   - All fields are validated at construction time via asserts.
@@ -41,6 +42,16 @@
 //     clip. The sequential layout is recomputed via sequentialWithTransitions.
 //     Dart is the single source of truth for split math, ID generation, and
 //     transition rebinding (DEC-147).
+//
+// Phase 7.15 additions (DEC-148 revised — Option D boundary-slot relinking):
+//   - VGEditorDraft.reorderClip(...) is a non-destructive reorder-editing helper
+//     that moves a clip from [fromIndex] to [toIndex], applies Option D
+//     boundary-slot transition relinking (transitions are anchored to their
+//     original boundary slot; after reorder, fromClipId/toClipId are rewritten
+//     to the new adjacent clip pair at that slot while preserving id/type/
+//     duration/curve), and recomputes the sequential layout via
+//     sequentialWithTransitions. Dart is the single source of truth for reorder
+//     logic and transition relinking (DEC-148).
 //
 // Consumed by VGEditorController (Stage 7.7) to coordinate channel calls.
 //
@@ -576,6 +587,157 @@ final class VGEditorDraft {
     }).toList();
 
     // 9. Rebuild the sequential layout (propagates startTimeSeconds cascade).
+    return VGEditorDraft.sequentialWithTransitions(
+      id: id,
+      clips: updatedClips,
+      transitions: updatedTransitions,
+      canvasWidth: canvasWidth,
+      canvasHeight: canvasHeight,
+      fps: fps,
+    );
+  }
+
+  // ── Reorder editing (Phase 7.15 / DEC-148) ──────────────────────────────────
+
+  /// Moves the clip at [fromIndex] to [toIndex] in the timeline, applies
+  /// **Option D boundary-slot transition relinking**, and returns a new
+  /// [VGEditorDraft] with recomputed clip start times.
+  ///
+  /// **Option D transition policy**: Transitions are treated as boundary-slot
+  /// effects rather than permanently bound to a specific clip pair. For a
+  /// timeline with N clips there are N-1 boundary slots. A transition at old
+  /// boundary slot k stays at slot k after the move: its `fromClipId` and
+  /// `toClipId` are rewritten to the new adjacent clip pair occupying slot k,
+  /// while `id`, `type`, `durationSeconds`, and `curve` are preserved intact.
+  ///
+  /// Example — two clips:
+  /// ```
+  /// Before: A → fade(tr-0) → B
+  /// After swap (fromIndex:0, toIndex:1):
+  ///         B → fade(tr-0, from:B, to:A) → A
+  /// ```
+  ///
+  /// Example — three clips:
+  /// ```
+  /// Before: A → t0 → B → t1 → C
+  /// After moving A to end (fromIndex:0, toIndex:2):
+  ///         B → t0(from:B,to:C) → C → t1(from:C,to:A) → A
+  /// ```
+  ///
+  /// **Null-ref transitions** (Stage 7.1 compat — `fromClipId` or `toClipId`
+  /// is null) cannot be matched to a slot and are **discarded**. They were
+  /// never meaningfully linked to a boundary, and retaining them would produce
+  /// an indeterminate layout. If Stage 7.1 null-ref compat is required, callers
+  /// must re-add them after reordering.
+  ///
+  /// **Duration validation**: before relinking, each candidate transition's
+  /// `durationSeconds` is checked against the `timelineDuration` of both new
+  /// adjacent clips. If the transition duration exceeds either adjacent clip's
+  /// timeline duration an [ArgumentError] is thrown before any [MethodChannel]
+  /// call is made.
+  ///
+  /// If [fromIndex] == [toIndex] this is a no-op and returns `this` unchanged
+  /// (the same instance). Drag-and-drop UIs regularly emit identity moves;
+  /// the caller should inspect the return value to decide whether to push an
+  /// update to the renderer.
+  ///
+  /// Throws [ArgumentError] if:
+  /// - [fromIndex] is out of range for the current clips list.
+  /// - [toIndex] is out of range for the current clips list.
+  /// - A relinked transition's `durationSeconds` exceeds either new adjacent
+  ///   clip's `timelineDuration`.
+  ///
+  /// ```dart
+  /// // Swap clip at index 0 with clip at index 2:
+  /// final reordered = draft.reorderClip(fromIndex: 0, toIndex: 2);
+  /// // reordered.clips[0] was previously draft.clips[2]
+  /// // reordered.clips[2] was previously draft.clips[0]
+  /// // All startTimeSeconds recomputed.
+  /// // Slot-0 transition relinked to new clips[0]→clips[1] pair.
+  /// // Slot-1 transition relinked to new clips[1]→clips[2] pair.
+  /// ```
+  VGEditorDraft reorderClip({
+    required int fromIndex,
+    required int toIndex,
+  }) {
+    // 1. Validate index range.
+    if (fromIndex < 0 || fromIndex >= clips.length) {
+      throw ArgumentError(
+        'VGEditorDraft.reorderClip: fromIndex ($fromIndex) is out of range '
+        '[0, ${clips.length - 1}] for draft "$id".',
+      );
+    }
+    if (toIndex < 0 || toIndex >= clips.length) {
+      throw ArgumentError(
+        'VGEditorDraft.reorderClip: toIndex ($toIndex) is out of range '
+        '[0, ${clips.length - 1}] for draft "$id".',
+      );
+    }
+
+    // 2. Identity move — return this unchanged. Drag-and-drop UIs regularly
+    //    emit a drop at the same position; this avoids forcing caller-side
+    //    filtering. The controller guards against pushing a no-op to native.
+    if (fromIndex == toIndex) return this;
+
+    // 3. Build the reordered clip list.
+    //    Remove the clip at fromIndex, then insert it at toIndex.
+    final updatedClips = List<VGClipDescriptor>.of(clips);
+    final movedClip = updatedClips.removeAt(fromIndex);
+    updatedClips.insert(toIndex, movedClip);
+
+
+    // 4. Option D — boundary-slot transition relinking.
+    //
+    //    Step 4a: map each old boundary slot → the transition occupying it.
+    //    Slot k is the boundary between clips[k] and clips[k+1] in the
+    //    *original* (pre-reorder) ordering.
+    //    Transitions with null fromClipId/toClipId (Stage 7.1 compat) cannot
+    //    be matched to a slot and are discarded (see docstring).
+    final oldSlotTransitions = <int, VGTransitionDescriptor>{};
+    for (var k = 0; k < clips.length - 1; k++) {
+      final oldFrom = clips[k].id;
+      final oldTo = clips[k + 1].id;
+      for (final t in transitions) {
+        if (t.fromClipId == oldFrom && t.toClipId == oldTo) {
+          oldSlotTransitions[k] = t;
+          break; // at most one transition per slot
+        }
+      }
+    }
+
+    //    Step 4b: relink each slot to the new adjacent clip pair.
+    //    Validate duration before accepting the relinked transition.
+    final updatedTransitions = <VGTransitionDescriptor>[];
+    for (var k = 0; k < updatedClips.length - 1; k++) {
+      final oldTransition = oldSlotTransitions[k];
+      if (oldTransition == null) continue; // no transition at this slot
+
+      final newLeftClip = updatedClips[k];
+      final newRightClip = updatedClips[k + 1];
+
+      // Duration safety check: relinked duration must not exceed either
+      // adjacent clip's wall-clock timeline contribution.
+      final leftTimeline = newLeftClip.timelineDuration;
+      final rightTimeline = newRightClip.timelineDuration;
+      if (oldTransition.durationSeconds > leftTimeline ||
+          oldTransition.durationSeconds > rightTimeline) {
+        throw ArgumentError(
+          'VGEditorDraft.reorderClip: relinked transition "${oldTransition.id}" '
+          'durationSeconds (${oldTransition.durationSeconds}s) exceeds the '
+          'timelineDuration of the new adjacent clips at slot $k '
+          '(left "${newLeftClip.id}": ${leftTimeline}s, '
+          'right "${newRightClip.id}": ${rightTimeline}s) for draft "$id".',
+        );
+      }
+
+      // Rewrite fromClipId/toClipId; preserve id, type, durationSeconds, curve.
+      updatedTransitions.add(oldTransition.copyWith(
+        fromClipId: newLeftClip.id,
+        toClipId: newRightClip.id,
+      ));
+    }
+
+    // 5. Rebuild the sequential layout (propagates startTimeSeconds cascade).
     return VGEditorDraft.sequentialWithTransitions(
       id: id,
       clips: updatedClips,

@@ -33,6 +33,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vg_clip_descriptor.dart';
 import 'package:vanguard_media_engine/vg_editor_controller.dart';
 import 'package:vanguard_media_engine/vg_editor_draft.dart';
+import 'package:vanguard_media_engine/vg_transition_descriptor.dart';
+
 import 'package:vanguard_media_engine/vg_editor_export_request.dart';
 import 'package:vanguard_media_engine/vg_editor_export_result.dart';
 import 'package:vanguard_media_engine/vg_editor_value.dart';
@@ -1232,5 +1234,214 @@ void main() {
           reason: 'ArgumentError from draft validation must not reach channel');
     });
   });
-}
 
+  // ───────────────────────────────────────────────────────────────────────────
+  // reorderClip() — Phase 7.15 / DEC-148
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorController — reorderClip() (Phase 7.15)', () {
+    late VGEditorController controller;
+    final List<String> calledMethods = [];
+    dynamic capturedUpdateArgs;
+
+    setUp(() async {
+      calledMethods.clear();
+      capturedUpdateArgs = null;
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        switch (method) {
+          case 'createTimelineTexture':
+            return {'textureId': 40, 'width': 640, 'height': 360};
+          case 'updateTimeline':
+            capturedUpdateArgs = args;
+            return {'textureId': 41, 'width': 640, 'height': 360};
+          case 'timelinePause':
+          case 'disposeTimeline':
+            return null;
+          default:
+            return null;
+        }
+      });
+      // Use a three-clip draft so reorder is meaningful.
+      final threeClipDraft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-reorder-ec',
+        clips: [
+          VGClipDescriptor(
+            id: 'clip-A',
+            sourcePath: '/tmp/clip_a.mp4',
+            durationSeconds: 5.0,
+            trimStartSeconds: 0.0,
+            trimEndSeconds: 5.0,
+          ),
+          VGClipDescriptor(
+            id: 'clip-B',
+            sourcePath: '/tmp/clip_b.mp4',
+            durationSeconds: 5.0,
+            trimStartSeconds: 0.0,
+            trimEndSeconds: 5.0,
+          ),
+          VGClipDescriptor(
+            id: 'clip-C',
+            sourcePath: '/tmp/clip_c.mp4',
+            durationSeconds: 5.0,
+            trimStartSeconds: 0.0,
+            trimEndSeconds: 5.0,
+          ),
+        ],
+      );
+      controller = VGEditorController(initialDraft: threeClipDraft);
+      await controller.initialize();
+    });
+
+    tearDown(() => controller.dispose());
+
+    test('RO-EC1 reorderClip invokes updateTimeline exactly once', () async {
+      calledMethods.clear();
+      await controller.reorderClip(fromIndex: 0, toIndex: 2);
+
+      expect(
+        calledMethods.where((m) => m == 'updateTimeline').length,
+        1,
+        reason: 'reorderClip must invoke updateTimeline exactly once',
+      );
+    });
+
+    test('RO-EC2 reorderClip updates draft value notifier and resets currentPTS to 0.0', () async {
+      // Advance PTS via callback.
+      await controller.handleNativeCallback(
+        const MethodCall('onTimelineFrame', {'pts': 3.0}),
+      );
+      expect(controller.value.currentPTS, closeTo(3.0, 0.001));
+
+      await controller.reorderClip(fromIndex: 0, toIndex: 2);
+
+      // PTS must reset to 0.
+      expect(controller.value.currentPTS, closeTo(0.0, 0.001));
+      // Controller must be ready again.
+      expect(controller.value.isReady, isTrue);
+      // Draft clip order must reflect the move: [B, C, A].
+      expect(controller.draft.clips[0].id, 'clip-B');
+      expect(controller.draft.clips[1].id, 'clip-C');
+      expect(controller.draft.clips[2].id, 'clip-A');
+      // updateTimeline payload must contain the updated draft.
+      expect(capturedUpdateArgs, isA<Map>());
+      final argsMap = capturedUpdateArgs as Map;
+      expect(argsMap.containsKey('draft'), isTrue);
+    });
+
+    test('RO-EC3 reorderClip throws StateError after dispose', () async {
+      controller.dispose();
+      await expectLater(
+        controller.reorderClip(fromIndex: 0, toIndex: 1),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('RO-EC4 reorderClip propagates ArgumentError for out-of-range index without calling updateTimeline',
+        () async {
+      calledMethods.clear();
+      // fromIndex out of range → ArgumentError from draft validation.
+      await expectLater(
+        controller.reorderClip(fromIndex: 99, toIndex: 0),
+        throwsA(isA<ArgumentError>()),
+      );
+      // updateTimeline must NOT have been called.
+      expect(calledMethods, isNot(contains('updateTimeline')),
+          reason: 'ArgumentError from draft validation must not reach channel');
+    });
+
+    test(
+        'RO-EC5 reorderClip no-op (fromIndex == toIndex) does not call updateTimeline and leaves state unchanged',
+        () async {
+      calledMethods.clear();
+      final ptsBefore = controller.value.currentPTS;
+      final draftBefore = controller.value.draft;
+      final textureIdBefore = controller.value.textureId;
+
+      // fromIndex == toIndex → no-op; must not throw.
+      await controller.reorderClip(fromIndex: 1, toIndex: 1);
+
+      // MethodChannel must NOT have been called.
+      expect(calledMethods, isNot(contains('updateTimeline')),
+          reason: 'No-op reorder must not invoke the MethodChannel');
+      // Controller state must be completely stable.
+      expect(controller.value.currentPTS, closeTo(ptsBefore, 0.001),
+          reason: 'currentPTS must not change on no-op');
+      expect(identical(controller.value.draft, draftBefore), isTrue,
+          reason: 'Draft instance must be unchanged on no-op');
+      expect(controller.value.textureId, textureIdBefore,
+          reason: 'textureId must be unchanged on no-op');
+      expect(controller.value.isReady, isTrue,
+          reason: 'isReady must remain true on no-op');
+    });
+
+    test(
+        'RO-EC6 Option D: relinked transition fromClipId/toClipId reach updateTimeline payload',
+        () async {
+      // The controller setUp uses a three-clip draft with no transitions.
+      // Build a two-clip controller with a fade A→B so we can verify relinking.
+      final twoClipDraft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-ec6',
+        clips: [
+          const VGClipDescriptor(
+            id: 'clip-A',
+            sourcePath: '/tmp/clip_a.mp4',
+            durationSeconds: 5.0,
+            trimStartSeconds: 0.0,
+            trimEndSeconds: 5.0,
+          ),
+          const VGClipDescriptor(
+            id: 'clip-B',
+            sourcePath: '/tmp/clip_b.mp4',
+            durationSeconds: 5.0,
+            trimStartSeconds: 0.0,
+            trimEndSeconds: 5.0,
+          ),
+        ],
+        transitions: [
+          const VGTransitionDescriptor(
+            id: 'tr-fade',
+            type: VGTransitionType.fade,
+            durationSeconds: 1.0,
+            fromClipId: 'clip-A',
+            toClipId: 'clip-B',
+          ),
+        ],
+      );
+      final ec6Controller = VGEditorController(initialDraft: twoClipDraft);
+      await ec6Controller.initialize();
+
+      dynamic ec6CapturedArgs;
+      _setMockHandler((method, args) async {
+        if (method == 'updateTimeline') ec6CapturedArgs = args;
+        if (method == 'createTimelineTexture') {
+          return {'textureId': 50, 'width': 640, 'height': 360};
+        }
+        if (method == 'updateTimeline') {
+          return {'textureId': 51, 'width': 640, 'height': 360};
+        }
+        return null;
+      });
+
+      // Reinitialise ec6Controller with the override handler.
+      // (setUp already ran initialize; we just need the next updateTimeline call.)
+      await ec6Controller.reorderClip(fromIndex: 0, toIndex: 1);
+      ec6Controller.dispose();
+
+      // Verify payload contains the relinked transition.
+      expect(ec6CapturedArgs, isA<Map>(),
+          reason: 'updateTimeline must have been called');
+      final draftMap = (ec6CapturedArgs as Map)['draft'] as Map;
+      final transitionsList = draftMap['transitions'] as List;
+      expect(transitionsList.length, 1,
+          reason: 'Relinked transition must be present in payload');
+      final tMap = transitionsList[0] as Map;
+      expect(tMap['id'], 'tr-fade', reason: 'Transition ID preserved');
+      expect(tMap['type'], 'fade', reason: 'Transition type preserved');
+      expect(tMap['fromClipId'], 'clip-B',
+          reason: 'fromClipId rewritten to new left clip B');
+      expect(tMap['toClipId'], 'clip-A',
+          reason: 'toClipId rewritten to new right clip A');
+    });
+  });
+}

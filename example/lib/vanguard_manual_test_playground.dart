@@ -80,9 +80,13 @@ class _VanguardManualTestPlaygroundState
   // true once _trimClipA() succeeds; resets when timeline is rebuilt.
   bool _trimApplied = false;
 
-  // ── Phase 7.14: Split Debug State ──────────────────────────────────────────
+  // ── Phase 7.14: Split Debug State ────────────────────────────────────
   // true once _splitClipA() succeeds; resets when timeline is rebuilt.
   bool _splitApplied = false;
+
+  // ── Phase 7.15: Reorder Debug State ─────────────────────────────────
+  // true once _reorderClips() succeeds; resets when timeline is rebuilt.
+  bool _reorderApplied = false;
 
   // ── Seek scrub throttle ────────────────────────────────────────────────────
   double? _seekDragValue;
@@ -318,6 +322,7 @@ class _VanguardManualTestPlaygroundState
       _exportResult = null;
       _trimApplied = false;
       _splitApplied = false;
+      _reorderApplied = false;
     });
 
     try {
@@ -400,6 +405,39 @@ class _VanguardManualTestPlaygroundState
       if (mounted) setState(() => _status = 'Split rejected: $e');
     } catch (e) {
       if (mounted) setState(() => _status = 'Split error: $e');
+    }
+  }
+
+  // Phase 7.15: reorder debug trigger — moves Clip A (index 0) to index 1,
+  // swapping [A, B] → [B, A]. Verifies reorderClip calls updateTimeline and
+  // updates clip ordering. Only valid on a two-clip baseline timeline.
+  Future<void> _reorderClips() async {
+    final c = _controller;
+    if (c == null || !c.isReady || _exporting) return;
+
+    // Requires at least 2 clips to do a meaningful swap.
+    if (c.draft.clips.length < 2) {
+      setState(() => _status = 'Reorder skipped — need ≥2 clips. Use baseline timeline.');
+      return;
+    }
+
+    // Always swap index 0 and index 1 for a predictable, repeatable debug move.
+    final fromIdx = 0;
+    final toIdx = 1;
+    try {
+      await c.reorderClip(fromIndex: fromIdx, toIndex: toIdx);
+      if (mounted) {
+        final newOrder = c.draft.clips.map((cl) => cl.id).join(' → ');
+        setState(() {
+          _reorderApplied = true;
+          _status = 'Reorder OK — clip order: $newOrder. '
+              'Duration: ${c.draft.durationSeconds.toStringAsFixed(2)}s';
+        });
+      }
+    } on ArgumentError catch (e) {
+      if (mounted) setState(() => _status = 'Reorder rejected: $e');
+    } catch (e) {
+      if (mounted) setState(() => _status = 'Reorder error: $e');
     }
   }
 
@@ -554,6 +592,10 @@ class _VanguardManualTestPlaygroundState
 
                         // ── Phase 7.14: Split Debug Card ───────────────────────
                         _buildSplitDebugCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.15: Reorder Debug Card ──────────────────────
+                        _buildReorderDebugCard(),
                         const SizedBox(height: 24),
                       ],
                     ),
@@ -1416,5 +1458,56 @@ class _VanguardManualTestPlaygroundState
       ),
     );
   }
-}
 
+  // ── Phase 7.15: Reorder Debug Card ──────────────────────────────────────────
+
+  Widget _buildReorderDebugCard() {
+    final ready = _controller?.isReady == true && !_exporting;
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Text(
+            'PHASE 7.15 — REORDER EDITING DEBUG',
+            style: TextStyle(
+              color: Color(0xFF6C7A9C),
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.2,
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Swaps Clip A (index 0) and Clip B (index 1). '
+            'Verifies updateTimeline is called and clip order changes.',
+            style: TextStyle(color: Colors.white38, fontSize: 10),
+          ),
+          const SizedBox(height: 10),
+          ElevatedButton.icon(
+            onPressed: ready ? _reorderClips : null,
+            icon: _reorderApplied
+                ? const Icon(Icons.check_circle_outline, size: 16)
+                : const Icon(Icons.swap_vert_outlined, size: 16),
+            label: Text(
+              _reorderApplied
+                  ? 'Reorder Applied — tap to re-apply'
+                  : 'Reorder: Swap Clip A ↔ Clip B',
+            ),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF9C27B0),
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
