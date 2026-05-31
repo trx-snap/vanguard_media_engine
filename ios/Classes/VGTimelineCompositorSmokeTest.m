@@ -304,7 +304,8 @@ static BOOL _generateSyntheticVideo(NSString *path,
                                            speed:1.0
                                        transform:nil
                                          fitMode:VGStillImageFitModeFit  // default; video clip
-                                        cropRect:nil];                    // no crop; video clip
+                                        cropRect:nil                    // no crop; video clip
+                                         freezePTS:nil];                  // not a freeze clip
 
     // Clip B: 5.0s duration, starts at 5.0s on timeline, trim [0, 5], speed 1.0
     VGClipDescriptor *clipB =
@@ -318,7 +319,8 @@ static BOOL _generateSyntheticVideo(NSString *path,
                                            speed:1.0
                                        transform:nil
                                          fitMode:VGStillImageFitModeFit  // default; video clip
-                                        cropRect:nil];                    // no crop; video clip
+                                        cropRect:nil                    // no crop; video clip
+                                         freezePTS:nil];                  // not a freeze clip
 
     if (![clipA isValid] || ![clipB isValid]) {
         log(@"  ❌ Clip descriptor validation failed");
@@ -1170,6 +1172,144 @@ static BOOL _generateMovingPatternVideo(NSString *path,
     return [result copy];
 }
 
+// ── Phase 7.17: Freeze-frame descriptor contract smoke test ──────────────────────
+//
+// Validates VGClipDescriptor freezePTS serialisation and rejection of invalid
+// values via +fromDictionary:. Exercises the Objective-C contract layer only;
+// no compositor execution or AVAssetImageGenerator is invoked.
+
++ (NSDictionary<NSString *, id> *)runFreezeFrameDescriptorSmokeTest {
+    NSMutableArray<NSDictionary *> *steps = [NSMutableArray array];
+    NSMutableArray<NSString *> *logs = [NSMutableArray array];
+    __block BOOL overallSuccess = YES;
+
+    void (^log)(NSString *) = ^(NSString *msg) {
+        [logs addObject:msg];
+        os_log(sSmokeLog, "[7.17] %{public}@", msg);
+    };
+    void (^step)(NSString *, BOOL, NSString *) = ^(NSString *name, BOOL passed, NSString *detail) {
+        if (!passed) overallSuccess = NO;
+        [steps addObject:_stepResult(name, passed, detail)];
+    };
+
+    log(@"Phase 7.17 Freeze-Frame Descriptor Contract Smoke Test");
+    log(@"Tests VGClipDescriptor freezePTS contract via fromDictionary:");
+    log(@"");
+
+    // ─── Test 1: freezePTS=3.0 round-trip via fromDictionary: ────────────────
+    log(@"Test 1: freezePTS=3.0 round-trips via fromDictionary:");
+    {
+        NSDictionary *dict = @{
+            @"id"               : @"vid-freeze-7.17",
+            @"sourcePath"       : @"/tmp/smoke_video.mp4",
+            @"mediaKind"        : @"video",
+            @"startTimeSeconds" : @0.0,
+            @"durationSeconds"  : @2.0,
+            @"trimStartSeconds" : @0.0,
+            @"trimEndSeconds"   : @2.0,
+            @"speed"            : @1.0,
+            @"freezePTS"        : @3.0,
+        };
+        VGClipDescriptor *clip = [VGClipDescriptor fromDictionary:dict];
+        BOOL passed = (clip != nil
+                       && clip.freezePTS != nil
+                       && fabs(clip.freezePTS.doubleValue - 3.0) < 1e-9);
+        if (passed) {
+            log(@"  ✅ freezePTS=3.0: fromDictionary: returned non-nil with correct PTS");
+        } else {
+            log([NSString stringWithFormat:
+                 @"  ❌ freezePTS=3.0: clip=%@ freezePTS=%@",
+                 clip ?: (id)@"nil", clip.freezePTS ?: (id)@"nil"]);
+        }
+        step(@"freezePTS=3.0 round-trip", passed, passed
+             ? @"freezePTS=3.0 deserialized correctly"
+             : @"fromDictionary: returned nil or wrong freezePTS value");
+    }
+
+    // ─── Test 2: freezePTS absent (normal clip) ───────────────────────────────
+    log(@"");
+    log(@"Test 2: absent freezePTS key (normal video clip) — must deserialise as nil:");
+    {
+        NSDictionary *dict = @{
+            @"id"               : @"vid-normal-7.17",
+            @"sourcePath"       : @"/tmp/smoke_video.mp4",
+            @"mediaKind"        : @"video",
+            @"startTimeSeconds" : @0.0,
+            @"durationSeconds"  : @5.0,
+            @"trimStartSeconds" : @0.0,
+            @"trimEndSeconds"   : @5.0,
+            @"speed"            : @1.0,
+            // freezePTS intentionally absent
+        };
+        VGClipDescriptor *clip = [VGClipDescriptor fromDictionary:dict];
+        BOOL passed = (clip != nil && clip.freezePTS == nil);
+        if (passed) {
+            log(@"  ✅ absent freezePTS: fromDictionary: returned non-nil with nil freezePTS");
+        } else {
+            log([NSString stringWithFormat:
+                 @"  ❌ absent freezePTS: clip=%@ freezePTS=%@",
+                 clip ?: (id)@"nil", clip.freezePTS ?: (id)@"nil"]);
+        }
+        step(@"absent freezePTS → nil", passed, passed
+             ? @"freezePTS correctly nil when key absent"
+             : @"fromDictionary: returned nil or unexpected non-nil freezePTS");
+    }
+
+    // ─── Test 3: Negative freezePTS=-1.0 must be rejected ────────────────────
+    log(@"");
+    log(@"Test 3: negative freezePTS=-1.0 must be rejected by fromDictionary:");
+    {
+        NSDictionary *dict = @{
+            @"id"               : @"vid-neg-freeze-7.17",
+            @"sourcePath"       : @"/tmp/smoke_video.mp4",
+            @"mediaKind"        : @"video",
+            @"startTimeSeconds" : @0.0,
+            @"durationSeconds"  : @2.0,
+            @"trimStartSeconds" : @0.0,
+            @"trimEndSeconds"   : @2.0,
+            @"speed"            : @1.0,
+            @"freezePTS"        : @(-1.0), // invalid: must be non-negative
+        };
+        VGClipDescriptor *clip = [VGClipDescriptor fromDictionary:dict];
+        BOOL passed = (clip == nil); // must return nil for negative freezePTS
+        if (passed) {
+            log(@"  ✅ Negative freezePTS correctly rejected (fromDictionary: returned nil)");
+        } else {
+            log([NSString stringWithFormat:
+                 @"  ❌ Negative freezePTS was NOT rejected (returned non-nil: %@)",
+                 clip]);
+        }
+        step(@"Negative freezePTS rejection", passed, passed
+             ? @"fromDictionary: returned nil for freezePTS=-1.0"
+             : @"fromDictionary: should have returned nil but did not");
+    }
+
+    // ─── Summary ──────────────────────────────────────────────────────────────
+    log(@"");
+    log(@"═══════════════════════════════════════════════════════");
+    if (overallSuccess) {
+        log(@"  ✅ ALL PHASE 7.17 NATIVE TESTS PASSED");
+    } else {
+        log(@"  ❌ SOME PHASE 7.17 NATIVE TESTS FAILED");
+    }
+    log(@"═══════════════════════════════════════════════════════");
+
+    NSMutableDictionary *result = [@{
+        @"success": @(overallSuccess),
+        @"steps": [steps copy],
+        @"logs": [logs copy],
+    } mutableCopy];
+    if (!overallSuccess) {
+        for (NSDictionary *s in steps) {
+            if (![s[@"passed"] boolValue]) {
+                result[@"error"] = s[@"detail"];
+                break;
+            }
+        }
+    }
+    return [result copy];
+}
+
 @end
 
 #else // !DEBUG
@@ -1210,6 +1350,16 @@ static BOOL _generateMovingPatternVideo(NSString *path,
         @"steps": @[],
         @"logs": @[@"Release build — still-image fit/crop smoke test disabled"],
         @"error": @"VGTimelineCompositorSmokeTest.runStillImageFitCropSmokeTest is DEBUG-only",
+    };
+}
+
++ (NSDictionary<NSString *, id> *)runFreezeFrameDescriptorSmokeTest {
+    // Phase 7.17 freeze-frame descriptor test is DEBUG-only.
+    return @{
+        @"success": @NO,
+        @"steps": @[],
+        @"logs": @[@"Release build — freeze-frame descriptor smoke test disabled"],
+        @"error": @"VGTimelineCompositorSmokeTest.runFreezeFrameDescriptorSmokeTest is DEBUG-only",
     };
 }
 

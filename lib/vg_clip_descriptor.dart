@@ -1,5 +1,5 @@
 // vg_clip_descriptor.dart
-// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11 / Phase 7.16
+// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11 / Phase 7.16 / Phase 7.17
 //
 // Non-destructive clip descriptor for the UMF V2 timeline editor.
 //
@@ -26,6 +26,17 @@
 //   - Both fields are omitted from toMap() when default/null.
 //   - Do NOT add these fields to VGClipTransformDescriptor.
 //
+// Phase 7.17 addition (DEC-150):
+//   - [freezePTS]: Optional source-local PTS (in seconds) for video-derived
+//     freeze frame extraction. When non-null the compositor extracts a single
+//     frame from the video asset at [sourcePath] using AVAssetImageGenerator
+//     at the specified source-local time and caches it as a static buffer.
+//   - Descriptor-level validation: must be non-negative. The caller
+//     (VGEditorDraft.freezeClip) is responsible for ensuring the value lies
+//     within the original clip's active trim window at split time.
+//   - Applies ONLY to [VGMediaKind.video] clips created by freezeClip().
+//   - Omitted from toMap() when null.
+//
 // Serialisation:
 //   toMap() produces a JSON-compatible map:
 //   {
@@ -40,6 +51,7 @@
 //     'transform': Map?,         // Phase 7.11: optional, omitted when null
 //     'fitMode': String?,        // Phase 7.16: omitted when 'fit' (default)
 //     'cropRect': List<double>?, // Phase 7.16: omitted when null
+//     'freezePTS': double?,      // Phase 7.17: omitted when null
 //   }
 
 import 'vg_clip_transform_descriptor.dart';
@@ -143,6 +155,7 @@ final class VGClipDescriptor {
     this.transform,
     this.fitMode = VGStillImageFitMode.fit,
     this.cropRect,
+    this.freezePTS,
   })  : assert(startTimeSeconds >= 0, 'startTimeSeconds must be >= 0'),
         assert(durationSeconds >= 0, 'durationSeconds must be >= 0'),
         assert(trimStartSeconds >= 0, 'trimStartSeconds must be >= 0'),
@@ -175,6 +188,14 @@ final class VGClipDescriptor {
         assert(
           cropRect == null || cropRect[1] + cropRect[3] <= 1.0,
           'cropRect y + height must be <= 1.0',
+        ),
+        // Phase 7.17: freezePTS validation.
+        // When non-null: must be non-negative and finite.
+        // Descriptor-level check only; VGEditorDraft.freezeClip() ensures the
+        // value lies within the original clip's active trim window at split time.
+        assert(
+          freezePTS == null || (freezePTS >= 0.0),
+          'freezePTS must be non-negative (source-local PTS for frame extraction)',
         );
 
   // ── Identity ───────────────────────────────────────────────────────────────
@@ -288,6 +309,31 @@ final class VGClipDescriptor {
   /// canvas, fill may crop additional edges (see RR-152).
   final List<double>? cropRect;
 
+  // ── Freeze frame (Phase 7.17) ──────────────────────────────────────────────
+
+  /// Source-local PTS (in seconds) for video-derived freeze frame extraction.
+  ///
+  /// **Phase 7.17 / DEC-150** — when non-null, this clip is a freeze-frame
+  /// clip. The native compositor extracts a single frame from the video asset
+  /// at [sourcePath] using `AVAssetImageGenerator` at this source-local time
+  /// on the first pull, and caches it as a static buffer thereafter.
+  ///
+  /// Design notes:
+  /// - Applies ONLY to [VGMediaKind.video] clips created by
+  ///   [VGEditorDraft.freezeClip]. Setting on image clips has no effect.
+  /// - `freezePTS` references the **original source video's** coordinate space,
+  ///   not the freeze clip's own trim window. The freeze clip's trim fields
+  ///   ([trimStartSeconds] = 0, [trimEndSeconds] = hold duration) describe
+  ///   how long the frame is held on the timeline.
+  /// - Descriptor-level validation: must be non-negative. [VGEditorDraft.freezeClip]
+  ///   ensures the value lies within the original clip's active trim window.
+  /// - Audio is implicitly silent for freeze clips in Phase 7.17 (no timeline
+  ///   audio pipeline exists). Future audio sidecar work should treat
+  ///   `freezePTS != null` as a mute/suppress-audio signal.
+  ///
+  /// Null means this is a normal video or image clip (no freeze behavior).
+  final double? freezePTS;
+
   // ── Crop rect convenience accessors (Phase 7.16) ─────────────────────────
 
   /// The normalized X origin of the crop rectangle. Null when [cropRect] is null.
@@ -360,6 +406,10 @@ final class VGClipDescriptor {
     if (cropRect != null) {
       m['cropRect'] = cropRect!;
     }
+    // Phase 7.17: omit freezePTS when null.
+    if (freezePTS != null) {
+      m['freezePTS'] = freezePTS!;
+    }
     return m;
   }
 
@@ -430,6 +480,17 @@ final class VGClipDescriptor {
       cropRect = doubles;
     }
 
+    // Phase 7.17: parse optional freezePTS. When present must be a finite
+    // non-negative number. A missing key means null (normal clip).
+    double? freezePTS;
+    final rawFreezePTS = map['freezePTS'];
+    if (rawFreezePTS != null) {
+      if (rawFreezePTS is! num) return null;
+      final v = rawFreezePTS.toDouble();
+      if (!v.isFinite || v < 0.0) return null;
+      freezePTS = v;
+    }
+
     return VGClipDescriptor(
       id: id as String,
       sourcePath: sourcePath as String,
@@ -442,6 +503,7 @@ final class VGClipDescriptor {
       transform: transform,
       fitMode: fitMode,
       cropRect: cropRect,
+      freezePTS: freezePTS,
     );
   }
 
@@ -464,6 +526,8 @@ final class VGClipDescriptor {
     VGStillImageFitMode? fitMode,
     // Use sentinel to allow explicit null assignment (clear cropRect).
     Object? cropRect = _kClipNoValue,
+    // Use sentinel to allow explicit null assignment (clear freezePTS).
+    Object? freezePTS = _kClipNoValue,
   }) {
     return VGClipDescriptor(
       id: id ?? this.id,
@@ -481,6 +545,9 @@ final class VGClipDescriptor {
       cropRect: cropRect == _kClipNoValue
           ? this.cropRect
           : cropRect as List<double>?,
+      freezePTS: freezePTS == _kClipNoValue
+          ? this.freezePTS
+          : freezePTS as double?,
     );
   }
 
@@ -500,7 +567,8 @@ final class VGClipDescriptor {
           other.speed == speed &&
           other.transform == transform &&
           other.fitMode == fitMode &&
-          _cropRectEqual(other.cropRect, cropRect);
+          _cropRectEqual(other.cropRect, cropRect) &&
+          other.freezePTS == freezePTS;
 
   /// Deep-equality helper for the [cropRect] list field.
   static bool _cropRectEqual(List<double>? a, List<double>? b) {
@@ -527,6 +595,7 @@ final class VGClipDescriptor {
         fitMode,
         // Hash cropRect elements individually for stable hash.
         Object.hashAll(cropRect ?? const []),
+        freezePTS,
       );
 
   @override
@@ -540,7 +609,8 @@ final class VGClipDescriptor {
       'speed: $speed×, '
       'transform: $transform, '
       'fitMode: ${fitMode.value}, '
-      'cropRect: $cropRect)';
+      'cropRect: $cropRect, '
+      'freezePTS: $freezePTS)';
 }
 
 // ── Sentinel for copyWith nullable fields ─────────────────────────────────────────

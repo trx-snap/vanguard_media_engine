@@ -1,5 +1,5 @@
 // VGTimelineCompositorSmokeTest.h
-// vanguard_media_engine — Phase 7 Stage 7.5B
+// vanguard_media_engine — Phase 7 Stage 7.5B / Phase 7.16 / Phase 7.17
 //
 // Headless native smoke test runner for VGTimelineCompositorNode.
 //
@@ -124,7 +124,22 @@ NS_ASSUME_NONNULL_BEGIN
 /// @return NSDictionary with @"success" YES/NO, @"steps", @"logs", @"error".
 + (NSDictionary<NSString *, id> *)runStillImageFitCropSmokeTest;
 
+/// Phase 7.17: Freeze-frame descriptor contract smoke test.
+///
+/// Validates VGClipDescriptor freezePTS serialisation and rejection of invalid values
+/// via +fromDictionary:. Does NOT require a real MP4 on disk — exercises the
+/// Objective-C contract layer only (no compositor execution or AVAssetImageGenerator).
+///
+/// Three subtests:
+///   1. freezePTS=3.0 round-trips through +fromDictionary: (non-nil, value=3.0).
+///   2. freezePTS=nil (absent key) round-trips as nil (normal clip).
+///   3. Negative freezePTS=-1.0 is rejected by +fromDictionary: (returns nil).
+///
+/// In RELEASE builds: returns a static error result.
+///
+/// @return NSDictionary with @"success" YES/NO, @"steps", @"logs", @"error".
++ (NSDictionary<NSString *, id> *)runFreezeFrameDescriptorSmokeTest;
+
 @end
 
 NS_ASSUME_NONNULL_END
-

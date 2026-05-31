@@ -597,6 +597,229 @@ final class VGEditorDraft {
     );
   }
 
+  // ── Freeze frame editing (Phase 7.17 / DEC-150) ─────────────────────────────
+
+  /// Returns a new copy of this draft with [clipId] replaced by three adjacent
+  /// clips: a **left clip** (normal video up to [splitSeconds]), a **freeze
+  /// clip** (a static hold of the frame at [splitSeconds] for [duration]
+  /// seconds), and a **right clip** (normal video from [splitSeconds] onward).
+  ///
+  /// **Three-way split layout:**
+  /// 1. **Left clip**: keeps original [clipId]; trim window
+  ///    `[original.trimStartSeconds, splitSeconds]`.
+  /// 2. **Freeze clip**: new ID `"${clipId}-freeze-1"` (suffix incremented on
+  ///    collision); `freezePTS = splitSeconds`; `durationSeconds = duration`;
+  ///    `trimStartSeconds = 0.0`; `trimEndSeconds = duration`; `speed = 1.0`.
+  ///    The native compositor extracts the frame via `AVAssetImageGenerator`
+  ///    on first pull and caches it as a static source (RR-154).
+  /// 3. **Right clip**: new ID `"${clipId}-split-1"` (suffix incremented on
+  ///    collision); trim window `[splitSeconds, original.trimEndSeconds]`.
+  ///
+  /// **Transition rebinding:**
+  /// - Incoming transitions to the original clip remain bound to the left clip.
+  /// - Outgoing transitions from the original clip are rebound to the right clip.
+  /// - The two new boundaries (left→freeze, freeze→right) are hard cuts.
+  ///
+  /// **Audio**: freeze clips are implicitly audio-silent in Phase 7.17 because
+  /// no timeline audio pipeline exists. Future audio code should treat
+  /// `freezePTS != null` as a mute/suppress-audio signal.
+  ///
+  /// Throws [ArgumentError] if:
+  /// - [clipId] is not found in this draft.
+  /// - The target clip is not `VGMediaKind.video`.
+  /// - [duration] is not > 0.
+  /// - [splitSeconds] is not strictly within `(trimStartSeconds, trimEndSeconds)`.
+  /// - Either resulting left/right clip active duration is below 0.1 s.
+  /// - The left or right clip's `timelineDuration` is less than its transition
+  ///   overlap (would collapse the transition window).
+  ///
+  /// ```dart
+  /// final frozen = draft.freezeClip(
+  ///   clipId: 'clip-A',
+  ///   splitSeconds: 3.0,
+  ///   duration: 2.0,
+  /// );
+  /// // frozen.clips[0].id             == 'clip-A'        (left)
+  /// // frozen.clips[1].id             == 'clip-A-freeze-1' (freeze)
+  /// // frozen.clips[1].freezePTS      == 3.0
+  /// // frozen.clips[2].id             == 'clip-A-split-1'  (right)
+  /// ```
+  VGEditorDraft freezeClip(
+    String clipId,
+    double splitSeconds,
+    double duration,
+  ) {
+    // 1. Locate the target clip.
+    final targetIndex = clips.indexWhere((c) => c.id == clipId);
+    if (targetIndex == -1) {
+      throw ArgumentError(
+        'VGEditorDraft.freezeClip: clip "$clipId" not found in draft "$id".',
+      );
+    }
+    final targetClip = clips[targetIndex];
+
+    // 2. Validate: must be a video clip.
+    if (targetClip.mediaKind != VGMediaKind.video) {
+      throw ArgumentError(
+        'VGEditorDraft.freezeClip: clip "$clipId" is not a video clip '
+        '(mediaKind=${targetClip.mediaKind.value}). '
+        'Freeze frame only applies to VGMediaKind.video clips.',
+      );
+    }
+
+    // 3. Validate: duration must be > 0.
+    if (duration <= 0.0) {
+      throw ArgumentError(
+        'VGEditorDraft.freezeClip: duration ($duration) must be > 0 '
+        'for clip "$clipId".',
+      );
+    }
+
+    // 4. Validate: splitSeconds must be strictly within the active trim window.
+    if (splitSeconds <= targetClip.trimStartSeconds ||
+        splitSeconds >= targetClip.trimEndSeconds) {
+      throw ArgumentError(
+        'VGEditorDraft.freezeClip: splitSeconds ($splitSeconds) must be '
+        'strictly between trimStartSeconds (${targetClip.trimStartSeconds}) '
+        'and trimEndSeconds (${targetClip.trimEndSeconds}) '
+        'for clip "$clipId".',
+      );
+    }
+
+    // 5. Validate minimum active duration for left and right clips.
+    final leftDuration = splitSeconds - targetClip.trimStartSeconds;
+    final rightDuration = targetClip.trimEndSeconds - splitSeconds;
+    if (leftDuration < _kMinTrimDurationSeconds ||
+        rightDuration < _kMinTrimDurationSeconds) {
+      throw ArgumentError(
+        'VGEditorDraft.freezeClip: resulting left/right clip active durations '
+        '($leftDuration s / $rightDuration s) must each be >= '
+        '$_kMinTrimDurationSeconds s. Do not silently clamp.',
+      );
+    }
+
+    // 6. Generate deterministic unique IDs for freeze and right clips.
+    //    Freeze: "${clipId}-freeze-1", incrementing suffix on collision.
+    //    Right:  "${clipId}-split-1",  incrementing suffix on collision.
+    final existingIds = clips.map((c) => c.id).toSet();
+
+    var freezeIndex = 1;
+    var freezeId = '$clipId-freeze-$freezeIndex';
+    while (existingIds.contains(freezeId)) {
+      freezeIndex++;
+      freezeId = '$clipId-freeze-$freezeIndex';
+    }
+    // Reserve freezeId so the right clip suffix search sees it.
+    existingIds.add(freezeId);
+
+    var splitIndex = 1;
+    var rightId = '$clipId-split-$splitIndex';
+    while (existingIds.contains(rightId)) {
+      splitIndex++;
+      rightId = '$clipId-split-$splitIndex';
+    }
+
+    // 7. Validate transition-overlap safety (mirrors splitClip logic).
+    //    Left clip: incoming overlap must not exceed left timeline duration.
+    //    Right clip: outgoing overlap must not exceed right timeline duration.
+    final prevClipId = targetIndex > 0 ? clips[targetIndex - 1].id : null;
+    final nextClipId =
+        targetIndex < clips.length - 1 ? clips[targetIndex + 1].id : null;
+
+    double overlapIn = 0.0;
+    double overlapOut = 0.0;
+    for (final t in transitions) {
+      if (t.isHardCut) continue;
+      if (t.toClipId == targetClip.id && t.fromClipId == prevClipId) {
+        overlapIn += t.durationSeconds;
+      }
+      if (t.fromClipId == targetClip.id && t.toClipId == nextClipId) {
+        overlapOut += t.durationSeconds;
+      }
+    }
+
+    final leftTimelineDuration = leftDuration / targetClip.speed;
+    final rightTimelineDuration = rightDuration / targetClip.speed;
+    if (leftTimelineDuration < overlapIn) {
+      throw ArgumentError(
+        'VGEditorDraft.freezeClip: resulting left clip timelineDuration '
+        '($leftTimelineDuration s) for clip "$clipId" is less than its '
+        'incoming transition overlap ($overlapIn s). '
+        'Freeze would collapse transition window.',
+      );
+    }
+    if (rightTimelineDuration < overlapOut) {
+      throw ArgumentError(
+        'VGEditorDraft.freezeClip: resulting right clip timelineDuration '
+        '($rightTimelineDuration s) for clip "$clipId" is less than its '
+        'outgoing transition overlap ($overlapOut s). '
+        'Freeze would collapse transition window.',
+      );
+    }
+
+    // 8. Build the three new clip descriptors.
+    //
+    //    Left clip: retains original clipId; trim window [trimStart, splitSeconds].
+    //    Inherits original transform; freezePTS stays null (normal video).
+    final leftClip = targetClip.copyWith(trimEndSeconds: splitSeconds);
+
+    //    Freeze clip: new freezeId; source is same file; mediaKind stays video.
+    //    durationSeconds = duration (the hold duration, not the source duration).
+    //    trimStartSeconds = 0.0, trimEndSeconds = duration (describes hold on timeline).
+    //    freezePTS = splitSeconds (source-local extraction PTS).
+    //    speed = 1.0, transform = null, fitMode = default, cropRect = null.
+    final freezeClipDescriptor = VGClipDescriptor(
+      id: freezeId,
+      sourcePath: targetClip.sourcePath,
+      mediaKind: VGMediaKind.video,
+      // startTimeSeconds will be recomputed by sequentialWithTransitions.
+      startTimeSeconds: 0.0,
+      durationSeconds: duration,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: duration,
+      speed: 1.0,
+      transform: null,
+      fitMode: VGStillImageFitMode.fit,
+      cropRect: null,
+      freezePTS: splitSeconds,
+    );
+
+    //    Right clip: new rightId; trim window [splitSeconds, trimEnd].
+    //    Inherits original transform, speed, and other fields.
+    final rightClip = targetClip.copyWith(
+      id: rightId,
+      trimStartSeconds: splitSeconds,
+    );
+
+    // 9. Assemble updated clip list: replace target with left, insert freeze,
+    //    then right.
+    final updatedClips = List<VGClipDescriptor>.of(clips);
+    updatedClips[targetIndex] = leftClip;
+    updatedClips.insert(targetIndex + 1, freezeClipDescriptor);
+    updatedClips.insert(targetIndex + 2, rightClip);
+
+    // 10. Rebind outgoing transitions from the original clip to the right clip.
+    //     Incoming transitions stay on the left clip (its ID is unchanged).
+    //     Boundaries left→freeze and freeze→right are hard cuts (no transitions
+    //     created here).
+    final updatedTransitions = transitions.map((t) {
+      if (t.fromClipId == targetClip.id) {
+        return t.copyWith(fromClipId: rightId);
+      }
+      return t;
+    }).toList();
+
+    // 11. Rebuild the sequential layout (propagates startTimeSeconds cascade).
+    return VGEditorDraft.sequentialWithTransitions(
+      id: id,
+      clips: updatedClips,
+      transitions: updatedTransitions,
+      canvasWidth: canvasWidth,
+      canvasHeight: canvasHeight,
+      fps: fps,
+    );
+  }
+
   // ── Reorder editing (Phase 7.15 / DEC-148) ──────────────────────────────────
 
   /// Moves the clip at [fromIndex] to [toIndex] in the timeline, applies

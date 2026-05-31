@@ -704,6 +704,11 @@ static os_log_t sTimelineLog;
 // Phase 7.12: YES for still-image clips. reader and trackOutput are nil.
 // Decoded buffer is cached on first pull; subsequent pulls return cached buffer.
 @property(nonatomic) BOOL isStaticSource;
+// Phase 7.17: Source-local PTS for video-derived freeze frame extraction.
+// Non-nil ONLY for freeze clips (mediaKind=video, freezePTS!=nil in descriptor).
+// Nil for still-image clips (those decode from sourceURL directly).
+// Nil for normal video clips (those use AVAssetReader).
+@property(nonatomic, strong, nullable) NSNumber *freezePTS;
 @end
 
 @implementation _VGClipReader
@@ -1628,6 +1633,9 @@ static os_log_t sTimelineLog;
 
   // ── Phase 7.12: Static source path ────────────────────────────────────────
   // Phase 7.12: static image transforms are baked into the cached buffer.
+  // Phase 7.17: freeze-frame clips also use isStaticSource=YES and share
+  //             this path; the frame is extracted via AVAssetImageGenerator
+  //             when freezePTS is non-nil.
   // Transform changes require reader/draft rebuild; no dynamic per-frame image transform update in this slice.
   if (reader.isStaticSource) {
     VGClipDescriptor *clip = _clips[reader.clipIndex];
@@ -1641,6 +1649,180 @@ static os_log_t sTimelineLog;
       return reader.lastDeliveredBuffer; // caller owns +1
     }
 
+    // ── Phase 7.17: Freeze-frame path ──────────────────────────────────────
+    // When freezePTS is non-nil this is a video-derived freeze clip.
+    // Use AVAssetImageGenerator to extract the exact frame at the requested
+    // source-local PTS. Zero tolerances ensure exact frame accuracy (same
+    // as Opus-approved contract; see DEC-150 / RR-154).
+    if (reader.freezePTS != nil) {
+      NSURL *assetURL = [NSURL fileURLWithPath:clip.sourceURL];
+      if (!assetURL) {
+        if (outError) {
+          *outError = _VGTCNError(
+              30, ([NSString stringWithFormat:
+                       @"VGTimelineCompositorNode (Phase 7.17): invalid sourceURL "
+                        "for freeze-frame clip %@.",
+                       clip.clipId]));
+        }
+        return NULL;
+      }
+
+      AVURLAsset *asset = [AVURLAsset URLAssetWithURL:assetURL options:nil];
+      AVAssetImageGenerator *gen =
+          [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
+      // kCMTimeZero tolerances: exact frame accuracy as specified in DEC-150 / RR-154.
+      gen.requestedTimeToleranceBefore = kCMTimeZero;
+      gen.requestedTimeToleranceAfter  = kCMTimeZero;
+      // Apply maximum size to avoid excess memory; canvas size is sufficient.
+      gen.maximumSize = CGSizeMake(_targetRenderSize.width * 2.0,
+                                   _targetRenderSize.height * 2.0);
+
+      // Convert source-local seconds to CMTime (timescale 600 for sub-frame precision).
+      double pts = reader.freezePTS.doubleValue;
+      CMTime requestTime = CMTimeMakeWithSeconds(pts, 600);
+
+      NSError *genErr = nil;
+      CMTime actualTime;
+      CGImageRef cgFrame = [gen copyCGImageAtTime:requestTime
+                                       actualTime:&actualTime
+                                            error:&genErr];
+      if (!cgFrame) {
+        if (outError) {
+          *outError = _VGTCNError(
+              31, ([NSString stringWithFormat:
+                       @"VGTimelineCompositorNode (Phase 7.17): "
+                        "AVAssetImageGenerator failed for clip %@ at PTS %.3fs: %@",
+                       clip.clipId, pts,
+                       genErr.localizedDescription ?: @"unknown"])); 
+        }
+        os_log_error(sTimelineLog,
+                     "[VGTCNode] freeze-frame extract failed clip=%lu pts=%.3fs: %{public}@",
+                     (unsigned long)reader.clipIndex, pts,
+                     genErr.localizedDescription);
+        return NULL;
+      }
+
+      os_log(sTimelineLog,
+             "[VGTCNode] freeze-frame extracted: clip=%lu reqPTS=%.3fs actualPTS=%.3fs",
+             (unsigned long)reader.clipIndex, pts,
+             CMTimeGetSeconds(actualTime));
+
+      // Convert CGImage → CVPixelBufferRef via CIImage + CIContext.
+      // Use the Phase 7.12 still-image helper with no crop/fitMode (video frame
+      // is already correctly sized; fitMode=fit, cropRect=nil).
+      // The helper scales to targetRenderSize using fit mode.
+      CGRelease_cleanup:
+      {
+        CIImage *ciFrame = [CIImage imageWithCGImage:cgFrame];
+        CGImageRelease(cgFrame);
+
+        CGSize imgSize = ciFrame.extent.size;
+        if (imgSize.width <= 0 || imgSize.height <= 0) {
+          if (outError) {
+            *outError = _VGTCNError(
+                32, ([NSString stringWithFormat:
+                         @"VGTimelineCompositorNode (Phase 7.17): "
+                          "extracted frame has zero size for clip %@.",
+                         clip.clipId]));
+          }
+          return NULL;
+        }
+
+        // Scale to canvas using fit mode (letterbox — same as image clips default).
+        CGFloat scaleX = _targetRenderSize.width  / imgSize.width;
+        CGFloat scaleY = _targetRenderSize.height / imgSize.height;
+        CGFloat scale  = MIN(scaleX, scaleY); // fit mode: no black-bar fill
+        CGSize  drawSize = CGSizeMake(imgSize.width * scale, imgSize.height * scale);
+        CGFloat offsetX  = (_targetRenderSize.width  - drawSize.width)  / 2.0;
+        CGFloat offsetY  = (_targetRenderSize.height - drawSize.height) / 2.0;
+
+        // Create a black-filled BGRA pixel buffer at canvas size.
+        NSDictionary *pbAttrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferWidthKey:  @((int)_targetRenderSize.width),
+            (id)kCVPixelBufferHeightKey: @((int)_targetRenderSize.height),
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        };
+        CVPixelBufferRef pb = NULL;
+        CVReturn pbRet = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            (size_t)_targetRenderSize.width,
+            (size_t)_targetRenderSize.height,
+            kCVPixelFormatType_32BGRA,
+            (__bridge CFDictionaryRef)pbAttrs,
+            &pb);
+        if (pbRet != kCVReturnSuccess || !pb) {
+          if (outError) {
+            *outError = _VGTCNError(
+                33, ([NSString stringWithFormat:
+                         @"VGTimelineCompositorNode (Phase 7.17): "
+                          "CVPixelBufferCreate failed for clip %@.",
+                         clip.clipId]));
+          }
+          return NULL;
+        }
+
+        // Clear to black.
+        CVPixelBufferLockBaseAddress(pb, 0);
+        void *baseAddr = CVPixelBufferGetBaseAddress(pb);
+        size_t byteCount = CVPixelBufferGetBytesPerRow(pb)
+                           * CVPixelBufferGetHeight(pb);
+        memset(baseAddr, 0, byteCount);
+        CVPixelBufferUnlockBaseAddress(pb, 0);
+
+        // Render scaled CIImage into the pixel buffer.
+        CGAffineTransform tx = CGAffineTransformTranslate(
+            CGAffineTransformMakeScale(scale, scale), 0, 0);
+        CIImage *scaled = [ciFrame imageByApplyingTransform:
+            CGAffineTransformMakeScale(scale, scale)];
+        // Translate to center within canvas (CI origin = bottom-left).
+        CIImage *centered = [scaled imageByApplyingTransform:
+            CGAffineTransformMakeTranslation(offsetX, offsetY)];
+
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        [_VGTCNSharedCIContext() render:centered
+                          toCVPixelBuffer:pb
+                                    bounds:CGRectMake(0, 0,
+                                                      _targetRenderSize.width,
+                                                      _targetRenderSize.height)
+                                colorSpace:cs];
+        CGColorSpaceRelease(cs);
+        (void)tx; // suppress unused warning
+
+        // Apply Phase 7.11 transform if non-identity (freeze clips default to nil).
+        VGClipTransformDescriptor *td = clip.transform;
+        if (td && !td.isIdentity) {
+          NSError *tfErr = nil;
+          CVPixelBufferRef tfPB = _VGTCNApplyTransformAndOpacity(pb, td, &tfErr);
+          CVPixelBufferRelease(pb);
+          if (!tfPB) {
+            if (outError) *outError = tfErr;
+            os_log_error(sTimelineLog,
+                         "[VGTCNode] freeze-frame transform failed clip=%lu: %{public}@",
+                         (unsigned long)reader.clipIndex,
+                         tfErr.localizedDescription);
+            return NULL;
+          }
+          pb = tfPB;
+        }
+
+        // Cache the decoded+transformed buffer. Cache takes its own +1.
+        reader.lastDeliveredBuffer = pb;
+        reader.lastDeliveredAssetPTS = 0.0;
+        reader.lastDeliveredAssetDuration = 1e9; // static: never expires
+        CVPixelBufferRetain(pb); // cache retain
+
+        os_log(sTimelineLog,
+               "[VGTCNode] freeze-frame decoded+cached: clip=%lu canvas=%.0fx%.0f",
+               (unsigned long)reader.clipIndex,
+               _targetRenderSize.width, _targetRenderSize.height);
+
+        return pb; // caller owns +1 from CVPixelBufferCreate
+      } // CGRelease_cleanup
+    }
+    // ── End Phase 7.17 freeze-frame path ───────────────────────────────────
+
+    // ── Phase 7.12: Still-image path (non-freeze) ──────────────────────────
     // First pull: decode still image.
     NSURL *imageURL = [NSURL fileURLWithPath:clip.sourceURL];
     if (!imageURL) {
@@ -1816,9 +1998,30 @@ static os_log_t sTimelineLog;
     clipReader.trackOutput = nil;
     clipReader.sourceFPS = 1.0;     // Safe non-zero default; unused for frame timing.
     clipReader.isStaticSource = YES;
+    clipReader.freezePTS = nil;     // Not a freeze clip; sourceURL decoded directly.
     os_log(sTimelineLog,
-           "[VGTCNode] built static reader: clip=%lu",
+           "[VGTCNode] built static reader (still-image): clip=%lu",
            (unsigned long)clipIndex);
+    return clipReader;
+  }
+
+  // ── Phase 7.17: Branch for video-derived freeze frame clips ──────────────
+  // Freeze clips have mediaKind == VGClipMediaKindVideo and a non-nil freezePTS.
+  // They do not use AVAssetReader. Build a minimal _VGClipReader with
+  // isStaticSource = YES; AVAssetImageGenerator extraction happens lazily
+  // in _pullBufferFromReader:.
+  if (clip.mediaKind == VGClipMediaKindVideo && clip.freezePTS != nil) {
+    _VGClipReader *clipReader = [[_VGClipReader alloc] init];
+    clipReader.clipIndex = clipIndex;
+    clipReader.reader = nil;
+    clipReader.trackOutput = nil;
+    clipReader.sourceFPS = 1.0;       // Unused for static path.
+    clipReader.isStaticSource = YES;
+    clipReader.freezePTS = clip.freezePTS; // Stored for lazy extraction.
+    os_log(sTimelineLog,
+           "[VGTCNode] built static reader (freeze-frame): clip=%lu freezePTS=%.3fs",
+           (unsigned long)clipIndex,
+           clip.freezePTS.doubleValue);
     return clipReader;
   }
 

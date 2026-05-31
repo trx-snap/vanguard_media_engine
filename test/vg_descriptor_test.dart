@@ -15,6 +15,7 @@ import 'package:vanguard_media_engine/vg_effect_catalog.dart';
 import 'package:vanguard_media_engine/vg_preset_descriptor.dart';
 import 'package:vanguard_media_engine/vg_filter_spec.dart';
 import 'package:vanguard_media_engine/vg_clip_descriptor.dart'; // Phase 7.12
+import 'package:vanguard_media_engine/vg_editor_draft.dart'; // Phase 7.17
 
 void main() {
   // ───────────────────────────────────────────────────────────────────────────
@@ -961,13 +962,221 @@ void main() {
           VGStillImageFitMode.fromValue('stretch'), VGStillImageFitMode.fit);
     });
   });
-}
 
-// ignore: unused_import
-// vg_clip_transform_descriptor tests appended by Phase 7.11 implementer.
-// These tests are imported by the vg_descriptor_test.dart main() above via
-// a separate call; kept in the same file for colocation with descriptor tests.
-// To run: `flutter test test/vg_descriptor_test.dart`
+  // ───────────────────────────────────────────────────────────────────────────
+  // Phase 7.17: VGClipDescriptor freezePTS
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGClipDescriptor — freezePTS (Phase 7.17)', () {
+    // Helper: a minimal valid video clip.
+    VGClipDescriptor _videoClip({
+      String id = 'vid-01',
+      String sourcePath = '/tmp/video.mp4',
+      double durationSeconds = 10.0,
+      double trimStart = 0.0,
+      double trimEnd = 10.0,
+      double? freezePTS,
+    }) =>
+        VGClipDescriptor(
+          id: id,
+          sourcePath: sourcePath,
+          mediaKind: VGMediaKind.video,
+          durationSeconds: durationSeconds,
+          trimStartSeconds: trimStart,
+          trimEndSeconds: trimEnd,
+          freezePTS: freezePTS,
+        );
+
+    test('FF-1  freezePTS defaults to null', () {
+      final clip = _videoClip();
+      expect(clip.freezePTS, isNull);
+    });
+
+    test('FF-2  non-null freezePTS is stored correctly', () {
+      final clip = _videoClip(freezePTS: 3.5);
+      expect(clip.freezePTS, closeTo(3.5, 1e-10));
+    });
+
+    test('FF-3  zero freezePTS is valid (non-negative boundary)', () {
+      final clip = _videoClip(freezePTS: 0.0);
+      expect(clip.freezePTS, 0.0);
+    });
+
+    test('FF-4  freezePTS=3.0 serialises to toMap()', () {
+      final clip = _videoClip(freezePTS: 3.0);
+      final m = clip.toMap();
+      expect(m.containsKey('freezePTS'), isTrue);
+      expect(m['freezePTS'], closeTo(3.0, 1e-10));
+    });
+
+    test('FF-5  null freezePTS is omitted from toMap()', () {
+      final clip = _videoClip();
+      final m = clip.toMap();
+      expect(m.containsKey('freezePTS'), isFalse);
+    });
+
+    test('FF-6  freezePTS round-trip via fromMap()', () {
+      final original = _videoClip(freezePTS: 4.25);
+      final clone = VGClipDescriptor.fromMap(
+          Map<Object?, Object?>.from(original.toMap()));
+      expect(clone, isNotNull);
+      expect(clone!.freezePTS, closeTo(4.25, 1e-10));
+    });
+
+    test('FF-7  absent freezePTS key in fromMap() returns null', () {
+      final m = _videoClip().toMap();
+      expect(m.containsKey('freezePTS'), isFalse);
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNotNull);
+      expect(clip!.freezePTS, isNull);
+    });
+
+    test('FF-8  negative freezePTS is rejected by fromMap()', () {
+      final m = _videoClip().toMap();
+      m['freezePTS'] = -1.0;
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNull);
+    });
+
+    test('FF-9  copyWith preserves freezePTS when not overridden', () {
+      final clip = _videoClip(freezePTS: 2.0);
+      final copy = clip.copyWith(id: 'vid-copy');
+      expect(copy.freezePTS, closeTo(2.0, 1e-10));
+    });
+
+    test('FF-10 copyWith can clear freezePTS to null via sentinel', () {
+      final clip = _videoClip(freezePTS: 2.0);
+      final cleared = clip.copyWith(freezePTS: null);
+      expect(cleared.freezePTS, isNull);
+    });
+
+    test('FF-11 equality includes freezePTS', () {
+      final a = _videoClip(freezePTS: 3.0);
+      final b = _videoClip(freezePTS: 3.0);
+      expect(a, equals(b));
+      expect(a.hashCode, b.hashCode);
+    });
+
+    test('FF-12 equality differs when freezePTS differs', () {
+      final a = _videoClip(freezePTS: 3.0);
+      final b = _videoClip(freezePTS: 4.0);
+      expect(a == b, isFalse);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Phase 7.17: VGEditorDraft.freezeClip
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorDraft.freezeClip — Phase 7.17', () {
+    // Helper: a draft with a single 10s video clip.
+    VGEditorDraft _singleClipDraft() => VGEditorDraft.sequentialWithTransitions(
+          id: 'draft-freeze',
+          clips: [
+            VGClipDescriptor(
+              id: 'clip-A',
+              sourcePath: '/tmp/video.mp4',
+              mediaKind: VGMediaKind.video,
+              durationSeconds: 10.0,
+              trimStartSeconds: 0.0,
+              trimEndSeconds: 10.0,
+            ),
+          ],
+          transitions: const [],
+          canvasWidth: 1920,
+          canvasHeight: 1080,
+          fps: 30,
+        );
+
+    test('FC-1  freezeClip returns a draft with 3 clips', () {
+      final result = _singleClipDraft().freezeClip('clip-A', 5.0, 2.0);
+      expect(result.clips.length, 3);
+    });
+
+    test('FC-2  left clip retains original ID with correct trimEnd', () {
+      final result = _singleClipDraft().freezeClip('clip-A', 5.0, 2.0);
+      final left = result.clips[0];
+      expect(left.id, 'clip-A');
+      expect(left.trimEndSeconds, closeTo(5.0, 1e-10));
+      expect(left.trimStartSeconds, closeTo(0.0, 1e-10));
+      expect(left.freezePTS, isNull);
+    });
+
+    test('FC-3  freeze clip has correct ID, freezePTS, and hold duration', () {
+      final result = _singleClipDraft().freezeClip('clip-A', 5.0, 2.0);
+      final freeze = result.clips[1];
+      expect(freeze.id, 'clip-A-freeze-1');
+      expect(freeze.freezePTS, closeTo(5.0, 1e-10));
+      expect(freeze.durationSeconds, closeTo(2.0, 1e-10));
+      expect(freeze.trimStartSeconds, closeTo(0.0, 1e-10));
+      expect(freeze.trimEndSeconds, closeTo(2.0, 1e-10));
+      expect(freeze.speed, 1.0);
+      expect(freeze.mediaKind, VGMediaKind.video);
+    });
+
+    test('FC-4  right clip has correct split ID and trimStart', () {
+      final result = _singleClipDraft().freezeClip('clip-A', 5.0, 2.0);
+      final right = result.clips[2];
+      expect(right.id, 'clip-A-split-1');
+      expect(right.trimStartSeconds, closeTo(5.0, 1e-10));
+      expect(right.trimEndSeconds, closeTo(10.0, 1e-10));
+      expect(right.freezePTS, isNull);
+    });
+
+    test('FC-5  throws ArgumentError for unknown clipId', () {
+      expect(
+        () => _singleClipDraft().freezeClip('no-such-clip', 5.0, 2.0),
+        throwsArgumentError,
+      );
+    });
+
+    test('FC-6  throws ArgumentError when splitSeconds out of trim window', () {
+      expect(
+        () => _singleClipDraft().freezeClip('clip-A', 0.0, 2.0),
+        throwsArgumentError,
+      );
+      expect(
+        () => _singleClipDraft().freezeClip('clip-A', 10.0, 2.0),
+        throwsArgumentError,
+      );
+    });
+
+    test('FC-7  throws ArgumentError for non-positive duration', () {
+      expect(
+        () => _singleClipDraft().freezeClip('clip-A', 5.0, 0.0),
+        throwsArgumentError,
+      );
+      expect(
+        () => _singleClipDraft().freezeClip('clip-A', 5.0, -1.0),
+        throwsArgumentError,
+      );
+    });
+
+    test('FC-8  throws ArgumentError when clip is not a video clip', () {
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-img',
+        clips: [
+          VGClipDescriptor(
+            id: 'img-clip',
+            sourcePath: '/tmp/img.jpg',
+            mediaKind: VGMediaKind.image,
+            durationSeconds: 5.0,
+            trimStartSeconds: 0.0,
+            trimEndSeconds: 5.0,
+          ),
+        ],
+        transitions: const [],
+        canvasWidth: 1920,
+        canvasHeight: 1080,
+        fps: 30,
+      );
+      expect(
+        () => draft.freezeClip('img-clip', 2.0, 1.0),
+        throwsArgumentError,
+      );
+    });
+  });
+}
 
 // ─── Phase 7.12: VGClipDescriptor — VGMediaKind.image ────────────────────────
 // Added by Phase 7.12 Implementer.
@@ -1013,3 +1222,26 @@ void main() {
 //   CV-11  VGStillImageFitMode.fromValue("fit") resolves to fit.
 //   CV-12  VGStillImageFitMode.fromValue unknown string resolves to fit.
 
+// ─── Phase 7.17: freezePTS and VGEditorDraft.freezeClip ──────────────────────
+// Added by Phase 7.17 Implementer.
+// Tests FF-1 through FF-12 and FC-1 through FC-8 above cover:
+//   FF-1   Default freezePTS is null.
+//   FF-2   Non-null freezePTS is stored correctly.
+//   FF-3   Zero freezePTS is valid (non-negative boundary).
+//   FF-4   Non-null freezePTS serialises to toMap().
+//   FF-5   Null freezePTS is omitted from toMap().
+//   FF-6   freezePTS round-trips via fromMap().
+//   FF-7   Absent freezePTS key in fromMap() returns null.
+//   FF-8   Negative freezePTS rejected by fromMap().
+//   FF-9   copyWith preserves freezePTS when not overridden.
+//   FF-10  copyWith can clear freezePTS to null via sentinel.
+//   FF-11  Equality includes freezePTS.
+//   FF-12  Equality differs when freezePTS differs.
+//   FC-1   freezeClip returns 3-clip draft.
+//   FC-2   Left clip retains original ID and trimEnd.
+//   FC-3   Freeze clip has correct ID, freezePTS, hold duration, speed.
+//   FC-4   Right clip has deterministic ID and trimStart.
+//   FC-5   Unknown clipId throws ArgumentError.
+//   FC-6   splitSeconds outside trim window throws ArgumentError.
+//   FC-7   Non-positive duration throws ArgumentError.
+//   FC-8   Non-video clip throws ArgumentError.
