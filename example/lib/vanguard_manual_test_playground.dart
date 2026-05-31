@@ -72,9 +72,13 @@ class _VanguardManualTestPlaygroundState
   String _status = 'Initializing...';
   String? _copyError;
 
-  // ── Export State ───────────────────────────────────────────────────────────
+  // ── Export State ──────────────────────────────────────────────────────────────
   bool _exporting = false;
   VGEditorExportResult? _exportResult;
+
+  // ── Phase 7.13: Trim Debug State ───────────────────────────────────────────
+  // true once _trimClipA() succeeds; resets when timeline is rebuilt.
+  bool _trimApplied = false;
 
   // ── Seek scrub throttle ────────────────────────────────────────────────────
   double? _seekDragValue;
@@ -340,6 +344,32 @@ class _VanguardManualTestPlaygroundState
     setState(() {});
   }
 
+  // Phase 7.13: trim debug trigger — trims Clip A to [1.5s → 4.5s].
+  // Verifies that trimClip calls updateTimeline and shrinks timeline duration.
+  Future<void> _trimClipA() async {
+    final c = _controller;
+    if (c == null || !c.isReady || _exporting) return;
+
+    try {
+      await c.trimClip(
+        clipId: 'clip-A',
+        trimStartSeconds: 1.5,
+        trimEndSeconds: 4.5,
+      );
+      if (mounted) {
+        setState(() {
+          _trimApplied = true;
+          _status = 'Trim OK — Clip A trimmed to [1.5s → 4.5s]. '
+              'Duration: ${c.draft.durationSeconds.toStringAsFixed(2)}s';
+        });
+      }
+    } on ArgumentError catch (e) {
+      if (mounted) setState(() => _status = 'Trim rejected: $e');
+    } catch (e) {
+      if (mounted) setState(() => _status = 'Trim error: $e');
+    }
+  }
+
   Future<void> _export() async {
     final c = _controller;
     if (c == null || !c.isReady || _exporting) return;
@@ -483,6 +513,10 @@ class _VanguardManualTestPlaygroundState
 
                         // ── Export Card ───────────────────────────────────────
                         _buildExportCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.13: Trim Debug Card ────────────────────────
+                        _buildTrimDebugCard(),
                         const SizedBox(height: 24),
                       ],
                     ),
@@ -1237,6 +1271,58 @@ class _VanguardManualTestPlaygroundState
               ),
             ),
           ],
+        ],
+      ),
+    );
+  }
+
+  // ── Phase 7.13: Trim Debug Card ──────────────────────────────────────────────
+
+  Widget _buildTrimDebugCard() {
+    final ready = _controller?.isReady == true && !_exporting;
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Text(
+            'PHASE 7.13 — TRIM EDITING DEBUG',
+            style: TextStyle(
+              color: Color(0xFF6C7A9C),
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.2,
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Tap to trim Clip A to [1.5s → 4.5s]. '
+            'Verifies updateTimeline is called and duration shrinks.',
+            style: TextStyle(color: Colors.white38, fontSize: 10),
+          ),
+          const SizedBox(height: 10),
+          ElevatedButton.icon(
+            onPressed: ready ? _trimClipA : null,
+            icon: _trimApplied
+                ? const Icon(Icons.check_circle_outline, size: 16)
+                : const Icon(Icons.content_cut_outlined, size: 16),
+            label: Text(
+              _trimApplied
+                  ? 'Trim Applied — tap to re-apply'
+                  : 'Trim Clip A → [1.5s – 4.5s]',
+            ),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFE07B39),
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 12),
+            ),
+          ),
         ],
       ),
     );

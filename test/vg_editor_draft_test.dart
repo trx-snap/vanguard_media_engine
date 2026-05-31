@@ -664,4 +664,197 @@ void main() {
       expect(resultTransform, equals(tdB));
     });
   });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // trimClip (Phase 7.13 / DEC-146)
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorDraft — trimClip (Phase 7.13)', () {
+    // Shared fixtures.
+    // Two 5-second clips with no transitions (hard-cut baseline).
+    VGEditorDraft makeTrimDraft() => VGEditorDraft.sequentialWithTransitions(
+          id: 'draft-trim',
+          clips: [
+            _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+            _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+          ],
+        );
+
+    // Two 5-second clips with a 1-second dissolve between them.
+    VGEditorDraft makeTransitionDraft() {
+      final tr = VGTransitionDescriptor(
+        id: 'tr-AB',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 1.0,
+        fromClipId: 'clip-A',
+        toClipId: 'clip-B',
+      );
+      return VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-dissolve',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        transitions: [tr],
+      );
+    }
+
+    test('TR-DR1 valid trim updates clip trim values on returned draft', () {
+      final draft = makeTrimDraft();
+      final trimmed = draft.trimClip(
+        clipId: 'clip-A',
+        trimStartSeconds: 1.5,
+        trimEndSeconds: 4.5,
+      );
+
+      // Original draft is immutable — unchanged.
+      expect(draft.clips[0].trimStartSeconds, closeTo(0.0, 1e-9));
+      expect(draft.clips[0].trimEndSeconds, closeTo(5.0, 1e-9));
+
+      // Returned draft reflects the new trim values.
+      expect(trimmed.clips[0].id, 'clip-A');
+      expect(trimmed.clips[0].trimStartSeconds, closeTo(1.5, 1e-9));
+      expect(trimmed.clips[0].trimEndSeconds, closeTo(4.5, 1e-9));
+      // Clip B must be unchanged.
+      expect(trimmed.clips[1].trimStartSeconds, closeTo(0.0, 1e-9));
+      expect(trimmed.clips[1].trimEndSeconds, closeTo(5.0, 1e-9));
+    });
+
+    test('TR-DR2 trim recomputes startTimeSeconds for downstream clip', () {
+      final draft = makeTrimDraft();
+      // Trim clip A to 3 s (1.0 → 4.0). clip B must shift back.
+      final trimmed = draft.trimClip(
+        clipId: 'clip-A',
+        trimStartSeconds: 1.0,
+        trimEndSeconds: 4.0,
+      );
+
+      // Clip A starts at 0, timelineDuration = 3s.
+      expect(trimmed.clips[0].startTimeSeconds, closeTo(0.0, 1e-9));
+      // Clip B must start immediately after clip A (no transition overlap).
+      expect(trimmed.clips[1].startTimeSeconds, closeTo(3.0, 1e-9));
+      // Total draft duration = 3 + 5 = 8s.
+      expect(trimmed.durationSeconds, closeTo(8.0, 1e-9));
+    });
+
+    test('TR-DR3 trim preserves transform and other fields on untouched clips', () {
+      // Clip B has a non-identity transform.
+      const tdB = VGClipTransformDescriptor(
+        scaleX: 0.5,
+        scaleY: 0.5,
+        opacity: 0.75,
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-tr3',
+        clips: [
+          VGClipDescriptor(
+            id: 'clip-A',
+            sourcePath: '/tmp/a.mp4',
+            durationSeconds: 5.0,
+            trimStartSeconds: 0.0,
+            trimEndSeconds: 5.0,
+          ),
+          VGClipDescriptor(
+            id: 'clip-B',
+            sourcePath: '/tmp/b.mp4',
+            durationSeconds: 5.0,
+            trimStartSeconds: 0.0,
+            trimEndSeconds: 5.0,
+            transform: tdB,
+          ),
+        ],
+      );
+
+      final trimmed = draft.trimClip(
+        clipId: 'clip-A',
+        trimStartSeconds: 0.5,
+        trimEndSeconds: 4.0,
+      );
+
+      // Clip B transform must be preserved exactly.
+      expect(trimmed.clips[1].transform, isNotNull);
+      expect(trimmed.clips[1].transform!.scaleX, closeTo(0.5, 1e-9));
+      expect(trimmed.clips[1].transform!.opacity, closeTo(0.75, 1e-9));
+      expect(trimmed.clips[1].transform, equals(tdB));
+    });
+
+    test('TR-DR4 trimEndSeconds exceeding durationSeconds throws ArgumentError', () {
+      final draft = makeTrimDraft();
+      expect(
+        () => draft.trimClip(
+          clipId: 'clip-A',
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 6.0, // durationSeconds is 5.0
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
+
+    test('TR-DR5 trim duration below 0.1 s minimum throws ArgumentError', () {
+      final draft = makeTrimDraft();
+      expect(
+        () => draft.trimClip(
+          clipId: 'clip-A',
+          trimStartSeconds: 2.0,
+          trimEndSeconds: 2.05, // 0.05s < 0.1s minimum
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
+
+    test('TR-DR6 trim shorter than attached transition overlap throws ArgumentError', () {
+      // clip A has a 1s dissolve out. Trimming it to exactly 0.9s wall-clock
+      // would collapse the transition window.
+      final draft = makeTransitionDraft();
+      expect(
+        () => draft.trimClip(
+          clipId: 'clip-A',
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 0.9, // 0.9s < 1.0s dissolve overlap → invalid
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
+
+    test('TR-DR7 unknown clipId throws ArgumentError', () {
+      final draft = makeTrimDraft();
+      expect(
+        () => draft.trimClip(
+          clipId: 'clip-UNKNOWN',
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 3.0,
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
+
+    test('TR-DR8 negative trimStartSeconds throws ArgumentError', () {
+      final draft = makeTrimDraft();
+      expect(
+        () => draft.trimClip(
+          clipId: 'clip-A',
+          trimStartSeconds: -0.1,
+          trimEndSeconds: 3.0,
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+    });
+
+    test('TR-DR9 trim clip A with dissolve recomputes clip B start correctly', () {
+      // clip A 5s, clip B 5s, dissolve 1s → baseline: B starts at 4.0s.
+      // Trim A to 2.0 → 4.5 (2.5s). New B start = 2.5 - 1.0 = 1.5s.
+      final draft = makeTransitionDraft();
+      final trimmed = draft.trimClip(
+        clipId: 'clip-A',
+        trimStartSeconds: 2.0,
+        trimEndSeconds: 4.5,
+      );
+
+      expect(trimmed.clips[0].startTimeSeconds, closeTo(0.0, 1e-9));
+      // A timelineDuration = 2.5s; overlap = 1.0s → B starts at 1.5s.
+      expect(trimmed.clips[1].startTimeSeconds, closeTo(1.5, 1e-9));
+      // Total duration = 1.5 + 5.0 = 6.5s.
+      expect(trimmed.durationSeconds, closeTo(6.5, 1e-9));
+    });
+  });
 }

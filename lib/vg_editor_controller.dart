@@ -1,5 +1,5 @@
 // vg_editor_controller.dart
-// Vanguard Media Engine — Phase 7 Stage 7.8
+// Vanguard Media Engine — Phase 7 Stage 7.8 / Stage 7.13
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // STAGE 7.8 — NATIVE INGESTION & PRODUCTION ROUTE HARDENING
@@ -446,6 +446,50 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     } finally {
       _busy = false;
     }
+  }
+
+  // ── Trim editing (Phase 7.13 / DEC-146) ──────────────────────────────
+
+  /// Adjusts the trim window of [clipId] and pushes the updated timeline to
+  /// the native renderer.
+  ///
+  /// Delegates trim-range validation and sequential layout recomputation to
+  /// [VGEditorDraft.trimClip]. On success, calls [updateDraft] which sends the
+  /// rebuilt draft to the `updateTimeline` native route, resets [currentPTS]
+  /// to 0.0, and notifies listeners.
+  ///
+  /// [trimStartSeconds] and [trimEndSeconds] are in source-asset seconds
+  /// (same coordinate space as [VGClipDescriptor.trimStartSeconds]/
+  /// [VGClipDescriptor.trimEndSeconds]).
+  ///
+  /// Throws [StateError] if the controller is disposed or currently busy with
+  /// another operation.
+  /// Throws [ArgumentError] (from [VGEditorDraft.trimClip]) if the trim range
+  /// is invalid. The [ArgumentError] is propagated without invoking the
+  /// MethodChannel.
+  Future<void> trimClip({
+    required String clipId,
+    required double trimStartSeconds,
+    required double trimEndSeconds,
+  }) async {
+    _assertNotDisposed();
+    if (_busy) {
+      throw StateError(
+        '[VGEditorController] trimClip: controller is busy with another operation.',
+      );
+    }
+
+    // Compute the new draft first (throws ArgumentError on invalid range).
+    // Do this BEFORE setting _busy so the caller can catch ArgumentError
+    // without affecting the busy-lock state.
+    final newDraft = value.draft.trimClip(
+      clipId: clipId,
+      trimStartSeconds: trimStartSeconds,
+      trimEndSeconds: trimEndSeconds,
+    );
+
+    // Push to native via updateDraft (handles busy-lock, pause, and state).
+    await updateDraft(newDraft);
   }
 
   // ── Export ─────────────────────────────────────────────────────────────────

@@ -1025,4 +1025,109 @@ void main() {
       expect(calledMethods, contains('timelinePlay'));
     });
   });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // trimClip() — Phase 7.13 / DEC-146
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorController — trimClip() (Phase 7.13)', () {
+    late VGEditorController controller;
+    final List<String> calledMethods = [];
+    dynamic capturedUpdateArgs;
+
+    setUp(() async {
+      calledMethods.clear();
+      capturedUpdateArgs = null;
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        switch (method) {
+          case 'createTimelineTexture':
+            return {'textureId': 20, 'width': 640, 'height': 360};
+          case 'updateTimeline':
+            capturedUpdateArgs = args;
+            return {'textureId': 21, 'width': 640, 'height': 360};
+          case 'timelinePause':
+          case 'disposeTimeline':
+            return null;
+          default:
+            return null;
+        }
+      });
+      controller = VGEditorController(initialDraft: _twoClipDraft());
+      await controller.initialize();
+    });
+
+    tearDown(() => controller.dispose());
+
+    test('TR-EC1 trimClip invokes updateTimeline exactly once', () async {
+      calledMethods.clear();
+      await controller.trimClip(
+        clipId: 'clip-A',
+        trimStartSeconds: 1.0,
+        trimEndSeconds: 4.0,
+      );
+
+      expect(
+        calledMethods.where((m) => m == 'updateTimeline').length,
+        1,
+        reason: 'trimClip must invoke updateTimeline exactly once',
+      );
+    });
+
+    test('TR-EC2 trimClip updates draft and resets currentPTS to 0.0', () async {
+      // Advance PTS via callback.
+      await controller.handleNativeCallback(
+        const MethodCall('onTimelineFrame', {'pts': 3.5}),
+      );
+      expect(controller.value.currentPTS, closeTo(3.5, 0.001));
+
+      await controller.trimClip(
+        clipId: 'clip-A',
+        trimStartSeconds: 1.0,
+        trimEndSeconds: 4.0,
+      );
+
+      // PTS must reset to 0.
+      expect(controller.value.currentPTS, closeTo(0.0, 0.001));
+      // Controller must be ready again.
+      expect(controller.value.isReady, isTrue);
+      // Draft trim values must be reflected.
+      expect(controller.draft.clips[0].trimStartSeconds, closeTo(1.0, 1e-9));
+      expect(controller.draft.clips[0].trimEndSeconds, closeTo(4.0, 1e-9));
+      // Draft duration must shrink: A=3s, B=5s → 8s.
+      expect(controller.draft.durationSeconds, closeTo(8.0, 0.001));
+      // updateTimeline payload must contain the updated draft.
+      expect(capturedUpdateArgs, isA<Map>());
+      final argsMap = capturedUpdateArgs as Map;
+      expect(argsMap.containsKey('draft'), isTrue);
+    });
+
+    test('TR-EC3 trimClip throws StateError after dispose', () async {
+      controller.dispose();
+      await expectLater(
+        controller.trimClip(
+          clipId: 'clip-A',
+          trimStartSeconds: 1.0,
+          trimEndSeconds: 4.0,
+        ),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('TR-EC4 trimClip propagates ArgumentError without calling updateTimeline',
+        () async {
+      calledMethods.clear();
+      await expectLater(
+        controller.trimClip(
+          clipId: 'clip-A',
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 99.0, // exceeds source duration → ArgumentError
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      // updateTimeline must NOT have been called.
+      expect(calledMethods, isNot(contains('updateTimeline')),
+          reason: 'ArgumentError from draft validation must not reach channel');
+    });
+  });
 }

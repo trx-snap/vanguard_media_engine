@@ -1,15 +1,16 @@
 // vg_editor_draft.dart
-// Vanguard Media Engine — Phase 7 Stage 7.7 / Stage 7.10
+// Vanguard Media Engine — Phase 7 Stage 7.7 / Stage 7.10 / Stage 7.13
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// STAGE 7.7 — EDITOR DRAFT RECIPE
+// STAGE 7.7  — EDITOR DRAFT RECIPE
 // STAGE 7.10 — TRANSITION-AWARE LAYOUT FACTORY
+// STAGE 7.13 — NON-DESTRUCTIVE TRIM EDITING API
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // VGEditorDraft is the immutable, non-destructive composition recipe that
 // describes a complete timeline editing session.
 //
-// Design rules (Phase 7.7 / 7.10 / Opus M4):
+// Design rules (Phase 7.7 / 7.10 / 7.13 / Opus M4):
 //   - Pure Dart value type. No rendering logic, no channel calls.
 //   - The clips list is non-destructive: source files are never modified.
 //   - All fields are validated at construction time via asserts.
@@ -25,7 +26,13 @@
 //     sum of clip timelineDurations. This matches what native computes as
 //     lastClip.startTimeSeconds + lastClip.timelineDuration.
 //
-// Consumed by VGEditorController (Stage 7.7) to coordinate dev_ channel calls.
+// Phase 7.13 additions (DEC-146):
+//   - VGEditorDraft.trimClip(...) is a non-destructive trim-editing helper that
+//     validates the new trim range, replaces the target clip, and recomputes
+//     the sequential layout via sequentialWithTransitions. Dart is the single
+//     source of truth for trim validation and start-time cascade (DEC-146).
+//
+// Consumed by VGEditorController (Stage 7.7) to coordinate channel calls.
 //
 // Serialisation:
 //   toMap() produces a JSON-compatible map:
@@ -319,6 +326,86 @@ final class VGEditorDraft {
     );
   }
 
+  // ── Trim editing (Phase 7.13 / DEC-146) ─────────────────────────────────
+
+  /// Returns a new copy of this draft with [clipId]'s trim window adjusted,
+  /// and with all clip [VGClipDescriptor.startTimeSeconds] recomputed via
+  /// [VGEditorDraft.sequentialWithTransitions].
+  ///
+  /// This is a **non-destructive** operation — the source media file is never
+  /// modified. The returned draft is a fully immutable new instance.
+  ///
+  /// **Dart is the single source of truth for trim range validation and
+  /// sequential layout recomputation (DEC-146).** The validated, recomputed
+  /// draft is then forwarded to the native timeline via
+  /// `VGEditorController.updateDraft` → `updateTimeline` MethodChannel route.
+  ///
+  /// [trimStartSeconds] and [trimEndSeconds] are measured in source-asset
+  /// seconds (same coordinate space as [VGClipDescriptor.trimStartSeconds]
+  /// and [VGClipDescriptor.trimEndSeconds]).
+  ///
+  /// Throws [ArgumentError] if:
+  /// - [clipId] is not found in this draft.
+  /// - [trimStartSeconds] < 0.
+  /// - [trimEndSeconds] exceeds the clip's [VGClipDescriptor.durationSeconds].
+  /// - The resulting trim duration is less than 0.1 s (minimum visible clip).
+  /// - The resulting timeline duration of the clip is less than the total
+  ///   non-hard-cut transition overlap attached to that clip, which would
+  ///   collapse the transition overlap windows.
+  ///
+  /// ```dart
+  /// final trimmed = draft.trimClip(
+  ///   clipId: 'clip-A',
+  ///   trimStartSeconds: 1.5,
+  ///   trimEndSeconds: 4.5,
+  /// );
+  /// // trimmed.clips[0].trimStartSeconds == 1.5
+  /// // trimmed.clips[0].trimEndSeconds   == 4.5
+  /// // all subsequent clips' startTimeSeconds are recomputed
+  /// ```
+  VGEditorDraft trimClip({
+    required String clipId,
+    required double trimStartSeconds,
+    required double trimEndSeconds,
+  }) {
+    // 1. Locate the target clip.
+    final targetIndex = clips.indexWhere((c) => c.id == clipId);
+    if (targetIndex == -1) {
+      throw ArgumentError(
+        'VGEditorDraft.trimClip: clip "$clipId" not found in draft "$id".',
+      );
+    }
+    final targetClip = clips[targetIndex];
+
+    // 2. Validate the new trim range.
+    _validateTrimRange(
+      clip: targetClip,
+      clipIndex: targetIndex,
+      newTrimStart: trimStartSeconds,
+      newTrimEnd: trimEndSeconds,
+      clips: clips,
+      transitions: transitions,
+    );
+
+    // 3. Build the updated clip list (only the target clip changes).
+    final updatedClip = targetClip.copyWith(
+      trimStartSeconds: trimStartSeconds,
+      trimEndSeconds: trimEndSeconds,
+    );
+    final updatedClips = List<VGClipDescriptor>.of(clips);
+    updatedClips[targetIndex] = updatedClip;
+
+    // 4. Recompute sequential layout (propagates startTimeSeconds cascade).
+    return VGEditorDraft.sequentialWithTransitions(
+      id: id,
+      clips: updatedClips,
+      transitions: transitions,
+      canvasWidth: canvasWidth,
+      canvasHeight: canvasHeight,
+      fps: fps,
+    );
+  }
+
   // ── copyWith ───────────────────────────────────────────────────────────────
 
   /// Returns a copy of this draft with the specified fields replaced.
@@ -376,6 +463,82 @@ final class VGEditorDraft {
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
+
+// Minimum trim duration, in source-asset seconds (Phase 7.13).
+const double _kMinTrimDurationSeconds = 0.1;
+
+/// Validates the proposed trim range for [clip] at [clipIndex] against the
+/// known bounds, minimum-duration requirement, and transition-overlap safety.
+///
+/// Throws [ArgumentError] with a descriptive message on any violation.
+void _validateTrimRange({
+  required VGClipDescriptor clip,
+  required int clipIndex,
+  required double newTrimStart,
+  required double newTrimEnd,
+  required List<VGClipDescriptor> clips,
+  required List<VGTransitionDescriptor> transitions,
+}) {
+  // Guard 1: trimStartSeconds must be >= 0.
+  if (newTrimStart < 0.0) {
+    throw ArgumentError(
+      'VGEditorDraft.trimClip: trimStartSeconds ($newTrimStart) must be >= 0.'
+    );
+  }
+
+  // Guard 2: trimEndSeconds must not exceed the clip's source duration.
+  // durationSeconds == 0.0 means unknown (streaming); skip upper-bound check.
+  if (clip.durationSeconds > 0.0 && newTrimEnd > clip.durationSeconds) {
+    throw ArgumentError(
+      'VGEditorDraft.trimClip: trimEndSeconds ($newTrimEnd) exceeds '
+      'clip "${clip.id}" source durationSeconds (${clip.durationSeconds}).',
+    );
+  }
+
+  // Guard 3: trimEndSeconds must be > trimStartSeconds (enforced by
+  // VGClipDescriptor assert) with at least the minimum visible duration.
+  final trimDuration = newTrimEnd - newTrimStart;
+  if (trimDuration < _kMinTrimDurationSeconds) {
+    throw ArgumentError(
+      'VGEditorDraft.trimClip: resulting trim duration ($trimDuration s) '
+      'for clip "${clip.id}" is below the minimum '
+      '$_kMinTrimDurationSeconds s. Do not silently clamp.',
+    );
+  }
+
+  // Guard 4: transition overlap safety.
+  // The clip's resulting wall-clock timelineDuration must be >= the sum of all
+  // non-hard-cut transition durations attached to it (in and out combined).
+  // Otherwise the overlap windows would collapse or overlap each other.
+  final timelineDuration = trimDuration / clip.speed;
+  double overlapIn = 0.0;
+  double overlapOut = 0.0;
+
+  // Build predecessor and successor clip IDs.
+  final prevClipId = clipIndex > 0 ? clips[clipIndex - 1].id : null;
+  final nextClipId = clipIndex < clips.length - 1 ? clips[clipIndex + 1].id : null;
+
+  for (final t in transitions) {
+    if (t.isHardCut) continue;
+    // Transition INTO this clip: fromClipId == previous clip, toClipId == this clip.
+    if (t.toClipId == clip.id && t.fromClipId == prevClipId) {
+      overlapIn += t.durationSeconds;
+    }
+    // Transition OUT OF this clip: fromClipId == this clip, toClipId == next clip.
+    if (t.fromClipId == clip.id && t.toClipId == nextClipId) {
+      overlapOut += t.durationSeconds;
+    }
+  }
+
+  final totalOverlap = overlapIn + overlapOut;
+  if (timelineDuration < totalOverlap) {
+    throw ArgumentError(
+      'VGEditorDraft.trimClip: resulting timelineDuration ($timelineDuration s) '
+      'for clip "${clip.id}" is less than its total transition overlap '
+      '($totalOverlap s). Trim would collapse transition windows.',
+    );
+  }
+}
 
 /// Returns true if all clip IDs in [clips] are unique.
 bool _allClipIdsUnique(List<VGClipDescriptor> clips) {
