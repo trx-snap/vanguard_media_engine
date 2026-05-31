@@ -34,6 +34,8 @@ import 'vanguard_timeline_execution_playground.dart';
 import 'vanguard_timeline_playback_playground.dart';
 // Phase 7 Stage 7.7: editor controller API proof playground (engine/example only).
 import 'vanguard_editor_controller_playground.dart';
+// Phase 7 Stage 7.10: manual timeline transition test playground (engine/example only).
+import 'vanguard_manual_test_playground.dart';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Entry point
@@ -848,76 +850,106 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
                     ),
                   ),
                 ),
-              // Phase 7 Stage 7.3: timeline playground entry point.
-              // Does not affect camera session, recording, or preview.
               const SizedBox(width: 8),
-              _CameraIconButton(
-                key: const ValueKey('timeline_playground_btn'),
-                icon: Icons.timeline,
-                active: false,
-                enabled: true,
-                onTap: () {
-                  Navigator.push<void>(
-                    context,
-                    MaterialPageRoute<void>(
-                      builder: (_) => const VanguardTimelinePlayground(),
-                    ),
-                  );
-                },
-                tooltip: 'Timeline Playground (Phase 7)',
-              ),
-              // Phase 7 Stage 7.5B: timeline execution proof entry point.
-              const SizedBox(width: 8),
-              _CameraIconButton(
-                key: const ValueKey('timeline_execution_btn'),
-                icon: Icons.play_circle_outline,
-                active: false,
-                enabled: true,
-                onTap: () {
-                  Navigator.push<void>(
-                    context,
-                    MaterialPageRoute<void>(
-                      builder: (_) => const VanguardTimelineExecutionPlayground(),
-                    ),
-                  );
-                },
-                tooltip: 'Timeline Execution (Phase 7 Stage 7.5B)',
-              ),
-              // Phase 7 Stage 7.5C: visual timeline playback proof entry point.
-              const SizedBox(width: 8),
-              _CameraIconButton(
-                key: const ValueKey('timeline_playback_btn'),
-                icon: Icons.movie_filter_outlined,
-                active: false,
-                enabled: true,
-                onTap: () {
-                  Navigator.push<void>(
-                    context,
-                    MaterialPageRoute<void>(
-                      builder: (_) =>
-                          const VanguardTimelinePlaybackPlayground(),
-                    ),
-                  );
-                },
-                tooltip: 'Timeline Playback (Phase 7 Stage 7.5C)',
-              ),
-              // Phase 7 Stage 7.7: editor controller API proof entry point.
-              const SizedBox(width: 8),
-              _CameraIconButton(
-                key: const ValueKey('editor_controller_btn'),
-                icon: Icons.video_settings_outlined,
-                active: false,
-                enabled: true,
-                onTap: () {
-                  Navigator.push<void>(
-                    context,
-                    MaterialPageRoute<void>(
-                      builder: (_) =>
-                          const VanguardEditorControllerPlayground(),
-                    ),
-                  );
-                },
-                tooltip: 'Editor Controller (Phase 7 Stage 7.7)',
+              // Phase 7 playground navigation buttons — wrapped in a
+              // scrollable container to prevent overflow on narrow screens.
+              Flexible(
+                child: SingleChildScrollView(
+                  scrollDirection: Axis.horizontal,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Phase 7 Stage 7.3: timeline playground entry point.
+                      // Does not affect camera session, recording, or preview.
+                      _CameraIconButton(
+                        key: const ValueKey('timeline_playground_btn'),
+                        icon: Icons.timeline,
+                        active: false,
+                        enabled: true,
+                        onTap: () {
+                          Navigator.push<void>(
+                            context,
+                            MaterialPageRoute<void>(
+                              builder: (_) => const VanguardTimelinePlayground(),
+                            ),
+                          );
+                        },
+                        tooltip: 'Timeline Playground (Phase 7)',
+                      ),
+                      // Phase 7 Stage 7.5B: timeline execution proof entry point.
+                      const SizedBox(width: 8),
+                      _CameraIconButton(
+                        key: const ValueKey('timeline_execution_btn'),
+                        icon: Icons.play_circle_outline,
+                        active: false,
+                        enabled: true,
+                        onTap: () {
+                          Navigator.push<void>(
+                            context,
+                            MaterialPageRoute<void>(
+                              builder: (_) => const VanguardTimelineExecutionPlayground(),
+                            ),
+                          );
+                        },
+                        tooltip: 'Timeline Execution (Phase 7 Stage 7.5B)',
+                      ),
+                      // Phase 7 Stage 7.5C: visual timeline playback proof entry point.
+                      const SizedBox(width: 8),
+                      _CameraIconButton(
+                        key: const ValueKey('timeline_playback_btn'),
+                        icon: Icons.movie_filter_outlined,
+                        active: false,
+                        enabled: true,
+                        onTap: () {
+                          Navigator.push<void>(
+                            context,
+                            MaterialPageRoute<void>(
+                              builder: (_) =>
+                                  const VanguardTimelinePlaybackPlayground(),
+                            ),
+                          );
+                        },
+                        tooltip: 'Timeline Playback (Phase 7 Stage 7.5C)',
+                      ),
+                      // Phase 7 Stage 7.7: editor controller API proof entry point.
+                      const SizedBox(width: 8),
+                      _CameraIconButton(
+                        key: const ValueKey('editor_controller_btn'),
+                        icon: Icons.video_settings_outlined,
+                        active: false,
+                        enabled: true,
+                        onTap: () {
+                          Navigator.push<void>(
+                            context,
+                            MaterialPageRoute<void>(
+                              builder: (_) =>
+                                  const VanguardEditorControllerPlayground(),
+                            ),
+                          );
+                        },
+                        tooltip: 'Editor Controller (Phase 7 Stage 7.7)',
+                      ),
+                      // Phase 7 Stage 7.10: manual device test playground.
+                      const SizedBox(width: 8),
+                      _CameraIconButton(
+                        key: const ValueKey('manual_device_test_btn'),
+                        icon: Icons.flourescent_outlined,
+                        active: false,
+                        enabled: true,
+                        onTap: () {
+                          Navigator.push<void>(
+                            context,
+                            MaterialPageRoute<void>(
+                              builder: (_) =>
+                                  const VanguardManualTestPlayground(),
+                            ),
+                          );
+                        },
+                        tooltip: 'Manual Device Test (Hanif decides PASS/FAIL)',
+                      ),
+                    ],
+                  ),
+                ),
               ),
             ],
           ),

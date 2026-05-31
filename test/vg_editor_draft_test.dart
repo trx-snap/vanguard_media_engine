@@ -461,4 +461,122 @@ void main() {
       );
     });
   });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // sequentialWithTransitions factory (Phase 7.10 / DEC-143)
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorDraft — sequentialWithTransitions (Phase 7.10)', () {
+    test('ED-41 no transitions: clips are placed sequentially (same as hard-cut)', () {
+      // Without any transitions, cursor advances by full timelineDuration each clip.
+      final d = VGEditorDraft.sequentialWithTransitions(
+        id: 'test-41',
+        clips: [
+          _clip(id: 'A', trimStart: 0.0, trimEnd: 4.0),
+          _clip(id: 'B', trimStart: 0.0, trimEnd: 3.0),
+        ],
+      );
+      expect(d.clips[0].startTimeSeconds, closeTo(0.0, 0.001));
+      expect(d.clips[1].startTimeSeconds, closeTo(4.0, 0.001));
+      expect(d.durationSeconds, closeTo(7.0, 0.001));
+    });
+
+    test('ED-42 single dissolve: clip B start is shifted back by transition overlap', () {
+      // Dissolve of 0.5s: clipA (5s) overlaps clipB (5s) by 0.5s.
+      // clipA.startTimeSeconds = 0.0
+      // clipB.startTimeSeconds = 5.0 - 0.5 = 4.5
+      final tr = VGTransitionDescriptor(
+        id: 'tr-AB',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 0.5,
+        fromClipId: 'clip-A',
+        toClipId: 'clip-B',
+      );
+      final d = VGEditorDraft.sequentialWithTransitions(
+        id: 'test-42',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        transitions: [tr],
+      );
+      expect(d.clips[0].startTimeSeconds, closeTo(0.0, 0.001));
+      expect(d.clips[1].startTimeSeconds, closeTo(4.5, 0.001));
+    });
+
+    test('ED-43 durationSeconds subtracts single dissolve overlap', () {
+      // Two 5s clips with a 0.5s dissolve: total = 10.0 - 0.5 = 9.5s
+      final tr = VGTransitionDescriptor(
+        id: 'tr-AB',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 0.5,
+        fromClipId: 'clip-A',
+        toClipId: 'clip-B',
+      );
+      final d = VGEditorDraft.sequentialWithTransitions(
+        id: 'test-43',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        transitions: [tr],
+      );
+      expect(d.durationSeconds, closeTo(9.5, 0.001));
+    });
+
+    test('ED-44 durationSeconds subtracts multiple dissolve overlaps', () {
+      // Three 5s clips with 0.5s dissolves between each:
+      // total = 15.0 - 0.5 - 0.5 = 14.0s
+      final trAB = VGTransitionDescriptor(
+        id: 'tr-AB',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 0.5,
+        fromClipId: 'A',
+        toClipId: 'B',
+      );
+      final trBC = VGTransitionDescriptor(
+        id: 'tr-BC',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 0.5,
+        fromClipId: 'B',
+        toClipId: 'C',
+      );
+      final d = VGEditorDraft.sequentialWithTransitions(
+        id: 'test-44',
+        clips: [
+          _clip(id: 'A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'B', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'C', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        transitions: [trAB, trBC],
+      );
+      expect(d.durationSeconds, closeTo(14.0, 0.001));
+      // Also validate startTimeSeconds layout
+      expect(d.clips[0].startTimeSeconds, closeTo(0.0, 0.001));
+      expect(d.clips[1].startTimeSeconds, closeTo(4.5, 0.001));
+      expect(d.clips[2].startTimeSeconds, closeTo(9.0, 0.001));
+    });
+
+    test('ED-45 durationSeconds unchanged for hard-cut-only transitions', () {
+      // Hard-cut transitions have zero overlap — durationSeconds is unchanged.
+      final tr = VGTransitionDescriptor(
+        id: 'tr-AB',
+        type: VGTransitionType.none,
+        durationSeconds: 0.0,
+        fromClipId: 'clip-A',
+        toClipId: 'clip-B',
+      );
+      final d = VGEditorDraft.sequentialWithTransitions(
+        id: 'test-45',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        transitions: [tr],
+      );
+      // Hard cut: no overlap subtracted
+      expect(d.durationSeconds, closeTo(10.0, 0.001));
+      expect(d.clips[1].startTimeSeconds, closeTo(5.0, 0.001));
+    });
+  });
 }

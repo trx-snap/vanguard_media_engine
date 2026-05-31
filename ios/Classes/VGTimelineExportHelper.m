@@ -74,6 +74,7 @@ static os_log_t sExportHelperLog;
 // ─── Public export entry point ────────────────────────────────────────────────
 
 + (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
+                    transitions:(NSArray<NSDictionary *> *)transitions
                      outputPath:(NSString *)outputPath
                           width:(NSInteger)width
                          height:(NSInteger)height
@@ -160,11 +161,13 @@ static os_log_t sExportHelperLog;
     // _prepareTimelineCompositorWithSize: helper:
     //   - descriptorStage: "7.5_executable" (required by VGTimelineCompositorNode)
     //   - clips: the caller-supplied clip descriptor dictionaries
-    //   - transitions: [] (hard-cut only, Stage 7.5 limitation)
+    //   - transitions: the caller-supplied transition descriptors (Phase 7.10).
+    //     Dissolve and fade transitions are executed inside the compositor
+    //     during the overlap window via the dual-reader blend path.
     NSDictionary<NSString *, id> *compositorParams = @{
         @"descriptorStage": @"7.5_executable",
         @"clips":           clips,
-        @"transitions":     @[],
+        @"transitions":     transitions ?: @[],
         // Phase 7.9: pass canvas dimensions for aspect-fit normalization.
         // Ensures export output matches preview orientation and scaling.
         @"canvasWidth":     @(width),
@@ -476,6 +479,7 @@ static os_log_t sExportHelperLog;
 @implementation VGTimelineExportHelper
 
 + (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
+                    transitions:(NSArray<NSDictionary *> *)transitions
                      outputPath:(NSString *)outputPath
                           width:(NSInteger)width
                          height:(NSInteger)height

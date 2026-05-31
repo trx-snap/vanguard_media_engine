@@ -56,6 +56,9 @@ NS_ASSUME_NONNULL_BEGIN
 ///
 /// @param clips        NSArray of clip descriptor dictionaries (same wire contract
 ///                     as dev_createTimelineTexture: id, sourcePath, mediaKind, etc.)
+/// @param transitions  NSArray of transition descriptor dictionaries (may be empty).
+///                     Passed directly to VGTimelineCompositorNode so that dissolve
+///                     and fade transitions are executed during export (Phase 7.10).
 /// @param outputPath   Absolute path for the output MP4 file.
 ///                     An existing file at this path will be deleted by the sink
 ///                     during preparation (AVAssetWriter cannot overwrite).
@@ -67,6 +70,7 @@ NS_ASSUME_NONNULL_BEGIN
 ///                     On success: success=YES, outputPath=absolute path, durationSeconds≈10.0.
 ///                     On failure: success=NO, error describes the failure.
 + (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
+                    transitions:(NSArray<NSDictionary *> *)transitions
                      outputPath:(NSString *)outputPath
                           width:(NSInteger)width
                          height:(NSInteger)height

@@ -1,21 +1,29 @@
 // vg_editor_draft.dart
-// Vanguard Media Engine — Phase 7 Stage 7.7
+// Vanguard Media Engine — Phase 7 Stage 7.7 / Stage 7.10
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // STAGE 7.7 — EDITOR DRAFT RECIPE
+// STAGE 7.10 — TRANSITION-AWARE LAYOUT FACTORY
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // VGEditorDraft is the immutable, non-destructive composition recipe that
 // describes a complete timeline editing session.
 //
-// Design rules (Phase 7.7 / Opus M4):
+// Design rules (Phase 7.7 / 7.10 / Opus M4):
 //   - Pure Dart value type. No rendering logic, no channel calls.
 //   - The clips list is non-destructive: source files are never modified.
-//   - Transitions are restricted to VGTransitionType.none (hard cuts) in this
-//     slice. The descriptor schema supports other types; rejection is doc-only.
 //   - All fields are validated at construction time via asserts.
 //   - Clip IDs must be unique within one draft.
 //   - Transition fromClipId / toClipId must reference clip IDs in the draft.
+//
+// Phase 7.10 additions (DEC-143):
+//   - VGEditorDraft.sequentialWithTransitions(...) computes clip startTimeSeconds
+//     so that each non-hard-cut transition creates an overlap window between
+//     the outgoing and incoming clips. Dart is the single source of truth for
+//     startTimeSeconds. Native consumes the pre-shifted values.
+//   - durationSeconds now subtracts non-hard-cut transition overlaps from the
+//     sum of clip timelineDurations. This matches what native computes as
+//     lastClip.startTimeSeconds + lastClip.timelineDuration.
 //
 // Consumed by VGEditorController (Stage 7.7) to coordinate dev_ channel calls.
 //
@@ -88,6 +96,90 @@ final class VGEditorDraft {
           'VGEditorDraft: transition fromClipId/toClipId must reference existing clip IDs',
         );
 
+  /// Creates a [VGEditorDraft] with clips automatically positioned so that
+  /// adjacent non-hard-cut transitions produce an overlap window.
+  ///
+  /// **Dart is the single source of truth for [VGClipDescriptor.startTimeSeconds]
+  /// in transition-aware timelines (DEC-143).** The factory computes each
+  /// clip's start time so that:
+  ///
+  ///   `clip[i+1].startTimeSeconds`
+  ///     `= clip[i].startTimeSeconds + clip[i].timelineDuration`
+  ///     `    - transitionOverlap(clip[i], clip[i+1])`
+  ///
+  /// where `transitionOverlap` is the [VGTransitionDescriptor.durationSeconds]
+  /// of the non-hard-cut transition between clip[i] and clip[i+1], or 0.0 for
+  /// hard cuts.
+  ///
+  /// The [VGClipDescriptor.startTimeSeconds] values in the supplied [clips] are
+  /// **ignored** — this factory overwrites them with the computed positions.
+  ///
+  /// [transitions] must reference adjacent clip IDs in the supplied [clips]
+  /// list (same constraint enforced natively — error code 12).
+  ///
+  /// ```dart
+  /// final draft = VGEditorDraft.sequentialWithTransitions(
+  ///   id: 'draft-001',
+  ///   clips: [clipA, clipB, clipC],
+  ///   transitions: [
+  ///     VGTransitionDescriptor(
+  ///       id: 'tr-1',
+  ///       type: VGTransitionType.dissolve,
+  ///       durationSeconds: 0.5,
+  ///       fromClipId: 'clip-A',
+  ///       toClipId: 'clip-B',
+  ///     ),
+  ///   ],
+  /// );
+  /// // clipA.startTimeSeconds = 0.0
+  /// // clipB.startTimeSeconds = clipA.timelineDuration - 0.5
+  /// // clipC.startTimeSeconds = clipB.startTimeSeconds + clipB.timelineDuration
+  /// ```
+  factory VGEditorDraft.sequentialWithTransitions({
+    required String id,
+    required List<VGClipDescriptor> clips,
+    List<VGTransitionDescriptor> transitions = const [],
+    int canvasWidth = 640,
+    int canvasHeight = 360,
+    int fps = 30,
+  }) {
+    assert(clips.isNotEmpty,
+        'VGEditorDraft.sequentialWithTransitions: clips must not be empty');
+
+    // Build (fromClipId → toClipId) → transition lookup.
+    final transitionMap = <String, VGTransitionDescriptor>{};
+    for (final t in transitions) {
+      final from = t.fromClipId;
+      final to = t.toClipId;
+      if (from != null && to != null) {
+        transitionMap['$from→$to'] = t;
+      }
+    }
+
+    // Compute startTimeSeconds for each clip.
+    // cursor advances by clip[i].timelineDuration minus any overlap.
+    double cursor = 0.0;
+    final positioned = <VGClipDescriptor>[];
+    for (var i = 0; i < clips.length; i++) {
+      positioned.add(clips[i].copyWith(startTimeSeconds: cursor));
+      if (i < clips.length - 1) {
+        final key = '${clips[i].id}→${clips[i + 1].id}';
+        final t = transitionMap[key];
+        final overlap = (t != null && !t.isHardCut) ? t.durationSeconds : 0.0;
+        cursor += clips[i].timelineDuration - overlap;
+      }
+    }
+
+    return VGEditorDraft(
+      id: id,
+      clips: positioned,
+      transitions: transitions,
+      canvasWidth: canvasWidth,
+      canvasHeight: canvasHeight,
+      fps: fps,
+    );
+  }
+
   // ── Identity ───────────────────────────────────────────────────────────────
 
   /// Stable identifier for this draft session. Must be non-empty.
@@ -131,14 +223,28 @@ final class VGEditorDraft {
 
   /// Total wall-clock duration of the timeline in seconds.
   ///
-  /// Sum of [VGClipDescriptor.timelineDuration] for all clips.
-  /// Accounts for each clip's [VGClipDescriptor.speed] multiplier.
+  /// For hard-cut-only timelines: sum of [VGClipDescriptor.timelineDuration]
+  /// for all clips.
   ///
-  /// Note: transition overlaps (cross-dissolve, fade) would subtract the
-  /// transition overlap window from this total, but in Phase 7.7 transitions
-  /// are hard-cut only so no overlap subtraction is applied.
-  double get durationSeconds =>
-      clips.fold(0.0, (sum, c) => sum + c.timelineDuration);
+  /// For timelines with non-hard-cut transitions (typically created via
+  /// [VGEditorDraft.sequentialWithTransitions]): the sum of clip
+  /// [VGClipDescriptor.timelineDuration] values minus the sum of non-hard-cut
+  /// [VGTransitionDescriptor.durationSeconds] overlap windows.
+  ///
+  /// **Phase 7.10 / DEC-143**: Dart is the single source of truth for timeline
+  /// layout. When clips are positioned by [sequentialWithTransitions], this
+  /// value equals `lastClip.startTimeSeconds + lastClip.timelineDuration`,
+  /// which is also how native computes `_totalTimelineDuration`. Both
+  /// representations are equivalent for EOS detection.
+  double get durationSeconds {
+    double total = clips.fold(0.0, (sum, c) => sum + c.timelineDuration);
+    for (final t in transitions) {
+      if (!t.isHardCut) {
+        total -= t.durationSeconds;
+      }
+    }
+    return total < 0.0 ? 0.0 : total;
+  }
 
   // ── Serialisation ──────────────────────────────────────────────────────────
 

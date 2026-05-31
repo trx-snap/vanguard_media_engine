@@ -1,7 +1,8 @@
 // VGTimelineCompositorNode.m
-// vanguard_media_engine — Phase 7 Stage 7.5
+// vanguard_media_engine — Phase 7 Stage 7.5 / Stage 7.10
 //
-// Phase 7 Stage 7.5: First executable multi-clip video timeline compositor.
+// Phase 7 Stage 7.5:  First executable multi-clip video timeline compositor.
+// Phase 7 Stage 7.10: Native crossfade/dissolve and fade transition execution.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // DESIGN OVERVIEW
@@ -62,12 +63,13 @@
 //   against
 //     _generation. Returns .skipped on mismatch.
 //
-// ── STAGE 7.5 LIMITATIONS (DOCUMENTED) ───────────────────────────────────────
+// ── STAGE 7.5 LIMITATIONS (DOCUMENTED — partially resolved in Phase 7.10) ───
 //
 //   Image clips:       Rejected at init. Returns nil with error.
 //   Audio clips:       Rejected at init. Returns nil with error.
-//   Fade/dissolve:     Rejected at init. Non-hard-cut transitions unsupported.
-//   GPU blending:      Not implemented. Phase 7.5B+.
+//   Fade/dissolve:     Phase 7.10: SUPPORTED via dual-reader CoreImage blend path
+//                      (DEC-143). Hard-cut (VGTransitionTypeNone) also supported.
+//   GPU blending:      Uses CoreImage Metal/GPU path (_VGTCNBlendBuffers). RR-143.
 //   Pre-warming:       Not implemented. Performance optimization deferred.
 //   Audio sidecar:     Phase 8+.
 //
@@ -115,6 +117,7 @@
 // ────────────────────────────────────────────────────
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <CoreImage/CoreImage.h>
 
 // ─── System
 // ───────────────────────────────────────────────────────────────────
@@ -164,6 +167,110 @@ static NSError *_VGTCNError(NSInteger code, NSString *message) {
                          userInfo:@{NSLocalizedDescriptionKey : message}];
 }
 
+// ─── Phase 7.10: CoreImage blend helpers ─────────────────────────────────────
+//
+// _VGTCNSharedCIContext: Lazily initialised Metal/GPU CIContext.
+// Thread-safe via dispatch_once; the pull queue is serial.
+//
+// _VGTCNBlendBuffers: Per-frame CoreImage blend of two CVPixelBuffers.
+//   VGTransitionTypeDissolve: linear alpha cross-fade (CIDissolveTransition).
+//     alpha 0.0 → outgoing only.  alpha 1.0 → incoming only.
+//   VGTransitionTypeFade: two-phase fade through black.
+//     alpha [0.0, 0.5) → outgoing fades to black.
+//     alpha [0.5, 1.0] → incoming fades in from black.
+// Returns new retained CVPixelBufferRef (+1). Caller must CVPixelBufferRelease.
+// Returns NULL with *outError on failure; no silent masking (DEC-143).
+//
+// RR-143: CIContext uses nil options (Metal/GPU on device; CPU fallback in sim).
+// RR-144: CIDissolveTransition interpolates in gamma-encoded RGB space, not
+//   linear-light. Perceptual blending accuracy is a deferred improvement.
+
+static CIContext *_VGTCNSharedCIContext(void) {
+  static CIContext *ctx = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    ctx = [CIContext contextWithOptions:nil];
+  });
+  return ctx;
+}
+
+static CVPixelBufferRef _VGTCNBlendBuffers(CVPixelBufferRef outgoing,
+                                            CVPixelBufferRef incoming,
+                                            VGTransitionType type,
+                                            float alpha,
+                                            NSError **outError) {
+  CIImage *outCI = [CIImage imageWithCVPixelBuffer:outgoing];
+  CIImage *inCI  = [CIImage imageWithCVPixelBuffer:incoming];
+  CIImage *blendedCI = nil;
+
+  if (type == VGTransitionTypeDissolve) {
+    // Cross-dissolve: outgoing ---(alpha)---> incoming.
+    CIFilter *f = [CIFilter filterWithName:@"CIDissolveTransition"];
+    [f setValue:outCI    forKey:kCIInputImageKey];
+    [f setValue:inCI     forKey:@"inputTargetImage"];
+    [f setValue:@(alpha) forKey:kCIInputTimeKey];
+    blendedCI = f.outputImage;
+  } else if (type == VGTransitionTypeFade) {
+    // Two-phase fade through black.
+    CIImage *black =
+        [CIImage imageWithColor:[CIColor colorWithRed:0 green:0 blue:0]];
+    if (alpha < 0.5f) {
+      float t = alpha * 2.0f; // 0→1 across first half
+      CIFilter *f = [CIFilter filterWithName:@"CIDissolveTransition"];
+      [f setValue:outCI forKey:kCIInputImageKey];
+      [f setValue:black forKey:@"inputTargetImage"];
+      [f setValue:@(t)  forKey:kCIInputTimeKey];
+      blendedCI = f.outputImage;
+    } else {
+      float t = (alpha - 0.5f) * 2.0f; // 0→1 across second half
+      CIFilter *f = [CIFilter filterWithName:@"CIDissolveTransition"];
+      [f setValue:black forKey:kCIInputImageKey];
+      [f setValue:inCI  forKey:@"inputTargetImage"];
+      [f setValue:@(t)  forKey:kCIInputTimeKey];
+      blendedCI = f.outputImage;
+    }
+  }
+
+  if (!blendedCI) {
+    if (outError) {
+      *outError = _VGTCNError(
+          15, @"VGTimelineCompositorNode: CoreImage blend produced no output "
+               "image. Unsupported transition type or CIContext unavailable.");
+    }
+    return NULL;
+  }
+
+  size_t w = CVPixelBufferGetWidth(incoming);
+  size_t h = CVPixelBufferGetHeight(incoming);
+  NSDictionary *attrs = @{
+    (id)kCVPixelBufferPixelFormatTypeKey  : @(kCVPixelFormatType_32BGRA),
+    (id)kCVPixelBufferMetalCompatibilityKey : @YES,
+    (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+  };
+
+  CVPixelBufferRef out = NULL;
+  CVReturn ret = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
+                                     kCVPixelFormatType_32BGRA,
+                                     (__bridge CFDictionaryRef)attrs, &out);
+  if (ret != kCVReturnSuccess || !out) {
+    if (outError) {
+      *outError = _VGTCNError(
+          15, @"VGTimelineCompositorNode: CVPixelBufferCreate failed for "
+               "transition blend output buffer.");
+    }
+    return NULL;
+  }
+
+  CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+  [_VGTCNSharedCIContext() render:blendedCI
+                    toCVPixelBuffer:out
+                              bounds:blendedCI.extent
+                          colorSpace:cs];
+  CGColorSpaceRelease(cs);
+
+  return out; // Caller owns +1 from CVPixelBufferCreate
+}
+
 // ─── os_log
 // ───────────────────────────────────────────────────────────────────
 static os_log_t sTimelineLog;
@@ -205,10 +312,14 @@ static os_log_t sTimelineLog;
   NSArray<VGClipDescriptor *> *_clips;
   NSArray<VGTransitionDescriptor *> *_transitions;
 
-  // ── Active reader state ────────────────────────────────────────────────────
-  // At most ONE clip reader is active at a time in this first slice.
-  // Rebuilt when the active clip changes or on seek.
-  _VGClipReader *_activeReader; // nullable
+  // ── Active / outgoing reader state ─────────────────────────────────────────
+  // _activeReader:  the incoming (or sole) clip reader. Never nil during decode.
+  // _outgoingReader: the outgoing clip reader during a non-hard-cut transition
+  //   window. Non-nil only while requestedPTSSecs is within the overlap window
+  //   [incomingClip.startTimeSeconds, incomingClip.startTimeSeconds + T].
+  //   Torn down when the window ends, on seek, or on invalidate (RR-142).
+  _VGClipReader *_activeReader;   // nullable
+  _VGClipReader *_outgoingReader; // nullable; non-nil during transition window
 
   // ── Buffer ownership (RR-36) ──────────────────────────────────────────────
   // Retained +1 by this node. Released before each new pullFrame: decode
@@ -391,40 +502,84 @@ static os_log_t sTimelineLog;
     }
   }
 
-  // ── (e) Stage 7.5: reject non-hard-cut transitions ────────────────────────
-  // Fade and cross-dissolve blending require GPU compositing (Phase 7.5B+).
-  // Hard cuts (type == none or durationSeconds == 0) are fully supported.
-  // Do NOT silently ignore — return a clear error so callers know what is
-  // pending.
+  // ── (e) Phase 7.10: validate non-hard-cut transition parameters ─────────────
+  // The Stage 7.5 hard-cut-only rejection gate is lifted. Fade and dissolve
+  // transitions are now executed by the dual-reader blend path in pullFrame:.
+  // Each non-hard-cut transition is validated for:
+  //   (1) durationSeconds > 0 (a dissolve with zero duration is a hard cut)
+  //   (2) fromClipId and toClipId are non-nil
+  //   (3) from/to IDs reference adjacent clips in ascending start-time order
+  //   (4) overlap does not exceed min(outgoing, incoming) timelineDuration
+  // Error code 12 is used for all init-time transition validation failures.
+  // (Note: error code 12 is also used in _buildReaderForClipIndex: for invalid
+  // sourceURL — same error domain, distinct execution paths.)
   for (NSUInteger i = 0; i < transitions.count; i++) {
     VGTransitionDescriptor *t = transitions[i];
-    if (!t.isHardCut) {
-      NSString *typeDesc;
-      switch (t.type) {
-      case VGTransitionTypeFade:
-        typeDesc = @"fade";
-        break;
-      case VGTransitionTypeDissolve:
-        typeDesc = @"dissolve";
-        break;
-      default:
-        typeDesc = @"non-hard-cut";
-        break;
-      }
+    if (t.isHardCut) continue; // Hard cuts: no further validation required.
+
+    // (1) Non-hard-cut transitions must have durationSeconds > 0.
+    if (t.durationSeconds <= 0.0) {
       if (outError) {
         *outError = _VGTCNError(
-            9,
-            ([NSString
-                stringWithFormat:
-                    @"VGTimelineCompositorNode: transitions[%lu] (id=%@) has "
-                     "unsupported type \"%@\" (durationSeconds=%.3f) for Stage "
-                     "7.5. "
-                     "Only hard cuts (VGTransitionTypeNone or "
-                     "durationSeconds==0) "
-                     "are supported in this first executable slice. "
-                     "Fade/dissolve GPU blending is Stage 7.5B+.",
-                    (unsigned long)i, t.transitionId, typeDesc,
-                    t.durationSeconds]));
+            12, ([NSString
+                     stringWithFormat:
+                         @"VGTimelineCompositorNode: transitions[%lu] (id=%@): "
+                          "non-hard-cut transition must have durationSeconds > 0 "
+                          "(got %.3fs).",
+                         (unsigned long)i, t.transitionId,
+                         t.durationSeconds]));
+      }
+      return nil;
+    }
+
+    // (2) Both clip IDs must be non-nil for the blend path to locate clips.
+    if (!t.fromClipId || !t.toClipId) {
+      if (outError) {
+        *outError = _VGTCNError(
+            12, ([NSString
+                     stringWithFormat:
+                         @"VGTimelineCompositorNode: transitions[%lu] (id=%@): "
+                          "non-hard-cut transition requires non-nil fromClipId "
+                          "and toClipId.",
+                         (unsigned long)i, t.transitionId]));
+      }
+      return nil;
+    }
+
+    // (3) from/to must reference adjacent clips in the sorted order.
+    NSUInteger fromIdx = NSNotFound, toIdx = NSNotFound;
+    for (NSUInteger j = 0; j < clips.count; j++) {
+      if ([clips[j].clipId isEqualToString:t.fromClipId]) fromIdx = j;
+      if ([clips[j].clipId isEqualToString:t.toClipId])   toIdx   = j;
+    }
+    if (fromIdx == NSNotFound || toIdx == NSNotFound || toIdx != fromIdx + 1) {
+      if (outError) {
+        *outError = _VGTCNError(
+            12, ([NSString
+                     stringWithFormat:
+                         @"VGTimelineCompositorNode: transitions[%lu] (id=%@): "
+                          "fromClipId=%@ and toClipId=%@ must reference "
+                          "adjacent clips in ascending start-time order.",
+                         (unsigned long)i, t.transitionId,
+                         t.fromClipId, t.toClipId]));
+      }
+      return nil;
+    }
+
+    // (4) Overlap must not exceed either clip's timelineDuration.
+    VGClipDescriptor *fromClip = clips[fromIdx];
+    VGClipDescriptor *toClip   = clips[toIdx];
+    double minDur = MIN(fromClip.timelineDuration, toClip.timelineDuration);
+    if (t.durationSeconds > minDur) {
+      if (outError) {
+        *outError = _VGTCNError(
+            12, ([NSString
+                     stringWithFormat:
+                         @"VGTimelineCompositorNode: transitions[%lu] (id=%@): "
+                          "durationSeconds (%.3fs) exceeds the shorter clip's "
+                          "timelineDuration (%.3fs).",
+                         (unsigned long)i, t.transitionId,
+                         t.durationSeconds, minDur]));
       }
       return nil;
     }
@@ -442,6 +597,7 @@ static os_log_t sTimelineLog;
 
   _lastDeliveredBuffer = NULL;
   _activeReader = nil;
+  _outgoingReader = nil;              // Phase 7.10: non-nil only in transition windows
   // [7.5C] Frame reuse tracking: -1 signals "no cached frame".
   _lastDeliveredAssetPTS = -1.0;
   _lastDeliveredAssetDuration = 0.0;
@@ -557,7 +713,8 @@ static os_log_t sTimelineLog;
     return;
   }
 
-  // Cancel and nil the active reader.
+  // Cancel and nil both readers (RR-142: outgoing reader must be torn down on invalidate).
+  [self _tearDownOutgoingReader];
   [self _tearDownActiveReader];
 
   // Release last delivered buffer (RR-36).
@@ -607,6 +764,7 @@ static os_log_t sTimelineLog;
   // AVAssetReader is forward-only; it cannot seek. Must cancel and rebuild
   // on next pullFrame: call. We do NOT rebuild here to avoid blocking seekTo:
   // — the rebuild happens lazily in pullFrame:.
+  [self _tearDownOutgoingReader]; // Phase 7.10: tear down outgoing reader on seek
   [self _tearDownActiveReader];
 
   os_log(sTimelineLog, "[VGTCNode] seekTo: %.3fs generation=%llu",
@@ -662,21 +820,31 @@ static os_log_t sTimelineLog;
   //   requestedPTSSecs >= clip.startTimeSeconds
   //   requestedPTSSecs <  clip.startTimeSeconds + clip.timelineDuration
   //
-  // The clip array is sorted ascending by startTimeSeconds
-  // (enforced by VGEditorGraphFactory validation).
+  // The clip array is sorted ascending by startTimeSeconds.
+  //
+  // Phase 7.10: Iterate BACKWARDS (last → first) so that when two clip ranges
+  // overlap during a transition window, the incoming (later-index) clip is
+  // selected first. This is required for correct transition detection:
+  //   Clip A: [0.0, 5.0),  Clip B: [4.0, 9.63)
+  //   Overlap: [4.0, 5.0)  → forward loop picks index 0 (Clip A) first,
+  //     making `activeClipIndex > 0` false → transition branch never fires.
+  //   Backward loop picks index 1 (Clip B) first → transition detection runs.
+  // NSInteger avoids unsigned underflow when decrementing past 0.
   NSUInteger activeClipIndex = NSNotFound;
-  for (NSUInteger i = 0; i < _clips.count; i++) {
-    VGClipDescriptor *clip = _clips[i];
+  for (NSInteger i = (NSInteger)_clips.count - 1; i >= 0; i--) {
+    VGClipDescriptor *clip = _clips[(NSUInteger)i];
     double clipStart = clip.startTimeSeconds;
     double clipEnd = clipStart + clip.timelineDuration;
 
-    if (requestedPTSSecs >= clipStart && requestedPTSSecs < clipEnd) {
-      activeClipIndex = i;
+    // Final clip: allow exact end boundary to extend EOS detection below.
+    // Checked before the range test so PTS at exact end of last clip is caught.
+    if ((NSUInteger)i == _clips.count - 1 && requestedPTSSecs >= clipStart) {
+      activeClipIndex = (NSUInteger)i;
       break;
     }
-    // Final clip: allow exact end boundary to extend EOS detection below.
-    if (i == _clips.count - 1 && requestedPTSSecs >= clipStart) {
-      activeClipIndex = i;
+
+    if (requestedPTSSecs >= clipStart && requestedPTSSecs < clipEnd) {
+      activeClipIndex = (NSUInteger)i;
       break;
     }
   }
@@ -690,6 +858,36 @@ static os_log_t sTimelineLog;
   }
 
   VGClipDescriptor *activeClip = _clips[activeClipIndex];
+
+  // ── Phase 7.10: Transition window detection ──────────────────────────────
+  // When the incoming clip has a non-hard-cut transition from the preceding
+  // clip, the overlap window is:
+  //   [activeClip.startTimeSeconds, activeClip.startTimeSeconds + T]
+  // During this window _outgoingReader decodes the outgoing clip and
+  // _activeReader decodes the incoming clip; frames are blended (DEC-143).
+  BOOL inTransitionWindow = NO;
+  double transitionElapsed = 0.0;
+  double transitionDuration = 0.0;
+  VGTransitionType transitionType = VGTransitionTypeNone;
+  NSUInteger outgoingClipIndex = NSNotFound;
+  if (activeClipIndex > 0) {
+    VGClipDescriptor *prevClip = _clips[activeClipIndex - 1];
+    for (VGTransitionDescriptor *t in _transitions) {
+      if (t.isHardCut) continue;
+      if ([t.fromClipId isEqualToString:prevClip.clipId] &&
+          [t.toClipId isEqualToString:activeClip.clipId]) {
+        double elapsed = requestedPTSSecs - activeClip.startTimeSeconds;
+        if (elapsed >= 0.0 && elapsed <= t.durationSeconds) {
+          inTransitionWindow = YES;
+          transitionElapsed = elapsed;
+          transitionDuration = t.durationSeconds;
+          transitionType = t.type;
+          outgoingClipIndex = activeClipIndex - 1;
+        }
+        break;
+      }
+    }
+  }
 
   // ── Compute asset-local decode PTS ────────────────────────────────────────
   // elapsed_timeline = requestedPTSSecs - clip.startTimeSeconds
@@ -713,6 +911,11 @@ static os_log_t sTimelineLog;
     [self _tearDownActiveReader];
   }
 
+  // Phase 7.10: Tear down outgoing reader when no longer in a transition window.
+  if (!inTransitionWindow && _outgoingReader) {
+    [self _tearDownOutgoingReader];
+  }
+
   // Build reader if needed (first access or after seek/clip-switch).
   if (!_activeReader) {
     NSError *buildError = nil;
@@ -729,10 +932,136 @@ static os_log_t sTimelineLog;
     }
   }
 
+  // Phase 7.10: Build outgoing reader for the transition window when needed.
+  // The outgoing clip is clips[outgoingClipIndex]; its reader must start at the
+  // asset-local time corresponding to the current global PTS (not time 0).
+  if (inTransitionWindow) {
+    if (!_outgoingReader || _outgoingReader.clipIndex != outgoingClipIndex) {
+      [self _tearDownOutgoingReader];
+      VGClipDescriptor *outgoingClip = _clips[outgoingClipIndex];
+      double elapsedOut = requestedPTSSecs - outgoingClip.startTimeSeconds;
+      double tAssetOut =
+          outgoingClip.trimStartSeconds + elapsedOut * outgoingClip.speed;
+      tAssetOut = MAX(tAssetOut, outgoingClip.trimStartSeconds);
+      tAssetOut = MIN(tAssetOut, outgoingClip.trimEndSeconds);
+      NSError *outBuildErr = nil;
+      _outgoingReader = [self _buildReaderForClipIndex:outgoingClipIndex
+                                           startAtTime:tAssetOut
+                                                 error:&outBuildErr];
+      if (!_outgoingReader) {
+        os_log_error(sTimelineLog,
+                     "[VGTCNode] transition: failed to build outgoing reader "
+                     "clip %lu: %{public}@",
+                     (unsigned long)outgoingClipIndex,
+                     outBuildErr.localizedDescription);
+        return [VGFrameResult errorResult:outBuildErr
+                               generation:request.generation];
+      }
+    }
+  }
+
   // ── Guard: check for generation change after expensive reader build ────────
   // A seek may have arrived while we were building the reader.
   if (request.isCancelled || atomic_load(&_generation) != capturedGeneration) {
     return [VGFrameResult skippedWithGeneration:request.generation];
+  }
+
+  // ── Phase 7.10: Transition blend path ─────────────────────────────────────
+  // During a transition window pull from both _outgoingReader (outgoing clip)
+  // and _activeReader (incoming clip) then blend via CoreImage.
+  // Blend failure returns errorResult — no silent masking (DEC-143).
+  if (inTransitionWindow) {
+    // Release last delivered buffer; the blend will produce a new one.
+    if (_lastDeliveredBuffer) {
+      CVPixelBufferRelease(_lastDeliveredBuffer);
+      _lastDeliveredBuffer = NULL;
+    }
+
+    float blendAlpha = (transitionDuration > 0.0)
+        ? (float)(transitionElapsed / transitionDuration)
+        : 1.0f;
+
+    // Pull incoming frame (_activeReader — incoming clip).
+    CMSampleBufferRef inSample =
+        [_activeReader.trackOutput copyNextSampleBuffer];
+    CVPixelBufferRef inPB =
+        inSample ? CMSampleBufferGetImageBuffer(inSample) : NULL;
+    if (inPB) CVPixelBufferRetain(inPB);
+    if (inSample) CFRelease(inSample);
+
+    // Pull outgoing frame (_outgoingReader — outgoing clip).
+    CMSampleBufferRef outSample =
+        [_outgoingReader.trackOutput copyNextSampleBuffer];
+    CVPixelBufferRef outPB =
+        outSample ? CMSampleBufferGetImageBuffer(outSample) : NULL;
+    if (outPB) CVPixelBufferRetain(outPB);
+    if (outSample) CFRelease(outSample);
+
+    CVPixelBufferRef blendedPB = NULL;
+
+    if (inPB && outPB) {
+      // Both readers delivered: perform CoreImage blend.
+      NSError *blendErr = nil;
+      blendedPB = _VGTCNBlendBuffers(outPB, inPB, transitionType,
+                                     blendAlpha, &blendErr);
+      if (!blendedPB) {
+        // Blend failure — report error; do not silently substitute a frame.
+        CVPixelBufferRelease(inPB);
+        CVPixelBufferRelease(outPB);
+        os_log_error(
+            sTimelineLog,
+            "[VGTCNode] blend error clip %lu→%lu alpha=%.3f: %{public}@",
+            (unsigned long)outgoingClipIndex,
+            (unsigned long)activeClipIndex, blendAlpha,
+            blendErr.localizedDescription);
+        return [VGFrameResult errorResult:blendErr
+                               generation:request.generation];
+      }
+    } else if (inPB) {
+      // Outgoing reader exhausted early — deliver incoming frame unblended.
+      [self _tearDownOutgoingReader];
+      blendedPB = inPB;
+      inPB = NULL; // ownership transferred
+    } else if (outPB) {
+      // Incoming reader not yet ready — deliver outgoing frame unblended.
+      blendedPB = outPB;
+      outPB = NULL;
+    } else {
+      // Both readers exhausted — skip this frame.
+      return [VGFrameResult skippedWithGeneration:request.generation];
+    }
+
+    if (inPB)  CVPixelBufferRelease(inPB);
+    if (outPB) CVPixelBufferRelease(outPB);
+
+    // Store blended buffer (node holds +1). Disable frame-reuse for transition
+    // frames — each blend output is unique.
+    _lastDeliveredBuffer = blendedPB;
+    _lastDeliveredAssetPTS = -1.0;
+    _lastDeliveredAssetDuration = 0.0;
+
+    CMTime outputDur =
+        CMTimeMakeWithSeconds(1.0 / _activeReader.sourceFPS, 600);
+
+    VGFrameEnvelope env;
+    memset(&env, 0, sizeof(env));
+    env.mediaType = VGMediaTypeVideo;
+    env.payload.videoBuffer = (void *)blendedPB; // +0 in envelope; node holds +1
+    env.pts = request.requestedPTS;
+    env.dts = kCMTimeInvalid;
+    env.duration = outputDur;
+    env.generation = request.generation;
+    env.metadata = NULL;
+
+    os_log_debug(sTimelineLog,
+                 "[VGTCNode] transition delivered: clip %lu→%lu "
+                 "alpha=%.3f type=%ld",
+                 (unsigned long)outgoingClipIndex,
+                 (unsigned long)activeClipIndex,
+                 blendAlpha, (long)transitionType);
+
+    return [VGFrameResult deliveredWithEnvelope:env
+                                     generation:request.generation];
   }
 
   // [7.5C] Frame reuse guard: if the requested asset time falls within the
@@ -1136,6 +1465,16 @@ static os_log_t sTimelineLog;
   if (_activeReader) {
     [_activeReader.reader cancelReading];
     _activeReader = nil;
+  }
+}
+
+/// Phase 7.10: Cancel and nil the outgoing reader (RR-142).
+/// Called when exiting a transition window, on seek, and on invalidate.
+/// Idempotent: safe to call when _outgoingReader is already nil.
+- (void)_tearDownOutgoingReader {
+  if (_outgoingReader) {
+    [_outgoingReader.reader cancelReading];
+    _outgoingReader = nil;
   }
 }
 

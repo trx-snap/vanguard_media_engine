@@ -447,27 +447,29 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         return nil
     }
 
-    /// Validates a transition dictionaries array for Phase 7.8 production routes.
+    /// Validates a transition dictionaries array for production routes.
     ///
-    /// Phase 7.8 supports only hard cuts: `type == "none"` or `durationSeconds == 0.0`.
-    /// Any non-hard-cut transition returns a `COMPOSITOR_INIT_FAILED` FlutterError.
+    /// Phase 7.10: the hard-cut-only gate is lifted. Supported transition types
+    /// are `none` (hard cut), `dissolve`, and `fade`. Any other type string is
+    /// rejected early so callers receive a clear error before the compositor
+    /// attempts construction. Structural validation (overlap math, adjacent-clip
+    /// checks, error code 12) remains in VGTimelineCompositorNode.
     ///
     /// Returns a `FlutterError` on the first invalid transition, or `nil` if all pass.
     private func _preflightTransitions(_ transitionDicts: [[String: Any]]) -> FlutterError? {
-        for (idx, t) in transitionDicts.enumerated() {
-            let tId         = t["id"] as? String ?? "<unknown>"
-            let typeStr     = t["type"] as? String ?? "none"
-            let durationSec = (t["durationSeconds"] as? NSNumber)?.doubleValue ?? 0.0
+        // Transition types accepted by VGTimelineCompositorNode as of Phase 7.10.
+        let supportedTypes: Set<String> = ["none", "dissolve", "fade"]
 
-            let isHardCut = (typeStr == "none") || (durationSec == 0.0)
-            guard isHardCut else {
+        for (idx, t) in transitionDicts.enumerated() {
+            let tId     = t["id"] as? String ?? "<unknown>"
+            let typeStr = t["type"] as? String ?? "none"
+
+            guard supportedTypes.contains(typeStr) else {
                 return FlutterError(
-                    code: "COMPOSITOR_INIT_FAILED",
+                    code: "UNSUPPORTED_TRANSITION_TYPE",
                     message: "transitions[\(idx)] id=\(tId): "
-                           + "type '\(typeStr)' with durationSeconds=\(durationSec) "
-                           + "is not a hard cut. Phase 7.8 supports only hard cuts "
-                           + "(type='none' or durationSeconds=0). "
-                           + "Fade/dissolve GPU blending is Phase 7.5B+.",
+                           + "type '\(typeStr)' is not supported. "
+                           + "Supported types: \(supportedTypes.sorted().joined(separator: ", ")).",
                     details: nil)
             }
         }
@@ -1732,6 +1734,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 // touches VGExportProfile directly.
                 VGTimelineExportHelper.exportTimeline(
                     withClips: clipDicts,
+                    transitions: [],
                     outputPath: exportOutputPath,
                     width: exportWidth,
                     height: exportHeight,
@@ -1995,6 +1998,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // VGExportProfile is constructed entirely in ObjC (MOD-1, MOD-2).
             VGTimelineExportHelper.exportTimeline(
                 withClips: clipDictsE,
+                transitions: transitionDictsE,
                 outputPath: exportOutputPath,
                 width: exportW,
                 height: exportH,
