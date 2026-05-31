@@ -655,11 +655,22 @@ void main() {
       expect(received, [closeTo(1.23, 0.001)]);
     });
 
-    test('EC-15 onTimelineEOS sets isPlaying=false', () async {
+    test('EC-15 onTimelineEOS sets isPlaying=false and pins currentPTS to durationSeconds', () async {
+      // Send a sub-duration frame first so currentPTS is not already at duration.
+      await controller.handleNativeCallback(
+        const MethodCall('onTimelineFrame', {'pts': 4.5}),
+      );
+      expect(controller.value.currentPTS, closeTo(4.5, 0.001));
+
       await controller.handleNativeCallback(
         const MethodCall('onTimelineEOS', null),
       );
       expect(controller.value.isPlaying, isFalse);
+      expect(
+        controller.value.currentPTS,
+        closeTo(controller.value.draft.durationSeconds, 0.001),
+        reason: 'onTimelineEOS must pin currentPTS to durationSeconds',
+      );
     });
 
     test('EC-16 onTimelineEOS emits on eosStream', () async {
@@ -821,6 +832,197 @@ void main() {
       const b = VGEditorExportRequest(bitrateBps: 4000000);
       expect(a, b);
       expect(a.hashCode, b.hashCode);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // play() — replay-at-end behaviour
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorController — play() replay-at-end', () {
+    // EC-RAE0 covers the critical real-device scenario that was missed before:
+    // the last onTimelineFrame delivers a PTS *slightly below* durationSeconds
+    // (e.g. 9.97s on a 10.0s timeline). Without the EOS currentPTS pin in
+    // handleNativeCallback, play() would see 9.97 >= 10.0 → false, send no
+    // seek, and native immediately re-fires EOS. This appeared on device as
+    // pressing Play doing nothing.
+    late VGEditorController controller;
+    final List<String> calledMethods = [];
+    final List<Map<String, dynamic>> capturedSeekArgs = [];
+
+    setUp(() async {
+      calledMethods.clear();
+      capturedSeekArgs.clear();
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        if (method == 'timelineSeek') {
+          capturedSeekArgs.add(Map<String, dynamic>.from(args as Map));
+        }
+        switch (method) {
+          case 'createTimelineTexture':
+            return {'textureId': 77, 'width': 640, 'height': 360};
+          case 'timelinePlay':
+          case 'timelinePause':
+          case 'timelineSeek':
+          case 'disposeTimeline':
+            return null;
+          default:
+            return null;
+        }
+      });
+      controller = VGEditorController(initialDraft: _twoClipDraft());
+      await controller.initialize();
+    });
+
+    tearDown(() => controller.dispose());
+
+    test(
+        'EC-RAE0 play() after EOS with sub-duration last frame seeks to 0.0 (real-device scenario)',
+        () async {
+      // REAL-DEVICE SCENARIO: the last onTimelineFrame delivers a PTS slightly
+      // below durationSeconds (as seen on physical iPhone). EOS fires on the
+      // next compositor tick. The onTimelineEOS handler must pin currentPTS to
+      // durationSeconds so play() replay-at-end condition fires correctly.
+      final duration = controller.value.draft.durationSeconds; // 10.0
+      const lastFramePTS = 9.967; // typical real-device last-frame PTS
+
+      await controller.handleNativeCallback(
+        const MethodCall('onTimelineFrame', {'pts': lastFramePTS}),
+      );
+      // Verify PTS was set from the frame callback.
+      expect(controller.value.currentPTS, closeTo(lastFramePTS, 0.001));
+
+      // EOS fires — controller must pin currentPTS to durationSeconds.
+      await controller.handleNativeCallback(
+        const MethodCall('onTimelineEOS', null),
+      );
+
+      expect(controller.value.isPlaying, isFalse);
+      // KEY ASSERTION: PTS is pinned to duration, not left at lastFramePTS.
+      expect(
+        controller.value.currentPTS,
+        closeTo(duration, 0.001),
+        reason: 'onTimelineEOS must pin currentPTS to durationSeconds so '
+            'play() replay-at-end condition fires even when last frame '
+            'PTS is slightly below duration (real-device behaviour)',
+      );
+
+      calledMethods.clear();
+      capturedSeekArgs.clear();
+
+      // Press play — must seek to 0 even though lastFramePTS < duration.
+      await controller.play();
+
+      expect(calledMethods, contains('timelineSeek'),
+          reason: 'play() after sub-duration EOS must seek to 0.0');
+      final seekIndex = calledMethods.indexOf('timelineSeek');
+      final playIndex = calledMethods.indexOf('timelinePlay');
+      expect(seekIndex, lessThan(playIndex),
+          reason: 'seek must precede timelinePlay');
+      expect(capturedSeekArgs.last['seconds'], closeTo(0.0, 0.001));
+      expect(controller.value.currentPTS, closeTo(0.0, 0.001));
+      expect(controller.value.isPlaying, isTrue);
+    });
+
+    test(
+        'EC-RAE1 play() after EOS seeks to 0.0 then starts playback',
+        () async {
+      // Draft duration is 10.0s (two untrimmed 5s clips with sequential start times).
+      // Send PTS at exactly end boundary so the replay-at-end condition fires.
+      final duration = controller.value.draft.durationSeconds; // 10.0
+      await controller.handleNativeCallback(
+        MethodCall('onTimelineFrame', {'pts': duration}),
+      );
+      await controller.handleNativeCallback(
+        const MethodCall('onTimelineEOS', null),
+      );
+
+      expect(controller.value.isPlaying, isFalse);
+      expect(controller.value.currentPTS, closeTo(duration, 0.001));
+
+      calledMethods.clear();
+      capturedSeekArgs.clear();
+
+      // Press play again — should seek to 0 first.
+      await controller.play();
+
+      // timelineSeek must have been called before timelinePlay.
+      expect(calledMethods, contains('timelineSeek'),
+          reason: 'play() after EOS must seek to 0.0 before starting');
+      final seekIndex = calledMethods.indexOf('timelineSeek');
+      final playIndex = calledMethods.indexOf('timelinePlay');
+      expect(seekIndex, lessThan(playIndex),
+          reason: 'seek must precede timelinePlay');
+
+      // Seek must target 0.0s.
+      expect(capturedSeekArgs.isNotEmpty, isTrue);
+      expect(capturedSeekArgs.last['seconds'], closeTo(0.0, 0.001));
+
+      // Controller PTS resets and isPlaying is true.
+      expect(controller.value.currentPTS, closeTo(0.0, 0.001));
+      expect(controller.value.isPlaying, isTrue);
+    });
+
+    test(
+        'EC-RAE2 play() when PTS exactly equals durationSeconds seeks first',
+        () async {
+      // Draft duration is 10.0s (two 5s clips).
+      final duration = controller.value.draft.durationSeconds;
+
+      // Simulate PTS at exact end boundary.
+      await controller.handleNativeCallback(
+        MethodCall('onTimelineFrame', {'pts': duration}),
+      );
+      // EOS sets isPlaying=false.
+      await controller.handleNativeCallback(
+        const MethodCall('onTimelineEOS', null),
+      );
+
+      calledMethods.clear();
+      capturedSeekArgs.clear();
+
+      await controller.play();
+
+      expect(calledMethods, contains('timelineSeek'));
+      expect(capturedSeekArgs.last['seconds'], closeTo(0.0, 0.001));
+      expect(controller.value.isPlaying, isTrue);
+    });
+
+    test(
+        'EC-RAE3 play() mid-timeline does NOT seek to 0 unnecessarily',
+        () async {
+      // Simulate PTS partway through the timeline.
+      await controller.handleNativeCallback(
+        const MethodCall('onTimelineFrame', {'pts': 4.5}),
+      );
+      expect(controller.value.currentPTS, closeTo(4.5, 0.001));
+
+      calledMethods.clear();
+      capturedSeekArgs.clear();
+
+      await controller.play();
+
+      // Should NOT have sent a seek before play.
+      expect(calledMethods, isNot(contains('timelineSeek')),
+          reason: 'play() mid-timeline must not auto-seek to 0');
+      expect(calledMethods, contains('timelinePlay'));
+      expect(controller.value.isPlaying, isTrue);
+    });
+
+    test(
+        'EC-RAE4 play() at time 0.0 does NOT seek unnecessarily',
+        () async {
+      // PTS is already 0.0 (initial state).
+      expect(controller.value.currentPTS, closeTo(0.0, 0.001));
+
+      calledMethods.clear();
+      capturedSeekArgs.clear();
+
+      await controller.play();
+
+      expect(calledMethods, isNot(contains('timelineSeek')),
+          reason: 'play() at 0.0 must not auto-seek');
+      expect(calledMethods, contains('timelinePlay'));
     });
   });
 }

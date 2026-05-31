@@ -165,6 +165,10 @@ static os_log_t sExportHelperLog;
         @"descriptorStage": @"7.5_executable",
         @"clips":           clips,
         @"transitions":     @[],
+        // Phase 7.9: pass canvas dimensions for aspect-fit normalization.
+        // Ensures export output matches preview orientation and scaling.
+        @"canvasWidth":     @(width),
+        @"canvasHeight":    @(height),
     };
 
     VGMediaPort *videoOutPort =

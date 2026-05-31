@@ -238,6 +238,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             "descriptorStage": "7.5_executable",
             "clips":           clipDicts,
             "transitions":     transitionDicts,
+            // Phase 7.9: no canvas dimensions in legacy path → compositor
+            // forwards asset-native buffers (backward compatible).
         ]
 
         // Build port array: single video_out port.
@@ -299,6 +301,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             "descriptorStage": "7.5_executable",
             "clips":           clipDicts,
             "transitions":     transitionDicts,
+            // Phase 7.9: pass canvas dimensions for aspect-fit normalization.
+            // The compositor uses these to override AVMutableVideoComposition
+            // renderSize and apply an aspect-fit layer instruction.
+            "canvasWidth":     width,
+            "canvasHeight":    height,
         ]
 
         let videoOutPort = VGMediaPort.outputPort("video_out", mediaType: .video)

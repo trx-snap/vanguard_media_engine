@@ -212,8 +212,17 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
       case 'onTimelineEOS':
         if (!_eosController.isClosed) _eosController.add(null);
+        // Pin currentPTS to durationSeconds on EOS so that the replay-at-end
+        // check in play() (currentPTS >= durationSeconds) fires reliably.
+        //
+        // On device the last onTimelineFrame PTS is the decoded frame's
+        // presentation timestamp, which is typically a few frames SHORT of the
+        // total timeline duration (e.g. 9.97s vs 10.0s). Without this pin the
+        // play() condition (9.97 >= 10.0) is false, no seek-to-zero occurs, and
+        // native immediately returns EOS again — appearing as if Play did nothing.
         value = value.copyWith(
           isPlaying: false,
+          currentPTS: value.draft.durationSeconds,
           statusMessage: 'End of timeline',
         );
         notifyListeners();
@@ -287,12 +296,27 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// Maps to `timelinePlay` (Phase 7.8 production route).
   /// No-op if already playing, not ready, or busy.
   ///
+  /// **Replay-at-end behaviour:** If [currentPTS] is at or beyond the draft
+  /// duration (i.e. the timeline has reached end-of-stream), this method
+  /// automatically seeks to `0.0s` first, then starts playback. This allows
+  /// the user to press Play again after the timeline finishes without having
+  /// to manually seek to the beginning.
+  ///
   /// Throws [StateError] if disposed.
   Future<void> play() async {
     _assertNotDisposed();
     if (!value.isReady || _busy || value.isPlaying) return;
 
     try {
+      // Replay-at-end: if the playhead is at or past the end of the timeline,
+      // seek back to the beginning before starting playback so the native
+      // compositor does not immediately return EOS on the first frame request.
+      final durationSeconds = value.draft.durationSeconds;
+      if (durationSeconds > 0.0 && value.currentPTS >= durationSeconds) {
+        await _channel.invokeMethod<void>('timelineSeek', {'seconds': 0.0});
+        value = value.copyWith(currentPTS: 0.0);
+      }
+
       await _channel.invokeMethod<void>('timelinePlay');
       value = value.copyWith(isPlaying: true, statusMessage: 'Playing');
       notifyListeners();

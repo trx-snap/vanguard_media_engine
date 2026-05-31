@@ -71,6 +71,22 @@
 //   Pre-warming:       Not implemented. Performance optimization deferred.
 //   Audio sidecar:     Phase 8+.
 //
+// ── PHASE 7.9 ORIENTATION NORMALIZATION ──────────────────────────────────────
+//
+// As of Phase 7.9, _buildReaderForClipIndex:startAtTime:error: uses
+// AVAssetReaderVideoCompositionOutput + AVMutableVideoComposition instead of
+// AVAssetReaderTrackOutput. This applies the track's preferredTransform at
+// decode time, producing orientation-normalized pixel buffers for both the
+// playback and export paths (both use VGTimelineCompositorNode).
+//
+// Two-domain orientation policy (DEC-142, DEC-141, DEC-132, RR-141):
+//   Camera-produced clips (DEC-132): identity preferredTransform; composition
+//     is a no-op. No double rotation.
+//   Imported/user-supplied clips (RR-141): may carry 90°/270° transform;
+//     composition normalizes them to correct orientation at decode time.
+//
+// Do NOT add manual CPU/Metal/GPU rotation code on top of this path.
+//
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #import "VGTimelineCompositorNode.h"
@@ -118,7 +134,17 @@ static NSString *const kVGTCNDescriptorStage74 = @"7.4_non_executable";
 static NSString *const kVGTCNClipsKey = @"clips";
 static NSString *const kVGTCNTransitionsKey = @"transitions";
 
-// ─── Output settings for AVAssetReaderTrackOutput ────────────────────────────
+// ─── Canvas dimension keys (Phase 7.9 aspect-fit normalization) ──────────────
+// When present and non-zero, the compositor overrides
+// AVMutableVideoComposition.renderSize and applies an aspect-fit affine
+// transform via AVMutableVideoCompositionLayerInstruction so that decoded
+// frames are mapped into the target canvas rectangle (letterbox/pillarbox).
+// When absent or zero, the compositor falls back to the legacy behavior of
+// forwarding the asset's native display-size buffers unchanged.
+static NSString *const kVGTCNCanvasWidthKey = @"canvasWidth";
+static NSString *const kVGTCNCanvasHeightKey = @"canvasHeight";
+
+// ─── Output settings for AVAssetReaderVideoCompositionOutput ─────────────────
 // Match VGExportFileSourceNode output settings: 32BGRA + Metal + IOSurface.
 // Same pixel format as the playback path (VanguardFileMediaSource) for
 // downstream renderer compatibility.
@@ -149,11 +175,16 @@ static os_log_t sTimelineLog;
 // Holds the active AVAssetReader + output for a single clip.
 // Created lazily; torn down and rebuilt on seek or clip switch.
 // _reader and _trackOutput are only valid while _reader.status == Reading.
+//
+// Phase 7.9: trackOutput is typed as AVAssetReaderOutput (base class) because
+// AVAssetReaderVideoCompositionOutput is not an AVAssetReaderTrackOutput.
+// copyNextSampleBuffer is declared on AVAssetReaderOutput, so the existing
+// call site at pullFrame: continues to work without modification.
 @interface _VGClipReader : NSObject
 @property(nonatomic) NSUInteger clipIndex; // index in _clips
 @property(nonatomic) AVAssetReader *reader;
-@property(nonatomic) AVAssetReaderTrackOutput *trackOutput;
-@property(nonatomic) double sourceFPS; // nominal frame rate
+@property(nonatomic) AVAssetReaderOutput *trackOutput; // Phase 7.9: base type
+@property(nonatomic) double sourceFPS;                 // nominal frame rate
 @end
 
 @implementation _VGClipReader
@@ -202,6 +233,11 @@ static os_log_t sTimelineLog;
   // ── Total timeline duration ───────────────────────────────────────────────
   // Pre-computed at prepare time: end time of the last clip.
   double _totalTimelineDuration;
+
+  // ── Target canvas dimensions (Phase 7.9) ─────────────────────────────────
+  // Non-zero: aspect-fit source frames into this canvas via layer instruction.
+  // Zero (CGSizeZero): legacy bypass — forward asset-native buffers unchanged.
+  CGSize _targetRenderSize;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -412,6 +448,20 @@ static os_log_t sTimelineLog;
   atomic_store(&_generation, 0);
   atomic_store(&_invalidated, 0);
 
+  // ── Phase 7.9: Parse canvas dimensions for aspect-fit normalization ────────
+  // canvasWidth/canvasHeight are optional. When present and both > 0, the
+  // compositor will override AVMutableVideoComposition.renderSize and apply
+  // an aspect-fit layer instruction in _buildReaderForClipIndex:.
+  // When absent or zero (legacy playground / smoke tests), buffers are
+  // forwarded at the asset's native display size (backward compatible).
+  NSNumber *cw = parameters[kVGTCNCanvasWidthKey];
+  NSNumber *ch = parameters[kVGTCNCanvasHeightKey];
+  if (cw && ch && cw.intValue > 0 && ch.intValue > 0) {
+    _targetRenderSize = CGSizeMake(cw.intValue, ch.intValue);
+  } else {
+    _targetRenderSize = CGSizeZero;
+  }
+
   // Pre-compute total timeline duration from the last clip's end.
   // Used for EOS detection.
   VGClipDescriptor *lastClip = _clips.lastObject;
@@ -419,8 +469,9 @@ static os_log_t sTimelineLog;
       lastClip.startTimeSeconds + lastClip.timelineDuration;
 
   os_log(sTimelineLog,
-         "[VGTCNode] init: nodeId=%{public}@ clips=%lu totalDuration=%.3fs",
-         _nodeId, (unsigned long)_clips.count, _totalTimelineDuration);
+         "[VGTCNode] init: nodeId=%{public}@ clips=%lu totalDuration=%.3fs canvas=%.0fx%.0f",
+         _nodeId, (unsigned long)_clips.count, _totalTimelineDuration,
+         _targetRenderSize.width, _targetRenderSize.height);
 
   return self;
 }
@@ -711,7 +762,7 @@ static os_log_t sTimelineLog;
     _lastDeliveredBuffer = NULL;
   }
 
-  // ── Pull next sample from AVAssetReaderTrackOutput ────────────────────────
+  // ── Pull next sample from AVAssetReaderOutput (Phase 7.9: VideoCompositionOutput) ──
   // copyNextSampleBuffer returns +1 CMSampleBufferRef.
   // Returns NULL when exhausted (reader.status → Completed) or on error.
   CMSampleBufferRef sample = [_activeReader.trackOutput copyNextSampleBuffer];
@@ -814,14 +865,22 @@ static os_log_t sTimelineLog;
 #pragma mark - Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build an AVAssetReader and AVAssetReaderTrackOutput for the clip at
-/// `clipIndex`, starting at asset-local time `startTimeSecs`.
+/// Build an AVAssetReader and AVAssetReaderVideoCompositionOutput for the clip
+/// at `clipIndex`, starting at asset-local time `startTimeSecs`.
 ///
 /// Apple Framework Contract:
 ///   AVAssetReader is forward-only; timeRange is set BEFORE startReading.
 ///   alwaysCopiesSampleData = NO: returns original decoded buffers (read-only).
 ///   Output settings: 32BGRA + MetalCompatibility + IOSurface (same as export
 ///   path).
+///   videoComposition must be assigned before startReading.
+///
+/// Phase 7.9 — Orientation normalization (DEC-142, RR-141):
+///   Uses AVMutableVideoComposition videoCompositionWithPropertiesOfAsset: to
+///   apply each track's preferredTransform at decode time. Camera-produced
+///   clips (DEC-132) carry identity transform and pass through unchanged.
+///   Imported portrait .mov/.mp4 files (RR-141) are normalized to correct
+///   orientation. No manual CPU/GPU rotation is added.
 ///
 /// @param clipIndex     Index into _clips.
 /// @param startTimeSecs Asset-local time (trimStartSeconds + speed-adjusted
@@ -903,21 +962,134 @@ static os_log_t sTimelineLog;
   }
   // else: zero-length range → reader will complete immediately (EOS).
 
-  // ── Create AVAssetReaderTrackOutput ───────────────────────────────────────
+  // ── Phase 7.9: AVMutableVideoComposition for orientation normalization ───────
+  //
+  // AVAssetReaderTrackOutput vends raw encoded-orientation pixel buffers and
+  // ignores AVAssetTrack.preferredTransform. Imported portrait .mov/.mp4 files
+  // carry a 90°/270° preferredTransform and rendered sideways before this fix.
+  //
+  // AVAssetReaderVideoCompositionOutput applies the video composition
+  // instructions (which include preferredTransform) at decode time, producing
+  // orientation-normalized BGRA pixel buffers.
+  //
+  // Camera-produced clips (DEC-132) carry identity preferredTransform. The
+  // video composition applies no rotation; decoded frames are unchanged. No
+  // double rotation occurs.
+  //
+  // DEADLOCK NOTE (ref: VanguardFileMediaSource.m G-02-T3):
+  // AVAssetReaderVideoCompositionOutput.copyNextSampleBuffer dispatches to
+  // main for each frame composition. This caused deadlocks in
+  // VanguardFileMediaSource because it used a fast-forward discard loop
+  // (60+ copyNextSampleBuffer calls during seek storms). That pattern does
+  // NOT apply here: VGTimelineCompositorNode sets AVAssetReader.timeRange
+  // before startReading to position the reader at the correct start time.
+  // pullFrame: calls copyNextSampleBuffer at most once per frame. The
+  // deadlock prerequisite (tight discard loop on background queue) is absent.
+  //
+  // ── Phase 7.9 Aspect-Fit Normalization ──────────────────────────────────────
+  //
+  // When _targetRenderSize is non-zero (canvasWidth/canvasHeight supplied via
+  // parameters), we override the auto-generated video composition with manual
+  // instructions that:
+  //   1. Set renderSize to _targetRenderSize (the draft canvas, e.g. 640×360).
+  //   2. Compute an aspect-fit affine transform that maps the source frame
+  //      (after preferredTransform rotation) into the canvas rectangle.
+  //   3. Apply this transform via AVMutableVideoCompositionLayerInstruction.
+  //
+  // This produces pixel buffers at the canvas size with the source frame
+  // aspect-fit centered (letterbox for landscape-in-portrait, pillarbox for
+  // portrait-in-landscape). No cropping, no stretching.
+  //
+  // When _targetRenderSize is CGSizeZero (legacy/smoke-test paths), the
+  // auto-generated composition from videoCompositionWithPropertiesOfAsset:
+  // is used unchanged, preserving backward compatibility.
+  //
+  // API deprecation: videoCompositionWithPropertiesOfAsset: is deprecated in
+  // iOS 18.0 (async completionHandler: variant is preferred). The synchronous
+  // variant (iOS 6.0+) is used here because _buildReaderForClipIndex: is
+  // called synchronously from the pull queue. Migrating to the async API
+  // would require significant restructuring of the reader build path and is
+  // deferred. The deprecated API remains fully functional through current iOS.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  AVMutableVideoComposition *videoComposition =
+      [AVMutableVideoComposition videoCompositionWithPropertiesOfAsset:asset];
+#pragma clang diagnostic pop
+
+  // ── Apply aspect-fit canvas normalization when _targetRenderSize is set ──────
+  if (_targetRenderSize.width > 0 && _targetRenderSize.height > 0) {
+    // Step 1: Compute display dimensions after applying preferredTransform.
+    CGAffineTransform preferredTx = videoTrack.preferredTransform;
+    CGSize naturalSize = videoTrack.naturalSize;
+    CGRect displayRect =
+        CGRectApplyAffineTransform(CGRectMake(0, 0, naturalSize.width,
+                                              naturalSize.height),
+                                  preferredTx);
+    CGFloat displayW = fabs(displayRect.size.width);
+    CGFloat displayH = fabs(displayRect.size.height);
+
+    // Step 2: Compute aspect-fit scale (min, not max — no cropping).
+    CGFloat canvasW = _targetRenderSize.width;
+    CGFloat canvasH = _targetRenderSize.height;
+    CGFloat fitScale = 1.0;
+    if (displayW > 0 && displayH > 0) {
+      fitScale = MIN(canvasW / displayW, canvasH / displayH);
+    }
+
+    // Step 3: Center-translate the scaled frame within the canvas.
+    CGFloat tx = (canvasW - displayW * fitScale) / 2.0;
+    CGFloat ty = (canvasH - displayH * fitScale) / 2.0;
+
+    // Step 4: Compose: preferredTransform → uniform scale → center translate.
+    CGAffineTransform fitTransform =
+        CGAffineTransformConcat(
+            preferredTx,
+            CGAffineTransformConcat(
+                CGAffineTransformMakeScale(fitScale, fitScale),
+                CGAffineTransformMakeTranslation(tx, ty)));
+
+    // Step 5: Build layer instruction with the computed transform.
+    AVMutableVideoCompositionLayerInstruction *layerInstruction =
+        [AVMutableVideoCompositionLayerInstruction
+            videoCompositionLayerInstructionWithAssetTrack:videoTrack];
+    [layerInstruction setTransform:fitTransform atTime:kCMTimeZero];
+
+    AVMutableVideoCompositionInstruction *instruction =
+        [AVMutableVideoCompositionInstruction videoCompositionInstruction];
+    instruction.timeRange =
+        CMTimeRangeMake(kCMTimeZero, asset.duration);
+    instruction.layerInstructions = @[layerInstruction];
+
+    // Step 6: Override composition renderSize and instructions.
+    videoComposition.renderSize = _targetRenderSize;
+    videoComposition.instructions = @[instruction];
+
+    os_log(sTimelineLog,
+           "[VGTCNode] aspect-fit: clip=%lu display=%.0fx%.0f "
+           "canvas=%.0fx%.0f scale=%.4f tx=%.1f ty=%.1f",
+           (unsigned long)clipIndex, displayW, displayH,
+           canvasW, canvasH, fitScale, tx, ty);
+  }
+
   NSDictionary *outputSettings = _VGTCNOutputSettings();
-  AVAssetReaderTrackOutput *output =
-      [[AVAssetReaderTrackOutput alloc] initWithTrack:videoTrack
-                                       outputSettings:outputSettings];
+  AVAssetReaderVideoCompositionOutput *output =
+      [[AVAssetReaderVideoCompositionOutput alloc]
+          initWithVideoTracks:@[videoTrack]
+               videoSettings:outputSettings];
+
+  // videoComposition must be set BEFORE startReading (Apple requirement).
+  output.videoComposition = videoComposition;
 
   // alwaysCopiesSampleData = NO: vend original decoded buffers (read-only).
   // Avoids per-frame allocation. Matches VGExportFileSourceNode pattern.
+  // (Property is declared on AVAssetReaderOutput base class.)
   output.alwaysCopiesSampleData = NO;
 
   if (![reader canAddOutput:output]) {
     if (outError) {
       *outError = _VGTCNError(
           14, ([NSString stringWithFormat:@"VGTimelineCompositorNode: cannot "
-                                          @"add AVAssetReaderTrackOutput "
+                                          @"add AVAssetReaderVideoCompositionOutput "
                                            "for clip %@.",
                                           clip.clipId]));
     }
@@ -934,9 +1106,17 @@ static os_log_t sTimelineLog;
   }
 
   // ── Compute source FPS ────────────────────────────────────────────────────
-  // Fallback to 30.0 if track reports 0 (matches VGExportFileSourceNode).
-  double sourceFPS =
-      videoTrack.nominalFrameRate > 0 ? videoTrack.nominalFrameRate : 30.0;
+  // Phase 7.9: prefer videoComposition.frameDuration when valid (it is set
+  // by videoCompositionWithPropertiesOfAsset: based on track properties).
+  // Fall back to track nominalFrameRate, then 30.0 fps.
+  double sourceFPS = 30.0;
+  if (videoComposition &&
+      CMTIME_IS_VALID(videoComposition.frameDuration) &&
+      CMTimeGetSeconds(videoComposition.frameDuration) > 0.0) {
+    sourceFPS = 1.0 / CMTimeGetSeconds(videoComposition.frameDuration);
+  } else if (videoTrack.nominalFrameRate > 0.0f) {
+    sourceFPS = videoTrack.nominalFrameRate;
+  }
 
   _VGClipReader *clipReader = [[_VGClipReader alloc] init];
   clipReader.clipIndex = clipIndex;
