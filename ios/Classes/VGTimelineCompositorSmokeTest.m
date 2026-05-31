@@ -302,7 +302,9 @@ static BOOL _generateSyntheticVideo(NSString *path,
                                trimStartSeconds:0.0
                                  trimEndSeconds:5.0
                                            speed:1.0
-                                       transform:nil];
+                                       transform:nil
+                                         fitMode:VGStillImageFitModeFit  // default; video clip
+                                        cropRect:nil];                    // no crop; video clip
 
     // Clip B: 5.0s duration, starts at 5.0s on timeline, trim [0, 5], speed 1.0
     VGClipDescriptor *clipB =
@@ -314,7 +316,9 @@ static BOOL _generateSyntheticVideo(NSString *path,
                                trimStartSeconds:0.0
                                  trimEndSeconds:5.0
                                            speed:1.0
-                                       transform:nil];
+                                       transform:nil
+                                         fitMode:VGStillImageFitModeFit  // default; video clip
+                                        cropRect:nil];                    // no crop; video clip
 
     if (![clipA isValid] || ![clipB isValid]) {
         log(@"  ❌ Clip descriptor validation failed");
@@ -1018,6 +1022,154 @@ static BOOL _generateMovingPatternVideo(NSString *path,
     return @{ @"clipAPath": pathA, @"clipBPath": pathB };
 }
 
+// ── Phase 7.16: Still-image fit/fill/crop smoke test ──────────────────────────────
+//
+// Validates VGClipDescriptor fitMode/cropRect serialization and native validation
+// via +fromDictionary:. Does NOT require a real PNG on disk; it exercises the
+// Objective-C contract layer only (no compositor execution).
+
++ (NSDictionary<NSString *, id> *)runStillImageFitCropSmokeTest {
+    NSMutableArray<NSDictionary *> *steps = [NSMutableArray array];
+    NSMutableArray<NSString *> *logs = [NSMutableArray array];
+    __block BOOL overallSuccess = YES;
+
+    void (^log)(NSString *) = ^(NSString *msg) {
+        [logs addObject:msg];
+        os_log(sSmokeLog, "[7.16] %{public}@", msg);
+    };
+    void (^step)(NSString *, BOOL, NSString *) = ^(NSString *name, BOOL passed, NSString *detail) {
+        if (!passed) overallSuccess = NO;
+        [steps addObject:_stepResult(name, passed, detail)];
+    };
+
+    log(@"Phase 7.16 Still-Image Fit/Crop Smoke Test");
+    log(@"Tests VGClipDescriptor fitMode/cropRect contract via fromDictionary:");
+    log(@"");
+
+    // ─── Test 1: fitMode=fill round-trip ─────────────────────────────────────
+    log(@"Test 1: fitMode=fill serialises and deserialises via fromDictionary:");
+    {
+        // Build a dictionary with fitMode=fill (image clip).
+        NSDictionary *dict = @{
+            @"id"               : @"img-fill-7.16",
+            @"sourcePath"       : @"/tmp/smoke_still.png", // path only checked by compositor
+            @"mediaKind"        : @"image",
+            @"startTimeSeconds" : @0.0,
+            @"durationSeconds"  : @5.0,
+            @"trimStartSeconds" : @0.0,
+            @"trimEndSeconds"   : @5.0,
+            @"speed"            : @1.0,
+            @"fitMode"          : @"fill",
+        };
+        VGClipDescriptor *clip = [VGClipDescriptor fromDictionary:dict];
+        BOOL passed = (clip != nil && clip.fitMode == VGStillImageFitModeFill && clip.cropRect == nil);
+        if (passed) {
+            log(@"  ✅ fitMode=fill: fromDictionary: returned non-nil descriptor with fitMode=fill");
+        } else {
+            log([NSString stringWithFormat:
+                 @"  ❌ fitMode=fill: fromDictionary: returned %@ (fitMode=%ld)",
+                 clip ?: (id)@"nil", (long)(clip ? clip.fitMode : -1)]);
+        }
+        step(@"fitMode=fill round-trip", passed, passed
+             ? @"VGStillImageFitModeFill deserialized correctly"
+             : @"fromDictionary: returned nil or wrong fitMode");
+    }
+
+    // ─── Test 2: cropRect=[0.2,0.2,0.6,0.6] + fitMode=fit round-trip ─────────
+    log(@"");
+    log(@"Test 2: cropRect=[0.2,0.2,0.6,0.6] + fitMode=fit (default) round-trip:");
+    {
+        NSDictionary *dict = @{
+            @"id"               : @"img-crop-7.16",
+            @"sourcePath"       : @"/tmp/smoke_still.png",
+            @"mediaKind"        : @"image",
+            @"startTimeSeconds" : @0.0,
+            @"durationSeconds"  : @5.0,
+            @"trimStartSeconds" : @0.0,
+            @"trimEndSeconds"   : @5.0,
+            @"speed"            : @1.0,
+            // fitMode omitted — should default to fit
+            @"cropRect"         : @[ @0.2, @0.2, @0.6, @0.6 ],
+        };
+        VGClipDescriptor *clip = [VGClipDescriptor fromDictionary:dict];
+        BOOL rectOK = NO;
+        if (clip.cropRect.count == 4) {
+            double x = [clip.cropRect[0] doubleValue];
+            double y = [clip.cropRect[1] doubleValue];
+            double w = [clip.cropRect[2] doubleValue];
+            double h = [clip.cropRect[3] doubleValue];
+            rectOK = (fabs(x - 0.2) < 1e-9 && fabs(y - 0.2) < 1e-9 &&
+                      fabs(w - 0.6) < 1e-9 && fabs(h - 0.6) < 1e-9);
+        }
+        BOOL passed = (clip != nil && clip.fitMode == VGStillImageFitModeFit && rectOK);
+        if (passed) {
+            log(@"  ✅ cropRect+fit: fromDictionary: returned non-nil descriptor with correct values");
+        } else {
+            log([NSString stringWithFormat:
+                 @"  ❌ cropRect+fit: clip=%@ fitMode=%ld cropRect=%@ rectOK=%d",
+                 clip ?: (id)@"nil", (long)(clip ? clip.fitMode : -1),
+                 clip.cropRect ?: (id)@"nil", rectOK]);
+        }
+        step(@"cropRect+fit round-trip", passed, passed
+             ? @"cropRect=[0.2,0.2,0.6,0.6] and fitMode=fit deserialized correctly"
+             : @"fromDictionary: returned nil or wrong values");
+    }
+
+    // ─── Test 3: Invalid cropRect rejected by fromDictionary: ─────────────────
+    log(@"");
+    log(@"Test 3: Invalid cropRect=[0.8,0.8,0.5,0.5] must be rejected (x+w=1.3>1.0, y+h=1.3>1.0):");
+    {
+        NSDictionary *dict = @{
+            @"id"               : @"img-invalid-crop-7.16",
+            @"sourcePath"       : @"/tmp/smoke_still.png",
+            @"mediaKind"        : @"image",
+            @"startTimeSeconds" : @0.0,
+            @"durationSeconds"  : @5.0,
+            @"trimStartSeconds" : @0.0,
+            @"trimEndSeconds"   : @5.0,
+            @"speed"            : @1.0,
+            @"cropRect"         : @[ @0.8, @0.8, @0.5, @0.5 ], // x+w=1.3>1.0 — invalid
+        };
+        VGClipDescriptor *clip = [VGClipDescriptor fromDictionary:dict];
+        BOOL passed = (clip == nil); // must return nil for invalid crop
+        if (passed) {
+            log(@"  ✅ Invalid cropRect correctly rejected (fromDictionary: returned nil)");
+        } else {
+            log([NSString stringWithFormat:
+                 @"  ❌ Invalid cropRect was NOT rejected (fromDictionary: returned non-nil: %@)",
+                 clip]);
+        }
+        step(@"Invalid cropRect rejection", passed, passed
+             ? @"fromDictionary: returned nil for x+w>1.0 cropRect"
+             : @"fromDictionary: should have returned nil but did not");
+    }
+
+    // ─── Summary ──────────────────────────────────────────────────────────────
+    log(@"");
+    log(@"═══════════════════════════════════════════════════════");
+    if (overallSuccess) {
+        log(@"  ✅ ALL PHASE 7.16 NATIVE TESTS PASSED");
+    } else {
+        log(@"  ❌ SOME PHASE 7.16 NATIVE TESTS FAILED");
+    }
+    log(@"═══════════════════════════════════════════════════════");
+
+    NSMutableDictionary *result = [@{
+        @"success": @(overallSuccess),
+        @"steps": [steps copy],
+        @"logs": [logs copy],
+    } mutableCopy];
+    if (!overallSuccess) {
+        for (NSDictionary *s in steps) {
+            if (![s[@"passed"] boolValue]) {
+                result[@"error"] = s[@"detail"];
+                break;
+            }
+        }
+    }
+    return [result copy];
+}
+
 @end
 
 #else // !DEBUG
@@ -1051,7 +1203,18 @@ static BOOL _generateMovingPatternVideo(NSString *path,
     return nil;
 }
 
++ (NSDictionary<NSString *, id> *)runStillImageFitCropSmokeTest {
+    // Phase 7.16 still-image fit/crop test is DEBUG-only.
+    return @{
+        @"success": @NO,
+        @"steps": @[],
+        @"logs": @[@"Release build — still-image fit/crop smoke test disabled"],
+        @"error": @"VGTimelineCompositorSmokeTest.runStillImageFitCropSmokeTest is DEBUG-only",
+    };
+}
+
 @end
 
 #endif // DEBUG
+
 

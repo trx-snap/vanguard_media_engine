@@ -674,6 +674,292 @@ void main() {
       final clip = _imageClip(trimStart: 0.0, trimEnd: 3.5);
       expect(clip.timelineDuration, closeTo(3.5, 1e-10));
     });
+
+    // ── Phase 7.16: VGStillImageFitMode and cropRect ─────────────────────────
+    // Tests added by Phase 7.16 Implementer.
+
+    test('IK-8  fitMode defaults to VGStillImageFitMode.fit', () {
+      final clip = _imageClip();
+      expect(clip.fitMode, VGStillImageFitMode.fit);
+    });
+
+    test('IK-9  cropRect defaults to null', () {
+      final clip = _imageClip();
+      expect(clip.cropRect, isNull);
+      expect(clip.cropX, isNull);
+      expect(clip.cropY, isNull);
+      expect(clip.cropWidth, isNull);
+      expect(clip.cropHeight, isNull);
+    });
+
+    test('IK-10 fitMode=fill serialises to "fill" in toMap()', () {
+      final clip = VGClipDescriptor(
+        id: 'img-fill',
+        sourcePath: '/tmp/img.jpg',
+        mediaKind: VGMediaKind.image,
+        durationSeconds: 3.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 3.0,
+        fitMode: VGStillImageFitMode.fill,
+      );
+      final m = clip.toMap();
+      expect(m['fitMode'], 'fill');
+    });
+
+    test('IK-11 fitMode=fit is omitted from toMap() (default omit style)', () {
+      final clip = _imageClip();
+      final m = clip.toMap();
+      expect(m.containsKey('fitMode'), isFalse);
+    });
+
+    test('IK-12 fitMode round-trip via fromMap() preserves fill', () {
+      final original = VGClipDescriptor(
+        id: 'img-rt-fill',
+        sourcePath: '/tmp/img.jpg',
+        mediaKind: VGMediaKind.image,
+        durationSeconds: 5.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 5.0,
+        fitMode: VGStillImageFitMode.fill,
+      );
+      final clone = VGClipDescriptor.fromMap(
+          Map<Object?, Object?>.from(original.toMap()));
+      expect(clone, isNotNull);
+      expect(clone!.fitMode, VGStillImageFitMode.fill);
+    });
+
+    test('IK-13 fitMode defaults to fit when key absent in fromMap()', () {
+      final m = _imageClip().toMap()..remove('fitMode');
+      final clip =
+          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNotNull);
+      expect(clip!.fitMode, VGStillImageFitMode.fit);
+    });
+
+    test('IK-14 unknown fitMode string resolves to fit (safe default)', () {
+      final m = _imageClip().toMap();
+      m['fitMode'] = 'stretch'; // unrecognised
+      final clip =
+          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNotNull);
+      expect(clip!.fitMode, VGStillImageFitMode.fit);
+    });
+
+    test('IK-15 cropRect [0.1, 0.2, 0.6, 0.5] round-trip via fromMap()', () {
+      final original = VGClipDescriptor(
+        id: 'img-crop',
+        sourcePath: '/tmp/img.jpg',
+        mediaKind: VGMediaKind.image,
+        durationSeconds: 4.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 4.0,
+        cropRect: [0.1, 0.2, 0.6, 0.5],
+      );
+      final clone = VGClipDescriptor.fromMap(
+          Map<Object?, Object?>.from(original.toMap()));
+      expect(clone, isNotNull);
+      expect(clone!.cropRect, isNotNull);
+      expect(clone.cropRect, hasLength(4));
+      expect(clone.cropX, closeTo(0.1, 1e-10));
+      expect(clone.cropY, closeTo(0.2, 1e-10));
+      expect(clone.cropWidth, closeTo(0.6, 1e-10));
+      expect(clone.cropHeight, closeTo(0.5, 1e-10));
+    });
+
+    test('IK-16 cropRect null is omitted from toMap()', () {
+      final m = _imageClip().toMap();
+      expect(m.containsKey('cropRect'), isFalse);
+    });
+
+    test('IK-17 copyWith preserves fitMode when not overridden', () {
+      final clip = VGClipDescriptor(
+        id: 'img-cw',
+        sourcePath: '/tmp/img.jpg',
+        mediaKind: VGMediaKind.image,
+        durationSeconds: 3.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 3.0,
+        fitMode: VGStillImageFitMode.fill,
+        cropRect: [0.1, 0.1, 0.8, 0.8],
+      );
+      final copy = clip.copyWith(id: 'img-cw-2');
+      expect(copy.fitMode, VGStillImageFitMode.fill);
+      expect(copy.cropRect, [0.1, 0.1, 0.8, 0.8]);
+    });
+
+    test('IK-18 copyWith can update fitMode', () {
+      final clip = _imageClip();
+      final copy = clip.copyWith(fitMode: VGStillImageFitMode.fill);
+      expect(copy.fitMode, VGStillImageFitMode.fill);
+    });
+
+    test('IK-19 copyWith can clear cropRect to null via sentinel', () {
+      final clip = VGClipDescriptor(
+        id: 'img-sentinel',
+        sourcePath: '/tmp/img.jpg',
+        mediaKind: VGMediaKind.image,
+        durationSeconds: 3.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 3.0,
+        cropRect: [0.0, 0.0, 1.0, 1.0],
+      );
+      final cleared = clip.copyWith(cropRect: null);
+      expect(cleared.cropRect, isNull);
+    });
+
+    test('IK-20 equality includes fitMode and cropRect', () {
+      final a = VGClipDescriptor(
+        id: 'eq-a',
+        sourcePath: '/tmp/img.jpg',
+        mediaKind: VGMediaKind.image,
+        durationSeconds: 3.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 3.0,
+        fitMode: VGStillImageFitMode.fill,
+        cropRect: [0.1, 0.1, 0.5, 0.5],
+      );
+      final b = VGClipDescriptor(
+        id: 'eq-a',
+        sourcePath: '/tmp/img.jpg',
+        mediaKind: VGMediaKind.image,
+        durationSeconds: 3.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 3.0,
+        fitMode: VGStillImageFitMode.fill,
+        cropRect: [0.1, 0.1, 0.5, 0.5],
+      );
+      expect(a, equals(b));
+      expect(a.hashCode, b.hashCode);
+    });
+
+    test('IK-21 equality differs when fitMode differs', () {
+      final a = _imageClip();
+      final b = VGClipDescriptor(
+        id: a.id,
+        sourcePath: a.sourcePath,
+        mediaKind: a.mediaKind,
+        durationSeconds: a.durationSeconds,
+        trimStartSeconds: a.trimStartSeconds,
+        trimEndSeconds: a.trimEndSeconds,
+        fitMode: VGStillImageFitMode.fill,
+      );
+      expect(a == b, isFalse);
+    });
+
+    test('IK-22 equality differs when cropRect differs', () {
+      final base = VGClipDescriptor(
+        id: 'eq-crop',
+        sourcePath: '/tmp/img.jpg',
+        mediaKind: VGMediaKind.image,
+        durationSeconds: 3.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 3.0,
+        cropRect: [0.1, 0.1, 0.5, 0.5],
+      );
+      final other = VGClipDescriptor(
+        id: 'eq-crop',
+        sourcePath: '/tmp/img.jpg',
+        mediaKind: VGMediaKind.image,
+        durationSeconds: 3.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 3.0,
+        cropRect: [0.2, 0.2, 0.5, 0.5],
+      );
+      expect(base == other, isFalse);
+    });
+
+    // ── Crop rect validation ──────────────────────────────────────────────────
+
+    test('CV-1  cropRect with wrong length (3 elements) is rejected by fromMap()', () {
+      final m = _imageClip().toMap();
+      m['cropRect'] = [0.1, 0.1, 0.8]; // length 3 — invalid
+      final clip =
+          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNull);
+    });
+
+    test('CV-2  cropRect with length 5 is rejected by fromMap()', () {
+      final m = _imageClip().toMap();
+      m['cropRect'] = [0.1, 0.1, 0.5, 0.5, 0.0]; // length 5 — invalid
+      final clip =
+          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNull);
+    });
+
+    test('CV-3  cropRect with x < 0 is rejected by fromMap()', () {
+      final m = _imageClip().toMap();
+      m['cropRect'] = [-0.1, 0.0, 0.5, 0.5];
+      final clip =
+          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNull);
+    });
+
+    test('CV-4  cropRect with width == 0 is rejected by fromMap()', () {
+      final m = _imageClip().toMap();
+      m['cropRect'] = [0.0, 0.0, 0.0, 0.5];
+      final clip =
+          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNull);
+    });
+
+    test('CV-5  cropRect with height == 0 is rejected by fromMap()', () {
+      final m = _imageClip().toMap();
+      m['cropRect'] = [0.0, 0.0, 0.5, 0.0];
+      final clip =
+          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNull);
+    });
+
+    test('CV-6  cropRect x + width > 1.0 is rejected by fromMap()', () {
+      final m = _imageClip().toMap();
+      m['cropRect'] = [0.8, 0.0, 0.5, 0.5]; // 0.8 + 0.5 = 1.3 > 1.0
+      final clip =
+          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNull);
+    });
+
+    test('CV-7  cropRect y + height > 1.0 is rejected by fromMap()', () {
+      final m = _imageClip().toMap();
+      m['cropRect'] = [0.0, 0.8, 0.5, 0.5]; // 0.8 + 0.5 = 1.3 > 1.0
+      final clip =
+          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNull);
+    });
+
+    test('CV-8  cropRect with value > 1.0 is rejected by fromMap()', () {
+      final m = _imageClip().toMap();
+      m['cropRect'] = [0.0, 0.0, 1.5, 0.5]; // width 1.5 out of range
+      final clip =
+          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNull);
+    });
+
+    test('CV-9  valid cropRect [0.0, 0.0, 1.0, 1.0] (full frame) is accepted', () {
+      final clip = VGClipDescriptor(
+        id: 'cv-full',
+        sourcePath: '/tmp/img.jpg',
+        mediaKind: VGMediaKind.image,
+        durationSeconds: 3.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 3.0,
+        cropRect: [0.0, 0.0, 1.0, 1.0],
+      );
+      expect(clip.cropRect, isNotNull);
+    });
+
+    test('CV-10 VGStillImageFitMode.fromValue("fill") resolves to fill', () {
+      expect(
+          VGStillImageFitMode.fromValue('fill'), VGStillImageFitMode.fill);
+    });
+
+    test('CV-11 VGStillImageFitMode.fromValue("fit") resolves to fit', () {
+      expect(VGStillImageFitMode.fromValue('fit'), VGStillImageFitMode.fit);
+    });
+
+    test('CV-12 VGStillImageFitMode.fromValue unknown string resolves to fit', () {
+      expect(
+          VGStillImageFitMode.fromValue('stretch'), VGStillImageFitMode.fit);
+    });
   });
 }
 
@@ -695,3 +981,35 @@ void main() {
 //   IK-7  Still-image VGClipDescriptor.timelineDuration equals (trimEnd - trimStart).
 // Note: These tests exercise only Dart-layer descriptor logic.
 //       Native compositor image decoding is validated via manual device test (still_C.png).
+
+// ─── Phase 7.16: VGStillImageFitMode and cropRect ────────────────────────────
+// Added by Phase 7.16 Implementer.
+// Tests IK-8 through IK-22 and CV-1 through CV-12 above cover:
+//   IK-8   Default fitMode is fit.
+//   IK-9   Default cropRect is null. Convenience accessors return null.
+//   IK-10  fitMode=fill serialises to "fill" key.
+//   IK-11  fitMode=fit (default) is omitted from toMap().
+//   IK-12  fitMode fill round-trips via fromMap().
+//   IK-13  Missing fitMode key in fromMap() defaults to fit.
+//   IK-14  Unknown fitMode string in fromMap() defaults to fit.
+//   IK-15  cropRect round-trip via fromMap() with correct values.
+//   IK-16  Null cropRect is omitted from toMap().
+//   IK-17  copyWith preserves fitMode and cropRect when not overridden.
+//   IK-18  copyWith can update fitMode.
+//   IK-19  copyWith can clear cropRect to null using sentinel.
+//   IK-20  Equality includes fitMode and cropRect.
+//   IK-21  Equality differs when fitMode differs.
+//   IK-22  Equality differs when cropRect differs.
+//   CV-1   cropRect length != 4 (3 elements) rejected by fromMap().
+//   CV-2   cropRect length != 4 (5 elements) rejected by fromMap().
+//   CV-3   cropRect x < 0 rejected by fromMap().
+//   CV-4   cropRect width == 0 rejected by fromMap().
+//   CV-5   cropRect height == 0 rejected by fromMap().
+//   CV-6   cropRect x + width > 1.0 rejected by fromMap().
+//   CV-7   cropRect y + height > 1.0 rejected by fromMap().
+//   CV-8   cropRect value > 1.0 rejected by fromMap().
+//   CV-9   Valid full-frame cropRect [0,0,1,1] accepted.
+//   CV-10  VGStillImageFitMode.fromValue("fill") resolves to fill.
+//   CV-11  VGStillImageFitMode.fromValue("fit") resolves to fit.
+//   CV-12  VGStillImageFitMode.fromValue unknown string resolves to fit.
+

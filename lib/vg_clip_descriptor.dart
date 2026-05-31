@@ -1,5 +1,5 @@
 // vg_clip_descriptor.dart
-// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11
+// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11 / Phase 7.16
 //
 // Non-destructive clip descriptor for the UMF V2 timeline editor.
 //
@@ -17,6 +17,15 @@
 //   - Null means identity (no transform applied by the compositor).
 //   - Serialised in toMap() under key 'transform' only when non-null.
 //
+// Phase 7.16 addition (DEC-148):
+//   - [fitMode]: VGStillImageFitMode — how a still image is scaled to fill the
+//     canvas. Defaults to [VGStillImageFitMode.fit]. Applies ONLY to clips with
+//     [VGMediaKind.image]; video fit/fill is Phase 8 canvas scope.
+//   - [cropRect]: Optional normalized [x, y, width, height] in [0.0, 1.0].
+//     Applied at decode time (baked into the static buffer cache). Null = no crop.
+//   - Both fields are omitted from toMap() when default/null.
+//   - Do NOT add these fields to VGClipTransformDescriptor.
+//
 // Serialisation:
 //   toMap() produces a JSON-compatible map:
 //   {
@@ -29,9 +38,46 @@
 //     'trimEndSeconds': double,
 //     'speed': double,
 //     'transform': Map?,         // Phase 7.11: optional, omitted when null
+//     'fitMode': String?,        // Phase 7.16: omitted when 'fit' (default)
+//     'cropRect': List<double>?, // Phase 7.16: omitted when null
 //   }
 
 import 'vg_clip_transform_descriptor.dart';
+
+// ── VGStillImageFitMode ──────────────────────────────────────────────────────
+
+/// How a still-image clip is scaled to fill the compositor canvas.
+///
+/// Applied at decode time — baked into the static buffer cache (DEC-148).
+/// This applies **only** to [VGMediaKind.image] clips in Phase 7.16.
+/// Video fit/fill belongs to the Phase 8 canvas system.
+///
+/// Wire values match the native `VGStillImageFitMode` enum in `VGClipDescriptor.h`.
+enum VGStillImageFitMode {
+  /// Scale image proportionally to fit within the canvas. Black bars
+  /// (letterbox / pillarbox) appear when the image and canvas aspect ratios differ.
+  /// This is the default.
+  fit('fit'),
+
+  /// Scale image proportionally to fill the canvas completely. The image is
+  /// centered; excess pixels are cropped by the canvas bounds. No black bars.
+  fill('fill');
+
+  const VGStillImageFitMode(this.value);
+
+  /// The wire-format string value as sent over MethodChannel and in toMap().
+  final String value;
+
+  /// Resolves a wire-format string to the corresponding [VGStillImageFitMode].
+  ///
+  /// Returns [VGStillImageFitMode.fit] for unrecognised strings (safe default).
+  static VGStillImageFitMode fromValue(String value) {
+    return VGStillImageFitMode.values.firstWhere(
+      (mode) => mode.value == value,
+      orElse: () => VGStillImageFitMode.fit,
+    );
+  }
+}
 
 /// A transport-safe, non-destructive description of a single media clip in a
 /// Phase 7 timeline arrangement.
@@ -95,12 +141,41 @@ final class VGClipDescriptor {
     required this.trimEndSeconds,
     this.speed = 1.0,
     this.transform,
+    this.fitMode = VGStillImageFitMode.fit,
+    this.cropRect,
   })  : assert(startTimeSeconds >= 0, 'startTimeSeconds must be >= 0'),
         assert(durationSeconds >= 0, 'durationSeconds must be >= 0'),
         assert(trimStartSeconds >= 0, 'trimStartSeconds must be >= 0'),
         assert(trimEndSeconds > trimStartSeconds,
             'trimEndSeconds must be > trimStartSeconds'),
-        assert(speed > 0, 'speed must be > 0');
+        assert(speed > 0, 'speed must be > 0'),
+        // Phase 7.16: cropRect validation.
+        // When non-null: length == 4, all finite, all in [0.0, 1.0],
+        // width > 0, height > 0, x + width <= 1.0, y + height <= 1.0.
+        assert(
+          cropRect == null || cropRect.length == 4,
+          'cropRect must have exactly 4 elements [x, y, width, height]',
+        ),
+        assert(
+          cropRect == null ||
+              (cropRect[0] >= 0.0 &&
+                  cropRect[0] <= 1.0 &&
+                  cropRect[1] >= 0.0 &&
+                  cropRect[1] <= 1.0 &&
+                  cropRect[2] > 0.0 &&
+                  cropRect[2] <= 1.0 &&
+                  cropRect[3] > 0.0 &&
+                  cropRect[3] <= 1.0),
+          'cropRect values must be finite and in (0.0, 1.0]',
+        ),
+        assert(
+          cropRect == null || cropRect[0] + cropRect[2] <= 1.0,
+          'cropRect x + width must be <= 1.0',
+        ),
+        assert(
+          cropRect == null || cropRect[1] + cropRect[3] <= 1.0,
+          'cropRect y + height must be <= 1.0',
+        );
 
   // ── Identity ───────────────────────────────────────────────────────────────
 
@@ -178,9 +253,54 @@ final class VGClipDescriptor {
   /// natively — a descriptor with all default field values is treated as
   /// identity and skipped.
   ///
-  /// **Phase 7.11 / DEC-144**: Keyframed transforms, crop, fit/fill, and
-  /// multi-layer overlay are deferred to later phases.
+  /// **Phase 7.11 / DEC-144**: Keyframed transforms and multi-layer overlay
+  /// are deferred to later phases. Crop and fit/fill are Phase 7.16 (see below).
+  ///
+  /// **NOTE**: Do NOT add fitMode or cropRect to this class. Those fields live
+  /// on [VGClipDescriptor] directly (DEC-148).
   final VGClipTransformDescriptor? transform;
+
+  // ── Still-image fit/fill and crop (Phase 7.16) ────────────────────────────
+
+  /// How this still-image clip is scaled to fill the compositor canvas.
+  ///
+  /// **Phase 7.16 / DEC-148** — applies ONLY to [VGMediaKind.image] clips.
+  /// For video clips, fit/fill is the Phase 8 canvas system's responsibility.
+  ///
+  /// The native compositor bakes fit/fill at decode time into the static
+  /// pixel buffer cache. Changing this field requires a reader/draft rebuild.
+  ///
+  /// Default: [VGStillImageFitMode.fit] (letterbox/pillarbox with black bars).
+  final VGStillImageFitMode fitMode;
+
+  /// Normalized crop rectangle for this still-image clip.
+  ///
+  /// Format: `[x, y, width, height]`, all in `[0.0, 1.0]`.
+  /// Constraints: `width > 0`, `height > 0`, `x + width ≤ 1.0`, `y + height ≤ 1.0`.
+  ///
+  /// **Phase 7.16 / DEC-148** — applied ONLY to [VGMediaKind.image] clips at
+  /// decode time, BEFORE fit/fill scaling (crop-then-fit order).
+  ///
+  /// Null means no crop — the full image is used as the source region.
+  ///
+  /// When both [cropRect] and `fitMode == fill` are set, the cropped region
+  /// is scaled to fill the canvas; if the crop aspect ratio differs from the
+  /// canvas, fill may crop additional edges (see RR-152).
+  final List<double>? cropRect;
+
+  // ── Crop rect convenience accessors (Phase 7.16) ─────────────────────────
+
+  /// The normalized X origin of the crop rectangle. Null when [cropRect] is null.
+  double? get cropX => cropRect?[0];
+
+  /// The normalized Y origin of the crop rectangle. Null when [cropRect] is null.
+  double? get cropY => cropRect?[1];
+
+  /// The normalized width of the crop rectangle. Null when [cropRect] is null.
+  double? get cropWidth => cropRect?[2];
+
+  /// The normalized height of the crop rectangle. Null when [cropRect] is null.
+  double? get cropHeight => cropRect?[3];
 
   // ── Derived helpers ────────────────────────────────────────────────────────
 
@@ -233,6 +353,13 @@ final class VGClipDescriptor {
     if (transform != null) {
       m['transform'] = transform!.toMap();
     }
+    // Phase 7.16: omit fitMode when default ('fit'); omit cropRect when null.
+    if (fitMode != VGStillImageFitMode.fit) {
+      m['fitMode'] = fitMode.value;
+    }
+    if (cropRect != null) {
+      m['cropRect'] = cropRect!;
+    }
     return m;
   }
 
@@ -273,6 +400,36 @@ final class VGClipDescriptor {
       if (transform == null) return null; // invalid transform payload
     }
 
+    // Phase 7.16: parse fitMode (default fit). Unknown strings resolve to fit.
+    final fitModeStr = map['fitMode'] as String?;
+    final fitMode = fitModeStr != null
+        ? VGStillImageFitMode.fromValue(fitModeStr)
+        : VGStillImageFitMode.fit;
+
+    // Phase 7.16: parse cropRect. When present, must be a list of 4 doubles
+    // with valid normalized bounds. A malformed cropRect causes fromMap to
+    // return null (mirrors the Dart assert constraints).
+    List<double>? cropRect;
+    final rawCropRect = map['cropRect'];
+    if (rawCropRect != null) {
+      if (rawCropRect is! List) return null;
+      if (rawCropRect.length != 4) return null;
+      final doubles = <double>[];
+      for (final v in rawCropRect) {
+        if (v is! num) return null;
+        doubles.add(v.toDouble());
+      }
+      final x = doubles[0], y = doubles[1], w = doubles[2], h = doubles[3];
+      // Validate: all in [0, 1], w > 0, h > 0, x+w <= 1, y+h <= 1.
+      if (x < 0.0 || x > 1.0) return null;
+      if (y < 0.0 || y > 1.0) return null;
+      if (w <= 0.0 || w > 1.0) return null;
+      if (h <= 0.0 || h > 1.0) return null;
+      if (x + w > 1.0) return null;
+      if (y + h > 1.0) return null;
+      cropRect = doubles;
+    }
+
     return VGClipDescriptor(
       id: id as String,
       sourcePath: sourcePath as String,
@@ -283,6 +440,8 @@ final class VGClipDescriptor {
       trimEndSeconds: trimEnd,
       speed: speed,
       transform: transform,
+      fitMode: fitMode,
+      cropRect: cropRect,
     );
   }
 
@@ -302,6 +461,9 @@ final class VGClipDescriptor {
     double? speed,
     // Use sentinel to allow explicit null assignment (clear transform).
     Object? transform = _kClipNoValue,
+    VGStillImageFitMode? fitMode,
+    // Use sentinel to allow explicit null assignment (clear cropRect).
+    Object? cropRect = _kClipNoValue,
   }) {
     return VGClipDescriptor(
       id: id ?? this.id,
@@ -315,6 +477,10 @@ final class VGClipDescriptor {
       transform: transform == _kClipNoValue
           ? this.transform
           : transform as VGClipTransformDescriptor?,
+      fitMode: fitMode ?? this.fitMode,
+      cropRect: cropRect == _kClipNoValue
+          ? this.cropRect
+          : cropRect as List<double>?,
     );
   }
 
@@ -332,7 +498,20 @@ final class VGClipDescriptor {
           other.trimStartSeconds == trimStartSeconds &&
           other.trimEndSeconds == trimEndSeconds &&
           other.speed == speed &&
-          other.transform == transform;
+          other.transform == transform &&
+          other.fitMode == fitMode &&
+          _cropRectEqual(other.cropRect, cropRect);
+
+  /// Deep-equality helper for the [cropRect] list field.
+  static bool _cropRectEqual(List<double>? a, List<double>? b) {
+    if (identical(a, b)) return true;
+    if (a == null || b == null) return false;
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
 
   @override
   int get hashCode => Object.hash(
@@ -345,6 +524,9 @@ final class VGClipDescriptor {
         trimEndSeconds,
         speed,
         transform,
+        fitMode,
+        // Hash cropRect elements individually for stable hash.
+        Object.hashAll(cropRect ?? const []),
       );
 
   @override
@@ -356,7 +538,9 @@ final class VGClipDescriptor {
       'duration: ${durationSeconds}s, '
       'trim: [${trimStartSeconds}s → ${trimEndSeconds}s], '
       'speed: $speed×, '
-      'transform: $transform)';
+      'transform: $transform, '
+      'fitMode: ${fitMode.value}, '
+      'cropRect: $cropRect)';
 }
 
 // ── Sentinel for copyWith nullable fields ─────────────────────────────────────────

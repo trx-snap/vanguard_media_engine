@@ -108,6 +108,23 @@ NS_ASSUME_NONNULL_BEGIN
 ///         or nil if clip generation failed.
 + (nullable NSDictionary<NSString *, NSString *> *)generateRealVideoClipPaths;
 
+/// Phase 7.16: Still-image fit/fill/crop contract smoke test.
+///
+/// Validates that VGClipDescriptor correctly serialises fitMode and cropRect,
+/// and that invalid cropRect values are rejected by +fromDictionary:.
+///
+/// Three subtests:
+///   1. fitMode=fill round-trips through +fromDictionary: (non-nil, fitMode=fill).
+///   2. cropRect=[0.2,0.2,0.6,0.6] + fitMode=fit (default) round-trips correctly.
+///   3. Invalid cropRect=[0.8,0.8,0.5,0.5] (x+w>1.0) is rejected (returns nil).
+///
+/// Requires no real PNG on disk — exercises Objective-C contract layer only.
+/// In RELEASE builds: returns a static error result.
+///
+/// @return NSDictionary with @"success" YES/NO, @"steps", @"logs", @"error".
++ (NSDictionary<NSString *, id> *)runStillImageFitCropSmokeTest;
+
 @end
 
 NS_ASSUME_NONNULL_END
+

@@ -1,9 +1,10 @@
 // VGTimelineCompositorNode.m
-// vanguard_media_engine — Phase 7 Stage 7.5 / Stage 7.10 / Stage 7.12
+// vanguard_media_engine — Phase 7 Stage 7.5 / Stage 7.10 / Stage 7.12 / Stage 7.16
 //
 // Phase 7 Stage 7.5:  First executable multi-clip video timeline compositor.
 // Phase 7 Stage 7.10: Native crossfade/dissolve and fade transition execution.
 // Phase 7 Stage 7.12: Still-image clip support via ImageIO decode + static buffer cache.
+// Phase 7 Stage 7.16: Still-image fit/fill/crop controls (DEC-148).
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // DESIGN OVERVIEW
@@ -282,27 +283,36 @@ static CVPixelBufferRef _VGTCNBlendBuffers(CVPixelBufferRef outgoing,
 // _VGTCNCreatePixelBufferFromStillImage: Decodes a still image at sourceURL
 //   into a 32BGRA CVPixelBufferRef at the specified targetSize.
 //
-// Uses ImageIO / CGImageSource to:
-//   1. Load the image source (JPEG, PNG, HEIC if platform supports it).
-//   2. Downscale at decode time using kCGImageSourceThumbnailMaxPixelSize to
-//      bound memory footprint per RR-148.
-//   3. Apply EXIF orientation normalization via kCGImageSourceCreateThumbnailWithTransform.
-//   4. Render the decoded CGImage aspect-fit centered into a black canvas-sized
-//      CVPixelBuffer using CoreGraphics.
+// Phase 7.16 DEC-148: Updated to accept fitMode and cropRect.
 //
-// Error codes (non-colliding with existing 1–21):
-//   23 — CGImageSource creation failed or unsupported image format.
-//   24 — CGImage thumbnail decode failed.
-//   25 — CVPixelBuffer creation or CG render failed for still image.
+// Crop contract (Phase 7.16):
+//   cropRect, when non-nil, is NSArray<NSNumber *> of 4 normalized doubles [x, y, w, h].
+//   Coordinate system: CGImage from CGImageSourceCreateThumbnailAtIndex with
+//   kCGImageSourceCreateThumbnailWithTransform=YES uses top-left origin (same as UIKit).
+//   Crop is applied BEFORE fit/fill scaling (crop-then-fit order).
 //
-// Ownership: Returns a new retained CVPixelBufferRef (+1) on success.
-//            Returns NULL with *outError set on failure.
+//   Apple documentation notes:
+//   - CGImageCreateWithImageInRect: rect is in the CGImage's coordinate system
+//     (top-left origin for post-thumbnail normalized images). Returns +1 CGImageRef.
+//     The returned image contains a copy of the pixels in the specified rect.
+//     If rect extends beyond the bounds, it is clipped to the available region.
+//   - kCGImageSourceCreateThumbnailWithTransform=YES applies EXIF orientation,
+//     so the thumbnail is already orientation-normalized. Crop is applied after.
+//
+// Fit/fill contract:
+//   fit  (VGStillImageFitModeFit):  scale = MIN(scaleX, scaleY) — letterbox/pillarbox.
+//   fill (VGStillImageFitModeFill): scale = MAX(scaleX, scaleY) — no black bars,
+//     excess pixels extend beyond canvas bounds and are not drawn.
+//
 // CoreFoundation objects: fully released before return in all paths.
 
-static CVPixelBufferRef _VGTCNCreatePixelBufferFromStillImage(NSURL *sourceURL,
-                                                               CGSize targetSize,
-                                                               NSError **outError) {
-  // ── 1. Create CGImageSource ────────────────────────────────────────────────
+static CVPixelBufferRef _VGTCNCreatePixelBufferFromStillImage(
+    NSURL *sourceURL,
+    CGSize targetSize,
+    VGStillImageFitMode fitMode,
+    NSArray<NSNumber *> * _Nullable cropRect,
+    NSError **outError) {
+  // ── 1. Create CGImageSource ─────────────────────────────────────────────────
   CGImageSourceRef imgSrc = CGImageSourceCreateWithURL(
       (__bridge CFURLRef)sourceURL, NULL);
   if (!imgSrc) {
@@ -316,13 +326,13 @@ static CVPixelBufferRef _VGTCNCreatePixelBufferFromStillImage(NSURL *sourceURL,
     return NULL;
   }
 
-  // ── 2. Determine max pixel size for downscaling (RR-148 mitigation) ─────────
+  // ── 2. Determine max pixel size for downscaling (RR-148 mitigation) ────────
   CGFloat maxPixelSize = 2048.0; // safe fallback when no canvas size supplied
   if (targetSize.width > 0 && targetSize.height > 0) {
     maxPixelSize = MAX(targetSize.width, targetSize.height);
   }
 
-  // ── 3. Decode thumbnail with EXIF orientation normalization ──────────────────
+  // ── 3. Decode thumbnail with EXIF orientation normalization ────────────────
   NSDictionary *thumbOptions = @{
     (id)kCGImageSourceCreateThumbnailFromImageAlways : @YES,
     (id)kCGImageSourceCreateThumbnailWithTransform   : @YES,   // apply EXIF orientation
@@ -343,19 +353,70 @@ static CVPixelBufferRef _VGTCNCreatePixelBufferFromStillImage(NSURL *sourceURL,
     return NULL;
   }
 
-  // ── 4. Determine canvas size for output buffer ────────────────────────────
+  // ── 3b. Phase 7.16: Apply crop if cropRect is specified ───────────────────
+  // Crop is applied BEFORE fit/fill scaling (crop-then-fit order).
+  //
+  // After kCGImageSourceCreateThumbnailWithTransform=YES, cgImage is already
+  // orientation-normalized (top-left origin). Denormalize the normalized
+  // [x, y, w, h] rect into pixel coordinates of the post-thumbnail image.
+  //
+  // CGImageCreateWithImageInRect: rect uses CGImage coordinate system
+  // (top-left origin for this post-thumbnail image). If rect extends beyond
+  // image bounds, it is clipped. We clamp defensively before calling.
+  //
+  // The cropped image becomes the active source for fit/fill scaling below.
+  // Release both the crop result and cgImage when done.
+  CGImageRef activeImage = cgImage; // owned by this function; released at end
+  if (cropRect != nil && cropRect.count == 4) {
+    size_t imgW = CGImageGetWidth(cgImage);
+    size_t imgH = CGImageGetHeight(cgImage);
+    if (imgW > 0 && imgH > 0) {
+      double cx = [cropRect[0] doubleValue];
+      double cy = [cropRect[1] doubleValue];
+      double cw = [cropRect[2] doubleValue];
+      double ch = [cropRect[3] doubleValue];
+
+      // Denormalize to pixel coordinates.
+      double pixX = cx * (double)imgW;
+      double pixY = cy * (double)imgH;
+      double pixW = cw * (double)imgW;
+      double pixH = ch * (double)imgH;
+
+      // Clamp defensively to image bounds (belt-and-suspenders; input was
+      // already validated by VGCDValidateCropRect).
+      pixX = MAX(0.0, MIN(pixX, (double)imgW));
+      pixY = MAX(0.0, MIN(pixY, (double)imgH));
+      pixW = MIN(pixW, (double)imgW - pixX);
+      pixH = MIN(pixH, (double)imgH - pixY);
+
+      if (pixW > 0.0 && pixH > 0.0) {
+        CGRect cropBounds = CGRectMake(pixX, pixY, pixW, pixH);
+        CGImageRef croppedImage = CGImageCreateWithImageInRect(cgImage, cropBounds);
+        if (croppedImage) {
+          // Transfer ownership: release original, use cropped as active source.
+          CGImageRelease(cgImage);
+          activeImage = croppedImage; // +1 from CGImageCreateWithImageInRect
+          cgImage = NULL;             // prevent double-release at end of function
+        }
+        // If crop failed (croppedImage == NULL), activeImage remains cgImage;
+        // fall through to render with the uncropped image (safe degradation).
+      }
+    }
+  }
+
+  // ── 4. Determine canvas size for output buffer ──────────────────────────
   // Use targetSize when valid, fall back to decoded image dimensions.
   size_t canvasW, canvasH;
   if (targetSize.width > 0 && targetSize.height > 0) {
     canvasW = (size_t)targetSize.width;
     canvasH = (size_t)targetSize.height;
   } else {
-    canvasW = CGImageGetWidth(cgImage);
-    canvasH = CGImageGetHeight(cgImage);
+    canvasW = CGImageGetWidth(activeImage);
+    canvasH = CGImageGetHeight(activeImage);
   }
 
   if (canvasW == 0 || canvasH == 0) {
-    CGImageRelease(cgImage);
+    CGImageRelease(activeImage);
     if (outError) {
       *outError = _VGTCNError(
           25, @"VGTimelineCompositorNode (Phase 7.12): canvas or image size is "
@@ -364,7 +425,7 @@ static CVPixelBufferRef _VGTCNCreatePixelBufferFromStillImage(NSURL *sourceURL,
     return NULL;
   }
 
-  // ── 5. Create BGRA CVPixelBuffer ──────────────────────────────────────────
+  // ── 5. Create BGRA CVPixelBuffer ────────────────────────────────────
   NSDictionary *pbAttrs = @{
     (id)kCVPixelBufferPixelFormatTypeKey     : @(kCVPixelFormatType_32BGRA),
     (id)kCVPixelBufferMetalCompatibilityKey  : @YES,
@@ -375,7 +436,7 @@ static CVPixelBufferRef _VGTCNCreatePixelBufferFromStillImage(NSURL *sourceURL,
                                        kCVPixelFormatType_32BGRA,
                                        (__bridge CFDictionaryRef)pbAttrs, &pb);
   if (cvRet != kCVReturnSuccess || !pb) {
-    CGImageRelease(cgImage);
+    CGImageRelease(activeImage);
     if (outError) {
       *outError = _VGTCNError(
           25, ([NSString stringWithFormat:
@@ -386,7 +447,16 @@ static CVPixelBufferRef _VGTCNCreatePixelBufferFromStillImage(NSURL *sourceURL,
     return NULL;
   }
 
-  // ── 6. Render CGImage into pixel buffer (aspect-fit, centered on black) ─────
+  // ── 6. Render active image into pixel buffer with fit/fill scaling ─────────
+  //
+  // Phase 7.16 (DEC-148):
+  //   fit  (VGStillImageFitModeFit):  scale = MIN(scaleX, scaleY)
+  //     Image fits entirely inside canvas; black bars fill remainder.
+  //   fill (VGStillImageFitModeFill): scale = MAX(scaleX, scaleY)
+  //     Image fills canvas completely; excess is clipped by canvas bounds.
+  //
+  // The CGContext clip rect is the full canvas; pixels outside the canvas
+  // rect are never written, naturally implementing fill-mode edge clipping.
   CVPixelBufferLockBaseAddress(pb, 0);
   void *base = CVPixelBufferGetBaseAddress(pb);
   CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
@@ -403,7 +473,7 @@ static CVPixelBufferRef _VGTCNCreatePixelBufferFromStillImage(NSURL *sourceURL,
   if (!ctx) {
     CVPixelBufferUnlockBaseAddress(pb, 0);
     CVPixelBufferRelease(pb);
-    CGImageRelease(cgImage);
+    CGImageRelease(activeImage);
     if (outError) {
       *outError = _VGTCNError(
           25, @"VGTimelineCompositorNode (Phase 7.12): CGBitmapContextCreate "
@@ -416,23 +486,33 @@ static CVPixelBufferRef _VGTCNCreatePixelBufferFromStillImage(NSURL *sourceURL,
   CGContextSetFillColorWithColor(ctx, [[UIColor blackColor] CGColor]);
   CGContextFillRect(ctx, CGRectMake(0, 0, canvasW, canvasH));
 
-  // Compute aspect-fit rect: scale image to fit inside canvas, centered.
-  size_t imgW = CGImageGetWidth(cgImage);
-  size_t imgH = CGImageGetHeight(cgImage);
+  // Compute scaled rect: fit or fill, centered on canvas.
+  size_t imgW = CGImageGetWidth(activeImage);
+  size_t imgH = CGImageGetHeight(activeImage);
   if (imgW > 0 && imgH > 0) {
     double scaleX = (double)canvasW / (double)imgW;
     double scaleY = (double)canvasH / (double)imgH;
-    double scale  = MIN(scaleX, scaleY);
-    double drawW  = imgW * scale;
-    double drawH  = imgH * scale;
-    double drawX  = ((double)canvasW - drawW) / 2.0;
-    double drawY  = ((double)canvasH - drawH) / 2.0;
-    CGContextDrawImage(ctx, CGRectMake(drawX, drawY, drawW, drawH), cgImage);
+
+    // Phase 7.16: select scale based on fitMode.
+    //   fit:  MIN(scaleX, scaleY) — image fits within canvas, black bars possible.
+    //   fill: MAX(scaleX, scaleY) — image covers canvas, edges may be clipped.
+    double scale;
+    if (fitMode == VGStillImageFitModeFill) {
+      scale = MAX(scaleX, scaleY);
+    } else {
+      scale = MIN(scaleX, scaleY); // VGStillImageFitModeFit (default)
+    }
+
+    double drawW = imgW * scale;
+    double drawH = imgH * scale;
+    double drawX = ((double)canvasW - drawW) / 2.0;
+    double drawY = ((double)canvasH - drawH) / 2.0;
+    CGContextDrawImage(ctx, CGRectMake(drawX, drawY, drawW, drawH), activeImage);
   }
 
   CGContextRelease(ctx);
   CVPixelBufferUnlockBaseAddress(pb, 0);
-  CGImageRelease(cgImage);
+  CGImageRelease(activeImage);
 
   return pb; // caller owns +1 from CVPixelBufferCreate
 }
@@ -1574,9 +1654,11 @@ static os_log_t sTimelineLog;
       return NULL;
     }
 
+    // Phase 7.16 (DEC-148): pass fitMode and cropRect to bake crop/fit/fill
+    // at decode time into the static buffer cache. Zero per-frame overhead.
     NSError *decErr = nil;
     CVPixelBufferRef pb = _VGTCNCreatePixelBufferFromStillImage(
-        imageURL, _targetRenderSize, &decErr);
+        imageURL, _targetRenderSize, clip.fitMode, clip.cropRect, &decErr);
     if (!pb) {
       if (outError) *outError = decErr;
       os_log_error(sTimelineLog,
