@@ -1,15 +1,16 @@
 // VGTimelineExportHelper.h
-// vanguard_media_engine — Phase 7 Stage 7.5E
+// vanguard_media_engine — Phase 7 Stage 7.5E / Phase 7.12
 //
-// Dev-only offline timeline export helper for the Stage 7.5E proof.
+// Offline timeline export helper for the Phase 7 pipeline.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// DEBUG-ONLY FUNCTIONALITY
+// ALL-CONFIGURATIONS FUNCTIONALITY (Phase 7.12, DEC-145)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // The header is unconditional so Swift can always see the @interface.
-// The implementation (.m) is guarded by #if DEBUG. In release builds, the
-// +exportTimeline... method returns a static error.
+// Phase 7.12: the #if DEBUG guard on the .m implementation was removed.
+// The real export pipeline now compiles in all configurations (debug, profile,
+// release). Required for profile-mode device validation (flutter run --profile)
 //
 // Architecture:
 //   - Creates a completely independent VGTimelineCompositorNode (does NOT reuse

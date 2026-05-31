@@ -1,8 +1,9 @@
 // VGTimelineCompositorNode.m
-// vanguard_media_engine — Phase 7 Stage 7.5 / Stage 7.10
+// vanguard_media_engine — Phase 7 Stage 7.5 / Stage 7.10 / Stage 7.12
 //
 // Phase 7 Stage 7.5:  First executable multi-clip video timeline compositor.
 // Phase 7 Stage 7.10: Native crossfade/dissolve and fade transition execution.
+// Phase 7 Stage 7.12: Still-image clip support via ImageIO decode + static buffer cache.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // DESIGN OVERVIEW
@@ -63,9 +64,11 @@
 //   against
 //     _generation. Returns .skipped on mismatch.
 //
-// ── STAGE 7.5 LIMITATIONS (DOCUMENTED — partially resolved in Phase 7.10) ───
+// ── STAGE 7.5 LIMITATIONS (DOCUMENTED — partially resolved in Phase 7.10/7.12) ─
 //
-//   Image clips:       Rejected at init. Returns nil with error.
+//   Image clips:       Phase 7.12: SUPPORTED via ImageIO decode + static buffer
+//                      cache in _VGClipReader (DEC-145). AVAssetReader = nil for
+//                      image clips. Still-image buffer cached on first pull.
 //   Audio clips:       Rejected at init. Returns nil with error.
 //   Fade/dissolve:     Phase 7.10: SUPPORTED via dual-reader CoreImage blend path
 //                      (DEC-143). Hard-cut (VGTransitionTypeNone) also supported.
@@ -118,6 +121,9 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <CoreImage/CoreImage.h>
+
+// ─── Phase 7.12: ImageIO for still-image decode ───────────────────────────────
+#import <ImageIO/ImageIO.h>
 
 // ─── System
 // ───────────────────────────────────────────────────────────────────
@@ -269,6 +275,166 @@ static CVPixelBufferRef _VGTCNBlendBuffers(CVPixelBufferRef outgoing,
   CGColorSpaceRelease(cs);
 
   return out; // Caller owns +1 from CVPixelBufferCreate
+}
+
+// ─── Phase 7.12: Still-image decode helper ───────────────────────────────────
+//
+// _VGTCNCreatePixelBufferFromStillImage: Decodes a still image at sourceURL
+//   into a 32BGRA CVPixelBufferRef at the specified targetSize.
+//
+// Uses ImageIO / CGImageSource to:
+//   1. Load the image source (JPEG, PNG, HEIC if platform supports it).
+//   2. Downscale at decode time using kCGImageSourceThumbnailMaxPixelSize to
+//      bound memory footprint per RR-148.
+//   3. Apply EXIF orientation normalization via kCGImageSourceCreateThumbnailWithTransform.
+//   4. Render the decoded CGImage aspect-fit centered into a black canvas-sized
+//      CVPixelBuffer using CoreGraphics.
+//
+// Error codes (non-colliding with existing 1–21):
+//   23 — CGImageSource creation failed or unsupported image format.
+//   24 — CGImage thumbnail decode failed.
+//   25 — CVPixelBuffer creation or CG render failed for still image.
+//
+// Ownership: Returns a new retained CVPixelBufferRef (+1) on success.
+//            Returns NULL with *outError set on failure.
+// CoreFoundation objects: fully released before return in all paths.
+
+static CVPixelBufferRef _VGTCNCreatePixelBufferFromStillImage(NSURL *sourceURL,
+                                                               CGSize targetSize,
+                                                               NSError **outError) {
+  // ── 1. Create CGImageSource ────────────────────────────────────────────────
+  CGImageSourceRef imgSrc = CGImageSourceCreateWithURL(
+      (__bridge CFURLRef)sourceURL, NULL);
+  if (!imgSrc) {
+    if (outError) {
+      *outError = _VGTCNError(
+          23, ([NSString stringWithFormat:
+                   @"VGTimelineCompositorNode (Phase 7.12): CGImageSourceCreateWithURL "
+                    "failed or unsupported image format. sourceURL=%@",
+                   sourceURL.lastPathComponent]));
+    }
+    return NULL;
+  }
+
+  // ── 2. Determine max pixel size for downscaling (RR-148 mitigation) ─────────
+  CGFloat maxPixelSize = 2048.0; // safe fallback when no canvas size supplied
+  if (targetSize.width > 0 && targetSize.height > 0) {
+    maxPixelSize = MAX(targetSize.width, targetSize.height);
+  }
+
+  // ── 3. Decode thumbnail with EXIF orientation normalization ──────────────────
+  NSDictionary *thumbOptions = @{
+    (id)kCGImageSourceCreateThumbnailFromImageAlways : @YES,
+    (id)kCGImageSourceCreateThumbnailWithTransform   : @YES,   // apply EXIF orientation
+    (id)kCGImageSourceThumbnailMaxPixelSize          : @(maxPixelSize),
+  };
+  CGImageRef cgImage = CGImageSourceCreateThumbnailAtIndex(
+      imgSrc, 0, (__bridge CFDictionaryRef)thumbOptions);
+  CFRelease(imgSrc); // imgSrc no longer needed
+
+  if (!cgImage) {
+    if (outError) {
+      *outError = _VGTCNError(
+          24, ([NSString stringWithFormat:
+                   @"VGTimelineCompositorNode (Phase 7.12): CGImageSourceCreateThumbnailAtIndex "
+                    "failed. Unsupported image data or corrupt file. sourceURL=%@",
+                   sourceURL.lastPathComponent]));
+    }
+    return NULL;
+  }
+
+  // ── 4. Determine canvas size for output buffer ────────────────────────────
+  // Use targetSize when valid, fall back to decoded image dimensions.
+  size_t canvasW, canvasH;
+  if (targetSize.width > 0 && targetSize.height > 0) {
+    canvasW = (size_t)targetSize.width;
+    canvasH = (size_t)targetSize.height;
+  } else {
+    canvasW = CGImageGetWidth(cgImage);
+    canvasH = CGImageGetHeight(cgImage);
+  }
+
+  if (canvasW == 0 || canvasH == 0) {
+    CGImageRelease(cgImage);
+    if (outError) {
+      *outError = _VGTCNError(
+          25, @"VGTimelineCompositorNode (Phase 7.12): canvas or image size is "
+               "zero; cannot create pixel buffer.");
+    }
+    return NULL;
+  }
+
+  // ── 5. Create BGRA CVPixelBuffer ──────────────────────────────────────────
+  NSDictionary *pbAttrs = @{
+    (id)kCVPixelBufferPixelFormatTypeKey     : @(kCVPixelFormatType_32BGRA),
+    (id)kCVPixelBufferMetalCompatibilityKey  : @YES,
+    (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+  };
+  CVPixelBufferRef pb = NULL;
+  CVReturn cvRet = CVPixelBufferCreate(kCFAllocatorDefault, canvasW, canvasH,
+                                       kCVPixelFormatType_32BGRA,
+                                       (__bridge CFDictionaryRef)pbAttrs, &pb);
+  if (cvRet != kCVReturnSuccess || !pb) {
+    CGImageRelease(cgImage);
+    if (outError) {
+      *outError = _VGTCNError(
+          25, ([NSString stringWithFormat:
+                   @"VGTimelineCompositorNode (Phase 7.12): CVPixelBufferCreate "
+                    "failed (CVReturn=%d) for still image canvas %zux%zu.",
+                   (int)cvRet, canvasW, canvasH]));
+    }
+    return NULL;
+  }
+
+  // ── 6. Render CGImage into pixel buffer (aspect-fit, centered on black) ─────
+  CVPixelBufferLockBaseAddress(pb, 0);
+  void *base = CVPixelBufferGetBaseAddress(pb);
+  CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+
+  CGContextRef ctx = CGBitmapContextCreate(
+      base,
+      canvasW, canvasH,
+      8,                                              // bits per component
+      CVPixelBufferGetBytesPerRow(pb),
+      cs,
+      kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst); // 32BGRA
+  CGColorSpaceRelease(cs);
+
+  if (!ctx) {
+    CVPixelBufferUnlockBaseAddress(pb, 0);
+    CVPixelBufferRelease(pb);
+    CGImageRelease(cgImage);
+    if (outError) {
+      *outError = _VGTCNError(
+          25, @"VGTimelineCompositorNode (Phase 7.12): CGBitmapContextCreate "
+               "failed for still image render.");
+    }
+    return NULL;
+  }
+
+  // Fill canvas with black (handles letterbox/pillarbox regions and alpha PNGs).
+  CGContextSetFillColorWithColor(ctx, [[UIColor blackColor] CGColor]);
+  CGContextFillRect(ctx, CGRectMake(0, 0, canvasW, canvasH));
+
+  // Compute aspect-fit rect: scale image to fit inside canvas, centered.
+  size_t imgW = CGImageGetWidth(cgImage);
+  size_t imgH = CGImageGetHeight(cgImage);
+  if (imgW > 0 && imgH > 0) {
+    double scaleX = (double)canvasW / (double)imgW;
+    double scaleY = (double)canvasH / (double)imgH;
+    double scale  = MIN(scaleX, scaleY);
+    double drawW  = imgW * scale;
+    double drawH  = imgH * scale;
+    double drawX  = ((double)canvasW - drawW) / 2.0;
+    double drawY  = ((double)canvasH - drawH) / 2.0;
+    CGContextDrawImage(ctx, CGRectMake(drawX, drawY, drawW, drawH), cgImage);
+  }
+
+  CGContextRelease(ctx);
+  CVPixelBufferUnlockBaseAddress(pb, 0);
+  CGImageRelease(cgImage);
+
+  return pb; // caller owns +1 from CVPixelBufferCreate
 }
 
 // ─── Phase 7.11: Per-clip CoreImage transform + opacity helper ─────────────────
@@ -455,6 +621,9 @@ static os_log_t sTimelineLog;
 @property(nonatomic) CVPixelBufferRef lastDeliveredBuffer;      // nullable; +1
 @property(nonatomic) double lastDeliveredAssetPTS;              // -1.0 when empty
 @property(nonatomic) double lastDeliveredAssetDuration;
+// Phase 7.12: YES for still-image clips. reader and trackOutput are nil.
+// Decoded buffer is cached on first pull; subsequent pulls return cached buffer.
+@property(nonatomic) BOOL isStaticSource;
 @end
 
 @implementation _VGClipReader
@@ -625,18 +794,15 @@ static os_log_t sTimelineLog;
     [clips addObject:clip];
   }
 
-  // ── (c) Stage 7.5: reject non-video clips ─────────────────────────────────
-  // Image clips and audio clips are not supported in this first executable
-  // slice. Rejection here means the graph will not prepare rather than silently
-  // delivering garbage frames.
+  // ── (c) Stage 7.5B: reject unsupported media kinds ──────────────────────────
+  // Phase 7.12 (DEC-145): VGClipMediaKindImage is now accepted alongside
+  // VGClipMediaKindVideo. Audio and unknown kinds are still rejected explicitly.
   for (NSUInteger i = 0; i < clips.count; i++) {
     VGClipDescriptor *clip = clips[i];
-    if (clip.mediaKind != VGClipMediaKindVideo) {
+    if (clip.mediaKind != VGClipMediaKindVideo &&
+        clip.mediaKind != VGClipMediaKindImage) {
       NSString *kindDesc;
       switch (clip.mediaKind) {
-      case VGClipMediaKindImage:
-        kindDesc = @"image";
-        break;
       case VGClipMediaKindAudio:
         kindDesc = @"audio";
         break;
@@ -652,11 +818,9 @@ static os_log_t sTimelineLog;
             6, ([NSString
                    stringWithFormat:
                        @"VGTimelineCompositorNode: clips[%lu] (id=%@) has "
-                       @"unsupported "
-                        "mediaKind \"%@\" for Stage 7.5. "
-                        "Only VGClipMediaKindVideo is supported in this slice. "
-                        "Image clips are Stage 7.5B+. Audio timelines are "
-                        "Phase 8+.",
+                        "unsupported mediaKind \"%@\". "
+                        "Supported: VGClipMediaKindVideo, VGClipMediaKindImage. "
+                        "Audio timelines are Phase 8+.",
                        (unsigned long)i, clip.clipId, kindDesc]));
       }
       return nil;
@@ -1292,6 +1456,11 @@ static os_log_t sTimelineLog;
       // Error from reader or transform.
       return [VGFrameResult errorResult:pullErr generation:request.generation];
     }
+    // Phase 7.12: Static image readers never return NULL without pullErr.
+    // Guard against accessing nil reader.status for static source readers.
+    if (_activeReader.isStaticSource) {
+      return [VGFrameResult skippedWithGeneration:request.generation];
+    }
     // NULL without error: reader completed (EOS) or unknown status.
     AVAssetReaderStatus status = _activeReader.reader.status;
     if (status == AVAssetReaderStatusCompleted) {
@@ -1377,7 +1546,79 @@ static os_log_t sTimelineLog;
                                      error:(NSError **)outError {
   NSParameterAssert(reader != nil);
 
-  // ── 1. Per-reader reuse guard ──────────────────────────────────────────────
+  // ── Phase 7.12: Static source path ────────────────────────────────────────
+  // Phase 7.12: static image transforms are baked into the cached buffer.
+  // Transform changes require reader/draft rebuild; no dynamic per-frame image transform update in this slice.
+  if (reader.isStaticSource) {
+    VGClipDescriptor *clip = _clips[reader.clipIndex];
+
+    if (reader.lastDeliveredBuffer != NULL) {
+      // Cache hit: retain and return the static buffer directly.
+      CVPixelBufferRetain(reader.lastDeliveredBuffer);
+      os_log_debug(sTimelineLog,
+                   "[VGTCNode] static cache hit: clip=%lu",
+                   (unsigned long)reader.clipIndex);
+      return reader.lastDeliveredBuffer; // caller owns +1
+    }
+
+    // First pull: decode still image.
+    NSURL *imageURL = [NSURL fileURLWithPath:clip.sourceURL];
+    if (!imageURL) {
+      if (outError) {
+        *outError = _VGTCNError(
+            23, ([NSString stringWithFormat:
+                     @"VGTimelineCompositorNode (Phase 7.12): invalid sourceURL "
+                      "for still-image clip %@.",
+                     clip.clipId]));
+      }
+      return NULL;
+    }
+
+    NSError *decErr = nil;
+    CVPixelBufferRef pb = _VGTCNCreatePixelBufferFromStillImage(
+        imageURL, _targetRenderSize, &decErr);
+    if (!pb) {
+      if (outError) *outError = decErr;
+      os_log_error(sTimelineLog,
+                   "[VGTCNode] still-image decode failed clip=%lu: %{public}@",
+                   (unsigned long)reader.clipIndex,
+                   decErr.localizedDescription);
+      return NULL;
+    }
+
+    // Apply Phase 7.11 static transform + opacity if non-identity.
+    // Transform is baked into the cached buffer here; no per-frame re-apply.
+    VGClipTransformDescriptor *td = clip.transform;
+    if (td && !td.isIdentity) {
+      NSError *tfErr = nil;
+      CVPixelBufferRef tfPB = _VGTCNApplyTransformAndOpacity(pb, td, &tfErr);
+      CVPixelBufferRelease(pb); // release un-transformed decode
+      if (!tfPB) {
+        if (outError) *outError = tfErr;
+        os_log_error(sTimelineLog,
+                     "[VGTCNode] still-image transform failed clip=%lu: %{public}@",
+                     (unsigned long)reader.clipIndex,
+                     tfErr.localizedDescription);
+        return NULL;
+      }
+      pb = tfPB; // +1 owned by this scope
+    }
+
+    // Cache the decoded+transformed buffer. Cache takes its own +1.
+    reader.lastDeliveredBuffer = pb;
+    reader.lastDeliveredAssetPTS = 0.0;
+    reader.lastDeliveredAssetDuration = 1e9; // large window: static buffer never expires
+    CVPixelBufferRetain(pb); // cache retain
+
+    os_log(sTimelineLog,
+           "[VGTCNode] still-image decoded+cached: clip=%lu canvas=%.0fx%.0f",
+           (unsigned long)reader.clipIndex,
+           _targetRenderSize.width, _targetRenderSize.height);
+
+    return pb; // caller owns +1 from decode
+  }
+
+  // ── 1. Per-reader reuse guard (video path) ────────────────────────────────
   if (reader.lastDeliveredBuffer != NULL) {
     if (tAsset >= reader.lastDeliveredAssetPTS &&
         tAsset <  reader.lastDeliveredAssetPTS + reader.lastDeliveredAssetDuration) {
@@ -1482,6 +1723,22 @@ static os_log_t sTimelineLog;
                                          startAtTime:(double)startTimeSecs
                                                error:(NSError **)outError {
   VGClipDescriptor *clip = _clips[clipIndex];
+
+  // ── Phase 7.12: Branch for still-image clips ──────────────────────────────
+  // Still images do not use AVAssetReader. Build a minimal _VGClipReader
+  // with isStaticSource = YES; decode happens lazily in _pullBufferFromReader:.
+  if (clip.mediaKind == VGClipMediaKindImage) {
+    _VGClipReader *clipReader = [[_VGClipReader alloc] init];
+    clipReader.clipIndex = clipIndex;
+    clipReader.reader = nil;        // No AVAssetReader for static sources.
+    clipReader.trackOutput = nil;
+    clipReader.sourceFPS = 1.0;     // Safe non-zero default; unused for frame timing.
+    clipReader.isStaticSource = YES;
+    os_log(sTimelineLog,
+           "[VGTCNode] built static reader: clip=%lu",
+           (unsigned long)clipIndex);
+    return clipReader;
+  }
 
   // ── Build AVURLAsset ──────────────────────────────────────────────────────
   NSURL *assetURL = [NSURL fileURLWithPath:clip.sourceURL];
@@ -1725,7 +1982,10 @@ static os_log_t sTimelineLog;
 /// Cancel and nil the active reader, safely releasing AVFoundation resources.
 - (void)_tearDownActiveReader {
   if (_activeReader) {
-    [_activeReader.reader cancelReading];
+    // Static image readers have reader == nil; nil guard documents intentional no-op.
+    if (_activeReader.reader) {
+      [_activeReader.reader cancelReading];
+    }
     _activeReader = nil;
   }
 }
@@ -1735,7 +1995,10 @@ static os_log_t sTimelineLog;
 /// Idempotent: safe to call when _outgoingReader is already nil.
 - (void)_tearDownOutgoingReader {
   if (_outgoingReader) {
-    [_outgoingReader.reader cancelReading];
+    // Static image readers have reader == nil; nil guard documents intentional no-op.
+    if (_outgoingReader.reader) {
+      [_outgoingReader.reader cancelReading];
+    }
     _outgoingReader = nil;
   }
 }

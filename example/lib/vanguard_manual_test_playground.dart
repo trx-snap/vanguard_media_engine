@@ -41,18 +41,27 @@ class _VanguardManualTestPlaygroundState
   // ── Asset Paths ────────────────────────────────────────────────────────────
   static const String _kAssetPathA = 'assets/manual_test_clips/clip_A.mov';
   static const String _kAssetPathB = 'assets/manual_test_clips/clip_B.mov';
+  // Phase 7.12: approved still-image test fixture (Hanif explicit approval).
+  static const String _kAssetPathC = 'assets/manual_test_clips/still_C.png';
 
   // ── Temp File Paths ─────────────────────────────────────────────────────────
   String? _tempPathA;
   String? _tempPathB;
+  String? _tempPathC; // Phase 7.12: still-image fixture
 
   bool _existsA = false;
   bool _existsB = false;
+  bool _existsC = false; // Phase 7.12
 
   // ── Canvas Configurations ──────────────────────────────────────────────────
   int _canvasWidth = 1280;
   int _canvasHeight = 720;
   final int _fps = 30;
+
+  // ── Phase 7.12: still-image test mode toggle ─────────────────────────────
+  // false: Clip B uses clip_B.mov (Phases 7.10/7.11 test).
+  // true:  Clip B uses still_C.png with VGMediaKind.image, 5.0 s hold (Phase 7.12 test).
+  bool _useStillImageClipB = false;
 
   // ── Active Transition ──────────────────────────────────────────────────────
   String _selectedTransition = 'dissolve'; // 'hard_cut' | 'dissolve' | 'fade'
@@ -136,13 +145,20 @@ class _VanguardManualTestPlaygroundState
       final fileB = File(pathB);
       final existsB = await fileB.exists();
 
+      // 3. Phase 7.12: Copy still-image fixture C
+      final pathC = await _copyAssetToTemp(_kAssetPathC, 'still_C.png');
+      final fileC = File(pathC);
+      final existsC = await fileC.exists();
+
       if (!mounted) return;
 
       setState(() {
         _tempPathA = pathA;
         _tempPathB = pathB;
+        _tempPathC = pathC;
         _existsA = existsA;
         _existsB = existsB;
+        _existsC = existsC;
         _copyingAssets = false;
         _status = 'Assets ready in temp. Initializing timeline...';
       });
@@ -213,13 +229,18 @@ class _VanguardManualTestPlaygroundState
               )
             : null,
       ),
+      // Phase 7.12: when _useStillImageClipB is true, Clip B becomes a still image.
+      // The existing A→B transition selector and Clip B transform sliders apply to
+      // the still image exactly as they do to the video clip (unified pipeline).
       VGClipDescriptor(
         id: 'clip-B',
-        sourcePath: _tempPathB!,
-        durationSeconds: 5.56,
+        sourcePath: _useStillImageClipB ? _tempPathC! : _tempPathB!,
+        mediaKind: _useStillImageClipB ? VGMediaKind.image : VGMediaKind.video,
+        durationSeconds: _useStillImageClipB ? 5.0 : 5.56,
         trimStartSeconds: 0.0,
-        trimEndSeconds: 5.56,
-        // Phase 7.11: apply clip B transform when non-identity.
+        trimEndSeconds: _useStillImageClipB ? 5.0 : 5.56,
+        // Phase 7.11 + 7.12: apply clip B transform when non-identity.
+        // Applies to both video and still-image variants of Clip B.
         transform: (_clipBScaleX != 1.0 || _clipBScaleY != 1.0 ||
                     _clipBRotation != 0.0 || _clipBOpacity != 1.0 ||
                     _clipBTransX != 0.0 || _clipBTransY != 0.0)
@@ -362,7 +383,7 @@ class _VanguardManualTestPlaygroundState
   // ── Build UI ───────────────────────────────────────────────────────────────
 
   String get _appBarTitle =>
-      'Phase 7.10 + 7.11 Manual Device Test';
+      'Phase 7.10 + 7.11 + 7.12 Manual Device Test';
 
   @override
   Widget build(BuildContext context) {
@@ -558,6 +579,38 @@ class _VanguardManualTestPlaygroundState
             assetPath: _kAssetPathB,
             tempPath: _tempPathB ?? 'Not copied',
             exists: _existsB,
+          ),
+          const Divider(color: Colors.white10, height: 16),
+          // Phase 7.12: still-image fixture row.
+          _buildPathRow(
+            label: 'Still C (img)',
+            assetPath: _kAssetPathC,
+            tempPath: _tempPathC ?? 'Not copied',
+            exists: _existsC,
+          ),
+          const SizedBox(height: 10),
+          // Phase 7.12: toggle to replace Clip B with still_C.png.
+          Row(
+            children: [
+              const Icon(Icons.image_outlined, color: Color(0xFFFF9E00), size: 14),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  'Use Still Image as Clip B',
+                  style: TextStyle(color: Colors.white60, fontSize: 11),
+                ),
+              ),
+              Switch(
+                value: _useStillImageClipB,
+                activeColor: const Color(0xFFFF9E00),
+                onChanged: _existsC
+                    ? (v) {
+                        setState(() => _useStillImageClipB = v);
+                        _rebuildTimeline();
+                      }
+                    : null,
+              ),
+            ],
           ),
         ],
       ),

@@ -361,11 +361,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     //     for paths with spaces or special characters.
     //     (Foundation.URL — Apple Developer Documentation)
 
-    /// Validates a clip dictionaries array for Phase 7.8 production routes.
+    /// Validates a clip dictionaries array for Phase 7.12 production routes.
     ///
     /// Checks per clip:
     ///   - Non-empty `id`
-    ///   - `mediaKind == "video"` (Phase 7.8: video-only hard-cut constraint)
+    ///   - `mediaKind` is `"video"` or `"image"` (Phase 7.12: still-image clips supported; audio is Phase 8+)
     ///   - Non-empty `sourcePath`
     ///   - `FileManager.default.isReadableFile(atPath: sourcePath)` = true
     ///   - `trimStartSeconds >= 0`
@@ -385,13 +385,14 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     details: nil)
             }
 
-            // Validate mediaKind — video-only in Phase 7.8.
+            // Validate mediaKind — video and image supported in Phase 7.12.
+            // Audio timelines are Phase 8+; unknown kinds are always rejected.
             let mediaKind = clip["mediaKind"] as? String ?? ""
-            guard mediaKind == "video" else {
+            guard mediaKind == "video" || mediaKind == "image" else {
                 return FlutterError(
                     code: "UNSUPPORTED_MEDIA_KIND",
                     message: "clips[\(idx)] id=\(clipId): mediaKind '\(mediaKind)' "
-                           + "is not supported in Phase 7.8 (video-only)",
+                           + "is not supported. Supported: video, image. Audio timelines are Phase 8+.",
                     details: nil)
             }
 

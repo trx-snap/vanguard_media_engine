@@ -1,7 +1,7 @@
 // VGTimelineExportHelper.m
-// vanguard_media_engine — Phase 7 Stage 7.5E
+// vanguard_media_engine — Phase 7 Stage 7.5E / Phase 7.12
 //
-// Dev-only offline timeline export helper implementation.
+// Offline timeline export helper implementation.
 //
 // Implements the full pull-mode export graph for a VGTimelineCompositorNode:
 //   VGTimelineCompositorNode → VGVideoEncoderSinkNode
@@ -10,7 +10,9 @@
 //   - This file never touches VanguardGraphRuntime or the playback compositor.
 //   - VGExportProfile is constructed here in ObjC (MOD-1, MOD-2).
 //   - VGTimelineCompositorNode is freshly initialized (independent — MOD-3).
-//   - Entire implementation is guarded by #if DEBUG (MOD-4).
+//   - Phase 7.12: DEBUG-only guard removed (MOD-4 retired). Compiles in all
+//     configurations (debug, profile, release). Required for profile-mode device
+//     validation and future production export (DEC-145).
 //   - VGClockPolicyPull + clock=nil (MOD-5).
 //   - Sink invalidate on failure, scheduler invalidate on cleanup (MOD-6).
 //   - VGGraphPlanner is called after VGGraphValidator (MOD-7).
@@ -21,8 +23,6 @@
 //   VGExportFileSourceNode, VGTimelineCompositorSmokeTest.
 
 #import "VGTimelineExportHelper.h"
-
-#if DEBUG
 
 // ─── Stage 7.5A compositor ───────────────────────────────────────────────────
 #import "VGTimelineCompositorNode.h"
@@ -466,41 +466,3 @@ static os_log_t sExportHelperLog;
 }
 
 @end
-
-#else // !DEBUG
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Release-mode stub
-// ─────────────────────────────────────────────────────────────────────────────
-// The @interface is unconditional (header always visible). In release builds,
-// this stub returns a static error. The actual export logic is DEBUG-only.
-// Follows the same pattern as VGTimelineCompositorSmokeTest.m.
-
-@implementation VGTimelineExportHelper
-
-+ (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
-                    transitions:(NSArray<NSDictionary *> *)transitions
-                     outputPath:(NSString *)outputPath
-                          width:(NSInteger)width
-                         height:(NSInteger)height
-                            fps:(NSInteger)fps
-                     bitrateBps:(NSInteger)bitrateBps
-                     completion:(void (^)(BOOL success,
-                                         NSString * _Nullable outputPath,
-                                         NSTimeInterval durationSeconds,
-                                         NSError * _Nullable error))completion
-{
-    NSError *error = [NSError errorWithDomain:@"VGTimelineExportHelper"
-                                         code:-1
-                                     userInfo:@{
-        NSLocalizedDescriptionKey: @"VGTimelineExportHelper is DEBUG-only. "
-                                   @"Timeline export is not available in release builds."
-    }];
-    if (completion) {
-        completion(NO, nil, 0.0, error);
-    }
-}
-
-@end
-
-#endif // DEBUG

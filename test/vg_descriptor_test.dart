@@ -14,6 +14,7 @@ import 'package:vanguard_media_engine/vg_parameter_descriptor.dart';
 import 'package:vanguard_media_engine/vg_effect_catalog.dart';
 import 'package:vanguard_media_engine/vg_preset_descriptor.dart';
 import 'package:vanguard_media_engine/vg_filter_spec.dart';
+import 'package:vanguard_media_engine/vg_clip_descriptor.dart'; // Phase 7.12
 
 void main() {
   // ───────────────────────────────────────────────────────────────────────────
@@ -588,6 +589,92 @@ void main() {
       expect(a == b, isFalse);
     });
   });
+
+  // ───────────────────────────────────────────────────────────────────────
+  // VGClipDescriptor — VGMediaKind.image (Phase 7.12)
+  // ───────────────────────────────────────────────────────────────────────
+
+  group('VGClipDescriptor — VGMediaKind.image (Phase 7.12)', () {
+    // Helper: a minimal valid still-image descriptor.
+    VGClipDescriptor _imageClip({
+      String id = 'img-01',
+      String sourcePath = '/tmp/still_C.png',
+      double durationSeconds = 5.0,
+      double trimStart = 0.0,
+      double trimEnd = 5.0,
+    }) =>
+        VGClipDescriptor(
+          id: id,
+          sourcePath: sourcePath,
+          mediaKind: VGMediaKind.image,
+          durationSeconds: durationSeconds,
+          trimStartSeconds: trimStart,
+          trimEndSeconds: trimEnd,
+        );
+
+    test('IK-1  VGClipDescriptor with VGMediaKind.image is constructible', () {
+      final clip = _imageClip();
+      expect(clip.mediaKind, VGMediaKind.image);
+      expect(clip.id, 'img-01');
+      expect(clip.sourcePath, '/tmp/still_C.png');
+    });
+
+    test('IK-2  toMap() serialises mediaKind as "image"', () {
+      final m = _imageClip().toMap();
+      expect(m['mediaKind'], 'image');
+    });
+
+    test('IK-3  fromMap() deserialises mediaKind="image" to VGMediaKind.image', () {
+      final m = _imageClip().toMap();
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNotNull);
+      expect(clip!.mediaKind, VGMediaKind.image);
+    });
+
+    test('IK-4  fromMap() round-trip preserves all fields for an image clip', () {
+      final original = _imageClip(
+        id: 'img-rt',
+        sourcePath: '/tmp/photo.jpg',
+        durationSeconds: 10.0,
+        trimStart: 0.0,
+        trimEnd: 4.0,
+      );
+      final clone = VGClipDescriptor.fromMap(
+        Map<Object?, Object?>.from(original.toMap()),
+      );
+      expect(clone, isNotNull);
+      expect(clone!.id, original.id);
+      expect(clone.sourcePath, original.sourcePath);
+      expect(clone.mediaKind, VGMediaKind.image);
+      expect(clone.durationSeconds, original.durationSeconds);
+      expect(clone.trimStartSeconds, original.trimStartSeconds);
+      expect(clone.trimEndSeconds, original.trimEndSeconds);
+      expect(clone.speed, original.speed);
+    });
+
+    test('IK-5  fromMap() with unknown mediaKind string returns VGMediaKind.unknown', () {
+      // VGMediaKind.fromValue returns unknown for unrecognised strings;
+      // fromMap should still succeed (not return null) for unknown kinds.
+      final m = _imageClip().toMap()
+        ..['mediaKind'] = 'hologram'; // unrecognised
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNotNull);
+      expect(clip!.mediaKind, VGMediaKind.unknown);
+    });
+
+    test('IK-6  fromMap() defaults mediaKind to video when key is absent', () {
+      final m = _imageClip().toMap()..remove('mediaKind');
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNotNull);
+      // Dart default when key absent: mediaKindStr = 'video' per fromMap impl.
+      expect(clip!.mediaKind, VGMediaKind.video);
+    });
+
+    test('IK-7  timelineDuration for image clip equals trimEnd - trimStart', () {
+      final clip = _imageClip(trimStart: 0.0, trimEnd: 3.5);
+      expect(clip.timelineDuration, closeTo(3.5, 1e-10));
+    });
+  });
 }
 
 // ignore: unused_import
@@ -595,3 +682,16 @@ void main() {
 // These tests are imported by the vg_descriptor_test.dart main() above via
 // a separate call; kept in the same file for colocation with descriptor tests.
 // To run: `flutter test test/vg_descriptor_test.dart`
+
+// ─── Phase 7.12: VGClipDescriptor — VGMediaKind.image ────────────────────────
+// Added by Phase 7.12 Implementer.
+// Tests cover:
+//   IK-1  VGClipDescriptor constructed with VGMediaKind.image is valid.
+//   IK-2  toMap() serialises mediaKind as "image".
+//   IK-3  fromMap() deserialises mediaKind = "image" to VGMediaKind.image.
+//   IK-4  fromMap() round-trip preserves mediaKind.image end-to-end.
+//   IK-5  fromMap() with unknown mediaKind returns VGMediaKind.unknown (no null).
+//   IK-6  VGClipDescriptor.mediaKind defaults to VGMediaKind.video when omitted from map.
+//   IK-7  Still-image VGClipDescriptor.timelineDuration equals (trimEnd - trimStart).
+// Note: These tests exercise only Dart-layer descriptor logic.
+//       Native compositor image decoding is validated via manual device test (still_C.png).
