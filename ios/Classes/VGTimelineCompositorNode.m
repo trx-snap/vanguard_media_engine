@@ -1676,6 +1676,12 @@ static os_log_t sTimelineLog;
       // Apply maximum size to avoid excess memory; canvas size is sufficient.
       gen.maximumSize = CGSizeMake(_targetRenderSize.width * 2.0,
                                    _targetRenderSize.height * 2.0);
+      // Phase 7.17 orientation fix (RR-154): AVAssetImageGenerator defaults
+      // appliesPreferredTrackTransform to NO, returning raw track-coordinate
+      // pixels that are unrotated.  Normal video playback is already
+      // orientation-normalised by AVPlayer; setting YES here aligns the
+      // freeze path with that behaviour so the frozen frame is never sideways.
+      gen.appliesPreferredTrackTransform = YES;
 
       // Convert source-local seconds to CMTime (timescale 600 for sub-frame precision).
       double pts = reader.freezePTS.doubleValue;

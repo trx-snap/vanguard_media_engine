@@ -63,6 +63,13 @@ class _VanguardManualTestPlaygroundState
   // true:  Clip B uses still_C.png with VGMediaKind.image, 5.0 s hold (Phase 7.12 test).
   bool _useStillImageClipB = false;
 
+  // ── Phase 7.16: still-image fit mode and crop rect (DEV validation only) ─
+  VGStillImageFitMode _stillFitMode = VGStillImageFitMode.fit;
+  bool _useStillCrop = false;
+
+  // ── Phase 7.17: freeze-frame apply status (DEV validation only) ─────────
+  bool _freezeApplied = false;
+
   // ── Active Transition ──────────────────────────────────────────────────────
   String _selectedTransition = 'dissolve'; // 'hard_cut' | 'dissolve' | 'fade'
 
@@ -251,6 +258,9 @@ class _VanguardManualTestPlaygroundState
         durationSeconds: _useStillImageClipB ? 5.0 : 5.56,
         trimStartSeconds: 0.0,
         trimEndSeconds: _useStillImageClipB ? 5.0 : 5.56,
+        // Phase 7.16: Apply fitMode and cropRect when Clip B is still image
+        fitMode: _useStillImageClipB ? _stillFitMode : VGStillImageFitMode.fit,
+        cropRect: (_useStillImageClipB && _useStillCrop) ? const [0.1, 0.1, 0.8, 0.8] : null,
         // Phase 7.11 + 7.12: apply clip B transform when non-identity.
         // Applies to both video and still-image variants of Clip B.
         transform: (_clipBScaleX != 1.0 || _clipBScaleY != 1.0 ||
@@ -323,6 +333,7 @@ class _VanguardManualTestPlaygroundState
       _trimApplied = false;
       _splitApplied = false;
       _reorderApplied = false;
+      _freezeApplied = false;
     });
 
     try {
@@ -441,6 +452,34 @@ class _VanguardManualTestPlaygroundState
     }
   }
 
+  // Phase 7.17: freeze frame debug trigger — freezes Clip A at 3.0s for 2.0s.
+  // Verifies freezeClip calls updateTimeline, increases clip count, and inserts a freeze frame.
+  Future<void> _freezeClipA() async {
+    final c = _controller;
+    if (c == null || !c.isReady || _exporting) return;
+
+    try {
+      final newDraft = c.draft.freezeClip(
+        'clip-A',
+        3.0,
+        2.0,
+      );
+      await c.updateDraft(newDraft);
+      if (mounted) {
+        setState(() {
+          _freezeApplied = true;
+          _status = 'Freeze OK — Clip A frozen at 3.0s for 2.0s. '
+              'Clips: ${c.draft.clips.length}, '
+              'Duration: ${c.draft.durationSeconds.toStringAsFixed(2)}s';
+        });
+      }
+    } on ArgumentError catch (e) {
+      if (mounted) setState(() => _status = 'Freeze rejected: $e');
+    } catch (e) {
+      if (mounted) setState(() => _status = 'Freeze error: $e');
+    }
+  }
+
   Future<void> _export() async {
     final c = _controller;
     if (c == null || !c.isReady || _exporting) return;
@@ -484,7 +523,7 @@ class _VanguardManualTestPlaygroundState
   // ── Build UI ───────────────────────────────────────────────────────────────
 
   String get _appBarTitle =>
-      'Phase 7.10 + 7.11 + 7.12 Manual Device Test';
+      'Phase 7.10-7.17 Manual Device Test (DEV ONLY)';
 
   @override
   Widget build(BuildContext context) {
@@ -596,6 +635,10 @@ class _VanguardManualTestPlaygroundState
 
                         // ── Phase 7.15: Reorder Debug Card ──────────────────────
                         _buildReorderDebugCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.17: Freeze Debug Card ───────────────────────
+                        _buildFreezeDebugCard(),
                         const SizedBox(height: 24),
                       ],
                     ),
@@ -725,7 +768,84 @@ class _VanguardManualTestPlaygroundState
               ),
             ],
           ),
+          if (_useStillImageClipB) ...[
+            const Divider(color: Colors.white10, height: 16),
+            // Phase 7.16: Still Image Fit/Crop controls (DEV validation only)
+            const Text(
+              'PHASE 7.16 — STILL IMAGE FIT & CROP (DEV ONLY)',
+              style: TextStyle(
+                color: Color(0xFFFF9E00),
+                fontSize: 9,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 1.0,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                const Icon(Icons.fit_screen_outlined, color: Color(0xFFFF9E00), size: 14),
+                const SizedBox(width: 6),
+                const Text(
+                  'Fit Mode:',
+                  style: TextStyle(color: Colors.white54, fontSize: 11),
+                ),
+                const SizedBox(width: 12),
+                _buildStillFitButton(VGStillImageFitMode.fit, 'Fit (letterbox)'),
+                const SizedBox(width: 8),
+                _buildStillFitButton(VGStillImageFitMode.fill, 'Fill (cover)'),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                const Icon(Icons.crop_outlined, color: Color(0xFFFF9E00), size: 14),
+                const SizedBox(width: 6),
+                const Expanded(
+                  child: Text(
+                    'Apply Crop Rect [0.1, 0.1, 0.8, 0.8]',
+                    style: TextStyle(color: Colors.white54, fontSize: 11),
+                  ),
+                ),
+                Switch(
+                  value: _useStillCrop,
+                  activeColor: const Color(0xFFFF9E00),
+                  onChanged: (v) {
+                    setState(() => _useStillCrop = v);
+                    _rebuildTimeline();
+                  },
+                ),
+              ],
+            ),
+          ],
         ],
+      ),
+    );
+  }
+
+  Widget _buildStillFitButton(VGStillImageFitMode mode, String label) {
+    final active = _stillFitMode == mode;
+    return GestureDetector(
+      onTap: () {
+        setState(() => _stillFitMode = mode);
+        _rebuildTimeline();
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: active ? const Color(0xFFFF9E00) : Colors.white.withValues(alpha: 0.03),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: active ? const Color(0xFFFF9E00) : Colors.white10,
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: active ? Colors.white : Colors.white54,
+            fontSize: 10,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
       ),
     );
   }
@@ -1502,6 +1622,58 @@ class _VanguardManualTestPlaygroundState
             ),
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFF9C27B0),
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Phase 7.17: Freeze Frame Debug Card ────────────────────────────────────────
+
+  Widget _buildFreezeDebugCard() {
+    final ready = _controller?.isReady == true && !_exporting;
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Text(
+            'PHASE 7.17 — FREEZE FRAME EDITING (DEV ONLY)',
+            style: TextStyle(
+              color: Color(0xFF00D4AA),
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.2,
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Freeze Clip A at 3.0s with a 2.0s hold duration. '
+            'Verifies freezeClip splits and inserts a static video frame.',
+            style: TextStyle(color: Colors.white38, fontSize: 10),
+          ),
+          const SizedBox(height: 10),
+          ElevatedButton.icon(
+            onPressed: ready ? _freezeClipA : null,
+            icon: _freezeApplied
+                ? const Icon(Icons.check_circle_outline, size: 16)
+                : const Icon(Icons.ac_unit_outlined, size: 16),
+            label: Text(
+              _freezeApplied
+                  ? 'Freeze Applied — tap to re-apply'
+                  : 'Freeze Clip A @ 3.0s for 2.0s',
+            ),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF00D4AA),
               foregroundColor: Colors.white,
               padding: const EdgeInsets.symmetric(vertical: 12),
             ),
