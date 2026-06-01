@@ -1,5 +1,5 @@
 // vanguard_manual_test_playground.dart
-// Vanguard Media Engine — Phase 7 Stage 7.10 / Phase 7.11: Manual Test Playground
+// Vanguard Media Engine — Phase 7 Stage 7.10 / Phase 7.11 / Phase 7.18B2: Manual Test Playground
 //
 // ════════════════════════════════════════════════════════════════════════════════
 // STAGES 7.10 + 7.11 — MANUAL TEST PLAYGROUND (HANIF DEVICE TEST TARGET)
@@ -69,6 +69,10 @@ class _VanguardManualTestPlaygroundState
 
   // ── Phase 7.17: freeze-frame apply status (DEV validation only) ─────────
   bool _freezeApplied = false;
+
+  // ── Phase 7.18B2: Cache Metrics HUD state ──────────────────────────────────
+  Map<String, int> _cacheStats = const {};
+  bool _fetchingStats = false;
 
   // ── Active Transition ──────────────────────────────────────────────────────
   String _selectedTransition = 'dissolve'; // 'hard_cut' | 'dissolve' | 'fade'
@@ -509,6 +513,39 @@ class _VanguardManualTestPlaygroundState
     }
   }
 
+  // Phase 7.18B2: fetch live cache stats from the native frame cache.
+  Future<void> _fetchCacheStats() async {
+    final c = _controller;
+    if (c == null || _fetchingStats) return;
+    setState(() => _fetchingStats = true);
+    try {
+      final stats = await c.getTimelineCacheStats();
+      if (mounted) setState(() => _cacheStats = stats);
+    } finally {
+      if (mounted) setState(() => _fetchingStats = false);
+    }
+  }
+
+  // Phase 7.18B2: evict all frame cache entries and reset counters,
+  // then immediately re-fetch to show zeroed stats.
+  Future<void> _clearCache() async {
+    final c = _controller;
+    if (c == null || _fetchingStats) return;
+    setState(() => _fetchingStats = true);
+    try {
+      await c.clearTimelineCache();
+      final stats = await c.getTimelineCacheStats();
+      if (mounted) {
+        setState(() {
+          _cacheStats = stats;
+          _status = 'Cache cleared — counters reset.';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _fetchingStats = false);
+    }
+  }
+
   void _throttledScrubSeek(double seconds) {
     final now = DateTime.now();
     if (_lastScrubSeekAt == null ||
@@ -523,7 +560,7 @@ class _VanguardManualTestPlaygroundState
   // ── Build UI ───────────────────────────────────────────────────────────────
 
   String get _appBarTitle =>
-      'Phase 7.10-7.17 Manual Device Test (DEV ONLY)';
+      'Phase 7.10-7.18B Manual Device Test (DEV ONLY)';
 
   @override
   Widget build(BuildContext context) {
@@ -639,6 +676,10 @@ class _VanguardManualTestPlaygroundState
 
                         // ── Phase 7.17: Freeze Debug Card ───────────────────────
                         _buildFreezeDebugCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.18B2: Cache Metrics HUD ─────────────────────
+                        _buildCacheMetricsCard(),
                         const SizedBox(height: 24),
                       ],
                     ),
@@ -1682,4 +1723,169 @@ class _VanguardManualTestPlaygroundState
       ),
     );
   }
+
+  // ── Phase 7.18B2: Cache Metrics HUD ─────────────────────────────────────────
+
+  Widget _buildCacheMetricsCard() {
+    final ready     = _controller != null;
+    final hits      = _cacheStats['frameCacheHits']      ?? 0;
+    final misses    = _cacheStats['frameCacheMisses']    ?? 0;
+    final evictions = _cacheStats['frameCacheEvictions'] ?? 0;
+    final inserts   = _cacheStats['frameCacheInserts']   ?? 0;
+    final entries   = _cacheStats['frameCacheEntries']   ?? 0;
+    final bytes     = _cacheStats['frameCacheBytes']     ?? 0;
+    const maxBytes  = 32 * 1024 * 1024; // 32 MB budget (Phase 7.18A)
+
+    final totalLookups = hits + misses;
+    final hitRatePct   = totalLookups > 0
+        ? (hits / totalLookups * 100.0).toStringAsFixed(1)
+        : '—';
+    final usageMb = (bytes / (1024 * 1024)).toStringAsFixed(2);
+    const budgetMb = '32.00';
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: const Color(0xFF6C63FF).withValues(alpha: 0.4)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // ── Header ────────────────────────────────────────────────────────
+          Row(
+            children: [
+              const Icon(Icons.speed_outlined, color: Color(0xFF6C63FF), size: 14),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  'PHASE 7.18B2 — FRAME CACHE METRICS (DEV ONLY)',
+                  style: TextStyle(
+                    color: Color(0xFF6C63FF),
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.0,
+                  ),
+                ),
+              ),
+              if (_fetchingStats)
+                const SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.5,
+                    color: Color(0xFF6C63FF),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Live native LRU frame cache counters. '
+            'Tap "Fetch Stats" to refresh. "Clear Cache" forces cold decode.',
+            style: TextStyle(color: Colors.white38, fontSize: 10),
+          ),
+          const SizedBox(height: 10),
+
+          // ── Stats rows ────────────────────────────────────────────────────
+          if (_cacheStats.isNotEmpty) ...[
+            _buildStatRow('Hits',      '$hits',        const Color(0xFF00D4AA)),
+            _buildStatRow('Misses',    '$misses',      Colors.orangeAccent),
+            _buildStatRow('Hit rate',  '$hitRatePct%', const Color(0xFF6C63FF)),
+            _buildStatRow('Evictions', '$evictions',   Colors.redAccent),
+            _buildStatRow('Inserts',   '$inserts',     Colors.white54),
+            _buildStatRow('Entries',   '$entries',     Colors.white54),
+            _buildStatRow(
+              'Cache used',
+              '$usageMb MB / $budgetMb MB',
+              bytes > maxBytes * 0.9 ? Colors.redAccent : Colors.white54,
+            ),
+            const SizedBox(height: 8),
+            // Budget fill bar
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: (bytes / maxBytes).clamp(0.0, 1.0),
+                minHeight: 6,
+                backgroundColor: Colors.white10,
+                valueColor: AlwaysStoppedAnimation<Color>(
+                  bytes > maxBytes * 0.9
+                      ? Colors.redAccent
+                      : const Color(0xFF6C63FF),
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+          ] else ...[
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text(
+                'No stats yet — tap "Fetch Stats" to load.',
+                style: TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+            ),
+          ],
+
+          // ── Buttons ────────────────────────────────────────────────────────
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: ready && !_fetchingStats ? _fetchCacheStats : null,
+                  icon: const Icon(Icons.refresh_outlined, size: 14),
+                  label: const Text('Fetch Stats'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF6C63FF),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    textStyle: const TextStyle(fontSize: 12),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: ready && !_fetchingStats ? _clearCache : null,
+                  icon: const Icon(Icons.delete_outline, size: 14),
+                  label: const Text('Clear Cache'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.redAccent,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    textStyle: const TextStyle(fontSize: 12),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatRow(String label, String value, Color valueColor) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Row(
+        children: [
+          Text(
+            label,
+            style: const TextStyle(color: Colors.white38, fontSize: 11),
+          ),
+          const Spacer(),
+          Text(
+            value,
+            style: TextStyle(
+              color: valueColor,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
+

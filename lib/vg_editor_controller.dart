@@ -28,6 +28,10 @@
 //   exportTimeline        → export()
 //   disposeTimeline       → disposeAsync() / dispose()
 //
+// CACHE METRICS ROUTES (Phase 7.18B1 native / Phase 7.18B2 Dart, DEC-152):
+//   getTimelineCacheStats → getTimelineCacheStats()
+//   clearTimelineCache    → clearTimelineCache()
+//
 // LEGACY DEV ROUTES (retained for playground compatibility, DEC-138):
 //   dev_createTimelineTexture  (accessed via legacy VGEditorController path
 //   dev_timelinePlay            when useRealVideoClips is explicitly set for
@@ -590,6 +594,61 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
     // Push to native via updateDraft (handles busy-lock, pause, and state).
     await updateDraft(newDraft);
+  }
+
+  // ── Frame cache stats (Phase 7.18B2 / DEC-152) ───────────────────────────
+
+  /// Returns a live snapshot of the native frame cache metrics.
+  ///
+  /// Maps to `getTimelineCacheStats` (Phase 7.18B1 native route, DEC-152).
+  ///
+  /// Returns a [Map] with the following integer keys (all values ≥ 0):
+  /// - `frameCacheBytes`     — current bytes held in the LRU cache.
+  /// - `frameCacheHits`      — total cache hits since last flush.
+  /// - `frameCacheMisses`    — total cache misses since last flush.
+  /// - `frameCacheEvictions` — total LRU evictions since last flush.
+  /// - `frameCacheInserts`   — total successful inserts since last flush.
+  /// - `frameCacheEntries`   — current number of cached frame entries.
+  ///
+  /// Returns an empty map if no timeline compositor is active or if the
+  /// native runtime returns an empty result. Never throws on native failure.
+  ///
+  /// Does NOT require [isReady] — safe to call at any lifecycle point after
+  /// construction and before [dispose].
+  ///
+  /// Throws [StateError] if [dispose] has been called.
+  Future<Map<String, int>> getTimelineCacheStats() async {
+    _assertNotDisposed();
+    try {
+      final result = await _channel.invokeMapMethod<String, dynamic>(
+        'getTimelineCacheStats',
+      );
+      if (result == null || result.isEmpty) return const {};
+      return result.map((k, v) => MapEntry(k, (v as num).toInt()));
+    } on PlatformException catch (_) {
+      // Best-effort — native may have no active timeline or compositor.
+      return const {};
+    }
+  }
+
+  /// Evicts all entries from the native frame cache and resets all counters.
+  ///
+  /// Maps to `clearTimelineCache` (Phase 7.18B1 native route, DEC-152).
+  ///
+  /// Forces a cold decode on the next scrub or seek, enabling manual
+  /// before/after latency benchmarks in the DEV harness.
+  ///
+  /// No-op if no timeline compositor is active. Always completes without
+  /// error — native failure is silently swallowed (best-effort).
+  ///
+  /// Throws [StateError] if [dispose] has been called.
+  Future<void> clearTimelineCache() async {
+    _assertNotDisposed();
+    try {
+      await _channel.invokeMethod<void>('clearTimelineCache');
+    } on PlatformException catch (_) {
+      // Best-effort — native may have no active timeline or compositor.
+    }
   }
 
   // ── Export ───────────────────────────────────────────────────────────────────────

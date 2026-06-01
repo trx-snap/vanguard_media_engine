@@ -1444,4 +1444,178 @@ void main() {
           reason: 'toClipId rewritten to new right clip A');
     });
   });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // getTimelineCacheStats() / clearTimelineCache() — Phase 7.18B2
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorController — getTimelineCacheStats() [Phase 7.18B2]', () {
+    late VGEditorController controller;
+    final List<String> calledMethods = [];
+
+    setUp(() {
+      calledMethods.clear();
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+      controller = VGEditorController(initialDraft: _twoClipDraft());
+    });
+
+    tearDown(() => controller.dispose());
+
+    test('CS-1  getTimelineCacheStats invokes getTimelineCacheStats route',
+        () async {
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        if (method == 'getTimelineCacheStats') {
+          return <String, dynamic>{
+            'frameCacheHits':      42,
+            'frameCacheMisses':    7,
+            'frameCacheEvictions': 1,
+            'frameCacheInserts':   49,
+            'frameCacheEntries':   5,
+            'frameCacheBytes':     1048576,
+          };
+        }
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      calledMethods.clear();
+      await controller.getTimelineCacheStats();
+      expect(calledMethods, contains('getTimelineCacheStats'));
+    });
+
+    test('CS-2  getTimelineCacheStats returns typed Map<String, int>',
+        () async {
+      _setMockHandler((method, args) async {
+        if (method == 'getTimelineCacheStats') {
+          return <String, dynamic>{
+            'frameCacheHits':      10,
+            'frameCacheMisses':    3,
+            'frameCacheEvictions': 0,
+            'frameCacheInserts':   13,
+            'frameCacheEntries':   2,
+            'frameCacheBytes':     524288,
+          };
+        }
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      final stats = await controller.getTimelineCacheStats();
+      expect(stats, isA<Map<String, int>>());
+      expect(stats['frameCacheHits'],      10);
+      expect(stats['frameCacheMisses'],    3);
+      expect(stats['frameCacheEvictions'], 0);
+      expect(stats['frameCacheInserts'],   13);
+      expect(stats['frameCacheEntries'],   2);
+      expect(stats['frameCacheBytes'],     524288);
+    });
+
+    test('CS-3  getTimelineCacheStats returns empty map when native returns null',
+        () async {
+      _setMockHandler((method, args) async {
+        if (method == 'getTimelineCacheStats') return null;
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      final stats = await controller.getTimelineCacheStats();
+      expect(stats, isEmpty);
+    });
+
+    test('CS-3b getTimelineCacheStats returns empty map when native returns {}',
+        () async {
+      _setMockHandler((method, args) async {
+        if (method == 'getTimelineCacheStats') return <String, dynamic>{};
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      final stats = await controller.getTimelineCacheStats();
+      expect(stats, isEmpty);
+    });
+
+    test('CS-3c getTimelineCacheStats returns empty map on PlatformException',
+        () async {
+      _setMockHandler((method, args) async {
+        if (method == 'getTimelineCacheStats') {
+          throw PlatformException(code: 'NATIVE_ERROR');
+        }
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      final stats = await controller.getTimelineCacheStats();
+      expect(stats, isEmpty,
+          reason: 'PlatformException must be swallowed and return empty map');
+    });
+
+    test('CS-6  getTimelineCacheStats throws StateError after dispose',
+        () async {
+      controller.dispose();
+      await expectLater(
+        controller.getTimelineCacheStats(),
+        throwsA(isA<StateError>()),
+      );
+    });
+  });
+
+  group('VGEditorController — clearTimelineCache() [Phase 7.18B2]', () {
+    late VGEditorController controller;
+    final List<String> calledMethods = [];
+
+    setUp(() {
+      calledMethods.clear();
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+      controller = VGEditorController(initialDraft: _twoClipDraft());
+    });
+
+    tearDown(() => controller.dispose());
+
+    test('CS-4  clearTimelineCache invokes clearTimelineCache route', () async {
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      calledMethods.clear();
+      await controller.clearTimelineCache();
+      expect(calledMethods, contains('clearTimelineCache'));
+    });
+
+    test('CS-5  clearTimelineCache completes without error on PlatformException',
+        () async {
+      _setMockHandler((method, args) async {
+        if (method == 'clearTimelineCache') {
+          throw PlatformException(code: 'NATIVE_ERROR');
+        }
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      await expectLater(
+        controller.clearTimelineCache(),
+        completes,
+        reason: 'PlatformException must be silently swallowed',
+      );
+    });
+
+    test('CS-7  clearTimelineCache throws StateError after dispose', () async {
+      controller.dispose();
+      await expectLater(
+        controller.clearTimelineCache(),
+        throwsA(isA<StateError>()),
+      );
+    });
+  });
 }
+
