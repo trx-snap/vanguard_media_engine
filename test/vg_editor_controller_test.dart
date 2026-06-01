@@ -38,6 +38,7 @@ import 'package:vanguard_media_engine/vg_transition_descriptor.dart';
 import 'package:vanguard_media_engine/vg_editor_export_request.dart';
 import 'package:vanguard_media_engine/vg_editor_export_result.dart';
 import 'package:vanguard_media_engine/vg_editor_value.dart';
+import 'package:vanguard_media_engine/vg_reverse_sidecar_status.dart';
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
 
@@ -1613,6 +1614,277 @@ void main() {
       controller.dispose();
       await expectLater(
         controller.clearTimelineCache(),
+        throwsA(isA<StateError>()),
+      );
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // prepareReverseSidecars / getSidecarStatus / cleanupReverseSidecars — Phase 7.20D
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorController — reverse sidecar routes (Phase 7.20D)', () {
+    late VGEditorController controller;
+    final List<String> calledMethods = [];
+    dynamic capturedSidecarArgs;
+
+    // Builds a draft with one reversed clip.
+    VGEditorDraft _reversedDraft() {
+      final clip = VGClipDescriptor(
+        id: 'clip-A',
+        sourcePath: '/tmp/fixture.mp4',
+        durationSeconds: 5.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 5.0,
+        isReversed: true,
+      );
+      return VGEditorDraft(id: 'draft-ps', clips: [clip]);
+    }
+
+    setUp(() async {
+      calledMethods.clear();
+      capturedSidecarArgs = null;
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        switch (method) {
+          case 'createTimelineTexture':
+            return {'textureId': 60, 'width': 640, 'height': 360};
+          case 'prepareReverseSidecars':
+            capturedSidecarArgs = args;
+            return {
+              'clips': [
+                {
+                  'clipId': 'clip-A',
+                  'state': 'ready',
+                  'progress': 1.0,
+                  'sidecarPath': '/tmp/VGReverseSidecars/clip-A.mov',
+                },
+              ],
+            };
+          case 'getSidecarStatus':
+            capturedSidecarArgs = args;
+            return {
+              'clipId': 'clip-A',
+              'state': 'preparing',
+              'progress': 0.42,
+            };
+          case 'cleanupReverseSidecars':
+            return {'ok': true};
+          case 'disposeTimeline':
+          case 'timelinePause':
+            return null;
+          default:
+            return null;
+        }
+      });
+      controller = VGEditorController(initialDraft: _reversedDraft());
+      await controller.initialize();
+    });
+
+    tearDown(() => controller.dispose());
+
+    // ── VGReverseSidecarStatus.fromMap ──────────────────────────────────────
+
+    test('PS-FM1 VGReverseSidecarStatus.fromMap deserialises idle state', () {
+      final s = VGReverseSidecarStatus.fromMap(const {
+        'clipId': 'clip-X',
+        'state': 'idle',
+        'progress': 0.0,
+      });
+      expect(s.clipId, 'clip-X');
+      expect(s.state, VGReverseSidecarState.idle);
+      expect(s.progress, 0.0);
+      expect(s.sidecarPath, isNull);
+      expect(s.errorMessage, isNull);
+    });
+
+    test('PS-FM2 VGReverseSidecarStatus.fromMap deserialises ready state with sidecarPath', () {
+      final s = VGReverseSidecarStatus.fromMap(const {
+        'clipId':      'clip-A',
+        'state':       'ready',
+        'progress':    1.0,
+        'sidecarPath': '/tmp/VGReverseSidecars/clip-A.mov',
+      });
+      expect(s.state, VGReverseSidecarState.ready);
+      expect(s.progress, closeTo(1.0, 0.001));
+      expect(s.sidecarPath, '/tmp/VGReverseSidecars/clip-A.mov');
+    });
+
+    test('PS-FM3 VGReverseSidecarStatus.fromMap deserialises failed state with errorMessage', () {
+      final s = VGReverseSidecarStatus.fromMap(const {
+        'clipId':       'clip-B',
+        'state':        'failed',
+        'progress':     0.0,
+        'errorMessage': 'Frame budget exceeded',
+      });
+      expect(s.state, VGReverseSidecarState.failed);
+      expect(s.errorMessage, 'Frame budget exceeded');
+    });
+
+    test('PS-FM4 VGReverseSidecarStatus.fromMap clamps progress to [0,1]', () {
+      final over = VGReverseSidecarStatus.fromMap(const {
+        'clipId': 'x', 'state': 'preparing', 'progress': 1.5,
+      });
+      final under = VGReverseSidecarStatus.fromMap(const {
+        'clipId': 'x', 'state': 'preparing', 'progress': -0.5,
+      });
+      expect(over.progress, closeTo(1.0, 0.001));
+      expect(under.progress, closeTo(0.0, 0.001));
+    });
+
+    test('PS-FM5 VGReverseSidecarStatus.fromMap handles unknown state', () {
+      final s = VGReverseSidecarStatus.fromMap(const {
+        'clipId': 'x', 'state': 'future_state', 'progress': 0.0,
+      });
+      expect(s.state, VGReverseSidecarState.unknown);
+    });
+
+    // ── prepareReverseSidecars ────────────────────────────────────────────────
+
+    test('PS-1  prepareReverseSidecars invokes native route with clips payload', () async {
+      calledMethods.clear();
+      await controller.prepareReverseSidecars();
+
+      expect(calledMethods, contains('prepareReverseSidecars'));
+      expect(capturedSidecarArgs, isA<Map>());
+      final args = capturedSidecarArgs as Map;
+      expect(args.containsKey('clips'), isTrue);
+      final clips = args['clips'] as List;
+      expect(clips.length, 1);
+      final clip = clips[0] as Map;
+      expect(clip['clipId'], 'clip-A');
+      expect(clip.containsKey('sourcePath'), isTrue);
+      expect(clip.containsKey('trimStart'), isTrue);
+      expect(clip.containsKey('trimEnd'), isTrue);
+      expect(clip.containsKey('targetWidth'), isTrue);
+      expect(clip.containsKey('targetHeight'), isTrue);
+      expect(clip.containsKey('sourceHash'), isTrue);
+      // sourceHash must be non-empty.
+      expect((clip['sourceHash'] as String).isNotEmpty, isTrue);
+    });
+
+    test('PS-2  prepareReverseSidecars returns parsed VGReverseSidecarStatus list', () async {
+      final statuses = await controller.prepareReverseSidecars();
+
+      expect(statuses, isA<List<VGReverseSidecarStatus>>());
+      expect(statuses.length, 1);
+      expect(statuses[0].clipId, 'clip-A');
+      expect(statuses[0].state, VGReverseSidecarState.ready);
+      expect(statuses[0].progress, closeTo(1.0, 0.001));
+      expect(statuses[0].sidecarPath, '/tmp/VGReverseSidecars/clip-A.mov');
+    });
+
+    test('PS-3  prepareReverseSidecars returns empty list when no reversed clips', () async {
+      // Rebuild controller with a non-reversed draft.
+      controller.dispose();
+      _setMockHandler((method, args) async {
+        if (method == 'createTimelineTexture') {
+          return {'textureId': 61, 'width': 640, 'height': 360};
+        }
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+      final ctrl = VGEditorController(initialDraft: _twoClipDraft());
+      await ctrl.initialize();
+      addTearDown(() => ctrl.dispose());
+
+      final result = await ctrl.prepareReverseSidecars();
+      expect(result, isEmpty,
+          reason: 'No reversed clips → channel must not be called and result is []');
+    });
+
+    test('PS-4  prepareReverseSidecars returns empty list on PlatformException', () async {
+      _setMockHandler((method, args) async {
+        if (method == 'prepareReverseSidecars') {
+          throw PlatformException(code: 'NATIVE_ERROR');
+        }
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      final result = await controller.prepareReverseSidecars();
+      expect(result, isEmpty,
+          reason: 'PlatformException must be swallowed and return empty list');
+    });
+
+    test('PS-5  prepareReverseSidecars throws StateError after dispose', () async {
+      controller.dispose();
+      await expectLater(
+        controller.prepareReverseSidecars(),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    // ── getSidecarStatus ──────────────────────────────────────────────────────
+
+    test('PS-6  getSidecarStatus invokes native route with clipId', () async {
+      calledMethods.clear();
+      await controller.getSidecarStatus(clipId: 'clip-A');
+
+      expect(calledMethods, contains('getSidecarStatus'));
+      expect(capturedSidecarArgs, isA<Map>());
+      expect((capturedSidecarArgs as Map)['clipId'], 'clip-A');
+    });
+
+    test('PS-7  getSidecarStatus returns parsed VGReverseSidecarStatus', () async {
+      final status = await controller.getSidecarStatus(clipId: 'clip-A');
+
+      expect(status, isA<VGReverseSidecarStatus>());
+      expect(status.clipId, 'clip-A');
+      expect(status.state, VGReverseSidecarState.preparing);
+      expect(status.progress, closeTo(0.42, 0.001));
+    });
+
+    test('PS-8  getSidecarStatus returns idle on PlatformException', () async {
+      _setMockHandler((method, args) async {
+        if (method == 'getSidecarStatus') {
+          throw PlatformException(code: 'NATIVE_ERROR');
+        }
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      final status = await controller.getSidecarStatus(clipId: 'clip-A');
+      expect(status.state, VGReverseSidecarState.idle);
+      expect(status.clipId, 'clip-A');
+    });
+
+    test('PS-9  getSidecarStatus throws StateError after dispose', () async {
+      controller.dispose();
+      await expectLater(
+        controller.getSidecarStatus(clipId: 'clip-A'),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    // ── cleanupReverseSidecars ────────────────────────────────────────────────
+
+    test('PS-10 cleanupReverseSidecars invokes native route', () async {
+      calledMethods.clear();
+      await controller.cleanupReverseSidecars();
+      expect(calledMethods, contains('cleanupReverseSidecars'));
+    });
+
+    test('PS-11 cleanupReverseSidecars completes without error on PlatformException', () async {
+      _setMockHandler((method, args) async {
+        if (method == 'cleanupReverseSidecars') {
+          throw PlatformException(code: 'NATIVE_ERROR');
+        }
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      await expectLater(
+        controller.cleanupReverseSidecars(),
+        completes,
+        reason: 'PlatformException must be silently swallowed',
+      );
+    });
+
+    test('PS-12 cleanupReverseSidecars throws StateError after dispose', () async {
+      controller.dispose();
+      await expectLater(
+        controller.cleanupReverseSidecars(),
         throwsA(isA<StateError>()),
       );
     });

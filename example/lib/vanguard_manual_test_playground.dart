@@ -73,6 +73,11 @@ class _VanguardManualTestPlaygroundState
   // ── Phase 7.19B: reverse-clip apply status (DEV validation only) ────────
   bool _reverseApplied = false;
 
+  // ── Phase 7.20D: Reverse sidecar status HUD state ───────────────────────────
+  // Latest statuses returned by prepareReverseSidecars() or getSidecarStatus().
+  List<VGReverseSidecarStatus>? _sidecarStatuses;
+  bool _sidecarBusy = false; // true while an action is in-flight
+
   // ── Phase 7.18B2: Cache Metrics HUD state ──────────────────────────────────
   Map<String, int> _cacheStats = const {};
   bool _fetchingStats = false;
@@ -342,6 +347,9 @@ class _VanguardManualTestPlaygroundState
       _reorderApplied = false;
       _freezeApplied = false;
       _reverseApplied = false;
+      // Phase 7.20D: reset sidecar status on every timeline rebuild.
+      _sidecarStatuses = null;
+      _sidecarBusy = false;
     });
 
     try {
@@ -512,6 +520,91 @@ class _VanguardManualTestPlaygroundState
       if (mounted) setState(() => _status = 'Reverse rejected: $e');
     } catch (e) {
       if (mounted) setState(() => _status = 'Reverse error: $e');
+    }
+  }
+
+  // Phase 7.20D: trigger background sidecar preparation for all reversed clips.
+  Future<void> _prepareSidecars() async {
+    final c = _controller;
+    if (c == null || !c.isReady || _sidecarBusy) return;
+    setState(() {
+      _sidecarBusy = true;
+      _status = 'Preparing reverse sidecars...';
+    });
+    try {
+      final statuses = await c.prepareReverseSidecars();
+      if (mounted) {
+        setState(() {
+          _sidecarStatuses = statuses;
+          _sidecarBusy = false;
+          _status = statuses.isEmpty
+              ? 'No reversed clips — sidecar preparation skipped.'
+              : 'Sidecar preparation complete: '
+                  '${statuses.map((s) => '${s.clipId}=${s.state.name}').join(', ')}';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _sidecarBusy = false;
+          _status = 'Sidecar prepare error: $e';
+        });
+      }
+    }
+  }
+
+  // Phase 7.20D: query sidecar status for Clip A.
+  Future<void> _getSidecarStatusForClipA() async {
+    final c = _controller;
+    if (c == null || _sidecarBusy) return;
+    setState(() {
+      _sidecarBusy = true;
+      _status = 'Querying sidecar status for clip-A...';
+    });
+    try {
+      final status = await c.getSidecarStatus(clipId: 'clip-A');
+      if (mounted) {
+        setState(() {
+          _sidecarStatuses = [status];
+          _sidecarBusy = false;
+          _status = 'Sidecar status: clip-A = ${status.state.name} '
+              '(progress ${(status.progress * 100).toStringAsFixed(0)}%)';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _sidecarBusy = false;
+          _status = 'Sidecar status error: $e';
+        });
+      }
+    }
+  }
+
+  // Phase 7.20D: cancel all in-flight transcodes and delete all sidecar files.
+  Future<void> _cleanupSidecars() async {
+    final c = _controller;
+    if (c == null || _sidecarBusy) return;
+    setState(() {
+      _sidecarBusy = true;
+      _status = 'Cleaning up all sidecars...';
+    });
+    try {
+      await c.cleanupReverseSidecars();
+      if (mounted) {
+        setState(() {
+          _sidecarStatuses = null;
+          _sidecarBusy = false;
+          _status = 'Sidecar cleanup complete — all files deleted.';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _sidecarBusy = false;
+          _status = 'Sidecar cleanup error: $e';
+        });
+      }
     }
   }
 
@@ -709,8 +802,12 @@ class _VanguardManualTestPlaygroundState
                         _buildFreezeDebugCard(),
                         const SizedBox(height: 12),
 
-                        // ── Phase 7.19B: Reverse Debug Card ─────────────────────
+                        // ── Phase 7.19B: Reverse Debug Card ─────────────────────────
                         _buildReverseDebugCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.20D: Reverse Sidecar Status HUD ──────────────
+                        _buildSidecarStatusCard(),
                         const SizedBox(height: 12),
 
                         // ── Phase 7.18B2: Cache Metrics HUD ─────────────────────
@@ -1971,6 +2068,209 @@ class _VanguardManualTestPlaygroundState
               fontWeight: FontWeight.w600,
               fontFeatures: const [FontFeature.tabularFigures()],
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Phase 7.20D: Reverse Sidecar Status HUD ────────────────────────────────
+
+  Widget _buildSidecarStatusCard() {
+    final ready = _controller?.isReady == true && !_sidecarBusy;
+
+    Color _stateColor(VGReverseSidecarState s) {
+      switch (s) {
+        case VGReverseSidecarState.ready:       return const Color(0xFF00D4AA);
+        case VGReverseSidecarState.preparing:   return const Color(0xFFFF9E00);
+        case VGReverseSidecarState.failed:      return Colors.redAccent;
+        case VGReverseSidecarState.invalidated: return Colors.white54;
+        default:                                return Colors.white24;
+      }
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: const Color(0xFFFF6B6B).withValues(alpha: 0.5),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // ── Header ──────────────────────────────────────────────────────────
+          Row(
+            children: [
+              const Icon(Icons.sync_outlined, color: Color(0xFFFF6B6B), size: 14),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  'PHASE 7.20D — REVERSE SIDECAR STATUS (DEV ONLY)',
+                  style: TextStyle(
+                    color: Color(0xFFFF6B6B),
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.0,
+                  ),
+                ),
+              ),
+              if (_sidecarBusy)
+                const SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.5,
+                    color: Color(0xFFFF6B6B),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Controls VGReverseSidecarManager. '
+            'Tap "Prepare Sidecars" after toggling Reverse ON above. '
+            '"Get Status" polls clip-A. "Cleanup" deletes all sidecar files.',
+            style: TextStyle(color: Colors.white38, fontSize: 10),
+          ),
+          const SizedBox(height: 10),
+
+          // ── Status Rows ───────────────────────────────────────────────────
+          if (_sidecarStatuses != null && _sidecarStatuses!.isNotEmpty) ...[
+            for (final s in _sidecarStatuses!) ...[
+              Row(
+                children: [
+                  Container(
+                    width: 8, height: 8,
+                    decoration: BoxDecoration(
+                      color: _stateColor(s.state),
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    s.clipId,
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    s.state.name.toUpperCase(),
+                    style: TextStyle(
+                      color: _stateColor(s.state),
+                      fontSize: 10,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.8,
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    '${(s.progress * 100).toStringAsFixed(0)}%',
+                    style: TextStyle(
+                      color: _stateColor(s.state),
+                      fontSize: 10,
+                      fontWeight: FontWeight.w600,
+                      fontFeatures: const [FontFeature.tabularFigures()],
+                    ),
+                  ),
+                ],
+              ),
+              if (s.state == VGReverseSidecarState.preparing) ...[
+                const SizedBox(height: 4),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(3),
+                  child: LinearProgressIndicator(
+                    value: s.progress,
+                    minHeight: 4,
+                    backgroundColor: Colors.white10,
+                    valueColor: const AlwaysStoppedAnimation<Color>(
+                      Color(0xFFFF9E00),
+                    ),
+                  ),
+                ),
+              ],
+              if (s.errorMessage != null) ...[
+                const SizedBox(height: 2),
+                Text(
+                  'Error: ${s.errorMessage}',
+                  style: const TextStyle(color: Colors.redAccent, fontSize: 9),
+                ),
+              ],
+              if (s.sidecarPath != null) ...[
+                const SizedBox(height: 2),
+                SelectableText(
+                  'Path: ${s.sidecarPath}',
+                  style: const TextStyle(color: Colors.white30, fontSize: 9),
+                ),
+              ],
+              const SizedBox(height: 6),
+            ],
+            const Divider(color: Colors.white10, height: 8),
+            const SizedBox(height: 6),
+          ] else ...[
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 6),
+              child: Text(
+                'No sidecar status yet — tap "Prepare Sidecars" or "Get Status".',
+                style: TextStyle(color: Colors.white30, fontSize: 10),
+              ),
+            ),
+          ],
+
+          // ── Action Buttons ────────────────────────────────────────────────
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: ready ? _prepareSidecars : null,
+                  icon: const Icon(Icons.compress_outlined, size: 14),
+                  label: const Text('Prepare Sidecars'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFFFF6B6B),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 9),
+                    textStyle: const TextStyle(fontSize: 11),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: _controller != null && !_sidecarBusy
+                      ? _getSidecarStatusForClipA
+                      : null,
+                  icon: const Icon(Icons.info_outline, size: 14),
+                  label: const Text('Get Status'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF6C7A9C),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 9),
+                    textStyle: const TextStyle(fontSize: 11),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: _controller != null && !_sidecarBusy
+                      ? _cleanupSidecars
+                      : null,
+                  icon: const Icon(Icons.delete_sweep_outlined, size: 14),
+                  label: const Text('Cleanup'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.white12,
+                    foregroundColor: Colors.white70,
+                    padding: const EdgeInsets.symmetric(vertical: 9),
+                    textStyle: const TextStyle(fontSize: 11),
+                  ),
+                ),
+              ),
+            ],
           ),
         ],
       ),

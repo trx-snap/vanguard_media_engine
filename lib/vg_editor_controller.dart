@@ -55,10 +55,12 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import 'vg_clip_descriptor.dart';
 import 'vg_editor_draft.dart';
 import 'vg_editor_export_request.dart';
 import 'vg_editor_export_result.dart';
 import 'vg_editor_value.dart';
+import 'vg_reverse_sidecar_status.dart';
 
 /// The formal Dart-side controller for the Phase 7 timeline editor API.
 ///
@@ -625,6 +627,20 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
     // Push to native via updateDraft (handles busy-lock, pause, and state).
     await updateDraft(newDraft);
+
+    // Phase 7.20D: if the clip is now reversed, kick off background sidecar
+    // preparation (fire-and-forget). The native compositor (Phase 7.20C)
+    // picks up the ready sidecar on the next compositor pull cycle.
+    // Does not block reverseClip completion and is safe to ignore on failure.
+    if (!_disposed) {
+      final toggled = value.draft.clips.firstWhere(
+        (c) => c.id == clipId,
+        orElse: () => value.draft.clips.first,
+      );
+      if (toggled.isReversed) {
+        prepareReverseSidecars().catchError((_) => <VGReverseSidecarStatus>[]);
+      }
+    }
   }
 
   // ── Frame cache stats (Phase 7.18B2 / DEC-152) ────────────────────────────
@@ -679,6 +695,110 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
       await _channel.invokeMethod<void>('clearTimelineCache');
     } on PlatformException catch (_) {
       // Best-effort — native may have no active timeline or compositor.
+    }
+  }
+
+  // ── Reverse sidecar (Phase 7.20D / DEC-155) ─────────────────────────────────
+
+  /// Prepares reverse sidecar assets for all currently reversed video clips in
+  /// the active draft.
+  ///
+  /// Maps to `prepareReverseSidecars` (Phase 7.20B native route).
+  /// Builds the clip list from [value.draft.clips] where
+  /// [VGClipDescriptor.isReversed] == true, then dispatches background H.264
+  /// All-Intra transcode tasks via [VGReverseSidecarManager].
+  ///
+  /// Returns a [List<VGReverseSidecarStatus>] — one entry per reversed clip.
+  /// Returns an empty list if there are no reversed clips in the current draft.
+  ///
+  /// **Preview only.** The export compositor must NOT call this method.
+  /// See VGReverseSidecarManager.h § Export isolation.
+  ///
+  /// Never throws on native failure — [PlatformException] is swallowed and
+  /// an empty list is returned (best-effort).
+  ///
+  /// Throws [StateError] if [dispose] has been called.
+  Future<List<VGReverseSidecarStatus>> prepareReverseSidecars() async {
+    _assertNotDisposed();
+    final reversedClips =
+        value.draft.clips.where((c) => c.isReversed).toList();
+    if (reversedClips.isEmpty) return const [];
+
+    final clips = reversedClips.map((c) {
+      return <String, Object>{
+        'clipId':       c.id,
+        'sourcePath':   c.sourcePath,
+        'trimStart':    c.trimStartSeconds,
+        'trimEnd':      c.trimEndSeconds,
+        'targetWidth':  value.draft.canvasWidth.toDouble(),
+        'targetHeight': value.draft.canvasHeight.toDouble(),
+        'sourceHash':   _sidecarSourceHash(c),
+      };
+    }).toList();
+
+    try {
+      final result = await _channel.invokeMapMethod<String, dynamic>(
+        'prepareReverseSidecars',
+        {'clips': clips},
+      );
+      final clipList = (result?['clips'] as List?) ?? [];
+      return clipList
+          .whereType<Map<Object?, Object?>>()
+          .map(VGReverseSidecarStatus.fromMap)
+          .toList();
+    } on PlatformException catch (_) {
+      // Best-effort — native may have no active compositor.
+      return const [];
+    }
+  }
+
+  /// Returns a live status snapshot for the given [clipId]'s reverse sidecar.
+  ///
+  /// Maps to `getSidecarStatus` (Phase 7.20B native route).
+  /// The native implementation is synchronous (lock-acquire + dict lookup).
+  ///
+  /// Returns an idle [VGReverseSidecarStatus] if no record exists for [clipId]
+  /// or on native failure.
+  ///
+  /// Throws [StateError] if [dispose] has been called.
+  Future<VGReverseSidecarStatus> getSidecarStatus({
+    required String clipId,
+  }) async {
+    _assertNotDisposed();
+    try {
+      final result = await _channel.invokeMapMethod<String, dynamic>(
+        'getSidecarStatus',
+        {'clipId': clipId},
+      );
+      if (result == null) {
+        return VGReverseSidecarStatus(
+          clipId: clipId,
+          state: VGReverseSidecarState.idle,
+        );
+      }
+      return VGReverseSidecarStatus.fromMap(
+        result.map((k, v) => MapEntry<Object?, Object?>(k, v)),
+      );
+    } on PlatformException catch (_) {
+      return VGReverseSidecarStatus(
+        clipId: clipId,
+        state: VGReverseSidecarState.idle,
+      );
+    }
+  }
+
+  /// Cancels all in-flight sidecar transcodes and deletes all sidecar files.
+  ///
+  /// Maps to `cleanupReverseSidecars` (Phase 7.20B native route).
+  /// Best-effort — never throws. No-op if no sidecars exist.
+  ///
+  /// Throws [StateError] if [dispose] has been called.
+  Future<void> cleanupReverseSidecars() async {
+    _assertNotDisposed();
+    try {
+      await _channel.invokeMethod<void>('cleanupReverseSidecars');
+    } on PlatformException catch (_) {
+      // Best-effort.
     }
   }
 
@@ -810,6 +930,17 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
       );
     }
   }
+
+  /// Computes a stable hash string for sidecar identity checks.
+  ///
+  /// Encodes (sourcePath + trimStart + trimEnd + canvasWidth + canvasHeight)
+  /// as a pipe-delimited string. Matches the sourceHash contract documented
+  /// in VGReverseSidecarManager.h § Sidecar identity (sourceHash).
+  String _sidecarSourceHash(VGClipDescriptor clip) =>
+      '${clip.sourcePath}'
+      '|${clip.trimStartSeconds}'
+      '|${clip.trimEndSeconds}'
+      '|${value.draft.canvasWidth}x${value.draft.canvasHeight}';
 
   // ── Debug ──────────────────────────────────────────────────────────────────
 
