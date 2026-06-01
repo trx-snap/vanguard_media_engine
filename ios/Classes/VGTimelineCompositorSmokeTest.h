@@ -1,5 +1,5 @@
 // VGTimelineCompositorSmokeTest.h
-// vanguard_media_engine — Phase 7 Stage 7.5B / Phase 7.16 / Phase 7.17
+// vanguard_media_engine — Phase 7 Stage 7.5B / Phase 7.16 / Phase 7.17 / Phase 7.19
 //
 // Headless native smoke test runner for VGTimelineCompositorNode.
 //
@@ -139,6 +139,24 @@ NS_ASSUME_NONNULL_BEGIN
 ///
 /// @return NSDictionary with @"success" YES/NO, @"steps", @"logs", @"error".
 + (NSDictionary<NSString *, id> *)runFreezeFrameDescriptorSmokeTest;
+
+/// Phase 7.19: Reverse-playback descriptor contract smoke test.
+///
+/// Validates VGClipDescriptor isReversed serialisation and isValid constraints
+/// via +fromDictionary: and -isValid. Exercises the Objective-C contract layer
+/// only; no compositor execution or AVAssetImageGenerator is invoked.
+///
+/// Five subtests:
+///   1. isReversed=YES round-trips through +fromDictionary: (non-nil, isReversed=YES, isValid=YES).
+///   2. Absent isReversed key round-trips as NO (forward clip).
+///   3. toDictionary omits isReversed key when NO.
+///   4. isValid rejects isReversed=YES on still-image clips.
+///   5. isValid rejects isReversed=YES on freeze-frame clips (freezePTS != nil).
+///
+/// In RELEASE builds: returns a static error result.
+///
+/// @return NSDictionary with @"success" YES/NO, @"steps", @"logs", @"error".
++ (NSDictionary<NSString *, id> *)runReverseDescriptorSmokeTest;
 
 @end
 

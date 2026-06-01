@@ -710,6 +710,12 @@ static os_log_t sTimelineLog;
 // Nil for still-image clips (those decode from sourceURL directly).
 // Nil for normal video clips (those use AVAssetReader).
 @property(nonatomic, strong, nullable) NSNumber *freezePTS;
+// Phase 7.19 (DEC-154): Reverse playback direction flag.
+// YES for reversed video clips (isReversed=YES in descriptor).
+// When YES, _pullBufferFromReader: uses AVAssetImageGenerator for each frame
+// (forward-only AVAssetReader is bypassed). Frames are cached in _frameCache.
+// Always NO for still-image and freeze-frame clips (those use isStaticSource=YES).
+@property(nonatomic) BOOL isReversed;
 @end
 
 @implementation _VGClipReader
@@ -1644,13 +1650,18 @@ static inline double _VGQuantizePTS(double pts) {
   }
 
   // ── Compute asset-local decode PTS ────────────────────────────────────────
-  // elapsed_timeline = requestedPTSSecs - clip.startTimeSeconds
-  // elapsed_asset    = elapsed_timeline * clip.speed
-  // t_asset          = clip.trimStartSeconds + elapsed_asset
-  // Clamped to [trimStartSeconds, trimEndSeconds] for float safety.
+  // Phase 7.19 (DEC-154): Reverse playback support.
+  // Forward: t_asset = clip.trimStartSeconds + elapsed_asset
+  // Reverse: t_asset = clip.trimEndSeconds   - elapsed_asset
+  // Both clamped to [trimStartSeconds, trimEndSeconds] for float safety.
   double elapsedTimeline = requestedPTSSecs - activeClip.startTimeSeconds;
   double elapsedAsset = elapsedTimeline * activeClip.speed;
-  double tAsset = activeClip.trimStartSeconds + elapsedAsset;
+  double tAsset;
+  if (activeClip.isReversed) {
+    tAsset = activeClip.trimEndSeconds - elapsedAsset;
+  } else {
+    tAsset = activeClip.trimStartSeconds + elapsedAsset;
+  }
   tAsset = MAX(tAsset, activeClip.trimStartSeconds);
   tAsset = MIN(tAsset, activeClip.trimEndSeconds);
 
@@ -1694,8 +1705,13 @@ static inline double _VGQuantizePTS(double pts) {
       [self _tearDownOutgoingReader];
       VGClipDescriptor *outgoingClip = _clips[outgoingClipIndex];
       double elapsedOut = requestedPTSSecs - outgoingClip.startTimeSeconds;
-      double tAssetOut =
-          outgoingClip.trimStartSeconds + elapsedOut * outgoingClip.speed;
+      // Phase 7.19: apply reverse formula for outgoing clip if reversed.
+      double tAssetOut;
+      if (outgoingClip.isReversed) {
+        tAssetOut = outgoingClip.trimEndSeconds - elapsedOut * outgoingClip.speed;
+      } else {
+        tAssetOut = outgoingClip.trimStartSeconds + elapsedOut * outgoingClip.speed;
+      }
       tAssetOut = MAX(tAssetOut, outgoingClip.trimStartSeconds);
       tAssetOut = MIN(tAssetOut, outgoingClip.trimEndSeconds);
       NSError *outBuildErr = nil;
@@ -1743,8 +1759,15 @@ static inline double _VGQuantizePTS(double pts) {
     // Compute outgoing clip asset-local time.
     VGClipDescriptor *outgoingClipDesc = _clips[outgoingClipIndex];
     double elapsedOut = requestedPTSSecs - outgoingClipDesc.startTimeSeconds;
-    double tAssetOut = outgoingClipDesc.trimStartSeconds +
-                       elapsedOut * outgoingClipDesc.speed;
+    // Phase 7.19: apply reverse formula for outgoing clip if reversed.
+    double tAssetOut;
+    if (outgoingClipDesc.isReversed) {
+      tAssetOut = outgoingClipDesc.trimEndSeconds -
+                  elapsedOut * outgoingClipDesc.speed;
+    } else {
+      tAssetOut = outgoingClipDesc.trimStartSeconds +
+                  elapsedOut * outgoingClipDesc.speed;
+    }
     tAssetOut = MAX(tAssetOut, outgoingClipDesc.trimStartSeconds);
     tAssetOut = MIN(tAssetOut, outgoingClipDesc.trimEndSeconds);
 
@@ -2258,6 +2281,218 @@ static inline double _VGQuantizePTS(double pts) {
 
     return pb; // caller owns +1 from decode
   }
+
+  // ── Phase 7.19 (DEC-154): Reverse video path ────────────────────────────────
+  // AVAssetReader is forward-only (copyNextSampleBuffer sequential contract).
+  // For reversed video clips, bypass the reader and extract each frame via
+  // AVAssetImageGenerator at the computed tAsset (reverse time-mapped PTS).
+  // The compositor-level _frameCache absorbs duplicate requests within a
+  // display-refresh cycle (60 Hz display vs 30 fps source).
+  // Error codes 40-49 are reserved for Phase 7.19 reverse extraction.
+  if (reader.isReversed && !reader.isStaticSource) {
+    VGClipDescriptor *clip = _clips[reader.clipIndex];
+    uint64_t currentGen = atomic_load(&_generation);
+
+    // ── 1. Check compositor-level frame cache ──────────────────────────────
+    // Same cache keying as the freeze-frame path. PTS-quantized keys
+    // (0.001 s granularity in _VGTimelineFrameCache) naturally differentiate
+    // each unique reverse-playback frame.
+    CVPixelBufferRef cachedBuf =
+        [_frameCache lookupWithClipIndex:reader.clipIndex
+                               sourceURL:clip.sourceURL
+                                assetPTS:tAsset
+                              renderSize:_targetRenderSize
+                              generation:currentGen];
+    if (cachedBuf) {
+      // Cache hit: update per-reader last-delivered fields so that
+      // display-refresh re-requests within the same frame window short-circuit.
+      reader.lastDeliveredAssetPTS      = tAsset;
+      reader.lastDeliveredAssetDuration = 1.0 / MAX(reader.sourceFPS, 1.0);
+      if (reader.lastDeliveredBuffer) CVPixelBufferRelease(reader.lastDeliveredBuffer);
+      reader.lastDeliveredBuffer = cachedBuf; // adopt the +1 from lookupWith...
+      CVPixelBufferRetain(cachedBuf);          // reader's own cache +1
+      os_log_debug(sTimelineLog,
+                   "[VGTCNode] reverse cache hit: clip=%lu tAsset=%.3fs",
+                   (unsigned long)reader.clipIndex, tAsset);
+      return cachedBuf; // caller owns the +1 from lookupWith...
+    }
+
+    // ── 2. Cache miss: extract via AVAssetImageGenerator (inline) ────────
+    // Create inline — stateless; alloc cost (~30 μs) is negligible vs
+    // extraction I/O cost (~5-15 ms). No persistent generator on _VGClipReader.
+    // Configuration exactly matches the Phase 7.17 freeze-frame path (DEC-150).
+    NSURL *assetURL = [NSURL fileURLWithPath:clip.sourceURL];
+    if (!assetURL) {
+      if (outError) {
+        *outError = _VGTCNError(
+            40, ([NSString stringWithFormat:
+                     @"VGTimelineCompositorNode (Phase 7.19): invalid sourceURL "
+                      "for reversed clip %@.",
+                     clip.clipId]));
+      }
+      return NULL;
+    }
+
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:assetURL options:nil];
+    AVAssetImageGenerator *gen =
+        [AVAssetImageGenerator assetImageGeneratorWithAsset:asset];
+    // kCMTimeZero tolerances: exact frame accuracy (same as Phase 7.17 freeze path).
+    gen.requestedTimeToleranceBefore = kCMTimeZero;
+    gen.requestedTimeToleranceAfter  = kCMTimeZero;
+    // 2× canvas size: avoid excess memory while supporting HiDPI sources.
+    gen.maximumSize = CGSizeMake(_targetRenderSize.width * 2.0,
+                                 _targetRenderSize.height * 2.0);
+    // appliesPreferredTrackTransform=YES: orientation-normalize the extracted
+    // frame (same as Phase 7.17 fix — see RR-154).
+    gen.appliesPreferredTrackTransform = YES;
+
+    CMTime requestTime = CMTimeMakeWithSeconds(tAsset, 600);
+    NSError *genErr = nil;
+    CMTime actualTime;
+    CGImageRef cgFrame = [gen copyCGImageAtTime:requestTime
+                                     actualTime:&actualTime
+                                          error:&genErr];
+    if (!cgFrame) {
+      if (outError) {
+        *outError = _VGTCNError(
+            41, ([NSString stringWithFormat:
+                     @"VGTimelineCompositorNode (Phase 7.19): "
+                      "AVAssetImageGenerator failed for reversed clip %@ "
+                      "at tAsset=%.3fs: %@",
+                     clip.clipId, tAsset,
+                     genErr.localizedDescription ?: @"unknown"]));
+      }
+      os_log_error(sTimelineLog,
+                   "[VGTCNode] reverse extract failed clip=%lu tAsset=%.3fs: %{public}@",
+                   (unsigned long)reader.clipIndex, tAsset,
+                   genErr.localizedDescription);
+      return NULL;
+    }
+
+    os_log(sTimelineLog,
+           "[VGTCNode] reverse frame extracted: clip=%lu tAsset=%.3fs actualPTS=%.3fs",
+           (unsigned long)reader.clipIndex, tAsset, CMTimeGetSeconds(actualTime));
+
+    // ── 3. Convert CGImage → CVPixelBufferRef ───────────────────────────────
+    // Exact same CGImage→CIImage→CVPixelBuffer pipeline as Phase 7.17 (lines
+    // 2066–2188). Fit-mode center-scaled letterbox. Black bars on AR mismatch.
+    {
+      CIImage *ciFrame = [CIImage imageWithCGImage:cgFrame];
+      CGImageRelease(cgFrame); // CIImage retains internally; release CGImage.
+      cgFrame = NULL;          // prevent double-release.
+
+      CGSize imgSize = ciFrame.extent.size;
+      if (imgSize.width <= 0 || imgSize.height <= 0) {
+        if (outError) {
+          *outError = _VGTCNError(
+              42, ([NSString stringWithFormat:
+                       @"VGTimelineCompositorNode (Phase 7.19): "
+                        "extracted reverse frame has zero size for clip %@.",
+                       clip.clipId]));
+        }
+        return NULL;
+      }
+
+      // Aspect-fit scale (letterbox — same as Phase 7.17 freeze path).
+      CGFloat scaleX = _targetRenderSize.width  / imgSize.width;
+      CGFloat scaleY = _targetRenderSize.height / imgSize.height;
+      CGFloat scale  = MIN(scaleX, scaleY);
+      CGSize  drawSize = CGSizeMake(imgSize.width * scale, imgSize.height * scale);
+      CGFloat offsetX  = (_targetRenderSize.width  - drawSize.width)  / 2.0;
+      CGFloat offsetY  = (_targetRenderSize.height - drawSize.height) / 2.0;
+
+      // Create black-filled BGRA canvas buffer.
+      NSDictionary *pbAttrs = @{
+          (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+          (id)kCVPixelBufferWidthKey:  @((int)_targetRenderSize.width),
+          (id)kCVPixelBufferHeightKey: @((int)_targetRenderSize.height),
+          (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+      };
+      CVPixelBufferRef pb = NULL;
+      CVReturn pbRet = CVPixelBufferCreate(
+          kCFAllocatorDefault,
+          (size_t)_targetRenderSize.width,
+          (size_t)_targetRenderSize.height,
+          kCVPixelFormatType_32BGRA,
+          (__bridge CFDictionaryRef)pbAttrs,
+          &pb);
+      if (pbRet != kCVReturnSuccess || !pb) {
+        if (outError) {
+          *outError = _VGTCNError(
+              43, ([NSString stringWithFormat:
+                       @"VGTimelineCompositorNode (Phase 7.19): "
+                        "CVPixelBufferCreate failed for reversed clip %@.",
+                       clip.clipId]));
+        }
+        return NULL;
+      }
+
+      // Clear to black.
+      CVPixelBufferLockBaseAddress(pb, 0);
+      void *baseAddr = CVPixelBufferGetBaseAddress(pb);
+      size_t byteCount = CVPixelBufferGetBytesPerRow(pb)
+                         * CVPixelBufferGetHeight(pb);
+      memset(baseAddr, 0, byteCount);
+      CVPixelBufferUnlockBaseAddress(pb, 0);
+
+      // Render scaled CIImage into pixel buffer (CI origin = bottom-left).
+      CIImage *scaled = [ciFrame imageByApplyingTransform:
+          CGAffineTransformMakeScale(scale, scale)];
+      CIImage *centered = [scaled imageByApplyingTransform:
+          CGAffineTransformMakeTranslation(offsetX, offsetY)];
+
+      CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+      [_VGTCNSharedCIContext() render:centered
+                        toCVPixelBuffer:pb
+                                  bounds:CGRectMake(0, 0,
+                                                    _targetRenderSize.width,
+                                                    _targetRenderSize.height)
+                              colorSpace:cs];
+      CGColorSpaceRelease(cs);
+
+      // Apply Phase 7.11 per-clip transform if non-identity.
+      VGClipTransformDescriptor *td = clip.transform;
+      if (td && !td.isIdentity) {
+        NSError *tfErr = nil;
+        CVPixelBufferRef tfPB = _VGTCNApplyTransformAndOpacity(pb, td, &tfErr);
+        CVPixelBufferRelease(pb);
+        if (!tfPB) {
+          if (outError) *outError = tfErr;
+          os_log_error(sTimelineLog,
+                       "[VGTCNode] reverse transform failed clip=%lu: %{public}@",
+                       (unsigned long)reader.clipIndex,
+                       tfErr.localizedDescription);
+          return NULL;
+        }
+        pb = tfPB;
+      }
+
+      // ── 4. Insert into compositor-level frame cache ──────────────────────
+      [_frameCache insertWithClipIndex:reader.clipIndex
+                             sourceURL:clip.sourceURL
+                              assetPTS:tAsset
+                            renderSize:_targetRenderSize
+                            generation:currentGen
+                                buffer:pb];
+
+      // ── 5. Update per-reader last-delivered fields ──────────────────────
+      reader.lastDeliveredAssetPTS      = tAsset;
+      reader.lastDeliveredAssetDuration = 1.0 / MAX(reader.sourceFPS, 1.0);
+      if (reader.lastDeliveredBuffer) CVPixelBufferRelease(reader.lastDeliveredBuffer);
+      reader.lastDeliveredBuffer = pb;
+      CVPixelBufferRetain(pb); // per-reader cache +1
+
+      os_log(sTimelineLog,
+             "[VGTCNode] reverse decoded+cached: clip=%lu tAsset=%.3fs "
+             "canvas=%.0fx%.0f cacheBytes=%zu",
+             (unsigned long)reader.clipIndex, tAsset,
+             _targetRenderSize.width, _targetRenderSize.height,
+             _frameCache.currentBytes);
+
+      return pb; // caller owns +1 from CVPixelBufferCreate
+    }
+  }
+  // ── End Phase 7.19 reverse extraction ───────────────────────────────────
 
   // ── 1. Per-reader reuse guard (video path) ────────────────────────────────
   if (reader.lastDeliveredBuffer != NULL) {
@@ -2810,10 +3045,14 @@ static inline double _VGQuantizePTS(double pts) {
   clipReader.reader = reader;
   clipReader.trackOutput = output;
   clipReader.sourceFPS = sourceFPS;
+  // Phase 7.19 (DEC-154): propagate reverse direction flag from descriptor.
+  // Still-image and freeze clips already short-circuit before this point
+  // (they return from the mediaKindImage and freezePTS branches above).
+  clipReader.isReversed = clip.isReversed;
 
   os_log(sTimelineLog,
-         "[VGTCNode] built reader: clip=%lu startAt=%.3fs fps=%.1f",
-         (unsigned long)clipIndex, startTimeSecs, sourceFPS);
+         "[VGTCNode] built reader: clip=%lu startAt=%.3fs fps=%.1f isReversed=%d",
+         (unsigned long)clipIndex, startTimeSecs, sourceFPS, (int)clip.isReversed);
 
   return clipReader;
 }

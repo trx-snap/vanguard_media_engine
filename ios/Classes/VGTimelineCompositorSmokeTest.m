@@ -305,7 +305,8 @@ static BOOL _generateSyntheticVideo(NSString *path,
                                        transform:nil
                                          fitMode:VGStillImageFitModeFit  // default; video clip
                                         cropRect:nil                    // no crop; video clip
-                                         freezePTS:nil];                  // not a freeze clip
+                                         freezePTS:nil                    // not a freeze clip
+                                        isReversed:NO];
 
     // Clip B: 5.0s duration, starts at 5.0s on timeline, trim [0, 5], speed 1.0
     VGClipDescriptor *clipB =
@@ -320,7 +321,8 @@ static BOOL _generateSyntheticVideo(NSString *path,
                                        transform:nil
                                          fitMode:VGStillImageFitModeFit  // default; video clip
                                         cropRect:nil                    // no crop; video clip
-                                         freezePTS:nil];                  // not a freeze clip
+                                         freezePTS:nil                    // not a freeze clip
+                                        isReversed:NO];
 
     if (![clipA isValid] || ![clipB isValid]) {
         log(@"  ❌ Clip descriptor validation failed");
@@ -1312,6 +1314,224 @@ static BOOL _generateMovingPatternVideo(NSString *path,
 
 @end
 
+// ── Phase 7.19: Reverse-playback descriptor contract smoke test ─────────────
+//
+// Validates VGClipDescriptor isReversed serialisation and isValid constraints
+// via +fromDictionary: and -isValid. Exercises the Objective-C contract layer
+// only; no compositor execution or AVAssetImageGenerator is invoked.
+//
+// Five subtests:
+//   1. isReversed=YES round-trips via fromDictionary: (non-nil, value=YES).
+//   2. isReversed=NO (absent key) round-trips as NO (normal clip).
+//   3. toDictionary omits isReversed key when NO.
+//   4. isValid rejects isReversed=YES on an image clip.
+//   5. isValid rejects isReversed=YES on a freeze-frame clip.
+
+@implementation VGTimelineCompositorSmokeTest (Phase719)
+
++ (NSDictionary<NSString *, id> *)runReverseDescriptorSmokeTest {
+    NSMutableArray<NSDictionary *> *steps = [NSMutableArray array];
+    NSMutableArray<NSString *> *logs = [NSMutableArray array];
+    __block BOOL overallSuccess = YES;
+
+    void (^log)(NSString *) = ^(NSString *msg) {
+        [logs addObject:msg];
+        os_log(sSmokeLog, "[7.19] %{public}@", msg);
+    };
+    void (^step)(NSString *, BOOL, NSString *) = ^(NSString *name, BOOL passed, NSString *detail) {
+        if (!passed) overallSuccess = NO;
+        [steps addObject:_stepResult(name, passed, detail)];
+    };
+
+    log(@"Phase 7.19 Reverse-Playback Descriptor Contract Smoke Test");
+    log(@"Tests VGClipDescriptor isReversed contract via fromDictionary: and isValid");
+    log(@"");
+
+    // ─── Test 1: isReversed=YES round-trip via fromDictionary: ───────────────
+    log(@"Test 1: isReversed=YES round-trips via fromDictionary:");
+    {
+        NSDictionary *dict = @{
+            @"id"               : @"vid-reversed-7.19",
+            @"sourcePath"       : @"/tmp/smoke_video.mp4",
+            @"mediaKind"        : @"video",
+            @"startTimeSeconds" : @0.0,
+            @"durationSeconds"  : @5.0,
+            @"trimStartSeconds" : @0.0,
+            @"trimEndSeconds"   : @5.0,
+            @"speed"            : @1.0,
+            @"isReversed"       : @YES,
+        };
+        VGClipDescriptor *clip = [VGClipDescriptor fromDictionary:dict];
+        BOOL passed = (clip != nil && clip.isReversed == YES && [clip isValid]);
+        if (passed) {
+            log(@"  \u2705 isReversed=YES: fromDictionary: returned non-nil with isReversed=YES and isValid=YES");
+        } else {
+            log([NSString stringWithFormat:
+                 @"  \u274c isReversed=YES: clip=%@ isReversed=%@ isValid=%@",
+                 clip ?: (id)@"nil",
+                 clip ? @(clip.isReversed) : (id)@"nil",
+                 clip ? @([clip isValid]) : (id)@"nil"]);
+        }
+        step(@"isReversed=YES round-trip", passed, passed
+             ? @"isReversed=YES deserialized correctly and passes isValid"
+             : @"fromDictionary: returned nil, wrong isReversed, or isValid failed");
+    }
+
+    // ─── Test 2: absent isReversed key → NO (normal forward clip) ────────────
+    log(@"");
+    log(@"Test 2: absent isReversed key (normal video clip) — must deserialise as NO:");
+    {
+        NSDictionary *dict = @{
+            @"id"               : @"vid-forward-7.19",
+            @"sourcePath"       : @"/tmp/smoke_video.mp4",
+            @"mediaKind"        : @"video",
+            @"startTimeSeconds" : @0.0,
+            @"durationSeconds"  : @5.0,
+            @"trimStartSeconds" : @0.0,
+            @"trimEndSeconds"   : @5.0,
+            @"speed"            : @1.0,
+            // isReversed intentionally absent
+        };
+        VGClipDescriptor *clip = [VGClipDescriptor fromDictionary:dict];
+        BOOL passed = (clip != nil && clip.isReversed == NO);
+        if (passed) {
+            log(@"  \u2705 absent isReversed: fromDictionary: returned non-nil with isReversed=NO");
+        } else {
+            log([NSString stringWithFormat:
+                 @"  \u274c absent isReversed: clip=%@ isReversed=%@",
+                 clip ?: (id)@"nil",
+                 clip ? @(clip.isReversed) : (id)@"nil"]);
+        }
+        step(@"absent isReversed \u2192 NO", passed, passed
+             ? @"isReversed correctly NO when key absent"
+             : @"fromDictionary: returned nil or unexpected isReversed=YES");
+    }
+
+    // ─── Test 3: toDictionary omits isReversed when NO ─────────────────────
+    log(@"");
+    log(@"Test 3: toDictionary omits isReversed key when NO:");
+    {
+        VGClipDescriptor *clip = [[VGClipDescriptor alloc]
+            initWithClipId:@"vid-fwd-ser-7.19"
+                 sourceURL:@"/tmp/smoke_video.mp4"
+                 mediaKind:VGClipMediaKindVideo
+         startTimeSeconds:0.0
+         durationSeconds:5.0
+         trimStartSeconds:0.0
+           trimEndSeconds:5.0
+                     speed:1.0
+                 transform:nil
+                   fitMode:VGStillImageFitModeFit
+                  cropRect:nil
+                 freezePTS:nil
+                isReversed:NO];
+        NSDictionary *dict = [clip toDictionary];
+        BOOL passed = (dict[@"isReversed"] == nil);
+        if (passed) {
+            log(@"  \u2705 toDictionary omits isReversed when NO");
+        } else {
+            log([NSString stringWithFormat:
+                 @"  \u274c toDictionary includes isReversed=%@ when it should be absent",
+                 dict[@"isReversed"]]);
+        }
+        step(@"toDictionary omits isReversed=NO", passed, passed
+             ? @"isReversed key absent from serialised dict when NO"
+             : @"toDictionary unexpectedly included isReversed key");
+    }
+
+    // ─── Test 4: isValid rejects isReversed=YES on an image clip ───────────
+    log(@"");
+    log(@"Test 4: isValid rejects isReversed=YES on a still-image clip:");
+    {
+        NSDictionary *dict = @{
+            @"id"               : @"img-reversed-7.19",
+            @"sourcePath"       : @"/tmp/smoke_image.png",
+            @"mediaKind"        : @"image",
+            @"startTimeSeconds" : @0.0,
+            @"durationSeconds"  : @3.0,
+            @"trimStartSeconds" : @0.0,
+            @"trimEndSeconds"   : @3.0,
+            @"speed"            : @1.0,
+            @"isReversed"       : @YES,
+        };
+        VGClipDescriptor *clip = [VGClipDescriptor fromDictionary:dict];
+        // fromDictionary: succeeds (no constraint on isReversed at parse level).
+        // isValid must return NO because image clips must not be reversed.
+        BOOL passed = (clip != nil && ![clip isValid]);
+        if (passed) {
+            log(@"  \u2705 isValid correctly rejected isReversed=YES on image clip");
+        } else {
+            log([NSString stringWithFormat:
+                 @"  \u274c Expected isValid=NO for reversed image clip, got clip=%@ isValid=%@",
+                 clip ?: (id)@"nil",
+                 clip ? @([clip isValid]) : (id)@"n/a"]);
+        }
+        step(@"isValid rejects reversed image clip", passed, passed
+             ? @"isValid=NO for isReversed=YES + mediaKind=image"
+             : @"isValid should have returned NO for reversed image clip");
+    }
+
+    // ─── Test 5: isValid rejects isReversed=YES on a freeze-frame clip ──────
+    log(@"");
+    log(@"Test 5: isValid rejects isReversed=YES on a freeze-frame clip:");
+    {
+        NSDictionary *dict = @{
+            @"id"               : @"vid-rev-freeze-7.19",
+            @"sourcePath"       : @"/tmp/smoke_video.mp4",
+            @"mediaKind"        : @"video",
+            @"startTimeSeconds" : @0.0,
+            @"durationSeconds"  : @2.0,
+            @"trimStartSeconds" : @0.0,
+            @"trimEndSeconds"   : @2.0,
+            @"speed"            : @1.0,
+            @"freezePTS"        : @3.0,
+            @"isReversed"       : @YES,
+        };
+        VGClipDescriptor *clip = [VGClipDescriptor fromDictionary:dict];
+        // fromDictionary: succeeds. isValid must return NO:
+        // freeze clips (freezePTS != nil) must not have isReversed=YES.
+        BOOL passed = (clip != nil && ![clip isValid]);
+        if (passed) {
+            log(@"  \u2705 isValid correctly rejected isReversed=YES on freeze clip");
+        } else {
+            log([NSString stringWithFormat:
+                 @"  \u274c Expected isValid=NO for reversed freeze clip, got clip=%@ isValid=%@",
+                 clip ?: (id)@"nil",
+                 clip ? @([clip isValid]) : (id)@"n/a"]);
+        }
+        step(@"isValid rejects reversed freeze clip", passed, passed
+             ? @"isValid=NO for isReversed=YES + freezePTS != nil"
+             : @"isValid should have returned NO for reversed freeze clip");
+    }
+
+    // ─── Summary ──────────────────────────────────────────────────────
+    log(@"");
+    log(@"\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550");
+    if (overallSuccess) {
+        log(@"  \u2705 ALL PHASE 7.19 NATIVE TESTS PASSED");
+    } else {
+        log(@"  \u274c SOME PHASE 7.19 NATIVE TESTS FAILED");
+    }
+    log(@"\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550");
+
+    NSMutableDictionary *result = [@{
+        @"success": @(overallSuccess),
+        @"steps": [steps copy],
+        @"logs": [logs copy],
+    } mutableCopy];
+    if (!overallSuccess) {
+        for (NSDictionary *s in steps) {
+            if (![s[@"passed"] boolValue]) {
+                result[@"error"] = s[@"detail"];
+                break;
+            }
+        }
+    }
+    return [result copy];
+}
+
+@end
+
 #else // !DEBUG
 
 // ─── Release-mode stub ──────────────────────────────────────────────────────
@@ -1328,7 +1548,7 @@ static BOOL _generateMovingPatternVideo(NSString *path,
     return @{
         @"success": @NO,
         @"steps": @[],
-        @"logs": @[@"Release build — smoke test disabled"],
+        @"logs": @[@"Release build \u2014 smoke test disabled"],
         @"error": @"VGTimelineCompositorSmokeTest is DEBUG-only",
     };
 }
@@ -1348,7 +1568,7 @@ static BOOL _generateMovingPatternVideo(NSString *path,
     return @{
         @"success": @NO,
         @"steps": @[],
-        @"logs": @[@"Release build — still-image fit/crop smoke test disabled"],
+        @"logs": @[@"Release build \u2014 still-image fit/crop smoke test disabled"],
         @"error": @"VGTimelineCompositorSmokeTest.runStillImageFitCropSmokeTest is DEBUG-only",
     };
 }
@@ -1358,8 +1578,18 @@ static BOOL _generateMovingPatternVideo(NSString *path,
     return @{
         @"success": @NO,
         @"steps": @[],
-        @"logs": @[@"Release build — freeze-frame descriptor smoke test disabled"],
+        @"logs": @[@"Release build \u2014 freeze-frame descriptor smoke test disabled"],
         @"error": @"VGTimelineCompositorSmokeTest.runFreezeFrameDescriptorSmokeTest is DEBUG-only",
+    };
+}
+
++ (NSDictionary<NSString *, id> *)runReverseDescriptorSmokeTest {
+    // Phase 7.19 reverse-playback descriptor test is DEBUG-only.
+    return @{
+        @"success": @NO,
+        @"steps": @[],
+        @"logs": @[@"Release build \u2014 reverse-playback descriptor smoke test disabled"],
+        @"error": @"VGTimelineCompositorSmokeTest.runReverseDescriptorSmokeTest is DEBUG-only",
     };
 }
 
