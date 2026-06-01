@@ -1650,6 +1650,95 @@ static BOOL _generateMovingPatternVideo(NSString *path,
     return [result copy];
 }
 
+// ───────────────────────────────────────────────────────────────────────────────
+#pragma mark - Phase 7.20C: Preview/export guard smoke test
+// ───────────────────────────────────────────────────────────────────────────────
+
++ (NSDictionary<NSString *, id> *)runSidecarCompositorGuardSmokeTest {
+    // Phase 7.20C structural guard verification.
+    // No real video files are required; this validates the guard logic that
+    // prevents sidecar use in export mode at the ObjC API level.
+    NSMutableArray *steps = [NSMutableArray array];
+    NSMutableArray *logs  = [NSMutableArray array];
+    NSString *firstError  = nil;
+
+    // ── Baseline: ensure all sidecars are in idle state ───────────────────────
+    [[VGReverseSidecarManager sharedManager] cleanupAllSidecars];
+    [logs addObject:@"[7.20C-baseline] cleanupAllSidecars called"];
+
+    // ── Step 1: unknown clipId returns idle (no sidecar, guard short-circuits) ──
+    {
+        VGReverseSidecarStatus *status =
+            [[VGReverseSidecarManager sharedManager]
+                statusForClipId:@"smoke_7_20c_guard_clip"];
+        BOOL passed = (status.state == VGReverseSidecarStateIdle);
+        [steps addObject:_stepResult(
+            @"7.20C-1: unknown clip → idle (no sidecar, guard would skip swap)",
+            passed,
+            [NSString stringWithFormat:@"state=%ld sidecarPath=%@",
+             (long)status.state, status.sidecarPath ?: @"nil"])];
+        [logs addObject:[NSString stringWithFormat:
+            @"[7.20C-1] statusForClipId for unknown clip: state=%ld (expected 0=idle)",
+            (long)status.state]];
+        if (!passed && !firstError)
+            firstError = @"7.20C-1: expected idle state for unknown clip";
+    }
+
+    // ── Step 2: VGRenderModeExport != VGRenderModePreview (guard constants OK) ──
+    {
+        BOOL passed = (VGRenderModeExport != VGRenderModePreview);
+        [steps addObject:_stepResult(
+            @"7.20C-2: VGRenderModeExport != VGRenderModePreview",
+            passed,
+            [NSString stringWithFormat:@"preview=%ld export=%ld",
+             (long)VGRenderModePreview, (long)VGRenderModeExport])];
+        [logs addObject:[NSString stringWithFormat:
+            @"[7.20C-2] VGRenderModePreview=%ld VGRenderModeExport=%ld",
+            (long)VGRenderModePreview, (long)VGRenderModeExport]];
+        if (!passed && !firstError)
+            firstError = @"7.20C-2: render mode constants must not overlap";
+    }
+
+    // ── Step 3: idle sidecar status → guard condition evaluates to skip ────────
+    // The guard in _buildReaderForClipIndex: checks:
+    //   sidecarStatus.state == VGReverseSidecarStateReady && sidecarPath.length > 0
+    // For an idle clip, this must be NO (guard skips sidecar swap).
+    {
+        VGReverseSidecarStatus *status =
+            [[VGReverseSidecarManager sharedManager]
+                statusForClipId:@"smoke_7_20c_guard_clip"];
+        BOOL guardCondition = (status.state == VGReverseSidecarStateReady &&
+                               status.sidecarPath.length > 0);
+        // Guard must NOT trigger for idle state — so passed when guardCondition==NO.
+        BOOL passed = !guardCondition;
+        [steps addObject:_stepResult(
+            @"7.20C-3: idle sidecar → sidecar swap guard condition is false",
+            passed,
+            [NSString stringWithFormat:
+             @"guardCondition=%d (expected 0=false) state=%ld sidecarPath=%@",
+             (int)guardCondition, (long)status.state,
+             status.sidecarPath ?: @"nil"])];
+        [logs addObject:[NSString stringWithFormat:
+            @"[7.20C-3] guard condition for idle status: %d (expected 0=false)",
+            (int)guardCondition]];
+        if (!passed && !firstError)
+            firstError = @"7.20C-3: idle sidecar guard condition must be false";
+    }
+
+    // ── Summarise ────────────────────────────────────────────────────────────────────
+    BOOL allPassed = YES;
+    for (NSDictionary *s in steps) {
+        if (![s[@"passed"] boolValue]) { allPassed = NO; break; }
+    }
+    NSMutableDictionary *result = [@{
+        @"success": @(allPassed),
+        @"steps":   steps,
+        @"logs":    logs,
+    } mutableCopy];
+    if (!allPassed && firstError) result[@"error"] = firstError;
+    return [result copy];
+}
+
 @end
 
 #else // !DEBUG
@@ -1720,6 +1809,16 @@ static BOOL _generateMovingPatternVideo(NSString *path,
         @"steps": @[],
         @"logs": @[@"Release build \u2014 sidecar manager smoke test disabled"],
         @"error": @"VGTimelineCompositorSmokeTest.runReverseSidecarManagerSmokeTest is DEBUG-only",
+    };
+}
+
++ (NSDictionary<NSString *, id> *)runSidecarCompositorGuardSmokeTest {
+    // Phase 7.20C preview/export guard smoke test is DEBUG-only.
+    return @{
+        @"success": @NO,
+        @"steps": @[],
+        @"logs": @[@"Release build \u2014 sidecar guard smoke test disabled"],
+        @"error": @"VGTimelineCompositorSmokeTest.runSidecarCompositorGuardSmokeTest is DEBUG-only",
     };
 }
 

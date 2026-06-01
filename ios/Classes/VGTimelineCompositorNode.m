@@ -127,6 +127,9 @@
 // ─── Phase 7.12: ImageIO for still-image decode ───────────────────────────────
 #import <ImageIO/ImageIO.h>
 
+// ─── Phase 7.20C: Reverse sidecar manager (preview reader swap) ──────────────
+#import "VGReverseSidecarManager.h"
+
 // ─── System
 // ───────────────────────────────────────────────────────────────────
 #import <os/log.h>
@@ -1101,6 +1104,11 @@ static inline double _VGQuantizePTS(double pts) {
   //   when multiple freeze clips share the same source asset.
   _VGTimelineFrameCache *_frameCache;
   dispatch_queue_t _prefetchQueue;
+
+  // ── Phase 7.20C: transient render mode ───────────────────────────────────
+  // Set at the start of each pullFrame:, read by _buildReaderForClipIndex:.
+  // Pull-queue-serial access only — no lock required.
+  VGRenderMode _currentRenderMode;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1558,6 +1566,12 @@ static inline double _VGQuantizePTS(double pts) {
   if (request.generation != capturedGeneration) {
     return [VGFrameResult skippedWithGeneration:request.generation];
   }
+
+  // Phase 7.20C: capture render mode so _buildReaderForClipIndex: can gate the
+  // sidecar reader swap. Set here once per pullFrame: before any reader build.
+  // VGRenderModeExport (VGExportScheduler path) bypasses the sidecar swap;
+  // VGRenderModePreview uses the sidecar when ready.
+  _currentRenderMode = request.mode;
 
   // ── Compute requested global PTS in seconds ───────────────────────────────
   double requestedPTSSecs = 0.0;
@@ -2814,6 +2828,56 @@ static inline double _VGQuantizePTS(double pts) {
     return clipReader;
   }
 
+  // ── Phase 7.20C: Preview sidecar reader swap ─────────────────────────────
+  //
+  // Condition: preview mode + clip.isReversed + sidecar state == ready.
+  //
+  // Strategy A (Phase 7.20): instead of invoking AVAssetImageGenerator
+  // synchronously on the pull queue for every frame (5–150 ms per call,
+  // Phase 7.19 pain point), redirect to a forward AVAssetReader on the
+  // All-Intra sidecar that was pre-transcoded in reverse order by
+  // VGReverseSidecarManager. This yields the same optimized forward-sequential
+  // AVAssetReader path used for all forward clips.
+  //
+  // Export guard: _currentRenderMode == VGRenderModeExport skips this block.
+  // The export compositor (VGTimelineExportHelper) is a fully independent node
+  // instance that never touches VGReverseSidecarManager. It uses the Phase 7.19
+  // AVAssetImageGenerator path for per-frame exact frame accuracy — correct for
+  // export quality. The sidecar is Preview-only (All-Intra, preview bitrate).
+  //
+  // Orientation: the sidecar transcoder bakes preferredTransform into the pixel
+  // data. The sidecar track's preferredTransform is identity. The reader built
+  // here must NOT re-apply orientation (no layer instruction with the source
+  // clip's preferredTransform). The auto-generated videoComposition from
+  // videoCompositionWithPropertiesOfAsset: on the identity-transform sidecar
+  // track is a pass-through — correct behavior.
+  //
+  // Fall-through: any failure in _buildSidecarReaderForClipIndex:... returns nil,
+  // and this block falls through to the Phase 7.19 AVAssetImageGenerator path.
+  // The sidecar is therefore a pure acceleration: correctness is preserved when
+  // it is unavailable.
+  if (clip.isReversed && _currentRenderMode == VGRenderModePreview) {
+    VGReverseSidecarStatus *sidecarStatus =
+        [[VGReverseSidecarManager sharedManager] statusForClipId:clip.clipId];
+    if (sidecarStatus.state == VGReverseSidecarStateReady &&
+        sidecarStatus.sidecarPath.length > 0) {
+      _VGClipReader *sidecarClipReader =
+          [self _buildSidecarReaderForClipIndex:clipIndex
+                                    startAtTime:startTimeSecs
+                                    sidecarPath:sidecarStatus.sidecarPath];
+      if (sidecarClipReader) {
+        return sidecarClipReader;
+      }
+      // Reader build failed — fall through to Phase 7.19 generator path.
+      os_log_error(
+          sTimelineLog,
+          "[VGTCNode] 7.20C sidecar reader build failed, falling back to "
+          "AVAssetImageGenerator path: clip=%lu src=%{public}@",
+          (unsigned long)clipIndex, clip.sourceURL.lastPathComponent);
+    }
+  }
+  // ── End Phase 7.20C sidecar swap ─────────────────────────────────────────
+
   // ── Build AVURLAsset ──────────────────────────────────────────────────────
   NSURL *assetURL = [NSURL fileURLWithPath:clip.sourceURL];
   if (!assetURL) {
@@ -3053,6 +3117,166 @@ static inline double _VGQuantizePTS(double pts) {
   os_log(sTimelineLog,
          "[VGTCNode] built reader: clip=%lu startAt=%.3fs fps=%.1f isReversed=%d",
          (unsigned long)clipIndex, startTimeSecs, sourceFPS, (int)clip.isReversed);
+
+  return clipReader;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Phase 7.20C: Sidecar reader builder
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Phase 7.20C: Build a forward AVAssetReader from the pre-transcoded reverse
+/// sidecar file for a reversed clip in preview mode.
+///
+/// The sidecar is an All-Intra H.264 .mov that contains the reversed clip's
+/// frames encoded in forward sequential order (frame 0 = original trimEnd,
+/// frame N = original trimStart). The sidecar track has identity
+/// preferredTransform (orientation is pre-baked into pixel data by the
+/// transcoder). No orientation layer instruction is applied here.
+///
+/// Time mapping (sidecar_t = trimEnd − tAsset):
+///
+///   The caller passes startAtTime = tAsset (original source-local PTS,
+///   computed by the reverse formula: tAsset = trimEnd − elapsedAsset).
+///
+///   Sidecar_t = trimEnd − tAsset = elapsedAsset
+///
+///   At clip start (elapsedTimeline=0): tAsset=trimEnd → sidecar_t=0     ✓
+///   At clip end:   tAsset≈trimStart   → sidecar_t≈trimEnd−trimStart     ✓
+///
+/// This mapping correctly positions the forward sidecar reader at the seek
+/// point corresponding to the original reverse-playback position.
+///
+/// @param clipIndex   Index into _clips.
+/// @param startAtTime Original source-local tAsset seconds (reverse formula).
+/// @param sidecarPath Absolute path to the ready sidecar .mov file.
+/// @return A populated _VGClipReader with isReversed=NO, or nil on any
+///         failure (caller falls through to Phase 7.19 generator path).
+- (_VGClipReader *_Nullable)
+    _buildSidecarReaderForClipIndex:(NSUInteger)clipIndex
+                         startAtTime:(double)startAtTime
+                         sidecarPath:(NSString *)sidecarPath {
+  VGClipDescriptor *clip = _clips[clipIndex];
+
+  // ── Map original source tAsset → sidecar time ────────────────────────────
+  // sidecar_t = trimEnd − tAsset  (see header comment for derivation)
+  double sidecarStart = clip.trimEndSeconds - startAtTime;
+  sidecarStart = MAX(0.0, sidecarStart);
+
+  // ── Build AVURLAsset from sidecar path ────────────────────────────────────
+  NSURL *sidecarURL = [NSURL fileURLWithPath:sidecarPath];
+  if (!sidecarURL) {
+    os_log_error(sTimelineLog,
+                 "[VGTCNode] 7.20C sidecar: invalid path clip=%lu path=%{public}@",
+                 (unsigned long)clipIndex, sidecarPath);
+    return nil;
+  }
+
+  AVURLAsset *sidecarAsset = [AVURLAsset URLAssetWithURL:sidecarURL options:nil];
+  NSArray<AVAssetTrack *> *scTracks =
+      [sidecarAsset tracksWithMediaType:AVMediaTypeVideo];
+  AVAssetTrack *scTrack = scTracks.firstObject;
+  if (!scTrack) {
+    os_log_error(sTimelineLog,
+                 "[VGTCNode] 7.20C sidecar: no video track clip=%lu",
+                 (unsigned long)clipIndex);
+    return nil;
+  }
+
+  // ── Create AVAssetReader ──────────────────────────────────────────────────
+  NSError *scReaderErr = nil;
+  AVAssetReader *scReader =
+      [AVAssetReader assetReaderWithAsset:sidecarAsset error:&scReaderErr];
+  if (!scReader) {
+    os_log_error(
+        sTimelineLog,
+        "[VGTCNode] 7.20C sidecar: reader create failed clip=%lu: %{public}@",
+        (unsigned long)clipIndex, scReaderErr.localizedDescription);
+    return nil;
+  }
+
+  // ── Set timeRange from sidecarStart to end of sidecar ────────────────────
+  // The sidecar covers the full reversed clip segment. Seek to the correct
+  // forward offset within it. Same pattern as the main _buildReaderForClipIndex:.
+  CMTime scAssetStart = CMTimeMakeWithSeconds(sidecarStart, 600);
+  CMTime scAssetDur   = sidecarAsset.duration;
+  if (CMTIME_IS_VALID(scAssetDur) &&
+      CMTimeCompare(scAssetStart, scAssetDur) < 0) {
+    CMTime scRemaining = CMTimeSubtract(scAssetDur, scAssetStart);
+    scReader.timeRange = CMTimeRangeMake(scAssetStart, scRemaining);
+  }
+  // else: sidecarStart >= duration → reader produces no samples (EOS immediately).
+  //   Caller's pullFrame: will handle this as a normal EOS from the completed reader.
+
+  // ── Build video composition ───────────────────────────────────────────────
+  // The sidecar track has identity preferredTransform (orientation pre-baked).
+  // The auto-generated composition is therefore a pixel-pass-through.
+  // Do NOT add a custom layer instruction with aspect-fit scale: the sidecar
+  // pixels are already canvas-fitted at _targetRenderSize by the transcoder.
+  // Only override renderSize to confirm output buffer dimensions.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  AVMutableVideoComposition *scComposition =
+      [AVMutableVideoComposition videoCompositionWithPropertiesOfAsset:sidecarAsset];
+#pragma clang diagnostic pop
+
+  if (_targetRenderSize.width > 0 && _targetRenderSize.height > 0) {
+    // Reinforce the output buffer dimensions. The sidecar is already fitted,
+    // so this should be a no-op scale, but setting it explicitly ensures
+    // the AVAssetReaderVideoCompositionOutput allocates buffers at canvas size.
+    scComposition.renderSize = _targetRenderSize;
+  }
+
+  // ── Configure output ──────────────────────────────────────────────────────
+  NSDictionary *outputSettings = _VGTCNOutputSettings();
+  AVAssetReaderVideoCompositionOutput *scOutput =
+      [[AVAssetReaderVideoCompositionOutput alloc]
+          initWithVideoTracks:@[scTrack]
+                 videoSettings:outputSettings];
+  scOutput.videoComposition        = scComposition;
+  scOutput.alwaysCopiesSampleData  = NO;
+
+  if (![scReader canAddOutput:scOutput]) {
+    os_log_error(sTimelineLog,
+                 "[VGTCNode] 7.20C sidecar: canAddOutput failed clip=%lu",
+                 (unsigned long)clipIndex);
+    return nil;
+  }
+  [scReader addOutput:scOutput];
+
+  if (![scReader startReading]) {
+    os_log_error(
+        sTimelineLog,
+        "[VGTCNode] 7.20C sidecar: startReading failed clip=%lu: %{public}@",
+        (unsigned long)clipIndex, scReader.error.localizedDescription);
+    return nil;
+  }
+
+  // ── Compute source FPS (same logic as main reader build) ──────────────────
+  double scFPS = 30.0;
+  if (scComposition &&
+      CMTIME_IS_VALID(scComposition.frameDuration) &&
+      CMTimeGetSeconds(scComposition.frameDuration) > 0.0) {
+    scFPS = 1.0 / CMTimeGetSeconds(scComposition.frameDuration);
+  } else if (scTrack.nominalFrameRate > 0.0f) {
+    scFPS = scTrack.nominalFrameRate;
+  }
+
+  // ── Populate reader ───────────────────────────────────────────────────────
+  _VGClipReader *clipReader     = [[_VGClipReader alloc] init];
+  clipReader.clipIndex          = clipIndex;
+  clipReader.reader             = scReader;
+  clipReader.trackOutput        = scOutput;
+  clipReader.sourceFPS          = scFPS;
+  clipReader.isReversed         = NO;  // ← sidecar is forward-playable
+  clipReader.isStaticSource     = NO;
+  clipReader.freezePTS          = nil;
+
+  os_log(sTimelineLog,
+         "[VGTCNode] 7.20C sidecar reader built: clip=%lu sidecarStart=%.3fs "
+         "fps=%.1f sidecar=%{public}@",
+         (unsigned long)clipIndex, sidecarStart, scFPS,
+         sidecarPath.lastPathComponent);
 
   return clipReader;
 }

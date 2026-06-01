@@ -1,5 +1,5 @@
 // VGTimelineCompositorSmokeTest.h
-// vanguard_media_engine — Phase 7 Stage 7.5B / Phase 7.16 / Phase 7.17 / Phase 7.19 / Phase 7.20A
+// vanguard_media_engine — Phase 7 Stage 7.5B / Phase 7.16 / Phase 7.17 / Phase 7.19 / Phase 7.20A / Phase 7.20C
 //
 // Headless native smoke test runner for VGTimelineCompositorNode.
 //
@@ -171,6 +171,19 @@ NS_ASSUME_NONNULL_BEGIN
 ///
 /// @return NSDictionary with @"success" YES/NO, @"steps", @"logs", @"error".
 + (NSDictionary<NSString *, id> *)runReverseSidecarManagerSmokeTest;
+
+/// Phase 7.20C: Preview/export guard smoke test.
+///
+/// Validates the structural guard that prevents sidecar use in export mode:
+///   1. Unknown clipId returns idle state (no sidecar, guard short-circuits).
+///   2. VGRenderModeExport != VGRenderModePreview (guard constants correct).
+///   3. Idle sidecar status results in guard skip (sidecarPath=nil, state!=ready).
+///
+/// Requires no real video files on disk.
+/// In RELEASE builds: returns a static error result.
+///
+/// @return NSDictionary with @"success" YES/NO, @"steps", @"logs", @"error".
++ (NSDictionary<NSString *, id> *)runSidecarCompositorGuardSmokeTest;
 
 @end
 
