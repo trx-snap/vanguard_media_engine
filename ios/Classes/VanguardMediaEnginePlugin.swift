@@ -2038,6 +2038,14 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
                 self._timelineRuntime = nil
             }
+            // Phase 7.20B: dispose wiring — cancel all in-flight reverse sidecar transcodes
+            // and delete all cached sidecar files when the timeline is torn down.
+            // This runs before result(nil) so cleanup is guaranteed before Dart proceeds.
+            // Sidecar cleanup is synchronous from the caller's perspective (cleanupAllSidecars
+            // acquires the internal lock, resets all records, and dispatches file deletions
+            // asynchronously on a utility queue — the lock release is immediate).
+            VGReverseSidecarManager.shared().cleanupAllSidecars()
+            NSLog("[VanguardPlugin][7.20B] disposeTimeline: sidecar cleanup triggered")
             result(nil)
 
         // ── Phase 7.18B1: Frame cache metrics + manual cache flush ─────────────
@@ -2065,6 +2073,217 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // Always succeeds (void). Forces cold decode on next scrub.
             self._timelineRuntime?.flushTimelineCaches()
             result(nil)
+
+        // ── Phase 7.20B: Reverse Sidecar MethodChannel routes ─────────────────
+        //
+        // Apple documentation cross-checked (Phase 7.20B):
+        //
+        //   MethodChannel result threading:
+        //     Flutter requires result() to be called exactly once and on the main
+        //     thread (or any thread for non-platform-channel operations). This plugin
+        //     uses DispatchQueue.main.async before result() for async completions,
+        //     matching the pattern used by exportTimeline and normalizeVideo.
+        //     Reference: FlutterPlugin.h — "The result block may be called on any thread."
+        //
+        //   Swift/ObjC block bridging:
+        //     ObjC completion blocks (void (^)(VGReverseSidecarStatus *)) bridge to
+        //     Swift as `@escaping (VGReverseSidecarStatus) -> Void` closures.
+        //     ARC manages block memory; the closure is retained by the manager's
+        //     pendingCompletions array and released after firing.
+        //     Reference: "Using Swift with Cocoa and Objective-C" — Blocks and Closures.
+        //
+        //   DispatchGroup usage:
+        //     DispatchGroup.enter()/leave() is the standard pattern for collecting
+        //     multiple async callbacks before proceeding. notify(queue:) fires once
+        //     all leave() calls have been received.
+        //     Reference: Apple Developer Documentation — DispatchGroup.
+        //
+        //   Temporary directory:
+        //     NSTemporaryDirectory() returns a per-app directory iOS may evict under
+        //     disk pressure. Callers must handle a ready sidecar disappearing between
+        //     status.sidecarPath receipt and compositor use (re-transcode via
+        //     prepareReverseSidecars). Reference: File System Programming Guide.
+        //
+        // Export isolation:
+        //     These routes are for preview only. The export compositor (VGExportScheduler
+        //     + VGTimelineExportHelper) MUST NOT call prepareReverseSidecars.
+        //     See VGReverseSidecarManager.h § Export isolation.
+
+        case "prepareReverseSidecars":
+            // Phase 7.20B: begin background transcoding for one or more reversed clips.
+            //
+            // Args:
+            //   "clips": [[String: Any]] — required, list of clip specs:
+            //     "clipId":       String  — stable clip identifier
+            //     "sourcePath":   String  — absolute path to source video
+            //     "trimStart":    Double  — trim window start in asset seconds (>= 0)
+            //     "trimEnd":      Double  — trim window end in asset seconds (> trimStart)
+            //     "targetWidth":  Double  — canvas width (pass 0 to use source natural size)
+            //     "targetHeight": Double  — canvas height (pass 0 to use source natural size)
+            //     "sourceHash":   String  — stable hash of (sourcePath+trimStart+trimEnd+targetSize)
+            //
+            // Returns on success:
+            //   ["clips": [["clipId": String, "state": String, "sidecarPath": String?,
+            //               "errorMessage": String?, "progress": Double]]]
+            //
+            // Completions are collected via DispatchGroup. Result is returned on main thread.
+            // Does not block the call thread; all transcode work runs on VGReverseSidecarManager's
+            // internal serial background queue.
+            guard let clipList = args?["clips"] as? [[String: Any]] else {
+                result(FlutterError(
+                    code: "INVALID_REVERSE_SIDECAR_ARGS",
+                    message: "prepareReverseSidecars: 'clips' array is required",
+                    details: nil))
+                return
+            }
+
+            // Empty clip list: return immediately with empty success result.
+            if clipList.isEmpty {
+                result(["clips": [[String: Any]]()])
+                return
+            }
+
+            // Validate all clip entries upfront before dispatching any work.
+            for (idx, clipDict) in clipList.enumerated() {
+                guard
+                    let clipId     = clipDict["clipId"]     as? String, !clipId.isEmpty,
+                    let sourcePath = clipDict["sourcePath"] as? String, !sourcePath.isEmpty,
+                    let sourceHash = clipDict["sourceHash"] as? String, !sourceHash.isEmpty
+                else {
+                    result(FlutterError(
+                        code: "INVALID_REVERSE_SIDECAR_CLIP",
+                        message: "prepareReverseSidecars: clips[\(idx)] missing required fields "
+                               + "(clipId, sourcePath, sourceHash)",
+                        details: nil))
+                    return
+                }
+                let trimStart = (clipDict["trimStart"] as? NSNumber)?.doubleValue ?? 0.0
+                let trimEnd   = (clipDict["trimEnd"]   as? NSNumber)?.doubleValue ?? 0.0
+                guard trimStart >= 0.0, trimEnd > trimStart else {
+                    result(FlutterError(
+                        code: "INVALID_REVERSE_SIDECAR_CLIP",
+                        message: "prepareReverseSidecars: clips[\(idx)] id=\(clipId): "
+                               + "invalid trim range trimStart=\(trimStart) trimEnd=\(trimEnd)",
+                        details: nil))
+                    return
+                }
+                // Suppress unused-variable warnings for validated-but-not-used-yet fields.
+                _ = sourcePath; _ = sourceHash
+            }
+
+            // Dispatch all sidecar preparations and collect results via DispatchGroup.
+            let group = DispatchGroup()
+            // resultStatuses is accessed only from the sidecar's internal serial queue
+            // (completion blocks), then read on main after group.notify — no lock needed
+            // because group.notify guarantees all leave() calls completed.
+            var resultStatuses: [[String: Any]] = Array(repeating: [:], count: clipList.count)
+
+            for (idx, clipDict) in clipList.enumerated() {
+                // These are validated above; force-unwrap is safe here.
+                let clipId     = clipDict["clipId"]     as! String
+                let sourcePath = clipDict["sourcePath"] as! String
+                let sourceHash = clipDict["sourceHash"] as! String
+                let trimStart  = (clipDict["trimStart"]    as? NSNumber)?.doubleValue ?? 0.0
+                let trimEnd    = (clipDict["trimEnd"]      as? NSNumber)?.doubleValue ?? 0.0
+                let targetW    = (clipDict["targetWidth"]  as? NSNumber)?.doubleValue ?? 0.0
+                let targetH    = (clipDict["targetHeight"] as? NSNumber)?.doubleValue ?? 0.0
+                let targetSize = CGSize(width: targetW, height: targetH)
+
+                group.enter()
+                VGReverseSidecarManager.shared().prepareSidecar(
+                    forClipId:  clipId,
+                    sourcePath: sourcePath,
+                    trimStart:  trimStart,
+                    trimEnd:    trimEnd,
+                    targetSize: targetSize,
+                    sourceHash: sourceHash
+                ) { status in
+                    // Completion fires on VGReverseSidecarManager's internal serial queue.
+                    // Map VGReverseSidecarState to a stable string for Dart.
+                    let stateStr: String
+                    switch status.state {
+                    case .idle:        stateStr = "idle"
+                    case .preparing:   stateStr = "preparing"
+                    case .ready:       stateStr = "ready"
+                    case .failed:      stateStr = "failed"
+                    case .invalidated: stateStr = "invalidated"
+                    @unknown default:  stateStr = "unknown"
+                    }
+                    var entry: [String: Any] = [
+                        "clipId":   clipId,
+                        "state":    stateStr,
+                        "progress": status.progress,
+                    ]
+                    if let path = status.sidecarPath {
+                        entry["sidecarPath"] = path
+                    }
+                    if let err = status.errorMessage {
+                        entry["errorMessage"] = err
+                    }
+                    resultStatuses[idx] = entry
+                    group.leave()
+                }
+            }
+
+            group.notify(queue: .main) {
+                result(["clips": resultStatuses])
+            }
+
+        case "getSidecarStatus":
+            // Phase 7.20B: query the current state of a single reverse sidecar.
+            //
+            // Args:
+            //   "clipId": String — required
+            //
+            // Returns:
+            //   ["clipId": String, "state": String, "sidecarPath": String?,
+            //    "errorMessage": String?, "progress": Double]
+            //
+            // If no record exists for clipId, VGReverseSidecarManager returns idle.
+            // This call is synchronous and fast (lock-acquire + dict lookup).
+            guard let clipId = args?["clipId"] as? String, !clipId.isEmpty else {
+                result(FlutterError(
+                    code: "INVALID_REVERSE_SIDECAR_ARGS",
+                    message: "getSidecarStatus: 'clipId' string is required",
+                    details: nil))
+                return
+            }
+
+            let status = VGReverseSidecarManager.shared().status(forClipId: clipId)
+            let stateString: String
+            switch status.state {
+            case .idle:        stateString = "idle"
+            case .preparing:   stateString = "preparing"
+            case .ready:       stateString = "ready"
+            case .failed:      stateString = "failed"
+            case .invalidated: stateString = "invalidated"
+            @unknown default:  stateString = "unknown"
+            }
+            var statusDict: [String: Any] = [
+                "clipId":   clipId,
+                "state":    stateString,
+                "progress": status.progress,
+            ]
+            if let path = status.sidecarPath {
+                statusDict["sidecarPath"] = path
+            }
+            if let err = status.errorMessage {
+                statusDict["errorMessage"] = err
+            }
+            result(statusDict)
+
+        case "cleanupReverseSidecars":
+            // Phase 7.20B: cancel all in-flight transcodes and delete all sidecar files.
+            //
+            // No args required.
+            // Returns: ["ok": true]
+            //
+            // Primarily used for manual testing, debug harness, and future lifecycle cleanup.
+            // cleanupAllSidecars acquires the internal lock, resets all records, and
+            // dispatches file deletions asynchronously on a utility queue.
+            VGReverseSidecarManager.shared().cleanupAllSidecars()
+            NSLog("[VanguardPlugin][7.20B] cleanupReverseSidecars: cleanup triggered")
+            result(["ok": true])
 
         #endif // VG_USE_V2_GRAPH
 

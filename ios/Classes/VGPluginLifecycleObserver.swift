@@ -91,11 +91,20 @@ final class VGPluginLifecycleObserver: NSObject {
             forName: UIApplication.willResignActiveNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
-            guard let plugin = self?.plugin, plugin.currentMode == .camera else { return }
-            NSLog("[VanguardPlugin] willResignActive — stopping camera session")
-            plugin.cameraSource?.stop()
-            // Do NOT nil cameraSource here: didBecomeActive restarts using the
-            // same source object. Dart-side restarts via _startCamera() on resume.
+            guard let plugin = self?.plugin else { return }
+            // A3: belt-and-suspenders camera stop (existing behaviour).
+            if plugin.currentMode == .camera {
+                NSLog("[VanguardPlugin] willResignActive — stopping camera session")
+                plugin.cameraSource?.stop()
+                // Do NOT nil cameraSource here: didBecomeActive restarts using the
+                // same source object. Dart-side restarts via _startCamera() on resume.
+            }
+            // Phase 7.20B: cancel all in-flight reverse sidecar transcodes when the
+            // app backgrounds. Sidecar transcodes are CPU/IO intensive and should not
+            // run in the background. On foreground return, Dart will re-trigger
+            // prepareReverseSidecars via the editor's existing update cycle.
+            // cleanupAllSidecars is fast (lock + state reset; async file deletion).
+            VGReverseSidecarManager.shared().cleanupAllSidecars()
         }
 
         NotificationCenter.default.addObserver(

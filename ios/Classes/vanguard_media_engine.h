@@ -27,3 +27,4 @@
 #import "VanguardPlaybackTypes.h"     // VGAudioRole enum — used by VGSessionRegistry.swift
 #import "VanguardFileMediaSource.h"   // VanguardFileMediaSource — registry-owned runtime source
 #import "VanguardGraphRuntime.h"      // VanguardGraphRuntime — primary runtime type cast in Swift
+#import "VGReverseSidecarManager.h"   // Phase 7.20B: VGReverseSidecarManager + VGReverseSidecarStatus
