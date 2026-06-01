@@ -104,6 +104,24 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (instancetype)init NS_UNAVAILABLE;
 
+// ─── Phase 7.18B1: Cache metrics and flush ─────────────────────────────────
+//
+// These methods are safe to call from any thread. Both delegate to the internal
+// _VGTimelineFrameCache which acquires its own os_unfair_lock.
+//
+// Intended use: MethodChannel routes `getTimelineCacheStats` / `clearTimelineCache`
+// call these via VanguardGraphRuntime wrapper methods.
+
+/// Returns a snapshot of compositor frame cache metrics.
+///
+/// Keys (all NSNumber):
+///   frameCacheBytes, frameCacheHits, frameCacheMisses,
+///   frameCacheEvictions, frameCacheInserts, frameCacheEntries
+- (NSDictionary<NSString *, NSNumber *> *)cacheStatistics;
+
+/// Immediately evicts all compositor frame cache entries and resets counters.
+- (void)flushFrameCache;
+
 @end
 
 NS_ASSUME_NONNULL_END

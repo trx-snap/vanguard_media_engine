@@ -2040,6 +2040,32 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
             result(nil)
 
+        // ── Phase 7.18B1: Frame cache metrics + manual cache flush ─────────────
+        //
+        // getTimelineCacheStats — returns the frame cache metrics dictionary.
+        //   Returns an empty dictionary (not a FlutterError) when no timeline
+        //   compositor is active, so Dart callers never need error handling.
+        //
+        // clearTimelineCache — evicts all frame cache entries and resets counters.
+        //   Forces the next scrub to decode from raw AVAssetReader / AVAssetImageGenerator,
+        //   enabling manual before/after latency benchmarks in the harness.
+        //   Always returns nil (void success) — never a FlutterError.
+
+        case "getTimelineCacheStats":
+            // Phase 7.18B1: returns live frame cache metrics dictionary.
+            // Returns empty dict (not FlutterError) when no timeline is active.
+            if let runtime = self._timelineRuntime {
+                result(runtime.timelineCacheStatistics())
+            } else {
+                result([String: Any]())
+            }
+
+        case "clearTimelineCache":
+            // Phase 7.18B1: flush all frame cache entries + reset counters.
+            // Always succeeds (void). Forces cold decode on next scrub.
+            self._timelineRuntime?.flushTimelineCaches()
+            result(nil)
+
         #endif // VG_USE_V2_GRAPH
 
 

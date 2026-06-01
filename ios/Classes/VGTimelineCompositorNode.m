@@ -814,10 +814,13 @@ static const size_t kVGFrameCacheBudgetBytes = 32 * 1024 * 1024; // 32 MB
                      buffer:(CVPixelBufferRef)buffer;
 /// Flush all entries whose generation does not match.
 - (void)flushForGeneration:(uint64_t)generation;
-/// Release all entries.
+/// Release all entries. Resets metrics counters.
 - (void)flushAll;
 /// Current byte usage (for logging).
 - (size_t)currentBytes;
+/// Phase 7.18B1: Snapshot of cache metrics under lock.
+/// Keys: hits, misses, evictions, inserts, entries.
+- (NSDictionary<NSString *, NSNumber *> *)statistics;
 @end
 
 @implementation _VGTimelineFrameCache {
@@ -825,6 +828,12 @@ static const size_t kVGFrameCacheBudgetBytes = 32 * 1024 * 1024; // 32 MB
   size_t    _currentBytes;
   uint64_t  _accessCounter;
   os_unfair_lock _lock;
+  // Phase 7.18B1: monotonic hit/miss/eviction/insert counters.
+  // All incremented under _lock. Reset in flushAll.
+  uint64_t  _hitCount;
+  uint64_t  _missCount;
+  uint64_t  _evictionCount;
+  uint64_t  _insertCount;
 }
 
 - (instancetype)init {
@@ -834,6 +843,11 @@ static const size_t kVGFrameCacheBudgetBytes = 32 * 1024 * 1024; // 32 MB
     _currentBytes  = 0;
     _accessCounter = 0;
     _lock          = OS_UNFAIR_LOCK_INIT;
+    // Phase 7.18B1: initialise metric counters.
+    _hitCount      = 0;
+    _missCount     = 0;
+    _evictionCount = 0;
+    _insertCount   = 0;
   }
   return self;
 }
@@ -880,9 +894,11 @@ static inline double _VGQuantizePTS(double pts) {
     e.accessOrder = ++_accessCounter;
     CVPixelBufferRef buf = e.buffer;
     if (buf) CVPixelBufferRetain(buf); // +1 for caller
+    ++_hitCount; // Phase 7.18B1: count cache hit
     os_unfair_lock_unlock(&_lock);
     return buf; // caller owns +1
   }
+  ++_missCount; // Phase 7.18B1: count cache miss
   os_unfair_lock_unlock(&_lock);
   return NULL; // miss
 }
@@ -934,6 +950,7 @@ static inline double _VGQuantizePTS(double pts) {
     evict.buffer = NULL;
     _currentBytes -= evictBytes;
     [_entries removeObjectAtIndex:lruIdx];
+    ++_evictionCount; // Phase 7.18B1: count eviction
   }
 
   // Insert new entry.
@@ -948,6 +965,7 @@ static inline double _VGQuantizePTS(double pts) {
   entry.accessOrder = ++_accessCounter;
   [_entries addObject:entry];
   _currentBytes += bufBytes;
+  ++_insertCount; // Phase 7.18B1: count successful insert
 
   os_unfair_lock_unlock(&_lock);
 }
@@ -974,7 +992,7 @@ static inline double _VGQuantizePTS(double pts) {
   os_unfair_lock_unlock(&_lock);
 }
 
-/// Release all cached entries.
+/// Release all cached entries. Resets metrics counters.
 - (void)flushAll {
   os_unfair_lock_lock(&_lock);
   for (_VGFrameCacheEntry *e in _entries) {
@@ -985,7 +1003,27 @@ static inline double _VGQuantizePTS(double pts) {
   }
   [_entries removeAllObjects];
   _currentBytes = 0;
+  // Phase 7.18B1: reset counters on flush so next warm-up starts from zero.
+  _hitCount      = 0;
+  _missCount     = 0;
+  _evictionCount = 0;
+  _insertCount   = 0;
   os_unfair_lock_unlock(&_lock);
+}
+
+/// Phase 7.18B1: Returns an immutable snapshot of cache metrics under lock.
+- (NSDictionary<NSString *, NSNumber *> *)statistics {
+  os_unfair_lock_lock(&_lock);
+  NSDictionary *snap = @{
+    @"hits":      @(_hitCount),
+    @"misses":    @(_missCount),
+    @"evictions": @(_evictionCount),
+    @"inserts":   @(_insertCount),
+    @"entries":   @(_entries.count),
+    @"bytes":     @(_currentBytes),
+  };
+  os_unfair_lock_unlock(&_lock);
+  return snap;
 }
 
 @end
@@ -2802,6 +2840,48 @@ static inline double _VGQuantizePTS(double pts) {
     }
     _outgoingReader = nil;
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Phase 7.18B1: Cache metrics and flush
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns a snapshot of the compositor-level frame cache metrics.
+///
+/// Thread-safe: delegates to _VGTimelineFrameCache.statistics which acquires
+/// its own os_unfair_lock internally.
+///
+/// Dictionary keys (all NSNumber/uint64):
+///   frameCacheBytes     — current byte usage
+///   frameCacheHits      — total cache hits since last flushAll
+///   frameCacheMisses    — total cache misses since last flushAll
+///   frameCacheEvictions — total LRU evictions since last flushAll
+///   frameCacheInserts   — total successful inserts since last flushAll
+///   frameCacheEntries   — current number of cached entries
+- (NSDictionary<NSString *, NSNumber *> *)cacheStatistics {
+  NSDictionary<NSString *, NSNumber *> *inner = [_frameCache statistics];
+  return @{
+    @"frameCacheBytes":     @(_frameCache.currentBytes),
+    @"frameCacheHits":      inner[@"hits"]      ?: @0,
+    @"frameCacheMisses":    inner[@"misses"]    ?: @0,
+    @"frameCacheEvictions": inner[@"evictions"] ?: @0,
+    @"frameCacheInserts":   inner[@"inserts"]   ?: @0,
+    @"frameCacheEntries":   inner[@"entries"]   ?: @0,
+  };
+}
+
+/// Immediately evicts all entries from the compositor-level frame cache and
+/// resets all metrics counters.
+///
+/// Thread-safe: delegates to _VGTimelineFrameCache.flushAll which acquires
+/// its own os_unfair_lock internally.
+///
+/// Use this from the MethodChannel `clearTimelineCache` route to force a cold
+/// decode on the next scrub, enabling manual benchmark comparisons.
+- (void)flushFrameCache {
+  [_frameCache flushAll];
+  os_log(sTimelineLog,
+         "[VGTCNode] flushFrameCache: frame cache cleared (Phase 7.18B1)");
 }
 
 @end

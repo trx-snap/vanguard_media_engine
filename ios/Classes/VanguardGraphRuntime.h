@@ -232,6 +232,28 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)_timelinePause
     NS_SWIFT_NAME(_timelinePause());
 
+// ─── Phase 7.18B1: Cache metrics and flush ─────────────────────────────────
+//
+// Forwarding wrappers so the Swift plugin and VGPluginLifecycleObserver can
+// reach the compositor's frame cache without accessing the private
+// timelineCompositor ivar directly.
+//
+// Both are thread-safe (delegate to os_unfair_lock-guarded cache methods).
+// Both are no-ops if no timeline compositor has been prepared.
+
+/// Returns a snapshot of the active timeline frame cache metrics, or an empty
+/// dictionary if no timeline compositor is active.
+///
+/// Keys (all NSNumber): frameCacheBytes, frameCacheHits, frameCacheMisses,
+///   frameCacheEvictions, frameCacheInserts, frameCacheEntries.
+- (NSDictionary<NSString *, NSNumber *> *)timelineCacheStatistics
+    NS_SWIFT_NAME(timelineCacheStatistics());
+
+/// Flushes all entries from the active timeline frame cache and resets metric
+/// counters. No-op if no timeline compositor is active.
+- (void)flushTimelineCaches
+    NS_SWIFT_NAME(flushTimelineCaches());
+
 #endif // VG_USE_V2_GRAPH
 
 @end

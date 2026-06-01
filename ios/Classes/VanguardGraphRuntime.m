@@ -2163,6 +2163,26 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
         self.timelineCurrentPTS);
 }
 
+// ─── Phase 7.18B1: Cache metrics forwarding ───────────────────────────────
+// These methods forward to the private timelineCompositor without exposing it
+// in the public header. Both guard against nil compositor (no timeline active).
+
+- (NSDictionary<NSString *, NSNumber *> *)timelineCacheStatistics {
+  VGTimelineCompositorNode *compositor = self.timelineCompositor;
+  if (!compositor) {
+    return @{};
+  }
+  return [compositor cacheStatistics];
+}
+
+- (void)flushTimelineCaches {
+  VGTimelineCompositorNode *compositor = self.timelineCompositor;
+  if (!compositor) {
+    return;
+  }
+  [compositor flushFrameCache];
+}
+
 #endif // VG_USE_V2_GRAPH
 
 @end

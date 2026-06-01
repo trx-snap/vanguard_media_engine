@@ -69,6 +69,12 @@ final class VGPluginLifecycleObserver: NSObject {
             guard let self, let plugin = self.plugin, let registry = self.registry else { return }
             plugin.renderers.values.forEach { $0.handleMemoryPressure() }
             registry.pauseMutedSessions()
+            // Phase 7.18B1: flush the active timeline's frame cache under memory pressure
+            // so the OS reclaims the backing IOSurface memory before resorting to Jetsam.
+            // flushTimelineCaches() is thread-safe and no-op when no timeline is active.
+            #if VG_USE_V2_GRAPH
+            plugin._timelineRuntime?.flushTimelineCaches()
+            #endif
         }
 
         // ── A3: App background / foreground safety ───────────────────────────
