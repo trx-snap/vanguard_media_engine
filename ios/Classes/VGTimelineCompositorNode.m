@@ -1,10 +1,11 @@
 // VGTimelineCompositorNode.m
-// vanguard_media_engine — Phase 7 Stage 7.5 / Stage 7.10 / Stage 7.12 / Stage 7.16
+// vanguard_media_engine — Phase 7 Stage 7.5 / Stage 7.10 / Stage 7.12 / Stage 7.16 / Stage 7.18A
 //
 // Phase 7 Stage 7.5:  First executable multi-clip video timeline compositor.
 // Phase 7 Stage 7.10: Native crossfade/dissolve and fade transition execution.
 // Phase 7 Stage 7.12: Still-image clip support via ImageIO decode + static buffer cache.
 // Phase 7 Stage 7.16: Still-image fit/fill/crop controls (DEC-148).
+// Phase 7 Stage 7.18A: Internal byte-budgeted frame cache + best-effort freeze prefetch (DEC-151).
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // DESIGN OVERVIEW
@@ -736,6 +737,260 @@ static os_log_t sTimelineLog;
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Phase 7.18A: Frame cache entry
+// ─────────────────────────────────────────────────────────────────────────────
+
+// _VGFrameCacheEntry — one cached (clipIndex, sourceURL, quantized assetPTS,
+// renderSize, generation) → CVPixelBufferRef mapping.
+//
+// Ownership:
+//   buffer is retained +1 by the entry.
+//   dealloc releases buffer, guarding against double-release via NULL.
+//
+// assetPTS quantization: rounded to nearest millisecond (0.001 s) to avoid
+//   floating-point key mismatches for the same logical frame.
+@interface _VGFrameCacheEntry : NSObject
+@property (nonatomic) NSUInteger  clipIndex;     // index in _clips
+@property (nonatomic, copy) NSString *sourceURL; // clip.sourceURL at cache time
+@property (nonatomic) double      assetPTS;      // quantized to 0.001 s
+@property (nonatomic) CGSize      renderSize;    // canvas dimensions at cache time
+@property (nonatomic) uint64_t    generation;    // graph generation when cached
+@property (nonatomic) CVPixelBufferRef buffer;   // retained +1 by this entry
+@property (nonatomic) uint64_t    accessOrder;   // monotonic LRU counter
+@end
+
+@implementation _VGFrameCacheEntry
+
+- (void)dealloc {
+  if (_buffer) {
+    CVPixelBufferRelease(_buffer);
+    _buffer = NULL;
+  }
+}
+
+@end
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Phase 7.18A: Frame cache
+// ─────────────────────────────────────────────────────────────────────────────
+
+// _VGTimelineFrameCache — compositor-private, byte-budgeted LRU cache.
+//
+// Budget: kVGFrameCacheBudgetBytes (32 MB). Byte-budgeted, not frame-count-
+// budgeted, because BGRA buffer sizes vary with render size:
+//   640×360   ≈  922 KB → ~34 frames cached
+//   1080×1920 ≈ 8.3 MB  →  ~3 frames cached
+//
+// Thread safety: os_unfair_lock protects the entries array and byte counter.
+//   - Pull-thread reads and writes (lookup, insert on sync path).
+//   - Prefetch-queue writes (insert on async prefetch completion).
+//   - Seek/invalidate caller writes (flush).
+//
+// Ownership contract:
+//   Insert:  cache retains buffer (CVPixelBufferRetain). Caller keeps its own +1.
+//   Lookup:  cache retains on return for caller (+1). Caller must release.
+//   Evict:   cache releases its retain (CVPixelBufferRelease).
+//   Flush:   cache releases all retains.
+//   Dealloc: equivalent to flushAll.
+//
+// TODO: Phase 7.18B — query VGResourceAllocator for dynamic budget adjustment
+// and respond to memory-warning notifications.
+
+static const size_t kVGFrameCacheBudgetBytes = 32 * 1024 * 1024; // 32 MB
+
+@interface _VGTimelineFrameCache : NSObject
+/// Lookup: returns a retained CVPixelBufferRef (+1) on hit, NULL on miss.
+- (nullable CVPixelBufferRef)lookupWithClipIndex:(NSUInteger)clipIndex
+                                       sourceURL:(NSString *)sourceURL
+                                        assetPTS:(double)assetPTS
+                                      renderSize:(CGSize)renderSize
+                                      generation:(uint64_t)generation;
+/// Insert. Skips if key already cached or single buffer exceeds budget.
+- (void)insertWithClipIndex:(NSUInteger)clipIndex
+                  sourceURL:(NSString *)sourceURL
+                   assetPTS:(double)assetPTS
+                 renderSize:(CGSize)renderSize
+                 generation:(uint64_t)generation
+                     buffer:(CVPixelBufferRef)buffer;
+/// Flush all entries whose generation does not match.
+- (void)flushForGeneration:(uint64_t)generation;
+/// Release all entries.
+- (void)flushAll;
+/// Current byte usage (for logging).
+- (size_t)currentBytes;
+@end
+
+@implementation _VGTimelineFrameCache {
+  NSMutableArray<_VGFrameCacheEntry *> *_entries;
+  size_t    _currentBytes;
+  uint64_t  _accessCounter;
+  os_unfair_lock _lock;
+}
+
+- (instancetype)init {
+  self = [super init];
+  if (self) {
+    _entries       = [NSMutableArray array];
+    _currentBytes  = 0;
+    _accessCounter = 0;
+    _lock          = OS_UNFAIR_LOCK_INIT;
+  }
+  return self;
+}
+
+- (void)dealloc {
+  // Release every retained buffer without taking the lock (already single owner at dealloc).
+  for (_VGFrameCacheEntry *e in _entries) {
+    if (e.buffer) {
+      CVPixelBufferRelease(e.buffer);
+      e.buffer = NULL;
+    }
+  }
+  [_entries removeAllObjects];
+  _currentBytes = 0;
+}
+
+// Quantise assetPTS to nearest millisecond to avoid float key mismatches.
+static inline double _VGQuantizePTS(double pts) {
+  return round(pts * 1000.0) / 1000.0;
+}
+
+- (size_t)currentBytes {
+  os_unfair_lock_lock(&_lock);
+  size_t b = _currentBytes;
+  os_unfair_lock_unlock(&_lock);
+  return b;
+}
+
+/// Lookup: returns a retained CVPixelBufferRef (+1) on hit, NULL on miss.
+- (nullable CVPixelBufferRef)lookupWithClipIndex:(NSUInteger)clipIndex
+                                       sourceURL:(NSString *)sourceURL
+                                        assetPTS:(double)assetPTS
+                                      renderSize:(CGSize)renderSize
+                                      generation:(uint64_t)generation {
+  double qpts = _VGQuantizePTS(assetPTS);
+  os_unfair_lock_lock(&_lock);
+  for (_VGFrameCacheEntry *e in _entries) {
+    if (e.generation  != generation)             continue;
+    if (e.clipIndex   != clipIndex)              continue;
+    if (fabs(e.assetPTS - qpts) > 1e-9)         continue;
+    if (!CGSizeEqualToSize(e.renderSize, renderSize)) continue;
+    if (![e.sourceURL isEqualToString:sourceURL])    continue;
+    // Hit: update LRU access order and retain for caller.
+    e.accessOrder = ++_accessCounter;
+    CVPixelBufferRef buf = e.buffer;
+    if (buf) CVPixelBufferRetain(buf); // +1 for caller
+    os_unfair_lock_unlock(&_lock);
+    return buf; // caller owns +1
+  }
+  os_unfair_lock_unlock(&_lock);
+  return NULL; // miss
+}
+
+/// Insert a buffer into the cache. Skip if key already exists.
+/// Budget-bounded with LRU eviction.
+- (void)insertWithClipIndex:(NSUInteger)clipIndex
+                  sourceURL:(NSString *)sourceURL
+                   assetPTS:(double)assetPTS
+                 renderSize:(CGSize)renderSize
+                 generation:(uint64_t)generation
+                     buffer:(CVPixelBufferRef)buffer {
+  if (!buffer) return;
+  size_t bufBytes = CVPixelBufferGetDataSize(buffer);
+  // If a single frame exceeds the entire budget, skip caching.
+  if (bufBytes > kVGFrameCacheBudgetBytes) return;
+
+  double qpts = _VGQuantizePTS(assetPTS);
+
+  os_unfair_lock_lock(&_lock);
+
+  // Duplicate-key guard: skip if already cached.
+  for (_VGFrameCacheEntry *e in _entries) {
+    if (e.generation == generation       &&
+        e.clipIndex  == clipIndex        &&
+        fabs(e.assetPTS - qpts) < 1e-9  &&
+        CGSizeEqualToSize(e.renderSize, renderSize) &&
+        [e.sourceURL isEqualToString:sourceURL]) {
+      os_unfair_lock_unlock(&_lock);
+      return; // already cached; no-op
+    }
+  }
+
+  // Evict LRU entries until we have room.
+  while (_currentBytes + bufBytes > kVGFrameCacheBudgetBytes &&
+         _entries.count > 0) {
+    // Find entry with lowest accessOrder (LRU).
+    NSUInteger lruIdx = 0;
+    uint64_t   lruOrder = _entries[0].accessOrder;
+    for (NSUInteger i = 1; i < _entries.count; i++) {
+      if (_entries[i].accessOrder < lruOrder) {
+        lruOrder = _entries[i].accessOrder;
+        lruIdx = i;
+      }
+    }
+    _VGFrameCacheEntry *evict = _entries[lruIdx];
+    size_t evictBytes = CVPixelBufferGetDataSize(evict.buffer);
+    CVPixelBufferRelease(evict.buffer); // cache relinquishes its +1
+    evict.buffer = NULL;
+    _currentBytes -= evictBytes;
+    [_entries removeObjectAtIndex:lruIdx];
+  }
+
+  // Insert new entry.
+  _VGFrameCacheEntry *entry = [[_VGFrameCacheEntry alloc] init];
+  entry.clipIndex   = clipIndex;
+  entry.sourceURL   = [sourceURL copy];
+  entry.assetPTS    = qpts;
+  entry.renderSize  = renderSize;
+  entry.generation  = generation;
+  entry.buffer      = buffer;
+  CVPixelBufferRetain(buffer); // cache takes +1; caller keeps its own +1
+  entry.accessOrder = ++_accessCounter;
+  [_entries addObject:entry];
+  _currentBytes += bufBytes;
+
+  os_unfair_lock_unlock(&_lock);
+}
+
+/// Flush all entries whose generation does not match.
+- (void)flushForGeneration:(uint64_t)generation {
+  os_unfair_lock_lock(&_lock);
+  NSMutableIndexSet *stale = [NSMutableIndexSet indexSet];
+  for (NSUInteger i = 0; i < _entries.count; i++) {
+    if (_entries[i].generation != generation) {
+      [stale addIndex:i];
+    }
+  }
+  [stale enumerateIndexesUsingBlock:^(NSUInteger idx, BOOL *stop) {
+    _VGFrameCacheEntry *e = self->_entries[idx];
+    if (e.buffer) {
+      size_t eBytes = CVPixelBufferGetDataSize(e.buffer);
+      CVPixelBufferRelease(e.buffer);
+      e.buffer = NULL;
+      self->_currentBytes -= eBytes;
+    }
+  }];
+  [_entries removeObjectsAtIndexes:stale];
+  os_unfair_lock_unlock(&_lock);
+}
+
+/// Release all cached entries.
+- (void)flushAll {
+  os_unfair_lock_lock(&_lock);
+  for (_VGFrameCacheEntry *e in _entries) {
+    if (e.buffer) {
+      CVPixelBufferRelease(e.buffer);
+      e.buffer = NULL;
+    }
+  }
+  [_entries removeAllObjects];
+  _currentBytes = 0;
+  os_unfair_lock_unlock(&_lock);
+}
+
+@end
+
+// ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - VGTimelineCompositorNode
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -792,6 +1047,16 @@ static os_log_t sTimelineLog;
   // Non-zero: aspect-fit source frames into this canvas via layer instruction.
   // Zero (CGSizeZero): legacy bypass — forward asset-native buffers unchanged.
   CGSize _targetRenderSize;
+
+  // ── Phase 7.18A: Frame cache + prefetch queue (DEC-151) ──────────────────
+  // _frameCache: compositor-private, byte-budgeted (32 MB) LRU cache shared
+  //   by the freeze-frame synchronous path and the async prefetch queue.
+  //   Thread-safe internally via os_unfair_lock.
+  // _prefetchQueue: serial background queue for best-effort freeze prefetch.
+  //   Serial (not concurrent) to bound memory and avoid file-handle contention
+  //   when multiple freeze clips share the same source asset.
+  _VGTimelineFrameCache *_frameCache;
+  dispatch_queue_t _prefetchQueue;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1042,6 +1307,11 @@ static os_log_t sTimelineLog;
   atomic_store(&_generation, 0);
   atomic_store(&_invalidated, 0);
 
+  // Phase 7.18A: initialise frame cache and prefetch queue.
+  _frameCache     = [[_VGTimelineFrameCache alloc] init];
+  _prefetchQueue  = dispatch_queue_create("com.vanguard.timeline.prefetch",
+                                          DISPATCH_QUEUE_SERIAL);
+
   // ── Phase 7.9: Parse canvas dimensions for aspect-fit normalization ────────
   // canvasWidth/canvasHeight are optional. When present and both > 0, the
   // compositor will override AVMutableVideoComposition.renderSize and apply
@@ -1161,6 +1431,9 @@ static os_log_t sTimelineLog;
     _lastDeliveredBuffer = NULL;
   }
 
+  // Phase 7.18A: flush all cached frames on invalidate.
+  [_frameCache flushAll];
+
   os_log(sTimelineLog, "[VGTCNode] invalidated: nodeId=%{public}@", _nodeId);
 }
 
@@ -1187,6 +1460,11 @@ static os_log_t sTimelineLog;
   // Any in-flight pullFrame: with the old generation will return .skipped
   // once it checks _generation vs. request.generation.
   atomic_store(&_generation, generation);
+
+  // Phase 7.18A: evict stale-generation cache entries immediately after
+  // updating the generation counter. Any in-flight prefetch that captures the
+  // old generation will detect the mismatch and discard its result.
+  [_frameCache flushForGeneration:generation];
 
   // ── 2. Release held buffer before tearing down reader (RR-36) ────────────
   if (_lastDeliveredBuffer) {
@@ -1640,8 +1918,42 @@ static os_log_t sTimelineLog;
   if (reader.isStaticSource) {
     VGClipDescriptor *clip = _clips[reader.clipIndex];
 
+    // ── Phase 7.18A: Compositor-level frame cache lookup ──────────────────
+    // Check the shared frame cache before the per-reader buffer and before
+    // any expensive decode/extraction work. The cache key for freeze clips
+    // uses freezePTS as assetPTS; for still-image clips it uses 0.0.
+    {
+      double cachePTS = (reader.freezePTS != nil) ? reader.freezePTS.doubleValue : 0.0;
+      uint64_t currentGen = atomic_load(&_generation);
+      CVPixelBufferRef cachedBuf =
+          [_frameCache lookupWithClipIndex:reader.clipIndex
+                                 sourceURL:clip.sourceURL
+                                  assetPTS:cachePTS
+                                renderSize:_targetRenderSize
+                                generation:currentGen];
+      if (cachedBuf) {
+        os_log_debug(sTimelineLog,
+                     "[VGTCNode] frame-cache hit: clip=%lu pts=%.3fs bytes=%zu",
+                     (unsigned long)reader.clipIndex, cachePTS,
+                     _frameCache.currentBytes);
+        // Warm the per-reader buffer so the hot path (next call) short-circuits
+        // without hitting the shared cache. Transfer the +1 from lookupWith… into
+        // lastDeliveredBuffer; reader takes a new +1 for its own slot.
+        if (reader.lastDeliveredBuffer == NULL) {
+          reader.lastDeliveredBuffer = cachedBuf;     // adopt lookup +1
+          reader.lastDeliveredAssetPTS = 0.0;
+          reader.lastDeliveredAssetDuration = 1e9;    // static: never expires
+          CVPixelBufferRetain(reader.lastDeliveredBuffer); // reader's own +1
+        }
+        return cachedBuf; // caller owns the +1 from lookupWith…
+      }
+      os_log_debug(sTimelineLog,
+                   "[VGTCNode] frame-cache miss: clip=%lu pts=%.3fs",
+                   (unsigned long)reader.clipIndex, cachePTS);
+    }
+
     if (reader.lastDeliveredBuffer != NULL) {
-      // Cache hit: retain and return the static buffer directly.
+      // Per-reader cache hit: retain and return the static buffer directly.
       CVPixelBufferRetain(reader.lastDeliveredBuffer);
       os_log_debug(sTimelineLog,
                    "[VGTCNode] static cache hit: clip=%lu",
@@ -1816,12 +2128,23 @@ static os_log_t sTimelineLog;
         reader.lastDeliveredBuffer = pb;
         reader.lastDeliveredAssetPTS = 0.0;
         reader.lastDeliveredAssetDuration = 1e9; // static: never expires
-        CVPixelBufferRetain(pb); // cache retain
+        CVPixelBufferRetain(pb); // per-reader cache retain
 
+        // Phase 7.18A: also insert into the compositor-level frame cache so
+        // future scrubs and prefetch hits can serve this buffer without
+        // re-invoking AVAssetImageGenerator.
+        [_frameCache insertWithClipIndex:reader.clipIndex
+                               sourceURL:clip.sourceURL
+                                assetPTS:reader.freezePTS.doubleValue
+                              renderSize:_targetRenderSize
+                              generation:atomic_load(&_generation)
+                                  buffer:pb];
         os_log(sTimelineLog,
-               "[VGTCNode] freeze-frame decoded+cached: clip=%lu canvas=%.0fx%.0f",
+               "[VGTCNode] freeze-frame decoded+cached (sync+framecache): "
+               "clip=%lu canvas=%.0fx%.0f cacheBytes=%zu",
                (unsigned long)reader.clipIndex,
-               _targetRenderSize.width, _targetRenderSize.height);
+               _targetRenderSize.width, _targetRenderSize.height,
+               _frameCache.currentBytes);
 
         return pb; // caller owns +1 from CVPixelBufferCreate
       } // CGRelease_cleanup
@@ -1878,12 +2201,22 @@ static os_log_t sTimelineLog;
     reader.lastDeliveredBuffer = pb;
     reader.lastDeliveredAssetPTS = 0.0;
     reader.lastDeliveredAssetDuration = 1e9; // large window: static buffer never expires
-    CVPixelBufferRetain(pb); // cache retain
+    CVPixelBufferRetain(pb); // per-reader cache retain
 
+    // Phase 7.18A: also insert into the compositor-level frame cache.
+    // assetPTS = 0.0 for still-image clips (single static frame).
+    [_frameCache insertWithClipIndex:reader.clipIndex
+                           sourceURL:clip.sourceURL
+                            assetPTS:0.0
+                          renderSize:_targetRenderSize
+                          generation:atomic_load(&_generation)
+                              buffer:pb];
     os_log(sTimelineLog,
-           "[VGTCNode] still-image decoded+cached: clip=%lu canvas=%.0fx%.0f",
+           "[VGTCNode] still-image decoded+cached (framecache): "
+           "clip=%lu canvas=%.0fx%.0f cacheBytes=%zu",
            (unsigned long)reader.clipIndex,
-           _targetRenderSize.width, _targetRenderSize.height);
+           _targetRenderSize.width, _targetRenderSize.height,
+           _frameCache.currentBytes);
 
     return pb; // caller owns +1 from decode
   }
@@ -2028,6 +2361,183 @@ static os_log_t sTimelineLog;
            "[VGTCNode] built static reader (freeze-frame): clip=%lu freezePTS=%.3fs",
            (unsigned long)clipIndex,
            clip.freezePTS.doubleValue);
+
+    // ── Phase 7.18A: Best-effort async freeze prefetch (DEC-151) ─────────
+    //
+    // Dispatch extraction of the frozen frame to the serial prefetch queue
+    // so that the very first pullFrame: for this clip hits the compositor
+    // frame cache rather than blocking on AVAssetImageGenerator.
+    //
+    // Safety guarantees:
+    //   - Serial queue: at most one extraction in flight at a time.
+    //   - Generation check before work and before insert: stale work is
+    //     discarded without touching the cache.
+    //   - Duplicate-key guard in _frameCache.insertWith…: if the synchronous
+    //     path beats the prefetch, the insert is a no-op.
+    //   - If prefetch beats the sync path, the cache hit in
+    //     _pullBufferFromReader:atAssetTime: saves the AVAssetImageGenerator call.
+    //   - This block holds only value-typed copies; no unsafe captures.
+    uint64_t capturedGen       = atomic_load(&_generation);
+    NSUInteger capturedIdx     = clipIndex;
+    NSString *capturedSrcURL   = [clip.sourceURL copy];
+    NSNumber *capturedFreezePTS = clip.freezePTS;
+    CGSize capturedRenderSize  = _targetRenderSize;
+
+    dispatch_async(_prefetchQueue, ^{
+      // ── Guard 1: stale generation ────────────────────────────────────────
+      if (atomic_load(&self->_generation) != capturedGen) {
+        os_log_debug(sTimelineLog,
+                     "[VGTCNode] prefetch stale (pre-work): clip=%lu gen=%llu",
+                     (unsigned long)capturedIdx,
+                     (unsigned long long)capturedGen);
+        return;
+      }
+
+      // ── Guard 2: already cached ──────────────────────────────────────────
+      double freezePTS = capturedFreezePTS.doubleValue;
+      CVPixelBufferRef existing =
+          [self->_frameCache lookupWithClipIndex:capturedIdx
+                                       sourceURL:capturedSrcURL
+                                        assetPTS:freezePTS
+                                      renderSize:capturedRenderSize
+                                      generation:capturedGen];
+      if (existing) {
+        CVPixelBufferRelease(existing);
+        os_log_debug(sTimelineLog,
+                     "[VGTCNode] prefetch skipped (already cached): clip=%lu",
+                     (unsigned long)capturedIdx);
+        return;
+      }
+
+      // ── Extract frame via AVAssetImageGenerator (same safe config as sync path)
+      NSURL *assetURL = [NSURL fileURLWithPath:capturedSrcURL];
+      if (!assetURL) {
+        os_log_error(sTimelineLog,
+                     "[VGTCNode] prefetch failed (invalid URL): clip=%lu",
+                     (unsigned long)capturedIdx);
+        return;
+      }
+
+      AVURLAsset *pAsset = [AVURLAsset URLAssetWithURL:assetURL options:nil];
+      AVAssetImageGenerator *pGen =
+          [AVAssetImageGenerator assetImageGeneratorWithAsset:pAsset];
+      pGen.requestedTimeToleranceBefore    = kCMTimeZero;
+      pGen.requestedTimeToleranceAfter     = kCMTimeZero;
+      if (capturedRenderSize.width > 0 && capturedRenderSize.height > 0) {
+        pGen.maximumSize = CGSizeMake(capturedRenderSize.width  * 2.0,
+                                     capturedRenderSize.height * 2.0);
+      }
+      // Orientation fix (RR-154): must match synchronous freeze path.
+      pGen.appliesPreferredTrackTransform = YES;
+
+      CMTime requestTime = CMTimeMakeWithSeconds(freezePTS, 600);
+      NSError *pGenErr = nil;
+      CMTime pActualTime;
+      CGImageRef pCGFrame = [pGen copyCGImageAtTime:requestTime
+                                         actualTime:&pActualTime
+                                              error:&pGenErr];
+      if (!pCGFrame) {
+        os_log_error(sTimelineLog,
+                     "[VGTCNode] prefetch extract failed: clip=%lu pts=%.3fs err=%{public}@",
+                     (unsigned long)capturedIdx, freezePTS,
+                     pGenErr.localizedDescription);
+        return;
+      }
+
+      // ── Guard 3: stale generation after extraction ────────────────────────
+      if (atomic_load(&self->_generation) != capturedGen) {
+        CGImageRelease(pCGFrame);
+        os_log_debug(sTimelineLog,
+                     "[VGTCNode] prefetch stale (post-extract): clip=%lu gen=%llu",
+                     (unsigned long)capturedIdx,
+                     (unsigned long long)capturedGen);
+        return;
+      }
+
+      // ── Convert CGImage → CVPixelBufferRef (same aspect-fit path as sync)
+      CIImage *pCIFrame = [CIImage imageWithCGImage:pCGFrame];
+      CGImageRelease(pCGFrame);
+
+      CGSize pImgSize = pCIFrame.extent.size;
+      if (pImgSize.width <= 0 || pImgSize.height <= 0) {
+        os_log_error(sTimelineLog,
+                     "[VGTCNode] prefetch: zero-size frame for clip=%lu",
+                     (unsigned long)capturedIdx);
+        return;
+      }
+
+      CGFloat pScaleX = 1.0, pScaleY = 1.0;
+      if (capturedRenderSize.width > 0 && capturedRenderSize.height > 0) {
+        pScaleX = capturedRenderSize.width  / pImgSize.width;
+        pScaleY = capturedRenderSize.height / pImgSize.height;
+      }
+      CGFloat pScale   = MIN(pScaleX, pScaleY);
+      CGFloat pOffsetX = (capturedRenderSize.width  - pImgSize.width  * pScale) / 2.0;
+      CGFloat pOffsetY = (capturedRenderSize.height - pImgSize.height * pScale) / 2.0;
+
+      size_t pW = (capturedRenderSize.width  > 0) ? (size_t)capturedRenderSize.width  : (size_t)pImgSize.width;
+      size_t pH = (capturedRenderSize.height > 0) ? (size_t)capturedRenderSize.height : (size_t)pImgSize.height;
+
+      NSDictionary *pPBAttrs = @{
+          (id)kCVPixelBufferPixelFormatTypeKey:     @(kCVPixelFormatType_32BGRA),
+          (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+      };
+      CVPixelBufferRef pPB = NULL;
+      CVReturn pPBRet = CVPixelBufferCreate(kCFAllocatorDefault, pW, pH,
+                                            kCVPixelFormatType_32BGRA,
+                                            (__bridge CFDictionaryRef)pPBAttrs,
+                                            &pPB);
+      if (pPBRet != kCVReturnSuccess || !pPB) {
+        os_log_error(sTimelineLog,
+                     "[VGTCNode] prefetch CVPixelBufferCreate failed: clip=%lu",
+                     (unsigned long)capturedIdx);
+        return;
+      }
+
+      // Clear to black.
+      CVPixelBufferLockBaseAddress(pPB, 0);
+      memset(CVPixelBufferGetBaseAddress(pPB), 0,
+             CVPixelBufferGetBytesPerRow(pPB) * pH);
+      CVPixelBufferUnlockBaseAddress(pPB, 0);
+
+      CIImage *pScaled   = [pCIFrame imageByApplyingTransform:
+                                CGAffineTransformMakeScale(pScale, pScale)];
+      CIImage *pCentered = [pScaled imageByApplyingTransform:
+                                CGAffineTransformMakeTranslation(pOffsetX, pOffsetY)];
+      CGColorSpaceRef pCS = CGColorSpaceCreateDeviceRGB();
+      [_VGTCNSharedCIContext() render:pCentered
+                        toCVPixelBuffer:pPB
+                                  bounds:CGRectMake(0, 0, (CGFloat)pW, (CGFloat)pH)
+                              colorSpace:pCS];
+      CGColorSpaceRelease(pCS);
+
+      // ── Guard 4: stale generation before insert ───────────────────────────
+      if (atomic_load(&self->_generation) != capturedGen) {
+        CVPixelBufferRelease(pPB);
+        os_log_debug(sTimelineLog,
+                     "[VGTCNode] prefetch stale (pre-insert): clip=%lu gen=%llu",
+                     (unsigned long)capturedIdx,
+                     (unsigned long long)capturedGen);
+        return;
+      }
+
+      [self->_frameCache insertWithClipIndex:capturedIdx
+                                   sourceURL:capturedSrcURL
+                                    assetPTS:freezePTS
+                                  renderSize:capturedRenderSize
+                                  generation:capturedGen
+                                      buffer:pPB];
+      CVPixelBufferRelease(pPB); // cache has its own +1; release local ref
+
+      os_log(sTimelineLog,
+             "[VGTCNode] prefetch complete: clip=%lu pts=%.3fs actualPTS=%.3fs "
+             "cacheBytes=%zu",
+             (unsigned long)capturedIdx, freezePTS,
+             CMTimeGetSeconds(pActualTime),
+             self->_frameCache.currentBytes);
+    }); // dispatch_async _prefetchQueue
+    // ── End Phase 7.18A prefetch ─────────────────────────────────────────────
+
     return clipReader;
   }
 
