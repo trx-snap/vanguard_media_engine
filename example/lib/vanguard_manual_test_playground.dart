@@ -524,6 +524,16 @@ class _VanguardManualTestPlaygroundState
   }
 
   // Phase 7.20D: trigger background sidecar preparation for all reversed clips.
+  //
+  // Phase 7.20 fix (ROOT_CAUSE_READY_SIDECAR_DOES_NOT_INVALIDATE_EXISTING_FALLBACK_READER):
+  // After prepareReverseSidecars() returns, if any sidecar is ready the compositor
+  // may already hold a stale fallback Phase 7.19 generator reader (built before
+  // sidecar readiness). To guarantee the accelerated sidecar reader is used on
+  // first play, we force a full native timeline rebuild (updateDraft) + seek to 0.
+  // updateDraft tears down and recreates the graph runtime; the new compositor
+  // then lazy-builds its active reader while the sidecar is already ready,
+  // producing a sidecar reader rather than the slow fallback reader.
+  // This is safe: updateDraft leaves the controller paused and at PTS 0.0.
   Future<void> _prepareSidecars() async {
     final c = _controller;
     if (c == null || !c.isReady || _sidecarBusy) return;
@@ -533,23 +543,52 @@ class _VanguardManualTestPlaygroundState
     });
     try {
       final statuses = await c.prepareReverseSidecars();
+
       if (mounted) {
         setState(() {
           _sidecarStatuses = statuses;
-          _sidecarBusy = false;
           _status = statuses.isEmpty
               ? 'No reversed clips — sidecar preparation skipped.'
               : 'Sidecar preparation complete: '
                   '${statuses.map((s) => '${s.clipId}=${s.state.name}').join(', ')}';
         });
       }
+
+      // Phase 7.20 reader-invalidation fix: if any sidecar is ready, force a
+      // native compositor rebuild so the ready sidecar reader is picked up before
+      // the user presses Play. Without this, the compositor keeps the fallback
+      // Phase 7.19 generator reader that was built before sidecar readiness.
+      final hasReadySidecar = statuses.any(
+        (s) => s.state == VGReverseSidecarState.ready,
+      );
+      if (hasReadySidecar && mounted) {
+        setState(() => _status = 'Sidecar ready. Refreshing timeline...');
+        try {
+          // updateDraft tears down + recreates the native graph runtime and
+          // compositor, leaving the controller paused and currentPTS at 0.0.
+          await c.updateDraft(c.value.draft);
+          // Explicit seek to 0 is belt-and-suspenders: updateDraft resets PTS,
+          // but an explicit seek guarantees _activeReader is nil'd before play.
+          await c.seek(0.0);
+          if (mounted) {
+            setState(
+              () => _status = 'Sidecar ready — timeline refreshed. Press Play.',
+            );
+          }
+        } catch (e) {
+          if (mounted) {
+            setState(
+              () => _status = 'Sidecar ready but timeline refresh failed: $e',
+            );
+          }
+        }
+      }
     } catch (e) {
       if (mounted) {
-        setState(() {
-          _sidecarBusy = false;
-          _status = 'Sidecar prepare error: $e';
-        });
+        setState(() => _status = 'Sidecar prepare error: $e');
       }
+    } finally {
+      if (mounted) setState(() => _sidecarBusy = false);
     }
   }
 

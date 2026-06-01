@@ -2508,6 +2508,29 @@ static inline double _VGQuantizePTS(double pts) {
   }
   // ── End Phase 7.19 reverse extraction ───────────────────────────────────
 
+  // ── Phase 7.20: Sidecar reader time mapping ─────────────────────────────────
+  // A forward sidecar reader is built for a reversed clip (clip.isReversed == YES,
+  // reader.isReversed == NO). The sidecar file stores frames in forward order
+  // (sidecar PTS increases 0 → duration). The compositor passes tAsset decreasing
+  // from trimEnd to trimStart (reversed source formula). The per-reader reuse
+  // guard and lastDeliveredAssetPTS tracking below are in sidecar-local forward
+  // time, so remap here before the guard.
+  //   sidecarT = clip.trimEndSeconds - tAsset
+  // Identity for all non-sidecar readers (clip not reversed, or reader.isReversed YES,
+  // or reader is a static source with reader.reader == nil).
+  {
+    VGClipDescriptor *scRemapClip = _clips[reader.clipIndex];
+    if (scRemapClip.isReversed && !reader.isReversed && reader.reader != nil) {
+      double sidecarT = scRemapClip.trimEndSeconds - tAsset;
+      os_log_debug(sTimelineLog,
+                   "[VGTCNode] sidecar time-remap: clip=%lu "
+                   "tAsset(src)=%.3fs sidecarT=%.3fs",
+                   (unsigned long)reader.clipIndex, tAsset, sidecarT);
+      tAsset = sidecarT;
+    }
+  }
+  // ── End Phase 7.20 sidecar time mapping ─────────────────────────────────────
+
   // ── 1. Per-reader reuse guard (video path) ────────────────────────────────
   if (reader.lastDeliveredBuffer != NULL) {
     if (tAsset >= reader.lastDeliveredAssetPTS &&
@@ -3208,12 +3231,17 @@ static inline double _VGQuantizePTS(double pts) {
   // else: sidecarStart >= duration → reader produces no samples (EOS immediately).
   //   Caller's pullFrame: will handle this as a normal EOS from the completed reader.
 
-  // ── Build video composition ───────────────────────────────────────────────
-  // The sidecar track has identity preferredTransform (orientation pre-baked).
-  // The auto-generated composition is therefore a pixel-pass-through.
-  // Do NOT add a custom layer instruction with aspect-fit scale: the sidecar
-  // pixels are already canvas-fitted at _targetRenderSize by the transcoder.
-  // Only override renderSize to confirm output buffer dimensions.
+  // ── Build video composition with aspect-fit centering ────────────────────
+  // The sidecar track has identity preferredTransform (orientation pre-baked by
+  // the transcoder). However, the sidecar file encodes the CONTENT pixels only
+  // (tight portrait rectangle, e.g. 202×360), NOT a full canvas-sized frame.
+  // To correctly place the portrait content centered in the landscape canvas
+  // (e.g. 640×360), we must add an explicit layer instruction that:
+  //   1. Scales the content to aspect-fit within _targetRenderSize.
+  //   2. Translates it to the centered position.
+  // This mirrors the Phase 7.9 aspect-fit logic in _buildReaderForClipIndex:
+  // for normal clips (Steps 2–6), but uses the sidecar track's natural size
+  // instead of applying preferredTransform (which is identity here).
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
   AVMutableVideoComposition *scComposition =
@@ -3221,9 +3249,55 @@ static inline double _VGQuantizePTS(double pts) {
 #pragma clang diagnostic pop
 
   if (_targetRenderSize.width > 0 && _targetRenderSize.height > 0) {
-    // Reinforce the output buffer dimensions. The sidecar is already fitted,
-    // so this should be a no-op scale, but setting it explicitly ensures
-    // the AVAssetReaderVideoCompositionOutput allocates buffers at canvas size.
+    // ── Phase 7.20 sidecar centering ──────────────────────────────────────────
+    // Step 1: Read sidecar natural size. preferredTransform is identity, so
+    // naturalSize IS the display size. Use fabs for defensive correctness.
+    CGSize scNatural = scTrack.naturalSize;
+    CGFloat naturalW = fabs(scNatural.width);
+    CGFloat naturalH = fabs(scNatural.height);
+    CGFloat canvasW  = _targetRenderSize.width;
+    CGFloat canvasH  = _targetRenderSize.height;
+
+    if (naturalW > 0 && naturalH > 0) {
+      // Step 2: Compute aspect-fit scale (min, not max — no cropping).
+      CGFloat fitScale = MIN(canvasW / naturalW, canvasH / naturalH);
+
+      // Step 3: Center-translate the scaled content within the canvas.
+      CGFloat tx = (canvasW - naturalW * fitScale) / 2.0;
+      CGFloat ty = (canvasH - naturalH * fitScale) / 2.0;
+
+      // Step 4: Build the fit transform. Convention matches Phase 7.9:
+      //   preferredTransform (identity) → scale → center translate.
+      //   Result: x' = x * fitScale + tx, y' = y * fitScale + ty.
+      CGAffineTransform scFitTransform =
+          CGAffineTransformConcat(
+              CGAffineTransformIdentity,
+              CGAffineTransformConcat(
+                  CGAffineTransformMakeScale(fitScale, fitScale),
+                  CGAffineTransformMakeTranslation(tx, ty)));
+
+      // Step 5: Build layer instruction with the computed transform.
+      AVMutableVideoCompositionLayerInstruction *scLayerInstr =
+          [AVMutableVideoCompositionLayerInstruction
+              videoCompositionLayerInstructionWithAssetTrack:scTrack];
+      [scLayerInstr setTransform:scFitTransform atTime:kCMTimeZero];
+
+      // Step 6: Wire instruction into composition.
+      AVMutableVideoCompositionInstruction *scInstruction =
+          [AVMutableVideoCompositionInstruction videoCompositionInstruction];
+      scInstruction.timeRange =
+          CMTimeRangeMake(kCMTimeZero, sidecarAsset.duration);
+      scInstruction.layerInstructions = @[scLayerInstr];
+      scComposition.instructions = @[scInstruction];
+
+      os_log(sTimelineLog,
+             "[VGTCNode] 7.20 sidecar centering: clip=%lu natural=%.0fx%.0f "
+             "canvas=%.0fx%.0f scale=%.4f tx=%.1f ty=%.1f",
+             (unsigned long)clipIndex, naturalW, naturalH,
+             canvasW, canvasH, fitScale, tx, ty);
+    }
+
+    // Step 7: Set output buffer dimensions to canvas size.
     scComposition.renderSize = _targetRenderSize;
   }
 

@@ -99,12 +99,6 @@ final class VGPluginLifecycleObserver: NSObject {
                 // Do NOT nil cameraSource here: didBecomeActive restarts using the
                 // same source object. Dart-side restarts via _startCamera() on resume.
             }
-            // Phase 7.20B: cancel all in-flight reverse sidecar transcodes when the
-            // app backgrounds. Sidecar transcodes are CPU/IO intensive and should not
-            // run in the background. On foreground return, Dart will re-trigger
-            // prepareReverseSidecars via the editor's existing update cycle.
-            // cleanupAllSidecars is fast (lock + state reset; async file deletion).
-            VGReverseSidecarManager.shared().cleanupAllSidecars()
         }
 
         NotificationCenter.default.addObserver(
