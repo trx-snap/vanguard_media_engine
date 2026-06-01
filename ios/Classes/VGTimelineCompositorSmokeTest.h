@@ -1,5 +1,5 @@
 // VGTimelineCompositorSmokeTest.h
-// vanguard_media_engine — Phase 7 Stage 7.5B / Phase 7.16 / Phase 7.17 / Phase 7.19
+// vanguard_media_engine — Phase 7 Stage 7.5B / Phase 7.16 / Phase 7.17 / Phase 7.19 / Phase 7.20A
 //
 // Headless native smoke test runner for VGTimelineCompositorNode.
 //
@@ -157,6 +157,20 @@ NS_ASSUME_NONNULL_BEGIN
 ///
 /// @return NSDictionary with @"success" YES/NO, @"steps", @"logs", @"error".
 + (NSDictionary<NSString *, id> *)runReverseDescriptorSmokeTest;
+
+/// Phase 7.20A: VGReverseSidecarManager state-machine smoke test.
+///
+/// Validates manager lifecycle without requiring a real video fixture:
+///   1. Unknown clipId returns idle status.
+///   2. prepareSidecar with missing file → failed state.
+///   3. invalidateSidecarForClipId resets failed → idle.
+///   4. cleanupAllSidecars resets all records → idle.
+///
+/// Requires no real video files on disk.
+/// In RELEASE builds: returns a static error result.
+///
+/// @return NSDictionary with @"success" YES/NO, @"steps", @"logs", @"error".
++ (NSDictionary<NSString *, id> *)runReverseSidecarManagerSmokeTest;
 
 @end
 

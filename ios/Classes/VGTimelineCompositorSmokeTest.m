@@ -62,6 +62,9 @@
 // ─── System ──────────────────────────────────────────────────────────────────
 #import <os/log.h>
 
+// ─── Phase 7.20A: Reverse sidecar manager ────────────────────────────────────
+#import "VGReverseSidecarManager.h"
+
 static os_log_t sSmokeLog;
 
 // ─── Step result builder ─────────────────────────────────────────────────────
@@ -1530,6 +1533,123 @@ static BOOL _generateMovingPatternVideo(NSString *path,
     return [result copy];
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Phase 7.20A: VGReverseSidecarManager smoke test
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Phase 7.20A sidecar manager smoke test. No real video file needed.
++ (NSDictionary<NSString *, id> *)runReverseSidecarManagerSmokeTest {
+    // Import is done at class level (#import at top of file or via bridging).
+    // VGReverseSidecarManager.h is in the same Classes/ directory.
+    NSMutableArray<NSDictionary *> *steps = [NSMutableArray array];
+    NSMutableArray<NSString *> *logs = [NSMutableArray array];
+    __block NSString *firstError = nil;
+
+    // ── Step 1: Unknown clipId returns idle ───────────────────────────────────
+    {
+        VGReverseSidecarStatus *status =
+            [[VGReverseSidecarManager sharedManager]
+                statusForClipId:@"smoke_test_unknown_clip_7_20"];
+        BOOL passed = (status.state == VGReverseSidecarStateIdle);
+        [steps addObject:_stepResult(@"7.20A-1: unknown clipId = idle", passed,
+            [NSString stringWithFormat:@"state=%ld", (long)status.state])];
+        [logs addObject:[NSString stringWithFormat:
+            @"[7.20A-1] statusForClipId(unknown) state=%ld (expected=0=idle)",
+            (long)status.state]];
+        if (!passed && !firstError) firstError = @"7.20A-1: expected idle for unknown clipId";
+    }
+
+    // ── Step 2: prepareSidecar with missing file → failed ─────────────────────
+    {
+        NSString *missingPath = [NSTemporaryDirectory()
+            stringByAppendingPathComponent:
+                @"vg_smoke_7_20a_missing_does_not_exist.mov"];
+        [[NSFileManager defaultManager] removeItemAtPath:missingPath error:nil];
+
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block VGReverseSidecarStatus *resultStatus = nil;
+
+        [[VGReverseSidecarManager sharedManager]
+            prepareSidecarForClipId:@"smoke_test_missing_clip_7_20"
+                         sourcePath:missingPath
+                          trimStart:0.0
+                            trimEnd:2.0
+                         targetSize:CGSizeMake(320, 240)
+                         sourceHash:@"smoke_hash_missing_7_20"
+                         completion:^(VGReverseSidecarStatus *s) {
+                             resultStatus = s;
+                             dispatch_semaphore_signal(sem);
+                         }];
+
+        dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC);
+        BOOL timedOut = (dispatch_semaphore_wait(sem, timeout) != 0);
+
+        BOOL passed = !timedOut && (resultStatus.state == VGReverseSidecarStateFailed);
+        NSString *detail = timedOut
+            ? @"TIMED OUT"
+            : [NSString stringWithFormat:@"state=%ld err=%@",
+               (long)resultStatus.state, resultStatus.errorMessage];
+        [steps addObject:_stepResult(@"7.20A-2: missing file → failed", passed, detail)];
+        [logs addObject:[NSString stringWithFormat:
+            @"[7.20A-2] missing-file prepare state=%ld err=%@",
+            (long)resultStatus.state, resultStatus.errorMessage]];
+        if (!passed && !firstError) {
+            firstError = timedOut
+                ? @"7.20A-2: timed out waiting for failed status"
+                : @"7.20A-2: expected failed state for missing source file";
+        }
+    }
+
+    // ── Step 3: invalidateSidecarForClipId resets failed → idle ───────────────
+    {
+        [[VGReverseSidecarManager sharedManager]
+            invalidateSidecarForClipId:@"smoke_test_missing_clip_7_20"];
+        VGReverseSidecarStatus *status =
+            [[VGReverseSidecarManager sharedManager]
+                statusForClipId:@"smoke_test_missing_clip_7_20"];
+        BOOL passed = (status.state == VGReverseSidecarStateIdle);
+        [steps addObject:_stepResult(@"7.20A-3: invalidate failed → idle", passed,
+            [NSString stringWithFormat:@"state=%ld", (long)status.state])];
+        [logs addObject:[NSString stringWithFormat:
+            @"[7.20A-3] after invalidate state=%ld (expected=0=idle)",
+            (long)status.state]];
+        if (!passed && !firstError) firstError = @"7.20A-3: expected idle after invalidate";
+    }
+
+    // ── Step 4: cleanupAllSidecars resets all records → idle ──────────────────
+    {
+        [[VGReverseSidecarManager sharedManager] cleanupAllSidecars];
+        VGReverseSidecarStatus *s1 =
+            [[VGReverseSidecarManager sharedManager]
+                statusForClipId:@"smoke_test_missing_clip_7_20"];
+        VGReverseSidecarStatus *s2 =
+            [[VGReverseSidecarManager sharedManager]
+                statusForClipId:@"smoke_test_unknown_clip_7_20"];
+        BOOL passed = (s1.state == VGReverseSidecarStateIdle &&
+                       s2.state == VGReverseSidecarStateIdle);
+        [steps addObject:_stepResult(@"7.20A-4: cleanupAllSidecars → all idle", passed,
+            [NSString stringWithFormat:@"s1=%ld s2=%ld",
+             (long)s1.state, (long)s2.state])];
+        [logs addObject:[NSString stringWithFormat:
+            @"[7.20A-4] after cleanupAll s1=%ld s2=%ld (expected both=0=idle)",
+            (long)s1.state, (long)s2.state]];
+        if (!passed && !firstError) firstError = @"7.20A-4: expected idle after cleanupAllSidecars";
+    }
+
+    // ── Summarise ──────────────────────────────────────────────────────────────
+    BOOL allPassed = YES;
+    for (NSDictionary *s in steps) {
+        if (![s[@"passed"] boolValue]) { allPassed = NO; break; }
+    }
+    NSMutableDictionary *result = [@{
+        @"success": @(allPassed),
+        @"steps":   steps,
+        @"logs":    logs,
+    } mutableCopy];
+    if (!allPassed && firstError) result[@"error"] = firstError;
+    return [result copy];
+}
+
 @end
 
 #else // !DEBUG
@@ -1590,6 +1710,16 @@ static BOOL _generateMovingPatternVideo(NSString *path,
         @"steps": @[],
         @"logs": @[@"Release build \u2014 reverse-playback descriptor smoke test disabled"],
         @"error": @"VGTimelineCompositorSmokeTest.runReverseDescriptorSmokeTest is DEBUG-only",
+    };
+}
+
++ (NSDictionary<NSString *, id> *)runReverseSidecarManagerSmokeTest {
+    // Phase 7.20A sidecar manager smoke test is DEBUG-only.
+    return @{
+        @"success": @NO,
+        @"steps": @[],
+        @"logs": @[@"Release build \u2014 sidecar manager smoke test disabled"],
+        @"error": @"VGTimelineCompositorSmokeTest.runReverseSidecarManagerSmokeTest is DEBUG-only",
     };
 }
 
