@@ -70,6 +70,9 @@ class _VanguardManualTestPlaygroundState
   // ── Phase 7.17: freeze-frame apply status (DEV validation only) ─────────
   bool _freezeApplied = false;
 
+  // ── Phase 7.19B: reverse-clip apply status (DEV validation only) ────────
+  bool _reverseApplied = false;
+
   // ── Phase 7.18B2: Cache Metrics HUD state ──────────────────────────────────
   Map<String, int> _cacheStats = const {};
   bool _fetchingStats = false;
@@ -338,6 +341,7 @@ class _VanguardManualTestPlaygroundState
       _splitApplied = false;
       _reorderApplied = false;
       _freezeApplied = false;
+      _reverseApplied = false;
     });
 
     try {
@@ -481,6 +485,33 @@ class _VanguardManualTestPlaygroundState
       if (mounted) setState(() => _status = 'Freeze rejected: $e');
     } catch (e) {
       if (mounted) setState(() => _status = 'Freeze error: $e');
+    }
+  }
+
+  // Phase 7.19B: reverse clip debug trigger — toggles isReversed on Clip A.
+  // Verifies reverseClip calls updateTimeline and isReversed toggles on the descriptor.
+  Future<void> _reverseClipA() async {
+    final c = _controller;
+    if (c == null || !c.isReady || _exporting) return;
+
+    try {
+      await c.reverseClip(clipId: 'clip-A');
+      final nowReversed = c.draft.clips
+          .firstWhere((clip) => clip.id == 'clip-A',
+              orElse: () => c.draft.clips.first)
+          .isReversed;
+      if (mounted) {
+        setState(() {
+          _reverseApplied = nowReversed;
+          _status = nowReversed
+              ? 'Reverse ON — Clip A is now playing in reverse.'
+              : 'Reverse OFF — Clip A restored to forward playback.';
+        });
+      }
+    } on ArgumentError catch (e) {
+      if (mounted) setState(() => _status = 'Reverse rejected: $e');
+    } catch (e) {
+      if (mounted) setState(() => _status = 'Reverse error: $e');
     }
   }
 
@@ -676,6 +707,10 @@ class _VanguardManualTestPlaygroundState
 
                         // ── Phase 7.17: Freeze Debug Card ───────────────────────
                         _buildFreezeDebugCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.19B: Reverse Debug Card ─────────────────────
+                        _buildReverseDebugCard(),
                         const SizedBox(height: 12),
 
                         // ── Phase 7.18B2: Cache Metrics HUD ─────────────────────
@@ -1724,7 +1759,61 @@ class _VanguardManualTestPlaygroundState
     );
   }
 
-  // ── Phase 7.18B2: Cache Metrics HUD ─────────────────────────────────────────
+  // ── Phase 7.19B: Reverse Playback Debug Card ──────────────────────────────
+
+  Widget _buildReverseDebugCard() {
+    final ready = _controller?.isReady == true && !_exporting;
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: _reverseApplied
+              ? const Color(0xFFFF6B6B).withValues(alpha: 0.6)
+              : Colors.white10,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          const Text(
+            'PHASE 7.19B — REVERSE PLAYBACK (DEV ONLY)',
+            style: TextStyle(
+              color: Color(0xFFFF6B6B),
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.2,
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Toggles isReversed on Clip A. '
+            'Verifies reverseClip calls updateTimeline and the clip plays backwards.',
+            style: TextStyle(color: Colors.white38, fontSize: 10),
+          ),
+          const SizedBox(height: 10),
+          ElevatedButton.icon(
+            onPressed: ready ? _reverseClipA : null,
+            icon: _reverseApplied
+                ? const Icon(Icons.check_circle_outline, size: 16)
+                : const Icon(Icons.swap_horiz_outlined, size: 16),
+            label: Text(
+              _reverseApplied
+                  ? 'Reverse ON — tap to restore forward'
+                  : 'Reverse Clip A',
+            ),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFFF6B6B),
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 
   Widget _buildCacheMetricsCard() {
     final ready     = _controller != null;

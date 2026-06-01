@@ -1,5 +1,5 @@
 // vg_editor_draft.dart
-// Vanguard Media Engine — Phase 7 Stage 7.7 / Stage 7.10 / Stage 7.13 / Stage 7.14 / Stage 7.15
+// Vanguard Media Engine — Phase 7 Stage 7.7 / Stage 7.10 / Stage 7.13 / Stage 7.14 / Stage 7.15 / Phase 7.19B
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // STAGE 7.7  — EDITOR DRAFT RECIPE
@@ -814,6 +814,76 @@ final class VGEditorDraft {
       id: id,
       clips: updatedClips,
       transitions: updatedTransitions,
+      canvasWidth: canvasWidth,
+      canvasHeight: canvasHeight,
+      fps: fps,
+    );
+  }
+
+  // ── Reverse playback (Phase 7.19B / DEC-154) ─────────────────────────────────
+
+  /// Returns a new copy of this draft with [clipId]'s
+  /// [VGClipDescriptor.isReversed] flag toggled.
+  ///
+  /// This is a **non-destructive** operation — the source media file is never
+  /// modified. The returned draft is a fully immutable new instance.
+  ///
+  /// **Dart is the single source of truth for reverse-playback state
+  /// (DEC-154).** The updated draft is forwarded to the native timeline via
+  /// `VGEditorController.reverseClip` → `updateTimeline` MethodChannel route.
+  ///
+  /// Throws [ArgumentError] if:
+  /// - [clipId] is not found in this draft.
+  /// - The target clip is not `VGMediaKind.video`.
+  /// - The target clip has a non-null [VGClipDescriptor.freezePTS] (freeze-frame
+  ///   clips cannot be reversed — native constraint DEC-154).
+  ///
+  /// ```dart
+  /// final reversed = draft.reverseClip(clipId: 'clip-A');
+  /// // reversed.clips[0].isReversed == true  (was false)
+  /// // reversed.clips[0].id          == 'clip-A'
+  /// // second call toggles back:
+  /// final forward = reversed.reverseClip(clipId: 'clip-A');
+  /// // forward.clips[0].isReversed == false
+  /// ```
+  VGEditorDraft reverseClip({required String clipId}) {
+    // 1. Locate the target clip.
+    final targetIndex = clips.indexWhere((c) => c.id == clipId);
+    if (targetIndex == -1) {
+      throw ArgumentError(
+        'VGEditorDraft.reverseClip: clip "$clipId" not found in draft "$id".',
+      );
+    }
+    final targetClip = clips[targetIndex];
+
+    // 2. Validate: must be a video clip.
+    if (targetClip.mediaKind != VGMediaKind.video) {
+      throw ArgumentError(
+        'VGEditorDraft.reverseClip: clip "$clipId" is not a video clip '
+        '(mediaKind=${targetClip.mediaKind.value}). '
+        'Reverse playback only applies to VGMediaKind.video clips.',
+      );
+    }
+
+    // 3. Validate: freeze-frame clips cannot be reversed.
+    if (targetClip.freezePTS != null) {
+      throw ArgumentError(
+        'VGEditorDraft.reverseClip: clip "$clipId" is a freeze-frame clip '
+        '(freezePTS=${targetClip.freezePTS}). '
+        'Freeze-frame clips cannot be reversed (DEC-154).',
+      );
+    }
+
+    // 4. Toggle isReversed on the target clip.
+    final updatedClip = targetClip.copyWith(isReversed: !targetClip.isReversed);
+    final updatedClips = List<VGClipDescriptor>.of(clips);
+    updatedClips[targetIndex] = updatedClip;
+
+    // 5. Rebuild the sequential layout (propagates startTimeSeconds cascade).
+    return VGEditorDraft.sequentialWithTransitions(
+      id: id,
+      clips: updatedClips,
+      transitions: transitions,
       canvasWidth: canvasWidth,
       canvasHeight: canvasHeight,
       fps: fps,

@@ -1,5 +1,5 @@
 // vg_editor_controller.dart
-// Vanguard Media Engine — Phase 7 Stage 7.8 / Stage 7.13 / Stage 7.14 / Stage 7.15
+// Vanguard Media Engine — Phase 7 Stage 7.8 / Stage 7.13 / Stage 7.14 / Stage 7.15 / Phase 7.19B
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // STAGE 7.8 — NATIVE INGESTION & PRODUCTION ROUTE HARDENING
@@ -596,7 +596,38 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     await updateDraft(newDraft);
   }
 
-  // ── Frame cache stats (Phase 7.18B2 / DEC-152) ───────────────────────────
+  // ── Reverse playback (Phase 7.19B / DEC-154) ───────────────────────────
+
+  /// Toggles the [VGClipDescriptor.isReversed] flag of [clipId] and pushes the
+  /// updated timeline to the native renderer.
+  ///
+  /// Delegates validation to [VGEditorDraft.reverseClip]. On success, calls
+  /// [updateDraft] which sends the rebuilt draft to the `updateTimeline` native
+  /// route, resets [currentPTS] to 0.0, and notifies listeners.
+  ///
+  /// Throws [StateError] if the controller is disposed or currently busy with
+  /// another operation.
+  /// Throws [ArgumentError] (from [VGEditorDraft.reverseClip]) if the clip is
+  /// not found, not a video clip, or is a freeze-frame clip. The [ArgumentError]
+  /// is propagated without invoking the MethodChannel.
+  Future<void> reverseClip({required String clipId}) async {
+    _assertNotDisposed();
+    if (_busy) {
+      throw StateError(
+        '[VGEditorController] reverseClip: controller is busy with another operation.',
+      );
+    }
+
+    // Compute the new draft first (throws ArgumentError on invalid clip).
+    // Do this BEFORE setting _busy so the caller can catch ArgumentError
+    // without affecting the busy-lock state.
+    final newDraft = value.draft.reverseClip(clipId: clipId);
+
+    // Push to native via updateDraft (handles busy-lock, pause, and state).
+    await updateDraft(newDraft);
+  }
+
+  // ── Frame cache stats (Phase 7.18B2 / DEC-152) ────────────────────────────
 
   /// Returns a live snapshot of the native frame cache metrics.
   ///

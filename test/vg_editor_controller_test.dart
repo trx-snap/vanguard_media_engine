@@ -1383,14 +1383,14 @@ void main() {
       final twoClipDraft = VGEditorDraft.sequentialWithTransitions(
         id: 'draft-ec6',
         clips: [
-          const VGClipDescriptor(
+          VGClipDescriptor(
             id: 'clip-A',
             sourcePath: '/tmp/clip_a.mp4',
             durationSeconds: 5.0,
             trimStartSeconds: 0.0,
             trimEndSeconds: 5.0,
           ),
-          const VGClipDescriptor(
+          VGClipDescriptor(
             id: 'clip-B',
             sourcePath: '/tmp/clip_b.mp4',
             durationSeconds: 5.0,

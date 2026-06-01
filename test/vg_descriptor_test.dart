@@ -1176,6 +1176,91 @@ void main() {
       );
     });
   });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Phase 7.19B: VGClipDescriptor.isReversed
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGClipDescriptor — isReversed (Phase 7.19B)', () {
+    // Helper: minimal valid video clip.
+    VGClipDescriptor _videoClipRV({
+      String id = 'vid-rv',
+      bool isReversed = false,
+    }) =>
+        VGClipDescriptor(
+          id: id,
+          sourcePath: '/tmp/video.mp4',
+          mediaKind: VGMediaKind.video,
+          durationSeconds: 10.0,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 10.0,
+          isReversed: isReversed,
+        );
+
+    test('RV-1  isReversed defaults to false', () {
+      final clip = _videoClipRV();
+      expect(clip.isReversed, isFalse);
+    });
+
+    test('RV-2  isReversed=true is stored correctly', () {
+      final clip = _videoClipRV(isReversed: true);
+      expect(clip.isReversed, isTrue);
+    });
+
+    test('RV-3  false isReversed is omitted from toMap() (wire-minimal)', () {
+      final clip = _videoClipRV(isReversed: false);
+      final m = clip.toMap();
+      expect(m.containsKey('isReversed'), isFalse);
+    });
+
+    test('RV-4  true isReversed serialises to toMap() as true', () {
+      final clip = _videoClipRV(isReversed: true);
+      final m = clip.toMap();
+      expect(m.containsKey('isReversed'), isTrue);
+      expect(m['isReversed'], isTrue);
+    });
+
+    test('RV-5  isReversed=true round-trips via fromMap()', () {
+      final original = _videoClipRV(isReversed: true);
+      final clone = VGClipDescriptor.fromMap(
+          Map<Object?, Object?>.from(original.toMap()));
+      expect(clone, isNotNull);
+      expect(clone!.isReversed, isTrue);
+    });
+
+    test('RV-6  absent isReversed key in fromMap() defaults to false', () {
+      final m = _videoClipRV().toMap();
+      expect(m.containsKey('isReversed'), isFalse);
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      expect(clip, isNotNull);
+      expect(clip!.isReversed, isFalse);
+    });
+
+    test('RV-7  copyWith preserves isReversed when not overridden', () {
+      final clip = _videoClipRV(isReversed: true);
+      final copy = clip.copyWith(id: 'vid-rv-copy');
+      expect(copy.isReversed, isTrue);
+    });
+
+    test('RV-8  copyWith can set isReversed to true from false', () {
+      final clip = _videoClipRV(isReversed: false);
+      final reversed = clip.copyWith(isReversed: true);
+      expect(reversed.isReversed, isTrue);
+    });
+
+    test('RV-9  equality includes isReversed', () {
+      final a = _videoClipRV(isReversed: true);
+      final b = _videoClipRV(isReversed: true);
+      expect(a, equals(b));
+      expect(a.hashCode, b.hashCode);
+    });
+
+    test('RV-10 equality differs when isReversed differs', () {
+      final a = _videoClipRV(isReversed: false);
+      final b = _videoClipRV(isReversed: true);
+      expect(a == b, isFalse);
+    });
+  });
 }
 
 // ─── Phase 7.12: VGClipDescriptor — VGMediaKind.image ────────────────────────
@@ -1222,8 +1307,8 @@ void main() {
 //   CV-11  VGStillImageFitMode.fromValue("fit") resolves to fit.
 //   CV-12  VGStillImageFitMode.fromValue unknown string resolves to fit.
 
-// ─── Phase 7.17: freezePTS and VGEditorDraft.freezeClip ──────────────────────
-// Added by Phase 7.17 Implementer.
+// ─── Phase 7.19B: isReversed and VGEditorDraft.reverseClip ──────────────────
+// Added by Phase 7.19B Implementer.
 // Tests FF-1 through FF-12 and FC-1 through FC-8 above cover:
 //   FF-1   Default freezePTS is null.
 //   FF-2   Non-null freezePTS is stored correctly.
@@ -1245,3 +1330,13 @@ void main() {
 //   FC-6   splitSeconds outside trim window throws ArgumentError.
 //   FC-7   Non-positive duration throws ArgumentError.
 //   FC-8   Non-video clip throws ArgumentError.
+//   RV-1   isReversed defaults to false.
+//   RV-2   isReversed=true is stored correctly.
+//   RV-3   false isReversed is omitted from toMap() (wire-minimal).
+//   RV-4   true isReversed serialises to toMap() as true.
+//   RV-5   isReversed round-trips via fromMap() when true.
+//   RV-6   Absent isReversed key in fromMap() defaults to false.
+//   RV-7   copyWith preserves isReversed when not overridden.
+//   RV-8   copyWith can set isReversed to true.
+//   RV-9   Equality includes isReversed.
+//   RV-10  Equality differs when isReversed differs.

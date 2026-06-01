@@ -1,5 +1,5 @@
 // vg_clip_descriptor.dart
-// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11 / Phase 7.16 / Phase 7.17
+// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11 / Phase 7.16 / Phase 7.17 / Phase 7.19B
 //
 // Non-destructive clip descriptor for the UMF V2 timeline editor.
 //
@@ -37,6 +37,12 @@
 //   - Applies ONLY to [VGMediaKind.video] clips created by freezeClip().
 //   - Omitted from toMap() when null.
 //
+// Phase 7.19B addition (DEC-154):
+//   - [isReversed]: bool — when true the compositor plays this video clip
+//     in reverse (temporal reversal via AVAssetImageGenerator). Defaults to
+//     false. Applies ONLY to [VGMediaKind.video] clips with a null [freezePTS].
+//     Still-image and freeze-frame clips cannot be reversed (native constraint).
+//
 // Serialisation:
 //   toMap() produces a JSON-compatible map:
 //   {
@@ -52,6 +58,7 @@
 //     'fitMode': String?,        // Phase 7.16: omitted when 'fit' (default)
 //     'cropRect': List<double>?, // Phase 7.16: omitted when null
 //     'freezePTS': double?,      // Phase 7.17: omitted when null
+//     'isReversed': bool?,       // Phase 7.19B: omitted when false (default)
 //   }
 
 import 'vg_clip_transform_descriptor.dart';
@@ -156,6 +163,7 @@ final class VGClipDescriptor {
     this.fitMode = VGStillImageFitMode.fit,
     this.cropRect,
     this.freezePTS,
+    this.isReversed = false,
   })  : assert(startTimeSeconds >= 0, 'startTimeSeconds must be >= 0'),
         assert(durationSeconds >= 0, 'durationSeconds must be >= 0'),
         assert(trimStartSeconds >= 0, 'trimStartSeconds must be >= 0'),
@@ -334,6 +342,26 @@ final class VGClipDescriptor {
   /// Null means this is a normal video or image clip (no freeze behavior).
   final double? freezePTS;
 
+  // ── Reverse playback (Phase 7.19B) ────────────────────────────────────────
+
+  /// Whether this clip plays in reverse (temporal reversal).
+  ///
+  /// **Phase 7.19B / DEC-154** — when true the native compositor reads video
+  /// frames in reverse order using `AVAssetImageGenerator` per-frame extraction
+  /// (the same path as freeze-frame extraction).
+  ///
+  /// Design notes:
+  /// - Applies ONLY to [VGMediaKind.video] clips with a null [freezePTS].
+  ///   Still-image and freeze-frame clips cannot be reversed — this is enforced
+  ///   by [VGEditorDraft.reverseClip] at mutation time.
+  /// - Audio is out of scope for Phase 7.19. Reverse clips render silent until
+  ///   the Phase 8 audio sidecar.
+  /// - When false (default) the compositor uses the standard forward `AVAssetReader`
+  ///   path — zero overhead.
+  ///
+  /// Omitted from [toMap] when false to keep wire payloads minimal.
+  final bool isReversed;
+
   // ── Crop rect convenience accessors (Phase 7.16) ─────────────────────────
 
   /// The normalized X origin of the crop rectangle. Null when [cropRect] is null.
@@ -409,6 +437,10 @@ final class VGClipDescriptor {
     // Phase 7.17: omit freezePTS when null.
     if (freezePTS != null) {
       m['freezePTS'] = freezePTS!;
+    }
+    // Phase 7.19B: omit isReversed when false (default); include only when true.
+    if (isReversed) {
+      m['isReversed'] = true;
     }
     return m;
   }
@@ -491,6 +523,9 @@ final class VGClipDescriptor {
       freezePTS = v;
     }
 
+    // Phase 7.19B: parse optional isReversed. Missing key → false (default).
+    final isReversed = (map['isReversed'] as bool?) ?? false;
+
     return VGClipDescriptor(
       id: id as String,
       sourcePath: sourcePath as String,
@@ -504,6 +539,7 @@ final class VGClipDescriptor {
       fitMode: fitMode,
       cropRect: cropRect,
       freezePTS: freezePTS,
+      isReversed: isReversed,
     );
   }
 
@@ -528,6 +564,7 @@ final class VGClipDescriptor {
     Object? cropRect = _kClipNoValue,
     // Use sentinel to allow explicit null assignment (clear freezePTS).
     Object? freezePTS = _kClipNoValue,
+    bool? isReversed,
   }) {
     return VGClipDescriptor(
       id: id ?? this.id,
@@ -548,6 +585,7 @@ final class VGClipDescriptor {
       freezePTS: freezePTS == _kClipNoValue
           ? this.freezePTS
           : freezePTS as double?,
+      isReversed: isReversed ?? this.isReversed,
     );
   }
 
@@ -568,7 +606,8 @@ final class VGClipDescriptor {
           other.transform == transform &&
           other.fitMode == fitMode &&
           _cropRectEqual(other.cropRect, cropRect) &&
-          other.freezePTS == freezePTS;
+          other.freezePTS == freezePTS &&
+          other.isReversed == isReversed;
 
   /// Deep-equality helper for the [cropRect] list field.
   static bool _cropRectEqual(List<double>? a, List<double>? b) {
@@ -596,6 +635,7 @@ final class VGClipDescriptor {
         // Hash cropRect elements individually for stable hash.
         Object.hashAll(cropRect ?? const []),
         freezePTS,
+        isReversed,
       );
 
   @override
@@ -610,7 +650,8 @@ final class VGClipDescriptor {
       'transform: $transform, '
       'fitMode: ${fitMode.value}, '
       'cropRect: $cropRect, '
-      'freezePTS: $freezePTS)';
+      'freezePTS: $freezePTS, '
+      'isReversed: $isReversed)';
 }
 
 // ── Sentinel for copyWith nullable fields ─────────────────────────────────────────

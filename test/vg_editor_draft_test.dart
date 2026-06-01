@@ -1327,7 +1327,6 @@ void main() {
         throwsA(isA<ArgumentError>()),
       );
     });
-
     test('RO-DR12 toIndex out of range throws ArgumentError', () {
       final draft = makeThreeClipDraft();
       // Too low.
@@ -1464,6 +1463,106 @@ void main() {
           reason: 'Slot-0 relinked to new left clip C');
       expect(reordered.transitions[0].toClipId, 'clip-A',
           reason: 'Slot-0 relinked to new right clip A');
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // reverseClip (Phase 7.19B / DEC-154)
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorDraft — reverseClip (Phase 7.19B)', () {
+    // Helper: two 5-second video clips (hard-cut, no transitions).
+    VGEditorDraft makeReverseDraft() => VGEditorDraft.sequentialWithTransitions(
+          id: 'draft-reverse',
+          clips: [
+            _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+            _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+          ],
+        );
+
+    test('RC-1  reverseClip sets isReversed true on the target clip', () {
+      final draft = makeReverseDraft();
+      final reversed = draft.reverseClip(clipId: 'clip-A');
+
+      // Returned draft has isReversed=true on clip-A.
+      expect(reversed.clips[0].id, 'clip-A');
+      expect(reversed.clips[0].isReversed, isTrue);
+      // Clip B must be unchanged.
+      expect(reversed.clips[1].isReversed, isFalse);
+    });
+
+    test('RC-2  second reverseClip toggles isReversed back to false', () {
+      final draft = makeReverseDraft();
+      final reversed = draft.reverseClip(clipId: 'clip-A');
+      expect(reversed.clips[0].isReversed, isTrue);
+
+      // Toggle again → back to forward.
+      final forward = reversed.reverseClip(clipId: 'clip-A');
+      expect(forward.clips[0].isReversed, isFalse);
+    });
+
+    test('RC-3  original draft is immutable after reverseClip', () {
+      final draft = makeReverseDraft();
+      draft.reverseClip(clipId: 'clip-A');
+
+      // Original draft must be unchanged.
+      expect(draft.clips[0].isReversed, isFalse);
+    });
+
+    test('RC-4  reverseClip preserves draft duration (toggle has no timeline effect)', () {
+      final draft = makeReverseDraft();
+      final reversed = draft.reverseClip(clipId: 'clip-A');
+
+      // Reversing a clip does not change its timeline duration.
+      expect(reversed.durationSeconds, closeTo(draft.durationSeconds, 1e-9));
+    });
+
+    test('RC-5  throws ArgumentError for unknown clipId', () {
+      expect(
+        () => makeReverseDraft().reverseClip(clipId: 'no-such-clip'),
+        throwsArgumentError,
+      );
+    });
+
+    test('RC-6  throws ArgumentError for non-video clip (image)', () {
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-img-rv',
+        clips: [
+          VGClipDescriptor(
+            id: 'img-clip',
+            sourcePath: '/tmp/img.jpg',
+            mediaKind: VGMediaKind.image,
+            durationSeconds: 5.0,
+            trimStartSeconds: 0.0,
+            trimEndSeconds: 5.0,
+          ),
+        ],
+      );
+      expect(
+        () => draft.reverseClip(clipId: 'img-clip'),
+        throwsArgumentError,
+      );
+    });
+
+    test('RC-7  throws ArgumentError for freeze-frame clip (freezePTS != null)', () {
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'draft-freeze-rv',
+        clips: [
+          VGClipDescriptor(
+            id: 'freeze-clip',
+            sourcePath: '/tmp/video.mp4',
+            mediaKind: VGMediaKind.video,
+            durationSeconds: 2.0,
+            trimStartSeconds: 0.0,
+            trimEndSeconds: 2.0,
+            freezePTS: 3.0, // this is a freeze-frame clip
+          ),
+        ],
+      );
+      expect(
+        () => draft.reverseClip(clipId: 'freeze-clip'),
+        throwsArgumentError,
+      );
     });
   });
 }
