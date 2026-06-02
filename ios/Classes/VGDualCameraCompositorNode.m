@@ -1,5 +1,5 @@
 // VGDualCameraCompositorNode.m
-// vanguard_media_engine — Phase 7.x-B / Phase 7.x-F
+// vanguard_media_engine — Phase 7.x-B / Phase 7.x-F / Phase 7.x-G
 //
 // Phase 7.x-B skeleton only. Not integrated into the live runtime.
 // Phase 7.x-F: Primary clip AVAssetReader added. pullFrame: now decodes
@@ -13,6 +13,14 @@
 //   while the requested asset time falls inside [lastSamplePTS, lastSamplePTS
 //   + lastSampleDuration). copyNextSampleBuffer is called only when the
 //   current cached window does not cover the requested time.
+// Phase 7.x-G: Secondary clip AVAssetReader added, mirroring the primary
+//   reader pattern exactly. pullFrame: drives the secondary reader with the
+//   same requested-PTS/sample-window pacing (RR-146 equivalent) as the primary.
+//   The decoded secondary buffer is tracked internally but NOT rendered; the
+//   visual output remains primary-only pass-through.
+//   Secondary EOS does not end the stream; primary EOS still governs.
+//   Both readers are torn down together on seek, invalidate, and dispose.
+//   No PiP. No CoreImage. No Metal.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // DESIGN OVERVIEW
@@ -209,6 +217,13 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
 //     is in-flight, it will see the generation mismatch (incremented by
 //     seekTo:generation:) or the invalidated flag, and return skipped.
 //
+// Phase 7.x-G: Identical lifecycle applied to secondary reader.
+//   _secondaryReader / _secondaryOutput mirror the primary pattern.
+//   Both are cancelled/rebuilt together on seek and invalidate.
+//   A _secondaryEOSReached flag tracks secondary exhaustion without halting
+//   the primary stream. When YES, secondary decode is skipped and the primary
+//   frame is delivered as-is (primary-only pass-through continues).
+//
 // Last-decoded buffer ownership (RR-36):
 //   - _primaryLastBuffer: retained +1 by this node.
 //   - Purpose: extend the CVPixelBuffer's lifetime through the VGFrameEnvelope
@@ -217,6 +232,8 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
 //   - The VGFrameEnvelope.payload.videoBuffer is documented as +0. The renderer
 //     (VanguardGraphRuntime / FlutterTexture) retains the buffer under its own
 //     lock before we clear _primaryLastBuffer.
+//   - _secondaryLastBuffer: retained +1 by this node. Never delivered to the
+//     renderer. Released on seek/invalidate/EOS.
 //
 // Phase 7.x-F (patch) — Sample-window tracking (RR-146 equivalent):
 //   - _primaryLastSamplePTS:      asset-local PTS of the cached frame, in seconds.
@@ -228,6 +245,7 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
 //   - Both are reset to -1.0 / 0.0 on seek, invalidate, reader build, and EOS.
 //   - The sourceFPS fallback is stored as _primarySourceFPS and set when the reader
 //     is built, mirroring _VGClipReader.sourceFPS in VGTimelineCompositorNode.
+//   - Secondary reader uses equivalent _secondaryLastSamplePTS / _secondaryLastSampleDuration.
 @interface VGDualCameraCompositorNode ()
 
 // ─── Primary reader (Phase 7.x-F) ────────────────────────────────────────────
@@ -262,6 +280,33 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
 // Accessible publicly as -primaryRenderSize.
 @property (nonatomic) CGSize primaryRenderSize;
 
+// ─── Secondary reader (Phase 7.x-G) ───────────────────────────────────────────
+// All fields mirror the primary reader pattern exactly.
+
+@property (nonatomic, nullable) AVAssetReader                      *secondaryReader;
+@property (nonatomic, nullable) AVAssetReaderVideoCompositionOutput *secondaryOutput;
+
+// Nominal frame rate of the secondary clip's video composition.
+// Set on reader build; reset to 30.0 on clear.
+@property (nonatomic) double secondarySourceFPS;
+
+// Phase 7.x-G: Sample-window reuse cache (RR-146 equivalent).
+@property (nonatomic) double secondaryLastSamplePTS;      // asset-local PTS; -1.0 = empty
+@property (nonatomic) double secondaryLastSampleDuration; // asset-local sample duration
+
+// Last decoded secondary buffer. Retained +1. Never delivered to renderer.
+// Released on seek, invalidate, secondary EOS, and when a new secondary sample
+// is decoded.
+@property (nonatomic) CVPixelBufferRef secondaryLastBuffer; // nullable; +1
+
+// When YES, secondary reader has exhausted. pullFrame: skips secondary decode
+// and continues delivering primary frames. Reset to NO on seek/invalidate.
+@property (nonatomic) BOOL secondaryEOSReached;
+
+// Display-correct output dimensions of the secondary clip.
+// Probed synchronously during init; DEV-only diagnostic.
+@property (nonatomic) CGSize secondaryRenderSize;
+
 @end
 
 @implementation VGDualCameraCompositorNode {
@@ -277,11 +322,8 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
 @synthesize secondaryClip = _secondaryClip;
 @synthesize layoutMode    = _layoutMode;
 @synthesize pipLayout     = _pipLayout;
-@synthesize primaryRenderSize = _primaryRenderSize;
-
-// CVPixelBufferRef property synthesized manually to handle CF retain/release.
-// We do NOT use @synthesize for primaryLastBuffer because it is a CF type
-// that requires manual ownership management. The ivars are declared below.
+@synthesize primaryRenderSize   = _primaryRenderSize;
+@synthesize secondaryRenderSize = _secondaryRenderSize;
 
 // ─── Designated initializer ───────────────────────────────────────────────────
 
@@ -422,6 +464,15 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     _primaryLastBuffer        = NULL;
     atomic_store(&_primaryGeneration, 0);
 
+    // Phase 7.x-G: secondary reader state initialised to nil.
+    _secondaryReader            = nil;
+    _secondaryOutput            = nil;
+    _secondarySourceFPS         = 30.0;
+    _secondaryLastSamplePTS     = -1.0;
+    _secondaryLastSampleDuration = 0.0;
+    _secondaryLastBuffer         = NULL;
+    _secondaryEOSReached         = NO;
+
     // Phase 7.x-F (aspect ratio, Option B, timing fix):
     // Probe primaryRenderSize synchronously during init so dev_createDualCameraTexture
     // can read the correct display dimensions before the first async pullFrame: fires.
@@ -480,10 +531,47 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
           parsedPipLayout.cornerRadius,
           parsedPipLayout.opacity);
 
+    // Phase 7.x-G: Probe secondaryRenderSize synchronously, same pattern as primary.
+    _secondaryRenderSize = CGSizeMake(1280.0, 720.0);
+    {
+        NSString *secURLStr = secondary.sourceURL;
+        if (secURLStr.length > 0) {
+            NSURL *secAssetURL = [NSURL fileURLWithPath:secURLStr];
+            NSDictionary *opts = @{ AVURLAssetPreferPreciseDurationAndTimingKey : @NO };
+            AVURLAsset *secProbeAsset = [AVURLAsset URLAssetWithURL:secAssetURL options:opts];
+            NSArray<AVAssetTrack *> *secVideoTracks = [secProbeAsset
+                tracksWithMediaType:AVMediaTypeVideo];
+            AVAssetTrack *secProbeTrack = secVideoTracks.firstObject;
+            if (secProbeTrack) {
+                CGAffineTransform secTx  = secProbeTrack.preferredTransform;
+                CGSize             secNat = secProbeTrack.naturalSize;
+                CGSize             secDisplay = CGSizeApplyAffineTransform(secNat, secTx);
+                secDisplay = CGSizeMake(fabs(secDisplay.width), fabs(secDisplay.height));
+                if (secDisplay.width > 1.0 && secDisplay.height > 1.0) {
+                    _secondaryRenderSize = secDisplay;
+                } else if (secNat.width > 1.0 && secNat.height > 1.0) {
+                    _secondaryRenderSize = secNat;
+                }
+                NSLog(@"[VGDualCameraCompositorNode][7.x-G] init probe: "
+                      "secondaryRenderSize={%.0f,%.0f} natural={%.0f,%.0f} clipId=%@",
+                      _secondaryRenderSize.width, _secondaryRenderSize.height,
+                      secNat.width, secNat.height, secondary.clipId);
+            } else {
+                NSLog(@"[VGDualCameraCompositorNode][7.x-G] init probe: "
+                      "no video track found for secondary — using DEV fallback 1280x720. clipId=%@",
+                      secondary.clipId);
+            }
+        } else {
+            NSLog(@"[VGDualCameraCompositorNode][7.x-G] init probe: "
+                  "secondary sourceURL empty — using DEV fallback 1280x720. clipId=%@",
+                  secondary.clipId);
+        }
+    }
+
     return self;
 }
 
-// ─── Phase 7.x-F: Dealloc — release retained CVPixelBuffer ───────────────────
+// ─── Phase 7.x-F / 7.x-G: Dealloc — release retained CVPixelBuffers ─────────
 
 - (void)dealloc {
     // Release the retained primary buffer if any.
@@ -491,6 +579,13 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     if (_primaryLastBuffer) {
         CVPixelBufferRelease(_primaryLastBuffer);
         _primaryLastBuffer = NULL;
+    }
+    // Phase 7.x-G: Release the retained secondary buffer if any.
+    // Mirrors primary buffer release. invalidate normally handles this, but dealloc
+    // is the last-resort safety net if the node is torn down without invalidate.
+    if (_secondaryLastBuffer) {
+        CVPixelBufferRelease(_secondaryLastBuffer);
+        _secondaryLastBuffer = NULL;
     }
 }
 
@@ -538,8 +633,10 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     }
 
     // Phase 7.x-F: Cancel and release the primary reader.
+    // Phase 7.x-G: Cancel and release the secondary reader together.
     // invalidate may be called from any thread.
     [self _cancelAndClearPrimaryReader];
+    [self _cancelAndClearSecondaryReader];
 }
 
 // ─── VGNode protocol — format negotiation ────────────────────────────────────
@@ -583,9 +680,11 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     // VGSourceNode.h: "Thread-safe: may be called from any thread."
     atomic_store(&_primaryGeneration, generation);
 
+    // Phase 7.x-G: Clear both readers together on seek.
     [self _cancelAndClearPrimaryReader];
+    [self _cancelAndClearSecondaryReader];
 
-    NSLog(@"[VGDualCameraCompositorNode][7.x-F] seekTo: time=%.3fs gen=%llu",
+    NSLog(@"[VGDualCameraCompositorNode][7.x-F/G] seekTo: time=%.3fs gen=%llu",
           CMTimeGetSeconds(time),
           (unsigned long long)generation);
 }
@@ -751,6 +850,50 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
         }
     }
 
+    // ── 5b. Lazy secondary reader initialization (Phase 7.x-G) ──────────────
+    //
+    // Mirror the primary reader lazy build. Use the same assetTime mapping
+    // for the secondary clip so both readers start approximately in sync.
+    //
+    // Secondary clip shape guard: only support forward video clips, matching
+    // the primary guard. Unsupported shapes skip secondary decode silently;
+    // the primary pass-through is unaffected.
+    if (!_secondaryEOSReached && _secondaryReader == nil) {
+        VGClipDescriptor *secClip = _secondaryClip;
+        BOOL secCanRead = (secClip.mediaKind == VGClipMediaKindVideo &&
+                           secClip.freezePTS == nil &&
+                           !secClip.isReversed &&
+                           secClip.sourceURL.length > 0);
+        if (secCanRead) {
+            // Map primary requestedPTSSecs to secondary asset time.
+            double secSpeed = (secClip.speed > 0.0) ? secClip.speed : 1.0;
+            double secAssetTime = secClip.trimStartSeconds + requestedPTSSecs * secSpeed;
+            if (secAssetTime < secClip.trimStartSeconds) { secAssetTime = secClip.trimStartSeconds; }
+            if (secAssetTime > secClip.trimEndSeconds)   { secAssetTime = secClip.trimEndSeconds;   }
+
+            NSError *secBuildError = nil;
+            BOOL secBuilt = [self _buildSecondaryReaderStartingAtTime:secAssetTime
+                                                                error:&secBuildError];
+            if (!secBuilt) {
+                NSLog(@"[VGDualCameraCompositorNode][7.x-G] Failed to build secondary reader: %@. "
+                      "Secondary decode disabled for this session. clipId=%@",
+                      secBuildError.localizedDescription, secClip.clipId);
+                // Mark secondary as exhausted so we don't retry every frame.
+                _secondaryEOSReached = YES;
+            }
+        } else {
+            NSLog(@"[VGDualCameraCompositorNode][7.x-G] secondary clip shape unsupported "
+                  "(mediaKind=%ld freezePTS=%@ isReversed=%d sourceURL=%@); "
+                  "secondary decode skipped. clipId=%@",
+                  (long)_secondaryClip.mediaKind,
+                  _secondaryClip.freezePTS,
+                  _secondaryClip.isReversed,
+                  _secondaryClip.sourceURL.length > 0 ? @"<set>" : @"<empty>",
+                  _secondaryClip.clipId);
+            _secondaryEOSReached = YES;
+        }
+    }
+
     // ── 6. Check reader is still alive ──────────────────────────────────────
     //
     // AVAssetReader.status transitions from Reading to Completed/Failed/Cancelled
@@ -798,6 +941,16 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
         CVPixelBufferRelease(cachedBuf); // release the extra +1 we just took above
         // (The node's +1 in _primaryLastBuffer extends the buffer lifetime
         //  past this return. The renderer will retain under its own lock.)
+
+        // Phase 7.x-G: Advance secondary reader in parallel with primary cache hit.
+        // The secondary advance result does not affect primary delivery.
+        if (!_secondaryEOSReached) {
+            BOOL secOk = [self _advanceSecondaryReaderToRequestedPTS:requestedPTSSecs
+                                                          generation:currentGen];
+            if (!secOk) {
+                _secondaryEOSReached = YES;
+            }
+        }
 
         return [VGFrameResult deliveredWithEnvelope:envelope generation:currentGen];
     }
@@ -924,6 +1077,16 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
             envelope.payload.videoBuffer = (void *)pixelBuffer; // +0 in envelope
             envelope.metadata   = NULL;
 
+            // Phase 7.x-G: Advance secondary reader in parallel with primary frame
+            // delivery. The secondary advance result does not affect primary delivery.
+            if (!_secondaryEOSReached) {
+                BOOL secOk = [self _advanceSecondaryReaderToRequestedPTS:requestedPTSSecs
+                                                              generation:currentGen];
+                if (!secOk) {
+                    _secondaryEOSReached = YES;
+                }
+            }
+
             return [VGFrameResult deliveredWithEnvelope:envelope generation:currentGen];
         }
 
@@ -934,6 +1097,153 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     // Unreachable: loop always returns or falls through via the early-exits above.
     // Defensive fallback for static analyser.
     return [VGFrameResult skippedWithGeneration:request.generation];
+}
+
+// ─── Phase 7.x-G: Private — advance secondary reader to cover requestedPTSSecs ─────────
+//
+// Called from pullFrame: after the primary frame is determined.
+// Drives the secondary AVAssetReader with the same sample-window reuse pacing
+// as the primary reader (RR-146 equivalent).
+//
+// The secondary buffer is never delivered to the renderer. It is retained by
+// this node (+1) and released on seek, invalidate, secondary EOS, and dealloc.
+//
+// Returns: YES if a frame was decoded or reused. NO if secondary is exhausted
+// or an error occurred (caller marks _secondaryEOSReached = YES).
+
+- (BOOL)_advanceSecondaryReaderToRequestedPTS:(double)requestedPTSSecs
+                                    generation:(uint64_t)currentGen {
+    if (_secondaryEOSReached || _secondaryReader == nil) {
+        return NO;
+    }
+
+    VGClipDescriptor *secClip = _secondaryClip;
+    double secSpeed    = (secClip.speed > 0.0) ? secClip.speed : 1.0;
+    double secAssetTime = secClip.trimStartSeconds + requestedPTSSecs * secSpeed;
+    if (secAssetTime < secClip.trimStartSeconds) { secAssetTime = secClip.trimStartSeconds; }
+    if (secAssetTime > secClip.trimEndSeconds)   { secAssetTime = secClip.trimEndSeconds;   }
+
+    // ── Sample-window reuse guard (RR-146 equivalent for secondary) ──────────────
+    if (_secondaryLastBuffer != NULL &&
+        _secondaryLastSamplePTS >= 0.0 &&
+        secAssetTime >= _secondaryLastSamplePTS &&
+        secAssetTime <  _secondaryLastSamplePTS + _secondaryLastSampleDuration) {
+        // Cache hit: reuse without decoding.
+        return YES;
+    }
+
+    // Check secondary reader health.
+    if (_secondaryReader.status != AVAssetReaderStatusReading) {
+        AVAssetReaderStatus status = _secondaryReader.status;
+        _secondaryLastSamplePTS      = -1.0;
+        _secondaryLastSampleDuration = 0.0;
+        NSLog(@"[VGDualCameraCompositorNode][7.x-G] secondary reader not reading (status=%ld). "
+              "Marking secondary EOS. clipId=%@", (long)status, secClip.clipId);
+        return NO;
+    }
+
+    // Advance reader until window covers secAssetTime or EOS.
+    // Guard against unbounded iteration with a conservative frame-count cap.
+    // 300 iterations is generous enough for any clip at up to 120 fps.
+    const NSInteger kMaxSecondaryReadIterations = 300;
+    NSInteger iterations = 0;
+
+    while (iterations < kMaxSecondaryReadIterations) {
+        iterations++;
+
+        // Generation guard: bail if seek happened during secondary decode.
+        if (atomic_load(&_primaryGeneration) != currentGen) {
+            return NO;
+        }
+
+        if (_secondaryReader.status != AVAssetReaderStatusReading) {
+            AVAssetReaderStatus status = _secondaryReader.status;
+            _secondaryLastSamplePTS      = -1.0;
+            _secondaryLastSampleDuration = 0.0;
+            if (status == AVAssetReaderStatusCompleted) {
+                NSLog(@"[VGDualCameraCompositorNode][7.x-G] secondary reader EOS in advance loop. "
+                      "clipId=%@", secClip.clipId);
+            } else {
+                NSLog(@"[VGDualCameraCompositorNode][7.x-G] secondary reader status=%ld in advance loop. "
+                      "clipId=%@", (long)status, secClip.clipId);
+            }
+            return NO;
+        }
+
+        CMSampleBufferRef secSampleBuf = [_secondaryOutput copyNextSampleBuffer]; // +1
+
+        if (!secSampleBuf) {
+            // NULL: secondary reader exhausted or cancelled.
+            _secondaryLastSamplePTS      = -1.0;
+            _secondaryLastSampleDuration = 0.0;
+            NSLog(@"[VGDualCameraCompositorNode][7.x-G] secondary reader null sample "
+                  "(status=%ld). Marking secondary EOS. clipId=%@",
+                  (long)_secondaryReader.status, secClip.clipId);
+            return NO;
+        }
+
+        CVImageBufferRef secImageBuffer = CMSampleBufferGetImageBuffer(secSampleBuf);
+        if (!secImageBuffer) {
+            // Timing-only sample. Skip and continue.
+            CFRelease(secSampleBuf);
+            continue;
+        }
+
+        // Extract timing.
+        CMTime rawSecPTS = CMSampleBufferGetPresentationTimeStamp(secSampleBuf);
+        CMTime rawSecDur = CMSampleBufferGetDuration(secSampleBuf);
+
+        double secSPTS = CMTIME_IS_VALID(rawSecPTS) ? CMTimeGetSeconds(rawSecPTS) : -1.0;
+        double secSDur = (CMTIME_IS_VALID(rawSecDur) &&
+                          !CMTIME_IS_INDEFINITE(rawSecDur) &&
+                          CMTimeGetSeconds(rawSecDur) > 0.0)
+                         ? CMTimeGetSeconds(rawSecDur)
+                         : (1.0 / MAX(_secondarySourceFPS, 1.0));
+
+        // Retain secondary pixel buffer (+1).
+        CVPixelBufferRef secPixelBuffer = (CVPixelBufferRef)secImageBuffer;
+        CVPixelBufferRetain(secPixelBuffer); // +1: node cache ref
+
+        // Release previous cached secondary buffer.
+        if (_secondaryLastBuffer) {
+            CVPixelBufferRelease(_secondaryLastBuffer);
+        }
+        _secondaryLastBuffer        = secPixelBuffer; // node takes +1
+        _secondaryLastSamplePTS      = secSPTS;
+        _secondaryLastSampleDuration = secSDur;
+
+        CFRelease(secSampleBuf); // release CMSampleBufferRef +1
+
+        // Generation guard post-decode.
+        if (atomic_load(&_primaryGeneration) != currentGen) {
+            CVPixelBufferRelease(_secondaryLastBuffer);
+            _secondaryLastBuffer        = NULL;
+            _secondaryLastSamplePTS      = -1.0;
+            _secondaryLastSampleDuration = 0.0;
+            return NO;
+        }
+
+        NSLog(@"[VGDualCameraCompositorNode][7.x-G] secondary decoded frame: "
+              "secAssetTime=%.3fs samplePTS=%.3fs dur=%.3fs clipId=%@",
+              secAssetTime, secSPTS, secSDur, secClip.clipId);
+
+        // Check if window covers requested time or reader has advanced past it.
+        BOOL secWindowCovers = (secSPTS >= 0.0 &&
+                                secAssetTime >= secSPTS &&
+                                secAssetTime <  secSPTS + secSDur);
+        BOOL secPastRequest  = (secSPTS > secAssetTime);
+
+        if (secWindowCovers || secPastRequest) {
+            return YES; // Frame ready; no rendering — primary pass-through continues.
+        }
+        // Continue advancing.
+    }
+
+    // Fell out of the loop: iteration cap exceeded.
+    NSLog(@"[VGDualCameraCompositorNode][7.x-G] secondary advance cap reached at "
+          "secAssetTime=%.3fs after %ld iterations. clipId=%@",
+          secAssetTime, (long)iterations, secClip.clipId);
+    return YES; // Not an error; just stop advancing this frame.
 }
 
 // ─── Phase 7.x-F: Private — build primary AVAssetReader ──────────────────────
@@ -1171,6 +1481,159 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     if (_primaryLastBuffer) {
         CVPixelBufferRelease(_primaryLastBuffer);
         _primaryLastBuffer = NULL;
+    }
+}
+
+// ─── Phase 7.x-G: Private — build secondary AVAssetReader ────────────────────────
+//
+// Identical structure to _buildPrimaryReaderStartingAtTime:error:.
+// Builds an AVAssetReader + AVAssetReaderVideoCompositionOutput for _secondaryClip.
+// timeRange must be set before -startReading (Apple contract).
+
+- (BOOL)_buildSecondaryReaderStartingAtTime:(double)startTimeSecs
+                                       error:(NSError **)outError {
+    VGClipDescriptor *secClip = _secondaryClip;
+
+    NSURL *assetURL = [NSURL fileURLWithPath:secClip.sourceURL];
+    if (!assetURL) {
+        if (outError) {
+            *outError = [NSError errorWithDomain:VGDualCameraCompositorNodeErrorDomain
+                                           code:3200
+                                       userInfo:@{NSLocalizedDescriptionKey:
+                                           [NSString stringWithFormat:
+                                               @"VGDualCameraCompositorNode[7.x-G]: "
+                                                "invalid sourceURL for secondaryClip '%@': %@",
+                                               secClip.clipId, secClip.sourceURL]}];
+        }
+        return NO;
+    }
+
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:assetURL options:nil];
+
+    NSArray<AVAssetTrack *> *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
+    AVAssetTrack *videoTrack = tracks.firstObject;
+    if (!videoTrack) {
+        if (outError) {
+            *outError = [NSError errorWithDomain:VGDualCameraCompositorNodeErrorDomain
+                                           code:3201
+                                       userInfo:@{NSLocalizedDescriptionKey:
+                                           [NSString stringWithFormat:
+                                               @"VGDualCameraCompositorNode[7.x-G]: "
+                                                "no video track for secondaryClip '%@' at %@",
+                                               secClip.clipId, secClip.sourceURL]}];
+        }
+        return NO;
+    }
+
+    NSError *readerError = nil;
+    AVAssetReader *reader = [AVAssetReader assetReaderWithAsset:asset error:&readerError];
+    if (!reader) {
+        if (outError) *outError = readerError;
+        return NO;
+    }
+
+    // Set timeRange before startReading (Apple requirement).
+    CMTime assetStart    = CMTimeMakeWithSeconds(startTimeSecs,          600);
+    CMTime assetEnd      = CMTimeMakeWithSeconds(secClip.trimEndSeconds, 600);
+    CMTime assetDuration = asset.duration;
+
+    if (CMTIME_IS_VALID(assetDuration) &&
+        CMTimeCompare(assetStart, assetDuration) >= 0) {
+        assetStart = assetDuration;
+    }
+    CMTime readEnd = assetEnd;
+    if (CMTIME_IS_VALID(assetDuration) &&
+        CMTimeCompare(assetEnd, assetDuration) > 0) {
+        readEnd = assetDuration;
+    }
+    if (CMTimeCompare(assetStart, readEnd) < 0) {
+        CMTime readDuration = CMTimeSubtract(readEnd, assetStart);
+        reader.timeRange = CMTimeRangeMake(assetStart, readDuration);
+    }
+
+    // Phase 7.9-identical orientation normalization via AVMutableVideoComposition.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    AVMutableVideoComposition *videoComposition =
+        [AVMutableVideoComposition videoCompositionWithPropertiesOfAsset:asset];
+#pragma clang diagnostic pop
+
+    NSDictionary *outputSettings = _VGDCCNOutputSettings();
+    AVAssetReaderVideoCompositionOutput *output =
+        [[AVAssetReaderVideoCompositionOutput alloc]
+            initWithVideoTracks:@[videoTrack]
+                   videoSettings:outputSettings];
+
+    // Both must be set before startReading (Apple contract).
+    output.videoComposition       = videoComposition;
+    output.alwaysCopiesSampleData = NO;
+
+    if (![reader canAddOutput:output]) {
+        if (outError) {
+            *outError = [NSError errorWithDomain:VGDualCameraCompositorNodeErrorDomain
+                                           code:3202
+                                       userInfo:@{NSLocalizedDescriptionKey:
+                                           [NSString stringWithFormat:
+                                               @"VGDualCameraCompositorNode[7.x-G]: "
+                                                "cannot add output for secondaryClip '%@'.",
+                                               secClip.clipId]}];
+        }
+        return NO;
+    }
+
+    [reader addOutput:output];
+
+    if (![reader startReading]) {
+        if (outError) *outError = reader.error;
+        return NO;
+    }
+
+    // Compute source FPS (mirrors primary build).
+    double sourceFPS = 30.0;
+    if (videoComposition &&
+        CMTIME_IS_VALID(videoComposition.frameDuration) &&
+        CMTimeGetSeconds(videoComposition.frameDuration) > 0.0) {
+        sourceFPS = 1.0 / CMTimeGetSeconds(videoComposition.frameDuration);
+    } else if (videoTrack.nominalFrameRate > 0.0f) {
+        sourceFPS = (double)videoTrack.nominalFrameRate;
+    }
+
+    _secondaryReader             = reader;
+    _secondaryOutput             = output;
+    _secondarySourceFPS          = sourceFPS;
+    _secondaryLastSamplePTS      = -1.0;
+    _secondaryLastSampleDuration = 0.0;
+
+    NSLog(@"[VGDualCameraCompositorNode][7.x-G] secondary reader built ok | "
+          "clipId=%@ start=%.3fs end=%.3fs fps=%.1f",
+          secClip.clipId, startTimeSecs, secClip.trimEndSeconds, sourceFPS);
+
+    return YES;
+}
+
+// ─── Phase 7.x-G: Private — cancel and clear secondary reader ─────────────────────
+//
+// Cancels the active secondary AVAssetReader, nils reader and output references,
+// resets sample-window cache fields, releases the retained secondary buffer,
+// and resets _secondaryEOSReached so a fresh seek rebuilds cleanly.
+// Idempotent: safe to call when reader is already nil.
+
+- (void)_cancelAndClearSecondaryReader {
+    AVAssetReader *reader = _secondaryReader;
+    if (reader) {
+        [reader cancelReading];
+        _secondaryReader = nil;
+        _secondaryOutput = nil;
+    }
+
+    _secondaryLastSamplePTS      = -1.0;
+    _secondaryLastSampleDuration = 0.0;
+    _secondarySourceFPS          = 30.0;
+    _secondaryEOSReached         = NO;
+
+    if (_secondaryLastBuffer) {
+        CVPixelBufferRelease(_secondaryLastBuffer);
+        _secondaryLastBuffer = NULL;
     }
 }
 

@@ -1,8 +1,8 @@
 // VGDualCameraCompositorNode.h
-// vanguard_media_engine — Phase 7.x-B / Phase 7.x-F
+// vanguard_media_engine — Phase 7.x-B / Phase 7.x-F / Phase 7.x-G
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// PHASE 7.x-B / 7.x-F — DUAL-CAMERA EDITOR CONSUMPTION
+// PHASE 7.x-B / 7.x-F / 7.x-G — DUAL-CAMERA EDITOR CONSUMPTION
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // VGDualCameraCompositorNode is the native skeleton for dual-camera timeline
@@ -29,12 +29,21 @@
 //     • primaryRenderSize: display-correct output dimensions (preferredTransform applied).
 //     • Secondary clip remains parsed/stored but unused (no PiP yet).
 //
-//   OUT OF SCOPE (DEFERRED TO 7.x-G AND LATER):
-//     • Secondary clip AVAssetReader or rendering.
+//   ADDED (Phase 7.x-G):
+//     • Secondary clip AVAssetReader lifecycle mirroring the primary reader.
+//     • Secondary requested-PTS/sample-window pacing (RR-146 equivalent).
+//     • Combined seek/invalidate/dispose clearing both readers atomically.
+//     • Secondary EOS: if secondary exhausts before primary, primary continues.
+//       Primary EOS still dictates overall DEV texture EOS.
+//     • secondaryRenderSize DEV diagnostic property.
+//     • Rendered output remains primary-only pass-through (no PiP/CoreImage).
+//
+//   OUT OF SCOPE (DEFERRED TO 7.x-H AND LATER):
 //     • PiP geometry computation or CoreImage compositing.
 //     • Export parity with VanguardDualCameraFlattener.
 //     • Live camera capture or AVCaptureMultiCamSession usage.
 //     • Still/freeze/reverse primary clip support.
+//     • Canvas aspect-fit normalization.
 //
 // ── DO NOT MODIFY ────────────────────────────────────────────────────────────
 //
@@ -122,7 +131,7 @@ typedef NS_ENUM(NSInteger, VGDualCameraCompositorNodeErrorCode) {
 };
 
 // ─── VGDualCameraCompositorNode ───────────────────────────────────────────────
-/// Phase 7.x-B / 7.x-F dual-camera compositor node.
+/// Phase 7.x-B / 7.x-F / 7.x-G dual-camera compositor node.
 ///
 /// Conforms to <VGSourceNode> for pull-mode integration with the generic
 /// VanguardGraphRuntime source node interface (Phase 7.x-D).
@@ -131,6 +140,13 @@ typedef NS_ENUM(NSInteger, VGDualCameraCompositorNodeErrorCode) {
 /// `primaryClip` and returns decoded BGRA frames. Orientation normalization
 /// uses `AVAssetReaderVideoCompositionOutput` with an `AVMutableVideoComposition`
 /// (Phase 7.9-identical convention). Secondary clip is stored but not rendered.
+///
+/// Phase 7.x-G: `pullFrame:` now also drives a secondary `AVAssetReader`
+/// for `secondaryClip`, applying identical requested-PTS/sample-window pacing
+/// (RR-146 equivalent). The secondary buffer is decoded and tracked internally;
+/// the rendered output remains primary-only pass-through. Secondary EOS does
+/// not terminate the stream; primary EOS still governs. Both readers are torn
+/// down together on seek, invalidate, and dispose.
 /// No PiP, no CoreImage compositing, no export in this phase.
 ///
 /// Initialized from a `parameters` dictionary that mirrors the Dart
@@ -192,6 +208,16 @@ typedef NS_ENUM(NSInteger, VGDualCameraCompositorNodeErrorCode) {
 /// Not related to `VanguardGraphRuntime.renderSize` (which is the V1 push-mode
 /// output size). This property is DEV-only and read by the plugin route only.
 @property (nonatomic, readonly) CGSize primaryRenderSize;
+
+/// Phase 7.x-G: Display-correct output dimensions of the secondary clip.
+///
+/// Probed synchronously during `initWithNodeId:parameters:ports:error:` using
+/// the same `naturalSize` + `preferredTransform` logic as `primaryRenderSize`.
+/// Returns `{1280, 720}` (DEV fallback) if `secondaryClip.sourceURL` is empty
+/// or the secondary asset has no video track.
+///
+/// DEV-only. Not exposed to production runtime.
+@property (nonatomic, readonly) CGSize secondaryRenderSize;
 
 // ─── Designated initializer ───────────────────────────────────────────────────
 
