@@ -1,5 +1,5 @@
 // VGDualCameraCompositorNode.m
-// vanguard_media_engine — Phase 7.x-B / Phase 7.x-F / Phase 7.x-G
+// vanguard_media_engine — Phase 7.x-B / Phase 7.x-F / Phase 7.x-G / Phase 7.x-J
 //
 // Phase 7.x-B skeleton only. Not integrated into the live runtime.
 // Phase 7.x-F: Primary clip AVAssetReader added. pullFrame: now decodes
@@ -1315,14 +1315,92 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     CGAffineTransform translateT = CGAffineTransformMakeTranslation(pipOriginX, pipOriginY);
     CIImage *secPositioned = [secScaled imageByApplyingTransform:translateT];
 
-    // ── 7. Composite: secondary over primary (Porter-Duff SourceOver) ────────
-    CIImage *composited = [secPositioned imageByCompositingOverImage:primaryCI];
+    // ── 7. Phase 7.x-J: Apply corner radius mask (CIRoundedRectangleGenerator) ──
+    //
+    // Mirrors VanguardDualCameraCompositor.swift §E (CIRoundedRectangleGenerator
+    // + CIBlendWithAlphaMask). The mask is built in PiP-local space (origin 0,0)
+    // then applied BEFORE translation so the extent matches the scaled PiP image.
+    //
+    // cornerRadius = 0.0  → mask covers the full rectangle → identical to 7.x-H.
+    // cornerRadius > 0.0  → corners are transparent (alpha = 0).
+    //
+    // Clamp cornerRadius: must be >= 0 and <= half the shortest PiP dimension
+    // so the rounded rect does not degenerate into a circle or become invisible.
+    CIImage *secStyled = secPositioned;
+    double cr = pip.cornerRadius;
+    if (cr < 0.0) { cr = 0.0; }
+    double maxCR = MIN(pipW, pipH) * 0.5;
+    if (cr > maxCR) { cr = maxCR; }
+
+    if (cr > 0.0) {
+        // Build mask in PiP-local space: extent = {0, 0, pipW, pipH}.
+        // secPositioned extent origin = (pipOriginX, pipOriginY) after the
+        // translation above; we need the mask in the same coordinate space.
+        CGRect pipLocalRect = CGRectMake(pipOriginX, pipOriginY, pipW, pipH);
+        CIImage *mask = [CIFilter filterWithName:@"CIRoundedRectangleGenerator"
+                                   keysAndValues:
+                             @"inputExtent",  [CIVector vectorWithCGRect:pipLocalRect],
+                             @"inputRadius",  @(cr),
+                             @"inputColor",   [CIColor whiteColor],
+                             nil].outputImage;
+        if (mask) {
+            mask = [mask imageByCroppingToRect:pipLocalRect];
+            // CIBlendWithAlphaMask: pixels where mask.alpha > 0 are kept,
+            // corners are transparent. Background = empty (transparent).
+            // Use CIFilter (ObjC API) not applyingFilter:withInputParameters: (Swift-only).
+            CIFilter *blendFilter = [CIFilter filterWithName:@"CIBlendWithAlphaMask"
+                                                keysAndValues:
+                kCIInputImageKey,       secPositioned,
+                kCIInputMaskImageKey,   mask,
+                kCIInputBackgroundImageKey, [CIImage emptyImage],
+                nil];
+            CIImage *masked = blendFilter.outputImage;
+            if (masked) {
+                secStyled = masked;
+            }
+        }
+    }
+
+    // ── 8. Phase 7.x-J: Apply opacity (CIColorMatrix alpha-channel multiply) ─
+    //
+    // Multiplies each pixel's alpha channel by pip.opacity.
+    // opacity = 1.0 → no change (identity).
+    // opacity = 0.0 → fully transparent PiP (invisible, no crash).
+    //
+    // CIColorMatrix inputAVector: {0, 0, 0, opacity} multiplies alpha by opacity.
+    // inputRVector / inputGVector / inputBVector are identity (passthrough).
+    double op = pip.opacity;
+    if (op < 0.0) { op = 0.0; }
+    if (op > 1.0) { op = 1.0; }
+
+    if (op < 1.0) {
+        // Use CIFilter (ObjC API) not applyingFilter:withInputParameters: (Swift-only).
+        // CIColorMatrix multiplies each channel component:
+        //   R' = dot(pixel, inputRVector), etc.
+        //   A' = dot(pixel, inputAVector) = pixel.a * op  (since inputAVector.w = op).
+        CIFilter *opacityFilter = [CIFilter filterWithName:@"CIColorMatrix"
+                                              keysAndValues:
+            kCIInputImageKey,           secStyled,
+            @"inputRVector",   [CIVector vectorWithX:1 Y:0 Z:0 W:0],
+            @"inputGVector",   [CIVector vectorWithX:0 Y:1 Z:0 W:0],
+            @"inputBVector",   [CIVector vectorWithX:0 Y:0 Z:1 W:0],
+            @"inputAVector",   [CIVector vectorWithX:0 Y:0 Z:0 W:op],
+            @"inputBiasVector",[CIVector vectorWithX:0 Y:0 Z:0 W:0],
+            nil];
+        CIImage *withOpacity = opacityFilter.outputImage;
+        if (withOpacity) {
+            secStyled = withOpacity;
+        }
+    }
+
+    // ── 9. Composite: styled secondary over primary (Porter-Duff SourceOver) ─
+    CIImage *composited = [secStyled imageByCompositingOverImage:primaryCI];
     if (!composited) {
-        NSLog(@"[VGDualCameraCompositorNode][7.x-H] _composite: imageByCompositingOverImage: returned nil.");
+        NSLog(@"[VGDualCameraCompositorNode][7.x-J] _composite: imageByCompositingOverImage: returned nil.");
         return NULL;
     }
 
-    // ── 8. Create output CVPixelBuffer ───────────────────────────────────────
+    // ── 10. Create output CVPixelBuffer ──────────────────────────────────────
     NSDictionary *attrs = @{
         (id)kCVPixelBufferPixelFormatTypeKey    : @(kCVPixelFormatType_32BGRA),
         (id)kCVPixelBufferMetalCompatibilityKey : @YES,
@@ -1337,26 +1415,27 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
         &outputBuf);
 
     if (cvRet != kCVReturnSuccess || outputBuf == NULL) {
-        NSLog(@"[VGDualCameraCompositorNode][7.x-H] _composite: CVPixelBufferCreate failed (ret=%d).", cvRet);
+        NSLog(@"[VGDualCameraCompositorNode][7.x-J] _composite: CVPixelBufferCreate failed (ret=%d).", cvRet);
         return NULL;
     }
 
-    // ── 9. Render CIImage into output buffer ─────────────────────────────────
+    // ── 11. Render CIImage into output buffer ─────────────────────────────────
     CGRect renderBounds = CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH);
     [_VGDCCNSharedCIContext() render:composited
                       toCVPixelBuffer:outputBuf
                                 bounds:renderBounds
                             colorSpace:nil];
 
-    // ── 10. One-time first-frame log ─────────────────────────────────────────
+    // ── 12. One-time first-frame log (Phase 7.x-J: includes cr and op) ───────
     if (!_compositedFirstFrameLogged) {
         _compositedFirstFrameLogged = YES;
-        NSLog(@"[VGDualCameraCompositorNode][7.x-H] first composited frame generated | "
+        NSLog(@"[VGDualCameraCompositorNode][7.x-J] first composited frame generated | "
               "pipRect=(%.0f,%.0f,%.0f,%.0f) primSize=%zux%zu secSize=%zux%zu "
-              "anchor=%ld wf=%.3f mf=%.3f",
+              "anchor=%ld wf=%.3f mf=%.3f cr=%.1f op=%.2f",
               pipOriginX, pipOriginY, pipW, pipH,
               primW, primH, secW, secH,
-              (long)pip.anchor, pip.widthFraction, pip.marginFraction);
+              (long)pip.anchor, pip.widthFraction, pip.marginFraction,
+              cr, op);
     }
 
     return outputBuf; // Caller owns +1 from CVPixelBufferCreate

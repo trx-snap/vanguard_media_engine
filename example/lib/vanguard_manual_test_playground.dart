@@ -87,12 +87,15 @@ class _VanguardManualTestPlaygroundState
   Map<String, Object?>? _devDualCamMountResult;
   bool _devDualCamMounting = false;
 
-  // ── Phase 7.x-I: DEV dual-camera PiP layout controls ───────────────────
+  // ── Phase 7.x-I/J: DEV dual-camera PiP layout controls ───────────────
   // Defaults match Phase 7.x-H manual validation evidence:
   //   anchor=3 (bottomRight) wf=0.350 mf=0.018
+  // Phase 7.x-J adds cornerRadius (0.0 = rectangular) and opacity (1.0 = opaque).
   VGPiPAnchor _pipAnchor = VGPiPAnchor.bottomRight;
   double _pipWidthFraction = 0.35;
   double _pipMarginFraction = 0.018;
+  double _pipCornerRadius = 0.0; // Phase 7.x-J: 0.0 = rectangular (7.x-H default)
+  double _pipOpacity = 1.0;     // Phase 7.x-J: 1.0 = fully opaque (7.x-H default)
 
   // ── Phase 7.18B2: Cache Metrics HUD state ──────────────────────────────────
   Map<String, int> _cacheStats = const {};
@@ -699,7 +702,7 @@ class _VanguardManualTestPlaygroundState
       trimStartSeconds: 0.0,
       trimEndSeconds: 5.56,
     );
-    // Phase 7.x-I: use state-driven layout controls
+    // Phase 7.x-I/J: use state-driven layout controls
     final descriptor = VGDualCameraDescriptor(
       primaryClip: primaryClip,
       secondaryClip: secondaryClip,
@@ -708,7 +711,8 @@ class _VanguardManualTestPlaygroundState
         anchor: _pipAnchor,
         widthFraction: _pipWidthFraction.clamp(0.05, 0.75),
         marginFraction: _pipMarginFraction.clamp(0.0, 0.10),
-        cornerRadius: 0.0, // Phase 7.x-I: rectangular only
+        cornerRadius: _pipCornerRadius.clamp(0.0, 80.0), // Phase 7.x-J
+        opacity: _pipOpacity.clamp(0.0, 1.0),            // Phase 7.x-J
       ),
     );
 
@@ -774,7 +778,7 @@ class _VanguardManualTestPlaygroundState
       trimStartSeconds: 0.0,
       trimEndSeconds: 5.56,
     );
-    // Phase 7.x-I: use state-driven layout controls
+    // Phase 7.x-I/J: use state-driven layout controls
     final descriptor = VGDualCameraDescriptor(
       primaryClip: primaryClip,
       secondaryClip: secondaryClip,
@@ -783,7 +787,8 @@ class _VanguardManualTestPlaygroundState
         anchor: _pipAnchor,
         widthFraction: _pipWidthFraction.clamp(0.05, 0.75),
         marginFraction: _pipMarginFraction.clamp(0.0, 0.10),
-        cornerRadius: 0.0, // Phase 7.x-I: rectangular only
+        cornerRadius: _pipCornerRadius.clamp(0.0, 80.0), // Phase 7.x-J
+        opacity: _pipOpacity.clamp(0.0, 1.0),            // Phase 7.x-J
       ),
     );
 
@@ -840,8 +845,9 @@ class _VanguardManualTestPlaygroundState
     }
   }
 
-  // Phase 7.x-I: Apply PiP layout — dispose the current texture (if any) then
-  // remount with the current _pipAnchor / _pipWidthFraction / _pipMarginFraction.
+  // Phase 7.x-I/J: Apply PiP layout — dispose the current texture (if any) then
+  // remount with the current _pipAnchor / _pipWidthFraction / _pipMarginFraction /
+  // _pipCornerRadius / _pipOpacity.
   // Button-driven: not triggered by slider ticks.
   Future<void> _applyPiPLayout() async {
     final c = _controller;
@@ -2357,7 +2363,7 @@ class _VanguardManualTestPlaygroundState
               const SizedBox(width: 6),
               const Expanded(
                 child: Text(
-                  'PHASE 7.x-I — DUAL-CAM PiP LAYOUT CONTROLS (DEV ONLY)',
+                  'PHASE 7.x-J — DUAL-CAM PiP LAYOUT + STYLING CONTROLS (DEV ONLY)',
                   style: TextStyle(
                     color: kAccent,
                     fontSize: 10,
@@ -2488,6 +2494,95 @@ class _VanguardManualTestPlaygroundState
               ),
             ],
           ),
+          // ── Corner radius slider ──────────────────────────────────────────
+          // Range: 0.0–80.0 (practical range; native clamps to min(pipW,pipH)/2)
+          Row(
+            children: [
+              const SizedBox(
+                width: 100,
+                child: Text(
+                  'Corner Radius',
+                  style: TextStyle(color: Colors.white54, fontSize: 11),
+                ),
+              ),
+              Expanded(
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    activeTrackColor: kAccent,
+                    inactiveTrackColor: Colors.white10,
+                    thumbColor: kAccent,
+                    overlayColor: kAccent.withValues(alpha: 0.15),
+                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                    trackHeight: 2,
+                  ),
+                  child: Slider(
+                    value: _pipCornerRadius.clamp(0.0, 80.0),
+                    min: 0.0,
+                    max: 80.0,
+                    divisions: 80,
+                    onChanged: (v) => setState(() => _pipCornerRadius = v),
+                  ),
+                ),
+              ),
+              SizedBox(
+                width: 44,
+                child: Text(
+                  _pipCornerRadius.toStringAsFixed(1),
+                  style: const TextStyle(
+                    color: kAccent,
+                    fontSize: 10,
+                    fontFamily: 'monospace',
+                  ),
+                  textAlign: TextAlign.right,
+                ),
+              ),
+            ],
+          ),
+
+          // ── Opacity slider ─────────────────────────────────────────────────
+          // Range: 0.0–1.0
+          Row(
+            children: [
+              const SizedBox(
+                width: 100,
+                child: Text(
+                  'Opacity',
+                  style: TextStyle(color: Colors.white54, fontSize: 11),
+                ),
+              ),
+              Expanded(
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    activeTrackColor: kAccent,
+                    inactiveTrackColor: Colors.white10,
+                    thumbColor: kAccent,
+                    overlayColor: kAccent.withValues(alpha: 0.15),
+                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                    trackHeight: 2,
+                  ),
+                  child: Slider(
+                    value: _pipOpacity.clamp(0.0, 1.0),
+                    min: 0.0,
+                    max: 1.0,
+                    divisions: 100,
+                    onChanged: (v) => setState(() => _pipOpacity = v),
+                  ),
+                ),
+              ),
+              SizedBox(
+                width: 44,
+                child: Text(
+                  _pipOpacity.toStringAsFixed(2),
+                  style: const TextStyle(
+                    color: kAccent,
+                    fontSize: 10,
+                    fontFamily: 'monospace',
+                  ),
+                  textAlign: TextAlign.right,
+                ),
+              ),
+            ],
+          ),
           const SizedBox(height: 4),
 
           // ── Current descriptor summary ────────────────────────────────────
@@ -2501,7 +2596,8 @@ class _VanguardManualTestPlaygroundState
               'anchor=${_pipAnchor.value}  '
               'wf=${_pipWidthFraction.toStringAsFixed(3)}  '
               'mf=${_pipMarginFraction.toStringAsFixed(3)}  '
-              'cornerRadius=0.0 (rectangular)',
+              'cr=${_pipCornerRadius.toStringAsFixed(1)}  '
+              'op=${_pipOpacity.toStringAsFixed(2)}',
               style: const TextStyle(
                 color: kAccent,
                 fontSize: 10,
@@ -2542,6 +2638,8 @@ class _VanguardManualTestPlaygroundState
                 _pipAnchor = VGPiPAnchor.bottomRight;
                 _pipWidthFraction = 0.35;
                 _pipMarginFraction = 0.018;
+                _pipCornerRadius = 0.0; // Phase 7.x-J: rectangular
+                _pipOpacity = 1.0;     // Phase 7.x-J: fully opaque
               });
             },
             style: OutlinedButton.styleFrom(
@@ -2550,7 +2648,7 @@ class _VanguardManualTestPlaygroundState
               padding: const EdgeInsets.symmetric(vertical: 8),
               textStyle: const TextStyle(fontSize: 11),
             ),
-            child: const Text('Reset to 7.x-H Validated Defaults (bot-R, 0.35, 0.018)'),
+            child: const Text('Reset to 7.x-H Defaults (bot-R, 0.35, 0.018, cr=0, op=1)'),
           ),
         ],
       ),
