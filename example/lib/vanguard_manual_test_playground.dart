@@ -101,6 +101,12 @@ class _VanguardManualTestPlaygroundState
   VGDualCameraLayoutMode _dualCamLayoutMode = VGDualCameraLayoutMode.pip;
   double _splitRatio = 0.5; // fraction of canvas height for primary (top)
 
+  // ── Phase 7.x-L: DEV dual-camera image mode ─────────────────────────────
+  // 0 = video primary + video secondary (default, existing behavior)
+  // 1 = video primary + image secondary (still_C.png as PiP or split)
+  // 2 = image primary + video secondary (still_C.png as background)
+  int _dualCamImageMode = 0; // Phase 7.x-L
+
   // ── Phase 7.18B2: Cache Metrics HUD state ──────────────────────────────────
   Map<String, int> _cacheStats = const {};
   bool _fetchingStats = false;
@@ -766,21 +772,34 @@ class _VanguardManualTestPlaygroundState
       _status = 'Dual-cam texture mount: preparing runtime...';
     });
 
+    // Phase 7.x-L: resolve primary/secondary paths and media kinds from _dualCamImageMode.
+    final bool primaryIsImage = _dualCamImageMode == 2;
+    final bool secondaryIsImage = _dualCamImageMode == 1;
+    final String primaryPath = primaryIsImage ? (_tempPathC ?? pathA) : pathA;
+    final String secondaryPath = secondaryIsImage ? (_tempPathC ?? pathB) : pathB;
+    final VGMediaKind primaryKind = primaryIsImage ? VGMediaKind.image : VGMediaKind.video;
+    final VGMediaKind secondaryKind = secondaryIsImage ? VGMediaKind.image : VGMediaKind.video;
+    // Image clips use the trim duration from the descriptor directly.
+    // For still_C.png we use a 30-second hold duration (DEV only).
+    const double kImageHoldDuration = 30.0;
+    final double primaryDuration = primaryIsImage ? kImageHoldDuration : 5.06;
+    final double secondaryDuration = secondaryIsImage ? kImageHoldDuration : 5.56;
+
     final primaryClip = VGClipDescriptor(
       id: 'mount-primary',
-      sourcePath: pathA,
-      mediaKind: VGMediaKind.video,
-      durationSeconds: 5.06,
+      sourcePath: primaryPath,
+      mediaKind: primaryKind,
+      durationSeconds: primaryDuration,
       trimStartSeconds: 0.0,
-      trimEndSeconds: 5.06,
+      trimEndSeconds: primaryDuration,
     );
     final secondaryClip = VGClipDescriptor(
       id: 'mount-secondary',
-      sourcePath: pathB,
-      mediaKind: VGMediaKind.video,
-      durationSeconds: 5.56,
+      sourcePath: secondaryPath,
+      mediaKind: secondaryKind,
+      durationSeconds: secondaryDuration,
       trimStartSeconds: 0.0,
-      trimEndSeconds: 5.56,
+      trimEndSeconds: secondaryDuration,
     );
     // Phase 7.x-I/J/K: use state-driven layout controls
     final VGDualCameraDescriptor descriptor;
@@ -2703,6 +2722,43 @@ class _VanguardManualTestPlaygroundState
           ],
           const SizedBox(height: 10),
 
+          // ── Phase 7.x-L: Image mode toggle ──────────────────────────────
+          const Text(
+            'Image Mode (Phase 7.x-L)',
+            style: TextStyle(color: Colors.white54, fontSize: 11),
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              _buildImageModeButton(0, 'Vid+Vid', kAccent),
+              const SizedBox(width: 6),
+              _buildImageModeButton(1, 'Vid+Img', kAccent),
+              const SizedBox(width: 6),
+              _buildImageModeButton(2, 'Img+Vid', kAccent),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+            decoration: BoxDecoration(
+              color: Colors.black26,
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(
+              _dualCamImageMode == 0
+                  ? 'primary=video  secondary=video'
+                  : _dualCamImageMode == 1
+                      ? 'primary=video  secondary=image (still_C.png)'
+                      : 'primary=image (still_C.png)  secondary=video',
+              style: const TextStyle(
+                color: kAccent,
+                fontSize: 10,
+                fontFamily: 'monospace',
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+
           // ── Apply button ──────────────────────────────────────────────
           ElevatedButton.icon(
             onPressed: canApply ? _applyLayout : null,
@@ -2739,8 +2795,9 @@ class _VanguardManualTestPlaygroundState
                 _pipAnchor = VGPiPAnchor.bottomRight;
                 _pipWidthFraction = 0.35;
                 _pipMarginFraction = 0.018;
-                _pipCornerRadius = 0.0; // Phase 7.x-J: rectangular
-                _pipOpacity = 1.0;     // Phase 7.x-J: fully opaque
+                _pipCornerRadius = 0.0;
+                _pipOpacity = 1.0;
+                _dualCamImageMode = 0; // Phase 7.x-L: reset to video+video
               });
             },
             style: OutlinedButton.styleFrom(
@@ -2749,7 +2806,7 @@ class _VanguardManualTestPlaygroundState
               padding: const EdgeInsets.symmetric(vertical: 8),
               textStyle: const TextStyle(fontSize: 11),
             ),
-            child: const Text('Reset to Defaults (PiP bot-R, 0.35, 0.018, cr=0, op=1, ratio=0.5)'),
+            child: const Text('Reset to Defaults (PiP bot-R, 0.35, 0.018, cr=0, op=1, ratio=0.5, vid+vid)'),
           ),
         ],
       ),
@@ -2795,6 +2852,37 @@ class _VanguardManualTestPlaygroundState
     return Expanded(
       child: GestureDetector(
         onTap: () => setState(() => _pipAnchor = anchor),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          decoration: BoxDecoration(
+            color: active
+                ? accentColor
+                : Colors.white.withValues(alpha: 0.03),
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(
+              color: active ? accentColor : Colors.white12,
+            ),
+          ),
+          alignment: Alignment.center,
+          child: Text(
+            label,
+            style: TextStyle(
+              color: active ? const Color(0xFF0F0E17) : Colors.white54,
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Phase 7.x-L: Helper for dual-camera image mode toggle button.
+  Widget _buildImageModeButton(int mode, String label, Color accentColor) {
+    final bool active = _dualCamImageMode == mode;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => setState(() => _dualCamImageMode = mode),
         child: Container(
           padding: const EdgeInsets.symmetric(vertical: 8),
           decoration: BoxDecoration(

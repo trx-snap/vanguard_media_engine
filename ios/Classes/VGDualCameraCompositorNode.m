@@ -369,6 +369,22 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
 
     // Phase 7.x-K: one-time log guard for split-screen first frame.
     BOOL _splitFirstFrameLogged;
+
+    // Phase 7.x-L: Still-image pixel buffers.
+    // Loaded once from the source image file via CIImage; retained +1.
+    // NULL when the clip is not a still-image kind or has not been loaded yet.
+    // Released on seek/invalidate/clear/dealloc.
+    CVPixelBufferRef _primaryImageBuffer;   // primary still-image (nullable; +1)
+    CVPixelBufferRef _secondaryImageBuffer; // secondary still-image (nullable; +1)
+
+    // Phase 7.x-L: YES once the primary still-image buffer has been logged.
+    BOOL _primaryImageLogged;
+    // Phase 7.x-L: YES when the secondary clip is a still image.
+    // When YES, _advanceSecondaryReaderToRequestedPTS: returns immediately
+    // (image is already in _secondaryLastBuffer; no AVAssetReader needed).
+    BOOL _secondaryIsImage;
+    // Phase 7.x-L: YES once the secondary still-image buffer has been logged.
+    BOOL _secondaryImageLogged;
 }
 
 @synthesize primaryClip   = _primaryClip;
@@ -553,6 +569,13 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     // Phase 7.x-K: split-screen log guard.
     _splitFirstFrameLogged      = NO;
 
+    // Phase 7.x-L: still-image buffer state.
+    _primaryImageBuffer   = NULL;
+    _secondaryImageBuffer = NULL;
+    _primaryImageLogged   = NO;
+    _secondaryIsImage     = NO;
+    _secondaryImageLogged = NO;
+
     // Phase 7.x-F (aspect ratio, Option B, timing fix):
     // Probe primaryRenderSize synchronously during init so dev_createDualCameraTexture
     // can read the correct display dimensions before the first async pullFrame: fires.
@@ -651,6 +674,30 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         }
     }
 
+    // ── Phase 7.x-L: Image-primary canvas override ───────────────────────────
+    //
+    // When primary is a still image and secondary is video, there is no AVAsset
+    // video track on the primary to probe, so _primaryRenderSize remains at the
+    // DEV fallback (1280x720 landscape). That fallback produces a visually wrong
+    // landscape canvas for portrait dual-camera preview.
+    //
+    // Rule: image primary + video secondary → use secondary video render size.
+    // This ensures _primaryRenderSize (and thus the image buffer canvas) matches
+    // the display-correct portrait dimensions probed from the secondary video.
+    //
+    // Vid+Vid, Vid+Img, and Img+Img are all unaffected: this guard is only true
+    // when primary.mediaKind == Image AND secondary.mediaKind == Video AND the
+    // secondary probe produced a valid non-fallback size.
+    if (primary.mediaKind == VGClipMediaKindImage &&
+        secondary.mediaKind == VGClipMediaKindVideo &&
+        _secondaryRenderSize.width  > 0.0 &&
+        _secondaryRenderSize.height > 0.0) {
+        _primaryRenderSize = _secondaryRenderSize;
+        NSLog(@"[VGDualCameraCompositorNode][7.x-L] image-primary canvas uses secondary "
+              "video render size | size=%.0fx%.0f",
+              _primaryRenderSize.width, _primaryRenderSize.height);
+    }
+
     return self;
 }
 
@@ -674,6 +721,15 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     if (_compositedLastBuffer) {
         CVPixelBufferRelease(_compositedLastBuffer);
         _compositedLastBuffer = NULL;
+    }
+    // Phase 7.x-L: Release still-image buffers.
+    if (_primaryImageBuffer) {
+        CVPixelBufferRelease(_primaryImageBuffer);
+        _primaryImageBuffer = NULL;
+    }
+    if (_secondaryImageBuffer) {
+        CVPixelBufferRelease(_secondaryImageBuffer);
+        _secondaryImageBuffer = NULL;
     }
 }
 
@@ -830,22 +886,16 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         return [VGFrameResult skippedWithGeneration:request.generation];
     }
 
-    // ── 3. Unsupported primary clip shape guard ─────────────────────────────
+    // ── 3. Primary clip shape guard ─────────────────────────────────────────
     //
-    // Phase 7.x-F supports only simple forward video clips.
-    // Unsupported shapes log a DEV warning and return skipped (no crash).
+    // Phase 7.x-F: video-only; Phase 7.x-L adds VGClipMediaKindImage.
+    // Audio-only and unknown media kinds remain unsupported.
     VGClipDescriptor *clip = _primaryClip;
 
-    if (clip.mediaKind == VGClipMediaKindImage) {
-        NSLog(@"[VGDualCameraCompositorNode][7.x-F][DEV] primaryClip is a still-image clip "
-              "(mediaKind=Image). Still-image primary clips are unsupported in Phase 7.x-F. "
-              "Returning skipped. clipId=%@", clip.clipId);
-        return [VGFrameResult skippedWithGeneration:request.generation];
-    }
-
-    if (clip.mediaKind != VGClipMediaKindVideo) {
-        NSLog(@"[VGDualCameraCompositorNode][7.x-F][DEV] primaryClip has unsupported "
-              "mediaKind=%ld. Only VGClipMediaKindVideo is supported in Phase 7.x-F. "
+    if (clip.mediaKind != VGClipMediaKindVideo &&
+        clip.mediaKind != VGClipMediaKindImage) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-F/L][DEV] primaryClip has unsupported "
+              "mediaKind=%ld. Only Video and Image are supported. "
               "Returning skipped. clipId=%@", (long)clip.mediaKind, clip.clipId);
         return [VGFrameResult skippedWithGeneration:request.generation];
     }
@@ -868,6 +918,63 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         NSLog(@"[VGDualCameraCompositorNode][7.x-F][DEV] primaryClip has empty sourceURL. "
               "Returning skipped. clipId=%@", clip.clipId);
         return [VGFrameResult skippedWithGeneration:request.generation];
+    }
+
+    // ── Phase 7.x-L: Still-image primary clip — lazy load only ───────────────
+    //
+    // Image clips bypass AVAssetReader entirely. We load the source once into
+    // a Metal-compatible 32BGRA CVPixelBuffer and cache it for the full clip duration.
+    //
+    // This block sets _primaryLastBuffer and the pseudo sample-window, then falls
+    // through to the shared flow: global EOS check → secondary lazy init →
+    // secondary advance → sample-window cache-hit → composition/delivery.
+    //
+    // It does NOT return early. That is the key difference from the previous
+    // broken implementation which bypassed secondary initialization.
+    if (clip.mediaKind == VGClipMediaKindImage) {
+        if (_primaryImageBuffer == NULL) {
+            size_t imgW = (size_t)(_primaryRenderSize.width  > 1.0 ? _primaryRenderSize.width  : 1280.0);
+            size_t imgH = (size_t)(_primaryRenderSize.height > 1.0 ? _primaryRenderSize.height : 720.0);
+            CVPixelBufferRef imgBuf = [self _buildImageBufferForClip:clip
+                                                         renderWidth:imgW
+                                                        renderHeight:imgH];
+            if (imgBuf == NULL) {
+                NSLog(@"[VGDualCameraCompositorNode][7.x-L] primary image buffer build failed "
+                      "— returning skipped. clipId=%@", clip.clipId);
+                return [VGFrameResult skippedWithGeneration:request.generation];
+            }
+            _primaryImageBuffer = imgBuf; // node owns +1 from _buildImageBufferForClip
+        }
+
+        // Populate _primaryLastBuffer once (or after seek when _primaryImageBuffer was reset).
+        if (_primaryLastBuffer != _primaryImageBuffer) {
+            if (_primaryLastBuffer) {
+                CVPixelBufferRelease(_primaryLastBuffer);
+            }
+            CVPixelBufferRetain(_primaryImageBuffer); // +1 for _primaryLastBuffer
+            _primaryLastBuffer = _primaryImageBuffer;
+
+            // Pseudo sample-window covering the full clip duration so the cache-hit
+            // path below fires on every subsequent frame without re-entering this block.
+            double imgSpeed = (clip.speed > 0.0) ? clip.speed : 1.0;
+            double imgClipDur = (clip.trimEndSeconds - clip.trimStartSeconds) / imgSpeed;
+            _primaryLastSamplePTS      = 0.0;
+            _primaryLastSampleDuration = imgClipDur > 0.0 ? imgClipDur : 3600.0;
+        }
+
+        // One-time log.
+        if (!_primaryImageLogged) {
+            _primaryImageLogged = YES;
+            NSLog(@"[VGDualCameraCompositorNode][7.x-L] primary image buffer ready | "
+                  "size=%zux%zu clipId=%@",
+                  CVPixelBufferGetWidth(_primaryImageBuffer),
+                  CVPixelBufferGetHeight(_primaryImageBuffer),
+                  clip.clipId);
+        }
+
+        // Fall through to: global EOS (step 4) → secondary lazy init (step 5b) →
+        // reader-status guard (skipped for image) → sample-window cache-hit (step 7) →
+        // secondary advance → composition → delivery.
     }
 
     // ── 4. EOS check: requested timeline PTS exceeds primary clip duration ────
@@ -926,7 +1033,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     // Pass the initial assetTime so the reader's timeRange starts there,
     // avoiding unnecessary sequential reads from trimStartSeconds when the
     // first requested PTS is non-zero (e.g., after a mid-clip seek).
-    if (_primaryReader == nil) {
+    // Phase 7.x-L: Image primary has no AVAssetReader; skip reader init entirely.
+    if (clip.mediaKind != VGClipMediaKindImage && _primaryReader == nil) {
         NSError *buildError = nil;
         BOOL built = [self _buildPrimaryReaderStartingAtTime:assetTime
                                                        error:&buildError];
@@ -938,47 +1046,80 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         }
     }
 
-    // ── 5b. Lazy secondary reader initialization (Phase 7.x-G) ──────────────
+    // ── 5b. Lazy secondary reader / image initialization (Phase 7.x-G / 7.x-L) ─
     //
-    // Mirror the primary reader lazy build. Use the same assetTime mapping
-    // for the secondary clip so both readers start approximately in sync.
-    //
-    // Secondary clip shape guard: only support forward video clips, matching
-    // the primary guard. Unsupported shapes skip secondary decode silently;
-    // the primary pass-through is unaffected.
-    if (!_secondaryEOSReached && _secondaryReader == nil) {
+    // Video: mirror the primary reader lazy build.
+    // Image (Phase 7.x-L): load once into _secondaryLastBuffer; no AVAssetReader needed.
+    // Unsupported shapes (audio, unknown, freeze, reversed) skip silently.
+    if (!_secondaryEOSReached && _secondaryReader == nil && !_secondaryIsImage) {
         VGClipDescriptor *secClip = _secondaryClip;
-        BOOL secCanRead = (secClip.mediaKind == VGClipMediaKindVideo &&
-                           secClip.freezePTS == nil &&
-                           !secClip.isReversed &&
-                           secClip.sourceURL.length > 0);
-        if (secCanRead) {
-            // Map primary requestedPTSSecs to secondary asset time.
-            double secSpeed = (secClip.speed > 0.0) ? secClip.speed : 1.0;
-            double secAssetTime = secClip.trimStartSeconds + requestedPTSSecs * secSpeed;
-            if (secAssetTime < secClip.trimStartSeconds) { secAssetTime = secClip.trimStartSeconds; }
-            if (secAssetTime > secClip.trimEndSeconds)   { secAssetTime = secClip.trimEndSeconds;   }
 
-            NSError *secBuildError = nil;
-            BOOL secBuilt = [self _buildSecondaryReaderStartingAtTime:secAssetTime
-                                                                error:&secBuildError];
-            if (!secBuilt) {
-                NSLog(@"[VGDualCameraCompositorNode][7.x-G] Failed to build secondary reader: %@. "
-                      "Secondary decode disabled for this session. clipId=%@",
-                      secBuildError.localizedDescription, secClip.clipId);
-                // Mark secondary as exhausted so we don't retry every frame.
+        // Phase 7.x-L: still-image secondary.
+        if (secClip.mediaKind == VGClipMediaKindImage &&
+            secClip.freezePTS == nil &&
+            !secClip.isReversed &&
+            secClip.sourceURL.length > 0) {
+
+            // Load the secondary image at a reasonable size. Use the primary
+            // render size as the target canvas so composition dimensions match.
+            size_t secImgW = (size_t)(_primaryRenderSize.width  > 1.0 ? _primaryRenderSize.width  : 1280.0);
+            size_t secImgH = (size_t)(_primaryRenderSize.height > 1.0 ? _primaryRenderSize.height : 720.0);
+            CVPixelBufferRef secImgBuf = [self _buildImageBufferForClip:secClip
+                                                            renderWidth:secImgW
+                                                           renderHeight:secImgH];
+            if (secImgBuf != NULL) {
+                // Release any previous secondary buffer.
+                if (_secondaryLastBuffer) {
+                    CVPixelBufferRelease(_secondaryLastBuffer);
+                }
+                _secondaryImageBuffer = secImgBuf; // node owns +1
+                CVPixelBufferRetain(secImgBuf);    // +1 for _secondaryLastBuffer
+                _secondaryLastBuffer        = secImgBuf;
+                _secondaryLastSamplePTS     = 0.0;
+                double secSpeed = (secClip.speed > 0.0) ? secClip.speed : 1.0;
+                double secDur   = (secClip.trimEndSeconds - secClip.trimStartSeconds) / secSpeed;
+                _secondaryLastSampleDuration = secDur > 0.0 ? secDur : 3600.0;
+                _secondaryIsImage            = YES;
+                // Do NOT mark EOS: image is always available.
+            } else {
+                NSLog(@"[VGDualCameraCompositorNode][7.x-L] secondary image buffer build failed — "
+                      "secondary decode skipped. clipId=%@", secClip.clipId);
                 _secondaryEOSReached = YES;
             }
+
         } else {
-            NSLog(@"[VGDualCameraCompositorNode][7.x-G] secondary clip shape unsupported "
-                  "(mediaKind=%ld freezePTS=%@ isReversed=%d sourceURL=%@); "
-                  "secondary decode skipped. clipId=%@",
-                  (long)_secondaryClip.mediaKind,
-                  _secondaryClip.freezePTS,
-                  _secondaryClip.isReversed,
-                  _secondaryClip.sourceURL.length > 0 ? @"<set>" : @"<empty>",
-                  _secondaryClip.clipId);
-            _secondaryEOSReached = YES;
+            // Video secondary (existing path).
+            BOOL secCanRead = (secClip.mediaKind == VGClipMediaKindVideo &&
+                               secClip.freezePTS == nil &&
+                               !secClip.isReversed &&
+                               secClip.sourceURL.length > 0);
+            if (secCanRead) {
+                // Map primary requestedPTSSecs to secondary asset time.
+                double secSpeed = (secClip.speed > 0.0) ? secClip.speed : 1.0;
+                double secAssetTime = secClip.trimStartSeconds + requestedPTSSecs * secSpeed;
+                if (secAssetTime < secClip.trimStartSeconds) { secAssetTime = secClip.trimStartSeconds; }
+                if (secAssetTime > secClip.trimEndSeconds)   { secAssetTime = secClip.trimEndSeconds;   }
+
+                NSError *secBuildError = nil;
+                BOOL secBuilt = [self _buildSecondaryReaderStartingAtTime:secAssetTime
+                                                                    error:&secBuildError];
+                if (!secBuilt) {
+                    NSLog(@"[VGDualCameraCompositorNode][7.x-G] Failed to build secondary reader: %@. "
+                          "Secondary decode disabled for this session. clipId=%@",
+                          secBuildError.localizedDescription, secClip.clipId);
+                    _secondaryEOSReached = YES;
+                }
+            } else {
+                NSLog(@"[VGDualCameraCompositorNode][7.x-G/L] secondary clip shape unsupported "
+                      "(mediaKind=%ld freezePTS=%@ isReversed=%d sourceURL=%@); "
+                      "secondary decode skipped. clipId=%@",
+                      (long)_secondaryClip.mediaKind,
+                      _secondaryClip.freezePTS,
+                      _secondaryClip.isReversed,
+                      _secondaryClip.sourceURL.length > 0 ? @"<set>" : @"<empty>",
+                      _secondaryClip.clipId);
+                _secondaryEOSReached = YES;
+            }
         }
     }
 
@@ -986,7 +1127,9 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     //
     // AVAssetReader.status transitions from Reading to Completed/Failed/Cancelled
     // once the stream is exhausted or cancelled.
-    if (_primaryReader.status != AVAssetReaderStatusReading) {
+    // Phase 7.x-L: Image primary has no _primaryReader; skip this guard entirely.
+    if (clip.mediaKind != VGClipMediaKindImage &&
+        _primaryReader.status != AVAssetReaderStatusReading) {
         AVAssetReaderStatus status = _primaryReader.status;
         if (status == AVAssetReaderStatusCompleted) {
             NSLog(@"[VGDualCameraCompositorNode][7.x-F] primary reader EOS at assetTime=%.3fs. "
@@ -1030,13 +1173,16 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         // (The node's +1 in _primaryLastBuffer extends the buffer lifetime
         //  past this return. The renderer will retain under its own lock.)
 
-        // Phase 7.x-G: Advance secondary reader in parallel with primary cache hit.
+        // Phase 7.x-G/L: Advance secondary reader in parallel with primary cache hit.
+        // Image secondary: no-op (buffer is always ready). Video secondary: advance reader.
         // The secondary advance result does not affect primary delivery.
         if (!_secondaryEOSReached) {
-            BOOL secOk = [self _advanceSecondaryReaderToRequestedPTS:requestedPTSSecs
-                                                          generation:currentGen];
-            if (!secOk) {
-                _secondaryEOSReached = YES;
+            if (!_secondaryIsImage) {
+                BOOL secOk = [self _advanceSecondaryReaderToRequestedPTS:requestedPTSSecs
+                                                              generation:currentGen];
+                if (!secOk) {
+                    _secondaryEOSReached = YES;
+                }
             }
         }
 
@@ -1198,13 +1344,16 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
             envelope.payload.videoBuffer = (void *)pixelBuffer; // +0 in envelope
             envelope.metadata   = NULL;
 
-            // Phase 7.x-G: Advance secondary reader in parallel with primary frame
-            // delivery. The secondary advance result does not affect primary delivery.
+            // Phase 7.x-G/L: Advance secondary reader in parallel with primary frame
+            // delivery. Image secondary: no-op. Video secondary: advance reader.
+            // The secondary advance result does not affect primary delivery.
             if (!_secondaryEOSReached) {
-                BOOL secOk = [self _advanceSecondaryReaderToRequestedPTS:requestedPTSSecs
-                                                              generation:currentGen];
-                if (!secOk) {
-                    _secondaryEOSReached = YES;
+                if (!_secondaryIsImage) {
+                    BOOL secOk = [self _advanceSecondaryReaderToRequestedPTS:requestedPTSSecs
+                                                                  generation:currentGen];
+                    if (!secOk) {
+                        _secondaryEOSReached = YES;
+                    }
                 }
             }
 
@@ -1251,6 +1400,140 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     // Unreachable: loop always returns or falls through via the early-exits above.
     // Defensive fallback for static analyser.
     return [VGFrameResult skippedWithGeneration:request.generation];
+}
+
+// ─── Phase 7.x-L: Private — Build still-image pixel buffer ──────────────────────
+//
+// Loads a still image from clip.sourceURL using the CoreImage-native path
+// (CIImage imageWithContentsOfURL:). Does NOT use UIKit/UIImage.
+//
+// The image is aspect-fill scaled into a renderWidth × renderHeight canvas,
+// centered, and rendered once into a Metal-compatible 32BGRA CVPixelBuffer
+// using the shared CIContext.
+//
+// Ownership: Returns a CVPixelBufferRef at +1 (caller owns via CVPixelBufferCreate).
+//            Returns NULL on any failure (logs the reason); does not crash.
+//
+// Calling convention: called at most once per clip lifecycle (lazy, on first pullFrame:).
+// Callers store the result in _primaryImageBuffer or _secondaryImageBuffer and
+// must release it on seek, invalidate, and dealloc.
+
+- (nullable CVPixelBufferRef)_buildImageBufferForClip:(VGClipDescriptor *)clip
+                                          renderWidth:(size_t)renderWidth
+                                         renderHeight:(size_t)renderHeight {
+    if (!clip || clip.sourceURL.length == 0) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-L] _buildImageBuffer: nil clip or empty sourceURL.");
+        return NULL;
+    }
+
+    if (renderWidth < 1 || renderHeight < 1) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-L] _buildImageBuffer: degenerate canvas "
+              "size %zux%zu for clipId=%@.", renderWidth, renderHeight, clip.clipId);
+        return NULL;
+    }
+
+    // ── 1. Load CIImage from file URL (CoreImage-native; no UIKit) ─────────────
+    NSURL *fileURL = [NSURL fileURLWithPath:clip.sourceURL];
+    if (!fileURL) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-L] _buildImageBuffer: invalid fileURL "
+              "for sourceURL=%@ clipId=%@.", clip.sourceURL, clip.clipId);
+        return NULL;
+    }
+
+    CIImage *srcImage = [CIImage imageWithContentsOfURL:fileURL];
+    if (!srcImage) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-L] _buildImageBuffer: CIImage load failed "
+              "for sourceURL=%@ clipId=%@.", clip.sourceURL, clip.clipId);
+        return NULL;
+    }
+
+    // ── 2. Normalize CIImage origin to (0, 0) ──────────────────────────────────
+    CGRect srcExtent = srcImage.extent;
+    // CGRectIsFinite is not declared in all SDK configurations; use isfinite()
+    // on individual fields instead (equivalent check, always available via math.h).
+    BOOL extentFinite = (isfinite(srcExtent.origin.x) &&
+                         isfinite(srcExtent.origin.y) &&
+                         isfinite(srcExtent.size.width) &&
+                         isfinite(srcExtent.size.height));
+    if (!extentFinite || srcExtent.size.width < 1.0 || srcExtent.size.height < 1.0) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-L] _buildImageBuffer: degenerate CIImage "
+              "extent for clipId=%@.", clip.clipId);
+        return NULL;
+    }
+
+    CIImage *normalized = srcImage;
+    if (srcExtent.origin.x != 0.0 || srcExtent.origin.y != 0.0) {
+        CGAffineTransform normT = CGAffineTransformMakeTranslation(-srcExtent.origin.x,
+                                                                    -srcExtent.origin.y);
+        normalized = [srcImage imageByApplyingTransform:normT];
+        srcExtent  = normalized.extent;
+    }
+
+    double srcW = srcExtent.size.width;
+    double srcH = srcExtent.size.height;
+
+    // ── 3. Aspect-fill scale into canvas ──────────────────────────────────────
+    //
+    // scale = MAX(canvasW / srcW, canvasH / srcH) — fills the canvas entirely.
+    // Center the scaled image so equal amounts are cropped from each side.
+    double canvasW = (double)renderWidth;
+    double canvasH = (double)renderHeight;
+    double scaleX  = (srcW > 0.0) ? canvasW / srcW : 1.0;
+    double scaleY  = (srcH > 0.0) ? canvasH / srcH : 1.0;
+    double scale   = MAX(scaleX, scaleY);
+    if (scale <= 0.0) { scale = 1.0; }
+
+    CGAffineTransform scaleT = CGAffineTransformMakeScale(scale, scale);
+    CIImage *scaled = [normalized imageByApplyingTransform:scaleT];
+
+    // Center-translate so scaled image is centered over {0, 0, canvasW, canvasH}.
+    double scaledW  = srcW * scale;
+    double scaledH  = srcH * scale;
+    double offsetX  = (canvasW - scaledW) * 0.5;
+    double offsetY  = (canvasH - scaledH) * 0.5;
+    CGAffineTransform transT = CGAffineTransformMakeTranslation(offsetX, offsetY);
+    CIImage *centered = [scaled imageByApplyingTransform:transT];
+
+    // Crop to canvas bounds — removes any overflow from aspect-fill.
+    CGRect canvasRect = CGRectMake(0.0, 0.0, canvasW, canvasH);
+    CIImage *cropped  = [centered imageByCroppingToRect:canvasRect];
+    if (!cropped) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-L] _buildImageBuffer: imageByCroppingToRect "
+              "returned nil for clipId=%@.", clip.clipId);
+        return NULL;
+    }
+
+    // ── 4. Allocate output CVPixelBuffer ──────────────────────────────────────
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey    : @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferMetalCompatibilityKey : @YES,
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    CVPixelBufferRef outputBuf = NULL;
+    CVReturn cvRet = CVPixelBufferCreate(
+        kCFAllocatorDefault,
+        renderWidth, renderHeight,
+        kCVPixelFormatType_32BGRA,
+        (__bridge CFDictionaryRef)attrs,
+        &outputBuf);
+
+    if (cvRet != kCVReturnSuccess || outputBuf == NULL) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-L] _buildImageBuffer: CVPixelBufferCreate "
+              "failed (ret=%d) for clipId=%@.", cvRet, clip.clipId);
+        return NULL;
+    }
+
+    // ── 5. Render CIImage into output buffer ──────────────────────────────────
+    [_VGDCCNSharedCIContext() render:cropped
+                     toCVPixelBuffer:outputBuf
+                               bounds:canvasRect
+                           colorSpace:nil];
+
+    NSLog(@"[VGDualCameraCompositorNode][7.x-L] _buildImageBuffer: image rendered ok "
+          "| canvas=%zux%zu srcSize=%.0fx%.0f scale=%.4f clipId=%@",
+          renderWidth, renderHeight, srcW, srcH, scale, clip.clipId);
+
+    return outputBuf; // Caller owns +1 from CVPixelBufferCreate
 }
 
 // ─── Phase 7.x-K: Private — Split-screen CoreImage compositor ────────────────────
@@ -2066,10 +2349,22 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     _primarySourceFPS          = 30.0;
 
     // Release last-delivered buffer.
+    // Note: if primaryLastBuffer == primaryImageBuffer, both point to the same
+    // underlying buffer. We release them separately; the ivar is set to NULL
+    // after each release so there is no double-release risk.
     if (_primaryLastBuffer) {
         CVPixelBufferRelease(_primaryLastBuffer);
         _primaryLastBuffer = NULL;
     }
+
+    // Phase 7.x-L: Release still-image buffer on reader clear / seek.
+    // This forces a reload on the next pullFrame: after a seek, ensuring the
+    // static buffer is regenerated cleanly.
+    if (_primaryImageBuffer) {
+        CVPixelBufferRelease(_primaryImageBuffer);
+        _primaryImageBuffer = NULL;
+    }
+    _primaryImageLogged = NO;
 
     // Phase 7.x-H: Release composited buffer whenever primary resets.
     // Both readers are always cleared together on seek/invalidate, so clearing
@@ -2232,6 +2527,14 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         CVPixelBufferRelease(_secondaryLastBuffer);
         _secondaryLastBuffer = NULL;
     }
+
+    // Phase 7.x-L: Release still-image buffer and reset image state.
+    if (_secondaryImageBuffer) {
+        CVPixelBufferRelease(_secondaryImageBuffer);
+        _secondaryImageBuffer = NULL;
+    }
+    _secondaryIsImage     = NO;
+    _secondaryImageLogged = NO;
 }
 
 @end
