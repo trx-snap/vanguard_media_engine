@@ -78,6 +78,9 @@ class _VanguardManualTestPlaygroundState
   List<VGReverseSidecarStatus>? _sidecarStatuses;
   bool _sidecarBusy = false; // true while an action is in-flight
 
+  // ── Phase 7.x-C: DEV dual-camera descriptor smoke result ─────────────────
+  Map<String, Object?>? _dualCamSmokeResult;
+
   // ── Phase 7.18B2: Cache Metrics HUD state ──────────────────────────────────
   Map<String, int> _cacheStats = const {};
   bool _fetchingStats = false;
@@ -647,6 +650,80 @@ class _VanguardManualTestPlaygroundState
     }
   }
 
+  // Phase 7.x-C: DEV dual-camera descriptor smoke — validates that a
+  // VGDualCameraDescriptor built from the existing fixture clips can be
+  // parsed by the native VGDualCameraCompositorNode.
+  //
+  // Does NOT create a texture, start playback, or modify timeline state.
+  // Requires the controller to be initialized (tempPathA and tempPathB set).
+  Future<void> _smokeDualCamDescriptor() async {
+    final c = _controller;
+    final pathA = _tempPathA;
+    final pathB = _tempPathB;
+    if (c == null || pathA == null || pathB == null) {
+      setState(() => _status = 'Dual-cam smoke: assets not ready. Tap Rebuild first.');
+      return;
+    }
+
+    setState(() {
+      _dualCamSmokeResult = null;
+      _status = 'Dual-cam smoke: sending descriptor to native...';
+    });
+
+    final primaryClip = VGClipDescriptor(
+      id: 'smoke-primary',
+      sourcePath: pathA,
+      mediaKind: VGMediaKind.video,
+      durationSeconds: 5.06,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 5.06,
+    );
+    final secondaryClip = VGClipDescriptor(
+      id: 'smoke-secondary',
+      sourcePath: pathB,
+      mediaKind: VGMediaKind.video,
+      durationSeconds: 5.56,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 5.56,
+    );
+    final descriptor = VGDualCameraDescriptor(
+      primaryClip: primaryClip,
+      secondaryClip: secondaryClip,
+      layoutMode: VGDualCameraLayoutMode.pip,
+      pipLayout: const VGPiPLayoutDescriptor(
+        anchor: VGPiPAnchor.bottomRight,
+        widthFraction: 0.35,
+        cornerRadius: 24.0,
+      ),
+    );
+
+    try {
+      final result = await c.devValidateDualCameraDescriptor(descriptor);
+      if (mounted) {
+        setState(() {
+          _dualCamSmokeResult = result;
+          _status = 'Dual-cam descriptor native init passed ✓ '
+              'nodeClass=${result['nodeClass']} '
+              'primary=${result['primaryClipId']} '
+              'secondary=${result['secondaryClipId']}';
+        });
+      }
+    } on PlatformException catch (e) {
+      if (mounted) {
+        setState(() {
+          _dualCamSmokeResult = {'ok': false, 'error': e.code, 'message': e.message};
+          _status = 'Dual-cam smoke FAILED [${e.code}]: ${e.message}';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _status = 'Dual-cam smoke error: $e';
+        });
+      }
+    }
+  }
+
   Future<void> _export() async {
     final c = _controller;
     if (c == null || !c.isReady || _exporting) return;
@@ -847,6 +924,10 @@ class _VanguardManualTestPlaygroundState
 
                         // ── Phase 7.20D: Reverse Sidecar Status HUD ──────────────
                         _buildSidecarStatusCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.x-C: DEV Dual-Camera Smoke ───────────────────
+                        _buildDualCamSmokeCard(),
                         const SizedBox(height: 12),
 
                         // ── Phase 7.18B2: Cache Metrics HUD ─────────────────────
@@ -2083,6 +2164,95 @@ class _VanguardManualTestPlaygroundState
                 ),
               ),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Phase 7.x-C: DEV dual-camera descriptor smoke card ─────────────────────
+  Widget _buildDualCamSmokeCard() {
+    final ready = _controller != null && _tempPathA != null && _tempPathB != null;
+    final smokeOk = _dualCamSmokeResult?['ok'] == true;
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: smokeOk
+              ? const Color(0xFF00D4AA).withValues(alpha: 0.6)
+              : const Color(0xFF00D4AA).withValues(alpha: 0.25),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Header
+          Row(
+            children: [
+              const Icon(Icons.camera_enhance_outlined,
+                  color: Color(0xFF00D4AA), size: 14),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  'PHASE 7.x-C — DUAL-CAMERA DESCRIPTOR SMOKE (DEV ONLY)',
+                  style: TextStyle(
+                    color: Color(0xFF00D4AA),
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.0,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Validates Dart → MethodChannel → ObjC descriptor parsing. '
+            'Does NOT create a texture or start playback.',
+            style: TextStyle(color: Colors.white38, fontSize: 10),
+          ),
+          const SizedBox(height: 10),
+
+          // Result row (shown after a successful or failed smoke)
+          if (_dualCamSmokeResult != null) ...[
+            _buildStatRow(
+              'ok',
+              '${_dualCamSmokeResult!['ok']}',
+              smokeOk ? const Color(0xFF00D4AA) : Colors.redAccent,
+            ),
+            if (smokeOk) ...[
+              _buildStatRow('nodeClass',
+                  '${_dualCamSmokeResult!['nodeClass']}', Colors.white54),
+              _buildStatRow('layoutMode',
+                  '${_dualCamSmokeResult!['layoutMode']}', Colors.white54),
+              _buildStatRow('primaryClipId',
+                  '${_dualCamSmokeResult!['primaryClipId']}', Colors.white54),
+              _buildStatRow('secondaryClipId',
+                  '${_dualCamSmokeResult!['secondaryClipId']}', Colors.white54),
+            ] else ...[
+              _buildStatRow('error',
+                  '${_dualCamSmokeResult!['error']}', Colors.redAccent),
+            ],
+            const SizedBox(height: 8),
+          ],
+
+          // Action button
+          ElevatedButton.icon(
+            onPressed: ready ? _smokeDualCamDescriptor : null,
+            icon: const Icon(Icons.play_circle_outline, size: 14),
+            label: const Text('Smoke Test Dual-Cam Descriptor'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF00D4AA),
+              foregroundColor: const Color(0xFF0F0E17),
+              disabledBackgroundColor: Colors.white10,
+              disabledForegroundColor: Colors.white24,
+              padding: const EdgeInsets.symmetric(vertical: 10),
+              textStyle: const TextStyle(
+                  fontSize: 12, fontWeight: FontWeight.w600),
+            ),
           ),
         ],
       ),

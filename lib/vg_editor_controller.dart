@@ -56,6 +56,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'vg_clip_descriptor.dart';
+import 'vg_dual_camera_descriptor.dart';
 import 'vg_editor_draft.dart';
 import 'vg_editor_export_request.dart';
 import 'vg_editor_export_result.dart';
@@ -919,6 +920,44 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     _channel.invokeMethod<void>('disposeTimeline').catchError((_) {});
 
     super.dispose();
+  }
+
+  // ── Phase 7.x-C: DEV dual-camera descriptor smoke ─────────────────────────
+
+  /// **DEV-only.** Validates that a [VGDualCameraDescriptor] can be
+  /// deserialised correctly by the native [VGDualCameraCompositorNode].
+  ///
+  /// Invokes `dev_validateDualCameraDescriptor` — a non-playback native route
+  /// introduced in Phase 7.x-C. The native side instantiates the ObjC node,
+  /// verifies all descriptor fields, and immediately discards the node.
+  ///
+  /// On success, returns a map such as:
+  /// ```json
+  /// { "ok": true, "nodeClass": "VGDualCameraCompositorNode",
+  ///   "layoutMode": "pip",
+  ///   "primaryClipId": "clip-A", "secondaryClipId": "clip-B" }
+  /// ```
+  ///
+  /// On native validation failure, throws [PlatformException] with
+  /// code `DUAL_CAMERA_DESCRIPTOR_INVALID`.
+  ///
+  /// Does NOT:
+  ///   - create a texture
+  ///   - start playback
+  ///   - modify the active draft
+  ///   - touch VanguardGraphRuntime
+  ///   - instantiate AVAssetReader
+  ///
+  /// Throws [StateError] if [dispose] has been called.
+  Future<Map<String, Object?>> devValidateDualCameraDescriptor(
+    VGDualCameraDescriptor descriptor,
+  ) async {
+    _assertNotDisposed();
+    final raw = await _channel.invokeMapMethod<String, Object?>(
+      'dev_validateDualCameraDescriptor',
+      {'descriptor': descriptor.toMap()},
+    );
+    return raw ?? const {};
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────

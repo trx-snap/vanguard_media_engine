@@ -1,8 +1,11 @@
 // vg_dual_camera_descriptor_test.dart
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   group('VGDualCameraDescriptor & VGPiPLayoutDescriptor Tests', () {
     final clipA = VGClipDescriptor(
       id: 'clip-a',
@@ -81,10 +84,10 @@ void main() {
         () => VGPiPLayoutDescriptor(widthFraction: 0.8),
         throwsA(isA<AssertionError>()),
       );
-      
+
       final badMap1 = {'widthFraction': 0.01};
       expect(VGPiPLayoutDescriptor.fromMap(badMap1), isNull);
-      
+
       final badMap2 = {'widthFraction': 0.8};
       expect(VGPiPLayoutDescriptor.fromMap(badMap2), isNull);
     });
@@ -126,7 +129,7 @@ void main() {
         secondaryClip: clipB,
       );
       final map = desc.toMap();
-      
+
       final str = map.toString();
       expect(str.contains('MultiCam'), false);
       expect(str.contains('camera'), false);
@@ -138,7 +141,7 @@ void main() {
         () => VGDualCameraDescriptor(primaryClip: clipA, secondaryClip: clipA),
         throwsA(isA<AssertionError>()),
       );
-      
+
       final desc = VGDualCameraDescriptor(
         primaryClip: clipA,
         secondaryClip: clipB,
@@ -146,6 +149,171 @@ void main() {
       final map = desc.toMap();
       (map['secondaryClip'] as Map)['id'] = 'clip-a';
       expect(VGDualCameraDescriptor.fromMap(map), isNull);
+    });
+  });
+
+  // ── Phase 7.x-C: devValidateDualCameraDescriptor bridge tests ─────────────
+
+  group('VGEditorController.devValidateDualCameraDescriptor (Phase 7.x-C)', () {
+    const channel = MethodChannel('vanguard_media_engine');
+
+    final clipA = VGClipDescriptor(
+      id: 'clip-a',
+      sourcePath: '/path/to/a.mp4',
+      mediaKind: VGMediaKind.video,
+      startTimeSeconds: 0.0,
+      durationSeconds: 10.0,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 10.0,
+      speed: 1.0,
+    );
+
+    final clipB = VGClipDescriptor(
+      id: 'clip-b',
+      sourcePath: '/path/to/b.mp4',
+      mediaKind: VGMediaKind.video,
+      startTimeSeconds: 0.0,
+      durationSeconds: 10.0,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 10.0,
+      speed: 1.0,
+    );
+
+    late VGEditorDraft minimalDraft;
+
+    setUp(() {
+      minimalDraft = VGEditorDraft(
+        id: 'test-draft',
+        clips: [clipA],
+      );
+    });
+
+    // Captured state for each test assertion.
+    String? capturedMethod;
+    Map<Object?, Object?>? capturedArgs;
+
+    void setChannelHandler(Map<String, Object?> returnValue) {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (MethodCall call) async {
+        capturedMethod = call.method;
+        capturedArgs = call.arguments is Map
+            ? Map<Object?, Object?>.from(call.arguments as Map)
+            : null;
+        return returnValue;
+      });
+    }
+
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null);
+      capturedMethod = null;
+      capturedArgs = null;
+    });
+
+    test('11. invokes dev_validateDualCameraDescriptor channel method', () async {
+      setChannelHandler({'ok': true});
+
+      final controller = VGEditorController(
+        initialDraft: minimalDraft,
+        channel: channel,
+      );
+
+      final descriptor = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+      );
+
+      await controller.devValidateDualCameraDescriptor(descriptor);
+
+      expect(capturedMethod, 'dev_validateDualCameraDescriptor');
+
+      controller.dispose();
+    });
+
+    test(
+        '12. payload contains descriptor key with primaryClip, secondaryClip, layoutMode, pipLayout',
+        () async {
+      setChannelHandler({'ok': true});
+
+      final controller = VGEditorController(
+        initialDraft: minimalDraft,
+        channel: channel,
+      );
+
+      final descriptor = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+        layoutMode: VGDualCameraLayoutMode.pip,
+        pipLayout: const VGPiPLayoutDescriptor(anchor: VGPiPAnchor.topLeft),
+      );
+
+      await controller.devValidateDualCameraDescriptor(descriptor);
+
+      expect(capturedArgs, isNotNull);
+      final descriptorPayload = capturedArgs!['descriptor'] as Map?;
+      expect(descriptorPayload, isNotNull);
+      expect(descriptorPayload!.containsKey('primaryClip'), isTrue);
+      expect(descriptorPayload.containsKey('secondaryClip'), isTrue);
+      expect(descriptorPayload.containsKey('layoutMode'), isTrue);
+      expect(descriptorPayload.containsKey('pipLayout'), isTrue);
+      expect(descriptorPayload['layoutMode'], 'pip');
+
+      // Confirm no camera/MultiCam fields in the payload.
+      final payloadStr = descriptorPayload.toString();
+      expect(payloadStr.contains('MultiCam'), isFalse);
+      expect(payloadStr.contains('AVCapture'), isFalse);
+
+      controller.dispose();
+    });
+
+    test('13. native return map is passed through correctly', () async {
+      final nativeResult = <String, Object?>{
+        'ok': true,
+        'nodeClass': 'VGDualCameraCompositorNode',
+        'layoutMode': 'pip',
+        'primaryClipId': 'clip-a',
+        'secondaryClipId': 'clip-b',
+      };
+      setChannelHandler(nativeResult);
+
+      final controller = VGEditorController(
+        initialDraft: minimalDraft,
+        channel: channel,
+      );
+
+      final descriptor = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+      );
+
+      final result = await controller.devValidateDualCameraDescriptor(descriptor);
+
+      expect(result['ok'], isTrue);
+      expect(result['nodeClass'], 'VGDualCameraCompositorNode');
+      expect(result['primaryClipId'], 'clip-a');
+      expect(result['secondaryClipId'], 'clip-b');
+
+      controller.dispose();
+    });
+
+    test('14. throws StateError after dispose', () async {
+      setChannelHandler({'ok': true});
+
+      final controller = VGEditorController(
+        initialDraft: minimalDraft,
+        channel: channel,
+      );
+      controller.dispose();
+
+      final descriptor = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+      );
+
+      expect(
+        () => controller.devValidateDualCameraDescriptor(descriptor),
+        throwsA(isA<StateError>()),
+      );
     });
   });
 }

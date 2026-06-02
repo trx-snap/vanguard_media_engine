@@ -28,3 +28,4 @@
 #import "VanguardFileMediaSource.h"   // VanguardFileMediaSource — registry-owned runtime source
 #import "VanguardGraphRuntime.h"      // VanguardGraphRuntime — primary runtime type cast in Swift
 #import "VGReverseSidecarManager.h"   // Phase 7.20B: VGReverseSidecarManager + VGReverseSidecarStatus
+#import "VGDualCameraCompositorNode.h" // Phase 7.x-C: DEV descriptor smoke route

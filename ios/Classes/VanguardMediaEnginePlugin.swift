@@ -3328,6 +3328,63 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(nil)
             }
 
+        // ── Phase 7.x-C: DEV dual-camera descriptor smoke route ───────────────────
+        // Validates that a Dart VGDualCameraDescriptor.toMap() payload can be
+        // deserialised natively by VGDualCameraCompositorNode.
+        //
+        // Constraints:
+        //   - DEV-only. Never creates a texture. Never touches VanguardGraphRuntime.
+        //   - Does NOT start playback, AVAssetReader, or PiP rendering.
+        //   - Does NOT mutate sessionRegistry or any session state.
+        //   - Node is instantiated and immediately discarded (not stored).
+        //   - Safe to call at any lifecycle point (no mode guard required).
+        case "dev_validateDualCameraDescriptor":
+            guard let descriptorMap = args?["descriptor"] as? [String: Any] else {
+                result(FlutterError(code: "DUAL_CAMERA_DESCRIPTOR_INVALID",
+                                    message: "dev_validateDualCameraDescriptor: missing or non-map 'descriptor' argument",
+                                    details: nil))
+                return
+            }
+
+            // Build the minimal port list required by the designated initializer.
+            // A single video_out output port matches VGDualCameraCompositorNode's
+            // declaredPorts contract and the pattern used in _prepareTimelineCompositor.
+            let videoOutPort = VGMediaPort.outputPort("video_out", mediaType: .video)
+
+            // ObjC NSError** outparam initializers are bridged by Swift as throwing
+            // initializers — use do/try/catch rather than the error: label.
+            do {
+                let node = try VGDualCameraCompositorNode(
+                    nodeId:     "dev_dual_camera_smoke",
+                    parameters: descriptorMap,
+                    ports:      [videoOutPort]
+                )
+
+                NSLog("[VanguardPlugin][7.x-C] dev_validateDualCameraDescriptor: PASS | nodeId=%@ | primary=%@ | secondary=%@",
+                      "dev_dual_camera_smoke",
+                      node.primaryClip.clipId,
+                      node.secondaryClip.clipId)
+
+                // Return parsed metadata so the Dart harness can display what was parsed.
+                result([
+                    "ok":              true,
+                    "nodeClass":       node.nodeClass,
+                    "layoutMode":      "pip",
+                    "primaryClipId":   node.primaryClip.clipId,
+                    "secondaryClipId": node.secondaryClip.clipId,
+                ] as [String: Any])
+                // node is discarded here — no texture, no runtime, no storage.
+
+            } catch let err as NSError {
+                let details: [String: Any] = [
+                    "domain": err.domain,
+                    "code":   err.code,
+                ]
+                result(FlutterError(code: "DUAL_CAMERA_DESCRIPTOR_INVALID",
+                                    message: err.localizedDescription,
+                                    details: details))
+            }
+
         default:
             result(FlutterMethodNotImplemented)
         }
