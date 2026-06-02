@@ -2377,6 +2377,14 @@ class _VanguardManualTestPlaygroundState
     final mountOk = _devDualCamMountResult?['ok'] == true;
     final textureId = _devDualCamTextureId;
 
+    // Phase 7.x-F (aspect ratio, Option B): Use native-returned render dimensions
+    // to drive the AspectRatio widget. Falls back to 16/9 only if absent/degenerate.
+    final double renderW = (_devDualCamMountResult?['renderWidth'] as num?)?.toDouble() ?? 0.0;
+    final double renderH = (_devDualCamMountResult?['renderHeight'] as num?)?.toDouble() ?? 0.0;
+    final double textureAspectRatio = (renderW > 1.0 && renderH > 1.0)
+        ? renderW / renderH
+        : 16.0 / 9.0;
+
     return Container(
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
@@ -2413,8 +2421,8 @@ class _VanguardManualTestPlaygroundState
           const SizedBox(height: 4),
           const Text(
             'Mounts VGDualCameraCompositorNode in the generic runtime. '
-            'Node returns skipped frames — blank output expected. '
-            'Does NOT decode, render, or touch camera/export code.',
+            'Displays primary clip only. Secondary/PiP are deferred. '
+            'Does NOT touch camera/export code.',
             style: TextStyle(color: Colors.white38, fontSize: 10),
           ),
           const SizedBox(height: 10),
@@ -2435,6 +2443,10 @@ class _VanguardManualTestPlaygroundState
                   '${_devDualCamMountResult!["primaryClipId"]}', Colors.white54),
               _buildStatRow('secondaryClipId',
                   '${_devDualCamMountResult!["secondaryClipId"]}', Colors.white54),
+              _buildStatRow('renderWidth',
+                  '${_devDualCamMountResult!["renderWidth"]}', Colors.white54),
+              _buildStatRow('renderHeight',
+                  '${_devDualCamMountResult!["renderHeight"]}', Colors.white54),
             ] else ...[
               _buildStatRow('error',
                   '${_devDualCamMountResult!["error"]}', Colors.redAccent),
@@ -2442,23 +2454,28 @@ class _VanguardManualTestPlaygroundState
             const SizedBox(height: 8),
           ],
 
-          // Texture preview — blank/transparent expected
+          // Texture preview
           if (textureId != null) ...[
             const Text(
-              'Texture preview (blank expected):',
+              'Texture preview (primary only):',
               style: TextStyle(color: Colors.white38, fontSize: 10),
             ),
             const SizedBox(height: 6),
-            Container(
-              height: 120,
-              decoration: BoxDecoration(
-                color: Colors.black,
-                borderRadius: BorderRadius.circular(6),
-                border: Border.all(color: const Color(0xFF9B59B6).withValues(alpha: 0.4)),
-              ),
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(6),
-                child: Texture(textureId: textureId),
+            AspectRatio(
+              // Phase 7.x-F (aspect ratio, Option B): computed from native
+              // primaryRenderSize returned by dev_createDualCameraTexture.
+              // Falls back to 16/9 only if the returned dimensions are absent.
+              aspectRatio: textureAspectRatio,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Colors.black,
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: const Color(0xFF9B59B6).withValues(alpha: 0.4)),
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(6),
+                  child: Texture(textureId: textureId),
+                ),
               ),
             ),
             const SizedBox(height: 8),
@@ -2475,7 +2492,7 @@ class _VanguardManualTestPlaygroundState
                         strokeWidth: 2, color: Colors.white70),
                   )
                 : const Icon(Icons.play_circle_outline, size: 14),
-            label: const Text('Mount DEV Dual-Cam Texture (Blank Expected)'),
+            label: const Text('Mount DEV Dual-Cam Texture'),
             style: ElevatedButton.styleFrom(
               backgroundColor: const Color(0xFF9B59B6),
               foregroundColor: Colors.white,

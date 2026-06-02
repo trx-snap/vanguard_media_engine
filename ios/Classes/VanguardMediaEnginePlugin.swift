@@ -3439,9 +3439,25 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
 
             // Create a new runtime isolated from VGSessionRegistry and _timelineRuntime.
+            //
+            // Phase 7.x-F (method-channel isolation fix):
+            // Use a DEDICATED, unregistered FlutterMethodChannel for the DEV runtime
+            // instead of the shared main `channel`. Because no Dart handler listens on
+            // "vanguard_media_engine/dev_dual_camera", all invokeMethod calls
+            // (onTimelineFrame, onTimelineEOS, etc.) from this runtime are silently
+            // discarded by Flutter. This prevents DEV runtime events from hijacking the
+            // main timeline PTS UI overlay (ROOT_CAUSE_RUNTIME_SHARED_STATE_CORRUPTION).
+            //
+            // We cannot pass nil because VanguardGraphRuntime.init requires a non-null
+            // channel (nonnull annotation in header). Modifying VanguardGraphRuntime is
+            // out-of-scope for Phase 7.x-F (hard constraint).
+            let devChannel = FlutterMethodChannel(
+                name:             "vanguard_media_engine/dev_dual_camera",
+                binaryMessenger:  registrar.messenger()
+            )
             let devRuntime = VanguardGraphRuntime(
                 textureRegistry: registrar.textures(),
-                methodChannel:   channel
+                methodChannel:   devChannel
             )
             self._devDualCameraRuntime = devRuntime
 
@@ -3469,8 +3485,48 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                       dualCameraNode.primaryClip.clipId,
                       dualCameraNode.secondaryClip.clipId)
 
+                // Phase 7.x-F: Start the isolated DEV runtime so the pull loop
+                // begins advancing requestedPTS. Without this call timelineIsPlaying
+                // stays NO and the pacing cache returns the preview frame forever.
+                //
+                // _timelinePlay() asserts main thread; this completion block is
+                // dispatched to dispatch_get_main_queue() by prepareWithSourceNode:
+                // completion: (VanguardGraphRuntime.m line ~1965), so the assertion
+                // is always satisfied here.
+                //
+                // We capture devRuntime from the ivar rather than using optional-
+                // chaining so the NSLog below can confirm the identity is the same
+                // instance that just completed prepare.
+                if let devRuntime = self._devDualCameraRuntime {
+                    devRuntime._timelinePlay()
+                    NSLog("[VanguardPlugin][7.x-F] dev_createDualCameraTexture: DEV runtime play started textureId=%lld",
+                          textureId)
+                } else {
+                    // Defensive: runtime was disposed between prepare and callback.
+                    // Return error rather than leaving Dart with a dead textureId.
+                    NSLog("[VanguardPlugin][7.x-F] dev_createDualCameraTexture: " +
+                          "DEV runtime nil after prepare — invalidating and returning error")
+                    result(FlutterError(code: "DUAL_CAMERA_TEXTURE_CREATE_FAILED",
+                                        message: "DEV runtime was nil after successful prepare",
+                                        details: nil))
+                    return
+                }
+
                 // Return textureId and descriptor metadata to the Dart harness.
-                // ok:true signals mount success; blank output is expected.
+                // ok:true signals mount success; primary video playback has started.
+                //
+                // Phase 7.x-F (aspect ratio, Option B): include the primary clip's
+                // display-correct render dimensions so the Dart preview can set
+                // AspectRatio to the real source aspect rather than hardcoding 16/9.
+                let rSize = dualCameraNode.primaryRenderSize
+                let renderW = rSize.width  > 1.0 ? rSize.width  : 1280.0
+                let renderH = rSize.height > 1.0 ? rSize.height : 720.0
+                if rSize.width <= 1.0 || rSize.height <= 1.0 {
+                    NSLog("[VanguardPlugin][7.x-F] dev_createDualCameraTexture: " +
+                          "primaryRenderSize degenerate {%.0f, %.0f} — using DEV fallback 1280x720",
+                          rSize.width, rSize.height)
+                }
+
                 result([
                     "ok":              true,
                     "textureId":       textureId,
@@ -3478,6 +3534,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     "layoutMode":      "pip",
                     "primaryClipId":   dualCameraNode.primaryClip.clipId,
                     "secondaryClipId": dualCameraNode.secondaryClip.clipId,
+                    "renderWidth":     renderW,
+                    "renderHeight":    renderH,
                 ] as [String: Any])
             }
 

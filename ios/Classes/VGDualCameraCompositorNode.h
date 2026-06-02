@@ -1,8 +1,8 @@
 // VGDualCameraCompositorNode.h
-// vanguard_media_engine — Phase 7.x-B
+// vanguard_media_engine — Phase 7.x-B / Phase 7.x-F
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// PHASE 7.x-B — DUAL-CAMERA EDITOR CONSUMPTION SKELETON
+// PHASE 7.x-B / 7.x-F — DUAL-CAMERA EDITOR CONSUMPTION
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // VGDualCameraCompositorNode is the native skeleton for dual-camera timeline
@@ -12,23 +12,29 @@
 //
 // ── SCOPE (Phase 7.x-B) ─────────────────────────────────────────────────────
 //
-//   IN SCOPE:
+//   IN SCOPE (7.x-B):
 //     • Objective-C class skeleton conforming to <VGSourceNode>.
 //     • Designated initializer that parses and validates the primary clip,
 //       secondary clip, layoutMode, and pipLayout from the parameters dict.
 //     • Readonly property exposure of parsed clip descriptors and layout config.
-//     • pullFrame: stub that returns VGFrameStatusSkipped unconditionally.
 //     • Idempotent invalidate / no-op startProducing / stopProducing.
 //     • VGNode protocol stubs (prepareWithContext:completion:,
 //       negotiateFormatForPort:inputFormats:, declaredPorts).
 //
-//   OUT OF SCOPE (DEFERRED TO 7.x-C AND LATER):
-//     • AVAssetReader instantiation or video decoding.
+//   ADDED (Phase 7.x-F):
+//     • Lazy AVAssetReader + AVAssetReaderVideoCompositionOutput for primaryClip.
+//     • pullFrame: now decodes and returns primary clip BGRA frames.
+//     • seekTo:generation: cancels the reader and rebuilds on next pull.
+//     • Phase 7.9-identical preferredTransform orientation normalization.
+//     • primaryRenderSize: display-correct output dimensions (preferredTransform applied).
+//     • Secondary clip remains parsed/stored but unused (no PiP yet).
+//
+//   OUT OF SCOPE (DEFERRED TO 7.x-G AND LATER):
+//     • Secondary clip AVAssetReader or rendering.
 //     • PiP geometry computation or CoreImage compositing.
-//     • MethodChannel routing in VanguardMediaEnginePlugin.
-//     • Integration with VanguardGraphRuntime or VGExportScheduler.
 //     • Export parity with VanguardDualCameraFlattener.
 //     • Live camera capture or AVCaptureMultiCamSession usage.
+//     • Still/freeze/reverse primary clip support.
 //
 // ── DO NOT MODIFY ────────────────────────────────────────────────────────────
 //
@@ -116,12 +122,16 @@ typedef NS_ENUM(NSInteger, VGDualCameraCompositorNodeErrorCode) {
 };
 
 // ─── VGDualCameraCompositorNode ───────────────────────────────────────────────
-/// Phase 7.x-B native skeleton for dual-camera timeline consumption.
+/// Phase 7.x-B / 7.x-F dual-camera compositor node.
 ///
-/// Conforms to <VGSourceNode> for structural compatibility with the UMF
-/// graph topology. `pullFrame:` is a stub that returns VGFrameStatusSkipped
-/// unconditionally; actual video decoding and PiP compositing are deferred
-/// to Phase 7.x-C.
+/// Conforms to <VGSourceNode> for pull-mode integration with the generic
+/// VanguardGraphRuntime source node interface (Phase 7.x-D).
+///
+/// Phase 7.x-F: `pullFrame:` lazily initializes an AVAssetReader for
+/// `primaryClip` and returns decoded BGRA frames. Orientation normalization
+/// uses `AVAssetReaderVideoCompositionOutput` with an `AVMutableVideoComposition`
+/// (Phase 7.9-identical convention). Secondary clip is stored but not rendered.
+/// No PiP, no CoreImage compositing, no export in this phase.
 ///
 /// Initialized from a `parameters` dictionary that mirrors the Dart
 /// `VGDualCameraDescriptor.toMap()` serialization:
@@ -130,8 +140,10 @@ typedef NS_ENUM(NSInteger, VGDualCameraCompositorNodeErrorCode) {
 ///   parameters[@"layoutMode"]    — NSString ("pip")
 ///   parameters[@"pipLayout"]     — NSDictionary (optional PiP geometry)
 ///
-/// Phase 7.x-B: does NOT allocate pixel buffers, does NOT open files,
-/// does NOT instantiate AVAssetReader, does NOT touch any camera/session code.
+/// Phase 7.x-F supported primary clip shapes: VGClipMediaKindVideo,
+/// freezePTS == nil, isReversed == NO, valid sourceURL.
+/// All other shapes return skippedWithGeneration: with a DEV log warning.
+/// Does NOT touch any camera/session code or AVCaptureMultiCamSession.
 @interface VGDualCameraCompositorNode : NSObject <VGSourceNode>
 
 // ─── Parsed descriptor properties ────────────────────────────────────────────
@@ -161,6 +173,25 @@ typedef NS_ENUM(NSInteger, VGDualCameraCompositorNodeErrorCode) {
 /// cornerRadius=24.0, opacity=1.0 } when the key is absent or invalid.
 /// Stored for consumption by the Phase 7.x-C compositor.
 @property (nonatomic, readonly) VGPiPLayoutConfig pipLayout;
+
+/// Phase 7.x-F: Display-correct output dimensions of the primary clip.
+///
+/// Computed synchronously during `initWithNodeId:parameters:ports:error:` by
+/// probing `videoTrack.naturalSize` + `preferredTransform` on the primary asset.
+/// This is pure metadata access (no decoding, < 1 ms for local assets) and is
+/// guaranteed to be accurate before `dev_createDualCameraTexture` returns its
+/// MethodChannel result to Dart.
+///
+/// The value reflects the display-correct pixel dimensions after transform.
+/// For a portrait .mov recorded at 1080x1920 sensor, this returns {1080, 1920}.
+/// For a landscape clip it returns landscape dimensions.
+///
+/// Returns `{1280, 720}` (DEV fallback) only if `sourceURL` is empty or the
+/// asset has no video track.
+///
+/// Not related to `VanguardGraphRuntime.renderSize` (which is the V1 push-mode
+/// output size). This property is DEV-only and read by the plugin route only.
+@property (nonatomic, readonly) CGSize primaryRenderSize;
 
 // ─── Designated initializer ───────────────────────────────────────────────────
 
