@@ -87,6 +87,13 @@ class _VanguardManualTestPlaygroundState
   Map<String, Object?>? _devDualCamMountResult;
   bool _devDualCamMounting = false;
 
+  // ── Phase 7.x-I: DEV dual-camera PiP layout controls ───────────────────
+  // Defaults match Phase 7.x-H manual validation evidence:
+  //   anchor=3 (bottomRight) wf=0.350 mf=0.018
+  VGPiPAnchor _pipAnchor = VGPiPAnchor.bottomRight;
+  double _pipWidthFraction = 0.35;
+  double _pipMarginFraction = 0.018;
+
   // ── Phase 7.18B2: Cache Metrics HUD state ──────────────────────────────────
   Map<String, int> _cacheStats = const {};
   bool _fetchingStats = false;
@@ -692,14 +699,16 @@ class _VanguardManualTestPlaygroundState
       trimStartSeconds: 0.0,
       trimEndSeconds: 5.56,
     );
+    // Phase 7.x-I: use state-driven layout controls
     final descriptor = VGDualCameraDescriptor(
       primaryClip: primaryClip,
       secondaryClip: secondaryClip,
       layoutMode: VGDualCameraLayoutMode.pip,
-      pipLayout: const VGPiPLayoutDescriptor(
-        anchor: VGPiPAnchor.bottomRight,
-        widthFraction: 0.35,
-        cornerRadius: 24.0,
+      pipLayout: VGPiPLayoutDescriptor(
+        anchor: _pipAnchor,
+        widthFraction: _pipWidthFraction.clamp(0.05, 0.75),
+        marginFraction: _pipMarginFraction.clamp(0.0, 0.10),
+        cornerRadius: 0.0, // Phase 7.x-I: rectangular only
       ),
     );
 
@@ -765,14 +774,16 @@ class _VanguardManualTestPlaygroundState
       trimStartSeconds: 0.0,
       trimEndSeconds: 5.56,
     );
+    // Phase 7.x-I: use state-driven layout controls
     final descriptor = VGDualCameraDescriptor(
       primaryClip: primaryClip,
       secondaryClip: secondaryClip,
       layoutMode: VGDualCameraLayoutMode.pip,
-      pipLayout: const VGPiPLayoutDescriptor(
-        anchor: VGPiPAnchor.bottomRight,
-        widthFraction: 0.35,
-        cornerRadius: 24.0,
+      pipLayout: VGPiPLayoutDescriptor(
+        anchor: _pipAnchor,
+        widthFraction: _pipWidthFraction.clamp(0.05, 0.75),
+        marginFraction: _pipMarginFraction.clamp(0.0, 0.10),
+        cornerRadius: 0.0, // Phase 7.x-I: rectangular only
       ),
     );
 
@@ -827,6 +838,41 @@ class _VanguardManualTestPlaygroundState
         _status = 'Dual-cam DEV texture disposed.';
       });
     }
+  }
+
+  // Phase 7.x-I: Apply PiP layout — dispose the current texture (if any) then
+  // remount with the current _pipAnchor / _pipWidthFraction / _pipMarginFraction.
+  // Button-driven: not triggered by slider ticks.
+  Future<void> _applyPiPLayout() async {
+    final c = _controller;
+    final pathA = _tempPathA;
+    final pathB = _tempPathB;
+    if (c == null || pathA == null || pathB == null || _devDualCamMounting) {
+      setState(() =>
+          _status = 'PiP layout apply: assets or controller not ready.');
+      return;
+    }
+
+    setState(() {
+      _status = 'Applying PiP layout — rebuilding DEV dual-cam texture...';
+    });
+
+    // 1. Dispose current texture if mounted.
+    if (_devDualCamTextureId != null) {
+      try {
+        await c.devDisposeDualCameraTexture();
+      } catch (_) {}
+      if (mounted) {
+        setState(() {
+          _devDualCamTextureId = null;
+          _devDualCamMountResult = null;
+        });
+      }
+    }
+
+    // 2. Remount with updated layout — delegates to _mountDualCamTexture which
+    //    reads _pipAnchor / _pipWidthFraction / _pipMarginFraction from state.
+    await _mountDualCamTexture();
   }
 
   Future<void> _export() async {
@@ -1033,6 +1079,10 @@ class _VanguardManualTestPlaygroundState
 
                         // ── Phase 7.x-C: DEV Dual-Camera Smoke ───────────────────
                         _buildDualCamSmokeCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.x-I: DEV Dual-Camera PiP Layout Controls ─────
+                        _buildDualCamPiPLayoutCard(),
                         const SizedBox(height: 12),
 
                         // ── Phase 7.x-E: DEV Dual-Camera Texture Mount ───────────
@@ -2279,6 +2329,266 @@ class _VanguardManualTestPlaygroundState
     );
   }
 
+  // ── Phase 7.x-I: DEV dual-camera PiP layout controls card ──────────────────
+  Widget _buildDualCamPiPLayoutCard() {
+    final bool canApply = _controller != null &&
+        _tempPathA != null &&
+        _tempPathB != null &&
+        !_devDualCamMounting;
+    const Color kAccent = Color(0xFFE67E22); // warm orange — distinct from smoke/mount
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: kAccent.withValues(alpha: 0.45),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // ── Header ────────────────────────────────────────────────────────
+          Row(
+            children: [
+              const Icon(Icons.picture_in_picture_outlined,
+                  color: kAccent, size: 14),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  'PHASE 7.x-I — DUAL-CAM PiP LAYOUT CONTROLS (DEV ONLY)',
+                  style: TextStyle(
+                    color: kAccent,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.0,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Select anchor, width fraction, and margin fraction, then tap '
+            '"Apply PiP Layout / Rebuild Texture". '
+            'Requires Smoke to pass first. No continuous rebuilds on slider drag.',
+            style: TextStyle(color: Colors.white38, fontSize: 10),
+          ),
+          const SizedBox(height: 12),
+
+          // ── Anchor selector ───────────────────────────────────────────────
+          const Text(
+            'PiP Anchor',
+            style: TextStyle(
+              color: Colors.white54,
+              fontSize: 11,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              _buildPiPAnchorButton(VGPiPAnchor.topLeft,     'Top-L',    kAccent),
+              const SizedBox(width: 6),
+              _buildPiPAnchorButton(VGPiPAnchor.topRight,    'Top-R',    kAccent),
+              const SizedBox(width: 6),
+              _buildPiPAnchorButton(VGPiPAnchor.bottomLeft,  'Bot-L',    kAccent),
+              const SizedBox(width: 6),
+              _buildPiPAnchorButton(VGPiPAnchor.bottomRight, 'Bot-R ✓',  kAccent),
+            ],
+          ),
+          const SizedBox(height: 12),
+
+          // ── Width fraction slider ─────────────────────────────────────────
+          // Range: 0.10–0.70 (safe within descriptor assert 0.05–0.75)
+          Row(
+            children: [
+              const SizedBox(
+                width: 100,
+                child: Text(
+                  'Width Fraction',
+                  style: TextStyle(color: Colors.white54, fontSize: 11),
+                ),
+              ),
+              Expanded(
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    activeTrackColor: kAccent,
+                    inactiveTrackColor: Colors.white10,
+                    thumbColor: kAccent,
+                    overlayColor: kAccent.withValues(alpha: 0.15),
+                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                    trackHeight: 2,
+                  ),
+                  child: Slider(
+                    value: _pipWidthFraction.clamp(0.10, 0.70),
+                    min: 0.10,
+                    max: 0.70,
+                    divisions: 60,
+                    onChanged: (v) => setState(() => _pipWidthFraction = v),
+                  ),
+                ),
+              ),
+              SizedBox(
+                width: 44,
+                child: Text(
+                  _pipWidthFraction.toStringAsFixed(3),
+                  style: const TextStyle(
+                    color: kAccent,
+                    fontSize: 10,
+                    fontFamily: 'monospace',
+                  ),
+                  textAlign: TextAlign.right,
+                ),
+              ),
+            ],
+          ),
+
+          // ── Margin fraction slider ────────────────────────────────────────
+          // Range: 0.00–0.10
+          Row(
+            children: [
+              const SizedBox(
+                width: 100,
+                child: Text(
+                  'Margin Fraction',
+                  style: TextStyle(color: Colors.white54, fontSize: 11),
+                ),
+              ),
+              Expanded(
+                child: SliderTheme(
+                  data: SliderTheme.of(context).copyWith(
+                    activeTrackColor: kAccent,
+                    inactiveTrackColor: Colors.white10,
+                    thumbColor: kAccent,
+                    overlayColor: kAccent.withValues(alpha: 0.15),
+                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                    trackHeight: 2,
+                  ),
+                  child: Slider(
+                    value: _pipMarginFraction.clamp(0.0, 0.10),
+                    min: 0.0,
+                    max: 0.10,
+                    divisions: 100,
+                    onChanged: (v) => setState(() => _pipMarginFraction = v),
+                  ),
+                ),
+              ),
+              SizedBox(
+                width: 44,
+                child: Text(
+                  _pipMarginFraction.toStringAsFixed(3),
+                  style: const TextStyle(
+                    color: kAccent,
+                    fontSize: 10,
+                    fontFamily: 'monospace',
+                  ),
+                  textAlign: TextAlign.right,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+
+          // ── Current descriptor summary ────────────────────────────────────
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: Colors.black26,
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(
+              'anchor=${_pipAnchor.value}  '
+              'wf=${_pipWidthFraction.toStringAsFixed(3)}  '
+              'mf=${_pipMarginFraction.toStringAsFixed(3)}  '
+              'cornerRadius=0.0 (rectangular)',
+              style: const TextStyle(
+                color: kAccent,
+                fontSize: 10,
+                fontFamily: 'monospace',
+              ),
+            ),
+          ),
+          const SizedBox(height: 10),
+
+          // ── Apply button ──────────────────────────────────────────────────
+          ElevatedButton.icon(
+            onPressed: canApply ? _applyPiPLayout : null,
+            icon: _devDualCamMounting
+                ? const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: Colors.white70),
+                  )
+                : const Icon(Icons.refresh_outlined, size: 14),
+            label: const Text('Apply PiP Layout / Rebuild Texture'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: kAccent,
+              foregroundColor: const Color(0xFF0F0E17),
+              disabledBackgroundColor: Colors.white10,
+              disabledForegroundColor: Colors.white24,
+              padding: const EdgeInsets.symmetric(vertical: 10),
+              textStyle:
+                  const TextStyle(fontSize: 12, fontWeight: FontWeight.w700),
+            ),
+          ),
+
+          // ── Reset to defaults ─────────────────────────────────────────────
+          const SizedBox(height: 6),
+          OutlinedButton(
+            onPressed: () {
+              setState(() {
+                _pipAnchor = VGPiPAnchor.bottomRight;
+                _pipWidthFraction = 0.35;
+                _pipMarginFraction = 0.018;
+              });
+            },
+            style: OutlinedButton.styleFrom(
+              foregroundColor: kAccent.withValues(alpha: 0.8),
+              side: BorderSide(color: kAccent.withValues(alpha: 0.4), width: 0.8),
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              textStyle: const TextStyle(fontSize: 11),
+            ),
+            child: const Text('Reset to 7.x-H Validated Defaults (bot-R, 0.35, 0.018)'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // Helper: anchor selection button used in _buildDualCamPiPLayoutCard.
+  Widget _buildPiPAnchorButton(
+      VGPiPAnchor anchor, String label, Color accentColor) {
+    final bool active = _pipAnchor == anchor;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => setState(() => _pipAnchor = anchor),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          decoration: BoxDecoration(
+            color: active
+                ? accentColor
+                : Colors.white.withValues(alpha: 0.03),
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(
+              color: active ? accentColor : Colors.white12,
+            ),
+          ),
+          alignment: Alignment.center,
+          child: Text(
+            label,
+            style: TextStyle(
+              color: active ? const Color(0xFF0F0E17) : Colors.white54,
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   // ── Phase 7.x-C: DEV dual-camera descriptor smoke card ─────────────────────
   Widget _buildDualCamSmokeCard() {
     final ready = _controller != null && _tempPathA != null && _tempPathB != null;
@@ -2421,7 +2731,8 @@ class _VanguardManualTestPlaygroundState
           const SizedBox(height: 4),
           const Text(
             'Mounts VGDualCameraCompositorNode in the generic runtime. '
-            'Displays primary clip only. Secondary/PiP are deferred. '
+            'Phase 7.x-H: displays primary + secondary as rectangular PiP. '
+            'Phase 7.x-I: PiP layout controlled by the card above. '
             'Does NOT touch camera/export code.',
             style: TextStyle(color: Colors.white38, fontSize: 10),
           ),
