@@ -261,6 +261,51 @@ typedef NS_ENUM(NSInteger, VGDualCameraCompositorNodeErrorCode) {
 
 - (instancetype)init NS_UNAVAILABLE;
 
+// ─── Phase 7.x-N: DEV telemetry ──────────────────────────────────────────────
+
+/// Returns a snapshot of DEV-only frame telemetry counters.
+///
+/// All values are NSNumber. Integer counters are non-negative. Timing values are
+/// NSNumber doubleValue (milliseconds, ≥0). Read atomically — safe from any thread.
+///
+/// Core pull counters:
+///   @"pullFrameCallCount"          — total pullFrame: calls since last reset (incl. cache hits).
+///   @"primaryPullCount"            — alias for pullFrameCallCount (backward compat).
+///   @"primaryDecodeCount"          — total AVAssetReader decode (copyNextSampleBuffer) calls.
+///   @"successfulFrameCount"        — frames delivered (not skipped/EOS).
+///
+/// Composition counters:
+///   @"compositedFrameCount"        — total successful CoreImage composites (all modes).
+///   @"pipCompositionCount"         — successful PiP composites.
+///   @"splitScreenCompositionCount" — successful split-screen composites.
+///   @"compositionFailureCount"     — composites attempted but _compositeWith* returned NULL.
+///   @"fallbackToPrimaryCount"      — primary-only deliveries (secondary/composite unavailable).
+///
+/// Image / output buffer counters:
+///   @"imageBufferBuildCount"       — successful _buildImageBufferForClip calls (primary + secondary).
+///   @"outputBufferCreateCount"     — successful CVPixelBufferCreate calls in composite methods.
+///
+/// Buffer byte estimates (atomic, updated from pull queue):
+///   @"primaryBufferEstBytes"       — bytesPerRow×height of current primary CVPixelBuffer.
+///   @"secondaryBufferEstBytes"     — bytesPerRow×height of current secondary CVPixelBuffer.
+///   @"estimatedRetainedBufferBytes"— sum of primary + secondary byte estimates.
+///
+/// Timing (NSNumber doubleValue, milliseconds; 0 = not yet measured):
+///   @"firstFrameMs"                — monotonic timestamp (CACurrentMediaTime * 1e3) of first delivered frame.
+///   @"lastPullFrameMs"             — duration of the most recent pullFrame: call that delivered a frame.
+///   @"maxPullFrameMs"              — peak pullFrame: delivery duration since last reset.
+///   @"averagePullFrameMs"          — mean pullFrame: delivery duration since last reset.
+///   @"estimatedRetainedBufferMB"   — estimatedRetainedBufferBytes / (1024*1024) as double.
+///
+/// DEV-only. Not exposed to production runtime.
+- (NSDictionary<NSString *, NSNumber *> *)devGetTelemetry;
+
+/// Resets all DEV telemetry counters to zero.
+///
+/// Thread-safe: writes atomic counters without locking.
+/// DEV-only.
+- (void)devResetTelemetry;
+
 @end
 
 NS_ASSUME_NONNULL_END

@@ -1031,6 +1031,65 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     }
   }
 
+  // ── Phase 7.x-N: DEV dual-camera compositor telemetry ──────────────────────
+
+  /// **DEV-only.** Returns a snapshot of frame-level telemetry counters from
+  /// the mounted [VGDualCameraCompositorNode].
+  ///
+  /// Invokes `dev_getDualCameraTelemetry`. Returns an empty map if no DEV
+  /// dual-camera runtime is mounted or on native failure.
+  ///
+  /// Returned keys (`int` unless noted):
+  /// - `pullFrameCallCount`          — total `pullFrame:` calls since last reset.
+  /// - `primaryPullCount`            — alias for `pullFrameCallCount`.
+  /// - `primaryDecodeCount`          — `copyNextSampleBuffer` decode calls.
+  /// - `successfulFrameCount`        — frames delivered (not skipped/EOS).
+  /// - `compositedFrameCount`        — total CoreImage composites (all modes).
+  /// - `pipCompositionCount`         — successful PiP composites.
+  /// - `splitScreenCompositionCount` — successful split-screen composites.
+  /// - `compositionFailureCount`     — composites attempted but failed.
+  /// - `fallbackToPrimaryCount`      — primary-only deliveries.
+  /// - `imageBufferBuildCount`       — successful image buffer builds.
+  /// - `outputBufferCreateCount`     — successful CVPixelBufferCreate calls.
+  /// - `primaryBufferEstBytes`       — estimated bytes of current primary buffer.
+  /// - `secondaryBufferEstBytes`     — estimated bytes of current secondary buffer.
+  /// - `estimatedRetainedBufferBytes`— primary + secondary byte sum.
+  /// - `firstFrameMs` (**double**)   — monotonic stamp of first delivered frame.
+  /// - `lastPullFrameMs` (**double**)— last delivery duration in ms.
+  /// - `maxPullFrameMs` (**double**) — peak delivery duration in ms.
+  /// - `averagePullFrameMs` (**double**)— mean delivery duration in ms.
+  /// - `estimatedRetainedBufferMB` (**double**)— retained buffer in MB.
+  ///
+  /// Throws [StateError] if [dispose] has been called.
+  Future<Map<String, num>> devGetDualCameraTelemetry() async {
+    _assertNotDisposed();
+    try {
+      final raw = await _channel.invokeMapMethod<String, dynamic>(
+        'dev_getDualCameraTelemetry',
+      );
+      if (raw == null || raw.isEmpty) return const {};
+      return raw.map((k, v) => MapEntry(k, v as num));
+    } on PlatformException catch (_) {
+      return const {};
+    }
+  }
+
+  /// **DEV-only.** Resets all [VGDualCameraCompositorNode] telemetry counters
+  /// to zero.
+  ///
+  /// Invokes `dev_resetDualCameraTelemetry`. No-op if no DEV dual-camera
+  /// runtime is mounted. Swallows [PlatformException] (best-effort).
+  ///
+  /// Throws [StateError] if [dispose] has been called.
+  Future<void> devResetDualCameraTelemetry() async {
+    _assertNotDisposed();
+    try {
+      await _channel.invokeMethod<void>('dev_resetDualCameraTelemetry');
+    } on PlatformException catch (_) {
+      // Best-effort.
+    }
+  }
+
   // ── Private helpers ────────────────────────────────────────────────────────
 
   void _assertNotDisposed() {

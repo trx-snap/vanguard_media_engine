@@ -136,6 +136,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // Gated behind VG_USE_V2_GRAPH — nil when VG_USE_V2_GRAPH=0.
     #if VG_USE_V2_GRAPH
     private var _devDualCameraRuntime: VanguardGraphRuntime?
+    // Phase 7.x-N: retained reference to the mounted DEV compositor node.
+    // Set alongside _devDualCameraRuntime; nil'd on dispose.
+    // Allows telemetry routes to call devGetTelemetry/devResetTelemetry
+    // without requiring a new public property on VanguardGraphRuntime.
+    private var _devDualCameraCompositorNode: VGDualCameraCompositorNode?
     #endif
 
     // Phase 2 Step 6: session registry is the unconditional playback path.
@@ -3436,6 +3441,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 NSLog("[VanguardPlugin][7.x-E] dev_createDualCameraTexture: invalidating previous DEV runtime")
                 existing.invalidate()
                 _devDualCameraRuntime = nil
+                _devDualCameraCompositorNode = nil
             }
 
             // Create a new runtime isolated from VGSessionRegistry and _timelineRuntime.
@@ -3460,6 +3466,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 methodChannel:   devChannel
             )
             self._devDualCameraRuntime = devRuntime
+            // Phase 7.x-N: retain the compositor node for telemetry access.
+            self._devDualCameraCompositorNode = dualCameraNode
 
             // Prepare via the Phase 7.x-D generic source node API.
             // The node returns VGFrameStatusSkipped — blank/transparent output expected.
@@ -3473,6 +3481,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     // Invalidate the partially-prepared runtime to prevent leaks.
                     self._devDualCameraRuntime?.invalidate()
                     self._devDualCameraRuntime = nil
+                    self._devDualCameraCompositorNode = nil
                     result(FlutterError(code: "DUAL_CAMERA_TEXTURE_CREATE_FAILED",
                                         message: err.localizedDescription,
                                         details: nil))
@@ -3506,6 +3515,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     // Return error rather than leaving Dart with a dead textureId.
                     NSLog("[VanguardPlugin][7.x-F] dev_createDualCameraTexture: " +
                           "DEV runtime nil after prepare — invalidating and returning error")
+                    self._devDualCameraCompositorNode = nil
                     result(FlutterError(code: "DUAL_CAMERA_TEXTURE_CREATE_FAILED",
                                         message: "DEV runtime was nil after successful prepare",
                                         details: nil))
@@ -3542,11 +3552,45 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // ── Phase 7.x-E: DEV dual-camera texture disposal ────────────────────────
         // Invalidates and releases the DEV dual-camera runtime.
         // No-op if no DEV runtime is mounted.
+        //
+        // ── Phase 7.x-N: DEV dual-camera compositor telemetry ────────────────────
+        // Returns a snapshot of frame-level counters from the mounted
+        // VGDualCameraCompositorNode without modifying any data path.
+        //
+        // dev_getDualCameraTelemetry:
+        //   Returns { "primaryPullCount", "primaryDecodeCount", "compositedFrameCount",
+        //             "primaryBufferEstBytes", "secondaryBufferEstBytes" }
+        //   All values are NSNumber (uint64). Returns {} if no DEV runtime is mounted.
+        //
+        // dev_resetDualCameraTelemetry:
+        //   Zeros all counters. No-op if no DEV runtime is mounted.
+        case "dev_getDualCameraTelemetry":
+            if let node = _devDualCameraCompositorNode {
+                let telemetry = node.devGetTelemetry()
+                // Convert NSDictionary<NSString*,NSNumber*> → [String:Any] for Flutter.
+                var out: [String: Any] = [:]
+                for (k, v) in telemetry {
+                    out[k] = v.int64Value
+                }
+                result(out)
+            } else {
+                result([:] as [String: Any])
+            }
+
+        case "dev_resetDualCameraTelemetry":
+            if let node = _devDualCameraCompositorNode {
+                node.devResetTelemetry()
+                result(["ok": true])
+            } else {
+                result(["ok": false, "reason": "no DEV dual-camera runtime mounted"])
+            }
+
         case "dev_disposeDualCameraTexture":
             if let devRuntime = _devDualCameraRuntime {
                 NSLog("[VanguardPlugin][7.x-E] dev_disposeDualCameraTexture: invalidating DEV dual-camera runtime")
                 devRuntime.invalidate()
                 _devDualCameraRuntime = nil
+                _devDualCameraCompositorNode = nil
             }
             result(["ok": true])
         #endif // VG_USE_V2_GRAPH

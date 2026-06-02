@@ -100,6 +100,9 @@
 // ─── Phase 7.x-H: CoreImage for PiP compositing ───────────────────────────────
 #import <CoreImage/CoreImage.h>
 
+// ─── Phase 7.x-N: QuartzCore for CACurrentMediaTime() pull-frame timing ──────
+#import <QuartzCore/QuartzCore.h>
+
 // ─── System ───────────────────────────────────────────────────────────────────
 #import <os/log.h>
 #include <stdatomic.h>
@@ -385,6 +388,34 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     BOOL _secondaryIsImage;
     // Phase 7.x-L: YES once the secondary still-image buffer has been logged.
     BOOL _secondaryImageLogged;
+
+    // Phase 7.x-N: DEV telemetry counters.
+    // All atomic — safe to read from any thread for the telemetry route.
+    // Reset to 0 by devResetTelemetry. Never read on the critical path.
+    atomic_uint_fast64_t _primaryPullCount;       // total pullFrame: calls (incl. cache hits)
+    atomic_uint_fast64_t _primaryDecodeCount;     // total copyNextSampleBuffer decode calls
+    atomic_uint_fast64_t _compositedFrameCount;   // total successful CoreImage composites (all modes)
+    // Buffer byte estimates — updated atomically from pull queue alongside buffer stores.
+    // Avoids reading _primaryLastBuffer/_secondaryLastBuffer from the main thread.
+    atomic_uint_fast64_t _primaryLastBufferEstBytes;   // last primary buffer bytesPerRow*height
+    atomic_uint_fast64_t _secondaryLastBufferEstBytes; // last secondary buffer bytesPerRow*height
+
+    // Phase 7.x-N (patch): additional composition / fallback / image counters.
+    atomic_uint_fast64_t _pipCompositionCount;          // successful PiP composites
+    atomic_uint_fast64_t _splitScreenCompositionCount;  // successful split-screen composites
+    atomic_uint_fast64_t _compositionFailureCount;      // composite attempted but _compositeWith* returned NULL
+    atomic_uint_fast64_t _fallbackToPrimaryCount;       // delivered primary-only because secondary/composite unavailable
+    atomic_uint_fast64_t _imageBufferBuildCount;        // successful _buildImageBufferForClip calls (primary + secondary)
+    atomic_uint_fast64_t _outputBufferCreateCount;      // successful CVPixelBufferCreate in composite methods
+
+    // Phase 7.x-N (patch): pull-frame timing (all in nanoseconds, stored atomically).
+    // CACurrentMediaTime() returns absolute seconds; multiply by 1e9 for uint64 ns.
+    // uint64 overflows at ~584 years — safe.
+    atomic_uint_fast64_t _firstFrameWallTimeNs;   // ns timestamp of first successful delivered frame (0 = not set)
+    atomic_uint_fast64_t _lastPullFrameNs;        // duration of last pullFrame: in ns
+    atomic_uint_fast64_t _maxPullFrameNs;         // peak pullFrame: duration since last reset
+    atomic_uint_fast64_t _totalPullFrameNs;       // sum of all pullFrame: durations for average
+    atomic_uint_fast64_t _pullTimedCallCount;     // number of timing samples (denominator for average)
 }
 
 @synthesize primaryClip   = _primaryClip;
@@ -575,6 +606,25 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     _primaryImageLogged   = NO;
     _secondaryIsImage     = NO;
     _secondaryImageLogged = NO;
+
+    // Phase 7.x-N: DEV telemetry counters — initialise to zero.
+    atomic_init(&_primaryPullCount,            0);
+    atomic_init(&_primaryDecodeCount,          0);
+    atomic_init(&_compositedFrameCount,        0);
+    atomic_init(&_primaryLastBufferEstBytes,   0);
+    atomic_init(&_secondaryLastBufferEstBytes, 0);
+    // Phase 7.x-N (patch): composition / fallback / image / timing.
+    atomic_init(&_pipCompositionCount,         0);
+    atomic_init(&_splitScreenCompositionCount, 0);
+    atomic_init(&_compositionFailureCount,     0);
+    atomic_init(&_fallbackToPrimaryCount,      0);
+    atomic_init(&_imageBufferBuildCount,       0);
+    atomic_init(&_outputBufferCreateCount,     0);
+    atomic_init(&_firstFrameWallTimeNs,        0);
+    atomic_init(&_lastPullFrameNs,             0);
+    atomic_init(&_maxPullFrameNs,              0);
+    atomic_init(&_totalPullFrameNs,            0);
+    atomic_init(&_pullTimedCallCount,          0);
 
     // Phase 7.x-F (aspect ratio, Option B, timing fix):
     // Probe primaryRenderSize synchronously during init so dev_createDualCameraTexture
@@ -877,6 +927,12 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         return [VGFrameResult skippedWithGeneration:request.generation];
     }
 
+    // Phase 7.x-N: DEV telemetry — count every valid (non-cancelled, non-invalidated) pull.
+    // Also capture wall-clock t0 for pull-frame timing.
+    atomic_fetch_add(&_primaryPullCount, 1);
+    // Phase 7.x-N (patch): timing start.
+    uint64_t _pullT0Ns = (uint64_t)(CACurrentMediaTime() * 1.0e9);
+
     // ── 2. Generation guard ─────────────────────────────────────────────────
     //
     // If the scheduler's request.generation differs from our stored generation,
@@ -944,6 +1000,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
                 return [VGFrameResult skippedWithGeneration:request.generation];
             }
             _primaryImageBuffer = imgBuf; // node owns +1 from _buildImageBufferForClip
+            // Phase 7.x-N (patch): count successful primary image buffer builds.
+            atomic_fetch_add(&_imageBufferBuildCount, 1);
         }
 
         // Populate _primaryLastBuffer once (or after seek when _primaryImageBuffer was reset).
@@ -953,6 +1011,12 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
             }
             CVPixelBufferRetain(_primaryImageBuffer); // +1 for _primaryLastBuffer
             _primaryLastBuffer = _primaryImageBuffer;
+            // Phase 7.x-N: update byte estimate atomically.
+            {
+                size_t bpr = CVPixelBufferGetBytesPerRow(_primaryLastBuffer);
+                size_t h   = CVPixelBufferGetHeight(_primaryLastBuffer);
+                atomic_store(&_primaryLastBufferEstBytes, (uint64_t)(bpr * h));
+            }
 
             // Pseudo sample-window covering the full clip duration so the cache-hit
             // path below fires on every subsequent frame without re-entering this block.
@@ -1075,11 +1139,19 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
                 _secondaryImageBuffer = secImgBuf; // node owns +1
                 CVPixelBufferRetain(secImgBuf);    // +1 for _secondaryLastBuffer
                 _secondaryLastBuffer        = secImgBuf;
+                // Phase 7.x-N: update byte estimate atomically.
+                {
+                    size_t bpr = CVPixelBufferGetBytesPerRow(_secondaryLastBuffer);
+                    size_t h   = CVPixelBufferGetHeight(_secondaryLastBuffer);
+                    atomic_store(&_secondaryLastBufferEstBytes, (uint64_t)(bpr * h));
+                }
                 _secondaryLastSamplePTS     = 0.0;
                 double secSpeed = (secClip.speed > 0.0) ? secClip.speed : 1.0;
                 double secDur   = (secClip.trimEndSeconds - secClip.trimStartSeconds) / secSpeed;
                 _secondaryLastSampleDuration = secDur > 0.0 ? secDur : 3600.0;
                 _secondaryIsImage            = YES;
+                // Phase 7.x-N (patch): count successful secondary image buffer builds.
+                atomic_fetch_add(&_imageBufferBuildCount, 1);
                 // Do NOT mark EOS: image is always available.
             } else {
                 NSLog(@"[VGDualCameraCompositorNode][7.x-L] secondary image buffer build failed — "
@@ -1191,7 +1263,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         // Fallback to primary-only envelope if compositing fails or secondary unavailable.
         if (_secondaryLastBuffer != NULL) {
             CVPixelBufferRef composited = NULL;
-            if (_layoutMode == VGDualCameraLayoutModeSplitScreen) {
+            BOOL isSplitMode = (_layoutMode == VGDualCameraLayoutModeSplitScreen);
+            if (isSplitMode) {
                 composited = [self _compositeWithSplitScreen:cachedBuf
                                                   secondary:_secondaryLastBuffer];
             } else {
@@ -1199,6 +1272,13 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
                                               secondary:_secondaryLastBuffer];
             }
             if (composited != NULL) {
+                // Phase 7.x-N: DEV telemetry — count successful compositions.
+                atomic_fetch_add(&_compositedFrameCount, 1);
+                if (isSplitMode) {
+                    atomic_fetch_add(&_splitScreenCompositionCount, 1);
+                } else {
+                    atomic_fetch_add(&_pipCompositionCount, 1);
+                }
                 // Release old composited buffer before storing new one.
                 if (_compositedLastBuffer) {
                     CVPixelBufferRelease(_compositedLastBuffer);
@@ -1214,9 +1294,48 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
                 compEnvelope.payload.videoBuffer = (void *)composited; // +0 in envelope
                 compEnvelope.metadata   = NULL;
 
+                // Phase 7.x-N (patch): record timing for this delivered composited frame.
+                {
+                    uint64_t dur = (uint64_t)(CACurrentMediaTime() * 1.0e9) - _pullT0Ns;
+                    atomic_store(&_lastPullFrameNs, dur);
+                    atomic_fetch_add(&_totalPullFrameNs, dur);
+                    atomic_fetch_add(&_pullTimedCallCount, 1);
+                    uint64_t prev = atomic_load(&_maxPullFrameNs);
+                    while (dur > prev) {
+                        if (atomic_compare_exchange_weak(&_maxPullFrameNs, &prev, dur)) break;
+                    }
+                    uint64_t zero = 0;
+                    uint64_t now = (uint64_t)(CACurrentMediaTime() * 1.0e9);
+                    atomic_compare_exchange_strong(&_firstFrameWallTimeNs, &zero, now);
+                }
+
                 return [VGFrameResult deliveredWithEnvelope:compEnvelope generation:currentGen];
             }
             // Compositing failed — fall through to primary-only delivery below.
+            // Phase 7.x-N (patch): count the failure and the fallback.
+            atomic_fetch_add(&_compositionFailureCount, 1);
+            atomic_fetch_add(&_fallbackToPrimaryCount, 1);
+        } else {
+            // No secondary buffer available — deliver primary-only.
+            // Phase 7.x-N (patch): count fallback when secondary was expected but missing.
+            if (!_secondaryEOSReached) {
+                atomic_fetch_add(&_fallbackToPrimaryCount, 1);
+            }
+        }
+
+        // Phase 7.x-N (patch): record timing for primary-only delivery.
+        {
+            uint64_t dur = (uint64_t)(CACurrentMediaTime() * 1.0e9) - _pullT0Ns;
+            atomic_store(&_lastPullFrameNs, dur);
+            atomic_fetch_add(&_totalPullFrameNs, dur);
+            atomic_fetch_add(&_pullTimedCallCount, 1);
+            uint64_t prev = atomic_load(&_maxPullFrameNs);
+            while (dur > prev) {
+                if (atomic_compare_exchange_weak(&_maxPullFrameNs, &prev, dur)) break;
+            }
+            uint64_t zero = 0;
+            uint64_t now = (uint64_t)(CACurrentMediaTime() * 1.0e9);
+            atomic_compare_exchange_strong(&_firstFrameWallTimeNs, &zero, now);
         }
 
         return [VGFrameResult deliveredWithEnvelope:envelope generation:currentGen];
@@ -1259,6 +1378,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
             }
         }
 
+        // Phase 7.x-N: DEV telemetry — count each real decode call.
+        atomic_fetch_add(&_primaryDecodeCount, 1);
         CMSampleBufferRef sampleBuf = [_primaryOutput copyNextSampleBuffer]; // +1
 
         if (!sampleBuf) {
@@ -1308,6 +1429,12 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         _primaryLastBuffer        = pixelBuffer; // node takes +1
         _primaryLastSamplePTS      = sPTS;
         _primaryLastSampleDuration = sDur;
+        // Phase 7.x-N: update byte estimate atomically.
+        {
+            size_t bpr = CVPixelBufferGetBytesPerRow(_primaryLastBuffer);
+            size_t h   = CVPixelBufferGetHeight(_primaryLastBuffer);
+            atomic_store(&_primaryLastBufferEstBytes, (uint64_t)(bpr * h));
+        }
 
         // Done with sample buffer.
         CFRelease(sampleBuf); // release CMSampleBufferRef +1
@@ -1362,7 +1489,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
             // Fallback to primary-only envelope if compositing fails or secondary unavailable.
             if (_secondaryLastBuffer != NULL) {
                 CVPixelBufferRef composited = NULL;
-                if (_layoutMode == VGDualCameraLayoutModeSplitScreen) {
+                BOOL isSplitMode2 = (_layoutMode == VGDualCameraLayoutModeSplitScreen);
+                if (isSplitMode2) {
                     composited = [self _compositeWithSplitScreen:pixelBuffer
                                                       secondary:_secondaryLastBuffer];
                 } else {
@@ -1370,6 +1498,13 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
                                                   secondary:_secondaryLastBuffer];
                 }
                 if (composited != NULL) {
+                    // Phase 7.x-N: DEV telemetry — count successful compositions.
+                    atomic_fetch_add(&_compositedFrameCount, 1);
+                    if (isSplitMode2) {
+                        atomic_fetch_add(&_splitScreenCompositionCount, 1);
+                    } else {
+                        atomic_fetch_add(&_pipCompositionCount, 1);
+                    }
                     // Release old composited buffer before storing new one.
                     if (_compositedLastBuffer) {
                         CVPixelBufferRelease(_compositedLastBuffer);
@@ -1385,9 +1520,47 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
                     compEnvelope.payload.videoBuffer = (void *)composited; // +0 in envelope
                     compEnvelope.metadata   = NULL;
 
+                    // Phase 7.x-N (patch): record timing for composited frame delivery.
+                    {
+                        uint64_t dur = (uint64_t)(CACurrentMediaTime() * 1.0e9) - _pullT0Ns;
+                        atomic_store(&_lastPullFrameNs, dur);
+                        atomic_fetch_add(&_totalPullFrameNs, dur);
+                        atomic_fetch_add(&_pullTimedCallCount, 1);
+                        uint64_t prev = atomic_load(&_maxPullFrameNs);
+                        while (dur > prev) {
+                            if (atomic_compare_exchange_weak(&_maxPullFrameNs, &prev, dur)) break;
+                        }
+                        uint64_t zero = 0;
+                        uint64_t now2 = (uint64_t)(CACurrentMediaTime() * 1.0e9);
+                        atomic_compare_exchange_strong(&_firstFrameWallTimeNs, &zero, now2);
+                    }
+
                     return [VGFrameResult deliveredWithEnvelope:compEnvelope generation:currentGen];
                 }
                 // Compositing failed — fall through to primary-only delivery below.
+                // Phase 7.x-N (patch): count the failure and the fallback.
+                atomic_fetch_add(&_compositionFailureCount, 1);
+                atomic_fetch_add(&_fallbackToPrimaryCount, 1);
+            } else {
+                // No secondary buffer — deliver primary-only.
+                if (!_secondaryEOSReached) {
+                    atomic_fetch_add(&_fallbackToPrimaryCount, 1);
+                }
+            }
+
+            // Phase 7.x-N (patch): record timing for primary-only delivery.
+            {
+                uint64_t dur = (uint64_t)(CACurrentMediaTime() * 1.0e9) - _pullT0Ns;
+                atomic_store(&_lastPullFrameNs, dur);
+                atomic_fetch_add(&_totalPullFrameNs, dur);
+                atomic_fetch_add(&_pullTimedCallCount, 1);
+                uint64_t prev = atomic_load(&_maxPullFrameNs);
+                while (dur > prev) {
+                    if (atomic_compare_exchange_weak(&_maxPullFrameNs, &prev, dur)) break;
+                }
+                uint64_t zero = 0;
+                uint64_t now2 = (uint64_t)(CACurrentMediaTime() * 1.0e9);
+                atomic_compare_exchange_strong(&_firstFrameWallTimeNs, &zero, now2);
             }
 
             return [VGFrameResult deliveredWithEnvelope:envelope generation:currentGen];
@@ -1522,6 +1695,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
               "failed (ret=%d) for clipId=%@.", cvRet, clip.clipId);
         return NULL;
     }
+    // Phase 7.x-N (patch): count successful output buffer allocations.
+    atomic_fetch_add(&_outputBufferCreateCount, 1);
 
     // ── 5. Render CIImage into output buffer ──────────────────────────────────
     [_VGDCCNSharedCIContext() render:cropped
@@ -1696,6 +1871,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         NSLog(@"[VGDualCameraCompositorNode][7.x-K] _splitComposite: CVPixelBufferCreate failed (ret=%d).", cvRet);
         return NULL;
     }
+    // Phase 7.x-N (patch): count successful output buffer allocations.
+    atomic_fetch_add(&_outputBufferCreateCount, 1);
 
     // ── 7. Render into output buffer ─────────────────────────────────────────────
     CGRect renderBounds = CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH);
@@ -1947,6 +2124,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         NSLog(@"[VGDualCameraCompositorNode][7.x-J] _composite: CVPixelBufferCreate failed (ret=%d).", cvRet);
         return NULL;
     }
+    // Phase 7.x-N (patch): count successful output buffer allocations.
+    atomic_fetch_add(&_outputBufferCreateCount, 1);
 
     // ── 11. Render CIImage into output buffer ─────────────────────────────────
     CGRect renderBounds = CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH);
@@ -2082,6 +2261,12 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         _secondaryLastBuffer        = secPixelBuffer; // node takes +1
         _secondaryLastSamplePTS      = secSPTS;
         _secondaryLastSampleDuration = secSDur;
+        // Phase 7.x-N: update byte estimate atomically.
+        {
+            size_t bpr = CVPixelBufferGetBytesPerRow(_secondaryLastBuffer);
+            size_t h   = CVPixelBufferGetHeight(_secondaryLastBuffer);
+            atomic_store(&_secondaryLastBufferEstBytes, (uint64_t)(bpr * h));
+        }
 
         CFRelease(secSampleBuf); // release CMSampleBufferRef +1
 
@@ -2535,6 +2720,104 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     }
     _secondaryIsImage     = NO;
     _secondaryImageLogged = NO;
+}
+
+// ─── Phase 7.x-N: DEV telemetry ──────────────────────────────────────────────
+
+- (NSDictionary<NSString *, NSNumber *> *)devGetTelemetry {
+    // All reads are atomic — safe to call from any thread (e.g. the main thread
+    // serving a MethodChannel call) without locking.
+
+    // ── Core counters ────────────────────────────────────────────────────────
+    uint64_t pulls      = atomic_load(&_primaryPullCount);
+    uint64_t decodes    = atomic_load(&_primaryDecodeCount);
+    uint64_t composites = atomic_load(&_compositedFrameCount);
+    uint64_t primBytes  = atomic_load(&_primaryLastBufferEstBytes);
+    uint64_t secBytes   = atomic_load(&_secondaryLastBufferEstBytes);
+
+    // ── Phase 7.x-N (patch) counters ────────────────────────────────────────
+    uint64_t pipCount        = atomic_load(&_pipCompositionCount);
+    uint64_t splitCount      = atomic_load(&_splitScreenCompositionCount);
+    uint64_t failCount       = atomic_load(&_compositionFailureCount);
+    uint64_t fallbackCount   = atomic_load(&_fallbackToPrimaryCount);
+    uint64_t imgBuildCount   = atomic_load(&_imageBufferBuildCount);
+    uint64_t outBufCount     = atomic_load(&_outputBufferCreateCount);
+
+    // ── Timing (nanoseconds → milliseconds) ─────────────────────────────────
+    uint64_t firstFrameNs    = atomic_load(&_firstFrameWallTimeNs);
+    uint64_t lastPullNs      = atomic_load(&_lastPullFrameNs);
+    uint64_t maxPullNs       = atomic_load(&_maxPullFrameNs);
+    uint64_t totalPullNs     = atomic_load(&_totalPullFrameNs);
+    uint64_t timedCount      = atomic_load(&_pullTimedCallCount);
+
+    // Convert ns → ms (double, rounded to nearest integer for dictionary).
+    // firstFrameMs: wall-clock absolute timestamp when first frame was delivered.
+    //   Convert to milliseconds since midnight (for relative ordering only).
+    //   Value is absolute ns / 1e6 — use as opaque monotonic stamp.
+    double firstFrameMs  = (firstFrameNs > 0) ? (double)firstFrameNs / 1.0e6 : 0.0;
+    double lastPullMs    = (double)lastPullNs  / 1.0e6;
+    double maxPullMs     = (double)maxPullNs   / 1.0e6;
+    double avgPullMs     = (timedCount > 0) ? ((double)totalPullNs / (double)timedCount / 1.0e6) : 0.0;
+
+    // ── Derived: estimated retained buffer bytes ─────────────────────────────
+    uint64_t retainedBytes = primBytes + secBytes;
+    double   retainedMB    = (double)retainedBytes / (1024.0 * 1024.0);
+
+    // ── Derived: successful output frames = total composites + fallbacks ─────
+    // "successfulFrameCount" means pullFrame: returned a delivered (non-skipped) result.
+    // We track this via timedCount (every delivery site records timing).
+    uint64_t successfulFrames = timedCount;
+
+    return @{
+        // Core pull counters (compatible with Phase 7.x-N original keys).
+        @"pullFrameCallCount"         : @(pulls),
+        @"primaryPullCount"           : @(pulls),        // alias for backward compat
+        @"primaryDecodeCount"         : @(decodes),
+        @"successfulFrameCount"       : @(successfulFrames),
+        // Composition counters.
+        @"compositedFrameCount"       : @(composites),
+        @"pipCompositionCount"        : @(pipCount),
+        @"splitScreenCompositionCount": @(splitCount),
+        @"compositionFailureCount"    : @(failCount),
+        @"fallbackToPrimaryCount"     : @(fallbackCount),
+        // Image / output buffer build counters.
+        @"imageBufferBuildCount"      : @(imgBuildCount),
+        @"outputBufferCreateCount"    : @(outBufCount),
+        // Buffer byte estimates.
+        @"primaryBufferEstBytes"      : @(primBytes),
+        @"secondaryBufferEstBytes"    : @(secBytes),
+        @"estimatedRetainedBufferBytes" : @(retainedBytes),
+        // Timing (double ms, stored as NSNumber doubleValue).
+        // Dart side reads as (v as num).toDouble().
+        @"firstFrameMs"               : @(firstFrameMs),
+        @"lastPullFrameMs"            : @(lastPullMs),
+        @"maxPullFrameMs"             : @(maxPullMs),
+        @"averagePullFrameMs"         : @(avgPullMs),
+        @"estimatedRetainedBufferMB"  : @(retainedMB),
+    };
+}
+
+- (void)devResetTelemetry {
+    // Core counters.
+    atomic_store(&_primaryPullCount,            0);
+    atomic_store(&_primaryDecodeCount,          0);
+    atomic_store(&_compositedFrameCount,        0);
+    atomic_store(&_primaryLastBufferEstBytes,   0);
+    atomic_store(&_secondaryLastBufferEstBytes, 0);
+    // Phase 7.x-N (patch): composition / fallback / image / output buffer counters.
+    atomic_store(&_pipCompositionCount,         0);
+    atomic_store(&_splitScreenCompositionCount, 0);
+    atomic_store(&_compositionFailureCount,     0);
+    atomic_store(&_fallbackToPrimaryCount,      0);
+    atomic_store(&_imageBufferBuildCount,       0);
+    atomic_store(&_outputBufferCreateCount,     0);
+    // Phase 7.x-N (patch): timing — reset durations but keep firstFrameWallTime (re-arm).
+    atomic_store(&_firstFrameWallTimeNs,        0); // allow re-arm on next delivery
+    atomic_store(&_lastPullFrameNs,             0);
+    atomic_store(&_maxPullFrameNs,              0);
+    atomic_store(&_totalPullFrameNs,            0);
+    atomic_store(&_pullTimedCallCount,          0);
+    NSLog(@"[VGDualCameraCompositorNode][7.x-N] devResetTelemetry: all counters and timing zeroed.");
 }
 
 @end

@@ -107,6 +107,10 @@ class _VanguardManualTestPlaygroundState
   // 2 = image primary + video secondary (still_C.png as background)
   int _dualCamImageMode = 0; // Phase 7.x-L
 
+  // ── Phase 7.x-N: DEV dual-camera compositor telemetry HUD ────────────────
+  Map<String, num> _dualCamTelemetry = const {};
+  bool _fetchingTelemetry = false;
+
   // ── Phase 7.18B2: Cache Metrics HUD state ──────────────────────────────────
   Map<String, int> _cacheStats = const {};
   bool _fetchingStats = false;
@@ -875,8 +879,42 @@ class _VanguardManualTestPlaygroundState
       setState(() {
         _devDualCamTextureId = null;
         _devDualCamMountResult = null;
+        _dualCamTelemetry = const {}; // Phase 7.x-N: clear stale telemetry on dispose
         _status = 'Dual-cam DEV texture disposed.';
       });
+    }
+  }
+
+  // Phase 7.x-N: Fetch a live telemetry snapshot from the mounted DEV compositor.
+  Future<void> _fetchDualCamTelemetry() async {
+    final c = _controller;
+    if (c == null || _fetchingTelemetry) return;
+    setState(() => _fetchingTelemetry = true);
+    try {
+      final data = await c.devGetDualCameraTelemetry();
+      if (mounted) setState(() => _dualCamTelemetry = data);
+    } finally {
+      if (mounted) setState(() => _fetchingTelemetry = false);
+    }
+  }
+
+  // Phase 7.x-N: Reset all compositor telemetry counters to zero,
+  // then immediately fetch to show the zeroed state.
+  Future<void> _resetDualCamTelemetry() async {
+    final c = _controller;
+    if (c == null || _fetchingTelemetry) return;
+    setState(() => _fetchingTelemetry = true);
+    try {
+      await c.devResetDualCameraTelemetry();
+      final data = await c.devGetDualCameraTelemetry();
+      if (mounted) {
+        setState(() {
+          _dualCamTelemetry = data;
+          _status = 'Dual-cam telemetry counters reset.';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _fetchingTelemetry = false);
     }
   }
 
@@ -1135,6 +1173,10 @@ class _VanguardManualTestPlaygroundState
 
                         // ── Phase 7.x-E: DEV Dual-Camera Texture Mount ───────────
                         _buildDualCamTextureMountCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.x-N: DEV Dual-Camera Compositor Telemetry ────
+                        _buildDualCamTelemetryCard(),
                         const SizedBox(height: 12),
 
                         // ── Phase 7.18B2: Cache Metrics HUD ─────────────────────
@@ -3150,6 +3192,182 @@ class _VanguardManualTestPlaygroundState
               ),
             ),
           ],
+        ],
+      ),
+    );
+  }
+  // ── Phase 7.x-N (patch): DEV dual-camera compositor telemetry card ─────────
+  Widget _buildDualCamTelemetryCard() {
+    const Color kAccent  = Color(0xFF00BFA5); // teal
+    const Color kWarning = Color(0xFFFFAB40); // amber
+    const Color kDim     = Colors.white38;
+    const Color kMid     = Colors.white54;
+    const Color kBright  = Colors.white70;
+
+    final bool hasTelemetry = _dualCamTelemetry.isNotEmpty;
+    final bool isMounted    = _devDualCamTextureId != null;
+    final bool canFetch     = _controller != null && !_fetchingTelemetry;
+
+    // ── Extract values ─────────────────────────────────────────────────────
+    num _n(String k) => _dualCamTelemetry[k] ?? 0;
+
+    final pulls       = _n('pullFrameCallCount').toInt();
+    final decodes     = _n('primaryDecodeCount').toInt();
+    final successful  = _n('successfulFrameCount').toInt();
+    final composites  = _n('compositedFrameCount').toInt();
+    final pip         = _n('pipCompositionCount').toInt();
+    final split       = _n('splitScreenCompositionCount').toInt();
+    final failures    = _n('compositionFailureCount').toInt();
+    final fallbacks   = _n('fallbackToPrimaryCount').toInt();
+    final imgBuilds   = _n('imageBufferBuildCount').toInt();
+    final outBufs     = _n('outputBufferCreateCount').toInt();
+    final retBytes    = _n('estimatedRetainedBufferBytes').toInt();
+    final retMB       = _n('estimatedRetainedBufferMB').toDouble();
+    final firstMs     = _n('firstFrameMs').toDouble();
+    final lastMs      = _n('lastPullFrameMs').toDouble();
+    final maxMs       = _n('maxPullFrameMs').toDouble();
+    final avgMs       = _n('averagePullFrameMs').toDouble();
+
+    // ── Helpers ───────────────────────────────────────────────────────────
+    String fmtMs(double ms) => ms > 0 ? '${ms.toStringAsFixed(2)} ms' : '—';
+    String fmtBytes(int bytes) {
+      if (bytes == 0) return '—';
+      final kb = bytes / 1024.0;
+      if (kb < 1024) return '${kb.toStringAsFixed(0)} KB';
+      return '${(kb / 1024).toStringAsFixed(2)} MB';
+    }
+    String fmtMB(double mb) => mb > 0 ? '${mb.toStringAsFixed(3)} MB' : '—';
+    final cacheHitPct = pulls > 0 && decodes <= pulls
+        ? '${((pulls - decodes) / pulls * 100.0).toStringAsFixed(1)}%'
+        : '—';
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: isMounted
+              ? kAccent.withValues(alpha: 0.5)
+              : kAccent.withValues(alpha: 0.2),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // ── Header ────────────────────────────────────────────────────
+          Row(
+            children: [
+              const Icon(Icons.analytics_outlined, color: Color(0xFF00BFA5), size: 14),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  'PHASE 7.x-N — COMPOSITOR TELEMETRY (DEV ONLY)',
+                  style: TextStyle(
+                    color: Color(0xFF00BFA5), fontSize: 10,
+                    fontWeight: FontWeight.w700, letterSpacing: 1.0,
+                  ),
+                ),
+              ),
+              if (_fetchingTelemetry)
+                const SizedBox(
+                  width: 12, height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.5, color: Color(0xFF00BFA5),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            isMounted
+                ? 'Live frame counters from the DEV compositor. '
+                  'Tap "Fetch Telemetry" to refresh. "Reset" zeros all.'
+                : 'Mount a DEV dual-camera texture first, then fetch telemetry.',
+            style: const TextStyle(color: Colors.white38, fontSize: 10),
+          ),
+          const SizedBox(height: 10),
+
+          if (hasTelemetry) ...[
+            // ── Pull / decode ────────────────────────────────────────────
+            _buildStatRow('Pull calls',      '$pulls',      kAccent),
+            _buildStatRow('Decoded frames',  '$decodes',    kWarning),
+            _buildStatRow('Delivered frames','$successful', kBright),
+            _buildStatRow('Cache-hit ratio', cacheHitPct,
+                pulls > 0 ? kAccent : kDim),
+            const SizedBox(height: 6),
+
+            // ── Composition breakdown ────────────────────────────────────
+            _buildStatRow('Composited total', '$composites', kBright),
+            _buildStatRow('  PiP',            '$pip',        kMid),
+            _buildStatRow('  Split-screen',   '$split',      kMid),
+            _buildStatRow('  Failures',       '$failures',
+                failures > 0 ? Colors.redAccent : kDim),
+            _buildStatRow('  Fallback (primary-only)', '$fallbacks',
+                fallbacks > 0 ? kWarning : kDim),
+            const SizedBox(height: 6),
+
+            // ── Image / output buffer ────────────────────────────────────
+            _buildStatRow('Image buf builds',   '$imgBuilds', kMid),
+            _buildStatRow('Output buf allocs',  '$outBufs',   kMid),
+            const SizedBox(height: 6),
+
+            // ── Timing ──────────────────────────────────────────────────
+            _buildStatRow('Avg pull dur',  fmtMs(avgMs),  kAccent),
+            _buildStatRow('Last pull dur', fmtMs(lastMs), kMid),
+            _buildStatRow('Max pull dur',  fmtMs(maxMs),  kWarning),
+            _buildStatRow('First frame stamp',
+                firstMs > 0 ? '${firstMs.toStringAsFixed(0)} ms' : '—', kDim),
+            const SizedBox(height: 6),
+
+            // ── Buffer memory ────────────────────────────────────────────
+            _buildStatRow('Retained bytes', fmtBytes(retBytes), kMid),
+            _buildStatRow('Retained MB',    fmtMB(retMB),       kMid),
+            const SizedBox(height: 8),
+          ] else ...[
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 8),
+              child: Text(
+                'No telemetry yet — tap "Fetch Telemetry" to load.',
+                style: TextStyle(color: Colors.white38, fontSize: 11),
+              ),
+            ),
+          ],
+
+          // ── Buttons ──────────────────────────────────────────────────
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: canFetch ? _fetchDualCamTelemetry : null,
+                  icon: const Icon(Icons.refresh_outlined, size: 14),
+                  label: const Text('Fetch Telemetry'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: kAccent,
+                    foregroundColor: Colors.white,
+                    disabledBackgroundColor: Colors.white10,
+                    disabledForegroundColor: Colors.white24,
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    textStyle: const TextStyle(fontSize: 12),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: canFetch && hasTelemetry ? _resetDualCamTelemetry : null,
+                  icon: const Icon(Icons.restart_alt_outlined, size: 14),
+                  label: const Text('Reset'),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.orangeAccent,
+                    side: const BorderSide(color: Colors.orangeAccent, width: 0.8),
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    textStyle: const TextStyle(fontSize: 12),
+                  ),
+                ),
+              ),
+            ],
+          ),
         ],
       ),
     );

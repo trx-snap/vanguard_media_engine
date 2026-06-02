@@ -1889,5 +1889,186 @@ void main() {
       );
     });
   });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Phase 7.x-N (patch): devGetDualCameraTelemetry / devResetDualCameraTelemetry
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorController — devGetDualCameraTelemetry() [Phase 7.x-N]', () {
+    late VGEditorController controller;
+    final List<String> calledMethods = [];
+
+    /// Minimal telemetry map matching all new keys from Phase 7.x-N (patch).
+    Map<String, dynamic> _fullTelemetryMap() => <String, dynamic>{
+      'pullFrameCallCount':          100,
+      'primaryPullCount':            100,
+      'primaryDecodeCount':          42,
+      'successfulFrameCount':        85,
+      'compositedFrameCount':        80,
+      'pipCompositionCount':         60,
+      'splitScreenCompositionCount': 20,
+      'compositionFailureCount':     3,
+      'fallbackToPrimaryCount':      2,
+      'imageBufferBuildCount':       4,
+      'outputBufferCreateCount':     83,
+      'primaryBufferEstBytes':       2073600,
+      'secondaryBufferEstBytes':     2073600,
+      'estimatedRetainedBufferBytes': 4147200,
+      'firstFrameMs':                1234567890.0,
+      'lastPullFrameMs':             1.23,
+      'maxPullFrameMs':              8.77,
+      'averagePullFrameMs':          2.01,
+      'estimatedRetainedBufferMB':   3.958,
+    };
+
+    setUp(() {
+      calledMethods.clear();
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+      controller = VGEditorController(initialDraft: _twoClipDraft());
+    });
+
+    tearDown(() => controller.dispose());
+
+    test('DCT-1  devGetDualCameraTelemetry invokes correct channel method',
+        () async {
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        if (method == 'dev_getDualCameraTelemetry') return _fullTelemetryMap();
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      calledMethods.clear();
+      await controller.devGetDualCameraTelemetry();
+      expect(calledMethods, contains('dev_getDualCameraTelemetry'));
+      expect(calledMethods, isNot(contains('dev_resetDualCameraTelemetry')));
+    });
+
+    test('DCT-2  devGetDualCameraTelemetry returns Map<String, num> with all keys',
+        () async {
+      _setMockHandler((method, args) async {
+        if (method == 'dev_getDualCameraTelemetry') return _fullTelemetryMap();
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      final stats = await controller.devGetDualCameraTelemetry();
+      expect(stats, isA<Map<String, num>>());
+
+      // Integer counters.
+      expect(stats['pullFrameCallCount'],          100);
+      expect(stats['primaryPullCount'],            100);
+      expect(stats['primaryDecodeCount'],          42);
+      expect(stats['successfulFrameCount'],        85);
+      expect(stats['compositedFrameCount'],        80);
+      expect(stats['pipCompositionCount'],         60);
+      expect(stats['splitScreenCompositionCount'], 20);
+      expect(stats['compositionFailureCount'],     3);
+      expect(stats['fallbackToPrimaryCount'],      2);
+      expect(stats['imageBufferBuildCount'],       4);
+      expect(stats['outputBufferCreateCount'],     83);
+      expect(stats['primaryBufferEstBytes'],       2073600);
+      expect(stats['secondaryBufferEstBytes'],     2073600);
+      expect(stats['estimatedRetainedBufferBytes'], 4147200);
+
+      // Double timing fields — verify they are num and approximately correct.
+      expect(stats['lastPullFrameMs'],      closeTo(1.23, 0.01));
+      expect(stats['maxPullFrameMs'],       closeTo(8.77, 0.01));
+      expect(stats['averagePullFrameMs'],   closeTo(2.01, 0.01));
+      expect(stats['estimatedRetainedBufferMB'], closeTo(3.958, 0.001));
+      expect(stats['firstFrameMs'],         isA<num>());
+    });
+
+    test('DCT-3  devGetDualCameraTelemetry returns empty map when native returns null',
+        () async {
+      _setMockHandler((method, args) async {
+        if (method == 'dev_getDualCameraTelemetry') return null;
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      final stats = await controller.devGetDualCameraTelemetry();
+      expect(stats, isEmpty);
+    });
+
+    test('DCT-4  devGetDualCameraTelemetry returns empty map on PlatformException',
+        () async {
+      _setMockHandler((method, args) async {
+        if (method == 'dev_getDualCameraTelemetry') {
+          throw PlatformException(code: 'NO_DEV_NODE');
+        }
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      final stats = await controller.devGetDualCameraTelemetry();
+      expect(stats, isEmpty,
+          reason: 'PlatformException must be swallowed and return empty map');
+    });
+
+    test('DCT-5  devGetDualCameraTelemetry throws StateError after dispose',
+        () async {
+      controller.dispose();
+      await expectLater(
+        controller.devGetDualCameraTelemetry(),
+        throwsA(isA<StateError>()),
+      );
+    });
+  });
+
+  group('VGEditorController — devResetDualCameraTelemetry() [Phase 7.x-N]', () {
+    late VGEditorController controller;
+    final List<String> calledMethods = [];
+
+    setUp(() {
+      calledMethods.clear();
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+      controller = VGEditorController(initialDraft: _twoClipDraft());
+    });
+
+    tearDown(() => controller.dispose());
+
+    test('DCT-6  devResetDualCameraTelemetry invokes correct channel method',
+        () async {
+      calledMethods.clear();
+      await controller.devResetDualCameraTelemetry();
+      expect(calledMethods, contains('dev_resetDualCameraTelemetry'));
+      expect(calledMethods, isNot(contains('dev_getDualCameraTelemetry')));
+    });
+
+    test('DCT-7  devResetDualCameraTelemetry completes without error on PlatformException',
+        () async {
+      _setMockHandler((method, args) async {
+        if (method == 'dev_resetDualCameraTelemetry') {
+          throw PlatformException(code: 'NO_DEV_NODE');
+        }
+        if (method == 'disposeTimeline') return null;
+        return null;
+      });
+
+      await expectLater(
+        controller.devResetDualCameraTelemetry(),
+        completes,
+        reason: 'PlatformException must be silently swallowed',
+      );
+    });
+
+    test('DCT-8  devResetDualCameraTelemetry throws StateError after dispose',
+        () async {
+      controller.dispose();
+      await expectLater(
+        controller.devResetDualCameraTelemetry(),
+        throwsA(isA<StateError>()),
+      );
+    });
+  });
 }
 
