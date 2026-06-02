@@ -922,7 +922,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     super.dispose();
   }
 
-  // ── Phase 7.x-C: DEV dual-camera descriptor smoke ─────────────────────────
+  // ── Phase 7.x-C / 7.x-E: DEV dual-camera routes ─────────────────────────
 
   /// **DEV-only.** Validates that a [VGDualCameraDescriptor] can be
   /// deserialised correctly by the native [VGDualCameraCompositorNode].
@@ -958,6 +958,77 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
       {'descriptor': descriptor.toMap()},
     );
     return raw ?? const {};
+  }
+
+  // ── Phase 7.x-E: DEV dual-camera texture mount ────────────────────────────
+
+  /// **DEV-only.** Mounts [VGDualCameraCompositorNode] in the generic runtime
+  /// (Phase 7.x-D) and returns a Flutter texture ID.
+  ///
+  /// Invokes `dev_createDualCameraTexture`. The native side:
+  ///   1. Instantiates [VGDualCameraCompositorNode] from [descriptor].
+  ///   2. Creates a [VanguardGraphRuntime] isolated from the session registry.
+  ///   3. Calls `prepareTimeline(sourceNode:)` to register a Flutter texture.
+  ///   4. Returns the live textureId.
+  ///
+  /// The node returns `VGFrameStatusSkipped` for every frame — blank/transparent
+  /// output is expected. This proves the generic runtime can host the node without
+  /// crashing or leaking resources.
+  ///
+  /// On success, returns a map containing at minimum:
+  /// ```json
+  /// { "ok": true, "textureId": 42, "nodeClass": "VGDualCameraCompositorNode",
+  ///   "layoutMode": "pip",
+  ///   "primaryClipId": "...", "secondaryClipId": "..." }
+  /// ```
+  ///
+  /// [width] and [height] are forwarded as hints to native (optional).
+  ///
+  /// Does NOT:
+  ///   - modify the active draft or timeline
+  ///   - create an AVAssetReader
+  ///   - render or composite any frames
+  ///   - touch camera/session code
+  ///   - affect the normal timeline runtime
+  ///
+  /// Throws [PlatformException] with code `DUAL_CAMERA_TEXTURE_CREATE_FAILED`
+  /// on native failure.
+  ///
+  /// Throws [StateError] if [dispose] has been called.
+  Future<Map<String, Object?>> devCreateDualCameraTexture(
+    VGDualCameraDescriptor descriptor, {
+    int? width,
+    int? height,
+  }) async {
+    _assertNotDisposed();
+    final payload = <String, Object?>{
+      'descriptor': descriptor.toMap(),
+      if (width != null) 'width': width,
+      if (height != null) 'height': height,
+    };
+    final raw = await _channel.invokeMapMethod<String, Object?>(
+      'dev_createDualCameraTexture',
+      payload,
+    );
+    return raw ?? const {};
+  }
+
+  /// **DEV-only.** Invalidates and releases the DEV dual-camera runtime mounted
+  /// by [devCreateDualCameraTexture].
+  ///
+  /// Invokes `dev_disposeDualCameraTexture`. No-op if no DEV dual-camera runtime
+  /// is currently mounted. Swallows [PlatformException] (best-effort).
+  ///
+  /// Does NOT affect the normal timeline runtime or session registry.
+  ///
+  /// Throws [StateError] if [dispose] has been called.
+  Future<void> devDisposeDualCameraTexture() async {
+    _assertNotDisposed();
+    try {
+      await _channel.invokeMethod<void>('dev_disposeDualCameraTexture');
+    } on PlatformException catch (_) {
+      // Best-effort — native may already be gone.
+    }
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────

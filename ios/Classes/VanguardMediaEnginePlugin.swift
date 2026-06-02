@@ -130,6 +130,14 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     var _timelineRuntime: VanguardGraphRuntime?
     #endif
 
+    // Phase 7.x-E: DEV-only runtime for dual-camera texture mount smoke test.
+    // Isolated from VGSessionRegistry and _timelineRuntime.
+    // Created by dev_createDualCameraTexture; invalidated by dev_disposeDualCameraTexture.
+    // Gated behind VG_USE_V2_GRAPH — nil when VG_USE_V2_GRAPH=0.
+    #if VG_USE_V2_GRAPH
+    private var _devDualCameraRuntime: VanguardGraphRuntime?
+    #endif
+
     // Phase 2 Step 6: session registry is the unconditional playback path.
     // All createTexture / play / pause / seekTo / dispose calls route here.
     // Camera and export continue to use `renderers` exclusively.
@@ -3384,6 +3392,106 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                                     message: err.localizedDescription,
                                     details: details))
             }
+
+        // ── Phase 7.x-E: DEV dual-camera texture mount route ─────────────────────
+        // Mounts VGDualCameraCompositorNode in the generic runtime (Phase 7.x-D)
+        // and returns a live Flutter textureId.
+        //
+        // Constraints:
+        //   - DEV-only. The node returns VGFrameStatusSkipped — blank output expected.
+        //   - Does NOT decode AVAssetReader, render PiP, touch export, or camera code.
+        //   - Isolated from VGSessionRegistry and _timelineRuntime.
+        //   - Any previously mounted DEV dual-camera runtime is safely invalidated first.
+        #if VG_USE_V2_GRAPH
+        case "dev_createDualCameraTexture":
+            guard let descriptorMap = args?["descriptor"] as? [String: Any] else {
+                result(FlutterError(code: "DUAL_CAMERA_TEXTURE_CREATE_FAILED",
+                                    message: "dev_createDualCameraTexture: missing or non-map 'descriptor' argument",
+                                    details: nil))
+                return
+            }
+
+            // Build port list matching VGDualCameraCompositorNode.declaredPorts.
+            let videoOutPort = VGMediaPort.outputPort("video_out", mediaType: .video)
+
+            // Instantiate the compositor node from the Dart descriptor map.
+            let dualCameraNode: VGDualCameraCompositorNode
+            do {
+                dualCameraNode = try VGDualCameraCompositorNode(
+                    nodeId:     "dev_dual_camera_texture",
+                    parameters: descriptorMap,
+                    ports:      [videoOutPort]
+                )
+            } catch let err as NSError {
+                NSLog("[VanguardPlugin][7.x-E] dev_createDualCameraTexture: node init failed: %@",
+                      err.localizedDescription)
+                result(FlutterError(code: "DUAL_CAMERA_TEXTURE_CREATE_FAILED",
+                                    message: err.localizedDescription,
+                                    details: ["domain": err.domain, "code": err.code]))
+                return
+            }
+
+            // Invalidate any existing DEV dual-camera runtime before creating a new one.
+            if let existing = _devDualCameraRuntime {
+                NSLog("[VanguardPlugin][7.x-E] dev_createDualCameraTexture: invalidating previous DEV runtime")
+                existing.invalidate()
+                _devDualCameraRuntime = nil
+            }
+
+            // Create a new runtime isolated from VGSessionRegistry and _timelineRuntime.
+            let devRuntime = VanguardGraphRuntime(
+                textureRegistry: registrar.textures(),
+                methodChannel:   channel
+            )
+            self._devDualCameraRuntime = devRuntime
+
+            // Prepare via the Phase 7.x-D generic source node API.
+            // The node returns VGFrameStatusSkipped — blank/transparent output expected.
+            // Completion fires on main queue (per prepareTimeline API contract).
+            devRuntime.prepareTimeline(sourceNode: dualCameraNode) { [weak self] textureId, err in
+                guard let self else { return }
+
+                if let err = err {
+                    NSLog("[VanguardPlugin][7.x-E] dev_createDualCameraTexture: prepare failed: %@",
+                          err.localizedDescription)
+                    // Invalidate the partially-prepared runtime to prevent leaks.
+                    self._devDualCameraRuntime?.invalidate()
+                    self._devDualCameraRuntime = nil
+                    result(FlutterError(code: "DUAL_CAMERA_TEXTURE_CREATE_FAILED",
+                                        message: err.localizedDescription,
+                                        details: nil))
+                    return
+                }
+
+                NSLog("[VanguardPlugin][7.x-E] dev_createDualCameraTexture: READY " +
+                      "textureId=%lld primary=%@ secondary=%@",
+                      textureId,
+                      dualCameraNode.primaryClip.clipId,
+                      dualCameraNode.secondaryClip.clipId)
+
+                // Return textureId and descriptor metadata to the Dart harness.
+                // ok:true signals mount success; blank output is expected.
+                result([
+                    "ok":              true,
+                    "textureId":       textureId,
+                    "nodeClass":       dualCameraNode.nodeClass,
+                    "layoutMode":      "pip",
+                    "primaryClipId":   dualCameraNode.primaryClip.clipId,
+                    "secondaryClipId": dualCameraNode.secondaryClip.clipId,
+                ] as [String: Any])
+            }
+
+        // ── Phase 7.x-E: DEV dual-camera texture disposal ────────────────────────
+        // Invalidates and releases the DEV dual-camera runtime.
+        // No-op if no DEV runtime is mounted.
+        case "dev_disposeDualCameraTexture":
+            if let devRuntime = _devDualCameraRuntime {
+                NSLog("[VanguardPlugin][7.x-E] dev_disposeDualCameraTexture: invalidating DEV dual-camera runtime")
+                devRuntime.invalidate()
+                _devDualCameraRuntime = nil
+            }
+            result(["ok": true])
+        #endif // VG_USE_V2_GRAPH
 
         default:
             result(FlutterMethodNotImplemented)

@@ -81,6 +81,12 @@ class _VanguardManualTestPlaygroundState
   // ── Phase 7.x-C: DEV dual-camera descriptor smoke result ─────────────────
   Map<String, Object?>? _dualCamSmokeResult;
 
+  // ── Phase 7.x-E: DEV dual-camera texture mount state ────────────────────
+  // Stores the mounted textureId or null if not yet mounted.
+  int? _devDualCamTextureId;
+  Map<String, Object?>? _devDualCamMountResult;
+  bool _devDualCamMounting = false;
+
   // ── Phase 7.18B2: Cache Metrics HUD state ──────────────────────────────────
   Map<String, int> _cacheStats = const {};
   bool _fetchingStats = false;
@@ -724,6 +730,105 @@ class _VanguardManualTestPlaygroundState
     }
   }
 
+  // Phase 7.x-E: DEV dual-camera texture mount — mounts VGDualCameraCompositorNode
+  // via the generic runtime and returns a live Flutter textureId.
+  // The node returns skipped frames — blank output is expected.
+  Future<void> _mountDualCamTexture() async {
+    final c = _controller;
+    final pathA = _tempPathA;
+    final pathB = _tempPathB;
+    if (c == null || pathA == null || pathB == null || _devDualCamMounting) {
+      setState(() => _status = 'Dual-cam mount: assets not ready. Tap Rebuild first.');
+      return;
+    }
+
+    setState(() {
+      _devDualCamMounting = true;
+      _devDualCamMountResult = null;
+      _devDualCamTextureId = null;
+      _status = 'Dual-cam texture mount: preparing runtime...';
+    });
+
+    final primaryClip = VGClipDescriptor(
+      id: 'mount-primary',
+      sourcePath: pathA,
+      mediaKind: VGMediaKind.video,
+      durationSeconds: 5.06,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 5.06,
+    );
+    final secondaryClip = VGClipDescriptor(
+      id: 'mount-secondary',
+      sourcePath: pathB,
+      mediaKind: VGMediaKind.video,
+      durationSeconds: 5.56,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 5.56,
+    );
+    final descriptor = VGDualCameraDescriptor(
+      primaryClip: primaryClip,
+      secondaryClip: secondaryClip,
+      layoutMode: VGDualCameraLayoutMode.pip,
+      pipLayout: const VGPiPLayoutDescriptor(
+        anchor: VGPiPAnchor.bottomRight,
+        widthFraction: 0.35,
+        cornerRadius: 24.0,
+      ),
+    );
+
+    try {
+      final result = await c.devCreateDualCameraTexture(
+        descriptor,
+        width: 1280,
+        height: 720,
+      );
+      final tid = (result['textureId'] as num?)?.toInt();
+      if (mounted) {
+        setState(() {
+          _devDualCamMountResult = result;
+          _devDualCamTextureId = tid;
+          _devDualCamMounting = false;
+          _status = tid != null
+              ? 'Dual-cam DEV texture mounted — blank output expected '
+                  '(textureId=$tid)'
+              : 'Dual-cam mount: no textureId returned';
+        });
+      }
+    } on PlatformException catch (e) {
+      if (mounted) {
+        setState(() {
+          _devDualCamMountResult = {'ok': false, 'error': e.code, 'message': e.message};
+          _devDualCamTextureId = null;
+          _devDualCamMounting = false;
+          _status = 'Dual-cam mount FAILED [${e.code}]: ${e.message}';
+        });
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _devDualCamMounting = false;
+          _status = 'Dual-cam mount error: $e';
+        });
+      }
+    }
+  }
+
+  // Phase 7.x-E: Dispose the DEV dual-camera texture runtime.
+  Future<void> _disposeDualCamTexture() async {
+    final c = _controller;
+    if (c == null) return;
+    try {
+      await c.devDisposeDualCameraTexture();
+    } catch (_) {}
+    if (mounted) {
+      setState(() {
+        _devDualCamTextureId = null;
+        _devDualCamMountResult = null;
+        _status = 'Dual-cam DEV texture disposed.';
+      });
+    }
+  }
+
   Future<void> _export() async {
     final c = _controller;
     if (c == null || !c.isReady || _exporting) return;
@@ -928,6 +1033,10 @@ class _VanguardManualTestPlaygroundState
 
                         // ── Phase 7.x-C: DEV Dual-Camera Smoke ───────────────────
                         _buildDualCamSmokeCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.x-E: DEV Dual-Camera Texture Mount ───────────
+                        _buildDualCamTextureMountCard(),
                         const SizedBox(height: 12),
 
                         // ── Phase 7.18B2: Cache Metrics HUD ─────────────────────
@@ -2254,6 +2363,146 @@ class _VanguardManualTestPlaygroundState
                   fontSize: 12, fontWeight: FontWeight.w600),
             ),
           ),
+        ],
+      ),
+    );
+  }
+
+  // ── Phase 7.x-E: DEV dual-camera texture mount card ────────────────────────────
+  Widget _buildDualCamTextureMountCard() {
+    final ready = _controller != null &&
+        _tempPathA != null &&
+        _tempPathB != null &&
+        !_devDualCamMounting;
+    final mountOk = _devDualCamMountResult?['ok'] == true;
+    final textureId = _devDualCamTextureId;
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: mountOk
+              ? const Color(0xFF9B59B6).withValues(alpha: 0.7)
+              : const Color(0xFF9B59B6).withValues(alpha: 0.25),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Header
+          Row(
+            children: [
+              const Icon(Icons.videocam_outlined,
+                  color: Color(0xFF9B59B6), size: 14),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  'PHASE 7.x-E — DUAL-CAMERA TEXTURE MOUNT (DEV ONLY)',
+                  style: TextStyle(
+                    color: Color(0xFF9B59B6),
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.0,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Mounts VGDualCameraCompositorNode in the generic runtime. '
+            'Node returns skipped frames — blank output expected. '
+            'Does NOT decode, render, or touch camera/export code.',
+            style: TextStyle(color: Colors.white38, fontSize: 10),
+          ),
+          const SizedBox(height: 10),
+
+          // Mount result rows
+          if (_devDualCamMountResult != null) ...[
+            _buildStatRow('ok',
+                '${_devDualCamMountResult!["ok"]}',
+                mountOk ? const Color(0xFF9B59B6) : Colors.redAccent),
+            if (mountOk) ...[
+              _buildStatRow('textureId',
+                  '${_devDualCamMountResult!["textureId"]}', Colors.white70),
+              _buildStatRow('nodeClass',
+                  '${_devDualCamMountResult!["nodeClass"]}', Colors.white54),
+              _buildStatRow('layoutMode',
+                  '${_devDualCamMountResult!["layoutMode"]}', Colors.white54),
+              _buildStatRow('primaryClipId',
+                  '${_devDualCamMountResult!["primaryClipId"]}', Colors.white54),
+              _buildStatRow('secondaryClipId',
+                  '${_devDualCamMountResult!["secondaryClipId"]}', Colors.white54),
+            ] else ...[
+              _buildStatRow('error',
+                  '${_devDualCamMountResult!["error"]}', Colors.redAccent),
+            ],
+            const SizedBox(height: 8),
+          ],
+
+          // Texture preview — blank/transparent expected
+          if (textureId != null) ...[
+            const Text(
+              'Texture preview (blank expected):',
+              style: TextStyle(color: Colors.white38, fontSize: 10),
+            ),
+            const SizedBox(height: 6),
+            Container(
+              height: 120,
+              decoration: BoxDecoration(
+                color: Colors.black,
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: const Color(0xFF9B59B6).withValues(alpha: 0.4)),
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(6),
+                child: Texture(textureId: textureId),
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+
+          // Mount button
+          ElevatedButton.icon(
+            onPressed: ready ? _mountDualCamTexture : null,
+            icon: _devDualCamMounting
+                ? const SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: Colors.white70),
+                  )
+                : const Icon(Icons.play_circle_outline, size: 14),
+            label: const Text('Mount DEV Dual-Cam Texture (Blank Expected)'),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF9B59B6),
+              foregroundColor: Colors.white,
+              disabledBackgroundColor: Colors.white10,
+              disabledForegroundColor: Colors.white24,
+              padding: const EdgeInsets.symmetric(vertical: 10),
+              textStyle:
+                  const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+            ),
+          ),
+
+          // Dispose button (only shown when a texture is mounted)
+          if (textureId != null) ...[
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: _disposeDualCamTexture,
+              icon: const Icon(Icons.stop_circle_outlined, size: 14),
+              label: const Text('Dispose DEV Dual-Cam Texture'),
+              style: OutlinedButton.styleFrom(
+                foregroundColor: Colors.redAccent,
+                side: const BorderSide(color: Colors.redAccent, width: 0.8),
+                padding: const EdgeInsets.symmetric(vertical: 10),
+                textStyle:
+                    const TextStyle(fontSize: 12, fontWeight: FontWeight.w500),
+              ),
+            ),
+          ],
         ],
       ),
     );

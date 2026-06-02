@@ -316,4 +316,258 @@ void main() {
       );
     });
   });
+
+  // ── Phase 7.x-E: devCreateDualCameraTexture / devDisposeDualCameraTexture ──
+
+  group('VGEditorController.devCreateDualCameraTexture (Phase 7.x-E)', () {
+    const channel = MethodChannel('vanguard_media_engine');
+
+    final clipA = VGClipDescriptor(
+      id: 'clip-a',
+      sourcePath: '/path/to/a.mp4',
+      mediaKind: VGMediaKind.video,
+      startTimeSeconds: 0.0,
+      durationSeconds: 10.0,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 10.0,
+      speed: 1.0,
+    );
+
+    final clipB = VGClipDescriptor(
+      id: 'clip-b',
+      sourcePath: '/path/to/b.mp4',
+      mediaKind: VGMediaKind.video,
+      startTimeSeconds: 0.0,
+      durationSeconds: 10.0,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 10.0,
+      speed: 1.0,
+    );
+
+    late VGEditorDraft minimalDraft;
+
+    setUp(() {
+      minimalDraft = VGEditorDraft(
+        id: 'test-draft',
+        clips: [clipA],
+      );
+    });
+
+    String? capturedMethod;
+    Map<Object?, Object?>? capturedArgs;
+
+    void setChannelHandler(Map<String, Object?> returnValue) {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (MethodCall call) async {
+        capturedMethod = call.method;
+        capturedArgs = call.arguments is Map
+            ? Map<Object?, Object?>.from(call.arguments as Map)
+            : null;
+        return returnValue;
+      });
+    }
+
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null);
+      capturedMethod = null;
+      capturedArgs = null;
+    });
+
+    test('15. devCreateDualCameraTexture invokes dev_createDualCameraTexture', () async {
+      setChannelHandler({'ok': true, 'textureId': 77});
+
+      final controller = VGEditorController(
+        initialDraft: minimalDraft,
+        channel: channel,
+      );
+
+      final descriptor = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+      );
+
+      await controller.devCreateDualCameraTexture(descriptor);
+
+      expect(capturedMethod, 'dev_createDualCameraTexture');
+
+      controller.dispose();
+    });
+
+    test('16. payload contains descriptor key', () async {
+      setChannelHandler({'ok': true, 'textureId': 77});
+
+      final controller = VGEditorController(
+        initialDraft: minimalDraft,
+        channel: channel,
+      );
+
+      final descriptor = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+        layoutMode: VGDualCameraLayoutMode.pip,
+        pipLayout: const VGPiPLayoutDescriptor(anchor: VGPiPAnchor.topLeft),
+      );
+
+      await controller.devCreateDualCameraTexture(descriptor);
+
+      expect(capturedArgs, isNotNull);
+      final descriptorPayload = capturedArgs!['descriptor'] as Map?;
+      expect(descriptorPayload, isNotNull);
+      expect(descriptorPayload!.containsKey('primaryClip'), isTrue);
+      expect(descriptorPayload.containsKey('secondaryClip'), isTrue);
+      expect(descriptorPayload.containsKey('layoutMode'), isTrue);
+      expect(descriptorPayload['layoutMode'], 'pip');
+
+      // No camera/MultiCam fields in payload.
+      final payloadStr = descriptorPayload.toString();
+      expect(payloadStr.contains('MultiCam'), isFalse);
+      expect(payloadStr.contains('AVCapture'), isFalse);
+
+      controller.dispose();
+    });
+
+    test('17. width and height forwarded only when provided', () async {
+      setChannelHandler({'ok': true, 'textureId': 77});
+
+      final controller = VGEditorController(
+        initialDraft: minimalDraft,
+        channel: channel,
+      );
+
+      final descriptor = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+      );
+
+      // Without width/height — keys must be absent.
+      await controller.devCreateDualCameraTexture(descriptor);
+      expect(capturedArgs?.containsKey('width'), isFalse);
+      expect(capturedArgs?.containsKey('height'), isFalse);
+
+      // With width/height — keys must be present.
+      await controller.devCreateDualCameraTexture(descriptor, width: 1280, height: 720);
+      expect(capturedArgs?['width'], 1280);
+      expect(capturedArgs?['height'], 720);
+
+      controller.dispose();
+    });
+
+    test('18. return map passes through textureId', () async {
+      final nativeResult = <String, Object?>{
+        'ok': true,
+        'textureId': 99,
+        'nodeClass': 'VGDualCameraCompositorNode',
+        'layoutMode': 'pip',
+        'primaryClipId': 'clip-a',
+        'secondaryClipId': 'clip-b',
+      };
+      setChannelHandler(nativeResult);
+
+      final controller = VGEditorController(
+        initialDraft: minimalDraft,
+        channel: channel,
+      );
+
+      final descriptor = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+      );
+
+      final result = await controller.devCreateDualCameraTexture(descriptor);
+
+      expect(result['textureId'], 99);
+      expect(result['ok'], isTrue);
+      expect(result['nodeClass'], 'VGDualCameraCompositorNode');
+
+      controller.dispose();
+    });
+
+    test('19. devCreateDualCameraTexture does NOT invoke updateTimeline or createTimelineTexture',
+        () async {
+      final called = <String>[];
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (MethodCall call) async {
+        called.add(call.method);
+        return {'ok': true, 'textureId': 77};
+      });
+
+      final controller = VGEditorController(
+        initialDraft: minimalDraft,
+        channel: channel,
+      );
+
+      final descriptor = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+      );
+
+      await controller.devCreateDualCameraTexture(descriptor);
+
+      expect(called, isNot(contains('updateTimeline')));
+      expect(called, isNot(contains('createTimelineTexture')));
+
+      controller.dispose();
+    });
+
+    test('20. devDisposeDualCameraTexture invokes dev_disposeDualCameraTexture', () async {
+      setChannelHandler({'ok': true});
+
+      final controller = VGEditorController(
+        initialDraft: minimalDraft,
+        channel: channel,
+      );
+
+      await controller.devDisposeDualCameraTexture();
+
+      expect(capturedMethod, 'dev_disposeDualCameraTexture');
+
+      controller.dispose();
+    });
+
+    test('21. devCreateDualCameraTexture throws StateError after dispose', () async {
+      setChannelHandler({'ok': true, 'textureId': 77});
+
+      final controller = VGEditorController(
+        initialDraft: minimalDraft,
+        channel: channel,
+      );
+      controller.dispose();
+
+      final descriptor = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+      );
+
+      expect(
+        () => controller.devCreateDualCameraTexture(descriptor),
+        throwsA(isA<StateError>()),
+      );
+    });
+
+    test('22. no camera/MultiCam fields in serialized descriptor payload', () async {
+      setChannelHandler({'ok': true, 'textureId': 77});
+
+      final controller = VGEditorController(
+        initialDraft: minimalDraft,
+        channel: channel,
+      );
+
+      final descriptor = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+      );
+
+      await controller.devCreateDualCameraTexture(descriptor);
+
+      final descriptorPayload = capturedArgs!['descriptor'] as Map?;
+      expect(descriptorPayload, isNotNull);
+      final payloadStr = descriptorPayload.toString();
+      expect(payloadStr.contains('MultiCam'), isFalse);
+      expect(payloadStr.contains('AVCapture'), isFalse);
+      expect(payloadStr.contains('AVCaptureMultiCamSession'), isFalse);
+
+      controller.dispose();
+    });
+  });
 }
