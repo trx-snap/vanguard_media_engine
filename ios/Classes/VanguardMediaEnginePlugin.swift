@@ -272,7 +272,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             methodChannel:   channel)
         self._timelineRuntime = timelineRuntime
 
-        timelineRuntime.prepareTimeline(compositorNode: compositor) { textureId, err in
+        timelineRuntime.prepareTimeline(sourceNode: compositor) { textureId, err in
             if let err = err {
                 NSLog("[VanguardPlugin][7.5C] prepareTimeline failed: %@",
                       err.localizedDescription)
@@ -331,7 +331,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             methodChannel:   channel)
         self._timelineRuntime = timelineRuntime
 
-        timelineRuntime.prepareTimeline(compositorNode: compositor) { textureId, err in
+        timelineRuntime.prepareTimeline(sourceNode: compositor) { textureId, err in
             if let err = err {
                 NSLog("[VanguardPlugin][7.5D] prepareTimeline failed: %@",
                       err.localizedDescription)

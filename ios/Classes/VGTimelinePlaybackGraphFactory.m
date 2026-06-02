@@ -29,7 +29,12 @@
 
 #import "VGTimelinePlaybackGraphFactory.h"
 
-// ─── Stage 7.5A compositor ───────────────────────────────────────────────────
+// ─── Stage 7.5A compositor (still imported for nodeId/nodeClass/nodeRole/declaredPorts
+// access via the VGNode protocol) ——————————————————————————————————————
+// Retained so VGGraphNodeDescriptor can be constructed from the VGNode protocol
+// accessors (nodeId, nodeClass, nodeRole, declaredPorts). The factory no longer
+// requires the concrete VGTimelineCompositorNode type — it works with any
+// id<VGSourceNode> that also conforms to id<VGNode>.
 #import "VGTimelineCompositorNode.h"
 
 // ─── Renderer sink adapter (Phase 3) ─────────────────────────────────────────
@@ -73,7 +78,7 @@ static os_log_t sFactoryLog;
 // ─── Public factory method ────────────────────────────────────────────────────
 
 + (nullable NSDictionary<NSString *, id> *)
-    buildTimelineGraphWithCompositorNode:(VGTimelineCompositorNode *)compositorNode
+    buildTimelineGraphWithCompositorNode:(id<VGSourceNode>)compositorNode
                                 renderer:(VanguardMetalRenderer *)renderer
                                    error:(NSError * _Nullable * _Nullable)outError
 {

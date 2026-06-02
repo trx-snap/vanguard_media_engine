@@ -65,11 +65,11 @@
 #pragma once
 
 #import <Foundation/Foundation.h>
+#import <UMF/VGSourceNode.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
 // Forward declarations — full types imported in .m only.
-@class VGTimelineCompositorNode;
 @class VanguardMetalRenderer;
 
 // ─── VGTimelinePlaybackGraphFactory ──────────────────────────────────────────
@@ -99,19 +99,20 @@ NS_ASSUME_NONNULL_BEGIN
 ///   (f) Validate via VGGraphValidator (patched NoSource check).
 ///   (g) Return result dictionary.
 ///
-/// @param compositorNode  A fully initialized VGTimelineCompositorNode.
-///                        This node is V2-native and does NOT require an adapter.
-/// @param renderer        The VanguardMetalRenderer instance to use as the
-///                        frame sink. Stored as weak in VGRendererSinkAdapter.
-/// @param outError        On failure, set to a descriptive NSError.
-///                        On success, set to nil.
+/// @param sourceNode   A fully initialized id<VGSourceNode>.
+///                     This node must be V2-native (pull-mode, pullFrame:)
+///                     and does NOT require an adapter wrapper.
+/// @param renderer     The VanguardMetalRenderer instance to use as the
+///                     frame sink. Stored as weak in VGRendererSinkAdapter.
+/// @param outError     On failure, set to a descriptive NSError.
+///                     On success, set to nil.
 /// @return A dictionary on success, or nil on validation failure:
-///   @"compositorNode" — the VGTimelineCompositorNode (same as input)
+///   @"compositorNode" — the id<VGSourceNode> (same as input)
 ///   @"sinkAdapter"    — VGRendererSinkAdapter wrapping the renderer
 ///   @"descriptor"     — VGGraphDescriptor (validated)
 ///   @"nodes"          — NSDictionary<NSString *, id<VGNode>> nodeId → node
 + (nullable NSDictionary<NSString *, id> *)
-    buildTimelineGraphWithCompositorNode:(VGTimelineCompositorNode *)compositorNode
+    buildTimelineGraphWithCompositorNode:(id<VGSourceNode>)sourceNode
                                 renderer:(VanguardMetalRenderer *)renderer
                                    error:(NSError * _Nullable * _Nullable)outError;
 

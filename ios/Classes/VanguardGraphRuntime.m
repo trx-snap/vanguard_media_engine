@@ -48,6 +48,7 @@
 #import "VGRendererSinkAdapter.h"
 #import "VGTimelineCompositorNode.h"
 #import "VGTimelinePlaybackGraphFactory.h"
+#import <UMF/VGSourceNode.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UMF/VGFrameEnvelope.h>
 #import <UMF/VGFrameRequest.h>
@@ -133,10 +134,12 @@ static BOOL VGRIsImageURL(NSURL *url) {
 @property(nonatomic, strong, nullable) VGGraphSchedulerV2 *schedulerV2;
 @property(nonatomic, strong, nullable)
     VGGraphExecutionContext *executionContext;
-// Phase 7 Stage 7.5C: timeline pull-loop state.
-// All nil/zero unless prepareWithTimelineCompositorNode:completion: was used.
-@property(nonatomic, strong, nullable)
-    VGTimelineCompositorNode *timelineCompositor;
+// Phase 7 Stage 7.5C / Phase 7.x-D: timeline pull-loop state.
+// All nil/zero unless prepareWithSourceNode:completion: was used.
+// activeSourceNode: stores any id<VGSourceNode> (e.g. VGTimelineCompositorNode).
+// Timeline-specific properties (seek, cache) only act when activeSourceNode
+// is a VGTimelineCompositorNode (guarded by isKindOfClass: at each call site).
+@property(nonatomic, strong, nullable) id<VGSourceNode> activeSourceNode;
 @property(nonatomic, strong, nullable)
     VGRendererSinkAdapter *timelineSinkAdapter;
 @property(nonatomic, strong, nullable) CADisplayLink *timelineDisplayLink;
@@ -1740,13 +1743,15 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
 // ─── prepareWithTimelineCompositorNode:completion:
 // ────────────────────────────
 
-- (void)
-    prepareWithTimelineCompositorNode:(VGTimelineCompositorNode *)compositorNode
-                           completion:
-                               (void (^)(int64_t textureId,
-                                         NSError *_Nullable error))completion {
-  NSParameterAssert(compositorNode != nil);
+- (void)prepareWithSourceNode:(id<VGSourceNode>)sourceNode
+                   completion:(void (^)(int64_t textureId,
+                                       NSError *_Nullable error))completion {
+  NSParameterAssert(sourceNode != nil);
   NSParameterAssert(completion != nil);
+
+  // Rename incoming arg to compositorNode for local use, preserving all
+  // existing logic unchanged. activeSourceNode stores the generic reference.
+  id<VGSourceNode> compositorNode = sourceNode;
 
   dispatch_async(_prepareQueue, ^{
     // ── Guard ──────────────────────────────────────────────────────────
@@ -1907,7 +1912,7 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
 
     // ── 4. Store all timeline state ────────────────────────────────────
     self.renderer = renderer;
-    self.timelineCompositor = compositorNode;
+    self.activeSourceNode = compositorNode;
     self.timelineSinkAdapter = sinkAdapter;
     self.timelineGeneration = 0;
     self.timelineCurrentPTS = 0.0;
@@ -1922,7 +1927,7 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
     self.state = VGRuntimeStatePrepared;
 
     NSLog(@"[VanguardGraphRuntime][7.5C] timeline runtime prepared "
-           "textureId=%lld compositorId=%@",
+           "textureId=%lld nodeId=%@",
           (long long)tid, compositorNode.nodeId);
 
     // ── 5. Wire CADisplayLink on main thread ───────────────────────────
@@ -1982,9 +1987,9 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
   }
   self.timelineNeedsPreviewFrame = NO;
 
-  VGTimelineCompositorNode *compositor = self.timelineCompositor;
+  id<VGSourceNode> sourceNode = self.activeSourceNode;
   VGRendererSinkAdapter *sink = self.timelineSinkAdapter;
-  if (!compositor || !sink)
+  if (!sourceNode || !sink)
     return;
 
   // [7.5C] Advance PTS using wall-clock elapsed time anchored at play start.
@@ -2011,12 +2016,12 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
 
   // Pull on the serial pull queue so AVAssetReader.copyNextSampleBuffer
   // does not block the main thread.
-  __weak VGTimelineCompositorNode *weakCompositor = compositor;
+  __weak id<VGSourceNode> weakSourceNode = sourceNode;
   __weak VGRendererSinkAdapter *weakSink = sink;
   __weak typeof(self) weakSelf = self;
 
   dispatch_async(_VGTimelinePullQueue(), ^{
-    VGTimelineCompositorNode *c = weakCompositor;
+    id<VGSourceNode> c = weakSourceNode;
     VGRendererSinkAdapter *s = weakSink;
     if (!c || !s)
       return;
@@ -2122,11 +2127,12 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
       self.timelineBasePTS = self.timelineCurrentPTS;
     }
 
-    // Forward seek to compositor on pull queue to avoid reader rebuild on
-    // the main thread.
-    VGTimelineCompositorNode *compositor = self.timelineCompositor;
-    if (!compositor)
+    // Forward seek to compositor (timeline path) on pull queue.
+    // Guard: only VGTimelineCompositorNode supports seekTo:generation:.
+    id<VGSourceNode> node = self.activeSourceNode;
+    if (![node isKindOfClass:[VGTimelineCompositorNode class]])
       return;
+    VGTimelineCompositorNode *compositor = (VGTimelineCompositorNode *)node;
 
     CMTime seekTime = CMTimeMakeWithSeconds(seconds, 600);
     dispatch_async(_VGTimelinePullQueue(), ^{
@@ -2164,23 +2170,25 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
 }
 
 // ─── Phase 7.18B1: Cache metrics forwarding ───────────────────────────────
-// These methods forward to the private timelineCompositor without exposing it
-// in the public header. Both guard against nil compositor (no timeline active).
+// These methods forward to the active source node's timeline cache.
+// Both guard: only VGTimelineCompositorNode supports cacheStatistics/flushFrameCache.
+// For any other id<VGSourceNode> (e.g. future VGDualCameraCompositorNode),
+// these methods safely no-op or return empty defaults.
 
 - (NSDictionary<NSString *, NSNumber *> *)timelineCacheStatistics {
-  VGTimelineCompositorNode *compositor = self.timelineCompositor;
-  if (!compositor) {
+  id<VGSourceNode> node = self.activeSourceNode;
+  if (![node isKindOfClass:[VGTimelineCompositorNode class]]) {
     return @{};
   }
-  return [compositor cacheStatistics];
+  return [(VGTimelineCompositorNode *)node cacheStatistics];
 }
 
 - (void)flushTimelineCaches {
-  VGTimelineCompositorNode *compositor = self.timelineCompositor;
-  if (!compositor) {
+  id<VGSourceNode> node = self.activeSourceNode;
+  if (![node isKindOfClass:[VGTimelineCompositorNode class]]) {
     return;
   }
-  [compositor flushFrameCache];
+  [(VGTimelineCompositorNode *)node flushFrameCache];
 }
 
 #endif // VG_USE_V2_GRAPH
