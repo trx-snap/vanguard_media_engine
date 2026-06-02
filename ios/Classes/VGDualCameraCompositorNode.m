@@ -97,6 +97,9 @@
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 
+// ─── Phase 7.x-H: CoreImage for PiP compositing ───────────────────────────────
+#import <CoreImage/CoreImage.h>
+
 // ─── System ───────────────────────────────────────────────────────────────────
 #import <os/log.h>
 #include <stdatomic.h>
@@ -127,6 +130,24 @@ static NSDictionary *_VGDCCNOutputSettings(void) {
         (id)kCVPixelBufferMetalCompatibilityKey : @YES,
         (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
     };
+}
+
+// ─── Phase 7.x-H: Shared CIContext ───────────────────────────────────────────
+//
+// Lazily created once, reused across all frames.
+// Pattern mirrors VGTimelineCompositorNode._VGTCNSharedCIContext.
+// kCIContextWorkingColorSpace = NSNull disables color-space conversion,
+// matching the VanguardDualCameraCompositor.swift pattern and the existing
+// timeline compositor convention. Thread-safe via dispatch_once.
+static CIContext *_VGDCCNSharedCIContext(void) {
+    static CIContext *ctx = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        ctx = [CIContext contextWithOptions:@{
+            kCIContextWorkingColorSpace : [NSNull null],
+        }];
+    });
+    return ctx;
 }
 
 // ─── Private error factory ────────────────────────────────────────────────────
@@ -316,6 +337,14 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
 
     // Invalidation guard (atomic per VGNode contract).
     atomic_bool     _invalidated;
+
+    // Phase 7.x-H: composited output buffer (primary + secondary PiP).
+    // Retained +1 by this node. Released before each new compose, on seek,
+    // on invalidate, and in dealloc.
+    CVPixelBufferRef _compositedLastBuffer;
+
+    // One-time log guard: YES after first composited frame is generated.
+    BOOL _compositedFirstFrameLogged;
 }
 
 @synthesize primaryClip   = _primaryClip;
@@ -473,6 +502,10 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     _secondaryLastBuffer         = NULL;
     _secondaryEOSReached         = NO;
 
+    // Phase 7.x-H: composited buffer state.
+    _compositedLastBuffer       = NULL;
+    _compositedFirstFrameLogged = NO;
+
     // Phase 7.x-F (aspect ratio, Option B, timing fix):
     // Probe primaryRenderSize synchronously during init so dev_createDualCameraTexture
     // can read the correct display dimensions before the first async pullFrame: fires.
@@ -586,6 +619,11 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     if (_secondaryLastBuffer) {
         CVPixelBufferRelease(_secondaryLastBuffer);
         _secondaryLastBuffer = NULL;
+    }
+    // Phase 7.x-H: Release composited buffer.
+    if (_compositedLastBuffer) {
+        CVPixelBufferRelease(_compositedLastBuffer);
+        _compositedLastBuffer = NULL;
     }
 }
 
@@ -952,6 +990,32 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
             }
         }
 
+        // Phase 7.x-H: Attempt PiP composition if secondary buffer is available.
+        // Fallback to primary-only envelope if compositing fails or secondary unavailable.
+        if (_secondaryLastBuffer != NULL) {
+            CVPixelBufferRef composited = [self _compositeWithPrimary:cachedBuf
+                                                           secondary:_secondaryLastBuffer];
+            if (composited != NULL) {
+                // Release old composited buffer before storing new one.
+                if (_compositedLastBuffer) {
+                    CVPixelBufferRelease(_compositedLastBuffer);
+                }
+                _compositedLastBuffer = composited; // node takes +1 from _composite
+
+                VGFrameEnvelope compEnvelope;
+                compEnvelope.pts        = request.requestedPTS;
+                compEnvelope.dts        = kCMTimeInvalid;
+                compEnvelope.duration   = CMTimeMakeWithSeconds(_primaryLastSampleDuration, 600);
+                compEnvelope.generation = currentGen;
+                compEnvelope.mediaType  = VGMediaTypeVideo;
+                compEnvelope.payload.videoBuffer = (void *)composited; // +0 in envelope
+                compEnvelope.metadata   = NULL;
+
+                return [VGFrameResult deliveredWithEnvelope:compEnvelope generation:currentGen];
+            }
+            // Compositing failed — fall through to primary-only delivery below.
+        }
+
         return [VGFrameResult deliveredWithEnvelope:envelope generation:currentGen];
     }
 
@@ -1087,6 +1151,32 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
                 }
             }
 
+            // Phase 7.x-H: Attempt PiP composition if secondary buffer is available.
+            // Fallback to primary-only envelope if compositing fails or secondary unavailable.
+            if (_secondaryLastBuffer != NULL) {
+                CVPixelBufferRef composited = [self _compositeWithPrimary:pixelBuffer
+                                                               secondary:_secondaryLastBuffer];
+                if (composited != NULL) {
+                    // Release old composited buffer before storing new one.
+                    if (_compositedLastBuffer) {
+                        CVPixelBufferRelease(_compositedLastBuffer);
+                    }
+                    _compositedLastBuffer = composited; // node takes +1 from _composite
+
+                    VGFrameEnvelope compEnvelope;
+                    compEnvelope.pts        = request.requestedPTS;
+                    compEnvelope.dts        = kCMTimeInvalid;
+                    compEnvelope.duration   = CMTimeMakeWithSeconds(sDur, 600);
+                    compEnvelope.generation = currentGen;
+                    compEnvelope.mediaType  = VGMediaTypeVideo;
+                    compEnvelope.payload.videoBuffer = (void *)composited; // +0 in envelope
+                    compEnvelope.metadata   = NULL;
+
+                    return [VGFrameResult deliveredWithEnvelope:compEnvelope generation:currentGen];
+                }
+                // Compositing failed — fall through to primary-only delivery below.
+            }
+
             return [VGFrameResult deliveredWithEnvelope:envelope generation:currentGen];
         }
 
@@ -1099,14 +1189,187 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     return [VGFrameResult skippedWithGeneration:request.generation];
 }
 
+// ─── Phase 7.x-H: Private — PiP CoreImage compositor ────────────────────────
+//
+// Composites secondaryBuf as a rectangular PiP inset over primaryBuf.
+// Uses PiP geometry from _pipLayout (parsed from Dart descriptor).
+//
+// CoreImage coordinate system is Y-up (origin at bottom-left):
+//   bottom anchors: margin from minY.
+//   top anchors:    margin from maxY (primaryHeight - pipH - margin from minY).
+//
+// Returns a new CVPixelBufferRef at +1 (caller owns). Caller must
+// CVPixelBufferRelease when done. Returns NULL on failure (logs error).
+
+- (CVPixelBufferRef)_compositeWithPrimary:(CVPixelBufferRef)primaryBuf
+                                secondary:(CVPixelBufferRef)secondaryBuf {
+    if (!primaryBuf || !secondaryBuf) {
+        return NULL;
+    }
+
+    // ── 1. Dimensions ───────────────────────────────────────────────────────
+    size_t primW = CVPixelBufferGetWidth(primaryBuf);
+    size_t primH = CVPixelBufferGetHeight(primaryBuf);
+    size_t secW  = CVPixelBufferGetWidth(secondaryBuf);
+    size_t secH  = CVPixelBufferGetHeight(secondaryBuf);
+
+    if (primW == 0 || primH == 0 || secW == 0 || secH == 0) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-H] _composite: degenerate buffer dimensions "
+              "prim=%zux%zu sec=%zux%zu — skipping composition.", primW, primH, secW, secH);
+        return NULL;
+    }
+
+    // ── 2. PiP geometry (spec: §5 of Phase 7.x-H requirement) ───────────────
+    VGPiPLayoutConfig pip = _pipLayout;
+    double wf = pip.widthFraction;
+    double mf = pip.marginFraction;
+
+    // Clamp widthFraction: must produce a non-zero, bounded PiP width.
+    if (wf < 0.01) { wf = 0.01; }
+    if (wf > 0.95) { wf = 0.95; }
+
+    double pipW = (double)primW * wf;
+    double pipH = (secH > 0 && secW > 0)
+                  ? pipW * (double)secH / (double)secW
+                  : pipW; // fallback: square
+    double margin = (double)primW * mf;
+
+    // Clamp: PiP must fit within primary bounds after margin.
+    // Maximum pipW such that pipW + 2*margin <= primW.
+    double maxPipW = (double)primW - 2.0 * margin;
+    if (maxPipW < 1.0) { maxPipW = 1.0; margin = 0.0; }
+    if (pipW > maxPipW) { pipW = maxPipW; }
+
+    // Recompute pipH after pipW clamp.
+    if (secW > 0) { pipH = pipW * (double)secH / (double)secW; }
+    if (pipH < 1.0) { pipH = 1.0; }
+
+    // Clamp pipH so PiP fits vertically.
+    double maxPipH = (double)primH - 2.0 * margin;
+    if (maxPipH < 1.0) { maxPipH = 1.0; }
+    if (pipH > maxPipH) {
+        pipH = maxPipH;
+        // Preserve aspect ratio: scale pipW down proportionally.
+        if (secH > 0) { pipW = pipH * (double)secW / (double)secH; }
+    }
+
+    // ── 3. Anchor → CIImage Y-up origin ────────────────────────────────────
+    // CIImage coordinate system: Y=0 at bottom, Y=primH at top.
+    // margin from the edge:
+    //   bottom anchors: pipOriginY = margin
+    //   top anchors:    pipOriginY = primH - pipH - margin
+    double pipOriginX = 0.0;
+    double pipOriginY = 0.0;
+
+    switch (pip.anchor) {
+        case VGPiPAnchorTopLeft:
+            pipOriginX = margin;
+            pipOriginY = (double)primH - pipH - margin;
+            break;
+        case VGPiPAnchorTopRight:
+            pipOriginX = (double)primW - pipW - margin;
+            pipOriginY = (double)primH - pipH - margin;
+            break;
+        case VGPiPAnchorBottomLeft:
+            pipOriginX = margin;
+            pipOriginY = margin;
+            break;
+        case VGPiPAnchorBottomRight:
+        default:
+            pipOriginX = (double)primW - pipW - margin;
+            pipOriginY = margin;
+            break;
+    }
+
+    // Clamp origin so PiP stays within primary bounds.
+    if (pipOriginX < 0.0) { pipOriginX = 0.0; }
+    if (pipOriginY < 0.0) { pipOriginY = 0.0; }
+    if (pipOriginX + pipW > (double)primW) { pipOriginX = (double)primW - pipW; }
+    if (pipOriginY + pipH > (double)primH) { pipOriginY = (double)primH - pipH; }
+
+    // ── 4. Build CIImages ────────────────────────────────────────────────────
+    CIImage *primaryCI  = [CIImage imageWithCVPixelBuffer:primaryBuf];
+    CIImage *secondaryCI = [CIImage imageWithCVPixelBuffer:secondaryBuf];
+
+    if (!primaryCI || !secondaryCI) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-H] _composite: CIImage creation failed.");
+        return NULL;
+    }
+
+    // ── 5. Scale secondary to PiP size ───────────────────────────────────────
+    // CIImage extent origin may be non-zero (CoreImage convention); normalize first.
+    // Use CGAffineTransform translation via -imageByApplyingTransform: (not CATransform3D).
+    CIImage *secNorm = secondaryCI;
+    CGPoint secOrigin = secNorm.extent.origin;
+    if (secOrigin.x != 0.0 || secOrigin.y != 0.0) {
+        CGAffineTransform normT = CGAffineTransformMakeTranslation(-secOrigin.x, -secOrigin.y);
+        secNorm = [secNorm imageByApplyingTransform:normT];
+    }
+
+    double scaleX = (secW > 0) ? pipW / (double)secW : 1.0;
+    double scaleY = (secH > 0) ? pipH / (double)secH : 1.0;
+    CGAffineTransform scaleT = CGAffineTransformMakeScale(scaleX, scaleY);
+    CIImage *secScaled = [secNorm imageByApplyingTransform:scaleT];
+
+    // ── 6. Translate secondary to PiP position ───────────────────────────────
+    CGAffineTransform translateT = CGAffineTransformMakeTranslation(pipOriginX, pipOriginY);
+    CIImage *secPositioned = [secScaled imageByApplyingTransform:translateT];
+
+    // ── 7. Composite: secondary over primary (Porter-Duff SourceOver) ────────
+    CIImage *composited = [secPositioned imageByCompositingOverImage:primaryCI];
+    if (!composited) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-H] _composite: imageByCompositingOverImage: returned nil.");
+        return NULL;
+    }
+
+    // ── 8. Create output CVPixelBuffer ───────────────────────────────────────
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey    : @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferMetalCompatibilityKey : @YES,
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    CVPixelBufferRef outputBuf = NULL;
+    CVReturn cvRet = CVPixelBufferCreate(
+        kCFAllocatorDefault,
+        primW, primH,
+        kCVPixelFormatType_32BGRA,
+        (__bridge CFDictionaryRef)attrs,
+        &outputBuf);
+
+    if (cvRet != kCVReturnSuccess || outputBuf == NULL) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-H] _composite: CVPixelBufferCreate failed (ret=%d).", cvRet);
+        return NULL;
+    }
+
+    // ── 9. Render CIImage into output buffer ─────────────────────────────────
+    CGRect renderBounds = CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH);
+    [_VGDCCNSharedCIContext() render:composited
+                      toCVPixelBuffer:outputBuf
+                                bounds:renderBounds
+                            colorSpace:nil];
+
+    // ── 10. One-time first-frame log ─────────────────────────────────────────
+    if (!_compositedFirstFrameLogged) {
+        _compositedFirstFrameLogged = YES;
+        NSLog(@"[VGDualCameraCompositorNode][7.x-H] first composited frame generated | "
+              "pipRect=(%.0f,%.0f,%.0f,%.0f) primSize=%zux%zu secSize=%zux%zu "
+              "anchor=%ld wf=%.3f mf=%.3f",
+              pipOriginX, pipOriginY, pipW, pipH,
+              primW, primH, secW, secH,
+              (long)pip.anchor, pip.widthFraction, pip.marginFraction);
+    }
+
+    return outputBuf; // Caller owns +1 from CVPixelBufferCreate
+}
+
 // ─── Phase 7.x-G: Private — advance secondary reader to cover requestedPTSSecs ─────────
 //
 // Called from pullFrame: after the primary frame is determined.
 // Drives the secondary AVAssetReader with the same sample-window reuse pacing
 // as the primary reader (RR-146 equivalent).
 //
-// The secondary buffer is never delivered to the renderer. It is retained by
-// this node (+1) and released on seek, invalidate, secondary EOS, and dealloc.
+// The secondary buffer is decoded and stored in _secondaryLastBuffer (+1).
+// In Phase 7.x-H it feeds the compositor. Released on seek/invalidate/EOS/dealloc.
 //
 // Returns: YES if a frame was decoded or reused. NO if secondary is exhausted
 // or an error occurred (caller marks _secondaryEOSReached = YES).
@@ -1481,6 +1744,15 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     if (_primaryLastBuffer) {
         CVPixelBufferRelease(_primaryLastBuffer);
         _primaryLastBuffer = NULL;
+    }
+
+    // Phase 7.x-H: Release composited buffer whenever primary resets.
+    // Both readers are always cleared together on seek/invalidate, so clearing
+    // here (rather than a separate helper) avoids delivering a stale composite
+    // that mixes old primary and new secondary after a seek.
+    if (_compositedLastBuffer) {
+        CVPixelBufferRelease(_compositedLastBuffer);
+        _compositedLastBuffer = NULL;
     }
 }
 
