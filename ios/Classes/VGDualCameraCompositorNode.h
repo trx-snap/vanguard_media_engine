@@ -76,6 +76,9 @@ NS_ASSUME_NONNULL_BEGIN
 typedef NS_ENUM(NSInteger, VGDualCameraLayoutMode) {
     /// Picture-in-Picture: secondary clip is rendered as a smaller inset over the primary.
     VGDualCameraLayoutModePiP = 0,
+    /// Split-Screen: primary on top half, secondary on bottom half (portrait split).
+    /// Phase 7.x-K.
+    VGDualCameraLayoutModeSplitScreen = 1,
 };
 
 // ─── VGPiPAnchor ─────────────────────────────────────────────────────────────
@@ -99,6 +102,13 @@ typedef struct {
     double      cornerRadius;   ///< Corner radius in points (>= 0.0).
     double      opacity;        ///< PiP opacity (0.0–1.0).
 } VGPiPLayoutConfig;
+
+// ─── VGSplitScreenLayoutConfig ───────────────────────────────────────────────
+/// Parsed split-screen layout configuration. Phase 7.x-K.
+/// splitRatio: fraction of canvas height for primary (top). Range 0.2–0.8.
+typedef struct {
+    double splitRatio; ///< Primary (top) height fraction. Default 0.5.
+} VGSplitScreenLayoutConfig;
 
 // ─── Error domain ────────────────────────────────────────────────────────────
 /// NSError domain for VGDualCameraCompositorNode initialization failures.
@@ -126,7 +136,7 @@ typedef NS_ENUM(NSInteger, VGDualCameraCompositorNodeErrorCode) {
     VGDualCameraCompositorNodeErrorDuplicateClipId       = 2004,
 
     /// The `layoutMode` value is not a recognized or supported mode.
-    /// Phase 7.x-B only supports `VGDualCameraLayoutModePiP` ("pip").
+    /// Phase 7.x-K now supports both "pip" and "splitScreen".
     VGDualCameraCompositorNodeErrorUnsupportedLayoutMode = 2005,
 };
 
@@ -190,6 +200,11 @@ typedef NS_ENUM(NSInteger, VGDualCameraCompositorNodeErrorCode) {
 /// Stored for consumption by the Phase 7.x-C compositor.
 @property (nonatomic, readonly) VGPiPLayoutConfig pipLayout;
 
+/// Phase 7.x-K: Split-screen layout configuration, parsed from parameters[@"splitLayout"].
+///
+/// Defaults to { splitRatio=0.5 } when the key is absent or invalid.
+@property (nonatomic, readonly) VGSplitScreenLayoutConfig splitLayout;
+
 /// Phase 7.x-F: Display-correct output dimensions of the primary clip.
 ///
 /// Computed synchronously during `initWithNodeId:parameters:ports:error:` by
@@ -225,7 +240,8 @@ typedef NS_ENUM(NSInteger, VGDualCameraCompositorNodeErrorCode) {
 ///
 /// @param nodeId      The nodeId for this node, matching the VGGraphNodeDescriptor.
 /// @param parameters  Dictionary containing primaryClip, secondaryClip,
-///                    layoutMode, and optional pipLayout keys.
+///                    layoutMode ("pip" or "splitScreen"), optional pipLayout,
+///                    and optional splitLayout keys.
 /// @param ports       Ports array from VGGraphNodeDescriptor (stored for
 ///                    declaredPorts; currently unused in 7.x-B skeleton).
 /// @param outError    On failure, set to a VGDualCameraCompositorNodeErrorDomain
@@ -236,7 +252,7 @@ typedef NS_ENUM(NSInteger, VGDualCameraCompositorNodeErrorCode) {
 ///   - secondaryClip is missing or fails VGClipDescriptor +fromDictionary:.
 ///   - primaryClip or secondaryClip fails -isValid.
 ///   - primaryClip.clipId equals secondaryClip.clipId.
-///   - layoutMode is not "pip".
+///   - layoutMode is not "pip" or "splitScreen".
 - (nullable instancetype)initWithNodeId:(NSString *)nodeId
                              parameters:(NSDictionary<NSString *, id> *)parameters
                                   ports:(NSArray<id> *)ports

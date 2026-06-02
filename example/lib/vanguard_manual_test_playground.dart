@@ -97,6 +97,10 @@ class _VanguardManualTestPlaygroundState
   double _pipCornerRadius = 0.0; // Phase 7.x-J: 0.0 = rectangular (7.x-H default)
   double _pipOpacity = 1.0;     // Phase 7.x-J: 1.0 = fully opaque (7.x-H default)
 
+  // ── Phase 7.x-K: DEV dual-camera layout mode + split-screen controls ───
+  VGDualCameraLayoutMode _dualCamLayoutMode = VGDualCameraLayoutMode.pip;
+  double _splitRatio = 0.5; // fraction of canvas height for primary (top)
+
   // ── Phase 7.18B2: Cache Metrics HUD state ──────────────────────────────────
   Map<String, int> _cacheStats = const {};
   bool _fetchingStats = false;
@@ -778,19 +782,31 @@ class _VanguardManualTestPlaygroundState
       trimStartSeconds: 0.0,
       trimEndSeconds: 5.56,
     );
-    // Phase 7.x-I/J: use state-driven layout controls
-    final descriptor = VGDualCameraDescriptor(
-      primaryClip: primaryClip,
-      secondaryClip: secondaryClip,
-      layoutMode: VGDualCameraLayoutMode.pip,
-      pipLayout: VGPiPLayoutDescriptor(
-        anchor: _pipAnchor,
-        widthFraction: _pipWidthFraction.clamp(0.05, 0.75),
-        marginFraction: _pipMarginFraction.clamp(0.0, 0.10),
-        cornerRadius: _pipCornerRadius.clamp(0.0, 80.0), // Phase 7.x-J
-        opacity: _pipOpacity.clamp(0.0, 1.0),            // Phase 7.x-J
-      ),
-    );
+    // Phase 7.x-I/J/K: use state-driven layout controls
+    final VGDualCameraDescriptor descriptor;
+    if (_dualCamLayoutMode == VGDualCameraLayoutMode.splitScreen) {
+      descriptor = VGDualCameraDescriptor(
+        primaryClip: primaryClip,
+        secondaryClip: secondaryClip,
+        layoutMode: VGDualCameraLayoutMode.splitScreen,
+        splitLayout: VGSplitScreenLayoutDescriptor(
+          splitRatio: _splitRatio.clamp(0.2, 0.8),
+        ),
+      );
+    } else {
+      descriptor = VGDualCameraDescriptor(
+        primaryClip: primaryClip,
+        secondaryClip: secondaryClip,
+        layoutMode: VGDualCameraLayoutMode.pip,
+        pipLayout: VGPiPLayoutDescriptor(
+          anchor: _pipAnchor,
+          widthFraction: _pipWidthFraction.clamp(0.05, 0.75),
+          marginFraction: _pipMarginFraction.clamp(0.0, 0.10),
+          cornerRadius: _pipCornerRadius.clamp(0.0, 80.0), // Phase 7.x-J
+          opacity: _pipOpacity.clamp(0.0, 1.0),            // Phase 7.x-J
+        ),
+      );
+    }
 
     try {
       final result = await c.devCreateDualCameraTexture(
@@ -848,19 +864,23 @@ class _VanguardManualTestPlaygroundState
   // Phase 7.x-I/J: Apply PiP layout — dispose the current texture (if any) then
   // remount with the current _pipAnchor / _pipWidthFraction / _pipMarginFraction /
   // _pipCornerRadius / _pipOpacity.
+  // Phase 7.x-K: also handles split-screen layout via _dualCamLayoutMode.
   // Button-driven: not triggered by slider ticks.
-  Future<void> _applyPiPLayout() async {
+  Future<void> _applyLayout() async {
     final c = _controller;
     final pathA = _tempPathA;
     final pathB = _tempPathB;
     if (c == null || pathA == null || pathB == null || _devDualCamMounting) {
       setState(() =>
-          _status = 'PiP layout apply: assets or controller not ready.');
+          _status = 'Layout apply: assets or controller not ready.');
       return;
     }
 
+    final modeLabel = _dualCamLayoutMode == VGDualCameraLayoutMode.splitScreen
+        ? 'Split-Screen'
+        : 'PiP';
     setState(() {
-      _status = 'Applying PiP layout — rebuilding DEV dual-cam texture...';
+      _status = 'Applying $modeLabel layout — rebuilding DEV dual-cam texture...';
     });
 
     // 1. Dispose current texture if mounted.
@@ -877,9 +897,12 @@ class _VanguardManualTestPlaygroundState
     }
 
     // 2. Remount with updated layout — delegates to _mountDualCamTexture which
-    //    reads _pipAnchor / _pipWidthFraction / _pipMarginFraction from state.
+    //    reads _dualCamLayoutMode / _splitRatio / _pipAnchor / etc. from state.
     await _mountDualCamTexture();
   }
+
+  // Phase 7.x-I/J: Legacy wrapper kept for backward compatibility inside this file.
+  Future<void> _applyPiPLayout() => _applyLayout();
 
   Future<void> _export() async {
     final c = _controller;
@@ -1088,7 +1111,7 @@ class _VanguardManualTestPlaygroundState
                         const SizedBox(height: 12),
 
                         // ── Phase 7.x-I: DEV Dual-Camera PiP Layout Controls ─────
-                        _buildDualCamPiPLayoutCard(),
+                        _buildDualCamLayoutCard(),
                         const SizedBox(height: 12),
 
                         // ── Phase 7.x-E: DEV Dual-Camera Texture Mount ───────────
@@ -2335,13 +2358,14 @@ class _VanguardManualTestPlaygroundState
     );
   }
 
-  // ── Phase 7.x-I: DEV dual-camera PiP layout controls card ──────────────────
-  Widget _buildDualCamPiPLayoutCard() {
+  // ── Phase 7.x-I/J/K: DEV dual-camera layout controls card ─────────────────
+  Widget _buildDualCamLayoutCard() {
     final bool canApply = _controller != null &&
         _tempPathA != null &&
         _tempPathB != null &&
         !_devDualCamMounting;
     const Color kAccent = Color(0xFFE67E22); // warm orange — distinct from smoke/mount
+    final bool isSplit = _dualCamLayoutMode == VGDualCameraLayoutMode.splitScreen;
 
     return Container(
       padding: const EdgeInsets.all(12),
@@ -2363,7 +2387,7 @@ class _VanguardManualTestPlaygroundState
               const SizedBox(width: 6),
               const Expanded(
                 child: Text(
-                  'PHASE 7.x-J — DUAL-CAM PiP LAYOUT + STYLING CONTROLS (DEV ONLY)',
+                  'PHASE 7.x-K — DUAL-CAM LAYOUT CONTROLS (DEV ONLY)',
                   style: TextStyle(
                     color: kAccent,
                     fontSize: 10,
@@ -2376,240 +2400,312 @@ class _VanguardManualTestPlaygroundState
           ),
           const SizedBox(height: 4),
           const Text(
-            'Select anchor, width fraction, and margin fraction, then tap '
-            '"Apply PiP Layout / Rebuild Texture". '
+            'Select layout mode, adjust controls, then tap Apply/Rebuild Texture. '
             'Requires Smoke to pass first. No continuous rebuilds on slider drag.',
             style: TextStyle(color: Colors.white38, fontSize: 10),
           ),
           const SizedBox(height: 12),
 
-          // ── Anchor selector ───────────────────────────────────────────────
+          // ── Layout mode toggle ───────────────────────────────────────────
           const Text(
-            'PiP Anchor',
-            style: TextStyle(
-              color: Colors.white54,
-              fontSize: 11,
-            ),
+            'Layout Mode',
+            style: TextStyle(color: Colors.white54, fontSize: 11),
           ),
           const SizedBox(height: 6),
           Row(
             children: [
-              _buildPiPAnchorButton(VGPiPAnchor.topLeft,     'Top-L',    kAccent),
-              const SizedBox(width: 6),
-              _buildPiPAnchorButton(VGPiPAnchor.topRight,    'Top-R',    kAccent),
-              const SizedBox(width: 6),
-              _buildPiPAnchorButton(VGPiPAnchor.bottomLeft,  'Bot-L',    kAccent),
-              const SizedBox(width: 6),
-              _buildPiPAnchorButton(VGPiPAnchor.bottomRight, 'Bot-R ✓',  kAccent),
+              _buildLayoutModeButton(
+                VGDualCameraLayoutMode.pip, 'PiP', kAccent),
+              const SizedBox(width: 8),
+              _buildLayoutModeButton(
+                VGDualCameraLayoutMode.splitScreen, 'Split-Screen', kAccent),
             ],
           ),
           const SizedBox(height: 12),
 
-          // ── Width fraction slider ─────────────────────────────────────────
-          // Range: 0.10–0.70 (safe within descriptor assert 0.05–0.75)
-          Row(
-            children: [
-              const SizedBox(
-                width: 100,
-                child: Text(
-                  'Width Fraction',
-                  style: TextStyle(color: Colors.white54, fontSize: 11),
-                ),
-              ),
-              Expanded(
-                child: SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    activeTrackColor: kAccent,
-                    inactiveTrackColor: Colors.white10,
-                    thumbColor: kAccent,
-                    overlayColor: kAccent.withValues(alpha: 0.15),
-                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                    trackHeight: 2,
-                  ),
-                  child: Slider(
-                    value: _pipWidthFraction.clamp(0.10, 0.70),
-                    min: 0.10,
-                    max: 0.70,
-                    divisions: 60,
-                    onChanged: (v) => setState(() => _pipWidthFraction = v),
-                  ),
-                ),
-              ),
-              SizedBox(
-                width: 44,
-                child: Text(
-                  _pipWidthFraction.toStringAsFixed(3),
-                  style: const TextStyle(
-                    color: kAccent,
-                    fontSize: 10,
-                    fontFamily: 'monospace',
-                  ),
-                  textAlign: TextAlign.right,
-                ),
-              ),
-            ],
-          ),
-
-          // ── Margin fraction slider ────────────────────────────────────────
-          // Range: 0.00–0.10
-          Row(
-            children: [
-              const SizedBox(
-                width: 100,
-                child: Text(
-                  'Margin Fraction',
-                  style: TextStyle(color: Colors.white54, fontSize: 11),
-                ),
-              ),
-              Expanded(
-                child: SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    activeTrackColor: kAccent,
-                    inactiveTrackColor: Colors.white10,
-                    thumbColor: kAccent,
-                    overlayColor: kAccent.withValues(alpha: 0.15),
-                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                    trackHeight: 2,
-                  ),
-                  child: Slider(
-                    value: _pipMarginFraction.clamp(0.0, 0.10),
-                    min: 0.0,
-                    max: 0.10,
-                    divisions: 100,
-                    onChanged: (v) => setState(() => _pipMarginFraction = v),
-                  ),
-                ),
-              ),
-              SizedBox(
-                width: 44,
-                child: Text(
-                  _pipMarginFraction.toStringAsFixed(3),
-                  style: const TextStyle(
-                    color: kAccent,
-                    fontSize: 10,
-                    fontFamily: 'monospace',
-                  ),
-                  textAlign: TextAlign.right,
-                ),
-              ),
-            ],
-          ),
-          // ── Corner radius slider ──────────────────────────────────────────
-          // Range: 0.0–80.0 (practical range; native clamps to min(pipW,pipH)/2)
-          Row(
-            children: [
-              const SizedBox(
-                width: 100,
-                child: Text(
-                  'Corner Radius',
-                  style: TextStyle(color: Colors.white54, fontSize: 11),
-                ),
-              ),
-              Expanded(
-                child: SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    activeTrackColor: kAccent,
-                    inactiveTrackColor: Colors.white10,
-                    thumbColor: kAccent,
-                    overlayColor: kAccent.withValues(alpha: 0.15),
-                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                    trackHeight: 2,
-                  ),
-                  child: Slider(
-                    value: _pipCornerRadius.clamp(0.0, 80.0),
-                    min: 0.0,
-                    max: 80.0,
-                    divisions: 80,
-                    onChanged: (v) => setState(() => _pipCornerRadius = v),
-                  ),
-                ),
-              ),
-              SizedBox(
-                width: 44,
-                child: Text(
-                  _pipCornerRadius.toStringAsFixed(1),
-                  style: const TextStyle(
-                    color: kAccent,
-                    fontSize: 10,
-                    fontFamily: 'monospace',
-                  ),
-                  textAlign: TextAlign.right,
-                ),
-              ),
-            ],
-          ),
-
-          // ── Opacity slider ─────────────────────────────────────────────────
-          // Range: 0.0–1.0
-          Row(
-            children: [
-              const SizedBox(
-                width: 100,
-                child: Text(
-                  'Opacity',
-                  style: TextStyle(color: Colors.white54, fontSize: 11),
-                ),
-              ),
-              Expanded(
-                child: SliderTheme(
-                  data: SliderTheme.of(context).copyWith(
-                    activeTrackColor: kAccent,
-                    inactiveTrackColor: Colors.white10,
-                    thumbColor: kAccent,
-                    overlayColor: kAccent.withValues(alpha: 0.15),
-                    thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
-                    trackHeight: 2,
-                  ),
-                  child: Slider(
-                    value: _pipOpacity.clamp(0.0, 1.0),
-                    min: 0.0,
-                    max: 1.0,
-                    divisions: 100,
-                    onChanged: (v) => setState(() => _pipOpacity = v),
-                  ),
-                ),
-              ),
-              SizedBox(
-                width: 44,
-                child: Text(
-                  _pipOpacity.toStringAsFixed(2),
-                  style: const TextStyle(
-                    color: kAccent,
-                    fontSize: 10,
-                    fontFamily: 'monospace',
-                  ),
-                  textAlign: TextAlign.right,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 4),
-
-          // ── Current descriptor summary ────────────────────────────────────
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-            decoration: BoxDecoration(
-              color: Colors.black26,
-              borderRadius: BorderRadius.circular(6),
+          // ── Split-screen controls (visible only in splitScreen mode) ─────
+          if (isSplit) ...[
+            const Text(
+              'Split Ratio (primary top fraction)',
+              style: TextStyle(color: Colors.white54, fontSize: 11),
             ),
-            child: Text(
-              'anchor=${_pipAnchor.value}  '
-              'wf=${_pipWidthFraction.toStringAsFixed(3)}  '
-              'mf=${_pipMarginFraction.toStringAsFixed(3)}  '
-              'cr=${_pipCornerRadius.toStringAsFixed(1)}  '
-              'op=${_pipOpacity.toStringAsFixed(2)}',
-              style: const TextStyle(
-                color: kAccent,
-                fontSize: 10,
-                fontFamily: 'monospace',
+            Row(
+              children: [
+                Expanded(
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      activeTrackColor: kAccent,
+                      inactiveTrackColor: Colors.white10,
+                      thumbColor: kAccent,
+                      overlayColor: kAccent.withValues(alpha: 0.15),
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                      trackHeight: 2,
+                    ),
+                    child: Slider(
+                      value: _splitRatio.clamp(0.2, 0.8),
+                      min: 0.2,
+                      max: 0.8,
+                      divisions: 60,
+                      onChanged: (v) => setState(() => _splitRatio = v),
+                    ),
+                  ),
+                ),
+                SizedBox(
+                  width: 44,
+                  child: Text(
+                    _splitRatio.toStringAsFixed(2),
+                    style: const TextStyle(
+                      color: kAccent,
+                      fontSize: 10,
+                      fontFamily: 'monospace',
+                    ),
+                    textAlign: TextAlign.right,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: Colors.black26,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(
+                'mode=splitScreen  splitRatio=${_splitRatio.toStringAsFixed(2)}',
+                style: const TextStyle(
+                  color: kAccent,
+                  fontSize: 10,
+                  fontFamily: 'monospace',
+                ),
               ),
             ),
-          ),
+          ],
+
+          // ── PiP controls (visible only in PiP mode) ──────────────────────
+          if (!isSplit) ...[
+            // ── Anchor selector ───────────────────────────────────────────
+            const Text(
+              'PiP Anchor',
+              style: TextStyle(color: Colors.white54, fontSize: 11),
+            ),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                _buildPiPAnchorButton(VGPiPAnchor.topLeft,     'Top-L',    kAccent),
+                const SizedBox(width: 6),
+                _buildPiPAnchorButton(VGPiPAnchor.topRight,    'Top-R',    kAccent),
+                const SizedBox(width: 6),
+                _buildPiPAnchorButton(VGPiPAnchor.bottomLeft,  'Bot-L',    kAccent),
+                const SizedBox(width: 6),
+                _buildPiPAnchorButton(VGPiPAnchor.bottomRight, 'Bot-R ✓',  kAccent),
+              ],
+            ),
+            const SizedBox(height: 12),
+
+            // ── Width fraction slider ─────────────────────────────────────
+            Row(
+              children: [
+                const SizedBox(
+                  width: 100,
+                  child: Text(
+                    'Width Fraction',
+                    style: TextStyle(color: Colors.white54, fontSize: 11),
+                  ),
+                ),
+                Expanded(
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      activeTrackColor: kAccent,
+                      inactiveTrackColor: Colors.white10,
+                      thumbColor: kAccent,
+                      overlayColor: kAccent.withValues(alpha: 0.15),
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                      trackHeight: 2,
+                    ),
+                    child: Slider(
+                      value: _pipWidthFraction.clamp(0.10, 0.70),
+                      min: 0.10,
+                      max: 0.70,
+                      divisions: 60,
+                      onChanged: (v) => setState(() => _pipWidthFraction = v),
+                    ),
+                  ),
+                ),
+                SizedBox(
+                  width: 44,
+                  child: Text(
+                    _pipWidthFraction.toStringAsFixed(3),
+                    style: const TextStyle(
+                      color: kAccent,
+                      fontSize: 10,
+                      fontFamily: 'monospace',
+                    ),
+                    textAlign: TextAlign.right,
+                  ),
+                ),
+              ],
+            ),
+
+            // ── Margin fraction slider ────────────────────────────────────
+            Row(
+              children: [
+                const SizedBox(
+                  width: 100,
+                  child: Text(
+                    'Margin Fraction',
+                    style: TextStyle(color: Colors.white54, fontSize: 11),
+                  ),
+                ),
+                Expanded(
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      activeTrackColor: kAccent,
+                      inactiveTrackColor: Colors.white10,
+                      thumbColor: kAccent,
+                      overlayColor: kAccent.withValues(alpha: 0.15),
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                      trackHeight: 2,
+                    ),
+                    child: Slider(
+                      value: _pipMarginFraction.clamp(0.0, 0.10),
+                      min: 0.0,
+                      max: 0.10,
+                      divisions: 100,
+                      onChanged: (v) => setState(() => _pipMarginFraction = v),
+                    ),
+                  ),
+                ),
+                SizedBox(
+                  width: 44,
+                  child: Text(
+                    _pipMarginFraction.toStringAsFixed(3),
+                    style: const TextStyle(
+                      color: kAccent,
+                      fontSize: 10,
+                      fontFamily: 'monospace',
+                    ),
+                    textAlign: TextAlign.right,
+                  ),
+                ),
+              ],
+            ),
+
+            // ── Corner radius slider ──────────────────────────────────────
+            Row(
+              children: [
+                const SizedBox(
+                  width: 100,
+                  child: Text(
+                    'Corner Radius',
+                    style: TextStyle(color: Colors.white54, fontSize: 11),
+                  ),
+                ),
+                Expanded(
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      activeTrackColor: kAccent,
+                      inactiveTrackColor: Colors.white10,
+                      thumbColor: kAccent,
+                      overlayColor: kAccent.withValues(alpha: 0.15),
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                      trackHeight: 2,
+                    ),
+                    child: Slider(
+                      value: _pipCornerRadius.clamp(0.0, 80.0),
+                      min: 0.0,
+                      max: 80.0,
+                      divisions: 80,
+                      onChanged: (v) => setState(() => _pipCornerRadius = v),
+                    ),
+                  ),
+                ),
+                SizedBox(
+                  width: 44,
+                  child: Text(
+                    _pipCornerRadius.toStringAsFixed(1),
+                    style: const TextStyle(
+                      color: kAccent,
+                      fontSize: 10,
+                      fontFamily: 'monospace',
+                    ),
+                    textAlign: TextAlign.right,
+                  ),
+                ),
+              ],
+            ),
+
+            // ── Opacity slider ─────────────────────────────────────────────
+            Row(
+              children: [
+                const SizedBox(
+                  width: 100,
+                  child: Text(
+                    'Opacity',
+                    style: TextStyle(color: Colors.white54, fontSize: 11),
+                  ),
+                ),
+                Expanded(
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      activeTrackColor: kAccent,
+                      inactiveTrackColor: Colors.white10,
+                      thumbColor: kAccent,
+                      overlayColor: kAccent.withValues(alpha: 0.15),
+                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                      trackHeight: 2,
+                    ),
+                    child: Slider(
+                      value: _pipOpacity.clamp(0.0, 1.0),
+                      min: 0.0,
+                      max: 1.0,
+                      divisions: 100,
+                      onChanged: (v) => setState(() => _pipOpacity = v),
+                    ),
+                  ),
+                ),
+                SizedBox(
+                  width: 44,
+                  child: Text(
+                    _pipOpacity.toStringAsFixed(2),
+                    style: const TextStyle(
+                      color: kAccent,
+                      fontSize: 10,
+                      fontFamily: 'monospace',
+                    ),
+                    textAlign: TextAlign.right,
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+
+            // ── Current PiP descriptor summary ────────────────────────────
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.black26,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Text(
+                'anchor=${_pipAnchor.value}  '
+                'wf=${_pipWidthFraction.toStringAsFixed(3)}  '
+                'mf=${_pipMarginFraction.toStringAsFixed(3)}  '
+                'cr=${_pipCornerRadius.toStringAsFixed(1)}  '
+                'op=${_pipOpacity.toStringAsFixed(2)}',
+                style: const TextStyle(
+                  color: kAccent,
+                  fontSize: 10,
+                  fontFamily: 'monospace',
+                ),
+              ),
+            ),
+          ],
           const SizedBox(height: 10),
 
-          // ── Apply button ──────────────────────────────────────────────────
+          // ── Apply button ──────────────────────────────────────────────
           ElevatedButton.icon(
-            onPressed: canApply ? _applyPiPLayout : null,
+            onPressed: canApply ? _applyLayout : null,
             icon: _devDualCamMounting
                 ? const SizedBox(
                     width: 14,
@@ -2618,7 +2714,10 @@ class _VanguardManualTestPlaygroundState
                         strokeWidth: 2, color: Colors.white70),
                   )
                 : const Icon(Icons.refresh_outlined, size: 14),
-            label: const Text('Apply PiP Layout / Rebuild Texture'),
+            label: Text(
+              isSplit
+                  ? 'Apply Split-Screen Layout / Rebuild Texture'
+                  : 'Apply PiP Layout / Rebuild Texture'),
             style: ElevatedButton.styleFrom(
               backgroundColor: kAccent,
               foregroundColor: const Color(0xFF0F0E17),
@@ -2630,11 +2729,13 @@ class _VanguardManualTestPlaygroundState
             ),
           ),
 
-          // ── Reset to defaults ─────────────────────────────────────────────
+          // ── Reset to defaults ─────────────────────────────────────────
           const SizedBox(height: 6),
           OutlinedButton(
             onPressed: () {
               setState(() {
+                _dualCamLayoutMode = VGDualCameraLayoutMode.pip;
+                _splitRatio = 0.5;
                 _pipAnchor = VGPiPAnchor.bottomRight;
                 _pipWidthFraction = 0.35;
                 _pipMarginFraction = 0.018;
@@ -2648,14 +2749,46 @@ class _VanguardManualTestPlaygroundState
               padding: const EdgeInsets.symmetric(vertical: 8),
               textStyle: const TextStyle(fontSize: 11),
             ),
-            child: const Text('Reset to 7.x-H Defaults (bot-R, 0.35, 0.018, cr=0, op=1)'),
+            child: const Text('Reset to Defaults (PiP bot-R, 0.35, 0.018, cr=0, op=1, ratio=0.5)'),
           ),
         ],
       ),
     );
   }
 
-  // Helper: anchor selection button used in _buildDualCamPiPLayoutCard.
+  // Phase 7.x-K: Helper for layout mode toggle button.
+  Widget _buildLayoutModeButton(
+      VGDualCameraLayoutMode mode, String label, Color accentColor) {
+    final bool active = _dualCamLayoutMode == mode;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => setState(() => _dualCamLayoutMode = mode),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          decoration: BoxDecoration(
+            color: active
+                ? accentColor
+                : Colors.white.withValues(alpha: 0.03),
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(
+              color: active ? accentColor : Colors.white12,
+            ),
+          ),
+          alignment: Alignment.center,
+          child: Text(
+            label,
+            style: TextStyle(
+              color: active ? const Color(0xFF0F0E17) : Colors.white54,
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Helper: anchor selection button used in _buildDualCamLayoutCard.
   Widget _buildPiPAnchorButton(
       VGPiPAnchor anchor, String label, Color accentColor) {
     final bool active = _pipAnchor == anchor;

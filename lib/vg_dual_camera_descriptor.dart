@@ -4,6 +4,7 @@ import 'vg_clip_descriptor.dart';
 
 enum VGDualCameraLayoutMode {
   pip,
+  splitScreen,
 }
 
 enum VGPiPAnchor {
@@ -48,6 +49,8 @@ extension VGDualCameraLayoutModeExtension on VGDualCameraLayoutMode {
     switch (this) {
       case VGDualCameraLayoutMode.pip:
         return 'pip';
+      case VGDualCameraLayoutMode.splitScreen:
+        return 'splitScreen';
     }
   }
 
@@ -55,6 +58,8 @@ extension VGDualCameraLayoutModeExtension on VGDualCameraLayoutMode {
     switch (value) {
       case 'pip':
         return VGDualCameraLayoutMode.pip;
+      case 'splitScreen':
+        return VGDualCameraLayoutMode.splitScreen;
       default:
         return VGDualCameraLayoutMode.pip;
     }
@@ -145,6 +150,50 @@ class VGPiPLayoutDescriptor {
   int get hashCode => Object.hash(anchor, widthFraction, marginFraction, cornerRadius, opacity);
 }
 
+// ─── VGSplitScreenLayoutDescriptor ──────────────────────────────────────────
+/// Configuration for the split-screen layout mode.
+///
+/// Phase 7.x-K: vertical portrait split — primary on top, secondary on bottom.
+/// [splitRatio] controls what fraction of the canvas height is allocated to
+/// the primary (top) video. Valid range: 0.2–0.8. Default: 0.5.
+@immutable
+class VGSplitScreenLayoutDescriptor {
+  const VGSplitScreenLayoutDescriptor({
+    this.splitRatio = 0.5,
+  }) : assert(
+            splitRatio >= 0.2 && splitRatio <= 0.8,
+            'splitRatio must be between 0.2 and 0.8');
+
+  final double splitRatio;
+
+  VGSplitScreenLayoutDescriptor copyWith({double? splitRatio}) {
+    return VGSplitScreenLayoutDescriptor(
+      splitRatio: splitRatio ?? this.splitRatio,
+    );
+  }
+
+  Map<String, Object?> toMap() {
+    return {'splitRatio': splitRatio};
+  }
+
+  static VGSplitScreenLayoutDescriptor? fromMap(Map<Object?, Object?>? map) {
+    if (map == null) return null;
+    final ratio = (map['splitRatio'] as num?)?.toDouble() ?? 0.5;
+    if (ratio < 0.2 || ratio > 0.8) return null;
+    return VGSplitScreenLayoutDescriptor(splitRatio: ratio);
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGSplitScreenLayoutDescriptor &&
+          runtimeType == other.runtimeType &&
+          splitRatio == other.splitRatio;
+
+  @override
+  int get hashCode => splitRatio.hashCode;
+}
+
 @immutable
 class VGDualCameraDescriptor {
   VGDualCameraDescriptor({
@@ -152,24 +201,29 @@ class VGDualCameraDescriptor {
     required this.secondaryClip,
     this.layoutMode = VGDualCameraLayoutMode.pip,
     this.pipLayout = const VGPiPLayoutDescriptor(),
+    this.splitLayout = const VGSplitScreenLayoutDescriptor(),
   }) : assert(primaryClip.id != secondaryClip.id, 'primaryClip and secondaryClip must have different IDs');
 
   final VGClipDescriptor primaryClip;
   final VGClipDescriptor secondaryClip;
   final VGDualCameraLayoutMode layoutMode;
   final VGPiPLayoutDescriptor pipLayout;
+  // Phase 7.x-K: split-screen layout configuration.
+  final VGSplitScreenLayoutDescriptor splitLayout;
 
   VGDualCameraDescriptor copyWith({
     VGClipDescriptor? primaryClip,
     VGClipDescriptor? secondaryClip,
     VGDualCameraLayoutMode? layoutMode,
     VGPiPLayoutDescriptor? pipLayout,
+    VGSplitScreenLayoutDescriptor? splitLayout,
   }) {
     return VGDualCameraDescriptor(
       primaryClip: primaryClip ?? this.primaryClip,
       secondaryClip: secondaryClip ?? this.secondaryClip,
       layoutMode: layoutMode ?? this.layoutMode,
       pipLayout: pipLayout ?? this.pipLayout,
+      splitLayout: splitLayout ?? this.splitLayout,
     );
   }
 
@@ -179,6 +233,7 @@ class VGDualCameraDescriptor {
       'secondaryClip': secondaryClip.toMap(),
       'layoutMode': layoutMode.value,
       'pipLayout': pipLayout.toMap(),
+      'splitLayout': splitLayout.toMap(),
     };
   }
 
@@ -196,15 +251,21 @@ class VGDualCameraDescriptor {
 
     final layoutModeStr = map['layoutMode'] as String?;
     final layoutMode = layoutModeStr != null ? VGDualCameraLayoutModeExtension.fromValue(layoutModeStr) : VGDualCameraLayoutMode.pip;
-    
+
     final pipLayoutMap = map['pipLayout'] as Map<Object?, Object?>?;
     final pipLayout = VGPiPLayoutDescriptor.fromMap(pipLayoutMap) ?? const VGPiPLayoutDescriptor();
+
+    // Phase 7.x-K: parse splitLayout; fallback to default.
+    final splitLayoutMap = map['splitLayout'] as Map<Object?, Object?>?;
+    final splitLayout = VGSplitScreenLayoutDescriptor.fromMap(splitLayoutMap) ??
+        const VGSplitScreenLayoutDescriptor();
 
     return VGDualCameraDescriptor(
       primaryClip: primaryClip,
       secondaryClip: secondaryClip,
       layoutMode: layoutMode,
       pipLayout: pipLayout,
+      splitLayout: splitLayout,
     );
   }
 
@@ -216,8 +277,10 @@ class VGDualCameraDescriptor {
           primaryClip == other.primaryClip &&
           secondaryClip == other.secondaryClip &&
           layoutMode == other.layoutMode &&
-          pipLayout == other.pipLayout;
+          pipLayout == other.pipLayout &&
+          splitLayout == other.splitLayout;
 
   @override
-  int get hashCode => Object.hash(primaryClip, secondaryClip, layoutMode, pipLayout);
+  int get hashCode =>
+      Object.hash(primaryClip, secondaryClip, layoutMode, pipLayout, splitLayout);
 }

@@ -569,5 +569,111 @@ void main() {
 
       controller.dispose();
     });
+  }); // end devCreateDualCameraTexture group
+
+  // ── Phase 7.x-K: VGSplitScreenLayoutDescriptor and splitScreen layoutMode ──
+
+  group('VGSplitScreenLayoutDescriptor Tests (Phase 7.x-K)', () {
+    final clipA = VGClipDescriptor(
+      id: 'clip-a',
+      sourcePath: '/path/to/a.mp4',
+      mediaKind: VGMediaKind.video,
+      startTimeSeconds: 0.0,
+      durationSeconds: 10.0,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 10.0,
+      speed: 1.0,
+    );
+    final clipB = VGClipDescriptor(
+      id: 'clip-b',
+      sourcePath: '/path/to/b.mp4',
+      mediaKind: VGMediaKind.video,
+      startTimeSeconds: 0.0,
+      durationSeconds: 10.0,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 10.0,
+      speed: 1.0,
+    );
+
+    test('23. VGSplitScreenLayoutDescriptor default splitRatio = 0.5', () {
+      const layout = VGSplitScreenLayoutDescriptor();
+      expect(layout.splitRatio, 0.5);
+    });
+
+    test('24. VGSplitScreenLayoutDescriptor toMap/fromMap round-trip', () {
+      const layout = VGSplitScreenLayoutDescriptor(splitRatio: 0.3);
+      final map = layout.toMap();
+      expect(map['splitRatio'], 0.3);
+
+      final roundTrip = VGSplitScreenLayoutDescriptor.fromMap(map);
+      expect(roundTrip, layout);
+      expect(roundTrip?.splitRatio, 0.3);
+    });
+
+    test('25. VGSplitScreenLayoutDescriptor fromMap null/missing → null', () {
+      expect(VGSplitScreenLayoutDescriptor.fromMap(null), isNull);
+    });
+
+    test('26. VGSplitScreenLayoutDescriptor rejects splitRatio < 0.2', () {
+      expect(
+        () => VGSplitScreenLayoutDescriptor(splitRatio: 0.1),
+        throwsA(isA<AssertionError>()),
+      );
+      // fromMap out-of-range → null
+      expect(VGSplitScreenLayoutDescriptor.fromMap({'splitRatio': 0.1}), isNull);
+    });
+
+    test('27. VGSplitScreenLayoutDescriptor rejects splitRatio > 0.8', () {
+      expect(
+        () => VGSplitScreenLayoutDescriptor(splitRatio: 0.9),
+        throwsA(isA<AssertionError>()),
+      );
+      expect(VGSplitScreenLayoutDescriptor.fromMap({'splitRatio': 0.9}), isNull);
+    });
+
+    test('28. VGDualCameraDescriptor round-trip with splitScreen layoutMode', () {
+      final desc = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+        layoutMode: VGDualCameraLayoutMode.splitScreen,
+        splitLayout: const VGSplitScreenLayoutDescriptor(splitRatio: 0.6),
+      );
+
+      final map = desc.toMap();
+      expect(map['layoutMode'], 'splitScreen');
+      expect((map['splitLayout'] as Map)['splitRatio'], 0.6);
+
+      final roundTrip = VGDualCameraDescriptor.fromMap(map);
+      expect(roundTrip, desc);
+      expect(roundTrip?.layoutMode, VGDualCameraLayoutMode.splitScreen);
+      expect(roundTrip?.splitLayout.splitRatio, 0.6);
+    });
+
+    test('29. PiP layoutMode unaffected by split-screen changes (regression)', () {
+      final desc = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+        layoutMode: VGDualCameraLayoutMode.pip,
+        pipLayout: const VGPiPLayoutDescriptor(anchor: VGPiPAnchor.topLeft),
+      );
+      final map = desc.toMap();
+      expect(map['layoutMode'], 'pip');
+      final roundTrip = VGDualCameraDescriptor.fromMap(map);
+      expect(roundTrip?.layoutMode, VGDualCameraLayoutMode.pip);
+      expect(roundTrip?.pipLayout.anchor, VGPiPAnchor.topLeft);
+    });
+
+    test('30. serialized splitScreen payload has no camera/MultiCam fields', () {
+      final desc = VGDualCameraDescriptor(
+        primaryClip: clipA,
+        secondaryClip: clipB,
+        layoutMode: VGDualCameraLayoutMode.splitScreen,
+      );
+      final map = desc.toMap();
+      final str = map.toString();
+      expect(str.contains('MultiCam'), isFalse);
+      expect(str.contains('camera'), isFalse);
+      expect(str.contains('AVCapture'), isFalse);
+    });
   });
 }

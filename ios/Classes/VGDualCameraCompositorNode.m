@@ -1,5 +1,5 @@
 // VGDualCameraCompositorNode.m
-// vanguard_media_engine — Phase 7.x-B / Phase 7.x-F / Phase 7.x-G / Phase 7.x-J
+// vanguard_media_engine — Phase 7.x-B / Phase 7.x-F / Phase 7.x-G / Phase 7.x-J / Phase 7.x-K
 //
 // Phase 7.x-B skeleton only. Not integrated into the live runtime.
 // Phase 7.x-F: Primary clip AVAssetReader added. pullFrame: now decodes
@@ -120,6 +120,10 @@ static NSString * const kVGDCCNPiPMarginFractionKey = @"marginFraction";
 static NSString * const kVGDCCNPiPCornerRadiusKey   = @"cornerRadius";
 static NSString * const kVGDCCNPiPOpacityKey        = @"opacity";
 
+// ─── Phase 7.x-K: Split-screen wire key ──────────────────────────────────────
+static NSString * const kVGDCCNSplitLayoutKey      = @"splitLayout";
+static NSString * const kVGDCCNSplitRatioKey       = @"splitRatio";
+
 // ─── Phase 7.x-F: Output settings for AVAssetReaderVideoCompositionOutput ────
 // Match VGTimelineCompositorNode Phase 7.9 output settings:
 // 32BGRA + Metal + IOSurface. Same pixel format as the playback path for
@@ -211,6 +215,23 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
         cfg.opacity = op.doubleValue;
     }
 
+    return cfg;
+}
+/// Parses a VGSplitScreenLayoutConfig from a Dart-side splitLayout dictionary.
+/// Missing or invalid keys fall back to defaults (splitRatio=0.5).
+static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *, id> * _Nullable dict) {
+    VGSplitScreenLayoutConfig cfg;
+    cfg.splitRatio = 0.5; // default
+
+    if (!dict || ![dict isKindOfClass:[NSDictionary class]]) {
+        return cfg;
+    }
+
+    NSNumber *sr = dict[kVGDCCNSplitRatioKey];
+    if ([sr isKindOfClass:[NSNumber class]] &&
+        sr.doubleValue >= 0.2 && sr.doubleValue <= 0.8) {
+        cfg.splitRatio = sr.doubleValue;
+    }
     return cfg;
 }
 
@@ -345,12 +366,16 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
 
     // One-time log guard: YES after first composited frame is generated.
     BOOL _compositedFirstFrameLogged;
+
+    // Phase 7.x-K: one-time log guard for split-screen first frame.
+    BOOL _splitFirstFrameLogged;
 }
 
 @synthesize primaryClip   = _primaryClip;
 @synthesize secondaryClip = _secondaryClip;
 @synthesize layoutMode    = _layoutMode;
 @synthesize pipLayout     = _pipLayout;
+@synthesize splitLayout   = _splitLayout;
 @synthesize primaryRenderSize   = _primaryRenderSize;
 @synthesize secondaryRenderSize = _secondaryRenderSize;
 
@@ -450,19 +475,32 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     NSString *layoutModeStr = parameters[kVGDCCNLayoutModeKey];
     VGDualCameraLayoutMode parsedLayoutMode = VGDualCameraLayoutModePiP; // default
     if (layoutModeStr != nil) {
-        if (![layoutModeStr isKindOfClass:[NSString class]] ||
-            ![layoutModeStr isEqualToString:@"pip"]) {
+        if (![layoutModeStr isKindOfClass:[NSString class]]) {
             if (outError) {
                 *outError = _VGDCCNError(
                     VGDualCameraCompositorNodeErrorUnsupportedLayoutMode,
                     ([NSString stringWithFormat:
                         @"VGDualCameraCompositorNode: unsupported layoutMode '%@'. "
-                         "Phase 7.x-B only supports 'pip'.",
+                         "Phase 7.x-K supports 'pip' and 'splitScreen'.",
                         layoutModeStr]));
             }
             return nil;
         }
-        // layoutModeStr == @"pip" → parsedLayoutMode already VGDualCameraLayoutModePiP.
+        if ([layoutModeStr isEqualToString:@"pip"]) {
+            parsedLayoutMode = VGDualCameraLayoutModePiP;
+        } else if ([layoutModeStr isEqualToString:@"splitScreen"]) {
+            parsedLayoutMode = VGDualCameraLayoutModeSplitScreen;
+        } else {
+            if (outError) {
+                *outError = _VGDCCNError(
+                    VGDualCameraCompositorNodeErrorUnsupportedLayoutMode,
+                    ([NSString stringWithFormat:
+                        @"VGDualCameraCompositorNode: unsupported layoutMode '%@'. "
+                         "Phase 7.x-K supports 'pip' and 'splitScreen'.",
+                        layoutModeStr]));
+            }
+            return nil;
+        }
     }
 
     // ── 5. Parse pipLayout (optional; defaults on missing/invalid) ───────────
@@ -470,6 +508,12 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     id pipLayoutRaw = parameters[kVGDCCNPiPLayoutKey];
     VGPiPLayoutConfig parsedPipLayout = _VGDCCNParsePiPLayout(
         [pipLayoutRaw isKindOfClass:[NSDictionary class]] ? pipLayoutRaw : nil);
+
+    // ── 5b. Phase 7.x-K: Parse splitLayout (optional; defaults on missing/invalid) ─
+
+    id splitLayoutRaw = parameters[kVGDCCNSplitLayoutKey];
+    VGSplitScreenLayoutConfig parsedSplitLayout = _VGDCCNParseSplitLayout(
+        [splitLayoutRaw isKindOfClass:[NSDictionary class]] ? splitLayoutRaw : nil);
 
     // ── 6. Commit ────────────────────────────────────────────────────────────
 
@@ -482,6 +526,7 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     _secondaryClip = secondary;
     _layoutMode    = parsedLayoutMode;
     _pipLayout     = parsedPipLayout;
+    _splitLayout   = parsedSplitLayout;
     atomic_store(&_invalidated, false);
 
     // Phase 7.x-F: reader state initialised to nil.
@@ -505,6 +550,8 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     // Phase 7.x-H: composited buffer state.
     _compositedLastBuffer       = NULL;
     _compositedFirstFrameLogged = NO;
+    // Phase 7.x-K: split-screen log guard.
+    _splitFirstFrameLogged      = NO;
 
     // Phase 7.x-F (aspect ratio, Option B, timing fix):
     // Probe primaryRenderSize synchronously during init so dev_createDualCameraTexture
@@ -553,16 +600,19 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     }
 
     NSLog(@"[VGDualCameraCompositorNode][7.x-F] init ok | nodeId=%@ | "
-          "primary=%@ | secondary=%@ | layoutMode=pip | "
-          "pipLayout={anchor=%ld wf=%.3f mf=%.3f cr=%.1f op=%.2f}",
+          "primary=%@ | secondary=%@ | layoutMode=%@ | "
+          "pipLayout={anchor=%ld wf=%.3f mf=%.3f cr=%.1f op=%.2f} | "
+          "splitLayout={ratio=%.3f}",
           _nodeId,
           _primaryClip.clipId,
           _secondaryClip.clipId,
+          (parsedLayoutMode == VGDualCameraLayoutModeSplitScreen) ? @"splitScreen" : @"pip",
           (long)parsedPipLayout.anchor,
           parsedPipLayout.widthFraction,
           parsedPipLayout.marginFraction,
           parsedPipLayout.cornerRadius,
-          parsedPipLayout.opacity);
+          parsedPipLayout.opacity,
+          parsedSplitLayout.splitRatio);
 
     // Phase 7.x-G: Probe secondaryRenderSize synchronously, same pattern as primary.
     _secondaryRenderSize = CGSizeMake(1280.0, 720.0);
@@ -990,11 +1040,18 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
             }
         }
 
-        // Phase 7.x-H: Attempt PiP composition if secondary buffer is available.
+        // Phase 7.x-H/K: Attempt composition if secondary buffer is available.
+        // Branch on layoutMode: PiP (7.x-H/J) or split-screen (7.x-K).
         // Fallback to primary-only envelope if compositing fails or secondary unavailable.
         if (_secondaryLastBuffer != NULL) {
-            CVPixelBufferRef composited = [self _compositeWithPrimary:cachedBuf
-                                                           secondary:_secondaryLastBuffer];
+            CVPixelBufferRef composited = NULL;
+            if (_layoutMode == VGDualCameraLayoutModeSplitScreen) {
+                composited = [self _compositeWithSplitScreen:cachedBuf
+                                                  secondary:_secondaryLastBuffer];
+            } else {
+                composited = [self _compositeWithPrimary:cachedBuf
+                                              secondary:_secondaryLastBuffer];
+            }
             if (composited != NULL) {
                 // Release old composited buffer before storing new one.
                 if (_compositedLastBuffer) {
@@ -1151,11 +1208,18 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
                 }
             }
 
-            // Phase 7.x-H: Attempt PiP composition if secondary buffer is available.
+            // Phase 7.x-H/K: Attempt composition if secondary buffer is available.
+            // Branch on layoutMode: PiP (7.x-H/J) or split-screen (7.x-K).
             // Fallback to primary-only envelope if compositing fails or secondary unavailable.
             if (_secondaryLastBuffer != NULL) {
-                CVPixelBufferRef composited = [self _compositeWithPrimary:pixelBuffer
-                                                               secondary:_secondaryLastBuffer];
+                CVPixelBufferRef composited = NULL;
+                if (_layoutMode == VGDualCameraLayoutModeSplitScreen) {
+                    composited = [self _compositeWithSplitScreen:pixelBuffer
+                                                      secondary:_secondaryLastBuffer];
+                } else {
+                    composited = [self _compositeWithPrimary:pixelBuffer
+                                                  secondary:_secondaryLastBuffer];
+                }
                 if (composited != NULL) {
                     // Release old composited buffer before storing new one.
                     if (_compositedLastBuffer) {
@@ -1187,6 +1251,188 @@ static VGPiPLayoutConfig _VGDCCNParsePiPLayout(NSDictionary<NSString *, id> * _N
     // Unreachable: loop always returns or falls through via the early-exits above.
     // Defensive fallback for static analyser.
     return [VGFrameResult skippedWithGeneration:request.generation];
+}
+
+// ─── Phase 7.x-K: Private — Split-screen CoreImage compositor ────────────────────
+//
+// Composites primary and secondary into a vertical split-screen layout.
+// Primary fills the top half; secondary fills the bottom half.
+// The split point is determined by _splitLayout.splitRatio.
+//
+// Portrait split geometry (CoreImage Y-up, origin bottom-left):
+//   canvas   = (primW, primH)
+//   topH     = round(primH * splitRatio)    ← primary (top)
+//   bottomH  = primH - topH                 ← secondary (bottom)
+//
+//   primary target rect   = {x=0, y=bottomH, w=primW, h=topH}   (upper band)
+//   secondary target rect = {x=0, y=0,       w=primW, h=bottomH} (lower band)
+//
+// Each clip is aspect-fill scaled into its target rect:
+//   scale = MAX(targetW / sourceW, targetH / sourceH)
+// Centered, then cropped to prevent bleed across the split boundary.
+//
+// Returns a new CVPixelBufferRef at +1 (caller owns). Returns NULL on failure.
+
+- (CVPixelBufferRef)_compositeWithSplitScreen:(CVPixelBufferRef)primaryBuf
+                                    secondary:(CVPixelBufferRef)secondaryBuf {
+    if (!primaryBuf || !secondaryBuf) {
+        return NULL;
+    }
+
+    // ── 1. Dimensions ───────────────────────────────────────────────────────────
+    size_t primW = CVPixelBufferGetWidth(primaryBuf);
+    size_t primH = CVPixelBufferGetHeight(primaryBuf);
+    size_t secW  = CVPixelBufferGetWidth(secondaryBuf);
+    size_t secH  = CVPixelBufferGetHeight(secondaryBuf);
+
+    if (primW == 0 || primH == 0 || secW == 0 || secH == 0) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-K] _splitComposite: degenerate dimensions "
+              "prim=%zux%zu sec=%zux%zu — skipping.", primW, primH, secW, secH);
+        return NULL;
+    }
+
+    // ── 2. Split geometry ───────────────────────────────────────────────────────
+    double sr = _splitLayout.splitRatio;
+    // Clamp to safe range.
+    if (sr < 0.2) { sr = 0.2; }
+    if (sr > 0.8) { sr = 0.8; }
+
+    // topH: height of the primary (top) band (CoreImage Y-up: upper y values).
+    // bottomH: height of the secondary (bottom) band (y=0 at bottom-left).
+    double topH    = floor((double)primH * sr);
+    double bottomH = (double)primH - topH;
+
+    // Guard: both bands must be at least 1 pixel.
+    if (topH < 1.0 || bottomH < 1.0) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-K] _splitComposite: degenerate band height "
+              "topH=%.0f bottomH=%.0f — skipping.", topH, bottomH);
+        return NULL;
+    }
+
+    double canvasW = (double)primW;
+    double canvasH = (double)primH;
+
+    // ── 3. Build CIImages ────────────────────────────────────────────────────────
+    CIImage *primaryCI   = [CIImage imageWithCVPixelBuffer:primaryBuf];
+    CIImage *secondaryCI = [CIImage imageWithCVPixelBuffer:secondaryBuf];
+    if (!primaryCI || !secondaryCI) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-K] _splitComposite: CIImage creation failed.");
+        return NULL;
+    }
+
+    // ── 4. Helper: aspect-fill + crop a CIImage into a target rect ──────────
+    //
+    // For each band:
+    //   1. Normalize source origin to (0,0).
+    //   2. Compute scale = MAX(targetW/sourceW, targetH/sourceH).
+    //   3. Scale.
+    //   4. Center-translate so the scaled image is centered over the target rect
+    //      (origin at targetOriginX, targetOriginY).
+    //   5. Crop to the target rect to prevent bleed.
+    //
+    // CoreImage Y-up: top band origin Y = bottomH, bottom band origin Y = 0.
+
+    // — Primary (top band) —————————————————————————————————————
+    // Target rect (CIImage Y-up): {x=0, y=bottomH, w=canvasW, h=topH}
+    CGRect topRect    = CGRectMake(0.0, bottomH, canvasW, topH);
+    CGRect bottomRect = CGRectMake(0.0, 0.0,     canvasW, bottomH);
+
+    // Aspect-fill helper — normalize, scale-to-fill, center, crop.
+    CIImage *(^aspectFillIntoRect)(CIImage *, size_t, size_t, CGRect) =
+        ^CIImage *(CIImage *src, size_t srcW, size_t srcH, CGRect targetRect) {
+            // 1. Normalize origin.
+            CIImage *norm = src;
+            CGPoint srcOrigin = norm.extent.origin;
+            if (srcOrigin.x != 0.0 || srcOrigin.y != 0.0) {
+                CGAffineTransform normT = CGAffineTransformMakeTranslation(-srcOrigin.x, -srcOrigin.y);
+                norm = [norm imageByApplyingTransform:normT];
+            }
+
+            // 2. Scale = MAX(targetW / srcW, targetH / srcH).
+            double scaleX = (srcW > 0) ? CGRectGetWidth(targetRect)  / (double)srcW : 1.0;
+            double scaleY = (srcH > 0) ? CGRectGetHeight(targetRect) / (double)srcH : 1.0;
+            double scale = MAX(scaleX, scaleY);
+            if (scale <= 0.0) { scale = 1.0; }
+
+            // 3. Apply uniform scale.
+            CGAffineTransform scaleT = CGAffineTransformMakeScale(scale, scale);
+            CIImage *scaled = [norm imageByApplyingTransform:scaleT];
+
+            // 4. Center-translate: move the scaled image so its center aligns with
+            //    the target rect center.
+            double scaledW = (double)srcW * scale;
+            double scaledH = (double)srcH * scale;
+            double offsetX = CGRectGetMinX(targetRect) + (CGRectGetWidth(targetRect)  - scaledW) * 0.5;
+            double offsetY = CGRectGetMinY(targetRect) + (CGRectGetHeight(targetRect) - scaledH) * 0.5;
+            CGAffineTransform transT = CGAffineTransformMakeTranslation(offsetX, offsetY);
+            CIImage *centered = [scaled imageByApplyingTransform:transT];
+
+            // 5. Crop strictly to targetRect — prevents bleed into the other band.
+            return [centered imageByCroppingToRect:targetRect];
+        };
+
+    CIImage *topBand    = aspectFillIntoRect(primaryCI,   primW, primH, topRect);
+    CIImage *bottomBand = aspectFillIntoRect(secondaryCI, secW,  secH,  bottomRect);
+
+    if (!topBand || !bottomBand) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-K] _splitComposite: aspectFill failed.");
+        return NULL;
+    }
+
+    // ── 5. Composite: top band over bottom band (source-over on non-overlapping extents) ─
+    //
+    // Because the two rects are non-overlapping and the crops are strict,
+    // imageByCompositingOverImage: simply unions them on the canvas.
+    // We use a black backing canvas to ensure the full primW x primH output.
+    CGRect canvasRect = CGRectMake(0, 0, canvasW, canvasH);
+    CIImage *blackCanvas = [[CIImage imageWithColor:[CIColor blackColor]]
+        imageByCroppingToRect:canvasRect];
+    CIImage *withBottom  = [bottomBand imageByCompositingOverImage:blackCanvas];
+    CIImage *composited  = [topBand    imageByCompositingOverImage:withBottom];
+
+    if (!composited) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-K] _splitComposite: compositing failed.");
+        return NULL;
+    }
+
+    // ── 6. Create output CVPixelBuffer ─────────────────────────────────────────────
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey    : @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferMetalCompatibilityKey : @YES,
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    CVPixelBufferRef outputBuf = NULL;
+    CVReturn cvRet = CVPixelBufferCreate(
+        kCFAllocatorDefault,
+        primW, primH,
+        kCVPixelFormatType_32BGRA,
+        (__bridge CFDictionaryRef)attrs,
+        &outputBuf);
+
+    if (cvRet != kCVReturnSuccess || outputBuf == NULL) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-K] _splitComposite: CVPixelBufferCreate failed (ret=%d).", cvRet);
+        return NULL;
+    }
+
+    // ── 7. Render into output buffer ─────────────────────────────────────────────
+    CGRect renderBounds = CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH);
+    [_VGDCCNSharedCIContext() render:composited
+                     toCVPixelBuffer:outputBuf
+                               bounds:renderBounds
+                           colorSpace:nil];
+
+    // ── 8. One-time first-frame log (Phase 7.x-K) ─────────────────────────────
+    if (!_splitFirstFrameLogged) {
+        _splitFirstFrameLogged = YES;
+        NSLog(@"[VGDualCameraCompositorNode][7.x-K] first split-screen frame generated | "
+              "primaryRect=(0,%.0f,%.0f,%.0f) secondaryRect=(0,0,%.0f,%.0f) "
+              "splitRatio=%.3f canvas=%zux%zu",
+              bottomH, canvasW, topH,
+              canvasW, bottomH,
+              sr, primW, primH);
+    }
+
+    return outputBuf; // Caller owns +1 from CVPixelBufferCreate
 }
 
 // ─── Phase 7.x-H: Private — PiP CoreImage compositor ────────────────────────
