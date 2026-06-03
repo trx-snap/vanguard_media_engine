@@ -271,7 +271,9 @@ typedef NS_ENUM(NSInteger, VGDualCameraCompositorNodeErrorCode) {
 /// Core pull counters:
 ///   @"pullFrameCallCount"          — total pullFrame: calls since last reset (incl. cache hits).
 ///   @"primaryPullCount"            — alias for pullFrameCallCount (backward compat).
-///   @"primaryDecodeCount"          — total AVAssetReader decode (copyNextSampleBuffer) calls.
+///   @"primaryDecodeCount"          — copyNextSampleBuffer calls on the PRIMARY AVAssetReader.
+///   @"secondaryDecodeCount"        — copyNextSampleBuffer calls on the SECONDARY AVAssetReader. (Phase 7.x-P)
+///                                    0 for image-only secondary clips (no AVAssetReader).
 ///   @"successfulFrameCount"        — frames delivered (not skipped/EOS).
 ///
 /// Composition counters:
@@ -291,7 +293,9 @@ typedef NS_ENUM(NSInteger, VGDualCameraCompositorNodeErrorCode) {
 ///   @"estimatedRetainedBufferBytes"— sum of primary + secondary byte estimates.
 ///
 /// Timing (NSNumber doubleValue, milliseconds; 0 = not yet measured):
-///   @"firstFrameMs"                — monotonic timestamp (CACurrentMediaTime * 1e3) of first delivered frame.
+///   @"firstFrameLatencyMs"         — elapsed time from pullFrame: entry to first successful
+///                                    delivered frame. True latency, not an absolute timestamp.
+///                                    (Phase 7.x-P; replaces the former absolute-stamp firstFrameMs.)
 ///   @"lastPullFrameMs"             — duration of the most recent pullFrame: call that delivered a frame.
 ///   @"maxPullFrameMs"              — peak pullFrame: delivery duration since last reset.
 ///   @"averagePullFrameMs"          — mean pullFrame: delivery duration since last reset.

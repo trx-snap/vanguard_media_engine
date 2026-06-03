@@ -393,7 +393,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     // All atomic — safe to read from any thread for the telemetry route.
     // Reset to 0 by devResetTelemetry. Never read on the critical path.
     atomic_uint_fast64_t _primaryPullCount;       // total pullFrame: calls (incl. cache hits)
-    atomic_uint_fast64_t _primaryDecodeCount;     // total copyNextSampleBuffer decode calls
+    atomic_uint_fast64_t _primaryDecodeCount;     // copyNextSampleBuffer calls on the PRIMARY reader
+    atomic_uint_fast64_t _secondaryDecodeCount;   // copyNextSampleBuffer calls on the SECONDARY reader (Phase 7.x-P)
     atomic_uint_fast64_t _compositedFrameCount;   // total successful CoreImage composites (all modes)
     // Buffer byte estimates — updated atomically from pull queue alongside buffer stores.
     // Avoids reading _primaryLastBuffer/_secondaryLastBuffer from the main thread.
@@ -411,7 +412,12 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     // Phase 7.x-N (patch): pull-frame timing (all in nanoseconds, stored atomically).
     // CACurrentMediaTime() returns absolute seconds; multiply by 1e9 for uint64 ns.
     // uint64 overflows at ~584 years — safe.
-    atomic_uint_fast64_t _firstFrameWallTimeNs;   // ns timestamp of first successful delivered frame (0 = not set)
+    //
+    // Phase 7.x-P: _firstFrameLatencyNs replaces _firstFrameWallTimeNs.
+    //   Stores the elapsed ns from pullFrame: entry (_pullT0Ns) to the first
+    //   successful delivered frame — a true latency, not an absolute timestamp.
+    //   0 = not yet measured (arms on first delivery; re-arms after reset).
+    atomic_uint_fast64_t _firstFrameLatencyNs;   // ns elapsed from pullFrame: entry to first successful frame (Phase 7.x-P)
     atomic_uint_fast64_t _lastPullFrameNs;        // duration of last pullFrame: in ns
     atomic_uint_fast64_t _maxPullFrameNs;         // peak pullFrame: duration since last reset
     atomic_uint_fast64_t _totalPullFrameNs;       // sum of all pullFrame: durations for average
@@ -607,9 +613,10 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     _secondaryIsImage     = NO;
     _secondaryImageLogged = NO;
 
-    // Phase 7.x-N: DEV telemetry counters — initialise to zero.
+    // Phase 7.x-N / 7.x-P: DEV telemetry counters — initialise to zero.
     atomic_init(&_primaryPullCount,            0);
     atomic_init(&_primaryDecodeCount,          0);
+    atomic_init(&_secondaryDecodeCount,        0); // Phase 7.x-P: secondary reader decodes
     atomic_init(&_compositedFrameCount,        0);
     atomic_init(&_primaryLastBufferEstBytes,   0);
     atomic_init(&_secondaryLastBufferEstBytes, 0);
@@ -620,7 +627,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     atomic_init(&_fallbackToPrimaryCount,      0);
     atomic_init(&_imageBufferBuildCount,       0);
     atomic_init(&_outputBufferCreateCount,     0);
-    atomic_init(&_firstFrameWallTimeNs,        0);
+    // Phase 7.x-P: _firstFrameLatencyNs replaces _firstFrameWallTimeNs (true latency).
+    atomic_init(&_firstFrameLatencyNs,         0);
     atomic_init(&_lastPullFrameNs,             0);
     atomic_init(&_maxPullFrameNs,              0);
     atomic_init(&_totalPullFrameNs,            0);
@@ -1294,7 +1302,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
                 compEnvelope.payload.videoBuffer = (void *)composited; // +0 in envelope
                 compEnvelope.metadata   = NULL;
 
-                // Phase 7.x-N (patch): record timing for this delivered composited frame.
+                // Phase 7.x-N / 7.x-P: record timing for this delivered composited frame.
+                // Phase 7.x-P: capture first-frame latency (elapsed from _pullT0Ns).
                 {
                     uint64_t dur = (uint64_t)(CACurrentMediaTime() * 1.0e9) - _pullT0Ns;
                     atomic_store(&_lastPullFrameNs, dur);
@@ -1305,8 +1314,7 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
                         if (atomic_compare_exchange_weak(&_maxPullFrameNs, &prev, dur)) break;
                     }
                     uint64_t zero = 0;
-                    uint64_t now = (uint64_t)(CACurrentMediaTime() * 1.0e9);
-                    atomic_compare_exchange_strong(&_firstFrameWallTimeNs, &zero, now);
+                    atomic_compare_exchange_strong(&_firstFrameLatencyNs, &zero, dur);
                 }
 
                 return [VGFrameResult deliveredWithEnvelope:compEnvelope generation:currentGen];
@@ -1324,6 +1332,7 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         }
 
         // Phase 7.x-N (patch): record timing for primary-only delivery.
+        // Phase 7.x-P: capture first-frame latency (elapsed from _pullT0Ns).
         {
             uint64_t dur = (uint64_t)(CACurrentMediaTime() * 1.0e9) - _pullT0Ns;
             atomic_store(&_lastPullFrameNs, dur);
@@ -1334,8 +1343,7 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
                 if (atomic_compare_exchange_weak(&_maxPullFrameNs, &prev, dur)) break;
             }
             uint64_t zero = 0;
-            uint64_t now = (uint64_t)(CACurrentMediaTime() * 1.0e9);
-            atomic_compare_exchange_strong(&_firstFrameWallTimeNs, &zero, now);
+            atomic_compare_exchange_strong(&_firstFrameLatencyNs, &zero, dur);
         }
 
         return [VGFrameResult deliveredWithEnvelope:envelope generation:currentGen];
@@ -1521,6 +1529,7 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
                     compEnvelope.metadata   = NULL;
 
                     // Phase 7.x-N (patch): record timing for composited frame delivery.
+                    // Phase 7.x-P: capture first-frame latency (elapsed from _pullT0Ns).
                     {
                         uint64_t dur = (uint64_t)(CACurrentMediaTime() * 1.0e9) - _pullT0Ns;
                         atomic_store(&_lastPullFrameNs, dur);
@@ -1531,8 +1540,7 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
                             if (atomic_compare_exchange_weak(&_maxPullFrameNs, &prev, dur)) break;
                         }
                         uint64_t zero = 0;
-                        uint64_t now2 = (uint64_t)(CACurrentMediaTime() * 1.0e9);
-                        atomic_compare_exchange_strong(&_firstFrameWallTimeNs, &zero, now2);
+                        atomic_compare_exchange_strong(&_firstFrameLatencyNs, &zero, dur);
                     }
 
                     return [VGFrameResult deliveredWithEnvelope:compEnvelope generation:currentGen];
@@ -1549,6 +1557,7 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
             }
 
             // Phase 7.x-N (patch): record timing for primary-only delivery.
+            // Phase 7.x-P: capture first-frame latency (elapsed from _pullT0Ns).
             {
                 uint64_t dur = (uint64_t)(CACurrentMediaTime() * 1.0e9) - _pullT0Ns;
                 atomic_store(&_lastPullFrameNs, dur);
@@ -1559,8 +1568,7 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
                     if (atomic_compare_exchange_weak(&_maxPullFrameNs, &prev, dur)) break;
                 }
                 uint64_t zero = 0;
-                uint64_t now2 = (uint64_t)(CACurrentMediaTime() * 1.0e9);
-                atomic_compare_exchange_strong(&_firstFrameWallTimeNs, &zero, now2);
+                atomic_compare_exchange_strong(&_firstFrameLatencyNs, &zero, dur);
             }
 
             return [VGFrameResult deliveredWithEnvelope:envelope generation:currentGen];
@@ -2220,6 +2228,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
             return NO;
         }
 
+        // Phase 7.x-P: count each real secondary decode call.
+        atomic_fetch_add(&_secondaryDecodeCount, 1);
         CMSampleBufferRef secSampleBuf = [_secondaryOutput copyNextSampleBuffer]; // +1
 
         if (!secSampleBuf) {
@@ -2729,11 +2739,12 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     // serving a MethodChannel call) without locking.
 
     // ── Core counters ────────────────────────────────────────────────────────
-    uint64_t pulls      = atomic_load(&_primaryPullCount);
-    uint64_t decodes    = atomic_load(&_primaryDecodeCount);
-    uint64_t composites = atomic_load(&_compositedFrameCount);
-    uint64_t primBytes  = atomic_load(&_primaryLastBufferEstBytes);
-    uint64_t secBytes   = atomic_load(&_secondaryLastBufferEstBytes);
+    uint64_t pulls         = atomic_load(&_primaryPullCount);
+    uint64_t primDecodes   = atomic_load(&_primaryDecodeCount);   // Phase 7.x-P: primary reader only
+    uint64_t secDecodes    = atomic_load(&_secondaryDecodeCount); // Phase 7.x-P: secondary reader only
+    uint64_t composites    = atomic_load(&_compositedFrameCount);
+    uint64_t primBytes     = atomic_load(&_primaryLastBufferEstBytes);
+    uint64_t secBytes      = atomic_load(&_secondaryLastBufferEstBytes);
 
     // ── Phase 7.x-N (patch) counters ────────────────────────────────────────
     uint64_t pipCount        = atomic_load(&_pipCompositionCount);
@@ -2744,26 +2755,26 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     uint64_t outBufCount     = atomic_load(&_outputBufferCreateCount);
 
     // ── Timing (nanoseconds → milliseconds) ─────────────────────────────────
-    uint64_t firstFrameNs    = atomic_load(&_firstFrameWallTimeNs);
+    // Phase 7.x-P: _firstFrameLatencyNs is a true elapsed-time latency
+    //   (from pullFrame: entry to first successful delivered frame), not an
+    //   absolute wall-clock timestamp. 0 = not yet measured.
+    uint64_t firstLatencyNs  = atomic_load(&_firstFrameLatencyNs);
     uint64_t lastPullNs      = atomic_load(&_lastPullFrameNs);
     uint64_t maxPullNs       = atomic_load(&_maxPullFrameNs);
     uint64_t totalPullNs     = atomic_load(&_totalPullFrameNs);
     uint64_t timedCount      = atomic_load(&_pullTimedCallCount);
 
-    // Convert ns → ms (double, rounded to nearest integer for dictionary).
-    // firstFrameMs: wall-clock absolute timestamp when first frame was delivered.
-    //   Convert to milliseconds since midnight (for relative ordering only).
-    //   Value is absolute ns / 1e6 — use as opaque monotonic stamp.
-    double firstFrameMs  = (firstFrameNs > 0) ? (double)firstFrameNs / 1.0e6 : 0.0;
-    double lastPullMs    = (double)lastPullNs  / 1.0e6;
-    double maxPullMs     = (double)maxPullNs   / 1.0e6;
-    double avgPullMs     = (timedCount > 0) ? ((double)totalPullNs / (double)timedCount / 1.0e6) : 0.0;
+    // Convert ns → ms.
+    double firstFrameLatencyMs = (firstLatencyNs > 0) ? (double)firstLatencyNs / 1.0e6 : 0.0;
+    double lastPullMs          = (double)lastPullNs  / 1.0e6;
+    double maxPullMs           = (double)maxPullNs   / 1.0e6;
+    double avgPullMs           = (timedCount > 0) ? ((double)totalPullNs / (double)timedCount / 1.0e6) : 0.0;
 
     // ── Derived: estimated retained buffer bytes ─────────────────────────────
     uint64_t retainedBytes = primBytes + secBytes;
     double   retainedMB    = (double)retainedBytes / (1024.0 * 1024.0);
 
-    // ── Derived: successful output frames = total composites + fallbacks ─────
+    // ── Derived: successful output frames ────────────────────────────────────
     // "successfulFrameCount" means pullFrame: returned a delivered (non-skipped) result.
     // We track this via timedCount (every delivery site records timing).
     uint64_t successfulFrames = timedCount;
@@ -2771,8 +2782,10 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     return @{
         // Core pull counters (compatible with Phase 7.x-N original keys).
         @"pullFrameCallCount"         : @(pulls),
-        @"primaryPullCount"           : @(pulls),        // alias for backward compat
-        @"primaryDecodeCount"         : @(decodes),
+        @"primaryPullCount"           : @(pulls),           // alias for backward compat
+        // Phase 7.x-P: split decode counters — primary reader vs secondary reader.
+        @"primaryDecodeCount"         : @(primDecodes),
+        @"secondaryDecodeCount"       : @(secDecodes),
         @"successfulFrameCount"       : @(successfulFrames),
         // Composition counters.
         @"compositedFrameCount"       : @(composites),
@@ -2789,7 +2802,10 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         @"estimatedRetainedBufferBytes" : @(retainedBytes),
         // Timing (double ms, stored as NSNumber doubleValue).
         // Dart side reads as (v as num).toDouble().
-        @"firstFrameMs"               : @(firstFrameMs),
+        // Phase 7.x-P: firstFrameLatencyMs = true elapsed latency from pullFrame: entry
+        //   to first successful frame delivery. 0 = not yet measured.
+        //   Replaces the former absolute-timestamp firstFrameMs key.
+        @"firstFrameLatencyMs"        : @(firstFrameLatencyMs),
         @"lastPullFrameMs"            : @(lastPullMs),
         @"maxPullFrameMs"             : @(maxPullMs),
         @"averagePullFrameMs"         : @(avgPullMs),
@@ -2801,6 +2817,7 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     // Core counters.
     atomic_store(&_primaryPullCount,            0);
     atomic_store(&_primaryDecodeCount,          0);
+    atomic_store(&_secondaryDecodeCount,        0); // Phase 7.x-P
     atomic_store(&_compositedFrameCount,        0);
     atomic_store(&_primaryLastBufferEstBytes,   0);
     atomic_store(&_secondaryLastBufferEstBytes, 0);
@@ -2811,13 +2828,13 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     atomic_store(&_fallbackToPrimaryCount,      0);
     atomic_store(&_imageBufferBuildCount,       0);
     atomic_store(&_outputBufferCreateCount,     0);
-    // Phase 7.x-N (patch): timing — reset durations but keep firstFrameWallTime (re-arm).
-    atomic_store(&_firstFrameWallTimeNs,        0); // allow re-arm on next delivery
+    // Phase 7.x-N / 7.x-P: timing — zero all and re-arm first-frame latency capture.
+    atomic_store(&_firstFrameLatencyNs,         0); // Phase 7.x-P: re-arm on next delivery
     atomic_store(&_lastPullFrameNs,             0);
     atomic_store(&_maxPullFrameNs,              0);
     atomic_store(&_totalPullFrameNs,            0);
     atomic_store(&_pullTimedCallCount,          0);
-    NSLog(@"[VGDualCameraCompositorNode][7.x-N] devResetTelemetry: all counters and timing zeroed.");
+    NSLog(@"[VGDualCameraCompositorNode][7.x-P] devResetTelemetry: all counters and timing zeroed.");
 }
 
 @end

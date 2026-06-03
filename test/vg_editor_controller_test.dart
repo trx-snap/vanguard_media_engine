@@ -1898,11 +1898,12 @@ void main() {
     late VGEditorController controller;
     final List<String> calledMethods = [];
 
-    /// Minimal telemetry map matching all new keys from Phase 7.x-N (patch).
-    Map<String, dynamic> _fullTelemetryMap() => <String, dynamic>{
+    /// Minimal telemetry map matching all keys from Phase 7.x-P cleanup.
+    Map<String, dynamic> fullTelemetryMap() => <String, dynamic>{
       'pullFrameCallCount':          100,
       'primaryPullCount':            100,
       'primaryDecodeCount':          42,
+      'secondaryDecodeCount':        18,  // Phase 7.x-P: secondary reader decodes
       'successfulFrameCount':        85,
       'compositedFrameCount':        80,
       'pipCompositionCount':         60,
@@ -1914,7 +1915,8 @@ void main() {
       'primaryBufferEstBytes':       2073600,
       'secondaryBufferEstBytes':     2073600,
       'estimatedRetainedBufferBytes': 4147200,
-      'firstFrameMs':                1234567890.0,
+      // Phase 7.x-P: firstFrameLatencyMs is a true elapsed latency (not absolute).
+      'firstFrameLatencyMs':         12.34,
       'lastPullFrameMs':             1.23,
       'maxPullFrameMs':              8.77,
       'averagePullFrameMs':          2.01,
@@ -1937,7 +1939,7 @@ void main() {
         () async {
       _setMockHandler((method, args) async {
         calledMethods.add(method);
-        if (method == 'dev_getDualCameraTelemetry') return _fullTelemetryMap();
+        if (method == 'dev_getDualCameraTelemetry') return fullTelemetryMap();
         if (method == 'disposeTimeline') return null;
         return null;
       });
@@ -1951,7 +1953,7 @@ void main() {
     test('DCT-2  devGetDualCameraTelemetry returns Map<String, num> with all keys',
         () async {
       _setMockHandler((method, args) async {
-        if (method == 'dev_getDualCameraTelemetry') return _fullTelemetryMap();
+        if (method == 'dev_getDualCameraTelemetry') return fullTelemetryMap();
         if (method == 'disposeTimeline') return null;
         return null;
       });
@@ -1963,6 +1965,7 @@ void main() {
       expect(stats['pullFrameCallCount'],          100);
       expect(stats['primaryPullCount'],            100);
       expect(stats['primaryDecodeCount'],          42);
+      expect(stats['secondaryDecodeCount'],        18);  // Phase 7.x-P
       expect(stats['successfulFrameCount'],        85);
       expect(stats['compositedFrameCount'],        80);
       expect(stats['pipCompositionCount'],         60);
@@ -1980,7 +1983,8 @@ void main() {
       expect(stats['maxPullFrameMs'],       closeTo(8.77, 0.01));
       expect(stats['averagePullFrameMs'],   closeTo(2.01, 0.01));
       expect(stats['estimatedRetainedBufferMB'], closeTo(3.958, 0.001));
-      expect(stats['firstFrameMs'],         isA<num>());
+      // Phase 7.x-P: firstFrameLatencyMs is a true elapsed latency (not an absolute stamp).
+      expect(stats['firstFrameLatencyMs'],  closeTo(12.34, 0.01));
     });
 
     test('DCT-3  devGetDualCameraTelemetry returns empty map when native returns null',

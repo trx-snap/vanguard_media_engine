@@ -3211,22 +3211,24 @@ class _VanguardManualTestPlaygroundState
     // ── Extract values ─────────────────────────────────────────────────────
     num _n(String k) => _dualCamTelemetry[k] ?? 0;
 
-    final pulls       = _n('pullFrameCallCount').toInt();
-    final decodes     = _n('primaryDecodeCount').toInt();
-    final successful  = _n('successfulFrameCount').toInt();
-    final composites  = _n('compositedFrameCount').toInt();
-    final pip         = _n('pipCompositionCount').toInt();
-    final split       = _n('splitScreenCompositionCount').toInt();
-    final failures    = _n('compositionFailureCount').toInt();
-    final fallbacks   = _n('fallbackToPrimaryCount').toInt();
-    final imgBuilds   = _n('imageBufferBuildCount').toInt();
-    final outBufs     = _n('outputBufferCreateCount').toInt();
-    final retBytes    = _n('estimatedRetainedBufferBytes').toInt();
-    final retMB       = _n('estimatedRetainedBufferMB').toDouble();
-    final firstMs     = _n('firstFrameMs').toDouble();
-    final lastMs      = _n('lastPullFrameMs').toDouble();
-    final maxMs       = _n('maxPullFrameMs').toDouble();
-    final avgMs       = _n('averagePullFrameMs').toDouble();
+    final pulls          = _n('pullFrameCallCount').toInt();
+    final primaryDecodes = _n('primaryDecodeCount').toInt();
+    final secDecodes     = _n('secondaryDecodeCount').toInt(); // Phase 7.x-P
+    final successful     = _n('successfulFrameCount').toInt();
+    final composites     = _n('compositedFrameCount').toInt();
+    final pip            = _n('pipCompositionCount').toInt();
+    final split          = _n('splitScreenCompositionCount').toInt();
+    final failures       = _n('compositionFailureCount').toInt();
+    final fallbacks      = _n('fallbackToPrimaryCount').toInt();
+    final imgBuilds      = _n('imageBufferBuildCount').toInt();
+    final outBufs        = _n('outputBufferCreateCount').toInt();
+    final retBytes       = _n('estimatedRetainedBufferBytes').toInt();
+    final retMB          = _n('estimatedRetainedBufferMB').toDouble();
+    // Phase 7.x-P: firstFrameLatencyMs is a true elapsed latency, not an absolute stamp.
+    final firstLatencyMs = _n('firstFrameLatencyMs').toDouble();
+    final lastMs         = _n('lastPullFrameMs').toDouble();
+    final maxMs          = _n('maxPullFrameMs').toDouble();
+    final avgMs          = _n('averagePullFrameMs').toDouble();
 
     // ── Helpers ───────────────────────────────────────────────────────────
     String fmtMs(double ms) => ms > 0 ? '${ms.toStringAsFixed(2)} ms' : '—';
@@ -3237,8 +3239,9 @@ class _VanguardManualTestPlaygroundState
       return '${(kb / 1024).toStringAsFixed(2)} MB';
     }
     String fmtMB(double mb) => mb > 0 ? '${mb.toStringAsFixed(3)} MB' : '—';
-    final cacheHitPct = pulls > 0 && decodes <= pulls
-        ? '${((pulls - decodes) / pulls * 100.0).toStringAsFixed(1)}%'
+    // Cache-hit ratio uses primary decodes only (image clips have 0 primary decodes).
+    final cacheHitPct = pulls > 0 && primaryDecodes <= pulls
+        ? '${((pulls - primaryDecodes) / pulls * 100.0).toStringAsFixed(1)}%'
         : '—';
 
     return Container(
@@ -3290,9 +3293,13 @@ class _VanguardManualTestPlaygroundState
 
           if (hasTelemetry) ...[
             // ── Pull / decode ────────────────────────────────────────────
-            _buildStatRow('Pull calls',      '$pulls',      kAccent),
-            _buildStatRow('Decoded frames',  '$decodes',    kWarning),
-            _buildStatRow('Delivered frames','$successful', kBright),
+            _buildStatRow('Pull calls',        '$pulls',        kAccent),
+            // Phase 7.x-P: separate primary and secondary decode counters.
+            // Primary decodes > 0 for video primary; 0 for still-image primary.
+            // Secondary decodes > 0 for video secondary; 0 for still-image secondary.
+            _buildStatRow('Primary decodes',   '$primaryDecodes', kWarning),
+            _buildStatRow('Secondary decodes', '$secDecodes',     kWarning),
+            _buildStatRow('Delivered frames',  '$successful',    kBright),
             _buildStatRow('Cache-hit ratio', cacheHitPct,
                 pulls > 0 ? kAccent : kDim),
             const SizedBox(height: 6),
@@ -3316,8 +3323,10 @@ class _VanguardManualTestPlaygroundState
             _buildStatRow('Avg pull dur',  fmtMs(avgMs),  kAccent),
             _buildStatRow('Last pull dur', fmtMs(lastMs), kMid),
             _buildStatRow('Max pull dur',  fmtMs(maxMs),  kWarning),
-            _buildStatRow('First frame stamp',
-                firstMs > 0 ? '${firstMs.toStringAsFixed(0)} ms' : '—', kDim),
+            // Phase 7.x-P: firstFrameLatencyMs = elapsed from pullFrame: entry to first
+            // delivered frame — a true latency in ms, not an absolute timestamp.
+            _buildStatRow('First frame latency',
+                firstLatencyMs > 0 ? fmtMs(firstLatencyMs) : '—', kDim),
             const SizedBox(height: 6),
 
             // ── Buffer memory ────────────────────────────────────────────
