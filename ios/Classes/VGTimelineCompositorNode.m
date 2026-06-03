@@ -320,6 +320,17 @@ typedef struct {
     double           marginFraction; ///< >= 0.0
     double           cornerRadius;   ///< >= 0.0
     double           opacity;        ///< 0.0–1.0
+    /// Phase 7.x-Q3D: Display dimensions of the primary source video after
+    /// preferredTransform rotation. Set at reader build time so the PiP
+    /// compositor can compute the visible content rect inside the canvas.
+    /// CGSizeZero when unknown / no aspect-fit normalization is active.
+    CGSize primarySourceSize;
+    /// Phase 7.x-Q3E: Display dimensions of the secondary source video after
+    /// preferredTransform rotation. Set at secondary reader build time so the
+    /// PiP compositor can aspect-fill the secondary content into the PiP rect
+    /// (removing black bars introduced by the secondary's canvas aspect-fit).
+    /// CGSizeZero when unknown / no canvas normalization active.
+    CGSize secondarySourceSize;
 } _VGTCNPiPLayoutConfig;
 
 /// Parsed split-screen layout config. Stored per clip at init time.
@@ -427,6 +438,30 @@ static _VGTCNDualCameraLayoutConfig _VGTCNParseLayoutConfig(id rawDualCameraDict
     return cfg;
 }
 
+// ── Phase 7.x-Q3D: Visible primary content rect helper ──────────────────────
+//
+// Computes the CGRect within a canvas of canvasSize that contains the visible
+// aspect-fit content from a source of sourceSize.
+// Mirrors the aspect-fit logic in _buildReaderForClipIndex: (AVComposition
+// instruction). Returned rect is in CoreImage Y-up coordinates (Y=0 at bottom).
+//
+// When sourceSize is degenerate (zero width or height), falls back to the full
+// canvas rect so PiP placement degrades gracefully rather than crashing.
+static CGRect _VGTCNAspectFitRect(CGSize sourceSize, CGSize canvasSize) {
+    if (sourceSize.width <= 0.0 || sourceSize.height <= 0.0
+        || canvasSize.width <= 0.0 || canvasSize.height <= 0.0) {
+        // Degenerate: fall back to full canvas.
+        return CGRectMake(0.0, 0.0, canvasSize.width, canvasSize.height);
+    }
+    double scale = MIN(canvasSize.width  / sourceSize.width,
+                       canvasSize.height / sourceSize.height);
+    double visW = sourceSize.width  * scale;
+    double visH = sourceSize.height * scale;
+    double x    = (canvasSize.width  - visW) * 0.5;
+    double y    = (canvasSize.height - visH) * 0.5; // Y-up: lower origin = bottom letterbox
+    return CGRectMake(x, y, visW, visH);
+}
+
 // ── Phase 7.x-Q3B: Canvas-authority CVPixelBuffer allocator ─────────────────
 // Creates a BGRA + Metal + IOSurface buffer at _targetRenderSize.
 // Returns NULL if targetSize is degenerate.
@@ -474,74 +509,169 @@ static CVPixelBufferRef _VGTCNCompositePiP(
         return NULL;
     }
 
-    // PiP geometry — widthFraction and margin are fractions of PRIMARY width.
+    // Phase 7.x-Q3D: Compute the visible primary content rect.
+    // When _targetRenderSize != primaryBuf dimensions OR when primarySourceSize
+    // is known, the primary pixel buffer contains letterbox/pillarbox black bars
+    // from AVComposition aspect-fit. PiP must be placed relative to the visible
+    // content area, not the full canvas.
+    //
+    // primarySourceSize carries the display dimensions captured at reader build
+    // time. When zero (legacy/no aspect-fit), fall back to full primW x primH.
+    CGRect visiblePrimRect;
+    if (pip.primarySourceSize.width > 0.0 && pip.primarySourceSize.height > 0.0) {
+        visiblePrimRect = _VGTCNAspectFitRect(
+            pip.primarySourceSize,
+            CGSizeMake((double)primW, (double)primH));
+    } else {
+        // No source size known: treat entire primary buffer as visible.
+        visiblePrimRect = CGRectMake(0.0, 0.0, (double)primW, (double)primH);
+    }
+    double refW = CGRectGetWidth(visiblePrimRect);
+    double refH = CGRectGetHeight(visiblePrimRect);
+    double refX = CGRectGetMinX(visiblePrimRect);
+    double refY = CGRectGetMinY(visiblePrimRect);
+
+    // PiP geometry — widthFraction and margin are fractions of visible primary width.
     double wf = pip.widthFraction;
     double mf = pip.marginFraction;
     if (wf < 0.01) { wf = 0.01; }
     if (wf > 0.95) { wf = 0.95; }
 
-    double pipW  = (double)primW * wf;
-    double pipH  = (secH > 0 && secW > 0) ? pipW * (double)secH / (double)secW : pipW;
-    double margin = (double)primW * mf;
+    // Phase 7.x-Q3E (surgical): Compute visible secondary content rect BEFORE
+    // deriving pipH. The secondary pixel buffer is aspect-fit into the full
+    // canvas by AVComposition, so secW/secH = canvas dimensions (e.g. 1920x1080
+    // landscape), not the true secondary content size (e.g. portrait 1080x1920).
+    // Using secH/secW for pipH would produce a landscape PiP box, which then
+    // forces aspect-fill to aggressively crop portrait content to fill it.
+    // Using visSecH/visSecW for pipH makes the PiP box match the actual content.
+    CGRect visSecRect;
+    if (pip.secondarySourceSize.width > 0.0 && pip.secondarySourceSize.height > 0.0) {
+        visSecRect = _VGTCNAspectFitRect(
+            pip.secondarySourceSize,
+            CGSizeMake((double)secW, (double)secH));
+    } else {
+        // secondarySourceSize not known: use full buffer (may include black bars,
+        // but at least fallback preserves prior behavior without crash).
+        visSecRect = CGRectMake(0.0, 0.0, (double)secW, (double)secH);
+    }
+    double visSecW = CGRectGetWidth(visSecRect);
+    double visSecH = CGRectGetHeight(visSecRect);
+    // Safety clamp: avoid division-by-zero if rect is degenerate.
+    if (visSecW <= 0.0 || visSecH <= 0.0) {
+        visSecW = (double)secW;
+        visSecH = (double)secH;
+        visSecRect = CGRectMake(0.0, 0.0, visSecW, visSecH);
+    }
 
-    // Clamp pipW so PiP fits within primary bounds.
-    double maxPipW = (double)primW - 2.0 * margin;
+    double pipW  = refW * wf;
+    // Use visible secondary aspect ratio, not canvas aspect ratio.
+    double pipH  = (visSecH > 0.0 && visSecW > 0.0) ? pipW * visSecH / visSecW : pipW;
+    double margin = refW * mf;
+
+    // Clamp pipW so PiP fits within visible primary bounds.
+    double maxPipW = refW - 2.0 * margin;
     if (maxPipW < 1.0) { maxPipW = 1.0; margin = 0.0; }
     if (pipW > maxPipW) { pipW = maxPipW; }
-    if (secW > 0) { pipH = pipW * (double)secH / (double)secW; }
+    // Recompute pipH after pipW clamp — use visible secondary aspect ratio.
+    if (visSecW > 0.0) { pipH = pipW * visSecH / visSecW; }
     if (pipH < 1.0) { pipH = 1.0; }
-    double maxPipH = (double)primH - 2.0 * margin;
+    double maxPipH = refH - 2.0 * margin;
     if (maxPipH < 1.0) { maxPipH = 1.0; }
     if (pipH > maxPipH) {
         pipH = maxPipH;
-        if (secH > 0) { pipW = pipH * (double)secW / (double)secH; }
+        // Preserve visible secondary aspect ratio: scale pipW proportionally.
+        if (visSecH > 0.0) { pipW = pipH * visSecW / visSecH; }
     }
 
     // Anchor → CIImage Y-up origin (Y=0 at bottom-left).
+    // Origins are relative to the visible primary content rect, not the full canvas.
     double pipOriginX = 0.0, pipOriginY = 0.0;
     switch (pip.anchor) {
         case _VGTCNPiPAnchorTopLeft:
-            pipOriginX = margin;
-            pipOriginY = (double)primH - pipH - margin;
+            pipOriginX = refX + margin;
+            pipOriginY = refY + refH - pipH - margin;
             break;
         case _VGTCNPiPAnchorTopRight:
-            pipOriginX = (double)primW - pipW - margin;
-            pipOriginY = (double)primH - pipH - margin;
+            pipOriginX = refX + refW - pipW - margin;
+            pipOriginY = refY + refH - pipH - margin;
             break;
         case _VGTCNPiPAnchorBottomLeft:
-            pipOriginX = margin;
-            pipOriginY = margin;
+            pipOriginX = refX + margin;
+            pipOriginY = refY + margin;
             break;
         case _VGTCNPiPAnchorBottomRight:
         default:
-            pipOriginX = (double)primW - pipW - margin;
-            pipOriginY = margin;
+            pipOriginX = refX + refW - pipW - margin;
+            pipOriginY = refY + margin;
             break;
     }
-    // Clamp origin to keep PiP in bounds.
-    if (pipOriginX < 0.0) { pipOriginX = 0.0; }
-    if (pipOriginY < 0.0) { pipOriginY = 0.0; }
-    if (pipOriginX + pipW > (double)primW) { pipOriginX = (double)primW - pipW; }
-    if (pipOriginY + pipH > (double)primH) { pipOriginY = (double)primH - pipH; }
+    // Clamp origin to keep PiP fully inside visible primary rect.
+    if (pipOriginX < refX) { pipOriginX = refX; }
+    if (pipOriginY < refY) { pipOriginY = refY; }
+    if (pipOriginX + pipW > refX + refW) { pipOriginX = refX + refW - pipW; }
+    if (pipOriginY + pipH > refY + refH) { pipOriginY = refY + refH - pipH; }
 
     // Build CIImages.
     CIImage *primaryCI   = [CIImage imageWithCVPixelBuffer:primaryBuf];
     CIImage *secondaryCI = [CIImage imageWithCVPixelBuffer:secondaryBuf];
     if (!primaryCI || !secondaryCI) return NULL;
 
-    // Normalize secondary origin, scale to PiP rect, translate to anchor.
+    // Phase 7.x-Q3E: Aspect-fill secondary into PiP rect with center-crop.
+    //
+    // The secondary pixel buffer is aspect-fit into the full canvas by AVComposition,
+    // producing letterbox/pillarbox black bars. visSecRect (computed above) bounds
+    // the visible content. We crop it out, then aspect-fill into the PiP rect.
+    //
+    // Because pipW/pipH now matches visSecW/visSecH aspect ratio, fillScale using
+    // MAX() will be essentially uniform (equal in both axes), eliminating severe
+    // crop while still ensuring no black padding at the PiP edges.
+    //
+    // Pipeline:
+    //   1. Normalize secondary CIImage origin to {0,0}.
+    //   2. Crop to visSecRect (strips black bars).
+    //   3. Normalize cropped origin to {0,0}.
+    //   4. Aspect-fill scale: MAX(pipW/visSecW, pipH/visSecH).
+    //   5. Scale uniformly.
+    //   6. Center-translate over PiP rect.
+    //   7. Crop to pipFinalRect (removes any sub-pixel overflow).
+    CGRect pipFinalRect = CGRectMake(pipOriginX, pipOriginY, pipW, pipH);
+
     CIImage *secNorm = secondaryCI;
     CGPoint secOrigin = secNorm.extent.origin;
     if (secOrigin.x != 0.0 || secOrigin.y != 0.0) {
         secNorm = [secNorm imageByApplyingTransform:
                    CGAffineTransformMakeTranslation(-secOrigin.x, -secOrigin.y)];
     }
-    double scaleX = (secW > 0) ? pipW / (double)secW : 1.0;
-    double scaleY = (secH > 0) ? pipH / (double)secH : 1.0;
-    CIImage *secScaled = [secNorm imageByApplyingTransform:
-                          CGAffineTransformMakeScale(scaleX, scaleY)];
-    CIImage *secPositioned = [secScaled imageByApplyingTransform:
-                              CGAffineTransformMakeTranslation(pipOriginX, pipOriginY)];
+
+    // Crop to visible secondary content, removing black bar regions.
+    CIImage *secContent = [secNorm imageByCroppingToRect:visSecRect];
+    // Normalize cropped origin to {0,0} so scale/translate below use a simple origin.
+    if (visSecRect.origin.x != 0.0 || visSecRect.origin.y != 0.0) {
+        secContent = [secContent imageByApplyingTransform:
+                      CGAffineTransformMakeTranslation(-visSecRect.origin.x,
+                                                       -visSecRect.origin.y)];
+    }
+
+    // Aspect-fill: scale = MAX so secondary content fills PiP with no black edges.
+    // Because pipH/pipW already matches visSecH/visSecW, both axes yield the same
+    // scale — the content fits without aggressive crop in the normal case.
+    double fillScale = MAX(pipW / visSecW, pipH / visSecH);
+    if (fillScale <= 0.0) { fillScale = 1.0; }
+
+    CIImage *secScaled = [secContent imageByApplyingTransform:
+                          CGAffineTransformMakeScale(fillScale, fillScale)];
+
+    // Center over PiP rect (Y-up: CIImage origin is bottom-left).
+    double scaledW = visSecW * fillScale;
+    double scaledH = visSecH * fillScale;
+    double tx = pipOriginX + (pipW - scaledW) * 0.5;
+    double ty = pipOriginY + (pipH - scaledH) * 0.5;
+    CIImage *secTranslated = [secScaled imageByApplyingTransform:
+                              CGAffineTransformMakeTranslation(tx, ty)];
+
+    // Crop to PiP rect: removes any sub-pixel overflow from aspect-fill.
+    CIImage *secPositioned = [secTranslated imageByCroppingToRect:pipFinalRect];
+
 
     // Corner radius mask (CIRoundedRectangleGenerator + CIBlendWithAlphaMask).
     CIImage *secStyled = secPositioned;
@@ -3746,6 +3876,26 @@ static inline double _VGQuantizePTS(double pts) {
     videoComposition.renderSize = _targetRenderSize;
     videoComposition.instructions = @[instruction];
 
+    // Phase 7.x-Q3D: Store primary source display dimensions in the layout config
+    // so _VGTCNCompositePiP can compute the visible primary rect at composition
+    // time and anchor the PiP over the actual video content (not black bars).
+    if (clipIndex < _dualCameraLayoutConfigs.count) {
+      NSValue *cfgValue = _dualCameraLayoutConfigs[clipIndex];
+      _VGTCNDualCameraLayoutConfig cfg;
+      [cfgValue getValue:&cfg];
+      if (cfg.enabled) {
+        cfg.pip.primarySourceSize = CGSizeMake(displayW, displayH);
+        NSMutableArray *mutableConfigs =
+            [NSMutableArray arrayWithArray:_dualCameraLayoutConfigs];
+        mutableConfigs[clipIndex] =
+            [NSValue value:&cfg withObjCType:@encode(_VGTCNDualCameraLayoutConfig)];
+        _dualCameraLayoutConfigs = [mutableConfigs copy];
+        os_log(sTimelineLog,
+               "[VGTCNode-Q3D] stored primarySourceSize=%.0fx%.0f for clip=%lu",
+               displayW, displayH, (unsigned long)clipIndex);
+      }
+    }
+
     os_log(sTimelineLog,
            "[VGTCNode] aspect-fit: clip=%lu display=%.0fx%.0f "
            "canvas=%.0fx%.0f scale=%.4f tx=%.1f ty=%.1f",
@@ -4086,6 +4236,26 @@ static inline double _VGQuantizePTS(double pts) {
 
     secVideoComposition.renderSize = _targetRenderSize;
     secVideoComposition.instructions = @[secInstruction];
+
+    // Phase 7.x-Q3E: Store secondary source display dimensions in the layout
+    // config so _VGTCNCompositePiP can aspect-fill the visible secondary content
+    // into the PiP rect (removing black bars from the secondary canvas aspect-fit).
+    if (clipIndex < _dualCameraLayoutConfigs.count) {
+      NSValue *cfgValue = _dualCameraLayoutConfigs[clipIndex];
+      _VGTCNDualCameraLayoutConfig cfg;
+      [cfgValue getValue:&cfg];
+      if (cfg.enabled && cfg.mode == _VGTCNDualCameraLayoutModePiP) {
+        cfg.pip.secondarySourceSize = CGSizeMake(secDisplayW, secDisplayH);
+        NSMutableArray *mutableConfigs =
+            [NSMutableArray arrayWithArray:_dualCameraLayoutConfigs];
+        mutableConfigs[clipIndex] =
+            [NSValue value:&cfg withObjCType:@encode(_VGTCNDualCameraLayoutConfig)];
+        _dualCameraLayoutConfigs = [mutableConfigs copy];
+        os_log(sTimelineLog,
+               "[VGTCNode-Q3E] stored secondarySourceSize=%.0fx%.0f for clip=%lu",
+               secDisplayW, secDisplayH, (unsigned long)clipIndex);
+      }
+    }
   }
 
   // ── 9. Create and configure output ──────────────────────────────────────
