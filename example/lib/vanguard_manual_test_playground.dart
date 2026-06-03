@@ -111,6 +111,12 @@ class _VanguardManualTestPlaygroundState
   Map<String, num> _dualCamTelemetry = const {};
   bool _fetchingTelemetry = false;
 
+  // ── Phase 7.x-Q3C: Production timeline dual-camera toggle ────────────────
+  // When true, VGClipDescriptor.dualCamera is injected into Clip A before
+  // the standard VGEditorController / VGTimelineCompositorNode pipeline.
+  // This is distinct from the isolated DEV VGDualCameraCompositorNode texture.
+  bool _useProductionDualCamera = false;
+
   // ── Phase 7.18B2: Cache Metrics HUD state ──────────────────────────────────
   Map<String, int> _cacheStats = const {};
   bool _fetchingStats = false;
@@ -272,56 +278,104 @@ class _VanguardManualTestPlaygroundState
     }
 
     // Build the draft
-    final clips = [
-      VGClipDescriptor(
-        id: 'clip-A',
-        sourcePath: _tempPathA!,
-        durationSeconds: 5.06,
+    //
+    // Phase 7.x-Q3C: When _useProductionDualCamera is true, Clip A carries a
+    // nested VGDualCameraDescriptor (secondary = Clip B), routed through the
+    // production VGTimelineCompositorNode path (not the DEV texture route).
+    // Clip B remains in the timeline as a normal single-stream second clip so
+    // the total timeline structure stays valid; the compositor uses it only as
+    // the secondary source while rendering the dual-cam composite for Clip A.
+    final clipABase = VGClipDescriptor(
+      id: 'clip-A',
+      sourcePath: _tempPathA!,
+      durationSeconds: 5.06,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 5.06,
+      // Phase 7.11: apply clip A transform when non-identity.
+      transform: (_clipAScaleX != 1.0 || _clipAScaleY != 1.0 ||
+                  _clipARotation != 0.0 || _clipAOpacity != 1.0 ||
+                  _clipATransX != 0.0 || _clipATransY != 0.0)
+          ? VGClipTransformDescriptor(
+              scaleX: _clipAScaleX,
+              scaleY: _clipAScaleY,
+              rotation: _clipARotation,
+              opacity: _clipAOpacity,
+              translationX: _clipATransX,
+              translationY: _clipATransY,
+            )
+          : null,
+    );
+
+    // Phase 7.x-Q3C: build the dual-camera descriptor for the production path.
+    VGDualCameraDescriptor? prodDualCamera;
+    if (_useProductionDualCamera) {
+      final secondaryForDual = VGClipDescriptor(
+        id: 'clip-A-secondary',
+        sourcePath: _tempPathB!,
+        mediaKind: VGMediaKind.video,
+        durationSeconds: 5.56,
         trimStartSeconds: 0.0,
-        trimEndSeconds: 5.06,
-        // Phase 7.11: apply clip A transform when non-identity.
-        transform: (_clipAScaleX != 1.0 || _clipAScaleY != 1.0 ||
-                    _clipARotation != 0.0 || _clipAOpacity != 1.0 ||
-                    _clipATransX != 0.0 || _clipATransY != 0.0)
-            ? VGClipTransformDescriptor(
-                scaleX: _clipAScaleX,
-                scaleY: _clipAScaleY,
-                rotation: _clipARotation,
-                opacity: _clipAOpacity,
-                translationX: _clipATransX,
-                translationY: _clipATransY,
-              )
-            : null,
-      ),
-      // Phase 7.12: when _useStillImageClipB is true, Clip B becomes a still image.
-      // The existing A→B transition selector and Clip B transform sliders apply to
-      // the still image exactly as they do to the video clip (unified pipeline).
-      VGClipDescriptor(
-        id: 'clip-B',
-        sourcePath: _useStillImageClipB ? _tempPathC! : _tempPathB!,
-        mediaKind: _useStillImageClipB ? VGMediaKind.image : VGMediaKind.video,
-        durationSeconds: _useStillImageClipB ? 5.0 : 5.56,
-        trimStartSeconds: 0.0,
-        trimEndSeconds: _useStillImageClipB ? 5.0 : 5.56,
-        // Phase 7.16: Apply fitMode and cropRect when Clip B is still image
-        fitMode: _useStillImageClipB ? _stillFitMode : VGStillImageFitMode.fit,
-        cropRect: (_useStillImageClipB && _useStillCrop) ? const [0.1, 0.1, 0.8, 0.8] : null,
-        // Phase 7.11 + 7.12: apply clip B transform when non-identity.
-        // Applies to both video and still-image variants of Clip B.
-        transform: (_clipBScaleX != 1.0 || _clipBScaleY != 1.0 ||
-                    _clipBRotation != 0.0 || _clipBOpacity != 1.0 ||
-                    _clipBTransX != 0.0 || _clipBTransY != 0.0)
-            ? VGClipTransformDescriptor(
-                scaleX: _clipBScaleX,
-                scaleY: _clipBScaleY,
-                rotation: _clipBRotation,
-                opacity: _clipBOpacity,
-                translationX: _clipBTransX,
-                translationY: _clipBTransY,
-              )
-            : null,
-      ),
-    ];
+        trimEndSeconds: 5.56,
+      );
+      if (_dualCamLayoutMode == VGDualCameraLayoutMode.splitScreen) {
+        prodDualCamera = VGDualCameraDescriptor(
+          primaryClip: clipABase,
+          secondaryClip: secondaryForDual,
+          layoutMode: VGDualCameraLayoutMode.splitScreen,
+          splitLayout: VGSplitScreenLayoutDescriptor(
+            splitRatio: _splitRatio.clamp(0.2, 0.8),
+          ),
+        );
+      } else {
+        prodDualCamera = VGDualCameraDescriptor(
+          primaryClip: clipABase,
+          secondaryClip: secondaryForDual,
+          layoutMode: VGDualCameraLayoutMode.pip,
+          pipLayout: VGPiPLayoutDescriptor(
+            anchor: _pipAnchor,
+            widthFraction: _pipWidthFraction.clamp(0.05, 0.75),
+            marginFraction: _pipMarginFraction.clamp(0.0, 0.10),
+            cornerRadius: _pipCornerRadius.clamp(0.0, 80.0),
+            opacity: _pipOpacity.clamp(0.0, 1.0),
+          ),
+        );
+      }
+    }
+
+    final clipA = prodDualCamera != null
+        ? clipABase.copyWith(dualCamera: prodDualCamera)
+        : clipABase;
+
+    // Phase 7.12: when _useStillImageClipB is true, Clip B becomes a still image.
+    // The existing A→B transition selector and Clip B transform sliders apply to
+    // the still image exactly as they do to the video clip (unified pipeline).
+    final clipB = VGClipDescriptor(
+      id: 'clip-B',
+      sourcePath: _useStillImageClipB ? _tempPathC! : _tempPathB!,
+      mediaKind: _useStillImageClipB ? VGMediaKind.image : VGMediaKind.video,
+      durationSeconds: _useStillImageClipB ? 5.0 : 5.56,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: _useStillImageClipB ? 5.0 : 5.56,
+      // Phase 7.16: Apply fitMode and cropRect when Clip B is still image
+      fitMode: _useStillImageClipB ? _stillFitMode : VGStillImageFitMode.fit,
+      cropRect: (_useStillImageClipB && _useStillCrop) ? const [0.1, 0.1, 0.8, 0.8] : null,
+      // Phase 7.11 + 7.12: apply clip B transform when non-identity.
+      // Applies to both video and still-image variants of Clip B.
+      transform: (_clipBScaleX != 1.0 || _clipBScaleY != 1.0 ||
+                  _clipBRotation != 0.0 || _clipBOpacity != 1.0 ||
+                  _clipBTransX != 0.0 || _clipBTransY != 0.0)
+          ? VGClipTransformDescriptor(
+              scaleX: _clipBScaleX,
+              scaleY: _clipBScaleY,
+              rotation: _clipBRotation,
+              opacity: _clipBOpacity,
+              translationX: _clipBTransX,
+              translationY: _clipBTransY,
+            )
+          : null,
+    );
+
+    final clips = [clipA, clipB];
 
     List<VGTransitionDescriptor> transitions = [];
     if (_selectedTransition == 'hard_cut') {
@@ -1161,6 +1215,10 @@ class _VanguardManualTestPlaygroundState
 
                         // ── Phase 7.20D: Reverse Sidecar Status HUD ──────────────
                         _buildSidecarStatusCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.x-Q3C: Production Timeline Dual-Camera ────────
+                        _buildProductionDualCamCard(),
                         const SizedBox(height: 12),
 
                         // ── Phase 7.x-C: DEV Dual-Camera Smoke ───────────────────
@@ -2415,6 +2473,191 @@ class _VanguardManualTestPlaygroundState
             ],
           ),
         ],
+      ),
+    );
+  }
+
+  // ── Phase 7.x-Q3C: Production timeline dual-camera harness card ───────────
+  //
+  // Routes through VGClipDescriptor.dualCamera → VGEditorController →
+  // VGTimelineCompositorNode (Q3B composition). This is the production path,
+  // NOT the isolated DEV VGDualCameraCompositorNode texture route.
+  Widget _buildProductionDualCamCard() {
+    const Color kAccent = Color(0xFF7C3AED); // purple — visually distinct from DEV orange
+    final bool assetsReady = _tempPathA != null && _tempPathB != null;
+    final bool isActive = _useProductionDualCamera;
+    final String modeLabel = _dualCamLayoutMode == VGDualCameraLayoutMode.splitScreen
+        ? 'Split-Screen'
+        : 'PiP';
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: isActive
+              ? kAccent.withValues(alpha: 0.8)
+              : kAccent.withValues(alpha: 0.35),
+          width: isActive ? 1.5 : 1.0,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // ── Header ──────────────────────────────────────────────────────
+          Row(
+            children: [
+              const Icon(Icons.layers_outlined, color: kAccent, size: 14),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  'PHASE 7.x-Q3C — PRODUCTION TIMELINE DUAL-CAMERA (DEV)',
+                  style: TextStyle(
+                    color: kAccent,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.0,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'Routes through VGClipDescriptor.dualCamera → VGTimelineCompositorNode (Q3B). '
+            'Toggle ON rebuilds the production timeline with dual-camera composition. '
+            'Distinct from the DEV VGDualCameraCompositorNode texture below.',
+            style: TextStyle(color: Colors.white38, fontSize: 10),
+          ),
+          const SizedBox(height: 12),
+
+          // ── Enable/disable toggle ────────────────────────────────────────
+          Row(
+            children: [
+              const Icon(Icons.videocam_outlined, color: kAccent, size: 14),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  'Production Timeline Dual-Camera (DEV)',
+                  style: TextStyle(color: Colors.white70, fontSize: 12),
+                ),
+              ),
+              Switch(
+                value: _useProductionDualCamera,
+                activeColor: kAccent,
+                onChanged: assetsReady
+                    ? (v) {
+                        setState(() => _useProductionDualCamera = v);
+                        _rebuildTimeline();
+                      }
+                    : null,
+              ),
+            ],
+          ),
+
+          if (isActive) ...[
+            const SizedBox(height: 8),
+            // ── Active status banner ─────────────────────────────────────
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: kAccent.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: kAccent.withValues(alpha: 0.4)),
+              ),
+              child: Text(
+                'ACTIVE — layout=$modeLabel  primary=clip-A  secondary=clip-B (clip_B.mov)\n'
+                'Playback and seek below validate Q3B composition via production timeline.',
+                style: const TextStyle(
+                  color: kAccent,
+                  fontSize: 10,
+                  fontFamily: 'monospace',
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+
+            // ── Quick layout mode switcher (production path) ─────────────
+            const Text(
+              'Layout Mode (applies to production timeline)',
+              style: TextStyle(color: Colors.white54, fontSize: 11),
+            ),
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                _buildProdLayoutModeButton(
+                    VGDualCameraLayoutMode.pip, 'PiP', kAccent),
+                const SizedBox(width: 8),
+                _buildProdLayoutModeButton(
+                    VGDualCameraLayoutMode.splitScreen, 'Split-Screen', kAccent),
+              ],
+            ),
+            const SizedBox(height: 8),
+
+            // ── Manual validation instructions ───────────────────────────
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: Colors.black26,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: const Text(
+                'MANUAL VALIDATION STEPS:\n'
+                '1. Toggle ON Production Timeline Dual-Camera.\n'
+                '2. Select PiP → Press Play → verify secondary video appears in corner.\n'
+                '3. Scrub slider → verify secondary frame updates with primary.\n'
+                '4. Select Split-Screen → rebuild triggers automatically.\n'
+                '5. Press Play → verify top/bottom halves show different streams.\n'
+                '6. Toggle OFF to restore single-stream timeline.',
+                style: TextStyle(
+                  color: Colors.white54,
+                  fontSize: 10,
+                  fontFamily: 'monospace',
+                  height: 1.5,
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  // Production path layout mode button: tapping triggers _debouncedRebuild()
+  // (not _applyLayout(), which remounts the DEV texture).
+  Widget _buildProdLayoutModeButton(
+      VGDualCameraLayoutMode mode, String label, Color accentColor) {
+    final bool active = _dualCamLayoutMode == mode;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () {
+          setState(() => _dualCamLayoutMode = mode);
+          if (_useProductionDualCamera) {
+            _debouncedRebuild();
+          }
+        },
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          decoration: BoxDecoration(
+            color: active
+                ? accentColor
+                : Colors.white.withValues(alpha: 0.03),
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(
+              color: active ? accentColor : Colors.white12,
+            ),
+          ),
+          alignment: Alignment.center,
+          child: Text(
+            label,
+            style: TextStyle(
+              color: active ? Colors.white : Colors.white54,
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+        ),
       ),
     );
   }
