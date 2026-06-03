@@ -35,6 +35,8 @@ export 'vg_graph_transaction.dart';
 // Phase 7 Stage 7.1: non-destructive timeline descriptor models (pure data).
 export 'vg_clip_descriptor.dart';
 export 'vg_transition_descriptor.dart';
+// Phase 7.22A: time remap descriptor foundation (descriptor-only; no rendering).
+export 'vg_time_remap_descriptor.dart';
 // Phase 7.11: per-clip spatial transform + opacity descriptor.
 export 'vg_clip_transform_descriptor.dart';
 // Phase 7.x-A: Dual-Camera Editor Consumption Descriptor Foundation.

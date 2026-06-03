@@ -1,5 +1,5 @@
 // vg_clip_descriptor.dart
-// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11 / Phase 7.16 / Phase 7.17 / Phase 7.19B / Phase 7.x-Q1
+// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11 / Phase 7.16 / Phase 7.17 / Phase 7.19B / Phase 7.x-Q1 / Phase 7.22A
 //
 // Non-destructive clip descriptor for the UMF V2 timeline editor.
 //
@@ -54,6 +54,17 @@
 //   - Existing DEV routes that use VGDualCameraDescriptor.toMap() (which
 //     includes primaryClip) are unaffected.
 //
+// Phase 7.22A addition:
+//   - [timeRemap]: optional VGTimeRemapDescriptor — when non-null describes
+//     variable-speed playback as an ordered list of VGSpeedSegmentDescriptor
+//     values plus an audio policy.
+//   - **Descriptor-only in Phase 7.22A.** The native compositor ignores this
+//     field until Phase 7.22B+ implements PTS mapping.
+//   - Wire key: 'timeRemap'. Omitted from toMap() when null.
+//   - Backward-compatible: existing maps without 'timeRemap' produce null.
+//   - The existing [speed] field remains unchanged and is NOT superseded in
+//     this slice. Both coexist; the compositor continues to use [speed] only.
+//
 // Serialisation:
 //   toMap() produces a JSON-compatible map:
 //   {
@@ -71,10 +82,12 @@
 //     'freezePTS': double?,      // Phase 7.17: omitted when null
 //     'isReversed': bool?,       // Phase 7.19B: omitted when false (default)
 //     'dualCamera': Map?,        // Phase 7.x-Q1: omitted when null; secondary-only wire payload
+//     'timeRemap': Map?,         // Phase 7.22A: omitted when null; descriptor-only in 7.22A
 //   }
 
 import 'vg_clip_transform_descriptor.dart';
 import 'vg_dual_camera_descriptor.dart';
+import 'vg_time_remap_descriptor.dart';
 
 // ── VGStillImageFitMode ──────────────────────────────────────────────────────
 
@@ -178,6 +191,7 @@ final class VGClipDescriptor {
     this.freezePTS,
     this.isReversed = false,
     this.dualCamera,
+    this.timeRemap,
   })  : assert(startTimeSeconds >= 0, 'startTimeSeconds must be >= 0'),
         assert(durationSeconds >= 0, 'durationSeconds must be >= 0'),
         assert(trimStartSeconds >= 0, 'trimStartSeconds must be >= 0'),
@@ -396,6 +410,23 @@ final class VGClipDescriptor {
   ///   clip renders exactly as a normal single clip when dualCamera is present.
   final VGDualCameraDescriptor? dualCamera;
 
+  // ── Time remap descriptor (Phase 7.22A) ──────────────────────────────────
+
+  /// Optional variable-speed time remap descriptor.
+  ///
+  /// **Phase 7.22A** — descriptor and serialization only. When non-null,
+  /// this field describes piecewise variable-speed playback for this clip
+  /// via an ordered list of [VGSpeedSegmentDescriptor] values.
+  ///
+  /// Design notes:
+  /// - Null means no time remap; the existing [speed] field governs playback.
+  /// - **The native compositor ignores this field in Phase 7.22A.** Actual
+  ///   PTS mapping is implemented in a follow-up slice (Phase 7.22B+).
+  /// - The existing [speed] field is NOT removed or superseded in this slice.
+  /// - Wire key: 'timeRemap'. Omitted from [toMap] when null.
+  /// - Backward-compatible: existing clip maps without 'timeRemap' produce null.
+  final VGTimeRemapDescriptor? timeRemap;
+
   // ── Crop rect convenience accessors (Phase 7.16) ─────────────────────────
 
   /// The normalized X origin of the crop rectangle. Null when [cropRect] is null.
@@ -481,6 +512,11 @@ final class VGClipDescriptor {
     // IS the primary — duplicating it would create field drift risk).
     if (dualCamera != null) {
       m['dualCamera'] = dualCamera!.toTimelineMap();
+    }
+    // Phase 7.22A: include timeRemap when non-null (descriptor-only; compositor
+    // ignores this field until Phase 7.22B+ PTS mapping is implemented).
+    if (timeRemap != null) {
+      m['timeRemap'] = timeRemap!.toMap();
     }
     return m;
   }
@@ -600,6 +636,26 @@ final class VGClipDescriptor {
       if (dualCamera == null) return null; // malformed dual-camera payload
     }
 
+    // Phase 7.22A: parse optional timeRemap.
+    // Missing key means null (no time remap — uses [speed] only).
+    // A present but malformed map causes fromMap to return null.
+    VGTimeRemapDescriptor? timeRemap;
+    final rawTimeRemap = map['timeRemap'];
+    if (rawTimeRemap != null) {
+      if (rawTimeRemap is! Map<Object?, Object?>) {
+        if (rawTimeRemap is Map) {
+          timeRemap = VGTimeRemapDescriptor.fromMap(
+            rawTimeRemap.cast<Object?, Object?>(),
+          );
+        } else {
+          return null;
+        }
+      } else {
+        timeRemap = VGTimeRemapDescriptor.fromMap(rawTimeRemap);
+      }
+      if (timeRemap == null) return null; // malformed time remap payload
+    }
+
     return VGClipDescriptor(
       id: id as String,
       sourcePath: sourcePath as String,
@@ -615,6 +671,7 @@ final class VGClipDescriptor {
       freezePTS: freezePTS,
       isReversed: isReversed,
       dualCamera: dualCamera,
+      timeRemap: timeRemap,
     );
   }
 
@@ -642,6 +699,8 @@ final class VGClipDescriptor {
     bool? isReversed,
     // Use sentinel to allow explicit null assignment (clear dualCamera).
     Object? dualCamera = _kClipNoValue,
+    // Use sentinel to allow explicit null assignment (clear timeRemap).
+    Object? timeRemap = _kClipNoValue,
   }) {
     return VGClipDescriptor(
       id: id ?? this.id,
@@ -666,6 +725,9 @@ final class VGClipDescriptor {
       dualCamera: dualCamera == _kClipNoValue
           ? this.dualCamera
           : dualCamera as VGDualCameraDescriptor?,
+      timeRemap: timeRemap == _kClipNoValue
+          ? this.timeRemap
+          : timeRemap as VGTimeRemapDescriptor?,
     );
   }
 
@@ -688,7 +750,8 @@ final class VGClipDescriptor {
           _cropRectEqual(other.cropRect, cropRect) &&
           other.freezePTS == freezePTS &&
           other.isReversed == isReversed &&
-          other.dualCamera == dualCamera;
+          other.dualCamera == dualCamera &&
+          other.timeRemap == timeRemap;
 
   /// Deep-equality helper for the [cropRect] list field.
   static bool _cropRectEqual(List<double>? a, List<double>? b) {
@@ -718,6 +781,7 @@ final class VGClipDescriptor {
         freezePTS,
         isReversed,
         dualCamera,
+        timeRemap,
       );
 
   @override
@@ -734,7 +798,8 @@ final class VGClipDescriptor {
       'cropRect: $cropRect, '
       'freezePTS: $freezePTS, '
       'isReversed: $isReversed, '
-      'dualCamera: ${dualCamera != null ? "<present layoutMode=${dualCamera!.layoutMode.value}>" : null})';
+      'dualCamera: ${dualCamera != null ? "<present layoutMode=${dualCamera!.layoutMode.value}>" : null}, '
+      'timeRemap: ${timeRemap != null ? "<present segments=${timeRemap!.segments.length}>" : null})';
 }
 
 // ── Sentinel for copyWith nullable fields ─────────────────────────────────────────
