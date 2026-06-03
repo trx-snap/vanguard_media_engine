@@ -1,5 +1,5 @@
 // vg_clip_descriptor.dart
-// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11 / Phase 7.16 / Phase 7.17 / Phase 7.19B
+// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11 / Phase 7.16 / Phase 7.17 / Phase 7.19B / Phase 7.x-Q1
 //
 // Non-destructive clip descriptor for the UMF V2 timeline editor.
 //
@@ -43,6 +43,17 @@
 //     false. Applies ONLY to [VGMediaKind.video] clips with a null [freezePTS].
 //     Still-image and freeze-frame clips cannot be reversed (native constraint).
 //
+// Phase 7.x-Q1 addition:
+//   - [dualCamera]: optional VGDualCameraDescriptor — when non-null this clip
+//     is a dual-camera composite. The enclosing VGClipDescriptor is the
+//     primary stream. The nested descriptor provides the secondary stream and
+//     layout. Null means single-stream clip (no change to existing behavior).
+//   - The production timeline wire key is 'dualCamera'. Its nested map is
+//     produced by VGDualCameraDescriptor.toTimelineMap() which omits
+//     primaryClip (since the enclosing descriptor IS the primary).
+//   - Existing DEV routes that use VGDualCameraDescriptor.toMap() (which
+//     includes primaryClip) are unaffected.
+//
 // Serialisation:
 //   toMap() produces a JSON-compatible map:
 //   {
@@ -59,9 +70,11 @@
 //     'cropRect': List<double>?, // Phase 7.16: omitted when null
 //     'freezePTS': double?,      // Phase 7.17: omitted when null
 //     'isReversed': bool?,       // Phase 7.19B: omitted when false (default)
+//     'dualCamera': Map?,        // Phase 7.x-Q1: omitted when null; secondary-only wire payload
 //   }
 
 import 'vg_clip_transform_descriptor.dart';
+import 'vg_dual_camera_descriptor.dart';
 
 // ── VGStillImageFitMode ──────────────────────────────────────────────────────
 
@@ -164,6 +177,7 @@ final class VGClipDescriptor {
     this.cropRect,
     this.freezePTS,
     this.isReversed = false,
+    this.dualCamera,
   })  : assert(startTimeSeconds >= 0, 'startTimeSeconds must be >= 0'),
         assert(durationSeconds >= 0, 'durationSeconds must be >= 0'),
         assert(trimStartSeconds >= 0, 'trimStartSeconds must be >= 0'),
@@ -362,6 +376,26 @@ final class VGClipDescriptor {
   /// Omitted from [toMap] when false to keep wire payloads minimal.
   final bool isReversed;
 
+  // ── Dual-camera descriptor (Phase 7.x-Q1) ─────────────────────────────────
+
+  /// Optional dual-camera descriptor for production timeline integration.
+  ///
+  /// **Phase 7.x-Q1** — when non-null, this clip is a dual-camera composite.
+  /// The enclosing [VGClipDescriptor] is the **primary stream**. The nested
+  /// [VGDualCameraDescriptor] provides the secondary stream and layout.
+  ///
+  /// Design notes:
+  /// - Null means single-stream clip; no change to any existing behavior.
+  /// - The production timeline wire format uses [toMap] which serializes
+  ///   [dualCamera] via [VGDualCameraDescriptor.toTimelineMap], omitting
+  ///   `primaryClip` (the enclosing descriptor IS the primary).
+  /// - Existing DEV routes use [VGDualCameraDescriptor.toMap] directly and
+  ///   are not affected by this field.
+  /// - [VGTimelineCompositorNode] detects the nested 'dualCamera' key and
+  ///   stores it for future Q2 secondary-reader integration. In Q1, primary
+  ///   clip renders exactly as a normal single clip when dualCamera is present.
+  final VGDualCameraDescriptor? dualCamera;
+
   // ── Crop rect convenience accessors (Phase 7.16) ─────────────────────────
 
   /// The normalized X origin of the crop rectangle. Null when [cropRect] is null.
@@ -441,6 +475,12 @@ final class VGClipDescriptor {
     // Phase 7.19B: omit isReversed when false (default); include only when true.
     if (isReversed) {
       m['isReversed'] = true;
+    }
+    // Phase 7.x-Q1: include dualCamera as secondary-only timeline payload.
+    // Uses toTimelineMap() which omits primaryClip (the enclosing descriptor
+    // IS the primary — duplicating it would create field drift risk).
+    if (dualCamera != null) {
+      m['dualCamera'] = dualCamera!.toTimelineMap();
     }
     return m;
   }
@@ -526,6 +566,40 @@ final class VGClipDescriptor {
     // Phase 7.19B: parse optional isReversed. Missing key → false (default).
     final isReversed = (map['isReversed'] as bool?) ?? false;
 
+    // Phase 7.x-Q1: parse optional dualCamera timeline payload.
+    // The timeline wire format produced by toTimelineMap() does NOT include
+    // a 'primaryClip' key. fromMap() reconstructs a VGDualCameraDescriptor
+    // from the secondary-only payload by using the enclosing descriptor as
+    // the primary. A malformed dualCamera sub-map causes fromMap to return null.
+    VGDualCameraDescriptor? dualCamera;
+    final rawDualCamera = map['dualCamera'];
+    if (rawDualCamera != null) {
+      if (rawDualCamera is! Map<Object?, Object?>) return null;
+      // Build a synthetic primary from the fields parsed so far.
+      // We need a provisional primary to satisfy VGDualCameraDescriptor's
+      // constructor. The actual primary is the enclosing descriptor itself.
+      final provisionalPrimary = VGClipDescriptor(
+        id: id as String,
+        sourcePath: sourcePath as String,
+        mediaKind: VGMediaKind.fromValue(mediaKindStr),
+        startTimeSeconds: startTime,
+        durationSeconds: duration,
+        trimStartSeconds: trimStart,
+        trimEndSeconds: trimEnd,
+        speed: speed,
+        transform: transform,
+        fitMode: fitMode,
+        cropRect: cropRect,
+        freezePTS: freezePTS,
+        isReversed: isReversed,
+      );
+      dualCamera = VGDualCameraDescriptor.fromTimelineMap(
+        rawDualCamera,
+        primaryClip: provisionalPrimary,
+      );
+      if (dualCamera == null) return null; // malformed dual-camera payload
+    }
+
     return VGClipDescriptor(
       id: id as String,
       sourcePath: sourcePath as String,
@@ -540,6 +614,7 @@ final class VGClipDescriptor {
       cropRect: cropRect,
       freezePTS: freezePTS,
       isReversed: isReversed,
+      dualCamera: dualCamera,
     );
   }
 
@@ -565,6 +640,8 @@ final class VGClipDescriptor {
     // Use sentinel to allow explicit null assignment (clear freezePTS).
     Object? freezePTS = _kClipNoValue,
     bool? isReversed,
+    // Use sentinel to allow explicit null assignment (clear dualCamera).
+    Object? dualCamera = _kClipNoValue,
   }) {
     return VGClipDescriptor(
       id: id ?? this.id,
@@ -586,6 +663,9 @@ final class VGClipDescriptor {
           ? this.freezePTS
           : freezePTS as double?,
       isReversed: isReversed ?? this.isReversed,
+      dualCamera: dualCamera == _kClipNoValue
+          ? this.dualCamera
+          : dualCamera as VGDualCameraDescriptor?,
     );
   }
 
@@ -607,7 +687,8 @@ final class VGClipDescriptor {
           other.fitMode == fitMode &&
           _cropRectEqual(other.cropRect, cropRect) &&
           other.freezePTS == freezePTS &&
-          other.isReversed == isReversed;
+          other.isReversed == isReversed &&
+          other.dualCamera == dualCamera;
 
   /// Deep-equality helper for the [cropRect] list field.
   static bool _cropRectEqual(List<double>? a, List<double>? b) {
@@ -636,6 +717,7 @@ final class VGClipDescriptor {
         Object.hashAll(cropRect ?? const []),
         freezePTS,
         isReversed,
+        dualCamera,
       );
 
   @override
@@ -651,7 +733,8 @@ final class VGClipDescriptor {
       'fitMode: ${fitMode.value}, '
       'cropRect: $cropRect, '
       'freezePTS: $freezePTS, '
-      'isReversed: $isReversed)';
+      'isReversed: $isReversed, '
+      'dualCamera: ${dualCamera != null ? "<present layoutMode=${dualCamera!.layoutMode.value}>" : null})';
 }
 
 // ── Sentinel for copyWith nullable fields ─────────────────────────────────────────

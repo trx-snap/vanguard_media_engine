@@ -1,4 +1,6 @@
 // vg_dual_camera_descriptor.dart
+// Phase 7.x-Q1 addition: toTimelineMap() and fromTimelineMap(_:primaryClip:)
+// for production VGClipDescriptor wire integration.
 import 'package:flutter/foundation.dart';
 import 'vg_clip_descriptor.dart';
 
@@ -237,6 +239,28 @@ class VGDualCameraDescriptor {
     };
   }
 
+  /// Produces the production timeline wire payload for [VGClipDescriptor.toMap].
+  ///
+  /// **Phase 7.x-Q1** — This secondary-only map is embedded under the
+  /// 'dualCamera' key in the enclosing [VGClipDescriptor]'s map.
+  ///
+  /// Differs from [toMap] in one critical way:
+  /// - `primaryClip` is **omitted**. The enclosing [VGClipDescriptor] IS
+  ///   the primary clip; duplicating it would create field drift risk and
+  ///   unnecessary payload bloat.
+  ///
+  /// [VGTimelineCompositorNode] (native) parses this map from the clip dict
+  /// under the 'dualCamera' key. It reads `secondaryClip`, `layoutMode`,
+  /// `pipLayout`, and `splitLayout`. It does not expect `primaryClip`.
+  Map<String, Object?> toTimelineMap() {
+    return {
+      'secondaryClip': secondaryClip.toMap(),
+      'layoutMode': layoutMode.value,
+      'pipLayout': pipLayout.toMap(),
+      'splitLayout': splitLayout.toMap(),
+    };
+  }
+
   static VGDualCameraDescriptor? fromMap(Map<Object?, Object?>? map) {
     if (map == null) return null;
 
@@ -258,6 +282,49 @@ class VGDualCameraDescriptor {
     // Phase 7.x-K: parse splitLayout; fallback to default.
     final splitLayoutMap = map['splitLayout'] as Map<Object?, Object?>?;
     final splitLayout = VGSplitScreenLayoutDescriptor.fromMap(splitLayoutMap) ??
+        const VGSplitScreenLayoutDescriptor();
+
+    return VGDualCameraDescriptor(
+      primaryClip: primaryClip,
+      secondaryClip: secondaryClip,
+      layoutMode: layoutMode,
+      pipLayout: pipLayout,
+      splitLayout: splitLayout,
+    );
+  }
+
+  /// Reconstructs a [VGDualCameraDescriptor] from a secondary-only timeline map.
+  ///
+  /// **Phase 7.x-Q1** — The [map] is produced by [toTimelineMap] and does
+  /// NOT contain a 'primaryClip' key. The caller must supply [primaryClip]
+  /// (the enclosing [VGClipDescriptor]).
+  ///
+  /// Returns null if [map] is null, missing 'secondaryClip', or contains an
+  /// invalid secondary clip. Returns null if [primaryClip].id equals the
+  /// deserialized secondaryClip.id (same-ID guard).
+  static VGDualCameraDescriptor? fromTimelineMap(
+    Map<Object?, Object?> map, {
+    required VGClipDescriptor primaryClip,
+  }) {
+    final secondaryMap = map['secondaryClip'] as Map<Object?, Object?>?;
+    if (secondaryMap == null) return null;
+
+    final secondaryClip = VGClipDescriptor.fromMap(secondaryMap);
+    if (secondaryClip == null) return null;
+    if (primaryClip.id == secondaryClip.id) return null;
+
+    final layoutModeStr = map['layoutMode'] as String?;
+    final layoutMode = layoutModeStr != null
+        ? VGDualCameraLayoutModeExtension.fromValue(layoutModeStr)
+        : VGDualCameraLayoutMode.pip;
+
+    final pipLayoutMap = map['pipLayout'] as Map<Object?, Object?>?;
+    final pipLayout =
+        VGPiPLayoutDescriptor.fromMap(pipLayoutMap) ?? const VGPiPLayoutDescriptor();
+
+    final splitLayoutMap = map['splitLayout'] as Map<Object?, Object?>?;
+    final splitLayout =
+        VGSplitScreenLayoutDescriptor.fromMap(splitLayoutMap) ??
         const VGSplitScreenLayoutDescriptor();
 
     return VGDualCameraDescriptor(

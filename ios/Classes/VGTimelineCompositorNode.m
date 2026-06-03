@@ -147,6 +147,11 @@ static NSString *const kVGTCNDescriptorStage75 = @"7.5_executable";
 static NSString *const kVGTCNDescriptorStage74 = @"7.4_non_executable";
 static NSString *const kVGTCNClipsKey = @"clips";
 static NSString *const kVGTCNTransitionsKey = @"transitions";
+// Phase 7.x-Q1: dual-camera descriptor key embedded per clip dict.
+// Presence indicates this clip is a dual-camera composite (primary = enclosing
+// clip; secondary + layout = this nested map). Q1: detected and logged only.
+// Q2: secondary reader will be built from this dict.
+static NSString *const kVGTCNDualCameraKey = @"dualCamera";
 
 // ─── Canvas dimension keys (Phase 7.9 aspect-fit normalization) ──────────────
 // When present and non-zero, the compositor overrides
@@ -1051,6 +1056,7 @@ static inline double _VGQuantizePTS(double pts) {
   // Sorted ascending by startTimeSeconds (enforced by VGEditorGraphFactory).
   NSArray<VGClipDescriptor *> *_clips;
   NSArray<VGTransitionDescriptor *> *_transitions;
+  NSArray<NSDictionary *> *_dualCameraDescDicts; // Phase 7.x-Q1
 
   // ── Active / outgoing reader state ─────────────────────────────────────────
   // _activeReader:  the incoming (or sole) clip reader. Never nil during decode.
@@ -1229,6 +1235,66 @@ static inline double _VGQuantizePTS(double pts) {
     }
   }
 
+  // ── (c2) Phase 7.x-Q1: detect dual-camera descriptor per clip ───────────────
+  //
+  // The Dart VGClipDescriptor.toMap() embeds 'dualCamera' (a secondary-only
+  // map) under each clip dict when the clip carries a VGDualCameraDescriptor.
+  //
+  // Q1 contract:
+  //   - A clip dict WITHOUT 'dualCamera': exact existing behavior (no change).
+  //   - A clip dict WITH 'dualCamera' that is a valid NSDictionary:
+  //       • Accepted without error.
+  //       • The clip is parsed as primary (enclosing VGClipDescriptor).
+  //       • The nested dict is stored per-clip for future Q2 secondary reader.
+  //       • Visual output: primary clip only (single-stream), exactly as if
+  //         dualCamera were absent. No rendering difference in Q1.
+  //   - A clip dict WITH 'dualCamera' that is NOT a dictionary:
+  //       • Rejected at init time (malformed payload guard).
+  //
+  // RR-162 note: when Q2 builds the secondary reader, double CVPixelBuffer
+  // memory will be held during composition. Monitor via estimatedRetainedBufferBytes.
+  //
+  // Implementation: rawClips is the original array from the parameters dict.
+  // We iterate it in parallel with the deserialized clips array to read the
+  // raw NSDictionary entry for each clip (VGClipDescriptor does not carry
+  // the unrecognised 'dualCamera' key — we preserve it here separately).
+  NSMutableArray<NSDictionary *> *dualCameraDescDicts =
+      [NSMutableArray arrayWithCapacity:clips.count];
+  NSArray *rawClipsArray = (NSArray *)rawClips; // safe: already type-checked above
+  for (NSUInteger i = 0; i < clips.count; i++) {
+    NSDictionary *rawClip = rawClipsArray[i]; // already validated as NSDictionary
+    id rawDualCamera = rawClip[kVGTCNDualCameraKey];
+    if (rawDualCamera == nil) {
+      // Normal single-stream clip. Store NSNull as sentinel.
+      [dualCameraDescDicts addObject:(NSDictionary *)[NSNull null]];
+    } else if (![rawDualCamera isKindOfClass:[NSDictionary class]]) {
+      // dualCamera key is present but not a dictionary — malformed payload.
+      if (outError) {
+        *outError = _VGTCNError(
+            30,
+            ([NSString
+                 stringWithFormat:
+                     @"VGTimelineCompositorNode (Phase 7.x-Q1): clips[%lu] (id=%@): "
+                      "'dualCamera' key is present but is not a dictionary. "
+                      "Expected Map<String,Object?> from VGDualCameraDescriptor.toTimelineMap().",
+                     (unsigned long)i,
+                     ((VGClipDescriptor *)clips[i]).clipId]));
+      }
+      return nil;
+    } else {
+      // Valid dual-camera descriptor dict. Store for Q2 secondary reader.
+      [dualCameraDescDicts addObject:(NSDictionary *)rawDualCamera];
+      os_log(sTimelineLog,
+             "[VGTCNode-Q1] clips[%lu] (id=%{public}@): dual-camera descriptor present "
+             "(layoutMode=%{public}@). Primary renders as single clip until Q2.",
+             (unsigned long)i,
+             ((VGClipDescriptor *)clips[i]).clipId,
+             rawDualCamera[@"layoutMode"] ?: @"<nil>");
+    }
+  }
+  // _dualCameraDescDicts is stored for Q2 consumption. In Q1 it is held but
+  // not acted upon during pullFrame:. Stored after [super init] below.
+
   // ── (d) Deserialize transition descriptors ────────────────────────────────
   id rawTransitions = parameters[kVGTCNTransitionsKey];
   NSMutableArray<VGTransitionDescriptor *> *transitions =
@@ -1349,6 +1415,8 @@ static inline double _VGQuantizePTS(double pts) {
   _ports = [ports copy];
   _clips = [clips copy];
   _transitions = [transitions copy];
+  // Phase 7.x-Q1: store dual-camera descriptor dicts for Q2 secondary reader.
+  _dualCameraDescDicts = [dualCameraDescDicts copy];
 
   _lastDeliveredBuffer = NULL;
   _activeReader = nil;
