@@ -734,6 +734,14 @@ static os_log_t sTimelineLog;
 // Reset to NO when this primary reader is torn down and rebuilt on next clip.
 // Ownership: this flag lives on the PRIMARY reader (not the secondary).
 @property(nonatomic) BOOL secondaryEOSReached;
+// Phase 7.x-Q3A: The VGClipDescriptor this reader was built from.
+// For primary readers: always _clips[clipIndex] (set in _buildReaderForClipIndex:).
+// For secondary readers: the parsed secondary VGClipDescriptor from the
+// dualCamera dictionary (set in _buildSecondaryReaderForDualCamera:).
+// This field decouples _pullBufferFromReader: from the _clips array, ensuring
+// secondary readers look up the correct sourceURL, fitMode, transform, etc.
+// ARC manages lifetime; no manual release needed.
+@property(nonatomic, strong, nullable) VGClipDescriptor *resolvedClip;
 @end
 
 @implementation _VGClipReader
@@ -2134,7 +2142,9 @@ static inline double _VGQuantizePTS(double pts) {
   //             when freezePTS is non-nil.
   // Transform changes require reader/draft rebuild; no dynamic per-frame image transform update in this slice.
   if (reader.isStaticSource) {
-    VGClipDescriptor *clip = _clips[reader.clipIndex];
+    // Phase 7.x-Q3A: Use resolvedClip so secondary static-source readers
+    // decode from their own sourceURL, not the primary timeline clip's URL.
+    VGClipDescriptor *clip = reader.resolvedClip ?: _clips[reader.clipIndex];
 
     // ── Phase 7.18A: Compositor-level frame cache lookup ──────────────────
     // Check the shared frame cache before the per-reader buffer and before
@@ -2447,7 +2457,9 @@ static inline double _VGQuantizePTS(double pts) {
   // display-refresh cycle (60 Hz display vs 30 fps source).
   // Error codes 40-49 are reserved for Phase 7.19 reverse extraction.
   if (reader.isReversed && !reader.isStaticSource) {
-    VGClipDescriptor *clip = _clips[reader.clipIndex];
+    // Phase 7.x-Q3A: Use resolvedClip so secondary reversed readers
+    // decode from their own sourceURL.
+    VGClipDescriptor *clip = reader.resolvedClip ?: _clips[reader.clipIndex];
     uint64_t currentGen = atomic_load(&_generation);
 
     // ── 1. Check compositor-level frame cache ──────────────────────────────
@@ -2662,7 +2674,9 @@ static inline double _VGQuantizePTS(double pts) {
   // Identity for all non-sidecar readers (clip not reversed, or reader.isReversed YES,
   // or reader is a static source with reader.reader == nil).
   {
-    VGClipDescriptor *scRemapClip = _clips[reader.clipIndex];
+    // Phase 7.x-Q3A: Use resolvedClip for sidecar time-remap so that
+    // a secondary reversed reader (if ever enabled) uses its own descriptor.
+    VGClipDescriptor *scRemapClip = reader.resolvedClip ?: _clips[reader.clipIndex];
     if (scRemapClip.isReversed && !reader.isReversed && reader.reader != nil) {
       double sidecarT = scRemapClip.trimEndSeconds - tAsset;
       os_log_debug(sTimelineLog,
@@ -2717,7 +2731,9 @@ static inline double _VGQuantizePTS(double pts) {
   CVPixelBufferRetain(pb); // pb is now +1
 
   // ── 4. Apply Phase 7.11 per-clip transform (identity optimization: skip if identity) ──
-  VGClipTransformDescriptor *td = _clips[reader.clipIndex].transform;
+  // Phase 7.x-Q3A: Use resolvedClip so secondary readers apply their own
+  // transform descriptor, not the primary timeline clip's transform.
+  VGClipTransformDescriptor *td = (reader.resolvedClip ?: _clips[reader.clipIndex]).transform;
   if (td && !td.isIdentity) {
     NSError *tfErr = nil;
     CVPixelBufferRef transformedPB = _VGTCNApplyTransformAndOpacity(pb, td, &tfErr);
@@ -2791,6 +2807,7 @@ static inline double _VGQuantizePTS(double pts) {
     clipReader.sourceFPS = 1.0;     // Safe non-zero default; unused for frame timing.
     clipReader.isStaticSource = YES;
     clipReader.freezePTS = nil;     // Not a freeze clip; sourceURL decoded directly.
+    clipReader.resolvedClip = clip; // Phase 7.x-Q3A: bind descriptor for pull path.
     os_log(sTimelineLog,
            "[VGTCNode] built static reader (still-image): clip=%lu",
            (unsigned long)clipIndex);
@@ -2810,6 +2827,7 @@ static inline double _VGQuantizePTS(double pts) {
     clipReader.sourceFPS = 1.0;       // Unused for static path.
     clipReader.isStaticSource = YES;
     clipReader.freezePTS = clip.freezePTS; // Stored for lazy extraction.
+    clipReader.resolvedClip = clip; // Phase 7.x-Q3A: bind descriptor for pull path.
     os_log(sTimelineLog,
            "[VGTCNode] built static reader (freeze-frame): clip=%lu freezePTS=%.3fs",
            (unsigned long)clipIndex,
@@ -3279,6 +3297,7 @@ static inline double _VGQuantizePTS(double pts) {
   // Still-image and freeze clips already short-circuit before this point
   // (they return from the mediaKindImage and freezePTS branches above).
   clipReader.isReversed = clip.isReversed;
+  clipReader.resolvedClip = clip; // Phase 7.x-Q3A: bind descriptor for pull path.
 
   os_log(sTimelineLog,
          "[VGTCNode] built reader: clip=%lu startAt=%.3fs fps=%.1f isReversed=%d",
@@ -3380,55 +3399,66 @@ static inline double _VGQuantizePTS(double pts) {
     return nil;
   }
 
-  // ── 2. Q2 shape guard: reject unsupported secondary shapes ───────────────
+  // ── 2. Shape guard: reject unsupported secondary shapes ─────────────────
   //
   // Freeze-frame and reversed clips require separate reader infrastructure
   // (AVAssetImageGenerator / sidecar swap) that is deferred to Q3+.
   // These are non-fatal: primary playback continues; secondary is simply absent.
   if (secClip.freezePTS != nil) {
     os_log(sTimelineLog,
-           "[VGTCNode-Q2] secondary clip (primary=%lu) is freeze-frame — "
-           "unsupported in Q2. Secondary skipped.",
+           "[VGTCNode-Q3A] secondary clip (primary=%lu) is freeze-frame — "
+           "unsupported in Q3A. Secondary skipped.",
            (unsigned long)clipIndex);
     return nil; // Not an error; outError left nil.
   }
   if (secClip.isReversed) {
     os_log(sTimelineLog,
-           "[VGTCNode-Q2] secondary clip (primary=%lu) is reversed — "
-           "unsupported in Q2. Secondary skipped.",
+           "[VGTCNode-Q3A] secondary clip (primary=%lu) is reversed — "
+           "unsupported in Q3A. Secondary skipped.",
            (unsigned long)clipIndex);
     return nil; // Not an error; outError left nil.
   }
 
   // ── 3a. Branch: still-image secondary ───────────────────────────────────
   //
-  // Q2: Still-image secondaries are deferred to Q3. The existing static-source
-  // pull path (_pullBufferFromReader: §Phase 7.12) looks up the clip descriptor
-  // via _clips[reader.clipIndex].sourceURL, which is the PRIMARY clip's URL.
-  // Using the primary's clipIndex for the secondary reader would decode the
-  // wrong image. Correct wiring of secondary sourceURL requires Q3 compositor
-  // refactoring (direct VGClipDescriptor pass-through). Non-fatal skip here.
+  // Phase 7.x-Q3A: Still-image secondaries are now supported. The resolvedClip
+  // property on _VGClipReader carries the secondary's VGClipDescriptor, so
+  // _pullBufferFromReader:'s static-source path will decode from the correct
+  // secondaryClip.sourceURL instead of the primary timeline clip's URL.
   if (secClip.mediaKind == VGClipMediaKindImage) {
+    if (secClip.sourceURL.length == 0) {
+      os_log_error(sTimelineLog,
+                   "[VGTCNode-Q3A] still-image secondary (primary=%lu) has empty "
+                   "sourceURL. Secondary skipped.",
+                   (unsigned long)clipIndex);
+      return nil;
+    }
+    _VGClipReader *secImgReader = [[_VGClipReader alloc] init];
+    secImgReader.clipIndex      = clipIndex; // primary timeline index (for logging/cache keying)
+    secImgReader.reader         = nil;
+    secImgReader.trackOutput    = nil;
+    secImgReader.sourceFPS      = 1.0;       // Unused for static path.
+    secImgReader.isStaticSource = YES;
+    secImgReader.freezePTS      = nil;       // Not a freeze clip.
+    secImgReader.isReversed     = NO;
+    secImgReader.resolvedClip   = secClip;   // Phase 7.x-Q3A: secondary descriptor.
     os_log(sTimelineLog,
-           "[VGTCNode-Q2] secondary clip (primary=%lu) is still-image — "
-           "unsupported in Q2 (sourceURL lookup deferred to Q3). "
-           "Secondary skipped.",
+           "[VGTCNode-Q3A] built static secondary reader (still-image): primary=%lu",
            (unsigned long)clipIndex);
-    return nil; // Not an error; outError left nil.
+    return secImgReader;
   }
-
 
   // ── 3b. Branch: video secondary (normal forward, non-frozen) ────────────
   if (secClip.mediaKind != VGClipMediaKindVideo) {
     os_log(sTimelineLog,
-           "[VGTCNode-Q2] secondary clip (primary=%lu) has unsupported "
+           "[VGTCNode-Q3A] secondary clip (primary=%lu) has unsupported "
            "mediaKind=%ld. Secondary skipped.",
            (unsigned long)clipIndex, (long)secClip.mediaKind);
     return nil;
   }
   if (secClip.sourceURL.length == 0) {
     os_log_error(sTimelineLog,
-                 "[VGTCNode-Q2] video secondary (primary=%lu) has empty "
+                 "[VGTCNode-Q3A] video secondary (primary=%lu) has empty "
                  "sourceURL. Secondary skipped.",
                  (unsigned long)clipIndex);
     return nil;
@@ -3585,15 +3615,16 @@ static inline double _VGQuantizePTS(double pts) {
 
   // ── 12. Build and return secondary _VGClipReader ─────────────────────────
   _VGClipReader *secClipReader = [[_VGClipReader alloc] init];
-  secClipReader.clipIndex      = clipIndex; // shared index; Q3 reads secClip from dualCameraDict
+  secClipReader.clipIndex      = clipIndex; // primary timeline index (for logging/cache keying)
   secClipReader.reader         = secReader;
   secClipReader.trackOutput    = secOutput;
   secClipReader.sourceFPS      = secSourceFPS;
   secClipReader.isStaticSource = NO;
   secClipReader.isReversed     = NO; // reversed guard above ensures this is NO
+  secClipReader.resolvedClip   = secClip; // Phase 7.x-Q3A: bind secondary descriptor.
 
   os_log(sTimelineLog,
-         "[VGTCNode-Q2] secondary video reader built: primary clip=%lu "
+         "[VGTCNode-Q3A] secondary video reader built: primary clip=%lu "
          "secStart=%.3fs fps=%.1f",
          (unsigned long)clipIndex, startTimeSecs, secSourceFPS);
 
@@ -3801,6 +3832,7 @@ static inline double _VGQuantizePTS(double pts) {
   clipReader.isReversed         = NO;  // ← sidecar is forward-playable
   clipReader.isStaticSource     = NO;
   clipReader.freezePTS          = nil;
+  clipReader.resolvedClip       = _clips[clipIndex]; // Phase 7.x-Q3A: sidecar is always a primary reader.
 
   os_log(sTimelineLog,
          "[VGTCNode] 7.20C sidecar reader built: clip=%lu sidecarStart=%.3fs "
