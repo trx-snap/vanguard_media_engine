@@ -724,6 +724,16 @@ static os_log_t sTimelineLog;
 // (forward-only AVAssetReader is bypassed). Frames are cached in _frameCache.
 // Always NO for still-image and freeze-frame clips (those use isStaticSource=YES).
 @property(nonatomic) BOOL isReversed;
+// Phase 7.x-Q2: Optional nested secondary reader for dual-camera timeline clips.
+// Non-nil only when the enclosing clip carries a VGDualCameraDescriptor.
+// Lifecycle: released automatically when this primary reader is deallocated
+// (clip switch, seek, or invalidate). No additional teardown code needed.
+@property(nonatomic, strong, nullable) _VGClipReader *secondaryClipReader;
+// Phase 7.x-Q2: YES when the secondary reader has been exhausted (EOS or error).
+// When YES, pullFrame: skips secondary pull for this clip; primary continues.
+// Reset to NO when this primary reader is torn down and rebuilt on next clip.
+// Ownership: this flag lives on the PRIMARY reader (not the secondary).
+@property(nonatomic) BOOL secondaryEOSReached;
 @end
 
 @implementation _VGClipReader
@@ -1995,6 +2005,71 @@ static inline double _VGQuantizePTS(double pts) {
   // Store for node-level envelope lifetime (RR-36).
   _lastDeliveredBuffer = pb;
 
+  // ── Phase 7.x-Q2: Secondary reader lockstep pull ─────────────────────────
+  //
+  // If this primary clip has a secondary reader (dual-camera), advance it
+  // in lockstep with the primary. Q2 output remains the primary buffer only;
+  // the secondary buffer is immediately released (caller's +1), but the
+  // secondary reader's lastDeliveredBuffer retains its own +1 for Q3
+  // composition. Seek/clip-switch/invalidate cleanup cascades automatically
+  // through _activeReader → secondaryClipReader dealloc.
+  //
+  // Time mapping (Opus Q2 correction):
+  //   elapsedTimeline = requestedPTSSecs - primaryClip.startTimeSeconds
+  //   secSpeed        = secondaryClip.speed (clamped to > 0)
+  //   t_sec_asset     = secondaryClip.trimStartSeconds + elapsedTimeline * secSpeed
+  //   t_sec_asset     = clamp(t_sec_asset, trimStartSeconds, trimEndSeconds)
+  if (_activeReader.secondaryClipReader != nil &&
+      !_activeReader.secondaryEOSReached) {
+    // Retrieve the secondary clip descriptor from the stored dicts.
+    // _dualCameraDescDicts[activeClipIndex] is validated non-nil (NSDictionary)
+    // at reader build time; checking isKindOfClass here is a belt-and-suspenders
+    // guard (should always be YES at this point).
+    id rawDualCamera = (activeClipIndex < _dualCameraDescDicts.count)
+        ? _dualCameraDescDicts[activeClipIndex]
+        : nil;
+    id rawSecondaryClip = [rawDualCamera isKindOfClass:[NSDictionary class]]
+        ? ((NSDictionary *)rawDualCamera)[@"secondaryClip"]
+        : nil;
+    if ([rawSecondaryClip isKindOfClass:[NSDictionary class]]) {
+      VGClipDescriptor *secondaryClip =
+          [VGClipDescriptor fromDictionary:(NSDictionary *)rawSecondaryClip];
+      if (secondaryClip) {
+        double secSpeed = (secondaryClip.speed > 0.0) ? secondaryClip.speed : 1.0;
+        double tSecAsset = secondaryClip.trimStartSeconds + elapsedTimeline * secSpeed;
+        tSecAsset = MAX(tSecAsset, secondaryClip.trimStartSeconds);
+        tSecAsset = MIN(tSecAsset, secondaryClip.trimEndSeconds);
+
+        NSError *secPullErr = nil;
+        CVPixelBufferRef secPB =
+            [self _pullBufferFromReader:_activeReader.secondaryClipReader
+                           atAssetTime:tSecAsset
+                                 error:&secPullErr];
+        if (secPB) {
+          // Q2: discard caller's +1; secondary reader cache retains its own +1
+          // via lastDeliveredBuffer for Q3 composition use.
+          CVPixelBufferRelease(secPB);
+          os_log_debug(sTimelineLog,
+                       "[VGTCNode-Q2] secondary frame pulled: clip=%lu tSec=%.3fs",
+                       (unsigned long)activeClipIndex, tSecAsset);
+        } else if (!secPullErr) {
+          // NULL without error: secondary reader exhausted (EOS).
+          _activeReader.secondaryEOSReached = YES;
+          os_log(sTimelineLog,
+                 "[VGTCNode-Q2] secondary EOS: clip=%lu — future pulls skipped",
+                 (unsigned long)activeClipIndex);
+        } else {
+          // Pull error: mark EOS on secondary to avoid repeated error attempts.
+          _activeReader.secondaryEOSReached = YES;
+          os_log_error(sTimelineLog,
+                       "[VGTCNode-Q2] secondary pull error clip=%lu: %{public}@",
+                       (unsigned long)activeClipIndex,
+                       secPullErr.localizedDescription);
+        }
+      }
+    }
+  }
+
   // Use asset-local duration from per-reader cache for the output envelope.
   double sDur = _activeReader.lastDeliveredAssetDuration;
   CMTime outputDur = (sDur > 0.0)
@@ -3209,7 +3284,320 @@ static inline double _VGQuantizePTS(double pts) {
          "[VGTCNode] built reader: clip=%lu startAt=%.3fs fps=%.1f isReversed=%d",
          (unsigned long)clipIndex, startTimeSecs, sourceFPS, (int)clip.isReversed);
 
+  // ── Phase 7.x-Q2: Build secondary reader for dual-camera clips ───────────
+  //
+  // If this clip carries a valid dualCamera payload (stored in
+  // _dualCameraDescDicts at the corresponding index), build the secondary
+  // reader now and nest it inside the primary reader.
+  //
+  // startAtTime for the secondary is computed using the same elapsed_timeline
+  // value that was used to compute the primary startTimeSecs, but applying
+  // the secondary clip's own speed (see §Opus Q2 time-mapping correction).
+  //
+  // Safety: failure to build the secondary reader is non-fatal. Primary
+  // playback continues unchanged. secondaryEOSReached is left NO so the
+  // first pullFrame: attempt will re-check _secondaryClipReader (nil) and
+  // skip cleanly without retry.
+  if (clipIndex < _dualCameraDescDicts.count) {
+    id rawDualCamera = _dualCameraDescDicts[clipIndex];
+    if ([rawDualCamera isKindOfClass:[NSDictionary class]]) {
+      NSError *secBuildErr = nil;
+      _VGClipReader *secondaryReader =
+          [self _buildSecondaryReaderForDualCamera:(NSDictionary *)rawDualCamera
+                                        clipIndex:clipIndex
+                                      startAtTime:startTimeSecs
+                                            error:&secBuildErr];
+      if (secondaryReader) {
+        clipReader.secondaryClipReader = secondaryReader;
+        os_log(sTimelineLog,
+               "[VGTCNode-Q2] secondary reader built for clip=%lu",
+               (unsigned long)clipIndex);
+      } else {
+        // Non-fatal: secondary reader build failed. Primary continues.
+        os_log(sTimelineLog,
+               "[VGTCNode-Q2] secondary reader build skipped/failed for clip=%lu: %{public}@",
+               (unsigned long)clipIndex,
+               secBuildErr.localizedDescription ?: @"unsupported secondary shape");
+      }
+    }
+  }
+
   return clipReader;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Phase 7.x-Q2: Secondary reader builder
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Phase 7.x-Q2: Build an AVAssetReader (or static-source _VGClipReader) for
+/// the secondary clip embedded in a dual-camera timeline clip's `dualCamera`
+/// dictionary.
+///
+/// The `dualCamera` dictionary is produced by VGDualCameraDescriptor.toTimelineMap()
+/// and contains:
+///   - @"secondaryClip": NSDictionary (a VGClipDescriptor wire map)
+///   - @"layoutMode":   NSString (ignored in Q2; consumed by Q3 compositor)
+///   - @"pipLayout":    NSDictionary (ignored in Q2)
+///   - @"splitLayout":  NSDictionary (ignored in Q2)
+///
+/// Supported secondary shapes in Q2:
+///   • Video (normal, non-frozen, non-reversed): full AVAssetReader path.
+///   • Still image:  isStaticSource = YES; existing static-source pull path.
+///
+/// Unsupported secondary shapes (deferred to Q3+):
+///   • Freeze-frame video (freezePTS != nil): rejected, returns nil (non-fatal).
+///   • Reversed video (isReversed == YES):    rejected, returns nil (non-fatal).
+///
+/// @param dualCameraDict  The `dualCamera` NSDictionary from the clip parameters.
+/// @param clipIndex       Index of the primary clip in _clips (for logging).
+/// @param startTimeSecs   Asset-local start time for the secondary reader.
+///                        This is the t_sec_asset at reader build time:
+///                          t_sec_asset = secondary.trimStart + elapsedTimeline * secSpeed
+/// @param outError        Optional; set on hard failure. nil on supported-shape skip.
+/// @return                A populated _VGClipReader on success, nil otherwise.
+- (_VGClipReader *_Nullable)
+    _buildSecondaryReaderForDualCamera:(NSDictionary *)dualCameraDict
+                             clipIndex:(NSUInteger)clipIndex
+                           startAtTime:(double)startTimeSecs
+                                 error:(NSError **)outError {
+  // ── 1. Extract and parse secondary clip descriptor ───────────────────────
+  id rawSecClip = dualCameraDict[@"secondaryClip"];
+  if (![rawSecClip isKindOfClass:[NSDictionary class]]) {
+    os_log_error(sTimelineLog,
+                 "[VGTCNode-Q2] dualCamera dict missing 'secondaryClip' key "
+                 "for primary clip=%lu. Secondary skipped.",
+                 (unsigned long)clipIndex);
+    return nil;
+  }
+
+  VGClipDescriptor *secClip =
+      [VGClipDescriptor fromDictionary:(NSDictionary *)rawSecClip];
+  if (!secClip) {
+    os_log_error(sTimelineLog,
+                 "[VGTCNode-Q2] fromDictionary failed for secondaryClip "
+                 "(primary clip=%lu). Secondary skipped.",
+                 (unsigned long)clipIndex);
+    return nil;
+  }
+
+  // ── 2. Q2 shape guard: reject unsupported secondary shapes ───────────────
+  //
+  // Freeze-frame and reversed clips require separate reader infrastructure
+  // (AVAssetImageGenerator / sidecar swap) that is deferred to Q3+.
+  // These are non-fatal: primary playback continues; secondary is simply absent.
+  if (secClip.freezePTS != nil) {
+    os_log(sTimelineLog,
+           "[VGTCNode-Q2] secondary clip (primary=%lu) is freeze-frame — "
+           "unsupported in Q2. Secondary skipped.",
+           (unsigned long)clipIndex);
+    return nil; // Not an error; outError left nil.
+  }
+  if (secClip.isReversed) {
+    os_log(sTimelineLog,
+           "[VGTCNode-Q2] secondary clip (primary=%lu) is reversed — "
+           "unsupported in Q2. Secondary skipped.",
+           (unsigned long)clipIndex);
+    return nil; // Not an error; outError left nil.
+  }
+
+  // ── 3a. Branch: still-image secondary ───────────────────────────────────
+  //
+  // Q2: Still-image secondaries are deferred to Q3. The existing static-source
+  // pull path (_pullBufferFromReader: §Phase 7.12) looks up the clip descriptor
+  // via _clips[reader.clipIndex].sourceURL, which is the PRIMARY clip's URL.
+  // Using the primary's clipIndex for the secondary reader would decode the
+  // wrong image. Correct wiring of secondary sourceURL requires Q3 compositor
+  // refactoring (direct VGClipDescriptor pass-through). Non-fatal skip here.
+  if (secClip.mediaKind == VGClipMediaKindImage) {
+    os_log(sTimelineLog,
+           "[VGTCNode-Q2] secondary clip (primary=%lu) is still-image — "
+           "unsupported in Q2 (sourceURL lookup deferred to Q3). "
+           "Secondary skipped.",
+           (unsigned long)clipIndex);
+    return nil; // Not an error; outError left nil.
+  }
+
+
+  // ── 3b. Branch: video secondary (normal forward, non-frozen) ────────────
+  if (secClip.mediaKind != VGClipMediaKindVideo) {
+    os_log(sTimelineLog,
+           "[VGTCNode-Q2] secondary clip (primary=%lu) has unsupported "
+           "mediaKind=%ld. Secondary skipped.",
+           (unsigned long)clipIndex, (long)secClip.mediaKind);
+    return nil;
+  }
+  if (secClip.sourceURL.length == 0) {
+    os_log_error(sTimelineLog,
+                 "[VGTCNode-Q2] video secondary (primary=%lu) has empty "
+                 "sourceURL. Secondary skipped.",
+                 (unsigned long)clipIndex);
+    return nil;
+  }
+
+  // ── 4. Build AVURLAsset for secondary clip ───────────────────────────────
+  NSURL *secURL = [NSURL fileURLWithPath:secClip.sourceURL];
+  if (!secURL) {
+    if (outError) {
+      *outError = _VGTCNError(
+          31, ([NSString stringWithFormat:
+                   @"VGTimelineCompositorNode (Q2): invalid sourceURL for "
+                    "secondary clip (primary=%lu): %@",
+                   (unsigned long)clipIndex, secClip.sourceURL]));
+    }
+    return nil;
+  }
+
+  AVURLAsset *secAsset = [AVURLAsset URLAssetWithURL:secURL options:nil];
+
+  // ── 5. Find first video track ────────────────────────────────────────────
+  NSArray<AVAssetTrack *> *secTracks =
+      [secAsset tracksWithMediaType:AVMediaTypeVideo];
+  AVAssetTrack *secVideoTrack = secTracks.firstObject;
+  if (!secVideoTrack) {
+    if (outError) {
+      *outError = _VGTCNError(
+          32, ([NSString stringWithFormat:
+                   @"VGTimelineCompositorNode (Q2): no video track in "
+                    "secondary asset (primary=%lu) at %@",
+                   (unsigned long)clipIndex, secClip.sourceURL]));
+    }
+    return nil;
+  }
+
+  // ── 6. Create AVAssetReader for secondary ────────────────────────────────
+  NSError *secReaderErr = nil;
+  AVAssetReader *secReader = [AVAssetReader assetReaderWithAsset:secAsset
+                                                           error:&secReaderErr];
+  if (!secReader) {
+    if (outError) *outError = secReaderErr;
+    return nil;
+  }
+
+  // ── 7. Set timeRange (starting at secondary asset-local time) ────────────
+  // Mirrors the primary reader timeRange logic in _buildReaderForClipIndex:.
+  CMTime secAssetStart = CMTimeMakeWithSeconds(startTimeSecs, 600);
+  CMTime secAssetEnd   = CMTimeMakeWithSeconds(secClip.trimEndSeconds, 600);
+  CMTime secAssetDur   = secAsset.duration;
+
+  if (CMTIME_IS_VALID(secAssetDur) &&
+      CMTimeCompare(secAssetStart, secAssetDur) >= 0) {
+    secAssetStart = secAssetDur; // start beyond end → immediate EOS
+  }
+  CMTime secReadEnd = secAssetEnd;
+  if (CMTIME_IS_VALID(secAssetDur) &&
+      CMTimeCompare(secAssetEnd, secAssetDur) > 0) {
+    secReadEnd = secAssetDur;
+  }
+  if (CMTimeCompare(secAssetStart, secReadEnd) < 0) {
+    CMTime secReadDuration = CMTimeSubtract(secReadEnd, secAssetStart);
+    secReader.timeRange = CMTimeRangeMake(secAssetStart, secReadDuration);
+  }
+
+  // ── 8. Build video composition for orientation normalization (Phase 7.9) ──
+  // Apply preferredTransform at decode time, matching the primary reader path.
+  // See _buildReaderForClipIndex: § Phase 7.9 for the deprecation note on
+  // videoCompositionWithPropertiesOfAsset: (deprecated iOS 18 but functional).
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  AVMutableVideoComposition *secVideoComposition =
+      [AVMutableVideoComposition videoCompositionWithPropertiesOfAsset:secAsset];
+#pragma clang diagnostic pop
+
+  // Apply canvas normalization when _targetRenderSize is set, mirroring the
+  // primary path in _buildReaderForClipIndex: §Phase 7.9 aspect-fit.
+  if (_targetRenderSize.width > 0 && _targetRenderSize.height > 0) {
+    CGAffineTransform secPrefTx = secVideoTrack.preferredTransform;
+    CGSize secNaturalSize = secVideoTrack.naturalSize;
+    CGRect secDisplayRect =
+        CGRectApplyAffineTransform(
+            CGRectMake(0, 0, secNaturalSize.width, secNaturalSize.height),
+            secPrefTx);
+    CGFloat secDisplayW = fabs(secDisplayRect.size.width);
+    CGFloat secDisplayH = fabs(secDisplayRect.size.height);
+
+    CGFloat canvasW = _targetRenderSize.width;
+    CGFloat canvasH = _targetRenderSize.height;
+    CGFloat secFitScale = 1.0;
+    if (secDisplayW > 0 && secDisplayH > 0) {
+      secFitScale = MIN(canvasW / secDisplayW, canvasH / secDisplayH);
+    }
+    CGFloat secTx = (canvasW - secDisplayW * secFitScale) / 2.0;
+    CGFloat secTy = (canvasH - secDisplayH * secFitScale) / 2.0;
+
+    CGAffineTransform secFitTransform =
+        CGAffineTransformConcat(
+            secPrefTx,
+            CGAffineTransformConcat(
+                CGAffineTransformMakeScale(secFitScale, secFitScale),
+                CGAffineTransformMakeTranslation(secTx, secTy)));
+
+    AVMutableVideoCompositionLayerInstruction *secLayerInst =
+        [AVMutableVideoCompositionLayerInstruction
+            videoCompositionLayerInstructionWithAssetTrack:secVideoTrack];
+    [secLayerInst setTransform:secFitTransform atTime:kCMTimeZero];
+
+    AVMutableVideoCompositionInstruction *secInstruction =
+        [AVMutableVideoCompositionInstruction videoCompositionInstruction];
+    secInstruction.timeRange =
+        CMTimeRangeMake(kCMTimeZero, secAsset.duration);
+    secInstruction.layerInstructions = @[secLayerInst];
+
+    secVideoComposition.renderSize = _targetRenderSize;
+    secVideoComposition.instructions = @[secInstruction];
+  }
+
+  // ── 9. Create and configure output ──────────────────────────────────────
+  NSDictionary *secOutputSettings = _VGTCNOutputSettings();
+  AVAssetReaderVideoCompositionOutput *secOutput =
+      [[AVAssetReaderVideoCompositionOutput alloc]
+          initWithVideoTracks:@[secVideoTrack]
+               videoSettings:secOutputSettings];
+  secOutput.videoComposition = secVideoComposition;
+  secOutput.alwaysCopiesSampleData = NO;
+
+  if (![secReader canAddOutput:secOutput]) {
+    if (outError) {
+      *outError = _VGTCNError(
+          33, ([NSString stringWithFormat:
+                   @"VGTimelineCompositorNode (Q2): cannot add output for "
+                    "secondary clip (primary=%lu).",
+                   (unsigned long)clipIndex]));
+    }
+    return nil;
+  }
+  [secReader addOutput:secOutput];
+
+  // ── 10. Start reading ────────────────────────────────────────────────────
+  if (![secReader startReading]) {
+    if (outError) *outError = secReader.error;
+    return nil;
+  }
+
+  // ── 11. Compute secondary source FPS ────────────────────────────────────
+  double secSourceFPS = 30.0;
+  if (secVideoComposition &&
+      CMTIME_IS_VALID(secVideoComposition.frameDuration) &&
+      CMTimeGetSeconds(secVideoComposition.frameDuration) > 0.0) {
+    secSourceFPS = 1.0 / CMTimeGetSeconds(secVideoComposition.frameDuration);
+  } else if (secVideoTrack.nominalFrameRate > 0.0f) {
+    secSourceFPS = secVideoTrack.nominalFrameRate;
+  }
+
+  // ── 12. Build and return secondary _VGClipReader ─────────────────────────
+  _VGClipReader *secClipReader = [[_VGClipReader alloc] init];
+  secClipReader.clipIndex      = clipIndex; // shared index; Q3 reads secClip from dualCameraDict
+  secClipReader.reader         = secReader;
+  secClipReader.trackOutput    = secOutput;
+  secClipReader.sourceFPS      = secSourceFPS;
+  secClipReader.isStaticSource = NO;
+  secClipReader.isReversed     = NO; // reversed guard above ensures this is NO
+
+  os_log(sTimelineLog,
+         "[VGTCNode-Q2] secondary video reader built: primary clip=%lu "
+         "secStart=%.3fs fps=%.1f",
+         (unsigned long)clipIndex, startTimeSecs, secSourceFPS);
+
+  return secClipReader;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
