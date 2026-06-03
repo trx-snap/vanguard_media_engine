@@ -287,6 +287,437 @@ static CVPixelBufferRef _VGTCNBlendBuffers(CVPixelBufferRef outgoing,
   return out; // Caller owns +1 from CVPixelBufferCreate
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 7.x-Q3B: Dual-camera layout types, parsers, and composition helpers
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Private layout structs mirror VGDualCameraCompositorNode.h public types but
+// are named _VGTCN-prefixed to stay local to this translation unit.
+// VGDualCameraCompositorNode.h is NOT imported here.
+//
+// Layout config is parsed ONCE per clip during init from _dualCameraDescDicts
+// and stored in _dualCameraLayoutConfigs. pullFrame: reads the parsed value
+// for the active clip index — zero dict-parsing overhead per frame.
+
+/// Layout mode tag for dual-camera composition in the timeline path.
+typedef NS_ENUM(NSInteger, _VGTCNDualCameraLayoutMode) {
+    _VGTCNDualCameraLayoutModePiP         = 0,
+    _VGTCNDualCameraLayoutModeSplitScreen = 1,
+};
+
+/// PiP anchor corner. Wire values mirror Dart VGPiPAnchor.
+typedef NS_ENUM(NSInteger, _VGTCNPiPAnchor) {
+    _VGTCNPiPAnchorTopLeft     = 0,
+    _VGTCNPiPAnchorTopRight    = 1,
+    _VGTCNPiPAnchorBottomLeft  = 2,
+    _VGTCNPiPAnchorBottomRight = 3, ///< Default.
+};
+
+/// Parsed PiP layout config. Stored per clip at init time.
+typedef struct {
+    _VGTCNPiPAnchor anchor;
+    double           widthFraction;  ///< 0.05–0.75
+    double           marginFraction; ///< >= 0.0
+    double           cornerRadius;   ///< >= 0.0
+    double           opacity;        ///< 0.0–1.0
+} _VGTCNPiPLayoutConfig;
+
+/// Parsed split-screen layout config. Stored per clip at init time.
+typedef struct {
+    double splitRatio; ///< 0.2–0.8; primary (top) fraction of canvas height.
+} _VGTCNSplitScreenLayoutConfig;
+
+/// Tagged layout config union — carries mode + relevant sub-config.
+/// Stored as NSValue-wrapped bytes in _dualCameraLayoutConfigs.
+typedef struct {
+    _VGTCNDualCameraLayoutMode mode;
+    _VGTCNPiPLayoutConfig      pip;   ///< Valid when mode == PiP.
+    _VGTCNSplitScreenLayoutConfig split; ///< Valid when mode == SplitScreen.
+    BOOL enabled; ///< NO if clip has no dualCamera descriptor.
+} _VGTCNDualCameraLayoutConfig;
+
+// ── Wire-key constants (mirror Dart VGDualCameraDescriptor.toTimelineMap) ────
+static NSString * const kVGTCNQLModeKey        = @"layoutMode";
+static NSString * const kVGTCNQPiPLayoutKey    = @"pipLayout";
+static NSString * const kVGTCNQSplitLayoutKey  = @"splitLayout";
+static NSString * const kVGTCNQPiPAnchorKey    = @"anchor";
+static NSString * const kVGTCNQPiPWidthFracKey = @"widthFraction";
+static NSString * const kVGTCNQPiPMarginFracKey= @"marginFraction";
+static NSString * const kVGTCNQPiPCornerRadKey = @"cornerRadius";
+static NSString * const kVGTCNQPiPOpacityKey   = @"opacity";
+static NSString * const kVGTCNQSplitRatioKey   = @"splitRatio";
+
+/// Parse PiP anchor from wire string; falls back to BottomRight.
+static _VGTCNPiPAnchor _VGTCNParsePiPAnchor(NSString * _Nullable str) {
+    if ([str isEqualToString:@"topLeft"])    return _VGTCNPiPAnchorTopLeft;
+    if ([str isEqualToString:@"topRight"])   return _VGTCNPiPAnchorTopRight;
+    if ([str isEqualToString:@"bottomLeft"]) return _VGTCNPiPAnchorBottomLeft;
+    return _VGTCNPiPAnchorBottomRight;
+}
+
+/// Parse PiP layout config from Dart-side pipLayout dict.
+/// Absent/invalid keys fall back to Dart VGPiPLayoutDescriptor defaults.
+static _VGTCNPiPLayoutConfig _VGTCNParsePiPLayout(NSDictionary * _Nullable dict) {
+    _VGTCNPiPLayoutConfig cfg;
+    cfg.anchor         = _VGTCNPiPAnchorBottomRight;
+    cfg.widthFraction  = 0.35;
+    cfg.marginFraction = 0.018;
+    cfg.cornerRadius   = 24.0;
+    cfg.opacity        = 1.0;
+    if (!dict || ![dict isKindOfClass:[NSDictionary class]]) return cfg;
+
+    NSString *anchorStr = dict[kVGTCNQPiPAnchorKey];
+    if ([anchorStr isKindOfClass:[NSString class]])
+        cfg.anchor = _VGTCNParsePiPAnchor(anchorStr);
+
+    NSNumber *wf = dict[kVGTCNQPiPWidthFracKey];
+    if ([wf isKindOfClass:[NSNumber class]] && wf.doubleValue >= 0.05 && wf.doubleValue <= 0.75)
+        cfg.widthFraction = wf.doubleValue;
+
+    NSNumber *mf = dict[kVGTCNQPiPMarginFracKey];
+    if ([mf isKindOfClass:[NSNumber class]] && mf.doubleValue >= 0.0)
+        cfg.marginFraction = mf.doubleValue;
+
+    NSNumber *cr = dict[kVGTCNQPiPCornerRadKey];
+    if ([cr isKindOfClass:[NSNumber class]] && cr.doubleValue >= 0.0)
+        cfg.cornerRadius = cr.doubleValue;
+
+    NSNumber *op = dict[kVGTCNQPiPOpacityKey];
+    if ([op isKindOfClass:[NSNumber class]] && op.doubleValue >= 0.0 && op.doubleValue <= 1.0)
+        cfg.opacity = op.doubleValue;
+
+    return cfg;
+}
+
+/// Parse split-screen layout config from Dart-side splitLayout dict.
+/// Absent/invalid keys fall back to splitRatio=0.5.
+static _VGTCNSplitScreenLayoutConfig _VGTCNParseSplitLayout(NSDictionary * _Nullable dict) {
+    _VGTCNSplitScreenLayoutConfig cfg;
+    cfg.splitRatio = 0.5;
+    if (!dict || ![dict isKindOfClass:[NSDictionary class]]) return cfg;
+    NSNumber *sr = dict[kVGTCNQSplitRatioKey];
+    if ([sr isKindOfClass:[NSNumber class]] && sr.doubleValue >= 0.2 && sr.doubleValue <= 0.8)
+        cfg.splitRatio = sr.doubleValue;
+    return cfg;
+}
+
+/// Parse a full dual-camera layout config from a raw dualCamera timeline dict.
+/// Returns a disabled config if dict is nil/NSNull.
+static _VGTCNDualCameraLayoutConfig _VGTCNParseLayoutConfig(id rawDualCameraDict) {
+    _VGTCNDualCameraLayoutConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.enabled = NO;
+
+    if (!rawDualCameraDict || [rawDualCameraDict isKindOfClass:[NSNull class]]
+        || ![rawDualCameraDict isKindOfClass:[NSDictionary class]]) {
+        return cfg;
+    }
+    NSDictionary *dict = (NSDictionary *)rawDualCameraDict;
+    cfg.enabled = YES;
+
+    NSString *modeStr = dict[kVGTCNQLModeKey];
+    if ([modeStr isEqualToString:@"splitScreen"]) {
+        cfg.mode  = _VGTCNDualCameraLayoutModeSplitScreen;
+        cfg.split = _VGTCNParseSplitLayout(dict[kVGTCNQSplitLayoutKey]);
+    } else {
+        // Default to PiP for "pip" or any unrecognised value.
+        cfg.mode = _VGTCNDualCameraLayoutModePiP;
+        cfg.pip  = _VGTCNParsePiPLayout(dict[kVGTCNQPiPLayoutKey]);
+    }
+    return cfg;
+}
+
+// ── Phase 7.x-Q3B: Canvas-authority CVPixelBuffer allocator ─────────────────
+// Creates a BGRA + Metal + IOSurface buffer at _targetRenderSize.
+// Returns NULL if targetSize is degenerate.
+static CVPixelBufferRef _VGTCNCreateCanvasBuffer(CGSize targetSize) {
+    if (targetSize.width <= 0.0 || targetSize.height <= 0.0) return NULL;
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey    : @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferMetalCompatibilityKey : @YES,
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    CVPixelBufferRef buf = NULL;
+    CVReturn ret = CVPixelBufferCreate(
+        kCFAllocatorDefault,
+        (size_t)targetSize.width,
+        (size_t)targetSize.height,
+        kCVPixelFormatType_32BGRA,
+        (__bridge CFDictionaryRef)attrs,
+        &buf);
+    return (ret == kCVReturnSuccess) ? buf : NULL;
+}
+
+// ── Phase 7.x-Q3B: PiP composition helper ───────────────────────────────────
+//
+// Composites secondaryBuf as a PiP inset over primaryBuf using pip config.
+// Canvas authority: output is allocated at canvasSize, NOT at primaryBuf size.
+// Returns new CVPixelBufferRef +1 (caller owns). Returns NULL on any failure.
+//
+// Port of VGDualCameraCompositorNode._compositeWithPrimary:secondary:
+static CVPixelBufferRef _VGTCNCompositePiP(
+        CVPixelBufferRef primaryBuf,
+        CVPixelBufferRef secondaryBuf,
+        _VGTCNPiPLayoutConfig pip,
+        CGSize canvasSize) {
+    if (!primaryBuf || !secondaryBuf) return NULL;
+
+    size_t primW = CVPixelBufferGetWidth(primaryBuf);
+    size_t primH = CVPixelBufferGetHeight(primaryBuf);
+    size_t secW  = CVPixelBufferGetWidth(secondaryBuf);
+    size_t secH  = CVPixelBufferGetHeight(secondaryBuf);
+
+    if (primW == 0 || primH == 0 || secW == 0 || secH == 0) {
+        os_log_error(OS_LOG_DEFAULT,
+                     "[VGTCNode-Q3B] PiP: degenerate buffer dimensions "
+                     "prim=%zux%zu sec=%zux%zu — skipping.", primW, primH, secW, secH);
+        return NULL;
+    }
+
+    // PiP geometry — widthFraction and margin are fractions of PRIMARY width.
+    double wf = pip.widthFraction;
+    double mf = pip.marginFraction;
+    if (wf < 0.01) { wf = 0.01; }
+    if (wf > 0.95) { wf = 0.95; }
+
+    double pipW  = (double)primW * wf;
+    double pipH  = (secH > 0 && secW > 0) ? pipW * (double)secH / (double)secW : pipW;
+    double margin = (double)primW * mf;
+
+    // Clamp pipW so PiP fits within primary bounds.
+    double maxPipW = (double)primW - 2.0 * margin;
+    if (maxPipW < 1.0) { maxPipW = 1.0; margin = 0.0; }
+    if (pipW > maxPipW) { pipW = maxPipW; }
+    if (secW > 0) { pipH = pipW * (double)secH / (double)secW; }
+    if (pipH < 1.0) { pipH = 1.0; }
+    double maxPipH = (double)primH - 2.0 * margin;
+    if (maxPipH < 1.0) { maxPipH = 1.0; }
+    if (pipH > maxPipH) {
+        pipH = maxPipH;
+        if (secH > 0) { pipW = pipH * (double)secW / (double)secH; }
+    }
+
+    // Anchor → CIImage Y-up origin (Y=0 at bottom-left).
+    double pipOriginX = 0.0, pipOriginY = 0.0;
+    switch (pip.anchor) {
+        case _VGTCNPiPAnchorTopLeft:
+            pipOriginX = margin;
+            pipOriginY = (double)primH - pipH - margin;
+            break;
+        case _VGTCNPiPAnchorTopRight:
+            pipOriginX = (double)primW - pipW - margin;
+            pipOriginY = (double)primH - pipH - margin;
+            break;
+        case _VGTCNPiPAnchorBottomLeft:
+            pipOriginX = margin;
+            pipOriginY = margin;
+            break;
+        case _VGTCNPiPAnchorBottomRight:
+        default:
+            pipOriginX = (double)primW - pipW - margin;
+            pipOriginY = margin;
+            break;
+    }
+    // Clamp origin to keep PiP in bounds.
+    if (pipOriginX < 0.0) { pipOriginX = 0.0; }
+    if (pipOriginY < 0.0) { pipOriginY = 0.0; }
+    if (pipOriginX + pipW > (double)primW) { pipOriginX = (double)primW - pipW; }
+    if (pipOriginY + pipH > (double)primH) { pipOriginY = (double)primH - pipH; }
+
+    // Build CIImages.
+    CIImage *primaryCI   = [CIImage imageWithCVPixelBuffer:primaryBuf];
+    CIImage *secondaryCI = [CIImage imageWithCVPixelBuffer:secondaryBuf];
+    if (!primaryCI || !secondaryCI) return NULL;
+
+    // Normalize secondary origin, scale to PiP rect, translate to anchor.
+    CIImage *secNorm = secondaryCI;
+    CGPoint secOrigin = secNorm.extent.origin;
+    if (secOrigin.x != 0.0 || secOrigin.y != 0.0) {
+        secNorm = [secNorm imageByApplyingTransform:
+                   CGAffineTransformMakeTranslation(-secOrigin.x, -secOrigin.y)];
+    }
+    double scaleX = (secW > 0) ? pipW / (double)secW : 1.0;
+    double scaleY = (secH > 0) ? pipH / (double)secH : 1.0;
+    CIImage *secScaled = [secNorm imageByApplyingTransform:
+                          CGAffineTransformMakeScale(scaleX, scaleY)];
+    CIImage *secPositioned = [secScaled imageByApplyingTransform:
+                              CGAffineTransformMakeTranslation(pipOriginX, pipOriginY)];
+
+    // Corner radius mask (CIRoundedRectangleGenerator + CIBlendWithAlphaMask).
+    CIImage *secStyled = secPositioned;
+    double cr = pip.cornerRadius;
+    if (cr < 0.0) { cr = 0.0; }
+    double maxCR = MIN(pipW, pipH) * 0.5;
+    if (cr > maxCR) { cr = maxCR; }
+    if (cr > 0.0) {
+        CGRect pipLocalRect = CGRectMake(pipOriginX, pipOriginY, pipW, pipH);
+        CIImage *mask = [CIFilter filterWithName:@"CIRoundedRectangleGenerator"
+                                   keysAndValues:
+                         @"inputExtent", [CIVector vectorWithCGRect:pipLocalRect],
+                         @"inputRadius", @(cr),
+                         @"inputColor",  [CIColor whiteColor],
+                         nil].outputImage;
+        if (mask) {
+            mask = [mask imageByCroppingToRect:pipLocalRect];
+            CIFilter *blendFilter = [CIFilter filterWithName:@"CIBlendWithAlphaMask"
+                                                keysAndValues:
+                kCIInputImageKey,           secPositioned,
+                kCIInputMaskImageKey,       mask,
+                kCIInputBackgroundImageKey, [CIImage emptyImage],
+                nil];
+            CIImage *masked = blendFilter.outputImage;
+            if (masked) secStyled = masked;
+        }
+    }
+
+    // Opacity (CIColorMatrix alpha-channel multiply).
+    double op = pip.opacity;
+    if (op < 0.0) { op = 0.0; }
+    if (op > 1.0) { op = 1.0; }
+    if (op < 1.0) {
+        CIFilter *opFilter = [CIFilter filterWithName:@"CIColorMatrix"
+                                         keysAndValues:
+            kCIInputImageKey,    secStyled,
+            @"inputRVector",     [CIVector vectorWithX:1 Y:0 Z:0 W:0],
+            @"inputGVector",     [CIVector vectorWithX:0 Y:1 Z:0 W:0],
+            @"inputBVector",     [CIVector vectorWithX:0 Y:0 Z:1 W:0],
+            @"inputAVector",     [CIVector vectorWithX:0 Y:0 Z:0 W:op],
+            @"inputBiasVector",  [CIVector vectorWithX:0 Y:0 Z:0 W:0],
+            nil];
+        CIImage *withOpacity = opFilter.outputImage;
+        if (withOpacity) secStyled = withOpacity;
+    }
+
+    // Composite secondary over primary (Porter-Duff SourceOver).
+    CIImage *composited = [secStyled imageByCompositingOverImage:primaryCI];
+    if (!composited) return NULL;
+
+    // Allocate canvas-authoritative output buffer.
+    CVPixelBufferRef outputBuf = _VGTCNCreateCanvasBuffer(canvasSize);
+    if (!outputBuf) {
+        os_log_error(OS_LOG_DEFAULT, "[VGTCNode-Q3B] PiP: CVPixelBufferCreate failed.");
+        return NULL;
+    }
+
+    CGRect renderBounds = CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH);
+    [_VGTCNSharedCIContext() render:composited
+                     toCVPixelBuffer:outputBuf
+                               bounds:renderBounds
+                           colorSpace:nil];
+
+    os_log(OS_LOG_DEFAULT,
+           "[VGTCNode-Q3B] PiP composited: pip=(%.0f,%.0f,%.0f,%.0f) "
+           "prim=%zux%zu sec=%zux%zu anchor=%ld wf=%.3f cr=%.1f op=%.2f",
+           pipOriginX, pipOriginY, pipW, pipH,
+           primW, primH, secW, secH,
+           (long)pip.anchor, pip.widthFraction, cr, op);
+
+    return outputBuf; // Caller owns +1
+}
+
+// ── Phase 7.x-Q3B: Split-screen composition helper ──────────────────────────
+//
+// Primary → top band, secondary → bottom band. Portrait vertical split only.
+// Canvas authority: output allocated at canvasSize.
+// Port of VGDualCameraCompositorNode._compositeWithSplitScreen:secondary:
+static CVPixelBufferRef _VGTCNCompositeSplitScreen(
+        CVPixelBufferRef primaryBuf,
+        CVPixelBufferRef secondaryBuf,
+        _VGTCNSplitScreenLayoutConfig split,
+        CGSize canvasSize) {
+    if (!primaryBuf || !secondaryBuf) return NULL;
+
+    size_t primW = CVPixelBufferGetWidth(primaryBuf);
+    size_t primH = CVPixelBufferGetHeight(primaryBuf);
+    size_t secW  = CVPixelBufferGetWidth(secondaryBuf);
+    size_t secH  = CVPixelBufferGetHeight(secondaryBuf);
+
+    if (primW == 0 || primH == 0 || secW == 0 || secH == 0) {
+        os_log_error(OS_LOG_DEFAULT,
+                     "[VGTCNode-Q3B] Split: degenerate dimensions "
+                     "prim=%zux%zu sec=%zux%zu — skipping.", primW, primH, secW, secH);
+        return NULL;
+    }
+
+    // Split geometry (Y-up: top band has higher Y values).
+    double sr = split.splitRatio;
+    if (sr < 0.2) { sr = 0.2; }
+    if (sr > 0.8) { sr = 0.8; }
+    double topH    = floor((double)primH * sr);
+    double bottomH = (double)primH - topH;
+    if (topH < 1.0 || bottomH < 1.0) {
+        os_log_error(OS_LOG_DEFAULT,
+                     "[VGTCNode-Q3B] Split: degenerate band heights topH=%.0f bottomH=%.0f.",
+                     topH, bottomH);
+        return NULL;
+    }
+    double canvasW = (double)primW;
+    double canvasH = (double)primH;
+
+    CIImage *primaryCI   = [CIImage imageWithCVPixelBuffer:primaryBuf];
+    CIImage *secondaryCI = [CIImage imageWithCVPixelBuffer:secondaryBuf];
+    if (!primaryCI || !secondaryCI) return NULL;
+
+    // Aspect-fill helper: normalize → scale-to-fill → center → crop to rect.
+    CIImage *(^aspectFillIntoRect)(CIImage *, size_t, size_t, CGRect) =
+        ^CIImage *(CIImage *src, size_t srcW, size_t srcH, CGRect targetRect) {
+            CIImage *norm = src;
+            CGPoint origin = norm.extent.origin;
+            if (origin.x != 0.0 || origin.y != 0.0) {
+                norm = [norm imageByApplyingTransform:
+                        CGAffineTransformMakeTranslation(-origin.x, -origin.y)];
+            }
+            double sX = (srcW > 0) ? CGRectGetWidth(targetRect)  / (double)srcW : 1.0;
+            double sY = (srcH > 0) ? CGRectGetHeight(targetRect) / (double)srcH : 1.0;
+            double s  = MAX(sX, sY);
+            if (s <= 0.0) { s = 1.0; }
+            CIImage *scaled = [norm imageByApplyingTransform:CGAffineTransformMakeScale(s, s)];
+            double scaledW = (double)srcW * s;
+            double scaledH = (double)srcH * s;
+            double offX = CGRectGetMinX(targetRect) + (CGRectGetWidth(targetRect)  - scaledW) * 0.5;
+            double offY = CGRectGetMinY(targetRect) + (CGRectGetHeight(targetRect) - scaledH) * 0.5;
+            CIImage *centered = [scaled imageByApplyingTransform:
+                                 CGAffineTransformMakeTranslation(offX, offY)];
+            return [centered imageByCroppingToRect:targetRect];
+        };
+
+    // CoreImage Y-up: top band rect has higher Y.
+    CGRect topRect    = CGRectMake(0.0, bottomH, canvasW, topH);
+    CGRect bottomRect = CGRectMake(0.0, 0.0,     canvasW, bottomH);
+    CIImage *topBand    = aspectFillIntoRect(primaryCI,   primW, primH, topRect);
+    CIImage *bottomBand = aspectFillIntoRect(secondaryCI, secW,  secH,  bottomRect);
+    if (!topBand || !bottomBand) return NULL;
+
+    // Black canvas backing prevents any gaps at the split boundary.
+    CGRect canvasRect  = CGRectMake(0, 0, canvasW, canvasH);
+    CIImage *blackBase = [[CIImage imageWithColor:[CIColor blackColor]]
+                          imageByCroppingToRect:canvasRect];
+    CIImage *withBottom = [bottomBand imageByCompositingOverImage:blackBase];
+    CIImage *composited = [topBand    imageByCompositingOverImage:withBottom];
+    if (!composited) return NULL;
+
+    // Allocate canvas-authoritative output buffer.
+    CVPixelBufferRef outputBuf = _VGTCNCreateCanvasBuffer(canvasSize);
+    if (!outputBuf) {
+        os_log_error(OS_LOG_DEFAULT, "[VGTCNode-Q3B] Split: CVPixelBufferCreate failed.");
+        return NULL;
+    }
+
+    CGRect renderBounds = CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH);
+    [_VGTCNSharedCIContext() render:composited
+                     toCVPixelBuffer:outputBuf
+                               bounds:renderBounds
+                           colorSpace:nil];
+
+    os_log(OS_LOG_DEFAULT,
+           "[VGTCNode-Q3B] Split composited: prim=%zux%zu sec=%zux%zu "
+           "topH=%.0f bottomH=%.0f splitRatio=%.3f",
+           primW, primH, secW, secH, topH, bottomH, sr);
+
+    return outputBuf; // Caller owns +1
+}
+// ─── End Phase 7.x-Q3B helpers ───────────────────────────────────────────────
+
 // ─── Phase 7.12: Still-image decode helper ───────────────────────────────────
 //
 // _VGTCNCreatePixelBufferFromStillImage: Decodes a still image at sourceURL
@@ -1075,6 +1506,9 @@ static inline double _VGQuantizePTS(double pts) {
   NSArray<VGClipDescriptor *> *_clips;
   NSArray<VGTransitionDescriptor *> *_transitions;
   NSArray<NSDictionary *> *_dualCameraDescDicts; // Phase 7.x-Q1
+  // Phase 7.x-Q3B: One NSValue-wrapped _VGTCNDualCameraLayoutConfig per clip.
+  // Parsed once at init from _dualCameraDescDicts. NSNull sentinel for no-dual-camera clips.
+  NSArray<NSValue *> *_dualCameraLayoutConfigs; // Phase 7.x-Q3B
 
   // ── Active / outgoing reader state ─────────────────────────────────────────
   // _activeReader:  the incoming (or sole) clip reader. Never nil during decode.
@@ -1435,6 +1869,19 @@ static inline double _VGQuantizePTS(double pts) {
   _transitions = [transitions copy];
   // Phase 7.x-Q1: store dual-camera descriptor dicts for Q2 secondary reader.
   _dualCameraDescDicts = [dualCameraDescDicts copy];
+
+  // Phase 7.x-Q3B: Parse layout configs once from the same source array.
+  // This avoids any NSDictionary parsing overhead during pullFrame:.
+  {
+    NSMutableArray<NSValue *> *layoutConfigs =
+        [NSMutableArray arrayWithCapacity:dualCameraDescDicts.count];
+    for (id rawDC in dualCameraDescDicts) {
+      _VGTCNDualCameraLayoutConfig cfg = _VGTCNParseLayoutConfig(rawDC);
+      [layoutConfigs addObject:[NSValue value:&cfg
+                                 withObjCType:@encode(_VGTCNDualCameraLayoutConfig)]];
+    }
+    _dualCameraLayoutConfigs = [layoutConfigs copy];
+  }
 
   _lastDeliveredBuffer = NULL;
   _activeReader = nil;
@@ -2078,16 +2525,81 @@ static inline double _VGQuantizePTS(double pts) {
     }
   }
 
+  // ── Phase 7.x-Q3B: Dual-camera composition ──────────────────────────────────
+  //
+  // If the active clip has a dual-camera descriptor AND the secondary reader
+  // has a cached frame (lastDeliveredBuffer), attempt CoreImage composition
+  // (PiP or split-screen) to produce a composite output buffer.
+  //
+  // Ownership rules:
+  //   - primaryBuf (pb) is the _lastDeliveredBuffer, already stored above (+1).
+  //   - secondaryPB is secondaryClipReader.lastDeliveredBuffer — NOT caller-owned;
+  //     we temporarily retain it around the composition call for safety.
+  //   - On success: release pb (+1), replace _lastDeliveredBuffer with compositedPB.
+  //   - On failure: leave pb / _lastDeliveredBuffer unchanged (primary-only fallback).
+  //   - Do NOT double-release secondaryPB.
+  //
+  // No per-frame NSDictionary parsing: layout config was parsed at init and
+  // stored in _dualCameraLayoutConfigs.
+  if (_activeReader.secondaryClipReader != nil
+      && activeClipIndex < _dualCameraLayoutConfigs.count) {
+    CVPixelBufferRef secondaryPB =
+        _activeReader.secondaryClipReader.lastDeliveredBuffer;
+    if (secondaryPB != NULL) {
+      // Read the pre-parsed layout config (no dict overhead).
+      NSValue *cfgValue = _dualCameraLayoutConfigs[activeClipIndex];
+      _VGTCNDualCameraLayoutConfig layoutCfg;
+      [cfgValue getValue:&layoutCfg];
+
+      if (layoutCfg.enabled) {
+        // Temporarily retain secondary around the render call.
+        CVPixelBufferRetain(secondaryPB);
+
+        CVPixelBufferRef compositedPB = NULL;
+        if (layoutCfg.mode == _VGTCNDualCameraLayoutModeSplitScreen) {
+          compositedPB = _VGTCNCompositeSplitScreen(
+              pb, secondaryPB, layoutCfg.split, _targetRenderSize);
+        } else {
+          // PiP (default).
+          compositedPB = _VGTCNCompositePiP(
+              pb, secondaryPB, layoutCfg.pip, _targetRenderSize);
+        }
+
+        CVPixelBufferRelease(secondaryPB); // release temporary retain
+
+        if (compositedPB != NULL) {
+          // Success: swap primary buffer for composed buffer.
+          // pb (+1) held by _lastDeliveredBuffer — release it now.
+          CVPixelBufferRelease(pb);
+          pb = NULL; // defensive nil — not used after this point
+          _lastDeliveredBuffer = compositedPB; // node owns +1 from composite helper
+          os_log_debug(sTimelineLog,
+                       "[VGTCNode-Q3B] composed frame delivered: clip=%lu mode=%ld",
+                       (unsigned long)activeClipIndex, (long)layoutCfg.mode);
+        } else {
+          // Composition failed: fall through with primary buffer unchanged.
+          os_log_error(sTimelineLog,
+                       "[VGTCNode-Q3B] composition failed clip=%lu mode=%ld — "
+                       "falling back to primary-only.",
+                       (unsigned long)activeClipIndex, (long)layoutCfg.mode);
+        }
+      }
+    }
+  }
+  // ── End Phase 7.x-Q3B composition ───────────────────────────────────────────
+
   // Use asset-local duration from per-reader cache for the output envelope.
   double sDur = _activeReader.lastDeliveredAssetDuration;
   CMTime outputDur = (sDur > 0.0)
       ? CMTimeMakeWithSeconds(sDur, 600)
       : CMTimeMakeWithSeconds(1.0 / _activeReader.sourceFPS, 600);
 
+  // _lastDeliveredBuffer is the final output (primary or composited).
+  // VGFrameEnvelope carries +0; node holds the +1 in _lastDeliveredBuffer.
   VGFrameEnvelope env;
   memset(&env, 0, sizeof(env));
   env.mediaType = VGMediaTypeVideo;
-  env.payload.videoBuffer = (void *)pb; // +0 in envelope; node holds +1
+  env.payload.videoBuffer = (void *)_lastDeliveredBuffer; // +0 in envelope
   env.pts = request.requestedPTS;
   env.dts = kCMTimeInvalid;
   env.duration = outputDur;
