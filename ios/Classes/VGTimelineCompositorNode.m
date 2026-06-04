@@ -101,6 +101,8 @@
 // ─── Descriptor models (UMF Stage 7.1) ───────────────────────────────────────
 #import "VGClipDescriptor.h"
 #import "VGTransitionDescriptor.h"
+// Phase 7.23B (DEC-167): native keyframe transform descriptor + interpolation.
+#import <UMF/VGTransformTrackDescriptor.h>
 
 // ─── UMF protocol / type imports ─────────────────────────────────────────────
 #import <UMF/VGFrameEnvelope.h>
@@ -153,7 +155,7 @@ static NSString *const kVGTCNTransitionsKey = @"transitions";
 // Q2: secondary reader will be built from this dict.
 static NSString *const kVGTCNDualCameraKey = @"dualCamera";
 
-// ─── Canvas dimension keys (Phase 7.9 aspect-fit normalization) ──────────────
+// ─── Canvas dimension keys (Phase 7.9 aspect-fit normalization) ────────────────────────────────────────────────────────
 // When present and non-zero, the compositor overrides
 // AVMutableVideoComposition.renderSize and applies an aspect-fit affine
 // transform via AVMutableVideoCompositionLayerInstruction so that decoded
@@ -1708,6 +1710,13 @@ static inline double _VGQuantizePTS(double pts) {
   // Set at the start of each pullFrame:, read by _buildReaderForClipIndex:.
   // Pull-queue-serial access only — no lock required.
   VGRenderMode _currentRenderMode;
+
+  // ── Phase 7.23B (DEC-167): clip-local elapsed timeline time ────────────────
+  // Set before each _pullBufferFromReader: call; read by that method to compute
+  // the keyframe-interpolated transform when the resolved clip has a
+  // transformTrack. Pull-queue-serial access only — no lock required.
+  // 0.0 = clip's first frame on the timeline (post-trim, post-layout).
+  double _currentElapsedTimeline;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2402,6 +2411,11 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
   double elapsedTimeline = requestedPTSSecs - activeClip.startTimeSeconds;
   double tAsset = VGComputeAssetTime(activeClip, elapsedTimeline);
 
+  // Phase 7.23B (DEC-167): Store clip-local elapsed time so _pullBufferFromReader:
+  // can read it when applying keyframe-interpolated transforms.
+  // Clamped to >= 0 defensively (requestedPTSSecs could theoretically undershoot).
+  _currentElapsedTimeline = MAX(0.0, elapsedTimeline);
+
   // ── Ensure the correct clip reader is active ──────────────────────────────
   // If the active clip changed since the last pullFrame:, tear down the
   // previous reader and prepare to build a new one for the new clip.
@@ -2492,13 +2506,23 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
     double elapsedOut = requestedPTSSecs - outgoingClipDesc.startTimeSeconds;
     double tAssetOut = VGComputeAssetTime(outgoingClipDesc, elapsedOut);
 
-    // Pull outgoing frame with per-reader reuse guard + Phase 7.11 transform.
+    // Phase 7.23B (DEC-167): Store outgoing clip-local elapsed time for
+    // keyframe-interpolated transform resolution in _pullBufferFromReader:.
+    // The primary elapsedTimeline is set above; override with outgoing value
+    // immediately before the outgoing pull, then restore for incoming pull.
+    double savedElapsedTimeline = _currentElapsedTimeline;
+    _currentElapsedTimeline = MAX(0.0, elapsedOut);
+
+    // Pull outgoing frame with per-reader reuse guard + Phase 7.11 / 7.23B transform.
     NSError *outErr = nil;
     CVPixelBufferRef outPB = [self _pullBufferFromReader:_outgoingReader
                                              atAssetTime:tAssetOut
                                                    error:&outErr];
 
-    // Pull incoming frame with per-reader reuse guard + Phase 7.11 transform.
+    // Restore primary elapsed for the incoming (active) clip pull.
+    _currentElapsedTimeline = savedElapsedTimeline;
+
+    // Pull incoming frame with per-reader reuse guard + Phase 7.11 / 7.23B transform.
     NSError *inErr = nil;
     CVPixelBufferRef inPB = [self _pullBufferFromReader:_activeReader
                                             atAssetTime:tAsset
@@ -3419,10 +3443,46 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
   }
   CVPixelBufferRetain(pb); // pb is now +1
 
-  // ── 4. Apply Phase 7.11 per-clip transform (identity optimization: skip if identity) ──
-  // Phase 7.x-Q3A: Use resolvedClip so secondary readers apply their own
-  // transform descriptor, not the primary timeline clip's transform.
-  VGClipTransformDescriptor *td = (reader.resolvedClip ?: _clips[reader.clipIndex]).transform;
+  // ── 4. Apply transform (Phase 7.11 / Phase 7.23B) ────────────────────────────
+  //
+  // Phase 7.23B (DEC-167): Keyframe-interpolated transform path.
+  // Eligibility guard: only forward-playing primary video clips with a
+  // non-nil transformTrack. Still-image, freeze-frame, reverse, and
+  // secondary dual-camera readers are excluded (cache coherency / bake
+  // constraints — deferred). Uses _currentElapsedTimeline set by
+  // pullFrame: immediately before this call.
+  //
+  // The outer condition mirrors the existing `if (td && !td.isIdentity)` guard:
+  // if the resulting interpolated descriptor is identity, skip the pixel op.
+  //
+  // Phase 7.x-Q3A: resolvedClip governs which transform descriptor to use,
+  // ensuring secondary readers apply their own clip's transform, not the
+  // primary timeline clip's transform.
+  VGClipDescriptor *resolvedClipDesc = (reader.resolvedClip ?: _clips[reader.clipIndex]);
+  VGClipTransformDescriptor *td = nil;
+
+  // Phase 7.23B: keyframe path (forward-play primary video only).
+  //   - resolvedClip.transformTrack must be non-nil.
+  //   - Not a static-source (still-image / freeze-frame) reader.
+  //   - Not a reversed clip.
+  //   - Not a secondary reader (resolvedClip and _clips[reader.clipIndex] must be the same).
+  BOOL isSecondaryReader = (reader.resolvedClip != nil &&
+                            reader.resolvedClip != _clips[reader.clipIndex]);
+  VGTransformTrackDescriptor *transformTrack =
+      (!isSecondaryReader && !reader.isStaticSource && !resolvedClipDesc.isReversed)
+          ? resolvedClipDesc.transformTrack
+          : nil;
+
+  if (transformTrack != nil) {
+    // Keyframe-interpolated transform: convert _currentElapsedTimeline to
+    // microseconds using llround for accurate int64 conversion (DEC-167 / Opus).
+    int64_t timeUs = llround(_currentElapsedTimeline * 1000000.0);
+    td = [transformTrack interpolatedTransformAtTimeUs:timeUs];
+  } else {
+    // Static transform path: existing Phase 7.11 / Q3A behavior.
+    td = resolvedClipDesc.transform;
+  }
+
   if (td && !td.isIdentity) {
     NSError *tfErr = nil;
     CVPixelBufferRef transformedPB = _VGTCNApplyTransformAndOpacity(pb, td, &tfErr);
