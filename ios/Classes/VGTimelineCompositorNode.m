@@ -730,10 +730,16 @@ static CVPixelBufferRef _VGTCNCompositePiP(
     }
 
     CGRect renderBounds = CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH);
+    // Phase 7.x-Q3B color-space fix: pass explicit device RGB so Core Image
+    // gamma-encodes output values correctly. Matches _VGTCNBlendBuffers pattern.
+    // colorSpace:nil would write linear working-space values directly, causing
+    // dark/underexposed composited output.
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     [_VGTCNSharedCIContext() render:composited
                      toCVPixelBuffer:outputBuf
                                bounds:renderBounds
-                           colorSpace:nil];
+                           colorSpace:cs];
+    CGColorSpaceRelease(cs);
 
     os_log(OS_LOG_DEFAULT,
            "[VGTCNode-Q3B] PiP composited: pip=(%.0f,%.0f,%.0f,%.0f) "
@@ -834,10 +840,15 @@ static CVPixelBufferRef _VGTCNCompositeSplitScreen(
     }
 
     CGRect renderBounds = CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH);
+    // Phase 7.x-Q3B color-space fix: explicit device RGB to match PiP path and
+    // _VGTCNBlendBuffers. Prevents linear working-space values from being written
+    // directly into the output buffer (which would produce dark composited output).
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
     [_VGTCNSharedCIContext() render:composited
                      toCVPixelBuffer:outputBuf
                                bounds:renderBounds
-                           colorSpace:nil];
+                           colorSpace:cs];
+    CGColorSpaceRelease(cs);
 
     os_log(OS_LOG_DEFAULT,
            "[VGTCNode-Q3B] Split composited: prim=%zux%zu sec=%zux%zu "
