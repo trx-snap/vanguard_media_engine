@@ -2204,6 +2204,64 @@ static inline double _VGQuantizePTS(double pts) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Time-remap PTS mapping helper (Phase 7.22B / DEC-165)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Maps an elapsed timeline duration (seconds since clip start) to the
+/// asset-local decode PTS for the given clip.
+///
+/// When clip.timeRemap is present and has valid segments, segments define
+/// the source-time mapping via piecewise-constant speed. clip.speed and
+/// clip.isReversed are ignored (timeRemap supersedes both).
+///
+/// When clip.timeRemap is absent, falls back to the legacy formula:
+///   Forward: trimStartSeconds + elapsedTimeline * clip.speed
+///   Reverse: trimEndSeconds   - elapsedTimeline * clip.speed
+///   Both clamped to [trimStartSeconds, trimEndSeconds].
+///
+/// This helper is called for the primary active clip and the outgoing
+/// transition clip. Secondary dual-camera clips continue using the legacy
+/// path directly (timeRemap on secondary clips is deferred to Phase 7.22C+).
+static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline) {
+    VGTimeRemapDescriptor *remap = clip.timeRemap;
+    if (remap != nil && remap.segments.count > 0) {
+        // ── Time-remap path ────────────────────────────────────────────────
+        // Walk segments in order, accumulating timeline duration consumed
+        // by each segment. When elapsedTimeline falls inside a segment,
+        // compute the source time within that segment.
+        double timelineCursor = 0.0;
+        for (VGSpeedSegmentDescriptor *seg in remap.segments) {
+            double segTimelineDur = seg.sourceDuration / seg.speedMultiplier;
+            if (elapsedTimeline <= timelineCursor + segTimelineDur) {
+                // elapsedTimeline falls inside this segment.
+                double elapsedInSeg = elapsedTimeline - timelineCursor;
+                return seg.sourceStartTime + elapsedInSeg * seg.speedMultiplier;
+            }
+            timelineCursor += segTimelineDur;
+        }
+        // elapsedTimeline is past all segments — clamp to end of last segment.
+        VGSpeedSegmentDescriptor *lastSeg = remap.segments.lastObject;
+        return lastSeg.sourceStartTime + lastSeg.sourceDuration; // = sourceEndTime
+    }
+
+    // ── Legacy path (no timeRemap) ─────────────────────────────────────────
+    // Phase 7.19 (DEC-154): Reverse playback support.
+    // Forward: trimStartSeconds + elapsedAsset
+    // Reverse: trimEndSeconds   - elapsedAsset
+    // Both clamped to [trimStartSeconds, trimEndSeconds] for float safety.
+    double elapsedAsset = elapsedTimeline * clip.speed;
+    double tAsset;
+    if (clip.isReversed) {
+        tAsset = clip.trimEndSeconds - elapsedAsset;
+    } else {
+        tAsset = clip.trimStartSeconds + elapsedAsset;
+    }
+    tAsset = MAX(tAsset, clip.trimStartSeconds);
+    tAsset = MIN(tAsset, clip.trimEndSeconds);
+    return tAsset;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - VGSourceNode — Pull-mode
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2327,20 +2385,11 @@ static inline double _VGQuantizePTS(double pts) {
   }
 
   // ── Compute asset-local decode PTS ────────────────────────────────────────
-  // Phase 7.19 (DEC-154): Reverse playback support.
-  // Forward: t_asset = clip.trimStartSeconds + elapsed_asset
-  // Reverse: t_asset = clip.trimEndSeconds   - elapsed_asset
-  // Both clamped to [trimStartSeconds, trimEndSeconds] for float safety.
+  // Phase 7.22B (DEC-165): VGComputeAssetTime encapsulates both the legacy
+  // speed/isReversed path and the new timeRemap piecewise-constant path.
+  // freezePTS remains a downstream override applied below, after this mapping.
   double elapsedTimeline = requestedPTSSecs - activeClip.startTimeSeconds;
-  double elapsedAsset = elapsedTimeline * activeClip.speed;
-  double tAsset;
-  if (activeClip.isReversed) {
-    tAsset = activeClip.trimEndSeconds - elapsedAsset;
-  } else {
-    tAsset = activeClip.trimStartSeconds + elapsedAsset;
-  }
-  tAsset = MAX(tAsset, activeClip.trimStartSeconds);
-  tAsset = MIN(tAsset, activeClip.trimEndSeconds);
+  double tAsset = VGComputeAssetTime(activeClip, elapsedTimeline);
 
   // ── Ensure the correct clip reader is active ──────────────────────────────
   // If the active clip changed since the last pullFrame:, tear down the
@@ -2382,15 +2431,8 @@ static inline double _VGQuantizePTS(double pts) {
       [self _tearDownOutgoingReader];
       VGClipDescriptor *outgoingClip = _clips[outgoingClipIndex];
       double elapsedOut = requestedPTSSecs - outgoingClip.startTimeSeconds;
-      // Phase 7.19: apply reverse formula for outgoing clip if reversed.
-      double tAssetOut;
-      if (outgoingClip.isReversed) {
-        tAssetOut = outgoingClip.trimEndSeconds - elapsedOut * outgoingClip.speed;
-      } else {
-        tAssetOut = outgoingClip.trimStartSeconds + elapsedOut * outgoingClip.speed;
-      }
-      tAssetOut = MAX(tAssetOut, outgoingClip.trimStartSeconds);
-      tAssetOut = MIN(tAssetOut, outgoingClip.trimEndSeconds);
+      // Phase 7.22B (DEC-165): use VGComputeAssetTime for outgoing clip.
+      double tAssetOut = VGComputeAssetTime(outgoingClip, elapsedOut);
       NSError *outBuildErr = nil;
       _outgoingReader = [self _buildReaderForClipIndex:outgoingClipIndex
                                            startAtTime:tAssetOut
@@ -2434,19 +2476,10 @@ static inline double _VGQuantizePTS(double pts) {
         : 1.0f;
 
     // Compute outgoing clip asset-local time.
+    // Phase 7.22B (DEC-165): use VGComputeAssetTime for the outgoing clip.
     VGClipDescriptor *outgoingClipDesc = _clips[outgoingClipIndex];
     double elapsedOut = requestedPTSSecs - outgoingClipDesc.startTimeSeconds;
-    // Phase 7.19: apply reverse formula for outgoing clip if reversed.
-    double tAssetOut;
-    if (outgoingClipDesc.isReversed) {
-      tAssetOut = outgoingClipDesc.trimEndSeconds -
-                  elapsedOut * outgoingClipDesc.speed;
-    } else {
-      tAssetOut = outgoingClipDesc.trimStartSeconds +
-                  elapsedOut * outgoingClipDesc.speed;
-    }
-    tAssetOut = MAX(tAssetOut, outgoingClipDesc.trimStartSeconds);
-    tAssetOut = MIN(tAssetOut, outgoingClipDesc.trimEndSeconds);
+    double tAssetOut = VGComputeAssetTime(outgoingClipDesc, elapsedOut);
 
     // Pull outgoing frame with per-reader reuse guard + Phase 7.11 transform.
     NSError *outErr = nil;
@@ -2620,6 +2653,9 @@ static inline double _VGQuantizePTS(double pts) {
       VGClipDescriptor *secondaryClip =
           [VGClipDescriptor fromDictionary:(NSDictionary *)rawSecondaryClip];
       if (secondaryClip) {
+        // Phase 7.22B (DEC-165): secondary dual-camera clips continue using
+        // the legacy speed-only mapping. timeRemap on secondary clips is
+        // deferred to Phase 7.22C+ to keep this slice minimal and safe.
         double secSpeed = (secondaryClip.speed > 0.0) ? secondaryClip.speed : 1.0;
         double tSecAsset = secondaryClip.trimStartSeconds + elapsedTimeline * secSpeed;
         tSecAsset = MAX(tSecAsset, secondaryClip.trimStartSeconds);

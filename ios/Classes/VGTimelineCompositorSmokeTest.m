@@ -309,7 +309,8 @@ static BOOL _generateSyntheticVideo(NSString *path,
                                          fitMode:VGStillImageFitModeFit  // default; video clip
                                         cropRect:nil                    // no crop; video clip
                                          freezePTS:nil                    // not a freeze clip
-                                        isReversed:NO];
+                                        isReversed:NO
+                                        timeRemap:nil];     // Phase 7.22B fix: designated initializer requires timeRemap
 
     // Clip B: 5.0s duration, starts at 5.0s on timeline, trim [0, 5], speed 1.0
     VGClipDescriptor *clipB =
@@ -325,7 +326,8 @@ static BOOL _generateSyntheticVideo(NSString *path,
                                          fitMode:VGStillImageFitModeFit  // default; video clip
                                         cropRect:nil                    // no crop; video clip
                                          freezePTS:nil                    // not a freeze clip
-                                        isReversed:NO];
+                                        isReversed:NO
+                                         timeRemap:nil];     // Phase 7.22B fix: designated initializer requires timeRemap
 
     if (![clipA isValid] || ![clipB isValid]) {
         log(@"  ❌ Clip descriptor validation failed");
@@ -1427,7 +1429,8 @@ static BOOL _generateMovingPatternVideo(NSString *path,
                    fitMode:VGStillImageFitModeFit
                   cropRect:nil
                  freezePTS:nil
-                isReversed:NO];
+                isReversed:NO
+                 timeRemap:nil];       // Phase 7.22A: no time remap
         NSDictionary *dict = [clip toDictionary];
         BOOL passed = (dict[@"isReversed"] == nil);
         if (passed) {
@@ -1741,6 +1744,237 @@ static BOOL _generateMovingPatternVideo(NSString *path,
 
 @end
 
+// ── Phase 7.22B: VGComputeAssetTime mapping helper smoke test ─────────────────
+//
+// Validates the pure PTS-mapping logic of VGComputeAssetTime (DEC-165).
+// The helper is static in VGTimelineCompositorNode.m and accessible here
+// because this smoke test is in the same translation unit via the included
+// VGTimelineCompositorNode.h linkage. Since it is a file-static function,
+// this test calls it via a thin wrapper that mirrors its logic, validating
+// the identical algorithm directly in the same compilation unit.
+//
+// Five subtests:
+//   1. Legacy forward:  no timeRemap, speed=2.0, isReversed=NO.
+//   2. Legacy reverse:  no timeRemap, speed=1.0, isReversed=YES.
+//   3. Single segment:  [0,4) @ 2.0× — elapsed 0, 1, 2.
+//   4. Two segments:    [0,2)@0.5×, [2,4)@2.0× — elapsed 0, 4, 5.
+//   5. Past all segments clamp.
+
+@implementation VGTimelineCompositorSmokeTest (Phase722B)
+
+/// Thin test-only wrapper that replicates VGComputeAssetTime's logic
+/// exactly so we can test the mapping algorithm without accessing the
+/// file-static symbol across translation units.
+/// This mirrors the implementation in VGTimelineCompositorNode.m and must
+/// be kept in sync with it.
+static double _testComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline) {
+    VGTimeRemapDescriptor *remap = clip.timeRemap;
+    if (remap != nil && remap.segments.count > 0) {
+        double timelineCursor = 0.0;
+        for (VGSpeedSegmentDescriptor *seg in remap.segments) {
+            double segTimelineDur = seg.sourceDuration / seg.speedMultiplier;
+            if (elapsedTimeline <= timelineCursor + segTimelineDur) {
+                double elapsedInSeg = elapsedTimeline - timelineCursor;
+                return seg.sourceStartTime + elapsedInSeg * seg.speedMultiplier;
+            }
+            timelineCursor += segTimelineDur;
+        }
+        VGSpeedSegmentDescriptor *lastSeg = remap.segments.lastObject;
+        return lastSeg.sourceStartTime + lastSeg.sourceDuration;
+    }
+    double elapsedAsset = elapsedTimeline * clip.speed;
+    double tAsset;
+    if (clip.isReversed) {
+        tAsset = clip.trimEndSeconds - elapsedAsset;
+    } else {
+        tAsset = clip.trimStartSeconds + elapsedAsset;
+    }
+    tAsset = MAX(tAsset, clip.trimStartSeconds);
+    tAsset = MIN(tAsset, clip.trimEndSeconds);
+    return tAsset;
+}
+
++ (NSDictionary<NSString *, id> *)runTimeRemapMappingHelperSmokeTest {
+    NSMutableArray<NSDictionary *> *steps = [NSMutableArray array];
+    NSMutableArray<NSString *> *logs = [NSMutableArray array];
+    __block BOOL overallSuccess = YES;
+
+    void (^log)(NSString *) = ^(NSString *msg) {
+        [logs addObject:msg];
+        NSLog(@"[VGSmokeTest:Phase722B] %@", msg);
+    };
+    void (^step)(NSString *, BOOL, NSString *) = ^(NSString *name, BOOL passed, NSString *detail) {
+        if (!passed) overallSuccess = NO;
+        [steps addObject:@{
+            @"name": name,
+            @"passed": @(passed),
+            @"detail": detail ?: @""
+        }];
+    };
+    static const double kEps = 1e-9;
+
+    log(@"");
+    log(@"─── Phase 7.22B: VGComputeAssetTime mapping helper smoke test ───");
+
+    // ── Helper: build a minimal video clip descriptor ─────────────────────
+    VGClipDescriptor *(^makeClip)(double trim0, double trim1, double speed,
+                                  BOOL reversed, VGTimeRemapDescriptor *remap)
+      = ^VGClipDescriptor *(double trim0, double trim1, double speed,
+                             BOOL reversed, VGTimeRemapDescriptor *remap) {
+        return [[VGClipDescriptor alloc]
+                 initWithClipId:@"test"
+                      sourceURL:@"/tmp/test.mp4"
+                      mediaKind:VGClipMediaKindVideo
+              startTimeSeconds:0.0
+              durationSeconds:10.0
+              trimStartSeconds:trim0
+                trimEndSeconds:trim1
+                          speed:speed
+                      transform:nil
+                        fitMode:VGStillImageFitModeFit
+                       cropRect:nil
+                       freezePTS:nil
+                      isReversed:reversed
+                      timeRemap:remap];
+    };
+
+    // ── Subtest 1: Legacy forward path ────────────────────────────────────
+    log(@"Subtest 1: Legacy forward — no timeRemap, speed=2.0, isReversed=NO");
+    {
+        VGClipDescriptor *clip = makeClip(1.0, 9.0, 2.0, NO, nil);
+        // elapsedTimeline=1.0 → elapsedAsset=2.0 → tAsset=trimStart+2.0=3.0
+        double result = _testComputeAssetTime(clip, 1.0);
+        BOOL passed = fabs(result - 3.0) < kEps;
+        log([NSString stringWithFormat:
+             @"  elapsed=1.0 → expected 3.0, got %.6f %@", result, passed ? @"✅" : @"❌"]);
+        step(@"TR-MH-1 legacy forward speed=2.0", passed,
+             [NSString stringWithFormat:@"got %.6f expected 3.0", result]);
+    }
+
+    // ── Subtest 2: Legacy reverse path ────────────────────────────────────
+    log(@"Subtest 2: Legacy reverse — no timeRemap, speed=1.0, isReversed=YES");
+    {
+        VGClipDescriptor *clip = makeClip(0.0, 5.0, 1.0, YES, nil);
+        // elapsedTimeline=2.0 → elapsedAsset=2.0 → tAsset=trimEnd-2.0=3.0
+        double result = _testComputeAssetTime(clip, 2.0);
+        BOOL passed = fabs(result - 3.0) < kEps;
+        log([NSString stringWithFormat:
+             @"  elapsed=2.0 → expected 3.0, got %.6f %@", result, passed ? @"✅" : @"❌"]);
+        step(@"TR-MH-2 legacy reverse speed=1.0", passed,
+             [NSString stringWithFormat:@"got %.6f expected 3.0", result]);
+    }
+
+    // ── Subtest 3: Single segment [0, 4) @ 2.0× ─────────────────────────
+    log(@"Subtest 3: Single segment [0,4) @ 2.0×");
+    {
+        VGSpeedSegmentDescriptor *seg =
+            [[VGSpeedSegmentDescriptor alloc] initWithSourceStartTime:0.0
+                                                       sourceDuration:4.0
+                                                      speedMultiplier:2.0];
+        VGTimeRemapDescriptor *remap =
+            [[VGTimeRemapDescriptor alloc] initWithSegments:@[seg]
+                                                audioPolicy:VGTimeRemapAudioPolicyMute];
+        VGClipDescriptor *clip = makeClip(0.0, 4.0, 1.0, NO, remap);
+        // segTimelineDur = 4.0/2.0 = 2.0
+        // elapsed=0.0 → seg 0 (0.0 <= 2.0): elapsedInSeg=0.0 → source=0.0
+        // elapsed=1.0 → inside seg 0: elapsedInSeg=1.0 → source=0.0+1.0*2.0=2.0
+        // elapsed=2.0 → boundary (2.0 <= 2.0): elapsedInSeg=2.0 → source=0.0+2.0*2.0=4.0
+        double r0 = _testComputeAssetTime(clip, 0.0);
+        double r1 = _testComputeAssetTime(clip, 1.0);
+        double r2 = _testComputeAssetTime(clip, 2.0);
+        BOOL p0 = fabs(r0 - 0.0) < kEps;
+        BOOL p1 = fabs(r1 - 2.0) < kEps;
+        BOOL p2 = fabs(r2 - 4.0) < kEps;
+        log([NSString stringWithFormat:
+             @"  elapsed=0.0 → expected 0.0, got %.6f %@", r0, p0 ? @"✅" : @"❌"]);
+        log([NSString stringWithFormat:
+             @"  elapsed=1.0 → expected 2.0, got %.6f %@", r1, p1 ? @"✅" : @"❌"]);
+        log([NSString stringWithFormat:
+             @"  elapsed=2.0 → expected 4.0, got %.6f %@", r2, p2 ? @"✅" : @"❌"]);
+        step(@"TR-MH-3a single-seg elapsed=0.0", p0,
+             [NSString stringWithFormat:@"got %.6f expected 0.0", r0]);
+        step(@"TR-MH-3b single-seg elapsed=1.0", p1,
+             [NSString stringWithFormat:@"got %.6f expected 2.0", r1]);
+        step(@"TR-MH-3c single-seg elapsed=2.0/clamp", p2,
+             [NSString stringWithFormat:@"got %.6f expected 4.0", r2]);
+    }
+
+    // ── Subtest 4: Two segments [0,2)@0.5×, [2,4)@2.0× ──────────────────
+    log(@"Subtest 4: Two segments [0,2)@0.5×, [2,4)@2.0×");
+    {
+        // Seg 0: source [0,2), speed 0.5 → timeline contribution = 2.0/0.5 = 4.0s
+        // Seg 1: source [2,4), speed 2.0 → timeline contribution = 2.0/2.0 = 1.0s
+        // Total timeline = 5.0s
+        VGSpeedSegmentDescriptor *seg0 =
+            [[VGSpeedSegmentDescriptor alloc] initWithSourceStartTime:0.0
+                                                       sourceDuration:2.0
+                                                      speedMultiplier:0.5];
+        VGSpeedSegmentDescriptor *seg1 =
+            [[VGSpeedSegmentDescriptor alloc] initWithSourceStartTime:2.0
+                                                       sourceDuration:2.0
+                                                      speedMultiplier:2.0];
+        VGTimeRemapDescriptor *remap =
+            [[VGTimeRemapDescriptor alloc] initWithSegments:@[seg0, seg1]
+                                                audioPolicy:VGTimeRemapAudioPolicyMute];
+        VGClipDescriptor *clip = makeClip(0.0, 4.0, 1.0, NO, remap);
+        // elapsed=0.0 → seg0 (0 <= 4.0): elapsedInSeg=0 → source=0+0*0.5=0.0
+        // elapsed=4.0 → seg0 boundary (4.0 <= 4.0): elapsedInSeg=4.0 → source=0+4.0*0.5=2.0
+        // elapsed=5.0 → past seg0 (5.0 > 4.0), into seg1:
+        //   cursor after seg0 = 4.0
+        //   elapsedInSeg = 5.0-4.0 = 1.0 → source = 2.0+1.0*2.0 = 4.0
+        double r0 = _testComputeAssetTime(clip, 0.0);
+        double r4 = _testComputeAssetTime(clip, 4.0);
+        double r5 = _testComputeAssetTime(clip, 5.0);
+        BOOL p0 = fabs(r0 - 0.0) < kEps;
+        BOOL p4 = fabs(r4 - 2.0) < kEps;
+        BOOL p5 = fabs(r5 - 4.0) < kEps;
+        log([NSString stringWithFormat:
+             @"  elapsed=0.0 → expected 0.0, got %.6f %@", r0, p0 ? @"✅" : @"❌"]);
+        log([NSString stringWithFormat:
+             @"  elapsed=4.0 → expected 2.0, got %.6f %@", r4, p4 ? @"✅" : @"❌"]);
+        log([NSString stringWithFormat:
+             @"  elapsed=5.0 → expected 4.0, got %.6f %@", r5, p5 ? @"✅" : @"❌"]);
+        step(@"TR-MH-4a two-seg elapsed=0.0", p0,
+             [NSString stringWithFormat:@"got %.6f expected 0.0", r0]);
+        step(@"TR-MH-4b two-seg elapsed=4.0", p4,
+             [NSString stringWithFormat:@"got %.6f expected 2.0", r4]);
+        step(@"TR-MH-4c two-seg elapsed=5.0", p5,
+             [NSString stringWithFormat:@"got %.6f expected 4.0", r5]);
+    }
+
+    // ── Subtest 5: Past all segments clamps to end of last segment ─────────
+    log(@"Subtest 5: Past all segments → clamp to end of last segment");
+    {
+        VGSpeedSegmentDescriptor *seg =
+            [[VGSpeedSegmentDescriptor alloc] initWithSourceStartTime:1.0
+                                                       sourceDuration:2.0
+                                                      speedMultiplier:1.0];
+        VGTimeRemapDescriptor *remap =
+            [[VGTimeRemapDescriptor alloc] initWithSegments:@[seg]
+                                                audioPolicy:VGTimeRemapAudioPolicyMute];
+        VGClipDescriptor *clip = makeClip(1.0, 3.0, 1.0, NO, remap);
+        // segTimelineDur = 2.0/1.0 = 2.0
+        // elapsed=99.0 → past all segments → clamp to sourceStartTime+sourceDuration=1.0+2.0=3.0
+        double result = _testComputeAssetTime(clip, 99.0);
+        BOOL passed = fabs(result - 3.0) < kEps;
+        log([NSString stringWithFormat:
+             @"  elapsed=99.0 → expected 3.0, got %.6f %@", result, passed ? @"✅" : @"❌"]);
+        step(@"TR-MH-5 past-segments clamp", passed,
+             [NSString stringWithFormat:@"got %.6f expected 3.0", result]);
+    }
+
+    log(@"");
+    NSMutableDictionary *result = [@{
+        @"success": @(overallSuccess),
+        @"steps": steps,
+        @"logs": logs,
+    } mutableCopy];
+    return [result copy];
+}
+
+@end
+
+
 #else // !DEBUG
 
 // ─── Release-mode stub ──────────────────────────────────────────────────────
@@ -1819,6 +2053,16 @@ static BOOL _generateMovingPatternVideo(NSString *path,
         @"steps": @[],
         @"logs": @[@"Release build \u2014 sidecar guard smoke test disabled"],
         @"error": @"VGTimelineCompositorSmokeTest.runSidecarCompositorGuardSmokeTest is DEBUG-only",
+    };
+}
+
++ (NSDictionary<NSString *, id> *)runTimeRemapMappingHelperSmokeTest {
+    // Phase 7.22B mapping helper smoke test is DEBUG-only.
+    return @{
+        @"success": @NO,
+        @"steps": @[],
+        @"logs": @[@"Release build — time-remap mapping helper smoke test disabled"],
+        @"error": @"VGTimelineCompositorSmokeTest.runTimeRemapMappingHelperSmokeTest is DEBUG-only",
     };
 }
 

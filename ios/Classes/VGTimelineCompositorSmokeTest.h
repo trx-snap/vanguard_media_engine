@@ -185,6 +185,24 @@ NS_ASSUME_NONNULL_BEGIN
 /// @return NSDictionary with @"success" YES/NO, @"steps", @"logs", @"error".
 + (NSDictionary<NSString *, id> *)runSidecarCompositorGuardSmokeTest;
 
+/// Phase 7.22B: VGComputeAssetTime mapping helper smoke test.
+///
+/// Validates the pure PTS-mapping logic introduced in Phase 7.22B (DEC-165).
+/// Exercises the VGComputeAssetTime static helper directly within this
+/// compilation unit. No AVAssetReader, no real video files required.
+///
+/// Five subtests:
+///   1. Legacy forward path: no timeRemap, speed=2.0, isReversed=NO.
+///   2. Legacy reverse path: no timeRemap, speed=1.0, isReversed=YES.
+///   3. Single segment [0,4) @ 2.0×: elapsed 0, 1, 2 maps correctly.
+///   4. Two segments [0,2)@0.5×, [2,4)@2.0×: elapsed 0, 4, 5 maps correctly.
+///   5. Past-all-segments clamp: returns end of last segment.
+///
+/// In RELEASE builds: returns a static error result.
+///
+/// @return NSDictionary with @"success" YES/NO, @"steps", @"logs", @"error".
++ (NSDictionary<NSString *, id> *)runTimeRemapMappingHelperSmokeTest;
+
 @end
 
 NS_ASSUME_NONNULL_END

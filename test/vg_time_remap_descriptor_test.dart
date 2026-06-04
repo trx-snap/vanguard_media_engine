@@ -629,4 +629,107 @@ void main() {
       expect(clone.speed, 1.0);
     });
   });
+
+  // ── VGClipDescriptor — timelineDuration with timeRemap (Phase 7.22B) ──────
+
+  group('VGClipDescriptor — timelineDuration (Phase 7.22B)', () {
+    test('TR-TLD-1 no timeRemap: timelineDuration == trimDuration / speed', () {
+      // Legacy path: speed=2.0, trim [1.0, 5.0] → trimDuration=4.0
+      // timelineDuration = 4.0 / 2.0 = 2.0
+      final clip = _videoClip(
+        trimStart: 1.0,
+        trimEnd: 5.0,
+        speed: 2.0,
+      );
+      expect(clip.timelineDuration, closeTo(2.0, 1e-10));
+    });
+
+    test('TR-TLD-2 no timeRemap speed=0.5: timelineDuration = trimDuration / 0.5', () {
+      // trim [0, 4], speed=0.5 → trimDuration=4.0 → timelineDuration=8.0
+      final clip = _videoClip(trimStart: 0.0, trimEnd: 4.0, speed: 0.5);
+      expect(clip.timelineDuration, closeTo(8.0, 1e-10));
+    });
+
+    test('TR-TLD-3 single segment [0,4) @ 2.0×: timelineDuration == 2.0', () {
+      // sourceDuration=4.0, speedMultiplier=2.0 → contribution=4.0/2.0=2.0
+      final remap = VGTimeRemapDescriptor(
+        segments: [
+          VGSpeedSegmentDescriptor(
+            sourceStartTime: 0.0,
+            sourceDuration: 4.0,
+            speedMultiplier: 2.0,
+          ),
+        ],
+      );
+      final clip = _videoClip(trimStart: 0.0, trimEnd: 4.0, timeRemap: remap);
+      expect(clip.timelineDuration, closeTo(2.0, 1e-10));
+    });
+
+    test('TR-TLD-4 two segments [0,2)@0.5× and [2,4)@2.0×: timelineDuration == 5.0', () {
+      // seg0: 2.0/0.5 = 4.0; seg1: 2.0/2.0 = 1.0 → total = 5.0
+      final remap = VGTimeRemapDescriptor(
+        segments: [
+          VGSpeedSegmentDescriptor(
+            sourceStartTime: 0.0,
+            sourceDuration: 2.0,
+            speedMultiplier: 0.5,
+          ),
+          VGSpeedSegmentDescriptor(
+            sourceStartTime: 2.0,
+            sourceDuration: 2.0,
+            speedMultiplier: 2.0,
+          ),
+        ],
+      );
+      final clip = _videoClip(trimStart: 0.0, trimEnd: 4.0, timeRemap: remap);
+      expect(clip.timelineDuration, closeTo(5.0, 1e-10));
+    });
+
+    test('TR-TLD-5 timeRemap supersedes speed for timelineDuration', () {
+      // clip.speed=0.5 but timeRemap has one segment [0,4)@1.0×
+      // Expected: 4.0/1.0=4.0 (not trimDuration/speed=4.0/0.5=8.0)
+      final remap = VGTimeRemapDescriptor(
+        segments: [
+          VGSpeedSegmentDescriptor(
+            sourceStartTime: 0.0,
+            sourceDuration: 4.0,
+            speedMultiplier: 1.0,
+          ),
+        ],
+      );
+      final clip = _videoClip(trimStart: 0.0, trimEnd: 4.0, speed: 0.5, timeRemap: remap);
+      expect(clip.timelineDuration, closeTo(4.0, 1e-10));
+      // Confirm it is NOT using trimDuration/speed:
+      expect(clip.timelineDuration, isNot(closeTo(8.0, 1e-2)));
+    });
+
+    test('TR-TLD-6 three-segment remap accumulates correctly', () {
+      // seg0: [0,3)@3.0× → 1.0s; seg1: [3,5)@1.0× → 2.0s; seg2: [5,6)@0.5× → 2.0s
+      // Total: 5.0s
+      final remap = VGTimeRemapDescriptor(
+        segments: [
+          VGSpeedSegmentDescriptor(
+              sourceStartTime: 0.0, sourceDuration: 3.0, speedMultiplier: 3.0),
+          VGSpeedSegmentDescriptor(
+              sourceStartTime: 3.0, sourceDuration: 2.0, speedMultiplier: 1.0),
+          VGSpeedSegmentDescriptor(
+              sourceStartTime: 5.0, sourceDuration: 1.0, speedMultiplier: 0.5),
+        ],
+      );
+      final clip = _videoClip(trimStart: 0.0, trimEnd: 6.0, timeRemap: remap);
+      expect(clip.timelineDuration, closeTo(5.0, 1e-10));
+    });
+
+    test('TR-TLD-7 existing serialization tests unaffected: no regression', () {
+      // Regression guard: a clip without timeRemap serializes identically to
+      // pre-7.22B behavior.
+      final clip = _videoClip(trimStart: 0.0, trimEnd: 6.0, speed: 1.5);
+      expect(clip.timelineDuration, closeTo(6.0 / 1.5, 1e-10));
+      final clone = VGClipDescriptor.fromMap(
+        Map<Object?, Object?>.from(clip.toMap()),
+      );
+      expect(clone, isNotNull);
+      expect(clone!.timelineDuration, closeTo(6.0 / 1.5, 1e-10));
+    });
+  });
 }

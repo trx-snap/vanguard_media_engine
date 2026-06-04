@@ -452,9 +452,24 @@ final class VGClipDescriptor {
 
   /// The wall-clock duration this clip contributes to the global timeline.
   ///
-  /// Accounts for the [speed] multiplier: at 0.5× speed a 4-second trim
-  /// occupies 8 seconds on the timeline.
-  double get timelineDuration => trimDuration / speed;
+  /// When [timeRemap] is present, the timeline duration is the sum of each
+  /// segment's contribution: `sourceDuration / speedMultiplier`. This
+  /// supersedes the scalar [speed] field for timeline duration purposes.
+  ///
+  /// When [timeRemap] is absent, preserves legacy behaviour:
+  /// `trimDuration / speed`.
+  ///
+  /// Phase 7.22B (DEC-165): updated to account for [timeRemap].
+  double get timelineDuration {
+    final remap = timeRemap;
+    if (remap != null) {
+      return remap.segments.fold(
+        0.0,
+        (sum, seg) => sum + seg.sourceDuration / seg.speedMultiplier,
+      );
+    }
+    return trimDuration / speed;
+  }
 
   // ── Serialisation ──────────────────────────────────────────────────────────
 
