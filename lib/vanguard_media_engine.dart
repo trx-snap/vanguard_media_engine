@@ -39,6 +39,8 @@ export 'vg_transition_descriptor.dart';
 export 'vg_time_remap_descriptor.dart';
 // Phase 7.11: per-clip spatial transform + opacity descriptor.
 export 'vg_clip_transform_descriptor.dart';
+// Phase 7.23: keyframe transform track foundation (descriptor + interpolation math; no rendering).
+export 'vg_transform_keyframe_descriptor.dart';
 // Phase 7.x-A: Dual-Camera Editor Consumption Descriptor Foundation.
 export 'vg_dual_camera_descriptor.dart';
 // Phase 7 Stage 7.7: formal editor draft recipe and controller API.

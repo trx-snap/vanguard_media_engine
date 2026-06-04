@@ -1,5 +1,5 @@
 // vg_clip_descriptor.dart
-// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11 / Phase 7.16 / Phase 7.17 / Phase 7.19B / Phase 7.x-Q1 / Phase 7.22A
+// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11 / Phase 7.16 / Phase 7.17 / Phase 7.19B / Phase 7.x-Q1 / Phase 7.22A / Phase 7.23
 //
 // Non-destructive clip descriptor for the UMF V2 timeline editor.
 //
@@ -65,6 +65,19 @@
 //   - The existing [speed] field remains unchanged and is NOT superseded in
 //     this slice. Both coexist; the compositor continues to use [speed] only.
 //
+// Phase 7.23 addition (DEC-167):
+//   - [transformTrack]: optional VGTransformTrackDescriptor — when non-null
+//     describes keyframed transform/opacity animation via an ordered list of
+//     VGTransformKeyframeDescriptor values and a declared interpolation mode.
+//   - **Descriptor-only in Phase 7.23.** The native compositor ignores this
+//     field until Phase 7.23B runtime integration is implemented.
+//   - Wire key: 'transformTrack'. Omitted from toMap() when null.
+//   - Backward-compatible: existing maps without 'transformTrack' produce null.
+//   - Precedence rule (DEC-167): When transformTrack is non-null, runtime
+//     rendering uses it INSTEAD of the static [transform] field. The two are
+//     NOT composed. Static transform remains stored as a fallback if
+//     transformTrack is absent or later cleared. Runtime integration: 7.23B.
+//
 // Serialisation:
 //   toMap() produces a JSON-compatible map:
 //   {
@@ -83,11 +96,13 @@
 //     'isReversed': bool?,       // Phase 7.19B: omitted when false (default)
 //     'dualCamera': Map?,        // Phase 7.x-Q1: omitted when null; secondary-only wire payload
 //     'timeRemap': Map?,         // Phase 7.22A: omitted when null; descriptor-only in 7.22A
+//     'transformTrack': Map?,    // Phase 7.23: omitted when null; descriptor-only in 7.23
 //   }
 
 import 'vg_clip_transform_descriptor.dart';
 import 'vg_dual_camera_descriptor.dart';
 import 'vg_time_remap_descriptor.dart';
+import 'vg_transform_keyframe_descriptor.dart';
 
 // ── VGStillImageFitMode ──────────────────────────────────────────────────────
 
@@ -192,6 +207,7 @@ final class VGClipDescriptor {
     this.isReversed = false,
     this.dualCamera,
     this.timeRemap,
+    this.transformTrack,
   })  : assert(startTimeSeconds >= 0, 'startTimeSeconds must be >= 0'),
         assert(durationSeconds >= 0, 'durationSeconds must be >= 0'),
         assert(trimStartSeconds >= 0, 'trimStartSeconds must be >= 0'),
@@ -427,9 +443,30 @@ final class VGClipDescriptor {
   /// - Backward-compatible: existing clip maps without 'timeRemap' produce null.
   final VGTimeRemapDescriptor? timeRemap;
 
+  // ── Keyframe transform track (Phase 7.23) ────────────────────────────────
+
+  /// Optional keyframed transform/opacity track for animated per-clip transforms.
+  ///
+  /// **Phase 7.23 / DEC-167** — descriptor and interpolation math only.
+  /// When non-null, this field describes animated per-clip transform/opacity
+  /// via an ordered list of [VGTransformKeyframeDescriptor] values.
+  ///
+  /// Design notes:
+  /// - Null means no keyframe animation; [transform] (static) governs rendering.
+  /// - **The native compositor ignores this field in Phase 7.23.** Runtime
+  ///   integration is Phase 7.23B.
+  /// - **Precedence rule (DEC-167)**: When [transformTrack] is non-null,
+  ///   runtime rendering uses it INSTEAD of the static [transform] field.
+  ///   The two are NOT composed together. Static [transform] remains stored
+  ///   as a fallback if [transformTrack] is absent or later cleared.
+  /// - Wire key: 'transformTrack'. Omitted from [toMap] when null.
+  /// - Backward-compatible: existing clip maps without 'transformTrack' produce null.
+  final VGTransformTrackDescriptor? transformTrack;
+
   // ── Crop rect convenience accessors (Phase 7.16) ─────────────────────────
 
   /// The normalized X origin of the crop rectangle. Null when [cropRect] is null.
+
   double? get cropX => cropRect?[0];
 
   /// The normalized Y origin of the crop rectangle. Null when [cropRect] is null.
@@ -532,6 +569,11 @@ final class VGClipDescriptor {
     // ignores this field until Phase 7.22B+ PTS mapping is implemented).
     if (timeRemap != null) {
       m['timeRemap'] = timeRemap!.toMap();
+    }
+    // Phase 7.23: include transformTrack when non-null (descriptor-only;
+    // compositor ignores this field until Phase 7.23B runtime integration).
+    if (transformTrack != null) {
+      m['transformTrack'] = transformTrack!.toMap();
     }
     return m;
   }
@@ -671,6 +713,26 @@ final class VGClipDescriptor {
       if (timeRemap == null) return null; // malformed time remap payload
     }
 
+    // Phase 7.23: parse optional transformTrack.
+    // Missing key means null (no keyframe track — uses static [transform]).
+    // A present but malformed map causes fromMap to return null.
+    VGTransformTrackDescriptor? transformTrack;
+    final rawTransformTrack = map['transformTrack'];
+    if (rawTransformTrack != null) {
+      if (rawTransformTrack is! Map<Object?, Object?>) {
+        if (rawTransformTrack is Map) {
+          transformTrack = VGTransformTrackDescriptor.fromMap(
+            rawTransformTrack.cast<Object?, Object?>(),
+          );
+        } else {
+          return null;
+        }
+      } else {
+        transformTrack = VGTransformTrackDescriptor.fromMap(rawTransformTrack);
+      }
+      if (transformTrack == null) return null; // malformed transform track payload
+    }
+
     return VGClipDescriptor(
       id: id as String,
       sourcePath: sourcePath as String,
@@ -687,6 +749,7 @@ final class VGClipDescriptor {
       isReversed: isReversed,
       dualCamera: dualCamera,
       timeRemap: timeRemap,
+      transformTrack: transformTrack,
     );
   }
 
@@ -716,6 +779,8 @@ final class VGClipDescriptor {
     Object? dualCamera = _kClipNoValue,
     // Use sentinel to allow explicit null assignment (clear timeRemap).
     Object? timeRemap = _kClipNoValue,
+    // Use sentinel to allow explicit null assignment (clear transformTrack).
+    Object? transformTrack = _kClipNoValue,
   }) {
     return VGClipDescriptor(
       id: id ?? this.id,
@@ -743,6 +808,9 @@ final class VGClipDescriptor {
       timeRemap: timeRemap == _kClipNoValue
           ? this.timeRemap
           : timeRemap as VGTimeRemapDescriptor?,
+      transformTrack: transformTrack == _kClipNoValue
+          ? this.transformTrack
+          : transformTrack as VGTransformTrackDescriptor?,
     );
   }
 
@@ -766,7 +834,8 @@ final class VGClipDescriptor {
           other.freezePTS == freezePTS &&
           other.isReversed == isReversed &&
           other.dualCamera == dualCamera &&
-          other.timeRemap == timeRemap;
+          other.timeRemap == timeRemap &&
+          other.transformTrack == transformTrack;
 
   /// Deep-equality helper for the [cropRect] list field.
   static bool _cropRectEqual(List<double>? a, List<double>? b) {
@@ -797,6 +866,7 @@ final class VGClipDescriptor {
         isReversed,
         dualCamera,
         timeRemap,
+        transformTrack,
       );
 
   @override
@@ -814,7 +884,8 @@ final class VGClipDescriptor {
       'freezePTS: $freezePTS, '
       'isReversed: $isReversed, '
       'dualCamera: ${dualCamera != null ? "<present layoutMode=${dualCamera!.layoutMode.value}>" : null}, '
-      'timeRemap: ${timeRemap != null ? "<present segments=${timeRemap!.segments.length}>" : null})';
+      'timeRemap: ${timeRemap != null ? "<present segments=${timeRemap!.segments.length}>" : null}, '
+      'transformTrack: ${transformTrack != null ? "<present keyframes=${transformTrack!.keyframes.length} interp=${transformTrack!.interpolation.value}>" : null})';
 }
 
 // ── Sentinel for copyWith nullable fields ─────────────────────────────────────────
