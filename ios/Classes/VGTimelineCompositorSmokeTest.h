@@ -1,5 +1,5 @@
 // VGTimelineCompositorSmokeTest.h
-// vanguard_media_engine — Phase 7 Stage 7.5B / Phase 7.16 / Phase 7.17 / Phase 7.19 / Phase 7.20A / Phase 7.20C
+// vanguard_media_engine — Phase 7 Stage 7.5B / Phase 7.16 / Phase 7.17 / Phase 7.19 / Phase 7.20A / Phase 7.20C / Phase 7.23B
 //
 // Headless native smoke test runner for VGTimelineCompositorNode.
 //
@@ -203,6 +203,27 @@ NS_ASSUME_NONNULL_BEGIN
 /// @return NSDictionary with @"success" YES/NO, @"steps", @"logs", @"error".
 + (NSDictionary<NSString *, id> *)runTimeRemapMappingHelperSmokeTest;
 
+/// Phase 7.23B: VGTransformTrackDescriptor interpolation smoke test.
+///
+/// Validates native keyframe descriptor model, interpolation math, and
+/// VGClipDescriptor serialisation round-trip for transformTrack.
+/// No AVAssetReader, no real video files, no compositor execution required.
+///
+/// Seven subtests:
+///   1. Single keyframe: interpolatedTransformAtTimeUs:0 returns exact values.
+///   2. Two keyframes, linear midpoint: at 500,000 us returns correct midpoints.
+///   3. Clamp before first: time before first returns first keyframe values.
+///   4. Clamp after last: time after last returns last keyframe values.
+///   5. Hold mode: two keyframes, hold interpolation, 500,000 us → first values.
+///   6. VGClipDescriptor round-trip: toDictionary → fromDictionary with transformTrack.
+///   7. VGClipDescriptor backward compatibility: dict without 'transformTrack' → nil.
+///
+/// In RELEASE builds: returns a static error result.
+///
+/// @return NSDictionary with @"success" YES/NO, @"steps", @"logs", @"error".
++ (NSDictionary<NSString *, id> *)runTransformTrackDescriptorSmokeTest;
+
 @end
 
 NS_ASSUME_NONNULL_END
+

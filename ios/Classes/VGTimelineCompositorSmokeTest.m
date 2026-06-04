@@ -37,6 +37,7 @@
 // ─── Stage 7.1 descriptor models ─────────────────────────────────────────────
 #import "VGClipDescriptor.h"
 #import "VGTransitionDescriptor.h"
+#import <UMF/VGTransformTrackDescriptor.h>
 
 // ─── UMF V2 types ────────────────────────────────────────────────────────────
 #import <UMF/VGGraphDescriptor.h>
@@ -326,8 +327,9 @@ static BOOL _generateSyntheticVideo(NSString *path,
                                          fitMode:VGStillImageFitModeFit  // default; video clip
                                         cropRect:nil                    // no crop; video clip
                                          freezePTS:nil                    // not a freeze clip
-                                        isReversed:NO
-                                         timeRemap:nil];     // Phase 7.22B fix: designated initializer requires timeRemap
+                                         isReversed:NO
+                                         timeRemap:nil              // Phase 7.22B
+                                       transformTrack:nil];          // Phase 7.23B
 
     if (![clipA isValid] || ![clipB isValid]) {
         log(@"  ❌ Clip descriptor validation failed");
@@ -1430,7 +1432,8 @@ static BOOL _generateMovingPatternVideo(NSString *path,
                   cropRect:nil
                  freezePTS:nil
                 isReversed:NO
-                 timeRemap:nil];       // Phase 7.22A: no time remap
+                 timeRemap:nil           // Phase 7.22A: no time remap
+            transformTrack:nil];         // Phase 7.23B: no keyframed track
         NSDictionary *dict = [clip toDictionary];
         BOOL passed = (dict[@"isReversed"] == nil);
         if (passed) {
@@ -1835,7 +1838,8 @@ static double _testComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeli
                        cropRect:nil
                        freezePTS:nil
                       isReversed:reversed
-                      timeRemap:remap];
+                      timeRemap:remap
+                 transformTrack:nil];
     };
 
     // ── Subtest 1: Legacy forward path ────────────────────────────────────
@@ -1974,6 +1978,327 @@ static double _testComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeli
 
 @end
 
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Phase 7.23B: Transform track descriptor smoke test
+// ─────────────────────────────────────────────────────────────────────────────
+
+@implementation VGTimelineCompositorSmokeTest (Phase723B)
+
++ (NSDictionary<NSString *, id> *)runTransformTrackDescriptorSmokeTest {
+    NSMutableArray<NSDictionary *> *steps = [NSMutableArray array];
+    NSMutableArray<NSString *> *logs = [NSMutableArray array];
+    __block BOOL overallSuccess = YES;
+
+    void (^log)(NSString *) = ^(NSString *msg) {
+        [logs addObject:msg];
+        NSLog(@"[VGSmokeTest:Phase723B] %@", msg);
+    };
+    void (^step)(NSString *, BOOL, NSString *) = ^(NSString *name, BOOL passed, NSString *detail) {
+        if (!passed) overallSuccess = NO;
+        [steps addObject:@{
+            @"name": name,
+            @"passed": @(passed),
+            @"detail": detail ?: @""
+        }];
+    };
+    static const double kEps = 1e-9;
+
+    log(@"");
+    log(@"─── Phase 7.23B: VGTransformTrackDescriptor interpolation smoke test ───");
+
+    // ── Subtest 1: Single keyframe ──────────────────────────────────────────────
+    log(@"Subtest 1: Single keyframe — interpolatedTransformAtTimeUs:0 returns exact values");
+    {
+        VGTransformKeyframeDescriptor *kf =
+            [[VGTransformKeyframeDescriptor alloc]
+             initWithTimeUs:0
+                     scaleX:2.0
+                     scaleY:0.5
+               translationX:10.0
+               translationY:-5.0
+                   rotation:0.785
+                    opacity:0.75];
+        VGTransformTrackDescriptor *track =
+            [[VGTransformTrackDescriptor alloc]
+             initWithKeyframes:@[kf]
+                 interpolation:VGKeyframeInterpolationValueLinear
+                       anchorX:0.5
+                       anchorY:0.5];
+        VGClipTransformDescriptor *result = [track interpolatedTransformAtTimeUs:0];
+        BOOL passed = (fabs(result.scaleX - 2.0) < kEps &&
+                       fabs(result.scaleY - 0.5) < kEps &&
+                       fabs(result.translationX - 10.0) < kEps &&
+                       fabs(result.translationY - (-5.0)) < kEps &&
+                       fabs(result.rotation - 0.785) < kEps &&
+                       fabs(result.opacity - 0.75) < kEps &&
+                       fabs(result.anchorX - 0.5) < kEps &&
+                       fabs(result.anchorY - 0.5) < kEps);
+        log([NSString stringWithFormat:
+             @"  scaleX=%.3f scaleY=%.3f tx=%.3f ty=%.3f rot=%.3f op=%.3f %@",
+             result.scaleX, result.scaleY,
+             result.translationX, result.translationY,
+             result.rotation, result.opacity,
+             passed ? @"\u2705" : @"\u274c"]);
+        step(@"TK-1 single keyframe exact values", passed,
+             passed ? @"All fields match exact keyframe values"
+                    : @"One or more fields deviate from expected keyframe values");
+    }
+
+    // ── Subtest 2: Two keyframes, linear midpoint ───────────────────────────
+    log(@"Subtest 2: Two keyframes, linear midpoint at 500,000 us");
+    {
+        // KF 0 at 0 us: scale(1,1), translate(0,0), rot=0, opacity=1
+        // KF 1 at 1,000,000 us: scale(2,3), translate(100,-50), rot=1, opacity=0
+        // at 500,000 us (t=0.5): scale(1.5,2), translate(50,-25), rot=0.5, opacity=0.5
+        VGTransformKeyframeDescriptor *kf0 =
+            [[VGTransformKeyframeDescriptor alloc]
+             initWithTimeUs:0
+                     scaleX:1.0
+                     scaleY:1.0
+               translationX:0.0
+               translationY:0.0
+                   rotation:0.0
+                    opacity:1.0];
+        VGTransformKeyframeDescriptor *kf1 =
+            [[VGTransformKeyframeDescriptor alloc]
+             initWithTimeUs:1000000
+                     scaleX:2.0
+                     scaleY:3.0
+               translationX:100.0
+               translationY:-50.0
+                   rotation:1.0
+                    opacity:0.0];
+        VGTransformTrackDescriptor *track =
+            [[VGTransformTrackDescriptor alloc]
+             initWithKeyframes:@[kf0, kf1]
+                 interpolation:VGKeyframeInterpolationValueLinear
+                       anchorX:0.5
+                       anchorY:0.5];
+        VGClipTransformDescriptor *result = [track interpolatedTransformAtTimeUs:500000];
+        BOOL passed = (fabs(result.scaleX - 1.5) < kEps &&
+                       fabs(result.scaleY - 2.0) < kEps &&
+                       fabs(result.translationX - 50.0) < kEps &&
+                       fabs(result.translationY - (-25.0)) < kEps &&
+                       fabs(result.rotation - 0.5) < kEps &&
+                       fabs(result.opacity - 0.5) < kEps);
+        log([NSString stringWithFormat:
+             @"  scaleX=%.3f(expected 1.5) scaleY=%.3f(expected 2.0) "
+              "tx=%.1f(expected 50) ty=%.1f(expected -25) "
+              "rot=%.3f(expected 0.5) op=%.3f(expected 0.5) %@",
+             result.scaleX, result.scaleY,
+             result.translationX, result.translationY,
+             result.rotation, result.opacity,
+             passed ? @"\u2705" : @"\u274c"]);
+        step(@"TK-2 linear midpoint t=0.5", passed,
+             passed ? @"All fields match expected linear midpoints"
+                    : @"One or more fields deviate from expected midpoint values");
+    }
+
+    // ── Subtest 3: Clamp before first keyframe ────────────────────────────
+    log(@"Subtest 3: Clamp before first keyframe");
+    {
+        VGTransformKeyframeDescriptor *kf =
+            [[VGTransformKeyframeDescriptor alloc]
+             initWithTimeUs:1000
+                     scaleX:1.5
+                     scaleY:1.5
+               translationX:20.0
+               translationY:0.0
+                   rotation:0.3
+                    opacity:0.8];
+        VGTransformTrackDescriptor *track =
+            [[VGTransformTrackDescriptor alloc]
+             initWithKeyframes:@[kf]
+                 interpolation:VGKeyframeInterpolationValueLinear
+                       anchorX:0.5
+                       anchorY:0.5];
+        // Query at timeUs=0, which is before kf.timeUs=1000.
+        VGClipTransformDescriptor *result = [track interpolatedTransformAtTimeUs:0];
+        BOOL passed = (fabs(result.scaleX - 1.5) < kEps &&
+                       fabs(result.translationX - 20.0) < kEps);
+        log([NSString stringWithFormat:
+             @"  timeUs=0 (first kf at 1000) → scaleX=%.3f(expected 1.5) tx=%.1f(expected 20) %@",
+             result.scaleX, result.translationX, passed ? @"\u2705" : @"\u274c"]);
+        step(@"TK-3 clamp before first keyframe", passed,
+             passed ? @"Returns first keyframe values for time before first kf"
+                    : @"Did not return first keyframe values for pre-first-kf time");
+    }
+
+    // ── Subtest 4: Clamp after last keyframe ────────────────────────────
+    log(@"Subtest 4: Clamp after last keyframe");
+    {
+        VGTransformKeyframeDescriptor *kfLast =
+            [[VGTransformKeyframeDescriptor alloc]
+             initWithTimeUs:2000000
+                     scaleX:3.0
+                     scaleY:3.0
+               translationX:-50.0
+               translationY:100.0
+                   rotation:1.57
+                    opacity:0.1];
+        VGTransformTrackDescriptor *track =
+            [[VGTransformTrackDescriptor alloc]
+             initWithKeyframes:@[kfLast]
+                 interpolation:VGKeyframeInterpolationValueLinear
+                       anchorX:0.5
+                       anchorY:0.5];
+        // Query at timeUs=9999999, which is after kfLast.timeUs=2000000.
+        VGClipTransformDescriptor *result = [track interpolatedTransformAtTimeUs:9999999];
+        BOOL passed = (fabs(result.scaleX - 3.0) < kEps &&
+                       fabs(result.opacity - 0.1) < kEps);
+        log([NSString stringWithFormat:
+             @"  timeUs=9999999 (last kf at 2000000) → scaleX=%.3f(expected 3.0) op=%.3f(expected 0.1) %@",
+             result.scaleX, result.opacity, passed ? @"\u2705" : @"\u274c"]);
+        step(@"TK-4 clamp after last keyframe", passed,
+             passed ? @"Returns last keyframe values for time after last kf"
+                    : @"Did not return last keyframe values for post-last-kf time");
+    }
+
+    // ── Subtest 5: Hold mode ────────────────────────────────────────────────────────
+    log(@"Subtest 5: Hold mode — 500,000 us between kf(0) and kf(1000000) returns kf(0) values");
+    {
+        VGTransformKeyframeDescriptor *kfHold0 =
+            [[VGTransformKeyframeDescriptor alloc]
+             initWithTimeUs:0
+                     scaleX:1.0
+                     scaleY:1.0
+               translationX:0.0
+               translationY:0.0
+                   rotation:0.0
+                    opacity:1.0];
+        VGTransformKeyframeDescriptor *kfHold1 =
+            [[VGTransformKeyframeDescriptor alloc]
+             initWithTimeUs:1000000
+                     scaleX:2.0
+                     scaleY:2.0
+               translationX:100.0
+               translationY:100.0
+                   rotation:1.0
+                    opacity:0.0];
+        VGTransformTrackDescriptor *track =
+            [[VGTransformTrackDescriptor alloc]
+             initWithKeyframes:@[kfHold0, kfHold1]
+                 interpolation:VGKeyframeInterpolationValueHold
+                       anchorX:0.5
+                       anchorY:0.5];
+        // At 500,000 us, hold mode should return kf(0) values (not interpolated).
+        VGClipTransformDescriptor *result = [track interpolatedTransformAtTimeUs:500000];
+        BOOL passed = (fabs(result.scaleX - 1.0) < kEps &&
+                       fabs(result.translationX - 0.0) < kEps &&
+                       fabs(result.opacity - 1.0) < kEps);
+        log([NSString stringWithFormat:
+             @"  hold at 500000 us → scaleX=%.3f(expected 1.0) tx=%.1f(expected 0) op=%.3f(expected 1.0) %@",
+             result.scaleX, result.translationX, result.opacity, passed ? @"\u2705" : @"\u274c"]);
+        step(@"TK-5 hold mode returns prev keyframe", passed,
+             passed ? @"Hold mode correctly returns kf(0) values at time between kf(0) and kf(1)"
+                    : @"Hold mode returned incorrect interpolated values instead of kf(0)");
+    }
+
+    // ── Subtest 6: VGClipDescriptor round-trip with transformTrack ─────────
+    log(@"Subtest 6: VGClipDescriptor toDictionary → fromDictionary round-trip with transformTrack");
+    {
+        VGTransformKeyframeDescriptor *kfRT =
+            [[VGTransformKeyframeDescriptor alloc]
+             initWithTimeUs:0
+                     scaleX:1.5
+                     scaleY:2.0
+               translationX:30.0
+               translationY:-10.0
+                   rotation:0.5
+                    opacity:0.9];
+        VGTransformTrackDescriptor *track =
+            [[VGTransformTrackDescriptor alloc]
+             initWithKeyframes:@[kfRT]
+                 interpolation:VGKeyframeInterpolationValueLinear
+                       anchorX:0.3
+                       anchorY:0.7];
+        VGClipDescriptor *clip =
+            [[VGClipDescriptor alloc]
+             initWithClipId:@"rt-clip"
+                  sourceURL:@"/tmp/video.mp4"
+                  mediaKind:VGClipMediaKindVideo
+          startTimeSeconds:0.0
+          durationSeconds:5.0
+          trimStartSeconds:0.0
+            trimEndSeconds:5.0
+                      speed:1.0
+                  transform:nil
+                    fitMode:VGStillImageFitModeFit
+                   cropRect:nil
+                  freezePTS:nil
+                 isReversed:NO
+                  timeRemap:nil
+             transformTrack:track];
+        NSDictionary *dict = [clip toDictionary];
+        VGClipDescriptor *roundTripped = [VGClipDescriptor fromDictionary:dict];
+        BOOL nonNil = (roundTripped != nil);
+        BOOL hasTrack = (roundTripped.transformTrack != nil);
+        BOOL kfParityOk = NO;
+        if (hasTrack && roundTripped.transformTrack.keyframes.count == 1) {
+            VGTransformKeyframeDescriptor *rtKF = roundTripped.transformTrack.keyframes[0];
+            kfParityOk = (rtKF.timeUs == 0 &&
+                          fabs(rtKF.scaleX - 1.5) < kEps &&
+                          fabs(rtKF.scaleY - 2.0) < kEps &&
+                          fabs(rtKF.translationX - 30.0) < kEps &&
+                          fabs(rtKF.translationY - (-10.0)) < kEps &&
+                          fabs(rtKF.rotation - 0.5) < kEps &&
+                          fabs(rtKF.opacity - 0.9) < kEps);
+        }
+        BOOL anchorOk = (roundTripped.transformTrack != nil &&
+                         fabs(roundTripped.transformTrack.anchorX - 0.3) < kEps &&
+                         fabs(roundTripped.transformTrack.anchorY - 0.7) < kEps);
+        BOOL passed = nonNil && hasTrack && kfParityOk && anchorOk;
+        log([NSString stringWithFormat:
+             @"  nonNil=%@ hasTrack=%@ kfParityOk=%@ anchorOk=%@ %@",
+             nonNil ? @"YES" : @"NO",
+             hasTrack ? @"YES" : @"NO",
+             kfParityOk ? @"YES" : @"NO",
+             anchorOk ? @"YES" : @"NO",
+             passed ? @"\u2705" : @"\u274c"]);
+        step(@"TK-6 VGClipDescriptor round-trip with transformTrack", passed,
+             passed ? @"transformTrack survives toDictionary/fromDictionary round-trip"
+                    : @"transformTrack lost or field mismatch after round-trip");
+    }
+
+    // ── Subtest 7: VGClipDescriptor backward compatibility (no transformTrack) ─
+    log(@"Subtest 7: VGClipDescriptor backward compatibility — fromDictionary without transformTrack");
+    {
+        // Build a dict that has no 'transformTrack' key at all.
+        NSDictionary *dict = @{
+            @"id":                @"back-compat-clip",
+            @"sourcePath":        @"/tmp/video.mp4",
+            @"mediaKind":         @"video",
+            @"startTimeSeconds":  @(0.0),
+            @"durationSeconds":   @(5.0),
+            @"trimStartSeconds":  @(0.0),
+            @"trimEndSeconds":    @(5.0),
+            @"speed":             @(1.0),
+        };
+        VGClipDescriptor *clip = [VGClipDescriptor fromDictionary:dict];
+        BOOL nonNil = (clip != nil);
+        BOOL trackNil = (clip.transformTrack == nil);
+        BOOL passed = nonNil && trackNil;
+        log([NSString stringWithFormat:
+             @"  clip nonNil=%@ transformTrack==%@ %@",
+             nonNil ? @"YES" : @"NO",
+             trackNil ? @"nil" : @"non-nil",
+             passed ? @"\u2705" : @"\u274c"]);
+        step(@"TK-7 backward compat: no transformTrack key → nil", passed,
+             passed ? @"Missing transformTrack key correctly produces nil property"
+                    : @"transformTrack unexpectedly non-nil when key absent from dict");
+    }
+
+    log(@"");
+    NSMutableDictionary *result = [@{
+        @"success": @(overallSuccess),
+        @"steps": steps,
+        @"logs": logs,
+    } mutableCopy];
+    return [result copy];
+}
+
+@end
+
 
 #else // !DEBUG
 
@@ -2065,6 +2390,17 @@ static double _testComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeli
         @"error": @"VGTimelineCompositorSmokeTest.runTimeRemapMappingHelperSmokeTest is DEBUG-only",
     };
 }
+
++ (NSDictionary<NSString *, id> *)runTransformTrackDescriptorSmokeTest {
+    // Phase 7.23B transform track descriptor smoke test is DEBUG-only.
+    return @{
+        @"success": @NO,
+        @"steps": @[],
+        @"logs": @[@"Release build \u2014 transform track descriptor smoke test disabled"],
+        @"error": @"VGTimelineCompositorSmokeTest.runTransformTrackDescriptorSmokeTest is DEBUG-only",
+    };
+}
+
 
 @end
 
