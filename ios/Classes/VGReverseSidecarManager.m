@@ -148,8 +148,9 @@ static const NSInteger kVGSidecarMaxFrameCount = 300;
 
 /// Maximum estimated raw pixel bytes for the in-memory frame accumulation.
 /// Estimated as: targetWidth × targetHeight × 4 × frameCount.
-/// Default: 160 MB — conservative for foreground app footprint.
-static const NSUInteger kVGSidecarMaxEstimatedBytes = 160 * 1024 * 1024;
+/// Default: 200 MB — still bounded for foreground app footprint while allowing
+/// short <=10s / ~30fps reverse preview sidecars at the 540px target dimension.
+static const NSUInteger kVGSidecarMaxEstimatedBytes = 200 * 1024 * 1024;
 
 /// Maximum target size dimension for sidecar output. Frames are downscaled to
 /// at most this size to reduce memory footprint. This matches typical preview

@@ -3203,6 +3203,37 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
     // Create inline — stateless; alloc cost (~30 μs) is negligible vs
     // extraction I/O cost (~5-15 ms). No persistent generator on _VGClipReader.
     // Configuration exactly matches the Phase 7.17 freeze-frame path (DEC-150).
+
+    // ── Phase 7.24A (RR-157): Long-reverse inline guard ──────────────────
+    // The inline AVAssetImageGenerator path is safe only for short clips.
+    // For clips > 10 s, per-frame CGImage/CIImage allocations accumulate
+    // faster than ARC drains them, causing multi-GB memory growth and
+    // Jetsam termination. Reject early; caller must prepare a reverse sidecar.
+    double clipDuration = MAX(0.0, clip.trimEndSeconds - clip.trimStartSeconds);
+    if (clipDuration > 10.0) {
+      if (outError) {
+        *outError = _VGTCNError(
+            44, ([NSString stringWithFormat:
+                     @"VGTimelineCompositorNode (Phase 7.24A): reversed clip "
+                      "exceeds 10s inline extraction limit. "
+                      "Prepare a reverse sidecar first. "
+                      "clip=%@, duration=%.1fs",
+                     clip.clipId, clipDuration]));
+      }
+      os_log_error(sTimelineLog,
+                   "[VGTCNode] Phase 7.24A: long-reverse guard fired clip=%lu "
+                   "duration=%.1fs — refusing inline extraction to prevent Jetsam",
+                   (unsigned long)reader.clipIndex, clipDuration);
+      return NULL;
+    }
+
+    // ── Phase 7.24A (RR-157): Autoreleasepool for per-frame intermediates ─
+    // Wrap the entire extraction in a local @autoreleasepool so that
+    // AVURLAsset, AVAssetImageGenerator, CGImage, and CIImage intermediates
+    // are drained immediately after each frame rather than accumulating in
+    // the enclosing pool. This keeps per-frame memory footprint bounded for
+    // short (≤ 10 s) reversed clips.
+    @autoreleasepool {
     NSURL *assetURL = [NSURL fileURLWithPath:clip.sourceURL];
     if (!assetURL) {
       if (outError) {
@@ -3373,6 +3404,7 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
 
       return pb; // caller owns +1 from CVPixelBufferCreate
     }
+    } // @autoreleasepool — Phase 7.24A: drain per-frame reverse intermediates
   }
   // ── End Phase 7.19 reverse extraction ───────────────────────────────────
 
