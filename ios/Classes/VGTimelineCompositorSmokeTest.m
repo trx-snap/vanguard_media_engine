@@ -311,7 +311,7 @@ static BOOL _generateSyntheticVideo(NSString *path,
                                         cropRect:nil                    // no crop; video clip
                                          freezePTS:nil                    // not a freeze clip
                                         isReversed:NO
-                                        timeRemap:nil];     // Phase 7.22B fix: designated initializer requires timeRemap
+                                        timeRemap:nil transformTrack:nil];
 
     // Clip B: 5.0s duration, starts at 5.0s on timeline, trim [0, 5], speed 1.0
     VGClipDescriptor *clipB =
