@@ -2004,12 +2004,24 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             let exportOutputPath: String = (args?["outputPath"] as? String)
                                            ?? (NSTemporaryDirectory() + "vg_timeline_export_prod.mp4")
 
-            NSLog("[VanguardPlugin][7.8] exportTimeline: clips=%d w=%ld h=%ld fps=%ld bitrate=%ld path=%@",
-                  clipDictsE.count, Int(exportW), Int(exportH),
-                  Int(exportFps), Int(exportBitrate), exportOutputPath)
+            // Phase 8.6: Extract optional canvas and overlays from the draft map.
+            // These originate from VGEditorDraft.toMap() which emits both keys
+            // unconditionally. Missing or malformed values are passed as nil —
+            // VGOverlayNode parses defensively and produces safe defaults.
+            // No strict preflight: malformed overlay dicts are silently skipped.
+            let exportCanvasDict   = draftMapE["canvas"]   as? [String: Any]
+            let exportOverlayDicts = draftMapE["overlays"] as? [[String: Any]]
 
-            // Delegate to ObjC VGTimelineExportHelper — same path as dev_timelineExport.
+            NSLog("[VanguardPlugin][8.6] exportTimeline: clips=%d w=%ld h=%ld fps=%ld bitrate=%ld overlays=%d path=%@",
+                  clipDictsE.count, Int(exportW), Int(exportH),
+                  Int(exportFps), Int(exportBitrate),
+                  exportOverlayDicts?.count ?? 0, exportOutputPath)
+
+            // Delegate to ObjC VGTimelineExportHelper.
+            // Phase 8.6: uses the new 9-parameter method with canvas and overlays.
             // VGExportProfile is constructed entirely in ObjC (MOD-1, MOD-2).
+            // When exportOverlayDicts is nil or empty, VGTimelineExportHelper
+            // preserves the original 2-node compositor → sink topology.
             VGTimelineExportHelper.exportTimeline(
                 withClips: clipDictsE,
                 transitions: transitionDictsE,
@@ -2017,11 +2029,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 width: exportW,
                 height: exportH,
                 fps: exportFps,
-                bitrateBps: exportBitrate
+                bitrateBps: exportBitrate,
+                canvas: exportCanvasDict,
+                overlays: exportOverlayDicts
             ) { success, outPath, duration, error in
                 DispatchQueue.main.async {
                     if success, let outPath = outPath {
-                        NSLog("[VanguardPlugin][7.8] exportTimeline success: %.2fs %@",
+                        NSLog("[VanguardPlugin][8.6] exportTimeline success: %.2fs %@",
                               duration, outPath)
                         result([
                             "success":         true,
@@ -2034,7 +2048,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     } else {
                         let msg = error?.localizedDescription
                                   ?? "Production timeline export failed (unknown error)"
-                        NSLog("[VanguardPlugin][7.8] exportTimeline failed: %@", msg)
+                        NSLog("[VanguardPlugin][8.6] exportTimeline failed: %@", msg)
                         result(FlutterError(
                             code: "COMPOSITOR_INIT_FAILED",
                             message: msg,

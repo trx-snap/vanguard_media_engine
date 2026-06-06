@@ -29,6 +29,25 @@
 //
 // Phase 7 Stage 7.5E: dev export proof only. No production API surface.
 // PLATFORM: AVFoundation, VideoToolbox (via VGVideoEncoderSinkNode).
+//
+// ── Phase 8.6 Overlay Wiring ─────────────────────────────────────────────────
+//
+// Phase 8.6 adds a new 9-parameter method that accepts optional canvas and
+// overlays dictionaries.
+//
+// When overlays is non-empty, VGOverlayNode is inserted between the compositor
+// and sink, changing the export topology from:
+//   VGTimelineCompositorNode → VGVideoEncoderSinkNode
+// to:
+//   VGTimelineCompositorNode → VGOverlayNode → VGVideoEncoderSinkNode
+//
+// When overlays is nil or empty, the existing 2-node topology is preserved
+// exactly. No behavior change for the no-overlay case.
+//
+// The original 7-parameter method is kept for backward compatibility and
+// forwards to the new method with canvas:nil overlays:nil.
+//
+// Phase 8.6: Pass-through only. No rendering. No Metal. No CoreImage.
 
 #pragma once
 
@@ -70,6 +89,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// @param completion   Invoked exactly once on a background queue upon completion.
 ///                     On success: success=YES, outputPath=absolute path, durationSeconds≈10.0.
 ///                     On failure: success=NO, error describes the failure.
+///
+/// Forwards to exportTimelineWithClips:transitions:outputPath:width:height:fps:bitrateBps:
+/// canvas:overlays:completion: with canvas:nil overlays:nil.
 + (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
                     transitions:(NSArray<NSDictionary *> *)transitions
                      outputPath:(NSString *)outputPath
@@ -77,6 +99,46 @@ NS_ASSUME_NONNULL_BEGIN
                          height:(NSInteger)height
                             fps:(NSInteger)fps
                      bitrateBps:(NSInteger)bitrateBps
+                     completion:(void (^)(BOOL success,
+                                         NSString * _Nullable outputPath,
+                                         NSTimeInterval durationSeconds,
+                                         NSError * _Nullable error))completion;
+
+/// Perform offline pull-mode video-only timeline export with optional overlay support.
+///
+/// Phase 8.6 variant. Accepts optional canvas and overlays dictionaries from the
+/// Dart VGEditorDraft serialization.
+///
+/// When overlays is non-nil and non-empty:
+///   Inserts VGOverlayNode between compositor and sink:
+///   VGTimelineCompositorNode → VGOverlayNode → VGVideoEncoderSinkNode
+///
+/// When overlays is nil or empty:
+///   Preserves existing 2-node topology:
+///   VGTimelineCompositorNode → VGVideoEncoderSinkNode
+///
+/// @param clips        NSArray of clip descriptor dictionaries.
+/// @param transitions  NSArray of transition descriptor dictionaries (may be empty).
+/// @param outputPath   Absolute path for the output MP4 file.
+/// @param width        Video width in pixels (must be > 0).
+/// @param height       Video height in pixels (must be > 0).
+/// @param fps          Frame rate (must be > 0).
+/// @param bitrateBps   Target bitrate in bits per second (must be > 0).
+/// @param canvas       Optional canvas descriptor dictionary (NSDictionary).
+///                     Passed to VGOverlayNode as parameters[@"canvas"].
+///                     If nil, VGOverlayNode uses its default canvas.
+/// @param overlays     Optional array of overlay descriptor dictionaries.
+///                     If nil or empty, no VGOverlayNode is inserted.
+/// @param completion   Invoked exactly once on a background queue upon completion.
++ (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
+                    transitions:(NSArray<NSDictionary *> *)transitions
+                     outputPath:(NSString *)outputPath
+                          width:(NSInteger)width
+                         height:(NSInteger)height
+                            fps:(NSInteger)fps
+                     bitrateBps:(NSInteger)bitrateBps
+                         canvas:(nullable NSDictionary *)canvas
+                       overlays:(nullable NSArray<NSDictionary *> *)overlays
                      completion:(void (^)(BOOL success,
                                          NSString * _Nullable outputPath,
                                          NSTimeInterval durationSeconds,
