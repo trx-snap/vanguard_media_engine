@@ -43,6 +43,8 @@ export 'vg_clip_transform_descriptor.dart';
 export 'vg_transform_keyframe_descriptor.dart';
 // Phase 7.x-A: Dual-Camera Editor Consumption Descriptor Foundation.
 export 'vg_dual_camera_descriptor.dart';
+// MC-1B: Live dual-camera preview layout config (pure Dart; no clip/session semantics).
+export 'vg_live_preview_config.dart';
 // Phase 7 Stage 7.7: formal editor draft recipe and controller API.
 export 'vg_editor_draft.dart';
 export 'vg_editor_value.dart';
