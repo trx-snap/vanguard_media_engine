@@ -81,6 +81,7 @@
 
 import 'vg_canvas_descriptor.dart';
 import 'vg_clip_descriptor.dart';
+import 'vg_overlay_descriptor.dart';
 import 'vg_transition_descriptor.dart';
 
 /// An immutable, non-destructive composition recipe for a Phase 7 timeline
@@ -121,6 +122,10 @@ final class VGEditorDraft {
   /// When null, the draft uses [canvasWidth] / [canvasHeight] alone (Phase 7
   /// behaviour). Phase 8.2 additive bridge — native Swift plugin is unaffected
   /// because [toMap] still emits the root canvasWidth / canvasHeight keys.
+  ///
+  /// [overlays] is an optional list of [VGOverlayDescriptor] elements (Phase 8.3
+  /// additive bridge). Defaults to an empty list. Missing overlays in legacy
+  /// drafts are safely ignored by [fromMap].
   VGEditorDraft({
     required this.id,
     required List<VGClipDescriptor> clips,
@@ -129,8 +134,10 @@ final class VGEditorDraft {
     this.canvasHeight = 360,
     this.fps = 30,
     this.canvas,
+    List<VGOverlayDescriptor> overlays = const [],
   })  : clips = List.unmodifiable(clips),
         transitions = List.unmodifiable(transitions),
+        overlays = List.unmodifiable(overlays),
         assert(id.isNotEmpty, 'VGEditorDraft: id must not be empty'),
         assert(clips.isNotEmpty, 'VGEditorDraft: clips must not be empty'),
         assert(canvasWidth > 0, 'VGEditorDraft: canvasWidth must be > 0'),
@@ -193,6 +200,8 @@ final class VGEditorDraft {
     int fps = 30,
     // Phase 8.2: optional canvas passes through to the constructed draft.
     VGCanvasDescriptor? canvas,
+    // Phase 8.3: optional overlays pass through to the constructed draft.
+    List<VGOverlayDescriptor> overlays = const [],
   }) {
     assert(clips.isNotEmpty,
         'VGEditorDraft.sequentialWithTransitions: clips must not be empty');
@@ -229,6 +238,7 @@ final class VGEditorDraft {
       canvasHeight: canvasHeight,
       fps: fps,
       canvas: canvas,
+      overlays: overlays,
     );
   }
 
@@ -292,6 +302,20 @@ final class VGEditorDraft {
   VGCanvasDescriptor get resolvedCanvas =>
       canvas ?? VGCanvasDescriptor(width: canvasWidth, height: canvasHeight);
 
+  // ── Overlays ────────────────────────────────────────────────────────────────
+
+  /// Timed overlay elements on the timeline canvas (Phase 8.3 additive bridge).
+  ///
+  /// Each element is a [VGOverlayDescriptor] describing a text, emoji, or
+  /// sticker overlay with absolute canvas-pixel geometry.
+  ///
+  /// Defaults to an empty list. Legacy drafts without an `'overlays'` key in
+  /// their serialised map will produce an empty list here (backward-compatible).
+  ///
+  /// **Phase 8.3**: Data model only. Not yet wired into the native graph
+  /// or MethodChannel. Graph wiring is Phase 8.4+.
+  final List<VGOverlayDescriptor> overlays;
+
   // ── Derived helpers ────────────────────────────────────────────────────────
 
   /// Total wall-clock duration of the timeline in seconds.
@@ -350,6 +374,8 @@ final class VGEditorDraft {
       'canvasWidth': canvasWidth,
       'canvasHeight': canvasHeight,
       'fps': fps,
+      // Phase 8.3: overlays are always serialised (empty list is valid JSON).
+      'overlays': overlays.map((o) => o.toMap()).toList(),
     };
     // Phase 8.2: emit nested canvas map only when explicitly set.
     // Root canvasWidth / canvasHeight keys above always satisfy the native
@@ -407,6 +433,20 @@ final class VGEditorDraft {
       canvas = VGCanvasDescriptor.fromMap(rawCanvas);
     }
 
+    // Phase 8.3: parse 'overlays' list if present.
+    // Missing, null, or malformed → empty list (backward-compatible).
+    final overlays = <VGOverlayDescriptor>[];
+    final rawOverlays = map['overlays'];
+    if (rawOverlays is List) {
+      for (final entry in rawOverlays) {
+        if (entry is Map<Object?, Object?>) {
+          final o = VGOverlayDescriptor.fromMap(entry);
+          if (o != null) overlays.add(o);
+        }
+        // Non-map entries are silently skipped (recovery-oriented).
+      }
+    }
+
     return VGEditorDraft(
       id: id,
       clips: clips,
@@ -415,6 +455,7 @@ final class VGEditorDraft {
       canvasHeight: canvasHeight,
       fps: fps,
       canvas: canvas,
+      overlays: overlays,
     );
   }
 
@@ -496,6 +537,7 @@ final class VGEditorDraft {
       canvasHeight: canvasHeight,
       fps: fps,
       canvas: canvas,
+      overlays: overlays,
     );
   }
 
@@ -667,6 +709,7 @@ final class VGEditorDraft {
       canvasHeight: canvasHeight,
       fps: fps,
       canvas: canvas,
+      overlays: overlays,
     );
   }
 
@@ -891,6 +934,7 @@ final class VGEditorDraft {
       canvasHeight: canvasHeight,
       fps: fps,
       canvas: canvas,
+      overlays: overlays,
     );
   }
 
@@ -962,6 +1006,7 @@ final class VGEditorDraft {
       canvasHeight: canvasHeight,
       fps: fps,
       canvas: canvas,
+      overlays: overlays,
     );
   }
 
@@ -1114,6 +1159,7 @@ final class VGEditorDraft {
       canvasHeight: canvasHeight,
       fps: fps,
       canvas: canvas,
+      overlays: overlays,
     );
   }
 
@@ -1136,6 +1182,7 @@ final class VGEditorDraft {
     int? canvasHeight,
     int? fps,
     VGCanvasDescriptor? canvas,
+    List<VGOverlayDescriptor>? overlays,
   }) {
     return VGEditorDraft(
       id: id ?? this.id,
@@ -1145,6 +1192,7 @@ final class VGEditorDraft {
       canvasHeight: canvasHeight ?? this.canvasHeight,
       fps: fps ?? this.fps,
       canvas: canvas ?? this.canvas,
+      overlays: overlays ?? this.overlays,
     );
   }
 
@@ -1160,7 +1208,8 @@ final class VGEditorDraft {
           other.canvasWidth == canvasWidth &&
           other.canvasHeight == canvasHeight &&
           other.fps == fps &&
-          other.canvas == canvas;
+          other.canvas == canvas &&
+          _listEqual(other.overlays, overlays);
 
   @override
   int get hashCode => Object.hash(
@@ -1171,6 +1220,7 @@ final class VGEditorDraft {
         canvasHeight,
         fps,
         canvas,
+        Object.hashAll(overlays),
       );
 
   @override
@@ -1178,6 +1228,7 @@ final class VGEditorDraft {
       'id: $id, '
       'clips: ${clips.length}, '
       'transitions: ${transitions.length}, '
+      'overlays: ${overlays.length}, '
       'canvas: $canvasWidth\u00d7$canvasHeight'
       '${canvas != null ? " (VGCanvasDescriptor)" : ""}, '
       'fps: $fps, '

@@ -1,5 +1,5 @@
 // vg_editor_draft_test.dart
-// Vanguard Media Engine — Phase 7 Stage 7.7 / Phase 7.11 / Phase 8.2
+// Vanguard Media Engine — Phase 7 Stage 7.7 / Phase 7.11 / Phase 8.2 / Phase 8.3
 //
 // Pure Dart unit tests for VGEditorDraft.
 //
@@ -13,11 +13,13 @@
 //   - equality / hashCode
 //   - Phase 7.11: sequentialWithTransitions preserves clip.transform (D6)
 //   - Phase 8.2: VGCanvasDescriptor additive bridge
+//   - Phase 8.3: VGOverlayDescriptor additive bridge
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vg_canvas_descriptor.dart';
 import 'package:vanguard_media_engine/vg_clip_descriptor.dart';
 import 'package:vanguard_media_engine/vg_clip_transform_descriptor.dart';
+import 'package:vanguard_media_engine/vg_overlay_descriptor.dart';
 import 'package:vanguard_media_engine/vg_transition_descriptor.dart';
 import 'package:vanguard_media_engine/vg_editor_draft.dart';
 
@@ -1741,6 +1743,209 @@ void main() {
       );
       final split = draft.splitClip(clipId: 'clip-A', splitSeconds: 2.5);
       expect(split.canvas, testCanvas);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Phase 8.3 — VGOverlayDescriptor additive bridge
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorDraft — Phase 8.3 overlay additive bridge', () {
+    // Reusable text overlay.
+    final testOverlay = VGOverlayDescriptor(
+      id: 'ov-1',
+      type: VGOverlayType.text,
+      startTimeSeconds: 1.0,
+      durationSeconds: 3.0,
+      translationX: 100.0,
+      translationY: 200.0,
+      width: 300.0,
+      height: 80.0,
+      textContent: 'Hello Phase 8.3',
+      opacity: 0.9,
+      zIndex: 1,
+    );
+
+    // Reusable sticker overlay.
+    final stickerOverlay = VGOverlayDescriptor(
+      id: 'ov-sticker',
+      type: VGOverlayType.sticker,
+      startTimeSeconds: 0.5,
+      durationSeconds: 2.0,
+      translationX: 50.0,
+      translationY: 50.0,
+      width: 120.0,
+      height: 120.0,
+      assetPath: 'assets/stickers/star.png',
+    );
+
+    test('OD-1  default draft has empty overlays list', () {
+      final d = _draft();
+      expect(d.overlays, isEmpty);
+    });
+
+    test('OD-2  toMap() serializes overlays as a list', () {
+      final d = VGEditorDraft(
+        id: 'od-2',
+        clips: [_clip()],
+        overlays: [testOverlay],
+      );
+      final m = d.toMap();
+      expect(m.containsKey('overlays'), isTrue);
+      final rawList = m['overlays'] as List;
+      expect(rawList.length, 1);
+      final ovMap = rawList.first as Map<String, Object>;
+      expect(ovMap['id'], 'ov-1');
+      expect(ovMap['type'], 'text');
+      expect(ovMap['textContent'], 'Hello Phase 8.3');
+    });
+
+    test('OD-3  fromMap() parses overlays and round-trips them', () {
+      final d = VGEditorDraft(
+        id: 'od-3',
+        clips: [_clip()],
+        overlays: [testOverlay, stickerOverlay],
+      );
+      final m = d.toMap().map((k, v) => MapEntry<Object?, Object?>(k, v));
+      final restored = VGEditorDraft.fromMap(m);
+      expect(restored, isNotNull);
+      expect(restored!.overlays.length, 2);
+      expect(restored.overlays[0].id, testOverlay.id);
+      expect(restored.overlays[0].type, VGOverlayType.text);
+      expect(restored.overlays[0].textContent, testOverlay.textContent);
+      expect(restored.overlays[1].id, stickerOverlay.id);
+      expect(restored.overlays[1].type, VGOverlayType.sticker);
+      expect(restored.overlays[1].assetPath, stickerOverlay.assetPath);
+    });
+
+    test('OD-4  fromMap() without overlays key produces empty list (legacy compat)', () {
+      final result = VGEditorDraft.fromMap({
+        'id': 'od-4',
+        'clips': [_clip().toMap()],
+        'canvasWidth': 640,
+        'canvasHeight': 360,
+        'fps': 30,
+        // No 'overlays' key — legacy draft format.
+      });
+      expect(result, isNotNull);
+      expect(result!.overlays, isEmpty);
+    });
+
+    test('OD-5  fromMap() with malformed overlays entry skips invalid entries', () {
+      // Non-map entries in the overlays list are silently skipped.
+      final result = VGEditorDraft.fromMap(<Object?, Object?>{
+        'id': 'od-5',
+        'clips': [_clip().toMap()],
+        'canvasWidth': 640,
+        'canvasHeight': 360,
+        'fps': 30,
+        'overlays': [
+          testOverlay.toMap(), // valid
+          'not-a-map',         // invalid — string, not a map
+          42,                  // invalid — int, not a map
+        ],
+      });
+      expect(result, isNotNull);
+      // Only the valid entry is parsed.
+      expect(result!.overlays.length, 1);
+      expect(result.overlays[0].id, testOverlay.id);
+    });
+
+    test('OD-5b fromMap() with null overlays value produces empty list', () {
+      final result = VGEditorDraft.fromMap(<Object?, Object?>{
+        'id': 'od-5b',
+        'clips': [_clip().toMap()],
+        'canvasWidth': 640,
+        'canvasHeight': 360,
+        'fps': 30,
+        'overlays': null, // null → treated as missing
+      });
+      expect(result, isNotNull);
+      expect(result!.overlays, isEmpty);
+    });
+
+    test('OD-6  copyWith(overlays: [...]) replaces overlays', () {
+      final d = _draft();
+      expect(d.overlays, isEmpty);
+      final d2 = d.copyWith(overlays: [testOverlay]);
+      expect(d2.overlays.length, 1);
+      expect(d2.overlays[0], testOverlay);
+      // Original is unchanged.
+      expect(d.overlays, isEmpty);
+    });
+
+    test('OD-6b copyWith() without overlays preserves existing overlays', () {
+      final d = VGEditorDraft(
+        id: 'od-6b',
+        clips: [_clip()],
+        overlays: [testOverlay],
+      );
+      final d2 = d.copyWith(fps: 60);
+      expect(d2.overlays.length, 1);
+      expect(d2.overlays[0], testOverlay);
+      expect(d2.fps, 60);
+    });
+
+    test('OD-7a trimClip preserves overlays across non-destructive trim', () {
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'od-7a',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        overlays: [testOverlay],
+      );
+      final trimmed = draft.trimClip(
+        clipId: 'clip-A',
+        trimStartSeconds: 0.5,
+        trimEndSeconds: 4.5,
+      );
+      expect(trimmed.overlays.length, 1);
+      expect(trimmed.overlays[0], testOverlay);
+    });
+
+    test('OD-7b splitClip preserves overlays across non-destructive split', () {
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'od-7b',
+        clips: [_clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0)],
+        overlays: [testOverlay, stickerOverlay],
+      );
+      final split = draft.splitClip(clipId: 'clip-A', splitSeconds: 2.5);
+      expect(split.overlays.length, 2);
+      expect(split.overlays[0], testOverlay);
+      expect(split.overlays[1], stickerOverlay);
+    });
+
+    test('OD-8  drafts with same overlays are equal', () {
+      final a = VGEditorDraft(
+        id: 'od-8',
+        clips: [_clip()],
+        overlays: [testOverlay],
+      );
+      final b = VGEditorDraft(
+        id: 'od-8',
+        clips: [_clip()],
+        overlays: [testOverlay],
+      );
+      expect(a, b);
+      expect(a.hashCode, b.hashCode);
+    });
+
+    test('OD-8b drafts with different overlays are not equal', () {
+      final a = VGEditorDraft(id: 'od-8b', clips: [_clip()]);
+      final b = VGEditorDraft(
+        id: 'od-8b',
+        clips: [_clip()],
+        overlays: [testOverlay],
+      );
+      expect(a == b, isFalse);
+    });
+
+    test('OD-9  toMap() always emits overlays key (even when empty)', () {
+      final d = _draft();
+      final m = d.toMap();
+      expect(m.containsKey('overlays'), isTrue);
+      expect(m['overlays'] as List, isEmpty);
     });
   });
 }
