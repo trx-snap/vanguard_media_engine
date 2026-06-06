@@ -1,10 +1,11 @@
 // VGOverlayNode.m
-// vanguard_media_engine — Phase 8.5 / Phase 8.7 / Phase 8.8
+// vanguard_media_engine — Phase 8.5 / Phase 8.7 / Phase 8.8 / Phase 8.9
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // PHASE 8.5 — NATIVE OVERLAY NODE PASS-THROUGH STUB
 // PHASE 8.7 — EXPORT-ONLY DEBUG RECTANGLE RENDERING
 // PHASE 8.8 — EXPORT-ONLY SIMPLE TEXT / EMOJI RENDERING
+// PHASE 8.9 — EXPORT-ONLY STICKER / IMAGE OVERLAY RENDERING
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Implementation of VGOverlayNode.
@@ -24,10 +25,20 @@
 // opacity, rotation, zIndex, and buffer path. The Phase 8.7 red debug rectangle
 // is retained as fallback for:
 //   - empty or nil textContent (any type)
-//   - VGOverlayTypeSticker (asset resolver is Phase 8.9+)
+//   - VGOverlayTypeSticker with missing/invalid assetPath (now handled by Phase 8.9)
 //   - rasterization failure (nil CGContext / CGImage / CIImage)
 // Each overlay body is wrapped in @autoreleasepool to drain CoreGraphics
 // temporaries (UIFont, UIColor, NSDictionary attributes) before the runloop turns.
+//
+// Phase 8.9: Adds export-only sticker/image rendering for VGOverlayTypeSticker
+// overlays with a non-empty assetPath pointing to a local absolute file path.
+// Images are loaded via [CIImage imageWithContentsOfURL:options:] with
+// kCIImageApplyOrientationProperty:@YES to correct EXIF orientation. The loaded
+// image is normalized to origin (0,0) and scaled to overlay pixel bounds, then
+// cached in _stickerCache (keyed by assetPath) for the duration of the export
+// session. Failed asset paths are cached as [NSNull null] to prevent repeated
+// failed I/O. Cache is cleared in invalidate. Falls back to red debug rectangle
+// for any load failure, nil assetPath, or cache sentinel.
 //
 // Key architectural invariants (unchanged from Phase 8.7):
 //   - When no overlays are active for the current PTS, the original envelope is
@@ -209,6 +220,138 @@ static CIImage * _Nullable _VGOverlayCreateTextImage(VGOverlayDescriptor *overla
     return ciImage; // autoreleased
 }
 
+// ─── Phase 8.9: Sticker image helper ─────────────────────────────────────────
+//
+// _VGOverlayCreateStickerImage:
+//   Loads and scales a sticker/image overlay asset for the current overlay bounds.
+//
+//   Loading path:
+//     1. Guard nil/empty assetPath → return nil.
+//     2. Cache hit (CIImage *) → return cached scaled image.
+//     3. Cache hit (NSNull *)  → return nil (known failure, no retry).
+//     4. Load via [CIImage imageWithContentsOfURL:options:] with
+//        kCIImageApplyOrientationProperty:@YES (EXIF auto-correction, iOS 11+).
+//     5. If nil → cache NSNull sentinel, return nil.
+//     6. Normalize extent origin to (0,0).
+//     7. Scale to overlay pixel bounds (stretch-to-bounds MVP).
+//     8. Cache scaled CIImage for the session, return it.
+//
+//   Technology notes:
+//     CIImage imageWithContentsOfURL: — CoreImage-native path (no UIKit).
+//     Same API used by VGDualCameraCompositorNode._buildImageBufferForClip.
+//     kCIImageApplyOrientationProperty — iOS 11+; prevents EXIF-rotated stickers.
+//     CIImage is immutable and thread-safe (used from export serial queue).
+//
+//   Cache lifetime: export session (cleared in invalidate).
+//   Returns nil on any failure; caller falls back to red debug rectangle.
+//   Returned CIImage origin is (0,0); caller translates to canvas position.
+
+static CIImage * _Nullable _VGOverlayCreateStickerImage(
+    VGOverlayDescriptor *overlay,
+    CGFloat width,
+    CGFloat height,
+    NSMutableDictionary<NSString *, id> *cache) {
+
+    // Guard: assetPath must be non-nil and non-empty.
+    NSString *assetPath = overlay.assetPath;
+    if (assetPath.length == 0) { return nil; }
+
+    // Bounds must be at least 1×1.
+    if (width < 1.0 || height < 1.0) { return nil; }
+
+    // ── Cache lookup ──────────────────────────────────────────────────────────
+    id cached = cache[assetPath];
+    if (cached != nil) {
+        if ([cached isKindOfClass:[CIImage class]]) {
+            return (CIImage *)cached;
+        }
+        // NSNull sentinel: known failure — do not retry.
+        return nil;
+    }
+
+    // ── Load from file ────────────────────────────────────────────────────────
+    // Use NSURL fileURLWithPath: to construct the URL.
+    // kCIImageApplyOrientationProperty:@YES applies EXIF orientation metadata
+    // automatically (iOS 11+), preventing rotated stickers from Photos.
+    NSURL *fileURL = [NSURL fileURLWithPath:assetPath];
+    if (!fileURL) {
+        os_log_error(OS_LOG_DEFAULT,
+                     "[VGOverlayNode][8.9] invalid assetPath for fileURLWithPath: "
+                     "path=%{public}@", assetPath);
+        cache[assetPath] = [NSNull null];
+        return nil;
+    }
+
+    NSDictionary *loadOptions = @{ (id)kCIImageApplyOrientationProperty: @YES };
+    CIImage *image = [CIImage imageWithContentsOfURL:fileURL options:loadOptions];
+    if (!image) {
+        os_log_error(OS_LOG_DEFAULT,
+                     "[VGOverlayNode][8.9] CIImage load failed for assetPath=%{public}@",
+                     assetPath);
+        cache[assetPath] = [NSNull null];
+        return nil;
+    }
+
+    // ── Normalize extent origin to (0, 0) ─────────────────────────────────────
+    // CIImage loaded from a file URL may have a non-zero extent origin.
+    // Normalize before scaling so the geometry math is simple and predictable.
+    CGRect extent = image.extent;
+    if (!CGRectIsEmpty(extent) &&
+        (extent.origin.x != 0.0 || extent.origin.y != 0.0)) {
+        CGAffineTransform normT = CGAffineTransformMakeTranslation(
+            -extent.origin.x, -extent.origin.y);
+        image = [image imageByApplyingTransform:normT];
+        if (!image) {
+            cache[assetPath] = [NSNull null];
+            return nil;
+        }
+        extent = image.extent;
+    }
+
+    // ── Guard degenerate source dimensions ────────────────────────────────────
+    CGFloat srcW = extent.size.width;
+    CGFloat srcH = extent.size.height;
+    if (srcW <= 0.0 || srcH <= 0.0) {
+        os_log_error(OS_LOG_DEFAULT,
+                     "[VGOverlayNode][8.9] degenerate CIImage extent (%.0fx%.0f) "
+                     "for assetPath=%{public}@", (double)srcW, (double)srcH, assetPath);
+        cache[assetPath] = [NSNull null];
+        return nil;
+    }
+
+    // ── Scale to overlay pixel bounds (stretch-to-bounds MVP) ─────────────────
+    // sx/sy map source image pixels → overlay output pixels.
+    CGFloat sx = width  / srcW;
+    CGFloat sy = height / srcH;
+    CIImage *scaled = [image imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
+    if (!scaled) {
+        cache[assetPath] = [NSNull null];
+        return nil;
+    }
+
+    // Re-normalize scaled extent to (0,0) in case the scale transform shifted origin.
+    CGRect scaledExtent = scaled.extent;
+    if (scaledExtent.origin.x != 0.0 || scaledExtent.origin.y != 0.0) {
+        CGAffineTransform fixT = CGAffineTransformMakeTranslation(
+            -scaledExtent.origin.x, -scaledExtent.origin.y);
+        scaled = [scaled imageByApplyingTransform:fixT];
+        if (!scaled) {
+            cache[assetPath] = [NSNull null];
+            return nil;
+        }
+    }
+
+    // ── Cache and return ──────────────────────────────────────────────────────
+    cache[assetPath] = scaled;
+    os_log_info(OS_LOG_DEFAULT,
+                "[VGOverlayNode][8.9] sticker cached: %.0fx%.0f→%.0fx%.0f "
+                "path=%{public}@",
+                (double)srcW, (double)srcH,
+                (double)width, (double)height,
+                assetPath);
+    return scaled;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - @implementation VGOverlayNode
 // ─────────────────────────────────────────────────────────────────────────────
@@ -218,6 +361,11 @@ static CIImage * _Nullable _VGOverlayCreateTextImage(VGOverlayDescriptor *overla
     BOOL                            _enabled;
     VGCanvasDescriptor             *_canvas;
     NSArray<VGOverlayDescriptor *> *_overlays;
+    // Phase 8.9: Export-session asset cache.
+    // Values: CIImage * (scaled, orientation-corrected) or NSNull * (load failure sentinel).
+    // Keyed by overlay.assetPath (absolute local file path).
+    // Cleared in invalidate. Never touches singleton CIContext.
+    NSMutableDictionary<NSString *, id> *_stickerCache;
 }
 
 // ─── Module initialization ────────────────────────────────────────────────────
@@ -243,6 +391,9 @@ static CIImage * _Nullable _VGOverlayCreateTextImage(VGOverlayDescriptor *overla
     if (!self) return nil;
 
     _nodeId = [nodeId copy];
+
+    // Phase 8.9: Initialize the sticker asset cache for this export session.
+    _stickerCache = [NSMutableDictionary dictionary];
 
     // ── enabled ──────────────────────────────────────────────────────────────
     // Default YES. If parameters supplies an NSNumber for "enabled", honour it.
@@ -351,9 +502,12 @@ static CIImage * _Nullable _VGOverlayCreateTextImage(VGOverlayDescriptor *overla
 }
 
 - (void)invalidate {
-    // Phase 8.7: no persistent resources held by this instance.
-    // The CIContext is shared and must not be released here.
+    // Phase 8.7: The CIContext is shared and must not be released here.
     // CVPixelBufferCreate allocations are owned by the scheduler after return.
+    //
+    // Phase 8.9: Clear the sticker cache on export teardown.
+    // CIImage objects held as values are released by the dictionary.
+    [_stickerCache removeAllObjects];
     os_log_debug(sOverlayNodeLog,
                  "[VGOverlayNode] invalidate: nodeId=%{public}@", _nodeId);
 }
@@ -535,24 +689,25 @@ static CIImage * _Nullable _VGOverlayCreateTextImage(VGOverlayDescriptor *overla
         CGRect overlayRect = CGRectMake((CGFloat)rectXLeft, (CGFloat)ciY,
                                         (CGFloat)rectW,     (CGFloat)rectH);
 
-        // ── Phase 8.8: Determine overlay image (text or debug fallback) ────────
+        // ── Phase 8.8/8.9: Determine overlay image ───────────────────────────
         //
-        // Text/emoji with non-empty textContent → rasterize via
-        // _VGOverlayCreateTextImage. The returned CIImage has bottom-left origin
-        // (matching CoreImage convention) with dimensions (rectW × rectH) pixels.
-        // It must be translated into position before compositing.
+        // Priority order:
+        //   1. Text/emoji with non-empty textContent → _VGOverlayCreateTextImage.
+        //   2. Sticker with non-empty assetPath      → _VGOverlayCreateStickerImage.
+        //   3. Fallback (any failure / unsupported)  → red debug rectangle.
         //
-        // Fallback (sticker / empty text / rasterization failure) → Phase 8.7
-        // solid red debug rectangle.
+        // All returned CIImages have origin at (0,0) and are translated into
+        // canvas position before compositing.
         CIImage *overlayCI = nil;
-        BOOL usedTextRaster = NO;
+        BOOL usedContentRender = NO;
 
         VGOverlayType overlayType = overlay.type;
         BOOL isTextOrEmoji = (overlayType == VGOverlayTypeText ||
                               overlayType == VGOverlayTypeEmoji);
+        BOOL isSticker = (overlayType == VGOverlayTypeSticker);
 
         if (isTextOrEmoji && overlay.textContent.length > 0) {
-            // Attempt text rasterization.
+            // ── Phase 8.8: Text/emoji rasterization ──────────────────────────
             CIImage *textImage = _VGOverlayCreateTextImage(
                 overlay,
                 (CGFloat)rectW,
@@ -565,23 +720,48 @@ static CIImage * _Nullable _VGOverlayCreateTextImage(VGOverlayDescriptor *overla
                 CGAffineTransform positionT =
                     CGAffineTransformMakeTranslation((CGFloat)rectXLeft, (CGFloat)ciY);
                 overlayCI = [textImage imageByApplyingTransform:positionT];
-                usedTextRaster = (overlayCI != nil);
+                usedContentRender = (overlayCI != nil);
             }
 
-            if (!usedTextRaster) {
+            if (!usedContentRender) {
                 os_log_debug(sOverlayNodeLog,
                              "[VGOverlayNode][8.8] text rasterization failed for "
                              "overlay id=%{public}@ — falling back to debug rectangle",
                              overlay.overlayId);
             }
+
+        } else if (isSticker && overlay.assetPath.length > 0) {
+            // ── Phase 8.9: Sticker/image rendering ───────────────────────────
+            // _VGOverlayCreateStickerImage returns a pre-scaled CIImage at (0,0),
+            // or nil on failure (cache sentinel already stored for the path).
+            CIImage *stickerImage = _VGOverlayCreateStickerImage(
+                overlay,
+                (CGFloat)rectW,
+                (CGFloat)rectH,
+                _stickerCache);
+
+            if (stickerImage) {
+                // Translate scaled sticker into CoreImage canvas position.
+                CGAffineTransform positionT =
+                    CGAffineTransformMakeTranslation((CGFloat)rectXLeft, (CGFloat)ciY);
+                overlayCI = [stickerImage imageByApplyingTransform:positionT];
+                usedContentRender = (overlayCI != nil);
+            }
+
+            if (!usedContentRender) {
+                os_log_debug(sOverlayNodeLog,
+                             "[VGOverlayNode][8.9] sticker load/cache failed for "
+                             "overlay id=%{public}@ — falling back to debug rectangle",
+                             overlay.overlayId);
+            }
         }
 
-        if (!usedTextRaster) {
+        if (!usedContentRender) {
             // ── Debug solid color fallback: semi-transparent red ───────────────
             // Retained from Phase 8.7 for:
-            //   - VGOverlayTypeSticker (no asset resolver in Phase 8.8)
-            //   - empty / nil textContent
-            //   - text rasterization failure
+            //   - empty / nil textContent on text/emoji overlays
+            //   - sticker overlays with missing/invalid assetPath or load failure
+            //   - text/sticker rasterization failure
             CIColor *debugColor = [CIColor colorWithRed:1.0
                                                   green:0.0
                                                    blue:0.0
