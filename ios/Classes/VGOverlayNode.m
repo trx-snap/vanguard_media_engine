@@ -1,9 +1,10 @@
 // VGOverlayNode.m
-// vanguard_media_engine — Phase 8.5 / Phase 8.7
+// vanguard_media_engine — Phase 8.5 / Phase 8.7 / Phase 8.8
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // PHASE 8.5 — NATIVE OVERLAY NODE PASS-THROUGH STUB
 // PHASE 8.7 — EXPORT-ONLY DEBUG RECTANGLE RENDERING
+// PHASE 8.8 — EXPORT-ONLY SIMPLE TEXT / EMOJI RENDERING
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Implementation of VGOverlayNode.
@@ -13,10 +14,22 @@
 //
 // Phase 8.7: Adds export-only debug rectangle rendering inside
 // processEnvelope:device:. Uses CoreImage to composite solid semi-transparent
-// red rectangles for each active overlay over the input frame. This is a visual
-// proof slice only — no text, no emoji, no sticker/image loading.
+// red rectangles for each active overlay over the input frame.
 //
-// Key architectural invariants (Phase 8.7):
+// Phase 8.8: Replaces the debug rectangle with real text/emoji rendering for
+// VGOverlayTypeText and VGOverlayTypeEmoji overlays whose textContent is
+// non-empty. Text is rasterized via CGBitmapContextCreate + UIGraphicsPushContext
+// + [NSString drawInRect:withAttributes:], converted to CIImage via
+// imageWithCGImage:, and composited through the existing Phase 8.7 geometry,
+// opacity, rotation, zIndex, and buffer path. The Phase 8.7 red debug rectangle
+// is retained as fallback for:
+//   - empty or nil textContent (any type)
+//   - VGOverlayTypeSticker (asset resolver is Phase 8.9+)
+//   - rasterization failure (nil CGContext / CGImage / CIImage)
+// Each overlay body is wrapped in @autoreleasepool to drain CoreGraphics
+// temporaries (UIFont, UIColor, NSDictionary attributes) before the runloop turns.
+//
+// Key architectural invariants (unchanged from Phase 8.7):
 //   - When no overlays are active for the current PTS, the original envelope is
 //     returned EXACTLY unchanged (zero buffer allocation, zero CoreImage work).
 //   - When active overlays exist, a NEW CVPixelBuffer is allocated via
@@ -60,6 +73,13 @@
 #import <CoreVideo/CoreVideo.h>
 #import <CoreMedia/CoreMedia.h>
 
+// ─── Phase 8.8: UIKit for text rasterization ─────────────────────────────────
+// Used for UIFont, UIColor, UIGraphicsPushContext/Pop, and
+// NSString drawInRect:withAttributes:. UIGraphicsImageRenderer and
+// UIGraphicsBeginImageContext are NOT used — CGBitmapContextCreate gives
+// explicit ownership and is safe on the background export serial queue.
+#import <UIKit/UIKit.h>
+
 // ─── System ──────────────────────────────────────────────────────────────────
 #import <os/log.h>
 #include <math.h>
@@ -81,6 +101,105 @@ static CIContext *_VGOverlaySharedCIContext(void) {
         context = [CIContext contextWithOptions:nil];
     });
     return context;
+}
+
+// ─── Phase 8.8: Text rasterization helper ────────────────────────────────────
+//
+// _VGOverlayCreateTextImage:
+//   Rasterizes overlay.textContent into a CIImage at the specified pixel size.
+//
+//   Technology choice (per Opus Phase 8.8 validation):
+//     CGBitmapContextCreate gives explicit pixel format, byte stride,
+//     and lifecycle control — safe from any background thread / GCD queue.
+//     UIGraphicsPushContext makes the CGBitmapContext available to UIKit string
+//     drawing methods (NSString UIKitAdditions) on the calling thread.
+//     This avoids UIGraphicsImageRenderer / UIGraphicsBeginImageContext, which
+//     carry UIKit graphics-context-stack semantics that are not appropriate here.
+//
+//   Text parameters (Phase 8.8 defaults — no descriptor fields for font/color):
+//     Font:  UIFontWeightSemibold system font.
+//     Size:  MAX(12.0, MIN(height * 0.6, 96.0)) — readable fraction of overlay height.
+//     Color: white at the overlay's opacity level.
+//     Background: fully transparent (CGContextClearRect).
+//
+//   Emoji: works opportunistically — system font stack falls back to Apple Color
+//     Emoji for emoji characters. No special handling needed.
+//
+//   Returns nil on any failure; caller falls back to red debug rectangle.
+//   Caller is responsible for no further release of the returned CIImage
+//   (it is autoreleased per CoreImage conventions).
+//
+//   All CoreFoundation objects (colorSpace, ctx, cgImage) are released
+//   before return in every code path.
+
+static CIImage * _Nullable _VGOverlayCreateTextImage(VGOverlayDescriptor *overlay,
+                                                     CGFloat width,
+                                                     CGFloat height,
+                                                     CGFloat opacity) {
+    // Guard: caller should have checked this, but be defensive.
+    if (overlay.textContent.length == 0) { return nil; }
+
+    // Pixel dimensions must be at least 1×1.
+    NSInteger pixelWidth  = (NSInteger)MAX(1.0, round((double)width));
+    NSInteger pixelHeight = (NSInteger)MAX(1.0, round((double)height));
+
+    // ── Create CGBitmapContext ────────────────────────────────────────────────
+    // BGRA / premultiplied-first matches the CVPixelBuffer format used throughout
+    // VGOverlayNode (kCVPixelFormatType_32BGRA). Using NULL data pointer lets
+    // CoreGraphics manage the backing store.
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    if (!colorSpace) { return nil; }
+
+    CGContextRef ctx = CGBitmapContextCreate(
+        NULL,
+        (size_t)pixelWidth,
+        (size_t)pixelHeight,
+        8,                   // bits per component
+        (size_t)pixelWidth * 4, // bytes per row (4 bytes/pixel, no padding)
+        colorSpace,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    CGColorSpaceRelease(colorSpace); // released regardless of ctx success
+
+    if (!ctx) { return nil; }
+
+    // ── Clear to fully transparent ────────────────────────────────────────────
+    CGContextClearRect(ctx, CGRectMake(0, 0, (CGFloat)pixelWidth, (CGFloat)pixelHeight));
+
+    // ── Draw text ─────────────────────────────────────────────────────────────
+    // UIGraphicsPushContext pushes onto the per-thread UIKit context stack,
+    // making CGBitmapContext available to NSString UIKit drawing methods.
+    // UIGraphicsPopContext restores the previous stack state.
+    UIGraphicsPushContext(ctx);
+
+    CGFloat fontSize = MAX(12.0, MIN(height * 0.6, 96.0));
+    UIFont  *font    = [UIFont systemFontOfSize:fontSize weight:UIFontWeightSemibold];
+    UIColor *color   = [[UIColor whiteColor] colorWithAlphaComponent:
+                            MAX(0.0, MIN(1.0, (double)opacity))];
+    NSDictionary<NSAttributedStringKey, id> *attrs = @{
+        NSFontAttributeName:            font,
+        NSForegroundColorAttributeName: color,
+    };
+    // drawInRect: clips to the provided rect; wraps text naturally within bounds.
+    // CGBitmapContext origin is bottom-left; UIKit drawing into a pushed CGContext
+    // uses the same coordinate system as the context (Y increases upward here).
+    // For this overlay use-case the exact vertical origin is acceptable —
+    // the text renders within the raster and the raster is placed by the
+    // existing geometry path.
+    [overlay.textContent drawInRect:CGRectMake(0, 0, (CGFloat)pixelWidth, (CGFloat)pixelHeight)
+                     withAttributes:attrs];
+
+    UIGraphicsPopContext();
+
+    // ── Extract CGImage and convert to CIImage ────────────────────────────────
+    CGImageRef cgImage = CGBitmapContextCreateImage(ctx);
+    CGContextRelease(ctx); // released regardless of cgImage success
+
+    if (!cgImage) { return nil; }
+
+    CIImage *ciImage = [CIImage imageWithCGImage:cgImage];
+    CGImageRelease(cgImage); // CIImage has retained what it needs
+
+    return ciImage; // autoreleased
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -261,7 +380,7 @@ static CIContext *_VGOverlaySharedCIContext(void) {
 
 // ─── VGTransformNode — Frame processing ──────────────────────────────────────
 //
-// Phase 8.7: Export-only debug rectangle rendering.
+// Phase 8.7 / Phase 8.8: Export-only overlay rendering.
 //
 // Fast path (no active overlays):
 //   Returns the original envelope EXACTLY unchanged. No buffer allocation.
@@ -269,8 +388,12 @@ static CIContext *_VGOverlaySharedCIContext(void) {
 //
 // Render path (active overlays exist):
 //   1. Wraps the input CVPixelBuffer in a CIImage.
-//   2. For each active overlay (sorted by zIndex ascending), composites a
-//      solid semi-transparent red CIImage rectangle using CISourceOverCompositing.
+//   2. For each active overlay (sorted by zIndex ascending, wrapped in
+//      @autoreleasepool):
+//        Phase 8.8: if type is text/emoji and textContent is non-empty,
+//          rasterize text via _VGOverlayCreateTextImage and use the result.
+//        Fallback: composite a solid semi-transparent red rectangle (Phase 8.7)
+//          for sticker type, empty/nil textContent, or rasterization failure.
 //   3. Allocates a new CVPixelBuffer via CVPixelBufferCreate (+1).
 //   4. Renders the composited CIImage into the new buffer via CIContext.
 //   5. Returns a copy of the input envelope with only payload.videoBuffer
@@ -378,7 +501,14 @@ static CIContext *_VGOverlaySharedCIContext(void) {
     }
 
     // ── Composite each active overlay ─────────────────────────────────────────
+    //
+    // Phase 8.8: Each overlay body is wrapped in @autoreleasepool to drain
+    // UIFont, UIColor, NSDictionary, and CIImage autoreleased objects created
+    // during text rasterization before the next overlay iteration. This prevents
+    // memory pressure from accumulating across multiple overlays per frame.
     for (VGOverlayDescriptor *overlay in activeOverlays) {
+        @autoreleasepool {
+
         // ── Geometry ─────────────────────────────────────────────────────────
         // Descriptor coordinates: top-left canvas pixels.
         // CoreImage coordinates: bottom-left origin.
@@ -398,42 +528,96 @@ static CIContext *_VGOverlaySharedCIContext(void) {
         CGRect overlayRect = CGRectMake((CGFloat)rectXLeft, (CGFloat)ciY,
                                         (CGFloat)rectW,     (CGFloat)rectH);
 
-        // ── Debug solid color: semi-transparent red using overlay opacity ─────
-        // Phase 8.7: visual proof color only. Real overlay content deferred.
-        CIColor *debugColor = [CIColor colorWithRed:1.0
-                                              green:0.0
-                                               blue:0.0
-                                              alpha:(CGFloat)overlay.opacity];
-        CIImage *solidRect = [CIImage imageWithColor:debugColor];
+        // ── Phase 8.8: Determine overlay image (text or debug fallback) ────────
+        //
+        // Text/emoji with non-empty textContent → rasterize via
+        // _VGOverlayCreateTextImage. The returned CIImage has bottom-left origin
+        // (matching CoreImage convention) with dimensions (rectW × rectH) pixels.
+        // It must be translated into position before compositing.
+        //
+        // Fallback (sticker / empty text / rasterization failure) → Phase 8.7
+        // solid red debug rectangle.
+        CIImage *overlayCI = nil;
+        BOOL usedTextRaster = NO;
 
-        // Crop to the overlay rectangle bounds.
-        CIImage *croppedRect = [solidRect imageByCroppingToRect:overlayRect];
+        VGOverlayType overlayType = overlay.type;
+        BOOL isTextOrEmoji = (overlayType == VGOverlayTypeText ||
+                              overlayType == VGOverlayTypeEmoji);
 
-        // ── Rotation (Phase 8.7 — simple implementation) ──────────────────────
-        // Rotate around the rectangle's center point.
-        // CGAffineTransformRotate uses radians; descriptor rotation is radians.
-        // Note: VGOverlayDescriptor.rotation is clockwise-positive, while
-        // CoreImage uses counter-clockwise-positive. Negate to correct.
-        // If rotation is effectively zero, skip the transform for efficiency.
+        if (isTextOrEmoji && overlay.textContent.length > 0) {
+            // Attempt text rasterization.
+            CIImage *textImage = _VGOverlayCreateTextImage(
+                overlay,
+                (CGFloat)rectW,
+                (CGFloat)rectH,
+                (CGFloat)overlay.opacity);
+
+            if (textImage) {
+                // _VGOverlayCreateTextImage returns a raster with origin at (0,0).
+                // Translate to the correct CoreImage canvas position.
+                CGAffineTransform positionT =
+                    CGAffineTransformMakeTranslation((CGFloat)rectXLeft, (CGFloat)ciY);
+                overlayCI = [textImage imageByApplyingTransform:positionT];
+                usedTextRaster = (overlayCI != nil);
+            }
+
+            if (!usedTextRaster) {
+                os_log_debug(sOverlayNodeLog,
+                             "[VGOverlayNode][8.8] text rasterization failed for "
+                             "overlay id=%{public}@ — falling back to debug rectangle",
+                             overlay.overlayId);
+            }
+        }
+
+        if (!usedTextRaster) {
+            // ── Debug solid color fallback: semi-transparent red ───────────────
+            // Retained from Phase 8.7 for:
+            //   - VGOverlayTypeSticker (no asset resolver in Phase 8.8)
+            //   - empty / nil textContent
+            //   - text rasterization failure
+            CIColor *debugColor = [CIColor colorWithRed:1.0
+                                                  green:0.0
+                                                   blue:0.0
+                                                  alpha:(CGFloat)overlay.opacity];
+            CIImage *solidRect = [CIImage imageWithColor:debugColor];
+            overlayCI = [solidRect imageByCroppingToRect:overlayRect];
+        }
+
+        if (!overlayCI) {
+            os_log_error(sOverlayNodeLog,
+                         "[VGOverlayNode][8.8] overlay CIImage is nil — skipping overlay");
+            continue;
+        }
+
+        // ── Rotation ──────────────────────────────────────────────────────────
+        // Rotate around the overlay's center point in CoreImage space.
+        // VGOverlayDescriptor.rotation is clockwise-positive; CoreImage uses
+        // counter-clockwise-positive — negate to correct.
+        // Skip rotation when effectively zero.
         if (fabs(overlay.rotation) > 1e-6) {
             CGFloat cx = (CGFloat)(rectXLeft + rectW * 0.5);
             CGFloat cy = (CGFloat)(ciY + rectH * 0.5);
             // Translate center to origin, rotate, translate back.
-            CGAffineTransform t =
-                CGAffineTransformMakeTranslation(cx, cy);
+            CGAffineTransform t = CGAffineTransformMakeTranslation(cx, cy);
             t = CGAffineTransformRotate(t, -(CGFloat)overlay.rotation);
             t = CGAffineTransformTranslate(t, -cx, -cy);
-            croppedRect = [croppedRect imageByApplyingTransform:t];
+            overlayCI = [overlayCI imageByApplyingTransform:t];
+            if (!overlayCI) {
+                os_log_error(sOverlayNodeLog,
+                             "[VGOverlayNode][8.8] rotation transform returned nil — skipping overlay");
+                continue;
+            }
         }
 
         // ── Composite over accumulator (Porter-Duff source-over) ──────────────
-        // CIImage.imageByCompositingOverImage: renders croppedRect on top.
-        accumulator = [croppedRect imageByCompositingOverImage:accumulator];
+        accumulator = [overlayCI imageByCompositingOverImage:accumulator];
         if (!accumulator) {
             os_log_error(sOverlayNodeLog,
-                         "[VGOverlayNode][8.7] compositing returned nil — pass-through");
+                         "[VGOverlayNode][8.8] compositing returned nil — pass-through");
             return envelope;
         }
+
+        } // @autoreleasepool
     }
 
     // ── Allocate output CVPixelBuffer ─────────────────────────────────────────
@@ -474,7 +658,7 @@ static CIContext *_VGOverlaySharedCIContext(void) {
     }
 
     os_log(sOverlayNodeLog,
-           "[VGOverlayNode][8.7] rendered: pts=%.3fs activeOverlays=%lu "
+           "[VGOverlayNode][8.8] rendered: pts=%.3fs activeOverlays=%lu "
            "outputSize=%zux%zu",
            ptsSeconds, (unsigned long)activeOverlays.count,
            outputWidth, outputHeight);
