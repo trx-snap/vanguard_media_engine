@@ -56,6 +56,7 @@
 //
 //   <UMF/VGSourceNode.h>  — pull-mode VGNode + VGSourceNode protocol.
 //   <UMF/VGClipDescriptor.h> — existing clip descriptor model.
+//   "VGDualCameraLayoutMath.h" — pure layout geometry types and helpers (MC-1A).
 //   No AVFoundation. No CoreMedia. No Flutter. No camera.
 //
 // Phase 7.x-B skeleton only. Not integrated into the live runtime.
@@ -65,50 +66,21 @@
 #import <Foundation/Foundation.h>
 #import <UMF/VGSourceNode.h>
 #import <UMF/VGClipDescriptor.h>
+// MC-1A: Layout types (VGDualCameraLayoutMode, VGPiPAnchor, VGPiPLayoutConfig,
+// VGSplitScreenLayoutConfig) and geometry helpers are now in VGDualCameraLayoutMath.h.
+// Import it here so all existing consumers of VGDualCameraCompositorNode.h continue
+// to see the types without any source changes.
+#import "VGDualCameraLayoutMath.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
-// ─── VGDualCameraLayoutMode ───────────────────────────────────────────────────
-/// The spatial layout mode for dual-camera composition.
-///
-/// Wire value mirrors the Dart `VGDualCameraLayoutMode` enum.
-/// Only `VGDualCameraLayoutModePiP` is supported in Phase 7.x-B.
-typedef NS_ENUM(NSInteger, VGDualCameraLayoutMode) {
-    /// Picture-in-Picture: secondary clip is rendered as a smaller inset over the primary.
-    VGDualCameraLayoutModePiP = 0,
-    /// Split-Screen: primary on top half, secondary on bottom half (portrait split).
-    /// Phase 7.x-K.
-    VGDualCameraLayoutModeSplitScreen = 1,
-};
-
-// ─── VGPiPAnchor ─────────────────────────────────────────────────────────────
-/// The corner anchor for the PiP inset.
-///
-/// Wire values mirror the Dart `VGPiPAnchor` enum.
-typedef NS_ENUM(NSInteger, VGPiPAnchor) {
-    VGPiPAnchorTopLeft     = 0,
-    VGPiPAnchorTopRight    = 1,
-    VGPiPAnchorBottomLeft  = 2,
-    VGPiPAnchorBottomRight = 3,  ///< Default.
-};
-
-// ─── VGPiPLayoutConfig ───────────────────────────────────────────────────────
-/// Parsed PiP layout configuration. Mirrors Dart VGPiPLayoutDescriptor fields.
-/// Stored by VGDualCameraCompositorNode for use by Phase 7.x-C compositor.
-typedef struct {
-    VGPiPAnchor anchor;         ///< Corner anchor for PiP inset.
-    double      widthFraction;  ///< PiP width as fraction of primary canvas (0.05–0.75).
-    double      marginFraction; ///< Margin from edge as fraction of primary canvas (>= 0.0).
-    double      cornerRadius;   ///< Corner radius in points (>= 0.0).
-    double      opacity;        ///< PiP opacity (0.0–1.0).
-} VGPiPLayoutConfig;
-
-// ─── VGSplitScreenLayoutConfig ───────────────────────────────────────────────
-/// Parsed split-screen layout configuration. Phase 7.x-K.
-/// splitRatio: fraction of canvas height for primary (top). Range 0.2–0.8.
-typedef struct {
-    double splitRatio; ///< Primary (top) height fraction. Default 0.5.
-} VGSplitScreenLayoutConfig;
+// ─── Layout types — provided by VGDualCameraLayoutMath.h (MC-1A) ─────────────
+//
+// VGDualCameraLayoutMode, VGPiPAnchor, VGPiPLayoutConfig, and
+// VGSplitScreenLayoutConfig are declared in VGDualCameraLayoutMath.h which is
+// imported above.  They remain visible to all code that imports this header.
+//
+// Do NOT re-declare them here — that would produce duplicate typedef errors.
 
 // ─── Error domain ────────────────────────────────────────────────────────────
 /// NSError domain for VGDualCameraCompositorNode initialization failures.

@@ -80,6 +80,8 @@
 //   No camera/session headers.
 
 #import "VGDualCameraCompositorNode.h"
+// MC-1A: Pure layout geometry helpers (VGDCLayoutComputePiPGeometry, etc.)
+#import "VGDualCameraLayoutMath.h"
 
 // ─── UMF protocol / type imports ─────────────────────────────────────────────
 #import <UMF/VGFrameEnvelope.h>
@@ -1757,26 +1759,20 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         return NULL;
     }
 
-    // ── 2. Split geometry ───────────────────────────────────────────────────────
-    double sr = _splitLayout.splitRatio;
-    // Clamp to safe range.
-    if (sr < 0.2) { sr = 0.2; }
-    if (sr > 0.8) { sr = 0.8; }
-
-    // topH: height of the primary (top) band (CoreImage Y-up: upper y values).
-    // bottomH: height of the secondary (bottom) band (y=0 at bottom-left).
-    double topH    = floor((double)primH * sr);
-    double bottomH = (double)primH - topH;
-
-    // Guard: both bands must be at least 1 pixel.
-    if (topH < 1.0 || bottomH < 1.0) {
-        NSLog(@"[VGDualCameraCompositorNode][7.x-K] _splitComposite: degenerate band height "
-              "topH=%.0f bottomH=%.0f — skipping.", topH, bottomH);
+    // ── 2. Split geometry (delegated to VGDualCameraLayoutMath — MC-1A) ──────────
+    VGDCSplitRects splitRects = VGDCLayoutComputeSplitRects(primW, primH, _splitLayout);
+    if (!splitRects.isValid) {
+        NSLog(@"[VGDualCameraCompositorNode][7.x-K] _splitComposite: degenerate split geometry "
+              "prim=%zux%zu splitRatio=%.3f — skipping.", primW, primH, _splitLayout.splitRatio);
         return NULL;
     }
 
-    double canvasW = (double)primW;
-    double canvasH = (double)primH;
+    CGRect topRect    = splitRects.topRect;
+    CGRect bottomRect = splitRects.bottomRect;
+    double topH       = CGRectGetHeight(topRect);
+    double bottomH    = CGRectGetMinY(topRect);  // Y of top band origin == bottomH
+    double canvasW    = (double)primW;
+    double canvasH    = (double)primH;
 
     // ── 3. Build CIImages ────────────────────────────────────────────────────────
     CIImage *primaryCI   = [CIImage imageWithCVPixelBuffer:primaryBuf];
@@ -1786,25 +1782,18 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         return NULL;
     }
 
-    // ── 4. Helper: aspect-fill + crop a CIImage into a target rect ──────────
+    // ── 4. Aspect-fill each band using VGDCLayoutComputeAspectFill (MC-1A) ───
     //
     // For each band:
     //   1. Normalize source origin to (0,0).
-    //   2. Compute scale = MAX(targetW/sourceW, targetH/sourceH).
-    //   3. Scale.
-    //   4. Center-translate so the scaled image is centered over the target rect
-    //      (origin at targetOriginX, targetOriginY).
-    //   5. Crop to the target rect to prevent bleed.
+    //   2. Apply scale from VGDCLayoutComputeAspectFill.
+    //   3. Translate by (offsetX, offsetY) from VGDCLayoutComputeAspectFill.
+    //   4. Crop to the target rect to prevent bleed.
     //
     // CoreImage Y-up: top band origin Y = bottomH, bottom band origin Y = 0.
 
-    // — Primary (top band) —————————————————————————————————————
-    // Target rect (CIImage Y-up): {x=0, y=bottomH, w=canvasW, h=topH}
-    CGRect topRect    = CGRectMake(0.0, bottomH, canvasW, topH);
-    CGRect bottomRect = CGRectMake(0.0, 0.0,     canvasW, bottomH);
-
-    // Aspect-fill helper — normalize, scale-to-fill, center, crop.
-    CIImage *(^aspectFillIntoRect)(CIImage *, size_t, size_t, CGRect) =
+    // Helper that applies VGDCAspectFillResult to a CIImage and crops to targetRect.
+    CIImage *(^applyAspectFill)(CIImage *, size_t, size_t, CGRect) =
         ^CIImage *(CIImage *src, size_t srcW, size_t srcH, CGRect targetRect) {
             // 1. Normalize origin.
             CIImage *norm = src;
@@ -1814,31 +1803,19 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
                 norm = [norm imageByApplyingTransform:normT];
             }
 
-            // 2. Scale = MAX(targetW / srcW, targetH / srcH).
-            double scaleX = (srcW > 0) ? CGRectGetWidth(targetRect)  / (double)srcW : 1.0;
-            double scaleY = (srcH > 0) ? CGRectGetHeight(targetRect) / (double)srcH : 1.0;
-            double scale = MAX(scaleX, scaleY);
-            if (scale <= 0.0) { scale = 1.0; }
-
-            // 3. Apply uniform scale.
-            CGAffineTransform scaleT = CGAffineTransformMakeScale(scale, scale);
-            CIImage *scaled = [norm imageByApplyingTransform:scaleT];
-
-            // 4. Center-translate: move the scaled image so its center aligns with
-            //    the target rect center.
-            double scaledW = (double)srcW * scale;
-            double scaledH = (double)srcH * scale;
-            double offsetX = CGRectGetMinX(targetRect) + (CGRectGetWidth(targetRect)  - scaledW) * 0.5;
-            double offsetY = CGRectGetMinY(targetRect) + (CGRectGetHeight(targetRect) - scaledH) * 0.5;
-            CGAffineTransform transT = CGAffineTransformMakeTranslation(offsetX, offsetY);
+            // 2-3. Compute scale + offsets, apply.
+            VGDCAspectFillResult af = VGDCLayoutComputeAspectFill(srcW, srcH, targetRect);
+            CGAffineTransform scaleT = CGAffineTransformMakeScale(af.scale, af.scale);
+            CIImage *scaled   = [norm imageByApplyingTransform:scaleT];
+            CGAffineTransform transT = CGAffineTransformMakeTranslation(af.offsetX, af.offsetY);
             CIImage *centered = [scaled imageByApplyingTransform:transT];
 
-            // 5. Crop strictly to targetRect — prevents bleed into the other band.
+            // 4. Crop strictly to targetRect — prevents bleed into the other band.
             return [centered imageByCroppingToRect:targetRect];
         };
 
-    CIImage *topBand    = aspectFillIntoRect(primaryCI,   primW, primH, topRect);
-    CIImage *bottomBand = aspectFillIntoRect(secondaryCI, secW,  secH,  bottomRect);
+    CIImage *topBand    = applyAspectFill(primaryCI,   primW, primH, topRect);
+    CIImage *bottomBand = applyAspectFill(secondaryCI, secW,  secH,  bottomRect);
 
     if (!topBand || !bottomBand) {
         NSLog(@"[VGDualCameraCompositorNode][7.x-K] _splitComposite: aspectFill failed.");
@@ -1897,7 +1874,7 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
               "splitRatio=%.3f canvas=%zux%zu",
               bottomH, canvasW, topH,
               canvasW, bottomH,
-              sr, primW, primH);
+              _splitLayout.splitRatio, primW, primH);
     }
 
     return outputBuf; // Caller owns +1 from CVPixelBufferCreate
@@ -1933,76 +1910,19 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
         return NULL;
     }
 
-    // ── 2. PiP geometry (spec: §5 of Phase 7.x-H requirement) ───────────────
-    VGPiPLayoutConfig pip = _pipLayout;
-    double wf = pip.widthFraction;
-    double mf = pip.marginFraction;
-
-    // Clamp widthFraction: must produce a non-zero, bounded PiP width.
-    if (wf < 0.01) { wf = 0.01; }
-    if (wf > 0.95) { wf = 0.95; }
-
-    double pipW = (double)primW * wf;
-    double pipH = (secH > 0 && secW > 0)
-                  ? pipW * (double)secH / (double)secW
-                  : pipW; // fallback: square
-    double margin = (double)primW * mf;
-
-    // Clamp: PiP must fit within primary bounds after margin.
-    // Maximum pipW such that pipW + 2*margin <= primW.
-    double maxPipW = (double)primW - 2.0 * margin;
-    if (maxPipW < 1.0) { maxPipW = 1.0; margin = 0.0; }
-    if (pipW > maxPipW) { pipW = maxPipW; }
-
-    // Recompute pipH after pipW clamp.
-    if (secW > 0) { pipH = pipW * (double)secH / (double)secW; }
-    if (pipH < 1.0) { pipH = 1.0; }
-
-    // Clamp pipH so PiP fits vertically.
-    double maxPipH = (double)primH - 2.0 * margin;
-    if (maxPipH < 1.0) { maxPipH = 1.0; }
-    if (pipH > maxPipH) {
-        pipH = maxPipH;
-        // Preserve aspect ratio: scale pipW down proportionally.
-        if (secH > 0) { pipW = pipH * (double)secW / (double)secH; }
-    }
-
-    // ── 3. Anchor → CIImage Y-up origin ────────────────────────────────────
-    // CIImage coordinate system: Y=0 at bottom, Y=primH at top.
-    // margin from the edge:
-    //   bottom anchors: pipOriginY = margin
-    //   top anchors:    pipOriginY = primH - pipH - margin
-    double pipOriginX = 0.0;
-    double pipOriginY = 0.0;
-
-    switch (pip.anchor) {
-        case VGPiPAnchorTopLeft:
-            pipOriginX = margin;
-            pipOriginY = (double)primH - pipH - margin;
-            break;
-        case VGPiPAnchorTopRight:
-            pipOriginX = (double)primW - pipW - margin;
-            pipOriginY = (double)primH - pipH - margin;
-            break;
-        case VGPiPAnchorBottomLeft:
-            pipOriginX = margin;
-            pipOriginY = margin;
-            break;
-        case VGPiPAnchorBottomRight:
-        default:
-            pipOriginX = (double)primW - pipW - margin;
-            pipOriginY = margin;
-            break;
-    }
-
-    // Clamp origin so PiP stays within primary bounds.
-    if (pipOriginX < 0.0) { pipOriginX = 0.0; }
-    if (pipOriginY < 0.0) { pipOriginY = 0.0; }
-    if (pipOriginX + pipW > (double)primW) { pipOriginX = (double)primW - pipW; }
-    if (pipOriginY + pipH > (double)primH) { pipOriginY = (double)primH - pipH; }
+    // ── 2+3. PiP geometry (delegated to VGDualCameraLayoutMath — MC-1A) ──────
+    // Computes: pipOriginX, pipOriginY, pipW, pipH, clamped cornerRadius + opacity.
+    // Preserves Phase 7.x-H / 7.x-J arithmetic exactly.
+    VGDCPiPGeometry pipGeo = VGDCLayoutComputePiPGeometry(primW, primH, secW, secH, _pipLayout);
+    double pipOriginX = pipGeo.pipOriginX;
+    double pipOriginY = pipGeo.pipOriginY;
+    double pipW       = pipGeo.pipW;
+    double pipH       = pipGeo.pipH;
+    double cr         = pipGeo.clampedCornerRadius;
+    double op         = pipGeo.clampedOpacity;
 
     // ── 4. Build CIImages ────────────────────────────────────────────────────
-    CIImage *primaryCI  = [CIImage imageWithCVPixelBuffer:primaryBuf];
+    CIImage *primaryCI   = [CIImage imageWithCVPixelBuffer:primaryBuf];
     CIImage *secondaryCI = [CIImage imageWithCVPixelBuffer:secondaryBuf];
 
     if (!primaryCI || !secondaryCI) {
@@ -2038,13 +1958,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     // cornerRadius = 0.0  → mask covers the full rectangle → identical to 7.x-H.
     // cornerRadius > 0.0  → corners are transparent (alpha = 0).
     //
-    // Clamp cornerRadius: must be >= 0 and <= half the shortest PiP dimension
-    // so the rounded rect does not degenerate into a circle or become invisible.
+    // cr is already clamped by VGDCLayoutComputePiPGeometry (MC-1A).
     CIImage *secStyled = secPositioned;
-    double cr = pip.cornerRadius;
-    if (cr < 0.0) { cr = 0.0; }
-    double maxCR = MIN(pipW, pipH) * 0.5;
-    if (cr > maxCR) { cr = maxCR; }
 
     if (cr > 0.0) {
         // Build mask in PiP-local space: extent = {0, 0, pipW, pipH}.
@@ -2083,9 +1998,8 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
     //
     // CIColorMatrix inputAVector: {0, 0, 0, opacity} multiplies alpha by opacity.
     // inputRVector / inputGVector / inputBVector are identity (passthrough).
-    double op = pip.opacity;
-    if (op < 0.0) { op = 0.0; }
-    if (op > 1.0) { op = 1.0; }
+    //
+    // op is already clamped by VGDCLayoutComputePiPGeometry (MC-1A).
 
     if (op < 1.0) {
         // Use CIFilter (ObjC API) not applyingFilter:withInputParameters: (Swift-only).
@@ -2150,7 +2064,7 @@ static VGSplitScreenLayoutConfig _VGDCCNParseSplitLayout(NSDictionary<NSString *
               "anchor=%ld wf=%.3f mf=%.3f cr=%.1f op=%.2f",
               pipOriginX, pipOriginY, pipW, pipH,
               primW, primH, secW, secH,
-              (long)pip.anchor, pip.widthFraction, pip.marginFraction,
+              (long)_pipLayout.anchor, _pipLayout.widthFraction, _pipLayout.marginFraction,
               cr, op);
     }
 
