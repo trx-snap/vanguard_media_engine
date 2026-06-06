@@ -1,11 +1,12 @@
 // VGOverlayNode.m
-// vanguard_media_engine — Phase 8.5 / Phase 8.7 / Phase 8.8 / Phase 8.9
+// vanguard_media_engine — Phase 8.5 / Phase 8.7 / Phase 8.8 / Phase 8.9 / Phase 8.10
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// PHASE 8.5 — NATIVE OVERLAY NODE PASS-THROUGH STUB
-// PHASE 8.7 — EXPORT-ONLY DEBUG RECTANGLE RENDERING
-// PHASE 8.8 — EXPORT-ONLY SIMPLE TEXT / EMOJI RENDERING
-// PHASE 8.9 — EXPORT-ONLY STICKER / IMAGE OVERLAY RENDERING
+// PHASE 8.5  — NATIVE OVERLAY NODE PASS-THROUGH STUB
+// PHASE 8.7  — EXPORT-ONLY DEBUG RECTANGLE RENDERING
+// PHASE 8.8  — EXPORT-ONLY SIMPLE TEXT / EMOJI RENDERING
+// PHASE 8.9  — EXPORT-ONLY STICKER / IMAGE OVERLAY RENDERING
+// PHASE 8.10 — EXPORT-ONLY TEXT / EMOJI RENDER CACHING
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Implementation of VGOverlayNode.
@@ -39,6 +40,33 @@
 // session. Failed asset paths are cached as [NSNull null] to prevent repeated
 // failed I/O. Cache is cleared in invalidate. Falls back to red debug rectangle
 // for any load failure, nil assetPath, or cache sentinel.
+//
+// Phase 8.10: Adds export-session render caching for text/emoji overlays.
+// Previously, _VGOverlayCreateTextImage was called every frame for every active
+// text/emoji overlay, running CGBitmapContextCreate + NSString drawInRect on the
+// CPU serial export queue on every single frame. For a 30fps 10-second export
+// with one static text overlay that is 300 redundant CPU rasterizations.
+//
+// The fix: _textCache (NSMutableDictionary, keyed by a composite string) stores
+// the resulting CIImage for the duration of the export session. The cache key
+// encodes every input that affects the rasterized output:
+//   - overlayId
+//   - overlay type integer
+//   - textContent (UTF-8 string value — not pointer)
+//   - rendered pixel width  (rounded integer)
+//   - rendered pixel height (rounded integer)
+//   - resolved font size (integer-rounded CGFloat)
+//   - opacity (encoded as integer 0-1000 for floating-point stability)
+// Any change to any of these dimensions produces a different key and triggers a
+// fresh rasterization. Failed rasterizations are NOT cached (nil return from
+// _VGOverlayCreateTextImage falls through to the debug rectangle on every frame,
+// matching prior Phase 8.8 behaviour for transient failures).
+//
+// Thread safety: _textCache is accessed exclusively on the VGExportScheduler
+// _exportQueue (serial) via processEnvelope:device:, and cleared in invalidate
+// which is also called from the export teardown on the same queue. No cross-
+// thread access — NSMutableDictionary is sufficient; NSCache is not required.
+// Cache is cleared in invalidate alongside _stickerCache.
 //
 // Key architectural invariants (unchanged from Phase 8.7):
 //   - When no overlays are active for the current PTS, the original envelope is
@@ -361,11 +389,19 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
     BOOL                            _enabled;
     VGCanvasDescriptor             *_canvas;
     NSArray<VGOverlayDescriptor *> *_overlays;
-    // Phase 8.9: Export-session asset cache.
+    // Phase 8.9: Export-session sticker asset cache.
     // Values: CIImage * (scaled, orientation-corrected) or NSNull * (load failure sentinel).
     // Keyed by overlay.assetPath (absolute local file path).
     // Cleared in invalidate. Never touches singleton CIContext.
     NSMutableDictionary<NSString *, id> *_stickerCache;
+    // Phase 8.10: Export-session text/emoji render cache.
+    // Values: CIImage * (rasterized, origin at (0,0)).
+    // Keyed by _VGOverlayTextCacheKey() — composite of overlayId, type, textContent,
+    // render pixel dimensions, resolved font size, and opacity integer.
+    // Cleared in invalidate alongside _stickerCache.
+    // No NSNull sentinel: failed rasterizations are NOT cached; they fall through
+    // to the debug rectangle on every frame, preserving Phase 8.8 fallback semantics.
+    NSMutableDictionary<NSString *, CIImage *> *_textCache;
 }
 
 // ─── Module initialization ────────────────────────────────────────────────────
@@ -394,6 +430,9 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
 
     // Phase 8.9: Initialize the sticker asset cache for this export session.
     _stickerCache = [NSMutableDictionary dictionary];
+
+    // Phase 8.10: Initialize the text/emoji render cache for this export session.
+    _textCache = [NSMutableDictionary dictionary];
 
     // ── enabled ──────────────────────────────────────────────────────────────
     // Default YES. If parameters supplies an NSNumber for "enabled", honour it.
@@ -508,6 +547,12 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
     // Phase 8.9: Clear the sticker cache on export teardown.
     // CIImage objects held as values are released by the dictionary.
     [_stickerCache removeAllObjects];
+
+    // Phase 8.10: Clear the text/emoji render cache on export teardown.
+    // Releasing CIImage objects here is safe — they are immutable and not
+    // being consumed by any other retain path at invalidation time.
+    [_textCache removeAllObjects];
+
     os_log_debug(sOverlayNodeLog,
                  "[VGOverlayNode] invalidate: nodeId=%{public}@", _nodeId);
 }
@@ -707,25 +752,60 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
         BOOL isSticker = (overlayType == VGOverlayTypeSticker);
 
         if (isTextOrEmoji && overlay.textContent.length > 0) {
-            // ── Phase 8.8: Text/emoji rasterization ──────────────────────────
-            CIImage *textImage = _VGOverlayCreateTextImage(
-                overlay,
-                (CGFloat)rectW,
-                (CGFloat)rectH,
-                (CGFloat)overlay.opacity);
+            // ── Phase 8.10: Text/emoji cache lookup ───────────────────────────
+            // Build a composite cache key encoding every input that affects the
+            // rasterized bitmap. Font size is derived inside _VGOverlayCreateTextImage
+            // as MAX(12.0, MIN(height * 0.6, 96.0)) — replicate that formula here
+            // so the key correctly distinguishes different render dimensions.
+            CGFloat resolvedFontSize = MAX(12.0, MIN((CGFloat)rectH * 0.6, 96.0));
+            // Encode opacity as integer thousandths (0–1000) to avoid floating-point
+            // instability in string keys while still distinguishing meaningful
+            // differences in alpha.
+            NSInteger opacityKey = (NSInteger)round((double)overlay.opacity * 1000.0);
+            NSString *textCacheKey = [NSString stringWithFormat:
+                @"%@|%ld|%@|%ld|%ld|%ld|%ld",
+                overlay.overlayId,
+                (long)overlay.type,
+                overlay.textContent,
+                (long)round((double)rectW),
+                (long)round((double)rectH),
+                (long)round((double)resolvedFontSize),
+                (long)opacityKey];
 
-            if (textImage) {
-                // _VGOverlayCreateTextImage returns a raster with origin at (0,0).
-                // Translate to the correct CoreImage canvas position.
+            // Check cache first — avoids per-frame CPU rasterization for static
+            // text/emoji overlays (Phase 8.10).
+            CIImage *cachedTextImage = _textCache[textCacheKey];
+            if (!cachedTextImage) {
+                // Cache miss: rasterize via Phase 8.8 helper.
+                cachedTextImage = _VGOverlayCreateTextImage(
+                    overlay,
+                    (CGFloat)rectW,
+                    (CGFloat)rectH,
+                    (CGFloat)overlay.opacity);
+
+                if (cachedTextImage) {
+                    // Store in cache. CIImage is immutable; safe to retain.
+                    _textCache[textCacheKey] = cachedTextImage;
+                    os_log_debug(sOverlayNodeLog,
+                                 "[VGOverlayNode][8.10] text rasterized+cached: "
+                                 "id=%{public}@ key=%{public}@",
+                                 overlay.overlayId, textCacheKey);
+                }
+                // If nil: do NOT cache — fall through to debug rectangle.
+                // A transient failure may recover on the next frame.
+            }
+
+            if (cachedTextImage) {
+                // Cached image has origin at (0,0). Translate to canvas position.
                 CGAffineTransform positionT =
                     CGAffineTransformMakeTranslation((CGFloat)rectXLeft, (CGFloat)ciY);
-                overlayCI = [textImage imageByApplyingTransform:positionT];
+                overlayCI = [cachedTextImage imageByApplyingTransform:positionT];
                 usedContentRender = (overlayCI != nil);
             }
 
             if (!usedContentRender) {
                 os_log_debug(sOverlayNodeLog,
-                             "[VGOverlayNode][8.8] text rasterization failed for "
+                             "[VGOverlayNode][8.10] text rasterization/cache failed for "
                              "overlay id=%{public}@ — falling back to debug rectangle",
                              overlay.overlayId);
             }
