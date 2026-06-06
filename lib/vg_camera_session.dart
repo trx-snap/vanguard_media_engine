@@ -245,6 +245,56 @@ final class VGCameraSession {
     }
   }
 
+  /// Returns the sets of camera devices that can be used simultaneously in an
+  /// `AVCaptureMultiCamSession`, as enumerated by
+  /// `AVCaptureDevice.DiscoverySession.supportedMultiCamDeviceSets`.
+  ///
+  /// This is a pure hardware capability query. It does **not** allocate an
+  /// `AVCaptureMultiCamSession`, add any `AVCaptureDeviceInput`,
+  /// create any `AVCaptureVideoDataOutput`, or request camera permission.
+  ///
+  /// ## Return value
+  /// Returns a list of **device sets**. Each device set is a list of device
+  /// descriptor maps with the following keys:
+  ///
+  /// | Key             | Type   | Example                       |
+  /// |:--------------- |:------ |:----------------------------- |
+  /// | `uniqueId`      | String | `"com.apple.avfoundation..."` |
+  /// | `localizedName` | String | `"Back Camera"`               |
+  /// | `position`      | String | `"back"` / `"front"` / etc.   |
+  /// | `deviceType`    | String | `"builtInWideAngleCamera"`    |
+  /// | `modelId`       | String | Device model string (optional)|
+  /// | `manufacturer`  | String | `"Apple Inc."` (optional)     |
+  ///
+  /// On a supported iPhone 15 Pro, a typical result includes two-element sets
+  /// pairing the front TrueDepth camera with a back camera.
+  ///
+  /// ## Android
+  /// The native handler is absent on Android. Returns `[]` silently via
+  /// `PlatformException` fallback.
+  ///
+  /// ## Failure behaviour
+  /// Returns `[]` on any of:
+  ///   - Device does not support MultiCam (natively detected before query).
+  ///   - iOS < 13.0 (guarded natively with `#available`).
+  ///   - A [PlatformException] is thrown (Android or unexpected native error).
+  ///   - Malformed or null native response.
+  static Future<List<List<Map<String, Object?>>>> getMultiCamDeviceSets() async {
+    try {
+      final raw = await _channel.invokeMethod<List<Object?>>('getMultiCamDeviceSets');
+      if (raw == null) return [];
+      return raw.map((setRaw) {
+        if (setRaw is! List) return <Map<String, Object?>>[];
+        return setRaw.map((deviceRaw) {
+          if (deviceRaw is! Map) return <String, Object?>{};
+          return Map<String, Object?>.from(deviceRaw);
+        }).toList();
+      }).toList();
+    } on PlatformException {
+      return [];
+    }
+  }
+
   /// Tap-to-focus and tap-to-expose at a normalised point.
   ///
   /// [x] and [y] must be in the range `[0.0, 1.0]`, where `(0, 0)` is the

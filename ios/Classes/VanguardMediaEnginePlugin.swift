@@ -3083,6 +3083,99 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(false)
             }
 
+        // ── Phase 9.2: MultiCam device-set enumeration ────────────────────────────
+        //
+        // Returns the hardware-guaranteed sets of AVCaptureDevices that can be
+        // used simultaneously in an AVCaptureMultiCamSession, as reported by
+        // AVCaptureDevice.DiscoverySession.supportedMultiCamDeviceSets.
+        //
+        // Constraints:
+        //   - Pure read-only. Does NOT allocate an AVCaptureMultiCamSession.
+        //   - Does NOT add any AVCaptureDeviceInput or AVCaptureVideoDataOutput.
+        //   - Does NOT request camera permission.
+        //   - Does NOT start or modify any capture session.
+        //   - Uses a short-lived DiscoverySession scoped to this call frame.
+        //   - Returns an empty array if MultiCam is not supported on this device.
+        //   - Returns an empty array on iOS < 13.0 via #available guard.
+        case "getMultiCamDeviceSets":
+            if #available(iOS 13.0, *) {
+                guard AVCaptureMultiCamSession.isMultiCamSupported else {
+                    result([])
+                    return
+                }
+
+                // Create a short-lived discovery session covering all device types
+                // relevant for iPhone multi-camera pairing. Using .unspecified for
+                // position so we discover both front- and back-camera candidates.
+                let deviceTypes: [AVCaptureDevice.DeviceType] = [
+                    .builtInWideAngleCamera,
+                    .builtInTelephotoCamera,
+                    .builtInUltraWideCamera,
+                    .builtInDualCamera,
+                    .builtInDualWideCamera,
+                    .builtInTripleCamera,
+                    .builtInTrueDepthCamera,
+                ]
+
+                let discovery = AVCaptureDevice.DiscoverySession(
+                    deviceTypes: deviceTypes,
+                    mediaType: .video,
+                    position: .unspecified
+                )
+
+                // Map each supported set → [[String: String]]
+                let serialisedSets: [[[String: String]]] = discovery
+                    .supportedMultiCamDeviceSets
+                    .map { deviceSet in
+                        deviceSet.map { device in
+                            var deviceMap: [String: String] = [
+                                "uniqueId":      device.uniqueID,
+                                "localizedName": device.localizedName,
+                                "modelId":       device.modelID,
+                                "manufacturer":  device.manufacturer,
+                            ]
+
+                            // position → human-readable string
+                            switch device.position {
+                            case .front:
+                                deviceMap["position"] = "front"
+                            case .back:
+                                deviceMap["position"] = "back"
+                            case .unspecified:
+                                deviceMap["position"] = "unspecified"
+                            @unknown default:
+                                deviceMap["position"] = "unknown"
+                            }
+
+                            // deviceType → human-readable string
+                            switch device.deviceType {
+                            case .builtInWideAngleCamera:
+                                deviceMap["deviceType"] = "builtInWideAngleCamera"
+                            case .builtInTelephotoCamera:
+                                deviceMap["deviceType"] = "builtInTelephotoCamera"
+                            case .builtInUltraWideCamera:
+                                deviceMap["deviceType"] = "builtInUltraWideCamera"
+                            case .builtInDualCamera:
+                                deviceMap["deviceType"] = "builtInDualCamera"
+                            case .builtInDualWideCamera:
+                                deviceMap["deviceType"] = "builtInDualWideCamera"
+                            case .builtInTripleCamera:
+                                deviceMap["deviceType"] = "builtInTripleCamera"
+                            case .builtInTrueDepthCamera:
+                                deviceMap["deviceType"] = "builtInTrueDepthCamera"
+                            default:
+                                deviceMap["deviceType"] = device.deviceType.rawValue
+                            }
+
+                            return deviceMap
+                        }
+                    }
+
+                result(serialisedSets)
+            } else {
+                result([])
+            }
+
         case "setFocusPoint":
             guard let x = args?["x"] as? Double, let y = args?["y"] as? Double else {
                 result(FlutterError(code: "INVALID_ARG", message: "x and y required", details: nil))

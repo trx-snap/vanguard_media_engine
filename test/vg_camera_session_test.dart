@@ -1224,4 +1224,207 @@ void main() {
       },
     );
   });
+
+  // ── DS-1 to DS-7: VGCameraSession.getMultiCamDeviceSets ───────────────────
+  //
+  // Acceptance criteria:
+  //   DS-1  dispatches 'getMultiCamDeviceSets' to the method channel
+  //   DS-2  returns parsed device sets when native responds with valid data
+  //   DS-3  device maps preserve uniqueId, localizedName, position, deviceType
+  //   DS-4  returns empty list when native responds with empty list
+  //   DS-5  returns empty list when native responds with null
+  //   DS-6  returns empty list (does not throw) on PlatformException
+  //   DS-7  callable as static method without an active camera session
+
+  group('VGCameraSession.getMultiCamDeviceSets', () {
+    // Canonical mock device set used across tests.
+    final kMockDeviceSets = [
+      [
+        {
+          'uniqueId': 'AVCaptureDevice-Front-001',
+          'localizedName': 'Front Camera',
+          'position': 'front',
+          'deviceType': 'builtInTrueDepthCamera',
+          'modelId': 'iPhone16,2',
+          'manufacturer': 'Apple Inc.',
+        },
+        {
+          'uniqueId': 'AVCaptureDevice-Back-001',
+          'localizedName': 'Back Camera',
+          'position': 'back',
+          'deviceType': 'builtInWideAngleCamera',
+          'modelId': 'iPhone16,2',
+          'manufacturer': 'Apple Inc.',
+        },
+      ],
+      [
+        {
+          'uniqueId': 'AVCaptureDevice-Front-001',
+          'localizedName': 'Front Camera',
+          'position': 'front',
+          'deviceType': 'builtInTrueDepthCamera',
+          'modelId': 'iPhone16,2',
+          'manufacturer': 'Apple Inc.',
+        },
+        {
+          'uniqueId': 'AVCaptureDevice-Back-Ultra-001',
+          'localizedName': 'Back Ultra Wide Camera',
+          'position': 'back',
+          'deviceType': 'builtInUltraWideCamera',
+          'modelId': 'iPhone16,2',
+          'manufacturer': 'Apple Inc.',
+        },
+      ],
+    ];
+
+    test('DS-1: dispatches getMultiCamDeviceSets to the method channel',
+        () async {
+      _responses['getMultiCamDeviceSets'] = kMockDeviceSets;
+
+      await VGCameraSession.getMultiCamDeviceSets();
+
+      expect(
+        _callCount('getMultiCamDeviceSets'),
+        equals(1),
+        reason:
+            'getMultiCamDeviceSets() must invoke the channel exactly once',
+      );
+    });
+
+    test('DS-2: returns parsed device sets when native responds with valid data',
+        () async {
+      _responses['getMultiCamDeviceSets'] = kMockDeviceSets;
+
+      final result = await VGCameraSession.getMultiCamDeviceSets();
+
+      expect(
+        result.length,
+        equals(2),
+        reason: 'must return 2 device sets matching mock data',
+      );
+      expect(
+        result[0].length,
+        equals(2),
+        reason: 'first set must contain 2 devices',
+      );
+      expect(
+        result[1].length,
+        equals(2),
+        reason: 'second set must contain 2 devices',
+      );
+    });
+
+    test(
+        'DS-3: device maps preserve uniqueId, localizedName, position, '
+        'and deviceType', () async {
+      _responses['getMultiCamDeviceSets'] = kMockDeviceSets;
+
+      final result = await VGCameraSession.getMultiCamDeviceSets();
+
+      final firstDevice = result[0][0];
+      expect(
+        firstDevice['uniqueId'],
+        equals('AVCaptureDevice-Front-001'),
+        reason: 'uniqueId must be preserved',
+      );
+      expect(
+        firstDevice['localizedName'],
+        equals('Front Camera'),
+        reason: 'localizedName must be preserved',
+      );
+      expect(
+        firstDevice['position'],
+        equals('front'),
+        reason: 'position must be preserved',
+      );
+      expect(
+        firstDevice['deviceType'],
+        equals('builtInTrueDepthCamera'),
+        reason: 'deviceType must be preserved',
+      );
+
+      final secondDevice = result[0][1];
+      expect(
+        secondDevice['position'],
+        equals('back'),
+        reason: 'back position must be preserved',
+      );
+      expect(
+        secondDevice['deviceType'],
+        equals('builtInWideAngleCamera'),
+        reason: 'builtInWideAngleCamera deviceType must be preserved',
+      );
+    });
+
+    test('DS-4: returns empty list when native responds with empty list',
+        () async {
+      _responses['getMultiCamDeviceSets'] = <Object?>[];
+
+      final result = await VGCameraSession.getMultiCamDeviceSets();
+
+      expect(
+        result,
+        isEmpty,
+        reason: 'must return empty list when native returns empty list '
+            '(device does not support MultiCam)',
+      );
+    });
+
+    test('DS-5: returns empty list when native responds with null', () async {
+      _responses['getMultiCamDeviceSets'] = null;
+
+      final result = await VGCameraSession.getMultiCamDeviceSets();
+
+      expect(
+        result,
+        isEmpty,
+        reason: 'must return empty list gracefully when native returns null',
+      );
+    });
+
+    test(
+      'DS-6: returns empty list (does not throw) on PlatformException',
+      () async {
+        // Simulate Android where the handler is absent.
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+          const MethodChannel('vanguard_media_engine'),
+          (MethodCall call) async {
+            if (call.method == 'getMultiCamDeviceSets') {
+              throw PlatformException(
+                code: 'NOT_IMPLEMENTED',
+                message: 'getMultiCamDeviceSets not available on Android',
+              );
+            }
+            return _responses[call.method];
+          },
+        );
+
+        final result = await VGCameraSession.getMultiCamDeviceSets();
+
+        expect(
+          result,
+          isEmpty,
+          reason:
+              'must return empty list gracefully on PlatformException (e.g. Android)',
+        );
+
+        // Restore standard mock after this test.
+        _installMock();
+      },
+    );
+
+    test(
+      'DS-7: callable as a static method without an active camera session',
+      () async {
+        // This test deliberately does NOT call VGCameraSession.create().
+        // The method is static and must work at any lifecycle point.
+        _responses['getMultiCamDeviceSets'] = <Object?>[];
+
+        // Should complete without error.
+        final result = await VGCameraSession.getMultiCamDeviceSets();
+        expect(result, isEmpty);
+      },
+    );
+  });
 }
