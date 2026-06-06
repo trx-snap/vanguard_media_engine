@@ -45,6 +45,8 @@ export 'vg_transform_keyframe_descriptor.dart';
 export 'vg_dual_camera_descriptor.dart';
 // MC-1B: Live dual-camera preview layout config (pure Dart; no clip/session semantics).
 export 'vg_live_preview_config.dart';
+// MC-2: Typed MultiCam device-set models and Dart selection policy.
+export 'vg_multicam_device_set.dart';
 // Phase 7 Stage 7.7: formal editor draft recipe and controller API.
 export 'vg_editor_draft.dart';
 export 'vg_editor_value.dart';
