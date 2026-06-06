@@ -3176,6 +3176,39 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result([])
             }
 
+        // ── MC-3: MultiCam hardware cost diagnostic ───────────────────────────
+        //
+        // Allocates a non-running AVCaptureMultiCamSession to measure the ISP
+        // bandwidth cost (hardwareCost) for a given front/back device pair.
+        //
+        // Constraints:
+        //   - Does NOT call startRunning.
+        //   - Does NOT set sample-buffer delegates.
+        //   - Does NOT stream frames.
+        //   - Does NOT request camera permission (checks only, never prompts).
+        //   - Does NOT report systemPressureCost (deferred to MC-4).
+        //   - The diagnostic session is destroyed immediately after the cost read.
+        //   - Returns nil if unauthorized, device not found, or unsupported.
+        case "measureMultiCamHardwareCost":
+            guard let frontDeviceId = args?["frontDeviceId"] as? String,
+                  let backDeviceId  = args?["backDeviceId"]  as? String else {
+                result(FlutterError(
+                    code: "INVALID_ARG",
+                    message: "measureMultiCamHardwareCost requires frontDeviceId and backDeviceId",
+                    details: nil
+                ))
+                return
+            }
+            if #available(iOS 13.0, *) {
+                let cost = VanguardMultiCamSessionDiagnostic.measureCost(
+                    forFrontId: frontDeviceId,
+                    backId: backDeviceId
+                )
+                result(cost)
+            } else {
+                result(nil)
+            }
+
         case "setFocusPoint":
             guard let x = args?["x"] as? Double, let y = args?["y"] as? Double else {
                 result(FlutterError(code: "INVALID_ARG", message: "x and y required", details: nil))

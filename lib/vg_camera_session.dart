@@ -83,6 +83,87 @@ enum VGTorchMode {
 /// calling one while the other is active will cause the native side to tear
 /// down the previous session before starting a new one. This is the same
 /// behaviour as calling `VanguardEngine.startCamera()` twice.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MC-3: VGMultiCamCostReport
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reports the ISP bandwidth cost of a configured (non-running)
+/// `AVCaptureMultiCamSession` for a given front/back device pair.
+///
+/// Produced by [VGCameraSession.measureMultiCamHardwareCost].
+///
+/// ## Fields
+/// - [hardwareCost]: The fraction of the hardware ISP bandwidth budget consumed
+///   by this configuration (0.0–1.0+). Must be ≤ 1.0 for the session to be
+///   runnable.
+/// - [isWithinBudget]: `true` if [hardwareCost] ≤ 1.0.
+///
+/// ## Note on systemPressureCost
+/// `systemPressureCost` is intentionally excluded. It reflects runtime thermal
+/// and power factors and is only meaningful on a running session (MC-4+).
+@immutable
+class VGMultiCamCostReport {
+  const VGMultiCamCostReport({
+    required this.hardwareCost,
+    required this.isWithinBudget,
+  });
+
+  /// ISP bandwidth cost in the range 0.0–1.0+.
+  /// Must be ≤ 1.0 for the session to be capable of running.
+  final double hardwareCost;
+
+  /// `true` if [hardwareCost] ≤ 1.0, meaning the session configuration is
+  /// within the hardware bandwidth budget.
+  final bool isWithinBudget;
+
+  /// Parses a [VGMultiCamCostReport] from the native channel response map.
+  ///
+  /// Returns `null` if [map] is `null` or does not contain a valid
+  /// `hardwareCost` numeric value.
+  static VGMultiCamCostReport? fromMap(Map<Object?, Object?>? map) {
+    if (map == null) return null;
+    final rawCost = map['hardwareCost'];
+    if (rawCost == null) return null;
+    final double cost;
+    if (rawCost is double) {
+      cost = rawCost;
+    } else if (rawCost is int) {
+      cost = rawCost.toDouble();
+    } else {
+      return null;
+    }
+    // Prefer the native isWithinBudget if present; compute locally as fallback.
+    final rawBudget = map['isWithinBudget'];
+    final bool withinBudget;
+    if (rawBudget is bool) {
+      withinBudget = rawBudget;
+    } else {
+      withinBudget = cost <= 1.0;
+    }
+    return VGMultiCamCostReport(
+      hardwareCost: cost,
+      isWithinBudget: withinBudget,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGMultiCamCostReport &&
+          runtimeType == other.runtimeType &&
+          hardwareCost == other.hardwareCost &&
+          isWithinBudget == other.isWithinBudget;
+
+  @override
+  int get hashCode => Object.hash(hardwareCost, isWithinBudget);
+
+  @override
+  String toString() =>
+      'VGMultiCamCostReport(hardwareCost: $hardwareCost, '
+      'isWithinBudget: $isWithinBudget)';
+}
+
 final class VGCameraSession {
   // ── Channel ──────────────────────────────────────────────────────────────────
 
@@ -292,6 +373,52 @@ final class VGCameraSession {
       }).toList();
     } on PlatformException {
       return [];
+    }
+  }
+
+  /// MC-3: Measures the ISP bandwidth cost of configuring an
+  /// `AVCaptureMultiCamSession` for the given front and back device IDs,
+  /// without starting the session.
+  ///
+  /// Uses [VGMultiCamDeviceSet.selectFrontBackPair] and
+  /// [VGCameraSession.getMultiCamDeviceSets] to obtain device IDs before
+  /// calling this method.
+  ///
+  /// ## Authorization
+  /// Returns `null` if the camera is not yet authorized. Does **not** trigger
+  /// the permission prompt. The existing camera startup path handles that.
+  ///
+  /// ## What this does NOT do:
+  ///   - Does NOT start the session.
+  ///   - Does NOT stream frames.
+  ///   - Does NOT report `systemPressureCost` (deferred to MC-4).
+  ///   - Does NOT modify the running single-camera session.
+  ///
+  /// ## Android
+  /// Returns `null` silently via `PlatformException` fallback.
+  ///
+  /// ## Failure behavior
+  /// Returns `null` on any of:
+  ///   - Camera authorization not granted.
+  ///   - Device not found by uniqueID.
+  ///   - `AVCaptureMultiCamSession` not supported on this device/OS.
+  ///   - A [PlatformException] (Android or unexpected native error).
+  ///   - Malformed or null native response.
+  static Future<VGMultiCamCostReport?> measureMultiCamHardwareCost({
+    required String frontDeviceId,
+    required String backDeviceId,
+  }) async {
+    try {
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'measureMultiCamHardwareCost',
+        {
+          'frontDeviceId': frontDeviceId,
+          'backDeviceId': backDeviceId,
+        },
+      );
+      return VGMultiCamCostReport.fromMap(raw);
+    } on PlatformException {
+      return null;
     }
   }
 

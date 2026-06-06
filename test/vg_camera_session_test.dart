@@ -1427,4 +1427,114 @@ void main() {
       },
     );
   });
+
+  // ── MC-3: VGCameraSession.measureMultiCamHardwareCost ─────────────────────
+  //
+  // Tests for the non-running MultiCam hardware cost diagnostic.
+  // Confirms the channel dispatch, argument passing, result parsing,
+  // and null-safety fallbacks.
+  //
+  // These are pure Dart / mock-channel tests — no native code runs.
+  group('VGCameraSession.measureMultiCamHardwareCost', () {
+    const kFrontId = 'AVCaptureDevice-Front-001';
+    const kBackId  = 'AVCaptureDevice-Back-002';
+
+    test(
+      'MC3-1 dispatches channel method with frontDeviceId and backDeviceId',
+      () async {
+        _responses['measureMultiCamHardwareCost'] = <Object?, Object?>{
+          'hardwareCost': 0.72,
+          'isWithinBudget': true,
+        };
+
+        await VGCameraSession.measureMultiCamHardwareCost(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(_log.length, 1);
+        expect(_log.first.method, 'measureMultiCamHardwareCost');
+        expect(_log.first.arguments['frontDeviceId'], kFrontId);
+        expect(_log.first.arguments['backDeviceId'],  kBackId);
+      },
+    );
+
+    test(
+      'MC3-2 parses valid native response into VGMultiCamCostReport',
+      () async {
+        _responses['measureMultiCamHardwareCost'] = <Object?, Object?>{
+          'hardwareCost': 0.72,
+          'isWithinBudget': true,
+        };
+
+        final report = await VGCameraSession.measureMultiCamHardwareCost(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNotNull);
+        expect(report!.hardwareCost, closeTo(0.72, 0.0001));
+        expect(report.isWithinBudget, isTrue);
+      },
+    );
+
+    test(
+      'MC3-3 returns null on PlatformException',
+      () async {
+        _responses['measureMultiCamHardwareCost'] = PlatformException(
+          code: 'UNSUPPORTED',
+          message: 'MultiCam not available on Android',
+        );
+
+        final report = await VGCameraSession.measureMultiCamHardwareCost(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNull);
+      },
+    );
+
+    test(
+      'MC3-4 returns null on null native response',
+      () async {
+        _responses['measureMultiCamHardwareCost'] = null;
+
+        final report = await VGCameraSession.measureMultiCamHardwareCost(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNull);
+      },
+    );
+
+    test(
+      'MC3-5 VGMultiCamCostReport.fromMap returns within budget for hardwareCost <= 1.0',
+      () {
+        final report = VGMultiCamCostReport.fromMap(<Object?, Object?>{
+          'hardwareCost': 0.72,
+          'isWithinBudget': true,
+        });
+
+        expect(report, isNotNull);
+        expect(report!.hardwareCost, closeTo(0.72, 0.0001));
+        expect(report.isWithinBudget, isTrue);
+      },
+    );
+
+    test(
+      'MC3-6 VGMultiCamCostReport.fromMap returns not within budget for hardwareCost > 1.0',
+      () {
+        final report = VGMultiCamCostReport.fromMap(<Object?, Object?>{
+          'hardwareCost': 1.23,
+          'isWithinBudget': false,
+        });
+
+        expect(report, isNotNull);
+        expect(report!.hardwareCost, closeTo(1.23, 0.0001));
+        expect(report.isWithinBudget, isFalse);
+      },
+    );
+  });
 }
