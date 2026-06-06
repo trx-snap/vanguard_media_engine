@@ -1,7 +1,14 @@
 // vg_overlay_descriptor.dart
-// Vanguard Media Engine — Phase 8.3
+// Vanguard Media Engine — Phase 8.3 / Phase 8.4
 //
 // Timed overlay element descriptor for the UMF V2 timeline.
+//
+// Phase 8.4 additions:
+//   - isActiveAtPTS(double pts) — returns true when pts falls within the
+//     overlay's active time range [startTimeSeconds, startTimeSeconds + durationSeconds).
+//   - isValid — conservative validation: non-empty id, positive duration,
+//     non-negative dimensions, positive scale, opacity in [0.0, 1.0].
+//     Does not enforce textContent or assetPath (Phase 8.4 validation utility only).
 //
 // Design rules (Phase 8.3):
 //   - Pure Dart value type. No Flutter UI packages required.
@@ -213,6 +220,46 @@ final class VGOverlayDescriptor {
   ///
   /// **Phase 8.3**: Raw path string only. Asset resolution is Phase 8.4+.
   final String? assetPath;
+
+  // ── Phase 8.4 validation utilities ────────────────────────────────────────
+
+  /// Returns `true` when [pts] falls within this overlay's active time range.
+  ///
+  /// An overlay is active for a given playhead position [pts] when:
+  ///   `startTimeSeconds <= pts < startTimeSeconds + durationSeconds`
+  ///
+  /// The end boundary is **exclusive** (matching native compositor semantics).
+  ///
+  /// Returns `false` for:
+  ///   - Negative [pts].
+  ///   - Zero or negative [durationSeconds] (overlay has no active window).
+  bool isActiveAtPTS(double pts) {
+    if (pts < 0.0) return false;
+    if (durationSeconds <= 0.0) return false;
+    return pts >= startTimeSeconds && pts < startTimeSeconds + durationSeconds;
+  }
+
+  /// Returns `true` when this overlay descriptor passes conservative validity
+  /// checks sufficient for Phase 8.4 validation utilities.
+  ///
+  /// Validation rules (conservative — does not enforce Phase 8.5+ rendering
+  /// requirements such as non-null [textContent] or [assetPath]):
+  ///   - [id] must not be empty after trimming.
+  ///   - [durationSeconds] must be > 0.
+  ///   - [width] must be >= 0.
+  ///   - [height] must be >= 0.
+  ///   - [scale] must be > 0 (guaranteed by constructor clamping, verified here
+  ///     as a defence-in-depth check).
+  ///   - [opacity] must be in [0.0, 1.0] (guaranteed by clamping; verified here).
+  bool get isValid {
+    if (id.trim().isEmpty) return false;
+    if (durationSeconds <= 0.0) return false;
+    if (width < 0.0) return false;
+    if (height < 0.0) return false;
+    if (scale <= 0.0) return false;
+    if (opacity < 0.0 || opacity > 1.0) return false;
+    return true;
+  }
 
   // ── Serialisation ──────────────────────────────────────────────────────────
 

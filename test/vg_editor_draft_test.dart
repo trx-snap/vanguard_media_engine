@@ -1948,4 +1948,253 @@ void main() {
       expect(m['overlays'] as List, isEmpty);
     });
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 8.4 — overlaysActiveAtPTS
+  // ─────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorDraft — overlaysActiveAtPTS (Phase 8.4)', () {
+    // Two clips, each 5.0 s → total duration = 10.0 s.
+    late VGEditorDraft draft;
+
+    // Overlay A: active [1.0, 4.0) — zIndex 2.
+    // Overlay B: active [3.0, 8.0) — zIndex 0.
+    // Overlay C: active [7.0, 10.0) — zIndex 1.
+    setUp(() {
+      final oA = VGOverlayDescriptor(
+        id: 'ov-A',
+        startTimeSeconds: 1.0,
+        durationSeconds: 3.0,
+        zIndex: 2,
+      );
+      final oB = VGOverlayDescriptor(
+        id: 'ov-B',
+        startTimeSeconds: 3.0,
+        durationSeconds: 5.0,
+        zIndex: 0,
+      );
+      final oC = VGOverlayDescriptor(
+        id: 'ov-C',
+        startTimeSeconds: 7.0,
+        durationSeconds: 3.0,
+        zIndex: 1,
+      );
+      draft = VGEditorDraft(
+        id: 'pts-draft',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        overlays: [oA, oB, oC],
+      );
+    });
+
+    // PTS-1
+    test('PTS-1 returns only overlays active at a given pts', () {
+      // At pts=2.0: oA [1,4) active, oB [3,8) not yet, oC [7,10) not yet.
+      final active = draft.overlaysActiveAtPTS(2.0);
+      expect(active.length, 1);
+      expect(active[0].id, 'ov-A');
+    });
+
+    // PTS-2
+    test('PTS-2 sorts active overlays by zIndex ascending', () {
+      // At pts=3.5: oA [1,4) active (zIndex=2), oB [3,8) active (zIndex=0).
+      // Sort: oB(0) before oA(2).
+      final active = draft.overlaysActiveAtPTS(3.5);
+      expect(active.length, 2);
+      expect(active[0].id, 'ov-B'); // zIndex 0
+      expect(active[1].id, 'ov-A'); // zIndex 2
+    });
+
+    // PTS-3
+    test('PTS-3 returns empty list when no overlays are active', () {
+      // At pts=0.5: no overlay starts before 1.0.
+      final active = draft.overlaysActiveAtPTS(0.5);
+      expect(active, isEmpty);
+    });
+
+    test('PTS-3b returns empty list when draft has no overlays', () {
+      final emptyDraft = VGEditorDraft(id: 'empty', clips: [_clip()]);
+      expect(emptyDraft.overlaysActiveAtPTS(2.0), isEmpty);
+    });
+
+    test('PTS-4 returned list is unmodifiable', () {
+      final active = draft.overlaysActiveAtPTS(2.0);
+      expect(() => (active as List).add(VGOverlayDescriptor(id: 'x')),
+          throwsUnsupportedError);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 8.4 — validateOverlays
+  // ─────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorDraft — validateOverlays (Phase 8.4)', () {
+    // Draft: one 5-second clip on a 640×360 canvas.
+    VGEditorDraft _baseDraft({
+      List<VGOverlayDescriptor> overlays = const [],
+      VGCanvasDescriptor? canvas,
+    }) =>
+        VGEditorDraft(
+          id: 'val-draft',
+          clips: [_clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0)],
+          overlays: overlays,
+          canvas: canvas,
+        );
+
+    // VAL-1
+    test('VAL-1 no warnings for a valid overlay within draft and canvas', () {
+      final ov = VGOverlayDescriptor(
+        id: 'good',
+        startTimeSeconds: 0.0,
+        durationSeconds: 3.0,
+        translationX: 10.0,
+        translationY: 10.0,
+        width: 200.0,
+        height: 100.0,
+      );
+      final warnings = _baseDraft(overlays: [ov]).validateOverlays();
+      expect(warnings, isEmpty);
+    });
+
+    // VAL-2
+    test('VAL-2 warns for invalid overlay descriptor (empty id)', () {
+      final ov = VGOverlayDescriptor(
+        id: '',          // invalid
+        durationSeconds: 2.0,
+      );
+      final warnings = _baseDraft(overlays: [ov]).validateOverlays();
+      expect(warnings.any((w) => w.contains('invalid')), isTrue);
+    });
+
+    // VAL-3
+    test('VAL-3 warns when overlay extends past draft duration', () {
+      // Draft duration = 5.0 s. Overlay ends at 6.0 s.
+      final ov = VGOverlayDescriptor(
+        id: 'late',
+        startTimeSeconds: 3.0,
+        durationSeconds: 3.0, // 3+3=6 > 5
+      );
+      final warnings = _baseDraft(overlays: [ov]).validateOverlays();
+      expect(warnings.any((w) => w.contains('exceeds the')), isTrue);
+    });
+
+    // VAL-4
+    test('VAL-4 warns for negative translationX', () {
+      final ov = VGOverlayDescriptor(
+        id: 'neg-x',
+        startTimeSeconds: 0.0,
+        durationSeconds: 2.0,
+        translationX: -10.0,
+        width: 100.0,
+        height: 50.0,
+      );
+      final warnings = _baseDraft(overlays: [ov]).validateOverlays();
+      expect(warnings.any((w) => w.contains('translationX') && w.contains('negative')), isTrue);
+    });
+
+    // VAL-5 (canvas width overflow)
+    test('VAL-5 warns when overlay exceeds canvas width', () {
+      // Canvas 640 wide. translationX=600 + width=100 = 700 > 640.
+      final ov = VGOverlayDescriptor(
+        id: 'overflow-x',
+        startTimeSeconds: 0.0,
+        durationSeconds: 2.0,
+        translationX: 600.0,
+        width: 100.0,
+        height: 50.0,
+      );
+      final warnings = _baseDraft(overlays: [ov]).validateOverlays();
+      expect(warnings.any((w) => w.contains('canvas width')), isTrue);
+    });
+
+    // VAL-6 (canvas height overflow)
+    test('VAL-6 warns when overlay exceeds canvas height', () {
+      // Canvas 360 tall. translationY=320 + height=80 = 400 > 360.
+      final ov = VGOverlayDescriptor(
+        id: 'overflow-y',
+        startTimeSeconds: 0.0,
+        durationSeconds: 2.0,
+        translationY: 320.0,
+        width: 50.0,
+        height: 80.0,
+      );
+      final warnings = _baseDraft(overlays: [ov]).validateOverlays();
+      expect(warnings.any((w) => w.contains('canvas height')), isTrue);
+    });
+
+    // VAL-7 — negative translationY
+    test('VAL-7 warns for negative translationY', () {
+      final ov = VGOverlayDescriptor(
+        id: 'neg-y',
+        startTimeSeconds: 0.0,
+        durationSeconds: 2.0,
+        translationY: -5.0,
+        width: 50.0,
+        height: 50.0,
+      );
+      final warnings = _baseDraft(overlays: [ov]).validateOverlays();
+      expect(warnings.any((w) => w.contains('translationY') && w.contains('negative')), isTrue);
+    });
+
+    // VAL-8 — warns for zero duration (standalone check, not just via isValid)
+    test('VAL-8 warns for overlay with zero durationSeconds', () {
+      final ov = VGOverlayDescriptor(
+        id: 'zero-dur',
+        startTimeSeconds: 0.0,
+        durationSeconds: 0.0,
+      );
+      final warnings = _baseDraft(overlays: [ov]).validateOverlays();
+      expect(warnings.any((w) => w.contains('<= 0')), isTrue);
+    });
+
+    // VAL-9 — uses resolvedCanvas (explicit canvas descriptor)
+    test('VAL-9 uses resolvedCanvas from explicit VGCanvasDescriptor', () {
+      // Explicit canvas 320×240. Overlay at x=300 + width=50 = 350 > 320.
+      final canvas = VGCanvasDescriptor(width: 320, height: 240);
+      final ov = VGOverlayDescriptor(
+        id: 'out-explicit',
+        startTimeSeconds: 0.0,
+        durationSeconds: 2.0,
+        translationX: 300.0,
+        width: 50.0,
+        height: 20.0,
+      );
+      final warnings = _baseDraft(
+        overlays: [ov],
+        canvas: canvas,
+      ).validateOverlays();
+      expect(warnings.any((w) => w.contains('canvas width')), isTrue);
+    });
+
+    // VAL-10 — uses resolvedCanvas fallback from canvasWidth/canvasHeight
+    test('VAL-10 resolvedCanvas falls back to canvasWidth/canvasHeight when canvas is null', () {
+      // No explicit canvas; draft uses 640×360 fallback.
+      // Overlay at y=350 + height=50 = 400 > 360.
+      final ov = VGOverlayDescriptor(
+        id: 'fallback-canvas',
+        startTimeSeconds: 0.0,
+        durationSeconds: 2.0,
+        translationY: 350.0,
+        width: 50.0,
+        height: 50.0,
+      );
+      // canvas: null → resolvedCanvas uses canvasWidth=640, canvasHeight=360.
+      final draft = VGEditorDraft(
+        id: 'fallback-draft',
+        clips: [_clip()],
+        overlays: [ov],
+        // canvas explicitly omitted → null
+      );
+      final warnings = draft.validateOverlays();
+      expect(warnings.any((w) => w.contains('canvas height')), isTrue);
+    });
+
+    test('VAL-11 returned warnings list is unmodifiable', () {
+      final warnings = _baseDraft().validateOverlays();
+      expect(() => (warnings as List).add('x'), throwsUnsupportedError);
+    });
+  });
 }
+

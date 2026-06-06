@@ -343,6 +343,105 @@ final class VGEditorDraft {
     return total < 0.0 ? 0.0 : total;
   }
 
+  // ── Phase 8.4 overlay validation utilities ─────────────────────────────────
+
+  /// Returns the overlays that are visible at the given playhead position [pts].
+  ///
+  /// An overlay is included when `overlay.isActiveAtPTS(pts)` returns `true`
+  /// (i.e. `overlay.startTimeSeconds <= pts < overlay.startTimeSeconds +
+  /// overlay.durationSeconds`).
+  ///
+  /// The returned list is sorted by [VGOverlayDescriptor.zIndex] ascending
+  /// (lower values render first / behind). Among overlays with equal zIndex,
+  /// the original order from [overlays] is preserved (stable sort).
+  ///
+  /// Returns an unmodifiable empty list when [overlays] is empty or when no
+  /// overlays are active at [pts].
+  List<VGOverlayDescriptor> overlaysActiveAtPTS(double pts) {
+    final active = overlays.where((o) => o.isActiveAtPTS(pts)).toList();
+    // Stable sort by zIndex ascending.
+    active.sort((a, b) => a.zIndex.compareTo(b.zIndex));
+    return List.unmodifiable(active);
+  }
+
+  /// Validates the overlay list and returns a list of human-readable warning
+  /// strings describing any issues found.
+  ///
+  /// This method **never throws** — it returns warnings only. An empty list
+  /// means all overlays passed validation against the current draft.
+  ///
+  /// Warnings are emitted for:
+  ///   - An overlay that fails [VGOverlayDescriptor.isValid] (invalid id,
+  ///     non-positive duration, negative dimension, invalid scale/opacity).
+  ///   - An overlay whose active window extends past the draft's total duration:
+  ///     `overlay.startTimeSeconds + overlay.durationSeconds > durationSeconds`.
+  ///   - An overlay with zero or negative [VGOverlayDescriptor.durationSeconds].
+  ///   - An overlay whose position is outside the resolved canvas bounds (using
+  ///     [resolvedCanvas]):
+  ///       - `translationX < 0`
+  ///       - `translationY < 0`
+  ///       - `translationX + width > resolvedCanvas.width`
+  ///       - `translationY + height > resolvedCanvas.height`
+  ///
+  /// Canvas-bounds warnings are only emitted when [resolvedCanvas] dimensions
+  /// are > 0, which is always true for a valid draft.
+  List<String> validateOverlays() {
+    final warnings = <String>[];
+    final draftDuration = durationSeconds;
+    final canvas = resolvedCanvas;
+    final cw = canvas.width.toDouble();
+    final ch = canvas.height.toDouble();
+
+    for (var i = 0; i < overlays.length; i++) {
+      final o = overlays[i];
+      final tag = 'overlays[$i] (id="${o.id}")';
+
+      // Check 1: descriptor validity.
+      if (!o.isValid) {
+        warnings.add('$tag: overlay descriptor is invalid '
+            '(id empty, duration <= 0, negative dimension, or invalid scale/opacity).');
+      }
+
+      // Check 2: zero or negative duration (may duplicate isValid warning if
+      // isValid fails, but is useful standalone when id is missing too).
+      if (o.durationSeconds <= 0.0) {
+        warnings.add('$tag: durationSeconds (${o.durationSeconds}) is <= 0; '
+            'overlay will never be visible.');
+      }
+
+      // Check 3: active window extends past draft duration.
+      if (o.startTimeSeconds + o.durationSeconds > draftDuration) {
+        warnings.add('$tag: active window ends at '
+            '${o.startTimeSeconds + o.durationSeconds}s which exceeds the '
+            'draft duration ($draftDuration s).');
+      }
+
+      // Check 4: canvas-bounds validation (only when canvas has positive size).
+      if (cw > 0.0 && ch > 0.0) {
+        if (o.translationX < 0.0) {
+          warnings.add('$tag: translationX (${o.translationX}) is negative; '
+              'overlay is partially or fully off the left canvas edge.');
+        }
+        if (o.translationY < 0.0) {
+          warnings.add('$tag: translationY (${o.translationY}) is negative; '
+              'overlay is partially or fully off the top canvas edge.');
+        }
+        if (o.translationX + o.width > cw) {
+          warnings.add('$tag: translationX + width '
+              '(${o.translationX + o.width}) exceeds canvas width ($cw); '
+              'overlay extends past the right canvas edge.');
+        }
+        if (o.translationY + o.height > ch) {
+          warnings.add('$tag: translationY + height '
+              '(${o.translationY + o.height}) exceeds canvas height ($ch); '
+              'overlay extends past the bottom canvas edge.');
+        }
+      }
+    }
+
+    return List.unmodifiable(warnings);
+  }
+
   // ── Serialisation ──────────────────────────────────────────────────────────
 
   /// Serialises this draft to a JSON-compatible map.

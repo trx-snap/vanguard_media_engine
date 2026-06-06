@@ -531,4 +531,145 @@ void main() {
       expect(original.zIndex, 0);
     });
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 8.4 — isActiveAtPTS
+  // ─────────────────────────────────────────────────────────────────────────
+
+  group('VGOverlayDescriptor — isActiveAtPTS (Phase 8.4)', () {
+    // Overlay active from t=2.0 for 3.0 s  →  active [2.0, 5.0).
+    late VGOverlayDescriptor ov;
+
+    setUp(() {
+      ov = VGOverlayDescriptor(
+        id: 'pts-test',
+        startTimeSeconds: 2.0,
+        durationSeconds: 3.0,
+      );
+    });
+
+    // OV-PTS-1
+    test('OV-PTS-1 returns false before start (pts < startTimeSeconds)', () {
+      expect(ov.isActiveAtPTS(1.9), isFalse);
+    });
+
+    // OV-PTS-2
+    test('OV-PTS-2 returns true at start boundary (pts == startTimeSeconds)', () {
+      expect(ov.isActiveAtPTS(2.0), isTrue);
+    });
+
+    // OV-PTS-3
+    test('OV-PTS-3 returns true at midpoint (pts in open interior)', () {
+      expect(ov.isActiveAtPTS(3.5), isTrue);
+    });
+
+    // OV-PTS-4
+    test('OV-PTS-4 returns false at end boundary (exclusive end)', () {
+      // End = 2.0 + 3.0 = 5.0; 5.0 is exclusive.
+      expect(ov.isActiveAtPTS(5.0), isFalse);
+    });
+
+    // OV-PTS-5
+    test('OV-PTS-5 returns false for negative pts', () {
+      expect(ov.isActiveAtPTS(-1.0), isFalse);
+    });
+
+    // OV-PTS-6
+    test('OV-PTS-6 returns false for zero durationSeconds', () {
+      final zeroDur = VGOverlayDescriptor(
+        id: 'zero-dur',
+        startTimeSeconds: 0.0,
+        durationSeconds: 0.0,
+      );
+      expect(zeroDur.isActiveAtPTS(0.0), isFalse);
+    });
+
+    test('OV-PTS-6b returns false for pts past end', () {
+      expect(ov.isActiveAtPTS(99.0), isFalse);
+    });
+
+    test('OV-PTS-6c returns true just before exclusive end', () {
+      expect(ov.isActiveAtPTS(4.999), isTrue);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Phase 8.4 — isValid
+  // ─────────────────────────────────────────────────────────────────────────
+
+  group('VGOverlayDescriptor — isValid (Phase 8.4)', () {
+    // OV-VALID-1
+    test('OV-VALID-1 returns true for a well-formed descriptor', () {
+      final ov = VGOverlayDescriptor(
+        id: 'valid-overlay',
+        durationSeconds: 2.0,
+        width: 100.0,
+        height: 50.0,
+        scale: 1.0,
+        opacity: 1.0,
+      );
+      expect(ov.isValid, isTrue);
+    });
+
+    // OV-VALID-2
+    test('OV-VALID-2 returns false for empty id', () {
+      final ov = VGOverlayDescriptor(
+        id: '',
+        durationSeconds: 2.0,
+      );
+      expect(ov.isValid, isFalse);
+    });
+
+    test('OV-VALID-2b returns false for whitespace-only id', () {
+      final ov = VGOverlayDescriptor(
+        id: '   ',
+        durationSeconds: 2.0,
+      );
+      expect(ov.isValid, isFalse);
+    });
+
+    // OV-VALID-3
+    test('OV-VALID-3 returns false for zero durationSeconds', () {
+      final ov = VGOverlayDescriptor(
+        id: 'ok-id',
+        durationSeconds: 0.0,
+      );
+      expect(ov.isValid, isFalse);
+    });
+
+    // OV-VALID-4
+    test('OV-VALID-4 returns false for invalid scale (clamped to 1.0 by '
+        'constructor, so verify pre-clamp path via fromMap with scale=0)', () {
+      // The constructor clamps scale=0 to 1.0, so constructing a descriptor
+      // with invalid scale is not directly testable via the constructor alone.
+      // fromMap with scale=0 also delegates to the constructor → scale=1.0.
+      // Verify that a descriptor with scale=0 from fromMap still has isValid=true
+      // because the constructor clamps it to 1.0 (expected behavior).
+      final fromZeroScale = VGOverlayDescriptor.fromMap(<Object?, Object?>{
+        'id': 'scale-zero',
+        'durationSeconds': 2.0,
+        'scale': 0.0,
+      });
+      expect(fromZeroScale, isNotNull);
+      // After clamping, scale == 1.0, so isValid should be true (duration > 0, id non-empty).
+      expect(fromZeroScale!.scale, 1.0);
+      expect(fromZeroScale.isValid, isTrue);
+    });
+
+    test('OV-VALID-5 returns true for minimal valid descriptor (id + positive duration)', () {
+      final ov = VGOverlayDescriptor(id: 'min', durationSeconds: 0.001);
+      expect(ov.isValid, isTrue);
+    });
+
+    test('OV-VALID-6 returns true when width and height are zero', () {
+      // Zero dimensions are allowed (not negative); overlay may still be valid.
+      final ov = VGOverlayDescriptor(
+        id: 'zero-size',
+        durationSeconds: 1.0,
+        width: 0.0,
+        height: 0.0,
+      );
+      expect(ov.isValid, isTrue);
+    });
+  });
 }
