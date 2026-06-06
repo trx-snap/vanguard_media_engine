@@ -1,5 +1,5 @@
 // VGOverlayNode.m
-// vanguard_media_engine — Phase 8.5 / Phase 8.7 / Phase 8.8 / Phase 8.9 / Phase 8.10 / Phase 8.11
+// vanguard_media_engine — Phase 8.5 / Phase 8.7 / Phase 8.8 / Phase 8.9 / Phase 8.10 / Phase 8.11 / Phase 8.12
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // PHASE 8.5  — NATIVE OVERLAY NODE PASS-THROUGH STUB
@@ -8,6 +8,7 @@
 // PHASE 8.9  — EXPORT-ONLY STICKER / IMAGE OVERLAY RENDERING
 // PHASE 8.10 — EXPORT-ONLY TEXT / EMOJI RENDER CACHING
 // PHASE 8.11 — STICKER / IMAGE ASPECT-RATIO HARDENING (ASPECT-FIT WITH CENTERING)
+// PHASE 8.12 — EXPORT-ONLY TEXT OVERLAY READABILITY BACKGROUND BOX
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Implementation of VGOverlayNode.
@@ -51,6 +52,18 @@
 // to preserve the (0,0)-origin contract required by the caller's positionT
 // translation step (line ~825). Transparent letterbox/pillarbox margins occupy
 // the unused space and composite cleanly via CISourceOverCompositing.
+//
+// Phase 8.12: Adds a semi-transparent dark rounded-rectangle background behind
+// text overlays only. Emoji overlays share _VGOverlayCreateTextImage but bypass
+// the background via the new BOOL drawBackground parameter (YES only when
+// overlayType == VGOverlayTypeText). The background is drawn inside the existing
+// UIGraphicsPushContext block using UIBezierPath before NSString drawInRect:.
+// UIBezierPath is part of UIKit; it uses the current UIKit graphics context,
+// which is the CGBitmapContext pushed by UIGraphicsPushContext. No new drawing
+// technology is introduced. The overlay type is already encoded in the text cache
+// key ((long)overlay.type), so text and emoji cache entries are always separate.
+// Cache key: unchanged — no new render-affecting input is introduced (drawBackground
+// is fully determined by overlay.type, which is already in the key).
 //
 // Phase 8.10: Adds export-session render caching for text/emoji overlays.
 // Previously, _VGOverlayCreateTextImage was called every frame for every active
@@ -153,7 +166,7 @@ static CIContext *_VGOverlaySharedCIContext(void) {
     return context;
 }
 
-// ─── Phase 8.8: Text rasterization helper ────────────────────────────────────
+// ─── Phase 8.8 / Phase 8.12: Text rasterization helper ──────────────────────
 //
 // _VGOverlayCreateTextImage:
 //   Rasterizes overlay.textContent into a CIImage at the specified pixel size.
@@ -170,10 +183,27 @@ static CIContext *_VGOverlaySharedCIContext(void) {
 //     Font:  UIFontWeightSemibold system font.
 //     Size:  MAX(12.0, MIN(height * 0.6, 96.0)) — readable fraction of overlay height.
 //     Color: white at the overlay's opacity level.
-//     Background: fully transparent (CGContextClearRect).
+//     Background: controlled by drawBackground (see below).
 //
 //   Emoji: works opportunistically — system font stack falls back to Apple Color
 //     Emoji for emoji characters. No special handling needed.
+//
+//   Phase 8.12 — Background box (drawBackground == YES):
+//     Draws a semi-transparent black rounded rectangle covering the full raster
+//     bounds before the text, ensuring readability against any video background.
+//     Applied only to VGOverlayTypeText overlays (caller passes YES); emoji
+//     overlays pass NO and are unaffected.
+//     Implementation: UIBezierPath bezierPathWithRoundedRect:cornerRadius:
+//     called inside the UIGraphicsPushContext block. UIBezierPath uses the
+//     currently-pushed UIKit graphics context — the same CGBitmapContext used
+//     for NSString drawInRect:. No additional context stack manipulation needed.
+//     Background alpha: 0.55 * clamped_opacity (conservative, ensures legibility).
+//     Corner radius: MIN(pixelWidth, pixelHeight) * 0.1 (10% of the shorter edge),
+//     clamped to [4.0, 16.0] to handle very small/large overlay bounds.
+//
+//   Cache key note: drawBackground is fully determined by overlay.type, which is
+//     already encoded in the textCacheKey at the call site ((long)overlay.type).
+//     No cache key change is required.
 //
 //   Returns nil on any failure; caller falls back to red debug rectangle.
 //   Caller is responsible for no further release of the returned CIImage
@@ -185,7 +215,8 @@ static CIContext *_VGOverlaySharedCIContext(void) {
 static CIImage * _Nullable _VGOverlayCreateTextImage(VGOverlayDescriptor *overlay,
                                                      CGFloat width,
                                                      CGFloat height,
-                                                     CGFloat opacity) {
+                                                     CGFloat opacity,
+                                                     BOOL drawBackground) {
     // Guard: caller should have checked this, but be defensive.
     if (overlay.textContent.length == 0) { return nil; }
 
@@ -215,7 +246,7 @@ static CIImage * _Nullable _VGOverlayCreateTextImage(VGOverlayDescriptor *overla
     // ── Clear to fully transparent ────────────────────────────────────────────
     CGContextClearRect(ctx, CGRectMake(0, 0, (CGFloat)pixelWidth, (CGFloat)pixelHeight));
 
-    // ── Draw text ─────────────────────────────────────────────────────────────
+    // ── Draw text (and optional readability background) ───────────────────────
     // Phase 8.8A: Coordinate transform for text orientation.
     // CGBitmapContext has a bottom-left origin. UIKit text drawing assumes a
     // top-left origin. We must vertically flip the context before drawing text
@@ -224,9 +255,39 @@ static CIImage * _Nullable _VGOverlayCreateTextImage(VGOverlayDescriptor *overla
     CGContextScaleCTM(ctx, 1.0, -1.0);
 
     // UIGraphicsPushContext pushes onto the per-thread UIKit context stack,
-    // making CGBitmapContext available to NSString UIKit drawing methods.
+    // making CGBitmapContext available to NSString UIKit drawing methods
+    // and to UIBezierPath (Phase 8.12).
     // UIGraphicsPopContext restores the previous stack state.
     UIGraphicsPushContext(ctx);
+
+    // ── Phase 8.12: Readability background box (text overlays only) ───────────
+    // Draws a semi-transparent dark rounded rectangle over the full raster bounds
+    // before the text so that white text is readable against any video background.
+    //
+    // UIBezierPath operates on the currently-pushed UIKit graphics context, which
+    // is the CGBitmapContext pushed above. This is the same mechanism used by
+    // NSString drawInRect: below. No additional thread or context manipulation.
+    //
+    // Background alpha: 0.55 × clamped_opacity.
+    //   - 0.55 is conservative: provides good contrast without completely obscuring
+    //     the underlying video frame. The overall overlay opacity is folded in so
+    //     that a fading overlay fades both text and background together.
+    //
+    // Corner radius: 10% of the shorter pixel dimension, clamped to [4.0, 16.0].
+    //   - Scales gracefully from small thumbnails to large export canvases.
+    if (drawBackground) {
+        CGFloat clampedOpacity = (CGFloat)MAX(0.0, MIN(1.0, (double)opacity));
+        CGFloat bgAlpha        = 0.55 * clampedOpacity;
+        UIColor *bgColor = [[UIColor blackColor] colorWithAlphaComponent:bgAlpha];
+        [bgColor setFill];
+
+        CGFloat shortEdge    = (CGFloat)MIN(pixelWidth, pixelHeight);
+        CGFloat cornerRadius = (CGFloat)MAX(4.0, MIN(16.0, (double)(shortEdge * 0.1)));
+        CGRect  bgRect       = CGRectMake(0, 0, (CGFloat)pixelWidth, (CGFloat)pixelHeight);
+        UIBezierPath *bgPath = [UIBezierPath bezierPathWithRoundedRect:bgRect
+                                                          cornerRadius:cornerRadius];
+        [bgPath fill];
+    }
 
     CGFloat fontSize = MAX(12.0, MIN(height * 0.6, 96.0));
     UIFont  *font    = [UIFont systemFontOfSize:fontSize weight:UIFontWeightSemibold];
@@ -856,12 +917,18 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
             // text/emoji overlays (Phase 8.10).
             CIImage *cachedTextImage = _textCache[textCacheKey];
             if (!cachedTextImage) {
-                // Cache miss: rasterize via Phase 8.8 helper.
+                // Cache miss: rasterize via Phase 8.8/8.12 helper.
+                // drawBackground is YES only for VGOverlayTypeText overlays.
+                // Emoji overlays pass NO and are visually unaffected.
+                // Cache key already includes (long)overlay.type, so text and emoji
+                // entries are always distinct — no key change needed.
+                BOOL drawBackground = (overlayType == VGOverlayTypeText);
                 cachedTextImage = _VGOverlayCreateTextImage(
                     overlay,
                     (CGFloat)rectW,
                     (CGFloat)rectH,
-                    (CGFloat)overlay.opacity);
+                    (CGFloat)overlay.opacity,
+                    drawBackground);
 
                 if (cachedTextImage) {
                     // Store in cache. CIImage is immutable; safe to retain.
