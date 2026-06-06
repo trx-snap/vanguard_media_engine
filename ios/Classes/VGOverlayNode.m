@@ -166,6 +166,13 @@ static CIImage * _Nullable _VGOverlayCreateTextImage(VGOverlayDescriptor *overla
     CGContextClearRect(ctx, CGRectMake(0, 0, (CGFloat)pixelWidth, (CGFloat)pixelHeight));
 
     // ── Draw text ─────────────────────────────────────────────────────────────
+    // Phase 8.8A: Coordinate transform for text orientation.
+    // CGBitmapContext has a bottom-left origin. UIKit text drawing assumes a
+    // top-left origin. We must vertically flip the context before drawing text
+    // so that it renders upright in the bitmap.
+    CGContextTranslateCTM(ctx, 0.0, (CGFloat)pixelHeight);
+    CGContextScaleCTM(ctx, 1.0, -1.0);
+
     // UIGraphicsPushContext pushes onto the per-thread UIKit context stack,
     // making CGBitmapContext available to NSString UIKit drawing methods.
     // UIGraphicsPopContext restores the previous stack state.
