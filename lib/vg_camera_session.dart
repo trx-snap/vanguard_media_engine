@@ -218,6 +218,33 @@ final class VGCameraSession {
     }
   }
 
+  /// Returns whether this iOS device supports simultaneous multi-camera capture
+  /// via `AVCaptureMultiCamSession`.
+  ///
+  /// This is a pure hardware capability query. It does **not** start or modify
+  /// any capture session, and it does **not** request camera permission.
+  ///
+  /// Returns `true` only on iOS 13+ devices with multi-camera hardware support
+  /// (e.g., iPhone XS and later with A12 Bionic or newer).
+  ///
+  /// ## Android
+  /// The native handler is absent on Android. Returns `false` silently via
+  /// `PlatformException` fallback.
+  ///
+  /// ## Failure behaviour
+  /// Returns `false` on any of:
+  ///   - iOS < 13.0 (guarded natively with `#available`).
+  ///   - A [PlatformException] is thrown (Android or unexpected native error).
+  static Future<bool> isMultiCamSupported() async {
+    try {
+      final supported =
+          await _channel.invokeMethod<bool>('isMultiCamSupported');
+      return supported ?? false;
+    } on PlatformException {
+      return false;
+    }
+  }
+
   /// Tap-to-focus and tap-to-expose at a normalised point.
   ///
   /// [x] and [y] must be in the range `[0.0, 1.0]`, where `(0, 0)` is the

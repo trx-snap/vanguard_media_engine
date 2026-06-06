@@ -3066,6 +3066,22 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
             result(caps)
 
+        // ── Phase 7.x-MultiCam: Hardware capability query ─────────────────────────
+        //
+        // Returns whether this iOS device supports AVCaptureMultiCamSession.
+        //
+        // Constraints:
+        //   - Pure read-only. Does NOT allocate an AVCaptureMultiCamSession.
+        //   - Does NOT request camera permission.
+        //   - Does NOT start or modify any capture session.
+        //   - Safe to call at any lifecycle point (no mode guard required).
+        //   - Returns false on iOS < 13.0 via #available guard.
+        case "isMultiCamSupported":
+            if #available(iOS 13.0, *) {
+                result(AVCaptureMultiCamSession.isMultiCamSupported)
+            } else {
+                result(false)
+            }
 
         case "setFocusPoint":
             guard let x = args?["x"] as? Double, let y = args?["y"] as? Double else {

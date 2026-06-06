@@ -1132,4 +1132,96 @@ void main() {
       await session.dispose();
     });
   });
+
+  // ── MC-1 to MC-3: VGCameraSession.isMultiCamSupported ─────────────────────
+  //
+  // Acceptance criteria:
+  //   MC-1  isMultiCamSupported() invokes 'isMultiCamSupported' on the channel
+  //   MC-2  returns true when native returns true
+  //   MC-3  returns false when native returns false
+  //   MC-4  returns false (not throws) on PlatformException
+  //   MC-5  isMultiCamSupported() is callable without an active camera session
+
+  group('VGCameraSession.isMultiCamSupported', () {
+    test('MC-1: dispatches isMultiCamSupported to the method channel', () async {
+      _responses['isMultiCamSupported'] = true;
+
+      await VGCameraSession.isMultiCamSupported();
+
+      expect(
+        _callCount('isMultiCamSupported'),
+        equals(1),
+        reason: 'isMultiCamSupported() must invoke the channel exactly once',
+      );
+    });
+
+    test('MC-2: returns true when native responds true', () async {
+      _responses['isMultiCamSupported'] = true;
+
+      final result = await VGCameraSession.isMultiCamSupported();
+
+      expect(
+        result,
+        isTrue,
+        reason: 'must return true when native returns true',
+      );
+    });
+
+    test('MC-3: returns false when native responds false', () async {
+      _responses['isMultiCamSupported'] = false;
+
+      final result = await VGCameraSession.isMultiCamSupported();
+
+      expect(
+        result,
+        isFalse,
+        reason: 'must return false when native returns false',
+      );
+    });
+
+    test(
+      'MC-4: returns false (does not throw) on PlatformException',
+      () async {
+        // Simulate Android where the handler is absent (FlutterMethodNotImplemented).
+        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+            .setMockMethodCallHandler(
+          const MethodChannel('vanguard_media_engine'),
+          (MethodCall call) async {
+            if (call.method == 'isMultiCamSupported') {
+              throw PlatformException(
+                code: 'NOT_IMPLEMENTED',
+                message: 'isMultiCamSupported not available on this platform',
+              );
+            }
+            return _responses[call.method];
+          },
+        );
+
+        final result = await VGCameraSession.isMultiCamSupported();
+
+        expect(
+          result,
+          isFalse,
+          reason:
+              'must return false gracefully on PlatformException (e.g. Android)',
+        );
+
+        // Restore standard mock after this test.
+        _installMock();
+      },
+    );
+
+    test(
+      'MC-5: callable as a static method without an active camera session',
+      () async {
+        // This test deliberately does NOT call VGCameraSession.create().
+        // The method is static and must work at any lifecycle point.
+        _responses['isMultiCamSupported'] = false;
+
+        // Should complete without error.
+        final result = await VGCameraSession.isMultiCamSupported();
+        expect(result, isFalse);
+      },
+    );
+  });
 }
