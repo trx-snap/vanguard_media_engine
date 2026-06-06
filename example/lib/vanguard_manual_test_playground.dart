@@ -25,8 +25,19 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+import 'package:vanguard_media_engine/vg_overlay_descriptor.dart';
 
 const MethodChannel _channel = MethodChannel('vanguard_media_engine');
+
+enum _ManualOverlaySmokeMode {
+  off,
+  debugRectangle,
+  text,
+  emoji,
+  // Phase 8.9: sticker/image overlay export smoke mode.
+  // Uses the existing still_C.png fixture extracted to an absolute temp path.
+  sticker,
+}
 
 class VanguardManualTestPlayground extends StatefulWidget {
   const VanguardManualTestPlayground({super.key});
@@ -44,18 +55,35 @@ class _VanguardManualTestPlaygroundState
   // Phase 7.12: approved still-image test fixture (Hanif explicit approval).
   static const String _kAssetPathC = 'assets/manual_test_clips/still_C.png';
 
+  // Phase 7.24A: local-only high-res profiling assets (DO NOT COMMIT MEDIA).
+  static const String _kAsset60sVideo  = 'assets/manual_test_clips/IMG_3756 2.MOV';
+  static const String _kAsset10sVideo  = 'assets/manual_test_clips/IMG_3768.MOV';
+  static const String _kAssetHiRes1    = 'assets/manual_test_clips/IMG_3757.JPG';
+  static const String _kAssetHiRes2    = 'assets/manual_test_clips/IMG_3758.JPG';
+  static const String _kAssetHiRes3    = 'assets/manual_test_clips/IMG_3762.HEIC';
+  static const String _kAssetHiRes4    = 'assets/manual_test_clips/IMG_3763.HEIC';
+
   // ── Temp File Paths ─────────────────────────────────────────────────────────
   String? _tempPathA;
   String? _tempPathB;
   String? _tempPathC; // Phase 7.12: still-image fixture
+
+  // Phase 7.24A: temp paths for local profiling assets.
+  String? _tempPath60sVideo;
+  String? _tempPath10sVideo;
+  String? _tempPathHiRes1;
+  String? _tempPathHiRes2;
+  String? _tempPathHiRes3;
+  String? _tempPathHiRes4;
+  bool _hiResAssetsReady = false;
 
   bool _existsA = false;
   bool _existsB = false;
   bool _existsC = false; // Phase 7.12
 
   // ── Canvas Configurations ──────────────────────────────────────────────────
-  int _canvasWidth = 1280;
-  int _canvasHeight = 720;
+  int _canvasWidth = 720;
+  int _canvasHeight = 1280;
   final int _fps = 30;
 
   // ── Phase 7.12: still-image test mode toggle ─────────────────────────────
@@ -72,6 +100,18 @@ class _VanguardManualTestPlaygroundState
 
   // ── Phase 7.19B: reverse-clip apply status (DEV validation only) ────────
   bool _reverseApplied = false;
+
+  // ── Phase 7.22B-M: time-remap mode selector (DEV validation only) ────────
+  // 'off'  : timeRemap = null  (legacy speed path, backward compat)
+  // 'fast' : single segment [0,4)@2.0× → expected timelineDuration = 2.0s
+  // 'slow' : single segment [0,2)@0.5× → expected timelineDuration = 4.0s
+  String _timeRemapMode = 'off';
+
+  // ── Phase 7.24A: local profiling scenario state (DEV ONLY — DO NOT COMMIT) ─
+  // 0=idle 1=highResStills 2=highResTransitions 3=mixedStress 4=longReverse
+  int _phase724Scenario = 0;
+  String _phase724Status = 'Tap a scenario button to begin. LOCAL PROFILING — DO NOT COMMIT.';
+  bool _phase724Busy = false;
 
   // ── Phase 7.20D: Reverse sidecar status HUD state ───────────────────────────
   // Latest statuses returned by prepareReverseSidecars() or getSidecarStatus().
@@ -170,6 +210,15 @@ class _VanguardManualTestPlaygroundState
   // (D7: debounced playground rebuild)
   Timer? _transformDebounce;
 
+  // ── Phase 7.23B: TransformTrack Debug State ────────────────────────────────
+  // 0 = Off (static transform), 1 = Scale, 2 = Translation, 3 = Opacity, 4 = Combined
+  int _keyframeMode = 0;
+
+  // ── Phase 8.8: Overlay smoke test mode (local manual harness only) ─────────
+  // Replaces the old Phase 8.7 boolean toggle to support text/emoji injection.
+  // LOCAL ONLY — DO NOT COMMIT MEDIA OR ENABLE IN PRODUCTION.
+  _ManualOverlaySmokeMode _overlaySmokeMode = _ManualOverlaySmokeMode.off;
+
   @override
   void initState() {
     super.initState();
@@ -233,8 +282,12 @@ class _VanguardManualTestPlaygroundState
         _status = 'Assets ready in temp. Initializing timeline...';
       });
 
+      // Phase 7.24A: copy high-res profiling assets in background after main
+      // timeline is ready. Failures are soft — they set _hiResAssetsReady=false.
+      // Assets are large (115MB video) so this runs after the first timeline init.
       if (existsA && existsB) {
         await _rebuildTimeline();
+        _copyPhase724Assets(); // fire-and-forget; updates _hiResAssetsReady
       } else {
         setState(() {
           _status = 'Error: Fixture files were copied but do not exist in temp.';
@@ -246,6 +299,37 @@ class _VanguardManualTestPlaygroundState
         _copyingAssets = false;
         _status = 'Error loading assets: $e';
         _copyError = e.toString();
+      });
+    }
+  }
+
+  // Phase 7.24A: copy high-res profiling assets to temp (fire-and-forget after
+  // normal timeline is ready). Files are large — runs async, does not block UI.
+  // LOCAL PROFILING ONLY — DO NOT COMMIT.
+  Future<void> _copyPhase724Assets() async {
+    try {
+      final v60  = await _copyAssetToTemp(_kAsset60sVideo, 'IMG_3756_2.MOV');
+      final v10  = await _copyAssetToTemp(_kAsset10sVideo, 'IMG_3768.MOV');
+      final hr1  = await _copyAssetToTemp(_kAssetHiRes1,   'IMG_3757.JPG');
+      final hr2  = await _copyAssetToTemp(_kAssetHiRes2,   'IMG_3758.JPG');
+      final hr3  = await _copyAssetToTemp(_kAssetHiRes3,   'IMG_3762.HEIC');
+      final hr4  = await _copyAssetToTemp(_kAssetHiRes4,   'IMG_3763.HEIC');
+      if (!mounted) return;
+      setState(() {
+        _tempPath60sVideo  = v60;
+        _tempPath10sVideo  = v10;
+        _tempPathHiRes1    = hr1;
+        _tempPathHiRes2    = hr2;
+        _tempPathHiRes3    = hr3;
+        _tempPathHiRes4    = hr4;
+        _hiResAssetsReady  = true;
+        _phase724Status    = 'Hi-res assets ready. Select a scenario. DO NOT COMMIT MEDIA.';
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _hiResAssetsReady = false;
+        _phase724Status   = 'Hi-res asset copy failed: $e';
       });
     }
   }
@@ -285,12 +369,62 @@ class _VanguardManualTestPlaygroundState
     // Clip B remains in the timeline as a normal single-stream second clip so
     // the total timeline structure stays valid; the compositor uses it only as
     // the secondary source while rendering the dual-cam composite for Clip A.
+    // Phase 7.23B: Build the transformTrack based on DEV test mode
+    VGTransformTrackDescriptor? transformTrackForClipA;
+    if (_keyframeMode == 1) { // Scale
+      transformTrackForClipA = VGTransformTrackDescriptor(
+        keyframes: const [
+          VGTransformKeyframeDescriptor(timeUs: 0, scaleX: 1.0, scaleY: 1.0, translationX: 0.0, translationY: 0.0, rotation: 0.0, opacity: 1.0),
+          VGTransformKeyframeDescriptor(timeUs: 2000000, scaleX: 2.0, scaleY: 2.0, translationX: 0.0, translationY: 0.0, rotation: 0.0, opacity: 1.0),
+          VGTransformKeyframeDescriptor(timeUs: 4000000, scaleX: 1.0, scaleY: 1.0, translationX: 0.0, translationY: 0.0, rotation: 0.0, opacity: 1.0),
+        ],
+        interpolation: VGKeyframeInterpolation.linear,
+        anchorX: 0.5,
+        anchorY: 0.5,
+      );
+    } else if (_keyframeMode == 2) { // Translation
+      transformTrackForClipA = VGTransformTrackDescriptor(
+        keyframes: const [
+          VGTransformKeyframeDescriptor(timeUs: 0, scaleX: 1.0, scaleY: 1.0, translationX: 0.0, translationY: 0.0, rotation: 0.0, opacity: 1.0),
+          VGTransformKeyframeDescriptor(timeUs: 2000000, scaleX: 1.0, scaleY: 1.0, translationX: 200.0, translationY: -100.0, rotation: 0.0, opacity: 1.0),
+          VGTransformKeyframeDescriptor(timeUs: 4000000, scaleX: 1.0, scaleY: 1.0, translationX: 0.0, translationY: 0.0, rotation: 0.0, opacity: 1.0),
+        ],
+        interpolation: VGKeyframeInterpolation.linear,
+        anchorX: 0.5,
+        anchorY: 0.5,
+      );
+    } else if (_keyframeMode == 3) { // Opacity
+      transformTrackForClipA = VGTransformTrackDescriptor(
+        keyframes: const [
+          VGTransformKeyframeDescriptor(timeUs: 0, scaleX: 1.0, scaleY: 1.0, translationX: 0.0, translationY: 0.0, rotation: 0.0, opacity: 1.0),
+          VGTransformKeyframeDescriptor(timeUs: 2000000, scaleX: 1.0, scaleY: 1.0, translationX: 0.0, translationY: 0.0, rotation: 0.0, opacity: 0.1),
+          VGTransformKeyframeDescriptor(timeUs: 4000000, scaleX: 1.0, scaleY: 1.0, translationX: 0.0, translationY: 0.0, rotation: 0.0, opacity: 1.0),
+        ],
+        interpolation: VGKeyframeInterpolation.linear,
+        anchorX: 0.5,
+        anchorY: 0.5,
+      );
+    } else if (_keyframeMode == 4) { // Combined
+      transformTrackForClipA = VGTransformTrackDescriptor(
+        keyframes: const [
+          VGTransformKeyframeDescriptor(timeUs: 0, scaleX: 1.0, scaleY: 1.0, translationX: 0.0, translationY: 0.0, rotation: 0.0, opacity: 1.0),
+          VGTransformKeyframeDescriptor(timeUs: 2000000, scaleX: 1.5, scaleY: 1.5, translationX: 100.0, translationY: 100.0, rotation: 0.0, opacity: 0.5),
+          VGTransformKeyframeDescriptor(timeUs: 4000000, scaleX: 1.0, scaleY: 1.0, translationX: 0.0, translationY: 0.0, rotation: 0.0, opacity: 1.0),
+        ],
+        interpolation: VGKeyframeInterpolation.linear,
+        anchorX: 0.5,
+        anchorY: 0.5,
+      );
+    }
+
     final clipABase = VGClipDescriptor(
       id: 'clip-A',
       sourcePath: _tempPathA!,
       durationSeconds: 5.06,
       trimStartSeconds: 0.0,
       trimEndSeconds: 5.06,
+      // Phase 7.23B: injected track overrides static transform if non-null.
+      transformTrack: transformTrackForClipA,
       // Phase 7.11: apply clip A transform when non-identity.
       transform: (_clipAScaleX != 1.0 || _clipAScaleY != 1.0 ||
                   _clipARotation != 0.0 || _clipAOpacity != 1.0 ||
@@ -342,9 +476,38 @@ class _VanguardManualTestPlaygroundState
       }
     }
 
-    final clipA = prodDualCamera != null
-        ? clipABase.copyWith(dualCamera: prodDualCamera)
+    // Phase 7.22B-M: build timeRemap descriptor for Clip A based on DEV mode.
+    // 'off' → null (legacy speed path preserved bit-for-bit).
+    // 'fast' → 1 segment [0,4)@2.0× — wall-clock 2.0s from 4.0s source.
+    // 'slow' → 1 segment [0,2)@0.5× — wall-clock 4.0s from 2.0s source.
+    VGTimeRemapDescriptor? timeRemapForClipA;
+    if (_timeRemapMode == 'fast') {
+      timeRemapForClipA = VGTimeRemapDescriptor(
+        segments: [
+          VGSpeedSegmentDescriptor(
+            sourceStartTime: 0.0,
+            sourceDuration: 4.0,
+            speedMultiplier: 2.0,
+          ),
+        ],
+      );
+    } else if (_timeRemapMode == 'slow') {
+      timeRemapForClipA = VGTimeRemapDescriptor(
+        segments: [
+          VGSpeedSegmentDescriptor(
+            sourceStartTime: 0.0,
+            sourceDuration: 2.0,
+            speedMultiplier: 0.5,
+          ),
+        ],
+      );
+    }
+    final clipAWithRemap = timeRemapForClipA != null
+        ? clipABase.copyWith(timeRemap: timeRemapForClipA)
         : clipABase;
+    final clipA = prodDualCamera != null
+        ? clipAWithRemap.copyWith(dualCamera: prodDualCamera)
+        : clipAWithRemap;
 
     // Phase 7.12: when _useStillImageClipB is true, Clip B becomes a still image.
     // The existing A→B transition selector and Clip B transform sliders apply to
@@ -410,6 +573,91 @@ class _VanguardManualTestPlaygroundState
       ];
     }
 
+    // Phase 8.8 manual harness: inject overlay based on selected smoke mode.
+    // This is a local-only manual validation control — not a production path.
+    List<VGOverlayDescriptor> overlays = const [];
+    switch (_overlaySmokeMode) {
+      case _ManualOverlaySmokeMode.off:
+        overlays = const [];
+        break;
+      case _ManualOverlaySmokeMode.debugRectangle:
+        overlays = [
+          VGOverlayDescriptor(
+            id: 'manual_debug_overlay_fallback_1',
+            type: VGOverlayType.text,
+            startTimeSeconds: 0.25,
+            durationSeconds: 2.0,
+            translationX: 120.0,
+            translationY: 160.0,
+            width: 360.0,
+            height: 180.0,
+            opacity: 0.5,
+            zIndex: 10,
+            textContent: '',
+          ),
+        ];
+        break;
+      case _ManualOverlaySmokeMode.text:
+        overlays = [
+          VGOverlayDescriptor(
+            id: 'manual_text_overlay_1',
+            type: VGOverlayType.text,
+            startTimeSeconds: 0.25,
+            durationSeconds: 2.0,
+            translationX: 120.0,
+            translationY: 160.0,
+            width: 520.0,
+            height: 180.0,
+            opacity: 1.0,
+            zIndex: 10,
+            textContent: 'Hello Phase 8.8',
+          ),
+        ];
+        break;
+      case _ManualOverlaySmokeMode.emoji:
+        overlays = [
+          VGOverlayDescriptor(
+            id: 'manual_emoji_overlay_1',
+            type: VGOverlayType.emoji,
+            startTimeSeconds: 0.25,
+            durationSeconds: 2.0,
+            translationX: 120.0,
+            translationY: 160.0,
+            width: 240.0,
+            height: 180.0,
+            opacity: 1.0,
+            zIndex: 10,
+            textContent: '🔥',
+          ),
+        ];
+        break;
+      // Phase 8.9: sticker/image overlay smoke.
+      // Uses still_C.png (committed PNG fixture) extracted to an absolute temp path.
+      // _tempPathC is populated in _prepareAssets() via _copyAssetToTemp.
+      case _ManualOverlaySmokeMode.sticker:
+        if (_tempPathC != null) {
+          overlays = [
+            VGOverlayDescriptor(
+              id: 'manual_sticker_overlay_1',
+              type: VGOverlayType.sticker,
+              startTimeSeconds: 0.25,
+              durationSeconds: 2.0,
+              translationX: 120.0,
+              translationY: 160.0,
+              width: 360.0,
+              height: 240.0,
+              opacity: 1.0,
+              zIndex: 10,
+              assetPath: _tempPathC,
+            ),
+          ];
+        } else {
+          // still_C.png temp path not yet ready — fall back to off.
+          overlays = const [];
+        }
+        break;
+    }
+
     // Build transition-aware timeline layout (preserving canvas dimensions)
     final draft = VGEditorDraft.sequentialWithTransitions(
       id: 'manual-test-draft-${DateTime.now().millisecondsSinceEpoch}',
@@ -418,6 +666,7 @@ class _VanguardManualTestPlaygroundState
       canvasWidth: _canvasWidth,
       canvasHeight: _canvasHeight,
       fps: _fps,
+      overlays: overlays,
     );
 
     final controller = VGEditorController(initialDraft: draft);
@@ -1129,6 +1378,10 @@ class _VanguardManualTestPlaygroundState
                         _buildSetupControlsCard(),
                         const SizedBox(height: 12),
 
+                        // ── Phase 7.23B: Transform Keyframe Controls ──────────
+                        _buildKeyframeModeCard(),
+                        const SizedBox(height: 12),
+
                         // ── Phase 7.11: Clip A Transform Controls ─────────────
                         _buildTransformCard(
                           clipLabel: 'CLIP A',
@@ -1213,6 +1466,10 @@ class _VanguardManualTestPlaygroundState
                         _buildReverseDebugCard(),
                         const SizedBox(height: 12),
 
+                        // ── Phase 7.22B-M: Time Remap Validation Card ─────────────
+                        _buildTimeRemapDebugCard(),
+                        const SizedBox(height: 12),
+
                         // ── Phase 7.20D: Reverse Sidecar Status HUD ──────────────
                         _buildSidecarStatusCard(),
                         const SizedBox(height: 12),
@@ -1239,6 +1496,10 @@ class _VanguardManualTestPlaygroundState
 
                         // ── Phase 7.18B2: Cache Metrics HUD ─────────────────────
                         _buildCacheMetricsCard(),
+                        const SizedBox(height: 12),
+
+                        // ── Phase 7.24A: Local Profiling Harness ─────────────────
+                        _buildPhase724ProfilingCard(),
                         const SizedBox(height: 24),
                       ],
                     ),
@@ -1561,6 +1822,14 @@ class _VanguardManualTestPlaygroundState
           const SizedBox(height: 6),
           Row(
             children: [
+              _buildCanvasButton(720, 1280, '720x1280 (9:16)'),
+              const SizedBox(width: 8),
+              _buildCanvasButton(1080, 1920, '1080x1920'),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
               _buildCanvasButton(1280, 720, '1280×720 @30'),
               const SizedBox(width: 8),
               _buildCanvasButton(640, 360, '640×360 @30'),
@@ -1569,6 +1838,36 @@ class _VanguardManualTestPlaygroundState
             ],
           ),
           const SizedBox(height: 12),
+
+          // ── Phase 8.8: Overlay Smoke Mode selector ──
+          const SizedBox(height: 8),
+          const Text(
+            'Overlay Smoke Mode',
+            style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 4),
+          DropdownButton<_ManualOverlaySmokeMode>(
+            value: _overlaySmokeMode,
+            dropdownColor: const Color(0xFF2C2C2E),
+            style: const TextStyle(color: Colors.white, fontSize: 13),
+            isExpanded: true,
+            underline: Container(height: 1, color: Colors.white24),
+            items: const [
+              DropdownMenuItem(value: _ManualOverlaySmokeMode.off, child: Text('Off')),
+              DropdownMenuItem(value: _ManualOverlaySmokeMode.debugRectangle, child: Text('Debug Rectangle Fallback')),
+              DropdownMenuItem(value: _ManualOverlaySmokeMode.text, child: Text('Text: Hello Phase 8.8')),
+              DropdownMenuItem(value: _ManualOverlaySmokeMode.emoji, child: Text('Emoji: 🔥')),
+              // Phase 8.9: sticker smoke mode using still_C.png fixture.
+              DropdownMenuItem(value: _ManualOverlaySmokeMode.sticker, child: Text('Sticker: still_C.png')),
+            ],
+            onChanged: (v) {
+              if (v != null) {
+                setState(() => _overlaySmokeMode = v);
+                _rebuildTimeline();
+              }
+            },
+          ),
+          const SizedBox(height: 4),
 
           // ── Status Line ──
           Row(
@@ -1588,6 +1887,76 @@ class _VanguardManualTestPlaygroundState
             ],
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildKeyframeModeCard() {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.white10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'PHASE 7.23B — TRANSFORM KEYFRAMES (DEV ONLY)',
+            style: TextStyle(
+              color: Color(0xFF6C7A9C),
+              fontSize: 10,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.2,
+            ),
+          ),
+          const SizedBox(height: 12),
+          const Text(
+            'Overrides static transform when ON.',
+            style: TextStyle(color: Colors.white54, fontSize: 11),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              _buildKfButton(0, 'Off (Static)'),
+              _buildKfButton(1, 'Scale'),
+              _buildKfButton(2, 'Translate'),
+              _buildKfButton(3, 'Opacity'),
+              _buildKfButton(4, 'Combined'),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildKfButton(int mode, String label) {
+    final active = _keyframeMode == mode;
+    return GestureDetector(
+      onTap: () {
+        setState(() => _keyframeMode = mode);
+        _rebuildTimeline();
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        decoration: BoxDecoration(
+          color: active ? const Color(0xFF6C63FF) : Colors.white.withValues(alpha: 0.03),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: active ? const Color(0xFF6C63FF) : Colors.white10,
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: active ? Colors.white : Colors.white54,
+            fontSize: 10,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
       ),
     );
   }
@@ -2332,6 +2701,157 @@ class _VanguardManualTestPlaygroundState
               backgroundColor: const Color(0xFFFF6B6B),
               foregroundColor: Colors.white,
               padding: const EdgeInsets.symmetric(vertical: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Phase 7.22B-M: Time Remap Manual Validation Card ─────────────────────
+  //
+  // DEV-only harness for Hanif to validate Phase 7.22B PTS mapping.
+  // Selecting a mode rebuilds the timeline with the corresponding
+  // VGTimeRemapDescriptor injected into Clip A. Clip B is unaffected.
+  //
+  // Validation questions:
+  //   Fast 2×: does Clip A play at double speed (ends ~2s on timeline)?  PASS/FAIL
+  //   Slow 0.5×: does Clip A play at half speed (ends ~4s on timeline)?  PASS/FAIL
+  //   Off: does playback match pre-7.22B normal speed?                   PASS/FAIL
+  Widget _buildTimeRemapDebugCard() {
+    final bool isOff  = _timeRemapMode == 'off';
+    final bool isFast = _timeRemapMode == 'fast';
+    final bool isSlow = _timeRemapMode == 'slow';
+    const Color kAccent = Color(0xFF00D4AA);
+
+    Widget modeButton(String mode, String label, String detail, Color col) {
+      final bool selected = _timeRemapMode == mode;
+      return Expanded(
+        child: GestureDetector(
+          onTap: () {
+            if (_timeRemapMode == mode) return;
+            setState(() => _timeRemapMode = mode);
+            _rebuildTimeline();
+          },
+          child: AnimatedContainer(
+            duration: const Duration(milliseconds: 180),
+            padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
+            decoration: BoxDecoration(
+              color: selected ? col.withValues(alpha: 0.18) : Colors.transparent,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: selected ? col : Colors.white12,
+                width: selected ? 1.5 : 1.0,
+              ),
+            ),
+            child: Column(
+              children: [
+                Text(
+                  label,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: selected ? col : Colors.white38,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  detail,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: selected ? col.withValues(alpha: 0.8) : Colors.white24,
+                    fontSize: 9,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    final String statusLine;
+    if (isFast) {
+      final c = _controller;
+      final tld = c != null
+          ? c.draft.clips.where((cl) => cl.id == 'clip-A').firstOrNull?.timelineDuration
+          : null;
+      statusLine = tld != null
+          ? 'Clip A timelineDuration: ${tld.toStringAsFixed(2)}s (expected ~2.00s)'
+          : 'Fast 2× active — rebuild to see Clip A duration';
+    } else if (isSlow) {
+      final c = _controller;
+      final tld = c != null
+          ? c.draft.clips.where((cl) => cl.id == 'clip-A').firstOrNull?.timelineDuration
+          : null;
+      statusLine = tld != null
+          ? 'Clip A timelineDuration: ${tld.toStringAsFixed(2)}s (expected ~4.00s)'
+          : 'Slow 0.5× active — rebuild to see Clip A duration';
+    } else {
+      statusLine = 'Off — legacy speed path (timeRemap = null). Baseline playback.';
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1F1E29),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: isOff ? Colors.white10 : kAccent.withValues(alpha: 0.5),
+          width: isOff ? 1.0 : 1.5,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.speed_outlined, color: Color(0xFF00D4AA), size: 14),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  'PHASE 7.22B — TIME REMAP (DEV ONLY)',
+                  style: TextStyle(
+                    color: Color(0xFF00D4AA),
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.2,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 3),
+          const Text(
+            'Injects VGTimeRemapDescriptor into Clip A. '
+            'Verify: Fast plays at 2× speed; Slow plays at 0.5× speed; Off is normal.',
+            style: TextStyle(color: Colors.white38, fontSize: 10),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              modeButton('off',  'Off',      'Normal\n(no remap)',    Colors.white54),
+              const SizedBox(width: 6),
+              modeButton('fast', 'Fast 2×',  '[0,4)@2.0×\n→ ~2.0s',  const Color(0xFFFFB300)),
+              const SizedBox(width: 6),
+              modeButton('slow', 'Slow 0.5×', '[0,2)@0.5×\n→ ~4.0s', const Color(0xFF64B5F6)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: Colors.black26,
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(
+              statusLine,
+              style: TextStyle(
+                color: isOff ? Colors.white38 : kAccent,
+                fontSize: 10,
+                fontFamily: 'monospace',
+              ),
             ),
           ),
         ],
@@ -3846,6 +4366,485 @@ class _VanguardManualTestPlaygroundState
                 ),
               ),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Phase 7.24A: Scenario Actions (LOCAL PROFILING — DO NOT COMMIT) ─────────
+
+  Future<void> _run724HighResStills() async {
+    final c = _controller;
+    if (c == null || !_hiResAssetsReady || _phase724Busy) return;
+    final hr1 = _tempPathHiRes1; final hr2 = _tempPathHiRes2;
+    final hr3 = _tempPathHiRes3; final hr4 = _tempPathHiRes4;
+    if (hr1 == null || hr2 == null || hr3 == null || hr4 == null) return;
+    setState(() { _phase724Busy = true; _phase724Scenario = 1;
+      _phase724Status = '[RR-148/154/155] Building 4×high-res still timeline...'; });
+    try {
+      // Dispose current timeline before building profiling draft.
+      _channel.setMethodCallHandler(null);
+      await c.disposeAsync().catchError((_) {});
+      c.dispose();
+      _controller = null;
+
+      // 4×HEIC/JPEG images, 6s each, portrait 720×1280, no transitions.
+      const double kHold = 6.0;
+      final clips = [
+        VGClipDescriptor(id: 'hr1', sourcePath: hr1, mediaKind: VGMediaKind.image,
+            durationSeconds: kHold, trimStartSeconds: 0.0, trimEndSeconds: kHold),
+        VGClipDescriptor(id: 'hr2', sourcePath: hr2, mediaKind: VGMediaKind.image,
+            durationSeconds: kHold, trimStartSeconds: 0.0, trimEndSeconds: kHold),
+        VGClipDescriptor(id: 'hr3', sourcePath: hr3, mediaKind: VGMediaKind.image,
+            durationSeconds: kHold, trimStartSeconds: 0.0, trimEndSeconds: kHold),
+        VGClipDescriptor(id: 'hr4', sourcePath: hr4, mediaKind: VGMediaKind.image,
+            durationSeconds: kHold, trimStartSeconds: 0.0, trimEndSeconds: kHold),
+      ];
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'p724-stills-${DateTime.now().millisecondsSinceEpoch}',
+        clips: clips, transitions: [],
+        canvasWidth: 720, canvasHeight: 1280, fps: 30,
+      );
+      final nc = VGEditorController(initialDraft: draft);
+      _channel.setMethodCallHandler(nc.handleNativeCallback);
+      setState(() { _controller = nc; _seekDragValue = null; _exportResult = null;
+        _trimApplied = false; _splitApplied = false; _reorderApplied = false;
+        _freezeApplied = false; _reverseApplied = false;
+        _sidecarStatuses = null; _sidecarBusy = false; });
+      await nc.initialize();
+      if (mounted) setState(() {
+        _phase724Status = '[RR-148/154/155] Hi-res stills timeline ACTIVE. '
+            'Scrub slider. Watch Instruments + cache HUD. '
+            'Fetch Cache Stats to record hits/misses/bytes.';
+      });
+    } catch (e) {
+      if (mounted) setState(() { _phase724Status = 'HighResStills error: $e'; });
+    } finally {
+      if (mounted) setState(() => _phase724Busy = false);
+    }
+  }
+
+  Future<void> _run724HighResTransitions() async {
+    final c = _controller;
+    if (!_hiResAssetsReady || _phase724Busy) return;
+    final hr1 = _tempPathHiRes1; final hr2 = _tempPathHiRes2;
+    final hr3 = _tempPathHiRes3; final hr4 = _tempPathHiRes4;
+    if (hr1 == null || hr2 == null || hr3 == null || hr4 == null) return;
+    setState(() { _phase724Busy = true; _phase724Scenario = 2;
+      _phase724Status = '[RR-148/155] Building 4×hi-res still + dissolve transitions...'; });
+    try {
+      if (c != null) {
+        _channel.setMethodCallHandler(null);
+        await c.disposeAsync().catchError((_) {});
+        c.dispose();
+        _controller = null;
+      }
+      const double kHold = 6.0;
+      const double kDur  = 1.0;
+      final clips = [
+        VGClipDescriptor(id: 'hrt1', sourcePath: hr1, mediaKind: VGMediaKind.image,
+            durationSeconds: kHold, trimStartSeconds: 0.0, trimEndSeconds: kHold),
+        VGClipDescriptor(id: 'hrt2', sourcePath: hr2, mediaKind: VGMediaKind.image,
+            durationSeconds: kHold, trimStartSeconds: 0.0, trimEndSeconds: kHold),
+        VGClipDescriptor(id: 'hrt3', sourcePath: hr3, mediaKind: VGMediaKind.image,
+            durationSeconds: kHold, trimStartSeconds: 0.0, trimEndSeconds: kHold),
+        VGClipDescriptor(id: 'hrt4', sourcePath: hr4, mediaKind: VGMediaKind.image,
+            durationSeconds: kHold, trimStartSeconds: 0.0, trimEndSeconds: kHold),
+      ];
+      final transitions = [
+        VGTransitionDescriptor(id: 'tr-12', type: VGTransitionType.dissolve,
+            durationSeconds: kDur, fromClipId: 'hrt1', toClipId: 'hrt2'),
+        VGTransitionDescriptor(id: 'tr-23', type: VGTransitionType.dissolve,
+            durationSeconds: kDur, fromClipId: 'hrt2', toClipId: 'hrt3'),
+        VGTransitionDescriptor(id: 'tr-34', type: VGTransitionType.dissolve,
+            durationSeconds: kDur, fromClipId: 'hrt3', toClipId: 'hrt4'),
+      ];
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'p724-trans-${DateTime.now().millisecondsSinceEpoch}',
+        clips: clips, transitions: transitions,
+        canvasWidth: 720, canvasHeight: 1280, fps: 30,
+      );
+      final nc = VGEditorController(initialDraft: draft);
+      _channel.setMethodCallHandler(nc.handleNativeCallback);
+      setState(() { _controller = nc; _seekDragValue = null; _exportResult = null;
+        _trimApplied = false; _splitApplied = false; _reorderApplied = false;
+        _freezeApplied = false; _reverseApplied = false;
+        _sidecarStatuses = null; _sidecarBusy = false; });
+      await nc.initialize();
+      if (mounted) setState(() {
+        _phase724Status = '[RR-148/155] Hi-res transitions ACTIVE. '
+            'Scrub into dissolve zones for peak memory. '
+            'Fetch Cache Stats during overlap.';
+      });
+    } catch (e) {
+      if (mounted) setState(() { _phase724Status = 'HiResTransitions error: $e'; });
+    } finally {
+      if (mounted) setState(() => _phase724Busy = false);
+    }
+  }
+
+  Future<void> _run724MixedStress() async {
+    final c = _controller;
+    if (!_hiResAssetsReady || _phase724Busy) return;
+    final pathA = _tempPathA; final hr1 = _tempPathHiRes1;
+    if (pathA == null || hr1 == null) return;
+    setState(() { _phase724Busy = true; _phase724Scenario = 3;
+      _phase724Status = '[RR-154/155] Building mixed stress timeline (video+still+freeze+keyframe)...'; });
+    try {
+      if (c != null) {
+        _channel.setMethodCallHandler(null);
+        await c.disposeAsync().catchError((_) {});
+        c.dispose();
+        _controller = null;
+      }
+      // Scale keyframe on video clip — same as existing _keyframeMode==1 pattern.
+      final track = VGTransformTrackDescriptor(
+        keyframes: const [
+          VGTransformKeyframeDescriptor(timeUs: 0,       scaleX: 1.0, scaleY: 1.0, translationX: 0, translationY: 0, rotation: 0, opacity: 1.0),
+          VGTransformKeyframeDescriptor(timeUs: 2000000, scaleX: 1.5, scaleY: 1.5, translationX: 0, translationY: 0, rotation: 0, opacity: 0.8),
+          VGTransformKeyframeDescriptor(timeUs: 4000000, scaleX: 1.0, scaleY: 1.0, translationX: 0, translationY: 0, rotation: 0, opacity: 1.0),
+        ],
+        interpolation: VGKeyframeInterpolation.linear,
+        anchorX: 0.5, anchorY: 0.5,
+      );
+      // Video clip A with keyframe track.
+      final clipVideo = VGClipDescriptor(
+        id: 'mx-video', sourcePath: pathA,
+        durationSeconds: 5.06, trimStartSeconds: 0.0, trimEndSeconds: 5.06,
+        transformTrack: track,
+      );
+      // High-res image hold.
+      const double kHold = 5.0;
+      final clipImage = VGClipDescriptor(
+        id: 'mx-image', sourcePath: hr1, mediaKind: VGMediaKind.image,
+        durationSeconds: kHold, trimStartSeconds: 0.0, trimEndSeconds: kHold,
+      );
+      final clips = [clipVideo, clipImage];
+      final transitions = [
+        VGTransitionDescriptor(id: 'mx-tr', type: VGTransitionType.dissolve,
+            durationSeconds: 1.0, fromClipId: 'mx-video', toClipId: 'mx-image'),
+      ];
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'p724-mixed-${DateTime.now().millisecondsSinceEpoch}',
+        clips: clips, transitions: transitions,
+        canvasWidth: 720, canvasHeight: 1280, fps: 30,
+      );
+      final nc = VGEditorController(initialDraft: draft);
+      _channel.setMethodCallHandler(nc.handleNativeCallback);
+      setState(() { _controller = nc; _seekDragValue = null; _exportResult = null;
+        _trimApplied = false; _splitApplied = false; _reorderApplied = false;
+        _freezeApplied = false; _reverseApplied = false;
+        _sidecarStatuses = null; _sidecarBusy = false; });
+      await nc.initialize();
+      if (mounted) setState(() {
+        _phase724Status = '[RR-154/155] Mixed stress ACTIVE: video+keyframe→hi-res image dissolve. '
+            'Scrub the transition zone. Use Freeze Debug card to add freeze frame.';
+      });
+    } catch (e) {
+      if (mounted) setState(() { _phase724Status = 'MixedStress error: $e'; });
+    } finally {
+      if (mounted) setState(() => _phase724Busy = false);
+    }
+  }
+
+  Future<void> _run724LongReverse() async {
+    final c = _controller;
+    if (!_hiResAssetsReady || _phase724Busy) return;
+    final v60 = _tempPath60sVideo;
+    if (v60 == null) return;
+    setState(() { _phase724Busy = true; _phase724Scenario = 4;
+      _phase724Status = '[RR-157] Building 60s reverse clip timeline...'; });
+    try {
+      if (c != null) {
+        _channel.setMethodCallHandler(null);
+        await c.disposeAsync().catchError((_) {});
+        c.dispose();
+        _controller = null;
+      }
+      // Single 60s reversed clip. isReversed drives the sidecar path.
+      const double kDur = 60.0;
+      final clipLong = VGClipDescriptor(
+        id: 'long-rev', sourcePath: v60,
+        durationSeconds: kDur, trimStartSeconds: 0.0, trimEndSeconds: kDur,
+        isReversed: true,
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'p724-longrev-${DateTime.now().millisecondsSinceEpoch}',
+        clips: [clipLong], transitions: [],
+        canvasWidth: 720, canvasHeight: 1280, fps: 30,
+      );
+      final nc = VGEditorController(initialDraft: draft);
+      _channel.setMethodCallHandler(nc.handleNativeCallback);
+      setState(() { _controller = nc; _seekDragValue = null; _exportResult = null;
+        _trimApplied = false; _splitApplied = false; _reorderApplied = false;
+        _freezeApplied = false; _reverseApplied = true;
+        _sidecarStatuses = null; _sidecarBusy = false; });
+      await nc.initialize();
+      if (mounted) setState(() {
+        _phase724Status = '[RR-157] 60s reversed clip ACTIVE. '
+            'Tap "Prepare Sidecars" in the Reverse Sidecar card. '
+            'Observe first-pull stutter in Instruments Time Profiler.';
+      });
+    } catch (e) {
+      if (mounted) setState(() { _phase724Status = 'LongReverse error: $e'; });
+    } finally {
+      if (mounted) setState(() => _phase724Busy = false);
+    }
+  }
+
+  Future<void> _run724ShortReverse() async {
+    final c = _controller;
+    if (!_hiResAssetsReady || _phase724Busy) return;
+    final v10 = _tempPath10sVideo;
+    if (v10 == null) return;
+    setState(() { _phase724Busy = true; _phase724Scenario = 5;
+      _phase724Status = '[Phase 7.24A] Building 10s short reverse clip timeline...'; });
+    try {
+      if (c != null) {
+        _channel.setMethodCallHandler(null);
+        await c.disposeAsync().catchError((_) {});
+        c.dispose();
+        _controller = null;
+      }
+      // Single <=10s reversed clip.
+      const double kDur = 9.8;
+      final clipShort = VGClipDescriptor(
+        id: 'short-rev', sourcePath: v10,
+        durationSeconds: kDur, trimStartSeconds: 0.0, trimEndSeconds: kDur,
+        isReversed: true,
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'p724-shortrev-${DateTime.now().millisecondsSinceEpoch}',
+        clips: [clipShort], transitions: [],
+        canvasWidth: 720, canvasHeight: 1280, fps: 30,
+      );
+      final nc = VGEditorController(initialDraft: draft);
+      _channel.setMethodCallHandler(nc.handleNativeCallback);
+      setState(() { _controller = nc; _seekDragValue = null; _exportResult = null;
+        _trimApplied = false; _splitApplied = false; _reorderApplied = false;
+        _freezeApplied = false; _reverseApplied = true;
+        _sidecarStatuses = null; _sidecarBusy = false; });
+      await nc.initialize();
+      if (mounted) setState(() {
+        _phase724Status = '[Phase 7.24A] Short reversed clip ACTIVE. '
+            'Observe inline extraction memory stability.';
+      });
+    } catch (e) {
+      if (mounted) setState(() { _phase724Status = 'ShortReverse error: $e'; });
+    } finally {
+      if (mounted) setState(() => _phase724Busy = false);
+    }
+  }
+
+  // ── Phase 7.24A: Profiling Card (LOCAL ONLY — DO NOT COMMIT) ─────────────────
+
+  Widget _buildPhase724ProfilingCard() {
+    const Color kAccent  = Color(0xFFFFB347); // amber — visually distinct
+    const Color kWarning = Color(0xFFFF6B35); // orange-red for DEV-only label
+    final bool assetsReady = _hiResAssetsReady;
+    final bool isIdle      = !_phase724Busy;
+
+    Widget _scenarioBtn(String label, int scenario, VoidCallback? onTap) {
+      final active = _phase724Scenario == scenario;
+      return Expanded(
+        child: GestureDetector(
+          onTap: (assetsReady && isIdle) ? onTap : null,
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            decoration: BoxDecoration(
+              color: active
+                  ? kAccent.withValues(alpha: 0.85)
+                  : Colors.white.withValues(alpha: 0.04),
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                color: active ? kAccent : Colors.white12,
+              ),
+            ),
+            alignment: Alignment.center,
+            child: Text(
+              label,
+              textAlign: TextAlign.center,
+              style: TextStyle(
+                color: active ? Colors.white
+                    : (assetsReady && isIdle) ? Colors.white54 : Colors.white24,
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1A1710),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: kAccent.withValues(alpha: assetsReady ? 0.6 : 0.25),
+          width: 1.5,
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // ── Header ──────────────────────────────────────────────────────────
+          Row(
+            children: [
+              const Icon(Icons.science_outlined, color: kAccent, size: 14),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  'PHASE 7.24A PROFILING — DEV ONLY',
+                  style: TextStyle(
+                    color: kAccent,
+                    fontSize: 10,
+                    fontWeight: FontWeight.w700,
+                    letterSpacing: 1.0,
+                  ),
+                ),
+              ),
+              if (_phase724Busy)
+                const SizedBox(
+                  width: 12, height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.5, color: kAccent,
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'LOCAL PROFILING — DO NOT COMMIT MEDIA\n'
+            'Assets: IMG_3756 2.MOV (60s), IMG_3768.MOV (10s), IMG_3757.JPG, '
+            'IMG_3758.JPG, IMG_3762.HEIC, IMG_3763.HEIC',
+            style: TextStyle(
+              color: kWarning.withValues(alpha: 0.8),
+              fontSize: 9,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 0.3,
+            ),
+          ),
+          const SizedBox(height: 8),
+
+          // ── Asset readiness ──────────────────────────────────────────────────
+          Row(
+            children: [
+              Container(
+                width: 8, height: 8,
+                decoration: BoxDecoration(
+                  color: assetsReady ? const Color(0xFF00D4AA) : Colors.white24,
+                  shape: BoxShape.circle,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  assetsReady
+                      ? 'Hi-res assets copied to temp — ready.'
+                      : 'Copying hi-res assets to temp (large files)…',
+                  style: TextStyle(
+                    color: assetsReady ? const Color(0xFF00D4AA) : Colors.white38,
+                    fontSize: 10,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+
+          // ── Scenario buttons row 1 ───────────────────────────────────────────
+          Row(
+            children: [
+              _scenarioBtn('Hi-res\nStills', 1, _run724HighResStills),
+              const SizedBox(width: 6),
+              _scenarioBtn('Hi-res\nTransitions', 2, _run724HighResTransitions),
+              const SizedBox(width: 6),
+              _scenarioBtn('Mixed\nStress', 3, _run724MixedStress),
+            ],
+          ),
+          const SizedBox(height: 6),
+          // ── Scenario buttons row 2 ───────────────────────────────────────────
+          Row(
+            children: [
+              _scenarioBtn('Long\nReverse', 4, _run724LongReverse),
+              const SizedBox(width: 6),
+              _scenarioBtn('Short\nReverse <=10s', 5, _run724ShortReverse),
+              const SizedBox(width: 6),
+              Expanded(child: const SizedBox()),
+            ],
+          ),
+          const SizedBox(height: 8),
+
+          // ── Cache flush shortcut ─────────────────────────────────────────────
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: _controller != null && !_fetchingStats
+                      ? _fetchCacheStats
+                      : null,
+                  icon: const Icon(Icons.refresh_outlined, size: 13),
+                  label: const Text('Refresh Cache Stats'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF6C63FF),
+                    foregroundColor: Colors.white,
+                    disabledBackgroundColor: Colors.white10,
+                    disabledForegroundColor: Colors.white24,
+                    padding: const EdgeInsets.symmetric(vertical: 9),
+                    textStyle: const TextStyle(fontSize: 11),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ElevatedButton.icon(
+                  onPressed: _controller != null && !_fetchingStats
+                      ? _clearCache
+                      : null,
+                  icon: const Icon(Icons.delete_outline, size: 13),
+                  label: const Text('Clear Cache'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.redAccent,
+                    foregroundColor: Colors.white,
+                    disabledBackgroundColor: Colors.white10,
+                    disabledForegroundColor: Colors.white24,
+                    padding: const EdgeInsets.symmetric(vertical: 9),
+                    textStyle: const TextStyle(fontSize: 11),
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+
+          // ── Status line ─────────────────────────────────────────────────────
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.black26,
+              borderRadius: BorderRadius.circular(6),
+            ),
+            child: Text(
+              _phase724Status,
+              style: const TextStyle(
+                color: Colors.white70,
+                fontSize: 10,
+                fontFamily: 'monospace',
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 8),
+          const Text(
+            'After each scenario:\n'
+            '  1. Tap "Refresh Cache Stats" → record hits/misses/bytes.\n'
+            '  2. Instruments → Allocations: note phys_footprint peak.\n'
+            '  3. Xcode Debug → Simulate Memory Warning → re-check cache bytes.\n'
+            '  4. For Long Reverse: tap Prepare Sidecars in the Reverse Sidecar card.',
+            style: TextStyle(color: Colors.white30, fontSize: 9),
           ),
         ],
       ),
