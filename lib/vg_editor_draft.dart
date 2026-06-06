@@ -53,6 +53,19 @@
 //     sequentialWithTransitions. Dart is the single source of truth for reorder
 //     logic and transition relinking (DEC-148).
 //
+// Phase 8.2 additions (additive bridge):
+//   - VGEditorDraft now carries an optional VGCanvasDescriptor? canvas field.
+//   - canvas is null by default; legacy canvasWidth / canvasHeight remain the
+//     primary compatibility fields and are unchanged.
+//   - toMap() emits root 'canvasWidth' / 'canvasHeight' unconditionally (native
+//     Swift plugin reads these root keys), and emits nested 'canvas' map only
+//     when canvas != null.
+//   - fromMap() parses nested 'canvas' if present; otherwise leaves canvas null.
+//   - resolvedCanvas is a convenience getter: returns canvas if non-null,
+//     otherwise constructs a VGCanvasDescriptor from canvasWidth / canvasHeight.
+//   - All internal draft reconstruction calls pass canvas: canvas so the canvas
+//     reference survives trim, split, freeze, reverse, and reorder operations.
+//
 // Consumed by VGEditorController (Stage 7.7) to coordinate channel calls.
 //
 // Serialisation:
@@ -66,6 +79,7 @@
 //     'fps': int,
 //   }
 
+import 'vg_canvas_descriptor.dart';
 import 'vg_clip_descriptor.dart';
 import 'vg_transition_descriptor.dart';
 
@@ -101,6 +115,12 @@ final class VGEditorDraft {
   /// [canvasWidth] and [canvasHeight] must both be > 0.
   ///
   /// [fps] must be > 0.
+  ///
+  /// [canvas] is an optional [VGCanvasDescriptor] that enriches the canvas
+  /// geometry with contentMode, backgroundColor, and safe-zone insets.
+  /// When null, the draft uses [canvasWidth] / [canvasHeight] alone (Phase 7
+  /// behaviour). Phase 8.2 additive bridge — native Swift plugin is unaffected
+  /// because [toMap] still emits the root canvasWidth / canvasHeight keys.
   VGEditorDraft({
     required this.id,
     required List<VGClipDescriptor> clips,
@@ -108,6 +128,7 @@ final class VGEditorDraft {
     this.canvasWidth = 640,
     this.canvasHeight = 360,
     this.fps = 30,
+    this.canvas,
   })  : clips = List.unmodifiable(clips),
         transitions = List.unmodifiable(transitions),
         assert(id.isNotEmpty, 'VGEditorDraft: id must not be empty'),
@@ -170,6 +191,8 @@ final class VGEditorDraft {
     int canvasWidth = 640,
     int canvasHeight = 360,
     int fps = 30,
+    // Phase 8.2: optional canvas passes through to the constructed draft.
+    VGCanvasDescriptor? canvas,
   }) {
     assert(clips.isNotEmpty,
         'VGEditorDraft.sequentialWithTransitions: clips must not be empty');
@@ -205,6 +228,7 @@ final class VGEditorDraft {
       canvasWidth: canvasWidth,
       canvasHeight: canvasHeight,
       fps: fps,
+      canvas: canvas,
     );
   }
 
@@ -247,6 +271,27 @@ final class VGEditorDraft {
   /// Target frame rate for playback and export. Must be > 0.
   final int fps;
 
+  /// Optional rich canvas descriptor (Phase 8.2 additive bridge).
+  ///
+  /// When non-null, carries content-mode, background colour, and safe-zone
+  /// information in addition to the raw pixel dimensions.
+  ///
+  /// **Backward-compatibility guarantee**: this field is additive. When null
+  /// (the default), all Phase 7 behaviour is unchanged. The native Swift plugin
+  /// always reads the root `canvasWidth` / `canvasHeight` keys from [toMap],
+  /// which are emitted unconditionally regardless of this field.
+  ///
+  /// Use [resolvedCanvas] to obtain a non-nullable descriptor.
+  final VGCanvasDescriptor? canvas;
+
+  /// Returns [canvas] if explicitly set, otherwise constructs a minimal
+  /// [VGCanvasDescriptor] from [canvasWidth] and [canvasHeight].
+  ///
+  /// Callers that need a non-nullable canvas (e.g. overlay validation) should
+  /// use this getter rather than accessing [canvas] directly.
+  VGCanvasDescriptor get resolvedCanvas =>
+      canvas ?? VGCanvasDescriptor(width: canvasWidth, height: canvasHeight);
+
   // ── Derived helpers ────────────────────────────────────────────────────────
 
   /// Total wall-clock duration of the timeline in seconds.
@@ -278,6 +323,13 @@ final class VGEditorDraft {
 
   /// Serialises this draft to a JSON-compatible map.
   ///
+  /// The root `canvasWidth` and `canvasHeight` keys are always emitted so that
+  /// the native Swift plugin (which reads these root keys directly) requires no
+  /// changes in Phase 8.2.
+  ///
+  /// When [canvas] is non-null, a nested `'canvas'` map is additionally emitted
+  /// so that Phase 8.3+ consumers can read the full canvas descriptor.
+  ///
   /// Output shape:
   /// ```json
   /// {
@@ -286,17 +338,27 @@ final class VGEditorDraft {
   ///   "transitions": [...],
   ///   "canvasWidth": 640,
   ///   "canvasHeight": 360,
-  ///   "fps": 30
+  ///   "fps": 30,
+  ///   "canvas": { ... }   // omitted when canvas == null
   /// }
   /// ```
-  Map<String, Object?> toMap() => <String, Object?>{
-        'id': id,
-        'clips': clips.map((c) => c.toMap()).toList(),
-        'transitions': transitions.map((t) => t.toMap()).toList(),
-        'canvasWidth': canvasWidth,
-        'canvasHeight': canvasHeight,
-        'fps': fps,
-      };
+  Map<String, Object?> toMap() {
+    final m = <String, Object?>{
+      'id': id,
+      'clips': clips.map((c) => c.toMap()).toList(),
+      'transitions': transitions.map((t) => t.toMap()).toList(),
+      'canvasWidth': canvasWidth,
+      'canvasHeight': canvasHeight,
+      'fps': fps,
+    };
+    // Phase 8.2: emit nested canvas map only when explicitly set.
+    // Root canvasWidth / canvasHeight keys above always satisfy the native
+    // Swift plugin — no native-side changes are needed.
+    if (canvas != null) {
+      m['canvas'] = canvas!.toMap();
+    }
+    return m;
+  }
 
   /// Deserialises a [VGEditorDraft] from a map produced by [toMap].
   ///
@@ -337,6 +399,14 @@ final class VGEditorDraft {
 
     if (canvasWidth <= 0 || canvasHeight <= 0 || fps <= 0) return null;
 
+    // Phase 8.2: parse nested 'canvas' map if present and valid.
+    // Falls back to null when the key is missing (Phase 7 / legacy drafts).
+    VGCanvasDescriptor? canvas;
+    final rawCanvas = map['canvas'];
+    if (rawCanvas is Map<Object?, Object?>) {
+      canvas = VGCanvasDescriptor.fromMap(rawCanvas);
+    }
+
     return VGEditorDraft(
       id: id,
       clips: clips,
@@ -344,6 +414,7 @@ final class VGEditorDraft {
       canvasWidth: canvasWidth,
       canvasHeight: canvasHeight,
       fps: fps,
+      canvas: canvas,
     );
   }
 
@@ -424,6 +495,7 @@ final class VGEditorDraft {
       canvasWidth: canvasWidth,
       canvasHeight: canvasHeight,
       fps: fps,
+      canvas: canvas,
     );
   }
 
@@ -594,6 +666,7 @@ final class VGEditorDraft {
       canvasWidth: canvasWidth,
       canvasHeight: canvasHeight,
       fps: fps,
+      canvas: canvas,
     );
   }
 
@@ -817,6 +890,7 @@ final class VGEditorDraft {
       canvasWidth: canvasWidth,
       canvasHeight: canvasHeight,
       fps: fps,
+      canvas: canvas,
     );
   }
 
@@ -887,6 +961,7 @@ final class VGEditorDraft {
       canvasWidth: canvasWidth,
       canvasHeight: canvasHeight,
       fps: fps,
+      canvas: canvas,
     );
   }
 
@@ -1038,6 +1113,7 @@ final class VGEditorDraft {
       canvasWidth: canvasWidth,
       canvasHeight: canvasHeight,
       fps: fps,
+      canvas: canvas,
     );
   }
 
@@ -1046,6 +1122,12 @@ final class VGEditorDraft {
   /// Returns a copy of this draft with the specified fields replaced.
   ///
   /// Validation asserts are enforced on the new instance.
+  ///
+  /// **Phase 8.2 note on [canvas]**: passing `canvas: someDescriptor` replaces
+  /// the canvas. Omitting the parameter (or passing `null`) preserves the
+  /// existing canvas value. There is intentionally no "clear canvas" sentinel
+  /// in Phase 8.2 — if clearing is needed in a future phase, a separate
+  /// `clearCanvas()` method should be added rather than abusing `null`.
   VGEditorDraft copyWith({
     String? id,
     List<VGClipDescriptor>? clips,
@@ -1053,6 +1135,7 @@ final class VGEditorDraft {
     int? canvasWidth,
     int? canvasHeight,
     int? fps,
+    VGCanvasDescriptor? canvas,
   }) {
     return VGEditorDraft(
       id: id ?? this.id,
@@ -1061,6 +1144,7 @@ final class VGEditorDraft {
       canvasWidth: canvasWidth ?? this.canvasWidth,
       canvasHeight: canvasHeight ?? this.canvasHeight,
       fps: fps ?? this.fps,
+      canvas: canvas ?? this.canvas,
     );
   }
 
@@ -1075,7 +1159,8 @@ final class VGEditorDraft {
           _listEqual(other.transitions, transitions) &&
           other.canvasWidth == canvasWidth &&
           other.canvasHeight == canvasHeight &&
-          other.fps == fps;
+          other.fps == fps &&
+          other.canvas == canvas;
 
   @override
   int get hashCode => Object.hash(
@@ -1085,6 +1170,7 @@ final class VGEditorDraft {
         canvasWidth,
         canvasHeight,
         fps,
+        canvas,
       );
 
   @override
@@ -1092,7 +1178,8 @@ final class VGEditorDraft {
       'id: $id, '
       'clips: ${clips.length}, '
       'transitions: ${transitions.length}, '
-      'canvas: $canvasWidth\u00d7$canvasHeight, '
+      'canvas: $canvasWidth\u00d7$canvasHeight'
+      '${canvas != null ? " (VGCanvasDescriptor)" : ""}, '
       'fps: $fps, '
       'duration: ${durationSeconds.toStringAsFixed(2)}s)';
 }

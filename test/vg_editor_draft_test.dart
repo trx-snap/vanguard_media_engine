@@ -1,5 +1,5 @@
 // vg_editor_draft_test.dart
-// Vanguard Media Engine — Phase 7 Stage 7.7 / Phase 7.11
+// Vanguard Media Engine — Phase 7 Stage 7.7 / Phase 7.11 / Phase 8.2
 //
 // Pure Dart unit tests for VGEditorDraft.
 //
@@ -12,8 +12,10 @@
 //   - copyWith mutations
 //   - equality / hashCode
 //   - Phase 7.11: sequentialWithTransitions preserves clip.transform (D6)
+//   - Phase 8.2: VGCanvasDescriptor additive bridge
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:vanguard_media_engine/vg_canvas_descriptor.dart';
 import 'package:vanguard_media_engine/vg_clip_descriptor.dart';
 import 'package:vanguard_media_engine/vg_clip_transform_descriptor.dart';
 import 'package:vanguard_media_engine/vg_transition_descriptor.dart';
@@ -1563,6 +1565,182 @@ void main() {
         () => draft.reverseClip(clipId: 'freeze-clip'),
         throwsArgumentError,
       );
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Phase 8.2 — VGCanvasDescriptor additive bridge
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorDraft — Phase 8.2 canvas additive bridge', () {
+    // Minimal canvas descriptor used across tests.
+    final testCanvas = VGCanvasDescriptor(
+      width: 1080,
+      height: 1920,
+      contentMode: VGCanvasContentMode.fill,
+      backgroundColor: const [0.1, 0.2, 0.3, 1.0],
+      safeAreaTop: 44.0,
+      safeAreaBottom: 34.0,
+    );
+
+    test('CD-1  default draft has canvas == null', () {
+      final d = _draft();
+      expect(d.canvas, isNull);
+    });
+
+    test('CD-2  resolvedCanvas falls back to canvasWidth / canvasHeight when canvas is null', () {
+      final d = _draft(canvasWidth: 720, canvasHeight: 1280);
+      final resolved = d.resolvedCanvas;
+      expect(resolved.width, 720);
+      expect(resolved.height, 1280);
+      // Default contentMode and background from VGCanvasDescriptor defaults.
+      expect(resolved.contentMode, VGCanvasContentMode.fit);
+      expect(resolved.backgroundColor, [0.0, 0.0, 0.0, 1.0]);
+    });
+
+    test('CD-3  resolvedCanvas returns canvas when explicitly set', () {
+      final d = VGEditorDraft(
+        id: 'cd-3',
+        clips: [_clip()],
+        canvas: testCanvas,
+      );
+      expect(d.resolvedCanvas, testCanvas);
+    });
+
+    test('CD-4  toMap() always emits legacy root canvasWidth / canvasHeight', () {
+      final d = VGEditorDraft(
+        id: 'cd-4',
+        clips: [_clip()],
+        canvasWidth: 720,
+        canvasHeight: 1280,
+        canvas: testCanvas,
+      );
+      final m = d.toMap();
+      // Root keys must always be present for native Swift plugin compat.
+      expect(m['canvasWidth'], 720);
+      expect(m['canvasHeight'], 1280);
+    });
+
+    test('CD-5  toMap() emits nested canvas map when canvas is set', () {
+      final d = VGEditorDraft(
+        id: 'cd-5',
+        clips: [_clip()],
+        canvas: testCanvas,
+      );
+      final m = d.toMap();
+      expect(m.containsKey('canvas'), isTrue);
+      final canvasMap = m['canvas'] as Map<String, Object>;
+      expect(canvasMap['width'], 1080);
+      expect(canvasMap['height'], 1920);
+      expect(canvasMap['contentMode'], 'fill');
+    });
+
+    test('CD-6  toMap() omits nested canvas when canvas is null', () {
+      final d = _draft();
+      final m = d.toMap();
+      expect(m.containsKey('canvas'), isFalse);
+    });
+
+    test('CD-7  fromMap() parses nested canvas and round-trips it', () {
+      final d = VGEditorDraft(
+        id: 'cd-7',
+        clips: [_clip()],
+        canvas: testCanvas,
+      );
+      final m = d.toMap().map((k, v) => MapEntry<Object?, Object?>(k, v));
+      final restored = VGEditorDraft.fromMap(m);
+      expect(restored, isNotNull);
+      expect(restored!.canvas, isNotNull);
+      expect(restored.canvas!.width, testCanvas.width);
+      expect(restored.canvas!.height, testCanvas.height);
+      expect(restored.canvas!.contentMode, testCanvas.contentMode);
+      expect(restored.canvas!.safeAreaTop, testCanvas.safeAreaTop);
+      expect(restored.canvas!.safeAreaBottom, testCanvas.safeAreaBottom);
+    });
+
+    test('CD-8  fromMap() without nested canvas leaves canvas == null', () {
+      // Legacy map — no 'canvas' key.
+      final result = VGEditorDraft.fromMap({
+        'id': 'cd-8',
+        'clips': [_clip().toMap()],
+        'canvasWidth': 640,
+        'canvasHeight': 360,
+        'fps': 30,
+      });
+      expect(result, isNotNull);
+      expect(result!.canvas, isNull);
+    });
+
+    test('CD-9  copyWith(canvas: ...) replaces canvas', () {
+      final d = _draft();
+      expect(d.canvas, isNull);
+      final d2 = d.copyWith(canvas: testCanvas);
+      expect(d2.canvas, testCanvas);
+      // Original is unchanged.
+      expect(d.canvas, isNull);
+    });
+
+    test('CD-10 copyWith() without canvas preserves existing canvas', () {
+      final d = VGEditorDraft(
+        id: 'cd-10',
+        clips: [_clip()],
+        canvas: testCanvas,
+      );
+      final d2 = d.copyWith(fps: 60);
+      expect(d2.canvas, testCanvas);
+      expect(d2.fps, 60);
+    });
+
+    test('CD-11 drafts with same canvas are equal', () {
+      final a = VGEditorDraft(
+        id: 'cd-11',
+        clips: [_clip()],
+        canvas: testCanvas,
+      );
+      final b = VGEditorDraft(
+        id: 'cd-11',
+        clips: [_clip()],
+        canvas: testCanvas,
+      );
+      expect(a, b);
+      expect(a.hashCode, b.hashCode);
+    });
+
+    test('CD-12 drafts with different canvas are not equal', () {
+      final a = VGEditorDraft(id: 'cd-12', clips: [_clip()]);
+      final b = VGEditorDraft(
+        id: 'cd-12',
+        clips: [_clip()],
+        canvas: testCanvas,
+      );
+      expect(a == b, isFalse);
+    });
+
+    test('CD-13 trimClip preserves canvas across non-destructive trim', () {
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'cd-13',
+        clips: [
+          _clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0),
+          _clip(id: 'clip-B', trimStart: 0.0, trimEnd: 5.0),
+        ],
+        canvas: testCanvas,
+      );
+      final trimmed = draft.trimClip(
+        clipId: 'clip-A',
+        trimStartSeconds: 0.5,
+        trimEndSeconds: 4.5,
+      );
+      expect(trimmed.canvas, testCanvas);
+    });
+
+    test('CD-14 splitClip preserves canvas across non-destructive split', () {
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'cd-14',
+        clips: [_clip(id: 'clip-A', trimStart: 0.0, trimEnd: 5.0)],
+        canvas: testCanvas,
+      );
+      final split = draft.splitClip(clipId: 'clip-A', splitSeconds: 2.5);
+      expect(split.canvas, testCanvas);
     });
   });
 }
