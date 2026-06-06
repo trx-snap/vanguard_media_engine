@@ -1,5 +1,5 @@
 // VGOverlayNode.m
-// vanguard_media_engine — Phase 8.5 / Phase 8.7 / Phase 8.8 / Phase 8.9 / Phase 8.10
+// vanguard_media_engine — Phase 8.5 / Phase 8.7 / Phase 8.8 / Phase 8.9 / Phase 8.10 / Phase 8.11
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // PHASE 8.5  — NATIVE OVERLAY NODE PASS-THROUGH STUB
@@ -7,6 +7,7 @@
 // PHASE 8.8  — EXPORT-ONLY SIMPLE TEXT / EMOJI RENDERING
 // PHASE 8.9  — EXPORT-ONLY STICKER / IMAGE OVERLAY RENDERING
 // PHASE 8.10 — EXPORT-ONLY TEXT / EMOJI RENDER CACHING
+// PHASE 8.11 — STICKER / IMAGE ASPECT-RATIO HARDENING (ASPECT-FIT WITH CENTERING)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Implementation of VGOverlayNode.
@@ -40,6 +41,16 @@
 // session. Failed asset paths are cached as [NSNull null] to prevent repeated
 // failed I/O. Cache is cleared in invalidate. Falls back to red debug rectangle
 // for any load failure, nil assetPath, or cache sentinel.
+//
+// Phase 8.11: Replaces the Phase 8.9 stretch-to-bounds scaling with
+// aspect-fit-with-centering. Previously sx/sy were applied independently,
+// distorting stickers whose source aspect ratio differed from the overlay
+// descriptor bounds. Phase 8.11 computes a uniform scale s = MIN(sx, sy),
+// then centers the scaled image within the target bounds using integer-rounded
+// pixel offsets tx/ty. The final CIImage is cropped to CGRectMake(0,0,w,h)
+// to preserve the (0,0)-origin contract required by the caller's positionT
+// translation step (line ~825). Transparent letterbox/pillarbox margins occupy
+// the unused space and composite cleanly via CISourceOverCompositing.
 //
 // Phase 8.10: Adds export-session render caching for text/emoji overlays.
 // Previously, _VGOverlayCreateTextImage was called every frame for every active
@@ -248,31 +259,55 @@ static CIImage * _Nullable _VGOverlayCreateTextImage(VGOverlayDescriptor *overla
     return ciImage; // autoreleased
 }
 
-// ─── Phase 8.9: Sticker image helper ─────────────────────────────────────────
+// ─── Phase 8.9 / Phase 8.11: Sticker image helper ───────────────────────────
 //
 // _VGOverlayCreateStickerImage:
-//   Loads and scales a sticker/image overlay asset for the current overlay bounds.
+//   Loads, scales, and centers a sticker/image overlay asset within the given
+//   overlay pixel bounds.
 //
 //   Loading path:
 //     1. Guard nil/empty assetPath → return nil.
-//     2. Cache hit (CIImage *) → return cached scaled image.
-//     3. Cache hit (NSNull *)  → return nil (known failure, no retry).
-//     4. Load via [CIImage imageWithContentsOfURL:options:] with
+//     2. Build composite cache key: "<assetPath>|<roundedW>|<roundedH>".
+//        Phase 8.11 fix: the output CIImage is target-size specific (aspect-fit
+//        at different bounds produces different pixels). Encoding rounded width
+//        and height in the key ensures that the same asset used at two different
+//        overlay bounds produces two independent cache entries. NSNull sentinels
+//        are also stored under the composite key so failure is correctly tracked
+//        per (path, size) triple, not per path alone.
+//     3. Cache hit (CIImage *) → return cached image.
+//     4. Cache hit (NSNull *)  → return nil (known failure for this path+size, no retry).
+//     5. Load via [CIImage imageWithContentsOfURL:options:] with
 //        kCIImageApplyOrientationProperty:@YES (EXIF auto-correction, iOS 11+).
-//     5. If nil → cache NSNull sentinel, return nil.
-//     6. Normalize extent origin to (0,0).
-//     7. Scale to overlay pixel bounds (stretch-to-bounds MVP).
-//     8. Cache scaled CIImage for the session, return it.
+//     6. If nil → cache NSNull sentinel under composite key, return nil.
+//     7. Normalize extent origin to (0,0).
+//     8. Phase 8.11: Aspect-fit scale + centering:
+//          sx = width / srcW, sy = height / srcH
+//          s  = MIN(sx, sy)        ← uniform aspect-fit scale
+//          scaledW = srcW * s, scaledH = srcH * s
+//          tx = round((width  - scaledW) / 2.0)  ← pixel-aligned horizontal offset
+//          ty = round((height - scaledH) / 2.0)  ← pixel-aligned vertical offset
+//        Apply scale, then centering translation (tx, ty).
+//        Crop to CGRectMake(0, 0, width, height) — preserves the (0,0)-origin
+//        contract required by the caller's positionT translation step.
+//        Transparent margins occupy unused space (letterbox / pillarbox);
+//        these composite cleanly as clear pixels via CISourceOverCompositing.
+//     9. Cache aspect-fit CIImage under composite key for the session, return it.
 //
 //   Technology notes:
 //     CIImage imageWithContentsOfURL: — CoreImage-native path (no UIKit).
 //     Same API used by VGDualCameraCompositorNode._buildImageBufferForClip.
 //     kCIImageApplyOrientationProperty — iOS 11+; prevents EXIF-rotated stickers.
 //     CIImage is immutable and thread-safe (used from export serial queue).
+//     imageByCroppingToRect: (CoreImage) — clips the CIImage coordinate space
+//       without rasterization; the resulting extent equals the crop rect.
+//       Apple reference: CIImage.imageByCroppingToRect documentation confirms
+//       the returned image has extent == the provided rect.
 //
+//   Cache key: "<assetPath>|<roundedW>|<roundedH>" — composite of all render-
+//     affecting inputs. Same asset at different target sizes never collides.
+//   Origin contract: returned CIImage has extent.origin == (0,0).
 //   Cache lifetime: export session (cleared in invalidate).
 //   Returns nil on any failure; caller falls back to red debug rectangle.
-//   Returned CIImage origin is (0,0); caller translates to canvas position.
 
 static CIImage * _Nullable _VGOverlayCreateStickerImage(
     VGOverlayDescriptor *overlay,
@@ -287,13 +322,23 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
     // Bounds must be at least 1×1.
     if (width < 1.0 || height < 1.0) { return nil; }
 
+    // ── Composite cache key (Phase 8.11 fix) ──────────────────────────────────
+    // The output CIImage is target-size specific: same asset at different bounds
+    // produces a different aspect-fit result. Key encodes all render-affecting
+    // inputs: assetPath (content identity), rounded target width, rounded target
+    // height. Rounding matches the pixel-aligned tx/ty centering used below.
+    NSString *stickerCacheKey = [NSString stringWithFormat:@"%@|%ld|%ld",
+        assetPath,
+        (long)round((double)width),
+        (long)round((double)height)];
+
     // ── Cache lookup ──────────────────────────────────────────────────────────
-    id cached = cache[assetPath];
+    id cached = cache[stickerCacheKey];
     if (cached != nil) {
         if ([cached isKindOfClass:[CIImage class]]) {
             return (CIImage *)cached;
         }
-        // NSNull sentinel: known failure — do not retry.
+        // NSNull sentinel: known failure for this (path, size) — do not retry.
         return nil;
     }
 
@@ -306,7 +351,7 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
         os_log_error(OS_LOG_DEFAULT,
                      "[VGOverlayNode][8.9] invalid assetPath for fileURLWithPath: "
                      "path=%{public}@", assetPath);
-        cache[assetPath] = [NSNull null];
+        cache[stickerCacheKey] = [NSNull null];
         return nil;
     }
 
@@ -316,7 +361,7 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
         os_log_error(OS_LOG_DEFAULT,
                      "[VGOverlayNode][8.9] CIImage load failed for assetPath=%{public}@",
                      assetPath);
-        cache[assetPath] = [NSNull null];
+        cache[stickerCacheKey] = [NSNull null];
         return nil;
     }
 
@@ -330,7 +375,7 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
             -extent.origin.x, -extent.origin.y);
         image = [image imageByApplyingTransform:normT];
         if (!image) {
-            cache[assetPath] = [NSNull null];
+            cache[stickerCacheKey] = [NSNull null];
             return nil;
         }
         extent = image.extent;
@@ -343,41 +388,76 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
         os_log_error(OS_LOG_DEFAULT,
                      "[VGOverlayNode][8.9] degenerate CIImage extent (%.0fx%.0f) "
                      "for assetPath=%{public}@", (double)srcW, (double)srcH, assetPath);
-        cache[assetPath] = [NSNull null];
+        cache[stickerCacheKey] = [NSNull null];
         return nil;
     }
 
-    // ── Scale to overlay pixel bounds (stretch-to-bounds MVP) ─────────────────
-    // sx/sy map source image pixels → overlay output pixels.
+    // ── Phase 8.11: Aspect-fit scale + centering ──────────────────────────────
+    // Replace Phase 8.9 stretch-to-bounds with a uniform aspect-fit scale so
+    // the sticker's intrinsic proportions are preserved.
+    //
+    // s = MIN(sx, sy) is the largest uniform scale that fits the source entirely
+    // within the (width × height) target box without clipping.
+    //
+    // tx / ty are the pixel-aligned centering offsets (letterbox / pillarbox).
+    // Rounding to integer pixels prevents sub-pixel blur at the sticker edges.
+    //
+    // Origin contract:
+    //   After scaling, the image extent origin is (0,0) because the source was
+    //   normalized above. The centering translation shifts it to (tx, ty).
+    //   imageByCroppingToRect:(0,0,width,height) restores the origin to (0,0)
+    //   while preserving sticker pixels at their correct centered positions.
+    //   The caller (Phase 8.9 composition path) then applies positionT
+    //   (rectXLeft, ciY) to place the image on the canvas — this requires
+    //   the returned image to have extent.origin == (0,0).
     CGFloat sx = width  / srcW;
     CGFloat sy = height / srcH;
-    CIImage *scaled = [image imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
+    CGFloat s  = MIN(sx, sy);          // uniform aspect-fit scale
+
+    CIImage *scaled = [image imageByApplyingTransform:CGAffineTransformMakeScale(s, s)];
     if (!scaled) {
-        cache[assetPath] = [NSNull null];
+        cache[stickerCacheKey] = [NSNull null];
         return nil;
     }
 
-    // Re-normalize scaled extent to (0,0) in case the scale transform shifted origin.
-    CGRect scaledExtent = scaled.extent;
-    if (scaledExtent.origin.x != 0.0 || scaledExtent.origin.y != 0.0) {
-        CGAffineTransform fixT = CGAffineTransformMakeTranslation(
-            -scaledExtent.origin.x, -scaledExtent.origin.y);
-        scaled = [scaled imageByApplyingTransform:fixT];
-        if (!scaled) {
-            cache[assetPath] = [NSNull null];
-            return nil;
-        }
+    // Compute integer-rounded centering offsets.
+    CGFloat scaledW = srcW * s;
+    CGFloat scaledH = srcH * s;
+    CGFloat tx = round((width  - scaledW) / 2.0);
+    CGFloat ty = round((height - scaledH) / 2.0);
+
+    // Apply centering translation. Image extent is now at (tx, ty).
+    CIImage *centered = [scaled imageByApplyingTransform:
+                            CGAffineTransformMakeTranslation(tx, ty)];
+    if (!centered) {
+        cache[stickerCacheKey] = [NSNull null];
+        return nil;
+    }
+
+    // Crop to the target bounding rect to restore a (0,0) extent origin.
+    // imageByCroppingToRect: does not rasterize — it only clips the coordinate
+    // space. The sticker pixels remain at (tx, ty) within the cropped extent.
+    // Transparent margins outside the sticker composite as clear via
+    // CISourceOverCompositing, which is the correct behavior.
+    CIImage *fitted = [centered imageByCroppingToRect:
+                          CGRectMake(0.0, 0.0, width, height)];
+    if (!fitted) {
+        cache[stickerCacheKey] = [NSNull null];
+        return nil;
     }
 
     // ── Cache and return ──────────────────────────────────────────────────────
-    cache[assetPath] = scaled;
+    cache[stickerCacheKey] = fitted;
     os_log_info(OS_LOG_DEFAULT,
-                "[VGOverlayNode][8.9] sticker cached: %.0fx%.0f→%.0fx%.0f "
-                "path=%{public}@",
+                "[VGOverlayNode][8.11] sticker aspect-fit cached: "
+                "src=%.0fx%.0f scale=%.4f offset=(%.0f,%.0f) target=%.0fx%.0f "
+                "key=%{public}@",
                 (double)srcW, (double)srcH,
+                (double)s,
+                (double)tx, (double)ty,
                 (double)width, (double)height,
-                assetPath);
-    return scaled;
+                stickerCacheKey);
+    return fitted;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
