@@ -3204,4 +3204,83 @@ void main() {
       },
     );
   });
+
+  // ── MC-15: takeMultiCamPhoto ───────────────────────────────────────────────
+  //
+  // Acceptance criteria:
+  //   MC15-1  takeMultiCamPhoto invokes channel 'takeMultiCamPhoto' with the correct path argument
+  //   MC15-2  takeMultiCamPhoto returns a populated VGPhotoCaptureResult on a valid native map
+  //   MC15-3  takeMultiCamPhoto returns null when native returns null
+  //   MC15-4  takeMultiCamPhoto returns null (not rethrow) on PlatformException
+
+  group('VGCameraSession.takeMultiCamPhoto (MC-15)', () {
+    const kPhotoPath = '/tmp/mc15_multicam_photo_001.jpg';
+
+    const kValidPhotoResponse = <Object?, Object?>{
+      'filePath':  kPhotoPath,
+      'width':     1080,
+      'height':    1920,
+      'sizeBytes': 512000,
+      'format':    'jpeg',
+    };
+
+    test(
+      'MC15-1 takeMultiCamPhoto invokes channel with method name takeMultiCamPhoto and correct path',
+      () async {
+        _responses['takeMultiCamPhoto'] = kValidPhotoResponse;
+
+        await VGCameraSession.takeMultiCamPhoto(kPhotoPath);
+
+        expect(_callCount('takeMultiCamPhoto'), equals(1),
+            reason: 'must fire exactly one takeMultiCamPhoto channel call');
+        final call = _log.firstWhere((c) => c.method == 'takeMultiCamPhoto');
+        expect(call.arguments['path'], equals(kPhotoPath),
+            reason: 'must forward path as {path: ...} argument map');
+      },
+    );
+
+    test(
+      'MC15-2 takeMultiCamPhoto returns populated VGPhotoCaptureResult from valid native map',
+      () async {
+        _responses['takeMultiCamPhoto'] = kValidPhotoResponse;
+
+        final result = await VGCameraSession.takeMultiCamPhoto(kPhotoPath);
+
+        expect(result, isNotNull,
+            reason: 'must return non-null VGPhotoCaptureResult for valid native map');
+        expect(result!.filePath,  equals(kPhotoPath));
+        expect(result.width,      equals(1080));
+        expect(result.height,     equals(1920));
+        expect(result.sizeBytes,  equals(512000));
+        expect(result.format,     equals('jpeg'));
+      },
+    );
+
+    test(
+      'MC15-3 takeMultiCamPhoto returns null when native returns null',
+      () async {
+        _responses['takeMultiCamPhoto'] = null;
+
+        final result = await VGCameraSession.takeMultiCamPhoto(kPhotoPath);
+
+        expect(result, isNull,
+            reason: 'null native response must yield null — preview not active or no frame');
+      },
+    );
+
+    test(
+      'MC15-4 takeMultiCamPhoto returns null (does not rethrow) on PlatformException',
+      () async {
+        _responses['takeMultiCamPhoto'] = PlatformException(
+          code: 'NOT_RUNNING',
+          message: 'MultiCam preview is not running',
+        );
+
+        final result = await VGCameraSession.takeMultiCamPhoto(kPhotoPath);
+
+        expect(result, isNull,
+            reason: 'PlatformException must be caught and null returned, not rethrown');
+      },
+    );
+  });
 }
