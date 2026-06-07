@@ -152,13 +152,33 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // Instantiated in register(with:) after sessionRegistry is available.
     private var lifecycleObserver: VGPluginLifecycleObserver?
 
-    // ── MC-10: Live MultiCam render diagnostic (start/stop texture path) ───────
+    // ── MC-10/MC-11: Live MultiCam render diagnostic (start/stop texture path) ──
     //
     // Retained across start/stop calls. Both are nil when no diagnostic is running.
     // Start creates and retains them; stop reads, stops, unregisters, and nils them.
     // The MC-9 blocking runMultiCamRenderDiagnostic uses local-scope objects only.
     private var mcRenderDiagnosticSource: VanguardMultiCamMediaSource?
     private var mcRenderDiagnostic: VanguardMultiCamRenderDiagnostic?
+
+    // ── MC-11: Diagnostic lifecycle state machine ─────────────────────────────
+    //
+    // Guards the start/stop path against rapid-fire and concurrent calls.
+    // All state transitions happen on the main thread (handle(_:result:) is
+    // guaranteed to run on main by the Flutter plugin architecture).
+    //
+    //  idle     → starting  : startMultiCamRenderDiagnostic called
+    //  starting → running   : hardware started successfully
+    //  starting → stopping  : stopMultiCamRenderDiagnostic called while starting
+    //  starting → idle      : source init failed while state was .stopping
+    //  running  → stopping  : stopMultiCamRenderDiagnostic called normally
+    //  stopping → idle      : stop teardown complete
+    private enum MCDiagnosticState {
+        case idle
+        case starting
+        case running
+        case stopping
+    }
+    private var mcDiagnosticState: MCDiagnosticState = .idle
 
     // ─── Registration ─────────────────────────────────────────────────────────
 
@@ -3514,24 +3534,19 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(nil)
             }
         case "startMultiCamRenderDiagnostic":
-            // ── MC-10: Live MultiCam texture diagnostic — start ───────────────
+            // \u2500\u2500 MC-10/MC-11: Live MultiCam texture diagnostic — start \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
             //
-            // Creates VanguardMultiCamRenderDiagnostic with a FlutterTextureRegistry,
-            // registers a Flutter texture, wires as delegate of a new
-            // VanguardMultiCamMediaSource, starts the session, and returns the
-            // textureId so Dart can mount a Texture widget.
+            // MC-11 hardening: guarded by mcDiagnosticState so that any
+            // non-idle state (starting, running, stopping) returns ALREADY_RUNNING
+            // immediately without touching hardware. Previously the guard only
+            // checked mcRenderDiagnostic != nil, which missed the .starting
+            // window between dispatch_async dispatch and main-thread completion.
             //
             // Preconditions:
             //   - currentMode must be .idle (no camera preview active).
-            //   - No MC-10 diagnostic may already be running.
+            //   - mcDiagnosticState must be .idle.
             //   - iOS 13.0+ required.
             //   - frontDeviceId and backDeviceId must be provided.
-            //
-            // Stop ordering (enforced in stopMultiCamRenderDiagnostic):
-            //   1. source.stop()
-            //   2. renderer.stop()    — drains renderQ
-            //   3. renderer.doUnregisterTexture()  — on main thread
-            //   4. release retained references
 
             guard currentMode == .idle else {
                 result(FlutterError(
@@ -3541,7 +3556,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 ))
                 return
             }
-            guard mcRenderDiagnostic == nil else {
+            guard mcDiagnosticState == .idle else {
+                // Covers .starting, .running, and .stopping.
                 result(FlutterError(
                     code: "ALREADY_RUNNING",
                     message: "A MultiCam render diagnostic is already running — call stopMultiCamRenderDiagnostic first",
@@ -3559,15 +3575,19 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 return
             }
             if #available(iOS 13.0, *) {
+                // Transition to .starting BEFORE the background dispatch.
+                // Any subsequent startMultiCamRenderDiagnostic call will now
+                // hit the guard above and return ALREADY_RUNNING.
+                mcDiagnosticState = .starting
+
                 // Step 1: Create the render diagnostic on main thread (registerTexture requires main).
-                // initWithTextureRegistry: registers the texture on main thread internally.
                 let renderer = VanguardMultiCamRenderDiagnostic(textureRegistry: registrar.textures())
-                let textureId = renderer.textureId
+                let textureId    = renderer.textureId
                 let initialWidth  = renderer.outputWidth   // 0 until first frame
                 let initialHeight = renderer.outputHeight  // 0 until first frame
 
                 // Step 2: Create source and wire delegate on a background queue.
-                // startRunning is synchronous and blocks for hardware init (~50–200ms).
+                // startRunning is synchronous and blocks for hardware init (~50\u2013200ms).
                 // Must NOT run on main thread.
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     guard let self = self else { return }
@@ -3582,6 +3602,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         // Unregister the texture we already registered on main.
                         DispatchQueue.main.async {
                             renderer.doUnregisterTexture()
+                            // Regardless of whether stop was called while we were starting,
+                            // reset to idle — hardware is not active.
+                            self.mcDiagnosticState = .idle
                             result(nil)
                         }
                         return
@@ -3594,15 +3617,47 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         source.stop()
                         DispatchQueue.main.async {
                             renderer.doUnregisterTexture()
+                            self.mcDiagnosticState = .idle
                             result(nil)
                         }
                         return
                     }
 
-                    // Step 3: Retain source and diagnostic on main thread.
+                    // Step 3: Retain source and diagnostic on main thread,
+                    // but only if the state is still .starting.
+                    // If the user called stop while we were starting, the state
+                    // will be .stopping — tear down immediately rather than
+                    // leaving a zombie diagnostic running.
                     DispatchQueue.main.async {
+                        if self.mcDiagnosticState == .stopping {
+                            // MC-11: stop-while-starting path.
+                            // Tear down the hardware we just brought up.
+                            NSLog("[VanguardPlugin][MC-11] startMultiCamRenderDiagnostic: "
+                                  + "stop-while-starting detected — aborting startup.")
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                source.stop()
+                                renderer.stop()
+                                DispatchQueue.main.sync {
+                                    renderer.doUnregisterTexture()
+                                }
+                                DispatchQueue.main.async {
+                                    self.mcDiagnosticState = .idle
+                                    // MC-11 fix: call the START method's own result closure.
+                                    // The stop method's result(nil) (fired earlier) satisfies
+                                    // only the stopMultiCamRenderDiagnostic Future. Each
+                                    // Flutter method channel call has its own result closure
+                                    // that must be called exactly once. Omitting this call
+                                    // leaves the Dart start Future pending forever.
+                                    result(nil)
+                                }
+                            }
+                            return
+                        }
+
+                        // Normal path: startup completed without interference.
                         self.mcRenderDiagnosticSource = source
                         self.mcRenderDiagnostic       = renderer
+                        self.mcDiagnosticState        = .running
 
                         NSLog("[VanguardPlugin][MC-10] startMultiCamRenderDiagnostic: "
                               + "textureId=\(textureId) running.")
@@ -3619,60 +3674,91 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
 
         case "stopMultiCamRenderDiagnostic":
-            // ── MC-10: Live MultiCam texture diagnostic — stop ────────────────
+            // \u2500\u2500 MC-10/MC-11: Live MultiCam texture diagnostic — stop \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
             //
-            // Stop ordering (per Opus Revision 3):
-            //   1. source.stop()   — no more frames arrive on captureQ
-            //   2. renderer.stop() — drains renderQ, releases _lastCompositedBuffer
-            //   3. renderer.doUnregisterTexture()  — main thread: Flutter stops calling copyPixelBuffer
-            //   4. collect metrics, clear retained references, return to Dart
+            // MC-11 hardening: state machine replaces the simple nil-guard.
+            //
+            //  .idle     \u2192 return nil (no diagnostic was running, safe no-op).
+            //  .starting \u2192 set .stopping; the background completion block will
+            //              detect .stopping and abort the startup, unregistering
+            //              the texture and returning nil itself.
+            //  .running  \u2192 set .stopping, tear down source/renderer, clear refs,
+            //              set .idle, return report (normal stop path).
+            //  .stopping \u2192 return nil (another stop is already in flight).
 
-            guard let source   = mcRenderDiagnosticSource,
-                  let renderer = mcRenderDiagnostic else {
-                // No active diagnostic — safe return, not an error.
+            switch mcDiagnosticState {
+            case .idle:
+                // No diagnostic running — safe no-op.
                 result(nil)
-                return
-            }
 
-            // Stop and clean up on a background queue.
-            // Steps 1 and 2 must not run on main thread (startRunning/stopRunning constraint).
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                guard let self = self else { return }
+            case .starting:
+                // MC-11: stop-while-starting.
+                // Signal the in-flight start that it should abort on main completion.
+                // result(nil) here; the start block will complete cleanup on main.
+                NSLog("[VanguardPlugin][MC-11] stopMultiCamRenderDiagnostic: "
+                      + "called while still starting — signalling abort.")
+                mcDiagnosticState = .stopping
+                result(nil)
 
-                // Step 1: Stop capture source — no more frames on captureQ.
-                source.stop()
+            case .running:
+                // Normal stop path.
+                guard let source   = mcRenderDiagnosticSource,
+                      let renderer = mcRenderDiagnostic else {
+                    // Defensive: state said running but refs are nil. Reset and return.
+                    mcDiagnosticState = .idle
+                    result(nil)
+                    return
+                }
+                mcDiagnosticState = .stopping
 
-                // Step 2: Drain renderQ — all in-flight renders complete.
-                renderer.stop()
+                // Stop and clean up on a background queue.
+                // Steps 1 and 2 must not run on main thread (startRunning/stopRunning constraint).
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self = self else { return }
 
-                // Step 3: Unregister texture on main thread.
-                // After this returns, Flutter will never call copyPixelBuffer again.
-                DispatchQueue.main.sync {
-                    renderer.doUnregisterTexture()
+                    // Step 1: Stop capture source — no more frames on captureQ.
+                    source.stop()
+
+                    // Step 2: Drain renderQ — all in-flight renders complete.
+                    renderer.stop()
+
+                    // Step 3: Unregister texture on main thread.
+                    // After this returns, Flutter will never call copyPixelBuffer again.
+                    DispatchQueue.main.sync {
+                        renderer.doUnregisterTexture()
+                    }
+
+                    // Step 4: Collect metrics and return.
+                    var metrics = source.metrics() as? [String: Any] ?? [:]
+                    let renderMetrics = renderer.metrics()
+                    metrics["renderedFrames"]      = renderMetrics["renderedFrames"]
+                    metrics["droppedRenderFrames"] = renderMetrics["droppedRenderFrames"]
+                    metrics["averageRenderMs"]     = renderMetrics["averageRenderMs"]
+                    metrics["peakRenderMs"]        = renderMetrics["peakRenderMs"]
+                    metrics["outputWidth"]         = renderMetrics["outputWidth"]
+                    metrics["outputHeight"]        = renderMetrics["outputHeight"]
+
+                    // Step 5: Clear retained references and reset state on main thread.
+                    DispatchQueue.main.async {
+                        self.mcRenderDiagnosticSource = nil
+                        self.mcRenderDiagnostic       = nil
+                        self.mcDiagnosticState        = .idle
+
+                        NSLog("[VanguardPlugin][MC-10] stopMultiCamRenderDiagnostic: "
+                              + "rendered=\(renderMetrics["renderedFrames"] ?? 0) "
+                              + "avgMs=\(renderMetrics["averageRenderMs"] ?? 0).")
+
+                        result(metrics)
+                    }
                 }
 
-                // Step 4: Collect metrics and return.
-                var metrics = source.metrics() as? [String: Any] ?? [:]
-                let renderMetrics = renderer.metrics()
-                metrics["renderedFrames"]      = renderMetrics["renderedFrames"]
-                metrics["droppedRenderFrames"] = renderMetrics["droppedRenderFrames"]
-                metrics["averageRenderMs"]     = renderMetrics["averageRenderMs"]
-                metrics["peakRenderMs"]        = renderMetrics["peakRenderMs"]
-                metrics["outputWidth"]         = renderMetrics["outputWidth"]
-                metrics["outputHeight"]        = renderMetrics["outputHeight"]
-
-                // Step 5: Clear retained references on main thread.
-                DispatchQueue.main.async {
-                    self.mcRenderDiagnosticSource = nil
-                    self.mcRenderDiagnostic       = nil
-
-                    NSLog("[VanguardPlugin][MC-10] stopMultiCamRenderDiagnostic: "
-                          + "rendered=\(renderMetrics["renderedFrames"] ?? 0) "
-                          + "avgMs=\(renderMetrics["averageRenderMs"] ?? 0).")
-
-                    result(metrics)
-                }
+            case .stopping:
+                // Another stop is already in flight. Return nil safely.
+                NSLog("[VanguardPlugin][MC-11] stopMultiCamRenderDiagnostic: "
+                      + "already stopping — ignoring duplicate stop call.")
+                result(nil)
             }
+
 
         case "setFocusPoint":
 
