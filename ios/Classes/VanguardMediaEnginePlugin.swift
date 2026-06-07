@@ -3974,6 +3974,45 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         case "stopMultiCamPreview":
             _handleStopMultiCam(callerTag: "MC-13", result: result)
 
+        // ── MC-15: MultiCam still-photo capture ───────────────────────────────
+        //
+        // Extracts the current composited CVPixelBuffer from the running
+        // VanguardMultiCamRenderDiagnostic, encodes it to JPEG on the render
+        // queue, and writes the file to the caller-supplied path.
+        //
+        // Guards:
+        //   • mcDiagnosticState must be .running (preview must be active).
+        //   • mcRenderDiagnostic must be non-nil.
+        //   • path must be a non-empty string.
+        //
+        // Error codes forwarded to Dart:
+        //   NOT_RUNNING  — preview is not active
+        //   INVALID_ARG  — path is missing or empty
+        //   NO_FRAME     — no composited frame available yet
+        //   ENCODE_FAIL  — JPEG encoding returned nil
+        //   WRITE_FAIL   — file write failed (disk full, bad path, etc.)
+        case "takeMultiCamPhoto":
+            guard mcDiagnosticState == .running,
+                  let renderer = mcRenderDiagnostic else {
+                result(FlutterError(code: "NOT_RUNNING",
+                                    message: "MultiCam preview is not running",
+                                    details: nil))
+                return
+            }
+            guard let path = args?["path"] as? String, !path.isEmpty else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "Missing or invalid path",
+                                    details: nil))
+                return
+            }
+            renderer.capturePhoto(toPath: path) { resultMap, error in
+                if let error = error {
+                    result(error)
+                } else {
+                    result(resultMap)
+                }
+            }
+
 
         case "setFocusPoint":
 

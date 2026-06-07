@@ -77,6 +77,7 @@
 #import "VGDualCameraLayoutMath.h"
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
+#import <ImageIO/ImageIO.h>
 #import <QuartzCore/QuartzCore.h>  // CACurrentMediaTime
 #import <os/lock.h>
 
@@ -390,6 +391,141 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     }
 
     return cfg;
+}
+
+// ───────────────────────────────────────────────────────────────────────────────
+// MARK: - MC-15: Still-photo capture
+// ───────────────────────────────────────────────────────────────────────────────
+
+/// Captures the current composited preview frame as a JPEG.
+///
+/// Threading model (mirrors VanguardCameraMediaSource.takePhotoToURL:):
+///   1. Retain _lastCompositedBuffer under _bufferLock (nanosecond hold).
+///   2. All encoding and I/O run on the serial _renderQ (no UIKit, no main).
+///   3. completion is always dispatched to the main thread.
+///
+/// The buffer is IOSurface-backed (kCVPixelBufferIOSurfacePropertiesKey).
+/// CIImage reads the IOSurface without a CPU pixel copy.
+/// The _renderQ may concurrently write a new frame to _lastCompositedBuffer
+/// but that only replaces the pointer under the lock — it never mutates the
+/// pixel data of the already-retained snapshot buffer.
+- (void)capturePhotoToPath:(NSString *)path
+                completion:(void (^)(NSDictionary * _Nullable result,
+                                     FlutterError * _Nullable error))completion {
+
+    // ── Step 1: Retain snapshot under lock ────────────────────────────────────
+    //
+    // Lock is held for nanoseconds: retain + NULL-check only.
+    // No encoding or allocation happens inside the lock.
+    os_unfair_lock_lock(&_bufferLock);
+    CVPixelBufferRef snapshot =
+        _lastCompositedBuffer ? CVPixelBufferRetain(_lastCompositedBuffer) : NULL;
+    os_unfair_lock_unlock(&_bufferLock);
+
+    // ── Step 2: Guard — no frame delivered yet ────────────────────────────────
+    if (!snapshot) {
+        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-15] capturePhotoToPath: "
+              "no composited frame available yet.");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(nil,
+                [FlutterError errorWithCode:@"NO_FRAME"
+                                    message:@"No composited frame available yet"
+                                    details:nil]);
+        });
+        return;
+    }
+
+    // ── Step 3: Encode and write on _renderQ ──────────────────────────────────
+    //
+    // Dispatch to the existing serial _renderQ so encoding is serialized
+    // against ongoing renders. This prevents concurrent CIContext work and
+    // keeps CPU pressure predictable.
+    dispatch_async(_renderQ, ^{
+
+        // Read dimensions from snapshot BEFORE releasing.
+        size_t width  = CVPixelBufferGetWidth(snapshot);
+        size_t height = CVPixelBufferGetHeight(snapshot);
+
+        // Build CIImage. On A-series SoCs reads the IOSurface directly.
+        // No UIImage, no CGImage, no VTCreateCGImageFromCVPixelBuffer.
+        CIImage *ciImage = [CIImage imageWithCVPixelBuffer:snapshot];
+
+        // Release the retained snapshot — ownership fully transferred to CIImage.
+        // CIImage retains the IOSurface internally; releasing snapshot is safe.
+        CVPixelBufferRelease(snapshot);
+
+        // ── Determine color space ─────────────────────────────────────────────
+        // ciImage.colorSpace is a non-owning reference — do NOT release it.
+        // CGColorSpaceCreateDeviceRGB() returns +1 — MUST be released.
+        CGColorSpaceRef cs = ciImage.colorSpace;
+        BOOL ownedCS = NO;
+        if (!cs) {
+            cs = CGColorSpaceCreateDeviceRGB();
+            ownedCS = YES;
+        }
+
+        // ── Encode to JPEG ────────────────────────────────────────────────────
+        //
+        // CIContext.JPEGRepresentationOfImage:colorSpace:options: is fully
+        // thread-safe (CIContext is documented thread-safe by Apple).
+        // Uses kCGImageDestinationLossyCompressionQuality @0.9 — identical to
+        // VanguardCameraMediaSource and VGPhotoSinkNode.
+        NSDictionary *encodeOptions = @{
+            (id)kCGImageDestinationLossyCompressionQuality : @0.9,
+        };
+        NSData *jpegData = [_VGMCRDSharedCIContext()
+            JPEGRepresentationOfImage:ciImage
+                           colorSpace:cs
+                              options:encodeOptions];
+
+        if (ownedCS) {
+            CGColorSpaceRelease(cs); // release only the space we created
+        }
+
+        if (!jpegData) {
+            NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-15] capturePhotoToPath: "
+                  "JPEG encoding failed.");
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(nil,
+                    [FlutterError errorWithCode:@"ENCODE_FAIL"
+                                        message:@"JPEG encoding failed"
+                                        details:nil]);
+            });
+            return;
+        }
+
+        // ── Write to disk ─────────────────────────────────────────────────────
+        NSError *writeErr = nil;
+        [jpegData writeToFile:path
+                      options:NSDataWritingAtomic
+                        error:&writeErr];
+
+        if (writeErr) {
+            NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-15] capturePhotoToPath: "
+                  "write failed: %@", writeErr.localizedDescription);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(nil,
+                    [FlutterError errorWithCode:@"WRITE_FAIL"
+                                        message:writeErr.localizedDescription
+                                        details:nil]);
+            });
+            return;
+        }
+
+        // ── Success ───────────────────────────────────────────────────────────
+        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-15] capturePhotoToPath: "
+              "wrote %zu bytes to %@", (size_t)jpegData.length, path);
+        NSDictionary *resultMap = @{
+            @"filePath"  : path,
+            @"width"     : @(width),
+            @"height"    : @(height),
+            @"sizeBytes" : @(jpegData.length),
+            @"format"    : @"jpeg",
+        };
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(resultMap, nil);
+        });
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

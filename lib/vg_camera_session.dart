@@ -1682,6 +1682,52 @@ final class VGCameraSession {
     }
   }
 
+  /// Captures the current composited MultiCam preview frame as a JPEG and
+  /// writes it to [path].
+  ///
+  /// ## MC-15 — MultiCam still-photo capture
+  /// Extracts the most recently rendered composited buffer from the running
+  /// MultiCam preview pipeline and encodes it as a JPEG at quality 0.9.
+  /// The output is WYSIWYG: it exactly matches the current PiP or split-screen
+  /// layout visible in the preview.
+  ///
+  /// ## Resolution
+  /// The output resolution matches the composited preview buffer (1080×1920
+  /// portrait). This is a software-composited buffer, not a max-sensor capture.
+  ///
+  /// ## Orientation
+  /// The buffer is already portrait-correct and mirrored per camera side
+  /// (front mirrored, back not). No additional orientation transform is applied.
+  ///
+  /// ## Requirements
+  /// - [startMultiCamPreview] must be active and at least one frame rendered.
+  /// - [path] must be a writable absolute path (e.g. in the app temp directory).
+  ///
+  /// ## Returns
+  /// A [VGPhotoCaptureResult] with `filePath`, `width`, `height`, `sizeBytes`,
+  /// and `format` populated on success.
+  ///
+  /// Returns `null` on any failure:
+  ///   - `NOT_RUNNING`  — MultiCam preview is not active.
+  ///   - `NO_FRAME`     — No composited frame available yet (called too soon after start).
+  ///   - `ENCODE_FAIL`  — JPEG encoding failed.
+  ///   - `WRITE_FAIL`   — Disk write failed (bad path, disk full, etc.).
+  ///   - `INVALID_ARG`  — Path is empty or missing.
+  static Future<VGPhotoCaptureResult?> takeMultiCamPhoto(String path) async {
+    try {
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'takeMultiCamPhoto',
+        {'path': path},
+      );
+      if (raw == null) return null;
+      final typed = raw.map((key, value) => MapEntry(key.toString(), value));
+      return VGPhotoCaptureResult.fromMap(typed);
+    } on PlatformException {
+      return null;
+    }
+  }
+
+
   /// Tap-to-focus and tap-to-expose at a normalised point.
   ///
   /// [x] and [y] must be in the range `[0.0, 1.0]`, where `(0, 0)` is the

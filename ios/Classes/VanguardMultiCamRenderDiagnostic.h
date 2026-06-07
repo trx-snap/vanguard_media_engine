@@ -1,18 +1,24 @@
 // VanguardMultiCamRenderDiagnostic.h
-// vanguard_media_engine — MC-9/MC-10: MultiCam render diagnostic.
+// vanguard_media_engine — MC-9/MC-10/MC-13/MC-15: MultiCam compositor.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// MC-9/MC-10 — MULTICAM RENDER DIAGNOSTIC (OFFSCREEN COMPOSITION + TEXTURE)
+// MC-9/MC-10 — MULTICAM OFFSCREEN COMPOSITION + FLUTTER TEXTURE
+// MC-13      — PROMOTED TO PRODUCTION: startMultiCamPreview / stopMultiCamPreview
+//              route through this class via _handleStartMultiCam.
+// MC-15      — ADDS STILL-PHOTO CAPTURE: capturePhotoToPath:completion:
+//              extracts the current composited CVPixelBuffer and writes a JPEG.
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// Diagnostic-only offscreen compositor that receives VanguardMultiCamPairedFrame
-// objects from VanguardMultiCamMediaSource and composites them using CoreImage
-// into a CVPixelBuffer pool.
+// Offscreen compositor that receives VanguardMultiCamPairedFrame objects from
+// VanguardMultiCamMediaSource and composites them using CoreImage into a
+// CVPixelBuffer pool.
 //
-// MC-9: offscreen-only. No Flutter texture. No visible preview.
-// MC-10: adds FlutterTexture protocol conformance for live visible preview
-//        via the start/stop API (startMultiCamRenderDiagnostic /
-//        stopMultiCamRenderDiagnostic). The blocking run API is preserved.
+// MC-9:  offscreen-only. No Flutter texture. No visible preview.
+// MC-10: adds FlutterTexture conformance for live visible preview via
+//        startMultiCamRenderDiagnostic / stopMultiCamRenderDiagnostic.
+// MC-13: promoted to production preview path via startMultiCamPreview /
+//        stopMultiCamPreview (VanguardMediaEnginePlugin._handleStartMultiCam).
+// MC-15: adds capturePhotoToPath:completion: for WYSIWYG still capture.
 //
 // ── PURPOSE ──────────────────────────────────────────────────────────────────
 //
@@ -32,9 +38,10 @@
 //
 // ── DESIGN CONSTRAINTS ───────────────────────────────────────────────────────
 //
-//   DIAGNOSTIC-ONLY: This class must NOT be used for production rendering,
-//   camera graph integration, or any Flutter texture delivery outside the
-//   MC-10 start/stop diagnostic route.
+//   NOTE (MC-13): The "diagnostic-only" restriction is lifted. This class is
+//   now used for production MultiCam preview delivery via the
+//   startMultiCamPreview / stopMultiCamPreview channel routes.
+//   Do NOT integrate with VGCameraGraphSession or VanguardCameraMediaSource.
 //
 //   Frame dropping: If the renderQ is busy when a new paired frame arrives,
 //   the new frame is silently dropped (_renderingInFlight flag). This preserves
@@ -234,6 +241,34 @@ static inline VGMCRDLayoutConfig VGMCRDDefaultLayoutConfig(void) {
 /// Fully defensive: any missing/malformed field falls back to the default.
 /// Called from Swift, which cannot directly reference C-struct enum constants.
 + (VGMCRDLayoutConfig)layoutConfigFromMap:(NSDictionary<NSString *, id> * _Nullable)map;
+
+// ─── MC-15: Still-photo capture ───────────────────────────────────────────────
+
+/// Captures the current composited preview frame as a JPEG and writes it to
+/// [path].
+///
+/// ## Thread safety
+/// Safe to call from any thread. The composited buffer is retained under
+/// `_bufferLock` and encoding runs on the existing serial `_renderQ`.
+/// The completion block is always dispatched to the **main thread**.
+///
+/// ## Error codes (FlutterError)
+///   `NO_FRAME`    — no frame has been composited yet (called before first render)
+///   `ENCODE_FAIL` — CIContext JPEGRepresentationOfImage returned nil
+///   `WRITE_FAIL`  — NSData writeToFile:options:error: returned an error
+///
+/// ## Orientation
+/// The composited buffer is already portrait-correct (1080×1920) and
+/// mirrored per-camera-side by the AVCaptureConnection contract.
+/// No orientation transform is applied.
+///
+/// @param path       Writable absolute file path. Existing file is overwritten.
+/// @param completion Called on the main thread with either a result map or a
+///                   FlutterError (never both nil simultaneously).
+///                   Result map keys: filePath, width, height, sizeBytes, format.
+- (void)capturePhotoToPath:(NSString *)path
+                completion:(void (^)(NSDictionary * _Nullable result,
+                                     FlutterError * _Nullable error))completion;
 
 @end
 
