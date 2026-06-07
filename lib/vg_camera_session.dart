@@ -391,6 +391,13 @@ class VGMultiCamSyncReport {
     required this.hardwareCost,
     required this.durationSeconds,
     required this.pairingThresholdSeconds,
+    // MC-8 optional fields — default to safe values for MC-5/MC-7 maps
+    this.delegatePairedFramesReceived = 0,
+    this.frontBufferWidth = 0,
+    this.frontBufferHeight = 0,
+    this.backBufferWidth = 0,
+    this.backBufferHeight = 0,
+    this.buffersValid = false,
   });
 
   /// Frames software-paired within [pairingThresholdSeconds].
@@ -444,6 +451,34 @@ class VGMultiCamSyncReport {
 
   /// Pairing threshold in milliseconds.
   double get pairingThresholdMilliseconds => pairingThresholdSeconds * 1000.0;
+
+  // ── MC-8 buffer verification fields ──────────────────────────────────────
+
+  /// MC-8: Number of paired frames delivered via the
+  /// `VanguardMultiCamMediaSourceDelegate` callback during the diagnostic.
+  /// Should equal [pairedFramesReceived] when buffer retention is active.
+  /// Defaults to 0 for MC-5/MC-7 reports (field absent from native map).
+  final int delegatePairedFramesReceived;
+
+  /// MC-8: Width in pixels of the front-camera buffer from the first valid
+  /// paired frame. 0 if no paired frames were delivered.
+  final int frontBufferWidth;
+
+  /// MC-8: Height in pixels of the front-camera buffer from the first valid
+  /// paired frame. 0 if no paired frames were delivered.
+  final int frontBufferHeight;
+
+  /// MC-8: Width in pixels of the back-camera buffer from the first valid
+  /// paired frame. 0 if no paired frames were delivered.
+  final int backBufferWidth;
+
+  /// MC-8: Height in pixels of the back-camera buffer from the first valid
+  /// paired frame. 0 if no paired frames were delivered.
+  final int backBufferHeight;
+
+  /// MC-8: `true` if at least one paired frame arrived with non-zero dimensions
+  /// on both the front and back buffers. `false` for MC-5/MC-7 reports.
+  final bool buffersValid;
 
   // ── Parsing ───────────────────────────────────────────────────────────────
 
@@ -598,7 +633,22 @@ class VGMultiCamSyncReport {
       hardwareCost: hw,
       durationSeconds: duration,
       pairingThresholdSeconds: threshold,
+      // MC-8 optional fields — absent in MC-5/MC-7 native maps, default safely.
+      delegatePairedFramesReceived: _parseInt(map['delegatePairedFramesReceived']) ?? 0,
+      frontBufferWidth:             _parseInt(map['frontBufferWidth'])             ?? 0,
+      frontBufferHeight:            _parseInt(map['frontBufferHeight'])            ?? 0,
+      backBufferWidth:              _parseInt(map['backBufferWidth'])              ?? 0,
+      backBufferHeight:             _parseInt(map['backBufferHeight'])             ?? 0,
+      buffersValid:                 map['buffersValid'] as bool?                   ?? false,
     );
+  }
+
+  /// Parses an optional int field from a map value (int or double → int).
+  /// Returns null if the value is null or is neither int nor double.
+  static int? _parseInt(Object? raw) {
+    if (raw is int) return raw;
+    if (raw is double) return raw.toInt();
+    return null;
   }
 
   @override
@@ -616,7 +666,13 @@ class VGMultiCamSyncReport {
           peakSystemPressureCost == other.peakSystemPressureCost &&
           hardwareCost == other.hardwareCost &&
           durationSeconds == other.durationSeconds &&
-          pairingThresholdSeconds == other.pairingThresholdSeconds;
+          pairingThresholdSeconds == other.pairingThresholdSeconds &&
+          delegatePairedFramesReceived == other.delegatePairedFramesReceived &&
+          frontBufferWidth == other.frontBufferWidth &&
+          frontBufferHeight == other.frontBufferHeight &&
+          backBufferWidth == other.backBufferWidth &&
+          backBufferHeight == other.backBufferHeight &&
+          buffersValid == other.buffersValid;
 
   @override
   int get hashCode => Object.hash(
@@ -631,6 +687,12 @@ class VGMultiCamSyncReport {
         hardwareCost,
         durationSeconds,
         pairingThresholdSeconds,
+        delegatePairedFramesReceived,
+        frontBufferWidth,
+        frontBufferHeight,
+        backBufferWidth,
+        backBufferHeight,
+        buffersValid,
       );
 
   @override
@@ -647,7 +709,11 @@ class VGMultiCamSyncReport {
       'pairingThresholdMs: ${pairingThresholdMilliseconds.toStringAsFixed(2)}, '
       'peakSystemPressureCost: $peakSystemPressureCost, '
       'hardwareCost: $hardwareCost, '
-      'durationSeconds: $durationSeconds)';
+      'durationSeconds: $durationSeconds, '
+      'delegatePairedFramesReceived: $delegatePairedFramesReceived, '
+      'frontBuffer: ${frontBufferWidth}x${frontBufferHeight}, '
+      'backBuffer: ${backBufferWidth}x${backBufferHeight}, '
+      'buffersValid: $buffersValid)';
 }
 
 final class VGCameraSession {

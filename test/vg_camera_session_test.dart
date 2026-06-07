@@ -1946,4 +1946,160 @@ void main() {
       },
     );
   });
+
+  // ── MC-8: VGMultiCamSyncReport MC-8 optional field parsing ───────────────
+  //
+  // Tests for the paired-frame buffer lifecycle additions in MC-8.
+  // Verifies that:
+  //   - MC-8 buffer fields parse correctly from a full native map.
+  //   - MC-5/MC-7 native maps (no MC-8 fields) parse to safe defaults (0/false).
+  //   - PlatformException still returns null after MC-8 field additions.
+  //   - Null native response still returns null.
+  //
+  // These are pure Dart / mock-channel tests — no native code runs.
+  //
+  // Acceptance criteria:
+  //   MC8-1  parses all MC-8 delegate verification fields
+  //   MC8-2  uses safe defaults when MC-8 fields are absent
+  //   MC8-3  returns null on PlatformException (MC-8 field addition regression)
+  //   MC8-4  returns null on null native response (MC-8 field addition regression)
+  group('VGCameraSession.runMultiCamSourceLifecycleDiagnostic (MC-8 fields)', () {
+    const kFrontId = 'AVCaptureDevice-Front-001';
+    const kBackId  = 'AVCaptureDevice-Back-002';
+
+    // Canonical MC-7 base map (no MC-8 fields) — used to verify safe defaults.
+    const kMC7BaseResponse = <Object?, Object?>{
+      'pairedFramesReceived':    85,
+      'frontFramesReceived':     91,
+      'backFramesReceived':      85,
+      'unmatchedFrontFrames':    6,
+      'unmatchedBackFrames':     0,
+      'maxDriftSeconds':         0.020586,
+      'averageDriftSeconds':     0.020428,
+      'peakSystemPressureCost':  0.4955,
+      'hardwareCost':            0.5000,
+      'durationSeconds':         3.22,
+      'pairingThresholdSeconds': 1.0 / 30.0,
+    };
+
+    // Full MC-8 response including all buffer verification fields.
+    const kMC8FullResponse = <Object?, Object?>{
+      'pairedFramesReceived':         85,
+      'frontFramesReceived':          91,
+      'backFramesReceived':           85,
+      'unmatchedFrontFrames':         6,
+      'unmatchedBackFrames':          0,
+      'maxDriftSeconds':              0.020586,
+      'averageDriftSeconds':          0.020428,
+      'peakSystemPressureCost':       0.4955,
+      'hardwareCost':                 0.5000,
+      'durationSeconds':              3.22,
+      'pairingThresholdSeconds':      1.0 / 30.0,
+      // MC-8 additions:
+      'delegatePairedFramesReceived': 85,
+      'frontBufferWidth':             1080,
+      'frontBufferHeight':            1920,
+      'backBufferWidth':              1080,
+      'backBufferHeight':             1920,
+      'buffersValid':                 true,
+    };
+
+    test(
+      'MC8-1 runMultiCamSourceLifecycleDiagnostic parses MC-8 delegate verification fields',
+      () async {
+        _responses['runMultiCamSourceLifecycleDiagnostic'] = kMC8FullResponse;
+
+        final report = await VGCameraSession.runMultiCamSourceLifecycleDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNotNull,
+            reason: 'must return non-null VGMultiCamSyncReport for a full MC-8 native map');
+
+        // Existing MC-7 fields must still parse correctly.
+        expect(report!.pairedFramesReceived, 85);
+        expect(report.frontFramesReceived,   91);
+        expect(report.backFramesReceived,    85);
+
+        // MC-8 buffer verification fields.
+        expect(report.delegatePairedFramesReceived, 85,
+            reason: 'delegatePairedFramesReceived must match native value');
+        expect(report.frontBufferWidth,  1080,
+            reason: 'frontBufferWidth must parse from native map');
+        expect(report.frontBufferHeight, 1920,
+            reason: 'frontBufferHeight must parse from native map');
+        expect(report.backBufferWidth,   1080,
+            reason: 'backBufferWidth must parse from native map');
+        expect(report.backBufferHeight,  1920,
+            reason: 'backBufferHeight must parse from native map');
+        expect(report.buffersValid, isTrue,
+            reason: 'buffersValid must be true when native reports valid buffers');
+      },
+    );
+
+    test(
+      'MC8-2 VGMultiCamSyncReport.fromMap uses safe defaults for absent MC-8 fields',
+      () {
+        // Parse a map with the MC-5/MC-7 shape only — no MC-8 fields present.
+        final report = VGMultiCamSyncReport.fromMap(kMC7BaseResponse);
+
+        expect(report, isNotNull,
+            reason: 'fromMap must succeed for MC-5/MC-7 maps (backward compatibility)');
+
+        // Existing required fields parse normally.
+        expect(report!.pairedFramesReceived, 85);
+        expect(report.durationSeconds, closeTo(3.22, 0.001));
+
+        // MC-8 fields must default to safe zero/false values.
+        expect(report.delegatePairedFramesReceived, 0,
+            reason: 'delegatePairedFramesReceived must default to 0 when absent');
+        expect(report.frontBufferWidth,  0,
+            reason: 'frontBufferWidth must default to 0 when absent');
+        expect(report.frontBufferHeight, 0,
+            reason: 'frontBufferHeight must default to 0 when absent');
+        expect(report.backBufferWidth,   0,
+            reason: 'backBufferWidth must default to 0 when absent');
+        expect(report.backBufferHeight,  0,
+            reason: 'backBufferHeight must default to 0 when absent');
+        expect(report.buffersValid, isFalse,
+            reason: 'buffersValid must default to false when absent');
+      },
+    );
+
+    test(
+      'MC8-3 runMultiCamSourceLifecycleDiagnostic returns null on PlatformException with MC-8 fields',
+      () async {
+        _responses['runMultiCamSourceLifecycleDiagnostic'] = PlatformException(
+          code: 'CAMERA_ACTIVE',
+          message: 'Stop camera preview before running MultiCam source lifecycle diagnostic',
+        );
+
+        final report = await VGCameraSession.runMultiCamSourceLifecycleDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNull,
+            reason: 'must return null (not rethrow) when native throws PlatformException '
+                '(regression: MC-8 field additions must not affect error handling)');
+      },
+    );
+
+    test(
+      'MC8-4 runMultiCamSourceLifecycleDiagnostic returns null on null native response with MC-8 fields',
+      () async {
+        _responses['runMultiCamSourceLifecycleDiagnostic'] = null;
+
+        final report = await VGCameraSession.runMultiCamSourceLifecycleDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNull,
+            reason: 'must return null when native responds with null '
+                '(regression: MC-8 field additions must not affect null handling)');
+      },
+    );
+  });
 }

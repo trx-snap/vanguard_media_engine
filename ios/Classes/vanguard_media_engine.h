@@ -29,3 +29,8 @@
 #import "VanguardGraphRuntime.h"      // VanguardGraphRuntime — primary runtime type cast in Swift
 #import "VGReverseSidecarManager.h"   // Phase 7.20B: VGReverseSidecarManager + VGReverseSidecarStatus
 #import "VGDualCameraCompositorNode.h" // Phase 7.x-C: DEV descriptor smoke route
+// MC-7/MC-8: MultiCam media source and paired-frame type.
+// Required so Swift plugin code can reference VanguardMultiCamMediaSource,
+// VanguardMultiCamMediaSourceDelegate, and VanguardMultiCamPairedFrame.
+#import "VanguardMultiCamMediaSource.h"  // MC-7: VanguardMultiCamMediaSource + delegate protocol
+#import "VanguardMultiCamPairedFrame.h"  // MC-8: VanguardMultiCamPairedFrame (RAII pixel buffer wrapper)

@@ -1,8 +1,8 @@
 // VanguardMultiCamMediaSource.h
-// vanguard_media_engine — MC-7: Production MultiCam media source scaffold.
+// vanguard_media_engine — MC-7/MC-8: Production MultiCam media source.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// MC-7 — MULTICAM MEDIA SOURCE (LIFECYCLE DIAGNOSTIC)
+// MC-7/MC-8 — MULTICAM MEDIA SOURCE (LIFECYCLE DIAGNOSTIC + BUFFER LIFECYCLE)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Production AVCaptureMultiCamSession source that manages independent
@@ -41,9 +41,9 @@
 //     MultiCam output. Conformance would require dead stubs that the engine
 //     never calls.
 //
-//   Does NOT retain CMSampleBuffer or CVPixelBuffer.
-//     Rationale: no consumer exists for pixel data in MC-7. Only CMTime values
-//     (~20 bytes each) are retained for pairing. This matches MC-5 exactly.
+//   Does NOT retain CMSampleBuffer.
+//     MC-8: retains at most one pending CVPixelBuffer per camera side
+//     (front/back). Released on displacement, stop, and dealloc.
 //
 //   Does NOT create Flutter textures, Metal renderers, or compositors.
 //
@@ -112,8 +112,31 @@
 #import <AVFoundation/AVFoundation.h>
 
 @class VanguardMultiCamFramePairer;
+@class VanguardMultiCamPairedFrame;
+@class VanguardMultiCamMediaSource;
 
 NS_ASSUME_NONNULL_BEGIN
+
+// ─── VanguardMultiCamMediaSourceDelegate ─────────────────────────────────────
+
+/// Delegate for receiving software-paired front/back pixel buffer frames.
+///
+/// Called synchronously on the source's internal serial captureQ.
+/// Implementations MUST return quickly — no GPU work, no blocking I/O.
+/// The paired frame is released (via ARC) after this method returns;
+/// retain it if you need it beyond the callback scope.
+@protocol VanguardMultiCamMediaSourceDelegate <NSObject>
+
+/// Delivered when a front/back frame pair has formed within the pairing threshold.
+///
+/// @param source       The source that formed the pair.
+/// @param pairedFrame  The paired frame holding both retained pixel buffers.
+///                     The delegate does NOT own this object; it will be
+///                     released by ARC after this method returns unless retained.
+- (void)multiCamMediaSource:(VanguardMultiCamMediaSource *)source
+       didOutputPairedFrame:(VanguardMultiCamPairedFrame *)pairedFrame;
+
+@end
 
 // ─── VanguardMultiCamMediaSource ──────────────────────────────────────────────
 
@@ -121,16 +144,18 @@ NS_ASSUME_NONNULL_BEGIN
 /// with independent front/back camera delegates and VanguardMultiCamFramePairer
 /// software PTS pairing.
 ///
-/// MC-7 scope: lifecycle diagnostic only. Not wired to VGCameraGraphSession.
+/// MC-7: lifecycle diagnostic. MC-8: adds paired-frame buffer delivery.
+/// Not wired to VGCameraGraphSession.
 ///
 /// ## Protocol conformance
-/// Does NOT conform to `<VanguardMediaSource>` in MC-7. That protocol models
+/// Does NOT conform to `<VanguardMediaSource>`. That protocol models
 /// a single-stream source (one CVPixelBuffer callback) and is unsuitable for
-/// paired MultiCam output. Conformance is deferred to MC-8+.
+/// paired MultiCam output.
 ///
-/// ## Buffer retention
-/// Does NOT retain `CMSampleBuffer` or `CVPixelBuffer`. PTS extraction only,
-/// matching the proven MC-5 pattern.
+/// ## Buffer retention (MC-8)
+/// Retains at most one pending `CVPixelBuffer` per camera side at a time.
+/// Released on displacement, `stop`, or `dealloc`.
+/// Does NOT retain `CMSampleBuffer`.
 ///
 /// ## Thread safety
 /// `start` / `stop` must be called from a background thread.
@@ -213,6 +238,15 @@ NS_ASSUME_NONNULL_BEGIN
 ///
 /// Safe to call before stop (returns current counters) or after stop (final).
 - (NSDictionary<NSString *, NSNumber *> *)metrics;
+
+// ─── Delegate ─────────────────────────────────────────────────────────────────
+
+/// Delegate to receive paired-frame callbacks.
+///
+/// The delegate is held weakly to avoid retain cycles.
+/// Callbacks fire synchronously on the internal serial captureQ.
+/// Delegate methods must return quickly — no GPU work, no blocking I/O.
+@property (nonatomic, weak, nullable) id<VanguardMultiCamMediaSourceDelegate> delegate;
 
 // ─── Pairer access ────────────────────────────────────────────────────────────
 

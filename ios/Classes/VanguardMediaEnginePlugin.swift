@@ -3317,22 +3317,23 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(nil)
             }
 
-        // ── MC-7: MultiCam media source lifecycle diagnostic ──────────────────
+        // ── MC-7/MC-8: MultiCam media source lifecycle diagnostic ─────────────
         //
         // Instantiates VanguardMultiCamMediaSource, starts it for 3 seconds,
-        // stops it, and returns the pairing + system metrics dictionary.
+        // stops it, and returns the pairing + buffer metrics dictionary.
         //
-        // Key differences from MC-5 (runMultiCamSyncDiagnostic):
-        //   MC-5: standalone diagnostic class (_VanguardMC5SoftPairDelegate),
-        //         session and pairing logic are internal to the diagnostic.
-        //   MC-7: production source object (VanguardMultiCamMediaSource),
-        //         uses the extracted VanguardMultiCamFramePairer (MC-6).
+        // MC-8 additions over MC-7:
+        //   - Acts as VanguardMultiCamMediaSourceDelegate via a lightweight
+        //     inner object (_VanguardMC8DiagDelegate) to receive paired frames.
+        //   - Collects delegatePairedFramesReceived, front/back buffer dimensions,
+        //     and buffersValid from the first valid paired frame.
+        //   - All metrics are appended to the existing pairer+session dictionary.
+        //   - PTS-only pairer (MC-6) is NOT modified.
         //
         //   - Does NOT create textures, renderers, or compositors.
         //   - Does NOT modify VanguardCameraMediaSource or VGCameraGraphSession.
         //   - Does NOT add VanguardEngineMode.multiCam.
         //   - Does NOT conform to <VanguardMediaSource>.
-        //   - Does NOT retain CVPixelBuffer (PTS extraction only).
         //   - startRunning is dispatched to a background queue (synchronous API).
         //   - Returns nil if unauthorized, unsupported, or device not found.
         //   - REQUIRES currentMode == .idle. Refuses with CAMERA_ACTIVE if not.
@@ -3373,6 +3374,14 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         DispatchQueue.main.async { result(nil) }
                         return
                     }
+
+                    // ── MC-8: wire delegate before start ─────────────────────
+                    // _VanguardMC8DiagDelegate collects paired-frame buffer
+                    // metrics synchronously on the source's captureQ.
+                    // Declared below as a file-level private class.
+                    let diagDelegate = _VanguardMC8DiagDelegate()
+                    source.delegate = diagDelegate
+
                     guard source.start() else {
                         // startRunning returned NO: session failed to run.
                         source.stop()
@@ -3383,8 +3392,18 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     // captureQ delivers frames freely during this sleep.
                     Thread.sleep(forTimeInterval: 3.0)
                     source.stop()
+
+                    // ── Merge MC-8 delegate metrics into the source metrics ───
+                    var metrics = source.metrics() as? [String: Any] ?? [:]
+                    metrics["delegatePairedFramesReceived"] = diagDelegate.pairedFramesReceived
+                    metrics["frontBufferWidth"]             = diagDelegate.frontBufferWidth
+                    metrics["frontBufferHeight"]            = diagDelegate.frontBufferHeight
+                    metrics["backBufferWidth"]              = diagDelegate.backBufferWidth
+                    metrics["backBufferHeight"]             = diagDelegate.backBufferHeight
+                    metrics["buffersValid"]                 = diagDelegate.buffersValid
+
                     DispatchQueue.main.async {
-                        result(source.metrics())
+                        result(metrics)
                     }
                 }
             } else {
@@ -4363,5 +4382,84 @@ private final class VanguardP5TestRunner {
         let sorted = values.sorted()
         let idx = max(0, Int(ceil(0.99 * Double(sorted.count))) - 1)
         return sorted[min(idx, sorted.count - 1)]
+    }
+}
+
+// ─── _VanguardMC8DiagDelegate ─────────────────────────────────────────────────
+//
+// MC-8 diagnostic delegate for runMultiCamSourceLifecycleDiagnostic.
+//
+// Receives VanguardMultiCamMediaSourceDelegate callbacks synchronously on the
+// source's serial captureQ. Collects:
+//   - pairedFramesReceived: count of paired-frame callbacks received
+//   - frontBufferWidth / frontBufferHeight: dimensions of first valid front buffer
+//   - backBufferWidth / backBufferHeight: dimensions of first valid back buffer
+//   - buffersValid: true if at least one paired frame arrived with non-zero
+//       dimensions on both sides
+//
+// Design constraints:
+//   - Does NOT retain the paired frame beyond the callback scope.
+//   - Does NOT dispatch GPU or blocking work from the callback.
+//   - Only inspects CVPixelBufferGetWidth/CVPixelBufferGetHeight (metadata,
+//     thread-safe, no LockBaseAddress required).
+//   - The object is created and owned by the diagnostic route on the background
+//     queue. The source holds only a weak reference (source.delegate = weak).
+//   - pairedFramesReceived is accessed after source.stop() on the background
+//     queue — no concurrent access because stop() drains the captureQ first.
+//
+// DO NOT use this class for production rendering, compositing, or texture delivery.
+
+@available(iOS 13.0, *)
+private final class _VanguardMC8DiagDelegate: NSObject, VanguardMultiCamMediaSourceDelegate {
+
+    // ── Counters (written on captureQ, read after stop() on background queue) ──
+
+    /// Number of paired-frame callbacks received during the diagnostic window.
+    private(set) var pairedFramesReceived: Int = 0
+
+    /// Width of the front buffer from the first valid paired frame. 0 if none.
+    private(set) var frontBufferWidth: Int = 0
+
+    /// Height of the front buffer from the first valid paired frame. 0 if none.
+    private(set) var frontBufferHeight: Int = 0
+
+    /// Width of the back buffer from the first valid paired frame. 0 if none.
+    private(set) var backBufferWidth: Int = 0
+
+    /// Height of the back buffer from the first valid paired frame. 0 if none.
+    private(set) var backBufferHeight: Int = 0
+
+    /// true if at least one paired frame arrived with non-zero dimensions on both sides.
+    private(set) var buffersValid: Bool = false
+
+    // ── VanguardMultiCamMediaSourceDelegate ───────────────────────────────────
+
+    func multiCamMediaSource(
+        _ source: VanguardMultiCamMediaSource,
+        didOutputPairedFrame pairedFrame: VanguardMultiCamPairedFrame
+    ) {
+        pairedFramesReceived += 1
+
+        // Capture dimensions from first valid paired frame only.
+        // CVPixelBufferGetWidth/Height are metadata reads — thread-safe,
+        // no LockBaseAddress required.
+        if !buffersValid {
+            let fw = CVPixelBufferGetWidth(pairedFrame.frontBuffer)
+            let fh = CVPixelBufferGetHeight(pairedFrame.frontBuffer)
+            let bw = CVPixelBufferGetWidth(pairedFrame.backBuffer)
+            let bh = CVPixelBufferGetHeight(pairedFrame.backBuffer)
+
+            if fw > 0 && fh > 0 && bw > 0 && bh > 0 {
+                frontBufferWidth  = fw
+                frontBufferHeight = fh
+                backBufferWidth   = bw
+                backBufferHeight  = bh
+                buffersValid      = true
+            }
+        }
+
+        // Do NOT retain pairedFrame beyond this scope.
+        // ARC releases it here → VanguardMultiCamPairedFrame.dealloc →
+        // CVPixelBufferRelease(frontBuffer) + CVPixelBufferRelease(backBuffer).
     }
 }

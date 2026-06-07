@@ -1,5 +1,5 @@
 // VanguardMultiCamMediaSource.m
-// vanguard_media_engine — MC-7: Production MultiCam media source scaffold.
+// vanguard_media_engine — MC-7/MC-8: Production MultiCam media source.
 //
 // ── IMPLEMENTATION NOTES ─────────────────────────────────────────────────────
 //
@@ -46,6 +46,7 @@
 
 #import "VanguardMultiCamMediaSource.h"
 #import "VanguardMultiCamFramePairer.h"
+#import "VanguardMultiCamPairedFrame.h"
 #import <CoreMedia/CoreMedia.h>
 #import <QuartzCore/QuartzCore.h>
 #include <stdatomic.h>
@@ -97,6 +98,17 @@ static AVCaptureDevice *_mc7DeviceForUniqueId(NSString *uniqueId) {
     // ── Frame pairer (MC-6) ───────────────────────────────────────────────────
     VanguardMultiCamFramePairer *_pairer;
 
+    // ── Pending pixel buffers (MC-8) ──────────────────────────────────────────
+    //
+    // At most one pending +1-retained buffer per camera side at any time.
+    // Written and read exclusively on the serial _captureQ — no locks needed.
+    // Released on displacement (new frame arrives before pair forms),
+    // on stop (after stopRunning drains captureQ), and in dealloc (safety net).
+    CVPixelBufferRef _pendingFrontBuffer;  // NULL if none pending
+    CMTime           _pendingFrontPTS;
+    CVPixelBufferRef _pendingBackBuffer;   // NULL if none pending
+    CMTime           _pendingBackPTS;
+
     // ── Session-level metrics ─────────────────────────────────────────────────
     double _hardwareCost;
     double _peakSystemPressureCost;
@@ -112,6 +124,7 @@ static AVCaptureDevice *_mc7DeviceForUniqueId(NSString *uniqueId) {
 }
 
 @synthesize pairer = _pairer;
+@synthesize delegate = _delegate;
 
 // ─── Designated initializer ───────────────────────────────────────────────────
 
@@ -308,6 +321,10 @@ static AVCaptureDevice *_mc7DeviceForUniqueId(NSString *uniqueId) {
     _stopped = NO;
     _startWallTime = 0;
     _durationSeconds = 0;
+    _pendingFrontBuffer = NULL;
+    _pendingFrontPTS    = kCMTimeInvalid;
+    _pendingBackBuffer  = NULL;
+    _pendingBackPTS     = kCMTimeInvalid;
 
     return self;
 }
@@ -354,7 +371,21 @@ static AVCaptureDevice *_mc7DeviceForUniqueId(NSString *uniqueId) {
     // Any PTS still pending in the pairer never found a partner — count them.
     [_pairer flushPendingUnmatched];
 
-    NSLog(@"[MC7] stop complete. paired=%d front=%d back=%d "
+    // ── Release any remaining pending pixel buffers (MC-8) ────────────────────────
+    //
+    // After stopRunning drains captureQ, no more delegate callbacks will fire.
+    // Any pending buffers were never paired — release them now.
+    // Guard against NULL: CVPixelBufferRelease(NULL) is undefined behavior.
+    if (_pendingFrontBuffer) {
+        CVPixelBufferRelease(_pendingFrontBuffer);
+        _pendingFrontBuffer = NULL;
+    }
+    if (_pendingBackBuffer) {
+        CVPixelBufferRelease(_pendingBackBuffer);
+        _pendingBackBuffer = NULL;
+    }
+
+    NSLog(@"[MC8] stop complete. paired=%d front=%d back=%d "
           "unmatchedFront=%d unmatchedBack=%d "
           "maxDrift=%.6fs avgDrift=%.6fs peakPressure=%.4f",
           (int)_pairer.pairedFramesReceived,
@@ -397,24 +428,91 @@ static AVCaptureDevice *_mc7DeviceForUniqueId(NSString *uniqueId) {
         return;
     }
 
-    // ── Extract PTS ────────────────────────────────────────────────────────────
+    // ── Extract PTS and pixel buffer ──────────────────────────────────────────
     //
-    // CMSampleBufferGetPresentationTimeStamp is a lightweight read (~1µs).
-    // The sample buffer is NOT retained beyond this scope.
-    // CMSampleBufferGetImageBuffer is NOT called — no CVPixelBuffer access.
-    // CVBufferRetain is NOT called.
-    // CVBufferRelease is NOT called.
+    // CMSampleBufferGetPresentationTimeStamp: lightweight CMTime read (~1µs).
+    // CMSampleBufferGetImageBuffer: returns CVPixelBuffer at +0, owned by
+    //   CMSampleBuffer, valid only for the duration of this callback.
+    //   We must CVPixelBufferRetain before storing or using beyond this scope.
+    // CMSampleBuffer is NOT retained.
     CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+
+    CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!pixelBuffer) return;
 
     // ── Feed PTS to pairer ────────────────────────────────────────────────────
     //
-    // VanguardMultiCamFramePairer handles non-numeric PTS internally.
-    // The BOOL return (paired?) is not used in MC-7 — reserved for MC-8+
-    // when a paired CVPixelBuffer will be retained for compositing.
+    // VanguardMultiCamFramePairer (MC-6) is CMTime-only and is NOT modified.
+    // Returns YES if a pair formed (|frontPTS − backPTS| ≤ threshold).
+    BOOL paired;
     if (isFront) {
-        [_pairer offerFrontPTS:pts];
+        paired = [_pairer offerFrontPTS:pts];
     } else {
-        [_pairer offerBackPTS:pts];
+        paired = [_pairer offerBackPTS:pts];
+    }
+
+    if (paired) {
+        // ── Pair formed ───────────────────────────────────────────────────────
+        //
+        // The current callback's pixelBuffer is +0 (borrowed). Retain for pair.
+        // The pending buffer from the other side is already +1 (stored earlier).
+        // Transfer ownership of both to VanguardMultiCamPairedFrame.
+        CVPixelBufferRetain(pixelBuffer);  // +1 for the paired frame
+
+        CVPixelBufferRef frontBuf, backBuf;
+        CMTime frontPTS, backPTS;
+
+        if (isFront) {
+            frontBuf = pixelBuffer;        // +1 just retained
+            frontPTS = pts;
+            backBuf  = _pendingBackBuffer; // +1 from prior pending storage
+            backPTS  = _pendingBackPTS;
+            _pendingBackBuffer = NULL;     // ownership transferred; do NOT release
+        } else {
+            backBuf  = pixelBuffer;         // +1 just retained
+            backPTS  = pts;
+            frontBuf = _pendingFrontBuffer; // +1 from prior pending storage
+            frontPTS = _pendingFrontPTS;
+            _pendingFrontBuffer = NULL;     // ownership transferred; do NOT release
+        }
+
+        // Construct paired frame — takes ownership of both +1 buffers.
+        // dealloc calls CVPixelBufferRelease on each buffer.
+        VanguardMultiCamPairedFrame *frame =
+            [[VanguardMultiCamPairedFrame alloc]
+                initWithFrontBuffer:frontBuf frontPTS:frontPTS
+                         backBuffer:backBuf  backPTS:backPTS];
+
+        // Deliver synchronously on captureQ.
+        // Delegate must return quickly — no GPU work, no blocking I/O.
+        // Do NOT retain frame beyond the callback unless needed.
+        id<VanguardMultiCamMediaSourceDelegate> delegate = _delegate;
+        if (delegate) {
+            [delegate multiCamMediaSource:self didOutputPairedFrame:frame];
+        }
+        // ARC releases frame here → dealloc → CVPixelBufferRelease × 2.
+
+    } else {
+        // ── Not paired — store as pending unmatched ───────────────────────────
+        //
+        // Retain the current buffer (+1) for pending storage.
+        // If there is already a pending buffer on this side, it was displaced
+        // (the pairer cleared it as stale) — release the old one.
+        CVPixelBufferRetain(pixelBuffer);  // +1 for pending storage
+
+        if (isFront) {
+            if (_pendingFrontBuffer) {
+                CVPixelBufferRelease(_pendingFrontBuffer);  // release displaced
+            }
+            _pendingFrontBuffer = pixelBuffer;  // takes +1 ownership
+            _pendingFrontPTS    = pts;
+        } else {
+            if (_pendingBackBuffer) {
+                CVPixelBufferRelease(_pendingBackBuffer);   // release displaced
+            }
+            _pendingBackBuffer = pixelBuffer;   // takes +1 ownership
+            _pendingBackPTS    = pts;
+        }
     }
 
     // ── Track peak systemPressureCost ─────────────────────────────────────────
@@ -433,6 +531,22 @@ static AVCaptureDevice *_mc7DeviceForUniqueId(NSString *uniqueId) {
     // Intentionally no-op.
     // alwaysDiscardsLateVideoFrames = YES may drop frames under load.
     // The source counts only delivered frames.
+}
+
+// ─── dealloc ──────────────────────────────────────────────────────────────────
+
+- (void)dealloc {
+    // Safety net: release any pending pixel buffers that were not consumed
+    // (e.g., if stop was not called before dealloc, or stop was interrupted).
+    // Guard against NULL: CVPixelBufferRelease(NULL) is undefined behavior.
+    if (_pendingFrontBuffer) {
+        CVPixelBufferRelease(_pendingFrontBuffer);
+        _pendingFrontBuffer = NULL;
+    }
+    if (_pendingBackBuffer) {
+        CVPixelBufferRelease(_pendingBackBuffer);
+        _pendingBackBuffer = NULL;
+    }
 }
 
 @end
