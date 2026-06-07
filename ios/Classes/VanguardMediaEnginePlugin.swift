@@ -152,6 +152,14 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // Instantiated in register(with:) after sessionRegistry is available.
     private var lifecycleObserver: VGPluginLifecycleObserver?
 
+    // ── MC-10: Live MultiCam render diagnostic (start/stop texture path) ───────
+    //
+    // Retained across start/stop calls. Both are nil when no diagnostic is running.
+    // Start creates and retains them; stop reads, stops, unregisters, and nils them.
+    // The MC-9 blocking runMultiCamRenderDiagnostic uses local-scope objects only.
+    private var mcRenderDiagnosticSource: VanguardMultiCamMediaSource?
+    private var mcRenderDiagnostic: VanguardMultiCamRenderDiagnostic?
+
     // ─── Registration ─────────────────────────────────────────────────────────
 
     public static func register(with registrar: FlutterPluginRegistrar) {
@@ -3504,6 +3512,166 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
             } else {
                 result(nil)
+            }
+        case "startMultiCamRenderDiagnostic":
+            // ── MC-10: Live MultiCam texture diagnostic — start ───────────────
+            //
+            // Creates VanguardMultiCamRenderDiagnostic with a FlutterTextureRegistry,
+            // registers a Flutter texture, wires as delegate of a new
+            // VanguardMultiCamMediaSource, starts the session, and returns the
+            // textureId so Dart can mount a Texture widget.
+            //
+            // Preconditions:
+            //   - currentMode must be .idle (no camera preview active).
+            //   - No MC-10 diagnostic may already be running.
+            //   - iOS 13.0+ required.
+            //   - frontDeviceId and backDeviceId must be provided.
+            //
+            // Stop ordering (enforced in stopMultiCamRenderDiagnostic):
+            //   1. source.stop()
+            //   2. renderer.stop()    — drains renderQ
+            //   3. renderer.doUnregisterTexture()  — on main thread
+            //   4. release retained references
+
+            guard currentMode == .idle else {
+                result(FlutterError(
+                    code: "CAMERA_ACTIVE",
+                    message: "Stop camera preview before starting MultiCam render diagnostic",
+                    details: nil
+                ))
+                return
+            }
+            guard mcRenderDiagnostic == nil else {
+                result(FlutterError(
+                    code: "ALREADY_RUNNING",
+                    message: "A MultiCam render diagnostic is already running — call stopMultiCamRenderDiagnostic first",
+                    details: nil
+                ))
+                return
+            }
+            guard let frontDeviceId = args?["frontDeviceId"] as? String,
+                  let backDeviceId  = args?["backDeviceId"]  as? String else {
+                result(FlutterError(
+                    code: "INVALID_ARG",
+                    message: "startMultiCamRenderDiagnostic requires frontDeviceId and backDeviceId",
+                    details: nil
+                ))
+                return
+            }
+            if #available(iOS 13.0, *) {
+                // Step 1: Create the render diagnostic on main thread (registerTexture requires main).
+                // initWithTextureRegistry: registers the texture on main thread internally.
+                let renderer = VanguardMultiCamRenderDiagnostic(textureRegistry: registrar.textures())
+                let textureId = renderer.textureId
+                let initialWidth  = renderer.outputWidth   // 0 until first frame
+                let initialHeight = renderer.outputHeight  // 0 until first frame
+
+                // Step 2: Create source and wire delegate on a background queue.
+                // startRunning is synchronous and blocks for hardware init (~50–200ms).
+                // Must NOT run on main thread.
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    guard let self = self else { return }
+
+                    let source = VanguardMultiCamMediaSource(
+                        frontDeviceId: frontDeviceId,
+                        backDeviceId: backDeviceId,
+                        frameRate: 30
+                    )
+                    guard let source = source else {
+                        // Init returned nil: not authorized, not supported, or device not found.
+                        // Unregister the texture we already registered on main.
+                        DispatchQueue.main.async {
+                            renderer.doUnregisterTexture()
+                            result(nil)
+                        }
+                        return
+                    }
+
+                    source.delegate = renderer
+
+                    guard source.start() else {
+                        // startRunning returned NO: session failed to run.
+                        source.stop()
+                        DispatchQueue.main.async {
+                            renderer.doUnregisterTexture()
+                            result(nil)
+                        }
+                        return
+                    }
+
+                    // Step 3: Retain source and diagnostic on main thread.
+                    DispatchQueue.main.async {
+                        self.mcRenderDiagnosticSource = source
+                        self.mcRenderDiagnostic       = renderer
+
+                        NSLog("[VanguardPlugin][MC-10] startMultiCamRenderDiagnostic: "
+                              + "textureId=\(textureId) running.")
+
+                        result([
+                            "textureId":     textureId,
+                            "outputWidth":   Int(initialWidth),
+                            "outputHeight":  Int(initialHeight),
+                        ])
+                    }
+                }
+            } else {
+                result(nil)
+            }
+
+        case "stopMultiCamRenderDiagnostic":
+            // ── MC-10: Live MultiCam texture diagnostic — stop ────────────────
+            //
+            // Stop ordering (per Opus Revision 3):
+            //   1. source.stop()   — no more frames arrive on captureQ
+            //   2. renderer.stop() — drains renderQ, releases _lastCompositedBuffer
+            //   3. renderer.doUnregisterTexture()  — main thread: Flutter stops calling copyPixelBuffer
+            //   4. collect metrics, clear retained references, return to Dart
+
+            guard let source   = mcRenderDiagnosticSource,
+                  let renderer = mcRenderDiagnostic else {
+                // No active diagnostic — safe return, not an error.
+                result(nil)
+                return
+            }
+
+            // Stop and clean up on a background queue.
+            // Steps 1 and 2 must not run on main thread (startRunning/stopRunning constraint).
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+
+                // Step 1: Stop capture source — no more frames on captureQ.
+                source.stop()
+
+                // Step 2: Drain renderQ — all in-flight renders complete.
+                renderer.stop()
+
+                // Step 3: Unregister texture on main thread.
+                // After this returns, Flutter will never call copyPixelBuffer again.
+                DispatchQueue.main.sync {
+                    renderer.doUnregisterTexture()
+                }
+
+                // Step 4: Collect metrics and return.
+                var metrics = source.metrics() as? [String: Any] ?? [:]
+                let renderMetrics = renderer.metrics()
+                metrics["renderedFrames"]      = renderMetrics["renderedFrames"]
+                metrics["droppedRenderFrames"] = renderMetrics["droppedRenderFrames"]
+                metrics["averageRenderMs"]     = renderMetrics["averageRenderMs"]
+                metrics["peakRenderMs"]        = renderMetrics["peakRenderMs"]
+                metrics["outputWidth"]         = renderMetrics["outputWidth"]
+                metrics["outputHeight"]        = renderMetrics["outputHeight"]
+
+                // Step 5: Clear retained references on main thread.
+                DispatchQueue.main.async {
+                    self.mcRenderDiagnosticSource = nil
+                    self.mcRenderDiagnostic       = nil
+
+                    NSLog("[VanguardPlugin][MC-10] stopMultiCamRenderDiagnostic: "
+                          + "rendered=\(renderMetrics["renderedFrames"] ?? 0) "
+                          + "avgMs=\(renderMetrics["averageRenderMs"] ?? 0).")
+
+                    result(metrics)
+                }
             }
 
         case "setFocusPoint":

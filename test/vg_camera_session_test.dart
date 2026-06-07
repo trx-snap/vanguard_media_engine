@@ -2513,4 +2513,338 @@ void main() {
       },
     );
   });
+
+  // ── MC-10: VGMultiCamRenderTextureSession ─────────────────────────────────
+  //
+  // Tests for VGMultiCamRenderTextureSession.fromMap parsing and equality.
+  //
+  // Acceptance criteria:
+  //   MC10-11 fromMap parses a complete valid map
+  //   MC10-12 fromMap returns null when textureId is missing
+  //   MC10-13 fromMap returns null when textureId is null
+  //   MC10-14 fromMap defaults outputWidth/outputHeight to 0 when absent
+  //   MC10-15 fromMap accepts double outputWidth/outputHeight (int coercion)
+  //   MC10-16 equality and hashCode
+  //   MC10-17 toString includes textureId and output dimensions
+  group('VGMultiCamRenderTextureSession', () {
+    const kValidSessionMap = <Object?, Object?>{
+      'textureId':    42,
+      'outputWidth':  1080,
+      'outputHeight': 1920,
+    };
+
+    test('MC10-11 fromMap parses a complete valid map', () {
+      final s = VGMultiCamRenderTextureSession.fromMap(kValidSessionMap);
+      expect(s, isNotNull,
+          reason: 'must parse valid map with all fields');
+      expect(s!.textureId,    42);
+      expect(s.outputWidth,   1080);
+      expect(s.outputHeight,  1920);
+    });
+
+    test('MC10-12 fromMap returns null when textureId is missing', () {
+      final map = Map<Object?, Object?>.from(kValidSessionMap)..remove('textureId');
+      final s = VGMultiCamRenderTextureSession.fromMap(map);
+      expect(s, isNull,
+          reason: 'textureId is required — must return null when absent');
+    });
+
+    test('MC10-13 fromMap returns null when map is null', () {
+      final s = VGMultiCamRenderTextureSession.fromMap(null);
+      expect(s, isNull, reason: 'null input must yield null output');
+    });
+
+    test('MC10-14 fromMap defaults outputWidth/outputHeight to 0 when absent', () {
+      const map = <Object?, Object?>{'textureId': 7};
+      final s = VGMultiCamRenderTextureSession.fromMap(map);
+      expect(s, isNotNull);
+      expect(s!.outputWidth,  0,
+          reason: 'outputWidth must default to 0 when not present');
+      expect(s.outputHeight, 0,
+          reason: 'outputHeight must default to 0 when not present');
+    });
+
+    test('MC10-15 fromMap coerces double outputWidth/outputHeight to int', () {
+      const map = <Object?, Object?>{
+        'textureId':    5,
+        'outputWidth':  1080.0,
+        'outputHeight': 1920.0,
+      };
+      final s = VGMultiCamRenderTextureSession.fromMap(map);
+      expect(s, isNotNull);
+      expect(s!.outputWidth,  1080);
+      expect(s.outputHeight,  1920);
+    });
+
+    test('MC10-16 equality and hashCode', () {
+      const a = VGMultiCamRenderTextureSession(
+          textureId: 1, outputWidth: 1080, outputHeight: 1920);
+      const b = VGMultiCamRenderTextureSession(
+          textureId: 1, outputWidth: 1080, outputHeight: 1920);
+      const c = VGMultiCamRenderTextureSession(
+          textureId: 2, outputWidth: 1080, outputHeight: 1920);
+      expect(a == b, isTrue,
+          reason: 'identical field values must be equal');
+      expect(a.hashCode == b.hashCode, isTrue,
+          reason: 'equal objects must have same hashCode');
+      expect(a == c, isFalse,
+          reason: 'different textureId must not be equal');
+    });
+
+    test('MC10-17 toString includes textureId and output dimensions', () {
+      const s = VGMultiCamRenderTextureSession(
+          textureId: 99, outputWidth: 1080, outputHeight: 1920);
+      final str = s.toString();
+      expect(str, contains('99'),     reason: 'textureId must appear in toString');
+      expect(str, contains('1080'),   reason: 'outputWidth must appear in toString');
+      expect(str, contains('1920'),   reason: 'outputHeight must appear in toString');
+    });
+  });
+
+  // ── MC-10: VGCameraSession.startMultiCamRenderDiagnostic ─────────────────
+  //
+  // Tests for the MC-10 live Flutter texture diagnostic — start channel route.
+  // Confirms channel dispatch, argument passing, result parsing, and
+  // null-safety fallbacks.
+  //
+  // These are pure Dart / mock-channel tests — no native code runs.
+  //
+  // Acceptance criteria:
+  //   MC10-1  dispatches 'startMultiCamRenderDiagnostic' with frontDeviceId and backDeviceId
+  //   MC10-2  parses valid response map into VGMultiCamRenderTextureSession
+  //   MC10-3  returns null when native returns null (source init failed / iOS<13)
+  //   MC10-4  returns null on PlatformException (CAMERA_ACTIVE, ALREADY_RUNNING, etc.)
+  //   MC10-5  uses exact channel method name 'startMultiCamRenderDiagnostic'
+  group('VGCameraSession.startMultiCamRenderDiagnostic', () {
+    const kFrontId = 'AVCaptureDevice-Front-001';
+    const kBackId  = 'AVCaptureDevice-Back-002';
+
+    const kValidStartResponse = <Object?, Object?>{
+      'textureId':    42,
+      'outputWidth':  0,
+      'outputHeight': 0,
+    };
+
+    test(
+      'MC10-1 dispatches startMultiCamRenderDiagnostic with frontDeviceId and backDeviceId',
+      () async {
+        _responses['startMultiCamRenderDiagnostic'] = kValidStartResponse;
+
+        await VGCameraSession.startMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(_log.length, 1,
+            reason: 'startMultiCamRenderDiagnostic must invoke the channel exactly once');
+        expect(_log.first.method, 'startMultiCamRenderDiagnostic',
+            reason: 'channel method name must be exactly startMultiCamRenderDiagnostic');
+        expect(_log.first.arguments['frontDeviceId'], kFrontId,
+            reason: 'frontDeviceId must be forwarded to the channel');
+        expect(_log.first.arguments['backDeviceId'],  kBackId,
+            reason: 'backDeviceId must be forwarded to the channel');
+      },
+    );
+
+    test(
+      'MC10-2 parses valid response map into VGMultiCamRenderTextureSession',
+      () async {
+        _responses['startMultiCamRenderDiagnostic'] = kValidStartResponse;
+
+        final session = await VGCameraSession.startMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(session, isNotNull,
+            reason: 'must return non-null VGMultiCamRenderTextureSession for valid map');
+        expect(session!.textureId,    42);
+        expect(session.outputWidth,   0);
+        expect(session.outputHeight,  0);
+      },
+    );
+
+    test(
+      'MC10-3 returns null when native returns null (iOS<13 or init failed)',
+      () async {
+        _responses['startMultiCamRenderDiagnostic'] = null;
+
+        final session = await VGCameraSession.startMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(session, isNull,
+            reason: 'null native response must yield null session');
+      },
+    );
+
+    test(
+      'MC10-4 returns null on PlatformException (CAMERA_ACTIVE)',
+      () async {
+        _responses['startMultiCamRenderDiagnostic'] = PlatformException(
+          code: 'CAMERA_ACTIVE',
+          message: 'Stop camera preview before starting MultiCam render diagnostic',
+        );
+
+        final session = await VGCameraSession.startMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(session, isNull,
+            reason: 'must return null (not rethrow) on PlatformException CAMERA_ACTIVE');
+      },
+    );
+
+    test(
+      'MC10-4b returns null on PlatformException (ALREADY_RUNNING)',
+      () async {
+        _responses['startMultiCamRenderDiagnostic'] = PlatformException(
+          code: 'ALREADY_RUNNING',
+          message: 'A MultiCam render diagnostic is already running',
+        );
+
+        final session = await VGCameraSession.startMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(session, isNull,
+            reason: 'must return null (not rethrow) on PlatformException ALREADY_RUNNING');
+      },
+    );
+
+    test(
+      'MC10-5 uses exact channel method name startMultiCamRenderDiagnostic',
+      () async {
+        _responses['startMultiCamRenderDiagnostic'] = kValidStartResponse;
+
+        await VGCameraSession.startMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(
+          _log.first.method,
+          'startMultiCamRenderDiagnostic',
+          reason: 'channel method name must be exactly startMultiCamRenderDiagnostic '
+              '(not startMultiCamRendererDiagnostic or any other variant)',
+        );
+      },
+    );
+  });
+
+  // ── MC-10: VGCameraSession.stopMultiCamRenderDiagnostic ──────────────────
+  //
+  // Tests for the MC-10 live Flutter texture diagnostic — stop channel route.
+  // Confirms channel dispatch, no-args contract, result parsing, and
+  // null-safety fallbacks.
+  //
+  // Acceptance criteria:
+  //   MC10-6  dispatches 'stopMultiCamRenderDiagnostic' with no arguments
+  //   MC10-7  parses valid response into VGMultiCamRenderReport
+  //   MC10-8  returns null when native returns null (no diagnostic running)
+  //   MC10-9  returns null on PlatformException
+  //   MC10-10 uses exact channel method name 'stopMultiCamRenderDiagnostic'
+  group('VGCameraSession.stopMultiCamRenderDiagnostic', () {
+    // Canonical valid stop response — mirrors native merged metrics map.
+    const kValidStopResponse = <Object?, Object?>{
+      'renderedFrames':        78,
+      'droppedRenderFrames':   7,
+      'averageRenderMs':       12.34,
+      'peakRenderMs':          28.91,
+      'outputWidth':           1080,
+      'outputHeight':          1920,
+      'pairedFramesReceived':  85,
+      'frontFramesReceived':   90,
+      'backFramesReceived':    85,
+      'peakSystemPressureCost': 0.51,
+      'hardwareCost':          0.50,
+      'durationSeconds':       5.10,
+    };
+
+    test(
+      'MC10-6 dispatches stopMultiCamRenderDiagnostic with no arguments',
+      () async {
+        _responses['stopMultiCamRenderDiagnostic'] = kValidStopResponse;
+
+        await VGCameraSession.stopMultiCamRenderDiagnostic();
+
+        expect(_log.length, 1,
+            reason: 'stopMultiCamRenderDiagnostic must invoke the channel exactly once');
+        expect(_log.first.method, 'stopMultiCamRenderDiagnostic',
+            reason: 'channel method name must be exactly stopMultiCamRenderDiagnostic');
+        expect(_log.first.arguments, isNull,
+            reason: 'stopMultiCamRenderDiagnostic must send no arguments');
+      },
+    );
+
+    test(
+      'MC10-7 parses valid response into VGMultiCamRenderReport',
+      () async {
+        _responses['stopMultiCamRenderDiagnostic'] = kValidStopResponse;
+
+        final report = await VGCameraSession.stopMultiCamRenderDiagnostic();
+
+        expect(report, isNotNull,
+            reason: 'must return non-null VGMultiCamRenderReport for valid response');
+        expect(report!.renderedFrames,       78);
+        expect(report.droppedRenderFrames,   7);
+        expect(report.averageRenderMs,       closeTo(12.34, 0.0001));
+        expect(report.peakRenderMs,          closeTo(28.91, 0.0001));
+        expect(report.outputWidth,           1080);
+        expect(report.outputHeight,          1920);
+        expect(report.pairedFramesReceived,  85);
+        expect(report.frontFramesReceived,   90);
+        expect(report.backFramesReceived,    85);
+        expect(report.peakSystemPressureCost, closeTo(0.51, 0.0001));
+        expect(report.hardwareCost,          closeTo(0.50, 0.0001));
+        expect(report.durationSeconds,       closeTo(5.10, 0.001));
+      },
+    );
+
+    test(
+      'MC10-8 returns null when native returns null (no active diagnostic)',
+      () async {
+        _responses['stopMultiCamRenderDiagnostic'] = null;
+
+        final report = await VGCameraSession.stopMultiCamRenderDiagnostic();
+
+        expect(report, isNull,
+            reason: 'null native response must yield null (no active diagnostic)');
+      },
+    );
+
+    test(
+      'MC10-9 returns null on PlatformException',
+      () async {
+        _responses['stopMultiCamRenderDiagnostic'] = PlatformException(
+          code: 'INTERNAL_ERROR',
+          message: 'Unexpected failure during stop',
+        );
+
+        final report = await VGCameraSession.stopMultiCamRenderDiagnostic();
+
+        expect(report, isNull,
+            reason: 'must return null (not rethrow) on PlatformException');
+      },
+    );
+
+    test(
+      'MC10-10 uses exact channel method name stopMultiCamRenderDiagnostic',
+      () async {
+        _responses['stopMultiCamRenderDiagnostic'] = kValidStopResponse;
+
+        await VGCameraSession.stopMultiCamRenderDiagnostic();
+
+        expect(
+          _log.first.method,
+          'stopMultiCamRenderDiagnostic',
+          reason: 'channel method name must be exactly stopMultiCamRenderDiagnostic '
+              '(not stopMultiCamRendererDiagnostic or any other variant)',
+        );
+      },
+    );
+  });
 }

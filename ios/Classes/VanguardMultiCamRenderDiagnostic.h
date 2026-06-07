@@ -1,19 +1,28 @@
 // VanguardMultiCamRenderDiagnostic.h
-// vanguard_media_engine — MC-9: Offscreen MultiCam render diagnostic.
+// vanguard_media_engine — MC-9/MC-10: MultiCam render diagnostic.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// MC-9 — MULTICAM RENDER DIAGNOSTIC (OFFSCREEN COMPOSITION, DIAGNOSTIC-ONLY)
+// MC-9/MC-10 — MULTICAM RENDER DIAGNOSTIC (OFFSCREEN COMPOSITION + TEXTURE)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Diagnostic-only offscreen compositor that receives VanguardMultiCamPairedFrame
 // objects from VanguardMultiCamMediaSource and composites them using CoreImage
-// into a CVPixelBuffer pool. No Flutter texture. No visible preview.
+// into a CVPixelBuffer pool.
+//
+// MC-9: offscreen-only. No Flutter texture. No visible preview.
+// MC-10: adds FlutterTexture protocol conformance for live visible preview
+//        via the start/stop API (startMultiCamRenderDiagnostic /
+//        stopMultiCamRenderDiagnostic). The blocking run API is preserved.
 //
 // ── PURPOSE ──────────────────────────────────────────────────────────────────
 //
 //   MC-9 proves that real-time offscreen CoreImage composition of two 1080p
 //   BGRA streams at ~26–30 fps is feasible within the device's thermal and
-//   memory budget, before any Flutter texture integration (MC-10+).
+//   memory budget.
+//
+//   MC-10 proves that the composited buffer can be delivered to Flutter's
+//   rendering pipeline through <FlutterTexture>, producing a live visible
+//   dual-camera PiP preview.
 //
 //   The class composites:
 //     - Back camera = full canvas (primary)
@@ -24,7 +33,8 @@
 // ── DESIGN CONSTRAINTS ───────────────────────────────────────────────────────
 //
 //   DIAGNOSTIC-ONLY: This class must NOT be used for production rendering,
-//   Flutter texture delivery, or camera graph integration.
+//   camera graph integration, or any Flutter texture delivery outside the
+//   MC-10 start/stop diagnostic route.
 //
 //   Frame dropping: If the renderQ is busy when a new paired frame arrives,
 //   the new frame is silently dropped (_renderingInFlight flag). This preserves
@@ -36,8 +46,9 @@
 //   Buffer lifetime: VanguardMultiCamPairedFrame is ARC-retained through the
 //   async dispatch, releasing both pixel buffers when the frame is done.
 //
-//   _lastCompositedBuffer: Retained for MC-10 readiness. Released on next
-//   successful render, on stop, and in dealloc.
+//   _lastCompositedBuffer: Protected by os_unfair_lock (_bufferLock).
+//   Written on renderQ; read on Flutter raster thread via copyPixelBuffer.
+//   Released on next successful render, on stop, and in dealloc.
 //
 // ── THREAD SAFETY ─────────────────────────────────────────────────────────────
 //
@@ -45,7 +56,13 @@
 //   _renderingInFlight is written on captureQ (read/check/set — all on captureQ).
 //   The NO write from renderQ is a single aligned store (safe on ARM64).
 //
-//   All other ivars are accessed on renderQ only.
+//   _lastCompositedBuffer is protected by os_unfair_lock (_bufferLock).
+//   Lock scope covers only pointer swap/retain/release — not CIContext rendering.
+//
+//   textureFrameAvailable: dispatched to main queue from renderQ after each
+//   successful composition, but only when a texture is registered.
+//
+//   registerTexture / unregisterTexture: called on main thread only.
 //
 // ── AVAILABILITY ─────────────────────────────────────────────────────────────
 //
@@ -57,11 +74,11 @@
 //   VanguardMultiCamMediaSource.*    VanguardMultiCamPairedFrame.*
 //   VanguardMultiCamFramePairer.*    VGCameraGraphSession.*
 //   VanguardCameraMediaSource.*      VanguardMediaSource.h
-//   VanguardMediaEnginePlugin.swift  connectsapp_*/**
 //   Phase 8 overlay files
 
 #import <Foundation/Foundation.h>
 #import <CoreVideo/CoreVideo.h>
+#import <Flutter/Flutter.h>
 #import "VanguardMultiCamMediaSource.h"
 
 NS_ASSUME_NONNULL_BEGIN
@@ -70,10 +87,16 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Diagnostic-only offscreen compositor for MultiCam paired frames.
 ///
-/// Conforms to `VanguardMultiCamMediaSourceDelegate` and composites received
+/// ## MC-9: Blocking run API
+/// Conforms to `VanguardMultiCamMediaSourceDelegate`. Composites received
 /// front/back paired frames offscreen using CoreImage and CVPixelBufferPool.
 ///
-/// ## Usage
+/// ## MC-10: Start/stop texture API
+/// Implements `<FlutterTexture>` to deliver composited buffers to Flutter.
+/// When instantiated with a `FlutterTextureRegistry`, registers a texture on
+/// init and signals `textureFrameAvailable` after each successful composition.
+///
+/// ## Usage (MC-9 blocking)
 /// ```objc
 /// VanguardMultiCamRenderDiagnostic *renderer = [[VanguardMultiCamRenderDiagnostic alloc] init];
 /// source.delegate = renderer;
@@ -81,18 +104,55 @@ NS_ASSUME_NONNULL_BEGIN
 /// NSDictionary *metrics = renderer.metrics;
 /// ```
 ///
+/// ## Usage (MC-10 start/stop)
+/// ```objc
+/// VanguardMultiCamRenderDiagnostic *renderer =
+///     [[VanguardMultiCamRenderDiagnostic alloc] initWithTextureRegistry:registry];
+/// int64_t textureId = renderer.textureId;
+/// source.delegate = renderer;
+/// // ... run source until stopped ...
+/// [renderer doUnregisterTexture];
+/// NSDictionary *metrics = renderer.metrics;
+/// ```
+///
 /// ## Diagnostic-Only
-/// Not for production use. No Flutter texture. No visible preview.
-/// Do NOT integrate with VGCameraGraphSession or VanguardCameraMediaSource.
-@interface VanguardMultiCamRenderDiagnostic : NSObject <VanguardMultiCamMediaSourceDelegate>
+/// Not for production use. Do NOT integrate with VGCameraGraphSession or
+/// VanguardCameraMediaSource.
+@interface VanguardMultiCamRenderDiagnostic : NSObject <VanguardMultiCamMediaSourceDelegate, FlutterTexture>
 
-// ─── Designated initializer ───────────────────────────────────────────────────
+// ─── Designated initializers ──────────────────────────────────────────────────
 
-/// Initializes the renderer. Call before assigning as a delegate.
+/// MC-9 initializer. No texture registry. No Flutter texture.
 ///
 /// Creates the serial renderQ and dedicated CIContext.
 /// Does NOT allocate the CVPixelBufferPool (created lazily on first render).
+/// Does NOT call textureFrameAvailable after renders.
 - (instancetype)init NS_DESIGNATED_INITIALIZER;
+
+/// MC-10 initializer. Registers a Flutter texture on the main thread.
+///
+/// Creates the serial renderQ, dedicated CIContext, and registers this object
+/// as a FlutterTexture with the provided registry. The texture ID is stored in
+/// `textureId` and is valid until `doUnregisterTexture` is called.
+///
+/// MUST be called on the main thread (Flutter requirement for registerTexture:).
+///
+/// @param registry  The Flutter texture registry from the plugin registrar.
+- (instancetype)initWithTextureRegistry:(id<FlutterTextureRegistry>)registry
+    NS_DESIGNATED_INITIALIZER;
+
+// ─── Flutter Texture (MC-10) ──────────────────────────────────────────────────
+
+/// The registered Flutter texture ID. Valid only after initWithTextureRegistry:.
+/// 0 when no texture is registered (init-only path).
+@property (nonatomic, readonly) int64_t textureId;
+
+/// Unregisters the Flutter texture from the registry.
+///
+/// Must be called on the main thread AFTER draining the renderQ (stop).
+/// After this call, Flutter will never call copyPixelBuffer again.
+/// Safe to call multiple times (idempotent).
+- (void)doUnregisterTexture;
 
 // ─── Metrics ──────────────────────────────────────────────────────────────────
 
@@ -124,18 +184,18 @@ NS_ASSUME_NONNULL_BEGIN
 ///   @"outputWidth"         — int32_t: output buffer width in pixels
 ///   @"outputHeight"        — int32_t: output buffer height in pixels
 ///
-/// Safe to call from any thread after source.stop().
+/// Safe to call from any thread after source.stop() and self.stop().
 - (NSDictionary<NSString *, NSNumber *> *)metrics;
 
 // ─── Cleanup ──────────────────────────────────────────────────────────────────
 
-/// Releases the last composited buffer and tears down pool resources.
+/// Drains the renderQ and releases the last composited buffer.
 ///
 /// Call after source.stop() to ensure all retained buffers are freed before
 /// reading metrics. Safe to call multiple times (idempotent).
 ///
-/// After stop, the delegate will not process any further frames (the source
-/// has already stopped delivering them). This method completes the cleanup.
+/// For the MC-10 start/stop path, call BEFORE doUnregisterTexture so that
+/// renderQ is drained before the raster thread is unblocked from unregister.
 - (void)stop;
 
 @end

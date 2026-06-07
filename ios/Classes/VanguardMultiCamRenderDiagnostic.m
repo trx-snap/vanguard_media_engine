@@ -1,8 +1,8 @@
 // VanguardMultiCamRenderDiagnostic.m
-// vanguard_media_engine — MC-9: Offscreen MultiCam render diagnostic.
+// vanguard_media_engine — MC-9/MC-10: MultiCam render diagnostic.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// MC-9 — MULTICAM RENDER DIAGNOSTIC (OFFSCREEN COMPOSITION, DIAGNOSTIC-ONLY)
+// MC-9/MC-10 — MULTICAM RENDER DIAGNOSTIC (OFFSCREEN COMPOSITION + TEXTURE)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // See VanguardMultiCamRenderDiagnostic.h for full documentation.
@@ -36,12 +36,22 @@
 //   Written NO from renderQ (single aligned store — safe on ARM64).
 //   When YES on arrival, the frame is dropped and droppedRenderFrames incremented.
 //
-// _lastCompositedBuffer:
-//   Retained after each successful render (node-owned +1 from pool allocation).
+// _lastCompositedBuffer (MC-10):
+//   Protected by os_unfair_lock (_bufferLock).
+//   Written on renderQ (after render completes), released under lock.
+//   Read by Flutter raster thread via copyPixelBuffer (under lock, retained).
+//   Lock scope covers ONLY pointer swap/retain/release — not CIContext rendering.
 //   Released on displacement, stop, and dealloc.
-//   Exposed for MC-10 readiness but not surfaced in current diagnostic metrics.
 //
-// Composition layout (PiP only — MC-9 scope):
+// textureFrameAvailable (MC-10):
+//   Dispatched to main queue after each successful composition and buffer swap.
+//   Guarded by _textureRegistered flag — no-op during MC-9 blocking run path.
+//
+// registerTexture / unregisterTexture (MC-10):
+//   Both called on main thread. initWithTextureRegistry: asserts main thread.
+//   doUnregisterTexture must be called after stop (renderQ drained).
+//
+// Composition layout (PiP only — MC-9 scope, preserved in MC-10):
 //   Primary: back camera (full canvas, back buffer dimensions used as output).
 //   Secondary: front camera (PiP inset, bottom-right corner, widthFraction=0.35).
 //   Layout math: VGDualCameraLayoutMath (MC-1A).
@@ -52,12 +62,15 @@
 //   VGDualCameraCompositorNode._compositeWithPrimary:secondary: (Phase 7.x-J)
 //   BeautyV2FilterGroup._VGBeautyCreatePool() (Phase 4B)
 //
+//   FlutterTexture pattern matches VanguardMetalRenderer (os_unfair_lock,
+//   CVPixelBufferRetain in copyPixelBuffer, textureFrameAvailable on main).
+//
 // ── DO NOT MODIFY ─────────────────────────────────────────────────────────────
 //
 //   VanguardMultiCamMediaSource.*    VanguardMultiCamPairedFrame.*
 //   VanguardMultiCamFramePairer.*    VGCameraGraphSession.*
 //   VanguardCameraMediaSource.*      VGDualCameraCompositorNode.*
-//   VanguardMediaEnginePlugin.swift  connectsapp_*/**
+//   Phase 8 overlay files
 
 #import "VanguardMultiCamRenderDiagnostic.h"
 #import "VanguardMultiCamPairedFrame.h"
@@ -65,6 +78,7 @@
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
 #import <QuartzCore/QuartzCore.h>  // CACurrentMediaTime
+#import <os/lock.h>
 
 // ─── Dedicated CIContext ──────────────────────────────────────────────────────
 //
@@ -99,7 +113,7 @@ _VGMCRDCreatePool(size_t width, size_t height) {
         (id)kCVPixelBufferHeightKey             : @(height),
         (id)kCVPixelBufferPixelFormatTypeKey    : @(kCVPixelFormatType_32BGRA),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},     // IOSurface-backed
-        (id)kCVPixelBufferMetalCompatibilityKey : @YES,   // MC-10 texture bridge readiness
+        (id)kCVPixelBufferMetalCompatibilityKey : @YES,   // MC-10 texture bridge
     };
     CVPixelBufferPoolRef pool = NULL;
     CVReturn status = CVPixelBufferPoolCreate(
@@ -146,11 +160,19 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     size_t _poolWidth;
     size_t _poolHeight;
 
-    // ── Last composited buffer ────────────────────────────────────────────────
+    // ── Last composited buffer (MC-9/MC-10) ──────────────────────────────────
     //
-    // Retained for MC-10 readiness. Allocated from _pool (+1).
-    // Released on displacement (next successful render), stop, and dealloc.
+    // Protected by os_unfair_lock (_bufferLock).
+    // Written on renderQ after each successful composite.
+    // Read on Flutter raster thread via copyPixelBuffer.
+    // Lock scope: pointer swap/retain/release only — NOT CIContext rendering.
     CVPixelBufferRef _lastCompositedBuffer;
+
+    // ── Buffer lock (MC-10) ───────────────────────────────────────────────────
+    //
+    // os_unfair_lock is priority-aware (raster thread is high-priority).
+    // Non-recursive. Must not be held across CIContext rendering.
+    os_unfair_lock _bufferLock;
 
     // ── Metrics (written on renderQ, read after stop) ─────────────────────────
     int32_t _renderedFrames;
@@ -165,29 +187,44 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     // Set to YES by stop. Checked in renderQ block to prevent rendering
     // after the diagnostic window has closed.
     BOOL _stopped;
+
+    // ── Flutter Texture (MC-10) ───────────────────────────────────────────────
+    //
+    // Weak reference to avoid retain cycle: Flutter registry retains textures
+    // by ID, not by object reference. We must not extend registry lifetime.
+    __weak id<FlutterTextureRegistry> _textureRegistry;
+
+    // The registered texture ID. 0 until initWithTextureRegistry: is called.
+    int64_t _textureId;
+
+    // Guards textureFrameAvailable dispatch. YES only when initWithTextureRegistry:
+    // was used. The MC-9 blocking run path never sets this to YES.
+    BOOL _textureRegistered;
 }
 
 @synthesize renderedFrames      = _renderedFrames;
 @synthesize droppedRenderFrames = _droppedRenderFrames;
-@synthesize averageRenderMs     = _averageRenderMs;
+// averageRenderMs is a computed property — custom getter defined below.
+// @dynamic suppresses the auto-synthesis warning; no backing ivar is generated.
+@dynamic    averageRenderMs;
 @synthesize peakRenderMs        = _peakRenderMs;
 @synthesize outputWidth         = _outputWidth;
 @synthesize outputHeight        = _outputHeight;
+@synthesize textureId           = _textureId;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Init / Dealloc
 // ─────────────────────────────────────────────────────────────────────────────
 
-- (instancetype)init {
-    self = [super init];
-    if (!self) return nil;
-
+/// Shared initialization logic. Called from both designated initializers.
+- (void)_commonInit {
     // Create dedicated serial render queue.
-    // Quality: userInitiated — we need timely completion but must not block UI.
+    // Quality: userInitiated — timely completion without blocking UI.
     _renderQ = dispatch_queue_create(
         "com.vanguard.multicam.renderDiagnosticQ",
         DISPATCH_QUEUE_SERIAL);
 
+    _bufferLock          = OS_UNFAIR_LOCK_INIT;
     _renderingInFlight   = NO;
     _stopped             = NO;
     _pool                = NULL;
@@ -202,26 +239,99 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     _outputWidth         = 0;
     _outputHeight        = 0;
 
+    _textureRegistry     = nil;
+    _textureId           = 0;
+    _textureRegistered   = NO;
+
     // Pre-warm the shared CIContext (dispatch_once is lazy).
     // Doing this here avoids a first-frame spike.
     (void)_VGMCRDSharedCIContext();
+}
 
-    NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] init: render diagnostic created.");
+/// MC-9 designated initializer — no Flutter texture.
+- (instancetype)init {
+    self = [super init];
+    if (!self) return nil;
+    [self _commonInit];
+    NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] init: render diagnostic created (no texture).");
+    return self;
+}
+
+/// MC-10 designated initializer — registers Flutter texture.
+///
+/// Must be called on the main thread.
+- (instancetype)initWithTextureRegistry:(id<FlutterTextureRegistry>)registry {
+    NSAssert([NSThread isMainThread],
+             @"[VanguardMultiCamRenderDiagnostic] initWithTextureRegistry: must be called on main thread.");
+    self = [super init];
+    if (!self) return nil;
+    [self _commonInit];
+
+    // Register with Flutter texture registry on the main thread.
+    // Matches VanguardMetalRenderer.m L218-226 pattern.
+    _textureRegistry   = registry;
+    _textureId         = [registry registerTexture:self];
+    _textureRegistered = YES;
+
+    NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-10] initWithTextureRegistry: "
+          "registered textureId=%lld.", (long long)_textureId);
     return self;
 }
 
 - (void)dealloc {
-    // Release last composited buffer if any.
-    if (_lastCompositedBuffer) {
-        CVPixelBufferRelease(_lastCompositedBuffer);
-        _lastCompositedBuffer = NULL;
-    }
+    // Release last composited buffer if any (under lock).
+    os_unfair_lock_lock(&_bufferLock);
+    CVPixelBufferRef buf = _lastCompositedBuffer;
+    _lastCompositedBuffer = NULL;
+    os_unfair_lock_unlock(&_bufferLock);
+    if (buf) CVPixelBufferRelease(buf);
+
     // Release pool (CF type — not ARC).
     if (_pool) {
         CVPixelBufferPoolRelease(_pool);
         _pool = NULL;
     }
     NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] dealloc: resources released.");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - FlutterTexture Protocol (MC-10)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Called on Flutter raster thread. Must be thread-safe and fast.
+///
+/// Returns a +1 retained CVPixelBufferRef — Flutter engine releases it after
+/// rendering. Returns NULL if no frame has been composited yet.
+///
+/// Lock scope: acquire lock, retain, unlock, return. No CIContext work here.
+- (CVPixelBufferRef _Nullable)copyPixelBuffer {
+    os_unfair_lock_lock(&_bufferLock);
+    CVPixelBufferRef result =
+        _lastCompositedBuffer ? CVPixelBufferRetain(_lastCompositedBuffer) : NULL;
+    os_unfair_lock_unlock(&_bufferLock);
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Texture Unregister (MC-10)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Unregisters the Flutter texture from the registry.
+///
+/// Must be called on main thread AFTER stop (renderQ drained).
+/// After this returns, Flutter will never call copyPixelBuffer again.
+/// Safe to call multiple times (idempotent via _textureRegistered guard).
+- (void)doUnregisterTexture {
+    NSAssert([NSThread isMainThread],
+             @"[VanguardMultiCamRenderDiagnostic] doUnregisterTexture must be called on main thread.");
+    if (!_textureRegistered) return;
+    id<FlutterTextureRegistry> registry = _textureRegistry;
+    if (registry && _textureId != 0) {
+        [registry unregisterTexture:_textureId];
+    }
+    _textureRegistered = NO;
+    NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-10] doUnregisterTexture: "
+          "unregistered textureId=%lld.", (long long)_textureId);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -235,12 +345,16 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     // Synchronously drain the renderQ so we can safely read metrics afterward.
     // dispatch_sync on the serial renderQ guarantees all enqueued blocks complete.
     dispatch_sync(_renderQ, ^{
-        // Release last composited buffer — no longer needed after stop.
-        if (self->_lastCompositedBuffer) {
-            CVPixelBufferRelease(self->_lastCompositedBuffer);
-            self->_lastCompositedBuffer = NULL;
-        }
+        // Release last composited buffer under lock — no more raster-thread reads
+        // are possible after doUnregisterTexture (called by plugin after stop).
+        // Locking here is defensive: ensures correct pairing with copyPixelBuffer.
+        os_unfair_lock_lock(&self->_bufferLock);
+        CVPixelBufferRef buf = self->_lastCompositedBuffer;
+        self->_lastCompositedBuffer = NULL;
+        os_unfair_lock_unlock(&self->_bufferLock);
+        if (buf) CVPixelBufferRelease(buf);
     });
+
     NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] stop: renderQ drained. "
           "rendered=%d dropped=%d avgMs=%.2f peakMs=%.2f",
           _renderedFrames, _droppedRenderFrames,
@@ -319,6 +433,9 @@ _VGMCRDCreatePool(size_t width, size_t height) {
 ///
 /// CIFilter instances are created fresh per-frame. CIFilter is NOT thread-safe.
 /// VGDualCameraLayoutMath is pure C — safe to call from any thread.
+///
+/// After successful render and buffer swap (MC-10):
+///   If _textureRegistered, dispatches textureFrameAvailable: to main queue.
 - (void)_renderPairedFrame:(VanguardMultiCamPairedFrame *)frame {
     if (_stopped) return;
 
@@ -351,10 +468,13 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     if (!_pool || _poolWidth != primW || _poolHeight != primH) {
         if (_pool) {
             // Release previous pool (dimension change — defensive path).
-            if (_lastCompositedBuffer) {
-                CVPixelBufferRelease(_lastCompositedBuffer);
-                _lastCompositedBuffer = NULL;
-            }
+            // Release old buffer under lock before releasing pool.
+            os_unfair_lock_lock(&_bufferLock);
+            CVPixelBufferRef old = _lastCompositedBuffer;
+            _lastCompositedBuffer = NULL;
+            os_unfair_lock_unlock(&_bufferLock);
+            if (old) CVPixelBufferRelease(old);
+
             CVPixelBufferPoolRelease(_pool);
             _pool = NULL;
         }
@@ -477,6 +597,7 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     // CIContext render:toCVPixelBuffer:bounds:colorSpace: is synchronous.
     // It blocks renderQ until the GPU operation completes.
     // Timing wraps this call to measure actual render duration.
+    // Lock is NOT held during rendering — only during pointer swap.
     double t0 = CACurrentMediaTime() * 1000.0; // milliseconds
 
     CGRect renderBounds = CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH);
@@ -498,22 +619,44 @@ _VGMCRDCreatePool(size_t width, size_t height) {
         _outputHeight = (int32_t)primH;
     }
 
-    // ── 12. Retain last composited buffer (MC-10 readiness) ───────────────────
+    // ── 12. Swap _lastCompositedBuffer under lock (MC-10) ─────────────────────
     //
-    // Release previous buffer before storing new one.
-    // Manual release required — this is a CVPixelBufferRef (CF type, not ARC).
-    if (_lastCompositedBuffer) {
-        CVPixelBufferRelease(_lastCompositedBuffer);
-    }
+    // Lock scope covers ONLY pointer swap — NOT the CIContext render above.
+    // Raster thread (copyPixelBuffer) may be concurrently reading;
+    // os_unfair_lock ensures mutual exclusion with correct priority inheritance.
+    os_unfair_lock_lock(&_bufferLock);
+    CVPixelBufferRef old = _lastCompositedBuffer;
     _lastCompositedBuffer = outputBuf; // takes +1 from pool allocation
+    os_unfair_lock_unlock(&_bufferLock);
 
-    // ── 13. One-time first-frame log ──────────────────────────────────────────
+    // Release the displaced buffer AFTER unlocking.
+    // The +1 from pool allocation is now exclusively held by _lastCompositedBuffer.
+    if (old) {
+        CVPixelBufferRelease(old);
+    }
+
+    // ── 13. Signal Flutter raster thread (MC-10) ──────────────────────────────
+    //
+    // Only when a texture is registered (MC-10 start/stop path).
+    // The MC-9 blocking run path does not call this (no texture registered).
+    // Dispatched to main queue — Flutter requirement (matches VanguardMetalRenderer).
+    if (_textureRegistered) {
+        __weak __typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong __typeof(weakSelf) strong = weakSelf;
+            if (!strong || !strong->_textureRegistered) return;
+            [strong->_textureRegistry textureFrameAvailable:strong->_textureId];
+        });
+    }
+
+    // ── 14. One-time first-frame log ──────────────────────────────────────────
     if (_renderedFrames == 1) {
         NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] first frame rendered | "
-              "canvas=%zux%zu pip=(%.0f,%.0f,%.0f,%.0f) cr=%.1f renderMs=%.2f",
+              "canvas=%zux%zu pip=(%.0f,%.0f,%.0f,%.0f) cr=%.1f renderMs=%.2f texture=%s",
               primW, primH,
               pipOriginX, pipOriginY, pipW, pipH,
-              cr, renderMs);
+              cr, renderMs,
+              _textureRegistered ? "YES" : "NO");
     }
 }
 

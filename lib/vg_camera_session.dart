@@ -717,6 +717,95 @@ class VGMultiCamSyncReport {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// MC-10: VGMultiCamRenderTextureSession
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The result returned by [VGCameraSession.startMultiCamRenderDiagnostic].
+///
+/// Contains the Flutter texture ID for mounting a [Texture] widget, plus the
+/// initial output dimensions (0×0 until the first frame has been composited).
+///
+/// ## Usage
+/// ```dart
+/// final session = await VGCameraSession.startMultiCamRenderDiagnostic(
+///   frontDeviceId: frontId,
+///   backDeviceId: backId,
+/// );
+/// if (session != null) {
+///   // Mount the live PiP preview:
+///   Widget preview = Texture(textureId: session.textureId);
+/// }
+/// // When done:
+/// final report = await VGCameraSession.stopMultiCamRenderDiagnostic();
+/// ```
+///
+/// ## Diagnostic-Only
+/// Not for production use. Part of the MC-10 live MultiCam texture diagnostic.
+@immutable
+class VGMultiCamRenderTextureSession {
+  const VGMultiCamRenderTextureSession({
+    required this.textureId,
+    required this.outputWidth,
+    required this.outputHeight,
+  });
+
+  /// The Flutter texture ID. Pass to `Texture(textureId: textureId)` to display
+  /// the live dual-camera PiP composite.
+  final int textureId;
+
+  /// Width of the output composite buffer in pixels.
+  /// 0 until the first frame has been composited.
+  final int outputWidth;
+
+  /// Height of the output composite buffer in pixels.
+  /// 0 until the first frame has been composited.
+  final int outputHeight;
+
+  /// Parses a [VGMultiCamRenderTextureSession] from the native channel response.
+  ///
+  /// Returns `null` if [map] is `null` or [textureId] is absent or of the
+  /// wrong type. [outputWidth] and [outputHeight] default to 0 if absent.
+  static VGMultiCamRenderTextureSession? fromMap(Map<Object?, Object?>? map) {
+    if (map == null) return null;
+
+    // textureId — required int (Int64 on native, decoded as int in Dart)
+    final rawId = map['textureId'];
+    final int? tid = rawId is int ? rawId : null;
+    if (tid == null) return null;
+
+    // outputWidth / outputHeight — optional; default 0
+    final rawW = map['outputWidth'];
+    final rawH = map['outputHeight'];
+    final int w = rawW is int ? rawW : (rawW is double ? rawW.toInt() : 0);
+    final int h = rawH is int ? rawH : (rawH is double ? rawH.toInt() : 0);
+
+    return VGMultiCamRenderTextureSession(
+      textureId:    tid,
+      outputWidth:  w,
+      outputHeight: h,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGMultiCamRenderTextureSession &&
+          runtimeType == other.runtimeType &&
+          textureId   == other.textureId    &&
+          outputWidth == other.outputWidth  &&
+          outputHeight == other.outputHeight;
+
+  @override
+  int get hashCode => Object.hash(textureId, outputWidth, outputHeight);
+
+  @override
+  String toString() =>
+      'VGMultiCamRenderTextureSession('
+      'textureId: $textureId, '
+      'output: ${outputWidth}x${outputHeight})';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MC-9: VGMultiCamRenderReport
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1428,6 +1517,73 @@ final class VGCameraSession {
           'frontDeviceId': frontDeviceId,
           'backDeviceId': backDeviceId,
         },
+      );
+      return VGMultiCamRenderReport.fromMap(raw);
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  /// Starts a live MultiCam render diagnostic and registers a Flutter texture.
+  ///
+  /// ## MC-10 — diagnostic-only
+  /// Creates a [VanguardMultiCamMediaSource] and [VanguardMultiCamRenderDiagnostic]
+  /// that composites live front/back camera frames using CoreImage into a
+  /// Flutter-visible texture.
+  ///
+  /// ## Lifecycle
+  /// Must be followed by a call to [stopMultiCamRenderDiagnostic] to release
+  /// hardware, drain the render queue, and unregister the Flutter texture.
+  ///
+  /// ## Errors
+  /// Returns `null` on [PlatformException] (e.g., camera not authorized,
+  /// `CAMERA_ACTIVE` if a camera preview is running, `ALREADY_RUNNING` if a
+  /// diagnostic is already active, or iOS < 13.0).
+  ///
+  /// ## Usage
+  /// ```dart
+  /// final session = await VGCameraSession.startMultiCamRenderDiagnostic(
+  ///   frontDeviceId: frontId,
+  ///   backDeviceId: backId,
+  /// );
+  /// if (session != null) {
+  ///   setState(() { _textureId = session.textureId; });
+  /// }
+  /// ```
+  static Future<VGMultiCamRenderTextureSession?> startMultiCamRenderDiagnostic({
+    required String frontDeviceId,
+    required String backDeviceId,
+  }) async {
+    try {
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'startMultiCamRenderDiagnostic',
+        {
+          'frontDeviceId': frontDeviceId,
+          'backDeviceId': backDeviceId,
+        },
+      );
+      return VGMultiCamRenderTextureSession.fromMap(raw);
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  /// Stops the active live MultiCam render diagnostic and returns metrics.
+  ///
+  /// ## MC-10 — diagnostic-only
+  /// Stops the [VanguardMultiCamMediaSource], drains the render queue,
+  /// unregisters the Flutter texture, and returns a [VGMultiCamRenderReport]
+  /// with combined capture and render metrics.
+  ///
+  /// ## Idempotent
+  /// Returns `null` if no diagnostic is currently running. Does not throw.
+  ///
+  /// ## Errors
+  /// Returns `null` on [PlatformException].
+  static Future<VGMultiCamRenderReport?> stopMultiCamRenderDiagnostic() async {
+    try {
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'stopMultiCamRenderDiagnostic',
       );
       return VGMultiCamRenderReport.fromMap(raw);
     } on PlatformException {
