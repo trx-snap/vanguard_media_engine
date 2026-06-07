@@ -2102,4 +2102,415 @@ void main() {
       },
     );
   });
+
+  // ── MC-9: VGMultiCamRenderReport.fromMap ─────────────────────────────────
+  //
+  // Unit tests for the VGMultiCamRenderReport value type introduced in MC-9.
+  // Verifies fromMap parsing, int/double coercion, null handling for missing
+  // fields, renderedFPS computation, equality, hashCode, and toString.
+  //
+  // These are pure Dart tests — no native code, no channel calls.
+  //
+  // Acceptance criteria:
+  //   MC9R-1  parses complete map with all fields
+  //   MC9R-2  parses int values for double fields (int-to-double coercion)
+  //   MC9R-3  returns null for null map
+  //   MC9R-4  returns null for missing renderedFrames (required field)
+  //   MC9R-5  returns null for missing averageRenderMs (required double field)
+  //   MC9R-6  returns null for missing pairedFramesReceived (capture-side field)
+  //   MC9R-7  returns null for missing durationSeconds
+  //   MC9R-8  renderedFPS returns 0.0 when durationSeconds is 0
+  //   MC9R-9  renderedFPS computes correctly
+  //   MC9R-10 equality: two identical reports are equal
+  //   MC9R-11 equality: different renderedFrames are not equal
+  //   MC9R-12 hashCode matches for equal reports
+  //   MC9R-13 toString includes renderedFrames and averageRenderMs
+  //   MC9R-14 toString includes output dimensions
+  group('VGMultiCamRenderReport.fromMap', () {
+    // Canonical valid native response map (mirrors expected native output).
+    const kValidRenderResponse = <Object?, Object?>{
+      'renderedFrames':        78,
+      'droppedRenderFrames':   7,
+      'averageRenderMs':       12.34,
+      'peakRenderMs':          28.91,
+      'outputWidth':           1080,
+      'outputHeight':          1920,
+      'pairedFramesReceived':  85,
+      'frontFramesReceived':   90,
+      'backFramesReceived':    85,
+      'peakSystemPressureCost': 0.51,
+      'hardwareCost':          0.50,
+      'durationSeconds':       3.21,
+    };
+
+    test(
+      'MC9R-1 parses complete map with all fields',
+      () {
+        final report = VGMultiCamRenderReport.fromMap(kValidRenderResponse);
+
+        expect(report, isNotNull,
+            reason: 'must return non-null for a complete valid map');
+        expect(report!.renderedFrames,       78);
+        expect(report.droppedRenderFrames,    7);
+        expect(report.averageRenderMs,        closeTo(12.34, 0.0001));
+        expect(report.peakRenderMs,           closeTo(28.91, 0.0001));
+        expect(report.outputWidth,            1080);
+        expect(report.outputHeight,           1920);
+        expect(report.pairedFramesReceived,   85);
+        expect(report.frontFramesReceived,    90);
+        expect(report.backFramesReceived,     85);
+        expect(report.peakSystemPressureCost, closeTo(0.51, 0.0001));
+        expect(report.hardwareCost,           closeTo(0.50, 0.0001));
+        expect(report.durationSeconds,        closeTo(3.21, 0.001));
+      },
+    );
+
+    test(
+      'MC9R-2 parses int values for double fields (int-to-double coercion)',
+      () {
+        // Native may send integer values for double fields.
+        const map = <Object?, Object?>{
+          'renderedFrames':        78,
+          'droppedRenderFrames':   7,
+          'averageRenderMs':       12,    // int instead of double
+          'peakRenderMs':          28,    // int instead of double
+          'outputWidth':           1080,
+          'outputHeight':          1920,
+          'pairedFramesReceived':  85,
+          'frontFramesReceived':   90,
+          'backFramesReceived':    85,
+          'peakSystemPressureCost': 0,   // int instead of double
+          'hardwareCost':          0,    // int instead of double
+          'durationSeconds':       3,    // int instead of double
+        };
+        final report = VGMultiCamRenderReport.fromMap(map);
+
+        expect(report, isNotNull,
+            reason: 'must parse int values for double fields without error');
+        expect(report!.averageRenderMs,        closeTo(12.0, 0.0001));
+        expect(report.peakRenderMs,            closeTo(28.0, 0.0001));
+        expect(report.peakSystemPressureCost,  closeTo(0.0, 0.0001));
+        expect(report.hardwareCost,            closeTo(0.0, 0.0001));
+        expect(report.durationSeconds,         closeTo(3.0, 0.001));
+      },
+    );
+
+    test(
+      'MC9R-3 returns null for null map',
+      () {
+        final report = VGMultiCamRenderReport.fromMap(null);
+        expect(report, isNull,
+            reason: 'fromMap must return null when map is null');
+      },
+    );
+
+    test(
+      'MC9R-4 returns null for missing renderedFrames',
+      () {
+        final map = Map<Object?, Object?>.from(kValidRenderResponse)
+          ..remove('renderedFrames');
+        final report = VGMultiCamRenderReport.fromMap(map);
+        expect(report, isNull,
+            reason: 'fromMap must return null when renderedFrames is absent');
+      },
+    );
+
+    test(
+      'MC9R-5 returns null for missing averageRenderMs',
+      () {
+        final map = Map<Object?, Object?>.from(kValidRenderResponse)
+          ..remove('averageRenderMs');
+        final report = VGMultiCamRenderReport.fromMap(map);
+        expect(report, isNull,
+            reason: 'fromMap must return null when averageRenderMs is absent');
+      },
+    );
+
+    test(
+      'MC9R-6 returns null for missing pairedFramesReceived',
+      () {
+        final map = Map<Object?, Object?>.from(kValidRenderResponse)
+          ..remove('pairedFramesReceived');
+        final report = VGMultiCamRenderReport.fromMap(map);
+        expect(report, isNull,
+            reason: 'fromMap must return null when pairedFramesReceived is absent');
+      },
+    );
+
+    test(
+      'MC9R-7 returns null for missing durationSeconds',
+      () {
+        final map = Map<Object?, Object?>.from(kValidRenderResponse)
+          ..remove('durationSeconds');
+        final report = VGMultiCamRenderReport.fromMap(map);
+        expect(report, isNull,
+            reason: 'fromMap must return null when durationSeconds is absent');
+      },
+    );
+
+    test(
+      'MC9R-8 renderedFPS returns 0.0 when durationSeconds is 0',
+      () {
+        const map = <Object?, Object?>{
+          'renderedFrames':        50,
+          'droppedRenderFrames':   5,
+          'averageRenderMs':       10.0,
+          'peakRenderMs':          20.0,
+          'outputWidth':           1080,
+          'outputHeight':          1920,
+          'pairedFramesReceived':  55,
+          'frontFramesReceived':   60,
+          'backFramesReceived':    55,
+          'peakSystemPressureCost': 0.50,
+          'hardwareCost':          0.50,
+          'durationSeconds':       0.0,  // zero duration
+        };
+        final report = VGMultiCamRenderReport.fromMap(map);
+        expect(report, isNotNull);
+        expect(
+          report!.renderedFPS,
+          closeTo(0.0, 0.0001),
+          reason: 'renderedFPS must be 0.0 when durationSeconds is 0',
+        );
+      },
+    );
+
+    test(
+      'MC9R-9 renderedFPS computes correctly',
+      () {
+        // renderedFPS = 78 / 3.21 ≈ 24.30
+        final report = VGMultiCamRenderReport.fromMap(kValidRenderResponse);
+        expect(report, isNotNull);
+        expect(
+          report!.renderedFPS,
+          closeTo(78.0 / 3.21, 0.001),
+          reason: 'renderedFPS must equal renderedFrames / durationSeconds',
+        );
+      },
+    );
+
+    test(
+      'MC9R-10 equality: two identical reports are equal',
+      () {
+        final r1 = VGMultiCamRenderReport.fromMap(kValidRenderResponse);
+        final r2 = VGMultiCamRenderReport.fromMap(kValidRenderResponse);
+        expect(r1, isNotNull);
+        expect(r2, isNotNull);
+        expect(r1, equals(r2),
+            reason: 'two reports parsed from the same map must be equal');
+      },
+    );
+
+    test(
+      'MC9R-11 equality: different renderedFrames are not equal',
+      () {
+        final r1 = VGMultiCamRenderReport.fromMap(kValidRenderResponse);
+        final map2 = Map<Object?, Object?>.from(kValidRenderResponse)
+          ..['renderedFrames'] = 50;
+        final r2 = VGMultiCamRenderReport.fromMap(map2);
+        expect(r1, isNotNull);
+        expect(r2, isNotNull);
+        expect(r1, isNot(equals(r2)),
+            reason: 'reports with different renderedFrames must not be equal');
+      },
+    );
+
+    test(
+      'MC9R-12 hashCode matches for equal reports',
+      () {
+        final r1 = VGMultiCamRenderReport.fromMap(kValidRenderResponse);
+        final r2 = VGMultiCamRenderReport.fromMap(kValidRenderResponse);
+        expect(r1, isNotNull);
+        expect(r2, isNotNull);
+        expect(r1.hashCode, equals(r2.hashCode),
+            reason: 'equal reports must have the same hashCode');
+      },
+    );
+
+    test(
+      'MC9R-13 toString includes renderedFrames and averageRenderMs',
+      () {
+        final report = VGMultiCamRenderReport.fromMap(kValidRenderResponse);
+        expect(report, isNotNull);
+        final s = report.toString();
+        expect(s, contains('renderedFrames: 78'),
+            reason: 'toString must include renderedFrames');
+        expect(s, contains('averageRenderMs'),
+            reason: 'toString must include averageRenderMs');
+      },
+    );
+
+    test(
+      'MC9R-14 toString includes output dimensions',
+      () {
+        final report = VGMultiCamRenderReport.fromMap(kValidRenderResponse);
+        expect(report, isNotNull);
+        final s = report.toString();
+        expect(s, contains('1080'),
+            reason: 'toString must include output width');
+        expect(s, contains('1920'),
+            reason: 'toString must include output height');
+      },
+    );
+  });
+
+  // ── MC-9: VGCameraSession.runMultiCamRenderDiagnostic ────────────────────
+  //
+  // Tests for the MC-9 offscreen MultiCam render diagnostic channel route.
+  // Confirms channel dispatch, argument passing, result parsing, and
+  // null-safety fallbacks.
+  //
+  // These are pure Dart / mock-channel tests — no native code runs.
+  //
+  // Acceptance criteria:
+  //   MC9-1  dispatches 'runMultiCamRenderDiagnostic' with frontDeviceId and backDeviceId
+  //   MC9-2  parses valid native response into VGMultiCamRenderReport
+  //   MC9-3  returns null when required native map field is missing
+  //   MC9-4  handles int-to-double conversion for render timing fields
+  //   MC9-5  uses exact channel method name 'runMultiCamRenderDiagnostic'
+  //   MC9-6  passes frontDeviceId and backDeviceId
+  group('VGCameraSession.runMultiCamRenderDiagnostic', () {
+    const kFrontId = 'AVCaptureDevice-Front-001';
+    const kBackId  = 'AVCaptureDevice-Back-002';
+
+    // Canonical valid response — mirrors expected native merged metrics map.
+    const kValidResponse = <Object?, Object?>{
+      'renderedFrames':        78,
+      'droppedRenderFrames':   7,
+      'averageRenderMs':       12.34,
+      'peakRenderMs':          28.91,
+      'outputWidth':           1080,
+      'outputHeight':          1920,
+      'pairedFramesReceived':  85,
+      'frontFramesReceived':   90,
+      'backFramesReceived':    85,
+      'peakSystemPressureCost': 0.51,
+      'hardwareCost':          0.50,
+      'durationSeconds':       3.21,
+    };
+
+    test(
+      'MC9-1 dispatches runMultiCamRenderDiagnostic with frontDeviceId and backDeviceId',
+      () async {
+        _responses['runMultiCamRenderDiagnostic'] = kValidResponse;
+
+        await VGCameraSession.runMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(_log.length, 1,
+            reason: 'runMultiCamRenderDiagnostic must invoke the channel exactly once');
+        expect(_log.first.method, 'runMultiCamRenderDiagnostic',
+            reason: 'channel method name must be exactly runMultiCamRenderDiagnostic');
+        expect(_log.first.arguments['frontDeviceId'], kFrontId,
+            reason: 'frontDeviceId must be forwarded to the channel');
+        expect(_log.first.arguments['backDeviceId'],  kBackId,
+            reason: 'backDeviceId must be forwarded to the channel');
+      },
+    );
+
+    test(
+      'MC9-2 parses valid native response into VGMultiCamRenderReport',
+      () async {
+        _responses['runMultiCamRenderDiagnostic'] = kValidResponse;
+
+        final report = await VGCameraSession.runMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNotNull,
+            reason: 'must return a non-null VGMultiCamRenderReport for a valid native map');
+        expect(report!.renderedFrames,        78);
+        expect(report.droppedRenderFrames,     7);
+        expect(report.averageRenderMs,         closeTo(12.34, 0.0001));
+        expect(report.peakRenderMs,            closeTo(28.91, 0.0001));
+        expect(report.outputWidth,             1080);
+        expect(report.outputHeight,            1920);
+        expect(report.pairedFramesReceived,    85);
+        expect(report.frontFramesReceived,     90);
+        expect(report.backFramesReceived,      85);
+        expect(report.peakSystemPressureCost,  closeTo(0.51, 0.0001));
+        expect(report.hardwareCost,            closeTo(0.50, 0.0001));
+        expect(report.durationSeconds,         closeTo(3.21, 0.001));
+      },
+    );
+
+    test(
+      'MC9-3 returns null when required native map field is missing',
+      () async {
+        // Remove a required field to trigger fromMap null return.
+        final map = Map<Object?, Object?>.from(kValidResponse)
+          ..remove('renderedFrames');
+        _responses['runMultiCamRenderDiagnostic'] = map;
+
+        final report = await VGCameraSession.runMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNull,
+            reason: 'must return null when required field renderedFrames is missing');
+      },
+    );
+
+    test(
+      'MC9-4 handles int-to-double conversion for render timing fields',
+      () async {
+        // Native may return int for averageRenderMs / peakRenderMs.
+        final map = Map<Object?, Object?>.from(kValidResponse)
+          ..['averageRenderMs'] = 12    // int
+          ..['peakRenderMs']    = 28;   // int
+        _responses['runMultiCamRenderDiagnostic'] = map;
+
+        final report = await VGCameraSession.runMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNotNull,
+            reason: 'must handle int values for averageRenderMs and peakRenderMs');
+        expect(report!.averageRenderMs, closeTo(12.0, 0.0001));
+        expect(report.peakRenderMs,     closeTo(28.0, 0.0001));
+      },
+    );
+
+    test(
+      'MC9-5 uses exact channel method name runMultiCamRenderDiagnostic',
+      () async {
+        _responses['runMultiCamRenderDiagnostic'] = kValidResponse;
+
+        await VGCameraSession.runMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(
+          _log.first.method,
+          'runMultiCamRenderDiagnostic',
+          reason: 'channel method name must be exactly runMultiCamRenderDiagnostic '
+              '(not runMultiCamRendererDiagnostic or any other variant)',
+        );
+      },
+    );
+
+    test(
+      'MC9-6 returns null on PlatformException (e.g. CAMERA_ACTIVE or Android)',
+      () async {
+        _responses['runMultiCamRenderDiagnostic'] = PlatformException(
+          code: 'CAMERA_ACTIVE',
+          message: 'Stop camera preview before running MultiCam render diagnostic',
+        );
+
+        final report = await VGCameraSession.runMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNull,
+            reason: 'must return null (not rethrow) on PlatformException');
+      },
+    );
+  });
 }

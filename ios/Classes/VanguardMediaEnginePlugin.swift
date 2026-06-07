@@ -3410,6 +3410,102 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(nil)
             }
 
+        // ── MC-9: Offscreen MultiCam render diagnostic ────────────────────────────
+        //
+        // Runs a 3-second offscreen CoreImage composition diagnostic using:
+        //   - VanguardMultiCamMediaSource (MC-7/MC-8) for paired-frame capture
+        //   - VanguardMultiCamRenderDiagnostic (MC-9) as the delegate renderer
+        //
+        // The renderer:
+        //   - Receives VanguardMultiCamPairedFrame on captureQ
+        //   - Dispatches composition to a dedicated serial renderQ
+        //   - Uses CVPixelBufferPool (IOSurface-backed, Metal-compatible)
+        //   - Composites back (primary/canvas) + front (PiP inset) via CIContext
+        //   - Drops frames when renderQ is busy (_renderingInFlight guard)
+        //   - Retains _lastCompositedBuffer for MC-10 readiness
+        //
+        // Returns a merged map of render metrics + capture metrics to Flutter.
+        //
+        // Constraints (same as MC-8):
+        //   - Requires currentMode == .idle. Refuses with CAMERA_ACTIVE if not.
+        //   - Requires iOS 13.0+ (AVCaptureMultiCamSession).
+        //   - Does NOT create textures, renderers, or Flutter previews.
+        //   - Does NOT modify VGCameraGraphSession or VanguardCameraMediaSource.
+        case "runMultiCamRenderDiagnostic":
+            // ── Hard precondition: engine must be idle ────────────────────────
+            guard currentMode == .idle else {
+                result(FlutterError(
+                    code: "CAMERA_ACTIVE",
+                    message: "Stop camera preview before running MultiCam render diagnostic",
+                    details: nil
+                ))
+                return
+            }
+            guard let frontDeviceId = args?["frontDeviceId"] as? String,
+                  let backDeviceId  = args?["backDeviceId"]  as? String else {
+                result(FlutterError(
+                    code: "INVALID_ARG",
+                    message: "runMultiCamRenderDiagnostic requires frontDeviceId and backDeviceId",
+                    details: nil
+                ))
+                return
+            }
+            if #available(iOS 13.0, *) {
+                // Dispatch to global background queue: startRunning is synchronous
+                // and blocks for hardware init (~50–200ms) + 3-second window.
+                // CIContext render is also synchronous — must not run on main thread.
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let source = VanguardMultiCamMediaSource(
+                        frontDeviceId: frontDeviceId,
+                        backDeviceId: backDeviceId,
+                        frameRate: 30
+                    )
+                    guard let source = source else {
+                        // Init returned nil: not authorized, not supported,
+                        // device not found, or session configuration failed.
+                        DispatchQueue.main.async { result(nil) }
+                        return
+                    }
+
+                    // ── MC-9: create renderer and wire as delegate ────────────
+                    let renderer = VanguardMultiCamRenderDiagnostic()
+                    source.delegate = renderer
+
+                    guard source.start() else {
+                        // startRunning returned NO: session failed to run.
+                        source.stop()
+                        DispatchQueue.main.async { result(nil) }
+                        return
+                    }
+
+                    // Fixed 3-second diagnostic window.
+                    // captureQ delivers paired frames; renderer dispatches to renderQ.
+                    Thread.sleep(forTimeInterval: 3.0)
+
+                    // Stop capture first — no more frames will arrive after this.
+                    source.stop()
+
+                    // Stop renderer — drains renderQ, releases _lastCompositedBuffer.
+                    renderer.stop()
+
+                    // ── Merge render metrics + capture metrics ────────────────
+                    var metrics = source.metrics() as? [String: Any] ?? [:]
+                    let renderMetrics = renderer.metrics()
+                    metrics["renderedFrames"]      = renderMetrics["renderedFrames"]
+                    metrics["droppedRenderFrames"] = renderMetrics["droppedRenderFrames"]
+                    metrics["averageRenderMs"]     = renderMetrics["averageRenderMs"]
+                    metrics["peakRenderMs"]        = renderMetrics["peakRenderMs"]
+                    metrics["outputWidth"]         = renderMetrics["outputWidth"]
+                    metrics["outputHeight"]        = renderMetrics["outputHeight"]
+
+                    DispatchQueue.main.async {
+                        result(metrics)
+                    }
+                }
+            } else {
+                result(nil)
+            }
+
         case "setFocusPoint":
 
             guard let x = args?["x"] as? Double, let y = args?["y"] as? Double else {

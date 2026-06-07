@@ -716,6 +716,240 @@ class VGMultiCamSyncReport {
       'buffersValid: $buffersValid)';
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MC-9: VGMultiCamRenderReport
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reports the results of a 3-second offscreen MultiCam render diagnostic.
+///
+/// Produced by [VGCameraSession.runMultiCamRenderDiagnostic].
+///
+/// ## Purpose
+/// MC-9 proves that real-time CoreImage offscreen composition of two 1080p
+/// camera streams (~26–30 fps) is feasible within the device's thermal and
+/// memory budget, before any Flutter texture integration (MC-10+).
+///
+/// ## Fields — render metrics
+/// - [renderedFrames]: Frames successfully composited into the output pool.
+/// - [droppedRenderFrames]: Frames dropped because the renderQ was busy.
+/// - [averageRenderMs]: Mean CoreImage render time per composited frame (ms).
+/// - [peakRenderMs]: Worst-case render time for any single frame (ms).
+/// - [outputWidth]: Width of the output composite buffer (pixels).
+/// - [outputHeight]: Height of the output composite buffer (pixels).
+///
+/// ## Fields — capture-side metrics (from VanguardMultiCamMediaSource)
+/// - [pairedFramesReceived]: Frames software-paired within the threshold.
+/// - [frontFramesReceived]: Total front frames delivered by AVFoundation.
+/// - [backFramesReceived]: Total back frames delivered by AVFoundation.
+/// - [peakSystemPressureCost]: Maximum systemPressureCost while running.
+/// - [hardwareCost]: ISP bandwidth cost after session configuration.
+/// - [durationSeconds]: Elapsed time of the diagnostic window.
+///
+/// ## Derived properties
+/// - [renderedFPS]: `renderedFrames / durationSeconds`
+@immutable
+class VGMultiCamRenderReport {
+  const VGMultiCamRenderReport({
+    required this.renderedFrames,
+    required this.droppedRenderFrames,
+    required this.averageRenderMs,
+    required this.peakRenderMs,
+    required this.outputWidth,
+    required this.outputHeight,
+    required this.pairedFramesReceived,
+    required this.frontFramesReceived,
+    required this.backFramesReceived,
+    required this.peakSystemPressureCost,
+    required this.hardwareCost,
+    required this.durationSeconds,
+  });
+
+  // ── Render metrics ────────────────────────────────────────────────────────
+
+  /// Frames successfully composited into the output CVPixelBuffer pool.
+  final int renderedFrames;
+
+  /// Frames dropped because the render queue was busy with the previous frame.
+  final int droppedRenderFrames;
+
+  /// Mean CoreImage render time per composited frame, in milliseconds.
+  final double averageRenderMs;
+
+  /// Peak (worst-case) CoreImage render time for any single frame, in ms.
+  final double peakRenderMs;
+
+  /// Width of the output composite buffer in pixels.
+  /// 0 if no frames were rendered.
+  final int outputWidth;
+
+  /// Height of the output composite buffer in pixels.
+  /// 0 if no frames were rendered.
+  final int outputHeight;
+
+  // ── Capture-side metrics ──────────────────────────────────────────────────
+
+  /// Frames software-paired within the pairing threshold.
+  final int pairedFramesReceived;
+
+  /// Total front frames delivered by AVFoundation.
+  final int frontFramesReceived;
+
+  /// Total back frames delivered by AVFoundation.
+  final int backFramesReceived;
+
+  /// Peak systemPressureCost observed while the session was running.
+  final double peakSystemPressureCost;
+
+  /// ISP bandwidth cost read from the session after configuration.
+  final double hardwareCost;
+
+  /// Elapsed duration of the diagnostic window in seconds.
+  final double durationSeconds;
+
+  // ── Derived ───────────────────────────────────────────────────────────────
+
+  /// Estimated rendered frame rate in frames per second.
+  double get renderedFPS =>
+      durationSeconds > 0 ? renderedFrames / durationSeconds : 0.0;
+
+  // ── Parsing ───────────────────────────────────────────────────────────────
+
+  /// Parses a [VGMultiCamRenderReport] from the native channel response map.
+  ///
+  /// Returns `null` if [map] is `null` or any required field is absent or
+  /// of an unexpected type. Handles int-to-double coercion for timing fields.
+  static VGMultiCamRenderReport? fromMap(Map<Object?, Object?>? map) {
+    if (map == null) return null;
+
+    // renderedFrames — required int
+    final int? rendered = _parseInt(map['renderedFrames']);
+    if (rendered == null) return null;
+
+    // droppedRenderFrames — required int
+    final int? dropped = _parseInt(map['droppedRenderFrames']);
+    if (dropped == null) return null;
+
+    // averageRenderMs — required double
+    final double? avgRender = _parseDouble(map['averageRenderMs']);
+    if (avgRender == null) return null;
+
+    // peakRenderMs — required double
+    final double? peakRender = _parseDouble(map['peakRenderMs']);
+    if (peakRender == null) return null;
+
+    // outputWidth — required int
+    final int? outW = _parseInt(map['outputWidth']);
+    if (outW == null) return null;
+
+    // outputHeight — required int
+    final int? outH = _parseInt(map['outputHeight']);
+    if (outH == null) return null;
+
+    // pairedFramesReceived — required int
+    final int? paired = _parseInt(map['pairedFramesReceived']);
+    if (paired == null) return null;
+
+    // frontFramesReceived — required int
+    final int? frontFrames = _parseInt(map['frontFramesReceived']);
+    if (frontFrames == null) return null;
+
+    // backFramesReceived — required int
+    final int? backFrames = _parseInt(map['backFramesReceived']);
+    if (backFrames == null) return null;
+
+    // peakSystemPressureCost — required double
+    final double? peakPressure = _parseDouble(map['peakSystemPressureCost']);
+    if (peakPressure == null) return null;
+
+    // hardwareCost — required double
+    final double? hw = _parseDouble(map['hardwareCost']);
+    if (hw == null) return null;
+
+    // durationSeconds — required double
+    final double? duration = _parseDouble(map['durationSeconds']);
+    if (duration == null) return null;
+
+    return VGMultiCamRenderReport(
+      renderedFrames:       rendered,
+      droppedRenderFrames:  dropped,
+      averageRenderMs:      avgRender,
+      peakRenderMs:         peakRender,
+      outputWidth:          outW,
+      outputHeight:         outH,
+      pairedFramesReceived: paired,
+      frontFramesReceived:  frontFrames,
+      backFramesReceived:   backFrames,
+      peakSystemPressureCost: peakPressure,
+      hardwareCost:         hw,
+      durationSeconds:      duration,
+    );
+  }
+
+  /// Parses an int from a map value (int or double → int).
+  /// Returns null if the value is null or not numeric.
+  static int? _parseInt(Object? raw) {
+    if (raw is int) return raw;
+    if (raw is double) return raw.toInt();
+    return null;
+  }
+
+  /// Parses a double from a map value (double or int → double).
+  /// Returns null if the value is null or not numeric.
+  static double? _parseDouble(Object? raw) {
+    if (raw is double) return raw;
+    if (raw is int) return raw.toDouble();
+    return null;
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGMultiCamRenderReport &&
+          runtimeType == other.runtimeType &&
+          renderedFrames == other.renderedFrames &&
+          droppedRenderFrames == other.droppedRenderFrames &&
+          averageRenderMs == other.averageRenderMs &&
+          peakRenderMs == other.peakRenderMs &&
+          outputWidth == other.outputWidth &&
+          outputHeight == other.outputHeight &&
+          pairedFramesReceived == other.pairedFramesReceived &&
+          frontFramesReceived == other.frontFramesReceived &&
+          backFramesReceived == other.backFramesReceived &&
+          peakSystemPressureCost == other.peakSystemPressureCost &&
+          hardwareCost == other.hardwareCost &&
+          durationSeconds == other.durationSeconds;
+
+  @override
+  int get hashCode => Object.hash(
+        renderedFrames,
+        droppedRenderFrames,
+        averageRenderMs,
+        peakRenderMs,
+        outputWidth,
+        outputHeight,
+        pairedFramesReceived,
+        frontFramesReceived,
+        backFramesReceived,
+        peakSystemPressureCost,
+        hardwareCost,
+        durationSeconds,
+      );
+
+  @override
+  String toString() =>
+      'VGMultiCamRenderReport('
+      'renderedFrames: $renderedFrames, '
+      'droppedRenderFrames: $droppedRenderFrames, '
+      'renderedFPS: ${renderedFPS.toStringAsFixed(1)}, '
+      'averageRenderMs: ${averageRenderMs.toStringAsFixed(2)}, '
+      'peakRenderMs: ${peakRenderMs.toStringAsFixed(2)}, '
+      'output: ${outputWidth}x${outputHeight}, '
+      'pairedFramesReceived: $pairedFramesReceived, '
+      'peakSystemPressureCost: $peakSystemPressureCost, '
+      'hardwareCost: $hardwareCost, '
+      'durationSeconds: $durationSeconds)';
+}
+
 final class VGCameraSession {
 
   // ── Channel ──────────────────────────────────────────────────────────────────
@@ -1152,6 +1386,50 @@ final class VGCameraSession {
         },
       );
       return VGMultiCamSyncReport.fromMap(raw);
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  /// Runs a 3-second offscreen MultiCam render diagnostic and returns the result.
+  ///
+  /// MC-9 diagnostic. Uses [VanguardMultiCamMediaSource] to capture paired
+  /// front/back frames and [VanguardMultiCamRenderDiagnostic] to composite them
+  /// offscreen using CoreImage into a CVPixelBuffer pool (PiP layout).
+  ///
+  /// No Flutter texture is created. No visible preview. Diagnostic-only.
+  ///
+  /// ## iOS
+  /// Requires:
+  ///   - iOS 13.0+ (`AVCaptureMultiCamSession`).
+  ///   - Camera authorization granted.
+  ///   - Hardware MultiCam support.
+  ///   - Engine must be idle (no active camera session).
+  ///
+  /// ## Android
+  /// Returns `null` silently via `PlatformException` fallback.
+  ///
+  /// ## Failure behavior
+  /// Returns `null` on any of:
+  ///   - Engine is not idle (`CAMERA_ACTIVE` error from native).
+  ///   - Camera authorization not granted.
+  ///   - Device not found by uniqueID.
+  ///   - `AVCaptureMultiCamSession` not supported on this device/OS.
+  ///   - A [PlatformException] (Android or unexpected native error).
+  ///   - Malformed or null native response.
+  static Future<VGMultiCamRenderReport?> runMultiCamRenderDiagnostic({
+    required String frontDeviceId,
+    required String backDeviceId,
+  }) async {
+    try {
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'runMultiCamRenderDiagnostic',
+        {
+          'frontDeviceId': frontDeviceId,
+          'backDeviceId': backDeviceId,
+        },
+      );
+      return VGMultiCamRenderReport.fromMap(raw);
     } on PlatformException {
       return null;
     }
