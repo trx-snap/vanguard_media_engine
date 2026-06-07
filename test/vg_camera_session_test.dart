@@ -2855,7 +2855,7 @@ void main() {
   // Tests that the optional config parameter is forwarded correctly on both
   // runMultiCamRenderDiagnostic and startMultiCamRenderDiagnostic.
   //
-  // Acceptance criteria:
+  // Acceptance criteria covered:
   //   MC12-1  runMultiCamRenderDiagnostic omits 'config' key when config is null
   //   MC12-2  runMultiCamRenderDiagnostic forwards config.toMap() when config is provided
   //   MC12-3  startMultiCamRenderDiagnostic omits 'config' key when config is null
@@ -2969,6 +2969,238 @@ void main() {
           layoutMode: VGDualCameraLayoutMode.splitScreen,
         );
         expect(config.toMap()['layoutMode'], 'splitScreen');
+      },
+    );
+  });
+
+  // ── MC-13: VGCameraSession.startMultiCamPreview ──────────────────────────
+  //
+  // Tests for the MC-13 production-facing MultiCam preview API — start route.
+  // Confirms correct channel method name, argument forwarding, config
+  // forwarding, no-config case, and null/error fallbacks.
+  //
+  // These are pure Dart / mock-channel tests — no native code runs.
+  // The existing MC-10 diagnostic tests remain unchanged.
+  //
+  // Acceptance criteria:
+  //   MC13-1  startMultiCamPreview invokes method channel name 'startMultiCamPreview'
+  //   MC13-2  startMultiCamPreview forwards frontDeviceId and backDeviceId
+  //   MC13-3  startMultiCamPreview forwards config.toMap() when config is provided
+  //   MC13-4  startMultiCamPreview works without config (no 'config' key in args)
+  //   MC13-5  stopMultiCamPreview invokes method channel name 'stopMultiCamPreview'
+  //   MC13-6  stopMultiCamPreview parses VGMultiCamRenderReport from response
+  //   MC13-7  existing diagnostic tests remain unaffected (verified by MC10/MC12 groups above)
+  group('VGCameraSession.startMultiCamPreview (MC-13)', () {
+    const kFrontId = 'AVCaptureDevice-Front-001';
+    const kBackId  = 'AVCaptureDevice-Back-002';
+
+    const kValidPreviewStartResponse = <Object?, Object?>{
+      'textureId':    77,
+      'outputWidth':  1080,
+      'outputHeight': 1920,
+    };
+
+    test(
+      'MC13-1 startMultiCamPreview invokes the channel with method name startMultiCamPreview',
+      () async {
+        _responses['startMultiCamPreview'] = kValidPreviewStartResponse;
+
+        await VGCameraSession.startMultiCamPreview(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(_log.length, 1,
+            reason: 'startMultiCamPreview must invoke the channel exactly once');
+        expect(
+          _log.first.method,
+          'startMultiCamPreview',
+          reason: 'channel method name must be exactly startMultiCamPreview '
+              '(not startMultiCamRenderDiagnostic or any other variant)',
+        );
+      },
+    );
+
+    test(
+      'MC13-2 startMultiCamPreview forwards frontDeviceId and backDeviceId',
+      () async {
+        _responses['startMultiCamPreview'] = kValidPreviewStartResponse;
+
+        await VGCameraSession.startMultiCamPreview(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(_log.first.arguments['frontDeviceId'], kFrontId,
+            reason: 'frontDeviceId must be forwarded to the channel');
+        expect(_log.first.arguments['backDeviceId'], kBackId,
+            reason: 'backDeviceId must be forwarded to the channel');
+      },
+    );
+
+    test(
+      'MC13-3 startMultiCamPreview forwards config.toMap() when config is provided',
+      () async {
+        _responses['startMultiCamPreview'] = kValidPreviewStartResponse;
+        const config = VGLivePreviewConfig(
+          layoutMode: VGDualCameraLayoutMode.splitScreen,
+        );
+
+        await VGCameraSession.startMultiCamPreview(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+          config: config,
+        );
+
+        final args = _log.first.arguments as Map;
+        expect(args.containsKey('config'), isTrue,
+            reason: 'config map must be forwarded when config is provided');
+        final configMap = args['config'] as Map;
+        expect(configMap['layoutMode'], 'splitScreen',
+            reason: 'layoutMode must be serialised as the wire string');
+      },
+    );
+
+    test(
+      'MC13-4 startMultiCamPreview omits config key when config is null',
+      () async {
+        _responses['startMultiCamPreview'] = kValidPreviewStartResponse;
+
+        await VGCameraSession.startMultiCamPreview(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(
+          (_log.first.arguments as Map).containsKey('config'),
+          isFalse,
+          reason: 'no config key must be present when config is not supplied',
+        );
+      },
+    );
+
+    test(
+      'MC13-4b startMultiCamPreview returns typed VGMultiCamRenderTextureSession',
+      () async {
+        _responses['startMultiCamPreview'] = kValidPreviewStartResponse;
+
+        final session = await VGCameraSession.startMultiCamPreview(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(session, isNotNull,
+            reason: 'must return non-null session for a valid map response');
+        expect(session!.textureId,    77);
+        expect(session.outputWidth,   1080);
+        expect(session.outputHeight,  1920);
+      },
+    );
+
+    test(
+      'MC13-4c startMultiCamPreview returns null on PlatformException (CAMERA_ACTIVE)',
+      () async {
+        _responses['startMultiCamPreview'] = PlatformException(
+          code: 'CAMERA_ACTIVE',
+          message: 'Stop camera preview before starting MultiCam preview',
+        );
+
+        final session = await VGCameraSession.startMultiCamPreview(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(session, isNull,
+            reason: 'must return null (not rethrow) on PlatformException');
+      },
+    );
+  });
+
+  // ── MC-13: VGCameraSession.stopMultiCamPreview ───────────────────────────
+  group('VGCameraSession.stopMultiCamPreview (MC-13)', () {
+    const kValidPreviewStopResponse = <Object?, Object?>{
+      'renderedFrames':        92,
+      'droppedRenderFrames':   4,
+      'averageRenderMs':       11.5,
+      'peakRenderMs':          22.3,
+      'outputWidth':           1080,
+      'outputHeight':          1920,
+      'pairedFramesReceived':  96,
+      'frontFramesReceived':   100,
+      'backFramesReceived':    96,
+      'peakSystemPressureCost': 0.48,
+      'hardwareCost':          0.47,
+      'durationSeconds':       6.20,
+    };
+
+    test(
+      'MC13-5 stopMultiCamPreview invokes the channel with method name stopMultiCamPreview',
+      () async {
+        _responses['stopMultiCamPreview'] = kValidPreviewStopResponse;
+
+        await VGCameraSession.stopMultiCamPreview();
+
+        expect(_log.length, 1,
+            reason: 'stopMultiCamPreview must invoke the channel exactly once');
+        expect(
+          _log.first.method,
+          'stopMultiCamPreview',
+          reason: 'channel method name must be exactly stopMultiCamPreview '
+              '(not stopMultiCamRenderDiagnostic or any other variant)',
+        );
+        expect(_log.first.arguments, isNull,
+            reason: 'stopMultiCamPreview must send no arguments');
+      },
+    );
+
+    test(
+      'MC13-6 stopMultiCamPreview parses VGMultiCamRenderReport from response',
+      () async {
+        _responses['stopMultiCamPreview'] = kValidPreviewStopResponse;
+
+        final report = await VGCameraSession.stopMultiCamPreview();
+
+        expect(report, isNotNull,
+            reason: 'must return non-null VGMultiCamRenderReport for valid response');
+        expect(report!.renderedFrames,        92);
+        expect(report.droppedRenderFrames,    4);
+        expect(report.averageRenderMs,        closeTo(11.5,  0.001));
+        expect(report.peakRenderMs,           closeTo(22.3,  0.001));
+        expect(report.outputWidth,            1080);
+        expect(report.outputHeight,           1920);
+        expect(report.pairedFramesReceived,   96);
+        expect(report.frontFramesReceived,    100);
+        expect(report.backFramesReceived,     96);
+        expect(report.peakSystemPressureCost, closeTo(0.48, 0.001));
+        expect(report.hardwareCost,           closeTo(0.47, 0.001));
+        expect(report.durationSeconds,        closeTo(6.20, 0.01));
+      },
+    );
+
+    test(
+      'MC13-6b stopMultiCamPreview returns null when native returns null',
+      () async {
+        _responses['stopMultiCamPreview'] = null;
+
+        final report = await VGCameraSession.stopMultiCamPreview();
+
+        expect(report, isNull,
+            reason: 'null native response must yield null (no active preview)');
+      },
+    );
+
+    test(
+      'MC13-6c stopMultiCamPreview returns null on PlatformException',
+      () async {
+        _responses['stopMultiCamPreview'] = PlatformException(
+          code: 'INTERNAL_ERROR',
+          message: 'Unexpected failure during stop',
+        );
+
+        final report = await VGCameraSession.stopMultiCamPreview();
+
+        expect(report, isNull,
+            reason: 'must return null (not rethrow) on PlatformException');
       },
     );
   });

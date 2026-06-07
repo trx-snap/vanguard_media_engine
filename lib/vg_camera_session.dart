@@ -1596,6 +1596,92 @@ final class VGCameraSession {
     }
   }
 
+  // ── MC-13: Production MultiCam preview API ─────────────────────────────────
+
+  /// Starts a live MultiCam preview and registers a Flutter texture.
+  ///
+  /// ## MC-13 — production API boundary
+  /// This is the production-facing entry point for MultiCam live preview.
+  /// Internally it reuses the same native capture/render pipeline as
+  /// [startMultiCamRenderDiagnostic] (MC-10/MC-12), providing a clean
+  /// production boundary decoupled from diagnostic-named methods.
+  ///
+  /// ## Lifecycle
+  /// Must be followed by a call to [stopMultiCamPreview] to release
+  /// hardware, drain the render queue, and unregister the Flutter texture.
+  ///
+  /// ## Layout
+  /// Pass a [VGLivePreviewConfig] to choose between PiP (bottom-right,
+  /// top-left) and split-screen layouts. Defaults to PiP bottom-right.
+  ///
+  /// ## Preconditions
+  ///   - Engine must be idle (no single-camera session active via
+  ///     [VGCameraSession.create]).
+  ///   - iOS 13.0+ with hardware MultiCam support required.
+  ///   - Camera authorization must be granted.
+  ///
+  /// ## Errors
+  /// Returns `null` on [PlatformException] (e.g. camera not authorized,
+  /// `CAMERA_ACTIVE` if a camera preview is running, `ALREADY_RUNNING`
+  /// if a preview is already active, or iOS < 13.0).
+  ///
+  /// ## Usage
+  /// ```dart
+  /// final session = await VGCameraSession.startMultiCamPreview(
+  ///   frontDeviceId: frontId,
+  ///   backDeviceId: backId,
+  ///   config: VGLivePreviewConfig(layoutMode: VGDualCameraLayoutMode.splitScreen),
+  /// );
+  /// if (session != null) {
+  ///   setState(() { _textureId = session.textureId; });
+  /// }
+  /// // When done:
+  /// await VGCameraSession.stopMultiCamPreview();
+  /// ```
+  static Future<VGMultiCamRenderTextureSession?> startMultiCamPreview({
+    required String frontDeviceId,
+    required String backDeviceId,
+    VGLivePreviewConfig? config,
+  }) async {
+    try {
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'startMultiCamPreview',
+        {
+          'frontDeviceId': frontDeviceId,
+          'backDeviceId': backDeviceId,
+          if (config != null) 'config': config.toMap(),
+        },
+      );
+      return VGMultiCamRenderTextureSession.fromMap(raw);
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  /// Stops the active live MultiCam preview and returns metrics.
+  ///
+  /// ## MC-13 — production API boundary
+  /// Production-facing companion to [startMultiCamPreview]. Stops the
+  /// capture source, drains the render queue, unregisters the Flutter
+  /// texture, and returns a [VGMultiCamRenderReport] with combined
+  /// capture and render metrics.
+  ///
+  /// ## Idempotent
+  /// Returns `null` if no preview is currently running. Does not throw.
+  ///
+  /// ## Errors
+  /// Returns `null` on [PlatformException].
+  static Future<VGMultiCamRenderReport?> stopMultiCamPreview() async {
+    try {
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'stopMultiCamPreview',
+      );
+      return VGMultiCamRenderReport.fromMap(raw);
+    } on PlatformException {
+      return null;
+    }
+  }
+
   /// Tap-to-focus and tap-to-expose at a normalised point.
   ///
   /// [x] and [y] must be in the range `[0.0, 1.0]`, where `(0, 0)` is the

@@ -493,10 +493,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     ///
     /// Phase 7.10: the hard-cut-only gate is lifted. Supported transition types
     /// are `none` (hard cut), `dissolve`, and `fade`. Any other type string is
-    /// rejected early so callers receive a clear error before the compositor
-    /// attempts construction. Structural validation (overlap math, adjacent-clip
-    /// checks, error code 12) remains in VGTimelineCompositorNode.
-    ///
     /// Returns a `FlutterError` on the first invalid transition, or `nil` if all pass.
     private func _preflightTransitions(_ transitionDicts: [[String: Any]]) -> FlutterError? {
         // Transition types accepted by VGTimelineCompositorNode as of Phase 7.10.
@@ -520,6 +516,198 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
     #endif // VG_USE_V2_GRAPH
 
+
+
+    // ── MC-13: Shared MultiCam preview pipeline helpers ───────────────────────
+    //
+    // These private helpers centralise the start/stop logic so that both the
+    // diagnostic routes ('startMultiCamRenderDiagnostic'/'stopMultiCamRenderDiagnostic')
+    // and the production routes ('startMultiCamPreview'/'stopMultiCamPreview')
+    // share identical behaviour without code duplication.
+    //
+    // The original `case "startMultiCamRenderDiagnostic"` body is preserved
+    // verbatim and NOT refactored. Only the new MC-13 cases delegate here.
+    // This guarantees zero regression risk for the diagnostic path.
+
+    /// Starts the MultiCam render pipeline and registers a Flutter texture.
+    ///
+    /// Enforces the same CAMERA_ACTIVE, ALREADY_RUNNING, and stop-while-starting
+    /// guards as the `startMultiCamRenderDiagnostic` handler.
+    /// [callerTag] is included in log messages to distinguish the production
+    /// call-site ("MC-13") from the diagnostic call-site ("MC-10").
+    private func _handleStartMultiCam(
+        args: [String: Any]?,
+        callerTag: String,
+        result: @escaping FlutterResult
+    ) {
+        guard currentMode == .idle else {
+            result(FlutterError(
+                code: "CAMERA_ACTIVE",
+                message: "Stop camera preview before starting MultiCam preview",
+                details: nil
+            ))
+            return
+        }
+        guard mcDiagnosticState == .idle else {
+            result(FlutterError(
+                code: "ALREADY_RUNNING",
+                message: "A MultiCam preview is already running — call stopMultiCamPreview first",
+                details: nil
+            ))
+            return
+        }
+        guard let frontDeviceId = args?["frontDeviceId"] as? String,
+              let backDeviceId  = args?["backDeviceId"]  as? String else {
+            result(FlutterError(
+                code: "INVALID_ARG",
+                message: "startMultiCamPreview requires frontDeviceId and backDeviceId",
+                details: nil
+            ))
+            return
+        }
+        if #available(iOS 13.0, *) {
+            mcDiagnosticState = .starting
+
+            let renderer = VanguardMultiCamRenderDiagnostic(textureRegistry: registrar.textures())
+            if let configMap = args?["config"] as? [String: Any] {
+                renderer.setLayoutConfig(VanguardMultiCamRenderDiagnostic.layoutConfig(fromMap: configMap))
+            }
+            let textureId     = renderer.textureId
+            let initialWidth  = renderer.outputWidth
+            let initialHeight = renderer.outputHeight
+
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+
+                let source = VanguardMultiCamMediaSource(
+                    frontDeviceId: frontDeviceId,
+                    backDeviceId: backDeviceId,
+                    frameRate: 30
+                )
+                guard let source = source else {
+                    DispatchQueue.main.async {
+                        renderer.doUnregisterTexture()
+                        self.mcDiagnosticState = .idle
+                        result(nil)
+                    }
+                    return
+                }
+
+                source.delegate = renderer
+
+                guard source.start() else {
+                    source.stop()
+                    DispatchQueue.main.async {
+                        renderer.doUnregisterTexture()
+                        self.mcDiagnosticState = .idle
+                        result(nil)
+                    }
+                    return
+                }
+
+                DispatchQueue.main.async {
+                    if self.mcDiagnosticState == .stopping {
+                        NSLog("[VanguardPlugin][\(callerTag)] _handleStartMultiCam: "
+                              + "stop-while-starting detected — aborting startup.")
+                        DispatchQueue.global(qos: .userInitiated).async {
+                            source.stop()
+                            renderer.stop()
+                            DispatchQueue.main.sync {
+                                renderer.doUnregisterTexture()
+                            }
+                            DispatchQueue.main.async {
+                                self.mcDiagnosticState = .idle
+                                result(nil)
+                            }
+                        }
+                        return
+                    }
+
+                    self.mcRenderDiagnosticSource = source
+                    self.mcRenderDiagnostic       = renderer
+                    self.mcDiagnosticState        = .running
+
+                    NSLog("[VanguardPlugin][\(callerTag)] _handleStartMultiCam: "
+                          + "textureId=\(textureId) running.")
+
+                    result([
+                        "textureId":    textureId,
+                        "outputWidth":  Int(initialWidth),
+                        "outputHeight": Int(initialHeight),
+                    ])
+                }
+            }
+        } else {
+            result(nil)
+        }
+    }
+
+    /// Stops the active MultiCam render pipeline and returns the metrics map.
+    ///
+    /// Mirrors the `stopMultiCamRenderDiagnostic` state-machine exactly.
+    /// [callerTag] is included in log messages.
+    private func _handleStopMultiCam(
+        callerTag: String,
+        result: @escaping FlutterResult
+    ) {
+        switch mcDiagnosticState {
+        case .idle:
+            result(nil)
+
+        case .starting:
+            NSLog("[VanguardPlugin][\(callerTag)] _handleStopMultiCam: "
+                  + "called while still starting — signalling abort.")
+            mcDiagnosticState = .stopping
+            result(nil)
+
+        case .running:
+            guard let source   = mcRenderDiagnosticSource,
+                  let renderer = mcRenderDiagnostic else {
+                mcDiagnosticState = .idle
+                result(nil)
+                return
+            }
+            mcDiagnosticState = .stopping
+
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+
+                source.stop()
+                renderer.stop()
+
+                DispatchQueue.main.sync {
+                    renderer.doUnregisterTexture()
+                }
+
+                var metrics = source.metrics() as? [String: Any] ?? [:]
+                let renderMetrics = renderer.metrics()
+                metrics["renderedFrames"]      = renderMetrics["renderedFrames"]
+                metrics["droppedRenderFrames"] = renderMetrics["droppedRenderFrames"]
+                metrics["averageRenderMs"]     = renderMetrics["averageRenderMs"]
+                metrics["peakRenderMs"]        = renderMetrics["peakRenderMs"]
+                metrics["outputWidth"]         = renderMetrics["outputWidth"]
+                metrics["outputHeight"]        = renderMetrics["outputHeight"]
+
+                DispatchQueue.main.async {
+                    self.mcRenderDiagnosticSource = nil
+                    self.mcRenderDiagnostic       = nil
+                    self.mcDiagnosticState        = .idle
+
+                    let logRendered = renderMetrics["renderedFrames"] ?? 0
+                    let logAvgMs    = renderMetrics["averageRenderMs"] ?? 0
+                    NSLog("[VanguardPlugin][%@] _handleStopMultiCam: rendered=%@ avgMs=%@.",
+                          callerTag, "\(logRendered)", "\(logAvgMs)")
+
+                    result(metrics)
+                }
+            }
+
+        case .stopping:
+            NSLog("[VanguardPlugin][\(callerTag)] _handleStopMultiCam: "
+                  + "already stopping — ignoring duplicate stop call.")
+            result(nil)
+        }
+    }
 
     /// PATCH-2: Async camera teardown for transitions that may have an active recording.
     /// Calls stopRecording(completion:) (no main-thread block) then invokes completion
@@ -3682,17 +3870,17 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
 
         case "stopMultiCamRenderDiagnostic":
-            // \u2500\u2500 MC-10/MC-11: Live MultiCam texture diagnostic — stop \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+            // ── MC-10/MC-11: Live MultiCam texture diagnostic — stop ───────────
             //
             // MC-11 hardening: state machine replaces the simple nil-guard.
             //
-            //  .idle     \u2192 return nil (no diagnostic was running, safe no-op).
-            //  .starting \u2192 set .stopping; the background completion block will
+            //  .idle     → return nil (no diagnostic was running, safe no-op).
+            //  .starting → set .stopping; the background completion block will
             //              detect .stopping and abort the startup, unregistering
             //              the texture and returning nil itself.
-            //  .running  \u2192 set .stopping, tear down source/renderer, clear refs,
+            //  .running  → set .stopping, tear down source/renderer, clear refs,
             //              set .idle, return report (normal stop path).
-            //  .stopping \u2192 return nil (another stop is already in flight).
+            //  .stopping → return nil (another stop is already in flight).
 
             switch mcDiagnosticState {
             case .idle:
@@ -3766,6 +3954,25 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                       + "already stopping — ignoring duplicate stop call.")
                 result(nil)
             }
+
+
+        // ── MC-13: Production MultiCam preview — start ────────────────────────
+        //
+        // Routes 'startMultiCamPreview' to the same state-machine / renderer /
+        // capture pipeline as 'startMultiCamRenderDiagnostic'. All lifecycle
+        // hardening (CAMERA_ACTIVE guard, ALREADY_RUNNING guard, stop-while-
+        // starting abort, texture registration) is inherited via the shared
+        // helper. Only the log tag and channel method name differ.
+        case "startMultiCamPreview":
+            _handleStartMultiCam(args: args, callerTag: "MC-13", result: result)
+
+        // ── MC-13: Production MultiCam preview — stop ─────────────────────────
+        //
+        // Routes 'stopMultiCamPreview' to the same teardown path as
+        // 'stopMultiCamRenderDiagnostic'. Returns the same metrics map so the
+        // Dart VGMultiCamRenderReport parser works without modification.
+        case "stopMultiCamPreview":
+            _handleStopMultiCam(callerTag: "MC-13", result: result)
 
 
         case "setFocusPoint":
