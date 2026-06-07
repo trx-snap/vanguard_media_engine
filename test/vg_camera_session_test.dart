@@ -1537,4 +1537,129 @@ void main() {
       },
     );
   });
+
+  // ── MC-4: VGCameraSession.runMultiCamStreamingDiagnostic ──────────────────
+  //
+  // Tests for the running MultiCam streaming diagnostic.
+  // Confirms channel dispatch, argument passing, result parsing,
+  // FPS computation, and null-safety fallbacks.
+  //
+  // These are pure Dart / mock-channel tests — no native code runs.
+  group('VGCameraSession.runMultiCamStreamingDiagnostic', () {
+    const kFrontId = 'AVCaptureDevice-Front-001';
+    const kBackId  = 'AVCaptureDevice-Back-002';
+
+    test(
+      'MC4-1 runMultiCamStreamingDiagnostic dispatches channel method with frontDeviceId and backDeviceId',
+      () async {
+        _responses['runMultiCamStreamingDiagnostic'] = <Object?, Object?>{
+          'frontFramesReceived':    90,
+          'backFramesReceived':     87,
+          'peakSystemPressureCost': 0.42,
+          'hardwareCost':           0.50,
+          'durationSeconds':        3.01,
+        };
+
+        await VGCameraSession.runMultiCamStreamingDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(_log.length, 1);
+        expect(_log.first.method, 'runMultiCamStreamingDiagnostic');
+        expect(_log.first.arguments['frontDeviceId'], kFrontId);
+        expect(_log.first.arguments['backDeviceId'],  kBackId);
+      },
+    );
+
+    test(
+      'MC4-2 runMultiCamStreamingDiagnostic parses valid native response into VGMultiCamStreamingReport',
+      () async {
+        _responses['runMultiCamStreamingDiagnostic'] = <Object?, Object?>{
+          'frontFramesReceived':    90,
+          'backFramesReceived':     87,
+          'peakSystemPressureCost': 0.42,
+          'hardwareCost':           0.50,
+          'durationSeconds':        3.01,
+        };
+
+        final report = await VGCameraSession.runMultiCamStreamingDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNotNull);
+        expect(report!.frontFramesReceived,    90);
+        expect(report.backFramesReceived,      87);
+        expect(report.peakSystemPressureCost,  closeTo(0.42, 0.0001));
+        expect(report.hardwareCost,            closeTo(0.50, 0.0001));
+        expect(report.durationSeconds,         closeTo(3.01, 0.001));
+      },
+    );
+
+    test(
+      'MC4-3 runMultiCamStreamingDiagnostic returns null on PlatformException',
+      () async {
+        _responses['runMultiCamStreamingDiagnostic'] = PlatformException(
+          code: 'CAMERA_ACTIVE',
+          message: 'Stop camera preview before running MultiCam streaming diagnostic',
+        );
+
+        final report = await VGCameraSession.runMultiCamStreamingDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNull);
+      },
+    );
+
+    test(
+      'MC4-4 runMultiCamStreamingDiagnostic returns null on null native response',
+      () async {
+        _responses['runMultiCamStreamingDiagnostic'] = null;
+
+        final report = await VGCameraSession.runMultiCamStreamingDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNull);
+      },
+    );
+
+    test(
+      'MC4-5 VGMultiCamStreamingReport.fromMap computes FPS correctly',
+      () {
+        final report = VGMultiCamStreamingReport.fromMap(<Object?, Object?>{
+          'frontFramesReceived':    90,
+          'backFramesReceived':     60,
+          'peakSystemPressureCost': 0.30,
+          'hardwareCost':           0.50,
+          'durationSeconds':        3.0,
+        });
+
+        expect(report, isNotNull);
+        // frontFPS = 90 / 3.0 = 30.0
+        expect(report!.frontFPS, closeTo(30.0, 0.001));
+        // backFPS = 60 / 3.0 = 20.0
+        expect(report.backFPS, closeTo(20.0, 0.001));
+      },
+    );
+
+    test(
+      'MC4-6 VGMultiCamStreamingReport.fromMap returns null for missing frontFramesReceived',
+      () {
+        final report = VGMultiCamStreamingReport.fromMap(<Object?, Object?>{
+          // frontFramesReceived intentionally omitted
+          'backFramesReceived':     87,
+          'peakSystemPressureCost': 0.42,
+          'hardwareCost':           0.50,
+          'durationSeconds':        3.01,
+        });
+
+        expect(report, isNull);
+      },
+    );
+  });
 }

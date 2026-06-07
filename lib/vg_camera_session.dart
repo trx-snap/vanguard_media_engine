@@ -164,6 +164,176 @@ class VGMultiCamCostReport {
       'isWithinBudget: $isWithinBudget)';
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MC-4: VGMultiCamStreamingReport
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reports the results of a live 3-second `AVCaptureMultiCamSession` streaming
+/// diagnostic for a given front/back device pair.
+///
+/// Produced by [VGCameraSession.runMultiCamStreamingDiagnostic].
+///
+/// ## Fields
+/// - [frontFramesReceived]: Count of sample-buffer callbacks from the front camera.
+/// - [backFramesReceived]: Count of sample-buffer callbacks from the back camera.
+/// - [peakSystemPressureCost]: Maximum `systemPressureCost` sampled while the
+///   session was running. 0.0 if no frames were delivered. Values > 1.0 indicate
+///   unsustainable thermal/power load.
+/// - [hardwareCost]: ISP bandwidth cost fraction re-read from the running session.
+///   Should closely match the MC-3 reading. Values > 1.0 mean the session cannot
+///   sustain.
+/// - [durationSeconds]: Actual elapsed time of the diagnostic window in seconds.
+///
+/// ## Derived properties
+/// - [frontFPS]: `frontFramesReceived / durationSeconds`
+/// - [backFPS]: `backFramesReceived / durationSeconds`
+@immutable
+class VGMultiCamStreamingReport {
+  const VGMultiCamStreamingReport({
+    required this.frontFramesReceived,
+    required this.backFramesReceived,
+    required this.peakSystemPressureCost,
+    required this.hardwareCost,
+    required this.durationSeconds,
+  });
+
+  /// Number of sample-buffer delegate callbacks from the front camera.
+  final int frontFramesReceived;
+
+  /// Number of sample-buffer delegate callbacks from the back camera.
+  final int backFramesReceived;
+
+  /// Peak `systemPressureCost` observed while the session was running.
+  /// 0.0 if no frames were delivered. Values > 1.0 indicate unsustainable load.
+  final double peakSystemPressureCost;
+
+  /// ISP bandwidth cost re-read from the running (or configured) session.
+  /// Should match the MC-3 `hardwareCost` reading closely.
+  final double hardwareCost;
+
+  /// Actual elapsed duration of the diagnostic window, in seconds.
+  final double durationSeconds;
+
+  /// Estimated front camera frame rate in frames per second.
+  ///
+  /// Returns 0.0 if [durationSeconds] is 0.
+  double get frontFPS =>
+      durationSeconds > 0 ? frontFramesReceived / durationSeconds : 0.0;
+
+  /// Estimated back camera frame rate in frames per second.
+  ///
+  /// Returns 0.0 if [durationSeconds] is 0.
+  double get backFPS =>
+      durationSeconds > 0 ? backFramesReceived / durationSeconds : 0.0;
+
+  /// Parses a [VGMultiCamStreamingReport] from the native channel response map.
+  ///
+  /// Returns `null` if [map] is `null` or any required numeric field is absent
+  /// or of an unexpected type.
+  static VGMultiCamStreamingReport? fromMap(Map<Object?, Object?>? map) {
+    if (map == null) return null;
+
+    // frontFramesReceived — required int
+    final rawFront = map['frontFramesReceived'];
+    if (rawFront == null) return null;
+    final int frontFrames;
+    if (rawFront is int) {
+      frontFrames = rawFront;
+    } else if (rawFront is double) {
+      frontFrames = rawFront.toInt();
+    } else {
+      return null;
+    }
+
+    // backFramesReceived — required int
+    final rawBack = map['backFramesReceived'];
+    if (rawBack == null) return null;
+    final int backFrames;
+    if (rawBack is int) {
+      backFrames = rawBack;
+    } else if (rawBack is double) {
+      backFrames = rawBack.toInt();
+    } else {
+      return null;
+    }
+
+    // peakSystemPressureCost — required double
+    final rawPeak = map['peakSystemPressureCost'];
+    if (rawPeak == null) return null;
+    final double peakPressure;
+    if (rawPeak is double) {
+      peakPressure = rawPeak;
+    } else if (rawPeak is int) {
+      peakPressure = rawPeak.toDouble();
+    } else {
+      return null;
+    }
+
+    // hardwareCost — required double
+    final rawHW = map['hardwareCost'];
+    if (rawHW == null) return null;
+    final double hw;
+    if (rawHW is double) {
+      hw = rawHW;
+    } else if (rawHW is int) {
+      hw = rawHW.toDouble();
+    } else {
+      return null;
+    }
+
+    // durationSeconds — required double
+    final rawDuration = map['durationSeconds'];
+    if (rawDuration == null) return null;
+    final double duration;
+    if (rawDuration is double) {
+      duration = rawDuration;
+    } else if (rawDuration is int) {
+      duration = rawDuration.toDouble();
+    } else {
+      return null;
+    }
+
+    return VGMultiCamStreamingReport(
+      frontFramesReceived: frontFrames,
+      backFramesReceived: backFrames,
+      peakSystemPressureCost: peakPressure,
+      hardwareCost: hw,
+      durationSeconds: duration,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGMultiCamStreamingReport &&
+          runtimeType == other.runtimeType &&
+          frontFramesReceived == other.frontFramesReceived &&
+          backFramesReceived == other.backFramesReceived &&
+          peakSystemPressureCost == other.peakSystemPressureCost &&
+          hardwareCost == other.hardwareCost &&
+          durationSeconds == other.durationSeconds;
+
+  @override
+  int get hashCode => Object.hash(
+        frontFramesReceived,
+        backFramesReceived,
+        peakSystemPressureCost,
+        hardwareCost,
+        durationSeconds,
+      );
+
+  @override
+  String toString() =>
+      'VGMultiCamStreamingReport('
+      'frontFramesReceived: $frontFramesReceived, '
+      'backFramesReceived: $backFramesReceived, '
+      'frontFPS: ${frontFPS.toStringAsFixed(1)}, '
+      'backFPS: ${backFPS.toStringAsFixed(1)}, '
+      'peakSystemPressureCost: $peakSystemPressureCost, '
+      'hardwareCost: $hardwareCost, '
+      'durationSeconds: $durationSeconds)';
+}
+
 final class VGCameraSession {
   // ── Channel ──────────────────────────────────────────────────────────────────
 
@@ -417,6 +587,58 @@ final class VGCameraSession {
         },
       );
       return VGMultiCamCostReport.fromMap(raw);
+    } on PlatformException {
+      return null;
+    }
+  }
+
+  /// MC-4: Runs a live 3-second MultiCam streaming diagnostic for the given
+  /// front and back device IDs.
+  ///
+  /// Starts a real `AVCaptureMultiCamSession`, streams frames from both cameras
+  /// via sample-buffer delegates for a fixed 3-second window, samples
+  /// `systemPressureCost` while running, then stops the session.
+  ///
+  /// ## Precondition
+  /// The native plugin requires the engine to be **idle** (no single-camera
+  /// session running). If the camera is active, this returns `null` (the native
+  /// side returns a `CAMERA_ACTIVE` error, which this method silently converts
+  /// to null). Stop the camera preview before calling this method.
+  ///
+  /// ## Authorization
+  /// Returns `null` if the camera is not yet authorized. Does **not** trigger
+  /// the permission prompt.
+  ///
+  /// ## What this does NOT do:
+  ///   - Does NOT create a Flutter texture or Metal renderer.
+  ///   - Does NOT composite frames.
+  ///   - Does NOT create `AVCaptureDataOutputSynchronizer`.
+  ///   - Does NOT modify the single-camera session.
+  ///
+  /// ## Android
+  /// Returns `null` silently via `PlatformException` fallback.
+  ///
+  /// ## Failure behavior
+  /// Returns `null` on any of:
+  ///   - Engine is not idle (`CAMERA_ACTIVE` error from native).
+  ///   - Camera authorization not granted.
+  ///   - Device not found by uniqueID.
+  ///   - `AVCaptureMultiCamSession` not supported on this device/OS.
+  ///   - A [PlatformException] (Android or unexpected native error).
+  ///   - Malformed or null native response.
+  static Future<VGMultiCamStreamingReport?> runMultiCamStreamingDiagnostic({
+    required String frontDeviceId,
+    required String backDeviceId,
+  }) async {
+    try {
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'runMultiCamStreamingDiagnostic',
+        {
+          'frontDeviceId': frontDeviceId,
+          'backDeviceId': backDeviceId,
+        },
+      );
+      return VGMultiCamStreamingReport.fromMap(raw);
     } on PlatformException {
       return null;
     }
