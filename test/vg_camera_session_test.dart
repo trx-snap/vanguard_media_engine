@@ -34,8 +34,10 @@
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vg_camera_session.dart';
+import 'package:vanguard_media_engine/vg_dual_camera_descriptor.dart';
 import 'package:vanguard_media_engine/vg_filter_spec.dart';
 import 'package:vanguard_media_engine/vg_graph_transaction.dart';
+import 'package:vanguard_media_engine/vg_live_preview_config.dart';
 import 'package:vanguard_media_engine/vg_preset_descriptor.dart';
 import 'package:vanguard_media_engine/vg_recording_stats.dart';
 import 'package:vanguard_media_engine/vg_photo_capture_result.dart';
@@ -2844,6 +2846,129 @@ void main() {
           reason: 'channel method name must be exactly stopMultiCamRenderDiagnostic '
               '(not stopMultiCamRendererDiagnostic or any other variant)',
         );
+      },
+    );
+  });
+
+  // ── MC-12: Layout config forwarding ──────────────────────────────────────
+  //
+  // Tests that the optional config parameter is forwarded correctly on both
+  // runMultiCamRenderDiagnostic and startMultiCamRenderDiagnostic.
+  //
+  // Acceptance criteria:
+  //   MC12-1  runMultiCamRenderDiagnostic omits 'config' key when config is null
+  //   MC12-2  runMultiCamRenderDiagnostic forwards config.toMap() when config is provided
+  //   MC12-3  startMultiCamRenderDiagnostic omits 'config' key when config is null
+  //   MC12-4  startMultiCamRenderDiagnostic forwards config.toMap() when config is provided
+  //   MC12-5  default VGLivePreviewConfig produces expected layout keys
+  //   MC12-6  splitScreen VGLivePreviewConfig produces layoutMode 'splitScreen'
+  group('MC-12 layout config forwarding', () {
+    const kFrontId = 'AVCaptureDevice-Front-001';
+    const kBackId  = 'AVCaptureDevice-Back-002';
+    const kValidRunResponse = <Object?, Object?>{
+      'renderedFrames': 10, 'droppedRenderFrames': 0,
+      'averageRenderMs': 10.0, 'peakRenderMs': 15.0,
+      'outputWidth': 1080, 'outputHeight': 1920,
+      'pairedFramesReceived': 10, 'frontFramesReceived': 10,
+      'backFramesReceived': 10, 'peakSystemPressureCost': 0.3,
+      'hardwareCost': 0.3, 'durationSeconds': 3.0,
+    };
+    const kValidStartResponse = <Object?, Object?>{'textureId': 42};
+
+    test(
+      'MC12-1 runMultiCamRenderDiagnostic omits config key when config is null',
+      () async {
+        _responses['runMultiCamRenderDiagnostic'] = kValidRunResponse;
+
+        await VGCameraSession.runMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(_log.first.arguments.containsKey('config'), isFalse,
+            reason: 'no config key must be present when config==null');
+      },
+    );
+
+    test(
+      'MC12-2 runMultiCamRenderDiagnostic forwards config.toMap() when config is provided',
+      () async {
+        _responses['runMultiCamRenderDiagnostic'] = kValidRunResponse;
+        const config = VGLivePreviewConfig(
+          layoutMode: VGDualCameraLayoutMode.splitScreen,
+        );
+
+        await VGCameraSession.runMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+          config: config,
+        );
+
+        final args = _log.first.arguments as Map;
+        expect(args.containsKey('config'), isTrue,
+            reason: 'config map must be forwarded to the channel');
+        final configMap = args['config'] as Map;
+        expect(configMap['layoutMode'], 'splitScreen',
+            reason: 'layoutMode must be serialized as the wire string');
+      },
+    );
+
+    test(
+      'MC12-3 startMultiCamRenderDiagnostic omits config key when config is null',
+      () async {
+        _responses['startMultiCamRenderDiagnostic'] = kValidStartResponse;
+
+        await VGCameraSession.startMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(_log.first.arguments.containsKey('config'), isFalse,
+            reason: 'no config key must be present when config==null');
+      },
+    );
+
+    test(
+      'MC12-4 startMultiCamRenderDiagnostic forwards config.toMap() when config is provided',
+      () async {
+        _responses['startMultiCamRenderDiagnostic'] = kValidStartResponse;
+        const config = VGLivePreviewConfig(
+          pipLayout: VGPiPLayoutDescriptor(anchor: VGPiPAnchor.topLeft),
+        );
+
+        await VGCameraSession.startMultiCamRenderDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+          config: config,
+        );
+
+        final args = _log.first.arguments as Map;
+        expect(args.containsKey('config'), isTrue,
+            reason: 'config map must be forwarded to the channel');
+        final pip = (args['config'] as Map)['pipLayout'] as Map;
+        expect(pip['anchor'], 'topLeft',
+            reason: 'topLeft anchor must serialize to the wire string topLeft');
+      },
+    );
+
+    test(
+      'MC12-5 default VGLivePreviewConfig produces layoutMode pip',
+      () {
+        const config = VGLivePreviewConfig();
+        final map = config.toMap();
+        expect(map['layoutMode'], 'pip');
+        final pip = map['pipLayout'] as Map;
+        expect(pip['anchor'], 'bottomRight');
+      },
+    );
+
+    test(
+      'MC12-6 splitScreen VGLivePreviewConfig produces layoutMode splitScreen',
+      () {
+        const config = VGLivePreviewConfig(
+          layoutMode: VGDualCameraLayoutMode.splitScreen,
+        );
+        expect(config.toMap()['layoutMode'], 'splitScreen');
       },
     );
   });

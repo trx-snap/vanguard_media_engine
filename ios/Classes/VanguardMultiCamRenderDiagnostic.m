@@ -200,6 +200,12 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     // Guards textureFrameAvailable dispatch. YES only when initWithTextureRegistry:
     // was used. The MC-9 blocking run path never sets this to YES.
     BOOL _textureRegistered;
+
+    // ── Layout config (MC-12) ────────────────────────────────────────────────
+    //
+    // Drives PiP or split-screen composition in _renderPairedFrame:
+    // Set once before source starts; read exclusively on renderQ.
+    VGMCRDLayoutConfig _layoutConfig;
 }
 
 @synthesize renderedFrames      = _renderedFrames;
@@ -242,6 +248,7 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     _textureRegistry     = nil;
     _textureId           = 0;
     _textureRegistered   = NO;
+    _layoutConfig        = VGMCRDDefaultLayoutConfig();
 
     // Pre-warm the shared CIContext (dispatch_once is lazy).
     // Doing this here avoids a first-frame spike.
@@ -332,6 +339,57 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     _textureRegistered = NO;
     NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-10] doUnregisterTexture: "
           "unregistered textureId=%lld.", (long long)_textureId);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - Layout config (MC-12)
+// ─────────────────────────────────────────────────────────────────────────────
+
+- (void)setLayoutConfig:(VGMCRDLayoutConfig)config {
+    _layoutConfig = config;
+}
+
++ (VGMCRDLayoutConfig)layoutConfigFromMap:(NSDictionary<NSString *, id> *)map {
+    VGMCRDLayoutConfig cfg = VGMCRDDefaultLayoutConfig();
+    if (!map) return cfg;
+
+    // layoutMode
+    NSString *modeStr = [map objectForKey:@"layoutMode"];
+    if ([modeStr isEqualToString:@"splitScreen"]) {
+        cfg.layoutMode = VGDualCameraLayoutModeSplitScreen;
+    } else {
+        cfg.layoutMode = VGDualCameraLayoutModePiP;
+    }
+
+    // pipLayout
+    NSDictionary *pip = [map objectForKey:@"pipLayout"];
+    if ([pip isKindOfClass:[NSDictionary class]]) {
+        NSString *anchorStr = [pip objectForKey:@"anchor"];
+        if      ([anchorStr isEqualToString:@"topLeft"])    cfg.pipConfig.anchor = VGPiPAnchorTopLeft;
+        else if ([anchorStr isEqualToString:@"topRight"])   cfg.pipConfig.anchor = VGPiPAnchorTopRight;
+        else if ([anchorStr isEqualToString:@"bottomLeft"]) cfg.pipConfig.anchor = VGPiPAnchorBottomLeft;
+        else                                                 cfg.pipConfig.anchor = VGPiPAnchorBottomRight;
+
+        NSNumber *wf = [pip objectForKey:@"widthFraction"];
+        if (wf && [wf doubleValue] > 0) cfg.pipConfig.widthFraction = [wf doubleValue];
+        NSNumber *mf = [pip objectForKey:@"marginFraction"];
+        if (mf && [mf doubleValue] >= 0) cfg.pipConfig.marginFraction = [mf doubleValue];
+        NSNumber *cr = [pip objectForKey:@"cornerRadius"];
+        if (cr && [cr doubleValue] >= 0) cfg.pipConfig.cornerRadius = [cr doubleValue];
+        NSNumber *op = [pip objectForKey:@"opacity"];
+        if (op) cfg.pipConfig.opacity = MAX(0.0, MIN(1.0, [op doubleValue]));
+    }
+
+    // splitLayout
+    NSDictionary *split = [map objectForKey:@"splitLayout"];
+    if ([split isKindOfClass:[NSDictionary class]]) {
+        NSNumber *sr = [split objectForKey:@"splitRatio"];
+        if (sr && [sr doubleValue] > 0.0 && [sr doubleValue] < 1.0) {
+            cfg.splitConfig.splitRatio = [sr doubleValue];
+        }
+    }
+
+    return cfg;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -426,13 +484,9 @@ _VGMCRDCreatePool(size_t width, size_t height) {
 /// Composites a paired frame offscreen using CoreImage.
 /// Called exclusively on the serial renderQ.
 ///
-/// Composition layout (PiP only — MC-9 scope):
-///   Primary (canvas): back camera buffer
-///   Secondary (inset): front camera buffer (bottom-right PiP)
-///   Output: same dimensions as primary (back camera)
-///
-/// CIFilter instances are created fresh per-frame. CIFilter is NOT thread-safe.
-/// VGDualCameraLayoutMath is pure C — safe to call from any thread.
+/// MC-12: branches on _layoutConfig.layoutMode — PiP or split-screen.
+/// Both paths use VGDualCameraLayoutMath for geometry. Falls back to
+/// default bottom-right PiP on any degenerate input.
 ///
 /// After successful render and buffer swap (MC-10):
 ///   If _textureRegistered, dispatches textureFrameAvailable: to main queue.
@@ -440,7 +494,7 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     if (_stopped) return;
 
     CVPixelBufferRef primaryBuf   = frame.backBuffer;   // back = full canvas
-    CVPixelBufferRef secondaryBuf = frame.frontBuffer;  // front = PiP inset
+    CVPixelBufferRef secondaryBuf = frame.frontBuffer;  // front = PiP/secondary
 
     if (!primaryBuf || !secondaryBuf) {
         NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] _renderPairedFrame: "
@@ -462,19 +516,13 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     }
 
     // ── 2. Lazy pool creation / dimension check ───────────────────────────────
-    //
-    // Pool is created once for the first frame's dimensions.
-    // Defensive re-creation if dimensions change (unlikely in diagnostic).
     if (!_pool || _poolWidth != primW || _poolHeight != primH) {
         if (_pool) {
-            // Release previous pool (dimension change — defensive path).
-            // Release old buffer under lock before releasing pool.
             os_unfair_lock_lock(&_bufferLock);
             CVPixelBufferRef old = _lastCompositedBuffer;
             _lastCompositedBuffer = NULL;
             os_unfair_lock_unlock(&_bufferLock);
             if (old) CVPixelBufferRelease(old);
-
             CVPixelBufferPoolRelease(_pool);
             _pool = NULL;
         }
@@ -498,11 +546,8 @@ _VGMCRDCreatePool(size_t width, size_t height) {
               "CVPixelBufferPoolCreatePixelBuffer failed (ret=%d).", poolRet);
         return;
     }
-    // outputBuf is +1 from pool allocation — we own it.
 
     // ── 4. Build CIImages ─────────────────────────────────────────────────────
-    //
-    // CIImage is immutable and thread-safe.
     CIImage *primaryCI   = [CIImage imageWithCVPixelBuffer:primaryBuf];
     CIImage *secondaryCI = [CIImage imageWithCVPixelBuffer:secondaryBuf];
     if (!primaryCI || !secondaryCI) {
@@ -512,134 +557,131 @@ _VGMCRDCreatePool(size_t width, size_t height) {
         return;
     }
 
-    // ── 5. PiP geometry (VGDualCameraLayoutMath — MC-1A) ─────────────────────
-    //
-    // Use default PiP layout (bottom-right, 35% width, 1.8% margin, 24pt corner).
-    // These match VGPiPLayoutDescriptor() defaults in Dart.
-    VGPiPLayoutConfig pipLayout = {
-        .anchor         = VGPiPAnchorBottomRight,
-        .widthFraction  = 0.35,
-        .marginFraction = 0.018,
-        .cornerRadius   = 24.0,
-        .opacity        = 1.0,
-    };
-    VGDCPiPGeometry pipGeo = VGDCLayoutComputePiPGeometry(primW, primH,
-                                                           secW,  secH,
-                                                           pipLayout);
-    double pipOriginX = pipGeo.pipOriginX;
-    double pipOriginY = pipGeo.pipOriginY;
-    double pipW       = pipGeo.pipW;
-    double pipH       = pipGeo.pipH;
-    double cr         = pipGeo.clampedCornerRadius;
+    // ── 5. Compose based on layout mode (MC-12) ───────────────────────────────
+    CIImage *composited = nil;
 
-    // ── 6. Scale secondary to PiP size ────────────────────────────────────────
-    //
-    // Normalize secondary origin first (CoreImage Y-up, may be non-zero).
-    // Matches VGDualCameraCompositorNode._compositeWithPrimary:secondary: §5.
-    CIImage *secNorm = secondaryCI;
-    CGPoint secOrigin = secNorm.extent.origin;
-    if (secOrigin.x != 0.0 || secOrigin.y != 0.0) {
-        CGAffineTransform normT = CGAffineTransformMakeTranslation(-secOrigin.x,
-                                                                   -secOrigin.y);
-        secNorm = [secNorm imageByApplyingTransform:normT];
-    }
+    if (_layoutConfig.layoutMode == VGDualCameraLayoutModeSplitScreen) {
+        // ── Split-screen path ─────────────────────────────────────────────────
+        VGDCSplitRects rects = VGDCLayoutComputeSplitRects(primW, primH,
+                                                            _layoutConfig.splitConfig);
+        if (rects.isValid) {
+            // Scale and crop primary into top band.
+            VGDCAspectFillResult primFill = VGDCLayoutComputeAspectFill(primW, primH, rects.topRect);
+            CGPoint primOrigin = primaryCI.extent.origin;
+            CIImage *primNorm = (primOrigin.x != 0.0 || primOrigin.y != 0.0)
+                ? [primaryCI imageByApplyingTransform:
+                    CGAffineTransformMakeTranslation(-primOrigin.x, -primOrigin.y)]
+                : primaryCI;
+            CIImage *primFilled = [[primNorm
+                imageByApplyingTransform:CGAffineTransformMakeScale(primFill.scale, primFill.scale)]
+                imageByApplyingTransform:CGAffineTransformMakeTranslation(primFill.offsetX, primFill.offsetY)];
+            CIImage *primCropped = [primFilled imageByCroppingToRect:rects.topRect];
 
-    double scaleX = (secW > 0) ? pipW / (double)secW : 1.0;
-    double scaleY = (secH > 0) ? pipH / (double)secH : 1.0;
-    CGAffineTransform scaleT = CGAffineTransformMakeScale(scaleX, scaleY);
-    CIImage *secScaled = [secNorm imageByApplyingTransform:scaleT];
+            // Scale and crop secondary into bottom band.
+            VGDCAspectFillResult secFill = VGDCLayoutComputeAspectFill(secW, secH, rects.bottomRect);
+            CGPoint secOrigin = secondaryCI.extent.origin;
+            CIImage *secNorm = (secOrigin.x != 0.0 || secOrigin.y != 0.0)
+                ? [secondaryCI imageByApplyingTransform:
+                    CGAffineTransformMakeTranslation(-secOrigin.x, -secOrigin.y)]
+                : secondaryCI;
+            CIImage *secFilled = [[secNorm
+                imageByApplyingTransform:CGAffineTransformMakeScale(secFill.scale, secFill.scale)]
+                imageByApplyingTransform:CGAffineTransformMakeTranslation(secFill.offsetX, secFill.offsetY)];
+            CIImage *secCropped = [secFilled imageByCroppingToRect:rects.bottomRect];
 
-    // ── 7. Translate secondary to PiP position ────────────────────────────────
-    CGAffineTransform translateT = CGAffineTransformMakeTranslation(pipOriginX,
-                                                                    pipOriginY);
-    CIImage *secPositioned = [secScaled imageByApplyingTransform:translateT];
-
-    // ── 8. Apply corner radius mask ───────────────────────────────────────────
-    //
-    // CIFilter instances are created per-frame — CIFilter is NOT thread-safe.
-    // Matches VGDualCameraCompositorNode._compositeWithPrimary:secondary: §7.
-    CIImage *secStyled = secPositioned;
-    if (cr > 0.0) {
-        CGRect pipLocalRect = CGRectMake(pipOriginX, pipOriginY, pipW, pipH);
-        CIFilter *maskFilter = [CIFilter filterWithName:@"CIRoundedRectangleGenerator"
-                                          keysAndValues:
-            @"inputExtent", [CIVector vectorWithCGRect:pipLocalRect],
-            @"inputRadius", @(cr),
-            @"inputColor",  [CIColor whiteColor],
-            nil];
-        CIImage *mask = maskFilter.outputImage;
-        if (mask) {
-            mask = [mask imageByCroppingToRect:pipLocalRect];
-            CIFilter *blendFilter = [CIFilter filterWithName:@"CIBlendWithAlphaMask"
-                                                keysAndValues:
-                kCIInputImageKey,           secPositioned,
-                kCIInputMaskImageKey,        mask,
-                kCIInputBackgroundImageKey,  [CIImage emptyImage],
-                nil];
-            CIImage *masked = blendFilter.outputImage;
-            if (masked) {
-                secStyled = masked;
-            }
+            // Composite onto a black canvas.
+            CIImage *black = [[CIImage imageWithColor:[CIColor blackColor]]
+                imageByCroppingToRect:CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH)];
+            composited = [primCropped imageByCompositingOverImage:
+                            [secCropped imageByCompositingOverImage:black]];
+        } else {
+            NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-12] split rects invalid — "
+                  "falling back to default PiP.");
         }
     }
 
-    // ── 9. Composite: secondary PiP over primary (Porter-Duff SourceOver) ─────
-    CIImage *composited = [secStyled imageByCompositingOverImage:primaryCI];
+    if (!composited) {
+        // ── PiP path (default and split-screen fallback) ──────────────────────
+        VGDCPiPGeometry pipGeo = VGDCLayoutComputePiPGeometry(primW, primH,
+                                                               secW, secH,
+                                                               _layoutConfig.pipConfig);
+        double pipOriginX = pipGeo.pipOriginX;
+        double pipOriginY = pipGeo.pipOriginY;
+        double pipW       = pipGeo.pipW;
+        double pipH       = pipGeo.pipH;
+        double cr         = pipGeo.clampedCornerRadius;
+
+        CIImage *secNorm = secondaryCI;
+        CGPoint secOrigin = secNorm.extent.origin;
+        if (secOrigin.x != 0.0 || secOrigin.y != 0.0) {
+            secNorm = [secNorm imageByApplyingTransform:
+                CGAffineTransformMakeTranslation(-secOrigin.x, -secOrigin.y)];
+        }
+        double scaleX = (secW > 0) ? pipW / (double)secW : 1.0;
+        double scaleY = (secH > 0) ? pipH / (double)secH : 1.0;
+        CIImage *secScaled = [secNorm imageByApplyingTransform:
+            CGAffineTransformMakeScale(scaleX, scaleY)];
+        CIImage *secPositioned = [secScaled imageByApplyingTransform:
+            CGAffineTransformMakeTranslation(pipOriginX, pipOriginY)];
+
+        CIImage *secStyled = secPositioned;
+        if (cr > 0.0) {
+            CGRect pipLocalRect = CGRectMake(pipOriginX, pipOriginY, pipW, pipH);
+            CIFilter *maskFilter = [CIFilter filterWithName:@"CIRoundedRectangleGenerator"
+                                              keysAndValues:
+                @"inputExtent", [CIVector vectorWithCGRect:pipLocalRect],
+                @"inputRadius", @(cr),
+                @"inputColor",  [CIColor whiteColor],
+                nil];
+            CIImage *mask = maskFilter.outputImage;
+            if (mask) {
+                mask = [mask imageByCroppingToRect:pipLocalRect];
+                CIFilter *blendFilter = [CIFilter filterWithName:@"CIBlendWithAlphaMask"
+                                                    keysAndValues:
+                    kCIInputImageKey,           secPositioned,
+                    kCIInputMaskImageKey,        mask,
+                    kCIInputBackgroundImageKey,  [CIImage emptyImage],
+                    nil];
+                CIImage *masked = blendFilter.outputImage;
+                if (masked) { secStyled = masked; }
+            }
+        }
+        composited = [secStyled imageByCompositingOverImage:primaryCI];
+    }
+
     if (!composited) {
         NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] _renderPairedFrame: "
-              "imageByCompositingOverImage: returned nil.");
+              "compositing returned nil.");
         CVPixelBufferRelease(outputBuf);
         return;
     }
 
-    // ── 10. Render into output buffer (synchronous) ───────────────────────────
-    //
-    // CIContext render:toCVPixelBuffer:bounds:colorSpace: is synchronous.
-    // It blocks renderQ until the GPU operation completes.
-    // Timing wraps this call to measure actual render duration.
-    // Lock is NOT held during rendering — only during pointer swap.
-    double t0 = CACurrentMediaTime() * 1000.0; // milliseconds
-
+    // ── 6. Render into output buffer (synchronous) ────────────────────────────
+    double t0 = CACurrentMediaTime() * 1000.0;
     CGRect renderBounds = CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH);
     [_VGMCRDSharedCIContext() render:composited
                      toCVPixelBuffer:outputBuf
                                bounds:renderBounds
                            colorSpace:nil];
-
     double renderMs = CACurrentMediaTime() * 1000.0 - t0;
 
-    // ── 11. Update metrics ────────────────────────────────────────────────────
+    // ── 7. Update metrics ─────────────────────────────────────────────────────
     _renderedFrames++;
     _totalRenderMs += renderMs;
-    if (renderMs > _peakRenderMs) {
-        _peakRenderMs = renderMs;
-    }
+    if (renderMs > _peakRenderMs) { _peakRenderMs = renderMs; }
     if (_outputWidth == 0) {
         _outputWidth  = (int32_t)primW;
         _outputHeight = (int32_t)primH;
     }
 
-    // ── 12. Swap _lastCompositedBuffer under lock (MC-10) ─────────────────────
-    //
-    // Lock scope covers ONLY pointer swap — NOT the CIContext render above.
-    // Raster thread (copyPixelBuffer) may be concurrently reading;
-    // os_unfair_lock ensures mutual exclusion with correct priority inheritance.
+    // ── 8. Swap _lastCompositedBuffer under lock (MC-10) ──────────────────────
     os_unfair_lock_lock(&_bufferLock);
     CVPixelBufferRef old = _lastCompositedBuffer;
-    _lastCompositedBuffer = outputBuf; // takes +1 from pool allocation
+    _lastCompositedBuffer = outputBuf;
     os_unfair_lock_unlock(&_bufferLock);
+    if (old) CVPixelBufferRelease(old);
 
-    // Release the displaced buffer AFTER unlocking.
-    // The +1 from pool allocation is now exclusively held by _lastCompositedBuffer.
-    if (old) {
-        CVPixelBufferRelease(old);
-    }
-
-    // ── 13. Signal Flutter raster thread (MC-10) ──────────────────────────────
-    //
-    // Only when a texture is registered (MC-10 start/stop path).
-    // The MC-9 blocking run path does not call this (no texture registered).
-    // Dispatched to main queue — Flutter requirement (matches VanguardMetalRenderer).
+    // ── 9. Signal Flutter raster thread (MC-10) ───────────────────────────────
     if (_textureRegistered) {
         __weak __typeof(self) weakSelf = self;
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -649,15 +691,16 @@ _VGMCRDCreatePool(size_t width, size_t height) {
         });
     }
 
-    // ── 14. One-time first-frame log ──────────────────────────────────────────
+    // ── 10. One-time first-frame log ──────────────────────────────────────────
     if (_renderedFrames == 1) {
-        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] first frame rendered | "
-              "canvas=%zux%zu pip=(%.0f,%.0f,%.0f,%.0f) cr=%.1f renderMs=%.2f texture=%s",
-              primW, primH,
-              pipOriginX, pipOriginY, pipW, pipH,
-              cr, renderMs,
+        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-12] first frame | "
+              "mode=%s canvas=%zux%zu renderMs=%.2f texture=%s",
+              _layoutConfig.layoutMode == VGDualCameraLayoutModeSplitScreen
+                  ? "splitScreen" : "pip",
+              primW, primH, renderMs,
               _textureRegistered ? "YES" : "NO");
     }
 }
 
 @end
+

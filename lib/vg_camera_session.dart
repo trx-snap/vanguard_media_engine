@@ -27,6 +27,7 @@ import 'package:flutter/services.dart';
 import 'vg_camera_zoom_capabilities.dart';
 import 'vg_filter_spec.dart';
 import 'vg_graph_transaction.dart';
+import 'vg_live_preview_config.dart';
 import 'vg_recording_stats.dart';
 import 'vg_photo_capture_result.dart';
 
@@ -1509,6 +1510,7 @@ final class VGCameraSession {
   static Future<VGMultiCamRenderReport?> runMultiCamRenderDiagnostic({
     required String frontDeviceId,
     required String backDeviceId,
+    VGLivePreviewConfig? config,
   }) async {
     try {
       final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
@@ -1516,6 +1518,7 @@ final class VGCameraSession {
         {
           'frontDeviceId': frontDeviceId,
           'backDeviceId': backDeviceId,
+          if (config != null) 'config': config.toMap(),
         },
       );
       return VGMultiCamRenderReport.fromMap(raw);
@@ -1553,6 +1556,7 @@ final class VGCameraSession {
   static Future<VGMultiCamRenderTextureSession?> startMultiCamRenderDiagnostic({
     required String frontDeviceId,
     required String backDeviceId,
+    VGLivePreviewConfig? config,
   }) async {
     try {
       final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
@@ -1560,6 +1564,7 @@ final class VGCameraSession {
         {
           'frontDeviceId': frontDeviceId,
           'backDeviceId': backDeviceId,
+          if (config != null) 'config': config.toMap(),
         },
       );
       return VGMultiCamRenderTextureSession.fromMap(raw);

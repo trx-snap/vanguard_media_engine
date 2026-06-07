@@ -80,10 +80,35 @@
 #import <CoreVideo/CoreVideo.h>
 #import <Flutter/Flutter.h>
 #import "VanguardMultiCamMediaSource.h"
+#import "VGDualCameraLayoutMath.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
-// ─── VanguardMultiCamRenderDiagnostic ─────────────────────────────────────────
+// ─── VGMCRDLayoutConfig ───────────────────────────────────────────────────────
+/// Parsed layout configuration passed from Dart via the method channel.
+/// MC-12: Drives PiP anchor/size or split-screen ratio in _renderPairedFrame:
+///
+/// Parsed defensively from a raw [String:Any] map.
+/// All fields have safe defaults matching the existing MC-9/MC-10 behaviour.
+typedef struct {
+    VGDualCameraLayoutMode layoutMode;     ///< .pip (0) or .splitScreen (1). Default: .pip.
+    VGPiPLayoutConfig      pipConfig;     ///< PiP geometry. Default: bottomRight, 0.35, 0.018, 24pt.
+    VGSplitScreenLayoutConfig splitConfig; ///< Split-screen geometry. Default: ratio 0.5.
+} VGMCRDLayoutConfig;
+
+/// Returns the default layout config (bottom-right PiP, 35% width).
+/// Used when no config is provided and as a fallback for malformed input.
+static inline VGMCRDLayoutConfig VGMCRDDefaultLayoutConfig(void) {
+    VGMCRDLayoutConfig c;
+    c.layoutMode              = VGDualCameraLayoutModePiP;
+    c.pipConfig.anchor        = VGPiPAnchorBottomRight;
+    c.pipConfig.widthFraction  = 0.35;
+    c.pipConfig.marginFraction = 0.018;
+    c.pipConfig.cornerRadius   = 24.0;
+    c.pipConfig.opacity        = 1.0;
+    c.splitConfig.splitRatio   = 0.5;
+    return c;
+}
 
 /// Diagnostic-only offscreen compositor for MultiCam paired frames.
 ///
@@ -197,6 +222,18 @@ NS_ASSUME_NONNULL_BEGIN
 /// For the MC-10 start/stop path, call BEFORE doUnregisterTexture so that
 /// renderQ is drained before the raster thread is unblocked from unregister.
 - (void)stop;
+
+/// MC-12: Set layout configuration before calling source.start().
+///
+/// Not thread-safe — must be called before the source delegate fires.
+/// After start, the config is read on renderQ only.
+- (void)setLayoutConfig:(VGMCRDLayoutConfig)config;
+
+/// MC-12: Parse a VGLivePreviewConfig.toMap() dictionary into a VGMCRDLayoutConfig.
+///
+/// Fully defensive: any missing/malformed field falls back to the default.
+/// Called from Swift, which cannot directly reference C-struct enum constants.
++ (VGMCRDLayoutConfig)layoutConfigFromMap:(NSDictionary<NSString *, id> * _Nullable)map;
 
 @end
 

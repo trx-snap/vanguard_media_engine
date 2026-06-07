@@ -3497,6 +3497,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
                     // ── MC-9: create renderer and wire as delegate ────────────
                     let renderer = VanguardMultiCamRenderDiagnostic()
+                    // MC-12: apply layout config if provided.
+                    if let configMap = args?["config"] as? [String: Any] {
+                        renderer.setLayoutConfig(VanguardMultiCamRenderDiagnostic.layoutConfig(fromMap: configMap))
+                    }
                     source.delegate = renderer
 
                     guard source.start() else {
@@ -3582,6 +3586,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
                 // Step 1: Create the render diagnostic on main thread (registerTexture requires main).
                 let renderer = VanguardMultiCamRenderDiagnostic(textureRegistry: registrar.textures())
+                // MC-12: apply layout config if provided.
+                if let configMap = args?["config"] as? [String: Any] {
+                    renderer.setLayoutConfig(VanguardMultiCamRenderDiagnostic.layoutConfig(fromMap: configMap))
+                }
                 let textureId    = renderer.textureId
                 let initialWidth  = renderer.outputWidth   // 0 until first frame
                 let initialHeight = renderer.outputHeight  // 0 until first frame
