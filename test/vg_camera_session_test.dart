@@ -1827,4 +1827,123 @@ void main() {
       },
     );
   });
+
+  // ── MC-7: VGCameraSession.runMultiCamSourceLifecycleDiagnostic ───────────
+  //
+  // Tests for the production MultiCam media source lifecycle diagnostic that
+  // uses VanguardMultiCamMediaSource + VanguardMultiCamFramePairer (MC-6).
+  //
+  // Confirms channel dispatch, argument passing, full result parsing,
+  // and null-safety fallbacks.
+  //
+  // These are pure Dart / mock-channel tests — no native code runs.
+  //
+  // Acceptance criteria:
+  //   MC7-1  dispatches 'runMultiCamSourceLifecycleDiagnostic' with
+  //          frontDeviceId and backDeviceId
+  //   MC7-2  parses valid native response into VGMultiCamSyncReport
+  //   MC7-3  returns null on PlatformException
+  //   MC7-4  returns null on null native response
+  group('VGCameraSession.runMultiCamSourceLifecycleDiagnostic', () {
+    const kFrontId = 'AVCaptureDevice-Front-001';
+    const kBackId  = 'AVCaptureDevice-Back-002';
+
+    // Canonical valid response — mirrors physical-device MC-5/MC-7 results.
+    // Shape is identical to VGMultiCamSyncReport native dictionary.
+    const kValidResponse = <Object?, Object?>{
+      'pairedFramesReceived':    85,
+      'frontFramesReceived':     91,
+      'backFramesReceived':      85,
+      'unmatchedFrontFrames':    6,
+      'unmatchedBackFrames':     0,
+      'maxDriftSeconds':         0.020586,
+      'averageDriftSeconds':     0.020428,
+      'peakSystemPressureCost':  0.4955,
+      'hardwareCost':            0.5000,
+      'durationSeconds':         3.22,
+      'pairingThresholdSeconds': 1.0 / 30.0,
+    };
+
+    test(
+      'MC7-1 runMultiCamSourceLifecycleDiagnostic dispatches channel method with frontDeviceId and backDeviceId',
+      () async {
+        _responses['runMultiCamSourceLifecycleDiagnostic'] = kValidResponse;
+
+        await VGCameraSession.runMultiCamSourceLifecycleDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(_log.length, 1,
+            reason: 'runMultiCamSourceLifecycleDiagnostic must invoke the channel exactly once');
+        expect(_log.first.method, 'runMultiCamSourceLifecycleDiagnostic',
+            reason: 'channel method name must be runMultiCamSourceLifecycleDiagnostic');
+        expect(_log.first.arguments['frontDeviceId'], kFrontId,
+            reason: 'frontDeviceId must be forwarded to the channel');
+        expect(_log.first.arguments['backDeviceId'],  kBackId,
+            reason: 'backDeviceId must be forwarded to the channel');
+      },
+    );
+
+    test(
+      'MC7-2 runMultiCamSourceLifecycleDiagnostic parses valid native response into VGMultiCamSyncReport',
+      () async {
+        _responses['runMultiCamSourceLifecycleDiagnostic'] = kValidResponse;
+
+        final report = await VGCameraSession.runMultiCamSourceLifecycleDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNotNull,
+            reason: 'must return a non-null VGMultiCamSyncReport for a valid native map');
+        expect(report!.pairedFramesReceived,  85);
+        expect(report.frontFramesReceived,    91);
+        expect(report.backFramesReceived,     85);
+        expect(report.unmatchedFrontFrames,    6);
+        expect(report.unmatchedBackFrames,     0);
+        expect(report.maxDriftSeconds,     closeTo(0.020586, 0.000001));
+        expect(report.averageDriftSeconds, closeTo(0.020428, 0.000001));
+        expect(report.peakSystemPressureCost, closeTo(0.4955, 0.0001));
+        expect(report.hardwareCost,           closeTo(0.5000, 0.0001));
+        expect(report.durationSeconds,        closeTo(3.22, 0.001));
+        expect(report.pairingThresholdSeconds,
+            closeTo(1.0 / 30.0, 0.000001));
+      },
+    );
+
+    test(
+      'MC7-3 runMultiCamSourceLifecycleDiagnostic returns null on PlatformException',
+      () async {
+        _responses['runMultiCamSourceLifecycleDiagnostic'] = PlatformException(
+          code: 'CAMERA_ACTIVE',
+          message: 'Stop camera preview before running MultiCam source lifecycle diagnostic',
+        );
+
+        final report = await VGCameraSession.runMultiCamSourceLifecycleDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNull,
+            reason: 'must return null (not rethrow) when native throws PlatformException');
+      },
+    );
+
+    test(
+      'MC7-4 runMultiCamSourceLifecycleDiagnostic returns null on null native response',
+      () async {
+        _responses['runMultiCamSourceLifecycleDiagnostic'] = null;
+
+        final report = await VGCameraSession.runMultiCamSourceLifecycleDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNull,
+            reason: 'must return null when native responds with null '
+                '(e.g. iOS < 13, device not found, or not authorized)');
+      },
+    );
+  });
 }

@@ -3317,6 +3317,80 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(nil)
             }
 
+        // ── MC-7: MultiCam media source lifecycle diagnostic ──────────────────
+        //
+        // Instantiates VanguardMultiCamMediaSource, starts it for 3 seconds,
+        // stops it, and returns the pairing + system metrics dictionary.
+        //
+        // Key differences from MC-5 (runMultiCamSyncDiagnostic):
+        //   MC-5: standalone diagnostic class (_VanguardMC5SoftPairDelegate),
+        //         session and pairing logic are internal to the diagnostic.
+        //   MC-7: production source object (VanguardMultiCamMediaSource),
+        //         uses the extracted VanguardMultiCamFramePairer (MC-6).
+        //
+        //   - Does NOT create textures, renderers, or compositors.
+        //   - Does NOT modify VanguardCameraMediaSource or VGCameraGraphSession.
+        //   - Does NOT add VanguardEngineMode.multiCam.
+        //   - Does NOT conform to <VanguardMediaSource>.
+        //   - Does NOT retain CVPixelBuffer (PTS extraction only).
+        //   - startRunning is dispatched to a background queue (synchronous API).
+        //   - Returns nil if unauthorized, unsupported, or device not found.
+        //   - REQUIRES currentMode == .idle. Refuses with CAMERA_ACTIVE if not.
+        case "runMultiCamSourceLifecycleDiagnostic":
+            // ── Hard precondition: engine must be idle ────────────────────────
+            // Starting a second AVCaptureSession while single-camera is running
+            // interrupts VanguardCameraMediaSource, which has no recovery logic.
+            guard currentMode == .idle else {
+                result(FlutterError(
+                    code: "CAMERA_ACTIVE",
+                    message: "Stop camera preview before running MultiCam source lifecycle diagnostic",
+                    details: nil
+                ))
+                return
+            }
+            guard let frontDeviceId = args?["frontDeviceId"] as? String,
+                  let backDeviceId  = args?["backDeviceId"]  as? String else {
+                result(FlutterError(
+                    code: "INVALID_ARG",
+                    message: "runMultiCamSourceLifecycleDiagnostic requires frontDeviceId and backDeviceId",
+                    details: nil
+                ))
+                return
+            }
+            if #available(iOS 13.0, *) {
+                // Dispatch to global background queue: startRunning is synchronous
+                // and blocks for hardware init (~50–200ms) + 3-second window.
+                // Must not run on the main thread.
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let source = VanguardMultiCamMediaSource(
+                        frontDeviceId: frontDeviceId,
+                        backDeviceId: backDeviceId,
+                        frameRate: 30
+                    )
+                    guard let source = source else {
+                        // Init returned nil: not authorized, not supported,
+                        // device not found, or session configuration failed.
+                        DispatchQueue.main.async { result(nil) }
+                        return
+                    }
+                    guard source.start() else {
+                        // startRunning returned NO: session failed to run.
+                        source.stop()
+                        DispatchQueue.main.async { result(nil) }
+                        return
+                    }
+                    // Fixed 3-second diagnostic window.
+                    // captureQ delivers frames freely during this sleep.
+                    Thread.sleep(forTimeInterval: 3.0)
+                    source.stop()
+                    DispatchQueue.main.async {
+                        result(source.metrics())
+                    }
+                }
+            } else {
+                result(nil)
+            }
+
         case "setFocusPoint":
 
             guard let x = args?["x"] as? Double, let y = args?["y"] as? Double else {

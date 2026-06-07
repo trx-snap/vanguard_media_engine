@@ -1026,8 +1026,72 @@ final class VGCameraSession {
     }
   }
 
-  /// Tap-to-focus and tap-to-expose at a normalised point.
+  /// MC-7: Runs a live 3-second MultiCam media source lifecycle diagnostic
+  /// for the given front and back device IDs.
+  ///
+  /// Instantiates `VanguardMultiCamMediaSource` — the production MultiCam
+  /// source scaffold created in MC-7 — starts it for 3 seconds, stops it,
+  /// and returns the pairing + system metrics.
+  ///
+  /// ## Key difference from MC-5
+  /// [runMultiCamSyncDiagnostic] (MC-5) uses a standalone diagnostic class
+  /// with an internal pairing delegate.
+  /// This method (MC-7) uses the production `VanguardMultiCamMediaSource`
+  /// with the extracted `VanguardMultiCamFramePairer` (MC-6).
+  ///
+  /// ## Return value
+  /// Returns the same [VGMultiCamSyncReport] type as MC-5. Both the native
+  /// dictionary shape and the Dart report model are identical. MC-7 and MC-5
+  /// results should be comparable within ±10%.
+  ///
+  /// ## Precondition
+  /// The native plugin requires the engine to be **idle** (no single-camera
+  /// session running). If the camera is active, this returns `null` (the
+  /// native side returns a `CAMERA_ACTIVE` error, which this method silently
+  /// converts to null). Stop the camera preview before calling this method.
+  ///
+  /// ## Authorization
+  /// Returns `null` if the camera is not yet authorized. Does **not** trigger
+  /// the permission prompt.
+  ///
+  /// ## What this does NOT do
+  ///   - Does NOT create a Flutter texture or Metal renderer.
+  ///   - Does NOT composite frames.
+  ///   - Does NOT retain `CMSampleBuffer` or `CVPixelBuffer`.
+  ///   - Does NOT conform to `<VanguardMediaSource>`.
+  ///   - Does NOT add `VanguardEngineMode.multiCam`.
+  ///   - Does NOT modify the single-camera session.
+  ///
+  /// ## Android
+  /// Returns `null` silently via `PlatformException` fallback.
+  ///
+  /// ## Failure behavior
+  /// Returns `null` on any of:
+  ///   - Engine is not idle (`CAMERA_ACTIVE` error from native).
+  ///   - Camera authorization not granted.
+  ///   - Device not found by uniqueID.
+  ///   - `AVCaptureMultiCamSession` not supported on this device/OS.
+  ///   - A [PlatformException] (Android or unexpected native error).
+  ///   - Malformed or null native response.
+  static Future<VGMultiCamSyncReport?> runMultiCamSourceLifecycleDiagnostic({
+    required String frontDeviceId,
+    required String backDeviceId,
+  }) async {
+    try {
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'runMultiCamSourceLifecycleDiagnostic',
+        {
+          'frontDeviceId': frontDeviceId,
+          'backDeviceId': backDeviceId,
+        },
+      );
+      return VGMultiCamSyncReport.fromMap(raw);
+    } on PlatformException {
+      return null;
+    }
+  }
 
+  /// Tap-to-focus and tap-to-expose at a normalised point.
   ///
   /// [x] and [y] must be in the range `[0.0, 1.0]`, where `(0, 0)` is the
   /// top-left and `(1, 1)` is the bottom-right of the camera frame.
