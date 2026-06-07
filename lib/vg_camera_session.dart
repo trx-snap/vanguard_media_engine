@@ -334,7 +334,324 @@ class VGMultiCamStreamingReport {
       'durationSeconds: $durationSeconds)';
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// MC-5: VGMultiCamSyncReport
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reports the results of a live 3-second MultiCam software timestamp-pairing
+/// diagnostic for a given front/back device pair.
+///
+/// Produced by [VGCameraSession.runMultiCamSyncDiagnostic].
+///
+/// ## Purpose
+/// MC-4 ([VGMultiCamStreamingReport]) proved independent per-camera frame
+/// delivery. MC-5 extends that by measuring how closely the independent
+/// front and back frames are temporally aligned. A software nearest-neighbour
+/// algorithm pairs each newly arrived frame with the most recent unmatched
+/// frame from the other camera if their PTS difference is within
+/// [pairingThresholdSeconds] (1/30 s ≈ 33.3 ms).
+///
+/// ## Why not AVCaptureDataOutputSynchronizer?
+/// Physical-device testing confirmed that `AVCaptureDataOutputSynchronizer`
+/// produces zero paired frames for independent front/back cameras:
+/// `alwaysDiscardsLateVideoFrames` (honored by the synchronizer per Apple docs)
+/// causes the secondary camera's frames to be discarded before pairing. MC-5
+/// therefore uses independent `setSampleBufferDelegate` callbacks on a shared
+/// serial queue, matching the proven MC-4 approach.
+///
+/// ## Fields
+/// - [pairedFramesReceived]: Frames software-paired within [pairingThresholdSeconds].
+/// - [frontFramesReceived]: Total front frames delivered by AVFoundation.
+/// - [backFramesReceived]: Total back frames delivered by AVFoundation.
+/// - [unmatchedFrontFrames]: Front frames that expired without a back partner.
+/// - [unmatchedBackFrames]: Back frames that expired without a front partner.
+/// - [maxDriftSeconds]: Peak |frontPTS − backPTS| across all paired frames.
+/// - [averageDriftSeconds]: Mean |frontPTS − backPTS| across all paired frames.
+/// - [peakSystemPressureCost]: Maximum `systemPressureCost` while running.
+/// - [hardwareCost]: ISP bandwidth cost read from the configured session.
+/// - [durationSeconds]: Actual elapsed time of the diagnostic window.
+/// - [pairingThresholdSeconds]: The threshold used for pairing (1/30 s).
+///
+/// ## Derived properties
+/// - [pairedFPS]: `pairedFramesReceived / durationSeconds`
+/// - [maxDriftMilliseconds]: `maxDriftSeconds * 1000.0`
+/// - [averageDriftMilliseconds]: `averageDriftSeconds * 1000.0`
+/// - [pairingThresholdMilliseconds]: `pairingThresholdSeconds * 1000.0`
+@immutable
+class VGMultiCamSyncReport {
+  const VGMultiCamSyncReport({
+    required this.pairedFramesReceived,
+    required this.frontFramesReceived,
+    required this.backFramesReceived,
+    required this.unmatchedFrontFrames,
+    required this.unmatchedBackFrames,
+    required this.maxDriftSeconds,
+    required this.averageDriftSeconds,
+    required this.peakSystemPressureCost,
+    required this.hardwareCost,
+    required this.durationSeconds,
+    required this.pairingThresholdSeconds,
+  });
+
+  /// Frames software-paired within [pairingThresholdSeconds].
+  final int pairedFramesReceived;
+
+  /// Total front frames delivered by AVFoundation during the run window.
+  final int frontFramesReceived;
+
+  /// Total back frames delivered by AVFoundation during the run window.
+  final int backFramesReceived;
+
+  /// Front frames that arrived but found no back partner within the threshold.
+  final int unmatchedFrontFrames;
+
+  /// Back frames that arrived but found no front partner within the threshold.
+  final int unmatchedBackFrames;
+
+  /// Peak absolute PTS difference between a paired front and back frame,
+  /// in seconds. 0.0 if no pairs were received.
+  final double maxDriftSeconds;
+
+  /// Mean PTS difference across all paired frames, in seconds.
+  /// 0.0 if no pairs were received.
+  final double averageDriftSeconds;
+
+  /// Peak `systemPressureCost` observed while the session was running.
+  /// Values > 1.0 indicate unsustainable load.
+  final double peakSystemPressureCost;
+
+  /// ISP bandwidth cost read from the session after configuration.
+  final double hardwareCost;
+
+  /// Actual elapsed duration of the diagnostic window, in seconds.
+  final double durationSeconds;
+
+  /// The pairing threshold used by the native algorithm, in seconds.
+  /// Fixed at 1/30 s ≈ 33.3 ms.
+  final double pairingThresholdSeconds;
+
+  // ── Derived ───────────────────────────────────────────────────────────────
+
+  /// Estimated paired frame rate in frames per second.
+  double get pairedFPS =>
+      durationSeconds > 0 ? pairedFramesReceived / durationSeconds : 0.0;
+
+  /// Peak PTS drift between front and back cameras, in milliseconds.
+  double get maxDriftMilliseconds => maxDriftSeconds * 1000.0;
+
+  /// Mean PTS drift between front and back cameras, in milliseconds.
+  double get averageDriftMilliseconds => averageDriftSeconds * 1000.0;
+
+  /// Pairing threshold in milliseconds.
+  double get pairingThresholdMilliseconds => pairingThresholdSeconds * 1000.0;
+
+  // ── Parsing ───────────────────────────────────────────────────────────────
+
+  /// Parses a [VGMultiCamSyncReport] from the native channel response map.
+  ///
+  /// Returns `null` if [map] is `null` or any required field is absent or
+  /// of an unexpected type.
+  static VGMultiCamSyncReport? fromMap(Map<Object?, Object?>? map) {
+    if (map == null) return null;
+
+    // pairedFramesReceived — required int
+    final rawPaired = map['pairedFramesReceived'];
+    if (rawPaired == null) return null;
+    final int paired;
+    if (rawPaired is int) {
+      paired = rawPaired;
+    } else if (rawPaired is double) {
+      paired = rawPaired.toInt();
+    } else {
+      return null;
+    }
+
+    // frontFramesReceived — required int
+    final rawFront = map['frontFramesReceived'];
+    if (rawFront == null) return null;
+    final int frontFrames;
+    if (rawFront is int) {
+      frontFrames = rawFront;
+    } else if (rawFront is double) {
+      frontFrames = rawFront.toInt();
+    } else {
+      return null;
+    }
+
+    // backFramesReceived — required int
+    final rawBack = map['backFramesReceived'];
+    if (rawBack == null) return null;
+    final int backFrames;
+    if (rawBack is int) {
+      backFrames = rawBack;
+    } else if (rawBack is double) {
+      backFrames = rawBack.toInt();
+    } else {
+      return null;
+    }
+
+    // unmatchedFrontFrames — required int
+    final rawUnmatchedFront = map['unmatchedFrontFrames'];
+    if (rawUnmatchedFront == null) return null;
+    final int unmatchedFront;
+    if (rawUnmatchedFront is int) {
+      unmatchedFront = rawUnmatchedFront;
+    } else if (rawUnmatchedFront is double) {
+      unmatchedFront = rawUnmatchedFront.toInt();
+    } else {
+      return null;
+    }
+
+    // unmatchedBackFrames — required int
+    final rawUnmatchedBack = map['unmatchedBackFrames'];
+    if (rawUnmatchedBack == null) return null;
+    final int unmatchedBack;
+    if (rawUnmatchedBack is int) {
+      unmatchedBack = rawUnmatchedBack;
+    } else if (rawUnmatchedBack is double) {
+      unmatchedBack = rawUnmatchedBack.toInt();
+    } else {
+      return null;
+    }
+
+    // maxDriftSeconds — required double
+    final rawMaxDrift = map['maxDriftSeconds'];
+    if (rawMaxDrift == null) return null;
+    final double maxDrift;
+    if (rawMaxDrift is double) {
+      maxDrift = rawMaxDrift;
+    } else if (rawMaxDrift is int) {
+      maxDrift = rawMaxDrift.toDouble();
+    } else {
+      return null;
+    }
+
+    // averageDriftSeconds — required double
+    final rawAvgDrift = map['averageDriftSeconds'];
+    if (rawAvgDrift == null) return null;
+    final double avgDrift;
+    if (rawAvgDrift is double) {
+      avgDrift = rawAvgDrift;
+    } else if (rawAvgDrift is int) {
+      avgDrift = rawAvgDrift.toDouble();
+    } else {
+      return null;
+    }
+
+    // peakSystemPressureCost — required double
+    final rawPeak = map['peakSystemPressureCost'];
+    if (rawPeak == null) return null;
+    final double peakPressure;
+    if (rawPeak is double) {
+      peakPressure = rawPeak;
+    } else if (rawPeak is int) {
+      peakPressure = rawPeak.toDouble();
+    } else {
+      return null;
+    }
+
+    // hardwareCost — required double
+    final rawHW = map['hardwareCost'];
+    if (rawHW == null) return null;
+    final double hw;
+    if (rawHW is double) {
+      hw = rawHW;
+    } else if (rawHW is int) {
+      hw = rawHW.toDouble();
+    } else {
+      return null;
+    }
+
+    // durationSeconds — required double
+    final rawDuration = map['durationSeconds'];
+    if (rawDuration == null) return null;
+    final double duration;
+    if (rawDuration is double) {
+      duration = rawDuration;
+    } else if (rawDuration is int) {
+      duration = rawDuration.toDouble();
+    } else {
+      return null;
+    }
+
+    // pairingThresholdSeconds — required double
+    final rawThreshold = map['pairingThresholdSeconds'];
+    if (rawThreshold == null) return null;
+    final double threshold;
+    if (rawThreshold is double) {
+      threshold = rawThreshold;
+    } else if (rawThreshold is int) {
+      threshold = rawThreshold.toDouble();
+    } else {
+      return null;
+    }
+
+    return VGMultiCamSyncReport(
+      pairedFramesReceived: paired,
+      frontFramesReceived: frontFrames,
+      backFramesReceived: backFrames,
+      unmatchedFrontFrames: unmatchedFront,
+      unmatchedBackFrames: unmatchedBack,
+      maxDriftSeconds: maxDrift,
+      averageDriftSeconds: avgDrift,
+      peakSystemPressureCost: peakPressure,
+      hardwareCost: hw,
+      durationSeconds: duration,
+      pairingThresholdSeconds: threshold,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGMultiCamSyncReport &&
+          runtimeType == other.runtimeType &&
+          pairedFramesReceived == other.pairedFramesReceived &&
+          frontFramesReceived == other.frontFramesReceived &&
+          backFramesReceived == other.backFramesReceived &&
+          unmatchedFrontFrames == other.unmatchedFrontFrames &&
+          unmatchedBackFrames == other.unmatchedBackFrames &&
+          maxDriftSeconds == other.maxDriftSeconds &&
+          averageDriftSeconds == other.averageDriftSeconds &&
+          peakSystemPressureCost == other.peakSystemPressureCost &&
+          hardwareCost == other.hardwareCost &&
+          durationSeconds == other.durationSeconds &&
+          pairingThresholdSeconds == other.pairingThresholdSeconds;
+
+  @override
+  int get hashCode => Object.hash(
+        pairedFramesReceived,
+        frontFramesReceived,
+        backFramesReceived,
+        unmatchedFrontFrames,
+        unmatchedBackFrames,
+        maxDriftSeconds,
+        averageDriftSeconds,
+        peakSystemPressureCost,
+        hardwareCost,
+        durationSeconds,
+        pairingThresholdSeconds,
+      );
+
+  @override
+  String toString() =>
+      'VGMultiCamSyncReport('
+      'pairedFramesReceived: $pairedFramesReceived, '
+      'frontFramesReceived: $frontFramesReceived, '
+      'backFramesReceived: $backFramesReceived, '
+      'unmatchedFrontFrames: $unmatchedFrontFrames, '
+      'unmatchedBackFrames: $unmatchedBackFrames, '
+      'pairedFPS: ${pairedFPS.toStringAsFixed(1)}, '
+      'maxDriftMs: ${maxDriftMilliseconds.toStringAsFixed(3)}, '
+      'avgDriftMs: ${averageDriftMilliseconds.toStringAsFixed(3)}, '
+      'pairingThresholdMs: ${pairingThresholdMilliseconds.toStringAsFixed(2)}, '
+      'peakSystemPressureCost: $peakSystemPressureCost, '
+      'hardwareCost: $hardwareCost, '
+      'durationSeconds: $durationSeconds)';
+}
+
 final class VGCameraSession {
+
   // ── Channel ──────────────────────────────────────────────────────────────────
 
   static const _channel = MethodChannel('vanguard_media_engine');
@@ -644,7 +961,73 @@ final class VGCameraSession {
     }
   }
 
+  /// MC-5: Runs a live 3-second MultiCam software timestamp-pairing diagnostic
+  /// for the given front and back device IDs.
+  ///
+  /// Uses independent `setSampleBufferDelegate:queue:` on each output (same as
+  /// MC-4), with a shared serial queue for lock-free software pairing. On each
+  /// callback, the presentation timestamp (PTS) is extracted and compared with
+  /// the most recent unmatched PTS from the other camera. If the drift is within
+  /// 1/30 s, the frames are counted as a pair and the drift is measured.
+  ///
+  /// ## Why not AVCaptureDataOutputSynchronizer?
+  /// Physical-device testing showed zero paired frames with `AVCaptureDataOutputSynchronizer`:
+  /// its `alwaysDiscardsLateVideoFrames` behavior causes the secondary camera's
+  /// frames to be discarded before pairing. Software pairing is used instead.
+  ///
+  /// ## Key difference from MC-4
+  /// MC-4 ([runMultiCamStreamingDiagnostic]) counts raw frame delivery only.
+  /// MC-5 additionally measures temporal alignment between front and back frames
+  /// via nearest-neighbour PTS matching.
+  ///
+  /// ## Precondition
+  /// The native plugin requires the engine to be **idle** (no single-camera
+  /// session running). If the camera is active, this returns `null` (the native
+  /// side returns a `CAMERA_ACTIVE` error, which this method silently converts
+  /// to null). Stop the camera preview before calling this method.
+  ///
+  /// ## Authorization
+  /// Returns `null` if the camera is not yet authorized. Does **not** trigger
+  /// the permission prompt.
+  ///
+  /// ## What this does NOT do:
+  ///   - Does NOT create a Flutter texture or Metal renderer.
+  ///   - Does NOT composite frames.
+  ///   - Does NOT retain `CMSampleBuffer` or `CVPixelBuffer` beyond the callback.
+  ///   - Does NOT create `VanguardMultiCamMediaSource`.
+  ///   - Does NOT modify the single-camera session.
+  ///
+  /// ## Android
+  /// Returns `null` silently via `PlatformException` fallback.
+  ///
+  /// ## Failure behavior
+  /// Returns `null` on any of:
+  ///   - Engine is not idle (`CAMERA_ACTIVE` error from native).
+  ///   - Camera authorization not granted.
+  ///   - Device not found by uniqueID.
+  ///   - `AVCaptureMultiCamSession` not supported on this device/OS.
+  ///   - A [PlatformException] (Android or unexpected native error).
+  ///   - Malformed or null native response.
+  static Future<VGMultiCamSyncReport?> runMultiCamSyncDiagnostic({
+    required String frontDeviceId,
+    required String backDeviceId,
+  }) async {
+    try {
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'runMultiCamSyncDiagnostic',
+        {
+          'frontDeviceId': frontDeviceId,
+          'backDeviceId': backDeviceId,
+        },
+      );
+      return VGMultiCamSyncReport.fromMap(raw);
+    } on PlatformException {
+      return null;
+    }
+  }
+
   /// Tap-to-focus and tap-to-expose at a normalised point.
+
   ///
   /// [x] and [y] must be in the range `[0.0, 1.0]`, where `(0, 0)` is the
   /// top-left and `(1, 1)` is the bottom-right of the camera frame.

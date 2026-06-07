@@ -3261,7 +3261,64 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(nil)
             }
 
+        // ── MC-5: MultiCam synchronized frame-pair diagnostic ─────────────────
+        //
+        // Uses AVCaptureDataOutputSynchronizer to deliver paired
+        // AVCaptureSynchronizedDataCollection callbacks and measure
+        // PTS drift between front and back frames within each pair.
+        //
+        // Key architectural difference from MC-4:
+        //   MC-4 sets setSampleBufferDelegate:queue: on each output independently.
+        //   MC-5 does NOT — AVCaptureDataOutputSynchronizer takes exclusive
+        //   control of synchronized delivery. Setting individual delegates
+        //   on outputs governed by a synchronizer conflicts with its operation.
+        //
+        //   - Does NOT create textures, renderers, or compositors.
+        //   - Does NOT create VanguardMultiCamMediaSource.
+        //   - Does NOT modify VanguardCameraMediaSource.
+        //   - startRunning is dispatched to a background queue (synchronous API).
+        //   - Returns nil if unauthorized, unsupported, or device not found.
+        //   - REQUIRES currentMode == .idle. Refuses with CAMERA_ACTIVE if not.
+        case "runMultiCamSyncDiagnostic":
+            // ── Hard precondition: engine must be idle ────────────────────────
+            // Starting a second AVCaptureSession while single-camera is running
+            // interrupts VanguardCameraMediaSource, which has no recovery logic.
+            guard currentMode == .idle else {
+                result(FlutterError(
+                    code: "CAMERA_ACTIVE",
+                    message: "Stop camera preview before running MultiCam sync diagnostic",
+                    details: nil
+                ))
+                return
+            }
+            guard let frontDeviceId = args?["frontDeviceId"] as? String,
+                  let backDeviceId  = args?["backDeviceId"]  as? String else {
+                result(FlutterError(
+                    code: "INVALID_ARG",
+                    message: "runMultiCamSyncDiagnostic requires frontDeviceId and backDeviceId",
+                    details: nil
+                ))
+                return
+            }
+            if #available(iOS 13.0, *) {
+                // Dispatch to global background queue: startRunning is synchronous
+                // and blocks for hardware init (~50–200ms) + 3-second window.
+                // Must not run on the main thread.
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let report = VanguardMultiCamSyncDiagnostic.run(
+                        forFrontId: frontDeviceId,
+                        backId: backDeviceId
+                    )
+                    DispatchQueue.main.async {
+                        result(report)
+                    }
+                }
+            } else {
+                result(nil)
+            }
+
         case "setFocusPoint":
+
             guard let x = args?["x"] as? Double, let y = args?["y"] as? Double else {
                 result(FlutterError(code: "INVALID_ARG", message: "x and y required", details: nil))
                 return

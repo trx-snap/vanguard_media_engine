@@ -1662,4 +1662,169 @@ void main() {
       },
     );
   });
+
+  // ── MC-5: VGCameraSession.runMultiCamSyncDiagnostic ───────────────────────
+  //
+  // Tests for the synchronized frame-pair diagnostic using
+  // AVCaptureDataOutputSynchronizer.
+  //
+  // Confirms channel dispatch, argument passing, full result parsing,
+  // derived getter computation (pairedFPS, drift milliseconds), and
+  // null-safety fallbacks.
+  //
+  // These are pure Dart / mock-channel tests — no native code runs.
+  //
+  // Acceptance criteria:
+  //   MC5-1  dispatches 'runMultiCamSyncDiagnostic' with frontDeviceId and backDeviceId
+  //   MC5-2  parses valid native response into VGMultiCamSyncReport
+  //   MC5-3  returns null on PlatformException
+  //   MC5-4  returns null on null native response
+  //   MC5-5  fromMap computes derived pairedFPS, drift ms, threshold ms correctly
+  //   MC5-6  fromMap returns null for missing pairedFramesReceived
+  group('VGCameraSession.runMultiCamSyncDiagnostic', () {
+    const kFrontId = 'AVCaptureDevice-Front-001';
+    const kBackId  = 'AVCaptureDevice-Back-002';
+
+    // Canonical valid response — mirrors the revised native return dictionary.
+    const kValidResponse = <Object?, Object?>{
+      'pairedFramesReceived':    86,
+      'frontFramesReceived':     91,
+      'backFramesReceived':      89,
+      'unmatchedFrontFrames':    5,
+      'unmatchedBackFrames':     3,
+      'maxDriftSeconds':         0.008,
+      'averageDriftSeconds':     0.002,
+      'peakSystemPressureCost':  0.49,
+      'hardwareCost':            0.50,
+      'durationSeconds':         3.02,
+      'pairingThresholdSeconds': 1.0 / 30.0,
+    };
+
+    test(
+      'MC5-1 runMultiCamSyncDiagnostic dispatches channel method with frontDeviceId and backDeviceId',
+      () async {
+        _responses['runMultiCamSyncDiagnostic'] = kValidResponse;
+
+        await VGCameraSession.runMultiCamSyncDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(_log.length, 1,
+            reason: 'runMultiCamSyncDiagnostic must invoke the channel exactly once');
+        expect(_log.first.method, 'runMultiCamSyncDiagnostic',
+            reason: 'channel method name must be runMultiCamSyncDiagnostic');
+        expect(_log.first.arguments['frontDeviceId'], kFrontId,
+            reason: 'frontDeviceId must be forwarded to the channel');
+        expect(_log.first.arguments['backDeviceId'],  kBackId,
+            reason: 'backDeviceId must be forwarded to the channel');
+      },
+    );
+
+    test(
+      'MC5-2 runMultiCamSyncDiagnostic parses valid native response into VGMultiCamSyncReport',
+      () async {
+        _responses['runMultiCamSyncDiagnostic'] = kValidResponse;
+
+        final report = await VGCameraSession.runMultiCamSyncDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNotNull,
+            reason: 'must return a non-null VGMultiCamSyncReport for a valid native map');
+        expect(report!.pairedFramesReceived,  86);
+        expect(report.frontFramesReceived,    91);
+        expect(report.backFramesReceived,     89);
+        expect(report.unmatchedFrontFrames,    5);
+        expect(report.unmatchedBackFrames,     3);
+        expect(report.maxDriftSeconds,     closeTo(0.008, 0.000001));
+        expect(report.averageDriftSeconds, closeTo(0.002, 0.000001));
+        expect(report.peakSystemPressureCost, closeTo(0.49, 0.0001));
+        expect(report.hardwareCost,           closeTo(0.50, 0.0001));
+        expect(report.durationSeconds,        closeTo(3.02, 0.001));
+        expect(report.pairingThresholdSeconds,
+            closeTo(1.0 / 30.0, 0.000001));
+      },
+    );
+
+    test(
+      'MC5-3 runMultiCamSyncDiagnostic returns null on PlatformException',
+      () async {
+        _responses['runMultiCamSyncDiagnostic'] = PlatformException(
+          code: 'CAMERA_ACTIVE',
+          message: 'Stop camera preview before running MultiCam sync diagnostic',
+        );
+
+        final report = await VGCameraSession.runMultiCamSyncDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNull,
+            reason: 'must return null (not rethrow) when native throws PlatformException');
+      },
+    );
+
+    test(
+      'MC5-4 runMultiCamSyncDiagnostic returns null on null native response',
+      () async {
+        _responses['runMultiCamSyncDiagnostic'] = null;
+
+        final report = await VGCameraSession.runMultiCamSyncDiagnostic(
+          frontDeviceId: kFrontId,
+          backDeviceId: kBackId,
+        );
+
+        expect(report, isNull,
+            reason: 'must return null when native responds with null '
+                '(e.g. iOS < 13, device not found, or not authorized)');
+      },
+    );
+
+    test(
+      'MC5-5 VGMultiCamSyncReport.fromMap computes derived FPS and drift/threshold milliseconds correctly',
+      () {
+        // pairedFPS              = 86 / 3.02 ≈ 28.48
+        // maxDriftMilliseconds   = 0.008 * 1000 = 8.0 ms
+        // avgDriftMilliseconds   = 0.002 * 1000 = 2.0 ms
+        // thresholdMilliseconds  = (1/30) * 1000 ≈ 33.33 ms
+        final report = VGMultiCamSyncReport.fromMap(kValidResponse);
+
+        expect(report, isNotNull);
+        expect(
+          report!.pairedFPS,
+          closeTo(86.0 / 3.02, 0.001),
+          reason: 'pairedFPS must equal pairedFramesReceived / durationSeconds',
+        );
+        expect(
+          report.maxDriftMilliseconds,
+          closeTo(8.0, 0.0001),
+          reason: 'maxDriftMilliseconds must equal maxDriftSeconds * 1000',
+        );
+        expect(
+          report.averageDriftMilliseconds,
+          closeTo(2.0, 0.0001),
+          reason: 'averageDriftMilliseconds must equal averageDriftSeconds * 1000',
+        );
+        expect(
+          report.pairingThresholdMilliseconds,
+          closeTo(1000.0 / 30.0, 0.001),
+          reason: 'pairingThresholdMilliseconds must equal pairingThresholdSeconds * 1000',
+        );
+      },
+    );
+
+    test(
+      'MC5-6 VGMultiCamSyncReport.fromMap returns null for missing pairedFramesReceived',
+      () {
+        final map = Map<Object?, Object?>.from(kValidResponse)
+          ..remove('pairedFramesReceived');
+        final report = VGMultiCamSyncReport.fromMap(map);
+
+        expect(report, isNull,
+            reason: 'fromMap must return null when pairedFramesReceived is missing');
+      },
+    );
+  });
 }
