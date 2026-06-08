@@ -1,10 +1,11 @@
 // vg_audio_sidecar_plan_test.dart
-// Vanguard Media Engine — Phase 8.14A/8.14B/8.14C Audio Sidecar Export Muxer
+// Vanguard Media Engine — Phase 8.14A/8.14B/8.14C/8.14D Audio Sidecar Export Muxer
 //
 // Pure Dart unit tests for VGAudioSidecarTrack and VGAudioSidecarPlan,
 // plus VGEditorDraft audioSidecarPlan additive bridge tests.
 // Phase 8.14B additions: role, fadeInSeconds, fadeOutSeconds, multi-track.
 // Phase 8.14C additions: sourceTrimStartSeconds, flattenOriginalClipAudio().
+// Phase 8.14D additions: transition-derived fadeInSeconds/fadeOutSeconds.
 //
 // Tests:
 //   AST-*  VGAudioSidecarTrack round-trip, validation, equality
@@ -18,6 +19,7 @@ import 'package:vanguard_media_engine/vg_clip_descriptor.dart';
 import 'package:vanguard_media_engine/vg_dual_camera_descriptor.dart';
 import 'package:vanguard_media_engine/vg_editor_draft.dart';
 import 'package:vanguard_media_engine/vg_time_remap_descriptor.dart';
+import 'package:vanguard_media_engine/vg_transition_descriptor.dart';
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
 
@@ -920,14 +922,14 @@ void main() {
 
     // ── Generated track fades are 0.0 ────────────────────────────────────────
 
-    test('FAO-4 generated tracks always have fadeInSeconds = 0.0', () {
+    test('FAO-4 hard-cut or no transition: generated track has fadeInSeconds = 0.0', () {
       final clip = _videoClip(id: 'v1', trimEndSeconds: 3.0);
       final result = VGEditorDraft(id: 'fao-4', clips: [clip])
           .flattenOriginalClipAudio();
       expect(result.audioSidecarPlan!.tracks[0].fadeInSeconds, closeTo(0.0, 1e-9));
     });
 
-    test('FAO-5 generated tracks always have fadeOutSeconds = 0.0', () {
+    test('FAO-5 hard-cut or no transition: generated track has fadeOutSeconds = 0.0', () {
       final clip = _videoClip(id: 'v1', trimEndSeconds: 3.0);
       final result = VGEditorDraft(id: 'fao-5', clips: [clip])
           .flattenOriginalClipAudio();
@@ -1077,6 +1079,135 @@ void main() {
       final plan = result.audioSidecarPlan!;
       final trackMap = plan.tracks[0].toMap();
       expect(trackMap['sourceTrimStart'], closeTo(1.5, 1e-9));
+    });
+
+    // ── Phase 8.14D: transition-derived crossfades ────────────────────────────
+
+    test('FAO-16 dissolve outgoing: outgoing clip gets fadeOutSeconds = transition duration', () {
+      final clipA = _videoClip(id: 'clip-a', durationSeconds: 5.0, trimStartSeconds: 0.0, trimEndSeconds: 5.0);
+      final clipB = _videoClip(id: 'clip-b', durationSeconds: 5.0, trimStartSeconds: 0.0, trimEndSeconds: 5.0);
+      final dissolve = VGTransitionDescriptor(
+        id: 'tr-ab',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 0.5,
+        fromClipId: 'clip-a',
+        toClipId: 'clip-b',
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'fao-16',
+        clips: [clipA, clipB],
+        transitions: [dissolve],
+      );
+      final result = draft.flattenOriginalClipAudio();
+
+      final tracks = result.audioSidecarPlan!.tracks;
+      expect(tracks.length, 2);
+      // Outgoing clip (clip-a): fadeOut = 0.5, no incoming transition → fadeIn = 0.0.
+      expect(tracks[0].trackId, 'original-clip-a');
+      expect(tracks[0].fadeOutSeconds, closeTo(0.5, 1e-9));
+      expect(tracks[0].fadeInSeconds, closeTo(0.0, 1e-9));
+      // Incoming clip (clip-b): fadeIn = 0.5, no outgoing transition → fadeOut = 0.0.
+      expect(tracks[1].trackId, 'original-clip-b');
+      expect(tracks[1].fadeInSeconds, closeTo(0.5, 1e-9));
+      expect(tracks[1].fadeOutSeconds, closeTo(0.0, 1e-9));
+    });
+
+    test('FAO-17 hard-cut transition produces 0.0 fades on both clips', () {
+      final clipA = _videoClip(id: 'clip-a', durationSeconds: 5.0, trimStartSeconds: 0.0, trimEndSeconds: 5.0);
+      final clipB = _videoClip(id: 'clip-b', durationSeconds: 5.0, trimStartSeconds: 0.0, trimEndSeconds: 5.0);
+      final hardCut = VGTransitionDescriptor(
+        id: 'tr-hc',
+        type: VGTransitionType.none,
+        durationSeconds: 0.0,
+        fromClipId: 'clip-a',
+        toClipId: 'clip-b',
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'fao-17',
+        clips: [clipA, clipB],
+        transitions: [hardCut],
+      );
+      final result = draft.flattenOriginalClipAudio();
+
+      final tracks = result.audioSidecarPlan!.tracks;
+      expect(tracks[0].fadeOutSeconds, closeTo(0.0, 1e-9));
+      expect(tracks[1].fadeInSeconds, closeTo(0.0, 1e-9));
+    });
+
+    test('FAO-18 middle clip with transitions on both sides gets both fades', () {
+      final clipA = _videoClip(id: 'ca', durationSeconds: 5.0, trimStartSeconds: 0.0, trimEndSeconds: 5.0);
+      final clipB = _videoClip(id: 'cb', durationSeconds: 5.0, trimStartSeconds: 0.0, trimEndSeconds: 5.0);
+      final clipC = _videoClip(id: 'cc', durationSeconds: 5.0, trimStartSeconds: 0.0, trimEndSeconds: 5.0);
+      final trAB = VGTransitionDescriptor(
+        id: 'tr-ab',
+        type: VGTransitionType.dissolve,
+        durationSeconds: 0.4,
+        fromClipId: 'ca',
+        toClipId: 'cb',
+      );
+      final trBC = VGTransitionDescriptor(
+        id: 'tr-bc',
+        type: VGTransitionType.fade,
+        durationSeconds: 0.8,
+        fromClipId: 'cb',
+        toClipId: 'cc',
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'fao-18',
+        clips: [clipA, clipB, clipC],
+        transitions: [trAB, trBC],
+      );
+      final result = draft.flattenOriginalClipAudio();
+
+      final tracks = result.audioSidecarPlan!.tracks;
+      expect(tracks.length, 3);
+      // Middle clip (cb): incoming dissolve 0.4s → fadeIn, outgoing fade 0.8s → fadeOut.
+      final mid = tracks[1];
+      expect(mid.trackId, 'original-cb');
+      expect(mid.fadeInSeconds, closeTo(0.4, 1e-9));
+      expect(mid.fadeOutSeconds, closeTo(0.8, 1e-9));
+    });
+
+    test('FAO-19 dissolve-type=none with non-zero duration is treated as hard cut (isHardCut)', () {
+      // VGTransitionDescriptor.isHardCut: type==none OR durationSeconds==0.0.
+      // type==none always isHardCut regardless of durationSeconds.
+      final clipA = _videoClip(id: 'clip-a', durationSeconds: 5.0, trimStartSeconds: 0.0, trimEndSeconds: 5.0);
+      final clipB = _videoClip(id: 'clip-b', durationSeconds: 5.0, trimStartSeconds: 0.0, trimEndSeconds: 5.0);
+      final noneWithDuration = VGTransitionDescriptor(
+        id: 'tr-none',
+        type: VGTransitionType.none,
+        durationSeconds: 1.0, // duration set but type=none → isHardCut == true
+        fromClipId: 'clip-a',
+        toClipId: 'clip-b',
+      );
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'fao-19',
+        clips: [clipA, clipB],
+        transitions: [noneWithDuration],
+      );
+      final result = draft.flattenOriginalClipAudio();
+
+      final tracks = result.audioSidecarPlan!.tracks;
+      // Hard cut (type=none): both fades must be 0.0.
+      expect(tracks[0].fadeOutSeconds, closeTo(0.0, 1e-9));
+      expect(tracks[1].fadeInSeconds, closeTo(0.0, 1e-9));
+    });
+
+    test('FAO-20 no transitions on draft: all generated tracks have 0.0 fades', () {
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'fao-20',
+        clips: [
+          _videoClip(id: 'v1', durationSeconds: 5.0, trimStartSeconds: 0.0, trimEndSeconds: 5.0),
+          _videoClip(id: 'v2', durationSeconds: 5.0, trimStartSeconds: 0.0, trimEndSeconds: 5.0),
+        ],
+        // no transitions
+      );
+      final result = draft.flattenOriginalClipAudio();
+
+      for (final t in result.audioSidecarPlan!.tracks) {
+        expect(t.fadeInSeconds, closeTo(0.0, 1e-9));
+        expect(t.fadeOutSeconds, closeTo(0.0, 1e-9));
+      }
     });
   });
 }

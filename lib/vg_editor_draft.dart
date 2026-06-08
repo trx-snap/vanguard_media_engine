@@ -74,6 +74,18 @@
 //   - All internal draft reconstruction calls pass audioSidecarPlan through so
 //     it survives trim, split, freeze, reverse, and reorder operations.
 //
+// Phase 8.14D additions (transition-derived audio crossfades):
+//   - flattenOriginalClipAudio() now derives fadeInSeconds / fadeOutSeconds for
+//     each generated original-audio sidecar track from the non-hard-cut transition
+//     adjacent to that clip in the timeline.
+//   - Incoming transition (toClipId == clip.id): its durationSeconds becomes the
+//     generated track's fadeInSeconds.
+//   - Outgoing transition (fromClipId == clip.id): its durationSeconds becomes the
+//     generated track's fadeOutSeconds.
+//   - Hard cuts and absent transitions produce 0.0 (no change from 8.14C behaviour).
+//   - No native Objective-C changes. Native muxer fade-ramp clamping handles
+//     edge cases (fades exceeding clip duration are proportionally scaled).
+//
 // Consumed by VGEditorController (Stage 7.7) to coordinate channel calls.
 //
 // Serialisation:
@@ -645,6 +657,16 @@ final class VGEditorDraft {
   ///
   /// This is a **pure** operation — no MethodChannel calls, no I/O.
   VGEditorDraft flattenOriginalClipAudio() {
+    // Phase 8.14D: build transition lookup maps once for O(n) total work.
+    // incoming: toClipId → transition (determines fadeInSeconds for that clip).
+    // outgoing: fromClipId → transition (determines fadeOutSeconds for that clip).
+    final incoming = <String, VGTransitionDescriptor>{};
+    final outgoing = <String, VGTransitionDescriptor>{};
+    for (final t in transitions) {
+      if (t.toClipId != null) incoming[t.toClipId!] = t;
+      if (t.fromClipId != null) outgoing[t.fromClipId!] = t;
+    }
+
     final generatedTracks = <VGAudioSidecarTrack>[];
     for (final clip in clips) {
       // Skip condition 1: not a video clip.
@@ -660,6 +682,13 @@ final class VGEditorDraft {
       // Skip condition 6: dual-camera clip.
       if (clip.dualCamera != null) continue;
 
+      // Phase 8.14D: derive audio crossfade durations from adjacent transitions.
+      // Hard cuts (isHardCut == true) and absent transitions produce 0.0.
+      final inTr = incoming[clip.id];
+      final outTr = outgoing[clip.id];
+      final fadeIn = (inTr != null && !inTr.isHardCut) ? inTr.durationSeconds : 0.0;
+      final fadeOut = (outTr != null && !outTr.isHardCut) ? outTr.durationSeconds : 0.0;
+
       generatedTracks.add(VGAudioSidecarTrack(
         trackId: 'original-${clip.id}',
         url: clip.sourcePath,
@@ -668,9 +697,8 @@ final class VGEditorDraft {
         sourceTrimStartSeconds: clip.trimStartSeconds,
         role: 'original',
         volume: 1.0,
-        // Transition-derived crossfades deferred to Phase 8.14D.
-        fadeInSeconds: 0.0,
-        fadeOutSeconds: 0.0,
+        fadeInSeconds: fadeIn,
+        fadeOutSeconds: fadeOut,
       ));
     }
 
