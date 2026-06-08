@@ -1,5 +1,5 @@
-// VanguardMultiCamRenderDiagnostic.h
-// vanguard_media_engine — MC-9/MC-10/MC-13/MC-15: MultiCam compositor.
+// VanguardMultiCamRenderer.h
+// vanguard_media_engine — MC-9/MC-10/MC-13/MC-15/MC-17/MC-19: MultiCam compositor.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // MC-9/MC-10 — MULTICAM OFFSCREEN COMPOSITION + FLUTTER TEXTURE
@@ -117,7 +117,9 @@ static inline VGMCRDLayoutConfig VGMCRDDefaultLayoutConfig(void) {
     return c;
 }
 
-/// Diagnostic-only offscreen compositor for MultiCam paired frames.
+/// Production MultiCam compositor for MultiCam paired frames.
+///
+/// MC-19: Promoted to production status (MC-13 preview, MC-15 photo, MC-17 video recording).
 ///
 /// ## MC-9: Blocking run API
 /// Conforms to `VanguardMultiCamMediaSourceDelegate`. Composites received
@@ -130,7 +132,7 @@ static inline VGMCRDLayoutConfig VGMCRDDefaultLayoutConfig(void) {
 ///
 /// ## Usage (MC-9 blocking)
 /// ```objc
-/// VanguardMultiCamRenderDiagnostic *renderer = [[VanguardMultiCamRenderDiagnostic alloc] init];
+/// VanguardMultiCamRenderer *renderer = [[VanguardMultiCamRenderer alloc] init];
 /// source.delegate = renderer;
 /// // ... run source for 3 seconds ...
 /// NSDictionary *metrics = renderer.metrics;
@@ -138,8 +140,8 @@ static inline VGMCRDLayoutConfig VGMCRDDefaultLayoutConfig(void) {
 ///
 /// ## Usage (MC-10 start/stop)
 /// ```objc
-/// VanguardMultiCamRenderDiagnostic *renderer =
-///     [[VanguardMultiCamRenderDiagnostic alloc] initWithTextureRegistry:registry];
+/// VanguardMultiCamRenderer *renderer =
+///     [[VanguardMultiCamRenderer alloc] initWithTextureRegistry:registry];
 /// int64_t textureId = renderer.textureId;
 /// source.delegate = renderer;
 /// // ... run source until stopped ...
@@ -147,10 +149,8 @@ static inline VGMCRDLayoutConfig VGMCRDDefaultLayoutConfig(void) {
 /// NSDictionary *metrics = renderer.metrics;
 /// ```
 ///
-/// ## Diagnostic-Only
-/// Not for production use. Do NOT integrate with VGCameraGraphSession or
-/// VanguardCameraMediaSource.
-@interface VanguardMultiCamRenderDiagnostic : NSObject <VanguardMultiCamMediaSourceDelegate, FlutterTexture>
+/// Do NOT integrate with VGCameraGraphSession or VanguardCameraMediaSource.
+@interface VanguardMultiCamRenderer : NSObject <VanguardMultiCamMediaSourceDelegate, FlutterTexture>
 
 // ─── Designated initializers ──────────────────────────────────────────────────
 

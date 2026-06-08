@@ -34,6 +34,6 @@
 // VanguardMultiCamMediaSourceDelegate, and VanguardMultiCamPairedFrame.
 #import "VanguardMultiCamMediaSource.h"  // MC-7: VanguardMultiCamMediaSource + delegate protocol
 #import "VanguardMultiCamPairedFrame.h"  // MC-8: VanguardMultiCamPairedFrame (RAII pixel buffer wrapper)
-// MC-9: Offscreen MultiCam render diagnostic.
-// Required so Swift plugin code can reference VanguardMultiCamRenderDiagnostic.
-#import "VanguardMultiCamRenderDiagnostic.h"  // MC-9: offscreen CIContext composition diagnostic
+// MC-9/MC-19: MultiCam production compositor (promoted from VanguardMultiCamRenderDiagnostic).
+// Required so Swift plugin code can reference VanguardMultiCamRenderer.
+#import "VanguardMultiCamRenderer.h"  // MC-9/MC-19: MultiCam compositor (production renderer)

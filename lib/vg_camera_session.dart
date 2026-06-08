@@ -1485,7 +1485,7 @@ final class VGCameraSession {
   /// Runs a 3-second offscreen MultiCam render diagnostic and returns the result.
   ///
   /// MC-9 diagnostic. Uses [VanguardMultiCamMediaSource] to capture paired
-  /// front/back frames and [VanguardMultiCamRenderDiagnostic] to composite them
+  /// front/back frames and [VanguardMultiCamRenderer] to composite them
   /// offscreen using CoreImage into a CVPixelBuffer pool (PiP layout).
   ///
   /// No Flutter texture is created. No visible preview. Diagnostic-only.
@@ -1531,7 +1531,7 @@ final class VGCameraSession {
   /// Starts a live MultiCam render diagnostic and registers a Flutter texture.
   ///
   /// ## MC-10 — diagnostic-only
-  /// Creates a [VanguardMultiCamMediaSource] and [VanguardMultiCamRenderDiagnostic]
+  /// Creates a [VanguardMultiCamMediaSource] and [VanguardMultiCamRenderer]
   /// that composites live front/back camera frames using CoreImage into a
   /// Flutter-visible texture.
   ///

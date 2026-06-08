@@ -1,11 +1,11 @@
-// VanguardMultiCamRenderDiagnostic.m
-// vanguard_media_engine — MC-9/MC-10: MultiCam render diagnostic.
+// VanguardMultiCamRenderer.m
+// vanguard_media_engine — MC-9/MC-10/MC-19: MultiCam compositor (production renderer).
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// MC-9/MC-10 — MULTICAM RENDER DIAGNOSTIC (OFFSCREEN COMPOSITION + TEXTURE)
+// MC-9/MC-10 — MULTICAM OFFSCREEN COMPOSITION + FLUTTER TEXTURE
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// See VanguardMultiCamRenderDiagnostic.h for full documentation.
+// See VanguardMultiCamRenderer.h for full documentation.
 //
 // ── IMPLEMENTATION NOTES ─────────────────────────────────────────────────────
 //
@@ -72,7 +72,7 @@
 //   VanguardCameraMediaSource.*      VGDualCameraCompositorNode.*
 //   Phase 8 overlay files
 
-#import "VanguardMultiCamRenderDiagnostic.h"
+#import "VanguardMultiCamRenderer.h"
 #import "VanguardMultiCamPairedFrame.h"
 #import "VGDualCameraLayoutMath.h"
 #import <AVFoundation/AVFoundation.h>  // MC-17: AVAssetWriter
@@ -125,7 +125,7 @@ _VGMCRDCreatePool(size_t width, size_t height) {
         (__bridge CFDictionaryRef)bufAttrs,
         &pool);
     if (status != kCVReturnSuccess || !pool) {
-        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] _VGMCRDCreatePool: "
+        NSLog(@"[VanguardMultiCamRenderer][MC-9] _VGMCRDCreatePool: "
               "CVPixelBufferPoolCreate failed (ret=%d) for %zux%zu.",
               status, width, height);
         return NULL;
@@ -152,7 +152,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
 // MARK: - Implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-@implementation VanguardMultiCamRenderDiagnostic {
+@implementation VanguardMultiCamRenderer {
 
     // ── Render queue ──────────────────────────────────────────────────────────
     //
@@ -313,7 +313,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     self = [super init];
     if (!self) return nil;
     [self _commonInit];
-    NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] init: render diagnostic created (no texture).");
+    NSLog(@"[VanguardMultiCamRenderer][MC-9] init: render diagnostic created (no texture).");
     return self;
 }
 
@@ -322,7 +322,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
 /// Must be called on the main thread.
 - (instancetype)initWithTextureRegistry:(id<FlutterTextureRegistry>)registry {
     NSAssert([NSThread isMainThread],
-             @"[VanguardMultiCamRenderDiagnostic] initWithTextureRegistry: must be called on main thread.");
+             @"[VanguardMultiCamRenderer] initWithTextureRegistry: must be called on main thread.");
     self = [super init];
     if (!self) return nil;
     [self _commonInit];
@@ -333,7 +333,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     _textureId         = [registry registerTexture:self];
     _textureRegistered = YES;
 
-    NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-10] initWithTextureRegistry: "
+    NSLog(@"[VanguardMultiCamRenderer][MC-10] initWithTextureRegistry: "
           "registered textureId=%lld.", (long long)_textureId);
     return self;
 }
@@ -351,7 +351,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         CVPixelBufferPoolRelease(_pool);
         _pool = NULL;
     }
-    NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] dealloc: resources released.");
+    NSLog(@"[VanguardMultiCamRenderer][MC-9] dealloc: resources released.");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -383,14 +383,14 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
 /// Safe to call multiple times (idempotent via _textureRegistered guard).
 - (void)doUnregisterTexture {
     NSAssert([NSThread isMainThread],
-             @"[VanguardMultiCamRenderDiagnostic] doUnregisterTexture must be called on main thread.");
+             @"[VanguardMultiCamRenderer] doUnregisterTexture must be called on main thread.");
     if (!_textureRegistered) return;
     id<FlutterTextureRegistry> registry = _textureRegistry;
     if (registry && _textureId != 0) {
         [registry unregisterTexture:_textureId];
     }
     _textureRegistered = NO;
-    NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-10] doUnregisterTexture: "
+    NSLog(@"[VanguardMultiCamRenderer][MC-10] doUnregisterTexture: "
           "unregistered textureId=%lld.", (long long)_textureId);
 }
 
@@ -476,7 +476,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
 
     // ── Step 2: Guard — no frame delivered yet ────────────────────────────────
     if (!snapshot) {
-        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-15] capturePhotoToPath: "
+        NSLog(@"[VanguardMultiCamRenderer][MC-15] capturePhotoToPath: "
               "no composited frame available yet.");
         dispatch_async(dispatch_get_main_queue(), ^{
             completion(nil,
@@ -535,7 +535,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         }
 
         if (!jpegData) {
-            NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-15] capturePhotoToPath: "
+            NSLog(@"[VanguardMultiCamRenderer][MC-15] capturePhotoToPath: "
                   "JPEG encoding failed.");
             dispatch_async(dispatch_get_main_queue(), ^{
                 completion(nil,
@@ -553,7 +553,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
                         error:&writeErr];
 
         if (writeErr) {
-            NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-15] capturePhotoToPath: "
+            NSLog(@"[VanguardMultiCamRenderer][MC-15] capturePhotoToPath: "
                   "write failed: %@", writeErr.localizedDescription);
             dispatch_async(dispatch_get_main_queue(), ^{
                 completion(nil,
@@ -565,7 +565,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         }
 
         // ── Success ───────────────────────────────────────────────────────────
-        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-15] capturePhotoToPath: "
+        NSLog(@"[VanguardMultiCamRenderer][MC-15] capturePhotoToPath: "
               "wrote %zu bytes to %@", (size_t)jpegData.length, path);
         NSDictionary *resultMap = @{
             @"filePath"  : path,
@@ -594,7 +594,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         if (self->_mcRecordingState == VGMCRecordingStateRecording ||
             self->_mcRecordingState == VGMCRecordingStateStarting) {
 
-            NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] stop: force-finalizing active recording.");
+            NSLog(@"[VanguardMultiCamRenderer][MC-17] stop: force-finalizing active recording.");
             self->_mcRecordingState = VGMCRecordingStateStopping;
 
             AVAssetWriter      *writer = self->_assetWriter;
@@ -610,7 +610,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
                 long rc = dispatch_semaphore_wait(
                     sem, dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC));
                 if (rc != 0) {
-                    NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] stop: "
+                    NSLog(@"[VanguardMultiCamRenderer][MC-17] stop: "
                           "finishWriting did not complete within 3s — file may be truncated.");
                 }
             }
@@ -631,7 +631,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         if (buf) CVPixelBufferRelease(buf);
     });
 
-    NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] stop: renderQ drained. "
+    NSLog(@"[VanguardMultiCamRenderer][MC-9] stop: renderQ drained. "
           "rendered=%d dropped=%d avgMs=%.2f peakMs=%.2f",
           _renderedFrames, _droppedRenderFrames,
           [self averageRenderMs], _peakRenderMs);
@@ -786,7 +786,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         self->_recordingStartTime          = 0;
         self->_mcRecordingState            = VGMCRecordingStateStarting;
 
-        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] startVideoRecordingToPath: "
+        NSLog(@"[VanguardMultiCamRenderer][MC-17] startVideoRecordingToPath: "
               "ready. outputDims=%dx%d path=%@", w, h, path);
 
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -868,7 +868,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
                 self->_pixelBufferAdaptor = nil;
                 self->_mcRecordingState   = VGMCRecordingStateIdle;
 
-                NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] stopVideoRecording: "
+                NSLog(@"[VanguardMultiCamRenderer][MC-17] stopVideoRecording: "
                       "done. status=%ld duration=%.2fs offered=%d appended=%d dropped=%d "
                       "fileSize=%lld error=%@",
                       (long)finalStatus, durationSeconds,
@@ -962,7 +962,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     CVPixelBufferRef secondaryBuf = frame.frontBuffer;  // front = PiP/secondary
 
     if (!primaryBuf || !secondaryBuf) {
-        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] _renderPairedFrame: "
+        NSLog(@"[VanguardMultiCamRenderer][MC-9] _renderPairedFrame: "
               "nil buffer — skipping.");
         return;
     }
@@ -974,7 +974,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     size_t secH  = CVPixelBufferGetHeight(secondaryBuf);
 
     if (primW == 0 || primH == 0 || secW == 0 || secH == 0) {
-        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] _renderPairedFrame: "
+        NSLog(@"[VanguardMultiCamRenderer][MC-9] _renderPairedFrame: "
               "degenerate dimensions prim=%zux%zu sec=%zux%zu — skipping.",
               primW, primH, secW, secH);
         return;
@@ -993,13 +993,13 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         }
         _pool = _VGMCRDCreatePool(primW, primH);
         if (!_pool) {
-            NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] _renderPairedFrame: "
+            NSLog(@"[VanguardMultiCamRenderer][MC-9] _renderPairedFrame: "
                   "pool creation failed for %zux%zu — skipping.", primW, primH);
             return;
         }
         _poolWidth  = primW;
         _poolHeight = primH;
-        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] pool created: %zux%zu BGRA.",
+        NSLog(@"[VanguardMultiCamRenderer][MC-9] pool created: %zux%zu BGRA.",
               primW, primH);
     }
 
@@ -1007,7 +1007,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     CVPixelBufferRef outputBuf = NULL;
     CVReturn poolRet = CVPixelBufferPoolCreatePixelBuffer(nil, _pool, &outputBuf);
     if (poolRet != kCVReturnSuccess || !outputBuf) {
-        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] _renderPairedFrame: "
+        NSLog(@"[VanguardMultiCamRenderer][MC-9] _renderPairedFrame: "
               "CVPixelBufferPoolCreatePixelBuffer failed (ret=%d).", poolRet);
         return;
     }
@@ -1016,7 +1016,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     CIImage *primaryCI   = [CIImage imageWithCVPixelBuffer:primaryBuf];
     CIImage *secondaryCI = [CIImage imageWithCVPixelBuffer:secondaryBuf];
     if (!primaryCI || !secondaryCI) {
-        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] _renderPairedFrame: "
+        NSLog(@"[VanguardMultiCamRenderer][MC-9] _renderPairedFrame: "
               "CIImage creation failed.");
         CVPixelBufferRelease(outputBuf);
         return;
@@ -1060,7 +1060,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
             composited = [primCropped imageByCompositingOverImage:
                             [secCropped imageByCompositingOverImage:black]];
         } else {
-            NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-12] split rects invalid — "
+            NSLog(@"[VanguardMultiCamRenderer][MC-12] split rects invalid — "
                   "falling back to default PiP.");
         }
     }
@@ -1115,7 +1115,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     }
 
     if (!composited) {
-        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-9] _renderPairedFrame: "
+        NSLog(@"[VanguardMultiCamRenderer][MC-9] _renderPairedFrame: "
               "compositing returned nil.");
         CVPixelBufferRelease(outputBuf);
         return;
@@ -1157,7 +1157,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         if (!_videoWriterInput.isReadyForMoreMediaData) {
             // Writer backpressure — skip this frame, preserve preview.
             _framesDroppedWriterNotReady++;
-            NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] writer not ready — drop frame "
+            NSLog(@"[VanguardMultiCamRenderer][MC-17] writer not ready — drop frame "
                   "(offered=%d dropped=%d)",
                   _framesOfferedToWriter, _framesDroppedWriterNotReady);
         } else {
@@ -1168,7 +1168,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
                 _mcRecordingSessionStarted = YES;
                 _recordingStartTime        = CFAbsoluteTimeGetCurrent();
                 _mcRecordingState          = VGMCRecordingStateRecording;
-                NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] session started at hardware PTS.");
+                NSLog(@"[VanguardMultiCamRenderer][MC-17] session started at hardware PTS.");
             }
 
             BOOL ok = [_pixelBufferAdaptor appendPixelBuffer:outputBuf
@@ -1176,7 +1176,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
             if (ok) {
                 _framesAppended++;
             } else {
-                NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] appendPixelBuffer failed. "
+                NSLog(@"[VanguardMultiCamRenderer][MC-17] appendPixelBuffer failed. "
                       "writerStatus=%ld error=%@",
                       (long)_assetWriter.status,
                       _assetWriter.error.localizedDescription);
@@ -1185,7 +1185,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
 
         // Detect writer failure (e.g. disk full mid-recording).
         if (_assetWriter.status == AVAssetWriterStatusFailed) {
-            NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] writer FAILED: %@",
+            NSLog(@"[VanguardMultiCamRenderer][MC-17] writer FAILED: %@",
                   _assetWriter.error.localizedDescription);
             _assetWriter        = nil;
             _videoWriterInput   = nil;
@@ -1213,7 +1213,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
 
     // ── 10. One-time first-frame log ──────────────────────────────────────────
     if (_renderedFrames == 1) {
-        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-12] first frame | "
+        NSLog(@"[VanguardMultiCamRenderer][MC-12] first frame | "
               "mode=%s canvas=%zux%zu renderMs=%.2f texture=%s",
               _layoutConfig.layoutMode == VGDualCameraLayoutModeSplitScreen
                   ? "splitScreen" : "pip",

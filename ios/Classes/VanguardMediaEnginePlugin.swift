@@ -158,7 +158,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // Start creates and retains them; stop reads, stops, unregisters, and nils them.
     // The MC-9 blocking runMultiCamRenderDiagnostic uses local-scope objects only.
     private var mcRenderDiagnosticSource: VanguardMultiCamMediaSource?
-    private var mcRenderDiagnostic: VanguardMultiCamRenderDiagnostic?
+    private var mcRenderDiagnostic: VanguardMultiCamRenderer?
 
     // ── MC-11: Diagnostic lifecycle state machine ─────────────────────────────
     //
@@ -568,9 +568,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         if #available(iOS 13.0, *) {
             mcDiagnosticState = .starting
 
-            let renderer = VanguardMultiCamRenderDiagnostic(textureRegistry: registrar.textures())
+            let renderer = VanguardMultiCamRenderer(textureRegistry: registrar.textures())
             if let configMap = args?["config"] as? [String: Any] {
-                renderer.setLayoutConfig(VanguardMultiCamRenderDiagnostic.layoutConfig(fromMap: configMap))
+                renderer.setLayoutConfig(VanguardMultiCamRenderer.layoutConfig(fromMap: configMap))
             }
             let textureId     = renderer.textureId
             let initialWidth  = renderer.outputWidth
@@ -3630,7 +3630,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         //
         // Runs a 3-second offscreen CoreImage composition diagnostic using:
         //   - VanguardMultiCamMediaSource (MC-7/MC-8) for paired-frame capture
-        //   - VanguardMultiCamRenderDiagnostic (MC-9) as the delegate renderer
+        //   - VanguardMultiCamRenderer (MC-9/MC-19) as the delegate renderer
         //
         // The renderer:
         //   - Receives VanguardMultiCamPairedFrame on captureQ
@@ -3684,10 +3684,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     }
 
                     // ── MC-9: create renderer and wire as delegate ────────────
-                    let renderer = VanguardMultiCamRenderDiagnostic()
+                    let renderer = VanguardMultiCamRenderer()
                     // MC-12: apply layout config if provided.
                     if let configMap = args?["config"] as? [String: Any] {
-                        renderer.setLayoutConfig(VanguardMultiCamRenderDiagnostic.layoutConfig(fromMap: configMap))
+                        renderer.setLayoutConfig(VanguardMultiCamRenderer.layoutConfig(fromMap: configMap))
                     }
                     source.delegate = renderer
 
@@ -3773,10 +3773,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 mcDiagnosticState = .starting
 
                 // Step 1: Create the render diagnostic on main thread (registerTexture requires main).
-                let renderer = VanguardMultiCamRenderDiagnostic(textureRegistry: registrar.textures())
+                let renderer = VanguardMultiCamRenderer(textureRegistry: registrar.textures())
                 // MC-12: apply layout config if provided.
                 if let configMap = args?["config"] as? [String: Any] {
-                    renderer.setLayoutConfig(VanguardMultiCamRenderDiagnostic.layoutConfig(fromMap: configMap))
+                    renderer.setLayoutConfig(VanguardMultiCamRenderer.layoutConfig(fromMap: configMap))
                 }
                 let textureId    = renderer.textureId
                 let initialWidth  = renderer.outputWidth   // 0 until first frame
@@ -3977,7 +3977,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // ── MC-15: MultiCam still-photo capture ───────────────────────────────
         //
         // Extracts the current composited CVPixelBuffer from the running
-        // VanguardMultiCamRenderDiagnostic, encodes it to JPEG on the render
+        // VanguardMultiCamRenderer, encodes it to JPEG on the render
         // queue, and writes the file to the caller-supplied path.
         //
         // Guards:
