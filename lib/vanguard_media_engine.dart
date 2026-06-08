@@ -64,6 +64,8 @@ export 'vg_audio_sidecar_plan.dart';
 export 'vg_audio_ducking_engine.dart';
 // Phase 8.15C: native offline audio waveform extraction.
 export 'vg_waveform_extractor.dart';
+// Phase 8.16: standalone AVPlayer-backed audio playback service.
+export 'vg_audio_playback_service.dart';
 // Phase 7.20D: Dart model for reverse sidecar asset state.
 export 'vg_reverse_sidecar_status.dart';
 

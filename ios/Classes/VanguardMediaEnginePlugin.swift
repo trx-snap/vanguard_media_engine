@@ -180,6 +180,15 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     }
     private var mcDiagnosticState: MCDiagnosticState = .idle
 
+    // ─── Phase 8.16: Standalone audio playback service ───────────────────────
+    //
+    // Holds exactly one VGAudioPlaybackService. The service owns an AVPlayer
+    // internally and supports one active player at a time. All routing is
+    // through audioPlayback_* MethodChannel methods.
+    // AVAudioSession is NOT configured here — the pre-activated .playback
+    // session set up by VanguardFileMediaSource.preActivateAudioSession is shared.
+    var audioPlaybackService: VGAudioPlaybackService = VGAudioPlaybackService()
+
     // ─── Registration ─────────────────────────────────────────────────────────
 
     public static func register(with registrar: FlutterPluginRegistrar) {
@@ -4744,6 +4753,69 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
             result(["ok": true])
         #endif // VG_USE_V2_GRAPH
+
+        // ── Phase 8.16: Standalone Audio Playback Service ────────────────────
+        //
+        // All methods use the "audioPlayback_" prefix to avoid collision with
+        // the existing play/pause/seekTo methods that route to VGSessionRegistry.
+        //
+        // AVPlayer owns one active player at a time.
+        // All AVPlayer calls run on the main thread (guaranteed by Flutter plugin
+        // architecture — handle(_:result:) is always called on main).
+
+        case "audioPlayback_load":
+            guard let filePath = args?["path"] as? String, !filePath.isEmpty else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "path is required and must be non-empty",
+                                    details: nil))
+                return
+            }
+            audioPlaybackService.load(withPath: filePath) { durationSeconds, error in
+                if let error = error {
+                    result(FlutterError(code: "LOAD_FAILED",
+                                        message: error.localizedDescription,
+                                        details: nil))
+                    return
+                }
+                result(["durationSeconds": durationSeconds])
+            }
+
+        case "audioPlayback_play":
+            audioPlaybackService.play()
+            result(nil)
+
+        case "audioPlayback_pause":
+            audioPlaybackService.pause()
+            result(nil)
+
+        case "audioPlayback_stop":
+            audioPlaybackService.stop()
+            result(nil)
+
+        case "audioPlayback_seekTo":
+            guard let seconds = (args?["seconds"] as? NSNumber)?.doubleValue else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "seconds is required",
+                                    details: nil))
+                return
+            }
+            audioPlaybackService.seek(toSeconds: seconds) {
+                result(nil)
+            }
+
+        case "audioPlayback_setVolume":
+            guard let volume = (args?["volume"] as? NSNumber)?.floatValue else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "volume is required",
+                                    details: nil))
+                return
+            }
+            audioPlaybackService.setVolume(volume)
+            result(nil)
+
+        case "audioPlayback_getPosition":
+            let position = audioPlaybackService.currentPositionSeconds()
+            result(["seconds": position])
 
         default:
             result(FlutterMethodNotImplemented)

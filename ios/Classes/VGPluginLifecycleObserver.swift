@@ -75,6 +75,8 @@ final class VGPluginLifecycleObserver: NSObject {
             #if VG_USE_V2_GRAPH
             plugin._timelineRuntime?.flushTimelineCaches()
             #endif
+            // Phase 8.16: release audio playback resources under memory pressure.
+            plugin.audioPlaybackService.stop()
         }
 
         // ── A3: App background / foreground safety ───────────────────────────
@@ -132,6 +134,8 @@ final class VGPluginLifecycleObserver: NSObject {
                 // Suspend in-progress export.
                 plugin.activeExportSession?.suspend()
                 plugin.activeExportSession = nil
+                // Phase 8.16: pause standalone audio playback service.
+                plugin.audioPlaybackService.pause()
             case .ended:
                 // Do NOT auto-resume — require explicit user action.
                 break
