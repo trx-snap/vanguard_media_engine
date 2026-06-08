@@ -30,6 +30,7 @@ import 'dart:async';
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:vanguard_media_engine/vg_audio_sidecar_plan.dart';
 import 'package:vanguard_media_engine/vg_clip_descriptor.dart';
 import 'package:vanguard_media_engine/vg_editor_controller.dart';
 import 'package:vanguard_media_engine/vg_editor_draft.dart';
@@ -2073,6 +2074,295 @@ void main() {
         throwsA(isA<StateError>()),
       );
     });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // export() — Phase 8.20 Audio Ducking Controller Integration
+  //
+  // Verifies that export() chains flattenOriginalClipAudio() then
+  // applyAudioDucking() before sending the exportTimeline payload.
+  //
+  // Tests:
+  //   DUCK-EC1  overlapping music + original clip → volumeKeyframes in payload
+  //   DUCK-EC2  music with no overlap → no volumeKeyframes in payload
+  //   DUCK-EC3  pre-authored music keyframes are preserved unchanged
+  //   DUCK-EC4  draft with no audioSidecarPlan succeeds normally (no-op path)
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorController — export() Phase 8.20 audio ducking integration',
+      () {
+    // Returns a draft whose single video clip will produce an 'original' sidecar
+    // track during flattenOriginalClipAudio(), and which has an explicit 'music'
+    // sidecar track that overlaps the clip timeline position.
+    VGEditorDraft _draftWithMusicAndOverlappingClip() {
+      final clip = VGClipDescriptor(
+        id: 'clip-A',
+        sourcePath: '/tmp/clip.mp4',
+        durationSeconds: 10.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 10.0,
+      );
+      final musicTrack = VGAudioSidecarTrack(
+        trackId: 'music-1',
+        url: '/tmp/music.m4a',
+        startTime: 0.0,
+        duration: 10.0,
+        volume: 0.8,
+        role: 'music',
+      );
+      return VGEditorDraft(
+        id: 'draft-ducking-ec',
+        clips: [clip],
+        audioSidecarPlan: VGAudioSidecarPlan(tracks: [musicTrack]),
+      );
+    }
+
+    // Returns a draft where the music track does NOT overlap with the clip
+    // (clip at 0–5s, music at 8–13s → no overlap).
+    VGEditorDraft _draftWithMusicNoOverlap() {
+      final clip = VGClipDescriptor(
+        id: 'clip-A',
+        sourcePath: '/tmp/clip.mp4',
+        durationSeconds: 5.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 5.0,
+      );
+      final musicTrack = VGAudioSidecarTrack(
+        trackId: 'music-1',
+        url: '/tmp/music.m4a',
+        startTime: 8.0, // starts after the clip ends (clip occupies 0–5s)
+        duration: 5.0,
+        volume: 0.8,
+        role: 'music',
+      );
+      return VGEditorDraft(
+        id: 'draft-no-overlap',
+        clips: [clip],
+        audioSidecarPlan: VGAudioSidecarPlan(tracks: [musicTrack]),
+      );
+    }
+
+    // Returns a draft with a music track that already has pre-authored
+    // volumeKeyframes. The ducking engine must skip it.
+    VGEditorDraft _draftWithPreAuthoredMusicKeyframes() {
+      final clip = VGClipDescriptor(
+        id: 'clip-A',
+        sourcePath: '/tmp/clip.mp4',
+        durationSeconds: 10.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 10.0,
+      );
+      const preAuthored = [
+        VGAudioVolumeKeyframe(time: 0.0, volume: 0.8),
+        VGAudioVolumeKeyframe(time: 5.0, volume: 0.2),
+        VGAudioVolumeKeyframe(time: 10.0, volume: 0.8),
+      ];
+      final musicTrack = VGAudioSidecarTrack(
+        trackId: 'music-1',
+        url: '/tmp/music.m4a',
+        startTime: 0.0,
+        duration: 10.0,
+        volume: 0.8,
+        role: 'music',
+        volumeKeyframes: preAuthored,
+      );
+      return VGEditorDraft(
+        id: 'draft-preauthored',
+        clips: [clip],
+        audioSidecarPlan: VGAudioSidecarPlan(tracks: [musicTrack]),
+      );
+    }
+
+    Future<Object?> Function(String, dynamic) _exportMockHandler(
+      void Function(dynamic args) capture,
+    ) {
+      return (method, args) async {
+        switch (method) {
+          case 'createTimelineTexture':
+            return {'textureId': 90, 'width': 1080, 'height': 1920};
+          case 'exportTimeline':
+            capture(args);
+            return {
+              'success': true,
+              'path': '/tmp/export.mp4',
+              'durationSeconds': 10.0,
+              'width': 1080,
+              'height': 1920,
+            };
+          case 'timelinePause':
+          case 'disposeTimeline':
+            return null;
+          default:
+            return null;
+        }
+      };
+    }
+
+    // ── DUCK-EC1 ──────────────────────────────────────────────────────────────
+
+    test(
+        'DUCK-EC1: export with music + overlapping original clip produces volumeKeyframes in exportTimeline payload',
+        () async {
+      dynamic capturedArgs;
+      _setMockHandler(_exportMockHandler((args) => capturedArgs = args));
+
+      final controller = VGEditorController(
+        initialDraft: _draftWithMusicAndOverlappingClip(),
+      );
+      addTearDown(() => controller.dispose());
+      await controller.initialize();
+
+      await controller.export(const VGEditorExportRequest());
+
+      // Payload must include draft key.
+      expect(capturedArgs, isA<Map>());
+      final draftMap = (capturedArgs as Map)['draft'] as Map;
+      final sidecarMap = draftMap['audioSidecar'] as Map;
+      final tracksList = sidecarMap['tracks'] as List;
+
+      // There should be tracks (at least 'music-1' and 'original-clip-A').
+      expect(tracksList, isNotEmpty);
+
+      // Locate the music track in the payload.
+      final musicTrackMap = tracksList.firstWhere(
+        (t) => (t as Map)['role'] == 'music',
+        orElse: () => null,
+      ) as Map?;
+      expect(musicTrackMap, isNotNull,
+          reason: 'music track must be present in exportTimeline payload');
+
+      // Music track must have volumeKeyframes after ducking.
+      expect(musicTrackMap!.containsKey('volumeKeyframes'), isTrue,
+          reason:
+              'music track with overlapping original clip must have volumeKeyframes');
+      final keyframes = musicTrackMap['volumeKeyframes'] as List;
+      expect(keyframes, isNotEmpty,
+          reason: 'volumeKeyframes list must not be empty');
+
+      // At least one keyframe must have a volume less than 0.8 (the duck point).
+      final hasDuckPoint =
+          keyframes.any((kf) => ((kf as Map)['volume'] as num) < 0.8);
+      expect(hasDuckPoint, isTrue,
+          reason:
+              'At least one keyframe must have volume < 0.8 (the duck dip)');
+    });
+
+    // ── DUCK-EC2 ──────────────────────────────────────────────────────────────
+
+    test(
+        'DUCK-EC2: export with music but no overlap does not add volumeKeyframes to music track',
+        () async {
+      dynamic capturedArgs;
+      _setMockHandler(_exportMockHandler((args) => capturedArgs = args));
+
+      final controller = VGEditorController(
+        initialDraft: _draftWithMusicNoOverlap(),
+      );
+      addTearDown(() => controller.dispose());
+      await controller.initialize();
+
+      await controller.export(const VGEditorExportRequest());
+
+      final draftMap = (capturedArgs as Map)['draft'] as Map;
+      final sidecarMap = draftMap['audioSidecar'] as Map;
+      final tracksList = sidecarMap['tracks'] as List;
+
+      final musicTrackMap = tracksList.firstWhere(
+        (t) => (t as Map)['role'] == 'music',
+        orElse: () => null,
+      ) as Map?;
+      expect(musicTrackMap, isNotNull,
+          reason: 'music track must be present in payload');
+
+      // No overlap → ducking engine returns the same tracks → no volumeKeyframes.
+      expect(musicTrackMap!.containsKey('volumeKeyframes'), isFalse,
+          reason:
+              'No overlap between music and original clip: volumeKeyframes must not be added');
+    });
+
+    // ── DUCK-EC3 ──────────────────────────────────────────────────────────────
+
+    test(
+        'DUCK-EC3: export with pre-authored music keyframes preserves existing keyframes',
+        () async {
+      dynamic capturedArgs;
+      _setMockHandler(_exportMockHandler((args) => capturedArgs = args));
+
+      final controller = VGEditorController(
+        initialDraft: _draftWithPreAuthoredMusicKeyframes(),
+      );
+      addTearDown(() => controller.dispose());
+      await controller.initialize();
+
+      await controller.export(const VGEditorExportRequest());
+
+      final draftMap = (capturedArgs as Map)['draft'] as Map;
+      final sidecarMap = draftMap['audioSidecar'] as Map;
+      final tracksList = sidecarMap['tracks'] as List;
+
+      final musicTrackMap = tracksList.firstWhere(
+        (t) => (t as Map)['role'] == 'music',
+        orElse: () => null,
+      ) as Map?;
+      expect(musicTrackMap, isNotNull);
+
+      // Pre-authored keyframes must be preserved exactly.
+      expect(musicTrackMap!.containsKey('volumeKeyframes'), isTrue,
+          reason: 'Pre-authored keyframes must be preserved in payload');
+      final keyframes = musicTrackMap['volumeKeyframes'] as List;
+      expect(keyframes.length, 3,
+          reason: 'Exactly 3 pre-authored keyframes must be present');
+
+      // Verify the pre-authored keyframes are sent unchanged.
+      final times = keyframes.map((kf) => (kf as Map)['time'] as num).toList();
+      final vols = keyframes.map((kf) => (kf as Map)['volume'] as num).toList();
+      expect(times[0], closeTo(0.0, 1e-9));
+      expect(vols[0], closeTo(0.8, 1e-9));
+      expect(times[1], closeTo(5.0, 1e-9));
+      expect(vols[1], closeTo(0.2, 1e-9));
+      expect(times[2], closeTo(10.0, 1e-9));
+      expect(vols[2], closeTo(0.8, 1e-9));
+    });
+
+    // ── DUCK-EC4 ──────────────────────────────────────────────────────────────
+
+    test(
+        'DUCK-EC4: export with no explicit audioSidecarPlan succeeds normally (ducking is a no-op)',
+        () async {
+      dynamic capturedArgs;
+      _setMockHandler(_exportMockHandler((args) => capturedArgs = args));
+
+      // Plain two-clip draft with no explicit audioSidecarPlan (no music/SFX).
+      // flattenOriginalClipAudio() will generate 'original' sidecar tracks for
+      // the two video clips, but applyAudioDucking() has no music track to duck
+      // against → it is a pure no-op and must not throw.
+      final controller = VGEditorController(initialDraft: _twoClipDraft());
+      addTearDown(() => controller.dispose());
+      await controller.initialize();
+
+      // Must not throw.
+      final result = await controller.export(const VGEditorExportRequest());
+      expect(result, isA<VGEditorExportResult>());
+
+      // The exportTimeline payload must have been received.
+      expect(capturedArgs, isA<Map>());
+      final draftMap = (capturedArgs as Map)['draft'] as Map;
+
+      // flattenOriginalClipAudio() adds original tracks, so audioSidecar is
+      // expected in the payload. None of those original tracks should have
+      // volumeKeyframes injected (no music track → ducking is a pure no-op).
+      if (draftMap.containsKey('audioSidecar')) {
+        final sidecarMap = draftMap['audioSidecar'] as Map;
+        final tracksList = sidecarMap['tracks'] as List;
+        for (final t in tracksList) {
+          final track = t as Map;
+          expect(track.containsKey('volumeKeyframes'), isFalse,
+              reason:
+                  'No music track → ducking must not inject volumeKeyframes into original tracks');
+        }
+      }
+    });
+
   });
 }
 

@@ -838,7 +838,13 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     try {
       // Phase 8.14C: flatten original clip audio into explicit sidecar tracks
       // before serialising. Pure operation — no I/O, appends to existing plan.
-      final exportDraft = value.draft.flattenOriginalClipAudio();
+      // Phase 8.20: apply automated audio ducking to the music tracks using
+      // VGAudioDuckingEngine. Pure offline model transform — delegates entirely
+      // to VGEditorDraft.applyAudioDucking(); no ducking math here.
+      // Returns this when no plan, no music tracks, or no overlap.
+      final exportDraft = value.draft
+          .flattenOriginalClipAudio()
+          .applyAudioDucking();
       final result = await _channel.invokeMapMethod<String, dynamic>(
         'exportTimeline',
         {
