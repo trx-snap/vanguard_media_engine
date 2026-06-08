@@ -4013,20 +4013,20 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
             }
 
-        // ── MC-17: MultiCam video-only recording ──────────────────────────────────
+        // ── MC-17/MC-20: MultiCam recording ────────────────────────────────────────
         //
-        // Diagnostic recording of the composited preview buffer to .mp4.
-        // Audio is not included. Preview must be active (.running state).
+        // Records H.264 video and best-effort AAC audio (MC-20) from the
+        // composited preview buffer. Preview must be active (.running state).
         //
-        // startMultiCamVideoRecording:
+        // startMultiCamRecording:
         //   Returns true (NSNumber/Bool) on success, FlutterError on failure.
         //   Error codes: NOT_RUNNING, INVALID_ARG, NOT_RENDERING, ALREADY_RECORDING,
         //                DISK_SPACE, WRITER_INIT_FAIL.
         //
-        // stopMultiCamVideoRecording:
+        // stopMultiCamRecording:
         //   Returns result map on success, FlutterError on failure.
         //   Error codes: NOT_RUNNING, NOT_RECORDING, WRITER_FINISH_FAIL.
-        case "startMultiCamVideoRecording":
+        case "startMultiCamRecording":
             guard mcDiagnosticState == .running,
                   let renderer = mcRenderDiagnostic else {
                 result(FlutterError(code: "NOT_RUNNING",
@@ -4048,7 +4048,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
             }
 
-        case "stopMultiCamVideoRecording":
+        case "stopMultiCamRecording":
             guard mcDiagnosticState == .running,
                   let renderer = mcRenderDiagnostic else {
                 result(FlutterError(code: "NOT_RUNNING",

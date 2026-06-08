@@ -1728,12 +1728,17 @@ final class VGCameraSession {
     }
   }
 
-  // ── MC-17: Video-only recording ─────────────────────────────────────────────
+  // ── MC-17/MC-20: MultiCam recording ─────────────────────────────────────────
 
-  /// Starts video-only recording of the composited MultiCam preview.
+  /// Starts recording of the composited MultiCam preview.
   ///
-  /// Audio is not included. MultiCam preview must be active and at least one
-  /// frame must have been rendered before calling this.
+  /// Records H.264 video from the composited preview buffer. Best-effort AAC
+  /// microphone audio (44100 Hz, mono, 128 kb/s) is included when microphone
+  /// permission is granted; if the microphone is unavailable or permission is
+  /// denied, recording proceeds as a valid video-only MP4 (MC-20 fallback).
+  ///
+  /// MultiCam preview must be active and at least one frame must have been
+  /// rendered before calling this.
   ///
   /// [path] must be a writable absolute path ending in `.mp4`.
   ///
@@ -1744,10 +1749,10 @@ final class VGCameraSession {
   ///   - `DISK_SPACE`       — Less than 200 MB free disk space.
   ///   - `WRITER_INIT_FAIL` — AVAssetWriter creation or startWriting failed.
   ///   - `INVALID_ARG`      — Path is empty or missing.
-  static Future<bool> startMultiCamVideoRecording(String path) async {
+  static Future<bool> startMultiCamRecording(String path) async {
     try {
       final ok = await _channel.invokeMethod<bool>(
-        'startMultiCamVideoRecording',
+        'startMultiCamRecording',
         {'path': path},
       );
       return ok == true;
@@ -1756,9 +1761,9 @@ final class VGCameraSession {
     }
   }
 
-  /// Stops video-only recording of the composited MultiCam preview.
+  /// Stops recording of the composited MultiCam preview and finalises the MP4.
   ///
-  /// Returns a diagnostic result map on success, `null` on any failure:
+  /// Returns a [VGMultiCamRecordingStats] on success, `null` on any failure:
   ///   - `NOT_RUNNING`        — MultiCam preview is not active.
   ///   - `NOT_RECORDING`      — No recording is currently active.
   ///   - `WRITER_FINISH_FAIL` — AVAssetWriter finishWriting completed with an error.
@@ -1773,10 +1778,10 @@ final class VGCameraSession {
   /// - `framesDroppedWriterNotReady` — Frames dropped due to writer backpressure.
   /// - `writerStatus`                — Native AVAssetWriterStatus integer.
   /// - `fileSizeBytes`               — Output file size in bytes.
-  static Future<VGMultiCamRecordingStats?> stopMultiCamVideoRecording() async {
+  static Future<VGMultiCamRecordingStats?> stopMultiCamRecording() async {
     try {
       final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
-        'stopMultiCamVideoRecording',
+        'stopMultiCamRecording',
       );
       if (raw == null) return null;
       final stringMap = raw.map((key, value) => MapEntry(key.toString(), value));

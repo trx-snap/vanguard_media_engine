@@ -3285,17 +3285,17 @@ void main() {
     );
   });
 
-  // ── MC-17: startMultiCamVideoRecording / stopMultiCamVideoRecording ──────────
+  // ── MC-17/MC-20: startMultiCamRecording / stopMultiCamRecording ─────────────
   //
   // Acceptance criteria:
-  //   MC17-1  startMultiCamVideoRecording invokes channel 'startMultiCamVideoRecording' with correct path
-  //   MC17-2  startMultiCamVideoRecording returns true on native success (true)
-  //   MC17-3  startMultiCamVideoRecording returns false on PlatformException
-  //   MC17-4  stopMultiCamVideoRecording invokes channel 'stopMultiCamVideoRecording' and parses result map
-  //   MC17-5  stopMultiCamVideoRecording returns null when native returns null
-  //   MC17-6  stopMultiCamVideoRecording returns null (not rethrow) on PlatformException
+  //   MC17-1  startMultiCamRecording invokes channel 'startMultiCamRecording' with correct path
+  //   MC17-2  startMultiCamRecording returns true on native success (true)
+  //   MC17-3  startMultiCamRecording returns false on PlatformException
+  //   MC17-4  stopMultiCamRecording invokes channel 'stopMultiCamRecording' and parses result map
+  //   MC17-5  stopMultiCamRecording returns null when native returns null
+  //   MC17-6  stopMultiCamRecording returns null (not rethrow) on PlatformException
 
-  group('VGCameraSession.startMultiCamVideoRecording / stopMultiCamVideoRecording (MC-17)', () {
+  group('VGCameraSession.startMultiCamRecording / stopMultiCamRecording (MC-17)', () {
     const kVideoPath = '/tmp/mc17_multicam_video_001.mp4';
 
     const kValidStopResponse = <Object?, Object?>{
@@ -3311,26 +3311,26 @@ void main() {
     };
 
     test(
-      'MC17-1 startMultiCamVideoRecording invokes channel with method name and correct path',
+      'MC17-1 startMultiCamRecording invokes channel with method name and correct path',
       () async {
-        _responses['startMultiCamVideoRecording'] = true;
+        _responses['startMultiCamRecording'] = true;
 
-        await VGCameraSession.startMultiCamVideoRecording(kVideoPath);
+        await VGCameraSession.startMultiCamRecording(kVideoPath);
 
-        expect(_callCount('startMultiCamVideoRecording'), equals(1),
-            reason: 'must fire exactly one startMultiCamVideoRecording channel call');
-        final call = _log.firstWhere((c) => c.method == 'startMultiCamVideoRecording');
+        expect(_callCount('startMultiCamRecording'), equals(1),
+            reason: 'must fire exactly one startMultiCamRecording channel call');
+        final call = _log.firstWhere((c) => c.method == 'startMultiCamRecording');
         expect(call.arguments['path'], equals(kVideoPath),
             reason: 'must forward path as {path: ...} argument map');
       },
     );
 
     test(
-      'MC17-2 startMultiCamVideoRecording returns true when native returns true',
+      'MC17-2 startMultiCamRecording returns true when native returns true',
       () async {
-        _responses['startMultiCamVideoRecording'] = true;
+        _responses['startMultiCamRecording'] = true;
 
-        final ok = await VGCameraSession.startMultiCamVideoRecording(kVideoPath);
+        final ok = await VGCameraSession.startMultiCamRecording(kVideoPath);
 
         expect(ok, isTrue,
             reason: 'must return true when native responds with true');
@@ -3338,14 +3338,14 @@ void main() {
     );
 
     test(
-      'MC17-3 startMultiCamVideoRecording returns false (does not rethrow) on PlatformException',
+      'MC17-3 startMultiCamRecording returns false (does not rethrow) on PlatformException',
       () async {
-        _responses['startMultiCamVideoRecording'] = PlatformException(
+        _responses['startMultiCamRecording'] = PlatformException(
           code: 'NOT_RUNNING',
           message: 'MultiCam preview is not running',
         );
 
-        final ok = await VGCameraSession.startMultiCamVideoRecording(kVideoPath);
+        final ok = await VGCameraSession.startMultiCamRecording(kVideoPath);
 
         expect(ok, isFalse,
             reason: 'PlatformException must be caught and false returned, not rethrown');
@@ -3353,14 +3353,14 @@ void main() {
     );
 
     test(
-      'MC17-4 stopMultiCamVideoRecording invokes channel and returns typed VGMultiCamRecordingStats',
+      'MC17-4 stopMultiCamRecording invokes channel and returns typed VGMultiCamRecordingStats',
       () async {
-        _responses['stopMultiCamVideoRecording'] = kValidStopResponse;
+        _responses['stopMultiCamRecording'] = kValidStopResponse;
 
-        final result = await VGCameraSession.stopMultiCamVideoRecording();
+        final result = await VGCameraSession.stopMultiCamRecording();
 
-        expect(_callCount('stopMultiCamVideoRecording'), equals(1),
-            reason: 'must fire exactly one stopMultiCamVideoRecording channel call');
+        expect(_callCount('stopMultiCamRecording'), equals(1),
+            reason: 'must fire exactly one stopMultiCamRecording channel call');
         expect(result, isNotNull,
             reason: 'must return non-null typed result for valid native response');
         expect(result, isA<VGMultiCamRecordingStats>());
@@ -3377,11 +3377,11 @@ void main() {
     );
 
     test(
-      'MC17-5 stopMultiCamVideoRecording returns null when native returns null',
+      'MC17-5 stopMultiCamRecording returns null when native returns null',
       () async {
-        _responses['stopMultiCamVideoRecording'] = null;
+        _responses['stopMultiCamRecording'] = null;
 
-        final result = await VGCameraSession.stopMultiCamVideoRecording();
+        final result = await VGCameraSession.stopMultiCamRecording();
 
         expect(result, isNull,
             reason: 'null native response must yield null typed result');
@@ -3389,14 +3389,14 @@ void main() {
     );
 
     test(
-      'MC17-6 stopMultiCamVideoRecording returns null (does not rethrow) on PlatformException',
+      'MC17-6 stopMultiCamRecording returns null (does not rethrow) on PlatformException',
       () async {
-        _responses['stopMultiCamVideoRecording'] = PlatformException(
+        _responses['stopMultiCamRecording'] = PlatformException(
           code: 'NOT_RECORDING',
           message: 'No recording is currently active',
         );
 
-        final result = await VGCameraSession.stopMultiCamVideoRecording();
+        final result = await VGCameraSession.stopMultiCamRecording();
 
         expect(result, isNull,
             reason: 'PlatformException must be caught and null typed result returned, not rethrown');
