@@ -1,17 +1,19 @@
 // vg_audio_sidecar_plan_test.dart
-// Vanguard Media Engine — Phase 8.14A/8.14B/8.14C/8.14D Audio Sidecar Export Muxer
+// Vanguard Media Engine — Phase 8.14A/8.14B/8.14C/8.14D/8.15A Audio Sidecar Export Muxer
 //
 // Pure Dart unit tests for VGAudioSidecarTrack and VGAudioSidecarPlan,
 // plus VGEditorDraft audioSidecarPlan additive bridge tests.
 // Phase 8.14B additions: role, fadeInSeconds, fadeOutSeconds, multi-track.
 // Phase 8.14C additions: sourceTrimStartSeconds, flattenOriginalClipAudio().
 // Phase 8.14D additions: transition-derived fadeInSeconds/fadeOutSeconds.
+// Phase 8.15A additions: VGAudioVolumeKeyframe, per-track volumeKeyframes.
 //
 // Tests:
 //   AST-*  VGAudioSidecarTrack round-trip, validation, equality
 //   ASP-*  VGAudioSidecarPlan round-trip, validation, equality
 //   EDA-*  VGEditorDraft audioSidecarPlan additive bridge tests
 //   FAO-*  VGEditorDraft.flattenOriginalClipAudio() tests (Phase 8.14C)
+//   VKF-*  VGAudioVolumeKeyframe and per-track volumeKeyframes (Phase 8.15A)
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vg_audio_sidecar_plan.dart';
@@ -1208,6 +1210,237 @@ void main() {
         expect(t.fadeInSeconds, closeTo(0.0, 1e-9));
         expect(t.fadeOutSeconds, closeTo(0.0, 1e-9));
       }
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // VGAudioVolumeKeyframe — Phase 8.15A
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  group('VGAudioVolumeKeyframe — Phase 8.15A', () {
+    test('VKF-1 construction stores time, volume, curve', () {
+      const kf = VGAudioVolumeKeyframe(time: 2.0, volume: 0.5);
+      expect(kf.time, closeTo(2.0, 1e-9));
+      expect(kf.volume, closeTo(0.5, 1e-9));
+      expect(kf.curve, 'linear');
+    });
+
+    test('VKF-2 equality: identical keyframes are equal', () {
+      const a = VGAudioVolumeKeyframe(time: 1.0, volume: 0.8);
+      const b = VGAudioVolumeKeyframe(time: 1.0, volume: 0.8);
+      expect(a, equals(b));
+      expect(a.hashCode, b.hashCode);
+    });
+
+    test('VKF-3 equality: different time not equal', () {
+      const a = VGAudioVolumeKeyframe(time: 1.0, volume: 0.5);
+      const b = VGAudioVolumeKeyframe(time: 2.0, volume: 0.5);
+      expect(a == b, isFalse);
+    });
+
+    test('VKF-4 equality: different volume not equal', () {
+      const a = VGAudioVolumeKeyframe(time: 1.0, volume: 0.3);
+      const b = VGAudioVolumeKeyframe(time: 1.0, volume: 0.9);
+      expect(a == b, isFalse);
+    });
+
+    test('VKF-5 toMap omits curve when linear', () {
+      const kf = VGAudioVolumeKeyframe(time: 0.0, volume: 1.0);
+      final m = kf.toMap();
+      expect(m.containsKey('curve'), isFalse);
+      expect(m['time'], closeTo(0.0, 1e-9));
+      expect(m['volume'], closeTo(1.0, 1e-9));
+    });
+
+    test('VKF-6 toMap includes curve when non-linear', () {
+      const kf = VGAudioVolumeKeyframe(time: 1.0, volume: 0.5, curve: 'easeIn');
+      final m = kf.toMap();
+      expect(m['curve'], 'easeIn');
+    });
+
+    test('VKF-7 fromMap round-trip preserves fields', () {
+      const original = VGAudioVolumeKeyframe(time: 3.5, volume: 0.25);
+      final m = original.toMap();
+      final restored = VGAudioVolumeKeyframe.fromMap(m.cast<Object?, Object?>());
+      expect(restored, isNotNull);
+      expect(restored!.time, closeTo(3.5, 1e-9));
+      expect(restored.volume, closeTo(0.25, 1e-9));
+      expect(restored.curve, 'linear');
+    });
+
+    test('VKF-8 fromMap defaults curve to linear when absent', () {
+      final m = <Object?, Object?>{'time': 1.0, 'volume': 0.5};
+      final kf = VGAudioVolumeKeyframe.fromMap(m);
+      expect(kf, isNotNull);
+      expect(kf!.curve, 'linear');
+    });
+
+    test('VKF-9 fromMap returns null when time missing', () {
+      final kf = VGAudioVolumeKeyframe.fromMap({'volume': 0.5});
+      expect(kf, isNull);
+    });
+
+    test('VKF-10 fromMap returns null when volume missing', () {
+      final kf = VGAudioVolumeKeyframe.fromMap({'time': 1.0});
+      expect(kf, isNull);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // VGAudioSidecarTrack — volumeKeyframes (Phase 8.15A)
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  group('VGAudioSidecarTrack — volumeKeyframes (Phase 8.15A)', () {
+    test('VKF-11 volumeKeyframes defaults to null', () {
+      expect(_track().volumeKeyframes, isNull);
+    });
+
+    test('VKF-12 volumeKeyframes stored correctly when set', () {
+      final kfs = [
+        const VGAudioVolumeKeyframe(time: 0.0, volume: 1.0),
+        const VGAudioVolumeKeyframe(time: 2.0, volume: 0.3),
+        const VGAudioVolumeKeyframe(time: 4.0, volume: 1.0),
+      ];
+      final t = VGAudioSidecarTrack(
+        trackId: 'tid',
+        url: '/tmp/a.m4a',
+        startTime: 0.0,
+        duration: 5.0,
+        volumeKeyframes: kfs,
+      );
+      expect(t.volumeKeyframes, isNotNull);
+      expect(t.volumeKeyframes!.length, 3);
+      expect(t.volumeKeyframes![1].volume, closeTo(0.3, 1e-9));
+    });
+
+    test('VKF-13 toMap omits volumeKeyframes when null', () {
+      final m = _track().toMap();
+      expect(m.containsKey('volumeKeyframes'), isFalse);
+    });
+
+    test('VKF-14 toMap omits volumeKeyframes when empty list', () {
+      final t = VGAudioSidecarTrack(
+        trackId: 'tid',
+        url: '/tmp/a.m4a',
+        startTime: 0.0,
+        duration: 5.0,
+        volumeKeyframes: const [],
+      );
+      expect(t.toMap().containsKey('volumeKeyframes'), isFalse);
+    });
+
+    test('VKF-15 toMap includes volumeKeyframes when non-empty', () {
+      final t = VGAudioSidecarTrack(
+        trackId: 'tid',
+        url: '/tmp/a.m4a',
+        startTime: 0.0,
+        duration: 5.0,
+        volumeKeyframes: [
+          const VGAudioVolumeKeyframe(time: 0.0, volume: 1.0),
+          const VGAudioVolumeKeyframe(time: 2.5, volume: 0.2),
+        ],
+      );
+      final m = t.toMap();
+      expect(m.containsKey('volumeKeyframes'), isTrue);
+      final kfList = m['volumeKeyframes'] as List;
+      expect(kfList.length, 2);
+      final first = kfList[0] as Map;
+      expect((first['volume'] as num).toDouble(), closeTo(1.0, 1e-9));
+    });
+
+    test('VKF-16 round-trip preserves volumeKeyframes', () {
+      final original = VGAudioSidecarTrack(
+        trackId: 'tid',
+        url: '/tmp/a.m4a',
+        startTime: 0.0,
+        duration: 5.0,
+        volumeKeyframes: [
+          const VGAudioVolumeKeyframe(time: 0.0, volume: 1.0),
+          const VGAudioVolumeKeyframe(time: 2.0, volume: 0.3),
+          const VGAudioVolumeKeyframe(time: 4.0, volume: 1.0),
+        ],
+      );
+      final restored = VGAudioSidecarTrack.fromMap(
+        original.toMap().cast<Object?, Object?>(),
+      );
+      expect(restored, isNotNull);
+      expect(restored!.volumeKeyframes, isNotNull);
+      expect(restored.volumeKeyframes!.length, 3);
+      expect(restored.volumeKeyframes![1].time, closeTo(2.0, 1e-9));
+      expect(restored.volumeKeyframes![1].volume, closeTo(0.3, 1e-9));
+    });
+
+    test('VKF-17 equality: tracks with same keyframes are equal', () {
+      final kfs = [const VGAudioVolumeKeyframe(time: 1.0, volume: 0.5)];
+      final a = VGAudioSidecarTrack(
+        trackId: 'tid', url: '/tmp/a.m4a', startTime: 0.0,
+        duration: 5.0, volumeKeyframes: kfs,
+      );
+      final b = VGAudioSidecarTrack(
+        trackId: 'tid', url: '/tmp/a.m4a', startTime: 0.0,
+        duration: 5.0, volumeKeyframes: [const VGAudioVolumeKeyframe(time: 1.0, volume: 0.5)],
+      );
+      expect(a, equals(b));
+      expect(a.hashCode, b.hashCode);
+    });
+
+    test('VKF-18 equality: tracks with different keyframes are not equal', () {
+      final a = VGAudioSidecarTrack(
+        trackId: 'tid', url: '/tmp/a.m4a', startTime: 0.0,
+        duration: 5.0,
+        volumeKeyframes: [const VGAudioVolumeKeyframe(time: 1.0, volume: 0.5)],
+      );
+      final b = VGAudioSidecarTrack(
+        trackId: 'tid', url: '/tmp/a.m4a', startTime: 0.0,
+        duration: 5.0,
+        volumeKeyframes: [const VGAudioVolumeKeyframe(time: 1.0, volume: 0.9)],
+      );
+      expect(a == b, isFalse);
+    });
+
+    test('VKF-19 equality: null vs non-null keyframes not equal', () {
+      final a = _track();
+      final b = VGAudioSidecarTrack(
+        trackId: a.trackId, url: a.url, startTime: a.startTime,
+        duration: a.duration,
+        volumeKeyframes: [const VGAudioVolumeKeyframe(time: 0.0, volume: 1.0)],
+      );
+      expect(a == b, isFalse);
+    });
+
+    test('VKF-20 backward compat: fromMap with no volumeKeyframes key gives null keyframes', () {
+      final result = VGAudioSidecarTrack.fromMap({
+        'trackId': 'tid',
+        'url': '/tmp/a.m4a',
+        'startTime': 0.0,
+        'duration': 5.0,
+      });
+      expect(result, isNotNull);
+      expect(result!.volumeKeyframes, isNull);
+    });
+
+    test('VKF-21 plan round-trip preserves tracks with keyframes', () {
+      final plan = VGAudioSidecarPlan(tracks: [
+        VGAudioSidecarTrack(
+          trackId: 'kf-track',
+          url: '/tmp/music.m4a',
+          startTime: 0.0,
+          duration: 10.0,
+          volumeKeyframes: [
+            const VGAudioVolumeKeyframe(time: 0.0, volume: 1.0),
+            const VGAudioVolumeKeyframe(time: 5.0, volume: 0.2),
+            const VGAudioVolumeKeyframe(time: 8.0, volume: 1.0),
+          ],
+        ),
+      ]);
+      final restored = VGAudioSidecarPlan.fromMap(
+        plan.toMap().cast<Object?, Object?>(),
+      );
+      expect(restored, isNotNull);
+      expect(restored!.tracks.length, 1);
+      expect(restored.tracks[0].volumeKeyframes, isNotNull);
+      expect(restored.tracks[0].volumeKeyframes!.length, 3);
+      expect(restored.tracks[0].volumeKeyframes![1].volume, closeTo(0.2, 1e-9));
     });
   });
 }

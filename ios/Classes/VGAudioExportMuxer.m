@@ -443,50 +443,138 @@ static void _VGAudioExportMuxerLogInit(void) {
         anyTrackInserted = YES;
 
         // ── Build AVMutableAudioMixInputParameters for this track ─────────────
-        // Apply fade-in, constant body, and fade-out ramps relative to
-        // the insertion point in the composition timeline.
+        // Phase 8.15A: if per-track volumeKeyframes are present and valid, they
+        // completely override static volume / fadeInSeconds / fadeOutSeconds.
+        // Only setVolumeRampFromStartVolume:toEndVolume:timeRange: is used for
+        // keyframed tracks (never setVolume:atTime:) to avoid AVFoundation
+        // ramp-vs-point interaction bugs.
 
         AVMutableAudioMixInputParameters *params =
             [AVMutableAudioMixInputParameters audioMixInputParametersWithTrack:compTrack];
 
-        CMTime insertEnd  = CMTimeAdd(insertionPoint, audioDurationTime);
         double insertStart_s = startTime;
         double insertEnd_s   = insertStart_s + CMTimeGetSeconds(audioDurationTime);
+        CMTime insertEnd     = CMTimeAdd(insertionPoint, audioDurationTime);
 
-        if (fadeInSeconds > 0.0) {
-            // Ramp from 0 → volume during [insertionPoint, insertionPoint+fadeIn].
-            CMTime fadeInStart = insertionPoint;
-            CMTime fadeInEnd   = CMTimeMakeWithSeconds(insertStart_s + fadeInSeconds, kVGMuxTimescale);
-            CMTimeRange fadeInRange = CMTimeRangeMake(fadeInStart,
-                                                      CMTimeSubtract(fadeInEnd, fadeInStart));
-            [params setVolumeRampFromStartVolume:0.0f
-                                     toEndVolume:(float)volume
-                                       timeRange:fadeInRange];
+        // ── Phase 8.15A: keyframe path ────────────────────────────────────────
+        NSArray *rawKeyframes = td[@"volumeKeyframes"];
+        BOOL useKeyframes = NO;
+
+        if ([rawKeyframes isKindOfClass:[NSArray class]] && rawKeyframes.count > 0) {
+            // 1. Parse and clamp to valid keyframes inside the track range.
+            NSMutableArray<NSDictionary *> *validKfs = [NSMutableArray array];
+            for (id entry in rawKeyframes) {
+                if (![entry isKindOfClass:[NSDictionary class]]) continue;
+                NSDictionary *kfDict = (NSDictionary *)entry;
+                double kfTime   = [kfDict[@"time"]   doubleValue];
+                double kfVolume = [kfDict[@"volume"] doubleValue];
+                // Clamp volume to [0, 1].
+                kfVolume = MAX(0.0, MIN(1.0, kfVolume));
+                // Discard keyframes outside the effective track range.
+                if (kfTime < insertStart_s || kfTime > insertEnd_s) continue;
+                [validKfs addObject:@{@"time": @(kfTime), @"volume": @(kfVolume)}];
+            }
+
+            // 2. Sort by time ascending.
+            [validKfs sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+                double ta = [a[@"time"] doubleValue];
+                double tb = [b[@"time"] doubleValue];
+                if (ta < tb) return NSOrderedAscending;
+                if (ta > tb) return NSOrderedDescending;
+                return NSOrderedSame;
+            }];
+
+            // 3. Merge adjacent keyframes closer than 1 ms (keep later volume).
+            NSMutableArray<NSDictionary *> *mergedKfs = [NSMutableArray array];
+            for (NSUInteger i = 0; i < validKfs.count; i++) {
+                if (mergedKfs.count == 0) {
+                    [mergedKfs addObject:validKfs[i]];
+                    continue;
+                }
+                NSDictionary *prev = mergedKfs.lastObject;
+                double prevTime = [prev[@"time"] doubleValue];
+                double currTime = [validKfs[i][@"time"] doubleValue];
+                if ((currTime - prevTime) < 0.001) {
+                    // Replace last with current (keep later volume).
+                    [mergedKfs removeLastObject];
+                }
+                [mergedKfs addObject:validKfs[i]];
+            }
+
+            if (mergedKfs.count > 0) {
+                useKeyframes = YES;
+
+                // 4. Synthesize implicit start keyframe if needed.
+                double firstKfTime = [mergedKfs.firstObject[@"time"] doubleValue];
+                if (firstKfTime > insertStart_s + 0.001) {
+                    NSMutableArray *withStart = [NSMutableArray array];
+                    [withStart addObject:@{@"time": @(insertStart_s), @"volume": @(0.0)}];
+                    [withStart addObjectsFromArray:mergedKfs];
+                    mergedKfs = withStart;
+                }
+
+                // 5. Synthesize implicit terminal keyframe if needed (hold last volume).
+                double lastKfTime   = [mergedKfs.lastObject[@"time"] doubleValue];
+                double lastKfVolume = [mergedKfs.lastObject[@"volume"] doubleValue];
+                if (lastKfTime < insertEnd_s - 0.001) {
+                    [mergedKfs addObject:@{@"time": @(insertEnd_s), @"volume": @(lastKfVolume)}];
+                }
+
+                // 6. Emit one contiguous ramp per consecutive keyframe pair.
+                for (NSUInteger i = 0; i + 1 < mergedKfs.count; i++) {
+                    double t0 = [mergedKfs[i][@"time"]     doubleValue];
+                    double v0 = [mergedKfs[i][@"volume"]   doubleValue];
+                    double t1 = [mergedKfs[i + 1][@"time"]   doubleValue];
+                    double v1 = [mergedKfs[i + 1][@"volume"] doubleValue];
+                    if (t1 - t0 < 0.001) continue; // skip sub-ms gaps
+                    CMTime segStart = CMTimeMakeWithSeconds(t0, kVGMuxTimescale);
+                    CMTime segEnd   = CMTimeMakeWithSeconds(t1, kVGMuxTimescale);
+                    CMTimeRange segRange = CMTimeRangeMake(segStart,
+                                                           CMTimeSubtract(segEnd, segStart));
+                    [params setVolumeRampFromStartVolume:(float)v0
+                                             toEndVolume:(float)v1
+                                               timeRange:segRange];
+                }
+
+                os_log(sMuxerLog,
+                       "[8.15A] pass1: track %{public}@ keyframe path — %lu kf(s) "
+                       "start=%.3fs dur=%.3fs",
+                       td[@"trackId"], (unsigned long)mergedKfs.count,
+                       insertStart_s, insertEnd_s - insertStart_s);
+            }
         }
 
-        // Constant body volume.
-        double bodyStart_s = insertStart_s + fadeInSeconds;
-        CMTime bodyStartTime = CMTimeMakeWithSeconds(bodyStart_s, kVGMuxTimescale);
-        [params setVolume:(float)volume atTime:bodyStartTime];
-
-        if (fadeOutSeconds > 0.0) {
-            // Ramp from volume → 0 during [insertEnd-fadeOut, insertEnd].
-            double fadeOutStart_s = insertEnd_s - fadeOutSeconds;
-            CMTime fadeOutStart = CMTimeMakeWithSeconds(fadeOutStart_s, kVGMuxTimescale);
-            CMTimeRange fadeOutRange = CMTimeRangeMake(fadeOutStart,
-                                                        CMTimeSubtract(insertEnd, fadeOutStart));
-            [params setVolumeRampFromStartVolume:(float)volume
-                                     toEndVolume:0.0f
-                                       timeRange:fadeOutRange];
+        // ── Static volume/fade path (unchanged from 8.14B) ───────────────────
+        if (!useKeyframes) {
+            CMTime bodyStartTime = CMTimeMakeWithSeconds(insertStart_s + fadeInSeconds,
+                                                         kVGMuxTimescale);
+            if (fadeInSeconds > 0.0) {
+                CMTime fadeInEnd = CMTimeMakeWithSeconds(insertStart_s + fadeInSeconds,
+                                                         kVGMuxTimescale);
+                CMTimeRange fadeInRange = CMTimeRangeMake(insertionPoint,
+                                                           CMTimeSubtract(fadeInEnd, insertionPoint));
+                [params setVolumeRampFromStartVolume:0.0f
+                                         toEndVolume:(float)volume
+                                           timeRange:fadeInRange];
+            }
+            [params setVolume:(float)volume atTime:bodyStartTime];
+            if (fadeOutSeconds > 0.0) {
+                double fadeOutStart_s = insertEnd_s - fadeOutSeconds;
+                CMTime fadeOutStart = CMTimeMakeWithSeconds(fadeOutStart_s, kVGMuxTimescale);
+                CMTimeRange fadeOutRange = CMTimeRangeMake(fadeOutStart,
+                                                            CMTimeSubtract(insertEnd, fadeOutStart));
+                [params setVolumeRampFromStartVolume:(float)volume
+                                         toEndVolume:0.0f
+                                           timeRange:fadeOutRange];
+            }
+            os_log(sMuxerLog,
+                   "[8.14B] pass1: track %{public}@ start=%.3fs dur=%.3fs vol=%.2f "
+                   "fadeIn=%.3fs fadeOut=%.3fs",
+                   td[@"trackId"], startTime, CMTimeGetSeconds(audioDurationTime),
+                   volume, fadeInSeconds, fadeOutSeconds);
         }
 
         [mixParams addObject:params];
-
-        os_log(sMuxerLog,
-               "[8.14B] pass1: track %{public}@ start=%.3fs dur=%.3fs vol=%.2f "
-               "fadeIn=%.3fs fadeOut=%.3fs",
-               td[@"trackId"], startTime, CMTimeGetSeconds(audioDurationTime),
-               volume, fadeInSeconds, fadeOutSeconds);
     }
 
     if (!anyTrackInserted) {

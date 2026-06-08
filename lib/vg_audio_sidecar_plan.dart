@@ -9,7 +9,7 @@
 //   - Minimal validation: nil/empty guards only.
 //   - Serialisation under key "audioSidecar" in VGEditorDraft.toMap().
 //   - Native VGAudioSidecarPlan.fromDictionary: round-trips this exactly.
-//   - Do NOT add ducking, keyframes, waveform, volume envelope, or beat sync.
+//   - Do NOT add ducking, waveform, volume envelope, or beat sync.
 //   - Do NOT add Phase 15 work.
 //
 // Phase 8.14B additions (additive):
@@ -19,6 +19,14 @@
 //     in a separate audio-only Pass 1 export (AVAssetExportPresetAppleM4A).
 //   - Pass 2 muxes video-only MP4 + mixed M4A using AVAssetExportPresetPassthrough.
 //   - VGAudioSidecarPlan now supports multiple tracks (8.14A was single-track only).
+//
+// Phase 8.15A additions (additive):
+//   - VGAudioVolumeKeyframe: per-track volume automation point.
+//   - VGAudioSidecarTrack gains optional volumeKeyframes list.
+//   - When volumeKeyframes is non-empty, it completely overrides static volume,
+//     fadeInSeconds, and fadeOutSeconds for that track in the native muxer.
+//   - Only 'linear' curve is supported in this slice.
+//   - Keyframe times are seconds in the output timeline (same basis as startTime).
 //
 // Wire contract (matches native VGAudioSidecarPlan / track dictionary keys):
 //   audioSidecar: {
@@ -33,10 +41,60 @@
 //         "fadeInSeconds":        double?,  // optional fade-in duration (≥ 0)
 //         "fadeOutSeconds":       double?,  // optional fade-out duration (≥ 0)
 //         "timeRemapAudioPolicy": String?,  // optional; "preserve" | "mute"
-//         "sourceTrimStart":      double?   // Phase 8.14C: source-file offset (≥ 0) to begin reading
+//         "sourceTrimStart":      double?,  // Phase 8.14C: source-file offset (≥ 0) to begin reading
+//         "volumeKeyframes":      List?,    // Phase 8.15A: [{time, volume, curve?}]; overrides volume/fades
 //       }
 //     ]
 //   }
+
+/// A single volume automation keyframe for a sidecar audio track.
+///
+/// [time] is seconds in the output timeline (same basis as [VGAudioSidecarTrack.startTime]).
+/// [volume] is linear gain in [0.0, 1.0].
+/// [curve] is the interpolation curve to the next keyframe. Only 'linear' is
+///   supported in Phase 8.15A. Omitted from wire when 'linear'.
+final class VGAudioVolumeKeyframe {
+  const VGAudioVolumeKeyframe({
+    required this.time,
+    required this.volume,
+    this.curve = 'linear',
+  });
+
+  final double time;
+  final double volume;
+  final String curve;
+
+  Map<String, Object?> toMap() {
+    final m = <String, Object?>{'time': time, 'volume': volume};
+    if (curve != 'linear') m['curve'] = curve;
+    return m;
+  }
+
+  static VGAudioVolumeKeyframe? fromMap(Map<Object?, Object?> map) {
+    final time = (map['time'] as num?)?.toDouble();
+    if (time == null) return null;
+    final volume = (map['volume'] as num?)?.toDouble();
+    if (volume == null) return null;
+    final curveRaw = map['curve'];
+    final curve = curveRaw is String ? curveRaw : 'linear';
+    return VGAudioVolumeKeyframe(time: time, volume: volume, curve: curve);
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGAudioVolumeKeyframe &&
+          other.time == time &&
+          other.volume == volume &&
+          other.curve == curve;
+
+  @override
+  int get hashCode => Object.hash(time, volume, curve);
+
+  @override
+  String toString() =>
+      'VGAudioVolumeKeyframe(time: ${time.toStringAsFixed(3)}s, volume: $volume, curve: $curve)';
+}
 
 /// A single sidecar audio track to be muxed alongside the exported video.
 ///
@@ -46,16 +104,15 @@
 ///   (≥ 0.0). Native clamps audio so it does not exceed the video duration.
 /// [duration] is how many seconds of audio to include (> 0.0).
 /// [volume] is the linear gain, clamped to [0.0, 1.0] by the native muxer.
-///   Defaults to 1.0 (unity gain).
+///   Defaults to 1.0 (unity gain). Ignored when [volumeKeyframes] is non-empty.
 /// [role] is an optional semantic role string. Recognised values:
 ///   `"music"`, `"voiceover"`, `"sfx"`, `"original"`. Defaults to null.
 ///   Role is metadata-only in Phase 8.14B; the muxer does not change behaviour
 ///   based on role. Future ducking will key on this field.
 /// [fadeInSeconds] is the fade-in duration in seconds (≥ 0.0). Defaults to 0.0.
-///   A ramp from silence → [volume] is applied at the track's insertion point.
+///   Ignored when [volumeKeyframes] is non-empty.
 /// [fadeOutSeconds] is the fade-out duration in seconds (≥ 0.0). Defaults to 0.0.
-///   A ramp from [volume] → silence is applied at the end of the track's
-///   effective duration in the composition.
+///   Ignored when [volumeKeyframes] is non-empty.
 /// [timeRemapAudioPolicy] is an optional string hint for time-remap handling.
 ///   Only "preserve" and "mute" are acted on. Absent or unrecognised values
 ///   are treated as "preserve".
@@ -63,6 +120,10 @@
 ///   reading begins (≥ 0.0). Defaults to 0.0 (start of file). Wire key: `sourceTrimStart`.
 ///   Phase 8.14C: used for original clip audio to start reading at the clip's
 ///   `trimStartSeconds` rather than the beginning of the video source file.
+/// [volumeKeyframes] is an optional list of volume automation keyframes.
+///   Phase 8.15A: when non-empty, completely overrides [volume], [fadeInSeconds],
+///   and [fadeOutSeconds] for this track. Caller encodes all volume automation
+///   (including transition-derived crossfades) as keyframes.
 final class VGAudioSidecarTrack {
   const VGAudioSidecarTrack({
     required this.trackId,
@@ -75,6 +136,7 @@ final class VGAudioSidecarTrack {
     this.fadeOutSeconds = 0.0,
     this.timeRemapAudioPolicy,
     this.sourceTrimStartSeconds = 0.0,
+    this.volumeKeyframes,
   });
 
   final String trackId;
@@ -87,12 +149,12 @@ final class VGAudioSidecarTrack {
   /// Metadata-only in Phase 8.14B; no behaviour change in native muxer.
   final String? role;
 
-  /// Fade-in duration in seconds. 0.0 = no fade-in. Native applies a linear
-  /// volume ramp from 0.0 → [volume] starting at the track's insertion point.
+  /// Fade-in duration in seconds. 0.0 = no fade-in. Ignored when [volumeKeyframes]
+  /// is non-empty.
   final double fadeInSeconds;
 
-  /// Fade-out duration in seconds. 0.0 = no fade-out. Native applies a linear
-  /// volume ramp from [volume] → 0.0 ending at the track's effective end time.
+  /// Fade-out duration in seconds. 0.0 = no fade-out. Ignored when [volumeKeyframes]
+  /// is non-empty.
   final double fadeOutSeconds;
 
   final String? timeRemapAudioPolicy;
@@ -104,6 +166,13 @@ final class VGAudioSidecarTrack {
   /// source video file. Wire key: `sourceTrimStart`.
   /// Defaults to 0.0 (start of file). Must be >= 0.0.
   final double sourceTrimStartSeconds;
+
+  /// Optional volume automation keyframes. Phase 8.15A.
+  ///
+  /// When non-empty, completely overrides [volume], [fadeInSeconds], and
+  /// [fadeOutSeconds] for this track. Null or empty list preserves existing
+  /// static volume/fade behaviour.
+  final List<VGAudioVolumeKeyframe>? volumeKeyframes;
 
   /// Serialises to a map whose keys match the native
   /// `VGAudioSidecarPlan.tracks` dictionary contract.
@@ -124,6 +193,10 @@ final class VGAudioSidecarTrack {
     // Phase 8.14C: emit sourceTrimStart only when non-zero (0.0 = start of file).
     if (sourceTrimStartSeconds != 0.0) {
       m['sourceTrimStart'] = sourceTrimStartSeconds;
+    }
+    // Phase 8.15A: emit volumeKeyframes only when non-null and non-empty.
+    if (volumeKeyframes != null && volumeKeyframes!.isNotEmpty) {
+      m['volumeKeyframes'] = volumeKeyframes!.map((kf) => kf.toMap()).toList();
     }
     return m;
   }
@@ -159,6 +232,20 @@ final class VGAudioSidecarTrack {
     final sourceTrimStart =
         (map['sourceTrimStart'] as num?)?.toDouble() ?? 0.0;
 
+    // Phase 8.15A: parse volumeKeyframes; absent or non-list = null.
+    List<VGAudioVolumeKeyframe>? keyframes;
+    final rawKf = map['volumeKeyframes'];
+    if (rawKf is List && rawKf.isNotEmpty) {
+      final parsed = <VGAudioVolumeKeyframe>[];
+      for (final entry in rawKf) {
+        if (entry is Map<Object?, Object?>) {
+          final kf = VGAudioVolumeKeyframe.fromMap(entry);
+          if (kf != null) parsed.add(kf);
+        }
+      }
+      if (parsed.isNotEmpty) keyframes = parsed;
+    }
+
     return VGAudioSidecarTrack(
       trackId: trackId,
       url: url,
@@ -170,6 +257,7 @@ final class VGAudioSidecarTrack {
       fadeOutSeconds: fadeOut,
       timeRemapAudioPolicy: policyStr,
       sourceTrimStartSeconds: sourceTrimStart,
+      volumeKeyframes: keyframes,
     );
   }
 
@@ -186,7 +274,8 @@ final class VGAudioSidecarTrack {
           other.fadeInSeconds == fadeInSeconds &&
           other.fadeOutSeconds == fadeOutSeconds &&
           other.timeRemapAudioPolicy == timeRemapAudioPolicy &&
-          other.sourceTrimStartSeconds == sourceTrimStartSeconds;
+          other.sourceTrimStartSeconds == sourceTrimStartSeconds &&
+          _listEqual(other.volumeKeyframes, volumeKeyframes);
 
   @override
   int get hashCode => Object.hash(
@@ -200,6 +289,7 @@ final class VGAudioSidecarTrack {
         fadeOutSeconds,
         timeRemapAudioPolicy,
         sourceTrimStartSeconds,
+        Object.hashAll(volumeKeyframes ?? const []),
       );
 
   @override
@@ -214,6 +304,7 @@ final class VGAudioSidecarTrack {
       '${fadeOutSeconds != 0.0 ? ", fadeOut: ${fadeOutSeconds}s" : ""}'
       '${timeRemapAudioPolicy != null ? ", policy: $timeRemapAudioPolicy" : ""}'
       '${sourceTrimStartSeconds != 0.0 ? ", sourceTrimStart: ${sourceTrimStartSeconds.toStringAsFixed(3)}s" : ""}'
+      '${volumeKeyframes != null && volumeKeyframes!.isNotEmpty ? ", keyframes: ${volumeKeyframes!.length}" : ""}'
       ')';
 }
 
@@ -277,8 +368,10 @@ final class VGAudioSidecarPlan {
       'VGAudioSidecarPlan(tracks: ${tracks.length})';
 }
 
-bool _listEqual<T>(List<T> a, List<T> b) {
+bool _listEqual<T>(List<T>? a, List<T>? b) {
   if (identical(a, b)) return true;
+  if (a == null && b == null) return true;
+  if (a == null || b == null) return false;
   if (a.length != b.length) return false;
   for (var i = 0; i < a.length; i++) {
     if (a[i] != b[i]) return false;
