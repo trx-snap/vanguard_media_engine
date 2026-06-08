@@ -1,8 +1,9 @@
 // vg_audio_sidecar_plan_test.dart
-// Vanguard Media Engine — Phase 8.14A Audio Sidecar Export Muxer MVP
+// Vanguard Media Engine — Phase 8.14A/8.14B Audio Sidecar Export Muxer
 //
 // Pure Dart unit tests for VGAudioSidecarTrack and VGAudioSidecarPlan,
 // plus VGEditorDraft audioSidecarPlan additive bridge tests.
+// Phase 8.14B additions: role, fadeInSeconds, fadeOutSeconds, multi-track.
 //
 // Tests:
 //   AST-*  VGAudioSidecarTrack round-trip, validation, equality
@@ -22,6 +23,9 @@ VGAudioSidecarTrack _track({
   double startTime = 0.0,
   double duration = 5.0,
   double volume = 1.0,
+  String? role,
+  double fadeInSeconds = 0.0,
+  double fadeOutSeconds = 0.0,
   String? timeRemapAudioPolicy,
 }) =>
     VGAudioSidecarTrack(
@@ -30,6 +34,9 @@ VGAudioSidecarTrack _track({
       startTime: startTime,
       duration: duration,
       volume: volume,
+      role: role,
+      fadeInSeconds: fadeInSeconds,
+      fadeOutSeconds: fadeOutSeconds,
       timeRemapAudioPolicy: timeRemapAudioPolicy,
     );
 
@@ -92,6 +99,47 @@ void main() {
     test('AST-4 timeRemapAudioPolicy defaults to null', () {
       expect(_track().timeRemapAudioPolicy, isNull);
     });
+
+    // Phase 8.14B: role and fade fields
+    test('AST-19 role defaults to null', () {
+      expect(_track().role, isNull);
+    });
+
+    test('AST-20 fadeInSeconds defaults to 0.0', () {
+      expect(_track().fadeInSeconds, closeTo(0.0, 1e-9));
+    });
+
+    test('AST-21 fadeOutSeconds defaults to 0.0', () {
+      expect(_track().fadeOutSeconds, closeTo(0.0, 1e-9));
+    });
+
+    test('AST-22 role is stored correctly', () {
+      final t = _track(role: 'voiceover');
+      expect(t.role, 'voiceover');
+    });
+
+    test('AST-23 fadeInSeconds is stored correctly', () {
+      final t = _track(fadeInSeconds: 0.5);
+      expect(t.fadeInSeconds, closeTo(0.5, 1e-9));
+    });
+
+    test('AST-24 fadeOutSeconds is stored correctly', () {
+      final t = _track(fadeOutSeconds: 0.75);
+      expect(t.fadeOutSeconds, closeTo(0.75, 1e-9));
+    });
+
+    test('AST-25 all 8.14B fields stored together', () {
+      final t = _track(
+        role: 'music',
+        fadeInSeconds: 0.3,
+        fadeOutSeconds: 0.5,
+        volume: 0.6,
+      );
+      expect(t.role, 'music');
+      expect(t.fadeInSeconds, closeTo(0.3, 1e-9));
+      expect(t.fadeOutSeconds, closeTo(0.5, 1e-9));
+      expect(t.volume, closeTo(0.6, 1e-9));
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -138,6 +186,87 @@ void main() {
     test('AST-8 toMap includes timeRemapAudioPolicy when set', () {
       final map = _track(timeRemapAudioPolicy: 'preserve').toMap();
       expect(map['timeRemapAudioPolicy'], 'preserve');
+    });
+
+    // Phase 8.14B: role and fade serialisation
+    test('AST-26 toMap omits role when null', () {
+      final map = _track().toMap();
+      expect(map.containsKey('role'), isFalse);
+    });
+
+    test('AST-27 toMap includes role when set', () {
+      final map = _track(role: 'sfx').toMap();
+      expect(map['role'], 'sfx');
+    });
+
+    test('AST-28 toMap omits fadeInSeconds when 0.0', () {
+      final map = _track(fadeInSeconds: 0.0).toMap();
+      expect(map.containsKey('fadeInSeconds'), isFalse);
+    });
+
+    test('AST-29 toMap includes fadeInSeconds when non-zero', () {
+      final map = _track(fadeInSeconds: 0.5).toMap();
+      expect(map['fadeInSeconds'], closeTo(0.5, 1e-9));
+    });
+
+    test('AST-30 toMap omits fadeOutSeconds when 0.0', () {
+      final map = _track(fadeOutSeconds: 0.0).toMap();
+      expect(map.containsKey('fadeOutSeconds'), isFalse);
+    });
+
+    test('AST-31 toMap includes fadeOutSeconds when non-zero', () {
+      final map = _track(fadeOutSeconds: 0.75).toMap();
+      expect(map['fadeOutSeconds'], closeTo(0.75, 1e-9));
+    });
+
+    test('AST-32 round-trip preserves role and fades', () {
+      final original = _track(
+        role: 'voiceover',
+        fadeInSeconds: 0.3,
+        fadeOutSeconds: 0.6,
+        volume: 0.7,
+      );
+      final restored = VGAudioSidecarTrack.fromMap(
+        original.toMap().cast<Object?, Object?>(),
+      );
+      expect(restored, isNotNull);
+      expect(restored!.role, 'voiceover');
+      expect(restored.fadeInSeconds, closeTo(0.3, 1e-9));
+      expect(restored.fadeOutSeconds, closeTo(0.6, 1e-9));
+      expect(restored.volume, closeTo(0.7, 1e-9));
+    });
+
+    test('AST-33 fromMap defaults fadeInSeconds to 0.0 when absent', () {
+      final result = VGAudioSidecarTrack.fromMap({
+        'trackId': 'tid',
+        'url': '/tmp/a.m4a',
+        'startTime': 0.0,
+        'duration': 5.0,
+      });
+      expect(result, isNotNull);
+      expect(result!.fadeInSeconds, closeTo(0.0, 1e-9));
+    });
+
+    test('AST-34 fromMap defaults fadeOutSeconds to 0.0 when absent', () {
+      final result = VGAudioSidecarTrack.fromMap({
+        'trackId': 'tid',
+        'url': '/tmp/a.m4a',
+        'startTime': 0.0,
+        'duration': 5.0,
+      });
+      expect(result, isNotNull);
+      expect(result!.fadeOutSeconds, closeTo(0.0, 1e-9));
+    });
+
+    test('AST-35 fromMap defaults role to null when absent', () {
+      final result = VGAudioSidecarTrack.fromMap({
+        'trackId': 'tid',
+        'url': '/tmp/a.m4a',
+        'startTime': 0.0,
+        'duration': 5.0,
+      });
+      expect(result, isNotNull);
+      expect(result!.role, isNull);
     });
 
     test('AST-9 fromMap returns null for empty trackId', () {
@@ -233,6 +362,35 @@ void main() {
         isFalse,
       );
     });
+
+    // Phase 8.14B: equality for new fields
+    test('AST-36 tracks with different role are not equal', () {
+      expect(
+        _track(role: 'music') == _track(role: 'voiceover'),
+        isFalse,
+      );
+    });
+
+    test('AST-37 tracks with different fadeInSeconds are not equal', () {
+      expect(
+        _track(fadeInSeconds: 0.5) == _track(fadeInSeconds: 0.0),
+        isFalse,
+      );
+    });
+
+    test('AST-38 tracks with different fadeOutSeconds are not equal', () {
+      expect(
+        _track(fadeOutSeconds: 0.5) == _track(fadeOutSeconds: 0.0),
+        isFalse,
+      );
+    });
+
+    test('AST-39 tracks identical including new fields are equal', () {
+      final a = _track(role: 'sfx', fadeInSeconds: 0.2, fadeOutSeconds: 0.4);
+      final b = _track(role: 'sfx', fadeInSeconds: 0.2, fadeOutSeconds: 0.4);
+      expect(a, equals(b));
+      expect(a.hashCode, b.hashCode);
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -257,6 +415,28 @@ void main() {
         () => (plan.tracks as List).add(_track(trackId: 'new')),
         throwsUnsupportedError,
       );
+    });
+
+    // Phase 8.14B: multi-track support
+    test('ASP-12 plan with multiple tracks constructs without error', () {
+      expect(
+        () => VGAudioSidecarPlan(tracks: [
+          _track(trackId: 't1'),
+          _track(trackId: 't2', url: '/tmp/sfx.m4a', role: 'sfx'),
+        ]),
+        returnsNormally,
+      );
+    });
+
+    test('ASP-13 multi-track plan stores all tracks', () {
+      final plan = VGAudioSidecarPlan(tracks: [
+        _track(trackId: 'a'),
+        _track(trackId: 'b'),
+        _track(trackId: 'c'),
+      ]);
+      expect(plan.tracks.length, 3);
+      expect(plan.tracks[0].trackId, 'a');
+      expect(plan.tracks[2].trackId, 'c');
     });
   });
 
@@ -288,6 +468,58 @@ void main() {
       expect(restored.tracks[0].startTime, closeTo(0.5, 1e-9));
       expect(restored.tracks[0].duration, closeTo(12.0, 1e-9));
       expect(restored.tracks[0].volume, closeTo(0.9, 1e-9));
+    });
+
+    // Phase 8.14B: multi-track round-trip with fades and roles
+    test('ASP-14 multi-track round-trip preserves all tracks with 8.14B fields', () {
+      final original = VGAudioSidecarPlan(tracks: [
+        _track(
+          trackId: 'music-1',
+          url: '/tmp/music.m4a',
+          startTime: 0.0,
+          duration: 5.0,
+          volume: 0.8,
+          role: 'music',
+          fadeInSeconds: 0.5,
+          fadeOutSeconds: 0.5,
+        ),
+        _track(
+          trackId: 'vo-1',
+          url: '/tmp/vo.m4a',
+          startTime: 1.0,
+          duration: 3.0,
+          volume: 1.0,
+          role: 'voiceover',
+          fadeInSeconds: 0.0,
+          fadeOutSeconds: 0.25,
+        ),
+      ]);
+      final restored = VGAudioSidecarPlan.fromMap(
+        original.toMap().cast<Object?, Object?>(),
+      );
+      expect(restored, isNotNull);
+      expect(restored!.tracks.length, 2);
+      expect(restored.tracks[0].trackId, 'music-1');
+      expect(restored.tracks[0].role, 'music');
+      expect(restored.tracks[0].fadeInSeconds, closeTo(0.5, 1e-9));
+      expect(restored.tracks[0].fadeOutSeconds, closeTo(0.5, 1e-9));
+      expect(restored.tracks[1].trackId, 'vo-1');
+      expect(restored.tracks[1].role, 'voiceover');
+      expect(restored.tracks[1].fadeInSeconds, closeTo(0.0, 1e-9));
+      expect(restored.tracks[1].fadeOutSeconds, closeTo(0.25, 1e-9));
+    });
+
+    test('ASP-15 multi-track equality: same two-track plans are equal', () {
+      final a = VGAudioSidecarPlan(tracks: [
+        _track(trackId: 'x', role: 'music', fadeInSeconds: 0.3),
+        _track(trackId: 'y', role: 'sfx'),
+      ]);
+      final b = VGAudioSidecarPlan(tracks: [
+        _track(trackId: 'x', role: 'music', fadeInSeconds: 0.3),
+        _track(trackId: 'y', role: 'sfx'),
+      ]);
+      expect(a, equals(b));
+      expect(a.hashCode, b.hashCode);
     });
 
     test('ASP-5 toMap shape has "tracks" list key', () {

@@ -1,27 +1,38 @@
 // vg_audio_sidecar_plan.dart
-// Vanguard Media Engine — Phase 8.14A Audio Sidecar Export Muxer MVP
+// Vanguard Media Engine — Phase 8.14B Multi-Track Audio Mixdown
 //
-// Minimal Dart descriptor types for a single sidecar audio track that is
-// post-pass muxed into the exported MP4 by VGAudioExportMuxer (native).
+// Dart descriptor types for sidecar audio tracks that are post-pass muxed
+// into the exported MP4 by VGAudioExportMuxer (native).
 //
 // Design rules:
 //   - Pure Dart value types. No rendering logic, no channel calls.
-//   - Minimal validation: nil/empty guards only (as per Opus approval).
+//   - Minimal validation: nil/empty guards only.
 //   - Serialisation under key "audioSidecar" in VGEditorDraft.toMap().
 //   - Native VGAudioSidecarPlan.fromDictionary: round-trips this exactly.
 //   - Do NOT add ducking, keyframes, waveform, volume envelope, or beat sync.
 //   - Do NOT add Phase 15 work.
 //
+// Phase 8.14B additions (additive):
+//   - VGAudioSidecarTrack gains optional role, fadeInSeconds, fadeOutSeconds.
+//   - Role is metadata-only in 8.14B. Native muxer does not branch on role.
+//   - Fades use AVMutableAudioMixInputParameters.setVolumeRampFrom:to:timeRange:
+//     in a separate audio-only Pass 1 export (AVAssetExportPresetAppleM4A).
+//   - Pass 2 muxes video-only MP4 + mixed M4A using AVAssetExportPresetPassthrough.
+//   - VGAudioSidecarPlan now supports multiple tracks (8.14A was single-track only).
+//
 // Wire contract (matches native VGAudioSidecarPlan / track dictionary keys):
 //   audioSidecar: {
 //     "tracks": [
 //       {
-//         "trackId":             String,
-//         "url":                 String,   // absolute device path
-//         "startTime":           double,   // seconds into timeline where audio begins
-//         "duration":            double,   // seconds of audio to include
-//         "volume":              double,   // 0.0–1.0 linear gain
-//         "timeRemapAudioPolicy": String?  // optional; "preserve" | "mute"
+//         "trackId":              String,
+//         "url":                  String,   // absolute device path
+//         "startTime":            double,   // seconds into timeline where audio begins
+//         "duration":             double,   // seconds of audio to include
+//         "volume":               double,   // 0.0–1.0 linear gain
+//         "role":                 String?,  // optional: "music"|"voiceover"|"sfx"|"original"
+//         "fadeInSeconds":        double?,  // optional fade-in duration (≥ 0)
+//         "fadeOutSeconds":       double?,  // optional fade-out duration (≥ 0)
+//         "timeRemapAudioPolicy": String?   // optional; "preserve" | "mute"
 //       }
 //     ]
 //   }
@@ -35,9 +46,18 @@
 /// [duration] is how many seconds of audio to include (> 0.0).
 /// [volume] is the linear gain, clamped to [0.0, 1.0] by the native muxer.
 ///   Defaults to 1.0 (unity gain).
+/// [role] is an optional semantic role string. Recognised values:
+///   `"music"`, `"voiceover"`, `"sfx"`, `"original"`. Defaults to null.
+///   Role is metadata-only in Phase 8.14B; the muxer does not change behaviour
+///   based on role. Future ducking will key on this field.
+/// [fadeInSeconds] is the fade-in duration in seconds (≥ 0.0). Defaults to 0.0.
+///   A ramp from silence → [volume] is applied at the track's insertion point.
+/// [fadeOutSeconds] is the fade-out duration in seconds (≥ 0.0). Defaults to 0.0.
+///   A ramp from [volume] → silence is applied at the end of the track's
+///   effective duration in the composition.
 /// [timeRemapAudioPolicy] is an optional string hint for time-remap handling.
-///   Only "preserve" and "mute" are acted on in Phase 8.14A MVP. Absent or
-///   unrecognised values are treated as "preserve".
+///   Only "preserve" and "mute" are acted on. Absent or unrecognised values
+///   are treated as "preserve".
 final class VGAudioSidecarTrack {
   const VGAudioSidecarTrack({
     required this.trackId,
@@ -45,6 +65,9 @@ final class VGAudioSidecarTrack {
     required this.startTime,
     required this.duration,
     this.volume = 1.0,
+    this.role,
+    this.fadeInSeconds = 0.0,
+    this.fadeOutSeconds = 0.0,
     this.timeRemapAudioPolicy,
   });
 
@@ -53,6 +76,19 @@ final class VGAudioSidecarTrack {
   final double startTime;
   final double duration;
   final double volume;
+
+  /// Optional semantic role. Values: "music", "voiceover", "sfx", "original".
+  /// Metadata-only in Phase 8.14B; no behaviour change in native muxer.
+  final String? role;
+
+  /// Fade-in duration in seconds. 0.0 = no fade-in. Native applies a linear
+  /// volume ramp from 0.0 → [volume] starting at the track's insertion point.
+  final double fadeInSeconds;
+
+  /// Fade-out duration in seconds. 0.0 = no fade-out. Native applies a linear
+  /// volume ramp from [volume] → 0.0 ending at the track's effective end time.
+  final double fadeOutSeconds;
+
   final String? timeRemapAudioPolicy;
 
   /// Serialises to a map whose keys match the native
@@ -65,6 +101,9 @@ final class VGAudioSidecarTrack {
       'duration': duration,
       'volume': volume,
     };
+    if (role != null) m['role'] = role;
+    if (fadeInSeconds != 0.0) m['fadeInSeconds'] = fadeInSeconds;
+    if (fadeOutSeconds != 0.0) m['fadeOutSeconds'] = fadeOutSeconds;
     if (timeRemapAudioPolicy != null) {
       m['timeRemapAudioPolicy'] = timeRemapAudioPolicy;
     }
@@ -89,6 +128,12 @@ final class VGAudioSidecarTrack {
 
     final volume = (map['volume'] as num?)?.toDouble() ?? 1.0;
 
+    final role = map['role'];
+    final roleStr = role is String ? role : null;
+
+    final fadeIn = (map['fadeInSeconds'] as num?)?.toDouble() ?? 0.0;
+    final fadeOut = (map['fadeOutSeconds'] as num?)?.toDouble() ?? 0.0;
+
     final policy = map['timeRemapAudioPolicy'];
     final policyStr = policy is String ? policy : null;
 
@@ -98,6 +143,9 @@ final class VGAudioSidecarTrack {
       startTime: startTime,
       duration: duration,
       volume: volume,
+      role: roleStr,
+      fadeInSeconds: fadeIn,
+      fadeOutSeconds: fadeOut,
       timeRemapAudioPolicy: policyStr,
     );
   }
@@ -111,6 +159,9 @@ final class VGAudioSidecarTrack {
           other.startTime == startTime &&
           other.duration == duration &&
           other.volume == volume &&
+          other.role == role &&
+          other.fadeInSeconds == fadeInSeconds &&
+          other.fadeOutSeconds == fadeOutSeconds &&
           other.timeRemapAudioPolicy == timeRemapAudioPolicy;
 
   @override
@@ -120,6 +171,9 @@ final class VGAudioSidecarTrack {
         startTime,
         duration,
         volume,
+        role,
+        fadeInSeconds,
+        fadeOutSeconds,
         timeRemapAudioPolicy,
       );
 
@@ -130,6 +184,9 @@ final class VGAudioSidecarTrack {
       'startTime: ${startTime.toStringAsFixed(3)}s, '
       'duration: ${duration.toStringAsFixed(3)}s, '
       'volume: $volume'
+      '${role != null ? ", role: $role" : ""}'
+      '${fadeInSeconds != 0.0 ? ", fadeIn: ${fadeInSeconds}s" : ""}'
+      '${fadeOutSeconds != 0.0 ? ", fadeOut: ${fadeOutSeconds}s" : ""}'
       '${timeRemapAudioPolicy != null ? ", policy: $timeRemapAudioPolicy" : ""}'
       ')';
 }
@@ -137,8 +194,10 @@ final class VGAudioSidecarTrack {
 /// Descriptor for a set of sidecar audio tracks to be post-pass muxed into
 /// the exported MP4.
 ///
-/// Phase 8.14A MVP: single-track only. The [tracks] list is expected to
-/// contain exactly one entry. Multi-track muxing is deferred.
+/// Phase 8.14B: supports multiple tracks. The native VGAudioExportMuxer
+/// performs a 2-pass export:
+///   Pass 1: audio-only mixdown (AVAssetExportPresetAppleM4A + AVMutableAudioMix)
+///   Pass 2: video + mixed audio final mux (AVAssetExportPresetPassthrough)
 ///
 /// [tracks] must be non-empty.
 final class VGAudioSidecarPlan {

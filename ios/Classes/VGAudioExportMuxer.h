@@ -1,31 +1,48 @@
 // VGAudioExportMuxer.h
-// vanguard_media_engine — Phase 8.14A Audio Sidecar Export Muxer MVP
+// vanguard_media_engine — Phase 8.14B Multi-Track Audio Mixdown
 //
-// Post-pass sidecar audio muxer using AVMutableComposition + AVAssetExportSession.
+// 2-pass post-pass sidecar audio muxer using AVMutableComposition + AVAssetExportSession.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// ARCHITECTURE: POST-PASS ONLY (Opus approval 2026-06-08)
+// ARCHITECTURE: 2-PASS POST-PASS (Opus approval 2026-06-08)
 // ═══════════════════════════════════════════════════════════════════════════════
 //
-// This muxer is invoked AFTER VGVideoEncoderSinkNode has produced a video-only
-// MP4 at a temporary path. It reads that video + one sidecar audio track and
-// produces the final muxed MP4 at the caller's requested output path.
+// PHASE 8.14A had a latent bug: it set audioMix on an AVAssetExportPresetPassthrough
+// session. Apple ignores audioMix in passthrough mode — volume was silently dropped.
+// Phase 8.14B fixes this with a 2-pass design.
+//
+// Pass 1 — Audio Mixdown:
+//   Builds an audio-only AVMutableComposition from all active sidecar tracks.
+//   Applies AVMutableAudioMix (per-track volume, fade ramps) during export.
+//   Uses AVAssetExportPresetAppleM4A (compatible with AVMutableAudioMix).
+//   Output: {finalOutputPath}.audio_mix_tmp.m4a
+//
+// Pass 2 — Final Passthrough:
+//   Builds a composition of the video-only MP4 + mixed M4A from Pass 1.
+//   Uses AVAssetExportPresetPassthrough (no re-encode of H.264 video).
+//   Output: finalOutputPath
+//
+// Per-track features (Phase 8.14B):
+//   - role: metadata-only ("music"|"voiceover"|"sfx"|"original"). No behavior branch.
+//   - volume: 0.0–1.0. Applied via AVMutableAudioMixInputParameters.setVolume:atTime:
+//   - fadeInSeconds: linear ramp 0 → volume at insertion point.
+//   - fadeOutSeconds: linear ramp volume → 0 at track end.
+//   - timeRemapAudioPolicy "mute": track is skipped entirely.
+//
+// Cleanup:
+//   - All temp files (video, audio mix) deleted on success.
+//   - All temp files + partial output deleted on any failure.
+//   - Includes Pass 1 success + Pass 2 failure case.
 //
 // Approved by Opus:
 //   - Do NOT modify VGVideoEncoderSinkNode, VGTimelineExportHelper (graph).
 //   - Do NOT interleave audio into the inline AVAssetWriter lifecycle.
-//   - Use AVAssetExportPresetPassthrough (no re-encode).
+//   - Do NOT set audioMix on AVAssetExportPresetPassthrough (Apple ignores it).
 //   - Use timescale 600 for all CMTime construction.
 //   - Clamp audio so final output duration == video duration.
 //   - Delete existing output file before AVAssetExportSession starts.
-//   - Delete temp video file on success; delete both on failure.
-//
-// Phase 8.14A MVP scope:
-//   - Single sidecar audio track only.
-//   - Supports: trackId, url (absolute device path), startTime, duration, volume.
-//   - timeRemapAudioPolicy: "mute" → skip audio. Anything else → preserve/include.
-//   - No ducking, no keyframed volume, no waveform, no Phase 15 work.
-//   - Original clip audio is NOT included (deferred to Phase 8.15+).
+//   - Use one AVMutableCompositionTrack + one AVMutableAudioMixInputParameters per track.
+//   - Fade ramps computed relative to track insertion point, not source file time.
 //
 // Forbidden imports:
 //   VGVideoEncoderSinkNode, VGVideoExportSession, VGAudioOnlyExporter,
@@ -50,12 +67,17 @@ NS_ASSUME_NONNULL_BEGIN
 @interface VGAudioExportMuxer : NSObject
 
 /// Creates a muxer configured to combine a video-only temporary file with the
-/// first audio track from the supplied VGAudioSidecarPlan.
+/// sidecar audio tracks from the supplied VGAudioSidecarPlan.
+///
+/// Phase 8.14B: supports multiple audio tracks with per-track volume, role,
+/// and fade-in/fade-out. Uses a 2-pass export:
+///   Pass 1: audio-only mixdown → {finalOutputPath}.audio_mix_tmp.m4a
+///   Pass 2: video + mixed audio → finalOutputPath (passthrough, no re-encode).
 ///
 /// @param videoTempPath   Absolute path to the video-only MP4 produced by the
 ///                        export graph. This file is deleted on success.
-/// @param audioSidecar    VGAudioSidecarPlan containing the audio track(s).
-///                        Phase 8.14A: only the first track is used.
+/// @param audioSidecar    VGAudioSidecarPlan containing the audio tracks.
+///                        All tracks with timeRemapAudioPolicy="mute" are skipped.
 /// @param finalOutputPath Absolute path where the muxed MP4 will be written.
 ///                        An existing file at this path is deleted before
 ///                        AVAssetExportSession starts.
