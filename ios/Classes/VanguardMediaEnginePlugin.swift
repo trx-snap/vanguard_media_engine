@@ -4817,6 +4817,94 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             let position = audioPlaybackService.currentPositionSeconds()
             result(["seconds": position])
 
+        // ── Phase 8.17: Waveform Cache ───────────────────────────────────────
+        //
+        // Disk-backed save/load for VGWaveformResult data produced by
+        // VGWaveformExtractor (Phase 8.15C). All I/O is delegated to the
+        // stateless VGWaveformCache utility.
+        //
+        // Both endpoints must be called from a background isolate / thread
+        // if the caller wants to avoid blocking the UI. The MethodChannel
+        // itself does not dispatch — it executes on the main thread.
+
+        case "waveformCache_save":
+            guard let cacheKey = args?["cacheKey"] as? String, !cacheKey.isEmpty else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "cacheKey is required and must be non-empty",
+                                    details: nil))
+                return
+            }
+            // samples may arrive as FlutterStandardTypedData (bytes) or [NSNumber].
+            let rawSamples = args?["samples"]
+            let samplesData: Data?
+            if let typedData = rawSamples as? FlutterStandardTypedData {
+                samplesData = typedData.data
+            } else if let byteArray = rawSamples as? [Int] {
+                // Fallback: rebuild from byte array
+                var bytes = byteArray.map { UInt8($0 & 0xFF) }
+                samplesData = Data(bytes: &bytes, count: bytes.count)
+            } else {
+                samplesData = nil
+            }
+            guard let samplesData = samplesData, !samplesData.isEmpty else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "samples must be non-empty typed data",
+                                    details: nil))
+                return
+            }
+            guard let durationSeconds = (args?["durationSeconds"] as? NSNumber)?.doubleValue,
+                  durationSeconds > 0 else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "durationSeconds must be > 0",
+                                    details: nil))
+                return
+            }
+            guard let samplesPerSecond = (args?["samplesPerSecond"] as? NSNumber)?.intValue,
+                  samplesPerSecond > 0 else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "samplesPerSecond must be > 0",
+                                    details: nil))
+                return
+            }
+            guard let pointCount = (args?["pointCount"] as? NSNumber)?.intValue,
+                  pointCount > 0 else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "pointCount must be > 0",
+                                    details: nil))
+                return
+            }
+            let waveformResult = VGWaveformResult(samplesData: samplesData,
+                                                  durationSeconds: durationSeconds,
+                                                  samplesPerSecond: samplesPerSecond,
+                                                  pointCount: pointCount)
+            do {
+                try VGWaveformCache.save(waveformResult, forCacheKey: cacheKey)
+                result(nil)
+            } catch {
+                result(FlutterError(code: "CACHE_SAVE_FAILED",
+                                    message: error.localizedDescription,
+                                    details: nil))
+            }
+
+        case "waveformCache_load":
+            guard let cacheKey = args?["cacheKey"] as? String, !cacheKey.isEmpty else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "cacheKey is required and must be non-empty",
+                                    details: nil))
+                return
+            }
+            if let cached = VGWaveformCache.loadResult(forCacheKey: cacheKey) {
+                result([
+                    "durationSeconds":  cached.durationSeconds,
+                    "samplesPerSecond": cached.samplesPerSecond,
+                    "pointCount":       cached.pointCount,
+                    "samples":          FlutterStandardTypedData(bytes: cached.samplesData),
+                ])
+            } else {
+                // Cache miss — return nil so Dart can detect and re-extract.
+                result(nil)
+            }
+
         default:
             result(FlutterMethodNotImplemented)
         }

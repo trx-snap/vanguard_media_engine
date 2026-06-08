@@ -41,3 +41,5 @@
 #import "VGWaveformExtractor.h"       // VGWaveformExtractor + VGWaveformResult
 // Phase 8.16: standalone AVPlayer-backed audio playback service.
 #import "VGAudioPlaybackService.h"    // VGAudioPlaybackService
+// Phase 8.17: disk-backed waveform result cache.
+#import "VGWaveformCache.h"           // VGWaveformCache
