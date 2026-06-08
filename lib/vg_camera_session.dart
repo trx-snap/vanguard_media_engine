@@ -1727,6 +1727,63 @@ final class VGCameraSession {
     }
   }
 
+  // ── MC-17: Video-only recording ─────────────────────────────────────────────
+
+  /// Starts video-only recording of the composited MultiCam preview.
+  ///
+  /// Audio is not included. MultiCam preview must be active and at least one
+  /// frame must have been rendered before calling this.
+  ///
+  /// [path] must be a writable absolute path ending in `.mp4`.
+  ///
+  /// Returns `true` on success, `false` on any failure:
+  ///   - `NOT_RUNNING`      — MultiCam preview is not active.
+  ///   - `NOT_RENDERING`    — No frames rendered yet (called too soon after start).
+  ///   - `ALREADY_RECORDING`— A recording is already in progress.
+  ///   - `DISK_SPACE`       — Less than 200 MB free disk space.
+  ///   - `WRITER_INIT_FAIL` — AVAssetWriter creation or startWriting failed.
+  ///   - `INVALID_ARG`      — Path is empty or missing.
+  static Future<bool> startMultiCamVideoRecording(String path) async {
+    try {
+      final ok = await _channel.invokeMethod<bool>(
+        'startMultiCamVideoRecording',
+        {'path': path},
+      );
+      return ok == true;
+    } on PlatformException {
+      return false;
+    }
+  }
+
+  /// Stops video-only recording of the composited MultiCam preview.
+  ///
+  /// Returns a diagnostic result map on success, `null` on any failure:
+  ///   - `NOT_RUNNING`        — MultiCam preview is not active.
+  ///   - `NOT_RECORDING`      — No recording is currently active.
+  ///   - `WRITER_FINISH_FAIL` — AVAssetWriter finishWriting completed with an error.
+  ///
+  /// ## Result map keys
+  /// - `filePath`                    — Output .mp4 file path.
+  /// - `durationSeconds`             — Recording duration in seconds.
+  /// - `width`                       — Output frame width.
+  /// - `height`                      — Output frame height.
+  /// - `framesOffered`               — Total frames offered to the writer.
+  /// - `framesAppended`              — Frames successfully appended.
+  /// - `framesDroppedWriterNotReady` — Frames dropped due to writer backpressure.
+  /// - `writerStatus`                — Native AVAssetWriterStatus integer.
+  /// - `fileSizeBytes`               — Output file size in bytes.
+  static Future<Map<String, dynamic>?> stopMultiCamVideoRecording() async {
+    try {
+      final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
+        'stopMultiCamVideoRecording',
+      );
+      if (raw == null) return null;
+      return raw.map((key, value) => MapEntry(key.toString(), value));
+    } on PlatformException {
+      return null;
+    }
+  }
+
 
   /// Tap-to-focus and tap-to-expose at a normalised point.
   ///

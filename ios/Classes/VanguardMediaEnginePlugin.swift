@@ -4013,6 +4013,57 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
             }
 
+        // ── MC-17: MultiCam video-only recording ──────────────────────────────────
+        //
+        // Diagnostic recording of the composited preview buffer to .mp4.
+        // Audio is not included. Preview must be active (.running state).
+        //
+        // startMultiCamVideoRecording:
+        //   Returns true (NSNumber/Bool) on success, FlutterError on failure.
+        //   Error codes: NOT_RUNNING, INVALID_ARG, NOT_RENDERING, ALREADY_RECORDING,
+        //                DISK_SPACE, WRITER_INIT_FAIL.
+        //
+        // stopMultiCamVideoRecording:
+        //   Returns result map on success, FlutterError on failure.
+        //   Error codes: NOT_RUNNING, NOT_RECORDING, WRITER_FINISH_FAIL.
+        case "startMultiCamVideoRecording":
+            guard mcDiagnosticState == .running,
+                  let renderer = mcRenderDiagnostic else {
+                result(FlutterError(code: "NOT_RUNNING",
+                                    message: "MultiCam preview is not running",
+                                    details: nil))
+                return
+            }
+            guard let path = args?["path"] as? String, !path.isEmpty else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "Missing or invalid path",
+                                    details: nil))
+                return
+            }
+            renderer.startVideoRecording(toPath: path) { error in
+                if let error = error {
+                    result(error)
+                } else {
+                    result(true)
+                }
+            }
+
+        case "stopMultiCamVideoRecording":
+            guard mcDiagnosticState == .running,
+                  let renderer = mcRenderDiagnostic else {
+                result(FlutterError(code: "NOT_RUNNING",
+                                    message: "MultiCam preview is not running",
+                                    details: nil))
+                return
+            }
+            renderer.stopVideoRecording { resultMap, error in
+                if let error = error {
+                    result(error)
+                } else {
+                    result(resultMap)
+                }
+            }
+
 
         case "setFocusPoint":
 

@@ -3283,4 +3283,122 @@ void main() {
       },
     );
   });
+
+  // ── MC-17: startMultiCamVideoRecording / stopMultiCamVideoRecording ──────────
+  //
+  // Acceptance criteria:
+  //   MC17-1  startMultiCamVideoRecording invokes channel 'startMultiCamVideoRecording' with correct path
+  //   MC17-2  startMultiCamVideoRecording returns true on native success (true)
+  //   MC17-3  startMultiCamVideoRecording returns false on PlatformException
+  //   MC17-4  stopMultiCamVideoRecording invokes channel 'stopMultiCamVideoRecording' and parses result map
+  //   MC17-5  stopMultiCamVideoRecording returns null when native returns null
+  //   MC17-6  stopMultiCamVideoRecording returns null (not rethrow) on PlatformException
+
+  group('VGCameraSession.startMultiCamVideoRecording / stopMultiCamVideoRecording (MC-17)', () {
+    const kVideoPath = '/tmp/mc17_multicam_video_001.mp4';
+
+    const kValidStopResponse = <Object?, Object?>{
+      'filePath':                    kVideoPath,
+      'durationSeconds':             10.5,
+      'width':                       1080,
+      'height':                      1920,
+      'framesOffered':               315,
+      'framesAppended':              315,
+      'framesDroppedWriterNotReady': 0,
+      'writerStatus':                2,   // AVAssetWriterStatusCompleted
+      'fileSizeBytes':               15728640,
+    };
+
+    test(
+      'MC17-1 startMultiCamVideoRecording invokes channel with method name and correct path',
+      () async {
+        _responses['startMultiCamVideoRecording'] = true;
+
+        await VGCameraSession.startMultiCamVideoRecording(kVideoPath);
+
+        expect(_callCount('startMultiCamVideoRecording'), equals(1),
+            reason: 'must fire exactly one startMultiCamVideoRecording channel call');
+        final call = _log.firstWhere((c) => c.method == 'startMultiCamVideoRecording');
+        expect(call.arguments['path'], equals(kVideoPath),
+            reason: 'must forward path as {path: ...} argument map');
+      },
+    );
+
+    test(
+      'MC17-2 startMultiCamVideoRecording returns true when native returns true',
+      () async {
+        _responses['startMultiCamVideoRecording'] = true;
+
+        final ok = await VGCameraSession.startMultiCamVideoRecording(kVideoPath);
+
+        expect(ok, isTrue,
+            reason: 'must return true when native responds with true');
+      },
+    );
+
+    test(
+      'MC17-3 startMultiCamVideoRecording returns false (does not rethrow) on PlatformException',
+      () async {
+        _responses['startMultiCamVideoRecording'] = PlatformException(
+          code: 'NOT_RUNNING',
+          message: 'MultiCam preview is not running',
+        );
+
+        final ok = await VGCameraSession.startMultiCamVideoRecording(kVideoPath);
+
+        expect(ok, isFalse,
+            reason: 'PlatformException must be caught and false returned, not rethrown');
+      },
+    );
+
+    test(
+      'MC17-4 stopMultiCamVideoRecording invokes channel and parses result map correctly',
+      () async {
+        _responses['stopMultiCamVideoRecording'] = kValidStopResponse;
+
+        final result = await VGCameraSession.stopMultiCamVideoRecording();
+
+        expect(_callCount('stopMultiCamVideoRecording'), equals(1),
+            reason: 'must fire exactly one stopMultiCamVideoRecording channel call');
+        expect(result, isNotNull,
+            reason: 'must return non-null map for valid native response');
+        expect(result!['filePath'],     equals(kVideoPath));
+        expect(result['durationSeconds'], equals(10.5));
+        expect(result['width'],          equals(1080));
+        expect(result['height'],         equals(1920));
+        expect(result['framesOffered'],  equals(315));
+        expect(result['framesAppended'], equals(315));
+        expect(result['framesDroppedWriterNotReady'], equals(0));
+        expect(result['writerStatus'],   equals(2));
+        expect(result['fileSizeBytes'],  equals(15728640));
+      },
+    );
+
+    test(
+      'MC17-5 stopMultiCamVideoRecording returns null when native returns null',
+      () async {
+        _responses['stopMultiCamVideoRecording'] = null;
+
+        final result = await VGCameraSession.stopMultiCamVideoRecording();
+
+        expect(result, isNull,
+            reason: 'null native response must yield null result map');
+      },
+    );
+
+    test(
+      'MC17-6 stopMultiCamVideoRecording returns null (does not rethrow) on PlatformException',
+      () async {
+        _responses['stopMultiCamVideoRecording'] = PlatformException(
+          code: 'NOT_RECORDING',
+          message: 'No recording is currently active',
+        );
+
+        final result = await VGCameraSession.stopMultiCamVideoRecording();
+
+        expect(result, isNull,
+            reason: 'PlatformException must be caught and null returned, not rethrown');
+      },
+    );
+  });
 }

@@ -270,6 +270,49 @@ static inline VGMCRDLayoutConfig VGMCRDDefaultLayoutConfig(void) {
                 completion:(void (^)(NSDictionary * _Nullable result,
                                      FlutterError * _Nullable error))completion;
 
+
+// ─── MC-17: Video-only recording ──────────────────────────────────────────────
+
+/// Starts video-only recording of the composited preview buffer to [path].
+/// Audio is not included. Preview must be actively rendering frames.
+///
+/// ## Thread safety
+/// Dispatches all setup onto `_renderQ` to serialize with the render/append path.
+/// The completion block is always dispatched to the **main thread**.
+///
+/// ## Error codes (FlutterError)
+///   `NOT_RENDERING`    — no frames have been rendered yet (preview not active)
+///   `ALREADY_RECORDING`— a recording is already active
+///   `DISK_SPACE`       — less than 200 MB free disk space
+///   `WRITER_INIT_FAIL` — AVAssetWriter creation failed
+///
+/// @param path       Writable absolute file path for .mp4 output.
+/// @param completion Called on the main thread with nil on success, or FlutterError.
+- (void)startVideoRecordingToPath:(NSString *)path
+                       completion:(void (^)(FlutterError * _Nullable error))completion;
+
+/// Stops video-only recording and returns diagnostic metrics.
+///
+/// ## Thread safety
+/// Dispatches finalization onto `_renderQ`. The completion block is always
+/// dispatched to the **main thread**.
+///
+/// ## Error codes (FlutterError)
+///   `NOT_RECORDING` — no recording is currently active
+///
+/// ## Result map keys
+///   `filePath`                    — NSString: output file path
+///   `durationSeconds`             — NSNumber (double): recording duration
+///   `width`                       — NSNumber (int): output frame width
+///   `height`                      — NSNumber (int): output frame height
+///   `framesOffered`               — NSNumber (int): total frames offered to writer
+///   `framesAppended`              — NSNumber (int): frames successfully appended
+///   `framesDroppedWriterNotReady` — NSNumber (int): frames dropped (writer backpressure)
+///   `writerStatus`                — NSNumber (int): AVAssetWriterStatus at finish
+///   `fileSizeBytes`               — NSNumber (int): file size in bytes after finalization
+- (void)stopVideoRecordingWithCompletion:(void (^)(NSDictionary * _Nullable result,
+                                                    FlutterError * _Nullable error))completion;
+
 @end
 
 NS_ASSUME_NONNULL_END

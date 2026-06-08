@@ -75,8 +75,10 @@
 #import "VanguardMultiCamRenderDiagnostic.h"
 #import "VanguardMultiCamPairedFrame.h"
 #import "VGDualCameraLayoutMath.h"
+#import <AVFoundation/AVFoundation.h>  // MC-17: AVAssetWriter
 #import <CoreImage/CoreImage.h>
 #import <CoreVideo/CoreVideo.h>
+#import <CoreMedia/CoreMedia.h>        // MC-17: CMTime, CMSampleBuffer
 #import <ImageIO/ImageIO.h>
 #import <QuartzCore/QuartzCore.h>  // CACurrentMediaTime
 #import <os/lock.h>
@@ -130,6 +132,21 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     }
     return pool; // +1 from Create — caller owns
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - MC-17: Recording state enum
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Declared at file scope so the enum type is visible in both the ivar block
+// and method bodies. (NS_ENUM inside @implementation {} ivar block is not
+// legal in Objective-C.)
+
+typedef NS_ENUM(NSInteger, VGMCRecordingState) {
+    VGMCRecordingStateIdle      = 0,
+    VGMCRecordingStateStarting  = 1,
+    VGMCRecordingStateRecording = 2,
+    VGMCRecordingStateStopping  = 3,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Implementation
@@ -207,6 +224,29 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     // Drives PiP or split-screen composition in _renderPairedFrame:
     // Set once before source starts; read exclusively on renderQ.
     VGMCRDLayoutConfig _layoutConfig;
+
+    // ── MC-17: Video-only recording ──────────────────────────────────────────
+    //
+    // All writer state is accessed exclusively on the serial _renderQ.
+    // No lock needed — _renderQ serializes all access.
+    //
+    // State machine:
+    //   VGMCRecordingStateIdle      — not recording
+    //   VGMCRecordingStateStarting  — writer created; waiting for first renderable frame
+    //   VGMCRecordingStateRecording — actively appending frames
+    //   VGMCRecordingStateStopping  — markAsFinished called, awaiting finishWriting
+    AVAssetWriter          *_assetWriter;
+    AVAssetWriterInput     *_videoWriterInput;
+    AVAssetWriterInputPixelBufferAdaptor *_pixelBufferAdaptor;
+    NSString               *_recordingOutputPath;
+    BOOL                    _mcRecordingSessionStarted;  // startSessionAtSourceTime: called
+    int32_t                 _framesOfferedToWriter;
+    int32_t                 _framesAppended;
+    int32_t                 _framesDroppedWriterNotReady;
+    CFAbsoluteTime          _recordingStartTime;         // CFAbsoluteTimeGetCurrent() at first append
+
+    // Recording state — written/read exclusively on _renderQ.
+    VGMCRecordingState _mcRecordingState;
 }
 
 @synthesize renderedFrames      = _renderedFrames;
@@ -250,6 +290,18 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     _textureId           = 0;
     _textureRegistered   = NO;
     _layoutConfig        = VGMCRDDefaultLayoutConfig();
+
+    // MC-17: recording state
+    _mcRecordingState             = VGMCRecordingStateIdle;
+    _assetWriter                  = nil;
+    _videoWriterInput             = nil;
+    _pixelBufferAdaptor           = nil;
+    _recordingOutputPath          = nil;
+    _mcRecordingSessionStarted    = NO;
+    _framesOfferedToWriter        = 0;
+    _framesAppended               = 0;
+    _framesDroppedWriterNotReady  = 0;
+    _recordingStartTime           = 0;
 
     // Pre-warm the shared CIContext (dispatch_once is lazy).
     // Doing this here avoids a first-frame spike.
@@ -536,9 +588,39 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     // Set stopped flag immediately so any in-flight renderQ work can check it.
     _stopped = YES;
 
-    // Synchronously drain the renderQ so we can safely read metrics afterward.
-    // dispatch_sync on the serial renderQ guarantees all enqueued blocks complete.
+    // MC-17: Finalize any active recording before draining the renderQ.
+    // Must run on _renderQ to serialize with any in-flight append.
     dispatch_sync(_renderQ, ^{
+        if (self->_mcRecordingState == VGMCRecordingStateRecording ||
+            self->_mcRecordingState == VGMCRecordingStateStarting) {
+
+            NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] stop: force-finalizing active recording.");
+            self->_mcRecordingState = VGMCRecordingStateStopping;
+
+            AVAssetWriter      *writer = self->_assetWriter;
+            AVAssetWriterInput *input  = self->_videoWriterInput;
+
+            if (writer && writer.status == AVAssetWriterStatusWriting) {
+                [input markAsFinished];
+                // Bounded wait — prevents hanging teardown if mediaserverd stalls.
+                dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                [writer finishWritingWithCompletionHandler:^{
+                    dispatch_semaphore_signal(sem);
+                }];
+                long rc = dispatch_semaphore_wait(
+                    sem, dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC));
+                if (rc != 0) {
+                    NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] stop: "
+                          "finishWriting did not complete within 3s — file may be truncated.");
+                }
+            }
+
+            self->_assetWriter        = nil;
+            self->_videoWriterInput   = nil;
+            self->_pixelBufferAdaptor = nil;
+            self->_mcRecordingState   = VGMCRecordingStateIdle;
+        }
+
         // Release last composited buffer under lock — no more raster-thread reads
         // are possible after doUnregisterTexture (called by plugin after stop).
         // Locking here is defensive: ensures correct pairing with copyPixelBuffer.
@@ -573,6 +655,253 @@ _VGMCRDCreatePool(size_t width, size_t height) {
         @"outputWidth"         : @(_outputWidth),
         @"outputHeight"        : @(_outputHeight),
     };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - MC-17: Video Recording
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Starts video-only recording of the composited preview buffer.
+///
+/// All writer setup runs on _renderQ to serialize with the render/append path.
+/// completion: is dispatched to main thread.
+- (void)startVideoRecordingToPath:(NSString *)path
+                       completion:(void (^)(FlutterError * _Nullable error))completion {
+
+    dispatch_async(_renderQ, ^{
+
+        // Guard: at least one frame must have been rendered.
+        if (self->_renderedFrames <= 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion([FlutterError errorWithCode:@"NOT_RENDERING"
+                                               message:@"No frames rendered yet — start preview first"
+                                               details:nil]);
+            });
+            return;
+        }
+
+        // Guard: no recording already active.
+        if (self->_mcRecordingState != VGMCRecordingStateIdle) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion([FlutterError errorWithCode:@"ALREADY_RECORDING"
+                                               message:@"A recording is already active"
+                                               details:nil]);
+            });
+            return;
+        }
+
+        // ── Disk space pre-flight (200 MB minimum, matching single-camera policy) ──
+        NSError *fsErr = nil;
+        NSDictionary *attrs = [[NSFileManager defaultManager]
+            attributesOfFileSystemForPath:[path stringByDeletingLastPathComponent]
+                                    error:&fsErr];
+        int64_t freeBytes = [attrs[NSFileSystemFreeSize] longLongValue];
+        if (fsErr || freeBytes < 200 * 1024 * 1024) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion([FlutterError errorWithCode:@"DISK_SPACE"
+                                               message:@"Insufficient disk space (< 200 MB)"
+                                               details:nil]);
+            });
+            return;
+        }
+
+        // ── AVAssetWriter setup ──────────────────────────────────────────────────
+        NSError *writerErr = nil;
+        NSURL *outputURL = [NSURL fileURLWithPath:path];
+        AVAssetWriter *writer = [AVAssetWriter assetWriterWithURL:outputURL
+                                                         fileType:AVFileTypeMPEG4
+                                                            error:&writerErr];
+        if (writerErr || !writer) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion([FlutterError errorWithCode:@"WRITER_INIT_FAIL"
+                                               message:writerErr.localizedDescription ?: @"AVAssetWriter creation failed"
+                                               details:nil]);
+            });
+            return;
+        }
+
+        // Use current output dimensions if known; fall back to 1080×1920.
+        int32_t w = (self->_outputWidth  > 0) ? self->_outputWidth  : 1080;
+        int32_t h = (self->_outputHeight > 0) ? self->_outputHeight : 1920;
+
+        // ── Video input — H.264, real-time ───────────────────────────────────────
+        NSDictionary *videoSettings = @{
+            AVVideoCodecKey  : AVVideoCodecTypeH264,
+            AVVideoWidthKey  : @(w),
+            AVVideoHeightKey : @(h),
+            AVVideoCompressionPropertiesKey : @{
+                AVVideoAverageBitRateKey         : @(10000000),   // 10 Mbps
+                AVVideoMaxKeyFrameIntervalKey    : @30,           // 1 keyframe/sec at 30 fps
+                AVVideoExpectedSourceFrameRateKey: @30,
+                AVVideoAllowFrameReorderingKey   : @NO,
+            },
+        };
+        AVAssetWriterInput *videoInput =
+            [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
+                                              outputSettings:videoSettings];
+        videoInput.expectsMediaDataInRealTime = YES;
+
+        // ── Pixel buffer adaptor — BGRA, matches pool format ─────────────────────
+        NSDictionary *pbAttrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey     : @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferWidthKey               : @(w),
+            (id)kCVPixelBufferHeightKey              : @(h),
+            (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+            (id)kCVPixelBufferMetalCompatibilityKey  : @YES,
+        };
+        AVAssetWriterInputPixelBufferAdaptor *adaptor =
+            [AVAssetWriterInputPixelBufferAdaptor
+                assetWriterInputPixelBufferAdaptorWithAssetWriterInput:videoInput
+                                           sourcePixelBufferAttributes:pbAttrs];
+
+        if (![writer canAddInput:videoInput]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion([FlutterError errorWithCode:@"WRITER_INIT_FAIL"
+                                               message:@"Cannot add video input to AVAssetWriter"
+                                               details:nil]);
+            });
+            return;
+        }
+        [writer addInput:videoInput];
+
+        if (![writer startWriting]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion([FlutterError errorWithCode:@"WRITER_INIT_FAIL"
+                                               message:writer.error.localizedDescription ?: @"startWriting failed"
+                                               details:nil]);
+            });
+            return;
+        }
+
+        // ── Activate recording state ─────────────────────────────────────────────
+        // State is set to Starting; transitions to Recording on first appended frame.
+        self->_assetWriter                 = writer;
+        self->_videoWriterInput            = videoInput;
+        self->_pixelBufferAdaptor          = adaptor;
+        self->_recordingOutputPath         = [path copy];
+        self->_mcRecordingSessionStarted   = NO;
+        self->_framesOfferedToWriter       = 0;
+        self->_framesAppended              = 0;
+        self->_framesDroppedWriterNotReady = 0;
+        self->_recordingStartTime          = 0;
+        self->_mcRecordingState            = VGMCRecordingStateStarting;
+
+        NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] startVideoRecordingToPath: "
+              "ready. outputDims=%dx%d path=%@", w, h, path);
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            completion(nil);  // success
+        });
+    });
+}
+
+/// Stops video-only recording and returns diagnostic metrics.
+///
+/// Dispatches finalization onto _renderQ. completion: is dispatched to main thread.
+- (void)stopVideoRecordingWithCompletion:(void (^)(NSDictionary * _Nullable result,
+                                                    FlutterError * _Nullable error))completion {
+
+    dispatch_async(_renderQ, ^{
+
+        // Guard: must be actively recording (or in starting state).
+        if (self->_mcRecordingState != VGMCRecordingStateRecording &&
+            self->_mcRecordingState != VGMCRecordingStateStarting) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(nil, [FlutterError errorWithCode:@"NOT_RECORDING"
+                                                    message:@"No recording is currently active"
+                                                    details:nil]);
+            });
+            return;
+        }
+
+        // Transition to stopping — prevents further appends in _renderPairedFrame:.
+        self->_mcRecordingState = VGMCRecordingStateStopping;
+
+        // Capture state before finalization.
+        AVAssetWriter      *writer     = self->_assetWriter;
+        AVAssetWriterInput *input      = self->_videoWriterInput;
+        NSString           *outputPath = self->_recordingOutputPath;
+        int32_t framesOffered  = self->_framesOfferedToWriter;
+        int32_t framesAppended = self->_framesAppended;
+        int32_t framesDropped  = self->_framesDroppedWriterNotReady;
+        int32_t outWidth       = self->_outputWidth;
+        int32_t outHeight      = self->_outputHeight;
+        CFAbsoluteTime startTime = self->_recordingStartTime;
+
+        // Handle the case where recording was started but no frame was ever appended.
+        if (!writer || writer.status != AVAssetWriterStatusWriting) {
+            self->_assetWriter        = nil;
+            self->_videoWriterInput   = nil;
+            self->_pixelBufferAdaptor = nil;
+            self->_mcRecordingState   = VGMCRecordingStateIdle;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                completion(nil, [FlutterError errorWithCode:@"NOT_RECORDING"
+                                                    message:@"Writer is not in writing state"
+                                                    details:nil]);
+            });
+            return;
+        }
+
+        // Finalize the writer.
+        [input markAsFinished];
+        [writer finishWritingWithCompletionHandler:^{
+            // finishWriting fires on an arbitrary thread — re-dispatch to _renderQ
+            // to safely access and clear ivars (matches single-camera FIX-B pattern).
+            dispatch_async(self->_renderQ, ^{
+                NSError *writerError = writer.error;
+                AVAssetWriterStatus finalStatus = writer.status;
+
+                // Compute duration.
+                double durationSeconds = (startTime > 0)
+                    ? (CFAbsoluteTimeGetCurrent() - startTime)
+                    : 0.0;
+
+                // Compute file size.
+                NSError *sizeErr = nil;
+                NSDictionary *fileAttrs = [[NSFileManager defaultManager]
+                    attributesOfItemAtPath:outputPath error:&sizeErr];
+                int64_t fileSizeBytes = [fileAttrs[NSFileSize] longLongValue];
+
+                // Clear ivars.
+                self->_assetWriter        = nil;
+                self->_videoWriterInput   = nil;
+                self->_pixelBufferAdaptor = nil;
+                self->_mcRecordingState   = VGMCRecordingStateIdle;
+
+                NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] stopVideoRecording: "
+                      "done. status=%ld duration=%.2fs offered=%d appended=%d dropped=%d "
+                      "fileSize=%lld error=%@",
+                      (long)finalStatus, durationSeconds,
+                      framesOffered, framesAppended, framesDropped,
+                      (long long)fileSizeBytes,
+                      writerError.localizedDescription);
+
+                if (writerError) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        completion(nil, [FlutterError errorWithCode:@"WRITER_FINISH_FAIL"
+                                                            message:writerError.localizedDescription
+                                                            details:nil]);
+                    });
+                    return;
+                }
+
+                NSDictionary *resultMap = @{
+                    @"filePath"                    : outputPath ?: @"",
+                    @"durationSeconds"             : @(durationSeconds),
+                    @"width"                       : @(outWidth),
+                    @"height"                      : @(outHeight),
+                    @"framesOffered"               : @(framesOffered),
+                    @"framesAppended"              : @(framesAppended),
+                    @"framesDroppedWriterNotReady" : @(framesDropped),
+                    @"writerStatus"                : @((NSInteger)finalStatus),
+                    @"fileSizeBytes"               : @(fileSizeBytes),
+                };
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    completion(resultMap, nil);
+                });
+            });
+        }];
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -808,6 +1137,61 @@ _VGMCRDCreatePool(size_t width, size_t height) {
     if (_outputWidth == 0) {
         _outputWidth  = (int32_t)primW;
         _outputHeight = (int32_t)primH;
+    }
+
+    // ── 7a. MC-17: Append to video writer (before buffer swap) ────────────────
+    //
+    // outputBuf is still exclusively owned by this scope (+1 from pool).
+    // appendPixelBuffer:withPresentationTime: is synchronous — it copies pixel
+    // data into the encoder pipeline and returns before the next line executes.
+    // We therefore do NOT need an extra CVPixelBufferRetain here.
+    //
+    // Insertion point: after CIContext render is complete; before _lastCompositedBuffer
+    // swap so the buffer is still solely in our scope.
+    if (_mcRecordingState == VGMCRecordingStateStarting ||
+        _mcRecordingState == VGMCRecordingStateRecording) {
+
+        _framesOfferedToWriter++;
+        CMTime pts = frame.frontPTS;  // consistent single PTS source
+
+        if (!_videoWriterInput.isReadyForMoreMediaData) {
+            // Writer backpressure — skip this frame, preserve preview.
+            _framesDroppedWriterNotReady++;
+            NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] writer not ready — drop frame "
+                  "(offered=%d dropped=%d)",
+                  _framesOfferedToWriter, _framesDroppedWriterNotReady);
+        } else {
+            // First frame: start the writer session at this hardware PTS.
+            // Matches VanguardCameraMediaSource pattern (deferred start).
+            if (!_mcRecordingSessionStarted) {
+                [_assetWriter startSessionAtSourceTime:pts];
+                _mcRecordingSessionStarted = YES;
+                _recordingStartTime        = CFAbsoluteTimeGetCurrent();
+                _mcRecordingState          = VGMCRecordingStateRecording;
+                NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] session started at hardware PTS.");
+            }
+
+            BOOL ok = [_pixelBufferAdaptor appendPixelBuffer:outputBuf
+                                        withPresentationTime:pts];
+            if (ok) {
+                _framesAppended++;
+            } else {
+                NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] appendPixelBuffer failed. "
+                      "writerStatus=%ld error=%@",
+                      (long)_assetWriter.status,
+                      _assetWriter.error.localizedDescription);
+            }
+        }
+
+        // Detect writer failure (e.g. disk full mid-recording).
+        if (_assetWriter.status == AVAssetWriterStatusFailed) {
+            NSLog(@"[VanguardMultiCamRenderDiagnostic][MC-17] writer FAILED: %@",
+                  _assetWriter.error.localizedDescription);
+            _assetWriter        = nil;
+            _videoWriterInput   = nil;
+            _pixelBufferAdaptor = nil;
+            _mcRecordingState   = VGMCRecordingStateIdle;
+        }
     }
 
     // ── 8. Swap _lastCompositedBuffer under lock (MC-10) ──────────────────────
