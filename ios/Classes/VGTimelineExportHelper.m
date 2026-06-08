@@ -1,11 +1,17 @@
 // VGTimelineExportHelper.m
-// vanguard_media_engine — Phase 7 Stage 7.5E / Phase 7.12 / Phase 8.6
+// vanguard_media_engine — Phase 7 Stage 7.5E / Phase 7.12 / Phase 8.6 / Phase 8.14A
 //
 // Offline timeline export helper implementation.
 //
 // Implements the full pull-mode export graph for a VGTimelineCompositorNode:
 //   VGTimelineCompositorNode → VGVideoEncoderSinkNode          (no overlays)
 //   VGTimelineCompositorNode → VGOverlayNode → VGVideoEncoderSinkNode  (with overlays)
+//
+// Phase 8.14A: post-pass audio sidecar muxing via VGAudioExportMuxer.
+//   When audioSidecar is non-nil:
+//     1. Video-only export graph writes to {outputPath}.video_tmp.mp4
+//     2. VGAudioExportMuxer muxes temp video + sidecar audio → final outputPath.
+//     3. Temp file deleted on success; both temp + partial output deleted on failure.
 //
 // Key architectural invariants:
 //   - This file never touches VanguardGraphRuntime or the playback compositor.
@@ -29,6 +35,9 @@
 //   VGExportFileSourceNode, VGTimelineCompositorSmokeTest.
 
 #import "VGTimelineExportHelper.h"
+
+// Phase 8.14A: post-pass audio sidecar muxer.
+#import "VGAudioExportMuxer.h"
 
 // ─── Stage 7.5A compositor ───────────────────────────────────────────────────
 #import "VGTimelineCompositorNode.h"
@@ -108,10 +117,14 @@ static os_log_t sExportHelperLog;
                        bitrateBps:bitrateBps
                            canvas:nil
                          overlays:nil
+                      audioSidecar:nil
                        completion:completion];
 }
 
-// ─── Phase 8.6 9-parameter implementation ─────────────────────────────────────
+// ─── Phase 8.6 9-parameter forwarder ───────────────────────────────────────────────
+//
+// Phase 8.14A: now forwards to the 10-parameter method with audioSidecar:nil.
+// No behavioral change for existing callers.
 
 + (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
                     transitions:(NSArray<NSDictionary *> *)transitions
@@ -127,7 +140,57 @@ static os_log_t sExportHelperLog;
                                          NSTimeInterval durationSeconds,
                                          NSError * _Nullable error))completion
 {
+    [self exportTimelineWithClips:clips
+                      transitions:transitions
+                       outputPath:outputPath
+                            width:width
+                           height:height
+                              fps:fps
+                       bitrateBps:bitrateBps
+                           canvas:canvas
+                         overlays:overlays
+                      audioSidecar:nil
+                       completion:completion];
+}
+
+// ─── Phase 8.14A 10-parameter implementation ────────────────────────────────────────
+
++ (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
+                    transitions:(NSArray<NSDictionary *> *)transitions
+                     outputPath:(NSString *)outputPath
+                          width:(NSInteger)width
+                         height:(NSInteger)height
+                            fps:(NSInteger)fps
+                     bitrateBps:(NSInteger)bitrateBps
+                         canvas:(nullable NSDictionary *)canvas
+                       overlays:(nullable NSArray<NSDictionary *> *)overlays
+                    audioSidecar:(nullable VGAudioSidecarPlan *)audioSidecar
+                     completion:(void (^)(BOOL success,
+                                         NSString * _Nullable outputPath,
+                                         NSTimeInterval durationSeconds,
+                                         NSError * _Nullable error))completion
+{
     NSParameterAssert(completion != nil);
+
+    // ── 0. Phase 8.14A: determine temp vs final output path ───────────────────
+    //
+    // When audioSidecar is non-nil:
+    //   - The video-only export graph writes to videoWritePath = {outputPath}.video_tmp.mp4
+    //   - After the video graph completes, VGAudioExportMuxer muxes
+    //     videoWritePath + sidecar audio → finalOutputPath.
+    //
+    // When audioSidecar is nil:
+    //   - videoWritePath == outputPath (existing behavior, unchanged).
+    BOOL hasSidecar = (audioSidecar != nil && audioSidecar.tracks.count > 0);
+    NSString *videoWritePath = hasSidecar
+        ? [outputPath stringByAppendingString:@".video_tmp.mp4"]
+        : outputPath;
+
+    if (hasSidecar) {
+        os_log(sExportHelperLog,
+               "[8.14A] audio sidecar present — video will write to temp: %{public}@",
+               videoWritePath.lastPathComponent);
+    }
 
     // ── 1. Input validation ───────────────────────────────────────────────────
 
@@ -148,8 +211,7 @@ static os_log_t sExportHelperLog;
             NSLocalizedDescriptionKey: @"outputPath must not be empty"
         }]);
         return;
-    }
-    if (width <= 0 || height <= 0 || fps <= 0 || bitrateBps <= 0) {
+    }    if (width <= 0 || height <= 0 || fps <= 0 || bitrateBps <= 0) {
         completion(NO, nil, 0.0,
             [NSError errorWithDomain:@"VGTimelineExportHelper"
                                code:3
@@ -167,13 +229,14 @@ static os_log_t sExportHelperLog;
     BOOL shouldInsertOverlayNode = (overlays != nil && overlays.count > 0);
 
     os_log(sExportHelperLog,
-           "[8.6] exportTimeline: clips=%lu width=%ld height=%ld fps=%ld bitrate=%ld overlays=%lu",
+           "[8.14A] exportTimeline: clips=%lu width=%ld height=%ld fps=%ld bitrate=%ld overlays=%lu sidecar=%@",
            (unsigned long)clips.count, (long)width, (long)height,
-           (long)fps, (long)bitrateBps, (unsigned long)(overlays ? overlays.count : 0));
+           (long)fps, (long)bitrateBps, (unsigned long)(overlays ? overlays.count : 0),
+           hasSidecar ? @"YES" : @"NO");
 
-    // ── 2. Build output URL ───────────────────────────────────────────────────
+    // ── 2. Build output URL (pointing to videoWritePath) ──────────────────────
 
-    NSURL *outputURL = [NSURL fileURLWithPath:outputPath];
+    NSURL *outputURL = [NSURL fileURLWithPath:videoWritePath];
 
     // ── 3. Construct VGExportProfile (MOD-1, MOD-2) ──────────────────────────
     //
@@ -518,6 +581,11 @@ static os_log_t sExportHelperLog;
     VGExecutionPlan          *strongPlan        = plan;
     NSDictionary<NSString *, id<VGNode>> *strongNodeMap = [nodeMap copy];
 
+    // Phase 8.14A: capture sidecar state for the scheduler completion block.
+    BOOL        capturedHasSidecar    = hasSidecar;
+    NSString   *capturedVideoWrite    = videoWritePath;
+    VGAudioSidecarPlan *capturedSidecar = audioSidecar;
+
     dispatch_group_notify(prepGroup, prepQueue, ^{
         NSError *prepError = firstPrepareError;
 
@@ -565,11 +633,46 @@ static os_log_t sExportHelperLog;
                     [strongSink finalizeExportWithError:&finalizeErr];
 
                 if (manifest && !finalizeErr) {
-                    NSTimeInterval duration = manifest.durationSeconds;
+                    NSTimeInterval videoDuration = manifest.durationSeconds;
                     os_log(sExportHelperLog,
-                           "[8.6] export finalized: %.2fs %lld bytes",
-                           duration, (long long)manifest.fileSizeBytes);
-                    completion(YES, outputPath, duration, nil);
+                           "[8.14A] video finalized: %.2fs %lld bytes",
+                           videoDuration, (long long)manifest.fileSizeBytes);
+
+                    if (capturedHasSidecar) {
+                        // ── Phase 8.14A: post-pass audio mux ───────────────────
+                        //
+                        // The video-only MP4 is now at capturedVideoWrite.
+                        // Invoke VGAudioExportMuxer to combine it with the
+                        // sidecar audio track and write the final outputPath.
+                        os_log(sExportHelperLog,
+                               "[8.14A] starting post-pass audio mux");
+                        VGAudioExportMuxer *muxer =
+                            [[VGAudioExportMuxer alloc]
+                                initWithVideoTempPath:capturedVideoWrite
+                                        audioSidecar:capturedSidecar
+                                     finalOutputPath:outputPath];
+
+                        [muxer startMuxWithCompletion:^(BOOL muxOK,
+                                                       NSTimeInterval muxDuration,
+                                                       NSError * _Nullable muxErr) {
+                            if (muxOK) {
+                                os_log(sExportHelperLog,
+                                       "[8.14A] post-pass mux complete: %.2fs",
+                                       muxDuration);
+                                completion(YES, outputPath, muxDuration, nil);
+                            } else {
+                                os_log_error(sExportHelperLog,
+                                             "[8.14A] post-pass mux failed: %{public}@",
+                                             muxErr.localizedDescription);
+                                completion(NO, nil, 0.0, muxErr);
+                            }
+                        }];
+
+                    } else {
+                        // No sidecar — deliver the video-only result directly.
+                        completion(YES, outputPath, videoDuration, nil);
+                    }
+
                 } else {
                     // Finalization failed — sink is implicitly invalidated by
                     // cancelWriting inside VGVideoEncoderSinkNode.invalidate.
@@ -610,7 +713,7 @@ static os_log_t sExportHelperLog;
 
         // Start the pull loop asynchronously on the scheduler's internal queue.
         [scheduler startExport];
-        os_log(sExportHelperLog, "[8.6] VGExportScheduler started");
+        os_log(sExportHelperLog, "[8.14A] VGExportScheduler started");
     });
 }
 

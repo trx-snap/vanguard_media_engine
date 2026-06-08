@@ -1,5 +1,5 @@
 // VGTimelineExportHelper.h
-// vanguard_media_engine — Phase 7 Stage 7.5E / Phase 7.12
+// vanguard_media_engine — Phase 7 Stage 7.5E / Phase 7.12 / Phase 8.14A
 //
 // Offline timeline export helper for the Phase 7 pipeline.
 //
@@ -25,7 +25,9 @@
 //   - No VanguardGraphRuntime, VanguardMetalRenderer, VGGraphSchedulerV2.
 //   - No Flutter textures, no CADisplayLink, no camera path.
 //   - No ConnectsApp, no UMF contract changes.
-//   - No audio tracks.
+//   - No audio tracks. (Note: Phase 8.14A adds post-pass audio muxing via
+//     VGAudioExportMuxer AFTER the video-only export graph completes. The
+//     export graph itself remains audio-free.)
 //
 // Phase 7 Stage 7.5E: dev export proof only. No production API surface.
 // PLATFORM: AVFoundation, VideoToolbox (via VGVideoEncoderSinkNode).
@@ -48,10 +50,30 @@
 // forwards to the new method with canvas:nil overlays:nil.
 //
 // Phase 8.6: Pass-through only. No rendering. No Metal. No CoreImage.
+//
+// ── Phase 8.14A Audio Sidecar Post-Pass Muxer ────────────────────────────────
+//
+// Phase 8.14A adds a new 10-parameter method that accepts an optional
+// VGAudioSidecarPlan.
+//
+// When audioSidecar is non-nil:
+//   1. The video-only export graph writes to a temporary path:
+//      {outputPath}.video_tmp.mp4
+//   2. VGAudioExportMuxer combines the temp video + sidecar audio track into
+//      the final outputPath using AVMutableComposition + AVAssetExportSession.
+//   3. The temp file is deleted on success; both temp and partial output are
+//      deleted on any failure.
+//
+// When audioSidecar is nil:
+//   Existing behavior unchanged: video-only export writes directly to outputPath.
+//
+// The 7-parameter and 9-parameter methods forward with audioSidecar:nil.
+// No behavioral change for existing callers.
 
 #pragma once
 
 #import <Foundation/Foundation.h>
+#import <UMF/VGAudioSidecarPlan.h>
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -91,7 +113,7 @@ NS_ASSUME_NONNULL_BEGIN
 ///                     On failure: success=NO, error describes the failure.
 ///
 /// Forwards to exportTimelineWithClips:transitions:outputPath:width:height:fps:bitrateBps:
-/// canvas:overlays:completion: with canvas:nil overlays:nil.
+/// canvas:overlays:audioSidecar:completion: with canvas:nil overlays:nil audioSidecar:nil.
 + (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
                     transitions:(NSArray<NSDictionary *> *)transitions
                      outputPath:(NSString *)outputPath
@@ -130,6 +152,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// @param overlays     Optional array of overlay descriptor dictionaries.
 ///                     If nil or empty, no VGOverlayNode is inserted.
 /// @param completion   Invoked exactly once on a background queue upon completion.
+///
+/// Forwards to exportTimelineWithClips:…:canvas:overlays:audioSidecar:completion:
+/// with audioSidecar:nil.
 + (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
                     transitions:(NSArray<NSDictionary *> *)transitions
                      outputPath:(NSString *)outputPath
@@ -139,6 +164,48 @@ NS_ASSUME_NONNULL_BEGIN
                      bitrateBps:(NSInteger)bitrateBps
                          canvas:(nullable NSDictionary *)canvas
                        overlays:(nullable NSArray<NSDictionary *> *)overlays
+                     completion:(void (^)(BOOL success,
+                                         NSString * _Nullable outputPath,
+                                         NSTimeInterval durationSeconds,
+                                         NSError * _Nullable error))completion;
+
+/// Perform offline pull-mode timeline export with optional overlay and audio sidecar support.
+///
+/// Phase 8.14A variant. Accepts an optional VGAudioSidecarPlan in addition to
+/// canvas and overlays.
+///
+/// When audioSidecar is non-nil:
+///   1. The video-only export graph writes to a temporary path:
+///        {outputPath}.video_tmp.mp4
+///   2. VGAudioExportMuxer post-pass muxes the temp video + first audio track
+///      from audioSidecar into the final outputPath.
+///   3. Temp file deleted on success; both temp and partial output deleted on failure.
+///
+/// When audioSidecar is nil:
+///   Existing behavior unchanged: video-only export writes directly to outputPath.
+///
+/// @param clips        NSArray of clip descriptor dictionaries.
+/// @param transitions  NSArray of transition descriptor dictionaries (may be empty).
+/// @param outputPath   Absolute path for the output MP4 file.
+/// @param width        Video width in pixels (must be > 0).
+/// @param height       Video height in pixels (must be > 0).
+/// @param fps          Frame rate (must be > 0).
+/// @param bitrateBps   Target bitrate in bits per second (must be > 0).
+/// @param canvas       Optional canvas descriptor dictionary.
+/// @param overlays     Optional array of overlay descriptor dictionaries.
+/// @param audioSidecar Optional VGAudioSidecarPlan. Phase 8.14A: first track used.
+///                     If nil, video-only export is performed (existing behavior).
+/// @param completion   Invoked exactly once on a background queue upon completion.
++ (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
+                    transitions:(NSArray<NSDictionary *> *)transitions
+                     outputPath:(NSString *)outputPath
+                          width:(NSInteger)width
+                         height:(NSInteger)height
+                            fps:(NSInteger)fps
+                     bitrateBps:(NSInteger)bitrateBps
+                         canvas:(nullable NSDictionary *)canvas
+                       overlays:(nullable NSArray<NSDictionary *> *)overlays
+                    audioSidecar:(nullable VGAudioSidecarPlan *)audioSidecar
                      completion:(void (^)(BOOL success,
                                          NSString * _Nullable outputPath,
                                          NSTimeInterval durationSeconds,

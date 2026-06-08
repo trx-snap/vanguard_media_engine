@@ -58,8 +58,11 @@ export 'vg_editor_export_result.dart';
 // Phase 8: canvas and overlay descriptors
 export 'vg_canvas_descriptor.dart';
 export 'vg_overlay_descriptor.dart';
+// Phase 8.14A: audio sidecar export muxer descriptor.
+export 'vg_audio_sidecar_plan.dart';
 // Phase 7.20D: Dart model for reverse sidecar asset state.
 export 'vg_reverse_sidecar_status.dart';
+
 
 const String _libName = 'vanguard_media_engine';
 

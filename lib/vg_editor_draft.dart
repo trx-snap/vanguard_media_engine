@@ -66,6 +66,14 @@
 //   - All internal draft reconstruction calls pass canvas: canvas so the canvas
 //     reference survives trim, split, freeze, reverse, and reorder operations.
 //
+// Phase 8.14A additions (additive bridge):
+//   - VGEditorDraft now carries an optional VGAudioSidecarPlan? audioSidecarPlan.
+//   - Defaults to null; legacy maps without 'audioSidecar' produce null here.
+//   - toMap() emits 'audioSidecar' only when audioSidecarPlan != null.
+//   - fromMap() parses 'audioSidecar' if present; otherwise leaves null.
+//   - All internal draft reconstruction calls pass audioSidecarPlan through so
+//     it survives trim, split, freeze, reverse, and reorder operations.
+//
 // Consumed by VGEditorController (Stage 7.7) to coordinate channel calls.
 //
 // Serialisation:
@@ -79,10 +87,13 @@
 //     'fps': int,
 //   }
 
+import 'vg_audio_sidecar_plan.dart';
 import 'vg_canvas_descriptor.dart';
 import 'vg_clip_descriptor.dart';
 import 'vg_overlay_descriptor.dart';
 import 'vg_transition_descriptor.dart';
+
+export 'vg_audio_sidecar_plan.dart';
 
 /// An immutable, non-destructive composition recipe for a Phase 7 timeline
 /// editing session.
@@ -126,6 +137,11 @@ final class VGEditorDraft {
   /// [overlays] is an optional list of [VGOverlayDescriptor] elements (Phase 8.3
   /// additive bridge). Defaults to an empty list. Missing overlays in legacy
   /// drafts are safely ignored by [fromMap].
+  ///
+  /// [audioSidecarPlan] is an optional [VGAudioSidecarPlan] (Phase 8.14A
+  /// additive bridge). Defaults to null. When non-null, a single sidecar audio
+  /// track is post-pass muxed into the exported MP4 by the native
+  /// VGAudioExportMuxer. Missing in legacy maps → null (backward-compatible).
   VGEditorDraft({
     required this.id,
     required List<VGClipDescriptor> clips,
@@ -135,6 +151,7 @@ final class VGEditorDraft {
     this.fps = 30,
     this.canvas,
     List<VGOverlayDescriptor> overlays = const [],
+    this.audioSidecarPlan,
   })  : clips = List.unmodifiable(clips),
         transitions = List.unmodifiable(transitions),
         overlays = List.unmodifiable(overlays),
@@ -202,6 +219,8 @@ final class VGEditorDraft {
     VGCanvasDescriptor? canvas,
     // Phase 8.3: optional overlays pass through to the constructed draft.
     List<VGOverlayDescriptor> overlays = const [],
+    // Phase 8.14A: optional audio sidecar plan passes through.
+    VGAudioSidecarPlan? audioSidecarPlan,
   }) {
     assert(clips.isNotEmpty,
         'VGEditorDraft.sequentialWithTransitions: clips must not be empty');
@@ -239,6 +258,7 @@ final class VGEditorDraft {
       fps: fps,
       canvas: canvas,
       overlays: overlays,
+      audioSidecarPlan: audioSidecarPlan,
     );
   }
 
@@ -315,6 +335,20 @@ final class VGEditorDraft {
   /// **Phase 8.3**: Data model only. Not yet wired into the native graph
   /// or MethodChannel. Graph wiring is Phase 8.4+.
   final List<VGOverlayDescriptor> overlays;
+
+  // ── Audio sidecar plan ─────────────────────────────────────────────────────
+
+  /// Optional audio sidecar plan (Phase 8.14A additive bridge).
+  ///
+  /// When non-null, the native `VGAudioExportMuxer` post-pass muxes the
+  /// described audio track alongside the exported video MP4.
+  ///
+  /// Defaults to null. Legacy maps without `'audioSidecar'` key produce null
+  /// here (backward-compatible). When null, export behaviour is unchanged.
+  ///
+  /// **Phase 8.14A**: Single-track post-pass muxing only. Ducking, keyframed
+  /// volume, and waveform cache are NOT part of this phase.
+  final VGAudioSidecarPlan? audioSidecarPlan;
 
   // ── Derived helpers ────────────────────────────────────────────────────────
 
@@ -482,6 +516,11 @@ final class VGEditorDraft {
     if (canvas != null) {
       m['canvas'] = canvas!.toMap();
     }
+    // Phase 8.14A: emit 'audioSidecar' only when the plan is set.
+    // Absence of the key means no sidecar audio — backward-compatible.
+    if (audioSidecarPlan != null) {
+      m['audioSidecar'] = audioSidecarPlan!.toMap();
+    }
     return m;
   }
 
@@ -546,6 +585,14 @@ final class VGEditorDraft {
       }
     }
 
+    // Phase 8.14A: parse 'audioSidecar' if present.
+    // Missing, null, or malformed → null (backward-compatible).
+    VGAudioSidecarPlan? audioSidecarPlan;
+    final rawSidecar = map['audioSidecar'];
+    if (rawSidecar is Map<Object?, Object?>) {
+      audioSidecarPlan = VGAudioSidecarPlan.fromMap(rawSidecar);
+    }
+
     return VGEditorDraft(
       id: id,
       clips: clips,
@@ -555,6 +602,7 @@ final class VGEditorDraft {
       fps: fps,
       canvas: canvas,
       overlays: overlays,
+      audioSidecarPlan: audioSidecarPlan,
     );
   }
 
@@ -637,6 +685,7 @@ final class VGEditorDraft {
       fps: fps,
       canvas: canvas,
       overlays: overlays,
+      audioSidecarPlan: audioSidecarPlan,
     );
   }
 
@@ -809,6 +858,7 @@ final class VGEditorDraft {
       fps: fps,
       canvas: canvas,
       overlays: overlays,
+      audioSidecarPlan: audioSidecarPlan,
     );
   }
 
@@ -1034,6 +1084,7 @@ final class VGEditorDraft {
       fps: fps,
       canvas: canvas,
       overlays: overlays,
+      audioSidecarPlan: audioSidecarPlan,
     );
   }
 
@@ -1106,6 +1157,7 @@ final class VGEditorDraft {
       fps: fps,
       canvas: canvas,
       overlays: overlays,
+      audioSidecarPlan: audioSidecarPlan,
     );
   }
 
@@ -1259,6 +1311,7 @@ final class VGEditorDraft {
       fps: fps,
       canvas: canvas,
       overlays: overlays,
+      audioSidecarPlan: audioSidecarPlan,
     );
   }
 
@@ -1282,6 +1335,9 @@ final class VGEditorDraft {
     int? fps,
     VGCanvasDescriptor? canvas,
     List<VGOverlayDescriptor>? overlays,
+    // Phase 8.14A: audioSidecarPlan is optional and nullable.
+    // Passing null here preserves existing value (same sentinel pattern as canvas).
+    VGAudioSidecarPlan? audioSidecarPlan,
   }) {
     return VGEditorDraft(
       id: id ?? this.id,
@@ -1292,6 +1348,7 @@ final class VGEditorDraft {
       fps: fps ?? this.fps,
       canvas: canvas ?? this.canvas,
       overlays: overlays ?? this.overlays,
+      audioSidecarPlan: audioSidecarPlan ?? this.audioSidecarPlan,
     );
   }
 
@@ -1308,7 +1365,8 @@ final class VGEditorDraft {
           other.canvasHeight == canvasHeight &&
           other.fps == fps &&
           other.canvas == canvas &&
-          _listEqual(other.overlays, overlays);
+          _listEqual(other.overlays, overlays) &&
+          other.audioSidecarPlan == audioSidecarPlan;
 
   @override
   int get hashCode => Object.hash(
@@ -1320,6 +1378,7 @@ final class VGEditorDraft {
         fps,
         canvas,
         Object.hashAll(overlays),
+        audioSidecarPlan,
       );
 
   @override
@@ -1331,7 +1390,9 @@ final class VGEditorDraft {
       'canvas: $canvasWidth\u00d7$canvasHeight'
       '${canvas != null ? " (VGCanvasDescriptor)" : ""}, '
       'fps: $fps, '
-      'duration: ${durationSeconds.toStringAsFixed(2)}s)';
+      'duration: ${durationSeconds.toStringAsFixed(2)}s'
+      '${audioSidecarPlan != null ? ", audioSidecar: ${audioSidecarPlan!.tracks.length} track(s)" : ""}'
+      ')';
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
