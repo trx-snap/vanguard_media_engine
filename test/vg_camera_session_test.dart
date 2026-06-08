@@ -41,6 +41,7 @@ import 'package:vanguard_media_engine/vg_live_preview_config.dart';
 import 'package:vanguard_media_engine/vg_preset_descriptor.dart';
 import 'package:vanguard_media_engine/vg_recording_stats.dart';
 import 'package:vanguard_media_engine/vg_photo_capture_result.dart';
+import 'package:vanguard_media_engine/vg_multicam_recording_stats.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mock channel harness
@@ -3352,7 +3353,7 @@ void main() {
     );
 
     test(
-      'MC17-4 stopMultiCamVideoRecording invokes channel and parses result map correctly',
+      'MC17-4 stopMultiCamVideoRecording invokes channel and returns typed VGMultiCamRecordingStats',
       () async {
         _responses['stopMultiCamVideoRecording'] = kValidStopResponse;
 
@@ -3361,16 +3362,17 @@ void main() {
         expect(_callCount('stopMultiCamVideoRecording'), equals(1),
             reason: 'must fire exactly one stopMultiCamVideoRecording channel call');
         expect(result, isNotNull,
-            reason: 'must return non-null map for valid native response');
-        expect(result!['filePath'],     equals(kVideoPath));
-        expect(result['durationSeconds'], equals(10.5));
-        expect(result['width'],          equals(1080));
-        expect(result['height'],         equals(1920));
-        expect(result['framesOffered'],  equals(315));
-        expect(result['framesAppended'], equals(315));
-        expect(result['framesDroppedWriterNotReady'], equals(0));
-        expect(result['writerStatus'],   equals(2));
-        expect(result['fileSizeBytes'],  equals(15728640));
+            reason: 'must return non-null typed result for valid native response');
+        expect(result, isA<VGMultiCamRecordingStats>());
+        expect(result!.filePath,                    equals(kVideoPath));
+        expect(result.durationSeconds,              equals(10.5));
+        expect(result.width,                        equals(1080));
+        expect(result.height,                       equals(1920));
+        expect(result.framesOffered,                equals(315));
+        expect(result.framesAppended,               equals(315));
+        expect(result.framesDroppedWriterNotReady,  equals(0));
+        expect(result.writerStatus,                 equals(2));
+        expect(result.fileSizeBytes,                equals(15728640));
       },
     );
 
@@ -3382,7 +3384,7 @@ void main() {
         final result = await VGCameraSession.stopMultiCamVideoRecording();
 
         expect(result, isNull,
-            reason: 'null native response must yield null result map');
+            reason: 'null native response must yield null typed result');
       },
     );
 
@@ -3397,7 +3399,7 @@ void main() {
         final result = await VGCameraSession.stopMultiCamVideoRecording();
 
         expect(result, isNull,
-            reason: 'PlatformException must be caught and null returned, not rethrown');
+            reason: 'PlatformException must be caught and null typed result returned, not rethrown');
       },
     );
   });

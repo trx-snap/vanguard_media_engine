@@ -29,6 +29,7 @@ import 'vg_filter_spec.dart';
 import 'vg_graph_transaction.dart';
 import 'vg_live_preview_config.dart';
 import 'vg_recording_stats.dart';
+import 'vg_multicam_recording_stats.dart';
 import 'vg_photo_capture_result.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1772,13 +1773,14 @@ final class VGCameraSession {
   /// - `framesDroppedWriterNotReady` — Frames dropped due to writer backpressure.
   /// - `writerStatus`                — Native AVAssetWriterStatus integer.
   /// - `fileSizeBytes`               — Output file size in bytes.
-  static Future<Map<String, dynamic>?> stopMultiCamVideoRecording() async {
+  static Future<VGMultiCamRecordingStats?> stopMultiCamVideoRecording() async {
     try {
       final raw = await _channel.invokeMethod<Map<Object?, Object?>>(
         'stopMultiCamVideoRecording',
       );
       if (raw == null) return null;
-      return raw.map((key, value) => MapEntry(key.toString(), value));
+      final stringMap = raw.map((key, value) => MapEntry(key.toString(), value));
+      return VGMultiCamRecordingStats.fromMap(stringMap);
     } on PlatformException {
       return null;
     }
