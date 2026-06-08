@@ -1,5 +1,5 @@
 // VGAudioExportMuxer.m
-// vanguard_media_engine — Phase 8.14B Multi-Track Audio Mixdown
+// vanguard_media_engine — Phase 8.14B Multi-Track Audio Mixdown / Phase 8.14C Original Clip Audio Preservation
 //
 // 2-pass post-pass audio muxer.
 //
@@ -373,18 +373,49 @@ static void _VGAudioExportMuxerLogInit(void) {
         AVAssetTrack *audioTrack = audioTracks.firstObject;
 
         // ── Compute source range ──────────────────────────────────────────────
-        // Phase 8.14B: always reads from the beginning of the source file.
+        // Phase 8.14C: read sourceTrimStart for original clip audio tracks.
+        // Absent or 0.0 means start of file (backward-compatible with 8.14B).
+
+        double sourceTrimStart = [td[@"sourceTrimStart"] doubleValue];
+        if (sourceTrimStart < 0.0) sourceTrimStart = 0.0;
 
         CMTime audioDurationTime = CMTimeMakeWithSeconds(duration, kVGMuxTimescale);
+        CMTime sourceStartTime   = CMTimeMakeWithSeconds(sourceTrimStart, kVGMuxTimescale);
 
-        // Cap to actual asset duration.
+        // Cap source range so sourceStart + duration does not exceed asset duration.
+        // If sourceStart is past asset end or resulting duration is <= 0, skip.
         CMTime assetDur = audioAsset.duration;
         if (CMTIME_IS_VALID(assetDur) && CMTIME_IS_NUMERIC(assetDur)) {
-            if (CMTimeCompare(audioDurationTime, assetDur) > 0) {
-                audioDurationTime = assetDur;
+            // If sourceStart is at or past the asset duration, skip this track.
+            if (CMTimeCompare(sourceStartTime, assetDur) >= 0) {
+                os_log_error(sMuxerLog,
+                             "[8.14C] pass1: sourceTrimStart (%.3fs) is past "
+                             "asset duration (%.3fs) for track %{public}@ — skipping",
+                             sourceTrimStart, CMTimeGetSeconds(assetDur),
+                             td[@"trackId"]);
+                continue;
+            }
+            // Clamp: sourceStart + audioDuration must not exceed asset duration.
+            CMTime sourceEnd = CMTimeAdd(sourceStartTime, audioDurationTime);
+            if (CMTimeCompare(sourceEnd, assetDur) > 0) {
+                audioDurationTime = CMTimeSubtract(assetDur, sourceStartTime);
+                if (CMTimeCompare(audioDurationTime, kCMTimeZero) <= 0) {
+                    os_log_error(sMuxerLog,
+                                 "[8.14C] pass1: clamped duration <= 0 for "
+                                 "track %{public}@ — skipping",
+                                 td[@"trackId"]);
+                    continue;
+                }
+                os_log(sMuxerLog,
+                       "[8.14C] pass1: clamped track %{public}@ "
+                       "sourceEnd %.3f → asset end %.3fs",
+                       td[@"trackId"], CMTimeGetSeconds(sourceEnd),
+                       CMTimeGetSeconds(assetDur));
             }
         }
-        CMTimeRange sourceRange = CMTimeRangeMake(kCMTimeZero, audioDurationTime);
+
+        CMTimeRange sourceRange = CMTimeRangeMake(sourceStartTime, audioDurationTime);
+
 
         // ── Compute insertion point ───────────────────────────────────────────
 

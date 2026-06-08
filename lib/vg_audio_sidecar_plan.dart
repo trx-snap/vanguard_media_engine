@@ -1,5 +1,5 @@
 // vg_audio_sidecar_plan.dart
-// Vanguard Media Engine — Phase 8.14B Multi-Track Audio Mixdown
+// Vanguard Media Engine — Phase 8.14B Multi-Track Audio Mixdown / Phase 8.14C Original Clip Audio Preservation
 //
 // Dart descriptor types for sidecar audio tracks that are post-pass muxed
 // into the exported MP4 by VGAudioExportMuxer (native).
@@ -32,7 +32,8 @@
 //         "role":                 String?,  // optional: "music"|"voiceover"|"sfx"|"original"
 //         "fadeInSeconds":        double?,  // optional fade-in duration (≥ 0)
 //         "fadeOutSeconds":       double?,  // optional fade-out duration (≥ 0)
-//         "timeRemapAudioPolicy": String?   // optional; "preserve" | "mute"
+//         "timeRemapAudioPolicy": String?,  // optional; "preserve" | "mute"
+//         "sourceTrimStart":      double?   // Phase 8.14C: source-file offset (≥ 0) to begin reading
 //       }
 //     ]
 //   }
@@ -58,6 +59,10 @@
 /// [timeRemapAudioPolicy] is an optional string hint for time-remap handling.
 ///   Only "preserve" and "mute" are acted on. Absent or unrecognised values
 ///   are treated as "preserve".
+/// [sourceTrimStartSeconds] is the source-file offset in seconds from which audio
+///   reading begins (≥ 0.0). Defaults to 0.0 (start of file). Wire key: `sourceTrimStart`.
+///   Phase 8.14C: used for original clip audio to start reading at the clip's
+///   `trimStartSeconds` rather than the beginning of the video source file.
 final class VGAudioSidecarTrack {
   const VGAudioSidecarTrack({
     required this.trackId,
@@ -69,6 +74,7 @@ final class VGAudioSidecarTrack {
     this.fadeInSeconds = 0.0,
     this.fadeOutSeconds = 0.0,
     this.timeRemapAudioPolicy,
+    this.sourceTrimStartSeconds = 0.0,
   });
 
   final String trackId;
@@ -91,6 +97,14 @@ final class VGAudioSidecarTrack {
 
   final String? timeRemapAudioPolicy;
 
+  /// Source-file offset in seconds from which audio reading begins.
+  ///
+  /// Phase 8.14C: for original clip audio tracks, this is set to the clip's
+  /// `trimStartSeconds` so audio is read from the correct position in the
+  /// source video file. Wire key: `sourceTrimStart`.
+  /// Defaults to 0.0 (start of file). Must be >= 0.0.
+  final double sourceTrimStartSeconds;
+
   /// Serialises to a map whose keys match the native
   /// `VGAudioSidecarPlan.tracks` dictionary contract.
   Map<String, Object?> toMap() {
@@ -106,6 +120,10 @@ final class VGAudioSidecarTrack {
     if (fadeOutSeconds != 0.0) m['fadeOutSeconds'] = fadeOutSeconds;
     if (timeRemapAudioPolicy != null) {
       m['timeRemapAudioPolicy'] = timeRemapAudioPolicy;
+    }
+    // Phase 8.14C: emit sourceTrimStart only when non-zero (0.0 = start of file).
+    if (sourceTrimStartSeconds != 0.0) {
+      m['sourceTrimStart'] = sourceTrimStartSeconds;
     }
     return m;
   }
@@ -137,6 +155,10 @@ final class VGAudioSidecarTrack {
     final policy = map['timeRemapAudioPolicy'];
     final policyStr = policy is String ? policy : null;
 
+    // Phase 8.14C: parse sourceTrimStart; absent or 0.0 = start of file.
+    final sourceTrimStart =
+        (map['sourceTrimStart'] as num?)?.toDouble() ?? 0.0;
+
     return VGAudioSidecarTrack(
       trackId: trackId,
       url: url,
@@ -147,6 +169,7 @@ final class VGAudioSidecarTrack {
       fadeInSeconds: fadeIn,
       fadeOutSeconds: fadeOut,
       timeRemapAudioPolicy: policyStr,
+      sourceTrimStartSeconds: sourceTrimStart,
     );
   }
 
@@ -162,7 +185,8 @@ final class VGAudioSidecarTrack {
           other.role == role &&
           other.fadeInSeconds == fadeInSeconds &&
           other.fadeOutSeconds == fadeOutSeconds &&
-          other.timeRemapAudioPolicy == timeRemapAudioPolicy;
+          other.timeRemapAudioPolicy == timeRemapAudioPolicy &&
+          other.sourceTrimStartSeconds == sourceTrimStartSeconds;
 
   @override
   int get hashCode => Object.hash(
@@ -175,6 +199,7 @@ final class VGAudioSidecarTrack {
         fadeInSeconds,
         fadeOutSeconds,
         timeRemapAudioPolicy,
+        sourceTrimStartSeconds,
       );
 
   @override
@@ -188,6 +213,7 @@ final class VGAudioSidecarTrack {
       '${fadeInSeconds != 0.0 ? ", fadeIn: ${fadeInSeconds}s" : ""}'
       '${fadeOutSeconds != 0.0 ? ", fadeOut: ${fadeOutSeconds}s" : ""}'
       '${timeRemapAudioPolicy != null ? ", policy: $timeRemapAudioPolicy" : ""}'
+      '${sourceTrimStartSeconds != 0.0 ? ", sourceTrimStart: ${sourceTrimStartSeconds.toStringAsFixed(3)}s" : ""}'
       ')';
 }
 

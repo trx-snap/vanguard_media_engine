@@ -1,19 +1,23 @@
 // vg_audio_sidecar_plan_test.dart
-// Vanguard Media Engine — Phase 8.14A/8.14B Audio Sidecar Export Muxer
+// Vanguard Media Engine — Phase 8.14A/8.14B/8.14C Audio Sidecar Export Muxer
 //
 // Pure Dart unit tests for VGAudioSidecarTrack and VGAudioSidecarPlan,
 // plus VGEditorDraft audioSidecarPlan additive bridge tests.
 // Phase 8.14B additions: role, fadeInSeconds, fadeOutSeconds, multi-track.
+// Phase 8.14C additions: sourceTrimStartSeconds, flattenOriginalClipAudio().
 //
 // Tests:
 //   AST-*  VGAudioSidecarTrack round-trip, validation, equality
 //   ASP-*  VGAudioSidecarPlan round-trip, validation, equality
 //   EDA-*  VGEditorDraft audioSidecarPlan additive bridge tests
+//   FAO-*  VGEditorDraft.flattenOriginalClipAudio() tests (Phase 8.14C)
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vg_audio_sidecar_plan.dart';
 import 'package:vanguard_media_engine/vg_clip_descriptor.dart';
+import 'package:vanguard_media_engine/vg_dual_camera_descriptor.dart';
 import 'package:vanguard_media_engine/vg_editor_draft.dart';
+import 'package:vanguard_media_engine/vg_time_remap_descriptor.dart';
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
 
@@ -27,6 +31,7 @@ VGAudioSidecarTrack _track({
   double fadeInSeconds = 0.0,
   double fadeOutSeconds = 0.0,
   String? timeRemapAudioPolicy,
+  double sourceTrimStartSeconds = 0.0,
 }) =>
     VGAudioSidecarTrack(
       trackId: trackId,
@@ -38,6 +43,7 @@ VGAudioSidecarTrack _track({
       fadeInSeconds: fadeInSeconds,
       fadeOutSeconds: fadeOutSeconds,
       timeRemapAudioPolicy: timeRemapAudioPolicy,
+      sourceTrimStartSeconds: sourceTrimStartSeconds,
     );
 
 VGAudioSidecarPlan _plan({List<VGAudioSidecarTrack>? tracks}) =>
@@ -55,6 +61,32 @@ VGEditorDraft _draft({VGAudioSidecarPlan? audioSidecarPlan}) => VGEditorDraft(
       id: 'draft-sidecar-test',
       clips: [_clip()],
       audioSidecarPlan: audioSidecarPlan,
+    );
+
+// ── Helper: valid video clip at given timeline position ───────────────────────
+
+VGClipDescriptor _videoClip({
+  required String id,
+  String sourcePath = '/tmp/video.mp4',
+  double startTimeSeconds = 0.0,
+  double durationSeconds = 10.0,
+  double trimStartSeconds = 0.0,
+  double trimEndSeconds = 5.0,
+  double speed = 1.0,
+  bool isReversed = false,
+  double? freezePTS,
+}) =>
+    VGClipDescriptor(
+      id: id,
+      sourcePath: sourcePath,
+      mediaKind: VGMediaKind.video,
+      startTimeSeconds: startTimeSeconds,
+      durationSeconds: durationSeconds,
+      trimStartSeconds: trimStartSeconds,
+      trimEndSeconds: trimEndSeconds,
+      speed: speed,
+      isReversed: isReversed,
+      freezePTS: freezePTS,
     );
 
 // ── VGAudioSidecarTrack ───────────────────────────────────────────────────────
@@ -738,6 +770,313 @@ void main() {
     test('EDA-15 toString does not mention sidecar when plan is null', () {
       final d = _draft();
       expect(d.toString(), isNot(contains('audioSidecar')));
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // VGAudioSidecarTrack — Phase 8.14C sourceTrimStartSeconds
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  group('VGAudioSidecarTrack — Phase 8.14C sourceTrimStartSeconds', () {
+    test('AST-40 defaults to 0.0', () {
+      expect(_track().sourceTrimStartSeconds, closeTo(0.0, 1e-9));
+    });
+
+    test('AST-41 stored correctly when set', () {
+      expect(
+        _track(sourceTrimStartSeconds: 1.5).sourceTrimStartSeconds,
+        closeTo(1.5, 1e-9),
+      );
+    });
+
+    test('AST-42 toMap omits sourceTrimStart when 0.0', () {
+      final map = _track(sourceTrimStartSeconds: 0.0).toMap();
+      expect(map.containsKey('sourceTrimStart'), isFalse);
+    });
+
+    test('AST-43 toMap includes sourceTrimStart when non-zero', () {
+      final map = _track(sourceTrimStartSeconds: 2.0).toMap();
+      expect(map['sourceTrimStart'], closeTo(2.0, 1e-9));
+    });
+
+    test('AST-44 round-trip preserves sourceTrimStartSeconds via sourceTrimStart key', () {
+      final original = _track(sourceTrimStartSeconds: 1.25);
+      final map = original.toMap();
+      expect(map.containsKey('sourceTrimStart'), isTrue);
+      expect(map['sourceTrimStart'], closeTo(1.25, 1e-9));
+
+      final restored = VGAudioSidecarTrack.fromMap(map.cast<Object?, Object?>());
+      expect(restored, isNotNull);
+      expect(restored!.sourceTrimStartSeconds, closeTo(1.25, 1e-9));
+    });
+
+    test('AST-45 fromMap defaults sourceTrimStartSeconds to 0.0 when absent', () {
+      final result = VGAudioSidecarTrack.fromMap({
+        'trackId': 'tid',
+        'url': '/tmp/a.m4a',
+        'startTime': 0.0,
+        'duration': 5.0,
+      });
+      expect(result, isNotNull);
+      expect(result!.sourceTrimStartSeconds, closeTo(0.0, 1e-9));
+    });
+
+    test('AST-46 tracks with different sourceTrimStartSeconds are not equal', () {
+      expect(
+        _track(sourceTrimStartSeconds: 0.5) == _track(sourceTrimStartSeconds: 0.0),
+        isFalse,
+      );
+    });
+
+    test('AST-47 tracks identical including sourceTrimStartSeconds are equal', () {
+      final a = _track(sourceTrimStartSeconds: 1.5);
+      final b = _track(sourceTrimStartSeconds: 1.5);
+      expect(a, equals(b));
+      expect(a.hashCode, b.hashCode);
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // VGEditorDraft.flattenOriginalClipAudio() — Phase 8.14C
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  group('VGEditorDraft.flattenOriginalClipAudio() — Phase 8.14C', () {
+    // ── Basic generation ─────────────────────────────────────────────────────
+
+    test('FAO-1 single eligible video clip produces exactly one original-audio track', () {
+      final clip = _videoClip(
+        id: 'v1',
+        sourcePath: '/path/to/clip.mp4',
+        startTimeSeconds: 0.0,
+        trimStartSeconds: 0.5,
+        trimEndSeconds: 3.5,
+      );
+      final draft = VGEditorDraft(id: 'fao-1', clips: [clip]);
+      final result = draft.flattenOriginalClipAudio();
+
+      expect(result.audioSidecarPlan, isNotNull);
+      expect(result.audioSidecarPlan!.tracks.length, 1);
+
+      final t = result.audioSidecarPlan!.tracks[0];
+      expect(t.trackId, 'original-v1');
+      expect(t.url, '/path/to/clip.mp4');
+      expect(t.startTime, closeTo(0.0, 1e-9));
+      expect(t.duration, closeTo(3.0, 1e-9)); // trimEnd - trimStart = 3.5 - 0.5
+      expect(t.sourceTrimStartSeconds, closeTo(0.5, 1e-9));
+      expect(t.role, 'original');
+      expect(t.volume, closeTo(1.0, 1e-9));
+      expect(t.fadeInSeconds, closeTo(0.0, 1e-9));
+      expect(t.fadeOutSeconds, closeTo(0.0, 1e-9));
+    });
+
+    test('FAO-2 multi-clip timeline produces one track per eligible clip', () {
+      final draft = VGEditorDraft.sequentialWithTransitions(
+        id: 'fao-2',
+        clips: [
+          _videoClip(id: 'v1', durationSeconds: 10.0, trimStartSeconds: 0.0, trimEndSeconds: 3.0),
+          _videoClip(id: 'v2', durationSeconds: 10.0, trimStartSeconds: 1.0, trimEndSeconds: 4.0),
+        ],
+      );
+      final result = draft.flattenOriginalClipAudio();
+
+      expect(result.audioSidecarPlan, isNotNull);
+      expect(result.audioSidecarPlan!.tracks.length, 2);
+
+      final t1 = result.audioSidecarPlan!.tracks[0];
+      expect(t1.trackId, 'original-v1');
+      expect(t1.startTime, closeTo(0.0, 1e-9));
+      expect(t1.duration, closeTo(3.0, 1e-9));
+      expect(t1.sourceTrimStartSeconds, closeTo(0.0, 1e-9));
+
+      final t2 = result.audioSidecarPlan!.tracks[1];
+      expect(t2.trackId, 'original-v2');
+      expect(t2.startTime, closeTo(3.0, 1e-9)); // sequential: clip 2 starts after clip 1
+      expect(t2.duration, closeTo(3.0, 1e-9));
+      expect(t2.sourceTrimStartSeconds, closeTo(1.0, 1e-9));
+    });
+
+    test('FAO-3 existing explicit sidecar tracks are preserved; generated tracks appended', () {
+      final musicTrack = VGAudioSidecarTrack(
+        trackId: 'music-1',
+        url: '/music.m4a',
+        startTime: 0.0,
+        duration: 5.0,
+        role: 'music',
+      );
+      final clip = _videoClip(id: 'v1', trimEndSeconds: 3.0);
+      final draft = VGEditorDraft(
+        id: 'fao-3',
+        clips: [clip],
+        audioSidecarPlan: VGAudioSidecarPlan(tracks: [musicTrack]),
+      );
+      final result = draft.flattenOriginalClipAudio();
+
+      expect(result.audioSidecarPlan, isNotNull);
+      expect(result.audioSidecarPlan!.tracks.length, 2);
+      // Music track is first (existing), original track appended.
+      expect(result.audioSidecarPlan!.tracks[0].trackId, 'music-1');
+      expect(result.audioSidecarPlan!.tracks[1].trackId, 'original-v1');
+    });
+
+    // ── Generated track fades are 0.0 ────────────────────────────────────────
+
+    test('FAO-4 generated tracks always have fadeInSeconds = 0.0', () {
+      final clip = _videoClip(id: 'v1', trimEndSeconds: 3.0);
+      final result = VGEditorDraft(id: 'fao-4', clips: [clip])
+          .flattenOriginalClipAudio();
+      expect(result.audioSidecarPlan!.tracks[0].fadeInSeconds, closeTo(0.0, 1e-9));
+    });
+
+    test('FAO-5 generated tracks always have fadeOutSeconds = 0.0', () {
+      final clip = _videoClip(id: 'v1', trimEndSeconds: 3.0);
+      final result = VGEditorDraft(id: 'fao-5', clips: [clip])
+          .flattenOriginalClipAudio();
+      expect(result.audioSidecarPlan!.tracks[0].fadeOutSeconds, closeTo(0.0, 1e-9));
+    });
+
+    // ── Skip condition tests ──────────────────────────────────────────────────
+
+    test('FAO-6 skip condition 1: image clip is skipped', () {
+      final clip = VGClipDescriptor(
+        id: 'img-1',
+        sourcePath: '/tmp/img.png',
+        mediaKind: VGMediaKind.image,
+        durationSeconds: 5.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 3.0,
+      );
+      final draft = VGEditorDraft(id: 'fao-6', clips: [clip]);
+      final result = draft.flattenOriginalClipAudio();
+      // No eligible clips → same instance returned.
+      expect(identical(draft, result), isTrue);
+    });
+
+    test('FAO-7 skip condition 2: speed != 1.0 clip is skipped', () {
+      final clip = _videoClip(id: 'v1', speed: 0.5, trimEndSeconds: 3.0);
+      final draft = VGEditorDraft(id: 'fao-7', clips: [clip]);
+      final result = draft.flattenOriginalClipAudio();
+      expect(identical(draft, result), isTrue);
+    });
+
+    test('FAO-8 skip condition 3: isReversed clip is skipped', () {
+      final clip = _videoClip(id: 'v1', isReversed: true, trimEndSeconds: 3.0);
+      final draft = VGEditorDraft(id: 'fao-8', clips: [clip]);
+      final result = draft.flattenOriginalClipAudio();
+      expect(identical(draft, result), isTrue);
+    });
+
+    test('FAO-9 skip condition 4: freeze-frame clip (freezePTS != null) is skipped', () {
+      // freezePTS requires isReversed == false and mediaKind == video.
+      final clip = VGClipDescriptor(
+        id: 'freeze-1',
+        sourcePath: '/tmp/video.mp4',
+        mediaKind: VGMediaKind.video,
+        durationSeconds: 10.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 2.0, // hold duration for freeze
+        freezePTS: 1.5,
+      );
+      final draft = VGEditorDraft(id: 'fao-9', clips: [clip]);
+      final result = draft.flattenOriginalClipAudio();
+      expect(identical(draft, result), isTrue);
+    });
+
+    test('FAO-10 skip condition 5: timeRemap != null clip is skipped', () {
+      final remap = VGTimeRemapDescriptor(
+        segments: [
+          VGSpeedSegmentDescriptor(
+            sourceStartTime: 0.0,
+            sourceDuration: 3.0,
+            speedMultiplier: 1.0,
+          ),
+        ],
+        audioPolicy: VGTimeRemapAudioPolicy.mute,
+      );
+      final clip = VGClipDescriptor(
+        id: 'remap-1',
+        sourcePath: '/tmp/video.mp4',
+        mediaKind: VGMediaKind.video,
+        durationSeconds: 10.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 3.0,
+        timeRemap: remap,
+      );
+      final draft = VGEditorDraft(id: 'fao-10', clips: [clip]);
+      final result = draft.flattenOriginalClipAudio();
+      expect(identical(draft, result), isTrue);
+    });
+
+    test('FAO-11 skip condition 6: dualCamera != null clip is skipped', () {
+      final primary = _videoClip(id: 'primary', trimEndSeconds: 3.0);
+      final secondary = _videoClip(id: 'secondary', trimEndSeconds: 3.0);
+      final dualCameraClip = primary.copyWith(
+        dualCamera: VGDualCameraDescriptor(
+          primaryClip: primary,
+          secondaryClip: secondary,
+          layoutMode: VGDualCameraLayoutMode.pip,
+        ),
+      );
+      final draft = VGEditorDraft(id: 'fao-11', clips: [dualCameraClip]);
+      final result = draft.flattenOriginalClipAudio();
+      expect(identical(draft, result), isTrue);
+    });
+
+    // ── Mixed eligible and ineligible clips ───────────────────────────────────
+
+    test('FAO-12 mixed timeline: ineligible clips are skipped, eligible clips generate tracks', () {
+      final videoClip = _videoClip(id: 'v1', trimStartSeconds: 0.0, trimEndSeconds: 3.0);
+      final imageClip = VGClipDescriptor(
+        id: 'img-1',
+        sourcePath: '/tmp/img.png',
+        mediaKind: VGMediaKind.image,
+        startTimeSeconds: 3.0,
+        durationSeconds: 5.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 2.0,
+      );
+      final draft = VGEditorDraft(id: 'fao-12', clips: [videoClip, imageClip]);
+      final result = draft.flattenOriginalClipAudio();
+
+      expect(result.audioSidecarPlan, isNotNull);
+      expect(result.audioSidecarPlan!.tracks.length, 1);
+      expect(result.audioSidecarPlan!.tracks[0].trackId, 'original-v1');
+    });
+
+    // ── No eligible clips returns same instance ───────────────────────────────
+
+    test('FAO-13 returns same instance when no eligible clips', () {
+      final imageClip = VGClipDescriptor(
+        id: 'img-1',
+        sourcePath: '/tmp/img.png',
+        mediaKind: VGMediaKind.image,
+        durationSeconds: 5.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 3.0,
+      );
+      final draft = VGEditorDraft(id: 'fao-13', clips: [imageClip]);
+      final result = draft.flattenOriginalClipAudio();
+      expect(identical(draft, result), isTrue);
+    });
+
+    // ── trimStartSeconds = 0.0 does not emit sourceTrimStart in wire ─────────
+
+    test('FAO-14 sourceTrimStartSeconds=0.0 omitted from generated track wire', () {
+      final clip = _videoClip(id: 'v1', trimStartSeconds: 0.0, trimEndSeconds: 3.0);
+      final result = VGEditorDraft(id: 'fao-14', clips: [clip])
+          .flattenOriginalClipAudio();
+      final plan = result.audioSidecarPlan!;
+      final trackMap = plan.tracks[0].toMap();
+      // 0.0 sourceTrimStart is omitted from wire (backward-compatible with 8.14B).
+      expect(trackMap.containsKey('sourceTrimStart'), isFalse);
+    });
+
+    test('FAO-15 non-zero trimStartSeconds emits sourceTrimStart in generated track wire', () {
+      final clip = _videoClip(id: 'v1', trimStartSeconds: 1.5, trimEndSeconds: 4.5);
+      final result = VGEditorDraft(id: 'fao-15', clips: [clip])
+          .flattenOriginalClipAudio();
+      final plan = result.audioSidecarPlan!;
+      final trackMap = plan.tracks[0].toMap();
+      expect(trackMap['sourceTrimStart'], closeTo(1.5, 1e-9));
     });
   });
 }

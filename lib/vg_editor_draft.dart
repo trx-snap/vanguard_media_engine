@@ -606,6 +606,88 @@ final class VGEditorDraft {
     );
   }
 
+  // ── Original clip audio flattening (Phase 8.14C) ───────────────────────────
+
+  /// Returns a new [VGEditorDraft] with original clip audio from eligible video
+  /// clips flattened into explicit [VGAudioSidecarTrack] entries in the
+  /// [audioSidecarPlan].
+  ///
+  /// **Phase 8.14C — Original Clip Audio Preservation.**
+  ///
+  /// For each eligible clip, a sidecar track is generated:
+  ///   - `url`:                   `clip.sourcePath`
+  ///   - `startTime`:             `clip.startTimeSeconds` (timeline insertion point)
+  ///   - `duration`:              `clip.timelineDuration`
+  ///   - `sourceTrimStartSeconds`:`clip.trimStartSeconds` (source file read offset)
+  ///   - `role`:                  `"original"`
+  ///   - `volume`:                `1.0`
+  ///   - `fadeInSeconds`:         `0.0` (transition-derived crossfades deferred)
+  ///   - `fadeOutSeconds`:        `0.0`
+  ///
+  /// Generated tracks are **appended** to any existing explicit sidecar tracks
+  /// (music, voiceover, SFX, etc.). Existing tracks are never replaced.
+  ///
+  /// A clip is **skipped** if any of the following are true (Opus corrections):
+  ///   1. `clip.mediaKind != VGMediaKind.video` — images/audio-only have no clip audio.
+  ///   2. `clip.speed != 1.0` — speed-changed clips deferred.
+  ///   3. `clip.isReversed == true` — reverse clips deferred.
+  ///   4. `clip.freezePTS != null` — freeze-frame clips are implicitly silent.
+  ///   5. `clip.timeRemap != null` — variable-speed clips deferred.
+  ///   6. `clip.dualCamera != null` — dual-camera clips deferred.
+  ///
+  /// Transition-derived crossfades are explicitly deferred to Phase 8.14D:
+  /// all generated tracks have `fadeInSeconds = 0.0` and `fadeOutSeconds = 0.0`.
+  ///
+  /// Native muxer gracefully skips any source that has no audio track.
+  ///
+  /// Returns `this` (same instance) if no eligible clips are found, preserving
+  /// the existing draft without allocating a new instance.
+  ///
+  /// This is a **pure** operation — no MethodChannel calls, no I/O.
+  VGEditorDraft flattenOriginalClipAudio() {
+    final generatedTracks = <VGAudioSidecarTrack>[];
+    for (final clip in clips) {
+      // Skip condition 1: not a video clip.
+      if (clip.mediaKind != VGMediaKind.video) continue;
+      // Skip condition 2: speed-changed clip.
+      if (clip.speed != 1.0) continue;
+      // Skip condition 3: reversed clip.
+      if (clip.isReversed) continue;
+      // Skip condition 4: freeze-frame clip.
+      if (clip.freezePTS != null) continue;
+      // Skip condition 5: variable-speed time remap.
+      if (clip.timeRemap != null) continue;
+      // Skip condition 6: dual-camera clip.
+      if (clip.dualCamera != null) continue;
+
+      generatedTracks.add(VGAudioSidecarTrack(
+        trackId: 'original-${clip.id}',
+        url: clip.sourcePath,
+        startTime: clip.startTimeSeconds,
+        duration: clip.timelineDuration,
+        sourceTrimStartSeconds: clip.trimStartSeconds,
+        role: 'original',
+        volume: 1.0,
+        // Transition-derived crossfades deferred to Phase 8.14D.
+        fadeInSeconds: 0.0,
+        fadeOutSeconds: 0.0,
+      ));
+    }
+
+    if (generatedTracks.isEmpty) return this;
+
+    // Append generated tracks to any existing explicit sidecar tracks.
+    final existingTracks = audioSidecarPlan?.tracks ?? const <VGAudioSidecarTrack>[];
+    final mergedTracks = [
+      ...existingTracks,
+      ...generatedTracks,
+    ];
+
+    return copyWith(
+      audioSidecarPlan: VGAudioSidecarPlan(tracks: mergedTracks),
+    );
+  }
+
   // ── Trim editing (Phase 7.13 / DEC-146) ─────────────────────────────────
 
   /// Returns a new copy of this draft with [clipId]'s trim window adjusted,

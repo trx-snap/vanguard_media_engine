@@ -1,5 +1,5 @@
 // VGAudioExportMuxer.h
-// vanguard_media_engine — Phase 8.14B Multi-Track Audio Mixdown
+// vanguard_media_engine — Phase 8.14B Multi-Track Audio Mixdown / Phase 8.14C Original Clip Audio Preservation
 //
 // 2-pass post-pass sidecar audio muxer using AVMutableComposition + AVAssetExportSession.
 //

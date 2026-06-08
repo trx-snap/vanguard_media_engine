@@ -836,10 +836,13 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     notifyListeners();
 
     try {
+      // Phase 8.14C: flatten original clip audio into explicit sidecar tracks
+      // before serialising. Pure operation — no I/O, appends to existing plan.
+      final exportDraft = value.draft.flattenOriginalClipAudio();
       final result = await _channel.invokeMapMethod<String, dynamic>(
         'exportTimeline',
         {
-          'draft': value.draft.toMap(),
+          'draft': exportDraft.toMap(),
           ...request.toMap(),
         },
       );
