@@ -409,6 +409,17 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     _layoutConfig = config;
 }
 
+// MC-23: Live layout update — safe to call from any thread while running.
+// Dispatches a struct copy onto the serial _renderQ; the next composited
+// frame will use the new config. No lock needed (_renderQ serialises all
+// _layoutConfig reads). No-op after stop (_stopped will be YES but the
+// assignment is harmless).
+- (void)updateLayoutConfig:(VGMCRDLayoutConfig)config {
+    dispatch_async(_renderQ, ^{
+        self->_layoutConfig = config;
+    });
+}
+
 + (VGMCRDLayoutConfig)layoutConfigFromMap:(NSDictionary<NSString *, id> *)map {
     VGMCRDLayoutConfig cfg = VGMCRDDefaultLayoutConfig();
     if (!map) return cfg;

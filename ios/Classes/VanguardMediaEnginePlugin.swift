@@ -4064,6 +4064,38 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
             }
 
+        // ── MC-23: Live MultiCam layout update ────────────────────────────────
+        //
+        // Updates the compositor layout (PiP anchor/size or split-screen ratio)
+        // while the preview is running. Does NOT restart AVCaptureMultiCamSession,
+        // reconfigure camera hardware, or touch recording/audio state.
+        //
+        // The update is dispatched to the serial _renderQ inside the renderer;
+        // the next composited frame will use the new layout config.
+        //
+        // Guards:
+        //   • mcDiagnosticState must be .running (preview must be active).
+        //   • args["config"] must be a [String:Any] map (VGLivePreviewConfig.toMap()).
+        //
+        // Error codes:
+        //   NOT_RUNNING  — MultiCam preview is not active.
+        //   INVALID_ARG  — config map is missing or wrong type.
+        case "updateMultiCamPreviewConfig":
+            guard mcDiagnosticState == .running,
+                  let renderer = mcRenderDiagnostic else {
+                result(FlutterError(code: "NOT_RUNNING",
+                                    message: "MultiCam preview is not running",
+                                    details: nil))
+                return
+            }
+            guard let configMap = args?["config"] as? [String: Any] else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "updateMultiCamPreviewConfig requires a 'config' map",
+                                    details: nil))
+                return
+            }
+            renderer.updateLayoutConfig(VanguardMultiCamRenderer.layoutConfig(fromMap: configMap))
+            result(nil)
 
         case "setFocusPoint":
 

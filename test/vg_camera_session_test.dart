@@ -3403,4 +3403,65 @@ void main() {
       },
     );
   });
+
+  // ── MC-23: updateMultiCamPreviewConfig ──────────────────────────────────────
+  //
+  // Acceptance criteria:
+  //   MC23-1  invokes channel 'updateMultiCamPreviewConfig' with config.toMap()
+  //   MC23-2  forwards the correct config map for a non-default config
+  //   MC23-3  swallows PlatformException (does not rethrow)
+
+  group('VGCameraSession.updateMultiCamPreviewConfig (MC-23)', () {
+    test(
+      'MC23-1 updateMultiCamPreviewConfig invokes channel with method name updateMultiCamPreviewConfig',
+      () async {
+        await VGCameraSession.updateMultiCamPreviewConfig(
+            const VGLivePreviewConfig());
+
+        expect(_callCount('updateMultiCamPreviewConfig'), equals(1),
+            reason: 'must fire exactly one updateMultiCamPreviewConfig channel call');
+      },
+    );
+
+    test(
+      'MC23-2 updateMultiCamPreviewConfig forwards config.toMap() as the config argument',
+      () async {
+        const config = VGLivePreviewConfig(
+          pipLayout: VGPiPLayoutDescriptor(anchor: VGPiPAnchor.topLeft),
+        );
+
+        await VGCameraSession.updateMultiCamPreviewConfig(config);
+
+        expect(_log.length, equals(1));
+        final call = _log.first;
+        expect(call.method, equals('updateMultiCamPreviewConfig'));
+        final sentArgs = call.arguments as Map;
+        expect(sentArgs.containsKey('config'), isTrue,
+            reason: 'must include config key');
+        final sentConfig = sentArgs['config'] as Map;
+        expect(sentConfig['layoutMode'], equals('pip'),
+            reason: 'layoutMode must be pip');
+        final sentPip = sentConfig['pipLayout'] as Map;
+        expect(sentPip['anchor'], equals('topLeft'),
+            reason: 'anchor must match the provided config');
+      },
+    );
+
+    test(
+      'MC23-3 updateMultiCamPreviewConfig swallows PlatformException (does not rethrow)',
+      () async {
+        _responses['updateMultiCamPreviewConfig'] = PlatformException(
+          code: 'NOT_RUNNING',
+          message: 'MultiCam preview is not running',
+        );
+
+        // Must complete without throwing.
+        await expectLater(
+          VGCameraSession.updateMultiCamPreviewConfig(
+              const VGLivePreviewConfig()),
+          completes,
+        );
+      },
+    );
+  });
 }

@@ -1,5 +1,5 @@
 // VanguardMultiCamRenderer.h
-// vanguard_media_engine — MC-9/MC-10/MC-13/MC-15/MC-17/MC-19/MC-20: MultiCam compositor.
+// vanguard_media_engine — MC-9/MC-10/MC-13/MC-15/MC-17/MC-19/MC-20/MC-23: MultiCam compositor.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // MC-9/MC-10 — MULTICAM OFFSCREEN COMPOSITION + FLUTTER TEXTURE
@@ -235,6 +235,14 @@ static inline VGMCRDLayoutConfig VGMCRDDefaultLayoutConfig(void) {
 /// Not thread-safe — must be called before the source delegate fires.
 /// After start, the config is read on renderQ only.
 - (void)setLayoutConfig:(VGMCRDLayoutConfig)config;
+
+/// MC-23: Update layout configuration while the preview is running.
+///
+/// Thread-safe. Dispatches the struct assignment to the serial _renderQ so
+/// the next composited frame picks up the new config without a session restart.
+/// No-op if called after stop.
+- (void)updateLayoutConfig:(VGMCRDLayoutConfig)config
+    NS_SWIFT_NAME(updateLayoutConfig(_:));
 
 /// MC-12: Parse a VGLivePreviewConfig.toMap() dictionary into a VGMCRDLayoutConfig.
 ///

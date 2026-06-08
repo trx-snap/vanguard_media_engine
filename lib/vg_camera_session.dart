@@ -1791,6 +1791,29 @@ final class VGCameraSession {
     }
   }
 
+  /// MC-23: Updates the compositor layout while MultiCam preview is running.
+  ///
+  /// Changes the PiP anchor/size or switches to split-screen without restarting
+  /// the [AVCaptureMultiCamSession] or camera hardware. The layout change takes
+  /// effect on the next composited frame (~1/30 s latency).
+  ///
+  /// [startMultiCamPreview] must be active before calling this.
+  ///
+  /// ## Error behaviour
+  /// Returns silently on any failure:
+  ///   - `NOT_RUNNING`  — MultiCam preview is not active.
+  ///   - `INVALID_ARG`  — Internal: config serialisation error (should not occur).
+  static Future<void> updateMultiCamPreviewConfig(
+      VGLivePreviewConfig config) async {
+    try {
+      await _channel.invokeMethod<void>(
+        'updateMultiCamPreviewConfig',
+        {'config': config.toMap()},
+      );
+    } on PlatformException {
+      // Silent: caller does not need to handle layout-update failures.
+    }
+  }
 
   /// Tap-to-focus and tap-to-expose at a normalised point.
   ///
