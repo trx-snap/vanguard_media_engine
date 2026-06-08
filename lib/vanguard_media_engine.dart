@@ -55,6 +55,9 @@ export 'vg_editor_value.dart';
 export 'vg_editor_controller.dart';
 export 'vg_editor_export_request.dart';
 export 'vg_editor_export_result.dart';
+// Phase 8: canvas and overlay descriptors
+export 'vg_canvas_descriptor.dart';
+export 'vg_overlay_descriptor.dart';
 // Phase 7.20D: Dart model for reverse sidecar asset state.
 export 'vg_reverse_sidecar_status.dart';
 

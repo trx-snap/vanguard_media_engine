@@ -207,6 +207,33 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             registry: instance.sessionRegistry,
             plugin: instance
         )
+
+        // Phase 8.13: Install the Flutter asset resolver block.
+        //
+        // VGAssetResolverMVP (UMF) is a pure ObjC utility that cannot import
+        // Flutter headers. Vanguard injects the Flutter-specific implementation
+        // here, at plugin registration time, before any export session starts.
+        //
+        // Resolution logic:
+        //   1. registrar.lookupKey(forAsset:) translates a Flutter asset key
+        //      (e.g. "assets/stickers/star.png") into a bundle-relative resource
+        //      name (e.g. "flutter_assets/assets/stickers/star.png").
+        //   2. Bundle.main.path(forResource:ofType:) resolves that bundle key to
+        //      an absolute native file path.
+        //   Both APIs are documented thread-safe by Apple. The block is set once
+        //   here (main thread) and only read thereafter (any thread), which is
+        //   safe per the _Atomic happens-before guarantee in VGAssetResolverMVP.
+        //
+        // Absolute paths (starting with '/') are already handled by
+        // VGAssetResolverMVP's pass-through rule and never reach this block.
+        VGAssetResolverMVP.setResolverBlock { assetPath in
+            // Translate Flutter asset key → bundle resource key.
+            let bundleKey = registrar.lookupKey(forAsset: assetPath)
+            // Resolve bundle resource key → absolute file path.
+            // ofType: nil because bundleKey already contains the full filename
+            // including extension (e.g. "flutter_assets/assets/stickers/star.png").
+            return Bundle.main.path(forResource: bundleKey, ofType: nil)
+        }
     }
 
     // ─── Mode teardown ─────────────────────────────────────────────────────────

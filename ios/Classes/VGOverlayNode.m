@@ -125,6 +125,9 @@
 // ─── Phase 8.3 overlay descriptor ────────────────────────────────────────────
 #import <UMF/VGOverlayDescriptor.h>
 
+// ─── Phase 8.13 asset resolver ───────────────────────────────────────────────
+#import <UMF/VGAssetResolverMVP.h>
+
 // ─── UMF graph context (required by VGNode lifecycle) ────────────────────────
 #import <UMF/VGGraphExecutionContext.h>
 #import <UMF/VGMediaPort.h>
@@ -384,10 +387,10 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
     if (width < 1.0 || height < 1.0) { return nil; }
 
     // ── Composite cache key (Phase 8.11 fix) ──────────────────────────────────
-    // The output CIImage is target-size specific: same asset at different bounds
-    // produces a different aspect-fit result. Key encodes all render-affecting
-    // inputs: assetPath (content identity), rounded target width, rounded target
-    // height. Rounding matches the pixel-aligned tx/ty centering used below.
+    // Cache key uses the raw descriptor assetPath (before resolution) so that:
+    //   (a) the key is stable — the descriptor string never changes per overlay,
+    //   (b) different overlay IDs with the same raw key share the resolved image.
+    // Phase 8.13: the key is unchanged; resolution is transparent to caching.
     NSString *stickerCacheKey = [NSString stringWithFormat:@"%@|%ld|%ld",
         assetPath,
         (long)round((double)width),
@@ -403,15 +406,32 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
         return nil;
     }
 
+    // ── Phase 8.13: Resolve asset path ────────────────────────────────────────
+    // Translate the raw descriptor path to an absolute native file path.
+    //   - Absolute local paths (starting with '/') are returned unchanged.
+    //   - Flutter asset keys (e.g. 'assets/stickers/star.png') are resolved
+    //     through VGAssetResolverMVP, which uses the Flutter registrar lookup
+    //     installed by VanguardMediaEnginePlugin at registration time.
+    // On resolution failure (nil), cache a sentinel and fall back to the debug
+    // rectangle; export is never aborted by a missing sticker asset.
+    NSString *resolvedPath = [VGAssetResolverMVP resolvePath:assetPath];
+    if (resolvedPath.length == 0) {
+        os_log_error(OS_LOG_DEFAULT,
+                     "[VGOverlayNode][8.13] asset resolution failed for "
+                     "assetPath=%{public}@", assetPath);
+        cache[stickerCacheKey] = [NSNull null];
+        return nil;
+    }
+
     // ── Load from file ────────────────────────────────────────────────────────
-    // Use NSURL fileURLWithPath: to construct the URL.
+    // Use the resolved absolute path to construct the NSURL.
     // kCIImageApplyOrientationProperty:@YES applies EXIF orientation metadata
     // automatically (iOS 11+), preventing rotated stickers from Photos.
-    NSURL *fileURL = [NSURL fileURLWithPath:assetPath];
+    NSURL *fileURL = [NSURL fileURLWithPath:resolvedPath];
     if (!fileURL) {
         os_log_error(OS_LOG_DEFAULT,
-                     "[VGOverlayNode][8.9] invalid assetPath for fileURLWithPath: "
-                     "path=%{public}@", assetPath);
+                     "[VGOverlayNode][8.9] invalid resolvedPath for fileURLWithPath: "
+                     "original=%{public}@ resolved=%{public}@", assetPath, resolvedPath);
         cache[stickerCacheKey] = [NSNull null];
         return nil;
     }
