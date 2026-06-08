@@ -1,5 +1,5 @@
 // vg_waveform_extractor_test.dart
-// vanguard_media_engine — Phase 8.15C
+// vanguard_media_engine — Phase 8.15C / Phase 8.18
 //
 // Unit tests for VGAudioWaveformResult and VGAudioWaveformExtractor.
 //
@@ -19,6 +19,16 @@
 //   WAVE-13: PlatformException propagation.
 //   WAVE-14: Uint8List bytes from channel are reinterpreted as Float32List.
 //   WAVE-15: VGAudioWaveformResult.toString contains pointCount.
+//
+//   Phase 8.18 cache integration tests:
+//   WAVE-16: null cacheKey bypasses cache, calls native extraction.
+//   WAVE-17: empty cacheKey bypasses cache, calls native extraction.
+//   WAVE-18: cache hit returns cached result, does not call native extraction.
+//   WAVE-19: cache miss calls native extraction and then saves result.
+//   WAVE-20: cache load throws, falls back to native extraction and saves result.
+//   WAVE-21: cache save throws after extraction, still returns extracted result.
+//   WAVE-22: native extraction error still propagates when cacheKey is provided.
+//   WAVE-23: cache hit does not call waveformCache_save.
 
 import 'dart:typed_data';
 
@@ -282,7 +292,6 @@ void main() {
       expect(result.samples.length, 5);
       expect(result.samples[4], closeTo(0.5, 0.001));
     });
-
   });
 
   // ── WAVE-15 ─────────────────────────────────────────────────────────────────
@@ -294,5 +303,274 @@ void main() {
       pointCount: 1,
     );
     expect(result.toString(), contains('pointCount: 1'));
+  });
+
+  // ── Phase 8.18 cache integration tests ──────────────────────────────────────
+  group('Phase 8.18: cache integration', () {
+    const channel = MethodChannel('vanguard_media_engine');
+    late List<MethodCall> capturedCalls;
+
+    // Shared mock native extraction result (pointCount=3 to distinguish from cache).
+    final nativeResult = {
+      'samples': Float32List.fromList([0.1, 0.2, 0.3]),
+      'durationSeconds': 3.0,
+      'samplesPerSecond': 100,
+      'pointCount': 3,
+    };
+
+    // Shared cached result payload (pointCount=2, durationSeconds=2.0 to distinguish).
+    final cachedSamples = Float32List.fromList([0.9, 0.8]);
+    final cachedResultPayload = {
+      'durationSeconds': 2.0,
+      'samplesPerSecond': 50,
+      'pointCount': 2,
+      'samples': cachedSamples.buffer.asUint8List(
+        cachedSamples.offsetInBytes,
+        cachedSamples.lengthInBytes,
+      ),
+    };
+
+    setUp(() {
+      capturedCalls = [];
+      TestWidgetsFlutterBinding.ensureInitialized();
+    });
+
+    tearDown(() {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null);
+    });
+
+    // ── WAVE-16 ──────────────────────────────────────────────────────────────
+    test('WAVE-16: null cacheKey bypasses cache, calls native extraction',
+        () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        capturedCalls.add(call);
+        if (call.method == 'extractWaveform') return nativeResult;
+        if (call.method == 'waveformCache_load' ||
+            call.method == 'waveformCache_save') {
+          fail('Cache must not be touched when cacheKey is null');
+        }
+        return null;
+      });
+
+      final result = await VGAudioWaveformExtractor.extract(
+        path: '/tmp/test.mp4',
+        cacheKey: null,
+      );
+
+      final methods = capturedCalls.map((c) => c.method).toList();
+      expect(methods, contains('extractWaveform'));
+      expect(methods, isNot(contains('waveformCache_load')));
+      expect(methods, isNot(contains('waveformCache_save')));
+      expect(result.pointCount, 3);
+    });
+
+    // ── WAVE-17 ──────────────────────────────────────────────────────────────
+    test('WAVE-17: empty cacheKey bypasses cache, calls native extraction',
+        () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        capturedCalls.add(call);
+        if (call.method == 'extractWaveform') return nativeResult;
+        if (call.method == 'waveformCache_load' ||
+            call.method == 'waveformCache_save') {
+          fail('Cache must not be touched when cacheKey is empty');
+        }
+        return null;
+      });
+
+      final result = await VGAudioWaveformExtractor.extract(
+        path: '/tmp/test.mp4',
+        cacheKey: '',
+      );
+
+      final methods = capturedCalls.map((c) => c.method).toList();
+      expect(methods, contains('extractWaveform'));
+      expect(methods, isNot(contains('waveformCache_load')));
+      expect(methods, isNot(contains('waveformCache_save')));
+      expect(result.pointCount, 3);
+    });
+
+    // ── WAVE-18 ──────────────────────────────────────────────────────────────
+    test('WAVE-18: cache hit returns cached result, native extraction skipped',
+        () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        capturedCalls.add(call);
+        if (call.method == 'waveformCache_load') return cachedResultPayload;
+        if (call.method == 'extractWaveform') {
+          fail('Native extraction must not be called on cache hit');
+        }
+        return null;
+      });
+
+      final result = await VGAudioWaveformExtractor.extract(
+        path: '/tmp/test.mp4',
+        cacheKey: 'track-abc',
+      );
+
+      final methods = capturedCalls.map((c) => c.method).toList();
+      expect(methods, contains('waveformCache_load'));
+      expect(methods, isNot(contains('extractWaveform')));
+      expect(methods, isNot(contains('waveformCache_save')));
+      expect(result.durationSeconds, closeTo(2.0, 0.001));
+      expect(result.samplesPerSecond, 50);
+      expect(result.pointCount, 2);
+      expect(result.samples.length, 2);
+    });
+
+    // ── WAVE-19 ──────────────────────────────────────────────────────────────
+    test('WAVE-19: cache miss calls native extraction and then saves result',
+        () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        capturedCalls.add(call);
+        if (call.method == 'waveformCache_load') return null; // cache miss
+        if (call.method == 'extractWaveform') return nativeResult;
+        if (call.method == 'waveformCache_save') return null;
+        return null;
+      });
+
+      final result = await VGAudioWaveformExtractor.extract(
+        path: '/tmp/test.mp4',
+        cacheKey: 'track-xyz',
+      );
+
+      final methods = capturedCalls.map((c) => c.method).toList();
+      expect(methods, contains('waveformCache_load'));
+      expect(methods, contains('extractWaveform'));
+      expect(methods, contains('waveformCache_save'));
+      // Load must precede extractWaveform, save must follow.
+      final loadIdx = methods.indexOf('waveformCache_load');
+      final extractIdx = methods.indexOf('extractWaveform');
+      final saveIdx = methods.indexOf('waveformCache_save');
+      expect(loadIdx, lessThan(extractIdx));
+      expect(extractIdx, lessThan(saveIdx));
+      // Result must be the native extraction result.
+      expect(result.pointCount, 3);
+      expect(result.durationSeconds, closeTo(3.0, 0.001));
+      // Save payload must carry the correct cacheKey.
+      final saveArgs = capturedCalls
+          .firstWhere((c) => c.method == 'waveformCache_save')
+          .arguments as Map;
+      expect(saveArgs['cacheKey'], 'track-xyz');
+    });
+
+    // ── WAVE-20 ──────────────────────────────────────────────────────────────
+    test(
+        'WAVE-20: cache load throws, falls back to native extraction and saves',
+        () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        capturedCalls.add(call);
+        if (call.method == 'waveformCache_load') {
+          throw PlatformException(
+            code: 'CACHE_ERROR',
+            message: 'Disk read failed',
+          );
+        }
+        if (call.method == 'extractWaveform') return nativeResult;
+        if (call.method == 'waveformCache_save') return null;
+        return null;
+      });
+
+      // Must not throw even though cache load threw.
+      final result = await VGAudioWaveformExtractor.extract(
+        path: '/tmp/test.mp4',
+        cacheKey: 'track-fallback',
+      );
+
+      final methods = capturedCalls.map((c) => c.method).toList();
+      expect(methods, contains('waveformCache_load'));
+      expect(methods, contains('extractWaveform'));
+      expect(methods, contains('waveformCache_save'));
+      expect(result.pointCount, 3);
+    });
+
+    // ── WAVE-21 ──────────────────────────────────────────────────────────────
+    test(
+        'WAVE-21: cache save throws after extraction, still returns extracted result',
+        () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        capturedCalls.add(call);
+        if (call.method == 'waveformCache_load') return null; // miss
+        if (call.method == 'extractWaveform') return nativeResult;
+        if (call.method == 'waveformCache_save') {
+          throw PlatformException(
+            code: 'CACHE_SAVE_FAILED',
+            message: 'Disk full',
+          );
+        }
+        return null;
+      });
+
+      // Must not throw even though save threw.
+      final result = await VGAudioWaveformExtractor.extract(
+        path: '/tmp/test.mp4',
+        cacheKey: 'track-save-fails',
+      );
+
+      final methods = capturedCalls.map((c) => c.method).toList();
+      expect(methods, contains('waveformCache_save'));
+      expect(result.pointCount, 3);
+      expect(result.samples.length, isPositive);
+    });
+
+    // ── WAVE-22 ──────────────────────────────────────────────────────────────
+    test(
+        'WAVE-22: native extraction error propagates when cacheKey is provided',
+        () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        capturedCalls.add(call);
+        if (call.method == 'waveformCache_load') return null; // miss
+        if (call.method == 'extractWaveform') {
+          throw PlatformException(
+            code: 'NO_AUDIO_TRACK',
+            message: 'no audio',
+          );
+        }
+        return null;
+      });
+
+      await expectLater(
+        () => VGAudioWaveformExtractor.extract(
+          path: '/tmp/silent.mp4',
+          cacheKey: 'track-error',
+        ),
+        throwsA(
+          isA<PlatformException>()
+              .having((e) => e.code, 'code', 'NO_AUDIO_TRACK'),
+        ),
+      );
+
+      final methods = capturedCalls.map((c) => c.method).toList();
+      expect(methods, contains('waveformCache_load'));
+      expect(methods, contains('extractWaveform'));
+      expect(methods, isNot(contains('waveformCache_save')));
+    });
+
+    // ── WAVE-23 ──────────────────────────────────────────────────────────────
+    test('WAVE-23: cache hit does not call waveformCache_save', () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+        capturedCalls.add(call);
+        if (call.method == 'waveformCache_load') return cachedResultPayload;
+        if (call.method == 'waveformCache_save') {
+          fail('waveformCache_save must not be called on cache hit');
+        }
+        return null;
+      });
+
+      await VGAudioWaveformExtractor.extract(
+        path: '/tmp/test.mp4',
+        cacheKey: 'track-hit-no-save',
+      );
+
+      final methods = capturedCalls.map((c) => c.method).toList();
+      expect(methods, isNot(contains('waveformCache_save')));
+    });
   });
 }

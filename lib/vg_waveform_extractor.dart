@@ -1,5 +1,5 @@
 // vg_waveform_extractor.dart
-// vanguard_media_engine — Phase 8.15C
+// vanguard_media_engine — Phase 8.15C / Phase 8.18
 //
 // Dart bridge for native iOS offline audio waveform extraction.
 //
@@ -7,15 +7,21 @@
 //   - VGAudioWaveformResult: typed result (Float32List samples + metadata).
 //   - VGAudioWaveformExtractor: static API that calls the native extractWaveform endpoint.
 //
-// Non-goals (Phase 8.15C):
+// Phase 8.18 addition:
+//   - Optional [cacheKey] parameter on extract().
+//   - On cache hit: returns the cached result without touching native extraction.
+//   - On cache miss: runs native extraction, then saves to cache.
+//   - Cache errors (load or save) are swallowed; extraction result is always returned.
+//
+// Non-goals:
 //   - No real-time audio graph.
 //   - No playback service.
 //   - No Android implementation.
 //   - No peak extraction (RMS only).
-//   - No caching (VGWaveformCache is a separate future slice).
 
 import 'dart:typed_data';
 import 'package:flutter/services.dart';
+import 'vg_waveform_cache.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Result type
@@ -102,6 +108,10 @@ abstract final class VGAudioWaveformExtractor {
   /// [path] must be a non-empty absolute path to a readable file.
   /// [samplesPerSecond] must be in [1, 1000]. Default 100.
   /// [maxDurationSeconds] must be > 0. Default 600.0 (10 minutes).
+  /// [cacheKey] is optional. If non-null and non-empty:
+  ///   - A cached result is returned immediately on cache hit.
+  ///   - On a miss, native extraction is run and the result is saved.
+  ///   - Cache load/save errors are swallowed and never surface to the caller.
   ///
   /// Returns a [VGAudioWaveformResult] containing Float32 RMS samples.
   /// Throws [ArgumentError] for invalid parameters.
@@ -110,6 +120,7 @@ abstract final class VGAudioWaveformExtractor {
     required String path,
     int samplesPerSecond = 100,
     double maxDurationSeconds = 600.0,
+    String? cacheKey,
   }) async {
     if (path.isEmpty) {
       throw ArgumentError.value(path, 'path', 'must be non-empty');
@@ -127,6 +138,19 @@ abstract final class VGAudioWaveformExtractor {
         'maxDurationSeconds',
         'must be > 0',
       );
+    }
+
+    // ── Phase 8.18: Cache-first lookup ───────────────────────────────────────
+    final effectiveKey =
+        (cacheKey != null && cacheKey.isNotEmpty) ? cacheKey : null;
+
+    if (effectiveKey != null) {
+      try {
+        final cached = await VGAudioWaveformCache.load(cacheKey: effectiveKey);
+        if (cached != null) return cached;
+      } catch (_) {
+        // Cache load error is non-fatal — fall through to native extraction.
+      }
     }
 
     final raw = await _channel.invokeMapMethod<String, dynamic>(
@@ -160,12 +184,23 @@ abstract final class VGAudioWaveformExtractor {
       samples = Float32List(0);
     }
 
-    return VGAudioWaveformResult(
+    final result = VGAudioWaveformResult(
       samples: samples,
       durationSeconds: (raw?['durationSeconds'] as num?)?.toDouble() ?? 0.0,
       samplesPerSecond: (raw?['samplesPerSecond'] as num?)?.toInt() ??
           samplesPerSecond,
       pointCount: (raw?['pointCount'] as num?)?.toInt() ?? samples.length,
     );
+
+    // ── Phase 8.18: Post-extraction cache save ────────────────────────────────
+    if (effectiveKey != null) {
+      try {
+        await VGAudioWaveformCache.save(cacheKey: effectiveKey, result: result);
+      } catch (_) {
+        // Cache save error is non-fatal — return the extracted result.
+      }
+    }
+
+    return result;
   }
 }
