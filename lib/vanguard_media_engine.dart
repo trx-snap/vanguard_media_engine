@@ -19,6 +19,8 @@ export 'vg_playback_session.dart';
 // Phase 6D.1A: typed camera session + preview widget.
 export 'vg_camera_session.dart';
 export 'vg_camera_preview.dart';
+// MC-22: Production MultiCam preview widget (composited dual-camera texture).
+export 'vg_multicam_preview.dart';
 // Phase 6: continuous device-aware zoom capability model.
 export 'vg_camera_zoom_capabilities.dart';
 
