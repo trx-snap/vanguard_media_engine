@@ -1,5 +1,5 @@
 // VanguardMultiCamMediaSource.m
-// vanguard_media_engine — MC-7/MC-8: Production MultiCam media source.
+// vanguard_media_engine — MC-7/MC-8/MC-20: Production MultiCam media source.
 //
 // ── IMPLEMENTATION NOTES ─────────────────────────────────────────────────────
 //
@@ -76,7 +76,8 @@ static AVCaptureDevice *_mc7DeviceForUniqueId(NSString *uniqueId) {
 // Implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-@interface VanguardMultiCamMediaSource () <AVCaptureVideoDataOutputSampleBufferDelegate>
+@interface VanguardMultiCamMediaSource () <AVCaptureVideoDataOutputSampleBufferDelegate,
+                                            AVCaptureAudioDataOutputSampleBufferDelegate>
 @end
 
 @implementation VanguardMultiCamMediaSource {
@@ -108,6 +109,13 @@ static AVCaptureDevice *_mc7DeviceForUniqueId(NSString *uniqueId) {
     CMTime           _pendingFrontPTS;
     CVPixelBufferRef _pendingBackBuffer;   // NULL if none pending
     CMTime           _pendingBackPTS;
+
+    // ── MC-20: Audio capture output (best-effort) ──────────────────────────
+    //
+    // Nil when microphone permission is denied or when hardware setup fails.
+    // Delegate callbacks fire on _captureQ (same queue as video) — serial.
+    // The sample buffer is forwarded to the delegate and is NOT retained here.
+    AVCaptureAudioDataOutput *_audioOutput;  // nil if audio unavailable
 
     // ── Session-level metrics ─────────────────────────────────────────────────
     double _hardwareCost;
@@ -318,6 +326,77 @@ static AVCaptureDevice *_mc7DeviceForUniqueId(NSString *uniqueId) {
     [_frontOutput setSampleBufferDelegate:self queue:_captureQ];
     [_backOutput  setSampleBufferDelegate:self queue:_captureQ];
 
+    // ── MC-20: Best-effort microphone input/output ───────────────────────────
+    //
+    // Performed after commitConfiguration (mic addition requires a separate
+    // beginConfiguration on AVCaptureMultiCamSession). Any failure is silently
+    // skipped: MultiCam preview and video-only recording remain functional.
+    //
+    // Mic permission check (no prompt): check only. Denied → skip entirely.
+    _audioOutput = nil;
+    AVAuthorizationStatus micStatus =
+        [AVCaptureDevice authorizationStatusForMediaType:AVMediaTypeAudio];
+    if (micStatus == AVAuthorizationStatusAuthorized) {
+        AVCaptureDevice *mic =
+            [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+        NSError *audioInputErr = nil;
+        AVCaptureDeviceInput *audioInput = mic
+            ? [AVCaptureDeviceInput deviceInputWithDevice:mic error:&audioInputErr]
+            : nil;
+
+        if (audioInput && !audioInputErr) {
+            [_session beginConfiguration];
+            BOOL audioConfigured = NO;
+            if ([_session canAddInput:audioInput]) {
+                [_session addInputWithNoConnections:audioInput];
+                AVCaptureAudioDataOutput *audioOut =
+                    [[AVCaptureAudioDataOutput alloc] init];
+                if ([_session canAddOutput:audioOut]) {
+                    [_session addOutputWithNoConnections:audioOut];
+                    // Connect mic input port → audio output.
+                    AVCaptureInputPort *audioPort = nil;
+                    for (AVCaptureInputPort *port in audioInput.ports) {
+                        if ([port.mediaType isEqualToString:AVMediaTypeAudio]) {
+                            audioPort = port;
+                            break;
+                        }
+                    }
+                    if (audioPort) {
+                        AVCaptureConnection *audioConn =
+                            [AVCaptureConnection connectionWithInputPorts:@[audioPort]
+                                                                   output:audioOut];
+                        if ([_session canAddConnection:audioConn]) {
+                            [_session addConnection:audioConn];
+                            _audioOutput = audioOut;
+                            audioConfigured = YES;
+                        } else {
+                            NSLog(@"[MC20] Cannot add audio connection — video-only fallback.");
+                        }
+                    } else {
+                        NSLog(@"[MC20] No audio port on mic input — video-only fallback.");
+                    }
+                } else {
+                    NSLog(@"[MC20] Cannot add audio output — video-only fallback.");
+                }
+            } else {
+                NSLog(@"[MC20] Cannot add audio input — video-only fallback.");
+            }
+            [_session commitConfiguration];
+            if (audioConfigured) {
+                // Wire audio delegate on the same serial captureQ as video.
+                [_audioOutput setSampleBufferDelegate:self queue:_captureQ];
+                NSLog(@"[MC20] Audio capture configured successfully.");
+            } else {
+                _audioOutput = nil;
+            }
+        } else {
+            NSLog(@"[MC20] Mic input setup failed (%@) — video-only fallback.",
+                  audioInputErr.localizedDescription);
+        }
+    } else {
+        NSLog(@"[MC20] Mic not authorized (status=%ld) — video-only fallback.", (long)micStatus);
+    }
+
     _stopped = NO;
     _startWallTime = 0;
     _durationSeconds = 0;
@@ -364,6 +443,9 @@ static AVCaptureDevice *_mc7DeviceForUniqueId(NSString *uniqueId) {
     // Belt-and-suspenders: stopRunning already drains the captureQ.
     [_frontOutput setSampleBufferDelegate:nil queue:nil];
     [_backOutput  setSampleBufferDelegate:nil queue:nil];
+    // MC-20: nil audio delegate (idempotent when _audioOutput is nil).
+    [_audioOutput setSampleBufferDelegate:nil queue:nil];
+    _audioOutput = nil;
 
     // ── Flush remaining unmatched PTS ─────────────────────────────────────────
     //
@@ -418,6 +500,21 @@ static AVCaptureDevice *_mc7DeviceForUniqueId(NSString *uniqueId) {
 - (void)captureOutput:(AVCaptureOutput *)output
     didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
          fromConnection:(AVCaptureConnection *)connection {
+
+    // ── MC-20: Audio path ───────────────────────────────────────────────────────────
+    // Identified by output pointer identity: output == _audioOutput.
+    // The sample buffer is borrowed (+0). The delegate receives it as-is;
+    // it is the delegate's responsibility to CFRetain if it needs it beyond
+    // its callback scope.
+    if (_audioOutput && output == _audioOutput) {
+        id<VanguardMultiCamMediaSourceDelegate> delegate = _delegate;
+        if (delegate && [delegate respondsToSelector:
+                @selector(multiCamMediaSource:didOutputAudioSampleBuffer:)]) {
+            [delegate multiCamMediaSource:self
+                didOutputAudioSampleBuffer:sampleBuffer];
+        }
+        return;
+    }
 
     // ── Identify camera by output pointer identity ────────────────────────────
     BOOL isFront = (output == _frontOutput);

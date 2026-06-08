@@ -1,5 +1,5 @@
 // VanguardMultiCamMediaSource.h
-// vanguard_media_engine — MC-7/MC-8: Production MultiCam media source.
+// vanguard_media_engine — MC-7/MC-8/MC-20: Production MultiCam media source.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // MC-7/MC-8 — MULTICAM MEDIA SOURCE (LIFECYCLE DIAGNOSTIC + BUFFER LIFECYCLE)
@@ -135,6 +135,26 @@ NS_ASSUME_NONNULL_BEGIN
 ///                     released by ARC after this method returns unless retained.
 - (void)multiCamMediaSource:(VanguardMultiCamMediaSource *)source
        didOutputPairedFrame:(VanguardMultiCamPairedFrame *)pairedFrame;
+
+@optional
+
+/// MC-20: Delivered when an audio sample buffer arrives from the microphone.
+///
+/// Called synchronously on the source's internal serial captureQ.
+/// Implementations MUST return quickly — no blocking I/O, no GPU work.
+/// The sample buffer is valid only for the duration of this callback.
+/// Implementations that need it beyond the callback MUST CFRetain it.
+///
+/// This method is @optional. Sources that do not need audio may ignore it.
+/// The source only calls this method when a microphone input was successfully
+/// configured (best-effort). No call is made when mic permission is denied
+/// or when hardware setup fails.
+///
+/// @param source        The source delivering the audio.
+/// @param sampleBuffer  The audio CMSampleBufferRef. The delegate does NOT own
+///                      this buffer; it will be released by the session.
+- (void)multiCamMediaSource:(VanguardMultiCamMediaSource *)source
+  didOutputAudioSampleBuffer:(CMSampleBufferRef)sampleBuffer;
 
 @end
 

@@ -1,5 +1,5 @@
 // VanguardMultiCamRenderer.m
-// vanguard_media_engine — MC-9/MC-10/MC-19: MultiCam compositor (production renderer).
+// vanguard_media_engine — MC-9/MC-10/MC-19/MC-20: MultiCam compositor (production renderer).
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // MC-9/MC-10 — MULTICAM OFFSCREEN COMPOSITION + FLUTTER TEXTURE
@@ -245,6 +245,12 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     int32_t                 _framesDroppedWriterNotReady;
     CFAbsoluteTime          _recordingStartTime;         // CFAbsoluteTimeGetCurrent() at first append
 
+    // MC-20: Best-effort AAC audio writer input.
+    // Nil when the source did not configure microphone capture (permission denied,
+    // hardware unavailable, or any canAdd* check failed).
+    // All access is on _renderQ (same as video writer state above).
+    AVAssetWriterInput     *_audioWriterInput;
+
     // Recording state — written/read exclusively on _renderQ.
     VGMCRecordingState _mcRecordingState;
 }
@@ -295,6 +301,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     _mcRecordingState             = VGMCRecordingStateIdle;
     _assetWriter                  = nil;
     _videoWriterInput             = nil;
+    _audioWriterInput             = nil;  // MC-20
     _pixelBufferAdaptor           = nil;
     _recordingOutputPath          = nil;
     _mcRecordingSessionStarted    = NO;
@@ -601,6 +608,10 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
             AVAssetWriterInput *input  = self->_videoWriterInput;
 
             if (writer && writer.status == AVAssetWriterStatusWriting) {
+                // MC-20: mark audio before video (AAC encoder flush order).
+                if (self->_audioWriterInput) {
+                    [self->_audioWriterInput markAsFinished];
+                }
                 [input markAsFinished];
                 // Bounded wait — prevents hanging teardown if mediaserverd stalls.
                 dispatch_semaphore_t sem = dispatch_semaphore_create(0);
@@ -617,6 +628,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
 
             self->_assetWriter        = nil;
             self->_videoWriterInput   = nil;
+            self->_audioWriterInput   = nil;  // MC-20
             self->_pixelBufferAdaptor = nil;
             self->_mcRecordingState   = VGMCRecordingStateIdle;
         }
@@ -764,6 +776,29 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         }
         [writer addInput:videoInput];
 
+        // ── MC-20: Best-effort AAC audio writer input ────────────────────────────
+        // Mirrors single-camera AAC settings (VanguardCameraMediaSource L694-698).
+        // Only added if canAddInput: passes. Failure is logged and silently skipped
+        // so recording proceeds as video-only (unchanged from pre-MC-20 behavior).
+        AVAssetWriterInput *audioInput = nil;
+        NSDictionary *audioSettings = @{
+            AVFormatIDKey           : @(kAudioFormatMPEG4AAC),
+            AVSampleRateKey         : @44100,
+            AVNumberOfChannelsKey   : @1,
+            AVEncoderBitRateKey     : @(128000),
+        };
+        AVAssetWriterInput *candidateAudioInput =
+            [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
+                                              outputSettings:audioSettings];
+        candidateAudioInput.expectsMediaDataInRealTime = YES;
+        if ([writer canAddInput:candidateAudioInput]) {
+            [writer addInput:candidateAudioInput];
+            audioInput = candidateAudioInput;
+            NSLog(@"[VanguardMultiCamRenderer][MC-20] AAC audio input added to writer.");
+        } else {
+            NSLog(@"[VanguardMultiCamRenderer][MC-20] Cannot add audio input — video-only recording.");
+        }
+
         if (![writer startWriting]) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 completion([FlutterError errorWithCode:@"WRITER_INIT_FAIL"
@@ -777,6 +812,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         // State is set to Starting; transitions to Recording on first appended frame.
         self->_assetWriter                 = writer;
         self->_videoWriterInput            = videoInput;
+        self->_audioWriterInput            = audioInput;  // MC-20: nil if unavailable
         self->_pixelBufferAdaptor          = adaptor;
         self->_recordingOutputPath         = [path copy];
         self->_mcRecordingSessionStarted   = NO;
@@ -787,7 +823,8 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         self->_mcRecordingState            = VGMCRecordingStateStarting;
 
         NSLog(@"[VanguardMultiCamRenderer][MC-17] startVideoRecordingToPath: "
-              "ready. outputDims=%dx%d path=%@", w, h, path);
+              "ready. outputDims=%dx%d audio=%@ path=%@",
+              w, h, audioInput ? @"YES" : @"NO", path);
 
         dispatch_async(dispatch_get_main_queue(), ^{
             completion(nil);  // success
@@ -832,6 +869,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         if (!writer || writer.status != AVAssetWriterStatusWriting) {
             self->_assetWriter        = nil;
             self->_videoWriterInput   = nil;
+            self->_audioWriterInput   = nil;  // MC-20
             self->_pixelBufferAdaptor = nil;
             self->_mcRecordingState   = VGMCRecordingStateIdle;
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -843,6 +881,11 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
         }
 
         // Finalize the writer.
+        // MC-20: markAsFinished on audio input before video input (order matters
+        // for AAC encoder flush). Both must be marked before finishWriting.
+        if (self->_audioWriterInput) {
+            [self->_audioWriterInput markAsFinished];
+        }
         [input markAsFinished];
         [writer finishWritingWithCompletionHandler:^{
             // finishWriting fires on an arbitrary thread — re-dispatch to _renderQ
@@ -865,6 +908,7 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
                 // Clear ivars.
                 self->_assetWriter        = nil;
                 self->_videoWriterInput   = nil;
+                self->_audioWriterInput   = nil;  // MC-20
                 self->_pixelBufferAdaptor = nil;
                 self->_mcRecordingState   = VGMCRecordingStateIdle;
 
@@ -940,6 +984,69 @@ typedef NS_ENUM(NSInteger, VGMCRecordingState) {
     });
 
     // Return immediately. GPU work happens on renderQ.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK: - MC-20: Audio delegate
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Called on the source's captureQ. The sample buffer is borrowed (+0).
+///
+/// MC-20 threading contract (Opus-validated):
+///   1. CFRetain the sample buffer here on captureQ — extends its lifetime.
+///   2. dispatch_async to _renderQ — serializes with all video appends.
+///   3. On renderQ: check guards, append if safe, CFRelease unconditionally.
+///
+/// Guards on _renderQ (all must pass):
+///   - _mcRecordingState == VGMCRecordingStateRecording
+///   - _mcRecordingSessionStarted == YES (startSessionAtSourceTime: was called)
+///   - _assetWriter.status == AVAssetWriterStatusWriting
+///   - _audioWriterInput != nil
+///   - _audioWriterInput.isReadyForMoreMediaData == YES
+///
+/// Early audio (before first video frame establishes session time) is dropped
+/// by the _mcRecordingSessionStarted guard. No buffering, no timestamp rebasing.
+- (void)multiCamMediaSource:(VanguardMultiCamMediaSource *)source
+  didOutputAudioSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+
+    // Retain on captureQ — makes the buffer safe to use asynchronously.
+    CFRetain(sampleBuffer);
+
+    dispatch_async(_renderQ, ^{
+        // ── Guard 1: must be actively recording (not starting, stopping, or idle) ──
+        // Starting state intentionally excluded: session hasn't begun yet.
+        // Audio appended before startSessionAtSourceTime: would crash the writer.
+        if (self->_mcRecordingState != VGMCRecordingStateRecording ||
+            !self->_mcRecordingSessionStarted) {
+            CFRelease(sampleBuffer);
+            return;
+        }
+
+        // ── Guard 2: writer must be in writing state ───────────────────────────
+        if (!self->_assetWriter ||
+            self->_assetWriter.status != AVAssetWriterStatusWriting) {
+            CFRelease(sampleBuffer);
+            return;
+        }
+
+        // ── Guard 3: audio writer input must be present and ready ──────────────
+        if (!self->_audioWriterInput ||
+            !self->_audioWriterInput.isReadyForMoreMediaData) {
+            CFRelease(sampleBuffer);
+            return;
+        }
+
+        // ── Append ────────────────────────────────────────────────────────────
+        BOOL ok = [self->_audioWriterInput appendSampleBuffer:sampleBuffer];
+        if (!ok) {
+            NSLog(@"[VanguardMultiCamRenderer][MC-20] audio appendSampleBuffer failed. "
+                  "writerStatus=%ld error=%@",
+                  (long)self->_assetWriter.status,
+                  self->_assetWriter.error.localizedDescription);
+        }
+
+        CFRelease(sampleBuffer);
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

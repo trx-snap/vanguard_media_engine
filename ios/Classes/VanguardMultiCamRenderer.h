@@ -1,5 +1,5 @@
 // VanguardMultiCamRenderer.h
-// vanguard_media_engine — MC-9/MC-10/MC-13/MC-15/MC-17/MC-19: MultiCam compositor.
+// vanguard_media_engine — MC-9/MC-10/MC-13/MC-15/MC-17/MC-19/MC-20: MultiCam compositor.
 //
 // ═══════════════════════════════════════════════════════════════════════════════
 // MC-9/MC-10 — MULTICAM OFFSCREEN COMPOSITION + FLUTTER TEXTURE
@@ -273,8 +273,9 @@ static inline VGMCRDLayoutConfig VGMCRDDefaultLayoutConfig(void) {
 
 // ─── MC-17: Video-only recording ──────────────────────────────────────────────
 
-/// Starts video-only recording of the composited preview buffer to [path].
-/// Audio is not included. Preview must be actively rendering frames.
+/// Starts recording of the composited preview buffer to [path].
+/// MC-20: Includes best-effort AAC audio if microphone was configured in the source.
+/// Falls back to video-only if audio input/output setup failed at source init.
 ///
 /// ## Thread safety
 /// Dispatches all setup onto `_renderQ` to serialize with the render/append path.
