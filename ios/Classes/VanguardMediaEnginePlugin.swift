@@ -2785,6 +2785,71 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
             }
 
+        // ── Waveform Extraction (Phase 8.15C) ─────────────────────────────────
+        // Extracts a Float32 RMS waveform from an audio/video file offline.
+        //
+        // Args:
+        //   "path":               String — required, absolute path to audio/video file
+        //   "samplesPerSecond":   Int    — optional, default 100 (range 1–1000)
+        //   "maxDurationSeconds": Double — optional, default 600.0
+        //
+        // Returns on success:
+        //   [
+        //     "samples":         FlutterStandardTypedData (Float32List)
+        //     "durationSeconds": Double
+        //     "samplesPerSecond": Int
+        //     "pointCount":      Int
+        //   ]
+        //
+        // Returns FlutterError on failure with codes:
+        //   "NO_AUDIO_TRACK", "ZERO_DURATION", "DURATION_EXCEEDED",
+        //   "READER_SETUP_FAILED", "READER_FAILED", "WAVEFORM_CANCELLED"
+
+        case "extractWaveform":
+            guard let filePath = args?["path"] as? String, !filePath.isEmpty else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "path is required and must be non-empty",
+                                    details: nil))
+                return
+            }
+            let waveSamplesPerSec = args?["samplesPerSecond"] as? Int ?? 100
+            let waveMaxDuration   = args?["maxDurationSeconds"] as? Double ?? 600.0
+
+            let waveAsset = AVURLAsset(url: URL(fileURLWithPath: filePath))
+            let extractor = VGWaveformExtractor(asset: waveAsset)
+
+            extractor.extract(withSamplesPerSecond: waveSamplesPerSec,
+                              maxDurationSeconds: waveMaxDuration) { waveResult, error in
+                if let error = error {
+                    let code: String
+                    switch (error as NSError).code {
+                    case 1:  code = "NO_AUDIO_TRACK"
+                    case 2:  code = "ZERO_DURATION"
+                    case 3:  code = "DURATION_EXCEEDED"
+                    case 4:  code = "READER_SETUP_FAILED"
+                    case 5:  code = "READER_FAILED"
+                    case 6:  code = "WAVEFORM_CANCELLED"
+                    default: code = "WAVEFORM_ERROR"
+                    }
+                    result(FlutterError(code: code,
+                                        message: error.localizedDescription,
+                                        details: nil))
+                    return
+                }
+                guard let waveResult = waveResult else {
+                    result(FlutterError(code: "WAVEFORM_ERROR",
+                                        message: "Extraction returned nil result",
+                                        details: nil))
+                    return
+                }
+                result([
+                    "samples":          FlutterStandardTypedData(float32: waveResult.samplesData),
+                    "durationSeconds":  waveResult.durationSeconds,
+                    "samplesPerSecond": waveResult.samplesPerSecond,
+                    "pointCount":       waveResult.pointCount,
+                ])
+            }
+
         // ── Thumbnail Generation (P1-T7: VanguardThumbnailGenerator) ─────────
 
         case "generateThumbnails":

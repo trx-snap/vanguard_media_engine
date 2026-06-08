@@ -37,3 +37,5 @@
 // MC-9/MC-19: MultiCam production compositor (promoted from VanguardMultiCamRenderDiagnostic).
 // Required so Swift plugin code can reference VanguardMultiCamRenderer.
 #import "VanguardMultiCamRenderer.h"  // MC-9/MC-19: MultiCam compositor (production renderer)
+// Phase 8.15C: offline audio waveform extraction utility.
+#import "VGWaveformExtractor.h"       // VGWaveformExtractor + VGWaveformResult

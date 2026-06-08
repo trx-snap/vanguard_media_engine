@@ -62,6 +62,8 @@ export 'vg_overlay_descriptor.dart';
 export 'vg_audio_sidecar_plan.dart';
 // Phase 8.15B: offline audio ducking engine.
 export 'vg_audio_ducking_engine.dart';
+// Phase 8.15C: native offline audio waveform extraction.
+export 'vg_waveform_extractor.dart';
 // Phase 7.20D: Dart model for reverse sidecar asset state.
 export 'vg_reverse_sidecar_status.dart';
 
