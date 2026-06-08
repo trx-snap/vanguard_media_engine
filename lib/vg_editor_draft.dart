@@ -99,6 +99,7 @@
 //     'fps': int,
 //   }
 
+import 'vg_audio_ducking_engine.dart';
 import 'vg_audio_sidecar_plan.dart';
 import 'vg_canvas_descriptor.dart';
 import 'vg_clip_descriptor.dart';
@@ -713,6 +714,72 @@ final class VGEditorDraft {
 
     return copyWith(
       audioSidecarPlan: VGAudioSidecarPlan(tracks: mergedTracks),
+    );
+  }
+
+  // ── Audio ducking integration (Phase 8.19) ────────────────────────────────
+
+  /// Returns a new [VGEditorDraft] with automated volume ducking applied to
+  /// the `music` tracks in [audioSidecarPlan] using [VGAudioDuckingEngine].
+  ///
+  /// **Phase 8.19 — Audio Ducking Engine Draft Integration.**
+  ///
+  /// Delegates entirely to [VGAudioDuckingEngine.apply] — does NOT reimplement
+  /// ducking math. The engine ducks music tracks around foreground
+  /// (`voiceover`, `original`) intervals, respecting [config] parameters.
+  ///
+  /// **Return behaviour:**
+  ///   - Returns `this` if [audioSidecarPlan] is null (no sidecar → no change).
+  ///   - Returns `this` if [audioSidecarPlan.tracks] is empty.
+  ///   - Returns `this` if the engine produces an identical track list (no
+  ///     music tracks, no overlapping foreground intervals, or all music tracks
+  ///     already have pre-authored keyframes).
+  ///   - Otherwise, returns a new [VGEditorDraft] via [copyWith] containing an
+  ///     updated [VGAudioSidecarPlan] with keyframe-enriched music tracks.
+  ///
+  /// **Non-destructive:** the original draft, original sidecar plan, and
+  /// original track list are never mutated. All non-audio draft fields
+  /// (clips, transitions, canvas, overlays, fps) are preserved exactly.
+  ///
+  /// **Offline only:** this is a model-level, export-targeted operation. It
+  /// does not affect real-time playback and requires no MethodChannel calls.
+  ///
+  /// [config] is the ducking configuration. Defaults to
+  /// [VGAudioDuckingConfig] defaults (–12 dB duck, 150 ms attack, 300 ms
+  /// release, 50 ms merge gap).
+  ///
+  /// ```dart
+  /// final ducked = draft.applyAudioDucking();
+  /// // Same as:
+  /// final ducked = draft.applyAudioDucking(config: const VGAudioDuckingConfig());
+  /// ```
+  VGEditorDraft applyAudioDucking({VGAudioDuckingConfig? config}) {
+    // Guard: no sidecar plan → nothing to duck.
+    if (audioSidecarPlan == null) return this;
+    // Guard: empty track list → nothing to duck.
+    if (audioSidecarPlan!.tracks.isEmpty) return this;
+
+    final effectiveConfig = config ?? const VGAudioDuckingConfig();
+    final processedTracks = const VGAudioDuckingEngine().apply(
+      audioSidecarPlan!.tracks,
+      config: effectiveConfig,
+    );
+
+    // If the engine returned an identical track list (no ducking applied),
+    // return this to avoid allocating a new instance unnecessarily.
+    bool changed = processedTracks.length != audioSidecarPlan!.tracks.length;
+    if (!changed) {
+      for (var i = 0; i < processedTracks.length; i++) {
+        if (processedTracks[i] != audioSidecarPlan!.tracks[i]) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    if (!changed) return this;
+
+    return copyWith(
+      audioSidecarPlan: VGAudioSidecarPlan(tracks: processedTracks),
     );
   }
 
