@@ -17,8 +17,34 @@ Pod::Spec.new do |s|
   # DynamicLibrary.process() finds symbols in all loaded dylibs — no linker flags needed.
   s.source_files     = 'Classes/**/*.{swift,h,m,mm,metal}'
 
+  # Phase 9B — model asset bundle.
+  # selfie_multiclass_256x256.tflite: Apache 2.0 (Google MediaPipe Solutions).
+  # SHA256: c6748b1253a99067ef71f7e26ca71096cd449baefa8f101900ea23016507e0e0
+  # Bundled under 'VanguardMLModels' so the resource resolver can locate it
+  # via NSBundle(identifier:) or by walking the main bundle's path.
+  s.resource_bundles = {
+    'VanguardMLModels' => ['Assets/**/*.tflite']
+  }
+
   s.dependency       'Flutter'
   s.dependency       'UMF'
+  # Phase 9B — TFLite C runtime + Metal GPU delegate (prebuilt dynamic xcframeworks).
+  #
+  # TensorFlowLiteC is the dynamic xcframework variant of the TFLite runtime.
+  # It is compatible with Flutter's use_frameworks! Podfile directive.
+  #
+  # TensorFlowLiteObjC (the high-level ObjC wrapper pod) is NOT declared here
+  # because it is a source-code-only pod that compiles to a static library,
+  # which conflicts with use_frameworks! in the Flutter example Podfile.
+  # The VGLiteRTMaskProvider implementation (Phase 9B-1) will use the
+  # TFLite C API directly via TensorFlowLiteC headers, which expose a complete
+  # Objective-C-compatible C interface for interpreter lifecycle and tensor I/O.
+  #
+  # TensorFlowLiteC/Metal adds the prebuilt GPU delegate xcframework
+  # (TensorFlowLiteCMetal.xcframework) required for < 25 ms live-preview
+  # inference. CPU fallback (~140 ms) is forbidden for real-time video.
+  s.dependency       'TensorFlowLiteC', '~> 2.14'
+  s.dependency       'TensorFlowLiteC/Metal', '~> 2.14'
   s.platform         = :ios, '14.0'
 
   # Frameworks required for the GPU pipeline + Vision (Phase 4C face detection, DEC-61)
@@ -133,7 +159,9 @@ Pod::Spec.new do |s|
       # Phase 6A-3D-2: Camera filter construction unit tests (Beauty V1)
       'Tests/VGCameraFilterConstructionTest.m',
       # Phase 9A: Provider-backed segmentation architecture contract tests
-      'Tests/VGSegmentationNodeProviderTest.m'
+      'Tests/VGSegmentationNodeProviderTest.m',
+      # Phase 9B: Model asset integrity smoke test
+      'Tests/VGMLModelAssetTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage'
     ts.dependency    'UMF'
