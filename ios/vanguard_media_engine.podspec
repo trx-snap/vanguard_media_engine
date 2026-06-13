@@ -131,7 +131,9 @@ Pod::Spec.new do |s|
       # Phase 6A-3D-1: Camera resource contract unit tests
       'Tests/VGCameraResourceContractTest.m',
       # Phase 6A-3D-2: Camera filter construction unit tests (Beauty V1)
-      'Tests/VGCameraFilterConstructionTest.m'
+      'Tests/VGCameraFilterConstructionTest.m',
+      # Phase 9A: Provider-backed segmentation architecture contract tests
+      'Tests/VGSegmentationNodeProviderTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage'
     ts.dependency    'UMF'

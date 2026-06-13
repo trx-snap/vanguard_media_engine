@@ -2,32 +2,35 @@
 // Phase 4F — Step 1: VGSegmentationNode extraction (DEC-100).
 // Phase B  — Step 3 temporal stability (DEC-117): generation reset + adaptive EMA.
 // Phase C  — Step 4 semantic accuracy (DEC-119): YCbCr chroma extraction for skin verification.
+// Phase 9A — Provider-backed architecture: delegates frame submission and mask
+//            retrieval to an id<VGMaskProvider> (default: VGHeuristicMaskProvider).
 //
-// Exact behavioral clone of the face detection + mask generation path
-// previously embedded in BeautyV2FilterGroup. No algorithm changes.
+// Behavior preserved exactly:
+//   - processEnvelope: output metadata is identical to the pre-9A implementation.
+//   - skinMaskBuffer CVPixelBufferRef ownership/lifetime contract unchanged.
+//   - Legacy VGSkinMask metadata key preserved for BeautyV2 fallback.
+//   - processBuffer: (legacy VanguardFilterNode path) behavior unchanged.
 //
-// Execution model:
-//   processEnvelope:device: is called synchronously on the filter chain thread
-//   (videoDecodeQueue for video, main thread for image). Face detection is
-//   dispatched asynchronously inside VGFaceDetectionProvider (never blocks).
-//   Mask generation is dispatched asynchronously inside VGSkinMaskGenerator.
-//   This node reads the latest cached results — NEVER blocks waiting for them.
+// State migrated to VGHeuristicMaskProvider (no longer lives here):
+//   _faceDetectionProvider
+//   _skinMaskGenerator
+//   _lastMaskDetectionTime
+//   _lastGeneration / _lastGenerationValid
+//   _chromaDownBuffer / _chromaDownBufferSize
 //
-// Metadata output:
-//   When a valid mask exists, this node creates an NSDictionary with mask data
-//   and attaches it to the envelope via VGFrameEnvelopeCopyWithMetadata.
-//   When no mask is available, the envelope is forwarded unchanged (metadata=NULL).
+// State remaining here (metadata packaging only):
+//   _maskProvider (id<VGMaskProvider>) — the active provider
 //
-// Memory safety (DEC-102, RR-86):
-//   All metadata ownership goes through VGFrameEnvelope lifecycle helpers.
-//   The NSDictionary is created inside processEnvelope:, CFRetained by
-//   VGFrameEnvelopeCopyWithMetadata, and released by the final consumer
-//   (scheduler or image processor) via VGFrameEnvelopeReleaseMetadata.
+// Ownership rules:
+//   CVPixelBufferCreateWithBytes, _VGMaskBufferReleaseCallback, and the
+//   metadata NSDictionary are all created and owned here, not in the provider.
+//   This preserves the existing NSData / CVPixelBuffer lifetime contract exactly.
 
 #import "VGSegmentationNode.h"
-#import "VGFaceDetectionProvider.h"
-#import "VGSkinMaskGenerator.h"
-#import <CoreVideo/CoreVideo.h>  // kCVPixelFormatType_420YpCbCr8BiPlanar*
+#import "VGMaskProvider.h"
+#import "VGHeuristicMaskProvider.h"
+#import "VGSkinMaskGenerator.h"  // VGSkinMask type
+#import <CoreVideo/CoreVideo.h>
 #import <os/log.h>
 
 // ─── Metadata keys ───────────────────────────────────────────────────────────
@@ -59,45 +62,11 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
     NSString *_nodeType;
     NSString *_filterName;
 
-    // ── Face detection (moved from BeautyV2FilterGroup) ──────────────────────
-    VGFaceDetectionProvider *_faceDetectionProvider;
-
-    // ── Skin mask (moved from BeautyV2FilterGroup) ───────────────────────────
-    VGSkinMaskGenerator *_skinMaskGenerator;
-    CFAbsoluteTime _lastMaskDetectionTime;
-
-    // ── Phase A.1 luma buffer — DISABLED (DEC-113 / RR-98) ───────────────────
-    // Edge-aware luma-guided feathering is disabled on all paths until luma and
-    // detection geometry can be paired by PTS or generation tag.
-    //
-    // Root cause: _faceDetectionProvider.latestResult is asynchronous with
-    // cadence=3. At the point submitResult: is called, the detection geometry
-    // may be from frame N-3 while the current-frame luma is from frame N.
-    // Pairing stale geometry with fresh luma produces incorrect bilateral weights
-    // at face/background edges and is unsafe for video.
-    //
-    // The image/still path uses the same processEnvelope:device: entrypoint and
-    // provides no reliable same-frame pairing signal. Disabling globally is the
-    // only conservative option until PTS/generation-paired luma delivery exists.
-    //
-    // Feathering falls back to the original Gaussian blur (exact Step 1 behaviour).
-    // _lumaDownBuffer intentionally removed — no luma extraction occurs.
-    // A.1 is deferred to a future step (see RR-98, DEC-113 updated status).
-
-    // ── Phase B (DEC-117): generation tracking ─────────────────────────────────────────
-    // _lastGeneration: the generation stamp seen on the previous envelope.
-    // When it changes, temporal state in _skinMaskGenerator is reset and
-    // _lastMaskDetectionTime is cleared so a fresh detection is not skipped.
-    uint64_t _lastGeneration;
-    BOOL     _lastGenerationValid; // NO until first envelope is processed
-    // NOTE: Cadence adaptation (B.2) is DEFERRED — see DEC-118.
-    // cadenceFrames stays fixed at 3 (set at init, never modified at runtime).
-
-    // ── Phase C.1 (DEC-119): reusable quarter-res CbCr downsample buffer ───────────
-    // Allocated once, rewritten each frame when the source is biplanar YCbCr.
-    // Freed in invalidate/dealloc.
-    uint8_t *_chromaDownBuffer;
-    size_t   _chromaDownBufferSize;
+    // ── Phase 9A: mask provider ───────────────────────────────────────────────
+    // Default: VGHeuristicMaskProvider (wraps VGFaceDetectionProvider +
+    // VGSkinMaskGenerator + generation/chroma state).
+    // In tests: replaced with a stub conforming to VGMaskProvider.
+    id<VGMaskProvider> _maskProvider;
 }
 
 @synthesize nodeId     = _nodeId;
@@ -126,6 +95,14 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
 
 - (instancetype)initWithPool:(CVPixelBufferPoolRef)pool
                       device:(id<MTLDevice>)device {
+    return [self initWithPool:pool
+                       device:device
+                     provider:[[VGHeuristicMaskProvider alloc] init]];
+}
+
+- (instancetype)initWithPool:(CVPixelBufferPoolRef)pool
+                      device:(id<MTLDevice>)device
+                    provider:(id<VGMaskProvider>)provider {
     self = [super init];
     if (!self) return nil;
 
@@ -134,24 +111,8 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
     _filterName = @"Segmentation";
     _enabled    = YES;
 
-    // Phase 4C (DEC-61): async face detection provider.
-    // Same init as BeautyV2FilterGroup — cadenceFrames:3, enabled=YES.
-    _faceDetectionProvider = [[VGFaceDetectionProvider alloc] initWithCadenceFrames:3];
-    _faceDetectionProvider.enabled = YES;
-
-    // Phase 4C (DEC-62/64): CPU skin mask generator.
-    _skinMaskGenerator = [[VGSkinMaskGenerator alloc] init];
-    _lastMaskDetectionTime = 0;
-
-    // Phase B (DEC-117): generation tracking — initialise as invalid so the
-    // first envelope always triggers a reset check.
-    _lastGeneration      = 0;
-    _lastGenerationValid = NO;
-    // Cadence adaptation (B.2) DEFERRED (DEC-118) — cadenceFrames fixed at 3.
-
-    // Phase C.1 (DEC-119): chroma downsample buffer — allocated on first use.
-    _chromaDownBuffer     = NULL;
-    _chromaDownBufferSize = 0;
+    // Phase 9A: delegate all heuristic work to the provider.
+    _maskProvider = provider;
 
     return self;
 }
@@ -159,22 +120,16 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
 // ─── Lifecycle ───────────────────────────────────────────────────────────────
 
 - (void)prepareWithCompletion:(void (^)(NSError * _Nullable))completion {
-    // No preparation needed — detection and mask gen are created at init.
+    // No preparation needed — provider is ready at init.
     if (completion) completion(nil);
 }
 
 - (void)invalidate {
-    [_faceDetectionProvider invalidate];
-    [_skinMaskGenerator invalidate];
-    // No luma buffer to free — luma extraction disabled (DEC-113 / RR-98).
-    free(_chromaDownBuffer); _chromaDownBuffer = NULL; _chromaDownBufferSize = 0;
+    [_maskProvider invalidate];
 }
 
 - (void)dealloc {
-    [_faceDetectionProvider invalidate];
-    [_skinMaskGenerator invalidate];
-    // No luma buffer to free — luma extraction disabled (DEC-113 / RR-98).
-    free(_chromaDownBuffer); _chromaDownBuffer = NULL;
+    [_maskProvider invalidate];
 }
 
 // ─── VGMetalFilterNode: processEnvelope:device: ──────────────────────────────
@@ -182,8 +137,8 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
 // Core execution path. Called once per frame on the filter chain thread.
 //
 // This method:
-//   1. Submits the input frame for async face detection (never blocks)
-//   2. Feeds detection results to the mask generator (never blocks)
+//   1. Submits the input frame to the mask provider (never blocks)
+//   2. Reads the latest mask from the provider
 //   3. If a valid mask exists, creates metadata and attaches it to the envelope
 //   4. Returns the envelope with the same video payload, optionally with metadata
 //
@@ -201,127 +156,13 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
     CVPixelBufferRef input = (CVPixelBufferRef)envelope.payload.videoBuffer;
     if (!input) return envelope;
 
-    size_t w = CVPixelBufferGetWidth(input);
-    size_t h = CVPixelBufferGetHeight(input);
+    // ── 1. Submit frame to the mask provider (never blocks) ──────────────────
+    // The provider handles async face detection, chroma extraction, mask
+    // generation, and generation-change temporal resets internally.
+    [_maskProvider submitFrame:input pts:envelope.pts generation:envelope.generation];
 
-    // ── Phase B: Generation reset (DEC-117) ───────────────────────────────────
-    // On generation change (seek / session restart), clear all temporal state
-    // so the first post-seek mask does not blend with pre-seek data.
-    //
-    // Constraints satisfied:
-    //   - Does NOT use wall-clock time (uses envelope.generation).
-    //   - EMA buffer and motion history cleared via resetTemporalState.
-    //   - _lastMaskDetectionTime is reset so the updated detection result is
-    //     not filtered out by the completionTime guard below.
-    if (!_lastGenerationValid || envelope.generation != _lastGeneration) {
-        // Reset mask generator temporal state (dispatched to mask queue).
-        [_skinMaskGenerator resetTemporalState];
-        // Reset detection time so new detection results are not skipped.
-        _lastMaskDetectionTime = 0;
-        // Record new generation.
-        _lastGeneration      = envelope.generation;
-        _lastGenerationValid = YES;
-    }
-
-    // ── 1. Submit for async face detection (never blocks) ────────────────────
-    [_faceDetectionProvider detectInPixelBuffer:input pts:envelope.pts];
-
-    // ── 2. Feed latest detection result to mask generator ────────────────────
-    //
-    // Phase A.1 (DEC-113) luma-guided feathering is DISABLED on all paths.
-    //
-    // Safety reason (RR-98): `_faceDetectionProvider.latestResult` is produced
-    // asynchronously with cadence=3. At this call site the detection geometry
-    // may be from frame N-3 while a current-frame luma would be from frame N.
-    // Pairing stale detection geometry with fresh luma is unsafe for edge-aware
-    // feathering — the bilateral weights reference face/background edges that no
-    // longer correspond to the current frame.
-    //
-    // The image/still path shares this entrypoint and provides no reliable
-    // same-frame PTS or generation signal to distinguish it from video.
-    //
-    // Mitigation: pass NULL luma, forcing the Gaussian fallback in
-    // VGSkinMaskGenerator (exact Step 1 behaviour). No luma extraction occurs.
-    // A.1 is deferred until PTS/generation-paired luma delivery is available.
-    //
-    // Phase A.2 (soft feature exclusion) and Phase A.3 (neck extension) are
-    // NOT affected by this change — they depend only on face geometry, which
-    // is already async-accepted by the detection cadence model.
-    //
-    // Phase C.1 (DEC-119): CbCr chroma is extracted each frame for skin verification.
-    // A 1-frame lag between chroma and detection geometry is safe (skin colour
-    // is stable between frames). No PTS pairing required (contrast: A.1 luma).
-    VGFaceDetectionResult *detectionResult = _faceDetectionProvider.latestResult;
-    if (detectionResult && detectionResult.completionTime > _lastMaskDetectionTime) {
-
-        // ── Phase C.1: Extract quarter-res CbCr from current CVPixelBuffer ──────────
-        // Source format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange (420v)
-        //             or kCVPixelFormatType_420YpCbCr8BiPlanarFullRange  (420f).
-        // Plane 1 is interleaved CbCr at half-resolution (w/2 × h/2).
-        // Target: quarter-res (qw × qh = w/4 × h/4) — nearest-neighbor 2:1 subsample.
-        //
-        // Memory: _chromaDownBuffer is a reusable malloc buffer (qw*qh*2 bytes).
-        // It is re-filled each frame and copied synchronously into NSData before
-        // submitResult:chromaBuffer: returns. No long-lived pointer is kept.
-        //
-        // If the pixel format is not biplanar YCbCr, chromaBuffer is NULL and
-        // skin verification is skipped gracefully this frame.
-        const uint8_t *chromaBuffer = NULL;
-        size_t qw = w / 4;
-        size_t qh = h / 4;
-        size_t chromaBufSize = qw * qh * 2; // 2 bytes per pixel: Cb + Cr
-
-        OSType pixelFormat = CVPixelBufferGetPixelFormatType(input);
-        BOOL isBiplanarYCbCr = (pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
-                                 pixelFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
-
-        if (isBiplanarYCbCr && qw >= 2 && qh >= 2) {
-            // Ensure reuse buffer is allocated.
-            if (!_chromaDownBuffer || _chromaDownBufferSize < chromaBufSize) {
-                free(_chromaDownBuffer);
-                _chromaDownBuffer = (uint8_t *)malloc(chromaBufSize);
-                _chromaDownBufferSize = _chromaDownBuffer ? chromaBufSize : 0;
-            }
-
-            if (_chromaDownBuffer) {
-                CVPixelBufferLockBaseAddress(input, kCVPixelBufferLock_ReadOnly);
-                // Plane 1: interleaved CbCr at w/2 × h/2.
-                const uint8_t *cbcrPlane = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(input, 1);
-                size_t cbcrBPR = CVPixelBufferGetBytesPerRowOfPlane(input, 1); // bytes-per-row (may have padding)
-                size_t cbcrH   = CVPixelBufferGetHeightOfPlane(input, 1); // == h/2
-
-                // Nearest-neighbor 2:1 subsample: take row (2r), col (2c) from the CbCr plane.
-                // This maps CbCr half-res coords to quarter-res of source (= target qw×qh).
-                // cbcr[row][col] covers source pixel (row*2, col*2) = quarter-res pixel.
-                for (size_t qy = 0; qy < qh && (qy * 2) < cbcrH; qy++) {
-                    const uint8_t *srcRow = cbcrPlane + (qy * 2) * cbcrBPR;
-                    uint8_t       *dstRow = _chromaDownBuffer + qy * qw * 2;
-                    for (size_t qx = 0; qx < qw; qx++) {
-                        // srcRow offset: column qx*2 in the CbCr plane → 2*(qx*2) bytes
-                        // (each CbCr pixel = 2 bytes interleaved).
-                        size_t srcOff = (qx * 2) * 2; // = qx*4
-                        dstRow[qx * 2]     = srcRow[srcOff];     // Cb
-                        dstRow[qx * 2 + 1] = srcRow[srcOff + 1]; // Cr
-                    }
-                }
-                CVPixelBufferUnlockBaseAddress(input, kCVPixelBufferLock_ReadOnly);
-                chromaBuffer = _chromaDownBuffer;
-            }
-        }
-
-        // Submit to mask generator with chroma (or NULL for non-YCbCr formats).
-        [_skinMaskGenerator submitResult:detectionResult
-                            chromaBuffer:chromaBuffer
-                             chromaWidth:(chromaBuffer ? qw : 0)
-                            chromaHeight:(chromaBuffer ? qh : 0)
-                             sourceWidth:w
-                            sourceHeight:h];
-        _lastMaskDetectionTime = detectionResult.completionTime;
-        // Cadence adaptation (B.2) DEFERRED — cadenceFrames stays fixed at 3 (DEC-118).
-    }
-
-    // ── 3. Read latest mask and attach as metadata ───────────────────────────
-    VGSkinMask *currentMask = _skinMaskGenerator.latestMask;
+    // ── 2. Read latest mask from the provider ────────────────────────────────
+    VGSkinMask *currentMask = _maskProvider.latestMask;
     BOOL maskValid = (currentMask &&
                       currentMask.width > 0 &&
                       currentMask.height > 0 &&
@@ -333,33 +174,32 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
         return envelope;
     }
 
-    // ── 4. Create metadata NSDictionary ──────────────────────────────────────
+    // ── 3. Create metadata NSDictionary ──────────────────────────────────────
     //
-    // DEC-121: Primary payload is now CVPixelBufferRef (kCVPixelFormatType_OneComponent8).
+    // DEC-121: Primary payload is CVPixelBufferRef (kCVPixelFormatType_OneComponent8).
     // The CVPixelBuffer wraps the existing VGSkinMask R8 bytes zero-copy.
     //
     // Ownership model:
-    //   - currentMask (VGSkinMask *) is ARC-retained; its _backingData (NSData)
-    //     owns the R8 byte buffer. The CVPixelBuffer is created with a
-    //     releaseCallback that releases the NSData retain, keeping the backing
-    //     buffer alive for the full lifetime of the pixel buffer.
+    //   - currentMask (VGSkinMask *) is ARC-retained; its backing NSData owns
+    //     the R8 byte buffer. The CVPixelBuffer is created with a releaseCallback
+    //     that releases the NSData retain, keeping the backing buffer alive for
+    //     the full lifetime of the pixel buffer.
     //   - CVPixelBufferCreateWithBytes returns a +1 CF object. We transfer
-    //     ownership to ARC via CFBridgingRelease, then store the resulting id
-    //     in the NSDictionary (ARC retains it). The NSDictionary is CFRetained
-    //     by VGFrameEnvelopeCopyWithMetadata. Net result: the CVPixelBuffer
-    //     lives at least as long as the envelope metadata.
+    //     ownership to ARC via CFBridgingRelease, then store in the NSDictionary
+    //     (ARC retains it). The NSDictionary is CFRetained by
+    //     VGFrameEnvelopeCopyWithMetadata. Net result: the CVPixelBuffer lives
+    //     at least as long as the envelope metadata.
     //   - The legacy VGSkinMask key is also included for the BeautyV2 fallback
     //     path until all consumers are fully migrated (DEC-121).
     //
     // Thread safety:
-    //   currentMask is an immutable snapshot (ARC-retained). _backingData is
-    //   immutable NSData. No locks needed for read-only access from this thread.
+    //   currentMask is an immutable snapshot (ARC-retained). Its backing NSData
+    //   is immutable. No locks needed for read-only access from this thread.
 
     // Retain the NSData backing so it outlives the pixel buffer creation.
     // The release callback will balance this retain.
     NSData *backingData = [NSData dataWithBytes:currentMask.data
                                          length:currentMask.width * currentMask.height];
-
 
     // Release callback: called by CoreVideo when the pixel buffer is freed.
     // Must be a plain C function pointer — ObjC blocks are NOT compatible with
@@ -415,7 +255,7 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
         VGSegmentationMetadataKeySkinMask: currentMask,
     };
 
-    // ── 5. Attach metadata to envelope via lifecycle helper (DEC-102) ────────
+    // ── 4. Attach metadata to envelope via lifecycle helper (DEC-102) ────────
     // VGFrameEnvelopeCopyWithMetadata takes env by value, CFRetains metadata.
     VGFrameEnvelope output = VGFrameEnvelopeCopyWithMetadata(
         envelope, (__bridge void *)metadata);

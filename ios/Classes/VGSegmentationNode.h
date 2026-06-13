@@ -1,5 +1,6 @@
 // VGSegmentationNode.h
 // Phase 4F — Step 1: VGSegmentationNode extraction (DEC-100).
+// Phase 9A — Provider-backed architecture (VGMaskProvider).
 //
 // First-class VGMediaNode for segmentation mask production.
 // CPU-only — does not create or modify the video pixel buffer;
@@ -9,16 +10,17 @@
 //   Source → VGSegmentationNode → BeautyV2FilterGroup → Sink
 //
 // Responsibilities:
-//   - Owns VGFaceDetectionProvider (async face/landmark detection)
-//   - Owns VGSkinMaskGenerator (CPU mask rasterization)
+//   - Owns a VGMaskProvider (default: VGHeuristicMaskProvider)
+//   - Submits frames to the provider each envelope
+//   - Reads latestMask from the provider and packages into metadata
 //   - Attaches mask data to VGFrameEnvelope.metadata via lifecycle helpers
 //   - Forwards the video payload unchanged
 //
-// Step 1 scope:
-//   - Exact mask generation as current system (no quality changes)
-//   - No Phase A–D improvements
-//   - No quality tiers
-//   - No debug stages
+// Phase 9A scope:
+//   - Provider protocol is narrow: submitFrame:pts:generation: / latestMask
+//   - VGSegmentationResult is NOT introduced in this slice
+//   - All CVPixelBuffer wrapping and metadata NSDictionary creation remain here
+//   - Exact downstream metadata contract preserved
 //
 // Architecture alignment:
 //   DEC-100 — segmentation as first-class VGMediaNode
@@ -66,6 +68,8 @@
 #import <CoreVideo/CoreVideo.h>
 #import <Metal/Metal.h>
 
+@protocol VGMaskProvider;
+
 NS_ASSUME_NONNULL_BEGIN
 
 // ─── Metadata dictionary keys (Phase 4F — DEC-101) ───────────────────────────
@@ -111,13 +115,25 @@ extern NSString * const VGSegmentationMetadataKeySkinMaskBuffer;
 /// When NO, processEnvelope:device: returns input envelope unchanged (no metadata).
 @property (nonatomic, assign) BOOL enabled;
 
-// ─── Initializer ─────────────────────────────────────────────────────────────
+// ─── Initializers ────────────────────────────────────────────────────────────
 
 /// Designated initializer.
+/// Instantiates the default VGHeuristicMaskProvider internally.
 /// @param pool   Runtime session pool (not used by this node — passed for protocol compat).
 /// @param device Shared MTLDevice (not used by this CPU-only node).
 - (instancetype)initWithPool:(CVPixelBufferPoolRef)pool
                       device:(id<MTLDevice>)device NS_DESIGNATED_INITIALIZER;
+
+/// Dependency-injection initializer for testing.
+/// Accepts a custom VGMaskProvider conformer instead of the default heuristic provider.
+/// Use this initializer to inject a stub/mock in unit tests.
+/// @param pool     Runtime session pool (not used by this node).
+/// @param device   Shared MTLDevice (not used by this CPU-only node).
+/// @param provider A VGMaskProvider conformer to delegate frame/mask work to.
+- (instancetype)initWithPool:(CVPixelBufferPoolRef)pool
+                      device:(id<MTLDevice>)device
+                    provider:(id<VGMaskProvider>)provider;
+
 - (instancetype)init NS_UNAVAILABLE;
 
 @end
