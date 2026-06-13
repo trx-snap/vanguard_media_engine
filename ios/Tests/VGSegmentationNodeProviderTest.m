@@ -36,72 +36,59 @@
 #import "VGSkinMaskGenerator.h"    // VGSkinMask type
 #import "VGFaceDetectionProvider.h" // VGFaceDetectionResult type (for stub)
 
-// ─── VGP9A_StubSkinMask ───────────────────────────────────────────────────────
+// ─── VGP9A_MakeSkinMask ───────────────────────────────────────────────────────
 //
-// A controllable VGSkinMask-like object that exposes the same read-only
-// interface used by VGSegmentationNode's metadata packaging code.
-// Allocated via a private factory method since VGSkinMask has NS_UNAVAILABLE init.
+// Test-only factory that produces a real VGSkinMask instance with controlled
+// pixel data, dimensions, faceCount, and sourcePTS.
 //
-// We use a subclass to control width/height/data/faceCount/sourcePTS.
-// This is test-internal only.
+// VGSkinMask has no public initializer (NS_UNAVAILABLE on -init).
+// However, its concrete private initializer -_initWithData:width:height:
+// sourcePTS:faceCount: exists in VGSkinMaskGenerator.m and is callable via
+// NSInvocation — this is intentional test-internal plumbing, not production use.
+//
+// Using NSInvocation avoids subclassing entirely (no NS_UNAVAILABLE compile
+// error) and produces a genuine VGSkinMask whose ivars are populated by the
+// class's own implementation. The returned object is ARC-managed.
 
-@interface VGP9A_StubSkinMask : VGSkinMask
-@end
+static VGSkinMask * _Nullable VGP9A_MakeSkinMask(size_t width,
+                                                  size_t height,
+                                                  NSInteger faceCount,
+                                                  CMTime pts) {
+    // Allocate an uninitialized instance. +alloc does not trigger the
+    // NS_UNAVAILABLE -init guard — that is a compile-time annotation only.
+    VGSkinMask *mask = [VGSkinMask alloc];
+    if (!mask) return nil;
 
-@implementation VGP9A_StubSkinMask {
-    NSData  *_backingData;
-    size_t   _width;
-    size_t   _height;
-    size_t   _bytesPerRow;
-    NSInteger _faceCount;
-    CMTime   _sourcePTS;
-}
-
-// Use the VGSkinMask private factory via performSelector on a real generator,
-// OR — simpler for tests — build our own subclass that overrides accessors.
-// Since VGSkinMask has no public initializer we cannot call [super init] safely
-// without knowledge of its ivar layout. Instead we expose a dedicated test
-// factory that populates NSData-backed storage and overrides the read properties.
-
-+ (instancetype)maskWithWidth:(size_t)width
-                       height:(size_t)height
-                    faceCount:(NSInteger)faceCount
-                    sourcePTS:(CMTime)pts {
-    VGP9A_StubSkinMask *m = [[self alloc] _testInit];
-    if (!m) return nil;
+    // Build the R8 backing buffer filled with a recognisable skin value (200).
     size_t len = width * height;
-    // Fill with a recognizable non-zero pattern so data != NULL guard passes.
     uint8_t *bytes = (uint8_t *)calloc(len, 1);
     if (!bytes) return nil;
-    memset(bytes, 200, len); // 200 = recognizable skin value
-    m->_backingData = [NSData dataWithBytesNoCopy:bytes length:len freeWhenDone:YES];
-    m->_width       = width;
-    m->_height      = height;
-    m->_bytesPerRow = width;
-    m->_faceCount   = faceCount;
-    m->_sourcePTS   = pts;
-    return m;
+    memset(bytes, 200, len); // 200 = opaque skin — ensures data pointer is non-NULL
+
+    NSData *data = [NSData dataWithBytesNoCopy:bytes length:len freeWhenDone:YES];
+
+    // Invoke the private designated initializer via NSInvocation.
+    // Selector: _initWithData:width:height:sourcePTS:faceCount:
+    SEL sel = NSSelectorFromString(@"_initWithData:width:height:sourcePTS:faceCount:");
+    NSMethodSignature *sig = [VGSkinMask instanceMethodSignatureForSelector:sel];
+    if (!sig) return nil; // selector not found — fail gracefully
+
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:mask];
+    [inv setSelector:sel];
+    [inv setArgument:&data      atIndex:2]; // id data
+    [inv setArgument:&width     atIndex:3]; // size_t width
+    [inv setArgument:&height    atIndex:4]; // size_t height
+    [inv setArgument:&pts       atIndex:5]; // CMTime sourcePTS
+    [inv setArgument:&faceCount atIndex:6]; // NSInteger faceCount
+    [inv invoke];
+
+    // -_initWithData:... returns instancetype (id). Retrieve it without
+    // ARC managing the return slot directly to avoid double-release.
+    __unsafe_unretained VGSkinMask *result = nil;
+    [inv getReturnValue:&result];
+    return result; // ARC bridge — result is already +0 retained by the alloc/init pair
 }
-
-- (instancetype)_testInit {
-    // VGSkinMask declares -init as NS_UNAVAILABLE (compile-time annotation only).
-    // We bypass it safely here by calling NSObject's init directly.
-    // This is intentional and test-only. VGP9A_StubSkinMask overrides all
-    // accessors, so no VGSkinMask backing ivars are accessed.
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wobjc-designated-initializers"
-    return [super init]; // NSObject.init — safe for test stub
-#pragma clang diagnostic pop
-}
-
-- (const uint8_t *)data      { return (const uint8_t *)_backingData.bytes; }
-- (size_t)width              { return _width; }
-- (size_t)height             { return _height; }
-- (size_t)bytesPerRow        { return _bytesPerRow; }
-- (NSInteger)faceCount       { return _faceCount; }
-- (CMTime)sourcePTS          { return _sourcePTS; }
-
-@end
 
 // ─── VGP9A_StubMaskProvider ──────────────────────────────────────────────────
 //
@@ -270,10 +257,7 @@
 
 - (void)testMetadataContainsSkinMaskBufferKeyWhenMaskValid {
     // Arrange: stub returns a valid 16×16 mask with 1 face.
-    _stub.stubbedMask = [VGP9A_StubSkinMask maskWithWidth:16
-                                                    height:16
-                                                 faceCount:1
-                                                 sourcePTS:kCMTimeZero];
+    _stub.stubbedMask = VGP9A_MakeSkinMask(16, 16, 1, kCMTimeZero);
 
     CMTime pts = CMTimeMakeWithSeconds(0.5, 600);
     VGFrameEnvelope env = [self envelopeWithBuffer:_testBuffer pts:pts generation:1];
@@ -292,10 +276,7 @@
 // ─── Test 4: skinMaskBuffer is a CVPixelBufferRef ────────────────────────────
 
 - (void)testSkinMaskBufferValueIsCVPixelBufferRef {
-    _stub.stubbedMask = [VGP9A_StubSkinMask maskWithWidth:16
-                                                    height:16
-                                                 faceCount:1
-                                                 sourcePTS:kCMTimeZero];
+    _stub.stubbedMask = VGP9A_MakeSkinMask(16, 16, 1, kCMTimeZero);
 
     VGFrameEnvelope env = [self envelopeWithBuffer:_testBuffer
                                                 pts:kCMTimeZero
@@ -319,10 +300,7 @@
 // ─── Test 5: skinMaskBuffer pixel format is R8 (OneComponent8) ───────────────
 
 - (void)testSkinMaskBufferPixelFormatIsR8 {
-    _stub.stubbedMask = [VGP9A_StubSkinMask maskWithWidth:16
-                                                    height:16
-                                                 faceCount:1
-                                                 sourcePTS:kCMTimeZero];
+    _stub.stubbedMask = VGP9A_MakeSkinMask(16, 16, 1, kCMTimeZero);
 
     VGFrameEnvelope env = [self envelopeWithBuffer:_testBuffer
                                                 pts:kCMTimeZero
@@ -343,10 +321,7 @@
 
 - (void)testSkinMaskBufferDimensionsMatchMask {
     const size_t W = 20, H = 15;
-    _stub.stubbedMask = [VGP9A_StubSkinMask maskWithWidth:W
-                                                    height:H
-                                                 faceCount:2
-                                                 sourcePTS:kCMTimeZero];
+    _stub.stubbedMask = VGP9A_MakeSkinMask(W, H, 2, kCMTimeZero);
 
     VGFrameEnvelope env = [self envelopeWithBuffer:_testBuffer
                                                 pts:kCMTimeZero
@@ -367,10 +342,7 @@
 // ─── Test 7: All required metadata keys present ───────────────────────────────
 
 - (void)testAllRequiredMetadataKeysPresent {
-    _stub.stubbedMask = [VGP9A_StubSkinMask maskWithWidth:8
-                                                    height:8
-                                                 faceCount:1
-                                                 sourcePTS:kCMTimeZero];
+    _stub.stubbedMask = VGP9A_MakeSkinMask(8, 8, 1, kCMTimeZero);
 
     VGFrameEnvelope env = [self envelopeWithBuffer:_testBuffer
                                                 pts:kCMTimeZero
@@ -395,10 +367,7 @@
 // ─── Test 8: faceMetaGeneration matches envelope.generation ──────────────────
 
 - (void)testMetadataGenerationMatchesEnvelope {
-    _stub.stubbedMask = [VGP9A_StubSkinMask maskWithWidth:8
-                                                    height:8
-                                                 faceCount:1
-                                                 sourcePTS:kCMTimeZero];
+    _stub.stubbedMask = VGP9A_MakeSkinMask(8, 8, 1, kCMTimeZero);
 
     const uint64_t expectedGen = 99;
     VGFrameEnvelope env = [self envelopeWithBuffer:_testBuffer
@@ -418,10 +387,7 @@
 // ─── Test 9: faceCount matches stub mask faceCount ────────────────────────────
 
 - (void)testMetadataFaceCountMatchesMask {
-    _stub.stubbedMask = [VGP9A_StubSkinMask maskWithWidth:8
-                                                    height:8
-                                                 faceCount:3
-                                                 sourcePTS:kCMTimeZero];
+    _stub.stubbedMask = VGP9A_MakeSkinMask(8, 8, 3, kCMTimeZero);
 
     VGFrameEnvelope env = [self envelopeWithBuffer:_testBuffer
                                                 pts:kCMTimeZero
@@ -461,10 +427,7 @@
 // A mask with faceCount == 0 must be treated as invalid (no metadata attached).
 
 - (void)testZeroFaceCountProducesPassthroughEnvelope {
-    _stub.stubbedMask = [VGP9A_StubSkinMask maskWithWidth:8
-                                                    height:8
-                                                 faceCount:0  // <-- zero faces
-                                                 sourcePTS:kCMTimeZero];
+    _stub.stubbedMask = VGP9A_MakeSkinMask(8, 8, 0, kCMTimeZero); // faceCount=0 → passthrough
 
     VGFrameEnvelope env = [self envelopeWithBuffer:_testBuffer
                                                 pts:kCMTimeZero
@@ -504,10 +467,7 @@
 
 - (void)testDisabledNodePassesThroughWithoutCallingProvider {
     _node.enabled = NO;
-    _stub.stubbedMask = [VGP9A_StubSkinMask maskWithWidth:8
-                                                    height:8
-                                                 faceCount:1
-                                                 sourcePTS:kCMTimeZero];
+    _stub.stubbedMask = VGP9A_MakeSkinMask(8, 8, 1, kCMTimeZero);
 
     VGFrameEnvelope env = [self envelopeWithBuffer:_testBuffer
                                                 pts:kCMTimeZero
