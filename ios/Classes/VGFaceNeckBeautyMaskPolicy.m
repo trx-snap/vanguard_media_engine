@@ -1,0 +1,445 @@
+// VGFaceNeckBeautyMaskPolicy.m
+// Phase 9B-1 — Deterministic post-processing policy.
+//
+// Algorithm:
+//   1. Confidence competition across the 6 MediaPipe Selfie Multiclass classes.
+//   2. Face bounding box derived from class-3 (face-skin) pixels above threshold.
+//   3. Neck ROI rectangle projected downward from face box.
+//   4. Eligible skin = competition result ∩ (face box ∪ neck ROI).
+//   5. Per-column forehead trim (fraction of faceHeight from topmost face pixel).
+//   6. Gated forehead expansion upward (blocked by high hair/clothes confidence).
+//   7. Morphological open then close (simple 2-pass box erosion/dilation, CPU).
+//   8. Motion-adaptive temporal EMA on a float[256*256] history buffer.
+//   9. Threshold final float buffer at ≥ 0.5 → uint8 (0 or 255).
+//  10. Downscale binary mask to quarter-resolution for VGSkinMask output.
+//
+// Tensor input constants (selfie_multiclass_256x256.tflite):
+//   kModelW = 256, kModelH = 256, kModelC = 6
+//   Class indices: 0=background 1=hair 2=body-skin 3=face-skin 4=clothes 5=others
+
+#import "VGFaceNeckBeautyMaskPolicy.h"
+#import "VGSkinMaskGenerator.h"   // VGSkinMask definition
+#import <os/log.h>
+
+// ─── Private VGSkinMask category ────────────────────────────────────────────
+// VGSkinMask._initWithData:width:height:sourcePTS:faceCount: is a file-private
+// designated initializer in VGSkinMaskGenerator.m.  Because VGFaceNeckBeautyMaskPolicy
+// must also create VGSkinMask instances (not via the generator), we forward-declare
+// the private initializer here using an Objective-C category so ARC can call it
+// without requiring any modification to VGSkinMaskGenerator.
+// The method MUST match the implementation in VGSkinMaskGenerator.m exactly.
+
+@interface VGSkinMask (VGMLPolicyCreation)
+- (instancetype)_initWithData:(NSData *)data
+                        width:(size_t)width
+                       height:(size_t)height
+                    sourcePTS:(CMTime)pts
+                    faceCount:(NSInteger)faceCount;
+@end
+
+// ─── Model tensor constants ──────────────────────────────────────────────────
+static const size_t kModelW = 256;
+static const size_t kModelH = 256;
+static const size_t kModelC = 6;
+static const size_t kModelPixels = kModelW * kModelH; // 65 536
+
+// Class channel offsets within a pixel (layout: [H][W][C])
+// kClassBackground (0) is implicit — skin must beat all others above threshold.
+static const int kClassHair        = 1;
+static const int kClassBodySkin    = 2;
+static const int kClassFaceSkin    = 3;
+static const int kClassClothes     = 4;
+static const int kClassOthers      = 5;
+
+// ─── Inline helpers ─────────────────────────────────────────────────────────
+
+static inline float _clamp01(float v) {
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+
+static inline float _confidence(const float *tensor, int y, int x, int c) {
+    // tensor layout: [H][W][C], H=W=256, C=6
+    return tensor[(y * (int)kModelW + x) * (int)kModelC + c];
+}
+
+// ─── Morphological helpers (box kernel, square neighbourhood) ───────────────
+
+/// In-place binary erosion of a uint8 mask (value 1 = foreground, 0 = background).
+/// radius = (kernelSize - 1) / 2.
+static void _morphErode(uint8_t *buf, size_t w, size_t h, int radius) {
+    if (radius <= 0) return;
+    uint8_t *tmp = (uint8_t *)malloc(w * h);
+    if (!tmp) return;
+    for (int y = 0; y < (int)h; y++) {
+        for (int x = 0; x < (int)w; x++) {
+            uint8_t minVal = 1;
+            for (int ky = y - radius; ky <= y + radius && minVal; ky++) {
+                if (ky < 0 || ky >= (int)h) { minVal = 0; break; }
+                for (int kx = x - radius; kx <= x + radius; kx++) {
+                    if (kx < 0 || kx >= (int)w) { minVal = 0; break; }
+                    if (!buf[ky * w + kx]) { minVal = 0; break; }
+                }
+            }
+            tmp[y * w + x] = minVal;
+        }
+    }
+    memcpy(buf, tmp, w * h);
+    free(tmp);
+}
+
+/// In-place binary dilation of a uint8 mask.
+static void _morphDilate(uint8_t *buf, size_t w, size_t h, int radius) {
+    if (radius <= 0) return;
+    uint8_t *tmp = (uint8_t *)calloc(w * h, 1);
+    if (!tmp) return;
+    for (int y = 0; y < (int)h; y++) {
+        for (int x = 0; x < (int)w; x++) {
+            if (!buf[y * w + x]) continue;
+            // Dilate: set neighbourhood to 1.
+            int y0 = y - radius < 0 ? 0 : y - radius;
+            int y1 = y + radius >= (int)h ? (int)h - 1 : y + radius;
+            int x0 = x - radius < 0 ? 0 : x - radius;
+            int x1 = x + radius >= (int)w ? (int)w - 1 : x + radius;
+            for (int ky = y0; ky <= y1; ky++)
+                for (int kx = x0; kx <= x1; kx++)
+                    tmp[ky * w + kx] = 1;
+        }
+    }
+    memcpy(buf, tmp, w * h);
+    free(tmp);
+}
+
+/// Morphological open (erode then dilate) — removes small noise blobs.
+static void _morphOpen(uint8_t *buf, size_t w, size_t h, int radius) {
+    _morphErode(buf, w, h, radius);
+    _morphDilate(buf, w, h, radius);
+}
+
+/// Morphological close (dilate then erode) — fills small holes.
+static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
+    _morphDilate(buf, w, h, radius);
+    _morphErode(buf, w, h, radius);
+}
+
+// ─── Implementation ─────────────────────────────────────────────────────────
+
+@implementation VGFaceNeckBeautyMaskPolicy {
+    // Temporal EMA — float history buffer at model resolution (256×256).
+    // Stores the blended mask probability for each pixel.
+    float   *_historyBuffer;   // length = kModelPixels
+    BOOL     _hasHistory;      // NO until first frame
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (!self) return nil;
+
+    // Phase 9B-1 defaults (match prototype FaceNeckBeautyMaskPolicy.py).
+    _skinThreshold  = 0.60f;
+    _hairMargin     = 0.10f;
+    _clothMargin    = 0.05f;
+    _neckDepth      = 0.40f;
+    _neckWidth      = 0.65f;
+    _foreheadTrim   = 0.10f;
+    _foreheadExpand = 4;
+    _morphKernelSize = 3;
+    _temporalAlpha  = 0.60f;
+
+    _historyBuffer = (float *)calloc(kModelPixels, sizeof(float));
+    _hasHistory    = NO;
+
+    return self;
+}
+
+- (void)dealloc {
+    free(_historyBuffer);
+}
+
+- (void)resetTemporalState {
+    if (_historyBuffer) {
+        memset(_historyBuffer, 0, kModelPixels * sizeof(float));
+    }
+    _hasHistory = NO;
+}
+
+// ─── Main processing entry point ─────────────────────────────────────────────
+
+- (VGSkinMask *)processTensor:(const float *)outputTensor
+                  sourceWidth:(size_t)sourceWidth
+                 sourceHeight:(size_t)sourceHeight
+                          pts:(CMTime)pts
+              generationReset:(BOOL)generationReset {
+
+    if (generationReset) {
+        [self resetTemporalState];
+    }
+
+    // ── 1. Confidence competition → binary candidate mask (1=eligible, 0=not) ──
+    //
+    // skin = max(face_skin, body_skin)
+    // include if:
+    //   skin >= skinThreshold
+    //   skin > hair + hairMargin
+    //   skin > clothes + clothMargin
+    //   skin > others + clothMargin
+
+    uint8_t *candidateMask = (uint8_t *)calloc(kModelPixels, 1);
+    if (!candidateMask) return [self _emptyMaskForPTS:pts sourceWidth:sourceWidth sourceHeight:sourceHeight];
+
+    float thr    = _skinThreshold;
+    float hairMg = _hairMargin;
+    float clMg   = _clothMargin;
+
+    // Also track face-skin confidence to derive face bounding box.
+    // We need the raw face-skin confidence per pixel for step 2.
+
+    // Find face bounding box from face-skin class (class 3).
+    int faceMinY = (int)kModelH, faceMaxY = -1;
+    int faceMinX = (int)kModelW, faceMaxX = -1;
+
+    for (int y = 0; y < (int)kModelH; y++) {
+        for (int x = 0; x < (int)kModelW; x++) {
+            float faceSkin  = _confidence(outputTensor, y, x, kClassFaceSkin);
+            float bodySkin  = _confidence(outputTensor, y, x, kClassBodySkin);
+            float hair      = _confidence(outputTensor, y, x, kClassHair);
+            float clothes   = _confidence(outputTensor, y, x, kClassClothes);
+            float others    = _confidence(outputTensor, y, x, kClassOthers);
+            float skin      = faceSkin > bodySkin ? faceSkin : bodySkin;
+
+            BOOL passes = (skin >= thr)
+                       && (skin > hair + hairMg)
+                       && (skin > clothes + clMg)
+                       && (skin > others + clMg);
+
+            candidateMask[y * kModelW + x] = passes ? 1 : 0;
+
+            // Track face bounding box using face-skin class only.
+            if (faceSkin >= thr) {
+                if (y < faceMinY) faceMinY = y;
+                if (y > faceMaxY) faceMaxY = y;
+                if (x < faceMinX) faceMinX = x;
+                if (x > faceMaxX) faceMaxX = x;
+            }
+        }
+    }
+
+    // ── 2. No face detected → return empty mask ──────────────────────────────
+    if (faceMaxY < faceMinY || faceMaxX < faceMinX) {
+        free(candidateMask);
+        return [self _emptyMaskForPTS:pts sourceWidth:sourceWidth sourceHeight:sourceHeight];
+    }
+
+    int faceW = faceMaxX - faceMinX + 1;
+    int faceH = faceMaxY - faceMinY + 1;
+
+    // ── 3. Neck ROI ──────────────────────────────────────────────────────────
+    //
+    // Width  = neckWidth  * faceW   (centred on face)
+    // Height = neckDepth  * faceH   (extends downward from faceMaxY)
+    int neckW = (int)(_neckWidth  * (float)faceW + 0.5f);
+    int neckH = (int)(_neckDepth  * (float)faceH + 0.5f);
+    int neckMidX = faceMinX + faceW / 2;
+    int neckX0 = neckMidX - neckW / 2;
+    int neckX1 = neckMidX + neckW / 2;
+    int neckY0 = faceMaxY + 1;
+    int neckY1 = faceMaxY + neckH;
+
+    // Clamp to 256×256.
+    if (neckX0 < 0)              neckX0 = 0;
+    if (neckX1 >= (int)kModelW)  neckX1 = (int)kModelW - 1;
+    if (neckY0 < 0)              neckY0 = 0;
+    if (neckY1 >= (int)kModelH)  neckY1 = (int)kModelH - 1;
+
+    // ── 4. Restrict candidate to face box ∪ neck ROI ─────────────────────────
+    uint8_t *roiMask = (uint8_t *)calloc(kModelPixels, 1);
+    if (!roiMask) { free(candidateMask); return [self _emptyMaskForPTS:pts sourceWidth:sourceWidth sourceHeight:sourceHeight]; }
+
+    for (int y = 0; y < (int)kModelH; y++) {
+        for (int x = 0; x < (int)kModelW; x++) {
+            if (!candidateMask[y * kModelW + x]) continue;
+
+            BOOL inFace = (y >= faceMinY && y <= faceMaxY && x >= faceMinX && x <= faceMaxX);
+            BOOL inNeck = (y >= neckY0   && y <= neckY1   && x >= neckX0   && x <= neckX1);
+
+            if (inFace || inNeck) {
+                roiMask[y * kModelW + x] = 1;
+            }
+        }
+    }
+    free(candidateMask);
+
+    // ── 5. Forehead trim ─────────────────────────────────────────────────────
+    //
+    // For each column x within [faceMinX, faceMaxX], find the topmost ROI
+    // pixel and trim foreheadTrim * faceH pixels downward from it.
+    int trimRows = (int)(_foreheadTrim * (float)faceH + 0.5f);
+    if (trimRows < 0) trimRows = 0;
+
+    if (trimRows > 0) {
+        for (int x = faceMinX; x <= faceMaxX; x++) {
+            // Find topmost ROI pixel in this column within the face box rows.
+            int topY = -1;
+            for (int y = faceMinY; y <= faceMaxY; y++) {
+                if (roiMask[y * kModelW + x]) { topY = y; break; }
+            }
+            if (topY < 0) continue;
+
+            int trimEnd = topY + trimRows - 1;
+            if (trimEnd > faceMaxY) trimEnd = faceMaxY;
+            for (int y = topY; y <= trimEnd; y++) {
+                roiMask[y * kModelW + x] = 0;
+            }
+        }
+    }
+
+    // ── 6. Gated forehead expansion ──────────────────────────────────────────
+    //
+    // After trim, expand upward by foreheadExpand pixels per column — but only
+    // if hair/clothes/others confidence is low (below skinThreshold).
+    // This recovers legitimate forehead skin trimmed by step 5.
+    if (_foreheadExpand > 0) {
+        for (int x = faceMinX; x <= faceMaxX; x++) {
+            // Find the new topmost ROI pixel in column after trim.
+            int topY = -1;
+            for (int y = faceMinY; y <= faceMaxY; y++) {
+                if (roiMask[y * kModelW + x]) { topY = y; break; }
+            }
+            if (topY < 0) continue;
+
+            // Expand upward from (topY - 1).
+            for (int step = 1; step <= (int)_foreheadExpand; step++) {
+                int ey = topY - step;
+                if (ey < 0) break;
+
+                float hair    = _confidence(outputTensor, ey, x, kClassHair);
+                float clothes = _confidence(outputTensor, ey, x, kClassClothes);
+                float others  = _confidence(outputTensor, ey, x, kClassOthers);
+
+                // Gate: stop expansion if any blocking class is too confident.
+                if (hair >= _skinThreshold || clothes >= _skinThreshold || others >= _skinThreshold) break;
+
+                roiMask[ey * kModelW + x] = 1;
+            }
+        }
+    }
+
+    // ── 7. Morphological cleanup ─────────────────────────────────────────────
+    //
+    // Open (erode→dilate): removes isolated noise pixels.
+    // Close (dilate→erode): fills small interior holes.
+    int kernelRadius = (int)(_morphKernelSize - 1) / 2;
+    if (kernelRadius > 0) {
+        _morphOpen(roiMask, kModelW, kModelH, kernelRadius);
+        _morphClose(roiMask, kModelW, kModelH, kernelRadius);
+    }
+
+    // ── 8. Temporal EMA ──────────────────────────────────────────────────────
+    //
+    // Motion = fraction of pixels that changed between current binary mask and
+    //          the thresholded history (|current - (history >= 0.5)|).
+    // alphaEff = temporalAlpha * max(0, 1 - motion / 0.08)
+    //
+    // First frame (no history): seed directly, alpha irrelevant.
+
+    if (!_hasHistory || !_historyBuffer) {
+        // Seed history with the current binary mask.
+        for (size_t i = 0; i < kModelPixels; i++) {
+            _historyBuffer[i] = roiMask[i] ? 1.0f : 0.0f;
+        }
+        _hasHistory = YES;
+    } else {
+        // Compute motion: changed-pixel fraction.
+        size_t changed = 0;
+        for (size_t i = 0; i < kModelPixels; i++) {
+            uint8_t prevBin = (_historyBuffer[i] >= 0.5f) ? 1 : 0;
+            if (roiMask[i] != prevBin) changed++;
+        }
+        float motion = (float)changed / (float)kModelPixels;
+
+        // Motion-adaptive alpha: high motion → lower alpha (less smoothing lag).
+        // alphaEff = temporalAlpha * max(0, 1 - motion / 0.08)
+        float motionFactor = 1.0f - motion / 0.08f;
+        if (motionFactor < 0.0f) motionFactor = 0.0f;
+        float alphaEff = _clamp01(_temporalAlpha * motionFactor);
+
+        // EMA blend: history = alphaEff * history + (1 - alphaEff) * current.
+        for (size_t i = 0; i < kModelPixels; i++) {
+            float cur = roiMask[i] ? 1.0f : 0.0f;
+            _historyBuffer[i] = alphaEff * _historyBuffer[i] + (1.0f - alphaEff) * cur;
+        }
+    }
+    free(roiMask);
+
+    // ── 9. Threshold history → binary uint8 at model resolution ─────────────
+    //
+    // Pixel is foreground if history >= 0.5 → value 255.
+    uint8_t *modelMask = (uint8_t *)malloc(kModelPixels);
+    if (!modelMask) return [self _emptyMaskForPTS:pts sourceWidth:sourceWidth sourceHeight:sourceHeight];
+
+    for (size_t i = 0; i < kModelPixels; i++) {
+        modelMask[i] = (_historyBuffer[i] >= 0.5f) ? 255 : 0;
+    }
+
+    // ── 10. Downscale to quarter-resolution ──────────────────────────────────
+    //
+    // Output mask dimensions match existing pipeline expectation:
+    //   qw = sourceWidth / 4, qh = sourceHeight / 4.
+    // Model operates at 256×256.  To produce the quarter-res mask we:
+    //   - Compute the scale from 256×256 to sourceW/4 × sourceH/4.
+    //   - Use nearest-neighbour mapping from model space to output space.
+    // If sourceWidth == 0 or sourceHeight == 0, fall back to 64×64.
+
+    size_t qw = sourceWidth  > 0 ? sourceWidth  / 4 : 64;
+    size_t qh = sourceHeight > 0 ? sourceHeight / 4 : 64;
+    if (qw < 1) qw = 1;
+    if (qh < 1) qh = 1;
+
+    size_t outPixels = qw * qh;
+    uint8_t *outBuf = (uint8_t *)calloc(outPixels, 1);
+    if (!outBuf) { free(modelMask); return [self _emptyMaskForPTS:pts sourceWidth:sourceWidth sourceHeight:sourceHeight]; }
+
+    for (size_t oy = 0; oy < qh; oy++) {
+        for (size_t ox = 0; ox < qw; ox++) {
+            // Map from output pixel (ox, oy) to model pixel (my, mx).
+            size_t my = (oy * kModelH + kModelH / 2) / qh;  // round to nearest
+            size_t mx = (ox * kModelW + kModelW / 2) / qw;
+            if (my >= kModelH) my = kModelH - 1;
+            if (mx >= kModelW) mx = kModelW - 1;
+            outBuf[oy * qw + ox] = modelMask[my * kModelW + mx];
+        }
+    }
+    free(modelMask);
+
+    // ── 11. Build and return VGSkinMask ──────────────────────────────────────
+    NSData *maskData = [NSData dataWithBytesNoCopy:outBuf length:outPixels freeWhenDone:YES];
+    VGSkinMask *mask = [[VGSkinMask alloc] _initWithData:maskData
+                                                   width:qw
+                                                  height:qh
+                                               sourcePTS:pts
+                                               faceCount:1];
+    return mask;
+}
+
+// ─── Private ─────────────────────────────────────────────────────────────────
+
+/// Builds an empty (all-zero) VGSkinMask at quarter-resolution.
+- (VGSkinMask *)_emptyMaskForPTS:(CMTime)pts
+                      sourceWidth:(size_t)sourceWidth
+                     sourceHeight:(size_t)sourceHeight {
+    size_t qw = sourceWidth  > 0 ? sourceWidth  / 4 : 64;
+    size_t qh = sourceHeight > 0 ? sourceHeight / 4 : 64;
+    if (qw < 1) qw = 1;
+    if (qh < 1) qh = 1;
+
+    size_t outPixels = qw * qh;
+    NSData *emptyData = [NSData dataWithBytesNoCopy:calloc(outPixels, 1)
+                                             length:outPixels
+                                       freeWhenDone:YES];
+    return [[VGSkinMask alloc] _initWithData:emptyData
+                                       width:qw
+                                      height:qh
+                                   sourcePTS:pts
+                                   faceCount:0];
+}
+
+@end

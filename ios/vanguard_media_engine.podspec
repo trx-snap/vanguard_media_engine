@@ -161,7 +161,9 @@ Pod::Spec.new do |s|
       # Phase 9A: Provider-backed segmentation architecture contract tests
       'Tests/VGSegmentationNodeProviderTest.m',
       # Phase 9B: Model asset integrity smoke test
-      'Tests/VGMLModelAssetTest.m'
+      'Tests/VGMLModelAssetTest.m',
+      # Phase 9B-1: Face+Neck beauty mask policy unit tests (synthetic tensors, no TFLite API)
+      'Tests/VGFaceNeckBeautyMaskPolicyTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage'
     ts.dependency    'UMF'
