@@ -163,7 +163,9 @@ Pod::Spec.new do |s|
       # Phase 9B: Model asset integrity smoke test
       'Tests/VGMLModelAssetTest.m',
       # Phase 9B-1: Face+Neck beauty mask policy unit tests (synthetic tensors, no TFLite API)
-      'Tests/VGFaceNeckBeautyMaskPolicyTest.m'
+      'Tests/VGFaceNeckBeautyMaskPolicyTest.m',
+      # Phase 9B-2: LiteRT mask provider tests (real bundled model + synthetic CVPixelBuffer)
+      'Tests/VGLiteRTMaskProviderTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage'
     ts.dependency    'UMF'
