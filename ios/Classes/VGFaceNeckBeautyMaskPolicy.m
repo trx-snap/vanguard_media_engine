@@ -289,7 +289,16 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
     // normal provider timing. The argmax loop runs once here, before any ROI
     // masking, and never mutates candidateMask, roiMask, EMA, or output.
     _diagStatsFrameCount++;
-    BOOL shouldLogStats = (_diagStatsFrameCount % kVGPolicyDiagLogInterval == 1);
+    // Log on first 3 frames for immediate physical smoke visibility,
+    // then every kVGPolicyDiagLogInterval frames thereafter.
+    BOOL shouldLogStats = (_diagStatsFrameCount <= 3) || (_diagStatsFrameCount % kVGPolicyDiagLogInterval == 1);
+
+    if (_diagStatsFrameCount == 1) {
+        os_log_info(VGPolicyLog(),
+            "[VGFaceNeckBeautyMaskPolicy diagnostic] processTensor reached frame=1 "
+            "throttleInterval=%lu firstLogFrames=3 threshold=%.2f",
+            (unsigned long)kVGPolicyDiagLogInterval, _skinThreshold);
+    }
 
     if (shouldLogStats && faceMaxY >= faceMinY && faceMaxX >= faceMinX) {
         // Argmax tally: count pixels where each class has the highest confidence.
@@ -316,15 +325,23 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
             }
         }
         os_log_info(VGPolicyLog(),
-            "[VGFaceNeckBeautyMaskPolicy stats] "
+            "[VGFaceNeckBeautyMaskPolicy diagnostic] "
             "bg=%.1f%% hair=%.1f%% bodySkin=%.1f%% faceSkin=%.1f%% "
-            "clothes=%.1f%% other=%.1f%%",
+            "clothes=%.1f%% other=%.1f%% frame=%lu",
             countBG     * 100.0 / kModelPixels,
             countHair   * 100.0 / kModelPixels,
             countBody   * 100.0 / kModelPixels,
             countFace   * 100.0 / kModelPixels,
             countClothes* 100.0 / kModelPixels,
-            countOthers * 100.0 / kModelPixels);
+            countOthers * 100.0 / kModelPixels,
+            (unsigned long)_diagStatsFrameCount);
+    }
+    // ── No-face diagnostic: log when a diagnostic frame finds no face pixels ──
+    if (shouldLogStats && (faceMaxY < faceMinY || faceMaxX < faceMinX)) {
+        os_log_info(VGPolicyLog(),
+            "[VGFaceNeckBeautyMaskPolicy diagnostic] no face pixels detected above "
+            "threshold=%.2f frame=%lu — empty mask will be returned",
+            _skinThreshold, (unsigned long)_diagStatsFrameCount);
     }
 
     // ── 5. Forehead trim ─────────────────────────────────────────────────────
@@ -487,10 +504,10 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
             }
         }
         os_log_info(VGPolicyLog(),
-            "[VGFaceNeckBeautyMaskPolicy stats] "
-            "finalMask=%.1f%% (%zu/%zu px at %zux%zu)",
+            "[VGFaceNeckBeautyMaskPolicy diagnostic] "
+            "finalMask=%.1f%% (%zu/%zu px at %zux%zu) frame=%lu",
             outPixels > 0 ? nonZero * 100.0 / outPixels : 0.0,
-            nonZero, outPixels, qw, qh);
+            nonZero, outPixels, qw, qh, (unsigned long)_diagStatsFrameCount);
     }
 
     return mask;

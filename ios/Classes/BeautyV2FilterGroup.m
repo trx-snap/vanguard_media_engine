@@ -737,7 +737,32 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
     // ── Phase 9B-6A: mask freshness diagnostic ────────────────────────────────
     // Computed before temporal fade logic — logging only, no logic change.
     _freshnessLogCount++;
-    if (_freshnessLogCount % kVGBeautyDiagLogInterval == 1) {
+    // Log on first 3 frames for immediate physical smoke visibility,
+    // then every kVGBeautyDiagLogInterval frames thereafter.
+    BOOL shouldLogFreshness = (_freshnessLogCount <= 3) || (_freshnessLogCount % kVGBeautyDiagLogInterval == 1);
+    if (shouldLogFreshness) {
+        // ── Metadata and mask buffer presence diagnostic ─────────────────────
+        BOOL hasMetadata   = (envelope.metadata != NULL);
+        BOOL hasMaskBuffer = NO;
+        BOOL hasMaskLegacy = NO;
+        if (hasMetadata) {
+            NSDictionary *metaDiag = (__bridge NSDictionary *)envelope.metadata;
+            if ([metaDiag isKindOfClass:[NSDictionary class]]) {
+                hasMaskBuffer = metaDiag[VGSegmentationMetadataKeySkinMaskBuffer] != nil;
+                hasMaskLegacy = metaDiag[VGSegmentationMetadataKeySkinMask] != nil;
+            }
+        }
+        os_log_info(OS_LOG_DEFAULT,
+            "[BeautyV2 diagnostic] frame=%lu metadata=%s maskBuffer=%s maskLegacy=%s "
+            "faceAware=%s maskValid=%s",
+            (unsigned long)_freshnessLogCount,
+            hasMetadata   ? "YES" : "NO",
+            hasMaskBuffer ? "YES" : "NO",
+            hasMaskLegacy ? "YES" : "NO",
+            _faceAwareEnabled ? "YES" : "NO",
+            maskValid ? "YES" : "NO");
+
+        // ── Mask PTS freshness diagnostic ─────────────────────────────────────
         // Read mask PTS from metadata (same path as above, read-only).
         CMTime maskPTS = kCMTimeInvalid;
         if (envelope.metadata != NULL) {
@@ -755,8 +780,8 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
             ? (envelopePtsSec - maskPtsSec) * 1000.0
             : -1.0;
         const char *freshLabel = (ageMs >= 0.0 && ageMs < 50.0) ? "freshCandidate" : "staleCandidate";
-        os_log_debug(OS_LOG_DEFAULT,
-            "[BeautyV2 maskFreshness] ageMs=%.1f envelopePts=%.3fs maskPts=%.3fs "
+        os_log_info(OS_LOG_DEFAULT,
+            "[BeautyV2 diagnostic] maskFreshness ageMs=%.1f envelopePts=%.3fs maskPts=%.3fs "
             "available=%s %s",
             ageMs, envelopePtsSec, maskPtsSec,
             maskValid ? "YES" : "NO",

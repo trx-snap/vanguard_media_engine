@@ -375,7 +375,15 @@ static const NSUInteger kVGDiagLogInterval = 30;
 
     // ── Phase 9B-6A: diagnostic frame counter ────────────────────────────────
     _diagFrameCount++;
-    BOOL shouldLog = (_diagFrameCount % kVGDiagLogInterval == 1);
+    // Log on first 3 frames for immediate physical smoke visibility,
+    // then every kVGDiagLogInterval frames thereafter.
+    BOOL shouldLog = (_diagFrameCount <= 3) || (_diagFrameCount % kVGDiagLogInterval == 1);
+    if (_diagFrameCount == 1) {
+        os_log_info(VGLiteRTLog(),
+            "[VGLiteRTMaskProvider diagnostic] processing path reached frame=1 "
+            "throttleInterval=%lu firstLogFrames=3",
+            (unsigned long)kVGDiagLogInterval);
+    }
     CFAbsoluteTime t0 = shouldLog ? CFAbsoluteTimeGetCurrent() : 0;
 
     // 1. Preprocess pixel buffer → float RGB [0,1] at 256×256.
@@ -441,11 +449,12 @@ static const NSUInteger kVGDiagLogInterval = 30;
             double inferMs = (t2 - t1) * 1000.0;
             double postMs  = (t3 - t2) * 1000.0;
             double totalMs = (t3 - t0) * 1000.0;
-            os_log_debug(VGLiteRTLog(),
-                "[VGLiteRTMaskProvider timing] pre=%.1fms infer=%.1fms post=%.1fms "
-                "total=%.1fms cadence=%.1fms pts=%.3fs gen=%llu",
+            os_log_info(VGLiteRTLog(),
+                "[VGLiteRTMaskProvider diagnostic] pre=%.1fms infer=%.1fms post=%.1fms "
+                "total=%.1fms cadence=%.1fms pts=%.3fs gen=%llu frame=%lu",
                 preMs, inferMs, postMs, totalMs, cadenceMs,
-                CMTimeGetSeconds(pts), (unsigned long long)generation);
+                CMTimeGetSeconds(pts), (unsigned long long)generation,
+                (unsigned long)_diagFrameCount);
         }
         _diagLastSuccessTime = (t3 > 0) ? t3 : CFAbsoluteTimeGetCurrent();
         _latestMask = mask;
