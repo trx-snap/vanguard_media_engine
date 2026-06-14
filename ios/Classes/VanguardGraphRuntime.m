@@ -35,6 +35,9 @@
 #import "BeautyV2FilterGroup.h"
 // Phase 4F: VGSegmentationNode — face detection + mask generation (DEC-100)
 #import "VGSegmentationNode.h"
+// Phase 9B-4: gated factory helper (VG_ML_SEGMENTATION_ENABLED defaults 0 — no
+// behaviour change in production builds).
+#import "VGCameraGraphFactory.h"
 
 // Phase 4 Batch 3: V2 graph scheduler feature gate.
 // VGUseV2Graph.h is imported OUTSIDE any #if guard so the preprocessor can
@@ -1412,8 +1415,12 @@ static BOOL VGRIsImageURL(NSURL *url) {
   for (id<VGMetalFilterNode> n in nodes) {
     if (!segInserted && [n isKindOfClass:[BeautyV2FilterGroup class]]) {
       BeautyV2FilterGroup *beauty = (BeautyV2FilterGroup *)n;
+      // Phase 9B-4: delegate construction to the gated factory helper.
+      // With VG_ML_SEGMENTATION_ENABLED=0 (default) this expands to the
+      // identical [[VGSegmentationNode alloc] initWithPool:pool device:device]
+      // call — zero production behaviour change.
       VGSegmentationNode *segNode =
-          [[VGSegmentationNode alloc] initWithPool:pool device:device];
+          [VGCameraGraphFactory makeSegmentationNodeWithPool:pool device:device];
       segNode.enabled = beauty.faceAwareEnabled;
       [finalNodes addObject:segNode];
       segInserted = YES;
