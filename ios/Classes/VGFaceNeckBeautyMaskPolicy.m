@@ -51,6 +51,17 @@ static const int kClassFaceSkin    = 3;
 static const int kClassClothes     = 4;
 static const int kClassOthers      = 5;
 
+static os_log_t VGPolicyLog(void) {
+    static os_log_t log;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ log = os_log_create("com.vanguard", "VGFaceNeckBeautyMaskPolicy"); });
+    return log;
+}
+
+// ── Phase 9B-6A: diagnostic throttle interval ───────────────────────────────
+// Log once every kVGPolicyDiagLogInterval processed frames (~1s at 30fps).
+static const NSUInteger kVGPolicyDiagLogInterval = 30;
+
 // ─── Inline helpers ─────────────────────────────────────────────────────────
 
 static inline float _clamp01(float v) {
@@ -128,6 +139,10 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
     // Stores the blended mask probability for each pixel.
     float   *_historyBuffer;   // length = kModelPixels
     BOOL     _hasHistory;      // NO until first frame
+
+    // ── Phase 9B-6A: diagnostic stats frame counter ──────────────────────
+    // Throttle to one stats tally every kVGPolicyDiagLogInterval calls.
+    NSUInteger _diagStatsFrameCount;
 }
 
 - (instancetype)init {
@@ -267,6 +282,50 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
         }
     }
     free(candidateMask);
+
+    // ── Phase 9B-6A: class coverage stats (on diagnostic frames only) ──────────
+    //
+    // Only computed on throttled frames — not every frame — to avoid distorting
+    // normal provider timing. The argmax loop runs once here, before any ROI
+    // masking, and never mutates candidateMask, roiMask, EMA, or output.
+    _diagStatsFrameCount++;
+    BOOL shouldLogStats = (_diagStatsFrameCount % kVGPolicyDiagLogInterval == 1);
+
+    if (shouldLogStats && faceMaxY >= faceMinY && faceMaxX >= faceMinX) {
+        // Argmax tally: count pixels where each class has the highest confidence.
+        size_t countBG = 0, countHair = 0, countBody = 0;
+        size_t countFace = 0, countClothes = 0, countOthers = 0;
+
+        for (int y = 0; y < (int)kModelH; y++) {
+            for (int x = 0; x < (int)kModelW; x++) {
+                // Find the class with maximum confidence at this pixel.
+                float maxConf = -1.0f;
+                int   maxCls  = 0;
+                for (int c = 0; c < (int)kModelC; c++) {
+                    float v = _confidence(outputTensor, y, x, c);
+                    if (v > maxConf) { maxConf = v; maxCls = c; }
+                }
+                switch (maxCls) {
+                    case 0: countBG++;      break;
+                    case 1: countHair++;    break;
+                    case 2: countBody++;    break;
+                    case 3: countFace++;    break;
+                    case 4: countClothes++; break;
+                    case 5: countOthers++;  break;
+                }
+            }
+        }
+        os_log_info(VGPolicyLog(),
+            "[VGFaceNeckBeautyMaskPolicy stats] "
+            "bg=%.1f%% hair=%.1f%% bodySkin=%.1f%% faceSkin=%.1f%% "
+            "clothes=%.1f%% other=%.1f%%",
+            countBG     * 100.0 / kModelPixels,
+            countHair   * 100.0 / kModelPixels,
+            countBody   * 100.0 / kModelPixels,
+            countFace   * 100.0 / kModelPixels,
+            countClothes* 100.0 / kModelPixels,
+            countOthers * 100.0 / kModelPixels);
+    }
 
     // ── 5. Forehead trim ─────────────────────────────────────────────────────
     //
@@ -417,6 +476,23 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
                                                   height:qh
                                                sourcePTS:pts
                                                faceCount:1];
+
+    // ── Phase 9B-6A: final derived mask coverage stat (on same throttled frames) ──
+    if (shouldLogStats) {
+        size_t nonZero = 0;
+        const uint8_t *finalBytes = mask.data;
+        if (finalBytes) {
+            for (size_t i = 0; i < outPixels; i++) {
+                if (finalBytes[i] > 0) nonZero++;
+            }
+        }
+        os_log_info(VGPolicyLog(),
+            "[VGFaceNeckBeautyMaskPolicy stats] "
+            "finalMask=%.1f%% (%zu/%zu px at %zux%zu)",
+            outPixels > 0 ? nonZero * 100.0 / outPixels : 0.0,
+            nonZero, outPixels, qw, qh);
+    }
+
     return mask;
 }
 

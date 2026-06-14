@@ -100,6 +100,12 @@ static os_log_t VGLiteRTLog(void) {
 
     // Float input scratch buffer — reused each frame (kInputH * kInputW * kInputC floats).
     float *_inputScratch;  // kInputFloats
+
+    // ── Phase 9B-6A: diagnostic timing state (mlQueue only) ──────────────────
+    // _diagFrameCount: total number of frames that entered _processPixelBuffer.
+    // Throttle: log when (_diagFrameCount % kVGDiagLogInterval == 1).
+    NSUInteger       _diagFrameCount;
+    CFAbsoluteTime   _diagLastSuccessTime;  // time of last mask publication
 }
 
 @synthesize latestMask      = _latestMask;
@@ -152,26 +158,37 @@ static os_log_t VGLiteRTLog(void) {
 
 // ─── Interpreter lifecycle (called once during init, not on _mlQueue) ─────────
 
+// ── Phase 9B-6A: diagnostic throttle interval ────────────────────────────────
+// Log once every kVGDiagLogInterval processed frames (~1s at 30fps).
+static const NSUInteger kVGDiagLogInterval = 30;
+
 - (void)_setupInterpreterFromURL:(NSURL *)modelURL {
     // 1. Load model from file path.
     const char *path = modelURL.fileSystemRepresentation;
     if (!path) {
-        os_log_error(VGLiteRTLog(), "modelURL has no fileSystemRepresentation");
+        os_log_error(VGLiteRTLog(),
+            "[VGLiteRTMaskProvider lifecycle] model=MISSING reason=noFileSystemRepresentation");
         _usingFallback = YES;
         return;
     }
 
+    os_log_info(VGLiteRTLog(),
+        "[VGLiteRTMaskProvider lifecycle] model=found path=%{public}s", path);
+
     _tflModel = TfLiteModelCreateFromFile(path);
     if (!_tflModel) {
-        os_log_error(VGLiteRTLog(), "TfLiteModelCreateFromFile failed: %{public}s", path);
+        os_log_error(VGLiteRTLog(),
+            "[VGLiteRTMaskProvider lifecycle] model=loadFailed path=%{public}s", path);
         _usingFallback = YES;
         return;
     }
+    os_log_info(VGLiteRTLog(), "[VGLiteRTMaskProvider lifecycle] model=loaded");
 
     // 2. Create interpreter options.
     TfLiteInterpreterOptions *opts = TfLiteInterpreterOptionsCreate();
     if (!opts) {
-        os_log_error(VGLiteRTLog(), "TfLiteInterpreterOptionsCreate failed");
+        os_log_error(VGLiteRTLog(),
+            "[VGLiteRTMaskProvider lifecycle] TfLiteInterpreterOptionsCreate failed");
         TfLiteModelDelete(_tflModel); _tflModel = nil;
         _usingFallback = YES;
         return;
@@ -180,22 +197,25 @@ static os_log_t VGLiteRTLog(void) {
 
     // 3. Attempt Metal GPU delegate (device only — simulator has no Metal GPU).
 #if !TARGET_OS_SIMULATOR
+    os_log_info(VGLiteRTLog(), "[VGLiteRTMaskProvider lifecycle] metalDelegate=attempting");
     TFLGpuDelegateOptions gpuOpts = TFLGpuDelegateOptionsDefault();
     gpuOpts.allow_precision_loss = false;  // full float32 precision
     gpuOpts.enable_quantization  = true;
     _metalDelegate = TFLGpuDelegateCreate(&gpuOpts);
     if (_metalDelegate) {
         TfLiteInterpreterOptionsAddDelegate(opts, _metalDelegate);
-        os_log_info(VGLiteRTLog(), "Metal GPU delegate configured");
+        os_log_info(VGLiteRTLog(), "[VGLiteRTMaskProvider lifecycle] metalDelegate=attached");
     } else {
-        os_log_error(VGLiteRTLog(), "TFLGpuDelegateCreate failed — entering fallback (CPU not permitted on device)");
+        os_log_error(VGLiteRTLog(),
+            "[VGLiteRTMaskProvider lifecycle] metalDelegate=failed reason=TFLGpuDelegateCreate returned nil");
         TfLiteInterpreterOptionsDelete(opts);
         TfLiteModelDelete(_tflModel); _tflModel = nil;
         _usingFallback = YES;
         return;
     }
 #else
-    os_log_info(VGLiteRTLog(), "Simulator build — Metal delegate skipped, using CPU");
+    os_log_info(VGLiteRTLog(),
+        "[VGLiteRTMaskProvider lifecycle] metalDelegate=skipped reason=simulator");
 #endif
 
     // 4. Create interpreter.
@@ -206,25 +226,30 @@ static os_log_t VGLiteRTLog(void) {
     _tflModel = nil;
 
     if (!_tflInterpreter) {
-        os_log_error(VGLiteRTLog(), "TfLiteInterpreterCreate failed");
+        os_log_error(VGLiteRTLog(),
+            "[VGLiteRTMaskProvider lifecycle] interpreter=createFailed");
 #if !TARGET_OS_SIMULATOR
         if (_metalDelegate) { TFLGpuDelegateDelete(_metalDelegate); _metalDelegate = nil; }
 #endif
         _usingFallback = YES;
         return;
     }
+    os_log_info(VGLiteRTLog(), "[VGLiteRTMaskProvider lifecycle] interpreter=created");
 
     // 5. Allocate tensors.
     if (TfLiteInterpreterAllocateTensors(_tflInterpreter) != kTfLiteOk) {
-        os_log_error(VGLiteRTLog(), "TfLiteInterpreterAllocateTensors failed");
+        os_log_error(VGLiteRTLog(),
+            "[VGLiteRTMaskProvider lifecycle] tensors=allocFailed");
         [self _teardownInterpreter];
         _usingFallback = YES;
         return;
     }
+    os_log_info(VGLiteRTLog(), "[VGLiteRTMaskProvider lifecycle] tensors=allocated");
 
     // 6. Validate tensor contract: input [1,256,256,3] float32, output [1,256,256,6] float32.
     if (![self _validateTensorContract]) {
-        os_log_error(VGLiteRTLog(), "Tensor contract validation failed — entering fallback");
+        os_log_error(VGLiteRTLog(),
+            "[VGLiteRTMaskProvider lifecycle] tensors=contractMismatch — entering fallback");
         [self _teardownInterpreter];
         _usingFallback = YES;
         return;
@@ -232,7 +257,14 @@ static os_log_t VGLiteRTLog(void) {
 
     _ready         = YES;
     _usingFallback = NO;
-    os_log_info(VGLiteRTLog(), "VGLiteRTMaskProvider ready");
+    os_log_info(VGLiteRTLog(),
+        "[VGLiteRTMaskProvider lifecycle] model=found interpreter=created tensors=allocated "
+#if !TARGET_OS_SIMULATOR
+        "metalDelegate=attached"
+#else
+        "metalDelegate=skipped(sim)"
+#endif
+        " status=READY");
 }
 
 /// Returns YES if input [1,256,256,3] float32 and output [1,256,256,6] float32.
@@ -341,11 +373,18 @@ static os_log_t VGLiteRTLog(void) {
         generationReset    = YES;
     }
 
+    // ── Phase 9B-6A: diagnostic frame counter ────────────────────────────────
+    _diagFrameCount++;
+    BOOL shouldLog = (_diagFrameCount % kVGDiagLogInterval == 1);
+    CFAbsoluteTime t0 = shouldLog ? CFAbsoluteTimeGetCurrent() : 0;
+
     // 1. Preprocess pixel buffer → float RGB [0,1] at 256×256.
     if (![self _preprocessPixelBuffer:pixelBuffer intoScratch:_inputScratch]) {
         os_log_error(VGLiteRTLog(), "Pixel buffer preprocessing failed — skipping frame");
         return;
     }
+
+    CFAbsoluteTime t1 = shouldLog ? CFAbsoluteTimeGetCurrent() : 0;
 
     // 2. Copy into input tensor.
     TfLiteTensor *inputTensor = TfLiteInterpreterGetInputTensor(_tflInterpreter, 0);
@@ -364,6 +403,8 @@ static os_log_t VGLiteRTLog(void) {
         os_log_error(VGLiteRTLog(), "TfLiteInterpreterInvoke failed");
         return;
     }
+
+    CFAbsoluteTime t2 = shouldLog ? CFAbsoluteTimeGetCurrent() : 0;
 
     // 4. Read output tensor data pointer.
     const TfLiteTensor *outputTensor = TfLiteInterpreterGetOutputTensor(_tflInterpreter, 0);
@@ -386,8 +427,27 @@ static os_log_t VGLiteRTLog(void) {
                                           pts:pts
                               generationReset:generationReset];
 
+    CFAbsoluteTime t3 = shouldLog ? CFAbsoluteTimeGetCurrent() : 0;
+
     // 6. Publish.
     if (mask) {
+        // ── Phase 9B-6A: cadence measurement ─────────────────────────────────
+        if (shouldLog) {
+            CFAbsoluteTime now = (t3 > 0) ? t3 : CFAbsoluteTimeGetCurrent();
+            double cadenceMs = (_diagLastSuccessTime > 0)
+                ? (now - _diagLastSuccessTime) * 1000.0
+                : -1.0;
+            double preMs   = (t1 - t0) * 1000.0;
+            double inferMs = (t2 - t1) * 1000.0;
+            double postMs  = (t3 - t2) * 1000.0;
+            double totalMs = (t3 - t0) * 1000.0;
+            os_log_debug(VGLiteRTLog(),
+                "[VGLiteRTMaskProvider timing] pre=%.1fms infer=%.1fms post=%.1fms "
+                "total=%.1fms cadence=%.1fms pts=%.3fs gen=%llu",
+                preMs, inferMs, postMs, totalMs, cadenceMs,
+                CMTimeGetSeconds(pts), (unsigned long long)generation);
+        }
+        _diagLastSuccessTime = (t3 > 0) ? t3 : CFAbsoluteTimeGetCurrent();
         _latestMask = mask;
     }
 }

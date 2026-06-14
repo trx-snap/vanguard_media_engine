@@ -131,6 +131,10 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     float _currentMaskStrength;       // current smoothed maskStrength [0,1]
     CFAbsoluteTime _lastValidMaskTime; // wall-clock time of last valid mask
     BOOL _hadMaskLastFrame;           // true if previous frame had a valid mask
+
+    // ── Phase 9B-6A: mask freshness diagnostic counter ─────────────────────
+    // Throttle freshness log to once every kVGBeautyDiagLogInterval frames.
+    NSUInteger _freshnessLogCount;
 }
 
 @synthesize enabled              = _enabled;
@@ -636,6 +640,9 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
     static const float kMaskFadeSpeed      = 0.15f;
     static const float kMaskHoldDurationS  = 0.15f;  // 150ms
 
+    // Phase 9B-6A: diagnostic throttle interval for BeautyV2 freshness logs.
+    static const NSUInteger kVGBeautyDiagLogInterval = 30;
+
     // ── Extract mask from metadata ───────────────────────────────────────────
     // maskValid: set to YES if a usable mask was found and texture was uploaded.
     // maskFaceCount: used for temporal fade logic below.
@@ -725,6 +732,35 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
                 }
             }
         }
+    }
+
+    // ── Phase 9B-6A: mask freshness diagnostic ────────────────────────────────
+    // Computed before temporal fade logic — logging only, no logic change.
+    _freshnessLogCount++;
+    if (_freshnessLogCount % kVGBeautyDiagLogInterval == 1) {
+        // Read mask PTS from metadata (same path as above, read-only).
+        CMTime maskPTS = kCMTimeInvalid;
+        if (envelope.metadata != NULL) {
+            NSDictionary *metaForDiag = (__bridge NSDictionary *)envelope.metadata;
+            if ([metaForDiag isKindOfClass:[NSDictionary class]]) {
+                NSValue *ptsVal = metaForDiag[VGSegmentationMetadataKeyFaceMetaPTS];
+                if (ptsVal) {
+                    maskPTS = [ptsVal CMTimeValue];
+                }
+            }
+        }
+        double envelopePtsSec = CMTimeGetSeconds(envelope.pts);
+        double maskPtsSec     = CMTIME_IS_VALID(maskPTS) ? CMTimeGetSeconds(maskPTS) : -1.0;
+        double ageMs          = CMTIME_IS_VALID(maskPTS)
+            ? (envelopePtsSec - maskPtsSec) * 1000.0
+            : -1.0;
+        const char *freshLabel = (ageMs >= 0.0 && ageMs < 50.0) ? "freshCandidate" : "staleCandidate";
+        os_log_debug(OS_LOG_DEFAULT,
+            "[BeautyV2 maskFreshness] ageMs=%.1f envelopePts=%.3fs maskPts=%.3fs "
+            "available=%s %s",
+            ageMs, envelopePtsSec, maskPtsSec,
+            maskValid ? "YES" : "NO",
+            CMTIME_IS_VALID(maskPTS) ? freshLabel : "noPTS");
     }
 
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
