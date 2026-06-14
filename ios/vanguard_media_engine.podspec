@@ -165,7 +165,9 @@ Pod::Spec.new do |s|
       # Phase 9B-1: Face+Neck beauty mask policy unit tests (synthetic tensors, no TFLite API)
       'Tests/VGFaceNeckBeautyMaskPolicyTest.m',
       # Phase 9B-2: LiteRT mask provider tests (real bundled model + synthetic CVPixelBuffer)
-      'Tests/VGLiteRTMaskProviderTest.m'
+      'Tests/VGLiteRTMaskProviderTest.m',
+      # Phase 9B-3: Camera graph factory gate test (gate-OFF path, VGHeuristicMaskProvider default)
+      'Tests/VGCameraGraphFactoryGateTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage'
     ts.dependency    'UMF'

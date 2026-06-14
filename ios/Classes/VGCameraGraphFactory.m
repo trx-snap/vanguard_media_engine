@@ -1,9 +1,31 @@
 // VGCameraGraphFactory.m
-// vanguard_media_engine — Phase 6A-1
+// vanguard_media_engine — Phase 6A-1 / Phase 9B-3
 //
 // Implementation of VGCameraGraphFactory.
+//
+// Phase 9B-3: Adds +makeSegmentationNodeWithPool:device: gated behind
+// VG_ML_SEGMENTATION_ENABLED (defaults OFF).
+// When OFF: identical behaviour to the pre-9B-3 VGSegmentationNode
+// designated initializer — no behavioural change whatsoever.
+// When ON: VGLiteRTMaskProvider with VGHeuristicMaskProvider fallback.
 
 #import "VGCameraGraphFactory.h"
+
+// ─── Phase 9B-3 ML segmentation gate ─────────────────────────────────────────
+// Default OFF. Never enable in production until Phase 9B-4 device validation.
+// Callers (e.g. VanguardGraphRuntime) should call
+//   +makeSegmentationNodeWithPool:device:
+// and receive the gated node — replacing the direct alloc/init site.
+// In this slice NO callers are migrated; the method is ready for Phase 9B-4.
+#ifndef VG_ML_SEGMENTATION_ENABLED
+#define VG_ML_SEGMENTATION_ENABLED 0
+#endif
+
+#if VG_ML_SEGMENTATION_ENABLED
+#import "VGLiteRTMaskProvider.h"
+#import "VGHeuristicMaskProvider.h"
+#import "VGMLModelBundle.h"
+#endif
 
 // ─── Native source / adapters / sinks ─────────────────────────────────────────
 #import "VGCameraSourceAdapter.h"
@@ -35,6 +57,69 @@
 #import "VanguardMetalRenderer.h"
 
 @implementation VGCameraGraphFactory
+
+// ─── Phase 9B-3: Gated segmentation node factory ──────────────────────────────
+//
+// Creates a VGSegmentationNode wired with the correct mask provider.
+//
+// VG_ML_SEGMENTATION_ENABLED == 0 (DEFAULT — ALL PRODUCTION BUILDS):
+//   Delegates directly to the existing designated initializer.
+//   No new code paths executed. Behaviour is byte-for-byte identical to
+//   calling [[VGSegmentationNode alloc] initWithPool:pool device:device]
+//   directly.
+//
+// VG_ML_SEGMENTATION_ENABLED == 1 (DEV/TEST OVERRIDE ONLY):
+//   1. Resolves selfie_multiclass_256x256.tflite from VGMLModelBundle.
+//   2. Creates VGHeuristicMaskProvider as fallback.
+//   3. Creates VGLiteRTMaskProvider with model URL + fallback.
+//   4. If provider init fails or -isReady is NO, uses fallback alone.
+//   5. Injects the chosen provider via the DI initializer.
+//
+// Migration note:
+//   VanguardGraphRuntime currently creates VGSegmentationNode directly at
+//   line 1415 with [[VGSegmentationNode alloc] initWithPool:pool device:device].
+//   That call site is NOT modified in Phase 9B-3. A future Phase 9B-4 task
+//   should replace it with [VGCameraGraphFactory makeSegmentationNodeWithPool:device:].
+
++ (VGSegmentationNode *)makeSegmentationNodeWithPool:(CVPixelBufferPoolRef)pool
+                                              device:(id<MTLDevice>)device {
+#if VG_ML_SEGMENTATION_ENABLED
+    // ── 1. Resolve model URL ────────────────────────────────────────────────
+    NSURL *modelURL = [VGMLModelBundle URLForModelNamed:@"selfie_multiclass_256x256"];
+    if (!modelURL) {
+        NSLog(@"[VGCameraGraphFactory] 9B-3: model URL not found — using heuristic provider");
+        return [[VGSegmentationNode alloc] initWithPool:pool device:device];
+    }
+
+    // ── 2. Build heuristic fallback ──────────────────────────────────────────
+    VGHeuristicMaskProvider *fallback = [[VGHeuristicMaskProvider alloc] init];
+
+    // ── 3. Build LiteRT provider ─────────────────────────────────────────────
+    VGLiteRTMaskProvider *mlProvider =
+        [[VGLiteRTMaskProvider alloc] initWithModelURL:modelURL
+                                              fallback:fallback];
+
+    // ── 4. Validate readiness — fall back to heuristic on any failure ─────────
+    id<VGMaskProvider> chosenProvider;
+    if (!mlProvider || !mlProvider.isReady) {
+        NSLog(@"[VGCameraGraphFactory] 9B-3: VGLiteRTMaskProvider not ready — "
+              @"using VGHeuristicMaskProvider");
+        chosenProvider = fallback;
+    } else {
+        NSLog(@"[VGCameraGraphFactory] 9B-3: VGLiteRTMaskProvider ready — "
+              @"injecting ML provider");
+        chosenProvider = mlProvider;
+    }
+
+    // ── 5. Inject provider via DI initializer ────────────────────────────────
+    return [[VGSegmentationNode alloc] initWithPool:pool
+                                             device:device
+                                           provider:chosenProvider];
+#else
+    // Gate OFF: identical to the existing production call site.
+    return [[VGSegmentationNode alloc] initWithPool:pool device:device];
+#endif
+}
 
 + (nullable NSDictionary<NSString *, id> *)
     buildCameraGraphWithSource:(VanguardCameraMediaSource *)source
