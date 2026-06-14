@@ -73,6 +73,66 @@ static inline float _confidence(const float *tensor, int y, int x, int c) {
     return tensor[(y * (int)kModelW + x) * (int)kModelC + c];
 }
 
+// ─── Separable box blur (feather/soft-edge helper) ───────────────────────────
+//
+// Converts a hard binary uint8 mask (0 or 255) into a soft-edge float mask
+// by applying a 1D box blur horizontally then vertically. The result is a
+// float buffer in [0, 1] at the same resolution. Used between step 9 (binary
+// threshold) and step 10 (downscale) to produce a smooth 0–255 feather ramp
+// instead of a hard staircase boundary.
+//
+// radius: box half-width in pixels (kernel size = 2*radius+1).
+// outFloat: caller-allocated float buffer of size w*h.
+static void _boxBlurToFloat(const uint8_t *src, float *outFloat,
+                             size_t w, size_t h, int radius) {
+    if (radius <= 0) {
+        for (size_t i = 0; i < w * h; i++) {
+            outFloat[i] = src[i] / 255.0f;
+        }
+        return;
+    }
+    // Horizontal pass: src (uint8) → tmp (float)
+    float *tmp = (float *)malloc(w * h * sizeof(float));
+    if (!tmp) {
+        for (size_t i = 0; i < w * h; i++) outFloat[i] = src[i] / 255.0f;
+        return;
+    }
+    float kernelW = (float)(2 * radius + 1);
+    for (int y = 0; y < (int)h; y++) {
+        // Sliding-window accumulation.
+        float acc = 0.0f;
+        // Initialise window for x=-radius..0 (clamped at left edge).
+        for (int k = -radius; k <= radius; k++) {
+            int kx = k < 0 ? 0 : k;
+            acc += src[y * w + (size_t)kx] / 255.0f;
+        }
+        for (int x = 0; x < (int)w; x++) {
+            tmp[y * w + x] = acc / kernelW;
+            // Slide: remove left, add right.
+            int removeX = x - radius;     if (removeX < 0)       removeX = 0;
+            int addX    = x + radius + 1; if (addX >= (int)w)    addX    = (int)w - 1;
+            acc -= src[y * w + removeX] / 255.0f;
+            acc += src[y * w + addX]    / 255.0f;
+        }
+    }
+    // Vertical pass: tmp (float) → outFloat (float)
+    for (int x = 0; x < (int)w; x++) {
+        float acc = 0.0f;
+        for (int k = -radius; k <= radius; k++) {
+            int ky = k < 0 ? 0 : k;
+            acc += tmp[(size_t)ky * w + x];
+        }
+        for (int y = 0; y < (int)h; y++) {
+            outFloat[y * w + x] = acc / kernelW;
+            int removeY = y - radius;     if (removeY < 0)       removeY = 0;
+            int addY    = y + radius + 1; if (addY >= (int)h)    addY    = (int)h - 1;
+            acc -= tmp[removeY * w + x];
+            acc += tmp[addY    * w + x];
+        }
+    }
+    free(tmp);
+}
+
 // ─── Morphological helpers (box kernel, square neighbourhood) ───────────────
 
 /// In-place binary erosion of a uint8 mask (value 1 = foreground, 0 = background).
@@ -155,8 +215,18 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
     _clothMargin    = 0.05f;
     _neckDepth      = 0.40f;
     _neckWidth      = 0.65f;
-    _foreheadTrim   = 0.10f;
-    _foreheadExpand = 4;
+    // Phase 9B-6C: reduce forehead trim from 0.10 to 0.0.
+    // Root cause: trim was the primary direct cause of the forehead gap.
+    // The existing gated forehead expansion (step 6) guards against hair-spill
+    // independently. Setting trim to 0 allows the full detected face-skin
+    // region to reach its natural top boundary.
+    _foreheadTrim   = 0.0f;
+    // Phase 9B-6C: increase forehead expand from 4 to 8.
+    // More recovery pixels above the detected face bbox top, for cases where
+    // face-skin confidence drops below threshold near the hairline but the
+    // region is still genuine forehead (not hair). Still gated by
+    // hair/clothes/others >= skinThreshold.
+    _foreheadExpand = 8;
     _morphKernelSize = 3;
     _temporalAlpha  = 0.60f;
 
@@ -305,6 +375,11 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
         size_t countBG = 0, countHair = 0, countBody = 0;
         size_t countFace = 0, countClothes = 0, countOthers = 0;
 
+        // Phase 9B-6C: also tally top-face band (forehead region) separately.
+        // Top band = top 25% of the detected face bbox rows.
+        int topBandEndY = faceMinY + faceH / 4;
+        size_t topBandFace = 0, topBandHair = 0, topBandBG = 0, topBandOther = 0;
+
         for (int y = 0; y < (int)kModelH; y++) {
             for (int x = 0; x < (int)kModelW; x++) {
                 // Find the class with maximum confidence at this pixel.
@@ -322,6 +397,13 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
                     case 4: countClothes++; break;
                     case 5: countOthers++;  break;
                 }
+                // Top-band tally (forehead zone only).
+                if (y >= faceMinY && y <= topBandEndY && x >= faceMinX && x <= faceMaxX) {
+                    if (maxCls == 3 || maxCls == 2)      topBandFace++;
+                    else if (maxCls == 1)                 topBandHair++;
+                    else if (maxCls == 0)                 topBandBG++;
+                    else                                  topBandOther++;
+                }
             }
         }
         os_log_info(VGPolicyLog(),
@@ -335,6 +417,20 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
             countClothes* 100.0 / kModelPixels,
             countOthers * 100.0 / kModelPixels,
             (unsigned long)_diagStatsFrameCount);
+        // Phase 9B-6C: top-face band diagnostic.
+        size_t topBandTotal = topBandFace + topBandHair + topBandBG + topBandOther;
+        if (topBandTotal > 0) {
+            os_log_info(VGPolicyLog(),
+                "[VGFaceNeckBeautyMaskPolicy diagnostic] "
+                "topFaceBand(face/hair/bg/other)=%.0f%%/%.0f%%/%.0f%%/%.0f%% "
+                "faceBox=(%d,%d)-(%d,%d) frame=%lu",
+                topBandFace  * 100.0 / topBandTotal,
+                topBandHair  * 100.0 / topBandTotal,
+                topBandBG    * 100.0 / topBandTotal,
+                topBandOther * 100.0 / topBandTotal,
+                faceMinX, faceMinY, faceMaxX, faceMaxY,
+                (unsigned long)_diagStatsFrameCount);
+        }
     }
     // ── No-face diagnostic: log when a diagnostic frame finds no face pixels ──
     if (shouldLogStats && (faceMaxY < faceMinY || faceMaxX < faceMinX)) {
@@ -455,6 +551,42 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
     for (size_t i = 0; i < kModelPixels; i++) {
         modelMask[i] = (_historyBuffer[i] >= 0.5f) ? 255 : 0;
     }
+
+    // ── 9B. Soft-edge feathering (Phase 9B-6C) ──────────────────────────────
+    //
+    // Apply a separable box blur to the binary modelMask to produce a soft
+    // 0–255 feather ramp at boundaries. This eliminates the hard staircase
+    // edge that was making the mask boundary jagged/polygonal when BeautyV2
+    // sampled it at render resolution.
+    //
+    // Blur radius 3 at 256×256 → ~3-pixel wide gradient at model resolution
+    // (~12px at full 1080p render resolution). Wide enough to smooth, narrow
+    // enough not to bleed significantly into hair/background.
+    //
+    // The blurred float values replace the binary modelMask bytes for downscale.
+    static const int kFeatherRadius = 3;
+    float *featherBuf = (float *)malloc(kModelPixels * sizeof(float));
+    if (featherBuf) {
+        _boxBlurToFloat(modelMask, featherBuf, kModelW, kModelH, kFeatherRadius);
+        // Inward-only masked feather: only apply soft values where the original
+        // binary mask was foreground (non-zero). Background pixels stay exactly 0
+        // — no outward bleed into hair, clothes, or background regions.
+        // The interior boundary pixels receive the blur-attenuated value
+        // (e.g. ~145 at the outermost foreground row), creating a smooth
+        // 0→145→255 gradient inside the face region that BeautyV2 blends
+        // bilinearly at render resolution, eliminating the staircase edge.
+        for (size_t i = 0; i < kModelPixels; i++) {
+            if (modelMask[i] != 0) {
+                float v = featherBuf[i];
+                if (v < 0.0f) v = 0.0f;
+                if (v > 1.0f) v = 1.0f;
+                modelMask[i] = (uint8_t)(v * 255.0f + 0.5f);
+            }
+            // else: background stays 0 — no outward bleed
+        }
+        free(featherBuf);
+    }
+    // (If allocation fails, modelMask retains hard binary 0/255 — safe fallback.)
 
     // ── 10. Downscale to quarter-resolution ──────────────────────────────────
     //
