@@ -47,6 +47,8 @@
 
 #import <Accelerate/Accelerate.h>
 #import <os/log.h>
+#import <os/lock.h>
+#include <stdatomic.h>
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -106,6 +108,21 @@ static os_log_t VGLiteRTLog(void) {
     // Throttle: log when (_diagFrameCount % kVGDiagLogInterval == 1).
     NSUInteger       _diagFrameCount;
     CFAbsoluteTime   _diagLastSuccessTime;  // time of last mask publication
+
+    // ── Phase 9B-6B.1: latest-pending-frame guard ────────────────────────────
+    // At most one inference runs at a time (_mlInFlight=1 while running).
+    // At most one pending frame is held (_pendingPixelBuffer) — newer arrivals
+    // replace older ones. When inference completes, _mlQueue immediately drains
+    // the pending frame (no idle gap waiting for the next camera frame arrival).
+    // Eliminates the 20ms camera-arrival gap that caused 166ms ageMs peaks.
+    _Atomic(int32_t) _mlInFlight;       // 0=idle, 1=inference running
+    CVPixelBufferRef _pendingPixelBuffer; // retained; nil if no pending frame
+    CMTime           _pendingPTS;
+    uint64_t         _pendingGeneration;
+    os_unfair_lock   _pendingLock;      // protects the pending slot
+    // Diagnostics (not on any specific queue — used with interlocked access).
+    NSUInteger       _diagDropCount;    // frames that arrived while busy (went to pending)
+    NSUInteger       _diagPendingFired; // times a pending frame was immediately processed
 }
 
 @synthesize latestMask      = _latestMask;
@@ -125,13 +142,18 @@ static os_log_t VGLiteRTLog(void) {
     self = [super init];
     if (!self) return nil;
 
-    _fallback          = fallback;
-    _policy            = policy ?: [[VGFaceNeckBeautyMaskPolicy alloc] init];
-    _usingFallback     = NO;
-    _ready             = NO;
-    _invalidated       = NO;
-    _currentGeneration = UINT64_MAX;
-    _latestMask        = nil;
+    _fallback             = fallback;
+    _policy               = policy ?: [[VGFaceNeckBeautyMaskPolicy alloc] init];
+    _usingFallback        = NO;
+    _ready                = NO;
+    _invalidated          = NO;
+    _currentGeneration    = UINT64_MAX;
+    _latestMask           = nil;
+    _pendingPixelBuffer   = nil;
+    _pendingPTS           = kCMTimeInvalid;
+    _pendingGeneration    = 0;
+    _pendingLock          = OS_UNFAIR_LOCK_INIT;
+    atomic_store(&_mlInFlight, 0);
 
     _mlQueue = dispatch_queue_create("com.vanguard.litert", DISPATCH_QUEUE_SERIAL);
 
@@ -325,6 +347,31 @@ static const NSUInteger kVGDiagLogInterval = 30;
         return;
     }
 
+    // ── Phase 9B-6B.1: latest-pending-frame guard ────────────────────────────
+    // If an inference is already running, store this frame as the pending frame
+    // (replacing any older pending). When the running inference completes it
+    // immediately drains the pending slot — no idle gap, no queue backlog.
+    int32_t expected = 0;
+    if (!atomic_compare_exchange_strong(&_mlInFlight, &expected, 1)) {
+        // Already in-flight — store as pending (replace any older pending).
+        _diagDropCount++;
+        os_unfair_lock_lock(&_pendingLock);
+        CVPixelBufferRef oldPending = _pendingPixelBuffer;
+        CVPixelBufferRetain(pixelBuffer);
+        _pendingPixelBuffer = pixelBuffer;
+        _pendingPTS         = pts;
+        _pendingGeneration  = generation;
+        os_unfair_lock_unlock(&_pendingLock);
+        if (oldPending) { CVPixelBufferRelease(oldPending); } // release replaced older frame
+        if (_diagDropCount == 1) {
+            os_log_info(VGLiteRTLog(),
+                "[VGLiteRTMaskProvider diagnostic] pending-frame slot active — "
+                "first frame stored as pending (inference in-flight).");
+        }
+        [_fallback submitFrame:pixelBuffer pts:pts generation:generation];
+        return;
+    }
+
     // Retain pixel buffer for async dispatch.
     CVPixelBufferRetain(pixelBuffer);
     __weak typeof(self) weakSelf = self;
@@ -333,10 +380,44 @@ static const NSUInteger kVGDiagLogInterval = 30;
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf || strongSelf->_invalidated) {
             CVPixelBufferRelease(pixelBuffer);
+            // Release any pending buffer we can no longer use.
+            if (strongSelf) {
+                os_unfair_lock_lock(&strongSelf->_pendingLock);
+                CVPixelBufferRef stale = strongSelf->_pendingPixelBuffer;
+                strongSelf->_pendingPixelBuffer = nil;
+                os_unfair_lock_unlock(&strongSelf->_pendingLock);
+                if (stale) { CVPixelBufferRelease(stale); }
+                atomic_store(&strongSelf->_mlInFlight, 0);
+            }
             return;
         }
         [strongSelf _processPixelBuffer:pixelBuffer pts:pts generation:generation];
         CVPixelBufferRelease(pixelBuffer);
+
+        // ── Drain pending: if a newer frame arrived while we were running,
+        // process it immediately without waiting for the next camera frame.
+        // _mlInFlight stays 1 during pending processing — no concurrent submit.
+        os_unfair_lock_lock(&strongSelf->_pendingLock);
+        CVPixelBufferRef pendingBuf = strongSelf->_pendingPixelBuffer;
+        CMTime           pendingPTS = strongSelf->_pendingPTS;
+        uint64_t         pendingGen = strongSelf->_pendingGeneration;
+        strongSelf->_pendingPixelBuffer = nil;
+        os_unfair_lock_unlock(&strongSelf->_pendingLock);
+
+        if (pendingBuf && !strongSelf->_invalidated) {
+            strongSelf->_diagPendingFired++;
+            if (strongSelf->_diagPendingFired == 1) {
+                os_log_info(VGLiteRTLog(),
+                    "[VGLiteRTMaskProvider diagnostic] pending-frame drain fired — "
+                    "first immediate back-to-back inference.");
+            }
+            [strongSelf _processPixelBuffer:pendingBuf pts:pendingPTS generation:pendingGen];
+            CVPixelBufferRelease(pendingBuf);
+        } else if (pendingBuf) {
+            CVPixelBufferRelease(pendingBuf); // invalidated — just release
+        }
+
+        atomic_store(&strongSelf->_mlInFlight, 0);
     });
 }
 
@@ -345,6 +426,13 @@ static const NSUInteger kVGDiagLogInterval = 30;
     // Mark invalidated atomically before dispatching teardown.
     _invalidated = YES;
     _ready       = NO;
+
+    // Release any pending buffer immediately — it can no longer be processed.
+    os_unfair_lock_lock(&_pendingLock);
+    CVPixelBufferRef stalePending = _pendingPixelBuffer;
+    _pendingPixelBuffer = nil;
+    os_unfair_lock_unlock(&_pendingLock);
+    if (stalePending) { CVPixelBufferRelease(stalePending); }
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(_mlQueue, ^{
@@ -638,10 +726,17 @@ static const NSUInteger kVGDiagLogInterval = 30;
     _tflModel       = nil;
     _inputScratch   = NULL;
 
+    // Phase 9B-6B.1: capture and release pending buffer on _mlQueue.
+    // _pendingLock is not needed here — dealloc is single-threaded and no
+    // concurrent submitFrame: can reach this object (ARC retain count = 0).
+    CVPixelBufferRef pendingCapture = _pendingPixelBuffer;
+    _pendingPixelBuffer = nil;
+
     // Asynchronous teardown on _mlQueue. 'self' is deallocated immediately,
     // but the underlying C/C++ resources are cleaned up safely on the queue
     // that created/used them.
     dispatch_async(_mlQueue, ^{
+        if (pendingCapture) { CVPixelBufferRelease(pendingCapture); }
         if (interp) {
             TfLiteInterpreterDelete(interp);
         }
