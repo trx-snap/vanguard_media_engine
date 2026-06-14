@@ -309,6 +309,7 @@ static os_log_t VGLiteRTLog(void) {
 }
 
 - (void)invalidate {
+    os_log_info(VGLiteRTLog(), "[VGLiteRTMaskProvider] invalidate");
     // Mark invalidated atomically before dispatching teardown.
     _invalidated = YES;
     _ready       = NO;
@@ -553,11 +554,40 @@ static os_log_t VGLiteRTLog(void) {
 // ─── Dealloc ──────────────────────────────────────────────────────────────────
 
 - (void)dealloc {
-    // Synchronous teardown on _mlQueue to ensure no in-flight inference.
-    dispatch_sync(_mlQueue, ^{
-        [self _teardownInterpreter];
+    os_log_info(VGLiteRTLog(), "[VGLiteRTMaskProvider] dealloc");
+
+    // Capture pointers locally to avoid self-deadlock if dealloc happens on _mlQueue.
+    TfLiteInterpreter *interp  = _tflInterpreter;
+#if !TARGET_OS_SIMULATOR
+    TfLiteDelegate    *metal   = _metalDelegate;
+    _metalDelegate  = nil;
+#endif
+    TfLiteModel       *model   = _tflModel;
+    void              *scratch = _inputScratch;
+
+    _tflInterpreter = nil;
+    _tflModel       = nil;
+    _inputScratch   = NULL;
+
+    // Asynchronous teardown on _mlQueue. 'self' is deallocated immediately,
+    // but the underlying C/C++ resources are cleaned up safely on the queue
+    // that created/used them.
+    dispatch_async(_mlQueue, ^{
+        if (interp) {
+            TfLiteInterpreterDelete(interp);
+        }
+#if !TARGET_OS_SIMULATOR
+        if (metal) {
+            TFLGpuDelegateDelete(metal);
+        }
+#endif
+        if (model) {
+            TfLiteModelDelete(model);
+        }
+        if (scratch) {
+            free(scratch);
+        }
     });
-    free(_inputScratch);
 }
 
 @end
