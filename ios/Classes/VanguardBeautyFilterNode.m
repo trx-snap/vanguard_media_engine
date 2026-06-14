@@ -1,5 +1,6 @@
 // VanguardBeautyFilterNode.m
 #import "VanguardBeautyFilterNode.h"
+#import "VGMetalLibraryResolver.h"
 
 typedef struct {
   float sigmaSpace;
@@ -198,12 +199,9 @@ typedef struct {
 }
 
 - (void)_compilePSO {
-  NSBundle *bundle = [NSBundle bundleForClass:[self class]];
-  NSError *error = nil;
-  id<MTLLibrary> lib = [_device newDefaultLibraryWithBundle:bundle error:&error];
+  id<MTLLibrary> lib = [VGMetalLibraryResolver libraryForDevice:_device caller:@"VGBeauty"];
   if (!lib) {
-    NSLog(@"[VGFilter] Failed to load Metal library from bundle %@: %@",
-          bundle.bundlePath, error);
+    NSLog(@"[VGFilter] Failed to load Metal library — see VGMetalLibraryResolver logs");
     return;
   }
   id<MTLFunction> fn = [lib newFunctionWithName:@"vanguard_bilateral_filter"];

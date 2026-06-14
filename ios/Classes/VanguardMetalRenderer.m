@@ -17,6 +17,7 @@
 #import "VanguardFileMediaSource.h"
 #import "VanguardFilterNode.h"  // Full protocol
 #import "VanguardMediaSource.h" // Full protocol
+#import "VGMetalLibraryResolver.h"
 
 // P4-5: VGFrameDelegate — scheduler frame-forwarding protocol
 #import "VGFrameDelegate.h"
@@ -277,20 +278,13 @@ static os_log_t _rendererLog;
   CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, _device, nil,
                             &_textureCache);
 
-  // FIX: [_device newDefaultLibrary] loads from the MAIN app bundle, which
-  // has no .metal shaders. The shaders (VanguardCompositor.metal,
-  // VanguardEffects.metal) are compiled into default.metallib inside the
-  // vanguard_media_engine.framework bundle. Use bundleForClass: to locate
-  // the framework bundle that loaded this class — correct on all deployment
-  // configurations (CocoaPods use_frameworks!, SwiftPM, static xcframework).
-  NSBundle *bundle = [NSBundle bundleForClass:[VanguardMetalRenderer class]];
-  NSError *libraryError = nil;
-  id<MTLLibrary> library = [_device newDefaultLibraryWithBundle:bundle
-                                                          error:&libraryError];
+  // Load the Metal library via VGMetalLibraryResolver, which searches
+  // VanguardMetal.bundle (copied into Runner.app by CocoaPods for all linkage
+  // modes) before falling back to the class bundle root (dynamic framework path).
+  id<MTLLibrary> library = [VGMetalLibraryResolver libraryForDevice:_device
+                                                             caller:@"VanguardRenderer"];
   if (!library) {
-    NSLog(@"[VanguardRenderer] FATAL: Metal library not found in bundle %@: %@",
-          bundle.bundleURL.lastPathComponent,
-          libraryError.localizedDescription);
+    NSLog(@"[VanguardRenderer] FATAL: Metal library not found — see VGMetalLibraryResolver logs");
     return;
   }
 

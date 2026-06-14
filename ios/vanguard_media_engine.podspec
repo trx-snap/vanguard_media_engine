@@ -15,15 +15,30 @@ Pod::Spec.new do |s|
   # (vanguard_engine_create etc.) are compiled into the vanguard_media_engine.framework.
   # Because the app uses use_frameworks!, this framework is a dylib loaded at launch.
   # DynamicLibrary.process() finds symbols in all loaded dylibs — no linker flags needed.
-  s.source_files     = 'Classes/**/*.{swift,h,m,mm,metal}'
+  # .metal files are excluded from source_files and placed in resource_bundles
+  # instead. With use_frameworks! :linkage => :static (required for
+  # TensorFlowLiteC static xcframeworks), the pod compiles into a static archive.
+  # Xcode compiles .metal files listed in source_files into an intermediate
+  # default.metallib inside the pod's fake .framework in DerivedData — but that
+  # intermediate is NOT copied into Runner.app at install time (only dynamic
+  # frameworks are embedded). Placing .metal files in resource_bundles causes
+  # Xcode to compile them into default.metallib inside VanguardMetal.bundle,
+  # which CocoaPods correctly copies into Runner.app for all linkage modes.
+  s.source_files     = 'Classes/**/*.{swift,h,m,mm}'
 
   # Phase 9B — model asset bundle.
   # selfie_multiclass_256x256.tflite: Apache 2.0 (Google MediaPipe Solutions).
   # SHA256: c6748b1253a99067ef71f7e26ca71096cd449baefa8f101900ea23016507e0e0
   # Bundled under 'VanguardMLModels' so the resource resolver can locate it
   # via NSBundle(identifier:) or by walking the main bundle's path.
+  #
+  # Metal shader bundle — VanguardMetal.bundle:
+  # VanguardEffects.metal + VanguardCompositor.metal are compiled by Xcode into
+  # default.metallib inside this bundle. VGMetalLibraryResolver locates it at
+  # runtime via NSBundle(identifier:) or main bundle path walk.
   s.resource_bundles = {
-    'VanguardMLModels' => ['Assets/**/*.tflite']
+    'VanguardMLModels' => ['Assets/**/*.tflite'],
+    'VanguardMetal'    => ['Classes/**/*.metal']
   }
 
   s.dependency       'Flutter'

@@ -1,6 +1,7 @@
 // VanguardSegmentationFilterNode.m
 #import "VanguardSegmentationFilterNode.h"
 #import "VanguardMaskSnapshot.h"
+#import "VGMetalLibraryResolver.h"
 #import <QuartzCore/QuartzCore.h>
 #import <Vision/Vision.h> // VNCoreMLRequest — P5 invalidate
 #include <os/lock.h>      // os_unfair_lock — P5 invalidate
@@ -287,12 +288,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 - (void)_compilePSO {
-  NSBundle *bundle = [NSBundle bundleForClass:[self class]];
-  NSError *error = nil;
-  id<MTLLibrary> lib = [_device newDefaultLibraryWithBundle:bundle error:&error];
+  id<MTLLibrary> lib = [VGMetalLibraryResolver libraryForDevice:_device caller:@"VGSeg"];
   if (!lib) {
-    NSLog(@"[VGFilter] Failed to load Metal library from bundle %@: %@",
-          bundle.bundlePath, error);
+    NSLog(@"[VGFilter] Failed to load Metal library — see VGMetalLibraryResolver logs");
     return;
   }
   id<MTLFunction> fn =

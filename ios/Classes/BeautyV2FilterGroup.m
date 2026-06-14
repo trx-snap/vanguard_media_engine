@@ -27,6 +27,7 @@
 #import "BeautyV2FilterGroup.h"
 #import "VGSegmentationNode.h"
 #import "VGSkinMaskGenerator.h"  // Phase 4F: VGSkinMask type for metadata consumption
+#import "VGMetalLibraryResolver.h"
 #import <os/lock.h>
 #import <os/log.h>
 
@@ -444,11 +445,9 @@ _VGBeautyCreatePool(size_t width, size_t height) {
 // ---------------------------------------------------------------------------
 
 - (void)_compilePSOs {
-    NSBundle *bundle = [NSBundle bundleForClass:[self class]];
-    NSError  *err    = nil;
-    id<MTLLibrary> lib = [_device newDefaultLibraryWithBundle:bundle error:&err];
+    id<MTLLibrary> lib = [VGMetalLibraryResolver libraryForDevice:_device caller:@"BeautyV2"];
     if (!lib) {
-        os_log_error(OS_LOG_DEFAULT, "[BeautyV2] Metal library load failed: %{public}@", err);
+        os_log_error(OS_LOG_DEFAULT, "[BeautyV2] Metal library load failed — see VGMetalLibraryResolver logs");
         return;
     }
     NSDictionary *kernels = @{
