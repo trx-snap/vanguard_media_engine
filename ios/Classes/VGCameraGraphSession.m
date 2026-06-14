@@ -43,6 +43,7 @@
 #import "VanguardMetalRenderer.h"
 #import "VanguardBeautyFilterNode.h"
 #import "BeautyV2FilterGroup.h"
+#import "VGSegmentationNode.h"  // Phase 9B-5: segmentation auto-insertion before BeautyV2
 
 #import <UMF/VGGraphExecutionContext.h>
 #import <UMF/VGFrameDelegate.h>
@@ -511,8 +512,8 @@
         }
 
         if ([type isEqualToString:@"beauty"]) {
-            // beautyVersion:2 is now constructable in Phase 6A-3E-V2.
-            // beauty V1 (default/no key) remains the production path.
+            // beautyVersion:2 with faceAwareEnabled is fully constructable (Phase 9B-5).
+            // beautyVersion:2 without faceAware, and beauty V1, remain the default path.
         }
     }
 
@@ -534,7 +535,7 @@
                           [params[@"beautyVersion"] integerValue] == 2;
 
             if (wantV2) {
-                // ── Beauty V2 path (Phase 6A-3E-V2) ──────────────────────────
+                // ── Beauty V2 path (Phase 6A-3E-V2 / Phase 9B-5) ─────────────────────
                 // BeautyV2FilterGroup owns its own intermediate pools;
                 // borrows _sessionPool for final output only (matches runtime pattern).
                 BeautyV2FilterGroup *v2 =
@@ -544,7 +545,33 @@
                     if ([params[@"intensity"] isKindOfClass:[NSNumber class]]) {
                         v2.intensity = [params[@"intensity"] floatValue];
                     }
+                    // Phase 9B-5: parse faceAwareEnabled and mirror it onto the group.
+                    BOOL faceAwareEnabled = NO;
+                    if ([params[@"faceAwareEnabled"] isKindOfClass:[NSNumber class]]) {
+                        faceAwareEnabled = [params[@"faceAwareEnabled"] boolValue];
+                    }
+                    v2.faceAwareEnabled = faceAwareEnabled;
                     v2.enabled = enabled;
+
+                    // Phase 9B-5 (Phase 4F port): auto-insert VGSegmentationNode before
+                    // BeautyV2FilterGroup when face-aware mode is requested.
+                    // Uses the gated factory helper so VG_ML_SEGMENTATION_ENABLED controls
+                    // whether the heuristic or LiteRT provider is used — gate default is OFF.
+                    if (faceAwareEnabled) {
+                        VGSegmentationNode *segNode =
+                            [VGCameraGraphFactory makeSegmentationNodeWithPool:_sessionPool
+                                                                        device:metalDevice];
+                        if (segNode) {
+                            segNode.enabled = enabled;
+                            [nodes addObject:(id<VGMetalFilterNode>)segNode];
+                            NSLog(@"[VGCameraGraphSession] VGSegmentationNode auto-inserted "
+                                   "before BeautyV2 (faceAwareEnabled=1)");
+                        } else {
+                            NSLog(@"[VGCameraGraphSession] WARNING: VGSegmentationNode "
+                                   "auto-insert failed before BeautyV2");
+                        }
+                    }
+
                     [nodes addObject:(id<VGMetalFilterNode>)v2];
                 }
             } else {

@@ -14,6 +14,8 @@
 #import "VanguardCameraMediaSource.h"
 #import "VanguardMetalRenderer.h"
 #import "VanguardBeautyFilterNode.h"
+#import "BeautyV2FilterGroup.h"
+#import "VGSegmentationNode.h"
 #import "VGLegacyFilterAdapter.h"
 #import <UMF/VGMetalFilterNode.h>
 #import <CoreVideo/CoreVideo.h>
@@ -175,9 +177,11 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
     [session invalidate];
 }
 
-// ─── 2. beautyVersion:2 returns UNSUPPORTED_FILTER_TYPE, no mutation ─────────
+// ─── 2. beautyVersion:2 (without faceAwareEnabled) constructs BeautyV2 node ────────
+//      Phase 9B-5: beautyVersion:2 is no longer deferred; it constructs a single
+//      BeautyV2FilterGroup node (faceAwareEnabled defaults to NO — no segmentation).
 
-- (void)testBeautyV2ParamReturnsUnsupported {
+- (void)testBeautyV2ParamConstructesNode {
     VGCFC2_TestGraphSession *session = [self makeSessionWithPool];
 
     NSDictionary *spec  = @{ @"type": @"beauty",
@@ -187,14 +191,85 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
     NSError *error = nil;
     BOOL success = [session setCameraFilterChainFromSpecs:specs error:&error];
 
-    XCTAssertFalse(success, @"beautyVersion:2 must be rejected");
-    XCTAssertEqualObjects(error.domain, @"UNSUPPORTED_FILTER_TYPE",
-        @"Error domain must be UNSUPPORTED_FILTER_TYPE for beautyVersion:2");
+    XCTAssertTrue(success,  @"beautyVersion:2 must now succeed (Phase 9B-5): %@", error);
+    XCTAssertNil(error,     @"No error expected for beautyVersion:2");
 
-    // Graph must not have been mutated — passthrough = 2 nodes.
+    // Graph: passthrough=2 + 1 BeautyV2FilterGroup adapter = at least 3.
     NSDictionary<NSString *, id> *nodes = [session valueForKey:@"_nodes"];
-    XCTAssertEqual(nodes.count, 2u,
-        @"Graph must not be mutated on validation failure");
+    XCTAssertGreaterThanOrEqual(nodes.count, 3u,
+        @"Graph must contain source + BeautyV2 + sink after V2 spec");
+
+    [session invalidate];
+}
+
+// ─── 2b. beautyVersion:2 faceAwareEnabled=NO → 1 filter node (no segmentation) ───
+
+- (void)testBeautyV2WithoutFaceAwareInsertsSingleNode {
+    VGCFC2_TestGraphSession *session = [self makeSessionWithPool];
+
+    NSDictionary *spec = @{
+        @"type": @"beauty",
+        @"parameters": @{
+            @"beautyVersion":    @2,
+            @"intensity":        @(0.5f),
+            @"faceAwareEnabled": @NO    // explicit false — segmentation must NOT be inserted
+        }
+    };
+
+    NSError *error = nil;
+    BOOL success = [session setCameraFilterChainFromSpecs:@[ spec ] error:&error];
+
+    XCTAssertTrue(success, @"V2 faceAware=NO must succeed: %@", error);
+    XCTAssertNil(error);
+
+    // _currentFilterChain should have exactly 1 filter (BeautyV2, no segmentation node).
+    NSArray *chain = [session valueForKey:@"_currentFilterChain"];
+    XCTAssertEqual(chain.count, 1u,
+        @"V2 faceAware=NO must produce exactly 1 filter node (BeautyV2 only)");
+    XCTAssertTrue([chain.firstObject isKindOfClass:[BeautyV2FilterGroup class]],
+        @"The single node must be BeautyV2FilterGroup");
+
+    [session invalidate];
+}
+
+// ─── 2c. beautyVersion:2 faceAwareEnabled=YES → 2 filter nodes (seg + BeautyV2) ──
+//      Phase 9B-5 smoke-critical: proves VGSegmentationNode is auto-inserted.
+
+- (void)testBeautyV2WithFaceAwareInsertsTwoNodes {
+    VGCFC2_TestGraphSession *session = [self makeSessionWithPool];
+
+    NSDictionary *spec = @{
+        @"type": @"beauty",
+        @"parameters": @{
+            @"beautyVersion":    @2,
+            @"intensity":        @(0.5f),
+            @"faceAwareEnabled": @YES   // triggers VGSegmentationNode auto-insertion
+        }
+    };
+
+    NSError *error = nil;
+    BOOL success = [session setCameraFilterChainFromSpecs:@[ spec ] error:&error];
+
+    XCTAssertTrue(success, @"V2 faceAware=YES must succeed: %@", error);
+    XCTAssertNil(error);
+
+    // _currentFilterChain must have 2 filter nodes: [VGSegmentationNode, BeautyV2FilterGroup].
+    NSArray *chain = [session valueForKey:@"_currentFilterChain"];
+    XCTAssertEqual(chain.count, 2u,
+        @"V2 faceAware=YES must produce 2 filter nodes: [VGSegmentationNode, BeautyV2FilterGroup]");
+
+    if (chain.count >= 2) {
+        XCTAssertTrue([chain[0] isKindOfClass:[VGSegmentationNode class]],
+            @"First node must be VGSegmentationNode");
+        XCTAssertTrue([chain[1] isKindOfClass:[BeautyV2FilterGroup class]],
+            @"Second node must be BeautyV2FilterGroup");
+        // VGSegmentationNode must mirror the spec's enabled state (YES).
+        XCTAssertTrue(((VGSegmentationNode *)chain[0]).enabled,
+            @"VGSegmentationNode must be enabled when faceAwareEnabled=YES");
+        // BeautyV2FilterGroup must have faceAwareEnabled set.
+        XCTAssertTrue(((BeautyV2FilterGroup *)chain[1]).faceAwareEnabled,
+            @"BeautyV2FilterGroup.faceAwareEnabled must be YES");
+    }
 
     [session invalidate];
 }
