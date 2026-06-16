@@ -116,20 +116,36 @@
 // MARK: Landmark point extraction helper
 // ---------------------------------------------------------------------------
 
-/// Extracts normalized CGPoints from a VNFaceLandmarkRegion2D into an NSArray.
+/// Extracts landmark CGPoints from a VNFaceLandmarkRegion2D, converting
+/// from face-bounding-box-relative coordinates to image-normalized coordinates.
+///
+/// Apple Vision `VNFaceLandmarkRegion2D.normalizedPoints` returns points in
+/// [0,1] coordinates relative to the face observation's bounding box, NOT
+/// relative to the full image. This function applies the bbox transform so
+/// that callers receive image-normalized [0,1] coordinates (origin = bottom-left
+/// of the image), consistent with `VNFaceObservation.boundingBox`.
+///
+/// Conversion: imageNorm = faceBB.origin + pt * faceBB.size
+///
 /// Returns nil if the region is nil or has no points.
 static NSArray<NSValue *> * _Nullable
-_VGExtractLandmarkPoints(VNFaceLandmarkRegion2D * _Nullable region) {
+_VGExtractLandmarkPoints(VNFaceLandmarkRegion2D * _Nullable region,
+                         CGRect faceBoundingBox) {
     if (!region || region.pointCount == 0) return nil;
     NSUInteger count = region.pointCount;
-    // `normalizedPoints` returns landmark positions in normalized [0,1] coords.
-    // This is the correct VNFaceLandmarkRegion2D API (pointsInImageCoordOfSize:
-    // does not exist). The mask rasterizer scales to pixel coords internally.
+    // `normalizedPoints` are in bbox-relative [0,1] space (origin = bottom-left
+    // of the face bounding box). Convert each to image-normalized [0,1] by
+    // applying the bbox transform before storing. (Phase 9B-6W)
     const CGPoint *pts = region.normalizedPoints;
     if (!pts) return nil;
     NSMutableArray<NSValue *> *arr = [NSMutableArray arrayWithCapacity:count];
     for (NSUInteger i = 0; i < count; i++) {
-        [arr addObject:[NSValue valueWithCGPoint:pts[i]]];
+        CGPoint bboxPt = pts[i];
+        CGPoint imageNorm = CGPointMake(
+            faceBoundingBox.origin.x + bboxPt.x * faceBoundingBox.size.width,
+            faceBoundingBox.origin.y + bboxPt.y * faceBoundingBox.size.height
+        );
+        [arr addObject:[NSValue valueWithCGPoint:imageNorm]];
     }
     return arr;
 }
@@ -241,13 +257,13 @@ _VGExtractLandmarkPoints(VNFaceLandmarkRegion2D * _Nullable region) {
                           confidence:obs.confidence
                            rollAngle:obs.roll
                             yawAngle:obs.yaw
-                    faceContourPoints:_VGExtractLandmarkPoints(landmarks.faceContour)
-                        leftEyePoints:_VGExtractLandmarkPoints(landmarks.leftEye)
-                       rightEyePoints:_VGExtractLandmarkPoints(landmarks.rightEye)
-                    leftEyebrowPoints:_VGExtractLandmarkPoints(landmarks.leftEyebrow)
-                   rightEyebrowPoints:_VGExtractLandmarkPoints(landmarks.rightEyebrow)
-                      outerLipsPoints:_VGExtractLandmarkPoints(landmarks.outerLips)
-                           nosePoints:_VGExtractLandmarkPoints(landmarks.nose)];
+                    faceContourPoints:_VGExtractLandmarkPoints(landmarks.faceContour, obs.boundingBox)
+                        leftEyePoints:_VGExtractLandmarkPoints(landmarks.leftEye, obs.boundingBox)
+                       rightEyePoints:_VGExtractLandmarkPoints(landmarks.rightEye, obs.boundingBox)
+                    leftEyebrowPoints:_VGExtractLandmarkPoints(landmarks.leftEyebrow, obs.boundingBox)
+                   rightEyebrowPoints:_VGExtractLandmarkPoints(landmarks.rightEyebrow, obs.boundingBox)
+                      outerLipsPoints:_VGExtractLandmarkPoints(landmarks.outerLips, obs.boundingBox)
+                           nosePoints:_VGExtractLandmarkPoints(landmarks.nose, obs.boundingBox)];
             [faces addObject:face];
             faceCount++;
         }

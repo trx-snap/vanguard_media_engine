@@ -34,8 +34,10 @@ NS_ASSUME_NONNULL_BEGIN
 // ---------------------------------------------------------------------------
 // VGDetectedFace — lightweight face observation model
 // ---------------------------------------------------------------------------
-// Normalized coordinates [0,1] in Vision orientation (origin = bottom-left).
-// Step 2 (mask generation) will convert to pixel coordinates.
+// All coordinates are image-normalized [0,1] in Vision orientation (origin = bottom-left).
+// Landmark points are converted from VNFaceLandmarkRegion2D bbox-relative normalizedPoints
+// to full-image-normalized coordinates at extraction time (Phase 9B-6W).
+// Step 2 (mask generation) converts to pixel coordinates via _VGNormToQuarterPixel.
 
 @interface VGDetectedFace : NSObject
 
@@ -54,27 +56,29 @@ NS_ASSUME_NONNULL_BEGIN
 /// 0 = facing camera. May be nil if not available.
 @property (nonatomic, readonly, nullable) NSNumber *yawAngle;
 
-/// Face contour landmark points (normalized [0,1], Vision coords).
+/// Face contour landmark points — image-normalized [0,1] in Vision coords (origin = bottom-left).
+/// Converted from VNFaceLandmarkRegion2D face-bbox-relative normalizedPoints
+/// to image-normalized coordinates at extraction time. See _VGExtractLandmarkPoints.
 /// nil if landmarks were not requested or not available.
 /// Array of NSValue-wrapped CGPoints.
 @property (nonatomic, readonly, nullable) NSArray<NSValue *> *faceContourPoints;
 
-/// Left eye landmark points. nil if not available.
+/// Left eye landmark points — image-normalized [0,1]. nil if not available.
 @property (nonatomic, readonly, nullable) NSArray<NSValue *> *leftEyePoints;
 
-/// Right eye landmark points. nil if not available.
+/// Right eye landmark points — image-normalized [0,1]. nil if not available.
 @property (nonatomic, readonly, nullable) NSArray<NSValue *> *rightEyePoints;
 
-/// Left eyebrow landmark points. nil if not available.
+/// Left eyebrow landmark points — image-normalized [0,1]. nil if not available.
 @property (nonatomic, readonly, nullable) NSArray<NSValue *> *leftEyebrowPoints;
 
-/// Right eyebrow landmark points. nil if not available.
+/// Right eyebrow landmark points — image-normalized [0,1]. nil if not available.
 @property (nonatomic, readonly, nullable) NSArray<NSValue *> *rightEyebrowPoints;
 
-/// Outer lips landmark points. nil if not available.
+/// Outer lips landmark points — image-normalized [0,1]. nil if not available.
 @property (nonatomic, readonly, nullable) NSArray<NSValue *> *outerLipsPoints;
 
-/// Nose landmark points. nil if not available.
+/// Nose landmark points — image-normalized [0,1]. nil if not available.
 @property (nonatomic, readonly, nullable) NSArray<NSValue *> *nosePoints;
 
 - (instancetype)init NS_UNAVAILABLE;
