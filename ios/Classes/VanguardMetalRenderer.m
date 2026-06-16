@@ -21,6 +21,8 @@
 
 // P4-5: VGFrameDelegate — scheduler frame-forwarding protocol
 #import "VGFrameDelegate.h"
+// Phase 9B-Reset POC-A.2: texture-side face tracking diagnostic overlay.
+#import "VGFaceTrackingDiagnosticOverlay.h"
 #include <os/lock.h>
 #include <os/signpost.h>
 #include <stdatomic.h>
@@ -1045,6 +1047,23 @@ static os_log_t _rendererLog;
   // behaviour of _onVideoFrame: line 908 (CVPixelBufferRetain(frame)).
   CVPixelBufferRef incoming =
       CVPixelBufferRetain((CVPixelBufferRef)envelope.payload.videoBuffer);
+
+  // Phase 9B-Reset: face-tracking diagnostic overlay.
+  // Gate 1 (compile-time): #if DEBUG — zero overhead in Release builds.
+  // Gate 2 (runtime): VG_FACE_TRACKING_DIAGNOSTIC=1 env var — see VGFaceTrackingDiagnosticOverlay.h.
+  // This block draws onto `incoming` before the _latestPixelBuffer swap so Flutter displays it.
+  // It is visual-only and does NOT modify BeautyV2 / segmentation / mask generation.
+#if DEBUG
+  if ([VGFaceTrackingDiagnosticOverlay enabled]) {
+    NSDictionary *diagMeta = envelope.metadata
+        ? (__bridge NSDictionary *)envelope.metadata
+        : nil;
+    [[VGFaceTrackingDiagnosticOverlay shared] drawOverlayOn:incoming
+                                                        pts:envelope.pts
+                                                   metadata:diagMeta];
+  }
+#endif
+
 
   // P0-T7: swap _latestPixelBuffer — identical to _onVideoFrame: tail (L904).
   CVPixelBufferRef old = NULL;
