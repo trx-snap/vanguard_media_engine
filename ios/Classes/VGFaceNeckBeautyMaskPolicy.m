@@ -82,9 +82,11 @@ static inline float _confidence(const float *tensor, int y, int x, int c) {
 // instead of a hard staircase boundary.
 //
 // radius: box half-width in pixels (kernel size = 2*radius+1).
-// outFloat: caller-allocated float buffer of size w*h.
+// outFloat: caller-supplied float buffer of size w*h.
+// externalTmp: caller-supplied float buffer of size w*h for the H-pass
+//   intermediate. If NULL the function malloc-s its own tmp (safe fallback).
 static void _boxBlurToFloat(const uint8_t *src, float *outFloat,
-                             size_t w, size_t h, int radius) {
+                             size_t w, size_t h, int radius, float *externalTmp) {
     if (radius <= 0) {
         for (size_t i = 0; i < w * h; i++) {
             outFloat[i] = src[i] / 255.0f;
@@ -92,7 +94,12 @@ static void _boxBlurToFloat(const uint8_t *src, float *outFloat,
         return;
     }
     // Horizontal pass: src (uint8) → tmp (float)
-    float *tmp = (float *)malloc(w * h * sizeof(float));
+    BOOL ownedTmp = NO;
+    float *tmp = externalTmp;
+    if (!tmp) {
+        tmp = (float *)malloc(w * h * sizeof(float));
+        ownedTmp = YES;
+    }
     if (!tmp) {
         for (size_t i = 0; i < w * h; i++) outFloat[i] = src[i] / 255.0f;
         return;
@@ -130,16 +137,19 @@ static void _boxBlurToFloat(const uint8_t *src, float *outFloat,
             acc += tmp[addY    * w + x];
         }
     }
-    free(tmp);
+    if (ownedTmp) free(tmp);
 }
 
 // ─── Morphological helpers (box kernel, square neighbourhood) ───────────────
 
 /// In-place binary erosion of a uint8 mask (value 1 = foreground, 0 = background).
 /// radius = (kernelSize - 1) / 2.
-static void _morphErode(uint8_t *buf, size_t w, size_t h, int radius) {
+/// scratch: caller-supplied buffer of size w*h. If NULL, malloc-s internally.
+static void _morphErode(uint8_t *buf, size_t w, size_t h, int radius, uint8_t *scratch) {
     if (radius <= 0) return;
-    uint8_t *tmp = (uint8_t *)malloc(w * h);
+    BOOL ownedScratch = NO;
+    uint8_t *tmp = scratch;
+    if (!tmp) { tmp = (uint8_t *)malloc(w * h); ownedScratch = YES; }
     if (!tmp) return;
     for (int y = 0; y < (int)h; y++) {
         for (int x = 0; x < (int)w; x++) {
@@ -155,14 +165,18 @@ static void _morphErode(uint8_t *buf, size_t w, size_t h, int radius) {
         }
     }
     memcpy(buf, tmp, w * h);
-    free(tmp);
+    if (ownedScratch) free(tmp);
 }
 
 /// In-place binary dilation of a uint8 mask.
-static void _morphDilate(uint8_t *buf, size_t w, size_t h, int radius) {
+/// scratch: caller-supplied buffer of size w*h. If NULL, calloc-s internally.
+static void _morphDilate(uint8_t *buf, size_t w, size_t h, int radius, uint8_t *scratch) {
     if (radius <= 0) return;
-    uint8_t *tmp = (uint8_t *)calloc(w * h, 1);
+    BOOL ownedScratch = NO;
+    uint8_t *tmp = scratch;
+    if (!tmp) { tmp = (uint8_t *)calloc(w * h, 1); ownedScratch = YES; }
     if (!tmp) return;
+    memset(tmp, 0, w * h);  // Always zero before dilation (handles pre-allocated case).
     for (int y = 0; y < (int)h; y++) {
         for (int x = 0; x < (int)w; x++) {
             if (!buf[y * w + x]) continue;
@@ -177,19 +191,19 @@ static void _morphDilate(uint8_t *buf, size_t w, size_t h, int radius) {
         }
     }
     memcpy(buf, tmp, w * h);
-    free(tmp);
+    if (ownedScratch) free(tmp);
 }
 
 /// Morphological open (erode then dilate) — removes small noise blobs.
-static void _morphOpen(uint8_t *buf, size_t w, size_t h, int radius) {
-    _morphErode(buf, w, h, radius);
-    _morphDilate(buf, w, h, radius);
+static void _morphOpen(uint8_t *buf, size_t w, size_t h, int radius, uint8_t *scratch) {
+    _morphErode(buf, w, h, radius, scratch);
+    _morphDilate(buf, w, h, radius, scratch);
 }
 
 /// Morphological close (dilate then erode) — fills small holes.
-static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
-    _morphDilate(buf, w, h, radius);
-    _morphErode(buf, w, h, radius);
+static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius, uint8_t *scratch) {
+    _morphDilate(buf, w, h, radius, scratch);
+    _morphErode(buf, w, h, radius, scratch);
 }
 
 // ─── Implementation ─────────────────────────────────────────────────────────
@@ -203,6 +217,16 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
     // ── Phase 9B-6A: diagnostic stats frame counter ──────────────────────
     // Throttle to one stats tally every kVGPolicyDiagLogInterval calls.
     NSUInteger _diagStatsFrameCount;
+
+    // ── Phase 9B-6D.1: pre-allocated scratch buffers ─────────────────────
+    // Eliminates per-frame malloc/free churn in morphological and feathering ops.
+    // Each buffer is kModelPixels in size (65 536 elements).
+    // _morphTmpBuf : uint8 scratch shared across all four morph ops (open+close)
+    // _blurTmpBuf  : float scratch for box-blur horizontal-pass intermediate
+    // _blurOutBuf  : float output for box-blur (feathering result before write-back)
+    uint8_t *_morphTmpBuf;
+    float   *_blurTmpBuf;
+    float   *_blurOutBuf;
 }
 
 - (instancetype)init {
@@ -233,11 +257,23 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
     _historyBuffer = (float *)calloc(kModelPixels, sizeof(float));
     _hasHistory    = NO;
 
+    // Phase 9B-6D.1: pre-allocate morph and blur scratch buffers.
+    // These eliminate the 6 malloc/free calls per processTensor call that
+    // caused post=20ms under CPU thermal throttling.
+    _morphTmpBuf = (uint8_t *)malloc(kModelPixels);
+    _blurTmpBuf  = (float *)malloc(kModelPixels * sizeof(float));
+    _blurOutBuf  = (float *)malloc(kModelPixels * sizeof(float));
+    // Allocation failure is safe: the morph/blur functions fall back to
+    // malloc-ing their own buffers when passed NULL scratch.
+
     return self;
 }
 
 - (void)dealloc {
     free(_historyBuffer);
+    free(_morphTmpBuf);
+    free(_blurTmpBuf);
+    free(_blurOutBuf);
 }
 
 - (void)resetTemporalState {
@@ -499,10 +535,11 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
     //
     // Open (erode→dilate): removes isolated noise pixels.
     // Close (dilate→erode): fills small interior holes.
+    // Phase 9B-6D.1: pass _morphTmpBuf to eliminate per-call malloc/free.
     int kernelRadius = (int)(_morphKernelSize - 1) / 2;
     if (kernelRadius > 0) {
-        _morphOpen(roiMask, kModelW, kModelH, kernelRadius);
-        _morphClose(roiMask, kModelW, kModelH, kernelRadius);
+        _morphOpen(roiMask, kModelW, kModelH, kernelRadius, _morphTmpBuf);
+        _morphClose(roiMask, kModelW, kModelH, kernelRadius, _morphTmpBuf);
     }
 
     // ── 8. Temporal EMA ──────────────────────────────────────────────────────
@@ -564,10 +601,14 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
     // enough not to bleed significantly into hair/background.
     //
     // The blurred float values replace the binary modelMask bytes for downscale.
+    // Phase 9B-6D.1: use pre-allocated _blurOutBuf and _blurTmpBuf to avoid
+    // per-frame malloc/free of the 512KB of float buffers this step requires.
     static const int kFeatherRadius = 3;
-    float *featherBuf = (float *)malloc(kModelPixels * sizeof(float));
+    // Use pre-allocated buffers if available; fall back to malloc on alloc failure.
+    float *featherBuf = _blurOutBuf ? _blurOutBuf : (float *)malloc(kModelPixels * sizeof(float));
+    BOOL   featherOwned = (_blurOutBuf == nil);
     if (featherBuf) {
-        _boxBlurToFloat(modelMask, featherBuf, kModelW, kModelH, kFeatherRadius);
+        _boxBlurToFloat(modelMask, featherBuf, kModelW, kModelH, kFeatherRadius, _blurTmpBuf);
         // Inward-only masked feather: only apply soft values where the original
         // binary mask was foreground (non-zero). Background pixels stay exactly 0
         // — no outward bleed into hair, clothes, or background regions.
@@ -584,7 +625,7 @@ static void _morphClose(uint8_t *buf, size_t w, size_t h, int radius) {
             }
             // else: background stays 0 — no outward bleed
         }
-        free(featherBuf);
+        if (featherOwned) free(featherBuf);
     }
     // (If allocation fails, modelMask retains hard binary 0/255 — safe fallback.)
 
