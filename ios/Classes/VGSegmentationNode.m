@@ -30,6 +30,7 @@
 #import "VGMaskProvider.h"
 #import "VGHeuristicMaskProvider.h"
 #import "VGSkinMaskGenerator.h"  // VGSkinMask type
+#import "VGFaceDetectionProvider.h"  // Phase 9B-Reset POC-C: face tracking metadata
 #import <CoreVideo/CoreVideo.h>
 #import <os/log.h>
 
@@ -40,6 +41,8 @@ NSString * const VGSegmentationMetadataKeyFaceMetaGeneration  = @"faceMetaGenera
 NSString * const VGSegmentationMetadataKeyFaceCount           = @"faceCount";
 NSString * const VGSegmentationMetadataKeySkinMask            = @"skinMask";         // legacy bridge
 NSString * const VGSegmentationMetadataKeySkinMaskBuffer      = @"skinMaskBuffer";   // DEC-121: CVPixelBufferRef R8
+// Phase 9B-Reset POC-C: face tracking result (VGFaceDetectionResult *)
+NSString * const VGSegmentationMetadataKeyFaceTrackingResult  = @"faceTrackingResult";
 
 // ---------------------------------------------------------------------------
 // CVPixelBufferReleaseBytesCallback for the mask pixel buffer (DEC-121).
@@ -67,6 +70,15 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
     // VGSkinMaskGenerator + generation/chroma state).
     // In tests: replaced with a stub conforming to VGMaskProvider.
     id<VGMaskProvider> _maskProvider;
+
+    // ── Phase 9B-Reset POC-C: face tracking provider ─────────────────────────
+    // Separate from the mask provider's internal VGFaceDetectionProvider.
+    // Purpose: supply near-current-frame (cadence=1) face tracking metadata
+    // to the envelope so BeautyV2 can measure relative staleness vs. the
+    // stale ML mask. Does not affect mask generation in any way.
+    // Lifecycle: created in init, invalidated in invalidate/dealloc.
+    // Threading: detectInPixelBuffer: is non-blocking; result is read atomically.
+    VGFaceDetectionProvider *_faceTrackingProvider;
 }
 
 @synthesize nodeId     = _nodeId;
@@ -114,6 +126,12 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
     // Phase 9A: delegate all heuristic work to the provider.
     _maskProvider = provider;
 
+    // Phase 9B-Reset POC-C: independent face tracking provider.
+    // cadence=1: detect every frame (self-throttled by _detectionInFlight).
+    // maxFaces=1: single-face optimisation — beauty mask targets primary face.
+    _faceTrackingProvider = [[VGFaceDetectionProvider alloc] initWithCadenceFrames:1];
+    _faceTrackingProvider.maxFaces = 1;
+
     return self;
 }
 
@@ -126,10 +144,12 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
 
 - (void)invalidate {
     [_maskProvider invalidate];
+    [_faceTrackingProvider invalidate];
 }
 
 - (void)dealloc {
     [_maskProvider invalidate];
+    [_faceTrackingProvider invalidate];
 }
 
 // ─── VGMetalFilterNode: processEnvelope:device: ──────────────────────────────
@@ -160,6 +180,12 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
     // The provider handles async face detection, chroma extraction, mask
     // generation, and generation-change temporal resets internally.
     [_maskProvider submitFrame:input pts:envelope.pts generation:envelope.generation];
+
+    // ── 1b. Submit frame to face tracking provider (never blocks) ─────────────
+    // Phase 9B-Reset POC-C: supplies near-current-frame face tracking metadata
+    // for downstream staleness measurement. Independent of mask generation.
+    // Self-throttled by _detectionInFlight — at most one Vision request in-flight.
+    [_faceTrackingProvider detectInPixelBuffer:input pts:envelope.pts];
 
     // ── 2. Read latest mask from the provider ────────────────────────────────
     VGSkinMask *currentMask = _maskProvider.latestMask;
@@ -223,7 +249,8 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
         // (the release callback will NOT fire if Create failed).
         // Fall back to VGSkinMask-only metadata.
         CFRelease((__bridge CFTypeRef)backingData);
-        NSDictionary *fallbackMetadata = @{
+        VGFaceDetectionResult *trackingResultFallback = _faceTrackingProvider.latestResult;
+        NSMutableDictionary *fallbackMeta = [NSMutableDictionary dictionaryWithDictionary:@{
             VGSegmentationMetadataKeyFaceMetaPTS:
                 [NSValue valueWithCMTime:currentMask.sourcePTS],
             VGSegmentationMetadataKeyFaceMetaGeneration:
@@ -231,7 +258,11 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
             VGSegmentationMetadataKeyFaceCount:
                 @(currentMask.faceCount),
             VGSegmentationMetadataKeySkinMask: currentMask,
-        };
+        }];
+        if (trackingResultFallback) {
+            fallbackMeta[VGSegmentationMetadataKeyFaceTrackingResult] = trackingResultFallback;
+        }
+        NSDictionary *fallbackMetadata = [fallbackMeta copy];
         VGFrameEnvelope fallbackOutput = VGFrameEnvelopeCopyWithMetadata(
             envelope, (__bridge void *)fallbackMetadata);
         return fallbackOutput;
@@ -241,19 +272,43 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
     // Transfer ownership to ARC via CFBridgingRelease so it lives through the dict.
     id maskBufferObj = CFBridgingRelease(maskPixelBuffer);
 
-    NSDictionary *metadata = @{
-        VGSegmentationMetadataKeyFaceMetaPTS:
-            [NSValue valueWithCMTime:currentMask.sourcePTS],
-        VGSegmentationMetadataKeyFaceMetaGeneration:
-            @(envelope.generation),
-        VGSegmentationMetadataKeyFaceCount:
-            @(currentMask.faceCount),
-        // DEC-121: Primary carrier — CVPixelBufferRef R8 (kCVPixelFormatType_OneComponent8).
-        // ARC-retained by the dict; backed by backingData kept alive via releaseCallback.
-        VGSegmentationMetadataKeySkinMaskBuffer: maskBufferObj,
-        // Legacy bridge (DEC-110): retained for BeautyV2 fallback during migration.
-        VGSegmentationMetadataKeySkinMask: currentMask,
-    };
+    // Phase 9B-Reset POC-C: attach latest face tracking result if available.
+    // The result is the latest-known VGFaceDetectionResult from the independent
+    // tracking provider. It is NOT guaranteed to be current-frame — it is the
+    // most recently completed async Vision detection (typically ~33ms stale).
+    // Coordinate basis: Vision normalized [0,1], origin = bottom-left.
+    // BeautyV2 must handle absence gracefully (key absent if nil).
+    VGFaceDetectionResult *trackingResult = _faceTrackingProvider.latestResult;
+
+    NSDictionary *metadata;
+    if (trackingResult) {
+        metadata = @{
+            VGSegmentationMetadataKeyFaceMetaPTS:
+                [NSValue valueWithCMTime:currentMask.sourcePTS],
+            VGSegmentationMetadataKeyFaceMetaGeneration:
+                @(envelope.generation),
+            VGSegmentationMetadataKeyFaceCount:
+                @(currentMask.faceCount),
+            // DEC-121: Primary carrier — CVPixelBufferRef R8 (kCVPixelFormatType_OneComponent8).
+            // ARC-retained by the dict; backed by backingData kept alive via releaseCallback.
+            VGSegmentationMetadataKeySkinMaskBuffer: maskBufferObj,
+            // Legacy bridge (DEC-110): retained for BeautyV2 fallback during migration.
+            VGSegmentationMetadataKeySkinMask: currentMask,
+            // POC-C: latest-known Apple Vision tracking result. Key absent if nil.
+            VGSegmentationMetadataKeyFaceTrackingResult: trackingResult,
+        };
+    } else {
+        metadata = @{
+            VGSegmentationMetadataKeyFaceMetaPTS:
+                [NSValue valueWithCMTime:currentMask.sourcePTS],
+            VGSegmentationMetadataKeyFaceMetaGeneration:
+                @(envelope.generation),
+            VGSegmentationMetadataKeyFaceCount:
+                @(currentMask.faceCount),
+            VGSegmentationMetadataKeySkinMaskBuffer: maskBufferObj,
+            VGSegmentationMetadataKeySkinMask: currentMask,
+        };
+    }
 
     // ── 4. Attach metadata to envelope via lifecycle helper (DEC-102) ────────
     // VGFrameEnvelopeCopyWithMetadata takes env by value, CFRetains metadata.

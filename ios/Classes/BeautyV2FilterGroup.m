@@ -27,6 +27,7 @@
 #import "BeautyV2FilterGroup.h"
 #import "VGSegmentationNode.h"
 #import "VGSkinMaskGenerator.h"  // Phase 4F: VGSkinMask type for metadata consumption
+#import "VGFaceDetectionProvider.h"  // Phase 9B-Reset POC-C: tracking staleness diagnostic
 #import "VGMetalLibraryResolver.h"
 #import <os/lock.h>
 #import <os/log.h>
@@ -786,6 +787,46 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
             ageMs, envelopePtsSec, maskPtsSec,
             maskValid ? "YES" : "NO",
             CMTIME_IS_VALID(maskPTS) ? freshLabel : "noPTS");
+
+        // ── Phase 9B-Reset POC-C: face tracking staleness diagnostic ──────────
+        // Compare ML mask staleness vs Apple Vision tracking staleness.
+        // Tracking result is the latest-known VGFaceDetectionResult from
+        // VGSegmentationNode's independent VGFaceDetectionProvider (cadence=1).
+        // Coordinate basis: raw Vision normalized [0,1], origin = bottom-left.
+        // No coordinate conversion is performed here.
+        if (envelope.metadata != NULL) {
+            NSDictionary *trackingMeta = (__bridge NSDictionary *)envelope.metadata;
+            if ([trackingMeta isKindOfClass:[NSDictionary class]]) {
+                VGFaceDetectionResult *trackingResult =
+                    trackingMeta[VGSegmentationMetadataKeyFaceTrackingResult];
+                if (trackingResult) {
+                    double trackingPtsSec = CMTimeGetSeconds(trackingResult.sourcePTS);
+                    double trackingAgeMs  = (envelopePtsSec - trackingPtsSec) * 1000.0;
+                    BOOL trackingFresher  = (trackingAgeMs >= 0.0) &&
+                                           (trackingAgeMs < ageMs || ageMs < 0.0);
+
+                    // Log first face bbox (raw Vision normalized, no conversion).
+                    VGDetectedFace *primaryFace =
+                        (trackingResult.faces.count > 0) ? trackingResult.faces[0] : nil;
+                    CGRect bbox = primaryFace ? primaryFace.boundingBox : CGRectZero;
+                    NSInteger trackingFaceCount = (NSInteger)trackingResult.faces.count;
+
+                    os_log_info(OS_LOG_DEFAULT,
+                        "[BeautyV2 POC-C] trackingAge=%.1fms maskAge=%.1fms "
+                        "trackingFresher=%s faces=%ld "
+                        "bbox=(x=%.3f y=%.3f w=%.3f h=%.3f) [Vision norm, bottom-left origin]",
+                        trackingAgeMs, ageMs,
+                        trackingFresher ? "YES" : "NO",
+                        (long)trackingFaceCount,
+                        bbox.origin.x, bbox.origin.y,
+                        bbox.size.width, bbox.size.height);
+                } else {
+                    os_log_info(OS_LOG_DEFAULT,
+                        "[BeautyV2 POC-C] trackingResult=absent maskAge=%.1fms",
+                        ageMs);
+                }
+            }
+        }
     }
 
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
