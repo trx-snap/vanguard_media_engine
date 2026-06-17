@@ -30,8 +30,6 @@
 #import "VGMaskProvider.h"
 #import "VGHeuristicMaskProvider.h"
 #import "VGSkinMaskGenerator.h"  // VGSkinMask type
-#import "VGFaceDetectionProvider.h"  // Phase 9B-Reset POC-C: face tracking metadata
-#import <CoreMedia/CoreMedia.h>  // CMTimeEqual, CMTimeGetSeconds
 #import <CoreVideo/CoreVideo.h>
 #import <os/log.h>
 
@@ -42,8 +40,6 @@ NSString * const VGSegmentationMetadataKeyFaceMetaGeneration  = @"faceMetaGenera
 NSString * const VGSegmentationMetadataKeyFaceCount           = @"faceCount";
 NSString * const VGSegmentationMetadataKeySkinMask            = @"skinMask";         // legacy bridge
 NSString * const VGSegmentationMetadataKeySkinMaskBuffer      = @"skinMaskBuffer";   // DEC-121: CVPixelBufferRef R8
-// Phase 9B-Reset POC-C: face tracking result (VGFaceDetectionResult *)
-NSString * const VGSegmentationMetadataKeyFaceTrackingResult  = @"faceTrackingResult";
 
 // ---------------------------------------------------------------------------
 // CVPixelBufferReleaseBytesCallback for the mask pixel buffer (DEC-121).
@@ -71,38 +67,6 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
     // VGSkinMaskGenerator + generation/chroma state).
     // In tests: replaced with a stub conforming to VGMaskProvider.
     id<VGMaskProvider> _maskProvider;
-
-    // ── Phase 9B-Reset POC-C: face tracking provider ─────────────────────────
-    // Separate from the mask provider's internal VGFaceDetectionProvider.
-    // Purpose: supply near-current-frame (cadence=1) face tracking metadata
-    // to the envelope so BeautyV2 can measure relative staleness vs. the
-    // stale ML mask. Does not affect mask generation in any way.
-    // Lifecycle: created in init, invalidated in invalidate/dealloc.
-    // Threading: detectInPixelBuffer: is non-blocking; result is read atomically.
-    VGFaceDetectionProvider *_faceTrackingProvider;
-
-    // ── Phase 9B-Reset POC-D: face tracking history ring buffer ──────────────
-    // Fixed-size C struct array — no heap allocation, no ARC churn.
-    // Stores {pts, bbox} tuples from _faceTrackingProvider as they complete.
-    // Used to look up the face position at/near currentMask.sourcePTS for
-    // mask reprojection delta computation (log-only in this slice).
-    //
-    // Coordinate basis: Vision normalized [0,1], origin = bottom-left.
-    // No coordinate conversion is applied in this slice.
-    //
-    // Threading: processEnvelope: is called on the filter chain thread only.
-    // Ring buffer is single-threaded — no lock required.
-    struct VGTrackingHistoryEntry {
-        BOOL   valid;
-        CMTime pts;
-        CGRect bbox;  // Vision normalized [0,1], origin = bottom-left
-    } _trackingHistory[16];
-    NSUInteger _trackingHistoryWriteIdx;    // next write position (mod 16)
-    NSUInteger _trackingHistoryCount;       // entries stored, capped at 16
-    CMTime     _lastStoredTrackingPTS;      // avoids duplicate stores per result
-
-    // Throttle counter for POC-D logs.
-    NSUInteger _pocdLogCount;
 }
 
 @synthesize nodeId     = _nodeId;
@@ -150,19 +114,6 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
     // Phase 9A: delegate all heuristic work to the provider.
     _maskProvider = provider;
 
-    // Phase 9B-Reset POC-C: independent face tracking provider.
-    // cadence=1: detect every frame (self-throttled by _detectionInFlight).
-    // maxFaces=1: single-face optimisation — beauty mask targets primary face.
-    _faceTrackingProvider = [[VGFaceDetectionProvider alloc] initWithCadenceFrames:1];
-    _faceTrackingProvider.maxFaces = 1;
-
-    // Phase 9B-Reset POC-D: zero-initialise ring buffer.
-    memset(_trackingHistory, 0, sizeof(_trackingHistory));
-    _trackingHistoryWriteIdx = 0;
-    _trackingHistoryCount    = 0;
-    _lastStoredTrackingPTS   = kCMTimeInvalid;
-    _pocdLogCount            = 0;
-
     return self;
 }
 
@@ -175,12 +126,10 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
 
 - (void)invalidate {
     [_maskProvider invalidate];
-    [_faceTrackingProvider invalidate];
 }
 
 - (void)dealloc {
     [_maskProvider invalidate];
-    [_faceTrackingProvider invalidate];
 }
 
 // ─── VGMetalFilterNode: processEnvelope:device: ──────────────────────────────
@@ -211,37 +160,6 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
     // The provider handles async face detection, chroma extraction, mask
     // generation, and generation-change temporal resets internally.
     [_maskProvider submitFrame:input pts:envelope.pts generation:envelope.generation];
-
-    // ── 1b. Submit frame to face tracking provider (never blocks) ─────────────
-    // Phase 9B-Reset POC-C: supplies near-current-frame face tracking metadata
-    // for downstream staleness measurement. Independent of mask generation.
-    // Self-throttled by _detectionInFlight — at most one Vision request in-flight.
-    [_faceTrackingProvider detectInPixelBuffer:input pts:envelope.pts];
-
-    // ── 1c. Store face tracking result in history ring buffer (POC-D) ─────────
-    // Phase 9B-Reset POC-D: record the latest tracking result if its PTS is new.
-    // We compare sourcePTS to _lastStoredTrackingPTS to avoid re-storing the
-    // same result on every frame between Vision completions (async cadence).
-    // Only results with at least one face are stored (bbox is meaningless otherwise).
-    {
-        VGFaceDetectionResult *latestForHistory = _faceTrackingProvider.latestResult;
-        if (latestForHistory &&
-            latestForHistory.faces.count > 0 &&
-            // Manual CMTime equality check: avoids CMTimeEqual undeclared-function
-            // diagnostic under this translation unit's C dialect settings.
-            !(latestForHistory.sourcePTS.value     == _lastStoredTrackingPTS.value &&
-              latestForHistory.sourcePTS.timescale == _lastStoredTrackingPTS.timescale)) {
-
-            VGDetectedFace *primaryFace = latestForHistory.faces[0];
-            NSUInteger idx = _trackingHistoryWriteIdx % 16;
-            _trackingHistory[idx].valid = YES;
-            _trackingHistory[idx].pts   = latestForHistory.sourcePTS;
-            _trackingHistory[idx].bbox  = primaryFace.boundingBox;
-            _trackingHistoryWriteIdx++;
-            if (_trackingHistoryCount < 16) _trackingHistoryCount++;
-            _lastStoredTrackingPTS = latestForHistory.sourcePTS;
-        }
-    }
 
     // ── 2. Read latest mask from the provider ────────────────────────────────
     VGSkinMask *currentMask = _maskProvider.latestMask;
@@ -305,8 +223,7 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
         // (the release callback will NOT fire if Create failed).
         // Fall back to VGSkinMask-only metadata.
         CFRelease((__bridge CFTypeRef)backingData);
-        VGFaceDetectionResult *trackingResultFallback = _faceTrackingProvider.latestResult;
-        NSMutableDictionary *fallbackMeta = [NSMutableDictionary dictionaryWithDictionary:@{
+        NSDictionary *fallbackMetadata = @{
             VGSegmentationMetadataKeyFaceMetaPTS:
                 [NSValue valueWithCMTime:currentMask.sourcePTS],
             VGSegmentationMetadataKeyFaceMetaGeneration:
@@ -314,11 +231,7 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
             VGSegmentationMetadataKeyFaceCount:
                 @(currentMask.faceCount),
             VGSegmentationMetadataKeySkinMask: currentMask,
-        }];
-        if (trackingResultFallback) {
-            fallbackMeta[VGSegmentationMetadataKeyFaceTrackingResult] = trackingResultFallback;
-        }
-        NSDictionary *fallbackMetadata = [fallbackMeta copy];
+        };
         VGFrameEnvelope fallbackOutput = VGFrameEnvelopeCopyWithMetadata(
             envelope, (__bridge void *)fallbackMetadata);
         return fallbackOutput;
@@ -328,160 +241,19 @@ static void _VGMaskBufferReleaseCallback(void *releaseRefCon,
     // Transfer ownership to ARC via CFBridgingRelease so it lives through the dict.
     id maskBufferObj = CFBridgingRelease(maskPixelBuffer);
 
-    // ── Phase 9B-Reset POC-D: log mask reprojection delta (log-only) ──────────
-    // Nearest-neighbor lookup: find the ring buffer entry whose PTS is closest
-    // to currentMask.sourcePTS within ±50ms. Compute dx/dy in Vision space and
-    // proposed UV offsets. NO rendering change — purely diagnostic.
-    //
-    // Coordinate basis reminder:
-    //   Vision bbox: [0,1] bottom-left origin
-    //   Proposed UV offset is UNVERIFIED — do not use for rendering.
-    //
-    // Log throttle: first 3 hits, then every 30 frames.
-    {
-        static const NSUInteger kPocdLogFirst    = 3;
-        static const NSUInteger kPocdLogInterval = 30;
-
-        VGFaceDetectionResult *currentTracking = _faceTrackingProvider.latestResult;
-
-        // Only attempt lookup if we have a current tracking result with a face.
-        if (currentTracking && currentTracking.faces.count > 0 && _trackingHistoryCount > 0) {
-
-            CMTime maskSrcPTS = currentMask.sourcePTS;
-            double maskSrcSec = CMTimeGetSeconds(maskSrcPTS);
-
-            // ── Nearest-neighbor PTS lookup (±50ms tolerance) ────────────────
-            NSUInteger bestIdx    = NSUIntegerMax;
-            double     bestDeltaS = 0.100; // > 50ms sentinel — no match unless beaten
-
-            for (NSUInteger i = 0; i < _trackingHistoryCount && i < 16; i++) {
-                if (!_trackingHistory[i].valid) continue;
-                double entryPtsSec = CMTimeGetSeconds(_trackingHistory[i].pts);
-                double deltaS      = fabs(entryPtsSec - maskSrcSec);
-                if (deltaS < bestDeltaS) {
-                    bestDeltaS = deltaS;
-                    bestIdx    = i;
-                }
-            }
-
-            BOOL cacheHit = (bestIdx != NSUIntegerMax && bestDeltaS <= 0.050);
-
-            // Throttle logic: always log first kPocdLogFirst hits, then every interval.
-            _pocdLogCount++;
-            BOOL shouldLog = (_pocdLogCount <= kPocdLogFirst) ||
-                             (_pocdLogCount % kPocdLogInterval == 1);
-
-            if (shouldLog) {
-                VGDetectedFace *currentFace = currentTracking.faces[0];
-                CGRect currentBbox = currentFace.boundingBox;
-
-                double currentTrackingSec = CMTimeGetSeconds(currentTracking.sourcePTS);
-                double envelopeSec        = CMTimeGetSeconds(envelope.pts);
-
-                if (cacheHit) {
-                    CGRect  historicalBbox    = _trackingHistory[bestIdx].bbox;
-                    double  historicalPtsSec  = CMTimeGetSeconds(_trackingHistory[bestIdx].pts);
-                    double  matchDeltaMs      = bestDeltaS * 1000.0;
-
-                    double currentMidX = currentBbox.origin.x  + currentBbox.size.width  * 0.5;
-                    double currentMidY = currentBbox.origin.y  + currentBbox.size.height * 0.5;
-                    double histMidX    = historicalBbox.origin.x + historicalBbox.size.width  * 0.5;
-                    double histMidY    = historicalBbox.origin.y + historicalBbox.size.height * 0.5;
-
-                    double dx = currentMidX - histMidX;  // Vision normalized
-                    double dy = currentMidY - histMidY;  // Vision normalized
-
-                    // Proposed UV offsets — UNVERIFIED; for logging only.
-                    // u_offset = -dx: mask shifts right with face moving right.
-                    // v_offset = +dy: compensates Y-flip from _VGNormToQuarterPixel.
-                    double proposed_u_offset = -dx;
-                    double proposed_v_offset = +dy;
-
-                    os_log_info(OS_LOG_DEFAULT,
-                        "[VGSegmentationNode POC-D] frame=%lu "
-                        "envelopePts=%.3fs maskSrcPts=%.3fs "
-                        "currentTrackPts=%.3fs matchedHistPts=%.3fs matchDeltaMs=%.1f "
-                        "currentBbox=(x=%.3f y=%.3f w=%.3f h=%.3f) "
-                        "histBbox=(x=%.3f y=%.3f w=%.3f h=%.3f) "
-                        "dx=%.4f dy=%.4f "
-                        "proposed_u=%.4f proposed_v=%.4f [uvOffsets=UNVERIFIED] "
-                        "cacheHit=YES bufCount=%lu",
-                        (unsigned long)_pocdLogCount,
-                        envelopeSec, maskSrcSec,
-                        currentTrackingSec, historicalPtsSec, matchDeltaMs,
-                        currentBbox.origin.x,  currentBbox.origin.y,
-                        currentBbox.size.width, currentBbox.size.height,
-                        historicalBbox.origin.x,  historicalBbox.origin.y,
-                        historicalBbox.size.width, historicalBbox.size.height,
-                        dx, dy,
-                        proposed_u_offset, proposed_v_offset,
-                        (unsigned long)_trackingHistoryCount);
-                } else {
-                    // Cache miss: no historical entry within ±50ms of mask source PTS.
-                    os_log_info(OS_LOG_DEFAULT,
-                        "[VGSegmentationNode POC-D] frame=%lu "
-                        "envelopePts=%.3fs maskSrcPts=%.3fs "
-                        "currentTrackPts=%.3fs "
-                        "currentBbox=(x=%.3f y=%.3f w=%.3f h=%.3f) "
-                        "cacheHit=NO bestDeltaMs=%.1f bufCount=%lu",
-                        (unsigned long)_pocdLogCount,
-                        envelopeSec, maskSrcSec,
-                        currentTrackingSec,
-                        currentBbox.origin.x,  currentBbox.origin.y,
-                        currentBbox.size.width, currentBbox.size.height,
-                        bestDeltaS * 1000.0,
-                        (unsigned long)_trackingHistoryCount);
-                }
-            }
-
-        } else if (_trackingHistoryCount == 0) {
-            // Cold start: ring buffer not yet populated.
-            _pocdLogCount++;
-            if (_pocdLogCount <= kPocdLogFirst) {
-                os_log_info(OS_LOG_DEFAULT,
-                    "[VGSegmentationNode POC-D] frame=%lu warmup — history empty",
-                    (unsigned long)_pocdLogCount);
-            }
-        }
-    }
-
-    // Phase 9B-Reset POC-C: attach latest face tracking result if available.
-    // The result is the latest-known VGFaceDetectionResult from the independent
-    // tracking provider. It is NOT guaranteed to be current-frame — it is the
-    // most recently completed async Vision detection (typically ~33ms stale).
-    // Coordinate basis: Vision normalized [0,1], origin = bottom-left.
-    // BeautyV2 must handle absence gracefully (key absent if nil).
-    VGFaceDetectionResult *trackingResult = _faceTrackingProvider.latestResult;
-
-    NSDictionary *metadata;
-    if (trackingResult) {
-        metadata = @{
-            VGSegmentationMetadataKeyFaceMetaPTS:
-                [NSValue valueWithCMTime:currentMask.sourcePTS],
-            VGSegmentationMetadataKeyFaceMetaGeneration:
-                @(envelope.generation),
-            VGSegmentationMetadataKeyFaceCount:
-                @(currentMask.faceCount),
-            // DEC-121: Primary carrier — CVPixelBufferRef R8 (kCVPixelFormatType_OneComponent8).
-            // ARC-retained by the dict; backed by backingData kept alive via releaseCallback.
-            VGSegmentationMetadataKeySkinMaskBuffer: maskBufferObj,
-            // Legacy bridge (DEC-110): retained for BeautyV2 fallback during migration.
-            VGSegmentationMetadataKeySkinMask: currentMask,
-            // POC-C: latest-known Apple Vision tracking result. Key absent if nil.
-            VGSegmentationMetadataKeyFaceTrackingResult: trackingResult,
-        };
-    } else {
-        metadata = @{
-            VGSegmentationMetadataKeyFaceMetaPTS:
-                [NSValue valueWithCMTime:currentMask.sourcePTS],
-            VGSegmentationMetadataKeyFaceMetaGeneration:
-                @(envelope.generation),
-            VGSegmentationMetadataKeyFaceCount:
-                @(currentMask.faceCount),
-            VGSegmentationMetadataKeySkinMaskBuffer: maskBufferObj,
-            VGSegmentationMetadataKeySkinMask: currentMask,
-        };
-    }
+    NSDictionary *metadata = @{
+        VGSegmentationMetadataKeyFaceMetaPTS:
+            [NSValue valueWithCMTime:currentMask.sourcePTS],
+        VGSegmentationMetadataKeyFaceMetaGeneration:
+            @(envelope.generation),
+        VGSegmentationMetadataKeyFaceCount:
+            @(currentMask.faceCount),
+        // DEC-121: Primary carrier — CVPixelBufferRef R8 (kCVPixelFormatType_OneComponent8).
+        // ARC-retained by the dict; backed by backingData kept alive via releaseCallback.
+        VGSegmentationMetadataKeySkinMaskBuffer: maskBufferObj,
+        // Legacy bridge (DEC-110): retained for BeautyV2 fallback during migration.
+        VGSegmentationMetadataKeySkinMask: currentMask,
+    };
 
     // ── 4. Attach metadata to envelope via lifecycle helper (DEC-102) ────────
     // VGFrameEnvelopeCopyWithMetadata takes env by value, CFRetains metadata.

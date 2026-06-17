@@ -95,22 +95,6 @@ extern NSString * const VGSegmentationMetadataKeySkinMask;
 /// Consumers must lock with kCVPixelBufferLock_ReadOnly before reading pixel data.
 extern NSString * const VGSegmentationMetadataKeySkinMaskBuffer;
 
-// ─── Phase 9B-Reset POC-C: face tracking metadata keys ───────────────────────
-// Diagnostic-only metadata path. Carries Apple Vision face tracking results
-// alongside the ML mask so downstream nodes (BeautyV2) can measure relative
-// staleness of tracking vs mask.
-//
-// These keys are ADDITIVE — they do not replace or modify any existing keys.
-// Consumers must handle absence gracefully (nil → key not present).
-//
-// Coordinate basis: Vision normalized [0,1], origin = bottom-left of frame.
-// No Y-flip, no mirror compensation, no render-space conversion.
-
-/// VGFaceDetectionResult * — latest Apple Vision face tracking result from
-/// VGSegmentationNode's private VGFaceDetectionProvider (cadence=1).
-/// nil if no tracking result is available yet (first few frames) or no face found.
-extern NSString * const VGSegmentationMetadataKeyFaceTrackingResult;
-
 // ─── VGSegmentationNode ──────────────────────────────────────────────────────
 
 @interface VGSegmentationNode : NSObject <VanguardFilterNode, VGMetalFilterNode>
