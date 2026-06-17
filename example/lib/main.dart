@@ -88,7 +88,7 @@ final List<_PresetEntry> _kPresets = [
     descriptor: VGPresetDescriptor(
       id: 'soft',
       name: 'Soft',
-      filterStack: [VGFilterSpecs.beauty(intensity: 0.5)],
+      filterStack: [VGFilterSpecs.beauty(intensity: 0.5, beautyVersion: 2)],
     ),
   ),
 ];
