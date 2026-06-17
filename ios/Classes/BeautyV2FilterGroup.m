@@ -1,17 +1,17 @@
 // BeautyV2FilterGroup.m
-// Phase 4B — Beauty V2: VGFilterGroupNode (Step 3: full 4-pass execution).
+// Phase 4B — Beauty V2: VGFilterGroupNode (Step 3: full 3-pass execution).
+// Phase 9B+ OP-1: highpass fused into composite — eliminates Pass 3 and _beautyPoolC.
 //
 // Step 3 adds to Step 1 skeleton:
-//   - _compilePSOs        — creates 4 MTLComputePipelineState objects at init
-//   - processEnvelope:    — 4-encoder single command buffer + waitUntilCompleted
+//   - _compilePSOs        — creates 3 MTLComputePipelineState objects at init
+//   - processEnvelope:    — 3-encoder single command buffer + waitUntilCompleted
 //   - processBuffer:      — thin wrapper calling processEnvelope:
 //
-// GPU execution contract (DEC-57 / DEC-58):
-//   Single MTLCommandBuffer, 4 sequential compute encoders:
+// GPU execution contract (DEC-57 / DEC-58 / Phase 9B+ OP-1):
+//   Single MTLCommandBuffer, 3 sequential compute encoders:
 //     [1] blur_h    original         → intermediateA  (_beautyPoolA)
 //     [2] blur_v    intermediateA    → intermediateB  (_beautyPoolB)
-//     [3] highpass  original+B       → intermediateC  (_beautyPoolC)
-//     [4] composite original+B+C     → outputBuffer   (_pool)
+//     [3] composite original+B       → outputBuffer   (_pool)  [highpass fused inline]
 //   [cmd commit]; [cmd waitUntilCompleted];
 //   Intermediates released AFTER waitUntilCompleted — never before (RR-38/39).
 //
@@ -21,8 +21,8 @@
 //   radius = clamp(radius, 1, 8)  — bounds loop trip-count for video budget
 //
 // CF ownership discipline (mandatory — RR-43/DEC-58):
-//   _beautyPoolA/B/C  — node-local. CFRelease on replace/nil.
-//   _pool             — borrowed (no CFRetain). Caller (runtime) owns lifetime.
+//   _beautyPoolA/B  — node-local. CFRelease on replace/nil.
+//   _pool           — borrowed (no CFRetain). Caller (runtime) owns lifetime.
 
 #import "BeautyV2FilterGroup.h"
 #import "VGSegmentationNode.h"
@@ -76,16 +76,14 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     // ── Pipeline states — one per Beauty V2 pass ──────────────────────────────
     id<MTLComputePipelineState> _psoBlurH;      // Pass 1: vanguard_beauty_blur_h
     id<MTLComputePipelineState> _psoBlurV;      // Pass 2: vanguard_beauty_blur_v
-    id<MTLComputePipelineState> _psoHighpass;   // Pass 3: vanguard_beauty_highpass
-    id<MTLComputePipelineState> _psoComposite;  // Pass 4: vanguard_beauty_composite
+    id<MTLComputePipelineState> _psoComposite;  // Pass 3: vanguard_beauty_composite (highpass fused, OP-1)
 
     // ── Node-local intermediate pools (node-owned — CFRelease on teardown) ────
     // _beautyPoolA: blur_h output  (Pass 1 → Pass 2 input)
-    // _beautyPoolB: blur_v output  (meanColor; Pass 2 → Pass 3+4 input)
-    // _beautyPoolC: highpass output (Pass 3 → Pass 4 input)
+    // _beautyPoolB: blur_v output  (meanColor; Pass 2 → Pass 3 input)
+    // _beautyPoolC removed (Phase 9B+ OP-1): highpass now fused into composite.
     CVPixelBufferPoolRef _beautyPoolA;
     CVPixelBufferPoolRef _beautyPoolB;
-    CVPixelBufferPoolRef _beautyPoolC;
 
     // ── Prepare state ─────────────────────────────────────────────────────────
     size_t _preparedWidth;
@@ -203,7 +201,7 @@ _VGBeautyCreatePool(size_t width, size_t height) {
 // ---------------------------------------------------------------------------
 
 - (NSInteger)passCount {
-    return 4;
+    return 3;  // Phase 9B+ OP-1: was 4 (highpass fused into composite)
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +295,7 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     // Node-local pools start as NULL — created in prepareWithWidth:height:device:error:
     _beautyPoolA = NULL;
     _beautyPoolB = NULL;
-    _beautyPoolC = NULL;
+    // _beautyPoolC removed (Phase 9B+ OP-1)
 
 #ifndef NDEBUG
     // Phase 9B+: zero-init timing buffer and frame counter.
@@ -318,7 +316,7 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     // Release node-local pools explicitly (CFRelease — not ARC).
     if (_beautyPoolA) { CFRelease(_beautyPoolA); _beautyPoolA = NULL; }
     if (_beautyPoolB) { CFRelease(_beautyPoolB); _beautyPoolB = NULL; }
-    if (_beautyPoolC) { CFRelease(_beautyPoolC); _beautyPoolC = NULL; }
+    // _beautyPoolC removed (Phase 9B+ OP-1).
     // _pool is borrowed — do NOT release.
     _queue  = nil;
     _device = nil;
@@ -346,7 +344,7 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     // Dimensions changed or first call — tear down old pools before rebuilding.
     if (_beautyPoolA) { CFRelease(_beautyPoolA); _beautyPoolA = NULL; }
     if (_beautyPoolB) { CFRelease(_beautyPoolB); _beautyPoolB = NULL; }
-    if (_beautyPoolC) { CFRelease(_beautyPoolC); _beautyPoolC = NULL; }
+    // _beautyPoolC removed (Phase 9B+ OP-1).
     _poolsReady = NO;
 
     // Update device ref if changed (rare — usually same device across sessions).
@@ -381,26 +379,12 @@ _VGBeautyCreatePool(size_t width, size_t height) {
         return NO;
     }
 
-    // Create Pool C (highpass output).
-    CVPixelBufferPoolRef poolC = _VGBeautyCreatePool(width, height);
-    if (!poolC) {
-        CFRelease(poolA);
-        CFRelease(poolB);
-        os_unfair_lock_unlock(&_prepareLock);
-        if (error) {
-            *error = [NSError errorWithDomain:@"BeautyV2FilterGroup"
-                                         code:3
-                                     userInfo:@{
-                NSLocalizedDescriptionKey: @"[BeautyV2] Failed to create _beautyPoolC"
-            }];
-        }
-        return NO;
-    }
+    // Phase 9B+ OP-1: Pool C (_beautyPoolC) removed — highpass fused into composite.
+    // Two pools are now sufficient.
 
-    // All three pools created — assign (node owns +1 from each Create call).
+    // Both pools created — assign (node owns +1 from each Create call).
     _beautyPoolA    = poolA;
     _beautyPoolB    = poolB;
-    _beautyPoolC    = poolC;
     _preparedWidth  = width;
     _preparedHeight = height;
     _poolsReady     = YES;
@@ -421,7 +405,7 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     os_unfair_lock_lock(&_prepareLock);
     if (_beautyPoolA) { CFRelease(_beautyPoolA); _beautyPoolA = NULL; }
     if (_beautyPoolB) { CFRelease(_beautyPoolB); _beautyPoolB = NULL; }
-    if (_beautyPoolC) { CFRelease(_beautyPoolC); _beautyPoolC = NULL; }
+    // _beautyPoolC removed (Phase 9B+ OP-1).
     _poolsReady = NO;
     os_unfair_lock_unlock(&_prepareLock);
 
@@ -469,10 +453,10 @@ _VGBeautyCreatePool(size_t width, size_t height) {
         return;
     }
     NSDictionary *kernels = @{
-        @"vanguard_beauty_blur_h":   @"_psoBlurH",
-        @"vanguard_beauty_blur_v":   @"_psoBlurV",
-        @"vanguard_beauty_highpass": @"_psoHighpass",
-        @"vanguard_beauty_composite":@"_psoComposite",
+        @"vanguard_beauty_blur_h":    @"_psoBlurH",
+        @"vanguard_beauty_blur_v":    @"_psoBlurV",
+        // vanguard_beauty_highpass removed (Phase 9B+ OP-1): fused into composite.
+        @"vanguard_beauty_composite": @"_psoComposite",
     };
     for (NSString *name in kernels) {
         id<MTLFunction> fn = [lib newFunctionWithName:name];
@@ -544,7 +528,7 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
     if (!_enabled) return envelope;
 
     // ── Gate 2: PSOs not compiled → passthrough ───────────────────────────────
-    if (!_psoBlurH || !_psoBlurV || !_psoHighpass || !_psoComposite) return envelope;
+    if (!_psoBlurH || !_psoBlurV || !_psoComposite) return envelope;  // _psoHighpass removed (OP-1)
 
     // ── Gate 3: nil input → passthrough ───────────────────────────────────────
     CVPixelBufferRef input = (CVPixelBufferRef)envelope.payload.videoBuffer;
@@ -904,25 +888,23 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
     }
 
     // ── Snapshot pools under lock (RR-85 v2: CFRetain prevents use-after-free) ─
-    // invalidate can CFRelease _beautyPoolA/B/C on another thread at any time.
+    // invalidate can CFRelease _beautyPoolA/B on another thread at any time.
     // Snapshot + retain under _prepareLock so the pools survive for the duration
     // of GPU work. The lock is NOT held during encoding or waitUntilCompleted.
+    // Phase 9B+ OP-1: poolC/_beautyPoolC removed — highpass fused into composite.
     CVPixelBufferPoolRef poolA = NULL;
     CVPixelBufferPoolRef poolB = NULL;
-    CVPixelBufferPoolRef poolC = NULL;
 
     os_unfair_lock_lock(&_prepareLock);
-    if (_beautyPoolA && _beautyPoolB && _beautyPoolC) {
+    if (_beautyPoolA && _beautyPoolB) {
         poolA = (CVPixelBufferPoolRef)CFRetain(_beautyPoolA);
         poolB = (CVPixelBufferPoolRef)CFRetain(_beautyPoolB);
-        poolC = (CVPixelBufferPoolRef)CFRetain(_beautyPoolC);
     }
     os_unfair_lock_unlock(&_prepareLock);
 
-    if (!poolA || !poolB || !poolC) {
+    if (!poolA || !poolB) {
         if (poolA) CFRelease(poolA);
         if (poolB) CFRelease(poolB);
-        if (poolC) CFRelease(poolC);
         os_log_error(OS_LOG_DEFAULT, "[BeautyV2] pools unavailable during processing — passthrough");
         return envelope;
     }
@@ -930,46 +912,41 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
     // ── Acquire intermediate buffers from retained local pools ────────────────
     // RR-38: every early-return below releases all buffers acquired so far.
     // RR-39: NO buffer released before waitUntilCompleted returns.
-    CVPixelBufferRef bufA = NULL, bufB = NULL, bufC = NULL, output = NULL;
+    // Phase 9B+ OP-1: bufC/texC removed — no intermediateC pool needed.
+    CVPixelBufferRef bufA = NULL, bufB = NULL, output = NULL;
 
     if (CVPixelBufferPoolCreatePixelBuffer(nil, poolA, &bufA) != kCVReturnSuccess) {
-        CFRelease(poolA); CFRelease(poolB); CFRelease(poolC);
+        CFRelease(poolA); CFRelease(poolB);
         os_log_error(OS_LOG_DEFAULT, "[BeautyV2] pool A exhausted");
         VGFrameEnvelope f = envelope; f.payload.videoBuffer = NULL; return f;
     }
     if (CVPixelBufferPoolCreatePixelBuffer(nil, poolB, &bufB) != kCVReturnSuccess) {
         CVPixelBufferRelease(bufA);
-        CFRelease(poolA); CFRelease(poolB); CFRelease(poolC);
+        CFRelease(poolA); CFRelease(poolB);
         os_log_error(OS_LOG_DEFAULT, "[BeautyV2] pool B exhausted");
         VGFrameEnvelope f = envelope; f.payload.videoBuffer = NULL; return f;
     }
-    if (CVPixelBufferPoolCreatePixelBuffer(nil, poolC, &bufC) != kCVReturnSuccess) {
-        CVPixelBufferRelease(bufA); CVPixelBufferRelease(bufB);
-        CFRelease(poolA); CFRelease(poolB); CFRelease(poolC);
-        os_log_error(OS_LOG_DEFAULT, "[BeautyV2] pool C exhausted");
-        VGFrameEnvelope f = envelope; f.payload.videoBuffer = NULL; return f;
-    }
     if (CVPixelBufferPoolCreatePixelBuffer(nil, _pool, &output) != kCVReturnSuccess) {
-        CVPixelBufferRelease(bufA); CVPixelBufferRelease(bufB); CVPixelBufferRelease(bufC);
-        CFRelease(poolA); CFRelease(poolB); CFRelease(poolC);
+        CVPixelBufferRelease(bufA); CVPixelBufferRelease(bufB);
+        CFRelease(poolA); CFRelease(poolB);
         os_log_error(OS_LOG_DEFAULT, "[BeautyV2] output pool exhausted");
         VGFrameEnvelope f = envelope; f.payload.videoBuffer = NULL; return f;
     }
 
     // Pool snapshots no longer needed — buffers are independently retained.
-    CFRelease(poolA); CFRelease(poolB); CFRelease(poolC);
+    CFRelease(poolA); CFRelease(poolB);
 
     // ── Make Metal textures ───────────────────────────────────────────────────
+    // Phase 9B+ OP-1: texC removed — no intermediateC pool needed.
     const MTLTextureUsage kRW = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
     id<MTLTexture> texIn  = _VGMakeTexture(device, input,  MTLTextureUsageShaderRead, w, h);
     id<MTLTexture> texA   = _VGMakeTexture(device, bufA,   kRW,                       w, h);
     id<MTLTexture> texB   = _VGMakeTexture(device, bufB,   kRW,                       w, h);
-    id<MTLTexture> texC   = _VGMakeTexture(device, bufC,   kRW,                       w, h);
     id<MTLTexture> texOut = _VGMakeTexture(device, output, MTLTextureUsageShaderWrite, w, h);
 
-    if (!texIn || !texA || !texB || !texC || !texOut) {
+    if (!texIn || !texA || !texB || !texOut) {
         CVPixelBufferRelease(bufA); CVPixelBufferRelease(bufB);
-        CVPixelBufferRelease(bufC); CVPixelBufferRelease(output);
+        CVPixelBufferRelease(output);
         // Return original envelope as passthrough so the preview continues.
         // The stride-mismatch case (camera switch) is already logged by
         // _VGMakeTexture with [BeautyV2-3F-R1]; no additional log here.
@@ -1009,33 +986,24 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
         [enc endEncoding];
     }
-    // Pass 3: highpass — original + meanColor → intermediateC
-    {
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-        [enc setComputePipelineState:_psoHighpass];
-        [enc setTexture:texIn  atIndex:0];
-        [enc setTexture:texB  atIndex:1];
-        [enc setTexture:texC  atIndex:2];
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-        [enc endEncoding];
-    }
-    // Pass 4: composite — original + meanColor + highPassMap + mask → outputBuffer
+    // Phase 9B+ OP-1: Pass 3 (highpass) removed — highpass is now fused inline in composite.
+    // Pass 3: composite — original + meanColor + optional mask → outputBuffer
+    //   (fused highpass computed as Option A: clamp(orig - mean + 0.5, 0, 1) - 0.5)
     {
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
         [enc setComputePipelineState:_psoComposite];
-        [enc setTexture:texIn  atIndex:0];
-        [enc setTexture:texB   atIndex:1];
-        [enc setTexture:texC   atIndex:2];
-        [enc setTexture:texOut atIndex:3];
-        // Phase 4C (DEC-63): bind mask texture at index 4.
+        [enc setTexture:texIn  atIndex:0];  // original
+        [enc setTexture:texB   atIndex:1];  // meanColor (blur_v output)
+        [enc setTexture:texOut atIndex:2];  // output — Phase 9B+ OP-1: was index 3
+        // Phase 4C (DEC-63): bind mask texture at index 3 (Phase 9B+ OP-1: was index 4).
         // If no mask is available (hasMask=0), we still bind a valid texture
         // to satisfy the Metal argument table. The kernel branches on hasMask
         // and never reads maskTex when hasMask=0.
         if (maskTex) {
-            [enc setTexture:maskTex atIndex:4];
+            [enc setTexture:maskTex atIndex:3];
         } else {
-            // Bind original as dummy — hasMask=0 means kernel ignores texture(4).
-            [enc setTexture:texIn atIndex:4];
+            // Bind original as dummy — hasMask=0 means kernel ignores texture(3).
+            [enc setTexture:texIn atIndex:3];
         }
         [enc setBuffer:compBuf offset:0 atIndex:0];
         [enc dispatchThreads:grid threadsPerThreadgroup:tg];
@@ -1093,15 +1061,15 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
                      cmd.error.localizedDescription);
         CVPixelBufferRelease(bufA);
         CVPixelBufferRelease(bufB);
-        CVPixelBufferRelease(bufC);
+        // bufC removed (Phase 9B+ OP-1).
         CVPixelBufferRelease(output);
         VGFrameEnvelope f = envelope; f.payload.videoBuffer = NULL; return f;
     }
 
     // ── Release intermediates — GPU completed successfully (RR-38 / RR-39) ────
+    // Phase 9B+ OP-1: bufC removed — no intermediateC pool.
     CVPixelBufferRelease(bufA);
     CVPixelBufferRelease(bufB);
-    CVPixelBufferRelease(bufC);
 
     // ── Return outputBuffer at +1 (RR-41: NEVER return an intermediate) ───────
     VGFrameEnvelope out = envelope;

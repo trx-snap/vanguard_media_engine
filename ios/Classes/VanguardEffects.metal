@@ -170,13 +170,17 @@ kernel void vanguard_segmentation_composite(
 }
 
 // =============================================================================
-// MARK: Beauty V2 — 4-Pass GPUPixel-Style Kernels (Phase 4B)
+// MARK: Beauty V2 — 3-Pass GPUPixel-Style Kernels (Phase 4B / Phase 9B+ OP-1)
 //
-// Pass graph (DEC-57 backend-neutral spec):
+// Pass graph (OP-1: highpass fused into composite — eliminates intermediateC):
 //   Pass 1  vanguard_beauty_blur_h    — horizontal 1D Gaussian → intermediateA
 //   Pass 2  vanguard_beauty_blur_v    — vertical   1D Gaussian → intermediateB (meanColor)
-//   Pass 3  vanguard_beauty_highpass  — original − meanColor + 0.5 bias → intermediateC
-//   Pass 4  vanguard_beauty_composite — adaptive smooth + detail restore → outputBuffer
+//   Pass 3  vanguard_beauty_composite — fused highpass + adaptive smooth + detail restore → outputBuffer
+//
+// OP-1 change (Phase 9B+): vanguard_beauty_highpass kernel removed.
+//   highPass is now computed inline in composite:
+//   highPass = clamp(orig - mean + 0.5, 0, 1) - 0.5  (Option A — preserves old clamped range)
+//   This eliminates the _beautyPoolC intermediate texture and one full-frame dispatch.
 //
 // Design rules (DEC-56 / RR-40):
 //   - Separated Gaussian blur (not box blur). DEC-56: deliberate adaptation from GPUPixel.
@@ -311,37 +315,7 @@ kernel void vanguard_beauty_blur_v(
 }
 
 // ---------------------------------------------------------------------------
-// MARK: Pass 3 — vanguard_beauty_highpass
-//
-// Extracts the high-frequency detail residual: original - meanColor.
-// Result is bias-offset by +0.5 to map signed [-0.5, +0.5] into
-// the [0, 1] range representable by BGRA8Unorm without clamping.
-//
-// texture(0) in:  original frame                  BGRA8Unorm read
-// texture(1) in:  intermediateB (meanColor)        BGRA8Unorm read
-// texture(2) out: intermediateC (highPassMap)      BGRA8Unorm write
-//
-// No boundary handling — 1:1 pixel-aligned reads, all textures same dimensions.
-// Composite kernel recovers signed value by subtracting 0.5 again (Pass 4).
-// ---------------------------------------------------------------------------
-kernel void vanguard_beauty_highpass(
-    texture2d<half, access::read>  origTex [[texture(0)]],
-    texture2d<half, access::read>  meanTex [[texture(1)]],
-    texture2d<half, access::write> outTex  [[texture(2)]],
-    uint2 gid [[thread_position_in_grid]])
-{
-    if (gid.x >= outTex.get_width() || gid.y >= outTex.get_height()) return;
-
-    half4 orig = origTex.read(gid);
-    half3 mean = meanTex.read(gid).rgb;
-
-    // highPass = orig.rgb - mean + 0.5 bias → stored in [0, 1].
-    half3 hp = clamp(orig.rgb - mean + half3(0.5h), half3(0.0h), half3(1.0h));
-    outTex.write(half4(hp, orig.a), gid);
-}
-
-// ---------------------------------------------------------------------------
-// MARK: Pass 4 — vanguard_beauty_composite
+// MARK: Pass 3 — vanguard_beauty_composite  (Phase 9B+ OP-1: was Pass 4)
 //
 // Adaptive skin-smoothing composite. Blends original toward meanColor in flat
 // regions, preserves edges via theta variance-gate, then applies Phase 4B.6
@@ -353,17 +327,20 @@ kernel void vanguard_beauty_highpass(
 // receive the original pixel unchanged. When hasMask=0, output is identical
 // to Phase 4B.6 (zero regression).
 //
+// Phase 9B+ OP-1: highpass is now computed inline (no intermediateC texture).
+//   Option A math: clamp(orig - mean + 0.5, 0, 1) - 0.5  → range [-0.5, +0.5]
+//   × 2.0 multiplier on detail add-back is preserved (range unchanged).
+//
 // texture(0) in:  original frame                  BGRA8Unorm read
 // texture(1) in:  intermediateB (meanColor)        BGRA8Unorm read
-// texture(2) in:  intermediateC (highPassMap)      BGRA8Unorm read
-// texture(3) out: outputBuffer (final composite)   BGRA8Unorm write
-// texture(4) in:  skinMask (R8Unorm, quarter-res) — optional (Phase 4C, DEC-62)
+// texture(2) out: outputBuffer (final composite)   BGRA8Unorm write  [was texture(3)]
+// texture(3) in:  skinMask (R8Unorm, quarter-res) — optional (Phase 4C, DEC-62) [was texture(4)]
 // buffer(0):      BeautyCompositeParams {smoothStrength, sharpenStrength, theta,
 //                                        detailDamping, toneStrength, midtoneLift,
 //                                        hasMask, maskStrength}
 //
 // Algorithm (Phase 4B.6 — DEC-60 + Phase 4C mask — DEC-63):
-//   highPass  = highPassMap.rgb - 0.5             (recover signed detail)
+//   highPass  = clamp(orig - mean + 0.5, 0, 1) - 0.5    (Option A inline, range [-0.5, +0.5])
 //   varLuma   = mean(|highPass.rgb|)              (per-pixel variance proxy)
 //   k         = (1 - varLuma/(varLuma+theta)) * smoothStrength
 //   smoothed  = mix(original, meanColor, clamp(k,0,1))
@@ -612,22 +589,24 @@ inline half3 _applyTonePolish(half3 colorRGB, half3 origRGB, half3 highPass,
 }
 
 kernel void vanguard_beauty_composite(
-    texture2d<half, access::read>   origTex     [[texture(0)]],
-    texture2d<half, access::read>   meanTex     [[texture(1)]],
-    texture2d<half, access::read>   highPassTex [[texture(2)]],
-    texture2d<half, access::write>  outTex      [[texture(3)]],
-    texture2d<half, access::sample> maskTex     [[texture(4)]],
-    constant BeautyCompositeParams& params      [[buffer(0)]],
+    texture2d<half, access::read>   origTex [[texture(0)]],
+    texture2d<half, access::read>   meanTex [[texture(1)]],
+    texture2d<half, access::write>  outTex  [[texture(2)]],   // Phase 9B+ OP-1: was texture(3)
+    texture2d<half, access::sample> maskTex [[texture(3)]],   // Phase 9B+ OP-1: was texture(4)
+    constant BeautyCompositeParams& params  [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= outTex.get_width() || gid.y >= outTex.get_height()) return;
 
-    half4 orig     = origTex.read(gid);
-    half3 mean     = meanTex.read(gid).rgb;
-    half3 hpStored = highPassTex.read(gid).rgb;
+    half4 orig = origTex.read(gid);
+    half3 mean = meanTex.read(gid).rgb;
 
-    // 1. Recover signed detail from bias-offset BGRA8 storage.
-    half3 highPass = hpStored - half3(0.5h);   // [-0.5, +0.5]
+    // 1. Fused highpass — Option A: preserve old clamped [-0.5, +0.5] range.
+    // Formerly computed by vanguard_beauty_highpass into intermediateC.
+    // Clamp ensures range identical to former BGRA8Unorm storage round-trip.
+    // × 2.0 multiplier on detail add-back is preserved unchanged (line ~688).
+    half3 highPass = clamp(orig.rgb - mean + half3(0.5h),
+                           half3(0.0h), half3(1.0h)) - half3(0.5h);  // [-0.5, +0.5]
 
     // 2. Per-pixel variance proxy.
     float varLuma = (abs(float(highPass.r)) +

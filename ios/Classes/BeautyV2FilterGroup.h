@@ -42,16 +42,18 @@ NS_ASSUME_NONNULL_BEGIN
 //
 //   VGFrameEnvelope in → BeautyV2FilterGroup → VGFrameEnvelope out
 //
-// Internal pass graph (Step 2 — not yet active):
+// Internal pass graph (Phase 9B+ OP-1: 3-pass, highpass fused into composite):
 //
 //   original (read-only)
 //     ├──► [Pass 1: blur_h]  → intermediateA  (_beautyPoolA)
 //     │         └──► [Pass 2: blur_v] → intermediateB  (_beautyPoolB)  = meanColor
-//     ├──► [Pass 3: highpass(original, intermediateB)] → intermediateC (_beautyPoolC)
-//     └──► [Pass 4: composite(original, B, C)] → outputBuffer  (runtime session pool)
+//     └──► [Pass 3: composite(original, B, fused-highpass)] → outputBuffer  (runtime session pool)
+//
+// OP-1 change: _beautyPoolC and Pass 3 highpass kernel removed.
+//   highPass is fused inline in composite: clamp(orig - mean + 0.5, 0, 1) - 0.5
 //
 // Pool ownership:
-//   _beautyPoolA/B/C  — node-local; MUST use CFRetain/CFRelease explicitly.
+//   _beautyPoolA/B  — node-local; MUST use CFRetain/CFRelease explicitly.
 //   _pool (init param) — borrowed from runtime; DO NOT CFRetain.
 //
 @interface BeautyV2FilterGroup : NSObject <VanguardFilterNode, VGMetalFilterNode>
