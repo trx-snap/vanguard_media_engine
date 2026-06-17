@@ -1049,11 +1049,11 @@ static os_log_t _rendererLog;
       CVPixelBufferRetain((CVPixelBufferRef)envelope.payload.videoBuffer);
 
   // Phase 9B-Reset: face-tracking diagnostic overlay.
-  // Gate 1 (compile-time): #if DEBUG — zero overhead in Release builds.
+  // Gate 1 (compile-time): #ifndef NDEBUG — zero overhead in Release builds.
   // Gate 2 (runtime): VG_FACE_TRACKING_DIAGNOSTIC=1 env var — see VGFaceTrackingDiagnosticOverlay.h.
   // This block draws onto `incoming` before the _latestPixelBuffer swap so Flutter displays it.
   // It is visual-only and does NOT modify BeautyV2 / segmentation / mask generation.
-#if DEBUG
+#ifndef NDEBUG
   if ([VGFaceTrackingDiagnosticOverlay enabled]) {
     NSDictionary *diagMeta = envelope.metadata
         ? (__bridge NSDictionary *)envelope.metadata
@@ -1062,7 +1062,7 @@ static os_log_t _rendererLog;
                                                         pts:envelope.pts
                                                    metadata:diagMeta];
   }
-#endif
+#endif // !NDEBUG
 
 
   // P0-T7: swap _latestPixelBuffer — identical to _onVideoFrame: tail (L904).
