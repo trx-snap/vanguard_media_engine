@@ -135,6 +135,14 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     // ── Phase 9B-6A: mask freshness diagnostic counter ─────────────────────
     // Throttle freshness log to once every kVGBeautyDiagLogInterval frames.
     NSUInteger _freshnessLogCount;
+
+#ifndef NDEBUG
+    // ── Phase 9B+: total GPU blocking-time measurement ────────────────────────
+    // Rolling 60-frame buffer of wall-clock ms for [cmd commit]+waitUntilCompleted.
+    // Filled circularly; sorted+logged every 60 frames.
+    float      _gpuTimingBuf[60];
+    NSUInteger _gpuTimingCount;  // total frames measured so far
+#endif
 }
 
 @synthesize enabled              = _enabled;
@@ -290,6 +298,12 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     _beautyPoolA = NULL;
     _beautyPoolB = NULL;
     _beautyPoolC = NULL;
+
+#ifndef NDEBUG
+    // Phase 9B+: zero-init timing buffer and frame counter.
+    memset(_gpuTimingBuf, 0, sizeof(_gpuTimingBuf));
+    _gpuTimingCount = 0;
+#endif
 
     // Identity
     _nodeId     = [[NSUUID UUID] UUIDString];
@@ -1029,8 +1043,44 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
     }
 
     // ── Commit + synchronous wait (DEC-58 — NO addCompletedHandler:) ──────────
+#ifndef NDEBUG
+    CFAbsoluteTime _vgTimerT0 = CFAbsoluteTimeGetCurrent();
+#endif
     [cmd commit];
     [cmd waitUntilCompleted];
+#ifndef NDEBUG
+    {
+        // Phase 9B+: accumulate total GPU wall-clock blocking time.
+        // waitUntilCompleted is synchronous — delta is true blocking cost.
+        double _vgElapsedMs = (CFAbsoluteTimeGetCurrent() - _vgTimerT0) * 1000.0;
+        NSUInteger _vgSlot  = _gpuTimingCount % 60;
+        _gpuTimingBuf[_vgSlot] = (float)_vgElapsedMs;
+        _gpuTimingCount++;
+
+        if (_gpuTimingCount % 60 == 0) {
+            // Sort a copy; never mutate the ring buffer.
+            float _vgSorted[60];
+            memcpy(_vgSorted, _gpuTimingBuf, sizeof(_vgSorted));
+            // Insertion sort — 60 elements, negligible CPU cost.
+            for (int _i = 1; _i < 60; _i++) {
+                float _vgKey = _vgSorted[_i];
+                int   _j     = _i - 1;
+                while (_j >= 0 && _vgSorted[_j] > _vgKey) {
+                    _vgSorted[_j + 1] = _vgSorted[_j];
+                    _j--;
+                }
+                _vgSorted[_j + 1] = _vgKey;
+            }
+            float _vgP50  = _vgSorted[29];   // index 29 of 60  ≈ p50
+            float _vgP95  = _vgSorted[56];   // index 56 of 60  ≈ p95
+            float _vgMax  = _vgSorted[59];
+            os_log_info(OS_LOG_DEFAULT,
+                "[BeautyV2 timing] frames=60 gpuTotal: "
+                "p50=%.1fms p95=%.1fms max=%.1fms intensity=%.2f radius=%d",
+                _vgP50, _vgP95, _vgMax, _intensity, _radius);
+        }
+    }
+#endif
 
     // ── GPU fault check (Step 3B) ──────────────────────────────────────────────
     // waitUntilCompleted blocks until the GPU is done but does NOT guarantee
