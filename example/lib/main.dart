@@ -66,29 +66,45 @@ class VanguardExampleApp extends StatelessWidget {
 // Preset definitions
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Preset catalogue used by the preset selector strip.
+/// Preset catalogue used by the beauty preset strip.
 ///
-/// Only presets whose filter types are currently supported by the native
-/// camera graph path are included here. LUT and LUT-composite presets
-/// (Glow, LUT) are omitted: VGCameraGraphSession rejects \"lut\" specs with
-/// UNSUPPORTED_FILTER_TYPE. They will be restored once LUT is constructable.
-final List<_PresetEntry> _kPresets = [
+/// Off:    No BeautyV2 filter active (empty filter stack).
+/// Soft:   BeautyV2 intensity 0.5  — subtle, everyday look.
+/// Strong: BeautyV2 intensity 0.75 — visible smoothing.
+/// Max:    BeautyV2 intensity 1.0  — full effect.
+///
+/// Default: Soft (index 1).
+final List<_PresetEntry> _kBeautyPresets = [
   _PresetEntry(
-    label: 'None',
-    emoji: '✕',
+    label: 'Off',
     descriptor: VGPresetDescriptor(
-      id: 'none',
-      name: 'None',
+      id: 'off',
+      name: 'Off',
       filterStack: const [],
     ),
   ),
   _PresetEntry(
     label: 'Soft',
-    emoji: '✦',
     descriptor: VGPresetDescriptor(
       id: 'soft',
       name: 'Soft',
       filterStack: [VGFilterSpecs.beauty(intensity: 0.5, beautyVersion: 2)],
+    ),
+  ),
+  _PresetEntry(
+    label: 'Strong',
+    descriptor: VGPresetDescriptor(
+      id: 'strong',
+      name: 'Strong',
+      filterStack: [VGFilterSpecs.beauty(intensity: 0.75, beautyVersion: 2)],
+    ),
+  ),
+  _PresetEntry(
+    label: 'Max',
+    descriptor: VGPresetDescriptor(
+      id: 'max',
+      name: 'Max',
+      filterStack: [VGFilterSpecs.beauty(intensity: 1.0, beautyVersion: 2)],
     ),
   ),
 ];
@@ -96,11 +112,9 @@ final List<_PresetEntry> _kPresets = [
 class _PresetEntry {
   const _PresetEntry({
     required this.label,
-    required this.emoji,
     required this.descriptor,
   });
   final String label;
-  final String emoji;
   final VGPresetDescriptor descriptor;
 }
 
@@ -131,17 +145,9 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
 
   // ── Preset state ───────────────────────────────────────────────────────────
 
-  int _selectedPresetIndex = 0; // index into _kPresets
+  // Default: Soft (index 1). Off is index 0.
+  int _selectedPresetIndex = 1;
   bool _applyingPreset = false;
-
-  // ── Beauty intensity (hot parameter) ──────────────────────────────────────
-
-  double _beautyIntensity = 0.5;
-  // We only show the slider when a beauty-carrying preset is active.
-  bool get _activePresetHasBeauty => _kPresets[_selectedPresetIndex]
-      .descriptor
-      .filterStack
-      .any((f) => f.type == 'beauty');
 
   // ── Zoom state ─────────────────────────────────────────────────────────────
 
@@ -473,15 +479,13 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
   Future<void> _applyPreset(int index) async {
     final session = _session;
     if (session == null || _applyingPreset) return;
-    // Capture prior index so we can revert on failure — prevents the beauty
-    // slider from becoming sticky on an unapplied preset.
     final previousIndex = _selectedPresetIndex;
     setState(() {
       _applyingPreset = true;
       _selectedPresetIndex = index;
     });
     try {
-      final preset = _kPresets[index].descriptor;
+      final preset = _kBeautyPresets[index].descriptor;
       final payload = session.prepareTransaction((tx) {
         tx.applyPreset(preset);
       });
@@ -491,30 +495,11 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
       _showStatus('Preset applied: ${preset.name}');
     } on PlatformException catch (e) {
       if (!mounted) return;
-      // Revert selection so slider visibility reflects the actual active preset.
       setState(() {
         _applyingPreset = false;
         _selectedPresetIndex = previousIndex;
       });
       _showStatus('Preset error: ${e.code}');
-    }
-  }
-
-  // ──────────────────────────────────────────────────────────────────────────
-  // Hot beauty intensity update (Phase 6C.2B — hot parameter transaction)
-  // ──────────────────────────────────────────────────────────────────────────
-
-  Future<void> _applyBeautyIntensity(double value) async {
-    final session = _session;
-    if (session == null) return;
-    setState(() => _beautyIntensity = value);
-    try {
-      final payload = session.prepareTransaction((tx) {
-        tx.setParameter('beauty', 'intensity', value);
-      });
-      await session.applyTransaction(payload);
-    } on PlatformException {
-      // Silently absorb — slider will stay at last value; no graph rebuild.
     }
   }
 
@@ -613,9 +598,6 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
 
           // ── Preset strip ──────────────────────────────────────────────────
           _buildPresetStrip(),
-
-          // ── Beauty intensity slider ───────────────────────────────────────
-          if (_activePresetHasBeauty) _buildBeautySlider(),
 
           // ── Bottom shutter row ────────────────────────────────────────────
           _buildBottomControls(),
@@ -872,7 +854,7 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
     );
   }
 
-  // ── Preset strip ───────────────────────────────────────────────────────────
+  // ── Preset strip (Off / Soft / Strong / Max) ───────────────────────────────
 
   Widget _buildPresetStrip() {
     return Positioned(
@@ -880,15 +862,16 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
       left: 0,
       right: 0,
       child: SizedBox(
-        height: 72,
+        height: 80,
         child: ListView.separated(
           scrollDirection: Axis.horizontal,
           padding: const EdgeInsets.symmetric(horizontal: 20),
-          itemCount: _kPresets.length,
+          itemCount: _kBeautyPresets.length,
           separatorBuilder: (_, _) => const SizedBox(width: 10),
           itemBuilder: (context, i) {
-            final preset = _kPresets[i];
+            final preset = _kBeautyPresets[i];
             final selected = i == _selectedPresetIndex;
+            final isOff = i == 0;
             return GestureDetector(
               onTap: _applyingPreset || _session == null
                   ? null
@@ -896,21 +879,34 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
               child: AnimatedContainer(
                 duration: const Duration(milliseconds: 220),
                 curve: Curves.easeOut,
-                width: 60,
+                width: 64,
                 decoration: BoxDecoration(
                   borderRadius: BorderRadius.circular(16),
                   color: selected
-                      ? const Color(0xFF6C63FF)
-                      : Colors.white.withValues(alpha: 0.12),
+                      ? Colors.white.withValues(alpha: 0.18)
+                      : Colors.white.withValues(alpha: 0.08),
                   border: selected
-                      ? Border.all(color: Colors.white54, width: 1.5)
-                      : null,
+                      ? Border.all(color: Colors.white, width: 2.0)
+                      : Border.all(color: Colors.white24, width: 1.0),
                 ),
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Text(preset.emoji, style: const TextStyle(fontSize: 18)),
-                    const SizedBox(height: 4),
+                    // Off uses a circle-slash icon; beauty presets use a
+                    // sparkle/wand icon to signal enhancement.
+                    if (isOff)
+                      Icon(
+                        Icons.block,
+                        color: selected ? Colors.white : Colors.white54,
+                        size: 22,
+                      )
+                    else
+                      Icon(
+                        Icons.auto_fix_high,
+                        color: selected ? Colors.white : Colors.white54,
+                        size: 22,
+                      ),
+                    const SizedBox(height: 5),
                     Text(
                       preset.label,
                       style: TextStyle(
@@ -919,6 +915,7 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
                         fontWeight: selected
                             ? FontWeight.w700
                             : FontWeight.w400,
+                        letterSpacing: 0.2,
                       ),
                     ),
                   ],
@@ -927,53 +924,6 @@ class _FullScreenCameraScreenState extends State<FullScreenCameraScreen>
             );
           },
         ),
-      ),
-    );
-  }
-
-  // ── Beauty intensity slider ────────────────────────────────────────────────
-
-  Widget _buildBeautySlider() {
-    return Positioned(
-      bottom: 258,
-      left: 24,
-      right: 24,
-      child: Row(
-        children: [
-          const Icon(Icons.auto_fix_high, color: Colors.white54, size: 18),
-          const SizedBox(width: 8),
-          Expanded(
-            child: SliderTheme(
-              data: SliderTheme.of(context).copyWith(
-                trackHeight: 3,
-                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
-                overlayShape: const RoundSliderOverlayShape(overlayRadius: 18),
-                activeTrackColor: const Color(0xFF6C63FF),
-                inactiveTrackColor: Colors.white24,
-                thumbColor: Colors.white,
-                overlayColor: const Color(0x446C63FF),
-              ),
-              child: Slider(
-                value: _beautyIntensity,
-                min: 0.0,
-                max: 1.0,
-                divisions: 20,
-                onChanged: _session == null ? null : _applyBeautyIntensity,
-              ),
-            ),
-          ),
-          SizedBox(
-            width: 36,
-            child: Text(
-              _beautyIntensity.toStringAsFixed(2),
-              style: const TextStyle(
-                color: Colors.white70,
-                fontSize: 11,
-                fontFamily: 'monospace',
-              ),
-            ),
-          ),
-        ],
       ),
     );
   }
