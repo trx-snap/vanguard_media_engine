@@ -182,7 +182,9 @@ Pod::Spec.new do |s|
       # Phase 9B-2: LiteRT mask provider tests (real bundled model + synthetic CVPixelBuffer)
       'Tests/VGLiteRTMaskProviderTest.m',
       # Phase 9B-3: Camera graph factory gate test (gate-OFF path, VGHeuristicMaskProvider default)
-      'Tests/VGCameraGraphFactoryGateTest.m'
+      'Tests/VGCameraGraphFactoryGateTest.m',
+      # Phase 10-C-3L.1D: Spatial transform filter node tests
+      'Tests/VGTransformFilterNodeTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage'
     ts.dependency    'UMF'

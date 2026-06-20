@@ -2813,6 +2813,131 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         node.enabled = enabled
                         nodes.append(VGLegacyFilterAdapter(filter: node))
 
+                    case "transform":
+                        // Phase 10-C-3L.1D: spatial transform for still-image export.
+                        //
+                        // Required parameters:
+                        //   canvasWidth:          Int  – output canvas pixel width
+                        //   canvasHeight:         Int  – output canvas pixel height
+                        //   scale:                Double – zoom multiplier relative to aspect-fill
+                        //   offsetX:              Double – normalized pan [-1, 1]
+                        //   offsetY:              Double – normalized pan [-1, 1]
+                        //   rotationQuarterTurns: Int  – CW rotation [0–3]
+                        //   flipX:                Bool – horizontal mirror after rotation
+                        //
+                        // Optional parameters:
+                        //   cropRect:             [Double] – normalized [x, y, w, h] crop, length 4
+
+                        guard let canvasWidthRaw  = parameters["canvasWidth"],
+                              let canvasHeightRaw = parameters["canvasHeight"],
+                              let scaleRaw        = parameters["scale"] else {
+                            NSLog("[VanguardPlugin] exportImage: 'transform' filter missing " +
+                                  "required parameters (canvasWidth, canvasHeight, scale). Skipping.")
+                            continue
+                        }
+
+                        // Coerce canvasWidth / canvasHeight to Int.
+                        let canvasWidth: Int
+                        let canvasHeight: Int
+                        if let n = canvasWidthRaw as? Int {
+                            canvasWidth = n
+                        } else if let n = canvasWidthRaw as? NSNumber {
+                            canvasWidth = n.intValue
+                        } else {
+                            NSLog("[VanguardPlugin] exportImage: 'transform' canvasWidth coercion failed. Skipping.")
+                            continue
+                        }
+                        if let n = canvasHeightRaw as? Int {
+                            canvasHeight = n
+                        } else if let n = canvasHeightRaw as? NSNumber {
+                            canvasHeight = n.intValue
+                        } else {
+                            NSLog("[VanguardPlugin] exportImage: 'transform' canvasHeight coercion failed. Skipping.")
+                            continue
+                        }
+                        guard canvasWidth > 0, canvasHeight > 0 else {
+                            NSLog("[VanguardPlugin] exportImage: 'transform' canvas dimensions must be > 0 " +
+                                  "(\(canvasWidth)×\(canvasHeight)). Skipping.")
+                            continue
+                        }
+
+                        // Coerce scale to Double.
+                        let scaleValue: Double
+                        if let d = scaleRaw as? Double {
+                            scaleValue = d
+                        } else if let n = scaleRaw as? NSNumber {
+                            scaleValue = n.doubleValue
+                        } else {
+                            NSLog("[VanguardPlugin] exportImage: 'transform' scale coercion failed. Skipping.")
+                            continue
+                        }
+                        guard scaleValue > 0 else {
+                            NSLog("[VanguardPlugin] exportImage: 'transform' scale must be > 0 (\(scaleValue)). Skipping.")
+                            continue
+                        }
+
+                        // Coerce offsetX / offsetY (default 0.0 if missing).
+                        let offsetXValue: Double
+                        let offsetYValue: Double
+                        if let raw = parameters["offsetX"] {
+                            offsetXValue = (raw as? NSNumber)?.doubleValue ?? 0.0
+                        } else {
+                            offsetXValue = 0.0
+                        }
+                        if let raw = parameters["offsetY"] {
+                            offsetYValue = (raw as? NSNumber)?.doubleValue ?? 0.0
+                        } else {
+                            offsetYValue = 0.0
+                        }
+
+                        // Coerce rotationQuarterTurns (default 0 if missing).
+                        let quarterTurns: Int
+                        if let raw = parameters["rotationQuarterTurns"] {
+                            quarterTurns = (raw as? NSNumber)?.intValue ?? 0
+                        } else {
+                            quarterTurns = 0
+                        }
+
+                        // Coerce flipX (default false if missing).
+                        let flipXValue: Bool
+                        if let raw = parameters["flipX"] {
+                            flipXValue = (raw as? Bool) ?? ((raw as? NSNumber)?.boolValue ?? false)
+                        } else {
+                            flipXValue = false
+                        }
+
+                        // Coerce optional cropRect ([Double], length 4).
+                        var cropRectNumbers: [NSNumber]? = nil
+                        if let rawCrop = parameters["cropRect"] as? [Any], rawCrop.count == 4 {
+                            let coerced: [NSNumber] = rawCrop.compactMap {
+                                if let n = $0 as? NSNumber { return n }
+                                if let d = $0 as? Double    { return NSNumber(value: d) }
+                                if let i = $0 as? Int       { return NSNumber(value: i) }
+                                return nil
+                            }
+                            if coerced.count == 4 {
+                                cropRectNumbers = coerced
+                            } else {
+                                NSLog("[VanguardPlugin] exportImage: 'transform' cropRect coercion " +
+                                      "failed (\(coerced.count)/4 valid). Ignoring cropRect.")
+                            }
+                        }
+
+                        let transformNode = VGTransformFilterNode(
+                            pool:         nil,
+                            device:       metalDevice,
+                            canvasWidth:  canvasWidth,
+                            canvasHeight: canvasHeight,
+                            scale:        scaleValue,
+                            offsetX:      offsetXValue,
+                            offsetY:      offsetYValue,
+                            quarterTurns: quarterTurns,
+                            flipX:        flipXValue,
+                            cropRect:     cropRectNumbers
+                        )
+                        transformNode.enabled = enabled
+                        nodes.append(VGLegacyFilterAdapter(filter: transformNode))
+
                     default:
                         NSLog("[VanguardPlugin] exportImage: Unknown filter type '\(type)'. Skipping.")
                     }

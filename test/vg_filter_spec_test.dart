@@ -205,6 +205,237 @@ void main() {
       );
     },
   );
+
+  // ── Phase 10-C-3L.1D: transform factory tests ──────────────────────────────
+
+  // ── Test 10 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.transform() produces correct type and all required parameters',
+    () {
+      final spec = VGFilterSpecs.transform(
+        canvasWidth: 1080,
+        canvasHeight: 1920,
+        scale: 1.5,
+        offsetX: 0.2,
+        offsetY: -0.3,
+        rotationQuarterTurns: 1,
+        flipX: true,
+      );
+
+      expect(spec.type, equals('transform'),
+          reason: 'transform() must produce type string "transform"');
+      expect(spec.enabled, isTrue,
+          reason: 'transform() default enabled must be true');
+      expect(spec.parameters['canvasWidth'], equals(1080));
+      expect(spec.parameters['canvasHeight'], equals(1920));
+      expect((spec.parameters['scale'] as num).toDouble(), closeTo(1.5, 1e-9));
+      expect((spec.parameters['offsetX'] as num).toDouble(), closeTo(0.2, 1e-9));
+      expect((spec.parameters['offsetY'] as num).toDouble(), closeTo(-0.3, 1e-9));
+      expect(spec.parameters['rotationQuarterTurns'], equals(1));
+      expect(spec.parameters['flipX'], isTrue);
+      expect(spec.parameters.containsKey('cropRect'), isFalse,
+          reason: 'cropRect absent when not provided');
+    },
+  );
+
+  // ── Test 11 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.transform() toJson() serialises all fields correctly',
+    () {
+      final spec = VGFilterSpecs.transform(
+        canvasWidth: 720,
+        canvasHeight: 1280,
+        scale: 2.0,
+        offsetX: 0.0,
+        offsetY: 0.0,
+        rotationQuarterTurns: 0,
+        flipX: false,
+        cropRect: [0.1, 0.15, 0.8, 0.7],
+      );
+      final json = spec.toJson();
+
+      expect(json['type'], equals('transform'));
+      expect(json['enabled'], isTrue);
+      final params = json['parameters'] as Map;
+      expect(params['canvasWidth'], equals(720));
+      expect(params['canvasHeight'], equals(1280));
+      expect((params['scale'] as num).toDouble(), closeTo(2.0, 1e-9));
+      expect(params['flipX'], isFalse);
+      final cropRect = params['cropRect'] as List;
+      expect(cropRect.length, equals(4));
+      expect((cropRect[0] as num).toDouble(), closeTo(0.1, 1e-9));
+      expect((cropRect[2] as num).toDouble(), closeTo(0.8, 1e-9));
+    },
+  );
+
+  // ── Test 12 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.transform() assertValid() does not throw '
+    '("transform" is in _validTypes)',
+    () {
+      final spec = VGFilterSpecs.transform(
+        canvasWidth: 1080,
+        canvasHeight: 1920,
+        scale: 1.0,
+        offsetX: 0.0,
+        offsetY: 0.0,
+        rotationQuarterTurns: 0,
+        flipX: false,
+      );
+      expect(
+        () => spec.assertValid(),
+        returnsNormally,
+        reason: '"transform" is a known type; assertValid() must not throw',
+      );
+    },
+  );
+
+  // ── Test 13 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.transform() with cropRect serialises a 4-element list',
+    () {
+      final spec = VGFilterSpecs.transform(
+        canvasWidth: 1080,
+        canvasHeight: 1920,
+        scale: 1.0,
+        offsetX: 0.0,
+        offsetY: 0.0,
+        rotationQuarterTurns: 0,
+        flipX: false,
+        cropRect: [0.0, 0.0, 1.0, 1.0],
+      );
+      final cropRect = spec.parameters['cropRect'] as List<double>;
+      expect(cropRect.length, equals(4));
+      expect(cropRect[0], closeTo(0.0, 1e-9));
+      expect(cropRect[2], closeTo(1.0, 1e-9));
+    },
+  );
+
+  // ── Test 14 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.transform() normalises rotationQuarterTurns to [0, 3]',
+    () {
+      final spec4  = VGFilterSpecs.transform(
+        canvasWidth: 1080, canvasHeight: 1920,
+        scale: 1.0, offsetX: 0.0, offsetY: 0.0,
+        rotationQuarterTurns: 4,  // 4 mod 4 = 0
+        flipX: false,
+      );
+      expect(spec4.parameters['rotationQuarterTurns'], equals(0),
+          reason: 'quarterTurns=4 must normalise to 0');
+
+      final spec5 = VGFilterSpecs.transform(
+        canvasWidth: 1080, canvasHeight: 1920,
+        scale: 1.0, offsetX: 0.0, offsetY: 0.0,
+        rotationQuarterTurns: 5,  // 5 mod 4 = 1
+        flipX: false,
+      );
+      expect(spec5.parameters['rotationQuarterTurns'], equals(1),
+          reason: 'quarterTurns=5 must normalise to 1');
+    },
+  );
+
+  // ── Test 15 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.transform() throws AssertionError for canvasWidth <= 0',
+    () {
+      expect(
+        () => VGFilterSpecs.transform(
+          canvasWidth: 0,   // invalid
+          canvasHeight: 1920,
+          scale: 1.0,
+          offsetX: 0.0,
+          offsetY: 0.0,
+          rotationQuarterTurns: 0,
+          flipX: false,
+        ),
+        throwsA(isA<AssertionError>()),
+        reason: 'canvasWidth=0 must throw AssertionError',
+      );
+    },
+  );
+
+  // ── Test 16 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.transform() throws AssertionError for canvasHeight <= 0',
+    () {
+      expect(
+        () => VGFilterSpecs.transform(
+          canvasWidth: 1080,
+          canvasHeight: -1,   // invalid
+          scale: 1.0,
+          offsetX: 0.0,
+          offsetY: 0.0,
+          rotationQuarterTurns: 0,
+          flipX: false,
+        ),
+        throwsA(isA<AssertionError>()),
+        reason: 'canvasHeight=-1 must throw AssertionError',
+      );
+    },
+  );
+
+  // ── Test 17 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.transform() throws AssertionError for scale <= 0',
+    () {
+      expect(
+        () => VGFilterSpecs.transform(
+          canvasWidth: 1080,
+          canvasHeight: 1920,
+          scale: 0.0,   // invalid
+          offsetX: 0.0,
+          offsetY: 0.0,
+          rotationQuarterTurns: 0,
+          flipX: false,
+        ),
+        throwsA(isA<AssertionError>()),
+        reason: 'scale=0.0 must throw AssertionError',
+      );
+    },
+  );
+
+  // ── Test 18 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.transform() throws AssertionError for cropRect with wrong length',
+    () {
+      expect(
+        () => VGFilterSpecs.transform(
+          canvasWidth: 1080,
+          canvasHeight: 1920,
+          scale: 1.0,
+          offsetX: 0.0,
+          offsetY: 0.0,
+          rotationQuarterTurns: 0,
+          flipX: false,
+          cropRect: [0.0, 0.0, 1.0],   // only 3 elements — invalid
+        ),
+        throwsA(isA<AssertionError>()),
+        reason: 'cropRect with 3 elements must throw AssertionError',
+      );
+    },
+  );
+
+  // ── Test 19 ───────────────────────────────────────────────────────────────
+  test(
+    'VGFilterSpecs.transform() throws AssertionError for cropRect with w=0',
+    () {
+      expect(
+        () => VGFilterSpecs.transform(
+          canvasWidth: 1080,
+          canvasHeight: 1920,
+          scale: 1.0,
+          offsetX: 0.0,
+          offsetY: 0.0,
+          rotationQuarterTurns: 0,
+          flipX: false,
+          cropRect: [0.0, 0.0, 0.0, 1.0],   // w=0 — invalid
+        ),
+        throwsA(isA<AssertionError>()),
+        reason: 'cropRect with w=0 must throw AssertionError',
+      );
+    },
+  );
 }
 
 // ── AC coverage summary (P4-10 + Phase 10-C-3L.1C) ───────────────────────────
@@ -218,3 +449,14 @@ void main() {
 // P10C3L1C-02  colorMatrix() toJson() serialises matrix (Test 7)
 // P10C3L1C-03  colorMatrix() assertValid() passes (Test 8)
 // P10C3L1C-04  colorMatrix() asserts on wrong-length matrix (Test 9)
+// P10C3L1D-01  transform() produces correct type and parameters (Test 10)
+// P10C3L1D-02  transform() toJson() serialises all fields (Test 11)
+// P10C3L1D-03  transform() assertValid() passes (Test 12)
+// P10C3L1D-04  transform() with cropRect serialises 4-element list (Test 13)
+// P10C3L1D-05  transform() rotationQuarterTurns normalised to [0,3] (Test 14)
+// P10C3L1D-06  transform() invalid canvasWidth asserts (Test 15)
+// P10C3L1D-07  transform() invalid canvasHeight asserts (Test 16)
+// P10C3L1D-08  transform() invalid scale asserts (Test 17)
+// P10C3L1D-09  transform() cropRect wrong length asserts (Test 18)
+// P10C3L1D-10  transform() cropRect invalid values asserts (Test 19)
+// P10C3L1D-11  'transform' accepted by assertValid (part of Test 12)

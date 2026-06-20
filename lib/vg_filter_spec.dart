@@ -129,7 +129,7 @@ bool _mapEquals(Map<String, Object?> a, Map<String, Object?> b) {
 /// The native plugin's `setFilterChain` handler maps each type to a concrete
 /// filter node class. Extend this set when a new filter node is added to both
 /// the native handler and the UMF protocol conformers.
-const Set<String> _validTypes = {'lut', 'beauty', 'segmentation', 'colorMatrix'};
+const Set<String> _validTypes = {'lut', 'beauty', 'segmentation', 'colorMatrix', 'transform'};
 
 /// Typed factory constructors and validation for [VGFilterSpec].
 ///
@@ -360,6 +360,91 @@ extension VGFilterSpecs on VGFilterSpec {
       type: 'colorMatrix',
       parameters: {'matrix': List<double>.unmodifiable(matrix)},
     );
+  }
+
+  /// Creates a spatial transform filter for still-image export.
+  ///
+  /// Applies crop, rotation, flip, zoom, and pan to the source image and
+  /// renders the result into an output canvas of [canvasWidth] × [canvasHeight]
+  /// with a black background.
+  ///
+  /// ## Parameters
+  ///
+  /// - [canvasWidth] / [canvasHeight]: Output canvas pixel dimensions. Must be > 0.
+  ///
+  /// - [scale]: Zoom multiplier relative to the aspect-fill base scale.
+  ///   `1.0` = image aspect-fills the canvas exactly (no extra zoom).
+  ///   `2.0` = 2× zoom relative to aspect-fill. Must be > 0.
+  ///
+  /// - [offsetX] / [offsetY]: Normalized pan displacement in `[-1.0, 1.0]`.
+  ///   These are NOT pixel values. They represent the fraction of maximum pan
+  ///   travel in each axis:
+  ///   `maxDeltaX = max(0, (renderedW - canvasW) / 2)`
+  ///   `translationX = offsetX * maxDeltaX`
+  ///   The native node replicates this math from UniversalEditor's preview.
+  ///
+  /// - [rotationQuarterTurns]: Clockwise rotation in 90° increments (0–3).
+  ///   Applied before flip.
+  ///
+  /// - [flipX]: When `true`, mirrors the image horizontally after rotation.
+  ///
+  /// - [cropRect]: Optional normalized crop region `[x, y, w, h]` in `[0, 1]`
+  ///   relative to the source image, applied before rotation and scale.
+  ///   Must have exactly 4 elements with `w > 0`, `h > 0`, `x+w ≤ 1.0`,
+  ///   `y+h ≤ 1.0`.
+  ///
+  /// Phase 10-C-3L.1D — still-image export only.
+  static VGFilterSpec transform({
+    required int canvasWidth,
+    required int canvasHeight,
+    required double scale,
+    required double offsetX,
+    required double offsetY,
+    required int rotationQuarterTurns,
+    required bool flipX,
+    List<double>? cropRect,
+  }) {
+    assert(
+      canvasWidth > 0,
+      'VGFilterSpecs.transform: canvasWidth must be > 0. Got $canvasWidth.',
+    );
+    assert(
+      canvasHeight > 0,
+      'VGFilterSpecs.transform: canvasHeight must be > 0. Got $canvasHeight.',
+    );
+    assert(
+      scale > 0,
+      'VGFilterSpecs.transform: scale must be > 0. Got $scale.',
+    );
+    if (cropRect != null) {
+      assert(
+        cropRect.length == 4,
+        'VGFilterSpecs.transform: cropRect must have exactly 4 elements '
+        '[x, y, w, h]. Got ${cropRect.length}.',
+      );
+      final x = cropRect[0];
+      final y = cropRect[1];
+      final w = cropRect[2];
+      final h = cropRect[3];
+      assert(
+        x >= 0 && y >= 0 && w > 0 && h > 0 && x + w <= 1.0 && y + h <= 1.0,
+        'VGFilterSpecs.transform: cropRect [$x, $y, $w, $h] is invalid. '
+        'All values must be in [0, 1] with w > 0, h > 0, x+w ≤ 1.0, y+h ≤ 1.0.',
+      );
+    }
+    // Normalize quarter turns to [0, 3].
+    final normalizedTurns = rotationQuarterTurns % 4;
+    final params = <String, Object?>{
+      'canvasWidth': canvasWidth,
+      'canvasHeight': canvasHeight,
+      'scale': scale,
+      'offsetX': offsetX,
+      'offsetY': offsetY,
+      'rotationQuarterTurns': normalizedTurns,
+      'flipX': flipX,
+      if (cropRect != null) 'cropRect': List<double>.unmodifiable(cropRect),
+    };
+    return VGFilterSpec(type: 'transform', parameters: params);
   }
 
   /// Asserts that this spec's [type] is recognised by the native plugin.

@@ -44,7 +44,12 @@
 // Phase 8.17: disk-backed waveform result cache.
 #import "VGWaveformCache.h"           // VGWaveformCache
 
+
 // Phase 10-C-3L.1C: GPU color matrix filter node.
 // Required so Swift plugin code can reference VGColorMatrixFilterNode.
 #import "VGColorMatrixFilterNode.h"
+
+// Phase 10-C-3L.1D: Spatial transform filter node for still-image export.
+// Required so Swift plugin code can reference VGTransformFilterNode.
+#import "VGTransformFilterNode.h"
 
