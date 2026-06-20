@@ -211,9 +211,21 @@ static NSString * const kSinkNodeId   = @"imageSink";
                                                                profile:_profile];
 
     // Build filter adapters from the raw filterChain.
+    // Guard: if an element is already a VGLegacyFilterAdapter (e.g. from a caller
+    // that pre-wrapped), use it as-is to prevent double-wrapping. Double-wrapping
+    // causes the outer adapter's prepareWithContext:completion: to call
+    // [self.filter prepareWithCompletion:] on the inner adapter, which does not
+    // implement prepareWithCompletion:, triggering NSInvalidArgumentException.
     NSMutableArray<VGLegacyFilterAdapter *> *adapters = [NSMutableArray array];
     for (id filter in _filterChain) {
-        VGLegacyFilterAdapter *adapter = [[VGLegacyFilterAdapter alloc] initWithFilter:filter];
+        VGLegacyFilterAdapter *adapter;
+        if ([filter isKindOfClass:[VGLegacyFilterAdapter class]]) {
+            // Already wrapped — use as-is. Do not double-wrap.
+            adapter = (VGLegacyFilterAdapter *)filter;
+        } else {
+            // Raw id<VGMetalFilterNode> — wrap exactly once.
+            adapter = [[VGLegacyFilterAdapter alloc] initWithFilter:filter];
+        }
         [adapters addObject:adapter];
     }
     _filterAdapters = [adapters copy];

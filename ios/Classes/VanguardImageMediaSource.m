@@ -27,29 +27,46 @@
   _Atomic(BOOL) _invalidated;
   NSString *_nodeId;   // NSUUID assigned at init; immutable
   NSString *_nodeType; // always @"VanguardImageMediaSource"
+
+  // Slice-A: opt-in release policy.
+  // YES only for one-shot serial export sessions (VGImageExportSession).
+  // Must remain NO for live-preview/concurrent paths to avoid IOSurface deadlocks.
+  BOOL _releaseBuffersOnInvalidate;
 }
 
 @synthesize playbackRate = _playbackRate;
 @synthesize nodeId = _nodeId;
 @synthesize nodeType = _nodeType;
 @synthesize renderSize = _renderSize;
+@synthesize releaseBuffersOnInvalidate = _releaseBuffersOnInvalidate;
 
 // P4-2: VGMediaNode topology role — frame source.
 - (VGNodeRole)nodeRole { return VGNodeRoleSource; }
 
 - (instancetype)initWithURL:(NSURL *)imageURL
-                  processor:(VanguardImageProcessor *)processor {
+                  processor:(VanguardImageProcessor *)processor
+   releaseBuffersOnInvalidate:(BOOL)releaseBuffersOnInvalidate {
   self = [super init];
   if (!self)
     return nil;
   _imageURL = imageURL;
   _processor = processor;
   _playbackRate = 1.0;
+  _releaseBuffersOnInvalidate = releaseBuffersOnInvalidate;
   // P1A-07: VGMediaNode identity and invalidation flag.
   atomic_store_explicit(&_invalidated, NO, memory_order_relaxed);
   _nodeId = [NSUUID UUID].UUIDString;
   _nodeType = @"VanguardImageMediaSource";
   return self;
+}
+
+/// Convenience initialiser — releaseBuffersOnInvalidate defaults to NO.
+/// Preserves historical intentional-leak policy for all live-preview paths.
+- (instancetype)initWithURL:(NSURL *)imageURL
+                  processor:(VanguardImageProcessor *)processor {
+  return [self initWithURL:imageURL
+                 processor:processor
+  releaseBuffersOnInvalidate:NO];
 }
 
 - (void)dealloc {
@@ -258,6 +275,17 @@
 /// Sets _invalidated = YES BEFORE releasing _buffer (guards RR-3, double-free).
 /// Idempotent: second call is a no-op (CAS NO→YES).
 /// Does NOT alter start()/stop() or any other production path (C-1).
+/// Buffer release policy:
+///   - _releaseBuffersOnInvalidate == NO (default): buffers are intentionally
+///     leaked. CVPixelBufferRelease is NOT called. _buffer and _rawBuffer are
+///     set to NULL. The OS reclaims the IOSurface memory at process exit.
+///     This avoids IOSurface kernel-fence waits that permanently freeze
+///     _prepareQueue when concurrent sessions are active (same root cause as
+///     VanguardMetalRenderer._latestPixelBuffer intentional-leak policy).
+///   - _releaseBuffersOnInvalidate == YES: safe ONLY for one-shot serial
+///     export sessions (VGImageExportSession) where no concurrent IOSurface
+///     allocations can race. CVPixelBufferRelease is called, reclaiming
+///     ~97 MB of decoded pixel data per export cycle.
 - (void)invalidate {
   // CAS: only the first caller transitions NO → YES.
   BOOL expected = NO;
@@ -266,17 +294,32 @@
                                                memory_order_acquire)) {
     return; // already invalidated
   }
-  // INTENTIONAL: Do NOT call CVPixelBufferRelease(_buffer) here.
-  // _buffer is an IOSurface-backed CVPixelBuffer. CVPixelBufferRelease
-  // triggers an IOSurface fence wait in the kernel. If the next session
-  // (TC-04) is concurrently executing prepareWithCompletion: on a
-  // USER_INITIATED queue — allocating a new IOSurface buffer from the pool
-  // via CVPixelBufferPoolCreatePixelBuffer — the kernel serializes the
-  // IOSurface operations, creating a permanent wait that freezes _prepareQueue.
-  // Same root cause as the renderer's _latestPixelBuffer/pool release fix.
-  // The OS reclaims the IOSurface memory at process exit.
-  _rawBuffer = NULL; // matches _buffer intentional-leak policy
-  _buffer = NULL;    // intentional leak — OS reclaims on process exit
+
+  if (_releaseBuffersOnInvalidate) {
+    // Slice-A: export-only safe release path.
+    // One-shot serial VGImageExportSession — no concurrent IOSurface activity.
+    // Safe to release both buffers without IOSurface kernel-fence deadlock risk.
+    if (_rawBuffer) {
+      CVPixelBufferRelease(_rawBuffer);
+      _rawBuffer = NULL;
+    }
+    if (_buffer) {
+      CVPixelBufferRelease(_buffer);
+      _buffer = NULL;
+    }
+  } else {
+    // INTENTIONAL: Do NOT call CVPixelBufferRelease(_buffer) here.
+    // _buffer is an IOSurface-backed CVPixelBuffer. CVPixelBufferRelease
+    // triggers an IOSurface fence wait in the kernel. If the next session
+    // (TC-04) is concurrently executing prepareWithCompletion: on a
+    // USER_INITIATED queue — allocating a new IOSurface buffer from the pool
+    // via CVPixelBufferPoolCreatePixelBuffer — the kernel serializes the
+    // IOSurface operations, creating a permanent wait that freezes _prepareQueue.
+    // Same root cause as the renderer's _latestPixelBuffer/pool release fix.
+    // The OS reclaims the IOSurface memory at process exit.
+    _rawBuffer = NULL; // matches _buffer intentional-leak policy
+    _buffer = NULL;    // intentional leak — OS reclaims on process exit
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -17,7 +17,9 @@
 #import <ImageIO/ImageIO.h>
 
 #import "VGImageExportSession.h"
+#import "VGColorMatrixFilterNode.h"
 #import "VGLegacyFilterAdapter.h"
+#import "VGTransformFilterNode.h"
 #import "VanguardImageMediaSource.h"
 #import "VanguardImageProcessor.h"
 
@@ -544,6 +546,141 @@ static uint8_t VGIES_FirstPixelLuma(NSURL *url) {
     }];
     [NSThread sleepForTimeInterval:0.3];
     XCTAssertEqual(secondCount, 0, @"Second start must be a no-op");
+    [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ─── TC-5D3-15 to TC-5D3-18: Regression — VGLegacyFilterAdapter double-wrap ──
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Root cause (Phase 10-C-3L.2):
+//   VanguardMediaEnginePlugin.swift wrapped each filter in VGLegacyFilterAdapter
+//   before passing filterChain to VGImageExportSession. The session then wrapped
+//   each element again. The outer adapter's prepareWithContext:completion: called
+//   [self.filter prepareWithCompletion:] on the inner adapter, which does not
+//   implement prepareWithCompletion:, triggering NSInvalidArgumentException.
+//
+// Fix:
+//   (1) Swift bridge: pass raw filter nodes; VGImageExportSession wraps them.
+//   (2) VGImageExportSession: defensive guard skips wrapping if already wrapped.
+
+// TC-5D3-15: Raw VGColorMatrixFilterNode in filterChain — must not crash.
+- (void)testTC_5D3_15_rawColorMatrixFilterNodeDoesNotCrashOnPrepare {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) { return; }
+    NSArray<NSNumber *> *identity = @[
+        @1, @0, @0, @0, @0, @0, @1, @0, @0, @0,
+        @0, @0, @1, @0, @0, @0, @0, @0, @1, @0,
+    ];
+    VGColorMatrixFilterNode *colorNode =
+        [[VGColorMatrixFilterNode alloc] initWithPool:nil device:device matrix:identity];
+    VGImageExportProfile *profile = [VGImageExportProfile jpegProfileWithQuality:0.85f];
+    NSURL *url = VGIES_TempURL(@"jpg");
+    VGImageExportSession *sut = [[VGImageExportSession alloc]
+        initWithSource:_src filterChain:@[colorNode] profile:profile outputURL:url];
+    XCTestExpectation *exp = [self expectationWithDescription:@"TC-5D3-15"];
+    [sut startWithCompletion:^(VGImageExportManifest *m, NSError *e) {
+        XCTAssertNil(e, @"TC-5D3-15: raw colorMatrix node must not crash: %@", e);
+        XCTAssertNotNil(m, @"TC-5D3-15: must produce manifest");
+        [exp fulfill];
+    }];
+    [self waitForExpectationsWithTimeout:15 handler:nil];
+    [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+}
+
+// TC-5D3-16: Raw VGTransformFilterNode in filterChain — must not crash.
+- (void)testTC_5D3_16_rawTransformFilterNodeDoesNotCrashOnPrepare {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) { return; }
+    VGTransformFilterNode *transformNode =
+        [[VGTransformFilterNode alloc] initWithPool:nil
+                                             device:device
+                                        canvasWidth:8
+                                       canvasHeight:8
+                                              scale:1.0
+                                            offsetX:0.0
+                                            offsetY:0.0
+                                       quarterTurns:0
+                                              flipX:NO
+                                           cropRect:nil];
+    VGImageExportProfile *profile = [VGImageExportProfile jpegProfileWithQuality:0.85f];
+    NSURL *url = VGIES_TempURL(@"jpg");
+    VGImageExportSession *sut = [[VGImageExportSession alloc]
+        initWithSource:_src filterChain:@[transformNode] profile:profile outputURL:url];
+    XCTestExpectation *exp = [self expectationWithDescription:@"TC-5D3-16"];
+    [sut startWithCompletion:^(VGImageExportManifest *m, NSError *e) {
+        XCTAssertNil(e, @"TC-5D3-16: raw transform node must not crash: %@", e);
+        XCTAssertNotNil(m, @"TC-5D3-16: must produce manifest");
+        [exp fulfill];
+    }];
+    [self waitForExpectationsWithTimeout:15 handler:nil];
+    [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+}
+
+// TC-5D3-17: transform + colorMatrix chain — matches production export shape.
+- (void)testTC_5D3_17_transformThenColorMatrixChainDoesNotCrash {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) { return; }
+    VGTransformFilterNode *transformNode =
+        [[VGTransformFilterNode alloc] initWithPool:nil
+                                             device:device
+                                        canvasWidth:8
+                                       canvasHeight:8
+                                              scale:1.0
+                                            offsetX:0.0
+                                            offsetY:0.0
+                                       quarterTurns:0
+                                              flipX:NO
+                                           cropRect:nil];
+    NSArray<NSNumber *> *identity = @[
+        @1, @0, @0, @0, @0, @0, @1, @0, @0, @0,
+        @0, @0, @1, @0, @0, @0, @0, @0, @1, @0,
+    ];
+    VGColorMatrixFilterNode *colorNode =
+        [[VGColorMatrixFilterNode alloc] initWithPool:nil device:device matrix:identity];
+    VGImageExportProfile *profile = [VGImageExportProfile jpegProfileWithQuality:0.85f];
+    NSURL *url = VGIES_TempURL(@"jpg");
+    VGImageExportSession *sut = [[VGImageExportSession alloc]
+        initWithSource:_src
+           filterChain:@[transformNode, colorNode]
+               profile:profile
+             outputURL:url];
+    XCTestExpectation *exp = [self expectationWithDescription:@"TC-5D3-17"];
+    [sut startWithCompletion:^(VGImageExportManifest *m, NSError *e) {
+        XCTAssertNil(e, @"TC-5D3-17: transform+colorMatrix chain must not crash: %@", e);
+        XCTAssertNotNil(m, @"TC-5D3-17: must produce manifest");
+        [exp fulfill];
+    }];
+    [self waitForExpectationsWithTimeout:15 handler:nil];
+    [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+}
+
+// TC-5D3-18: Defensive guard — pre-wrapped VGLegacyFilterAdapter must not
+// trigger double-wrap NSInvalidArgumentException.
+- (void)testTC_5D3_18_preWrappedLegacyAdapterGuardPreventsDoubleWrap {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (!device) { return; }
+    NSArray<NSNumber *> *identity = @[
+        @1, @0, @0, @0, @0, @0, @1, @0, @0, @0,
+        @0, @0, @1, @0, @0, @0, @0, @0, @1, @0,
+    ];
+    VGColorMatrixFilterNode *rawNode =
+        [[VGColorMatrixFilterNode alloc] initWithPool:nil device:device matrix:identity];
+    // Simulate old (buggy) Swift bridge: pre-wrap before passing to session.
+    VGLegacyFilterAdapter *preWrapped =
+        [[VGLegacyFilterAdapter alloc] initWithFilter:rawNode];
+    VGImageExportProfile *profile = [VGImageExportProfile jpegProfileWithQuality:0.85f];
+    NSURL *url = VGIES_TempURL(@"jpg");
+    VGImageExportSession *sut = [[VGImageExportSession alloc]
+        initWithSource:_src filterChain:@[preWrapped] profile:profile outputURL:url];
+    XCTestExpectation *exp = [self expectationWithDescription:@"TC-5D3-18"];
+    [sut startWithCompletion:^(VGImageExportManifest *m, NSError *e) {
+        XCTAssertNil(e,
+            @"TC-5D3-18: pre-wrapped VGLegacyFilterAdapter must not crash: %@", e);
+        XCTAssertNotNil(m, @"TC-5D3-18: must produce manifest");
+        [exp fulfill];
+    }];
+    [self waitForExpectationsWithTimeout:15 handler:nil];
     [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
 }
 

@@ -15,11 +15,28 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface VanguardImageMediaSource : NSObject <VanguardMediaSource, VGMediaNode>
 
-/// @param imageURL  Local file URL for a JPEG/PNG/HEIC/WebP image
-/// @param processor Shared VanguardImageProcessor — no new pool allocation
+/// Designated initialiser.
+/// @param imageURL               Local file URL for a JPEG/PNG/HEIC/WebP image
+/// @param processor              Shared VanguardImageProcessor — no new pool allocation
+/// @param releaseBuffersOnInvalidate  When YES, CVPixelBufferRelease is called for
+///   _buffer and _rawBuffer inside invalidate(). Safe ONLY for one-shot serial
+///   export sessions (VGImageExportSession). Must remain NO (default) for any
+///   live-preview or concurrent rendering path to prevent IOSurface fence deadlocks.
 - (instancetype)initWithURL:(NSURL *)imageURL
-                  processor:(VanguardImageProcessor *)processor NS_DESIGNATED_INITIALIZER;
+                  processor:(VanguardImageProcessor *)processor
+   releaseBuffersOnInvalidate:(BOOL)releaseBuffersOnInvalidate NS_DESIGNATED_INITIALIZER;
+
+/// Convenience initialiser — releaseBuffersOnInvalidate defaults to NO.
+/// All live-preview and rendering paths use this initialiser.
+- (instancetype)initWithURL:(NSURL *)imageURL
+                  processor:(VanguardImageProcessor *)processor;
+
 - (instancetype)init NS_UNAVAILABLE;
+
+/// When YES, invalidate() will call CVPixelBufferRelease on _buffer and _rawBuffer.
+/// Default: NO (historical intentional-leak policy for live/preview paths).
+/// Set to YES only for one-shot serial export sessions (VGImageExportSession).
+@property (nonatomic, readonly) BOOL releaseBuffersOnInvalidate;
 
 /// Display-correct pixel dimensions of the decoded image.
 /// Set during prepareWithCompletion: from UIImage.size, which already applies EXIF

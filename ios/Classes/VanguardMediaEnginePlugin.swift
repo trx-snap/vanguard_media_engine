@@ -2769,7 +2769,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             let sourceURL = URL(fileURLWithPath: sourcePath)
             let metalDevice = VGResourceAllocator.sharedInstance().metalDevice
             let processor = VanguardImageProcessor(device: metalDevice, pool: nil)
-            let source = VanguardImageMediaSource(url: sourceURL, processor: processor)
+            // Slice-A memory fix: this source is a one-shot serial export session.
+            // No concurrent IOSurface allocations can race, so it is safe to
+            // release pixel buffers on invalidate (~97 MB reclaimed per export).
+            let source = VanguardImageMediaSource(url: sourceURL,
+                                                  processor: processor,
+                                                  releaseBuffersOnInvalidate: true)
 
             // ── Phase 10-C-3L.1C: Parse filter chain from 'filters' argument ──
             //
@@ -2782,7 +2787,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // Unknown types are logged and skipped (forward-compatible).
             var filterChain: [Any]? = nil
             if let filterDicts = args["filters"] as? [[String: Any]], !filterDicts.isEmpty {
-                var nodes: [VGLegacyFilterAdapter] = []
+                // Pass raw filter/node objects — VGImageExportSession.m wraps them
+                // in VGLegacyFilterAdapter exactly once. Wrapping here causes double-wrap
+                // which makes the outer adapter call prepareWithCompletion: on the inner
+                // adapter (which does not implement that selector → NSInvalidArgumentException).
+                var nodes: [Any] = []
                 for filterDict in filterDicts {
                     guard let type = filterDict["type"] as? String else { continue }
                     let enabled = filterDict["enabled"] as? Bool ?? true
@@ -2811,7 +2820,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                                                            device: metalDevice,
                                                            matrix: matrixNumbers)
                         node.enabled = enabled
-                        nodes.append(VGLegacyFilterAdapter(filter: node))
+                        nodes.append(node)
 
                     case "transform":
                         // Phase 10-C-3L.1D: spatial transform for still-image export.
@@ -2936,7 +2945,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                             cropRect:     cropRectNumbers
                         )
                         transformNode.enabled = enabled
-                        nodes.append(VGLegacyFilterAdapter(filter: transformNode))
+                        nodes.append(transformNode)
 
                     default:
                         NSLog("[VanguardPlugin] exportImage: Unknown filter type '\(type)'. Skipping.")

@@ -1122,13 +1122,70 @@ static os_log_t _rendererLog;
     _displayLink = nil;
   }
 
-  // INTENTIONAL LEAK (KEEP TEMPORARILY): Do NOT call CVPixelBufferRelease /
-  // CFRelease on IOSurface-backed resources while other sessions may be
-  // rendering. Fence waits in the kernel cause 5+ min deadlocks. OS reclaims
-  // all IOSurface/GPU memory at process exit.
+  // ── C2: GPU-fence deferred _latestPixelBuffer release ─────────────────────
+  //
+  // Historical context: _latestPixelBuffer was intentionally leaked (set to
+  // NULL without CVPixelBufferRelease) because synchronous release on the
+  // renderer thread while the GPU still had active IOSurface fences could
+  // trigger 5+ minute kernel-level deadlocks.
+  //
+  // Fix (C2): Capture the buffer, submit an empty sentinel command buffer on
+  // the renderer's own _commandQueue, and release the pixel buffer in the
+  // completion handler — after the GPU has drained all preceding work on this
+  // queue. This pattern is architecturally identical to VanguardGraphRuntime
+  // invalidateAsync (P4-8, lines 819-891) and proven safe in production.
+  //
+  // Defence-in-depth: A 5-second dispatch_after fallback releases the buffer
+  // unconditionally if the GPU device is lost or the fence never fires.
+  // An atomic flag prevents double-release across both paths.
   os_unfair_lock_lock(&_pixelBufferLock);
+  CVPixelBufferRef capturedBuffer = _latestPixelBuffer;
   _latestPixelBuffer = NULL;
   os_unfair_lock_unlock(&_pixelBufferLock);
+
+  if (capturedBuffer) {
+    id<MTLCommandQueue> sentinelQueue = _commandQueue;
+    id<MTLCommandBuffer> sentinelBuf =
+        sentinelQueue ? [sentinelQueue commandBuffer] : nil;
+
+    __block _Atomic(BOOL) bufferReleased = NO;
+
+    if (sentinelBuf) {
+      // Primary path: GPU fence via addCompletedHandler:.
+      [sentinelBuf addCompletedHandler:^(id<MTLCommandBuffer> __unused cb) {
+        BOOL already = atomic_exchange(&bufferReleased, YES);
+        if (!already) {
+          CVPixelBufferRelease(capturedBuffer);
+          NSLog(@"[VanguardRenderer] C2: _latestPixelBuffer=%p released via "
+                @"GPU fence",
+                capturedBuffer);
+        }
+      }];
+      [sentinelBuf commit];
+    } else {
+      // No command queue available — the dispatch_after fallback below is the
+      // only release path. Log for diagnostics.
+      NSLog(@"[VanguardRenderer] C2: _latestPixelBuffer=%p no command queue — "
+            @"relying on dispatch_after fallback",
+            capturedBuffer);
+    }
+
+    // Fallback: unconditional 5-second timer. If the fence handler already
+    // ran, the CAS makes this a no-op (zero cost). If the device was lost
+    // and the fence never fires, this reclaims the buffer.
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+        dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
+          BOOL already = atomic_exchange(&bufferReleased, YES);
+          if (!already) {
+            CVPixelBufferRelease(capturedBuffer);
+            NSLog(@"[VanguardRenderer] C2: GPU fence timeout — "
+                  @"_latestPixelBuffer=%p released via dispatch_after fallback",
+                  capturedBuffer);
+          }
+        });
+  }
+
   // P4-7C: _pixelBufferPool = NULL removed — renderer-owned pool deleted.
   _textureCache = NULL;
 }
