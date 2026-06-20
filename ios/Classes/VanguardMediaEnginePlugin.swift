@@ -2697,6 +2697,158 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 ))
             }
 
+        case "exportImage":
+            guard let args = args,
+                  let sourcePath = args["sourcePath"] as? String,
+                  let outputPath = args["outputPath"] as? String,
+                  let format = args["format"] as? String,
+                  let quality = args["quality"] as? Double,
+                  let orientationPolicy = args["orientationPolicy"] as? String else {
+                result(FlutterError(code: "EXPORT_IMAGE_INVALID_ARGUMENTS",
+                                    message: "Missing or invalid arguments for exportImage",
+                                    details: nil))
+                return
+            }
+
+            let fileManager = FileManager.default
+            guard fileManager.fileExists(atPath: sourcePath) else {
+                result(FlutterError(code: "EXPORT_IMAGE_INVALID_ARGUMENTS",
+                                    message: "Source image file does not exist at: \(sourcePath)",
+                                    details: nil))
+                return
+            }
+
+            let outputURL = URL(fileURLWithPath: outputPath)
+            let parentDir = outputURL.deletingLastPathComponent().path
+            var isDir: ObjCBool = false
+            guard fileManager.fileExists(atPath: parentDir, isDirectory: &isDir), isDir.boolValue else {
+                result(FlutterError(code: "EXPORT_IMAGE_INVALID_ARGUMENTS",
+                                    message: "Output parent directory does not exist: \(parentDir)",
+                                    details: nil))
+                return
+            }
+
+            let mappedFormat: VGImageEncodeFormat
+            let fmtLower = format.lowercased()
+            if fmtLower == "jpeg" || fmtLower == "jpg" {
+                mappedFormat = VGImageEncodeFormat(rawValue: 0)!
+            } else if fmtLower == "heic" || fmtLower == "heif" {
+                mappedFormat = VGImageEncodeFormat(rawValue: 1)!
+            } else if fmtLower == "png" {
+                mappedFormat = VGImageEncodeFormat(rawValue: 2)!
+            } else if fmtLower == "webp" {
+                result(FlutterError(code: "EXPORT_IMAGE_UNSUPPORTED_FORMAT",
+                                    message: "WebP still image encoding is not supported on iOS via ImageIO",
+                                    details: nil))
+                return
+            } else {
+                result(FlutterError(code: "EXPORT_IMAGE_UNSUPPORTED_FORMAT",
+                                    message: "Unsupported image format: \(format)",
+                                    details: nil))
+                return
+            }
+
+            let orientPolicy: VGImageOrientationPolicyType
+            let orientLower = orientationPolicy.lowercased()
+            if orientLower == "preserve" {
+                orientPolicy = VGImageOrientationPolicyType(rawValue: 0)!
+            } else if orientLower == "applyandrotate" {
+                orientPolicy = VGImageOrientationPolicyType(rawValue: 1)!
+            } else {
+                result(FlutterError(code: "EXPORT_IMAGE_INVALID_ARGUMENTS",
+                                    message: "Invalid orientation policy: \(orientationPolicy)",
+                                    details: nil))
+                return
+            }
+
+            let profile = VGImageExportProfile(format: mappedFormat,
+                                               quality: Float(quality),
+                                               colorProfilePolicy: VGImageColorProfilePolicyType(rawValue: 0)!,
+                                               orientationPolicy: orientPolicy)
+
+            let sourceURL = URL(fileURLWithPath: sourcePath)
+            let metalDevice = VGResourceAllocator.sharedInstance().metalDevice
+            let processor = VanguardImageProcessor(device: metalDevice, pool: nil)
+            let source = VanguardImageMediaSource(url: sourceURL, processor: processor)
+
+            // ── Phase 10-C-3L.1C: Parse filter chain from 'filters' argument ──
+            //
+            // Dart sends filters as [[String: Any]] where each dict has keys:
+            //   'type' (String), 'enabled' (Bool), 'parameters' (Map).
+            //
+            // Supported type in this slice: 'colorMatrix'
+            //   parameters['matrix']: [Any] of exactly 20 numeric elements
+            //
+            // Unknown types are logged and skipped (forward-compatible).
+            var filterChain: [Any]? = nil
+            if let filterDicts = args["filters"] as? [[String: Any]], !filterDicts.isEmpty {
+                var nodes: [VGLegacyFilterAdapter] = []
+                for filterDict in filterDicts {
+                    guard let type = filterDict["type"] as? String else { continue }
+                    let enabled = filterDict["enabled"] as? Bool ?? true
+                    let parameters = filterDict["parameters"] as? [String: Any] ?? [:]
+
+                    switch type {
+                    case "colorMatrix":
+                        guard let rawMatrix = parameters["matrix"] as? [Any],
+                              rawMatrix.count == 20 else {
+                            NSLog("[VanguardPlugin] exportImage: 'colorMatrix' filter " +
+                                  "missing or invalid 'matrix' (expected 20 elements). Skipping.")
+                            continue
+                        }
+                        let matrixNumbers: [NSNumber] = rawMatrix.compactMap {
+                            if let n = $0 as? NSNumber { return n }
+                            if let d = $0 as? Double    { return NSNumber(value: d) }
+                            if let i = $0 as? Int       { return NSNumber(value: i) }
+                            return nil
+                        }
+                        guard matrixNumbers.count == 20 else {
+                            NSLog("[VanguardPlugin] exportImage: 'colorMatrix' coercion " +
+                                  "failed (\(matrixNumbers.count)/20 valid). Skipping.")
+                            continue
+                        }
+                        let node = VGColorMatrixFilterNode(pool: nil,
+                                                           device: metalDevice,
+                                                           matrix: matrixNumbers)
+                        node.enabled = enabled
+                        nodes.append(VGLegacyFilterAdapter(filter: node))
+
+                    default:
+                        NSLog("[VanguardPlugin] exportImage: Unknown filter type '\(type)'. Skipping.")
+                    }
+                }
+                filterChain = nodes.isEmpty ? nil : nodes
+            }
+
+            let exportSession = VGImageExportSession(source: source,
+                                                     filterChain: filterChain,
+                                                     profile: profile,
+                                                     outputURL: outputURL)
+
+            exportSession.start { manifest, error in
+                DispatchQueue.main.async {
+                    if let error = error {
+                        result(FlutterError(code: "EXPORT_IMAGE_FAILED",
+                                            message: "VGImageExportSession failed: \(error.localizedDescription)",
+                                            details: nil))
+                    } else if let manifest = manifest {
+                        let response: [String: Any] = [
+                            "success": true,
+                            "path": outputPath,
+                            "width": Int(manifest.width),
+                            "height": Int(manifest.height),
+                            "format": format,
+                            "fileSizeBytes": Int64(manifest.fileSizeBytes)
+                        ]
+                        result(response)
+                    } else {
+                        result(FlutterError(code: "EXPORT_IMAGE_FAILED",
+                                            message: "VGImageExportSession returned neither manifest nor error",
+                                            details: nil))
+                    }
+                }
+            }
+
         // ── Export ─────────────────────────────────────────────────────────────
 
         case "startExport":

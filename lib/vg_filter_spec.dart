@@ -72,6 +72,8 @@ final class VGFilterSpec {
   /// - `'lut'`          → `'intensity'` (double, 0.0–1.0)
   /// - `'beauty'`       → `'intensity'` (double, 0.0–1.0), `'radius'` (double)
   /// - `'segmentation'` → (none in Phase 3; reserved for Phase 4)
+  /// - `'colorMatrix'`  → `'matrix'` (`List<double>`, exactly 20 elements,
+  ///                      4×5 row-major matching Flutter's [ColorFilter.matrix])
   ///
   /// Values must be JSON-serialisable. The map is passed through to native
   /// verbatim; native ignores unknown keys.
@@ -127,7 +129,7 @@ bool _mapEquals(Map<String, Object?> a, Map<String, Object?> b) {
 /// The native plugin's `setFilterChain` handler maps each type to a concrete
 /// filter node class. Extend this set when a new filter node is added to both
 /// the native handler and the UMF protocol conformers.
-const Set<String> _validTypes = {'lut', 'beauty', 'segmentation'};
+const Set<String> _validTypes = {'lut', 'beauty', 'segmentation', 'colorMatrix'};
 
 /// Typed factory constructors and validation for [VGFilterSpec].
 ///
@@ -147,10 +149,8 @@ extension VGFilterSpecs on VGFilterSpec {
   ///
   /// [intensity] controls the blend between the identity and the loaded LUT
   /// [0.0, 1.0]. Defaults to 1.0 (full LUT).
-  static VGFilterSpec lut({double intensity = 1.0}) => VGFilterSpec(
-        type: 'lut',
-        parameters: {'intensity': intensity},
-      );
+  static VGFilterSpec lut({double intensity = 1.0}) =>
+      VGFilterSpec(type: 'lut', parameters: {'intensity': intensity});
 
   /// Creates a beauty (bilateral skin-smoothing) filter.
   ///
@@ -253,50 +253,65 @@ extension VGFilterSpecs on VGFilterSpec {
     final bool isV2 = beautyVersion != 1;
     final params = <String, Object?>{
       'intensity': intensity,
-      if (!isV2) 'radius': radius,              // V1: always send radius
+      if (!isV2) 'radius': radius, // V1: always send radius
       if (isV2 && radius != 2.0) 'radius': radius, // V2: only when overridden
       if (isV2) 'beautyVersion': beautyVersion,
       // DEV granular overrides (V2 only):
-      if (isV2 && sigma          != null) 'sigma':          sigma,
-      if (isV2 && rangeSigma     != null) 'rangeSigma':     rangeSigma,
+      if (isV2 && sigma != null) 'sigma': sigma,
+      if (isV2 && rangeSigma != null) 'rangeSigma': rangeSigma,
       if (isV2 && smoothStrength != null) 'smoothStrength': smoothStrength,
-      if (isV2 && theta          != null) 'theta':          theta,
-      if (isV2 && sharpenStrength!= null) 'sharpenStrength':sharpenStrength,
+      if (isV2 && theta != null) 'theta': theta,
+      if (isV2 && sharpenStrength != null) 'sharpenStrength': sharpenStrength,
       // Phase 4B.6 (DEC-60) DEV overrides:
-      if (isV2 && detailDamping  != null) 'detailDamping':  detailDamping,
-      if (isV2 && toneStrength   != null) 'toneStrength':   toneStrength,
-      if (isV2 && midtoneLift    != null) 'midtoneLift':    midtoneLift,
+      if (isV2 && detailDamping != null) 'detailDamping': detailDamping,
+      if (isV2 && toneStrength != null) 'toneStrength': toneStrength,
+      if (isV2 && midtoneLift != null) 'midtoneLift': midtoneLift,
       // Phase 4C (DEC-61/63): only send when true — omit = default NO on native.
       if (isV2 && faceAwareEnabled) 'faceAwareEnabled': true,
       // Phase 4C.1 (DEC-66/67): face-boost overrides (V2 only, null-safe).
       // Independent of hasGranular — do not disable intensity ramp.
-      if (isV2 && faceSmoothBoost   != null) 'faceSmoothBoost':   faceSmoothBoost,
-      if (isV2 && faceToneBoost     != null) 'faceToneBoost':     faceToneBoost,
-      if (isV2 && faceLiftBoost     != null) 'faceLiftBoost':     faceLiftBoost,
-      if (isV2 && faceDampingReduce != null) 'faceDampingReduce': faceDampingReduce,
+      if (isV2 && faceSmoothBoost != null) 'faceSmoothBoost': faceSmoothBoost,
+      if (isV2 && faceToneBoost != null) 'faceToneBoost': faceToneBoost,
+      if (isV2 && faceLiftBoost != null) 'faceLiftBoost': faceLiftBoost,
+      if (isV2 && faceDampingReduce != null)
+        'faceDampingReduce': faceDampingReduce,
       // Phase 4C.2 (DEC-70/71): color aesthetic overrides (V2 only, null-safe).
       // Independent of hasGranular — do not disable intensity ramp.
-      if (isV2 && faceWhitenStrength    != null) 'faceWhitenStrength':    faceWhitenStrength,
-      if (isV2 && faceRosyStrength      != null) 'faceRosyStrength':      faceRosyStrength,
-      if (isV2 && faceToneUnifyStrength != null) 'faceToneUnifyStrength': faceToneUnifyStrength,
-      if (isV2 && faceGlowStrength      != null) 'faceGlowStrength':      faceGlowStrength,
+      if (isV2 && faceWhitenStrength != null)
+        'faceWhitenStrength': faceWhitenStrength,
+      if (isV2 && faceRosyStrength != null)
+        'faceRosyStrength': faceRosyStrength,
+      if (isV2 && faceToneUnifyStrength != null)
+        'faceToneUnifyStrength': faceToneUnifyStrength,
+      if (isV2 && faceGlowStrength != null)
+        'faceGlowStrength': faceGlowStrength,
       // Phase 4C.3 (DEC-76/78): feature protection & enhancement overrides (V2 only, null-safe).
       // Independent of hasGranular — do not disable intensity ramp.
-      if (isV2 && featureRestoreStrength != null) 'featureRestoreStrength': featureRestoreStrength,
-      if (isV2 && featureDetailRestore   != null) 'featureDetailRestore':   featureDetailRestore,
-      if (isV2 && featureContrastBoost   != null) 'featureContrastBoost':   featureContrastBoost,
-      if (isV2 && featureSatBoost        != null) 'featureSatBoost':        featureSatBoost,
+      if (isV2 && featureRestoreStrength != null)
+        'featureRestoreStrength': featureRestoreStrength,
+      if (isV2 && featureDetailRestore != null)
+        'featureDetailRestore': featureDetailRestore,
+      if (isV2 && featureContrastBoost != null)
+        'featureContrastBoost': featureContrastBoost,
+      if (isV2 && featureSatBoost != null) 'featureSatBoost': featureSatBoost,
       // Phase 4D (DEC-82/84): perceptual feature enhancement overrides (V2 only, null-safe).
       // Independent of hasGranular — do not disable intensity ramp.
-      if (isV2 && eyeEnhanceStrength  != null) 'eyeEnhanceStrength':  eyeEnhanceStrength,
-      if (isV2 && lipEnhanceStrength  != null) 'lipEnhanceStrength':  lipEnhanceStrength,
-      if (isV2 && browEnhanceStrength != null) 'browEnhanceStrength': browEnhanceStrength,
+      if (isV2 && eyeEnhanceStrength != null)
+        'eyeEnhanceStrength': eyeEnhanceStrength,
+      if (isV2 && lipEnhanceStrength != null)
+        'lipEnhanceStrength': lipEnhanceStrength,
+      if (isV2 && browEnhanceStrength != null)
+        'browEnhanceStrength': browEnhanceStrength,
       // Phase 4E (DEC-90/92): tone polish layer overrides (V2 only, null-safe).
       // Independent of hasGranular — do not disable intensity ramp.
-      if (isV2 && polishGlowStrength   != null) 'polishGlowStrength':   polishGlowStrength,
-      if (isV2 && polishSmoothStrength != null) 'polishSmoothStrength': polishSmoothStrength,
-      if (isV2 && polishWarmthStrength != null) 'polishWarmthStrength': polishWarmthStrength,
-      if (isV2 && polishBloomStrength  != null) 'polishBloomStrength':  polishBloomStrength,
+      if (isV2 && polishGlowStrength != null)
+        'polishGlowStrength': polishGlowStrength,
+      if (isV2 && polishSmoothStrength != null)
+        'polishSmoothStrength': polishSmoothStrength,
+      if (isV2 && polishWarmthStrength != null)
+        'polishWarmthStrength': polishWarmthStrength,
+      if (isV2 && polishBloomStrength != null)
+        'polishBloomStrength': polishBloomStrength,
     };
     return VGFilterSpec(type: 'beauty', parameters: params);
   }
@@ -307,6 +322,45 @@ extension VGFilterSpecs on VGFilterSpec {
   /// on the native side.
   static VGFilterSpec segmentation() =>
       const VGFilterSpec(type: 'segmentation');
+
+  /// Creates a color-matrix filter for still-image export.
+  ///
+  /// [matrix] must be exactly 20 floats arranged as a 4×5 row-major matrix
+  /// matching Flutter's [ColorFilter.matrix] convention:
+  ///
+  /// ```
+  ///   Columns : [R_in, G_in, B_in, A_in, constant]
+  ///   Rows    : [R_out, G_out, B_out, A_out]
+  /// ```
+  ///
+  /// The constant term (column 4) is treated as a 0–255 additive offset;
+  /// the native kernel divides by 255.0 internally.
+  ///
+  /// Throws an [AssertionError] in debug builds if [matrix].length ≠ 20.
+  ///
+  /// Example — identity matrix:
+  /// ```dart
+  /// VGFilterSpecs.colorMatrix(matrix: [
+  ///   1, 0, 0, 0, 0,
+  ///   0, 1, 0, 0, 0,
+  ///   0, 0, 1, 0, 0,
+  ///   0, 0, 0, 1, 0,
+  /// ]);
+  /// ```
+  ///
+  /// Phase 10-C-3L.1C — still-image export only.
+  /// Do NOT use for live preview (use Flutter [ColorFilter.matrix] there).
+  static VGFilterSpec colorMatrix({required List<double> matrix}) {
+    assert(
+      matrix.length == 20,
+      'VGFilterSpecs.colorMatrix: matrix must have exactly 20 elements '
+      '(4×5 row-major). Got ${matrix.length}.',
+    );
+    return VGFilterSpec(
+      type: 'colorMatrix',
+      parameters: {'matrix': List<double>.unmodifiable(matrix)},
+    );
+  }
 
   /// Asserts that this spec's [type] is recognised by the native plugin.
   ///

@@ -71,7 +71,6 @@ export 'vg_waveform_cache.dart';
 // Phase 7.20D: Dart model for reverse sidecar asset state.
 export 'vg_reverse_sidecar_status.dart';
 
-
 const String _libName = 'vanguard_media_engine';
 
 /// The dynamic library in which the symbols for [VanguardMediaEngineBindings] can be found.
@@ -697,6 +696,26 @@ class VanguardEngine {
       'width': (raw['width'] as num?)?.toInt() ?? 0,
       'height': (raw['height'] as num?)?.toInt() ?? 0,
     };
+  }
+
+  /// Exposes native still-image export session.
+  static Future<Map<String, dynamic>> exportImage({
+    required String sourcePath,
+    required String outputPath,
+    String format = 'jpeg',
+    double quality = 0.92,
+    List<Map<String, dynamic>> filters = const [],
+    String orientationPolicy = 'preserve',
+  }) async {
+    final result = await _cameraChannel.invokeMethod<Map>('exportImage', {
+      'sourcePath': sourcePath,
+      'outputPath': outputPath,
+      'format': format,
+      'quality': quality,
+      'filters': filters,
+      'orientationPolicy': orientationPolicy,
+    });
+    return Map<String, dynamic>.from(result ?? {});
   }
 
   /// Phase 3A: iOS-native static-image-to-video exporter.

@@ -716,6 +716,74 @@ kernel void vanguard_beauty_composite(
         finalRGB = mix(orig.rgb, polishedRGB, half(m));
     }
 
+
     // 9. Alpha preserved from original (unchanged).
     outTex.write(half4(finalRGB, orig.a), gid);
+}
+
+// =============================================================================
+// MARK: Color Matrix Apply — Phase 10-C-3L.1C
+//
+// Applies a 4×5 row-major color matrix to each pixel, matching the layout
+// used by Flutter's ColorFilter.matrix:
+//   Columns : [R_in, G_in, B_in, A_in, constant]
+//   Rows    : [R_out, G_out, B_out, A_out]
+//
+// The constant term (column 4) follows Flutter convention: a value in [0, 255]
+// that is divided by 255.0 before being added to the normalised [0,1] output.
+//
+// Metal pixel format: MTLPixelFormatBGRA8Unorm.
+// Metal auto-swizzles to logical RGBA channels: .r=R, .g=G, .b=B, .a=A.
+//
+// buffer(0): 20 contiguous floats (4 rows × 5 columns, row-major order).
+// texture(0): BGRA8 read.
+// texture(1): BGRA8 write.
+// =============================================================================
+
+struct ColorMatrixParams {
+    float m[20]; // 4 rows × 5 cols, row-major. Matches Flutter ColorFilter.matrix.
+};
+
+kernel void vanguard_color_matrix_apply(
+    texture2d<half, access::read>  inTex  [[texture(0)]],
+    texture2d<half, access::write> outTex [[texture(1)]],
+    constant ColorMatrixParams&    cm     [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= outTex.get_width() || gid.y >= outTex.get_height()) return;
+
+    half4 p = inTex.read(gid);  // Metal BGRA8 auto-swizzled: .r=R, .g=G, .b=B, .a=A
+
+    // Row 0: R_out = m[0]*R + m[1]*G + m[2]*B + m[3]*A + m[4]/255
+    float r = cm.m[0]  * float(p.r)
+            + cm.m[1]  * float(p.g)
+            + cm.m[2]  * float(p.b)
+            + cm.m[3]  * float(p.a)
+            + cm.m[4]  / 255.0f;
+
+    // Row 1: G_out = m[5]*R + m[6]*G + m[7]*B + m[8]*A + m[9]/255
+    float g = cm.m[5]  * float(p.r)
+            + cm.m[6]  * float(p.g)
+            + cm.m[7]  * float(p.b)
+            + cm.m[8]  * float(p.a)
+            + cm.m[9]  / 255.0f;
+
+    // Row 2: B_out = m[10]*R + m[11]*G + m[12]*B + m[13]*A + m[14]/255
+    float b = cm.m[10] * float(p.r)
+            + cm.m[11] * float(p.g)
+            + cm.m[12] * float(p.b)
+            + cm.m[13] * float(p.a)
+            + cm.m[14] / 255.0f;
+
+    // Row 3: A_out = m[15]*R + m[16]*G + m[17]*B + m[18]*A + m[19]/255
+    float a = cm.m[15] * float(p.r)
+            + cm.m[16] * float(p.g)
+            + cm.m[17] * float(p.b)
+            + cm.m[18] * float(p.a)
+            + cm.m[19] / 255.0f;
+
+    outTex.write(half4(half(clamp(r, 0.0f, 1.0f)),
+                       half(clamp(g, 0.0f, 1.0f)),
+                       half(clamp(b, 0.0f, 1.0f)),
+                       half(clamp(a, 0.0f, 1.0f))), gid);
 }
