@@ -28,7 +28,7 @@ typedef void (^VanguardEncodedPacketHandler)(NSData *_Nullable nalData,
 // MARK: - Initializers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Phase 5B designated initializer — dual-mode encoder.
+/// Phase 5B/10-C designated initializer — dual-mode encoder.
 ///
 /// Creates a VTCompressionSession for the specified codec, profile, and usage.
 /// VT properties are set according to §A.1 of 01_encoder_export_foundation.md.
@@ -40,6 +40,10 @@ typedef void (^VanguardEncodedPacketHandler)(NSData *_Nullable nalData,
 /// @param codecType      kCMVideoCodecType_H264 or kCMVideoCodecType_HEVC
 /// @param profileLevel   VT profile-level string (e.g. kVTProfileLevel_H264_Baseline_4_0)
 /// @param usage          VGEncoderUsageRealtime or VGEncoderUsageOffline
+/// @param quality        Quality for offline CQ mode. Pass 0.0f for bitrate-driven mode
+///                       (kVTCompressionPropertyKey_Quality is NOT set, AverageBitRate
+///                       controls rate). Pass 0.0f–1.0f to enable quality-driven mode.
+///                       Ignored when usage == VGEncoderUsageRealtime.
 /// @param handler        Called for each encoded NAL unit (camera path). May be nil.
 - (instancetype)initWithWidth:(int)width
                        height:(int)height
@@ -48,6 +52,7 @@ typedef void (^VanguardEncodedPacketHandler)(NSData *_Nullable nalData,
                     codecType:(CMVideoCodecType)codecType
                  profileLevel:(NSString *)profileLevel
                         usage:(VGEncoderUsage)usage
+                      quality:(float)quality
                 packetHandler:(nullable VanguardEncodedPacketHandler)handler
     NS_DESIGNATED_INITIALIZER;
 

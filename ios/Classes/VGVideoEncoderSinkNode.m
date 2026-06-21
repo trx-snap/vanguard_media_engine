@@ -164,6 +164,7 @@ NS_ASSUME_NONNULL_BEGIN
             codecType:_profile.codecType
          profileLevel:_profile.profileLevel
                 usage:VGEncoderUsageOffline
+             quality:(float)_profile.quality   // Phase 10-C: 0.0 = bitrate-driven; >0 = CQ mode
         packetHandler:nil];  // No Annex-B NAL path for export
 
     if (!_encoder.isReady) {

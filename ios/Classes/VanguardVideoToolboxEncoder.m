@@ -73,6 +73,8 @@ static void vtOutputCallback(void *outputCallbackRefCon,
     CMVideoCodecType _codecType;
     NSString *_profileLevel;        // ARC-managed; bridged to CFStringRef at VT call site.
     VGEncoderUsage _usage;
+    // Phase 10-C: quality for offline CQ mode. 0.0f = bitrate-driven (Quality NOT set).
+    float _quality;
     // Readiness and prewarm state.
     BOOL _isReady;
     BOOL _prewarming;
@@ -118,6 +120,7 @@ static void vtOutputCallback(void *outputCallbackRefCon,
                     codecType:(CMVideoCodecType)codecType
                  profileLevel:(NSString *)profileLevel
                         usage:(VGEncoderUsage)usage
+                      quality:(float)quality
                 packetHandler:(nullable VanguardEncodedPacketHandler)handler {
     NSParameterAssert(width > 0);
     NSParameterAssert(height > 0);
@@ -135,6 +138,8 @@ static void vtOutputCallback(void *outputCallbackRefCon,
     _codecType     = codecType;
     _profileLevel  = [profileLevel copy];
     _usage         = usage;
+    // Phase 10-C: clamp to [0.0, 1.0]; 0.0 = bitrate-driven (Quality NOT set).
+    _quality       = MAX(0.0f, MIN(1.0f, quality));
     _packetHandler = [handler copy];
 
     _isReady         = NO;
@@ -151,7 +156,7 @@ static void vtOutputCallback(void *outputCallbackRefCon,
 }
 
 /// Phase 4 backward-compatible convenience initializer.
-/// Calls the 8-arg designated init with H.264 / Baseline 4.0 / Realtime defaults.
+/// Calls the 9-arg designated init with H.264 / Baseline 4.0 / Realtime / quality=0.0 defaults.
 /// All existing Swift call sites remain unmodified.
 - (instancetype)initWithWidth:(int)width
                        height:(int)height
@@ -165,6 +170,7 @@ static void vtOutputCallback(void *outputCallbackRefCon,
                      codecType:kCMVideoCodecType_H264
                   profileLevel:(__bridge NSString *)kVTProfileLevel_H264_Baseline_4_0
                          usage:VGEncoderUsageRealtime
+                       quality:0.0f
                  packetHandler:handler];
 }
 
@@ -219,11 +225,18 @@ static void vtOutputCallback(void *outputCallbackRefCon,
         VTSessionSetProperty(_session, kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kfDurRef);
         CFRelease(kfDurRef);
 
-        // #8: Quality (offline only) = 1.0
-        Float32 qualityVal = 1.0f;
-        CFNumberRef qualityRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloat32Type, &qualityVal);
-        VTSessionSetProperty(_session, kVTCompressionPropertyKey_Quality, qualityRef);
-        CFRelease(qualityRef);
+        // #8: Quality (offline only) — conditional.
+        // Phase 10-C: only set Quality when _quality > 0.0f.
+        // When _quality == 0.0f (bitrate-driven mode), Quality is intentionally NOT set
+        // so that kVTCompressionPropertyKey_AverageBitRate controls the rate.
+        // Setting Quality=1.0 unconditionally triggers CQ mode and overrides AverageBitRate,
+        // causing the ~181 Mbps export bug observed in Phase 10-C validation.
+        if (_quality > 0.0f) {
+            Float32 qualityVal = _quality;
+            CFNumberRef qualityRef = CFNumberCreate(kCFAllocatorDefault, kCFNumberFloat32Type, &qualityVal);
+            VTSessionSetProperty(_session, kVTCompressionPropertyKey_Quality, qualityRef);
+            CFRelease(qualityRef);
+        }
 
         // #9: AllowFrameReordering = YES (B-frames for offline)
         VTSessionSetProperty(_session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanTrue);
