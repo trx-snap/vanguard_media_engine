@@ -72,6 +72,8 @@ export 'vg_waveform_cache.dart';
 export 'vg_reverse_sidecar_status.dart';
 // Phase 10-C: one-shot headless timeline export API (no controller, no texture).
 export 'vg_timeline_exporter.dart';
+// Phase 10-C: shared media-stack image optimizer (UMF/Vanguard owned; no FFmpeg).
+export 'vg_image_optimizer.dart';
 
 const String _libName = 'vanguard_media_engine';
 

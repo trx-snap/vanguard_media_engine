@@ -5204,6 +5204,289 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(nil)
             }
 
+        // ── Phase 10-C: Shared media-stack image optimizer ────────────────────
+        //
+        // Args: {
+        //   'sourcePath':           String  (required, absolute local path)
+        //   'outputPath':           String? (optional, nil → temp file)
+        //   'maxWidth':             Int?    (optional, cap on output width)
+        //   'maxHeight':            Int?    (optional, cap on output height)
+        //   'maxLongEdge':          Int?    (optional, cap on max(width, height))
+        //   'fileSizeTargetBytes':  Int?    (optional, advisory-only in v1)
+        //   'quality':              Double? (optional, default 0.80, clamped 0.0–1.0)
+        //   'format':               String? ("jpeg"|"jpg"|"heic"|"png", default "jpeg")
+        //   'stripMetadata':        Bool    (default true; v1 always strips via re-encode)
+        //   'normalizeOrientation': Bool    (default true; v1 always normalises via UIImage)
+        //   'colorPolicy':          String? (advisory-only in v1, e.g. "sdr_rec709")
+        //   'destinationIntent':    String? (advisory-only in v1, e.g. "story")
+        // }
+        //
+        // Returns: {
+        //   'success':       Bool
+        //   'outputPath':    String
+        //   'width':         Int
+        //   'height':        Int
+        //   'fileSizeBytes': Int
+        //   'format':        String  (actual format after platform resolution)
+        // }
+        //
+        // Resize algorithm (single-pass bounding-box, no upscale, no crop):
+        //   scale = 1.0
+        //   if maxLongEdge > 0: scale = min(scale, maxLongEdge / max(srcW, srcH))
+        //   if maxWidth    > 0: scale = min(scale, maxWidth    / srcW)
+        //   if maxHeight   > 0: scale = min(scale, maxHeight   / srcH)
+        //   scale = min(scale, 1.0)   // never upscale
+        //   targetW = max(1, round(srcW * scale))
+        //   targetH = max(1, round(srcH * scale))
+        //
+        // Native pipeline:
+        //   VanguardImageMediaSource (UIImage orientation bake)
+        //   → VGTransformFilterNode (downscale via CIImage/Metal, nil pool)
+        //   → VGImageExportSession (pull-mode coordinator)
+        //   → VGImageEncoderSinkNode (ImageIO JPEG/HEIC/PNG encode)
+        //
+        // Threading: work dispatched on a background queue; result() called
+        // on main thread (matches exportTimeline / normalizeVideo pattern).
+        //
+        // Metadata stripping: always implicit in v1 — the re-encode path does
+        // not copy source EXIF metadata into the CGImageDestination.
+        // When stripMetadata=false is requested, the same re-encode path is
+        // used; full metadata-preservation support is deferred to v2.
+        //
+        // Orientation: always normalised in v1 via UIImage decode path.
+        // When normalizeOrientation=false is requested, the same UIImage
+        // decode path is used; selective orientation-preservation is v2.
+        case "optimizeImage":
+            guard let sourcePath = args?["sourcePath"] as? String,
+                  !sourcePath.isEmpty else {
+                result(FlutterError(
+                    code: "MISSING_SOURCE_PATH",
+                    message: "optimizeImage: 'sourcePath' is required and must be non-empty",
+                    details: nil))
+                return
+            }
+
+            guard FileManager.default.isReadableFile(atPath: sourcePath) else {
+                result(FlutterError(
+                    code: "FILE_UNREADABLE",
+                    message: "optimizeImage: file does not exist or is unreadable at path: \(sourcePath)",
+                    details: nil))
+                return
+            }
+
+            // Parse optional parameters with documented native defaults.
+            // ── Resize bounds (UMF contract keys: maxWidth, maxHeight, maxLongEdge) ──
+            let maxLongEdge: Int? = (args?["maxLongEdge"] as? NSNumber).map { $0.intValue > 0 ? $0.intValue : nil } ?? nil
+            let maxWidth:    Int? = (args?["maxWidth"]    as? NSNumber).map { $0.intValue > 0 ? $0.intValue : nil } ?? nil
+            let maxHeight:   Int? = (args?["maxHeight"]   as? NSNumber).map { $0.intValue > 0 ? $0.intValue : nil } ?? nil
+
+            // ── Encode quality (UMF contract key: quality) ──────────────────────────
+            // Default 0.80. Clamped to [0.0, 1.0] by VGImageExportProfile initializer.
+            let rawQuality: Double = (args?["quality"] as? NSNumber)?.doubleValue ?? 0.80
+            let quality: Float = Float(max(0.0, min(1.0, rawQuality)))
+
+            // ── Format (UMF contract key: format) ───────────────────────────────────
+            // Supported v1 formats: "jpeg", "jpg" (alias), "heic", "png".
+            // Unsupported formats (webp, avif, jxl, unknown strings) are rejected
+            // with UNSUPPORTED_FORMAT — never silently defaulted to JPEG.
+            let rawFormat: String = (args?["format"] as? String) ?? "jpeg"
+            let formatStr: String
+            switch rawFormat.lowercased() {
+            case "jpeg", "jpg":
+                formatStr = "jpeg"
+            case "heic":
+                formatStr = "heic"
+            case "png":
+                formatStr = "png"
+            default:
+                result(FlutterError(
+                    code: "UNSUPPORTED_FORMAT",
+                    message: "optimizeImage: unsupported format '\(rawFormat)'. Supported: jpeg, jpg, heic, png.",
+                    details: nil))
+                return
+            }
+
+            // ── Advisory / v1-only fields ────────────────────────────────────────────
+            // fileSizeTargetBytes: advisory in v1; accepted and logged, not enforced.
+            // The encoder reports actual fileSizeBytes in the result manifest.
+            let fileSizeTargetBytes: Int? = (args?["fileSizeTargetBytes"] as? NSNumber).map { $0.intValue }
+
+            // stripMetadata: in v1, metadata is always stripped via the re-encode path.
+            // Accepting the field prevents unknown-key errors; actual behaviour is
+            // unchanged — CGImageDestination does not copy source EXIF.
+            let stripMetadata: Bool = (args?["stripMetadata"] as? Bool) ?? true
+
+            // normalizeOrientation: in v1, UIImage always normalises EXIF orientation
+            // via its internal decode path. Accepting the field for contract parity.
+            let normalizeOrientation: Bool = (args?["normalizeOrientation"] as? Bool) ?? true
+
+            // colorPolicy / destinationIntent: advisory-only in v1. Parsed and logged.
+            let colorPolicy: String       = (args?["colorPolicy"]      as? String) ?? "preserve"
+            let destinationIntent: String = (args?["destinationIntent"] as? String) ?? "unknown"
+
+            // Resolve output path.
+            let outputPath: String = (args?["outputPath"] as? String)
+                                     ?? (NSTemporaryDirectory() + "vg_img_opt_\(Int(Date().timeIntervalSince1970 * 1000)).jpg")
+
+            NSLog("[VanguardPlugin][10-C] optimizeImage: src=%@ maxLongEdge=%@ maxWidth=%@ maxHeight=%@ quality=%.2f format=%@ stripMetadata=%@ normalizeOrientation=%@ colorPolicy=%@ destinationIntent=%@ fileSizeTarget=%@ dst=%@",
+                  (sourcePath as NSString).lastPathComponent,
+                  maxLongEdge.map { "\($0)" } ?? "nil",
+                  maxWidth.map    { "\($0)" } ?? "nil",
+                  maxHeight.map   { "\($0)" } ?? "nil",
+                  quality, formatStr,
+                  stripMetadata         ? "YES" : "NO",
+                  normalizeOrientation  ? "YES" : "NO",
+                  colorPolicy, destinationIntent,
+                  fileSizeTargetBytes.map { "\($0)" } ?? "nil",
+                  (outputPath as NSString).lastPathComponent)
+
+            DispatchQueue.global(qos: .userInitiated).async {
+                // 1. Resolve format → VGImageExportProfile factory.
+                let profile: VGImageExportProfile
+                switch formatStr {
+                case "heic":
+                    profile = VGImageExportProfile.heicProfile(withQuality: quality)
+                case "png":
+                    profile = VGImageExportProfile.png()
+                default: // "jpeg" — already validated above
+                    profile = VGImageExportProfile.jpegProfile(withQuality: quality)
+                }
+
+                // 2. Decode source via UIImage to bake EXIF orientation.
+                //    UIImage honours imageOrientation internally; drawing it into
+                //    a CVPixelBuffer via UIGraphicsImageRenderer applies the transform.
+                //    v1 normalises orientation unconditionally via this path.
+                guard let sourceImage = UIImage(contentsOfFile: sourcePath) else {
+                    DispatchQueue.main.async {
+                        result(FlutterError(
+                            code: "DECODE_FAILED",
+                            message: "optimizeImage: UIImage could not decode source at: \(sourcePath)",
+                            details: nil))
+                    }
+                    return
+                }
+
+                // 3. Compute target canvas dimensions — single-pass bounding-box downscale.
+                //    UIImage.size reports display-correct dimensions after applying
+                //    imageOrientation, so the source W/H are already orientation-corrected.
+                //
+                //    Algorithm:
+                //      scale = 1.0
+                //      if maxLongEdge: scale = min(scale, maxLongEdge / max(srcW, srcH))
+                //      if maxWidth:    scale = min(scale, maxWidth    / srcW)
+                //      if maxHeight:   scale = min(scale, maxHeight   / srcH)
+                //      scale = min(scale, 1.0)   // never upscale
+                //      targetW = max(1, round(srcW * scale))
+                //      targetH = max(1, round(srcH * scale))
+                let srcW = Int(sourceImage.size.width)
+                let srcH = Int(sourceImage.size.height)
+
+                var scale = 1.0
+
+                if let mle = maxLongEdge, mle > 0 {
+                    let longEdge = max(srcW, srcH)
+                    if longEdge > mle {
+                        scale = min(scale, Double(mle) / Double(longEdge))
+                    }
+                }
+                if let mw = maxWidth, mw > 0, srcW > mw {
+                    scale = min(scale, Double(mw) / Double(srcW))
+                }
+                if let mh = maxHeight, mh > 0, srcH > mh {
+                    scale = min(scale, Double(mh) / Double(srcH))
+                }
+                // Clamp to ≤1.0 — no upscaling.
+                scale = min(scale, 1.0)
+
+                let canvasW = max(1, Int((Double(srcW) * scale).rounded()))
+                let canvasH = max(1, Int((Double(srcH) * scale).rounded()))
+
+                NSLog("[VanguardPlugin][10-C] optimizeImage resize: %dx%d → %dx%d (scale=%.4f)",
+                      srcW, srcH, canvasW, canvasH, scale)
+
+                // 4. Build VanguardImageMediaSource.
+                //    releaseBuffersOnInvalidate=YES: safe for one-shot serial export.
+                let processor = VanguardImageProcessor(device: MTLCreateSystemDefaultDevice()!,
+                                                       pool: nil)
+                let sourceURL = URL(fileURLWithPath: sourcePath)
+                let mediaSource = VanguardImageMediaSource(url: sourceURL,
+                                                           processor: processor,
+                                                           releaseBuffersOnInvalidate: true)
+
+                // 5. Build filter chain: VGTransformFilterNode for downscale only.
+                //    Identity transform (scale=1, offsets=0, no rotation, no flip,
+                //    no crop) — VGTransformFilterNode renders at canvasW×canvasH.
+                //    Pass nil pool for one-shot export (node allocates standalone buffer).
+                let device = MTLCreateSystemDefaultDevice()!
+                let transformNode = VGTransformFilterNode(pool: nil,
+                                                          device: device,
+                                                          canvasWidth: canvasW,
+                                                          canvasHeight: canvasH,
+                                                          scale: 1.0,
+                                                          offsetX: 0.0,
+                                                          offsetY: 0.0,
+                                                          quarterTurns: 0,
+                                                          flipX: false,
+                                                          cropRect: nil)
+
+                // Use transform only when a resize is actually required.
+                let needsResize = (canvasW != srcW || canvasH != srcH)
+                let filterChain: [Any]? = needsResize ? [transformNode] : nil
+
+                // 6. Create VGImageExportSession and run.
+                let outputURL = URL(fileURLWithPath: outputPath)
+                let session = VGImageExportSession(source: mediaSource,
+                                                   filterChain: filterChain,
+                                                   profile: profile,
+                                                   outputURL: outputURL)
+
+                session.start { manifest, error in
+                    DispatchQueue.main.async {
+                        if let error = error {
+                            NSLog("[VanguardPlugin][10-C] optimizeImage failed: %@",
+                                  error.localizedDescription)
+                            result(FlutterError(
+                                code: "IMAGE_OPTIMIZER_FAILED",
+                                message: error.localizedDescription,
+                                details: nil))
+                            return
+                        }
+                        guard let manifest = manifest else {
+                            NSLog("[VanguardPlugin][10-C] optimizeImage: nil manifest (unexpected)")
+                            result(FlutterError(
+                                code: "IMAGE_OPTIMIZER_FAILED",
+                                message: "optimizeImage: native returned nil manifest without error",
+                                details: nil))
+                            return
+                        }
+
+                        // Resolve format name from manifest (reflects actual platform format,
+                        // e.g. HEIC → JPEG fallback on non-HEVC devices).
+                        let resolvedFormat: String
+                        switch manifest.format {
+                        case .HEIC:
+                            resolvedFormat = "heic"
+                        case .PNG:
+                            resolvedFormat = "png"
+                        default:
+                            resolvedFormat = "jpeg"
+                        }
+
+                        NSLog("[VanguardPlugin][10-C] optimizeImage success: %dx%d %@ %lld bytes",
+                              manifest.width, manifest.height, resolvedFormat, manifest.fileSizeBytes)
+
+                        result([
+                            "success":       true,
+                            "outputPath":    outputPath,
+                            "width":         Int(manifest.width),
+                            "height":        Int(manifest.height),
+                            "fileSizeBytes": Int(manifest.fileSizeBytes),
+                            "format":        resolvedFormat,
+                        ] as [String: Any])
+                    }
+                }
+            }
+
         default:
             result(FlutterMethodNotImplemented)
         }
