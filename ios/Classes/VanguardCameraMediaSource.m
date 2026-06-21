@@ -352,10 +352,19 @@ static const char kCaptureQueueKey = 0;
     return;
   }
 
-  NSLog(@"[VanguardCamera] start — session initialising");
-  [_session startRunning];
-  NSLog(@"[VanguardCamera] start — session running=%d", _session.isRunning);
-  [self _startWatchdog];
+  NSLog(@"[VanguardCamera] start — session initialising (background)");
+  // Phase 10-C: startRunning blocks the calling thread for ~100–400 ms on
+  // cold-start while AVFoundation negotiates the ISP / hardware encoder slot.
+  // Dispatching onto _captureQueue (already .userInteractive serial) keeps the
+  // main thread free so Flutter's raster thread and the UI remain responsive.
+  // _startWatchdog is called after startRunning completes so it observes the
+  // live session state.
+  dispatch_async(_captureQueue, ^{
+    [self->_session startRunning];
+    NSLog(@"[VanguardCamera] start — session running=%d",
+          self->_session.isRunning);
+    [self _startWatchdog];
+  });
 }
 
 - (void)stop {
