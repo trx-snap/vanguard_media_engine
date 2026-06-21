@@ -107,6 +107,31 @@ NS_ASSUME_NONNULL_BEGIN
 /// file).
 @property(nonatomic, readonly) BOOL isRecording;
 
+/// YES after the first video frame has been delivered by AVFoundation.
+///
+/// Thread-safe: reads _latestBuffer under _latestBufferLock (nanosecond hold).
+/// Use this to gate the Record button — recording should not be started before
+/// the camera is producing frames.
+///
+/// Resets to NO after stop is called. A fresh session always starts as NO.
+@property(nonatomic, readonly) BOOL isCameraReady;
+
+/// YES when AVAssetWriter has started its writing session and is actively
+/// receiving video frames.
+///
+/// This is strictly stronger than isRecording:
+///   isRecording  — YES as soon as startRecordingToURL: creates the writer
+///   isRecordingActive — YES only after the first video frame is received and
+///                       startSessionAtSourceTime: has been called
+///
+/// Uses compound check: _recordingState == Writing && _sessionStarted.
+/// During Finishing, _sessionStarted may still be YES — the compound check
+/// prevents a stale-true result during teardown.
+///
+/// Thread-safe for point-in-time snapshots: _recordingState (NSInteger) and
+/// _sessionStarted (BOOL) are each atomic reads on ARM64.
+@property(nonatomic, readonly) BOOL isRecordingActive;
+
 // ── Device Controls (Phase 2)
 // ─────────────────────────────────────────────────
 

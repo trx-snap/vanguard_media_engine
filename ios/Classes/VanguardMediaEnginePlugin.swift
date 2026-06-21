@@ -3619,6 +3619,19 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
             }
 
+        // Phase 10-C: camera prewarm — true after first video frame delivered.
+        // Dart polls this (200ms interval, no timeout) to gate the Record button:
+        // Record is disabled until the native pipeline is producing frames.
+        case "isCameraReady":
+            result(cameraSource?.isCameraReady ?? false)
+
+        // Phase 10-C: recording active signal — true only after AVAssetWriter
+        // has called startSessionAtSourceTime: on a real video frame.
+        // Dart polls this (150ms interval, 2.5s timeout) to gate REC/timer UI:
+        // recording indicators are shown only after the writer is genuinely active.
+        case "isRecordingActive":
+            result(cameraSource?.isRecordingActive ?? false)
+
         // P5-C: Reset per-session VT callback frame counter before flush test.
         case "resetEncoderCallbackCount":
             streamingEncoder?.resetCallbackCount()

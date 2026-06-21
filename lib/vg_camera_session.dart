@@ -1938,6 +1938,45 @@ final class VGCameraSession {
     return VGRecordingStats.fromMap(Map<String, dynamic>.from(raw ?? const {}));
   }
 
+  // ── Phase 10-C: camera prewarm readiness signals ─────────────────────────────
+
+  /// Returns true if the native camera pipeline has delivered at least one
+  /// video frame since the session was created.
+  ///
+  /// Use this to gate the Record button: recording should not be started
+  /// before the camera is producing frames.
+  ///
+  /// Native source of truth: `VanguardCameraMediaSource._latestBuffer != NULL`
+  /// (read under `_latestBufferLock`).
+  ///
+  /// Returns false if the session has been [dispose]d.
+  Future<bool> isCameraReady() async {
+    if (_disposed) return false;
+    final result = await _channel.invokeMethod<bool>('isCameraReady');
+    return result ?? false;
+  }
+
+  /// Returns true when the AVAssetWriter has started its writing session and
+  /// is actively receiving video frames.
+  ///
+  /// This is strictly stronger than [isRecording]: [isRecording] becomes true
+  /// as soon as `startRecordingToURL:` accepts the command; [isRecordingActive]
+  /// becomes true only after the first video frame is received and
+  /// `startSessionAtSourceTime:` has been called on the writer.
+  ///
+  /// Use this to gate the REC/timer UI: recording indicators should not appear
+  /// until this returns true.
+  ///
+  /// Native source of truth: compound check
+  /// `_recordingState == VanguardRecordingStateWriting && _sessionStarted`.
+  ///
+  /// Returns false if the session has been [dispose]d.
+  Future<bool> isRecordingActive() async {
+    if (_disposed) return false;
+    final result = await _channel.invokeMethod<bool>('isRecordingActive');
+    return result ?? false;
+  }
+
   // ── Native MTKView preview ───────────────────────────────────────────────────
 
   /// Presents the fullscreen native MTKView camera overlay.

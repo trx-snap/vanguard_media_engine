@@ -995,6 +995,34 @@ static const char kCaptureQueueKey = 0;
   return _assetWriter != nil;
 }
 
+// Phase 10-C: camera prewarm readiness signal.
+// _latestBuffer starts NULL and is set to non-NULL on the first video frame
+// (line 485). Cleared back to NULL in stop (line 385) and dealloc (line 1417).
+// The os_unfair_lock hold is nanosecond-duration — safe to call from any thread
+// including the main thread (method channel handler).
+- (BOOL)isCameraReady {
+  os_unfair_lock_lock(&_latestBufferLock);
+  BOOL ready = _latestBuffer != NULL;
+  os_unfair_lock_unlock(&_latestBufferLock);
+  return ready;
+}
+
+// Phase 10-C: recording active signal.
+// Compound check required:
+//   _recordingState == Writing  — writer is in the active accepting-frames phase
+//   _sessionStarted             — startSessionAtSourceTime: has been called (first frame)
+//
+// During Finishing: _recordingState == Finishing → returns NO (correct).
+// During Writing before first frame: Writing && !_sessionStarted → NO (correct).
+// Only returns YES once the writer is genuinely producing output.
+//
+// Both ivars are written only on _captureQueue (serial). Reading them from
+// the main thread for a point-in-time snapshot is safe on ARM64: NSInteger and
+// BOOL reads are atomic. Worst case: stale NO triggers one extra poll cycle.
+- (BOOL)isRecordingActive {
+  return _recordingState == VanguardRecordingStateWriting && _sessionStarted;
+}
+
 /// Sets camera zoom level. factor = 1.0 is no zoom.
 /// Clamped to the device's activeFormat.videoMaxZoomFactor on the native side.
 - (void)setZoom:(CGFloat)factor {
