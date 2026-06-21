@@ -70,6 +70,8 @@ export 'vg_audio_playback_service.dart';
 export 'vg_waveform_cache.dart';
 // Phase 7.20D: Dart model for reverse sidecar asset state.
 export 'vg_reverse_sidecar_status.dart';
+// Phase 10-C: one-shot headless timeline export API (no controller, no texture).
+export 'vg_timeline_exporter.dart';
 
 const String _libName = 'vanguard_media_engine';
 
