@@ -5239,9 +5239,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         //   targetW = max(1, round(srcW * scale))
         //   targetH = max(1, round(srcH * scale))
         //
-        // Native pipeline:
+        // Native pipeline (Phase 10-D):
         //   VanguardImageMediaSource (UIImage orientation bake)
+        //   → optional VGDenoiseFilterNode (Phase 10-D, pre-resize, derivative-only)
         //   → VGTransformFilterNode (downscale via CIImage/Metal, nil pool)
+        //   → optional VGSharpenFilterNode (Phase 10-D, post-resize, derivative-only)
         //   → VGImageExportSession (pull-mode coordinator)
         //   → VGImageEncoderSinkNode (ImageIO JPEG/HEIC/PNG encode)
         //
@@ -5324,11 +5326,78 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             let colorPolicy: String       = (args?["colorPolicy"]      as? String) ?? "preserve"
             let destinationIntent: String = (args?["destinationIntent"] as? String) ?? "unknown"
 
+            // ── Phase 10-D: Parse optional enhancement config ────────────────────
+
+            // 'enhancementConfig' is omitted by Dart callers that do not supply
+            // VGImageEnhancementConfig (backward-compatible: nil = baseline).
+            // When present and enabled=true, VGDenoiseFilterNode is inserted
+            // pre-resize and VGSharpenFilterNode is inserted post-resize.
+            // All parsing errors fall back to the baseline (no-enhancement) path.
+
+            struct VGEnhancementParams {
+                var enabled    = false
+                var mode       = "off"
+                var noiseLevel = 0.02
+                var sharpness  = 0.40
+                var intensity  = 0.15
+                var radius     = 0.65
+            }
+
+            var enhancementParams = VGEnhancementParams()
+
+            if let enhMap = args?["enhancementConfig"] as? [String: Any] {
+                let enhEnabled = enhMap["enabled"] as? Bool ?? false
+                let enhMode    = enhMap["mode"]    as? String ?? "off"
+
+                if enhEnabled && enhMode != "off" {
+                    enhancementParams.enabled = true
+                    enhancementParams.mode    = enhMode
+
+                    // Preset defaults per mode (UMF contract, Phase 10-D).
+                    switch enhMode {
+                    case "balanced":
+                        enhancementParams.noiseLevel = 0.04
+                        enhancementParams.sharpness  = 0.50
+                        enhancementParams.intensity  = 0.30
+                        enhancementParams.radius     = 1.20
+                    default: // "conservative" — already set as struct defaults
+                        break
+                    }
+
+                    // Explicit overrides (denoise sub-map).
+                    if let denoiseMap = enhMap["denoise"] as? [String: Any] {
+                        if let nl = (denoiseMap["noiseLevel"] as? NSNumber)?.doubleValue {
+                            enhancementParams.noiseLevel = max(0.0, min(0.06, nl))
+                        }
+                        if let sh = (denoiseMap["sharpness"] as? NSNumber)?.doubleValue {
+                            enhancementParams.sharpness = max(0.0, min(1.0, sh))
+                        }
+                    }
+
+                    // Explicit overrides (sharpen sub-map).
+                    if let sharpenMap = enhMap["sharpen"] as? [String: Any] {
+                        if let it = (sharpenMap["intensity"] as? NSNumber)?.doubleValue {
+                            enhancementParams.intensity = max(0.0, min(0.50, it))
+                        }
+                        if let rd = (sharpenMap["radius"] as? NSNumber)?.doubleValue {
+                            enhancementParams.radius = max(0.0, min(1.5, rd))
+                        }
+                    }
+
+                    NSLog("[VanguardPlugin][10-D] enhancementConfig: mode=%@ noiseLevel=%.3f sharpness=%.2f intensity=%.2f radius=%.2f",
+                          enhancementParams.mode,
+                          enhancementParams.noiseLevel,
+                          enhancementParams.sharpness,
+                          enhancementParams.intensity,
+                          enhancementParams.radius)
+                }
+            }
+
             // Resolve output path.
             let outputPath: String = (args?["outputPath"] as? String)
                                      ?? (NSTemporaryDirectory() + "vg_img_opt_\(Int(Date().timeIntervalSince1970 * 1000)).jpg")
 
-            NSLog("[VanguardPlugin][10-C] optimizeImage: src=%@ maxLongEdge=%@ maxWidth=%@ maxHeight=%@ quality=%.2f format=%@ stripMetadata=%@ normalizeOrientation=%@ colorPolicy=%@ destinationIntent=%@ fileSizeTarget=%@ dst=%@",
+            NSLog("[VanguardPlugin][10-C] optimizeImage: src=%@ maxLongEdge=%@ maxWidth=%@ maxHeight=%@ quality=%.2f format=%@ stripMetadata=%@ normalizeOrientation=%@ colorPolicy=%@ destinationIntent=%@ fileSizeTarget=%@ dst=%@ enhancement=%@",
                   (sourcePath as NSString).lastPathComponent,
                   maxLongEdge.map { "\($0)" } ?? "nil",
                   maxWidth.map    { "\($0)" } ?? "nil",
@@ -5338,7 +5407,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                   normalizeOrientation  ? "YES" : "NO",
                   colorPolicy, destinationIntent,
                   fileSizeTargetBytes.map { "\($0)" } ?? "nil",
-                  (outputPath as NSString).lastPathComponent)
+                  (outputPath as NSString).lastPathComponent,
+                  enhancementParams.enabled ? "ON(\(enhancementParams.mode))" : "OFF")
+
+            // Capture for use inside the async block (structs are value-copied).
+            let capturedEnhancement = enhancementParams
 
             DispatchQueue.global(qos: .userInitiated).async {
                 // 1. Resolve format → VGImageExportProfile factory.
@@ -5413,11 +5486,25 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                                                            processor: processor,
                                                            releaseBuffersOnInvalidate: true)
 
-                // 5. Build filter chain: VGTransformFilterNode for downscale only.
-                //    Identity transform (scale=1, offsets=0, no rotation, no flip,
-                //    no crop) — VGTransformFilterNode renders at canvasW×canvasH.
-                //    Pass nil pool for one-shot export (node allocates standalone buffer).
+                // 5. Build filter chain.
+                //
+                //    Baseline (no enhancement):
+                //      [VGTransformFilterNode] when a resize is required, else nil.
+                //
+                //    Phase 10-D (enhancement enabled):
+                //      [VGDenoiseFilterNode, VGTransformFilterNode, VGSharpenFilterNode]
+                //      — denoise runs at source res (pre-resize), transform resizes,
+                //        sharpen runs at canvas res (post-resize).
+                //      — If no resize is needed: [VGDenoiseFilterNode, VGSharpenFilterNode].
+                //
+                //    Failure-safe: each node independently falls back to passthrough
+                //    if CIFilter returns nil, so a failing enhancement node never
+                //    blocks the export.
+                //
                 let device = MTLCreateSystemDefaultDevice()!
+                let needsResize = (canvasW != srcW || canvasH != srcH)
+
+                // Build transform node (always constructed, conditionally included).
                 let transformNode = VGTransformFilterNode(pool: nil,
                                                           device: device,
                                                           canvasWidth: canvasW,
@@ -5429,9 +5516,30 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                                                           flipX: false,
                                                           cropRect: nil)
 
-                // Use transform only when a resize is actually required.
-                let needsResize = (canvasW != srcW || canvasH != srcH)
-                let filterChain: [Any]? = needsResize ? [transformNode] : nil
+
+                // Build filter chain.
+                // Baseline: [VGTransformFilterNode] when resize required, else nil.
+                // Phase 10-D: [VGDenoiseFilterNode, VGTransformFilterNode, VGSharpenFilterNode]
+                //             (or [VGDenoiseFilterNode, VGSharpenFilterNode] if no resize).
+                let filterChain: [Any]?
+
+                if capturedEnhancement.enabled {
+                    let denoiseNode = VGDenoiseFilterNode(pool: nil,
+                                                          device: device,
+                                                          noiseLevel: capturedEnhancement.noiseLevel,
+                                                          sharpness: capturedEnhancement.sharpness)
+                    let sharpenNode = VGSharpenFilterNode(pool: nil,
+                                                          device: device,
+                                                          intensity: capturedEnhancement.intensity,
+                                                          radius: capturedEnhancement.radius)
+                    filterChain = needsResize
+                        ? [denoiseNode, transformNode, sharpenNode]
+                        : [denoiseNode, sharpenNode]
+                } else {
+                    // Baseline: transform only when a resize is actually required.
+                    filterChain = needsResize ? [transformNode] : nil
+                }
+
 
                 // 6. Create VGImageExportSession and run.
                 let outputURL = URL(fileURLWithPath: outputPath)

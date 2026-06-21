@@ -53,3 +53,10 @@
 // Required so Swift plugin code can reference VGTransformFilterNode.
 #import "VGTransformFilterNode.h"
 
+// Phase 10-D: CINoiseReduction denoise filter node (pre-resize, derivative-only).
+// Required so Swift plugin code can reference VGDenoiseFilterNode.
+#import "VGDenoiseFilterNode.h"
+
+// Phase 10-D: CIUnsharpMask sharpening filter node (post-resize, derivative-only).
+// Required so Swift plugin code can reference VGSharpenFilterNode.
+#import "VGSharpenFilterNode.h"

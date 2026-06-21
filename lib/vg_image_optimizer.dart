@@ -1,5 +1,5 @@
 // vg_image_optimizer.dart
-// Vanguard Media Engine — Phase 10-C Image Optimization Shared Media Stack.
+// Vanguard Media Engine — Phase 10-C / 10-D Image Optimization & Enhancement.
 //
 // Typed Dart bridge for the native `optimizeImage` MethodChannel route.
 //
@@ -15,14 +15,263 @@
 // Architecture boundary:
 //   - UMF owns the contract/profile semantics (VGImageExportProfile).
 //   - Vanguard owns the native implementation (VGImageExportSession,
-//     VGTransformFilterNode, VanguardImageMediaSource).
+//     VGTransformFilterNode, VGDenoiseFilterNode, VGSharpenFilterNode,
+//     VanguardImageMediaSource).
 //   - Connects is the product caller; it must not own core compression logic.
 //
 // MethodChannel map key names match the UMF contract exactly:
 //   maxWidth, maxHeight, maxLongEdge, fileSizeTargetBytes,
 //   stripMetadata, normalizeOrientation, colorPolicy, destinationIntent.
+//
+// Phase 10-D additions:
+//   enhancementConfig — optional per-request image enhancement settings.
+//   Key: 'enhancementConfig'. Value: serialized sub-map. Omitted when null.
+//   Enhancement is derivative-only. Master export is never touched.
 
 import 'package:flutter/services.dart';
+
+// ── Phase 10-D: Enhancement Enumerations ─────────────────────────────────────
+
+/// Enhancement preset mode.
+///
+/// Controls which pre-configured parameter set is applied when
+/// [VGImageEnhancementConfig.denoise] or [VGImageEnhancementConfig.sharpen]
+/// are not explicitly set.
+///
+/// Candidate mode mappings (pending physical device validation):
+/// - [off]: no enhancement nodes are inserted.
+/// - [conservative]: safe defaults — noiseLevel=0.02, sharpness=0.40,
+///   sharpen intensity=0.15, sharpen radius=0.65.
+/// - [balanced]: moderate settings — noiseLevel≤0.04, intensity≤0.30,
+///   radius≤1.2. Requires physical artifact validation before production use.
+enum VGImageEnhancementMode {
+  /// No enhancement. No filter nodes are inserted.
+  off,
+
+  /// Conservative preset. Uses safe UMF defaults for denoise and sharpening.
+  conservative,
+
+  /// Balanced preset. Moderate settings. Requires physical artifact validation.
+  balanced,
+}
+
+/// Declares which pipeline stage enhancement applies to.
+///
+/// v1 only supports [derivativeOnly]. Enhancement filters run exclusively
+/// on the transient derivative generation pipeline. The master image is
+/// never modified.
+enum VGImageEnhancementTarget {
+  /// Enhancement runs on the derivative pipeline only. Master is untouched.
+  derivativeOnly,
+}
+
+// ── Phase 10-D: Enhancement Parameter Models ─────────────────────────────────
+
+/// Configuration for the CINoiseReduction denoise step.
+///
+/// Applied before resize/downscale so that high-frequency noise is processed
+/// at full resolution before interpolation can alias it.
+///
+/// Safe ranges (UMF contract):
+///   - [noiseLevel]: 0.0–0.06 (native clamps to max 0.06)
+///   - [sharpness]: 0.0–1.0 (native clamps)
+final class VGImageDenoiseConfig {
+  /// Creates a denoise configuration.
+  const VGImageDenoiseConfig({
+    this.noiseLevel,
+    this.sharpness,
+  });
+
+  /// CINoiseReduction inputNoiseLevel. Conservative default: 0.02.
+  ///
+  /// Clamped by native layer to [0.0, 0.06]. Values above 0.06 create
+  /// "plastic" skin textures and smear fine detail.
+  final double? noiseLevel;
+
+  /// CINoiseReduction inputSharpness. Conservative default: 0.40.
+  ///
+  /// Clamped by native layer to [0.0, 1.0].
+  final double? sharpness;
+
+  /// Serializes to a MethodChannel-compatible map.
+  Map<String, Object?> toMap() {
+    final map = <String, Object?>{};
+    if (noiseLevel != null) map['noiseLevel'] = noiseLevel;
+    if (sharpness != null) map['sharpness'] = sharpness;
+    return map;
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGImageDenoiseConfig &&
+          other.noiseLevel == noiseLevel &&
+          other.sharpness == sharpness;
+
+  @override
+  int get hashCode => Object.hash(noiseLevel, sharpness);
+
+  @override
+  String toString() =>
+      'VGImageDenoiseConfig(noiseLevel: $noiseLevel, sharpness: $sharpness)';
+}
+
+/// Configuration for the CIUnsharpMask post-resize sharpening step.
+///
+/// Applied after resize/downscale to restore micro-contrast lost during
+/// interpolation. Because sharpening runs at the target canvas size,
+/// its parameters are appropriate for the derivative dimensions.
+///
+/// Safe ranges (UMF contract):
+///   - [intensity]: 0.0–0.50 (native clamps)
+///   - [radius]: 0.0–1.5 (native clamps)
+final class VGImageSharpenConfig {
+  /// Creates a sharpen configuration.
+  const VGImageSharpenConfig({
+    this.intensity,
+    this.radius,
+  });
+
+  /// CIUnsharpMask inputIntensity. Conservative default: 0.15.
+  ///
+  /// Clamped by native layer to [0.0, 0.50]. Values above 0.50 create
+  /// halo artifacts and ringing around high-contrast edges.
+  final double? intensity;
+
+  /// CIUnsharpMask inputRadius. Conservative default: 0.65.
+  ///
+  /// Clamped by native layer to [0.0, 1.5]. Values above 1.5 create
+  /// broad halos visible at typical viewing distances.
+  final double? radius;
+
+  /// Serializes to a MethodChannel-compatible map.
+  Map<String, Object?> toMap() {
+    final map = <String, Object?>{};
+    if (intensity != null) map['intensity'] = intensity;
+    if (radius != null) map['radius'] = radius;
+    return map;
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGImageSharpenConfig &&
+          other.intensity == intensity &&
+          other.radius == radius;
+
+  @override
+  int get hashCode => Object.hash(intensity, radius);
+
+  @override
+  String toString() =>
+      'VGImageSharpenConfig(intensity: $intensity, radius: $radius)';
+}
+
+/// Phase 10-D image enhancement configuration.
+///
+/// Configures optional derivative-only still-image enhancement in the
+/// Vanguard native pipeline. When [enabled] is false or [mode] is
+/// [VGImageEnhancementMode.off], no enhancement nodes are inserted and
+/// the baseline resize/compress path runs unchanged.
+///
+/// Enhancement runs derivative-only:
+///   1. CINoiseReduction at source/high-res dimensions (pre-resize).
+///   2. Bounding-box downscale via VGTransformFilterNode.
+///   3. CIUnsharpMask at target canvas dimensions (post-resize).
+///
+/// Explicit [denoise] / [sharpen] values override the mode defaults when
+/// provided. If a sub-config is null, the native layer uses the mode
+/// preset defaults for that step.
+///
+/// Existing [VGImageOptimizationRequest] callers that do not pass
+/// [enhancement] are unaffected — the field defaults to null and no
+/// enhancement map is serialized.
+final class VGImageEnhancementConfig {
+  /// Creates an image enhancement configuration.
+  const VGImageEnhancementConfig({
+    this.enabled = false,
+    this.mode = VGImageEnhancementMode.off,
+    this.denoise,
+    this.sharpen,
+    this.target = VGImageEnhancementTarget.derivativeOnly,
+  });
+
+  /// Whether enhancement is active. Defaults to false.
+  ///
+  /// When false, the native layer inserts no enhancement nodes and the
+  /// baseline resize/compress path runs unchanged.
+  final bool enabled;
+
+  /// Enhancement preset mode. Defaults to [VGImageEnhancementMode.off].
+  final VGImageEnhancementMode mode;
+
+  /// Optional explicit denoise parameters. Overrides mode defaults when set.
+  final VGImageDenoiseConfig? denoise;
+
+  /// Optional explicit sharpen parameters. Overrides mode defaults when set.
+  final VGImageSharpenConfig? sharpen;
+
+  /// Enhancement target. Must be [VGImageEnhancementTarget.derivativeOnly] in v1.
+  final VGImageEnhancementTarget target;
+
+  /// Serializes to a MethodChannel-compatible sub-map.
+  ///
+  /// Returns null when disabled/off to allow the caller to omit the key.
+  Map<String, Object?>? toMap() {
+    if (!enabled || mode == VGImageEnhancementMode.off) {
+      // Serialize a disabled marker so native can log it cleanly.
+      return <String, Object?>{
+        'enabled': false,
+        'mode': 'off',
+        'target': 'derivativeOnly',
+      };
+    }
+
+    final modeStr = switch (mode) {
+      VGImageEnhancementMode.off => 'off',
+      VGImageEnhancementMode.conservative => 'conservative',
+      VGImageEnhancementMode.balanced => 'balanced',
+    };
+
+    final map = <String, Object?>{
+      'enabled': true,
+      'mode': modeStr,
+      'target': 'derivativeOnly',
+    };
+
+    if (denoise != null) {
+      final dm = denoise!.toMap();
+      if (dm.isNotEmpty) map['denoise'] = dm;
+    }
+    if (sharpen != null) {
+      final sm = sharpen!.toMap();
+      if (sm.isNotEmpty) map['sharpen'] = sm;
+    }
+
+    return map;
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGImageEnhancementConfig &&
+          other.enabled == enabled &&
+          other.mode == mode &&
+          other.denoise == denoise &&
+          other.sharpen == sharpen &&
+          other.target == target;
+
+  @override
+  int get hashCode => Object.hash(enabled, mode, denoise, sharpen, target);
+
+  @override
+  String toString() => 'VGImageEnhancementConfig('
+      'enabled: $enabled, '
+      'mode: $mode, '
+      'denoise: $denoise, '
+      'sharpen: $sharpen, '
+      'target: $target)';
+}
 
 // ── VGImageOptimizationRequest ─────────────────────────────────────────────────
 
@@ -46,6 +295,10 @@ final class VGImageOptimizationRequest {
   ///
   /// [sourcePath] is required and must be a non-empty absolute path to a
   /// readable local file. All other fields are optional.
+  ///
+  /// [enhancement] is a Phase 10-D optional parameter. When null (default),
+  /// no enhancement nodes are inserted and the baseline pipeline runs.
+  /// Existing callers that do not pass [enhancement] are unaffected.
   const VGImageOptimizationRequest({
     required this.sourcePath,
     this.outputPath,
@@ -59,6 +312,7 @@ final class VGImageOptimizationRequest {
     this.normalizeOrientation = true,
     this.colorPolicy,
     this.destinationIntent,
+    this.enhancement,
   });
 
   // ── Fields ──────────────────────────────────────────────────────────────────
@@ -158,6 +412,15 @@ final class VGImageOptimizationRequest {
   /// Parsed and logged; not enforced in v1.
   final String? destinationIntent;
 
+  /// Optional Phase 10-D enhancement configuration.
+  ///
+  /// When null (default), no enhancement nodes are inserted and the baseline
+  /// resize/compress path runs unchanged. Existing callers that do not supply
+  /// this field continue to work without modification.
+  ///
+  /// Enhancement is derivative-only. The master export is never modified.
+  final VGImageEnhancementConfig? enhancement;
+
   // ── Serialisation ────────────────────────────────────────────────────────────
 
   /// Serialises this request to a MethodChannel-compatible map.
@@ -165,6 +428,10 @@ final class VGImageOptimizationRequest {
   /// Keys match the UMF contract exactly. Null optional fields are omitted;
   /// the native layer applies its documented defaults for missing keys.
   /// Non-nullable booleans are always included.
+  ///
+  /// Phase 10-D: when [enhancement] is non-null, 'enhancementConfig' is
+  /// included as a nested map. When null, the key is omitted entirely so the
+  /// native layer applies the no-enhancement baseline path.
   Map<String, Object?> toMap() {
     final map = <String, Object?>{
       'sourcePath': sourcePath,
@@ -183,6 +450,11 @@ final class VGImageOptimizationRequest {
     if (format != null) map['format'] = format;
     if (colorPolicy != null) map['colorPolicy'] = colorPolicy;
     if (destinationIntent != null) map['destinationIntent'] = destinationIntent;
+    // Phase 10-D: serialize enhancement config when present.
+    if (enhancement != null) {
+      final enhMap = enhancement!.toMap();
+      if (enhMap != null) map['enhancementConfig'] = enhMap;
+    }
     return map;
   }
 
@@ -203,7 +475,8 @@ final class VGImageOptimizationRequest {
           other.stripMetadata == stripMetadata &&
           other.normalizeOrientation == normalizeOrientation &&
           other.colorPolicy == colorPolicy &&
-          other.destinationIntent == destinationIntent;
+          other.destinationIntent == destinationIntent &&
+          other.enhancement == enhancement;
 
   @override
   int get hashCode => Object.hash(
@@ -219,6 +492,7 @@ final class VGImageOptimizationRequest {
         normalizeOrientation,
         colorPolicy,
         destinationIntent,
+        enhancement,
       );
 
   @override
@@ -234,7 +508,8 @@ final class VGImageOptimizationRequest {
       'stripMetadata: $stripMetadata, '
       'normalizeOrientation: $normalizeOrientation, '
       'colorPolicy: $colorPolicy, '
-      'destinationIntent: $destinationIntent)';
+      'destinationIntent: $destinationIntent, '
+      'enhancement: $enhancement)';
 }
 
 // ── VGImageOptimizationResult ─────────────────────────────────────────────────
