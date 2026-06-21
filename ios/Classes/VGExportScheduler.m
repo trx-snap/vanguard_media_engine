@@ -235,6 +235,23 @@ static os_log_t sExportSchedulerLog;
 
     while (!atomic_load(&_cancelled) && !atomic_load(&_invalidated)) {
 
+        // Phase 10-C C1C (RR-memory): Wrap the entire per-frame work unit in a
+        // local @autoreleasepool so that CIImage / CIFilter / NSValue / CIContext
+        // render-graph intermediates are drained after each frame rather than
+        // accumulating in the dispatch block's implicit pool until loop exit.
+        // Without this, a zoom/pan export of a 5 s / 150-frame 1080p clip can
+        // build 3–4 GB of transient Core Image objects and trigger Jetsam.
+        //
+        // Safety notes:
+        //   goto loop_exit  — exits the @autoreleasepool scope; Clang drains the
+        //                     pool on any control-flow exit from the braces.
+        //   continue        — re-enters the while condition; the pool is drained
+        //                     before the next iteration's @autoreleasepool opens.
+        //   CVPixelBufferRef / CMSampleBufferRef — retained (+1) before entering
+        //                     the pool; CF retain counts are unaffected by pool
+        //                     drain. Buffer ownership contracts are unchanged.
+        @autoreleasepool {
+
         // ── 1. Create VGFrameRequest ──────────────────────────────────────────
         CMTime pts      = CMTimeMake(_frameIndex, _fps);
         CMTime duration = CMTimeMake(1, _fps);
@@ -352,6 +369,8 @@ static os_log_t sExportSchedulerLog;
 
         // ── 8. Advance frame index on delivered frames ────────────────────────
         _frameIndex++;
+
+        } // @autoreleasepool — Phase 10-C C1C: drain per-frame Core Image intermediates
     }
 
 loop_exit:

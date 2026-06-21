@@ -269,6 +269,32 @@ static void vtOutputCallback(void *outputCallbackRefCon,
     CFRelease(secLimit);
     CFRelease(dataRateLimits);
 
+    // ── Phase 10-C C1E: Rec.709 / sRGB colour properties ────────────────────
+    // Set BT.709 colour metadata on the VTCompressionSession so that the encoded
+    // H.264 bitstream carries a valid colr atom (colour_primaries=1,
+    // transfer_characteristics=1, matrix_coefficients=1).  Without these, players
+    // default to BT.601 or make no assumption, producing washed / incorrect colour
+    // when viewing SDR Rec.709 output.
+    //
+    // These constants are CFStringRef and require no CFRelease — they are static
+    // system-owned strings obtained from VideoToolbox / CoreMedia headers.
+    //
+    // Applied unconditionally: both realtime (camera) and offline (export) paths
+    // produce BT.709 content.  The compositor fix (C1E VGTimelineCompositorNode.m)
+    // ensures export frames are rendered into sRGB/BT.709 BGRA buffers before
+    // reaching this encoder.
+    VTSessionSetProperty(_session,
+                         kVTCompressionPropertyKey_ColorPrimaries,
+                         kCMFormatDescriptionColorPrimaries_ITU_R_709_2);
+
+    VTSessionSetProperty(_session,
+                         kVTCompressionPropertyKey_TransferFunction,
+                         kCMFormatDescriptionTransferFunction_ITU_R_709_2);
+
+    VTSessionSetProperty(_session,
+                         kVTCompressionPropertyKey_YCbCrMatrix,
+                         kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2);
+
     OSStatus prepErr = VTCompressionSessionPrepareToEncodeFrames(_session);
     if (prepErr != noErr) {
         NSLog(@"[VanguardEncoder] VTCompressionSessionPrepareToEncodeFrames failed: %d (dims=%dx%d)",

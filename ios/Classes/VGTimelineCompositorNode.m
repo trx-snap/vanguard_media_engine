@@ -185,6 +185,32 @@ static NSError *_VGTCNError(NSInteger code, NSString *message) {
                          userInfo:@{NSLocalizedDescriptionKey : message}];
 }
 
+// ─── Phase 10-C C1E: SDR Rec.709 output buffer tagging ───────────────────────
+//
+// Tags a compositor-owned CVPixelBuffer with BT.709 color attachments so that
+// downstream VTCompressionSession and AVAssetWriter emit correct colr atom data.
+// Called after every CVPixelBufferCreate + CIContext render in the export path.
+// Propagation mode ShouldPropagate ensures VT picks up the attachment automatically.
+// Safe no-op for NULL buffer (guard at top).
+static inline void _VGTCNTagSDR709PixelBuffer(CVPixelBufferRef buffer) {
+  if (!buffer) { return; }
+
+  CVBufferSetAttachment(buffer,
+                        kCVImageBufferColorPrimariesKey,
+                        kCVImageBufferColorPrimaries_ITU_R_709_2,
+                        kCVAttachmentMode_ShouldPropagate);
+
+  CVBufferSetAttachment(buffer,
+                        kCVImageBufferTransferFunctionKey,
+                        kCVImageBufferTransferFunction_ITU_R_709_2,
+                        kCVAttachmentMode_ShouldPropagate);
+
+  CVBufferSetAttachment(buffer,
+                        kCVImageBufferYCbCrMatrixKey,
+                        kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+                        kCVAttachmentMode_ShouldPropagate);
+}
+
 // ─── Phase 7.10: CoreImage blend helpers ─────────────────────────────────────
 //
 // _VGTCNSharedCIContext: Lazily initialised Metal/GPU CIContext.
@@ -199,7 +225,11 @@ static NSError *_VGTCNError(NSInteger code, NSString *message) {
 // Returns new retained CVPixelBufferRef (+1). Caller must CVPixelBufferRelease.
 // Returns NULL with *outError on failure; no silent masking (DEC-143).
 //
-// RR-143: CIContext uses nil options (Metal/GPU on device; CPU fallback in sim).
+// RR-143: CIContext uses Metal/GPU on device (CPU fallback in sim).
+// Phase 10-C C1C: kCIContextCacheIntermediates:@NO — each export frame has unique
+//   inputs; caching intermediates between frames wastes GPU memory without benefit.
+//   For the playback path the per-reader frame reuse cache (see _pullBufferFromReader:)
+//   already avoids redundant decoding, so CI intermediate caching is likewise redundant.
 // RR-144: CIDissolveTransition interpolates in gamma-encoded RGB space, not
 //   linear-light. Perceptual blending accuracy is a deferred improvement.
 
@@ -207,9 +237,313 @@ static CIContext *_VGTCNSharedCIContext(void) {
   static CIContext *ctx = nil;
   static dispatch_once_t once;
   dispatch_once(&once, ^{
-    ctx = [CIContext contextWithOptions:nil];
+    ctx = [CIContext contextWithOptions:@{
+      kCIContextCacheIntermediates: @NO,
+    }];
   });
   return ctx;
+}
+
+// ─── Phase 10-C C1F: HLG→SDR single canonical render helpers ─────────────────
+//
+// _VGTCNIsHLGBuffer:
+//   Returns YES when the CVPixelBuffer carries the ITU-R BT.2100 HLG transfer
+//   function attachment. Used to gate HLG rendering so SDR buffers are never
+//   modified.
+//
+// _VGTCNHLGToSDRColorKernel:
+//   Lazily creates a CIColorKernel that performs the 2-step HLG→linear BT.709
+//   conversion matching the preview Metal shader (VanguardCompositor.metal:
+//   hlgInverseOETF + BT.2087 Table-2 matrix). Constants are byte-identical to
+//   the Metal shader. The kernel returns linear BT.709 values — the final sRGB
+//   OETF is applied by the CIContext render call (kCGColorSpaceSRGB), not the
+//   kernel. Kernel is created once (dispatch_once) and re-used for every frame.
+//
+// _VGTCNRenderHLGFrame:
+//   Single canonical HLG export render helper. Composes the entire CIImage
+//   filter graph — tone-map kernel + optional transform/opacity — and renders
+//   exactly once to a 32BGRA CVPixelBuffer using kCGColorSpaceSRGB, so the
+//   sRGB OETF is applied exactly once for both identity and zoom/pan paths.
+//   Propagates clean aperture/aspect attachments, then tags output BT.709.
+//   Both identity and transformed HLG frames go through this helper; there is
+//   no separate direct-to-encoder bypass for identity frames.
+//
+// CIKernel approach: CIColorKernel with CIKernel Language string.
+//   - Zero build-system changes: no new .metal/.ci.metal files, no build phases.
+//   - kernelWithString: is deprecated at iOS 12 but present and functional on
+//     iOS 15+ (the project deployment target). Deprecation suppressed with
+//     clang diagnostic pragmas to keep the build clean.
+//   - The kernel language source uses vec4/float to match CIKernel Language
+//     syntax (GLSL-like), not Metal Shading Language.
+
+static BOOL _VGTCNIsHLGBuffer(CVPixelBufferRef buffer) {
+  if (!buffer) { return NO; }
+  CFTypeRef tfValue = CVBufferCopyAttachment(buffer,
+                                             kCVImageBufferTransferFunctionKey,
+                                             NULL);
+  if (!tfValue) { return NO; }
+  BOOL isHLG = CFEqual(tfValue,
+                       kCVImageBufferTransferFunction_ITU_R_2100_HLG);
+  CFRelease(tfValue);
+  if (isHLG) {
+    static BOOL sHLGLogged = NO;
+    if (!sHLGLogged) {
+      sHLGLogged = YES;
+      os_log_info(OS_LOG_DEFAULT,
+                  "[VGTCNode-C1F] HLG source detected in export path — "
+                  "applying explicit HLG\u2192SDR tone mapping");
+    }
+  }
+  return isHLG;
+}
+
+// CIColorKernel language source (CIKernel Language / GLSL-like, NOT Metal MSL).
+// Steps match VanguardCompositor.metal hlgInverseOETF + BT.2087 Table-2 +
+// sRGBEncode exactly.
+static NSString *const kVGTCNHLGToSDRKernelSource =
+  @"kernel vec4 hlgToSDR(__sample s) {\n"
+   // Step 1: HLG inverse OETF — encoded signal → BT.2020 scene-linear.
+   // a = 0.17883277, b = 0.28466892, c = 0.55991073  (ITU-R BT.2100)
+   "  float a = 0.17883277;\n"
+   "  float b = 0.28466892;\n"
+   "  float c = 0.55991073;\n"
+   // Per-channel inverse OETF: E <=0.5 → E²/3, else (exp((E-c)/a)+b)/12
+   "  float r = s.r; float g = s.g; float fl = s.b;\n"
+   "  float lr = (r <= 0.5) ? (r * r / 3.0) : ((exp((r - c) / a) + b) / 12.0);\n"
+   "  float lg = (g <= 0.5) ? (g * g / 3.0) : ((exp((g - c) / a) + b) / 12.0);\n"
+   "  float lb = (fl <= 0.5) ? (fl * fl / 3.0) : ((exp((fl - c) / a) + b) / 12.0);\n"
+   // Step 2: BT.2020 linear → BT.709 linear.
+   // Coefficients from VanguardCompositor.metal vanguard_blit_rotated / vanguard_blit_rotated_ex:
+   //   float3x3 M = float3x3(col0, col1, col2) — MSL float3x3 constructor takes COLUMNS.
+   //   M * v: result.r = col0.x*v.r + col1.x*v.g + col2.x*v.b, etc.
+   // Effective scalars matching metal M * bt2020Linear:
+   "  float r709 = clamp( 1.6605*lr - 0.5876*lg - 0.0728*lb, 0.0, 1.0);\n"
+   "  float g709 = clamp(-0.1246*lr + 1.1329*lg - 0.0083*lb, 0.0, 1.0);\n"
+   "  float b709 = clamp(-0.0182*lr - 0.1006*lg + 1.1187*lb, 0.0, 1.0);\n"
+   // Phase 10-C C1F Redesign: return linear BT.709 values; do NOT manually apply
+   // the sRGB OETF here. The subsequent CIContext render call in
+   // _VGTCNRenderHLGFrame (colorSpace:kCGColorSpaceSRGB) applies the single
+   // correct sRGB OETF automatically. Manual encoding here would cause a
+   // double-OETF, producing washed output.
+   "  return vec4(r709, g709, b709, s.a);\n"
+   "}";
+
+static CIColorKernel *_VGTCNHLGToSDRColorKernel(void) {
+  static CIColorKernel *kernel = nil;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    kernel = [CIColorKernel kernelWithString:kVGTCNHLGToSDRKernelSource];
+#pragma clang diagnostic pop
+    if (!kernel) {
+      os_log_error(OS_LOG_DEFAULT,
+                   "[VGTCNode-C1F] Failed to create HLG\u2192SDR CIColorKernel — "
+                   "HLG tone mapping disabled for this session");
+    }
+  });
+  return kernel;
+}
+
+// Phase 10-C C1F Redesign: single canonical HLG export render helper.
+//
+// Replaces the former _VGTCNToneMapHLGToSDR intermediate-buffer approach.
+// Both identity (td nil/identity) and zoom/pan (td non-identity) HLG frames
+// are routed here and render exactly once. This eliminates the divergent
+// downstream paths that caused the identity/zoom-pan colour ping-pong.
+//
+// canvasSize: use the physical source buffer dimensions so the output buffer
+//   matches the encoder's expected frame size. The caller passes
+//   CGSizeMake(CVPixelBufferGetWidth(pb), CVPixelBufferGetHeight(pb)).
+//
+// Returns a new +1 retained CVPixelBufferRef on success.
+// Returns NULL with *outError on render or allocation failure.
+// Returns NULL (no error) if sourceBuffer is NULL.
+static CVPixelBufferRef _VGTCNRenderHLGFrame(CVPixelBufferRef sourceBuffer,
+                                             VGClipTransformDescriptor *td,
+                                             CGSize canvasSize,
+                                             NSError **outError) {
+  if (!sourceBuffer) { return NULL; }
+
+  // ── 1. Create raw/unmanaged source CIImage ───────────────────────────────
+  // kCIImageColorSpace:[NSNull null] instructs CoreImage NOT to pre-colour-manage
+  // the HLG buffer. The kernel receives raw HLG-encoded sample values in [0,1].
+  // Without this, CoreImage may apply HLG→linear before the kernel, causing
+  // the manual inverse OETF to run on already-linearised pixels.
+  NSDictionary *srcOptions = @{ (id)kCIImageColorSpace: [NSNull null] };
+  CIImage *srcCI = [CIImage imageWithCVPixelBuffer:sourceBuffer options:srcOptions];
+
+  // ── 2. Apply HLG inverse OETF + BT.2020→BT.709 matrix kernel ────────────
+  // Kernel output is linear BT.709. The final sRGB OETF is applied by the
+  // CIContext render to kCGColorSpaceSRGB below — not manually here.
+  CIColorKernel *kernel = _VGTCNHLGToSDRColorKernel();
+  if (!kernel) {
+    // Kernel creation failed (logged once at creation).
+    if (outError) {
+      *outError = _VGTCNError(22,
+          @"VGTimelineCompositorNode (C1F): HLG→SDR CIColorKernel unavailable.");
+    }
+    return NULL;
+  }
+  CIImage *toneMappedCI = [kernel applyWithExtent:srcCI.extent
+                                        arguments:@[srcCI]];
+  if (!toneMappedCI) {
+    if (outError) {
+      *outError = _VGTCNError(22,
+          @"VGTimelineCompositorNode (C1F): CIColorKernel produced no output image.");
+    }
+    return NULL;
+  }
+
+  // ── 3. Compute output bounds ──────────────────────────────────────────────
+  // Use physical source dimensions (canvasSize). Fall back to srcCI.extent
+  // dimensions if canvasSize is zero (defensive; callers always set it).
+  size_t srcW = CVPixelBufferGetWidth(sourceBuffer);
+  size_t srcH = CVPixelBufferGetHeight(sourceBuffer);
+  CGFloat outW = (canvasSize.width  > 0) ? canvasSize.width  : (CGFloat)srcW;
+  CGFloat outH = (canvasSize.height > 0) ? canvasSize.height : (CGFloat)srcH;
+  CGRect fullBounds = CGRectMake(0, 0, outW, outH);
+
+  // ── 4. Clamp to full physical bounds (infinite extent) ────────────────────
+  // srcCI.extent may reflect a clean aperture smaller than the physical buffer
+  // (e.g. 1916×1076 encoded in a 1920×1080 surface). imageByClampingToExtent
+  // extends the image edge pixels to infinity so that rendering to fullBounds
+  // fills the entire output buffer rather than leaving black strips outside
+  // the clean aperture. The crop to fullBounds is deferred to Step 6 (after
+  // optional transform) to preserve this edge extension through zoom/pan ops.
+  CIImage *workingCI = [toneMappedCI imageByClampingToExtent];
+
+  // ── 5. Optional: inline transform + opacity ───────────────────────────────
+  // Applied to the already-tone-mapped CIImage so the entire graph renders
+  // in one pass. This replicates the math in _VGTCNApplyTransformAndOpacity
+  // but operates on the tone-mapped CIImage directly, avoiding a second
+  // CVPixelBuffer allocation and a second colour-management pass.
+  //
+  // HLG frames must NOT enter _VGTCNApplyTransformAndOpacity: that function
+  // constructs a new CIImage from its CVPixelBuffer input without
+  // kCIImageColorSpace:[NSNull null], which would re-apply colour management
+  // to the already-rendered sRGB intermediate, and renders with bounds:
+  // srcCI.extent (clean aperture), producing the right-side black strip.
+  CIImage *finalCI = workingCI;
+  if (td && !td.isIdentity) {
+    // Anchor in CoreImage coordinates (bottom-left origin, Y up — D1 flip).
+    CGFloat anchorX_CI = (CGFloat)(td.anchorX * outW);
+    CGFloat anchorY_CI = (CGFloat)((1.0 - td.anchorY) * outH);
+
+    // Build component transforms independently (RR-147: explicit Concat
+    // preserves left-to-right application order).
+    CGAffineTransform t1 = CGAffineTransformMakeTranslation(-anchorX_CI, -anchorY_CI);
+    CGAffineTransform t2 = CGAffineTransformMakeScale((CGFloat)td.scaleX,
+                                                       (CGFloat)td.scaleY);
+    CGAffineTransform t3 = CGAffineTransformMakeRotation(-(CGFloat)td.rotation);
+    CGAffineTransform t4 = CGAffineTransformMakeTranslation(anchorX_CI, anchorY_CI);
+    CGAffineTransform t5 = CGAffineTransformMakeTranslation((CGFloat)td.translationX,
+                                                             -(CGFloat)td.translationY);
+    CGAffineTransform t = CGAffineTransformConcat(t1, t2);
+    t = CGAffineTransformConcat(t, t3);
+    t = CGAffineTransformConcat(t, t4);
+    t = CGAffineTransformConcat(t, t5);
+
+    CIFilter *affineFilter = [CIFilter filterWithName:@"CIAffineTransform"];
+    [affineFilter setValue:workingCI forKey:kCIInputImageKey];
+    [affineFilter setValue:[NSValue valueWithBytes:&t
+                                          objCType:@encode(CGAffineTransform)]
+                    forKey:@"inputTransform"];
+    CIImage *transformedCI = affineFilter.outputImage;
+    if (!transformedCI) {
+      if (outError) {
+        *outError = _VGTCNError(
+            20, @"VGTimelineCompositorNode (C1F): CIAffineTransform produced "
+                 "no output image.");
+      }
+      return NULL;
+    }
+
+    // Composite transformed image over a black background cropped to fullBounds
+    // so pixels outside the transformed region are black, not transparent/garbage.
+    CIImage *black = [CIImage imageWithColor:[CIColor colorWithRed:0
+                                                             green:0
+                                                              blue:0]];
+    CIFilter *composite = [CIFilter filterWithName:@"CISourceOverCompositing"];
+    [composite setValue:transformedCI forKey:kCIInputImageKey];
+    [composite setValue:[black imageByCroppingToRect:fullBounds]
+                 forKey:kCIInputBackgroundImageKey];
+    CIImage *composited = composite.outputImage;
+    if (!composited) { composited = transformedCI; } // defensive fallback
+
+    // Optional opacity via CIColorMatrix alpha-channel scale.
+    if (td.opacity < 1.0) {
+      CIFilter *opacityFilter = [CIFilter filterWithName:@"CIColorMatrix"];
+      [opacityFilter setValue:composited forKey:kCIInputImageKey];
+      CIVector *alphaVec = [CIVector vectorWithX:0 Y:0 Z:0 W:(CGFloat)td.opacity];
+      [opacityFilter setValue:alphaVec forKey:@"inputAVector"];
+      [opacityFilter setValue:[CIVector vectorWithX:0 Y:0 Z:0 W:0]
+                       forKey:@"inputBiasVector"];
+      CIImage *opacityOut = opacityFilter.outputImage;
+      if (opacityOut) { composited = opacityOut; }
+    }
+
+    finalCI = composited;
+  }
+
+  // ── 6. Crop final image to output bounds ──────────────────────────────────
+  // Ensures the CIImage extent exactly matches fullBounds before rendering,
+  // which is required when no-transform path uses imageByClampingToExtent
+  // (infinite extent after clamping).
+  finalCI = [finalCI imageByCroppingToRect:fullBounds];
+
+  // ── 7. Allocate output CVPixelBuffer ─────────────────────────────────────
+  NSDictionary *attrs = @{
+    (id)kCVPixelBufferPixelFormatTypeKey     : @(kCVPixelFormatType_32BGRA),
+    (id)kCVPixelBufferMetalCompatibilityKey  : @YES,
+    (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+  };
+  CVPixelBufferRef out = NULL;
+  CVReturn ret = CVPixelBufferCreate(kCFAllocatorDefault,
+                                     (size_t)outW, (size_t)outH,
+                                     kCVPixelFormatType_32BGRA,
+                                     (__bridge CFDictionaryRef)attrs, &out);
+  if (ret != kCVReturnSuccess || !out) {
+    if (outError) {
+      *outError = _VGTCNError(23,
+          @"VGTimelineCompositorNode (C1F): CVPixelBufferCreate failed for "
+           "HLG output buffer.");
+    }
+    return NULL;
+  }
+
+  // ── 8. Single final render — sRGB OETF applied exactly once ──────────────
+  // CIContext renders linear BT.709 kernel output into a kCGColorSpaceSRGB
+  // destination, applying the sRGB transfer function automatically. This is
+  // step 3 of the preview Metal shader (sRGBEncode), performed by the
+  // framework rather than manually in the kernel.
+  CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  [_VGTCNSharedCIContext() render:finalCI
+                   toCVPixelBuffer:out
+                             bounds:fullBounds
+                         colorSpace:cs];
+  CGColorSpaceRelease(cs);
+
+  // ── 9. Tag output colour as BT.709 ───────────────────────────────────────
+  // Phase 10-C C1F Clean Aperture Fix:
+  // Do NOT call CVBufferPropagateAttachments(sourceBuffer, out) here.
+  //
+  // The output buffer is a fully rendered timeline compositor frame — it is
+  // not a re-packaged source frame. The source HLG pixel buffer (decoded by
+  // AVAssetReaderVideoCompositionOutput) retains the original camera track's
+  // clean aperture and pixel aspect ratio CVBuffer attachments (e.g. the
+  // iPhone records a 1916×1076 clean aperture inside a 1920×1080 coded
+  // surface). Propagating these attachments to `out` causes VideoToolbox /
+  // QuickTime to interpret the fully-rendered output as if it still has that
+  // source clean aperture, triggering unwanted edge cropping and producing
+  // the right-side smear / strip artifact.
+  //
+  // The output buffer is freshly allocated via CVPixelBufferCreate and carries
+  // no geometry metadata. Only BT.709 colour tags are required; those are
+  // applied unconditionally by _VGTCNTagSDR709PixelBuffer below.
+  _VGTCNTagSDR709PixelBuffer(out); // C1F: tag output BT.709/sRGB — no source aperture propagation
+
+  return out; // caller owns +1 from CVPixelBufferCreate
 }
 
 static CVPixelBufferRef _VGTCNBlendBuffers(CVPixelBufferRef outgoing,
@@ -279,12 +613,16 @@ static CVPixelBufferRef _VGTCNBlendBuffers(CVPixelBufferRef outgoing,
     return NULL;
   }
 
-  CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+  // Phase 10-C C1E: sRGB is the deterministic SDR Rec.709 target; DeviceRGB is
+  // unmanaged and varies per device. CoreImage colour-manages HLG/P3 sources
+  // into sRGB when rendering to this colour space.
+  CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
   [_VGTCNSharedCIContext() render:blendedCI
                     toCVPixelBuffer:out
                               bounds:blendedCI.extent
                           colorSpace:cs];
   CGColorSpaceRelease(cs);
+  _VGTCNTagSDR709PixelBuffer(out); // C1E: tag output as BT.709/sRGB
 
   return out; // Caller owns +1 from CVPixelBufferCreate
 }
@@ -732,16 +1070,15 @@ static CVPixelBufferRef _VGTCNCompositePiP(
     }
 
     CGRect renderBounds = CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH);
-    // Phase 7.x-Q3B color-space fix: pass explicit device RGB so Core Image
-    // gamma-encodes output values correctly. Matches _VGTCNBlendBuffers pattern.
-    // colorSpace:nil would write linear working-space values directly, causing
-    // dark/underexposed composited output.
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    // Phase 10-C C1E: sRGB replaces DeviceRGB for deterministic SDR Rec.709 output.
+    // CoreImage colour-manages HLG/P3 sources into sRGB at render time.
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     [_VGTCNSharedCIContext() render:composited
                      toCVPixelBuffer:outputBuf
                                bounds:renderBounds
                            colorSpace:cs];
     CGColorSpaceRelease(cs);
+    _VGTCNTagSDR709PixelBuffer(outputBuf); // C1E: tag output as BT.709/sRGB
 
     os_log(OS_LOG_DEFAULT,
            "[VGTCNode-Q3B] PiP composited: pip=(%.0f,%.0f,%.0f,%.0f) "
@@ -842,15 +1179,15 @@ static CVPixelBufferRef _VGTCNCompositeSplitScreen(
     }
 
     CGRect renderBounds = CGRectMake(0, 0, (CGFloat)primW, (CGFloat)primH);
-    // Phase 7.x-Q3B color-space fix: explicit device RGB to match PiP path and
-    // _VGTCNBlendBuffers. Prevents linear working-space values from being written
-    // directly into the output buffer (which would produce dark composited output).
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    // Phase 10-C C1E: sRGB replaces DeviceRGB for deterministic SDR Rec.709 output.
+    // CoreImage colour-manages HLG/P3 sources into sRGB at render time.
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     [_VGTCNSharedCIContext() render:composited
                      toCVPixelBuffer:outputBuf
                                bounds:renderBounds
                            colorSpace:cs];
     CGColorSpaceRelease(cs);
+    _VGTCNTagSDR709PixelBuffer(outputBuf); // C1E: tag output as BT.709/sRGB
 
     os_log(OS_LOG_DEFAULT,
            "[VGTCNode-Q3B] Split composited: prim=%zux%zu sec=%zux%zu "
@@ -1042,7 +1379,8 @@ static CVPixelBufferRef _VGTCNCreatePixelBufferFromStillImage(
   // rect are never written, naturally implementing fill-mode edge clipping.
   CVPixelBufferLockBaseAddress(pb, 0);
   void *base = CVPixelBufferGetBaseAddress(pb);
-  CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+  // Phase 10-C C1E: sRGB replaces DeviceRGB for deterministic SDR Rec.709 output.
+  CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
 
   CGContextRef ctx = CGBitmapContextCreate(
       base,
@@ -1096,6 +1434,7 @@ static CVPixelBufferRef _VGTCNCreatePixelBufferFromStillImage(
   CGContextRelease(ctx);
   CVPixelBufferUnlockBaseAddress(pb, 0);
   CGImageRelease(activeImage);
+  _VGTCNTagSDR709PixelBuffer(pb); // C1E: tag output as BT.709/sRGB
 
   return pb; // caller owns +1 from CVPixelBufferCreate
 }
@@ -1236,12 +1575,15 @@ static CVPixelBufferRef _VGTCNApplyTransformAndOpacity(
     return NULL;
   }
 
-  CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+  // Phase 10-C C1E: sRGB replaces DeviceRGB for deterministic SDR Rec.709 output.
+  // CoreImage colour-manages HLG source pixels into sRGB at render time.
+  CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
   [_VGTCNSharedCIContext() render:finalCI
                    toCVPixelBuffer:out
                              bounds:srcCI.extent
                          colorSpace:cs];
   CGColorSpaceRelease(cs);
+  _VGTCNTagSDR709PixelBuffer(out); // C1E: tag output as BT.709/sRGB
 
   return out; // Caller owns +1 from CVPixelBufferCreate
 }
@@ -3038,7 +3380,8 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
         CIImage *centered = [scaled imageByApplyingTransform:
             CGAffineTransformMakeTranslation(offsetX, offsetY)];
 
-        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        // Phase 10-C C1E: sRGB replaces DeviceRGB for deterministic SDR Rec.709 output.
+        CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
         [_VGTCNSharedCIContext() render:centered
                           toCVPixelBuffer:pb
                                     bounds:CGRectMake(0, 0,
@@ -3046,6 +3389,7 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
                                                       _targetRenderSize.height)
                                 colorSpace:cs];
         CGColorSpaceRelease(cs);
+        _VGTCNTagSDR709PixelBuffer(pb); // C1E: tag output as BT.709/sRGB
         (void)tx; // suppress unused warning
 
         // Apply Phase 7.11 transform if non-identity (freeze clips default to nil).
@@ -3354,7 +3698,8 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
       CIImage *centered = [scaled imageByApplyingTransform:
           CGAffineTransformMakeTranslation(offsetX, offsetY)];
 
-      CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+      // Phase 10-C C1E: sRGB replaces DeviceRGB for deterministic SDR Rec.709 output.
+      CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
       [_VGTCNSharedCIContext() render:centered
                         toCVPixelBuffer:pb
                                   bounds:CGRectMake(0, 0,
@@ -3362,6 +3707,7 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
                                                     _targetRenderSize.height)
                               colorSpace:cs];
       CGColorSpaceRelease(cs);
+      _VGTCNTagSDR709PixelBuffer(pb); // C1E: tag output as BT.709/sRGB
 
       // Apply Phase 7.11 per-clip transform if non-identity.
       VGClipTransformDescriptor *td = clip.transform;
@@ -3475,7 +3821,70 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
   }
   CVPixelBufferRetain(pb); // pb is now +1
 
-  // ── 4. Apply transform (Phase 7.11 / Phase 7.23B) ────────────────────────────
+  // ── 3b. Phase 10-C C1F: Single canonical HLG export render ───────────────────
+  //
+  // For HLG frames, resolve the transform descriptor and call _VGTCNRenderHLGFrame
+  // which composes the full CIImage graph — tone-map kernel + optional
+  // transform/opacity — and renders exactly once to kCGColorSpaceSRGB.
+  //
+  // Both identity (no-transform) and zoom/pan HLG frames take this path, so
+  // colour management and geometry are handled identically. The former divergence
+  // (identity → encoder direct, zoom/pan → _VGTCNApplyTransformAndOpacity second
+  // render) is eliminated.
+  //
+  // If _VGTCNRenderHLGFrame succeeds, pb is replaced with the rendered output and
+  // hlgFrameRendered is set to YES so the downstream step 4 transform block is
+  // skipped. If it fails (kernel unavailable, allocation error) the frame falls
+  // through to the existing SDR path as a non-fatal degraded output.
+  //
+  // SDR buffers are unchanged: _VGTCNIsHLGBuffer returns NO and this block is
+  // skipped entirely.
+  BOOL hlgFrameRendered = NO;
+  if (_VGTCNIsHLGBuffer(pb)) {
+    // Resolve transform descriptor — same logic as step 4 below, duplicated
+    // here so HLG frames resolve td before rendering and can skip step 4.
+    VGClipDescriptor *hlgClipDesc = (reader.resolvedClip ?: _clips[reader.clipIndex]);
+    VGClipTransformDescriptor *hlgTd = nil;
+    BOOL hlgIsSecondary = (reader.resolvedClip != nil &&
+                           reader.resolvedClip != _clips[reader.clipIndex]);
+    VGTransformTrackDescriptor *hlgTransformTrack =
+        (!hlgIsSecondary && !reader.isStaticSource && !hlgClipDesc.isReversed)
+            ? hlgClipDesc.transformTrack
+            : nil;
+    if (hlgTransformTrack != nil) {
+      int64_t timeUs = llround(_currentElapsedTimeline * 1000000.0);
+      hlgTd = [hlgTransformTrack interpolatedTransformAtTimeUs:timeUs];
+    } else {
+      hlgTd = hlgClipDesc.transform;
+    }
+
+    CGSize canvas = CGSizeMake((CGFloat)CVPixelBufferGetWidth(pb),
+                               (CGFloat)CVPixelBufferGetHeight(pb));
+    NSError *hlgErr = nil;
+    CVPixelBufferRef hlgOut = _VGTCNRenderHLGFrame(pb, hlgTd, canvas, &hlgErr);
+    if (hlgOut) {
+      CVPixelBufferRelease(pb); // release decoded HLG source buffer
+      pb = hlgOut;              // adopt fully-rendered output (+1 from helper)
+      hlgFrameRendered = YES;   // signal step 4 to skip _VGTCNApplyTransformAndOpacity
+    } else if (hlgErr) {
+      os_log_error(sTimelineLog,
+                   "[VGTCNode-C1F] HLG render failed clip=%lu: %{public}@ — "
+                   "falling through to SDR path",
+                   (unsigned long)reader.clipIndex,
+                   hlgErr.localizedDescription);
+      // hlgFrameRendered stays NO; pb stays as original HLG buffer;
+      // step 4 will apply transform only (degraded colour, but not broken).
+    }
+    // If hlgOut is NULL and hlgErr is nil: kernel unavailable (already logged
+    // at creation). Same degraded fallthrough.
+  }
+
+  // ── 4. Apply transform (Phase 7.11 / Phase 7.23B) — SDR frames only ─────────
+  //
+  // HLG frames that were successfully rendered by _VGTCNRenderHLGFrame already
+  // have their transform applied inside the helper (hlgFrameRendered == YES).
+  // Skipping here prevents a second _VGTCNApplyTransformAndOpacity render which
+  // would re-apply colour management and produce geometry errors.
   //
   // Phase 7.23B (DEC-167): Keyframe-interpolated transform path.
   // Eligibility guard: only forward-playing primary video clips with a
@@ -3490,45 +3899,47 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
   // Phase 7.x-Q3A: resolvedClip governs which transform descriptor to use,
   // ensuring secondary readers apply their own clip's transform, not the
   // primary timeline clip's transform.
-  VGClipDescriptor *resolvedClipDesc = (reader.resolvedClip ?: _clips[reader.clipIndex]);
-  VGClipTransformDescriptor *td = nil;
+  if (!hlgFrameRendered) {
+    VGClipDescriptor *resolvedClipDesc = (reader.resolvedClip ?: _clips[reader.clipIndex]);
+    VGClipTransformDescriptor *td = nil;
 
-  // Phase 7.23B: keyframe path (forward-play primary video only).
-  //   - resolvedClip.transformTrack must be non-nil.
-  //   - Not a static-source (still-image / freeze-frame) reader.
-  //   - Not a reversed clip.
-  //   - Not a secondary reader (resolvedClip and _clips[reader.clipIndex] must be the same).
-  BOOL isSecondaryReader = (reader.resolvedClip != nil &&
-                            reader.resolvedClip != _clips[reader.clipIndex]);
-  VGTransformTrackDescriptor *transformTrack =
-      (!isSecondaryReader && !reader.isStaticSource && !resolvedClipDesc.isReversed)
-          ? resolvedClipDesc.transformTrack
-          : nil;
+    // Phase 7.23B: keyframe path (forward-play primary video only).
+    //   - resolvedClip.transformTrack must be non-nil.
+    //   - Not a static-source (still-image / freeze-frame) reader.
+    //   - Not a reversed clip.
+    //   - Not a secondary reader (resolvedClip and _clips[reader.clipIndex] must be the same).
+    BOOL isSecondaryReader = (reader.resolvedClip != nil &&
+                              reader.resolvedClip != _clips[reader.clipIndex]);
+    VGTransformTrackDescriptor *transformTrack =
+        (!isSecondaryReader && !reader.isStaticSource && !resolvedClipDesc.isReversed)
+            ? resolvedClipDesc.transformTrack
+            : nil;
 
-  if (transformTrack != nil) {
-    // Keyframe-interpolated transform: convert _currentElapsedTimeline to
-    // microseconds using llround for accurate int64 conversion (DEC-167 / Opus).
-    int64_t timeUs = llround(_currentElapsedTimeline * 1000000.0);
-    td = [transformTrack interpolatedTransformAtTimeUs:timeUs];
-  } else {
-    // Static transform path: existing Phase 7.11 / Q3A behavior.
-    td = resolvedClipDesc.transform;
-  }
-
-  if (td && !td.isIdentity) {
-    NSError *tfErr = nil;
-    CVPixelBufferRef transformedPB = _VGTCNApplyTransformAndOpacity(pb, td, &tfErr);
-    CVPixelBufferRelease(pb); // release un-transformed original
-    if (!transformedPB) {
-      CFRelease(sample);
-      os_log_error(sTimelineLog,
-                   "[VGTCNode] _pullBufferFromReader: transform clip %lu: %{public}@",
-                   (unsigned long)reader.clipIndex,
-                   tfErr.localizedDescription);
-      if (outError) *outError = tfErr;
-      return NULL;
+    if (transformTrack != nil) {
+      // Keyframe-interpolated transform: convert _currentElapsedTimeline to
+      // microseconds using llround for accurate int64 conversion (DEC-167 / Opus).
+      int64_t timeUs = llround(_currentElapsedTimeline * 1000000.0);
+      td = [transformTrack interpolatedTransformAtTimeUs:timeUs];
+    } else {
+      // Static transform path: existing Phase 7.11 / Q3A behavior.
+      td = resolvedClipDesc.transform;
     }
-    pb = transformedPB; // +1 owned by this scope
+
+    if (td && !td.isIdentity) {
+      NSError *tfErr = nil;
+      CVPixelBufferRef transformedPB = _VGTCNApplyTransformAndOpacity(pb, td, &tfErr);
+      CVPixelBufferRelease(pb); // release un-transformed original
+      if (!transformedPB) {
+        CFRelease(sample);
+        os_log_error(sTimelineLog,
+                     "[VGTCNode] _pullBufferFromReader: transform clip %lu: %{public}@",
+                     (unsigned long)reader.clipIndex,
+                     tfErr.localizedDescription);
+        if (outError) *outError = tfErr;
+        return NULL;
+      }
+      pb = transformedPB; // +1 owned by this scope
+    }
   }
 
   // ── 5. Read timing and update per-reader cache ────────────────────────────
@@ -3756,12 +4167,14 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
                                 CGAffineTransformMakeScale(pScale, pScale)];
       CIImage *pCentered = [pScaled imageByApplyingTransform:
                                 CGAffineTransformMakeTranslation(pOffsetX, pOffsetY)];
-      CGColorSpaceRef pCS = CGColorSpaceCreateDeviceRGB();
+      // Phase 10-C C1E: sRGB replaces DeviceRGB for deterministic SDR Rec.709 output.
+      CGColorSpaceRef pCS = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
       [_VGTCNSharedCIContext() render:pCentered
                         toCVPixelBuffer:pPB
                                   bounds:CGRectMake(0, 0, (CGFloat)pW, (CGFloat)pH)
                               colorSpace:pCS];
       CGColorSpaceRelease(pCS);
+      _VGTCNTagSDR709PixelBuffer(pPB); // C1E: tag output as BT.709/sRGB
 
       // ── Guard 4: stale generation before insert ───────────────────────────
       if (atomic_load(&self->_generation) != capturedGen) {
