@@ -195,9 +195,16 @@ static CIContext *_VGDFNSharedCIContext(void) {
     }
 
     // Render CIImage into the output buffer.
+    // Phase 10-D fix: pass an explicit DeviceRGB color space so Core Image
+    // converts from its linear working space back to the sRGB/DeviceRGB
+    // destination format. Passing nil left intermediate buffers in linear
+    // space, causing gamma double-application and severe tone collapse in
+    // downstream nodes. Matches the pattern used in VGTransformFilterNode.m.
     CIContext *ctx = _VGDFNSharedCIContext();
     CGRect renderRect = CGRectMake(0, 0, (CGFloat)srcW, (CGFloat)srcH);
-    [ctx render:outputCI toCVPixelBuffer:outputBuffer bounds:renderRect colorSpace:nil];
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    [ctx render:outputCI toCVPixelBuffer:outputBuffer bounds:renderRect colorSpace:colorSpace];
+    CGColorSpaceRelease(colorSpace);
 
     NSLog(@"[VGDenoiseFilterNode] applied: %zux%zu noiseLevel=%.3f sharpness=%.2f",
           srcW, srcH, _noiseLevel, _sharpness);
