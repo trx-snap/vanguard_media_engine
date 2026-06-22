@@ -5414,16 +5414,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             let capturedEnhancement = enhancementParams
 
             DispatchQueue.global(qos: .userInitiated).async {
-                // 1. Resolve format → VGImageExportProfile factory.
-                let profile: VGImageExportProfile
-                switch formatStr {
-                case "heic":
-                    profile = VGImageExportProfile.heicProfile(withQuality: quality)
-                case "png":
-                    profile = VGImageExportProfile.png()
-                default: // "jpeg" — already validated above
-                    profile = VGImageExportProfile.jpegProfile(withQuality: quality)
-                }
 
                 // 2. Decode source via UIImage to bake EXIF orientation.
                 //    UIImage honours imageOrientation internally; drawing it into
@@ -5477,121 +5467,264 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 NSLog("[VanguardPlugin][10-C] optimizeImage resize: %dx%d → %dx%d (scale=%.4f)",
                       srcW, srcH, canvasW, canvasH, scale)
 
-                // 4. Build VanguardImageMediaSource.
-                //    releaseBuffersOnInvalidate=YES: safe for one-shot serial export.
-                let processor = VanguardImageProcessor(device: MTLCreateSystemDefaultDevice()!,
-                                                       pool: nil)
+                // 4. Prepare invariants shared across all passes.
                 let sourceURL = URL(fileURLWithPath: sourcePath)
-                let mediaSource = VanguardImageMediaSource(url: sourceURL,
-                                                           processor: processor,
-                                                           releaseBuffersOnInvalidate: true)
-
-                // 5. Build filter chain.
-                //
-                //    Baseline (no enhancement):
-                //      [VGTransformFilterNode] when a resize is required, else nil.
-                //
-                //    Phase 10-D (enhancement enabled):
-                //      [VGDenoiseFilterNode, VGTransformFilterNode, VGSharpenFilterNode]
-                //      — denoise runs at source res (pre-resize), transform resizes,
-                //        sharpen runs at canvas res (post-resize).
-                //      — If no resize is needed: [VGDenoiseFilterNode, VGSharpenFilterNode].
-                //
-                //    Failure-safe: each node independently falls back to passthrough
-                //    if CIFilter returns nil, so a failing enhancement node never
-                //    blocks the export.
-                //
-                let device = MTLCreateSystemDefaultDevice()!
+                let device    = MTLCreateSystemDefaultDevice()!
                 let needsResize = (canvasW != srcW || canvasH != srcH)
 
-                // Build transform node (always constructed, conditionally included).
-                let transformNode = VGTransformFilterNode(pool: nil,
-                                                          device: device,
-                                                          canvasWidth: canvasW,
-                                                          canvasHeight: canvasH,
-                                                          scale: 1.0,
-                                                          offsetX: 0.0,
-                                                          offsetY: 0.0,
-                                                          quarterTurns: 0,
-                                                          flipX: false,
-                                                          cropRect: nil)
+                // 5. Phase 10-D.3B — Adaptive quality / file-size enforcement loop.
+                //
+                // Rationale: high-frequency images (foliage, lace, fine texture) can
+                // exceed the 600 KB soft target at quality=0.88 even after downscale,
+                // because CIUnsharpMask adds entropy that JPEG cannot fully absorb.
+                // The loop reduces quality and sharpening in successive passes until
+                // the output meets the budget, or the maximum pass count is reached.
+                //
+                // Budget thresholds (Connects timeline delivery profile):
+                //   softMax: 600 KB — target for normal images.
+                //   (hardMax: 750 KB — not enforced; overshoots are logged.)
+                //
+                // Per-pass policy when enhancement is ON and fileSizeTargetBytes is set:
+                //   Pass 1: configured quality + full sharpen intensity.
+                //   Pass 2: quality 0.84 + half sharpen intensity  (if > softMax).
+                //   Pass 3: quality 0.80 + sharpen off             (if > softMax).
+                //   Pass 4: quality 0.75 + sharpen off             (if > softMax).
+                // Without enhancement, or without a size target: single pass only.
+                //
+                // File management: each pass writes to a unique temp path. The
+                // winning file is renamed to the caller's outputPath. The previous
+                // pass temp is deleted before each new attempt to avoid orphaned files.
+                //
+                // VGImageExportSession is single-use (startWithCompletion: may be
+                // called once). A fresh session — and fresh mediaSource — is created
+                // for every pass. Completion is awaited via DispatchSemaphore (safe:
+                // completion fires on the session's private queue, not this queue).
 
+                let softMaxBytes: Int64  = 600_000
+                let hardMaxBytes: Int64  = 750_000
+                let baseQuality          = Float(quality)
+                let baseIntensity        = capturedEnhancement.enabled
+                                          ? capturedEnhancement.intensity : 0.0
+                let hasFileSizeTarget    = (fileSizeTargetBytes ?? 0) > 0
 
-                // Build filter chain.
-                // Baseline: [VGTransformFilterNode] when resize required, else nil.
-                // Phase 10-D: [VGDenoiseFilterNode, VGTransformFilterNode, VGSharpenFilterNode]
-                //             (or [VGDenoiseFilterNode, VGSharpenFilterNode] if no resize).
-                let filterChain: [Any]?
-
-                if capturedEnhancement.enabled {
-                    let denoiseNode = VGDenoiseFilterNode(pool: nil,
-                                                          device: device,
-                                                          noiseLevel: capturedEnhancement.noiseLevel,
-                                                          sharpness: capturedEnhancement.sharpness)
-                    let sharpenNode = VGSharpenFilterNode(pool: nil,
-                                                          device: device,
-                                                          intensity: capturedEnhancement.intensity,
-                                                          radius: capturedEnhancement.radius)
-                    filterChain = needsResize
-                        ? [denoiseNode, transformNode, sharpenNode]
-                        : [denoiseNode, sharpenNode]
-                } else {
-                    // Baseline: transform only when a resize is actually required.
-                    filterChain = needsResize ? [transformNode] : nil
+                // Per-pass parameter tuple.
+                struct _VGAdaptivePass {
+                    let quality:          Float
+                    let sharpenIntensity: Double
                 }
 
+                let passes: [_VGAdaptivePass]
+                if hasFileSizeTarget && capturedEnhancement.enabled {
+                    passes = [
+                        _VGAdaptivePass(quality: baseQuality, sharpenIntensity: baseIntensity),
+                        _VGAdaptivePass(quality: 0.84,        sharpenIntensity: baseIntensity * 0.5),
+                        _VGAdaptivePass(quality: 0.80,        sharpenIntensity: 0.0),
+                        _VGAdaptivePass(quality: 0.75,        sharpenIntensity: 0.0),
+                    ]
+                } else if hasFileSizeTarget {
+                    // Enhancement off: quality reduction only.
+                    passes = [
+                        _VGAdaptivePass(quality: baseQuality, sharpenIntensity: 0.0),
+                        _VGAdaptivePass(quality: 0.84,        sharpenIntensity: 0.0),
+                        _VGAdaptivePass(quality: 0.80,        sharpenIntensity: 0.0),
+                        _VGAdaptivePass(quality: 0.75,        sharpenIntensity: 0.0),
+                    ]
+                } else {
+                    // No size target → single pass, no adaptation.
+                    passes = [_VGAdaptivePass(quality: baseQuality, sharpenIntensity: baseIntensity)]
+                }
 
-                // 6. Create VGImageExportSession and run.
-                let outputURL = URL(fileURLWithPath: outputPath)
-                let session = VGImageExportSession(source: mediaSource,
-                                                   filterChain: filterChain,
-                                                   profile: profile,
-                                                   outputURL: outputURL)
+                var winManifest:  VGImageExportManifest? = nil
+                var winPassIndex: Int                    = 0
+                var winQuality:   Float                  = baseQuality
+                var winTempURL:   URL?                   = nil
+                var prevTempURL:  URL?                   = nil   // previous pass temp to delete
 
-                session.start { manifest, error in
-                    DispatchQueue.main.async {
-                        if let error = error {
-                            NSLog("[VanguardPlugin][10-C] optimizeImage failed: %@",
-                                  error.localizedDescription)
-                            result(FlutterError(
-                                code: "IMAGE_OPTIMIZER_FAILED",
-                                message: error.localizedDescription,
-                                details: nil))
-                            return
-                        }
-                        guard let manifest = manifest else {
-                            NSLog("[VanguardPlugin][10-C] optimizeImage: nil manifest (unexpected)")
-                            result(FlutterError(
-                                code: "IMAGE_OPTIMIZER_FAILED",
-                                message: "optimizeImage: native returned nil manifest without error",
-                                details: nil))
-                            return
-                        }
+                for (idx, passP) in passes.enumerated() {
+                    let passNum    = idx + 1
+                    let isLastPass = passNum == passes.count
 
-                        // Resolve format name from manifest (reflects actual platform format,
-                        // e.g. HEIC → JPEG fallback on non-HEVC devices).
-                        let resolvedFormat: String
-                        switch manifest.format {
-                        case .HEIC:
-                            resolvedFormat = "heic"
-                        case .PNG:
-                            resolvedFormat = "png"
-                        default:
-                            resolvedFormat = "jpeg"
-                        }
+                    // Unique temp path for this pass.
+                    let tempURL = URL(fileURLWithPath: outputPath + ".vg_p\(passNum).tmp")
 
-                        NSLog("[VanguardPlugin][10-C] optimizeImage success: %dx%d %@ %lld bytes",
-                              manifest.width, manifest.height, resolvedFormat, manifest.fileSizeBytes)
-
-                        result([
-                            "success":       true,
-                            "outputPath":    outputPath,
-                            "width":         Int(manifest.width),
-                            "height":        Int(manifest.height),
-                            "fileSizeBytes": Int(manifest.fileSizeBytes),
-                            "format":        resolvedFormat,
-                        ] as [String: Any])
+                    // Delete the previous pass temp (no longer needed).
+                    if let prev = prevTempURL {
+                        try? FileManager.default.removeItem(at: prev)
+                        prevTempURL = nil
                     }
+
+                    // ── Build profile for this pass ────────────────────────────
+                    let passProfile: VGImageExportProfile
+                    switch formatStr {
+                    case "heic": passProfile = VGImageExportProfile.heicProfile(withQuality: passP.quality)
+                    case "png":  passProfile = VGImageExportProfile.png()
+                    default:     passProfile = VGImageExportProfile.jpegProfile(withQuality: passP.quality)
+                    }
+
+                    // ── Build filter chain for this pass ───────────────────────
+                    // VGTransformFilterNode is stateless after init; re-instantiated per
+                    // pass because the prior instance is invalidated by the previous session.
+                    let passTransform = VGTransformFilterNode(pool: nil,
+                                                              device: device,
+                                                              canvasWidth:  canvasW,
+                                                              canvasHeight: canvasH,
+                                                              scale:        1.0,
+                                                              offsetX:      0.0,
+                                                              offsetY:      0.0,
+                                                              quarterTurns: 0,
+                                                              flipX:        false,
+                                                              cropRect:     nil)
+
+                    let passFilterChain: [Any]?
+                    if capturedEnhancement.enabled {
+                        let denoiseNode = VGDenoiseFilterNode(
+                            pool: nil, device: device,
+                            noiseLevel: capturedEnhancement.noiseLevel,
+                            sharpness:  capturedEnhancement.sharpness)
+                        let sharpenNode = VGSharpenFilterNode(
+                            pool: nil, device: device,
+                            intensity: passP.sharpenIntensity,
+                            radius:    capturedEnhancement.radius)
+                        passFilterChain = needsResize
+                            ? [denoiseNode, passTransform, sharpenNode]
+                            : [denoiseNode, sharpenNode]
+                    } else {
+                        passFilterChain = needsResize ? [passTransform] : nil
+                    }
+
+                    // ── Fresh media source per pass ────────────────────────────
+                    // VanguardImageMediaSource is invalidated at the end of each
+                    // VGImageExportSession — a new instance is required for each pass.
+                    let passProcessor = VanguardImageProcessor(device: device, pool: nil)
+                    let passSource    = VanguardImageMediaSource(
+                        url: sourceURL,
+                        processor: passProcessor,
+                        releaseBuffersOnInvalidate: true)
+
+                    // ── Create and run session (block via semaphore) ────────────
+                    let sem           = DispatchSemaphore(value: 0)
+                    var passManifest: VGImageExportManifest? = nil
+                    var passError:    Error?                  = nil
+
+                    let passSession = VGImageExportSession(source: passSource,
+                                                           filterChain: passFilterChain,
+                                                           profile: passProfile,
+                                                           outputURL: tempURL)
+                    passSession.start { mf, err in
+                        passManifest = mf
+                        passError    = err
+                        sem.signal()
+                    }
+                    sem.wait()
+
+                    // ── Handle session failure ─────────────────────────────────
+                    if let err = passError {
+                        try? FileManager.default.removeItem(at: tempURL)
+                        NSLog("[VanguardPlugin][10-D.3B] pass %d failed: %@",
+                              passNum, err.localizedDescription)
+                        DispatchQueue.main.async {
+                            result(FlutterError(
+                                code:    "IMAGE_OPTIMIZER_FAILED",
+                                message: err.localizedDescription,
+                                details: nil))
+                        }
+                        return
+                    }
+                    guard let mf = passManifest else {
+                        try? FileManager.default.removeItem(at: tempURL)
+                        DispatchQueue.main.async {
+                            result(FlutterError(
+                                code:    "IMAGE_OPTIMIZER_FAILED",
+                                message: "optimizeImage pass \(passNum): nil manifest (unexpected)",
+                                details: nil))
+                        }
+                        return
+                    }
+
+                    NSLog("[VanguardPlugin][10-D.3B] pass %d: quality=%.2f sharpen=%.2f → %lld bytes",
+                          passNum, passP.quality, passP.sharpenIntensity, mf.fileSizeBytes)
+
+                    // ── Budget check ───────────────────────────────────────────
+                    let withinSoftMax = mf.fileSizeBytes <= softMaxBytes
+                    if !withinSoftMax && !isLastPass {
+                        // Over budget and more passes available — continue.
+                        prevTempURL = tempURL
+                        continue
+                    }
+
+                    // Winner: within softMax, or ran out of passes.
+                    if !withinSoftMax {
+                        NSLog("[VanguardPlugin][10-D.3B] pass %d: %lld bytes exceeds softMax (%lld)%@",
+                              passNum, mf.fileSizeBytes, softMaxBytes,
+                              mf.fileSizeBytes > hardMaxBytes
+                                  ? " AND hardMax (\(hardMaxBytes))" : "")
+                    }
+                    winManifest  = mf
+                    winPassIndex = passNum
+                    winQuality   = passP.quality
+                    winTempURL   = tempURL
+                    break
+                }
+
+                // ── Finalize: rename winning temp to caller's outputPath ────────
+                guard let manifest = winManifest, let srcTemp = winTempURL else {
+                    DispatchQueue.main.async {
+                        result(FlutterError(
+                            code:    "IMAGE_OPTIMIZER_FAILED",
+                            message: "optimizeImage: adaptive loop produced no result",
+                            details: nil))
+                    }
+                    return
+                }
+
+                do {
+                    let destURL = URL(fileURLWithPath: outputPath)
+                    if FileManager.default.fileExists(atPath: outputPath) {
+                        try FileManager.default.removeItem(at: destURL)
+                    }
+                    try FileManager.default.moveItem(at: srcTemp, to: destURL)
+                } catch {
+                    // Move failed — last-resort copy.
+                    do {
+                        try FileManager.default.copyItem(at: srcTemp,
+                                                          to: URL(fileURLWithPath: outputPath))
+                        try? FileManager.default.removeItem(at: srcTemp)
+                    } catch let copyErr {
+                        try? FileManager.default.removeItem(at: srcTemp)
+                        DispatchQueue.main.async {
+                            result(FlutterError(
+                                code:    "IMAGE_OPTIMIZER_FAILED",
+                                message: "optimizeImage: output finalize failed: \(copyErr.localizedDescription)",
+                                details: nil))
+                        }
+                        return
+                    }
+                }
+
+                // ── Return result to Flutter ────────────────────────────────────
+                DispatchQueue.main.async {
+                    let resolvedFormat: String
+                    switch manifest.format {
+                    case .HEIC: resolvedFormat = "heic"
+                    case .PNG:  resolvedFormat = "png"
+                    default:    resolvedFormat = "jpeg"
+                    }
+
+                    NSLog("[VanguardPlugin][10-D.3B] optimizeImage done: pass=%d quality=%.2f %dx%d %@ %lld bytes",
+                          winPassIndex, winQuality,
+                          manifest.width, manifest.height,
+                          resolvedFormat, manifest.fileSizeBytes)
+
+                    result([
+                        "success":       true,
+                        "outputPath":    outputPath,
+                        "width":         Int(manifest.width),
+                        "height":        Int(manifest.height),
+                        "fileSizeBytes": Int(manifest.fileSizeBytes),
+                        "format":        resolvedFormat,
+                        "passCount":     winPassIndex,
+                        "chosenQuality": Double(winQuality),
+                    ] as [String: Any])
                 }
             }
 

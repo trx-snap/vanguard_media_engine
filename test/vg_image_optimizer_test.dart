@@ -735,4 +735,109 @@ void main() {
     expect(a.hashCode, equals(b.hashCode));
     expect(a, isNot(equals(c)));
   });
+
+  // ── IO-34 ─────────────────────────────────────────────────────────────────
+  // Phase 10-D.3B: VGImageOptimizationResult parses passCount and
+  // chosenQuality when present in the native result map.
+  test(
+    'IO-34: fromMap parses passCount and chosenQuality from native result',
+    () {
+      final map = <Object?, Object?>{
+        'success': true,
+        'outputPath': '/tmp/result.jpg',
+        'width': 1080,
+        'height': 810,
+        'fileSizeBytes': 450000,
+        'format': 'jpeg',
+        'passCount': 3,
+        'chosenQuality': 0.80,
+      };
+      final result = VGImageOptimizationResult.fromMap(map);
+      expect(result, isNotNull);
+      expect(result!.passCount, 3);
+      expect(result.chosenQuality, closeTo(0.80, 0.0001));
+    },
+  );
+
+  // ── IO-35 ─────────────────────────────────────────────────────────────────
+  // Phase 10-D.3B: backward-compatible defaults when passCount and
+  // chosenQuality are absent (e.g. older plugin versions).
+  test(
+    'IO-35: fromMap uses safe defaults when passCount and chosenQuality absent',
+    () {
+      final map = <Object?, Object?>{
+        'success': true,
+        'outputPath': '/tmp/result.jpg',
+        'width': 1080,
+        'height': 810,
+        'fileSizeBytes': 185000,
+        'format': 'jpeg',
+        // passCount and chosenQuality intentionally absent
+      };
+      final result = VGImageOptimizationResult.fromMap(map);
+      expect(result, isNotNull);
+      expect(result!.passCount, 1);
+      expect(result.chosenQuality, closeTo(-1.0, 0.0001));
+    },
+  );
+
+  // ── IO-36 ─────────────────────────────────────────────────────────────────
+  // Phase 10-D.3B: VGImageOptimizationResult equality includes passCount
+  // and chosenQuality.
+  test(
+    'IO-36: VGImageOptimizationResult equality includes passCount and chosenQuality',
+    () {
+      const a = VGImageOptimizationResult(
+        outputPath: '/tmp/a.jpg',
+        width: 1080,
+        height: 810,
+        fileSizeBytes: 450000,
+        format: 'jpeg',
+        passCount: 2,
+        chosenQuality: 0.84,
+      );
+      const b = VGImageOptimizationResult(
+        outputPath: '/tmp/a.jpg',
+        width: 1080,
+        height: 810,
+        fileSizeBytes: 450000,
+        format: 'jpeg',
+        passCount: 2,
+        chosenQuality: 0.84,
+      );
+      const c = VGImageOptimizationResult(
+        outputPath: '/tmp/a.jpg',
+        width: 1080,
+        height: 810,
+        fileSizeBytes: 450000,
+        format: 'jpeg',
+        passCount: 1,       // different passCount
+        chosenQuality: 0.88,
+      );
+      expect(a, equals(b));
+      expect(a.hashCode, equals(b.hashCode));
+      expect(a, isNot(equals(c)));
+    },
+  );
+
+  // ── IO-37 ─────────────────────────────────────────────────────────────────
+  // Phase 10-D.3B: VGImageOptimizationResult.toMap includes passCount and
+  // chosenQuality for round-trip serialisation.
+  test(
+    'IO-37: VGImageOptimizationResult.toMap includes passCount and chosenQuality',
+    () {
+      const r = VGImageOptimizationResult(
+        outputPath: '/tmp/r.jpg',
+        width: 1080,
+        height: 1440,
+        fileSizeBytes: 520000,
+        format: 'jpeg',
+        passCount: 2,
+        chosenQuality: 0.84,
+      );
+      final map = r.toMap();
+      expect(map['passCount'], 2);
+      expect((map['chosenQuality'] as num).toDouble(), closeTo(0.84, 0.0001));
+    },
+  );
 }

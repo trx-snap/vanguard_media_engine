@@ -526,6 +526,8 @@ final class VGImageOptimizationResult {
     required this.height,
     required this.fileSizeBytes,
     required this.format,
+    this.passCount = 1,
+    this.chosenQuality = -1.0,
   });
 
   // ── Fields ──────────────────────────────────────────────────────────────────
@@ -548,6 +550,22 @@ final class VGImageOptimizationResult {
   /// non-HEVC devices). Values: `"jpeg"`, `"heic"`, `"png"`.
   final String format;
 
+  /// Number of adaptive passes executed by the native encoder.
+  ///
+  /// 1 = single pass (no size target set or image met budget on first try).
+  /// 2–4 = multiple passes were needed to meet the file-size target.
+  /// Useful for logging and diagnostics. Defaults to 1 when the native layer
+  /// does not report this field (e.g. older plugin versions).
+  final int passCount;
+
+  /// JPEG quality value used in the winning pass. Range: 0.0–1.0.
+  ///
+  /// Equals the configured [VGImageOptimizationRequest.quality] when no
+  /// file-size target is set or the image meets the budget on the first pass.
+  /// Lower values indicate the adaptive loop reduced quality to meet the target.
+  /// -1.0 indicates the field was not reported by the native layer.
+  final double chosenQuality;
+
   // ── Deserialisation ───────────────────────────────────────────────────────────
 
   /// Creates a [VGImageOptimizationResult] from the native result map.
@@ -563,9 +581,14 @@ final class VGImageOptimizationResult {
   ///   "width": 1080,
   ///   "height": 1920,
   ///   "fileSizeBytes": 234000,
-  ///   "format": "jpeg"
+  ///   "format": "jpeg",
+  ///   "passCount": 1,
+  ///   "chosenQuality": 0.88
   /// }
   /// ```
+  ///
+  /// [passCount] and [chosenQuality] are optional; absent fields receive
+  /// safe defaults (1 and -1.0 respectively) for backward compatibility.
   static VGImageOptimizationResult? fromMap(Map<Object?, Object?> map) {
     final success = map['success'] as bool? ?? true;
     if (!success) return null;
@@ -585,12 +608,18 @@ final class VGImageOptimizationResult {
       return null;
     }
 
+    // Phase 10-D.3B: optional fields with safe defaults for backward compat.
+    final passCount = (map['passCount'] as num?)?.toInt() ?? 1;
+    final chosenQuality = (map['chosenQuality'] as num?)?.toDouble() ?? -1.0;
+
     return VGImageOptimizationResult(
       outputPath: outputPath,
       width: width,
       height: height,
       fileSizeBytes: fileSizeBytes,
       format: format,
+      passCount: passCount,
+      chosenQuality: chosenQuality,
     );
   }
 
@@ -603,6 +632,8 @@ final class VGImageOptimizationResult {
         'height': height,
         'fileSizeBytes': fileSizeBytes,
         'format': format,
+        'passCount': passCount,
+        'chosenQuality': chosenQuality,
       };
 
   // ── Equality ─────────────────────────────────────────────────────────────────
@@ -615,18 +646,24 @@ final class VGImageOptimizationResult {
           other.width == width &&
           other.height == height &&
           other.fileSizeBytes == fileSizeBytes &&
-          other.format == format;
+          other.format == format &&
+          other.passCount == passCount &&
+          other.chosenQuality == chosenQuality;
 
   @override
   int get hashCode =>
-      Object.hash(outputPath, width, height, fileSizeBytes, format);
+      Object.hash(outputPath, width, height, fileSizeBytes, format,
+                  passCount, chosenQuality);
 
   @override
-  String toString() => 'VGImageOptimizationResult('
+  String toString() =>
+      'VGImageOptimizationResult('
       'outputPath: ${outputPath.split('/').last}, '
       '$width x $height, '
       'fileSizeBytes: $fileSizeBytes, '
-      'format: $format)';
+      'format: $format, '
+      'passCount: $passCount, '
+      'chosenQuality: $chosenQuality)';
 }
 
 // ── VanguardImageOptimizer ────────────────────────────────────────────────────
