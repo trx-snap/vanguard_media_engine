@@ -60,6 +60,7 @@ Pod::Spec.new do |s|
   # inference. CPU fallback (~140 ms) is forbidden for real-time video.
   s.dependency       'TensorFlowLiteC', '~> 2.14'
   s.dependency       'TensorFlowLiteC/Metal', '~> 2.14'
+  s.static_framework = true
   s.platform         = :ios, '14.0'
 
   # Frameworks required for the GPU pipeline + Vision (Phase 4C face detection, DEC-61)
