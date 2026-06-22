@@ -40,6 +40,21 @@
 //   IO-31: VGImageEnhancementConfig equality: different params are not equal.
 //   IO-32: VGImageDenoiseConfig equality and hashCode.
 //   IO-33: VGImageSharpenConfig equality and hashCode.
+//
+// Phase 10-D.3B adaptive JPEG coverage:
+//   IO-34: fromMap parses passCount and chosenQuality.
+//   IO-35: fromMap uses safe defaults when passCount/chosenQuality absent.
+//   IO-36: VGImageOptimizationResult equality includes passCount and chosenQuality.
+//   IO-37: VGImageOptimizationResult.toMap includes passCount and chosenQuality.
+//
+// Phase 10-D.4A ROI coverage:
+//   IO-38: request without roi omits 'roiConfig' key.
+//   IO-39: disabled VGImageROIConfig(enabled:false) does not serialize roiConfig.
+//   IO-40: enabled VGImageROIConfig serializes all fields under 'roiConfig'.
+//   IO-41: VGImageROIConfig equality: same params are equal.
+//   IO-42: VGImageROIConfig equality: different enabled values are not equal.
+//   IO-43: fromMap parses ROI result fields when present.
+//   IO-44: fromMap leaves ROI result fields null when absent (no ROI requested).
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -838,6 +853,172 @@ void main() {
       final map = r.toMap();
       expect(map['passCount'], 2);
       expect((map['chosenQuality'] as num).toDouble(), closeTo(0.84, 0.0001));
+    },
+  );
+  // ── IO-38 ─────────────────────────────────────────────────────────────────
+  // Phase 10-D.4A: request without roi omits 'roiConfig' key entirely.
+  test(
+    'IO-38: request without roi omits roiConfig key',
+    () async {
+      setHandler((call) async => makeSuccessResponse());
+
+      await VanguardImageOptimizer.optimizeImage(
+        request: makeRequest(),
+        channel: channel,
+      );
+
+      final args = capturedCalls.first.arguments as Map;
+      expect(args.containsKey('roiConfig'), isFalse);
+    },
+  );
+
+  // ── IO-39 ─────────────────────────────────────────────────────────────────
+  // Phase 10-D.4A: disabled VGImageROIConfig(enabled:false) does NOT add
+  // 'roiConfig' to the request map (backward-compatible).
+  test(
+    'IO-39: disabled VGImageROIConfig does not serialize roiConfig',
+    () async {
+      setHandler((call) async => makeSuccessResponse());
+
+      await VanguardImageOptimizer.optimizeImage(
+        request: const VGImageOptimizationRequest(
+          sourcePath: '/tmp/src.jpg',
+          roi: VGImageROIConfig(enabled: false),
+        ),
+        channel: channel,
+      );
+
+      final args = capturedCalls.first.arguments as Map;
+      expect(args.containsKey('roiConfig'), isFalse);
+    },
+  );
+
+  // ── IO-40 ─────────────────────────────────────────────────────────────────
+  // Phase 10-D.4A: enabled VGImageROIConfig serializes all fields under
+  // 'roiConfig' with correct key names and default values.
+  test(
+    'IO-40: enabled VGImageROIConfig serializes all fields under roiConfig',
+    () async {
+      setHandler((call) async => makeSuccessResponse());
+
+      const roi = VGImageROIConfig(
+        enabled: true,
+        detector: 'vision_face_box',
+        faceExpandX: 0.25,
+        faceExpandYTop: 0.35,
+        faceExpandYBottom: 0.15,
+        maskFeatherRadius: 18.0,
+        minFaceRatio: 0.05,
+        bgBlurPass1: 0.75,
+        bgBlurPass2: 1.25,
+        bgBlurPass3: 1.75,
+        bgBlurPass4: 2.0,
+        sharpenROIOnly: true,
+      );
+
+      await VanguardImageOptimizer.optimizeImage(
+        request: const VGImageOptimizationRequest(
+          sourcePath: '/tmp/src.jpg',
+          roi: roi,
+        ),
+        channel: channel,
+      );
+
+      final args = capturedCalls.first.arguments as Map;
+      expect(args.containsKey('roiConfig'), isTrue);
+      final r = args['roiConfig'] as Map;
+      expect(r['enabled'], true);
+      expect(r['detector'], 'vision_face_box');
+      expect((r['faceExpandX'] as num).toDouble(), closeTo(0.25, 0.0001));
+      expect((r['faceExpandYTop'] as num).toDouble(), closeTo(0.35, 0.0001));
+      expect((r['faceExpandYBottom'] as num).toDouble(), closeTo(0.15, 0.0001));
+      expect((r['maskFeatherRadius'] as num).toDouble(), closeTo(18.0, 0.0001));
+      expect((r['minFaceRatio'] as num).toDouble(), closeTo(0.05, 0.0001));
+      expect((r['bgBlurPass1'] as num).toDouble(), closeTo(0.75, 0.0001));
+      expect((r['bgBlurPass2'] as num).toDouble(), closeTo(1.25, 0.0001));
+      expect((r['bgBlurPass3'] as num).toDouble(), closeTo(1.75, 0.0001));
+      expect((r['bgBlurPass4'] as num).toDouble(), closeTo(2.0, 0.0001));
+      expect(r['sharpenROIOnly'], true);
+    },
+  );
+
+  // ── IO-41 ─────────────────────────────────────────────────────────────────
+  // Phase 10-D.4A: VGImageROIConfig equality — same params are equal.
+  test('IO-41: VGImageROIConfig equality: same params are equal', () {
+    const a = VGImageROIConfig(
+      enabled: true,
+      faceExpandX: 0.25,
+      bgBlurPass3: 1.75,
+    );
+    const b = VGImageROIConfig(
+      enabled: true,
+      faceExpandX: 0.25,
+      bgBlurPass3: 1.75,
+    );
+    expect(a, equals(b));
+    expect(a.hashCode, equals(b.hashCode));
+  });
+
+  // ── IO-42 ─────────────────────────────────────────────────────────────────
+  // Phase 10-D.4A: VGImageROIConfig equality — different enabled values
+  // are not equal.
+  test('IO-42: VGImageROIConfig equality: different enabled values not equal', () {
+    const a = VGImageROIConfig(enabled: true);
+    const b = VGImageROIConfig(enabled: false);
+    expect(a, isNot(equals(b)));
+  });
+
+  // ── IO-43 ─────────────────────────────────────────────────────────────────
+  // Phase 10-D.4A: fromMap parses ROI result fields when present.
+  test(
+    'IO-43: fromMap parses ROI result fields when present',
+    () {
+      final map = <Object?, Object?>{
+        'success': true,
+        'outputPath': '/tmp/result.jpg',
+        'width': 1080,
+        'height': 810,
+        'fileSizeBytes': 420000,
+        'format': 'jpeg',
+        'passCount': 2,
+        'chosenQuality': 0.84,
+        'roiApplied': true,
+        'roiFaceCount': 1,
+        'roiDetector': 'vision_face_box',
+        'roiSuppressionPass': 2,
+        // roiFallbackReason absent (ROI was applied)
+      };
+      final result = VGImageOptimizationResult.fromMap(map);
+      expect(result, isNotNull);
+      expect(result!.roiApplied, isTrue);
+      expect(result.roiFaceCount, 1);
+      expect(result.roiDetector, 'vision_face_box');
+      expect(result.roiFallbackReason, isNull);
+      expect(result.roiSuppressionPass, 2);
+    },
+  );
+
+  // ── IO-44 ─────────────────────────────────────────────────────────────────
+  // Phase 10-D.4A: ROI result fields are null when not present in the native
+  // response (no ROI requested — fully backward-compatible).
+  test(
+    'IO-44: fromMap leaves ROI result fields null when absent',
+    () {
+      final map = <Object?, Object?>{
+        'success': true,
+        'outputPath': '/tmp/result.jpg',
+        'width': 1080,
+        'height': 810,
+        'fileSizeBytes': 185000,
+        'format': 'jpeg',
+      };
+      final result = VGImageOptimizationResult.fromMap(map);
+      expect(result, isNotNull);
+      expect(result!.roiApplied, isNull);
+      expect(result.roiFaceCount, isNull);
+      expect(result.roiDetector, isNull);
+      expect(result.roiFallbackReason, isNull);
+      expect(result.roiSuppressionPass, isNull);
     },
   );
 }

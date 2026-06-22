@@ -5393,6 +5393,52 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
             }
 
+            // ── Phase 10-D.4A: Parse optional ROI config ─────────────────────────
+            //
+            // 'roiConfig' is supplied by Dart callers that pass VGImageROIConfig.
+            // Omitting the key is backward-compatible: nil = no ROI.
+            // When enabled=true and detector="vision_face_box", the native layer
+            // runs a synchronous Vision face detection after image decode and
+            // inserts VGROIEntropySuppressionFilterNode per adaptive pass.
+
+            struct VGROIParams {
+                var enabled               = false
+                var detector              = "vision_face_box"
+                var faceExpandX           = 0.25
+                var faceExpandYTop        = 0.35
+                var faceExpandYBottom     = 0.15
+                var maskFeatherRadius     = 18.0
+                var minFaceRatio          = 0.05
+                var bgBlurPass1           = 0.75
+                var bgBlurPass2           = 1.25
+                var bgBlurPass3           = 1.75
+                var bgBlurPass4           = 2.0
+                var sharpenROIOnly        = true
+            }
+
+            var roiParams = VGROIParams()
+
+            if let roiMap = args?["roiConfig"] as? [String: Any] {
+                let roiEnabled = roiMap["enabled"] as? Bool ?? false
+                if roiEnabled {
+                    roiParams.enabled = true
+                    roiParams.detector = roiMap["detector"] as? String ?? "vision_face_box"
+                    if let v = (roiMap["faceExpandX"]       as? NSNumber)?.doubleValue { roiParams.faceExpandX       = v }
+                    if let v = (roiMap["faceExpandYTop"]    as? NSNumber)?.doubleValue { roiParams.faceExpandYTop    = v }
+                    if let v = (roiMap["faceExpandYBottom"] as? NSNumber)?.doubleValue { roiParams.faceExpandYBottom = v }
+                    if let v = (roiMap["maskFeatherRadius"] as? NSNumber)?.doubleValue { roiParams.maskFeatherRadius = v }
+                    if let v = (roiMap["minFaceRatio"]      as? NSNumber)?.doubleValue { roiParams.minFaceRatio      = v }
+                    if let v = (roiMap["bgBlurPass1"]       as? NSNumber)?.doubleValue { roiParams.bgBlurPass1       = v }
+                    if let v = (roiMap["bgBlurPass2"]       as? NSNumber)?.doubleValue { roiParams.bgBlurPass2       = v }
+                    if let v = (roiMap["bgBlurPass3"]       as? NSNumber)?.doubleValue { roiParams.bgBlurPass3       = v }
+                    if let v = (roiMap["bgBlurPass4"]       as? NSNumber)?.doubleValue { roiParams.bgBlurPass4       = v }
+                    if let v = roiMap["sharpenROIOnly"] as? Bool                       { roiParams.sharpenROIOnly    = v }
+                    NSLog("[VanguardPlugin][10-D.4A] roiConfig: enabled detector=%@", roiParams.detector)
+                }
+            }
+
+            let capturedROI = roiParams
+
             // Resolve output path.
             let outputPath: String = (args?["outputPath"] as? String)
                                      ?? (NSTemporaryDirectory() + "vg_img_opt_\(Int(Date().timeIntervalSince1970 * 1000)).jpg")
@@ -5412,6 +5458,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
             // Capture for use inside the async block (structs are value-copied).
             let capturedEnhancement = enhancementParams
+            // capturedROI is already captured above.
 
             DispatchQueue.global(qos: .userInitiated).async {
 
@@ -5472,6 +5519,40 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 let device    = MTLCreateSystemDefaultDevice()!
                 let needsResize = (canvasW != srcW || canvasH != srcH)
 
+                // ── Phase 10-D.4A: Synchronous ROI face detection ─────────────────
+                // Runs once before the adaptive loop on the full-resolution UIImage.
+                // If capturedROI.enabled=false or no faces found, roiMaskImage=nil
+                // and all passes fall back to the standard enhancement chain.
+
+                var roiMaskImage:    CIImage? = nil
+                var roiFaceCount:    Int      = 0
+                var roiDetectorTag:  String   = capturedROI.detector
+                var roiFallbackReason: String? = nil
+
+                if capturedROI.enabled {
+                    let processor = VGStillImageROIProcessor()
+                    processor.faceExpandX        = capturedROI.faceExpandX
+                    processor.faceExpandYTop     = capturedROI.faceExpandYTop
+                    processor.faceExpandYBottom  = capturedROI.faceExpandYBottom
+                    processor.featherRadius       = capturedROI.maskFeatherRadius
+                    processor.minFaceRatio        = capturedROI.minFaceRatio
+
+                    let roiResult = processor.detectAndBuildMask(for: sourceImage,
+                                                                  canvasWidth: canvasW,
+                                                                  canvasHeight: canvasH)
+                    roiFaceCount   = roiResult.faceRegions.count
+                    roiDetectorTag = roiResult.detectorTag
+
+                    if roiResult.faceRegions.count > 0, let mask = roiResult.maskImage {
+                        roiMaskImage = mask
+                        NSLog("[VanguardPlugin][10-D.4A] ROI: %d face(s) detected, mask ready.",
+                              roiFaceCount)
+                    } else {
+                        roiFallbackReason = "no_face_detected"
+                        NSLog("[VanguardPlugin][10-D.4A] ROI: no usable faces — fallback to standard adaptive JPEG.")
+                    }
+                }
+
                 // 5. Phase 10-D.3B — Adaptive quality / file-size enforcement loop.
                 //
                 // Rationale: high-frequency images (foliage, lace, fine texture) can
@@ -5511,27 +5592,31 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 struct _VGAdaptivePass {
                     let quality:          Float
                     let sharpenIntensity: Double
+                    let roiBgBlur:        Double  // background blur radius for VGROIEntropySuppressionFilterNode
+                    let sharpenROIOnly:   Bool    // when true, ROI node owns sharpening; downstream VGSharpenFilterNode gets intensity=0
                 }
 
                 let passes: [_VGAdaptivePass]
                 if hasFileSizeTarget && capturedEnhancement.enabled {
+                    // ROI passes suppress background blur incrementally.
+                    // sharpenROIOnly=true from pass 3 onward (where downstream sharpen is off).
                     passes = [
-                        _VGAdaptivePass(quality: baseQuality, sharpenIntensity: baseIntensity),
-                        _VGAdaptivePass(quality: 0.84,        sharpenIntensity: baseIntensity * 0.5),
-                        _VGAdaptivePass(quality: 0.80,        sharpenIntensity: 0.0),
-                        _VGAdaptivePass(quality: 0.75,        sharpenIntensity: 0.0),
+                        _VGAdaptivePass(quality: baseQuality, sharpenIntensity: baseIntensity,       roiBgBlur: capturedROI.bgBlurPass1, sharpenROIOnly: false),
+                        _VGAdaptivePass(quality: 0.84,        sharpenIntensity: baseIntensity * 0.5, roiBgBlur: capturedROI.bgBlurPass2, sharpenROIOnly: false),
+                        _VGAdaptivePass(quality: 0.80,        sharpenIntensity: 0.0,                 roiBgBlur: capturedROI.bgBlurPass3, sharpenROIOnly: capturedROI.sharpenROIOnly),
+                        _VGAdaptivePass(quality: 0.75,        sharpenIntensity: 0.0,                 roiBgBlur: capturedROI.bgBlurPass4, sharpenROIOnly: capturedROI.sharpenROIOnly),
                     ]
                 } else if hasFileSizeTarget {
-                    // Enhancement off: quality reduction only.
+                    // Enhancement off: quality reduction only; ROI blur still applies.
                     passes = [
-                        _VGAdaptivePass(quality: baseQuality, sharpenIntensity: 0.0),
-                        _VGAdaptivePass(quality: 0.84,        sharpenIntensity: 0.0),
-                        _VGAdaptivePass(quality: 0.80,        sharpenIntensity: 0.0),
-                        _VGAdaptivePass(quality: 0.75,        sharpenIntensity: 0.0),
+                        _VGAdaptivePass(quality: baseQuality, sharpenIntensity: 0.0, roiBgBlur: capturedROI.bgBlurPass1, sharpenROIOnly: false),
+                        _VGAdaptivePass(quality: 0.84,        sharpenIntensity: 0.0, roiBgBlur: capturedROI.bgBlurPass2, sharpenROIOnly: false),
+                        _VGAdaptivePass(quality: 0.80,        sharpenIntensity: 0.0, roiBgBlur: capturedROI.bgBlurPass3, sharpenROIOnly: capturedROI.sharpenROIOnly),
+                        _VGAdaptivePass(quality: 0.75,        sharpenIntensity: 0.0, roiBgBlur: capturedROI.bgBlurPass4, sharpenROIOnly: capturedROI.sharpenROIOnly),
                     ]
                 } else {
                     // No size target → single pass, no adaptation.
-                    passes = [_VGAdaptivePass(quality: baseQuality, sharpenIntensity: baseIntensity)]
+                    passes = [_VGAdaptivePass(quality: baseQuality, sharpenIntensity: baseIntensity, roiBgBlur: capturedROI.bgBlurPass1, sharpenROIOnly: false)]
                 }
 
                 var winManifest:  VGImageExportManifest? = nil
@@ -5576,6 +5661,29 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                                                               cropRect:     nil)
 
                     let passFilterChain: [Any]?
+
+                    // ── Phase 10-D.4A: ROI node wired per-pass ─────────────────────
+                    // If ROI is active and faces were detected, insert the ROI node
+                    // between VGTransformFilterNode and VGSharpenFilterNode.
+                    // When sharpenROIOnly=true for this pass, the ROI node owns
+                    // sharpening; downstream VGSharpenFilterNode receives intensity=0.
+                    let roiIsActive = capturedROI.enabled && (roiMaskImage != nil)
+                    let passROINode: VGROIEntropySuppressionFilterNode? = roiIsActive
+                        ? VGROIEntropySuppressionFilterNode(
+                            pool:                nil,
+                            device:              device,
+                            maskImage:           roiMaskImage,
+                            backgroundBlurRadius: passP.roiBgBlur,
+                            sharpenROIOnly:      passP.sharpenROIOnly,
+                            sharpenIntensity:    capturedEnhancement.enabled ? capturedEnhancement.intensity : 0.0,
+                            sharpenRadius:       capturedEnhancement.enabled ? capturedEnhancement.radius    : 0.65)
+                        : nil
+
+                    // Downstream sharpen intensity: zero if ROI node owns sharpening.
+                    let downstreamSharpenIntensity: Double = (roiIsActive && passP.sharpenROIOnly)
+                        ? 0.0
+                        : passP.sharpenIntensity
+
                     if capturedEnhancement.enabled {
                         let denoiseNode = VGDenoiseFilterNode(
                             pool: nil, device: device,
@@ -5583,13 +5691,25 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                             sharpness:  capturedEnhancement.sharpness)
                         let sharpenNode = VGSharpenFilterNode(
                             pool: nil, device: device,
-                            intensity: passP.sharpenIntensity,
+                            intensity: downstreamSharpenIntensity,
                             radius:    capturedEnhancement.radius)
-                        passFilterChain = needsResize
-                            ? [denoiseNode, passTransform, sharpenNode]
-                            : [denoiseNode, sharpenNode]
+                        if let roi = passROINode {
+                            passFilterChain = needsResize
+                                ? [denoiseNode, passTransform, roi, sharpenNode]
+                                : [denoiseNode, roi, sharpenNode]
+                        } else {
+                            passFilterChain = needsResize
+                                ? [denoiseNode, passTransform, sharpenNode]
+                                : [denoiseNode, sharpenNode]
+                        }
                     } else {
-                        passFilterChain = needsResize ? [passTransform] : nil
+                        if let roi = passROINode {
+                            passFilterChain = needsResize
+                                ? [passTransform, roi]
+                                : [roi]
+                        } else {
+                            passFilterChain = needsResize ? [passTransform] : nil
+                        }
                     }
 
                     // ── Fresh media source per pass ────────────────────────────
@@ -5710,12 +5830,14 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     default:    resolvedFormat = "jpeg"
                     }
 
-                    NSLog("[VanguardPlugin][10-D.3B] optimizeImage done: pass=%d quality=%.2f %dx%d %@ %lld bytes",
+                    NSLog("[VanguardPlugin][10-D.4A] optimizeImage done: pass=%d quality=%.2f %dx%d %@ %lld bytes roi=%@ faces=%d",
                           winPassIndex, winQuality,
                           manifest.width, manifest.height,
-                          resolvedFormat, manifest.fileSizeBytes)
+                          resolvedFormat, manifest.fileSizeBytes,
+                          capturedROI.enabled ? (roiMaskImage != nil ? "applied" : "fallback") : "off",
+                          roiFaceCount)
 
-                    result([
+                    var resultMap: [String: Any] = [
                         "success":       true,
                         "outputPath":    outputPath,
                         "width":         Int(manifest.width),
@@ -5724,7 +5846,18 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         "format":        resolvedFormat,
                         "passCount":     winPassIndex,
                         "chosenQuality": Double(winQuality),
-                    ] as [String: Any])
+                    ]
+                    // Phase 10-D.4A: ROI metadata (always populated when ROI was requested).
+                    if capturedROI.enabled {
+                        resultMap["roiApplied"]   = (roiMaskImage != nil)
+                        resultMap["roiFaceCount"]  = roiFaceCount
+                        resultMap["roiDetector"]   = roiDetectorTag
+                        if let reason = roiFallbackReason {
+                            resultMap["roiFallbackReason"] = reason
+                        }
+                        resultMap["roiSuppressionPass"] = winPassIndex
+                    }
+                    result(resultMap)
                 }
             }
 

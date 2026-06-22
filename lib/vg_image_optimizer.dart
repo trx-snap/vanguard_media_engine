@@ -273,6 +273,132 @@ final class VGImageEnhancementConfig {
       'target: $target)';
 }
 
+// ── Phase 10-D.4A: ROI Config ──────────────────────────────────────────────────────────────────
+
+/// Phase 10-D.4A still-image ROI compression configuration.
+///
+/// Configures Vision face bounding-box detection and mask-based background
+/// entropy suppression. When [enabled] is false, no ROI preprocessing is
+/// applied and the standard adaptive JPEG loop runs unchanged.
+///
+/// ROI is perceptual compression, not beauty. The face/head/hair region
+/// is preserved at full quality; the background entropy is suppressed per
+/// the background blur radius schedule defined by the pass table.
+///
+/// Background blur radii are applied per adaptive pass. Pass 1 uses a very
+/// mild blur (mostly noise smoothing); later passes increase suppression.
+final class VGImageROIConfig {
+  const VGImageROIConfig({
+    this.enabled = false,
+    this.detector = 'vision_face_box',
+    this.faceExpandX = 0.25,
+    this.faceExpandYTop = 0.35,
+    this.faceExpandYBottom = 0.15,
+    this.maskFeatherRadius = 18.0,
+    this.minFaceRatio = 0.05,
+    this.bgBlurPass1 = 0.75,
+    this.bgBlurPass2 = 1.25,
+    this.bgBlurPass3 = 1.75,
+    this.bgBlurPass4 = 2.0,
+    this.sharpenROIOnly = true,
+  });
+
+  /// Whether ROI preprocessing is enabled. Defaults to false.
+  final bool enabled;
+
+  /// Face detector to use. Only 'vision_face_box' is supported in v1.
+  final String detector;
+
+  /// Fractional expansion of the face bounding box on the left and right.
+  /// Default: 0.25 (25% — includes ears).
+  final double faceExpandX;
+
+  /// Fractional upward expansion of the face bounding box (head/hair).
+  /// Default: 0.35 (35%).
+  final double faceExpandYTop;
+
+  /// Fractional downward expansion of the face bounding box (chin/neck).
+  /// Default: 0.15 (15%).
+  final double faceExpandYBottom;
+
+  /// Gaussian feather radius applied to the mask edge (pixels at canvas resolution).
+  /// Default: 18.0.
+  final double maskFeatherRadius;
+
+  /// Minimum face size as a fraction of the shorter canvas dimension.
+  /// Faces smaller than this are ignored. Default: 0.05 (5%).
+  final double minFaceRatio;
+
+  /// Background Gaussian blur radius for pass 1 (mildest). Default: 0.75.
+  final double bgBlurPass1;
+
+  /// Background Gaussian blur radius for pass 2. Default: 1.25.
+  final double bgBlurPass2;
+
+  /// Background Gaussian blur radius for pass 3. Default: 1.75.
+  final double bgBlurPass3;
+
+  /// Background Gaussian blur radius for pass 4 (strongest). Default: 2.0.
+  final double bgBlurPass4;
+
+  /// When true, sharpening is restricted to the face ROI in later passes.
+  /// The downstream VGSharpenFilterNode receives intensity=0 for those passes.
+  /// Default: true.
+  final bool sharpenROIOnly;
+
+  /// Serializes to a MethodChannel-compatible map.
+  Map<String, Object?> toMap() => <String, Object?>{
+        'enabled': enabled,
+        'detector': detector,
+        'faceExpandX': faceExpandX,
+        'faceExpandYTop': faceExpandYTop,
+        'faceExpandYBottom': faceExpandYBottom,
+        'maskFeatherRadius': maskFeatherRadius,
+        'minFaceRatio': minFaceRatio,
+        'bgBlurPass1': bgBlurPass1,
+        'bgBlurPass2': bgBlurPass2,
+        'bgBlurPass3': bgBlurPass3,
+        'bgBlurPass4': bgBlurPass4,
+        'sharpenROIOnly': sharpenROIOnly,
+      };
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGImageROIConfig &&
+          other.enabled == enabled &&
+          other.detector == detector &&
+          other.faceExpandX == faceExpandX &&
+          other.faceExpandYTop == faceExpandYTop &&
+          other.faceExpandYBottom == faceExpandYBottom &&
+          other.maskFeatherRadius == maskFeatherRadius &&
+          other.minFaceRatio == minFaceRatio &&
+          other.bgBlurPass1 == bgBlurPass1 &&
+          other.bgBlurPass2 == bgBlurPass2 &&
+          other.bgBlurPass3 == bgBlurPass3 &&
+          other.bgBlurPass4 == bgBlurPass4 &&
+          other.sharpenROIOnly == sharpenROIOnly;
+
+  @override
+  int get hashCode => Object.hash(
+        enabled, detector, faceExpandX, faceExpandYTop, faceExpandYBottom,
+        maskFeatherRadius, minFaceRatio, bgBlurPass1, bgBlurPass2,
+        bgBlurPass3, bgBlurPass4, sharpenROIOnly);
+
+  @override
+  String toString() => 'VGImageROIConfig('
+      'enabled: $enabled, '
+      'detector: $detector, '
+      'faceExpandX: $faceExpandX, '
+      'faceExpandYTop: $faceExpandYTop, '
+      'faceExpandYBottom: $faceExpandYBottom, '
+      'maskFeatherRadius: $maskFeatherRadius, '
+      'minFaceRatio: $minFaceRatio, '
+      'bgBlurPass1: $bgBlurPass1, '
+      'bgBlurPass4: $bgBlurPass4, '
+      'sharpenROIOnly: $sharpenROIOnly)';
+}
+
 // ── VGImageOptimizationRequest ─────────────────────────────────────────────────
 
 /// Immutable request configuration for a [VanguardImageOptimizer.optimizeImage]
@@ -313,6 +439,7 @@ final class VGImageOptimizationRequest {
     this.colorPolicy,
     this.destinationIntent,
     this.enhancement,
+    this.roi,
   });
 
   // ── Fields ──────────────────────────────────────────────────────────────────
@@ -421,6 +548,12 @@ final class VGImageOptimizationRequest {
   /// Enhancement is derivative-only. The master export is never modified.
   final VGImageEnhancementConfig? enhancement;
 
+  /// Optional Phase 10-D.4A ROI compression configuration.
+  ///
+  /// When null (default), no ROI preprocessing is applied and the standard
+  /// adaptive JPEG loop runs unchanged.
+  final VGImageROIConfig? roi;
+
   // ── Serialisation ────────────────────────────────────────────────────────────
 
   /// Serialises this request to a MethodChannel-compatible map.
@@ -455,6 +588,10 @@ final class VGImageOptimizationRequest {
       final enhMap = enhancement!.toMap();
       if (enhMap != null) map['enhancementConfig'] = enhMap;
     }
+    // Phase 10-D.4A: serialize ROI config when present and enabled.
+    if (roi != null && roi!.enabled) {
+      map['roiConfig'] = roi!.toMap();
+    }
     return map;
   }
 
@@ -476,7 +613,8 @@ final class VGImageOptimizationRequest {
           other.normalizeOrientation == normalizeOrientation &&
           other.colorPolicy == colorPolicy &&
           other.destinationIntent == destinationIntent &&
-          other.enhancement == enhancement;
+          other.enhancement == enhancement &&
+          other.roi == roi;
 
   @override
   int get hashCode => Object.hash(
@@ -493,6 +631,7 @@ final class VGImageOptimizationRequest {
         colorPolicy,
         destinationIntent,
         enhancement,
+        roi,
       );
 
   @override
@@ -509,7 +648,8 @@ final class VGImageOptimizationRequest {
       'normalizeOrientation: $normalizeOrientation, '
       'colorPolicy: $colorPolicy, '
       'destinationIntent: $destinationIntent, '
-      'enhancement: $enhancement)';
+      'enhancement: $enhancement, '
+      'roi: $roi)';
 }
 
 // ── VGImageOptimizationResult ─────────────────────────────────────────────────
@@ -528,6 +668,11 @@ final class VGImageOptimizationResult {
     required this.format,
     this.passCount = 1,
     this.chosenQuality = -1.0,
+    this.roiApplied,
+    this.roiFaceCount,
+    this.roiDetector,
+    this.roiFallbackReason,
+    this.roiSuppressionPass,
   });
 
   // ── Fields ──────────────────────────────────────────────────────────────────
@@ -565,6 +710,26 @@ final class VGImageOptimizationResult {
   /// Lower values indicate the adaptive loop reduced quality to meet the target.
   /// -1.0 indicates the field was not reported by the native layer.
   final double chosenQuality;
+
+  // ── Phase 10-D.4A: ROI result fields ───────────────────────────────────────
+
+  /// Whether ROI preprocessing was applied (faces detected and mask built).
+  /// Null when ROI was not requested.
+  final bool? roiApplied;
+
+  /// Number of faces detected. 0 when no faces found or ROI not requested.
+  final int? roiFaceCount;
+
+  /// Detector used for ROI. 'vision_face_box' in v1.
+  final String? roiDetector;
+
+  /// Reason for ROI fallback when [roiApplied] is false.
+  /// 'no_face_detected' when Vision found no usable faces.
+  final String? roiFallbackReason;
+
+  /// The adaptive pass number that won and in which ROI suppression was applied.
+  /// Nil when ROI was not requested.
+  final int? roiSuppressionPass;
 
   // ── Deserialisation ───────────────────────────────────────────────────────────
 
@@ -612,6 +777,13 @@ final class VGImageOptimizationResult {
     final passCount = (map['passCount'] as num?)?.toInt() ?? 1;
     final chosenQuality = (map['chosenQuality'] as num?)?.toDouble() ?? -1.0;
 
+    // Phase 10-D.4A: optional ROI fields (null when not reported).
+    final roiApplied = map['roiApplied'] as bool?;
+    final roiFaceCount = (map['roiFaceCount'] as num?)?.toInt();
+    final roiDetector = map['roiDetector'] as String?;
+    final roiFallbackReason = map['roiFallbackReason'] as String?;
+    final roiSuppressionPass = (map['roiSuppressionPass'] as num?)?.toInt();
+
     return VGImageOptimizationResult(
       outputPath: outputPath,
       width: width,
@@ -620,6 +792,11 @@ final class VGImageOptimizationResult {
       format: format,
       passCount: passCount,
       chosenQuality: chosenQuality,
+      roiApplied: roiApplied,
+      roiFaceCount: roiFaceCount,
+      roiDetector: roiDetector,
+      roiFallbackReason: roiFallbackReason,
+      roiSuppressionPass: roiSuppressionPass,
     );
   }
 
@@ -634,6 +811,11 @@ final class VGImageOptimizationResult {
         'format': format,
         'passCount': passCount,
         'chosenQuality': chosenQuality,
+        if (roiApplied != null) 'roiApplied': roiApplied,
+        if (roiFaceCount != null) 'roiFaceCount': roiFaceCount,
+        if (roiDetector != null) 'roiDetector': roiDetector,
+        if (roiFallbackReason != null) 'roiFallbackReason': roiFallbackReason,
+        if (roiSuppressionPass != null) 'roiSuppressionPass': roiSuppressionPass,
       };
 
   // ── Equality ─────────────────────────────────────────────────────────────────
@@ -648,12 +830,18 @@ final class VGImageOptimizationResult {
           other.fileSizeBytes == fileSizeBytes &&
           other.format == format &&
           other.passCount == passCount &&
-          other.chosenQuality == chosenQuality;
+          other.chosenQuality == chosenQuality &&
+          other.roiApplied == roiApplied &&
+          other.roiFaceCount == roiFaceCount &&
+          other.roiDetector == roiDetector &&
+          other.roiFallbackReason == roiFallbackReason &&
+          other.roiSuppressionPass == roiSuppressionPass;
 
   @override
   int get hashCode =>
       Object.hash(outputPath, width, height, fileSizeBytes, format,
-                  passCount, chosenQuality);
+                  passCount, chosenQuality, roiApplied, roiFaceCount,
+                  roiDetector, roiFallbackReason, roiSuppressionPass);
 
   @override
   String toString() =>
@@ -663,7 +851,9 @@ final class VGImageOptimizationResult {
       'fileSizeBytes: $fileSizeBytes, '
       'format: $format, '
       'passCount: $passCount, '
-      'chosenQuality: $chosenQuality)';
+      'chosenQuality: $chosenQuality, '
+      'roiApplied: $roiApplied, '
+      'roiFaceCount: $roiFaceCount)';
 }
 
 // ── VanguardImageOptimizer ────────────────────────────────────────────────────
