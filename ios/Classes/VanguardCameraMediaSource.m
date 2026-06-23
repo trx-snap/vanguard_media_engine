@@ -35,7 +35,8 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
 
 @interface VanguardCameraMediaSource () <
     AVCaptureVideoDataOutputSampleBufferDelegate,
-    AVCaptureAudioDataOutputSampleBufferDelegate>
+    AVCaptureAudioDataOutputSampleBufferDelegate,
+    AVCapturePhotoCaptureDelegate>
 @end
 
 @implementation VanguardCameraMediaSource {
@@ -116,6 +117,21 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
   //   window. Read and written exclusively on the main thread — no lock needed.
   dispatch_queue_t _photoQueue;
   BOOL _isSwitching;
+
+  // ── Phase 10-E.1: Native still-photo capture (AVCapturePhotoOutput) ─────
+  // _photoOutput: added to the AVCaptureSession alongside the video output.
+  //   When nil the native path falls back to takePhotoToURL:completion:.
+  // _nativePhotoURL / _nativePhotoCompletion: single-slot pending capture
+  //   state. Written on the main thread (takeNativePhotoToURL:) and cleared
+  //   on the main thread (delegate callback). The delegate fires on an
+  //   arbitrary AVFoundation serial queue; we immediately dispatch to main.
+  //   _nativeCaptureInFlight: YES between capturePhotoWithSettings: and the
+  //   delegate callback. Prevents concurrent native captures which would
+  //   stomp _nativePhotoURL / _nativePhotoCompletion.
+  AVCapturePhotoOutput *_photoOutput;
+  NSURL *_nativePhotoURL;
+  void (^_nativePhotoCompletion)(NSURL *_Nullable, NSError *_Nullable);
+  BOOL _nativeCaptureInFlight;
 
   // ── Phase 6C: Preview orientation lock ───────────────────────────────────
   // When YES, _applyConnectionOrientationContract forces portrait orientation
@@ -324,6 +340,63 @@ static const char kCaptureQueueKey = 0;
   [_audioOutput setSampleBufferDelegate:self queue:_captureQueue];
   if ([_session canAddOutput:_audioOutput])
     [_session addOutput:_audioOutput];
+
+  // ── Phase 10-E.1: AVCapturePhotoOutput ───────────────────────────────────
+  // Added alongside the existing video data output. The session preset
+  // (1920x1080) governs AVCaptureVideoDataOutput dimensions only;
+  // AVCapturePhotoOutput negotiates the full sensor resolution independently
+  // so still-photos are not limited to 1080x1920.
+  _photoOutput = [[AVCapturePhotoOutput alloc] init];
+  if ([_session canAddOutput:_photoOutput]) {
+    // ── Phase 10-E.1: Add output first, then configure high-resolution ────
+    // AVCapturePhotoOutput.maxPhotoDimensions (iOS 16+) requires the output
+    // to be connected to an active source device with a non-nil activeFormat.
+    // Calling [_session addOutput:] inside beginConfiguration establishes that
+    // connection; only then may maxPhotoDimensions be read or written.
+    // Reference: "May not be set until connected to active source device".
+    //
+    // iOS 14–15: highResolutionCaptureEnabled can technically be set before
+    // addOutput, but we apply the same ordering for consistency and safety.
+    [_session addOutput:_photoOutput];
+    NSLog(@"[VanguardCamera][10-E.1] AVCapturePhotoOutput added to session");
+
+    // ── High-resolution still capture opt-in ─────────────────────────────
+    // iOS 16+: use maxPhotoDimensions — select the largest CMVideoDimensions
+    //          from the active format's supportedMaxPhotoDimensions array.
+    // iOS 14–15: use the deprecated (but functional) highResolutionCaptureEnabled
+    //            flag to enable the same behaviour.
+    if (@available(iOS 16.0, *)) {
+      // _captureDevice is set to `cam` at line 300, before this block.
+      NSArray<NSValue *> *supported =
+          _captureDevice.activeFormat.supportedMaxPhotoDimensions;
+      CMVideoDimensions best = {0, 0};
+      for (NSValue *v in supported) {
+        CMVideoDimensions d;
+        [v getValue:&d];
+        if (d.width > 0 && d.height > 0 &&
+            (int64_t)d.width * d.height > (int64_t)best.width * best.height) {
+          best = d;
+        }
+      }
+      if (best.width > 0 && best.height > 0) {
+        _photoOutput.maxPhotoDimensions = best;
+        NSLog(@"[VanguardCamera][10-E.1] maxPhotoDimensions set to %dx%d (iOS 16+)",
+              (int)best.width, (int)best.height);
+      } else {
+        NSLog(@"[VanguardCamera][10-E.1] WARNING: no supportedMaxPhotoDimensions found — output may be 1080p");
+      }
+    } else {
+      // iOS 14–15: deprecated API, still required to unlock full-sensor resolution.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+      _photoOutput.highResolutionCaptureEnabled = YES;
+#pragma clang diagnostic pop
+      NSLog(@"[VanguardCamera][10-E.1] highResolutionCaptureEnabled=YES (iOS 14-15 fallback)");
+    }
+  } else {
+    _photoOutput = nil;
+    NSLog(@"[VanguardCamera][10-E.1] WARNING: session cannot add AVCapturePhotoOutput — native photo will fall back to preview-frame capture");
+  }
 
   [_session commitConfiguration];
 
@@ -1418,9 +1491,217 @@ static const char kCaptureQueueKey = 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Phase 10-E.1: Native Still-Photo Capture
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Threading model:
+//   takeNativePhotoToURL:completion: MUST be called on the main thread
+//   (method-channel handler). Checked implicitly: _isSwitching and
+//   _nativeCaptureInFlight are both read/written on the main thread only.
+//
+//   captureOutput:didFinishProcessingPhoto:error: is delivered by AVFoundation
+//   on an arbitrary serial queue. We immediately dispatch to the main thread
+//   so all state reads/writes (_nativePhotoURL, _nativePhotoCompletion,
+//   _nativeCaptureInFlight) happen on the main thread, matching the writer.
+//
+// Orientation: set at capture time (just before capturePhotoWithSettings:) so
+//   the EXIF orientation in the JPEG matches the physical device angle at the
+//   exact moment of shutter. Using the portrait-lock flag mirrors the video
+//   connection contract (_applyConnectionOrientationContract).
+//
+// Fallback: if _photoOutput is nil (canAddOutput: returned NO at config time),
+//   delegates to takePhotoToURL:completion: so no regression occurs.
+
+- (void)takeNativePhotoToURL:(NSURL *)url
+                  completion:
+                      (void (^)(NSURL *_Nullable, NSError *_Nullable))completion {
+
+  // ── Fallback: no AVCapturePhotoOutput available ────────────────────────────
+  if (!_photoOutput) {
+    NSLog(@"[VanguardCamera][10-E.1] _photoOutput nil — falling back to preview-frame capture");
+    [self takePhotoToURL:url completion:completion];
+    return;
+  }
+
+  // ── Guard: camera-switch reconfiguration window ────────────────────────────
+  // _isSwitching and this method are both on the main thread; no lock needed.
+  if (_isSwitching) {
+    NSError *err = [NSError
+        errorWithDomain:@"VanguardCamera"
+                   code:3
+               userInfo:@{NSLocalizedDescriptionKey : @"Camera switch in progress"}];
+    dispatch_async(dispatch_get_main_queue(), ^{
+      completion(nil, err);
+    });
+    return;
+  }
+
+  // ── Guard: concurrent native capture ──────────────────────────────────────
+  // Single-slot: only one AVCapturePhotoOutput request may be in-flight.
+  if (_nativeCaptureInFlight) {
+    NSError *err = [NSError
+        errorWithDomain:@"VanguardCamera"
+                   code:3
+               userInfo:@{NSLocalizedDescriptionKey : @"Native photo capture already in progress"}];
+    dispatch_async(dispatch_get_main_queue(), ^{
+      completion(nil, err);
+    });
+    return;
+  }
+
+  // ── Store pending capture state ────────────────────────────────────────────
+  _nativePhotoURL = url;
+  _nativePhotoCompletion = [completion copy];
+  _nativeCaptureInFlight = YES;
+
+  // ── Set photo connection orientation at capture time ───────────────────────
+  // Per Opus architecture requirement: orientation is set at capture time (not
+  // only at _configureSession) to match the physical device angle at the exact
+  // moment of shutter. This is the recommended Apple pattern for correct EXIF.
+  AVCaptureConnection *photoConn =
+      [_photoOutput connectionWithMediaType:AVMediaTypeVideo];
+  if (photoConn) {
+    if (photoConn.isVideoOrientationSupported) {
+      // When the portrait orientation lock is active (always YES in production
+      // per DEC-132), force portrait so EXIF matches the locked preview.
+      if (_previewOrientationLocked) {
+        photoConn.videoOrientation = AVCaptureVideoOrientationPortrait;
+      } else {
+        UIDeviceOrientation devOrientation = UIDevice.currentDevice.orientation;
+        AVCaptureVideoOrientation vidOrientation;
+        switch (devOrientation) {
+        case UIDeviceOrientationPortraitUpsideDown:
+          vidOrientation = AVCaptureVideoOrientationPortraitUpsideDown;
+          break;
+        case UIDeviceOrientationLandscapeLeft:
+          vidOrientation = AVCaptureVideoOrientationLandscapeRight;
+          break;
+        case UIDeviceOrientationLandscapeRight:
+          vidOrientation = AVCaptureVideoOrientationLandscapeLeft;
+          break;
+        case UIDeviceOrientationPortrait:
+        default:
+          vidOrientation = AVCaptureVideoOrientationPortrait;
+          break;
+        }
+        photoConn.videoOrientation = vidOrientation;
+      }
+    }
+
+    // ── Front-camera mirroring ─────────────────────────────────────────────
+    // Explicitly disable AVFoundation's automatic adjustment and mirror the
+    // front camera so the saved JPEG matches what the user saw in the preview
+    // (selfie convention: mirrored). Back camera is not mirrored.
+    if (photoConn.isVideoMirroringSupported) {
+      photoConn.automaticallyAdjustsVideoMirroring = NO;
+      photoConn.videoMirrored = (_position == AVCaptureDevicePositionFront);
+    }
+  }
+
+  // ── Configure and trigger AVCapturePhotoOutput capture ────────────────────
+  // Request JPEG explicitly. Without AVVideoCodecTypeJPEG, iOS 11+ may default
+  // to HEIF which requires a separate conversion step for downstream consumers.
+  AVCapturePhotoSettings *settings =
+      [AVCapturePhotoSettings photoSettingsWithFormat:@{
+        AVVideoCodecKey : AVVideoCodecTypeJPEG
+      }];
+
+  // ── High-resolution per-request opt-in ────────────────────────────────────
+  // iOS 16+: request the same maxPhotoDimensions set on the output object.
+  //          The dimensions must match or be smaller than _photoOutput.maxPhotoDimensions.
+  // iOS 14–15: set the deprecated highResolutionPhotoEnabled flag on settings.
+  if (@available(iOS 16.0, *)) {
+    CMVideoDimensions outputMax = _photoOutput.maxPhotoDimensions;
+    if (outputMax.width > 0 && outputMax.height > 0) {
+      settings.maxPhotoDimensions = outputMax;
+      NSLog(@"[VanguardCamera][10-E.1] capturePhoto: position=%@ orientation=%ld mirrored=%d maxDims=%dx%d",
+            (_position == AVCaptureDevicePositionFront ? @"front" : @"back"),
+            (long)(photoConn ? photoConn.videoOrientation : -1),
+            (int)(photoConn ? photoConn.videoMirrored : -1),
+            (int)outputMax.width, (int)outputMax.height);
+    } else {
+      NSLog(@"[VanguardCamera][10-E.1] capturePhoto: position=%@ orientation=%ld mirrored=%d (no maxDims set)",
+            (_position == AVCaptureDevicePositionFront ? @"front" : @"back"),
+            (long)(photoConn ? photoConn.videoOrientation : -1),
+            (int)(photoConn ? photoConn.videoMirrored : -1));
+    }
+  } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    settings.highResolutionPhotoEnabled = YES;
+#pragma clang diagnostic pop
+    NSLog(@"[VanguardCamera][10-E.1] capturePhoto: position=%@ orientation=%ld mirrored=%d highResolutionPhotoEnabled=YES (iOS 14-15)",
+          (_position == AVCaptureDevicePositionFront ? @"front" : @"back"),
+          (long)(photoConn ? photoConn.videoOrientation : -1),
+          (int)(photoConn ? photoConn.videoMirrored : -1));
+  }
+
+  [_photoOutput capturePhotoWithSettings:settings delegate:self];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - AVCapturePhotoCaptureDelegate (Phase 10-E.1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+- (void)captureOutput:(AVCapturePhotoOutput *)output
+    didFinishProcessingPhoto:(AVCapturePhoto *)photo
+                       error:(NSError *)error {
+  // ── Capture completion — dispatch all state mutations to main thread ────────
+  // AVFoundation calls this on an internal serial queue. We dispatch to main
+  // so _nativePhotoURL / _nativePhotoCompletion / _nativeCaptureInFlight are
+  // only ever read/written on the main thread, matching takeNativePhotoToURL:.
+  dispatch_async(dispatch_get_main_queue(), ^{
+    NSURL *targetURL = self->_nativePhotoURL;
+    void (^completion)(NSURL *_Nullable, NSError *_Nullable) = self->_nativePhotoCompletion;
+
+    // Clear pending state before calling completion (prevents re-entrant issues).
+    self->_nativePhotoURL = nil;
+    self->_nativePhotoCompletion = nil;
+    self->_nativeCaptureInFlight = NO;
+
+    // ── Delegate error path ────────────────────────────────────────────────
+    if (error) {
+      NSLog(@"[VanguardCamera][10-E.1] didFinishProcessingPhoto error: %@", error);
+      NSError *mappedErr = [NSError
+          errorWithDomain:@"VanguardCamera"
+                     code:2
+                 userInfo:@{NSLocalizedDescriptionKey :
+                                error.localizedDescription ?: @"AVCapturePhotoOutput error"}];
+      if (completion) completion(nil, mappedErr);
+      return;
+    }
+
+    // ── Extract JPEG data from AVCapturePhoto ──────────────────────────────
+    NSData *jpegData = [photo fileDataRepresentation];
+    if (!jpegData) {
+      NSLog(@"[VanguardCamera][10-E.1] fileDataRepresentation returned nil");
+      NSError *encErr = [NSError
+          errorWithDomain:@"VanguardCamera"
+                     code:1
+                 userInfo:@{NSLocalizedDescriptionKey : @"fileDataRepresentation returned nil"}];
+      if (completion) completion(nil, encErr);
+      return;
+    }
+
+    // ── Write atomically to target URL ────────────────────────────────────
+    NSError *writeErr = nil;
+    [jpegData writeToURL:targetURL options:NSDataWritingAtomic error:&writeErr];
+    if (writeErr) {
+      NSLog(@"[VanguardCamera][10-E.1] write failed: %@", writeErr);
+    } else {
+      NSLog(@"[VanguardCamera][10-E.1] photo written: %@ (%lu bytes)",
+            targetURL.lastPathComponent, (unsigned long)jpegData.length);
+    }
+
+    if (completion) completion(writeErr ? nil : targetURL, writeErr);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Dealloc
 
 - (void)dealloc {
+
   [self _stopWatchdog];
   // Phase 6A-3J-F: Remove orientation observer.
   if (_orientationObserver) {
@@ -1517,6 +1798,32 @@ static const char kCaptureQueueKey = 0;
   if (vidConn.isVideoMirroringSupported) {
     vidConn.automaticallyAdjustsVideoMirroring = NO;
     vidConn.videoMirrored = (_position == AVCaptureDevicePositionFront);
+  }
+
+  // ── Phase 10-E.1: Photo output connection orientation/mirroring ───────────
+  // Mirror the video connection contract so the photo output always matches the
+  // preview orientation. Orientation is also set at capture time (in
+  // takeNativePhotoToURL:) for correctness; setting it here ensures the
+  // connection is ready and consistent with _applyConnectionOrientationContract.
+  if (_photoOutput) {
+    AVCaptureConnection *photoConn =
+        [_photoOutput connectionWithMediaType:AVMediaTypeVideo];
+    if (photoConn) {
+      if (photoConn.isVideoOrientationSupported) {
+        if (_previewOrientationLocked) {
+          photoConn.videoOrientation = AVCaptureVideoOrientationPortrait;
+        } else {
+          // Derive orientation from the video connection we just computed above.
+          if (vidConn.isVideoOrientationSupported) {
+            photoConn.videoOrientation = vidConn.videoOrientation;
+          }
+        }
+      }
+      if (photoConn.isVideoMirroringSupported) {
+        photoConn.automaticallyAdjustsVideoMirroring = NO;
+        photoConn.videoMirrored = (_position == AVCaptureDevicePositionFront);
+      }
+    }
   }
 }
 

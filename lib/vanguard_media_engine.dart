@@ -524,14 +524,18 @@ class VanguardEngine {
   ///
   /// Returns the absolute path of the written file on success.
   ///
+  /// [captureMode] is an optional hint controlling which native pipeline is
+  /// used on iOS. See [VGCameraSession.takePhoto] for accepted values.
+  ///
   /// Throws [PlatformException] with one of:
   ///   'NO_FRAME'    — camera started but no frame delivered yet (~100ms window)
   ///   'SWITCHING'   — a camera switch is in progress (~150ms window)
   ///   'ENCODE_FAIL' — JPEG encoding or disk write failed
   ///   'NO_CAMERA'   — startCamera was not called
-  static Future<String> takePhoto(String path) async {
+  static Future<String> takePhoto(String path, {String? captureMode}) async {
     final filePath = await _cameraChannel.invokeMethod<String>('takePhoto', {
       'path': path,
+      if (captureMode != null) 'captureMode': captureMode,
     });
     if (filePath == null) {
       throw PlatformException(

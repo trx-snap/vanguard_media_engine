@@ -217,6 +217,31 @@ NS_ASSUME_NONNULL_BEGIN
             completion:
                 (void (^)(NSURL *_Nullable, NSError *_Nullable))completion;
 
+// ── Phase 10-E.1: Native Still-Photo Capture ─────────────────────────────────
+
+/// Captures a native still-image via AVCapturePhotoOutput and writes the JPEG
+/// atomically to url. This uses the ISP still-photo pipeline (not a video
+/// preview frame), yielding full sensor resolution on both front and rear cameras.
+///
+/// Must be called after start. Safe to call while a video recording is active.
+/// Serialised: only one native capture may be in-flight at a time. A concurrent
+/// request is rejected with error code 3 (SWITCHING).
+///
+/// completion is always called on the main thread with exactly one of:
+///   url non-nil, error nil    — success; file is complete and readable
+///   url nil,     error non-nil — failure; no file was written
+///
+/// Error codes (domain "VanguardCamera"):
+///   1  ENCODE_FAIL — fileDataRepresentation returned nil or write failed
+///   2  ENCODE_FAIL — AVCapturePhotoOutput delegate error
+///   3  SWITCHING   — camera switch in progress or native capture already pending
+///
+/// Fallback: if _photoOutput is unavailable (session could not add the output),
+/// delegates to takePhotoToURL:completion: automatically.
+- (void)takeNativePhotoToURL:(NSURL *)url
+                  completion:
+                      (void (^)(NSURL *_Nullable, NSError *_Nullable))completion;
+
 // ── Phase 6E.1C: Processed-frame append entry point ─────────────────────────
 
 /// Appends a processed (effects-applied) video frame to the active AVAssetWriter.

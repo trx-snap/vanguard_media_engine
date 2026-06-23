@@ -1862,12 +1862,21 @@ final class VGCameraSession {
 
   // ── Capture ──────────────────────────────────────────────────────────────────
 
-  /// Captures the current live camera frame as a JPEG and writes it to [path].
+  /// Captures a photo and writes a JPEG to [path].
   ///
   /// [path] must be a writable absolute path with a `.jpg` extension.
   /// Safe to call while a video recording is active.
   ///
   /// Returns the absolute path of the written file on success.
+  ///
+  /// [captureMode] is an optional hint that controls which native pipeline is
+  /// used on iOS:
+  ///   `'photo'`    — bypasses the camera graph and uses native
+  ///                  `AVCapturePhotoOutput` for full ISP resolution (Phase 10-E.1).
+  ///   `'story'`    — uses the graph-first path (effects-baked 1080×1920).
+  ///   `'timeline'` — uses the graph-first path (effects-baked 1080×1920).
+  ///   `null`       — legacy behavior: graph-first when a graph session is
+  ///                  active, native fallback otherwise.
   ///
   /// Throws [StateError] if this session has been [dispose]d.
   /// Throws [PlatformException] with one of:
@@ -1875,7 +1884,7 @@ final class VGCameraSession {
   ///   `'SWITCHING'`   — a camera switch is in progress (~150 ms window)
   ///   `'ENCODE_FAIL'` — JPEG encoding or disk write failed
   ///   `'NO_CAMERA'`   — native has no active camera source
-  Future<String> takePhoto(String path) async {
+  Future<String> takePhoto(String path, {String? captureMode}) async {
     if (_disposed) {
       throw StateError(
         '[VGCameraSession] takePhoto called on a disposed session',
@@ -1883,6 +1892,7 @@ final class VGCameraSession {
     }
     final filePath = await _channel.invokeMethod<String>('takePhoto', {
       'path': path,
+      if (captureMode != null) 'captureMode': captureMode,
     });
     if (filePath == null) {
       throw PlatformException(
@@ -1893,12 +1903,14 @@ final class VGCameraSession {
     return filePath;
   }
 
-  /// Captures the current live camera frame as a JPEG and writes it to [path],
-  /// returning a typed [VGPhotoCaptureResult].
+  /// Captures a photo and returns a typed [VGPhotoCaptureResult].
   ///
   /// This is the typed companion to [takePhoto]. It calls [takePhoto] internally
   /// so all existing lifecycle guards (disposed check, null-path error) apply
   /// identically. Callers that only need the file path should prefer [takePhoto].
+  ///
+  /// [captureMode] is forwarded to [takePhoto] unchanged. See [takePhoto] for
+  /// the full description of accepted values.
   ///
   /// Metadata fields ([VGPhotoCaptureResult.width], [VGPhotoCaptureResult.height],
   /// [VGPhotoCaptureResult.sizeBytes]) are `0` until the native handler is
@@ -1906,8 +1918,11 @@ final class VGCameraSession {
   ///
   /// Throws [StateError] if this session has been [dispose]d.
   /// Throws [PlatformException] with the same codes as [takePhoto].
-  Future<VGPhotoCaptureResult> takePhotoResult(String path) async {
-    final filePath = await takePhoto(path);
+  Future<VGPhotoCaptureResult> takePhotoResult(
+    String path, {
+    String? captureMode,
+  }) async {
+    final filePath = await takePhoto(path, captureMode: captureMode);
     return VGPhotoCaptureResult.fromPath(filePath);
   }
 

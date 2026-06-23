@@ -4558,10 +4558,46 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                                     details: nil))
                 return
             }
-            // ── Phase 6E.2D: Graph-backed photo capture ───────────────────────
-            // When VG_USE_CAMERA_GRAPH is active and a graph session is live,
-            // route through the graph photo sink so effects are baked into the
-            // captured JPEG.  Falls back to raw capture when:
+            // ── Phase 10-E.1: Mode-aware photo routing ────────────────────────
+            // Parse the optional captureMode signal from Dart.
+            //   "photo"    → bypass graph; call native AVCapturePhotoOutput directly.
+            //   "story"    → graph-first (effects-baked 1080×1920); native fallback on
+            //                structural arm failure.
+            //   "timeline" → same as "story".
+            //   nil/other  → legacy behavior: graph-first when graph is active;
+            //                native fallback on structural arm failure.
+            //
+            // Only "photo" produces a full-ISP-resolution unfiltered still JPEG.
+            // All other modes preserve the existing graph path so Beauty/filters
+            // continue to be baked into captured frames.
+            let captureMode = args?["captureMode"] as? String
+
+            // ── Photo mode: bypass graph, use native AVCapturePhotoOutput ─────
+            if captureMode == "photo" {
+                NSLog("[VanguardPlugin][10-E.1] captureMode=photo — routing to native AVCapturePhotoOutput (bypassing graph).")
+                src.takeNativePhoto(to: URL(fileURLWithPath: path)) { url, error in
+                    if let error = error {
+                        let nsErr = error as NSError
+                        let code: String
+                        switch nsErr.code {
+                        case 1:  code = "NO_FRAME"
+                        case 3:  code = "SWITCHING"
+                        default: code = "ENCODE_FAIL"
+                        }
+                        result(FlutterError(code: code,
+                                            message: error.localizedDescription,
+                                            details: nil))
+                    } else {
+                        result(url?.path)
+                    }
+                }
+                return
+            }
+
+            // ── Story / Timeline / legacy mode: graph-first path ──────────────
+            // Phase 6E.2D: When VG_USE_CAMERA_GRAPH is active and a graph session
+            // is live, route through the graph photo sink so effects are baked into
+            // the captured JPEG.  Falls back to native capture when:
             //   • VG_USE_CAMERA_GRAPH is not compiled, or
             //   • cameraGraphSession is nil (graph not started), or
             //   • armPhotoCapture throws a structural error (session torn down,
@@ -4606,30 +4642,33 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     // the frame is latched, encoded, and written.
                     try graphSession.armPhotoCapture(path, completion: graphCompletion)
                     // Arming succeeded — graph path owns this request.
-                    // Do NOT fall through to raw capture.
+                    // Do NOT fall through to native capture.
                     return
                 } catch {
                     let nsErr = error as NSError
                     if nsErr.code == 3 {
                         // GRAPH_PHOTO_ALREADY_PENDING: another request is in
                         // flight. Return the error immediately; do not attempt
-                        // raw capture which would yield an unfiltered image.
+                        // native capture which would yield an unfiltered image.
                         result(FlutterError(code: "ALREADY_PENDING",
                                             message: "A photo capture request is already pending",
                                             details: nil))
                         return
                     }
                     // Structural arm failure (session invalidated, sink missing).
-                    // Fall through to raw capture below.
-                    NSLog("[VanguardPlugin] Graph photo arm failed (code: \(nsErr.code)); falling back to raw capture.")
+                    // Fall through to native capture below.
+                    // takeNativePhoto internally falls back to preview-frame capture
+                    // when _photoOutput is unavailable.
+                    NSLog("[VanguardPlugin] Graph photo arm failed (code: \(nsErr.code)); falling back to native capture (captureMode=\(captureMode ?? "nil")).")
                 }
             }
             #endif
 
-            // ── Raw fallback (Phase 4 / pre-graph path) ───────────────────────
-            // Swift ObjC bridge: takePhotoToURL:completion: → takePhoto(to:completion:)
-            // completion: is guaranteed on the main thread by takePhotoToURL:
-            src.takePhoto(to: URL(fileURLWithPath: path)) { url, error in
+            // ── Native capture: graph not active or structural arm failure ────
+            // Phase 10-E.1: use AVCapturePhotoOutput (takeNativePhoto) rather
+            // than the old preview-frame snapshot path.  takeNativePhoto itself
+            // falls back to takePhotoToURL: if _photoOutput is nil.
+            src.takeNativePhoto(to: URL(fileURLWithPath: path)) { url, error in
                 if let error = error {
                     let nsErr = error as NSError
                     let code: String
