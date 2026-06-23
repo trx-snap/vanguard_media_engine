@@ -1598,15 +1598,51 @@ static const char kCaptureQueueKey = 0;
     }
   }
 
-  // ── Configure and trigger AVCapturePhotoOutput capture ────────────────────
-  // Request JPEG explicitly. Without AVVideoCodecTypeJPEG, iOS 11+ may default
-  // to HEIF which requires a separate conversion step for downstream consumers.
-  AVCapturePhotoSettings *settings =
-      [AVCapturePhotoSettings photoSettingsWithFormat:@{
-        AVVideoCodecKey : AVVideoCodecTypeJPEG
-      }];
+  // ── Phase 10-E.2: Codec selection — HEVC/HEIF preferred, JPEG fallback ─────
+  //
+  // AVCapturePhotoOutput.availablePhotoCodecTypes is populated once the output
+  // is connected to the session. HEVC (kCMVideoCodecType_HEVC) maps to HEIF
+  // container on disk. JPEG is the universal fallback.
+  //
+  // Path contract:
+  //   Caller always passes a .jpg URL (Dart layer convention).
+  //   If HEVC is selected, we derive the sibling .heic path here and update
+  //   _nativePhotoURL before the capture fires. The delegate reads
+  //   _nativePhotoURL as the write target — no change needed in the delegate.
+  //
+  // Final-export JPEG path is untouched: the photo master is consumed by
+  // VanguardMediaEnginePlugin which re-encodes to JPEG for the export pipeline.
+  // Story/Timeline graph path is not involved in still-photo capture.
+  AVCapturePhotoSettings *settings;
+  BOOL useHEVC = NO;
 
-  // ── High-resolution per-request opt-in ────────────────────────────────────
+  if (@available(iOS 11.0, *)) {
+    NSArray<AVVideoCodecType> *codecs = _photoOutput.availablePhotoCodecTypes;
+    useHEVC = [codecs containsObject:AVVideoCodecTypeHEVC];
+  }
+
+  if (useHEVC) {
+    settings = [AVCapturePhotoSettings
+        photoSettingsWithFormat:@{AVVideoCodecKey : AVVideoCodecTypeHEVC}];
+
+    // Derive sibling .heic path from the caller-supplied .jpg URL.
+    // If the caller did not pass a .jpg extension, we still swap safely: any
+    // existing extension is replaced with .heic.
+    NSURL *heicURL = [[[url URLByDeletingPathExtension]
+        URLByAppendingPathExtension:@"heic"] absoluteURL];
+    _nativePhotoURL = heicURL; // Update before capture fires (delegate reads this).
+    NSLog(@"[VanguardCamera][10-E.2] HEVC available — using HEIF master: %@",
+          heicURL.lastPathComponent);
+  } else {
+    // HEVC unavailable (older device or simulator): preserve Phase 10-E.1 JPEG.
+    settings = [AVCapturePhotoSettings photoSettingsWithFormat:@{
+      AVVideoCodecKey : AVVideoCodecTypeJPEG
+    }];
+    NSLog(@"[VanguardCamera][10-E.2] HEVC unavailable — using JPEG master: %@",
+          url.lastPathComponent);
+  }
+
+  // ── High-resolution per-request opt-in (Phase 10-E.1, preserved) ──────────
   // iOS 16+: request the same maxPhotoDimensions set on the output object.
   //          The dimensions must match or be smaller than _photoOutput.maxPhotoDimensions.
   // iOS 14–15: set the deprecated highResolutionPhotoEnabled flag on settings.
@@ -1614,26 +1650,29 @@ static const char kCaptureQueueKey = 0;
     CMVideoDimensions outputMax = _photoOutput.maxPhotoDimensions;
     if (outputMax.width > 0 && outputMax.height > 0) {
       settings.maxPhotoDimensions = outputMax;
-      NSLog(@"[VanguardCamera][10-E.1] capturePhoto: position=%@ orientation=%ld mirrored=%d maxDims=%dx%d",
+      NSLog(@"[VanguardCamera][10-E.1] capturePhoto: position=%@ orientation=%ld mirrored=%d maxDims=%dx%d codec=%@",
             (_position == AVCaptureDevicePositionFront ? @"front" : @"back"),
             (long)(photoConn ? photoConn.videoOrientation : -1),
             (int)(photoConn ? photoConn.videoMirrored : -1),
-            (int)outputMax.width, (int)outputMax.height);
+            (int)outputMax.width, (int)outputMax.height,
+            useHEVC ? @"HEVC/HEIF" : @"JPEG");
     } else {
-      NSLog(@"[VanguardCamera][10-E.1] capturePhoto: position=%@ orientation=%ld mirrored=%d (no maxDims set)",
+      NSLog(@"[VanguardCamera][10-E.1] capturePhoto: position=%@ orientation=%ld mirrored=%d (no maxDims set) codec=%@",
             (_position == AVCaptureDevicePositionFront ? @"front" : @"back"),
             (long)(photoConn ? photoConn.videoOrientation : -1),
-            (int)(photoConn ? photoConn.videoMirrored : -1));
+            (int)(photoConn ? photoConn.videoMirrored : -1),
+            useHEVC ? @"HEVC/HEIF" : @"JPEG");
     }
   } else {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     settings.highResolutionPhotoEnabled = YES;
 #pragma clang diagnostic pop
-    NSLog(@"[VanguardCamera][10-E.1] capturePhoto: position=%@ orientation=%ld mirrored=%d highResolutionPhotoEnabled=YES (iOS 14-15)",
+    NSLog(@"[VanguardCamera][10-E.1] capturePhoto: position=%@ orientation=%ld mirrored=%d highResolutionPhotoEnabled=YES (iOS 14-15) codec=%@",
           (_position == AVCaptureDevicePositionFront ? @"front" : @"back"),
           (long)(photoConn ? photoConn.videoOrientation : -1),
-          (int)(photoConn ? photoConn.videoMirrored : -1));
+          (int)(photoConn ? photoConn.videoMirrored : -1),
+          useHEVC ? @"HEVC/HEIF" : @"JPEG");
   }
 
   [_photoOutput capturePhotoWithSettings:settings delegate:self];
