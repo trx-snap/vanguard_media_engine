@@ -358,7 +358,6 @@ static const char kCaptureQueueKey = 0;
     // iOS 14–15: highResolutionCaptureEnabled can technically be set before
     // addOutput, but we apply the same ordering for consistency and safety.
     [_session addOutput:_photoOutput];
-    NSLog(@"[VanguardCamera][10-E.1] AVCapturePhotoOutput added to session");
 
     // ── High-resolution still capture opt-in ─────────────────────────────
     // iOS 16+: use maxPhotoDimensions — select the largest CMVideoDimensions
@@ -380,10 +379,8 @@ static const char kCaptureQueueKey = 0;
       }
       if (best.width > 0 && best.height > 0) {
         _photoOutput.maxPhotoDimensions = best;
-        NSLog(@"[VanguardCamera][10-E.1] maxPhotoDimensions set to %dx%d (iOS 16+)",
-              (int)best.width, (int)best.height);
       } else {
-        NSLog(@"[VanguardCamera][10-E.1] WARNING: no supportedMaxPhotoDimensions found — output may be 1080p");
+        NSLog(@"[VanguardCamera] WARNING: no supportedMaxPhotoDimensions found — output may be 1080p");
       }
     } else {
       // iOS 14–15: deprecated API, still required to unlock full-sensor resolution.
@@ -391,11 +388,10 @@ static const char kCaptureQueueKey = 0;
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
       _photoOutput.highResolutionCaptureEnabled = YES;
 #pragma clang diagnostic pop
-      NSLog(@"[VanguardCamera][10-E.1] highResolutionCaptureEnabled=YES (iOS 14-15 fallback)");
     }
   } else {
     _photoOutput = nil;
-    NSLog(@"[VanguardCamera][10-E.1] WARNING: session cannot add AVCapturePhotoOutput — native photo will fall back to preview-frame capture");
+    NSLog(@"[VanguardCamera] WARNING: session cannot add AVCapturePhotoOutput — native photo will fall back to preview-frame capture");
   }
 
   [_session commitConfiguration];
@@ -1518,7 +1514,7 @@ static const char kCaptureQueueKey = 0;
 
   // ── Fallback: no AVCapturePhotoOutput available ────────────────────────────
   if (!_photoOutput) {
-    NSLog(@"[VanguardCamera][10-E.1] _photoOutput nil — falling back to preview-frame capture");
+    NSLog(@"[VanguardCamera] _photoOutput nil — falling back to preview-frame capture");
     [self takePhotoToURL:url completion:completion];
     return;
   }
@@ -1631,15 +1627,11 @@ static const char kCaptureQueueKey = 0;
     NSURL *heicURL = [[[url URLByDeletingPathExtension]
         URLByAppendingPathExtension:@"heic"] absoluteURL];
     _nativePhotoURL = heicURL; // Update before capture fires (delegate reads this).
-    NSLog(@"[VanguardCamera][10-E.2] HEVC available — using HEIF master: %@",
-          heicURL.lastPathComponent);
   } else {
     // HEVC unavailable (older device or simulator): preserve Phase 10-E.1 JPEG.
     settings = [AVCapturePhotoSettings photoSettingsWithFormat:@{
       AVVideoCodecKey : AVVideoCodecTypeJPEG
     }];
-    NSLog(@"[VanguardCamera][10-E.2] HEVC unavailable — using JPEG master: %@",
-          url.lastPathComponent);
   }
 
   // ── High-resolution per-request opt-in (Phase 10-E.1, preserved) ──────────
@@ -1650,29 +1642,12 @@ static const char kCaptureQueueKey = 0;
     CMVideoDimensions outputMax = _photoOutput.maxPhotoDimensions;
     if (outputMax.width > 0 && outputMax.height > 0) {
       settings.maxPhotoDimensions = outputMax;
-      NSLog(@"[VanguardCamera][10-E.1] capturePhoto: position=%@ orientation=%ld mirrored=%d maxDims=%dx%d codec=%@",
-            (_position == AVCaptureDevicePositionFront ? @"front" : @"back"),
-            (long)(photoConn ? photoConn.videoOrientation : -1),
-            (int)(photoConn ? photoConn.videoMirrored : -1),
-            (int)outputMax.width, (int)outputMax.height,
-            useHEVC ? @"HEVC/HEIF" : @"JPEG");
-    } else {
-      NSLog(@"[VanguardCamera][10-E.1] capturePhoto: position=%@ orientation=%ld mirrored=%d (no maxDims set) codec=%@",
-            (_position == AVCaptureDevicePositionFront ? @"front" : @"back"),
-            (long)(photoConn ? photoConn.videoOrientation : -1),
-            (int)(photoConn ? photoConn.videoMirrored : -1),
-            useHEVC ? @"HEVC/HEIF" : @"JPEG");
     }
   } else {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     settings.highResolutionPhotoEnabled = YES;
 #pragma clang diagnostic pop
-    NSLog(@"[VanguardCamera][10-E.1] capturePhoto: position=%@ orientation=%ld mirrored=%d highResolutionPhotoEnabled=YES (iOS 14-15) codec=%@",
-          (_position == AVCaptureDevicePositionFront ? @"front" : @"back"),
-          (long)(photoConn ? photoConn.videoOrientation : -1),
-          (int)(photoConn ? photoConn.videoMirrored : -1),
-          useHEVC ? @"HEVC/HEIF" : @"JPEG");
   }
 
   [_photoOutput capturePhotoWithSettings:settings delegate:self];
@@ -1700,7 +1675,7 @@ static const char kCaptureQueueKey = 0;
 
     // ── Delegate error path ────────────────────────────────────────────────
     if (error) {
-      NSLog(@"[VanguardCamera][10-E.1] didFinishProcessingPhoto error: %@", error);
+      NSLog(@"[VanguardCamera] didFinishProcessingPhoto error: %@", error);
       NSError *mappedErr = [NSError
           errorWithDomain:@"VanguardCamera"
                      code:2
@@ -1713,7 +1688,7 @@ static const char kCaptureQueueKey = 0;
     // ── Extract JPEG data from AVCapturePhoto ──────────────────────────────
     NSData *jpegData = [photo fileDataRepresentation];
     if (!jpegData) {
-      NSLog(@"[VanguardCamera][10-E.1] fileDataRepresentation returned nil");
+      NSLog(@"[VanguardCamera] fileDataRepresentation returned nil");
       NSError *encErr = [NSError
           errorWithDomain:@"VanguardCamera"
                      code:1
@@ -1726,10 +1701,7 @@ static const char kCaptureQueueKey = 0;
     NSError *writeErr = nil;
     [jpegData writeToURL:targetURL options:NSDataWritingAtomic error:&writeErr];
     if (writeErr) {
-      NSLog(@"[VanguardCamera][10-E.1] write failed: %@", writeErr);
-    } else {
-      NSLog(@"[VanguardCamera][10-E.1] photo written: %@ (%lu bytes)",
-            targetURL.lastPathComponent, (unsigned long)jpegData.length);
+      NSLog(@"[VanguardCamera] write failed: %@", writeErr);
     }
 
     if (completion) completion(writeErr ? nil : targetURL, writeErr);
