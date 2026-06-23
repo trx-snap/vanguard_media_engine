@@ -309,6 +309,7 @@ static os_log_t sExportSchedulerLog;
         // from the node's CVPixelBufferCreate). The previous scheduler-owned
         // buffer is released before adopting the new one. Source buffers are
         // never released by the scheduler.
+
         for (NSString *nodeId in _executionOrder) {
             id<VGNode> node = _nodes[nodeId];
             if (!node) continue;
@@ -353,6 +354,7 @@ static os_log_t sExportSchedulerLog;
             currentEnvelope = nodeResult;
         }
 
+
         // ── 6. Deliver to sink ────────────────────────────────────────────────
         id<VGFrameSink> sink = self.sink;
         if (sink) {
@@ -360,6 +362,8 @@ static os_log_t sExportSchedulerLog;
             deliveredEnvelope.payload.videoBuffer = frame;
             [sink presentEnvelope:deliveredEnvelope];
         }
+
+
 
         // ── 7. Post-delivery cleanup (RR-36 + DEC-102) ───────────────────────
         if (schedulerOwnedBuffer) {

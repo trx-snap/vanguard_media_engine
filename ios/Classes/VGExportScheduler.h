@@ -108,7 +108,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// transitions the context to VGGraphStateStopped, and fires completionHandler
 /// once (if not already fired). Safe from any thread.
 - (void)invalidate;
-
 @end
+
 
 NS_ASSUME_NONNULL_END

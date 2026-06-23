@@ -2059,6 +2059,7 @@ static inline double _VGQuantizePTS(double pts) {
   // transformTrack. Pull-queue-serial access only — no lock required.
   // 0.0 = clip's first frame on the timeline (post-trim, post-layout).
   double _currentElapsedTimeline;
+
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2378,7 +2379,6 @@ static inline double _VGQuantizePTS(double pts) {
   _lastDeliveredBuffer = NULL;
   _activeReader = nil;
   _outgoingReader = nil;              // Phase 7.10: non-nil only in transition windows
-  // [7.5C] Frame reuse tracking: -1 signals "no cached frame".
   _lastDeliveredAssetPTS = -1.0;
   _lastDeliveredAssetDuration = 0.0;
   atomic_store(&_generation, 0);
@@ -2635,6 +2635,8 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
                                     @"called after invalidate.")
          generation:request.generation];
   }
+
+
 
   // ── Guard 2: cancelled ────────────────────────────────────────────────────
   if (request.isCancelled) {
@@ -3153,6 +3155,8 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
                "[VGTCNode] delivered frame: clip=%lu tAsset=%.3fs genMatch=%d",
                (unsigned long)activeClipIndex, tAsset,
                (int)(atomic_load(&_generation) == capturedGeneration));
+
+
 
   return [VGFrameResult deliveredWithEnvelope:env
                                    generation:request.generation];

@@ -563,6 +563,7 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
     // No NSNull sentinel: failed rasterizations are NOT cached; they fall through
     // to the debug rectangle on every frame, preserving Phase 8.8 fallback semantics.
     NSMutableDictionary<NSString *, CIImage *> *_textCache;
+
 }
 
 // ─── Module initialization ────────────────────────────────────────────────────
@@ -594,6 +595,8 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
 
     // Phase 8.10: Initialize the text/emoji render cache for this export session.
     _textCache = [NSMutableDictionary dictionary];
+
+
 
     // ── enabled ──────────────────────────────────────────────────────────────
     // Default YES. If parameters supplies an NSNumber for "enabled", honour it.
@@ -804,6 +807,8 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
                      "[VGOverlayNode][8.7] non-finite PTS — pass-through");
         return envelope;
     }
+
+
 
     // ── Filter active overlays ────────────────────────────────────────────────
     // An overlay is active when:
@@ -1096,6 +1101,8 @@ static CIImage * _Nullable _VGOverlayCreateStickerImage(
            "outputSize=%zux%zu",
            ptsSeconds, (unsigned long)activeOverlays.count,
            outputWidth, outputHeight);
+
+
 
     // ── Return new envelope with replaced video buffer ─────────────────────────
     // C struct copy by value — metadata pointer is preserved unchanged.

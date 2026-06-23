@@ -1,16 +1,35 @@
 // VGVideoEncoderSinkNode.m
-// vanguard_media_engine — Phase 5C-4
+// vanguard_media_engine — Phase 5C-4 / Phase 10 encoder pipeline fix
 //
 // Concrete VGFrameSink: VanguardVideoToolboxEncoder + AVAssetWriter.
 //
 // Pull-mode only. No VGGraphSchedulerV2. No push callbacks. No camera path.
 //
-// Key architectural invariants:
-//   - presentEnvelope: blocks until append completes (corrected signal ordering).
+// Key architectural invariants (Phase 10 bounded async path):
+//   - presentEnvelope: acquires one in-flight slot (counting semaphore),
+//     then returns immediately after encodePixelBuffer: — no per-frame wait.
+//   - VGRetainedBuffer stored in _inFlightBuffers until VT callback fires,
+//     ensuring CVPixelBuffer lifetime across the async VT boundary.
+//   - _inFlightBuffers access is serialized on _inFlightQueue (private serial).
+//   - frameCompletionHandler removes the oldest buffer and signals the slot.
+//   - encodedSampleHandler appends the encoded sample to AVAssetWriterInput,
+//     still called from the VT callback queue (unchanged from legacy path).
 //   - AVAssetWriterInput created lazily on first sample with sourceFormatHint:.
-//   - VGRetainedBuffer ensures CVPixelBuffer survives async VT crossing.
-//   - Semaphore signaled in encodedSampleHandler (success) or
-//     frameCompletionHandler (error/drop) — exactly once per frame.
+//   - finalizeExportWithError: calls completeFrames (synchronous VT drain),
+//     then asserts _inFlightBuffers.count == 0 before proceeding.
+//
+// In-flight semaphore timeout contract (Phase 10 hardening):
+//   - If _inFlightSemaphore wait times out (10s), the VT session is assumed dead.
+//   - The timeout path calls [self invalidate] (cancels writer, tears down encoder)
+//     and returns immediately WITHOUT storing a buffer or submitting to VT.
+//   - No slot was acquired, so no signal is emitted — semaphore count stays balanced.
+//   - _invalidated = YES causes all subsequent presentEnvelope: calls to no-op.
+//   - finalizeExportWithError: returns nil (writer is cancelled) → caller sees failure.
+//   - This is fail-fast: producing a truncated/corrupt MP4 is not acceptable.
+//
+// Legacy synchronous path (kVGUseLegacySynchronousEncoderSink = YES):
+//   - presentEnvelope: blocks until the VT callback signals _encodeSemaphore.
+//   - Preserved verbatim for rollback safety.
 //
 // NOT imported:
 //   VGGraphSchedulerV2, VanguardFileMediaSource, VanguardGraphRuntime,
@@ -26,6 +45,20 @@
 #import <CoreVideo/CoreVideo.h>
 #import <CoreMedia/CoreMedia.h>
 #import <VideoToolbox/VideoToolbox.h>
+
+
+// ─── Phase 10 encoder pipeline constants ──────────────────────────────────────
+
+/// Rollback flag. Set to YES to revert to the original synchronous per-frame
+/// semaphore wait. Defaults to NO (bounded async path active).
+/// Temporary diagnostic — do not commit as permanent production code.
+static const BOOL kVGUseLegacySynchronousEncoderSink = NO;
+
+/// Maximum number of frames that may be submitted to VideoToolbox and awaiting
+/// their VT callback concurrently. First kVGMaxFramesInFlight frames submit
+/// without blocking; subsequent frames block until a callback drains a slot.
+/// Cap of 4 covers the B-frame reorder window (2–3 frames) + 1 headroom.
+static const NSInteger kVGMaxFramesInFlight = 4;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -54,12 +87,31 @@ NS_ASSUME_NONNULL_BEGIN
     AVAssetWriterInput              *_writerInput;  // nil until first encoded sample
     BOOL                             _writerStarted; // YES after startWriting
 
-    // Semaphore: signals exactly once per frame (see signal ordering comments)
+    // ── Legacy synchronous path ───────────────────────────────────────────────
+    // Binary semaphore: signals exactly once per frame (legacy path only).
+    // In the bounded async path this semaphore is unused.
     dispatch_semaphore_t             _encodeSemaphore;
 
     // Per-frame encode status (set by frameCompletionHandler before signal)
     OSStatus                         _lastEncodeStatus;
     VTEncodeInfoFlags                _lastEncodeFlags;
+
+    // ── Phase 10 bounded async path ───────────────────────────────────────────
+    // Counting semaphore: initialized to kVGMaxFramesInFlight.
+    // presentEnvelope: waits (acquires) before submitting each frame.
+    // frameCompletionHandler signals (releases) after draining the slot.
+    dispatch_semaphore_t             _inFlightSemaphore;
+
+    // Serial queue protecting _inFlightBuffers from concurrent access.
+    // Writer thread (scheduler/export queue) appends; VT callback queue removes.
+    dispatch_queue_t                 _inFlightQueue;
+
+    // Retained pixel buffers for frames currently in-flight with VideoToolbox.
+    // Each entry is a VGRetainedBuffer* that holds +1 CVPixelBuffer retain.
+    // Entries are appended in presentEnvelope: and removed (FIFO) in
+    // frameCompletionHandler, which fires for every VT callback (success/drop/error).
+    NSMutableArray<VGRetainedBuffer *> *_inFlightBuffers;
+
 }
 
 @synthesize ready = _ready;
@@ -107,9 +159,18 @@ NS_ASSUME_NONNULL_BEGIN
     _writerInput    = nil;
     _writerStarted  = NO;
 
+    // Legacy path semaphore (binary — starts at 0, signals once per frame).
     _encodeSemaphore = dispatch_semaphore_create(0);
     _lastEncodeStatus = noErr;
     _lastEncodeFlags  = 0;
+
+    // Bounded async path: counting semaphore + serial protection queue + buffer array.
+    _inFlightSemaphore = dispatch_semaphore_create(kVGMaxFramesInFlight);
+    _inFlightQueue     = dispatch_queue_create("com.vanguard.encoder.inflight",
+                                               DISPATCH_QUEUE_SERIAL);
+    _inFlightBuffers   = [NSMutableArray arrayWithCapacity:(NSUInteger)kVGMaxFramesInFlight];
+
+
 
     return self;
 }
@@ -178,51 +239,100 @@ NS_ASSUME_NONNULL_BEGIN
 
     // ── 4. Wire encoder handlers ──────────────────────────────────────────────
     //
-    // SEMAPHORE SIGNAL ORDERING (CRITICAL — see header comments):
+    // HANDLER WIRING DIFFERS BY PATH:
     //
-    //   vtOutputCallback fires in this order (Phase 5B):
-    //     1. frameCompletionHandler  — UNCONDITIONAL, FIRST
-    //     2. encodedSampleHandler    — SUCCESS ONLY
+    // Legacy path (kVGUseLegacySynchronousEncoderSink = YES):
+    //   frameCompletionHandler signals _encodeSemaphore on error/drop.
+    //   encodedSampleHandler appends sample, then signals _encodeSemaphore.
+    //   presentEnvelope: blocks on _encodeSemaphore after every submit.
     //
-    //   Signal rule (exactly once per frame):
-    //     - On error (status != noErr):           signal in frameCompletionHandler
-    //     - On drop (kVTEncodeInfo_FrameDropped): signal in frameCompletionHandler
-    //     - On success (noErr, no drop):          signal in encodedSampleHandler
-    //                                             AFTER appendSampleBuffer completes
+    // Bounded async path (kVGUseLegacySynchronousEncoderSink = NO):
+    //   frameCompletionHandler removes the oldest VGRetainedBuffer from
+    //   _inFlightBuffers and signals _inFlightSemaphore (frees one slot).
+    //   encodedSampleHandler appends sample (unchanged — still on VT queue).
+    //   presentEnvelope: acquires _inFlightSemaphore before submitting, then
+    //   returns immediately without waiting for the VT callback.
     //
-    //   This guarantees presentEnvelope: does NOT return before the compressed
-    //   sample has been written to AVAssetWriterInput.
+    // vtOutputCallback fires in this order (Phase 5B):
+    //   1. frameCompletionHandler  — UNCONDITIONAL, FIRST
+    //   2. encodedSampleHandler    — SUCCESS ONLY (noErr + no drop)
+    //
+    // In the bounded async path, the slot is freed in frameCompletionHandler
+    // regardless of success/error/drop — this is the correct drain point because
+    // frameCompletionHandler fires unconditionally for every submitted frame.
 
     __weak typeof(self) weakSelf = self;
 
-    _encoder.frameCompletionHandler = ^(OSStatus status, VTEncodeInfoFlags flags) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
+    if (kVGUseLegacySynchronousEncoderSink) {
+        // ── Legacy handler wiring (unchanged from pre-Phase-10 behavior) ──────
 
-        strongSelf->_lastEncodeStatus = status;
-        strongSelf->_lastEncodeFlags  = flags;
+        _encoder.frameCompletionHandler = ^(OSStatus status, VTEncodeInfoFlags flags) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
 
-        // Determine if encodedSampleHandler will follow.
-        // Apple VT: noErr + no FrameDropped → sampleBuffer non-NULL → handler fires.
-        BOOL willHaveSample = (status == noErr) &&
-                              !(flags & kVTEncodeInfo_FrameDropped);
-        if (!willHaveSample) {
-            // Error or drop — no sample handler will fire → signal now.
+            strongSelf->_lastEncodeStatus = status;
+            strongSelf->_lastEncodeFlags  = flags;
+
+            // Determine if encodedSampleHandler will follow.
+            // Apple VT: noErr + no FrameDropped → sampleBuffer non-NULL → handler fires.
+            BOOL willHaveSample = (status == noErr) &&
+                                  !(flags & kVTEncodeInfo_FrameDropped);
+            if (!willHaveSample) {
+                // Error or drop — no sample handler will fire → signal now.
+                dispatch_semaphore_signal(strongSelf->_encodeSemaphore);
+            }
+            // Success path → encodedSampleHandler will signal after append.
+        };
+
+        _encoder.encodedSampleHandler = ^(CMSampleBufferRef sampleBuffer) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+
+            // Append to writer (lazy init on first sample).
+            [strongSelf _appendEncodedSample:sampleBuffer];
+
+            // Signal AFTER append — presentEnvelope: may now return.
             dispatch_semaphore_signal(strongSelf->_encodeSemaphore);
-        }
-        // Success path → encodedSampleHandler will signal after append.
-    };
+        };
 
-    _encoder.encodedSampleHandler = ^(CMSampleBufferRef sampleBuffer) {
-        __strong typeof(weakSelf) strongSelf = weakSelf;
-        if (!strongSelf) return;
+    } else {
+        // ── Bounded async handler wiring ──────────────────────────────────────
 
-        // Append to writer (lazy init on first sample).
-        [strongSelf _appendEncodedSample:sampleBuffer];
+        _encoder.frameCompletionHandler = ^(OSStatus status, VTEncodeInfoFlags flags) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
 
-        // Signal AFTER append — presentEnvelope: may now return.
-        dispatch_semaphore_signal(strongSelf->_encodeSemaphore);
-    };
+            strongSelf->_lastEncodeStatus = status;
+            strongSelf->_lastEncodeFlags  = flags;
+
+            // Remove the oldest in-flight buffer (FIFO — callbacks fire in
+            // encode/DTS order, matching submission order).
+            // Serialized on _inFlightQueue for thread safety.
+            dispatch_sync(strongSelf->_inFlightQueue, ^{
+                if (strongSelf->_inFlightBuffers.count > 0) {
+                    [strongSelf->_inFlightBuffers removeObjectAtIndex:0];
+                }
+            });
+
+            // Release one in-flight slot — allows the next blocked
+            // presentEnvelope: call (if any) to proceed.
+            dispatch_semaphore_signal(strongSelf->_inFlightSemaphore);
+        };
+
+        _encoder.encodedSampleHandler = ^(CMSampleBufferRef sampleBuffer) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) return;
+
+            // Append to writer (lazy init on first sample).
+            // Still called from the VT callback queue — same as legacy path.
+            // appendSampleBuffer: is safe here because it runs serially on the
+            // VT callback queue and no other writer appends overlap.
+            [strongSelf _appendEncodedSample:sampleBuffer];
+
+            // No semaphore signal here — slot was already freed in
+            // frameCompletionHandler (which fired before this handler).
+        };
+    }
 
     _ready = YES;
     completion(nil);
@@ -244,6 +354,12 @@ NS_ASSUME_NONNULL_BEGIN
     // Nil out handlers to prevent callbacks after teardown.
     _encoder.frameCompletionHandler = nil;
     _encoder.encodedSampleHandler   = nil;
+
+    // Drain _inFlightBuffers under the lock so any racing callback
+    // that fires after invalidation finds the array empty.
+    dispatch_sync(_inFlightQueue, ^{
+        [self->_inFlightBuffers removeAllObjects];
+    });
 }
 
 // ─── VGFrameSink — presentEnvelope: ──────────────────────────────────────────
@@ -257,41 +373,153 @@ NS_ASSUME_NONNULL_BEGIN
     CVPixelBufferRef rawBuffer = (CVPixelBufferRef)envelope.payload.videoBuffer;
     if (!rawBuffer) return;
 
-    // ── 1. Wrap CVPixelBuffer in VGRetainedBuffer (DEC-V2-010) ───────────────
-    //
-    // VGExportScheduler releases the buffer AFTER presentEnvelope: returns.
-    // VTCompressionSessionEncodeFrame is async — VT may read the buffer after
-    // encodeFrame returns. VGRetainedBuffer provides +1 ARC-managed retain,
-    // ensuring the buffer remains valid until the VT callback fires.
-    // Released by ARC when this scope exits (after semaphore wait).
-    VGRetainedBuffer *retained = [[VGRetainedBuffer alloc]
-                                      initWithPixelBuffer:rawBuffer];
 
-    // ── 2. Submit to encoder (async — VT callback fires later) ───────────────
-    [_encoder encodePixelBuffer:retained.pixelBuffer
-               presentationTime:envelope.pts];
 
-    // ── 3. Block until semaphore signals (exactly once per frame) ─────────────
-    //
-    //   Success: signal fires in encodedSampleHandler AFTER appendSampleBuffer.
-    //   Error/drop: signal fires in frameCompletionHandler (no sample coming).
-    //   Timeout: treat as encode error; prevents infinite hang on VT failure.
-    intptr_t result = dispatch_semaphore_wait(
-        _encodeSemaphore,
-        dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+    if (kVGUseLegacySynchronousEncoderSink) {
+        // ═══════════════════════════════════════════════════════════════════════
+        // LEGACY SYNCHRONOUS PATH — preserved verbatim for rollback
+        // ═══════════════════════════════════════════════════════════════════════
 
-    if (result != 0) {
-        // Timeout — log and continue; encoder may be degraded.
-        NSLog(@"[VGVideoEncoderSinkNode] presentEnvelope: semaphore timeout "
-              @"(frame %ld) — encoder may have stalled", (long)_framesSubmitted);
+        // ── 1. Wrap CVPixelBuffer in VGRetainedBuffer (DEC-V2-010) ───────────
+        //
+        // VGExportScheduler releases the buffer AFTER presentEnvelope: returns.
+        // VTCompressionSessionEncodeFrame is async — VT may read the buffer after
+        // encodeFrame returns. VGRetainedBuffer provides +1 ARC-managed retain,
+        // ensuring the buffer remains valid until the VT callback fires.
+        // Released by ARC when this scope exits (after semaphore wait).
+        VGRetainedBuffer *retained = [[VGRetainedBuffer alloc]
+                                          initWithPixelBuffer:rawBuffer];
+
+        // ── 2. Submit to encoder (async — VT callback fires later) ────────────
+        [_encoder encodePixelBuffer:retained.pixelBuffer
+                   presentationTime:envelope.pts];
+
+        // ── 3. Block until semaphore signals (exactly once per frame) ──────────
+        //
+        //   Success: signal fires in encodedSampleHandler AFTER appendSampleBuffer.
+        //   Error/drop: signal fires in frameCompletionHandler (no sample coming).
+        //   Timeout: treat as encode error; prevents infinite hang on VT failure.
+        intptr_t result = dispatch_semaphore_wait(
+            _encodeSemaphore,
+            dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+
+        if (result != 0) {
+            // Timeout — log and continue; encoder may be degraded.
+            NSLog(@"[VGVideoEncoderSinkNode] presentEnvelope: semaphore timeout "
+                  @"(frame %ld) — encoder may have stalled", (long)_framesSubmitted);
+        }
+
+
+
+        // ── 4. retained released by ARC here ──────────────────────────────────
+        // By this point: VT callback has fired, encoder has consumed the buffer,
+        // and (on success) appendSampleBuffer has completed. Safe to release.
+        (void)retained;
+
+        _framesSubmitted++;
+
+    } else {
+        // ═══════════════════════════════════════════════════════════════════════
+        // BOUNDED ASYNC PATH — Phase 10 encoder pipeline fix
+        // ═══════════════════════════════════════════════════════════════════════
+        //
+        // Model:
+        //   - Up to kVGMaxFramesInFlight (4) frames may be in-flight concurrently.
+        //   - First 4 frames acquire a slot and return immediately.
+        //   - Frame 5 blocks only if no callback has drained a slot yet.
+        //   - This ensures VideoToolbox always has enough frames to satisfy
+        //     its B-frame reordering window, eliminating the 15-second startup
+        //     deadlock caused by the legacy single-frame synchronous wait.
+        //
+        // Buffer lifetime:
+        //   - VGRetainedBuffer holds +1 CVPixelBuffer retain.
+        //   - It is stored in _inFlightBuffers until frameCompletionHandler fires.
+        //   - frameCompletionHandler removes it (FIFO) — VT is done reading by then.
+        //   - ARC releases the VGRetainedBuffer, which releases the CVPixelBuffer.
+        //
+        // Thread safety:
+        //   - _inFlightBuffers is mutated from the export queue (here, in append)
+        //     and from the VT callback queue (in frameCompletionHandler remove).
+        //   - All accesses are wrapped in dispatch_sync on _inFlightQueue (serial).
+
+        // ── 1. Wrap CVPixelBuffer in VGRetainedBuffer (DEC-V2-010) ───────────
+        // Retain BEFORE acquiring the in-flight slot and BEFORE storing in
+        // _inFlightBuffers, so the buffer survives any reorder between this call
+        // and the VT callback.
+        VGRetainedBuffer *retained = [[VGRetainedBuffer alloc]
+                                          initWithPixelBuffer:rawBuffer];
+
+        // ── 2. Acquire one in-flight slot (backpressure) ──────────────────────
+        //
+        // Blocks only when all kVGMaxFramesInFlight slots are occupied.
+        // 10-second timeout is a last-resort safety valve: if VT stops firing
+        // callbacks (session death), this prevents an infinite hang.
+        intptr_t slotResult = dispatch_semaphore_wait(
+            _inFlightSemaphore,
+            dispatch_time(DISPATCH_TIME_NOW, 10LL * NSEC_PER_SEC));
+
+        if (slotResult != 0) {
+            // ── TIMEOUT: in-flight slot was NOT acquired ───────────────────────
+            //
+            // VT session has stopped firing callbacks. This is a fatal encoder
+            // condition. Fail-fast rather than producing a corrupt or truncated MP4:
+            //
+            //   1. Do NOT store retained in _inFlightBuffers (no slot was acquired).
+            //   2. Do NOT submit to VideoToolbox.
+            //   3. Do NOT signal _inFlightSemaphore (count is already balanced).
+            //   4. Call [self invalidate] to cancel the writer and tear down the
+            //      encoder. _invalidated = YES causes all subsequent presentEnvelope:
+            //      calls to exit at the top guard. finalizeExportWithError: will
+            //      subsequently return nil because the writer is cancelled.
+            //
+            // Note: frameCompletionHandler will NOT fire for this frame because no
+            // submit occurred — so the semaphore count remains correct.
+            NSLog(@"[VGVideoEncoderSinkNode] FATAL: in-flight slot timeout "
+                  @"(frame %ld, 10s elapsed) — VT session has stalled. "
+                  @"Aborting export to prevent corrupt output.",
+                  (long)_framesSubmitted);
+
+            // invalidate tears down encoder + writer and sets _invalidated = YES.
+            // ARC releases retained here since it was never stored or submitted.
+            [self invalidate];
+            return;
+        }
+
+        // Guard: re-check ready state after potentially blocking on the semaphore.
+        // If invalidated while waiting (e.g. by a concurrent cancel), discard this
+        // frame safely. The slot was acquired — release it immediately.
+        if (_invalidated || !_ready) {
+            dispatch_semaphore_signal(_inFlightSemaphore);
+            (void)retained;
+            return;
+        }
+
+        // ── 3. Store retained buffer (must precede encodePixelBuffer:) ─────────
+        //
+        // The buffer is stored BEFORE encoding so that if the VT callback fires
+        // synchronously (possible on some VT configurations), frameCompletionHandler
+        // will find a non-empty array. In practice VT callbacks are async, but
+        // FIFO ordering is preserved regardless: callbacks fire in DTS order
+        // (matching submission order), so removeObjectAtIndex:0 is always correct.
+        dispatch_sync(_inFlightQueue, ^{
+            [self->_inFlightBuffers addObject:retained];
+        });
+
+        // ── 4. Submit to encoder (async — VT callback fires later) ────────────
+        [_encoder encodePixelBuffer:retained.pixelBuffer
+                   presentationTime:envelope.pts];
+
+        // ── 5. Return immediately — no per-frame wait ─────────────────────────
+        //
+        // The VT callback (frameCompletionHandler) will:
+        //   a. Remove the oldest VGRetainedBuffer from _inFlightBuffers.
+        //   b. Signal _inFlightSemaphore to free the slot.
+        // The retained buffer survives in _inFlightBuffers until that point.
+
+
+
+        _framesSubmitted++;
     }
-
-    // ── 4. retained released by ARC here ─────────────────────────────────────
-    // By this point: VT callback has fired, encoder has consumed the buffer,
-    // and (on success) appendSampleBuffer has completed. Safe to release.
-    (void)retained;
-
-    _framesSubmitted++;
 }
 
 // ─── Private: lazy writer init + append ──────────────────────────────────────
@@ -353,7 +581,10 @@ NS_ASSUME_NONNULL_BEGIN
               @"writer status=%ld error=%@",
               (long)_writer.status, _writer.error);
     }
-    // Semaphore is signaled by the caller (encodedSampleHandler) AFTER this returns.
+
+
+    // In the legacy path: semaphore is signaled by encodedSampleHandler AFTER this returns.
+    // In the bounded async path: no semaphore signal here — slot freed in frameCompletionHandler.
 }
 
 // ─── Export finalization ──────────────────────────────────────────────────────
@@ -371,9 +602,36 @@ NS_ASSUME_NONNULL_BEGIN
     }
 
     // ── 1. Flush all pending VT callbacks ─────────────────────────────────────
+    //
+    // VTCompressionSessionCompleteFrames blocks until every pending VT callback
+    // has fired. After this returns:
+    //   - All frameCompletionHandler calls have completed.
+    //   - All encodedSampleHandler calls have completed.
+    //   - All appendSampleBuffer: calls have completed.
+    //   - In the bounded async path: _inFlightBuffers must be empty.
     BOOL flushed = [_encoder completeFrames];
     if (!flushed) {
         NSLog(@"[VGVideoEncoderSinkNode] finalizeExport: completeFrames returned NO");
+    }
+
+    // ── 1a. Drain invariant check (bounded async path) ────────────────────────
+    if (!kVGUseLegacySynchronousEncoderSink) {
+        __block NSUInteger remainingCount = 0;
+        dispatch_sync(_inFlightQueue, ^{
+            remainingCount = self->_inFlightBuffers.count;
+        });
+        if (remainingCount > 0) {
+            // This should never happen: completeFrames guarantees all VT callbacks
+            // have fired, which means all frameCompletionHandlers have run, which
+            // means all _inFlightBuffers entries have been removed.
+            NSLog(@"[VGVideoEncoderSinkNode] finalizeExport: WARNING — %lu in-flight "
+                  @"buffers remain after completeFrames (expected 0). "
+                  @"Draining defensively.", (unsigned long)remainingCount);
+            dispatch_sync(_inFlightQueue, ^{
+                [self->_inFlightBuffers removeAllObjects];
+            });
+        }
+
     }
 
     // ── 2. Mark writer input finished (no more samples) ───────────────────────

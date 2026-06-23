@@ -36,6 +36,7 @@
 
 #import "VGTimelineExportHelper.h"
 
+
 // Phase 8.14A: post-pass audio sidecar muxer.
 #import "VGAudioExportMuxer.h"
 
@@ -72,6 +73,7 @@
 #import <os/log.h>
 
 static os_log_t sExportHelperLog;
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - @implementation
@@ -171,6 +173,8 @@ static os_log_t sExportHelperLog;
                                          NSError * _Nullable error))completion
 {
     NSParameterAssert(completion != nil);
+
+
 
     // ── 0. Phase 8.14A: determine temp vs final output path ───────────────────
     //
@@ -618,6 +622,8 @@ static os_log_t sExportHelperLog;
         // Wire the sink (weak reference in scheduler; strong in this scope). (MOD-6)
         scheduler.sink = strongSink;
 
+
+
         // ── 13. Wire completionHandler ─────────────────────────────────────────
         //
         // Follows VGVideoExportSession.m completion wiring (lines 244-265).
@@ -625,6 +631,8 @@ static os_log_t sExportHelperLog;
         // failure → invalidate sink (cancel AVAssetWriter) then propagate error.
         // MOD-6: sink invalidation on all failure paths.
         scheduler.completionHandler = ^(BOOL success, NSError * _Nullable schedError) {
+
+
             if (success) {
                 // Pull loop reached EOS — finalize: flush VT encoder + finish AVAssetWriter.
                 os_log(sExportHelperLog, "[8.6] pull loop EOS — finalizing export");
@@ -646,6 +654,7 @@ static os_log_t sExportHelperLog;
                         // sidecar audio track and write the final outputPath.
                         os_log(sExportHelperLog,
                                "[8.14A] starting post-pass audio mux");
+
                         VGAudioExportMuxer *muxer =
                             [[VGAudioExportMuxer alloc]
                                 initWithVideoTempPath:capturedVideoWrite
@@ -655,21 +664,26 @@ static os_log_t sExportHelperLog;
                         [muxer startMuxWithCompletion:^(BOOL muxOK,
                                                        NSTimeInterval muxDuration,
                                                        NSError * _Nullable muxErr) {
+
+
                             if (muxOK) {
                                 os_log(sExportHelperLog,
                                        "[8.14A] post-pass mux complete: %.2fs",
                                        muxDuration);
+
                                 completion(YES, outputPath, muxDuration, nil);
                             } else {
                                 os_log_error(sExportHelperLog,
                                              "[8.14A] post-pass mux failed: %{public}@",
                                              muxErr.localizedDescription);
+
                                 completion(NO, nil, 0.0, muxErr);
                             }
                         }];
 
                     } else {
                         // No sidecar — deliver the video-only result directly.
+
                         completion(YES, outputPath, videoDuration, nil);
                     }
 
@@ -686,6 +700,7 @@ static os_log_t sExportHelperLog;
                     os_log_error(sExportHelperLog,
                                  "[8.6] finalize failed: %{public}@",
                                  err.localizedDescription);
+
                     completion(NO, nil, 0.0, err);
                 }
 
@@ -707,6 +722,7 @@ static os_log_t sExportHelperLog;
                            userInfo:@{
                     NSLocalizedDescriptionKey: @"Export scheduler failed or was cancelled"
                 }];
+
                 completion(NO, nil, 0.0, err);
             }
         };
