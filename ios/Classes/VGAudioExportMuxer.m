@@ -41,6 +41,15 @@
 //   - timeRemapAudioPolicy "mute": skip that track entirely.
 //   - Output file deleted before AVAssetExportSession (cannot overwrite).
 //
+// Phase 10-F: Direct audio copy path (visual-only export optimisation)
+//   When sidecar has exactly one track with role="original", volume=1.0,
+//   no fades, no keyframes, and the source file contains an AAC audio track,
+//   we bypass Pass 1 (AppleM4A re-encode) entirely. The source audio file is
+//   inserted directly into the Pass 2 composition and muxed with
+//   AVAssetExportPresetPassthrough — a bit-exact stream copy.
+//   This prevents the ~240 kbps audio bloat caused by AppleM4A re-encoding
+//   low-bitrate sources (e.g. 64 kbps or 128 kbps AAC).
+//
 // Forbidden:
 //   VGVideoEncoderSinkNode, VGVideoExportSession, VGAudioOnlyExporter,
 //   VGExportScheduler, VGGraphDescriptor, VGGraphValidator, VGGraphPlanner,
@@ -219,7 +228,106 @@ static void _VGAudioExportMuxerLogInit(void) {
            (unsigned long)videoTracks.count,
            (unsigned long)activeTracks.count);
 
-    // ── 5. Pass 1: Audio-only mixdown → audioMixTempPath (.m4a) ──────────────
+    // ── 5. Phase 10-F: direct-copy path check ────────────────────────────────
+    //
+    // Qualification (all must hold):
+    //   a. Exactly one active track.
+    //   b. role == "original".
+    //   c. volume == 1.0 (or absent → defaults to 1.0).
+    //   d. fadeInSeconds == 0 (or absent).
+    //   e. fadeOutSeconds == 0 (or absent).
+    //   f. volumeKeyframes absent or empty.
+    //   g. Source file exists and contains an AVFoundation-decodable audio track
+    //      whose format subtype is AAC (compatible with passthrough MP4 mux).
+    //
+    // When qualified, we skip Pass 1 entirely and load the source audio file
+    // directly into the Pass 2 composition — a bit-exact stream copy.
+
+    if ([self _trackQualifiesForDirectCopy:activeTracks]) {
+        NSDictionary<NSString *, id> *td = activeTracks.firstObject;
+        os_log(sMuxerLog,
+               "[10-F] single original track qualifies for direct audio copy — "
+               "bypassing Pass 1 re-encode (track=%{public}@)",
+               td[@"trackId"]);
+
+        // Capture variables needed for the mixdown fallback.
+        NSString *audioMixTempPath =
+            [finalOutputPath stringByAppendingString:@".audio_mix_tmp.m4a"];
+
+        [self _directCopyMuxVideoTempPath:videoTempPath
+                               videoAsset:videoAsset
+                           videoDuration:videoDuration
+                       audioDurationSecs:videoDurationSecs
+                          sourceAudioURL:[NSURL fileURLWithPath:(NSString *)td[@"url"]]
+                    sourceTrimStartSecs:[td[@"sourceTrimStart"] doubleValue]
+                          finalOutputPath:finalOutputPath
+                              completion:^(BOOL dcOK, NSTimeInterval dcDuration,
+                                          NSError * _Nullable dcErr) {
+            if (dcOK) {
+                // Direct copy succeeded — done.
+                os_log(sMuxerLog,
+                       "[10-F] direct copy succeeded: %.3fs", dcDuration);
+                [self _fireCompletion:completion
+                              success:YES
+                             duration:dcDuration
+                                error:nil];
+                return;
+            }
+
+            // ── Direct copy failed — fall back to Pass 1 + Pass 2 mixdown ───
+            // This ensures the export never silently drops audio when the
+            // source has audio and direct copy is not possible.
+            os_log_error(sMuxerLog,
+                         "[10-F] direct copy failed (%{public}@) — "
+                         "falling back to Pass 1 mixdown (audio is preserved)",
+                         dcErr.localizedDescription);
+
+            [self _pass1AudioMixdown:activeTracks
+                   videoDurationSecs:videoDurationSecs
+                   audioMixTempPath:audioMixTempPath
+                          completion:^(BOOL pass1OK, NSError * _Nullable pass1Err) {
+                if (!pass1OK) {
+                    [self _deleteFileIfExists:videoTempPath];
+                    [self _deleteFileIfExists:audioMixTempPath];
+                    [self _deleteFileIfExists:finalOutputPath];
+                    [self _fireCompletion:completion
+                                  success:NO
+                                 duration:0.0
+                                    error:pass1Err];
+                    return;
+                }
+                [self _pass2FinalMux:videoTempPath
+                           videoAsset:videoAsset
+                     audioMixTempPath:audioMixTempPath
+                      finalOutputPath:finalOutputPath
+                           completion:^(BOOL pass2OK, NSTimeInterval p2Dur,
+                                        NSError * _Nullable pass2Err) {
+                    if (pass2OK) {
+                        [self _deleteFileIfExists:videoTempPath];
+                        [self _deleteFileIfExists:audioMixTempPath];
+                        os_log(sMuxerLog,
+                               "[10-F] fallback mixdown complete: %.3fs", p2Dur);
+                        [self _fireCompletion:completion
+                                      success:YES
+                                     duration:p2Dur
+                                        error:nil];
+                    } else {
+                        [self _deleteFileIfExists:videoTempPath];
+                        [self _deleteFileIfExists:audioMixTempPath];
+                        [self _deleteFileIfExists:finalOutputPath];
+                        [self _fireCompletion:completion
+                                      success:NO
+                                     duration:0.0
+                                        error:pass2Err];
+                    }
+                }];
+            }];
+        }];
+        return;
+    }
+
+    // ── 6. Pass 1: Audio-only mixdown → audioMixTempPath (.m4a) ──────────────
+    // (Normal path — multiple tracks or audio with effects.)
 
     NSString *audioMixTempPath = [finalOutputPath stringByAppendingString:@".audio_mix_tmp.m4a"];
 
@@ -236,7 +344,7 @@ static void _VGAudioExportMuxerLogInit(void) {
             return;
         }
 
-        // ── 6. Pass 2: Video + mixed audio → finalOutputPath ─────────────────
+        // ── 7. Pass 2: Video + mixed audio → finalOutputPath ─────────────────
 
         [self _pass2FinalMux:videoTempPath
                videoAsset:videoAsset
@@ -257,6 +365,338 @@ static void _VGAudioExportMuxerLogInit(void) {
                 [self _fireCompletion:completion success:NO duration:0.0 error:pass2Err];
             }
         }];
+    }];
+}
+
+// ─── Phase 10-F: Direct-copy qualification check ────────────────────────────
+//
+// Returns YES when all active tracks qualify for bit-exact audio stream copy
+// (no re-encode). See §5 above for the full qualification list.
+
+- (BOOL)_trackQualifiesForDirectCopy:(NSArray<NSDictionary<NSString *, id> *> *)activeTracks {
+    // Require exactly one active track.
+    if (activeTracks.count != 1) {
+        os_log(sMuxerLog,
+               "[10-F] direct copy not eligible: %lu active tracks (need 1)",
+               (unsigned long)activeTracks.count);
+        return NO;
+    }
+
+    NSDictionary<NSString *, id> *td = activeTracks.firstObject;
+
+    // Role must be "original".
+    NSString *role = td[@"role"];
+    if (![role isEqualToString:@"original"]) {
+        os_log(sMuxerLog,
+               "[10-F] direct copy not eligible: role=%{public}@ (need 'original')",
+               role ?: @"(nil)");
+        return NO;
+    }
+
+    // Volume must be 1.0 (default when absent).
+    id rawVolume = td[@"volume"];
+    double volume = rawVolume ? [rawVolume doubleValue] : 1.0;
+    if (fabs(volume - 1.0) > 0.001) {
+        os_log(sMuxerLog,
+               "[10-F] direct copy not eligible: volume=%.4f (need 1.0)", volume);
+        return NO;
+    }
+
+    // No fade-in.
+    id rawFadeIn = td[@"fadeInSeconds"];
+    double fadeIn = rawFadeIn ? [rawFadeIn doubleValue] : 0.0;
+    if (fadeIn > 0.001) {
+        os_log(sMuxerLog,
+               "[10-F] direct copy not eligible: fadeInSeconds=%.4f", fadeIn);
+        return NO;
+    }
+
+    // No fade-out.
+    id rawFadeOut = td[@"fadeOutSeconds"];
+    double fadeOut = rawFadeOut ? [rawFadeOut doubleValue] : 0.0;
+    if (fadeOut > 0.001) {
+        os_log(sMuxerLog,
+               "[10-F] direct copy not eligible: fadeOutSeconds=%.4f", fadeOut);
+        return NO;
+    }
+
+    // No volume keyframes.
+    id rawKfs = td[@"volumeKeyframes"];
+    if ([rawKfs isKindOfClass:[NSArray class]] && ((NSArray *)rawKfs).count > 0) {
+        os_log(sMuxerLog, "[10-F] direct copy not eligible: volumeKeyframes present");
+        return NO;
+    }
+
+    // Source file must exist.
+    NSString *audioURL = td[@"url"];
+    if (audioURL.length == 0) {
+        os_log(sMuxerLog, "[10-F] direct copy not eligible: empty url");
+        return NO;
+    }
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:audioURL]) {
+        os_log(sMuxerLog,
+               "[10-F] direct copy not eligible: audio file not found at %{public}@",
+               audioURL);
+        return NO;
+    }
+
+    // Source must have at least one AVFoundation audio track.
+    // We also accept non-AAC here; AVAssetExportPresetPassthrough handles
+    // most common codecs (AAC, ALAC, AC-3, PCM in certain containers).
+    // For safety we only stream-copy AAC, which is the overwhelmingly common
+    // codec for MP4/MOV sources exported from iOS devices.
+    AVAsset *audioAsset = [AVAsset assetWithURL:[NSURL fileURLWithPath:audioURL]];
+    NSArray<AVAssetTrack *> *audioTracks = [audioAsset tracksWithMediaType:AVMediaTypeAudio];
+    if (audioTracks.count == 0) {
+        os_log(sMuxerLog,
+               "[10-F] direct copy not eligible: no audio track in %{public}@",
+               audioURL.lastPathComponent);
+        return NO;
+    }
+    AVAssetTrack *audioTrack = audioTracks.firstObject;
+
+    // Check that audio codec is AAC — safe for passthrough MP4 mux.
+    BOOL isAAC = NO;
+    for (id fmtDesc in audioTrack.formatDescriptions) {
+        FourCharCode subtype =
+            CMFormatDescriptionGetMediaSubType((__bridge CMFormatDescriptionRef)fmtDesc);
+        if (subtype == kAudioFormatMPEG4AAC ||
+            subtype == kAudioFormatMPEG4AAC_HE ||
+            subtype == kAudioFormatMPEG4AAC_HE_V2) {
+            isAAC = YES;
+            break;
+        }
+    }
+    if (!isAAC) {
+        os_log(sMuxerLog,
+               "[10-F] direct copy not eligible: audio codec is not AAC — "
+               "falling back to Pass 1 re-encode");
+        return NO;
+    }
+
+    return YES;
+}
+
+// ─── Phase 10-F: Direct-copy mux (bypass Pass 1) ─────────────────────────────
+//
+// Inserts the original source audio file directly into a composition alongside
+// the video-only temp, then exports using AVAssetExportPresetPassthrough.
+// No audio re-encoding occurs.
+//
+// ── Cleanup ownership ────────────────────────────────────────────────────────
+// This method MUST NOT delete videoTempPath on any failure path. The call-site
+// wrapper in _runMuxFromVideoTempPath: intercepts completion(NO, ...) and falls
+// back to Pass 1 + Pass 2 mixdown, which needs videoTempPath to be intact.
+//
+//   • On success:      delete videoTempPath here (direct copy is complete).
+//   • On cancellation: delete videoTempPath and finalOutputPath (terminal).
+//   • On any other failure: return completion(NO, error) WITHOUT deleting
+//     videoTempPath. The call-site fallback owns the final cleanup.
+//   • A partial finalOutputPath may be deleted on failure because the fallback
+//     produces its own finalOutputPath via Pass 2.
+
+- (void)_directCopyMuxVideoTempPath:(NSString *)videoTempPath
+                         videoAsset:(AVAsset *)videoAsset
+                     videoDuration:(CMTime)videoDuration
+                 audioDurationSecs:(double)audioDurationSecs
+                    sourceAudioURL:(NSURL *)sourceAudioURL
+              sourceTrimStartSecs:(double)sourceTrimStartSecs
+                    finalOutputPath:(NSString *)finalOutputPath
+                         completion:(void (^)(BOOL, NSTimeInterval, NSError * _Nullable))completion {
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // Load video track.
+    NSArray<AVAssetTrack *> *videoTracks = [videoAsset tracksWithMediaType:AVMediaTypeVideo];
+    if (videoTracks.count == 0) {
+        // Do NOT delete videoTempPath — fallback Pass 2 needs it.
+        [self _fireCompletion:completion
+                      success:NO
+                     duration:0.0
+                        error:[self _errorCode:60
+                                      message:@"[10-F] direct copy: video temp has no video track — "
+                                              @"triggering mixdown fallback"]];
+        return;
+    }
+    AVAssetTrack *videoTrack = videoTracks.firstObject;
+
+    // Load source audio track.
+    AVAsset *audioAsset = [AVAsset assetWithURL:sourceAudioURL];
+    NSArray<AVAssetTrack *> *audioTracks = [audioAsset tracksWithMediaType:AVMediaTypeAudio];
+    if (audioTracks.count == 0) {
+        // No audio track in source — hard fail so caller's fallback triggers.
+        // Never silently produce video-only when the source qualified as having audio.
+        // Do NOT delete videoTempPath — fallback Pass 2 needs it.
+        os_log_error(sMuxerLog,
+                     "[10-F] direct copy: no audio track in source audio file — "
+                     "will fall back to Pass 1 mixdown");
+        [self _fireCompletion:completion
+                      success:NO
+                     duration:0.0
+                        error:[self _errorCode:66
+                                      message:@"[10-F] direct copy: no audio track in source — "
+                                              @"triggering mixdown fallback"]];
+        return;
+    }
+    AVAssetTrack *audioTrack = audioTracks.firstObject;
+
+    // Build composition.
+    AVMutableComposition *composition = [AVMutableComposition composition];
+
+    // Insert video track (full duration).
+    AVMutableCompositionTrack *compVideo =
+        [composition addMutableTrackWithMediaType:AVMediaTypeVideo
+                                 preferredTrackID:kCMPersistentTrackID_Invalid];
+    CMTimeRange fullVideoRange = CMTimeRangeMake(kCMTimeZero, videoDuration);
+    NSError *videoInsertErr = nil;
+    if (![compVideo insertTimeRange:fullVideoRange
+                            ofTrack:videoTrack
+                             atTime:kCMTimeZero
+                              error:&videoInsertErr]) {
+        // Do NOT delete videoTempPath — fallback Pass 2 needs it.
+        [self _fireCompletion:completion
+                      success:NO
+                     duration:0.0
+                        error:[self _errorCode:61
+                                      message:@"[10-F] direct copy: failed to insert video track — "
+                                              @"triggering mixdown fallback"
+                                   underlying:videoInsertErr]];
+        return;
+    }
+
+    // Insert audio track.
+    // sourceTrimStart: offset into the source audio file to begin reading.
+    // audioDuration: clamped to video duration.
+    double sourceAudioFileDuration = CMTimeGetSeconds(audioAsset.duration);
+    double availableFromTrim = (sourceAudioFileDuration > sourceTrimStartSecs)
+        ? (sourceAudioFileDuration - sourceTrimStartSecs) : 0.0;
+    double clampedAudioDuration = MIN(audioDurationSecs, availableFromTrim);
+    if (clampedAudioDuration <= 0.0) {
+        // Audio duration is zero after trim — hard fail so caller's fallback triggers.
+        // Never silently produce video-only when the source had audio.
+        // Do NOT delete videoTempPath — fallback Pass 2 needs it.
+        os_log_error(sMuxerLog,
+                     "[10-F] direct copy: audio duration after trim is <= 0 — "
+                     "will fall back to Pass 1 mixdown");
+        [self _fireCompletion:completion
+                      success:NO
+                     duration:0.0
+                        error:[self _errorCode:67
+                                      message:@"[10-F] direct copy: audio duration <= 0 after trim — "
+                                              @"triggering mixdown fallback"]];
+        return;
+    }
+
+    CMTime audioSourceStart = CMTimeMakeWithSeconds(sourceTrimStartSecs, kVGMuxTimescale);
+    CMTime audioSourceDur   = CMTimeMakeWithSeconds(clampedAudioDuration, kVGMuxTimescale);
+    CMTimeRange audioSourceRange = CMTimeRangeMake(audioSourceStart, audioSourceDur);
+
+    AVMutableCompositionTrack *compAudio =
+        [composition addMutableTrackWithMediaType:AVMediaTypeAudio
+                                 preferredTrackID:kCMPersistentTrackID_Invalid];
+    NSError *audioInsertErr = nil;
+    if (![compAudio insertTimeRange:audioSourceRange
+                            ofTrack:audioTrack
+                             atTime:kCMTimeZero
+                              error:&audioInsertErr]) {
+        // Audio insert failed — hard fail so caller's fallback triggers Pass 1 mixdown.
+        // Never silently produce video-only when the source had audio.
+        // Do NOT delete videoTempPath — fallback Pass 2 needs it.
+        os_log_error(sMuxerLog,
+                     "[10-F] direct copy: audio insert failed (%{public}@) — "
+                     "will fall back to Pass 1 mixdown",
+                     audioInsertErr.localizedDescription);
+        [self _fireCompletion:completion
+                      success:NO
+                     duration:0.0
+                        error:[self _errorCode:68
+                                      message:@"[10-F] direct copy: audio track insert failed — "
+                                              @"triggering mixdown fallback"
+                                   underlying:audioInsertErr]];
+        return;
+    }
+
+
+    os_log(sMuxerLog,
+           "[10-F] direct copy: composition ready — "
+           "video=%.3fs audio=%.3fs (trim=%.3fs)",
+           audioDurationSecs, clampedAudioDuration, sourceTrimStartSecs);
+
+    // Delete any stale finalOutputPath before writing (safe: this is not videoTempPath).
+    if ([fm fileExistsAtPath:finalOutputPath]) {
+        NSError *removeErr = nil;
+        if (![fm removeItemAtPath:finalOutputPath error:&removeErr]) {
+            // Do NOT delete videoTempPath — fallback Pass 2 needs it.
+            [self _fireCompletion:completion
+                          success:NO
+                         duration:0.0
+                            error:[self _errorCode:62
+                                          message:@"[10-F] direct copy: failed to remove existing output — "
+                                                  @"triggering mixdown fallback"
+                                       underlying:removeErr]];
+            return;
+        }
+    }
+
+    // Export with passthrough — no re-encode of video or audio.
+    NSURL *outputURL = [NSURL fileURLWithPath:finalOutputPath];
+    AVAssetExportSession *session =
+        [[AVAssetExportSession alloc] initWithAsset:composition
+                                         presetName:AVAssetExportPresetPassthrough];
+    if (!session) {
+        // Do NOT delete videoTempPath — fallback Pass 2 needs it.
+        [self _fireCompletion:completion
+                      success:NO
+                     duration:0.0
+                        error:[self _errorCode:63
+                                      message:@"[10-F] direct copy: AVAssetExportSession init failed — "
+                                              @"triggering mixdown fallback"]];
+        return;
+    }
+    session.outputFileType = AVFileTypeMPEG4;
+    session.outputURL      = outputURL;
+
+    os_log(sMuxerLog, "[10-F] direct copy: starting passthrough export");
+
+    [session exportAsynchronouslyWithCompletionHandler:^{
+        AVAssetExportSessionStatus status = session.status;
+        if (status == AVAssetExportSessionStatusCompleted) {
+            AVAsset *outAsset = [AVAsset assetWithURL:outputURL];
+            CMTime outDur   = outAsset.duration;
+            NSTimeInterval outSecs = 0.0;
+            if (CMTIME_IS_VALID(outDur) && CMTIME_IS_NUMERIC(outDur)) {
+                outSecs = CMTimeGetSeconds(outDur);
+            }
+            [self _deleteFileIfExists:videoTempPath];
+            os_log(sMuxerLog,
+                   "[10-F] direct copy: complete — %.3fs (audio stream-copied, no re-encode)",
+                   outSecs);
+            [self _fireCompletion:completion success:YES duration:outSecs error:nil];
+        } else if (status == AVAssetExportSessionStatusCancelled) {
+            [self _deleteFileIfExists:videoTempPath];
+            [self _deleteFileIfExists:finalOutputPath];
+            [self _fireCompletion:completion
+                          success:NO
+                         duration:0.0
+                            error:[self _errorCode:64
+                                          message:@"[10-F] direct copy: export cancelled"]];
+        } else {
+            NSError *exportErr = session.error;
+            os_log_error(sMuxerLog,
+                         "[10-F] direct copy: export failed status=%ld err=%{public}@",
+                         (long)status, exportErr.localizedDescription);
+            // Export failed — do NOT delete videoTempPath (fallback Pass 2 needs it).
+            // Delete the partial/corrupt finalOutputPath: fallback will recreate it via Pass 2.
+            [self _deleteFileIfExists:finalOutputPath];
+            [self _fireCompletion:completion
+                          success:NO
+                         duration:0.0
+                            error:[self _errorCode:65
+                                          message:@"[10-F] direct copy: passthrough export failed — "
+                                                  @"triggering mixdown fallback"
+                                       underlying:exportErr]];
+        }
     }];
 }
 
