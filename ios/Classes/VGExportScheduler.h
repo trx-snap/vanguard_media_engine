@@ -1,7 +1,12 @@
 // VGExportScheduler.h
-// vanguard_media_engine — Phase 5C-1
+// vanguard_media_engine — Phase 5C-1 / Phase 10 (real progress)
 //
 // VGExportScheduler is the pull-mode export frame pump for offline video export.
+//
+// Phase 10 (Real Export Progress):
+//   progressHandler — nullable block fired after each delivered frame.
+//   totalExpectedFrames — set by VGTimelineExportHelper to enable 0.0→1.0 progress.
+//   Throttling is performed at the VGTimelineExportHelper boundary, not here.
 //
 // Architecture:
 //   - Does NOT subclass VGGraphSchedulerV2 (push-mode only).
@@ -82,6 +87,21 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// YES after cancelExport or invalidate has been called.
 @property (nonatomic, readonly, getter=isCancelled) BOOL cancelled;
+
+// ─── Progress ─────────────────────────────────────────────────────────────────
+
+/// Total expected frames for the export. Set by VGTimelineExportHelper before
+/// calling startExport. When 0, progress callbacks are not fired.
+/// Used to compute progress = frameIndex / totalExpectedFrames.
+@property (nonatomic, assign) int64_t totalExpectedFrames;
+
+/// Called after each delivered frame (VGFrameStatusDelivered only).
+/// Invoked on _exportQueue (background serial queue).
+/// The argument is progress in [0.0, 1.0], clamped to 1.0.
+/// Throttling must be applied by the caller (VGTimelineExportHelper) — the
+/// scheduler fires this on every delivered frame.
+/// Set to nil when progress reporting is not needed.
+@property (nonatomic, copy, nullable) void (^progressHandler)(double progress);
 
 // ─── Completion ───────────────────────────────────────────────────────────────
 

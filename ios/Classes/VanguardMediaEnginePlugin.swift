@@ -2273,15 +2273,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 exportAudioSidecar = VGAudioSidecarPlan.fromDictionary(sidecarDict)
             }
 
-            NSLog("[VanguardPlugin][8.14A] exportTimeline: clips=%d w=%ld h=%ld fps=%ld bitrate=%ld overlays=%d sidecar=%@ path=%@",
-                  clipDictsE.count, Int(exportW), Int(exportH),
-                  Int(exportFps), Int(exportBitrate),
-                  exportOverlayDicts?.count ?? 0,
-                  exportAudioSidecar != nil ? "YES" : "NO",
-                  exportOutputPath)
-
             // Delegate to ObjC VGTimelineExportHelper.
-            // Phase 8.14A: uses the new 10-parameter method with canvas, overlays, and audioSidecar.
+            // Phase 10: uses the new 11-parameter method with progress: block.
             // VGExportProfile is constructed entirely in ObjC (MOD-1, MOD-2).
             // When exportOverlayDicts is nil or empty, VGTimelineExportHelper
             // preserves the original 2-node compositor → sink topology.
@@ -2296,7 +2289,14 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 bitrateBps: exportBitrate,
                 canvas: exportCanvasDict,
                 overlays: exportOverlayDicts,
-                audioSidecar: exportAudioSidecar
+                audioSidecar: exportAudioSidecar,
+                progress: { [weak self] pct in
+                    // Phase 10 Amendment 1: dispatch to main thread before invoking MethodChannel.
+                    // Throttling is applied in VGTimelineExportHelper (100ms gate).
+                    DispatchQueue.main.async {
+                        self?.channel.invokeMethod("onExportProgress", arguments: pct)
+                    }
+                }
             ) { success, outPath, duration, error in
                 DispatchQueue.main.async {
                     if success, let outPath = outPath {
@@ -2946,6 +2946,46 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         )
                         transformNode.enabled = enabled
                         nodes.append(transformNode)
+
+                    case "overlay":
+                        // Phase 10-B1: Still-image overlay compositing via VGOverlayNode.
+                        //
+                        // Accepts the same parameters dict that the video timeline already uses:
+                        //   parameters["canvas"]   : [String: Any]   → VGCanvasDescriptor
+                        //   parameters["overlays"] : [[String: Any]] → VGOverlayDescriptor[]
+                        //
+                        // VGOverlayNode parses defensively — missing or malformed values
+                        // produce safe defaults without returning an error.
+                        //
+                        // Contract note (Opus Q3): VGOverlayNode filters active overlays by PTS.
+                        // VGImageExportSession pulls at kCMTimeZero, so all overlay descriptors
+                        // passed here MUST have startTime=0.0 and duration>0 on the Dart side.
+                        //
+                        // VGOverlayNode conforms to VGTransformNode directly — VGImageExportSession
+                        // (Phase 10-B1 widened) will NOT wrap it in VGLegacyFilterAdapter.
+                        if !enabled {
+                            NSLog("[VanguardPlugin] exportImage: 'overlay' filter is disabled. Skipping.")
+                            continue
+                        }
+
+                        // Validate that at least an overlays array is present and non-empty.
+                        guard let overlayDicts = parameters["overlays"] as? [[String: Any]],
+                              !overlayDicts.isEmpty else {
+                            NSLog("[VanguardPlugin] exportImage: 'overlay' filter has no valid 'overlays' array. Skipping.")
+                            continue
+                        }
+
+                        // Build the parameters NSDictionary to pass to VGOverlayNode.
+                        // We pass the full parameters dict as-is; VGOverlayNode reads
+                        // @"canvas" and @"overlays" keys defensively.
+                        let overlayNodeParams: [String: Any] = parameters
+
+                        let overlayNode = VGOverlayNode(nodeId: "image_overlay_\(nodes.count)",
+                                                        parameters: overlayNodeParams,
+                                                        ports: nil,
+                                                        error: nil)
+                        overlayNode.enabled = enabled
+                        nodes.append(overlayNode)
 
                     default:
                         NSLog("[VanguardPlugin] exportImage: Unknown filter type '\(type)'. Skipping.")
@@ -5900,9 +5940,58 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
             }
 
+        // ── Phase 10 Slice 10A: Thermal state query ─────────────────────────────
+        //
+        // Returns the current ProcessInfo.ThermalState rawValue as an Int.
+        // Dart maps: 0=nominal, 1=fair, 2=serious, 3=critical.
+        // This is a one-shot synchronous query — no side effects.
+        case "getThermalState":
+            result(ProcessInfo.processInfo.thermalState.rawValue)
+
+        // ── Phase 10 Slice 10A: Debug thermal simulation (DEBUG builds only) ───
+        //
+        // Invokes notifyThermalStateChanged with a synthetic ProcessInfo.ThermalState
+        // so that the Dart ThermalGuardService can be exercised without a physical
+        // device reaching thermal load.
+        //
+        // DOES NOT:
+        //   - mutate real ProcessInfo thermal state (not possible via API)
+        //   - affect native filter chain, MLGate, or encoder bitrate
+        //   - reach VGPluginLifecycleObserver thermal handler
+        // ONLY: pushes the simulated state through notifyThermalStateChanged → Dart.
+        #if DEBUG
+        case "simulateThermalState":
+            guard let rawValue = args?["rawValue"] as? Int,
+                  let simulatedState = ProcessInfo.ThermalState(rawValue: rawValue) else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "simulateThermalState: rawValue (0–3) required",
+                                    details: nil))
+                return
+            }
+            NSLog("[Vanguard][DEBUG] Simulating thermal state → %ld", simulatedState.rawValue)
+            notifyThermalStateChanged(simulatedState)
+            result(nil)
+        #endif
+
         default:
             result(FlutterMethodNotImplemented)
         }
+    }
+
+    // ── Phase 10 Slice 10A: Thermal state Dart notification ─────────────────────
+    //
+    // Called by VGPluginLifecycleObserver after the existing native degradation
+    // logic runs. Forwards the raw thermal state integer to the Dart layer via
+    // the existing MethodChannel so VGThermalMonitor can update its stream.
+    //
+    // Must be called on the main thread — the lifecycle observer registers its
+    // notification with queue: .main, so this invariant is always satisfied.
+    //
+    // Access level: internal — VGPluginLifecycleObserver (same module) calls this;
+    // not exposed as public API.
+    internal func notifyThermalStateChanged(_ state: ProcessInfo.ThermalState) {
+        // channel is private but accessible from instance methods of this class.
+        channel.invokeMethod("onThermalStateChanged", arguments: state.rawValue)
     }
 }
 

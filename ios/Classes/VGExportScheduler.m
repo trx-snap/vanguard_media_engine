@@ -374,6 +374,16 @@ static os_log_t sExportSchedulerLog;
         // ── 8. Advance frame index on delivered frames ────────────────────────
         _frameIndex++;
 
+        // ── 9. Fire progress handler (Phase 10 Real Export Progress) ──────────
+        // Fires on _exportQueue after every delivered frame.
+        // Throttling is applied at the VGTimelineExportHelper boundary.
+        // totalExpectedFrames == 0 means no progress reporting is wired.
+        if (self.totalExpectedFrames > 0 && self.progressHandler) {
+            double progress = (double)_frameIndex / (double)self.totalExpectedFrames;
+            if (progress > 1.0) progress = 1.0;
+            self.progressHandler(progress);
+        }
+
         } // @autoreleasepool — Phase 10-C C1C: drain per-frame Core Image intermediates
     }
 

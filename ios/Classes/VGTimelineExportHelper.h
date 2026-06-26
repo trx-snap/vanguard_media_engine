@@ -67,7 +67,22 @@
 // When audioSidecar is nil:
 //   Existing behavior unchanged: video-only export writes directly to outputPath.
 //
-// The 7-parameter and 9-parameter methods forward with audioSidecar:nil.
+// ── Phase 10 Real Export Progress ──────────────────────────────────────────────
+//
+// Phase 10 adds a new 11-parameter method that accepts an optional progress block.
+//
+// When progress is non-nil:
+//   - totalExpectedFrames is computed from clip descriptors (ceil(totalDuration * fps)).
+//   - VGExportScheduler.progressHandler is wired to call the block.
+//   - Progress is throttled at ~100ms intervals at this boundary (not the scheduler).
+//   - When audioSidecar is non-nil, render progress is scaled to 0.0–0.95 and
+//     progress 1.0 is emitted only after VGAudioExportMuxer completes.
+//   - When audioSidecar is nil, render progress runs 0.0–1.0 directly.
+//
+// When progress is nil:
+//   Existing behavior unchanged — no progress callbacks are fired.
+//
+// The 7, 9, and 10-parameter methods forward with progress:nil.
 // No behavioral change for existing callers.
 
 #pragma once
@@ -206,6 +221,39 @@ NS_ASSUME_NONNULL_BEGIN
                          canvas:(nullable NSDictionary *)canvas
                        overlays:(nullable NSArray<NSDictionary *> *)overlays
                     audioSidecar:(nullable VGAudioSidecarPlan *)audioSidecar
+                     completion:(void (^)(BOOL success,
+                                         NSString * _Nullable outputPath,
+                                         NSTimeInterval durationSeconds,
+                                         NSError * _Nullable error))completion;
+
+/// Perform offline pull-mode timeline export with optional overlay, audio sidecar,
+/// and real-time progress reporting support.
+///
+/// Phase 10 variant. Accepts an optional progress block in addition to all
+/// Phase 8.14A parameters.
+///
+/// When progress is non-nil:
+///   - totalExpectedFrames is computed from clip startTimeSeconds + durationSeconds.
+///   - VGExportScheduler.progressHandler is wired, throttled at ~100ms intervals.
+///   - When audioSidecar is non-nil, render phase is scaled to 0.0–0.95.
+///     Progress 1.0 fires only after VGAudioExportMuxer completes.
+///   - When audioSidecar is nil, render progress runs 0.0–1.0 directly.
+///
+/// When progress is nil:
+///   Existing behavior unchanged (no callbacks).
+///
+/// The 7, 9, and 10-parameter methods forward to this with progress:nil.
++ (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
+                    transitions:(NSArray<NSDictionary *> *)transitions
+                     outputPath:(NSString *)outputPath
+                          width:(NSInteger)width
+                         height:(NSInteger)height
+                            fps:(NSInteger)fps
+                     bitrateBps:(NSInteger)bitrateBps
+                         canvas:(nullable NSDictionary *)canvas
+                       overlays:(nullable NSArray<NSDictionary *> *)overlays
+                    audioSidecar:(nullable VGAudioSidecarPlan *)audioSidecar
+                       progress:(nullable void (^)(double progress))progressBlock
                      completion:(void (^)(BOOL success,
                                          NSString * _Nullable outputPath,
                                          NSTimeInterval durationSeconds,

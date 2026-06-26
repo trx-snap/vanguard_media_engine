@@ -120,6 +120,7 @@ static os_log_t sExportHelperLog;
                            canvas:nil
                          overlays:nil
                       audioSidecar:nil
+                        progress:nil
                        completion:completion];
 }
 
@@ -152,10 +153,11 @@ static os_log_t sExportHelperLog;
                            canvas:canvas
                          overlays:overlays
                       audioSidecar:nil
+                        progress:nil
                        completion:completion];
 }
 
-// ─── Phase 8.14A 10-parameter implementation ────────────────────────────────────────
+// ─── Phase 8.14A 10-parameter forwarder (forwards to Phase 10 11-param method) ─────────
 
 + (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
                     transitions:(NSArray<NSDictionary *> *)transitions
@@ -172,9 +174,39 @@ static os_log_t sExportHelperLog;
                                          NSTimeInterval durationSeconds,
                                          NSError * _Nullable error))completion
 {
+    [self exportTimelineWithClips:clips
+                      transitions:transitions
+                       outputPath:outputPath
+                            width:width
+                           height:height
+                              fps:fps
+                       bitrateBps:bitrateBps
+                           canvas:canvas
+                         overlays:overlays
+                      audioSidecar:audioSidecar
+                        progress:nil
+                       completion:completion];
+}
+
+// ─── Phase 10 Real Export Progress: 11-parameter designated implementation ─────────
+
++ (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
+                    transitions:(NSArray<NSDictionary *> *)transitions
+                     outputPath:(NSString *)outputPath
+                          width:(NSInteger)width
+                         height:(NSInteger)height
+                            fps:(NSInteger)fps
+                     bitrateBps:(NSInteger)bitrateBps
+                         canvas:(nullable NSDictionary *)canvas
+                       overlays:(nullable NSArray<NSDictionary *> *)overlays
+                    audioSidecar:(nullable VGAudioSidecarPlan *)audioSidecar
+                       progress:(nullable void (^)(double progress))progressBlock
+                     completion:(void (^)(BOOL success,
+                                         NSString * _Nullable outputPath,
+                                         NSTimeInterval durationSeconds,
+                                         NSError * _Nullable error))completion
+{
     NSParameterAssert(completion != nil);
-
-
 
     // ── 0. Phase 8.14A: determine temp vs final output path ───────────────────
     //
@@ -590,6 +622,28 @@ static os_log_t sExportHelperLog;
     NSString   *capturedVideoWrite    = videoWritePath;
     VGAudioSidecarPlan *capturedSidecar = audioSidecar;
 
+    // Phase 10 Real Export Progress: compute totalExpectedFrames from clip descriptors.
+    // totalDuration = max(startTime + duration) across all clips.
+    // totalExpectedFrames = ceil(totalDuration * fps).
+    // When progressBlock is nil, totalExpectedFrames remains 0 and no progress fires.
+    int64_t totalExpectedFrames = 0;
+    void (^capturedProgressBlock)(double) = progressBlock;
+    if (capturedProgressBlock) {
+        NSTimeInterval totalDuration = 0.0;
+        for (NSDictionary *clip in clips) {
+            NSTimeInterval start    = [clip[@"startTimeSeconds"] doubleValue];
+            NSTimeInterval duration = [clip[@"durationSeconds"] doubleValue];
+            NSTimeInterval clipEnd  = start + duration;
+            if (clipEnd > totalDuration) { totalDuration = clipEnd; }
+        }
+        if (totalDuration > 0.0 && fps > 0) {
+            totalExpectedFrames = (int64_t)ceil(totalDuration * (double)fps);
+        }
+        os_log(sExportHelperLog,
+               "[Phase10] progress enabled: totalDuration=%.2fs fps=%ld totalExpectedFrames=%lld",
+               totalDuration, (long)fps, (long long)totalExpectedFrames);
+    }
+
     dispatch_group_notify(prepGroup, prepQueue, ^{
         NSError *prepError = firstPrepareError;
 
@@ -622,7 +676,27 @@ static os_log_t sExportHelperLog;
         // Wire the sink (weak reference in scheduler; strong in this scope). (MOD-6)
         scheduler.sink = strongSink;
 
-
+        // ── Phase 10 Real Export Progress: wire scheduler progress handler ────
+        //
+        // Throttling at ~100ms intervals is applied here, not in the scheduler.
+        // When audioSidecar is non-nil, render progress is scaled to [0.0, 0.95]
+        // so that 1.0 is emitted only after VGAudioExportMuxer completes.
+        // When audioSidecar is nil, render progress runs [0.0, 1.0] directly.
+        if (totalExpectedFrames > 0 && capturedProgressBlock) {
+            scheduler.totalExpectedFrames = totalExpectedFrames;
+            __block CFAbsoluteTime lastProgressTime = 0.0;
+            BOOL scaleForSidecar = capturedHasSidecar;
+            scheduler.progressHandler = ^(double rawProgress) {
+                CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+                // Throttle: skip if < 100ms since last fire and not the final frame.
+                if (now - lastProgressTime < 0.1 && rawProgress < 1.0) return;
+                lastProgressTime = now;
+                double scaledProgress = scaleForSidecar
+                    ? (rawProgress * 0.95)  // reserve 0.95-1.0 for mux pass
+                    : rawProgress;
+                capturedProgressBlock(scaledProgress);
+            };
+        }
 
         // ── 13. Wire completionHandler ─────────────────────────────────────────
         //
@@ -670,6 +744,10 @@ static os_log_t sExportHelperLog;
                                 os_log(sExportHelperLog,
                                        "[8.14A] post-pass mux complete: %.2fs",
                                        muxDuration);
+
+                                // Phase 10: emit 1.0 after mux completes
+                                // (render phase was scaled to 0.95 max).
+                                if (capturedProgressBlock) { capturedProgressBlock(1.0); }
 
                                 completion(YES, outputPath, muxDuration, nil);
                             } else {
