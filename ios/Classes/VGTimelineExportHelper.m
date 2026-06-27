@@ -188,7 +188,11 @@ static os_log_t sExportHelperLog;
                        completion:completion];
 }
 
-// ─── Phase 10 Real Export Progress: 11-parameter designated implementation ─────────
+// ─── Phase 10 Real Export Progress: 11-parameter forwarder → 12-param designated ──
+//
+// Forwards to the new 12-parameter designated implementation with
+// temporalDenoiseEnabled:NO. Preserves backward compatibility for all existing
+// callers that do not supply the temporal denoise flag.
 
 + (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
                     transitions:(NSArray<NSDictionary *> *)transitions
@@ -200,6 +204,44 @@ static os_log_t sExportHelperLog;
                          canvas:(nullable NSDictionary *)canvas
                        overlays:(nullable NSArray<NSDictionary *> *)overlays
                     audioSidecar:(nullable VGAudioSidecarPlan *)audioSidecar
+                       progress:(nullable void (^)(double progress))progressBlock
+                     completion:(void (^)(BOOL success,
+                                         NSString * _Nullable outputPath,
+                                         NSTimeInterval durationSeconds,
+                                         NSError * _Nullable error))completion
+{
+    [self exportTimelineWithClips:clips
+                      transitions:transitions
+                       outputPath:outputPath
+                            width:width
+                           height:height
+                              fps:fps
+                       bitrateBps:bitrateBps
+                           canvas:canvas
+                         overlays:overlays
+                      audioSidecar:audioSidecar
+            temporalDenoiseEnabled:NO
+                         progress:progressBlock
+                       completion:completion];
+}
+
+// ─── Phase 10 Temporal Denoise: 12-parameter designated implementation ─────────
+//
+// All other overloads converge here. The temporalDenoiseEnabled parameter
+// is threaded into compositorParams so VGTimelineCompositorNode reads it at
+// init and activates or suppresses the Metal temporal denoise pass accordingly.
+
++ (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
+                    transitions:(NSArray<NSDictionary *> *)transitions
+                     outputPath:(NSString *)outputPath
+                          width:(NSInteger)width
+                         height:(NSInteger)height
+                            fps:(NSInteger)fps
+                     bitrateBps:(NSInteger)bitrateBps
+                         canvas:(nullable NSDictionary *)canvas
+                       overlays:(nullable NSArray<NSDictionary *> *)overlays
+                    audioSidecar:(nullable VGAudioSidecarPlan *)audioSidecar
+           temporalDenoiseEnabled:(BOOL)temporalDenoiseEnabled
                        progress:(nullable void (^)(double progress))progressBlock
                      completion:(void (^)(BOOL success,
                                          NSString * _Nullable outputPath,
@@ -312,14 +354,21 @@ static os_log_t sExportHelperLog;
     //   - transitions: the caller-supplied transition descriptors (Phase 7.10).
     //     Dissolve and fade transitions are executed inside the compositor
     //     during the overlap window via the dual-reader blend path.
+    // Phase 10 Temporal Denoise: opt-in flag — threaded from Dart request
+    // via VGEditorExportRequest.temporalDenoiseEnabled → MethodChannel args
+    // → VanguardMediaEnginePlugin.swift → this 12-parameter method.
+    // Default: NO (disabled). The compositor reads this key at init and skips
+    // the entire denoise block when NO, incurring zero GPU or CPU overhead.
     NSDictionary<NSString *, id> *compositorParams = @{
-        @"descriptorStage": @"7.5_executable",
-        @"clips":           clips,
-        @"transitions":     transitions ?: @[],
+        @"descriptorStage":         @"7.5_executable",
+        @"clips":                   clips,
+        @"transitions":             transitions ?: @[],
         // Phase 7.9: pass canvas dimensions for aspect-fit normalization.
         // Ensures export output matches preview orientation and scaling.
-        @"canvasWidth":     @(width),
-        @"canvasHeight":    @(height),
+        @"canvasWidth":             @(width),
+        @"canvasHeight":            @(height),
+        // Phase 10 Temporal Denoise: bind the caller-supplied flag.
+        @"temporalDenoiseEnabled":  @(temporalDenoiseEnabled),
     };
 
     VGMediaPort *videoOutPort =

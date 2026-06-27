@@ -98,6 +98,13 @@
 
 #import "VGTimelineCompositorNode.h"
 
+// Phase 10: color matrix filter node for per-clip GPU color grading.
+#import "VGColorMatrixFilterNode.h"
+// Phase 10 Temporal Denoise: Metal framework for compute pipeline.
+#import <Metal/Metal.h>
+// Phase 10 Temporal Denoise: Metal library resolver (shared with other filter nodes).
+#import "VGMetalLibraryResolver.h"
+
 // ─── Descriptor models (UMF Stage 7.1) ───────────────────────────────────────
 #import "VGClipDescriptor.h"
 #import "VGTransitionDescriptor.h"
@@ -136,6 +143,8 @@
 // ───────────────────────────────────────────────────────────────────
 #import <os/log.h>
 #include <stdatomic.h>
+// Phase 10 Temporal Denoise: mach_absolute_time / mach_timebase_info for per-frame timing.
+#include <mach/mach_time.h>
 
 // ─── Error domain
 // ─────────────────────────────────────────────────────────────
@@ -2060,6 +2069,36 @@ static inline double _VGQuantizePTS(double pts) {
   // 0.0 = clip's first frame on the timeline (post-trim, post-layout).
   double _currentElapsedTimeline;
 
+  // ── Phase 10: color matrix filter cache ──────────────────────────────────
+  // The Metal device is obtained once per compositor instance and reused
+  // across all frames (MTLCreateSystemDefaultDevice() is expensive per-frame).
+  // _colorMatrixFilterCache maps clip index (NSNumber) → VGColorMatrixFilterNode.
+  // Nodes are created lazily on first access for each clip that carries a
+  // non-nil colorMatrix and are reused for subsequent frames of the same clip.
+  // Pull-queue-serial access only — no lock required.
+  // Cleared on invalidate to release Metal resources.
+  id<MTLDevice>                          _colorFilterMetalDevice; // nullable; nil on Metal-unavailable device
+  NSMutableDictionary<NSNumber *, VGColorMatrixFilterNode *> *_colorMatrixFilterCache;
+
+  // ── Phase 10 Temporal Denoise (proof slice) ───────────────────────────────
+  // Export-only, opt-in debug flag. Default NO.
+  // When NO the entire denoise block is bypassed with zero GPU/CPU cost.
+  //
+  // _temporalDenoiseEnabled:      set once at init from parameters dict.
+  // _temporalDenoiseHistoryBuffer: one-frame history; retained +1 by this node.
+  //   NULL = no history yet (first frame or post-reset).
+  //   Released on clip boundary, invalidate, and dealloc.
+  // _temporalDenoisePSO:          compiled once lazily from VGTemporalDenoise.metal.
+  // _temporalDenoiseQueue:        per-instance MTLCommandQueue for denoise.
+  //   Reuses _colorFilterMetalDevice (created lazily for color matrix too).
+  // Pull-queue-serial access only — no lock required.
+  BOOL                            _temporalDenoiseEnabled;
+  CVPixelBufferRef                _temporalDenoiseHistoryBuffer;  // nullable; +1
+  id<MTLComputePipelineState>     _temporalDenoisePSO;             // nullable; compiled lazily
+  id<MTLCommandQueue>             _temporalDenoiseQueue;           // nullable; created lazily
+  // Rolling per-export frame counter for periodic thermal logging.
+  NSUInteger                      _temporalDenoiseFrameCount;
+
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2403,6 +2442,23 @@ static inline double _VGQuantizePTS(double pts) {
     _targetRenderSize = CGSizeZero;
   }
 
+  // ── Phase 10 Temporal Denoise: parse opt-in flag ──────────────────────────
+  // Default: NO (disabled). When disabled, the denoise block is skipped
+  // entirely — zero GPU or CPU cost. The flag is set once at init and is
+  // immutable for the lifetime of this compositor instance.
+  NSNumber *tdEnabled = parameters[@"temporalDenoiseEnabled"];
+  _temporalDenoiseEnabled = ([tdEnabled isKindOfClass:[NSNumber class]] && tdEnabled.boolValue);
+  _temporalDenoiseHistoryBuffer = NULL;
+  _temporalDenoisePSO           = nil;
+  _temporalDenoiseQueue         = nil;
+  _temporalDenoiseFrameCount    = 0;
+
+  if (_temporalDenoiseEnabled) {
+    os_log(sTimelineLog,
+           "[VGTCNode-TD] temporal denoise ENABLED for this export (nodeId=%{public}@)",
+           nodeId);
+  }
+
   // Pre-compute total timeline duration from the last clip's end.
   // Used for EOS detection.
   VGClipDescriptor *lastClip = _clips.lastObject;
@@ -2511,6 +2567,19 @@ static inline double _VGQuantizePTS(double pts) {
   // Phase 7.18A: flush all cached frames on invalidate.
   [_frameCache flushAll];
 
+  // Phase 10: release color matrix filter cache and Metal device on invalidate.
+  _colorMatrixFilterCache = nil;
+  _colorFilterMetalDevice = nil;
+
+  // Phase 10 Temporal Denoise: release history buffer and Metal objects.
+  // Safe no-op when temporal denoise was disabled or history was never populated.
+  if (_temporalDenoiseHistoryBuffer) {
+    CVPixelBufferRelease(_temporalDenoiseHistoryBuffer);
+    _temporalDenoiseHistoryBuffer = NULL;
+  }
+  _temporalDenoisePSO   = nil;
+  _temporalDenoiseQueue = nil;
+
   os_log(sTimelineLog, "[VGTCNode] invalidated: nodeId=%{public}@", _nodeId);
 }
 
@@ -2552,6 +2621,15 @@ static inline double _VGQuantizePTS(double pts) {
   // [7.5C] Reset frame reuse cache — seek invalidates any cached frame.
   _lastDeliveredAssetPTS = -1.0;
   _lastDeliveredAssetDuration = 0.0;
+
+  // Phase 10 Temporal Denoise: reset history on seek.
+  // A seek jump makes the previous frame's pixel data temporally discontinuous
+  // with the post-seek frame. Blending them would produce a one-frame smear
+  // artifact. Release the history buffer so the next pullFrame: seeds afresh.
+  if (_temporalDenoiseHistoryBuffer) {
+    CVPixelBufferRelease(_temporalDenoiseHistoryBuffer);
+    _temporalDenoiseHistoryBuffer = NULL;
+  }
 
   // ── 3. Tear down the current reader ───────────────────────────────────────
   // AVAssetReader is forward-only; it cannot seek. Must cancel and rebuild
@@ -2768,6 +2846,16 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
     // the previous clip's frame for the new clip's asset PTS range.
     _lastDeliveredAssetPTS = -1.0;
     _lastDeliveredAssetDuration = 0.0;
+    // Phase 10 Temporal Denoise: reset history buffer on clip boundary.
+    // Blending across a hard cut would produce scene-cut smear — mandatory reset.
+    if (_temporalDenoiseHistoryBuffer) {
+      CVPixelBufferRelease(_temporalDenoiseHistoryBuffer);
+      _temporalDenoiseHistoryBuffer = NULL;
+      os_log_debug(sTimelineLog,
+                   "[VGTCNode-TD] history reset on clip switch: %lu → %lu",
+                   (unsigned long)_activeReader.clipIndex,
+                   (unsigned long)activeClipIndex);
+    }
     [self _tearDownActiveReader];
   }
 
@@ -3132,6 +3220,383 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
     }
   }
   // ── End Phase 7.x-Q3B composition ───────────────────────────────────────────
+
+  // ── Phase 10: Per-clip color matrix filter ───────────────────────────────────
+  //
+  // If the active clip carries a non-nil colorMatrix (20 NSNumber floats), apply
+  // VGColorMatrixFilterNode to _lastDeliveredBuffer on every decoded frame.
+  //
+  // Performance: the filter node is cached in _colorMatrixFilterCache keyed by
+  // clip index (NSNumber). The Metal device is cached in _colorFilterMetalDevice
+  // and created at most once per compositor instance. PSO compilation happens
+  // once at node creation inside VGColorMatrixFilterNode's -initWithPool:device:matrix:.
+  // On subsequent frames of the same clip we reuse the existing node — zero
+  // device/queue/PSO allocation overhead per frame.
+  //
+  // Design constraints (per VGColorMatrixFilterNode.h):
+  //   - pool=nil: output buffer is allocated internally per processBuffer: call
+  //     (IOSurface-backed, compatible with encoder input requirements).
+  //   - Applies ONLY to the normal AVAssetReader streaming path (non-static-source).
+  //     Static-source (still-image / freeze-frame) clips share a cached buffer;
+  //     applying a filter per-frame there would bypass the cache and degrade
+  //     performance. Deferred to Phase 10.1+.
+  //
+  // Ownership: _lastDeliveredBuffer holds +1 from the pull. On success the
+  // filter node returns a new +1 for filteredPB. We release the original +1
+  // and adopt filteredPB as the new _lastDeliveredBuffer (+1).
+  // On failure (nil filteredPB) we leave _lastDeliveredBuffer unchanged.
+  if (!_activeReader.isStaticSource) {
+    VGClipDescriptor *activeClipForFilter = _clips[activeClipIndex];
+    NSArray<NSNumber *> *cm = activeClipForFilter.colorMatrix;
+    if (cm != nil && cm.count == 20 && _lastDeliveredBuffer != NULL) {
+      // Lazily create Metal device once per compositor instance.
+      if (_colorFilterMetalDevice == nil) {
+        _colorFilterMetalDevice = MTLCreateSystemDefaultDevice();
+        if (_colorFilterMetalDevice == nil) {
+          os_log_error(sTimelineLog,
+                       "[VGTCNode-P10] MTLCreateSystemDefaultDevice returned nil — "
+                       "color matrix filter disabled for this export.");
+        }
+      }
+      if (_colorFilterMetalDevice != nil) {
+        // Lazily create and cache filter node per clip index.
+        // Clips are immutable after init; same clip index always has the same matrix.
+        if (_colorMatrixFilterCache == nil) {
+          _colorMatrixFilterCache = [NSMutableDictionary dictionary];
+        }
+        NSNumber *clipKey = @(activeClipIndex);
+        VGColorMatrixFilterNode *filterNode = _colorMatrixFilterCache[clipKey];
+        if (filterNode == nil) {
+          filterNode = [[VGColorMatrixFilterNode alloc] initWithPool:nil
+                                                             device:_colorFilterMetalDevice
+                                                             matrix:cm];
+          if (filterNode != nil) {
+            _colorMatrixFilterCache[clipKey] = filterNode;
+            os_log_debug(sTimelineLog,
+                         "[VGTCNode-P10] color matrix filter node created and cached: clip=%lu",
+                         (unsigned long)activeClipIndex);
+          } else {
+            os_log_error(sTimelineLog,
+                         "[VGTCNode-P10] failed to create VGColorMatrixFilterNode: clip=%lu",
+                         (unsigned long)activeClipIndex);
+          }
+        }
+        if (filterNode != nil) {
+          CVPixelBufferRef filteredPB =
+              [filterNode processBuffer:_lastDeliveredBuffer
+                                 atTime:request.requestedPTS
+                                 device:_colorFilterMetalDevice];
+          if (filteredPB != NULL) {
+            CVPixelBufferRelease(_lastDeliveredBuffer);
+            _lastDeliveredBuffer = filteredPB; // adopt filter output +1
+            os_log_debug(sTimelineLog,
+                         "[VGTCNode-P10] color matrix applied: clip=%lu",
+                         (unsigned long)activeClipIndex);
+          } else {
+            // Filter failed — leave _lastDeliveredBuffer unchanged (primary-only fallback).
+            os_log_error(sTimelineLog,
+                         "[VGTCNode-P10] color matrix filter returned nil: clip=%lu",
+                         (unsigned long)activeClipIndex);
+          }
+        }
+      }
+    }
+  }
+  // ── End Phase 10 color matrix filter ─────────────────────────────────────────
+
+  // ── Phase 10 Temporal Denoise (proof slice) ────────────────────────────────
+  //
+  // Applies one-frame-history Metal temporal denoise to _lastDeliveredBuffer.
+  // Runs AFTER the color matrix filter so denoise sees the graded frame.
+  // Runs BEFORE envelope construction and before VGOverlayNode (downstream in
+  // the scheduler chain), so overlays/text/stickers are never smeared.
+  //
+  // Gate: export-only (enabled at compositor init), non-static source only.
+  // History is NULL on first frame (or after clip-boundary reset): pass through
+  // and seed history. On subsequent frames: denoise, then update history.
+  //
+  // Performance: mach_absolute_time() timing is sampled per-frame and logged
+  // at first frame, every 30 frames, and at P50 summary (rolling). All
+  // measured values — not hypotheses.
+  //
+  // Ownership: same +1 ownership swap pattern as the color matrix block.
+  //   On success: release old _lastDeliveredBuffer, adopt denoised output (+1).
+  //   On failure: leave _lastDeliveredBuffer unchanged (safe passthrough).
+  if (_temporalDenoiseEnabled && !_activeReader.isStaticSource &&
+      _lastDeliveredBuffer != NULL) {
+
+    // ── Lazily obtain Metal device (shared with color matrix path) ────────────
+    if (_colorFilterMetalDevice == nil) {
+      _colorFilterMetalDevice = MTLCreateSystemDefaultDevice();
+      if (_colorFilterMetalDevice == nil) {
+        os_log_error(sTimelineLog,
+                     "[VGTCNode-TD] MTLCreateSystemDefaultDevice returned nil — "
+                     "temporal denoise disabled.");
+        _temporalDenoiseEnabled = NO; // prevent repeated failed attempts
+      }
+    }
+
+    if (_temporalDenoiseEnabled && _colorFilterMetalDevice != nil) {
+      // ── Lazily compile PSO from VGTemporalDenoise.metal ─────────────────────
+      if (_temporalDenoisePSO == nil) {
+        id<MTLLibrary> lib = [VGMetalLibraryResolver
+            libraryForDevice:_colorFilterMetalDevice
+                      caller:@"VGTemporalDenoise"];
+        if (lib) {
+          id<MTLFunction> fn = [lib newFunctionWithName:@"vanguard_temporal_denoise"];
+          if (fn) {
+            NSError *psoErr = nil;
+            _temporalDenoisePSO = [_colorFilterMetalDevice
+                newComputePipelineStateWithFunction:fn
+                                             error:&psoErr];
+            if (!_temporalDenoisePSO) {
+              os_log_error(sTimelineLog,
+                           "[VGTCNode-TD] PSO compile failed: %{public}@ — "
+                           "temporal denoise disabled.",
+                           psoErr.localizedDescription);
+              _temporalDenoiseEnabled = NO;
+            } else {
+              os_log(sTimelineLog,
+                     "[VGTCNode-TD] PSO compiled successfully.");
+            }
+          } else {
+            os_log_error(sTimelineLog,
+                         "[VGTCNode-TD] vanguard_temporal_denoise not found in "
+                         "Metal library — temporal denoise disabled.");
+            _temporalDenoiseEnabled = NO;
+          }
+        } else {
+          os_log_error(sTimelineLog,
+                       "[VGTCNode-TD] Metal library load failed — "
+                       "temporal denoise disabled.");
+          _temporalDenoiseEnabled = NO;
+        }
+      }
+
+      // ── Lazily create command queue ───────────────────────────────────────
+      if (_temporalDenoiseEnabled && _temporalDenoiseQueue == nil) {
+        _temporalDenoiseQueue = [_colorFilterMetalDevice newCommandQueue];
+        if (!_temporalDenoiseQueue) {
+          os_log_error(sTimelineLog,
+                       "[VGTCNode-TD] newCommandQueue failed — "
+                       "temporal denoise disabled.");
+          _temporalDenoiseEnabled = NO;
+        }
+      }
+    }
+
+    if (_temporalDenoiseEnabled && _temporalDenoisePSO != nil &&
+        _temporalDenoiseQueue != nil) {
+
+      // ── Thermal state logging (export start, every 30 frames) ─────────────
+      _temporalDenoiseFrameCount++;
+      if (_temporalDenoiseFrameCount == 1 ||
+          (_temporalDenoiseFrameCount % 30) == 0) {
+        NSProcessInfoThermalState thermalState =
+            [NSProcessInfo processInfo].thermalState;
+        os_log(sTimelineLog,
+               "[VGTCNode-TD] frame=%lu thermalState=%ld",
+               (unsigned long)_temporalDenoiseFrameCount,
+               (long)thermalState);
+      }
+
+      size_t curW = CVPixelBufferGetWidth(_lastDeliveredBuffer);
+      size_t curH = CVPixelBufferGetHeight(_lastDeliveredBuffer);
+
+      // ── First frame or post-reset: seed history and pass through ──────────
+      if (_temporalDenoiseHistoryBuffer == NULL) {
+        CVPixelBufferRetain(_lastDeliveredBuffer);
+        _temporalDenoiseHistoryBuffer = _lastDeliveredBuffer;
+        os_log_debug(sTimelineLog,
+                     "[VGTCNode-TD] history seeded: frame=%lu size=%zux%zu",
+                     (unsigned long)_temporalDenoiseFrameCount, curW, curH);
+        // Pass through current frame unchanged (no history to blend with yet).
+      } else {
+        // ── Dimension mismatch guard ─────────────────────────────────────────
+        size_t hisW = CVPixelBufferGetWidth(_temporalDenoiseHistoryBuffer);
+        size_t hisH = CVPixelBufferGetHeight(_temporalDenoiseHistoryBuffer);
+        if (curW != hisW || curH != hisH) {
+          // Dimensions changed (should not happen within a single export;
+          // defensive guard for edge cases). Discard old history and reseed.
+          CVPixelBufferRelease(_temporalDenoiseHistoryBuffer);
+          CVPixelBufferRetain(_lastDeliveredBuffer);
+          _temporalDenoiseHistoryBuffer = _lastDeliveredBuffer;
+          os_log_error(sTimelineLog,
+                       "[VGTCNode-TD] dimension mismatch cur=%zux%zu his=%zux%zu — "
+                       "history reset, passing through.",
+                       curW, curH, hisW, hisH);
+          // Pass through current frame unchanged.
+        } else {
+          // ── Allocate output buffer (same pattern as color matrix block) ─────
+          // BGRA + Metal + IOSurface required for encoder and Metal texture wrap.
+          NSDictionary *tdAttrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey:           @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferMetalCompatibilityKey:         @YES,
+            (id)kCVPixelBufferIOSurfacePropertiesKey:        @{},
+            (id)kCVPixelBufferCGImageCompatibilityKey:       @YES,
+            (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+          };
+          CVPixelBufferRef tdOutput = NULL;
+          CVReturn tdRet = CVPixelBufferCreate(kCFAllocatorDefault,
+                                               curW, curH,
+                                               kCVPixelFormatType_32BGRA,
+                                               (__bridge CFDictionaryRef)tdAttrs,
+                                               &tdOutput);
+          if (tdRet != kCVReturnSuccess || tdOutput == NULL) {
+            // Allocation failure: leave _lastDeliveredBuffer unchanged.
+            // Log only on first occurrence to avoid per-frame log spam.
+            static BOOL sTDAllocFailLogged = NO;
+            if (!sTDAllocFailLogged) {
+              sTDAllocFailLogged = YES;
+              os_log_error(sTimelineLog,
+                           "[VGTCNode-TD] CVPixelBufferCreate failed (CVReturn=%d) — "
+                           "skipping denoise for this frame.", (int)tdRet);
+            }
+          } else {
+            // Verify IOSurface-backed (required for Metal texture creation).
+            IOSurfaceRef curSurface = CVPixelBufferGetIOSurface(_lastDeliveredBuffer);
+            IOSurfaceRef hisSurface = CVPixelBufferGetIOSurface(_temporalDenoiseHistoryBuffer);
+            IOSurfaceRef outSurface = CVPixelBufferGetIOSurface(tdOutput);
+
+            if (!curSurface || !hisSurface || !outSurface) {
+              // Non-IOSurface buffer: cannot wrap as Metal texture.
+              // Pass through current frame, discard output buffer.
+              CVPixelBufferRelease(tdOutput);
+              static BOOL sTDIOSurfaceLoggedOnce = NO;
+              if (!sTDIOSurfaceLoggedOnce) {
+                sTDIOSurfaceLoggedOnce = YES;
+                os_log_error(sTimelineLog,
+                             "[VGTCNode-TD] pixel buffer not IOSurface-backed — "
+                             "skipping denoise for this frame.");
+              }
+            } else {
+              // ── Wrap as Metal textures (same pattern as VGColorMatrixFilterNode) ─
+              MTLTextureDescriptor *readDesc = [MTLTextureDescriptor
+                  texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                               width:curW
+                                              height:curH
+                                           mipmapped:NO];
+              readDesc.storageMode = MTLStorageModeShared;
+              readDesc.usage       = MTLTextureUsageShaderRead;
+
+              MTLTextureDescriptor *writeDesc = [MTLTextureDescriptor
+                  texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                               width:curW
+                                              height:curH
+                                           mipmapped:NO];
+              writeDesc.storageMode = MTLStorageModeShared;
+              writeDesc.usage       = MTLTextureUsageShaderWrite;
+
+              id<MTLTexture> curTex = [_colorFilterMetalDevice
+                  newTextureWithDescriptor:readDesc
+                                iosurface:curSurface
+                                    plane:0];
+              id<MTLTexture> hisTex = [_colorFilterMetalDevice
+                  newTextureWithDescriptor:readDesc
+                                iosurface:hisSurface
+                                    plane:0];
+              id<MTLTexture> outTex = [_colorFilterMetalDevice
+                  newTextureWithDescriptor:writeDesc
+                                iosurface:outSurface
+                                    plane:0];
+
+              if (!curTex || !hisTex || !outTex) {
+                CVPixelBufferRelease(tdOutput);
+                static BOOL sTDTexLoggedOnce = NO;
+                if (!sTDTexLoggedOnce) {
+                  sTDTexLoggedOnce = YES;
+                  os_log_error(sTimelineLog,
+                               "[VGTCNode-TD] Metal texture creation failed — "
+                               "skipping denoise for this frame.");
+                }
+              } else {
+                // ── Build params buffer ────────────────────────────────────────
+                // Layout must match TemporalDenoiseParams struct in VGTemporalDenoise.metal.
+                struct { float blendStrength; float motionThreshold; } tdParams = {
+                  .blendStrength   = 0.20f,  // conservative: blends only 20% toward history
+                  .motionThreshold = 0.06f,  // luma diff threshold (linear [0,1])
+                };
+                id<MTLBuffer> paramBuf = [_colorFilterMetalDevice
+                    newBufferWithBytes:&tdParams
+                               length:sizeof(tdParams)
+                              options:MTLResourceStorageModeShared];
+
+                if (!paramBuf) {
+                  CVPixelBufferRelease(tdOutput);
+                  os_log_error(sTimelineLog,
+                               "[VGTCNode-TD] newBufferWithBytes failed — "
+                               "skipping denoise for this frame.");
+                } else {
+                  // ── Timing: capture start ──────────────────────────────────
+                  uint64_t tdStartTick = mach_absolute_time();
+
+                  // ── Encode and commit compute ──────────────────────────────
+                  id<MTLCommandBuffer> cmd = [_temporalDenoiseQueue commandBuffer];
+                  id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+                  [enc setComputePipelineState:_temporalDenoisePSO];
+                  [enc setTexture:curTex atIndex:0];
+                  [enc setTexture:hisTex atIndex:1];
+                  [enc setTexture:outTex atIndex:2];
+                  [enc setBuffer:paramBuf offset:0 atIndex:0];
+
+                  // Thread dispatch: match existing VGColorMatrixFilterNode pattern.
+                  MTLSize threads = MTLSizeMake(
+                      _temporalDenoisePSO.threadExecutionWidth, 1, 1);
+                  MTLSize grid = MTLSizeMake(curW, curH, 1);
+                  [enc dispatchThreads:grid threadsPerThreadgroup:threads];
+                  [enc endEncoding];
+                  [cmd commit];
+                  [cmd waitUntilCompleted];
+
+                  // ── Timing: log results ────────────────────────────────────
+                  uint64_t tdEndTick = mach_absolute_time();
+                  // Convert to milliseconds using timebase info.
+                  mach_timebase_info_data_t tbInfo;
+                  mach_timebase_info(&tbInfo);
+                  double tdMs = (double)(tdEndTick - tdStartTick)
+                      * (double)tbInfo.numer
+                      / (double)tbInfo.denom
+                      / 1e6;
+
+                  // Log at first frame and every 30 frames.
+                  if (_temporalDenoiseFrameCount == 1 ||
+                      (_temporalDenoiseFrameCount % 30) == 0) {
+                    os_log(sTimelineLog,
+                           "[VGTCNode-TD] frame=%lu denoise=%.2fms "
+                           "res=%zux%zu blendStrength=%.2f motionThreshold=%.3f",
+                           (unsigned long)_temporalDenoiseFrameCount,
+                           tdMs,
+                           curW, curH,
+                           (double)tdParams.blendStrength,
+                           (double)tdParams.motionThreshold);
+                  }
+
+                  // ── Adopt denoised output as _lastDeliveredBuffer ──────────
+                  // History becomes the denoised output (not the raw current frame)
+                  // so the filter accumulates refined signal, not raw noise.
+                  CVPixelBufferRef oldHistory = _temporalDenoiseHistoryBuffer;
+                  CVPixelBufferRetain(tdOutput);          // history takes +1
+                  _temporalDenoiseHistoryBuffer = tdOutput; // history = denoised output
+
+                  CVPixelBufferRelease(_lastDeliveredBuffer); // release old current +1
+                  _lastDeliveredBuffer = tdOutput;            // adopt output +1 (from CVPixelBufferCreate)
+
+                  if (oldHistory) {
+                    CVPixelBufferRelease(oldHistory); // release old history +1
+                  }
+
+                  os_log_debug(sTimelineLog,
+                               "[VGTCNode-TD] denoise applied: frame=%lu %.2fms",
+                               (unsigned long)_temporalDenoiseFrameCount, tdMs);
+                } // paramBuf success
+              } // texture creation success
+            } // IOSurface-backed
+          } // CVPixelBufferCreate success
+        } // dimension match
+      } // history != NULL
+    } // PSO + queue ready
+  }
+  // ── End Phase 10 Temporal Denoise ────────────────────────────────────────────
 
   // Use asset-local duration from per-reader cache for the output envelope.
   double sDur = _activeReader.lastDeliveredAssetDuration;

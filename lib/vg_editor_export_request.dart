@@ -27,6 +27,7 @@ final class VGEditorExportRequest {
     this.width,
     this.height,
     this.fps,
+    this.temporalDenoiseEnabled,
   });
 
   // ── Fields ─────────────────────────────────────────────────────────────────
@@ -57,6 +58,17 @@ final class VGEditorExportRequest {
   /// If null, the native layer uses the fps from the active draft.
   final int? fps;
 
+  /// Opt-in flag to enable the one-frame-history Metal temporal video denoiser.
+  ///
+  /// Phase 10 Temporal Denoise proof slice. When `true`, the native
+  /// `VGTimelineCompositorNode` applies a GPU temporal denoise pass to each
+  /// exported frame (after color grading, before overlay composition).
+  ///
+  /// Defaults to `false` (disabled) when null or absent. The native layer
+  /// treats a missing key identically to explicit `false`. Enable only for
+  /// testing and A/B comparison — the feature is a proof slice.
+  final bool? temporalDenoiseEnabled;
+
   // ── Serialisation ──────────────────────────────────────────────────────────
 
   /// Serialises this request to a JSON-compatible map.
@@ -70,6 +82,10 @@ final class VGEditorExportRequest {
     if (width != null) map['width'] = width;
     if (height != null) map['height'] = height;
     if (fps != null) map['fps'] = fps;
+    // Phase 10 Temporal Denoise: omit when null; native defaults to OFF.
+    if (temporalDenoiseEnabled != null) {
+      map['temporalDenoiseEnabled'] = temporalDenoiseEnabled;
+    }
     return map;
   }
 
@@ -82,6 +98,7 @@ final class VGEditorExportRequest {
     int? width,
     int? height,
     int? fps,
+    Object? temporalDenoiseEnabled = _kNoValue,
   }) {
     return VGEditorExportRequest(
       outputPath:
@@ -90,6 +107,9 @@ final class VGEditorExportRequest {
       width: width ?? this.width,
       height: height ?? this.height,
       fps: fps ?? this.fps,
+      temporalDenoiseEnabled: temporalDenoiseEnabled == _kNoValue
+          ? this.temporalDenoiseEnabled
+          : temporalDenoiseEnabled as bool?,
     );
   }
 
@@ -103,11 +123,13 @@ final class VGEditorExportRequest {
           other.bitrateBps == bitrateBps &&
           other.width == width &&
           other.height == height &&
-          other.fps == fps;
+          other.fps == fps &&
+          other.temporalDenoiseEnabled == temporalDenoiseEnabled;
 
   @override
   int get hashCode =>
-      Object.hash(outputPath, bitrateBps, width, height, fps);
+      Object.hash(outputPath, bitrateBps, width, height, fps,
+          temporalDenoiseEnabled);
 
   @override
   String toString() => 'VGEditorExportRequest('
@@ -115,7 +137,8 @@ final class VGEditorExportRequest {
       'bitrateBps: $bitrateBps, '
       'width: $width, '
       'height: $height, '
-      'fps: $fps)';
+      'fps: $fps, '
+      'temporalDenoiseEnabled: $temporalDenoiseEnabled)';
 }
 
 // ── Sentinel for copyWith nullable fields ─────────────────────────────────────

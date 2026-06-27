@@ -2273,12 +2273,21 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 exportAudioSidecar = VGAudioSidecarPlan.fromDictionary(sidecarDict)
             }
 
+            // Phase 10 Temporal Denoise: extract opt-in flag from request args.
+            // VGEditorExportRequest.temporalDenoiseEnabled is serialised as a Bool
+            // by the Dart standard codec; cast defensively to also accept NSNumber
+            // in case the codec representation varies across Flutter versions.
+            // Defaults to false when absent or nil.
+            let exportTemporalDenoiseEnabled: Bool = {
+                let raw = args?["temporalDenoiseEnabled"]
+                if let b = raw as? Bool { return b }
+                if let n = raw as? NSNumber { return n.boolValue }
+                return false
+            }()
+
             // Delegate to ObjC VGTimelineExportHelper.
-            // Phase 10: uses the new 11-parameter method with progress: block.
-            // VGExportProfile is constructed entirely in ObjC (MOD-1, MOD-2).
-            // When exportOverlayDicts is nil or empty, VGTimelineExportHelper
-            // preserves the original 2-node compositor → sink topology.
-            // When exportAudioSidecar is nil, existing video-only behavior is unchanged.
+            // Phase 10 Temporal Denoise: uses the new 12-parameter method.
+            // All other parameters remain identical to the Phase 10 11-param call.
             VGTimelineExportHelper.exportTimeline(
                 withClips: clipDictsE,
                 transitions: transitionDictsE,
@@ -2290,6 +2299,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 canvas: exportCanvasDict,
                 overlays: exportOverlayDicts,
                 audioSidecar: exportAudioSidecar,
+                temporalDenoiseEnabled: exportTemporalDenoiseEnabled,
                 progress: { [weak self] pct in
                     // Phase 10 Amendment 1: dispatch to main thread before invoking MethodChannel.
                     // Throttling is applied in VGTimelineExportHelper (100ms gate).

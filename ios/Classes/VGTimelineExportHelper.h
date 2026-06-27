@@ -85,6 +85,26 @@
 // The 7, 9, and 10-parameter methods forward with progress:nil.
 // No behavioral change for existing callers.
 
+// ── Phase 10 Temporal Denoise Config Tunnel ──────────────────────────────────
+//
+// Phase 10 Temporal Denoise adds a 12-parameter designated method that accepts
+// temporalDenoiseEnabled:(BOOL) in addition to all Phase 10 real export progress
+// parameters.
+//
+// When temporalDenoiseEnabled = YES:
+//   VGTimelineCompositorNode applies a one-frame-history Metal temporal denoise
+//   pass to each exported frame (after color grading, before overlay composition).
+//
+// When temporalDenoiseEnabled = NO (or absent/nil from Dart):
+//   Existing behavior unchanged — no denoise applied, zero GPU overhead.
+//
+// Config tunnel: VGEditorExportRequest.temporalDenoiseEnabled → MethodChannel
+// args['temporalDenoiseEnabled'] → VanguardMediaEnginePlugin.swift → new
+// 12-parameter exportTimelineWithClips:…:temporalDenoiseEnabled: → compositorParams
+// → VGTimelineCompositorNode parameters[@"temporalDenoiseEnabled"].
+//
+// The 7, 9, 10, and 11-parameter methods forward with temporalDenoiseEnabled:NO.
+
 #pragma once
 
 #import <Foundation/Foundation.h>
@@ -242,6 +262,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// When progress is nil:
 ///   Existing behavior unchanged (no callbacks).
 ///
+/// Forwards to the 12-parameter method with temporalDenoiseEnabled:NO.
 /// The 7, 9, and 10-parameter methods forward to this with progress:nil.
 + (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
                     transitions:(NSArray<NSDictionary *> *)transitions
@@ -253,6 +274,30 @@ NS_ASSUME_NONNULL_BEGIN
                          canvas:(nullable NSDictionary *)canvas
                        overlays:(nullable NSArray<NSDictionary *> *)overlays
                     audioSidecar:(nullable VGAudioSidecarPlan *)audioSidecar
+                       progress:(nullable void (^)(double progress))progressBlock
+                     completion:(void (^)(BOOL success,
+                                         NSString * _Nullable outputPath,
+                                         NSTimeInterval durationSeconds,
+                                         NSError * _Nullable error))completion;
+
+/// Perform offline pull-mode timeline export — Phase 10 Temporal Denoise designated method.
+///
+/// 12-parameter designated implementation. All other overloads forward here.
+///
+/// @param temporalDenoiseEnabled  When YES, enables the one-frame-history Metal
+///   temporal denoise pass inside VGTimelineCompositorNode. Default: NO.
+///   Set via VGEditorExportRequest.temporalDenoiseEnabled from Dart.
++ (void)exportTimelineWithClips:(NSArray<NSDictionary *> *)clips
+                    transitions:(NSArray<NSDictionary *> *)transitions
+                     outputPath:(NSString *)outputPath
+                          width:(NSInteger)width
+                         height:(NSInteger)height
+                            fps:(NSInteger)fps
+                     bitrateBps:(NSInteger)bitrateBps
+                         canvas:(nullable NSDictionary *)canvas
+                       overlays:(nullable NSArray<NSDictionary *> *)overlays
+                    audioSidecar:(nullable VGAudioSidecarPlan *)audioSidecar
+           temporalDenoiseEnabled:(BOOL)temporalDenoiseEnabled
                        progress:(nullable void (^)(double progress))progressBlock
                      completion:(void (^)(BOOL success,
                                          NSString * _Nullable outputPath,
