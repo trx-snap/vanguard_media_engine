@@ -3513,8 +3513,8 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
                 // ── Build params buffer ────────────────────────────────────────
                 // Layout must match TemporalDenoiseParams struct in VGTemporalDenoise.metal.
                 struct { float blendStrength; float motionThreshold; } tdParams = {
-                  .blendStrength   = 0.20f,  // conservative: blends only 20% toward history
-                  .motionThreshold = 0.06f,  // luma diff threshold (linear [0,1])
+                  .blendStrength   = 0.30f,  // conservative: blends only 20% toward history
+                  .motionThreshold = 0.075f,  // luma diff threshold (linear [0,1])
                 };
                 id<MTLBuffer> paramBuf = [_colorFilterMetalDevice
                     newBufferWithBytes:&tdParams
