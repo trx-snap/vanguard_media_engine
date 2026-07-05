@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
@@ -74,6 +75,9 @@ export 'vg_reverse_sidecar_status.dart';
 export 'vg_timeline_exporter.dart';
 // Phase 10-C: shared media-stack image optimizer (UMF/Vanguard owned; no FFmpeg).
 export 'vg_image_optimizer.dart';
+// ROI Signal / Server-Ready Sidecar Dart Models (ROI-1A)
+export 'src/roi/vg_roi_models.dart';
+export 'src/roi/vg_roi_coordinate_converter.dart';
 
 const String _libName = 'vanguard_media_engine';
 
@@ -199,6 +203,131 @@ class _VanguardFFI {
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Phase 10 Slice 10A — Thermal Guard
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Dart representation of the native ProcessInfo.ThermalState.
+///
+/// Raw values mirror iOS ProcessInfo.ThermalState.rawValue:
+///   nominal = 0, fair = 1, serious = 2, critical = 3
+///
+/// Received via the `onThermalStateChanged` MethodChannel callback
+/// and by querying `getThermalState`.
+enum VGThermalState {
+  /// No thermal issues. All capabilities enabled.
+  nominal,
+
+  /// Slight thermal load. All capabilities still enabled.
+  fair,
+
+  /// Elevated thermal load. Vanguard natively reduces GPU/ML load.
+  /// Dart/product: show warning; export may be slower.
+  serious,
+
+  /// Critical thermal load. Vanguard natively disables Metal filter chain.
+  /// Dart/product: block new export/camera/record start.
+  critical;
+
+  /// Converts a native rawValue (0–3) to [VGThermalState].
+  /// Returns [nominal] for any unrecognised value (defensive).
+  static VGThermalState fromRaw(int raw) {
+    return switch (raw) {
+      1 => VGThermalState.fair,
+      2 => VGThermalState.serious,
+      3 => VGThermalState.critical,
+      _ => VGThermalState.nominal,
+    };
+  }
+}
+
+/// Static thermal state monitor for the Vanguard media engine.
+///
+/// Receives delegated `onThermalStateChanged` MethodChannel callbacks from
+/// [VanguardEngine._handleNativeCallback] (Opus M1 pattern: this class does NOT
+/// own or replace the MethodChannel handler).
+///
+/// ## Usage
+///
+/// ```dart
+/// // Listen to changes:
+/// VGThermalMonitor.onThermalStateChanged.listen((state) { ... });
+///
+/// // Query current state:
+/// final state = await VGThermalMonitor.getThermalState();
+///
+/// // Simulate in debug builds only:
+/// await VGThermalMonitor.simulateThermalState(VGThermalState.critical);
+/// ```
+final class VGThermalMonitor {
+  // Private constructor: static-only API.
+  const VGThermalMonitor._();
+
+  static const MethodChannel _channel =
+      MethodChannel('vanguard_media_engine');
+
+  // Internal mutable state.
+  static VGThermalState _currentState = VGThermalState.nominal;
+  static final StreamController<VGThermalState> _stateController =
+      StreamController<VGThermalState>.broadcast();
+
+  /// The most recently observed thermal state.
+  ///
+  /// Updated whenever [_onNativeStateChanged] is called by
+  /// [VanguardEngine._handleNativeCallback].
+  static VGThermalState get currentState => _currentState;
+
+  /// Broadcast stream of thermal state transitions.
+  ///
+  /// Emits every time the native `onThermalStateChanged` callback fires.
+  /// Obtain an initial value via [getThermalState] and then subscribe here
+  /// for subsequent changes.
+  static Stream<VGThermalState> get onThermalStateChanged =>
+      _stateController.stream;
+
+  /// Queries the current native thermal state from the device.
+  ///
+  /// Updates [currentState] and returns the result. Safe to call at any time.
+  static Future<VGThermalState> getThermalState() async {
+    final raw =
+        await _channel.invokeMethod<int>('getThermalState') ?? 0;
+    final state = VGThermalState.fromRaw(raw);
+    _currentState = state;
+    return state;
+  }
+
+  /// Debug-only: simulate a thermal state transition without reaching real thermal load.
+  ///
+  /// Calls the native `simulateThermalState` route (compiled out in release builds)
+  /// which invokes `notifyThermalStateChanged` on the plugin, causing the normal
+  /// `onThermalStateChanged` callback path to fire.
+  ///
+  /// Safe to call in debug builds only. In release this method is a no-op.
+  static Future<void> simulateThermalState(VGThermalState state) async {
+    if (!kDebugMode) return;
+    await _channel.invokeMethod<void>(
+      'simulateThermalState',
+      {'rawValue': state.index},
+    );
+  }
+
+  /// Internal: called by [VanguardEngine._handleNativeCallback] when the
+  /// native `onThermalStateChanged` callback fires.
+  ///
+  /// Not part of the public API — only [VanguardEngine] should call this.
+  static void _onNativeStateChanged(int rawValue) {
+    final state = VGThermalState.fromRaw(rawValue);
+    _currentState = state;
+    if (!_stateController.isClosed) {
+      _stateController.add(state);
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Original Public API continues below
+// ─────────────────────────────────────────────────────────────────────────────
+
 enum VanguardMode { nleOffline, livestream }
 
 class VanguardEngine {
@@ -307,6 +436,14 @@ class VanguardEngine {
       case 'onExportProgress':
         final pct = (call.arguments as num).toDouble();
         onExportProgress?.call(pct);
+        break;
+
+      // Phase 10 Slice 10A: Thermal state change forwarded from native.
+      // Delegates to VGThermalMonitor (Opus M1 pattern: monitor does NOT own
+      // the handler; VanguardEngine delegates the callback here).
+      case 'onThermalStateChanged':
+        final rawValue = (call.arguments as num?)?.toInt() ?? 0;
+        VGThermalMonitor._onNativeStateChanged(rawValue);
         break;
     }
   }
