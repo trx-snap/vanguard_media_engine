@@ -52,6 +52,27 @@ NS_ASSUME_NONNULL_BEGIN
 /// AVAssetReader claims it.
 - (void)stopRecordingAndWait;
 
+// ── ROI-1C: PTS diagnostic snapshot ──────────────────────────────────────────
+//
+// Diagnostic-only. Not production ROI sidecar data.
+//
+// Returns an NSDictionary containing PTS timing evidence collected during the
+// most recently completed recording. Valid only after stopRecordingWithCompletion:
+// fires its completion block on the main thread.
+//
+// Returns nil if no recording has been started yet since init.
+//
+// Keys:
+//   ptsAvailableCount          (uint64) — frames with valid PTS during recording
+//   ptsInvalidCount            (uint64) — frames with CMTIME_IS_INVALID(pts)
+//   ptsMonotonicViolationCount (uint64) — frames where pts <= previous pts
+//   firstPtsMs                 (double) — first valid PTS in ms
+//   lastPtsMs                  (double) — last valid PTS in ms
+//   minFrameDeltaMs            (double) — min consecutive-frame interval in ms
+//   maxFrameDeltaMs            (double) — max consecutive-frame interval in ms
+//   averageFrameDeltaMs        (double) — mean consecutive-frame interval in ms
+@property(nonatomic, readonly, nullable) NSDictionary<NSString *, id> *roiPtsDiagnostics;
+
 // ── Session access for PlatformView ──────────────────────────────────────────
 
 /// The underlying AVCaptureSession — PlatformView uses this for connection.

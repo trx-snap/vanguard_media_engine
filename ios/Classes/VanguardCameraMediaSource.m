@@ -140,7 +140,22 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
   // Written on main thread only; read on main thread (orientation observer
   // fires on main queue). No lock needed.
   BOOL _previewOrientationLocked;
+
+  // ── ROI-1C: PTS diagnostic counters ──────────────────────────────────────
+  // All writes are on _captureQueue (serial) — no lock needed.
+  // Reset in startRecordingToURL:. Read via roiPtsDiagnostics property
+  // (called on main thread after stop completes — counters are frozen).
+  uint64_t  _roiDiagPtsCount;           // frames with valid PTS seen during recording
+  uint64_t  _roiDiagPtsInvalidCount;    // frames with CMTIME_IS_INVALID(pts) during recording
+  uint64_t  _roiDiagMonotonicViolations;// frames where pts <= previous pts
+  double    _roiDiagFirstPtsMs;         // first valid PTS in ms
+  double    _roiDiagLastPtsMs;          // last valid PTS in ms
+  double    _roiDiagMinDeltaMs;         // min inter-frame delta in ms (DBL_MAX sentinel until set)
+  double    _roiDiagMaxDeltaMs;         // max inter-frame delta in ms
+  double    _roiDiagPtsSumMs;           // running sum of deltas for average (computed at stop time)
+  CMTime    _roiDiagPrevPts;            // previous valid PTS for delta/monotonic checks
 }
+
 
 @synthesize captureSession = _session;
 
@@ -609,6 +624,31 @@ static const char kCaptureQueueKey = 0;
   // safe.
   int32_t total = ++_totalFrameCount;
 
+  // ── ROI-1C: PTS diagnostic update (O(1), no allocation, no logging) ────────
+  // Updates only while recording (_recordingState == Writing check above).
+  // Uses existing `pts` (CMTime) — no pixel buffer access.
+  if (CMTIME_IS_VALID(pts)) {
+    double ptsMs = CMTimeGetSeconds(pts) * 1000.0;
+    _roiDiagPtsCount++;
+    _roiDiagLastPtsMs = ptsMs;
+    if (_roiDiagPtsCount == 1) {
+      _roiDiagFirstPtsMs = ptsMs;
+    }
+    if (CMTIME_IS_VALID(_roiDiagPrevPts)) {
+      double deltaMs = ptsMs - CMTimeGetSeconds(_roiDiagPrevPts) * 1000.0;
+      if (deltaMs <= 0.0) {
+        _roiDiagMonotonicViolations++;
+      } else {
+        _roiDiagPtsSumMs += deltaMs;
+        if (deltaMs < _roiDiagMinDeltaMs) _roiDiagMinDeltaMs = deltaMs;
+        if (deltaMs > _roiDiagMaxDeltaMs) _roiDiagMaxDeltaMs = deltaMs;
+      }
+    }
+    _roiDiagPrevPts = pts;
+  } else {
+    _roiDiagPtsInvalidCount++;
+  }
+
   // Frame skip (Tier 2 active)
   if (_recordingFrameSkip > 1) {
     if (++_frameSkipCounter % _recordingFrameSkip != 0)
@@ -618,6 +658,7 @@ static const char kCaptureQueueKey = 0;
   // isReadyForMoreMediaData gate
   if (!_videoWriterInput.isReadyForMoreMediaData) {
     int32_t dropped = ++_droppedFrameCount;
+
     int32_t consec = ++_consecutiveDropCount;
     _windowDrops++;
 
@@ -810,6 +851,20 @@ static const char kCaptureQueueKey = 0;
     self->_jitterM2 = 0.0;
     self->_jitterFrameCount = 0;
 
+    // ── ROI-1C: Reset PTS diagnostic counters ────────────────────────────────
+    // On _captureQueue (serial) — plain assignment is race-free.
+    // DBL_MAX is the sentinel for "no delta observed yet" in _roiDiagMinDeltaMs.
+    self->_roiDiagPtsCount = 0;
+    self->_roiDiagPtsInvalidCount = 0;
+    self->_roiDiagMonotonicViolations = 0;
+    self->_roiDiagFirstPtsMs = 0.0;
+    self->_roiDiagLastPtsMs = 0.0;
+    self->_roiDiagMinDeltaMs = DBL_MAX;
+    self->_roiDiagMaxDeltaMs = 0.0;
+    self->_roiDiagPtsSumMs = 0.0;
+    self->_roiDiagPrevPts = kCMTimeInvalid;
+
+
     dispatch_async(dispatch_get_main_queue(), ^{
       completion(nil);
     });
@@ -888,6 +943,30 @@ static const char kCaptureQueueKey = 0;
   });
 }
 
+// ── ROI-1C: PTS diagnostic snapshot property ──────────────────────────────────
+//
+// Called on main thread after stopRecordingWithCompletion: fires.
+// At that point _recordingState == Idle and all _captureQueue recording work is
+// complete — counters are frozen, so no lock is needed.
+//
+// Average is computed here (not per-frame) to avoid per-frame division.
+- (NSDictionary<NSString *, id> *)roiPtsDiagnostics {
+  double avgDeltaMs = (_roiDiagPtsCount > 1)
+      ? _roiDiagPtsSumMs / (double)(_roiDiagPtsCount - 1)
+      : 0.0;
+  double minDeltaMs = (_roiDiagMinDeltaMs == DBL_MAX) ? 0.0 : _roiDiagMinDeltaMs;
+  return @{
+    @"ptsAvailableCount":          @(_roiDiagPtsCount),
+    @"ptsInvalidCount":            @(_roiDiagPtsInvalidCount),
+    @"ptsMonotonicViolationCount": @(_roiDiagMonotonicViolations),
+    @"firstPtsMs":                 @(_roiDiagFirstPtsMs),
+    @"lastPtsMs":                  @(_roiDiagLastPtsMs),
+    @"minFrameDeltaMs":            @(minDeltaMs),
+    @"maxFrameDeltaMs":            @(_roiDiagMaxDeltaMs),
+    @"averageFrameDeltaMs":        @(avgDeltaMs),
+  };
+}
+
 /// Synchronously finalises any active recording before returning.
 /// Blocks the calling thread (must NOT be _captureQueue — deadlock) until
 /// AVAssetWriter.finishWritingWithCompletionHandler: fires.
@@ -896,6 +975,7 @@ static const char kCaptureQueueKey = 0;
 /// or AVAssetExportSession claim it.
 /// Safe to call when not recording: returns immediately.
 - (void)stopRecordingAndWait {
+
   if (_recordingState == VanguardRecordingStateIdle)
     return;
 

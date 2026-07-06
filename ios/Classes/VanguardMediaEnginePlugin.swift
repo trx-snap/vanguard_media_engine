@@ -3659,12 +3659,18 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                                             message: e.localizedDescription,
                                             details: nil))
                     } else {
-                        result([
+                        // ROI-1C: Merge PTS diagnostic snapshot (nested key).
+                        // src is captured via [weak self] so guard against dealloc.
+                        var resultDict: [String: Any] = [
                             "filePath":     url?.path ?? "",
                             "droppedFrames": dropped,
                             "totalFrames":  total,
                             "dropRate":     total > 0 ? Double(dropped) / Double(total) : 0.0
-                        ])
+                        ]
+                        if let diag = src.roiPtsDiagnostics {
+                            resultDict["roiPtsDiagnostics"] = diag
+                        }
+                        result(resultDict)
                     }
                 }
             }
@@ -3707,10 +3713,15 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         result(FlutterError(code: "STOP_FAIL", message: e.localizedDescription, details: nil))
                     } else {
                         let callbackCount = encoder?.vtCallbackCount ?? 0
-                        result([
+                        // ROI-1C: Merge PTS diagnostic snapshot (nested key).
+                        var resultDict: [String: Any] = [
                             "callbackFrameCount": callbackCount,
                             "filePath": url?.path ?? "",
-                        ])
+                        ]
+                        if let diag = src.roiPtsDiagnostics {
+                            resultDict["roiPtsDiagnostics"] = diag
+                        }
+                        result(resultDict)
                     }
                 }
             }
