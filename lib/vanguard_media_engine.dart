@@ -78,6 +78,7 @@ export 'vg_image_optimizer.dart';
 // ROI Signal / Server-Ready Sidecar Dart Models (ROI-1A)
 export 'src/roi/vg_roi_models.dart';
 export 'src/roi/vg_roi_coordinate_converter.dart';
+export 'src/roi/vg_roi_transform_mapper.dart';
 
 const String _libName = 'vanguard_media_engine';
 
