@@ -53,12 +53,28 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)stopRecordingAndWait;
 
 // ── ROI-1C / ROI-2A / ROI-2B: PTS, face-detection, and face-box diagnostic snapshot ─
+// ── ROI-3: Capture-space sidecar persistence ─────────────────────────────────────────
 //
-// Diagnostic-only. Not production ROI sidecar data.
+// ROI-3 writes a capture-space `.roi.json` sidecar file next to the video
+// output file after stopRecordingWithCompletion: finishes the asset writer.
+// The sidecar is written synchronously before the stop completion block fires
+// on the main thread, guaranteeing the file is on disk when Dart receives the
+// result map.
+//
+// Sidecar coordinate space: portrait_capture_normalized (top-left origin,
+// Y-down, normalized [0.0, 1.0]). Matches UMF V2 ROI contract §12.2.
+//
+// Sidecar write failure does NOT fail video recording. If writing fails,
+// roiSidecarPath is nil and roiSidecarError describes the failure.
+// Missing ROI is acceptable; wrong ROI is not.
+//
+// roiPtsDiagnostics returns scalar diagnostic counters only. The large
+// roiSamples array is stripped by VanguardMediaEnginePlugin.swift before
+// returning over the Flutter method channel (ROI-3 strip).
 //
 // Returns an NSDictionary containing PTS timing evidence (ROI-1C),
 // capture-time face-detection evidence (ROI-2A), and PTS-aligned face-box
-// samples (ROI-2B) collected during the most recently completed recording.
+// sample count (ROI-2B) collected during the most recently completed recording.
 // Valid only after stopRecordingWithCompletion: fires its completion block on
 // the main thread.
 //
@@ -86,7 +102,7 @@ NS_ASSUME_NONNULL_BEGIN
 //   roiTotalFacesDetected      (uint64) — total face observations across all
 //                                         completed detections
 //
-// ROI-2B face-box sample keys (diagnostic-only, in-memory, not production sidecar):
+// ROI-2B face-box sample keys (diagnostic-only, in-memory):
 //   roiSampleCount             (uint64) — number of samples appended (max 3000)
 //   roiSamples                 (NSArray<NSDictionary *>) — PTS-aligned face-box
 //                                         samples, one per sampled frame where
@@ -97,6 +113,7 @@ NS_ASSUME_NONNULL_BEGIN
 //                                           w         (NSNumber/double) — box width
 //                                           h         (NSNumber/double) — box height
 //                                           faceCount (NSNumber/uint64) — faces detected
+//                                         (faceCount is diagnostic-only; not persisted to sidecar)
 //
 //                                         Coordinate space: portrait_capture_normalized
 //                                           - normalized [0.0, 1.0]
@@ -114,6 +131,21 @@ NS_ASSUME_NONNULL_BEGIN
 //                                         Samples beyond cap (3000) are silently dropped.
 //                                         Missing ROI is acceptable; wrong ROI is not.
 @property(nonatomic, readonly, nullable) NSDictionary<NSString *, id> *roiPtsDiagnostics;
+
+// ── ROI-3: Capture-space sidecar result properties ───────────────────────────
+
+/// Absolute path to the `.roi.json` sidecar file written after the most
+/// recently completed recording. Non-nil only after a successful write.
+/// Valid only after stopRecordingWithCompletion: fires on the main thread.
+/// Nil if no recording has completed, if sampleCount was 0 and write was
+/// skipped (not the case — empty sidecars are still written), or if writing
+/// failed (see roiSidecarError).
+@property(nonatomic, readonly, nullable) NSString *roiSidecarPath;
+
+/// Human-readable error message if the ROI sidecar write failed.
+/// Nil on success. Does not affect video recording success.
+/// Valid only after stopRecordingWithCompletion: fires on the main thread.
+@property(nonatomic, readonly, nullable) NSString *roiSidecarError;
 
 
 // ── Session access for PlatformView ──────────────────────────────────────────

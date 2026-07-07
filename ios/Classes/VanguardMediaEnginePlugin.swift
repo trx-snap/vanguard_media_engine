@@ -3660,6 +3660,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                                             details: nil))
                     } else {
                         // ROI-1C: Merge PTS diagnostic snapshot (nested key).
+                        // ROI-3: Strip large roiSamples array before sending over channel.
                         // src is captured via [weak self] so guard against dealloc.
                         var resultDict: [String: Any] = [
                             "filePath":     url?.path ?? "",
@@ -3667,8 +3668,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                             "totalFrames":  total,
                             "dropRate":     total > 0 ? Double(dropped) / Double(total) : 0.0
                         ]
-                        if let diag = src.roiPtsDiagnostics {
+                        if var diag = src.roiPtsDiagnostics as? [String: Any] {
+                            // ROI-3: roiSamples persisted to .roi.json sidecar; do not
+                            // send the large array over the Flutter method channel.
+                            diag.removeValue(forKey: "roiSamples")
                             resultDict["roiPtsDiagnostics"] = diag
+                        }
+                        // ROI-3: Sidecar path and error (nil on success, non-nil on failure).
+                        resultDict["roiSidecarPath"] = src.roiSidecarPath ?? ""
+                        if let sidecarErr = src.roiSidecarError {
+                            resultDict["roiSidecarError"] = sidecarErr
                         }
                         result(resultDict)
                     }
@@ -3714,12 +3723,21 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     } else {
                         let callbackCount = encoder?.vtCallbackCount ?? 0
                         // ROI-1C: Merge PTS diagnostic snapshot (nested key).
+                        // ROI-3: Strip large roiSamples array before sending over channel.
                         var resultDict: [String: Any] = [
                             "callbackFrameCount": callbackCount,
                             "filePath": url?.path ?? "",
                         ]
-                        if let diag = src.roiPtsDiagnostics {
+                        if var diag = src.roiPtsDiagnostics as? [String: Any] {
+                            // ROI-3: roiSamples persisted to .roi.json sidecar; do not
+                            // send the large array over the Flutter method channel.
+                            diag.removeValue(forKey: "roiSamples")
                             resultDict["roiPtsDiagnostics"] = diag
+                        }
+                        // ROI-3: Sidecar path and error (nil on success, non-nil on failure).
+                        resultDict["roiSidecarPath"] = src.roiSidecarPath ?? ""
+                        if let sidecarErr = src.roiSidecarError {
+                            resultDict["roiSidecarError"] = sidecarErr
                         }
                         result(resultDict)
                     }

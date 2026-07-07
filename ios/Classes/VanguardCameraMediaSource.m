@@ -210,6 +210,16 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
   //   Missing ROI is acceptable; wrong ROI is not.
   NSMutableArray<NSDictionary *> *_roiSamples;   // worker-queue-owned
   NSUInteger                      _roiSampleCap;  // = 3000
+
+  // ── ROI-3: Capture-space sidecar persistence ───────────────────────────────────
+  // _roiRecordingSessionId: UUID generated at startRecordingToURL: so each
+  //   recording clip has a unique identity in its sidecar.
+  // _roiSidecarPath: absolute path of the written .roi.json file, or nil.
+  // _roiSidecarError: localizedDescription if write failed, or nil on success.
+  // All three are written on _captureQueue and read on main thread after stop.
+  NSString *_roiRecordingSessionId;  // UUID per recording clip
+  NSString *_roiSidecarPath;         // non-nil after successful write
+  NSString *_roiSidecarError;        // non-nil on write failure
 }
 
 
@@ -958,6 +968,13 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     self->_roiSamples    = [[NSMutableArray alloc] init];
     self->_roiSampleCap  = 3000;
 
+    // ── ROI-3: Reset sidecar state for new recording clip ────────────────────────
+    // Generate a new UUID so each recording clip has its own sidecar identity.
+    // On _captureQueue (serial) — plain assignment is race-free.
+    self->_roiRecordingSessionId = [[NSUUID UUID] UUIDString];
+    self->_roiSidecarPath        = nil;
+    self->_roiSidecarError       = nil;
+
 
     dispatch_async(dispatch_get_main_queue(), ^{
       completion(nil);
@@ -1028,6 +1045,13 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
         self->_stopCompletion = nil;
         if (chained)
           chained(err ? nil : url, dropped, total, err);
+
+        // ── ROI-3: Write capture-space sidecar before notifying main thread ───
+        // We are on _captureQueue, after writer teardown, before Dart is
+        // notified. The sidecar writer drains _roiWorkerQueue internally.
+        // Failure here does NOT fail video recording.
+        [self _writeROISidecarToURL:(err ? nil : url)];
+
         dispatch_async(dispatch_get_main_queue(), ^{
           if (completion)
             completion(err ? nil : url, dropped, total, err);
@@ -1084,6 +1108,153 @@ static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
     @"roiSampleCount": @(_roiSamples.count),
     @"roiSamples":     [_roiSamples copy],
   };
+}
+
+// ── ROI-3: Capture-space sidecar writer ────────────────────────────────────────────
+//
+// Called on _captureQueue inside the stopRecordingWithCompletion: cleanup
+// block, after the asset writer has finished and before the main-thread
+// completion fires. This guarantees the sidecar file is on disk when Dart
+// receives roiSidecarPath in the stop result map.
+//
+// Threading:
+//   - Called on _captureQueue (serial). Safe to dispatch_sync _roiWorkerQueue
+//     from here (different queues, no deadlock risk).
+//   - All ivar reads are safe: recording is idle, _captureQueue is the writer.
+//
+// Error isolation:
+//   - Any failure sets _roiSidecarError and returns without throwing.
+//   - Video recording success is never conditional on sidecar success.
+//   - NSDataWritingAtomic ensures no partial file is left on disk.
+//
+// Schema: UMF V2 ROI contract §15 (portrait_capture_normalized variant).
+//   version, sourceType, platform, coordinateSpace, recordingSessionId,
+//   videoIdentity {durationMs, width, height, hash},
+//   coverage {coveragePercent, missingIntervals[]},
+//   samples [{timestampMs, framePtsMs, recordingRelativeMs, box{x,y,w,h},
+//             quality, confidence, paddingPolicy}],
+//   finalized
+//
+// faceCount is intentionally omitted from persisted samples.
+// coveragePercent is 1.0 for ROI-3 v1; true gap analysis is deferred.
+- (void)_writeROISidecarToURL:(NSURL *)videoURL {
+  // Guard: nil URL means stop produced an error path — skip sidecar.
+  if (!videoURL) {
+    _roiSidecarPath  = nil;
+    _roiSidecarError = @"output URL nil";
+    return;
+  }
+
+  // Drain _roiWorkerQueue so all pending sample appends are committed before
+  // we copy _roiSamples. dispatch_sync from _captureQueue to _roiWorkerQueue
+  // is safe: they are different serial queues and _roiWorkerQueue never
+  // calls back into _captureQueue.
+  dispatch_sync(_roiWorkerQueue, ^{});
+
+  // Snapshot samples while on _captureQueue after the worker drain.
+  NSArray<NSDictionary *> *samplesSnapshot = [_roiSamples copy];
+
+  // ── Build per-sample JSON array ───────────────────────────────────────────────────
+  double firstPtsMs = _roiDiagFirstPtsMs;
+  double lastPtsMs  = _roiDiagLastPtsMs;
+
+  NSMutableArray *jsonSamples = [[NSMutableArray alloc]
+                                  initWithCapacity:samplesSnapshot.count];
+  for (NSDictionary *raw in samplesSnapshot) {
+    double ptsMs = [raw[@"ptsMs"] doubleValue];
+    double bX    = [raw[@"x"]    doubleValue];
+    double bY    = [raw[@"y"]    doubleValue];
+    double bW    = [raw[@"w"]    doubleValue];
+    double bH    = [raw[@"h"]    doubleValue];
+
+    // Validate coordinates: skip invalid samples rather than writing bad data.
+    // Missing ROI is acceptable; wrong ROI is not.
+    BOOL coordsValid = (isfinite(bX) && isfinite(bY) &&
+                        isfinite(bW) && isfinite(bH) &&
+                        bX >= 0.0 && bY >= 0.0 &&
+                        bW >  0.0 && bH >  0.0 &&
+                        (bX + bW) <= 1.001 && (bY + bH) <= 1.001);
+    if (!coordsValid || !isfinite(ptsMs) || ptsMs < 0.0) {
+      continue;
+    }
+
+    int64_t timestampMs         = (int64_t)round(ptsMs);
+    int64_t framePtsMs          = timestampMs;
+    int64_t relMs               = (int64_t)MAX(0.0, round(ptsMs - firstPtsMs));
+
+    // Box: clamp to exact [0,1] after tolerance allowed during validity check.
+    double cx = MIN(MAX(bX, 0.0), 1.0);
+    double cy = MIN(MAX(bY, 0.0), 1.0);
+    double cw = MIN(bW, 1.0 - cx);
+    double ch = MIN(bH, 1.0 - cy);
+
+    [jsonSamples addObject:@{
+      @"timestampMs":         @(timestampMs),
+      @"framePtsMs":          @(framePtsMs),
+      @"recordingRelativeMs": @(relMs),
+      @"box": @{
+        @"x": @(cx),
+        @"y": @(cy),
+        @"w": @(cw),
+        @"h": @(ch),
+      },
+      @"quality":       @"detected",
+      @"confidence":    [NSNull null],
+      @"paddingPolicy": [NSNull null],
+    }];
+  }
+
+  // ── Build top-level sidecar dictionary ─────────────────────────────────────────────
+  int64_t durationMs = (int64_t)MAX(0.0, round(lastPtsMs - firstPtsMs));
+
+  NSDictionary *sidecar = @{
+    @"version":          @(1),
+    @"sourceType":       @"app_recorded",
+    @"platform":         @"ios",
+    @"coordinateSpace":  @"portrait_capture_normalized",
+    @"recordingSessionId": _roiRecordingSessionId ?: @"unknown",
+    @"videoIdentity": @{
+      @"durationMs": @(durationMs),
+      @"width":      @(1080),
+      @"height":     @(1920),
+      @"hash":       [NSNull null],
+    },
+    @"coverage": @{
+      @"coveragePercent":  @(1.0),
+      @"missingIntervals": @[],
+    },
+    @"samples":   jsonSamples,
+    @"finalized": @(YES),
+  };
+
+  // ── Serialize and write atomically ────────────────────────────────────────────────
+  NSError *jsonErr = nil;
+  NSJSONWritingOptions jsonOpts =
+      NSJSONWritingPrettyPrinted | NSJSONWritingSortedKeys;
+  NSData *jsonData = [NSJSONSerialization dataWithJSONObject:sidecar
+                                                     options:jsonOpts
+                                                       error:&jsonErr];
+  if (!jsonData) {
+    _roiSidecarPath  = nil;
+    _roiSidecarError = jsonErr.localizedDescription
+                       ?: @"ROI sidecar JSON serialization failed";
+    return;
+  }
+
+  NSURL *sidecarURL = [[videoURL URLByDeletingPathExtension]
+                        URLByAppendingPathExtension:@"roi.json"];
+  NSError *writeErr = nil;
+  BOOL written = [jsonData writeToURL:sidecarURL
+                              options:NSDataWritingAtomic
+                                error:&writeErr];
+  if (written) {
+    _roiSidecarPath  = sidecarURL.path;
+    _roiSidecarError = nil;
+  } else {
+    _roiSidecarPath  = nil;
+    _roiSidecarError = writeErr.localizedDescription
+                       ?: @"ROI sidecar write failed";
+  }
 }
 
 // ── ROI-1C: PTS diagnostic update helper ─────────────────────────────────────
