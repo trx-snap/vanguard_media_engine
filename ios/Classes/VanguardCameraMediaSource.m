@@ -183,6 +183,33 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
   uint64_t _roiDetectErrors;          // Vision requests that returned an error (worker queue)
   uint64_t _roiFramesWithFace;        // completed detections with >= 1 face (worker queue)
   uint64_t _roiTotalFacesDetected;    // total face count across all completed detections (worker queue)
+
+  // ── ROI-2B: PTS-aligned face-box diagnostic samples ──────────────────────
+  // _roiSamples: in-memory array of NSDictionary samples, one per sampled
+  //   frame where a face was detected. Each entry contains:
+  //     ptsMs     (double) — frame PTS in milliseconds
+  //     x/y/w/h   (double) — largest-face bounding box in portrait_capture_normalized
+  //     faceCount (uint64) — total faces detected in this sampled frame
+  //
+  // Thread ownership: written exclusively on _roiWorkerQueue (serial).
+  //   Reset on _captureQueue at recording start — safe because:
+  //   (a) recording start is on _captureQueue, and
+  //   (b) _roiDetectInFlight is cleared before reset, ensuring no worker
+  //       block is still in-flight when the reset executes.
+  // Drained (via dispatch_sync) by roiPtsDiagnostics getter.
+  //
+  // Coordinates: portrait_capture_normalized, top-left origin, Y-down.
+  //   Vision Y-up boxes are converted by _VGVisionBoxToTopLeftNormalized.
+  //   No X-flip for front camera: AVCaptureConnection.videoMirrored already
+  //   physically mirrors the buffer, so Vision detects on the mirrored frame
+  //   that matches the recorded video.
+  //
+  // _roiSampleCap: hard cap preventing unbounded growth on long recordings.
+  //   At ~11 samples/sec (cadence=3 at 30fps minus in-flight skips), 3000
+  //   samples covers ~4.5 minutes. Samples beyond the cap are silently dropped.
+  //   Missing ROI is acceptable; wrong ROI is not.
+  NSMutableArray<NSDictionary *> *_roiSamples;   // worker-queue-owned
+  NSUInteger                      _roiSampleCap;  // = 3000
 }
 
 
@@ -195,6 +222,28 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
 // Queue-specific key used by stopRecordingAndWait to assert it is not called
 // from _captureQueue (which would deadlock via stopRecordingWithCompletion:).
 static const char kCaptureQueueKey = 0;
+
+// ── ROI-2B: Vision bottom-left/Y-up → UMF top-left/Y-down coordinate conversion
+//
+// Converts a VNFaceObservation.boundingBox (normalized, origin = lower-left,
+// Y increases upward) to the shared portrait_capture_normalized coordinate
+// space (normalized, origin = upper-left, Y increases downward).
+//
+// Math per UMF ROI contract §12.3 and reference in VGOfflineFaceBoxBenchmarkTest:
+//   x_shared = x_vision          (X axis direction is identical)
+//   y_shared = 1.0 - y_vision - h_vision  (flip: lower-left Y → upper-left Y)
+//   w_shared = w_vision
+//   h_shared = h_vision
+//
+// Called only on _roiWorkerQueue.
+static inline CGRect _VGVisionBoxToTopLeftNormalized(CGRect vb) {
+    return CGRectMake(
+        vb.origin.x,
+        1.0 - vb.origin.y - vb.size.height,
+        vb.size.width,
+        vb.size.height
+    );
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Init
@@ -902,6 +951,13 @@ static const char kCaptureQueueKey = 0;
     self->_roiTotalFacesDetected  = 0;
     atomic_store(&self->_roiDetectInFlight, false);
 
+    // ── ROI-2B: Reset sample storage ─────────────────────────────────────────
+    // On _captureQueue (serial). _roiDetectInFlight was cleared above so no
+    // worker block is in-flight. Safe to allocate a fresh array here;
+    // the worker queue will not see _roiSamples until the next detection dispatch.
+    self->_roiSamples    = [[NSMutableArray alloc] init];
+    self->_roiSampleCap  = 3000;
+
 
     dispatch_async(dispatch_get_main_queue(), ^{
       completion(nil);
@@ -1015,13 +1071,18 @@ static const char kCaptureQueueKey = 0;
     @"minFrameDeltaMs":            @(minDeltaMs),
     @"maxFrameDeltaMs":            @(_roiDiagMaxDeltaMs),
     @"averageFrameDeltaMs":        @(avgDeltaMs),
-    // ROI-2A face-detection diagnostic keys
+    // ROI-2A face-detection diagnostic keys (unchanged)
     @"roiDetectAttempts":      @(_roiDetectAttempts),
     @"roiDetectSkippedBusy":   @(_roiDetectSkippedBusy),
     @"roiDetectionsCompleted": @(_roiDetectionsCompleted),
     @"roiDetectErrors":        @(_roiDetectErrors),
     @"roiFramesWithFace":      @(_roiFramesWithFace),
     @"roiTotalFacesDetected":  @(_roiTotalFacesDetected),
+    // ROI-2B PTS-aligned face-box sample keys
+    // _roiSamples is worker-queue-owned; the dispatch_sync drain above
+    // ensures all pending appends have completed before we copy.
+    @"roiSampleCount": @(_roiSamples.count),
+    @"roiSamples":     [_roiSamples copy],
   };
 }
 
@@ -1136,12 +1197,56 @@ static const char kCaptureQueueKey = 0;
       return;
     }
 
-    // ── Count results ────────────────────────────────────────────────────────
-    NSUInteger faceCount = request.results.count;
+    // ── Count results and capture ROI-2B face-box sample ────────────────────
+    NSArray<VNFaceObservation *> *results = request.results;
+    NSUInteger faceCount = results.count;
     strongSelf->_roiDetectionsCompleted++;
     if (faceCount > 0) {
       strongSelf->_roiFramesWithFace++;
       strongSelf->_roiTotalFacesDetected += faceCount;
+
+      // ── ROI-2B: Find largest face by normalized area (O(n) single pass) ──
+      // "Largest" follows UMF ROI contract §14 primary-face selection policy.
+      // We never sort — O(n) max-find is sufficient and allocation-free.
+      VNFaceObservation *largest = results.firstObject;
+      CGFloat largestArea = (largest.boundingBox.size.width *
+                             largest.boundingBox.size.height);
+      for (NSUInteger i = 1; i < faceCount; i++) {
+        VNFaceObservation *obs = results[i];
+        CGFloat area = obs.boundingBox.size.width * obs.boundingBox.size.height;
+        if (area > largestArea) {
+          largest    = obs;
+          largestArea = area;
+        }
+      }
+
+      // Convert Vision bottom-left/Y-up → portrait_capture_normalized top-left/Y-down.
+      CGRect tlBox = _VGVisionBoxToTopLeftNormalized(largest.boundingBox);
+      double bX    = tlBox.origin.x;
+      double bY    = tlBox.origin.y;
+      double bW    = tlBox.size.width;
+      double bH    = tlBox.size.height;
+
+      // Safety guard: reject non-finite or out-of-range coordinates.
+      // Missing ROI is acceptable; wrong ROI is not.
+      BOOL coordsValid = (isfinite(bX) && isfinite(bY) &&
+                          isfinite(bW) && isfinite(bH) &&
+                          bX >= 0.0 && bY >= 0.0 &&
+                          bW > 0.0  && bH > 0.0  &&
+                          (bX + bW) <= 1.001 && (bY + bH) <= 1.001);
+
+      if (coordsValid &&
+          strongSelf->_roiSamples.count < strongSelf->_roiSampleCap) {
+        double ptsMs = CMTimeGetSeconds(pts) * 1000.0;
+        [strongSelf->_roiSamples addObject:@{
+          @"ptsMs":     @(ptsMs),
+          @"x":         @(bX),
+          @"y":         @(bY),
+          @"w":         @(bW),
+          @"h":         @(bH),
+          @"faceCount": @(faceCount),
+        }];
+      }
     }
 
     atomic_store(&strongSelf->_roiDetectInFlight, false);

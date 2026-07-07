@@ -52,14 +52,15 @@ NS_ASSUME_NONNULL_BEGIN
 /// AVAssetReader claims it.
 - (void)stopRecordingAndWait;
 
-// ── ROI-1C / ROI-2A: PTS and face-detection diagnostic snapshot ───────────────
+// ── ROI-1C / ROI-2A / ROI-2B: PTS, face-detection, and face-box diagnostic snapshot ─
 //
 // Diagnostic-only. Not production ROI sidecar data.
 //
-// Returns an NSDictionary containing PTS timing evidence (ROI-1C) and
-// capture-time face-detection evidence (ROI-2A) collected during the most
-// recently completed recording. Valid only after stopRecordingWithCompletion:
-// fires its completion block on the main thread.
+// Returns an NSDictionary containing PTS timing evidence (ROI-1C),
+// capture-time face-detection evidence (ROI-2A), and PTS-aligned face-box
+// samples (ROI-2B) collected during the most recently completed recording.
+// Valid only after stopRecordingWithCompletion: fires its completion block on
+// the main thread.
 //
 // Returns nil if no recording has been started yet since init.
 //
@@ -84,7 +85,36 @@ NS_ASSUME_NONNULL_BEGIN
 //   roiFramesWithFace          (uint64) — completed detections that found >= 1 face
 //   roiTotalFacesDetected      (uint64) — total face observations across all
 //                                         completed detections
+//
+// ROI-2B face-box sample keys (diagnostic-only, in-memory, not production sidecar):
+//   roiSampleCount             (uint64) — number of samples appended (max 3000)
+//   roiSamples                 (NSArray<NSDictionary *>) — PTS-aligned face-box
+//                                         samples, one per sampled frame where
+//                                         a face was detected. Each entry:
+//                                           ptsMs     (NSNumber/double) — frame PTS in ms
+//                                           x         (NSNumber/double) — box left edge
+//                                           y         (NSNumber/double) — box top edge
+//                                           w         (NSNumber/double) — box width
+//                                           h         (NSNumber/double) — box height
+//                                           faceCount (NSNumber/uint64) — faces detected
+//
+//                                         Coordinate space: portrait_capture_normalized
+//                                           - normalized [0.0, 1.0]
+//                                           - origin: top-left (0, 0)
+//                                           - X increases right, Y increases down
+//                                           - valid under portrait-locked recording only
+//
+//                                         Vision Y-up boxes are converted using
+//                                         _VGVisionBoxToTopLeftNormalized before storage.
+//                                         No X-flip for front camera: the buffer passed
+//                                         to Vision is already physically mirrored by
+//                                         AVCaptureConnection.videoMirrored and matches
+//                                         the recorded video pixel layout.
+//
+//                                         Samples beyond cap (3000) are silently dropped.
+//                                         Missing ROI is acceptable; wrong ROI is not.
 @property(nonatomic, readonly, nullable) NSDictionary<NSString *, id> *roiPtsDiagnostics;
+
 
 // ── Session access for PlatformView ──────────────────────────────────────────
 
