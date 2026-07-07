@@ -18,8 +18,10 @@
 #import "VanguardCameraMediaSource.h"
 #import "VanguardMLGate.h"
 #import <ImageIO/ImageIO.h>
+#import <Vision/Vision.h>
 #import <mach/mach.h>
 #import <os/lock.h>
+#import <stdatomic.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Internal recording state
@@ -154,6 +156,33 @@ typedef NS_ENUM(NSInteger, VanguardRecordingState) {
   double    _roiDiagMaxDeltaMs;         // max inter-frame delta in ms
   double    _roiDiagPtsSumMs;           // running sum of deltas for average (computed at stop time)
   CMTime    _roiDiagPrevPts;            // previous valid PTS for delta/monotonic checks
+
+  // ── ROI-2A: Capture-time face-detection diagnostic ────────────────────────
+  // _roiWorkerQueue: dedicated serial queue at utility QoS for Vision requests.
+  //   Never blocked from _captureQueue. Created in init; alive for object lifetime.
+  // _roiDetectInFlight: atomic flag ensuring at most one Vision request and one
+  //   retained CVPixelBuffer are alive at any moment.
+  //   Set to true on _captureQueue; cleared on _roiWorkerQueue.
+  //
+  // Counter ownership:
+  //   Written on _captureQueue (serial):  _roiDetectFrameCounter, _roiDetectAttempts,
+  //                                       _roiDetectSkippedBusy
+  //   Written on _roiWorkerQueue (serial): _roiDetectionsCompleted, _roiDetectErrors,
+  //                                        _roiFramesWithFace, _roiTotalFacesDetected
+  //   Atomic (set on capture, cleared on worker): _roiDetectInFlight
+  //
+  // No locks required: each counter is written by exactly one queue.
+  // roiPtsDiagnostics drains _roiWorkerQueue before reading worker counters.
+  dispatch_queue_t _roiWorkerQueue;
+  atomic_bool      _roiDetectInFlight;
+
+  uint64_t _roiDetectFrameCounter;    // eligible frames seen; cadence divisor (capture queue)
+  uint64_t _roiDetectAttempts;        // frames dispatched to worker (capture queue)
+  uint64_t _roiDetectSkippedBusy;     // frames skipped due to in-flight guard (capture queue)
+  uint64_t _roiDetectionsCompleted;   // Vision requests that finished without error (worker queue)
+  uint64_t _roiDetectErrors;          // Vision requests that returned an error (worker queue)
+  uint64_t _roiFramesWithFace;        // completed detections with >= 1 face (worker queue)
+  uint64_t _roiTotalFacesDetected;    // total face count across all completed detections (worker queue)
 }
 
 
@@ -198,6 +227,15 @@ static const char kCaptureQueueKey = 0;
       "com.vanguard.ml",
       dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,
                                               QOS_CLASS_USER_INITIATED, 0));
+
+  // ROI-2A: Dedicated serial worker queue for async Vision face-rectangle
+  // detection. Runs at utility QoS to avoid interfering with capture/recording.
+  _roiWorkerQueue = dispatch_queue_create(
+      "com.vanguard.roiWorker", DISPATCH_QUEUE_SERIAL);
+  dispatch_set_target_queue(
+      _roiWorkerQueue,
+      dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+  atomic_init(&_roiDetectInFlight, false);
 
   // Persistent queue for JPEG encoding + file I/O (Phase 4).
   // Allocated here once; reused for every takePhotoToURL: call.
@@ -624,36 +662,23 @@ static const char kCaptureQueueKey = 0;
   // safe.
   int32_t total = ++_totalFrameCount;
 
-  // ── ROI-1C: PTS diagnostic update (O(1), no allocation, no logging) ────────
-  // Updates only while recording (_recordingState == Writing check above).
-  // Uses existing `pts` (CMTime) — no pixel buffer access.
-  if (CMTIME_IS_VALID(pts)) {
-    double ptsMs = CMTimeGetSeconds(pts) * 1000.0;
-    _roiDiagPtsCount++;
-    _roiDiagLastPtsMs = ptsMs;
-    if (_roiDiagPtsCount == 1) {
-      _roiDiagFirstPtsMs = ptsMs;
-    }
-    if (CMTIME_IS_VALID(_roiDiagPrevPts)) {
-      double deltaMs = ptsMs - CMTimeGetSeconds(_roiDiagPrevPts) * 1000.0;
-      if (deltaMs <= 0.0) {
-        _roiDiagMonotonicViolations++;
-      } else {
-        _roiDiagPtsSumMs += deltaMs;
-        if (deltaMs < _roiDiagMinDeltaMs) _roiDiagMinDeltaMs = deltaMs;
-        if (deltaMs > _roiDiagMaxDeltaMs) _roiDiagMaxDeltaMs = deltaMs;
-      }
-    }
-    _roiDiagPrevPts = pts;
-  } else {
-    _roiDiagPtsInvalidCount++;
-  }
+  // ── ROI-1C / ROI-2A: PTS diagnostic update + face-detection offer ────────
+  // Extracted to helpers shared with the graph-backed appendProcessedVideoFrame:
+  // path. See _updateROIPTSDiagnosticsForPTS: and _offerROIDetectionForPixelBuffer:pts:
+  [self _updateROIPTSDiagnosticsForPTS:pts];
 
   // Frame skip (Tier 2 active)
   if (_recordingFrameSkip > 1) {
     if (++_frameSkipCounter % _recordingFrameSkip != 0)
       return;
   }
+
+  // ── ROI-2A: Offer this frame to the async face-detection tap ─────────────
+  // Must be called AFTER the frame-skip gate (above) and BEFORE the
+  // isReadyForMoreMediaData gate below, so only recording-intent frames that
+  // survived throttling are sampled. Early returns inside the helper only skip
+  // ROI work; normal recording continues unconditionally after this call.
+  [self _offerROIDetectionForPixelBuffer:pixelBuffer pts:pts];
 
   // isReadyForMoreMediaData gate
   if (!_videoWriterInput.isReadyForMoreMediaData) {
@@ -864,6 +889,19 @@ static const char kCaptureQueueKey = 0;
     self->_roiDiagPtsSumMs = 0.0;
     self->_roiDiagPrevPts = kCMTimeInvalid;
 
+    // ── ROI-2A: Reset face-detection diagnostic counters ─────────────────────
+    // On _captureQueue (serial) — plain assignment is race-free.
+    // Also reset the atomic in-flight flag so any prior state from the previous
+    // clip is cleared before the new recording begins.
+    self->_roiDetectFrameCounter  = 0;
+    self->_roiDetectAttempts      = 0;
+    self->_roiDetectSkippedBusy   = 0;
+    self->_roiDetectionsCompleted = 0;
+    self->_roiDetectErrors        = 0;
+    self->_roiFramesWithFace      = 0;
+    self->_roiTotalFacesDetected  = 0;
+    atomic_store(&self->_roiDetectInFlight, false);
+
 
     dispatch_async(dispatch_get_main_queue(), ^{
       completion(nil);
@@ -951,11 +989,24 @@ static const char kCaptureQueueKey = 0;
 //
 // Average is computed here (not per-frame) to avoid per-frame division.
 - (NSDictionary<NSString *, id> *)roiPtsDiagnostics {
+  // ROI-2A: Drain the worker queue before reading worker-queue-owned counters.
+  // This getter is expected to be called on the main thread after the stop
+  // completion block fires — _roiWorkerQueue is a different queue, so
+  // dispatch_sync is safe and cannot deadlock here.
+  //
+  // Deadlock safety: dispatch_sync(_roiWorkerQueue) can only deadlock if the
+  // caller is already running on _roiWorkerQueue. That queue is private to this
+  // class and is never used to call external code that might invoke
+  // roiPtsDiagnostics. The getter is documented as a main-thread post-stop
+  // call. This is safe.
+  dispatch_sync(_roiWorkerQueue, ^{});
+
   double avgDeltaMs = (_roiDiagPtsCount > 1)
       ? _roiDiagPtsSumMs / (double)(_roiDiagPtsCount - 1)
       : 0.0;
   double minDeltaMs = (_roiDiagMinDeltaMs == DBL_MAX) ? 0.0 : _roiDiagMinDeltaMs;
   return @{
+    // ROI-1C PTS timing keys (unchanged)
     @"ptsAvailableCount":          @(_roiDiagPtsCount),
     @"ptsInvalidCount":            @(_roiDiagPtsInvalidCount),
     @"ptsMonotonicViolationCount": @(_roiDiagMonotonicViolations),
@@ -964,10 +1015,140 @@ static const char kCaptureQueueKey = 0;
     @"minFrameDeltaMs":            @(minDeltaMs),
     @"maxFrameDeltaMs":            @(_roiDiagMaxDeltaMs),
     @"averageFrameDeltaMs":        @(avgDeltaMs),
+    // ROI-2A face-detection diagnostic keys
+    @"roiDetectAttempts":      @(_roiDetectAttempts),
+    @"roiDetectSkippedBusy":   @(_roiDetectSkippedBusy),
+    @"roiDetectionsCompleted": @(_roiDetectionsCompleted),
+    @"roiDetectErrors":        @(_roiDetectErrors),
+    @"roiFramesWithFace":      @(_roiFramesWithFace),
+    @"roiTotalFacesDetected":  @(_roiTotalFacesDetected),
   };
 }
 
-/// Synchronously finalises any active recording before returning.
+// ── ROI-1C: PTS diagnostic update helper ─────────────────────────────────────
+//
+// Called on _captureQueue (serial) — all ivar writes are lock-free.
+// Shared by both the raw captureOutput: path and the graph-backed
+// appendProcessedVideoFrame: path so both paths produce identical ROI-1C
+// PTS timing evidence.
+//
+// O(1): no allocation, no logging, no pixel-buffer access.
+- (void)_updateROIPTSDiagnosticsForPTS:(CMTime)pts {
+  if (CMTIME_IS_VALID(pts)) {
+    double ptsMs = CMTimeGetSeconds(pts) * 1000.0;
+    _roiDiagPtsCount++;
+    _roiDiagLastPtsMs = ptsMs;
+    if (_roiDiagPtsCount == 1) {
+      _roiDiagFirstPtsMs = ptsMs;
+    }
+    if (CMTIME_IS_VALID(_roiDiagPrevPts)) {
+      double deltaMs = ptsMs - CMTimeGetSeconds(_roiDiagPrevPts) * 1000.0;
+      if (deltaMs <= 0.0) {
+        _roiDiagMonotonicViolations++;
+      } else {
+        _roiDiagPtsSumMs += deltaMs;
+        if (deltaMs < _roiDiagMinDeltaMs) _roiDiagMinDeltaMs = deltaMs;
+        if (deltaMs > _roiDiagMaxDeltaMs) _roiDiagMaxDeltaMs = deltaMs;
+      }
+    }
+    _roiDiagPrevPts = pts;
+  } else {
+    _roiDiagPtsInvalidCount++;
+  }
+}
+
+// ── ROI-2A: Async face-rectangle detection tap ────────────────────────────────
+//
+// Called on _captureQueue once per eligible recording frame (after frame-skip
+// gate, before isReadyForMoreMediaData gate). Early returns here are internal
+// only — they never skip normal recording logic in captureOutput:.
+//
+// Lifecycle (mirrors VGFaceDetectionProvider.detectInPixelBuffer:pts:):
+//   1. Cadence gate:  only every 3rd eligible frame proceeds.
+//   2. In-flight guard: atomic_exchange prevents overlapping detections and
+//      ensures at most one CVPixelBuffer is retained for ROI at any time.
+//   3. Retain: CVPixelBufferRetain before dispatch; released on EVERY exit path.
+//   4. Worker queue (utility serial): VNDetectFaceRectanglesRequest, count only.
+//   5. Clear in-flight flag on every exit path (success, error, self-nil).
+//
+// Performance: no per-frame NSLog/os_log, no allocation on capture queue,
+//   no locks, no dispatch_sync on capture queue, no landmarks, no masks.
+- (void)_offerROIDetectionForPixelBuffer:(CVPixelBufferRef)pixelBuffer
+                                     pts:(CMTime)pts {
+  // ── Cadence gate: sample every 3rd eligible frame ───────────────────────────
+  _roiDetectFrameCounter++;
+  if ((_roiDetectFrameCounter % 3) != 0) {
+    return; // skip ROI only; recording continues in caller
+  }
+
+  _roiDetectAttempts++;
+
+  // ── In-flight guard: abort if a detection is already running ────────────────
+  // atomic_exchange returns the OLD value. If true, a prior detection is alive
+  // (its retained buffer is still held by the worker block). We must not retain
+  // a second buffer.
+  if (atomic_exchange(&_roiDetectInFlight, true)) {
+    _roiDetectSkippedBusy++;
+    return; // skip ROI only; _roiDetectAttempts was already incremented above
+  }
+
+  // ── Retain the pixel buffer for async use (RR-38 compliance) ───────────────
+  // Balanced by CVPixelBufferRelease on every exit path inside the block.
+  CVPixelBufferRetain(pixelBuffer);
+
+  // ── Dispatch face-rectangle detection to the worker queue ───────────────────
+  // __weak capture of self: if VanguardCameraMediaSource is deallocated before
+  // the block executes, strongSelf will be nil; we release the buffer and return.
+  // The buffer is ALWAYS released and _roiDetectInFlight is ALWAYS cleared (when
+  // strongSelf is non-nil) on every exit path.
+  __weak VanguardCameraMediaSource *weakSelf = self;
+  dispatch_async(_roiWorkerQueue, ^{
+    VanguardCameraMediaSource *strongSelf = weakSelf;
+    if (!strongSelf) {
+      CVPixelBufferRelease(pixelBuffer);
+      // _roiDetectInFlight lives in the object's memory which is being released;
+      // no action needed — the memory will be freed.
+      return;
+    }
+
+    // ── Build and perform VNDetectFaceRectanglesRequest ──────────────────────
+    // Rectangle-only: no landmarks, no masks, no coordinate conversion.
+    // kCGImagePropertyOrientationUp: native capture orientation assumption,
+    // matching VGFaceDetectionProvider convention.
+    VNDetectFaceRectanglesRequest *request =
+        [[VNDetectFaceRectanglesRequest alloc] init];
+
+    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc]
+        initWithCVPixelBuffer:pixelBuffer
+                  orientation:kCGImagePropertyOrientationUp
+                      options:@{}];
+
+    NSError *error = nil;
+    [handler performRequests:@[request] error:&error];
+
+    // ── Release pixel buffer — Vision has finished reading ───────────────────
+    CVPixelBufferRelease(pixelBuffer);
+
+    if (error) {
+      // Vision returned an error. Do not attempt partial-result processing.
+      strongSelf->_roiDetectErrors++;
+      atomic_store(&strongSelf->_roiDetectInFlight, false);
+      return;
+    }
+
+    // ── Count results ────────────────────────────────────────────────────────
+    NSUInteger faceCount = request.results.count;
+    strongSelf->_roiDetectionsCompleted++;
+    if (faceCount > 0) {
+      strongSelf->_roiFramesWithFace++;
+      strongSelf->_roiTotalFacesDetected += faceCount;
+    }
+
+    atomic_store(&strongSelf->_roiDetectInFlight, false);
+  });
+}
+
+
 /// Blocks the calling thread (must NOT be _captureQueue — deadlock) until
 /// AVAssetWriter.finishWritingWithCompletionHandler: fires.
 /// teardownCurrentMode MUST call this before starting editor or export mode
@@ -1069,6 +1250,16 @@ static const char kCaptureQueueKey = 0;
     self->_consecutiveDropCount = 0;
 
     int32_t total = ++self->_totalFrameCount;
+
+    // ── ROI-1C / ROI-2A: diagnostic update for graph-backed path ─────────────
+    // Mirrors the raw captureOutput: path. Called on _captureQueue (serial) so
+    // all ivar writes are safe without locks.
+    // _updateROIPTSDiagnosticsForPTS: is O(1), no allocation, no logging.
+    // _offerROIDetectionForPixelBuffer:pts: dispatches async Vision work to
+    // _roiWorkerQueue — no blocking here. The graph path has no Tier-2
+    // frame-skip so every processed frame is offered at the cadence rate.
+    [self _updateROIPTSDiagnosticsForPTS:pts];
+    [self _offerROIDetectionForPixelBuffer:pixelBuffer pts:pts];
 
     // Append the processed frame. AVAssetWriterInputPixelBufferAdaptor is
     // synchronous — buffer consumed before this returns.

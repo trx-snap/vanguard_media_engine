@@ -52,17 +52,18 @@ NS_ASSUME_NONNULL_BEGIN
 /// AVAssetReader claims it.
 - (void)stopRecordingAndWait;
 
-// ── ROI-1C: PTS diagnostic snapshot ──────────────────────────────────────────
+// ── ROI-1C / ROI-2A: PTS and face-detection diagnostic snapshot ───────────────
 //
 // Diagnostic-only. Not production ROI sidecar data.
 //
-// Returns an NSDictionary containing PTS timing evidence collected during the
-// most recently completed recording. Valid only after stopRecordingWithCompletion:
+// Returns an NSDictionary containing PTS timing evidence (ROI-1C) and
+// capture-time face-detection evidence (ROI-2A) collected during the most
+// recently completed recording. Valid only after stopRecordingWithCompletion:
 // fires its completion block on the main thread.
 //
 // Returns nil if no recording has been started yet since init.
 //
-// Keys:
+// ROI-1C PTS timing keys:
 //   ptsAvailableCount          (uint64) — frames with valid PTS during recording
 //   ptsInvalidCount            (uint64) — frames with CMTIME_IS_INVALID(pts)
 //   ptsMonotonicViolationCount (uint64) — frames where pts <= previous pts
@@ -71,6 +72,18 @@ NS_ASSUME_NONNULL_BEGIN
 //   minFrameDeltaMs            (double) — min consecutive-frame interval in ms
 //   maxFrameDeltaMs            (double) — max consecutive-frame interval in ms
 //   averageFrameDeltaMs        (double) — mean consecutive-frame interval in ms
+//
+// ROI-2A face-detection diagnostic keys:
+//   roiDetectAttempts          (uint64) — ROI cadence frames that passed the
+//                                         in-flight guard and were dispatched
+//   roiDetectSkippedBusy       (uint64) — ROI cadence frames skipped because a
+//                                         prior detection was still in-flight
+//   roiDetectionsCompleted     (uint64) — Vision requests that finished without
+//                                         error
+//   roiDetectErrors            (uint64) — Vision requests that returned an error
+//   roiFramesWithFace          (uint64) — completed detections that found >= 1 face
+//   roiTotalFacesDetected      (uint64) — total face observations across all
+//                                         completed detections
 @property(nonatomic, readonly, nullable) NSDictionary<NSString *, id> *roiPtsDiagnostics;
 
 // ── Session access for PlatformView ──────────────────────────────────────────
