@@ -79,6 +79,8 @@ export 'vg_image_optimizer.dart';
 export 'src/roi/vg_roi_models.dart';
 export 'src/roi/vg_roi_coordinate_converter.dart';
 export 'src/roi/vg_roi_transform_mapper.dart';
+// ROI-4A: Export-space sidecar mapper (capture → export_output_normalized)
+export 'src/roi/vg_roi_export_mapper.dart';
 
 const String _libName = 'vanguard_media_engine';
 
