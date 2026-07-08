@@ -403,6 +403,54 @@ class VanguardMediaPreparer {
     }
   }
 
+  // ── extractDisplayOrientedFrameEvidence ───────────────────────────────────
+
+  /// ROI-5B.1 — Diagnostic method for imported media orientation evidence.
+  ///
+  /// Extracts a single frame from [videoPath] using the native platform decoder
+  /// and returns the decoded pixel dimensions, extraction method, and rotation
+  /// handling metadata. This proves that the native pipeline produces
+  /// display-oriented frames whose dimensions match [MediaInfo.displayWidth] /
+  /// [MediaInfo.displayHeight] from [inspectMedia].
+  ///
+  /// **This method is diagnostic only.** It does not perform face detection,
+  /// generate ROI sidecars, write files, or encode images. The bitmap/CGImage
+  /// is immediately recycled after dimension retrieval.
+  ///
+  /// Returns null if:
+  /// - The file does not exist or is empty.
+  /// - Native frame extraction fails (corrupt file, no video track, etc.).
+  ///
+  /// Expected returned keys:
+  /// - `extractedFrameWidth` (int): decoded frame pixel width
+  /// - `extractedFrameHeight` (int): decoded frame pixel height
+  /// - `method` (String): native extraction mechanism used
+  /// - `rotationHandling` (String): how rotation was applied
+  /// - `displayTransformApplied` (bool?): whether preferredTransform was applied
+  /// - `requestedTimeSeconds` (double): timestamp requested (always 0.0)
+  /// - `actualTimeSeconds` (double, iOS only): actual frame timestamp decoded
+  static Future<Map<String, dynamic>?> extractDisplayOrientedFrameEvidence({
+    required String videoPath,
+  }) async {
+    final file = File(videoPath);
+    if (!file.existsSync() || file.lengthSync() == 0) return null;
+
+    try {
+      final raw = await _channel.invokeMethod<Map>(
+        'extractDisplayOrientedFrameEvidence',
+        {'videoPath': videoPath},
+      );
+      if (raw == null) return null;
+      return Map<String, dynamic>.from(raw);
+    } on PlatformException catch (e) {
+      debugPrint(
+        'VanguardMediaPreparer.extractDisplayOrientedFrameEvidence error: '
+        '${e.message}',
+      );
+      return null;
+    }
+  }
+
   // ── prepareForUpload ──────────────────────────────────────────────────────
 
   /// Universal upload preparation pipeline.

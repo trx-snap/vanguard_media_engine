@@ -436,8 +436,67 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 }.start()
             }
 
+            // ── ROI-5B.1: Display-Oriented Frame Extraction Evidence ──────────
+            // Diagnostic-only. Decodes the first frame via MediaMetadataRetriever
+            // and returns its Bitmap dimensions. The Bitmap is recycled immediately
+            // — no JPEG encoding, no file writes, no face detection.
+            //
+            // rotationHandling = "platformDecoderUnverified": Android API 29+
+            // getFrameAtTime() auto-rotates by METADATA_KEY_VIDEO_ROTATION, but
+            // behaviour on older APIs is not guaranteed. ROI-5B.2 physical smoke
+            // will compare these dimensions against inspectMedia.displayWidth/
+            // displayHeight on real devices to verify correctness.
+            "extractDisplayOrientedFrameEvidence" -> {
+                val videoPath = args?.get("videoPath") as? String
+                if (videoPath.isNullOrEmpty()) {
+                    result.error("INVALID_ARG",
+                        "extractDisplayOrientedFrameEvidence: videoPath required", null)
+                    return
+                }
+                Thread {
+                    val retriever = MediaMetadataRetriever()
+                    try {
+                        retriever.setDataSource(videoPath)
+                        val bitmap = retriever.getFrameAtTime(
+                            0L,
+                            MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                        )
+                        if (bitmap != null) {
+                            val w = bitmap.width
+                            val h = bitmap.height
+                            bitmap.recycle() // release immediately — no further use
+                            mainHandler.post {
+                                result.success(mapOf(
+                                    "extractedFrameWidth"     to w,
+                                    "extractedFrameHeight"    to h,
+                                    "method"                  to "MediaMetadataRetriever.getFrameAtTime",
+                                    "rotationHandling"        to "platformDecoderUnverified",
+                                    "displayTransformApplied" to null,
+                                    "requestedTimeSeconds"    to 0.0,
+                                ))
+                            }
+                        } else {
+                            mainHandler.post {
+                                result.error("DECODE_FAILED",
+                                    "extractDisplayOrientedFrameEvidence: getFrameAtTime returned null",
+                                    null)
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "extractDisplayOrientedFrameEvidence: $e")
+                        mainHandler.post {
+                            result.error("DECODE_FAILED",
+                                "extractDisplayOrientedFrameEvidence: ${e.message}", null)
+                        }
+                    } finally {
+                        try { retriever.release() } catch (_: Exception) {}
+                    }
+                }.start()
+            }
+
 
             "createImageTexture" -> {
+
                 // Mirrors iOS: CVPixelBuffer → Metal Texture — returns textureId.
                 // Android: BitmapFactory → Surface.lockCanvas() → Flutter SurfaceTexture.
                 val path = args?.get("path") as? String

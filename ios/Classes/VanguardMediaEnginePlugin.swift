@@ -3226,6 +3226,68 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 videoPath: videoPath, count: count, duration: duration
             ) { images in result(images) }
 
+        // ── ROI-5B.1: Display-Oriented Frame Extraction Evidence ─────────────
+        // Diagnostic-only. Extracts the first decoded frame and returns its
+        // pixel dimensions without JPEG encoding or file I/O.
+        // Uses AVAssetImageGenerator with appliesPreferredTrackTransform = true
+        // and maximumSize = .zero (default) so no scaling is applied.
+        // Purpose: prove that native extraction yields frames whose dimensions
+        // match inspectMedia.displayWidth / displayHeight before any scanner.
+
+        case "extractDisplayOrientedFrameEvidence":
+            guard
+                let videoPath = args?["videoPath"] as? String,
+                !videoPath.isEmpty
+            else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "extractDisplayOrientedFrameEvidence: videoPath required",
+                                    details: nil))
+                return
+            }
+            DispatchQueue.global(qos: .utility).async {
+                let url   = URL(fileURLWithPath: videoPath)
+                let asset = AVURLAsset(url: url,
+                                       options: [AVURLAssetPreferPreciseDurationAndTimingKey: false])
+
+                let gen = AVAssetImageGenerator(asset: asset)
+                // Apply preferredTransform so the CGImage is display-oriented.
+                // A portrait video stored as landscape+270° yields a CGImage
+                // whose width/height match the display portrait size.
+                gen.appliesPreferredTrackTransform = true
+                // maximumSize = .zero is the default (no upper bound); explicit
+                // to document intent: decode at full display resolution.
+                gen.maximumSize = .zero
+
+                let requestedTime = CMTime(seconds: 0, preferredTimescale: 600)
+                var actualTime    = CMTime.zero
+
+                do {
+                    let cgImage = try gen.copyCGImage(at: requestedTime,
+                                                      actualTime: &actualTime)
+                    let w         = cgImage.width
+                    let h         = cgImage.height
+                    let actualSec = CMTimeGetSeconds(actualTime)
+                    DispatchQueue.main.async {
+                        result([
+                            "extractedFrameWidth":     w,
+                            "extractedFrameHeight":    h,
+                            "method":                  "AVAssetImageGenerator",
+                            "rotationHandling":        "appliesPreferredTrackTransform",
+                            "displayTransformApplied": true,
+                            "requestedTimeSeconds":    0.0,
+                            "actualTimeSeconds":       actualSec,
+                        ] as [String: Any])
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        result(FlutterError(
+                            code: "DECODE_FAILED",
+                            message: "extractDisplayOrientedFrameEvidence: \(error.localizedDescription)",
+                            details: nil))
+                    }
+                }
+            }
+
         // ── Camera ────────────────────────────────────────────────────────────
 
         case "startCamera":
