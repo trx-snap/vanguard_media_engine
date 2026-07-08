@@ -1015,6 +1015,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 let hasRotationTransform = (transform.a != 1.0 || transform.b != 0.0 ||
                                             transform.c != 0.0 || transform.d != 1.0)
 
+                // ROI-5A.1: orientation evidence extraction (pure math, no I/O).
+                let orientationEvidence = VGOrientationEvidence.extract(
+                    naturalSize: size,
+                    preferredTransform: transform
+                )
+
                 // Video codec — read FourCC from first format description
                 var videoCodec = ""
                 if let fmtDesc = videoTrack?.formatDescriptions.first {
@@ -1087,7 +1093,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 else                            { kind = "unknown" }
 
                 DispatchQueue.main.async {
-                    result([
+                    // Base fields — all existing keys are preserved unchanged.
+                    var resultMap: [String: Any] = [
                         "kind":                  kind,
                         "container":             container,
                         "videoCodec":            videoCodec,
@@ -1104,9 +1111,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         "hasMoovAtFront":        hasMoovAtFront,
                         "hasRotationTransform":  hasRotationTransform,
                         "hasEmbeddedMetadata":   hasEmbeddedMetadata,
-                    ] as [String: Any])
+                    ]
+                    // ROI-5A.1 orientation evidence fields (additive — never
+                    // overwrite existing keys above).
+                    for (key, value) in orientationEvidence.toFlutterMap() {
+                        resultMap[key] = value
+                    }
+                    result(resultMap)
                 }
             }
+
 
         // ── compressImage ─────────────────────────────────────────────────────────
         // Resizes and JPEG-encodes an image file using CGImageDestination.

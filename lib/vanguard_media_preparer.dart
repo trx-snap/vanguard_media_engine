@@ -48,6 +48,20 @@ class MediaInfo {
     required this.hasMoovAtFront,
     required this.hasRotationTransform,
     required this.hasEmbeddedMetadata,
+    // ── ROI-5A.1 Orientation Evidence ──────────────────────────────────────
+    // Additive fields. Existing width/height remain encoded/raw (naturalSize).
+    this.encodedWidth  = 0,
+    this.encodedHeight = 0,
+    this.displayWidth  = 0,
+    this.displayHeight = 0,
+    this.rotationDegrees,
+    this.transformA  = 1.0,
+    this.transformB  = 0.0,
+    this.transformC  = 0.0,
+    this.transformD  = 1.0,
+    this.transformTx = 0.0,
+    this.transformTy = 0.0,
+    this.orientationStatus = 'valid',
   });
 
   final MediaKind kind;
@@ -61,6 +75,10 @@ class MediaInfo {
   /// Audio codec: 'aac', 'ac3', 'mp3', 'opus', '' if no audio track or unknown.
   final String audioCodec;
 
+  /// Raw encoded pixel dimensions from the video track's naturalSize.
+  /// These are the on-disk dimensions before any preferredTransform rotation is
+  /// applied. Do NOT swap for rotated videos — use [displayWidth]/[displayHeight]
+  /// when you need the correct display orientation.
   final int width;
   final int height;
 
@@ -92,6 +110,57 @@ class MediaInfo {
   /// True if the file contains embedded metadata (GPS, device info, etc.).
   final bool hasEmbeddedMetadata;
 
+  // ── ROI-5A.1 Orientation Evidence (additive) ─────────────────────────────
+
+  /// Raw encoded pixel width (same as [width]). Provided for semantic clarity
+  /// in code that explicitly documents which dimension space it operates in.
+  final int encodedWidth;
+
+  /// Raw encoded pixel height (same as [height]). Provided for semantic clarity
+  /// in code that explicitly documents which dimension space it operates in.
+  final int encodedHeight;
+
+  /// Display pixel width after applying the video track's preferredTransform.
+  /// For 0°/180° rotation this equals [encodedWidth].
+  /// For 90°/270° rotation this equals [encodedHeight].
+  /// 0 if there is no video track.
+  final int displayWidth;
+
+  /// Display pixel height after applying the video track's preferredTransform.
+  /// For 0°/180° rotation this equals [encodedHeight].
+  /// For 90°/270° rotation this equals [encodedWidth].
+  /// 0 if there is no video track.
+  final int displayHeight;
+
+  /// Rotation in degrees (0, 90, 180, or 270) for cardinal, non-mirrored
+  /// transforms. Null for mirrored, non-cardinal, ambiguous, or missing tracks.
+  final int? rotationDegrees;
+
+  /// The six components of the video track's preferredTransform matrix.
+  /// Default to identity (a=1,b=0,c=0,d=1,tx=0,ty=0) when not available.
+  final double transformA;
+  final double transformB;
+  final double transformC;
+  final double transformD;
+  final double transformTx;
+  final double transformTy;
+
+  /// Classification of the orientation metadata:
+  /// - 'valid'        : Supported cardinal rotation (0/90/180/270), no mirroring.
+  /// - 'validMirrored': Cardinal rotation + horizontal mirror (e.g. front camera).
+  ///                    ROI is blocked until a mirror coordinate policy is defined.
+  /// - 'ambiguous'    : Non-orthogonal matrix, shear, non-unit scale, or degenerate.
+  ///                    ROI must not be generated for ambiguous videos.
+  /// - 'noVideoTrack' : No video track exists.
+  /// Defaults to 'valid' so that older native responses remain fully compatible.
+  final String orientationStatus;
+
+  /// True when the display height is greater than the display width.
+  bool get isPortraitDisplay => displayHeight > displayWidth;
+
+  /// True when the display width is greater than or equal to the display height.
+  bool get isLandscapeDisplay => displayWidth >= displayHeight;
+
   int get shortestSide => min(width, height);
 
   static MediaInfo _fromRaw(Map<dynamic, dynamic> raw) {
@@ -102,13 +171,15 @@ class MediaInfo {
       'audio' => MediaKind.audio,
       _       => MediaKind.unknown,
     };
+    final rawWidth  = (raw['width']  as num?)?.toInt() ?? 0;
+    final rawHeight = (raw['height'] as num?)?.toInt() ?? 0;
     return MediaInfo(
       kind:                  kind,
       container:             raw['container']             as String? ?? '',
       videoCodec:            raw['videoCodec']            as String? ?? '',
       audioCodec:            raw['audioCodec']            as String? ?? '',
-      width:                 (raw['width']                as num?)?.toInt() ?? 0,
-      height:                (raw['height']               as num?)?.toInt() ?? 0,
+      width:                 rawWidth,
+      height:                rawHeight,
       durationSeconds:       (raw['durationSeconds']      as num?)?.toDouble() ?? -1.0,
       bitrateKbps:           (raw['bitrateKbps']          as num?)?.toInt() ?? 0,
       fps:                   (raw['fps']                  as num?)?.toDouble() ?? 0.0,
@@ -119,6 +190,20 @@ class MediaInfo {
       hasMoovAtFront:        raw['hasMoovAtFront']        as bool? ?? false,
       hasRotationTransform:  raw['hasRotationTransform']  as bool? ?? false,
       hasEmbeddedMetadata:   raw['hasEmbeddedMetadata']   as bool? ?? false,
+      // ROI-5A.1 Orientation Evidence — fall back to raw width/height when
+      // the native side does not yet return these keys (older plugin builds).
+      encodedWidth:     (raw['encodedWidth']     as num?)?.toInt() ?? rawWidth,
+      encodedHeight:    (raw['encodedHeight']    as num?)?.toInt() ?? rawHeight,
+      displayWidth:     (raw['displayWidth']     as num?)?.toInt() ?? rawWidth,
+      displayHeight:    (raw['displayHeight']    as num?)?.toInt() ?? rawHeight,
+      rotationDegrees:  (raw['rotationDegrees']  as num?)?.toInt(),
+      transformA:  (raw['transformA']  as num?)?.toDouble() ?? 1.0,
+      transformB:  (raw['transformB']  as num?)?.toDouble() ?? 0.0,
+      transformC:  (raw['transformC']  as num?)?.toDouble() ?? 0.0,
+      transformD:  (raw['transformD']  as num?)?.toDouble() ?? 1.0,
+      transformTx: (raw['transformTx'] as num?)?.toDouble() ?? 0.0,
+      transformTy: (raw['transformTy'] as num?)?.toDouble() ?? 0.0,
+      orientationStatus: raw['orientationStatus'] as String? ?? 'valid',
     );
   }
 
@@ -126,7 +211,8 @@ class MediaInfo {
   String toString() =>
       'MediaInfo(kind=$kind container=$container codec=$videoCodec '
       '${width}x$height ${durationSeconds.toStringAsFixed(1)}s '
-      '${bitrateKbps}kbps HDR=$isHDR rotation=$hasRotationTransform meta=$hasEmbeddedMetadata)';
+      '${bitrateKbps}kbps HDR=$isHDR rotation=$hasRotationTransform '
+      'orientation=$orientationStatus display=${displayWidth}x$displayHeight meta=$hasEmbeddedMetadata)';
 }
 
 // ─── UploadConstraints ───────────────────────────────────────────────────────
@@ -347,11 +433,13 @@ class VanguardMediaPreparer {
     if (info == null) {
       return PrepareResult._reject(
         // Return a minimal fallback info for the rejected result
-        MediaInfo(
+        const MediaInfo(
           kind: MediaKind.unknown, container: '', videoCodec: '', audioCodec: '',
           width: 0, height: 0, durationSeconds: -1, bitrateKbps: 0, fps: 0,
           fileSizeBytes: 0, hasVideo: false, hasAudio: false, isHDR: false,
           hasMoovAtFront: false, hasRotationTransform: false, hasEmbeddedMetadata: false,
+          // Orientation evidence defaults — safe for rejected/unknown files.
+          orientationStatus: 'noVideoTrack',
         ),
         'File is missing or unreadable',
       );

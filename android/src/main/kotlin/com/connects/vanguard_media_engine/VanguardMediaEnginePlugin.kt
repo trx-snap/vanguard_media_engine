@@ -199,6 +199,43 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                         val rotationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
                         val hasRotationTransform = (rotationStr?.toIntOrNull() ?: 0) != 0
 
+                        // ROI-5A.1 — Orientation evidence from integer rotation metadata.
+                        // Android MediaMetadataRetriever returns rotation as 0/90/180/270 or null.
+                        // Mirroring is not exposed via this API; validMirrored is iOS-only.
+                        val rotationDeg = rotationStr?.toIntOrNull()
+                        val isCardinal = rotationDeg != null &&
+                            (rotationDeg == 0 || rotationDeg == 90 || rotationDeg == 180 || rotationDeg == 270)
+
+                        val hasVideoTrack = w > 0 && h > 0
+                        val orientationStatus = when {
+                            !hasVideoTrack -> "noVideoTrack"
+                            isCardinal     -> "valid"
+                            else           -> "ambiguous"
+                        }
+
+                        // Display dimensions: swap for 90°/270°.
+                        val displayW: Int
+                        val displayH: Int
+                        if (hasVideoTrack && isCardinal &&
+                            (rotationDeg == 90 || rotationDeg == 270)) {
+                            displayW = h
+                            displayH = w
+                        } else {
+                            displayW = w
+                            displayH = h
+                        }
+
+                        // Synthesize matrix values from integer rotation for cross-platform parity.
+                        // Camera-produced clips are 0° (identity); gallery clips may differ.
+                        val tA: Double; val tB: Double; val tC: Double; val tD: Double
+                        when (if (isCardinal) rotationDeg else 0) {
+                            90  -> { tA =  0.0; tB =  1.0; tC = -1.0; tD =  0.0 }
+                            180 -> { tA = -1.0; tB =  0.0; tC =  0.0; tD = -1.0 }
+                            270 -> { tA =  0.0; tB = -1.0; tC =  1.0; tD =  0.0 }
+                            else -> { tA =  1.0; tB =  0.0; tC =  0.0; tD =  1.0 }
+                        }
+
+
                         // Embedded GPS metadata
                         val location = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_LOCATION)
                         val hasEmbeddedMetadata = location != null
@@ -287,7 +324,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                         val hasMoovAtFront = false
 
                         mainHandler.post {
-                            result.success(mapOf(
+                            // Build result map. Existing keys are preserved unchanged.
+                            val resultMap = mutableMapOf<String, Any?>(
                                 "kind"                 to kind,
                                 "container"            to container,
                                 "videoCodec"           to videoCodec,
@@ -304,8 +342,24 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                                 "hasMoovAtFront"       to hasMoovAtFront,
                                 "hasRotationTransform" to hasRotationTransform,
                                 "hasEmbeddedMetadata"  to hasEmbeddedMetadata,
-                            ))
+                                // ROI-5A.1 orientation evidence (additive).
+                                "encodedWidth"         to w,
+                                "encodedHeight"        to h,
+                                "displayWidth"         to displayW,
+                                "displayHeight"        to displayH,
+                                // rotationDegrees: null when non-cardinal or no track.
+                                "rotationDegrees"      to if (isCardinal) rotationDeg else null,
+                                "transformA"           to tA,
+                                "transformB"           to tB,
+                                "transformC"           to tC,
+                                "transformD"           to tD,
+                                "transformTx"          to 0.0,
+                                "transformTy"          to 0.0,
+                                "orientationStatus"    to orientationStatus,
+                            )
+                            result.success(resultMap)
                         }
+
                     } catch (e: Exception) {
                         Log.e(TAG, "inspectMedia: $e")
                         mainHandler.post {
