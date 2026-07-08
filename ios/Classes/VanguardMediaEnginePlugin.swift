@@ -8,6 +8,7 @@ import Flutter
 import UIKit
 import Metal
 import AVFoundation
+import Vision
 
 // ─── P1-T4: Engine Mode ───────────────────────────────────────────────────────
 
@@ -3288,7 +3289,159 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
             }
 
+        // ── ROI-5C.1: Imported face scan evidence ─────────────────────────────
+        //
+        // Diagnostic-only. Extracts one display-oriented frame via AVAssetImageGenerator
+        // (same path as extractDisplayOrientedFrameEvidence) then runs
+        // VNDetectFaceRectanglesRequest with orientation .up (frame is already
+        // display-oriented). Returns face bounding boxes in three coordinate spaces:
+        //   - Vision raw (bottom-left normalized origin, per Vision convention)
+        //   - Top-left normalized (Vision y-axis inverted: normalizedY = 1.0 - visionY - visionH)
+        //   - Display pixel (normalizedX/Y * frameWidth/Height)
+        //
+        // No ROI sidecar. No file writes. No landmarks. No export integration.
+        // iOS only — Android returns UNSUPPORTED_PLATFORM until ROI-5B Android smoke passes.
+
+        case "extractImportedFaceScanEvidence":
+            guard
+                let videoPath = args?["videoPath"] as? String,
+                !videoPath.isEmpty
+            else {
+                result(FlutterError(code: "INVALID_ARG",
+                                    message: "extractImportedFaceScanEvidence: videoPath required",
+                                    details: nil))
+                return
+            }
+            DispatchQueue.global(qos: .utility).async {
+                let url   = URL(fileURLWithPath: videoPath)
+                let asset = AVURLAsset(url: url,
+                                       options: [AVURLAssetPreferPreciseDurationAndTimingKey: false])
+
+                // ── Step 1: Extract display-oriented frame ─────────────────────
+                // Reuses identical AVAssetImageGenerator configuration as
+                // extractDisplayOrientedFrameEvidence (ROI-5B.1).
+                let gen = AVAssetImageGenerator(asset: asset)
+                gen.appliesPreferredTrackTransform = true
+                gen.maximumSize = .zero  // full display-native resolution
+
+                let requestedTime = CMTime(seconds: 0, preferredTimescale: 600)
+                var actualTime    = CMTime.zero
+
+                let cgImage: CGImage
+                do {
+                    cgImage = try gen.copyCGImage(at: requestedTime, actualTime: &actualTime)
+                } catch {
+                    DispatchQueue.main.async {
+                        result(FlutterError(
+                            code: "DECODE_FAILED",
+                            message: "extractImportedFaceScanEvidence frame extraction: \(error.localizedDescription)",
+                            details: nil))
+                    }
+                    return
+                }
+
+                let frameWidth  = cgImage.width
+                let frameHeight = cgImage.height
+                let actualSec   = CMTimeGetSeconds(actualTime)
+
+                // ── Step 2: Run Vision face rectangle detection ────────────────
+                // Frame is already display-oriented (appliesPreferredTrackTransform=true),
+                // so Vision orientation is .up — no rotation math required.
+                let faceRequest = VNDetectFaceRectanglesRequest()
+                let handler = VNImageRequestHandler(cgImage: cgImage,
+                                                    orientation: .up,
+                                                    options: [:])
+
+                // Release cgImage reference after Vision finishes; CGImage is
+                // ref-counted so capture in the closure keeps it alive until here.
+                let visionError: Error?
+                do {
+                    try handler.perform([faceRequest])
+                    visionError = nil
+                } catch {
+                    visionError = error
+                }
+
+                if let err = visionError {
+                    DispatchQueue.main.async {
+                        result(FlutterError(
+                            code: "VISION_FAILED",
+                            message: "extractImportedFaceScanEvidence Vision: \(err.localizedDescription)",
+                            details: nil))
+                    }
+                    return
+                }
+
+                // ── Step 3: Convert bounding boxes ────────────────────────────
+                // Vision boundingBox origin is bottom-left [0,1].
+                // Top-left normalized: normalizedY = 1.0 - visionY - visionH.
+                // Pixel: normalizedX * frameWidth, normalizedY * frameHeight.
+                let observations = faceRequest.results as? [VNFaceObservation] ?? []
+                var faceMaps: [[String: Any]] = []
+
+                for (idx, obs) in observations.enumerated() {
+                    let box = obs.boundingBox
+
+                    let visionX = Double(box.origin.x)
+                    let visionY = Double(box.origin.y)
+                    let visionW = Double(box.size.width)
+                    let visionH = Double(box.size.height)
+
+                    // y-axis inversion: Vision is bottom-left, UI is top-left.
+                    let normX = visionX
+                    let normY = 1.0 - visionY - visionH
+                    let normW = visionW
+                    let normH = visionH
+
+                    // Clamp to [0,1] to guard against floating-point edge drift.
+                    let clampedNormX = min(max(normX, 0.0), 1.0)
+                    let clampedNormY = min(max(normY, 0.0), 1.0)
+                    let clampedNormW = min(max(normW, 0.0), 1.0 - clampedNormX)
+                    let clampedNormH = min(max(normH, 0.0), 1.0 - clampedNormY)
+                    let wasClamped   = (clampedNormX != normX || clampedNormY != normY
+                                        || clampedNormW != normW || clampedNormH != normH)
+
+                    let pixelX = clampedNormX * Double(frameWidth)
+                    let pixelY = clampedNormY * Double(frameHeight)
+                    let pixelW = clampedNormW * Double(frameWidth)
+                    let pixelH = clampedNormH * Double(frameHeight)
+
+                    faceMaps.append([
+                        "index":           idx,
+                        "visionX":         visionX,
+                        "visionY":         visionY,
+                        "visionWidth":     visionW,
+                        "visionHeight":    visionH,
+                        "normalizedX":     clampedNormX,
+                        "normalizedY":     clampedNormY,
+                        "normalizedWidth": clampedNormW,
+                        "normalizedHeight":clampedNormH,
+                        "pixelX":          pixelX,
+                        "pixelY":          pixelY,
+                        "pixelWidth":      pixelW,
+                        "pixelHeight":     pixelH,
+                        "clamped":         wasClamped,
+                    ])
+                }
+
+                DispatchQueue.main.async {
+                    result([
+                        "frameWidth":           frameWidth,
+                        "frameHeight":          frameHeight,
+                        "method":               "VNDetectFaceRectanglesRequest",
+                        "frameExtractionMethod":"AVAssetImageGenerator",
+                        "visionOrientation":    "up",
+                        "coordinateSpace":      "displayTopLeftNormalizedAndPixels",
+                        "faceCount":            observations.count,
+                        "faces":                faceMaps,
+                        "requestedTimeSeconds": 0.0,
+                        "actualTimeSeconds":    actualSec,
+                    ] as [String: Any])
+                }
+            }
+
         // ── Camera ────────────────────────────────────────────────────────────
+
 
         case "startCamera":
             let positionInt = args?["position"] as? Int ?? 1  // 1=back, 2=front

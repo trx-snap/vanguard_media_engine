@@ -451,6 +451,70 @@ class VanguardMediaPreparer {
     }
   }
 
+  // ── extractImportedFaceScanEvidence ───────────────────────────────────────
+
+  /// ROI-5C.1 — Diagnostic method for imported face scan evidence (iOS only).
+  ///
+  /// Extracts one display-oriented frame from [videoPath] using
+  /// [AVAssetImageGenerator] with `appliesPreferredTrackTransform = true`
+  /// (same path as [extractDisplayOrientedFrameEvidence]) and then runs
+  /// Apple Vision [VNDetectFaceRectanglesRequest] on that display-oriented
+  /// frame with orientation `.up`.
+  ///
+  /// Returns face bounding boxes in three coordinate spaces per face:
+  /// - Vision raw (bottom-left normalized origin, Vision convention)
+  /// - Top-left normalized: `normalizedY = 1.0 - visionY - visionHeight`
+  /// - Display pixel: `normalizedX * frameWidth`, `normalizedY * frameHeight`
+  ///
+  /// **This method is diagnostic only.** It does not generate ROI sidecars,
+  /// write files, perform landmarks, or alter any export/capture path.
+  ///
+  /// **Android is not supported** for this slice — Android ROI-5C is blocked
+  /// until Android ROI-5B frame-extraction physical smoke passes. On Android,
+  /// the native side returns a [PlatformException] with code
+  /// `UNSUPPORTED_PLATFORM`, which is caught here and returned as null.
+  ///
+  /// Returns null if:
+  /// - The file does not exist or is empty.
+  /// - Native frame extraction or Vision detection fails.
+  ///
+  /// Expected returned map keys:
+  /// - `frameWidth` (int): display-oriented frame pixel width
+  /// - `frameHeight` (int): display-oriented frame pixel height
+  /// - `method` (String): `'VNDetectFaceRectanglesRequest'`
+  /// - `frameExtractionMethod` (String): `'AVAssetImageGenerator'`
+  /// - `visionOrientation` (String): `'up'`
+  /// - `coordinateSpace` (String): `'displayTopLeftNormalizedAndPixels'`
+  /// - `faceCount` (int): number of faces detected (0 is valid — no error)
+  /// - `faces` (List): one map per face, each with:
+  ///   - `index`, `visionX`, `visionY`, `visionWidth`, `visionHeight`
+  ///   - `normalizedX`, `normalizedY`, `normalizedWidth`, `normalizedHeight`
+  ///   - `pixelX`, `pixelY`, `pixelWidth`, `pixelHeight`
+  ///   - `clamped` (bool): true if any value was clamped to [0,1] range
+  /// - `requestedTimeSeconds` (double): timestamp requested (always 0.0)
+  /// - `actualTimeSeconds` (double): actual frame timestamp decoded
+  static Future<Map<String, dynamic>?> extractImportedFaceScanEvidence({
+    required String videoPath,
+  }) async {
+    final file = File(videoPath);
+    if (!file.existsSync() || file.lengthSync() == 0) return null;
+
+    try {
+      final raw = await _channel.invokeMethod<Map>(
+        'extractImportedFaceScanEvidence',
+        {'videoPath': videoPath},
+      );
+      if (raw == null) return null;
+      return Map<String, dynamic>.from(raw);
+    } on PlatformException catch (e) {
+      debugPrint(
+        'VanguardMediaPreparer.extractImportedFaceScanEvidence error: '
+        '${e.message}',
+      );
+      return null;
+    }
+  }
+
   // ── prepareForUpload ──────────────────────────────────────────────────────
 
   /// Universal upload preparation pipeline.

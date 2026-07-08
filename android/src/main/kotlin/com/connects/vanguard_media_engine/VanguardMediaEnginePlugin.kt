@@ -494,6 +494,18 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 }.start()
             }
 
+            // ROI-5C.1 Android stub — blocked until ROI-5B Android smoke passes.
+            // Android face detection is NOT implemented in this slice.
+            // Returns UNSUPPORTED_PLATFORM so Dart can handle it gracefully.
+            "extractImportedFaceScanEvidence" -> {
+                result.error(
+                    "UNSUPPORTED_PLATFORM",
+                    "ROI-5C Android face scan evidence is blocked until " +
+                        "ROI-5B Android smoke passes",
+                    null,
+                )
+            }
+
 
             "createImageTexture" -> {
 
