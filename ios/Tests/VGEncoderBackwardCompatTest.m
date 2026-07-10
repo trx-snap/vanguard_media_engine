@@ -32,13 +32,15 @@
             packetHandler:^(NSData *data, CMTime pts, BOOL kf, NSError *err) {}];
 }
 
-/// Creates a small encoder with the new 8-arg init.
-- (VanguardVideoToolboxEncoder *)make8ArgEncoderUsage:(VGEncoderUsage)usage {
+/// Creates a small encoder with the new 9-arg designated init.
+/// quality:0.0f selects bitrate-driven mode (quality-driven CQ mode disabled).
+- (VanguardVideoToolboxEncoder *)make9ArgEncoderUsage:(VGEncoderUsage)usage {
     return [[VanguardVideoToolboxEncoder alloc]
             initWithWidth:192 height:108 bitrate:500000 fps:30
                 codecType:kCMVideoCodecType_H264
              profileLevel:(__bridge NSString *)kVTProfileLevel_H264_High_4_0
                     usage:usage
+                 quality:0.0f
             packetHandler:nil];
 }
 
@@ -72,29 +74,29 @@
 
 // ─── Test 3: 8-arg init exists ───────────────────────────────────────────────
 
-- (void)test8ArgInitExists {
-    VanguardVideoToolboxEncoder *enc = [self make8ArgEncoderUsage:VGEncoderUsageRealtime];
-    XCTAssertNotNil(enc, @"8-arg init must return non-nil");
+- (void)test9ArgInitExists {
+    VanguardVideoToolboxEncoder *enc = [self make9ArgEncoderUsage:VGEncoderUsageRealtime];
+    XCTAssertNotNil(enc, @"9-arg designated init must return non-nil");
 }
 
 // ─── Test 4: 8-arg init realtime produces ready session ──────────────────────
 
-- (void)test8ArgInitRealtimeProducesReadySession {
-    VanguardVideoToolboxEncoder *enc = [self make8ArgEncoderUsage:VGEncoderUsageRealtime];
+- (void)test9ArgInitRealtimeProducesReadySession {
+    VanguardVideoToolboxEncoder *enc = [self make9ArgEncoderUsage:VGEncoderUsageRealtime];
     XCTSkipIf(!enc.isReady,
               @"VT session creation failed — skip on this environment");
     XCTAssertTrue(enc.isReady,
-                  @"8-arg init (Realtime): isReady must be YES after successful session");
+                  @"9-arg init (Realtime): isReady must be YES after successful session");
 }
 
 // ─── Test 5: 8-arg init offline produces ready session ───────────────────────
 
-- (void)test8ArgInitOfflineProducesReadySession {
-    VanguardVideoToolboxEncoder *enc = [self make8ArgEncoderUsage:VGEncoderUsageOffline];
+- (void)test9ArgInitOfflineProducesReadySession {
+    VanguardVideoToolboxEncoder *enc = [self make9ArgEncoderUsage:VGEncoderUsageOffline];
     XCTSkipIf(!enc.isReady,
               @"VT session creation failed — skip on this environment");
     XCTAssertTrue(enc.isReady,
-                  @"8-arg init (Offline): isReady must be YES after successful session");
+                  @"9-arg init (Offline): isReady must be YES after successful session");
 }
 
 // ─── Test 6: invalidateOnce is idempotent (no crash on double call) ───────────

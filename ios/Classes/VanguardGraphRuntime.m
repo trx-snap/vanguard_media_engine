@@ -164,6 +164,11 @@ static BOOL VGRIsImageURL(NSURL *url) {
 @property(nonatomic, assign) BOOL timelineNeedsPreviewFrame;
 #endif
 
+- (NSDictionary *)vg_timelineFrameArgumentsForPTS:(double)pts
+                                        generation:(NSInteger)generation;
+
+- (NSDictionary *)vg_timelineEOSArguments;
+
 @end
 
 // ─── VGGraphRuntime Base Implementation
@@ -2052,11 +2057,10 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
         typeof(self) ss = weakSelf;
         if (!ss || ss->_invalidated)
           return;
-        [ss.methodChannel invokeMethod:@"onTimelineFrame"
-                             arguments:@{
-                               @"pts" : @(pts_s),
-                               @"generation" : @(generation)
-                             }];
+        [ss.methodChannel
+            invokeMethod:@"onTimelineFrame"
+               arguments:[ss vg_timelineFrameArgumentsForPTS:pts_s
+                                                  generation:generation]];
       });
       break;
     }
@@ -2070,7 +2074,9 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
         if (!ss || ss->_invalidated)
           return;
         ss.timelineIsPlaying = NO;
-        [ss.methodChannel invokeMethod:@"onTimelineEOS" arguments:nil];
+        [ss.methodChannel
+            invokeMethod:@"onTimelineEOS"
+               arguments:[ss vg_timelineEOSArguments]];
         NSLog(@"[VanguardGraphRuntime][7.5C] timeline EOS reached "
                "PTS=%.3f",
               currentPTS);
@@ -2199,5 +2205,27 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
 }
 
 #endif // VG_USE_V2_GRAPH
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Channel payload helpers
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Private instance helpers — single authoritative source for argument
+// dictionary shapes used by production dispatch sites and the
+// VGGraphRuntimeLifecycleTest argument-capture seams. Kept implementation-
+// private; declared only in the class extension above.
+
+- (NSDictionary *)vg_timelineFrameArgumentsForPTS:(double)pts
+                                        generation:(NSInteger)generation {
+  return @{
+    @"textureId" : @(self.textureId),
+    @"pts"       : @(pts),
+    @"generation": @(generation)
+  };
+}
+
+- (NSDictionary *)vg_timelineEOSArguments {
+  return @{@"textureId" : @(self.textureId)};
+}
 
 @end

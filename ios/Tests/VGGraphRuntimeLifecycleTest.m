@@ -37,6 +37,10 @@
 // SUT
 #import "VanguardGraphRuntime.h"
 
+// VanguardMetalRenderer imported for the onPlaybackComplete payload helper
+// used by the testSeam_sendOnPlaybackComplete argument-capture seam.
+#import "VanguardMetalRenderer.h"
+
 // UMF contracts needed for mock construction
 #import <UMF/VGGraphRuntime.h>
 #import <UMF/VGMediaNode.h>
@@ -87,19 +91,24 @@
 #pragma mark - Mock: Flutter method channel
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Minimal stub that satisfies the FlutterMethodChannel pointer requirement.
-/// All invocations are silently dropped — the runtime only uses this for
-/// onPlaybackComplete callbacks which do not occur in unit tests.
+/// Minimal spy stub that satisfies the FlutterMethodChannel pointer requirement.
+/// Records each invocation so tests can assert method names and argument shapes.
 @interface VGMockMethodChannel : NSObject
 // Declared as NSObject because FlutterMethodChannel is a concrete class;
 // we pass it wherever FlutterMethodChannel * is expected using a cast.
 @property(nonatomic, readonly) NSInteger invokeCallCount;
+/// Name of the most recently invoked method. nil before first call.
+@property(nonatomic, strong, nullable) NSString *lastMethod;
+/// Arguments supplied to the most recent invocation. nil before first call.
+@property(nonatomic, strong, nullable) id lastArguments;
 - (void)invokeMethod:(NSString *)method arguments:(id)arguments;
 @end
 
 @implementation VGMockMethodChannel
 - (void)invokeMethod:(NSString *)method arguments:(id)arguments {
   _invokeCallCount++;
+  _lastMethod = [method copy];
+  _lastArguments = arguments;
 }
 @end
 
@@ -217,6 +226,21 @@
 @interface VanguardGraphRuntime (TestSeam)
 @property(nonatomic, readwrite) VGRuntimeState state;
 @property(nonatomic, readwrite) int64_t textureId;
+/// Read-only access to the stored method channel (for argument-capture tests).
+@property(nonatomic, readonly) FlutterMethodChannel *methodChannel;
+@end
+
+// Test-only categories that redeclare the private payload helpers from
+// VanguardGraphRuntime.m and VanguardMetalRenderer.m so that the test seams
+// can call them without requiring public-header exposure.
+@interface VanguardGraphRuntime (TestSeamPrivatePayloadHelpers)
+- (NSDictionary *)vg_timelineFrameArgumentsForPTS:(double)pts
+                                        generation:(NSInteger)generation;
+- (NSDictionary *)vg_timelineEOSArguments;
+@end
+
+@interface VanguardMetalRenderer (TestSeamPrivatePayloadHelpers)
++ (NSDictionary *)vg_playbackCompleteArgumentsForTextureId:(int64_t)textureId;
 @end
 
 @implementation VGTestableGraphRuntime
@@ -322,6 +346,36 @@
 /// Override seekTo: — no-op in mock; state unchanged.
 - (void)seekTo:(double)seconds {
   // no-op: state contract says seekTo does not change state.
+}
+
+// ── Argument-capture test seams ────────────────────────────────────────────
+// These methods simulate the dispatch blocks that the production pull loop
+// executes on the main queue. They call the PRODUCTION payload helpers
+// (VanguardGraphRuntime / VanguardMetalRenderer class methods) so that a
+// dict key change in production immediately breaks the corresponding seam.
+
+/// Simulates an onTimelineFrame callback with the given pts and generation.
+- (void)testSeam_sendOnTimelineFrameWithPts:(double)pts
+                                 generation:(NSInteger)generation {
+  [self.methodChannel
+      invokeMethod:@"onTimelineFrame"
+         arguments:[self vg_timelineFrameArgumentsForPTS:pts
+                                              generation:generation]];
+}
+
+/// Simulates an onTimelineEOS callback.
+- (void)testSeam_sendOnTimelineEOS {
+  [self.methodChannel
+      invokeMethod:@"onTimelineEOS"
+         arguments:[self vg_timelineEOSArguments]];
+}
+
+/// Simulates an onPlaybackComplete callback (mirroring VanguardMetalRenderer).
+- (void)testSeam_sendOnPlaybackComplete {
+  [self.methodChannel
+      invokeMethod:@"onPlaybackComplete"
+         arguments:[VanguardMetalRenderer
+                       vg_playbackCompleteArgumentsForTextureId:self.textureId]];
 }
 
 @end
@@ -738,6 +792,140 @@ static NSURL *stubURL(void) {
                  @"registerCallCount must be 1 after one registration");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Argument-capture tests for native → Dart callbacks
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// These tests verify that each native callback supplies the correct keys and
+// value types in its argument dictionary. They are simulator-safe and
+// deterministic: no real Metal GPU, no media assets, no wall-clock waits.
+
+/// Verifies that onTimelineFrame includes:
+///   - "textureId"  : NSNumber (int64) equal to the prepared textureId
+///   - "pts"        : NSNumber (double) equal to the supplied pts
+///   - "generation" : NSNumber (NSInteger) equal to the supplied generation
+- (void)testOnTimelineFrameArgumentCapture {
+  VGMockMethodChannel *channel = [[VGMockMethodChannel alloc] init];
+  VGMockTextureRegistry *registry = [[VGMockTextureRegistry alloc] init];
+  VGTestableGraphRuntime *rt = [[VGTestableGraphRuntime alloc]
+      initWithTextureRegistry:registry
+                methodChannel:(FlutterMethodChannel *)channel];
+
+  XCTestExpectation *prepExp = [self expectationWithDescription:@"prepare"];
+  [rt prepareWithURL:stubURL()
+          completion:^(int64_t tid, NSError *err) {
+            XCTAssertNil(err);
+            [prepExp fulfill];
+          }];
+  [self waitForExpectations:@[ prepExp ] timeout:kTimeout];
+
+  // textureId was assigned 42 by the mock registry.
+  XCTAssertEqual(rt.textureId, 42LL);
+
+  // Trigger the callback.
+  [rt testSeam_sendOnTimelineFrameWithPts:1.25 generation:7];
+
+  XCTAssertEqualObjects(channel.lastMethod, @"onTimelineFrame",
+                        @"method must be 'onTimelineFrame'");
+
+  NSDictionary *args = channel.lastArguments;
+  XCTAssertNotNil(args, @"arguments must not be nil");
+
+  NSNumber *textureIdNum = args[@"textureId"];
+  XCTAssertNotNil(textureIdNum, @"'textureId' key must be present");
+  XCTAssertEqual(textureIdNum.longLongValue, 42LL,
+                 @"textureId must equal the prepared textureId (42)");
+
+  NSNumber *ptsNum = args[@"pts"];
+  XCTAssertNotNil(ptsNum, @"'pts' key must be present");
+  XCTAssertEqualWithAccuracy(ptsNum.doubleValue, 1.25, 0.0001,
+                             @"pts must match the supplied value");
+
+  NSNumber *genNum = args[@"generation"];
+  XCTAssertNotNil(genNum, @"'generation' key must be present");
+  XCTAssertEqual(genNum.integerValue, 7,
+                 @"generation must match the supplied value");
+}
+
+/// Verifies that onTimelineEOS includes:
+///   - "textureId" : NSNumber (int64) equal to the prepared textureId
+- (void)testOnTimelineEOSArgumentCapture {
+  VGMockMethodChannel *channel = [[VGMockMethodChannel alloc] init];
+  VGMockTextureRegistry *registry = [[VGMockTextureRegistry alloc] init];
+  VGTestableGraphRuntime *rt = [[VGTestableGraphRuntime alloc]
+      initWithTextureRegistry:registry
+                methodChannel:(FlutterMethodChannel *)channel];
+
+  XCTestExpectation *prepExp = [self expectationWithDescription:@"prepare"];
+  [rt prepareWithURL:stubURL()
+          completion:^(int64_t tid, NSError *err) {
+            XCTAssertNil(err);
+            [prepExp fulfill];
+          }];
+  [self waitForExpectations:@[ prepExp ] timeout:kTimeout];
+
+  XCTAssertEqual(rt.textureId, 42LL);
+
+  [rt testSeam_sendOnTimelineEOS];
+
+  XCTAssertEqualObjects(channel.lastMethod, @"onTimelineEOS",
+                        @"method must be 'onTimelineEOS'");
+
+  NSDictionary *args = channel.lastArguments;
+  XCTAssertNotNil(args, @"arguments must not be nil");
+
+  NSNumber *textureIdNum = args[@"textureId"];
+  XCTAssertNotNil(textureIdNum, @"'textureId' key must be present");
+  XCTAssertEqual(textureIdNum.longLongValue, 42LL,
+                 @"textureId must equal the prepared textureId (42)");
+
+  // EOS must carry no extra keys — the dispatcher routes on textureId alone.
+  XCTAssertEqual(args.count, 1U,
+                 @"onTimelineEOS args must contain exactly one key ('textureId')");
+}
+
+/// Verifies that onPlaybackComplete includes:
+///   - "textureId" : NSNumber (int64) equal to the prepared textureId
+///
+/// Note: in production, onPlaybackComplete is emitted by VanguardMetalRenderer.
+/// This test exercises the same argument contract via the shared test seam so
+/// that payload-shape changes in the renderer are caught by a corresponding
+/// update to testSeam_sendOnPlaybackComplete.
+- (void)testOnPlaybackCompleteArgumentCapture {
+  VGMockMethodChannel *channel = [[VGMockMethodChannel alloc] init];
+  VGMockTextureRegistry *registry = [[VGMockTextureRegistry alloc] init];
+  VGTestableGraphRuntime *rt = [[VGTestableGraphRuntime alloc]
+      initWithTextureRegistry:registry
+                methodChannel:(FlutterMethodChannel *)channel];
+
+  XCTestExpectation *prepExp = [self expectationWithDescription:@"prepare"];
+  [rt prepareWithURL:stubURL()
+          completion:^(int64_t tid, NSError *err) {
+            XCTAssertNil(err);
+            [prepExp fulfill];
+          }];
+  [self waitForExpectations:@[ prepExp ] timeout:kTimeout];
+
+  XCTAssertEqual(rt.textureId, 42LL);
+
+  [rt testSeam_sendOnPlaybackComplete];
+
+  XCTAssertEqualObjects(channel.lastMethod, @"onPlaybackComplete",
+                        @"method must be 'onPlaybackComplete'");
+
+  NSDictionary *args = channel.lastArguments;
+  XCTAssertNotNil(args, @"arguments must not be nil");
+
+  NSNumber *textureIdNum = args[@"textureId"];
+  XCTAssertNotNil(textureIdNum, @"'textureId' key must be present");
+  XCTAssertEqual(textureIdNum.longLongValue, 42LL,
+                 @"textureId must equal the prepared textureId (42)");
+
+  // onPlaybackComplete must carry only textureId (same shape as native code).
+  XCTAssertEqual(args.count, 1U,
+                 @"onPlaybackComplete args must contain exactly one key ('textureId')");
+}
+
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -769,3 +957,11 @@ static NSURL *stubURL(void) {
 //        testPrepareIsAsynchronous — measures caller blocked time + completion
 //                                    ordering.
 //        testPrepareFromBackgroundThread — prepare called from bg queue.
+//
+//  AC-ARG  Argument-capture tests for native → Dart callbacks
+//          testOnTimelineFrameArgumentCapture — verifies textureId + pts +
+//                                               generation keys and values.
+//          testOnTimelineEOSArgumentCapture   — verifies textureId key and
+//                                               single-key constraint.
+//          testOnPlaybackCompleteArgumentCapture — verifies textureId key and
+//                                               single-key constraint.

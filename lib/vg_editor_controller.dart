@@ -55,6 +55,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+import 'src/channel/vanguard_channel_dispatcher.dart';
 import 'vg_clip_descriptor.dart';
 import 'vg_dual_camera_descriptor.dart';
 import 'vg_editor_draft.dart';
@@ -74,31 +75,30 @@ import 'vg_reverse_sidecar_status.dart';
 /// // 1. Create with an initial draft.
 /// final controller = VGEditorController(initialDraft: draft);
 ///
-/// // 2. Set the MethodChannel handler in the owning widget's initState,
-/// //    delegating callbacks to the controller (Opus M1).
-/// _channel.setMethodCallHandler(controller.handleNativeCallback);
-///
-/// // 3. Initialize the native timeline texture.
+/// // 2. Initialize the native timeline texture.
+/// //    The controller automatically registers its timeline subscription
+/// //    with [VanguardChannelDispatcher] when initialize() completes.
 /// await controller.initialize();
 ///
-/// // 4. Use value.textureId to display the preview.
+/// // 3. Use value.textureId to display the preview.
 /// Texture(textureId: controller.value.textureId!)
 ///
-/// // 5. Dispose (both sync and async) in widget dispose().
+/// // 4. Dispose (both sync and async) in widget dispose().
 /// await controller.disposeAsync();
 /// controller.dispose();
 /// ```
 ///
-/// ## MethodChannel Ownership (Opus M1)
+/// ## MethodChannel Ownership
 ///
-/// [VGEditorController] **never** calls [MethodChannel.setMethodCallHandler].
-/// The owning widget is responsible for registering the handler and delegating
-/// to [handleNativeCallback]. This prevents replacing an existing handler on
-/// the shared `vanguard_media_engine` channel.
+/// [VGEditorController] does NOT call [MethodChannel.setMethodCallHandler].
+/// Timeline callbacks (onTimelineFrame, onTimelineEOS) are received via
+/// [VanguardChannelDispatcher] subscription registered after [initialize]
+/// returns a textureId. The dispatcher is the sole handler owner.
 ///
 /// ## Disposal (Opus M3)
 ///
-/// - [disposeAsync] performs the async native teardown (`disposeTimeline`).
+/// - [disposeAsync] performs the async native teardown (`disposeTimeline`)
+///   and unregisters the timeline subscription.
 /// - [dispose] is synchronous — it closes streams and calls `super.dispose()`.
 /// - In the owning widget's `dispose()`, call `disposeAsync()` first (if
 ///   `mounted` context permits), then `dispose()`.
@@ -153,6 +153,13 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   final StreamController<void> _eosController =
       StreamController<void>.broadcast();
 
+  // ── Dispatcher subscription ────────────────────────────────────────────────
+
+  /// Active timeline subscription from [VanguardChannelDispatcher].
+  /// Registered after [initialize] returns a textureId.
+  /// Unregistered in [disposeAsync] / [dispose].
+  VGTimelineSubscription? _timelineSubscription;
+
   /// Broadcast stream emitting the current playhead position (in seconds) on
   /// every `onTimelineFrame` native callback.
   ///
@@ -191,18 +198,17 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// Whether an export is currently in progress.
   bool get isExporting => value.isExporting;
 
-  // ── Native callback delegation (Opus M1) ────────────────────────────────────
+  // ── Native callback handling ───────────────────────────────────────────────
 
-  /// Handles native → Dart MethodChannel callbacks delegated by the owning
-  /// widget.
+  /// Handles native → Dart timeline callbacks.
   ///
-  /// The owning widget must register its own [MethodChannel.setMethodCallHandler]
-  /// and forward calls here. This controller never registers its own handler
-  /// to avoid replacing handlers on the shared channel (Opus M1).
+  /// Internally called when the [VanguardChannelDispatcher] routes
+  /// `onTimelineFrame` or `onTimelineEOS` to this controller's subscription.
   ///
-  /// Handled callbacks:
-  /// - `onTimelineFrame` — updates [currentPTS] and emits [ptsStream].
-  /// - `onTimelineEOS`   — sets [isPlaying] = false and emits [eosStream].
+  /// This method is also public for backward-compatibility with existing
+  /// playgrounds that were written under the Opus M1 pattern. Those playgrounds
+  /// may still call this directly, but they no longer need to own a
+  /// `setMethodCallHandler` registration — the dispatcher handles routing.
   Future<dynamic> handleNativeCallback(MethodCall call) async {
     if (_disposed) return null;
 
@@ -236,6 +242,24 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
         break;
     }
     return null;
+  }
+
+  void _onTimelineFrame(double pts) {
+    if (_disposed) return;
+    if (!_ptsController.isClosed) _ptsController.add(pts);
+    value = value.copyWith(currentPTS: pts);
+    notifyListeners();
+  }
+
+  void _onTimelineEOS() {
+    if (_disposed) return;
+    if (!_eosController.isClosed) _eosController.add(null);
+    value = value.copyWith(
+      isPlaying: false,
+      currentPTS: value.draft.durationSeconds,
+      statusMessage: 'End of timeline',
+    );
+    notifyListeners();
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -275,6 +299,19 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
           '[VGEditorController] initialize: native returned invalid textureId=$id',
         );
       }
+
+      // Unregister any previous subscription before registering a new one.
+      // This prevents stale map entries if initialize() is called more than once.
+      final dispatcher = VanguardChannelDispatcher.instance;
+      if (_timelineSubscription != null) {
+        dispatcher.unregisterTimelineListener(_timelineSubscription!);
+        _timelineSubscription = null;
+      }
+      _timelineSubscription = dispatcher.registerTimelineListener(
+        textureId: id,
+        onFrame: _onTimelineFrame,
+        onEOS: _onTimelineEOS,
+      );
 
       value = value.copyWith(
         textureId: id,
@@ -902,6 +939,12 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// Call this before [dispose] in the owning widget's dispose lifecycle.
   Future<void> disposeAsync() async {
     if (_disposed) return;
+    // Unregister timeline subscription so no callbacks arrive after disposal.
+    final dispatcher = VanguardChannelDispatcher.instance;
+    if (_timelineSubscription != null) {
+      dispatcher.unregisterTimelineListener(_timelineSubscription!);
+      _timelineSubscription = null;
+    }
     try {
       await _channel.invokeMethod<void>('disposeTimeline');
     } catch (_) {
@@ -920,6 +963,13 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   void dispose() {
     if (_disposed) return;
     _disposed = true;
+
+    // Unregister timeline subscription if disposeAsync was not called.
+    final dispatcher = VanguardChannelDispatcher.instance;
+    if (_timelineSubscription != null) {
+      dispatcher.unregisterTimelineListener(_timelineSubscription!);
+      _timelineSubscription = null;
+    }
 
     // Close streams before super.dispose() to avoid adding to closed streams.
     _ptsController.close();

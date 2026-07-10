@@ -265,7 +265,7 @@ class VanguardGLRenderer(
                 // true = render to Surface → triggers SurfaceTexture.onFrameAvailable
                 codec.releaseOutputBuffer(outIdx, true)
                 if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                    methodChannel.invokeMethod("onPlaybackComplete", null)
+                    methodChannel.invokeMethod("onPlaybackComplete", mapOf("textureId" to textureId))
                     break
                 }
             }

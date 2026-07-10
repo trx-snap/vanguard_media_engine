@@ -10,6 +10,8 @@ import 'package:ffi/ffi.dart';
 import 'vg_playback_client.dart';
 import 'vg_playback_session.dart';
 import 'vg_filter_spec.dart';
+// MethodChannel router — sole owner of setMethodCallHandler.
+import 'src/channel/vanguard_channel_dispatcher.dart';
 
 export 'vanguard_texture_view.dart';
 export 'vanguard_media_preparer.dart';
@@ -248,9 +250,8 @@ enum VGThermalState {
 
 /// Static thermal state monitor for the Vanguard media engine.
 ///
-/// Receives delegated `onThermalStateChanged` MethodChannel callbacks from
-/// [VanguardEngine._handleNativeCallback] (Opus M1 pattern: this class does NOT
-/// own or replace the MethodChannel handler).
+/// Receives `onThermalStateChanged` callbacks via [VanguardChannelDispatcher].
+/// Self-registers lazily on first use.
 ///
 /// ## Usage
 ///
@@ -276,10 +277,13 @@ final class VGThermalMonitor {
   static final StreamController<VGThermalState> _stateController =
       StreamController<VGThermalState>.broadcast();
 
+  // Dispatcher self-registration state.
+  // Once registered, the subscription lives for the isolate lifetime.
+  static bool _dispatcherRegistered = false;
+  // ignore: unused_field — held to prevent GC of the subscription token
+  static VGThermalSubscription? _thermalSubscription;
+
   /// The most recently observed thermal state.
-  ///
-  /// Updated whenever [_onNativeStateChanged] is called by
-  /// [VanguardEngine._handleNativeCallback].
   static VGThermalState get currentState => _currentState;
 
   /// Broadcast stream of thermal state transitions.
@@ -287,13 +291,16 @@ final class VGThermalMonitor {
   /// Emits every time the native `onThermalStateChanged` callback fires.
   /// Obtain an initial value via [getThermalState] and then subscribe here
   /// for subsequent changes.
-  static Stream<VGThermalState> get onThermalStateChanged =>
-      _stateController.stream;
+  static Stream<VGThermalState> get onThermalStateChanged {
+    _ensureDispatcherRegistered();
+    return _stateController.stream;
+  }
 
   /// Queries the current native thermal state from the device.
   ///
   /// Updates [currentState] and returns the result. Safe to call at any time.
   static Future<VGThermalState> getThermalState() async {
+    _ensureDispatcherRegistered();
     final raw =
         await _channel.invokeMethod<int>('getThermalState') ?? 0;
     final state = VGThermalState.fromRaw(raw);
@@ -316,10 +323,23 @@ final class VGThermalMonitor {
     );
   }
 
-  /// Internal: called by [VanguardEngine._handleNativeCallback] when the
-  /// native `onThermalStateChanged` callback fires.
+  /// Lazily self-registers with [VanguardChannelDispatcher].
   ///
-  /// Not part of the public API — only [VanguardEngine] should call this.
+  /// The closure captures [_onNativeStateChanged] from within this library,
+  /// so the library-private method is accessible. Registration is permanent
+  /// for the isolate lifetime — thermal events require no engine instance.
+  static void _ensureDispatcherRegistered() {
+    if (_dispatcherRegistered) return;
+    _dispatcherRegistered = true;
+    _thermalSubscription =
+        VanguardChannelDispatcher.instance.registerThermalStateListener(
+      (rawValue) => _onNativeStateChanged(rawValue),
+    );
+  }
+
+  /// Internal: updates current state and emits the stream event.
+  ///
+  /// Called via the dispatcher closure; not a public method.
   static void _onNativeStateChanged(int rawValue) {
     final state = VGThermalState.fromRaw(rawValue);
     _currentState = state;
@@ -352,6 +372,11 @@ class VanguardEngine {
   // where T2's factory constructor would otherwise call _disposeSync() on a
   // T1 engine whose await dispose() has already run (use-after-free crash).
   bool _disposed = false;
+
+  // Dispatcher subscription tokens. Stored so we can unregister on dispose.
+  VGPlaybackCompleteSubscription? _playbackCompleteSub;
+  VGDurationProbedSubscription? _durationProbedSub;
+  VGExportSubscription? _exportProgressSub;
 
   // ── Camera API — static so no C++ engine is allocated for camera use ─────────
   // Camera operations use the same native method channel as the engine but do
@@ -396,8 +421,39 @@ class VanguardEngine {
 
   VanguardEngine._internal(VanguardMode mode) {
     _enginePtr = _VanguardFFI.create(mode.index);
-    // Listen for native → Dart callbacks
-    _channel.setMethodCallHandler(_handleNativeCallback);
+    // Register dispatcher subscriptions (dispatcher owns the channel handler).
+    final dispatcher = VanguardChannelDispatcher.instance;
+    dispatcher.ensureHandlerRegistered();
+    _playbackCompleteSub = dispatcher.registerPlaybackCompleteListener(
+      (textureId) {
+        if (_disposed) return;
+        // Guard: only forward if this engine owns the texture.
+        if (_activeRenderers.containsKey(textureId)) {
+          onPlaybackComplete?.call(textureId);
+        }
+      },
+    );
+    _durationProbedSub = dispatcher.registerDurationProbedListener(
+      (String path, double duration) {
+        if (_disposed) return;
+        // Update C++ TimelineManager with the probed duration.
+        final pathPtr = path.toNativeUtf8();
+        _VanguardFFI.setNodeDuration(_enginePtr, pathPtr, duration);
+        calloc.free(pathPtr);
+        onNodeDurationProbed?.call(path, duration);
+      },
+    );
+    // Export progress: forward to the UI callback when this engine is the
+    // most recently registered consumer. Single-slot: if VanguardTimelineExporter
+    // concurrently registers, its subscription overwrites this one while its
+    // export is running; this registration is restored as the last subscriber
+    // only when the exporter's finally block unregisters.
+    _exportProgressSub = dispatcher.registerExportListener(
+      (double progress) {
+        if (_disposed) return;
+        onExportProgress?.call(progress);
+      },
+    );
   }
 
   /// Synchronous native teardown — called during hot-reload when a new instance
@@ -406,6 +462,21 @@ class VanguardEngine {
   void _disposeSync() {
     if (_disposed) return; // already fully disposed by await dispose() — skip
     _disposed = true;
+    // Unregister dispatcher subscriptions before destroying the engine pointer.
+    // This ensures late callbacks after destruction are dropped by the dispatcher.
+    final dispatcher = VanguardChannelDispatcher.instance;
+    if (_playbackCompleteSub != null) {
+      dispatcher.unregisterPlaybackCompleteListener(_playbackCompleteSub!);
+      _playbackCompleteSub = null;
+    }
+    if (_durationProbedSub != null) {
+      dispatcher.unregisterDurationProbedListener(_durationProbedSub!);
+      _durationProbedSub = null;
+    }
+    if (_exportProgressSub != null) {
+      dispatcher.unregisterExportListener(_exportProgressSub!);
+      _exportProgressSub = null;
+    }
     for (final id in _activeRenderers.keys) {
       _channel.invokeMethod('dispose', {'textureId': id}); // fire-and-forget
     }
@@ -418,40 +489,6 @@ class VanguardEngine {
   /// Useful after FFI calls on Android to detect silent OOM or null-arg failures.
   int get lastNativeError => _VanguardFFI.lastError(_enginePtr);
 
-  Future<dynamic> _handleNativeCallback(MethodCall call) async {
-    switch (call.method) {
-      case 'onNodeDurationProbed':
-        final path = call.arguments['path'] as String;
-        final duration = call.arguments['duration'] as double;
-        // Update C++ TimelineManager with the real probed duration
-        final pathPtr = path.toNativeUtf8();
-        _VanguardFFI.setNodeDuration(_enginePtr, pathPtr, duration);
-        calloc.free(pathPtr);
-        onNodeDurationProbed?.call(path, duration);
-        break;
-
-      case 'onPlaybackComplete':
-        // Find which textureId completed and notify the UI
-        // (for single-renderer use, just take the first entry)
-        if (_activeRenderers.isNotEmpty) {
-          onPlaybackComplete?.call(_activeRenderers.keys.first);
-        }
-        break;
-
-      case 'onExportProgress':
-        final pct = (call.arguments as num).toDouble();
-        onExportProgress?.call(pct);
-        break;
-
-      // Phase 10 Slice 10A: Thermal state change forwarded from native.
-      // Delegates to VGThermalMonitor (Opus M1 pattern: monitor does NOT own
-      // the handler; VanguardEngine delegates the callback here).
-      case 'onThermalStateChanged':
-        final rawValue = (call.arguments as num?)?.toInt() ?? 0;
-        VGThermalMonitor._onNativeStateChanged(rawValue);
-        break;
-    }
-  }
 
   /// G-02: Returns the current masterClock position in seconds from the native engine.
   /// Used by the A/V sync integration test to measure audio-vs-wall-clock drift.
@@ -1039,6 +1076,21 @@ class VanguardEngine {
     // Clear _devInstance NOW — before awaiting — so that if T2's factory
     // constructor runs during our await, it won't call _disposeSync() on us.
     if (kDebugMode) _devInstance = null;
+    // Unregister dispatcher subscriptions before destroying the engine pointer.
+    // This ensures late callbacks after destruction are dropped by the dispatcher.
+    final dispatcher = VanguardChannelDispatcher.instance;
+    if (_playbackCompleteSub != null) {
+      dispatcher.unregisterPlaybackCompleteListener(_playbackCompleteSub!);
+      _playbackCompleteSub = null;
+    }
+    if (_durationProbedSub != null) {
+      dispatcher.unregisterDurationProbedListener(_durationProbedSub!);
+      _durationProbedSub = null;
+    }
+    if (_exportProgressSub != null) {
+      dispatcher.unregisterExportListener(_exportProgressSub!);
+      _exportProgressSub = null;
+    }
     final ids = List<int>.from(_activeRenderers.keys);
     for (final id in ids) {
       // Await each call — ensures the native renderer is fully disposed

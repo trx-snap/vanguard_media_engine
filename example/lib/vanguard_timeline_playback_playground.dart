@@ -84,6 +84,10 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+// Development-only: direct internal import for dispatcher registration.
+// VanguardChannelDispatcher is package-internal (not in the public barrel).
+// This import is acceptable only in the example package playground.
+import 'package:vanguard_media_engine/src/channel/vanguard_channel_dispatcher.dart';
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -119,6 +123,10 @@ class _VanguardTimelinePlaybackPlaygroundState
   /// Flutter texture ID returned by dev_createTimelineTexture.
   /// -1 until prepare succeeds.
   int? _textureId;
+
+  /// Dispatcher subscription for timeline callbacks (onTimelineFrame, onTimelineEOS).
+  /// Registered after a textureId is obtained; unregistered on dispose.
+  VGTimelineSubscription? _timelineSub;
 
   /// Render dimensions reported by native (always 1920×1080 in Stage 7.5C).
   int _width = 1920;
@@ -205,10 +213,8 @@ class _VanguardTimelinePlaybackPlaygroundState
   void initState() {
     super.initState();
 
-    // Register handler for native → Dart method channel invocations.
-    // onTimelineFrame: { pts: Double, generation: Int }
-    // onTimelineEOS:   null
-    _channel.setMethodCallHandler(_handleMethodCall);
+    // Dispatcher owns setMethodCallHandler — no manual registration here.
+    // Timeline callbacks are registered per-textureId after prepare/rebuild.
 
     // Start prepare immediately on first frame.
     WidgetsBinding.instance.addPostFrameCallback((_) => _prepare());
@@ -216,34 +222,44 @@ class _VanguardTimelinePlaybackPlaygroundState
 
   @override
   void dispose() {
-    _channel.setMethodCallHandler(null);
+    // Unregister dispatcher subscription before teardown.
+    final sub = _timelineSub;
+    if (sub != null) {
+      VanguardChannelDispatcher.instance.unregisterTimelineListener(sub);
+      _timelineSub = null;
+    }
     _disposeTimeline();
     super.dispose();
   }
 
-  Future<dynamic> _handleMethodCall(MethodCall call) async {
-    switch (call.method) {
-      case 'onTimelineFrame':
-        final args = call.arguments as Map?;
-        final pts = (args?['pts'] as num?)?.toDouble() ?? _currentPTS;
-        if (mounted && !(_seekDragValue != null)) {
-          setState(() {
-            _currentPTS = pts;
-            _atEOS = false;
-          });
-        }
-        break;
-      case 'onTimelineEOS':
-        if (mounted) {
-          setState(() {
-            _playing = false;
-            _atEOS = true;
-            _status = 'End of timeline reached';
-          });
-        }
-        break;
-    }
-    return null;
+  void _onTimelineFrame(double pts) {
+    if (!mounted || _seekDragValue != null) return;
+    setState(() {
+      _currentPTS = pts;
+      _atEOS = false;
+    });
+  }
+
+  void _onTimelineEOS() {
+    if (!mounted) return;
+    setState(() {
+      _playing = false;
+      _atEOS = true;
+      _status = 'End of timeline reached';
+    });
+  }
+
+  /// Registers dispatcher subscription for the given textureId.
+  /// Replaces any existing subscription.
+  void _registerDispatcherSubscription(int textureId) {
+    final dispatcher = VanguardChannelDispatcher.instance;
+    final old = _timelineSub;
+    if (old != null) dispatcher.unregisterTimelineListener(old);
+    _timelineSub = dispatcher.registerTimelineListener(
+      textureId: textureId,
+      onFrame: _onTimelineFrame,
+      onEOS: _onTimelineEOS,
+    );
   }
 
   // ── Live-scrub helpers ────────────────────────────────────────────────────
@@ -309,6 +325,8 @@ class _VanguardTimelinePlaybackPlaygroundState
         _busy      = false;
         _status    = 'Ready — tap ▶ to play';
       });
+      // Register dispatcher subscription for this textureId.
+      _registerDispatcherSubscription(textureId);
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -515,6 +533,8 @@ class _VanguardTimelinePlaybackPlaygroundState
         _rebuilding = false;
         _status = 'Timeline rebuilt — ${_timelineDuration.toStringAsFixed(1)}s — tap ▶ to play';
       });
+      // Re-register dispatcher subscription for the new textureId.
+      _registerDispatcherSubscription(textureId);
     } on PlatformException catch (e) {
       if (!mounted) return;
       setState(() {

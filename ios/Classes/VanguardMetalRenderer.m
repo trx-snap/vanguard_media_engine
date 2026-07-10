@@ -29,6 +29,10 @@
 
 static os_log_t _rendererLog;
 
+@interface VanguardMetalRenderer ()
++ (NSDictionary *)vg_playbackCompleteArgumentsForTextureId:(int64_t)textureId;
+@end
+
 @implementation VanguardMetalRenderer {
   // ── Source (Phase 1: any id<VanguardMediaSource>) ──────────────────────
   id<VanguardMediaSource> _source;
@@ -640,7 +644,10 @@ static os_log_t _rendererLog;
   if (t > displayDuration) {
     if (!_playbackCompleted) {
       _playbackCompleted = YES;
-      [_methodChannel invokeMethod:@"onPlaybackComplete" arguments:nil];
+      [_methodChannel
+          invokeMethod:@"onPlaybackComplete"
+             arguments:[VanguardMetalRenderer
+                           vg_playbackCompleteArgumentsForTextureId:_textureId]];
     }
     CFAbsoluteTime _tx = CFAbsoluteTimeGetCurrent();
     [_textureRegistry textureFrameAvailable:_textureId];
@@ -1250,6 +1257,18 @@ static os_log_t _rendererLog;
 }
 - (int)outputTextureHeight {
   return _outputTexture ? (int)_outputTexture.height : 0;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Channel payload helpers
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Single authoritative source for argument dictionary shapes used by both
+// the production dispatch site and the VGGraphRuntimeLifecycleTest
+// testSeam_sendOnPlaybackComplete argument-capture seam.
+
++ (NSDictionary *)vg_playbackCompleteArgumentsForTextureId:(int64_t)textureId {
+  return @{@"textureId" : @(textureId)};
 }
 
 @end

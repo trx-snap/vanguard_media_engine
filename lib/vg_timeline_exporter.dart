@@ -13,20 +13,23 @@
 //   - The optional [channel] parameter enables test injection without
 //     depending on the iOS/native runtime.
 //
-// Phase 10 Real Export Progress:
-//   - [exportDraft] accepts an optional [onProgress] callback (0.0 -> 1.0).
-//   - A temporary setMethodCallHandler is registered on [channel] for the
-//     duration of the export to receive 'onExportProgress' MethodChannel events
-//     fired by the native VGExportScheduler via VGTimelineExportHelper.
-//   - The handler is cleared in a finally block.
-//   - Progress values are clamped to [0.0, 1.0].
-//   - Amendment 3: This resolves the MethodChannel multiplexing gap -- without
-//     this temporary handler, onExportProgress events are silently dropped
-//     because VanguardTimelineExporter does not allocate a VanguardEngine
-//     instance (which is the only existing listener for onExportProgress).
+// Export progress:
+//   - [exportDraft] accepts an optional [onProgress] callback (0.0 → 1.0).
+//   - A [VGExportSubscription] is registered with [VanguardChannelDispatcher]
+//     for the duration of the export to receive 'onExportProgress' events.
+//   - The subscription is unregistered in a finally block (success, error,
+//     cancellation).
+//   - Progress values are clamped to [0.0, 1.0] by the dispatcher.
+//
+// Export concurrency note:
+//   exportTimeline has no native single-export guard. Concurrent exports
+//   may both execute. The most recent export subscription receives shared
+//   onExportProgress events. Older export Futures complete via their own
+//   result() callbacks regardless.
 
 import 'package:flutter/services.dart';
 
+import 'src/channel/vanguard_channel_dispatcher.dart';
 import 'vg_editor_draft.dart';
 import 'vg_editor_export_request.dart';
 import 'vg_editor_export_result.dart';
@@ -43,13 +46,16 @@ import 'vg_editor_export_result.dart';
 /// [VGEditorDraft.applyAudioDucking]) before passing it here.
 ///
 /// **Progress:** When [onProgress] is supplied, real frame-level progress
-/// events (0.0 -> 1.0) are received from the native VGExportScheduler via
-/// VGTimelineExportHelper. A temporary MethodChannel handler is registered for
-/// the duration of the export and cleared in a finally block. Progress values
-/// are clamped to [0.0, 1.0].
+/// events (0.0 → 1.0) are received from the native VGExportScheduler via
+/// a [VGExportSubscription] registered with [VanguardChannelDispatcher].
+/// The subscription is unregistered in a finally block on all exit paths.
 ///
 /// **Cancellation:** The native compositor is not cancellable once started.
 /// Post-export output cleanup is the caller's responsibility.
+///
+/// **Concurrency:** [exportTimeline] has no native single-export guard.
+/// Concurrent calls may both execute natively. The most recent progress
+/// registration receives shared progress events; older Futures still complete.
 ///
 /// ```dart
 /// final exportDraft = draft.flattenOriginalClipAudio().applyAudioDucking();
@@ -78,7 +84,7 @@ final class VanguardTimelineExporter {
   ///
   /// [onProgress] is an optional callback that receives real frame-level
   /// progress values in [0.0, 1.0] as the native export proceeds. When null,
-  /// no progress handler is registered and the export runs as before.
+  /// no progress subscription is registered.
   ///
   /// [channel] is optional and exists only for test injection. Production
   /// callers must not supply it.
@@ -93,29 +99,17 @@ final class VanguardTimelineExporter {
     void Function(double progress)? onProgress,
     MethodChannel channel = _defaultChannel,
   }) async {
-    // Phase 10 Amendment 3: register a temporary MethodChannel handler to
-    // receive 'onExportProgress' events fired by the native VGExportScheduler
-    // via VGTimelineExportHelper.
+    // Register with the dispatcher (not setMethodCallHandler) to receive
+    // 'onExportProgress' events. The subscription is unregistered in the
+    // finally block on all exit paths (success, error, cancellation).
     //
-    // VanguardTimelineExporter does not allocate a VanguardEngine instance --
-    // VanguardEngine is the only existing listener for onExportProgress (via
-    // its setMethodCallHandler in its constructor). Without this temporary
-    // handler, all onExportProgress events are silently dropped.
-    //
-    // The handler is cleared in a finally block to avoid leaving stale
-    // handlers on the channel after export completes or throws.
+    // The dispatcher is the sole handler owner — this exporter must not
+    // call channel.setMethodCallHandler directly.
+    VGExportSubscription? exportSub;
     if (onProgress != null) {
-      channel.setMethodCallHandler((MethodCall call) async {
-        if (call.method == 'onExportProgress') {
-          final raw = call.arguments;
-          if (raw is num) {
-            final clamped = raw.toDouble().clamp(0.0, 1.0);
-            onProgress(clamped);
-          }
-        }
-        // Silently ignore any other calls during export.
-        // This handler is only in place for the export duration.
-      });
+      exportSub = VanguardChannelDispatcher.instance.registerExportListener(
+        onProgress,
+      );
     }
 
     try {
@@ -145,11 +139,11 @@ final class VanguardTimelineExporter {
 
       return exportResult;
     } finally {
-      // Always clear the temporary handler after export -- whether success,
-      // failure, or cancellation. This restores the channel to its normal
-      // state (no handler on VanguardTimelineExporter's channel instance).
-      if (onProgress != null) {
-        channel.setMethodCallHandler(null);
+      // Always unregister the export subscription — success, error, or
+      // cancellation. This prevents the callback from receiving events from
+      // a subsequent export.
+      if (exportSub != null) {
+        VanguardChannelDispatcher.instance.unregisterExportListener(exportSub);
       }
     }
   }
