@@ -1,14 +1,26 @@
 // vg_audio_ducking_engine.dart
 // Vanguard Media Engine — Phase 8.15B Automated Audio Ducking Engine
+//                         Phase 10-C Slice B: VO-triggered ducking only.
 //
 // Pure-Dart offline utility.  No channel calls, no rendering logic.
-// Takes a List<VGAudioSidecarTrack> and returns a new list where 'music'
-// tracks gain VGAudioVolumeKeyframe automation that ducks around foreground
-// ('voiceover', 'original') intervals.
+// Takes a List<VGAudioSidecarTrack> and returns a new list where known Added
+// tracks ('music', 'sfx') gain VGAudioVolumeKeyframe automation that ducks
+// around voiceover intervals.
+//
+// Phase 10-C Slice B role classification:
+//   Foreground trigger (causes ducking): 'voiceover' ONLY.
+//   Ducking targets (get keyframes):     'music', 'sfx'.
+//   Pass-through unchanged:              'original', null, any unknown string.
+//
+// 'original' static muting is owned by VGEditorDraft.applyAudioCompositionPolicy(),
+// not by this engine.  The engine never modifies 'original' tracks.
 //
 // Design rules:
 //   - Immutable: does not mutate input tracks or input list.
-//   - Does not overwrite existing non-empty volumeKeyframes on music tracks.
+//   - Does not overwrite existing non-empty volumeKeyframes on 'music'/'sfx' tracks
+//     (Slice B limitation: no provenance distinguishes user-authored from generated
+//     ducking automation; full composition of user automation and system ducking is
+//     deferred to a future slice).
 //   - Timing is in output-timeline seconds (same basis as VGAudioSidecarTrack.startTime).
 //   - No native calls, no Phase 15 audio graph work, no real-time playback ducking.
 //   - Only 'linear' keyframe curves are used (matches Phase 8.15A constraint).
@@ -53,37 +65,44 @@ final class _Interval {
   final double end;
 }
 
-/// Phase 8.15B offline audio ducking engine.
+/// Phase 8.15B / Phase 10-C Slice B offline audio ducking engine.
 ///
 /// Call [apply] with the current track list and a [VGAudioDuckingConfig].
 /// Returns a new track list.  The input list and input track objects are
 /// never mutated.
 ///
-/// **Foreground roles** (trigger ducking): `'voiceover'`, `'original'`.
-/// **Background role** (gets ducked): `'music'`.
-/// All other roles and tracks without a role are passed through unchanged.
+/// **Foreground role** (triggers ducking): `'voiceover'` ONLY.
+/// **Ducking targets** (receive generated keyframes): `'music'`, `'sfx'`.
+/// **Pass-through unchanged**: `'original'`, null, or any unknown role string.
 ///
-/// **Skip condition**: if a music track already has non-empty [volumeKeyframes],
-/// it is returned unchanged.  Callers that pre-authored keyframe automation
-/// retain full control.
+/// Static muting of `'original'` tracks is the responsibility of
+/// [VGEditorDraft.applyAudioCompositionPolicy], not this engine.
 ///
-/// **No-overlap condition**: if no foreground interval overlaps a music track's
-/// effective output range, the track is returned unchanged (no keyframes added).
+/// **Skip condition** (Slice B): if a `'music'` or `'sfx'` track already has
+/// non-empty [volumeKeyframes], it is returned unchanged.  No provenance
+/// currently distinguishes user-authored automation from previously generated
+/// ducking; full automation composition is deferred to a future slice.
+///
+/// **No-overlap condition**: if no voiceover interval overlaps a target
+/// track's effective output range, the track is returned unchanged.
 final class VGAudioDuckingEngine {
   const VGAudioDuckingEngine();
 
   /// Applies offline ducking to [tracks] using [config].
   ///
-  /// Returns a new [List<VGAudioSidecarTrack>].  All non-music tracks and
-  /// music tracks with pre-authored keyframes are included unchanged.
+  /// Returns a new [List<VGAudioSidecarTrack>].  Tracks with roles other than
+  /// `'music'` and `'sfx'`, and target tracks with pre-authored keyframes, are
+  /// included unchanged.
   List<VGAudioSidecarTrack> apply(
     List<VGAudioSidecarTrack> tracks, {
     VGAudioDuckingConfig config = const VGAudioDuckingConfig(),
   }) {
-    // 1. Collect foreground intervals from voiceover + original tracks.
+    // 1. Collect foreground intervals from voiceover tracks ONLY.
+    //    'original' is no longer a foreground trigger (Phase 10-C Slice B).
+    //    Static muting of 'original' is handled by applyAudioCompositionPolicy.
     final foregroundIntervals = <_Interval>[];
     for (final t in tracks) {
-      if (t.role == 'voiceover' || t.role == 'original') {
+      if (t.role == 'voiceover') {
         final start = t.startTime;
         final end = t.startTime + t.duration;
         if (end > start) {
@@ -97,14 +116,28 @@ final class VGAudioDuckingEngine {
 
     // 3. Process each track.
     return tracks.map((t) {
-      if (t.role != 'music') return t;                    // pass through
+      // Only 'music' and 'sfx' are known Added roles that receive ducking.
+      // 'original', 'voiceover', null, and unknown role strings pass through.
+      if (!_isKnownAddedRole(t.role)) return t;
+      // Slice B: skip tracks with existing keyframes — no provenance to
+      // distinguish user-authored automation from generated ducking.
       if (t.volumeKeyframes != null && t.volumeKeyframes!.isNotEmpty) {
-        return t; // pre-authored, skip
+        return t; // pre-authored automation preserved, ducking skipped
       }
 
       return _duckTrack(t, merged, config);
     }).toList();
   }
+
+  // ── Role classification helpers ────────────────────────────────────────────
+
+  /// Returns `true` if [role] is a known Added-lane role that ducks under VO.
+  ///
+  /// Only `'music'` and `'sfx'` are currently known Added roles.
+  /// Null and unknown strings are explicitly excluded — they pass through
+  /// unchanged and are not automatic ducking targets.
+  static bool _isKnownAddedRole(String? role) =>
+      role == 'music' || role == 'sfx';
 
   // ── private helpers ────────────────────────────────────────────────────────
 

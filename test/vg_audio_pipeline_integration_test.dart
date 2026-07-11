@@ -579,12 +579,24 @@ void main() {
     expect((fadeInB as num).toDouble(), closeTo(0.6, 1e-9));
   });
 
-  // ── PIPE-9: Multiple music tracks each ducked ───────────────────────────────
+  // ── PIPE-9: Original is not a foreground ducking trigger (Phase 10-C Slice B)
 
   test(
-      'PIPE-9: two music tracks both receive ducking keyframes when '
-      'original clip overlaps both',
+      'PIPE-9: two music tracks overlapping only an original clip receive no '
+      'generated ducking keyframes — original is not a foreground trigger',
       () async {
+    // Scenario: Original-only clip (clip-A) overlaps both music tracks.
+    // There is NO voiceover track.
+    //
+    // Old policy (Phase 8.15B): Original acted as a foreground trigger, so both
+    // music tracks were ducked under the original-clip window.
+    //
+    // Slice B policy (Phase 10-C): Only 'voiceover' is a foreground trigger.
+    // Original is never a dynamic trigger. Without VO, no generated ducking
+    // keyframes are emitted for music tracks.
+    //
+    // Static composition policy: because known Added ('music') tracks exist,
+    // the derived original-clip-A track has volume 0.0 in the export payload.
     final draft = VGEditorDraft(
       id: 'draft-pipe9',
       clips: [_videoClip(id: 'clip-A', duration: 10.0)],
@@ -610,13 +622,31 @@ void main() {
     final m1 = _findById(tracks, 'music-1')!;
     final m2 = _findById(tracks, 'music-2')!;
 
-    // Both music tracks must be ducked.
-    expect(m1.containsKey('volumeKeyframes'), isTrue,
-        reason: 'music-1 must be ducked');
-    expect(m2.containsKey('volumeKeyframes'), isTrue,
-        reason: 'music-2 must be ducked');
-    expect((m1['volumeKeyframes'] as List), isNotEmpty);
-    expect((m2['volumeKeyframes'] as List), isNotEmpty);
+    // Neither music track must receive generated ducking keyframes.
+    // Original is not a foreground trigger under Slice B policy.
+    expect(m1.containsKey('volumeKeyframes'), isFalse,
+        reason:
+            'music-1 must not be ducked — Original is not a foreground trigger');
+    expect(m2.containsKey('volumeKeyframes'), isFalse,
+        reason:
+            'music-2 must not be ducked — Original is not a foreground trigger');
+
+    // Track ordering and IDs must survive export unchanged.
+    final musicTracks = tracks.where((t) => t['role'] == 'music').toList();
+    expect(musicTracks.length, 2,
+        reason: 'both music tracks must appear in the export payload');
+
+    // Derived Original (flattened from clip-A) must be statically zeroed
+    // because known Added tracks exist in the plan.
+    final origTrack = _findById(tracks, 'original-clip-A');
+    expect(origTrack, isNotNull,
+        reason: 'original-clip-A must be flattened into the export payload');
+    expect((origTrack!['volume'] as num).toDouble(), closeTo(0.0, 1e-9),
+        reason:
+            'derived Original must have volume 0.0 when known Added tracks exist');
+    expect(origTrack.containsKey('volumeKeyframes'), isFalse,
+        reason:
+            'derived Original must not have any automation that could restore it above zero');
   });
 
   // ── PIPE-10: Export chain does not mutate live controller draft ─────────────

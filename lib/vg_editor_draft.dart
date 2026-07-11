@@ -717,60 +717,127 @@ final class VGEditorDraft {
     );
   }
 
-  // ── Audio ducking integration (Phase 8.19) ────────────────────────────────
+  // ── Composition-policy normalization (Phase 10-C Slice B) ────────────────
 
-  /// Returns a new [VGEditorDraft] with automated volume ducking applied to
-  /// the `music` tracks in [audioSidecarPlan] using [VGAudioDuckingEngine].
+  /// Returns a **derived** [VGEditorDraft] with audio normalized according to
+  /// the Phase 10-C Universal Editor audio composition policy.
   ///
-  /// **Phase 8.19 — Audio Ducking Engine Draft Integration.**
+  /// **This is the canonical pre-export/pre-preview audio normalization entry
+  /// point.**  Call it after [flattenOriginalClipAudio] and before passing the
+  /// draft to preview or export.  Never feed the returned derived draft back
+  /// into normalization; always start from the raw authoring draft.
   ///
-  /// Delegates entirely to [VGAudioDuckingEngine.apply] — does NOT reimplement
-  /// ducking math. The engine ducks music tracks around foreground
-  /// (`voiceover`, `original`) intervals, respecting [config] parameters.
+  /// **Ownership contract:**
+  ///   - The receiver (`this`) is the raw authoring draft.  It is never mutated.
+  ///   - The returned draft is a disposable derived value for renderer/export
+  ///     intent.  Do not assign it back to canonical authoring state, undo/redo
+  ///     history, or serialised user state.
+  ///   - Regenerate it from the same raw authoring draft for each preview/export.
+  ///
+  /// **Transformation steps:**
+  ///
+  /// 1. **Role detection:** inspect the raw track list for voiceover and known
+  ///    Added roles (`'music'`, `'sfx'`).
+  ///
+  /// 2. **Static Original muting (in derived output only):**
+  ///    - If any `'voiceover'` or known Added track exists, every `'original'`
+  ///      track is copied into the derived plan with `volume: 0.0` and
+  ///      `volumeKeyframes: null`, so no automation can raise it above zero.
+  ///    - Raw Original tracks in the authoring draft are **not** modified.
+  ///    - If neither voiceover nor known Added exists (`'original'`-only plan),
+  ///      every Original track is preserved exactly — volume, keyframes, fades,
+  ///      metadata, and ID unchanged.  No force-to-unity occurs.
+  ///
+  /// 3. **VO-triggered dynamic ducking:**
+  ///    Passes the statically normalized track list to [VGAudioDuckingEngine].
+  ///    The engine applies keyframe automation only to `'music'` and `'sfx'`
+  ///    tracks when `'voiceover'` intervals overlap them.
+  ///
+  /// **Role classification:**
+  ///   - `'original'`: statically zeroed when VO or Added is present; otherwise
+  ///     preserved exactly.  Never dynamically ducked.
+  ///   - `'voiceover'`: preserved unchanged.  Not ducked.  VO is the sole
+  ///     foreground trigger for dynamic ducking.
+  ///   - `'music'`, `'sfx'`: known Added-lane roles.  Duck under VO intervals.
+  ///     Tracks with existing [VGAudioSidecarTrack.volumeKeyframes] are
+  ///     preserved unchanged (Slice B automation-provenance limitation).
+  ///   - `null` / unknown strings: preserved unchanged.  Not ducked.
   ///
   /// **Return behaviour:**
   ///   - Returns `this` if [audioSidecarPlan] is null (no sidecar → no change).
-  ///   - Returns `this` if [audioSidecarPlan.tracks] is empty.
-  ///   - Returns `this` if the engine produces an identical track list (no
-  ///     music tracks, no overlapping foreground intervals, or all music tracks
-  ///     already have pre-authored keyframes).
-  ///   - Otherwise, returns a new [VGEditorDraft] via [copyWith] containing an
-  ///     updated [VGAudioSidecarPlan] with keyframe-enriched music tracks.
+  ///   - Returns `this` if the plan contains no tracks.
+  ///   - Returns a new derived [VGEditorDraft] whenever any track changes;
+  ///     otherwise returns `this` when the normalized result is structurally
+  ///     identical to the raw input.
   ///
-  /// **Non-destructive:** the original draft, original sidecar plan, and
-  /// original track list are never mutated. All non-audio draft fields
-  /// (clips, transitions, canvas, overlays, fps) are preserved exactly.
+  /// **Repeatability:** calling this method twice with the same unchanged raw
+  /// authoring draft produces structurally equal derived output.  Normalizing
+  /// an already-normalized output is not a supported operation.
   ///
-  /// **Offline only:** this is a model-level, export-targeted operation. It
-  /// does not affect real-time playback and requires no MethodChannel calls.
+  /// **Non-destructive:** all non-audio draft fields (clips, transitions,
+  /// canvas, overlays, fps) are preserved exactly.
   ///
-  /// [config] is the ducking configuration. Defaults to
+  /// [duckingConfig] is the ducking configuration. Defaults to
   /// [VGAudioDuckingConfig] defaults (–12 dB duck, 150 ms attack, 300 ms
   /// release, 50 ms merge gap).
-  ///
-  /// ```dart
-  /// final ducked = draft.applyAudioDucking();
-  /// // Same as:
-  /// final ducked = draft.applyAudioDucking(config: const VGAudioDuckingConfig());
-  /// ```
-  VGEditorDraft applyAudioDucking({VGAudioDuckingConfig? config}) {
-    // Guard: no sidecar plan → nothing to duck.
+  VGEditorDraft applyAudioCompositionPolicy({VGAudioDuckingConfig? duckingConfig}) {
+    // Guard: no sidecar plan → nothing to normalize.
     if (audioSidecarPlan == null) return this;
-    // Guard: empty track list → nothing to duck.
+    // Guard: empty track list → nothing to normalize.
     if (audioSidecarPlan!.tracks.isEmpty) return this;
 
-    final effectiveConfig = config ?? const VGAudioDuckingConfig();
+    final rawTracks = audioSidecarPlan!.tracks;
+
+    // 1. Detect project scenario by inspecting the raw track list.
+    final hasVoiceover = rawTracks.any((t) => t.role == 'voiceover');
+    final hasKnownAdded =
+        rawTracks.any((t) => t.role == 'music' || t.role == 'sfx');
+
+    List<VGAudioSidecarTrack> normalizedTracks;
+
+    if (hasVoiceover || hasKnownAdded) {
+      // 2. Static Original muting: copy Original tracks into the derived
+      //    output with volume: 0.0 and no keyframes.
+      //    Raw authoring Original tracks remain untouched.
+      normalizedTracks = rawTracks.map((t) {
+        if (t.role != 'original') return t;
+        // Derived output only: explicit zero, no automation that could restore.
+        return VGAudioSidecarTrack(
+          trackId: t.trackId,
+          url: t.url,
+          startTime: t.startTime,
+          duration: t.duration,
+          volume: 0.0,
+          role: t.role,
+          fadeInSeconds: t.fadeInSeconds,
+          fadeOutSeconds: t.fadeOutSeconds,
+          timeRemapAudioPolicy: t.timeRemapAudioPolicy,
+          sourceTrimStartSeconds: t.sourceTrimStartSeconds,
+          // volumeKeyframes intentionally omitted (null) so no automation can
+          // restore the muted Original above zero in the derived output.
+          volumeKeyframes: null,
+        );
+      }).toList();
+    } else {
+      // Original-only (or unknown roles only): preserve all tracks exactly.
+      // Do not force any volume value; do not add or remove automation.
+      normalizedTracks = rawTracks;
+    }
+
+    // 3. Delegate dynamic VO-triggered ducking to the engine.
+    //    Engine uses voiceover-only foreground and music/sfx-only targets.
+    final effectiveConfig = duckingConfig ?? const VGAudioDuckingConfig();
     final processedTracks = const VGAudioDuckingEngine().apply(
-      audioSidecarPlan!.tracks,
+      normalizedTracks,
       config: effectiveConfig,
     );
 
-    // If the engine returned an identical track list (no ducking applied),
+    // If normalized+ducked result is structurally identical to the raw input,
     // return this to avoid allocating a new instance unnecessarily.
-    bool changed = processedTracks.length != audioSidecarPlan!.tracks.length;
+    bool changed = processedTracks.length != rawTracks.length;
     if (!changed) {
       for (var i = 0; i < processedTracks.length; i++) {
-        if (processedTracks[i] != audioSidecarPlan!.tracks[i]) {
+        if (processedTracks[i] != rawTracks[i]) {
           changed = true;
           break;
         }
@@ -782,6 +849,23 @@ final class VGEditorDraft {
       audioSidecarPlan: VGAudioSidecarPlan(tracks: processedTracks),
     );
   }
+
+  // ── Audio ducking compatibility wrapper (Phase 8.19 / deprecated) ─────────
+
+  /// **Deprecated.** Use [applyAudioCompositionPolicy] instead.
+  ///
+  /// This wrapper is retained for source-level compatibility with existing
+  /// callers outside the approved Slice B boundary.  It delegates directly to
+  /// [applyAudioCompositionPolicy] and produces an identical result.
+  ///
+  /// New code must not call this method.  Existing production callers within
+  /// the approved files have been updated to use [applyAudioCompositionPolicy].
+  @Deprecated(
+    'Use applyAudioCompositionPolicy({duckingConfig: config}) instead. '
+    'Deprecated in Phase 10-C Slice B.',
+  )
+  VGEditorDraft applyAudioDucking({VGAudioDuckingConfig? config}) =>
+      applyAudioCompositionPolicy(duckingConfig: config);
 
   // ── Trim editing (Phase 7.13 / DEC-146) ─────────────────────────────────
 

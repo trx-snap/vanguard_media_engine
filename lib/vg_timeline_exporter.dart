@@ -8,8 +8,8 @@
 //   - Does not initialise VGEditorController.
 //   - Does not allocate or require a preview texture.
 //   - Does not depend on VGGraphRuntime or the playback runtime.
-//   - Audio flattening (flattenOriginalClipAudio / applyAudioDucking) is the
-//     caller's responsibility — this class receives a fully prepared draft.
+//   - Audio flattening (flattenOriginalClipAudio / applyAudioCompositionPolicy)
+//     is the caller's responsibility — this class receives a fully prepared draft.
 //   - The optional [channel] parameter enables test injection without
 //     depending on the iOS/native runtime.
 //
@@ -43,7 +43,7 @@ import 'vg_editor_export_result.dart';
 ///
 /// **Audio:** The caller must apply any required audio transforms to the draft
 /// (e.g. [VGEditorDraft.flattenOriginalClipAudio] and
-/// [VGEditorDraft.applyAudioDucking]) before passing it here.
+/// [VGEditorDraft.applyAudioCompositionPolicy]) before passing it here.
 ///
 /// **Progress:** When [onProgress] is supplied, real frame-level progress
 /// events (0.0 → 1.0) are received from the native VGExportScheduler via
@@ -58,7 +58,8 @@ import 'vg_editor_export_result.dart';
 /// registration receives shared progress events; older Futures still complete.
 ///
 /// ```dart
-/// final exportDraft = draft.flattenOriginalClipAudio().applyAudioDucking();
+/// final exportDraft =
+///     draft.flattenOriginalClipAudio().applyAudioCompositionPolicy();
 /// final result = await VanguardTimelineExporter.exportDraft(
 ///   draft: exportDraft,
 ///   request: VGEditorExportRequest(outputPath: '/tmp/out.mp4', bitrateBps: 8000000),

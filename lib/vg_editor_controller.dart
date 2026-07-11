@@ -273,11 +273,6 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   void _onTimelineFrame(double pts, int generation) {
     if (_disposed) return;
 
-    // Filter out stale frames from earlier seeks.
-    if (generation < _latestDispatchedGeneration) {
-      return;
-    }
-
     // Track the highest generation we have received from native.
     if (generation > _latestDispatchedGeneration) {
       _latestDispatchedGeneration = generation;
@@ -983,13 +978,13 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     try {
       // Phase 8.14C: flatten original clip audio into explicit sidecar tracks
       // before serialising. Pure operation — no I/O, appends to existing plan.
-      // Phase 8.20: apply automated audio ducking to the music tracks using
-      // VGAudioDuckingEngine. Pure offline model transform — delegates entirely
-      // to VGEditorDraft.applyAudioDucking(); no ducking math here.
-      // Returns this when no plan, no music tracks, or no overlap.
+      // Phase 10-C Slice B: apply composition-policy normalization (static
+      // Original muting + VO-triggered ducking) to the flattened raw snapshot.
+      // The result is a disposable derived VGEditorDraft — it is never assigned
+      // back to value.draft or any canonical authoring state.
       final exportDraft = value.draft
           .flattenOriginalClipAudio()
-          .applyAudioDucking();
+          .applyAudioCompositionPolicy();
       final result = await _channel.invokeMapMethod<String, dynamic>(
         'exportTimeline',
         {
