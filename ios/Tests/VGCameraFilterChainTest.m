@@ -25,6 +25,10 @@
 @property (nonatomic) BOOL stopCalled;
 @property (nonatomic) NSInteger startCallCount;
 @property (nonatomic) NSInteger stopCallCount;
+// Phase 6E.1C: matches the accepted atomic BOOL on VanguardCameraMediaSource.
+// Without this property, VGCameraGraphSession.setRecordingEnabled: throws
+// an unrecognised-selector exception when the session writes the flag.
+@property (atomic, assign) BOOL graphRecordingEnabled;
 @end
 
 @implementation VGCFC_MockCameraSource
@@ -151,8 +155,13 @@
     XCTAssertNotNil(session, @"Session creation must succeed");
     XCTAssertNil(error);
     
+    // Phase 6A-3G-C: the session is the permanent renderer.frameDelegate.
+    // Hot-swap replaces the internal _scheduler, not the frameDelegate.
     id<VGFrameDelegate> initialDelegate = mockRenderer.frameDelegate;
     XCTAssertNotNil(initialDelegate, @"Initial frameDelegate must not be nil");
+    XCTAssertEqual(initialDelegate, session, @"renderer.frameDelegate must be the session itself");
+    id initialScheduler = [session valueForKey:@"_scheduler"];
+    XCTAssertNotNil(initialScheduler, @"Initial scheduler must not be nil");
     XCTAssertTrue(mockSource.startCalled);
     XCTAssertEqual(mockSource.startCallCount, 1);
     
@@ -165,9 +174,13 @@
     VGCFC_MockLUTFilter *mockLUT = [[VGCFC_MockLUTFilter alloc] init];
     [session setCameraFilterChain:@[mockLUT]];
     
-    id<VGFrameDelegate> secondDelegate = mockRenderer.frameDelegate;
-    XCTAssertNotNil(secondDelegate, @"Second frameDelegate must exist after hot-swap");
-    XCTAssertNotEqual(initialDelegate, secondDelegate, @"Hot-swap must create a new scheduler/delegate");
+    // The renderer delegate must remain the same session instance.
+    XCTAssertNotNil(mockRenderer.frameDelegate, @"Renderer frameDelegate must remain non-nil after hot-swap");
+    XCTAssertEqual(mockRenderer.frameDelegate, session, @"renderer.frameDelegate must remain the same session after hot-swap");
+    // The internal scheduler must have been replaced.
+    id updatedScheduler = [session valueForKey:@"_scheduler"];
+    XCTAssertNotNil(updatedScheduler, @"Updated scheduler must not be nil after hot-swap");
+    XCTAssertNotEqual(initialScheduler, updatedScheduler, @"Hot-swap must replace the internal scheduler");
     
     // Hot-swap must keep the source running
     XCTAssertFalse(mockSource.stopCalled, @"Source must not be stopped during hot-swap");
@@ -190,24 +203,32 @@
                   error:&error];
     
     XCTAssertNotNil(session);
-    id<VGFrameDelegate> initialDelegate = mockRenderer.frameDelegate;
-    XCTAssertNotNil(initialDelegate);
+    // Phase 6A-3G-C: the session is the permanent renderer.frameDelegate.
+    XCTAssertNotNil(mockRenderer.frameDelegate, @"Initial frameDelegate must not be nil");
+    XCTAssertEqual(mockRenderer.frameDelegate, session, @"renderer.frameDelegate must be the session itself");
+    id initialScheduler = [session valueForKey:@"_scheduler"];
+    XCTAssertNotNil(initialScheduler, @"Initial scheduler must not be nil");
     
     VGCFC_MockLUTFilter *mockLUT = [[VGCFC_MockLUTFilter alloc] init];
     [session setCameraFilterChain:@[mockLUT]];
     
-    id<VGFrameDelegate> secondDelegate = mockRenderer.frameDelegate;
-    XCTAssertNotNil(secondDelegate);
-    XCTAssertNotEqual(initialDelegate, secondDelegate);
+    // Delegate remains the same session; scheduler must have been replaced.
+    XCTAssertEqual(mockRenderer.frameDelegate, session, @"renderer.frameDelegate must remain the session after first hot-swap");
+    id schedulerAfterLUT = [session valueForKey:@"_scheduler"];
+    XCTAssertNotNil(schedulerAfterLUT, @"Scheduler must not be nil after first hot-swap");
+    XCTAssertNotEqual(initialScheduler, schedulerAfterLUT, @"Scheduler must be replaced after first hot-swap");
     
     mockSource.stopCalled = NO;
     mockSource.stopCallCount = 0;
     
     [session setCameraFilterChain:@[]];
-    id<VGFrameDelegate> thirdDelegate = mockRenderer.frameDelegate;
-    XCTAssertNotNil(thirdDelegate);
-    XCTAssertNotEqual(secondDelegate, thirdDelegate);
-    XCTAssertNotEqual(initialDelegate, thirdDelegate);
+    // Delegate remains the same session; scheduler must have been replaced again.
+    XCTAssertNotNil(mockRenderer.frameDelegate, @"frameDelegate must remain non-nil after empty-chain hot-swap");
+    XCTAssertEqual(mockRenderer.frameDelegate, session, @"renderer.frameDelegate must remain the session after second hot-swap");
+    id schedulerAfterEmpty = [session valueForKey:@"_scheduler"];
+    XCTAssertNotNil(schedulerAfterEmpty, @"Scheduler must not be nil after second hot-swap");
+    XCTAssertNotEqual(schedulerAfterLUT, schedulerAfterEmpty, @"Scheduler must be replaced after second hot-swap");
+    XCTAssertNotEqual(initialScheduler, schedulerAfterEmpty, @"Scheduler after second hot-swap must differ from the initial scheduler");
     
     XCTAssertFalse(mockSource.stopCalled, @"Source must not be stopped during empty swap");
     XCTAssertEqual(mockSource.stopCallCount, 0);
@@ -226,20 +247,27 @@
                   error:&error];
     
     XCTAssertNotNil(session);
-    id<VGFrameDelegate> initialDelegate = mockRenderer.frameDelegate;
+    // Phase 6A-3G-C: the session is the permanent renderer.frameDelegate.
+    XCTAssertEqual(mockRenderer.frameDelegate, session, @"renderer.frameDelegate must be the session itself");
+    id initialScheduler = [session valueForKey:@"_scheduler"];
+    XCTAssertNotNil(initialScheduler, @"Initial scheduler must not be nil");
     
     VGCFC_MockLUTFilter *mockLUT = [[VGCFC_MockLUTFilter alloc] init];
     [session setCameraFilterChain:@[mockLUT]];
-    id<VGFrameDelegate> secondDelegate = mockRenderer.frameDelegate;
-    XCTAssertNotEqual(initialDelegate, secondDelegate);
+    // Scheduler must have been replaced after first hot-swap.
+    id schedulerAfterLUT = [session valueForKey:@"_scheduler"];
+    XCTAssertNotEqual(initialScheduler, schedulerAfterLUT, @"Scheduler must be replaced after LUT hot-swap");
     
     mockSource.stopCalled = NO;
     mockSource.stopCallCount = 0;
     
     [session setCameraFilterChain:nil];
-    id<VGFrameDelegate> thirdDelegate = mockRenderer.frameDelegate;
-    XCTAssertNotNil(thirdDelegate);
-    XCTAssertNotEqual(secondDelegate, thirdDelegate);
+    // Delegate remains the same session; scheduler must have been replaced again.
+    XCTAssertNotNil(mockRenderer.frameDelegate, @"frameDelegate must remain non-nil after nil-chain hot-swap");
+    XCTAssertEqual(mockRenderer.frameDelegate, session, @"renderer.frameDelegate must remain the session after nil-chain hot-swap");
+    id schedulerAfterNil = [session valueForKey:@"_scheduler"];
+    XCTAssertNotNil(schedulerAfterNil, @"Scheduler must not be nil after nil-chain hot-swap");
+    XCTAssertNotEqual(schedulerAfterLUT, schedulerAfterNil, @"Scheduler must be replaced after nil-chain hot-swap");
     XCTAssertFalse(mockSource.stopCalled, @"Source must not be stopped during nil swap");
     XCTAssertEqual(mockSource.stopCallCount, 0);
     
@@ -257,22 +285,33 @@
                   error:&error];
     
     XCTAssertNotNil(session);
-    id<VGFrameDelegate> initialDelegate = mockRenderer.frameDelegate;
+    // Phase 6A-3G-C: the session is the permanent renderer.frameDelegate.
+    XCTAssertEqual(mockRenderer.frameDelegate, session, @"renderer.frameDelegate must be the session itself");
+    id initialScheduler = [session valueForKey:@"_scheduler"];
+    XCTAssertNotNil(initialScheduler, @"Initial scheduler must not be nil");
     
     VGCFC_MockBadFilter *badFilter = [[VGCFC_MockBadFilter alloc] init];
     
     NSArray *badFilterChain = @[badFilter];
     XCTAssertNoThrow([session setCameraFilterChain:badFilterChain], @"Skipping non-conforming object must not throw/crash");
     
-    id<VGFrameDelegate> secondDelegate = mockRenderer.frameDelegate;
-    XCTAssertNotNil(secondDelegate);
-    XCTAssertNotEqual(initialDelegate, secondDelegate, @"Dynamic swap to passthrough must succeed");
+    // The delegate remains the session; the scheduler must have been replaced (bad filter is skipped, passthrough rebuilt).
+    XCTAssertNotNil(mockRenderer.frameDelegate, @"frameDelegate must remain non-nil after bad-filter swap");
+    XCTAssertEqual(mockRenderer.frameDelegate, session, @"renderer.frameDelegate must remain the session");
+    id updatedScheduler = [session valueForKey:@"_scheduler"];
+    XCTAssertNotNil(updatedScheduler, @"Updated scheduler must not be nil after bad-filter hot-swap");
+    XCTAssertNotEqual(initialScheduler, updatedScheduler, @"Dynamic swap to passthrough must replace the scheduler");
     
     NSDictionary *nodes = [session valueForKey:@"_nodes"];
     XCTAssertNotNil(nodes);
     XCTAssertNotNil(nodes[@"camera_source"]);
     XCTAssertNotNil(nodes[@"fan_out_sink"]);
-    XCTAssertEqual(nodes.count, 2u, @"Bad filter must have been skipped, resulting in standard passthrough graph");
+    // Phase 6E: default graph has 4 baseline nodes
+    // (camera_source, fan_out_sink, camera_recording_sink, camera_photo_sink).
+    // Bad filter is skipped — no additional node is added beyond the baseline.
+    XCTAssertNotNil(nodes[@"camera_recording_sink"], @"Recording sink must be present in baseline graph");
+    XCTAssertNotNil(nodes[@"camera_photo_sink"], @"Photo sink must be present in baseline graph");
+    XCTAssertEqual(nodes.count, 4u, @"Bad filter must have been skipped, resulting in standard passthrough graph (4 baseline nodes)");
     
     [session invalidate];
 }
@@ -298,13 +337,17 @@
     id<VGFrameDelegate> secondDelegate = mockRenderer.frameDelegate;
     XCTAssertNotNil(secondDelegate);
     
-    // Verify that bad filter was skipped but valid LUT filter remains in the nodes dictionary
+    // Verify that bad filter was skipped but valid LUT filter remains in the nodes dictionary.
     NSDictionary *nodes = [session valueForKey:@"_nodes"];
     XCTAssertNotNil(nodes);
     XCTAssertNotNil(nodes[@"camera_source"]);
     XCTAssertNotNil(nodes[@"mock_lut_filter"], @"LUT filter must be preserved in the graph");
     XCTAssertNotNil(nodes[@"fan_out_sink"]);
-    XCTAssertEqual(nodes.count, 3u, @"Graph must have exactly 3 nodes because the bad filter was skipped");
+    // Phase 6E: 4 baseline nodes + 1 accepted LUT filter = 5 total.
+    // (camera_source, mock_lut_filter, fan_out_sink, camera_recording_sink, camera_photo_sink)
+    XCTAssertNotNil(nodes[@"camera_recording_sink"], @"Recording sink must be present in baseline graph");
+    XCTAssertNotNil(nodes[@"camera_photo_sink"], @"Photo sink must be present in baseline graph");
+    XCTAssertEqual(nodes.count, 5u, @"Graph must have 5 nodes: 4 baseline + accepted LUT (bad filter was skipped)");
     
     [session invalidate];
 }

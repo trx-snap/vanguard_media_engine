@@ -20,6 +20,10 @@
 @property (nonatomic) BOOL stopCalled;
 @property (nonatomic) NSInteger startCallCount;
 @property (nonatomic) NSInteger stopCallCount;
+// Phase 6E.1C: matches the accepted atomic BOOL on VanguardCameraMediaSource.
+// Without this property, VGCameraGraphSession.setRecordingEnabled: throws
+// an unrecognised-selector exception when the session writes the flag.
+@property (atomic, assign) BOOL graphRecordingEnabled;
 @end
 
 @implementation VGMCS_MockCameraSource
@@ -135,10 +139,14 @@
     XCTAssertNotNil(session, @"Session creation must succeed");
     XCTAssertNil(error);
 
-    // 1. session initializes, 2. initial frameDelegate exists
-    id<VGFrameDelegate> initialDelegate = _mockRenderer.frameDelegate;
-    XCTAssertNotNil(initialDelegate, @"Initial frameDelegate must exist");
-    
+    // Phase 6A-3G-C: the session is the permanent renderer.frameDelegate.
+    // Hot-swap replaces the internal _scheduler, not the frameDelegate pointer.
+    XCTAssertNotNil(_mockRenderer.frameDelegate, @"Initial frameDelegate must exist");
+    XCTAssertEqual(_mockRenderer.frameDelegate, session,
+        @"renderer.frameDelegate must be the session itself");
+    id initialScheduler = [session valueForKey:@"_scheduler"];
+    XCTAssertNotNil(initialScheduler, @"Initial scheduler must not be nil");
+
     // Verify source started initially
     XCTAssertTrue(_mockSource.startCalled, @"Source must be started initially");
     XCTAssertEqual(_mockSource.startCallCount, 1, @"Source start should be called exactly once initially");
@@ -151,11 +159,16 @@
     _mockSource.startCallCount = 0;
     _mockSource.stopCallCount = 0;
 
-    // 3. setCameraFilterChain:nil hot-swaps to a new delegate/scheduler
+    // 3. setCameraFilterChain:nil hot-swaps to a new internal scheduler
     [session setCameraFilterChain:nil];
-    id<VGFrameDelegate> secondDelegate = _mockRenderer.frameDelegate;
-    XCTAssertNotNil(secondDelegate, @"Second frameDelegate must exist after hot-swap with nil");
-    XCTAssertNotEqual(initialDelegate, secondDelegate, @"Hot-swap with nil must produce a new delegate");
+    // The renderer delegate remains the same session instance.
+    XCTAssertNotNil(_mockRenderer.frameDelegate, @"frameDelegate must remain non-nil after first hot-swap");
+    XCTAssertEqual(_mockRenderer.frameDelegate, session,
+        @"renderer.frameDelegate must remain the same session after first hot-swap");
+    id schedulerAfterFirstSwap = [session valueForKey:@"_scheduler"];
+    XCTAssertNotNil(schedulerAfterFirstSwap, @"Scheduler must not be nil after first hot-swap");
+    XCTAssertNotEqual(initialScheduler, schedulerAfterFirstSwap,
+        @"Hot-swap with nil must replace the internal scheduler");
     
     // Verify mock source was NOT stopped during hot-swap
     XCTAssertFalse(_mockSource.stopCalled, @"Mock source must not be stopped during hot-swap");
@@ -171,12 +184,18 @@
 
     // 4. setCameraFilterChain:@[] hot-swaps again
     [session setCameraFilterChain:@[]];
-    id<VGFrameDelegate> thirdDelegate = _mockRenderer.frameDelegate;
-    XCTAssertNotNil(thirdDelegate, @"Third frameDelegate must exist after hot-swap with empty array");
-    XCTAssertNotEqual(secondDelegate, thirdDelegate, @"Hot-swap with empty array must produce a new delegate");
+    // The renderer delegate still remains the same session instance.
+    XCTAssertNotNil(_mockRenderer.frameDelegate, @"frameDelegate must remain non-nil after second hot-swap");
+    XCTAssertEqual(_mockRenderer.frameDelegate, session,
+        @"renderer.frameDelegate must remain the same session after second hot-swap");
+    id schedulerAfterSecondSwap = [session valueForKey:@"_scheduler"];
+    XCTAssertNotNil(schedulerAfterSecondSwap, @"Scheduler must not be nil after second hot-swap");
+    XCTAssertNotEqual(schedulerAfterFirstSwap, schedulerAfterSecondSwap,
+        @"Hot-swap with empty array must replace the internal scheduler");
     
-    // 5. multiple hot-swaps produce distinct delegates/schedulers
-    XCTAssertNotEqual(initialDelegate, thirdDelegate, @"Multiple hot-swaps must produce distinct delegates");
+    // 5. multiple hot-swaps produce distinct internal schedulers
+    XCTAssertNotEqual(initialScheduler, schedulerAfterSecondSwap,
+        @"Multiple hot-swaps must produce distinct internal schedulers");
     XCTAssertFalse(_mockSource.stopCalled, @"Mock source must not be stopped during second hot-swap");
     XCTAssertEqual(_mockSource.stopCallCount, 0, @"Mock source stop count must remain 0");
     
@@ -208,5 +227,6 @@
     XCTAssertFalse(_mockSource.stopCalled, @"Source stop must not be called again");
     XCTAssertEqual(_mockSource.stopCallCount, 0, @"Source stop count must remain 0 post-invalidate");
 }
+
 
 @end

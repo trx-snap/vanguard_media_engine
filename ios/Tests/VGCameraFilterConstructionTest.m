@@ -63,6 +63,10 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
 @interface VGCFC2_MockCameraSource : NSObject
 @property (nonatomic) BOOL startCalled;
 @property (nonatomic) BOOL stopCalled;
+// Phase 6E.1C: matches the accepted atomic BOOL on VanguardCameraMediaSource.
+// Without this property, VGCameraGraphSession.setRecordingEnabled: throws
+// an unrecognised-selector exception when the session writes the flag.
+@property (atomic, assign) BOOL graphRecordingEnabled;
 @end
 
 @implementation VGCFC2_MockCameraSource
@@ -105,6 +109,16 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
     _mockRenderer = nil;
     [VGCFC2_TestGraphSession setMockWidth:0 height:0 enabled:NO];
     [super tearDown];
+}
+
+// ─── Atomicity helper ─────────────────────────────────────────────────────────
+
+/// Returns an immutable snapshot of the node key set from the session's _nodes
+/// dictionary. Use this to compare before/after identity on rejection tests:
+/// a rejected operation must leave the node map completely unchanged.
+- (NSSet<NSString *> *)VGCFC2_nodeKeySet:(VGCameraGraphSession *)session {
+    NSDictionary *nodes = [session valueForKey:@"_nodes"];
+    return nodes ? [NSSet setWithArray:nodes.allKeys] : [NSSet set];
 }
 
 // ─── Helper ──────────────────────────────────────────────────────────────────
@@ -281,6 +295,9 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
 
     NSArray *specs = @[ @{ @"type": @"lut" } ];
 
+    // Snapshot the node identity set before the rejected operation.
+    NSSet<NSString *> *nodeKeysBefore = [self VGCFC2_nodeKeySet:session];
+
     NSError *error = nil;
     BOOL success = [session setCameraFilterChainFromSpecs:specs error:&error];
 
@@ -288,8 +305,12 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
     XCTAssertEqualObjects(error.domain, @"UNSUPPORTED_FILTER_TYPE",
         @"Error domain must be UNSUPPORTED_FILTER_TYPE for lut");
 
-    NSDictionary<NSString *, id> *nodes = [session valueForKey:@"_nodes"];
-    XCTAssertEqual(nodes.count, 2u, @"Graph must not be mutated when lut rejected");
+    // Atomicity: the node set must be identical to what it was before the rejection.
+    NSSet<NSString *> *nodeKeysAfter = [self VGCFC2_nodeKeySet:session];
+    XCTAssertEqualObjects(nodeKeysBefore, nodeKeysAfter,
+        @"Graph must not be mutated when lut rejected: node key sets must be equal");
+    XCTAssertEqual(nodeKeysBefore.count, nodeKeysAfter.count,
+        @"Graph must not be mutated when lut rejected: node counts must be equal");
 
     [session invalidate];
 }
@@ -301,6 +322,9 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
 
     NSArray *specs = @[ @{ @"type": @"segmentation" } ];
 
+    // Snapshot the node identity set before the rejected operation.
+    NSSet<NSString *> *nodeKeysBefore = [self VGCFC2_nodeKeySet:session];
+
     NSError *error = nil;
     BOOL success = [session setCameraFilterChainFromSpecs:specs error:&error];
 
@@ -308,9 +332,12 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
     XCTAssertEqualObjects(error.domain, @"UNSUPPORTED_FILTER_TYPE",
         @"Error domain must be UNSUPPORTED_FILTER_TYPE for segmentation");
 
-    NSDictionary<NSString *, id> *nodes = [session valueForKey:@"_nodes"];
-    XCTAssertEqual(nodes.count, 2u,
-        @"Graph must not be mutated when segmentation rejected");
+    // Atomicity: the node set must be identical to what it was before the rejection.
+    NSSet<NSString *> *nodeKeysAfter = [self VGCFC2_nodeKeySet:session];
+    XCTAssertEqualObjects(nodeKeysBefore, nodeKeysAfter,
+        @"Graph must not be mutated when segmentation rejected: node key sets must be equal");
+    XCTAssertEqual(nodeKeysBefore.count, nodeKeysAfter.count,
+        @"Graph must not be mutated when segmentation rejected: node counts must be equal");
 
     [session invalidate];
 }
@@ -322,6 +349,9 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
 
     NSArray *specs = @[ @{ @"type": @"sparkle" } ];
 
+    // Snapshot the node identity set before the rejected operation.
+    NSSet<NSString *> *nodeKeysBefore = [self VGCFC2_nodeKeySet:session];
+
     NSError *error = nil;
     BOOL success = [session setCameraFilterChainFromSpecs:specs error:&error];
 
@@ -329,9 +359,12 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
     XCTAssertEqualObjects(error.domain, @"UNKNOWN_FILTER",
         @"Error domain must be UNKNOWN_FILTER for unknown type string");
 
-    NSDictionary<NSString *, id> *nodes = [session valueForKey:@"_nodes"];
-    XCTAssertEqual(nodes.count, 2u,
-        @"Graph must not be mutated when unknown type rejected");
+    // Atomicity: the node set must be identical to what it was before the rejection.
+    NSSet<NSString *> *nodeKeysAfter = [self VGCFC2_nodeKeySet:session];
+    XCTAssertEqualObjects(nodeKeysBefore, nodeKeysAfter,
+        @"Graph must not be mutated when unknown type rejected: node key sets must be equal");
+    XCTAssertEqual(nodeKeysBefore.count, nodeKeysAfter.count,
+        @"Graph must not be mutated when unknown type rejected: node counts must be equal");
 
     [session invalidate];
 }
@@ -341,7 +374,11 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
 - (void)testEmptySpecsClearsFilters {
     VGCFC2_TestGraphSession *session = [self makeSessionWithPool];
 
-    // First install a Beauty V1 filter.
+    // Capture the baseline node key set immediately after session creation (passthrough graph).
+    NSSet<NSString *> *baselineNodeKeys = [self VGCFC2_nodeKeySet:session];
+    XCTAssertTrue(baselineNodeKeys.count > 0, @"Baseline graph must have at least one node");
+
+    // Install a Beauty V1 filter.
     NSError *setupError = nil;
     BOOL setupOK = [session setCameraFilterChainFromSpecs:@[ @{ @"type": @"beauty" } ]
                                                     error:&setupError];
@@ -358,12 +395,30 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
     XCTAssertTrue(clearOK,  @"Empty specs must return YES");
     XCTAssertNil(clearError, @"No error expected for empty specs");
 
+    // Verify: clearing returns the graph to exactly the same passthrough topology it had at creation.
+    NSSet<NSString *> *clearedNodeKeys = [self VGCFC2_nodeKeySet:session];
+    XCTAssertEqualObjects(baselineNodeKeys, clearedNodeKeys,
+        @"Cleared graph node key set must exactly match the baseline passthrough set");
+    XCTAssertEqual(baselineNodeKeys.count, clearedNodeKeys.count,
+        @"Cleared graph must have the same node count as the original passthrough graph");
+
+    // Confirm the beauty filter node is no longer in the graph.
+    // The beauty filter is wrapped in a VGLegacyFilterAdapter which reports nodeClass="VGBeautyFilterNode".
+    // We verify by checking that no node with nodeClass "VGBeautyFilterNode" is found.
     NSDictionary<NSString *, id> *nodesAfter = [session valueForKey:@"_nodes"];
-    XCTAssertEqual(nodesAfter.count, 2u,
-        @"Graph must be passthrough (2 nodes) after empty specs");
+    BOOL foundBeauty = NO;
+    for (id node in nodesAfter.allValues) {
+        if ([node respondsToSelector:@selector(nodeClass)] &&
+            [[node nodeClass] isEqualToString:@"VGBeautyFilterNode"]) {
+            foundBeauty = YES;
+            break;
+        }
+    }
+    XCTAssertFalse(foundBeauty, @"Beauty filter must be absent after clearing specs");
 
     [session invalidate];
 }
+
 
 // ─── 7. No pool returns UNSUPPORTED_CAMERA_FILTER_RESOURCE_CONTRACT ──────────
 
@@ -440,6 +495,9 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
         @{ @"type": @"lut" }
     ];
 
+    // Snapshot the node identity set before the rejected operation.
+    NSSet<NSString *> *nodeKeysBefore = [self VGCFC2_nodeKeySet:session];
+
     NSError *error = nil;
     BOOL success = [session setCameraFilterChainFromSpecs:specs error:&error];
 
@@ -447,11 +505,15 @@ static BOOL   g_vgcfc2_mockEnabled = NO;
     XCTAssertEqualObjects(error.domain, @"UNSUPPORTED_FILTER_TYPE",
         @"Error domain must be UNSUPPORTED_FILTER_TYPE (lut is deferred)");
 
-    // Atomic: graph must be unchanged despite beauty being valid.
-    NSDictionary<NSString *, id> *nodes = [session valueForKey:@"_nodes"];
-    XCTAssertEqual(nodes.count, 2u,
-        @"Graph must not be mutated — atomic validation failed at lut");
+    // Atomicity: the node set must be identical to what it was before the rejection.
+    // Neither the beauty node nor the lut node may have been inserted.
+    NSSet<NSString *> *nodeKeysAfter = [self VGCFC2_nodeKeySet:session];
+    XCTAssertEqualObjects(nodeKeysBefore, nodeKeysAfter,
+        @"Graph must not be mutated — atomic validation failed at lut: node key sets must be equal");
+    XCTAssertEqual(nodeKeysBefore.count, nodeKeysAfter.count,
+        @"Graph must not be mutated — atomic validation failed at lut: node counts must be equal");
 
+    NSDictionary<NSString *, id> *nodes = [session valueForKey:@"_nodes"];
     BOOL foundBeauty = NO;
     for (id value in nodes.allValues) {
         if ([value isKindOfClass:[VanguardBeautyFilterNode class]]) {
