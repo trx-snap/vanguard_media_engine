@@ -185,7 +185,9 @@ Pod::Spec.new do |s|
       # Phase 9B-3: Camera graph factory gate test (gate-OFF path, VGHeuristicMaskProvider default)
       'Tests/VGCameraGraphFactoryGateTest.m',
       # Phase 10-C-3L.1D: Spatial transform filter node tests
-      'Tests/VGTransformFilterNodeTest.m'
+      'Tests/VGTransformFilterNodeTest.m',
+      # Phase 10-C Slice A: Audio export static zero-gain correction gate
+      'Tests/VGAudioExportMuxerTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage'
     ts.dependency    'UMF'

@@ -757,11 +757,15 @@ static void _VGAudioExportMuxerLogInit(void) {
 
         double startTime      = [td[@"startTime"] doubleValue];
         double duration       = [td[@"duration"]  doubleValue];
-        double volume         = [td[@"volume"]    doubleValue];
+        // Phase 10-C Slice A: distinguish an omitted key (nil → 0.0 via doubleValue)
+        // from an explicit zero, so that a static volume of 0.0 produces silence
+        // rather than being reset to unity gain.
+        id rawVolume = td[@"volume"];
+        double volume = rawVolume ? [rawVolume doubleValue] : 1.0;
         double fadeInSeconds  = [td[@"fadeInSeconds"]  doubleValue];
         double fadeOutSeconds = [td[@"fadeOutSeconds"] doubleValue];
 
-        if (volume <= 0.0) volume = 1.0;
+        if (volume < 0.0) volume = 1.0;
         if (startTime < 0.0) startTime = 0.0;
         if (duration <= 0.0) {
             os_log_error(sMuxerLog,
