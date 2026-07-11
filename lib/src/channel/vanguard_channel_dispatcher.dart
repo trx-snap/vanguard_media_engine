@@ -35,7 +35,9 @@ import 'package:flutter/services.dart';
 // ── Typedefs ──────────────────────────────────────────────────────────────────
 
 /// Callback type for timeline frame PTS updates.
-typedef VGTimelineFrameCallback = void Function(double pts);
+/// [generation] mirrors the native generation counter sent by the compositor;
+/// consumers use it to discard frames that belong to superseded seek requests.
+typedef VGTimelineFrameCallback = void Function(double pts, int generation);
 
 /// Callback type for timeline end-of-stream.
 typedef VGTimelineEOSCallback = void Function();
@@ -228,10 +230,12 @@ final class VanguardChannelDispatcher {
     final args = arguments as Map?;
     final textureId = (args?['textureId'] as num?)?.toInt();
     final pts = (args?['pts'] as num?)?.toDouble();
+    // generation is optional — defaults to 0 for payloads that do not include it.
+    final generation = (args?['generation'] as num?)?.toInt() ?? 0;
     if (textureId == null || pts == null) return; // malformed — drop silently
 
     final entry = _timelineListeners[textureId];
-    entry?.onFrame(pts);
+    entry?.onFrame(pts, generation);
   }
 
   void _dispatchTimelineEOS(dynamic arguments) {

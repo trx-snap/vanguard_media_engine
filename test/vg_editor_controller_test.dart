@@ -360,6 +360,86 @@ void main() {
     });
   });
 
+  group('VGEditorController — seekCoalesced() and cancelPendingCoalescedSeek() [coalescing logic]', () {
+    late VGEditorController controller;
+    final List<String> calledMethods = [];
+    final List<double> seekTimesDispatched = [];
+
+    Future<void> _invokeNative(String method, [dynamic arguments]) async {
+      final codec = const StandardMethodCodec();
+      final data = codec.encodeMethodCall(MethodCall(method, arguments));
+      await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .handlePlatformMessage(
+        'vanguard_media_engine',
+        data,
+        (ByteData? reply) {},
+      );
+    }
+
+    setUp(() async {
+      calledMethods.clear();
+      seekTimesDispatched.clear();
+      _setMockHandler((method, args) async {
+        calledMethods.add(method);
+        if (method == 'createTimelineTexture') {
+          return {'textureId': 55, 'width': 640, 'height': 360};
+        }
+        if (method == 'timelineSeek') {
+          final seconds = (args as Map)['seconds'] as num;
+          seekTimesDispatched.add(seconds.toDouble());
+          return null;
+        }
+        return null;
+      });
+      controller = VGEditorController(initialDraft: _twoClipDraft());
+      await controller.initialize();
+    });
+
+    tearDown(() => controller.dispose());
+
+    test('EC-SK-C1 seekCoalesced immediately dispatches first seek and queues subsequent ones', () async {
+      // 1. Initial seek: should be dispatched immediately because no seek is in-flight.
+      controller.seekCoalesced(1.0);
+      expect(seekTimesDispatched, [1.0]);
+
+      // 2. Subsequent seeks while first is in-flight: should be coalesced (only latest is stored).
+      controller.seekCoalesced(2.0);
+      controller.seekCoalesced(3.0);
+      expect(seekTimesDispatched, [1.0]); // Still only 1.0 has been sent to native
+
+      // 3. Deliver frame for generation 1 (first seek): triggers drain of the next pending seek (3.0).
+      await _invokeNative('onTimelineFrame', {'textureId': 55, 'pts': 1.0, 'generation': 1});
+      expect(seekTimesDispatched, [1.0, 3.0]); // 3.0 was drained and dispatched
+    });
+
+    test('EC-SK-C2 stale generation frames do not clear in-flight flag', () async {
+      controller.seekCoalesced(1.0);
+      expect(seekTimesDispatched, [1.0]);
+
+      controller.seekCoalesced(2.0);
+
+      // Deliver frame with old generation (e.g. 0). Should NOT clear the in-flight flag, so 2.0 is NOT dispatched yet.
+      await _invokeNative('onTimelineFrame', {'textureId': 55, 'pts': 0.5, 'generation': 0});
+      expect(seekTimesDispatched, [1.0]);
+
+      // Deliver frame with generation 1. Should clear the flag and drain 2.0.
+      await _invokeNative('onTimelineFrame', {'textureId': 55, 'pts': 1.0, 'generation': 1});
+      expect(seekTimesDispatched, [1.0, 2.0]);
+    });
+
+    test('EC-SK-C3 cancelPendingCoalescedSeek discards queued seek', () async {
+      controller.seekCoalesced(1.0);
+      expect(seekTimesDispatched, [1.0]);
+
+      controller.seekCoalesced(2.0);
+      controller.cancelPendingCoalescedSeek();
+
+      // Deliver frame for generation 1: no pending seek should be drained because it was cancelled.
+      await _invokeNative('onTimelineFrame', {'textureId': 55, 'pts': 1.0, 'generation': 1});
+      expect(seekTimesDispatched, [1.0]); // 2.0 was never sent
+    });
+  });
+
   // ───────────────────────────────────────────────────────────────────────────
   // updateDraft() — production route
   // ───────────────────────────────────────────────────────────────────────────

@@ -177,6 +177,32 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// Whether [dispose] has been called.
   bool _disposed = false;
 
+  // ── Latest-wins seek coalescer ─────────────────────────────────────────────
+  //
+  // When the user scrubs rapidly, multiple seek() calls arrive faster than
+  // the native compositor can decode and deliver onTimelineFrame callbacks.
+  // Without coalescing the channel fills with pending seeks that replay as a
+  // backlog after the gesture ends.
+  //
+  // Strategy (pure Dart, no native changes):
+  //   - _pendingCoalescedSeek: the most recently requested seek time.
+  //     Updated synchronously on every scrub event by seekCoalesced().
+  //   - _coalescedSeekInFlight: true while a native seek() is awaiting its
+  //     onTimelineFrame acknowledgement.
+  //   - When a seek completes (onTimelineFrame delivers the matching generation),
+  //     _drainCoalescedSeek() dispatches the next pending seek if one exists.
+  //
+  // This ensures at most ONE native seek is active at a time while always
+  // converging on the most recently requested position.
+
+  double? _pendingCoalescedSeek;
+  bool _coalescedSeekInFlight = false;
+
+  // Generation tracking: native compositor increments generation on each seek.
+  // We track the highest generation we dispatched so that onTimelineFrame
+  // callbacks for earlier generations can be filtered out.
+  int _latestDispatchedGeneration = 0;
+
   // ── Convenience accessors ──────────────────────────────────────────────────
 
   /// The active draft. Immutable. Updated by [updateDraft].
@@ -244,11 +270,29 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     return null;
   }
 
-  void _onTimelineFrame(double pts) {
+  void _onTimelineFrame(double pts, int generation) {
     if (_disposed) return;
+
+    // Filter out stale frames from earlier seeks.
+    if (generation < _latestDispatchedGeneration) {
+      return;
+    }
+
+    // Track the highest generation we have received from native.
+    if (generation > _latestDispatchedGeneration) {
+      _latestDispatchedGeneration = generation;
+    }
+
     if (!_ptsController.isClosed) _ptsController.add(pts);
     value = value.copyWith(currentPTS: pts);
     notifyListeners();
+
+    // A frame has arrived — if a coalesced seek was in flight, it has now
+    // been acknowledged. Drain any pending next seek.
+    if (_coalescedSeekInFlight) {
+      _coalescedSeekInFlight = false;
+      _drainCoalescedSeek();
+    }
   }
 
   void _onTimelineEOS() {
@@ -424,6 +468,70 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   }
 
   // ── Draft mutation ─────────────────────────────────────────────────────────
+
+  /// Requests a seek to [seconds] using latest-wins coalescing.
+  ///
+  /// Unlike [seek], this method does not await the native operation.
+  /// It records [seconds] as the next desired seek position and dispatches
+  /// to native only when no other seek is currently in flight. If a seek IS
+  /// already in flight, the position is stored and dispatched automatically
+  /// when the in-flight seek is acknowledged via [_onTimelineFrame].
+  ///
+  /// Use this for high-frequency scrub gestures to avoid flooding the
+  /// MethodChannel with redundant seeks. Use [seek] for one-shot programmatic
+  /// seeks (loop start, play-at-beginning) where you need to await completion.
+  ///
+  /// No-op if not ready or disposed.
+  void seekCoalesced(double seconds) {
+    if (_disposed || !value.isReady) return;
+    _pendingCoalescedSeek = seconds;
+    if (!_coalescedSeekInFlight) {
+      _drainCoalescedSeek();
+    }
+  }
+
+  void _drainCoalescedSeek() {
+    final next = _pendingCoalescedSeek;
+    if (next == null || _disposed || !value.isReady) return;
+    _pendingCoalescedSeek = null;
+    _coalescedSeekInFlight = true;
+    _latestDispatchedGeneration++;
+    // Fire-and-forget: a scrub seek failure is non-fatal.
+    _channel
+        .invokeMethod<void>('timelineSeek', {'seconds': next})
+        .then((_) {
+          if (_disposed) {
+            _coalescedSeekInFlight = false;
+            return;
+          }
+          // Update PTS optimistically so the UI stays responsive.
+          // Do NOT clear _coalescedSeekInFlight here — the channel returning
+          // only means native accepted the command, not that the frame is
+          // rendered. The flag is cleared exclusively in _onTimelineFrame
+          // so the next seek is held until the frame is actually delivered.
+          value = value.copyWith(
+            currentPTS: next,
+            statusMessage: 'Seeked to ${next.toStringAsFixed(2)}s',
+          );
+          notifyListeners();
+        })
+        .catchError((Object _) {
+          // On dispatch failure, release the in-flight lock so future scrubs
+          // are not permanently blocked.
+          _coalescedSeekInFlight = false;
+          _drainCoalescedSeek();
+        });
+  }
+
+  /// Discards any pending coalesced seek without dispatching it.
+  ///
+  /// Call this before issuing a direct [seek] (e.g. on drag end) so that
+  /// an already-queued coalesced position cannot overwrite the final target
+  /// after the direct seek completes.
+  void cancelPendingCoalescedSeek() {
+    _pendingCoalescedSeek = null;
+  }
+
 
   /// Replaces the active draft and rebuilds the native timeline.
   ///
