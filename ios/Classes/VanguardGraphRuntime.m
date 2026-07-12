@@ -51,12 +51,15 @@
 #import "VGRendererSinkAdapter.h"
 #import "VGTimelineCompositorNode.h"
 #import "VGTimelinePlaybackGraphFactory.h"
-#import <UMF/VGSourceNode.h>
 #import <QuartzCore/QuartzCore.h>
 #import <UMF/VGFrameEnvelope.h>
 #import <UMF/VGFrameRequest.h>
 #import <UMF/VGFrameResult.h>
 #import <UMF/VGRenderMode.h>
+#import <UMF/VGSourceNode.h>
+// Phase 10-C Slice C: timeline-state snapshot for cross-thread readers.
+#import <os/lock.h>
+#import "VGTimelineStateSnapshot.h"
 #endif
 
 // UMF shared infrastructure
@@ -139,9 +142,10 @@ static BOOL VGRIsImageURL(NSURL *url) {
     VGGraphExecutionContext *executionContext;
 // Phase 7 Stage 7.5C / Phase 7.x-D: timeline pull-loop state.
 // All nil/zero unless prepareWithSourceNode:completion: was used.
-// activeSourceNode: stores any id<VGSourceNode> (e.g. VGTimelineCompositorNode).
-// Timeline-specific properties (seek, cache) only act when activeSourceNode
-// is a VGTimelineCompositorNode (guarded by isKindOfClass: at each call site).
+// activeSourceNode: stores any id<VGSourceNode> (e.g.
+// VGTimelineCompositorNode). Timeline-specific properties (seek, cache) only
+// act when activeSourceNode is a VGTimelineCompositorNode (guarded by
+// isKindOfClass: at each call site).
 @property(nonatomic, strong, nullable) id<VGSourceNode> activeSourceNode;
 @property(nonatomic, strong, nullable)
     VGRendererSinkAdapter *timelineSinkAdapter;
@@ -154,9 +158,10 @@ static BOOL VGRIsImageURL(NSURL *url) {
 @property(nonatomic, assign) double timelineCurrentPTS;
 @property(nonatomic, assign) BOOL timelineIsPlaying;
 // [7.5C] Wall-clock playback clock anchors.
-// timelinePlayStartTime: CACurrentMediaTime() captured at play (or seek-while-playing).
-// timelineBasePTS: timelineCurrentPTS captured at that same moment.
-// Used to compute timelineCurrentPTS = timelineBasePTS + (CACurrentMediaTime() - timelinePlayStartTime).
+// timelinePlayStartTime: CACurrentMediaTime() captured at play (or
+// seek-while-playing). timelineBasePTS: timelineCurrentPTS captured at that
+// same moment. Used to compute timelineCurrentPTS = timelineBasePTS +
+// (CACurrentMediaTime() - timelinePlayStartTime).
 @property(nonatomic, assign) double timelinePlayStartTime;
 @property(nonatomic, assign) double timelineBasePTS;
 // When YES the display link must pull exactly one preview frame even while
@@ -165,7 +170,7 @@ static BOOL VGRIsImageURL(NSURL *url) {
 #endif
 
 - (NSDictionary *)vg_timelineFrameArgumentsForPTS:(double)pts
-                                        generation:(NSInteger)generation;
+                                       generation:(NSInteger)generation;
 
 - (NSDictionary *)vg_timelineEOSArguments;
 
@@ -199,6 +204,18 @@ static BOOL VGRIsImageURL(NSURL *url) {
   // value to reportPoolReleased: in invalidateAsync and _releaseSessionPool.
   // Zero when no budget was reserved (budget denied or pool creation failed).
   NSUInteger _sessionPoolBytes;
+
+#if VG_USE_V2_GRAPH
+  // Phase 10-C Slice C: coherent timeline-state snapshot.
+  // Protects _timelineSnapshotState against torn cross-thread reads.
+  // os_unfair_lock is priority-aware and has nanosecond-scale hold time
+  // (one struct copy). Safe for the Classification B scheduling queue in
+  // Slice D. MUST NOT be acquired from a hard real-time render callback.
+  os_unfair_lock _timelineSnapshotLock;
+  // The snapshot is zero-initialised (isValid == NO) until the first
+  // successful prepareWithSourceNode:completion: call.
+  VGTimelineStateSnapshot _timelineSnapshotState;
+#endif
 }
 
 @synthesize state = _vg_state;
@@ -235,6 +252,13 @@ static BOOL VGRIsImageURL(NSURL *url) {
   _sessionPoolBytes =
       0; // P4-8: populated in prepareWithURL: after pool creation
   _renderSize = CGSizeZero;
+
+#if VG_USE_V2_GRAPH
+  // Phase 10-C Slice C: initialise snapshot lock and zero-initialise state.
+  // isValid remains NO — an unprepared runtime is not a valid timeline.
+  _timelineSnapshotLock = OS_UNFAIR_LOCK_INIT;
+  _timelineSnapshotState = (VGTimelineStateSnapshot){0};
+#endif
 
   // Serial FIFO queue for source/renderer setup and post-prepare operations.
   _prepareQueue = dispatch_queue_create("com.vanguard.graph_runtime.prepare",
@@ -692,6 +716,17 @@ static BOOL VGRIsImageURL(NSURL *url) {
   if (alreadyInvalidated) {
     return; // Idempotent — second call is a no-op.
   }
+
+#if VG_USE_V2_GRAPH
+  // Phase 10-C Slice C: mark snapshot invalid immediately — before any
+  // cleanup — so pending callbacks that passed the _invalidated check above
+  // cannot republish a valid snapshot. _publishTimelineSnapshot also checks
+  // _invalidated under the lock, providing a second safety net.
+  os_unfair_lock_lock(&_timelineSnapshotLock);
+  _timelineSnapshotState.isValid = NO;
+  _timelineSnapshotState.isPlaying = NO;
+  os_unfair_lock_unlock(&_timelineSnapshotLock);
+#endif
 
   // Phase 2 (Step 3): relinquish the audio activation slot as the very first
   // teardown action. This frees the slot for the next session immediately,
@@ -1938,6 +1973,10 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
     self.textureId = tid;
     self.state = VGRuntimeStatePrepared;
 
+    // Phase 10-C Slice C: publish initial valid snapshot before completion
+    // fires. All five mapped fields are at their zero/prepared values.
+    [self _publishTimelineSnapshot];
+
     NSLog(@"[VanguardGraphRuntime][7.5C] timeline runtime prepared "
            "textureId=%lld nodeId=%@",
           (long long)tid, compositorNode.nodeId);
@@ -2010,6 +2049,10 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
   if (self.timelineIsPlaying) {
     double elapsed = CACurrentMediaTime() - self.timelinePlayStartTime;
     self.timelineCurrentPTS = self.timelineBasePTS + elapsed;
+    // Phase 10-C Slice C: publish updated PTS before dispatching the pull.
+    // Must occur after timelineCurrentPTS is written and before the pull
+    // block captures currentPTS below.
+    [self _publishTimelineSnapshot];
   }
 
   // Capture snapshot of PTS and generation for this tick.
@@ -2074,9 +2117,11 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
         if (!ss || ss->_invalidated)
           return;
         ss.timelineIsPlaying = NO;
-        [ss.methodChannel
-            invokeMethod:@"onTimelineEOS"
-               arguments:[ss vg_timelineEOSArguments]];
+        // Phase 10-C Slice C: publish stopped state after EOS.
+        // Snapshot remains isValid == YES — the runtime is still prepared.
+        [ss _publishTimelineSnapshot];
+        [ss.methodChannel invokeMethod:@"onTimelineEOS"
+                             arguments:[ss vg_timelineEOSArguments]];
         NSLog(@"[VanguardGraphRuntime][7.5C] timeline EOS reached "
                "PTS=%.3f",
               currentPTS);
@@ -2140,6 +2185,11 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
       self.timelineBasePTS = self.timelineCurrentPTS;
     }
 
+    // Phase 10-C Slice C: all seek mutations are complete; publish one coherent
+    // snapshot before dispatching the compositor seek (which runs on the pull
+    // queue and does not touch snapshot state).
+    [self _publishTimelineSnapshot];
+
     // Forward seek to compositor (timeline path) on pull queue.
     // Guard: only VGTimelineCompositorNode supports seekTo:generation:.
     id<VGSourceNode> node = self.activeSourceNode;
@@ -2169,6 +2219,8 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
   self.timelineBasePTS = self.timelineCurrentPTS;
   self.timelineIsPlaying = YES;
   self.state = VGRuntimeStateRunning;
+  // Phase 10-C Slice C: publish after all play anchors are set.
+  [self _publishTimelineSnapshot];
   NSLog(@"[VanguardGraphRuntime][7.5C] timeline play — PTS=%.3f",
         self.timelineCurrentPTS);
 }
@@ -2178,6 +2230,9 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
            @"[7.5C] _timelinePause must be on main thread");
   self.timelineIsPlaying = NO;
   self.state = VGRuntimeStatePaused;
+  // Phase 10-C Slice C: publish frozen PTS after pause.
+  // timelineCurrentPTS retains its last display-link-computed value (correct).
+  [self _publishTimelineSnapshot];
   NSLog(@"[VanguardGraphRuntime][7.5C] timeline pause — PTS=%.3f",
         self.timelineCurrentPTS);
 }
@@ -2202,6 +2257,47 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
     return;
   }
   [(VGTimelineCompositorNode *)node flushFrameCache];
+}
+
+// ─── Phase 10-C Slice C: snapshot publication and reader ─────────────────────
+
+/// Copies the current timeline state into _timelineSnapshotState under lock.
+///
+/// Called on the main thread at the end of each logical state transition,
+/// AFTER all property mutations for that transition are complete.
+/// Exception: the initial call in prepareWithSourceNode: runs on _prepareQueue
+/// before the completion callback fires, when no reader can yet exist.
+///
+/// If _invalidated is YES, forces isValid and isPlaying to NO without copying
+/// active state. Once the snapshot is invalid it cannot become valid again.
+- (void)_publishTimelineSnapshot {
+  os_unfair_lock_lock(&_timelineSnapshotLock);
+  if (!_invalidated) {
+    _timelineSnapshotState.timelinePTS       = self.timelineCurrentPTS;
+    _timelineSnapshotState.playStartHostTime = self.timelinePlayStartTime;
+    _timelineSnapshotState.playStartPTS      = self.timelineBasePTS;
+    _timelineSnapshotState.generation        = self.timelineGeneration;
+    _timelineSnapshotState.isPlaying         = self.timelineIsPlaying;
+    // Explicit valid-state predicate — do not use numerical enum ordering.
+    _timelineSnapshotState.isValid = (
+        self.state == VGRuntimeStatePrepared ||
+        self.state == VGRuntimeStateRunning  ||
+        self.state == VGRuntimeStatePaused   ||
+        self.state == VGRuntimeStateEnded);
+  } else {
+    // Monotonic invalidity: once invalid, never restore isValid.
+    _timelineSnapshotState.isValid   = NO;
+    _timelineSnapshotState.isPlaying = NO;
+    // Timing and generation fields are preserved for forensic readers.
+  }
+  os_unfair_lock_unlock(&_timelineSnapshotLock);
+}
+
+- (VGTimelineStateSnapshot)readTimelineStateSnapshot {
+  os_unfair_lock_lock(&_timelineSnapshotLock);
+  VGTimelineStateSnapshot copy = _timelineSnapshotState;
+  os_unfair_lock_unlock(&_timelineSnapshotLock);
+  return copy;
 }
 
 #endif // VG_USE_V2_GRAPH

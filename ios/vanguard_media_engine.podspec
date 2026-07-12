@@ -25,6 +25,7 @@ Pod::Spec.new do |s|
   # Xcode to compile them into default.metallib inside VanguardMetal.bundle,
   # which CocoaPods correctly copies into Runner.app for all linkage modes.
   s.source_files     = 'Classes/**/*.{swift,h,m,mm}'
+  s.private_header_files = 'Classes/VGTimelineStateSnapshot.h'
 
   # Phase 9B — model asset bundle.
   # selfie_multiclass_256x256.tflite: Apache 2.0 (Google MediaPipe Solutions).
@@ -187,7 +188,8 @@ Pod::Spec.new do |s|
       # Phase 10-C-3L.1D: Spatial transform filter node tests
       'Tests/VGTransformFilterNodeTest.m',
       # Phase 10-C Slice A: Audio export static zero-gain correction gate
-      'Tests/VGAudioExportMuxerTest.m'
+      'Tests/VGAudioExportMuxerTest.m',
+      'Tests/VGTimelineSnapshotTest.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage'
     ts.dependency    'UMF'
