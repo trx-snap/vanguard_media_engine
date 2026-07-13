@@ -25,7 +25,13 @@ Pod::Spec.new do |s|
   # Xcode to compile them into default.metallib inside VanguardMetal.bundle,
   # which CocoaPods correctly copies into Runner.app for all linkage modes.
   s.source_files     = 'Classes/**/*.{swift,h,m,mm}'
-  s.private_header_files = 'Classes/VGTimelineStateSnapshot.h'
+  s.private_header_files = [
+    'Classes/VGTimelineStateSnapshot.h',
+    # Phase 10-C Slice D: audio preview runtime — package-internal only.
+    'Classes/VanguardAudioPreviewRuntime.h',
+    # VanguardGraphRuntime+AudioPreview.h is module-visible (not private_header_files)
+    # so Swift can call setAudioSidecarPlan:timelineDuration:completion: directly.
+  ]
 
   # Phase 9B — model asset bundle.
   # selfie_multiclass_256x256.tflite: Apache 2.0 (Google MediaPipe Solutions).
@@ -189,9 +195,13 @@ Pod::Spec.new do |s|
       'Tests/VGTransformFilterNodeTest.m',
       # Phase 10-C Slice A: Audio export static zero-gain correction gate
       'Tests/VGAudioExportMuxerTest.m',
-      'Tests/VGTimelineSnapshotTest.m'
+      # Phase 10-C Slice C: timeline-state snapshot contract tests
+      'Tests/VGTimelineSnapshotTest.m',
+      # Phase 10-C Slice D: audio preview runtime deterministic unit tests
+      'Tests/VanguardAudioPreviewRuntimeTest.m'
     ]
-    ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage'
+    ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage', 'AVFoundation'
     ts.dependency    'UMF'
   end
+
 end

@@ -60,6 +60,19 @@
 // Phase 10-C Slice C: timeline-state snapshot for cross-thread readers.
 #import <os/lock.h>
 #import "VGTimelineStateSnapshot.h"
+// Phase 10-C Slice D: audio preview runtime category.
+#import "VanguardGraphRuntime+AudioPreview.h"
+#import "VanguardAudioPreviewRuntime.h"
+
+// Phase 10-C Slice D: private forward declarations for graph-audio lifecycle
+// methods defined in VanguardGraphRuntime+AudioPreview.m. Declared here so
+// the invalidate/invalidateAsync: implementations can call them without
+// importing the category header (which is module-visible, not private).
+@interface VanguardGraphRuntime (AudioPreviewPrivate)
+- (nullable VanguardAudioPreviewRuntime *)audioPreviewRuntime;
+- (void)invalidateAudioPreviewWithCompletion:(nullable dispatch_block_t)completion;
+@end
+
 #endif
 
 // UMF shared infrastructure
@@ -187,9 +200,22 @@ static BOOL VGRIsImageURL(NSURL *url) {
 // ─────────────────────────────────────────────────────
 
 @implementation VanguardGraphRuntime {
-  // Atomic invalidation flag. Written exactly once (YES) in -invalidate.
+  // Atomic invalidation flag. Set in two places:
+  //   1. invalidateAsync: — set IMMEDIATELY on the calling thread (main) so
+  //      the CADisplayLink callback sees it on the very next tick and
+  //      self-invalidates without rendering even one more frame. This is the
+  //      primary quiesce signal.
+  //   2. invalidate — belt-and-suspenders set for direct callers that bypass
+  //      invalidateAsync:. Harmless if already YES.
   // Declared in .m so it is not part of the frozen public header.
   _Atomic(BOOL) _invalidated;
+
+  // Cleanup idempotency guard for the body of invalidate.
+  // Separate from _invalidated so that _invalidated can be set early in
+  // invalidateAsync: (for quiescing) while the actual cleanup body in
+  // invalidate still runs exactly once on _prepareQueue.
+  // Written exactly once (YES) by the first call to invalidate.
+  _Atomic(BOOL) _cleanupDone;
 
   // P4-8: Idempotency guard for pool release.
   // Written exactly once (YES) by whichever release path fires first —
@@ -248,6 +274,7 @@ static BOOL VGRIsImageURL(NSURL *url) {
   _vg_state = VGRuntimeStateIdle;
   _vg_textureId = -1;
   _invalidated = NO;
+  _cleanupDone = NO;
   _poolReleased = NO; // P4-8: reset per-session on each new runtime instance
   _sessionPoolBytes =
       0; // P4-8: populated in prepareWithURL: after pool creation
@@ -709,12 +736,18 @@ static BOOL VGRIsImageURL(NSURL *url) {
 // ─────────────────────────────────────
 
 - (void)invalidate {
-  // Atomically set _invalidated = YES. This is the sentinel that makes all
-  // other methods no-ops from this point forward.
-  // Order is mandated by AC-5: set flag FIRST, dispose renderer, then source.
-  BOOL alreadyInvalidated = atomic_exchange(&_invalidated, YES);
-  if (alreadyInvalidated) {
-    return; // Idempotent — second call is a no-op.
+  // Belt-and-suspenders: ensure _invalidated is set even when invalidate is
+  // called directly (bypassing invalidateAsync:). For the normal path this
+  // is a no-op because invalidateAsync: already set it on the calling thread.
+  atomic_store(&_invalidated, YES);
+
+  // _cleanupDone guards the cleanup body. Use atomic_exchange for a single
+  // racy write — first caller proceeds, any concurrent second call returns
+  // immediately. This is separate from _invalidated so that the early quiesce
+  // in invalidateAsync: does not skip the cleanup body.
+  BOOL alreadyCleaned = atomic_exchange(&_cleanupDone, YES);
+  if (alreadyCleaned) {
+    return; // Idempotent — cleanup has already run or is running.
   }
 
 #if VG_USE_V2_GRAPH
@@ -773,6 +806,27 @@ static BOOL VGRIsImageURL(NSURL *url) {
   [self.schedulerV2 invalidate];
   self.schedulerV2 = nil;
   self.executionContext = nil;
+  // Phase 10-C Slice D: audio preview lifecycle invariant.
+  //
+  // INVARIANT: synchronous invalidate must only be called from invalidateAsync:
+  // (which calls invalidateAudioPreviewWithCompletion:nil on the main queue
+  // BEFORE dispatching this method to _prepareQueue). By the time we reach here:
+  //   - The audio lifecycle gate is already Active → ShuttingDown.
+  //   - The replacement generation has already been incremented.
+  //   - Any in-flight setAudioSidecarPlan: will be rejected at gate 2 or 3.
+  //
+  // Production audio-capable runtimes (i.e. _timelineRuntime) must always be
+  // torn down through invalidateAsync:, never through direct invalidate calls.
+  //
+  // If audioPreviewRuntime is still non-nil here (e.g. direct invalidate on a
+  // non-audio-capable runtime, or an unexpected direct caller), initiate its
+  // own cleanup as a defensive fallback. The lifecycle gate is already closed.
+  VanguardAudioPreviewRuntime *audioRT = [self audioPreviewRuntime];
+  if (audioRT) {
+      [audioRT invalidateAsync:^{
+          NSLog(@"[VanguardGraphRuntime][D] audio preview runtime cleanup from invalidate");
+      }];
+  }
 #endif
 
   self.state = VGRuntimeStateIdle;
@@ -831,6 +885,35 @@ static BOOL VGRIsImageURL(NSURL *url) {
 // ───────────────────────────────────────
 
 - (void)invalidateAsync:(dispatch_block_t)completion {
+  // ── Immediate quiesce (Phase 10-C Slice D teardown fix) ────────────────────
+  //
+  // Set _invalidated atomically on the calling thread (main in production)
+  // BEFORE dispatching any work to _prepareQueue. This ensures:
+  //   - _timelineDisplayLinkFired: sees _invalidated==YES on the very next
+  //     main-thread tick and self-invalidates without rendering another frame.
+  //   - _publishTimelineSnapshot forces isValid=NO / isPlaying=NO so the
+  //     audio runtime's snapshot provider returns an invalid snapshot,
+  //     gating any queued commandPlay calls.
+  //
+  // If _invalidated was already YES this is a concurrent/repeated call.
+  // Fire completion asynchronously and return — cleanup runs only once.
+  BOOL alreadyInvalidated = atomic_exchange(&_invalidated, YES);
+  if (alreadyInvalidated) {
+    if (completion) {
+      dispatch_async(dispatch_get_main_queue(), completion);
+    }
+    return;
+  }
+
+#if VG_USE_V2_GRAPH
+  // Invalidate snapshot immediately on the calling thread so readers on
+  // other queues see isValid=NO before any asynchronous cleanup begins.
+  os_unfair_lock_lock(&_timelineSnapshotLock);
+  _timelineSnapshotState.isValid = NO;
+  _timelineSnapshotState.isPlaying = NO;
+  os_unfair_lock_unlock(&_timelineSnapshotLock);
+#endif
+
   // Capture source and renderer strongly on the caller thread BEFORE
   // dispatching. invalidate will nil both _source and _renderer; we need
   // the pre-invalidate values for the drain step and post-completion cleanup.
@@ -846,14 +929,47 @@ static BOOL VGRIsImageURL(NSURL *url) {
   _sessionPool = NULL;
   _sessionPoolBytes = 0;
 
+#if VG_USE_V2_GRAPH
+  // Phase 10-C Slice D: initiate graph-audio shutdown on the main queue BEFORE
+  // dispatching video/graph cleanup to _prepareQueue. This ensures:
+  //   - The audio lifecycle gate transitions Active → ShuttingDown on main.
+  //   - The replacement generation is incremented before any in-flight
+  //     setAudioSidecarPlan: can install a new runtime on main.
+  //   - Any stale setAudioSidecarPlan: completions are rejected at gate 2 or 3.
+  // The second join (inside afterVideoCleanup below) ensures the graph
+  // completion fires only after BOTH video and audio cleanup complete.
+  if ([NSThread isMainThread]) {
+      [self invalidateAudioPreviewWithCompletion:nil];
+  } else {
+      dispatch_sync(dispatch_get_main_queue(), ^{
+          [self invalidateAudioPreviewWithCompletion:nil];
+      });
+  }
+#endif
+
   dispatch_async(_prepareQueue, ^{
     NSLog(@"[TRACE][IA1] invalidate started on prepareQueue");
     [self invalidate];
 
     dispatch_block_t afterCompletion = ^{
       dispatch_async(dispatch_get_main_queue(), ^{
+#if VG_USE_V2_GRAPH
+        // Phase 10-C Slice D: join audio cleanup before firing the graph
+        // completion. This is the second call to invalidateAudioPreviewWithCompletion:.
+        // If the audio lifecycle gate is already ShutDown (because no audio was
+        // active, or because it completed before video), this fires immediately.
+        // If audio cleanup is still in progress (ShuttingDown), we append ourselves
+        // as a waiter and fire only after audio cleanup completes.
+        // The graph completion is therefore deferred until BOTH video and audio
+        // cleanup are fully done.
+        [self invalidateAudioPreviewWithCompletion:^{
+            if (completion)
+                completion();
+        }];
+#else
         if (completion)
           completion();
+#endif
         [capturedRenderer doUnregisterTexture];
 
         // ── P4-8: GPU-fence deferred pool release ──────────────────────────
@@ -2120,6 +2236,8 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
         // Phase 10-C Slice C: publish stopped state after EOS.
         // Snapshot remains isValid == YES — the runtime is still prepared.
         [ss _publishTimelineSnapshot];
+        // Phase 10-C Slice D: stop audio preview on EOS.
+        [ss.audioPreviewRuntime commandEOS];
         [ss.methodChannel invokeMethod:@"onTimelineEOS"
                              arguments:[ss vg_timelineEOSArguments]];
         NSLog(@"[VanguardGraphRuntime][7.5C] timeline EOS reached "
@@ -2189,6 +2307,10 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
     // snapshot before dispatching the compositor seek (which runs on the pull
     // queue and does not touch snapshot state).
     [self _publishTimelineSnapshot];
+    // Phase 10-C Slice D: forward seek command to audio preview runtime.
+    // Must be called after the snapshot is published so the audio runtime
+    // reads the updated PTS and generation when it rereads the snapshot.
+    [self.audioPreviewRuntime commandSeek];
 
     // Forward seek to compositor (timeline path) on pull queue.
     // Guard: only VGTimelineCompositorNode supports seekTo:generation:.
@@ -2221,6 +2343,8 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
   self.state = VGRuntimeStateRunning;
   // Phase 10-C Slice C: publish after all play anchors are set.
   [self _publishTimelineSnapshot];
+  // Phase 10-C Slice D: forward play command to audio preview runtime.
+  [self.audioPreviewRuntime commandPlay];
   NSLog(@"[VanguardGraphRuntime][7.5C] timeline play — PTS=%.3f",
         self.timelineCurrentPTS);
 }
@@ -2233,6 +2357,8 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
   // Phase 10-C Slice C: publish frozen PTS after pause.
   // timelineCurrentPTS retains its last display-link-computed value (correct).
   [self _publishTimelineSnapshot];
+  // Phase 10-C Slice D: forward pause command to audio preview runtime.
+  [self.audioPreviewRuntime commandPause];
   NSLog(@"[VanguardGraphRuntime][7.5C] timeline pause — PTS=%.3f",
         self.timelineCurrentPTS);
 }

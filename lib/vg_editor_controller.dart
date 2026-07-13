@@ -123,8 +123,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     )
     // ignore: deprecated_member_use_from_same_package
     this.useRealVideoClips = true,
-  })  : _channel = channel ?? const MethodChannel('vanguard_media_engine'),
-        super(VGEditorValue.initial(initialDraft));
+  }) : _channel = channel ?? const MethodChannel('vanguard_media_engine'),
+       super(VGEditorValue.initial(initialDraft));
 
   // ── Channel ────────────────────────────────────────────────────────────────
 
@@ -176,6 +176,20 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
   /// Whether [dispose] has been called.
   bool _disposed = false;
+
+  // ── Teardown — exact-once dispatch (Phase 10-C Slice D teardown fix) ────────
+  //
+  // _teardownFuture is set the first time either [disposeAsync] or [dispose]
+  // dispatches the native `disposeTimeline` MethodChannel call. Subsequent
+  // calls to [disposeAsync] return the same future; [dispose] skips the
+  // native call if _teardownFuture is already set.
+  //
+  // This ensures:
+  //   - `disposeTimeline` is sent to native exactly once.
+  //   - Repeated [disposeAsync] calls join the same teardown future.
+  //   - [disposeAsync] followed by [dispose] does not send a second request.
+  //   - [dispose] alone still triggers native teardown (fire-and-forget).
+  Future<void>? _teardownFuture;
 
   // ── Latest-wins seek coalescer ─────────────────────────────────────────────
   //
@@ -303,10 +317,32 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
+  // ── Phase 10-C Slice F: preview-derivation boundary ──────────────────────
+  //
+  // Returns a disposable derived draft suitable for preview serialisation.
+  //
+  // Contract:
+  //   - `source` is the raw authoring draft; it is never mutated.
+  //   - The returned draft is ephemeral — it must not be persisted back into
+  //     any controller authoring state, undo/redo history or user state.
+  //   - Calling this twice with the same unchanged raw source always produces
+  //     structurally equal output (idempotent).  Because flattenOriginalClipAudio
+  //     derives Original tracks from `source.clips`, repeated calls never
+  //     accumulate duplicate tracks.
+  //   - Do NOT filter Voiceover before calling this.  Voiceover must pass
+  //     through applyAudioCompositionPolicy so that Original muting matches
+  //     export policy exactly (preview/export parity).
+  //   - `durationSeconds` must be taken from the raw `source`, not from the
+  //     derived draft, because derivation does not alter timeline structure.
+  VGEditorDraft _derivePreviewDraft(VGEditorDraft source) =>
+      source.flattenOriginalClipAudio().applyAudioCompositionPolicy();
+
   /// Initializes the native timeline texture using the current draft.
   ///
   /// Maps to `createTimelineTexture` (Phase 7.8 production route, DEC-140).
-  /// Sends the full [VGEditorDraft] serialized under the `'draft'` key.
+  /// Sends the derived preview [VGEditorDraft] serialized under the `'draft'`
+  /// key (flattenOriginalClipAudio → applyAudioCompositionPolicy).  The raw
+  /// authoring draft is preserved unchanged in controller state.
   /// On success, [value.textureId] is set and [value.isReady] becomes true.
   ///
   /// Throws [StateError] if already disposed.
@@ -325,10 +361,16 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     notifyListeners();
 
     try {
+      // Phase 10-C Slice F: derive the disposable preview draft from the raw
+      // authoring draft.  The raw draft (value.draft) is never mutated.
+      final previewDraft = _derivePreviewDraft(value.draft);
       final result = await _channel.invokeMapMethod<String, dynamic>(
         'createTimelineTexture',
         {
-          'draft': value.draft.toMap(),
+          'draft': previewDraft.toMap(),
+          // Phase 10-C Slice D: authoritative timeline duration for audio scheduling.
+          // Taken from the raw draft — derivation does not alter timeline structure.
+          'durationSeconds': value.draft.durationSeconds,
         },
       );
 
@@ -357,7 +399,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
         isReady: true,
         currentPTS: 0.0,
         isPlaying: false,
-        statusMessage: 'Ready — ${value.draft.durationSeconds.toStringAsFixed(1)}s',
+        statusMessage:
+            'Ready — ${value.draft.durationSeconds.toStringAsFixed(1)}s',
       );
       notifyListeners();
     } on PlatformException catch (e) {
@@ -424,8 +467,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
       await _channel.invokeMethod<void>('timelinePause');
       value = value.copyWith(
         isPlaying: false,
-        statusMessage:
-            'Paused at ${value.currentPTS.toStringAsFixed(2)}s',
+        statusMessage: 'Paused at ${value.currentPTS.toStringAsFixed(2)}s',
       );
       notifyListeners();
     } on PlatformException catch (e) {
@@ -446,10 +488,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     if (!value.isReady) return;
 
     try {
-      await _channel.invokeMethod<void>(
-        'timelineSeek',
-        {'seconds': seconds},
-      );
+      await _channel.invokeMethod<void>('timelineSeek', {'seconds': seconds});
       value = value.copyWith(
         currentPTS: seconds,
         statusMessage: 'Seeked to ${seconds.toStringAsFixed(2)}s',
@@ -527,7 +566,6 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     _pendingCoalescedSeek = null;
   }
 
-
   /// Replaces the active draft and rebuilds the native timeline.
   ///
   /// Maps to `updateTimeline` (Phase 7.8 production route, DEC-140).
@@ -542,6 +580,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     // Pause before rebuild.
     if (value.isPlaying) await pause();
 
+    final oldSubscription = _timelineSubscription;
+
     _busy = true;
     // Clear texture immediately so stale frames disappear.
     value = value.copyWith(
@@ -555,18 +595,43 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     notifyListeners();
 
     try {
-      final result = await _channel.invokeMapMethod<String, dynamic>(
-        'updateTimeline',
-        {
-          'draft': nextDraft.toMap(),
-        },
-      );
+      // Phase 10-C Slice F: derive the disposable preview draft from nextDraft,
+      // not value.draft, to avoid serialising a stale authoring state.
+      // The raw nextDraft is never mutated.
+      final previewDraft = _derivePreviewDraft(nextDraft);
+      final result = await _channel.invokeMapMethod<String, dynamic>('updateTimeline', {
+        'draft': previewDraft.toMap(),
+        // Phase 10-C Slice D: authoritative timeline duration for audio scheduling.
+        // VGEditorDraft.durationSeconds is computed by subtracting non-hard-cut
+        // transition overlaps from the sum of clip timelineDurations.
+        // The native plugin passes this to VanguardAudioPreviewRuntime so it can
+        // compute boundary-timer delays correctly without reading draft internals.
+        'durationSeconds': nextDraft.durationSeconds,
+      });
 
       final id = (result?['textureId'] as num?)?.toInt();
       if (id == null || id < 0) {
         throw StateError(
           '[VGEditorController] updateDraft: native returned invalid textureId=$id',
         );
+      }
+
+      // Safe listener handoff: register new before unregistering old to avoid gaps.
+      final dispatcher = VanguardChannelDispatcher.instance;
+      if (oldSubscription == null ||
+          oldSubscription.textureId != id ||
+          // ignore: invalid_use_of_visible_for_testing_member
+          !dispatcher.hasTimelineListenerForTesting(id)) {
+        final newSubscription = dispatcher.registerTimelineListener(
+          textureId: id,
+          onFrame: _onTimelineFrame,
+          onEOS: _onTimelineEOS,
+        );
+        _timelineSubscription = newSubscription;
+
+        if (oldSubscription != null) {
+          dispatcher.unregisterTimelineListener(oldSubscription);
+        }
       }
 
       value = value.copyWith(
@@ -861,19 +926,18 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// Throws [StateError] if [dispose] has been called.
   Future<List<VGReverseSidecarStatus>> prepareReverseSidecars() async {
     _assertNotDisposed();
-    final reversedClips =
-        value.draft.clips.where((c) => c.isReversed).toList();
+    final reversedClips = value.draft.clips.where((c) => c.isReversed).toList();
     if (reversedClips.isEmpty) return const [];
 
     final clips = reversedClips.map((c) {
       return <String, Object>{
-        'clipId':       c.id,
-        'sourcePath':   c.sourcePath,
-        'trimStart':    c.trimStartSeconds,
-        'trimEnd':      c.trimEndSeconds,
-        'targetWidth':  value.draft.canvasWidth.toDouble(),
+        'clipId': c.id,
+        'sourcePath': c.sourcePath,
+        'trimStart': c.trimStartSeconds,
+        'trimEnd': c.trimEndSeconds,
+        'targetWidth': value.draft.canvasWidth.toDouble(),
         'targetHeight': value.draft.canvasHeight.toDouble(),
-        'sourceHash':   _sidecarSourceHash(c),
+        'sourceHash': _sidecarSourceHash(c),
       };
     }).toList();
 
@@ -963,7 +1027,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     }
     if (value.isExporting) {
       throw StateError(
-          '[VGEditorController] export: an export is already in progress');
+        '[VGEditorController] export: an export is already in progress',
+      );
     }
 
     // Pause before export.
@@ -987,10 +1052,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
           .applyAudioCompositionPolicy();
       final result = await _channel.invokeMapMethod<String, dynamic>(
         'exportTimeline',
-        {
-          'draft': exportDraft.toMap(),
-          ...request.toMap(),
-        },
+        {'draft': exportDraft.toMap(), ...request.toMap()},
       );
 
       if (result == null) {
@@ -1032,27 +1094,42 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     }
   }
 
-  // ── Disposal (Opus M3) ─────────────────────────────────────────────────────
+  // ── Disposal (Opus M3 / Phase 10-C Slice D teardown fix) ──────────────────
 
   /// Asynchronously tears down the native timeline.
   ///
   /// Maps to `disposeTimeline` (Phase 7.8 production route).
-  /// Safe to call multiple times (idempotent).
+  ///
+  /// Repeated calls are safe and idempotent — every call returns the same
+  /// teardown future. Native `disposeTimeline` is dispatched exactly once.
   ///
   /// Call this before [dispose] in the owning widget's dispose lifecycle.
-  Future<void> disposeAsync() async {
-    if (_disposed) return;
-    // Unregister timeline subscription so no callbacks arrive after disposal.
+  Future<void> disposeAsync() {
+    if (_disposed) return Future<void>.value();
+
+    // If native teardown has already been dispatched, return the cached future
+    // so the caller joins the in-flight operation without sending a second
+    // disposeTimeline request.
+    if (_teardownFuture != null) return _teardownFuture!;
+
+    // Unregister timeline subscription so no callbacks arrive after teardown
+    // begins. Done synchronously before the first await so the subscription
+    // cannot deliver frames during the async native call.
     final dispatcher = VanguardChannelDispatcher.instance;
     if (_timelineSubscription != null) {
       dispatcher.unregisterTimelineListener(_timelineSubscription!);
       _timelineSubscription = null;
     }
-    try {
-      await _channel.invokeMethod<void>('disposeTimeline');
-    } catch (_) {
-      // Best-effort — native may already be gone.
-    }
+
+    // Cache the future before awaiting so that a concurrent disposeAsync()
+    // call arriving on the next microtask sees _teardownFuture != null and
+    // returns this same future rather than dispatching a second request.
+    _teardownFuture = _channel.invokeMethod<void>('disposeTimeline').catchError(
+      (_) {
+        // Best-effort — native may already be gone.
+      },
+    );
+    return _teardownFuture!;
   }
 
   /// Synchronously closes streams and releases [ValueNotifier] resources.
@@ -1067,7 +1144,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     if (_disposed) return;
     _disposed = true;
 
-    // Unregister timeline subscription if disposeAsync was not called.
+    // Unregister timeline subscription if disposeAsync was not called first.
     final dispatcher = VanguardChannelDispatcher.instance;
     if (_timelineSubscription != null) {
       dispatcher.unregisterTimelineListener(_timelineSubscription!);
@@ -1078,8 +1155,11 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     _ptsController.close();
     _eosController.close();
 
-    // Fire-and-forget native teardown if disposeAsync() was not called.
-    _channel.invokeMethod<void>('disposeTimeline').catchError((_) {});
+    // Dispatch native teardown fire-and-forget ONLY if disposeAsync() has not
+    // already done so. This ensures disposeTimeline is sent exactly once
+    // regardless of whether the caller followed the async → sync sequence.
+    _teardownFuture ??=
+        _channel.invokeMethod<void>('disposeTimeline').catchError((_) {});
 
     super.dispose();
   }
@@ -1256,9 +1336,7 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
   void _assertNotDisposed() {
     if (_disposed) {
-      throw StateError(
-        '[VGEditorController] method called after dispose()',
-      );
+      throw StateError('[VGEditorController] method called after dispose()');
     }
   }
 
@@ -1276,12 +1354,14 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   // ── Debug ──────────────────────────────────────────────────────────────────
 
   @override
-  String toString() => 'VGEditorController('
+  String toString() =>
+      'VGEditorController('
       'draftId: ${draft.id}, '
       'textureId: $textureId, '
       'pts: ${currentPTS.toStringAsFixed(2)}s, '
       'ready: $isReady, '
       'playing: $isPlaying, '
       'exporting: $isExporting, '
+      'tearingDown: ${_teardownFuture != null}, '
       'disposed: $_disposed)';
 }
