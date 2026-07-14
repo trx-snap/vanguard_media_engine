@@ -198,7 +198,17 @@ Pod::Spec.new do |s|
       # Phase 10-C Slice C: timeline-state snapshot contract tests
       'Tests/VGTimelineSnapshotTest.m',
       # Phase 10-C Slice D: audio preview runtime deterministic unit tests
-      'Tests/VanguardAudioPreviewRuntimeTest.m'
+      'Tests/VGAPrTestCollaborators.m',
+      'Tests/VanguardAudioPreviewRuntimeTest.m',
+      'Tests/VanguardAudioPreviewRuntimeTest_Prepare.m',
+      'Tests/VanguardAudioPreviewRuntimeTest_StateTransitions.m',
+      'Tests/VanguardAudioPreviewRuntimeTest_SourceRange.m',
+      'Tests/VanguardAudioPreviewRuntimeTest_Rescheduling.m',
+      'Tests/VanguardAudioPreviewRuntimeTest_Teardown.m',
+      'Tests/VanguardAudioPreviewRuntimeTest_SliceF_Arbitration.m',
+      'Tests/VanguardAudioPreviewRuntimeTest_SliceF_Races.m',
+      'Tests/VanguardAudioPreviewRuntimeTest_SliceF_Sequences.m',
+      'Tests/VanguardAudioPreviewRuntimeTest_SliceE.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage', 'AVFoundation'
     ts.dependency    'UMF'
