@@ -18,7 +18,30 @@
 }
 @end
 
-// ─── VGAPr_MockTimer
+// ─── VGAPr_MockAutomationTimer
+// ──────────────────────────────────────────────────
+
+@implementation VGAPr_MockAutomationTimer
+
+- (void)startWithInterval:(NSTimeInterval)interval block:(dispatch_block_t)block {
+  _startCount++;
+  _lastInterval = interval;
+  _pendingBlock = [block copy];
+}
+
+- (void)cancel {
+  _cancelCount++;
+  _pendingBlock = nil;
+}
+
+- (void)fireOnce {
+  dispatch_block_t block = self.pendingBlock;
+  if (block)
+    block();
+}
+
+@end
+
 // ────────────────────────────────────────────────────────── Records whether
 // armWithDelay:block: and cancel were called. The test drives the timer
 // callback manually via -fireForcefully.

@@ -36,12 +36,14 @@ NS_ASSUME_NONNULL_BEGIN
 
 @protocol VGAudioPreviewClock;
 @protocol VGAudioPreviewTimer;
+@protocol VGAudioPreviewAutomationTimer;
 @protocol VGAudioPreviewFileProvider;
 @protocol VGAudioPreviewEngine;
 @protocol VGAudioPreviewPlayer;
 @protocol VGAudioPreviewCommandQueue;
 @class VanguardAudioPreviewRuntime;
 @class VGAudioSidecarPlan;
+@class VGAudioPreviewAutomationCoordinator;
 
 // ─── VGAudioPreviewWorkToken
 // ──────────────────────────────────────────────────
@@ -182,12 +184,14 @@ typedef VGTimelineStateSnapshot (^VGTimelineSnapshotProvider)(void);
     NS_DESIGNATED_INITIALIZER;
 
 /// Package-internal test initialiser. Injects all collaborators.
-/// Pass nil for |timer| to use the production dispatch_source_t timer.
+/// Pass nil for |timer| to use the production dispatch_source_t boundary timer.
+/// Pass nil for |automationTimer| to use the production automation timer.
 - (instancetype)
     initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
               lifecycleEpoch:(uint64_t)lifecycleEpoch
                        clock:(id<VGAudioPreviewClock>)clock
                        timer:(nullable id<VGAudioPreviewTimer>)timer
+             automationTimer:(nullable id<VGAudioPreviewAutomationTimer>)automationTimer
                 fileProvider:(id<VGAudioPreviewFileProvider>)fileProvider
                       engine:(id<VGAudioPreviewEngine>)engine
                       player:(id<VGAudioPreviewPlayer>)player;

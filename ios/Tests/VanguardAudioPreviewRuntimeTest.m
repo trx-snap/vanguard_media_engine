@@ -32,6 +32,7 @@ NS_ASSUME_NONNULL_BEGIN
   [super setUp];
   _clock = [[VGAPr_MockClock alloc] init];
   _timer = [[VGAPr_MockTimer alloc] init];
+  _automationTimer = [[VGAPr_MockAutomationTimer alloc] init];
   _fileProvider = [[VGAPr_MockFileProvider alloc] init];
   _engine = [[VGAPr_MockEngine alloc] init];
   _player = [[VGAPr_MockPlayer alloc] init];
@@ -60,6 +61,7 @@ NS_ASSUME_NONNULL_BEGIN
                 lifecycleEpoch:epoch
                          clock:_clock
                          timer:_timer
+               automationTimer:_automationTimer
                   fileProvider:_fileProvider
                         engine:_engine
                         player:_player];
@@ -182,6 +184,28 @@ NS_ASSUME_NONNULL_BEGIN
     @"duration" : @(dur),
     @"volume" : @(vol),
   };
+}
+
+/// Builds a track dictionary with optional volumeKeyframes.
+- (NSDictionary<NSString *, id> *)trackDictWithId:(NSString *)tid
+                                             role:(NSString *)role
+                                        startTime:(double)start
+                                         duration:(double)dur
+                                           volume:(double)vol
+                                              url:(NSString *)path
+                                       keyframes:(nullable NSArray *)keyframes {
+  NSMutableDictionary *dict = [@{
+    @"trackId" : tid,
+    @"role" : role,
+    @"url" : path,
+    @"startTime" : @(start),
+    @"sourceTrimStart" : @(0.0),
+    @"duration" : @(dur),
+    @"volume" : @(vol),
+  } mutableCopy];
+  if (keyframes)
+    dict[@"volumeKeyframes"] = keyframes;
+  return [dict copy];
 }
 
 @end

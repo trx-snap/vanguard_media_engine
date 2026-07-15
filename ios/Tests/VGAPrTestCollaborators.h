@@ -10,6 +10,7 @@
 
 #import "VGTimelineStateSnapshot.h"
 #import "VanguardAudioPreviewRuntime.h"
+#import "VGAudioPreviewAutomationTimer.h"
 #import <UMF/VGAudioSidecarPlan.h>
 
 #if VG_USE_V2_GRAPH
@@ -23,10 +24,23 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic) NSTimeInterval currentTime;
 @end
 
+// ─── VGAPr_MockAutomationTimer
+// ──────────────────────────────────────
+// Mock automation timer for Slice J tests. Records start/cancel calls and
+// allows the test to fire the callback manually via -fireOnce.
+
+@interface VGAPr_MockAutomationTimer : NSObject <VGAudioPreviewAutomationTimer>
+@property(nonatomic) NSInteger startCount;
+@property(nonatomic) NSInteger cancelCount;
+@property(nonatomic) NSTimeInterval lastInterval;
+@property(nonatomic, copy, nullable) dispatch_block_t pendingBlock;
+- (void)fireOnce;
+@end
+
 // ─── VGAPr_MockTimer
-// ────────────────────────────────────────────────────────── Records whether
-// armWithDelay:block: and cancel were called. The test drives the timer
-// callback manually via -fireForcefully.
+// ────────────────────────────────────────────────────────
+// Records whether armWithDelay:block: and cancel were called. The test drives
+// the timer callback manually via -fireForcefully.
 
 @interface VGAPr_MockTimer : NSObject <VGAudioPreviewTimer>
 @property(nonatomic) NSInteger armCount;

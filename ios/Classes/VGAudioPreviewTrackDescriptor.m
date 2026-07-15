@@ -1,5 +1,5 @@
 // VGAudioPreviewTrackDescriptor.m
-// Vanguard Media Engine — Audio Modularity M2A
+// Vanguard Media Engine — Audio Modularity M2A / Slice J
 //
 // Implementation of VGAudioPreviewTrackDescriptor.
 // See VGAudioPreviewTrackDescriptor.h for API docs.
@@ -14,9 +14,10 @@ NS_ASSUME_NONNULL_BEGIN
 #pragma mark - VGAudioPreviewTrackDescriptor
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Private extension — keeps role internal to .m (Slice F Mandatory Correction 3).
+// Private extension — keeps role and rawVolumeKeyframes internal to .m.
 @interface VGAudioPreviewTrackDescriptor () {
   NSString *_role; ///< One of @"music", @"original", @"sfx", @"voiceover". Never nil.
+  NSArray *_Nullable _rawVolumeKeyframes; ///< Copied nonempty raw keyframe array or nil.
 }
 @end
 
@@ -24,6 +25,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (NSString *)role { return _role; }
 
+- (nullable NSArray *)rawVolumeKeyframes { return _rawVolumeKeyframes; }
+
+- (BOOL)hasRawKeyframes {
+  return _rawVolumeKeyframes != nil && _rawVolumeKeyframes.count > 0;
+}
 
 - (nullable instancetype)initWithDictionary:
     (NSDictionary<NSString *, id> *)dict {
@@ -118,6 +124,15 @@ NS_ASSUME_NONNULL_BEGIN
   _requestedDuration = duration;
   _staticVolume = (float)volume;
   _role = [role copy];
+
+  // Parse raw volumeKeyframes (Slice J). Store a copied nonempty array or nil.
+  id rawKfs = dict[@"volumeKeyframes"];
+  if ([rawKfs isKindOfClass:[NSArray class]] && [(NSArray *)rawKfs count] > 0) {
+    _rawVolumeKeyframes = [(NSArray *)rawKfs copy];
+  } else {
+    _rawVolumeKeyframes = nil;
+  }
+
   return self;
 }
 

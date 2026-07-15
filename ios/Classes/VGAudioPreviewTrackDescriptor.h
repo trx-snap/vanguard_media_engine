@@ -1,5 +1,5 @@
 // VGAudioPreviewTrackDescriptor.h
-// Vanguard Media Engine — Audio Modularity M2A
+// Vanguard Media Engine — Audio Modularity M2A / Slice J
 //
 // Immutable, normalised descriptor produced from one eligible track
 // dictionary in VGAudioSidecarPlan.tracks. Once constructed it is the
@@ -41,6 +41,12 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly) float staticVolume;
 /// The track role accepted by the scheduler: @"music", @"original",
 /// @"sfx", or @"voiceover".
+/// Raw volumeKeyframes array from the track dictionary, or nil if absent or
+/// empty.  Entries are unvalidated NSDictionary objects; normalization is
+/// performed externally by VGAudioPreviewKeyframeNormalizer.
+@property(nonatomic, readonly, nullable) NSArray *rawVolumeKeyframes;
+/// YES if rawVolumeKeyframes is non-nil and contains at least one entry.
+@property(nonatomic, readonly) BOOL hasRawKeyframes;
 @property(nonatomic, readonly, copy) NSString *role;
 
 /// Designated initialiser. Returns nil if any field fails validation.

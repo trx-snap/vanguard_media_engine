@@ -31,6 +31,12 @@ Pod::Spec.new do |s|
     'Classes/VanguardAudioPreviewRuntime.h',
     # Audio Modularity M2A: track descriptor — package-internal only.
     'Classes/VGAudioPreviewTrackDescriptor.h',
+    # Audio Slice J: keyframe automation — package-internal only.
+    'Classes/VGAudioPreviewVolumeKeyframe.h',
+    'Classes/VGAudioPreviewKeyframeNormalizer.h',
+    'Classes/VGAudioPreviewEnvelopeEvaluator.h',
+    'Classes/VGAudioPreviewAutomationTimer.h',
+    'Classes/VGAudioPreviewAutomationCoordinator.h',
     # VanguardGraphRuntime+AudioPreview.h is module-visible (not private_header_files)
     # so Swift can call setAudioSidecarPlan:timelineDuration:completion: directly.
   ]
@@ -210,7 +216,12 @@ Pod::Spec.new do |s|
       'Tests/VanguardAudioPreviewRuntimeTest_SliceF_Arbitration.m',
       'Tests/VanguardAudioPreviewRuntimeTest_SliceF_Races.m',
       'Tests/VanguardAudioPreviewRuntimeTest_SliceF_Sequences.m',
-      'Tests/VanguardAudioPreviewRuntimeTest_SliceE.m'
+      'Tests/VanguardAudioPreviewRuntimeTest_SliceE.m',
+      # Audio Slice J: preview keyframe automation tests
+      'Tests/VanguardAudioPreviewRuntimeTest_SliceJ_Normalization.m',
+      'Tests/VanguardAudioPreviewRuntimeTest_SliceJ_Evaluator.m',
+      'Tests/VanguardAudioPreviewRuntimeTest_SliceJ_Automation.m',
+      'Tests/VanguardAudioPreviewRuntimeTest_SliceJ_TimerProduction.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage', 'AVFoundation'
     ts.dependency    'UMF'

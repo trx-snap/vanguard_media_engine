@@ -6,6 +6,8 @@
 
 #import "VanguardAudioPreviewRuntime.h"
 #import "VGAudioPreviewTrackDescriptor.h"
+#import "VGAudioPreviewAutomationCoordinator.h"
+#import "VGAudioPreviewAutomationTimer.h"
 
 #if VG_USE_V2_GRAPH
 
@@ -254,6 +256,9 @@ NS_ASSUME_NONNULL_BEGIN
   NSTimeInterval _activeDuration;
   double _fileSampleRate;
   AVAudioFramePosition _fileLengthFrames;
+
+  // ── Slice J: automation coordinator ─────────────────────────────────────
+  VGAudioPreviewAutomationCoordinator *_coordinator;
 }
 @end
 
@@ -287,6 +292,7 @@ NS_ASSUME_NONNULL_BEGIN
                 lifecycleEpoch:lifecycleEpoch
                          clock:[[VGProductionAudioPreviewClock alloc] init]
                          timer:nil // replaced below after queue creation
+               automationTimer:nil // production automation timer created in designated init
                   fileProvider:[[VGProductionAudioPreviewFileProvider alloc]
                                    init]
                         engine:engineAdapter
@@ -298,6 +304,7 @@ NS_ASSUME_NONNULL_BEGIN
               lifecycleEpoch:(uint64_t)lifecycleEpoch
                        clock:(id<VGAudioPreviewClock>)clock
                        timer:(nullable id<VGAudioPreviewTimer>)timer
+             automationTimer:(nullable id<VGAudioPreviewAutomationTimer>)automationTimer
                 fileProvider:(id<VGAudioPreviewFileProvider>)fileProvider
                       engine:(id<VGAudioPreviewEngine>)engine
                       player:(id<VGAudioPreviewPlayer>)player {
@@ -330,6 +337,27 @@ NS_ASSUME_NONNULL_BEGIN
     _boundaryTimer =
         [[VGProductionAudioPreviewTimer alloc] initWithQueue:_schedulerQueue];
   }
+
+  // ── Slice J: automation coordinator ─────────────────────────────────────
+  // Create the production automation timer if no mock was supplied.
+  id<VGAudioPreviewAutomationTimer> automationTimerToUse;
+  if (automationTimer) {
+    automationTimerToUse = automationTimer;
+  } else {
+    automationTimerToUse = [[VGProductionAudioPreviewAutomationTimer alloc]
+        initWithQueue:_schedulerQueue];
+  }
+  // The gain-sink block captures a weak reference to the runtime to avoid
+  // a retain cycle (coordinator → gainSink block → runtime).
+  __weak typeof(self) weakSelf = self;
+  _coordinator = [[VGAudioPreviewAutomationCoordinator alloc]
+      initWithTimer:automationTimerToUse
+           gainSink:^(float v) {
+             typeof(self) strongSelf = weakSelf;
+             if (!strongSelf)
+               return;
+             [strongSelf->_player setVolume:v];
+           }];
 
   // ── Initial lifecycle state ───────────────────────────────────────────────
   _acceptingCommands = YES;
@@ -396,8 +424,10 @@ NS_ASSUME_NONNULL_BEGIN
           [[VGAudioPreviewTrackDescriptor alloc] initWithDictionary:trackDict];
       if (!candidate)
         continue; // malformed or unsupported role — skip
-      if (candidate.staticVolume <= 0.0f)
-        continue; // muted by composition policy — skip
+      // Slice J: a descriptor with raw keyframes is eligible even if
+      // staticVolume == 0.0, because the envelope may render audible gain.
+      if (candidate.staticVolume <= 0.0f && !candidate.hasRawKeyframes)
+        continue; // muted by composition policy with no keyframe automation
       [eligible addObject:candidate];
     }
   }
@@ -409,6 +439,11 @@ NS_ASSUME_NONNULL_BEGIN
     return VGAudioPreviewPreparationResultSilentNoEligibleTrack;
   }
 
+  // Deactivate coordinator before replacing descriptor state.
+  // Use deactivate (not invalidate) so the gain sink is preserved for reuse
+  // on subsequent keyframed playback after reprepare. Terminal invalidate
+  // is reserved for final runtime teardown in the cleanup block.
+  [_coordinator deactivate];
   _descriptors = [eligible copy];
   [_fileCache removeAllObjects];
   [_failedTrackIds removeAllObjects];
@@ -524,8 +559,10 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Cancels the boundary timer, stops the player, clears scheduled work.
 /// Increments commandSerial and updates _activeToken.
+/// Also pauses automation polling (preserves envelope for same-descriptor resume).
 - (uint64_t)_cancelAndIncrementSerial:(uint64_t)generation {
   [self assertOnSchedulerQueue];
+  [_coordinator pause]; // preserve envelope; stop automation timer
   [_boundaryTimer cancel];
   [_player stop];
   _commandSerial++;
@@ -860,7 +897,24 @@ NS_ASSUME_NONNULL_BEGIN
   _fileSampleRate = sr;
   _fileLengthFrames = frames;
 
-  [_player setVolume:descriptor.staticVolume];
+  // Slice J: delegate gain to coordinator if the descriptor has raw keyframes.
+  // effectiveStart = ts, effectiveEnd = ts + activeDur (stable for this activation).
+  if (descriptor.hasRawKeyframes) {
+    [_coordinator activateWithRawKeyframes:descriptor.rawVolumeKeyframes
+                             timelineStart:ts
+                              effectiveEnd:(ts + activeDur)
+                                initialPTS:pts];
+    // If no usable envelope was produced, fall back to staticVolume.
+    if (!_coordinator.hasActiveEnvelope) {
+      [_coordinator deactivate];
+      [_player setVolume:descriptor.staticVolume];
+    }
+    // Else: coordinator already applied the initial gain through the gainSink.
+  } else {
+    // Static descriptor — no automation needed.
+    [_coordinator deactivate];
+    [_player setVolume:descriptor.staticVolume];
+  }
 
   NSLog(@"[VanguardAudioPreviewRuntime][F] activateDescriptor: %@ "
         @"ts=%.3f active=%.3f sr=%.0f frames=%lld",
@@ -898,6 +952,7 @@ NS_ASSUME_NONNULL_BEGIN
 
   if (!winner) {
     // No descriptor active at this PTS — silent gap.
+    [_coordinator deactivate]; // stop any envelope polling during gap
     NSTimeInterval nextBoundary = [self _computeNextDecisionPTS:currentPTS];
     if (isfinite(nextBoundary) && nextBoundary > currentPTS) {
       _runtimeState = VGAudioPreviewRuntimeStateWaitingForTrackStart;
@@ -958,8 +1013,20 @@ NS_ASSUME_NONNULL_BEGIN
                                         endPTS:scheduledEndPTS
                                      withToken:capturedToken];
   if (scheduled) {
+    // Slice J: handle same-descriptor resume (activate may have been a no-op).
+    if (_coordinator.hasActiveEnvelope) {
+      [_coordinator reevaluateAtPTS:currentPTS];
+    }
+
     [_player play];
     _runtimeState = VGAudioPreviewRuntimeStatePlaying;
+
+    // Slice J: start automation polling only after successful play.
+    if (_coordinator.hasActiveEnvelope) {
+      dispatch_block_t tickBlock =
+          [self _buildAutomationTickBlockForToken:capturedToken];
+      [_coordinator startPollingWithTickBlock:tickBlock];
+    }
 
     // Arm for the next descriptor boundary at or before this segment ends.
     // Using <= so that an exact-end transition (nextBoundary == trackEnd)
@@ -974,6 +1041,36 @@ NS_ASSUME_NONNULL_BEGIN
   } else {
     _runtimeState = VGAudioPreviewRuntimeStateEnded;
   }
+}
+
+/// Builds the validated automation tick block used by startPollingWithTickBlock:.
+/// Captures the supplied token and the current _scheduledSegmentSerial by value.
+/// Requires the caller to be on the scheduler queue.
+- (dispatch_block_t)_buildAutomationTickBlockForToken:(VGAudioPreviewWorkToken)tok {
+  [self assertOnSchedulerQueue];
+  VGAudioPreviewWorkToken capturedToken = tok;
+  uint64_t capturedSegSerial = _scheduledSegmentSerial;
+  VGTimelineSnapshotProvider capturedProvider = _snapshotProvider;
+  id<VGAudioPreviewClock> capturedClock = _clock;
+  __weak typeof(self) weakSelf = self;
+  return ^{
+    typeof(self) ss = weakSelf;
+    if (!ss || !ss->_acceptingCommands)
+      return;
+    if (!VGAudioPreviewWorkTokenEqual(ss->_activeToken, capturedToken))
+      return;
+    if (ss->_scheduledSegmentSerial != capturedSegSerial)
+      return;
+    VGTimelineStateSnapshot snap = capturedProvider();
+    if (!snap.isValid || !snap.isPlaying)
+      return;
+    if (snap.generation != capturedToken.timelineGeneration)
+      return;
+    NSTimeInterval elapsed =
+        MAX(0.0, [capturedClock currentTime] - snap.playStartHostTime);
+    NSTimeInterval pts = MAX(0.0, snap.playStartPTS + elapsed);
+    [ss->_coordinator evaluateAtPTS:pts];
+  };
 }
 
 /// Arms the boundary timer, handling three delay ranges:
@@ -1114,6 +1211,7 @@ NS_ASSUME_NONNULL_BEGIN
   if (!winner) {
     // No descriptor is active at currentPTS. Either we are in a gap before
     // any descriptor starts, or all descriptors have ended.
+    [_coordinator deactivate]; // no track active — stop any envelope polling
     NSTimeInterval nextBoundary = [self _computeNextDecisionPTS:currentPTS];
     if (isfinite(nextBoundary) && nextBoundary > currentPTS) {
       // Arm a timer for the next start boundary.
@@ -1171,8 +1269,22 @@ NS_ASSUME_NONNULL_BEGIN
                                           endPTS:scheduledEndPTSPlay
                                        withToken:token];
     if (scheduled) {
+      // Slice J: handle same-descriptor resume path (activate was a no-op).
+      // If the coordinator has an envelope (from prior activation of same
+      // descriptor) we re-evaluate at the destination PTS before play.
+      if (_coordinator.hasActiveEnvelope) {
+        [_coordinator reevaluateAtPTS:currentPTS];
+      }
+
       [_player play];
       _runtimeState = VGAudioPreviewRuntimeStatePlaying;
+
+      // Slice J: start automation polling only after successful play.
+      if (_coordinator.hasActiveEnvelope) {
+        dispatch_block_t tickBlock =
+            [self _buildAutomationTickBlockForToken:token];
+        [_coordinator startPollingWithTickBlock:tickBlock];
+      }
 
       // Check if there is a descriptor boundary at or before this segment
       // ends. Using <= so that an exact-end transition (nextBoundary ==
@@ -1351,6 +1463,8 @@ NS_ASSUME_NONNULL_BEGIN
   void (^cleanupBlock)(void) = ^{
     // Runs on the scheduler queue. strongSelf keeps self alive.
     [strongSelf assertOnSchedulerQueue];
+    // Slice J teardown order: coordinator first, then boundary timer.
+    [strongSelf->_coordinator invalidate];
     [strongSelf->_boundaryTimer cancel];
     [strongSelf->_player stop];
     [strongSelf->_engine stop];

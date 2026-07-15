@@ -21,6 +21,7 @@ NS_ASSUME_NONNULL_BEGIN
 @protected
   VGAPr_MockClock *_clock;
   VGAPr_MockTimer *_timer;
+  VGAPr_MockAutomationTimer *_automationTimer;
   VGAPr_MockFileProvider *_fileProvider;
   VGAPr_MockEngine *_engine;
   VGAPr_MockPlayer *_player;
@@ -71,6 +72,15 @@ NS_ASSUME_NONNULL_BEGIN
                                               duration:(double)dur
                                                 volume:(double)vol
                                                    url:(NSString *)path;
+
+/// Builds a track dictionary with volumeKeyframes.
+- (NSDictionary<NSString *, id> *)trackDictWithId:(NSString *)tid
+                                             role:(NSString *)role
+                                        startTime:(double)start
+                                         duration:(double)dur
+                                           volume:(double)vol
+                                              url:(NSString *)path
+                                       keyframes:(nullable NSArray *)keyframes;
 
 @end
 
