@@ -459,6 +459,61 @@ NS_ASSUME_NONNULL_BEGIN
                  @"commandPlay after invalidation is no-op");
 }
 
+
+
+
+// G-T6: seek while playing a voiceover track stops and reschedules correctly
+- (void)testG_T6_seekWhilePlayingVoiceoverReschedules {
+  double sr = 44100.0, fileDur = 10.0, seekPTS = 2.5;
+  _stubbedSnapshot = (VGTimelineStateSnapshot){.timelinePTS = seekPTS,
+                                               .playStartPTS = seekPTS,
+                                               .playStartHostTime = 0.0,
+                                               .generation = 4,
+                                               .isPlaying = YES,
+                                               .isValid = YES};
+  _clock.currentTime = 0.0;
+
+  NSURL *url = VGAPrCreateTempWAVURL((AVAudioFramePosition)(fileDur * sr), sr);
+  if (!url) {
+    XCTSkip(@"temp WAV");
+    return;
+  }
+  NSError *err = nil;
+  _fileProvider.stubbedFile = [[AVAudioFile alloc] initForReading:url error:&err];
+  if (!_fileProvider.stubbedFile) {
+    XCTSkip(@"could not open WAV");
+    return;
+  }
+
+  VanguardAudioPreviewRuntime *rt = [self makeRuntime];
+  NSDictionary *trackDict = @{
+    @"trackId" : @"vo-g6",
+    @"role" : @"voiceover",
+    @"url" : url.path,
+    @"startTime" : @(0.0),
+    @"sourceTrimStart" : @(0.0),
+    @"duration" : @(fileDur),
+    @"volume" : @(1.0)
+  };
+  VGAudioSidecarPlan *plan =
+      [[VGAudioSidecarPlan alloc] initWithTracks:@[ trackDict ]
+                                 volumeKeyframes:nil
+                                   waveformCache:nil
+                            timeRemapAudioPolicy:nil];
+  [rt prepareWithSidecarPlan:plan timelineDuration:fileDur];
+  [rt commandSeek];
+  [self waitFor:0.3];
+
+  XCTAssertGreaterThan(_player.stopCount, 0, @"seek must stop voiceover player");
+  XCTAssertGreaterThan(_player.scheduleCount, 0,
+                       @"seek on voiceover track must reschedule");
+  XCTAssertGreaterThan(_player.playCount, 0,
+                       @"seek on voiceover track must restart player");
+
+  [self invalidateAndWait:rt];
+  [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+}
+
 @end
 
 NS_ASSUME_NONNULL_END

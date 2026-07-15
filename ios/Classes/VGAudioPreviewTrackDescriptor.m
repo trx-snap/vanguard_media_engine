@@ -16,7 +16,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 // Private extension — keeps role internal to .m (Slice F Mandatory Correction 3).
 @interface VGAudioPreviewTrackDescriptor () {
-  NSString *_role; ///< Either @"music" or @"original". Never nil.
+  NSString *_role; ///< One of @"music", @"original", @"sfx", @"voiceover". Never nil.
 }
 @end
 
@@ -27,14 +27,16 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (nullable instancetype)initWithDictionary:
     (NSDictionary<NSString *, id> *)dict {
-  // 1. Role must be "music" or "original"; all others (incl. voiceover) rejected.
+  // 1. Role must be music, original, sfx, or voiceover; all others rejected.
   id roleRaw = dict[@"role"];
   if (![roleRaw isKindOfClass:[NSString class]])
     return nil;
   NSString *role = (NSString *)roleRaw;
   BOOL isMusicRole = [role isEqualToString:@"music"];
   BOOL isOriginalRole = [role isEqualToString:@"original"];
-  if (!isMusicRole && !isOriginalRole)
+  BOOL isSfxRole = [role isEqualToString:@"sfx"];
+  BOOL isVoiceoverRole = [role isEqualToString:@"voiceover"];
+  if (!isMusicRole && !isOriginalRole && !isSfxRole && !isVoiceoverRole)
     return nil;
 
   // 2. trackId non-empty string.

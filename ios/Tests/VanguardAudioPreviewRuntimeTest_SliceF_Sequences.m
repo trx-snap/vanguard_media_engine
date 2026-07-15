@@ -398,6 +398,187 @@ NS_ASSUME_NONNULL_BEGIN
   [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
 }
 
+
+// G-T7: music → sfx sequential transition at exact boundary.
+//   music-A: [0, 3). sfx-B: [3, 5). PTS starts at 0.5.
+//   After the boundary timer fires at T=3, sfx-B must become the active
+//   descriptor and be scheduled — proving cross-role sequential preview works.
+- (void)testG_T7_sequentialMusicToSfxTransition {
+  double sr = 44100.0, fileDur = 5.0;
+  NSURL *url = VGAPrCreateTempWAVURL((AVAudioFramePosition)(fileDur * sr), sr);
+  if (!url) { XCTSkip(@"temp WAV needed"); return; }
+  NSError *err = nil;
+  _fileProvider.stubbedFile = [[AVAudioFile alloc] initForReading:url error:&err];
+  if (!_fileProvider.stubbedFile) { XCTSkip(@"could not open WAV"); return; }
+
+  // music-A: [0, 3); sfx-B: [3, 5) — exact boundary, no gap.
+  _stubbedSnapshot = (VGTimelineStateSnapshot){
+      .timelinePTS = 0.5, .playStartPTS = 0.5, .playStartHostTime = 0.0,
+      .generation = 1, .isPlaying = YES, .isValid = YES};
+  _clock.currentTime = 0.0;
+
+  VanguardAudioPreviewRuntime *rt = [self makeRuntime];
+  NSDictionary *musicA = [self musicTrackDictWithId:@"music-A"
+      startTime:0.0 duration:3.0 volume:0.7 url:url.path];
+  NSDictionary *sfxB = @{
+    @"trackId" : @"sfx-B",
+    @"role" : @"sfx",
+    @"url" : url.path,
+    @"startTime" : @(3.0),
+    @"sourceTrimStart" : @(0.0),
+    @"duration" : @(2.0),
+    @"volume" : @(0.9),
+  };
+  VGAudioSidecarPlan *plan = [[VGAudioSidecarPlan alloc]
+      initWithTracks:@[ musicA, sfxB ] volumeKeyframes:nil waveformCache:nil
+      timeRemapAudioPolicy:nil];
+  [rt prepareWithSidecarPlan:plan timelineDuration:10.0];
+  [rt commandPlay];
+  [self waitFor:0.3];
+
+  // Phase 1: music-A scheduled; boundary timer armed at T=3.0.
+  XCTAssertGreaterThan(_player.scheduleCount, 0, @"music-A must be scheduled");
+  XCTAssertGreaterThan(_timer.armCount, 0,
+                       @"boundary timer must arm at music-A end T=3.0");
+  XCTAssertEqualWithAccuracy(_timer.lastDelay, 2.5, 0.2,
+                             @"delay == 3.0 - 0.5 (PTS) = 2.5 s");
+  [rt vg_performSynchronouslyOnSchedulerQueueForTesting:^{
+    VGAudioPreviewTrackDescriptor *d = [rt valueForKey:@"_activeDescriptor"];
+    XCTAssertEqualObjects(d.trackId, @"music-A",
+                          @"music-A must be the active descriptor initially");
+    XCTAssertEqualObjects(d.role, @"music",
+                          @"initial role must be music");
+  }];
+
+  NSInteger schedCountAfterMusic = _player.scheduleCount;
+  NSInteger playCountAfterMusic = _player.playCount;
+
+  // Phase 2: advance to T=3.0 (sfx-B start), fire boundary timer.
+  _stubbedSnapshot.timelinePTS = 3.0;
+  _stubbedSnapshot.playStartPTS = 3.0;
+  [_timer fireForcefully];
+  [self waitFor:0.15];
+
+  // sfx-B must be scheduled immediately at the exact boundary.
+  XCTAssertGreaterThan(_player.scheduleCount, schedCountAfterMusic,
+                       @"sfx-B must be scheduled after music-A ends at T=3.0");
+  XCTAssertGreaterThan(_player.playCount, playCountAfterMusic,
+                       @"player must play sfx-B");
+  // B.timelineStart==PTS -> trackRelative=0 -> startFrame=0.
+  XCTAssertEqual(_player.lastStartFrame, (AVAudioFramePosition)0,
+                 @"sfx-B must start at source frame 0 (PTS == B.timelineStart)");
+  // KVC: prove sfx-B is now the active descriptor, not music-A.
+  [rt vg_performSynchronouslyOnSchedulerQueueForTesting:^{
+    VGAudioPreviewTrackDescriptor *d = [rt valueForKey:@"_activeDescriptor"];
+    XCTAssertEqualObjects(d.trackId, @"sfx-B",
+                          @"active descriptor must be sfx-B after transition");
+    XCTAssertEqualObjects(d.role, @"sfx",
+                          @"role must be sfx after transition from music");
+    XCTAssertEqual([[rt valueForKey:@"_runtimeState"] integerValue],
+                   VGAudioPreviewRuntimeStatePlaying,
+                   @"runtime must be Playing after sfx-B is scheduled");
+  }];
+  XCTAssertEqualWithAccuracy(_player.lastVolume, 0.9f, 0.01f,
+                             @"volume must match sfx-B staticVolume (0.9)");
+
+  [self invalidateAndWait:rt];
+  [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+}
+
+
+// G-T8: sfx → voiceover sequential transition at exact boundary.
+//   sfx-A: [0, 3). voiceover-B: [3, 5). PTS starts at 0.5.
+//   After the boundary timer fires at T=3, voiceover-B must become the active
+//   descriptor and be scheduled — proving sfx-to-voiceover transition works.
+- (void)testG_T8_sequentialSfxToVoiceoverTransition {
+  double sr = 44100.0, fileDur = 5.0;
+  NSURL *url = VGAPrCreateTempWAVURL((AVAudioFramePosition)(fileDur * sr), sr);
+  if (!url) { XCTSkip(@"temp WAV needed"); return; }
+  NSError *err = nil;
+  _fileProvider.stubbedFile = [[AVAudioFile alloc] initForReading:url error:&err];
+  if (!_fileProvider.stubbedFile) { XCTSkip(@"could not open WAV"); return; }
+
+  // sfx-A: [0, 3); voiceover-B: [3, 5) — exact boundary, no gap.
+  _stubbedSnapshot = (VGTimelineStateSnapshot){
+      .timelinePTS = 0.5, .playStartPTS = 0.5, .playStartHostTime = 0.0,
+      .generation = 1, .isPlaying = YES, .isValid = YES};
+  _clock.currentTime = 0.0;
+
+  VanguardAudioPreviewRuntime *rt = [self makeRuntime];
+  NSDictionary *sfxA = @{
+    @"trackId" : @"sfx-A",
+    @"role" : @"sfx",
+    @"url" : url.path,
+    @"startTime" : @(0.0),
+    @"sourceTrimStart" : @(0.0),
+    @"duration" : @(3.0),
+    @"volume" : @(0.8),
+  };
+  NSDictionary *voiceoverB = @{
+    @"trackId" : @"vo-B",
+    @"role" : @"voiceover",
+    @"url" : url.path,
+    @"startTime" : @(3.0),
+    @"sourceTrimStart" : @(0.0),
+    @"duration" : @(2.0),
+    @"volume" : @(1.0),
+  };
+  VGAudioSidecarPlan *plan = [[VGAudioSidecarPlan alloc]
+      initWithTracks:@[ sfxA, voiceoverB ] volumeKeyframes:nil waveformCache:nil
+      timeRemapAudioPolicy:nil];
+  [rt prepareWithSidecarPlan:plan timelineDuration:10.0];
+  [rt commandPlay];
+  [self waitFor:0.3];
+
+  // Phase 1: sfx-A scheduled; boundary timer armed at T=3.0.
+  XCTAssertGreaterThan(_player.scheduleCount, 0, @"sfx-A must be scheduled");
+  XCTAssertGreaterThan(_timer.armCount, 0,
+                       @"boundary timer must arm at sfx-A end T=3.0");
+  XCTAssertEqualWithAccuracy(_timer.lastDelay, 2.5, 0.2,
+                             @"delay == 3.0 - 0.5 (PTS) = 2.5 s");
+  [rt vg_performSynchronouslyOnSchedulerQueueForTesting:^{
+    VGAudioPreviewTrackDescriptor *d = [rt valueForKey:@"_activeDescriptor"];
+    XCTAssertEqualObjects(d.trackId, @"sfx-A",
+                          @"sfx-A must be the active descriptor initially");
+    XCTAssertEqualObjects(d.role, @"sfx",
+                          @"initial role must be sfx");
+  }];
+
+  NSInteger schedCountAfterSfx = _player.scheduleCount;
+  NSInteger playCountAfterSfx = _player.playCount;
+
+  // Phase 2: advance to T=3.0 (voiceover-B start), fire boundary timer.
+  _stubbedSnapshot.timelinePTS = 3.0;
+  _stubbedSnapshot.playStartPTS = 3.0;
+  [_timer fireForcefully];
+  [self waitFor:0.15];
+
+  // voiceover-B must be scheduled immediately at the exact boundary.
+  XCTAssertGreaterThan(_player.scheduleCount, schedCountAfterSfx,
+                       @"voiceover-B must be scheduled after sfx-A ends at T=3.0");
+  XCTAssertGreaterThan(_player.playCount, playCountAfterSfx,
+                       @"player must play voiceover-B");
+  // B.timelineStart==PTS -> trackRelative=0 -> startFrame=0.
+  XCTAssertEqual(_player.lastStartFrame, (AVAudioFramePosition)0,
+                 @"voiceover-B must start at source frame 0");
+  // KVC: prove voiceover-B is now the active descriptor, not sfx-A.
+  [rt vg_performSynchronouslyOnSchedulerQueueForTesting:^{
+    VGAudioPreviewTrackDescriptor *d = [rt valueForKey:@"_activeDescriptor"];
+    XCTAssertEqualObjects(d.trackId, @"vo-B",
+                          @"active descriptor must be vo-B after transition");
+    XCTAssertEqualObjects(d.role, @"voiceover",
+                          @"role must be voiceover after transition from sfx");
+    XCTAssertEqual([[rt valueForKey:@"_runtimeState"] integerValue],
+                   VGAudioPreviewRuntimeStatePlaying,
+                   @"runtime must be Playing after voiceover-B is scheduled");
+  }];
+  XCTAssertEqualWithAccuracy(_player.lastVolume, 1.0f, 0.01f,
+                             @"volume must match voiceover-B staticVolume (1.0)");
+
+  [self invalidateAndWait:rt];
+  [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+}
+
 @end
 
 NS_ASSUME_NONNULL_END

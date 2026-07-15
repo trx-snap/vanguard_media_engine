@@ -39,13 +39,14 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly) NSTimeInterval requestedDuration;
 /// Static gain applied to AVAudioPlayerNode.volume. 0.0–1.0.
 @property(nonatomic, readonly) float staticVolume;
-/// The track role accepted by the scheduler: @"music" or @"original".
+/// The track role accepted by the scheduler: @"music", @"original",
+/// @"sfx", or @"voiceover".
 @property(nonatomic, readonly, copy) NSString *role;
 
 /// Designated initialiser. Returns nil if any field fails validation.
 ///
 /// Validation rules (plan §D item 4):
-///   - role == @"music"
+///   - role is one of @"music", @"original", @"sfx", @"voiceover"
 ///   - trackId non-empty string
 ///   - url non-empty string resolvable to a local file NSURL
 ///   - startTime finite, >= 0.0

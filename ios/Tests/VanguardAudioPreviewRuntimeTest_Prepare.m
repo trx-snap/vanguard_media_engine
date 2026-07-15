@@ -28,9 +28,9 @@ NS_ASSUME_NONNULL_BEGIN
   _fileProvider.stubbedFile = [[AVAudioFile alloc] initForReading:url
                                                             error:&err];
 
-  NSDictionary *voiceDict = @{
-    @"trackId" : @"v1",
-    @"role" : @"voiceover",
+  NSDictionary *invalidDict = @{
+    @"trackId" : @"inv1",
+    @"role" : @"unknown",
     @"url" : url.path,
     @"startTime" : @(0.0),
     @"sourceTrimStart" : @(0.0),
@@ -47,7 +47,7 @@ NS_ASSUME_NONNULL_BEGIN
     @"volume" : @(1.0)
   };
   VGAudioSidecarPlan *plan =
-      [[VGAudioSidecarPlan alloc] initWithTracks:@[ voiceDict, musicDict ]
+      [[VGAudioSidecarPlan alloc] initWithTracks:@[ invalidDict, musicDict ]
                                  volumeKeyframes:nil
                                    waveformCache:nil
                             timeRemapAudioPolicy:nil];
@@ -57,7 +57,7 @@ NS_ASSUME_NONNULL_BEGIN
                                                   timelineDuration:10.0];
 
   XCTAssertEqual(res, VGAudioPreviewPreparationResultReady,
-                 @"must select first valid music dict (second entry)");
+                 @"must skip invalid-role dict and select first valid music dict (second entry)");
   XCTAssertEqual(_engine.startCount, 1, @"engine must start once");
 
   [self invalidateAndWait:rt];
@@ -197,10 +197,10 @@ NS_ASSUME_NONNULL_BEGIN
 // ─── Legacy tests (D-T1 through D-T12 migrated from
 // VGAudioPreviewRuntimeTest.m) ───
 
-- (void)testD_T1_trackDescriptorRejectsNonMusicRole {
+- (void)testD_T1_trackDescriptorRejectsUnknownRole {
   NSDictionary *dict = @{
     @"trackId" : @"t1",
-    @"role" : @"voiceover",
+    @"role" : @"unknown",
     @"url" : @"/tmp/x.mp3",
     @"startTime" : @(0.0),
     @"sourceTrimStart" : @(0.0),
@@ -359,8 +359,8 @@ NS_ASSUME_NONNULL_BEGIN
 }
 
 
-// SF-T2: descriptor rejects voiceover
-- (void)testSF_T2_descriptorRejectsVoiceover {
+// SF-T2: descriptor accepts voiceover (updated for Slice G)
+- (void)testSF_T2_descriptorAcceptsVoiceover {
   NSDictionary *dict = @{
     @"trackId" : @"vo-1",
     @"role" : @"voiceover",
@@ -372,7 +372,7 @@ NS_ASSUME_NONNULL_BEGIN
   };
   VGAudioPreviewTrackDescriptor *d =
       [[VGAudioPreviewTrackDescriptor alloc] initWithDictionary:dict];
-  XCTAssertNil(d, @"voiceover role must be rejected");
+  XCTAssertNotNil(d, @"voiceover role must be accepted in Slice G");
 }
 
 
@@ -400,12 +400,14 @@ NS_ASSUME_NONNULL_BEGIN
 }
 
 
-// SF-T8: voiceover-only plan yields silent, no engine start
-- (void)testSF_T8_voiceoverOnlyPlanYieldsSilent {
+// SF-T8: voiceover plan with unavailable file yields a file-open failure, no engine start.
+// (Updated for Slice G: voiceover descriptor is now accepted; the fake URL causes a
+// missing-file error rather than SilentNoEligibleTrack.)
+- (void)testSF_T8_voiceoverPlanWithMissingFileYieldsFailedFile {
   NSDictionary *vo = @{
     @"trackId" : @"vo-1",
     @"role" : @"voiceover",
-    @"url" : @"/tmp/vo.mp3",
+    @"url" : @"/tmp/vo.mp3",   // No stubbedFile set; provider returns nil, no error.
     @"startTime" : @(0.0),
     @"sourceTrimStart" : @(0.0),
     @"duration" : @(5.0),
@@ -417,9 +419,10 @@ NS_ASSUME_NONNULL_BEGIN
   VanguardAudioPreviewRuntime *rt = [self makeRuntime];
   VGAudioPreviewPreparationResult res =
       [rt prepareWithSidecarPlan:plan timelineDuration:10.0];
-  XCTAssertEqual(res, VGAudioPreviewPreparationResultSilentNoEligibleTrack,
-                 @"voiceover-only plan must yield silent");
-  XCTAssertEqual(_engine.startCount, 0, @"engine must not start for VO plan");
+  XCTAssertTrue(res == VGAudioPreviewPreparationResultFailedMissingFile ||
+                res == VGAudioPreviewPreparationResultFailedUnsupportedFormat,
+                @"voiceover plan with unavailable file must return a file-open failure");
+  XCTAssertEqual(_engine.startCount, 0, @"engine must not start on file-open failure");
   [self invalidateAndWait:rt];
 }
 
@@ -446,6 +449,109 @@ NS_ASSUME_NONNULL_BEGIN
                  @"failed track must not be retried on commandPlay");
   XCTAssertEqual(_engine.startCount, 0, @"engine must not start on file failure");
   [self invalidateAndWait:rt];
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice G: descriptor-role compatibility (sfx + voiceover)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// G-T1: descriptor accepts sfx role
+- (void)testG_T1_descriptorAcceptsSfxRole {
+  NSDictionary *dict = @{
+    @"trackId" : @"sfx-1",
+    @"role" : @"sfx",
+    @"url" : @"/tmp/clip.mp4",
+    @"startTime" : @(0.0),
+    @"sourceTrimStart" : @(0.0),
+    @"duration" : @(3.0),
+    @"volume" : @(0.8)
+  };
+  VGAudioPreviewTrackDescriptor *d =
+      [[VGAudioPreviewTrackDescriptor alloc] initWithDictionary:dict];
+  XCTAssertNotNil(d, @"sfx role must be accepted by the descriptor");
+  XCTAssertEqualObjects(d.trackId, @"sfx-1");
+  XCTAssertEqualObjects(d.role, @"sfx");
+}
+
+
+// G-T3: sfx-only plan with a valid file yields Ready and starts engine
+- (void)testG_T3_sfxOnlyPlanYieldsReady {
+  double sr = 44100.0, dur = 4.0;
+  NSURL *url = VGAPrCreateTempWAVURL((AVAudioFramePosition)(dur * sr), sr);
+  if (!url) {
+    XCTSkip(@"temp WAV needed");
+    return;
+  }
+  NSError *err = nil;
+  _fileProvider.stubbedFile = [[AVAudioFile alloc] initForReading:url error:&err];
+  if (!_fileProvider.stubbedFile) {
+    XCTSkip(@"could not open WAV");
+    return;
+  }
+
+  NSDictionary *sfxDict = @{
+    @"trackId" : @"sfx-g3",
+    @"role" : @"sfx",
+    @"url" : url.path,
+    @"startTime" : @(0.0),
+    @"sourceTrimStart" : @(0.0),
+    @"duration" : @(dur),
+    @"volume" : @(0.9)
+  };
+  VGAudioSidecarPlan *plan = [[VGAudioSidecarPlan alloc]
+      initWithTracks:@[ sfxDict ] volumeKeyframes:nil waveformCache:nil
+      timeRemapAudioPolicy:nil];
+  VanguardAudioPreviewRuntime *rt = [self makeRuntime];
+  VGAudioPreviewPreparationResult res =
+      [rt prepareWithSidecarPlan:plan timelineDuration:10.0];
+
+  XCTAssertEqual(res, VGAudioPreviewPreparationResultReady,
+                 @"sfx-only plan with valid file must yield Ready");
+  XCTAssertEqual(_engine.startCount, 1, @"engine must start for sfx track");
+
+  [self invalidateAndWait:rt];
+  [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+}
+
+
+// G-T4: voiceover-only plan with a valid file yields Ready and starts engine
+- (void)testG_T4_voiceoverOnlyPlanYieldsReady {
+  double sr = 44100.0, dur = 3.0;
+  NSURL *url = VGAPrCreateTempWAVURL((AVAudioFramePosition)(dur * sr), sr);
+  if (!url) {
+    XCTSkip(@"temp WAV needed");
+    return;
+  }
+  NSError *err = nil;
+  _fileProvider.stubbedFile = [[AVAudioFile alloc] initForReading:url error:&err];
+  if (!_fileProvider.stubbedFile) {
+    XCTSkip(@"could not open WAV");
+    return;
+  }
+
+  NSDictionary *voDict = @{
+    @"trackId" : @"vo-g4",
+    @"role" : @"voiceover",
+    @"url" : url.path,
+    @"startTime" : @(0.0),
+    @"sourceTrimStart" : @(0.0),
+    @"duration" : @(dur),
+    @"volume" : @(1.0)
+  };
+  VGAudioSidecarPlan *plan = [[VGAudioSidecarPlan alloc]
+      initWithTracks:@[ voDict ] volumeKeyframes:nil waveformCache:nil
+      timeRemapAudioPolicy:nil];
+  VanguardAudioPreviewRuntime *rt = [self makeRuntime];
+  VGAudioPreviewPreparationResult res =
+      [rt prepareWithSidecarPlan:plan timelineDuration:10.0];
+
+  XCTAssertEqual(res, VGAudioPreviewPreparationResultReady,
+                 @"voiceover-only plan with valid file must yield Ready");
+  XCTAssertEqual(_engine.startCount, 1, @"engine must start for voiceover track");
+
+  [self invalidateAndWait:rt];
+  [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
 }
 
 @end
