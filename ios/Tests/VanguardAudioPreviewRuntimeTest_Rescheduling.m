@@ -514,6 +514,93 @@ NS_ASSUME_NONNULL_BEGIN
   [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
 }
 
+
+// I-T1: seek to different descriptor applies static volume
+- (void)testI_T1_seekToDifferentDescriptorAppliesStaticVolume {
+  double sr = 44100.0, fileDur = 6.0;
+  NSURL *url = VGAPrCreateTempWAVURL((AVAudioFramePosition)(fileDur * sr), sr);
+  if (!url) {
+    XCTSkip(@"temp WAV");
+    return;
+  }
+  NSError *err = nil;
+  _fileProvider.stubbedFile = [[AVAudioFile alloc] initForReading:url error:&err];
+  if (!_fileProvider.stubbedFile) {
+    XCTSkip(@"could not open WAV");
+    return;
+  }
+
+  // orig-A: [0, 3) volume 0.5
+  // orig-B: [3, 6) volume 0.8
+  // Start at PTS = 0.5
+  _stubbedSnapshot = (VGTimelineStateSnapshot){.timelinePTS = 0.5,
+                                               .playStartPTS = 0.5,
+                                               .playStartHostTime = 0.0,
+                                               .generation = 1,
+                                               .isPlaying = YES,
+                                               .isValid = YES};
+  _clock.currentTime = 0.0;
+
+  VanguardAudioPreviewRuntime *rt = [self makeRuntime];
+  NSDictionary *origA = [self originalTrackDictWithId:@"orig-A"
+                                            startTime:0.0
+                                             duration:3.0
+                                               volume:0.5
+                                                  url:url.path];
+  NSDictionary *origB = [self originalTrackDictWithId:@"orig-B"
+                                            startTime:3.0
+                                             duration:3.0
+                                               volume:0.8
+                                                  url:url.path];
+
+  VGAudioSidecarPlan *plan = [[VGAudioSidecarPlan alloc]
+      initWithTracks:@[ origA, origB ]
+     volumeKeyframes:nil
+       waveformCache:nil
+  timeRemapAudioPolicy:nil];
+
+  VGAudioPreviewPreparationResult res = [rt prepareWithSidecarPlan:plan timelineDuration:10.0];
+  XCTAssertEqual(res, VGAudioPreviewPreparationResultReady);
+
+  [rt commandPlay];
+  [self waitFor:0.3];
+
+  // Assert state and volume before seek
+  [rt vg_performSynchronouslyOnSchedulerQueueForTesting:^{
+    VGAudioPreviewTrackDescriptor *d = [rt valueForKey:@"_activeDescriptor"];
+    XCTAssertEqualObjects(d.trackId, @"orig-A");
+    XCTAssertEqualObjects(d.role, @"original");
+  }];
+  XCTAssertEqualWithAccuracy(_player.lastVolume, 0.5f, 0.01f);
+
+  NSInteger stopCountBefore = _player.stopCount;
+  NSInteger schedCountBefore = _player.scheduleCount;
+  NSInteger playCountBefore = _player.playCount;
+
+  // Seek into orig-B range (T=4.0)
+  _stubbedSnapshot.timelinePTS = 4.0;
+  _stubbedSnapshot.playStartPTS = 4.0;
+  _stubbedSnapshot.generation = 2;
+
+  [rt commandSeek];
+  [self waitFor:0.3];
+
+  // Assert state, volume, and counters after seek
+  XCTAssertGreaterThan(_player.stopCount, stopCountBefore);
+  XCTAssertGreaterThan(_player.scheduleCount, schedCountBefore);
+  XCTAssertGreaterThan(_player.playCount, playCountBefore);
+
+  [rt vg_performSynchronouslyOnSchedulerQueueForTesting:^{
+    VGAudioPreviewTrackDescriptor *d = [rt valueForKey:@"_activeDescriptor"];
+    XCTAssertEqualObjects(d.trackId, @"orig-B");
+    XCTAssertEqualObjects(d.role, @"original");
+  }];
+  XCTAssertEqualWithAccuracy(_player.lastVolume, 0.8f, 0.01f);
+
+  [self invalidateAndWait:rt];
+  [[NSFileManager defaultManager] removeItemAtURL:url error:nil];
+}
+
 @end
 
 NS_ASSUME_NONNULL_END
