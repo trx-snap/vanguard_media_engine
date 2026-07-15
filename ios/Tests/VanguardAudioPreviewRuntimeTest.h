@@ -7,6 +7,7 @@
 
 #import "VGAPrTestCollaborators.h"
 #import "VanguardAudioPreviewRuntime+Testing.h"
+#import "VGAudioPreviewTrackDescriptor.h"
 
 #if VG_USE_V2_GRAPH
 

@@ -29,6 +29,8 @@ Pod::Spec.new do |s|
     'Classes/VGTimelineStateSnapshot.h',
     # Phase 10-C Slice D: audio preview runtime — package-internal only.
     'Classes/VanguardAudioPreviewRuntime.h',
+    # Audio Modularity M2A: track descriptor — package-internal only.
+    'Classes/VGAudioPreviewTrackDescriptor.h',
     # VanguardGraphRuntime+AudioPreview.h is module-visible (not private_header_files)
     # so Swift can call setAudioSidecarPlan:timelineDuration:completion: directly.
   ]
