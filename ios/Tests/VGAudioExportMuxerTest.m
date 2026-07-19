@@ -59,7 +59,7 @@ static NSString * _Nullable VGAEM_CreateVideoOnlyMP4(NSUInteger frameCount,
     };
     AVAssetWriterInput *videoInput =
         [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo
-                                           outputSettings:vSettings];
+                                          outputSettings:vSettings];
     videoInput.expectsMediaDataInRealTime = NO;
 
     NSDictionary *attrs = @{
@@ -113,8 +113,8 @@ static NSString * _Nullable VGAEM_CreateSineWaveWAV(double durationSec) {
 
     NSError *err = nil;
     AVAssetWriter *w = [AVAssetWriter assetWriterWithURL:url
-                                                 fileType:AVFileTypeWAVE
-                                                    error:&err];
+                                                fileType:AVFileTypeWAVE
+                                                   error:&err];
     if (!w || err) return nil;
 
     NSDictionary *settings = @{
@@ -128,7 +128,7 @@ static NSString * _Nullable VGAEM_CreateSineWaveWAV(double durationSec) {
     };
     AVAssetWriterInput *inp =
         [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
-                                           outputSettings:settings];
+                                          outputSettings:settings];
     inp.expectsMediaDataInRealTime = NO;
     [w addInput:inp];
     [w startWriting];

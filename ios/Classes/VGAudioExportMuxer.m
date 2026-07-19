@@ -285,6 +285,8 @@ static void _VGAudioExportMuxerLogInit(void) {
             [self _pass1AudioMixdown:activeTracks
                    videoDurationSecs:videoDurationSecs
                    audioMixTempPath:audioMixTempPath
+                    videoTempPath:videoTempPath
+                  finalOutputPath:finalOutputPath
                           completion:^(BOOL pass1OK, NSError * _Nullable pass1Err) {
                 if (!pass1OK) {
                     [self _deleteFileIfExists:videoTempPath];
@@ -334,6 +336,8 @@ static void _VGAudioExportMuxerLogInit(void) {
     [self _pass1AudioMixdown:activeTracks
            videoDurationSecs:videoDurationSecs
            audioMixTempPath:audioMixTempPath
+            videoTempPath:videoTempPath
+          finalOutputPath:finalOutputPath
                   completion:^(BOOL pass1OK, NSError * _Nullable pass1Err) {
         if (!pass1OK) {
             // Pass 1 failed. Clean up video temp and any partial audio temp.
@@ -718,6 +722,8 @@ static void _VGAudioExportMuxerLogInit(void) {
 - (void)_pass1AudioMixdown:(NSArray<NSDictionary<NSString *, id> *> *)activeTracks
          videoDurationSecs:(double)videoDurationSecs
          audioMixTempPath:(NSString *)audioMixTempPath
+          videoTempPath:(NSString *)videoTempPath
+        finalOutputPath:(NSString *)finalOutputPath
                completion:(void (^)(BOOL, NSError * _Nullable))completion {
 
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -1022,10 +1028,15 @@ static void _VGAudioExportMuxerLogInit(void) {
     }
 
     if (!anyTrackInserted) {
-        // All tracks were skipped (missing files, bad durations, etc.).
-        // Fall back to video-only passthrough.
-        os_log(sMuxerLog, "[8.14B] pass1: no valid tracks inserted — will copy video only");
-        completion(NO, [self _errorCode:31 message:@"No valid audio tracks could be inserted"]);
+        // All tracks were skipped — source has no audio track (video-only file).
+        // Fall back to video-only passthrough: copy the composited video temp
+        // to the final output path and complete successfully.
+        os_log(sMuxerLog, "[8.14B] pass1: no valid tracks inserted — performing video-only passthrough");
+        [self _copyVideoOnlyFrom:videoTempPath
+                              to:finalOutputPath
+                      completion:^(BOOL cpOK, NSTimeInterval cpDur, NSError * _Nullable cpErr) {
+            completion(cpOK, cpErr);
+        }];
         return;
     }
 

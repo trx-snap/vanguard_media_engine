@@ -56,11 +56,16 @@
             return NULL;
         }
     } else {
-        // Fallback: direct alloc (first call before pool is ready, or no pool provided)
+        // Fallback: direct alloc (first call before pool is ready, or no pool provided).
+        // Phase 10-A1: Add kCVPixelBufferIOSurfacePropertiesKey so this buffer is
+        // IOSurface-backed, matching the pool path above. Required for downstream
+        // CoreImage and Metal filter nodes (VGColorMatrixFilterNode, VGTransformFilterNode)
+        // which silently pass through non-IOSurface buffers.
         NSDictionary* attrs = @{
             (id)kCVPixelBufferMetalCompatibilityKey:           @YES,
             (id)kCVPixelBufferCGImageCompatibilityKey:         @YES,
             (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+            (id)kCVPixelBufferIOSurfacePropertiesKey:          @{},
         };
         CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, w, h,
                                               kCVPixelFormatType_32BGRA,
@@ -124,10 +129,15 @@
             return NULL;
         }
     } else {
+        // Phase 10-A1: Add kCVPixelBufferIOSurfacePropertiesKey so this buffer is
+        // IOSurface-backed, matching the pool path above. Required for downstream
+        // CoreImage and Metal filter nodes (VGColorMatrixFilterNode, VGTransformFilterNode)
+        // which silently pass through non-IOSurface buffers.
         NSDictionary *attrs = @{
             (id)kCVPixelBufferMetalCompatibilityKey:           @YES,
             (id)kCVPixelBufferCGImageCompatibilityKey:         @YES,
             (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+            (id)kCVPixelBufferIOSurfacePropertiesKey:          @{},
         };
         CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, displayW, displayH,
                                               kCVPixelFormatType_32BGRA,

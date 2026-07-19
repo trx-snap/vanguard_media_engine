@@ -1,5 +1,5 @@
 // vg_clip_descriptor.dart
-// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11 / Phase 7.16 / Phase 7.17 / Phase 7.19B / Phase 7.x-Q1 / Phase 7.22A / Phase 7.23
+// Vanguard Media Engine — Phase 7 Stage 7.1 / Phase 7.11 / Phase 7.16 / Phase 7.17 / Phase 7.19B / Phase 7.x-Q1 / Phase 7.22A / Phase 7.23 / Phase 10
 //
 // Non-destructive clip descriptor for the UMF V2 timeline editor.
 //
@@ -78,25 +78,34 @@
 //     NOT composed. Static transform remains stored as a fallback if
 //     transformTrack is absent or later cleared. Runtime integration: 7.23B.
 //
+// Phase 10 addition:
+//   - [colorMatrix]: optional 20-element List<double> — row-major 4×5 color
+//     matrix applied to every decoded video frame by the native compositor.
+//     Format matches Flutter's ColorFilter.matrix convention.
+//     Null means no color filter. Must be exactly 20 elements when non-null.
+//   - Wire key: 'colorMatrix'. Omitted from toMap() when null.
+//   - Backward-compatible: existing maps without 'colorMatrix' produce null.
+//
 // Serialisation:
 //   toMap() produces a JSON-compatible map:
 //   {
 //     'id': String,
 //     'sourcePath': String,
-//     'mediaKind': String,       // 'video' | 'audio' | 'image' | 'unknown'
+//     'mediaKind': String,        // 'video' | 'audio' | 'image' | 'unknown'
 //     'startTimeSeconds': double,
 //     'durationSeconds': double,
 //     'trimStartSeconds': double,
 //     'trimEndSeconds': double,
 //     'speed': double,
-//     'transform': Map?,         // Phase 7.11: optional, omitted when null
-//     'fitMode': String?,        // Phase 7.16: omitted when 'fit' (default)
-//     'cropRect': List<double>?, // Phase 7.16: omitted when null
-//     'freezePTS': double?,      // Phase 7.17: omitted when null
-//     'isReversed': bool?,       // Phase 7.19B: omitted when false (default)
-//     'dualCamera': Map?,        // Phase 7.x-Q1: omitted when null; secondary-only wire payload
-//     'timeRemap': Map?,         // Phase 7.22A: omitted when null; descriptor-only in 7.22A
-//     'transformTrack': Map?,    // Phase 7.23: omitted when null; descriptor-only in 7.23
+//     'transform': Map?,          // Phase 7.11: optional, omitted when null
+//     'fitMode': String?,         // Phase 7.16: omitted when 'fit' (default)
+//     'cropRect': List<double>?,  // Phase 7.16: omitted when null
+//     'freezePTS': double?,       // Phase 7.17: omitted when null
+//     'isReversed': bool?,        // Phase 7.19B: omitted when false (default)
+//     'dualCamera': Map?,         // Phase 7.x-Q1: omitted when null; secondary-only wire payload
+//     'timeRemap': Map?,          // Phase 7.22A: omitted when null; descriptor-only in 7.22A
+//     'transformTrack': Map?,     // Phase 7.23: omitted when null; descriptor-only in 7.23
+//     'colorMatrix': List<double>?,// Phase 10: omitted when null; 20-element 4×5 color matrix
 //   }
 
 import 'vg_clip_transform_descriptor.dart';
@@ -208,7 +217,13 @@ final class VGClipDescriptor {
     this.dualCamera,
     this.timeRemap,
     this.transformTrack,
+    this.colorMatrix,
   })  : assert(startTimeSeconds >= 0, 'startTimeSeconds must be >= 0'),
+        // Phase 10: colorMatrix must be exactly 20 elements when non-null.
+        assert(
+          colorMatrix == null || colorMatrix.length == 20,
+          'colorMatrix must have exactly 20 elements (4×5 row-major matrix)',
+        ),
         assert(durationSeconds >= 0, 'durationSeconds must be >= 0'),
         assert(trimStartSeconds >= 0, 'trimStartSeconds must be >= 0'),
         assert(trimEndSeconds > trimStartSeconds,
@@ -463,6 +478,31 @@ final class VGClipDescriptor {
   /// - Backward-compatible: existing clip maps without 'transformTrack' produce null.
   final VGTransformTrackDescriptor? transformTrack;
 
+  // ── Color matrix filter (Phase 10) ───────────────────────────────────────
+
+  /// Optional 4×5 row-major color matrix applied to every decoded video frame.
+  ///
+  /// **Phase 10** — when non-null, the native `VGTimelineCompositorNode` applies
+  /// this color matrix to each decoded `CVPixelBufferRef` before compositing.
+  ///
+  /// Format matches Flutter's `ColorFilter.matrix` convention:
+  /// ```
+  ///   [r0, r1, r2, r3, r4,    // R_out = r0*R + r1*G + r2*B + r3*A + r4/255
+  ///    g0, g1, g2, g3, g4,    // G_out = ...
+  ///    b0, b1, b2, b3, b4,    // B_out = ...
+  ///    a0, a1, a2, a3, a4]    // A_out = ...
+  /// ```
+  ///
+  /// Design notes:
+  /// - Must be exactly 20 elements. Enforced by constructor assert.
+  /// - Null means no color filter — clip renders with natural colors.
+  /// - Applies ONLY to [VGMediaKind.video] clips in the normal forward/streaming
+  ///   AVAssetReader path. Freeze-frame and reverse clips use the image-generator
+  ///   path; color matrix is not applied there in Phase 10.
+  /// - Wire key: 'colorMatrix'. Omitted from [toMap] when null.
+  /// - Backward-compatible: existing clip maps without 'colorMatrix' produce null.
+  final List<double>? colorMatrix;
+
   // ── Crop rect convenience accessors (Phase 7.16) ─────────────────────────
 
   /// The normalized X origin of the crop rectangle. Null when [cropRect] is null.
@@ -574,6 +614,11 @@ final class VGClipDescriptor {
     // compositor ignores this field until Phase 7.23B runtime integration).
     if (transformTrack != null) {
       m['transformTrack'] = transformTrack!.toMap();
+    }
+    // Phase 10: include colorMatrix when non-null. The native compositor applies
+    // this 4×5 color matrix to each decoded video frame during timeline export.
+    if (colorMatrix != null) {
+      m['colorMatrix'] = colorMatrix!;
     }
     return m;
   }
@@ -733,6 +778,23 @@ final class VGClipDescriptor {
       if (transformTrack == null) return null; // malformed transform track payload
     }
 
+    // Phase 10: parse optional colorMatrix.
+    // Missing key means null (no color filter — natural colors).
+    // When present: must be a list of exactly 20 finite numbers.
+    // A malformed or wrong-length colorMatrix causes fromMap to return null.
+    List<double>? colorMatrix;
+    final rawColorMatrix = map['colorMatrix'];
+    if (rawColorMatrix != null) {
+      if (rawColorMatrix is! List) return null;
+      if (rawColorMatrix.length != 20) return null;
+      final doubles = <double>[];
+      for (final v in rawColorMatrix) {
+        if (v is! num) return null;
+        doubles.add(v.toDouble());
+      }
+      colorMatrix = doubles;
+    }
+
     return VGClipDescriptor(
       id: id as String,
       sourcePath: sourcePath as String,
@@ -750,6 +812,7 @@ final class VGClipDescriptor {
       dualCamera: dualCamera,
       timeRemap: timeRemap,
       transformTrack: transformTrack,
+      colorMatrix: colorMatrix,
     );
   }
 
@@ -781,6 +844,8 @@ final class VGClipDescriptor {
     Object? timeRemap = _kClipNoValue,
     // Use sentinel to allow explicit null assignment (clear transformTrack).
     Object? transformTrack = _kClipNoValue,
+    // Use sentinel to allow explicit null assignment (clear colorMatrix).
+    Object? colorMatrix = _kClipNoValue,
   }) {
     return VGClipDescriptor(
       id: id ?? this.id,
@@ -811,6 +876,9 @@ final class VGClipDescriptor {
       transformTrack: transformTrack == _kClipNoValue
           ? this.transformTrack
           : transformTrack as VGTransformTrackDescriptor?,
+      colorMatrix: colorMatrix == _kClipNoValue
+          ? this.colorMatrix
+          : colorMatrix as List<double>?,
     );
   }
 
@@ -835,10 +903,22 @@ final class VGClipDescriptor {
           other.isReversed == isReversed &&
           other.dualCamera == dualCamera &&
           other.timeRemap == timeRemap &&
-          other.transformTrack == transformTrack;
+          other.transformTrack == transformTrack &&
+          _colorMatrixEqual(other.colorMatrix, colorMatrix);
 
   /// Deep-equality helper for the [cropRect] list field.
   static bool _cropRectEqual(List<double>? a, List<double>? b) {
+    if (identical(a, b)) return true;
+    if (a == null || b == null) return false;
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  /// Deep-equality helper for the [colorMatrix] list field.
+  static bool _colorMatrixEqual(List<double>? a, List<double>? b) {
     if (identical(a, b)) return true;
     if (a == null || b == null) return false;
     if (a.length != b.length) return false;
@@ -867,6 +947,8 @@ final class VGClipDescriptor {
         dualCamera,
         timeRemap,
         transformTrack,
+        // Hash colorMatrix elements individually for stable hash.
+        Object.hashAll(colorMatrix ?? const []),
       );
 
   @override
@@ -885,7 +967,8 @@ final class VGClipDescriptor {
       'isReversed: $isReversed, '
       'dualCamera: ${dualCamera != null ? "<present layoutMode=${dualCamera!.layoutMode.value}>" : null}, '
       'timeRemap: ${timeRemap != null ? "<present segments=${timeRemap!.segments.length}>" : null}, '
-      'transformTrack: ${transformTrack != null ? "<present keyframes=${transformTrack!.keyframes.length} interp=${transformTrack!.interpolation.value}>" : null})';
+      'transformTrack: ${transformTrack != null ? "<present keyframes=${transformTrack!.keyframes.length} interp=${transformTrack!.interpolation.value}>" : null}, '
+      'colorMatrix: ${colorMatrix != null ? "<present ${colorMatrix!.length} elements>" : null})';
 }
 
 // ── Sentinel for copyWith nullable fields ─────────────────────────────────────────

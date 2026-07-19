@@ -36,6 +36,7 @@
 #import "VGImageSourceAdapter.h"
 #import "VGImageEncoderSinkNode.h"
 #import "VGLegacyFilterAdapter.h"
+#import "VGOverlayNode.h"
 #import "VanguardImageMediaSource.h"
 
 #import <UMF/VGGraphDescriptor.h>
@@ -102,7 +103,9 @@ static NSString * const kSinkNodeId   = @"imageSink";
     // ── Live nodes ────────────────────────────────────────────────────────────
     VGImageSourceAdapter   *_sourceAdapter;
     VGImageEncoderSinkNode *_sink;
-    NSArray<VGLegacyFilterAdapter *> *_filterAdapters; // ordered, transform chain
+    // Phase 10-B1: widened to id<VGTransformNode> so VGOverlayNode (which conforms
+    // to VGTransformNode directly) can be stored here without wrapping in VGLegacyFilterAdapter.
+    NSArray<id<VGTransformNode>> *_filterAdapters; // ordered, transform chain
 
     // ── Graph infrastructure ──────────────────────────────────────────────────
     VGGraphDescriptor        *_descriptor;
@@ -210,23 +213,32 @@ static NSString * const kSinkNodeId   = @"imageSink";
     _sink          = [[VGImageEncoderSinkNode alloc] initWithOutputURL:_outputURL
                                                                profile:_profile];
 
-    // Build filter adapters from the raw filterChain.
-    // Guard: if an element is already a VGLegacyFilterAdapter (e.g. from a caller
-    // that pre-wrapped), use it as-is to prevent double-wrapping. Double-wrapping
-    // causes the outer adapter's prepareWithContext:completion: to call
-    // [self.filter prepareWithCompletion:] on the inner adapter, which does not
-    // implement prepareWithCompletion:, triggering NSInvalidArgumentException.
-    NSMutableArray<VGLegacyFilterAdapter *> *adapters = [NSMutableArray array];
+    // Phase 10-B1: Build the transform-node array from the raw filterChain.
+    //
+    // Three cases are handled:
+    //   1. Already a VGLegacyFilterAdapter — use as-is (prevents double-wrap).
+    //      Double-wrapping causes the outer adapter's prepareWithContext:completion:
+    //      to call [self.filter prepareWithCompletion:] on the inner adapter, which
+    //      does not implement that selector → NSInvalidArgumentException.
+    //   2. Already conforms to VGTransformNode (e.g. VGOverlayNode) — use as-is.
+    //      VGOverlayNode conforms to VGTransformNode directly, not VGMetalFilterNode,
+    //      so wrapping it in VGLegacyFilterAdapter would crash on prepareWithCompletion:.
+    //   3. Otherwise: raw id<VGMetalFilterNode> — wrap exactly once in VGLegacyFilterAdapter.
+    NSMutableArray<id<VGTransformNode>> *adapters = [NSMutableArray array];
     for (id filter in _filterChain) {
-        VGLegacyFilterAdapter *adapter;
+        id<VGTransformNode> node;
         if ([filter isKindOfClass:[VGLegacyFilterAdapter class]]) {
-            // Already wrapped — use as-is. Do not double-wrap.
-            adapter = (VGLegacyFilterAdapter *)filter;
+            // Case 1: Already a VGLegacyFilterAdapter — use as-is.
+            node = (VGLegacyFilterAdapter *)filter;
+        } else if ([filter conformsToProtocol:@protocol(VGTransformNode)]) {
+            // Case 2: Already conforms to VGTransformNode (e.g. VGOverlayNode).
+            // Pass through without wrapping.
+            node = (id<VGTransformNode>)filter;
         } else {
-            // Raw id<VGMetalFilterNode> — wrap exactly once.
-            adapter = [[VGLegacyFilterAdapter alloc] initWithFilter:filter];
+            // Case 3: Raw id<VGMetalFilterNode> — wrap exactly once.
+            node = [[VGLegacyFilterAdapter alloc] initWithFilter:filter];
         }
-        [adapters addObject:adapter];
+        [adapters addObject:node];
     }
     _filterAdapters = [adapters copy];
 
@@ -513,9 +525,15 @@ static NSString * const kSinkNodeId   = @"imageSink";
             [VGMediaPort inputPort:@"video_in"  mediaType:VGMediaTypeVideo required:YES],
             [VGMediaPort outputPort:@"video_out" mediaType:VGMediaTypeVideo],
         ];
+        // Phase 10-B1: Use the actual runtime class of each node for the descriptor's
+        // nodeClass field. This is required for VGOverlayNode (which reports
+        // "VGOverlayNode" from its -nodeClass method) and avoids lying to the
+        // descriptor about the node class being VGLegacyFilterAdapter.
+        id<VGTransformNode> nodeForDesc = _filterAdapters[i];
+        NSString *actualNodeClass = NSStringFromClass([nodeForDesc class]);
         VGGraphNodeDescriptor *transformDesc =
             [[VGGraphNodeDescriptor alloc] initWithNodeId:transformId
-                                                nodeClass:NSStringFromClass([VGLegacyFilterAdapter class])
+                                                nodeClass:actualNodeClass
                                                  nodeRole:VGNodeRoleFilter
                                                parameters:@{}
                                                     ports:transformPorts];

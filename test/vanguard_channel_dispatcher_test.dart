@@ -71,7 +71,7 @@ void main() {
       expect(dispatcher.isHandlerRegistered, isFalse);
       final sub = dispatcher.registerTimelineListener(
         textureId: 1,
-        onFrame: (_, __) {},
+        onFrame: (_) {},
         onEOS: () {},
       );
       expect(dispatcher.isHandlerRegistered, isTrue);
@@ -85,21 +85,16 @@ void main() {
     test('onTimelineFrame delivers pts to correct subscription', () async {
       const tid = 42;
       double? receivedPts;
-      int? receivedGen;
       bool eosReceived = false;
 
       final sub = dispatcher.registerTimelineListener(
         textureId: tid,
-        onFrame: (pts, gen) {
-          receivedPts = pts;
-          receivedGen = gen;
-        },
+        onFrame: (pts) => receivedPts = pts,
         onEOS: () => eosReceived = true,
       );
 
       await _invokeNative('onTimelineFrame', {'textureId': tid, 'pts': 1.5, 'generation': 1});
       expect(receivedPts, closeTo(1.5, 0.001));
-      expect(receivedGen, 1);
       expect(eosReceived, isFalse);
 
       dispatcher.unregisterTimelineListener(sub);
@@ -111,7 +106,7 @@ void main() {
 
       final sub = dispatcher.registerTimelineListener(
         textureId: tid,
-        onFrame: (_, __) {},
+        onFrame: (_) {},
         onEOS: () => eosReceived = true,
       );
 
@@ -143,12 +138,12 @@ void main() {
 
       final sub1 = dispatcher.registerTimelineListener(
         textureId: 1,
-        onFrame: (pts, gen) => pts1 = pts,
+        onFrame: (pts) => pts1 = pts,
         onEOS: () {},
       );
       final sub2 = dispatcher.registerTimelineListener(
         textureId: 2,
-        onFrame: (pts, gen) => pts2 = pts,
+        onFrame: (pts) => pts2 = pts,
         onEOS: () {},
       );
 
@@ -170,14 +165,14 @@ void main() {
 
       final oldSub = dispatcher.registerTimelineListener(
         textureId: tid,
-        onFrame: (_, __) => callCount++,
+        onFrame: (_) => callCount++,
         onEOS: () {},
       );
 
       // Replace with a new subscription.
       final newSub = dispatcher.registerTimelineListener(
         textureId: tid,
-        onFrame: (_, __) => callCount += 10,
+        onFrame: (_) => callCount += 10,
         onEOS: () {},
       );
 
@@ -297,7 +292,7 @@ void main() {
 
       final sub = dispatcher.registerTimelineListener(
         textureId: tid,
-        onFrame: (pts, gen) => receivedPts = pts,
+        onFrame: (pts) => receivedPts = pts,
         onEOS: () {},
       );
 
@@ -328,7 +323,7 @@ void main() {
 
       final sub = dispatcher.registerTimelineListener(
         textureId: 100,
-        onFrame: (_, __) => fireCount++,
+        onFrame: (_) => fireCount++,
         onEOS: () => fireCount++,
       );
 
@@ -344,7 +339,7 @@ void main() {
 
       final sub = dispatcher.registerTimelineListener(
         textureId: 101,
-        onFrame: (_, __) => fireCount++,
+        onFrame: (_) => fireCount++,
         onEOS: () => fireCount++,
       );
 
@@ -365,14 +360,14 @@ void main() {
 
       final old = dispatcher.registerTimelineListener(
         textureId: tid,
-        onFrame: (_, __) => oldCallCount++,
+        onFrame: (_) => oldCallCount++,
         onEOS: () {},
       );
 
       // Replace — old must be gone.
       final fresh = dispatcher.registerTimelineListener(
         textureId: tid,
-        onFrame: (_, __) => newCallCount++,
+        onFrame: (_) => newCallCount++,
         onEOS: () {},
       );
       // old subscription is superseded — we do not unregister it (stale token test).

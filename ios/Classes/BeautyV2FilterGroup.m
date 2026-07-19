@@ -31,6 +31,26 @@
 #import <os/lock.h>
 #import <os/log.h>
 
+// ── Diagnostic logging gate ──────────────────────────────────────────────────
+// Set VG_ENABLE_BEAUTYV2_DIAGNOSTICS=1 in your scheme's preprocessor macros to
+// enable BeautyV2 mask freshness / metadata diagnostics.
+// Default is OFF so that thermal and performance testing are not polluted
+// by per-frame logging overhead.
+#ifndef VG_ENABLE_BEAUTYV2_DIAGNOSTICS
+#define VG_ENABLE_BEAUTYV2_DIAGNOSTICS 0
+#endif
+
+// ── GPU timing logging gate ───────────────────────────────────────────────────
+// Set VG_ENABLE_BEAUTYV2_TIMING_LOGS=1 in your scheme's preprocessor macros to
+// enable per-frame GPU blocking-time measurement and the [BeautyV2 timing]
+// p50/p95/max log every 60 frames.
+// Default is OFF. When OFF, the _gpuTimingBuf ivars and the timer capture
+// around waitUntilCompleted are compiled out entirely, eliminating all
+// measurement overhead from production and thermal/perf runs.
+#ifndef VG_ENABLE_BEAUTYV2_TIMING_LOGS
+#define VG_ENABLE_BEAUTYV2_TIMING_LOGS 0
+#endif
+
 // ---------------------------------------------------------------------------
 // Pool creation helpers
 // ---------------------------------------------------------------------------
@@ -134,13 +154,13 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     // Throttle freshness log to once every kVGBeautyDiagLogInterval frames.
     NSUInteger _freshnessLogCount;
 
-#ifndef NDEBUG
+#if VG_ENABLE_BEAUTYV2_TIMING_LOGS
     // ── Phase 9B+: total GPU blocking-time measurement ────────────────────────
     // Rolling 60-frame buffer of wall-clock ms for [cmd commit]+waitUntilCompleted.
     // Filled circularly; sorted+logged every 60 frames.
     float      _gpuTimingBuf[60];
     NSUInteger _gpuTimingCount;  // total frames measured so far
-#endif
+#endif // VG_ENABLE_BEAUTYV2_TIMING_LOGS
 }
 
 @synthesize enabled              = _enabled;
@@ -297,11 +317,11 @@ _VGBeautyCreatePool(size_t width, size_t height) {
     _beautyPoolB = NULL;
     // _beautyPoolC removed (Phase 9B+ OP-1)
 
-#ifndef NDEBUG
+#if VG_ENABLE_BEAUTYV2_TIMING_LOGS
     // Phase 9B+: zero-init timing buffer and frame counter.
     memset(_gpuTimingBuf, 0, sizeof(_gpuTimingBuf));
     _gpuTimingCount = 0;
-#endif
+#endif // VG_ENABLE_BEAUTYV2_TIMING_LOGS
 
     // Identity
     _nodeId     = [[NSUUID UUID] UUIDString];
@@ -732,6 +752,7 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
         }
     }
 
+#if VG_ENABLE_BEAUTYV2_DIAGNOSTICS
     // ── Phase 9B-6A: mask freshness diagnostic ────────────────────────────────
     // Computed before temporal fade logic — logging only, no logic change.
     _freshnessLogCount++;
@@ -785,6 +806,7 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
             maskValid ? "YES" : "NO",
             CMTIME_IS_VALID(maskPTS) ? freshLabel : "noPTS");
     }
+#endif // VG_ENABLE_BEAUTYV2_DIAGNOSTICS
 
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
 
@@ -1011,12 +1033,12 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
     }
 
     // ── Commit + synchronous wait (DEC-58 — NO addCompletedHandler:) ──────────
-#ifndef NDEBUG
+#if VG_ENABLE_BEAUTYV2_TIMING_LOGS
     CFAbsoluteTime _vgTimerT0 = CFAbsoluteTimeGetCurrent();
 #endif
     [cmd commit];
     [cmd waitUntilCompleted];
-#ifndef NDEBUG
+#if VG_ENABLE_BEAUTYV2_TIMING_LOGS
     {
         // Phase 9B+: accumulate total GPU wall-clock blocking time.
         // waitUntilCompleted is synchronous — delta is true blocking cost.
@@ -1048,7 +1070,7 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
                 _vgP50, _vgP95, _vgMax, _intensity, _radius);
         }
     }
-#endif
+#endif // VG_ENABLE_BEAUTYV2_TIMING_LOGS
 
     // ── GPU fault check (Step 3B) ──────────────────────────────────────────────
     // waitUntilCompleted blocks until the GPU is done but does NOT guarantee
