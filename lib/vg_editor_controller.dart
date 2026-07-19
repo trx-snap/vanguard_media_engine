@@ -56,6 +56,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import 'src/channel/vanguard_channel_dispatcher.dart';
+import 'vg_audio_recording_models.dart';
 import 'vg_clip_descriptor.dart';
 import 'vg_dual_camera_descriptor.dart';
 import 'vg_editor_draft.dart';
@@ -1350,6 +1351,62 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
       '|${clip.trimStartSeconds}'
       '|${clip.trimEndSeconds}'
       '|${value.draft.canvasWidth}x${value.draft.canvasHeight}';
+
+  // ── Audio Recording — Slice M ──────────────────────────────────────────────
+
+  /// Starts audio recording to [outputPath] using the active timeline runtime.
+  ///
+  /// Maps to `startAudioRecording` (Slice M). The native layer reads the
+  /// current `VGTimelineStateSnapshot` to compute the authoritative start PTS
+  /// without any involvement from the Dart layer.
+  ///
+  /// Returns a [VGAudioRecordingStartResult] containing the file path, native
+  /// start PTS, and a headphone-connection indicator.
+  ///
+  /// Throws [PlatformException] if no active timeline runtime is present, if
+  /// the timeline snapshot is invalid, or if the recorder fails to start.
+  /// Throws [StateError] if disposed.
+  Future<VGAudioRecordingStartResult> startAudioRecording(
+      String outputPath) async {
+    _assertNotDisposed();
+    final raw = await _channel.invokeMapMethod<Object?, Object?>(
+      'startAudioRecording',
+      {'outputPath': outputPath},
+    );
+    final result = VGAudioRecordingStartResult.fromMap(raw ?? const {});
+    if (result == null) {
+      throw PlatformException(
+        code: 'INVALID_RESPONSE',
+        message: 'startAudioRecording: native returned incomplete map',
+      );
+    }
+    return result;
+  }
+
+  /// Stops the active audio recording.
+  ///
+  /// Maps to `stopAudioRecording` (Slice M). The native layer finalises the
+  /// file and restores the AVAudioSession category to `.playback`.
+  ///
+  /// Returns a [VGAudioRecordingStopResult] containing the file path, start
+  /// PTS, and total recorded duration.
+  ///
+  /// Throws [PlatformException] if no recording is active or if file
+  /// finalisation fails. Throws [StateError] if disposed.
+  Future<VGAudioRecordingStopResult> stopAudioRecording() async {
+    _assertNotDisposed();
+    final raw = await _channel.invokeMapMethod<Object?, Object?>(
+      'stopAudioRecording',
+    );
+    final result = VGAudioRecordingStopResult.fromMap(raw ?? const {});
+    if (result == null) {
+      throw PlatformException(
+        code: 'INVALID_RESPONSE',
+        message: 'stopAudioRecording: native returned incomplete map',
+      );
+    }
+    return result;
+  }
 
   // ── Debug ──────────────────────────────────────────────────────────────────
 

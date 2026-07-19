@@ -129,6 +129,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // Gated behind VG_USE_V2_GRAPH — nil when VG_USE_V2_GRAPH=0.
     #if VG_USE_V2_GRAPH
     var _timelineRuntime: VanguardGraphRuntime?
+    private let _audioRecordingHandler = VGAudioRecordingHandler()
     #endif
 
     // Phase 7.x-E: DEV-only runtime for dual-camera texture mount smoke test.
@@ -6239,6 +6240,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             NSLog("[Vanguard][DEBUG] Simulating thermal state → %ld", simulatedState.rawValue)
             notifyThermalStateChanged(simulatedState)
             result(nil)
+        #endif
+
+        #if VG_USE_V2_GRAPH
+        case "startAudioRecording":
+            _audioRecordingHandler.handleStart(args: args,
+                                               runtime: self._timelineRuntime,
+                                               result: result)
+
+        case "stopAudioRecording":
+            _audioRecordingHandler.handleStop(result: result)
         #endif
 
         default:

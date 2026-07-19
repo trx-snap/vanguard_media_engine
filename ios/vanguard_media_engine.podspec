@@ -225,7 +225,9 @@ Pod::Spec.new do |s|
       # Audio Slice K: four-scenario preview proof (two-slot architecture)
       'Tests/VanguardAudioPreviewRuntimeTest_SliceK_Scenarios.m',
       # Audio Slice L: preview/export parity gate tests
-      'Tests/VanguardAudioParity_SliceL_Tests.m'
+      'Tests/VanguardAudioParity_SliceL_Tests.m',
+      # Audio Slice M: recording contract and minimal native capture tests
+      'Tests/VanguardAudioRecorderTests.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage', 'AVFoundation'
     ts.dependency    'UMF'
