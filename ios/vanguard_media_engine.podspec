@@ -221,7 +221,11 @@ Pod::Spec.new do |s|
       'Tests/VanguardAudioPreviewRuntimeTest_SliceJ_Normalization.m',
       'Tests/VanguardAudioPreviewRuntimeTest_SliceJ_Evaluator.m',
       'Tests/VanguardAudioPreviewRuntimeTest_SliceJ_Automation.m',
-      'Tests/VanguardAudioPreviewRuntimeTest_SliceJ_TimerProduction.m'
+      'Tests/VanguardAudioPreviewRuntimeTest_SliceJ_TimerProduction.m',
+      # Audio Slice K: four-scenario preview proof (two-slot architecture)
+      'Tests/VanguardAudioPreviewRuntimeTest_SliceK_Scenarios.m',
+      # Audio Slice L: preview/export parity gate tests
+      'Tests/VanguardAudioParity_SliceL_Tests.m'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage', 'AVFoundation'
     ts.dependency    'UMF'
