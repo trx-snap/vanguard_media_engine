@@ -1,29 +1,33 @@
 // VanguardAudioRecorder.h
-// Vanguard Media Engine — Audio Slice M
+// Vanguard Media Engine — Audio Slice N
 //
 // Minimal microphone capture helper backed by AVAudioRecorder.
 //
-// VISIBILITY: Package-internal only. Do NOT add to public_header_files.
+// VISIBILITY: Module-visible (not in private_header_files).
+// Do NOT add to public_header_files.
 // Do NOT import from VanguardGraphRuntime.h.
 //
-// Responsibility:
+// Responsibility (Slice N — capture only):
 //   - Owns AVAudioRecorder lifecycle (via VGAudioRecorderBackend seam).
-//   - Owns AVAudioSession minimal category switch:
-//       start → PlayAndRecord (with MixWithOthers option)
-//       stop / cancel / error → restore Playback
-//   - Reads VGTimelineStateSnapshot from the supplied runtime to compute
-//     the authoritative start PTS atomically at record time.
-//   - Exposes the current AVAudioSession route to the caller for UX gating
-//     (headphone detection — policy is the caller's responsibility).
+//   - Does NOT own or call AVAudioSession. The caller (VGAudioRecordingHandler)
+//     activates PlayAndRecord before calling startRecording and restores Playback
+//     after stopRecording, using VGAudioSessionTransitionCoordinator.
+//   - Constructs the backend and calls prepareToRecord first.
+//   - Only after prepare succeeds does it read VGTimelineStateSnapshot from the
+//     supplied runtime and compute startPTS immediately before calling record.
+//     This minimises the skew between the snapshot read and the first recorded
+//     sample.
+//   - Does NOT carry headphonesConnected. The handler derives that flag from
+//     VGAudioRouteSnapshot.hasHeadphoneOutput and includes it in the result map.
 //
 // Explicit deferrals (Slices N/O):
+//   - No AVAudioSession management (moved to VGAudioSessionTransitionCoordinator).
 //   - No route-change notification handling.
 //   - No AVAudioSession interruption handling.
 //   - No background-audio hardening.
 //
 // Mockable seams for unit tests:
 //   - VGAudioRecorderTimeProvider  — injectable for CACurrentMediaTime().
-//   - VGAudioRecorderSessionManager — injectable AVAudioSession abstraction.
 //   - VGAudioRecorderBackend       — injectable recorder (avoids real AVAudioRecorder).
 //   - VGAudioRecorderBackendFactory — injectable builder for the backend.
 //   All seams default to real implementations; override in tests only.
@@ -39,7 +43,7 @@
 
 // Forward-declare the concrete runtime type. The .m file imports
 // VGTimelineStateSnapshot.h to access readTimelineStateSnapshot; this header
-// only needs the class name so Swift can pass _timelineRuntime safely.
+// only needs the class name so Swift can pass a runtime reference safely.
 @class VanguardGraphRuntime;
 
 NS_ASSUME_NONNULL_BEGIN
@@ -50,18 +54,6 @@ NS_ASSUME_NONNULL_BEGIN
 /// Production: wraps CACurrentMediaTime(). Inject a stub in tests.
 @protocol VGAudioRecorderTimeProvider <NSObject>
 - (NSTimeInterval)currentTime;
-@end
-
-/// Wraps AVAudioSession category management for testability.
-@protocol VGAudioRecorderSessionManager <NSObject>
-/// Switches the shared AVAudioSession to PlayAndRecord (with MixWithOthers).
-/// Returns YES on success; on failure sets *error.
-- (BOOL)activatePlayAndRecordWithError:(NSError * _Nullable * _Nullable)error;
-/// Restores the shared AVAudioSession to Playback.
-/// Idempotent; best-effort on failure.
-- (void)restorePlayback;
-/// Returns YES if a wired or Bluetooth headphone output is active.
-- (BOOL)isHeadphonesConnected;
 @end
 
 /// Abstracts the recording back-end so tests can operate without a real
@@ -95,20 +87,20 @@ NS_ASSUME_NONNULL_BEGIN
 // ─── VGAudioRecordingStartInfo ────────────────────────────────────────────────
 
 /// Returned from a successful startRecording call.
+///
+/// headphonesConnected is NOT carried here. The handler derives that flag from
+/// VGAudioRouteSnapshot.hasHeadphoneOutput and includes it in the Flutter result.
 @interface VGAudioRecordingStartInfo : NSObject
 
 /// Absolute path to the recording file (mirrors the supplied outputPath).
 @property(nonatomic, readonly) NSString *filePath;
 
 /// Authoritative timeline PTS at the moment recording began.
+/// Read from VGTimelineStateSnapshot immediately before record is called.
 @property(nonatomic, readonly) double startPTS;
 
-/// Whether headphones (wired or Bluetooth) were connected at start time.
-@property(nonatomic, readonly) BOOL isHeadphonesConnected;
-
 - (instancetype)initWithFilePath:(NSString *)filePath
-                        startPTS:(double)startPTS
-             isHeadphonesConnected:(BOOL)isHeadphonesConnected NS_DESIGNATED_INITIALIZER;
+                        startPTS:(double)startPTS NS_DESIGNATED_INITIALIZER;
 - (instancetype)init NS_UNAVAILABLE;
 
 @end
@@ -141,12 +133,16 @@ NS_ASSUME_NONNULL_BEGIN
 /// One instance is held by VGAudioRecordingHandler during an active recording.
 /// After stop or error it is discarded. All methods must be called on the main
 /// thread.
+///
+/// Start sequence (enforced internally):
+///   1. Construct backend (AVAudioRecorder init).
+///   2. prepareToRecord — allocates file and hardware resources.
+///   3. Read VGTimelineStateSnapshot → compute startPTS.
+///   4. record — begins capture.
+/// This order minimises the skew between the PTS read and first audio sample.
 @interface VanguardAudioRecorder : NSObject
 
-/// Designated initialiser. All collaborator parameters are optional;
-/// pass nil to use the production default implementations.
 - (instancetype)initWithTimeProvider:(nullable id<VGAudioRecorderTimeProvider>)timeProvider
-                      sessionManager:(nullable id<VGAudioRecorderSessionManager>)sessionManager
                       backendFactory:(nullable id<VGAudioRecorderBackendFactory>)backendFactory
     NS_DESIGNATED_INITIALIZER;
 
@@ -155,30 +151,32 @@ NS_ASSUME_NONNULL_BEGIN
 
 /// Starts recording to |outputPath|.
 ///
-/// Reads VGTimelineStateSnapshot from |runtime| to compute the authoritative
-/// startPTS:
-///   - snapshot.isValid == NO  → fails with VGRecorderErrorInvalidSnapshot.
-///   - snapshot.isPlaying      → startPTS = playStartPTS + max(0, now − playStartHostTime)
-///   - paused                  → startPTS = timelinePTS
+/// The caller is responsible for activating PlayAndRecord via
+/// VGAudioSessionTransitionCoordinator BEFORE calling this method.
 ///
-/// Switches AVAudioSession to PlayAndRecord + MixWithOthers on success.
-/// On failure, always restores Playback before returning.
+/// Internal sequence: backend init → prepareToRecord → snapshot read → record.
+/// Snapshot is read immediately before record to minimise PTS skew.
+///
+///   snapshot.isValid == NO  → fails with VGRecorderErrorInvalidSnapshot.
+///   snapshot.isPlaying      → startPTS = playStartPTS + max(0, now − playStartHostTime)
+///   paused                  → startPTS = timelinePTS
 ///
 /// Fails with VGRecorderErrorAlreadyRecording if a recording is in progress.
-///
 /// |runtime| must not be nil and must not have been invalidated.
 ///
-/// Returns a VGAudioRecordingStartInfo on success, nil + *error on failure.
+/// Returns a VGAudioRecordingStartInfo on success, nil + *outError on failure.
 - (nullable VGAudioRecordingStartInfo *)
     startRecordingWithRuntime:(VanguardGraphRuntime *)runtime
                    outputPath:(NSString *)outputPath
                         error:(NSError * _Nullable * _Nullable)outError;
 
-/// Stops the active recording, finalises the file, and restores Playback.
+/// Stops the active recording and finalises the file.
 ///
 /// |completion| is called on the main thread with the stop result on success
-/// or a non-nil error on failure. Always restores AVAudioSession to Playback
-/// whether or not an error occurs.
+/// or a non-nil error on failure.
+///
+/// The caller (VGAudioRecordingHandler) must call
+/// coordinator.restorePlayback() after this method's completion fires.
 ///
 /// No-op (calls completion with an error) if no recording is active.
 - (void)stopRecordingWithCompletion:
@@ -186,7 +184,7 @@ NS_ASSUME_NONNULL_BEGIN
               NSError * _Nullable error))completion;
 
 /// Cancels and discards the active recording without returning a result.
-/// Restores AVAudioSession to Playback. Idempotent.
+/// Idempotent.
 - (void)cancelRecording;
 
 /// Whether a recording is currently in progress.
@@ -201,7 +199,7 @@ extern NSString * const VGRecorderErrorDomain;
 typedef NS_ENUM(NSInteger, VGRecorderError) {
   VGRecorderErrorNoRuntime           = 1, ///< runtime argument was nil.
   VGRecorderErrorInvalidSnapshot     = 2, ///< snapshot.isValid == NO.
-  VGRecorderErrorSessionActivation   = 3, ///< AVAudioSession activation failed.
+  VGRecorderErrorSessionActivation   = 3, ///< AVAudioSession activation failed (reserved).
   VGRecorderErrorRecorderInit        = 4, ///< backend init/prepare/record failed.
   VGRecorderErrorNotRecording        = 5, ///< stopRecording called with no active session.
   VGRecorderErrorBadOutputPath       = 6, ///< outputPath is nil or empty.

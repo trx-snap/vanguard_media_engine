@@ -4249,10 +4249,34 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
   // ── End Phase 7.20 sidecar time mapping ─────────────────────────────────────
 
   // ── 1. Per-reader reuse guard (video path) ────────────────────────────────
+  //
+  // Guard condition: reuse the cached frame whenever tAsset falls BEFORE the
+  // end of the cached sample window, which covers two cases:
+  //
+  //   (a) Normal cache hit:
+  //         tAsset in [lastDeliveredAssetPTS, lastDeliveredAssetPTS + duration)
+  //       The requested time is inside the current frame's display window.
+  //       Return the cached buffer without consuming a new sample.
+  //
+  //   (b) Back-jitter / clock re-anchor:
+  //         tAsset < lastDeliveredAssetPTS
+  //       The requested time has drifted slightly behind the cached frame —
+  //       a proven consequence of AVAudioEngine clock re-anchoring after a
+  //       recording stop/resume cycle. Since AVAssetReader is strictly
+  //       forward-only, calling copyNextSampleBuffer here would decode a
+  //       frame even further ahead, making the gap grow by one frame duration
+  //       per display refresh (≈33 ms per 16 ms step at 30 fps/60 Hz).
+  //       This compounds into a runaway decode that exhausts the remaining
+  //       frames and triggers a spurious EOS at ~7.875 s instead of 9.833 s.
+  //       Reusing the cached frame is always correct: no earlier sample is
+  //       reachable without a full reader rebuild, and the playhead catches up
+  //       within one or two display refreshes. Dropping the lower-bound check
+  //       (`tAsset >= lastDeliveredAssetPTS`) fixes the runaway with zero
+  //       observable visual change.
+  //
   if (reader.lastDeliveredBuffer != NULL) {
-    if (tAsset >= reader.lastDeliveredAssetPTS &&
-        tAsset <  reader.lastDeliveredAssetPTS + reader.lastDeliveredAssetDuration) {
-      // Requested asset time is within the cached sample window.
+    if (tAsset < reader.lastDeliveredAssetPTS + reader.lastDeliveredAssetDuration) {
+      // Requested asset time is at or before the end of the cached sample window.
       // Retain and return cached buffer without decoding a new sample.
       CVPixelBufferRetain(reader.lastDeliveredBuffer);
       os_log_debug(sTimelineLog,
@@ -4263,7 +4287,7 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
                    reader.lastDeliveredAssetPTS + reader.lastDeliveredAssetDuration);
       return reader.lastDeliveredBuffer; // caller owns +1
     }
-    // Cache miss: release previous buffer before decoding a new sample.
+    // Cache miss: tAsset is past the cached window — release and decode next.
     CVPixelBufferRelease(reader.lastDeliveredBuffer);
     reader.lastDeliveredBuffer = NULL;
     reader.lastDeliveredAssetPTS = -1.0;
@@ -4469,9 +4493,9 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
     clipReader.isStaticSource = YES;
     clipReader.freezePTS = nil;     // Not a freeze clip; sourceURL decoded directly.
     clipReader.resolvedClip = clip; // Phase 7.x-Q3A: bind descriptor for pull path.
-    os_log(sTimelineLog,
-           "[VGTCNode] built static reader (still-image): clip=%lu",
-           (unsigned long)clipIndex);
+    os_log_debug(sTimelineLog,
+                 "[VGTCNode] built static reader (still-image): clip=%lu",
+                 (unsigned long)clipIndex);
     return clipReader;
   }
 
@@ -4489,10 +4513,10 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
     clipReader.isStaticSource = YES;
     clipReader.freezePTS = clip.freezePTS; // Stored for lazy extraction.
     clipReader.resolvedClip = clip; // Phase 7.x-Q3A: bind descriptor for pull path.
-    os_log(sTimelineLog,
-           "[VGTCNode] built static reader (freeze-frame): clip=%lu freezePTS=%.3fs",
-           (unsigned long)clipIndex,
-           clip.freezePTS.doubleValue);
+    os_log_debug(sTimelineLog,
+                 "[VGTCNode] built static reader (freeze-frame): clip=%lu freezePTS=%.3fs",
+                 (unsigned long)clipIndex,
+                 clip.freezePTS.doubleValue);
 
     // ── Phase 7.18A: Best-effort async freeze prefetch (DEC-151) ─────────
     //

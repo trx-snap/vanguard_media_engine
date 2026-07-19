@@ -80,6 +80,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic) NSInteger attachCount;
 @property(nonatomic) NSInteger prepareCount;
 @property(nonatomic, strong, nullable) AVAudioMixerNode *mixerNode;
+/// Controls the value returned by -isRunning. Defaults to NO.
+@property(nonatomic) BOOL simulatedRunning;
 @end
 
 // ─── VGAPr_MockPlayer

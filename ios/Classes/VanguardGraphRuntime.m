@@ -2216,6 +2216,7 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
         typeof(self) ss = weakSelf;
         if (!ss || ss->_invalidated)
           return;
+        NSLog(@"[AudioSliceKTimingProbe] Native timeline frame callback PTS sent to Dart: pts_s=%.6f, hostTime=%.6f", pts_s, CACurrentMediaTime());
         [ss.methodChannel
             invokeMethod:@"onTimelineFrame"
                arguments:[ss vg_timelineFrameArgumentsForPTS:pts_s

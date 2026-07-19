@@ -366,7 +366,36 @@ static char kAudioPreviewShutdownWaitersKey; ///< NSMutableArray<dispatch_block_
     }
 }
 
+// ─── recoverAudioPreviewAfterSessionTransitionWithCompletion: ─────────────────
+//
+// Thin forwarder: passes the Slice N recovery command through to the
+// installed VanguardAudioPreviewRuntime.  Swift callers receive
+// the clean Swift-renamed form:
+//   recoverAudioPreviewAfterSessionTransition(completion:)
+//
+// Must be called on the main thread.
+
+- (void)recoverAudioPreviewAfterSessionTransitionWithCompletion:
+    (void (^)(NSError * _Nullable))completion {
+    NSAssert([NSThread isMainThread],
+             @"recoverAudioPreviewAfterSessionTransitionWithCompletion: "
+             @"must be called on the main queue.");
+    NSParameterAssert(completion != nil);
+
+    VanguardAudioPreviewRuntime *runtime = [self audioPreviewRuntime];
+    if (!runtime) {
+        // No audio runtime (silent-mode project or not yet installed).
+        NSLog(@"[VanguardGraphRuntime+AudioPreview][N] "
+              @"recoverAudioPreview: no runtime installed — no-op");
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+        return;
+    }
+
+    [runtime commandRecoverAfterSessionTransitionWithCompletion:completion];
+}
+
 @end
+
 
 NS_ASSUME_NONNULL_END
 

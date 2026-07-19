@@ -137,6 +137,10 @@
   return _mixerNode;
 }
 
+- (BOOL)isRunning {
+  return _simulatedRunning;
+}
+
 - (BOOL)startAndReturnError:(NSError *_Nullable *_Nullable)error {
   _startCount++;
   if (_shouldFailStart) {

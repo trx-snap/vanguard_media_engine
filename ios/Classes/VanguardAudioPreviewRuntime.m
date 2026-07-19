@@ -18,174 +18,10 @@
 
 #import <QuartzCore/QuartzCore.h>
 #import <UMF/VGAudioSidecarPlan.h>
+#import "VGAudioPreviewProductionCollaborators.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
-// ─────────────────────────────────────────────────────────────────────────────
-#pragma mark - Production collaborators
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Production clock — wraps CACurrentMediaTime().
-@interface VGProductionAudioPreviewClock : NSObject <VGAudioPreviewClock>
-@end
-@implementation VGProductionAudioPreviewClock
-- (NSTimeInterval)currentTime {
-  return CACurrentMediaTime();
-}
-@end
-
-// Production timer — wraps a one-shot dispatch_source_t.
-@interface VGProductionAudioPreviewTimer : NSObject <VGAudioPreviewTimer> {
-  dispatch_queue_t _targetQueue;
-  dispatch_source_t _Nullable _source;
-}
-- (instancetype)initWithQueue:(dispatch_queue_t)queue NS_DESIGNATED_INITIALIZER;
-- (instancetype)init NS_UNAVAILABLE;
-@end
-
-@implementation VGProductionAudioPreviewTimer
-
-- (instancetype)initWithQueue:(dispatch_queue_t)queue {
-  self = [super init];
-  if (self) {
-    _targetQueue = queue;
-    _source = nil;
-  }
-  return self;
-}
-
-- (void)armWithDelay:(NSTimeInterval)delay block:(dispatch_block_t)block {
-  // Cancel any previous source before creating a new one.
-  [self cancel];
-  dispatch_source_t src =
-      dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _targetQueue);
-  uint64_t ns = (uint64_t)(delay * NSEC_PER_SEC);
-  dispatch_source_set_timer(src, dispatch_time(DISPATCH_TIME_NOW, (int64_t)ns),
-                            DISPATCH_TIME_FOREVER, 10 * NSEC_PER_MSEC);
-  dispatch_block_t capturedBlock = [block copy];
-  dispatch_source_set_event_handler(src, capturedBlock);
-  _source = src;
-  dispatch_resume(src);
-}
-
-- (void)cancel {
-  if (_source) {
-    dispatch_source_cancel(_source);
-    _source = nil;
-  }
-}
-
-@end
-
-// Production file provider — wraps AVAudioFile and NSFileManager.
-@interface VGProductionAudioPreviewFileProvider
-    : NSObject <VGAudioPreviewFileProvider>
-@end
-@implementation VGProductionAudioPreviewFileProvider
-- (nullable AVAudioFile *)openFileAtURL:(NSURL *)url
-                                  error:(NSError *_Nullable *_Nullable)error {
-  return [[AVAudioFile alloc] initForReading:url error:error];
-}
-- (BOOL)fileExistsAtURL:(NSURL *)url {
-  return [[NSFileManager defaultManager] fileExistsAtPath:url.path];
-}
-@end
-
-// Production engine — wraps AVAudioEngine.
-@interface VGProductionAudioPreviewEngine : NSObject <VGAudioPreviewEngine> {
-  AVAudioEngine *_engine;
-}
-- (instancetype)initWithEngine:(AVAudioEngine *)engine
-    NS_DESIGNATED_INITIALIZER;
-- (instancetype)init NS_UNAVAILABLE;
-@end
-
-@implementation VGProductionAudioPreviewEngine
-
-- (instancetype)initWithEngine:(AVAudioEngine *)engine {
-  self = [super init];
-  if (self) {
-    _engine = engine;
-  }
-  return self;
-}
-
-- (void)attachNode:(AVAudioNode *)node {
-  [_engine attachNode:node];
-}
-
-- (void)connect:(AVAudioNode *)node1
-             to:(AVAudioNode *)node2
-         format:(nullable AVAudioFormat *)format {
-  [_engine connect:node1 to:node2 format:format];
-}
-
-- (void)prepare {
-  [_engine prepare];
-}
-
-- (BOOL)startAndReturnError:(NSError *_Nullable *_Nullable)error {
-  return [_engine startAndReturnError:error];
-}
-
-- (void)stop {
-  [_engine stop];
-}
-
-- (AVAudioMixerNode *)mainMixerNode {
-  return _engine.mainMixerNode;
-}
-
-@end
-
-// Production player — wraps AVAudioPlayerNode.
-@interface VGProductionAudioPreviewPlayer : NSObject <VGAudioPreviewPlayer> {
-  AVAudioPlayerNode *_node;
-}
-- (instancetype)initWithNode:(AVAudioPlayerNode *)node
-    NS_DESIGNATED_INITIALIZER;
-- (instancetype)init NS_UNAVAILABLE;
-@end
-
-@implementation VGProductionAudioPreviewPlayer
-
-- (instancetype)initWithNode:(AVAudioPlayerNode *)node {
-  self = [super init];
-  if (self) {
-    _node = node;
-  }
-  return self;
-}
-
-- (void)scheduleSegment:(AVAudioFile *)file
-             startingFrame:(AVAudioFramePosition)startFrame
-                frameCount:(AVAudioFrameCount)frameCount
-                    atTime:(nullable AVAudioTime *)when
-    completionCallbackType:(AVAudioPlayerNodeCompletionCallbackType)callbackType
-         completionHandler:
-             (nullable AVAudioPlayerNodeCompletionHandler)completionHandler {
-  [_node scheduleSegment:file
-               startingFrame:startFrame
-                  frameCount:frameCount
-                      atTime:when
-      completionCallbackType:callbackType
-           completionHandler:completionHandler];
-}
-
-- (void)play {
-  [_node play];
-}
-- (void)stop {
-  [_node stop];
-}
-- (void)setVolume:(float)v {
-  _node.volume = v;
-}
-
-@end
-
-
-// ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - VGAudioPreviewSlot — per-lane state container
 // ─────────────────────────────────────────────────────────────────────────────
 //
@@ -474,6 +310,20 @@ NS_ASSUME_NONNULL_BEGIN
   _descriptors = @[];
   _fileCache = [NSMutableDictionary new];
   _failedTrackIds = [NSMutableSet new];
+
+  // ── Slice N: AVAudioEngineConfigurationChangeNotification ───────────────────
+  //
+  // AVAudioEngine stops itself asynchronously when the hardware route or
+  // sample-rate changes (e.g. after a PlayAndRecord ↔ Playback session
+  // category switch). The notification fires AFTER the engine has already
+  // stopped and flushed all player-node buffers. We register here so we can
+  // clear stale scheduledEndPTS and restart the engine if the timeline is
+  // actively playing. The observer is removed in invalidateAsync:.
+  [[NSNotificationCenter defaultCenter]
+      addObserver:self
+         selector:@selector(_handleEngineConfigurationChange:)
+             name:AVAudioEngineConfigurationChangeNotification
+           object:nil];
 
   return self;
 }
@@ -1498,6 +1348,117 @@ static BOOL VGIsVoiceoverRole(NSString *role) {
              }];
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice N: AVAudioEngine configuration-change handler
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fired on an arbitrary thread when AVAudioEngine stops itself due to a
+/// hardware route or format change (iounit configuration changed).
+/// Dispatches recovery work to the scheduler queue.
+- (void)_handleEngineConfigurationChange:(NSNotification *)notification {
+  if (!_acceptingCommands)
+    return;
+  __weak typeof(self) weakSelf = self;
+  dispatch_async(_schedulerQueue, ^{
+    typeof(self) ss = weakSelf;
+    if (!ss || !ss->_acceptingCommands)
+      return;
+    [ss assertOnSchedulerQueue];
+
+    NSLog(@"[VanguardAudioPreviewRuntime][N] AVAudioEngineConfigurationChangeNotification "
+          @"received — clearing stale scheduling state");
+
+    // The engine has stopped and flushed all player-node buffers.
+    // Clear scheduledEndPTS on both slots so the next scheduling cycle
+    // does not skip re-queuing because it thinks buffers are still present.
+    ss->_addedAudioSlot.scheduledEndPTS = 0.0;
+    ss->_voiceoverSlot.scheduledEndPTS  = 0.0;
+
+    // If the timeline is actively playing, attempt an engine restart and
+    // reschedule from the current playhead. Use the helper so we share the
+    // same logging and token-rebuild path as commandPlay.
+    VGTimelineStateSnapshot snap = ss->_snapshotProvider();
+    if (snap.isValid && snap.isPlaying &&
+        (ss->_runtimeState == VGAudioPreviewRuntimeStatePlaying ||
+         ss->_runtimeState == VGAudioPreviewRuntimeStateWaitingForTrackStart)) {
+      [ss _restartEngineIfNeededForPlaybackWithReason:@"AVAudioEngineConfigurationChange"];
+    }
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice N: engine restart helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Checks whether the engine is running. If it is, returns YES immediately
+/// without scheduling. If it is NOT running, performs:
+///   1. _cancelAndIncrementSerial: to stop players and clear stale state.
+///   2. engine prepare + startAndReturnError:.
+///   3. On success: rebuilds _activeToken from a fresh snapshot, then calls
+///      _reevaluateAndTransitionAtPTS:withToken: so fresh buffers are queued.
+///   4. On failure: sets runtime state to Paused and logs the error.
+///
+/// Returns YES if the engine was already running (caller can proceed with its
+/// own scheduling path). Returns NO if this method handled scheduling itself
+/// (restart path — caller must NOT schedule again to avoid double-buffering),
+/// or if start failed (caller should abort).
+///
+/// Must be called on _schedulerQueue.
+- (BOOL)_restartEngineIfNeededForPlaybackWithReason:(NSString *)reason {
+  [self assertOnSchedulerQueue];
+
+  if ([_engine isRunning]) {
+    // Engine is alive — nothing to do here.
+    return YES;
+  }
+
+  NSLog(@"[VanguardAudioPreviewRuntime][N] engine not running — restarting "
+        @"for playback: %@", reason);
+
+  // Use active token generation if snapshot is invalid.
+  VGTimelineStateSnapshot snapBefore = _snapshotProvider();
+  uint64_t gen = snapBefore.isValid ? snapBefore.generation
+                                    : _activeToken.timelineGeneration;
+  [self _cancelAndIncrementSerial:gen];
+
+  [_engine prepare];
+  NSError *engineErr = nil;
+  BOOL started = [_engine startAndReturnError:&engineErr];
+  if (!started) {
+    _runtimeState = VGAudioPreviewRuntimeStatePaused;
+    NSLog(@"[VanguardAudioPreviewRuntime][N] engine restart failed (%@): %@",
+          reason, engineErr.localizedDescription);
+    return NO;
+  }
+  NSLog(@"[VanguardAudioPreviewRuntime][N] engine restarted for playback: %@", reason);
+
+  // Rebuild the active token from a fresh snapshot.
+  VGTimelineStateSnapshot snap = _snapshotProvider();
+  if (!snap.isValid) {
+    _runtimeState = VGAudioPreviewRuntimeStatePaused;
+    NSLog(@"[VanguardAudioPreviewRuntime][N] engine restart: invalid snapshot after "
+          @"restart — paused");
+    return NO;
+  }
+  _activeToken = (VGAudioPreviewWorkToken){
+      _lifecycleEpoch,
+      _commandSerial,
+      snap.generation,
+  };
+  VGAudioPreviewWorkToken token = _activeToken;
+
+  if (snap.isPlaying) {
+    _runtimeState = VGAudioPreviewRuntimeStatePlaying;
+    NSTimeInterval currentPTS = [self _currentPTSFromSnapshot:snap];
+    [self _reevaluateAndTransitionAtPTS:currentPTS withToken:token];
+  } else {
+    _runtimeState = VGAudioPreviewRuntimeStatePaused;
+  }
+  // Return NO: this method has already called _reevaluateAndTransitionAtPTS.
+  // Caller must not schedule again.
+  return NO;
+}
+
 /// Applies the play command on the scheduler queue.
 - (void)_applyPlayOnQueue {
   [self assertOnSchedulerQueue];
@@ -1514,6 +1475,17 @@ static BOOL VGIsVoiceoverRole(NSString *role) {
   VGTimelineStateSnapshot snap = _snapshotProvider();
   if (!snap.isValid || !snap.isPlaying)
     return;
+
+  // ── Slice N: engine guard ────────────────────────────────────────────────
+  // The engine may have been stopped asynchronously by AVFoundation due to an
+  // iounit configuration change (category transition). If so, restart it and
+  // let the helper handle scheduling — do not fall through to the normal
+  // cancel/schedule path to avoid double-buffering.
+  BOOL engineAlreadyRunning = [self _restartEngineIfNeededForPlaybackWithReason:@"commandPlay"];
+  if (!engineAlreadyRunning) {
+    // Helper either restarted and rescheduled, or failed. Either way we're done.
+    return;
+  }
 
   uint64_t serial = [self _cancelAndIncrementSerial:snap.generation];
   VGAudioPreviewWorkToken token = _activeToken;
@@ -1622,12 +1594,173 @@ static BOOL VGIsVoiceoverRole(NSString *role) {
   });
 }
 
+NSString * const VGAudioPreviewRecoveryErrorDomain = @"VGAudioPreviewRecoveryErrorDomain";
+
+static NSError *_makeRecoveryError(VGAudioPreviewRecoveryError code, NSString *description) {
+  return [NSError errorWithDomain:VGAudioPreviewRecoveryErrorDomain
+                             code:code
+                         userInfo:@{NSLocalizedDescriptionKey : description}];
+}
+
+static NSError *_makeRecoveryErrorWithUnderlying(VGAudioPreviewRecoveryError code, NSString *description, NSError *underlying) {
+  NSMutableDictionary *userInfo = [NSMutableDictionary dictionaryWithDictionary:@{NSLocalizedDescriptionKey : description}];
+  if (underlying) {
+    userInfo[NSUnderlyingErrorKey] = underlying;
+  }
+  return [NSError errorWithDomain:VGAudioPreviewRecoveryErrorDomain
+                             code:code
+                         userInfo:userInfo];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+#pragma mark - Session recovery (Slice N)
+// ─────────────────────────────────────────────────────────────────────────────
+
+- (void)commandRecoverAfterSessionTransitionWithCompletion:
+    (void (^)(NSError * _Nullable))completion {
+  NSParameterAssert(completion != nil);
+
+  // Fast path: reject if not accepting commands.
+  if (!_acceptingCommands) {
+    NSError *err = _makeRecoveryError(VGAudioPreviewRecoveryErrorInvalidated,
+        @"commandRecoverAfterSessionTransition: runtime is invalidated");
+    dispatch_async(dispatch_get_main_queue(), ^{ completion(err); });
+    return;
+  }
+
+  __weak typeof(self) weakSelf = self;
+  dispatch_async(_schedulerQueue, ^{
+    typeof(self) ss = weakSelf;
+    if (!ss || !ss->_acceptingCommands) {
+      NSError *err = _makeRecoveryError(VGAudioPreviewRecoveryErrorInvalidated,
+          @"commandRecoverAfterSessionTransition: runtime invalidated before queue dispatch");
+      dispatch_async(dispatch_get_main_queue(), ^{ completion(err); });
+      return;
+    }
+    [ss assertOnSchedulerQueue];
+
+    // ── Gate: only operate on audible states ──────────────────────────────────
+
+    switch (ss->_runtimeState) {
+      case VGAudioPreviewRuntimeStateReadySilent:
+        {
+          // No audio to recover — silent success.
+          dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+          return;
+        }
+
+      case VGAudioPreviewRuntimeStateUnprepared:
+        {
+          NSError *err = _makeRecoveryError(VGAudioPreviewRecoveryErrorUnprepared,
+              @"commandRecoverAfterSessionTransition: runtime is unprepared");
+          dispatch_async(dispatch_get_main_queue(), ^{ completion(err); });
+          return;
+        }
+
+      case VGAudioPreviewRuntimeStateFailed:
+        {
+          NSError *err = _makeRecoveryError(VGAudioPreviewRecoveryErrorRuntimeFailed,
+              @"commandRecoverAfterSessionTransition: runtime is in failed state");
+          dispatch_async(dispatch_get_main_queue(), ^{ completion(err); });
+          return;
+        }
+
+      case VGAudioPreviewRuntimeStateInvalidated:
+        {
+          NSError *err = _makeRecoveryError(VGAudioPreviewRecoveryErrorInvalidated,
+              @"commandRecoverAfterSessionTransition: runtime is in invalidated state");
+          dispatch_async(dispatch_get_main_queue(), ^{ completion(err); });
+          return;
+        }
+
+      case VGAudioPreviewRuntimeStateWaitingForTrackStart:
+      case VGAudioPreviewRuntimeStatePlaying:
+      case VGAudioPreviewRuntimeStatePaused:
+      case VGAudioPreviewRuntimeStateEnded:
+        // Audible states — proceed to engine restart.
+        break;
+    }
+
+    // ── 1. Cancel stale timers, stop both players, increment serial ────────────
+    VGTimelineStateSnapshot snapBefore = ss->_snapshotProvider();
+    uint64_t priorGeneration = snapBefore.isValid
+        ? snapBefore.generation
+        : ss->_activeToken.timelineGeneration;
+    [ss _cancelAndIncrementSerial:priorGeneration];
+
+    // ── 2. Unconditionally restart AVAudioEngine ───────────────────────────────
+    //
+    // stop → prepare → start is the required pattern after a category
+    // transition to re-anchor hardware clock and route. Attached player nodes
+    // and graph topology survive stop/start (per AVFoundation documentation).
+    //
+    [ss->_engine stop];
+    [ss->_engine prepare];
+
+    NSError *engineErr = nil;
+    BOOL engineStarted = [ss->_engine startAndReturnError:&engineErr];
+    if (!engineStarted) {
+      ss->_runtimeState = VGAudioPreviewRuntimeStatePaused;
+      NSError *wrapped = _makeRecoveryErrorWithUnderlying(
+          VGAudioPreviewRecoveryErrorEngineStartFailed,
+          @"commandRecoverAfterSessionTransition: AVAudioEngine failed to start",
+          engineErr);
+      NSLog(@"[VanguardAudioPreviewRuntime][N] recovery: engine start FAILED: %@", engineErr);
+      dispatch_async(dispatch_get_main_queue(), ^{ completion(wrapped); });
+      return;
+    }
+    NSLog(@"[VanguardAudioPreviewRuntime][N] recovery: engine restarted");
+
+    // ── 3. Read fresh snapshot after restart ──────────────────────────────────
+    VGTimelineStateSnapshot snap = ss->_snapshotProvider();
+    if (!snap.isValid) {
+      ss->_runtimeState = VGAudioPreviewRuntimeStatePaused;
+      NSError *err = _makeRecoveryError(VGAudioPreviewRecoveryErrorInvalidSnapshot,
+          @"commandRecoverAfterSessionTransition: snapshot invalid after engine restart");
+      dispatch_async(dispatch_get_main_queue(), ^{ completion(err); });
+      return;
+    }
+
+    // ── 4. Re-anchor active token ─────────────────────────────────────────────
+    //
+    // _cancelAndIncrementSerial already incremented commandSerial (step 1).
+    // Rebuild activeToken with the fresh snapshot generation.
+    ss->_activeToken = (VGAudioPreviewWorkToken){
+        ss->_lifecycleEpoch,
+        ss->_commandSerial,
+        snap.generation,
+    };
+    VGAudioPreviewWorkToken token = ss->_activeToken;
+
+    // ── 5. Re-enter scheduling loop from current PTS ──────────────────────────
+    if (snap.isPlaying) {
+      ss->_runtimeState = VGAudioPreviewRuntimeStatePlaying;
+      NSTimeInterval currentPTS = [ss _currentPTSFromSnapshot:snap];
+      NSLog(@"[VanguardAudioPreviewRuntime][N] recovery: playing, resuming at PTS=%.3f",
+            currentPTS);
+      [ss _reevaluateAndTransitionAtPTS:currentPTS withToken:token];
+    } else {
+      ss->_runtimeState = VGAudioPreviewRuntimeStatePaused;
+      NSLog(@"[VanguardAudioPreviewRuntime][N] recovery: paused at PTS=%.3f",
+            snap.timelinePTS);
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{ completion(nil); });
+  });
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 #pragma mark - Invalidation
 // ─────────────────────────────────────────────────────────────────────────────
 
+
 - (void)invalidateAsync:(dispatch_block_t)completion {
   NSParameterAssert(completion != nil);
+
+  // Slice N: remove configuration-change observer before tearing down the engine.
+  [[NSNotificationCenter defaultCenter] removeObserver:self
+      name:AVAudioEngineConfigurationChangeNotification
+    object:nil];
 
   // Phase A: close command acceptance atomically.
   atomic_store(&_acceptingCommands, NO);

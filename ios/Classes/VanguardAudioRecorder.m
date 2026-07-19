@@ -1,8 +1,8 @@
 // VanguardAudioRecorder.m
-// Vanguard Media Engine — Audio Slice M
+// Vanguard Media Engine — Audio Slice N
 //
 // Minimal microphone capture backed by AVAudioRecorder.
-// Package-internal only — not part of the public API.
+// Module-visible only — not part of the public API.
 //
 // See VanguardAudioRecorder.h for full architecture notes.
 
@@ -45,59 +45,6 @@ static NSError *_makeErrorWithUnderlying(VGRecorderError code,
 @end
 @implementation _VGRealTimeProvider
 - (NSTimeInterval)currentTime { return CACurrentMediaTime(); }
-@end
-
-// ─── Production session manager ───────────────────────────────────────────────
-
-@interface _VGRealSessionManager : NSObject <VGAudioRecorderSessionManager>
-@end
-@implementation _VGRealSessionManager
-
-- (BOOL)activatePlayAndRecordWithError:(NSError **)error {
-    AVAudioSession *s = [AVAudioSession sharedInstance];
-    // MixWithOthers: allow AVAudioEngine preview to keep playing alongside
-    // the microphone input.  AllowBluetooth: enable BT microphone input.
-    NSError *catErr = nil;
-    BOOL ok = [s setCategory:AVAudioSessionCategoryPlayAndRecord
-                 withOptions:(AVAudioSessionCategoryOptionMixWithOthers |
-                              AVAudioSessionCategoryOptionAllowBluetooth)
-                       error:&catErr];
-    if (!ok) {
-        if (error) *error = catErr;
-        return NO;
-    }
-    NSError *actErr = nil;
-    ok = [s setActive:YES error:&actErr];
-    if (!ok) {
-        if (error) *error = actErr;
-        // Best-effort restore on partial failure.
-        [s setCategory:AVAudioSessionCategoryPlayback error:nil];
-        return NO;
-    }
-    return YES;
-}
-
-- (void)restorePlayback {
-    AVAudioSession *s = [AVAudioSession sharedInstance];
-    [s setCategory:AVAudioSessionCategoryPlayback error:nil];
-    // Do NOT call setActive:NO — that would silence AVAudioEngine playback.
-    NSLog(@"[VanguardAudioRecorder] AVAudioSession restored to Playback");
-}
-
-- (BOOL)isHeadphonesConnected {
-    AVAudioSessionRouteDescription *route =
-        [AVAudioSession sharedInstance].currentRoute;
-    for (AVAudioSessionPortDescription *port in route.outputs) {
-        if ([port.portType isEqualToString:AVAudioSessionPortHeadphones] ||
-            [port.portType isEqualToString:AVAudioSessionPortBluetoothA2DP] ||
-            [port.portType isEqualToString:AVAudioSessionPortBluetoothLE] ||
-            [port.portType isEqualToString:AVAudioSessionPortBluetoothHFP]) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
 @end
 
 // ─── Production recorder backend ─────────────────────────────────────────────
@@ -152,13 +99,11 @@ static NSError *_makeErrorWithUnderlying(VGRecorderError code,
 @implementation VGAudioRecordingStartInfo
 
 - (instancetype)initWithFilePath:(NSString *)filePath
-                        startPTS:(double)startPTS
-             isHeadphonesConnected:(BOOL)isHeadphonesConnected {
+                        startPTS:(double)startPTS {
     self = [super init];
     if (self) {
         _filePath = [filePath copy];
         _startPTS = startPTS;
-        _isHeadphonesConnected = isHeadphonesConnected;
     }
     return self;
 }
@@ -187,31 +132,25 @@ static NSError *_makeErrorWithUnderlying(VGRecorderError code,
 
 @implementation VanguardAudioRecorder {
     id<VGAudioRecorderTimeProvider>      _timeProvider;
-    id<VGAudioRecorderSessionManager>    _sessionManager;
     id<VGAudioRecorderBackendFactory>    _backendFactory;
 
     id<VGAudioRecorderBackend> _Nullable _backend;
     NSString                 * _Nullable _activeFilePath;
     double                                _activeStartPTS;
-
-    // YES between a successful activatePlayAndRecord and restorePlayback.
-    BOOL _sessionSwitched;
 }
 
 - (instancetype)initWithTimeProvider:(nullable id<VGAudioRecorderTimeProvider>)timeProvider
-                      sessionManager:(nullable id<VGAudioRecorderSessionManager>)sessionManager
                       backendFactory:(nullable id<VGAudioRecorderBackendFactory>)backendFactory {
     self = [super init];
     if (self) {
         _timeProvider   = timeProvider   ?: [[_VGRealTimeProvider alloc] init];
-        _sessionManager = sessionManager ?: [[_VGRealSessionManager alloc] init];
         _backendFactory = backendFactory ?: [[_VGRealBackendFactory alloc] init];
     }
     return self;
 }
 
 - (instancetype)init {
-    return [self initWithTimeProvider:nil sessionManager:nil backendFactory:nil];
+    return [self initWithTimeProvider:nil backendFactory:nil];
 }
 
 - (BOOL)isRecording {
@@ -252,7 +191,44 @@ static NSError *_makeErrorWithUnderlying(VGRecorderError code,
         return nil;
     }
 
-    // 4. Read snapshot to compute authoritative start PTS.
+    // 4. Build backend (settings: AAC, 44.1 kHz mono).
+    // Backend is constructed before reading the timeline snapshot so that
+    // any file-system / hardware allocation failures surface early.
+    NSDictionary<NSString *, id> *settings = @{
+        AVFormatIDKey:            @(kAudioFormatMPEG4AAC),
+        AVSampleRateKey:          @44100.0,
+        AVNumberOfChannelsKey:    @1,
+        AVEncoderAudioQualityKey: @(AVAudioQualityHigh),
+        AVEncoderBitRateKey:      @64000,
+    };
+
+    NSURL *url = [NSURL fileURLWithPath:outputPath];
+    NSError *backendErr = nil;
+    id<VGAudioRecorderBackend> backend = [_backendFactory backendWithURL:url
+                                                                settings:settings
+                                                                   error:&backendErr];
+    if (!backend) {
+        NSLog(@"[VanguardAudioRecorder] backend init failed: %@", backendErr);
+        if (outError) *outError = _makeErrorWithUnderlying(VGRecorderErrorRecorderInit,
+                                                           @"Recorder backend initialisation failed",
+                                                           backendErr);
+        return nil;
+    }
+
+    // 5. prepareToRecord — allocates output file and hardware resources.
+    //    Must succeed before we read the timeline snapshot so the skew between
+    //    the PTS read and the first recorded sample is minimised.
+    if (![backend prepareToRecord]) {
+        NSLog(@"[VanguardAudioRecorder] prepareToRecord failed");
+        [self _setError:outError
+                   code:VGRecorderErrorRecorderInit
+                message:@"Recorder backend prepareToRecord returned NO"];
+        return nil;
+    }
+
+    // 6. Read timeline snapshot immediately before record().
+    //    The caller (VGAudioRecordingHandler) has already activated
+    //    PlayAndRecord via VGAudioSessionTransitionCoordinator before this call.
     VGTimelineStateSnapshot snap = [runtime readTimelineStateSnapshot];
     if (!snap.isValid) {
         [self _setError:outError
@@ -275,73 +251,26 @@ static NSError *_makeErrorWithUnderlying(VGRecorderError code,
         NSLog(@"[VanguardAudioRecorder] start PTS (paused): %.6f", startPTS);
     }
 
-    // 5. Check headphone route BEFORE switching session (route is stable here).
-    BOOL headphones = [_sessionManager isHeadphonesConnected];
-
-    // 6. Switch AVAudioSession → PlayAndRecord.
-    NSError *sessErr = nil;
-    if (![_sessionManager activatePlayAndRecordWithError:&sessErr]) {
-        NSLog(@"[VanguardAudioRecorder] session activation failed: %@", sessErr);
-        if (outError) *outError = _makeErrorWithUnderlying(VGRecorderErrorSessionActivation,
-                                                           @"AVAudioSession activation failed",
-                                                           sessErr);
-        return nil;
-    }
-    _sessionSwitched = YES;
-
-    // 7. Build backend (settings: AAC, 44.1 kHz mono).
-    NSDictionary<NSString *, id> *settings = @{
-        AVFormatIDKey:            @(kAudioFormatMPEG4AAC),
-        AVSampleRateKey:          @44100.0,
-        AVNumberOfChannelsKey:    @1,
-        AVEncoderAudioQualityKey: @(AVAudioQualityHigh),
-        AVEncoderBitRateKey:      @64000,
-    };
-
-    NSURL *url = [NSURL fileURLWithPath:outputPath];
-    NSError *backendErr = nil;
-    id<VGAudioRecorderBackend> backend = [_backendFactory backendWithURL:url
-                                                                settings:settings
-                                                                   error:&backendErr];
-    if (!backend) {
-        NSLog(@"[VanguardAudioRecorder] backend init failed: %@", backendErr);
-        [self _cleanupSession];
-        if (outError) *outError = _makeErrorWithUnderlying(VGRecorderErrorRecorderInit,
-                                                           @"Recorder backend initialisation failed",
-                                                           backendErr);
-        return nil;
-    }
-
-    if (![backend prepareToRecord]) {
-        NSLog(@"[VanguardAudioRecorder] prepareToRecord failed");
-        [self _cleanupSession];
-        [self _setError:outError
-                   code:VGRecorderErrorRecorderInit
-                message:@"Recorder backend prepareToRecord returned NO"];
-        return nil;
-    }
-
+    // 7. Begin capture.
     if (![backend record]) {
         NSLog(@"[VanguardAudioRecorder] record failed to start");
-        [self _cleanupSession];
         [self _setError:outError
                    code:VGRecorderErrorRecorderInit
                 message:@"Recorder backend record returned NO"];
         return nil;
     }
 
-    // 8. Capture state.
+    // 8. Commit state — recorder is now live.
     _backend        = backend;
     _activeFilePath = [outputPath copy];
     _activeStartPTS = startPTS;
 
-    NSLog(@"[VanguardAudioRecorder] recording started: path=%@, startPTS=%.6f, headphones=%d",
-          outputPath.lastPathComponent, startPTS, headphones);
+    NSLog(@"[VanguardAudioRecorder] recording started: path=%@, startPTS=%.6f",
+          outputPath.lastPathComponent, startPTS);
 
     return [[VGAudioRecordingStartInfo alloc]
               initWithFilePath:outputPath
-                      startPTS:startPTS
-           isHeadphonesConnected:headphones];
+                      startPTS:startPTS];
 }
 
 // ── Stop ──────────────────────────────────────────────────────────────────────
@@ -353,7 +282,6 @@ static NSError *_makeErrorWithUnderlying(VGRecorderError code,
     NSAssert(completion != nil, @"completion must not be nil");
 
     if (!self.isRecording) {
-        [self _cleanupSession];
         completion(nil, _makeError(VGRecorderErrorNotRecording,
                                    @"stopRecording called but no recording is active"));
         return;
@@ -369,10 +297,12 @@ static NSError *_makeErrorWithUnderlying(VGRecorderError code,
     _activeFilePath = nil;
     _activeStartPTS = 0.0;
 
-    [self _cleanupSession];
-
     NSLog(@"[VanguardAudioRecorder] recording stopped: path=%@, duration≈%.3f",
           filePath.lastPathComponent, durationSecs);
+
+    // Note: AVAudioSession restoration is NOT performed here.
+    // The caller (VGAudioRecordingHandler) is responsible for calling
+    // coordinator.restorePlayback() after this completion fires.
 
     VGAudioRecordingStopInfo *info =
         [[VGAudioRecordingStopInfo alloc] initWithFilePath:filePath
@@ -392,18 +322,12 @@ static NSError *_makeErrorWithUnderlying(VGRecorderError code,
         _activeStartPTS = 0.0;
         NSLog(@"[VanguardAudioRecorder] recording cancelled");
     }
-    [self _cleanupSession];
+    // Note: AVAudioSession restoration is NOT performed here.
+    // The caller (VGAudioRecordingHandler) is responsible for calling
+    // coordinator.restorePlayback() after this returns.
 }
 
 // ── Internals ─────────────────────────────────────────────────────────────────
-
-/// Restores AVAudioSession to Playback exactly once.
-- (void)_cleanupSession {
-    if (_sessionSwitched) {
-        _sessionSwitched = NO;
-        [_sessionManager restorePlayback];
-    }
-}
 
 - (void)_setError:(NSError **)outError code:(VGRecorderError)code message:(NSString *)msg {
     if (outError) *outError = _makeError(code, msg);

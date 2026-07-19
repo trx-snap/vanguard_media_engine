@@ -37,8 +37,13 @@ Pod::Spec.new do |s|
     'Classes/VGAudioPreviewEnvelopeEvaluator.h',
     'Classes/VGAudioPreviewAutomationTimer.h',
     'Classes/VGAudioPreviewAutomationCoordinator.h',
+    # Audio Slice N: session coordinator, route snapshot, production collaborators.
+    # VGAudioSessionTransitionCoordinator.h is NOT private (Swift imports it directly).
+    'Classes/VGAudioPreviewProductionCollaborators.h',
+    # VGAudioRouteSnapshot.h is NOT private (Swift imports it via coordinator).
     # VanguardGraphRuntime+AudioPreview.h is module-visible (not private_header_files)
-    # so Swift can call setAudioSidecarPlan:timelineDuration:completion: directly.
+    # so Swift can call setAudioSidecarPlan:timelineDuration:completion: and
+    # recoverAudioPreviewAfterSessionTransitionWithCompletion: directly.
   ]
 
   # Phase 9B — model asset bundle.
@@ -227,10 +232,40 @@ Pod::Spec.new do |s|
       # Audio Slice L: preview/export parity gate tests
       'Tests/VanguardAudioParity_SliceL_Tests.m',
       # Audio Slice M: recording contract and minimal native capture tests
-      'Tests/VanguardAudioRecorderTests.m'
+      'Tests/VanguardAudioRecorderTests.m',
+      # Audio Slice N: (new test files added by Gemini Flash post-implementation audit)
+      'Tests/VGAudioSessionTransitionCoordinatorTests.m',
+      'Tests/VGAudioRouteSnapshotTests.m',
+      'Tests/VanguardAudioPreviewRuntimeTest_SliceN_Recovery.m',
+      'Tests/VanguardAudioRecordingHandlerTests.swift'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage', 'AVFoundation'
     ts.dependency    'UMF'
   end
 
+  # ROI Compression 2A — Vision Face-Box Sparse Sampling Benchmark (PROOF-ONLY)
+  # Isolated from the main unit-test bundle so the pre-existing compile error in
+  # VGEncoderBackwardCompatTest.m does not block physical-device benchmark runs.
+  # Only VGOfflineFaceBoxBenchmarkTest.m is compiled here; production code is
+  # not invoked (no segmentation, landmarks, masks, beauty, Dart, or export graph).
+  s.test_spec 'Benchmarks' do |bs|
+    # Uses the CocoaPods-generated AppHost (AppHost-vanguard_media_engine-Unit-Tests)
+    # as the test host. That AppHost is a minimal main.m stub — it does NOT compile
+    # any unit test files, so the pre-existing VGEncoderBackwardCompatTest.m compile
+    # error does not block this target. requires_app_host = true is required for
+    # physical iPhone (tool-hosted bundles cannot run on device destinations).
+    bs.requires_app_host = true
+
+    bs.source_files = [
+      'Tests/VGOfflineFaceBoxBenchmarkTest.m'
+    ]
+
+    bs.resources = [
+      'Tests/Fixtures/*.mov'
+    ]
+
+    bs.frameworks = 'Metal', 'ImageIO', 'CoreImage', 'AVFoundation', 'Vision', 'CoreMedia', 'CoreVideo', 'UIKit'
+
+    bs.dependency 'UMF'
+  end
 end

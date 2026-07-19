@@ -139,6 +139,8 @@ typedef NS_ENUM(NSInteger, VGAudioPreviewRuntimeState) {
 - (void)prepare;
 - (BOOL)startAndReturnError:(NSError *_Nullable *_Nullable)error;
 - (void)stop;
+/// Returns YES if the engine is currently running (audio graph active).
+- (BOOL)isRunning;
 - (AVAudioMixerNode *)mainMixerNode;
 @end
 
@@ -186,6 +188,8 @@ typedef VGTimelineStateSnapshot (^VGTimelineSnapshotProvider)(void);
 /// Package-internal test initialiser. Injects all collaborators.
 /// Pass nil for |timer| to use the production dispatch_source_t boundary timer.
 /// Pass nil for |automationTimer| to use the production automation timer.
+/// The injected |player| is routed to the Added Audio slot; the Voice-over slot
+/// receives the same player (backward-compatible — existing tests continue to work).
 - (instancetype)
     initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
               lifecycleEpoch:(uint64_t)lifecycleEpoch
@@ -195,6 +199,26 @@ typedef VGTimelineStateSnapshot (^VGTimelineSnapshotProvider)(void);
                 fileProvider:(id<VGAudioPreviewFileProvider>)fileProvider
                       engine:(id<VGAudioPreviewEngine>)engine
                       player:(id<VGAudioPreviewPlayer>)player;
+
+/// Package-internal Slice K test initialiser. Injects separate players and
+/// automation timers for the Added Audio and Voice-over slots, enabling
+/// independent per-slot assertion.
+/// Pass nil for |timer| to use the production boundary timer.
+/// Pass nil for |addedAudioAutomationTimer| or |voiceoverAutomationTimer| to
+/// use production automation timers for those slots.
+- (instancetype)
+    initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
+              lifecycleEpoch:(uint64_t)lifecycleEpoch
+                       clock:(id<VGAudioPreviewClock>)clock
+                       timer:(nullable id<VGAudioPreviewTimer>)timer
+    addedAudioAutomationTimer:
+        (nullable id<VGAudioPreviewAutomationTimer>)addedAudioAutomationTimer
+    voiceoverAutomationTimer:
+        (nullable id<VGAudioPreviewAutomationTimer>)voiceoverAutomationTimer
+                fileProvider:(id<VGAudioPreviewFileProvider>)fileProvider
+                      engine:(id<VGAudioPreviewEngine>)engine
+                 addedAudioPlayer:(id<VGAudioPreviewPlayer>)addedAudioPlayer
+                  voiceoverPlayer:(id<VGAudioPreviewPlayer>)voiceoverPlayer;
 
 - (instancetype)init NS_UNAVAILABLE;
 
@@ -240,6 +264,36 @@ typedef VGTimelineStateSnapshot (^VGTimelineSnapshotProvider)(void);
 /// Called when the timeline reaches end-of-stream.
 - (void)commandEOS;
 
+/// Called after an AVAudioSession category transition (start or stop of
+/// recording) to re-anchor the audio preview engine and reschedule player
+/// nodes under the new session configuration.
+///
+/// Dispatches to the scheduler queue. Restarts AVAudioEngine unconditionally
+/// (stop → prepare → start) to guarantee the engine's hardware connections
+/// are valid under the new category — this is the selected defensive
+/// Slice N strategy. Attached nodes and graph routing survive stop/start.
+///
+/// Algorithm (on scheduler queue):
+///   1. Reject if not accepting commands.
+///   2. ReadySilent → successful no-op (completion(nil)).
+///   3. Unprepared, Invalidated, or Failed → stable error without mutation.
+///   4. WaitingForTrackStart, Playing, Paused, Ended → continue.
+///   5. _cancelAndIncrementSerial: using current active-token generation.
+///   6. Unconditionally: engine stop → prepare → startAndReturnError:.
+///   7. Engine-start failure → state Paused, stable engine-start error.
+///   8. Read fresh snapshot after restart.
+///   9. Invalid snapshot → state Paused, stable invalid-snapshot error.
+///  10. Rebuild active token (lifecycleEpoch, incremented serial, fresh gen).
+///  11. snapshot.isPlaying → state Playing, compute PTS, reevaluate.
+///  12. Not playing → state Paused.
+///  13. completion fires exactly once on main queue.
+///
+/// commandPlay remains unchanged and does NOT restart AVAudioEngine.
+/// Retry after a Slice O route event re-invokes this method.
+- (void)commandRecoverAfterSessionTransitionWithCompletion:
+    (void (^)(NSError * _Nullable error))completion
+    NS_SWIFT_NAME(commandRecoverAfterSessionTransition(completion:));
+
 // ─── Invalidation
 // ─────────────────────────────────────────────────────────────
 
@@ -256,6 +310,23 @@ typedef VGTimelineStateSnapshot (^VGTimelineSnapshotProvider)(void);
 /// The runtime is strongly retained through cleanup until all waiters fire.
 /// May be called from any thread. completion must not be nil.
 - (void)invalidateAsync:(dispatch_block_t)completion;
+
+// ─── Recovery error domain and codes ─────────────────────────────────────────
+
+extern NSString * const VGAudioPreviewRecoveryErrorDomain;
+
+typedef NS_ENUM(NSInteger, VGAudioPreviewRecoveryError) {
+  /// Runtime is no longer accepting commands (invalidated).
+  VGAudioPreviewRecoveryErrorInvalidated       = 1,
+  /// Runtime was never prepared.
+  VGAudioPreviewRecoveryErrorUnprepared        = 2,
+  /// AVAudioEngine failed to start after the category transition.
+  VGAudioPreviewRecoveryErrorEngineStartFailed = 3,
+  /// Timeline snapshot was invalid when trying to reschedule.
+  VGAudioPreviewRecoveryErrorInvalidSnapshot   = 4,
+  /// Runtime is in the permanent Failed state (set only by prepareWithSidecarPlan:).
+  VGAudioPreviewRecoveryErrorRuntimeFailed     = 5,
+};
 
 // ─── Queue assertion
 // ──────────────────────────────────────────────────────────

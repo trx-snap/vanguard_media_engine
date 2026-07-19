@@ -26,16 +26,29 @@ NS_ASSUME_NONNULL_BEGIN
   VGAPr_MockEngine *_engine;
   VGAPr_MockPlayer *_player;
   VGTimelineStateSnapshot _stubbedSnapshot;
+
+  // ── Slice K: second slot collaborators ──────────────────────────────────
+  // Used only by makeMultiSlotRuntime. Not set by setUp — Slice K tests must
+  // allocate these before calling makeMultiSlotRuntime.
+  VGAPr_MockPlayer *_voiceoverPlayer;
+  VGAPr_MockAutomationTimer *_voiceoverAutomationTimer;
 }
 
 /// Mutable snapshot returned by the provider.
 @property(nonatomic, assign) VGTimelineStateSnapshot stubbedSnapshot;
 
 /// Builds a runtime with lifecycle epoch 1.
+/// Routes _player to both slots (backward compatible).
 - (VanguardAudioPreviewRuntime *)makeRuntime;
 
 /// Builds a runtime with the specified lifecycle epoch.
+/// Routes _player to both slots (backward compatible).
 - (VanguardAudioPreviewRuntime *)makeRuntimeWithEpoch:(uint64_t)epoch;
+
+/// Builds a two-slot runtime for Slice K.
+/// Callers must allocate _voiceoverPlayer and _voiceoverAutomationTimer
+/// before calling this method.
+- (VanguardAudioPreviewRuntime *)makeMultiSlotRuntime;
 
 /// Builds a valid music track dictionary.
 - (NSDictionary<NSString *, id> *)trackDictWithStartTime:(double)start
@@ -81,6 +94,13 @@ NS_ASSUME_NONNULL_BEGIN
                                            volume:(double)vol
                                               url:(NSString *)path
                                        keyframes:(nullable NSArray *)keyframes;
+
+/// Builds a voiceover-role track dictionary with a custom id and URL.
+- (NSDictionary<NSString *, id> *)voiceoverTrackDictWithId:(NSString *)tid
+                                                 startTime:(double)start
+                                                  duration:(double)dur
+                                                    volume:(double)vol
+                                                       url:(NSString *)path;
 
 @end
 

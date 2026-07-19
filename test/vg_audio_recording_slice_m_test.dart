@@ -1,21 +1,9 @@
 // vg_audio_recording_slice_m_test.dart
-// Vanguard Media Engine — Audio Slice M
+// Vanguard Media Engine — Audio Slice N
 //
 // Dart tests for:
-//   1. VGAudioRecordingStartResult / VGAudioRecordingStopResult model parsing.
+//   1. VGAudioRecordingStartResult / VGAudioRecordingStopResult / VGTransitionStatus model parsing.
 //   2. VGEditorController.startAudioRecording / stopAudioRecording channel binding.
-//
-// Tests:
-//   SM-D1  VGAudioRecordingStartResult.fromMap parses a valid map.
-//   SM-D2  VGAudioRecordingStartResult.fromMap returns null for missing filePath.
-//   SM-D3  VGAudioRecordingStartResult.fromMap returns null for missing startPTS.
-//   SM-D4  VGAudioRecordingStopResult.fromMap parses a valid map.
-//   SM-D5  VGAudioRecordingStopResult.fromMap returns null for incomplete map.
-//   SM-D6  startAudioRecording invokes 'startAudioRecording' with outputPath arg.
-//   SM-D7  startAudioRecording throws PlatformException on incomplete native map.
-//   SM-D8  stopAudioRecording invokes 'stopAudioRecording' with no args.
-//   SM-D9  stopAudioRecording throws PlatformException on incomplete native map.
-//   SM-D10 Both methods throw StateError after controller is disposed.
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -64,17 +52,40 @@ void main() {
   // ── Model parsing ──────────────────────────────────────────────────────────
 
   group('VGAudioRecordingStartResult.fromMap', () {
-    test('SM-D1 parses a valid map', () {
+    test('SM-D1 parses a valid map with nested audioRoute', () {
       final map = <Object?, Object?>{
         'filePath': '/tmp/rec.m4a',
         'startPTS': 3.14,
         'isHeadphonesConnected': true,
+        'audioRoute': {
+          'activeInputType': 'builtInMic',
+          'activeInputName': 'Built-in Microphone',
+          'activeInputUID': 'mic_uid',
+          'activeInputDataSourceName': 'Front',
+          'availableInputTypes': ['builtInMic', 'headsetMic'],
+          'activeOutputTypes': ['builtInSpeaker'],
+          'hasHeadphoneOutput': false,
+          'activeInputIsExternal': false,
+          'inputAvailable': true,
+        }
       };
       final r = VGAudioRecordingStartResult.fromMap(map);
       expect(r, isNotNull);
       expect(r!.filePath, '/tmp/rec.m4a');
       expect(r.startPTS, closeTo(3.14, 1e-9));
       expect(r.isHeadphonesConnected, isTrue);
+
+      final route = r.audioRoute;
+      expect(route, isNotNull);
+      expect(route!.activeInputType, 'builtInMic');
+      expect(route.activeInputName, 'Built-in Microphone');
+      expect(route.activeInputUID, 'mic_uid');
+      expect(route.activeInputDataSourceName, 'Front');
+      expect(route.availableInputTypes, containsAll(['builtInMic', 'headsetMic']));
+      expect(route.activeOutputTypes, contains('builtInSpeaker'));
+      expect(route.hasHeadphoneOutput, isFalse);
+      expect(route.activeInputIsExternal, isFalse);
+      expect(route.inputAvailable, isTrue);
     });
 
     test('SM-D2 returns null for missing filePath', () {
@@ -105,7 +116,43 @@ void main() {
   });
 
   group('VGAudioRecordingStopResult.fromMap', () {
-    test('SM-D4 parses a valid map', () {
+    test('SM-D4 parses a valid map with nested transitionStatus', () {
+      final map = <Object?, Object?>{
+        'filePath': '/tmp/rec.m4a',
+        'startPTS': 3.0,
+        'durationSeconds': 4.012,
+        'transitionStatus': {
+          'sessionRestored': true,
+          'previewRecovered': false,
+          'sessionErrorCode': null,
+          'previewErrorCode': 'RECOVERY_RUNTIME_NIL',
+        }
+      };
+      final r = VGAudioRecordingStopResult.fromMap(map);
+      expect(r, isNotNull);
+      expect(r!.filePath, '/tmp/rec.m4a');
+      expect(r.startPTS, closeTo(3.0, 1e-9));
+      expect(r.durationSeconds, closeTo(4.012, 1e-9));
+
+      final ts = r.transitionStatus;
+      expect(ts.sessionRestored, isTrue);
+      expect(ts.previewRecovered, isFalse);
+      expect(ts.sessionErrorCode, isNull);
+      expect(ts.previewErrorCode, 'RECOVERY_RUNTIME_NIL');
+
+      // Compatibility getter delegates to transitionStatus.sessionRestored
+      expect(r.sessionRestored, isTrue);
+    });
+
+    test('SM-D5 returns null for incomplete map', () {
+      final map = <Object?, Object?>{
+        'filePath': '/tmp/rec.m4a',
+        'durationSeconds': 4.012,
+      };
+      expect(VGAudioRecordingStopResult.fromMap(map), isNull);
+    });
+
+    test('SM-D5b missing transitionStatus map defaults booleans to false', () {
       final map = <Object?, Object?>{
         'filePath': '/tmp/rec.m4a',
         'startPTS': 3.0,
@@ -113,18 +160,10 @@ void main() {
       };
       final r = VGAudioRecordingStopResult.fromMap(map);
       expect(r, isNotNull);
-      expect(r!.filePath, '/tmp/rec.m4a');
-      expect(r.startPTS, closeTo(3.0, 1e-9));
-      expect(r.durationSeconds, closeTo(4.012, 1e-9));
-    });
-
-    test('SM-D5 returns null for incomplete map', () {
-      final map = <Object?, Object?>{
-        'filePath': '/tmp/rec.m4a',
-        // startPTS missing
-        'durationSeconds': 4.012,
-      };
-      expect(VGAudioRecordingStopResult.fromMap(map), isNull);
+      expect(r!.transitionStatus, isNotNull);
+      expect(r.transitionStatus.sessionRestored, isFalse);
+      expect(r.transitionStatus.previewRecovered, isFalse);
+      expect(r.sessionRestored, isFalse);
     });
   });
 
@@ -158,6 +197,17 @@ void main() {
             'filePath': '/tmp/out.m4a',
             'startPTS': 3.5,
             'isHeadphonesConnected': false,
+            'audioRoute': {
+              'activeInputType': 'builtInMic',
+              'activeInputName': 'Built-in Microphone',
+              'activeInputUID': 'mic_uid',
+              'activeInputDataSourceName': null,
+              'availableInputTypes': ['builtInMic'],
+              'activeOutputTypes': ['builtInSpeaker'],
+              'hasHeadphoneOutput': false,
+              'activeInputIsExternal': false,
+              'inputAvailable': true,
+            }
           };
         }
         return null;
@@ -170,6 +220,7 @@ void main() {
       expect(result.filePath, '/tmp/out.m4a');
       expect(result.startPTS, closeTo(3.5, 1e-9));
       expect(result.isHeadphonesConnected, isFalse);
+      expect(result.audioRoute?.activeInputType, 'builtInMic');
     });
 
     test('SM-D7 startAudioRecording throws PlatformException on incomplete native map',
@@ -199,6 +250,10 @@ void main() {
             'filePath': '/tmp/out.m4a',
             'startPTS': 3.5,
             'durationSeconds': 4.1,
+            'transitionStatus': {
+              'sessionRestored': true,
+              'previewRecovered': true,
+            }
           };
         }
         return null;
@@ -210,6 +265,8 @@ void main() {
       expect(result.filePath, '/tmp/out.m4a');
       expect(result.startPTS, closeTo(3.5, 1e-9));
       expect(result.durationSeconds, closeTo(4.1, 1e-9));
+      expect(result.sessionRestored, isTrue);
+      expect(result.transitionStatus.previewRecovered, isTrue);
     });
 
     test('SM-D9 stopAudioRecording throws PlatformException on incomplete native map',

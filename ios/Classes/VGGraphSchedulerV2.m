@@ -65,6 +65,14 @@
 // Cast required — same pattern as VGMetadataNodeAdapter.m.
 static const VGNodeRole kVGNodeRoleMetadata = (VGNodeRole)4;
 
+// ── Diagnostic logging gate ───────────────────────────────────────────────────
+// Set VG_ENABLE_SCHEDULER_FRAME_LOGS=1 in your scheme's preprocessor macros to
+// enable per-frame scheduler logging. Default is OFF so that thermal and
+// performance testing are not polluted by per-frame log overhead.
+#ifndef VG_ENABLE_SCHEDULER_FRAME_LOGS
+#define VG_ENABLE_SCHEDULER_FRAME_LOGS 0
+#endif
+
 static os_log_t sSchedulerV2Log;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -402,10 +410,12 @@ static os_log_t sSchedulerV2Log;
     // releases its copy when it forwarded the frame to this delegate. The source's
     // own +1 persists until the next decode cycle. No double-release.
 
+#if VG_ENABLE_SCHEDULER_FRAME_LOGS
     os_log_debug(sSchedulerV2Log,
                  "[VGSchedulerV2] didReceiveRawFrame: execOrder=%lu schedulerOwned=%d",
                  (unsigned long)_executionOrder.count,
                  (int)schedulerOwnedDelivered);
+#endif // VG_ENABLE_SCHEDULER_FRAME_LOGS
 }
 
 // ─── Property accessor ────────────────────────────────────────────────────────

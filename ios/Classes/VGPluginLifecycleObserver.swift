@@ -222,6 +222,10 @@ final class VGPluginLifecycleObserver: NSObject {
                 registry.allRuntimes().forEach { $0.setRuntimeThermalState(state) }
             @unknown default: break
             }
+            // Phase 10 Slice 10A: Notify Dart layer of thermal state change.
+            // This forwards the raw thermal state to VGThermalMonitor via the existing
+            // MethodChannel. Does NOT affect native degradation logic above.
+            plugin.notifyThermalStateChanged(state)
         }
     }
 }

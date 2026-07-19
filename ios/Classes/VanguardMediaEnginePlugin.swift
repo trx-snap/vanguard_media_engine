@@ -129,7 +129,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // Gated behind VG_USE_V2_GRAPH — nil when VG_USE_V2_GRAPH=0.
     #if VG_USE_V2_GRAPH
     var _timelineRuntime: VanguardGraphRuntime?
-    private let _audioRecordingHandler = VGAudioRecordingHandler()
     #endif
 
     // Phase 7.x-E: DEV-only runtime for dual-camera texture mount smoke test.
@@ -190,6 +189,14 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // AVAudioSession is NOT configured here — the pre-activated .playback
     // session set up by VanguardFileMediaSource.preActivateAudioSession is shared.
     var audioPlaybackService: VGAudioPlaybackService = VGAudioPlaybackService()
+
+    // ─── Audio Slice M: Recording handler ────────────────────────────────────
+    //
+    // Thin coordinator. All recording logic lives in VGAudioRecordingHandler
+    // (argument parsing / marshalling) and VanguardAudioRecorder (AVFoundation).
+    #if VG_USE_V2_GRAPH
+    private let _audioRecordingHandler = VGAudioRecordingHandler()
+    #endif
 
     // ─── Registration ─────────────────────────────────────────────────────────
 
@@ -374,6 +381,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         transitionDicts: [[String: Any]],
         width: Int,
         height: Int,
+        // Phase 10-C Slice D: optional audio sidecar plan and project duration.
+        // audioSidecarPlan may be nil (silent mode). durationSeconds must be > 0.
+        audioSidecarPlan: VGAudioSidecarPlan? = nil,
+        durationSeconds: Double = 0.0,
         result: @escaping FlutterResult
     ) {
         let compositorParams: [String: Any] = [
@@ -410,6 +421,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             methodChannel:   channel)
         self._timelineRuntime = timelineRuntime
 
+        // Phase 10-C Slice D: capture for use inside the completion handler.
+        let capturedSidecar   = audioSidecarPlan
+        let capturedDuration  = durationSeconds
+
         timelineRuntime.prepareTimeline(sourceNode: compositor) { textureId, err in
             if let err = err {
                 NSLog("[VanguardPlugin][7.5D] prepareTimeline failed: %@",
@@ -421,7 +436,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
             NSLog("[VanguardPlugin][7.5D] timeline texture ready textureId=%lld w=%d h=%d",
                   textureId, width, height)
-            result(["textureId": textureId, "width": width, "height": height])
+            // Phase 10-C Slice D: arm the audio preview runtime after the compositor
+            // is prepared. result() is deferred until audio setup completes (or
+            // silently falls back). Video preview is unaffected by any audio result.
+            // FlutterResult is called exactly once — either from the audio completion
+            // or from the video failure path above.
+            timelineRuntime.setAudioSidecarPlan(capturedSidecar,
+                                                timelineDuration: capturedDuration,
+                                                completion: {
+                result(["textureId": textureId, "width": width, "height": height])
+            })
         }
     }
 
@@ -2124,12 +2148,24 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             NSLog("[VanguardPlugin][7.8] createTimelineTexture: clips=%d w=%d h=%d",
                   clipDicts78.count, canvasWidth, canvasHeight)
 
+            // Phase 10-C Slice D: extract optional audio sidecar and project duration
+            // forwarded by Dart alongside the draft map.
+            // durationSeconds is mandatory for Slice D audio scheduling; absent means 0
+            // (silent fallback). audioSidecar is optional (nil = no music track).
+            let createDurationSeconds = (args?["durationSeconds"] as? NSNumber)?.doubleValue ?? 0.0
+            var createAudioSidecar: VGAudioSidecarPlan? = nil
+            if let sidecarDict78 = draftMap["audioSidecar"] as? [String: Any] {
+                createAudioSidecar = VGAudioSidecarPlan.fromDictionary(sidecarDict78)
+            }
+
             // Delegate to existing ObjC compositor path — no re-parsing.
             _prepareTimelineCompositorWithSize(
                 clipDicts: clipDicts78,
                 transitionDicts: transitionDicts78,
                 width: canvasWidth,
                 height: canvasHeight,
+                audioSidecarPlan: createAudioSidecar,
+                durationSeconds: createDurationSeconds,
                 result: result)
 
         case "updateTimeline":
@@ -2180,11 +2216,21 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             NSLog("[VanguardPlugin][7.8] updateTimeline: clips=%d w=%d h=%d",
                   clipDictsU.count, updateWidth, updateHeight)
 
+            // Phase 10-C Slice D: extract audio sidecar and project duration for
+            // audio preview runtime construction after compositor prepare.
+            let updateDurationSeconds = (args?["durationSeconds"] as? NSNumber)?.doubleValue ?? 0.0
+            var updateAudioSidecar: VGAudioSidecarPlan? = nil
+            if let sidecarDictU = draftMapU["audioSidecar"] as? [String: Any] {
+                updateAudioSidecar = VGAudioSidecarPlan.fromDictionary(sidecarDictU)
+            }
+
             _prepareTimelineCompositorWithSize(
                 clipDicts: clipDictsU,
                 transitionDicts: transitionDictsU,
                 width: updateWidth,
                 height: updateHeight,
+                audioSidecarPlan: updateAudioSidecar,
+                durationSeconds: updateDurationSeconds,
                 result: result)
 
         case "timelinePlay":
@@ -2350,21 +2396,31 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
         case "disposeTimeline":
             // Phase 7.8 production route: tear down the active timeline runtime.
+            // Phase 10-C Slice D teardown fix: result(nil) is returned INSIDE the
+            // invalidateAsync completion so that Dart's await on disposeTimeline
+            // resolves only after native invalidation is fully complete. This ensures
+            // the Dart future returned by disposeAsync() reflects actual teardown
+            // completion, not a fire-and-forget dispatch.
             if let runtime = self._timelineRuntime {
+                self._timelineRuntime = nil
                 runtime.invalidateAsync {
                     NSLog("[VanguardPlugin][7.8] disposeTimeline: runtime disposed")
+                    // Phase 7.20B: dispose wiring — cancel all in-flight reverse sidecar
+                    // transcodes and delete all cached sidecar files. Runs after runtime
+                    // invalidation completes, ensuring no new sidecar work is started.
+                    // cleanupAllSidecars acquires the internal lock, resets all records,
+                    // and dispatches file deletions asynchronously on a utility queue —
+                    // the lock release is immediate.
+                    VGReverseSidecarManager.shared().cleanupAllSidecars()
+                    NSLog("[VanguardPlugin][7.20B] disposeTimeline: sidecar cleanup triggered")
+                    result(nil)
                 }
-                self._timelineRuntime = nil
+            } else {
+                // No active runtime — still clean up sidecars and return immediately.
+                VGReverseSidecarManager.shared().cleanupAllSidecars()
+                NSLog("[VanguardPlugin][7.20B] disposeTimeline (no runtime): sidecar cleanup triggered")
+                result(nil)
             }
-            // Phase 7.20B: dispose wiring — cancel all in-flight reverse sidecar transcodes
-            // and delete all cached sidecar files when the timeline is torn down.
-            // This runs before result(nil) so cleanup is guaranteed before Dart proceeds.
-            // Sidecar cleanup is synchronous from the caller's perspective (cleanupAllSidecars
-            // acquires the internal lock, resets all records, and dispatches file deletions
-            // asynchronously on a utility queue — the lock release is immediate).
-            VGReverseSidecarManager.shared().cleanupAllSidecars()
-            NSLog("[VanguardPlugin][7.20B] disposeTimeline: sidecar cleanup triggered")
-            result(nil)
 
         // ── Phase 7.18B1: Frame cache metrics + manual cache flush ─────────────
         //
@@ -6242,14 +6298,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             result(nil)
         #endif
 
+        // ── Audio Slice N: Recording ─────────────────────────────────────────────
         #if VG_USE_V2_GRAPH
         case "startAudioRecording":
             _audioRecordingHandler.handleStart(args: args,
-                                               runtime: self._timelineRuntime,
+                                               handle: self._timelineRuntime,
                                                result: result)
 
         case "stopAudioRecording":
-            _audioRecordingHandler.handleStop(result: result)
+            _audioRecordingHandler.handleStop(handle: self._timelineRuntime,
+                                              result: result)
         #endif
 
         default:

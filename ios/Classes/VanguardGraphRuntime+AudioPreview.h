@@ -41,6 +41,23 @@ NS_ASSUME_NONNULL_BEGIN
                  completion:(dispatch_block_t)completion
     NS_SWIFT_NAME(setAudioSidecarPlan(_:timelineDuration:completion:));
 
+/// Forwards the Slice N recovery command to the installed audio preview runtime.
+///
+/// Called by VGAudioRecordingHandler (Swift) immediately after an AVAudioSession
+/// category transition (start or stop) to re-anchor the AVAudioEngine and
+/// reschedule player nodes under the new session configuration.
+///
+/// No-op (calls completion with nil) when no audio preview runtime is installed
+/// (e.g. silent-mode project). Must be called on the main thread.
+///
+/// completion fires exactly once on the main queue:
+///   nil   — engine restarted and preview recovered (or ReadySilent no-op).
+///   error — engine restart failed; caller should log and continue; preview
+///           may be silent until the next play command recovers it.
+- (void)recoverAudioPreviewAfterSessionTransitionWithCompletion:
+    (void (^)(NSError * _Nullable error))completion
+    NS_SWIFT_NAME(recoverAudioPreviewAfterSessionTransition(completion:));
+
 @end
 
 NS_ASSUME_NONNULL_END

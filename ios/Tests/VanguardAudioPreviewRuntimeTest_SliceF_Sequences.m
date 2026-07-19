@@ -386,12 +386,24 @@ NS_ASSUME_NONNULL_BEGIN
                  @"SF-T23: completed segment must NOT be rescheduled when "
                  @"snapshot clock is behind");
 
-  // Runtime must be Ended (no more descriptors after T=3).
+  // Runtime must remain Playing initially due to deferred stop.
+  [rt vg_performSynchronouslyOnSchedulerQueueForTesting:^{
+    NSInteger state = [[rt valueForKey:@"_runtimeState"] integerValue];
+    XCTAssertEqual(state, VGAudioPreviewRuntimeStatePlaying,
+                   @"SF-T23: runtime must remain Playing (deferred stop) when snapshot is behind");
+  }];
+
+  // Now advance the snapshot PTS to the physical end and fire the timer to finalize termination.
+  _stubbedSnapshot.timelinePTS = 3.0;
+  _stubbedSnapshot.playStartPTS = 3.0;
+  [_timer fireForcefully];
+  [self waitFor:0.15];
+
+  // Now the runtime must be Ended.
   [rt vg_performSynchronouslyOnSchedulerQueueForTesting:^{
     NSInteger state = [[rt valueForKey:@"_runtimeState"] integerValue];
     XCTAssertEqual(state, VGAudioPreviewRuntimeStateEnded,
-                   @"SF-T23: runtime must be Ended after single-track "
-                   @"completion with behind-clock snapshot");
+                   @"SF-T23: runtime must be Ended after boundary timer fires at T=3");
   }];
 
   [self invalidateAndWait:rt];

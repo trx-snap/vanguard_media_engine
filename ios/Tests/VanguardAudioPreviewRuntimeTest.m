@@ -208,6 +208,55 @@ NS_ASSUME_NONNULL_BEGIN
   return [dict copy];
 }
 
+/// Builds a voiceover-role track dictionary with a custom id and URL.
+- (NSDictionary<NSString *, id> *)voiceoverTrackDictWithId:(NSString *)tid
+                                                 startTime:(double)start
+                                                  duration:(double)dur
+                                                    volume:(double)vol
+                                                       url:(NSString *)path {
+  return @{
+    @"trackId" : tid,
+    @"role" : @"voiceover",
+    @"url" : path,
+    @"startTime" : @(start),
+    @"sourceTrimStart" : @(0.0),
+    @"duration" : @(dur),
+    @"volume" : @(vol),
+  };
+}
+
+/// Builds a two-slot runtime for Slice K tests.
+/// _voiceoverPlayer and _voiceoverAutomationTimer must be allocated before
+/// calling this. _timer, _automationTimer, _clock, _fileProvider, _engine, and
+/// _player are used for the Added Audio slot (same as single-slot tests).
+- (VanguardAudioPreviewRuntime *)makeMultiSlotRuntime {
+  NSAssert(_voiceoverPlayer != nil,
+           @"makeMultiSlotRuntime: _voiceoverPlayer must be set by the caller");
+  NSAssert(_voiceoverAutomationTimer != nil,
+           @"makeMultiSlotRuntime: _voiceoverAutomationTimer must be set");
+
+  __weak typeof(self) weakSelf = self;
+  VGTimelineSnapshotProvider provider = ^VGTimelineStateSnapshot {
+    typeof(self) ss = weakSelf;
+    if (!ss)
+      return (VGTimelineStateSnapshot){.isValid = NO};
+    return ss.stubbedSnapshot;
+  };
+  VanguardAudioPreviewRuntime *rt = [[VanguardAudioPreviewRuntime alloc]
+      initWithSnapshotProvider:provider
+                lifecycleEpoch:1
+                         clock:_clock
+                         timer:_timer
+       addedAudioAutomationTimer:_automationTimer
+       voiceoverAutomationTimer:_voiceoverAutomationTimer
+                  fileProvider:_fileProvider
+                        engine:_engine
+              addedAudioPlayer:_player
+               voiceoverPlayer:_voiceoverPlayer];
+  _timer.runtime = rt;
+  return rt;
+}
+
 @end
 
 NS_ASSUME_NONNULL_END
