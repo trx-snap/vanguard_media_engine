@@ -154,6 +154,25 @@ typedef NS_ENUM(NSInteger, VGSessionCoordinatorState) {
 - (VGSessionTransitionOutcome *)normalizationAttempt
     NS_SWIFT_NAME(normalizationAttempt());
 
+/// Forces AVAudioSession to Playback unconditionally after an external
+/// lifecycle event (interruption, background, or route change).
+///
+/// Unlike restorePlayback/normalizationAttempt, this method:
+///   - Is valid from ANY internal state (does NOT short-circuit on Playback).
+///   - Always executes setCategory:Playback options:0 followed by setActive:YES.
+///   - Never calls setActive:NO.
+///
+/// Success:        internal state → Playback, returns Success.
+/// Category fail:  internal state → Unknown,  returns FailedUnknown.
+/// Activation fail: internal state → Unknown, returns FailedUnknown.
+///
+/// Use this instead of normalizationAttempt after external lifecycle events
+/// because the OS may have silently changed the session category while the
+/// app was interrupted or backgrounded, making the coordinator's cached
+/// internal state stale.
+- (VGSessionTransitionOutcome *)forceNormalizePlaybackAfterExternalChange
+    NS_SWIFT_NAME(forceNormalizePlaybackAfterExternalChange());
+
 /// Captures the current route state and builds a VGAudioRouteSnapshot.
 ///
 /// Always returns a non-nil snapshot. When no active input exists,

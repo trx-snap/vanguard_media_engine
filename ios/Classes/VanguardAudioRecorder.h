@@ -1,5 +1,5 @@
 // VanguardAudioRecorder.h
-// Vanguard Media Engine — Audio Slice N
+// Vanguard Media Engine — Audio Slice N/O
 //
 // Minimal microphone capture helper backed by AVAudioRecorder.
 //
@@ -30,6 +30,7 @@
 //   - VGAudioRecorderTimeProvider  — injectable for CACurrentMediaTime().
 //   - VGAudioRecorderBackend       — injectable recorder (avoids real AVAudioRecorder).
 //   - VGAudioRecorderBackendFactory — injectable builder for the backend.
+//   - VGAudioRecorderDurationProbe — injectable finalized-file duration reader.
 //   All seams default to real implementations; override in tests only.
 //
 // Threading:
@@ -84,6 +85,31 @@ NS_ASSUME_NONNULL_BEGIN
                                                 error:(NSError * _Nullable * _Nullable)error;
 @end
 
+/// Probes the finalized encoded file for its true container duration after
+/// the recorder backend has flushed and stopped.
+///
+/// Production: backed by AVURLAsset / CoreMedia.
+/// Tests: backed by a synchronous stub that returns a controlled value.
+///
+/// Threading contract:
+///   - |probeDurationOfFileAtURL:completion:| is called on the main thread.
+///   - The probe may perform I/O on any queue internally.
+///   - Conforming probes SHOULD invoke |completion| at most once; probes that
+///     call back multiple times, call back late, or never call back are
+///     tolerated — the recorder owns bounded, exactly-once terminal delivery.
+///   - The production implementation always marshals |completion| to the main
+///     thread. Injected probes SHOULD do the same; the recorder defensively
+///     re-dispatches any off-main callback to the main queue before resolving.
+///   - Callbacks that arrive after the recorder has already resolved the stop
+///     (either via an earlier probe callback or via timeout) are ignored.
+///
+/// |completion| receives the encoded file duration in seconds, or a value
+/// that is not (isfinite && > 0) to indicate probe failure.
+@protocol VGAudioRecorderDurationProbe <NSObject>
+- (void)probeDurationOfFileAtURL:(NSURL *)fileURL
+                      completion:(void (^)(NSTimeInterval duration))completion;
+@end
+
 // ─── VGAudioRecordingStartInfo ────────────────────────────────────────────────
 
 /// Returned from a successful startRecording call.
@@ -117,6 +143,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly) double startPTS;
 
 /// Duration of the recorded audio in seconds.
+/// Sourced from the finalized container file when the probe succeeds;
+/// falls back to monotonic elapsed time otherwise.
 @property(nonatomic, readonly) double durationSeconds;
 
 - (instancetype)initWithFilePath:(NSString *)filePath
@@ -140,11 +168,39 @@ NS_ASSUME_NONNULL_BEGIN
 ///   3. Read VGTimelineStateSnapshot → compute startPTS.
 ///   4. record — begins capture.
 /// This order minimises the skew between the PTS read and first audio sample.
+///
+/// Stop sequence:
+///   1. [backend stop] — finalises the encoded file.
+///   2. Active state cleared synchronously on the main thread.
+///   3. Duration probe dispatches container read off-main; a bounded timeout
+///      guards against indefinite quiescence delay.
+///   4. Finalized-file duration is authoritative if finite and > 0.
+///      Monotonic elapsed is the fallback only when probing fails or times out.
+///   5. completion(info, nil) fires on the main thread exactly once.
 @interface VanguardAudioRecorder : NSObject
 
+/// Full test-injection initializer.
+///
+/// |timeProvider|     — nil → production CACurrentMediaTime() wrapper.
+/// |backendFactory|   — nil → production AVAudioRecorder factory.
+/// |durationProbe|    — nil → production AVURLAsset-backed probe.
+/// |probeTimeoutSecs| — duration-probe watchdog in seconds.
+///                      Replaced with the 2.0-second production default whenever
+///                      the value is not (isfinite && > 0): NaN, ±infinity,
+///                      zero, and negative values all select the default.
+///
+/// This is the designated initializer. All other initializers forward here.
 - (instancetype)initWithTimeProvider:(nullable id<VGAudioRecorderTimeProvider>)timeProvider
                       backendFactory:(nullable id<VGAudioRecorderBackendFactory>)backendFactory
+                       durationProbe:(nullable id<VGAudioRecorderDurationProbe>)durationProbe
+                   probeTimeoutSecs:(NSTimeInterval)probeTimeoutSecs
     NS_DESIGNATED_INITIALIZER;
+
+/// Initializer that accepts time-provider and backend-factory overrides.
+/// Uses the production duration probe and a 2.0-second probe timeout.
+/// All nil arguments default to their production implementations.
+- (instancetype)initWithTimeProvider:(nullable id<VGAudioRecorderTimeProvider>)timeProvider
+                      backendFactory:(nullable id<VGAudioRecorderBackendFactory>)backendFactory;
 
 /// Convenience initialiser that uses all production defaults.
 - (instancetype)init;
@@ -184,7 +240,7 @@ NS_ASSUME_NONNULL_BEGIN
               NSError * _Nullable error))completion;
 
 /// Cancels and discards the active recording without returning a result.
-/// Idempotent.
+/// Idempotent. Does NOT trigger a duration probe.
 - (void)cancelRecording;
 
 /// Whether a recording is currently in progress.

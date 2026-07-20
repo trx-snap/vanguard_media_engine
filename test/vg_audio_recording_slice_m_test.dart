@@ -300,4 +300,64 @@ void main() {
       );
     });
   });
+
+  group('VGTransitionStatus terminationReason', () {
+    test('parses all four frozen values', () {
+      final reasons = ['interruption', 'background', 'routeLost', 'routeChanged'];
+      for (final reason in reasons) {
+        final map = <Object?, Object?>{
+          'sessionRestored': true,
+          'previewRecovered': true,
+          'terminationReason': reason,
+        };
+        final ts = VGTransitionStatus.fromMap(map);
+        expect(ts.terminationReason, reason);
+      }
+    });
+
+    test('is null for legacy and user-stop maps', () {
+      final mapUser = <Object?, Object?>{
+        'sessionRestored': true,
+        'previewRecovered': true,
+      };
+      final tsUser = VGTransitionStatus.fromMap(mapUser);
+      expect(tsUser.terminationReason, isNull);
+
+      final tsNull = VGTransitionStatus.fromMap(null);
+      expect(tsNull.terminationReason, isNull);
+    });
+
+    test('toMap, equality, hashCode, and toString include terminationReason correctly', () {
+      const ts1 = VGTransitionStatus(
+        sessionRestored: true,
+        previewRecovered: true,
+        terminationReason: 'interruption',
+      );
+      const ts2 = VGTransitionStatus(
+        sessionRestored: true,
+        previewRecovered: true,
+        terminationReason: 'interruption',
+      );
+      const ts3 = VGTransitionStatus(
+        sessionRestored: true,
+        previewRecovered: true,
+        terminationReason: 'background',
+      );
+
+      // toMap
+      final map = ts1.toMap();
+      expect(map['terminationReason'], 'interruption');
+
+      // equality
+      expect(ts1, equals(ts2));
+      expect(ts1, isNot(equals(ts3)));
+
+      // hashCode
+      expect(ts1.hashCode, equals(ts2.hashCode));
+      expect(ts1.hashCode, isNot(equals(ts3.hashCode)));
+
+      // toString
+      expect(ts1.toString(), contains('terminationReason: interruption'));
+    });
+  });
 }

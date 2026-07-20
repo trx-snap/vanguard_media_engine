@@ -125,19 +125,30 @@ final class VGAudioRouteSnapshotResult {
 /// Session-restore and preview-recovery diagnostics from a stop operation.
 /// Nested under the "transitionStatus" key in the stop result map.
 ///
-/// [sessionRestored]  — true if AVAudioSession was restored to Playback.
-/// [previewRecovered] — true if the audio preview engine recovered successfully.
-/// [sessionErrorCode] — optional opaque code string when sessionRestored=false.
-/// [previewErrorCode] — optional opaque code string when previewRecovered=false.
-///                      "RECOVERY_RUNTIME_NIL" if stop was called with no runtime.
+/// [sessionRestored]   — true if AVAudioSession was restored to Playback.
+/// [previewRecovered]  — true if the audio preview engine recovered successfully.
+/// [sessionErrorCode]  — optional opaque code string when sessionRestored=false.
+/// [previewErrorCode]  — optional opaque code string when previewRecovered=false.
+///                       "RECOVERY_RUNTIME_NIL" if stop was called with no runtime.
+/// [terminationReason] — optional platform-neutral reason when a system event
+///                       terminated an active recording. Absent (null) for normal
+///                       user-initiated stops.
 ///
-/// Missing or malformed transitionStatus defaults both booleans to false.
+/// Frozen [terminationReason] values:
+///   "interruption" — AVAudioSession interruption (phone call, Siri, alarm).
+///   "background"   — App entered the background.
+///   "routeLost"    — Physical audio device removed (oldDeviceUnavailable).
+///   "routeChanged" — New audio device appeared during active capture.
+///
+/// Missing or malformed transitionStatus defaults all booleans to false and
+/// all optional strings to null.
 final class VGTransitionStatus {
   const VGTransitionStatus({
     required this.sessionRestored,
     required this.previewRecovered,
     this.sessionErrorCode,
     this.previewErrorCode,
+    this.terminationReason,
   });
 
   final bool sessionRestored;
@@ -149,6 +160,15 @@ final class VGTransitionStatus {
   /// Non-null when previewRecovered is false. Opaque; treat as diagnostic only.
   final String? previewErrorCode;
 
+  /// Non-null when a system event (interruption, background, route loss)
+  /// terminated an active recording before the user called stopAudioRecording.
+  ///
+  /// Platform-neutral frozen values: "interruption", "background",
+  /// "routeLost", "routeChanged".
+  ///
+  /// Null for normal user-initiated stops.
+  final String? terminationReason;
+
   /// Parses from the nested "transitionStatus" sub-map.
   /// Returns a fully-false instance if [map] is null or malformed.
   static VGTransitionStatus fromMap(Map<Object?, Object?>? map) {
@@ -157,39 +177,47 @@ final class VGTransitionStatus {
           sessionRestored: false, previewRecovered: false);
     }
     return VGTransitionStatus(
-      sessionRestored: (map['sessionRestored'] as bool?) ?? false,
+      sessionRestored:  (map['sessionRestored'] as bool?) ?? false,
       previewRecovered: (map['previewRecovered'] as bool?) ?? false,
-      sessionErrorCode: map['sessionErrorCode'] as String?,
-      previewErrorCode: map['previewErrorCode'] as String?,
+      sessionErrorCode:  map['sessionErrorCode'] as String?,
+      previewErrorCode:  map['previewErrorCode'] as String?,
+      terminationReason: map['terminationReason'] as String?,
     );
   }
 
   Map<String, Object?> toMap() => <String, Object?>{
-        'sessionRestored': sessionRestored,
+        'sessionRestored':  sessionRestored,
         'previewRecovered': previewRecovered,
-        if (sessionErrorCode != null) 'sessionErrorCode': sessionErrorCode,
-        if (previewErrorCode != null) 'previewErrorCode': previewErrorCode,
+        if (sessionErrorCode  != null) 'sessionErrorCode':  sessionErrorCode,
+        if (previewErrorCode  != null) 'previewErrorCode':  previewErrorCode,
+        if (terminationReason != null) 'terminationReason': terminationReason,
       };
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
       other is VGTransitionStatus &&
-          other.sessionRestored == sessionRestored &&
+          other.sessionRestored  == sessionRestored  &&
           other.previewRecovered == previewRecovered &&
           other.sessionErrorCode == sessionErrorCode &&
-          other.previewErrorCode == previewErrorCode;
+          other.previewErrorCode == previewErrorCode &&
+          other.terminationReason == terminationReason;
 
   @override
   int get hashCode => Object.hash(
-      sessionRestored, previewRecovered, sessionErrorCode, previewErrorCode);
+      sessionRestored,
+      previewRecovered,
+      sessionErrorCode,
+      previewErrorCode,
+      terminationReason);
 
   @override
   String toString() => 'VGTransitionStatus('
       'sessionRestored: $sessionRestored, '
       'previewRecovered: $previewRecovered'
-      '${sessionErrorCode != null ? ", sessionErrorCode: $sessionErrorCode" : ""}'
-      '${previewErrorCode != null ? ", previewErrorCode: $previewErrorCode" : ""}'
+      '${sessionErrorCode  != null ? ", sessionErrorCode: $sessionErrorCode"   : ""}'
+      '${previewErrorCode  != null ? ", previewErrorCode: $previewErrorCode"   : ""}'
+      '${terminationReason != null ? ", terminationReason: $terminationReason" : ""}'
       ')';
 }
 

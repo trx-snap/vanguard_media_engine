@@ -344,6 +344,54 @@ static NSError *_makeSessionErrorWithUnderlying(VGSessionTransitionError code,
     return [VGSessionTransitionOutcome success];
 }
 
+// ── forceNormalizePlaybackAfterExternalChange ─────────────────────────────────
+
+- (VGSessionTransitionOutcome *)forceNormalizePlaybackAfterExternalChange {
+    NSAssert([NSThread isMainThread],
+             @"VGAudioSessionTransitionCoordinator: must be called on main thread");
+
+    // Unlike restorePlayback / normalizationAttempt, we do NOT short-circuit
+    // when _state == Playback. The OS may have silently mutated the session
+    // category during interruption or background, making our cached state stale.
+    // We unconditionally re-assert the Playback category and re-activate.
+
+    NSLog(@"[VGCoordinator] forceNormalizePlaybackAfterExternalChange — forcing Playback");
+
+    NSError *catErr = nil;
+    BOOL catOK = [_backend setCategory:AVAudioSessionCategoryPlayback
+                           withOptions:0
+                                 error:&catErr];
+    if (!catOK) {
+        _state = VGSessionCoordinatorStateUnknown;
+        NSError *wrapped = _makeSessionErrorWithUnderlying(
+            VGSessionTransitionErrorNormalizationFailed,
+            @"forceNormalize setCategory:Playback failed", catErr);
+        NSLog(@"[VGCoordinator] forceNormalize setCategory failed → unknown");
+        return [VGSessionTransitionOutcome
+            failureWithStatus:VGSessionTransitionStatusFailedUnknown
+                 primaryError:wrapped
+               secondaryError:nil];
+    }
+
+    NSError *actErr = nil;
+    BOOL actOK = [_backend setActiveYesWithError:&actErr];
+    if (!actOK) {
+        _state = VGSessionCoordinatorStateUnknown;
+        NSError *wrapped = _makeSessionErrorWithUnderlying(
+            VGSessionTransitionErrorActivationFailed,
+            @"forceNormalize setActive:YES failed", actErr);
+        NSLog(@"[VGCoordinator] forceNormalize setActive:YES failed → unknown");
+        return [VGSessionTransitionOutcome
+            failureWithStatus:VGSessionTransitionStatusFailedUnknown
+                 primaryError:wrapped
+               secondaryError:nil];
+    }
+
+    _state = VGSessionCoordinatorStatePlayback;
+    NSLog(@"[VGCoordinator] forceNormalize succeeded → Playback");
+    return [VGSessionTransitionOutcome success];
+}
+
 // ── captureRouteSnapshot ──────────────────────────────────────────────────────
 
 - (VGAudioRouteSnapshot *)captureRouteSnapshot {

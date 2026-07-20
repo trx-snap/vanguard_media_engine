@@ -164,6 +164,39 @@ static NSMutableArray<NSString *> *VGARTest_SharedTrace;
 
 @end
 
+// ── Mock duration probe ───────────────────────────────────────────────────────
+
+@interface VGARTest_MockDurationProbe : NSObject <VGAudioRecorderDurationProbe>
+@property(nonatomic) NSTimeInterval stubbedDuration;
+@property(nonatomic) BOOL shouldNeverComplete;
+@property(nonatomic, copy, nullable) void (^capturedCompletion)(NSTimeInterval duration);
+@property(nonatomic) NSInteger probeCount;
+@property(nonatomic) BOOL callbackOffMain;
+@end
+
+@implementation VGARTest_MockDurationProbe
+
+- (void)probeDurationOfFileAtURL:(NSURL *)fileURL
+                      completion:(void (^)(NSTimeInterval duration))completion {
+    [VGARTest_SharedTrace addObject:@"probe"];
+    _probeCount++;
+    if (_shouldNeverComplete) {
+        _capturedCompletion = completion;
+        return;
+    }
+    
+    void (^cb)(NSTimeInterval) = [completion copy];
+    if (_callbackOffMain) {
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            cb(self->_stubbedDuration);
+        });
+    } else {
+        cb(_stubbedDuration);
+    }
+}
+
+@end
+
 // ─── Test case ────────────────────────────────────────────────────────────────
 
 @interface VanguardAudioRecorderTests : XCTestCase
@@ -173,6 +206,7 @@ static NSMutableArray<NSString *> *VGARTest_SharedTrace;
     VGARTest_MockTimeProvider    *_time;
     VGARTest_MockBackendFactory  *_factory;
     VGARTest_MockBackend         *_backend;
+    VGARTest_MockDurationProbe   *_probe;
     NSString                     *_tmpPath;
 }
 
@@ -186,6 +220,9 @@ static NSMutableArray<NSString *> *VGARTest_SharedTrace;
     _factory = [[VGARTest_MockBackendFactory alloc] init];
     _factory.stubbedBackend = _backend;
 
+    _probe = [[VGARTest_MockDurationProbe alloc] init];
+    _probe.stubbedDuration = 4.8;
+
     _tmpPath = [NSTemporaryDirectory()
                 stringByAppendingPathComponent:@"VGARTest_SliceN.m4a"];
     [[NSFileManager defaultManager] removeItemAtPath:_tmpPath error:nil];
@@ -198,7 +235,17 @@ static NSMutableArray<NSString *> *VGARTest_SharedTrace;
 
 - (VanguardAudioRecorder *)makeRecorder {
     return [[VanguardAudioRecorder alloc] initWithTimeProvider:_time
-                                                backendFactory:_factory];
+                                                backendFactory:_factory
+                                                 durationProbe:_probe
+                                              probeTimeoutSecs:1.0];
+}
+
+- (VanguardAudioRecorder *)makeRecorderWithProbe:(id<VGAudioRecorderDurationProbe>)probe
+                                        timeout:(NSTimeInterval)timeout {
+    return [[VanguardAudioRecorder alloc] initWithTimeProvider:_time
+                                                backendFactory:_factory
+                                                 durationProbe:probe
+                                              probeTimeoutSecs:timeout];
 }
 
 - (VanguardGraphRuntime *)makePreparedRuntime {
@@ -416,8 +463,8 @@ static NSMutableArray<NSString *> *VGARTest_SharedTrace;
     XCTAssertNil(err);
     XCTAssertNotNil(info);
 
-    // Expected sequence: create -> prepare -> time -> record
-    NSArray<NSString *> *expected = @[@"create", @"prepare", @"time", @"record"];
+    // Expected sequence: create -> prepare -> time -> record -> time
+    NSArray<NSString *> *expected = @[@"create", @"prepare", @"time", @"record", @"time"];
     XCTAssertEqualObjects(VGARTest_SharedTrace, expected);
 
     [rt invalidate];
@@ -448,6 +495,714 @@ static NSMutableArray<NSString *> *VGARTest_SharedTrace;
     XCTAssertFalse([VGARTest_SharedTrace containsObject:@"record"]);
 
     [rt invalidate];
+}
+
+// ── Focused duration fallback tests ──────────────────────────────────────────
+
+- (void)testStopDurationNormalPreserved {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = 4.8;
+    _time.currentTime = 105.0; // Monotonic elapsed = 5.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 4.8, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationNegativeFallback {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = -5.0;
+    _time.currentTime = 105.0; // Monotonic elapsed = 5.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 5.0, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationEnormousPositivePreserved {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = 76842.41;
+    _time.currentTime = 105.0; // Monotonic elapsed = 5.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 76842.41, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationNaNFallback {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = NAN;
+    _time.currentTime = 105.0; // Monotonic elapsed = 5.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 5.0, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationPositiveInfinityFallback {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = INFINITY;
+    _time.currentTime = 105.0; // Monotonic elapsed = 5.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 5.0, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationNegativeInfinityFallback {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = -INFINITY;
+    _time.currentTime = 105.0; // Monotonic elapsed = 5.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 5.0, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationPlausibleButWrongLowPreserved {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = 0.2;
+    _time.currentTime = 108.0; // Monotonic elapsed = 8.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 0.2, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationAtOneSecondBoundaryPreserved {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = 4.0; // exactly 1.0s difference from 5.0s
+    _time.currentTime = 105.0; // Monotonic elapsed = 5.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 4.0, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationBeyondOneSecondBoundaryPreserved {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = 3.99; // 1.01s difference from 5.0s
+    _time.currentTime = 105.0; // Monotonic elapsed = 5.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 3.99, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testRecorderReuseAfterStopUsesFreshTimestamp {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    // First run
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    _probe.stubbedDuration = 4.8;
+    _time.currentTime = 105.0;
+    XCTestExpectation *exp1 = [self expectationWithDescription:@"stop1"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        [exp1 fulfill];
+    }];
+    [self waitForExpectations:@[exp1] timeout:1.0];
+    
+    // Second run
+    _time.currentTime = 200.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    _probe.stubbedDuration = NAN; // force fallback
+    _time.currentTime = 208.0; // elapsed = 8.0 (if fresh), or 108.0 (if stale)
+    
+    XCTestExpectation *exp2 = [self expectationWithDescription:@"stop2"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 8.0, 1e-9);
+        [exp2 fulfill];
+    }];
+    [self waitForExpectations:@[exp2] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testRecorderReuseAfterCancelUsesFreshTimestamp {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    // First run -> cancel
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    [rec cancelRecording];
+    
+    // Second run
+    _time.currentTime = 200.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    _probe.stubbedDuration = NAN; // force fallback
+    _time.currentTime = 208.0; // elapsed = 8.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 8.0, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testFailedRecordDoesNotCommitStaleTimingState {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    // Make record fail
+    _backend.recordShouldFail = YES;
+    _time.currentTime = 100.0;
+    NSError *err = nil;
+    XCTAssertNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:&err]);
+    XCTAssertNotNil(err);
+    
+    // Restore record success
+    _backend.recordShouldFail = NO;
+    _time.currentTime = 200.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    _probe.stubbedDuration = NAN; // force fallback
+    _time.currentTime = 208.0; // elapsed = 8.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 8.0, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testCancelDeletesPartialFile {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    // Create a dummy file to verify cancel deletes it
+    [@"dummy data" writeToFile:_tmpPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:_tmpPath]);
+    
+    [rec cancelRecording];
+    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:_tmpPath]);
+    [rt invalidate];
+}
+
+- (void)testEmittedDurationIsAlwaysFiniteAndNonnegative {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    // Simulate backward clock jump: stop time (95.0) < start time (100.0) -> elapsed < 0
+    _time.currentTime = 95.0;
+    _probe.stubbedDuration = NAN;
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqual(info.durationSeconds, 0.0);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+// ── New Slice O tests ──────────────────────────────────────────────────────────
+
+- (void)testStopDurationExactPhysicalDiscrepancy {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = 4.48;
+    _time.currentTime = 106.42; // monotonic = 6.42
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 4.48, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationZeroProbeFallback {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = 0.0;
+    _time.currentTime = 105.0; // monotonic = 5.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 5.0, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationNeverCompletesTimeoutFallback {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorderWithProbe:_probe timeout:0.1];
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.shouldNeverComplete = YES;
+    _time.currentTime = 105.0; // monotonic = 5.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 5.0, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationLateCallbackIgnored {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorderWithProbe:_probe timeout:0.1];
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.shouldNeverComplete = YES;
+    _time.currentTime = 105.0; // monotonic = 5.0
+    
+    __block NSInteger callbackCount = 0;
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        callbackCount++;
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 5.0, 1e-9);
+        [exp fulfill];
+    }];
+    
+    [self waitForExpectations:@[exp] timeout:1.0];
+    
+    XCTAssertNotNil(_probe.capturedCompletion);
+    _probe.capturedCompletion(10.0);
+    
+    XCTAssertEqual(callbackCount, 1);
+    [rt invalidate];
+}
+
+- (void)testStopDurationRepeatedCallbacksDeliverOnce {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.shouldNeverComplete = YES;
+    _time.currentTime = 105.0; // monotonic = 5.0
+    
+    __block NSInteger callbackCount = 0;
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        callbackCount++;
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 4.5, 1e-9);
+        [exp fulfill];
+    }];
+    
+    _probe.capturedCompletion(4.5);
+    [self waitForExpectations:@[exp] timeout:1.0];
+    
+    _probe.capturedCompletion(7.5);
+    
+    XCTAssertEqual(callbackCount, 1);
+    [rt invalidate];
+}
+
+- (void)testStopDurationSynchronousCallbackWorks {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = 4.2;
+    _probe.callbackOffMain = NO; // synchronous
+    _time.currentTime = 105.0; // monotonic = 5.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 4.2, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationOffMainCallbackMarshalled {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = 4.2;
+    _probe.callbackOffMain = YES; // off-main
+    _time.currentTime = 105.0; // monotonic = 5.0
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertTrue([NSThread isMainThread]);
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 4.2, 1e-9);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationProbeFirstPreventsTimeout {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorderWithProbe:_probe timeout:0.2];
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.stubbedDuration = 4.2;
+    _time.currentTime = 105.0;
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(error);
+        XCTAssertNotNil(info);
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 4.2, 1e-9);
+        [exp fulfill];
+    }];
+    
+    [self waitForExpectations:@[exp] timeout:1.0];
+    
+    XCTestExpectation *delayExp = [self expectationWithDescription:@"delay"];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [delayExp fulfill];
+    });
+    [self waitForExpectations:@[delayExp] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testStopDurationIsolatedPerStop {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorderWithProbe:_probe timeout:0.1];
+    
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    _probe.shouldNeverComplete = YES;
+    
+    _time.currentTime = 105.0;
+    
+    XCTestExpectation *exp1 = [self expectationWithDescription:@"stop1"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 5.0, 1e-9);
+        [exp1 fulfill];
+    }];
+    
+    [self waitForExpectations:@[exp1] timeout:1.0];
+    
+    _time.currentTime = 200.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.shouldNeverComplete = NO;
+    _probe.stubbedDuration = 3.3;
+    _time.currentTime = 205.0;
+    
+    XCTestExpectation *exp2 = [self expectationWithDescription:@"stop2"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertEqualWithAccuracy(info.durationSeconds, 3.3, 1e-9);
+        [exp2 fulfill];
+    }];
+    [self waitForExpectations:@[exp2] timeout:1.0];
+    [rt invalidate];
+}
+
+- (void)testCancelDoesNotInvokeProbeAndPreservesDeletion {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    [@"dummy" writeToFile:_tmpPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    XCTAssertTrue([[NSFileManager defaultManager] fileExistsAtPath:_tmpPath]);
+    
+    _probe.probeCount = 0;
+    [rec cancelRecording];
+    
+    XCTAssertEqual(_probe.probeCount, 0);
+    XCTAssertFalse([[NSFileManager defaultManager] fileExistsAtPath:_tmpPath]);
+    [rt invalidate];
+}
+
+- (void)testZeroTimeoutDefaultsSafely {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorderWithProbe:_probe timeout:0.0];
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.shouldNeverComplete = YES;
+    _time.currentTime = 105.0;
+    
+    __block BOOL called = NO;
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        called = YES;
+    }];
+    
+    XCTestExpectation *delay = [self expectationWithDescription:@"delay"];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [delay fulfill];
+    });
+    [self waitForExpectations:@[delay] timeout:1.0];
+    XCTAssertFalse(called);
+    
+    if (_probe.capturedCompletion) {
+        _probe.capturedCompletion(1.5);
+    }
+    [rt invalidate];
+}
+
+- (void)testNegativeTimeoutDefaultsSafely {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorderWithProbe:_probe timeout:-1.0];
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.shouldNeverComplete = YES;
+    _time.currentTime = 105.0;
+    
+    __block BOOL called = NO;
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        called = YES;
+    }];
+    
+    XCTestExpectation *delay = [self expectationWithDescription:@"delay"];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [delay fulfill];
+    });
+    [self waitForExpectations:@[delay] timeout:1.0];
+    XCTAssertFalse(called);
+    
+    if (_probe.capturedCompletion) {
+        _probe.capturedCompletion(1.5);
+    }
+    [rt invalidate];
+}
+
+- (void)testNaNTimeoutDefaultsSafely {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorderWithProbe:_probe timeout:NAN];
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.shouldNeverComplete = YES;
+    _time.currentTime = 105.0;
+    
+    __block BOOL called = NO;
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        called = YES;
+    }];
+    
+    XCTestExpectation *delay = [self expectationWithDescription:@"delay"];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [delay fulfill];
+    });
+    [self waitForExpectations:@[delay] timeout:1.0];
+    XCTAssertFalse(called);
+    
+    if (_probe.capturedCompletion) {
+        _probe.capturedCompletion(1.5);
+    }
+    [rt invalidate];
+}
+
+- (void)testPosInfinityTimeoutDefaultsSafely {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorderWithProbe:_probe timeout:INFINITY];
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.shouldNeverComplete = YES;
+    _time.currentTime = 105.0;
+    
+    __block BOOL called = NO;
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        called = YES;
+    }];
+    
+    XCTestExpectation *delay = [self expectationWithDescription:@"delay"];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [delay fulfill];
+    });
+    [self waitForExpectations:@[delay] timeout:1.0];
+    XCTAssertFalse(called);
+    
+    if (_probe.capturedCompletion) {
+        _probe.capturedCompletion(1.5);
+    }
+    [rt invalidate];
+}
+
+- (void)testNegInfinityTimeoutDefaultsSafely {
+    VanguardGraphRuntime *rt = [self makePreparedRuntime];
+    VanguardAudioRecorder *rec = [self makeRecorderWithProbe:_probe timeout:-INFINITY];
+    _time.currentTime = 100.0;
+    XCTAssertNotNil([rec startRecordingWithRuntime:rt outputPath:_tmpPath error:nil]);
+    
+    _probe.shouldNeverComplete = YES;
+    _time.currentTime = 105.0;
+    
+    __block BOOL called = NO;
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        called = YES;
+    }];
+    
+    XCTestExpectation *delay = [self expectationWithDescription:@"delay"];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [delay fulfill];
+    });
+    [self waitForExpectations:@[delay] timeout:1.0];
+    XCTAssertFalse(called);
+    
+    if (_probe.capturedCompletion) {
+        _probe.capturedCompletion(1.5);
+    }
+    [rt invalidate];
+}
+
+- (void)testLegacyTwoArgumentInitializerUsable {
+    VanguardAudioRecorder *rec = [[VanguardAudioRecorder alloc] initWithTimeProvider:_time backendFactory:_factory];
+    XCTAssertNotNil(rec);
+}
+
+- (void)testStopNotRecordingReturnsNotRecordingWithoutProbing {
+    VanguardAudioRecorder *rec = [self makeRecorder];
+    _probe.probeCount = 0;
+    
+    XCTestExpectation *exp = [self expectationWithDescription:@"stop"];
+    [rec stopRecordingWithCompletion:^(VGAudioRecordingStopInfo * _Nullable info, NSError * _Nullable error) {
+        XCTAssertNil(info);
+        XCTAssertNotNil(error);
+        XCTAssertEqual(error.code, VGRecorderErrorNotRecording);
+        [exp fulfill];
+    }];
+    [self waitForExpectations:@[exp] timeout:1.0];
+    XCTAssertEqual(_probe.probeCount, 0);
 }
 
 @end

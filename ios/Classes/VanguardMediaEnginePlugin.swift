@@ -190,12 +190,36 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // session set up by VanguardFileMediaSource.preActivateAudioSession is shared.
     var audioPlaybackService: VGAudioPlaybackService = VGAudioPlaybackService()
 
-    // ─── Audio Slice M: Recording handler ────────────────────────────────────
+    // ─── Audio Slice O: Shared session coordinator ───────────────────────────
     //
-    // Thin coordinator. All recording logic lives in VGAudioRecordingHandler
-    // (argument parsing / marshalling) and VanguardAudioRecorder (AVFoundation).
+    // Exactly one VGAudioSessionTransitionCoordinator instance. Injected into
+    // both the recording handler and the lifecycle coordinator so they share
+    // one authoritative session state machine.
+    //
+    // Retain directions (no cycles):
+    //   Plugin (strong) → audioSessionCoordinator
+    //   Plugin (strong) → audioRecordingHandler (strong) → audioSessionCoordinator
+    //   Plugin (strong) → audioLifecycleCoordinator (strong) → audioSessionCoordinator
+    //   Plugin (strong) → audioTimelineAdapter (strong) → Plugin (WEAK)
+    //   Plugin (strong) → lifecycleObserver (strong) → audioLifecycleCoordinator (strong)
+    //   audioLifecycleCoordinator → audioRecordingHandler (WEAK)
     #if VG_USE_V2_GRAPH
-    private let _audioRecordingHandler = VGAudioRecordingHandler()
+    let audioSessionCoordinator = VGAudioSessionTransitionCoordinator()
+
+    private lazy var _audioRecordingHandler: VGAudioRecordingHandler = {
+        VGAudioRecordingHandler(coordinator: self.audioSessionCoordinator)
+    }()
+
+    private lazy var _audioTimelineAdapter: VGAudioTimelineLifecycleAdapter = {
+        VGAudioTimelineLifecycleAdapter(plugin: self)
+    }()
+
+    private lazy var _audioLifecycleCoordinator: VGAudioLifecycleCoordinator = {
+        VGAudioLifecycleCoordinator(
+            recordingHandler:  self._audioRecordingHandler,
+            coordinator:       self.audioSessionCoordinator,
+            timelineLifecycle: self._audioTimelineAdapter)
+    }()
     #endif
 
     // ─── Registration ─────────────────────────────────────────────────────────
@@ -217,14 +241,21 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         instance.cameraFactory = cameraFactory
         registrar.register(cameraFactory, withId: "vanguard_camera_view")
 
-        // Phase 2 Step 8: instantiate the lifecycle observer after sessionRegistry
-        // is available. The observer owns all NotificationCenter registrations
-        // (memory warning, willResignActive, didBecomeActive, audio interruption,
-        // route change, thermal state) and triggers preActivateAudioSession().
+        // Phase 2 Step 8 / Slice O: instantiate the lifecycle observer after
+        // sessionRegistry is available. The observer owns all NotificationCenter
+        // registrations and routes audio lifecycle events to the coordinator.
+        #if VG_USE_V2_GRAPH
+        instance.lifecycleObserver = VGPluginLifecycleObserver(
+            registry:                  instance.sessionRegistry,
+            plugin:                    instance,
+            audioLifecycleCoordinator: instance._audioLifecycleCoordinator
+        )
+        #else
         instance.lifecycleObserver = VGPluginLifecycleObserver(
             registry: instance.sessionRegistry,
             plugin: instance
         )
+        #endif
 
         // Phase 8.13: Install the Flutter asset resolver block.
         //

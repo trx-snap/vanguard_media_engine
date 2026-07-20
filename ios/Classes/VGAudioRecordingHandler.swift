@@ -1,77 +1,37 @@
 // VGAudioRecordingHandler.swift
-// Vanguard Media Engine — Audio Slice N
+// Vanguard Media Engine — Audio Slice O
 //
-// Swift orchestrator for startAudioRecording / stopAudioRecording MethodChannel
-// calls. Manages AVAudioSession transitions, preview recovery, and ObjC capture.
+// State machine:
+//   idle                — ready for startAudioRecording.
+//   starting            — PlayAndRecord + preview recovery + recorder start.
+//   recording           — active capture.
+//   stopping            — user-initiated stop in progress.
+//   suspended           — paused by a lifecycle event.
+//   terminalResultPending — cached system-terminated take awaits retrieval.
+//   blocked             — session state unknown; normalization required.
 //
-// ── Handler state machine (main-thread confined) ──────────────────────────────
-//   idle      — ready to accept startAudioRecording.
-//   starting  — PlayAndRecord switch + preview recovery + recorder start in
-//               progress. Rejects new start (START_IN_PROGRESS) and stop
-//               (START_IN_PROGRESS).
-//   recording — active recording. Accepts stopAudioRecording only.
-//   stopping  — stopRecording + restorePlayback + preview recovery in progress.
-//               Rejects new start (STOP_IN_PROGRESS) and stop (STOP_IN_PROGRESS).
-//   blocked   — coordinator state unknown. Normalization required before any
-//               new start. Stop rejects with SESSION_STATE_UNKNOWN.
+// FlutterResult ownership rule:
+//   Every entry point that begins an async operation stores `result` in
+//   `pendingResult` BEFORE the first async call. Every consuming path does:
+//       let cb = pendingResult; pendingResult = nil; cb?(value)
+//   Synchronous guard/validation returns may fire `result` directly (they
+//   return before ownership is acquired).
 //
-// ── State-guard priority ──────────────────────────────────────────────────────
-//   State guards always come first in handleStart / handleStop so that
-//   duplicate-operation error codes (START_IN_PROGRESS, ALREADY_RECORDING,
-//   STOP_IN_PROGRESS) are returned consistently regardless of runtime presence
-//   or argument validity.
+// Generation scheme:
+//   operationGeneration — guards start-path async recovery only.
+//     Incremented: at the start of _performStart, on lifecycle preemption of
+//     .starting, and on lifecycle preemption of blocked-start recovery.
+//   cleanupGeneration   — guards stop cleanup preview-recovery only.
+//     Incremented: when _performCleanupWithMetadata begins, on lifecycle
+//     takeover of .stopping.
+//   Recorder-stop callbacks are NEVER generation-guarded.
 //
-// ── Start sequence ────────────────────────────────────────────────────────────
-//   1. State guards (before runtime / outputPath validation).
-//   2. Runtime and outputPath validation.
-//   3. If blocked → _handleStartFromBlocked.
-//   4. coordinator.switchToPlayAndRecord()
-//   5. captureRouteSnapshot() — before preview recovery.
-//   6. If inputAvailable == false: _performCleanup → NO_INPUT_AVAILABLE.
-//   7. previewRecovery(handle) — injected seam.
-//   8. recorder.startRecording(handle:outputPath:) — no headphonesConnected.
-//   9. state = .recording; return start result map.
+// Stop metadata ownership rule:
+//   Stored to pendingStopInfo/pendingStopError immediately when the recorder-
+//   stop callback fires, before any cleanup begins. Cleared exactly once by
+//   whichever path delivers the result (normal cleanup or lifecycle takeover).
 //
-// ── Stop sequence ─────────────────────────────────────────────────────────────
-//   1. State guards (before activeRecorder check).
-//   2. Recorder-presence check → if absent, _performCleanup then NOT_RECORDING.
-//   3. recorder.stopRecording()
-//   4. _performCleanup — shared async cleanup.
-//   5. Return stop result map with nested transitionStatus.
-//
-// ── Blocked-start behaviour ───────────────────────────────────────────────────
-//   normalization failure:
-//     • Do NOT call _performCleanup / restorePlayback / normalization again.
-//     • Remain blocked.
-//     • Best-effort preview recovery (injected seam) only.
-//     • Return SESSION_STATE_UNKNOWN after that attempt.
-//   normalization success:
-//     • Recover preview under Playback.
-//     • If recovery succeeds → continue with _performStart.
-//     • If recovery fails → _performCleanup → ENGINE_RECOVERY_FAILED (no start).
-//
-// ── Shared cleanup (_performCleanup) ─────────────────────────────────────────
-//   • restorePlayback → if failure, normalizationAttempt.
-//   • Preview recovery runs AFTER the final category mutation.
-//   • State set from sessionRestored: true→idle, false→blocked.
-//     This means a failedUnknown that later restores cleanly finishes idle.
-//   • runtime=nil: previewRecovered=false, previewErrorCode="RECOVERY_RUNTIME_NIL".
-//   • result fires exactly once, directly inside the recovery completion
-//     (no extra main-queue hop — recovery callbacks already fire on main).
-//
-// ── Result contracts ──────────────────────────────────────────────────────────
-//   Start success:
-//     { filePath, startPTS, isHeadphonesConnected, audioRoute: routeSnapshot.toMap() }
-//
-//   Stop success (even when transitionStatus shows failure):
-//     { filePath, startPTS, durationSeconds,
-//       transitionStatus: { sessionRestored, previewRecovered,
-//                           sessionErrorCode?, previewErrorCode? } }
-//
-//   STOP_FAILED only when recorder stop itself fails or returns no metadata.
-//
-// Threading: all public methods must be called on the main thread.
-//            Recovery callbacks are guaranteed to fire on the main thread.
+// Threading: all public methods on main thread; recovery callbacks on main.
 
 import Flutter
 
@@ -79,66 +39,26 @@ import Flutter
 
 // MARK: - Testable seam protocols
 
-// ── Runtime handle ────────────────────────────────────────────────────────────
-
-/// Opaque handle to an active timeline runtime.
-/// VanguardGraphRuntime conforms to this protocol so tests can supply a fake
-/// handle without constructing a real graph runtime.
-///
-/// The protocol carries no methods — it is a marker that travels through the
-/// handler's seam boundary. The preview-recovery closure and the recorder
-/// adapter are each responsible for casting it to the concrete type they need.
 @objc protocol VGRuntimeHandle: AnyObject {}
-
 extension VanguardGraphRuntime: VGRuntimeHandle {}
 
-// ── Recorder control ──────────────────────────────────────────────────────────
-
-/// Controls a single recording session.
-/// Production implementation wraps VanguardAudioRecorder.
-/// Tests inject a stub that never touches hardware or the graph runtime.
 protocol VGRecorderControl: AnyObject {
     var isRecording: Bool { get }
-    /// Starts recording to outputPath using handle for PTS computation.
-    /// Returns VGAudioRecordingStartInfo on success; throws on failure.
     func startRecording(handle: VGRuntimeHandle,
                         outputPath: String) throws -> VGAudioRecordingStartInfo
-    /// Stops the active recording. Completion fires on main thread.
     func stopRecording(completion: @escaping (VGAudioRecordingStopInfo?, Error?) -> Void)
-    /// Cancels without result. Idempotent.
     func cancelRecording()
 }
 
-// ── Recorder factory ──────────────────────────────────────────────────────────
-
-/// Builds a VGRecorderControl for a new recording session.
-/// Inject a stub in tests to avoid microphone access.
 protocol VGRecorderFactory {
     func makeRecorder() -> VGRecorderControl
 }
 
-// ── Preview recovery ──────────────────────────────────────────────────────────
-
-/// Recovers the audio preview engine after an AVAudioSession category
-/// transition. Takes a VGRuntimeHandle so tests can exercise the seam
-/// without a real VanguardGraphRuntime.
-///
-/// The closure must call completion on the main thread.
 typealias VGPreviewRecovery = (
     _ handle: VGRuntimeHandle,
     _ completion: @escaping (Error?) -> Void
 ) -> Void
 
-// ── Flutter error factory ─────────────────────────────────────────────────────
-
-/// Constructs an error value to pass to a FlutterResult callback.
-///
-/// In production this returns a real FlutterError. In unit tests that run
-/// without Flutter.framework loaded into the host process, the factory is
-/// replaced with one that returns a lightweight FakeFlutterError so that
-/// assertions on error codes work without depending on the Objective-C class.
-///
-/// The return type is Any because FlutterResult itself is typed as (Any?) -> Void.
 typealias VGFlutterErrorFactory = (
     _ code: String,
     _ message: String?,
@@ -147,21 +67,14 @@ typealias VGFlutterErrorFactory = (
 
 // MARK: - Production conformances
 
-// ── Production recorder adapter ───────────────────────────────────────────────
-
-/// Production VGRecorderControl — wraps VanguardAudioRecorder.
 private final class _ProductionRecorder: VGRecorderControl {
     private let recorder = VanguardAudioRecorder()
-
     var isRecording: Bool { recorder.isRecording }
 
     func startRecording(handle: VGRuntimeHandle,
                         outputPath: String) throws -> VGAudioRecordingStartInfo {
         guard let runtime = handle as? VanguardGraphRuntime else {
-            // Misconfiguration: production code always passes a real runtime.
-            throw NSError(
-                domain: "VGRecorderErrorDomain",
-                code: 8,
+            throw NSError(domain: "VGRecorderErrorDomain", code: 8,
                 userInfo: [NSLocalizedDescriptionKey:
                     "_ProductionRecorder: handle is not a VanguardGraphRuntime"])
         }
@@ -175,22 +88,13 @@ private final class _ProductionRecorder: VGRecorderControl {
     func cancelRecording() { recorder.cancelRecording() }
 }
 
-// ── Production recorder factory ───────────────────────────────────────────────
-
-/// Production VGRecorderFactory — creates _ProductionRecorder instances.
 private struct _ProductionRecorderFactory: VGRecorderFactory {
     func makeRecorder() -> VGRecorderControl { _ProductionRecorder() }
 }
 
-// ── Production preview-recovery closure ───────────────────────────────────────
-
-/// Casts handle to VanguardGraphRuntime and forwards to the real engine.
-/// Calls completion with an error on misconfiguration.
 private let _productionPreviewRecovery: VGPreviewRecovery = { handle, completion in
     guard let runtime = handle as? VanguardGraphRuntime else {
-        completion(NSError(
-            domain: "VGRecorderErrorDomain",
-            code: 9,
+        completion(NSError(domain: "VGRecorderErrorDomain", code: 9,
             userInfo: [NSLocalizedDescriptionKey:
                 "previewRecovery: handle is not a VanguardGraphRuntime"]))
         return
@@ -198,59 +102,65 @@ private let _productionPreviewRecovery: VGPreviewRecovery = { handle, completion
     runtime.recoverAudioPreviewAfterSessionTransition(completion: completion)
 }
 
-// ── Production Flutter error factory ─────────────────────────────────────────
-
-/// Production factory — returns a real FlutterError.
 private let _productionFlutterErrorFactory: VGFlutterErrorFactory = { code, message, details in
     FlutterError(code: code, message: message, details: details)
 }
 
 // MARK: - VGAudioRecordingHandler
 
-/// Swift bridge and orchestrator for audio recording MethodChannel calls.
-///
-/// Owned by `VanguardMediaEnginePlugin` as a single retained property.
-/// Instantiate once at plugin registration time.
 final class VGAudioRecordingHandler {
 
-    // ── Handler state ─────────────────────────────────────────────────────────
+    // ── State ────────────────────────────────────────────────────────────────
 
     private enum HandlerState: Equatable {
-        case idle
-        case starting
-        case recording
-        case stopping
-        case blocked
+        case idle, starting, recording, stopping
+        case suspended, terminalResultPending, blocked
     }
-
     private var state: HandlerState = .idle
 
-    // ── Injected dependencies ─────────────────────────────────────────────────
+    // ── Dependencies ─────────────────────────────────────────────────────────
 
-    private let coordinator:         VGAudioSessionTransitionCoordinator
+    let coordinator:         VGAudioSessionTransitionCoordinator
     private let recorderFactory:     VGRecorderFactory
     private let previewRecovery:     VGPreviewRecovery
-    private let flutterErrorFactory: VGFlutterErrorFactory
+    let flutterErrorFactory: VGFlutterErrorFactory
 
     // ── Active recorder ───────────────────────────────────────────────────────
 
-    /// Retained for the lifetime of an active recording.
     private var activeRecorder: VGRecorderControl?
 
-    // ── Initialisers ──────────────────────────────────────────────────────────
+    // ── FlutterResult ownership ───────────────────────────────────────────────
 
-    /// Production init — uses real AVAudioSession backend, real recorder, and
-    /// real preview-recovery via VanguardGraphRuntime.
-    init() {
-        coordinator         = VGAudioSessionTransitionCoordinator()
-        recorderFactory     = _ProductionRecorderFactory()
-        previewRecovery     = _productionPreviewRecovery
-        flutterErrorFactory = _productionFlutterErrorFactory
+    private var pendingResult:       FlutterResult?
+    private var operationGeneration: UInt64 = 0   // start-path only
+    private var cleanupGeneration:   UInt64 = 0   // stop-cleanup only
+
+    // ── Lifecycle suspension ──────────────────────────────────────────────────
+
+    private var lifecycleIsSuspended:      Bool = false
+    private var capturedTerminationReason: VGAudioRecordingTerminationReason?
+    private var storedQuiescenceCompletion: (() -> Void)?
+
+    // ── Stop metadata + terminal result ──────────────────────────────────────
+
+    private var pendingStopInfo:          VGAudioRecordingStopInfo?
+    private var pendingStopError:         Error?
+    private var terminalResult:           VGRecordingTerminalResult?
+    private var terminalDeliveryStateIsIdle: Bool = true
+
+    // MARK: - Init
+
+    init(coordinator: VGAudioSessionTransitionCoordinator) {
+        self.coordinator         = coordinator
+        self.recorderFactory     = _ProductionRecorderFactory()
+        self.previewRecovery     = _productionPreviewRecovery
+        self.flutterErrorFactory = _productionFlutterErrorFactory
     }
 
-    /// Test-injection init — allows fake coordinator, recorder factory,
-    /// preview-recovery closure, and error factory without touching real
-    /// hardware, graph runtime, or Flutter.framework.
+    convenience init() {
+        self.init(coordinator: VGAudioSessionTransitionCoordinator())
+    }
+
     init(coordinator:         VGAudioSessionTransitionCoordinator,
          recorderFactory:     VGRecorderFactory,
          previewRecovery:     @escaping VGPreviewRecovery,
@@ -263,400 +173,493 @@ final class VGAudioRecordingHandler {
 
     // MARK: - handleStart
 
-    /// Handles the `startAudioRecording` MethodChannel call.
-    ///
-    /// Expected args: `{ "outputPath": String }`
     func handleStart(args: [String: Any]?,
                      handle: VGRuntimeHandle?,
                      result: @escaping FlutterResult) {
-
-        // ── State guards come first — before argument validation (Req 4) ──────
         switch state {
         case .starting:
             result(flutterErrorFactory("START_IN_PROGRESS",
-                                       "startAudioRecording: a start is already in progress",
-                                       nil))
-            return
+                "startAudioRecording: a start is already in progress", nil)); return
         case .recording:
             result(flutterErrorFactory("ALREADY_RECORDING",
-                                       "startAudioRecording: a recording is already active. Call stopAudioRecording first.",
-                                       nil))
-            return
+                "startAudioRecording: a recording is already active.", nil)); return
         case .stopping:
             result(flutterErrorFactory("STOP_IN_PROGRESS",
-                                       "startAudioRecording: a stop is currently in progress",
-                                       nil))
-            return
+                "startAudioRecording: a stop is currently in progress", nil)); return
+        case .suspended:
+            result(flutterErrorFactory("LIFECYCLE_SUSPENDED",
+                "startAudioRecording: audio lifecycle is suspended", nil)); return
+        case .terminalResultPending:
+            result(flutterErrorFactory("STOP_RESULT_PENDING",
+                "startAudioRecording: a previous system-terminated result has not been retrieved",
+                nil)); return
         case .blocked, .idle:
             break
         }
 
-        // ── Argument validation (after state guards) ──────────────────────────
-
         guard let handle = handle else {
             result(flutterErrorFactory("NO_TIMELINE",
-                                       "startAudioRecording: no active timeline runtime",
-                                       nil))
-            return
+                "startAudioRecording: no active timeline runtime", nil)); return
         }
-
         guard let outputPath = args?["outputPath"] as? String, !outputPath.isEmpty else {
             result(flutterErrorFactory("INVALID_ARG",
-                                       "startAudioRecording: outputPath is required and must be non-empty",
-                                       nil))
-            return
+                "startAudioRecording: outputPath is required and must be non-empty", nil)); return
         }
-
-        // ── Route to blocked or normal start ──────────────────────────────────
 
         if state == .blocked {
-            _handleStartFromBlocked(handle: handle,
-                                    outputPath: outputPath,
-                                    result: result)
+            _handleStartFromBlocked(handle: handle, outputPath: outputPath, result: result)
             return
         }
-
-        // state == .idle
         _performStart(handle: handle, outputPath: outputPath, result: result)
     }
 
     // MARK: - handleStop
 
-    /// Handles the `stopAudioRecording` MethodChannel call.
     func handleStop(handle: VGRuntimeHandle?, result: @escaping FlutterResult) {
-
-        // ── State guards come first (Req 4) ───────────────────────────────────
         switch state {
         case .idle:
             result(flutterErrorFactory("NOT_RECORDING",
-                                       "stopAudioRecording: no recording is active",
-                                       nil))
-            return
+                "stopAudioRecording: no recording is active", nil)); return
         case .starting:
             result(flutterErrorFactory("START_IN_PROGRESS",
-                                       "stopAudioRecording: a start is currently in progress",
-                                       nil))
-            return
+                "stopAudioRecording: a start is currently in progress", nil)); return
         case .stopping:
             result(flutterErrorFactory("STOP_IN_PROGRESS",
-                                       "stopAudioRecording: a stop is already in progress",
-                                       nil))
-            return
+                "stopAudioRecording: a stop is already in progress", nil)); return
+        case .suspended:
+            result(flutterErrorFactory("STOP_IN_PROGRESS",
+                "stopAudioRecording: recording is suspended; wait for lifecycle recovery",
+                nil)); return
         case .blocked:
             result(flutterErrorFactory("SESSION_STATE_UNKNOWN",
-                                       "stopAudioRecording: session state is unknown; call normalizationAttempt first",
-                                       nil))
-            return
+                "stopAudioRecording: session state is unknown", nil)); return
+        case .terminalResultPending:
+            _deliverTerminalResult(result: result); return
         case .recording:
             break
         }
 
-        // ── Recorder-presence check (Req 5) ───────────────────────────────────
-        // State is .recording but recorder is absent or not running.
-        // Run shared cleanup before returning so PlayAndRecord is not left
-        // active, then surface NOT_RECORDING.
         guard let recorder = activeRecorder, recorder.isRecording else {
-            NSLog("[VGAudioRecordingHandler] state=recording but recorder absent/inactive — running cleanup")
+            NSLog("[VGAudioRecordingHandler] state=recording but recorder absent — cleanup")
             state = .stopping
-            _performCleanup(handle: handle) { [weak self] _, _, _, _ in
+            pendingResult = result          // Acquire ownership before first async call.
+            activeRecorder = nil            // Clear synchronously so quiescence check in
+                                            // suspendForLifecycle sees nil immediately.
+            cleanupGeneration += 1
+            let capturedCleanupGen = cleanupGeneration
+            _performCleanup(handle: handle) { [weak self] sr, _, _, _ in
                 guard let self = self else { return }
-                self.activeRecorder = nil
-                result(self.flutterErrorFactory("NOT_RECORDING",
-                                                "stopAudioRecording: recorder is not active",
-                                                nil))
+                // Generation guard before any state mutation or result delivery.
+                guard self.cleanupGeneration == capturedCleanupGen else { return }
+                self.state = sr ? .idle : .blocked
+                let cb = self.pendingResult; self.pendingResult = nil
+                cb?(self.flutterErrorFactory("NOT_RECORDING",
+                    "stopAudioRecording: recorder is not active", nil))
             }
             return
         }
 
         state = .stopping
+        pendingResult = result   // ← owned before first async call
 
         recorder.stopRecording { [weak self] info, objcErr in
             guard let self = self else { return }
+            // Always store metadata immediately — never generation-guarded.
+            self.pendingStopInfo  = info
+            self.pendingStopError = objcErr
+            self.activeRecorder   = nil
 
-            // Capture stop metadata before cleanup — must survive session failures.
-            let stopInfo = info
-            let stopErr  = objcErr
-
-            // Shared async cleanup: restorePlayback → recovery → state → result.
-            self._performCleanup(handle: handle) { [weak self] sessionRestored, sessionErrCode,
-                                                               previewRecovered, previewErrCode in
-                guard let self = self else { return }
-
-                self.activeRecorder = nil
-
-                if let err = stopErr {
-                    let nsErr = err as NSError
-                    result(self.flutterErrorFactory("STOP_FAILED",
-                                                    err.localizedDescription,
-                                                    "\(nsErr.domain):\(nsErr.code)"))
-                    return
+            if self.lifecycleIsSuspended {
+                // Lifecycle took over during our stop. Signal quiescence so
+                // completeLifecycleRecovery can deliver via pendingResult.
+                if let cb = self.storedQuiescenceCompletion {
+                    self.storedQuiescenceCompletion = nil
+                    cb()
                 }
-
-                guard let info = stopInfo else {
-                    result(self.flutterErrorFactory("STOP_FAILED",
-                                                    "stopAudioRecording: recorder returned no metadata",
-                                                    nil))
-                    return
-                }
-
-                var transitionStatus: [String: Any] = [
-                    "sessionRestored":  sessionRestored,
-                    "previewRecovered": previewRecovered,
-                ]
-                if let code = sessionErrCode { transitionStatus["sessionErrorCode"] = code }
-                if let code = previewErrCode { transitionStatus["previewErrorCode"] = code }
-
-                result([
-                    "filePath":         info.filePath,
-                    "startPTS":         info.startPTS,
-                    "durationSeconds":  info.durationSeconds,
-                    "transitionStatus": transitionStatus,
-                ] as [String: Any])
+                return
             }
+            // Normal path: run cleanup and deliver via pendingResult.
+            self._performCleanupWithMetadata(handle: handle, reason: nil)
         }
     }
 
-    // MARK: - Private: blocked normalisation path
+    // MARK: - Private: terminal result delivery
 
-    /// Handles handleStart when the handler is in the .blocked state.
-    ///
-    /// normalization failure:
-    ///   • Do not call _performCleanup / restorePlayback / normalization again.
-    ///   • Remain blocked.
-    ///   • Best-effort preview recovery (injected seam) only.
-    ///   • Return SESSION_STATE_UNKNOWN after that attempt.
-    ///
-    /// normalization success:
-    ///   • state = .starting to prevent re-entry during async recovery.
-    ///   • Recover preview under Playback.
-    ///   • If recovery succeeds → _performStart.
-    ///   • If recovery fails → _performCleanup (session is Playback) →
-    ///     ENGINE_RECOVERY_FAILED.
+    private func _deliverTerminalResult(result: @escaping FlutterResult) {
+        guard let terminal = terminalResult else {
+            result(flutterErrorFactory("INTERNAL_ERROR",
+                "stopAudioRecording: terminal result state is corrupt", nil)); return
+        }
+        terminalResult = nil
+        state = terminalDeliveryStateIsIdle ? .idle : .blocked
+
+        if let failDetail = terminal.stopFailedDetail() {
+            result(flutterErrorFactory("STOP_FAILED", failDetail.message, failDetail.details))
+            return
+        }
+        if let map = terminal.toResultMap() {
+            result(map)
+        } else {
+            result(flutterErrorFactory("STOP_FAILED",
+                "stopAudioRecording: terminal result has no metadata", nil))
+        }
+    }
+
+    // MARK: - Private: blocked-start path
+
     private func _handleStartFromBlocked(handle: VGRuntimeHandle,
                                          outputPath: String,
                                          result: @escaping FlutterResult) {
         let normOutcome = coordinator.normalizationAttempt()
 
         guard normOutcome.status == .success else {
-            // Normalization failed — stay blocked, best-effort recovery only.
-            NSLog("[VGAudioRecordingHandler] normalization failed from blocked: \(normOutcome.primaryError?.localizedDescription ?? "unknown")")
+            NSLog("[VGAudioRecordingHandler] normalization failed from blocked")
+            // Best-effort recovery only; state stays .blocked.
+            // No ownership acquired — returns synchronously before async.
             previewRecovery(handle) { [weak self] _ in
                 guard let self = self else { return }
-                // state remains .blocked — do not touch it.
                 result(self.flutterErrorFactory("SESSION_STATE_UNKNOWN",
-                                                "startAudioRecording: session state is unknown and normalization failed",
-                                                nil))
+                    "startAudioRecording: session state is unknown and normalization failed",
+                    nil))
             }
             return
         }
 
-        // Normalization succeeded — session is in Playback.
-        // Recover preview before attempting a new recording.
-        NSLog("[VGAudioRecordingHandler] normalization succeeded; recovering preview before re-start")
-        state = .starting  // block re-entry during async recovery
+        NSLog("[VGAudioRecordingHandler] normalization succeeded; recovering preview")
+        state = .starting
+        // Acquire pendingResult ownership before the async recovery call.
+        operationGeneration += 1
+        let capturedGen = operationGeneration
+        pendingResult = result
 
         previewRecovery(handle) { [weak self] recoveryErr in
             guard let self = self else { return }
-
+            guard self.operationGeneration == capturedGen else {
+                // Lifecycle preempted this blocked-start recovery.
+                // pendingResult was already consumed by suspendForLifecycle.
+                return
+            }
             if let err = recoveryErr {
-                NSLog("[VGAudioRecordingHandler] preview recovery after normalization failed: \(err)")
-                // Session is in Playback — perform cleanup and surface error.
-                self._performCleanup(handle: handle) { [weak self] _, _, _, _ in
+                NSLog("[VGAudioRecordingHandler] blocked-start preview recovery failed: \(err)")
+                self._performCleanup(handle: handle) { [weak self] sr, _, _, _ in
                     guard let self = self else { return }
-                    result(self.flutterErrorFactory("ENGINE_RECOVERY_FAILED",
-                                                    err.localizedDescription,
-                                                    nil))
+                    guard self.operationGeneration == capturedGen else { return }
+                    self.state = sr ? .idle : .blocked
+                    let cb = self.pendingResult; self.pendingResult = nil
+                    cb?(self.flutterErrorFactory("ENGINE_RECOVERY_FAILED",
+                        err.localizedDescription, nil))
                 }
                 return
             }
-
-            // Recovery succeeded — proceed to start.
-            self._performStart(handle: handle, outputPath: outputPath, result: result)
+            // Recover succeeded — proceed to start. Transfer pendingResult to
+            // _performStart which will immediately re-acquire ownership.
+            guard let cb = self.pendingResult else {
+                NSLog("[VGAudioRecordingHandler] blocked-start: pendingResult nil after gen guard")
+                return
+            }
+            self.pendingResult = nil
+            self._performStart(handle: handle, outputPath: outputPath, result: cb)
         }
     }
 
-    // MARK: - Private: normal start sequence
+    // MARK: - Private: normal start
 
     private func _performStart(handle: VGRuntimeHandle,
                                outputPath: String,
                                result: @escaping FlutterResult) {
         state = .starting
+        // Acquire ownership before the first async call.
+        operationGeneration += 1
+        let capturedGen = operationGeneration
+        pendingResult = result
 
-        // Step 1: Switch AVAudioSession to PlayAndRecord.
         let sessionOutcome = coordinator.switchToPlayAndRecord()
-
         guard sessionOutcome.status == .success else {
             let errMsg = sessionOutcome.primaryError?.localizedDescription
                 ?? "PlayAndRecord activation failed"
-
             switch sessionOutcome.status {
             case .failedNoMutation:
-                // Nothing mutated — go idle immediately, no recovery needed.
+                // Synchronous failure; no cleanup needed. State → .idle.
                 state = .idle
-                result(flutterErrorFactory("SESSION_ACTIVATION_FAILED", errMsg, nil))
-            case .failedKnownPlayback:
-                // Rolled back to Playback — cleanup owns the state transition.
-                _performCleanup(handle: handle) { [weak self] _, _, _, _ in
+                let cb = pendingResult; pendingResult = nil
+                cb?(flutterErrorFactory("SESSION_ACTIVATION_FAILED", errMsg, nil))
+            default:
+                _performCleanup(handle: handle) { [weak self] sr, _, _, _ in
                     guard let self = self else { return }
-                    result(self.flutterErrorFactory("SESSION_ACTIVATION_FAILED", errMsg, nil))
-                }
-            case .failedUnknown:
-                // Unknown — cleanup will set .blocked via sessionRestored=false.
-                // Do NOT pre-set .blocked; let cleanup own the transition so
-                // a successful restore here finishes idle (Req 2).
-                _performCleanup(handle: handle) { [weak self] _, _, _, _ in
-                    guard let self = self else { return }
-                    result(self.flutterErrorFactory("SESSION_ACTIVATION_FAILED", errMsg, nil))
-                }
-            case .success:
-                break  // not reached
-            @unknown default:
-                _performCleanup(handle: handle) { [weak self] _, _, _, _ in
-                    guard let self = self else { return }
-                    result(self.flutterErrorFactory("SESSION_ACTIVATION_FAILED", errMsg, nil))
+                    guard self.operationGeneration == capturedGen else { return }
+                    self.state = sr ? .idle : .blocked
+                    let cb = self.pendingResult; self.pendingResult = nil
+                    cb?(self.flutterErrorFactory("SESSION_ACTIVATION_FAILED", errMsg, nil))
                 }
             }
             return
         }
 
-        // Step 2: Capture route snapshot — before preview recovery.
         let routeSnapshot = coordinator.captureRouteSnapshot()
-
-        // Step 3: Gate on input availability.
-        if !routeSnapshot.inputAvailable {
-            NSLog("[VGAudioRecordingHandler] no input available after PlayAndRecord; aborting")
-            _performCleanup(handle: handle) { [weak self] _, _, _, _ in
+        guard routeSnapshot.inputAvailable else {
+            NSLog("[VGAudioRecordingHandler] no input available after PlayAndRecord")
+            _performCleanup(handle: handle) { [weak self] sr, _, _, _ in
                 guard let self = self else { return }
-                result(self.flutterErrorFactory("NO_INPUT_AVAILABLE",
-                                               "startAudioRecording: no audio input available after PlayAndRecord activation",
-                                               nil))
+                guard self.operationGeneration == capturedGen else { return }
+                self.state = sr ? .idle : .blocked
+                let cb = self.pendingResult; self.pendingResult = nil
+                cb?(self.flutterErrorFactory("NO_INPUT_AVAILABLE",
+                    "startAudioRecording: no audio input available", nil))
             }
             return
         }
 
-        // Step 4: Recover preview under PlayAndRecord.
         previewRecovery(handle) { [weak self] engineErr in
             guard let self = self else { return }
-
+            guard self.operationGeneration == capturedGen else {
+                // Lifecycle preempted this start; pendingResult already consumed.
+                return
+            }
             if let err = engineErr {
-                NSLog("[VGAudioRecordingHandler] preview recovery under PlayAndRecord failed: \(err)")
-                self._performCleanup(handle: handle) { [weak self] _, _, _, _ in
+                NSLog("[VGAudioRecordingHandler] preview recovery under PlayAndRecord failed")
+                self._performCleanup(handle: handle) { [weak self] sr, _, _, _ in
                     guard let self = self else { return }
-                    result(self.flutterErrorFactory("ENGINE_RECOVERY_FAILED",
-                                                    err.localizedDescription,
-                                                    nil))
+                    guard self.operationGeneration == capturedGen else { return }
+                    self.state = sr ? .idle : .blocked
+                    let cb = self.pendingResult; self.pendingResult = nil
+                    cb?(self.flutterErrorFactory("ENGINE_RECOVERY_FAILED",
+                        err.localizedDescription, nil))
                 }
                 return
             }
 
-            // Step 5: Start capture.
             let recorder = self.recorderFactory.makeRecorder()
             do {
                 let info = try recorder.startRecording(handle: handle, outputPath: outputPath)
-
                 self.activeRecorder = recorder
                 self.state = .recording
-
-                let map: [String: Any] = [
-                    "filePath":              info.filePath,
-                    "startPTS":              info.startPTS,
-                    "isHeadphonesConnected": routeSnapshot.hasHeadphoneOutput,
-                    "audioRoute":            routeSnapshot.toMap(),
-                ]
-                result(map)
-
+                let cb = self.pendingResult; self.pendingResult = nil
+                cb?(["filePath":              info.filePath,
+                     "startPTS":              info.startPTS,
+                     "isHeadphonesConnected": routeSnapshot.hasHeadphoneOutput,
+                     "audioRoute":            routeSnapshot.toMap()] as [String: Any])
             } catch {
                 let nsErr = error as NSError
-                NSLog("[VGAudioRecordingHandler] recorder.startRecording failed: \(error)")
-                self._performCleanup(handle: handle) { [weak self] _, _, _, _ in
+                self._performCleanup(handle: handle) { [weak self] sr, _, _, _ in
                     guard let self = self else { return }
-                    result(self.flutterErrorFactory("RECORDING_FAILED",
-                                                    error.localizedDescription,
-                                                    "\(nsErr.domain):\(nsErr.code)"))
+                    guard self.operationGeneration == capturedGen else { return }
+                    self.state = sr ? .idle : .blocked
+                    let cb = self.pendingResult; self.pendingResult = nil
+                    cb?(self.flutterErrorFactory("RECORDING_FAILED",
+                        error.localizedDescription, "\(nsErr.domain):\(nsErr.code)"))
                 }
             }
         }
     }
 
-    // MARK: - Private: shared async cleanup
+    // MARK: - Private: cleanup after stop metadata is cached
 
-    /// Shared cleanup for start-failure and stop paths.
-    ///
-    /// 1. coordinator.restorePlayback()
-    /// 2. If restoration fails → coordinator.normalizationAttempt()
-    /// 3. Preview recovery runs after the final category mutation (injected seam).
-    /// 4. State set from sessionRestored:
-    ///      true  → .idle  (even when the caller previously set .blocked)
-    ///      false → .blocked
-    ///    This ensures failedUnknown followed by a successful restore finishes idle.
-    /// 5. handle=nil → previewRecovered=false, previewErrorCode="RECOVERY_RUNTIME_NIL".
-    /// 6. result fires exactly once, directly inside the recovery completion.
-    ///    Recovery callbacks fire on the main thread; no extra hop is needed.
-    ///
-    /// - Parameters:
-    ///   - handle: nil is handled — previewRecovered=false, code="RECOVERY_RUNTIME_NIL".
-    ///   - completion: (sessionRestored, sessionErrCode, previewRecovered, previewErrCode)
+    /// Runs session restore + preview recovery using pre-cached pendingStopInfo/Error.
+    /// Delivers via pendingResult exactly once. Clears metadata after use.
+    private func _performCleanupWithMetadata(
+        handle: VGRuntimeHandle?,
+        reason: VGAudioRecordingTerminationReason?
+    ) {
+        cleanupGeneration += 1
+        let capturedCleanupGen = cleanupGeneration
+
+        _performCleanup(handle: handle) { [weak self] sr, sec, pr, pec in
+            guard let self = self else { return }
+            // Generation guard BEFORE any state mutation or result delivery.
+            guard self.cleanupGeneration == capturedCleanupGen else { return }
+
+            // Generation validated: commit state, consume metadata, deliver result.
+            self.state = sr ? .idle : .blocked
+
+            let stopInfo  = self.pendingStopInfo
+            let stopErr   = self.pendingStopError
+            self.pendingStopInfo  = nil
+            self.pendingStopError = nil
+
+            let cb = self.pendingResult; self.pendingResult = nil
+            if let err = stopErr {
+                let nsErr = err as NSError
+                cb?(self.flutterErrorFactory("STOP_FAILED",
+                    err.localizedDescription, "\(nsErr.domain):\(nsErr.code)"))
+                return
+            }
+            guard let info = stopInfo else {
+                cb?(self.flutterErrorFactory("STOP_FAILED",
+                    "stopAudioRecording: recorder returned no metadata", nil))
+                return
+            }
+            cb?(self._buildStopResultMap(info: info, sr: sr, sec: sec, pr: pr, pec: pec,
+                                         reason: reason))
+        }
+    }
+
+    /// Shared result-map builder for both normal-stop and lifecycle-during-stop paths.
+    private func _buildStopResultMap(
+        info:   VGAudioRecordingStopInfo,
+        sr:     Bool, sec: String?,
+        pr:     Bool, pec: String?,
+        reason: VGAudioRecordingTerminationReason?
+    ) -> [String: Any] {
+        var ts: [String: Any] = ["sessionRestored": sr, "previewRecovered": pr]
+        if let c = sec { ts["sessionErrorCode"] = c }
+        if let c = pec { ts["previewErrorCode"] = c }
+        if let r = reason { ts["terminationReason"] = r.rawValue }
+        return ["filePath": info.filePath, "startPTS": info.startPTS,
+                "durationSeconds": info.durationSeconds, "transitionStatus": ts]
+    }
+
+    // MARK: - Private: session + preview cleanup
+
     private func _performCleanup(
         handle: VGRuntimeHandle?,
-        completion: @escaping (_ sessionRestored: Bool,
-                               _ sessionErrCode: String?,
-                               _ previewRecovered: Bool,
-                               _ previewErrCode: String?) -> Void
+        completion: @escaping (Bool, String?, Bool, String?) -> Void
     ) {
-        // ── Session restoration ───────────────────────────────────────────────
         let restoreOutcome = coordinator.restorePlayback()
         let sessionRestored: Bool
-        let sessionErrCode: String?
+        let sessionErrCode:  String?
 
         if restoreOutcome.status == .success {
-            sessionRestored = true
-            sessionErrCode  = nil
+            sessionRestored = true;  sessionErrCode = nil
         } else {
-            NSLog("[VGAudioRecordingHandler] restorePlayback failed: \(restoreOutcome.primaryError?.localizedDescription ?? "unknown")")
             let normOutcome = coordinator.normalizationAttempt()
             if normOutcome.status == .success {
-                sessionRestored = true
-                sessionErrCode  = nil
-                NSLog("[VGAudioRecordingHandler] normalizationAttempt succeeded")
+                sessionRestored = true;  sessionErrCode = nil
             } else {
-                sessionRestored = false
-                sessionErrCode  = "SESSION_RESTORE_FAILED"
-                NSLog("[VGAudioRecordingHandler] normalizationAttempt also failed — will enter blocked")
+                sessionRestored = false; sessionErrCode = "SESSION_RESTORE_FAILED"
             }
         }
 
-        // ── State is set from sessionRestored, not from prior state (Req 2) ───
-        // This is intentionally deferred into the recovery block below so
-        // that the state is committed atomically with the result call.
-
-        // ── Preview recovery (after the final category mutation) ──────────────
         guard let handle = handle else {
-            // No handle — cannot recover preview.
-            state = sessionRestored ? .idle : .blocked
+            // No async call — caller commits state inside its completion.
             completion(sessionRestored, sessionErrCode, false, "RECOVERY_RUNTIME_NIL")
             return
         }
 
-        previewRecovery(handle) { [weak self] recoveryErr in
+        previewRecovery(handle) { [weak self] err in
             guard let self = self else { return }
-
-            let previewRecovered: Bool
-            let previewErrCode: String?
-
-            if let err = recoveryErr {
-                NSLog("[VGAudioRecordingHandler] preview recovery failed: \(err)")
-                previewRecovered = false
-                previewErrCode   = "PREVIEW_RECOVERY_FAILED"
+            // State is NOT committed here. The owning call site commits state
+            // after validating its relevant generation (operation or cleanup).
+            if err != nil {
+                completion(sessionRestored, sessionErrCode, false, "PREVIEW_RECOVERY_FAILED")
             } else {
-                previewRecovered = true
-                previewErrCode   = nil
+                completion(sessionRestored, sessionErrCode, true, nil)
+            }
+        }
+    }
+}
+
+// MARK: - VGAudioRecordingLifecycleHandling
+
+extension VGAudioRecordingHandler: VGAudioRecordingLifecycleHandling {
+
+    var hasActiveCaptureOperation: Bool {
+        switch state {
+        case .starting, .recording, .stopping: return true
+        default: return false
+        }
+    }
+
+    func suspendForLifecycle(
+        reason:   VGAudioRecordingTerminationReason,
+        quiesced: @escaping () -> Void
+    ) {
+        lifecycleIsSuspended = true
+        if capturedTerminationReason == nil { capturedTerminationReason = reason }
+
+        switch state {
+        case .idle, .blocked:
+            quiesced()
+
+        case .starting:
+            // Stale in-flight start recovery and consume its FlutterResult.
+            operationGeneration += 1
+            activeRecorder?.cancelRecording()
+            activeRecorder = nil
+            let cb = pendingResult; pendingResult = nil
+            cb?(flutterErrorFactory("RECORDING_INTERRUPTED",
+                "startAudioRecording: interrupted by system event", reason.rawValue))
+            state = .suspended
+            quiesced()
+
+        case .recording:
+            state = .suspended
+            guard let recorder = activeRecorder else { quiesced(); return }
+            recorder.stopRecording { [weak self] info, err in
+                guard let self = self else { return }
+                self.pendingStopInfo  = info
+                self.pendingStopError = err
+                self.activeRecorder   = nil
+                quiesced()
             }
 
-            // Commit state from sessionRestored — not from self.state (Req 2).
-            self.state = sessionRestored ? .idle : .blocked
+        case .stopping:
+            // Don't stop recorder again. Stale the cleanup callback.
+            cleanupGeneration += 1
+            storedQuiescenceCompletion = quiesced
+            // If recorder already finished, signal immediately.
+            if activeRecorder == nil {
+                let cb = storedQuiescenceCompletion
+                storedQuiescenceCompletion = nil
+                cb?()
+            }
 
-            // result fires here — on the main thread, no additional hop needed.
-            completion(sessionRestored, sessionErrCode, previewRecovered, previewErrCode)
+        case .suspended, .terminalResultPending:
+            quiesced()
+        }
+    }
+
+    func completeLifecycleRecovery(_ outcome: VGRecordingLifecycleTransition) {
+        lifecycleIsSuspended      = false
+        let reason                = capturedTerminationReason
+        capturedTerminationReason = nil
+
+        switch state {
+        case .suspended:
+            let hadRecording = (pendingStopInfo != nil || pendingStopError != nil)
+            if hadRecording {
+                let terminal = VGRecordingTerminalResult(
+                    stopInfo:            pendingStopInfo,
+                    stopError:           pendingStopError,
+                    terminationReason:   reason ?? .interruption,
+                    lifecycleTransition: outcome)
+                pendingStopInfo  = nil
+                pendingStopError = nil
+                terminalResult   = terminal
+                terminalDeliveryStateIsIdle = outcome.sessionRestored
+                state = .terminalResultPending
+            } else {
+                state = outcome.sessionRestored ? .idle : .blocked
+            }
+
+        case .stopping:
+            // Lifecycle arrived during user stop. Deliver via original pendingResult.
+            let stopInfo = pendingStopInfo
+            let stopErr  = pendingStopError
+            pendingStopInfo  = nil
+            pendingStopError = nil
+            state = outcome.sessionRestored ? .idle : .blocked
+            let cb = pendingResult; pendingResult = nil
+
+            if let err = stopErr {
+                let nsErr = err as NSError
+                cb?(flutterErrorFactory("STOP_FAILED", err.localizedDescription,
+                                        "\(nsErr.domain):\(nsErr.code)"))
+                return
+            }
+            guard let info = stopInfo else {
+                cb?(flutterErrorFactory("STOP_FAILED",
+                    "stopAudioRecording: recorder returned no metadata after lifecycle event",
+                    nil)); return
+            }
+            // terminationReason deliberately omitted: user initiated the stop.
+            cb?(_buildStopResultMap(info: info,
+                sr: outcome.sessionRestored, sec: outcome.sessionErrorCode,
+                pr: outcome.previewRecovered, pec: outcome.previewErrorCode,
+                reason: nil))
+
+        default:
+            NSLog("[VGAudioRecordingHandler] completeLifecycleRecovery unexpected state: \(state)")
+            state = outcome.sessionRestored ? .idle : .blocked
         }
     }
 }

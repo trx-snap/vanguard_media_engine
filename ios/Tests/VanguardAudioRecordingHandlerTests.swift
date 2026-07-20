@@ -77,6 +77,7 @@ private final class FakeRecorderControl: VGRecorderControl {
     }
 
     func stopRecording(completion: @escaping (VGAudioRecordingStopInfo?, Error?) -> Void) {
+        onEvent?("recorderStop")
         if stopRecordingShouldFail {
             completion(nil, NSError(domain: "MockRecorder", code: 202))
         } else {
@@ -95,6 +96,45 @@ private final class FakeRecorderFactory: VGRecorderFactory {
     let stubbedRecorder = FakeRecorderControl()
     func makeRecorder() -> VGRecorderControl {
         return stubbedRecorder
+    }
+}
+
+private final class FakeLifecycleHandler: VGAudioRecordingLifecycleHandling {
+    var hasActiveCaptureOperation = false
+    var suspendForLifecycleCount = 0
+    var suspendForLifecycleReason: VGAudioRecordingTerminationReason?
+    var suspendQuiescedCallback: (() -> Void)?
+    var completeLifecycleRecoveryCount = 0
+    var lastLifecycleTransition: VGRecordingLifecycleTransition?
+
+    func suspendForLifecycle(reason: VGAudioRecordingTerminationReason, quiesced: @escaping () -> Void) {
+        suspendForLifecycleCount += 1
+        suspendForLifecycleReason = reason
+        suspendQuiescedCallback = quiesced
+    }
+
+    func completeLifecycleRecovery(_ outcome: VGRecordingLifecycleTransition) {
+        completeLifecycleRecoveryCount += 1
+        lastLifecycleTransition = outcome
+    }
+}
+
+private final class FakeTimelineLifecycle: VGAudioTimelineLifecycle {
+    var pauseTimelineCount = 0
+    var recoverPreviewCount = 0
+    var recoverPreviewCompletion: ((Error?) -> Void)?
+    var recoverPreviewErr: Error?
+
+    func pauseTimeline() {
+        pauseTimelineCount += 1
+    }
+
+    func recoverPreview(completion: @escaping (Error?) -> Void) {
+        recoverPreviewCount += 1
+        recoverPreviewCompletion = completion
+        if let err = recoverPreviewErr {
+            completion(err)
+        }
     }
 }
 
@@ -514,6 +554,594 @@ final class VanguardAudioRecordingHandlerTests: XCTestCase {
         let expected = ["setCategory", "setActive", "currentRoute", "availableInputs", "previewRecovery", "recorderStart"]
         XCTAssertEqual(trace, expected)
     }
+
+    func testP0StaleStopCleanupHasNoEffect() {
+        backend.availableInputsVal = [VGPortSnapshot(portType: AVAudioSession.Port.builtInMic.rawValue, portName: "mic", uid: "1", selectedDataSourceName: nil)]
+        backend.currentRouteVal = VGRouteSnapshot(inputs: backend.availableInputsVal, outputs: [])
+
+        let startExp = expectation(description: "start success")
+        handler.handleStart(args: ["outputPath": "/tmp/a.m4a"], handle: handle) { _ in startExp.fulfill() }
+        wait(for: [startExp], timeout: 1.0)
+
+        var recoveryCompletion: ((Error?) -> Void)? = nil
+        recoveryBlock = { h, completion in
+            recoveryCompletion = completion
+        }
+
+        let stopExp = expectation(description: "stop callback")
+        handler.handleStop(handle: handle) { res in
+            let map = res as? [String: Any]
+            XCTAssertNotNil(map)
+            let status = map?["transitionStatus"] as? [String: Any]
+            XCTAssertEqual(status?.keys.contains("terminationReason"), false, "User stop should omit terminationReason")
+            XCTAssertEqual(status?["sessionRestored"] as? Bool, true)
+            stopExp.fulfill()
+        }
+
+        let quiescedExp = expectation(description: "quiesced called")
+        handler.suspendForLifecycle(reason: .interruption) {
+            quiescedExp.fulfill()
+        }
+        wait(for: [quiescedExp], timeout: 1.0)
+
+        handler.completeLifecycleRecovery(VGRecordingLifecycleTransition(
+            sessionRestored: true,
+            sessionErrorCode: nil,
+            previewRecovered: true,
+            previewErrorCode: nil
+        ))
+
+        recoveryCompletion?(nil)
+        wait(for: [stopExp], timeout: 1.0)
+
+        recoveryBlock = nil
+
+        let start2Exp = expectation(description: "start 2 success")
+        handler.handleStart(args: ["outputPath": "/tmp/b.m4a"], handle: handle) { res in
+            XCTAssertTrue(res is [String: Any])
+            start2Exp.fulfill()
+        }
+        wait(for: [start2Exp], timeout: 1.0)
+    }
+
+    func testInactiveRecorderLifecyclePreemptionQuiescesAndResolvesExactlyOnce() {
+        // 1. Start recording normally so handler state becomes `.recording` and activeRecorder contains the fake recorder.
+        backend.availableInputsVal = [VGPortSnapshot(portType: AVAudioSession.Port.builtInMic.rawValue, portName: "mic", uid: "1", selectedDataSourceName: nil)]
+        backend.currentRouteVal = VGRouteSnapshot(inputs: backend.availableInputsVal, outputs: [])
+
+        let startExp = expectation(description: "start success")
+        handler.handleStart(args: ["outputPath": "/tmp/a.m4a"], handle: handle) { _ in startExp.fulfill() }
+        wait(for: [startExp], timeout: 1.0)
+
+        // 2. Set the fake recorder’s `isRecording` to false while leaving the recorder object installed.
+        factory.stubbedRecorder.isRecording = false
+
+        // 3. Replace preview recovery with a controlled closure that retains the cleanup completion without firing it.
+        var retainedCleanupCompletion: ((Error?) -> Void)? = nil
+        recoveryBlock = { h, completion in
+            retainedCleanupCompletion = completion
+        }
+
+        // 4. Call handleStop and count all FlutterResult deliveries.
+        var deliveryCount = 0
+        var lastResult: Any? = nil
+        handler.handleStop(handle: handle) { res in
+            deliveryCount += 1
+            lastResult = res
+        }
+
+        // 5. Call suspendForLifecycle(.interruption).
+        let quiescedExp = expectation(description: "quiesced called")
+        handler.suspendForLifecycle(reason: .interruption) {
+            quiescedExp.fulfill()
+        }
+
+        // 6. Assert quiescence occurs promptly and deterministically.
+        wait(for: [quiescedExp], timeout: 1.0)
+
+        // 7. Assert the stop result has not been delivered before lifecycle recovery completes.
+        XCTAssertEqual(deliveryCount, 0, "Stop result should not be delivered before recovery completes")
+
+        // 8. Call completeLifecycleRecovery with a successful session/preview outcome.
+        handler.completeLifecycleRecovery(VGRecordingLifecycleTransition(
+            sessionRestored: true,
+            sessionErrorCode: nil,
+            previewRecovered: true,
+            previewErrorCode: nil
+        ))
+
+        // 9. Assert the original stop result is delivered exactly once.
+        XCTAssertEqual(deliveryCount, 1, "Stop result should be delivered exactly once after recovery")
+
+        // 10. Assert its error code is STOP_FAILED because no recorder metadata exists.
+        XCTAssertEqual(errorCode(lastResult), "STOP_FAILED", "Expected error code STOP_FAILED because metadata is absent")
+
+        // 11. Fire the old retained cleanup completion.
+        XCTAssertNotNil(retainedCleanupCompletion)
+        retainedCleanupCompletion?(nil)
+
+        // 12. Assert delivery count remains exactly one.
+        XCTAssertEqual(deliveryCount, 1, "Delivery count must remain exactly one after staled callback fires")
+
+        // 13. Restore immediate preview recovery.
+        recoveryBlock = nil
+
+        // 14. Start a second recording successfully, proving the stale callback did not corrupt state.
+        let start2Exp = expectation(description: "start 2 success")
+        handler.handleStart(args: ["outputPath": "/tmp/b.m4a"], handle: handle) { res in
+            XCTAssertTrue(res is [String: Any])
+            start2Exp.fulfill()
+        }
+        wait(for: [start2Exp], timeout: 1.0)
+    }
+
+    func testLifecycleDuringStartRecoveryStalesCallback() {
+        backend.availableInputsVal = [VGPortSnapshot(portType: AVAudioSession.Port.builtInMic.rawValue, portName: "mic", uid: "1", selectedDataSourceName: nil)]
+        backend.currentRouteVal = VGRouteSnapshot(inputs: backend.availableInputsVal, outputs: [])
+
+        var startResultCount = 0
+        var lastStartResult: Any? = nil
+        var recoveryCompletion: ((Error?) -> Void)? = nil
+
+        recoveryBlock = { h, completion in
+            recoveryCompletion = completion
+        }
+
+        handler.handleStart(args: ["outputPath": "/tmp/a.m4a"], handle: handle) { res in
+            startResultCount += 1
+            lastStartResult = res
+        }
+
+        XCTAssertNotNil(recoveryCompletion)
+        XCTAssertEqual(startResultCount, 0)
+
+        let quiesceExp = expectation(description: "quiesced")
+        handler.suspendForLifecycle(reason: .interruption) {
+            quiesceExp.fulfill()
+        }
+        wait(for: [quiesceExp], timeout: 1.0)
+
+        XCTAssertEqual(startResultCount, 1)
+        XCTAssertEqual(errorCode(lastStartResult), "RECORDING_INTERRUPTED")
+
+        recoveryCompletion?(nil)
+
+        XCTAssertFalse(factory.stubbedRecorder.isRecording)
+        XCTAssertEqual(startResultCount, 1)
+
+        handler.completeLifecycleRecovery(VGRecordingLifecycleTransition.success)
+        _ = coordinator.forceNormalizePlaybackAfterExternalChange()
+
+        recoveryBlock = nil
+        let start2Exp = expectation(description: "start 2 success")
+        handler.handleStart(args: ["outputPath": "/tmp/b.m4a"], handle: handle) { res in
+            if let err = res as? FakeFlutterError {
+                print("--- testLifecycleDuringStartRecoveryStalesCallback start2 result error code: \(err.code) message: \(err.message ?? "")")
+            } else {
+                print("--- testLifecycleDuringStartRecoveryStalesCallback start2 result: \(res)")
+            }
+            XCTAssertTrue(res is [String: Any])
+            start2Exp.fulfill()
+        }
+        wait(for: [start2Exp], timeout: 1.0)
+    }
+
+    func testLifecycleDuringBlockedStartRecoveryStalesCallback() {
+        backend.activeShouldFail = true
+        backend.rollbackActiveShouldFail = true
+        let startFailExp = expectation(description: "start fails")
+        handler.handleStart(args: ["outputPath": "/tmp/a.m4a"], handle: handle) { _ in startFailExp.fulfill() }
+        wait(for: [startFailExp], timeout: 1.0)
+
+        backend.activeShouldFail = false
+        backend.rollbackActiveShouldFail = false
+        backend.availableInputsVal = [VGPortSnapshot(portType: AVAudioSession.Port.builtInMic.rawValue, portName: "mic", uid: "1", selectedDataSourceName: nil)]
+        backend.currentRouteVal = VGRouteSnapshot(inputs: backend.availableInputsVal, outputs: [])
+
+        var startResultCount = 0
+        var lastStartResult: Any? = nil
+        var recoveryCompletion: ((Error?) -> Void)? = nil
+
+        recoveryBlock = { h, completion in
+            recoveryCompletion = completion
+        }
+
+        handler.handleStart(args: ["outputPath": "/tmp/b.m4a"], handle: handle) { res in
+            startResultCount += 1
+            lastStartResult = res
+        }
+
+        XCTAssertNotNil(recoveryCompletion)
+        XCTAssertEqual(startResultCount, 0)
+
+        let quiesceExp = expectation(description: "quiesced")
+        handler.suspendForLifecycle(reason: .interruption) {
+            quiesceExp.fulfill()
+        }
+        wait(for: [quiesceExp], timeout: 1.0)
+
+        XCTAssertEqual(startResultCount, 1)
+        XCTAssertEqual(errorCode(lastStartResult), "RECORDING_INTERRUPTED")
+
+        recoveryCompletion?(nil)
+
+        XCTAssertFalse(factory.stubbedRecorder.isRecording)
+        XCTAssertEqual(startResultCount, 1)
+    }
+
+    func testSystemTerminationDuringActiveRecording() {
+        backend.availableInputsVal = [VGPortSnapshot(portType: AVAudioSession.Port.builtInMic.rawValue, portName: "mic", uid: "1", selectedDataSourceName: nil)]
+        backend.currentRouteVal = VGRouteSnapshot(inputs: backend.availableInputsVal, outputs: [])
+
+        let startExp = expectation(description: "start success")
+        handler.handleStart(args: ["outputPath": "/tmp/a.m4a"], handle: handle) { _ in startExp.fulfill() }
+        wait(for: [startExp], timeout: 1.0)
+
+        var stopCallbackCount = 0
+        factory.stubbedRecorder.onEvent = { event in
+            if event == "recorderStop" {
+                stopCallbackCount += 1
+            }
+        }
+
+        let quiesceExp = expectation(description: "quiesced")
+        handler.suspendForLifecycle(reason: .interruption) {
+            quiesceExp.fulfill()
+        }
+        wait(for: [quiesceExp], timeout: 1.0)
+
+        XCTAssertEqual(stopCallbackCount, 1)
+
+        handler.completeLifecycleRecovery(VGRecordingLifecycleTransition.success)
+
+        let stopExp = expectation(description: "stop terminal result")
+        handler.handleStop(handle: handle) { res in
+            let map = res as? [String: Any]
+            XCTAssertNotNil(map)
+            XCTAssertEqual(map?["filePath"] as? String, "/tmp/mock.m4a")
+            let ts = map?["transitionStatus"] as? [String: Any]
+            XCTAssertEqual(ts?["terminationReason"] as? String, "interruption")
+            stopExp.fulfill()
+        }
+        wait(for: [stopExp], timeout: 1.0)
+    }
+
+    func testRecoveryFailureAfterSystemTermination() {
+        backend.availableInputsVal = [VGPortSnapshot(portType: AVAudioSession.Port.builtInMic.rawValue, portName: "mic", uid: "1", selectedDataSourceName: nil)]
+        backend.currentRouteVal = VGRouteSnapshot(inputs: backend.availableInputsVal, outputs: [])
+
+        let startExp = expectation(description: "start success")
+        handler.handleStart(args: ["outputPath": "/tmp/a.m4a"], handle: handle) { _ in startExp.fulfill() }
+        wait(for: [startExp], timeout: 1.0)
+
+        let quiesceExp = expectation(description: "quiesced")
+        handler.suspendForLifecycle(reason: .interruption) {
+            quiesceExp.fulfill()
+        }
+        wait(for: [quiesceExp], timeout: 1.0)
+
+        handler.completeLifecycleRecovery(VGRecordingLifecycleTransition.sessionFailed(code: "ERR"))
+
+        let stopExp = expectation(description: "stop terminal failure")
+        handler.handleStop(handle: handle) { res in
+            let map = res as? [String: Any]
+            XCTAssertNotNil(map)
+            let ts = map?["transitionStatus"] as? [String: Any]
+            XCTAssertEqual(ts?["sessionRestored"] as? Bool, false)
+            stopExp.fulfill()
+        }
+        wait(for: [stopExp], timeout: 1.0)
+
+        let start2Exp = expectation(description: "start fails from blocked")
+        backend.categoryShouldFail = true
+        handler.handleStart(args: ["outputPath": "/tmp/b.m4a"], handle: handle) { res in
+            XCTAssertEqual(self.errorCode(res), "SESSION_STATE_UNKNOWN")
+            start2Exp.fulfill()
+        }
+        wait(for: [start2Exp], timeout: 1.0)
+    }
+
+    func testUserStopPreemptedByLifecycle() {
+        backend.availableInputsVal = [VGPortSnapshot(portType: AVAudioSession.Port.builtInMic.rawValue, portName: "mic", uid: "1", selectedDataSourceName: nil)]
+        backend.currentRouteVal = VGRouteSnapshot(inputs: backend.availableInputsVal, outputs: [])
+
+        let startExp = expectation(description: "start success")
+        handler.handleStart(args: ["outputPath": "/tmp/a.m4a"], handle: handle) { _ in startExp.fulfill() }
+        wait(for: [startExp], timeout: 1.0)
+
+        var stopCallbackCount = 0
+        factory.stubbedRecorder.onEvent = { event in
+            if event == "recorderStop" {
+                stopCallbackCount += 1
+            }
+        }
+
+        // Block cleanup so preemption can happen during stopping
+        var recoveryCompletion: ((Error?) -> Void)? = nil
+        recoveryBlock = { h, completion in
+            recoveryCompletion = completion
+        }
+
+        var stopResultCount = 0
+        var stopResult: Any? = nil
+
+        handler.handleStop(handle: handle) { res in
+            stopResultCount += 1
+            stopResult = res
+        }
+
+        let quiesceExp = expectation(description: "quiesced")
+        handler.suspendForLifecycle(reason: .interruption) {
+            quiesceExp.fulfill()
+        }
+        wait(for: [quiesceExp], timeout: 1.0)
+
+        XCTAssertEqual(stopCallbackCount, 1)
+        XCTAssertEqual(stopResultCount, 0)
+
+        handler.completeLifecycleRecovery(VGRecordingLifecycleTransition.success)
+
+        recoveryCompletion?(nil) // Fire stale cleanup callback
+
+        XCTAssertEqual(stopResultCount, 1)
+        let map = stopResult as? [String: Any]
+        XCTAssertNotNil(map)
+        let ts = map?["transitionStatus"] as? [String: Any]
+        XCTAssertNil(ts?["terminationReason"])
+    }
+
+    func testFirstTerminationReasonWins() {
+        backend.availableInputsVal = [VGPortSnapshot(portType: AVAudioSession.Port.builtInMic.rawValue, portName: "mic", uid: "1", selectedDataSourceName: nil)]
+        backend.currentRouteVal = VGRouteSnapshot(inputs: backend.availableInputsVal, outputs: [])
+
+        let startExp = expectation(description: "start success")
+        handler.handleStart(args: ["outputPath": "/tmp/a.m4a"], handle: handle) { _ in startExp.fulfill() }
+        wait(for: [startExp], timeout: 1.0)
+
+        let q1 = expectation(description: "q1")
+        handler.suspendForLifecycle(reason: .interruption) {
+            q1.fulfill()
+        }
+        wait(for: [q1], timeout: 1.0)
+
+        let q2 = expectation(description: "q2")
+        handler.suspendForLifecycle(reason: .background) {
+            q2.fulfill()
+        }
+        wait(for: [q2], timeout: 1.0)
+
+        handler.completeLifecycleRecovery(VGRecordingLifecycleTransition.success)
+
+        let stopExp = expectation(description: "stop")
+        handler.handleStop(handle: handle) { res in
+            let map = res as? [String: Any]
+            let ts = map?["transitionStatus"] as? [String: Any]
+            XCTAssertEqual(ts?["terminationReason"] as? String, "interruption")
+            stopExp.fulfill()
+        }
+        wait(for: [stopExp], timeout: 1.0)
+    }
+
+    func testDuplicateStop() {
+        backend.availableInputsVal = [VGPortSnapshot(portType: AVAudioSession.Port.builtInMic.rawValue, portName: "mic", uid: "1", selectedDataSourceName: nil)]
+        backend.currentRouteVal = VGRouteSnapshot(inputs: backend.availableInputsVal, outputs: [])
+
+        let startExp = expectation(description: "start success")
+        handler.handleStart(args: ["outputPath": "/tmp/a.m4a"], handle: handle) { _ in startExp.fulfill() }
+        wait(for: [startExp], timeout: 1.0)
+
+        // Block cleanup so first stop is in progress
+        var recoveryCompletion: ((Error?) -> Void)? = nil
+        recoveryBlock = { h, completion in
+            recoveryCompletion = completion
+        }
+
+        handler.handleStop(handle: handle) { _ in }
+
+        var secondStopResult: Any? = nil
+        handler.handleStop(handle: handle) { res in
+            secondStopResult = res
+        }
+        XCTAssertEqual(errorCode(secondStopResult), "STOP_IN_PROGRESS")
+
+        recoveryCompletion?(nil) // Unblock first stop cleanup
+    }
+
+    func testStartWhileTerminalResultPending() {
+        backend.availableInputsVal = [VGPortSnapshot(portType: AVAudioSession.Port.builtInMic.rawValue, portName: "mic", uid: "1", selectedDataSourceName: nil)]
+        backend.currentRouteVal = VGRouteSnapshot(inputs: backend.availableInputsVal, outputs: [])
+
+        let startExp = expectation(description: "start success")
+        handler.handleStart(args: ["outputPath": "/tmp/a.m4a"], handle: handle) { _ in startExp.fulfill() }
+        wait(for: [startExp], timeout: 1.0)
+
+        let quiesceExp = expectation(description: "quiesced")
+        handler.suspendForLifecycle(reason: .interruption) {
+            quiesceExp.fulfill()
+        }
+        wait(for: [quiesceExp], timeout: 1.0)
+
+        handler.completeLifecycleRecovery(VGRecordingLifecycleTransition.success)
+
+        var startResult: Any? = nil
+        handler.handleStart(args: ["outputPath": "/tmp/b.m4a"], handle: handle) { res in
+            startResult = res
+        }
+        XCTAssertEqual(errorCode(startResult), "STOP_RESULT_PENDING")
+    }
+
+    func testLifecycleCoordinatorInterruptionInhibitor() {
+        let fakeHandler = FakeLifecycleHandler()
+        let fakeTimeline = FakeTimelineLifecycle()
+        let coord = VGAudioLifecycleCoordinator(recordingHandler: fakeHandler,
+                                                coordinator: coordinator,
+                                                timelineLifecycle: fakeTimeline)
+
+        coord.interruptionBegan()
+        XCTAssertEqual(fakeTimeline.pauseTimelineCount, 1)
+
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 0)
+
+        coord.interruptionEnded()
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 1)
+    }
+
+    func testLifecycleCoordinatorBackgroundInhibitor() {
+        let fakeHandler = FakeLifecycleHandler()
+        let fakeTimeline = FakeTimelineLifecycle()
+        let coord = VGAudioLifecycleCoordinator(recordingHandler: fakeHandler,
+                                                coordinator: coordinator,
+                                                timelineLifecycle: fakeTimeline)
+
+        coord.didEnterBackground()
+        XCTAssertEqual(fakeTimeline.pauseTimelineCount, 1)
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 0)
+
+        coord.didBecomeActive()
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 1)
+    }
+
+    func testLifecycleCoordinatorCombinedInhibitors() {
+        let fakeHandler = FakeLifecycleHandler()
+        let fakeTimeline = FakeTimelineLifecycle()
+        let coord = VGAudioLifecycleCoordinator(recordingHandler: fakeHandler,
+                                                coordinator: coordinator,
+                                                timelineLifecycle: fakeTimeline)
+
+        coord.interruptionBegan()
+        coord.didEnterBackground()
+
+        coord.interruptionEnded()
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 0)
+
+        coord.didBecomeActive()
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 1)
+    }
+
+    func testLifecycleCoordinatorCaptureQuiescenceGating() {
+        let fakeHandler = FakeLifecycleHandler()
+        let fakeTimeline = FakeTimelineLifecycle()
+        let coord = VGAudioLifecycleCoordinator(recordingHandler: fakeHandler,
+                                                coordinator: coordinator,
+                                                timelineLifecycle: fakeTimeline)
+
+        fakeHandler.hasActiveCaptureOperation = true
+
+        coord.interruptionBegan()
+        XCTAssertEqual(fakeHandler.suspendForLifecycleCount, 1)
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 0)
+
+        fakeHandler.suspendQuiescedCallback?()
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 0)
+
+        coord.interruptionEnded()
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 1)
+    }
+
+    func testLifecycleCoordinatorSecondRouteEventInvalidatesOlderCallback() {
+        let fakeHandler = FakeLifecycleHandler()
+        let fakeTimeline = FakeTimelineLifecycle()
+        let coord = VGAudioLifecycleCoordinator(recordingHandler: fakeHandler,
+                                                coordinator: coordinator,
+                                                timelineLifecycle: fakeTimeline)
+
+        coord.routeChanged(.oldDeviceUnavailable)
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 1)
+
+        let originalCompletion = fakeTimeline.recoverPreviewCompletion
+        XCTAssertNotNil(originalCompletion)
+
+        coord.routeChanged(.newDeviceAvailable)
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 1)
+
+        originalCompletion?(nil)
+
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 2)
+    }
+
+    func testLifecycleCoordinatorOldDeviceUnavailableAlwaysPauses() {
+        let fakeHandler = FakeLifecycleHandler()
+        let fakeTimeline = FakeTimelineLifecycle()
+        let coord = VGAudioLifecycleCoordinator(recordingHandler: fakeHandler,
+                                                coordinator: coordinator,
+                                                timelineLifecycle: fakeTimeline)
+
+        coord.routeChanged(.oldDeviceUnavailable)
+        XCTAssertEqual(fakeTimeline.pauseTimelineCount, 1)
+    }
+
+    func testLifecycleCoordinatorNewDeviceAvailableWithActiveCapturePausesAndQuiesces() {
+        let fakeHandler = FakeLifecycleHandler()
+        let fakeTimeline = FakeTimelineLifecycle()
+        let coord = VGAudioLifecycleCoordinator(recordingHandler: fakeHandler,
+                                                coordinator: coordinator,
+                                                timelineLifecycle: fakeTimeline)
+
+        fakeHandler.hasActiveCaptureOperation = true
+        coord.routeChanged(.newDeviceAvailable)
+
+        XCTAssertEqual(fakeTimeline.pauseTimelineCount, 1)
+        XCTAssertEqual(fakeHandler.suspendForLifecycleCount, 1)
+    }
+
+    func testLifecycleCoordinatorNewDeviceAvailableWithoutActiveCaptureMayAvoidPause() {
+        let fakeHandler = FakeLifecycleHandler()
+        let fakeTimeline = FakeTimelineLifecycle()
+        let coord = VGAudioLifecycleCoordinator(recordingHandler: fakeHandler,
+                                                coordinator: coordinator,
+                                                timelineLifecycle: fakeTimeline)
+
+        fakeHandler.hasActiveCaptureOperation = false
+        coord.routeChanged(.newDeviceAvailable)
+
+        XCTAssertEqual(fakeTimeline.pauseTimelineCount, 0)
+        XCTAssertEqual(fakeHandler.suspendForLifecycleCount, 0)
+    }
+
+    func testLifecycleCoordinatorNormalizationFailureSkipsPreviewRecovery() {
+        let fakeHandler = FakeLifecycleHandler()
+        let fakeTimeline = FakeTimelineLifecycle()
+        let coord = VGAudioLifecycleCoordinator(recordingHandler: fakeHandler,
+                                                coordinator: coordinator,
+                                                timelineLifecycle: fakeTimeline)
+
+        backend.categoryShouldFail = true
+
+        coord.interruptionBegan()
+        coord.interruptionEnded()
+
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 0)
+        XCTAssertEqual(fakeHandler.completeLifecycleRecoveryCount, 1)
+        XCTAssertEqual(fakeHandler.lastLifecycleTransition?.sessionRestored, false)
+    }
+
+    func testLifecycleCoordinatorPreviewRecoveryFailureDeliveredToHandler() {
+        let fakeHandler = FakeLifecycleHandler()
+        let fakeTimeline = FakeTimelineLifecycle()
+        let coord = VGAudioLifecycleCoordinator(recordingHandler: fakeHandler,
+                                                coordinator: coordinator,
+                                                timelineLifecycle: fakeTimeline)
+
+        fakeTimeline.recoverPreviewErr = NSError(domain: "Test", code: 42)
+
+        coord.interruptionBegan()
+        coord.interruptionEnded()
+
+        XCTAssertEqual(fakeTimeline.recoverPreviewCount, 1)
+        XCTAssertEqual(fakeHandler.completeLifecycleRecoveryCount, 1)
+        XCTAssertEqual(fakeHandler.lastLifecycleTransition?.previewRecovered, false)
+    }
+
+    func testLifecycleCoordinatorNoPathCallsTimelinePlay() {
+        let fakeHandler = FakeLifecycleHandler()
+        let fakeTimeline = FakeTimelineLifecycle()
+        _ = VGAudioLifecycleCoordinator(recordingHandler: fakeHandler,
+                                        coordinator: coordinator,
+                                        timelineLifecycle: fakeTimeline)
+
+        XCTAssertEqual(fakeTimeline.pauseTimelineCount, 0)
+    }
+
 }
 
 #endif // VG_USE_V2_GRAPH
