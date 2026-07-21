@@ -108,6 +108,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // P1-T7: Single shared thumbnail generator — never a full renderer for filmstrip
     private let thumbnailGenerator = VanguardThumbnailGenerator()
 
+    // ── Slice Q: waveform-cache handler ──────────────────────────────────────
+    // Owns the serial I/O queue, HMAC-authenticated write leases, and epoch
+    // state for all waveformCache_* MethodChannel routes.
+    private let waveformCacheHandler = VGWaveformCacheMethodHandler()
+
     // Active export session — retained to outlive handle(_:result:) scope
     var activeExportSession: VanguardExportSession?
 
@@ -852,6 +857,14 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
         let args = call.arguments as? [String: Any]
+
+        // ── Slice Q: early waveform-cache forwarding ──────────────────────────
+        // Intercept all waveformCache_* routes before the main switch so they
+        // never traverse the full case table. The handler owns all epoch logic.
+        if call.method.hasPrefix("waveformCache_") {
+            waveformCacheHandler.handle(call: call.method, args: args, result: result)
+            return
+        }
 
         switch call.method {
 
@@ -5551,93 +5564,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             let position = audioPlaybackService.currentPositionSeconds()
             result(["seconds": position])
 
-        // ── Phase 8.17: Waveform Cache ───────────────────────────────────────
-        //
-        // Disk-backed save/load for VGWaveformResult data produced by
-        // VGWaveformExtractor (Phase 8.15C). All I/O is delegated to the
-        // stateless VGWaveformCache utility.
-        //
-        // Both endpoints must be called from a background isolate / thread
-        // if the caller wants to avoid blocking the UI. The MethodChannel
-        // itself does not dispatch — it executes on the main thread.
-
-        case "waveformCache_save":
-            guard let cacheKey = args?["cacheKey"] as? String, !cacheKey.isEmpty else {
-                result(FlutterError(code: "INVALID_ARG",
-                                    message: "cacheKey is required and must be non-empty",
-                                    details: nil))
-                return
-            }
-            // samples may arrive as FlutterStandardTypedData (bytes) or [NSNumber].
-            let rawSamples = args?["samples"]
-            let samplesData: Data?
-            if let typedData = rawSamples as? FlutterStandardTypedData {
-                samplesData = typedData.data
-            } else if let byteArray = rawSamples as? [Int] {
-                // Fallback: rebuild from byte array
-                var bytes = byteArray.map { UInt8($0 & 0xFF) }
-                samplesData = Data(bytes: &bytes, count: bytes.count)
-            } else {
-                samplesData = nil
-            }
-            guard let samplesData = samplesData, !samplesData.isEmpty else {
-                result(FlutterError(code: "INVALID_ARG",
-                                    message: "samples must be non-empty typed data",
-                                    details: nil))
-                return
-            }
-            guard let durationSeconds = (args?["durationSeconds"] as? NSNumber)?.doubleValue,
-                  durationSeconds > 0 else {
-                result(FlutterError(code: "INVALID_ARG",
-                                    message: "durationSeconds must be > 0",
-                                    details: nil))
-                return
-            }
-            guard let samplesPerSecond = (args?["samplesPerSecond"] as? NSNumber)?.intValue,
-                  samplesPerSecond > 0 else {
-                result(FlutterError(code: "INVALID_ARG",
-                                    message: "samplesPerSecond must be > 0",
-                                    details: nil))
-                return
-            }
-            guard let pointCount = (args?["pointCount"] as? NSNumber)?.intValue,
-                  pointCount > 0 else {
-                result(FlutterError(code: "INVALID_ARG",
-                                    message: "pointCount must be > 0",
-                                    details: nil))
-                return
-            }
-            let waveformResult = VGWaveformResult(samplesData: samplesData,
-                                                  durationSeconds: durationSeconds,
-                                                  samplesPerSecond: samplesPerSecond,
-                                                  pointCount: pointCount)
-            do {
-                try VGWaveformCache.save(waveformResult, forCacheKey: cacheKey)
-                result(nil)
-            } catch {
-                result(FlutterError(code: "CACHE_SAVE_FAILED",
-                                    message: error.localizedDescription,
-                                    details: nil))
-            }
-
-        case "waveformCache_load":
-            guard let cacheKey = args?["cacheKey"] as? String, !cacheKey.isEmpty else {
-                result(FlutterError(code: "INVALID_ARG",
-                                    message: "cacheKey is required and must be non-empty",
-                                    details: nil))
-                return
-            }
-            if let cached = VGWaveformCache.loadResult(forCacheKey: cacheKey) {
-                result([
-                    "durationSeconds":  cached.durationSeconds,
-                    "samplesPerSecond": cached.samplesPerSecond,
-                    "pointCount":       cached.pointCount,
-                    "samples":          FlutterStandardTypedData(bytes: cached.samplesData),
-                ])
-            } else {
-                // Cache miss — return nil so Dart can detect and re-extract.
-                result(nil)
-            }
+        // ── Slice Q: waveform-cache routes ────────────────────────────────────
+        // All waveformCache_* routes are intercepted by the early-forward guard
+        // at the top of handle(_:result:) before this switch executes.
+        // No case statements needed here.
 
         // ── Phase 10-C: Shared media-stack image optimizer ────────────────────
         //

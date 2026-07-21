@@ -42,9 +42,9 @@ void main() {
   void setHandler(Future<dynamic> Function(MethodCall) handler) {
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
         .setMockMethodCallHandler(channel, (call) async {
-      capturedCalls.add(call);
-      return handler(call);
-    });
+          capturedCalls.add(call);
+          return handler(call);
+        });
   }
 
   /// Helper: builds a minimal valid VGAudioWaveformResult.
@@ -78,23 +78,25 @@ void main() {
   });
 
   // ── WC-2 ────────────────────────────────────────────────────────────────────
-  test('WC-2: save payload includes cacheKey, samples, durationSeconds, samplesPerSecond, pointCount',
-      () async {
-    setHandler((call) async => null);
+  test(
+    'WC-2: save payload includes cacheKey, samples, durationSeconds, samplesPerSecond, pointCount',
+    () async {
+      setHandler((call) async => null);
 
-    final result = makeResult(pointCount: 3, duration: 5.0, sps: 50);
-    await VGAudioWaveformCache.save(cacheKey: 'my-key', result: result);
+      final result = makeResult(pointCount: 3, duration: 5.0, sps: 50);
+      await VGAudioWaveformCache.save(cacheKey: 'my-key', result: result);
 
-    expect(capturedCalls.length, 1);
-    final args = capturedCalls.first.arguments as Map;
-    expect(args['cacheKey'], 'my-key');
-    expect(args['durationSeconds'], closeTo(5.0, 0.001));
-    expect(args['samplesPerSecond'], 50);
-    expect(args['pointCount'], 3);
-    // samples should be a Uint8List of 3*4=12 bytes
-    expect(args['samples'], isA<Uint8List>());
-    expect((args['samples'] as Uint8List).length, 3 * 4);
-  });
+      expect(capturedCalls.length, 1);
+      final args = capturedCalls.first.arguments as Map;
+      expect(args['cacheKey'], 'my-key');
+      expect(args['durationSeconds'], closeTo(5.0, 0.001));
+      expect(args['samplesPerSecond'], 50);
+      expect(args['pointCount'], 3);
+      // samples should be a Uint8List of 3*4=12 bytes
+      expect(args['samples'], isA<Uint8List>());
+      expect((args['samples'] as Uint8List).length, 3 * 4);
+    },
+  );
 
   // ── WC-3 ────────────────────────────────────────────────────────────────────
   test('WC-3: load sends waveformCache_load with cacheKey', () async {
@@ -120,10 +122,10 @@ void main() {
     setHandler((call) async {
       if (call.method == 'waveformCache_load') {
         return {
-          'durationSeconds':  3.14,
+          'durationSeconds': 3.14,
           'samplesPerSecond': 100,
-          'pointCount':       3,
-          'samples':          fakeSampleBytes,
+          'pointCount': 3,
+          'samples': fakeSampleBytes,
         };
       }
       return null;
@@ -151,28 +153,32 @@ void main() {
   });
 
   // ── WC-6 ────────────────────────────────────────────────────────────────────
-  test('WC-6: empty cacheKey throws ArgumentError on save (no channel call)',
-      () async {
-    setHandler((call) async => null);
+  test(
+    'WC-6: empty cacheKey throws ArgumentError on save (no channel call)',
+    () async {
+      setHandler((call) async => null);
 
-    expect(
-      () => VGAudioWaveformCache.save(cacheKey: '', result: makeResult()),
-      throwsA(isA<ArgumentError>()),
-    );
-    expect(capturedCalls, isEmpty);
-  });
+      expect(
+        () => VGAudioWaveformCache.save(cacheKey: '', result: makeResult()),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(capturedCalls, isEmpty);
+    },
+  );
 
   // ── WC-7 ────────────────────────────────────────────────────────────────────
-  test('WC-7: empty cacheKey throws ArgumentError on load (no channel call)',
-      () async {
-    setHandler((call) async => null);
+  test(
+    'WC-7: empty cacheKey throws ArgumentError on load (no channel call)',
+    () async {
+      setHandler((call) async => null);
 
-    expect(
-      () => VGAudioWaveformCache.load(cacheKey: ''),
-      throwsA(isA<ArgumentError>()),
-    );
-    expect(capturedCalls, isEmpty);
-  });
+      expect(
+        () => VGAudioWaveformCache.load(cacheKey: ''),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(capturedCalls, isEmpty);
+    },
+  );
 
   // ── WC-8 ────────────────────────────────────────────────────────────────────
   test('WC-8: empty samples throws ArgumentError on save', () async {
@@ -192,108 +198,348 @@ void main() {
   });
 
   // ── WC-9 ────────────────────────────────────────────────────────────────────
-  test('WC-9: non-positive durationSeconds throws ArgumentError on save',
-      () async {
-    setHandler((call) async => null);
+  test(
+    'WC-9: non-positive durationSeconds throws ArgumentError on save',
+    () async {
+      setHandler((call) async => null);
 
-    // Zero duration
-    expect(
-      () => VGAudioWaveformCache.save(
-        cacheKey: 'key',
-        result: makeResult(duration: 0.0),
-      ),
-      throwsA(isA<ArgumentError>()),
-    );
-    // Negative duration
-    expect(
-      () => VGAudioWaveformCache.save(
-        cacheKey: 'key',
-        result: makeResult(duration: -1.0),
-      ),
-      throwsA(isA<ArgumentError>()),
-    );
-    expect(capturedCalls, isEmpty);
-  });
+      // Zero duration
+      expect(
+        () => VGAudioWaveformCache.save(
+          cacheKey: 'key',
+          result: makeResult(duration: 0.0),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      // Negative duration
+      expect(
+        () => VGAudioWaveformCache.save(
+          cacheKey: 'key',
+          result: makeResult(duration: -1.0),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(capturedCalls, isEmpty);
+    },
+  );
 
   // ── WC-10 ───────────────────────────────────────────────────────────────────
-  test('WC-10: non-positive samplesPerSecond throws ArgumentError on save',
-      () async {
-    setHandler((call) async => null);
+  test(
+    'WC-10: non-positive samplesPerSecond throws ArgumentError on save',
+    () async {
+      setHandler((call) async => null);
 
-    expect(
-      () => VGAudioWaveformCache.save(
-        cacheKey: 'key',
-        result: makeResult(sps: 0),
-      ),
-      throwsA(isA<ArgumentError>()),
-    );
-    expect(capturedCalls, isEmpty);
-  });
+      expect(
+        () => VGAudioWaveformCache.save(
+          cacheKey: 'key',
+          result: makeResult(sps: 0),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(capturedCalls, isEmpty);
+    },
+  );
 
   // ── WC-11 ───────────────────────────────────────────────────────────────────
-  test('WC-11: pointCount != samples.length throws ArgumentError on save',
-      () async {
-    setHandler((call) async => null);
+  test(
+    'WC-11: pointCount != samples.length throws ArgumentError on save',
+    () async {
+      setHandler((call) async => null);
 
-    // Build result where pointCount doesn't match samples.length
-    final samples = Float32List.fromList([0.1, 0.2, 0.3]);
-    final mismatchedResult = VGAudioWaveformResult(
-      samples: samples,
-      durationSeconds: 1.0,
-      samplesPerSecond: 100,
-      pointCount: 99, // wrong — samples.length is 3
-    );
-    expect(
-      () => VGAudioWaveformCache.save(cacheKey: 'key', result: mismatchedResult),
-      throwsA(isA<ArgumentError>()),
-    );
-    expect(capturedCalls, isEmpty);
-  });
+      // Build result where pointCount doesn't match samples.length
+      final samples = Float32List.fromList([0.1, 0.2, 0.3]);
+      final mismatchedResult = VGAudioWaveformResult(
+        samples: samples,
+        durationSeconds: 1.0,
+        samplesPerSecond: 100,
+        pointCount: 99, // wrong — samples.length is 3
+      );
+      expect(
+        () => VGAudioWaveformCache.save(
+          cacheKey: 'key',
+          result: mismatchedResult,
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(capturedCalls, isEmpty);
+    },
+  );
 
   // ── WC-12 ───────────────────────────────────────────────────────────────────
-  test('WC-12: native CACHE_SAVE_FAILED propagates as PlatformException',
-      () async {
-    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-        .setMockMethodCallHandler(channel, (call) async {
-      if (call.method == 'waveformCache_save') {
-        throw PlatformException(
-          code: 'CACHE_SAVE_FAILED',
-          message: 'Disk full',
-        );
+  test(
+    'WC-12: native CACHE_SAVE_FAILED propagates as PlatformException',
+    () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            if (call.method == 'waveformCache_save') {
+              throw PlatformException(
+                code: 'CACHE_SAVE_FAILED',
+                message: 'Disk full',
+              );
+            }
+            return null;
+          });
+
+      expect(
+        () => VGAudioWaveformCache.save(cacheKey: 'key', result: makeResult()),
+        throwsA(
+          isA<PlatformException>().having(
+            (e) => e.code,
+            'code',
+            'CACHE_SAVE_FAILED',
+          ),
+        ),
+      );
+    },
+  );
+
+  // ── WC-13 ───────────────────────────────────────────────────────────────────
+  test(
+    'WC-13: non-finite durationSeconds throws ArgumentError on save',
+    () async {
+      setHandler((call) async => null);
+
+      expect(
+        () => VGAudioWaveformCache.save(
+          cacheKey: 'key',
+          result: makeResult(duration: double.nan),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(
+        () => VGAudioWaveformCache.save(
+          cacheKey: 'key',
+          result: makeResult(duration: double.infinity),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(capturedCalls, isEmpty);
+    },
+  );
+
+  // ── Slice Q Namespaced Cache Tests (WC-14..WC-22) ──────────────────────────
+
+  test('WC-14: lookupNamespaced returns hit on cached result', () async {
+    final fakeSamples = Float32List.fromList([0.2, 0.4]);
+    final fakeBytes = fakeSamples.buffer.asUint8List(
+      fakeSamples.offsetInBytes,
+      fakeSamples.lengthInBytes,
+    );
+    setHandler((call) async {
+      if (call.method == 'waveformCache_lookupNamespaced') {
+        return {
+          'status': 'hit',
+          'result': {
+            'durationSeconds': 2.0,
+            'samplesPerSecond': 100,
+            'pointCount': 2,
+            'samples': fakeBytes,
+          },
+        };
       }
       return null;
     });
 
-    expect(
-      () => VGAudioWaveformCache.save(
-        cacheKey: 'key',
-        result: makeResult(),
-      ),
-      throwsA(
-        isA<PlatformException>().having((e) => e.code, 'code', 'CACHE_SAVE_FAILED'),
-      ),
+    final res = await VGAudioWaveformCache.lookupNamespaced(
+      namespace: 'ns1',
+      assetKey: 'ak1',
+      samplesPerSecond: 100,
     );
+
+    expect(res, isA<VGAudioWaveformLookupHit>());
+    final hit = res as VGAudioWaveformLookupHit;
+    expect(hit.cached.pointCount, 2);
+    expect(hit.cached.samplesPerSecond, 100);
   });
 
-  // ── WC-13 ───────────────────────────────────────────────────────────────────
-  test('WC-13: non-finite durationSeconds throws ArgumentError on save',
-      () async {
+  test(
+    'WC-15: lookupNamespaced returns miss with write lease on cache miss',
+    () async {
+      setHandler((call) async {
+        if (call.method == 'waveformCache_lookupNamespaced') {
+          return {'status': 'miss', 'writeLease': 'token123.sig456'};
+        }
+        return null;
+      });
+
+      final res = await VGAudioWaveformCache.lookupNamespaced(
+        namespace: 'ns1',
+        assetKey: 'ak1',
+        samplesPerSecond: 100,
+      );
+
+      expect(res, isA<VGAudioWaveformLookupMiss>());
+      final miss = res as VGAudioWaveformLookupMiss;
+      expect(miss.lease.samplesPerSecond, 100);
+    },
+  );
+
+  test(
+    'WC-16: lookupNamespaced throws ArgumentError for invalid args',
+    () async {
+      setHandler((call) async => null);
+
+      expect(
+        () => VGAudioWaveformCache.lookupNamespaced(
+          namespace: '',
+          assetKey: 'ak1',
+          samplesPerSecond: 100,
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(
+        () => VGAudioWaveformCache.lookupNamespaced(
+          namespace: 'ns1',
+          assetKey: '',
+          samplesPerSecond: 100,
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(
+        () => VGAudioWaveformCache.lookupNamespaced(
+          namespace: 'ns1',
+          assetKey: 'ak1',
+          samplesPerSecond: 0,
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+    },
+  );
+
+  test('WC-17: saveNamespaced returns saved outcome', () async {
+    setHandler((call) async {
+      if (call.method == 'waveformCache_lookupNamespaced') {
+        return {'status': 'miss', 'writeLease': 'valid.token'};
+      }
+      if (call.method == 'waveformCache_saveNamespaced') {
+        return {'status': 'saved'};
+      }
+      return null;
+    });
+
+    final lookup =
+        await VGAudioWaveformCache.lookupNamespaced(
+              namespace: 'ns1',
+              assetKey: 'ak1',
+              samplesPerSecond: 100,
+            )
+            as VGAudioWaveformLookupMiss;
+
+    final outcome = await VGAudioWaveformCache.saveNamespaced(
+      lease: lookup.lease,
+      result: makeResult(pointCount: 2, duration: 1.0, sps: 100),
+    );
+
+    expect(outcome, equals(VGAudioWaveformSaveOutcome.saved));
+  });
+
+  test('WC-18: saveNamespaced returns stale outcome', () async {
+    setHandler((call) async {
+      if (call.method == 'waveformCache_lookupNamespaced') {
+        return {'status': 'miss', 'writeLease': 'stale.token'};
+      }
+      if (call.method == 'waveformCache_saveNamespaced') {
+        return {'status': 'stale'};
+      }
+      return null;
+    });
+
+    final lookup =
+        await VGAudioWaveformCache.lookupNamespaced(
+              namespace: 'ns1',
+              assetKey: 'ak1',
+              samplesPerSecond: 100,
+            )
+            as VGAudioWaveformLookupMiss;
+
+    final outcome = await VGAudioWaveformCache.saveNamespaced(
+      lease: lookup.lease,
+      result: makeResult(pointCount: 2, duration: 1.0, sps: 100),
+    );
+
+    expect(outcome, equals(VGAudioWaveformSaveOutcome.stale));
+  });
+
+  test(
+    'WC-19: saveNamespaced throws ArgumentError for invalid result metadata',
+    () async {
+      setHandler((call) async {
+        if (call.method == 'waveformCache_lookupNamespaced') {
+          return {'status': 'miss', 'writeLease': 'tok'};
+        }
+        return null;
+      });
+
+      final lookup =
+          await VGAudioWaveformCache.lookupNamespaced(
+                namespace: 'ns1',
+                assetKey: 'ak1',
+                samplesPerSecond: 100,
+              )
+              as VGAudioWaveformLookupMiss;
+
+      expect(
+        () => VGAudioWaveformCache.saveNamespaced(
+          lease: lookup.lease,
+          result: makeResult(duration: 0.0),
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+    },
+  );
+
+  test('WC-20: invalidateAsset sends waveformCache_invalidateAsset', () async {
     setHandler((call) async => null);
 
-    expect(
-      () => VGAudioWaveformCache.save(
-        cacheKey: 'key',
-        result: makeResult(duration: double.nan),
-      ),
-      throwsA(isA<ArgumentError>()),
+    await VGAudioWaveformCache.invalidateAsset(
+      namespace: 'ns1',
+      assetKey: 'ak1',
     );
-    expect(
-      () => VGAudioWaveformCache.save(
-        cacheKey: 'key',
-        result: makeResult(duration: double.infinity),
-      ),
-      throwsA(isA<ArgumentError>()),
-    );
-    expect(capturedCalls, isEmpty);
+
+    expect(capturedCalls.length, 1);
+    expect(capturedCalls.first.method, 'waveformCache_invalidateAsset');
+    final args = capturedCalls.first.arguments as Map;
+    expect(args['namespace'], 'ns1');
+    expect(args['assetKey'], 'ak1');
   });
+
+  test(
+    'WC-21: invalidateNamespace sends waveformCache_invalidateNamespace',
+    () async {
+      setHandler((call) async => null);
+
+      await VGAudioWaveformCache.invalidateNamespace(namespace: 'ns1');
+
+      expect(capturedCalls.length, 1);
+      expect(capturedCalls.first.method, 'waveformCache_invalidateNamespace');
+      final args = capturedCalls.first.arguments as Map;
+      expect(args['namespace'], 'ns1');
+    },
+  );
+
+  test(
+    'WC-22: invalidation methods throw ArgumentError on empty identifiers',
+    () async {
+      setHandler((call) async => null);
+
+      expect(
+        () => VGAudioWaveformCache.invalidateAsset(
+          namespace: '',
+          assetKey: 'ak1',
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(
+        () => VGAudioWaveformCache.invalidateAsset(
+          namespace: 'ns1',
+          assetKey: '',
+        ),
+        throwsA(isA<ArgumentError>()),
+      );
+      expect(
+        () => VGAudioWaveformCache.invalidateNamespace(namespace: ''),
+        throwsA(isA<ArgumentError>()),
+      );
+    },
+  );
 }

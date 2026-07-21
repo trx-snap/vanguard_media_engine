@@ -237,7 +237,10 @@ Pod::Spec.new do |s|
       'Tests/VGAudioSessionTransitionCoordinatorTests.m',
       'Tests/VGAudioRouteSnapshotTests.m',
       'Tests/VanguardAudioPreviewRuntimeTest_SliceN_Recovery.m',
-      'Tests/VanguardAudioRecordingHandlerTests.swift'
+      'Tests/VanguardAudioRecordingHandlerTests.swift',
+      # Audio Slice Q: waveform cache and method handler native unit tests
+      'Tests/VGWaveformCacheTests.m',
+      'Tests/VGWaveformCacheMethodHandlerTests.swift'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage', 'AVFoundation'
     ts.dependency    'UMF'

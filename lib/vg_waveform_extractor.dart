@@ -1,5 +1,5 @@
 // vg_waveform_extractor.dart
-// vanguard_media_engine — Phase 8.15C / Phase 8.18
+// vanguard_media_engine — Phase 8.15C / Phase 8.18 / Slice Q
 //
 // Dart bridge for native iOS offline audio waveform extraction.
 //
@@ -121,6 +121,7 @@ abstract final class VGAudioWaveformExtractor {
     int samplesPerSecond = 100,
     double maxDurationSeconds = 600.0,
     String? cacheKey,
+    VGAudioWaveformCacheAddress? namespacedCacheAddress,
   }) async {
     if (path.isEmpty) {
       throw ArgumentError.value(path, 'path', 'must be non-empty');
@@ -140,19 +141,93 @@ abstract final class VGAudioWaveformExtractor {
       );
     }
 
-    // ── Phase 8.18: Cache-first lookup ───────────────────────────────────────
-    final effectiveKey =
-        (cacheKey != null && cacheKey.isNotEmpty) ? cacheKey : null;
+    final hasFlat = cacheKey != null && cacheKey.isNotEmpty;
+    final hasNamespaced = namespacedCacheAddress != null;
+    if (hasFlat && hasNamespaced) {
+      throw ArgumentError(
+        'cacheKey and namespacedCacheAddress are mutually exclusive',
+      );
+    }
 
-    if (effectiveKey != null) {
+    // ── Namespaced cache-first lookup (write-lease API) ───────────────────────
+    if (hasNamespaced) {
+      VGAudioWaveformWriteLease? lease;
       try {
-        final cached = await VGAudioWaveformCache.load(cacheKey: effectiveKey);
-        if (cached != null) return cached;
-      } catch (_) {
-        // Cache load error is non-fatal — fall through to native extraction.
+        final lookupResult = await VGAudioWaveformCache.lookupNamespaced(
+          address: namespacedCacheAddress,
+          samplesPerSecond: samplesPerSecond,
+        );
+        if (lookupResult is VGAudioWaveformLookupHit) {
+          final cached = lookupResult.cached;
+          if (cached.durationSeconds > maxDurationSeconds) {
+            throw PlatformException(
+              code: 'DURATION_EXCEEDED',
+              message: 'Cached duration ${cached.durationSeconds} exceeds maxDurationSeconds $maxDurationSeconds',
+            );
+          }
+          if (cached.samplesPerSecond == samplesPerSecond) {
+            return cached;
+          }
+          // SPS mismatch: treat as cache miss
+        } else if (lookupResult is VGAudioWaveformLookupMiss) {
+          lease = lookupResult.lease;
+        }
+      } on PlatformException catch (e) {
+        if (e.code == 'DURATION_EXCEEDED') rethrow;
+        // Other lookup errors are non-fatal — fall through to native extraction without saving.
+      }
+
+      final result = await _doExtract(path, samplesPerSecond, maxDurationSeconds);
+
+      if (lease != null) {
+        try {
+          await VGAudioWaveformCache.saveNamespaced(lease: lease, result: result);
+        } catch (_) {
+          // Save error is non-fatal — return the extraction result.
+        }
+      }
+      return result;
+    }
+
+    // ── Phase 8.18: Flat cache-first lookup ──────────────────────────────────
+    if (hasFlat) {
+      try {
+        final cached = await VGAudioWaveformCache.load(cacheKey: cacheKey!);
+        if (cached != null) {
+          if (cached.durationSeconds > maxDurationSeconds) {
+            throw PlatformException(
+              code: 'DURATION_EXCEEDED',
+              message: 'Cached duration ${cached.durationSeconds} exceeds maxDurationSeconds $maxDurationSeconds',
+            );
+          }
+          if (cached.samplesPerSecond == samplesPerSecond) {
+            return cached;
+          }
+        }
+      } on PlatformException catch (e) {
+        if (e.code == 'DURATION_EXCEEDED') rethrow;
       }
     }
 
+    final result = await _doExtract(path, samplesPerSecond, maxDurationSeconds);
+
+    if (hasFlat) {
+      try {
+        await VGAudioWaveformCache.save(cacheKey: cacheKey!, result: result);
+      } catch (_) {
+        // Cache save error is non-fatal — return the extracted result.
+      }
+    }
+
+    return result;
+  }
+
+  /// Shared native extraction. Throws [PlatformException] on native errors.
+  static Future<VGAudioWaveformResult> _doExtract(
+    String path,
+    int samplesPerSecond,
+    double maxDurationSeconds,
+  ) async {
     final raw = await _channel.invokeMapMethod<String, dynamic>(
       'extractWaveform',
       {
@@ -184,23 +259,12 @@ abstract final class VGAudioWaveformExtractor {
       samples = Float32List(0);
     }
 
-    final result = VGAudioWaveformResult(
+    return VGAudioWaveformResult(
       samples: samples,
       durationSeconds: (raw?['durationSeconds'] as num?)?.toDouble() ?? 0.0,
       samplesPerSecond: (raw?['samplesPerSecond'] as num?)?.toInt() ??
           samplesPerSecond,
       pointCount: (raw?['pointCount'] as num?)?.toInt() ?? samples.length,
     );
-
-    // ── Phase 8.18: Post-extraction cache save ────────────────────────────────
-    if (effectiveKey != null) {
-      try {
-        await VGAudioWaveformCache.save(cacheKey: effectiveKey, result: result);
-      } catch (_) {
-        // Cache save error is non-fatal — return the extracted result.
-      }
-    }
-
-    return result;
   }
 }
