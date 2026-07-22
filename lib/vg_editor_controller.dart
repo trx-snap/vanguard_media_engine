@@ -65,6 +65,30 @@ import 'vg_editor_export_result.dart';
 import 'vg_editor_value.dart';
 import 'vg_reverse_sidecar_status.dart';
 
+// ── Phase 10-C Slice R: generic preview-derivation seam ─────────────────────
+//
+// [VGEditorPreviewDraftDeriver] is a function type that takes a raw authoring
+// [VGEditorDraft] (source) and returns a disposable derived draft ready for
+// native renderer serialisation.  The deriver must be:
+//   - pure (no I/O, no MethodChannel calls)
+//   - idempotent (same source → structurally equal output)
+//   - ephemeral (the returned draft must not be persisted as authoring state)
+//
+// The default deriver used by [VGEditorController] is behaviorally identical to:
+//   source.flattenOriginalClipAudio().applyAudioCompositionPolicy()
+//
+// Product-specific derivers (e.g. ConnectsApp Original Sound policy) may be
+// injected at construction time via [VGEditorController.previewDraftDeriver].
+// Vanguard itself never owns product policy.
+
+/// A pure function from a raw authoring [VGEditorDraft] to a disposable derived
+/// draft suitable for native renderer serialisation.
+///
+/// The returned draft must be ephemeral — it must not be persisted as
+/// authoring state, placed in undo/redo history, or re-normalized.
+typedef VGEditorPreviewDraftDeriver = VGEditorDraft Function(
+    VGEditorDraft source);
+
 /// The formal Dart-side controller for the Phase 7 timeline editor API.
 ///
 /// [VGEditorController] coordinates native MethodChannel routes
@@ -124,12 +148,23 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     )
     // ignore: deprecated_member_use_from_same_package
     this.useRealVideoClips = true,
+    // Phase 10-C Slice R: optional deriver injection.
+    // When null, [_derivePreviewDraft] uses the default derivation
+    // (flattenOriginalClipAudio + applyAudioCompositionPolicy).
+    VGEditorPreviewDraftDeriver? previewDraftDeriver,
   }) : _channel = channel ?? const MethodChannel('vanguard_media_engine'),
+       _previewDraftDeriver = previewDraftDeriver,
        super(VGEditorValue.initial(initialDraft));
 
   // ── Channel ────────────────────────────────────────────────────────────────
 
   final MethodChannel _channel;
+
+  // ── Phase 10-C Slice R: derivation seam ───────────────────────────────────
+
+  /// Optional injected deriver. When non-null, used by [_derivePreviewDraft]
+  /// in [initialize] and [updateDraft] instead of the default derivation.
+  final VGEditorPreviewDraftDeriver? _previewDraftDeriver;
 
   // ── Dev proof flag (deprecated) ────────────────────────────────────────────
 
@@ -335,8 +370,22 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   //     export policy exactly (preview/export parity).
   //   - `durationSeconds` must be taken from the raw `source`, not from the
   //     derived draft, because derivation does not alter timeline structure.
-  VGEditorDraft _derivePreviewDraft(VGEditorDraft source) =>
-      source.flattenOriginalClipAudio().applyAudioCompositionPolicy();
+  /// Returns a disposable derived draft for preview/native serialisation.
+  ///
+  /// When [_previewDraftDeriver] is set (Phase 10-C Slice R injection), delegates
+  /// to it. Otherwise uses the default derivation:
+  ///   source.flattenOriginalClipAudio().applyAudioCompositionPolicy()
+  ///
+  /// Behavioral contract:
+  ///   - [source] is the raw authoring draft — never mutated.
+  ///   - The returned draft is ephemeral — must not be persisted.
+  ///   - Calling twice with the same unchanged source produces equal output.
+  VGEditorDraft _derivePreviewDraft(VGEditorDraft source) {
+    if (_previewDraftDeriver != null) {
+      return _previewDraftDeriver!(source);
+    }
+    return source.flattenOriginalClipAudio().applyAudioCompositionPolicy();
+  }
 
   /// Initializes the native timeline texture using the current draft.
   ///
