@@ -113,6 +113,22 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // state for all waveformCache_* MethodChannel routes.
     private let waveformCacheHandler = VGWaveformCacheMethodHandler()
 
+    // ── S-P1: timeline live filter-chain handler ──────────────────────────────
+    // Owns all parsing, stale-target checking, and runtime delegation for the
+    // `timeline_setFilterChain` route. Plugin provides composition wiring only.
+    // Target provider resolves _timelineRuntime at call time; safely returns nil
+    // when VG_USE_V2_GRAPH=0 (no _timelineRuntime property exists).
+    private lazy var _timelineLiveControlHandler: VGTimelineLiveControlHandler = {
+        VGTimelineLiveControlHandler(targetProvider: { [weak self] in
+            #if VG_USE_V2_GRAPH
+            guard let runtime = self?._timelineRuntime else { return nil }
+            return vgtlcProductionTarget(runtime: runtime)
+            #else
+            return nil
+            #endif
+        })
+    }()
+
     // Active export session — retained to outlive handle(_:result:) scope
     var activeExportSession: VanguardExportSession?
 
@@ -863,6 +879,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // never traverse the full case table. The handler owns all epoch logic.
         if call.method.hasPrefix("waveformCache_") {
             waveformCacheHandler.handle(call: call.method, args: args, result: result)
+            return
+        }
+
+        // ── S-P1: timeline live filter-chain forwarding ───────────────────────
+        // The handler owns all parsing, stale-target checking, and dispatch.
+        if call.method == "timeline_setFilterChain" {
+            _timelineLiveControlHandler.handle(args: args, result: result)
             return
         }
 

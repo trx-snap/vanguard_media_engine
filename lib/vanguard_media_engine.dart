@@ -87,6 +87,8 @@ export 'src/roi/vg_roi_transform_mapper.dart';
 export 'src/roi/vg_roi_export_mapper.dart';
 // ROI-5E.1: In-memory single-sample imported ROI sidecar builder
 export 'src/roi/vg_imported_roi_sidecar_builder.dart';
+// Audio Track Interaction S-P1: timeline-scoped live filter-chain control.
+export 'vg_timeline_live_controls.dart';
 
 const String _libName = 'vanguard_media_engine';
 

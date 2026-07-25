@@ -240,7 +240,9 @@ Pod::Spec.new do |s|
       'Tests/VanguardAudioRecordingHandlerTests.swift',
       # Audio Slice Q: waveform cache and method handler native unit tests
       'Tests/VGWaveformCacheTests.m',
-      'Tests/VGWaveformCacheMethodHandlerTests.swift'
+      'Tests/VGWaveformCacheMethodHandlerTests.swift',
+      # S-P1: timeline live filter-chain control handler tests
+      'Tests/VGTimelineLiveControlHandlerTests.swift'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage', 'AVFoundation'
     ts.dependency    'UMF'
