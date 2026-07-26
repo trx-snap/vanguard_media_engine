@@ -590,4 +590,91 @@ final class VGTimelineLiveControlHandlerTests: XCTestCase {
         XCTAssertEqual(providerCallCount, 0, "targetProvider must not be called when argument validation fails")
         XCTAssertEqual(applyCallCount, 0, "apply closure must not be called when argument validation fails")
     }
+
+    func test19_nsNumberInt32ZeroAndOneAndInt64AcceptedAndBoolRejected() {
+        // 1. NSNumber(value: Int32(0)) accepted for target textureId 0
+        var providerCallCount = 0
+        var applyCallCount = 0
+        var handler = VGTimelineLiveControlHandler(
+            targetProvider: {
+                providerCallCount += 1
+                return VGTimelineLiveFilterTarget(textureId: 0) { _ in
+                    applyCallCount += 1
+                    return (true, nil)
+                }
+            },
+            errorFactory: testFlutterErrorFactory
+        )
+
+        var resultCallCount = 0
+        var receivedResult: Any? = "not_set"
+        handler.handle(args: ["textureId": NSNumber(value: Int32(0)), "filters": []]) { res in
+            resultCallCount += 1
+            receivedResult = res
+        }
+
+        XCTAssertEqual(resultCallCount, 1)
+        XCTAssertNil(receivedResult)
+        XCTAssertEqual(providerCallCount, 1)
+        XCTAssertEqual(applyCallCount, 1)
+
+        // 2. NSNumber(value: Int32(1)) accepted for target textureId 1
+        providerCallCount = 0
+        applyCallCount = 0
+        handler = VGTimelineLiveControlHandler(
+            targetProvider: {
+                providerCallCount += 1
+                return VGTimelineLiveFilterTarget(textureId: 1) { _ in
+                    applyCallCount += 1
+                    return (true, nil)
+                }
+            },
+            errorFactory: testFlutterErrorFactory
+        )
+
+        resultCallCount = 0
+        receivedResult = "not_set"
+        handler.handle(args: ["textureId": NSNumber(value: Int32(1)), "filters": []]) { res in
+            resultCallCount += 1
+            receivedResult = res
+        }
+
+        XCTAssertEqual(resultCallCount, 1)
+        XCTAssertNil(receivedResult)
+        XCTAssertEqual(providerCallCount, 1)
+        XCTAssertEqual(applyCallCount, 1)
+
+        // 3. Int64(1) accepted for target textureId 1
+        providerCallCount = 0
+        applyCallCount = 0
+        resultCallCount = 0
+        receivedResult = "not_set"
+        handler.handle(args: ["textureId": Int64(1), "filters": []]) { res in
+            resultCallCount += 1
+            receivedResult = res
+        }
+
+        XCTAssertEqual(resultCallCount, 1)
+        XCTAssertNil(receivedResult)
+        XCTAssertEqual(providerCallCount, 1)
+        XCTAssertEqual(applyCallCount, 1)
+
+        // 4. NSNumber(value: true) and NSNumber(value: false) rejected as INVALID_ARG
+        providerCallCount = 0
+        applyCallCount = 0
+        let boolCases: [NSNumber] = [NSNumber(value: true), NSNumber(value: false)]
+        for boolVal in boolCases {
+            var callCount = 0
+            var errRes: Any? = nil
+            handler.handle(args: ["textureId": boolVal, "filters": []]) { res in
+                callCount += 1
+                errRes = res
+            }
+            XCTAssertEqual(callCount, 1)
+            XCTAssertEqual(errorCode(errRes), "INVALID_ARG")
+        }
+        XCTAssertEqual(providerCallCount, 0, "targetProvider must not be called for NSNumber bool values")
+        XCTAssertEqual(applyCallCount, 0, "apply closure must not be called for NSNumber bool values")
+    }
 }
+

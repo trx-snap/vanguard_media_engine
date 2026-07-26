@@ -156,6 +156,15 @@ final class VGTimelineLiveControlHandler {
         // truncates booleans (true→1, false→0) and floating-point values, and
         // wraps overflowing integers. Instead, CFNumber type inspection is used
         // to verify the stored numeric type before reading the value.
+        //
+        // Bool detection uses CFGetTypeID rather than `is Bool` because
+        // Flutter's StandardMethodCodec supplies integer texture IDs as
+        // NSNumber wrapping a C integer (CFNumber). When the integer value is 1,
+        // `rawTextureId is Bool` returns true for that NSNumber on some runtimes
+        // because Swift bridges NSNumber ↔ Bool by value, not by CoreFoundation
+        // type identity. CFGetTypeID(number) == CFBooleanGetTypeID() is the
+        // correct runtime check: it distinguishes __NSCFBoolean (CFBoolean) from
+        // __NSCFNumber (CFNumber) regardless of the stored integer value.
 
         guard let rawTextureId = args?["textureId"] else {
             result(errorFactory(kErrInvalidArg,
@@ -163,16 +172,19 @@ final class VGTimelineLiveControlHandler {
             return
         }
 
-        // Reject Bool bridged as NSNumber (CFBooleanRef / kCFNumberCharType)
-        if rawTextureId is Bool {
-            result(errorFactory(kErrInvalidArg,
-                                "timeline_setFilterChain: textureId must be an integer, got Bool", nil))
-            return
-        }
-
         guard let number = rawTextureId as? NSNumber else {
             result(errorFactory(kErrInvalidArg,
                                 "timeline_setFilterChain: textureId must be a number", nil))
+            return
+        }
+
+        // Reject CFBoolean (Bool bridged as NSNumber) using CoreFoundation type
+        // identity. This correctly rejects NSNumber(value: true/false) — which
+        // carry CFBooleanGetTypeID() — while accepting any integer-valued
+        // NSNumber carrying CFNumberGetTypeID(), including value 1.
+        if CFGetTypeID(number) == CFBooleanGetTypeID() {
+            result(errorFactory(kErrInvalidArg,
+                                "timeline_setFilterChain: textureId must be an integer, got Bool", nil))
             return
         }
 
