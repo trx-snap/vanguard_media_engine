@@ -1,5 +1,5 @@
 // VanguardGraphRuntime+AudioPreview.m
-// Vanguard Media Engine — Phase 10-C Slice D
+// Vanguard Media Engine — Phase 10-C Slice D / S-P2 MOV audio repair
 //
 // Category implementation: graph-audio lifecycle gate, latest-request-wins
 // replacement, and audio cleanup join for VanguardGraphRuntime.
@@ -11,6 +11,7 @@
 #if VG_USE_V2_GRAPH
 
 #import "VanguardAudioPreviewRuntime.h"
+#import "VGAudioPreviewFileResolver.h"
 #import "VGTimelineStateSnapshot.h"
 #import <UMF/VGAudioSidecarPlan.h>
 #import <objc/runtime.h>
@@ -35,6 +36,7 @@ static char kAudioPreviewEpochKey;          ///< NSNumber (uint64_t) — lifecyc
 static char kAudioPreviewLifecycleKey;      ///< NSNumber (VGGraphAudioLifecycleState)
 static char kAudioPreviewGenerationKey;     ///< NSNumber (uint64_t) — replacement generation
 static char kAudioPreviewShutdownWaitersKey; ///< NSMutableArray<dispatch_block_t> *
+static char kAudioPreviewFileResolverKey;   ///< VGAudioPreviewFileResolver * — current resolver
 
 // ─── Private category (runtime internals) ────────────────────────────────────
 
@@ -63,6 +65,11 @@ static char kAudioPreviewShutdownWaitersKey; ///< NSMutableArray<dispatch_block_
 // ─── Shutdown waiters (main-queue-confined) ───────────────────────────────────
 
 - (NSMutableArray<dispatch_block_t> *)_audioShutdownWaiters;
+
+// ─── Current file resolver (main-queue-confined) ─────────────────────────────
+
+- (nullable VGAudioPreviewFileResolver *)_audioFileResolver;
+- (void)_setAudioFileResolver:(nullable VGAudioPreviewFileResolver *)resolver;
 
 @end
 
@@ -120,6 +127,15 @@ static char kAudioPreviewShutdownWaitersKey; ///< NSMutableArray<dispatch_block_
     return arr;
 }
 
+- (nullable VGAudioPreviewFileResolver *)_audioFileResolver {
+    return objc_getAssociatedObject(self, &kAudioPreviewFileResolverKey);
+}
+
+- (void)_setAudioFileResolver:(nullable VGAudioPreviewFileResolver *)resolver {
+    objc_setAssociatedObject(self, &kAudioPreviewFileResolverKey, resolver,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
 @end
 
 // ─── Public category implementation ──────────────────────────────────────────
@@ -140,6 +156,11 @@ static char kAudioPreviewShutdownWaitersKey; ///< NSMutableArray<dispatch_block_
 //     Append waiter. Waiter fires when audio cleanup completes.
 //   ShutDown:
 //     Fire completion immediately (permanent closed state).
+//
+// S-P2: On graph shutdown, if a resolver is in flight and no runtime is
+//   installed, the resolver is cancelled and joined before _finishAudioShutdown.
+//   If a runtime exists, the runtime is invalidated first; then the resolver
+//   (if any) is cancelled and joined; then _finishAudioShutdown fires.
 //
 // Must be called on the main queue.
 //
@@ -186,14 +207,38 @@ static char kAudioPreviewShutdownWaitersKey; ///< NSMutableArray<dispatch_block_
     // 4. Capture and retain the current runtime strongly through audio cleanup.
     VanguardAudioPreviewRuntime *currentRuntime = [self audioPreviewRuntime];
 
+    // S-P2: Capture any in-flight resolver so we can cancel and join it.
+    // Clear the association so new requests (which are stale anyway after
+    // lifecycle transition) cannot reference it.
+    VGAudioPreviewFileResolver *currentResolver = [self _audioFileResolver];
+    if (currentResolver) {
+        [self _setAudioFileResolver:nil];
+    }
+
+    // Helper: cancel-and-join resolver then finish shutdown.
+    // Always called on the main queue after runtime invalidation (or
+    // immediately when no runtime is installed).
+    __weak VanguardGraphRuntime *weakSelf = self;
+
+    dispatch_block_t finishAfterResolverCleanup = ^{
+        if (currentResolver) {
+            [currentResolver cancelAndCleanupWithCompletion:^{
+                // Fires on main queue after ExtAudioFile dispose and temp removal.
+                VanguardGraphRuntime *ss = weakSelf;
+                [ss _finishAudioShutdown];
+            }];
+        } else {
+            [weakSelf _finishAudioShutdown];
+        }
+    };
+
     if (!currentRuntime) {
-        // No audio runtime — transition directly to ShutDown and drain waiters.
-        [self _finishAudioShutdown];
+        // No audio runtime — handle resolver then transition to ShutDown.
+        finishAfterResolverCleanup();
         return;
     }
 
     // 5. Weak self for the identity guard inside the completion.
-    __weak VanguardGraphRuntime *weakSelf = self;
     VanguardAudioPreviewRuntime *capturedRuntime = currentRuntime;
 
     [currentRuntime invalidateAsync:^{
@@ -208,7 +253,7 @@ static char kAudioPreviewShutdownWaitersKey; ///< NSMutableArray<dispatch_block_
                 [ss _setAudioPreviewRuntime:nil];
             }
 
-            [ss _finishAudioShutdown];
+            finishAfterResolverCleanup();
         });
     }];
 }
@@ -231,7 +276,8 @@ static char kAudioPreviewShutdownWaitersKey; ///< NSMutableArray<dispatch_block_
 
 // ─── setAudioSidecarPlan:timelineDuration:completion: ─────────────────────────
 //
-// Latest-request-wins audio runtime replacement with five-gate lifecycle safety.
+// Latest-request-wins audio runtime replacement with five-gate lifecycle safety
+// and one-shot file resolution for audiovisual sidecar URLs (S-P2).
 //
 // Five gates (all main-queue-confined):
 //   1. Lifecycle must be Active at entry.
@@ -240,9 +286,16 @@ static char kAudioPreviewShutdownWaitersKey; ///< NSMutableArray<dispatch_block_
 //   4. Associated runtime identity must still match (no newer runtime installed).
 //   5. Lifecycle and generation must still match before final installation.
 //
+// S-P2 addition:
+//   After old runtime teardown and before runtime construction, a one-shot
+//   VGAudioPreviewFileResolver resolves any audiovisual-container URLs in
+//   the sidecar plan to temporary CAF files. After resolution completes on
+//   the main queue, gates 2–5 are rechecked and a resolver-identity gate
+//   is applied before constructing VanguardAudioPreviewRuntime.
+//
 // Every code path invokes completion exactly once.
 // No runtime installs after graph shutdown begins.
-// Stale completions never clear or install over a newer runtime.
+// Stale completions never clear or install over a newer runtime/resolver.
 
 - (void)setAudioSidecarPlan:(nullable VGAudioSidecarPlan *)plan
            timelineDuration:(NSTimeInterval)timelineDuration
@@ -262,17 +315,27 @@ static char kAudioPreviewShutdownWaitersKey; ///< NSMutableArray<dispatch_block_
     // ── Increment replacement generation for this request ─────────────────────
     uint64_t myGeneration = [self _incrementAudioReplacementGeneration];
 
-    // ── Tear down existing runtime (fire-and-forget; new runtime built in completion) ──
+    // ── Tear down existing runtime (fire-and-forget; new runtime built after resolve) ──
     VanguardAudioPreviewRuntime *oldRuntime = [self audioPreviewRuntime];
+
+    // ── Capture the previous resolver (if any) ────────────────────────────────
+    //
+    // Cancellation and cleanup are sequenced after old-runtime invalidation
+    // in the branches below: runtime → resolver → beginResolution.
+    // No fire-and-forget cleanup here.
+    VGAudioPreviewFileResolver *oldResolver = [self _audioFileResolver];
 
     // Weak self for all async completions.
     __weak VanguardGraphRuntime *weakSelf = self;
 
-    dispatch_block_t installNewRuntime = ^{
-        // ── Gate 2: lifecycle must still be Active after old cleanup ─────────
+    // ── Block: begin resolution then install new runtime ─────────────────────
+    //
+    // Runs on main queue after old runtime teardown.
+    dispatch_block_t beginResolution = ^{
         VanguardGraphRuntime *ss = weakSelf;
         if (!ss) { completion(); return; }
 
+        // ── Gate 2: lifecycle must still be Active after old cleanup ─────────
         if ([ss _graphAudioLifecycleState] != VGGraphAudioLifecycleActive) {
             NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
                   @"setAudioSidecarPlan: rejected at gate 2 — graph shutdown during old cleanup");
@@ -289,10 +352,6 @@ static char kAudioPreviewShutdownWaitersKey; ///< NSMutableArray<dispatch_block_
         }
 
         // ── Gate 4: associated runtime identity must still match ─────────────
-        // If a newer request already installed a runtime, the old runtime that
-        // we cleaned up is no longer the current one. Guard: if the installed
-        // runtime is NOT the oldRuntime (or oldRuntime was nil), proceed.
-        // (For the nil-oldRuntime case this gate always passes.)
         if (oldRuntime && [ss audioPreviewRuntime] != nil &&
             [ss audioPreviewRuntime] != oldRuntime) {
             NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
@@ -301,68 +360,134 @@ static char kAudioPreviewShutdownWaitersKey; ///< NSMutableArray<dispatch_block_
             return;
         }
 
-        // ── Gate 5: lifecycle and generation still match before installation ──
+        // ── Gate 5: lifecycle and generation still match before resolution ────
         if ([ss _graphAudioLifecycleState] != VGGraphAudioLifecycleActive ||
             [ss _audioReplacementGeneration] != myGeneration) {
             NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
-                  @"setAudioSidecarPlan: stale at gate 5 — pre-install check failed");
+                  @"setAudioSidecarPlan: stale at gate 5 — pre-resolve check failed");
             completion();
             return;
         }
 
-        // ── Increment lifecycle epoch for the new runtime ────────────────────
-        [ss _incrementAudioPreviewEpoch];
-        uint64_t epoch = [ss _audioPreviewEpoch];
+        // ── Create and register a new one-shot resolver ──────────────────────
+        VGAudioPreviewFileResolver *myResolver = [[VGAudioPreviewFileResolver alloc] init];
+        [ss _setAudioFileResolver:myResolver];
 
-        // ── Snapshot provider (weak ref to graph runtime) ────────────────────
-        __weak VanguardGraphRuntime *weakSS = ss;
-        VGTimelineSnapshotProvider provider = ^VGTimelineStateSnapshot {
-            VanguardGraphRuntime *rt = weakSS;
-            if (!rt) {
-                return (VGTimelineStateSnapshot){ .isValid = NO };
+        // ── Start resolution ─────────────────────────────────────────────────
+        [myResolver resolvePlan:plan
+                     completion:^(VGAudioSidecarPlan *_Nullable resolvedPlan) {
+            // Fires on main queue.
+            VanguardGraphRuntime *ss2 = weakSelf;
+            if (!ss2) { completion(); return; }
+
+            // ── Post-resolve gate A: lifecycle ───────────────────────────────
+            if ([ss2 _graphAudioLifecycleState] != VGGraphAudioLifecycleActive) {
+                NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
+                      @"setAudioSidecarPlan: stale after resolve — graph shutdown");
+                completion();
+                return;
             }
-            return [rt readTimelineStateSnapshot];
-        };
 
-        // ── Construct new runtime ────────────────────────────────────────────
-        VanguardAudioPreviewRuntime *newRuntime =
-            [[VanguardAudioPreviewRuntime alloc]
-                initWithSnapshotProvider:provider
-                          lifecycleEpoch:epoch];
+            // ── Post-resolve gate B: generation ─────────────────────────────
+            if ([ss2 _audioReplacementGeneration] != myGeneration) {
+                NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
+                      @"setAudioSidecarPlan: stale after resolve — generation mismatch");
+                completion();
+                return;
+            }
 
-        VGAudioPreviewPreparationResult result =
-            [newRuntime prepareWithSidecarPlan:plan timelineDuration:timelineDuration];
+            // ── Post-resolve gate C: resolver identity ───────────────────────
+            //
+            // A newer request would have replaced the associated resolver.
+            // If ours is no longer installed, our result is stale.
+            if ([ss2 _audioFileResolver] != myResolver) {
+                NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
+                      @"setAudioSidecarPlan: stale after resolve — resolver identity replaced");
+                completion();
+                return;
+            }
 
-        NSLog(@"[VanguardGraphRuntime+AudioPreview][D] prepare result=%ld epoch=%llu",
-              (long)result, (unsigned long long)epoch);
+            // ── Increment lifecycle epoch for the new runtime ────────────────
+            [ss2 _incrementAudioPreviewEpoch];
+            uint64_t epoch = [ss2 _audioPreviewEpoch];
 
-        // ── Final guard: if a newer request raced in during prepare, stale this one ──
-        if ([ss _graphAudioLifecycleState] != VGGraphAudioLifecycleActive ||
-            [ss _audioReplacementGeneration] != myGeneration) {
-            NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
-                  @"setAudioSidecarPlan: raced out after prepare — invalidating stale runtime");
-            [newRuntime invalidateAsync:^{
-                NSLog(@"[VanguardGraphRuntime+AudioPreview][D] stale new runtime invalidated");
-            }];
+            // ── Snapshot provider (weak ref to graph runtime) ────────────────
+            __weak VanguardGraphRuntime *weakSS2 = ss2;
+            VGTimelineSnapshotProvider provider = ^VGTimelineStateSnapshot {
+                VanguardGraphRuntime *rt = weakSS2;
+                if (!rt) {
+                    return (VGTimelineStateSnapshot){ .isValid = NO };
+                }
+                return [rt readTimelineStateSnapshot];
+            };
+
+            // ── Construct new runtime ────────────────────────────────────────
+            VanguardAudioPreviewRuntime *newRuntime =
+                [[VanguardAudioPreviewRuntime alloc]
+                    initWithSnapshotProvider:provider
+                              lifecycleEpoch:epoch];
+
+            // Use resolved plan (with CAF URLs) if resolution succeeded.
+            // A nil resolved plan means all tracks were dropped or extraction
+            // was cancelled — prepare silent mode; never retry the original
+            // MOV URL which is known to fail AVAudioFile initForReading:.
+            VGAudioSidecarPlan *planForPreparation = resolvedPlan;
+
+            VGAudioPreviewPreparationResult result =
+                [newRuntime prepareWithSidecarPlan:planForPreparation
+                                  timelineDuration:timelineDuration];
+
+            NSLog(@"[VanguardGraphRuntime+AudioPreview][D] prepare result=%ld epoch=%llu",
+                  (long)result, (unsigned long long)epoch);
+
+            // ── Final guard: if a newer request raced in during prepare ──────
+            if ([ss2 _graphAudioLifecycleState] != VGGraphAudioLifecycleActive ||
+                [ss2 _audioReplacementGeneration] != myGeneration) {
+                NSLog(@"[VanguardGraphRuntime+AudioPreview][D] "
+                      @"setAudioSidecarPlan: raced out after prepare — invalidating stale runtime");
+                [newRuntime invalidateAsync:^{
+                    NSLog(@"[VanguardGraphRuntime+AudioPreview][D] stale new runtime invalidated");
+                }];
+                completion();
+                return;
+            }
+
+            // ── Install the new runtime ──────────────────────────────────────
+            [ss2 _setAudioPreviewRuntime:newRuntime];
             completion();
-            return;
-        }
-
-        // ── Install the new runtime ──────────────────────────────────────────
-        [ss _setAudioPreviewRuntime:newRuntime];
-        completion();
+        }];
     };
 
     if (oldRuntime) {
         // Retain old runtime strongly through its own cleanup.
+        // Sequencing: await runtime invalidation → await resolver cleanup → beginResolution.
         VanguardAudioPreviewRuntime *retainedOld = oldRuntime;
         [self _setAudioPreviewRuntime:nil];
         [retainedOld invalidateAsync:^{
-            dispatch_async(dispatch_get_main_queue(), installNewRuntime);
+            // Runtime is now fully invalidated. If there is a prior resolver,
+            // join it before starting the new request so that its temp files
+            // are not deleted while AVAudioFile holds them open.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (oldResolver) {
+                    [oldResolver cancelAndCleanupWithCompletion:^{
+                        dispatch_async(dispatch_get_main_queue(), beginResolution);
+                    }];
+                } else {
+                    beginResolution();
+                }
+            });
+        }];
+    } else if (oldResolver) {
+        // No runtime, but a prior resolver is in flight (e.g. a rapid
+        // second call before the first resolve finished). Join its cleanup
+        // before beginning the new resolution.
+        [self _setAudioFileResolver:nil];
+        [oldResolver cancelAndCleanupWithCompletion:^{
+            dispatch_async(dispatch_get_main_queue(), beginResolution);
         }];
     } else {
-        // No existing runtime — install immediately.
-        dispatch_async(dispatch_get_main_queue(), installNewRuntime);
+        // No existing runtime or resolver — begin resolution immediately.
+        dispatch_async(dispatch_get_main_queue(), beginResolution);
     }
 }
 

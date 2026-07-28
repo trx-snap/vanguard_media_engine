@@ -10,6 +10,10 @@
 //   TD-3  disposeAsync() followed by dispose() sends one request
 //   TD-4  dispose() alone sends one request
 //   TD-5  commands are rejected immediately after dispose() is called
+//   TD-6  repeated disposeAsyncConfirmed() returns identical future and dispatches once
+//   TD-7  disposeAsyncConfirmed() -> disposeAsync() shares dispatch; confirmed propagates error while best-effort completes
+//   TD-8  disposeAsync() -> disposeAsyncConfirmed() shares dispatch; best-effort completes while confirmed propagates error
+//   TD-9  dispose() -> disposeAsyncConfirmed() shares dispatch; confirmed joins raw future and propagates error
 
 import 'dart:async';
 
@@ -45,7 +49,7 @@ class _MockChannel {
   int disposeCount = 0;
   Completer<void>? _blockCompleter;
 
-  void install({bool block = false}) {
+  void install({bool block = false, bool throwException = false}) {
     if (block) {
       _blockCompleter = Completer<void>();
     }
@@ -57,6 +61,12 @@ class _MockChannel {
               disposeCount++;
               if (_blockCompleter != null) {
                 await _blockCompleter!.future;
+              }
+              if (throwException) {
+                throw PlatformException(
+                  code: 'TEARDOWN_FAILED',
+                  message: 'Mock native teardown error',
+                );
               }
               return null;
             }
@@ -222,5 +232,91 @@ void main() {
         reason: 'pause() must throw after dispose()',
       );
     });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TD-6: repeated disposeAsyncConfirmed() returns identical future and dispatches once
+    // ─────────────────────────────────────────────────────────────────────────
+
+    test(
+      'TD-6  repeated disposeAsyncConfirmed() returns identical future and dispatches once',
+      () async {
+        mock.install(block: true);
+        final controller = VGEditorController(initialDraft: _draft());
+
+        final f1 = controller.disposeAsyncConfirmed();
+        final f2 = controller.disposeAsyncConfirmed();
+        final f3 = controller.disposeAsyncConfirmed();
+
+        expect(identical(f1, f2), isTrue);
+        expect(identical(f1, f3), isTrue);
+
+        mock.completeBlock();
+        await f1;
+
+        expect(mock.disposeCount, equals(1));
+        controller.dispose();
+      },
+    );
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TD-7: disposeAsyncConfirmed() -> disposeAsync() shares dispatch; confirmed propagates error while best-effort completes
+    // ─────────────────────────────────────────────────────────────────────────
+
+    test(
+      'TD-7  disposeAsyncConfirmed() -> disposeAsync() shares dispatch; confirmed propagates error while best-effort completes',
+      () async {
+        mock.install(throwException: true);
+        final controller = VGEditorController(initialDraft: _draft());
+
+        final fConfirmed = controller.disposeAsyncConfirmed();
+        final fBestEffort = controller.disposeAsync();
+
+        await expectLater(fConfirmed, throwsA(isA<PlatformException>()));
+        await expectLater(fBestEffort, completes);
+
+        expect(mock.disposeCount, equals(1));
+        controller.dispose();
+      },
+    );
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TD-8: disposeAsync() -> disposeAsyncConfirmed() shares dispatch; best-effort completes while confirmed propagates error
+    // ─────────────────────────────────────────────────────────────────────────
+
+    test(
+      'TD-8  disposeAsync() -> disposeAsyncConfirmed() shares dispatch; best-effort completes while confirmed propagates error',
+      () async {
+        mock.install(throwException: true);
+        final controller = VGEditorController(initialDraft: _draft());
+
+        final fBestEffort = controller.disposeAsync();
+        final fConfirmed = controller.disposeAsyncConfirmed();
+
+        await expectLater(fBestEffort, completes);
+        await expectLater(fConfirmed, throwsA(isA<PlatformException>()));
+
+        expect(mock.disposeCount, equals(1));
+        controller.dispose();
+      },
+    );
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TD-9: dispose() -> disposeAsyncConfirmed() shares dispatch; confirmed joins raw future and propagates error
+    // ─────────────────────────────────────────────────────────────────────────
+
+    test(
+      'TD-9  dispose() -> disposeAsyncConfirmed() shares dispatch; confirmed joins raw future and propagates error',
+      () async {
+        mock.install(throwException: true);
+        final controller = VGEditorController(initialDraft: _draft());
+
+        controller.dispose();
+        final fConfirmed = controller.disposeAsyncConfirmed();
+
+        await expectLater(fConfirmed, throwsA(isA<PlatformException>()));
+
+        expect(mock.disposeCount, equals(1));
+      },
+    );
   });
 }

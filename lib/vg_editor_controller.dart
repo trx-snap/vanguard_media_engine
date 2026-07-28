@@ -215,16 +215,26 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
   // ── Teardown — exact-once dispatch (Phase 10-C Slice D teardown fix) ────────
   //
-  // _teardownFuture is set the first time either [disposeAsync] or [dispose]
-  // dispatches the native `disposeTimeline` MethodChannel call. Subsequent
-  // calls to [disposeAsync] return the same future; [dispose] skips the
-  // native call if _teardownFuture is already set.
+  // _rawTeardownFuture is the bare MethodChannel future for `disposeTimeline`,
+  // set the first time native teardown is dispatched. It propagates any
+  // PlatformException or error the native side returns.
   //
-  // This ensures:
+  // _teardownFuture is the best-effort wrapper: the same dispatch but with
+  // errors swallowed via .catchError. This is what [disposeAsync] and the
+  // fire-and-forget path in [dispose] return.
+  //
+  // Both fields are set atomically (same microtask) so there is never a window
+  // where one is set and the other is not.
+  //
+  // Invariants:
   //   - `disposeTimeline` is sent to native exactly once.
-  //   - Repeated [disposeAsync] calls join the same teardown future.
+  //   - Repeated [disposeAsync] calls join the same best-effort future.
+  //   - [disposeAsyncConfirmed] joins the same raw future and propagates errors.
   //   - [disposeAsync] followed by [dispose] does not send a second request.
+  //   - [disposeAsyncConfirmed] followed by [disposeAsync] (or vice-versa) shares
+  //     the single dispatch.
   //   - [dispose] alone still triggers native teardown (fire-and-forget).
+  Future<void>? _rawTeardownFuture;
   Future<void>? _teardownFuture;
 
   // ── Latest-wins seek coalescer ─────────────────────────────────────────────
@@ -1153,33 +1163,86 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// Repeated calls are safe and idempotent — every call returns the same
   /// teardown future. Native `disposeTimeline` is dispatched exactly once.
   ///
+  /// Errors from the native side are swallowed (best-effort). Use
+  /// [disposeAsyncConfirmed] when the caller must distinguish a confirmed
+  /// native teardown from a failed one.
+  ///
   /// Call this before [dispose] in the owning widget's dispose lifecycle.
   Future<void> disposeAsync() {
     if (_disposed) return Future<void>.value();
 
-    // If native teardown has already been dispatched, return the cached future
-    // so the caller joins the in-flight operation without sending a second
-    // disposeTimeline request.
+    // If native teardown has already been dispatched, return the cached
+    // best-effort future so the caller joins the in-flight operation without
+    // sending a second disposeTimeline request.
     if (_teardownFuture != null) return _teardownFuture!;
 
+    _dispatchTeardown();
+    return _teardownFuture!;
+  }
+
+  /// Asynchronously tears down the native timeline and propagates failures.
+  ///
+  /// Maps to `disposeTimeline` (Phase 7.8 production route).
+  ///
+  /// Like [disposeAsync], dispatches `disposeTimeline` at most once — if
+  /// teardown was already initiated (by [disposeAsync] or a prior call to this
+  /// method), this joins the same raw in-flight native operation rather than
+  /// sending a second request.
+  ///
+  /// Unlike [disposeAsync], this method propagates any [PlatformException] or
+  /// other error returned by the native side. The caller can use this to
+  /// distinguish a confirmed native teardown from an unconfirmed one.
+  ///
+  /// Compatible with [disposeAsync] and [dispose] in any call order:
+  ///   - [disposeAsyncConfirmed] → [disposeAsync]:  both join the same dispatch;
+  ///     [disposeAsync] still swallows the error.
+  ///   - [disposeAsync] → [disposeAsyncConfirmed]:  [disposeAsyncConfirmed]
+  ///     joins the raw future and will propagate an error if native failed
+  ///     (even if [disposeAsync] already swallowed it).
+  ///   - [dispose] → [disposeAsyncConfirmed]:  [dispose] already triggered
+  ///     the native call; [disposeAsyncConfirmed] joins the raw future.
+  ///
+  /// Never sends a second `disposeTimeline` request regardless of call order.
+  Future<void> disposeAsyncConfirmed() {
+    // Check for an already-dispatched raw teardown first — even if dispose()
+    // has been called. If dispose() fired _dispatchTeardown() before this
+    // method was reached, we must join that raw future and propagate its native
+    // error rather than returning a silent completed future.
+    if (_rawTeardownFuture != null) return _rawTeardownFuture!;
+
+    // Only return a completed future when the controller is disposed AND no
+    // raw teardown was ever dispatched (i.e. native was never called at all).
+    if (_disposed) return Future<void>.value();
+
+    // Dispatch exactly once, then return the raw (error-propagating) future.
+    _dispatchTeardown();
+    return _rawTeardownFuture!;
+  }
+
+  /// Internal: dispatches `disposeTimeline` exactly once, populating both
+  /// [_rawTeardownFuture] (error-propagating) and [_teardownFuture]
+  /// (best-effort / error-swallowing). Called by [disposeAsync],
+  /// [disposeAsyncConfirmed], and [dispose]. Must not be called when
+  /// [_rawTeardownFuture] is already set.
+  void _dispatchTeardown() {
+    assert(_rawTeardownFuture == null,
+        '_dispatchTeardown called after teardown already dispatched');
+
     // Unregister timeline subscription so no callbacks arrive after teardown
-    // begins. Done synchronously before the first await so the subscription
-    // cannot deliver frames during the async native call.
+    // begins. Done synchronously before the MethodChannel call so the
+    // subscription cannot deliver frames during the async native call.
     final dispatcher = VanguardChannelDispatcher.instance;
     if (_timelineSubscription != null) {
       dispatcher.unregisterTimelineListener(_timelineSubscription!);
       _timelineSubscription = null;
     }
 
-    // Cache the future before awaiting so that a concurrent disposeAsync()
-    // call arriving on the next microtask sees _teardownFuture != null and
-    // returns this same future rather than dispatching a second request.
-    _teardownFuture = _channel.invokeMethod<void>('disposeTimeline').catchError(
-      (_) {
-        // Best-effort — native may already be gone.
-      },
-    );
-    return _teardownFuture!;
+    // Store the raw future first. Both fields are set in the same microtask
+    // so there is never a window where one is set and the other is not.
+    _rawTeardownFuture = _channel.invokeMethod<void>('disposeTimeline');
+    _teardownFuture = _rawTeardownFuture!.catchError((_) {
+      // Best-effort — native may already be gone.
+    });
   }
 
   /// Synchronously closes streams and releases [ValueNotifier] resources.
@@ -1205,11 +1268,11 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     _ptsController.close();
     _eosController.close();
 
-    // Dispatch native teardown fire-and-forget ONLY if disposeAsync() has not
-    // already done so. This ensures disposeTimeline is sent exactly once
-    // regardless of whether the caller followed the async → sync sequence.
-    _teardownFuture ??=
-        _channel.invokeMethod<void>('disposeTimeline').catchError((_) {});
+    // Dispatch native teardown fire-and-forget ONLY if neither disposeAsync()
+    // nor disposeAsyncConfirmed() has already done so. Delegates to
+    // _dispatchTeardown() so disposeTimeline is sent exactly once regardless
+    // of which disposal path the caller used.
+    if (_rawTeardownFuture == null) _dispatchTeardown();
 
     super.dispose();
   }

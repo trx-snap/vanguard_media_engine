@@ -44,6 +44,8 @@ Pod::Spec.new do |s|
     # VanguardGraphRuntime+AudioPreview.h is module-visible (not private_header_files)
     # so Swift can call setAudioSidecarPlan:timelineDuration:completion: and
     # recoverAudioPreviewAfterSessionTransitionWithCompletion: directly.
+    # S-P2: audiovisual-to-CAF resolver — package-internal only.
+    'Classes/VGAudioPreviewFileResolver.h',
   ]
 
   # Phase 9B — model asset bundle.
@@ -84,7 +86,7 @@ Pod::Spec.new do |s|
   s.platform         = :ios, '14.0'
 
   # Frameworks required for the GPU pipeline + Vision (Phase 4C face detection, DEC-61)
-  s.frameworks       = 'Metal', 'MetalKit', 'AVFoundation', 'CoreVideo', 'CoreMedia', 'VideoToolbox', 'Vision'
+  s.frameworks       = 'Metal', 'MetalKit', 'AVFoundation', 'CoreVideo', 'CoreMedia', 'VideoToolbox', 'Vision', 'AudioToolbox'
 
   s.pod_target_xcconfig = {
     'DEFINES_MODULE'                                          => 'YES',
@@ -242,7 +244,12 @@ Pod::Spec.new do |s|
       'Tests/VGWaveformCacheTests.m',
       'Tests/VGWaveformCacheMethodHandlerTests.swift',
       # S-P1: timeline live filter-chain control handler tests
-      'Tests/VGTimelineLiveControlHandlerTests.swift'
+      'Tests/VGTimelineLiveControlHandlerTests.swift',
+      # S-P2: MOV-to-CAF audio preview file resolver tests
+      'Tests/VGAudioPreviewFileResolverTests.m'
+    ]
+    ts.resources     = [
+      'Tests/Fixtures/benchmark_face_clip.mov'
     ]
     ts.frameworks    = 'Metal', 'ImageIO', 'CoreImage', 'AVFoundation'
     ts.dependency    'UMF'
