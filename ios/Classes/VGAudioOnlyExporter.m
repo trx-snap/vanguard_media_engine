@@ -22,7 +22,7 @@
 //   - finishWritingWithCompletionHandler: — check writer.status in handler
 //   - AVFileTypeAppleM4A supported for audio-only M4A
 //   - AVFileTypeWAVE supported; AVLinearPCMIsFloatKey must be NO
-//   - cancelWriting blocks calling thread — dispatched to global queue to avoid deadlock
+//   - cancelWriting blocks calling thread — called synchronously on export queue
 //   - cancelWriting deletes the output file automatically
 //   - cancelReading stops reader from producing more samples
 //   - expectsMediaDataInRealTime = NO for offline export
@@ -61,6 +61,11 @@ static void _VGAudioOnlyExporterLogInit(void) {
     VGAudioExportProfile *_profile;
     NSURL                *_outputURL;
 
+    // Phase 10-C Slice T: optional trim range applied to AVAssetReader.
+    // CMTIME_IS_INVALID(_trimRange.start) when no trim is requested (full range).
+    CMTimeRange _trimRange;
+    BOOL _hasTrimRange;
+
     // Private serial export queue
     dispatch_queue_t _exportQueue;
 
@@ -90,9 +95,11 @@ static void _VGAudioOnlyExporterLogInit(void) {
     self = [super init];
     if (!self) return nil;
 
-    _asset     = asset;
-    _profile   = profile;
-    _outputURL = [outputURL copy];
+    _asset        = asset;
+    _profile      = profile;
+    _outputURL    = [outputURL copy];
+    _hasTrimRange = NO;
+    _trimRange    = kCMTimeRangeZero;
 
     atomic_init(&_startedAtomic,    0);
     atomic_init(&_completionFired,  0);
@@ -107,6 +114,28 @@ static void _VGAudioOnlyExporterLogInit(void) {
     os_log_debug(sExporterLog,
                  "[VGAudioOnlyExporter] init outputURL=%{public}@",
                  outputURL.lastPathComponent);
+    return self;
+}
+
+// ─── Trim-range initializer (Phase 10-C Slice T) ──────────────────────────────
+
+- (instancetype)initWithAsset:(AVAsset *)asset
+                      profile:(VGAudioExportProfile *)profile
+                    outputURL:(NSURL *)outputURL
+                    trimRange:(CMTimeRange)trimRange {
+    // Delegate to the designated initializer to set up all shared state.
+    self = [self initWithAsset:asset profile:profile outputURL:outputURL];
+    if (!self) return nil;
+
+    // Record the trim range. Validation happens in _runExport so that
+    // startWithCompletion: fires the completion block via the normal
+    // quiescence path rather than throwing.
+    _hasTrimRange = YES;
+    _trimRange    = trimRange;
+
+    os_log_debug(sExporterLog,
+                 "[VGAudioOnlyExporter] initWithTrimRange start=%.3fs",
+                 CMTimeGetSeconds(trimRange.start));
     return self;
 }
 
@@ -130,9 +159,9 @@ static void _VGAudioOnlyExporterLogInit(void) {
 - (void)cancel {
     atomic_store(&_cancelledAtomic, 1);
     // The sample pump checks this flag on each iteration and performs
-    // safe cleanup (markAsFinished → cancelReading → cancelWriting on
-    // global queue). We do not call cancelWriting here because it blocks
-    // and the caller's thread is unknown.
+    // safe cleanup (markAsFinished → cancelReading → cancelWriting
+    // synchronously on _exportQueue). We do not call cancelWriting here
+    // because the caller's thread is unknown.
     os_log_debug(sExporterLog, "[VGAudioOnlyExporter] cancel requested");
 }
 
@@ -266,6 +295,41 @@ static void _VGAudioOnlyExporterLogInit(void) {
         return;
     }
 
+    // Phase 10-C Slice T: apply trim range to the reader when set.
+    // Validates range bounds before setting — an invalid range fires failure
+    // via the same quiescence path as any other setup error.
+    if (_hasTrimRange) {
+        CMTime startTime = _trimRange.start;
+        CMTime duration  = _trimRange.duration;
+        // start must be non-negative and representable.
+        if (!CMTIME_IS_VALID(startTime) || CMTIME_IS_NEGATIVE_INFINITY(startTime)
+            || CMTimeCompare(startTime, kCMTimeZero) < 0) {
+            [self _fireCompletionWithManifest:nil
+                                       error:[self _errorWithCode:VGAudioOnlyExporterErrorReaderSetup
+                                                          message:@"trimRange start is invalid or negative"
+                                                       underlying:nil]];
+            return;
+        }
+        // Duration must be positive or positive-infinity (open-ended trim).
+        if (CMTIME_IS_VALID(duration) && !CMTIME_IS_POSITIVE_INFINITY(duration)
+            && CMTimeCompare(duration, kCMTimeZero) <= 0) {
+            [self _fireCompletionWithManifest:nil
+                                       error:[self _errorWithCode:VGAudioOnlyExporterErrorReaderSetup
+                                                          message:@"trimRange duration must be positive"
+                                                       underlying:nil]];
+            return;
+        }
+        // Apply range — AVAssetReader clips automatically at the asset's end.
+        // Positive-infinity duration means "read to end"; we convert it to
+        // a valid range by letting AVAssetReader handle clamping.
+        CMTimeRange applyRange = _trimRange;
+        if (CMTIME_IS_POSITIVE_INFINITY(duration)) {
+            // Open-ended: read from start to EOF (same as full-range but offset).
+            applyRange = CMTimeRangeMake(startTime, kCMTimePositiveInfinity);
+        }
+        _reader.timeRange = applyRange;
+    }
+
     // ── Step 6: Create AVAssetReaderTrackOutput ────────────────────────────────
     // Request PCM decompression so the pump produces raw samples
     // that can be re-encoded by AVAssetWriterInput.
@@ -366,12 +430,20 @@ static void _VGAudioOnlyExporterLogInit(void) {
     [_writer startSessionAtSourceTime:kCMTimeZero];
 
     // ── Step 11: Start reader ─────────────────────────────────────────────────
+    // If reader start fails AFTER the writer has already started, cancel the
+    // writer synchronously before firing terminal completion to ensure
+    // quiescence and to avoid a partially-open writer session.
 
     if (![_reader startReading]) {
+        NSError *readerStartErr = _reader.error;
+        // Writer was already started in Step 10 — cancel it synchronously.
+        // cancelWriting blocks on the calling thread (_exportQueue); this is
+        // safe because we are on a background serial queue.
+        [_writer cancelWriting];
         [self _fireCompletionWithManifest:nil
                                    error:[self _errorWithCode:VGAudioOnlyExporterErrorReaderStart
-                                                      message:@"AVAssetReader failed to start reading"
-                                                   underlying:_reader.error]];
+                                                       message:@"AVAssetReader failed to start reading"
+                                                    underlying:readerStartErr]];
         return;
     }
 
@@ -393,15 +465,17 @@ static void _VGAudioOnlyExporterLogInit(void) {
             // Cancellation check at the top of each iteration.
             if (atomic_load(&strongSelf->_cancelledAtomic) != 0) {
                 [writerInput markAsFinished];
-                // cancelReading stops the reader immediately.
                 AVAssetReader *reader = strongSelf->_reader;
                 [reader cancelReading];
-                // cancelWriting blocks — dispatch to global queue to avoid
-                // blocking the export queue from future use.
+                // Phase 10-C Slice T — Quiescence fix:
+                // cancelWriting BLOCKS the calling thread, guaranteeing that
+                // the writer is fully terminal before we fire completion.
+                // We are already on _exportQueue (a background serial queue),
+                // so blocking here is safe and does not touch the main thread.
+                // Completion fires AFTER cancelWriting returns — no future
+                // write is possible at that point.
                 AVAssetWriter *writer = strongSelf->_writer;
-                dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-                    [writer cancelWriting];
-                });
+                [writer cancelWriting];  // synchronous — quiescence guaranteed
                 [strongSelf _fireCompletionWithManifest:nil
                                                   error:[strongSelf _cancelledError]];
                 return;
@@ -419,13 +493,15 @@ static void _VGAudioOnlyExporterLogInit(void) {
                     os_log_error(sExporterLog,
                                  "[VGAudioOnlyExporter] reader failed: %{public}@", readErr);
                     [writerInput markAsFinished];
+                    // Phase 10-C Slice T — Quiescence fix:
+                    // Same synchronous cancelWriting pattern as above.
+                    // Use ReaderRuntimeFailure(14) — distinct from WriterFailed(11)
+                    // so the handler maps this to readFailure, not writeFailure.
                     AVAssetWriter *writer = strongSelf->_writer;
-                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-                        [writer cancelWriting];
-                    });
+                    [writer cancelWriting];  // synchronous — quiescence guaranteed
                     [strongSelf _fireCompletionWithManifest:nil
                                                       error:[strongSelf
-                                                             _errorWithCode:VGAudioOnlyExporterErrorWriterFailed
+                                                             _errorWithCode:VGAudioOnlyExporterErrorReaderRuntimeFailure
                                                              message:@"AVAssetReader failed during export"
                                                              underlying:readErr]];
                     return;
@@ -433,6 +509,8 @@ static void _VGAudioOnlyExporterLogInit(void) {
 
                 if (readerStatus == AVAssetReaderStatusCancelled) {
                     [writerInput markAsFinished];
+                    // Writer was already cancelled by our cancellation path above;
+                    // no need to call cancelWriting a second time.
                     [strongSelf _fireCompletionWithManifest:nil
                                                       error:[strongSelf _cancelledError]];
                     return;
@@ -460,10 +538,10 @@ static void _VGAudioOnlyExporterLogInit(void) {
                 // Do not call markAsFinished — the input is in an error state.
                 AVAssetReader *reader = strongSelf->_reader;
                 [reader cancelReading];
+                // Phase 10-C Slice T — Quiescence fix:
+                // Same synchronous cancelWriting pattern.
                 AVAssetWriter *writer = strongSelf->_writer;
-                dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
-                    [writer cancelWriting];
-                });
+                [writer cancelWriting];  // synchronous — quiescence guaranteed
                 [strongSelf _fireCompletionWithManifest:nil
                                                   error:[strongSelf
                                                          _errorWithCode:VGAudioOnlyExporterErrorWriterFailed

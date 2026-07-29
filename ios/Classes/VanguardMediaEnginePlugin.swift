@@ -113,6 +113,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // state for all waveformCache_* MethodChannel routes.
     private let waveformCacheHandler = VGWaveformCacheMethodHandler()
 
+    // ── Phase 10-C Slice T: managed audio extraction handler ─────────────────
+    // Owns the operation registry, VGAudioOnlyExporter instances, and
+    // terminal/cancellation bookkeeping for beginAudioExtraction and
+    // cancelAudioExtraction routes. Plugin is a thin router only.
+    private let audioExtractionHandler = VanguardAudioExtractionHandler()
+
     // ── S-P1: timeline live filter-chain handler ──────────────────────────────
     // Owns all parsing, stale-target checking, and runtime delegation for the
     // `timeline_setFilterChain` route. Plugin provides composition wiring only.
@@ -6293,6 +6299,15 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             _audioRecordingHandler.handleStop(handle: self._timelineRuntime,
                                               result: result)
         #endif
+
+        // ── Phase 10-C Slice T: Managed audio extraction ──────────────────────
+        // The handler owns all state, registry, and lifecycle.
+        // Plugin performs argument pass-through only.
+        case "beginAudioExtraction":
+            audioExtractionHandler.handleBegin(args: args, result: result)
+
+        case "cancelAudioExtraction":
+            audioExtractionHandler.handleCancel(args: args, result: result)
 
         default:
             result(FlutterMethodNotImplemented)

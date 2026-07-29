@@ -62,7 +62,7 @@ static NSURL *VGAOE_CreateSineWave(double durationSec, float sampleRate, int cha
     };
 
     CMBlockBufferRef bb = NULL;
-    CMBlockBufferCreateWithMemoryBlock(NULL, buf, dataSize, kCFAllocatorNull,
+    CMBlockBufferCreateWithMemoryBlock(NULL, buf, dataSize, kCFAllocatorMalloc,
                                        NULL, 0, dataSize, 0, &bb);
 
     // Simpler: use CMSampleBufferCreate
@@ -75,7 +75,6 @@ static NSURL *VGAOE_CreateSineWave(double durationSec, float sampleRate, int cha
                           1, &timing, 0, NULL, &sample);
     CFRelease(bb);
     if (fmt) CFRelease(fmt);
-    free(buf);
 
     if (sample) {
         [inp appendSampleBuffer:sample];
@@ -156,11 +155,11 @@ static NSURL *VGAOE_CreateVideoWithAudio(void) {
     CMFormatDescriptionRef afmt = NULL;
     CMAudioFormatDescriptionCreate(NULL, &asbd, 0, NULL, 0, NULL, NULL, &afmt);
     CMBlockBufferRef abb = NULL;
-    CMBlockBufferCreateWithMemoryBlock(NULL, abuf, ds, kCFAllocatorNull, NULL, 0, ds, 0, &abb);
+    CMBlockBufferCreateWithMemoryBlock(NULL, abuf, ds, kCFAllocatorMalloc, NULL, 0, ds, 0, &abb);
     CMSampleTimingInfo atiming = { CMTimeMake(1, (int32_t)sr), kCMTimeZero, kCMTimeInvalid };
     CMSampleBufferRef asample = NULL;
     CMSampleBufferCreate(NULL, abb, YES, NULL, NULL, afmt, ns, 1, &atiming, 0, NULL, &asample);
-    CFRelease(abb); free(abuf);
+    CFRelease(abb);
     if (afmt) CFRelease(afmt);
     if (asample) { [ai appendSampleBuffer:asample]; CFRelease(asample); }
     [ai markAsFinished];
@@ -405,6 +404,70 @@ static NSURL *VGAOE_CreateVideoWithAudio(void) {
         [exp fulfill];
     }];
     [self waitForExpectationsWithTimeout:30 handler:nil];
+    [[NSFileManager defaultManager] removeItemAtURL:src error:nil];
+    [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+}
+
+- (void)testTC_5E2_14_boundedTrimProducesRequestedDuration {
+    NSURL *src = VGAOE_CreateSineWave(5.0, 44100, 2);
+    XCTAssertNotNil(src);
+    AVAsset *asset = [AVAsset assetWithURL:src];
+    NSURL *out = VGAOE_TempURL(@"m4a");
+    CMTimeRange trim = CMTimeRangeMake(CMTimeMakeWithSeconds(1.0, 1000), CMTimeMakeWithSeconds(2.0, 1000));
+    VGAudioOnlyExporter *sut = [[VGAudioOnlyExporter alloc]
+        initWithAsset:asset profile:[VGAudioExportProfile m4aDefaultProfile] outputURL:out trimRange:trim];
+    XCTestExpectation *exp = [self expectationWithDescription:@"boundedTrim"];
+    [sut startWithCompletion:^(VGAudioExportManifest *m, NSError *e) {
+        XCTAssertNil(e);
+        XCTAssertNotNil(m);
+        AVAsset *outAsset = [AVAsset assetWithURL:out];
+        double seconds = CMTimeGetSeconds(outAsset.duration);
+        XCTAssertEqualWithAccuracy(seconds, 2.0, 0.5);
+        [exp fulfill];
+    }];
+    [self waitForExpectationsWithTimeout:30 handler:nil];
+    [[NSFileManager defaultManager] removeItemAtURL:src error:nil];
+    [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+}
+
+- (void)testTC_5E2_15_startOnlyTrimRunsToEOF {
+    NSURL *src = VGAOE_CreateSineWave(5.0, 44100, 2);
+    XCTAssertNotNil(src);
+    AVAsset *asset = [AVAsset assetWithURL:src];
+    NSURL *out = VGAOE_TempURL(@"m4a");
+    CMTimeRange trim = CMTimeRangeMake(CMTimeMakeWithSeconds(2.0, 1000), kCMTimePositiveInfinity);
+    VGAudioOnlyExporter *sut = [[VGAudioOnlyExporter alloc]
+        initWithAsset:asset profile:[VGAudioExportProfile m4aDefaultProfile] outputURL:out trimRange:trim];
+    XCTestExpectation *exp = [self expectationWithDescription:@"startOnlyTrim"];
+    [sut startWithCompletion:^(VGAudioExportManifest *m, NSError *e) {
+        XCTAssertNil(e);
+        XCTAssertNotNil(m);
+        AVAsset *outAsset = [AVAsset assetWithURL:out];
+        double seconds = CMTimeGetSeconds(outAsset.duration);
+        XCTAssertEqualWithAccuracy(seconds, 3.0, 0.5);
+        [exp fulfill];
+    }];
+    [self waitForExpectationsWithTimeout:30 handler:nil];
+    [[NSFileManager defaultManager] removeItemAtURL:src error:nil];
+    [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+}
+
+- (void)testTC_5E2_16_invalidTrimDurationReturnsReaderSetupError {
+    NSURL *src = VGAOE_CreateSineWave(2.0, 44100, 2);
+    XCTAssertNotNil(src);
+    AVAsset *asset = [AVAsset assetWithURL:src];
+    NSURL *out = VGAOE_TempURL(@"m4a");
+    CMTimeRange trim = CMTimeRangeMake(CMTimeMakeWithSeconds(1.0, 1000), CMTimeMakeWithSeconds(0.0, 1000));
+    VGAudioOnlyExporter *sut = [[VGAudioOnlyExporter alloc]
+        initWithAsset:asset profile:[VGAudioExportProfile m4aDefaultProfile] outputURL:out trimRange:trim];
+    XCTestExpectation *exp = [self expectationWithDescription:@"invalidTrim"];
+    [sut startWithCompletion:^(VGAudioExportManifest *m, NSError *e) {
+        XCTAssertNil(m);
+        XCTAssertNotNil(e);
+        XCTAssertEqual(e.code, VGAudioOnlyExporterErrorReaderSetup);
+        [exp fulfill];
+    }];
+    [self waitForExpectationsWithTimeout:10 handler:nil];
     [[NSFileManager defaultManager] removeItemAtURL:src error:nil];
     [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
 }

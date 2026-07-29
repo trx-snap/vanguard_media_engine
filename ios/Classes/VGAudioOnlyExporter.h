@@ -24,7 +24,9 @@
 //   Export runs on a private serial dispatch queue.
 //   requestMediaDataWhenReadyOnQueue uses the same private queue.
 //   Completion fires on the private queue (background).
-//   cancelWriting is dispatched to global queue to avoid blocking.
+//   cancelWriting is called synchronously on the export queue to guarantee
+//   quiescence before terminal completion fires.
+//   cancelReading stops reader from producing more samples.
 //
 // Supported formats:
 //   M4A/AAC: AVFileTypeAppleM4A + kAudioFormatMPEG4AAC
@@ -86,6 +88,9 @@ typedef NS_ENUM(NSInteger, VGAudioOnlyExporterErrorCode) {
     VGAudioOnlyExporterErrorOutputMissing       = 12,
     /// Export was cancelled.
     VGAudioOnlyExporterErrorCancelled           = 13,
+    /// AVAssetReader failed at runtime during the sample pump (after startReading
+    /// succeeded). Distinct from ReaderSetup/ReaderStart — maps to readFailure.
+    VGAudioOnlyExporterErrorReaderRuntimeFailure = 14,
 };
 
 // ─── VGAudioOnlyExporter ──────────────────────────────────────────────────────
@@ -102,7 +107,7 @@ typedef NS_ENUM(NSInteger, VGAudioOnlyExporterErrorCode) {
 
 // ─── Designated initializer ───────────────────────────────────────────────────
 
-/// Initialize the audio export service.
+/// Initialize the audio export service for full-range extraction.
 ///
 /// Does NOT start export — call startWithCompletion: to begin.
 ///
@@ -111,11 +116,34 @@ typedef NS_ENUM(NSInteger, VGAudioOnlyExporterErrorCode) {
 ///                   channels, container format). Must be non-nil.
 /// @param outputURL  Destination file URL. Any existing file is deleted before
 ///                   writing. Parent directory must exist.
+///
+/// All existing callers use this initializer; it is preserved unchanged.
 - (instancetype)initWithAsset:(AVAsset *)asset
                       profile:(VGAudioExportProfile *)profile
                     outputURL:(NSURL *)outputURL NS_DESIGNATED_INITIALIZER;
 
-/// Unavailable. Use initWithAsset:profile:outputURL:.
+/// Initialize the audio export service with an optional trim range.
+///
+/// Phase 10-C Slice T: cohesive trim API added alongside the existing
+/// full-range initializer. All existing callers continue to use the
+/// initWithAsset:profile:outputURL: initializer above.
+///
+/// @param asset      Source AVAsset with at least one audio track.
+/// @param profile    Audio export configuration. Must be non-nil.
+/// @param outputURL  Destination file URL. Parent directory must exist.
+/// @param trimRange  CMTimeRange to apply to the AVAssetReader. Pass
+///                   CMTimeRangeMake(kCMTimeZero, kCMTimePositiveInfinity)
+///                   for full-range extraction.
+///
+/// The range is validated before starting: start must be >= 0 and
+/// duration must be positive. An invalid range causes startWithCompletion:
+/// to fire completion with VGAudioOnlyExporterErrorReaderSetup.
+- (instancetype)initWithAsset:(AVAsset *)asset
+                      profile:(VGAudioExportProfile *)profile
+                    outputURL:(NSURL *)outputURL
+                    trimRange:(CMTimeRange)trimRange;
+
+/// Unavailable. Use initWithAsset:profile:outputURL: or initWithAsset:profile:outputURL:trimRange:.
 - (instancetype)init NS_UNAVAILABLE;
 
 // ─── State ────────────────────────────────────────────────────────────────────

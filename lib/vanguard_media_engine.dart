@@ -79,6 +79,8 @@ export 'vg_reverse_sidecar_status.dart';
 export 'vg_timeline_exporter.dart';
 // Phase 10-C: shared media-stack image optimizer (UMF/Vanguard owned; no FFmpeg).
 export 'vg_image_optimizer.dart';
+// Phase 10-C Slice T: managed, cancellable iOS audio extraction service.
+export 'src/audio_extraction/vg_audio_extraction_service.dart';
 // ROI Signal / Server-Ready Sidecar Dart Models (ROI-1A)
 export 'src/roi/vg_roi_models.dart';
 export 'src/roi/vg_roi_coordinate_converter.dart';

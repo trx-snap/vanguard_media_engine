@@ -246,7 +246,9 @@ Pod::Spec.new do |s|
       # S-P1: timeline live filter-chain control handler tests
       'Tests/VGTimelineLiveControlHandlerTests.swift',
       # S-P2: MOV-to-CAF audio preview file resolver tests
-      'Tests/VGAudioPreviewFileResolverTests.m'
+      'Tests/VGAudioPreviewFileResolverTests.m',
+      # Slice T Gate 6A: audio extraction handler tests
+      'Tests/VanguardAudioExtractionHandlerTests.swift'
     ]
     ts.resources     = [
       'Tests/Fixtures/benchmark_face_clip.mov'
