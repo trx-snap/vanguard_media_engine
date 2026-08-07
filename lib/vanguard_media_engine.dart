@@ -91,6 +91,8 @@ export 'src/roi/vg_roi_export_mapper.dart';
 export 'src/roi/vg_imported_roi_sidecar_builder.dart';
 // Audio Track Interaction S-P1: timeline-scoped live filter-chain control.
 export 'vg_timeline_live_controls.dart';
+// V-B1/V-B2: per-track live mix-gain control (no updateDraft call).
+export 'vg_timeline_audio_mix_controls.dart';
 
 const String _libName = 'vanguard_media_engine';
 

@@ -37,11 +37,13 @@ final class VGAudioDuckingConfig {
     this.attackSeconds = 0.15,
     this.releaseSeconds = 0.30,
     this.mergeGapSeconds = 0.05,
-  })  : assert(duckVolume >= 0.0 && duckVolume <= 1.0,
-            'duckVolume must be in [0, 1]'),
-        assert(attackSeconds >= 0.0, 'attackSeconds must be >= 0'),
-        assert(releaseSeconds >= 0.0, 'releaseSeconds must be >= 0'),
-        assert(mergeGapSeconds >= 0.0, 'mergeGapSeconds must be >= 0');
+  }) : assert(
+         duckVolume >= 0.0 && duckVolume <= 1.0,
+         'duckVolume must be in [0, 1]',
+       ),
+       assert(attackSeconds >= 0.0, 'attackSeconds must be >= 0'),
+       assert(releaseSeconds >= 0.0, 'releaseSeconds must be >= 0'),
+       assert(mergeGapSeconds >= 0.0, 'mergeGapSeconds must be >= 0');
 
   /// Target gain for the music track while a foreground track is playing.
   /// 0.0 = silence, 1.0 = no duck.  Default 0.25 (≈ –12 dB).
@@ -154,7 +156,6 @@ final class VGAudioDuckingEngine {
 
     final result = <_Interval>[sorted.first];
     for (var i = 1; i < sorted.length; i++) {
-
       final current = sorted[i];
       final last = result.last;
       if (current.start <= last.end + gapThreshold) {
@@ -194,7 +195,9 @@ final class VGAudioDuckingEngine {
     double cursor = trackStart;
 
     // Opening keyframe: start at normal volume.
-    keyframes.add(VGAudioVolumeKeyframe(time: trackStart, volume: normalVolume));
+    keyframes.add(
+      VGAudioVolumeKeyframe(time: trackStart, volume: normalVolume),
+    );
 
     for (final interval in overlaps) {
       // ── attack ──────────────────────────────────────────────
@@ -246,7 +249,9 @@ final class VGAudioDuckingEngine {
     // Closing keyframe: hold normal volume to track end (if not already there).
     final lastKf = keyframes.last;
     if (trackEnd - lastKf.time > 1e-6) {
-      keyframes.add(VGAudioVolumeKeyframe(time: trackEnd, volume: normalVolume));
+      keyframes.add(
+        VGAudioVolumeKeyframe(time: trackEnd, volume: normalVolume),
+      );
     }
 
     // De-duplicate consecutive keyframes at the same time that have the same
@@ -265,6 +270,7 @@ final class VGAudioDuckingEngine {
       timeRemapAudioPolicy: track.timeRemapAudioPolicy,
       sourceTrimStartSeconds: track.sourceTrimStartSeconds,
       volumeKeyframes: deduped,
+      mixGain: track.mixGain,
     );
   }
 
@@ -272,8 +278,7 @@ final class VGAudioDuckingEngine {
       v < min ? min : (v > max ? max : v);
 
   /// Removes consecutive keyframes at the same time and volume.
-  static List<VGAudioVolumeKeyframe> _dedup(
-      List<VGAudioVolumeKeyframe> kfs) {
+  static List<VGAudioVolumeKeyframe> _dedup(List<VGAudioVolumeKeyframe> kfs) {
     if (kfs.length <= 1) return kfs;
     final out = <VGAudioVolumeKeyframe>[kfs.first];
     for (var i = 1; i < kfs.length; i++) {

@@ -39,6 +39,10 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly) NSTimeInterval requestedDuration;
 /// Static gain applied to AVAudioPlayerNode.volume. 0.0–1.0.
 @property(nonatomic, readonly) float staticVolume;
+/// V-B1/V-B2: Committed user track-fader gain from the sidecar plan. [0.0, 1.0],
+/// default 1.0. Effective gain = staticVolume * committedMixGain.
+/// The live slider overrides this via _mixGainByTrackId on the runtime.
+@property(nonatomic, readonly) float committedMixGain;
 /// The track role accepted by the scheduler: @"music", @"original",
 /// @"sfx", or @"voiceover".
 /// Raw volumeKeyframes array from the track dictionary, or nil if absent or

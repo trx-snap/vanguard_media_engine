@@ -18,16 +18,17 @@ VGAudioSidecarTrack _track({
   required double duration,
   double volume = 1.0,
   List<VGAudioVolumeKeyframe>? volumeKeyframes,
-}) =>
-    VGAudioSidecarTrack(
-      trackId: id,
-      url: '/tmp/$id.m4a',
-      startTime: start,
-      duration: duration,
-      volume: volume,
-      role: role,
-      volumeKeyframes: volumeKeyframes,
-    );
+  double mixGain = 1.0,
+}) => VGAudioSidecarTrack(
+  trackId: id,
+  url: '/tmp/$id.m4a',
+  startTime: start,
+  duration: duration,
+  volume: volume,
+  role: role,
+  volumeKeyframes: volumeKeyframes,
+  mixGain: mixGain,
+);
 
 const _engine = VGAudioDuckingEngine();
 const _cfg = VGAudioDuckingConfig(
@@ -87,10 +88,14 @@ void main() {
     expect(first.volume, closeTo(1.0, 1e-9));
 
     // There must be a keyframe at duckVolume during the voiceover window.
-    final ducked = music.volumeKeyframes!.where((kf) =>
-        kf.volume < 0.5 && kf.time >= 3.0 - 0.15 && kf.time <= 7.0 + 0.30);
-    expect(ducked.isNotEmpty, isTrue,
-        reason: 'Expected a dipped keyframe around the voiceover window');
+    final ducked = music.volumeKeyframes!.where(
+      (kf) => kf.volume < 0.5 && kf.time >= 3.0 - 0.15 && kf.time <= 7.0 + 0.30,
+    );
+    expect(
+      ducked.isNotEmpty,
+      isTrue,
+      reason: 'Expected a dipped keyframe around the voiceover window',
+    );
 
     // Closing keyframe must return to normal.
     final last = music.volumeKeyframes!.last;
@@ -101,23 +106,27 @@ void main() {
   // ── DUCK-4: Original audio is NOT a foreground trigger (Phase 10-C Slice B)
   // 'original' static muting is owned by applyAudioCompositionPolicy, not here.
   test(
-      'DUCK-4 original audio is not a foreground trigger — music is unchanged',
-      () {
-    final tracks = [
-      _track(id: 'music1', role: 'music', start: 0.0, duration: 8.0),
-      _track(id: 'orig1', role: 'original', start: 2.0, duration: 3.0),
-    ];
-    final result = _engine.apply(tracks, config: _cfg);
-    final music = result.firstWhere((t) => t.trackId == 'music1');
-    // No voiceover present → engine produces no foreground intervals →
-    // music receives no ducking keyframes.
-    expect(music.volumeKeyframes, isNull,
+    'DUCK-4 original audio is not a foreground trigger — music is unchanged',
+    () {
+      final tracks = [
+        _track(id: 'music1', role: 'music', start: 0.0, duration: 8.0),
+        _track(id: 'orig1', role: 'original', start: 2.0, duration: 3.0),
+      ];
+      final result = _engine.apply(tracks, config: _cfg);
+      final music = result.firstWhere((t) => t.trackId == 'music1');
+      // No voiceover present → engine produces no foreground intervals →
+      // music receives no ducking keyframes.
+      expect(
+        music.volumeKeyframes,
+        isNull,
         reason:
-            'original is not a foreground trigger; music must not be ducked');
-    // Original track itself passes through unchanged.
-    final orig = result.firstWhere((t) => t.trackId == 'orig1');
-    expect(orig.volumeKeyframes, isNull);
-  });
+            'original is not a foreground trigger; music must not be ducked',
+      );
+      // Original track itself passes through unchanged.
+      final orig = result.firstWhere((t) => t.trackId == 'orig1');
+      expect(orig.volumeKeyframes, isNull);
+    },
+  );
 
   // ── DUCK-5: Non-overlapping foreground does not duck music ────────────────
   test('DUCK-5 non-overlapping foreground does not duck music', () {
@@ -128,8 +137,11 @@ void main() {
     ];
     final result = _engine.apply(tracks, config: _cfg);
     final music = result.firstWhere((t) => t.trackId == 'music1');
-    expect(music.volumeKeyframes, isNull,
-        reason: 'No overlap → no keyframes expected');
+    expect(
+      music.volumeKeyframes,
+      isNull,
+      reason: 'No overlap → no keyframes expected',
+    );
   });
 
   // ── DUCK-6: Overlapping foreground intervals are merged ───────────────────
@@ -156,34 +168,42 @@ void main() {
       }
     }
     // The two overlapping voiceovers should produce only one dip entry.
-    expect(dipCount, 1,
-        reason: 'Merged intervals should produce a single duck envelope');
+    expect(
+      dipCount,
+      1,
+      reason: 'Merged intervals should produce a single duck envelope',
+    );
   });
 
   // ── DUCK-7: Near-adjacent intervals merged by threshold ───────────────────
-  test('DUCK-7 near-adjacent foreground intervals are merged by gap threshold',
-      () {
-    // Gap between vo1 end (5.0) and vo2 start (5.03) = 0.03s < mergeGap 0.05s.
-    final tracks = [
-      _track(id: 'music1', role: 'music', start: 0.0, duration: 20.0),
-      _track(id: 'vo1', role: 'voiceover', start: 2.0, duration: 3.0),
-      _track(id: 'vo2', role: 'voiceover', start: 5.03, duration: 3.0),
-    ];
-    final result = _engine.apply(tracks, config: _cfg);
-    final kfs = result
-        .firstWhere((t) => t.trackId == 'music1')
-        .volumeKeyframes!;
+  test(
+    'DUCK-7 near-adjacent foreground intervals are merged by gap threshold',
+    () {
+      // Gap between vo1 end (5.0) and vo2 start (5.03) = 0.03s < mergeGap 0.05s.
+      final tracks = [
+        _track(id: 'music1', role: 'music', start: 0.0, duration: 20.0),
+        _track(id: 'vo1', role: 'voiceover', start: 2.0, duration: 3.0),
+        _track(id: 'vo2', role: 'voiceover', start: 5.03, duration: 3.0),
+      ];
+      final result = _engine.apply(tracks, config: _cfg);
+      final kfs = result
+          .firstWhere((t) => t.trackId == 'music1')
+          .volumeKeyframes!;
 
-    int dipEntries = 0;
-    for (var i = 1; i < kfs.length; i++) {
-      if (kfs[i - 1].volume > _cfg.duckVolume + 1e-9 &&
-          (kfs[i].volume - _cfg.duckVolume).abs() < 1e-9) {
-        dipEntries++;
+      int dipEntries = 0;
+      for (var i = 1; i < kfs.length; i++) {
+        if (kfs[i - 1].volume > _cfg.duckVolume + 1e-9 &&
+            (kfs[i].volume - _cfg.duckVolume).abs() < 1e-9) {
+          dipEntries++;
+        }
       }
-    }
-    expect(dipEntries, 1,
-        reason: 'Near-adjacent intervals should merge into one duck');
-  });
+      expect(
+        dipEntries,
+        1,
+        reason: 'Near-adjacent intervals should merge into one duck',
+      );
+    },
+  );
 
   // ── DUCK-8: Keyframes clamp to music track range ──────────────────────────
   test('DUCK-8 generated keyframes are clamped to music track range', () {
@@ -221,8 +241,7 @@ void main() {
 
   // ── DUCK-10: SFX ducks under voiceover (Phase 10-C Slice B) ──────────────
   test('DUCK-10 sfx ducks under voiceover', () {
-    final sfxTrack =
-        _track(id: 'sfx1', role: 'sfx', start: 0.0, duration: 5.0);
+    final sfxTrack = _track(id: 'sfx1', role: 'sfx', start: 0.0, duration: 5.0);
     final tracks = [
       sfxTrack,
       _track(id: 'vo1', role: 'voiceover', start: 1.0, duration: 3.0),
@@ -230,40 +249,52 @@ void main() {
     final result = _engine.apply(tracks, config: _cfg);
     final sfx = result.firstWhere((t) => t.trackId == 'sfx1');
     // SFX overlaps with voiceover: ducking keyframes must be generated.
-    expect(sfx.volumeKeyframes, isNotNull,
-        reason: 'sfx is a known Added role and must duck under VO');
+    expect(
+      sfx.volumeKeyframes,
+      isNotNull,
+      reason: 'sfx is a known Added role and must duck under VO',
+    );
     expect(sfx.volumeKeyframes!.any((kf) => kf.volume < 0.5), isTrue);
   });
 
   // ── DUCK-11: Existing volumeKeyframes on music track preserved ─────────────
-  test('DUCK-11 music track with existing volumeKeyframes is not overwritten',
-      () {
-    final existingKfs = [
-      const VGAudioVolumeKeyframe(time: 0.0, volume: 0.8),
-      const VGAudioVolumeKeyframe(time: 5.0, volume: 0.8),
-    ];
-    final original = _track(
+  test(
+    'DUCK-11 music track with existing volumeKeyframes is not overwritten',
+    () {
+      final existingKfs = [
+        const VGAudioVolumeKeyframe(time: 0.0, volume: 0.8),
+        const VGAudioVolumeKeyframe(time: 5.0, volume: 0.8),
+      ];
+      final original = _track(
+        id: 'music1',
+        role: 'music',
+        start: 0.0,
+        duration: 10.0,
+        volumeKeyframes: existingKfs,
+      );
+      final tracks = [
+        original,
+        _track(id: 'vo1', role: 'voiceover', start: 2.0, duration: 3.0),
+      ];
+      final result = _engine.apply(tracks, config: _cfg);
+      final music = result.firstWhere((t) => t.trackId == 'music1');
+      // Must be exactly the same track object (no new keyframes).
+      expect(
+        identical(music, original),
+        isTrue,
+        reason: 'Pre-authored keyframes must not be replaced',
+      );
+    },
+  );
+
+  // ── DUCK-12: Engine does not mutate input list or track objects ────────────
+  test('DUCK-12 engine does not mutate input list or track objects', () {
+    final music = _track(
       id: 'music1',
       role: 'music',
       start: 0.0,
       duration: 10.0,
-      volumeKeyframes: existingKfs,
     );
-    final tracks = [
-      original,
-      _track(id: 'vo1', role: 'voiceover', start: 2.0, duration: 3.0),
-    ];
-    final result = _engine.apply(tracks, config: _cfg);
-    final music = result.firstWhere((t) => t.trackId == 'music1');
-    // Must be exactly the same track object (no new keyframes).
-    expect(identical(music, original), isTrue,
-        reason: 'Pre-authored keyframes must not be replaced');
-  });
-
-  // ── DUCK-12: Engine does not mutate input list or track objects ────────────
-  test('DUCK-12 engine does not mutate input list or track objects', () {
-    final music =
-        _track(id: 'music1', role: 'music', start: 0.0, duration: 10.0);
     final vo = _track(id: 'vo1', role: 'voiceover', start: 2.0, duration: 3.0);
     final inputList = [music, vo];
 
@@ -292,47 +323,47 @@ void main() {
     ];
     final result = _engine.apply(tracks, config: customCfg);
     final music = result.firstWhere((t) => t.trackId == 'music1');
-    final minVolume =
-        music.volumeKeyframes!.map((kf) => kf.volume).reduce(
-              (a, b) => a < b ? a : b,
-            );
+    final minVolume = music.volumeKeyframes!
+        .map((kf) => kf.volume)
+        .reduce((a, b) => a < b ? a : b);
     expect(minVolume, closeTo(0.10, 1e-9));
   });
 
   // ── DUCK-14: Custom attack / release reflected in keyframe timing ──────────
-  test('DUCK-14 custom attack and release durations appear in keyframe times',
-      () {
-    const customCfg = VGAudioDuckingConfig(
-      duckVolume: 0.25,
-      attackSeconds: 0.50,
-      releaseSeconds: 1.0,
-    );
-    final tracks = [
-      _track(id: 'music1', role: 'music', start: 0.0, duration: 20.0),
-      _track(id: 'vo1', role: 'voiceover', start: 5.0, duration: 4.0),
-    ];
-    final result = _engine.apply(tracks, config: customCfg);
-    final kfs = result
-        .firstWhere((t) => t.trackId == 'music1')
-        .volumeKeyframes!;
+  test(
+    'DUCK-14 custom attack and release durations appear in keyframe times',
+    () {
+      const customCfg = VGAudioDuckingConfig(
+        duckVolume: 0.25,
+        attackSeconds: 0.50,
+        releaseSeconds: 1.0,
+      );
+      final tracks = [
+        _track(id: 'music1', role: 'music', start: 0.0, duration: 20.0),
+        _track(id: 'vo1', role: 'voiceover', start: 5.0, duration: 4.0),
+      ];
+      final result = _engine.apply(tracks, config: customCfg);
+      final kfs = result
+          .firstWhere((t) => t.trackId == 'music1')
+          .volumeKeyframes!;
 
-    // Expected ramp-down start: 5.0 - 0.5 = 4.5.
-    expect(
-      kfs.any((kf) => (kf.time - 4.5).abs() < 1e-9 && kf.volume > 0.5),
-      isTrue,
-      reason: 'Expected normal-volume keyframe at ramp-down start (t=4.5)',
-    );
-    // Expected ramp-up end: 9.0 + 1.0 = 10.0.
-    expect(
-      kfs.any((kf) => (kf.time - 10.0).abs() < 1e-9 && kf.volume > 0.5),
-      isTrue,
-      reason: 'Expected normal-volume keyframe at ramp-up end (t=10.0)',
-    );
-  });
+      // Expected ramp-down start: 5.0 - 0.5 = 4.5.
+      expect(
+        kfs.any((kf) => (kf.time - 4.5).abs() < 1e-9 && kf.volume > 0.5),
+        isTrue,
+        reason: 'Expected normal-volume keyframe at ramp-down start (t=4.5)',
+      );
+      // Expected ramp-up end: 9.0 + 1.0 = 10.0.
+      expect(
+        kfs.any((kf) => (kf.time - 10.0).abs() < 1e-9 && kf.volume > 0.5),
+        isTrue,
+        reason: 'Expected normal-volume keyframe at ramp-up end (t=10.0)',
+      );
+    },
+  );
 
   // ── DUCK-15: Output is serializable through VGAudioSidecarPlan ────────────
-  test('DUCK-15 output is serializable through VGAudioSidecarPlan.toMap()',
-      () {
+  test('DUCK-15 output is serializable through VGAudioSidecarPlan.toMap()', () {
     final tracks = [
       _track(id: 'music1', role: 'music', start: 0.0, duration: 10.0),
       _track(id: 'vo1', role: 'voiceover', start: 2.0, duration: 3.0),
@@ -342,14 +373,13 @@ void main() {
     final map = plan.toMap();
 
     // Round-trip.
-    final restored = VGAudioSidecarPlan.fromMap(
-      map.cast<Object?, Object?>(),
-    );
+    final restored = VGAudioSidecarPlan.fromMap(map.cast<Object?, Object?>());
     expect(restored, isNotNull);
     expect(restored!.tracks.length, 2);
 
-    final restoredMusic =
-        restored.tracks.firstWhere((t) => t.trackId == 'music1');
+    final restoredMusic = restored.tracks.firstWhere(
+      (t) => t.trackId == 'music1',
+    );
     expect(restoredMusic.volumeKeyframes, isNotNull);
     expect(restoredMusic.volumeKeyframes!.isNotEmpty, isTrue);
   });
@@ -403,38 +433,57 @@ void main() {
     final result = _engine.apply(tracks, config: _cfg);
     final resultVo = result.firstWhere((t) => t.trackId == 'vo1');
     // Voiceover track object must be the identical input object.
-    expect(identical(resultVo, vo), isTrue,
-        reason: 'voiceover must never be a ducking target');
+    expect(
+      identical(resultVo, vo),
+      isTrue,
+      reason: 'voiceover must never be a ducking target',
+    );
   });
 
   // ── DUCK-19: original track is never a ducking target ─────────────────────
   test('DUCK-19 original track passes through the engine unchanged', () {
-    final orig =
-        _track(id: 'orig1', role: 'original', start: 0.0, duration: 5.0);
+    final orig = _track(
+      id: 'orig1',
+      role: 'original',
+      start: 0.0,
+      duration: 5.0,
+    );
     final tracks = [
       orig,
       _track(id: 'vo1', role: 'voiceover', start: 1.0, duration: 3.0),
     ];
     final result = _engine.apply(tracks, config: _cfg);
     final resultOrig = result.firstWhere((t) => t.trackId == 'orig1');
-    expect(identical(resultOrig, orig), isTrue,
-        reason: 'original must never be a ducking target');
+    expect(
+      identical(resultOrig, orig),
+      isTrue,
+      reason: 'original must never be a ducking target',
+    );
   });
 
   // ── DUCK-20: unknown role passes through unchanged ────────────────────────
-  test('DUCK-20 unknown role string passes through unchanged and is not ducked',
-      () {
-    final unknown = _track(
-        id: 'unknown1', role: 'imported_audio', start: 0.0, duration: 5.0);
-    final tracks = [
-      unknown,
-      _track(id: 'vo1', role: 'voiceover', start: 1.0, duration: 3.0),
-    ];
-    final result = _engine.apply(tracks, config: _cfg);
-    final resultUnknown = result.firstWhere((t) => t.trackId == 'unknown1');
-    expect(identical(resultUnknown, unknown), isTrue,
-        reason: 'unknown role must pass through unchanged and not be ducked');
-  });
+  test(
+    'DUCK-20 unknown role string passes through unchanged and is not ducked',
+    () {
+      final unknown = _track(
+        id: 'unknown1',
+        role: 'imported_audio',
+        start: 0.0,
+        duration: 5.0,
+      );
+      final tracks = [
+        unknown,
+        _track(id: 'vo1', role: 'voiceover', start: 1.0, duration: 3.0),
+      ];
+      final result = _engine.apply(tracks, config: _cfg);
+      final resultUnknown = result.firstWhere((t) => t.trackId == 'unknown1');
+      expect(
+        identical(resultUnknown, unknown),
+        isTrue,
+        reason: 'unknown role must pass through unchanged and not be ducked',
+      );
+    },
+  );
 
   // ── DUCK-21: sfx with existing keyframes is preserved ─────────────────────
   test('DUCK-21 sfx track with existing keyframes is not overwritten', () {
@@ -456,9 +505,12 @@ void main() {
     final result = _engine.apply(tracks, config: _cfg);
     final resultSfx = result.firstWhere((t) => t.trackId == 'sfx1');
     // Same object: pre-authored keyframes must not be replaced.
-    expect(identical(resultSfx, sfx), isTrue,
-        reason:
-            'sfx track with pre-authored keyframes must not receive generated ducking');
+    expect(
+      identical(resultSfx, sfx),
+      isTrue,
+      reason:
+          'sfx track with pre-authored keyframes must not receive generated ducking',
+    );
   });
 
   // ── DUCK-22: track order and IDs are preserved ────────────────────────────
@@ -473,5 +525,24 @@ void main() {
     expect(result[0].trackId, 'music1');
     expect(result[1].trackId, 'vo1');
     expect(result[2].trackId, 'sfx1');
+  });
+
+  // ── DUCK-23: ducked music preserves non-unity mixGain ──────────────────────
+  test('DUCK-23 ducked music preserves non-unity mixGain', () {
+    final tracks = [
+      _track(
+        id: 'music1',
+        role: 'music',
+        start: 0.0,
+        duration: 10.0,
+        mixGain: 0.18,
+      ),
+      _track(id: 'vo1', role: 'voiceover', start: 3.0, duration: 4.0),
+    ];
+    final result = _engine.apply(tracks, config: _cfg);
+    final music = result.firstWhere((t) => t.trackId == 'music1');
+    expect(music.volumeKeyframes, isNotNull);
+    expect(music.volumeKeyframes!.isNotEmpty, isTrue);
+    expect(music.mixGain, closeTo(0.18, 1e-9));
   });
 }

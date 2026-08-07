@@ -135,6 +135,22 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         })
     }()
 
+    // ── V-B1/V-B2: per-track live audio mix-gain handler ─────────────────────
+    // Owns all parsing, stale-target checking, and runtime delegation for the
+    // `timeline_setAudioMixGain` route. Plugin provides composition wiring only.
+    // Target provider resolves _timelineRuntime at call time; safely returns nil
+    // when VG_USE_V2_GRAPH=0 (no _timelineRuntime property exists).
+    private lazy var _mixGainHandler: VGTimelineAudioMixControlHandler = {
+        VGTimelineAudioMixControlHandler(targetProvider: { [weak self] in
+            #if VG_USE_V2_GRAPH
+            guard let runtime = self?._timelineRuntime else { return nil }
+            return vgtlamProductionTarget(runtime: runtime)
+            #else
+            return nil
+            #endif
+        })
+    }()
+
     // Active export session — retained to outlive handle(_:result:) scope
     var activeExportSession: VanguardExportSession?
 
@@ -892,6 +908,17 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // The handler owns all parsing, stale-target checking, and dispatch.
         if call.method == "timeline_setFilterChain" {
             _timelineLiveControlHandler.handle(args: args, result: result)
+            return
+        }
+
+        // ── V-B1/V-B2: per-track live mix gain ────────────────────────────────
+        // Sets mix gain on the active VanguardAudioPreviewRuntime for a given
+        // trackId without rebuilding the timeline (no updateDraft call).
+        // Args: { "textureId": Int64, "trackId": String, "gain": Double [0.0,1.0] }
+        // Delegated to VGTimelineAudioMixControlHandler which enforces stale-texture
+        // guarding using the same target-provider pattern as VGTimelineLiveControlHandler.
+        if call.method == "timeline_setAudioMixGain" {
+            _mixGainHandler.handle(args: args, result: result)
             return
         }
 

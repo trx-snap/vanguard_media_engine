@@ -137,6 +137,7 @@ final class VGAudioSidecarTrack {
     this.timeRemapAudioPolicy,
     this.sourceTrimStartSeconds = 0.0,
     this.volumeKeyframes,
+    this.mixGain = 1.0,
   });
 
   final String trackId;
@@ -174,6 +175,14 @@ final class VGAudioSidecarTrack {
   /// static volume/fade behaviour.
   final List<VGAudioVolumeKeyframe>? volumeKeyframes;
 
+  /// V-B1/V-B2: Independent user track-fader gain. Linear [0.0, 1.0], default 1.0.
+  ///
+  /// Effective gain for export = volume * mixGain.
+  /// Does not affect [volumeKeyframes] keyframe times or values; the effective
+  /// gain at each keyframe time is kfVolume * mixGain.
+  /// Omitted from the wire when exactly 1.0 (backward-compatible).
+  final double mixGain;
+
   /// Serialises to a map whose keys match the native
   /// `VGAudioSidecarPlan.tracks` dictionary contract.
   Map<String, Object?> toMap() {
@@ -197,6 +206,10 @@ final class VGAudioSidecarTrack {
     // Phase 8.15A: emit volumeKeyframes only when non-null and non-empty.
     if (volumeKeyframes != null && volumeKeyframes!.isNotEmpty) {
       m['volumeKeyframes'] = volumeKeyframes!.map((kf) => kf.toMap()).toList();
+    }
+    // V-B1: emit mixGain only when not unity (backward-compatible wire).
+    if ((mixGain - 1.0).abs() > 1e-9) {
+      m['mixGain'] = mixGain;
     }
     return m;
   }
@@ -258,6 +271,7 @@ final class VGAudioSidecarTrack {
       timeRemapAudioPolicy: policyStr,
       sourceTrimStartSeconds: sourceTrimStart,
       volumeKeyframes: keyframes,
+      mixGain: (map['mixGain'] as num?)?.toDouble() ?? 1.0,
     );
   }
 
@@ -275,6 +289,7 @@ final class VGAudioSidecarTrack {
           other.fadeOutSeconds == fadeOutSeconds &&
           other.timeRemapAudioPolicy == timeRemapAudioPolicy &&
           other.sourceTrimStartSeconds == sourceTrimStartSeconds &&
+          other.mixGain == mixGain &&
           _listEqual(other.volumeKeyframes, volumeKeyframes);
 
   @override
@@ -289,6 +304,7 @@ final class VGAudioSidecarTrack {
         fadeOutSeconds,
         timeRemapAudioPolicy,
         sourceTrimStartSeconds,
+        mixGain,
         Object.hashAll(volumeKeyframes ?? const []),
       );
 

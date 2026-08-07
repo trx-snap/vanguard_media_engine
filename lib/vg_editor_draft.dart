@@ -788,41 +788,11 @@ final class VGEditorDraft {
 
     final rawTracks = audioSidecarPlan!.tracks;
 
-    // 1. Detect project scenario by inspecting the raw track list.
-    final hasVoiceover = rawTracks.any((t) => t.role == 'voiceover');
-    final hasKnownAdded =
-        rawTracks.any((t) => t.role == 'music' || t.role == 'sfx');
-
-    List<VGAudioSidecarTrack> normalizedTracks;
-
-    if (hasVoiceover || hasKnownAdded) {
-      // 2. Static Original muting: copy Original tracks into the derived
-      //    output with volume: 0.0 and no keyframes.
-      //    Raw authoring Original tracks remain untouched.
-      normalizedTracks = rawTracks.map((t) {
-        if (t.role != 'original') return t;
-        // Derived output only: explicit zero, no automation that could restore.
-        return VGAudioSidecarTrack(
-          trackId: t.trackId,
-          url: t.url,
-          startTime: t.startTime,
-          duration: t.duration,
-          volume: 0.0,
-          role: t.role,
-          fadeInSeconds: t.fadeInSeconds,
-          fadeOutSeconds: t.fadeOutSeconds,
-          timeRemapAudioPolicy: t.timeRemapAudioPolicy,
-          sourceTrimStartSeconds: t.sourceTrimStartSeconds,
-          // volumeKeyframes intentionally omitted (null) so no automation can
-          // restore the muted Original above zero in the derived output.
-          volumeKeyframes: null,
-        );
-      }).toList();
-    } else {
-      // Original-only (or unknown roles only): preserve all tracks exactly.
-      // Do not force any volume value; do not add or remove automation.
-      normalizedTracks = rawTracks;
-    }
+    // V-B1/V-B2: Original muting is now owned by per-track mixGain (committed
+    // via UniversalEditorTrackVolumeCoordinator), not by this policy.
+    // Preserve all tracks exactly — do not force Original volume to 0.0.
+    // Ducking (step 3 below) still applies to music/sfx/voiceover tracks only.
+    final normalizedTracks = rawTracks;
 
     // 3. Delegate dynamic VO-triggered ducking to the engine.
     //    Engine uses voiceover-only foreground and music/sfx-only targets.

@@ -1,14 +1,21 @@
 // VanguardAudioPreviewRuntime.h
-// Vanguard Media Engine — Phase 10-C Slice D
+// Vanguard Media Engine — Phase 10-C Slice D / V-B1
 //
 // One external-track timing proof.
 // Package-internal only. Do NOT add to public_header_files.
 // Do NOT import from VanguardGraphRuntime.h.
 //
-// Owns an AVAudioEngine and a single AVAudioPlayerNode. Receives coherent
+// Owns an AVAudioEngine and three AVAudioPlayerNodes. Receives coherent
 // VGTimelineStateSnapshot values from VanguardGraphRuntime via the
 // VGTimelineSnapshotProvider block; schedules, pauses, seeks and stops the
-// player node in lock-step with the timeline clock.
+// player nodes in lock-step with the timeline clock.
+//
+// V-B1 three-lane architecture:
+//   _addedAudioSlot  — music / sfx roles
+//   _voiceoverSlot   — voiceover role
+//   _originalAudioSlot — original role (video audio)
+// Each slot has its own player, automation coordinator, and scheduled-segment
+// serial. Original tracks no longer compete with music/sfx in _addedAudioSlot.
 //
 // Thread-safety:
 //   All mutable state is confined to the private serial queue
@@ -189,36 +196,59 @@ typedef VGTimelineStateSnapshot (^VGTimelineSnapshotProvider)(void);
 /// Pass nil for |timer| to use the production dispatch_source_t boundary timer.
 /// Pass nil for |automationTimer| to use the production automation timer.
 /// The injected |player| is routed to the Added Audio slot; the Voice-over slot
-/// receives the same player (backward-compatible — existing tests continue to work).
+/// receives the same player (backward-compatible — existing tests continue to
+/// work). The Original slot also receives the same player.
 - (instancetype)
     initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
               lifecycleEpoch:(uint64_t)lifecycleEpoch
                        clock:(id<VGAudioPreviewClock>)clock
                        timer:(nullable id<VGAudioPreviewTimer>)timer
-             automationTimer:(nullable id<VGAudioPreviewAutomationTimer>)automationTimer
+             automationTimer:
+                 (nullable id<VGAudioPreviewAutomationTimer>)automationTimer
                 fileProvider:(id<VGAudioPreviewFileProvider>)fileProvider
                       engine:(id<VGAudioPreviewEngine>)engine
                       player:(id<VGAudioPreviewPlayer>)player;
 
 /// Package-internal Slice K test initialiser. Injects separate players and
 /// automation timers for the Added Audio and Voice-over slots, enabling
-/// independent per-slot assertion.
+/// independent per-slot assertion. The Original slot receives the same
+/// player/timer as Added Audio for backward compatibility.
 /// Pass nil for |timer| to use the production boundary timer.
 /// Pass nil for |addedAudioAutomationTimer| or |voiceoverAutomationTimer| to
 /// use production automation timers for those slots.
 - (instancetype)
-    initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
-              lifecycleEpoch:(uint64_t)lifecycleEpoch
-                       clock:(id<VGAudioPreviewClock>)clock
-                       timer:(nullable id<VGAudioPreviewTimer>)timer
+     initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
+               lifecycleEpoch:(uint64_t)lifecycleEpoch
+                        clock:(id<VGAudioPreviewClock>)clock
+                        timer:(nullable id<VGAudioPreviewTimer>)timer
     addedAudioAutomationTimer:
         (nullable id<VGAudioPreviewAutomationTimer>)addedAudioAutomationTimer
-    voiceoverAutomationTimer:
-        (nullable id<VGAudioPreviewAutomationTimer>)voiceoverAutomationTimer
-                fileProvider:(id<VGAudioPreviewFileProvider>)fileProvider
-                      engine:(id<VGAudioPreviewEngine>)engine
-                 addedAudioPlayer:(id<VGAudioPreviewPlayer>)addedAudioPlayer
-                  voiceoverPlayer:(id<VGAudioPreviewPlayer>)voiceoverPlayer;
+     voiceoverAutomationTimer:
+         (nullable id<VGAudioPreviewAutomationTimer>)voiceoverAutomationTimer
+                 fileProvider:(id<VGAudioPreviewFileProvider>)fileProvider
+                       engine:(id<VGAudioPreviewEngine>)engine
+             addedAudioPlayer:(id<VGAudioPreviewPlayer>)addedAudioPlayer
+              voiceoverPlayer:(id<VGAudioPreviewPlayer>)voiceoverPlayer;
+
+/// Package-internal V-B1 three-slot test initialiser. Injects separate players
+/// and automation timers for Added Audio, Voice-over, and Original Audio,
+/// enabling full per-slot independent assertion.
+- (instancetype)
+     initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
+               lifecycleEpoch:(uint64_t)lifecycleEpoch
+                        clock:(id<VGAudioPreviewClock>)clock
+                        timer:(nullable id<VGAudioPreviewTimer>)timer
+    addedAudioAutomationTimer:
+        (nullable id<VGAudioPreviewAutomationTimer>)addedAudioAutomationTimer
+     voiceoverAutomationTimer:
+         (nullable id<VGAudioPreviewAutomationTimer>)voiceoverAutomationTimer
+   originalAudioAutomationTimer:
+       (nullable id<VGAudioPreviewAutomationTimer>)originalAudioAutomationTimer
+                 fileProvider:(id<VGAudioPreviewFileProvider>)fileProvider
+                       engine:(id<VGAudioPreviewEngine>)engine
+             addedAudioPlayer:(id<VGAudioPreviewPlayer>)addedAudioPlayer
+              voiceoverPlayer:(id<VGAudioPreviewPlayer>)voiceoverPlayer
+           originalAudioPlayer:(id<VGAudioPreviewPlayer>)originalAudioPlayer;
 
 - (instancetype)init NS_UNAVAILABLE;
 
@@ -264,6 +294,17 @@ typedef VGTimelineStateSnapshot (^VGTimelineSnapshotProvider)(void);
 /// Called when the timeline reaches end-of-stream.
 - (void)commandEOS;
 
+// ─── V-B1/V-B2: Per-track live mix gain
+// ─────────────────────────────────────────
+//
+// Sets the mix-gain multiplier for the track identified by |trackId|.
+// |gain| must be in [0.0, 1.0]. Values outside that range are clamped.
+// Effective gain applied to the player is staticVolume * mixGain.
+// Safe to call from any thread; dispatches to the scheduler queue.
+// No-op if the runtime is invalidated or the trackId is unknown.
+- (void)setMixGainForTrackId:(NSString *)trackId gain:(float)gain
+    NS_SWIFT_NAME(setMixGain(trackId:gain:));
+
 /// Called after an AVAudioSession category transition (start or stop of
 /// recording) to re-anchor the audio preview engine and reschedule player
 /// nodes under the new session configuration.
@@ -291,7 +332,7 @@ typedef VGTimelineStateSnapshot (^VGTimelineSnapshotProvider)(void);
 /// commandPlay remains unchanged and does NOT restart AVAudioEngine.
 /// Retry after a Slice O route event re-invokes this method.
 - (void)commandRecoverAfterSessionTransitionWithCompletion:
-    (void (^)(NSError * _Nullable error))completion
+    (void (^)(NSError *_Nullable error))completion
     NS_SWIFT_NAME(commandRecoverAfterSessionTransition(completion:));
 
 // ─── Invalidation
@@ -313,19 +354,20 @@ typedef VGTimelineStateSnapshot (^VGTimelineSnapshotProvider)(void);
 
 // ─── Recovery error domain and codes ─────────────────────────────────────────
 
-extern NSString * const VGAudioPreviewRecoveryErrorDomain;
+extern NSString *const VGAudioPreviewRecoveryErrorDomain;
 
 typedef NS_ENUM(NSInteger, VGAudioPreviewRecoveryError) {
   /// Runtime is no longer accepting commands (invalidated).
-  VGAudioPreviewRecoveryErrorInvalidated       = 1,
+  VGAudioPreviewRecoveryErrorInvalidated = 1,
   /// Runtime was never prepared.
-  VGAudioPreviewRecoveryErrorUnprepared        = 2,
+  VGAudioPreviewRecoveryErrorUnprepared = 2,
   /// AVAudioEngine failed to start after the category transition.
   VGAudioPreviewRecoveryErrorEngineStartFailed = 3,
   /// Timeline snapshot was invalid when trying to reschedule.
-  VGAudioPreviewRecoveryErrorInvalidSnapshot   = 4,
-  /// Runtime is in the permanent Failed state (set only by prepareWithSidecarPlan:).
-  VGAudioPreviewRecoveryErrorRuntimeFailed     = 5,
+  VGAudioPreviewRecoveryErrorInvalidSnapshot = 4,
+  /// Runtime is in the permanent Failed state (set only by
+  /// prepareWithSidecarPlan:).
+  VGAudioPreviewRecoveryErrorRuntimeFailed = 5,
 };
 
 // ─── Queue assertion

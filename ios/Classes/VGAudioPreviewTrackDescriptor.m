@@ -16,19 +16,30 @@ NS_ASSUME_NONNULL_BEGIN
 
 // Private extension — keeps role and rawVolumeKeyframes internal to .m.
 @interface VGAudioPreviewTrackDescriptor () {
-  NSString *_role; ///< One of @"music", @"original", @"sfx", @"voiceover". Never nil.
-  NSArray *_Nullable _rawVolumeKeyframes; ///< Copied nonempty raw keyframe array or nil.
+  NSString *
+      _role; ///< One of @"music", @"original", @"sfx", @"voiceover". Never nil.
+  NSArray *_Nullable _rawVolumeKeyframes; ///< Copied nonempty raw keyframe
+                                          ///< array or nil.
+  float _committedMixGain; ///< V-B1/V-B2: parsed from sidecar 'mixGain'. Default 1.0.
 }
 @end
 
 @implementation VGAudioPreviewTrackDescriptor
 
-- (NSString *)role { return _role; }
+- (NSString *)role {
+  return _role;
+}
 
-- (nullable NSArray *)rawVolumeKeyframes { return _rawVolumeKeyframes; }
+- (nullable NSArray *)rawVolumeKeyframes {
+  return _rawVolumeKeyframes;
+}
 
 - (BOOL)hasRawKeyframes {
   return _rawVolumeKeyframes != nil && _rawVolumeKeyframes.count > 0;
+}
+
+- (float)committedMixGain {
+  return _committedMixGain;
 }
 
 - (nullable instancetype)initWithDictionary:
@@ -131,6 +142,16 @@ NS_ASSUME_NONNULL_BEGIN
     _rawVolumeKeyframes = [(NSArray *)rawKfs copy];
   } else {
     _rawVolumeKeyframes = nil;
+  }
+
+  // V-B1/V-B2: parse committedMixGain from sidecar; default 1.0 when absent.
+  // Valid range [0.0, 1.0]; clamped defensively.
+  id mixGainRaw = dict[@"mixGain"];
+  if ([mixGainRaw isKindOfClass:[NSNumber class]]) {
+    float mg = [mixGainRaw floatValue];
+    _committedMixGain = MAX(0.0f, MIN(1.0f, mg));
+  } else {
+    _committedMixGain = 1.0f;
   }
 
   return self;
