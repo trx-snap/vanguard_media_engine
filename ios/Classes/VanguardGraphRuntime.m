@@ -315,7 +315,6 @@ static BOOL VGRIsImageURL(NSURL *url) {
   // Dispatch all setup off the calling thread (contract: completion fires on
   // a background queue, never synchronously on the caller).
   dispatch_async(_prepareQueue, ^{
-    NSLog(@"[TRACE][N3] runtime.prepare entered url=%@", url.lastPathComponent);
 
     // Guard against invalidate racing with prepare.
     if (self->_invalidated) {
@@ -938,6 +937,7 @@ static BOOL VGRIsImageURL(NSURL *url) {
   //   - Any stale setAudioSidecarPlan: completions are rejected at gate 2 or 3.
   // The second join (inside afterVideoCleanup below) ensures the graph
   // completion fires only after BOTH video and audio cleanup complete.
+
   if ([NSThread isMainThread]) {
       [self invalidateAudioPreviewWithCompletion:nil];
   } else {
@@ -948,7 +948,6 @@ static BOOL VGRIsImageURL(NSURL *url) {
 #endif
 
   dispatch_async(_prepareQueue, ^{
-    NSLog(@"[TRACE][IA1] invalidate started on prepareQueue");
     [self invalidate];
 
     dispatch_block_t afterCompletion = ^{
@@ -1295,8 +1294,6 @@ static BOOL VGRIsImageURL(NSURL *url) {
   // apply an empty chain. Callers should not invoke before prepare completes,
   // but we degrade gracefully rather than crashing.
   if (!pool || !device) {
-    NSLog(@"[VGRuntime] setFilterChainFromSpecs: pool or device nil (called "
-          @"before prepare?)");
     [self setFilterChain:@[]];
     return YES; // not an unknown-type error
   }
@@ -1523,10 +1520,8 @@ static BOOL VGRIsImageURL(NSURL *url) {
           }
 
           node = v2;
-          NSLog(@"[VGRuntime] Beauty V2 selected (beautyVersion=2)");
         } else {
           // V2 allocation failed — fall back to V1 silently.
-          NSLog(@"[VGRuntime] Beauty V2 alloc failed — falling back to V1");
           wantV2 = NO; // fall through to V1 block below
         }
       }
@@ -1580,9 +1575,6 @@ static BOOL VGRIsImageURL(NSURL *url) {
       segNode.enabled = beauty.faceAwareEnabled;
       [finalNodes addObject:segNode];
       segInserted = YES;
-      NSLog(@"[VGRuntime] VGSegmentationNode auto-inserted before BeautyV2 "
-             "(Phase 4F, enabled=%d)",
-            (int)beauty.faceAwareEnabled);
     }
     [finalNodes addObject:n];
   }
@@ -2216,7 +2208,6 @@ static dispatch_queue_t _VGTimelinePullQueue(void) {
         typeof(self) ss = weakSelf;
         if (!ss || ss->_invalidated)
           return;
-        NSLog(@"[AudioSliceKTimingProbe] Native timeline frame callback PTS sent to Dart: pts_s=%.6f, hostTime=%.6f", pts_s, CACurrentMediaTime());
         [ss.methodChannel
             invokeMethod:@"onTimelineFrame"
                arguments:[ss vg_timelineFrameArgumentsForPTS:pts_s

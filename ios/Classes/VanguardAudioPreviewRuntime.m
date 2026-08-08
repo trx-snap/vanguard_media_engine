@@ -152,7 +152,8 @@ NS_ASSUME_NONNULL_BEGIN
   NSTimeInterval _timelineDuration;
 
   // ── V-B1/V-B2: per-track mix gain (live slider) ────────────────────
-  // Default 1.0 per track. Keyed by trackId. Written only on the scheduler queue.
+  // Default 1.0 per track. Keyed by trackId. Written only on the scheduler
+  // queue.
   NSMutableDictionary<NSString *, NSNumber *> *_mixGainByTrackId;
 }
 @end
@@ -193,19 +194,19 @@ NS_ASSUME_NONNULL_BEGIN
   [engine connect:originalAudioNode to:engine.mainMixerNode format:nil];
 
   return [self
-       initWithSnapshotProvider:snapshotProvider
-                 lifecycleEpoch:lifecycleEpoch
-                          clock:[[VGProductionAudioPreviewClock alloc] init]
-                          timer:nil
-      addedAudioAutomationTimer:nil
-       voiceoverAutomationTimer:nil
-     originalAudioAutomationTimer:nil
-                   fileProvider:[[VGProductionAudioPreviewFileProvider alloc]
-                                    init]
-                         engine:engineAdapter
-               addedAudioPlayer:addedAudioAdapter
-                voiceoverPlayer:voiceoverAdapter
-            originalAudioPlayer:originalAudioAdapter];
+          initWithSnapshotProvider:snapshotProvider
+                    lifecycleEpoch:lifecycleEpoch
+                             clock:[[VGProductionAudioPreviewClock alloc] init]
+                             timer:nil
+         addedAudioAutomationTimer:nil
+          voiceoverAutomationTimer:nil
+      originalAudioAutomationTimer:nil
+                      fileProvider:[[VGProductionAudioPreviewFileProvider alloc]
+                                       init]
+                            engine:engineAdapter
+                  addedAudioPlayer:addedAudioAdapter
+                   voiceoverPlayer:voiceoverAdapter
+               originalAudioPlayer:originalAudioAdapter];
 }
 
 /// Slice K backward-compat two-player trampoline. Passes same player/timer for
@@ -221,19 +222,20 @@ NS_ASSUME_NONNULL_BEGIN
                       engine:(id<VGAudioPreviewEngine>)engine
                       player:(id<VGAudioPreviewPlayer>)player {
   return [self
-       initWithSnapshotProvider:snapshotProvider
-                 lifecycleEpoch:lifecycleEpoch
-                          clock:clock
-                          timer:timer
-      addedAudioAutomationTimer:automationTimer
-       voiceoverAutomationTimer:nil // production timer created in designated
-                                    // init
-     originalAudioAutomationTimer:nil
-                   fileProvider:fileProvider
-                         engine:engine
-               addedAudioPlayer:player
-                voiceoverPlayer:player // same player — backward compatible
-            originalAudioPlayer:player]; // same as added — backward compatible
+          initWithSnapshotProvider:snapshotProvider
+                    lifecycleEpoch:lifecycleEpoch
+                             clock:clock
+                             timer:timer
+         addedAudioAutomationTimer:automationTimer
+          voiceoverAutomationTimer:nil // production timer created in designated
+                                       // init
+      originalAudioAutomationTimer:nil
+                      fileProvider:fileProvider
+                            engine:engine
+                  addedAudioPlayer:player
+                   voiceoverPlayer:player   // same player — backward compatible
+               originalAudioPlayer:player]; // same as added — backward
+                                            // compatible
 }
 
 /// Slice K backward-compat two-slot trampoline (separate per-slot players and
@@ -254,39 +256,39 @@ NS_ASSUME_NONNULL_BEGIN
                        engine:(id<VGAudioPreviewEngine>)engine
              addedAudioPlayer:(id<VGAudioPreviewPlayer>)addedAudioPlayer
               voiceoverPlayer:(id<VGAudioPreviewPlayer>)voiceoverPlayer {
-  return [self
-       initWithSnapshotProvider:snapshotProvider
-                 lifecycleEpoch:lifecycleEpoch
-                          clock:clock
-                          timer:timer
-      addedAudioAutomationTimer:addedAudioAutomationTimer
-       voiceoverAutomationTimer:voiceoverAutomationTimer
-     // Original slot: reuse Added Audio collaborators for backward compat.
-     originalAudioAutomationTimer:addedAudioAutomationTimer
-                   fileProvider:fileProvider
-                         engine:engine
-               addedAudioPlayer:addedAudioPlayer
-                voiceoverPlayer:voiceoverPlayer
-            originalAudioPlayer:addedAudioPlayer];
+  return
+      [self initWithSnapshotProvider:snapshotProvider
+                        lifecycleEpoch:lifecycleEpoch
+                                 clock:clock
+                                 timer:timer
+             addedAudioAutomationTimer:addedAudioAutomationTimer
+              voiceoverAutomationTimer:voiceoverAutomationTimer
+          // Original slot: reuse Added Audio collaborators for backward compat.
+          originalAudioAutomationTimer:addedAudioAutomationTimer
+                          fileProvider:fileProvider
+                                engine:engine
+                      addedAudioPlayer:addedAudioPlayer
+                       voiceoverPlayer:voiceoverPlayer
+                   originalAudioPlayer:addedAudioPlayer];
 }
 
 /// V-B1 three-slot designated initializer.
 - (instancetype)
-     initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
-               lifecycleEpoch:(uint64_t)lifecycleEpoch
-                        clock:(id<VGAudioPreviewClock>)clock
-                        timer:(nullable id<VGAudioPreviewTimer>)timer
-    addedAudioAutomationTimer:
-        (nullable id<VGAudioPreviewAutomationTimer>)addedAudioAutomationTimer
-     voiceoverAutomationTimer:
-         (nullable id<VGAudioPreviewAutomationTimer>)voiceoverAutomationTimer
-   originalAudioAutomationTimer:
-       (nullable id<VGAudioPreviewAutomationTimer>)originalAudioAutomationTimer
-                 fileProvider:(id<VGAudioPreviewFileProvider>)fileProvider
-                       engine:(id<VGAudioPreviewEngine>)engine
-             addedAudioPlayer:(id<VGAudioPreviewPlayer>)addedAudioPlayer
-              voiceoverPlayer:(id<VGAudioPreviewPlayer>)voiceoverPlayer
-          originalAudioPlayer:(id<VGAudioPreviewPlayer>)originalAudioPlayer {
+        initWithSnapshotProvider:(VGTimelineSnapshotProvider)snapshotProvider
+                  lifecycleEpoch:(uint64_t)lifecycleEpoch
+                           clock:(id<VGAudioPreviewClock>)clock
+                           timer:(nullable id<VGAudioPreviewTimer>)timer
+       addedAudioAutomationTimer:
+           (nullable id<VGAudioPreviewAutomationTimer>)addedAudioAutomationTimer
+        voiceoverAutomationTimer:
+            (nullable id<VGAudioPreviewAutomationTimer>)voiceoverAutomationTimer
+    originalAudioAutomationTimer:
+        (nullable id<VGAudioPreviewAutomationTimer>)originalAudioAutomationTimer
+                    fileProvider:(id<VGAudioPreviewFileProvider>)fileProvider
+                          engine:(id<VGAudioPreviewEngine>)engine
+                addedAudioPlayer:(id<VGAudioPreviewPlayer>)addedAudioPlayer
+                 voiceoverPlayer:(id<VGAudioPreviewPlayer>)voiceoverPlayer
+             originalAudioPlayer:(id<VGAudioPreviewPlayer>)originalAudioPlayer {
   self = [super init];
   if (!self)
     return nil;
@@ -395,25 +397,27 @@ NS_ASSUME_NONNULL_BEGIN
           initWithQueue:_schedulerQueue];
     }
     __weak typeof(self) weakSelf = self;
-    _originalAudioSlot.coordinator = [[VGAudioPreviewAutomationCoordinator alloc]
-        initWithTimer:origTimer
-             gainSink:^(float v) {
-               typeof(self) ss = weakSelf;
-               if (!ss)
-                 return;
-               // V-B1: v is the raw envelope value — store before mixing.
-               ss->_originalAudioSlot.currentRawEnvelopeVolume = v;
-               VGAudioPreviewTrackDescriptor *desc =
-                   ss->_originalAudioSlot.activeDescriptor;
-               NSNumber *stored =
-                   desc ? ss->_mixGainByTrackId[desc.trackId] : nil;
-               float mixGain = stored ? stored.floatValue
-                                      : (desc ? desc.committedMixGain : 1.0f);
-               mixGain = MAX(0.0f, MIN(1.0f, mixGain));
-               float effective = v * mixGain;
-               [ss->_originalAudioSlot.player setVolume:effective];
-               ss->_originalAudioSlot.currentVolume = effective;
-             }];
+    _originalAudioSlot.coordinator =
+        [[VGAudioPreviewAutomationCoordinator alloc]
+            initWithTimer:origTimer
+                 gainSink:^(float v) {
+                   typeof(self) ss = weakSelf;
+                   if (!ss)
+                     return;
+                   // V-B1: v is the raw envelope value — store before mixing.
+                   ss->_originalAudioSlot.currentRawEnvelopeVolume = v;
+                   VGAudioPreviewTrackDescriptor *desc =
+                       ss->_originalAudioSlot.activeDescriptor;
+                   NSNumber *stored =
+                       desc ? ss->_mixGainByTrackId[desc.trackId] : nil;
+                   float mixGain = stored
+                                       ? stored.floatValue
+                                       : (desc ? desc.committedMixGain : 1.0f);
+                   mixGain = MAX(0.0f, MIN(1.0f, mixGain));
+                   float effective = v * mixGain;
+                   [ss->_originalAudioSlot.player setVolume:effective];
+                   ss->_originalAudioSlot.currentVolume = effective;
+                 }];
   }
 
   // ── Initial lifecycle state ───────────────────────────────────────────────
@@ -514,7 +518,8 @@ NS_ASSUME_NONNULL_BEGIN
   _descriptors = [eligible copy];
   [_fileCache removeAllObjects];
   [_failedTrackIds removeAllObjects];
-  // V-B1: Clear stale live-gain overrides so they don't bleed into the new plan.
+  // V-B1: Clear stale live-gain overrides so they don't bleed into the new
+  // plan.
   [_mixGainByTrackId removeAllObjects];
 
   // ── Step 2: open the earliest-needed descriptor's file & start engine ─────
@@ -624,20 +629,15 @@ NS_ASSUME_NONNULL_BEGIN
     res = MAX(0.0, snap.timelinePTS);
   }
   if ([self _isSliceK]) {
-    NSLog(@"[AudioSliceKTimingProbe] _currentPTSFromSnapshot: hostNow=%.6f, "
-          @"playStartHostTime=%.6f, playStartPTS=%.6f, elapsed=%.6f, "
-          @"computedPTS=%.6f",
-          [_clock currentTime], snap.playStartHostTime, snap.playStartPTS,
-          elapsed, res);
   }
   return res;
 }
 
-/// Cancels the boundary timer, stops all three players, pauses all coordinators.
-/// Increments commandSerial and updates _activeToken.
-/// Per-slot scheduledSegmentSerials are NOT reset here — they are
-/// incremented inside each _scheduleSegment:inSlot: call so that the
-/// per-slot stale guards work correctly.
+/// Cancels the boundary timer, stops all three players, pauses all
+/// coordinators. Increments commandSerial and updates _activeToken. Per-slot
+/// scheduledSegmentSerials are NOT reset here — they are incremented inside
+/// each _scheduleSegment:inSlot: call so that the per-slot stale guards work
+/// correctly.
 - (uint64_t)_cancelAndIncrementSerial:(uint64_t)generation {
   [self assertOnSchedulerQueue];
   [_addedAudioSlot.coordinator pause];
@@ -785,7 +785,8 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
   [self assertOnSchedulerQueue];
 
   VGAudioPreviewTrackDescriptor *winner = nil;
-  VGAudioPreviewTrackDescriptor *activeDesc = _originalAudioSlot.activeDescriptor;
+  VGAudioPreviewTrackDescriptor *activeDesc =
+      _originalAudioSlot.activeDescriptor;
 
   for (VGAudioPreviewTrackDescriptor *d in _descriptors) {
     if (!VGIsOriginalAudioRole(d.role))
@@ -952,8 +953,8 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
   // from sidecar. This means preview always reflects committed state on
   // activation, and the live slider overrides it immediately during drag.
   NSNumber *storedMixGain = _mixGainByTrackId[descriptor.trackId];
-  float mixGain = storedMixGain ? storedMixGain.floatValue
-                                : descriptor.committedMixGain;
+  float mixGain =
+      storedMixGain ? storedMixGain.floatValue : descriptor.committedMixGain;
   mixGain = MAX(0.0f, MIN(1.0f, mixGain));
 
   // Delegate gain to coordinator if the descriptor has raw keyframes.
@@ -982,7 +983,6 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
     [slot.player setVolume:effective];
     slot.currentVolume = effective;
   }
-
 
   NSLog(@"[VanguardAudioPreviewRuntime][F] activateDescriptor: %@ "
         @"ts=%.3f active=%.3f sr=%.0f frames=%lld",
@@ -1041,15 +1041,6 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
   if ([self _isSliceK]) {
     NSString *laneName =
         (slot == _addedAudioSlot) ? @"AddedAudio" : @"Voiceover";
-    NSLog(@"[AudioSliceKTimingProbe] segment scheduling: lane=%@, trackID=%@, "
-          @"role=%@, timelineStart=%.6f, sourceTrimStart=%.6f, "
-          @"activeDuration=%.6f, schedulePTS_Start=%.6f, schedulePTS_End=%.6f, "
-          @"startFrame=%lld, frameCount=%u, expectedAudibleStart=%.6f, "
-          @"expectedAudibleEnd=%.6f",
-          laneName, slot.activeDescriptor.trackId, slot.activeDescriptor.role,
-          slot.timelineStart, slot.sourceTrimStart, slot.activeDuration,
-          currentPTS, scheduledEndPTS, (long long)startFrame, frameCount,
-          slot.timelineStart, slot.timelineStart + slot.activeDuration);
   }
 
   // Per-slot segment serial.
@@ -1159,13 +1150,6 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
       [self _selectOriginalAudioDescriptorAtPTS:currentPTS];
 
   if ([self _isSliceK]) {
-    NSLog(@"[AudioSliceKTimingProbe] _reevaluateAndTransitionAtPTS: "
-          @"currentPTS=%.6f, addedWinner=%@, voWinner=%@, origWinner=%@, "
-          @"addedActiveDescriptor=%@, voActiveDescriptor=%@, origActiveDescriptor=%@",
-          currentPTS, addedWinner.trackId, voWinner.trackId, origWinner.trackId,
-          _addedAudioSlot.activeDescriptor.trackId,
-          _voiceoverSlot.activeDescriptor.trackId,
-          _originalAudioSlot.activeDescriptor.trackId);
   }
 
   // Handle Added Audio slot.
@@ -1227,7 +1211,8 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
     }
   }
 
-  // Determine if at least one lane is actively playing (updated at end of method).
+  // Determine if at least one lane is actively playing (updated at end of
+  // method).
   BOOL hasActiveLane = addedActive || voActive;
 
   // Deferred-termination epsilon: if activationFloor is within 1 ms of
@@ -1258,15 +1243,9 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
         activationFloor < _addedAudioSlot.scheduledEndPTS - kDeferEpsilon) {
       addedDeferStop = YES;
       if ([self _isSliceK]) {
-        NSLog(@"[AudioSliceKTimingProbe] lane stop deferred: lane=AddedAudio, "
-              @"activationFloor=%.6f, scheduledEndPTS=%.6f",
-              activationFloor, _addedAudioSlot.scheduledEndPTS);
       }
     } else {
       if ([self _isSliceK]) {
-        NSLog(@"[AudioSliceKTimingProbe] lane stop: lane=AddedAudio, "
-              @"currentPTS=%.6f, reason=NoActiveDescriptor, otherLaneActive=%d",
-              currentPTS, hasActiveLane);
       }
       // No active Added Audio descriptor — stop and quiet the slot.
       [_addedAudioSlot.coordinator deactivate];
@@ -1288,15 +1267,9 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
         activationFloor < _voiceoverSlot.scheduledEndPTS - kDeferEpsilon) {
       voDeferStop = YES;
       if ([self _isSliceK]) {
-        NSLog(@"[AudioSliceKTimingProbe] lane stop deferred: lane=Voiceover, "
-              @"activationFloor=%.6f, scheduledEndPTS=%.6f",
-              activationFloor, _voiceoverSlot.scheduledEndPTS);
       }
     } else {
       if ([self _isSliceK]) {
-        NSLog(@"[AudioSliceKTimingProbe] lane stop: lane=Voiceover, "
-              @"currentPTS=%.6f, reason=NoActiveDescriptor, otherLaneActive=%d",
-              currentPTS, hasActiveLane);
       }
       // No active Voice-over descriptor — stop and quiet the slot.
       [_voiceoverSlot.coordinator deactivate];
@@ -1432,14 +1405,16 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
   }
 
   if (origActive) {
-    BOOL origAlreadyScheduled = (currentPTS < _originalAudioSlot.scheduledEndPTS);
+    BOOL origAlreadyScheduled =
+        (currentPTS < _originalAudioSlot.scheduledEndPTS);
     if (origAlreadyScheduled) {
       [_originalAudioSlot.player play];
       anyScheduled = YES;
     } else {
       NSTimeInterval origEndPTS =
-          (isfinite(nextBoundary) && nextBoundary <= origTrackEnd) ? nextBoundary
-                                                                   : origTrackEnd;
+          (isfinite(nextBoundary) && nextBoundary <= origTrackEnd)
+              ? nextBoundary
+              : origTrackEnd;
       BOOL scheduled = [self _scheduleSegmentAtPTS:currentPTS
                                             endPTS:origEndPTS
                                          withToken:capturedToken
@@ -1466,8 +1441,8 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
   // exists, OR if all lanes are silent but a start boundary is approaching.
   // Deferred slots contribute to hasActiveLane so the runtime keeps Playing
   // state while queued audio renders through the hardware.
-  hasActiveLane = addedActive || voActive || origActive ||
-                  addedDeferStop || voDeferStop || origDeferStop;
+  hasActiveLane = addedActive || voActive || origActive || addedDeferStop ||
+                  voDeferStop || origDeferStop;
 
   // Timer-base correction: when the VO or Original activation floor guard
   // suppressed an early cross-lane start, evaluationPTS was advanced (MAX)
@@ -1490,7 +1465,8 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
     timerNextBoundary = MIN(timerNextBoundary, _voiceoverSlot.scheduledEndPTS);
   }
   if (origDeferStop && _originalAudioSlot.scheduledEndPTS > timerBase) {
-    timerNextBoundary = MIN(timerNextBoundary, _originalAudioSlot.scheduledEndPTS);
+    timerNextBoundary =
+        MIN(timerNextBoundary, _originalAudioSlot.scheduledEndPTS);
   }
   BOOL hasFutureBoundary =
       isfinite(timerNextBoundary) && timerNextBoundary > timerBase;
@@ -1556,10 +1532,6 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
       } else {
         laneName = @"OriginalAudio";
       }
-      NSLog(@"[AudioSliceKTimingProbe] keyframe/gain evaluation: lane=%@, "
-            @"trackID=%@, evaluatedPTS=%.6f, resultingGain=%.6f",
-            laneName, capturedSlot.activeDescriptor.trackId, pts,
-            capturedSlot.currentVolume);
     }
   };
 }
@@ -1808,10 +1780,6 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
   (void)serial;
 
   if ([self _isSliceK]) {
-    NSLog(@"[AudioSliceKTimingProbe] commandPlay: startPTS=%.6f, "
-          @"hostTime=%.6f, generation=%llu, serial=%llu",
-          snap.playStartPTS, snap.playStartHostTime, token.timelineGeneration,
-          serial);
   }
 
   NSTimeInterval currentPTS = [self _currentPTSFromSnapshot:snap];
@@ -1850,9 +1818,6 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
     [ss _cancelAndIncrementSerial:generation];
     ss->_runtimeState = VGAudioPreviewRuntimeStatePaused;
     if ([ss _isSliceK]) {
-      NSLog(@"[AudioSliceKTimingProbe] commandPause: currentPTS=%.6f, "
-            @"generation=%llu",
-            [ss _currentPTSFromSnapshot:snap], (unsigned long long)generation);
     }
     NSLog(@"[VanguardAudioPreviewRuntime][D] pause applied");
   });
@@ -1874,9 +1839,6 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
     [ss _cancelAndIncrementSerial:generation];
 
     if ([ss _isSliceK]) {
-      NSLog(@"[AudioSliceKTimingProbe] commandSeek: targetPTS=%.6f, "
-            @"generation=%llu",
-            snap.timelinePTS, (unsigned long long)generation);
     }
 
     if (!snap.isValid) {
@@ -1911,8 +1873,6 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
     [ss _cancelAndIncrementSerial:generation];
     ss->_runtimeState = VGAudioPreviewRuntimeStateEnded;
     if ([ss _isSliceK]) {
-      NSLog(@"[AudioSliceKTimingProbe] commandEOS: generation=%llu",
-            (unsigned long long)generation);
     }
     NSLog(@"[VanguardAudioPreviewRuntime][D] EOS — audio stopped");
   });
@@ -1940,7 +1900,8 @@ static BOOL VGIsOriginalAudioRole(NSString *role) {
     ss->_mixGainByTrackId[trackId] = @(clamped);
 
     // If the Added Audio slot is currently playing this trackId, update player.
-    VGAudioPreviewTrackDescriptor *aaDesc = ss->_addedAudioSlot.activeDescriptor;
+    VGAudioPreviewTrackDescriptor *aaDesc =
+        ss->_addedAudioSlot.activeDescriptor;
     if (aaDesc && [aaDesc.trackId isEqualToString:trackId]) {
       float effective;
       if (ss->_addedAudioSlot.coordinator.hasActiveEnvelope) {
@@ -2221,6 +2182,7 @@ _makeRecoveryErrorWithUnderlying(VGAudioPreviewRecoveryError code,
   BOOL shouldInitiateCleanup = NO;
 
   os_unfair_lock_lock(&_invalidationLock);
+
   switch (_invalidationPhase) {
   case VGAudioPreviewInvalidationStateAccepting:
     _invalidationPhase = VGAudioPreviewInvalidationStateInvalidating;
@@ -2286,7 +2248,8 @@ _makeRecoveryErrorWithUnderlying(VGAudioPreviewRecoveryError code,
     });
   };
 
-  if (dispatch_get_specific(_schedulerQueueKey) == (__bridge void *)self) {
+  BOOL isOnScheduler = (dispatch_get_specific(_schedulerQueueKey) == (__bridge void *)self);
+  if (isOnScheduler) {
     cleanupBlock();
   } else {
     dispatch_async(_schedulerQueue, cleanupBlock);

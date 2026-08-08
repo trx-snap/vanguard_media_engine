@@ -420,7 +420,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             )
         } catch {
             let msg = error.localizedDescription
-            NSLog("[VanguardPlugin][7.5C] compositor init failed: %@", msg)
             result(FlutterError(code: "COMPOSITOR_INIT_FAILED",
                                 message: msg, details: nil))
             return
@@ -434,14 +433,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
         timelineRuntime.prepareTimeline(sourceNode: compositor) { textureId, err in
             if let err = err {
-                NSLog("[VanguardPlugin][7.5C] prepareTimeline failed: %@",
-                      err.localizedDescription)
                 result(FlutterError(code: "PREPARE_TIMELINE_FAILED",
                                     message: err.localizedDescription,
                                     details: nil))
                 return
             }
-            NSLog("[VanguardPlugin][7.5C] timeline texture ready textureId=%lld", textureId)
             result(["textureId": textureId, "width": 320, "height": 240])
         }
     }
@@ -484,7 +480,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             )
         } catch {
             let msg = error.localizedDescription
-            NSLog("[VanguardPlugin][7.5D] compositor init failed: %@", msg)
             result(FlutterError(code: "COMPOSITOR_INIT_FAILED",
                                 message: msg, details: nil))
             return
@@ -501,15 +496,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
         timelineRuntime.prepareTimeline(sourceNode: compositor) { textureId, err in
             if let err = err {
-                NSLog("[VanguardPlugin][7.5D] prepareTimeline failed: %@",
-                      err.localizedDescription)
                 result(FlutterError(code: "PREPARE_TIMELINE_FAILED",
                                     message: err.localizedDescription,
                                     details: nil))
                 return
             }
-            NSLog("[VanguardPlugin][7.5D] timeline texture ready textureId=%lld w=%d h=%d",
-                  textureId, width, height)
             // Phase 10-C Slice D: arm the audio preview runtime after the compositor
             // is prepared. result() is deferred until audio setup completes (or
             // silently falls back). Video preview is unaffected by any audio result.
@@ -743,8 +734,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
                 DispatchQueue.main.async {
                     if self.mcDiagnosticState == .stopping {
-                        NSLog("[VanguardPlugin][\(callerTag)] _handleStartMultiCam: "
-                              + "stop-while-starting detected — aborting startup.")
                         DispatchQueue.global(qos: .userInitiated).async {
                             source.stop()
                             renderer.stop()
@@ -763,8 +752,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     self.mcRenderDiagnostic       = renderer
                     self.mcDiagnosticState        = .running
 
-                    NSLog("[VanguardPlugin][\(callerTag)] _handleStartMultiCam: "
-                          + "textureId=\(textureId) running.")
 
                     result([
                         "textureId":    textureId,
@@ -791,8 +778,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             result(nil)
 
         case .starting:
-            NSLog("[VanguardPlugin][\(callerTag)] _handleStopMultiCam: "
-                  + "called while still starting — signalling abort.")
             mcDiagnosticState = .stopping
             result(nil)
 
@@ -831,16 +816,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
                     let logRendered = renderMetrics["renderedFrames"] ?? 0
                     let logAvgMs    = renderMetrics["averageRenderMs"] ?? 0
-                    NSLog("[VanguardPlugin][%@] _handleStopMultiCam: rendered=%@ avgMs=%@.",
-                          callerTag, "\(logRendered)", "\(logAvgMs)")
 
                     result(metrics)
                 }
             }
 
         case .stopping:
-            NSLog("[VanguardPlugin][\(callerTag)] _handleStopMultiCam: "
-                  + "already stopping — ignoring duplicate stop call.")
             result(nil)
         }
     }
@@ -863,8 +844,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // AVAudioSession interruption; the clip is lost (url == nil). Log the
             // error and emit an event so Flutter can notify the user.
             if let error = error {
-                NSLog("[VanguardPlugin] teardownCameraAsync: recording failed during mode transition: %@",
-                      error.localizedDescription)
                 self?.channel.invokeMethod("onRecordingError",
                                            arguments: ["message": error.localizedDescription])
             }
@@ -932,7 +911,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 return
             }
 
-            NSLog("[TRACE][N1] createTexture entered path=%@", path)
 
             // Phase 2 Step 7: read caller-supplied muted flag.
             // Dart passes {'path': ..., 'muted': true/false}. Absent key defaults to
@@ -971,9 +949,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         }
                         let w = renderSize.width  > 0 ? Int(renderSize.width)  : 1080
                         let h = renderSize.height > 0 ? Int(renderSize.height) : 1920
-                        NSLog("[TRACE][N8] plugin result about to send textureId=%lld", textureId)
                         result(["textureId": textureId, "sessionId": sid, "width": w, "height": h])
-                        NSLog("[TRACE][N9] plugin result sent")
                     }
                 }
             }
@@ -1389,8 +1365,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 do {
                     try fm.removeItem(at: outputURL)
                 } catch {
-                    NSLog("[Vanguard] normalizeVideo: failed to remove stale output at %@ — %@",
-                          outputPath, error.localizedDescription)
                     // AVAssetExportSession will fail immediately; error surfaces to caller.
                 }
             }
@@ -1438,10 +1412,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     let subType = CMFormatDescriptionGetMediaSubType(fmt)
                     // 'hvc1' and 'hev1' are the two HEVC FourCC variants in MP4.
                     if subType == kCMVideoCodecType_HEVC {
-                        NSLog("[Vanguard] normalizeVideo: HEVC source detected in %@ — "
-                              + "backend/CDN HEVC-in-MP4 compatibility is PROVISIONAL. "
-                              + "Validate upload end-to-end before wider rollout.",
-                              (inputURL.lastPathComponent))
                         break
                     }
                 }
@@ -1493,7 +1463,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
             // Phase 2 Step 6: all playback via registry.
             if sessionRegistry.runtime(forTextureId: textureId)?.play() == nil {
-                NSLog("[VanguardPlugin] runtime not found for textureId %lld", textureId)
             }
             result(nil)
 
@@ -1503,7 +1472,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
             // Phase 2 Step 6: all playback via registry.
             if sessionRegistry.runtime(forTextureId: textureId)?.pause() == nil {
-                NSLog("[VanguardPlugin] runtime not found for textureId %lld", textureId)
             }
             result(nil)
 
@@ -1515,7 +1483,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             }
             // Phase 2 Step 6: all playback via registry.
             if sessionRegistry.runtime(forTextureId: textureId)?.seek(to: seconds) == nil {
-                NSLog("[VanguardPlugin] runtime not found for textureId %lld", textureId)
             }
             result(nil)
 
@@ -1895,7 +1862,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         case "dev_disposeTimeline":
             if let runtime = self._timelineRuntime {
                 runtime.invalidateAsync {
-                    NSLog("[VanguardPlugin][7.5C] timeline runtime disposed")
                 }
                 self._timelineRuntime = nil
             }
@@ -1946,7 +1912,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // This tears down the compositor and display link without blocking.
             if let oldRuntime = self._timelineRuntime {
                 oldRuntime.invalidateAsync {
-                    NSLog("[VanguardPlugin][7.6] old timeline runtime torn down")
                 }
                 self._timelineRuntime = nil
             }
@@ -2010,13 +1975,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     ],
                 ]
 
-                NSLog("[VanguardPlugin][7.6] rebuilding timeline "
-                    + "clipA=[%.1f…%.1f] clipB=[%.1f…%.1f] "
-                    + "totalDuration=%.1fs w=%d h=%d",
-                    trimAStart, trimAEnd,
-                    trimBStart, trimBEnd,
-                    clipAEffectiveDuration + clipBEffectiveDuration,
-                    updateWidth, updateHeight)
 
                 // Step 5: Rebuild via the established WithSize helper (MOD-2).
                 // This creates a new VGTimelineCompositorNode from the updated dicts.
@@ -2128,12 +2086,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     ],
                 ]
 
-                NSLog("[VanguardPlugin][7.5E/7.6] starting export — clips=%d width=%ld height=%ld trimA=[%.1f…%.1f] trimB=[%.1f…%.1f] path=%@",
-                      clipDicts.count,
-                      Int(exportWidth), Int(exportHeight),
-                      exportTrimAStart, exportTrimAEnd,
-                      exportTrimBStart, exportTrimBEnd,
-                      exportOutputPath)
 
                 // Delegate to VGTimelineExportHelper — VGExportProfile is
                 // constructed entirely in ObjC (MOD-1, MOD-2). Swift never
@@ -2151,8 +2103,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     // Marshal result back to main thread for Flutter.
                     DispatchQueue.main.async {
                         if success, let outPath = outPath {
-                            NSLog("[VanguardPlugin][7.5E/7.6] export success: %.2fs %@",
-                                  duration, outPath)
                             result([
                                 "success":         true,
                                 "path":            outPath,
@@ -2164,7 +2114,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         } else {
                             let msg = error?.localizedDescription
                                       ?? "Timeline export failed (unknown error)"
-                            NSLog("[VanguardPlugin][7.5E/7.6] export failed: %@", msg)
                             result(FlutterError(
                                 code: "EXPORT_FAILED",
                                 message: msg,
@@ -2240,13 +2189,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // Tear down any existing timeline runtime before creating a new one.
             if let oldRuntime = self._timelineRuntime {
                 oldRuntime.invalidateAsync {
-                    NSLog("[VanguardPlugin][7.8] createTimelineTexture: old runtime torn down")
                 }
                 self._timelineRuntime = nil
             }
 
-            NSLog("[VanguardPlugin][7.8] createTimelineTexture: clips=%d w=%d h=%d",
-                  clipDicts78.count, canvasWidth, canvasHeight)
 
             // Phase 10-C Slice D: extract optional audio sidecar and project duration
             // forwarded by Dart alongside the draft map.
@@ -2308,13 +2254,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // Tear down existing runtime (MOD-2: tear-down-and-rebuild).
             if let oldRuntime = self._timelineRuntime {
                 oldRuntime.invalidateAsync {
-                    NSLog("[VanguardPlugin][7.8] updateTimeline: old runtime torn down")
                 }
                 self._timelineRuntime = nil
             }
 
-            NSLog("[VanguardPlugin][7.8] updateTimeline: clips=%d w=%d h=%d",
-                  clipDictsU.count, updateWidth, updateHeight)
 
             // Phase 10-C Slice D: extract audio sidecar and project duration for
             // audio preview runtime construction after compositor prepare.
@@ -2472,8 +2415,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             ) { success, outPath, duration, error in
                 DispatchQueue.main.async {
                     if success, let outPath = outPath {
-                        NSLog("[VanguardPlugin][8.14A] exportTimeline success: %.2fs %@",
-                              duration, outPath)
                         result([
                             "success":         true,
                             "path":            outPath,
@@ -2485,7 +2426,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     } else {
                         let msg = error?.localizedDescription
                                   ?? "Production timeline export failed (unknown error)"
-                        NSLog("[VanguardPlugin][8.14A] exportTimeline failed: %@", msg)
                         result(FlutterError(
                             code: "COMPOSITOR_INIT_FAILED",
                             message: msg,
@@ -2504,7 +2444,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             if let runtime = self._timelineRuntime {
                 self._timelineRuntime = nil
                 runtime.invalidateAsync {
-                    NSLog("[VanguardPlugin][7.8] disposeTimeline: runtime disposed")
                     // Phase 7.20B: dispose wiring — cancel all in-flight reverse sidecar
                     // transcodes and delete all cached sidecar files. Runs after runtime
                     // invalidation completes, ensuring no new sidecar work is started.
@@ -2512,13 +2451,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     // and dispatches file deletions asynchronously on a utility queue —
                     // the lock release is immediate.
                     VGReverseSidecarManager.shared().cleanupAllSidecars()
-                    NSLog("[VanguardPlugin][7.20B] disposeTimeline: sidecar cleanup triggered")
                     result(nil)
                 }
             } else {
                 // No active runtime — still clean up sidecars and return immediately.
                 VGReverseSidecarManager.shared().cleanupAllSidecars()
-                NSLog("[VanguardPlugin][7.20B] disposeTimeline (no runtime): sidecar cleanup triggered")
                 result(nil)
             }
 
@@ -2756,7 +2693,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // cleanupAllSidecars acquires the internal lock, resets all records, and
             // dispatches file deletions asynchronously on a utility queue.
             VGReverseSidecarManager.shared().cleanupAllSidecars()
-            NSLog("[VanguardPlugin][7.20B] cleanupReverseSidecars: cleanup triggered")
             result(["ok": true])
 
         #endif // VG_USE_V2_GRAPH
@@ -2774,7 +2710,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             } else if let renderer = renderers[textureId] {
                 renderer.setPlaybackRate(rate)
             } else {
-                NSLog("[VanguardPlugin] setPlaybackRate: no runtime or renderer for textureId %lld", textureId)
             }
             result(nil)
 
@@ -2783,23 +2718,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 result(FlutterError(code: "BAD_ARGS", message: "dispose requires textureId", details: nil)); return
             }
             let id = textureId.int64Value
-            NSLog("[TRACE][DPS1] dispose entered textureId=%lld", id)
 
             // Phase 2 Step 6: remove from maps, then drain async before unblocking Dart.
             // removeFromMaps returns the runtime without calling invalidate — we call
             // invalidateAsync so the decode queue drains before result(nil) fires.
             // This preserves the G-02-T2 safety guarantee from the legacy disposeAsync path.
             if let runtime = sessionRegistry.removeFromMaps(textureId: id) {
-                NSLog("[TRACE][DPS2] removeFromMaps returned runtime=%@", runtime)
                 runtime.invalidateAsync {
-                    NSLog("[TRACE][DPS3] invalidateAsync completion fired textureId=%lld", id)
-                    NSLog("[VanguardPlugin] dispose complete for textureId=%lld — Dart unblocked", id)
-                    NSLog("[TRACE][DPS4] plugin result(nil) sent textureId=%lld", id)
                     result(nil)
                 }
             } else {
-                NSLog("[TRACE][DPS2] removeFromMaps returned runtime=nil textureId=%lld", id)
-                NSLog("[VanguardPlugin] runtime not found for textureId %lld", id)
                 result(nil)
             }
 
@@ -2983,8 +2911,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     case "colorMatrix":
                         guard let rawMatrix = parameters["matrix"] as? [Any],
                               rawMatrix.count == 20 else {
-                            NSLog("[VanguardPlugin] exportImage: 'colorMatrix' filter " +
-                                  "missing or invalid 'matrix' (expected 20 elements). Skipping.")
                             continue
                         }
                         let matrixNumbers: [NSNumber] = rawMatrix.compactMap {
@@ -2994,8 +2920,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                             return nil
                         }
                         guard matrixNumbers.count == 20 else {
-                            NSLog("[VanguardPlugin] exportImage: 'colorMatrix' coercion " +
-                                  "failed (\(matrixNumbers.count)/20 valid). Skipping.")
                             continue
                         }
                         let node = VGColorMatrixFilterNode(pool: nil,
@@ -3022,8 +2946,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         guard let canvasWidthRaw  = parameters["canvasWidth"],
                               let canvasHeightRaw = parameters["canvasHeight"],
                               let scaleRaw        = parameters["scale"] else {
-                            NSLog("[VanguardPlugin] exportImage: 'transform' filter missing " +
-                                  "required parameters (canvasWidth, canvasHeight, scale). Skipping.")
                             continue
                         }
 
@@ -3035,7 +2957,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         } else if let n = canvasWidthRaw as? NSNumber {
                             canvasWidth = n.intValue
                         } else {
-                            NSLog("[VanguardPlugin] exportImage: 'transform' canvasWidth coercion failed. Skipping.")
                             continue
                         }
                         if let n = canvasHeightRaw as? Int {
@@ -3043,12 +2964,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         } else if let n = canvasHeightRaw as? NSNumber {
                             canvasHeight = n.intValue
                         } else {
-                            NSLog("[VanguardPlugin] exportImage: 'transform' canvasHeight coercion failed. Skipping.")
                             continue
                         }
                         guard canvasWidth > 0, canvasHeight > 0 else {
-                            NSLog("[VanguardPlugin] exportImage: 'transform' canvas dimensions must be > 0 " +
-                                  "(\(canvasWidth)×\(canvasHeight)). Skipping.")
                             continue
                         }
 
@@ -3059,11 +2977,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         } else if let n = scaleRaw as? NSNumber {
                             scaleValue = n.doubleValue
                         } else {
-                            NSLog("[VanguardPlugin] exportImage: 'transform' scale coercion failed. Skipping.")
                             continue
                         }
                         guard scaleValue > 0 else {
-                            NSLog("[VanguardPlugin] exportImage: 'transform' scale must be > 0 (\(scaleValue)). Skipping.")
                             continue
                         }
 
@@ -3109,8 +3025,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                             if coerced.count == 4 {
                                 cropRectNumbers = coerced
                             } else {
-                                NSLog("[VanguardPlugin] exportImage: 'transform' cropRect coercion " +
-                                      "failed (\(coerced.count)/4 valid). Ignoring cropRect.")
                             }
                         }
 
@@ -3146,14 +3060,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         // VGOverlayNode conforms to VGTransformNode directly — VGImageExportSession
                         // (Phase 10-B1 widened) will NOT wrap it in VGLegacyFilterAdapter.
                         if !enabled {
-                            NSLog("[VanguardPlugin] exportImage: 'overlay' filter is disabled. Skipping.")
                             continue
                         }
 
                         // Validate that at least an overlays array is present and non-empty.
                         guard let overlayDicts = parameters["overlays"] as? [[String: Any]],
                               !overlayDicts.isEmpty else {
-                            NSLog("[VanguardPlugin] exportImage: 'overlay' filter has no valid 'overlays' array. Skipping.")
                             continue
                         }
 
@@ -3170,7 +3082,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         nodes.append(overlayNode)
 
                     default:
-                        NSLog("[VanguardPlugin] exportImage: Unknown filter type '\(type)'. Skipping.")
+                        break
                     }
                 }
                 filterChain = nodes.isEmpty ? nil : nodes
@@ -3643,9 +3555,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         let session = try VGCameraGraphSession(source: src, renderer: renderer)
                         self.cameraGraphSession = session
                         graphStarted = true
-                        NSLog("[VanguardPlugin] VGCameraGraphSession initialized and started successfully.")
                     } catch {
-                        NSLog("[VanguardPlugin] VGCameraGraphSession initialization failed: \(error.localizedDescription)")
                     }
                     if !graphStarted {
                         src.start()
@@ -3704,9 +3614,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 let session = try VGCameraGraphSession(source: src, renderer: renderer)
                 cameraGraphSession = session
                 graphStarted = true
-                NSLog("[VanguardPlugin] VGCameraGraphSession initialized and started successfully.")
             } catch {
-                NSLog("[VanguardPlugin] VGCameraGraphSession initialization failed: \(error.localizedDescription)")
             }
             if !graphStarted {
                 src.start()
@@ -3739,12 +3647,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // POC2 ONLY — Remove before Phase 7 / production.
         case "connectPlatformViewToCamera":
             guard let src = cameraSource else {
-                NSLog("[Vanguard] POC2: connectPlatformViewToCamera — no active camera source (startCamera first)")
                 result("no_camera_source")
                 return
             }
             guard let view = cameraFactory?.latestInstance else {
-                NSLog("[Vanguard] POC2: connectPlatformViewToCamera — no active PlatformView instance (mount UiKitView first)")
                 result("no_platform_view")
                 return
             }
@@ -3758,23 +3664,18 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 if connected {
                     // Disable raw forwarding — MTKView now receives graph frames only.
                     src.platformViewRawForwardingEnabled = false
-                    NSLog("[Vanguard] POC2: connectPlatformViewToCamera — graph fan-out wired ✓ (raw forwarding disabled)")
                     result("connected_graph")
                 } else {
-                    NSLog("[Vanguard] POC2: connectPlatformViewToCamera — connectPlatformViewReceiver returned NO")
                     result("connect_failed")
                 }
                 return
             }
             // No active graph session: fall through to raw path with a log.
-            NSLog("[Vanguard] POC2: connectPlatformViewToCamera — no active graph session, falling back to raw POC1 wiring")
             src.frameReceiver = view
             result("no_graph_session")
             #else
             // Non-graph mode: POC1 raw direct forwarding.
             src.frameReceiver = view
-            NSLog("[Vanguard] POC1: connectPlatformViewToCamera — raw frameReceiver wired ✓ (cameraSource=%@, platformView=%@)",
-                  "\(src)", "\(view)")
             result("connected_raw")
             #endif
 
@@ -4000,12 +3901,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             if let session = cameraGraphSession {
                 session.setRecordingEnabled(true)
                 graphRecordingEnabled = true
-                NSLog("[VanguardPlugin] startRecording: graph-backed recording enabled")
             } else {
-                NSLog("[VanguardPlugin] startRecording: no graph session — falling back to raw recording")
             }
             #else
-            NSLog("[VanguardPlugin] startRecording: VG_USE_CAMERA_GRAPH disabled — using raw recording")
             #endif
             src.startRecording(to: URL(fileURLWithPath: path)) { [weak self] error in
                 DispatchQueue.main.async {
@@ -4016,7 +3914,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         #if VG_USE_CAMERA_GRAPH
                         if graphRecordingEnabled, let session = self?.cameraGraphSession {
                             session.setRecordingEnabled(false)
-                            NSLog("[VanguardPlugin] startRecording: AVAssetWriter failed — graph recording rolled back")
                         }
                         #endif
                         result(FlutterError(code: "REC_FAIL",
@@ -4706,8 +4603,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         if self.mcDiagnosticState == .stopping {
                             // MC-11: stop-while-starting path.
                             // Tear down the hardware we just brought up.
-                            NSLog("[VanguardPlugin][MC-11] startMultiCamRenderDiagnostic: "
-                                  + "stop-while-starting detected — aborting startup.")
                             DispatchQueue.global(qos: .userInitiated).async {
                                 source.stop()
                                 renderer.stop()
@@ -4733,8 +4628,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         self.mcRenderDiagnostic       = renderer
                         self.mcDiagnosticState        = .running
 
-                        NSLog("[VanguardPlugin][MC-10] startMultiCamRenderDiagnostic: "
-                              + "textureId=\(textureId) running.")
 
                         result([
                             "textureId":     textureId,
@@ -4769,8 +4662,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 // MC-11: stop-while-starting.
                 // Signal the in-flight start that it should abort on main completion.
                 // result(nil) here; the start block will complete cleanup on main.
-                NSLog("[VanguardPlugin][MC-11] stopMultiCamRenderDiagnostic: "
-                      + "called while still starting — signalling abort.")
                 mcDiagnosticState = .stopping
                 result(nil)
 
@@ -4818,9 +4709,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         self.mcRenderDiagnostic       = nil
                         self.mcDiagnosticState        = .idle
 
-                        NSLog("[VanguardPlugin][MC-10] stopMultiCamRenderDiagnostic: "
-                              + "rendered=\(renderMetrics["renderedFrames"] ?? 0) "
-                              + "avgMs=\(renderMetrics["averageRenderMs"] ?? 0).")
 
                         result(metrics)
                     }
@@ -4828,8 +4716,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
             case .stopping:
                 // Another stop is already in flight. Return nil safely.
-                NSLog("[VanguardPlugin][MC-11] stopMultiCamRenderDiagnostic: "
-                      + "already stopping — ignoring duplicate stop call.")
                 result(nil)
             }
 
@@ -5039,7 +4925,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
             // ── Photo mode: bypass graph, use native AVCapturePhotoOutput ─────
             if captureMode == "photo" {
-                NSLog("[VanguardPlugin][10-E.1] captureMode=photo — routing to native AVCapturePhotoOutput (bypassing graph).")
                 src.takeNativePhoto(to: URL(fileURLWithPath: path)) { url, error in
                     if let error = error {
                         let nsErr = error as NSError
@@ -5124,7 +5009,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     // Fall through to native capture below.
                     // takeNativePhoto internally falls back to preview-frame capture
                     // when _photoOutput is unavailable.
-                    NSLog("[VanguardPlugin] Graph photo arm failed (code: \(nsErr.code)); falling back to native capture (captureMode=\(captureMode ?? "nil")).")
                 }
             }
             #endif
@@ -5335,10 +5219,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     ports:      [videoOutPort]
                 )
 
-                NSLog("[VanguardPlugin][7.x-C] dev_validateDualCameraDescriptor: PASS | nodeId=%@ | primary=%@ | secondary=%@",
-                      "dev_dual_camera_smoke",
-                      node.primaryClip.clipId,
-                      node.secondaryClip.clipId)
 
                 // Return parsed metadata so the Dart harness can display what was parsed.
                 result([
@@ -5390,8 +5270,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     ports:      [videoOutPort]
                 )
             } catch let err as NSError {
-                NSLog("[VanguardPlugin][7.x-E] dev_createDualCameraTexture: node init failed: %@",
-                      err.localizedDescription)
                 result(FlutterError(code: "DUAL_CAMERA_TEXTURE_CREATE_FAILED",
                                     message: err.localizedDescription,
                                     details: ["domain": err.domain, "code": err.code]))
@@ -5400,7 +5278,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
             // Invalidate any existing DEV dual-camera runtime before creating a new one.
             if let existing = _devDualCameraRuntime {
-                NSLog("[VanguardPlugin][7.x-E] dev_createDualCameraTexture: invalidating previous DEV runtime")
                 existing.invalidate()
                 _devDualCameraRuntime = nil
                 _devDualCameraCompositorNode = nil
@@ -5438,8 +5315,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 guard let self else { return }
 
                 if let err = err {
-                    NSLog("[VanguardPlugin][7.x-E] dev_createDualCameraTexture: prepare failed: %@",
-                          err.localizedDescription)
                     // Invalidate the partially-prepared runtime to prevent leaks.
                     self._devDualCameraRuntime?.invalidate()
                     self._devDualCameraRuntime = nil
@@ -5450,11 +5325,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     return
                 }
 
-                NSLog("[VanguardPlugin][7.x-E] dev_createDualCameraTexture: READY " +
-                      "textureId=%lld primary=%@ secondary=%@",
-                      textureId,
-                      dualCameraNode.primaryClip.clipId,
-                      dualCameraNode.secondaryClip.clipId)
 
                 // Phase 7.x-F: Start the isolated DEV runtime so the pull loop
                 // begins advancing requestedPTS. Without this call timelineIsPlaying
@@ -5470,13 +5340,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 // instance that just completed prepare.
                 if let devRuntime = self._devDualCameraRuntime {
                     devRuntime._timelinePlay()
-                    NSLog("[VanguardPlugin][7.x-F] dev_createDualCameraTexture: DEV runtime play started textureId=%lld",
-                          textureId)
                 } else {
                     // Defensive: runtime was disposed between prepare and callback.
                     // Return error rather than leaving Dart with a dead textureId.
-                    NSLog("[VanguardPlugin][7.x-F] dev_createDualCameraTexture: " +
-                          "DEV runtime nil after prepare — invalidating and returning error")
                     self._devDualCameraCompositorNode = nil
                     result(FlutterError(code: "DUAL_CAMERA_TEXTURE_CREATE_FAILED",
                                         message: "DEV runtime was nil after successful prepare",
@@ -5494,9 +5360,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 let renderW = rSize.width  > 1.0 ? rSize.width  : 1280.0
                 let renderH = rSize.height > 1.0 ? rSize.height : 720.0
                 if rSize.width <= 1.0 || rSize.height <= 1.0 {
-                    NSLog("[VanguardPlugin][7.x-F] dev_createDualCameraTexture: " +
-                          "primaryRenderSize degenerate {%.0f, %.0f} — using DEV fallback 1280x720",
-                          rSize.width, rSize.height)
                 }
 
                 result([
@@ -5549,7 +5412,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
         case "dev_disposeDualCameraTexture":
             if let devRuntime = _devDualCameraRuntime {
-                NSLog("[VanguardPlugin][7.x-E] dev_disposeDualCameraTexture: invalidating DEV dual-camera runtime")
                 devRuntime.invalidate()
                 _devDualCameraRuntime = nil
                 _devDualCameraCompositorNode = nil
@@ -5805,12 +5667,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         }
                     }
 
-                    NSLog("[VanguardPlugin][10-D] enhancementConfig: mode=%@ noiseLevel=%.3f sharpness=%.2f intensity=%.2f radius=%.2f",
-                          enhancementParams.mode,
-                          enhancementParams.noiseLevel,
-                          enhancementParams.sharpness,
-                          enhancementParams.intensity,
-                          enhancementParams.radius)
                 }
             }
 
@@ -5854,7 +5710,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     if let v = (roiMap["bgBlurPass3"]       as? NSNumber)?.doubleValue { roiParams.bgBlurPass3       = v }
                     if let v = (roiMap["bgBlurPass4"]       as? NSNumber)?.doubleValue { roiParams.bgBlurPass4       = v }
                     if let v = roiMap["sharpenROIOnly"] as? Bool                       { roiParams.sharpenROIOnly    = v }
-                    NSLog("[VanguardPlugin][10-D.4A] roiConfig: enabled detector=%@", roiParams.detector)
                 }
             }
 
@@ -5864,18 +5719,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             let outputPath: String = (args?["outputPath"] as? String)
                                      ?? (NSTemporaryDirectory() + "vg_img_opt_\(Int(Date().timeIntervalSince1970 * 1000)).jpg")
 
-            NSLog("[VanguardPlugin][10-C] optimizeImage: src=%@ maxLongEdge=%@ maxWidth=%@ maxHeight=%@ quality=%.2f format=%@ stripMetadata=%@ normalizeOrientation=%@ colorPolicy=%@ destinationIntent=%@ fileSizeTarget=%@ dst=%@ enhancement=%@",
-                  (sourcePath as NSString).lastPathComponent,
-                  maxLongEdge.map { "\($0)" } ?? "nil",
-                  maxWidth.map    { "\($0)" } ?? "nil",
-                  maxHeight.map   { "\($0)" } ?? "nil",
-                  quality, formatStr,
-                  stripMetadata         ? "YES" : "NO",
-                  normalizeOrientation  ? "YES" : "NO",
-                  colorPolicy, destinationIntent,
-                  fileSizeTargetBytes.map { "\($0)" } ?? "nil",
-                  (outputPath as NSString).lastPathComponent,
-                  enhancementParams.enabled ? "ON(\(enhancementParams.mode))" : "OFF")
 
             // Capture for use inside the async block (structs are value-copied).
             let capturedEnhancement = enhancementParams
@@ -5932,8 +5775,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 let canvasW = max(1, Int((Double(srcW) * scale).rounded()))
                 let canvasH = max(1, Int((Double(srcH) * scale).rounded()))
 
-                NSLog("[VanguardPlugin][10-C] optimizeImage resize: %dx%d → %dx%d (scale=%.4f)",
-                      srcW, srcH, canvasW, canvasH, scale)
 
                 // 4. Prepare invariants shared across all passes.
                 let sourceURL = URL(fileURLWithPath: sourcePath)
@@ -5966,11 +5807,8 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
                     if roiResult.faceRegions.count > 0, let mask = roiResult.maskImage {
                         roiMaskImage = mask
-                        NSLog("[VanguardPlugin][10-D.4A] ROI: %d face(s) detected, mask ready.",
-                              roiFaceCount)
                     } else {
                         roiFallbackReason = "no_face_detected"
-                        NSLog("[VanguardPlugin][10-D.4A] ROI: no usable faces — fallback to standard adaptive JPEG.")
                     }
                 }
 
@@ -6161,8 +5999,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     // ── Handle session failure ─────────────────────────────────
                     if let err = passError {
                         try? FileManager.default.removeItem(at: tempURL)
-                        NSLog("[VanguardPlugin][10-D.3B] pass %d failed: %@",
-                              passNum, err.localizedDescription)
                         DispatchQueue.main.async {
                             result(FlutterError(
                                 code:    "IMAGE_OPTIMIZER_FAILED",
@@ -6182,8 +6018,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                         return
                     }
 
-                    NSLog("[VanguardPlugin][10-D.3B] pass %d: quality=%.2f sharpen=%.2f → %lld bytes",
-                          passNum, passP.quality, passP.sharpenIntensity, mf.fileSizeBytes)
 
                     // ── Budget check ───────────────────────────────────────────
                     let withinSoftMax = mf.fileSizeBytes <= softMaxBytes
@@ -6195,10 +6029,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
                     // Winner: within softMax, or ran out of passes.
                     if !withinSoftMax {
-                        NSLog("[VanguardPlugin][10-D.3B] pass %d: %lld bytes exceeds softMax (%lld)%@",
-                              passNum, mf.fileSizeBytes, softMaxBytes,
-                              mf.fileSizeBytes > hardMaxBytes
-                                  ? " AND hardMax (\(hardMaxBytes))" : "")
                     }
                     winManifest  = mf
                     winPassIndex = passNum
@@ -6251,12 +6081,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                     default:    resolvedFormat = "jpeg"
                     }
 
-                    NSLog("[VanguardPlugin][10-D.4A] optimizeImage done: pass=%d quality=%.2f %dx%d %@ %lld bytes roi=%@ faces=%d",
-                          winPassIndex, winQuality,
-                          manifest.width, manifest.height,
-                          resolvedFormat, manifest.fileSizeBytes,
-                          capturedROI.enabled ? (roiMaskImage != nil ? "applied" : "fallback") : "off",
-                          roiFaceCount)
 
                     var resultMap: [String: Any] = [
                         "success":       true,
@@ -6310,7 +6134,6 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                                     details: nil))
                 return
             }
-            NSLog("[Vanguard][DEBUG] Simulating thermal state → %ld", simulatedState.rawValue)
             notifyThermalStateChanged(simulatedState)
             result(nil)
         #endif
@@ -6417,7 +6240,6 @@ final class VGNativeCameraViewController: UIViewController {
         pvView.frame = view.bounds
         pvView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         view.addSubview(pvView)
-        NSLog("[Vanguard][6C] VGNativeCameraViewController: MTKView added to view hierarchy")
         _addPOC6COverlay()
     }
 
@@ -6486,25 +6308,20 @@ final class VGNativeCameraViewController: UIViewController {
     @objc private func _poc6cClose() {
         // viewWillDisappear already handles orientation unlock + raw forwarding.
         dismiss(animated: false)
-        NSLog("[Vanguard][6C] POC6C overlay: Close tapped — dismissing")
     }
 
     @objc private func _poc6cSwitch() {
         guard let src = cameraSource else {
-            NSLog("[Vanguard][6C] POC6C overlay: Switch — no cameraSource")
             return
         }
         let newPosition: AVCaptureDevice.Position = (currentPosition == .back) ? .front : .back
         src.moveCamera(to: newPosition)
-        NSLog("[Vanguard][6C] POC6C overlay: Switch → %@",
-              newPosition == .front ? "front" : "back")
         updateCameraPosition(newPosition)
     }
 
     @objc private func _poc6cBeauty() {
         #if VG_USE_CAMERA_GRAPH
         guard let session = graphSession else {
-            NSLog("[Vanguard][6C] POC6C overlay: Beauty — no graphSession")
             return
         }
         if _beautyActive {
@@ -6512,7 +6329,6 @@ final class VGNativeCameraViewController: UIViewController {
             session.setCameraFilterChain(nil)
             _beautyActive = false
             _beautyButton?.setTitle("Beauty OFF", for: .normal)
-            NSLog("[Vanguard][6C] POC6C overlay: Beauty V2 OFF (cleared)")
         } else {
             // Toggle ON: apply Beauty V2 at intensity 0.75.
             let spec: [String: Any] = [
@@ -6523,25 +6339,20 @@ final class VGNativeCameraViewController: UIViewController {
             _ = didApply
             _beautyActive = true
             _beautyButton?.setTitle("Beauty ON", for: .normal)
-            NSLog("[Vanguard][6C] POC6C overlay: Beauty V2 ON (intensity=0.75)")
         }
         #else
-        NSLog("[Vanguard][6C] POC6C overlay: Beauty — VG_USE_CAMERA_GRAPH not enabled")
         #endif
     }
 
     @objc private func _poc6cClear() {
         #if VG_USE_CAMERA_GRAPH
         guard let session = graphSession else {
-            NSLog("[Vanguard][6C] POC6C overlay: Clear — no graphSession")
             return
         }
         session.setCameraFilterChain(nil)
         _beautyActive = false
         _beautyButton?.setTitle("Beauty OFF", for: .normal)
-        NSLog("[Vanguard][6C] POC6C overlay: Clear — filter chain cleared")
         #else
-        NSLog("[Vanguard][6C] POC6C overlay: Clear — VG_USE_CAMERA_GRAPH not enabled")
         #endif
     }
 
@@ -6559,20 +6370,16 @@ final class VGNativeCameraViewController: UIViewController {
             let connected = session.connectPlatformViewReceiver(pv)
             if connected {
                 src.platformViewRawForwardingEnabled = false
-                NSLog("[Vanguard][6C] VGNativeCameraViewController: graph fan-out wired to native MTKView ✓ (connected_graph)")
             } else {
                 // Fallback: raw forwarding if graph connect fails.
                 src.frameReceiver = pv
-                NSLog("[Vanguard][6C] VGNativeCameraViewController: graph connect failed, fell back to raw forwarding")
             }
         } else {
             // No graph session: raw forwarding path.
             src.frameReceiver = pv
-            NSLog("[Vanguard][6C] VGNativeCameraViewController: no graph session, using raw frameReceiver")
         }
         #else
         src.frameReceiver = pv
-        NSLog("[Vanguard][6C] VGNativeCameraViewController: raw frameReceiver wired ✓")
         #endif
 
         // Sync the platform view to the current interface orientation.
@@ -6590,7 +6397,6 @@ final class VGNativeCameraViewController: UIViewController {
         // We set platformViewRawForwardingEnabled back to YES so the legacy
         // Texture path (playground preview) can receive frames if re-wired.
         src.platformViewRawForwardingEnabled = true
-        NSLog("[Vanguard][6C] VGNativeCameraViewController: dismissed — orientation unlocked, raw forwarding re-enabled")
     }
 
     // Called by UIKit before the interface rotates.
@@ -6608,8 +6414,6 @@ final class VGNativeCameraViewController: UIViewController {
         let earlyIndex = _earlyRotationIndex(for: size)
         let isFront    = (currentPosition == .front)
         let earlyMirror = (isFront && earlyIndex != 0)
-        NSLog("[Vanguard][6C] transition target size=%.0fx%.0f earlyDisplayRotationIndex=%d",
-              size.width, size.height, earlyIndex)
         if let pv = ownedPlatformView {
             pv.displayRotationIndex    = earlyIndex
             pv.isFrontCamera           = isFront
@@ -6672,11 +6476,6 @@ final class VGNativeCameraViewController: UIViewController {
         let isFront       = (currentPosition == .front)
         let mirrorNeeded  = (isFront && rotationIndex != 0)
 
-        NSLog("[Vanguard][6C] final uiOrientation=%@ displayRotationIndex=%d front=%@ mirrorCorrection=%@",
-              _orientationName(uiOrientation),
-              rotationIndex,
-              isFront ? "YES" : "NO",
-              mirrorNeeded ? "YES" : "NO")
 
         if let pv = ownedPlatformView {
             pv.displayRotationIndex    = rotationIndex

@@ -2155,9 +2155,6 @@ static const NSInteger kAudioChunkFrames =
       CFRelease(sampleBuffer);
       sampleBuffer = [output copyNextSampleBuffer];
       if (!sampleBuffer) {
-        NSLog(@"[TRACE][SRC4] EOF during fast-forward seek: skipped=%ld "
-              @"targetSecs=%.4f status=%ld",
-              (long)skipped, targetSecs, (long)reader.status);
         return NO;
       }
     }

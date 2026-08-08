@@ -186,8 +186,6 @@
     return;
   }
 
-  NSLog(@"[TRACE][IMS1] prepareWithCompletion entered url=%@",
-        _imageURL.lastPathComponent);
   __weak __typeof(self) weakSelf = self;
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
     __strong __typeof(weakSelf) s = weakSelf;

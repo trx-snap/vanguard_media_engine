@@ -86,8 +86,8 @@ import 'vg_reverse_sidecar_status.dart';
 ///
 /// The returned draft must be ephemeral — it must not be persisted as
 /// authoring state, placed in undo/redo history, or re-normalized.
-typedef VGEditorPreviewDraftDeriver = VGEditorDraft Function(
-    VGEditorDraft source);
+typedef VGEditorPreviewDraftDeriver =
+    VGEditorDraft Function(VGEditorDraft source);
 
 /// The formal Dart-side controller for the Phase 7 timeline editor API.
 ///
@@ -1169,12 +1169,16 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   ///
   /// Call this before [dispose] in the owning widget's dispose lifecycle.
   Future<void> disposeAsync() {
-    if (_disposed) return Future<void>.value();
+    if (_disposed) {
+      return Future<void>.value();
+    }
 
     // If native teardown has already been dispatched, return the cached
     // best-effort future so the caller joins the in-flight operation without
     // sending a second disposeTimeline request.
-    if (_teardownFuture != null) return _teardownFuture!;
+    if (_teardownFuture != null) {
+      return _teardownFuture!;
+    }
 
     _dispatchTeardown();
     return _teardownFuture!;
@@ -1208,11 +1212,15 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     // has been called. If dispose() fired _dispatchTeardown() before this
     // method was reached, we must join that raw future and propagate its native
     // error rather than returning a silent completed future.
-    if (_rawTeardownFuture != null) return _rawTeardownFuture!;
+    if (_rawTeardownFuture != null) {
+      return _rawTeardownFuture!;
+    }
 
     // Only return a completed future when the controller is disposed AND no
     // raw teardown was ever dispatched (i.e. native was never called at all).
-    if (_disposed) return Future<void>.value();
+    if (_disposed) {
+      return Future<void>.value();
+    }
 
     // Dispatch exactly once, then return the raw (error-propagating) future.
     _dispatchTeardown();
@@ -1225,8 +1233,10 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// [disposeAsyncConfirmed], and [dispose]. Must not be called when
   /// [_rawTeardownFuture] is already set.
   void _dispatchTeardown() {
-    assert(_rawTeardownFuture == null,
-        '_dispatchTeardown called after teardown already dispatched');
+    assert(
+      _rawTeardownFuture == null,
+      '_dispatchTeardown called after teardown already dispatched',
+    );
 
     // Unregister timeline subscription so no callbacks arrive after teardown
     // begins. Done synchronously before the MethodChannel call so the
@@ -1240,7 +1250,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     // Store the raw future first. Both fields are set in the same microtask
     // so there is never a window where one is set and the other is not.
     _rawTeardownFuture = _channel.invokeMethod<void>('disposeTimeline');
-    _teardownFuture = _rawTeardownFuture!.catchError((_) {
+
+    _teardownFuture = _rawTeardownFuture!.catchError((e) {
       // Best-effort — native may already be gone.
     });
   }
@@ -1254,7 +1265,9 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// fire-and-forgotten in that case.
   @override
   void dispose() {
-    if (_disposed) return;
+    if (_disposed) {
+      return;
+    }
     _disposed = true;
 
     // Unregister timeline subscription if disposeAsync was not called first.
@@ -1272,7 +1285,9 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     // nor disposeAsyncConfirmed() has already done so. Delegates to
     // _dispatchTeardown() so disposeTimeline is sent exactly once regardless
     // of which disposal path the caller used.
-    if (_rawTeardownFuture == null) _dispatchTeardown();
+    if (_rawTeardownFuture == null) {
+      _dispatchTeardown();
+    }
 
     super.dispose();
   }
@@ -1479,7 +1494,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// the timeline snapshot is invalid, or if the recorder fails to start.
   /// Throws [StateError] if disposed.
   Future<VGAudioRecordingStartResult> startAudioRecording(
-      String outputPath) async {
+    String outputPath,
+  ) async {
     _assertNotDisposed();
     final raw = await _channel.invokeMapMethod<Object?, Object?>(
       'startAudioRecording',
