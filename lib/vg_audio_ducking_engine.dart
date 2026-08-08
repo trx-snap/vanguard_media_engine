@@ -25,6 +25,7 @@
 //   - No native calls, no Phase 15 audio graph work, no real-time playback ducking.
 //   - Only 'linear' keyframe curves are used (matches Phase 8.15A constraint).
 
+import 'src/audio/vg_audio_envelope_composer.dart';
 import 'vg_audio_sidecar_plan.dart';
 
 /// Configuration for [VGAudioDuckingEngine.apply].
@@ -90,15 +91,30 @@ final class _Interval {
 final class VGAudioDuckingEngine {
   const VGAudioDuckingEngine();
 
-  /// Applies offline ducking to [tracks] using [config].
+  /// Applies offline ducking and fade-envelope composition to [tracks] using
+  /// [config].
   ///
-  /// Returns a new [List<VGAudioSidecarTrack>].  Tracks with roles other than
-  /// `'music'` and `'sfx'`, and target tracks with pre-authored keyframes, are
-  /// included unchanged.
+  /// Returns a new [List<VGAudioSidecarTrack>]. Tracks with roles other than
+  /// `'music'`, `'sfx'`, and `'voiceover'` are included unchanged.
+  ///
+  /// **Processing order per track:**
+  /// 1. `'voiceover'` with existing non-empty keyframes: returned unchanged.
+  ///    `'voiceover'` with no keyframes: if fade fields are non-zero, derive fade
+  ///    envelope; otherwise returned unchanged.
+  /// 2. `'music'`/`'sfx'` with existing non-empty keyframes: returned unchanged.
+  ///    No ducking, no fade composition — pre-authored keyframes are always
+  ///    preserved exactly as supplied.
+  /// 3. `'music'`/`'sfx'` with no keyframes: apply ducking first. If ducking
+  ///    generated keyframes and fades are non-zero, compose fade over the
+  ///    ducking result. If ducking generated no keyframes (no voiceover overlap)
+  ///    and fades are non-zero, derive fade envelope independently.
+  /// 4. All other roles (`'original'`, null, unknown): pass through unchanged.
   List<VGAudioSidecarTrack> apply(
     List<VGAudioSidecarTrack> tracks, {
     VGAudioDuckingConfig config = const VGAudioDuckingConfig(),
   }) {
+    const composer = VGAudioEnvelopeComposer();
+
     // 1. Collect foreground intervals from voiceover tracks ONLY.
     //    'original' is no longer a foreground trigger (Phase 10-C Slice B).
     //    Static muting of 'original' is handled by applyAudioCompositionPolicy.
@@ -118,16 +134,43 @@ final class VGAudioDuckingEngine {
 
     // 3. Process each track.
     return tracks.map((t) {
-      // Only 'music' and 'sfx' are known Added roles that receive ducking.
-      // 'original', 'voiceover', null, and unknown role strings pass through.
-      if (!_isKnownAddedRole(t.role)) return t;
-      // Slice B: skip tracks with existing keyframes — no provenance to
-      // distinguish user-authored automation from generated ducking.
-      if (t.volumeKeyframes != null && t.volumeKeyframes!.isNotEmpty) {
-        return t; // pre-authored automation preserved, ducking skipped
+      // ── voiceover: fade only, never ducked ──────────────────────────────
+      if (t.role == 'voiceover') {
+        // Existing keyframes are always preserved unchanged.
+        if (t.volumeKeyframes != null && t.volumeKeyframes!.isNotEmpty) {
+          return t;
+        }
+        return composer.derive(t);
       }
 
-      return _duckTrack(t, merged, config);
+      // ── music/sfx: existing keyframes always preserved unchanged ─────────
+      // Pre-authored (or user-committed) keyframes are never overwritten or
+      // composed with fades here. This engine only composes fades with the
+      // ducking keyframes it generates in this same apply() call.
+      if (_isKnownAddedRole(t.role)) {
+        if (t.volumeKeyframes != null && t.volumeKeyframes!.isNotEmpty) {
+          return t; // pre-authored keyframes: pass through unchanged
+        }
+
+        // No existing keyframes: apply ducking first.
+        final ducked = _duckTrack(t, merged, config);
+
+        // If ducking generated keyframes and fades are requested, compose.
+        if (ducked.volumeKeyframes != null &&
+            ducked.volumeKeyframes!.isNotEmpty) {
+          if (t.fadeInSeconds > 0.0 || t.fadeOutSeconds > 0.0) {
+            return composer.composeWithDucking(ducked, ducked.volumeKeyframes!);
+          }
+          return ducked;
+        }
+
+        // Ducking produced no keyframes (no voiceover overlap): derive fade
+        // envelope independently if fades are requested.
+        return composer.derive(ducked);
+      }
+
+      // ── all other roles: pass through unchanged ────────────────────────
+      return t;
     }).toList();
   }
 

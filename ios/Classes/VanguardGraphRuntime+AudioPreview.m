@@ -234,17 +234,31 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
   // Helper: cancel-and-join resolver then finish shutdown.
   // Always called on the main queue after runtime invalidation (or
   // immediately when no runtime is installed).
+  //
+  // weakSelf is used by the runtime-invalidation identity guard (below) which
+  // races with replacement installs and must tolerate a nil graph owner.
+  //
+  // The resolver callback is the *terminal* shutdown path: the resolver was
+  // already detached from the graph before cancelAndCleanupWithCompletion: is
+  // called, so no retain cycle is introduced by capturing self strongly here.
+  // If weakSelf were used here and the graph owner had been deallocated,
+  // _finishAudioShutdown would never fire and all shutdown waiters would be
+  // permanently stranded — including the graph-completion block that delivers
+  // result(nil) back to Dart.
   __weak VanguardGraphRuntime *weakSelf = self;
+  __strong VanguardGraphRuntime *strongSelf = self;
 
   dispatch_block_t finishAfterResolverCleanup = ^{
     if (currentResolver) {
       [currentResolver cancelAndCleanupWithCompletion:^{
         // Fires on main queue after ExtAudioFile dispose and temp removal.
-        VanguardGraphRuntime *ss = weakSelf;
-        [ss _finishAudioShutdown];
+        // Use strongSelf here (not weakSelf) — _finishAudioShutdown MUST be
+        // reached to drain shutdown waiters. The resolver is already detached
+        // so there is no retain cycle.
+        [strongSelf _finishAudioShutdown];
       }];
     } else {
-      [weakSelf _finishAudioShutdown];
+      [strongSelf _finishAudioShutdown];
     }
   };
 
@@ -254,15 +268,15 @@ static char kAudioPreviewFileResolverKey; ///< VGAudioPreviewFileResolver * —
     return;
   }
 
-  // 5. Weak self for the identity guard inside the completion.
   VanguardAudioPreviewRuntime *capturedRuntime = currentRuntime;
 
   [currentRuntime invalidateAsync:^{
     // Fires on main queue (VanguardAudioPreviewRuntime drains waiters on main).
     dispatch_async(dispatch_get_main_queue(), ^{
       VanguardGraphRuntime *ss = weakSelf;
-      if (!ss)
+      if (!ss) {
         return;
+      }
 
       // Identity guard: only clear if the installed runtime is still
       // the one we invalidated (a replacement may have already installed).

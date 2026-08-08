@@ -545,4 +545,244 @@ void main() {
     expect(music.volumeKeyframes!.isNotEmpty, isTrue);
     expect(music.mixGain, closeTo(0.18, 1e-9));
   });
+
+  // ── DUCK-24: Music with fadeIn/fadeOut and no VO gets fade-only absolute keyframes ──
+  test(
+    'DUCK-24 music with fadeIn/fadeOut and no VO gets fade-only absolute keyframes',
+    () {
+      final track = VGAudioSidecarTrack(
+        trackId: 'music1',
+        url: '/tmp/music1.m4a',
+        startTime: 2.0,
+        duration: 10.0,
+        volume: 0.8,
+        role: 'music',
+        fadeInSeconds: 1.0,
+        fadeOutSeconds: 2.0,
+      );
+      final result = _engine.apply([track], config: _cfg);
+      expect(result.length, 1);
+      final music = result.first;
+      expect(music.volumeKeyframes, isNotNull);
+      expect(music.volumeKeyframes!.length, equals(4));
+
+      // Ramps:
+      // start (2.0) -> volume 0.0
+      // fadeInEnd (2.0 + 1.0 = 3.0) -> volume 0.8
+      // fadeOutStart (12.0 - 2.0 = 10.0) -> volume 0.8
+      // end (12.0) -> volume 0.0
+      expect(music.volumeKeyframes![0].time, closeTo(2.0, 1e-6));
+      expect(music.volumeKeyframes![0].volume, closeTo(0.0, 1e-6));
+
+      expect(music.volumeKeyframes![1].time, closeTo(3.0, 1e-6));
+      expect(music.volumeKeyframes![1].volume, closeTo(0.8, 1e-6));
+
+      expect(music.volumeKeyframes![2].time, closeTo(10.0, 1e-6));
+      expect(music.volumeKeyframes![2].volume, closeTo(0.8, 1e-6));
+
+      expect(music.volumeKeyframes![3].time, closeTo(12.0, 1e-6));
+      expect(music.volumeKeyframes![3].volume, closeTo(0.0, 1e-6));
+    },
+  );
+
+  // ── DUCK-25: Voiceover with fadeIn/fadeOut gets fade-only keyframes and is not ducked ──
+  test(
+    'DUCK-25 voiceover with fadeIn/fadeOut gets fade-only keyframes and is not ducked',
+    () {
+      final vo = VGAudioSidecarTrack(
+        trackId: 'vo1',
+        url: '/tmp/vo1.m4a',
+        startTime: 0.0,
+        duration: 5.0,
+        volume: 0.9,
+        role: 'voiceover',
+        fadeInSeconds: 1.0,
+        fadeOutSeconds: 1.0,
+      );
+      // Even with itself or other VO tracks, VO is never ducked.
+      final result = _engine.apply([vo], config: _cfg);
+      expect(result.length, 1);
+      final resultVo = result.first;
+      expect(resultVo.volumeKeyframes, isNotNull);
+      expect(resultVo.volumeKeyframes!.length, equals(4));
+
+      // Ramps:
+      // start (0.0) -> 0.0
+      // fadeInEnd (1.0) -> 0.9
+      // fadeOutStart (4.0) -> 0.9
+      // end (5.0) -> 0.0
+      expect(resultVo.volumeKeyframes![0].time, closeTo(0.0, 1e-6));
+      expect(resultVo.volumeKeyframes![0].volume, closeTo(0.0, 1e-6));
+
+      expect(resultVo.volumeKeyframes![1].time, closeTo(1.0, 1e-6));
+      expect(resultVo.volumeKeyframes![1].volume, closeTo(0.9, 1e-6));
+
+      expect(resultVo.volumeKeyframes![2].time, closeTo(4.0, 1e-6));
+      expect(resultVo.volumeKeyframes![2].volume, closeTo(0.9, 1e-6));
+
+      expect(resultVo.volumeKeyframes![3].time, closeTo(5.0, 1e-6));
+      expect(resultVo.volumeKeyframes![3].volume, closeTo(0.0, 1e-6));
+    },
+  );
+
+  // ── DUCK-26: Music/sfx with existing non-empty volumeKeyframes plus fade fields and overlapping VO are returned unchanged/identical ──
+  test(
+    'DUCK-26 music/sfx with existing keyframes, fades, and overlapping VO are returned identical',
+    () {
+      final existingKfs = [const VGAudioVolumeKeyframe(time: 1.0, volume: 0.7)];
+
+      // 1. Music track case
+      final music = VGAudioSidecarTrack(
+        trackId: 'music1',
+        url: '/tmp/music1.m4a',
+        startTime: 0.0,
+        duration: 10.0,
+        volume: 0.8,
+        role: 'music',
+        fadeInSeconds: 1.0,
+        fadeOutSeconds: 1.0,
+        volumeKeyframes: existingKfs,
+      );
+
+      // 2. SFX track case
+      final sfx = VGAudioSidecarTrack(
+        trackId: 'sfx1',
+        url: '/tmp/sfx1.m4a',
+        startTime: 0.0,
+        duration: 10.0,
+        volume: 0.8,
+        role: 'sfx',
+        fadeInSeconds: 1.0,
+        fadeOutSeconds: 1.0,
+        volumeKeyframes: existingKfs,
+      );
+
+      final vo = VGAudioSidecarTrack(
+        trackId: 'vo1',
+        url: '/tmp/vo1.m4a',
+        startTime: 3.0,
+        duration: 2.0,
+        role: 'voiceover',
+      );
+
+      final result = _engine.apply([music, sfx, vo], config: _cfg);
+
+      final resultMusic = result.firstWhere((t) => t.trackId == 'music1');
+      expect(identical(resultMusic, music), isTrue);
+
+      final resultSfx = result.firstWhere((t) => t.trackId == 'sfx1');
+      expect(identical(resultSfx, sfx), isTrue);
+    },
+  );
+
+  // ── DUCK-27: Music volume 0.5 + ducking + fade uses normalized fade scale (no squaring at sustain) ──
+  test(
+    'DUCK-27 music volume 0.5 + ducking + fade uses normalized fade scale, not squared volume',
+    () {
+      final music = VGAudioSidecarTrack(
+        trackId: 'music1',
+        url: '/tmp/music1.m4a',
+        startTime: 0.0,
+        duration: 10.0,
+        volume: 0.5,
+        role: 'music',
+        fadeInSeconds: 2.0,
+        fadeOutSeconds: 2.0,
+      );
+      final vo = VGAudioSidecarTrack(
+        trackId: 'vo1',
+        url: '/tmp/vo1.m4a',
+        startTime: 4.0,
+        duration: 2.0,
+        role: 'voiceover',
+      );
+      // Config: duckVolume = 0.25, attack = 0.15, release = 0.30
+      final result = _engine.apply([music, vo], config: _cfg);
+      final resultMusic = result.firstWhere((t) => t.trackId == 'music1');
+      expect(resultMusic.volumeKeyframes, isNotNull);
+
+      // Let's verify the volumes at key times using linear interpolation:
+      final kfs = resultMusic.volumeKeyframes!;
+
+      double valAt(double t) {
+        if (t <= kfs.first.time) return kfs.first.volume;
+        if (t >= kfs.last.time) return kfs.last.volume;
+        for (var i = 0; i < kfs.length - 1; i++) {
+          if (t >= kfs[i].time && t <= kfs[i + 1].time) {
+            final frac = (t - kfs[i].time) / (kfs[i + 1].time - kfs[i].time);
+            return kfs[i].volume + frac * (kfs[i + 1].volume - kfs[i].volume);
+          }
+        }
+        return 1.0;
+      }
+
+      // At t = 0.0, fade is 0.0 -> volume should be 0.0
+      expect(valAt(0.0), closeTo(0.0, 1e-5));
+
+      // At t = 2.0 (sustain region of fade, fade scale is 1.0). Ducking has not started.
+      // Absolute volume should be exactly track.volume = 0.5. (Not 0.25!).
+      expect(valAt(2.0), closeTo(0.5, 1e-5));
+
+      // At t = 3.85 (ducking attack starts, fade scale is 1.0).
+      expect(valAt(3.85), closeTo(0.5, 1e-5));
+
+      // At t = 4.0 (ducking dip reached, fade scale is 1.0).
+      // Absolute volume should be duckVolume = 0.25. (Not 0.25 * 0.5 = 0.125!).
+      expect(valAt(4.0), closeTo(0.25, 1e-5));
+
+      // At t = 6.0 (ducking dip ends, fade scale is 1.0).
+      expect(valAt(6.0), closeTo(0.25, 1e-5));
+
+      // At t = 6.30 (ducking release ends, fade scale is 1.0).
+      expect(valAt(6.30), closeTo(0.5, 1e-5));
+
+      // At t = 8.0 (sustain end).
+      expect(valAt(8.0), closeTo(0.5, 1e-5));
+
+      // At t = 10.0, fade ends -> volume should be 0.0
+      expect(valAt(10.0), closeTo(0.0, 1e-5));
+    },
+  );
+
+  // ── DUCK-28: Overlapping fades scale proportionally to fit exactly ──
+  test(
+    'DUCK-28 overlapping fades scale proportionally with no midpoint product',
+    () {
+      final music = VGAudioSidecarTrack(
+        trackId: 'music1',
+        url: '/tmp/music1.m4a',
+        startTime: 0.0,
+        duration: 4.0,
+        volume: 0.8,
+        role: 'music',
+        fadeInSeconds: 4.0,
+        fadeOutSeconds: 4.0,
+      );
+      final result = _engine.apply([music], config: _cfg);
+      final resultMusic = result.first;
+      expect(resultMusic.volumeKeyframes, isNotNull);
+
+      // Proportional scaling: fadeIn + fadeOut = 8.0 > 4.0 duration.
+      // scale = 4.0 / 8.0 = 0.5.
+      // effectiveFadeIn = 2.0, effectiveFadeOut = 2.0.
+      // Breakpoints:
+      // start (0.0) -> 0.0
+      // fadeInEnd (2.0) -> 0.8
+      // fadeOutStart (4.0 - 2.0 = 2.0) -> 0.8 (deduped or merged)
+      // end (4.0) -> 0.0
+      //
+      // Let's verify the keyframes:
+      final kfs = resultMusic.volumeKeyframes!;
+      expect(kfs.length, equals(3)); // 0.0 -> 0.0, 2.0 -> 0.8, 4.0 -> 0.0
+
+      expect(kfs[0].time, closeTo(0.0, 1e-6));
+      expect(kfs[0].volume, closeTo(0.0, 1e-6));
+
+      expect(kfs[1].time, closeTo(2.0, 1e-6));
+      expect(kfs[1].volume, closeTo(0.8, 1e-6));
+
+      expect(kfs[2].time, closeTo(4.0, 1e-6));
+      expect(kfs[2].volume, closeTo(0.0, 1e-6));
+    },
+  );
 }
