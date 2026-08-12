@@ -4532,16 +4532,29 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
     //     path beats the prefetch, the insert is a no-op.
     //   - If prefetch beats the sync path, the cache hit in
     //     _pullBufferFromReader:atAssetTime: saves the AVAssetImageGenerator call.
-    //   - This block holds only value-typed copies; no unsafe captures.
+    //   - Phase 10F-D: weak capture prevents the block from extending the node
+    //     lifetime after Done/invalidate. strongSelf promotion at block entry
+    //     aborts immediately if the node has been deallocated or invalidated.
     uint64_t capturedGen       = atomic_load(&_generation);
     NSUInteger capturedIdx     = clipIndex;
     NSString *capturedSrcURL   = [clip.sourceURL copy];
     NSNumber *capturedFreezePTS = clip.freezePTS;
     CGSize capturedRenderSize  = _targetRenderSize;
 
+    __weak typeof(self) weakSelf = self;
     dispatch_async(_prefetchQueue, ^{
+      // ── Weak→strong promotion: bail if node was deallocated or invalidated.
+      __strong typeof(weakSelf) strongSelf = weakSelf;
+      if (!strongSelf || atomic_load(&strongSelf->_invalidated)) {
+        os_log_debug(sTimelineLog,
+                     "[VGTCNode] prefetch aborted (invalidated): clip=%lu gen=%llu",
+                     (unsigned long)capturedIdx,
+                     (unsigned long long)capturedGen);
+        return;
+      }
+
       // ── Guard 1: stale generation ────────────────────────────────────────
-      if (atomic_load(&self->_generation) != capturedGen) {
+      if (atomic_load(&strongSelf->_generation) != capturedGen) {
         os_log_debug(sTimelineLog,
                      "[VGTCNode] prefetch stale (pre-work): clip=%lu gen=%llu",
                      (unsigned long)capturedIdx,
@@ -4552,11 +4565,11 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
       // ── Guard 2: already cached ──────────────────────────────────────────
       double freezePTS = capturedFreezePTS.doubleValue;
       CVPixelBufferRef existing =
-          [self->_frameCache lookupWithClipIndex:capturedIdx
-                                       sourceURL:capturedSrcURL
-                                        assetPTS:freezePTS
-                                      renderSize:capturedRenderSize
-                                      generation:capturedGen];
+          [strongSelf->_frameCache lookupWithClipIndex:capturedIdx
+                                              sourceURL:capturedSrcURL
+                                               assetPTS:freezePTS
+                                             renderSize:capturedRenderSize
+                                             generation:capturedGen];
       if (existing) {
         CVPixelBufferRelease(existing);
         os_log_debug(sTimelineLog,
@@ -4600,8 +4613,9 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
         return;
       }
 
-      // ── Guard 3: stale generation after extraction ────────────────────────
-      if (atomic_load(&self->_generation) != capturedGen) {
+      // ── Guard 3: stale generation or invalidated after extraction ─────────
+      if (atomic_load(&strongSelf->_invalidated) ||
+          atomic_load(&strongSelf->_generation) != capturedGen) {
         CGImageRelease(pCGFrame);
         os_log_debug(sTimelineLog,
                      "[VGTCNode] prefetch stale (post-extract): clip=%lu gen=%llu",
@@ -4633,6 +4647,16 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
 
       size_t pW = (capturedRenderSize.width  > 0) ? (size_t)capturedRenderSize.width  : (size_t)pImgSize.width;
       size_t pH = (capturedRenderSize.height > 0) ? (size_t)capturedRenderSize.height : (size_t)pImgSize.height;
+
+      // ── Guard before expensive alloc/render: skip if invalidated ─────────
+      if (atomic_load(&strongSelf->_invalidated) ||
+          atomic_load(&strongSelf->_generation) != capturedGen) {
+        os_log_debug(sTimelineLog,
+                     "[VGTCNode] prefetch aborted before render: clip=%lu gen=%llu",
+                     (unsigned long)capturedIdx,
+                     (unsigned long long)capturedGen);
+        return;
+      }
 
       NSDictionary *pPBAttrs = @{
           (id)kCVPixelBufferPixelFormatTypeKey:     @(kCVPixelFormatType_32BGRA),
@@ -4669,8 +4693,9 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
       CGColorSpaceRelease(pCS);
       _VGTCNTagSDR709PixelBuffer(pPB); // C1E: tag output as BT.709/sRGB
 
-      // ── Guard 4: stale generation before insert ───────────────────────────
-      if (atomic_load(&self->_generation) != capturedGen) {
+      // ── Guard 4: stale generation or invalidated before insert ────────────
+      if (atomic_load(&strongSelf->_invalidated) ||
+          atomic_load(&strongSelf->_generation) != capturedGen) {
         CVPixelBufferRelease(pPB);
         os_log_debug(sTimelineLog,
                      "[VGTCNode] prefetch stale (pre-insert): clip=%lu gen=%llu",
@@ -4679,12 +4704,12 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
         return;
       }
 
-      [self->_frameCache insertWithClipIndex:capturedIdx
-                                   sourceURL:capturedSrcURL
-                                    assetPTS:freezePTS
-                                  renderSize:capturedRenderSize
-                                  generation:capturedGen
-                                      buffer:pPB];
+      [strongSelf->_frameCache insertWithClipIndex:capturedIdx
+                                          sourceURL:capturedSrcURL
+                                           assetPTS:freezePTS
+                                         renderSize:capturedRenderSize
+                                         generation:capturedGen
+                                             buffer:pPB];
       CVPixelBufferRelease(pPB); // cache has its own +1; release local ref
 
       os_log(sTimelineLog,
@@ -4692,7 +4717,7 @@ static double VGComputeAssetTime(VGClipDescriptor *clip, double elapsedTimeline)
              "cacheBytes=%zu",
              (unsigned long)capturedIdx, freezePTS,
              CMTimeGetSeconds(pActualTime),
-             self->_frameCache.currentBytes);
+             strongSelf->_frameCache.currentBytes);
     }); // dispatch_async _prefetchQueue
     // ── End Phase 7.18A prefetch ─────────────────────────────────────────────
 
