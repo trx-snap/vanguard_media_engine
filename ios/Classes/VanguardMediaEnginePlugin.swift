@@ -27,13 +27,15 @@ import Vision
 
 /// Lightweight thumbnail extractor backed by a single shared AVAssetImageGenerator.
 /// Used for filmstrip frame extraction — never creates a full renderer.
-/// Max size 120×214 px — enough for filmstrip display, not for playback.
+/// Generates evenly-spaced JPEG thumbnail frames from a video.
+/// Supports configurable maximumSize and compressionQuality for filmstrip and gallery.
 final class VanguardThumbnailGenerator {
 
     private var generator: AVAssetImageGenerator?
     private let queue = DispatchQueue(label: "com.vanguard.thumbnails", qos: .userInitiated)
 
     func generateThumbnails(videoPath: String, count: Int, duration: Double,
+                            maxWidth: Int = 120, maxHeight: Int = 214, jpegQuality: Double = 0.6,
                             completion: @escaping ([FlutterStandardTypedData]) -> Void) {
         queue.async { [weak self] in
             guard let self = self else { return }
@@ -42,9 +44,13 @@ final class VanguardThumbnailGenerator {
             let asset = AVURLAsset(url: url,
                                    options: [AVURLAssetPreferPreciseDurationAndTimingKey: false])
 
+            let clampedWidth = max(1, min(maxWidth, 3840))
+            let clampedHeight = max(1, min(maxHeight, 3840))
+            let clampedQuality = max(0.1, min(jpegQuality, 1.0))
+
             let gen = AVAssetImageGenerator(asset: asset)
             gen.appliesPreferredTrackTransform = true
-            gen.maximumSize = CGSize(width: 120, height: 214)
+            gen.maximumSize = CGSize(width: clampedWidth, height: clampedHeight)
             gen.requestedTimeToleranceBefore = CMTimeMakeWithSeconds(0.1, preferredTimescale: 600)
             gen.requestedTimeToleranceAfter  = CMTimeMakeWithSeconds(0.1, preferredTimescale: 600)
             self.generator = gen
@@ -60,7 +66,7 @@ final class VanguardThumbnailGenerator {
             for timeValue in times {
                 let t = timeValue.timeValue
                 if let cgImage = try? gen.copyCGImage(at: t, actualTime: nil),
-                   let data = UIImage(cgImage: cgImage).jpegData(compressionQuality: 0.6) {
+                   let data = UIImage(cgImage: cgImage).jpegData(compressionQuality: CGFloat(clampedQuality)) {
                     images.append(FlutterStandardTypedData(bytes: data))
                 }
             }
@@ -3292,8 +3298,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                                     details: nil))
                 return
             }
+            let maxWidth = args?["maxWidth"] as? Int ?? 120
+            let maxHeight = args?["maxHeight"] as? Int ?? 214
+            let jpegQuality = args?["jpegQuality"] as? Double ?? 0.6
             thumbnailGenerator.generateThumbnails(
-                videoPath: videoPath, count: count, duration: duration
+                videoPath: videoPath, count: count, duration: duration,
+                maxWidth: maxWidth, maxHeight: maxHeight, jpegQuality: jpegQuality
             ) { images in result(images) }
 
         // ── ROI-5B.1: Display-Oriented Frame Extraction Evidence ─────────────

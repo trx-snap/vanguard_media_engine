@@ -426,12 +426,17 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 val videoPath = args?.get("videoPath") as? String
                 val count     = (args?.get("count")    as? Number)?.toInt()    ?: 8
                 val duration  = (args?.get("duration") as? Number)?.toDouble() ?: 0.0
+                val maxWidth  = (args?.get("maxWidth") as? Number)?.toInt()
+                val maxHeight = (args?.get("maxHeight") as? Number)?.toInt()
+                val jpegQuality = (args?.get("jpegQuality") as? Number)?.toDouble()
                 if (videoPath == null) {
                     result.error("INVALID_ARG", "generateThumbnails: videoPath required", null)
                     return
                 }
                 Thread {
-                    val frames = VanguardThumbnailExtractor.extract(videoPath, count, duration)
+                    val frames = VanguardThumbnailExtractor.extract(
+                        videoPath, count, duration, maxWidth, maxHeight, jpegQuality
+                    )
                     mainHandler.post { result.success(frames) }
                 }.start()
             }

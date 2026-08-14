@@ -277,8 +277,7 @@ final class VGThermalMonitor {
   // Private constructor: static-only API.
   const VGThermalMonitor._();
 
-  static const MethodChannel _channel =
-      MethodChannel('vanguard_media_engine');
+  static const MethodChannel _channel = MethodChannel('vanguard_media_engine');
 
   // Internal mutable state.
   static VGThermalState _currentState = VGThermalState.nominal;
@@ -309,8 +308,7 @@ final class VGThermalMonitor {
   /// Updates [currentState] and returns the result. Safe to call at any time.
   static Future<VGThermalState> getThermalState() async {
     _ensureDispatcherRegistered();
-    final raw =
-        await _channel.invokeMethod<int>('getThermalState') ?? 0;
+    final raw = await _channel.invokeMethod<int>('getThermalState') ?? 0;
     final state = VGThermalState.fromRaw(raw);
     _currentState = state;
     return state;
@@ -325,10 +323,9 @@ final class VGThermalMonitor {
   /// Safe to call in debug builds only. In release this method is a no-op.
   static Future<void> simulateThermalState(VGThermalState state) async {
     if (!kDebugMode) return;
-    await _channel.invokeMethod<void>(
-      'simulateThermalState',
-      {'rawValue': state.index},
-    );
+    await _channel.invokeMethod<void>('simulateThermalState', {
+      'rawValue': state.index,
+    });
   }
 
   /// Lazily self-registers with [VanguardChannelDispatcher].
@@ -339,10 +336,10 @@ final class VGThermalMonitor {
   static void _ensureDispatcherRegistered() {
     if (_dispatcherRegistered) return;
     _dispatcherRegistered = true;
-    _thermalSubscription =
-        VanguardChannelDispatcher.instance.registerThermalStateListener(
-      (rawValue) => _onNativeStateChanged(rawValue),
-    );
+    _thermalSubscription = VanguardChannelDispatcher.instance
+        .registerThermalStateListener(
+          (rawValue) => _onNativeStateChanged(rawValue),
+        );
   }
 
   /// Internal: updates current state and emits the stream event.
@@ -427,41 +424,46 @@ class VanguardEngine {
     return instance;
   }
 
+  /// Creates a test instance that bypasses native FFI library loading.
+  @visibleForTesting
+  factory VanguardEngine.forTesting() => VanguardEngine._forTesting();
+
+  VanguardEngine._forTesting() : _enginePtr = nullptr;
+
   VanguardEngine._internal(VanguardMode mode) {
     _enginePtr = _VanguardFFI.create(mode.index);
     // Register dispatcher subscriptions (dispatcher owns the channel handler).
     final dispatcher = VanguardChannelDispatcher.instance;
     dispatcher.ensureHandlerRegistered();
-    _playbackCompleteSub = dispatcher.registerPlaybackCompleteListener(
-      (textureId) {
-        if (_disposed) return;
-        // Guard: only forward if this engine owns the texture.
-        if (_activeRenderers.containsKey(textureId)) {
-          onPlaybackComplete?.call(textureId);
-        }
-      },
-    );
-    _durationProbedSub = dispatcher.registerDurationProbedListener(
-      (String path, double duration) {
-        if (_disposed) return;
-        // Update C++ TimelineManager with the probed duration.
-        final pathPtr = path.toNativeUtf8();
-        _VanguardFFI.setNodeDuration(_enginePtr, pathPtr, duration);
-        calloc.free(pathPtr);
-        onNodeDurationProbed?.call(path, duration);
-      },
-    );
+    _playbackCompleteSub = dispatcher.registerPlaybackCompleteListener((
+      textureId,
+    ) {
+      if (_disposed) return;
+      // Guard: only forward if this engine owns the texture.
+      if (_activeRenderers.containsKey(textureId)) {
+        onPlaybackComplete?.call(textureId);
+      }
+    });
+    _durationProbedSub = dispatcher.registerDurationProbedListener((
+      String path,
+      double duration,
+    ) {
+      if (_disposed) return;
+      // Update C++ TimelineManager with the probed duration.
+      final pathPtr = path.toNativeUtf8();
+      _VanguardFFI.setNodeDuration(_enginePtr, pathPtr, duration);
+      calloc.free(pathPtr);
+      onNodeDurationProbed?.call(path, duration);
+    });
     // Export progress: forward to the UI callback when this engine is the
     // most recently registered consumer. Single-slot: if VanguardTimelineExporter
     // concurrently registers, its subscription overwrites this one while its
     // export is running; this registration is restored as the last subscriber
     // only when the exporter's finally block unregisters.
-    _exportProgressSub = dispatcher.registerExportListener(
-      (double progress) {
-        if (_disposed) return;
-        onExportProgress?.call(progress);
-      },
-    );
+    _exportProgressSub = dispatcher.registerExportListener((double progress) {
+      if (_disposed) return;
+      onExportProgress?.call(progress);
+    });
   }
 
   /// Synchronous native teardown — called during hot-reload when a new instance
@@ -496,7 +498,6 @@ class VanguardEngine {
   /// Returns 0 on success, non-zero on error.
   /// Useful after FFI calls on Android to detect silent OOM or null-arg failures.
   int get lastNativeError => _VanguardFFI.lastError(_enginePtr);
-
 
   /// G-02: Returns the current masterClock position in seconds from the native engine.
   /// Used by the A/V sync integration test to measure audio-vs-wall-clock drift.
@@ -1015,26 +1016,67 @@ class VanguardEngine {
     return null;
   }
 
-  /// Generates evenly-spaced JPEG thumbnail frames from a video for the filmstrip UI.
+  /// Generates evenly-spaced JPEG thumbnail frames from a video.
+  ///
+  /// Static route that uses the camera method channel without allocating a C++
+  /// timeline engine or causing hot-reload engine teardown.
+  ///
+  /// When [maxWidth], [maxHeight], and [jpegQuality] are omitted, platforms
+  /// preserve their historical defaults (iOS limits to 120x214 with 0.6 quality
+  /// for filmstrips; Android preserves unconstrained frame dimensions and quality 72).
+  /// Pass explicit dimensions and quality (e.g. 640x640, 0.82) for high-resolution
+  /// gallery thumbnails across all platforms.
+  static Future<List<Uint8List>> extractThumbnails({
+    required String videoPath,
+    required int count,
+    required double duration,
+    int? maxWidth,
+    int? maxHeight,
+    double? jpegQuality,
+  }) async {
+    final args = <String, dynamic>{
+      'videoPath': videoPath,
+      'count': count,
+      'duration': duration,
+    };
+    if (maxWidth != null) args['maxWidth'] = maxWidth;
+    if (maxHeight != null) args['maxHeight'] = maxHeight;
+    if (jpegQuality != null) args['jpegQuality'] = jpegQuality;
 
+    final result = await _cameraChannel.invokeMethod<List>(
+      'generateThumbnails',
+      args,
+    );
+    if (result == null) return [];
+    return result.whereType<Uint8List>().toList();
+  }
+
+  /// Generates evenly-spaced JPEG thumbnail frames from a video for the filmstrip UI.
   ///
   /// - [videoPath]: source video
   /// - [count]: number of thumbnails to generate (typically 8–10 per clip)
   /// - [duration]: native duration of the clip in seconds
+  /// - [maxWidth]: optional max width constraint
+  /// - [maxHeight]: optional max height constraint
+  /// - [jpegQuality]: optional JPEG compression quality (0.0 to 1.0)
   ///
   /// Returns a list of JPEG bytes for each thumbnail.
   Future<List<Uint8List>> generateThumbnails({
     required String videoPath,
     required int count,
     required double duration,
-  }) async {
-    final result = await _channel.invokeMethod<List>('generateThumbnails', {
-      'videoPath': videoPath,
-      'count': count,
-      'duration': duration,
-    });
-    if (result == null) return [];
-    return result.whereType<Uint8List>().toList();
+    int? maxWidth,
+    int? maxHeight,
+    double? jpegQuality,
+  }) {
+    return extractThumbnails(
+      videoPath: videoPath,
+      count: count,
+      duration: duration,
+      maxWidth: maxWidth,
+      maxHeight: maxHeight,
+      jpegQuality: jpegQuality,
+    );
   }
 
   // ── C++ Timeline API ──────────────────────────────────────────────────────
