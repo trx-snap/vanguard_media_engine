@@ -8,6 +8,7 @@ import Flutter
 import UIKit
 import Metal
 import AVFoundation
+import Photos
 import Vision
 
 // ─── P1-T4: Engine Mode ───────────────────────────────────────────────────────
@@ -124,6 +125,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // terminal/cancellation bookkeeping for beginAudioExtraction and
     // cancelAudioExtraction routes. Plugin is a thin router only.
     private let audioExtractionHandler = VanguardAudioExtractionHandler()
+
+    // ── Phase 10F Slice 2B: custom video gallery picker handler ──────────────
+    // Owns PhotoKit authorization, video asset querying, thumbnail caching,
+    // and background video export to local cache.
+    private let videoAssetPickerHandler = VGVideoAssetPickerHandler()
 
     // ── S-P1: timeline live filter-chain handler ──────────────────────────────
     // Owns all parsing, stale-target checking, and runtime delegation for the
@@ -6319,6 +6325,28 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         case "cancelAudioExtraction":
             audioExtractionHandler.handleCancel(args: args, result: result)
 
+        // ── Phase 10F Slice 2B: Custom video gallery picker ───────────────────
+        case "checkPhotoLibraryPermission":
+            videoAssetPickerHandler.handleCheckPermission(result: result)
+
+        case "requestPhotoLibraryPermission":
+            videoAssetPickerHandler.handleRequestPermission(result: result)
+
+        case "fetchPhotoVideos":
+            videoAssetPickerHandler.handleFetchVideos(args: args, result: result)
+
+        case "fetchPhotoVideoThumbnail":
+            videoAssetPickerHandler.handleFetchThumbnail(args: args, result: result)
+
+        case "exportPhotoVideo":
+            videoAssetPickerHandler.handleExportVideo(args: args, result: result)
+
+        case "cancelExportPhotoVideo":
+            videoAssetPickerHandler.handleCancelExport(args: args, result: result)
+
+        case "openAppSettings":
+            videoAssetPickerHandler.handleOpenSettings(result: result)
+
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -6819,5 +6847,316 @@ private final class _VanguardMC8DiagDelegate: NSObject, VanguardMultiCamMediaSou
         // Do NOT retain pairedFrame beyond this scope.
         // ARC releases it here → VanguardMultiCamPairedFrame.dealloc →
         // CVPixelBufferRelease(frontBuffer) + CVPixelBufferRelease(backBuffer).
+    }
+}
+
+// ─── Phase 10F Slice 2B: Video Asset Picker Handler ───────────────────────────
+//
+// Native iOS PhotoKit handler for the custom video-only gallery picker.
+//
+// Responsibilities:
+//   - Request / check PHPhotoLibrary authorization status.
+//   - Query video assets (PHAssetMediaType.video) sorted newest first.
+//   - Provide thumbnail image bytes (JPEG) and video duration.
+//   - Export/copy selected asset into local app cache directory as .mov/.mp4.
+//   - Support iCloud-backed assets (isNetworkAccessAllowed = true).
+//   - Safe cancellation and temp file cleanup on error.
+//   - Thread-safe and dispatches Flutter results on the main queue.
+
+final class VGVideoAssetPickerHandler {
+    private let imageManager = PHCachingImageManager()
+    private let lock = NSLock()
+    private var activeRequestIds: [String: PHImageRequestID] = [:]
+    private var activeExports: [String: AVAssetExportSession] = [:]
+
+    // ── Authorization ────────────────────────────────────────────────────────
+
+    func handleCheckPermission(result: @escaping FlutterResult) {
+        if #available(iOS 14, *) {
+            let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+            result(mapAuthorizationStatus(status))
+        } else {
+            let status = PHPhotoLibrary.authorizationStatus()
+            result(mapAuthorizationStatus(status))
+        }
+    }
+
+    func handleRequestPermission(result: @escaping FlutterResult) {
+        if #available(iOS 14, *) {
+            PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] status in
+                DispatchQueue.main.async {
+                    result(self?.mapAuthorizationStatus(status) ?? "denied")
+                }
+            }
+        } else {
+            PHPhotoLibrary.requestAuthorization { [weak self] status in
+                DispatchQueue.main.async {
+                    result(self?.mapAuthorizationStatus(status) ?? "denied")
+                }
+            }
+        }
+    }
+
+    private func mapAuthorizationStatus(_ status: PHAuthorizationStatus) -> String {
+        switch status {
+        case .authorized:
+            return "authorized"
+        case .limited:
+            return "limited"
+        case .denied:
+            return "denied"
+        case .restricted:
+            return "restricted"
+        case .notDetermined:
+            return "notDetermined"
+        @unknown default:
+            return "denied"
+        }
+    }
+
+    // ── Query Videos ─────────────────────────────────────────────────────────
+
+    func handleFetchVideos(args: [String: Any]?, result: @escaping FlutterResult) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let options = PHFetchOptions()
+            options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
+            options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+
+            let fetchResult = PHAsset.fetchAssets(with: .video, options: options)
+            let limit = args?["limit"] as? Int ?? fetchResult.count
+            let offset = args?["offset"] as? Int ?? 0
+
+            var videoList: [[String: Any]] = []
+            let start = max(0, min(offset, fetchResult.count))
+            let end = min(start + limit, fetchResult.count)
+
+            if start < end {
+                for i in start..<end {
+                    let asset = fetchResult.object(at: i)
+                    var dict: [String: Any] = [
+                        "id": asset.localIdentifier,
+                        "durationSeconds": asset.duration,
+                        "pixelWidth": asset.pixelWidth,
+                        "pixelHeight": asset.pixelHeight
+                    ]
+                    if let creationDate = asset.creationDate {
+                        dict["creationTimestampMs"] = Int64(creationDate.timeIntervalSince1970 * 1000)
+                    }
+                    videoList.append(dict)
+                }
+            }
+
+            DispatchQueue.main.async {
+                result(videoList)
+            }
+        }
+    }
+
+    // ── Thumbnails ───────────────────────────────────────────────────────────
+
+    func handleFetchThumbnail(args: [String: Any]?, result: @escaping FlutterResult) {
+        guard let assetId = args?["id"] as? String, !assetId.isEmpty else {
+            result(FlutterError(code: "INVALID_ARGUMENT", message: "Asset ID is required", details: nil))
+            return
+        }
+
+        let width = args?["width"] as? CGFloat ?? 240
+        let height = args?["height"] as? CGFloat ?? 240
+        let targetSize = CGSize(width: width, height: height)
+
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [assetId], options: nil)
+        guard let asset = fetchResult.firstObject else {
+            result(nil)
+            return
+        }
+
+        let options = PHImageRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .highQualityFormat
+        options.resizeMode = .fast
+        options.isSynchronous = false
+
+        var hasResponded = false
+        let respondLock = NSLock()
+
+        func sendThumbnailResult(_ data: FlutterStandardTypedData?) {
+            respondLock.lock()
+            defer { respondLock.unlock() }
+            guard !hasResponded else { return }
+            hasResponded = true
+            DispatchQueue.main.async {
+                result(data)
+            }
+        }
+
+        _ = imageManager.requestImage(
+            for: asset,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            options: options
+        ) { image, info in
+            let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+            if let img = image, !isDegraded {
+                if let data = img.jpegData(compressionQuality: 0.75) {
+                    sendThumbnailResult(FlutterStandardTypedData(bytes: data))
+                    return
+                }
+            }
+            if !isDegraded && image == nil {
+                sendThumbnailResult(nil)
+            }
+        }
+    }
+
+    // ── Export Video ─────────────────────────────────────────────────────────
+
+    /// Removes the stored PHImageRequestID for [assetId] under the instance lock.
+    /// Called on every terminal path of handleExportVideo so that the dictionary
+    /// does not accumulate stale Int32 entries after a request has already settled.
+    private func clearRequestId(for assetId: String) {
+        lock.lock()
+        activeRequestIds.removeValue(forKey: assetId)
+        lock.unlock()
+    }
+
+    func handleExportVideo(args: [String: Any]?, result: @escaping FlutterResult) {
+        guard let assetId = args?["id"] as? String, !assetId.isEmpty else {
+            result(FlutterError(code: "INVALID_ARGUMENT", message: "Asset ID is required", details: nil))
+            return
+        }
+
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [assetId], options: nil)
+        guard let asset = fetchResult.firstObject else {
+            result(FlutterError(code: "ASSET_NOT_FOUND", message: "Asset with ID \(assetId) not found", details: nil))
+            return
+        }
+
+        let videoOptions = PHVideoRequestOptions()
+        videoOptions.isNetworkAccessAllowed = true
+        videoOptions.version = .current
+        videoOptions.deliveryMode = .highQualityFormat
+
+        let exportId = UUID().uuidString
+        let outputFileName = "ue_video_\(exportId).mov"
+        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(outputFileName)
+
+        try? FileManager.default.removeItem(at: outputURL)
+
+        var hasResponded = false
+        let respondLock = NSLock()
+
+        func sendExportResult(_ res: Any?) {
+            respondLock.lock()
+            defer { respondLock.unlock() }
+            guard !hasResponded else { return }
+            hasResponded = true
+            DispatchQueue.main.async {
+                result(res)
+            }
+        }
+
+        let reqId = imageManager.requestAVAsset(forVideo: asset, options: videoOptions) { [weak self] avAsset, audioMix, info in
+            if let error = info?[PHImageErrorKey] as? Error {
+                self?.clearRequestId(for: assetId)
+                try? FileManager.default.removeItem(at: outputURL)
+                sendExportResult(FlutterError(code: "EXPORT_FAILED", message: error.localizedDescription, details: nil))
+                return
+            }
+
+            guard let avAsset = avAsset else {
+                self?.clearRequestId(for: assetId)
+                try? FileManager.default.removeItem(at: outputURL)
+                sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "Could not load AVAsset for video", details: nil))
+                return
+            }
+
+            // Direct file copy if source is already a local file URL
+            if let urlAsset = avAsset as? AVURLAsset {
+                let sourceURL = urlAsset.url
+                do {
+                    try FileManager.default.copyItem(at: sourceURL, to: outputURL)
+                    self?.clearRequestId(for: assetId)
+                    sendExportResult(outputURL.path)
+                    return
+                } catch {
+                    // Fallback to AVAssetExportSession if direct copy fails
+                }
+            }
+
+            guard let exportSession = AVAssetExportSession(asset: avAsset, presetName: AVAssetExportPresetPassthrough) else {
+                self?.clearRequestId(for: assetId)
+                try? FileManager.default.removeItem(at: outputURL)
+                sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "Failed to create AVAssetExportSession", details: nil))
+                return
+            }
+
+            exportSession.outputURL = outputURL
+            exportSession.outputFileType = .mov
+            exportSession.shouldOptimizeForNetworkUse = false
+
+            self?.lock.lock()
+            self?.activeExports[assetId] = exportSession
+            self?.lock.unlock()
+
+            exportSession.exportAsynchronously { [weak self] in
+                self?.lock.lock()
+                self?.activeExports.removeValue(forKey: assetId)
+                self?.lock.unlock()
+
+                self?.clearRequestId(for: assetId)
+
+                switch exportSession.status {
+                case .completed:
+                    sendExportResult(outputURL.path)
+                case .failed:
+                    try? FileManager.default.removeItem(at: outputURL)
+                    let err = exportSession.error?.localizedDescription ?? "Export session failed"
+                    sendExportResult(FlutterError(code: "EXPORT_FAILED", message: err, details: nil))
+                case .cancelled:
+                    try? FileManager.default.removeItem(at: outputURL)
+                    sendExportResult(FlutterError(code: "EXPORT_CANCELLED", message: "Export cancelled", details: nil))
+                default:
+                    try? FileManager.default.removeItem(at: outputURL)
+                    sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "Unexpected export status \(exportSession.status.rawValue)", details: nil))
+                }
+            }
+        }
+
+        lock.lock()
+        activeRequestIds[assetId] = reqId
+        lock.unlock()
+    }
+
+    func handleCancelExport(args: [String: Any]?, result: @escaping FlutterResult) {
+        guard let assetId = args?["id"] as? String else {
+            result(false)
+            return
+        }
+
+        lock.lock()
+        if let reqId = activeRequestIds.removeValue(forKey: assetId) {
+            imageManager.cancelImageRequest(reqId)
+        }
+        if let exportSession = activeExports.removeValue(forKey: assetId) {
+            exportSession.cancelExport()
+        }
+        lock.unlock()
+        result(true)
+    }
+
+    // ── Open App Settings ───────────────────────────────────────────────────
+
+    func handleOpenSettings(result: @escaping FlutterResult) {
+        guard let settingsUrl = URL(string: UIApplication.openSettingsURLString) else {
+            result(false)
+            return
+        }
+        if UIApplication.shared.canOpenURL(settingsUrl) {
+            UIApplication.shared.open(settingsUrl, options: [:]) { success in
+                result(success)
+            }
+        } else {
+            result(false)
+        }
     }
 }
