@@ -4935,6 +4935,155 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
 
             // ── Photo mode: bypass graph, use native AVCapturePhotoOutput ─────
             if captureMode == "photo" {
+                // ── [Beauty-Still]: Check for active global Beauty filters ─────────
+                // Snapshot hasActiveFilters and activeFilterSpecs atomically at shutter
+                // tap time. If no filters, keep the unchanged direct-native path.
+                #if VG_USE_CAMERA_GRAPH
+                if let graphSession = cameraGraphSession, graphSession.hasActiveFilters,
+                   let specs = graphSession.activeFilterSpecs, !specs.isEmpty {
+                    // ── Filtered photo: native capture → offline Beauty → finalPath ──
+                    //
+                    // 1. Capture native high-res still to a unique tempPath.
+                    //    AVCapturePhotoOutput may choose a different codec (HEIC vs JPEG)
+                    //    and return an actualCapturedURL that differs from tempPath.
+                    // 2. Read display-correct dimensions from actualCapturedURL via UIImage.
+                    // 3. Build isolated offline VGOfflineFilterBundle via VGStillImageFilterFactory.
+                    // 4. Run VGImageExportSession: actualCapturedURL → Beauty → finalPath (JPEG).
+                    // 5. Delete actualCapturedURL and tempPath when each is distinct from finalPath.
+                    // 6. Return finalPath string or FlutterError.
+                    //
+                    // Bundle is retained strongly inside the closure until export completes.
+
+                    let finalPath = path
+                    let tempURL: URL = {
+                        let tmpDir = FileManager.default.temporaryDirectory
+                        return tmpDir.appendingPathComponent("vg_still_capture_\(UUID().uuidString).jpg")
+                    }()
+
+                    src.takeNativePhoto(to: tempURL) { [weak self] actualCapturedURL, captureError in
+                        guard let self = self else { return }
+
+                        // Helper: clean up temp files; never delete finalPath.
+                        func cleanupTempFiles() {
+                            let fm = FileManager.default
+                            let finalP = finalPath
+                            if let actual = actualCapturedURL, actual.path != finalP {
+                                try? fm.removeItem(at: actual)
+                            }
+                            if tempURL.path != finalP,
+                               tempURL.path != (actualCapturedURL?.path ?? "") {
+                                try? fm.removeItem(at: tempURL)
+                            }
+                        }
+
+                        if let captureError = captureError {
+                            cleanupTempFiles()
+                            let nsErr = captureError as NSError
+                            let code: String
+                            switch nsErr.code {
+                            case 1:  code = "NO_FRAME"
+                            case 3:  code = "SWITCHING"
+                            default: code = "ENCODE_FAIL"
+                            }
+                            DispatchQueue.main.async {
+                                result(FlutterError(code: code,
+                                                    message: captureError.localizedDescription,
+                                                    details: nil))
+                            }
+                            return
+                        }
+
+                        guard let sourceURL = actualCapturedURL else {
+                            cleanupTempFiles()
+                            DispatchQueue.main.async {
+                                result(FlutterError(code: "NO_FRAME",
+                                                    message: "takeNativePhoto returned nil URL without error",
+                                                    details: nil))
+                            }
+                            return
+                        }
+
+                        // ── Read display-corrected dimensions (UIImage respects EXIF) ──
+                        guard let imgData = try? Data(contentsOf: sourceURL),
+                              let uiImg = UIImage(data: imgData) else {
+                            cleanupTempFiles()
+                            DispatchQueue.main.async {
+                                result(FlutterError(code: "ENCODE_FAIL",
+                                                    message: "Failed to read or decode captured image for dimension detection",
+                                                    details: nil))
+                            }
+                            return
+                        }
+                        let imgW = size_t(uiImg.size.width)
+                        let imgH = size_t(uiImg.size.height)
+                        guard imgW > 0 && imgH > 0 else {
+                            cleanupTempFiles()
+                            DispatchQueue.main.async {
+                                result(FlutterError(code: "ENCODE_FAIL",
+                                                    message: "Captured image has invalid dimensions \(imgW)×\(imgH)",
+                                                    details: nil))
+                            }
+                            return
+                        }
+
+                        // ── Build offline Beauty filter bundle ─────────────────────────
+                        // VGStillImageFilterFactory is an ObjC factory with NSError**,
+                        // imported by Swift as a throwing function. Use do/try/catch.
+                        let metalDevice = VGResourceAllocator.sharedInstance().metalDevice
+                        let bundle: VGOfflineFilterBundle
+                        do {
+                            bundle = try VGStillImageFilterFactory.createOfflineFilterBundle(
+                                fromSpecs: specs as! [[String: Any]],
+                                width: imgW,
+                                height: imgH,
+                                device: metalDevice)
+                        } catch {
+                            cleanupTempFiles()
+                            let errMsg = error.localizedDescription
+                            DispatchQueue.main.async {
+                                result(FlutterError(code: "ENCODE_FAIL",
+                                                    message: "VGStillImageFilterFactory failed: \(errMsg)",
+                                                    details: nil))
+                            }
+                            return
+                        }
+
+
+                        // ── Run VGImageExportSession with offline Beauty nodes ──────────
+                        let processor = VanguardImageProcessor(device: metalDevice, pool: nil)
+                        let exportSource = VanguardImageMediaSource(url: sourceURL,
+                                                                    processor: processor,
+                                                                    releaseBuffersOnInvalidate: true)
+                        let profile = VGImageExportProfile.jpegProfile(withQuality: 0.92)
+                        let outputURL = URL(fileURLWithPath: finalPath)
+                        let exportSession = VGImageExportSession(source: exportSource,
+                                                                 filterChain: bundle.nodes,
+                                                                 profile: profile,
+                                                                 outputURL: outputURL)
+
+                        // Retain bundle strongly until completion to keep pool alive.
+                        exportSession.start { [bundle] manifest, exportError in
+                            _ = bundle // explicit capture to ensure ARC keeps bundle alive
+                            cleanupTempFiles()
+                            DispatchQueue.main.async {
+                                if let exportError = exportError {
+                                    result(FlutterError(code: "ENCODE_FAIL",
+                                                        message: "VGImageExportSession failed: \(exportError.localizedDescription)",
+                                                        details: nil))
+                                } else if manifest != nil {
+                                    result(finalPath)
+                                } else {
+                                    result(FlutterError(code: "ENCODE_FAIL",
+                                                        message: "Export completed without manifest or error",
+                                                        details: nil))
+                                }
+                            }
+                        }
+                    }
+                    return
+                }
+                #endif
+                // ── Unfiltered Photo mode: direct native path (unchanged) ──────────
                 src.takeNativePhoto(to: URL(fileURLWithPath: path)) { url, error in
                     if let error = error {
                         let nsErr = error as NSError
@@ -4953,6 +5102,7 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
                 }
                 return
             }
+
 
             // ── Story / Timeline / legacy mode: graph-first path ──────────────
             // Phase 6E.2D: When VG_USE_CAMERA_GRAPH is active and a graph session

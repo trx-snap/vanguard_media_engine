@@ -44,6 +44,9 @@
 #import "VanguardBeautyFilterNode.h"
 #import "BeautyV2FilterGroup.h"
 #import "VGSegmentationNode.h"  // Phase 9B-5: segmentation auto-insertion before BeautyV2
+// [Beauty-Still]: VGOfflineFilterBundle and VGStillImageFilterFactory declarations
+// are provided through VGCameraGraphSession.h (already imported above).
+// Their @implementation blocks are inlined later in this file.
 
 #import <UMF/VGGraphExecutionContext.h>
 #import <UMF/VGFrameDelegate.h>
@@ -54,6 +57,175 @@
 #import <stdatomic.h>
 #import <AVFoundation/AVFoundation.h>
 #import <CoreMedia/CoreMedia.h>
+
+// [Beauty-Still]: VGOfflineFilterBundle implementation inlined here so the class is compiled
+// as part of VGCameraGraphSession.m without requiring a new Pods project source-file entry.
+// The corresponding VGOfflineFilterBundle.m is intentionally empty.
+
+@implementation VGOfflineFilterBundle {
+    NSArray *_nodes;
+    CVPixelBufferPoolRef _adoptedPool; // +1 owned; released in dealloc
+}
+
+@synthesize nodes = _nodes;
+
+- (instancetype)initWithNodes:(NSArray *)nodes adoptedPool:(CVPixelBufferPoolRef)adoptedPool {
+    NSParameterAssert(nodes != nil);
+    NSParameterAssert(adoptedPool != NULL);
+    self = [super init];
+    if (!self) return nil;
+    _nodes       = [nodes copy];
+    _adoptedPool = adoptedPool; // Adopt: caller transferred +1; do NOT CVPixelBufferPoolRetain again.
+    return self;
+}
+
+- (void)dealloc {
+    if (_adoptedPool) {
+        CVPixelBufferPoolRelease(_adoptedPool);
+        _adoptedPool = NULL;
+    }
+}
+
+@end
+
+// ── VGStillImageFilterFactory pool helper (mirrors _VGBeautyCreatePool) ────────
+static CVPixelBufferPoolRef _Nullable
+_VGStillCreatePool(size_t width, size_t height) {
+    NSDictionary *poolAttrs = @{(id)kCVPixelBufferPoolMinimumBufferCountKey: @2};
+    NSDictionary *bufAttrs = @{
+        (id)kCVPixelBufferWidthKey:               @(width),
+        (id)kCVPixelBufferHeightKey:              @(height),
+        (id)kCVPixelBufferPixelFormatTypeKey:     @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        (id)kCVPixelBufferMetalCompatibilityKey:  @YES,
+    };
+    CVPixelBufferPoolRef pool = NULL;
+    CVReturn status = CVPixelBufferPoolCreate(
+        kCFAllocatorDefault,
+        (__bridge CFDictionaryRef)poolAttrs,
+        (__bridge CFDictionaryRef)bufAttrs,
+        &pool);
+    if (status != kCVReturnSuccess || !pool) return NULL;
+    return pool; // +1 from Create — caller owns
+}
+
+// [Beauty-Still]: VGStillImageFilterFactory implementation inlined here.
+// The corresponding VGStillImageFilterFactory.m is intentionally empty.
+
+@implementation VGStillImageFilterFactory
+
++ (nullable VGOfflineFilterBundle *)createOfflineFilterBundleFromSpecs:(NSArray<NSDictionary *> *)specs
+                                                                 width:(size_t)width
+                                                                height:(size_t)height
+                                                                device:(id<MTLDevice>)device
+                                                                 error:(NSError * _Nullable * _Nullable)outError {
+    if (outError) *outError = nil;
+
+    if (!specs || specs.count == 0) {
+        if (outError) *outError = [NSError errorWithDomain:@"VGStillImageFilterFactory" code:1
+            userInfo:@{NSLocalizedDescriptionKey: @"specs must not be empty"}];
+        return nil;
+    }
+    if (!device) {
+        if (outError) *outError = [NSError errorWithDomain:@"VGStillImageFilterFactory" code:2
+            userInfo:@{NSLocalizedDescriptionKey: @"MTLDevice must not be nil"}];
+        return nil;
+    }
+    if (width == 0 || height == 0) {
+        if (outError) *outError = [NSError errorWithDomain:@"VGStillImageFilterFactory" code:3
+            userInfo:@{NSLocalizedDescriptionKey:
+                [NSString stringWithFormat:@"invalid dimensions %zux%zu", width, height]}];
+        return nil;
+    }
+
+    // Pass 1: validate all specs before constructing anything.
+    // Supported: type=="beauty" with faceAwareEnabled != true.
+    // Rejected: any other type OR faceAwareEnabled==true.
+    for (NSDictionary *spec in specs) {
+        NSString *type = spec[@"type"];
+        if (![type isKindOfClass:[NSString class]] || ![type isEqualToString:@"beauty"]) {
+            NSString *badType = [type isKindOfClass:[NSString class]] ? type : @"(nil)";
+            if (outError) {
+                *outError = [NSError errorWithDomain:@"VGStillImageFilterFactory" code:10
+                    userInfo:@{NSLocalizedDescriptionKey:
+                        [NSString stringWithFormat:
+                            @"Unsupported filter type '%@'. Only 'beauty' is supported for offline still export.",
+                            badType]}];
+            }
+            NSLog(@"[VGStillImageFilterFactory] Unsupported type '%@' — aborting", badType);
+            return nil;
+        }
+        NSDictionary *params = spec[@"parameters"];
+        if ([params isKindOfClass:[NSDictionary class]]) {
+            id faceAwareVal = params[@"faceAwareEnabled"];
+            if ([faceAwareVal isKindOfClass:[NSNumber class]] && [faceAwareVal boolValue]) {
+                if (outError) {
+                    *outError = [NSError errorWithDomain:@"VGStillImageFilterFactory" code:11
+                        userInfo:@{NSLocalizedDescriptionKey:
+                            @"faceAwareEnabled=true is not supported for offline still export in this slice."}];
+                }
+                NSLog(@"[VGStillImageFilterFactory] faceAwareEnabled=true rejected");
+                return nil;
+            }
+        }
+    }
+
+    // Create the dimension-matched output pool (+1 from Create, transferred to bundle).
+    CVPixelBufferPoolRef outputPool = _VGStillCreatePool(width, height);
+    if (!outputPool) {
+        if (outError) {
+            *outError = [NSError errorWithDomain:@"VGStillImageFilterFactory" code:20
+                userInfo:@{NSLocalizedDescriptionKey:
+                    [NSString stringWithFormat:@"Failed to create CVPixelBufferPool for %zux%zu", width, height]}];
+        }
+        return nil;
+    }
+
+    // Pass 2: construct nodes.
+    NSMutableArray *nodes = [NSMutableArray arrayWithCapacity:specs.count];
+    for (NSDictionary *spec in specs) {
+        NSDictionary *params = spec[@"parameters"];
+        BOOL enabled = (spec[@"enabled"] != nil) ? [spec[@"enabled"] boolValue] : YES;
+        float intensity = 0.75f;
+        if ([params[@"intensity"] isKindOfClass:[NSNumber class]]) {
+            intensity = [params[@"intensity"] floatValue];
+        }
+        BOOL wantV2 = [params[@"beautyVersion"] isKindOfClass:[NSNumber class]]
+                      && [params[@"beautyVersion"] integerValue] == 2;
+        if (wantV2) {
+            BeautyV2FilterGroup *v2 = [[BeautyV2FilterGroup alloc] initWithPool:outputPool
+                                                                         device:device];
+            if (!v2) {
+                CVPixelBufferPoolRelease(outputPool);
+                if (outError) *outError = [NSError errorWithDomain:@"VGStillImageFilterFactory" code:21
+                    userInfo:@{NSLocalizedDescriptionKey: @"BeautyV2FilterGroup init returned nil"}];
+                return nil;
+            }
+            v2.intensity = intensity;
+            v2.enabled = enabled;
+            [nodes addObject:(id)v2];
+        } else {
+            VanguardBeautyFilterNode *v1 = [[VanguardBeautyFilterNode alloc] initWithPool:outputPool
+                                                                                   device:device];
+            if (!v1) {
+                CVPixelBufferPoolRelease(outputPool);
+                if (outError) *outError = [NSError errorWithDomain:@"VGStillImageFilterFactory" code:22
+                    userInfo:@{NSLocalizedDescriptionKey: @"VanguardBeautyFilterNode init returned nil"}];
+                return nil;
+            }
+            v1.intensity = intensity;
+            v1.enabled = enabled;
+            [nodes addObject:(id)v1];
+        }
+    }
+
+    NSLog(@"[VGStillImageFilterFactory] Built %lu offline node(s) for %zux%zu still",
+          (unsigned long)nodes.count, width, height);
+    // Transfer +1 pool ownership to the bundle — do NOT release here.
+    return [[VGOfflineFilterBundle alloc] initWithNodes:[nodes copy] adoptedPool:outputPool];
+}
+
+@end
 
 // 3G-C: VGCameraGraphSession adopts VGFrameDelegate so it can act as the
 // renderer.frameDelegate instead of _scheduler. This gives the session full
@@ -89,7 +261,35 @@
     // POC2: cache the most recent filter chain so connectPlatformViewReceiver:
     // can trigger a rebuild that preserves the current filter state.
     NSArray *_currentFilterChain;
+
+    // [Beauty-Still]: Immutable snapshot of currently active filter specs.
+    // Set only after a successful scheduler swap in _applyFilterChainInternal:.
+    // Updated in-place by applyHotParameterUpdates: after live node mutation succeeds.
+    // Cleared on invalidate and when filter chain is cleared.
+    // All reads and writes are serialized on _sessionQueue.
+    NSArray<NSDictionary *> *_activeFilterSpecs;
 }
+
+// [Beauty-Still]: hasActiveFilters and activeFilterSpecs are backed by _activeFilterSpecs ivar.
+// Explicit getters serialize access on _sessionQueue.
+
+- (BOOL)hasActiveFilters {
+    __block BOOL result = NO;
+    dispatch_sync(_sessionQueue, ^{
+        result = (self->_activeFilterSpecs.count > 0);
+    });
+    return result;
+}
+
+- (nullable NSArray<NSDictionary *> *)activeFilterSpecs {
+    __block NSArray<NSDictionary *> *result = nil;
+    dispatch_sync(_sessionQueue, ^{
+        result = self->_activeFilterSpecs; // already an immutable copy
+    });
+    return result;
+}
+
+
 
 - (nullable instancetype)initWithSource:(VanguardCameraMediaSource *)source
                                renderer:(VanguardMetalRenderer *)renderer
@@ -210,93 +410,102 @@
     return self;
 }
 
+// ─── [Beauty-Still]: Private graph-apply helper returning BOOL ────────────────
+//
+// Extracted from setCameraFilterChain: so both the public void method and
+// setCameraFilterChainFromSpecs: can detect rebuild success without breaking
+// the public API.
+//
+// MUST be called while already on _sessionQueue (via dispatch_sync).
+// Returns YES on successful scheduler swap, NO on any failure.
+- (BOOL)_applyFilterChainInternal:(nullable NSArray *)filterChain {
+    NSLog(@"[VGCameraGraphSession] _applyFilterChainInternal: filterChain.count=%lu",
+          (unsigned long)(filterChain.count ?: 0));
+
+    VanguardMetalRenderer *renderer = self->_renderer;
+    if (!self->_source || !renderer) {
+        NSLog(@"[VGCameraGraphSession] _applyFilterChainInternal skipped — source=%@ renderer=%@",
+              self->_source, renderer);
+        return NO;
+    }
+
+    // [Fix-4]: _currentFilterChain is assigned AFTER a successful swap, not here.
+    // This ensures _currentFilterChain only ever reflects a live committed graph state.
+
+    NSError *rebuildError = nil;
+    NSDictionary<NSString *, id> *newGraph =
+        [VGCameraGraphFactory buildCameraGraphWithSource:self->_source
+                                             filterChain:filterChain
+                                                renderer:renderer
+                                        platformViewSink:self->_platformViewSink
+                                                   error:&rebuildError];
+    if (!newGraph) {
+        NSLog(@"[VGCameraGraphSession] _applyFilterChainInternal rebuild failed: %@ — keeping current scheduler",
+              rebuildError);
+        return NO;
+    }
+
+    VGGraphDescriptor *newDesc = newGraph[@"descriptor"];
+    NSDictionary<NSString *, id<VGNode>> *newNodes = newGraph[@"nodes"];
+    VGExecutionPlan *newPlan = newGraph[@"plan"];
+
+    id<VGFrameSink> newSink = (id<VGFrameSink>)newNodes[@"fan_out_sink"];
+    if (!newSink) {
+        NSLog(@"[VGCameraGraphSession] _applyFilterChainInternal fan_out_sink missing — keeping current scheduler");
+        return NO;
+    }
+
+    VGGraphExecutionContext *newCtx =
+        [[VGGraphExecutionContext alloc] initWithDescriptor:newDesc
+                                                       plan:newPlan
+                                                      nodes:newNodes
+                                                      clock:nil
+                                          resourceAllocator:[VGResourceAllocator sharedInstance]];
+
+    VGGraphSchedulerV2 *newScheduler =
+        [[VGGraphSchedulerV2 alloc] initWithPlan:newPlan
+                                           nodes:newNodes
+                                         context:newCtx];
+    newScheduler.sink = newSink;
+
+    // Structural proof only. startWithClock:nil starts the new scheduler.
+    // Do NOT invalidate the old scheduler here because it would stop the
+    // shared camera source.
+    [newScheduler startWithClock:nil];
+
+    // 3G-C: Swap scheduler — from this point async blocks enqueue against the
+    // new scheduler.
+    self->_scheduler = newScheduler;
+    self->_context = newCtx;
+    self->_nodes = newNodes;
+
+    // Phase 6E.1D.1: Propagate recording-enabled state onto the new sink.
+    if (self->_source.graphRecordingEnabled) {
+        VGRecordingSinkNode *newRecSink =
+            (VGRecordingSinkNode *)newNodes[@"camera_recording_sink"];
+        if (newRecSink) {
+            newRecSink.enabled = YES;
+        }
+    }
+
+    // [Fix-4]: Assign _currentFilterChain only after the swap succeeds so POC2
+    // graph rebuilds always reflect a live committed graph state.
+    self->_currentFilterChain = [filterChain copy];
+
+    NSLog(@"[VGCameraGraphSession] _applyFilterChainInternal hot-swap complete (filterCount=%lu execOrder=%lu)",
+          (unsigned long)(filterChain.count ?: 0),
+          (unsigned long)newPlan.topologicalOrder.count);
+    return YES;
+}
+
+// Public void API — preserved for all existing callers (graph recording, POC2, etc.).
+// Calls the internal helper; return value is discarded as before.
 - (void)setCameraFilterChain:(nullable NSArray *)filterChain {
     dispatch_sync(_sessionQueue, ^{
         if (atomic_load(&self->_invalidated)) {
             return;
         }
-
-        NSLog(@"[VGCameraGraphSession] setCameraFilterChain: filterChain.count=%lu",
-              (unsigned long)(filterChain.count ?: 0));
-
-        VanguardMetalRenderer *renderer = self->_renderer;
-        if (!self->_source || !renderer) {
-            NSLog(@"[VGCameraGraphSession] setCameraFilterChain skipped — source=%@ renderer=%@",
-                  self->_source, renderer);
-            return;
-        }
-
-        // POC2: persist current filter chain so connectPlatformViewReceiver: can
-        // trigger a rebuild that preserves filter state.
-        // Defensive copy: caller may pass NSMutableArray; copy ensures the cached
-        // value cannot be mutated behind our back.
-        self->_currentFilterChain = [filterChain copy];
-
-        NSError *rebuildError = nil;
-        NSDictionary<NSString *, id> *newGraph =
-            [VGCameraGraphFactory buildCameraGraphWithSource:self->_source
-                                                 filterChain:filterChain
-                                                    renderer:renderer
-                                            platformViewSink:self->_platformViewSink
-                                                       error:&rebuildError];
-        if (!newGraph) {
-            NSLog(@"[VGCameraGraphSession] setCameraFilterChain rebuild failed: %@ — keeping current scheduler",
-                  rebuildError);
-            return;
-        }
-
-        VGGraphDescriptor *newDesc = newGraph[@"descriptor"];
-        NSDictionary<NSString *, id<VGNode>> *newNodes = newGraph[@"nodes"];
-        VGExecutionPlan *newPlan = newGraph[@"plan"];
-
-        id<VGFrameSink> newSink = (id<VGFrameSink>)newNodes[@"fan_out_sink"];
-        if (!newSink) {
-            NSLog(@"[VGCameraGraphSession] setCameraFilterChain fan_out_sink missing — keeping current scheduler");
-            return;
-        }
-
-        VGGraphExecutionContext *newCtx =
-            [[VGGraphExecutionContext alloc] initWithDescriptor:newDesc
-                                                           plan:newPlan
-                                                          nodes:newNodes
-                                                          clock:nil
-                                              resourceAllocator:[VGResourceAllocator sharedInstance]];
-
-        VGGraphSchedulerV2 *newScheduler =
-            [[VGGraphSchedulerV2 alloc] initWithPlan:newPlan
-                                               nodes:newNodes
-                                             context:newCtx];
-        newScheduler.sink = newSink;
-
-        // Structural proof only. startWithClock:nil starts the new scheduler.
-        // Do NOT invalidate the old scheduler here because it would stop the
-        // shared camera source.
-        [newScheduler startWithClock:nil];
-
-        // 3G-C: The session remains the permanent renderer.frameDelegate.
-        // Only _scheduler is swapped. Async blocks enqueued after this point
-        // will capture newScheduler because they read _scheduler at enqueue time
-        // inside the session queue, which is serialized with this swap.
-        // renderer.frameDelegate is NOT changed here — the session stays wired.
-        self->_scheduler = newScheduler;
-        self->_context = newCtx;
-        self->_nodes = newNodes;
-
-        // Phase 6E.1D.1: If graph recording is currently active, propagate the
-        // enabled state onto the newly created VGRecordingSinkNode. Without this,
-        // the replacement node defaults to disabled=NO and silently drops all
-        // processed frames for the remainder of the active recording session.
-        if (self->_source.graphRecordingEnabled) {
-            VGRecordingSinkNode *newRecSink =
-                (VGRecordingSinkNode *)newNodes[@"camera_recording_sink"];
-            if (newRecSink) {
-                newRecSink.enabled = YES;
-            }
-        }
-
-        NSLog(@"[VGCameraGraphSession] setCameraFilterChain hot-swap complete (filterCount=%lu execOrder=%lu)",
-              (unsigned long)(filterChain.count ?: 0),
-              (unsigned long)newPlan.topologicalOrder.count);
+        [self _applyFilterChainInternal:filterChain];
     });
 }
 
@@ -425,9 +634,17 @@
     if (outError) *outError = nil;
 
     // ── Empty specs: clear to passthrough ────────────────────────────────────
+    // [Fix-3]: Only clear _activeFilterSpecs if the internal graph swap succeeds.
     if (!specs || specs.count == 0) {
-        [self setCameraFilterChain:nil];
-        return YES;
+        __block BOOL cleared = NO;
+        dispatch_sync(_sessionQueue, ^{
+            if (atomic_load(&self->_invalidated)) return;
+            cleared = [self _applyFilterChainInternal:nil];
+            if (cleared) {
+                self->_activeFilterSpecs = nil;
+            }
+        });
+        return cleared;
     }
 
     // ── Pass 1: resource contract ─────────────────────────────────────────────
@@ -592,10 +809,34 @@
     NSLog(@"[VGCameraGraphSession] setCameraFilterChainFromSpecs: constructed %lu node(s)",
           (unsigned long)nodes.count);
 
-    // Delegate to the existing hot-swap method — it handles graph rebuild,
-    // scheduler swap, and renderer delegate rewiring.
-    [self setCameraFilterChain:nodes];
-    return YES;
+    // [Beauty-Still]: _applyFilterChainInternal: MUST be called on _sessionQueue.
+    // Wrap the entire apply + spec-commit in a single dispatch_sync so both are
+    // serialized and atomic relative to property reads (hasActiveFilters, activeFilterSpecs).
+    __block BOOL swapSucceeded = NO;
+    dispatch_sync(_sessionQueue, ^{
+        if (atomic_load(&self->_invalidated)) {
+            return;
+        }
+        swapSucceeded = [self _applyFilterChainInternal:nodes];
+        if (swapSucceeded) {
+            // Deep-copy specs (including nested parameters) so the snapshot is
+            // immutable and isolated from future Dart-side mutations.
+            NSMutableArray<NSDictionary *> *specsCopy =
+                [NSMutableArray arrayWithCapacity:specs.count];
+            for (NSDictionary *spec in specs) {
+                NSMutableDictionary *specCopy = [spec mutableCopy];
+                id params = spec[@"parameters"];
+                if ([params isKindOfClass:[NSDictionary class]]) {
+                    specCopy[@"parameters"] = [(NSDictionary *)params copy];
+                }
+                [specsCopy addObject:[specCopy copy]];
+            }
+            self->_activeFilterSpecs = [specsCopy copy];
+            NSLog(@"[VGCameraGraphSession] activeFilterSpecs committed (%lu spec(s))",
+                  (unsigned long)self->_activeFilterSpecs.count);
+        }
+    });
+    return swapSucceeded;
 }
 
 // ─── Phase 6E.1D.1: Graph-backed recording control ───────────────────────────
@@ -875,6 +1116,30 @@
             return;
         }
 
+        // [Beauty-Still]: Update the active spec snapshot with the new intensity
+        // so the next high-res still capture uses the current slider value.
+        if (self->_activeFilterSpecs.count > 0) {
+            NSMutableArray<NSDictionary *> *updatedSpecs =
+                [NSMutableArray arrayWithCapacity:self->_activeFilterSpecs.count];
+            for (NSDictionary *spec in self->_activeFilterSpecs) {
+                NSString *type = spec[@"type"];
+                if ([type isEqualToString:@"beauty"]) {
+                    NSMutableDictionary *specCopy = [spec mutableCopy];
+                    NSDictionary *oldParams = spec[@"parameters"];
+                    NSMutableDictionary *paramsCopy =
+                        [oldParams isKindOfClass:[NSDictionary class]]
+                        ? [oldParams mutableCopy]
+                        : [NSMutableDictionary dictionary];
+                    paramsCopy[@"intensity"] = @(clamped);
+                    specCopy[@"parameters"] = [paramsCopy copy];
+                    [updatedSpecs addObject:[specCopy copy]];
+                } else {
+                    [updatedSpecs addObject:spec];
+                }
+            }
+            self->_activeFilterSpecs = [updatedSpecs copy];
+        }
+
         success = YES;
     });
 
@@ -926,6 +1191,9 @@
         if (recordingSink) {
             recordingSink.enabled = NO;
         }
+
+        // [Beauty-Still]: Clear spec snapshot on teardown.
+        self->_activeFilterSpecs = nil;
 
         self->_nodes = nil;
         self->_source = nil;

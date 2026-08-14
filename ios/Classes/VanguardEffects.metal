@@ -189,7 +189,7 @@ kernel void vanguard_segmentation_composite(
 //   - No addCompletedHandler: references (RR-44 / DEC-58 — CPU-side concern).
 //   - Each kernel = one pass; no inter-pass Metal synchronisation.
 //   - half precision throughout for A-series throughput.
-//   - radius capped at 16 to bound loop trip-count (max 33 taps per axis).
+//   - radius capped at 64 (ramp path, resolution-scaled) or 12 (direct override) to bound loop trip-count.
 // =============================================================================
 
 // ---------------------------------------------------------------------------
@@ -199,8 +199,10 @@ kernel void vanguard_segmentation_composite(
 // Phase 4B.5 (DEC-59): rangeSigma added for bilateral range weighting.
 // ---------------------------------------------------------------------------
 struct BeautyBlurParams {
-    int   radius;      // Half-width of the 1D Gaussian kernel. Range [1, 16].
-    float sigma;       // Spatial std-dev. Range [1.0, 20.0].
+    int   radius;      // Half-width of the 1D Gaussian kernel.
+                       // Granular/direct override: [1, 12] (1080p reference).
+                       // Intensity-ramp path: [1, 64] (resolution-scaled for high-res stills).
+    float sigma;       // Spatial std-dev. Scales with resolution on ramp path. Range [1.0, 60.0].
     float rangeSigma;  // Colour-similarity std-dev. Range [0.01, 1.0]. (Phase 4B.5)
 };
 
@@ -229,7 +231,7 @@ kernel void vanguard_beauty_blur_h(
 
     const int   W           = int(inTex.get_width()) - 1;
     const int   px          = int(gid.x);
-    const int   radius      = clamp(params.radius, 1, 16);
+    const int   radius      = clamp(params.radius, 1, 64);  // 64 supports resolution-scaled radii for high-res stills (12MP ≈ 34, 48MP ≈ 64)
     const float twoSig2     = 2.0f * params.sigma      * params.sigma;      // spatial
     const float twoRangeSig2 = 2.0f * params.rangeSigma * params.rangeSigma; // range (RR-46)
 
@@ -285,7 +287,7 @@ kernel void vanguard_beauty_blur_v(
 
     const int   H            = int(inTex.get_height()) - 1;
     const int   py           = int(gid.y);
-    const int   radius       = clamp(params.radius, 1, 16);
+    const int   radius       = clamp(params.radius, 1, 64);  // 64 supports resolution-scaled radii for high-res stills (12MP ≈ 34, 48MP ≈ 64)
     const float twoSig2      = 2.0f * params.sigma      * params.sigma;
     const float twoRangeSig2 = 2.0f * params.rangeSigma * params.rangeSigma;
 

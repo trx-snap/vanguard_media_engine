@@ -116,7 +116,17 @@ NS_ASSUME_NONNULL_BEGIN
 /// when any granular param (radius/sigma/etc.) is explicitly provided.
 @property (nonatomic, assign) BOOL useIntensityRamp;
 
-/// Gaussian kernel half-radius in pixels. Clamped to [1, 12] before dispatch.
+/// Gaussian kernel half-radius in pixels.
+///
+/// Direct/granular override path (`useIntensityRamp = NO`): clamped to [1, 12]
+/// before GPU dispatch (1080p reference baseline).
+///
+/// Intensity-ramp path (`useIntensityRamp = YES`): the ramp computes a base
+/// radius in [1, 12] and then scales it by `max(1.0, min(W, H) / 1080.0)` to
+/// match perceived smoothing coverage on high-resolution stills. Clamped to
+/// [1, 64] before dispatch. At 1080p (live preview / video), scale = 1.0 and
+/// the intensity-ramp path preserves the previous ramp behavior.
+///
 /// Default: 10 (medium-strong smoothing at 1080p).
 @property (nonatomic, assign) int   radius;
 

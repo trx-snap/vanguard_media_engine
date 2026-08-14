@@ -18,7 +18,8 @@
 // CPU parameter sanitization (Step 2 gates):
 //   sigma  = max(sigma, 1.0f)     — prevents twoSig2=0 NaN (ISSUE-1)
 //   theta  = max(theta, 0.001f)   — prevents 0/0 NaN (ISSUE-3)
-//   radius = clamp(radius, 1, 8)  — bounds loop trip-count for video budget
+//   radius = clamp(radius, 1, radiusCap) — radiusCap=12 for direct overrides,
+//                                          64 for intensity-ramp (resolution-scaled).
 //
 // CF ownership discipline (mandatory — RR-43/DEC-58):
 //   _beautyPoolA/B  — node-local. CFRelease on replace/nil.
@@ -580,10 +581,21 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
     // ── Intensity → parameter mapping (Step 6B) ──────────────────────────────────
     // Runs ONLY when useIntensityRamp == YES (playground slider path).
     // When NO, explicit granular params set by runtime are preserved.
+    // ── High-resolution spatial scale ─────────────────────────────────────────────
+    // Compute scale factor relative to 1080p canonical reference so that
+    // radius/sigma cover the same proportional area on high-res stills.
+    // At 1080p (live preview / video): scale = 1.0 → exact existing behaviour.
+    // At 12MP 3024×4032: min(3024,4032)=3024 → scale ≈ 2.80 → radius up to 34.
+    float spatialScale = (w > 0 && h > 0)
+        ? fmaxf(1.0f, (float)MIN(w, h) / 1080.0f)
+        : 1.0f;
+
     if (_useIntensityRamp) {
         float t = _intensity < 0.0f ? 0.0f : (_intensity > 1.0f ? 1.0f : _intensity);
-        _radius          = (int)roundf(1.0f + t * (12.0f - 1.0f));  // unchanged
-        _sigma           = 1.0f + t * 7.5f;                         // stronger blur
+        float baseRadius = 1.0f + t * (12.0f - 1.0f);  // 1080p reference radius
+        float baseSigma  = 1.0f + t * 7.5f;             // 1080p reference sigma
+        _radius          = (int)roundf(baseRadius * spatialScale);  // scale to actual resolution
+        _sigma           = baseSigma * spatialScale;                 // scale to actual resolution
         _smoothStrength  = t * 1.40f;                                // stronger blend authority
         _theta           = 0.02f + t * 0.03f;                       // less aggressive edge suppression
         _sharpenStrength = 0.35f - t * 0.20f;                       // less detail restore at high intensity
@@ -602,7 +614,8 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
     // Read from properties (now updated by intensity ramp above, or by direct
     // caller assignment). Clamp to safe ranges before GPU uniform construction.
     // Clamp ranges (RR-38 §sanitization / ISSUE-1 / ISSUE-3):
-    //   radius  → [1, 12]   (kernel size; upper bound matches header contract)
+    //   radius  → [1, 12]  for direct/granular overrides (useIntensityRamp=NO);
+    //             [1, 64]  for intensity-ramp path (resolution-scaled for high-res stills).
     //   sigma   → ≥ 1.0     (prevents exp(-x/0) NaN in Gaussian weight)
     //   theta   → ≥ 0.001   (prevents divide-by-zero in composite luminance)
     // Phase 4B.5: sanitize rangeSigma now; wire to GPU uniform in Step 2.
@@ -644,8 +657,11 @@ _VGMakeTexture(id<MTLDevice> device, CVPixelBufferRef buf,
     float polishBloomStrength  = fminf(fmaxf(_polishBloomStrength,  0.0f), 0.12f);  // DEC-98
 
     // CPU struct must match Metal BeautyBlurParams EXACTLY (layout: 4+4+4 = 12 bytes).
+    // Ramp-aware radius cap: intensity ramp can produce resolution-scaled radius up to 64;
+    // direct/granular overrides (useIntensityRamp=NO) retain the 1080p cap of 12.
+    int radiusCap = _useIntensityRamp ? 64 : 12;
     struct { int radius; float sigma; float rangeSigma; } blurParams = {
-        .radius     = (int)MAX(1, MIN(_radius, 12)),
+        .radius     = (int)MAX(1, MIN(_radius, radiusCap)),
         .sigma      = MAX(_sigma, 1.0f),    // ISSUE-1: prevents NaN
         .rangeSigma = rangeSigma,           // Phase 4B.5: wired to bilateral kernel
     };
