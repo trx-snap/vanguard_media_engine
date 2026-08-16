@@ -9,6 +9,7 @@ import UIKit
 import Metal
 import AVFoundation
 import Photos
+import PhotosUI
 import Vision
 
 // ─── P1-T4: Engine Mode ───────────────────────────────────────────────────────
@@ -6347,6 +6348,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         case "openAppSettings":
             videoAssetPickerHandler.handleOpenSettings(result: result)
 
+        case "presentLimitedLibraryPicker":
+            videoAssetPickerHandler.handlePresentLimitedLibraryPicker(result: result)
+
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -6972,7 +6976,11 @@ final class VGVideoAssetPickerHandler {
 
         let options = PHImageRequestOptions()
         options.isNetworkAccessAllowed = true
-        options.deliveryMode = .highQualityFormat
+        // .opportunistic delivers a fast/degraded frame first, then a
+        // full-quality frame when available. We accept the first valid image we
+        // receive (including degraded) to guarantee the Flutter result always
+        // resolves and eliminate MethodChannel deadlocks on iCloud assets.
+        options.deliveryMode = .opportunistic
         options.resizeMode = .fast
         options.isSynchronous = false
 
@@ -6996,13 +7004,16 @@ final class VGVideoAssetPickerHandler {
             options: options
         ) { image, info in
             let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-            if let img = image, !isDegraded {
+            if let img = image {
+                // Accept the first valid frame, whether degraded or full quality.
                 if let data = img.jpegData(compressionQuality: 0.75) {
                     sendThumbnailResult(FlutterStandardTypedData(bytes: data))
                     return
                 }
             }
-            if !isDegraded && image == nil {
+            // image is nil and this is the final (non-degraded) callback →
+            // guarantee resolution so the channel future never hangs.
+            if !isDegraded {
                 sendThumbnailResult(nil)
             }
         }
@@ -7083,42 +7094,176 @@ final class VGVideoAssetPickerHandler {
                 }
             }
 
-            guard let exportSession = AVAssetExportSession(asset: avAsset, presetName: AVAssetExportPresetPassthrough) else {
-                self?.clearRequestId(for: assetId)
-                try? FileManager.default.removeItem(at: outputURL)
-                sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "Failed to create AVAssetExportSession", details: nil))
-                return
+            // ── AVAssetExportSession with passthrough → HQ fallback ──────────
+            // Helper that runs an export session and handles its terminal states.
+            // IMPORTANT: all path reporting uses session.outputURL.path, not the
+            // closed-over outputURL, so fallback .mp4 paths are returned correctly.
+            func runExport(_ session: AVAssetExportSession, isRetry: Bool) {
+                session.exportAsynchronously { [weak self] in
+                    // The actual output URL for this session (may differ from
+                    // outputURL when fallback chose .mp4).
+                    let sessionOutputURL = session.outputURL
+
+                    switch session.status {
+                    case .completed:
+                        self?.lock.lock()
+                        self?.activeExports.removeValue(forKey: assetId)
+                        self?.lock.unlock()
+                        self?.clearRequestId(for: assetId)
+                        // Return the session's actual output path so .mp4
+                        // fallback paths are forwarded correctly to Flutter.
+                        sendExportResult(sessionOutputURL?.path)
+
+                    case .failed:
+                        // Clean up this session's partial output file.
+                        if let url = sessionOutputURL {
+                            try? FileManager.default.removeItem(at: url)
+                        }
+
+                        if !isRetry {
+                            // Passthrough failed — retry with HighestQuality.
+                            // This covers AVComposition / slow-mo / cinematic
+                            // assets where passthrough is unsupported.
+                            guard let fallback = AVAssetExportSession(
+                                asset: avAsset,
+                                presetName: AVAssetExportPresetHighestQuality
+                            ) else {
+                                self?.lock.lock()
+                                self?.activeExports.removeValue(forKey: assetId)
+                                self?.lock.unlock()
+                                self?.clearRequestId(for: assetId)
+                                let err = session.error?.localizedDescription ?? "Export failed and fallback unavailable"
+                                sendExportResult(FlutterError(code: "EXPORT_FAILED", message: err, details: nil))
+                                return
+                            }
+
+                            // Choose a compatible output file type.
+                            let preferredTypes: [AVFileType] = [.mov, .mp4]
+                            let supportedTypes = fallback.supportedFileTypes
+                            guard let chosenType = preferredTypes.first(where: { supportedTypes.contains($0) }) else {
+                                self?.lock.lock()
+                                self?.activeExports.removeValue(forKey: assetId)
+                                self?.lock.unlock()
+                                self?.clearRequestId(for: assetId)
+                                sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "No compatible output file type", details: nil))
+                                return
+                            }
+
+                            // Adjust extension on the output URL to match chosen type.
+                            let ext = chosenType == .mp4 ? "mp4" : "mov"
+                            let fallbackURL = outputURL.deletingPathExtension().appendingPathExtension(ext)
+                            try? FileManager.default.removeItem(at: fallbackURL)
+
+                            fallback.outputURL = fallbackURL
+                            fallback.outputFileType = chosenType
+                            fallback.shouldOptimizeForNetworkUse = false
+
+                            // Rebind activeExports so cancelExport targets the
+                            // active session correctly during the retry.
+                            self?.lock.lock()
+                            self?.activeExports[assetId] = fallback
+                            self?.lock.unlock()
+
+                            runExport(fallback, isRetry: true)
+                        } else {
+                            // HQ retry also failed.
+                            self?.lock.lock()
+                            self?.activeExports.removeValue(forKey: assetId)
+                            self?.lock.unlock()
+                            self?.clearRequestId(for: assetId)
+                            let err = session.error?.localizedDescription ?? "Export session failed"
+                            sendExportResult(FlutterError(code: "EXPORT_FAILED", message: err, details: nil))
+                        }
+
+                    case .cancelled:
+                        // Clean up this session's output, plus any alternate
+                        // extension variant that may have been prepared.
+                        if let url = sessionOutputURL {
+                            try? FileManager.default.removeItem(at: url)
+                        }
+                        // Belt-and-suspenders: also remove the other extension
+                        // variant in case it was written during a handoff.
+                        let altExt = (sessionOutputURL?.pathExtension == "mp4") ? "mov" : "mp4"
+                        if let altURL = sessionOutputURL?.deletingPathExtension().appendingPathExtension(altExt) {
+                            try? FileManager.default.removeItem(at: altURL)
+                        }
+                        self?.lock.lock()
+                        self?.activeExports.removeValue(forKey: assetId)
+                        self?.lock.unlock()
+                        self?.clearRequestId(for: assetId)
+                        sendExportResult(FlutterError(code: "EXPORT_CANCELLED", message: "Export cancelled", details: nil))
+
+                    default:
+                        if let url = sessionOutputURL {
+                            try? FileManager.default.removeItem(at: url)
+                        }
+                        self?.lock.lock()
+                        self?.activeExports.removeValue(forKey: assetId)
+                        self?.lock.unlock()
+                        self?.clearRequestId(for: assetId)
+                        sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "Unexpected export status \(session.status.rawValue)", details: nil))
+                    }
+                }
             }
 
-            exportSession.outputURL = outputURL
-            exportSession.outputFileType = .mov
-            exportSession.shouldOptimizeForNetworkUse = false
-
-            self?.lock.lock()
-            self?.activeExports[assetId] = exportSession
-            self?.lock.unlock()
-
-            exportSession.exportAsynchronously { [weak self] in
-                self?.lock.lock()
-                self?.activeExports.removeValue(forKey: assetId)
-                self?.lock.unlock()
-
-                self?.clearRequestId(for: assetId)
-
-                switch exportSession.status {
-                case .completed:
-                    sendExportResult(outputURL.path)
-                case .failed:
+            // A shared helper to start an HQ export session when passthrough
+            // is either un-creatable or supports no compatible output type.
+            // Extracted to avoid code duplication across both entry points.
+            func startHQExport() {
+                guard let hqSession = AVAssetExportSession(
+                    asset: avAsset,
+                    presetName: AVAssetExportPresetHighestQuality
+                ) else {
+                    self?.clearRequestId(for: assetId)
                     try? FileManager.default.removeItem(at: outputURL)
-                    let err = exportSession.error?.localizedDescription ?? "Export session failed"
-                    sendExportResult(FlutterError(code: "EXPORT_FAILED", message: err, details: nil))
-                case .cancelled:
-                    try? FileManager.default.removeItem(at: outputURL)
-                    sendExportResult(FlutterError(code: "EXPORT_CANCELLED", message: "Export cancelled", details: nil))
-                default:
-                    try? FileManager.default.removeItem(at: outputURL)
-                    sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "Unexpected export status \(exportSession.status.rawValue)", details: nil))
+                    sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "Failed to create AVAssetExportSession", details: nil))
+                    return
                 }
+                let preferredHQ: [AVFileType] = [.mov, .mp4]
+                guard let hqType = preferredHQ.first(where: { hqSession.supportedFileTypes.contains($0) }) else {
+                    self?.clearRequestId(for: assetId)
+                    try? FileManager.default.removeItem(at: outputURL)
+                    sendExportResult(FlutterError(code: "EXPORT_FAILED", message: "No compatible output file type for HQ preset", details: nil))
+                    return
+                }
+                let hqExt = hqType == .mp4 ? "mp4" : "mov"
+                let hqURL = outputURL.deletingPathExtension().appendingPathExtension(hqExt)
+                try? FileManager.default.removeItem(at: hqURL)
+                hqSession.outputURL = hqURL
+                hqSession.outputFileType = hqType
+                hqSession.shouldOptimizeForNetworkUse = false
+                self?.lock.lock()
+                self?.activeExports[assetId] = hqSession
+                self?.lock.unlock()
+                runExport(hqSession, isRetry: true)
+            }
+
+            // Attempt passthrough first; verify supportedFileTypes and fall
+            // back to HQ if passthrough creation fails or has no compatible type.
+            if let passthroughSession = AVAssetExportSession(
+                asset: avAsset,
+                presetName: AVAssetExportPresetPassthrough
+            ) {
+                // Confirm a compatible type is available before running passthrough.
+                let preferredPT: [AVFileType] = [.mov, .mp4]
+                guard let ptType = preferredPT.first(where: { passthroughSession.supportedFileTypes.contains($0) }) else {
+                    // Passthrough has no compatible type — go straight to HQ.
+                    startHQExport()
+                    return
+                }
+                let ptExt = ptType == .mp4 ? "mp4" : "mov"
+                let ptURL = outputURL.deletingPathExtension().appendingPathExtension(ptExt)
+                try? FileManager.default.removeItem(at: ptURL)
+                passthroughSession.outputURL = ptURL
+                passthroughSession.outputFileType = ptType
+                passthroughSession.shouldOptimizeForNetworkUse = false
+                self?.lock.lock()
+                self?.activeExports[assetId] = passthroughSession
+                self?.lock.unlock()
+                runExport(passthroughSession, isRetry: false)
+            } else {
+                // Passthrough preset not creatable — go straight to HQ.
+                startHQExport()
             }
         }
 
@@ -7157,6 +7302,42 @@ final class VGVideoAssetPickerHandler {
             }
         } else {
             result(false)
+        }
+    }
+
+    // ── Limited Library Picker ───────────────────────────────────────────────
+
+    func handlePresentLimitedLibraryPicker(result: @escaping FlutterResult) {
+        guard #available(iOS 14, *) else {
+            // iOS 13 and earlier: limited library is not supported.
+            result(false)
+            return
+        }
+
+        DispatchQueue.main.async {
+            guard let rootVC = UIApplication.shared.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
+                result(false)
+                return
+            }
+            // Resolve the topmost presented view controller.
+            var topVC = rootVC
+            while let presented = topVC.presentedViewController {
+                topVC = presented
+            }
+
+            if #available(iOS 15, *) {
+                // iOS 15+: completion handler fires after user taps Done,
+                // so we can return true only after the picker is dismissed.
+                PHPhotoLibrary.shared().presentLimitedLibraryPicker(from: topVC) { _ in
+                    DispatchQueue.main.async {
+                        result(true)
+                    }
+                }
+            } else {
+                // iOS 14: no completion closure; returns immediately.
+                PHPhotoLibrary.shared().presentLimitedLibraryPicker(from: topVC)
+                result(true)
+            }
         }
     }
 }
