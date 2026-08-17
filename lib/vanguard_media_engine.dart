@@ -1079,6 +1079,25 @@ class VanguardEngine {
     );
   }
 
+  /// UMF V2 Slice 2A: Saves a local video file (.mp4, .mov, .m4v) to the platform
+  /// photo library (iOS Photos / PHPhotoLibrary).
+  ///
+  /// - [filePath]: absolute POSIX path to the local video file.
+  /// - [channel]: optional [MethodChannel] override for unit testing.
+  ///
+  /// Returns `true` on success.
+  /// Throws [PlatformException] on native permission denial or PhotoKit failure.
+  static Future<bool> saveVideoToPhotoLibrary(
+    String filePath, {
+    MethodChannel? channel,
+  }) async {
+    final ch = channel ?? _cameraChannel;
+    final result = await ch.invokeMethod<bool>('saveVideoToPhotoLibrary', {
+      'filePath': filePath,
+    });
+    return result ?? false;
+  }
+
   // ── C++ Timeline API ──────────────────────────────────────────────────────
 
   void addVideoNode(String path, {required double startTime, int layerId = 0}) {

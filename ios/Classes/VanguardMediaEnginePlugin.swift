@@ -132,6 +132,9 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // and background video export to local cache.
     private let videoAssetPickerHandler = VGVideoAssetPickerHandler()
 
+    // ── UMF V2 Slice 2A: photo library save handler ───────────────────────────
+    private let photoLibrarySaveHandler = VGPhotoLibrarySaveHandler()
+
     // ── S-P1: timeline live filter-chain handler ──────────────────────────────
     // Owns all parsing, stale-target checking, and runtime delegation for the
     // `timeline_setFilterChain` route. Plugin provides composition wiring only.
@@ -6351,6 +6354,10 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         case "presentLimitedLibraryPicker":
             videoAssetPickerHandler.handlePresentLimitedLibraryPicker(result: result)
 
+        // ── UMF V2 Slice 2A: save local video to Photos ──────────────────────
+        case "saveVideoToPhotoLibrary":
+            photoLibrarySaveHandler.handleSaveVideo(args: args, result: result)
+
         default:
             result(FlutterMethodNotImplemented)
         }
@@ -7337,6 +7344,142 @@ final class VGVideoAssetPickerHandler {
                 // iOS 14: no completion closure; returns immediately.
                 PHPhotoLibrary.shared().presentLimitedLibraryPicker(from: topVC)
                 result(true)
+            }
+        }
+    }
+}
+
+// ── UMF V2 Slice 2A: Photo Library Save Handler ─────────────────────────────
+//
+// Responsibilities:
+//   - Save rendered local video file (.mp4, .mov, .m4v) to iOS Photos (PHPhotoLibrary).
+//   - Uses PHPhotoLibrary.authorizationStatus(for: .addOnly) on iOS 14+; fallback on iOS <14.
+//   - Validates non-empty filePath, local file exists, valid video extension.
+//   - Uses PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL:).
+//   - Dispatches Flutter result on main queue.
+//   - Stable FlutterError codes:
+//       invalid_args
+//       file_not_found
+//       invalid_format
+//       permission_denied
+//       save_failed
+
+final class VGPhotoLibrarySaveHandler {
+    func handleSaveVideo(args: [String: Any]?, result: @escaping FlutterResult) {
+        guard let filePath = args?["filePath"] as? String, !filePath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            result(FlutterError(
+                code: "invalid_args",
+                message: "filePath is required and must not be empty.",
+                details: nil
+            ))
+            return
+        }
+
+        let fileURL = URL(fileURLWithPath: filePath)
+        let ext = fileURL.pathExtension.lowercased()
+        guard ext == "mp4" || ext == "mov" || ext == "m4v" else {
+            result(FlutterError(
+                code: "invalid_format",
+                message: "Only mp4, mov, and m4v video files are supported. Received: .\(ext)",
+                details: nil
+            ))
+            return
+        }
+
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            result(FlutterError(
+                code: "file_not_found",
+                message: "Video file not found at path: \(filePath)",
+                details: nil
+            ))
+            return
+        }
+
+        let performSave = {
+            var requestCreated = false
+            PHPhotoLibrary.shared().performChanges({
+                let request = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: fileURL)
+                if request != nil {
+                    requestCreated = true
+                }
+            }) { success, error in
+                DispatchQueue.main.async {
+                    if success && requestCreated {
+                        result(true)
+                    } else {
+                        result(FlutterError(
+                            code: "save_failed",
+                            message: error?.localizedDescription ?? "PhotoKit failed to create asset change request.",
+                            details: nil
+                        ))
+                    }
+                }
+            }
+        }
+
+        if #available(iOS 14, *) {
+            let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+            switch status {
+            case .authorized:
+                performSave()
+            case .notDetermined:
+                PHPhotoLibrary.requestAuthorization(for: .addOnly) { newStatus in
+                    DispatchQueue.main.async {
+                        if newStatus == .authorized {
+                            performSave()
+                        } else {
+                            result(FlutterError(
+                                code: "permission_denied",
+                                message: "Photo library add permission was not granted (status=\(newStatus.rawValue)).",
+                                details: nil
+                            ))
+                        }
+                    }
+                }
+            case .denied, .restricted, .limited:
+                result(FlutterError(
+                    code: "permission_denied",
+                    message: "Photo library add permission is \(status == .denied ? "denied" : (status == .restricted ? "restricted" : "limited")).",
+                    details: nil
+                ))
+            @unknown default:
+                result(FlutterError(
+                    code: "permission_denied",
+                    message: "Unknown photo library authorization status.",
+                    details: nil
+                ))
+            }
+        } else {
+            let status = PHPhotoLibrary.authorizationStatus()
+            switch status {
+            case .authorized:
+                performSave()
+            case .notDetermined:
+                PHPhotoLibrary.requestAuthorization { newStatus in
+                    DispatchQueue.main.async {
+                        if newStatus == .authorized {
+                            performSave()
+                        } else {
+                            result(FlutterError(
+                                code: "permission_denied",
+                                message: "Photo library permission was not granted.",
+                                details: nil
+                            ))
+                        }
+                    }
+                }
+            case .denied, .restricted:
+                result(FlutterError(
+                    code: "permission_denied",
+                    message: "Photo library permission is \(status == .denied ? "denied" : "restricted").",
+                    details: nil
+                ))
+            @unknown default:
+                result(FlutterError(
+                    code: "permission_denied",
+                    message: "Unknown photo library authorization status.",
+                    details: nil
+                ))
             }
         }
     }
