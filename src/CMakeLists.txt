@@ -7,6 +7,29 @@ project(vanguard_media_engine_library VERSION 0.0.1 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Modular Targets
+add_library(vanguard_core STATIC "core/src/status.cpp")
+target_include_directories(vanguard_core PUBLIC "core/include")
+
+add_library(vanguard_graph STATIC "graph/src/graph.cpp")
+target_include_directories(vanguard_graph PUBLIC "graph/include")
+target_link_libraries(vanguard_graph PRIVATE vanguard_core)
+
+add_library(vanguard_render_shared STATIC "render/shared/src/backend_capability.cpp")
+target_include_directories(vanguard_render_shared PUBLIC "render/shared/include")
+target_link_libraries(vanguard_render_shared PRIVATE vanguard_core)
+
+add_library(vanguard_render_vulkan STATIC "render/vulkan/src/vulkan_backend.cpp")
+target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include")
+target_link_libraries(vanguard_render_vulkan PRIVATE vanguard_render_shared vanguard_core)
+
+add_library(vanguard_render_gles STATIC "render/gles/src/gles_backend.cpp")
+target_include_directories(vanguard_render_gles PUBLIC "render/gles/include")
+target_link_libraries(vanguard_render_gles PRIVATE vanguard_render_shared vanguard_core)
+
+
+
+# Final Shared Library (Preserving C ABI compatibility)
 add_library(vanguard_media_engine SHARED
   "vanguard_media_engine.cpp"
 )
@@ -19,10 +42,21 @@ set_target_properties(vanguard_media_engine PROPERTIES
 target_compile_definitions(vanguard_media_engine PUBLIC DART_SHARED_LIB)
 
 if (ANDROID)
+  add_library(vanguard_platform_android STATIC "platform/android/src/jni_bridge.cpp" "platform/android/src/android_backend_probe.cpp")
+  target_include_directories(vanguard_platform_android PUBLIC "platform/android/include")
+  target_link_libraries(vanguard_platform_android PRIVATE vanguard_core vanguard_render_shared vanguard_render_vulkan vanguard_render_gles)
+
   # Support Android 15 16k page size
   target_link_options(vanguard_media_engine PRIVATE "-Wl,-z,max-page-size=16384")
-  # Link Android native libraries needed for GPU render pass
+  # Link modular targets and Android native libraries
   target_link_libraries(vanguard_media_engine
+    PRIVATE
+    vanguard_core
+    vanguard_graph
+    vanguard_render_shared
+    vanguard_render_vulkan
+    vanguard_render_gles
+    vanguard_platform_android
     android
     log
     GLESv3
