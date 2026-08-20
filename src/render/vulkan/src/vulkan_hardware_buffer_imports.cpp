@@ -1,10 +1,9 @@
 // vulkan_hardware_buffer_imports.cpp
-// Phase 2D: AHardwareBuffer Vulkan sampling-resource foundation.
+// Phase 2E: AHardwareBuffer Vulkan import management & table helper.
 //
-// Extends Phase 2C (AHB->VkImage/VkDeviceMemory import) with:
-//   - VkSamplerYcbcrConversion (external-format only)
-//   - VkImageView (2D or 2D_ARRAY; YCbCr chain for external-format)
-//   - VkSampler   (YCbCr chain for external-format; nearest/clamp-to-edge)
+// Manages the handle map, monotonic handle allocation, AHardwareBuffer NDK
+// reference acquisition/release (libandroid.so), acquire fence fd ownership,
+// and delegates Vulkan resource creation/teardown to VulkanHardwareBufferImage.
 //
 // Android-only: all implementation is inside #if defined(__ANDROID__) ... #endif.
 // Non-Android translation unit compiles to stubs only.
@@ -16,21 +15,17 @@
 // vkCreateSamplerYcbcrConversion, and vkDestroySamplerYcbcrConversion
 // are loaded via vkGetDeviceProcAddr.
 //
-// Forbidden (Phase 2D boundary):
+// Forbidden (Phase 2E boundary):
 //   JNI, AHardwareBuffer_allocate, lock/unlock, fromHardwareBuffer,
 //   descriptor sets, immutable sampler layouts, shaders, pipelines,
 //   command buffers, render passes, queue submit, presentation,
 //   semaphore import/wait, sync-fd GPU wait.
 
 #include "vulkan_hardware_buffer_imports.h"
+#include "vulkan_hardware_buffer_image.h"
 
 #if defined(__ANDROID__)
 
-// VK_USE_PLATFORM_ANDROID_KHR must be defined before <vulkan/vulkan.h> to
-// enable the Android platform extensions declared in vulkan_android.h, which
-// include VkAndroidHardwareBufferPropertiesANDROID, VkExternalFormatANDROID,
-// VkImportAndroidHardwareBufferInfoANDROID, PFN_vkGetAndroidHardwareBufferPropertiesANDROID,
-// and the forward declaration of struct AHardwareBuffer.
 #define VK_USE_PLATFORM_ANDROID_KHR
 
 #include <vulkan/vulkan.h>
@@ -44,6 +39,7 @@
 #include <cstring>
 #include <unordered_map>
 #include <atomic>
+#include <utility>
 
 #define VGLOG_AHB(...) \
     __android_log_print(ANDROID_LOG_DEBUG, "VanguardAHBImport", __VA_ARGS__)
@@ -59,9 +55,6 @@ namespace render {
 //   void AHardwareBuffer_acquire(AHardwareBuffer*)
 //   void AHardwareBuffer_release(AHardwareBuffer*)
 //   void AHardwareBuffer_describe(const AHardwareBuffer*, AHardwareBuffer_Desc*)
-//
-// AHardwareBuffer and AHardwareBuffer_Desc are provided by the NDK header
-// included above.  We cast to/from void* in our dlsym wrappers.
 // ---------------------------------------------------------------------------
 
 using VG_PFN_AcquireBuffer =
@@ -73,29 +66,15 @@ using VG_PFN_ReleaseBuffer =
 using VG_PFN_DescribeBuffer =
     void (*)(const AHardwareBuffer*, AHardwareBuffer_Desc*);
 
-// PFN_vkGetAndroidHardwareBufferPropertiesANDROID is declared in
-// <vulkan/vulkan_android.h> (included transitively above).
-// We use that type directly.
-
 // ---------------------------------------------------------------------------
 // Per-import record
-// Phase 2D extends Phase 2C fields with sampling resources.
+// Phase 2E: encapsulates Vulkan resources in VulkanHardwareBufferImage.
 // ---------------------------------------------------------------------------
 
 struct ImportRecord {
-    AHardwareBuffer*        ahbPtr;         // acquired ref (AHardwareBuffer*)
-    VkImage                 image;
-    VkDeviceMemory          memory;
-    int                     acquireFenceFd; // stored fd; -1 if none/closed
-
-    // Phase 2D: sampling resources.
-    VkSamplerYcbcrConversion ycbcrConversion; // VK_NULL_HANDLE for non-external
-    VkImageView              imageView;
-    VkSampler                sampler;
-
-    // Cached format state for teardown decisions.
-    VkFormat                 cachedFormat;         // VK_FORMAT_UNDEFINED => external
-    uint64_t                 cachedExternalFormat; // driver opaque value; 0 if n/a
+    AHardwareBuffer*          ahbPtr         = nullptr; // acquired ref (AHardwareBuffer*)
+    int                       acquireFenceFd = -1;      // stored fd; -1 if none/closed
+    VulkanHardwareBufferImage image;
 };
 
 // ---------------------------------------------------------------------------
@@ -118,8 +97,7 @@ struct VulkanHardwareBufferImports::Impl {
     // Resolved Vulkan extension functions (from vkGetDeviceProcAddr).
     PFN_vkGetAndroidHardwareBufferPropertiesANDROID fnGetAHBProps = nullptr;
 
-    // Phase 2D: Vulkan 1.1 sampler YCbCr conversion entry points.
-    // Resolved via vkGetDeviceProcAddr; initialize() returns false if missing.
+    // Phase 2D/2E: Vulkan 1.1 sampler YCbCr conversion entry points.
     PFN_vkCreateSamplerYcbcrConversion  fnCreateYcbcr  = nullptr;
     PFN_vkDestroySamplerYcbcrConversion fnDestroyYcbcr = nullptr;
 
@@ -133,34 +111,11 @@ struct VulkanHardwareBufferImports::Impl {
     // Does NOT remove it from the records map.
     //
     // Required order:
-    //   vkDestroySampler
-    //   -> vkDestroyImageView
-    //   -> vkDestroySamplerYcbcrConversion
-    //   -> vkDestroyImage
-    //   -> vkFreeMemory
+    //   Vulkan resources (sampler -> imageView -> ycbcrConversion -> image -> memory)
     //   -> AHardwareBuffer_release
     //   -> close(acquireFenceFd)
     void destroyRecord(ImportRecord& rec) {
-        if (rec.sampler != VK_NULL_HANDLE) {
-            vkDestroySampler(device, rec.sampler, nullptr);
-            rec.sampler = VK_NULL_HANDLE;
-        }
-        if (rec.imageView != VK_NULL_HANDLE) {
-            vkDestroyImageView(device, rec.imageView, nullptr);
-            rec.imageView = VK_NULL_HANDLE;
-        }
-        if (rec.ycbcrConversion != VK_NULL_HANDLE && fnDestroyYcbcr) {
-            fnDestroyYcbcr(device, rec.ycbcrConversion, nullptr);
-            rec.ycbcrConversion = VK_NULL_HANDLE;
-        }
-        if (rec.image != VK_NULL_HANDLE) {
-            vkDestroyImage(device, rec.image, nullptr);
-            rec.image = VK_NULL_HANDLE;
-        }
-        if (rec.memory != VK_NULL_HANDLE) {
-            vkFreeMemory(device, rec.memory, nullptr);
-            rec.memory = VK_NULL_HANDLE;
-        }
+        rec.image.destroy(device, fnDestroyYcbcr);
         if (rec.ahbPtr && fnRelease) {
             fnRelease(rec.ahbPtr);
             rec.ahbPtr = nullptr;
@@ -229,9 +184,7 @@ bool VulkanHardwareBufferImports::initialize(void* deviceHandle,
         return false;
     }
 
-    // Phase 2D: resolve Vulkan 1.1 sampler YCbCr conversion entry points.
-    // VulkanBackend::initialize() enables samplerYcbcrConversion and requires
-    // Vulkan 1.1, so these core entry points must be present.
+    // Phase 2D/2E: resolve Vulkan 1.1 sampler YCbCr conversion entry points.
     s.fnCreateYcbcr =
         reinterpret_cast<PFN_vkCreateSamplerYcbcrConversion>(
             vkGetDeviceProcAddr(s.device, "vkCreateSamplerYcbcrConversion"));
@@ -253,7 +206,7 @@ bool VulkanHardwareBufferImports::initialize(void* deviceHandle,
     }
 
     s.initialized = true;
-    VGLOG_AHB("VulkanHardwareBufferImports initialized (Phase 2D)");
+    VGLOG_AHB("VulkanHardwareBufferImports initialized (Phase 2E)");
     return true;
 }
 
@@ -299,57 +252,28 @@ HardwareBufferImportResult VulkanHardwareBufferImports::importBuffer(
 {
     Impl& s = *impl_;
 
-    // Helper: destroy partially-created Phase 2D resources in teardown order,
-    // release AHB ref, close fence, zero outputs, and return the result code.
-    //
-    // Teardown order mirrors destroyRecord:
-    //   sampler -> imageView -> ycbcrConversion -> image -> memory -> ahb -> fd
+    // Helper: release AHB ref if acquired, close fence, zero outputs, and return result.
     auto fail = [&](HardwareBufferImportResult r,
-                    int fenceToClose,
-                    AHardwareBuffer* ahbRef,
-                    VkImage img,
-                    VkDeviceMemory mem,
-                    VkSamplerYcbcrConversion ycbcr,
-                    VkImageView view,
-                    VkSampler samp) -> HardwareBufferImportResult {
-        if (samp  != VK_NULL_HANDLE) vkDestroySampler(s.device, samp, nullptr);
-        if (view  != VK_NULL_HANDLE) vkDestroyImageView(s.device, view, nullptr);
-        if (ycbcr != VK_NULL_HANDLE && s.fnDestroyYcbcr)
-            s.fnDestroyYcbcr(s.device, ycbcr, nullptr);
-        if (img   != VK_NULL_HANDLE) vkDestroyImage(s.device, img, nullptr);
-        if (mem   != VK_NULL_HANDLE) vkFreeMemory(s.device, mem, nullptr);
+                    AHardwareBuffer* ahbRef) -> HardwareBufferImportResult {
         if (ahbRef && s.fnRelease)   s.fnRelease(ahbRef);
-        if (fenceToClose >= 0)       ::close(fenceToClose);
+        if (acquireFenceFd >= 0)     ::close(acquireFenceFd);
         if (outHandle)     *outHandle     = kInvalidHardwareBufferHandle;
         if (outDescriptor) *outDescriptor = HardwareBufferDescriptor{};
         return r;
     };
 
-    // Convenience: call fail() before any Phase 2D resources are allocated.
-    auto failEarly = [&](HardwareBufferImportResult r,
-                         int fenceToClose,
-                         AHardwareBuffer* ahbRef,
-                         VkImage img,
-                         VkDeviceMemory mem) -> HardwareBufferImportResult {
-        return fail(r, fenceToClose, ahbRef, img, mem,
-                    VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
-    };
-
     // --- Argument validation ---
     if (!hardwareBuffer || !outHandle || !outDescriptor) {
-        return failEarly(HardwareBufferImportResult::kInvalidArgument,
-                         acquireFenceFd, nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        return fail(HardwareBufferImportResult::kInvalidArgument, nullptr);
     }
 
     if (!s.initialized) {
-        return failEarly(HardwareBufferImportResult::kBackendNotInitialized,
-                         acquireFenceFd, nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        return fail(HardwareBufferImportResult::kBackendNotInitialized, nullptr);
     }
 
     if (!s.fnAcquire || !s.fnRelease || !s.fnDescribe || !s.fnGetAHBProps ||
         !s.fnCreateYcbcr || !s.fnDestroyYcbcr) {
-        return failEarly(HardwareBufferImportResult::kVulkanFunctionUnavailable,
-                         acquireFenceFd, nullptr, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        return fail(HardwareBufferImportResult::kVulkanFunctionUnavailable, nullptr);
     }
 
     auto* ahbRaw = static_cast<AHardwareBuffer*>(hardwareBuffer);
@@ -357,9 +281,7 @@ HardwareBufferImportResult VulkanHardwareBufferImports::importBuffer(
     // --- Duplicate import check (same AHardwareBuffer* already active) ---
     for (const auto& kv : s.records) {
         if (kv.second.ahbPtr == ahbRaw) {
-            return failEarly(HardwareBufferImportResult::kDuplicateImport,
-                             acquireFenceFd, nullptr,
-                             VK_NULL_HANDLE, VK_NULL_HANDLE);
+            return fail(HardwareBufferImportResult::kDuplicateImport, nullptr);
         }
     }
 
@@ -373,289 +295,46 @@ HardwareBufferImportResult VulkanHardwareBufferImports::importBuffer(
 
     // Validate dimensions and layers.
     if (desc.width == 0 || desc.height == 0 || desc.layers == 0) {
-        return failEarly(HardwareBufferImportResult::kInvalidArgument,
-                         acquireFenceFd, ahbRef, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        return fail(HardwareBufferImportResult::kInvalidArgument, ahbRef);
     }
 
     // Reject BLOB format.
     if (desc.format == AHARDWAREBUFFER_FORMAT_BLOB) {
-        return failEarly(HardwareBufferImportResult::kInvalidArgument,
-                         acquireFenceFd, ahbRef, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        return fail(HardwareBufferImportResult::kInvalidArgument, ahbRef);
     }
 
     // Require GPU_SAMPLED_IMAGE usage.
     if (!(desc.usage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE)) {
-        return failEarly(HardwareBufferImportResult::kIncompatibleBuffer,
-                         acquireFenceFd, ahbRef, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        return fail(HardwareBufferImportResult::kIncompatibleBuffer, ahbRef);
     }
 
-    // --- Query Vulkan AHardwareBuffer properties ---
-    VkAndroidHardwareBufferFormatPropertiesANDROID fmtProps{};
-    fmtProps.sType =
-        VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
-    fmtProps.pNext = nullptr;
+    // --- Create Vulkan image and sampling resources via modular component ---
+    VulkanHardwareBufferImage vkImage;
+    HardwareBufferImportResult imgResult = vkImage.create(
+        s.device,
+        s.physDev,
+        ahbRef,
+        desc,
+        s.fnGetAHBProps,
+        s.fnCreateYcbcr,
+        s.fnDestroyYcbcr);
 
-    VkAndroidHardwareBufferPropertiesANDROID ahbProps{};
-    ahbProps.sType =
-        VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
-    ahbProps.pNext = &fmtProps;
-
-    VkResult vr = s.fnGetAHBProps(s.device, ahbRef, &ahbProps);
-    if (vr != VK_SUCCESS) {
-        VGLOG_AHB("vkGetAndroidHardwareBufferPropertiesANDROID failed: %d",
-                  static_cast<int>(vr));
-        return failEarly(HardwareBufferImportResult::kVulkanFailure,
-                         acquireFenceFd, ahbRef, VK_NULL_HANDLE, VK_NULL_HANDLE);
-    }
-
-    // Require SAMPLED_IMAGE format feature.
-    if (!(fmtProps.formatFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
-        VGLOG_AHB("Buffer lacks SAMPLED_IMAGE feature (formatFeatures=0x%x)",
-                  static_cast<uint32_t>(fmtProps.formatFeatures));
-        return failEarly(HardwareBufferImportResult::kIncompatibleBuffer,
-                         acquireFenceFd, ahbRef, VK_NULL_HANDLE, VK_NULL_HANDLE);
-    }
-
-    // --- Select memory type ---
-    VkPhysicalDeviceMemoryProperties memProps{};
-    vkGetPhysicalDeviceMemoryProperties(s.physDev, &memProps);
-
-    uint32_t memTypeIndex = UINT32_MAX;
-    for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
-        if (ahbProps.memoryTypeBits & (1u << i)) {
-            memTypeIndex = i;
-            break;
-        }
-    }
-
-    if (memTypeIndex == UINT32_MAX) {
-        VGLOG_AHB("No compatible memory type (memoryTypeBits=0x%x)",
-                  ahbProps.memoryTypeBits);
-        return failEarly(HardwareBufferImportResult::kVulkanFailure,
-                         acquireFenceFd, ahbRef, VK_NULL_HANDLE, VK_NULL_HANDLE);
-    }
-
-    // --- Create VkImage ---
-    // Chain VkExternalMemoryImageCreateInfo to signal the external handle type.
-    VkExternalMemoryImageCreateInfo extImgCI{};
-    extImgCI.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-    extImgCI.handleTypes =
-        VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
-
-    // For VK_FORMAT_UNDEFINED buffers, chain VkExternalFormatANDROID with
-    // the driver-provided externalFormat value.
-    VkExternalFormatANDROID extFmt{};
-    extFmt.sType          = VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID;
-    extFmt.externalFormat = 0;
-
-    const bool isExternalFormat = (fmtProps.format == VK_FORMAT_UNDEFINED);
-    VkFormat imageFormat = fmtProps.format;
-
-    if (isExternalFormat) {
-        if (fmtProps.externalFormat == 0) {
-            VGLOG_AHB("format=VK_FORMAT_UNDEFINED but externalFormat=0");
-            return failEarly(HardwareBufferImportResult::kIncompatibleBuffer,
-                             acquireFenceFd, ahbRef, VK_NULL_HANDLE, VK_NULL_HANDLE);
-        }
-        extFmt.pNext          = nullptr;
-        extFmt.externalFormat = fmtProps.externalFormat;
-        extImgCI.pNext        = &extFmt;
-    } else {
-        extImgCI.pNext = nullptr;
-    }
-
-    VkImageCreateInfo imgCI{};
-    imgCI.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imgCI.pNext         = &extImgCI;
-    imgCI.imageType     = VK_IMAGE_TYPE_2D;
-    imgCI.format        = imageFormat;
-    imgCI.extent        = { desc.width, desc.height, 1 };
-    imgCI.mipLevels     = 1;
-    imgCI.arrayLayers   = desc.layers;
-    imgCI.samples       = VK_SAMPLE_COUNT_1_BIT;
-    imgCI.tiling        = VK_IMAGE_TILING_OPTIMAL;
-    imgCI.usage         = VK_IMAGE_USAGE_SAMPLED_BIT;
-    imgCI.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
-    imgCI.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    VkImage image = VK_NULL_HANDLE;
-    vr = vkCreateImage(s.device, &imgCI, nullptr, &image);
-    if (vr != VK_SUCCESS) {
-        VGLOG_AHB("vkCreateImage failed: %d", static_cast<int>(vr));
-        return failEarly(HardwareBufferImportResult::kVulkanFailure,
-                         acquireFenceFd, ahbRef, VK_NULL_HANDLE, VK_NULL_HANDLE);
-    }
-
-    // --- Allocate and bind memory ---
-    VkImportAndroidHardwareBufferInfoANDROID importInfo{};
-    importInfo.sType  =
-        VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
-    importInfo.pNext  = nullptr;
-    importInfo.buffer = ahbRef;
-
-    VkMemoryDedicatedAllocateInfo dedicatedInfo{};
-    dedicatedInfo.sType  = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
-    dedicatedInfo.pNext  = &importInfo;
-    dedicatedInfo.image  = image;
-    dedicatedInfo.buffer = VK_NULL_HANDLE;
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.pNext           = &dedicatedInfo;
-    allocInfo.allocationSize  = ahbProps.allocationSize;
-    allocInfo.memoryTypeIndex = memTypeIndex;
-
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    vr = vkAllocateMemory(s.device, &allocInfo, nullptr, &memory);
-    if (vr != VK_SUCCESS) {
-        VGLOG_AHB("vkAllocateMemory failed: %d", static_cast<int>(vr));
-        return failEarly(HardwareBufferImportResult::kVulkanFailure,
-                         acquireFenceFd, ahbRef, image, VK_NULL_HANDLE);
-    }
-
-    vr = vkBindImageMemory(s.device, image, memory, 0);
-    if (vr != VK_SUCCESS) {
-        VGLOG_AHB("vkBindImageMemory failed: %d", static_cast<int>(vr));
-        return failEarly(HardwareBufferImportResult::kVulkanFailure,
-                         acquireFenceFd, ahbRef, image, memory);
-    }
-
-    // -------------------------------------------------------------------------
-    // Phase 2D: Create sampling resources after successful vkBindImageMemory.
-    // -------------------------------------------------------------------------
-
-    VkSamplerYcbcrConversion ycbcrConversion = VK_NULL_HANDLE;
-
-    if (isExternalFormat) {
-        // External-format (e.g., YUV/YCbCr hardware codec planes):
-        // VkSamplerYcbcrConversionCreateInfo requires VkExternalFormatANDROID
-        // chained in pNext with the driver opaque externalFormat value.
-        // Spec: when format == VK_FORMAT_UNDEFINED, components/model/range/
-        // chroma offsets come from fmtProps; chroma filter must be NEAREST
-        // for conservative compatibility.
-        VkExternalFormatANDROID convExtFmt{};
-        convExtFmt.sType          = VK_STRUCTURE_TYPE_EXTERNAL_FORMAT_ANDROID;
-        convExtFmt.pNext          = nullptr;
-        convExtFmt.externalFormat = fmtProps.externalFormat;
-
-        VkSamplerYcbcrConversionCreateInfo ycbcrCI{};
-        ycbcrCI.sType      = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_CREATE_INFO;
-        ycbcrCI.pNext      = &convExtFmt;
-        ycbcrCI.format     = VK_FORMAT_UNDEFINED; // must match image format
-        ycbcrCI.ycbcrModel = fmtProps.suggestedYcbcrModel;
-        ycbcrCI.ycbcrRange = fmtProps.suggestedYcbcrRange;
-        ycbcrCI.components = fmtProps.samplerYcbcrConversionComponents;
-        ycbcrCI.xChromaOffset             = fmtProps.suggestedXChromaOffset;
-        ycbcrCI.yChromaOffset             = fmtProps.suggestedYChromaOffset;
-        ycbcrCI.chromaFilter              = VK_FILTER_NEAREST; // conservative
-        ycbcrCI.forceExplicitReconstruction = VK_FALSE;
-
-        vr = s.fnCreateYcbcr(s.device, &ycbcrCI, nullptr, &ycbcrConversion);
-        if (vr != VK_SUCCESS) {
-            VGLOG_AHB("vkCreateSamplerYcbcrConversion failed: %d",
-                      static_cast<int>(vr));
-            return failEarly(HardwareBufferImportResult::kVulkanFailure,
-                             acquireFenceFd, ahbRef, image, memory);
-        }
-    }
-
-    // --- Create VkImageView ---
-    // For external-format images: chain VkSamplerYcbcrConversionInfo, set
-    // format = VK_FORMAT_UNDEFINED, and use identity component swizzle.
-    // For non-external images: plain 2D color view, no conversion chain.
-
-    VkSamplerYcbcrConversionInfo viewYcbcrInfo{};
-    viewYcbcrInfo.sType      = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO;
-    viewYcbcrInfo.pNext      = nullptr;
-    viewYcbcrInfo.conversion = ycbcrConversion; // VK_NULL_HANDLE if non-external
-
-    const VkImageViewType viewType =
-        (desc.layers > 1) ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
-                          : VK_IMAGE_VIEW_TYPE_2D;
-
-    VkImageViewCreateInfo viewCI{};
-    viewCI.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    viewCI.pNext    = isExternalFormat
-                          ? static_cast<void*>(&viewYcbcrInfo)
-                          : nullptr;
-    viewCI.image    = image;
-    viewCI.viewType = viewType;
-    viewCI.format   = isExternalFormat ? VK_FORMAT_UNDEFINED : imageFormat;
-    // Identity swizzle (required for external-format; safe for all).
-    viewCI.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-    viewCI.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-    viewCI.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-    viewCI.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-    viewCI.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
-    viewCI.subresourceRange.baseMipLevel   = 0;
-    viewCI.subresourceRange.levelCount     = 1;
-    viewCI.subresourceRange.baseArrayLayer = 0;
-    viewCI.subresourceRange.layerCount     = desc.layers;
-
-    VkImageView imageView = VK_NULL_HANDLE;
-    vr = vkCreateImageView(s.device, &viewCI, nullptr, &imageView);
-    if (vr != VK_SUCCESS) {
-        VGLOG_AHB("vkCreateImageView failed: %d", static_cast<int>(vr));
-        return fail(HardwareBufferImportResult::kVulkanFailure,
-                    acquireFenceFd, ahbRef, image, memory,
-                    ycbcrConversion, VK_NULL_HANDLE, VK_NULL_HANDLE);
-    }
-
-    // --- Create VkSampler ---
-    // For external-format images: chain VkSamplerYcbcrConversionInfo.
-    // Common settings: clamp-to-edge, normalized coordinates, no anisotropy,
-    // no compare, nearest filtering, nearest mipmap (conservative).
-
-    VkSamplerYcbcrConversionInfo samplerYcbcrInfo{};
-    samplerYcbcrInfo.sType      = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO;
-    samplerYcbcrInfo.pNext      = nullptr;
-    samplerYcbcrInfo.conversion = ycbcrConversion; // VK_NULL_HANDLE if non-external
-
-    VkSamplerCreateInfo samplerCI{};
-    samplerCI.sType            = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    samplerCI.pNext            = isExternalFormat
-                                     ? static_cast<void*>(&samplerYcbcrInfo)
-                                     : nullptr;
-    samplerCI.magFilter        = VK_FILTER_NEAREST;
-    samplerCI.minFilter        = VK_FILTER_NEAREST;
-    samplerCI.mipmapMode       = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    samplerCI.addressModeU     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerCI.addressModeV     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerCI.addressModeW     = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerCI.mipLodBias       = 0.0f;
-    samplerCI.anisotropyEnable = VK_FALSE;
-    samplerCI.maxAnisotropy    = 1.0f;
-    samplerCI.compareEnable    = VK_FALSE;
-    samplerCI.compareOp        = VK_COMPARE_OP_ALWAYS;
-    samplerCI.minLod           = 0.0f;
-    samplerCI.maxLod           = 0.0f;
-    samplerCI.borderColor      = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
-    samplerCI.unnormalizedCoordinates = VK_FALSE;
-
-    VkSampler sampler = VK_NULL_HANDLE;
-    vr = vkCreateSampler(s.device, &samplerCI, nullptr, &sampler);
-    if (vr != VK_SUCCESS) {
-        VGLOG_AHB("vkCreateSampler failed: %d", static_cast<int>(vr));
-        return fail(HardwareBufferImportResult::kVulkanFailure,
-                    acquireFenceFd, ahbRef, image, memory,
-                    ycbcrConversion, imageView, VK_NULL_HANDLE);
+    if (imgResult != HardwareBufferImportResult::kSuccess) {
+        return fail(imgResult, ahbRef);
     }
 
     // --- Register in handle table ---
     HardwareBufferHandle handle = s.nextHandle.fetch_add(1);
 
-    ImportRecord rec{};
-    rec.ahbPtr               = ahbRef;
-    rec.image                = image;
-    rec.memory               = memory;
-    rec.acquireFenceFd       = acquireFenceFd; // ownership transferred; stored here
-    rec.ycbcrConversion      = ycbcrConversion;
-    rec.imageView            = imageView;
-    rec.sampler              = sampler;
-    rec.cachedFormat         = imageFormat;
-    rec.cachedExternalFormat = isExternalFormat ? fmtProps.externalFormat : 0;
+    const bool isExternal = vkImage.isExternalFormat();
+    const bool hasYcbcr = vkImage.hasYcbcrConversion();
 
-    s.records.emplace(handle, rec);
+    ImportRecord rec{};
+    rec.ahbPtr         = ahbRef;
+    rec.acquireFenceFd = acquireFenceFd; // ownership transferred; stored here
+    rec.image          = std::move(vkImage);
+
+    s.records.emplace(handle, std::move(rec));
 
     // --- Populate outputs ---
     *outHandle = handle;
@@ -670,8 +349,8 @@ HardwareBufferImportResult VulkanHardwareBufferImports::importBuffer(
               " ahb=%p externalFmt=%s ycbcr=%s layers=%u",
               static_cast<uint64_t>(handle),
               static_cast<void*>(ahbRef),
-              isExternalFormat ? "yes" : "no",
-              (ycbcrConversion != VK_NULL_HANDLE) ? "yes" : "no",
+              isExternal ? "yes" : "no",
+              hasYcbcr ? "yes" : "no",
               desc.layers);
 
     return HardwareBufferImportResult::kSuccess;
