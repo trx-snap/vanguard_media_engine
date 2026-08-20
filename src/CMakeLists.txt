@@ -62,5 +62,6 @@ if (ANDROID)
     GLESv3
     EGL
     mediandk
+    vulkan
   )
 endif()
