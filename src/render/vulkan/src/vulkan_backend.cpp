@@ -1,21 +1,18 @@
-// Phase 2B1: VulkanBackend implementation.
+// Phase 2B2: VulkanBackend implementation.
 //
 // On Android (__ANDROID__):
 //   - Vulkan headers included here, never in the public header.
-//   - Implements: instance extension check, VkInstance creation (API 1.1),
-//     physical device selection (rejects CPU, requires API >= 1.1, required
-//     device extensions, samplerYcbcrConversion feature), queue family selection
-//     (GRAPHICS | COMPUTE), VkDevice creation, and vkGetDeviceQueue.
+//   - Phase 2B1: instance extension check, VkInstance (API 1.1),
+//     physical device selection, queue family, VkDevice, vkGetDeviceQueue.
+//   - Phase 2B2: delegates surface/swapchain lifecycle to VulkanSurfaceSwapchain.
 //
 // On non-Android host builds:
 //   - No Vulkan headers included.
 //   - initialize() returns false; shutdown() is a no-op.
-//
-// Forbidden scope (Phase 2B1): surfaces, swapchains, command buffers/pools,
-//   shaders, pipelines, render passes, AHardwareBuffer, GLES, MediaCodec,
-//   Camera2, presentation support, ANativeWindow.
+//   - Surface methods return false / no-op.
 
 #include "vanguard/render/vulkan_backend.h"
+#include "vulkan_surface_swapchain.h"
 
 #if defined(__ANDROID__)
 
@@ -44,6 +41,9 @@ struct VulkanBackend::Impl {
     VkQueue          queue     = VK_NULL_HANDLE;
     uint32_t         queueFamilyIndex = UINT32_MAX;
 #endif
+
+    // Phase 2B2: surface/swapchain lifecycle helper.
+    std::unique_ptr<VulkanSurfaceSwapchain> surfaceSwapchain;
 
     bool initialized = false;
 };
@@ -79,6 +79,22 @@ bool VulkanBackend::initialize() {
 
 void VulkanBackend::shutdown() {
     // no-op on host builds
+}
+
+bool VulkanBackend::attachSurface(void*, uint32_t, uint32_t) {
+    return false;
+}
+
+bool VulkanBackend::resizeSurface(uint32_t, uint32_t) {
+    return false;
+}
+
+void VulkanBackend::detachSurface() {
+    // no-op on host builds
+}
+
+bool VulkanBackend::hasSurface() const {
+    return false;
 }
 
 #else // __ANDROID__
@@ -400,6 +416,10 @@ void VulkanBackend::shutdown() {
         return; // already clean
     }
 
+    if (s.surfaceSwapchain) {
+        s.surfaceSwapchain->detach();
+    }
+
     // Reverse-order: device -> instance.
     // VkQueue must NOT be destroyed separately.
     if (s.device != VK_NULL_HANDLE) {
@@ -420,6 +440,59 @@ void VulkanBackend::shutdown() {
     s.initialized = false;
 
     VGLOG_VKB("VulkanBackend shut down");
+}
+
+// ---------------------------------------------------------------------------
+// Surface / swapchain lifecycle - Android
+// ---------------------------------------------------------------------------
+
+bool VulkanBackend::attachSurface(void* nativeWindow,
+                                  uint32_t width,
+                                  uint32_t height) {
+    if (!impl_) return false;
+    Impl& s = *impl_;
+    if (!s.initialized ||
+        s.instance == VK_NULL_HANDLE ||
+        s.physDev == VK_NULL_HANDLE ||
+        s.device == VK_NULL_HANDLE ||
+        s.queueFamilyIndex == UINT32_MAX) {
+        return false;
+    }
+
+    if (!s.surfaceSwapchain) {
+        s.surfaceSwapchain = std::make_unique<VulkanSurfaceSwapchain>();
+    }
+
+    return s.surfaceSwapchain->attach(
+        static_cast<void*>(s.instance),
+        static_cast<void*>(s.physDev),
+        static_cast<void*>(s.device),
+        s.queueFamilyIndex,
+        nativeWindow,
+        width,
+        height);
+}
+
+bool VulkanBackend::resizeSurface(uint32_t width, uint32_t height) {
+    if (!impl_) return false;
+    Impl& s = *impl_;
+    if (!s.initialized ||
+        s.device == VK_NULL_HANDLE ||
+        !s.surfaceSwapchain) {
+        return false;
+    }
+
+    return s.surfaceSwapchain->resize(width, height);
+}
+
+void VulkanBackend::detachSurface() {
+    if (impl_ && impl_->surfaceSwapchain) {
+        impl_->surfaceSwapchain->detach();
+    }
+}
+
+bool VulkanBackend::hasSurface() const {
+    return impl_ && impl_->surfaceSwapchain && impl_->surfaceSwapchain->hasSurface();
 }
 
 #endif // __ANDROID__

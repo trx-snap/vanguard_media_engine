@@ -1,10 +1,11 @@
 #pragma once
-// Phase 2B1: VulkanBackend - PImpl isolation.
-// This header must NOT include Vulkan or Android headers.
+// Phase 2B2: VulkanBackend - public header.
+// Must NOT include Vulkan or Android headers.
 // All Vulkan types live exclusively in vulkan_backend.cpp.
 
 #include "vanguard/render/render_backend.h"
 
+#include <cstdint>
 #include <memory>
 
 namespace vanguard {
@@ -22,6 +23,14 @@ public:
     bool initialize() override;
     void shutdown() override;
     RenderBackendType type() const override;
+
+    // Surface / swapchain lifecycle (delegates to VulkanSurfaceSwapchain).
+    bool attachSurface(void* nativeWindow,
+                       uint32_t width,
+                       uint32_t height) override;
+    bool resizeSurface(uint32_t width, uint32_t height) override;
+    void detachSurface() override;
+    bool hasSurface() const override;
 
 private:
     struct Impl;
