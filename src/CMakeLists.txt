@@ -19,7 +19,11 @@ add_library(vanguard_render_shared STATIC "render/shared/src/backend_capability.
 target_include_directories(vanguard_render_shared PUBLIC "render/shared/include")
 target_link_libraries(vanguard_render_shared PRIVATE vanguard_core)
 
-add_library(vanguard_render_vulkan STATIC "render/vulkan/src/vulkan_backend.cpp" "render/vulkan/src/vulkan_surface_swapchain.cpp")
+add_library(vanguard_render_vulkan STATIC
+    "render/vulkan/src/vulkan_backend.cpp"
+    "render/vulkan/src/vulkan_surface_swapchain.cpp"
+    "render/vulkan/src/vulkan_hardware_buffer_imports.cpp"
+)
 target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include")
 target_link_libraries(vanguard_render_vulkan PRIVATE vanguard_render_shared vanguard_core)
 

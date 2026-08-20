@@ -1,5 +1,6 @@
 #pragma once
 // Phase 2B2: VulkanBackend - public header.
+// Phase 2C: Added AHardwareBuffer import methods.
 // Must NOT include Vulkan or Android headers.
 // All Vulkan types live exclusively in vulkan_backend.cpp.
 
@@ -31,6 +32,19 @@ public:
     bool resizeSurface(uint32_t width, uint32_t height) override;
     void detachSurface() override;
     bool hasSurface() const override;
+
+    // Phase 2C: AHardwareBuffer import foundation.
+    HardwareBufferImportResult importHardwareBuffer(
+        void* hardwareBuffer,
+        int acquireFenceFd,
+        HardwareBufferHandle* outHandle,
+        HardwareBufferDescriptor* outDescriptor) override;
+
+    HardwareBufferImportResult releaseHardwareBuffer(
+        HardwareBufferHandle handle,
+        int* outReleaseFenceFd) override;
+
+    bool hasHardwareBuffer(HardwareBufferHandle handle) const override;
 
 private:
     struct Impl;

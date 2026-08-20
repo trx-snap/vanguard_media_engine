@@ -21,6 +21,19 @@ public:
     bool resizeSurface(uint32_t width, uint32_t height) override;
     void detachSurface() override;
     bool hasSurface() const override;
+
+    // Phase 2C: AHardwareBuffer import - not supported on GLES backend.
+    HardwareBufferImportResult importHardwareBuffer(
+        void* hardwareBuffer,
+        int acquireFenceFd,
+        HardwareBufferHandle* outHandle,
+        HardwareBufferDescriptor* outDescriptor) override;
+
+    HardwareBufferImportResult releaseHardwareBuffer(
+        HardwareBufferHandle handle,
+        int* outReleaseFenceFd) override;
+
+    bool hasHardwareBuffer(HardwareBufferHandle handle) const override;
 };
 
 } // namespace render

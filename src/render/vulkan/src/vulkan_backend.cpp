@@ -5,14 +5,17 @@
 //   - Phase 2B1: instance extension check, VkInstance (API 1.1),
 //     physical device selection, queue family, VkDevice, vkGetDeviceQueue.
 //   - Phase 2B2: delegates surface/swapchain lifecycle to VulkanSurfaceSwapchain.
+//   - Phase 2C: delegates AHardwareBuffer import to VulkanHardwareBufferImports.
 //
 // On non-Android host builds:
 //   - No Vulkan headers included.
 //   - initialize() returns false; shutdown() is a no-op.
 //   - Surface methods return false / no-op.
+//   - AHardwareBuffer methods return kUnavailable / false.
 
 #include "vanguard/render/vulkan_backend.h"
 #include "vulkan_surface_swapchain.h"
+#include "vulkan_hardware_buffer_imports.h"
 
 #if defined(__ANDROID__)
 
@@ -20,9 +23,14 @@
 #include <android/log.h>
 
 #include <cstring>
+#include <unistd.h>
 #include <vector>
 
 #define VGLOG_VKB(...) __android_log_print(ANDROID_LOG_DEBUG, "VanguardVkBackend", __VA_ARGS__)
+
+#elif !defined(_WIN32)
+
+#include <unistd.h>
 
 #endif // __ANDROID__
 
@@ -44,6 +52,9 @@ struct VulkanBackend::Impl {
 
     // Phase 2B2: surface/swapchain lifecycle helper.
     std::unique_ptr<VulkanSurfaceSwapchain> surfaceSwapchain;
+
+    // Phase 2C: AHardwareBuffer import helper.
+    std::unique_ptr<VulkanHardwareBufferImports> ahbImports;
 
     bool initialized = false;
 };
@@ -94,6 +105,37 @@ void VulkanBackend::detachSurface() {
 }
 
 bool VulkanBackend::hasSurface() const {
+    return false;
+}
+
+// Phase 2C: AHardwareBuffer import stubs - not supported on host builds.
+
+HardwareBufferImportResult VulkanBackend::importHardwareBuffer(
+    void* /*hardwareBuffer*/,
+    int acquireFenceFd,
+    HardwareBufferHandle* outHandle,
+    HardwareBufferDescriptor* outDescriptor)
+{
+    // Ownership of acquireFenceFd transfers at call entry; close it if valid.
+#if !defined(_WIN32)
+    if (acquireFenceFd >= 0) ::close(acquireFenceFd);
+#else
+    (void)acquireFenceFd;
+#endif
+    if (outHandle)     *outHandle     = kInvalidHardwareBufferHandle;
+    if (outDescriptor) *outDescriptor = HardwareBufferDescriptor{};
+    return HardwareBufferImportResult::kUnavailable;
+}
+
+HardwareBufferImportResult VulkanBackend::releaseHardwareBuffer(
+    HardwareBufferHandle /*handle*/,
+    int* outReleaseFenceFd)
+{
+    if (outReleaseFenceFd) *outReleaseFenceFd = -1;
+    return HardwareBufferImportResult::kUnavailable;
+}
+
+bool VulkanBackend::hasHardwareBuffer(HardwareBufferHandle /*handle*/) const {
     return false;
 }
 
@@ -399,6 +441,16 @@ bool VulkanBackend::initialize() {
               static_cast<void*>(s.queue),
               s.queueFamilyIndex);
 
+    // --- 7. Initialize Phase 2C AHardwareBuffer import helper ---
+    s.ahbImports = std::make_unique<VulkanHardwareBufferImports>();
+    if (!s.ahbImports->initialize(static_cast<void*>(s.device),
+                                   static_cast<void*>(s.physDev))) {
+        // Non-fatal: backend still functional; AHB import returns kUnavailable.
+        VGLOG_VKB("VulkanHardwareBufferImports initialization failed; "
+                  "importHardwareBuffer will return kUnavailable");
+        s.ahbImports.reset();
+    }
+
     s.initialized = true;
     return true;
 }
@@ -416,14 +468,28 @@ void VulkanBackend::shutdown() {
         return; // already clean
     }
 
+    // Wait for device idle before tearing down any GPU resources (surface,
+    // imported AHardwareBuffer VkImage/VkDeviceMemory).  Must be first so
+    // nothing is freed while the GPU may still be referencing it.
+    if (s.device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(s.device);
+    }
+
     if (s.surfaceSwapchain) {
         s.surfaceSwapchain->detach();
+    }
+
+    // Phase 2C: Release all AHardwareBuffer imports before destroying device.
+    // ahbImports->shutdown() destroys VkImage, VkDeviceMemory, releases AHB
+    // refs, and closes stored fds.  Must run before vkDestroyDevice.
+    if (s.ahbImports) {
+        s.ahbImports->shutdown();
+        s.ahbImports.reset();
     }
 
     // Reverse-order: device -> instance.
     // VkQueue must NOT be destroyed separately.
     if (s.device != VK_NULL_HANDLE) {
-        vkDeviceWaitIdle(s.device);
         vkDestroyDevice(s.device, nullptr);
         s.device = VK_NULL_HANDLE;
     }
@@ -493,6 +559,55 @@ void VulkanBackend::detachSurface() {
 
 bool VulkanBackend::hasSurface() const {
     return impl_ && impl_->surfaceSwapchain && impl_->surfaceSwapchain->hasSurface();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2C: AHardwareBuffer import - Android
+// ---------------------------------------------------------------------------
+
+HardwareBufferImportResult VulkanBackend::importHardwareBuffer(
+    void* hardwareBuffer,
+    int acquireFenceFd,
+    HardwareBufferHandle* outHandle,
+    HardwareBufferDescriptor* outDescriptor)
+{
+    if (!impl_) {
+        if (acquireFenceFd >= 0) ::close(acquireFenceFd);
+        if (outHandle)     *outHandle     = kInvalidHardwareBufferHandle;
+        if (outDescriptor) *outDescriptor = HardwareBufferDescriptor{};
+        return HardwareBufferImportResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (!s.initialized) {
+        if (acquireFenceFd >= 0) ::close(acquireFenceFd);
+        if (outHandle)     *outHandle     = kInvalidHardwareBufferHandle;
+        if (outDescriptor) *outDescriptor = HardwareBufferDescriptor{};
+        return HardwareBufferImportResult::kBackendNotInitialized;
+    }
+    if (!s.ahbImports) {
+        if (acquireFenceFd >= 0) ::close(acquireFenceFd);
+        if (outHandle)     *outHandle     = kInvalidHardwareBufferHandle;
+        if (outDescriptor) *outDescriptor = HardwareBufferDescriptor{};
+        return HardwareBufferImportResult::kUnavailable;
+    }
+    return s.ahbImports->importBuffer(hardwareBuffer, acquireFenceFd,
+                                      outHandle, outDescriptor);
+}
+
+HardwareBufferImportResult VulkanBackend::releaseHardwareBuffer(
+    HardwareBufferHandle handle,
+    int* outReleaseFenceFd)
+{
+    if (outReleaseFenceFd) *outReleaseFenceFd = -1;
+    if (!impl_ || !impl_->initialized || !impl_->ahbImports) {
+        return HardwareBufferImportResult::kUnavailable;
+    }
+    return impl_->ahbImports->releaseBuffer(handle, outReleaseFenceFd);
+}
+
+bool VulkanBackend::hasHardwareBuffer(HardwareBufferHandle handle) const {
+    if (!impl_ || !impl_->initialized || !impl_->ahbImports) return false;
+    return impl_->ahbImports->hasBuffer(handle);
 }
 
 #endif // __ANDROID__
