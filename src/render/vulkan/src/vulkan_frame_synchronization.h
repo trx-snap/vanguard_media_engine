@@ -1,11 +1,12 @@
 // vulkan_frame_synchronization.h
 // Phase 2N: Vulkan Frame Synchronization & Command Buffer Foundation.
+// Phase 2O2B4: Presentation semaphores are owned per swapchain-image in
+// VulkanSurfaceSwapchain (Khronos WSI lifecycle requirement).
 //
 // VulkanFrameSynchronization is a private move-only helper class managing
-// per-frame synchronization and primary command buffer resources:
+// per-frame-in-flight execution and synchronization resources:
 //   - VkCommandBuffer (allocated from borrowed command pool)
 //   - VkSemaphore imageAvailableSemaphore (binary semaphore for swapchain acquisition)
-//   - VkSemaphore renderFinishedSemaphore (binary semaphore for render completion)
 //   - VkFence inFlightFence (signaled initially to allow first frame wait)
 //
 // VkDevice and VkCommandPool are borrowed during initialize/shutdown and stored
@@ -39,7 +40,6 @@ namespace render {
 struct VulkanFrameSyncResources {
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
     VkSemaphore imageAvailableSemaphore = VK_NULL_HANDLE;
-    VkSemaphore renderFinishedSemaphore = VK_NULL_HANDLE;
     VkFence inFlightFence = VK_NULL_HANDLE;
 };
 
@@ -48,7 +48,6 @@ struct VulkanFrameSyncResources {
 struct VulkanFrameSyncResources {
     void* commandBuffer = nullptr;
     void* imageAvailableSemaphore = nullptr;
-    void* renderFinishedSemaphore = nullptr;
     void* inFlightFence = nullptr;
 };
 

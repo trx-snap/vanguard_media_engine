@@ -98,6 +98,19 @@ public:
     // Does NOT take or null out the semaphore handle; destroy() still owns it.
     bool markAcquireSemaphoreSubmitted(HardwareBufferHandle handle);
 
+    // ---------------------------------------------------------------------------
+    // Phase 2O2B4: Image layout tracking accessors.
+    // ---------------------------------------------------------------------------
+
+    // Returns the current VkImageLayout (as uint32_t) for handle's imported image,
+    // or 0 (VK_IMAGE_LAYOUT_UNDEFINED) if handle is invalid.
+    uint32_t getImageLayout(HardwareBufferHandle handle) const;
+
+    // Updates the current VkImageLayout for handle's imported image.
+    // Must be called ONLY after vkQueueSubmit returns VK_SUCCESS.
+    // Returns false if handle is not active.
+    bool setImageLayout(HardwareBufferHandle handle, uint32_t newLayout);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

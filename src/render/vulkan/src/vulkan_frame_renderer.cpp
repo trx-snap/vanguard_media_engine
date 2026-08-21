@@ -216,7 +216,6 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
         s.frameSync->getFrame(s.currentFrameIndex);
     if (frame == nullptr || frame->commandBuffer == VK_NULL_HANDLE ||
         frame->imageAvailableSemaphore == VK_NULL_HANDLE ||
-        frame->renderFinishedSemaphore == VK_NULL_HANDLE ||
         frame->inFlightFence == VK_NULL_HANDLE) {
         return RenderFrameResult::kVulkanFailure;
     }
@@ -294,9 +293,24 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     const VkFramebuffer framebuffer =
         u64ToVkHandle<VkFramebuffer>(framebufferHandle);
 
+    // Phase 2O2B4: Retrieve swapchain-image-indexed present semaphore
+    const uint64_t presentReadySemaphoreHandle =
+        swapchain.getPresentReadySemaphoreHandle(imageIndex);
+    if (presentReadySemaphoreHandle == 0) {
+        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+    }
+    const VkSemaphore presentReadySemaphore =
+        u64ToVkHandle<VkSemaphore>(presentReadySemaphoreHandle);
+
     if (!s.frameSync->resetCommandBuffer(s.currentFrameIndex)) {
         return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
     }
+
+    // Phase 2O2B4: Query current source image layout before recording.
+    // First frame: UNDEFINED -> SHADER_READ_ONLY_OPTIMAL transition.
+    // Later frames: image is already in SHADER_READ_ONLY_OPTIMAL; skip barrier.
+    const VkImageLayout currentLayout =
+        static_cast<VkImageLayout>(ahbImports.getImageLayout(handle));
 
     VulkanGraphicsPassParams passParams{};
     passParams.commandBuffer = frame->commandBuffer;
@@ -307,8 +321,16 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     passParams.pipelineLayout = pipelineLayout;
     passParams.descriptorSet = descriptorSet;
     passParams.pipeline = s.graphicsPipeline->get();
-    passParams.transitionSourceImage = true;
     passParams.sourceImage = srcImage;
+    if (currentLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        passParams.transitionSourceImage = true;
+        passParams.sourceOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        passParams.sourceNewLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    } else {
+        passParams.transitionSourceImage = false;
+        passParams.sourceOldLayout = currentLayout;
+        passParams.sourceNewLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
     if (!VulkanGraphicsCommandRecorder::recordCompletePass(passParams)) {
         return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
     }
@@ -341,7 +363,7 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &frame->commandBuffer;
     submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = &frame->renderFinishedSemaphore;
+    submitInfo.pSignalSemaphores = &presentReadySemaphore;
 
     const VkQueue queue = static_cast<VkQueue>(queueHandle);
     const VkResult submitResult =
@@ -359,9 +381,14 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
         return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
     }
 
+    // Phase 2O2B4: Mark layout as SHADER_READ_ONLY_OPTIMAL only after vkQueueSubmit returns VK_SUCCESS.
+    if (!ahbImports.setImageLayout(handle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))) {
+        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+    }
+
     const SwapchainResult presentResult = swapchain.presentImage(
         queueHandle,
-        vkHandleToU64(frame->renderFinishedSemaphore),
+        presentReadySemaphoreHandle,
         imageIndex);
     s.currentFrameIndex = (s.currentFrameIndex + 1) % frameCount;
 

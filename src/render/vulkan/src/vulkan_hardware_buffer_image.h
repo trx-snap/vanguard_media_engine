@@ -52,6 +52,11 @@ struct VulkanHardwareBufferImage {
     // destroy() destroys the semaphore handle regardless of this flag.
     bool                     acquireSemaphorePending = false;
 
+    // Phase 2O2B4: Track current VkImageLayout across multiple render passes.
+    // Initialized to VK_IMAGE_LAYOUT_UNDEFINED upon import, updated to
+    // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL after the first successful submit.
+    VkImageLayout            currentLayout           = VK_IMAGE_LAYOUT_UNDEFINED;
+
     // Cached format state.
     VkFormat                 cachedFormat         = VK_FORMAT_UNDEFINED;
     uint64_t                 cachedExternalFormat = 0;
@@ -77,6 +82,7 @@ struct VulkanHardwareBufferImage {
           sampler(other.sampler),
           acquireSemaphore(other.acquireSemaphore),
           acquireSemaphorePending(other.acquireSemaphorePending),
+          currentLayout(other.currentLayout),
           cachedFormat(other.cachedFormat),
           cachedExternalFormat(other.cachedExternalFormat),
           cachedLayerCount(other.cachedLayerCount),
@@ -88,6 +94,7 @@ struct VulkanHardwareBufferImage {
         other.sampler = VK_NULL_HANDLE;
         other.acquireSemaphore = VK_NULL_HANDLE;
         other.acquireSemaphorePending = false;
+        other.currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         other.cachedFormat = VK_FORMAT_UNDEFINED;
         other.cachedExternalFormat = 0;
         other.cachedLayerCount = 1;
@@ -102,6 +109,7 @@ struct VulkanHardwareBufferImage {
             sampler = other.sampler;
             acquireSemaphore = other.acquireSemaphore;
             acquireSemaphorePending = other.acquireSemaphorePending;
+            currentLayout = other.currentLayout;
             cachedFormat = other.cachedFormat;
             cachedExternalFormat = other.cachedExternalFormat;
             cachedLayerCount = other.cachedLayerCount;
@@ -114,6 +122,7 @@ struct VulkanHardwareBufferImage {
             other.sampler = VK_NULL_HANDLE;
             other.acquireSemaphore = VK_NULL_HANDLE;
             other.acquireSemaphorePending = false;
+            other.currentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             other.cachedFormat = VK_FORMAT_UNDEFINED;
             other.cachedExternalFormat = 0;
             other.cachedLayerCount = 1;
@@ -186,6 +195,7 @@ namespace render {
 // Minimal dummy struct for host builds.
 struct VulkanHardwareBufferImage {
     bool acquireSemaphorePending = false; // Phase 2O1: always false on host.
+    uint32_t currentLayout = 0;           // Phase 2O2B4: current layout tracking on host.
     bool isExternalFormat() const { return false; }
     bool hasYcbcrConversion() const { return false; }
 };

@@ -62,6 +62,7 @@ struct VulkanSurfaceSwapchain::Impl {
     VkSurfaceKHR     surface        = VK_NULL_HANDLE;
     VkSwapchainKHR   swapchain      = VK_NULL_HANDLE;
     std::vector<VkImage> images;
+    std::vector<VkSemaphore> presentSemaphores; // Phase 2O2B4: one per swapchain image
 
     VkExtent2D       extent         = {0, 0};
     VkFormat         format         = VK_FORMAT_UNDEFINED;
@@ -111,6 +112,7 @@ uint64_t VulkanSurfaceSwapchain::getRenderPassHandle() const       { return 0; }
 uint32_t VulkanSurfaceSwapchain::getImageCount() const             { return 0; }
 uint64_t VulkanSurfaceSwapchain::getImageViewHandle(uint32_t) const   { return 0; }
 uint64_t VulkanSurfaceSwapchain::getFramebufferHandle(uint32_t) const { return 0; }
+uint64_t VulkanSurfaceSwapchain::getPresentReadySemaphoreHandle(uint32_t) const { return 0; }
 
 // Phase 2O1: host stubs - WSI seam methods. No Vulkan runtime on host.
 SwapchainResult VulkanSurfaceSwapchain::acquireNextImage(
@@ -498,6 +500,37 @@ bool VulkanSurfaceSwapchain::attach(void* instanceHandle,
         return false;
     }
 
+    // --- Phase 2O2B4: Create present-ready semaphores (one per swapchain image) ---
+    std::vector<VkSemaphore> newPresentSemaphores(newImages.size(), VK_NULL_HANDLE);
+    VkSemaphoreCreateInfo semCI{};
+    semCI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    semCI.pNext = nullptr;
+    semCI.flags = 0;
+    bool semOk = true;
+    for (size_t i = 0; i < newImages.size(); ++i) {
+        VkResult semRes = vkCreateSemaphore(device, &semCI, nullptr, &newPresentSemaphores[i]);
+        if (semRes != VK_SUCCESS) {
+            VGLOG_SWP("attach: vkCreateSemaphore for presentReadySemaphore[%zu] failed: %d",
+                      i, static_cast<int>(semRes));
+            semOk = false;
+            break;
+        }
+    }
+    if (!semOk) {
+        for (VkSemaphore sem : newPresentSemaphores) {
+            if (sem != VK_NULL_HANDLE) {
+                vkDestroySemaphore(device, sem, nullptr);
+            }
+        }
+        vkDestroySwapchainKHR(device, newSwapchain, nullptr);
+        vkDestroySurfaceKHR(instance, impl_->surface, nullptr);
+        impl_->surface  = VK_NULL_HANDLE;
+        impl_->instance = VK_NULL_HANDLE;
+        impl_->physDev  = VK_NULL_HANDLE;
+        impl_->device   = VK_NULL_HANDLE;
+        return false;
+    }
+
     // --- Phase 2K: create render targets via dedicated class ---
     if (!impl_->renderTargets) {
         impl_->renderTargets = std::make_unique<VulkanSwapchainRenderTargets>();
@@ -514,8 +547,13 @@ bool VulkanSurfaceSwapchain::attach(void* instanceHandle,
             newExtent.height,
             imageHandles.data(),
             static_cast<uint32_t>(newImages.size()))) {
-        // Render-target creation failed; clean up new swapchain and surface.
+        // Render-target creation failed; clean up new render targets, present semaphores, swapchain, and surface.
         impl_->renderTargets->destroy(static_cast<void*>(device));
+        for (VkSemaphore sem : newPresentSemaphores) {
+            if (sem != VK_NULL_HANDLE) {
+                vkDestroySemaphore(device, sem, nullptr);
+            }
+        }
         vkDestroySwapchainKHR(device, newSwapchain, nullptr);
         vkDestroySurfaceKHR(instance, impl_->surface, nullptr);
         impl_->surface  = VK_NULL_HANDLE;
@@ -526,12 +564,13 @@ bool VulkanSurfaceSwapchain::attach(void* instanceHandle,
     }
 
     // All steps succeeded - commit to impl_.
-    impl_->swapchain    = newSwapchain;
-    impl_->format       = newFormat;
-    impl_->colorSpace   = newColorSpace;
-    impl_->extent       = newExtent;
-    impl_->images       = std::move(newImages);
-    impl_->attached     = true;
+    impl_->swapchain         = newSwapchain;
+    impl_->presentSemaphores = std::move(newPresentSemaphores);
+    impl_->format            = newFormat;
+    impl_->colorSpace        = newColorSpace;
+    impl_->extent            = newExtent;
+    impl_->images            = std::move(newImages);
+    impl_->attached          = true;
 
     VGLOG_SWP("attach: swapchain+render targets created extent=%ux%u images=%u",
               impl_->extent.width, impl_->extent.height,
@@ -579,6 +618,12 @@ bool VulkanSurfaceSwapchain::resize(uint32_t width, uint32_t height) {
         VGLOG_SWP("resize: vkCreateSwapchainKHR failed after old swapchain retirement; failing closed");
         if (impl_->device != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(impl_->device);
+            for (VkSemaphore sem : impl_->presentSemaphores) {
+                if (sem != VK_NULL_HANDLE) {
+                    vkDestroySemaphore(impl_->device, sem, nullptr);
+                }
+            }
+            impl_->presentSemaphores.clear();
             if (impl_->renderTargets) {
                 impl_->renderTargets->destroy(static_cast<void*>(impl_->device));
             }
@@ -602,12 +647,29 @@ bool VulkanSurfaceSwapchain::resize(uint32_t width, uint32_t height) {
     }
 
     // scStatus == kSuccess: new swapchain is live.  oldSwapchain has been
-    // retired by the driver.  Now build render targets into a temporary
-    // VulkanSwapchainRenderTargets instance.  We do NOT touch old render
-    // targets until we have confirmed success AND called vkDeviceWaitIdle.
+    // retired by the driver.  Now build render targets and present semaphores
+    // into temporary instances.  We do NOT touch old render targets or old
+    // semaphores until we have confirmed success AND called vkDeviceWaitIdle.
     //
     // Any failure here is post-retirement and requires the same fail-closed
     // teardown (old render targets reference the retired swapchain's images).
+
+    // Phase 2O2B4: Create new present-ready semaphores (one per swapchain image)
+    std::vector<VkSemaphore> newPresentSemaphores(newImages.size(), VK_NULL_HANDLE);
+    VkSemaphoreCreateInfo semCI{};
+    semCI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    semCI.pNext = nullptr;
+    semCI.flags = 0;
+    bool semOk = true;
+    for (size_t i = 0; i < newImages.size(); ++i) {
+        VkResult semRes = vkCreateSemaphore(impl_->device, &semCI, nullptr, &newPresentSemaphores[i]);
+        if (semRes != VK_SUCCESS) {
+            VGLOG_SWP("resize: vkCreateSemaphore for new present semaphore[%zu] failed: %d",
+                      i, static_cast<int>(semRes));
+            semOk = false;
+            break;
+        }
+    }
 
     // Encode VkImage handles as uint64_t via memcpy (portable across 32-bit
     // and 64-bit NDK ABIs) before passing to VulkanSwapchainRenderTargets.
@@ -617,27 +679,39 @@ bool VulkanSurfaceSwapchain::resize(uint32_t width, uint32_t height) {
     // render targets are not touched until device is idle.
     auto newRenderTargets = std::make_unique<VulkanSwapchainRenderTargets>();
 
-    if (!newRenderTargets->create(
+    if (!semOk || !newRenderTargets->create(
             static_cast<void*>(impl_->device),
             static_cast<uint32_t>(newFormat),
             newExtent.width,
             newExtent.height,
             imageHandles.data(),
             static_cast<uint32_t>(newImages.size()))) {
-        // New render-target creation failed. New swapchain succeeded but
+        // New render-target or semaphore creation failed. New swapchain succeeded but
         // oldSwapchain is already retired. Fail-closed:
-        //   1. Destroy new render targets (partially-created objects cleaned
+        //   1. Destroy new present semaphores.
+        //   2. Destroy new render targets (partially-created objects cleaned
         //      inside create(), but destroy() is idempotent / safe to call).
-        //   2. Destroy new swapchain.
-        //   3. vkDeviceWaitIdle (GPU may still reference old RT resources).
-        //   4. Destroy old render targets and old swapchain (retired handle).
-        //   5. Destroy surface, clear state, attached=false.
-        VGLOG_SWP("resize: render-target creation failed post-retirement; failing closed");
+        //   3. Destroy new swapchain.
+        //   4. vkDeviceWaitIdle (GPU may still reference old RT resources).
+        //   5. Destroy old present semaphores, old render targets, and old swapchain (retired handle).
+        //   6. Destroy surface, clear state, attached=false.
+        VGLOG_SWP("resize: render-target/semaphore creation failed post-retirement; failing closed");
+        for (VkSemaphore sem : newPresentSemaphores) {
+            if (sem != VK_NULL_HANDLE) {
+                vkDestroySemaphore(impl_->device, sem, nullptr);
+            }
+        }
         newRenderTargets->destroy(static_cast<void*>(impl_->device));
         vkDestroySwapchainKHR(impl_->device, newSwapchain, nullptr);
 
         if (impl_->device != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(impl_->device);
+            for (VkSemaphore sem : impl_->presentSemaphores) {
+                if (sem != VK_NULL_HANDLE) {
+                    vkDestroySemaphore(impl_->device, sem, nullptr);
+                }
+            }
+            impl_->presentSemaphores.clear();
         }
 
         // Destroy old render targets (GPU is now idle).
@@ -663,13 +737,19 @@ bool VulkanSurfaceSwapchain::resize(uint32_t width, uint32_t height) {
     }
 
     // All steps succeeded.
-    //   1. vkDeviceWaitIdle: ensure GPU is done with old render targets.
-    //   2. Destroy old render targets (GPU is now idle).
+    //   1. vkDeviceWaitIdle: ensure GPU is done with old render targets and present semaphores.
+    //   2. Destroy old present semaphores and old render targets (GPU is now idle).
     //   3. Destroy old swapchain (driver already retired it; this frees any
     //      remaining driver-side resources per Vulkan spec).
-    //   4. Move/commit new render targets and new swapchain state.
+    //   4. Move/commit new present semaphores, render targets, and new swapchain state.
     if (impl_->device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(impl_->device);
+        for (VkSemaphore sem : impl_->presentSemaphores) {
+            if (sem != VK_NULL_HANDLE) {
+                vkDestroySemaphore(impl_->device, sem, nullptr);
+            }
+        }
+        impl_->presentSemaphores.clear();
     }
 
     // Destroy old render targets (GPU is now idle; safe to release).
@@ -681,12 +761,13 @@ bool VulkanSurfaceSwapchain::resize(uint32_t width, uint32_t height) {
     vkDestroySwapchainKHR(impl_->device, impl_->swapchain, nullptr);
 
     // Commit new state.
-    impl_->renderTargets = std::move(newRenderTargets);
-    impl_->swapchain     = newSwapchain;
-    impl_->format        = newFormat;
-    impl_->colorSpace    = newColorSpace;
-    impl_->extent        = newExtent;
-    impl_->images        = std::move(newImages);
+    impl_->presentSemaphores = std::move(newPresentSemaphores);
+    impl_->renderTargets     = std::move(newRenderTargets);
+    impl_->swapchain         = newSwapchain;
+    impl_->format            = newFormat;
+    impl_->colorSpace        = newColorSpace;
+    impl_->extent            = newExtent;
+    impl_->images            = std::move(newImages);
 
     VGLOG_SWP("resize: new swapchain+render targets extent=%ux%u images=%u",
               impl_->extent.width, impl_->extent.height,
@@ -703,7 +784,13 @@ void VulkanSurfaceSwapchain::detach() {
 
     if (impl_->device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(impl_->device);
+        for (VkSemaphore sem : impl_->presentSemaphores) {
+            if (sem != VK_NULL_HANDLE) {
+                vkDestroySemaphore(impl_->device, sem, nullptr);
+            }
+        }
     }
+    impl_->presentSemaphores.clear();
 
     // Phase 2K: destroy render targets first (framebuffers -> imageViews ->
     // renderPass), then swapchain, then surface.
@@ -767,6 +854,11 @@ uint64_t VulkanSurfaceSwapchain::getImageViewHandle(uint32_t index) const {
 uint64_t VulkanSurfaceSwapchain::getFramebufferHandle(uint32_t index) const {
     if (!impl_->attached || !impl_->renderTargets) return 0;
     return impl_->renderTargets->getFramebufferHandle(index);
+}
+
+uint64_t VulkanSurfaceSwapchain::getPresentReadySemaphoreHandle(uint32_t index) const {
+    if (!impl_->attached || index >= impl_->presentSemaphores.size()) return 0;
+    return vkHandleToU64(impl_->presentSemaphores[index]);
 }
 
 // ---------------------------------------------------------------------------

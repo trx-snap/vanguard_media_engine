@@ -330,6 +330,7 @@ void VulkanHardwareBufferImage::destroy(
     cachedFormat         = VK_FORMAT_UNDEFINED;
     cachedExternalFormat = 0;
     cachedLayerCount     = 1; // Phase 2F
+    currentLayout        = VK_IMAGE_LAYOUT_UNDEFINED; // Phase 2O2B4
 }
 
 // Phase 2F: Records one VkImageMemoryBarrier via vkCmdPipelineBarrier.

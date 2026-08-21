@@ -516,6 +516,23 @@ bool VulkanHardwareBufferImports::markAcquireSemaphoreSubmitted(
     return true;
 }
 
+uint32_t VulkanHardwareBufferImports::getImageLayout(
+        HardwareBufferHandle handle) const {
+    const Impl& s = *impl_;
+    auto it = s.records.find(handle);
+    if (it == s.records.end()) return static_cast<uint32_t>(VK_IMAGE_LAYOUT_UNDEFINED);
+    return static_cast<uint32_t>(it->second.image.currentLayout);
+}
+
+bool VulkanHardwareBufferImports::setImageLayout(
+        HardwareBufferHandle handle, uint32_t newLayout) {
+    Impl& s = *impl_;
+    auto it = s.records.find(handle);
+    if (it == s.records.end()) return false;
+    it->second.image.currentLayout = static_cast<VkImageLayout>(newLayout);
+    return true;
+}
+
 } // namespace render
 } // namespace vanguard
 
@@ -593,6 +610,16 @@ uint64_t VulkanHardwareBufferImports::getPendingAcquireSemaphoreHandle(
 
 bool VulkanHardwareBufferImports::markAcquireSemaphoreSubmitted(
         HardwareBufferHandle /*handle*/) {
+    return false;
+}
+
+uint32_t VulkanHardwareBufferImports::getImageLayout(
+        HardwareBufferHandle /*handle*/) const {
+    return 0u;
+}
+
+bool VulkanHardwareBufferImports::setImageLayout(
+        HardwareBufferHandle /*handle*/, uint32_t /*newLayout*/) {
     return false;
 }
 

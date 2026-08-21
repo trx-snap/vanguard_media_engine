@@ -121,14 +121,6 @@ bool VulkanFrameSynchronization::initialize(VkDevice device,
             break;
         }
 
-        res = vkCreateSemaphore(device, &semInfo, nullptr, &newFrames[i].renderFinishedSemaphore);
-        if (res != VK_SUCCESS) {
-            VGLOG_FS("initialize: vkCreateSemaphore (renderFinished) failed for frame %u: %d",
-                     i, static_cast<int>(res));
-            success = false;
-            break;
-        }
-
         res = vkCreateFence(device, &fenceInfo, nullptr, &newFrames[i].inFlightFence);
         if (res != VK_SUCCESS) {
             VGLOG_FS("initialize: vkCreateFence failed for frame %u: %d",
@@ -144,10 +136,6 @@ bool VulkanFrameSynchronization::initialize(VkDevice device,
             if (frame.inFlightFence != VK_NULL_HANDLE) {
                 vkDestroyFence(device, frame.inFlightFence, nullptr);
                 frame.inFlightFence = VK_NULL_HANDLE;
-            }
-            if (frame.renderFinishedSemaphore != VK_NULL_HANDLE) {
-                vkDestroySemaphore(device, frame.renderFinishedSemaphore, nullptr);
-                frame.renderFinishedSemaphore = VK_NULL_HANDLE;
             }
             if (frame.imageAvailableSemaphore != VK_NULL_HANDLE) {
                 vkDestroySemaphore(device, frame.imageAvailableSemaphore, nullptr);
@@ -179,10 +167,6 @@ void VulkanFrameSynchronization::shutdown(VkDevice device, VkCommandPool command
             if (frame.inFlightFence != VK_NULL_HANDLE) {
                 vkDestroyFence(dev, frame.inFlightFence, nullptr);
                 frame.inFlightFence = VK_NULL_HANDLE;
-            }
-            if (frame.renderFinishedSemaphore != VK_NULL_HANDLE) {
-                vkDestroySemaphore(dev, frame.renderFinishedSemaphore, nullptr);
-                frame.renderFinishedSemaphore = VK_NULL_HANDLE;
             }
             if (frame.imageAvailableSemaphore != VK_NULL_HANDLE) {
                 vkDestroySemaphore(dev, frame.imageAvailableSemaphore, nullptr);

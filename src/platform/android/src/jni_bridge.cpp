@@ -80,6 +80,39 @@ jstring NewSmokeStatus(
     return env->NewStringUTF(status);
 }
 
+jstring NewLoopSmokeStatus(
+    JNIEnv* env,
+    bool pass,
+    const char* initialize,
+    const char* attach,
+    const char* import,
+    jint renderedFrames,
+    jint frameCount,
+    const char* renderFrame,
+    jint failingFrame,
+    const char* release,
+    jint width,
+    jint height) {
+    char status[kSmokeStatusCapacity];
+    std::snprintf(
+        status,
+        sizeof(status),
+        "status=%s;initialize=%s;attach=%s;import=%s;renderedFrames=%d;frameCount=%d;"
+        "renderFrame=%s;failingFrame=%d;release=%s;width=%d;height=%d",
+        pass ? "PASS" : "FAIL",
+        initialize,
+        attach,
+        import,
+        renderedFrames,
+        frameCount,
+        renderFrame,
+        failingFrame,
+        release,
+        width,
+        height);
+    return env->NewStringUTF(status);
+}
+
 } // namespace
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
@@ -234,6 +267,152 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         attachStatus,
         importStatus,
         renderStatus,
+        releaseStatus,
+        width,
+        height);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroidDagRenderLoopSmoke(
+    JNIEnv* env,
+    jobject /* this */,
+    jobject surface,
+    jobject hardwareBuffer,
+    jint width,
+    jint height,
+    jint frameCount) {
+    if (surface == nullptr || hardwareBuffer == nullptr || width <= 0 || height <= 0 || frameCount <= 0) {
+        return NewLoopSmokeStatus(
+            env, false, "not_run", "not_run", "not_run", 0, frameCount,
+            "not_run", -1, "not_run", width, height);
+    }
+
+    ANativeWindow* nativeWindow = ANativeWindow_fromSurface(env, surface);
+    if (nativeWindow == nullptr) {
+        return NewLoopSmokeStatus(
+            env, false, "not_run", "native_window_failed", "not_run", 0, frameCount,
+            "not_run", -1, "not_run", width, height);
+    }
+
+    void* libAndroid = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+    if (libAndroid == nullptr) {
+        ANativeWindow_release(nativeWindow);
+        return NewLoopSmokeStatus(
+            env, false, "not_run", "not_run", "hardware_buffer_jni_unavailable", 0, frameCount,
+            "not_run", -1, "not_run", width, height);
+    }
+
+    auto fnFromHardwareBuffer = reinterpret_cast<FnAHardwareBuffer_fromHardwareBuffer>(
+        dlsym(libAndroid, "AHardwareBuffer_fromHardwareBuffer"));
+    if (fnFromHardwareBuffer == nullptr) {
+        dlclose(libAndroid);
+        ANativeWindow_release(nativeWindow);
+        return NewLoopSmokeStatus(
+            env, false, "not_run", "not_run", "hardware_buffer_jni_unavailable", 0, frameCount,
+            "not_run", -1, "not_run", width, height);
+    }
+
+    AHardwareBuffer* borrowedHardwareBuffer =
+        fnFromHardwareBuffer(env, hardwareBuffer);
+    dlclose(libAndroid);
+
+    const char* initializeStatus = "not_run";
+    const char* attachStatus = "not_run";
+    const char* importStatus = borrowedHardwareBuffer == nullptr
+        ? "hardware_buffer_failed"
+        : "not_run";
+    const char* renderStatus = "not_run";
+    const char* releaseStatus = "not_run";
+    int renderedFrames = 0;
+    int failingFrame = -1;
+    bool renderPassed = false;
+    bool releasePassed = false;
+    bool cleanupCompleted = false;
+    int releaseFenceFd = -1;
+
+    try {
+        vanguard::render::VulkanBackend backend;
+        const bool initialized = backend.initialize();
+        initializeStatus = initialized ? "success" : "failed";
+
+        bool attached = false;
+        vanguard::render::HardwareBufferHandle handle =
+            vanguard::render::kInvalidHardwareBufferHandle;
+        bool imported = false;
+
+        if (initialized && borrowedHardwareBuffer != nullptr) {
+            attached = backend.attachSurface(
+                nativeWindow,
+                static_cast<uint32_t>(width),
+                static_cast<uint32_t>(height));
+            attachStatus = attached ? "success" : "failed";
+        }
+
+        if (attached) {
+            vanguard::render::HardwareBufferDescriptor descriptor{};
+            const auto importResult = backend.importHardwareBuffer(
+                borrowedHardwareBuffer,
+                -1,
+                &handle,
+                &descriptor);
+            importStatus = HardwareBufferResultName(importResult);
+            imported = importResult ==
+                vanguard::render::HardwareBufferImportResult::kSuccess;
+        }
+
+        if (imported) {
+            renderStatus = "success";
+            for (int f = 0; f < frameCount; ++f) {
+                const auto renderResult = backend.renderFrame(handle);
+                if (renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+                    renderResult == vanguard::render::RenderFrameResult::kSuboptimal) {
+                    renderedFrames++;
+                } else {
+                    renderStatus = RenderFrameResultName(renderResult);
+                    failingFrame = f;
+                    break;
+                }
+            }
+            renderPassed = (renderedFrames == frameCount);
+
+            const auto releaseResult =
+                backend.releaseHardwareBuffer(handle, &releaseFenceFd);
+            releaseStatus = HardwareBufferResultName(releaseResult);
+            releasePassed = releaseResult ==
+                vanguard::render::HardwareBufferImportResult::kSuccess;
+        }
+
+        if (releaseFenceFd >= 0) {
+            if (::close(releaseFenceFd) != 0) {
+                releaseStatus = "fence_close_failed";
+                releasePassed = false;
+            }
+            releaseFenceFd = -1;
+        }
+        backend.detachSurface();
+        backend.shutdown();
+        cleanupCompleted = true;
+    } catch (...) {
+        initializeStatus = "exception";
+        cleanupCompleted = false;
+    }
+
+    if (releaseFenceFd >= 0) {
+        ::close(releaseFenceFd);
+    }
+    ANativeWindow_release(nativeWindow);
+
+    const bool pass = renderPassed && releasePassed && cleanupCompleted;
+    return NewLoopSmokeStatus(
+        env,
+        pass,
+        initializeStatus,
+        attachStatus,
+        importStatus,
+        renderedFrames,
+        frameCount,
+        renderStatus,
+        failingFrame,
         releaseStatus,
         width,
         height);

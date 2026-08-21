@@ -105,6 +105,11 @@ public:
     // `index`, or 0 if not attached or index is out of range.
     uint64_t getFramebufferHandle(uint32_t index) const;
 
+    // Phase 2O2B4: Returns VkSemaphore as an opaque uint64_t handle for present
+    // synchronization for swapchain image at `index`, or 0 if not attached or
+    // index is out of range.
+    uint64_t getPresentReadySemaphoreHandle(uint32_t index) const;
+
     // --- Phase 2O1: WSI seam methods ---
     // Called by VulkanBackend::renderFrame (Phase 2O2).  Not called in this phase.
     //
