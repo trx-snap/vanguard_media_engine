@@ -16,6 +16,7 @@
 #include "vanguard/render/vulkan_backend.h"
 #include "vulkan_surface_swapchain.h"
 #include "vulkan_hardware_buffer_imports.h"
+#include "vulkan_shader_module.h"
 
 #if defined(__ANDROID__)
 
@@ -49,6 +50,9 @@ struct VulkanBackend::Impl {
     VkQueue          queue     = VK_NULL_HANDLE;
     uint32_t         queueFamilyIndex = UINT32_MAX;
     VkCommandPool    commandPool = VK_NULL_HANDLE; // Phase 2F
+
+    // Phase 2J: AOT-embedded core shader modules.
+    std::unique_ptr<VulkanCoreShaderModules> coreShaders;
 #endif
 
     // Phase 2B2: surface/swapchain lifecycle helper.
@@ -474,6 +478,27 @@ bool VulkanBackend::initialize() {
         s.ahbImports.reset();
     }
 
+    // --- 9. Initialize Phase 2J AOT core shader modules ---
+    s.coreShaders = std::make_unique<VulkanCoreShaderModules>();
+    if (!s.coreShaders->initialize(s.device)) {
+        VGLOG_VKB("VulkanCoreShaderModules initialization failed; aborting backend init");
+        s.coreShaders.reset();
+        if (s.ahbImports) {
+            s.ahbImports->shutdown();
+            s.ahbImports.reset();
+        }
+        vkDestroyCommandPool(s.device, s.commandPool, nullptr);
+        s.commandPool = VK_NULL_HANDLE;
+        vkDestroyDevice(s.device, nullptr);
+        s.device           = VK_NULL_HANDLE;
+        s.queue            = VK_NULL_HANDLE;
+        vkDestroyInstance(s.instance, nullptr);
+        s.instance         = VK_NULL_HANDLE;
+        s.physDev          = VK_NULL_HANDLE;
+        s.queueFamilyIndex = UINT32_MAX;
+        return false;
+    }
+
     s.initialized = true;
     return true;
 }
@@ -508,6 +533,12 @@ void VulkanBackend::shutdown() {
     if (s.ahbImports) {
         s.ahbImports->shutdown();
         s.ahbImports.reset();
+    }
+
+    // Phase 2J: Destroy AOT core shader modules before command pool/device.
+    if (s.coreShaders) {
+        s.coreShaders->shutdown(s.device);
+        s.coreShaders.reset();
     }
 
     // Phase 2F: Destroy persistent command pool before vkDestroyDevice.
