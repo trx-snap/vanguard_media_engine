@@ -27,6 +27,7 @@ add_library(vanguard_render_vulkan STATIC
     "render/vulkan/src/vulkan_hardware_buffer_imports.cpp"
     "render/vulkan/src/vulkan_hardware_buffer_image.cpp"
     "render/vulkan/src/vulkan_descriptor_resources.cpp"
+    "render/vulkan/src/vulkan_graphics_pipeline.cpp"
 )
 target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include"
     # Phase 2K: private Vulkan src dir exposed so vulkan_surface_swapchain.cpp
