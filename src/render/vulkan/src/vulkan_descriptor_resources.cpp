@@ -1,13 +1,15 @@
 // vulkan_descriptor_resources.cpp
-// Phase 2H: Vulkan descriptor resource creation/teardown for imported
-// AHardwareBuffer images.
+// Phase 2I: Vulkan descriptor resource and pipeline layout creation/teardown
+// for imported AHardwareBuffer images.
 //
 // Creates exactly:
 //   - VkDescriptorSetLayout  binding 0, COMBINED_IMAGE_SAMPLER, immutable sampler
+//   - VkPipelineLayout       one set layout, no push constants (Phase 2I)
 //   - VkDescriptorPool       one COMBINED_IMAGE_SAMPLER, maxSets 1
 //   - VkDescriptorSet        allocated from the pool, written with imageView
 //
-// No VkPipelineLayout; deferred to Phase 2I+ when the shader interface exists.
+// Deferred: shader modules, pipeline objects, command buffers, queue submit,
+// render pass / framebuffer / dynamic rendering, presentation.
 
 #include "vulkan_descriptor_resources.h"
 
@@ -67,7 +69,30 @@ HardwareBufferImportResult VulkanDescriptorResources::create(
     }
 
     // -------------------------------------------------------------------------
-    // 2. VkDescriptorPool
+    // 2. VkPipelineLayout (Phase 2I)
+    //    One descriptor set layout, no push constants.
+    //    Shaders, pipeline objects, command buffers, queue submit,
+    //    render pass / framebuffer / dynamic rendering remain deferred.
+    // -------------------------------------------------------------------------
+    VkPipelineLayoutCreateInfo plCI{};
+    plCI.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plCI.pNext                  = nullptr;
+    plCI.flags                  = 0;
+    plCI.setLayoutCount         = 1;
+    plCI.pSetLayouts            = &descriptorSetLayout;
+    plCI.pushConstantRangeCount = 0;
+    plCI.pPushConstantRanges    = nullptr;
+
+    vr = vkCreatePipelineLayout(device, &plCI, nullptr, &pipelineLayout);
+    if (vr != VK_SUCCESS) {
+        VGLOG_DESC("vkCreatePipelineLayout failed: %d",
+                   static_cast<int>(vr));
+        destroy(device);
+        return HardwareBufferImportResult::kVulkanFailure;
+    }
+
+    // -------------------------------------------------------------------------
+    // 3. VkDescriptorPool
     //    One COMBINED_IMAGE_SAMPLER descriptor, maxSets 1.
     //    No FREE_DESCRIPTOR_SET_BIT: the set is freed by destroying the pool.
     // -------------------------------------------------------------------------
@@ -92,7 +117,7 @@ HardwareBufferImportResult VulkanDescriptorResources::create(
     }
 
     // -------------------------------------------------------------------------
-    // 3. VkDescriptorSet allocation
+    // 4. VkDescriptorSet allocation
     // -------------------------------------------------------------------------
     VkDescriptorSetAllocateInfo allocInfo{};
     allocInfo.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -110,7 +135,7 @@ HardwareBufferImportResult VulkanDescriptorResources::create(
     }
 
     // -------------------------------------------------------------------------
-    // 4. VkWriteDescriptorSet
+    // 5. VkWriteDescriptorSet
     //    sampler = VK_NULL_HANDLE because the layout uses an immutable sampler.
     //    imageView = supplied imageView.
     //    imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL.
@@ -146,6 +171,13 @@ void VulkanDescriptorResources::destroy(VkDevice device)
     if (descriptorPool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(device, descriptorPool, nullptr);
         descriptorPool = VK_NULL_HANDLE;
+    }
+    // pipelineLayout must be destroyed before descriptorSetLayout because the
+    // layout was used to create it. Both are safe to destroy after the pool
+    // (which only references descriptorSetLayout indirectly via the set).
+    if (pipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+        pipelineLayout = VK_NULL_HANDLE;
     }
     if (descriptorSetLayout != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);

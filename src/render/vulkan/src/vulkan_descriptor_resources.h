@@ -1,14 +1,15 @@
 // vulkan_descriptor_resources.h
-// Phase 2H: Private helper - VulkanDescriptorResources.
+// Phase 2I: Private helper - VulkanDescriptorResources.
 //
-// Owns the descriptor-set resources required to bind a single
-// AHardwareBuffer-imported image for sampling in the fragment shader:
+// Owns the descriptor-set and pipeline-layout resources required to bind a
+// single AHardwareBuffer-imported image for sampling in the fragment shader:
 //   - VkDescriptorSetLayout  (binding 0, COMBINED_IMAGE_SAMPLER, immutable)
 //   - VkDescriptorPool       (one descriptor, maxSets 1)
 //   - VkDescriptorSet        (written with the imageView; freed with the pool)
+//   - VkPipelineLayout       (one set layout, no push constants; Phase 2I)
 //
-// VkPipelineLayout is deliberately excluded; it is deferred until the
-// shader/pipeline interface exists (Phase 2I+).
+// Deferred to later phases: shader modules, pipeline objects, command buffers,
+// queue submit, render pass / framebuffer / dynamic rendering, presentation.
 //
 // Confined to the private Vulkan render backend implementation.
 
@@ -31,6 +32,7 @@ struct VulkanDescriptorResources {
     VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
     VkDescriptorPool      descriptorPool      = VK_NULL_HANDLE;
     VkDescriptorSet       descriptorSet       = VK_NULL_HANDLE;
+    VkPipelineLayout      pipelineLayout      = VK_NULL_HANDLE;
 
     VulkanDescriptorResources() = default;
 
@@ -41,10 +43,12 @@ struct VulkanDescriptorResources {
     VulkanDescriptorResources(VulkanDescriptorResources&& other) noexcept
         : descriptorSetLayout(other.descriptorSetLayout),
           descriptorPool(other.descriptorPool),
-          descriptorSet(other.descriptorSet) {
+          descriptorSet(other.descriptorSet),
+          pipelineLayout(other.pipelineLayout) {
         other.descriptorSetLayout = VK_NULL_HANDLE;
         other.descriptorPool      = VK_NULL_HANDLE;
         other.descriptorSet       = VK_NULL_HANDLE;
+        other.pipelineLayout      = VK_NULL_HANDLE;
     }
 
     VulkanDescriptorResources& operator=(VulkanDescriptorResources&& other) noexcept {
@@ -52,16 +56,19 @@ struct VulkanDescriptorResources {
             descriptorSetLayout = other.descriptorSetLayout;
             descriptorPool      = other.descriptorPool;
             descriptorSet       = other.descriptorSet;
+            pipelineLayout      = other.pipelineLayout;
 
             other.descriptorSetLayout = VK_NULL_HANDLE;
             other.descriptorPool      = VK_NULL_HANDLE;
             other.descriptorSet       = VK_NULL_HANDLE;
+            other.pipelineLayout      = VK_NULL_HANDLE;
         }
         return *this;
     }
 
-    // Creates descriptorSetLayout, descriptorPool, and descriptorSet, then
-    // writes imageView into binding 0 using VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL.
+    // Creates descriptorSetLayout, descriptorPool, descriptorSet, and
+    // pipelineLayout (Phase 2I), then writes imageView into binding 0 using
+    // VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL.
     // The supplied immutableSampler is baked into the layout at binding 0;
     // consequently the VkWriteDescriptorSet uses sampler = VK_NULL_HANDLE.
     // On any failure all partially created resources are destroyed and
@@ -70,8 +77,9 @@ struct VulkanDescriptorResources {
                                       VkSampler immutableSampler,
                                       VkImageView imageView);
 
-    // Destroys descriptorPool (which implicitly frees descriptorSet) then
-    // destroys descriptorSetLayout. Sets all handles to VK_NULL_HANDLE.
+    // Destroys descriptorPool (which implicitly frees descriptorSet), then
+    // pipelineLayout, then descriptorSetLayout.
+    // Sets all handles to VK_NULL_HANDLE. Idempotent (null-handle guards).
     void destroy(VkDevice device);
 };
 

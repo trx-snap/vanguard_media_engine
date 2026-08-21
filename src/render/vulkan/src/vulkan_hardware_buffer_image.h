@@ -1,5 +1,5 @@
 // vulkan_hardware_buffer_image.h
-// Phase 2E/2G/2H: Private helper - VulkanHardwareBufferImage.
+// Phase 2E/2G/2H/2I: Private helper - VulkanHardwareBufferImage.
 //
 // Owns and encapsulates the creation and destruction of Vulkan sampling resources
 // for an imported AHardwareBuffer:
@@ -8,7 +8,7 @@
 //   - VkSamplerYcbcrConversion (for external format images)
 //   - VkImageView (2D or 2D_ARRAY; chained with YCbCr conversion if external)
 //   - VkSampler (chained with YCbCr conversion if external)
-//   - VulkanDescriptorResources (Phase 2H: set layout/pool/set for sampling)
+//   - VulkanDescriptorResources (Phase 2H/2I: set layout/pool/set/pipelineLayout)
 //
 // Confined to the private Vulkan render backend implementation.
 
@@ -49,9 +49,10 @@ struct VulkanHardwareBufferImage {
     uint64_t                 cachedExternalFormat = 0;
     uint32_t                 cachedLayerCount     = 1; // Phase 2F
 
-    // Phase 2H: Descriptor-set resources for sampling this image in the
-    // fragment shader. Lives alongside sampler/imageView because all three
-    // are per-import/per-conversion resources in the current architecture.
+    // Phase 2H/2I: Descriptor-set and pipeline-layout resources for sampling
+    // this image in the fragment shader. Lives alongside sampler/imageView
+    // because all three are per-import/per-conversion resources in the current
+    // architecture.
     VulkanDescriptorResources descriptorResources;
 
     VulkanHardwareBufferImage() = default;
