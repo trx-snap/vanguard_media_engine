@@ -21,6 +21,7 @@ target_link_libraries(vanguard_render_shared PRIVATE vanguard_core)
 
 add_library(vanguard_render_vulkan STATIC
     "render/vulkan/src/vulkan_backend.cpp"
+    "render/vulkan/src/vulkan_frame_renderer.cpp"
     "render/vulkan/src/vulkan_shader_module.cpp"
     "render/vulkan/src/vulkan_surface_swapchain.cpp"
     "render/vulkan/src/vulkan_swapchain_render_targets.cpp"

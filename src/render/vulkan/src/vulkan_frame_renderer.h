@@ -1,0 +1,72 @@
+// vulkan_frame_renderer.h
+// Phase 2O2B1: Modular Frame Renderer Extraction.
+//
+// VulkanFrameRenderer is a private helper class encapsulating frame rendering
+// orchestration, per-frame synchronization, graphics pipeline lifecycle, and
+// cached pipeline layout/render pass metadata behind a PImpl.
+//
+// All Vulkan and Android headers are strictly confined to the .cpp translation unit.
+// This header includes only <cstdint>, <memory>, and shared render types.
+
+#pragma once
+
+#include "vanguard/render/hardware_buffer_import.h"
+#include "vanguard/render/render_backend.h"
+
+#include <cstdint>
+#include <memory>
+
+namespace vanguard {
+namespace render {
+
+class VulkanSurfaceSwapchain;
+class VulkanHardwareBufferImports;
+struct VulkanCoreShaderModules;
+
+class VulkanFrameRenderer {
+public:
+    static constexpr uint32_t kDefaultFramesInFlight = 2;
+
+    VulkanFrameRenderer();
+    ~VulkanFrameRenderer();
+
+    // Non-copyable, non-movable.
+    VulkanFrameRenderer(const VulkanFrameRenderer&) = delete;
+    VulkanFrameRenderer& operator=(const VulkanFrameRenderer&) = delete;
+    VulkanFrameRenderer(VulkanFrameRenderer&&) = delete;
+    VulkanFrameRenderer& operator=(VulkanFrameRenderer&&) = delete;
+
+    // Initializes frame synchronization and renderer state with borrowed device and command pool.
+    // deviceHandle is cast from VkDevice (dispatchable); commandPoolHandle is encoded from VkCommandPool via memcpy.
+    bool initialize(void* deviceHandle,
+                    uint64_t commandPoolHandle,
+                    uint32_t frameCount = kDefaultFramesInFlight);
+
+    // Tears down graphics pipeline and frame synchronization resources. Idempotent.
+    void shutdown();
+
+    // Returns true if renderer is initialized.
+    bool isInitialized() const;
+
+    // Invalidates and destroys cached graphics pipeline and compatibility metadata.
+    void invalidatePipeline();
+
+    // Waits for device/GPU execution across all frames to complete.
+    void waitAllFramesIdle();
+
+    // Frame rendering entry point. Validates preconditions and returns explicit result.
+    // In Phase 2O2B1, returns kUnavailable after validation without executing GPU commands.
+    RenderFrameResult renderFrame(
+        void* queueHandle,
+        VulkanSurfaceSwapchain& swapchain,
+        VulkanHardwareBufferImports& ahbImports,
+        VulkanCoreShaderModules& coreShaders,
+        HardwareBufferHandle handle);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+} // namespace render
+} // namespace vanguard

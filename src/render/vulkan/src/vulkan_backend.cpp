@@ -1,4 +1,4 @@
-// Phase 2O2A: VulkanBackend implementation.
+// Phase 2O2B1: VulkanBackend implementation.
 //
 // On Android (__ANDROID__):
 //   - Vulkan headers included here, never in the public header.
@@ -6,9 +6,8 @@
 //     physical device selection, queue family, VkDevice, vkGetDeviceQueue.
 //   - Phase 2B2: delegates surface/swapchain lifecycle to VulkanSurfaceSwapchain.
 //   - Phase 2C: delegates AHardwareBuffer import to VulkanHardwareBufferImports.
-//   - Phase 2N/2O2A: frame synchronization helper (VulkanFrameSynchronization).
-//   - Phase 2L/2O2A: graphics pipeline runtime scaffolding (VulkanGraphicsPipeline).
-//   - Phase 2O2A: frame runtime state scaffolding and renderFrame validation.
+//   - Phase 2O2B1: modular frame renderer helper (VulkanFrameRenderer).
+//   - Phase 2O2B1: frame runtime state scaffolding and renderFrame validation.
 //
 // On non-Android host builds:
 //   - No Vulkan headers included.
@@ -21,8 +20,7 @@
 #include "vulkan_surface_swapchain.h"
 #include "vulkan_hardware_buffer_imports.h"
 #include "vulkan_shader_module.h"
-#include "vulkan_graphics_pipeline.h"
-#include "vulkan_frame_synchronization.h"
+#include "vulkan_frame_renderer.h"
 
 #if defined(__ANDROID__)
 
@@ -59,25 +57,10 @@ struct VulkanBackend::Impl {
 
     // Phase 2J: AOT-embedded core shader modules.
     std::unique_ptr<VulkanCoreShaderModules> coreShaders;
-
-    // Phase 2N/2O2A: Frame synchronization and primary command buffers.
-    std::unique_ptr<VulkanFrameSynchronization> frameSync;
-
-    // Phase 2L/2O2A: Graphics pipeline and cached pipeline state.
-    std::unique_ptr<VulkanGraphicsPipeline> graphicsPipeline;
-    VkPipelineLayout activePipelineLayout = VK_NULL_HANDLE;
-    uint64_t activeRenderPassHandle = 0;
-    uint32_t currentFrameIndex = 0;
-
-    void invalidatePipeline() {
-        if (graphicsPipeline) {
-            graphicsPipeline->destroy(device);
-            graphicsPipeline.reset();
-        }
-        activePipelineLayout = VK_NULL_HANDLE;
-        activeRenderPassHandle = 0;
-    }
 #endif
+
+    // Phase 2O2B1: modular frame renderer helper.
+    std::unique_ptr<VulkanFrameRenderer> frameRenderer;
 
     // Phase 2B2: surface/swapchain lifecycle helper.
     std::unique_ptr<VulkanSurfaceSwapchain> surfaceSwapchain;
@@ -169,9 +152,9 @@ bool VulkanBackend::hasHardwareBuffer(HardwareBufferHandle /*handle*/) const {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2O1: renderFrame stub - host build.
-// Phase 2O2 will wire acquire-semaphore wait + command recording + queue
-// submit + swapchain present.  Do NOT add any of those here.
+// Phase 2O2B1: renderFrame stub - host build.
+// Phase 2O2B2 will wire acquire-semaphore wait + command recording + queue
+// submit + swapchain present. Do NOT add any of those here.
 // ---------------------------------------------------------------------------
 
 RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle /*handle*/) {
@@ -270,7 +253,7 @@ bool CheckDeviceExtensions(VkPhysicalDevice physDev) {
 
 // Returns true iff the device reports samplerYcbcrConversion == VK_TRUE via
 // the VkPhysicalDeviceFeatures2 / VkPhysicalDeviceSamplerYcbcrConversionFeatures
-// pNext chain.  Requires Vulkan 1.1 (feature query via pNext is core 1.1).
+// pNext chain. Requires Vulkan 1.1 (feature query via pNext is core 1.1).
 bool CheckYcbcrConversionFeature(VkPhysicalDevice physDev) {
     VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr{};
     ycbcr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
@@ -290,7 +273,7 @@ bool CheckYcbcrConversionFeature(VkPhysicalDevice physDev) {
 }
 
 // Returns the index of the first queue family supporting both GRAPHICS and
-// COMPUTE bits, or UINT32_MAX if none qualifies.  Transfer is implicit for
+// COMPUTE bits, or UINT32_MAX if none qualifies. Transfer is implicit for
 // either graphics or compute queues; a separate transfer bit is not required.
 uint32_t FindQueueFamily(VkPhysicalDevice physDev) {
     uint32_t count = 0;
@@ -305,6 +288,19 @@ uint32_t FindQueueFamily(VkPhysicalDevice physDev) {
         }
     }
     return UINT32_MAX;
+}
+
+// Portable helper: convert any Vulkan non-dispatchable handle to uint64_t
+// without truncation or undefined behaviour.
+// Safe on 32-bit (uint64_t handle) and 64-bit (pointer handle) Android ABIs.
+template <typename VkHandle>
+static inline uint64_t vkHandleToU64(VkHandle h) {
+    static_assert(sizeof(VkHandle) <= sizeof(uint64_t),
+                  "VkHandle too large for uint64_t");
+    uint64_t v = 0;
+    // NOLINTNEXTLINE(bugprone-undefined-memory-manipulation)
+    std::memcpy(&v, &h, sizeof(VkHandle));
+    return v;
 }
 
 } // anonymous namespace
@@ -345,7 +341,6 @@ bool VulkanBackend::initialize() {
     VkResult result = vkCreateInstance(&instanceCI, nullptr, &s.instance);
     if (result != VK_SUCCESS) {
         VGLOG_VKB("vkCreateInstance failed: %d", static_cast<int>(result));
-        // Nothing to destroy yet.
         return false;
     }
 
@@ -438,10 +433,6 @@ bool VulkanBackend::initialize() {
     s.queueFamilyIndex = chosenQueueFamily;
 
     // --- 5. Create VkDevice ---
-    //   - One queue at priority 1.0
-    //   - Required device extensions enabled
-    //   - samplerYcbcrConversion enabled via pNext feature chain
-
     float queuePriority = 1.0f;
     VkDeviceQueueCreateInfo queueCI{};
     queueCI.sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -466,7 +457,6 @@ bool VulkanBackend::initialize() {
     result = vkCreateDevice(s.physDev, &deviceCI, nullptr, &s.device);
     if (result != VK_SUCCESS) {
         VGLOG_VKB("vkCreateDevice failed: %d", static_cast<int>(result));
-        // physDev is not owned (not created); destroy instance only.
         vkDestroyInstance(s.instance, nullptr);
         s.instance         = VK_NULL_HANDLE;
         s.physDev          = VK_NULL_HANDLE;
@@ -475,13 +465,10 @@ bool VulkanBackend::initialize() {
     }
 
     // --- 6. Retrieve the queue ---
-    // VkQueue must NOT be destroyed separately (destroyed with the device).
     vkGetDeviceQueue(s.device, s.queueFamilyIndex, /*queueIndex=*/0, &s.queue);
 
     VGLOG_VKB("VulkanBackend initialized: device=%p queue=%p queueFamily=%u",
-              static_cast<void*>(s.device),
-              static_cast<void*>(s.queue),
-              s.queueFamilyIndex);
+              static_cast<void*>(s.device), static_cast<void*>(s.queue), s.queueFamilyIndex);
 
     // --- 7. Create persistent command pool (Phase 2F) ---
     VkCommandPoolCreateInfo poolCI{};
@@ -493,22 +480,19 @@ bool VulkanBackend::initialize() {
     if (result != VK_SUCCESS) {
         VGLOG_VKB("vkCreateCommandPool failed: %d", static_cast<int>(result));
         vkDestroyDevice(s.device, nullptr);
-        s.device           = VK_NULL_HANDLE;
-        s.queue            = VK_NULL_HANDLE;
+        s.device = VK_NULL_HANDLE;
+        s.queue = VK_NULL_HANDLE;
         vkDestroyInstance(s.instance, nullptr);
-        s.instance         = VK_NULL_HANDLE;
-        s.physDev          = VK_NULL_HANDLE;
+        s.instance = VK_NULL_HANDLE;
+        s.physDev = VK_NULL_HANDLE;
         s.queueFamilyIndex = UINT32_MAX;
         return false;
     }
 
     // --- 8. Initialize Phase 2C AHardwareBuffer import helper ---
     s.ahbImports = std::make_unique<VulkanHardwareBufferImports>();
-    if (!s.ahbImports->initialize(static_cast<void*>(s.device),
-                                   static_cast<void*>(s.physDev))) {
-        // Non-fatal: backend still functional; AHB import returns kUnavailable.
-        VGLOG_VKB("VulkanHardwareBufferImports initialization failed; "
-                  "importHardwareBuffer will return kUnavailable");
+    if (!s.ahbImports->initialize(static_cast<void*>(s.device), static_cast<void*>(s.physDev))) {
+        VGLOG_VKB("VulkanHardwareBufferImports initialization failed; importHardwareBuffer will return kUnavailable");
         s.ahbImports.reset();
     }
 
@@ -524,21 +508,24 @@ bool VulkanBackend::initialize() {
         vkDestroyCommandPool(s.device, s.commandPool, nullptr);
         s.commandPool = VK_NULL_HANDLE;
         vkDestroyDevice(s.device, nullptr);
-        s.device           = VK_NULL_HANDLE;
-        s.queue            = VK_NULL_HANDLE;
+        s.device = VK_NULL_HANDLE;
+        s.queue = VK_NULL_HANDLE;
         vkDestroyInstance(s.instance, nullptr);
-        s.instance         = VK_NULL_HANDLE;
-        s.physDev          = VK_NULL_HANDLE;
+        s.instance = VK_NULL_HANDLE;
+        s.physDev = VK_NULL_HANDLE;
         s.queueFamilyIndex = UINT32_MAX;
         return false;
     }
 
-    // --- 10. Initialize Phase 2N/2O2A frame synchronization helper ---
-    s.frameSync = std::make_unique<VulkanFrameSynchronization>();
-    if (!s.frameSync->initialize(s.device, s.commandPool,
-                                 VulkanFrameSynchronization::kDefaultFramesInFlight)) {
-        VGLOG_VKB("VulkanFrameSynchronization initialization failed; aborting backend init");
-        s.frameSync.reset();
+    // --- 10. Initialize Phase 2O2B1 modular frame renderer helper ---
+    s.frameRenderer = std::make_unique<VulkanFrameRenderer>();
+    const uint64_t cmdPoolHandle = vkHandleToU64(s.commandPool);
+
+    if (!s.frameRenderer->initialize(static_cast<void*>(s.device),
+                                     cmdPoolHandle,
+                                     VulkanFrameRenderer::kDefaultFramesInFlight)) {
+        VGLOG_VKB("VulkanFrameRenderer initialization failed; aborting backend init");
+        s.frameRenderer.reset();
         if (s.coreShaders) {
             s.coreShaders->shutdown(s.device);
             s.coreShaders.reset();
@@ -550,16 +537,15 @@ bool VulkanBackend::initialize() {
         vkDestroyCommandPool(s.device, s.commandPool, nullptr);
         s.commandPool = VK_NULL_HANDLE;
         vkDestroyDevice(s.device, nullptr);
-        s.device           = VK_NULL_HANDLE;
-        s.queue            = VK_NULL_HANDLE;
+        s.device = VK_NULL_HANDLE;
+        s.queue = VK_NULL_HANDLE;
         vkDestroyInstance(s.instance, nullptr);
-        s.instance         = VK_NULL_HANDLE;
-        s.physDev          = VK_NULL_HANDLE;
+        s.instance = VK_NULL_HANDLE;
+        s.physDev = VK_NULL_HANDLE;
         s.queueFamilyIndex = UINT32_MAX;
         return false;
     }
 
-    s.currentFrameIndex = 0;
     s.initialized = true;
     return true;
 }
@@ -569,7 +555,7 @@ bool VulkanBackend::initialize() {
 // ---------------------------------------------------------------------------
 
 void VulkanBackend::shutdown() {
-    if (!impl_) return; // safety: called after move (shouldn't happen, but guard)
+    if (!impl_) return;
 
     Impl& s = *impl_;
 
@@ -577,32 +563,30 @@ void VulkanBackend::shutdown() {
         return; // already clean
     }
 
-    // Wait for device idle before tearing down any GPU resources (surface,
-    // imported AHardwareBuffer VkImage/VkDeviceMemory).  Must be first so
-    // nothing is freed while the GPU may still be referencing it.
+    // Wait for device idle before tearing down any GPU resources.
     if (s.device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(s.device);
     }
 
-    // Phase 2O2A: Invalidate and destroy pipeline if present.
-    s.invalidatePipeline();
+    // Phase 2O2B1: Invalidate and destroy pipeline if present via frameRenderer.
+    if (s.frameRenderer) {
+        s.frameRenderer->invalidatePipeline();
+    }
 
     if (s.surfaceSwapchain) {
         s.surfaceSwapchain->detach();
     }
 
     // Phase 2C: Release all AHardwareBuffer imports before destroying device.
-    // ahbImports->shutdown() destroys acquire semaphores, sampling resources,
-    // VkImage, VkDeviceMemory, and releases AHB refs.  Must run before vkDestroyDevice.
     if (s.ahbImports) {
         s.ahbImports->shutdown();
         s.ahbImports.reset();
     }
 
-    // Phase 2N/2O2A: Shutdown and destroy frame synchronization resources before command pool / device.
-    if (s.frameSync) {
-        s.frameSync->shutdown(s.device, s.commandPool);
-        s.frameSync.reset();
+    // Phase 2O2B1: Shutdown and destroy frame renderer resources before command pool / device.
+    if (s.frameRenderer) {
+        s.frameRenderer->shutdown();
+        s.frameRenderer.reset();
     }
 
     // Phase 2J: Destroy AOT core shader modules before command pool/device.
@@ -617,15 +601,14 @@ void VulkanBackend::shutdown() {
         s.commandPool = VK_NULL_HANDLE;
     }
 
-    // Reverse-order: device -> instance.
-    // VkQueue must NOT be destroyed separately.
+    // Reverse-order: device -> instance. VkQueue is destroyed with device.
     if (s.device != VK_NULL_HANDLE) {
         vkDestroyDevice(s.device, nullptr);
         s.device = VK_NULL_HANDLE;
     }
 
-    s.queue            = VK_NULL_HANDLE; // owned by device, already gone
-    s.physDev          = VK_NULL_HANDLE; // not owned
+    s.queue            = VK_NULL_HANDLE;
+    s.physDev          = VK_NULL_HANDLE;
     s.queueFamilyIndex = UINT32_MAX;
 
     if (s.instance != VK_NULL_HANDLE) {
@@ -633,9 +616,7 @@ void VulkanBackend::shutdown() {
         s.instance = VK_NULL_HANDLE;
     }
 
-    s.currentFrameIndex = 0;
     s.initialized = false;
-
     VGLOG_VKB("VulkanBackend shut down");
 }
 
@@ -673,13 +654,13 @@ bool VulkanBackend::attachSurface(void* nativeWindow,
 bool VulkanBackend::resizeSurface(uint32_t width, uint32_t height) {
     if (!impl_) return false;
     Impl& s = *impl_;
-    if (!s.initialized ||
-        s.device == VK_NULL_HANDLE ||
-        !s.surfaceSwapchain) {
+    if (!s.initialized || s.device == VK_NULL_HANDLE || !s.surfaceSwapchain) {
         return false;
     }
 
-    s.invalidatePipeline();
+    if (s.frameRenderer) {
+        s.frameRenderer->invalidatePipeline();
+    }
     return s.surfaceSwapchain->resize(width, height);
 }
 
@@ -689,7 +670,9 @@ void VulkanBackend::detachSurface() {
     if (s.device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(s.device);
     }
-    s.invalidatePipeline();
+    if (s.frameRenderer) {
+        s.frameRenderer->invalidatePipeline();
+    }
     if (s.surfaceSwapchain) {
         s.surfaceSwapchain->detach();
     }
@@ -709,27 +692,20 @@ HardwareBufferImportResult VulkanBackend::importHardwareBuffer(
     HardwareBufferHandle* outHandle,
     HardwareBufferDescriptor* outDescriptor)
 {
-    if (!impl_) {
+    if (!impl_ || !impl_->initialized) {
         if (acquireFenceFd >= 0) ::close(acquireFenceFd);
         if (outHandle)     *outHandle     = kInvalidHardwareBufferHandle;
         if (outDescriptor) *outDescriptor = HardwareBufferDescriptor{};
         return HardwareBufferImportResult::kBackendNotInitialized;
     }
-    Impl& s = *impl_;
-    if (!s.initialized) {
-        if (acquireFenceFd >= 0) ::close(acquireFenceFd);
-        if (outHandle)     *outHandle     = kInvalidHardwareBufferHandle;
-        if (outDescriptor) *outDescriptor = HardwareBufferDescriptor{};
-        return HardwareBufferImportResult::kBackendNotInitialized;
-    }
-    if (!s.ahbImports) {
+    if (!impl_->ahbImports) {
         if (acquireFenceFd >= 0) ::close(acquireFenceFd);
         if (outHandle)     *outHandle     = kInvalidHardwareBufferHandle;
         if (outDescriptor) *outDescriptor = HardwareBufferDescriptor{};
         return HardwareBufferImportResult::kUnavailable;
     }
-    return s.ahbImports->importBuffer(hardwareBuffer, acquireFenceFd,
-                                      outHandle, outDescriptor);
+    return impl_->ahbImports->importBuffer(hardwareBuffer, acquireFenceFd,
+                                          outHandle, outDescriptor);
 }
 
 HardwareBufferImportResult VulkanBackend::releaseHardwareBuffer(
@@ -741,9 +717,11 @@ HardwareBufferImportResult VulkanBackend::releaseHardwareBuffer(
         return HardwareBufferImportResult::kUnavailable;
     }
     Impl& s = *impl_;
-    const VulkanHardwareBufferImage* img = s.ahbImports->getImage(handle);
-    if (img && img->descriptorResources.pipelineLayout == s.activePipelineLayout) {
-        s.invalidatePipeline();
+    if (s.device != VK_NULL_HANDLE) {
+        vkDeviceWaitIdle(s.device);
+    }
+    if (s.frameRenderer) {
+        s.frameRenderer->invalidatePipeline();
     }
     return s.ahbImports->releaseBuffer(handle, outReleaseFenceFd);
 }
@@ -754,11 +732,11 @@ bool VulkanBackend::hasHardwareBuffer(HardwareBufferHandle handle) const {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2O2A: renderFrame - Android.
+// Phase 2O2B1: renderFrame - Android.
 // Backend frame runtime state scaffolding and argument validation.
-// Execution is deferred to Phase 2O2B.
+// Execution is deferred to Phase 2O2B2.
 //
-// Strictly forbidden in Phase 2O2A:
+// Strictly forbidden in Phase 2O2B1:
 //   - vkAcquireNextImageKHR / VulkanSurfaceSwapchain::acquireNextImage
 //   - vkQueuePresentKHR / VulkanSurfaceSwapchain::presentImage
 //   - vkQueueSubmit
@@ -780,7 +758,15 @@ RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle handle) {
     if (!s.ahbImports || !hasHardwareBuffer(handle) || s.ahbImports->getImage(handle) == nullptr) {
         return RenderFrameResult::kInvalidBufferHandle;
     }
-    return RenderFrameResult::kUnavailable;
+    if (!s.frameRenderer || !s.coreShaders) {
+        return RenderFrameResult::kUnavailable;
+    }
+    return s.frameRenderer->renderFrame(
+        static_cast<void*>(s.queue),
+        *s.surfaceSwapchain,
+        *s.ahbImports,
+        *s.coreShaders,
+        handle);
 }
 
 #endif // __ANDROID__
