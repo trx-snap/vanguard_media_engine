@@ -1,5 +1,5 @@
 // vulkan_hardware_buffer_imports.h
-// Phase 2E/2G: Private helper - VulkanHardwareBufferImports.
+// Phase 2E/2G/2O1: Private helper - VulkanHardwareBufferImports.
 //
 // Owns the AHardwareBuffer->Vulkan import table including sampling resources
 // (VkSamplerYcbcrConversion, VkImageView, VkSampler) and Phase 2G acquire-fence
@@ -19,6 +19,7 @@
 
 #pragma once
 #include "vanguard/render/hardware_buffer_import.h"
+#include "vulkan_hardware_buffer_image.h"
 #include <cstdint>
 #include <memory>
 
@@ -70,6 +71,32 @@ public:
 
     // Returns true iff handle is an active import.
     bool hasBuffer(HardwareBufferHandle handle) const;
+
+    // ---------------------------------------------------------------------------
+    // Phase 2O1: Acquire-semaphore pending-state accessors.
+    //
+    // These are read-only inspection seams for the renderFrame path (Phase 2O2).
+    // The semaphore ownership remains with the ImportRecord at all times;
+    // only the pending flag is toggled.
+    // ---------------------------------------------------------------------------
+
+    // Returns a pointer to the immutable VulkanHardwareBufferImage for handle,
+    // or nullptr if handle is not an active import.
+    const VulkanHardwareBufferImage* getImage(HardwareBufferHandle handle) const;
+
+    // Returns the VkSemaphore handle (as uint64_t via memcpy) for handle's
+    // acquire semaphore if it is pending (acquireSemaphorePending == true),
+    // otherwise returns 0.
+    // Returning 0 means: no semaphore to wait on (either none was imported, or
+    // it has already been submitted).
+    uint64_t getPendingAcquireSemaphoreHandle(HardwareBufferHandle handle) const;
+
+    // Marks the acquire semaphore for handle as submitted (sets
+    // acquireSemaphorePending = false).
+    // Must be called ONLY after vkQueueSubmit returns VK_SUCCESS.
+    // Returns false if handle is not active or if the semaphore was not pending.
+    // Does NOT take or null out the semaphore handle; destroy() still owns it.
+    bool markAcquireSemaphoreSubmitted(HardwareBufferHandle handle);
 
 private:
     struct Impl;

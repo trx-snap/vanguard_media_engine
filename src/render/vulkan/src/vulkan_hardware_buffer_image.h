@@ -1,5 +1,5 @@
 // vulkan_hardware_buffer_image.h
-// Phase 2E/2G/2H/2I: Private helper - VulkanHardwareBufferImage.
+// Phase 2E/2G/2H/2I/2O1: Private helper - VulkanHardwareBufferImage.
 //
 // Owns and encapsulates the creation and destruction of Vulkan sampling resources
 // for an imported AHardwareBuffer:
@@ -44,6 +44,14 @@ struct VulkanHardwareBufferImage {
     // transition and sampling draw.  vkDestroySemaphore is called in destroy().
     VkSemaphore              acquireSemaphore = VK_NULL_HANDLE;
 
+    // Phase 2O1: true when acquireSemaphore is non-null AND has not yet been
+    // submitted as a wait semaphore in a vkQueueSubmit call.
+    // Phase 2O2 sets this to false (via markAcquireSemaphoreSubmitted) ONLY
+    // after vkQueueSubmit returns VK_SUCCESS.  If submit fails the flag remains
+    // true so the semaphore can be re-presented as a wait on retry.
+    // destroy() destroys the semaphore handle regardless of this flag.
+    bool                     acquireSemaphorePending = false;
+
     // Cached format state.
     VkFormat                 cachedFormat         = VK_FORMAT_UNDEFINED;
     uint64_t                 cachedExternalFormat = 0;
@@ -68,6 +76,7 @@ struct VulkanHardwareBufferImage {
           imageView(other.imageView),
           sampler(other.sampler),
           acquireSemaphore(other.acquireSemaphore),
+          acquireSemaphorePending(other.acquireSemaphorePending),
           cachedFormat(other.cachedFormat),
           cachedExternalFormat(other.cachedExternalFormat),
           cachedLayerCount(other.cachedLayerCount),
@@ -78,6 +87,7 @@ struct VulkanHardwareBufferImage {
         other.imageView = VK_NULL_HANDLE;
         other.sampler = VK_NULL_HANDLE;
         other.acquireSemaphore = VK_NULL_HANDLE;
+        other.acquireSemaphorePending = false;
         other.cachedFormat = VK_FORMAT_UNDEFINED;
         other.cachedExternalFormat = 0;
         other.cachedLayerCount = 1;
@@ -91,6 +101,7 @@ struct VulkanHardwareBufferImage {
             imageView = other.imageView;
             sampler = other.sampler;
             acquireSemaphore = other.acquireSemaphore;
+            acquireSemaphorePending = other.acquireSemaphorePending;
             cachedFormat = other.cachedFormat;
             cachedExternalFormat = other.cachedExternalFormat;
             cachedLayerCount = other.cachedLayerCount;
@@ -102,6 +113,7 @@ struct VulkanHardwareBufferImage {
             other.imageView = VK_NULL_HANDLE;
             other.sampler = VK_NULL_HANDLE;
             other.acquireSemaphore = VK_NULL_HANDLE;
+            other.acquireSemaphorePending = false;
             other.cachedFormat = VK_FORMAT_UNDEFINED;
             other.cachedExternalFormat = 0;
             other.cachedLayerCount = 1;
@@ -173,6 +185,7 @@ namespace render {
 
 // Minimal dummy struct for host builds.
 struct VulkanHardwareBufferImage {
+    bool acquireSemaphorePending = false; // Phase 2O1: always false on host.
     bool isExternalFormat() const { return false; }
     bool hasYcbcrConversion() const { return false; }
 };

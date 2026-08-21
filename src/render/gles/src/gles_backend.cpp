@@ -74,5 +74,13 @@ bool GlesBackend::hasHardwareBuffer(HardwareBufferHandle /*handle*/) const {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2O1: renderFrame stub - GLES backend.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle /*handle*/) {
+    return RenderFrameResult::kUnavailable;
+}
+
 } // namespace render
 } // namespace vanguard

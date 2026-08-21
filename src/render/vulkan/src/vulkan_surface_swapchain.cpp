@@ -112,6 +112,26 @@ uint32_t VulkanSurfaceSwapchain::getImageCount() const             { return 0; }
 uint64_t VulkanSurfaceSwapchain::getImageViewHandle(uint32_t) const   { return 0; }
 uint64_t VulkanSurfaceSwapchain::getFramebufferHandle(uint32_t) const { return 0; }
 
+// Phase 2O1: host stubs - WSI seam methods. No Vulkan runtime on host.
+SwapchainResult VulkanSurfaceSwapchain::acquireNextImage(
+        uint64_t /*semaphoreHandle*/,
+        uint64_t /*fenceHandle*/,
+        uint32_t* outImageIndex,
+        uint64_t /*timeoutNs*/) {
+    if (outImageIndex) *outImageIndex = 0;
+    return SwapchainResult::kError;
+}
+
+SwapchainResult VulkanSurfaceSwapchain::presentImage(
+        void* /*queueHandle*/,
+        uint64_t /*waitSemaphoreHandle*/,
+        uint32_t /*imageIndex*/) {
+    return SwapchainResult::kError;
+}
+
+uint32_t VulkanSurfaceSwapchain::getExtentWidth() const  { return 0; }
+uint32_t VulkanSurfaceSwapchain::getExtentHeight() const { return 0; }
+
 #else // __ANDROID__
 
 // ---------------------------------------------------------------------------
@@ -747,6 +767,112 @@ uint64_t VulkanSurfaceSwapchain::getImageViewHandle(uint32_t index) const {
 uint64_t VulkanSurfaceSwapchain::getFramebufferHandle(uint32_t index) const {
     if (!impl_->attached || !impl_->renderTargets) return 0;
     return impl_->renderTargets->getFramebufferHandle(index);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2O1: WSI seam methods - Android.
+//
+// These methods are NOT called from any code path in this phase.
+// Phase 2O2 will call them from VulkanBackend::renderFrame.
+//
+// VkResult -> SwapchainResult mapping is exact per Khronos spec:
+//   VK_SUCCESS                -> kSuccess
+//   VK_SUBOPTIMAL_KHR         -> kSuboptimal
+//   VK_ERROR_OUT_OF_DATE_KHR  -> kOutOfDate
+//   VK_ERROR_SURFACE_LOST_KHR -> kSurfaceLost
+//   VK_ERROR_DEVICE_LOST      -> kDeviceLost
+//   anything else             -> kError
+// ---------------------------------------------------------------------------
+
+namespace {
+
+static SwapchainResult VkResultToSwapchainResult(VkResult res) {
+    switch (res) {
+        case VK_SUCCESS:                   return SwapchainResult::kSuccess;
+        case VK_SUBOPTIMAL_KHR:            return SwapchainResult::kSuboptimal;
+        case VK_ERROR_OUT_OF_DATE_KHR:     return SwapchainResult::kOutOfDate;
+        case VK_ERROR_SURFACE_LOST_KHR:    return SwapchainResult::kSurfaceLost;
+        case VK_ERROR_DEVICE_LOST:         return SwapchainResult::kDeviceLost;
+        default:                           return SwapchainResult::kError;
+    }
+}
+
+// Portable helper: reconstruct a Vulkan non-dispatchable handle from a uint64_t
+// value produced by vkHandleToU64 (same memcpy trick, inverse direction).
+template <typename VkHandle>
+static inline VkHandle u64ToVkHandle(uint64_t v) {
+    static_assert(sizeof(VkHandle) <= sizeof(uint64_t),
+                  "VkHandle too large for uint64_t");
+    VkHandle h{};
+    // NOLINTNEXTLINE(bugprone-undefined-memory-manipulation)
+    memcpy(&h, &v, sizeof(VkHandle));
+    return h;
+}
+
+} // anonymous namespace (Phase 2O1 WSI helpers)
+
+SwapchainResult VulkanSurfaceSwapchain::acquireNextImage(
+        uint64_t semaphoreHandle,
+        uint64_t fenceHandle,
+        uint32_t* outImageIndex,
+        uint64_t timeoutNs) {
+    if (!impl_->attached || impl_->swapchain == VK_NULL_HANDLE) {
+        if (outImageIndex) *outImageIndex = 0;
+        return SwapchainResult::kError;
+    }
+    if (!outImageIndex) {
+        return SwapchainResult::kError;
+    }
+
+    VkSemaphore sem   = u64ToVkHandle<VkSemaphore>(semaphoreHandle);
+    VkFence     fence = u64ToVkHandle<VkFence>(fenceHandle);
+
+    uint32_t imageIndex = 0;
+    VkResult res = vkAcquireNextImageKHR(
+            impl_->device,
+            impl_->swapchain,
+            timeoutNs,
+            sem,
+            fence,
+            &imageIndex);
+
+    *outImageIndex = imageIndex;
+    return VkResultToSwapchainResult(res);
+}
+
+SwapchainResult VulkanSurfaceSwapchain::presentImage(
+        void* queueHandle,
+        uint64_t waitSemaphoreHandle,
+        uint32_t imageIndex) {
+    if (!impl_->attached || impl_->swapchain == VK_NULL_HANDLE) {
+        return SwapchainResult::kError;
+    }
+    if (!queueHandle) {
+        return SwapchainResult::kError;
+    }
+
+    auto* queue       = static_cast<VkQueue>(queueHandle);
+    VkSemaphore waitSem = u64ToVkHandle<VkSemaphore>(waitSemaphoreHandle);
+
+    VkPresentInfoKHR presentInfo{};
+    presentInfo.sType              = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+    presentInfo.waitSemaphoreCount = (waitSem != VK_NULL_HANDLE) ? 1u : 0u;
+    presentInfo.pWaitSemaphores    = (waitSem != VK_NULL_HANDLE) ? &waitSem : nullptr;
+    presentInfo.swapchainCount     = 1;
+    presentInfo.pSwapchains        = &impl_->swapchain;
+    presentInfo.pImageIndices      = &imageIndex;
+    presentInfo.pResults           = nullptr;
+
+    VkResult res = vkQueuePresentKHR(queue, &presentInfo);
+    return VkResultToSwapchainResult(res);
+}
+
+uint32_t VulkanSurfaceSwapchain::getExtentWidth() const {
+    return impl_->attached ? impl_->extent.width : 0u;
+}
+
+uint32_t VulkanSurfaceSwapchain::getExtentHeight() const {
+    return impl_->attached ? impl_->extent.height : 0u;
 }
 
 #endif // __ANDROID__

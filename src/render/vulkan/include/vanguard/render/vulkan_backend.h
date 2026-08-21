@@ -1,6 +1,7 @@
 #pragma once
 // Phase 2B2: VulkanBackend - public header.
 // Phase 2C: Added AHardwareBuffer import methods.
+// Phase 2O1: Added renderFrame seam.
 // Must NOT include Vulkan or Android headers.
 // All Vulkan types live exclusively in vulkan_backend.cpp.
 
@@ -45,6 +46,9 @@ public:
         int* outReleaseFenceFd) override;
 
     bool hasHardwareBuffer(HardwareBufferHandle handle) const override;
+
+    // Phase 2O1: Frame rendering seam stub.
+    RenderFrameResult renderFrame(HardwareBufferHandle handle) override;
 
 private:
     struct Impl;

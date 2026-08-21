@@ -12,6 +12,25 @@ enum class RenderBackendType {
     kUnavailable
 };
 
+// ---------------------------------------------------------------------------
+// Phase 2O1: RenderFrameResult - explicit per-frame render outcome.
+// Using explicit states rather than bool to enable precise error propagation
+// to the DAG orchestrator without losing distinction between recoverable and
+// irrecoverable conditions.
+// ---------------------------------------------------------------------------
+enum class RenderFrameResult {
+    kSuccess,              // Frame rendered and presented successfully.
+    kSuboptimal,           // Rendered but swapchain is suboptimal (resize soon).
+    kBackendNotInitialized,// Backend initialize() has not succeeded.
+    kNoSurface,            // No swapchain surface is attached.
+    kInvalidBufferHandle,  // handle does not identify an active import.
+    kOutOfDate,            // Swapchain is out of date; caller must resize/reattach.
+    kSurfaceLost,          // Surface was lost; caller must detach and reattach.
+    kDeviceLost,           // Device lost; backend must be shut down and recreated.
+    kVulkanFailure,        // Unclassified Vulkan error.
+    kUnavailable,          // Operation not supported on this backend/platform.
+};
+
 class RenderBackend {
 public:
     virtual ~RenderBackend() = default;
@@ -71,6 +90,20 @@ public:
 
     // Returns true iff handle identifies an active import in this backend.
     virtual bool hasHardwareBuffer(HardwareBufferHandle handle) const = 0;
+
+    // ---------------------------------------------------------------------------
+    // Phase 2O1: Frame rendering seam.
+    // ---------------------------------------------------------------------------
+
+    // Render a single frame using the imported AHardwareBuffer identified by
+    // handle as the source image.  Returns an explicit result code.
+    //
+    // Phase 2O1 stubs: all backends return kUnavailable.
+    // Phase 2O2 will wire acquire-semaphore wait, command recording, queue
+    // submit, and swapchain present behind this seam.
+    //
+    // handle - must be a handle returned by a successful importHardwareBuffer.
+    virtual RenderFrameResult renderFrame(HardwareBufferHandle handle) = 0;
 };
 
 } // namespace render

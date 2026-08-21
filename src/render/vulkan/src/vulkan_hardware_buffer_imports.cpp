@@ -1,5 +1,5 @@
 // vulkan_hardware_buffer_imports.cpp
-// Phase 2E/2G: AHardwareBuffer Vulkan import management & table helper.
+// Phase 2E/2G/2O1: AHardwareBuffer Vulkan import management & table helper.
 //
 // Manages the handle map, monotonic handle allocation, AHardwareBuffer NDK
 // reference acquisition/release (libandroid.so), acquire-fence semaphore import
@@ -393,6 +393,9 @@ HardwareBufferImportResult VulkanHardwareBufferImports::importBuffer(
             // Vulkan now owns the fd; prevent any further close().
             acquireFenceFd = -1;
             vkImage.acquireSemaphore = acqSem;
+            // Phase 2O1: semaphore is pending until Phase 2O2 calls
+            // markAcquireSemaphoreSubmitted after a successful vkQueueSubmit.
+            vkImage.acquireSemaphorePending = true;
             VGLOG_AHB("importBuffer: acquire-fence fd imported as VkSemaphore");
         } else {
             VGLOG_AHB("importBuffer: vkImportSemaphoreFdKHR failed: %d (fd=%d)",
@@ -474,6 +477,45 @@ bool VulkanHardwareBufferImports::hasBuffer(HardwareBufferHandle handle) const {
     return s.records.find(handle) != s.records.end();
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2O1: Acquire-semaphore pending-state accessors - Android.
+// ---------------------------------------------------------------------------
+
+const VulkanHardwareBufferImage* VulkanHardwareBufferImports::getImage(
+        HardwareBufferHandle handle) const {
+    const Impl& s = *impl_;
+    auto it = s.records.find(handle);
+    if (it == s.records.end()) return nullptr;
+    return &it->second.image;
+}
+
+uint64_t VulkanHardwareBufferImports::getPendingAcquireSemaphoreHandle(
+        HardwareBufferHandle handle) const {
+    const Impl& s = *impl_;
+    auto it = s.records.find(handle);
+    if (it == s.records.end()) return 0u;
+    const VulkanHardwareBufferImage& img = it->second.image;
+    if (!img.acquireSemaphorePending) return 0u;
+    // acquireSemaphore is a VkSemaphore (non-dispatchable handle).
+    // Use the same memcpy idiom as vkHandleToU64 to avoid truncation on 32-bit.
+    uint64_t v = 0;
+    // NOLINTNEXTLINE(bugprone-undefined-memory-manipulation)
+    memcpy(&v, &img.acquireSemaphore, sizeof(img.acquireSemaphore));
+    return v;
+}
+
+bool VulkanHardwareBufferImports::markAcquireSemaphoreSubmitted(
+        HardwareBufferHandle handle) {
+    Impl& s = *impl_;
+    auto it = s.records.find(handle);
+    if (it == s.records.end()) return false;
+    VulkanHardwareBufferImage& img = it->second.image;
+    if (!img.acquireSemaphorePending) return false;
+    // Do NOT null out the semaphore; destroy() still owns the handle.
+    img.acquireSemaphorePending = false;
+    return true;
+}
+
 } // namespace render
 } // namespace vanguard
 
@@ -532,6 +574,25 @@ HardwareBufferImportResult VulkanHardwareBufferImports::releaseBuffer(
 }
 
 bool VulkanHardwareBufferImports::hasBuffer(HardwareBufferHandle /*handle*/) const {
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2O1: Acquire-semaphore pending-state accessors - host stubs.
+// ---------------------------------------------------------------------------
+
+const VulkanHardwareBufferImage* VulkanHardwareBufferImports::getImage(
+        HardwareBufferHandle /*handle*/) const {
+    return nullptr;
+}
+
+uint64_t VulkanHardwareBufferImports::getPendingAcquireSemaphoreHandle(
+        HardwareBufferHandle /*handle*/) const {
+    return 0u;
+}
+
+bool VulkanHardwareBufferImports::markAcquireSemaphoreSubmitted(
+        HardwareBufferHandle /*handle*/) {
     return false;
 }
 

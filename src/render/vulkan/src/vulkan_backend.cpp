@@ -6,6 +6,7 @@
 //     physical device selection, queue family, VkDevice, vkGetDeviceQueue.
 //   - Phase 2B2: delegates surface/swapchain lifecycle to VulkanSurfaceSwapchain.
 //   - Phase 2C: delegates AHardwareBuffer import to VulkanHardwareBufferImports.
+//   - Phase 2O1: renderFrame seam stub (returns kUnavailable).
 //
 // On non-Android host builds:
 //   - No Vulkan headers included.
@@ -142,6 +143,16 @@ HardwareBufferImportResult VulkanBackend::releaseHardwareBuffer(
 
 bool VulkanBackend::hasHardwareBuffer(HardwareBufferHandle /*handle*/) const {
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2O1: renderFrame stub - host build.
+// Phase 2O2 will wire acquire-semaphore wait + command recording + queue
+// submit + swapchain present.  Do NOT add any of those here.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle /*handle*/) {
+    return RenderFrameResult::kUnavailable;
 }
 
 #else // __ANDROID__
@@ -668,6 +679,23 @@ HardwareBufferImportResult VulkanBackend::releaseHardwareBuffer(
 bool VulkanBackend::hasHardwareBuffer(HardwareBufferHandle handle) const {
     if (!impl_ || !impl_->initialized || !impl_->ahbImports) return false;
     return impl_->ahbImports->hasBuffer(handle);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2O1: renderFrame - Android.
+// Safe scaffold stub only.  Returns kUnavailable.
+//
+// Forbidden in this phase:
+//   - vkAcquireNextImageKHR / vkQueuePresentKHR
+//   - vkQueueSubmit
+//   - command buffer recording
+//   - fence reset or wait
+//   - markAcquireSemaphoreSubmitted
+// Phase 2O2 will implement the real frame loop behind this seam.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle /*handle*/) {
+    return RenderFrameResult::kUnavailable;
 }
 
 #endif // __ANDROID__

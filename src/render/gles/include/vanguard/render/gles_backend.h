@@ -34,6 +34,9 @@ public:
         int* outReleaseFenceFd) override;
 
     bool hasHardwareBuffer(HardwareBufferHandle handle) const override;
+
+    // Phase 2O1: Frame rendering seam stub - GLES backend does not support this.
+    RenderFrameResult renderFrame(HardwareBufferHandle handle) override;
 };
 
 } // namespace render
