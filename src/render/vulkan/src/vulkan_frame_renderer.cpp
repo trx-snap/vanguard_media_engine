@@ -1,12 +1,12 @@
 // vulkan_frame_renderer.cpp
-// Phase 2O2B1: Modular Frame Renderer Extraction.
+// Phase 2O2B2: Native Vulkan Frame Execution Loop.
 //
 // Implements VulkanFrameRenderer helper managing frame synchronization,
 // graphics pipeline caching, and frame rendering orchestration behind a PImpl.
 //
 // On Android (__ANDROID__):
 //   - Manages VulkanFrameSynchronization and VulkanGraphicsPipeline.
-//   - renderFrame validates all preconditions and returns kUnavailable (real loop in Phase 2O2B2).
+//   - Executes acquire, record, submit, and present for one graphics frame.
 //
 // On non-Android host builds:
 //   - Compiles without Vulkan SDK.
@@ -14,6 +14,7 @@
 
 #include "vulkan_frame_renderer.h"
 #include "vulkan_frame_synchronization.h"
+#include "vulkan_graphics_command_recorder.h"
 #include "vulkan_graphics_pipeline.h"
 #include "vulkan_surface_swapchain.h"
 #include "vulkan_hardware_buffer_imports.h"
@@ -45,6 +46,18 @@ static inline VkHandle u64ToVkHandle(uint64_t v) {
     return h;
 }
 
+// Portable helper: encode a Vulkan non-dispatchable handle as uint64_t using
+// the same representation consumed by the private WSI/import seams.
+template <typename VkHandle>
+static inline uint64_t vkHandleToU64(VkHandle h) {
+    static_assert(sizeof(VkHandle) <= sizeof(uint64_t),
+                  "VkHandle too large for uint64_t");
+    uint64_t v = 0;
+    // NOLINTNEXTLINE(bugprone-undefined-memory-manipulation)
+    std::memcpy(&v, &h, sizeof(VkHandle));
+    return v;
+}
+
 } // anonymous namespace
 
 struct VulkanFrameRenderer::Impl {
@@ -66,6 +79,22 @@ struct VulkanFrameRenderer::Impl {
         }
         activePipelineLayout = VK_NULL_HANDLE;
         activeRenderPassHandle = 0;
+    }
+
+    RenderFrameResult failClosed(VulkanSurfaceSwapchain& swapchain,
+                                 RenderFrameResult result) {
+        if (device != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(device);
+        }
+        if (frameSync) {
+            frameSync->shutdown(device, commandPool);
+            frameSync.reset();
+        }
+        swapchain.detach();
+        invalidatePipeline();
+        initialized = false;
+        currentFrameIndex = 0;
+        return result;
     }
 };
 
@@ -157,24 +186,203 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     VulkanHardwareBufferImports& ahbImports,
     VulkanCoreShaderModules& coreShaders,
     HardwareBufferHandle handle) {
-    (void)queueHandle;
-
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (queueHandle == nullptr || s.device == VK_NULL_HANDLE ||
+        s.commandPool == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
     }
     if (!swapchain.hasSurface()) {
         return RenderFrameResult::kNoSurface;
     }
-    if (!ahbImports.hasBuffer(handle) || ahbImports.getImage(handle) == nullptr) {
+    const VulkanHardwareBufferImage* srcImage = ahbImports.getImage(handle);
+    if (!ahbImports.hasBuffer(handle) || srcImage == nullptr) {
         return RenderFrameResult::kInvalidBufferHandle;
     }
-    if (coreShaders.vertex.get() == VK_NULL_HANDLE || coreShaders.fragment.get() == VK_NULL_HANDLE) {
+    if (srcImage->image == VK_NULL_HANDLE ||
+        coreShaders.vertex.get() == VK_NULL_HANDLE ||
+        coreShaders.fragment.get() == VK_NULL_HANDLE ||
+        !s.frameSync || !s.frameSync->isInitialized()) {
         return RenderFrameResult::kVulkanFailure;
     }
 
-    // Strict Phase 2O2B1 boundary:
-    // Real frame loop (acquire, record, submit, present) is deferred to Phase 2O2B2.
-    return RenderFrameResult::kUnavailable;
+    const uint32_t frameCount = s.frameSync->getFrameCount();
+    if (frameCount == 0 || s.currentFrameIndex >= frameCount) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VulkanFrameSyncResources* frame =
+        s.frameSync->getFrame(s.currentFrameIndex);
+    if (frame == nullptr || frame->commandBuffer == VK_NULL_HANDLE ||
+        frame->imageAvailableSemaphore == VK_NULL_HANDLE ||
+        frame->renderFinishedSemaphore == VK_NULL_HANDLE ||
+        frame->inFlightFence == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t renderPassHandle = swapchain.getRenderPassHandle();
+    const uint32_t extentWidth = swapchain.getExtentWidth();
+    const uint32_t extentHeight = swapchain.getExtentHeight();
+    VkPipelineLayout pipelineLayout =
+        srcImage->descriptorResources.pipelineLayout;
+    VkDescriptorSet descriptorSet = srcImage->descriptorResources.descriptorSet;
+    if (renderPassHandle == 0 || extentWidth == 0 || extentHeight == 0 ||
+        pipelineLayout == VK_NULL_HANDLE || descriptorSet == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VkRenderPass renderPass =
+        u64ToVkHandle<VkRenderPass>(renderPassHandle);
+
+    const bool hasActivePipeline =
+        s.graphicsPipeline && s.graphicsPipeline->isValid();
+    const bool pipelineCompatibilityMismatch =
+        hasActivePipeline &&
+        (s.activePipelineLayout != pipelineLayout ||
+         s.activeRenderPassHandle != renderPassHandle);
+    const bool pipelineMismatch =
+        !hasActivePipeline || pipelineCompatibilityMismatch;
+    if (pipelineMismatch) {
+        if (pipelineCompatibilityMismatch &&
+            vkDeviceWaitIdle(s.device) != VK_SUCCESS) {
+            return RenderFrameResult::kVulkanFailure;
+        }
+        s.invalidatePipeline();
+        s.graphicsPipeline = std::make_unique<VulkanGraphicsPipeline>();
+        if (!s.graphicsPipeline->create(
+                s.device,
+                pipelineLayout,
+                renderPass,
+                coreShaders.vertex.get(),
+                coreShaders.fragment.get())) {
+            s.invalidatePipeline();
+            return RenderFrameResult::kVulkanFailure;
+        }
+        s.activePipelineLayout = pipelineLayout;
+        s.activeRenderPassHandle = renderPassHandle;
+    }
+
+    if (!s.frameSync->waitForFrameFence(s.currentFrameIndex)) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    uint32_t imageIndex = 0;
+    const SwapchainResult acquireResult = swapchain.acquireNextImage(
+        vkHandleToU64(frame->imageAvailableSemaphore),
+        0,
+        &imageIndex,
+        UINT64_MAX);
+    switch (acquireResult) {
+        case SwapchainResult::kSuccess:
+        case SwapchainResult::kSuboptimal:
+            break;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return RenderFrameResult::kDeviceLost;
+        case SwapchainResult::kError:
+            return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t framebufferHandle =
+        swapchain.getFramebufferHandle(imageIndex);
+    if (framebufferHandle == 0) {
+        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+    }
+    const VkFramebuffer framebuffer =
+        u64ToVkHandle<VkFramebuffer>(framebufferHandle);
+
+    if (!s.frameSync->resetCommandBuffer(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+    }
+
+    VulkanGraphicsPassParams passParams{};
+    passParams.commandBuffer = frame->commandBuffer;
+    passParams.renderPass = renderPass;
+    passParams.framebuffer = framebuffer;
+    passParams.extentWidth = extentWidth;
+    passParams.extentHeight = extentHeight;
+    passParams.pipelineLayout = pipelineLayout;
+    passParams.descriptorSet = descriptorSet;
+    passParams.pipeline = s.graphicsPipeline->get();
+    passParams.transitionSourceImage = true;
+    passParams.sourceImage = srcImage;
+    if (!VulkanGraphicsCommandRecorder::recordCompletePass(passParams)) {
+        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+    }
+
+    if (!s.frameSync->resetFrameFence(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+    }
+
+    VkSemaphore waitSemaphores[2] = {
+        frame->imageAvailableSemaphore,
+        VK_NULL_HANDLE,
+    };
+    VkPipelineStageFlags waitStages[2] = {
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+    };
+    uint32_t waitSemaphoreCount = 1;
+    const uint64_t pendingAcquireSemaphoreHandle =
+        ahbImports.getPendingAcquireSemaphoreHandle(handle);
+    if (pendingAcquireSemaphoreHandle != 0) {
+        waitSemaphores[waitSemaphoreCount++] =
+            u64ToVkHandle<VkSemaphore>(pendingAcquireSemaphoreHandle);
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = waitSemaphoreCount;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &frame->commandBuffer;
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = &frame->renderFinishedSemaphore;
+
+    const VkQueue queue = static_cast<VkQueue>(queueHandle);
+    const VkResult submitResult =
+        vkQueueSubmit(queue, 1, &submitInfo, frame->inFlightFence);
+    if (submitResult != VK_SUCCESS) {
+        const RenderFrameResult result =
+            (submitResult == VK_ERROR_DEVICE_LOST)
+                ? RenderFrameResult::kDeviceLost
+                : RenderFrameResult::kVulkanFailure;
+        return s.failClosed(swapchain, result);
+    }
+
+    if (pendingAcquireSemaphoreHandle != 0 &&
+        !ahbImports.markAcquireSemaphoreSubmitted(handle)) {
+        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+    }
+
+    const SwapchainResult presentResult = swapchain.presentImage(
+        queueHandle,
+        vkHandleToU64(frame->renderFinishedSemaphore),
+        imageIndex);
+    s.currentFrameIndex = (s.currentFrameIndex + 1) % frameCount;
+
+    switch (presentResult) {
+        case SwapchainResult::kSuccess:
+            return acquireResult == SwapchainResult::kSuboptimal
+                ? RenderFrameResult::kSuboptimal
+                : RenderFrameResult::kSuccess;
+        case SwapchainResult::kSuboptimal:
+            return RenderFrameResult::kSuboptimal;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return s.failClosed(swapchain, RenderFrameResult::kDeviceLost);
+        case SwapchainResult::kError:
+            return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+    }
+
+    return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
 }
 
 } // namespace render
