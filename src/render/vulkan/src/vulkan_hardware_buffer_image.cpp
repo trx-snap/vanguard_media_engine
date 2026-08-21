@@ -1,8 +1,11 @@
 // vulkan_hardware_buffer_image.cpp
-// Phase 2E/2G: Vulkan hardware buffer image resource encapsulation.
+// Phase 2E/2G/2H: Vulkan hardware buffer image resource encapsulation.
 // Phase 2G adds: acquireSemaphore ownership (VkSemaphore imported from sync-fd
 // acquire fence) with destroy() cleanup and getAcquireSemaphore() accessor for
 // the upcoming DAG queue submit.
+// Phase 2H adds: VulkanDescriptorResources creation (set layout/pool/set) after
+// sampler and imageView succeed; destroy() tears down descriptor resources
+// before sampler/imageView/ycbcrConversion/image/memory.
 
 #include "vulkan_hardware_buffer_image.h"
 
@@ -269,6 +272,20 @@ HardwareBufferImportResult VulkanHardwareBufferImage::create(
         return HardwareBufferImportResult::kVulkanFailure;
     }
 
+    // -------------------------------------------------------------------------
+    // Phase 2H: Create descriptor-set resources (layout / pool / set) using
+    // the immutable sampler and imageView created above.
+    // -------------------------------------------------------------------------
+    {
+        HardwareBufferImportResult dr =
+            descriptorResources.create(device, sampler, imageView);
+        if (dr != HardwareBufferImportResult::kSuccess) {
+            VGLOG_AHB("VulkanDescriptorResources::create failed");
+            destroy(device, fnDestroyYcbcr);
+            return HardwareBufferImportResult::kVulkanFailure;
+        }
+    }
+
     cachedFormat         = imageFormat;
     cachedExternalFormat = isExternal ? fmtProps.externalFormat : 0;
     cachedLayerCount     = desc.layers; // Phase 2F
@@ -285,6 +302,10 @@ void VulkanHardwareBufferImage::destroy(
         vkDestroySemaphore(device, acquireSemaphore, nullptr);
         acquireSemaphore = VK_NULL_HANDLE;
     }
+    // Phase 2H: destroy descriptor resources (pool implicitly frees the set,
+    // then the layout) before sampler/imageView, which the descriptor layout
+    // references via the immutable sampler.
+    descriptorResources.destroy(device);
     if (sampler != VK_NULL_HANDLE) {
         vkDestroySampler(device, sampler, nullptr);
         sampler = VK_NULL_HANDLE;

@@ -24,6 +24,7 @@ add_library(vanguard_render_vulkan STATIC
     "render/vulkan/src/vulkan_surface_swapchain.cpp"
     "render/vulkan/src/vulkan_hardware_buffer_imports.cpp"
     "render/vulkan/src/vulkan_hardware_buffer_image.cpp"
+    "render/vulkan/src/vulkan_descriptor_resources.cpp"
 )
 target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include")
 target_link_libraries(vanguard_render_vulkan PRIVATE vanguard_render_shared vanguard_core)

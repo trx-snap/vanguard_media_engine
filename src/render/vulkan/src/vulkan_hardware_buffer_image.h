@@ -1,5 +1,5 @@
 // vulkan_hardware_buffer_image.h
-// Phase 2E/2G: Private helper - VulkanHardwareBufferImage.
+// Phase 2E/2G/2H: Private helper - VulkanHardwareBufferImage.
 //
 // Owns and encapsulates the creation and destruction of Vulkan sampling resources
 // for an imported AHardwareBuffer:
@@ -8,6 +8,7 @@
 //   - VkSamplerYcbcrConversion (for external format images)
 //   - VkImageView (2D or 2D_ARRAY; chained with YCbCr conversion if external)
 //   - VkSampler (chained with YCbCr conversion if external)
+//   - VulkanDescriptorResources (Phase 2H: set layout/pool/set for sampling)
 //
 // Confined to the private Vulkan render backend implementation.
 
@@ -15,6 +16,7 @@
 
 #include "vanguard/render/hardware_buffer_import.h"
 #include <cstdint>
+#include <utility>
 
 #if defined(__ANDROID__)
 
@@ -24,6 +26,7 @@
 
 #include <vulkan/vulkan.h>
 #include <android/hardware_buffer.h>
+#include "vulkan_descriptor_resources.h"
 
 namespace vanguard {
 namespace render {
@@ -46,6 +49,11 @@ struct VulkanHardwareBufferImage {
     uint64_t                 cachedExternalFormat = 0;
     uint32_t                 cachedLayerCount     = 1; // Phase 2F
 
+    // Phase 2H: Descriptor-set resources for sampling this image in the
+    // fragment shader. Lives alongside sampler/imageView because all three
+    // are per-import/per-conversion resources in the current architecture.
+    VulkanDescriptorResources descriptorResources;
+
     VulkanHardwareBufferImage() = default;
 
     // Move-only: raw Vulkan handles must not be copied.
@@ -61,7 +69,8 @@ struct VulkanHardwareBufferImage {
           acquireSemaphore(other.acquireSemaphore),
           cachedFormat(other.cachedFormat),
           cachedExternalFormat(other.cachedExternalFormat),
-          cachedLayerCount(other.cachedLayerCount) {
+          cachedLayerCount(other.cachedLayerCount),
+          descriptorResources(std::move(other.descriptorResources)) {
         other.image = VK_NULL_HANDLE;
         other.memory = VK_NULL_HANDLE;
         other.ycbcrConversion = VK_NULL_HANDLE;
@@ -84,6 +93,7 @@ struct VulkanHardwareBufferImage {
             cachedFormat = other.cachedFormat;
             cachedExternalFormat = other.cachedExternalFormat;
             cachedLayerCount = other.cachedLayerCount;
+            descriptorResources = std::move(other.descriptorResources);
 
             other.image = VK_NULL_HANDLE;
             other.memory = VK_NULL_HANDLE;
