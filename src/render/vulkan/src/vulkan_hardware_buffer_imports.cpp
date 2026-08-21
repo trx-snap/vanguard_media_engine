@@ -1,10 +1,16 @@
 // vulkan_hardware_buffer_imports.cpp
-// Phase 2E/2G/2O1: AHardwareBuffer Vulkan import management & table helper.
+// Phase 2E/2G/2O1/2P2: AHardwareBuffer Vulkan import management & table helper.
 //
 // Manages the handle map, monotonic handle allocation, AHardwareBuffer NDK
 // reference acquisition/release (libandroid.so), acquire-fence semaphore import
 // (Phase 2G), and delegates Vulkan resource creation/teardown to
 // VulkanHardwareBufferImage.
+//
+// Phase 2P2: Non-blocking retirement queue. releaseBuffer() no longer performs
+// vkDeviceWaitIdle on the normal path. Records move to a retired list tagged
+// with lastSubmittedFrameSlot; Vulkan/AHB resources are destroyed only after
+// the corresponding frame fence confirms GPU completion. Compute-pipeline
+// deferral is not implemented in this phase.
 //
 // Android-only: all implementation is inside #if defined(__ANDROID__) ... #endif.
 // Non-Android translation unit compiles to stubs only.
@@ -40,6 +46,7 @@
 #include <unordered_map>
 #include <atomic>
 #include <utility>
+#include <vector>
 
 #define VGLOG_AHB(...) \
     __android_log_print(ANDROID_LOG_DEBUG, "VanguardAHBImport", __VA_ARGS__)
@@ -80,6 +87,17 @@ struct ImportRecord {
     // Phase 2P1: latest release-fence fd exported after vkQueueSubmit.
     // -1 means no fence is stored. Import record owns this fd.
     int latestReleaseFenceFd = -1;
+    // Phase 2P2: frame slot of the last successful vkQueueSubmit using this
+    // record. kNoSubmittedFrameSlot means the record was never submitted to GPU.
+    uint32_t lastSubmittedFrameSlot = VulkanHardwareBufferImports::kNoSubmittedFrameSlot;
+};
+
+// Phase 2P2: A retired record is an ImportRecord that has been removed from
+// the active records map but whose Vulkan/AHB resources must not be destroyed
+// until the tagged frame fence has been waited.
+struct RetiredRecord {
+    ImportRecord record;
+    uint32_t     frameSlot = VulkanHardwareBufferImports::kNoSubmittedFrameSlot;
 };
 
 // ---------------------------------------------------------------------------
@@ -113,9 +131,12 @@ struct VulkanHardwareBufferImports::Impl {
     std::unordered_map<HardwareBufferHandle, ImportRecord> records;
     std::atomic<uint64_t> nextHandle{1};
 
+    // Phase 2P2: Retired records pending frame-fence confirmation before destroy.
+    std::vector<RetiredRecord> retired;
+
     bool initialized = false;
 
-    // Destroy a single record.  Does NOT remove it from the records map.
+    // Destroy a single record.  Does NOT remove it from any container.
     //
     // Teardown order:
     //   Phase 2P1: close latestReleaseFenceFd if valid (before GPU teardown)
@@ -135,6 +156,7 @@ struct VulkanHardwareBufferImports::Impl {
         }
     }
 };
+
 
 // ---------------------------------------------------------------------------
 // Constructor / destructor
@@ -240,11 +262,19 @@ void VulkanHardwareBufferImports::shutdown() {
     if (!impl_) return;
     Impl& s = *impl_;
 
-    // Destroy all import records (acquireSemaphore -> Vulkan resources -> AHB ref).
+    // Destroy all active import records (acquireSemaphore -> Vulkan resources -> AHB ref).
     for (auto& kv : s.records) {
         s.destroyRecord(kv.second);
     }
     s.records.clear();
+
+    // Phase 2P2: Destroy all retired records. Caller (VulkanBackend::shutdown)
+    // has already called vkDeviceWaitIdle before invoking this, so GPU work
+    // referencing any retired resources has completed.
+    for (auto& r : s.retired) {
+        s.destroyRecord(r.record);
+    }
+    s.retired.clear();
 
     if (s.libAndroid) {
         dlclose(s.libAndroid);
@@ -262,6 +292,7 @@ void VulkanHardwareBufferImports::shutdown() {
     s.physDev             = VK_NULL_HANDLE;
     s.initialized         = false;
 }
+
 
 // ---------------------------------------------------------------------------
 // importBuffer()
@@ -452,8 +483,20 @@ HardwareBufferImportResult VulkanHardwareBufferImports::importBuffer(
 }
 
 // ---------------------------------------------------------------------------
-// releaseBuffer()
+// releaseBuffer() - Phase 2P2
 // ---------------------------------------------------------------------------
+//
+// Non-blocking retirement path:
+//   1. Always set *outReleaseFenceFd to -1 first.
+//   2. Unknown handle returns kUnknownHandle.
+//   3. Transfer stored latestReleaseFenceFd to caller if outReleaseFenceFd is
+//      non-null; otherwise close it. Clear the stored fd before moving record.
+//   4. Remove handle from active records so hasBuffer() returns false and a
+//      repeated release returns kUnknownHandle.
+//   5. If lastSubmittedFrameSlot == kNoSubmittedFrameSlot: destroy immediately
+//      (record was never submitted to GPU; no fence to wait).
+//   6. Otherwise move record to retired queue tagged with lastSubmittedFrameSlot.
+//      Vulkan/AHB resources are destroyed in drainRetiredForFrame().
 
 HardwareBufferImportResult VulkanHardwareBufferImports::releaseBuffer(
     HardwareBufferHandle handle,
@@ -461,20 +504,21 @@ HardwareBufferImportResult VulkanHardwareBufferImports::releaseBuffer(
 {
     Impl& s = *impl_;
 
+    // Step 1: always set caller's fd to -1 first.
     if (outReleaseFenceFd) {
         *outReleaseFenceFd = -1;
     }
 
+    // Step 2: unknown handle.
     auto it = s.records.find(handle);
     if (it == s.records.end()) {
         return HardwareBufferImportResult::kUnknownHandle;
     }
 
-    // Phase 2P1: Transfer or close the stored release-fence fd before
-    // destroyRecord (which closes any leftover as a safety net).
+    // Step 3: transfer or close the stored release-fence fd.
     ImportRecord& rec = it->second;
     const int storedFd = rec.latestReleaseFenceFd;
-    rec.latestReleaseFenceFd = -1; // field cleared before destroyRecord
+    rec.latestReleaseFenceFd = -1; // cleared before record is moved/destroyed
     if (storedFd >= 0) {
         if (outReleaseFenceFd) {
             *outReleaseFenceFd = storedFd; // ownership transferred to caller
@@ -483,12 +527,30 @@ HardwareBufferImportResult VulkanHardwareBufferImports::releaseBuffer(
         }
     }
 
-    s.destroyRecord(rec);
+    const uint32_t submittedSlot = rec.lastSubmittedFrameSlot;
+
+    // Step 4: remove from active map immediately.
+    ImportRecord movedRec = std::move(rec);
     s.records.erase(it);
 
-    VGLOG_AHB("releaseBuffer: handle=%" PRIu64, static_cast<uint64_t>(handle));
+    if (submittedSlot == kNoSubmittedFrameSlot) {
+        // Step 5: never submitted to GPU — destroy immediately without waiting.
+        s.destroyRecord(movedRec);
+        VGLOG_AHB("releaseBuffer: handle=%" PRIu64 " destroyed immediately (never submitted)",
+                  static_cast<uint64_t>(handle));
+    } else {
+        // Step 6: submitted — defer destruction until frame fence is waited.
+        RetiredRecord rr;
+        rr.record    = std::move(movedRec);
+        rr.frameSlot = submittedSlot;
+        s.retired.push_back(std::move(rr));
+        VGLOG_AHB("releaseBuffer: handle=%" PRIu64 " retired (frameSlot=%u, retiredCount=%zu)",
+                  static_cast<uint64_t>(handle), submittedSlot, s.retired.size());
+    }
+
     return HardwareBufferImportResult::kSuccess;
 }
+
 
 // ---------------------------------------------------------------------------
 // hasBuffer()
@@ -575,6 +637,70 @@ bool VulkanHardwareBufferImports::setLatestReleaseFenceFd(
     }
     rec.latestReleaseFenceFd = fd; // store including -1
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2P2: markBufferSubmitted() - Android
+// ---------------------------------------------------------------------------
+
+bool VulkanHardwareBufferImports::markBufferSubmitted(
+        HardwareBufferHandle handle, uint32_t frameSlot) {
+    Impl& s = *impl_;
+    auto it = s.records.find(handle);
+    if (it == s.records.end()) return false;
+    it->second.lastSubmittedFrameSlot = frameSlot;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2P2: drainRetiredForFrame() - Android
+//
+// Destroys all retired records tagged with frameSlot.
+// Must be called only after waitForFrameFence(frameSlot) has succeeded.
+// ---------------------------------------------------------------------------
+
+void VulkanHardwareBufferImports::drainRetiredForFrame(uint32_t frameSlot) {
+    Impl& s = *impl_;
+    size_t i = 0;
+    while (i < s.retired.size()) {
+        if (s.retired[i].frameSlot == frameSlot) {
+            s.destroyRecord(s.retired[i].record);
+            // Swap-erase for O(1) removal without preserving order.
+            s.retired[i] = std::move(s.retired.back());
+            s.retired.pop_back();
+            // Do NOT increment i; re-check element now at position i.
+        } else {
+            ++i;
+        }
+    }
+    VGLOG_AHB("drainRetiredForFrame: slot=%u done (remaining=%zu)",
+               frameSlot, s.retired.size());
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2P2: drainAllRetired() - Android
+//
+// Destroys all retired records unconditionally.
+// Caller must have established global GPU idle (vkDeviceWaitIdle) before
+// calling this.
+// ---------------------------------------------------------------------------
+
+void VulkanHardwareBufferImports::drainAllRetired() {
+    Impl& s = *impl_;
+    for (auto& r : s.retired) {
+        s.destroyRecord(r.record);
+    }
+    s.retired.clear();
+    VGLOG_AHB("drainAllRetired: complete");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2P2: retiredRecordCount() - Android
+// ---------------------------------------------------------------------------
+
+size_t VulkanHardwareBufferImports::retiredRecordCount() const {
+    const Impl& s = *impl_;
+    return s.retired.size();
 }
 
 } // namespace render
@@ -676,6 +802,27 @@ bool VulkanHardwareBufferImports::setLatestReleaseFenceFd(
     (void)fd;
 #endif
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2P2: Retirement queue host stubs (compile-safe no-ops).
+// ---------------------------------------------------------------------------
+
+bool VulkanHardwareBufferImports::markBufferSubmitted(
+        HardwareBufferHandle /*handle*/, uint32_t /*frameSlot*/) {
+    return false;
+}
+
+void VulkanHardwareBufferImports::drainRetiredForFrame(uint32_t /*frameSlot*/) {
+    // no-op on host
+}
+
+void VulkanHardwareBufferImports::drainAllRetired() {
+    // no-op on host
+}
+
+size_t VulkanHardwareBufferImports::retiredRecordCount() const {
+    return 0u;
 }
 
 } // namespace render

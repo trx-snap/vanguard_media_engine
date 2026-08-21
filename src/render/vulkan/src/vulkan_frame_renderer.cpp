@@ -27,6 +27,7 @@
 
 #include <vulkan/vulkan.h>
 #include <android/log.h>
+#include <inttypes.h>
 
 #define VGLOG_VFR(...) __android_log_print(ANDROID_LOG_DEBUG, "VanguardVkFrameRenderer", __VA_ARGS__)
 
@@ -87,11 +88,16 @@ struct VulkanFrameRenderer::Impl {
         activeRenderPassHandle = 0;
     }
 
+    // Phase 2P2: failClosed receives ahbImports so it can drainAllRetired()
+    // after vkDeviceWaitIdle and before destroying sync/swapchain/pipeline.
     RenderFrameResult failClosed(VulkanSurfaceSwapchain& swapchain,
+                                 VulkanHardwareBufferImports& ahbImports,
                                  RenderFrameResult result) {
         if (device != VK_NULL_HANDLE) {
             vkDeviceWaitIdle(device);
         }
+        // Phase 2P2: Drain all retired imports; GPU is now idle.
+        ahbImports.drainAllRetired();
         if (frameSync) {
             frameSync->shutdown(device, commandPool);
             frameSync.reset();
@@ -282,6 +288,10 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     if (!s.frameSync->waitForFrameFence(s.currentFrameIndex)) {
         return RenderFrameResult::kVulkanFailure;
     }
+    // Phase 2P2: Frame fence for this slot has been waited; GPU work from the
+    // previous use of this slot is complete. Drain retired records tagged with
+    // this slot before resetting and reusing the command buffer.
+    ahbImports.drainRetiredForFrame(s.currentFrameIndex);
 
     uint32_t imageIndex = 0;
     const SwapchainResult acquireResult = swapchain.acquireNextImage(
@@ -306,7 +316,7 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     const uint64_t framebufferHandle =
         swapchain.getFramebufferHandle(imageIndex);
     if (framebufferHandle == 0) {
-        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
     const VkFramebuffer framebuffer =
         u64ToVkHandle<VkFramebuffer>(framebufferHandle);
@@ -315,13 +325,13 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     const uint64_t presentReadySemaphoreHandle =
         swapchain.getPresentReadySemaphoreHandle(imageIndex);
     if (presentReadySemaphoreHandle == 0) {
-        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
     const VkSemaphore presentReadySemaphore =
         u64ToVkHandle<VkSemaphore>(presentReadySemaphoreHandle);
 
     if (!s.frameSync->resetCommandBuffer(s.currentFrameIndex)) {
-        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
 
     // Phase 2O2B4: Query current source image layout before recording.
@@ -350,11 +360,11 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
         passParams.sourceNewLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     }
     if (!VulkanGraphicsCommandRecorder::recordCompletePass(passParams)) {
-        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
 
     if (!s.frameSync->resetFrameFence(s.currentFrameIndex)) {
-        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
 
     VkSemaphore waitSemaphores[2] = {
@@ -408,7 +418,18 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
             (submitResult == VK_ERROR_DEVICE_LOST)
                 ? RenderFrameResult::kDeviceLost
                 : RenderFrameResult::kVulkanFailure;
-        return s.failClosed(swapchain, result);
+        return s.failClosed(swapchain, ahbImports, result);
+    }
+
+    // Phase 2P2: Record the frame slot for this submission so that
+    // releaseBuffer() can tag the retired record for deferred destruction.
+    // markBufferSubmitted updates lastSubmittedFrameSlot in the active record.
+    // Failure here is fatal: fail closed so the record is not left with a
+    // stale slot while resources may be in flight.
+    if (!ahbImports.markBufferSubmitted(handle, s.currentFrameIndex)) {
+        VGLOG_VFR("markBufferSubmitted failed for handle=%" PRIu64 "; failing closed",
+                  static_cast<uint64_t>(handle));
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
 
     // Phase 2P1: Export diagnostic release sync-fd via the dedicated
@@ -438,7 +459,7 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
                 // Clear stale stored FD and fail closed: vkDeviceWaitIdle
                 // must precede semaphore teardown after a failed export.
                 ahbImports.setLatestReleaseFenceFd(handle, -1);
-                return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
             }
             // Transfer ownership to import record (including -1 to clear stale).
             // setLatestReleaseFenceFd closes any prior valid FD on the record;
@@ -453,12 +474,12 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
 
     if (pendingAcquireSemaphoreHandle != 0 &&
         !ahbImports.markAcquireSemaphoreSubmitted(handle)) {
-        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
 
     // Phase 2O2B4: Mark layout as SHADER_READ_ONLY_OPTIMAL only after vkQueueSubmit returns VK_SUCCESS.
     if (!ahbImports.setImageLayout(handle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))) {
-        return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
 
     const SwapchainResult presentResult = swapchain.presentImage(
@@ -479,12 +500,12 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
         case SwapchainResult::kSurfaceLost:
             return RenderFrameResult::kSurfaceLost;
         case SwapchainResult::kDeviceLost:
-            return s.failClosed(swapchain, RenderFrameResult::kDeviceLost);
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kDeviceLost);
         case SwapchainResult::kError:
-            return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
 
-    return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+    return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
 }
 
 } // namespace render

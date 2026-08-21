@@ -1,5 +1,5 @@
 // vulkan_hardware_buffer_imports.h
-// Phase 2E/2G/2O1: Private helper - VulkanHardwareBufferImports.
+// Phase 2E/2G/2O1/2P2: Private helper - VulkanHardwareBufferImports.
 //
 // Owns the AHardwareBuffer->Vulkan import table including sampling resources
 // (VkSamplerYcbcrConversion, VkImageView, VkSampler) and Phase 2G acquire-fence
@@ -16,10 +16,19 @@
 // vkCreateSamplerYcbcrConversion, vkDestroySamplerYcbcrConversion, and
 // vkImportSemaphoreFdKHR are loaded via vkGetDeviceProcAddr.  No strong references
 // to AHardwareBuffer_* or to Android/Vulkan extension structs appear in this header.
+//
+// Phase 2P2: Non-blocking imported AHardwareBuffer retirement queue.
+// releaseBuffer() no longer performs vkDeviceWaitIdle on the normal path.
+// Records submitted to GPU work move to a retired queue tagged with their
+// lastSubmittedFrameSlot.  drainRetiredForFrame(slot) is called after
+// waitForFrameFence(slot) confirms GPU completion for that slot.
+// drainAllRetired() is used by shutdown/failClosed after a global idle wait.
+// Compute-pipeline deferral is not implemented in this phase.
 
 #pragma once
 #include "vanguard/render/hardware_buffer_import.h"
 #include "vulkan_hardware_buffer_image.h"
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -62,10 +71,17 @@ public:
         HardwareBufferHandle* outHandle,
         HardwareBufferDescriptor* outDescriptor);
 
-    // Release a previously imported buffer by handle.
-    // Phase 2P1: transfers the stored latestReleaseFenceFd to *outReleaseFenceFd
-    // when provided; otherwise closes it. Sets the stored field to -1 before
-    // destroyRecord. Destroys imported resources in teardown order.
+    // Release a previously imported buffer by handle. Phase 2P2 semantics:
+    // - Always sets *outReleaseFenceFd to -1 first; then transfers the stored
+    //   latestReleaseFenceFd to caller if outReleaseFenceFd is non-null,
+    //   otherwise closes it.
+    // - Removes the handle from active records immediately (hasBuffer returns
+    //   false after return; repeated release returns kUnknownHandle).
+    // - If the record was never submitted to GPU (lastSubmittedFrameSlot ==
+    //   kNoSubmittedFrameSlot), Vulkan/AHB resources are destroyed immediately.
+    // - Otherwise the record moves to the retired queue tagged with
+    //   lastSubmittedFrameSlot and is destroyed by drainRetiredForFrame() or
+    //   drainAllRetired() once GPU completion is confirmed.
     // outReleaseFenceFd - optional; set to -1 if non-null and no fd is stored.
     HardwareBufferImportResult releaseBuffer(
         HardwareBufferHandle handle,
@@ -119,6 +135,28 @@ public:
     // Must be called ONLY after vkQueueSubmit returns VK_SUCCESS.
     // Returns false if handle is not active.
     bool setImageLayout(HardwareBufferHandle handle, uint32_t newLayout);
+
+    // Phase 2P2: Frame slot sentinel — record has never been submitted to the GPU.
+    static constexpr uint32_t kNoSubmittedFrameSlot = UINT32_MAX;
+
+    // Phase 2P2: Mark the active import record for handle as submitted during
+    // frameSlot. Must be called only after vkQueueSubmit returns VK_SUCCESS.
+    // Returns false if handle is not active.
+    bool markBufferSubmitted(HardwareBufferHandle handle, uint32_t frameSlot);
+
+    // Phase 2P2: Destroy all retired records tagged with frameSlot.
+    // Must be called only after waitForFrameFence(frameSlot) has succeeded
+    // so that GPU work referencing those resources is complete.
+    void drainRetiredForFrame(uint32_t frameSlot);
+
+    // Phase 2P2: Destroy all retired records unconditionally.
+    // Caller must have established global GPU idle (vkDeviceWaitIdle) before
+    // calling this.
+    void drainAllRetired();
+
+    // Phase 2P2: Returns the number of records currently in the retired queue.
+    // Used for backpressure accounting.
+    size_t retiredRecordCount() const;
 
 private:
     struct Impl;

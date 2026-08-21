@@ -596,7 +596,10 @@ void VulkanBackend::shutdown() {
     }
 
     // Phase 2C: Release all AHardwareBuffer imports before destroying device.
+    // Phase 2P2: drainAllRetired() first so retired Vulkan objects are freed
+    // while the device is still alive; shutdown() then destroys active records.
     if (s.ahbImports) {
+        s.ahbImports->drainAllRetired();
         s.ahbImports->shutdown();
         s.ahbImports.reset();
     }
@@ -676,6 +679,15 @@ bool VulkanBackend::resizeSurface(uint32_t width, uint32_t height) {
         return false;
     }
 
+    // Phase 2P2: Resize is a lifecycle path that is allowed to block.
+    // Wait for GPU idle and drain retired imports before invalidating the
+    // pipeline or letting the swapchain resize tear down framebuffers/render
+    // passes that retired records may still reference.
+    vkDeviceWaitIdle(s.device);
+    if (s.ahbImports) {
+        s.ahbImports->drainAllRetired();
+    }
+
     if (s.frameRenderer) {
         s.frameRenderer->invalidatePipeline();
     }
@@ -687,6 +699,11 @@ void VulkanBackend::detachSurface() {
     Impl& s = *impl_;
     if (s.device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(s.device);
+    }
+    // Phase 2P2: After idle wait, drain retired imports so their Vulkan objects
+    // are freed before the swapchain surfaces they referenced are torn down.
+    if (s.ahbImports) {
+        s.ahbImports->drainAllRetired();
     }
     if (s.frameRenderer) {
         s.frameRenderer->invalidatePipeline();
@@ -735,14 +752,31 @@ HardwareBufferImportResult VulkanBackend::releaseHardwareBuffer(
         return HardwareBufferImportResult::kUnavailable;
     }
     Impl& s = *impl_;
-    if (s.device != VK_NULL_HANDLE) {
-        vkDeviceWaitIdle(s.device);
+
+    // Phase 2P2: Non-blocking normal release path.
+    // releaseBuffer() moves in-flight records to the retired queue instead of
+    // destroying them immediately. No idle wait or pipeline invalidation here;
+    // the pipeline may still reference current descriptor/image resources.
+    const HardwareBufferImportResult result =
+        s.ahbImports->releaseBuffer(handle, outReleaseFenceFd);
+
+    // Phase 2P2: Bounded backpressure. If the retired queue has grown beyond 16
+    // records, force a global idle and drain-all to prevent unbounded native
+    // resource accumulation. This is a fallback path only; the normal drain
+    // occurs per-frame after the corresponding frame fence wait.
+    if (result == HardwareBufferImportResult::kSuccess &&
+        s.ahbImports->retiredRecordCount() > 16) {
+        VGLOG_VKB("releaseHardwareBuffer: retired count exceeded 16; "
+                  "forcing vkDeviceWaitIdle + drainAllRetired");
+        if (s.device != VK_NULL_HANDLE) {
+            vkDeviceWaitIdle(s.device);
+        }
+        s.ahbImports->drainAllRetired();
     }
-    if (s.frameRenderer) {
-        s.frameRenderer->invalidatePipeline();
-    }
-    return s.ahbImports->releaseBuffer(handle, outReleaseFenceFd);
+
+    return result;
 }
+
 
 bool VulkanBackend::hasHardwareBuffer(HardwareBufferHandle handle) const {
     if (!impl_ || !impl_->initialized || !impl_->ahbImports) return false;
@@ -751,8 +785,10 @@ bool VulkanBackend::hasHardwareBuffer(HardwareBufferHandle handle) const {
 
 // ---------------------------------------------------------------------------
 // renderFrame - Android.
-// Phase 2P1 exports a diagnostic release sync fd; full non-blocking retirement
-// remains deferred.
+// Phase 2P2: Non-blocking AHardwareBuffer retirement queue active.
+// Released imports are deferred to drainRetiredForFrame() called after the
+// corresponding frame fence wait, removing normal-path vkDeviceWaitIdle.
+// Compute-pipeline deferral is not implemented in this phase.
 // ---------------------------------------------------------------------------
 
 RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle handle) {
