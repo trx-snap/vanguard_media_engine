@@ -23,11 +23,16 @@ add_library(vanguard_render_vulkan STATIC
     "render/vulkan/src/vulkan_backend.cpp"
     "render/vulkan/src/vulkan_shader_module.cpp"
     "render/vulkan/src/vulkan_surface_swapchain.cpp"
+    "render/vulkan/src/vulkan_swapchain_render_targets.cpp"
     "render/vulkan/src/vulkan_hardware_buffer_imports.cpp"
     "render/vulkan/src/vulkan_hardware_buffer_image.cpp"
     "render/vulkan/src/vulkan_descriptor_resources.cpp"
 )
-target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include")
+target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include"
+    # Phase 2K: private Vulkan src dir exposed so vulkan_surface_swapchain.cpp
+    # can find vulkan_swapchain_render_targets.h without a broad include path.
+    PRIVATE "render/vulkan/src"
+)
 target_link_libraries(vanguard_render_vulkan PRIVATE vanguard_render_shared vanguard_core)
 
 add_library(vanguard_render_gles STATIC "render/gles/src/gles_backend.cpp")
