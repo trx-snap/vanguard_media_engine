@@ -77,6 +77,9 @@ using VG_PFN_DescribeBuffer =
 struct ImportRecord {
     AHardwareBuffer*          ahbPtr = nullptr; // acquired ref (AHardwareBuffer*)
     VulkanHardwareBufferImage image;
+    // Phase 2P1: latest release-fence fd exported after vkQueueSubmit.
+    // -1 means no fence is stored. Import record owns this fd.
+    int latestReleaseFenceFd = -1;
 };
 
 // ---------------------------------------------------------------------------
@@ -115,10 +118,16 @@ struct VulkanHardwareBufferImports::Impl {
     // Destroy a single record.  Does NOT remove it from the records map.
     //
     // Teardown order:
+    //   Phase 2P1: close latestReleaseFenceFd if valid (before GPU teardown)
     //   image.destroy() [acquireSemaphore -> sampler -> imageView ->
     //                    ycbcrConversion -> image -> memory] (Phase 2G/2D)
     //   -> AHardwareBuffer_release
     void destroyRecord(ImportRecord& rec) {
+        // Phase 2P1: close any stored release-fence fd before Vulkan teardown.
+        if (rec.latestReleaseFenceFd >= 0) {
+            ::close(rec.latestReleaseFenceFd);
+            rec.latestReleaseFenceFd = -1;
+        }
         rec.image.destroy(device, fnDestroyYcbcr);
         if (rec.ahbPtr && fnRelease) {
             fnRelease(rec.ahbPtr);
@@ -461,7 +470,20 @@ HardwareBufferImportResult VulkanHardwareBufferImports::releaseBuffer(
         return HardwareBufferImportResult::kUnknownHandle;
     }
 
-    s.destroyRecord(it->second);
+    // Phase 2P1: Transfer or close the stored release-fence fd before
+    // destroyRecord (which closes any leftover as a safety net).
+    ImportRecord& rec = it->second;
+    const int storedFd = rec.latestReleaseFenceFd;
+    rec.latestReleaseFenceFd = -1; // field cleared before destroyRecord
+    if (storedFd >= 0) {
+        if (outReleaseFenceFd) {
+            *outReleaseFenceFd = storedFd; // ownership transferred to caller
+        } else {
+            ::close(storedFd);
+        }
+    }
+
+    s.destroyRecord(rec);
     s.records.erase(it);
 
     VGLOG_AHB("releaseBuffer: handle=%" PRIu64, static_cast<uint64_t>(handle));
@@ -530,6 +552,28 @@ bool VulkanHardwareBufferImports::setImageLayout(
     auto it = s.records.find(handle);
     if (it == s.records.end()) return false;
     it->second.image.currentLayout = static_cast<VkImageLayout>(newLayout);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2P1: setLatestReleaseFenceFd() - Android
+// ---------------------------------------------------------------------------
+
+bool VulkanHardwareBufferImports::setLatestReleaseFenceFd(
+        HardwareBufferHandle handle, int fd) {
+    Impl& s = *impl_;
+    auto it = s.records.find(handle);
+    if (it == s.records.end()) {
+        // Invalid handle: close incoming valid FD to prevent leak.
+        if (fd >= 0) ::close(fd);
+        return false;
+    }
+    ImportRecord& rec = it->second;
+    // Close prior valid stored FD before overwriting.
+    if (rec.latestReleaseFenceFd >= 0) {
+        ::close(rec.latestReleaseFenceFd);
+    }
+    rec.latestReleaseFenceFd = fd; // store including -1
     return true;
 }
 
@@ -620,6 +664,17 @@ uint32_t VulkanHardwareBufferImports::getImageLayout(
 
 bool VulkanHardwareBufferImports::setImageLayout(
         HardwareBufferHandle /*handle*/, uint32_t /*newLayout*/) {
+    return false;
+}
+
+// Phase 2P1: Host stub — closes incoming valid fd, returns false.
+bool VulkanHardwareBufferImports::setLatestReleaseFenceFd(
+        HardwareBufferHandle /*handle*/, int fd) {
+#if !defined(_WIN32)
+    if (fd >= 0) ::close(fd);
+#else
+    (void)fd;
+#endif
     return false;
 }
 

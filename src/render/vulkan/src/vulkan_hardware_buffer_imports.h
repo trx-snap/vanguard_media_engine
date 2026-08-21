@@ -63,11 +63,20 @@ public:
         HardwareBufferDescriptor* outDescriptor);
 
     // Release a previously imported buffer by handle.
-    // Destroys imported resources in teardown order.
-    // outReleaseFenceFd - optional; set to -1 if non-null.
+    // Phase 2P1: transfers the stored latestReleaseFenceFd to *outReleaseFenceFd
+    // when provided; otherwise closes it. Sets the stored field to -1 before
+    // destroyRecord. Destroys imported resources in teardown order.
+    // outReleaseFenceFd - optional; set to -1 if non-null and no fd is stored.
     HardwareBufferImportResult releaseBuffer(
         HardwareBufferHandle handle,
         int* outReleaseFenceFd);
+
+    // Phase 2P1: Transfer the latest release-fence fd to the import record for
+    // handle. Ownership of fd>=0 transfers at entry on all paths.
+    // Valid handle: close prior valid stored FD, store incoming value
+    // (including -1), return true.
+    // Invalid handle: close incoming valid FD, return false.
+    bool setLatestReleaseFenceFd(HardwareBufferHandle handle, int fd);
 
     // Returns true iff handle is an active import.
     bool hasBuffer(HardwareBufferHandle handle) const;

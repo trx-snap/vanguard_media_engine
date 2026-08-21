@@ -21,6 +21,7 @@
 #include "vulkan_shader_module.h"
 
 #include <cstring>
+#include <unistd.h>
 
 #if defined(__ANDROID__)
 
@@ -72,6 +73,11 @@ struct VulkanFrameRenderer::Impl {
     uint32_t currentFrameIndex = 0;
     bool initialized = false;
 
+    // Phase 2P1: diagnostic release-semaphore export via vkGetSemaphoreFdKHR.
+    // Null if VK_KHR_external_semaphore_fd is unavailable; non-null logs but
+    // does not fail initialization.
+    PFN_vkGetSemaphoreFdKHR pfnGetSemaphoreFd = nullptr;
+
     void invalidatePipeline() {
         if (graphicsPipeline) {
             graphicsPipeline->destroy(device);
@@ -92,6 +98,7 @@ struct VulkanFrameRenderer::Impl {
         }
         swapchain.detach();
         invalidatePipeline();
+        pfnGetSemaphoreFd = nullptr; // fail-closed: clear export capability
         initialized = false;
         currentFrameIndex = 0;
         return result;
@@ -137,6 +144,16 @@ bool VulkanFrameRenderer::initialize(void* deviceHandle,
     impl_->activePipelineLayout = VK_NULL_HANDLE;
     impl_->activeRenderPassHandle = 0;
     impl_->currentFrameIndex = 0;
+
+    // Phase 2P1: Resolve vkGetSemaphoreFdKHR for diagnostic release-semaphore export.
+    // A null return is diagnostic (logged) but does not fail initialization;
+    // the export path will safely leave the stored FD at -1.
+    impl_->pfnGetSemaphoreFd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
+        vkGetDeviceProcAddr(dev, "vkGetSemaphoreFdKHR"));
+    if (!impl_->pfnGetSemaphoreFd) {
+        VGLOG_VFR("vkGetSemaphoreFdKHR not resolved; release-semaphore export unavailable");
+    }
+
     impl_->initialized = true;
 
     VGLOG_VFR("VulkanFrameRenderer initialized with %u frames in flight", frameCount);
@@ -160,6 +177,7 @@ void VulkanFrameRenderer::shutdown() {
     s.device = VK_NULL_HANDLE;
     s.commandPool = VK_NULL_HANDLE;
     s.currentFrameIndex = 0;
+    s.pfnGetSemaphoreFd = nullptr;
     s.initialized = false;
 
     VGLOG_VFR("VulkanFrameRenderer shut down");
@@ -355,6 +373,23 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
             u64ToVkHandle<VkSemaphore>(pendingAcquireSemaphoreHandle);
     }
 
+    // Phase 2P1: Build signal semaphore array.
+    // presentReady is always signaled (required for present).
+    // releaseFenceSemaphore is signaled only when both the semaphore and the
+    // vkGetSemaphoreFdKHR function pointer are valid; otherwise only presentReady
+    // is signaled and the stale stored release FD is cleared to -1.
+    const bool canExportRelease =
+        (frame->releaseFenceSemaphore != VK_NULL_HANDLE) && (s.pfnGetSemaphoreFd != nullptr);
+
+    VkSemaphore signalSemaphores[2] = {
+        presentReadySemaphore,
+        VK_NULL_HANDLE,
+    };
+    uint32_t signalSemaphoreCount = 1;
+    if (canExportRelease) {
+        signalSemaphores[signalSemaphoreCount++] = frame->releaseFenceSemaphore;
+    }
+
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.waitSemaphoreCount = waitSemaphoreCount;
@@ -362,8 +397,8 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     submitInfo.pWaitDstStageMask = waitStages;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &frame->commandBuffer;
-    submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores = &presentReadySemaphore;
+    submitInfo.signalSemaphoreCount = signalSemaphoreCount;
+    submitInfo.pSignalSemaphores = signalSemaphores;
 
     const VkQueue queue = static_cast<VkQueue>(queueHandle);
     const VkResult submitResult =
@@ -374,6 +409,46 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
                 ? RenderFrameResult::kDeviceLost
                 : RenderFrameResult::kVulkanFailure;
         return s.failClosed(swapchain, result);
+    }
+
+    // Phase 2P1: Export diagnostic release sync-fd via the dedicated
+    // releaseFenceSemaphore immediately after successful vkQueueSubmit.
+    // VK_SUCCESS + fd>=0: app-owned fd transferred to import record.
+    // VK_SUCCESS + fd==-1: valid empty sync-fd; clears any older stored FD.
+    // Export failure after signaling: close any fd>=0, clear stored FD, log,
+    // and failClosed so vkDeviceWaitIdle precedes semaphore teardown.
+    // No releaseFenceSemaphore or no function pointer: clear stale stored FD
+    // to -1. Never export/alter inFlightFence beyond wait/reset/submit tracking.
+    {
+        if (canExportRelease) {
+            int exportedFd = -1;
+            VkSemaphoreGetFdInfoKHR semGetFdInfo{};
+            semGetFdInfo.sType      = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+            semGetFdInfo.pNext      = nullptr;
+            semGetFdInfo.semaphore  = frame->releaseFenceSemaphore;
+            semGetFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+            const VkResult exportResult =
+                s.pfnGetSemaphoreFd(s.device, &semGetFdInfo, &exportedFd);
+            if (exportResult != VK_SUCCESS) {
+                VGLOG_VFR("vkGetSemaphoreFdKHR failed: %d; clearing stored release fd",
+                          static_cast<int>(exportResult));
+                if (exportedFd >= 0) {
+                    ::close(exportedFd);
+                }
+                // Clear stale stored FD and fail closed: vkDeviceWaitIdle
+                // must precede semaphore teardown after a failed export.
+                ahbImports.setLatestReleaseFenceFd(handle, -1);
+                return s.failClosed(swapchain, RenderFrameResult::kVulkanFailure);
+            }
+            // Transfer ownership to import record (including -1 to clear stale).
+            // setLatestReleaseFenceFd closes any prior valid FD on the record;
+            // on invalid handle it closes exportedFd if >=0. Either way no leak.
+            ahbImports.setLatestReleaseFenceFd(handle, exportedFd);
+        } else {
+            // releaseFenceSemaphore not available or function pointer not resolved:
+            // clear any stale stored release FD so callers see a safe sentinel.
+            ahbImports.setLatestReleaseFenceFd(handle, -1);
+        }
     }
 
     if (pendingAcquireSemaphoreHandle != 0 &&

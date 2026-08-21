@@ -181,6 +181,8 @@ static constexpr uint32_t kRequiredInstanceExtensionCount =
 // Required device extensions (device-scoped per Khronos spec).
 // Phase 2G: VK_KHR_external_semaphore_fd added to enable sync-fd acquire-fence
 // semaphore import (vkImportSemaphoreFdKHR) for DAG queue submit ordering.
+// Phase 2P1: VK_KHR_external_semaphore_fd also supports release-semaphore export
+// via vkGetSemaphoreFdKHR.
 static const char* kRequiredDeviceExtensions[] = {
     "VK_KHR_swapchain",
     "VK_ANDROID_external_memory_android_hardware_buffer",
@@ -748,19 +750,9 @@ bool VulkanBackend::hasHardwareBuffer(HardwareBufferHandle handle) const {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2O2B1: renderFrame - Android.
-// Backend frame runtime state scaffolding and argument validation.
-// Execution is deferred to Phase 2O2B2.
-//
-// Strictly forbidden in Phase 2O2B1:
-//   - vkAcquireNextImageKHR / VulkanSurfaceSwapchain::acquireNextImage
-//   - vkQueuePresentKHR / VulkanSurfaceSwapchain::presentImage
-//   - vkQueueSubmit
-//   - command buffer recording
-//   - vkWaitForFences / vkResetFences
-//   - markAcquireSemaphoreSubmitted
-//   - compute pipeline
-//   - release fence export
+// renderFrame - Android.
+// Phase 2P1 exports a diagnostic release sync fd; full non-blocking retirement
+// remains deferred.
 // ---------------------------------------------------------------------------
 
 RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle handle) {

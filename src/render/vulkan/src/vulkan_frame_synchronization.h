@@ -7,7 +7,9 @@
 // per-frame-in-flight execution and synchronization resources:
 //   - VkCommandBuffer (allocated from borrowed command pool)
 //   - VkSemaphore imageAvailableSemaphore (binary semaphore for swapchain acquisition)
-//   - VkFence inFlightFence (signaled initially to allow first frame wait)
+//   - VkFence inFlightFence (signaled initially to allow first frame wait; CPU-tracking only)
+//   - VkSemaphore releaseFenceSemaphore (exportable binary semaphore for release
+//     sync-fd export via vkGetSemaphoreFdKHR; inFlightFence is NOT exported)
 //
 // VkDevice and VkCommandPool are borrowed during initialize/shutdown and stored
 // internally only for explicit shutdown or move-assignment cleanup.
@@ -16,9 +18,8 @@
 //
 // NOTE: Compute pipeline remains deferred: compute pipeline still requires
 // storage output target plus descriptor/pipeline layout expansion.
-// NOTE: Release fence export remains deferred: release fence export requires
-// external fence fd support/probing (e.g. VK_KHR_external_fence_fd) and remains
-// later work.
+// NOTE: Phase 2P1 exports a diagnostic release sync fd via releaseFenceSemaphore;
+// full non-blocking retirement remains deferred.
 
 #pragma once
 
@@ -41,6 +42,10 @@ struct VulkanFrameSyncResources {
     VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
     VkSemaphore imageAvailableSemaphore = VK_NULL_HANDLE;
     VkFence inFlightFence = VK_NULL_HANDLE;
+    // Phase 2P1: dedicated exportable binary semaphore for release sync-fd
+    // export via vkGetSemaphoreFdKHR / VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT.
+    // inFlightFence is NOT exported; it is CPU-tracking only.
+    VkSemaphore releaseFenceSemaphore = VK_NULL_HANDLE;
 };
 
 #else
@@ -49,6 +54,7 @@ struct VulkanFrameSyncResources {
     void* commandBuffer = nullptr;
     void* imageAvailableSemaphore = nullptr;
     void* inFlightFence = nullptr;
+    void* releaseFenceSemaphore = nullptr;
 };
 
 #endif

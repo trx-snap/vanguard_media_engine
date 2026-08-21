@@ -62,13 +62,15 @@ jstring NewSmokeStatus(
     const char* renderFrame,
     const char* release,
     jint width,
-    jint height) {
+    jint height,
+    jint releaseFenceFd,
+    bool releaseFenceExported) {
     char status[kSmokeStatusCapacity];
     std::snprintf(
         status,
         sizeof(status),
         "status=%s;initialize=%s;attach=%s;import=%s;renderFrame=%s;"
-        "release=%s;width=%d;height=%d",
+        "release=%s;width=%d;height=%d;releaseFenceFd=%d;releaseFenceExported=%s",
         pass ? "PASS" : "FAIL",
         initialize,
         attach,
@@ -76,7 +78,9 @@ jstring NewSmokeStatus(
         renderFrame,
         release,
         width,
-        height);
+        height,
+        releaseFenceFd,
+        releaseFenceExported ? "true" : "false");
     return env->NewStringUTF(status);
 }
 
@@ -92,13 +96,16 @@ jstring NewLoopSmokeStatus(
     jint failingFrame,
     const char* release,
     jint width,
-    jint height) {
+    jint height,
+    jint releaseFenceFd,
+    bool releaseFenceExported) {
     char status[kSmokeStatusCapacity];
     std::snprintf(
         status,
         sizeof(status),
         "status=%s;initialize=%s;attach=%s;import=%s;renderedFrames=%d;frameCount=%d;"
-        "renderFrame=%s;failingFrame=%d;release=%s;width=%d;height=%d",
+        "renderFrame=%s;failingFrame=%d;release=%s;width=%d;height=%d;"
+        "releaseFenceFd=%d;releaseFenceExported=%s",
         pass ? "PASS" : "FAIL",
         initialize,
         attach,
@@ -109,7 +116,9 @@ jstring NewLoopSmokeStatus(
         failingFrame,
         release,
         width,
-        height);
+        height,
+        releaseFenceFd,
+        releaseFenceExported ? "true" : "false");
     return env->NewStringUTF(status);
 }
 
@@ -151,14 +160,14 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     if (surface == nullptr || hardwareBuffer == nullptr || width <= 0 || height <= 0) {
         return NewSmokeStatus(
             env, false, "not_run", "not_run", "not_run", "not_run",
-            "not_run", width, height);
+            "not_run", width, height, -1, false);
     }
 
     ANativeWindow* nativeWindow = ANativeWindow_fromSurface(env, surface);
     if (nativeWindow == nullptr) {
         return NewSmokeStatus(
             env, false, "not_run", "native_window_failed", "not_run", "not_run",
-            "not_run", width, height);
+            "not_run", width, height, -1, false);
     }
 
     void* libAndroid = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
@@ -166,7 +175,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         ANativeWindow_release(nativeWindow);
         return NewSmokeStatus(
             env, false, "not_run", "not_run", "hardware_buffer_jni_unavailable",
-            "not_run", "not_run", width, height);
+            "not_run", "not_run", width, height, -1, false);
     }
 
     auto fnFromHardwareBuffer = reinterpret_cast<FnAHardwareBuffer_fromHardwareBuffer>(
@@ -176,7 +185,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         ANativeWindow_release(nativeWindow);
         return NewSmokeStatus(
             env, false, "not_run", "not_run", "hardware_buffer_jni_unavailable",
-            "not_run", "not_run", width, height);
+            "not_run", "not_run", width, height, -1, false);
     }
 
     AHardwareBuffer* borrowedHardwareBuffer =
@@ -194,6 +203,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     bool releasePassed = false;
     bool cleanupCompleted = false;
     int releaseFenceFd = -1;
+    // Phase 2P1: capture pre-close fd value and exported flag for status reporting.
+    int capturedReleaseFenceFd = -1;
+    bool releaseFenceExported = false;
 
     try {
         vanguard::render::VulkanBackend backend;
@@ -237,6 +249,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             releaseStatus = HardwareBufferResultName(releaseResult);
             releasePassed = releaseResult ==
                 vanguard::render::HardwareBufferImportResult::kSuccess;
+
+            // Phase 2P1: capture pre-close fd and exported flag immediately after
+            // releaseHardwareBuffer and before close/reset.
+            capturedReleaseFenceFd = releaseFenceFd;
+            releaseFenceExported = (releaseFenceFd >= 0);
         }
 
         if (releaseFenceFd >= 0) {
@@ -269,7 +286,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         renderStatus,
         releaseStatus,
         width,
-        height);
+        height,
+        capturedReleaseFenceFd,
+        releaseFenceExported);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -284,14 +303,14 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     if (surface == nullptr || hardwareBuffer == nullptr || width <= 0 || height <= 0 || frameCount <= 0) {
         return NewLoopSmokeStatus(
             env, false, "not_run", "not_run", "not_run", 0, frameCount,
-            "not_run", -1, "not_run", width, height);
+            "not_run", -1, "not_run", width, height, -1, false);
     }
 
     ANativeWindow* nativeWindow = ANativeWindow_fromSurface(env, surface);
     if (nativeWindow == nullptr) {
         return NewLoopSmokeStatus(
             env, false, "not_run", "native_window_failed", "not_run", 0, frameCount,
-            "not_run", -1, "not_run", width, height);
+            "not_run", -1, "not_run", width, height, -1, false);
     }
 
     void* libAndroid = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
@@ -299,7 +318,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         ANativeWindow_release(nativeWindow);
         return NewLoopSmokeStatus(
             env, false, "not_run", "not_run", "hardware_buffer_jni_unavailable", 0, frameCount,
-            "not_run", -1, "not_run", width, height);
+            "not_run", -1, "not_run", width, height, -1, false);
     }
 
     auto fnFromHardwareBuffer = reinterpret_cast<FnAHardwareBuffer_fromHardwareBuffer>(
@@ -309,7 +328,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         ANativeWindow_release(nativeWindow);
         return NewLoopSmokeStatus(
             env, false, "not_run", "not_run", "hardware_buffer_jni_unavailable", 0, frameCount,
-            "not_run", -1, "not_run", width, height);
+            "not_run", -1, "not_run", width, height, -1, false);
     }
 
     AHardwareBuffer* borrowedHardwareBuffer =
@@ -329,6 +348,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     bool releasePassed = false;
     bool cleanupCompleted = false;
     int releaseFenceFd = -1;
+    // Phase 2P1: capture pre-close fd value and exported flag for status reporting.
+    int capturedReleaseFenceFd = -1;
+    bool releaseFenceExported = false;
 
     try {
         vanguard::render::VulkanBackend backend;
@@ -380,6 +402,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             releaseStatus = HardwareBufferResultName(releaseResult);
             releasePassed = releaseResult ==
                 vanguard::render::HardwareBufferImportResult::kSuccess;
+
+            // Phase 2P1: capture pre-close fd and exported flag immediately after
+            // releaseHardwareBuffer and before close/reset.
+            capturedReleaseFenceFd = releaseFenceFd;
+            releaseFenceExported = (releaseFenceFd >= 0);
         }
 
         if (releaseFenceFd >= 0) {
@@ -415,5 +442,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         failingFrame,
         releaseStatus,
         width,
-        height);
+        height,
+        capturedReleaseFenceFd,
+        releaseFenceExported);
 }

@@ -79,6 +79,8 @@ bool HasRequiredInstanceExtensions() {
 // vkEnumerateDeviceExtensionProperties.
 // VK_KHR_sampler_ycbcr_conversion is core in Vulkan 1.1 — not checked here.
 // Phase 2G: VK_KHR_external_semaphore_fd added for sync-fd semaphore import.
+// Phase 2P1: VK_KHR_external_semaphore_fd also supports release-semaphore export
+// via vkGetSemaphoreFdKHR.
 
 static const char* kRequiredDeviceExtensions[] = {
     "VK_KHR_swapchain",

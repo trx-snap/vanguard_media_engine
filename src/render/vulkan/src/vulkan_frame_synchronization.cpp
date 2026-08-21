@@ -10,9 +10,8 @@
 //
 // NOTE: Compute pipeline remains deferred: compute pipeline still requires
 // storage output target plus descriptor/pipeline layout expansion.
-// NOTE: Release fence export remains deferred: release fence export requires
-// external fence fd support/probing (e.g. VK_KHR_external_fence_fd) and remains
-// later work.
+// NOTE: Phase 2P1 exports a diagnostic release sync fd; full non-blocking
+// retirement remains deferred.
 
 #include "vulkan_frame_synchronization.h"
 
@@ -102,6 +101,21 @@ bool VulkanFrameSynchronization::initialize(VkDevice device,
     semInfo.pNext = nullptr;
     semInfo.flags = 0;
 
+    // Phase 2P1: releaseFenceSemaphore is a dedicated exportable binary semaphore
+    // for release sync-fd export via vkGetSemaphoreFdKHR.
+    // imageAvailableSemaphore remains non-exportable (no pNext chain needed).
+    VkExportSemaphoreCreateInfo exportSemCI{};
+    exportSemCI.sType       = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+    exportSemCI.pNext       = nullptr;
+    exportSemCI.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+
+    VkSemaphoreCreateInfo exportSemInfo{};
+    exportSemInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    exportSemInfo.pNext = &exportSemCI;
+    exportSemInfo.flags = 0;
+
+    // Phase 2P1: inFlightFence is CPU-tracking only; pNext=nullptr preserves
+    // VK_FENCE_CREATE_SIGNALED_BIT for correct first-frame wait. It is NOT exported.
     VkFenceCreateInfo fenceInfo{};
     fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fenceInfo.pNext = nullptr;
@@ -128,11 +142,24 @@ bool VulkanFrameSynchronization::initialize(VkDevice device,
             success = false;
             break;
         }
+
+        // Phase 2P1: create the dedicated exportable releaseFenceSemaphore.
+        res = vkCreateSemaphore(device, &exportSemInfo, nullptr, &newFrames[i].releaseFenceSemaphore);
+        if (res != VK_SUCCESS) {
+            VGLOG_FS("initialize: vkCreateSemaphore (releaseFence) failed for frame %u: %d",
+                     i, static_cast<int>(res));
+            success = false;
+            break;
+        }
     }
 
     if (!success) {
         // Rollback created sync primitives
         for (auto& frame : newFrames) {
+            if (frame.releaseFenceSemaphore != VK_NULL_HANDLE) {
+                vkDestroySemaphore(device, frame.releaseFenceSemaphore, nullptr);
+                frame.releaseFenceSemaphore = VK_NULL_HANDLE;
+            }
             if (frame.inFlightFence != VK_NULL_HANDLE) {
                 vkDestroyFence(device, frame.inFlightFence, nullptr);
                 frame.inFlightFence = VK_NULL_HANDLE;
@@ -164,6 +191,10 @@ void VulkanFrameSynchronization::shutdown(VkDevice device, VkCommandPool command
     if (dev != VK_NULL_HANDLE) {
         // Destroy fences and semaphores first
         for (auto& frame : frames_) {
+            if (frame.releaseFenceSemaphore != VK_NULL_HANDLE) {
+                vkDestroySemaphore(dev, frame.releaseFenceSemaphore, nullptr);
+                frame.releaseFenceSemaphore = VK_NULL_HANDLE;
+            }
             if (frame.inFlightFence != VK_NULL_HANDLE) {
                 vkDestroyFence(dev, frame.inFlightFence, nullptr);
                 frame.inFlightFence = VK_NULL_HANDLE;
