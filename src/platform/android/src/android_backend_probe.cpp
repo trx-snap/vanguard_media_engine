@@ -74,13 +74,16 @@ bool HasRequiredInstanceExtensions() {
 }
 
 // --- Device extension check ---
-// VK_KHR_swapchain and VK_ANDROID_external_memory_android_hardware_buffer
-// are device extensions. Must be queried with vkEnumerateDeviceExtensionProperties.
+// VK_KHR_swapchain, VK_ANDROID_external_memory_android_hardware_buffer, and
+// VK_KHR_external_semaphore_fd are device extensions.  Must be queried with
+// vkEnumerateDeviceExtensionProperties.
 // VK_KHR_sampler_ycbcr_conversion is core in Vulkan 1.1 — not checked here.
+// Phase 2G: VK_KHR_external_semaphore_fd added for sync-fd semaphore import.
 
 static const char* kRequiredDeviceExtensions[] = {
     "VK_KHR_swapchain",
     "VK_ANDROID_external_memory_android_hardware_buffer",
+    "VK_KHR_external_semaphore_fd",
 };
 static const int kRequiredDeviceExtensionCount =
     static_cast<int>(sizeof(kRequiredDeviceExtensions) / sizeof(kRequiredDeviceExtensions[0]));

@@ -158,9 +158,12 @@ static constexpr uint32_t kRequiredInstanceExtensionCount =
                            sizeof(kRequiredInstanceExtensions[0]));
 
 // Required device extensions (device-scoped per Khronos spec).
+// Phase 2G: VK_KHR_external_semaphore_fd added to enable sync-fd acquire-fence
+// semaphore import (vkImportSemaphoreFdKHR) for DAG queue submit ordering.
 static const char* kRequiredDeviceExtensions[] = {
     "VK_KHR_swapchain",
     "VK_ANDROID_external_memory_android_hardware_buffer",
+    "VK_KHR_external_semaphore_fd",
 };
 static constexpr uint32_t kRequiredDeviceExtensionCount =
     static_cast<uint32_t>(sizeof(kRequiredDeviceExtensions) /
@@ -500,8 +503,8 @@ void VulkanBackend::shutdown() {
     }
 
     // Phase 2C: Release all AHardwareBuffer imports before destroying device.
-    // ahbImports->shutdown() destroys VkImage, VkDeviceMemory, releases AHB
-    // refs, and closes stored fds.  Must run before vkDestroyDevice.
+    // ahbImports->shutdown() destroys acquire semaphores, sampling resources,
+    // VkImage, VkDeviceMemory, and releases AHB refs.  Must run before vkDestroyDevice.
     if (s.ahbImports) {
         s.ahbImports->shutdown();
         s.ahbImports.reset();

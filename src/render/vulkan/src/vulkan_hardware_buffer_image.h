@@ -1,5 +1,5 @@
 // vulkan_hardware_buffer_image.h
-// Phase 2E: Private helper - VulkanHardwareBufferImage.
+// Phase 2E/2G: Private helper - VulkanHardwareBufferImage.
 //
 // Owns and encapsulates the creation and destruction of Vulkan sampling resources
 // for an imported AHardwareBuffer:
@@ -35,6 +35,12 @@ struct VulkanHardwareBufferImage {
     VkImageView              imageView        = VK_NULL_HANDLE;
     VkSampler                sampler          = VK_NULL_HANDLE;
 
+    // Phase 2G: Binary semaphore imported from the AHardwareBuffer acquire-fence
+    // sync-fd.  VK_NULL_HANDLE when acquireFenceFd was -1 (no pending wait).
+    // The DAG queue submit will wait on this semaphore before recording the layout
+    // transition and sampling draw.  vkDestroySemaphore is called in destroy().
+    VkSemaphore              acquireSemaphore = VK_NULL_HANDLE;
+
     // Cached format state.
     VkFormat                 cachedFormat         = VK_FORMAT_UNDEFINED;
     uint64_t                 cachedExternalFormat = 0;
@@ -52,6 +58,7 @@ struct VulkanHardwareBufferImage {
           ycbcrConversion(other.ycbcrConversion),
           imageView(other.imageView),
           sampler(other.sampler),
+          acquireSemaphore(other.acquireSemaphore),
           cachedFormat(other.cachedFormat),
           cachedExternalFormat(other.cachedExternalFormat),
           cachedLayerCount(other.cachedLayerCount) {
@@ -60,6 +67,7 @@ struct VulkanHardwareBufferImage {
         other.ycbcrConversion = VK_NULL_HANDLE;
         other.imageView = VK_NULL_HANDLE;
         other.sampler = VK_NULL_HANDLE;
+        other.acquireSemaphore = VK_NULL_HANDLE;
         other.cachedFormat = VK_FORMAT_UNDEFINED;
         other.cachedExternalFormat = 0;
         other.cachedLayerCount = 1;
@@ -72,6 +80,7 @@ struct VulkanHardwareBufferImage {
             ycbcrConversion = other.ycbcrConversion;
             imageView = other.imageView;
             sampler = other.sampler;
+            acquireSemaphore = other.acquireSemaphore;
             cachedFormat = other.cachedFormat;
             cachedExternalFormat = other.cachedExternalFormat;
             cachedLayerCount = other.cachedLayerCount;
@@ -81,6 +90,7 @@ struct VulkanHardwareBufferImage {
             other.ycbcrConversion = VK_NULL_HANDLE;
             other.imageView = VK_NULL_HANDLE;
             other.sampler = VK_NULL_HANDLE;
+            other.acquireSemaphore = VK_NULL_HANDLE;
             other.cachedFormat = VK_FORMAT_UNDEFINED;
             other.cachedExternalFormat = 0;
             other.cachedLayerCount = 1;
@@ -96,6 +106,13 @@ struct VulkanHardwareBufferImage {
         return ycbcrConversion != VK_NULL_HANDLE;
     }
 
+    // Phase 2G: Returns the imported acquire-fence semaphore, or VK_NULL_HANDLE
+    // if no fence was pending (acquireFenceFd was -1).
+    // The DAG queue submit uses this to wait before the layout transition + draw.
+    VkSemaphore getAcquireSemaphore() const {
+        return acquireSemaphore;
+    }
+
     // Creates the VkImage, binds imported VkDeviceMemory, and creates
     // VkSamplerYcbcrConversion (if external format), VkImageView, and VkSampler.
     // On any failure, all partially created Vulkan resources are destroyed in
@@ -109,8 +126,10 @@ struct VulkanHardwareBufferImage {
         PFN_vkCreateSamplerYcbcrConversion fnCreateYcbcr,
         PFN_vkDestroySamplerYcbcrConversion fnDestroyYcbcr);
 
-    // Destroys all owned Vulkan resources in Phase 2D teardown order:
-    //   vkDestroySampler -> vkDestroyImageView -> vkDestroySamplerYcbcrConversion
+    // Destroys all owned Vulkan resources in teardown order:
+    //   vkDestroySemaphore (acquireSemaphore, Phase 2G)
+    //   -> vkDestroySampler -> vkDestroyImageView
+    //   -> vkDestroySamplerYcbcrConversion
     //   -> vkDestroyImage -> vkFreeMemory
     void destroy(
         VkDevice device,

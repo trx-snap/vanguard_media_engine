@@ -1,5 +1,8 @@
 // vulkan_hardware_buffer_image.cpp
-// Phase 2E: Vulkan hardware buffer image resource encapsulation.
+// Phase 2E/2G: Vulkan hardware buffer image resource encapsulation.
+// Phase 2G adds: acquireSemaphore ownership (VkSemaphore imported from sync-fd
+// acquire fence) with destroy() cleanup and getAcquireSemaphore() accessor for
+// the upcoming DAG queue submit.
 
 #include "vulkan_hardware_buffer_image.h"
 
@@ -277,6 +280,11 @@ void VulkanHardwareBufferImage::destroy(
     VkDevice device,
     PFN_vkDestroySamplerYcbcrConversion fnDestroyYcbcr)
 {
+    // Phase 2G: destroy the imported acquire-fence semaphore first.
+    if (acquireSemaphore != VK_NULL_HANDLE) {
+        vkDestroySemaphore(device, acquireSemaphore, nullptr);
+        acquireSemaphore = VK_NULL_HANDLE;
+    }
     if (sampler != VK_NULL_HANDLE) {
         vkDestroySampler(device, sampler, nullptr);
         sampler = VK_NULL_HANDLE;

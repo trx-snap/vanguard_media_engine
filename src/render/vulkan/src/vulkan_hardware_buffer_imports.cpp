@@ -1,9 +1,10 @@
 // vulkan_hardware_buffer_imports.cpp
-// Phase 2E: AHardwareBuffer Vulkan import management & table helper.
+// Phase 2E/2G: AHardwareBuffer Vulkan import management & table helper.
 //
 // Manages the handle map, monotonic handle allocation, AHardwareBuffer NDK
-// reference acquisition/release (libandroid.so), acquire fence fd ownership,
-// and delegates Vulkan resource creation/teardown to VulkanHardwareBufferImage.
+// reference acquisition/release (libandroid.so), acquire-fence semaphore import
+// (Phase 2G), and delegates Vulkan resource creation/teardown to
+// VulkanHardwareBufferImage.
 //
 // Android-only: all implementation is inside #if defined(__ANDROID__) ... #endif.
 // Non-Android translation unit compiles to stubs only.
@@ -12,14 +13,13 @@
 // are loaded via dlopen/dlsym at runtime (no strong symbol references).
 //
 // vkGetAndroidHardwareBufferPropertiesANDROID,
-// vkCreateSamplerYcbcrConversion, and vkDestroySamplerYcbcrConversion
-// are loaded via vkGetDeviceProcAddr.
+// vkCreateSamplerYcbcrConversion, vkDestroySamplerYcbcrConversion, and
+// vkImportSemaphoreFdKHR are loaded via vkGetDeviceProcAddr.
 //
-// Forbidden (Phase 2E boundary):
+// Forbidden (Phase 2G boundary):
 //   JNI, AHardwareBuffer_allocate, lock/unlock, fromHardwareBuffer,
 //   descriptor sets, immutable sampler layouts, shaders, pipelines,
-//   command buffers, render passes, queue submit, presentation,
-//   semaphore import/wait, sync-fd GPU wait.
+//   render passes, queue submit, presentation.
 
 #include "vulkan_hardware_buffer_imports.h"
 #include "vulkan_hardware_buffer_image.h"
@@ -68,12 +68,14 @@ using VG_PFN_DescribeBuffer =
 
 // ---------------------------------------------------------------------------
 // Per-import record
-// Phase 2E: encapsulates Vulkan resources in VulkanHardwareBufferImage.
+// Phase 2E/2G: encapsulates Vulkan resources in VulkanHardwareBufferImage.
+// Phase 2G: acquireFenceFd is no longer stored here; after successful import
+// the fd is consumed by vkImportSemaphoreFdKHR (Vulkan owns it) and the
+// resulting VkSemaphore lives in image.acquireSemaphore.
 // ---------------------------------------------------------------------------
 
 struct ImportRecord {
-    AHardwareBuffer*          ahbPtr         = nullptr; // acquired ref (AHardwareBuffer*)
-    int                       acquireFenceFd = -1;      // stored fd; -1 if none/closed
+    AHardwareBuffer*          ahbPtr = nullptr; // acquired ref (AHardwareBuffer*)
     VulkanHardwareBufferImage image;
 };
 
@@ -101,28 +103,26 @@ struct VulkanHardwareBufferImports::Impl {
     PFN_vkCreateSamplerYcbcrConversion  fnCreateYcbcr  = nullptr;
     PFN_vkDestroySamplerYcbcrConversion fnDestroyYcbcr = nullptr;
 
+    // Phase 2G: VK_KHR_external_semaphore_fd entry point for sync-fd import.
+    PFN_vkImportSemaphoreFdKHR fnImportSemaphoreFd = nullptr;
+
     // Handle table and monotonic counter.
     std::unordered_map<HardwareBufferHandle, ImportRecord> records;
     std::atomic<uint64_t> nextHandle{1};
 
     bool initialized = false;
 
-    // Destroy a single record in Phase 2D teardown order.
-    // Does NOT remove it from the records map.
+    // Destroy a single record.  Does NOT remove it from the records map.
     //
-    // Required order:
-    //   Vulkan resources (sampler -> imageView -> ycbcrConversion -> image -> memory)
+    // Teardown order:
+    //   image.destroy() [acquireSemaphore -> sampler -> imageView ->
+    //                    ycbcrConversion -> image -> memory] (Phase 2G/2D)
     //   -> AHardwareBuffer_release
-    //   -> close(acquireFenceFd)
     void destroyRecord(ImportRecord& rec) {
         rec.image.destroy(device, fnDestroyYcbcr);
         if (rec.ahbPtr && fnRelease) {
             fnRelease(rec.ahbPtr);
             rec.ahbPtr = nullptr;
-        }
-        if (rec.acquireFenceFd >= 0) {
-            ::close(rec.acquireFenceFd);
-            rec.acquireFenceFd = -1;
         }
     }
 };
@@ -205,8 +205,21 @@ bool VulkanHardwareBufferImports::initialize(void* deviceHandle,
         return false;
     }
 
+    // Phase 2G: resolve vkImportSemaphoreFdKHR for acquire-fence semaphore import.
+    // A null pointer here means VK_KHR_external_semaphore_fd was not exposed by
+    // the driver despite being in the required extension list.  initialize() still
+    // succeeds (the helper is otherwise functional); importBuffer() will return
+    // kVulkanFunctionUnavailable for any import that carries a valid fd.
+    s.fnImportSemaphoreFd =
+        reinterpret_cast<PFN_vkImportSemaphoreFdKHR>(
+            vkGetDeviceProcAddr(s.device, "vkImportSemaphoreFdKHR"));
+    if (!s.fnImportSemaphoreFd) {
+        VGLOG_AHB("vkGetDeviceProcAddr(vkImportSemaphoreFdKHR) returned null; "
+                  "acquire-fence semaphore import unavailable");
+    }
+
     s.initialized = true;
-    VGLOG_AHB("VulkanHardwareBufferImports initialized (Phase 2E)");
+    VGLOG_AHB("VulkanHardwareBufferImports initialized (Phase 2G)");
     return true;
 }
 
@@ -218,7 +231,7 @@ void VulkanHardwareBufferImports::shutdown() {
     if (!impl_) return;
     Impl& s = *impl_;
 
-    // Destroy all import records in Phase 2D teardown order.
+    // Destroy all import records (acquireSemaphore -> Vulkan resources -> AHB ref).
     for (auto& kv : s.records) {
         s.destroyRecord(kv.second);
     }
@@ -229,15 +242,16 @@ void VulkanHardwareBufferImports::shutdown() {
         s.libAndroid = nullptr;
     }
 
-    s.fnAcquire      = nullptr;
-    s.fnRelease      = nullptr;
-    s.fnDescribe     = nullptr;
-    s.fnGetAHBProps  = nullptr;
-    s.fnCreateYcbcr  = nullptr;
-    s.fnDestroyYcbcr = nullptr;
-    s.device         = VK_NULL_HANDLE;
-    s.physDev        = VK_NULL_HANDLE;
-    s.initialized    = false;
+    s.fnAcquire           = nullptr;
+    s.fnRelease           = nullptr;
+    s.fnDescribe          = nullptr;
+    s.fnGetAHBProps       = nullptr;
+    s.fnCreateYcbcr       = nullptr;
+    s.fnDestroyYcbcr      = nullptr;
+    s.fnImportSemaphoreFd = nullptr;
+    s.device              = VK_NULL_HANDLE;
+    s.physDev             = VK_NULL_HANDLE;
+    s.initialized         = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,11 +266,15 @@ HardwareBufferImportResult VulkanHardwareBufferImports::importBuffer(
 {
     Impl& s = *impl_;
 
-    // Helper: release AHB ref if acquired, close fence, zero outputs, and return result.
+    // Helper: release AHB ref if acquired, close fence fd if still owned by us
+    // (not yet transferred to Vulkan), zero outputs, and return result.
+    // acquireFenceFd is captured by reference so that successful semaphore import
+    // (which sets it to -1) prevents double-close here.
     auto fail = [&](HardwareBufferImportResult r,
                     AHardwareBuffer* ahbRef) -> HardwareBufferImportResult {
         if (ahbRef && s.fnRelease)   s.fnRelease(ahbRef);
         if (acquireFenceFd >= 0)     ::close(acquireFenceFd);
+        acquireFenceFd = -1;
         if (outHandle)     *outHandle     = kInvalidHardwareBufferHandle;
         if (outDescriptor) *outDescriptor = HardwareBufferDescriptor{};
         return r;
@@ -323,16 +341,80 @@ HardwareBufferImportResult VulkanHardwareBufferImports::importBuffer(
         return fail(imgResult, ahbRef);
     }
 
+    // -------------------------------------------------------------------------
+    // Phase 2G: Import acquire-fence fd as a Vulkan binary semaphore.
+    //
+    // If acquireFenceFd == -1 there is no pending acquire wait; skip import.
+    // If acquireFenceFd >= 0 and fnImportSemaphoreFd is unavailable, the fd is
+    // closed and kVulkanFunctionUnavailable is returned (full failure path).
+    // On VK_SUCCESS vkImportSemaphoreFdKHR takes ownership of the fd; set
+    // acquireFenceFd to -1 so the fail lambda cannot double-close.
+    // On Vulkan failure the semaphore is destroyed, fd is closed, and
+    // kVulkanFailure is returned.
+    // -------------------------------------------------------------------------
+    if (acquireFenceFd >= 0) {
+        if (!s.fnImportSemaphoreFd) {
+            VGLOG_AHB("importBuffer: vkImportSemaphoreFdKHR unavailable; "
+                      "closing fence fd=%d", acquireFenceFd);
+            // Vulkan image is fully created but we cannot import the fence.
+            // Destroy the image before failing.
+            vkImage.destroy(s.device, s.fnDestroyYcbcr);
+            return fail(HardwareBufferImportResult::kVulkanFunctionUnavailable, ahbRef);
+        }
+
+        // Create a binary semaphore to receive the imported sync-fd.
+        VkSemaphoreCreateInfo semCI{};
+        semCI.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        semCI.pNext = nullptr;
+        semCI.flags = 0;
+
+        VkSemaphore acqSem = VK_NULL_HANDLE;
+        VkResult vr = vkCreateSemaphore(s.device, &semCI, nullptr, &acqSem);
+        if (vr != VK_SUCCESS) {
+            VGLOG_AHB("importBuffer: vkCreateSemaphore failed: %d (fd=%d)",
+                      static_cast<int>(vr), acquireFenceFd);
+            vkImage.destroy(s.device, s.fnDestroyYcbcr);
+            return fail(HardwareBufferImportResult::kVulkanFailure, ahbRef);
+        }
+
+        // Import the sync-fd into the semaphore.
+        // VK_SEMAPHORE_IMPORT_TEMPORARY_BIT: the semaphore's permanent payload
+        // is unaffected; the temporary payload is used for this one wait.
+        VkImportSemaphoreFdInfoKHR importInfo{};
+        importInfo.sType      = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
+        importInfo.pNext      = nullptr;
+        importInfo.semaphore  = acqSem;
+        importInfo.flags      = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT;
+        importInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+        importInfo.fd         = acquireFenceFd;
+
+        vr = s.fnImportSemaphoreFd(s.device, &importInfo);
+        if (vr == VK_SUCCESS) {
+            // Vulkan now owns the fd; prevent any further close().
+            acquireFenceFd = -1;
+            vkImage.acquireSemaphore = acqSem;
+            VGLOG_AHB("importBuffer: acquire-fence fd imported as VkSemaphore");
+        } else {
+            VGLOG_AHB("importBuffer: vkImportSemaphoreFdKHR failed: %d (fd=%d)",
+                      static_cast<int>(vr), acquireFenceFd);
+            vkDestroySemaphore(s.device, acqSem, nullptr);
+            // fd still owned by us; fail() will close it.
+            vkImage.destroy(s.device, s.fnDestroyYcbcr);
+            return fail(HardwareBufferImportResult::kVulkanFailure, ahbRef);
+        }
+    }
+    // acquireFenceFd == -1 at this point (either it was already -1, or Vulkan owns it).
+
     // --- Register in handle table ---
     HardwareBufferHandle handle = s.nextHandle.fetch_add(1);
 
     const bool isExternal = vkImage.isExternalFormat();
     const bool hasYcbcr = vkImage.hasYcbcrConversion();
+    const bool hasAcquireSem = (vkImage.getAcquireSemaphore() != VK_NULL_HANDLE);
 
     ImportRecord rec{};
-    rec.ahbPtr         = ahbRef;
-    rec.acquireFenceFd = acquireFenceFd; // ownership transferred; stored here
-    rec.image          = std::move(vkImage);
+    rec.ahbPtr = ahbRef;
+    rec.image  = std::move(vkImage);
 
     s.records.emplace(handle, std::move(rec));
 
@@ -346,12 +428,13 @@ HardwareBufferImportResult VulkanHardwareBufferImports::importBuffer(
     outDescriptor->usage  = desc.usage;
 
     VGLOG_AHB("importBuffer: handle=%" PRIu64
-              " ahb=%p externalFmt=%s ycbcr=%s layers=%u",
+              " ahb=%p externalFmt=%s ycbcr=%s layers=%u acqSem=%s",
               static_cast<uint64_t>(handle),
               static_cast<void*>(ahbRef),
               isExternal ? "yes" : "no",
               hasYcbcr ? "yes" : "no",
-              desc.layers);
+              desc.layers,
+              hasAcquireSem ? "yes" : "no");
 
     return HardwareBufferImportResult::kSuccess;
 }
