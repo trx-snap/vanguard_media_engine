@@ -48,6 +48,7 @@ struct VulkanBackend::Impl {
     VkDevice         device    = VK_NULL_HANDLE;
     VkQueue          queue     = VK_NULL_HANDLE;
     uint32_t         queueFamilyIndex = UINT32_MAX;
+    VkCommandPool    commandPool = VK_NULL_HANDLE; // Phase 2F
 #endif
 
     // Phase 2B2: surface/swapchain lifecycle helper.
@@ -441,7 +442,26 @@ bool VulkanBackend::initialize() {
               static_cast<void*>(s.queue),
               s.queueFamilyIndex);
 
-    // --- 7. Initialize Phase 2C AHardwareBuffer import helper ---
+    // --- 7. Create persistent command pool (Phase 2F) ---
+    VkCommandPoolCreateInfo poolCI{};
+    poolCI.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolCI.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolCI.queueFamilyIndex = s.queueFamilyIndex;
+
+    result = vkCreateCommandPool(s.device, &poolCI, nullptr, &s.commandPool);
+    if (result != VK_SUCCESS) {
+        VGLOG_VKB("vkCreateCommandPool failed: %d", static_cast<int>(result));
+        vkDestroyDevice(s.device, nullptr);
+        s.device           = VK_NULL_HANDLE;
+        s.queue            = VK_NULL_HANDLE;
+        vkDestroyInstance(s.instance, nullptr);
+        s.instance         = VK_NULL_HANDLE;
+        s.physDev          = VK_NULL_HANDLE;
+        s.queueFamilyIndex = UINT32_MAX;
+        return false;
+    }
+
+    // --- 8. Initialize Phase 2C AHardwareBuffer import helper ---
     s.ahbImports = std::make_unique<VulkanHardwareBufferImports>();
     if (!s.ahbImports->initialize(static_cast<void*>(s.device),
                                    static_cast<void*>(s.physDev))) {
@@ -485,6 +505,12 @@ void VulkanBackend::shutdown() {
     if (s.ahbImports) {
         s.ahbImports->shutdown();
         s.ahbImports.reset();
+    }
+
+    // Phase 2F: Destroy persistent command pool before vkDestroyDevice.
+    if (s.commandPool != VK_NULL_HANDLE && s.device != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(s.device, s.commandPool, nullptr);
+        s.commandPool = VK_NULL_HANDLE;
     }
 
     // Reverse-order: device -> instance.

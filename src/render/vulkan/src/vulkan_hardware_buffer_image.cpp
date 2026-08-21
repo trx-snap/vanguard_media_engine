@@ -268,6 +268,7 @@ HardwareBufferImportResult VulkanHardwareBufferImage::create(
 
     cachedFormat         = imageFormat;
     cachedExternalFormat = isExternal ? fmtProps.externalFormat : 0;
+    cachedLayerCount     = desc.layers; // Phase 2F
 
     return HardwareBufferImportResult::kSuccess;
 }
@@ -298,6 +299,60 @@ void VulkanHardwareBufferImage::destroy(
     }
     cachedFormat         = VK_FORMAT_UNDEFINED;
     cachedExternalFormat = 0;
+    cachedLayerCount     = 1; // Phase 2F
+}
+
+// Phase 2F: Records one VkImageMemoryBarrier via vkCmdPipelineBarrier.
+// Does NOT submit the command buffer.
+void VulkanHardwareBufferImage::recordLayoutTransition(
+    VkCommandBuffer commandBuffer,
+    VkImageLayout oldLayout,
+    VkImageLayout newLayout,
+    VkPipelineStageFlags srcStageMask,
+    VkPipelineStageFlags dstStageMask,
+    VkAccessFlags srcAccessMask,
+    VkAccessFlags dstAccessMask,
+    uint32_t srcQueueFamilyIndex,
+    uint32_t dstQueueFamilyIndex) const
+{
+    // Guard: must have a recording command buffer and a valid image.
+    if (commandBuffer == VK_NULL_HANDLE || image == VK_NULL_HANDLE) {
+        return;
+    }
+
+    // Guard: for external-format images, only UNDEFINED -> SHADER_READ_ONLY_OPTIMAL
+    // is a valid transition.  All other layout pairs are silently ignored.
+    if (isExternalFormat()) {
+        if (oldLayout != VK_IMAGE_LAYOUT_UNDEFINED ||
+            newLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            return;
+        }
+    }
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.pNext               = nullptr;
+    barrier.srcAccessMask       = srcAccessMask;
+    barrier.dstAccessMask       = dstAccessMask;
+    barrier.oldLayout           = oldLayout;
+    barrier.newLayout           = newLayout;
+    barrier.srcQueueFamilyIndex = srcQueueFamilyIndex;
+    barrier.dstQueueFamilyIndex = dstQueueFamilyIndex;
+    barrier.image               = image;
+    barrier.subresourceRange.aspectMask     = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseMipLevel   = 0;
+    barrier.subresourceRange.levelCount     = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount     = cachedLayerCount;
+
+    vkCmdPipelineBarrier(
+        commandBuffer,
+        srcStageMask,
+        dstStageMask,
+        /*dependencyFlags=*/0,
+        /*memoryBarrierCount=*/0,    nullptr,
+        /*bufferMemoryBarrierCount=*/0, nullptr,
+        /*imageMemoryBarrierCount=*/1,  &barrier);
 }
 
 } // namespace render

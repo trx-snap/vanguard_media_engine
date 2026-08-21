@@ -38,6 +38,7 @@ struct VulkanHardwareBufferImage {
     // Cached format state.
     VkFormat                 cachedFormat         = VK_FORMAT_UNDEFINED;
     uint64_t                 cachedExternalFormat = 0;
+    uint32_t                 cachedLayerCount     = 1; // Phase 2F
 
     VulkanHardwareBufferImage() = default;
 
@@ -52,7 +53,8 @@ struct VulkanHardwareBufferImage {
           imageView(other.imageView),
           sampler(other.sampler),
           cachedFormat(other.cachedFormat),
-          cachedExternalFormat(other.cachedExternalFormat) {
+          cachedExternalFormat(other.cachedExternalFormat),
+          cachedLayerCount(other.cachedLayerCount) {
         other.image = VK_NULL_HANDLE;
         other.memory = VK_NULL_HANDLE;
         other.ycbcrConversion = VK_NULL_HANDLE;
@@ -60,6 +62,7 @@ struct VulkanHardwareBufferImage {
         other.sampler = VK_NULL_HANDLE;
         other.cachedFormat = VK_FORMAT_UNDEFINED;
         other.cachedExternalFormat = 0;
+        other.cachedLayerCount = 1;
     }
 
     VulkanHardwareBufferImage& operator=(VulkanHardwareBufferImage&& other) noexcept {
@@ -71,6 +74,7 @@ struct VulkanHardwareBufferImage {
             sampler = other.sampler;
             cachedFormat = other.cachedFormat;
             cachedExternalFormat = other.cachedExternalFormat;
+            cachedLayerCount = other.cachedLayerCount;
 
             other.image = VK_NULL_HANDLE;
             other.memory = VK_NULL_HANDLE;
@@ -79,6 +83,7 @@ struct VulkanHardwareBufferImage {
             other.sampler = VK_NULL_HANDLE;
             other.cachedFormat = VK_FORMAT_UNDEFINED;
             other.cachedExternalFormat = 0;
+            other.cachedLayerCount = 1;
         }
         return *this;
     }
@@ -110,6 +115,22 @@ struct VulkanHardwareBufferImage {
     void destroy(
         VkDevice device,
         PFN_vkDestroySamplerYcbcrConversion fnDestroyYcbcr);
+
+    // Phase 2F: Records a pipeline-barrier image-layout transition into an
+    // already-recording command buffer.  Does NOT submit the command buffer.
+    // - Returns immediately if commandBuffer or image is VK_NULL_HANDLE.
+    // - For external-format images, only UNDEFINED -> SHADER_READ_ONLY_OPTIMAL
+    //   is permitted; any other layout pair is silently ignored.
+    void recordLayoutTransition(
+        VkCommandBuffer commandBuffer,
+        VkImageLayout oldLayout,
+        VkImageLayout newLayout,
+        VkPipelineStageFlags srcStageMask,
+        VkPipelineStageFlags dstStageMask,
+        VkAccessFlags srcAccessMask,
+        VkAccessFlags dstAccessMask,
+        uint32_t srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        uint32_t dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED) const;
 };
 
 } // namespace render
