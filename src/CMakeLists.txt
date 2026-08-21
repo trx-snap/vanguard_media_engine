@@ -58,11 +58,13 @@ set_target_properties(vanguard_media_engine PROPERTIES
 target_compile_definitions(vanguard_media_engine PUBLIC DART_SHARED_LIB)
 
 if (ANDROID)
-  add_library(vanguard_platform_android STATIC "platform/android/src/jni_bridge.cpp" "platform/android/src/android_backend_probe.cpp")
-  target_include_directories(vanguard_platform_android PUBLIC "platform/android/include")
-  target_link_libraries(vanguard_platform_android PRIVATE vanguard_core vanguard_render_shared vanguard_render_vulkan vanguard_render_gles)
+  target_sources(vanguard_media_engine PRIVATE
+    "platform/android/src/jni_bridge.cpp"
+    "platform/android/src/android_backend_probe.cpp"
+  )
+  target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
 
-  # Support Android 15 16k page size
+  # Support Android 15 16 KB page size
   target_link_options(vanguard_media_engine PRIVATE "-Wl,-z,max-page-size=16384")
   # Link modular targets and Android native libraries
   target_link_libraries(vanguard_media_engine
@@ -72,7 +74,6 @@ if (ANDROID)
     vanguard_render_shared
     vanguard_render_vulkan
     vanguard_render_gles
-    vanguard_platform_android
     android
     log
     GLESv3

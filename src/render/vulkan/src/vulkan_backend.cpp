@@ -254,7 +254,23 @@ bool CheckDeviceExtensions(VkPhysicalDevice physDev) {
 // Returns true iff the device reports samplerYcbcrConversion == VK_TRUE via
 // the VkPhysicalDeviceFeatures2 / VkPhysicalDeviceSamplerYcbcrConversionFeatures
 // pNext chain. Requires Vulkan 1.1 (feature query via pNext is core 1.1).
-bool CheckYcbcrConversionFeature(VkPhysicalDevice physDev) {
+// Dynamically resolves vkGetPhysicalDeviceFeatures2 to maintain minSdk 24 compatibility.
+bool CheckYcbcrConversionFeature(VkInstance instance, VkPhysicalDevice physDev) {
+    if (instance == VK_NULL_HANDLE || physDev == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    auto pfnGetPhysicalDeviceFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+        vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2"));
+    if (!pfnGetPhysicalDeviceFeatures2) {
+        pfnGetPhysicalDeviceFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+            vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceFeatures2KHR"));
+    }
+    if (!pfnGetPhysicalDeviceFeatures2) {
+        VGLOG_VKB("vkGetPhysicalDeviceFeatures2 symbol not found via vkGetInstanceProcAddr");
+        return false;
+    }
+
     VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr{};
     ycbcr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES;
     ycbcr.pNext = nullptr;
@@ -263,7 +279,7 @@ bool CheckYcbcrConversionFeature(VkPhysicalDevice physDev) {
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
     features2.pNext = &ycbcr;
 
-    vkGetPhysicalDeviceFeatures2(physDev, &features2);
+    pfnGetPhysicalDeviceFeatures2(physDev, &features2);
 
     if (ycbcr.samplerYcbcrConversion != VK_TRUE) {
         VGLOG_VKB("samplerYcbcrConversion not supported on physical device");
@@ -404,7 +420,7 @@ bool VulkanBackend::initialize() {
         }
 
         // d) samplerYcbcrConversion feature.
-        if (!CheckYcbcrConversionFeature(dev)) {
+        if (!CheckYcbcrConversionFeature(s.instance, dev)) {
             VGLOG_VKB("  Rejected: samplerYcbcrConversion not supported");
             continue;
         }

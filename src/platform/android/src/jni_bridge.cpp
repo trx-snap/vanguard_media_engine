@@ -1,6 +1,86 @@
 #include <jni.h>
+
+#include <android/hardware_buffer.h>
+#include <android/native_window_jni.h>
+#include <dlfcn.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstdint>
+
 #include "vanguard/platform/android_backend_probe.h"
 #include "vanguard/core/logging.h"
+#include "vanguard/render/vulkan_backend.h"
+
+namespace {
+
+using FnAHardwareBuffer_fromHardwareBuffer =
+    AHardwareBuffer* (*)(JNIEnv*, jobject);
+
+const char* HardwareBufferResultName(
+    vanguard::render::HardwareBufferImportResult result) {
+    using Result = vanguard::render::HardwareBufferImportResult;
+    switch (result) {
+        case Result::kSuccess: return "success";
+        case Result::kUnavailable: return "unavailable";
+        case Result::kBackendNotInitialized: return "backend_not_initialized";
+        case Result::kInvalidArgument: return "invalid_argument";
+        case Result::kDuplicateImport: return "duplicate_import";
+        case Result::kIncompatibleBuffer: return "incompatible_buffer";
+        case Result::kVulkanFunctionUnavailable: return "vulkan_function_unavailable";
+        case Result::kVulkanFailure: return "vulkan_failure";
+        case Result::kUnknownHandle: return "unknown_handle";
+    }
+    return "unknown";
+}
+
+const char* RenderFrameResultName(vanguard::render::RenderFrameResult result) {
+    using Result = vanguard::render::RenderFrameResult;
+    switch (result) {
+        case Result::kSuccess: return "success";
+        case Result::kSuboptimal: return "suboptimal";
+        case Result::kBackendNotInitialized: return "backend_not_initialized";
+        case Result::kNoSurface: return "no_surface";
+        case Result::kInvalidBufferHandle: return "invalid_buffer_handle";
+        case Result::kOutOfDate: return "out_of_date";
+        case Result::kSurfaceLost: return "surface_lost";
+        case Result::kDeviceLost: return "device_lost";
+        case Result::kVulkanFailure: return "vulkan_failure";
+        case Result::kUnavailable: return "unavailable";
+    }
+    return "unknown";
+}
+
+constexpr size_t kSmokeStatusCapacity = 512;
+
+jstring NewSmokeStatus(
+    JNIEnv* env,
+    bool pass,
+    const char* initialize,
+    const char* attach,
+    const char* import,
+    const char* renderFrame,
+    const char* release,
+    jint width,
+    jint height) {
+    char status[kSmokeStatusCapacity];
+    std::snprintf(
+        status,
+        sizeof(status),
+        "status=%s;initialize=%s;attach=%s;import=%s;renderFrame=%s;"
+        "release=%s;width=%d;height=%d",
+        pass ? "PASS" : "FAIL",
+        initialize,
+        attach,
+        import,
+        renderFrame,
+        release,
+        width,
+        height);
+    return env->NewStringUTF(status);
+}
+
+} // namespace
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
     vanguard::core::Logger::log("Vanguard JNI_OnLoad");
@@ -25,4 +105,136 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_probeCapab
     jobject report = env->NewObject(reportClass, ctor, caps.vulkanSupported, selectedInt, reasonStr);
     
     return report;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroidDagRenderSmoke(
+    JNIEnv* env,
+    jobject /* this */,
+    jobject surface,
+    jobject hardwareBuffer,
+    jint width,
+    jint height) {
+    if (surface == nullptr || hardwareBuffer == nullptr || width <= 0 || height <= 0) {
+        return NewSmokeStatus(
+            env, false, "not_run", "not_run", "not_run", "not_run",
+            "not_run", width, height);
+    }
+
+    ANativeWindow* nativeWindow = ANativeWindow_fromSurface(env, surface);
+    if (nativeWindow == nullptr) {
+        return NewSmokeStatus(
+            env, false, "not_run", "native_window_failed", "not_run", "not_run",
+            "not_run", width, height);
+    }
+
+    void* libAndroid = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+    if (libAndroid == nullptr) {
+        ANativeWindow_release(nativeWindow);
+        return NewSmokeStatus(
+            env, false, "not_run", "not_run", "hardware_buffer_jni_unavailable",
+            "not_run", "not_run", width, height);
+    }
+
+    auto fnFromHardwareBuffer = reinterpret_cast<FnAHardwareBuffer_fromHardwareBuffer>(
+        dlsym(libAndroid, "AHardwareBuffer_fromHardwareBuffer"));
+    if (fnFromHardwareBuffer == nullptr) {
+        dlclose(libAndroid);
+        ANativeWindow_release(nativeWindow);
+        return NewSmokeStatus(
+            env, false, "not_run", "not_run", "hardware_buffer_jni_unavailable",
+            "not_run", "not_run", width, height);
+    }
+
+    AHardwareBuffer* borrowedHardwareBuffer =
+        fnFromHardwareBuffer(env, hardwareBuffer);
+    dlclose(libAndroid);
+
+    const char* initializeStatus = "not_run";
+    const char* attachStatus = "not_run";
+    const char* importStatus = borrowedHardwareBuffer == nullptr
+        ? "hardware_buffer_failed"
+        : "not_run";
+    const char* renderStatus = "not_run";
+    const char* releaseStatus = "not_run";
+    bool renderPassed = false;
+    bool releasePassed = false;
+    bool cleanupCompleted = false;
+    int releaseFenceFd = -1;
+
+    try {
+        vanguard::render::VulkanBackend backend;
+        const bool initialized = backend.initialize();
+        initializeStatus = initialized ? "success" : "failed";
+
+        bool attached = false;
+        vanguard::render::HardwareBufferHandle handle =
+            vanguard::render::kInvalidHardwareBufferHandle;
+        bool imported = false;
+
+        if (initialized && borrowedHardwareBuffer != nullptr) {
+            attached = backend.attachSurface(
+                nativeWindow,
+                static_cast<uint32_t>(width),
+                static_cast<uint32_t>(height));
+            attachStatus = attached ? "success" : "failed";
+        }
+
+        if (attached) {
+            vanguard::render::HardwareBufferDescriptor descriptor{};
+            const auto importResult = backend.importHardwareBuffer(
+                borrowedHardwareBuffer,
+                -1,
+                &handle,
+                &descriptor);
+            importStatus = HardwareBufferResultName(importResult);
+            imported = importResult ==
+                vanguard::render::HardwareBufferImportResult::kSuccess;
+        }
+
+        if (imported) {
+            const auto renderResult = backend.renderFrame(handle);
+            renderStatus = RenderFrameResultName(renderResult);
+            renderPassed =
+                renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+                renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+
+            const auto releaseResult =
+                backend.releaseHardwareBuffer(handle, &releaseFenceFd);
+            releaseStatus = HardwareBufferResultName(releaseResult);
+            releasePassed = releaseResult ==
+                vanguard::render::HardwareBufferImportResult::kSuccess;
+        }
+
+        if (releaseFenceFd >= 0) {
+            if (::close(releaseFenceFd) != 0) {
+                releaseStatus = "fence_close_failed";
+                releasePassed = false;
+            }
+            releaseFenceFd = -1;
+        }
+        backend.detachSurface();
+        backend.shutdown();
+        cleanupCompleted = true;
+    } catch (...) {
+        initializeStatus = "exception";
+        cleanupCompleted = false;
+    }
+
+    if (releaseFenceFd >= 0) {
+        ::close(releaseFenceFd);
+    }
+    ANativeWindow_release(nativeWindow);
+
+    const bool pass = renderPassed && releasePassed && cleanupCompleted;
+    return NewSmokeStatus(
+        env,
+        pass,
+        initializeStatus,
+        attachStatus,
+        importStatus,
+        renderStatus,
+        releaseStatus,
+        width,
+        height);
 }

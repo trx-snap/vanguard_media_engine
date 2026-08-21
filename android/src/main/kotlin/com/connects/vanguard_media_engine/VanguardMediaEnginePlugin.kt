@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.annotation.NonNull
+import com.connects.vanguard_media_engine.diagnostics.AndroidDagRenderSmokeHarness
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -55,6 +56,15 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         val args = call.arguments as? Map<*, *>
 
         when (call.method) {
+
+            "runAndroidDagPhase2O2B3PhysicalSmoke" -> {
+                val width = (args?.get("width") as? Number)?.toInt() ?: 64
+                val height = (args?.get("height") as? Number)?.toInt() ?: 64
+                Thread {
+                    val smokeResult = AndroidDagRenderSmokeHarness.run(width, height)
+                    mainHandler.post { result.success(smokeResult) }
+                }.start()
+            }
 
             "createTexture" -> {
                 val path = args?.get("path") as? String

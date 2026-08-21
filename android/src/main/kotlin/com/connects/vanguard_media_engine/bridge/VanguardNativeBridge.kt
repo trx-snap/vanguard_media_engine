@@ -1,5 +1,7 @@
 package com.connects.vanguard_media_engine.bridge
 
+import android.hardware.HardwareBuffer
+import android.view.Surface
 import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
 import com.connects.vanguard_media_engine.diagnostics.BackendCapabilityReport
@@ -10,12 +12,21 @@ class VanguardNativeBridge(
     private val diagnostics: VanguardDiagnostics,
     private val codecAdapter: PlatformCodecAdapter?
 ) {
-    
-    init {
-        // Assume library is loaded by the main plugin class
+
+    companion object {
+        init {
+            System.loadLibrary("vanguard_media_engine")
+        }
     }
 
     external fun probeCapabilities(): BackendCapabilityReport
+
+    external fun runAndroidDagRenderSmoke(
+        surface: Surface,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+    ): String
 
     fun initialize() {
         val report = probeCapabilities()
