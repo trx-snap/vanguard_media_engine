@@ -1,5 +1,6 @@
 #pragma once
 #include "vanguard/core/status.h"
+#include "vanguard/graph/frame_request.h"
 #include "vanguard/graph/node.h"
 #include <cstdint>
 #include <memory>
@@ -44,6 +45,10 @@ public:
     // Topology queries.
     bool         hasCycle() const;
     core::Status topologicalSort(std::vector<std::shared_ptr<Node>>& outOrder) const;
+
+    // Playhead evaluation.
+    core::Status evaluatePlayhead(const FrameRequest& request,
+                                  FrameEvaluationResult& outResult) const;
 
     // Generation counter — incremented on every successful mutation.
     uint64_t generationId()   const;

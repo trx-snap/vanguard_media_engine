@@ -1,5 +1,6 @@
 #pragma once
 #include "vanguard/core/status.h"
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,11 @@ public:
     virtual NodeType                           type()        const = 0;
     virtual const std::vector<PortDescriptor>& inputPorts()  const = 0;
     virtual const std::vector<PortDescriptor>& outputPorts() const = 0;
+
+    // Timeline evaluation methods.
+    virtual bool     isActiveAt(uint64_t timelinePtsUs) const { return true; }
+    virtual uint64_t mapTimelineToLocalPts(uint64_t timelinePtsUs) const { return timelinePtsUs; }
+    virtual float    blendWeightAt(uint64_t timelinePtsUs) const { return 1.0f; }
 };
 
 } // namespace graph

@@ -269,5 +269,83 @@ void Graph::clear() {
     ++generation_;
 }
 
+// ---------------------------------------------------------------------------
+// Playhead evaluation
+// ---------------------------------------------------------------------------
+
+core::Status Graph::evaluatePlayhead(const FrameRequest& request,
+                                     FrameEvaluationResult& outResult) const {
+    outResult = FrameEvaluationResult{};
+    outResult.evaluatedPtsUs = request.timelinePtsUs;
+    outResult.evaluatedGeneration = generationId();
+
+    if (request.generationId != generationId()) {
+        outResult.statusCode = EvaluationStatusCode::kStaleGeneration;
+        outResult.errorMessage = "evaluatePlayhead: stale generation id " +
+                                 std::to_string(request.generationId) +
+                                 " does not match graph generation " +
+                                 std::to_string(generationId());
+        return core::Status(core::StatusCode::kError, outResult.errorMessage);
+    }
+
+    if (nodes_.empty()) {
+        outResult.statusCode = EvaluationStatusCode::kInvalidGraph;
+        outResult.errorMessage = "evaluatePlayhead: graph has zero nodes";
+        return core::Status(core::StatusCode::kError, outResult.errorMessage);
+    }
+
+    std::vector<std::shared_ptr<Node>> sortedNodes;
+    core::Status sortStatus = topologicalSort(sortedNodes);
+    if (!sortStatus.ok()) {
+        outResult.statusCode = EvaluationStatusCode::kInvalidGraph;
+        outResult.errorMessage = sortStatus.message();
+        return core::Status(core::StatusCode::kError, outResult.errorMessage);
+    }
+
+    uint32_t activeLayerIndex = 0;
+    for (const auto& node : sortedNodes) {
+        if (!node) continue;
+        if (node->isActiveAt(request.timelinePtsUs)) {
+            outResult.activeNodes.push_back(node);
+
+            ActiveNodeInfo info;
+            info.nodeId = node->id();
+            info.nodeType = node->type();
+            info.nodeKind = node->kind();
+            info.localPtsUs = node->mapTimelineToLocalPts(request.timelinePtsUs);
+            info.weight = std::clamp(node->blendWeightAt(request.timelinePtsUs), 0.0f, 1.0f);
+            info.layerIndex = activeLayerIndex++;
+            outResult.activeNodeDetails.push_back(std::move(info));
+
+            for (const auto& port : node->inputPorts()) {
+                if (port.dataType == PortDataType::kVideoFrame ||
+                    port.dataType == PortDataType::kTextureBuffer) {
+                    outResult.hasVideo = true;
+                } else if (port.dataType == PortDataType::kAudioPacket) {
+                    outResult.hasAudio = true;
+                }
+            }
+            for (const auto& port : node->outputPorts()) {
+                if (port.dataType == PortDataType::kVideoFrame ||
+                    port.dataType == PortDataType::kTextureBuffer) {
+                    outResult.hasVideo = true;
+                } else if (port.dataType == PortDataType::kAudioPacket) {
+                    outResult.hasAudio = true;
+                }
+            }
+        }
+    }
+
+    if (outResult.activeNodes.empty()) {
+        outResult.statusCode = EvaluationStatusCode::kNoActiveNodes;
+        outResult.errorMessage = "evaluatePlayhead: no active nodes at pts " +
+                                 std::to_string(request.timelinePtsUs);
+        return core::Status(core::StatusCode::kError, outResult.errorMessage);
+    }
+
+    outResult.statusCode = EvaluationStatusCode::kSuccess;
+    return core::Status::OK();
+}
+
 } // namespace graph
 } // namespace vanguard
