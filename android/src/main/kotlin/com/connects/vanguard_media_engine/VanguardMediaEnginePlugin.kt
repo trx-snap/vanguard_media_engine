@@ -76,6 +76,13 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 }.start()
             }
 
+            "runAndroidDagPhase2QCapabilityProbe" -> {
+                Thread {
+                    val probeResult = AndroidDagRenderSmokeHarness.runCapabilityProbe()
+                    mainHandler.post { result.success(probeResult) }
+                }.start()
+            }
+
             "createTexture" -> {
                 val path = args?.get("path") as? String
                     ?: return result.error("INVALID_ARG", "path required", null)

@@ -167,4 +167,67 @@ object AndroidDagRenderSmokeHarness {
     private fun smokeLoopFailure(reason: String, width: Int, height: Int, frameCount: Int): String =
         "status=FAIL;initialize=$reason;attach=not_run;import=not_run;renderedFrames=0;" +
             "frameCount=$frameCount;renderFrame=not_run;failingFrame=-1;release=not_run;width=$width;height=$height"
+
+    // ── Phase 2Q: direct capability-probe smoke ──────────────────────────────
+    private const val RESULT_MARKER_PHASE2Q = "ANDROID_DAG_PHASE2Q_CAPABILITY_PROBE_RESULT"
+
+    fun runCapabilityProbe(): Map<String, Any?> {
+        return try {
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            val report = nativeBridge.probeCapabilities()
+            diagnostics.logCapabilities(report)
+
+            val pass = report.vulkanSupported &&
+                report.selectedBackend == 0 &&
+                report.fallbackReason == "none" &&
+                report.profileGateStatus == "avp2022_partial_pass" &&
+                report.blacklistStatus == "not_blacklisted" &&
+                report.gpuVendor.isNotEmpty() &&
+                report.gpuRenderer.isNotEmpty() &&
+                report.vendorId != 0L &&
+                report.deviceId != 0L &&
+                report.apiVersion != 0L &&
+                report.vulkanDriverVersion != 0L
+
+            val result = mapOf<String, Any?>(
+                "pass" to pass,
+                "vulkanSupported" to report.vulkanSupported,
+                "selectedBackend" to report.selectedBackend,
+                "fallbackReason" to report.fallbackReason,
+                "gpuVendor" to report.gpuVendor,
+                "gpuRenderer" to report.gpuRenderer,
+                "vendorId" to report.vendorId,
+                "deviceId" to report.deviceId,
+                "apiVersion" to report.apiVersion,
+                "vulkanDriverVersion" to report.vulkanDriverVersion,
+                "profileGateStatus" to report.profileGateStatus,
+                "blacklistStatus" to report.blacklistStatus,
+            )
+            Log.i(TAG, "$RESULT_MARKER_PHASE2Q pass=$pass $report")
+            result
+        } catch (throwable: Throwable) {
+            val simpleName = throwable.javaClass.simpleName.ifEmpty { "UnknownException" }
+            val result = mapOf<String, Any?>(
+                "pass" to false,
+                "vulkanSupported" to false,
+                "selectedBackend" to 2,
+                "fallbackReason" to "exception:$simpleName",
+                "gpuVendor" to "",
+                "gpuRenderer" to "",
+                "vendorId" to 0L,
+                "deviceId" to 0L,
+                "apiVersion" to 0L,
+                "vulkanDriverVersion" to 0L,
+                "profileGateStatus" to "probe_exception",
+                "blacklistStatus" to "not_evaluated",
+            )
+            Log.e(TAG, "$RESULT_MARKER_PHASE2Q exception=$simpleName", throwable)
+            result
+        }
+    }
 }
