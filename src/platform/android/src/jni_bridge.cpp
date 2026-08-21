@@ -132,22 +132,61 @@ extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
 extern "C" JNIEXPORT jobject JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_probeCapabilities(JNIEnv* env, jobject /* this */) {
     auto caps = vanguard::platform::AndroidProbeBackendCapability();
-    
+
     // Convert to Kotlin BackendCapabilityReport
     jclass reportClass = env->FindClass("com/connects/vanguard_media_engine/diagnostics/BackendCapabilityReport");
     if (!reportClass) return nullptr;
-    
-    jmethodID ctor = env->GetMethodID(reportClass, "<init>", "(ZILjava/lang/String;)V");
+
+    // Descriptor matches the Phase 2Q Kotlin constructor field order:
+    //   vulkanSupported: Boolean  -> Z
+    //   selectedBackend: Int      -> I
+    //   fallbackReason: String    -> Ljava/lang/String;
+    //   gpuVendor: String         -> Ljava/lang/String;
+    //   gpuRenderer: String       -> Ljava/lang/String;
+    //   vendorId: Long            -> J
+    //   deviceId: Long            -> J
+    //   apiVersion: Long          -> J
+    //   vulkanDriverVersion: Long -> J
+    //   profileGateStatus: String -> Ljava/lang/String;
+    //   blacklistStatus: String   -> Ljava/lang/String;
+    jmethodID ctor = env->GetMethodID(
+        reportClass, "<init>",
+        "(ZILjava/lang/String;Ljava/lang/String;Ljava/lang/String;JJJJLjava/lang/String;Ljava/lang/String;)V");
     if (!ctor) return nullptr;
-    
-    int selectedInt = (caps.selected == vanguard::render::RenderBackendType::kVulkan) ? 0 : 
-                      (caps.selected == vanguard::render::RenderBackendType::kGles) ? 1 : 2;
-                      
-    jstring reasonStr = env->NewStringUTF(caps.fallbackReason.c_str());
-    jobject report = env->NewObject(reportClass, ctor, caps.vulkanSupported, selectedInt, reasonStr);
-    
+
+    int selectedInt = (caps.selected == vanguard::render::RenderBackendType::kVulkan) ? 0 :
+                      (caps.selected == vanguard::render::RenderBackendType::kGles)   ? 1 : 2;
+
+    jstring fallbackReasonStr    = env->NewStringUTF(caps.fallbackReason.c_str());
+    jstring gpuVendorStr         = env->NewStringUTF(caps.gpuVendor.c_str());
+    jstring gpuRendererStr       = env->NewStringUTF(caps.gpuRenderer.c_str());
+    jstring profileGateStatusStr = env->NewStringUTF(caps.profileGateStatus.c_str());
+    jstring blacklistStatusStr   = env->NewStringUTF(caps.blacklistStatus.c_str());
+
+    jobject report = env->NewObject(
+        reportClass, ctor,
+        static_cast<jboolean>(caps.vulkanSupported),
+        static_cast<jint>(selectedInt),
+        fallbackReasonStr,
+        gpuVendorStr,
+        gpuRendererStr,
+        static_cast<jlong>(caps.vendorId),
+        static_cast<jlong>(caps.deviceId),
+        static_cast<jlong>(caps.apiVersion),
+        static_cast<jlong>(caps.vulkanDriverVersion),
+        profileGateStatusStr,
+        blacklistStatusStr);
+
+    // Release local string refs now that the object is constructed.
+    env->DeleteLocalRef(fallbackReasonStr);
+    env->DeleteLocalRef(gpuVendorStr);
+    env->DeleteLocalRef(gpuRendererStr);
+    env->DeleteLocalRef(profileGateStatusStr);
+    env->DeleteLocalRef(blacklistStatusStr);
+
     return report;
 }
+
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroidDagRenderSmoke(

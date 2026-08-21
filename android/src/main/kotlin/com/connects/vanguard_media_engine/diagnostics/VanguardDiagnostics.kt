@@ -1,11 +1,27 @@
 package com.connects.vanguard_media_engine.diagnostics
 
+import android.util.Log
+
 class VanguardDiagnostics {
     fun logCapabilities(report: BackendCapabilityReport) {
-        // Scaffold
+        Log.i(TAG, "capability: vulkan=${report.vulkanSupported}" +
+            " backend=${report.selectedBackend}" +
+            " fallback=${report.fallbackReason}" +
+            " vendor=${report.gpuVendor}" +
+            " renderer=${report.gpuRenderer}" +
+            " vendorId=0x${report.vendorId.toString(16)}" +
+            " deviceId=0x${report.deviceId.toString(16)}" +
+            " api=${report.apiVersion}" +
+            " driver=${report.vulkanDriverVersion}" +
+            " profile=${report.profileGateStatus}" +
+            " blacklist=${report.blacklistStatus}")
     }
 
     fun logEvent(message: String) {
-        // Scaffold
+        Log.i(TAG, message)
+    }
+
+    companion object {
+        private const val TAG = "VanguardDiagnostics"
     }
 }
