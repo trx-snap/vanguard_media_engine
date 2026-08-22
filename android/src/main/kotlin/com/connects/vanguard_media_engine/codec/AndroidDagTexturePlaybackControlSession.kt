@@ -72,6 +72,21 @@ class AndroidDagTexturePlaybackControlSession(
      * Initializes resources and prepares the playback session on the dedicated HandlerThread.
      */
     fun prepare(onResult: (Map<String, Any?>) -> Unit) {
+        // Belt-and-suspenders: check file existence synchronously before touching
+        // MediaExtractor. setDataSource() can hang (rather than throw) on some
+        // Android versions when given a non-existent or unreadable path, which would
+        // prevent onResult from ever being called and hang the MethodChannel reply.
+        val fileCheck = java.io.File(videoPath)
+        if (!fileCheck.exists() || !fileCheck.canRead()) {
+            state = AndroidDagPlaybackState.Failed
+            onResult(mapOf(
+                "pass" to false,
+                "state" to state.name,
+                "raw" to "status=FAIL;reason=file_not_found_or_not_readable",
+            ))
+            return
+        }
+
         if (Build.VERSION.SDK_INT < 29) {
             state = AndroidDagPlaybackState.Failed
             onResult(mapOf(
@@ -99,7 +114,7 @@ class AndroidDagTexturePlaybackControlSession(
             }
 
             if (trackIndex < 0 || format == null) {
-                state = AndroidDagPlaybackState.Failed
+                cleanupResources(AndroidDagPlaybackState.Failed)
                 onResult(mapOf(
                     "pass" to false,
                     "state" to state.name,
@@ -176,7 +191,7 @@ class AndroidDagTexturePlaybackControlSession(
                     )
 
                     if (!createResult.startsWith("status=OK;")) {
-                        state = AndroidDagPlaybackState.Failed
+                        cleanupResources(AndroidDagPlaybackState.Failed)
                         onResult(mapOf(
                             "pass" to false,
                             "state" to state.name,
@@ -187,7 +202,7 @@ class AndroidDagTexturePlaybackControlSession(
 
                     sessionId = createResult.substringAfter("sessionId=").substringBefore(";").ifEmpty { null }
                     if (sessionId == null) {
-                        state = AndroidDagPlaybackState.Failed
+                        cleanupResources(AndroidDagPlaybackState.Failed)
                         onResult(mapOf(
                             "pass" to false,
                             "state" to state.name,
@@ -199,7 +214,7 @@ class AndroidDagTexturePlaybackControlSession(
                     // Initial generation bump
                     val bumpRes = bridge.bumpAndroidDagPhase4B1TexturePlaybackGeneration(sessionId!!)
                     if (!bumpRes.startsWith("status=OK;")) {
-                        state = AndroidDagPlaybackState.Failed
+                        cleanupResources(AndroidDagPlaybackState.Failed)
                         onResult(mapOf(
                             "pass" to false,
                             "state" to state.name,
@@ -210,7 +225,7 @@ class AndroidDagTexturePlaybackControlSession(
                     val genStr = bumpRes.substringAfter("generationId=").substringBefore(";")
                     val parsedGen = genStr.toLongOrNull()
                     if (parsedGen == null || parsedGen <= 0L) {
-                        state = AndroidDagPlaybackState.Failed
+                        cleanupResources(AndroidDagPlaybackState.Failed)
                         onResult(mapOf(
                             "pass" to false,
                             "state" to state.name,
@@ -236,7 +251,7 @@ class AndroidDagTexturePlaybackControlSession(
                     ))
                 } catch (t: Throwable) {
                     Log.e(TAG, "Error in session prepare", t)
-                    state = AndroidDagPlaybackState.Failed
+                    cleanupResources(AndroidDagPlaybackState.Failed)
                     onResult(mapOf(
                         "pass" to false,
                         "state" to state.name,
@@ -246,7 +261,7 @@ class AndroidDagTexturePlaybackControlSession(
             }
         } catch (t: Throwable) {
             Log.e(TAG, "Error initiating session prepare", t)
-            state = AndroidDagPlaybackState.Failed
+            cleanupResources(AndroidDagPlaybackState.Failed)
             onResult(mapOf(
                 "pass" to false,
                 "state" to state.name,
@@ -735,6 +750,62 @@ class AndroidDagTexturePlaybackControlSession(
     }
 
     /**
+     * Tears down all partially- or fully-allocated resources in strict order.
+     * Safe to call from any state; each step is individually guarded.
+     * @param targetState the [AndroidDagPlaybackState] to assign after cleanup.
+     * @param cancelPendingPlay when true, the pending play callback is invoked with CANCELLED.
+     */
+    private fun cleanupResources(
+        targetState: AndroidDagPlaybackState,
+        cancelPendingPlay: Boolean = true,
+    ) {
+        // 1. Remove active Choreographer callback
+        val cb = activeFrameCallback
+        if (cb != null) {
+            try { choreographer?.removeFrameCallback(cb) } catch (_: Throwable) {}
+            activeFrameCallback = null
+        }
+        // 2. Invoke and clear pending play callback only when requested
+        if (cancelPendingPlay) {
+            pendingPlayCallback?.invoke(mapOf("pass" to false, "raw" to "status=CANCELLED;reason=session_disposed"))
+            pendingPlayCallback = null
+        }
+        // 3. Destroy native session
+        val sid = sessionId
+        val bridge = nativeBridge
+        if (sid != null && bridge != null) {
+            try { bridge.destroyAndroidDagPhase4B1TexturePlaybackSession(sid) } catch (_: Throwable) {}
+        }
+        // 4. Stop / release MediaCodec
+        try { codec?.stop() } catch (_: Throwable) {}
+        try { codec?.release() } catch (_: Throwable) {}
+        // 5. Drain and close every queued Image
+        while (true) {
+            val img = imageQueue.poll() ?: break
+            try { img.close() } catch (_: Throwable) {}
+        }
+        // 6. Close ImageReader
+        try { imageReader?.close() } catch (_: Throwable) {}
+        // 7. Clear Flutter Surface reference only; SurfaceProducer owns the surface
+        flutterSurface = null
+        // 8. Release MediaExtractor
+        try { extractor?.release() } catch (_: Throwable) {}
+        // 9. Quit HandlerThread safely
+        try { handlerThread?.quitSafely() } catch (_: Throwable) {}
+        // 10. Null resource references
+        codec = null
+        imageReader = null
+        extractor = null
+        handler = null
+        handlerThread = null
+        nativeBridge = null
+        sessionId = null
+        activeFrameCallback = null
+        choreographer = null
+        state = targetState
+    }
+
+    /**
      * Disposes session resources idempotently.
      */
     fun dispose(onResult: ((Map<String, Any?>) -> Unit)? = null) {
@@ -748,48 +819,8 @@ class AndroidDagTexturePlaybackControlSession(
         }
 
         val h = handler
-        val cleanupBlock = {
-            // 1. Cancel callback
-            val cb = activeFrameCallback
-            if (cb != null) {
-                try { choreographer?.removeFrameCallback(cb) } catch (_: Throwable) {}
-                activeFrameCallback = null
-            }
-            pendingPlayCallback?.invoke(mapOf("pass" to false, "raw" to "status=CANCELLED;reason=session_disposed"))
-            pendingPlayCallback = null
-
-            // 2. Destroy native session
-            val sid = sessionId
-            val bridge = nativeBridge
-            if (sid != null && bridge != null) {
-                try {
-                    bridge.destroyAndroidDagPhase4B1TexturePlaybackSession(sid)
-                } catch (_: Throwable) {}
-            }
-
-            // 3. Stop / release codec
-            try { codec?.stop() } catch (_: Throwable) {}
-            try { codec?.release() } catch (_: Throwable) {}
-
-            // 4. Drain & close queued images
-            while (true) {
-                val img = imageQueue.poll() ?: break
-                try { img.close() } catch (_: Throwable) {}
-            }
-
-            // 5. ImageReader close
-            try { imageReader?.close() } catch (_: Throwable) {}
-
-            // 6. Clear Flutter Surface reference (owned by SurfaceProducer; coordinator releases producer)
-            flutterSurface = null
-
-            // 7. MediaExtractor release
-            try { extractor?.release() } catch (_: Throwable) {}
-
-            // 8. HandlerThread quit
-            try { handlerThread?.quitSafely() } catch (_: Throwable) {}
-
-            state = AndroidDagPlaybackState.Disposed
+        val doCleanup = {
+            cleanupResources(AndroidDagPlaybackState.Disposed)
             onResult?.invoke(mapOf(
                 "pass" to true,
                 "state" to state.name,
@@ -799,9 +830,9 @@ class AndroidDagTexturePlaybackControlSession(
         }
 
         if (h != null) {
-            h.post { cleanupBlock() }
+            h.post { doCleanup() }
         } else {
-            cleanupBlock()
+            doCleanup()
         }
     }
 }

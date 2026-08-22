@@ -108,6 +108,21 @@ class AndroidDagTexturePlaybackCoordinator(
             return
         }
 
+        // Preflight: verify the file exists and can be read before allocating any
+        // texture resources. MediaExtractor.setDataSource() can hang or throw
+        // unpredictably on non-existent paths; this guard guarantees a prompt,
+        // well-formed MethodChannel result for the missing-file case.
+        val fileCheck = java.io.File(path)
+        if (!fileCheck.exists() || !fileCheck.canRead()) {
+            Log.w(TAG, "createPhase4B1BPlaybackControlSmoke: file not found or not readable: $path")
+            result.success(mapOf(
+                "pass" to false,
+                "state" to AndroidDagPlaybackState.Failed.name,
+                "raw" to "status=FAIL;reason=file_not_found_or_not_readable;path=$path",
+            ))
+            return
+        }
+
         val surfaceProducer = textureRegistry.createSurfaceProducer()
         val textureId = surfaceProducer.id()
 
