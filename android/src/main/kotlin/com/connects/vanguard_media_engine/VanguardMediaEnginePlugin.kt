@@ -96,6 +96,22 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 }.start()
             }
 
+            "runAndroidDagPhase4ADecoderSmoke" -> {
+                val path       = args?.get("path")       as? String
+                val frameCount = (args?.get("frameCount") as? Number)?.toInt() ?: 10
+                if (path == null) {
+                    result.error("INVALID_ARG", "runAndroidDagPhase4ADecoderSmoke: path required", null)
+                    return
+                }
+                Thread {
+                    val smokeResult = AndroidDagRenderSmokeHarness.runDecoderSmoke(
+                        videoPath  = path,
+                        frameCount = frameCount,
+                    )
+                    mainHandler.post { result.success(smokeResult) }
+                }.start()
+            }
+
             "createTexture" -> {
                 val path = args?.get("path") as? String
                     ?: return result.error("INVALID_ARG", "path required", null)

@@ -323,4 +323,34 @@ object AndroidDagRenderSmokeHarness {
             result
         }
     }
+
+    // ── Phase 4A: MediaCodec decode → ImageReader → native DAG → Vulkan ─────
+    private const val RESULT_MARKER_PHASE4A = "ANDROID_DAG_PHASE4A_NATIVE_RESULT"
+
+    fun runDecoderSmoke(
+        videoPath: String,
+        frameCount: Int = 10,
+    ): Map<String, Any?> {
+        return try {
+            val adapter = com.connects.vanguard_media_engine.codec
+                .AndroidMediaCodecDecodedFrameSmokeAdapter(
+                    videoPath  = videoPath,
+                    maxFrames  = frameCount,
+                )
+            adapter.run()
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            val raw = "status=FAIL;decoder=exception:$reason;session=not_run;" +
+                "renderedFrames=0;frameCount=$frameCount;width=0;height=0"
+            Log.e(TAG, "$RESULT_MARKER_PHASE4A exception=$reason", throwable)
+            mapOf(
+                "pass"           to false,
+                "raw"            to raw,
+                "width"          to 0,
+                "height"         to 0,
+                "frameCount"     to frameCount,
+                "renderedFrames" to 0,
+            )
+        }
+    }
 }

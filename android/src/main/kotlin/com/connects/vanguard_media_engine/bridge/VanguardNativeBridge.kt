@@ -45,6 +45,26 @@ class VanguardNativeBridge(
         frameDurationUs: Long,
     ): String
 
+    // ── Phase 4A: MediaCodec decode → ImageReader → native DAG → Vulkan ─────
+    external fun createAndroidDagPhase4ADecoderSmokeSession(
+        surface: Surface,
+        width: Int,
+        height: Int,
+    ): String
+
+    external fun renderAndroidDagPhase4ADecoderSmokeFrame(
+        sessionId: String,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        timelinePtsUs: Long,
+        frameIndex: Int,
+    ): String
+
+    external fun destroyAndroidDagPhase4ADecoderSmokeSession(
+        sessionId: String,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

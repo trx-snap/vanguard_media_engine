@@ -61,6 +61,7 @@ if (ANDROID)
   target_sources(vanguard_media_engine PRIVATE
     "platform/android/src/jni_bridge.cpp"
     "platform/android/src/android_backend_probe.cpp"
+    "platform/android/src/android_phase4a_decoder_smoke_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
 
