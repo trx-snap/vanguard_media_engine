@@ -18,11 +18,18 @@ import android.hardware.HardwareBuffer
  * room orchestration, signaling session, participant roster, network token, or audio stream semantics.
  * Audio capture, routing, mixing, and WebRTC audio tracks are exclusively managed outside Vanguard.
  *
+ * ## Spatial Transforms & Orientation
+ * [rotationDegrees] is cardinal display orientation metadata (must be 0, 90, 180, or 270 degrees).
+ * [mirrored] indicates horizontal mirroring required for display/publish semantics, especially front camera.
+ * Vanguard/DAG owns spatial transforms; RTC transport adapters may translate this to transport-specific
+ * rotation/mirror representations.
+ *
  * @property hardwareBuffer GPU-accessible [HardwareBuffer] containing the frame pixels.
  * @property width Frame width in pixels (> 0).
  * @property height Frame height in pixels (> 0).
  * @property timestampNs Monotonic frame presentation timestamp in nanoseconds (>= 0).
- * @property rotationDegrees Display orientation adjustment in degrees (must be 0, 90, 180, or 270).
+ * @property rotationDegrees Cardinal display orientation metadata in degrees (must be 0, 90, 180, or 270).
+ * @property mirrored Indicates horizontal mirroring required for display/publish semantics, especially front camera.
  * @property frameIndex Monotonically increasing frame sequence index (>= 0).
  * @property sourceId Identifier of the generating source/node (must not be blank).
  */
@@ -32,6 +39,7 @@ data class RealtimeVideoFrame(
     val height: Int,
     val timestampNs: Long,
     val rotationDegrees: Int = 0,
+    val mirrored: Boolean = false,
     val frameIndex: Long = 0L,
     val sourceId: String = "vanguard",
 ) {
