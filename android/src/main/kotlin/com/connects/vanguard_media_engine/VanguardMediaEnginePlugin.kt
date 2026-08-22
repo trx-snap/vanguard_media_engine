@@ -9,7 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.annotation.NonNull
-import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackSmokeSession
+import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagRenderSmokeHarness
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
@@ -26,12 +26,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
     // ── Video editor renderers (existing, keyed by textureId) ─────────────────
     private val renderers = mutableMapOf<Long, VanguardGLRenderer>()
 
-    // ── Phase 4B1A: diagnostic texture playback smoke sessions ────────────────
-    private data class Phase4b1ActiveEntry(
-        val session: AndroidDagTexturePlaybackSmokeSession,
-        val textureEntry: TextureRegistry.SurfaceTextureEntry,
-    )
-    private val phase4b1Sessions = mutableMapOf<Long, Phase4b1ActiveEntry>()
+    // ── Phase 4B1: DAG texture playback coordinator ───────────────────────────
+    private var dagTexturePlaybackCoordinator: AndroidDagTexturePlaybackCoordinator? = null
 
     // ── Camera session state (B2: single camera instance invariant) ───────────
     // Mirrors iOS plugin: cameraSource + renderer stored at plugin level.
@@ -58,6 +54,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         this.context = binding.applicationContext
         channel = MethodChannel(binding.binaryMessenger, "vanguard_media_engine")
         channel.setMethodCallHandler(this)
+        dagTexturePlaybackCoordinator = AndroidDagTexturePlaybackCoordinator(
+            textureRegistry = binding.textureRegistry,
+            channel         = channel,
+            mainHandler     = mainHandler,
+        )
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
@@ -121,72 +122,65 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             }
 
             "runAndroidDagPhase4B1TexturePlaybackSmoke" -> {
-                val path       = args?.get("path")       as? String
-                val frameCount = (args?.get("frameCount") as? Number)?.toInt() ?: 12
-                if (path == null) {
-                    result.error("INVALID_ARG", "runAndroidDagPhase4B1TexturePlaybackSmoke: path required", null)
-                    return
+                val coord = dagTexturePlaybackCoordinator
+                if (coord != null) {
+                    coord.runPhase4B1TexturePlaybackSmoke(args, result)
+                } else {
+                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
                 }
-
-                val textureEntry = binding.textureRegistry.createSurfaceTexture()
-                val textureId = textureEntry.id()
-
-                val session = AndroidDagTexturePlaybackSmokeSession(
-                    videoPath    = path,
-                    frameCount   = frameCount,
-                    textureEntry = textureEntry,
-                )
-
-                val entry = Phase4b1ActiveEntry(session, textureEntry)
-                synchronized(phase4b1Sessions) {
-                    phase4b1Sessions[textureId] = entry
-                }
-
-                Thread {
-                    var smokeResult: Map<String, Any?>
-                    try {
-                        smokeResult = session.run()
-                    } catch (t: Throwable) {
-                        Log.e(TAG, "Phase 4B1A session execution error", t)
-                        smokeResult = mapOf(
-                            "pass" to false,
-                            "textureId" to textureId,
-                            "renderedFrames" to 0,
-                            "frameCount" to frameCount,
-                            "raw" to "status=FAIL;reason=exception:${t.javaClass.simpleName}",
-                        )
-                    }
-                    mainHandler.post {
-                        channel.invokeMethod("onAndroidDagPhase4B1TexturePlaybackSmokeComplete", smokeResult)
-                    }
-                }.start()
-
-                result.success(mapOf(
-                    "started" to true,
-                    "textureId" to textureId,
-                    "frameCount" to frameCount,
-                ))
             }
 
             "disposeAndroidDagPhase4B1TexturePlaybackSmoke" -> {
-                val textureId = (args?.get("textureId") as? Number)?.toLong()
-                val entry = synchronized(phase4b1Sessions) {
-                    if (textureId != null) phase4b1Sessions.remove(textureId) else null
-                }
-                if (entry != null) {
-                    try { entry.session.dispose() } catch (_: Throwable) {}
-                    try { entry.textureEntry.release() } catch (_: Throwable) {}
-                    result.success(mapOf(
-                        "pass" to true,
-                        "textureId" to textureId,
-                        "raw" to "status=OK;disposed=true",
-                    ))
+                val coord = dagTexturePlaybackCoordinator
+                if (coord != null) {
+                    coord.disposePhase4B1TexturePlaybackSmoke(args, result)
                 } else {
-                    result.success(mapOf(
-                        "pass" to false,
-                        "textureId" to textureId,
-                        "raw" to "status=FAIL;reason=session_not_found",
-                    ))
+                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
+                }
+            }
+
+            "createAndroidDagPhase4B1BPlaybackControlSmoke" -> {
+                val coord = dagTexturePlaybackCoordinator
+                if (coord != null) {
+                    coord.createPhase4B1BPlaybackControlSmoke(args, result)
+                } else {
+                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
+                }
+            }
+
+            "playAndroidDagPhase4B1BPlaybackControlSmoke" -> {
+                val coord = dagTexturePlaybackCoordinator
+                if (coord != null) {
+                    coord.playPhase4B1BPlaybackControlSmoke(args, result)
+                } else {
+                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
+                }
+            }
+
+            "pauseAndroidDagPhase4B1BPlaybackControlSmoke" -> {
+                val coord = dagTexturePlaybackCoordinator
+                if (coord != null) {
+                    coord.pausePhase4B1BPlaybackControlSmoke(args, result)
+                } else {
+                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
+                }
+            }
+
+            "seekAndroidDagPhase4B1BPlaybackControlSmoke" -> {
+                val coord = dagTexturePlaybackCoordinator
+                if (coord != null) {
+                    coord.seekPhase4B1BPlaybackControlSmoke(args, result)
+                } else {
+                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
+                }
+            }
+
+            "disposeAndroidDagPhase4B1BPlaybackControlSmoke" -> {
+                val coord = dagTexturePlaybackCoordinator
+                if (coord != null) {
+                    coord.disposePhase4B1BPlaybackControlSmoke(args, result)
+                } else {
+                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
                 }
             }
 
@@ -1166,13 +1160,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         // Tear down editor renderers.
         renderers.values.forEach { it.dispose() }
         renderers.clear()
-        // Tear down Phase 4B1A active sessions and release their texture entries.
-        synchronized(phase4b1Sessions) {
-            phase4b1Sessions.values.forEach { entry ->
-                try { entry.session.dispose() } catch (_: Throwable) {}
-                try { entry.textureEntry.release() } catch (_: Throwable) {}
-            }
-            phase4b1Sessions.clear()
-        }
+        // Tear down Phase 4B1 active sessions (4B1A & 4B1B) and release their texture entries.
+        dagTexturePlaybackCoordinator?.disposeAll()
+        dagTexturePlaybackCoordinator = null
     }
 }

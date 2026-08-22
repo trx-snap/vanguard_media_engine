@@ -451,3 +451,193 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_destroyAnd
         sid.c_str(), renderedFrames);
     return env->NewStringUTF(status);
 }
+
+// ---------------------------------------------------------------------------
+// JNI: bumpAndroidDagPhase4B1TexturePlaybackGeneration
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_bumpAndroidDagPhase4B1TexturePlaybackGeneration(
+    JNIEnv*  env,
+    jobject  /* this */,
+    jstring  sessionIdJ) {
+
+    char status[256];
+
+    if (!sessionIdJ) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=null_session_id");
+        return env->NewStringUTF(status);
+    }
+
+    const char* sidCStr = env->GetStringUTFChars(sessionIdJ, nullptr);
+    std::string sid(sidCStr ? sidCStr : "");
+    if (sidCStr) env->ReleaseStringUTFChars(sessionIdJ, sidCStr);
+
+    Phase4B1Session* session = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gPhase4B1SessionMutex);
+        auto it = gPhase4B1Sessions.find(sid);
+        if (it != gPhase4B1Sessions.end()) session = it->second;
+    }
+
+    if (!session) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=session_not_found;sessionId=%s", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    const uint64_t newGen = session->graph.bumpGeneration();
+    session->graphGenerationId = newGen;
+
+    std::snprintf(status, sizeof(status),
+        "status=OK;sessionId=%s;generationId=%llu",
+        sid.c_str(), static_cast<unsigned long long>(newGen));
+    return env->NewStringUTF(status);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration(
+    JNIEnv*  env,
+    jobject  /* this */,
+    jstring  sessionIdJ,
+    jobject  hardwareBufferJ,
+    jint     width,
+    jint     height,
+    jlong    timelinePtsUs,
+    jint     frameIndex,
+    jlong    generationIdJ) {
+
+    char status[512];
+
+    if (!sessionIdJ || !hardwareBufferJ || width <= 0 || height <= 0) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=invalid_args",
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    const char* sidCStr = env->GetStringUTFChars(sessionIdJ, nullptr);
+    std::string sid(sidCStr ? sidCStr : "");
+    if (sidCStr) env->ReleaseStringUTFChars(sessionIdJ, sidCStr);
+
+    Phase4B1Session* session = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gPhase4B1SessionMutex);
+        auto it = gPhase4B1Sessions.find(sid);
+        if (it != gPhase4B1Sessions.end()) session = it->second;
+    }
+
+    if (!session) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=session_not_found;sessionId=%s",
+            static_cast<int>(frameIndex), sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    if (!session->initialized || !session->surfaceAttached || !session->graphBuilt) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=session_not_ready",
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    AHardwareBuffer* ahwb = ResolveAHardwareBufferFromJObject(env, hardwareBufferJ);
+    if (!ahwb) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=ahardwarebuffer_resolve_failed",
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    vanguard::render::HardwareBufferHandle handle =
+        vanguard::render::kInvalidHardwareBufferHandle;
+    vanguard::render::HardwareBufferDescriptor descriptor{};
+    const auto importResult = session->backend.importHardwareBuffer(
+        ahwb, -1, &handle, &descriptor);
+
+    if (importResult != vanguard::render::HardwareBufferImportResult::kSuccess) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=import_failed;importResult=%s",
+            static_cast<int>(frameIndex),
+            HwBufResultName(importResult));
+        return env->NewStringUTF(status);
+    }
+
+    vanguard::graph::FrameRequest request;
+    request.timelinePtsUs = static_cast<uint64_t>(timelinePtsUs < 0 ? 0 : timelinePtsUs);
+    request.generationId  = static_cast<uint64_t>(generationIdJ);
+    request.canvasWidth   = static_cast<uint32_t>(width);
+    request.canvasHeight  = static_cast<uint32_t>(height);
+
+    vanguard::graph::FrameEvaluationResult evalResult;
+    const auto evalStatus = session->graph.evaluatePlayhead(request, evalResult);
+
+    if (!evalStatus.ok() || !evalResult.ok() ||
+        !evalResult.hasVideo ||
+        evalResult.activeNodes.empty()) {
+        int relFd = -1;
+        session->backend.releaseHardwareBuffer(handle, &relFd);
+        if (relFd >= 0) { ::close(relFd); }
+
+        if (evalResult.statusCode == vanguard::graph::EvaluationStatusCode::kStaleGeneration) {
+            std::snprintf(status, sizeof(status),
+                "status=FAIL;frameIndex=%d;reason=stale_generation/evaluation_failed;generationId=%llu;currentGeneration=%llu",
+                static_cast<int>(frameIndex),
+                static_cast<unsigned long long>(generationIdJ),
+                static_cast<unsigned long long>(session->graph.generationId()));
+        } else {
+            std::snprintf(status, sizeof(status),
+                "status=FAIL;frameIndex=%d;reason=evaluation_failed",
+                static_cast<int>(frameIndex));
+        }
+        return env->NewStringUTF(status);
+    }
+
+    const auto renderResult = session->backend.renderFrame(handle);
+    const bool renderOk =
+        renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+        renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+
+    int releaseFenceFd = -1;
+    const auto releaseResult =
+        session->backend.releaseHardwareBuffer(handle, &releaseFenceFd);
+    if (releaseFenceFd >= 0) {
+        ::close(releaseFenceFd);
+        releaseFenceFd = -1;
+    }
+
+    if (!renderOk) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=render_failed;renderResult=%s",
+            static_cast<int>(frameIndex),
+            RenderResultName(renderResult));
+        return env->NewStringUTF(status);
+    }
+
+    const bool releaseOk =
+        releaseResult == vanguard::render::HardwareBufferImportResult::kSuccess;
+
+    if (!releaseOk) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=release_failed;releaseResult=%s",
+            static_cast<int>(frameIndex),
+            HwBufResultName(releaseResult));
+        return env->NewStringUTF(status);
+    }
+
+    session->renderedFrames++;
+    session->lastRenderStatus = "success";
+
+    std::snprintf(status, sizeof(status),
+        "status=PASS;frameIndex=%d;renderedFrames=%d;generationId=%llu;"
+        "renderResult=%s;releaseResult=%s",
+        static_cast<int>(frameIndex),
+        session->renderedFrames,
+        static_cast<unsigned long long>(generationIdJ),
+        RenderResultName(renderResult),
+        HwBufResultName(releaseResult));
+    return env->NewStringUTF(status);
+}

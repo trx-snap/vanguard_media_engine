@@ -85,6 +85,21 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
+    // ── Phase 4B1B: Generation-aware texture playback controls ──────────────
+    external fun bumpAndroidDagPhase4B1TexturePlaybackGeneration(
+        sessionId: String,
+    ): String
+
+    external fun renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration(
+        sessionId: String,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        timelinePtsUs: Long,
+        frameIndex: Int,
+        generationId: Long,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
