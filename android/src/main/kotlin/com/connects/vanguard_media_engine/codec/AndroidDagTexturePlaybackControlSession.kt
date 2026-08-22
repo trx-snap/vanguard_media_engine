@@ -6,8 +6,6 @@ import android.media.Image
 import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaExtractor
-
-import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -314,93 +312,26 @@ class AndroidDagTexturePlaybackControlSession(
                         }
 
                         try {
-                            // Feed MediaCodec input buffers
-                            while (!inputDone) {
-                                val inIdx = codec?.dequeueInputBuffer(0) ?: -1
-                                if (inIdx < 0) break
-                                val buf = codec?.getInputBuffer(inIdx)
-                                if (buf == null) break
-                                val sampleSize = extractor?.readSampleData(buf, 0) ?: -1
-                                if (sampleSize < 0) {
-                                    codec?.queueInputBuffer(
-                                        inIdx,
-                                        0,
-                                        0,
-                                        0,
-                                        MediaCodec.BUFFER_FLAG_END_OF_STREAM,
-                                    )
-                                    inputDone = true
-                                } else {
-                                    val pts = extractor?.sampleTime ?: 0L
-                                    codec?.queueInputBuffer(inIdx, 0, sampleSize, pts, 0)
-                                    extractor?.advance()
-                                }
-                            }
-
-                            // Drain MediaCodec output buffers to ImageReader
-                            while (!outputDone && imageQueue.size < 2) {
-                                val info = MediaCodec.BufferInfo()
-                                val outIdx = codec?.dequeueOutputBuffer(info, 0) ?: -1
-                                if (outIdx < 0) break
-
-                                val isEos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-                                val renderable = info.size > 0 && !isEos
-                                codec?.releaseOutputBuffer(outIdx, renderable)
-
-                                if (isEos) {
-                                    outputDone = true
-                                }
-                            }
-
-                            // Render at most ONE frame per vsync callback
-                            val image: Image? = imageQueue.poll()
-                            if (image != null) {
-                                var hwBuf: HardwareBuffer? = null
-                                try {
-                                    hwBuf = image.hardwareBuffer
-                                    if (hwBuf != null) {
-                                        // SyncFence API >= 33 wait <= 1s
-                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                            val fence = image.fence
-                                            try {
-                                                if (fence.isValid) {
-                                                    fence.await(java.time.Duration.ofMillis(1000))
-                                                }
-                                            } catch (e: Exception) {
-                                                Log.w(TAG, "SyncFence exception: $e")
-                                            } finally {
-                                                try { fence.close() } catch (_: Throwable) {}
-                                            }
-                                        }
-
-                                        val sid = sessionId
-                                        val nb = nativeBridge
-                                        if (sid != null && nb != null) {
-                                            val ptsUs = image.timestamp / 1000L
-                                            lastRenderedPtsUs = ptsUs
-                                            val renderStr = nb.renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration(
-                                                sid,
-                                                hwBuf,
-                                                videoWidth,
-                                                videoHeight,
-                                                ptsUs,
-                                                renderedFrames,
-                                                currentGenerationId,
-                                            )
-
-                                            if (renderStr.startsWith("status=PASS;")) {
-                                                renderedFrames++
-                                            } else {
-                                                Log.w(TAG, "renderFrame FAIL at index $renderedFrames: $renderStr")
-                                                frameRenderError = renderStr
-                                            }
-                                        }
-                                    }
-                                } finally {
-                                    try { hwBuf?.close() } catch (_: Throwable) {}
-                                    try { image.close() } catch (_: Throwable) {}
-                                }
-                            }
+                            // Feed, drain, and render - delegated to AndroidDagFrameRenderPump.
+                            val pumpResult = AndroidDagFrameRenderPump().pumpOnce(
+                                extractor = extractor,
+                                codec = codec,
+                                imageQueue = imageQueue,
+                                bridge = nativeBridge,
+                                sessionId = sessionId,
+                                videoWidth = videoWidth,
+                                videoHeight = videoHeight,
+                                currentGenerationId = currentGenerationId,
+                                inputDone = inputDone,
+                                outputDone = outputDone,
+                                renderedFrames = renderedFrames,
+                                lastRenderedPtsUs = lastRenderedPtsUs,
+                            )
+                            inputDone = pumpResult.inputDone
+                            outputDone = pumpResult.outputDone
+                            renderedFrames = pumpResult.renderedFrames
+                            lastRenderedPtsUs = pumpResult.lastRenderedPtsUs
+                            frameRenderError = pumpResult.frameRenderError
 
                             // Check completion/termination
                             val target = targetFrameCount
