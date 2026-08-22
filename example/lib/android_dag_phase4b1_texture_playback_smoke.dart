@@ -11,6 +11,12 @@
 //   - Display Texture(textureId) if present in response.
 //   - Print ANDROID_DAG_PHASE4B1A_JSON:<json> and PASS only if pass == true
 //     and renderedFrames == 12.
+//
+// Phase 4B2C rotation correction:
+//   - The native session now returns displayWidth/displayHeight (post-rotation).
+//   - The Texture widget is sized to a compact box that preserves that aspect
+//     ratio (max 320 px on longest edge), so portrait-rotated clips render in a
+//     portrait box instead of the old hardcoded 320×240 landscape box.
 
 import 'dart:async';
 import 'dart:convert';
@@ -36,6 +42,10 @@ class _AndroidDagPhase4B1TexturePlaybackSmokeAppState
   static const _channel = MethodChannel('vanguard_media_engine');
   String _status = 'Running Android DAG Phase 4B1A texture playback smoke…';
   int? _textureId;
+
+  /// Display dimensions from the native session (post-rotation).
+  int _displayWidth = 320;
+  int _displayHeight = 240;
 
   @override
   void initState() {
@@ -83,6 +93,19 @@ class _AndroidDagPhase4B1TexturePlaybackSmokeAppState
       final startMap = Map<String, dynamic>.from(startResponse! as Map);
       activeTextureId = (startMap['textureId'] as num?)?.toInt();
 
+      // Capture display dimensions returned by the native session so the
+      // Texture widget respects the post-rotation aspect ratio.
+      final startDw = (startMap['displayWidth'] as num?)?.toInt();
+      final startDh = (startMap['displayHeight'] as num?)?.toInt();
+      if (startDw != null && startDw > 0 && startDh != null && startDh > 0) {
+        if (mounted) {
+          setState(() {
+            _displayWidth = startDw;
+            _displayHeight = startDh;
+          });
+        }
+      }
+
       if (mounted && activeTextureId != null) {
         setState(() {
           _textureId = activeTextureId;
@@ -108,6 +131,14 @@ class _AndroidDagPhase4B1TexturePlaybackSmokeAppState
     final pass = payload['pass'] == true && payload['renderedFrames'] == 12;
     final textureId =
         (payload['textureId'] as num?)?.toInt() ?? activeTextureId;
+
+    // Update display dimensions from the final result map if available.
+    final dw = (payload['displayWidth'] as num?)?.toInt();
+    final dh = (payload['displayHeight'] as num?)?.toInt();
+    if (dw != null && dw > 0 && dh != null && dh > 0) {
+      _displayWidth = dw;
+      _displayHeight = dh;
+    }
 
     // ignore: avoid_print
     print('ANDROID_DAG_PHASE4B1A_JSON:${jsonEncode(payload)}');
@@ -141,8 +172,19 @@ class _AndroidDagPhase4B1TexturePlaybackSmokeAppState
     } catch (_) {}
   }
 
+  /// Returns a [Size] that fits [displayWidth]×[displayHeight] within a
+  /// [maxLongestEdge]-px bounding box while preserving the aspect ratio.
+  Size _constrainedSize({double maxLongestEdge = 320}) {
+    final w = _displayWidth.toDouble();
+    final h = _displayHeight.toDouble();
+    if (w <= 0 || h <= 0) return const Size(320, 240);
+    final scale = maxLongestEdge / (w > h ? w : h);
+    return Size(w * scale, h * scale);
+  }
+
   @override
   Widget build(BuildContext context) {
+    final textureSize = _constrainedSize();
     return MaterialApp(
       home: Scaffold(
         body: Center(
@@ -151,8 +193,8 @@ class _AndroidDagPhase4B1TexturePlaybackSmokeAppState
             children: [
               if (_textureId != null)
                 SizedBox(
-                  width: 320,
-                  height: 240,
+                  width: textureSize.width,
+                  height: textureSize.height,
                   child: Texture(textureId: _textureId!),
                 ),
               const SizedBox(height: 16),

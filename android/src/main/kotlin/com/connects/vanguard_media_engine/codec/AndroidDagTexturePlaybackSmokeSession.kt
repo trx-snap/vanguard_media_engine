@@ -6,7 +6,6 @@ import android.media.Image
 import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaExtractor
-import android.media.MediaFormat
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -28,6 +27,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Route: MediaExtractor/MediaCodec -> ImageReader/HardwareBuffer ->
  *        native DAG evaluation -> VulkanBackend render ->
  *        Flutter TextureRegistry Surface.
+ *
+ * Phase 4B2C rotation correction: source inspection is delegated to
+ * AndroidDagSourceInspector, which provides rotationDegrees.  Display
+ * dimensions are swapped for 90/270 clockwise rotation.  The Flutter
+ * surface buffer size and native session use display dimensions; the
+ * ImageReader/MediaCodec decoder path uses raw (source) dimensions.
+ * Rendering uses the generation-aware JNI call which carries rotationDegrees.
  */
 class AndroidDagTexturePlaybackSmokeSession(
     private val videoPath: String,
@@ -56,8 +62,19 @@ class AndroidDagTexturePlaybackSmokeSession(
     private var choreographer: Choreographer? = null
     private var activeFrameCallback: Choreographer.FrameCallback? = null
 
+    // Source metadata (raw)
     private var videoWidth = 0
     private var videoHeight = 0
+    private var durationUs = 0L
+    private var rotationDegrees = 0
+
+    // Display (post-rotation) dimensions
+    private var displayWidth = 0
+    private var displayHeight = 0
+
+    // Generation tracking (Phase 4B2C)
+    private var currentGenerationId = 0L
+
     private var renderedFrames = 0
     private var inputDone = false
     private var outputDone = false
@@ -69,39 +86,37 @@ class AndroidDagTexturePlaybackSmokeSession(
      * completion, error, EOS, or timeout.
      */
     fun run(): Map<String, Any?> {
-        if (Build.VERSION.SDK_INT < 29) {
-            setupError = "api_below_29"
+        // 1. Delegate all source inspection to the shared inspector.
+        //    The inspector performs file preflight, API check, extractor creation,
+        //    track selection, and rotation metadata normalisation.
+        val inspection = AndroidDagSourceInspector().inspect(videoPath)
+        if (!inspection.pass) {
+            setupError = "source_inspection_failed;reason=${inspection.failureReason}"
             return buildResultMap(false)
         }
+
+        // On success the inspector transfers extractor ownership to this session.
+        // Store it as a class field so dispose() can always release it,
+        // regardless of which early-return path is taken below.
+        extractor = inspection.extractor!!
+
+        // Populate session metadata from inspection result.
+        videoWidth = inspection.width
+        videoHeight = inspection.height
+        durationUs = inspection.durationUs
+        rotationDegrees = inspection.rotationDegrees
+
+        // Phase 4B2C: compute display dimensions — swap for 90/270 clockwise rotation.
+        val swapDims = rotationDegrees == 90 || rotationDegrees == 270
+        displayWidth  = if (swapDims) videoHeight else videoWidth
+        displayHeight = if (swapDims) videoWidth  else videoHeight
+
+        val mime   = inspection.mime
+        val format = inspection.format!!
 
         val latch = CountDownLatch(1)
 
         try {
-            // 1. Prepare MediaExtractor & find first video track
-            val ex = MediaExtractor().also { extractor = it }
-            ex.setDataSource(videoPath)
-            var trackIndex = -1
-            var format: MediaFormat? = null
-            for (i in 0 until ex.trackCount) {
-                val f = ex.getTrackFormat(i)
-                val mime = f.getString(MediaFormat.KEY_MIME) ?: ""
-                if (mime.startsWith("video/")) {
-                    trackIndex = i
-                    format = f
-                    break
-                }
-            }
-
-            if (trackIndex < 0 || format == null) {
-                setupError = "no_video_track_found"
-                return buildResultMap(false)
-            }
-
-            ex.selectTrack(trackIndex)
-            val mime = format.getString(MediaFormat.KEY_MIME)!!
-            videoWidth = format.getInteger(MediaFormat.KEY_WIDTH)
-            videoHeight = format.getInteger(MediaFormat.KEY_HEIGHT)
-
             // 2. Start HandlerThread for Choreographer loop & ImageReader
             val ht = HandlerThread("DagTexturePlaybackSmokeLoop").also {
                 handlerThread = it
@@ -109,11 +124,14 @@ class AndroidDagTexturePlaybackSmokeSession(
             }
             val h = Handler(ht.looper).also { handler = it }
 
-            // 3. Configure Flutter texture surface buffer size and wrap in Surface
-            textureEntry.surfaceTexture().setDefaultBufferSize(videoWidth, videoHeight)
+            // 3. Configure Flutter texture surface buffer size using DISPLAY dimensions
+            //    (post-rotation) and wrap in Surface.
+            textureEntry.surfaceTexture().setDefaultBufferSize(displayWidth, displayHeight)
             val surface = Surface(textureEntry.surfaceTexture()).also { flutterSurface = it }
 
-            // 4. Create ImageReader (PRIVATE, GPU_SAMPLED_IMAGE, API 29+)
+            // 4. Create ImageReader using RAW (source) dimensions — the decoder
+            //    decodes at native resolution; the rotation is applied in the
+            //    native render stage.
             val reader = ImageReader.newInstance(
                 videoWidth,
                 videoHeight,
@@ -144,6 +162,7 @@ class AndroidDagTexturePlaybackSmokeSession(
             dec.start()
 
             // 6. Create native session (VulkanBackend + diagnostic DAG)
+            //    using DISPLAY dimensions so the Vulkan surface is correctly sized.
             val diagnostics = VanguardDiagnostics()
             val bridge = VanguardNativeBridge(
                 VanguardLifecycleObserver(diagnostics),
@@ -153,8 +172,8 @@ class AndroidDagTexturePlaybackSmokeSession(
 
             val createResult = bridge.createAndroidDagPhase4B1TexturePlaybackSession(
                 surface,
-                videoWidth,
-                videoHeight,
+                displayWidth,
+                displayHeight,
             )
 
             if (!createResult.startsWith("status=OK;")) {
@@ -168,7 +187,23 @@ class AndroidDagTexturePlaybackSmokeSession(
                 return buildResultMap(false)
             }
 
-            // 7. Schedule Choreographer vsync loop on HandlerThread
+            // 7. Bump generation (Phase 4B2C requirement): establishes the initial
+            //    generation id that all render calls must carry.  Fail closed if the
+            //    bump itself or its id parse fails.
+            val bumpRes = bridge.bumpAndroidDagPhase4B1TexturePlaybackGeneration(sessionId!!)
+            if (!bumpRes.startsWith("status=OK;")) {
+                setupError = "initial_generation_bump_failed;bumpResult=${bumpRes.take(80)}"
+                return buildResultMap(false)
+            }
+            val genStr   = bumpRes.substringAfter("generationId=").substringBefore(";")
+            val parsedGen = genStr.toLongOrNull()
+            if (parsedGen == null || parsedGen <= 0L) {
+                setupError = "initial_generation_parse_failed;bumpResult=${bumpRes.take(80)}"
+                return buildResultMap(false)
+            }
+            currentGenerationId = parsedGen
+
+            // 8. Schedule Choreographer vsync loop on HandlerThread
             val deadline = System.currentTimeMillis() + TOTAL_TIMEOUT_MS
 
             h.post {
@@ -248,13 +283,18 @@ class AndroidDagTexturePlaybackSmokeSession(
                                             val sid = sessionId
                                             val nb = nativeBridge
                                             if (sid != null && nb != null) {
-                                                val renderStr = nb.renderAndroidDagPhase4B1TexturePlaybackFrame(
+                                                // Phase 4B2C: generation-aware render call carrying
+                                                // display dimensions and rotation metadata so the
+                                                // native Vulkan stage applies the correct transform.
+                                                val renderStr = nb.renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration(
                                                     sid,
                                                     hwBuf,
-                                                    videoWidth,
-                                                    videoHeight,
+                                                    displayWidth,
+                                                    displayHeight,
                                                     image.timestamp / 1000,
                                                     renderedFrames,
+                                                    currentGenerationId,
+                                                    rotationDegrees,
                                                 )
 
                                                 if (renderStr.startsWith("status=PASS;")) {
@@ -323,19 +363,35 @@ class AndroidDagTexturePlaybackSmokeSession(
 
     private fun buildResultMap(pass: Boolean): Map<String, Any?> {
         val raw = if (pass) {
-            "status=PASS;renderedFrames=$renderedFrames;frameCount=$frameCount;width=$videoWidth;height=$videoHeight;textureId=${textureEntry.id()}"
+            "status=PASS;renderedFrames=$renderedFrames;frameCount=$frameCount;" +
+                "sourceWidth=$videoWidth;sourceHeight=$videoHeight;" +
+                "displayWidth=$displayWidth;displayHeight=$displayHeight;" +
+                "rotationDegrees=$rotationDegrees;durationUs=$durationUs;" +
+                "textureId=${textureEntry.id()}"
         } else {
-            "status=FAIL;renderedFrames=$renderedFrames;frameCount=$frameCount;width=$videoWidth;height=$videoHeight;textureId=${textureEntry.id()};error=${frameRenderError ?: setupError ?: "unknown"}"
+            "status=FAIL;renderedFrames=$renderedFrames;frameCount=$frameCount;" +
+                "sourceWidth=$videoWidth;sourceHeight=$videoHeight;" +
+                "displayWidth=$displayWidth;displayHeight=$displayHeight;" +
+                "rotationDegrees=$rotationDegrees;durationUs=$durationUs;" +
+                "textureId=${textureEntry.id()};" +
+                "error=${frameRenderError ?: setupError ?: "unknown"}"
         }
 
         return mapOf(
-            "pass" to pass,
-            "textureId" to textureEntry.id(),
-            "renderedFrames" to renderedFrames,
-            "frameCount" to frameCount,
-            "width" to videoWidth,
-            "height" to videoHeight,
-            "raw" to raw,
+            "pass"            to pass,
+            "textureId"       to textureEntry.id(),
+            "renderedFrames"  to renderedFrames,
+            "frameCount"      to frameCount,
+            // width/height now reflect the display (output) dimensions.
+            "width"           to displayWidth,
+            "height"          to displayHeight,
+            "sourceWidth"     to videoWidth,
+            "sourceHeight"    to videoHeight,
+            "rotationDegrees" to rotationDegrees,
+            "displayWidth"    to displayWidth,
+            "displayHeight"   to displayHeight,
+            "durationUs"      to durationUs,
+            "raw"             to raw,
         )
     }
 
