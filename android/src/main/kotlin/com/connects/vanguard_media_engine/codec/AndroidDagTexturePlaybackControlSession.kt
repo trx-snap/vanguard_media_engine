@@ -18,7 +18,6 @@ import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
 import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import io.flutter.view.TextureRegistry
 import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -581,136 +580,39 @@ class AndroidDagTexturePlaybackControlSession(
                 val genStr = bumpRes.substringAfter("generationId=").substringBefore(";")
                 currentGenerationId = genStr.toLongOrNull() ?: (currentGenerationId + 1)
 
-                // g & h. Preroll decode and render target frame
-                var seekRenderedPtsUs = -1L
-                var seekSuccess = false
-                var seekError: String? = null
-                val seekDeadline = System.currentTimeMillis() + 8000L
+                // g & h. Preroll decode and render — delegated to AndroidDagSeekPrerollEngine
+                val ex = extractor
+                val dec = codec
+                val reader = imageReader
+                if (ex == null || dec == null || reader == null) {
+                    state = AndroidDagPlaybackState.Failed
+                    onResult(mapOf("pass" to false, "state" to state.name, "raw" to "status=FAIL;reason=session_or_bridge_null"))
+                    return@post
+                }
 
-                while (System.currentTimeMillis() < seekDeadline && !seekSuccess && seekError == null) {
-                    // Feed input
-                    if (!inputDone) {
-                        val inIdx = codec?.dequeueInputBuffer(10000) ?: -1
-                        if (inIdx >= 0) {
-                            val buf = codec?.getInputBuffer(inIdx)
-                            if (buf != null) {
-                                val sampleSize = extractor?.readSampleData(buf, 0) ?: -1
-                                if (sampleSize < 0) {
-                                    codec?.queueInputBuffer(
-                                        inIdx,
-                                        0,
-                                        0,
-                                        0,
-                                        MediaCodec.BUFFER_FLAG_END_OF_STREAM,
-                                    )
-                                    inputDone = true
-                                } else {
-                                    val pts = extractor?.sampleTime ?: 0L
-                                    codec?.queueInputBuffer(inIdx, 0, sampleSize, pts, 0)
-                                    extractor?.advance()
-                                }
-                            }
-                        }
-                    }
+                val engineResult = AndroidDagSeekPrerollEngine().run(
+                    extractor = ex,
+                    codec = dec,
+                    imageReader = reader,
+                    imageQueue = imageQueue,
+                    bridge = nb,
+                    sessionId = sid,
+                    videoWidth = videoWidth,
+                    videoHeight = videoHeight,
+                    seekTargetUs = targetPtsUs,
+                    currentGenerationId = currentGenerationId,
+                    renderedFramesBefore = renderedFrames,
+                    deadlineMs = System.currentTimeMillis() + 8000L,
+                )
 
-                    // Dequeue output
-                    val info = MediaCodec.BufferInfo()
-                    val outIdx = codec?.dequeueOutputBuffer(info, 10000) ?: -1
-                    if (outIdx >= 0) {
-                        val isEos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-                        val ptsUs = info.presentationTimeUs
-
-                        if (isEos) {
-                            outputDone = true
-                            codec?.releaseOutputBuffer(outIdx, false)
-                            if (!seekSuccess) {
-                                seekError = "eos_reached_before_seek_target"
-                            }
-                            break
-                        }
-
-                        if (targetPtsUs > 0 && ptsUs < targetPtsUs) {
-                            // Preroll frame: release without rendering to surface
-                            codec?.releaseOutputBuffer(outIdx, false)
-                        } else {
-                            // Target frame reached: release with render=true
-                            codec?.releaseOutputBuffer(outIdx, true)
-
-                            // Wait for ImageReader
-                            var image: Image? = null
-                            val pollDeadline = System.currentTimeMillis() + 2000L
-                            while (System.currentTimeMillis() < pollDeadline && image == null) {
-                                image = try {
-                                    imageReader?.acquireLatestImage()
-                                        ?: imageReader?.acquireNextImage()
-                                        ?: imageQueue.poll(20, TimeUnit.MILLISECONDS)
-                                } catch (_: Throwable) {
-                                    imageQueue.poll(20, TimeUnit.MILLISECONDS)
-                                }
-                                if (image == null) {
-                                    try { Thread.sleep(10) } catch (_: Throwable) {}
-                                }
-                            }
-
-                            if (image == null) {
-                                seekError = "image_reader_timeout_on_seek_frame"
-                                break
-                            }
-
-                            var hwBuf: HardwareBuffer? = null
-                            try {
-                                hwBuf = image.hardwareBuffer
-                                if (hwBuf == null) {
-                                    seekError = "hardware_buffer_null_on_seek"
-                                    break
-                                }
-
-                                // Wait SyncFence API >= 33
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                    val fence = image.fence
-                                    try {
-                                        if (fence.isValid) {
-                                            fence.await(java.time.Duration.ofMillis(1000))
-                                        }
-                                    } catch (e: Exception) {
-                                        Log.w(TAG, "SyncFence await exception on seek: $e")
-                                    } finally {
-                                        try { fence.close() } catch (_: Throwable) {}
-                                    }
-                                }
-
-                                val imgPtsUs = image.timestamp / 1000L
-                                val framePts = if (imgPtsUs > 0) imgPtsUs else ptsUs
-
-                                val renderStr = nb.renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration(
-                                    sid,
-                                    hwBuf,
-                                    videoWidth,
-                                    videoHeight,
-                                    framePts,
-                                    renderedFrames,
-                                    currentGenerationId,
-                                )
-
-                                if (renderStr.startsWith("status=PASS;")) {
-                                    renderedFrames++
-                                    lastRenderedPtsUs = framePts
-                                    seekRenderedPtsUs = framePts
-                                    seekSuccess = true
-                                } else {
-                                    seekError = "render_failed_on_seek;$renderStr"
-                                }
-                            } finally {
-                                try { hwBuf?.close() } catch (_: Throwable) {}
-                                try { image.close() } catch (_: Throwable) {}
-                            }
-                            break
-                        }
-                    }
+                // Apply engine result back to session state
+                renderedFrames = engineResult.renderedFrames
+                if (engineResult.lastRenderedPtsUs >= 0) {
+                    lastRenderedPtsUs = engineResult.lastRenderedPtsUs
                 }
 
                 // j. Resume or hold Paused
-                if (seekSuccess) {
+                if (engineResult.pass) {
                     if (resumeAfterSeek) {
                         state = AndroidDagPlaybackState.Playing
                         play(null) { /* continuous */ }
@@ -722,10 +624,10 @@ class AndroidDagTexturePlaybackControlSession(
                         "pass" to true,
                         "state" to state.name,
                         "seekTargetUs" to targetPtsUs,
-                        "seekRenderedPtsUs" to seekRenderedPtsUs,
-                        "generationId" to currentGenerationId,
+                        "seekRenderedPtsUs" to engineResult.seekRenderedPtsUs,
+                        "generationId" to engineResult.generationId,
                         "renderedFrames" to renderedFrames,
-                        "raw" to "status=OK;state=${state.name};seekTargetUs=$targetPtsUs;seekRenderedPtsUs=$seekRenderedPtsUs;generationId=$currentGenerationId",
+                        "raw" to "status=OK;state=${state.name};seekTargetUs=$targetPtsUs;seekRenderedPtsUs=${engineResult.seekRenderedPtsUs};generationId=${engineResult.generationId}",
                     ))
                 } else {
                     state = AndroidDagPlaybackState.Failed
@@ -733,8 +635,8 @@ class AndroidDagTexturePlaybackControlSession(
                         "pass" to false,
                         "state" to state.name,
                         "seekTargetUs" to targetPtsUs,
-                        "seekRenderedPtsUs" to seekRenderedPtsUs,
-                        "raw" to "status=FAIL;reason=${seekError ?: "seek_timeout"}",
+                        "seekRenderedPtsUs" to engineResult.seekRenderedPtsUs,
+                        "raw" to "status=FAIL;reason=${engineResult.failureReason}",
                     ))
                 }
             } catch (t: Throwable) {
