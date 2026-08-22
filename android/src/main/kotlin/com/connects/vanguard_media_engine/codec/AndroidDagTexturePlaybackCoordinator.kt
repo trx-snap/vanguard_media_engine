@@ -12,6 +12,40 @@ class AndroidDagTexturePlaybackCoordinator(
 ) {
     companion object {
         private const val TAG = "DagTextureCoordinator"
+
+        private val OWNED_METHODS = setOf(
+            "runAndroidDagPhase4B1TexturePlaybackSmoke",
+            "disposeAndroidDagPhase4B1TexturePlaybackSmoke",
+            "createAndroidDagPhase4B1BPlaybackControlSmoke",
+            "playAndroidDagPhase4B1BPlaybackControlSmoke",
+            "pauseAndroidDagPhase4B1BPlaybackControlSmoke",
+            "seekAndroidDagPhase4B1BPlaybackControlSmoke",
+            "disposeAndroidDagPhase4B1BPlaybackControlSmoke",
+            "runAndroidDagPhase4B2AClockStateSmoke",
+            "simulateAndroidDagPhase4B2B2SurfaceCleanup",
+            "simulateAndroidDagPhase4B2B2SurfaceAvailable",
+        )
+
+        fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
+    }
+
+    fun ownsMethod(method: String): Boolean = Companion.ownsMethod(method)
+
+    fun handleMethodCall(method: String, args: Map<*, *>?, result: MethodChannel.Result): Boolean {
+        when (method) {
+            "runAndroidDagPhase4B1TexturePlaybackSmoke" -> runPhase4B1TexturePlaybackSmoke(args, result)
+            "disposeAndroidDagPhase4B1TexturePlaybackSmoke" -> disposePhase4B1TexturePlaybackSmoke(args, result)
+            "createAndroidDagPhase4B1BPlaybackControlSmoke" -> createPhase4B1BPlaybackControlSmoke(args, result)
+            "playAndroidDagPhase4B1BPlaybackControlSmoke" -> playPhase4B1BPlaybackControlSmoke(args, result)
+            "pauseAndroidDagPhase4B1BPlaybackControlSmoke" -> pausePhase4B1BPlaybackControlSmoke(args, result)
+            "seekAndroidDagPhase4B1BPlaybackControlSmoke" -> seekPhase4B1BPlaybackControlSmoke(args, result)
+            "disposeAndroidDagPhase4B1BPlaybackControlSmoke" -> disposePhase4B1BPlaybackControlSmoke(args, result)
+            "runAndroidDagPhase4B2AClockStateSmoke" -> runPhase4B2AClockStateSmoke(args, result)
+            "simulateAndroidDagPhase4B2B2SurfaceCleanup" -> simulatePhase4B2B2SurfaceCleanup(args, result)
+            "simulateAndroidDagPhase4B2B2SurfaceAvailable" -> simulatePhase4B2B2SurfaceAvailable(args, result)
+            else -> return false
+        }
+        return true
     }
 
     private data class ActiveSmokeEntry(

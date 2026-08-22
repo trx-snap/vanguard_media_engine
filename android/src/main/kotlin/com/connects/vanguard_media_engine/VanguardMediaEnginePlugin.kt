@@ -64,6 +64,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
         val args = call.arguments as? Map<*, *>
 
+        if (AndroidDagTexturePlaybackCoordinator.ownsMethod(call.method)) {
+            val coord = dagTexturePlaybackCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
+            }
+            return
+        }
+
         when (call.method) {
 
             "runAndroidDagPhase2O2B3PhysicalSmoke" -> {
@@ -119,96 +129,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                     )
                     mainHandler.post { result.success(smokeResult) }
                 }.start()
-            }
-
-            "runAndroidDagPhase4B1TexturePlaybackSmoke" -> {
-                val coord = dagTexturePlaybackCoordinator
-                if (coord != null) {
-                    coord.runPhase4B1TexturePlaybackSmoke(args, result)
-                } else {
-                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
-                }
-            }
-
-            "disposeAndroidDagPhase4B1TexturePlaybackSmoke" -> {
-                val coord = dagTexturePlaybackCoordinator
-                if (coord != null) {
-                    coord.disposePhase4B1TexturePlaybackSmoke(args, result)
-                } else {
-                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
-                }
-            }
-
-            "createAndroidDagPhase4B1BPlaybackControlSmoke" -> {
-                val coord = dagTexturePlaybackCoordinator
-                if (coord != null) {
-                    coord.createPhase4B1BPlaybackControlSmoke(args, result)
-                } else {
-                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
-                }
-            }
-
-            "playAndroidDagPhase4B1BPlaybackControlSmoke" -> {
-                val coord = dagTexturePlaybackCoordinator
-                if (coord != null) {
-                    coord.playPhase4B1BPlaybackControlSmoke(args, result)
-                } else {
-                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
-                }
-            }
-
-            "pauseAndroidDagPhase4B1BPlaybackControlSmoke" -> {
-                val coord = dagTexturePlaybackCoordinator
-                if (coord != null) {
-                    coord.pausePhase4B1BPlaybackControlSmoke(args, result)
-                } else {
-                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
-                }
-            }
-
-            "seekAndroidDagPhase4B1BPlaybackControlSmoke" -> {
-                val coord = dagTexturePlaybackCoordinator
-                if (coord != null) {
-                    coord.seekPhase4B1BPlaybackControlSmoke(args, result)
-                } else {
-                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
-                }
-            }
-
-            "disposeAndroidDagPhase4B1BPlaybackControlSmoke" -> {
-                val coord = dagTexturePlaybackCoordinator
-                if (coord != null) {
-                    coord.disposePhase4B1BPlaybackControlSmoke(args, result)
-                } else {
-                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
-                }
-            }
-
-            "runAndroidDagPhase4B2AClockStateSmoke" -> {
-                val coord = dagTexturePlaybackCoordinator
-                if (coord != null) {
-                    coord.runPhase4B2AClockStateSmoke(args, result)
-                } else {
-                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
-                }
-            }
-
-            "simulateAndroidDagPhase4B2B2SurfaceCleanup" -> {
-                val coord = dagTexturePlaybackCoordinator
-                if (coord != null) {
-                    coord.simulatePhase4B2B2SurfaceCleanup(args, result)
-                } else {
-                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
-                }
-            }
-
-            "simulateAndroidDagPhase4B2B2SurfaceAvailable" -> {
-                val coord = dagTexturePlaybackCoordinator
-                if (coord != null) {
-                    coord.simulatePhase4B2B2SurfaceAvailable(args, result)
-                } else {
-                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
-                }
             }
 
             "createTexture" -> {
