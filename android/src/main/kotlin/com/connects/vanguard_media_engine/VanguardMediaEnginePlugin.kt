@@ -184,6 +184,15 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 }
             }
 
+            "runAndroidDagPhase4B2AClockStateSmoke" -> {
+                val coord = dagTexturePlaybackCoordinator
+                if (coord != null) {
+                    coord.runPhase4B2AClockStateSmoke(args, result)
+                } else {
+                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
+                }
+            }
+
             "createTexture" -> {
                 val path = args?.get("path") as? String
                     ?: return result.error("INVALID_ARG", "path required", null)

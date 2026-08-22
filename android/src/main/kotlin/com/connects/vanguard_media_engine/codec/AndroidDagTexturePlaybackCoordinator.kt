@@ -257,6 +257,123 @@ class AndroidDagTexturePlaybackCoordinator(
         }
     }
 
+    // ── Phase 4B2A: State Machine & Timeline Clock diagnostic smoke ─────────
+
+    fun runPhase4B2AClockStateSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        try {
+            val stateSequence = mutableListOf<String>()
+            val sm = AndroidDagPlaybackStateMachine()
+            stateSequence.add(sm.state.name) // Idle
+
+            var smPass = true
+            fun step(res: AndroidDagPlaybackTransitionResult, expected: AndroidDagPlaybackState) {
+                if (!res.pass || sm.state != expected || res.toState != expected) {
+                    smPass = false
+                }
+                stateSequence.add(sm.state.name)
+            }
+
+            step(sm.prepareStarted(), AndroidDagPlaybackState.Preparing)
+            step(sm.prepareSucceeded(), AndroidDagPlaybackState.Prepared)
+            step(sm.playRequested(), AndroidDagPlaybackState.Playing)
+            step(sm.pauseRequested(), AndroidDagPlaybackState.Paused)
+            step(sm.seekStarted(), AndroidDagPlaybackState.Seeking)
+            step(sm.seekCompletedPaused(), AndroidDagPlaybackState.Paused)
+            step(sm.playRequested(), AndroidDagPlaybackState.Playing)
+            step(sm.surfaceLost(), AndroidDagPlaybackState.SurfaceLost)
+            step(sm.surfaceRestored(), AndroidDagPlaybackState.Paused)
+            step(sm.backgrounded(), AndroidDagPlaybackState.Backgrounded)
+            step(sm.foregrounded(), AndroidDagPlaybackState.Paused)
+            step(sm.playRequested(), AndroidDagPlaybackState.Playing)
+            step(sm.completed(), AndroidDagPlaybackState.Completed)
+            step(sm.dispose(), AndroidDagPlaybackState.Disposed)
+
+            // Test idempotent dispose
+            val disp2 = sm.dispose()
+            if (!disp2.pass || sm.state != AndroidDagPlaybackState.Disposed) {
+                smPass = false
+            }
+
+            // Test invalid transitions
+            val invalidFromDisposed = sm.playRequested()
+            val invalidSm = AndroidDagPlaybackStateMachine()
+            val invalidFromIdle = invalidSm.seekCompletedPaused()
+            val invalidTransitionPass = !invalidFromDisposed.pass &&
+                    sm.state == AndroidDagPlaybackState.Disposed &&
+                    invalidFromDisposed.reason != null &&
+                    !invalidFromIdle.pass &&
+                    invalidSm.state == AndroidDagPlaybackState.Idle &&
+                    invalidFromIdle.reason != null
+
+            // Exercise Timeline Clock
+            val clock = AndroidDagTimelineClock()
+            val baseNanos = 1_000_000_000L // 1.0s
+            clock.start(frameTimeNanos = baseNanos, initialMediaPtsUs = 0L)
+
+            // Advance 0.5s (500_000 us)
+            val t1Nanos = baseNanos + 500_000_000L
+            val pos1 = clock.currentPositionUs(t1Nanos)
+
+            // Pause at t1
+            val pausedPositionUs = clock.pause(t1Nanos)
+            val t2Nanos = baseNanos + 1_000_000_000L
+            val posWhilePaused = clock.currentPositionUs(t2Nanos)
+
+            // Resume at t2 and advance 0.25s (250_000 us)
+            clock.resume(t2Nanos)
+            val t3Nanos = t2Nanos + 250_000_000L
+            val resumedPositionUs = clock.currentPositionUs(t3Nanos)
+
+            // Seek to 2_000_000 us at t4
+            val t4Nanos = t3Nanos + 100_000_000L
+            val seekPositionUs = clock.seek(2_000_000L, t4Nanos)
+            val t5Nanos = t4Nanos + 100_000_000L
+            val posAfterSeek = clock.currentPositionUs(t5Nanos)
+
+            // Test negative clamp
+            clock.seek(-100_000L, t5Nanos)
+            val clampedNeg = clock.currentPositionUs(t5Nanos)
+
+            clock.dispose()
+
+            val clockPass = pos1 == 500_000L &&
+                    pausedPositionUs == 500_000L &&
+                    posWhilePaused == 500_000L &&
+                    resumedPositionUs == 750_000L &&
+                    seekPositionUs == 2_000_000L &&
+                    posAfterSeek == 2_100_000L &&
+                    clampedNeg == 0L
+
+            val pass = smPass && invalidTransitionPass && clockPass
+            val raw = if (pass) {
+                "status=OK;smPass=$smPass;clockPass=$clockPass;invalidTransitionPass=$invalidTransitionPass"
+            } else {
+                "status=FAIL;smPass=$smPass;clockPass=$clockPass;invalidTransitionPass=$invalidTransitionPass;pos1=$pos1;pausedPos=$pausedPositionUs;pausedCheck=$posWhilePaused;resumedPos=$resumedPositionUs;seekPos=$seekPositionUs;posAfterSeek=$posAfterSeek;clampedNeg=$clampedNeg"
+            }
+
+            result.success(mapOf(
+                "pass" to pass,
+                "stateSequence" to stateSequence,
+                "invalidTransitionPass" to invalidTransitionPass,
+                "pausedPositionUs" to pausedPositionUs,
+                "resumedPositionUs" to resumedPositionUs,
+                "seekPositionUs" to seekPositionUs,
+                "raw" to raw,
+            ))
+        } catch (t: Throwable) {
+            Log.e(TAG, "Phase 4B2A clock/state smoke error", t)
+            result.success(mapOf(
+                "pass" to false,
+                "stateSequence" to emptyList<String>(),
+                "invalidTransitionPass" to false,
+                "pausedPositionUs" to -1L,
+                "resumedPositionUs" to -1L,
+                "seekPositionUs" to -1L,
+                "raw" to "status=FAIL;reason=exception:${t.javaClass.simpleName}:${t.message}",
+            ))
+        }
+    }
+
     fun disposeAll() {
         synchronized(smokeSessions) {
             smokeSessions.values.forEach { entry ->
