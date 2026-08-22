@@ -36,6 +36,15 @@ class VanguardNativeBridge(
         frameCount: Int,
     ): String
 
+    external fun runAndroidDagPhase3CEvalRenderSmoke(
+        surface: Surface,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        frameCount: Int,
+        frameDurationUs: Long,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

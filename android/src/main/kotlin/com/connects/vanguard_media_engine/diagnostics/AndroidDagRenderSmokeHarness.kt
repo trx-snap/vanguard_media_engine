@@ -168,6 +168,99 @@ object AndroidDagRenderSmokeHarness {
         "status=FAIL;initialize=$reason;attach=not_run;import=not_run;renderedFrames=0;" +
             "frameCount=$frameCount;renderFrame=not_run;failingFrame=-1;release=not_run;width=$width;height=$height"
 
+    // ── Phase 3C: DAG playhead evaluation smoke ───────────────────────────────
+    private const val RESULT_MARKER_PHASE3C = "ANDROID_DAG_PHASE3C_NATIVE_RESULT"
+
+    fun runDagEvaluationSmoke(
+        width: Int = 64,
+        height: Int = 64,
+        frameCount: Int = 30,
+        frameDurationUs: Long = 33333L,
+    ): Map<String, Any?> {
+        var surfaceTexture: SurfaceTexture? = null
+        var surface: Surface? = null
+        var hardwareBuffer: HardwareBuffer? = null
+        var raw = dagEvalFailure("not_run", width, height, frameCount)
+
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                raw = dagEvalFailure("api_below_26", width, height, frameCount)
+                return dagEvalResult(raw, width, height, frameCount)
+            }
+            if (width <= 0 || height <= 0 || frameCount <= 0 || frameDurationUs <= 0) {
+                raw = dagEvalFailure("invalid_params", width, height, frameCount)
+                return dagEvalResult(raw, width, height, frameCount)
+            }
+
+            surfaceTexture = SurfaceTexture(false).apply {
+                setDefaultBufferSize(width, height)
+            }
+            surface = Surface(surfaceTexture)
+            hardwareBuffer = HardwareBuffer.create(
+                width,
+                height,
+                HardwareBuffer.RGBA_8888,
+                1,
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+            )
+
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase3CEvalRenderSmoke(
+                surface,
+                hardwareBuffer,
+                width,
+                height,
+                frameCount,
+                frameDurationUs,
+            )
+            return dagEvalResult(raw, width, height, frameCount)
+        } catch (throwable: Throwable) {
+            raw = dagEvalFailure(
+                throwable.javaClass.simpleName.ifEmpty { "unknown_exception" },
+                width,
+                height,
+                frameCount,
+            )
+            return dagEvalResult(raw, width, height, frameCount)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE3C $raw")
+            try { hardwareBuffer?.close() } catch (_: Throwable) {}
+            try { surface?.release() } catch (_: Throwable) {}
+            try { surfaceTexture?.release() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun dagEvalResult(raw: String, width: Int, height: Int, frameCount: Int): Map<String, Any?> {
+        val pass = raw.startsWith("status=PASS;")
+        // Parse evaluatedPtsUs from the structured status string if available.
+        val evaluatedPtsUs: Long = run {
+            val key = "evaluatedPtsUs="
+            val idx = raw.indexOf(key)
+            if (idx < 0) return@run 0L
+            val start = idx + key.length
+            val end = raw.indexOf(';', start).let { if (it < 0) raw.length else it }
+            raw.substring(start, end).toLongOrNull() ?: 0L
+        }
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "width" to width,
+            "height" to height,
+            "frameCount" to frameCount,
+            "evaluatedPtsUs" to evaluatedPtsUs,
+        )
+    }
+
+    private fun dagEvalFailure(reason: String, width: Int, height: Int, frameCount: Int): String =
+        "status=FAIL;initialize=$reason;attach=not_run;graphBuild=not_run;import=not_run;" +
+            "evaluation=not_run;renderedFrames=0;frameCount=$frameCount;evaluatedPtsUs=0;" +
+            "renderFrame=not_run;failingFrame=-1;release=not_run;width=$width;height=$height"
+
     // ── Phase 2Q: direct capability-probe smoke ──────────────────────────────
     private const val RESULT_MARKER_PHASE2Q = "ANDROID_DAG_PHASE2Q_CAPABILITY_PROBE_RESULT"
 
