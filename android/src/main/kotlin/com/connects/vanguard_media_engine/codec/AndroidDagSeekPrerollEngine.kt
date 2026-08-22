@@ -72,6 +72,10 @@ class AndroidDagSeekPrerollEngine {
      * @param renderedFramesBefore Cumulative rendered-frame count before this seek.
      * @param deadlineMs          Wall-clock deadline (System.currentTimeMillis()) for the loop.
      *                            Pass [System.currentTimeMillis] + [SEEK_DEADLINE_MS] or custom.
+     * @param shouldCancel        Optional lambda checked at the top of each loop iteration.
+     *                            When it returns `true` the loop exits immediately and
+     *                            [AndroidDagSeekPrerollResult.failureReason] is set to
+     *                            `"surface_lost"`. Defaults to `{ false }`.
      * @return [AndroidDagSeekPrerollResult] describing outcome.
      */
     fun run(
@@ -87,6 +91,7 @@ class AndroidDagSeekPrerollEngine {
         currentGenerationId: Long,
         renderedFramesBefore: Int,
         deadlineMs: Long,
+        shouldCancel: () -> Boolean = { false },
     ): AndroidDagSeekPrerollResult {
         var inputDone = false
         var outputDone = false
@@ -97,6 +102,12 @@ class AndroidDagSeekPrerollEngine {
         var lastRenderedPtsUs = -1L
 
         while (System.currentTimeMillis() < deadlineMs && !seekSuccess && seekError == null) {
+            // ── Cancellation check (e.g. surface lost during preroll) ─────────
+            if (shouldCancel()) {
+                seekError = "surface_lost"
+                break
+            }
+
             // ── Feed input ────────────────────────────────────────────────────
             if (!inputDone) {
                 val inIdx = codec.dequeueInputBuffer(10_000)

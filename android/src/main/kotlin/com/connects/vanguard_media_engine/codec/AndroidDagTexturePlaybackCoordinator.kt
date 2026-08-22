@@ -389,6 +389,70 @@ class AndroidDagTexturePlaybackCoordinator(
         }
     }
 
+    // ── Phase 4B2B2B: Surface lifecycle diagnostic seams ─────────────────────
+
+    /**
+     * Diagnostic seam: simulates a surface cleanup callback for the given textureId.
+     * Intended for future physical smoke tests; does not affect production lifecycle.
+     */
+    fun simulatePhase4B2B2SurfaceCleanup(args: Map<*, *>?, result: MethodChannel.Result) {
+        val textureId = (args?.get("textureId") as? Number)?.toLong()
+        if (textureId == null) {
+            result.error("INVALID_ARG", "simulateAndroidDagPhase4B2B2SurfaceCleanup: textureId required", null)
+            return
+        }
+        val entry = synchronized(controlSessions) { controlSessions[textureId] }
+        if (entry == null) {
+            result.success(mapOf(
+                "pass" to false,
+                "textureId" to textureId,
+                "raw" to "status=FAIL;reason=session_not_found;textureId=$textureId",
+            ))
+            return
+        }
+        // Delegate to the session; onDone fires after handler work completes so the snapshot is accurate.
+        entry.session.simulateSurfaceCleanup { diag ->
+            mainHandler.post {
+                result.success(diag.toMutableMap().apply {
+                    put("pass", true)
+                    put("textureId", textureId)
+                    put("raw", "status=OK;simulated=surface_cleanup;state=${diag["state"]}")
+                })
+            }
+        }
+    }
+
+    /**
+     * Diagnostic seam: simulates a surface available callback for the given textureId.
+     * Intended for future physical smoke tests; does not affect production lifecycle.
+     */
+    fun simulatePhase4B2B2SurfaceAvailable(args: Map<*, *>?, result: MethodChannel.Result) {
+        val textureId = (args?.get("textureId") as? Number)?.toLong()
+        if (textureId == null) {
+            result.error("INVALID_ARG", "simulateAndroidDagPhase4B2B2SurfaceAvailable: textureId required", null)
+            return
+        }
+        val entry = synchronized(controlSessions) { controlSessions[textureId] }
+        if (entry == null) {
+            result.success(mapOf(
+                "pass" to false,
+                "textureId" to textureId,
+                "raw" to "status=FAIL;reason=session_not_found;textureId=$textureId",
+            ))
+            return
+        }
+        // Delegate; onDone fires after restore handler work completes so the snapshot is accurate.
+        entry.session.simulateSurfaceAvailable { diag ->
+            mainHandler.post {
+                result.success(diag.toMutableMap().apply {
+                    put("pass", true)
+                    put("textureId", textureId)
+                    put("raw", "status=OK;simulated=surface_available;state=${diag["state"]}")
+                })
+            }
+        }
+    }
+
     fun disposeAll() {
         synchronized(smokeSessions) {
             smokeSessions.values.forEach { entry ->

@@ -193,6 +193,24 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 }
             }
 
+            "simulateAndroidDagPhase4B2B2SurfaceCleanup" -> {
+                val coord = dagTexturePlaybackCoordinator
+                if (coord != null) {
+                    coord.simulatePhase4B2B2SurfaceCleanup(args, result)
+                } else {
+                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
+                }
+            }
+
+            "simulateAndroidDagPhase4B2B2SurfaceAvailable" -> {
+                val coord = dagTexturePlaybackCoordinator
+                if (coord != null) {
+                    coord.simulatePhase4B2B2SurfaceAvailable(args, result)
+                } else {
+                    result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
+                }
+            }
+
             "createTexture" -> {
                 val path = args?.get("path") as? String
                     ?: return result.error("INVALID_ARG", "path required", null)
