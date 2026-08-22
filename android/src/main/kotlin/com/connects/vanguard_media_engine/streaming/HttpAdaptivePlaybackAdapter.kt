@@ -1,10 +1,11 @@
-// Copyright (c) Connects - Phase 4C1B: HttpAdaptivePlaybackAdapter scaffold.
-// Scaffold only. No live network streaming is claimed or verified here.
-// Physical network streaming proof is deferred to Phase 4C device validation.
+// Copyright (c) Connects - Phase 4C1C: HttpAdaptivePlaybackAdapter with headless ImageReader bridge.
+// Scaffold with headless decode surface bridge enabled.  No live network streaming is claimed or
+// verified here.  Physical network streaming proof is deferred to Phase 4C device validation.
 
 package com.connects.vanguard_media_engine.streaming
 
 import android.content.Context
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.view.Surface
@@ -23,7 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Android Media3 / ExoPlayer adaptive HTTP streaming adapter scaffold.
+ * Android Media3 / ExoPlayer adaptive HTTP streaming adapter.
  *
  * Supports HLS (including LL-HLS delta segments), DASH (MPD multi-period), and automatic format
  * detection for a single adaptive HTTP stream.  All ExoPlayer lifecycle operations execute on a
@@ -40,17 +41,28 @@ import java.util.concurrent.atomic.AtomicLong
  * ## Surface Binding
  * - The caller supplies an optional [android.view.Surface] via [setSurface].
  * - Internally, `ExoPlayer.setVideoSurface(surface)` / `setVideoSurface(null)` is used.
- * - [setVideoSurface] null is enforced **before** player stop/release and on surface loss.
- * - No [android.media.ImageReader] is allocated in this scaffold phase; wiring to the Vanguard
- *   True-DAG ImageReader pipeline is deferred to Phase 4C4.
+ * - `setVideoSurface(null)` is enforced **before** player stop/release and on surface loss.
+ * - [setSurface] and [enableHeadlessFrameBridge] are mutually exclusive outputs: activating one
+ *   disables and releases the other.
+ *
+ * ## Headless Frame Bridge (Phase 4C1C)
+ * - [enableHeadlessFrameBridge] creates an [HttpAdaptiveImageReaderBridge] that routes decoded
+ *   frames through an [android.media.ImageReader] -> [android.hardware.HardwareBuffer] pipeline.
+ * - This is the decode surface -> HardwareBuffer slice.  Native DAG render wiring is deferred
+ *   to Phase 4C1D.
+ * - ABR / rendition resolution changes detected via [Player.Listener.onVideoSizeChanged] trigger
+ *   automatic bridge recreation to match the new dimensions.
+ * - Requires API 29+ (Android 10 / Q).
  *
  * ## Release Contract
  * - [release] is idempotent and terminal.  Once released, all subsequent public calls are no-ops.
- * - Release order:  detach surface -> stop player -> release player -> quit HandlerThread.
+ * - Release order:  detach surface -> stop player -> release player -> release headless bridge ->
+ *   quit HandlerThread.
  *
- * ## Non-Goals (scaffold boundary)
+ * ## Non-Goals (current boundary)
  * - No ConnectsApp wiring, no WebRTC/LiveKit transport, no DRM licensing.
- * - No working end-to-end streaming claim.  Compile-only scaffold for Phase 4C1B.
+ * - No native DAG render wiring (deferred to Phase 4C1D).
+ * - No working end-to-end streaming claim.
  *
  * @param context   Android [Context] used to build [ExoPlayer].  Must be a valid application or
  *                  plugin context; must not be an Activity context that may be destroyed.
@@ -97,7 +109,8 @@ class HttpAdaptivePlaybackAdapter(
      */
     private var player: ExoPlayer? = null
 
-    /** Pending surface to bind once the player exists (set before prepare is called). */
+    /** Pending external surface to bind once the player exists (set before prepare is called).
+     *  Mutually exclusive with [headlessBridge]: activating the bridge clears this field. */
     private var pendingSurface: Surface? = null
 
     /** Pending seek to apply once [Player.STATE_READY] is first reached. */
@@ -105,6 +118,22 @@ class HttpAdaptivePlaybackAdapter(
 
     /** Current stream configuration.  Set during [prepare]. */
     private var activeConfig: HttpAdaptiveStreamConfig? = null
+
+    // --- Headless bridge state (Phase 4C1C) --------------------------------------------------
+
+    /**
+     * Active headless ImageReader bridge.  Non-null when [enableHeadlessFrameBridge] has been
+     * called and [disableHeadlessFrameBridge] / [clearSurface] / [release] has not yet run.
+     * Only accessed on the HandlerThread.
+     */
+    private var headlessBridge: HttpAdaptiveImageReaderBridge? = null
+
+    /**
+     * Frame listener stored so that bridge recreation (on ABR resize) can reuse it without
+     * requiring the caller to call [enableHeadlessFrameBridge] again.
+     * Only accessed on the HandlerThread.
+     */
+    private var headlessFrameListener: HttpAdaptiveFrameListener? = null
 
     // --- Player.Listener ---------------------------------------------------------------------
 
@@ -188,7 +217,32 @@ class HttpAdaptivePlaybackAdapter(
         }
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
-            listener.onVideoSizeChanged(videoSize.width, videoSize.height)
+            val newWidth = videoSize.width
+            val newHeight = videoSize.height
+
+            // Always forward the size change to the listener (external callers may need it).
+            listener.onVideoSizeChanged(newWidth, newHeight)
+
+            // --- ABR / rendition resize seam (Phase 4C1C) -----------------------------------
+            // If the headless bridge is active and the new size is positive and differs from the
+            // current bridge dimensions, recreate the bridge to match the new resolution.
+            // This handles mid-stream ABR quality switches that change the decoded frame size.
+            val bridge = headlessBridge
+            val frameListener = headlessFrameListener
+            if (bridge != null && frameListener != null &&
+                newWidth > 0 && newHeight > 0 &&
+                (newWidth != bridge.width || newHeight != bridge.height)
+            ) {
+                // 1. Detach the player from the old bridge surface.
+                player?.setVideoSurface(null)
+                // 2. Release the old bridge (closes its ImageReader and surface).
+                bridge.release()
+                // 3. Create a new bridge sized to the updated resolution.
+                val newBridge = createBridgeOnHandlerThread(newWidth, newHeight, frameListener)
+                headlessBridge = newBridge
+                // 4. Bind the new bridge surface to the player.
+                player?.setVideoSurface(newBridge.surface)
+            }
         }
 
         override fun onPlayerError(error: PlaybackException) {
@@ -209,6 +263,9 @@ class HttpAdaptivePlaybackAdapter(
      *
      * If a player is already running from a previous prepare call, it is stopped and released
      * before the new session is initialised.  Safe to call from any thread.
+     *
+     * If [enableHeadlessFrameBridge] has been called, the bridge's surface is bound to the new
+     * player.  Otherwise [pendingSurface] is bound as before.
      *
      * @param config Stream configuration.  Must pass its own local validation invariants.
      */
@@ -231,10 +288,17 @@ class HttpAdaptivePlaybackAdapter(
             exo.addListener(playerListener)
             exo.playWhenReady = config.autoPlay
 
-            // Bind pending surface if the caller set it before prepare().
-            val surface = pendingSurface
-            if (surface != null) {
-                exo.setVideoSurface(surface)
+            // Bind the appropriate video output surface:
+            //   - headless bridge takes priority (Phase 4C1C).
+            //   - external pending surface is the fallback (pre-4C1C behaviour).
+            val bridge = headlessBridge
+            if (bridge != null) {
+                exo.setVideoSurface(bridge.surface)
+            } else {
+                val surface = pendingSurface
+                if (surface != null) {
+                    exo.setVideoSurface(surface)
+                }
             }
 
             val mediaSource = buildMediaSource(config)
@@ -315,9 +379,12 @@ class HttpAdaptivePlaybackAdapter(
     }
 
     /**
-     * Binds [surface] as the video output target.  If the player is already active, the surface
-     * is attached immediately via `ExoPlayer.setVideoSurface(surface)`.  If [prepare] has not
-     * been called yet, the surface is stored and applied when [prepare] creates the player.
+     * Binds [surface] as the video output target, disabling and releasing any active headless
+     * bridge to maintain mutual exclusion between the two output paths.
+     *
+     * If the player is already active, the surface is attached immediately via
+     * `ExoPlayer.setVideoSurface(surface)`.  If [prepare] has not been called yet, the surface
+     * is stored and applied when [prepare] creates the player.
      * Safe to call from any thread.
      *
      * @param surface Target [Surface] for video frame output.  Must not be null.
@@ -326,16 +393,24 @@ class HttpAdaptivePlaybackAdapter(
         if (released.get()) return
         handler.post {
             if (released.get()) return@post
+            // Mutual exclusion: detach player from the bridge surface before releasing it, then
+            // bind the new external surface.
+            if (headlessBridge != null) {
+                player?.setVideoSurface(null)
+            }
+            releaseHeadlessBridgeOnHandlerThread()
             pendingSurface = surface
             player?.setVideoSurface(surface)
         }
     }
 
     /**
-     * Detaches the current video surface.  On surface loss the player is intentionally paused
-     * (`playWhenReady = false`) before the surface is detached so that the emitted
-     * [HttpAdaptivePlaybackState.Paused] state is honest: the player is not actively rendering
-     * and will not attempt to write frames to a destroyed surface handle.
+     * Detaches the current video surface and releases any active headless bridge.
+     *
+     * On surface loss the player is intentionally paused (`playWhenReady = false`) before the
+     * surface is detached so that the emitted [HttpAdaptivePlaybackState.Paused] state is honest:
+     * the player is not actively rendering and will not attempt to write frames to a destroyed or
+     * closed surface handle.
      *
      * Must be called when the surface is destroyed or becomes invalid.
      * Safe to call from any thread.
@@ -349,9 +424,11 @@ class HttpAdaptivePlaybackAdapter(
             p?.playWhenReady = false
             // 2. Detach the surface so no decoder writes land on the invalidated handle.
             p?.setVideoSurface(null)
-            // 3. Clear stored surface reference so a future prepare() does not rebind it.
+            // 3. Clear stored external surface reference.
             pendingSurface = null
-            // 4. Emit Paused if the player exists and we were in an active state.
+            // 4. Release any active headless bridge (its surface is also now invalid).
+            releaseHeadlessBridgeOnHandlerThread()
+            // 5. Emit Paused if the player exists and we were in an active state.
             //    onIsPlayingChanged will also fire; the guard on currentState prevents double-emit.
             if (p != null) {
                 val s = currentState
@@ -370,6 +447,82 @@ class HttpAdaptivePlaybackAdapter(
         }
     }
 
+    // --- Headless bridge API (Phase 4C1C) ---------------------------------------------------
+
+    /**
+     * Enables the headless ImageReader -> HardwareBuffer frame bridge.
+     *
+     * The bridge is created with the caller-supplied [width] x [height] dimensions.  The
+     * Phase 4C1C design intentionally does **not** rely on Media3 discovering an initial video
+     * size before a decode surface exists; the caller supplies the initial dimensions explicitly.
+     * Later ABR / rendition changes are detected via [Player.Listener.onVideoSizeChanged] and
+     * handled transparently by recreating the bridge to match the new resolution.
+     *
+     * Calling this method:
+     * - Disables any pending external surface ([pendingSurface] is cleared).
+     * - Releases and replaces any existing headless bridge.
+     * - If the player is already active, immediately binds the new bridge's surface.
+     *
+     * Requires **API 29 (Android 10 / Q)** or higher; the call is silently ignored on older
+     * devices.
+     *
+     * Safe to call from any thread.
+     *
+     * @param width         Initial bridge width in pixels.  Must be positive.
+     * @param height        Initial bridge height in pixels.  Must be positive.
+     * @param frameListener Receiver for decoded [HttpAdaptiveDecodedFrame] instances.
+     */
+    fun enableHeadlessFrameBridge(
+        width: Int,
+        height: Int,
+        frameListener: HttpAdaptiveFrameListener,
+    ) {
+        if (released.get()) return
+        require(width > 0) { "enableHeadlessFrameBridge: width must be positive, got $width" }
+        require(height > 0) { "enableHeadlessFrameBridge: height must be positive, got $height" }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return  // silently no-op on < API 29
+        handler.post {
+            if (released.get()) return@post
+            // Mutual exclusion: clear external surface before activating the bridge.
+            pendingSurface = null
+            // Release any prior bridge: detach player first so it never writes to a closed surface.
+            if (headlessBridge != null) {
+                player?.setVideoSurface(null)
+                headlessBridge?.release()
+                headlessBridge = null
+            }
+
+            headlessFrameListener = frameListener
+            val bridge = createBridgeOnHandlerThread(width, height, frameListener)
+            headlessBridge = bridge
+            player?.setVideoSurface(bridge.surface)
+        }
+    }
+
+    /**
+     * Disables the headless frame bridge and detaches the player from its surface.
+     *
+     * This method:
+     * - Detaches the player from the bridge surface (`setVideoSurface(null)`).
+     * - Releases the [HttpAdaptiveImageReaderBridge].
+     * - Clears the stored [HttpAdaptiveFrameListener].
+     *
+     * After this call [player] has no video output surface.  Call [setSurface] or
+     * [enableHeadlessFrameBridge] to re-attach an output.
+     *
+     * Safe to call from any thread.
+     */
+    fun disableHeadlessFrameBridge() {
+        if (released.get()) return
+        handler.post {
+            if (released.get()) return@post
+            // Only detach the player if the active output is the bridge surface.
+            if (headlessBridge != null) {
+                player?.setVideoSurface(null)
+            }
+            releaseHeadlessBridgeOnHandlerThread()
+        }
+    }
 
     /**
      * Releases all resources.  Terminal and idempotent.
@@ -378,7 +531,8 @@ class HttpAdaptivePlaybackAdapter(
      * 1. `player.setVideoSurface(null)` - detach surface before decoder teardown.
      * 2. `player.stop()` - cancel active network loaders and buffer allocations.
      * 3. `player.release()` - destroy MediaCodec decoders and audio sinks.
-     * 4. `handlerThread.quitSafely()` - shut down the dedicated Looper.
+     * 4. Release headless bridge (closes ImageReader and its internal surface).
+     * 5. `handlerThread.quitSafely()` - shut down the dedicated Looper.
      *
      * Safe to call from any thread.  Subsequent calls are no-ops.
      */
@@ -388,6 +542,9 @@ class HttpAdaptivePlaybackAdapter(
             tearDownPlayerOnHandlerThread()
             // Full release: clear surface reference so it cannot be rebound by any lingering post.
             pendingSurface = null
+            // Release the headless bridge after player teardown (player is already detached in
+            // tearDownPlayerOnHandlerThread).
+            releaseHeadlessBridgeOnHandlerThread()
             emitState(HttpAdaptivePlaybackState.Released)
             handlerThread.quitSafely()
         }
@@ -399,17 +556,20 @@ class HttpAdaptivePlaybackAdapter(
      * Performs ordered player teardown.  Must only be called from the HandlerThread.
      * Safe to call when [player] is null (no-op).
      *
-     * **Intentionally does NOT clear [pendingSurface].**  If this teardown is triggered by
-     * [prepare] (re-prepare), the caller's previously set surface remains valid and is rebound
-     * to the new ExoPlayer instance.  Only [release] (full teardown) and [clearSurface]
-     * (explicit surface loss) are permitted to clear [pendingSurface].
+     * Detaches the video surface (whether external or the headless bridge surface) before
+     * stopping and releasing the player.
+     *
+     * **Intentionally does NOT clear [pendingSurface] or release [headlessBridge].**
+     * - On re-prepare the caller's previously set surface / bridge remains valid and is rebound.
+     * - Only [release] (full teardown) and [clearSurface] (explicit surface loss) are permitted
+     *   to clear those references.
      */
     private fun tearDownPlayerOnHandlerThread() {
         val p = player ?: return
         player = null
         pendingSeekMs = null
 
-        // 1. Detach surface before any decoder teardown.
+        // 1. Detach surface before any decoder teardown (covers both external and bridge surfaces).
         p.setVideoSurface(null)
         // 2. Cancel active network loaders / buffer allocations.
         p.stop()
@@ -417,6 +577,35 @@ class HttpAdaptivePlaybackAdapter(
         p.removeListener(playerListener)
         p.release()
         // HandlerThread quitSafely() is called separately in release() after emitting Released.
+    }
+
+    /**
+     * Releases the headless bridge and clears the stored listener.
+     * Must only be called from the HandlerThread.
+     */
+    private fun releaseHeadlessBridgeOnHandlerThread() {
+        headlessBridge?.release()
+        headlessBridge = null
+        headlessFrameListener = null
+    }
+
+    /**
+     * Creates a new [HttpAdaptiveImageReaderBridge] instance.
+     * Must only be called from the HandlerThread.
+     * Caller must have already verified API >= Q before this point.
+     */
+    @androidx.annotation.RequiresApi(Build.VERSION_CODES.Q)
+    private fun createBridgeOnHandlerThread(
+        width: Int,
+        height: Int,
+        frameListener: HttpAdaptiveFrameListener,
+    ): HttpAdaptiveImageReaderBridge {
+        return HttpAdaptiveImageReaderBridge(
+            width = width,
+            height = height,
+            handler = handler,
+            frameListener = frameListener,
+        )
     }
 
     /**
