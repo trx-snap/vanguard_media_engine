@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class AndroidDagTexturePlaybackControlSession(
     private val videoPath: String,
-    private val textureEntry: TextureRegistry.SurfaceTextureEntry,
+    private val surfaceProducer: TextureRegistry.SurfaceProducer,
 ) {
     companion object {
         private const val TAG = "DagTexturePlaybackCtrl"
@@ -119,7 +119,7 @@ class AndroidDagTexturePlaybackControlSession(
             }
 
             // 2. Start HandlerThread for Choreographer loop & ImageReader
-            val ht = HandlerThread("DagPlaybackControlLoop_${textureEntry.id()}").also {
+            val ht = HandlerThread("DagPlaybackControlLoop_${surfaceProducer.id()}").also {
                 handlerThread = it
                 it.start()
             }
@@ -127,9 +127,9 @@ class AndroidDagTexturePlaybackControlSession(
 
             h.post {
                 try {
-                    // 3. Configure Flutter texture buffer size and Surface
-                    textureEntry.surfaceTexture().setDefaultBufferSize(videoWidth, videoHeight)
-                    val surface = Surface(textureEntry.surfaceTexture()).also { flutterSurface = it }
+                    // 3. Configure Flutter texture buffer size and obtain Surface
+                    surfaceProducer.setSize(videoWidth, videoHeight)
+                    val surface = surfaceProducer.getSurface().also { flutterSurface = it }
 
                     // 4. Create ImageReader (PRIVATE, GPU_SAMPLED_IMAGE, API 29+)
                     val reader = ImageReader.newInstance(
@@ -225,7 +225,7 @@ class AndroidDagTexturePlaybackControlSession(
 
                     onResult(mapOf(
                         "pass" to true,
-                        "textureId" to textureEntry.id(),
+                        "textureId" to surfaceProducer.id(),
                         "width" to videoWidth,
                         "height" to videoHeight,
                         "durationUs" to durationUs,
@@ -780,8 +780,8 @@ class AndroidDagTexturePlaybackControlSession(
             // 5. ImageReader close
             try { imageReader?.close() } catch (_: Throwable) {}
 
-            // 6. Flutter Surface release
-            try { flutterSurface?.release() } catch (_: Throwable) {}
+            // 6. Clear Flutter Surface reference (owned by SurfaceProducer; coordinator releases producer)
+            flutterSurface = null
 
             // 7. MediaExtractor release
             try { extractor?.release() } catch (_: Throwable) {}

@@ -21,7 +21,7 @@ class AndroidDagTexturePlaybackCoordinator(
 
     private data class ActiveControlEntry(
         val session: AndroidDagTexturePlaybackControlSession,
-        val textureEntry: TextureRegistry.SurfaceTextureEntry,
+        val surfaceProducer: TextureRegistry.SurfaceProducer,
     )
 
     private val smokeSessions = mutableMapOf<Long, ActiveSmokeEntry>()
@@ -108,15 +108,15 @@ class AndroidDagTexturePlaybackCoordinator(
             return
         }
 
-        val textureEntry = textureRegistry.createSurfaceTexture()
-        val textureId = textureEntry.id()
+        val surfaceProducer = textureRegistry.createSurfaceProducer()
+        val textureId = surfaceProducer.id()
 
         val session = AndroidDagTexturePlaybackControlSession(
             videoPath = path,
-            textureEntry = textureEntry,
+            surfaceProducer = surfaceProducer,
         )
 
-        val entry = ActiveControlEntry(session, textureEntry)
+        val entry = ActiveControlEntry(session, surfaceProducer)
         synchronized(controlSessions) {
             controlSessions[textureId] = entry
         }
@@ -128,7 +128,7 @@ class AndroidDagTexturePlaybackCoordinator(
                     synchronized(controlSessions) {
                         controlSessions.remove(textureId)
                     }
-                    try { textureEntry.release() } catch (_: Throwable) {}
+                    try { surfaceProducer.release() } catch (_: Throwable) {}
                 }
                 val resultMap = prepResult.toMutableMap().apply {
                     putIfAbsent("textureId", textureId)
@@ -243,7 +243,7 @@ class AndroidDagTexturePlaybackCoordinator(
                     putIfAbsent("textureId", textureId)
                 }
                 mainHandler.post {
-                    try { entry.textureEntry.release() } catch (_: Throwable) {}
+                    try { entry.surfaceProducer.release() } catch (_: Throwable) {}
                     result.success(resMap)
                 }
             }
@@ -391,7 +391,7 @@ class AndroidDagTexturePlaybackCoordinator(
             try {
                 entry.session.dispose {
                     mainHandler.post {
-                        try { entry.textureEntry.release() } catch (_: Throwable) {}
+                        try { entry.surfaceProducer.release() } catch (_: Throwable) {}
                     }
                 }
             } catch (_: Throwable) {}
