@@ -64,7 +64,10 @@ object RealtimeVideoInputAdapterSmokeHarness {
             val initialSnapshot = adapter.snapshot()
             val initialPass = (initialSnapshot["state"] == RealtimeVideoInputState.IDLE.name) &&
                 (initialSnapshot["acceptedFrames"] == 0L) &&
-                (initialSnapshot["droppedNotReadyFrames"] == 0L)
+                (initialSnapshot["droppedBackpressureFrames"] == 0L) &&
+                (initialSnapshot["droppedNotReadyFrames"] == 0L) &&
+                (initialSnapshot["unsupportedFormatFrames"] == 0L) &&
+                (initialSnapshot["failedFrames"] == 0L)
 
             // 2. Ingest before start (should drop as NOT_READY)
             val framePre = RealtimeVideoFrame(
@@ -103,7 +106,25 @@ object RealtimeVideoInputAdapterSmokeHarness {
             }
             val startDeliveryPass = startAcceptedCount == frameCount
 
-            // 4. Pause adapter & ingest frame (should drop as NOT_READY)
+            // 4. Ingest invalid frame while STARTED (should reject with UNSUPPORTED_FORMAT via RtcVideoFrameValidator)
+            val invalidFrame = RealtimeVideoFrame(
+                hardwareBuffer = hardwareBuffer,
+                width = width + 10,
+                height = height,
+                timestampNs = (frameCount + 1) * 33333333L,
+                rotationDegrees = 0,
+                frameIndex = (frameCount + 1).toLong(),
+                sourceId = "adapter_smoke",
+            )
+            val resInvalid = adapter.ingestFrame(invalidFrame)
+            val sinkSnapshotAfterInvalid = sink.snapshot()
+            val sinkAcceptedAfterInvalid = (sinkSnapshotAfterInvalid["acceptedFrames"] as? Number)?.toLong() ?: -1L
+            val invalidFrameRejected = !resInvalid.accepted &&
+                resInvalid.status == RtcVideoFrameDeliveryStatus.UNSUPPORTED_FORMAT &&
+                sinkAcceptedAfterInvalid == frameCount.toLong() &&
+                (adapter.snapshot()["unsupportedFormatFrames"] == 1L)
+
+            // 5. Pause adapter & ingest frame (should drop as NOT_READY)
             val pauseRes = adapter.pause()
             val pausePass = (pauseRes["pass"] == true) &&
                 (adapter.snapshot()["state"] == RealtimeVideoInputState.PAUSED.name)
@@ -112,16 +133,16 @@ object RealtimeVideoInputAdapterSmokeHarness {
                 hardwareBuffer = hardwareBuffer,
                 width = width,
                 height = height,
-                timestampNs = (frameCount + 1) * 33333333L,
+                timestampNs = (frameCount + 2) * 33333333L,
                 rotationDegrees = 0,
-                frameIndex = (frameCount + 1).toLong(),
+                frameIndex = (frameCount + 2).toLong(),
                 sourceId = "adapter_smoke",
             )
             val resPaused = adapter.ingestFrame(framePaused)
             val pauseDeliveryPass = !resPaused.accepted &&
                 resPaused.status == RtcVideoFrameDeliveryStatus.DROPPED_NOT_READY
 
-            // 5. Resume adapter & ingest 1 frame (should be ACCEPTED)
+            // 6. Resume adapter & ingest 1 frame (should be ACCEPTED)
             val resumeRes = adapter.resume()
             val resumePass = (resumeRes["pass"] == true) &&
                 (adapter.snapshot()["state"] == RealtimeVideoInputState.STARTED.name)
@@ -130,16 +151,16 @@ object RealtimeVideoInputAdapterSmokeHarness {
                 hardwareBuffer = hardwareBuffer,
                 width = width,
                 height = height,
-                timestampNs = (frameCount + 2) * 33333333L,
+                timestampNs = (frameCount + 3) * 33333333L,
                 rotationDegrees = 0,
-                frameIndex = (frameCount + 2).toLong(),
+                frameIndex = (frameCount + 3).toLong(),
                 sourceId = "adapter_smoke",
             )
             val resResume = adapter.ingestFrame(frameResume)
             val resumeDeliveryPass = resResume.accepted &&
                 resResume.status == RtcVideoFrameDeliveryStatus.ACCEPTED
 
-            // 6. Stop adapter & ingest frame (should drop as NOT_READY)
+            // 7. Stop adapter & ingest frame (should drop as NOT_READY)
             val stopRes = adapter.stop()
             val stopPass = (stopRes["pass"] == true) &&
                 (adapter.snapshot()["state"] == RealtimeVideoInputState.IDLE.name)
@@ -148,16 +169,16 @@ object RealtimeVideoInputAdapterSmokeHarness {
                 hardwareBuffer = hardwareBuffer,
                 width = width,
                 height = height,
-                timestampNs = (frameCount + 3) * 33333333L,
+                timestampNs = (frameCount + 4) * 33333333L,
                 rotationDegrees = 0,
-                frameIndex = (frameCount + 3).toLong(),
+                frameIndex = (frameCount + 4).toLong(),
                 sourceId = "adapter_smoke",
             )
             val resStopped = adapter.ingestFrame(frameStopped)
             val stopDeliveryPass = !resStopped.accepted &&
                 resStopped.status == RtcVideoFrameDeliveryStatus.DROPPED_NOT_READY
 
-            // 7. Dispose adapter & ingest frame (should drop as NOT_READY and not throw)
+            // 8. Dispose adapter & ingest frame (should drop as NOT_READY and not throw)
             val disposeRes = adapter.dispose()
             val disposePass = (disposeRes["pass"] == true) &&
                 (adapter.snapshot()["state"] == RealtimeVideoInputState.DISPOSED.name)
@@ -166,20 +187,21 @@ object RealtimeVideoInputAdapterSmokeHarness {
                 hardwareBuffer = hardwareBuffer,
                 width = width,
                 height = height,
-                timestampNs = (frameCount + 4) * 33333333L,
+                timestampNs = (frameCount + 5) * 33333333L,
                 rotationDegrees = 0,
-                frameIndex = (frameCount + 4).toLong(),
+                frameIndex = (frameCount + 5).toLong(),
                 sourceId = "adapter_smoke",
             )
             val resDisposed = adapter.ingestFrame(frameDisposed)
             val disposeDeliveryPass = !resDisposed.accepted &&
                 resDisposed.status == RtcVideoFrameDeliveryStatus.DROPPED_NOT_READY
 
-            // 8. Final telemetry verification
+            // 9. Final telemetry verification
             val adapterSnapshot = adapter.snapshot()
             val acceptedFrames = (adapterSnapshot["acceptedFrames"] as? Number)?.toLong() ?: -1L
             val droppedBackpressureFrames = (adapterSnapshot["droppedBackpressureFrames"] as? Number)?.toLong() ?: -1L
             val droppedNotReadyFrames = (adapterSnapshot["droppedNotReadyFrames"] as? Number)?.toLong() ?: -1L
+            val unsupportedFormatFrames = (adapterSnapshot["unsupportedFormatFrames"] as? Number)?.toLong() ?: -1L
             val failedFrames = (adapterSnapshot["failedFrames"] as? Number)?.toLong() ?: -1L
             val finalState = adapterSnapshot["state"] as? String
 
@@ -188,10 +210,12 @@ object RealtimeVideoInputAdapterSmokeHarness {
 
             val expectedAccepted = (frameCount + 1).toLong()
             val expectedDroppedNotReady = 4L // pre-start (1) + paused (1) + stopped (1) + disposed (1)
+            val expectedUnsupportedFormat = 1L // invalid frame rejected during started state (1)
 
             val telemetryPass = acceptedFrames == expectedAccepted &&
                 droppedBackpressureFrames == 0L &&
                 droppedNotReadyFrames == expectedDroppedNotReady &&
+                unsupportedFormatFrames == expectedUnsupportedFormat &&
                 failedFrames == 0L &&
                 finalState == RealtimeVideoInputState.DISPOSED.name &&
                 sinkAcceptedFrames == expectedAccepted
@@ -200,6 +224,7 @@ object RealtimeVideoInputAdapterSmokeHarness {
                 preStartPass &&
                 startPass &&
                 startDeliveryPass &&
+                invalidFrameRejected &&
                 pausePass &&
                 pauseDeliveryPass &&
                 resumePass &&
@@ -211,9 +236,9 @@ object RealtimeVideoInputAdapterSmokeHarness {
                 telemetryPass
 
             val rawStatus = if (overallPass) {
-                "status=OK;acceptedFrames=$acceptedFrames;droppedNotReadyFrames=$droppedNotReadyFrames;finalState=$finalState"
+                "status=OK;acceptedFrames=$acceptedFrames;droppedNotReadyFrames=$droppedNotReadyFrames;unsupportedFormatFrames=$unsupportedFormatFrames;invalidFrameRejected=true;finalState=$finalState"
             } else {
-                "status=ADAPTER_VERIFICATION_FAILED;initialPass=$initialPass;preStartPass=$preStartPass;startPass=$startPass;startDeliveryPass=$startDeliveryPass;pausePass=$pausePass;pauseDeliveryPass=$pauseDeliveryPass;resumePass=$resumePass;resumeDeliveryPass=$resumeDeliveryPass;stopPass=$stopPass;stopDeliveryPass=$stopDeliveryPass;disposePass=$disposePass;disposeDeliveryPass=$disposeDeliveryPass;telemetryPass=$telemetryPass"
+                "status=ADAPTER_VERIFICATION_FAILED;initialPass=$initialPass;preStartPass=$preStartPass;startPass=$startPass;startDeliveryPass=$startDeliveryPass;invalidFrameRejected=$invalidFrameRejected;pausePass=$pausePass;pauseDeliveryPass=$pauseDeliveryPass;resumePass=$resumePass;resumeDeliveryPass=$resumeDeliveryPass;stopPass=$stopPass;stopDeliveryPass=$stopDeliveryPass;disposePass=$disposePass;disposeDeliveryPass=$disposeDeliveryPass;telemetryPass=$telemetryPass"
             }
 
             return mapOf(
@@ -224,6 +249,8 @@ object RealtimeVideoInputAdapterSmokeHarness {
                 "frameCount" to frameCount,
                 "expectedAccepted" to expectedAccepted,
                 "expectedDroppedNotReady" to expectedDroppedNotReady,
+                "expectedUnsupportedFormat" to expectedUnsupportedFormat,
+                "invalidFrameRejected" to invalidFrameRejected,
             )
         } finally {
             hardwareBuffer.close()

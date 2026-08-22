@@ -21,13 +21,15 @@ enum class RealtimeVideoInputState {
 }
 
 /**
- * Video-only ingress adapter managing the lifecycle and delivery counters for ingesting
+ * Video-only ingress adapter managing the lifecycle, frame validation, and delivery counters for ingesting
  * incoming remote RTC video frames into a generic [RtcVideoFrameSink].
  *
  * ## Video-Only Domain Invariants
  * - **Video Only**: Handles video frame ingress exclusively. Zero ownership or awareness of
  *   room signaling, connection tokens, participant rosters, active speaker events, or audio streams.
  *   Room orchestration and audio capture/mixing are strictly forbidden in Vanguard.
+ * - **Frame Validation**: Validates generic [RealtimeVideoFrame] envelope and buffer format attributes
+ *   via [RtcVideoFrameValidator] before forwarding to downstream sinks, rejecting invalid frames early.
  * - **DAG Ingress Seam**: Acts as the boundary adapter forwarding remote RTC video frames to the
  *   Vanguard True-DAG engine (e.g. C++ `StreamSourceNode`) for downstream filtering, transform, and composition.
  * - **No Direct Display**: Does not directly render to display surfaces; presentation is scheduled
@@ -49,6 +51,7 @@ class RealtimeVideoInputAdapter(
     private var acceptedFrames: Long = 0L
     private var droppedBackpressureFrames: Long = 0L
     private var droppedNotReadyFrames: Long = 0L
+    private var unsupportedFormatFrames: Long = 0L
     private var failedFrames: Long = 0L
     private var lastError: String? = null
 
@@ -207,8 +210,10 @@ class RealtimeVideoInputAdapter(
      * [RealtimeVideoInputState.PAUSED], or [RealtimeVideoInputState.IDLE], the frame is dropped as not-ready
      * and [droppedNotReadyFrames] counter is incremented.
      *
-     * If [RealtimeVideoInputState.STARTED], delegates delivery to [RtcVideoFrameSink.onFrame]
-     * and updates counters based on delivery status. Does not retain or close [RealtimeVideoFrame.hardwareBuffer].
+     * If [RealtimeVideoInputState.STARTED], validates frame metadata via [RtcVideoFrameValidator.validate]
+     * before delegating to [RtcVideoFrameSink.onFrame]. If validation fails, immediately returns
+     * the rejection result and updates [unsupportedFormatFrames] (or [failedFrames]) without calling the sink.
+     * Updates counters based on delivery status. Does not retain or close [RealtimeVideoFrame.hardwareBuffer].
      */
     @Synchronized
     fun ingestFrame(frame: RealtimeVideoFrame): RtcVideoFrameDeliveryResult {
@@ -217,6 +222,16 @@ class RealtimeVideoInputAdapter(
             return RtcVideoFrameDeliveryResult.droppedNotReady(
                 "status=DROPPED_NOT_READY;state=${state.name}"
             )
+        }
+
+        val validation = RtcVideoFrameValidator.validate(frame)
+        if (!validation.accepted) {
+            when (validation.status) {
+                RtcVideoFrameDeliveryStatus.UNSUPPORTED_FORMAT -> unsupportedFormatFrames++
+                RtcVideoFrameDeliveryStatus.FAILED -> failedFrames++
+                else -> unsupportedFormatFrames++
+            }
+            return validation
         }
 
         val result = try {
@@ -238,7 +253,9 @@ class RealtimeVideoInputAdapter(
             RtcVideoFrameDeliveryStatus.DROPPED_NOT_READY -> {
                 droppedNotReadyFrames++
             }
-            RtcVideoFrameDeliveryStatus.UNSUPPORTED_FORMAT,
+            RtcVideoFrameDeliveryStatus.UNSUPPORTED_FORMAT -> {
+                unsupportedFormatFrames++
+            }
             RtcVideoFrameDeliveryStatus.FAILED -> {
                 failedFrames++
             }
@@ -294,6 +311,7 @@ class RealtimeVideoInputAdapter(
         "acceptedFrames" to acceptedFrames,
         "droppedBackpressureFrames" to droppedBackpressureFrames,
         "droppedNotReadyFrames" to droppedNotReadyFrames,
+        "unsupportedFormatFrames" to unsupportedFormatFrames,
         "failedFrames" to failedFrames,
         "lastError" to lastError,
     )
