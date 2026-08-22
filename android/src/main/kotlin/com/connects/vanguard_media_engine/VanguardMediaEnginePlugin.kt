@@ -11,6 +11,7 @@ import android.util.Log
 import androidx.annotation.NonNull
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagRenderSmokeHarness
+import com.connects.vanguard_media_engine.streaming.AndroidDagStreamingPlaybackCoordinator
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -28,6 +29,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
 
     // ── Phase 4B1: DAG texture playback coordinator ───────────────────────────
     private var dagTexturePlaybackCoordinator: AndroidDagTexturePlaybackCoordinator? = null
+
+    // ── Phase 4C1D1: DAG streaming playback coordinator ───────────────────────
+    private var dagStreamingPlaybackCoordinator: AndroidDagStreamingPlaybackCoordinator? = null
 
     // ── Camera session state (B2: single camera instance invariant) ───────────
     // Mirrors iOS plugin: cameraSource + renderer stored at plugin level.
@@ -59,6 +63,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             channel         = channel,
             mainHandler     = mainHandler,
         )
+        dagStreamingPlaybackCoordinator = AndroidDagStreamingPlaybackCoordinator(
+            context         = binding.applicationContext,
+            textureRegistry = binding.textureRegistry,
+            mainHandler     = mainHandler,
+        )
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
@@ -70,6 +79,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidDagStreamingPlaybackCoordinator.ownsMethod(call.method)) {
+            val coord = dagStreamingPlaybackCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android DAG streaming playback coordinator unavailable", null)
             }
             return
         }
@@ -1110,5 +1129,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         // Tear down Phase 4B1 active sessions (4B1A & 4B1B) and release their texture entries.
         dagTexturePlaybackCoordinator?.disposeAll()
         dagTexturePlaybackCoordinator = null
+        // Tear down Phase 4C1D1 active streaming sessions.
+        dagStreamingPlaybackCoordinator?.disposeAll()
+        dagStreamingPlaybackCoordinator = null
     }
 }
