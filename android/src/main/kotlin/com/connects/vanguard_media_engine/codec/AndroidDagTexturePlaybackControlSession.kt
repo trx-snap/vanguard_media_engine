@@ -760,6 +760,10 @@ class AndroidDagTexturePlaybackControlSession(
      * Recreates the native Vulkan/DAG session against the fresh Surface, bumps
      * generation, and optionally prerolls to [lastRenderedPtsUs] if non-zero.
      * Does NOT auto-resume playback — caller must call [play].
+     *
+     * Phase 4B2B3B: dense restore algorithm delegated to [AndroidDagSurfaceRecoveryHandler];
+     * this method keeps the spurious-available guard, nativeBridge null check, and all
+     * session field / state assignments.
      */
     private fun handleSurfaceAvailable() {
         val h = handler ?: return
@@ -779,152 +783,53 @@ class AndroidDagTexturePlaybackControlSession(
 
             Log.i(TAG, "handleSurfaceAvailable: restoring surface; state=$state")
 
-            // Track the session id created during this restore attempt so the catch block
-            // can destroy it if an unexpected exception occurs after creation.
-            var restoreCreatedSessionId: String? = null
-            try {
-                // Re-fetch surface from producer
-                val newSurface = surfaceProducer.getSurface()
-                if (!newSurface.isValid) {
-                    Log.w(TAG, "handleSurfaceAvailable: getSurface() returned invalid surface; staying SurfaceLost")
-                    lastRestoreFailureReason = "surface_invalid_after_available"
-                    state = AndroidDagPlaybackState.SurfaceLost
-                    return@post
-                }
-                flutterSurface = newSurface
+            val nb = nativeBridge
+            if (nb == null) {
+                Log.e(TAG, "handleSurfaceAvailable: nativeBridge is null; cannot recreate session")
+                lastRestoreFailureReason = "native_bridge_null_on_restore"
+                state = AndroidDagPlaybackState.SurfaceLost
+                return@post
+            }
 
-                val nb = nativeBridge
-                if (nb == null) {
-                    Log.e(TAG, "handleSurfaceAvailable: nativeBridge is null; cannot recreate session")
-                    lastRestoreFailureReason = "native_bridge_null_on_restore"
-                    state = AndroidDagPlaybackState.SurfaceLost
-                    return@post
-                }
+            // Reset codec bookkeeping flags before preroll so they are never stale
+            // regardless of whether the helper performs a seek/preroll.
+            if (lastRenderedPtsUs > 0) {
+                inputDone = false
+                outputDone = false
+            }
 
-                // Recreate native session with new Surface.
-                // sessionId was cleared by handleSurfaceCleanup → cleanupResources, so creating fresh is safe.
-                val createResult = nb.createAndroidDagPhase4B1TexturePlaybackSession(
-                    newSurface,
-                    videoWidth,
-                    videoHeight,
-                )
-                if (!createResult.startsWith("status=OK;")) {
-                    Log.e(TAG, "handleSurfaceAvailable: native session create failed: $createResult")
-                    lastRestoreFailureReason = "native_session_create_failed_on_restore;$createResult"
-                    state = AndroidDagPlaybackState.SurfaceLost
-                    return@post
-                }
-                val newSid = createResult.substringAfter("sessionId=").substringBefore(";").ifEmpty { null }
-                if (newSid == null) {
-                    lastRestoreFailureReason = "session_id_parse_failed_on_restore"
-                    state = AndroidDagPlaybackState.SurfaceLost
-                    return@post
-                }
-                sessionId = newSid
-                restoreCreatedSessionId = newSid  // track for guaranteed destruction on any later failure
+            val result = AndroidDagSurfaceRecoveryHandler().restoreSurface(
+                surfaceProducer = surfaceProducer,
+                bridge = nb,
+                extractor = extractor,
+                codec = codec,
+                imageReader = imageReader,
+                imageQueue = imageQueue,
+                videoWidth = videoWidth,
+                videoHeight = videoHeight,
+                lastRenderedPtsUs = lastRenderedPtsUs,
+                renderedFrames = renderedFrames,
+                currentGenerationId = currentGenerationId,
+                isDisposed = { disposed.get() },
+                shouldCancel = { surfaceLostFlag.get() || disposed.get() },
+            )
 
-                // Bump generation
-                val bumpRes = nb.bumpAndroidDagPhase4B1TexturePlaybackGeneration(newSid)
-                if (!bumpRes.startsWith("status=OK;")) {
-                    lastRestoreFailureReason = "generation_bump_failed_on_restore;$bumpRes"
-                    // Destroy the just-created session to avoid orphan
-                    try { nb.destroyAndroidDagPhase4B1TexturePlaybackSession(newSid) } catch (_: Throwable) {}
-                    sessionId = null; restoreCreatedSessionId = null
-                    state = AndroidDagPlaybackState.SurfaceLost
-                    return@post
-                }
-                val genStr = bumpRes.substringAfter("generationId=").substringBefore(";")
-                currentGenerationId = genStr.toLongOrNull() ?: (currentGenerationId + 1)
-
-                // Clear the lost flag now that native session is live
+            if (result.success) {
+                flutterSurface = result.surface
+                sessionId = result.sessionId
+                currentGenerationId = result.generationId
+                renderedFrames = result.renderedFrames
+                lastRenderedPtsUs = result.lastRenderedPtsUs
                 surfaceLostFlag.set(false)
                 lastRestoreFailureReason = null
                 state = AndroidDagPlaybackState.Paused
-
-                // Optional: preroll to last rendered PTS if we had played at least one frame
-                val prerollTarget = lastRenderedPtsUs
-                if (prerollTarget > 0) {
-                    val ex = extractor
-                    val dec = codec
-                    val reader = imageReader
-                    if (ex == null || dec == null || reader == null) {
-                        // Unexpected null resources — treat as restore failure; destroy new session.
-                        Log.e(TAG, "handleSurfaceAvailable: preroll resources null (ex=$ex dec=$dec reader=$reader); failing restore")
-                        lastRestoreFailureReason = "restore_resources_null_on_preroll"
-                        surfaceLostFlag.set(true)
-                        state = AndroidDagPlaybackState.SurfaceLost
-                        try { nb.destroyAndroidDagPhase4B1TexturePlaybackSession(newSid) } catch (_: Throwable) {}
-                        sessionId = null; restoreCreatedSessionId = null
-                    } else {
-                        // Drain queued images before seeking
-                        while (true) { val img = imageQueue.poll() ?: break; try { img.close() } catch (_: Throwable) {} }
-                        dec.flush()
-                        inputDone = false
-                        outputDone = false
-                        ex.seekTo(prerollTarget, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-
-                        val prerollBumpRes = nb.bumpAndroidDagPhase4B1TexturePlaybackGeneration(newSid)
-                        if (prerollBumpRes.startsWith("status=OK;")) {
-                            val prerollGenStr = prerollBumpRes.substringAfter("generationId=").substringBefore(";")
-                            currentGenerationId = prerollGenStr.toLongOrNull() ?: (currentGenerationId + 1)
-                        }
-
-                        val engineResult = AndroidDagSeekPrerollEngine().run(
-                            extractor = ex,
-                            codec = dec,
-                            imageReader = reader,
-                            imageQueue = imageQueue,
-                            bridge = nb,
-                            sessionId = newSid,
-                            videoWidth = videoWidth,
-                            videoHeight = videoHeight,
-                            seekTargetUs = prerollTarget,
-                            currentGenerationId = currentGenerationId,
-                            renderedFramesBefore = renderedFrames,
-                            deadlineMs = System.currentTimeMillis() + 8000L,
-                            shouldCancel = { surfaceLostFlag.get() || disposed.get() },
-                        )
-                        if (engineResult.pass) {
-                            renderedFrames = engineResult.renderedFrames
-                            lastRenderedPtsUs = engineResult.lastRenderedPtsUs
-                            restoreCreatedSessionId = null  // session is live and healthy; no need to destroy
-                            Log.i(TAG, "handleSurfaceAvailable: preroll OK; pts=${engineResult.seekRenderedPtsUs}")
-                        } else {
-                            // P1/P3: Any preroll failure → SurfaceLost + destroy new session + record reason.
-                            // Frozen contract: restore/preroll failure must keep SurfaceLost, never Paused.
-                            Log.w(TAG, "handleSurfaceAvailable: preroll failed: ${engineResult.failureReason}")
-                            val failReason = if (surfaceLostFlag.get()) {
-                                "surface_relost_during_preroll"
-                            } else {
-                                "preroll_failed:${engineResult.failureReason}"
-                            }
-                            lastRestoreFailureReason = failReason
-                            surfaceLostFlag.set(true)
-                            state = AndroidDagPlaybackState.SurfaceLost
-                            try { nb.destroyAndroidDagPhase4B1TexturePlaybackSession(newSid) } catch (_: Throwable) {}
-                            sessionId = null; restoreCreatedSessionId = null
-                        }
-                    }
-                } else {
-                    // No preroll needed — session is live and healthy.
-                    restoreCreatedSessionId = null
-                }
                 Log.i(TAG, "handleSurfaceAvailable: restore complete; state=$state; gen=$currentGenerationId")
-            } catch (t: Throwable) {
-                Log.e(TAG, "handleSurfaceAvailable: exception during restore", t)
-                lastRestoreFailureReason = "restore_exception:${t.javaClass.simpleName}"
+            } else {
                 surfaceLostFlag.set(true)
-                if (!disposed.get()) {
-                    state = AndroidDagPlaybackState.SurfaceLost
-                }
-                // Guarantee destruction of any native session created before the exception.
-                val leaked = restoreCreatedSessionId
-                val nb = nativeBridge
-                if (leaked != null && nb != null) {
-                    try { nb.destroyAndroidDagPhase4B1TexturePlaybackSession(leaked) } catch (_: Throwable) {}
-                    if (sessionId == leaked) sessionId = null
-                }
-                restoreCreatedSessionId = null
+                state = AndroidDagPlaybackState.SurfaceLost
+                sessionId = null
+                lastRestoreFailureReason = result.failureReason
+                Log.w(TAG, "handleSurfaceAvailable: restore failed: ${result.failureReason}")
             }
         }
     }
