@@ -6,7 +6,7 @@ import android.media.Image
 import android.media.ImageReader
 import android.media.MediaCodec
 import android.media.MediaExtractor
-import android.media.MediaFormat
+
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -78,71 +78,40 @@ class AndroidDagTexturePlaybackControlSession(
     private var inputDone = false
     private var outputDone = false
     private var frameRenderError: String? = null
+    /**
+     * Video rotation from source metadata (MediaFormat.KEY_ROTATION).
+     * Phase 4B2B3A: stored for future use; NOT applied to layout/shader/rendering.
+     */
+    private var rotationDegrees: Int = 0
 
     /**
      * Initializes resources and prepares the playback session on the dedicated HandlerThread.
      */
     fun prepare(onResult: (Map<String, Any?>) -> Unit) {
-        // Belt-and-suspenders: check file existence synchronously before touching
-        // MediaExtractor. setDataSource() can hang (rather than throw) on some
-        // Android versions when given a non-existent or unreadable path, which would
-        // prevent onResult from ever being called and hang the MethodChannel reply.
-        val fileCheck = java.io.File(videoPath)
-        if (!fileCheck.exists() || !fileCheck.canRead()) {
+        // Phase 4B2B3A: delegate all source inspection (file preflight, API check,
+        // MediaExtractor creation, track selection, metadata extraction) to helper.
+        val inspection = AndroidDagSourceInspector().inspect(videoPath)
+        if (!inspection.pass) {
             state = AndroidDagPlaybackState.Failed
             onResult(mapOf(
                 "pass" to false,
                 "state" to state.name,
-                "raw" to "status=FAIL;reason=file_not_found_or_not_readable",
+                "raw" to "status=FAIL;reason=${inspection.failureReason}",
             ))
             return
         }
 
-        if (Build.VERSION.SDK_INT < 29) {
-            state = AndroidDagPlaybackState.Failed
-            onResult(mapOf(
-                "pass" to false,
-                "state" to state.name,
-                "raw" to "status=FAIL;reason=api_below_29",
-            ))
-            return
-        }
+        // On success, take ownership of extractor and populate session fields.
+        extractor = inspection.extractor
+        videoWidth = inspection.width
+        videoHeight = inspection.height
+        durationUs = inspection.durationUs
+        // rotationDegrees captured for future use; NOT applied to layout/shader/rendering.
+        rotationDegrees = inspection.rotationDegrees
+        val mime = inspection.mime
+        val format = inspection.format!!
 
         try {
-            // 1. Prepare MediaExtractor & find video track
-            val ex = MediaExtractor().also { extractor = it }
-            ex.setDataSource(videoPath)
-            var trackIndex = -1
-            var format: MediaFormat? = null
-            for (i in 0 until ex.trackCount) {
-                val f = ex.getTrackFormat(i)
-                val mime = f.getString(MediaFormat.KEY_MIME) ?: ""
-                if (mime.startsWith("video/")) {
-                    trackIndex = i
-                    format = f
-                    break
-                }
-            }
-
-            if (trackIndex < 0 || format == null) {
-                cleanupResources(AndroidDagPlaybackState.Failed)
-                onResult(mapOf(
-                    "pass" to false,
-                    "state" to state.name,
-                    "raw" to "status=FAIL;reason=no_video_track_found",
-                ))
-                return
-            }
-
-            ex.selectTrack(trackIndex)
-            val mime = format.getString(MediaFormat.KEY_MIME)!!
-            videoWidth = format.getInteger(MediaFormat.KEY_WIDTH)
-            videoHeight = format.getInteger(MediaFormat.KEY_HEIGHT)
-            durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) {
-                format.getLong(MediaFormat.KEY_DURATION)
-            } else {
-                0L
-            }
 
             // 2. Start HandlerThread for Choreographer loop & ImageReader
             val ht = HandlerThread("DagPlaybackControlLoop_${surfaceProducer.id()}").also {
