@@ -65,6 +65,26 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
+    // ── Phase 4B1A: Texture playback smoke ──────────────────────────────────
+    external fun createAndroidDagPhase4B1TexturePlaybackSession(
+        surface: Surface,
+        width: Int,
+        height: Int,
+    ): String
+
+    external fun renderAndroidDagPhase4B1TexturePlaybackFrame(
+        sessionId: String,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        timelinePtsUs: Long,
+        frameIndex: Int,
+    ): String
+
+    external fun destroyAndroidDagPhase4B1TexturePlaybackSession(
+        sessionId: String,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
