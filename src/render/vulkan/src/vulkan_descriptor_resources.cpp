@@ -4,7 +4,7 @@
 //
 // Creates exactly:
 //   - VkDescriptorSetLayout  binding 0, COMBINED_IMAGE_SAMPLER, immutable sampler
-//   - VkPipelineLayout       one set layout, no push constants (Phase 2I)
+//   - VkPipelineLayout       one set layout, Phase 4B2C: vertex push constants
 //   - VkDescriptorPool       one COMBINED_IMAGE_SAMPLER, maxSets 1
 //   - VkDescriptorSet        allocated from the pool, written with imageView
 //
@@ -12,6 +12,7 @@
 // render pass / framebuffer / dynamic rendering, presentation.
 
 #include "vulkan_descriptor_resources.h"
+#include "vanguard/render/render_transform.h"
 
 #if defined(__ANDROID__)
 
@@ -69,19 +70,24 @@ HardwareBufferImportResult VulkanDescriptorResources::create(
     }
 
     // -------------------------------------------------------------------------
-    // 2. VkPipelineLayout (Phase 2I)
-    //    One descriptor set layout, no push constants.
-    //    Shaders, pipeline objects, command buffers, queue submit,
-    //    render pass / framebuffer / dynamic rendering remain deferred.
+    // 2. VkPipelineLayout (Phase 4B2C)
+    //    One descriptor set layout.
+    //    Phase 4B2C: vertex-stage push constant range for
+    //    VideoTransformPushConstants (offset 0, size derived from struct).
     // -------------------------------------------------------------------------
+    VkPushConstantRange pushConstantRange{};
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushConstantRange.offset     = 0;
+    pushConstantRange.size       = sizeof(vanguard::render::VideoTransformPushConstants);
+
     VkPipelineLayoutCreateInfo plCI{};
     plCI.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     plCI.pNext                  = nullptr;
     plCI.flags                  = 0;
     plCI.setLayoutCount         = 1;
     plCI.pSetLayouts            = &descriptorSetLayout;
-    plCI.pushConstantRangeCount = 0;
-    plCI.pPushConstantRanges    = nullptr;
+    plCI.pushConstantRangeCount = 1;
+    plCI.pPushConstantRanges    = &pushConstantRange;
 
     vr = vkCreatePipelineLayout(device, &plCI, nullptr, &pipelineLayout);
     if (vr != VK_SUCCESS) {

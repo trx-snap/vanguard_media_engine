@@ -30,6 +30,7 @@
 #include "vanguard/graph/frame_request.h"
 #include "vanguard/graph/graph.h"
 #include "vanguard/render/vulkan_backend.h"
+#include "vanguard/render/render_transform.h"
 
 // ---------------------------------------------------------------------------
 // AHardwareBuffer_fromHardwareBuffer dynamic lookup
@@ -497,6 +498,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_bumpAndroi
 
 // ---------------------------------------------------------------------------
 // JNI: renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration
+// Phase 4B2C: added jint rotationDegrees parameter for UV-space transform.
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration(
@@ -508,7 +510,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     jint     height,
     jlong    timelinePtsUs,
     jint     frameIndex,
-    jlong    generationIdJ) {
+    jlong    generationIdJ,
+    jint     rotationDegrees) {
 
     char status[512];
 
@@ -596,7 +599,12 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         return env->NewStringUTF(status);
     }
 
-    const auto renderResult = session->backend.renderFrame(handle);
+    // Phase 4B2C: build VideoFrameTransform from jint rotationDegrees and call
+    // the transform-aware renderFrame overload for UV-space rotation.
+    vanguard::render::VideoFrameTransform transform;
+    transform.rotationDegrees = static_cast<uint32_t>(rotationDegrees);
+
+    const auto renderResult = session->backend.renderFrame(handle, transform);
     const bool renderOk =
         renderResult == vanguard::render::RenderFrameResult::kSuccess ||
         renderResult == vanguard::render::RenderFrameResult::kSuboptimal;

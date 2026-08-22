@@ -131,6 +131,16 @@ bool VulkanGraphicsCommandRecorder::recordGraphicsPass(const VulkanGraphicsPassP
         0,
         nullptr);
 
+    // Phase 4B2C: push UV transform constants for vertex-shader rotation.
+    // VkPushConstantRange: VERTEX stage, offset 0, size 32.
+    vkCmdPushConstants(
+        params.commandBuffer,
+        params.pipelineLayout,
+        VK_SHADER_STAGE_VERTEX_BIT,
+        0,
+        sizeof(params.uvTransformPushConstants),
+        params.uvTransformPushConstants);
+
     vkCmdDraw(params.commandBuffer, 3, 1, 0, 0);
 
     vkCmdEndRenderPass(params.commandBuffer);

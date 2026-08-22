@@ -19,6 +19,7 @@
 #include "vulkan_surface_swapchain.h"
 #include "vulkan_hardware_buffer_imports.h"
 #include "vulkan_shader_module.h"
+#include "vanguard/render/render_transform.h"
 
 #include <cstring>
 #include <unistd.h>
@@ -204,12 +205,30 @@ void VulkanFrameRenderer::waitAllFramesIdle() {
     vkDeviceWaitIdle(impl_->device);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4B2C: renderFrame — identity path delegates to transform overload.
+// Passes VideoFrameTransform{} (rotationDegrees = 0) which resolves to the
+// identity push constants already set as defaults in VulkanGraphicsPassParams.
+// The transform overload below is the single authoritative render loop.
+// ---------------------------------------------------------------------------
+
 RenderFrameResult VulkanFrameRenderer::renderFrame(
     void* queueHandle,
     VulkanSurfaceSwapchain& swapchain,
     VulkanHardwareBufferImports& ahbImports,
     VulkanCoreShaderModules& coreShaders,
     HardwareBufferHandle handle) {
+    return renderFrame(queueHandle, swapchain, ahbImports, coreShaders,
+                       handle, VideoFrameTransform{});
+}
+
+RenderFrameResult VulkanFrameRenderer::renderFrame(
+    void* queueHandle,
+    VulkanSurfaceSwapchain& swapchain,
+    VulkanHardwareBufferImports& ahbImports,
+    VulkanCoreShaderModules& coreShaders,
+    HardwareBufferHandle handle,
+    const VideoFrameTransform& transform) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }
@@ -288,9 +307,6 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     if (!s.frameSync->waitForFrameFence(s.currentFrameIndex)) {
         return RenderFrameResult::kVulkanFailure;
     }
-    // Phase 2P2: Frame fence for this slot has been waited; GPU work from the
-    // previous use of this slot is complete. Drain retired records tagged with
-    // this slot before resetting and reusing the command buffer.
     ahbImports.drainRetiredForFrame(s.currentFrameIndex);
 
     uint32_t imageIndex = 0;
@@ -321,7 +337,6 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     const VkFramebuffer framebuffer =
         u64ToVkHandle<VkFramebuffer>(framebufferHandle);
 
-    // Phase 2O2B4: Retrieve swapchain-image-indexed present semaphore
     const uint64_t presentReadySemaphoreHandle =
         swapchain.getPresentReadySemaphoreHandle(imageIndex);
     if (presentReadySemaphoreHandle == 0) {
@@ -334,11 +349,11 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
         return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
 
-    // Phase 2O2B4: Query current source image layout before recording.
-    // First frame: UNDEFINED -> SHADER_READ_ONLY_OPTIMAL transition.
-    // Later frames: image is already in SHADER_READ_ONLY_OPTIMAL; skip barrier.
     const VkImageLayout currentLayout =
         static_cast<VkImageLayout>(ahbImports.getImageLayout(handle));
+
+    // Phase 4B2C: build push constants from transform.
+    const VideoTransformPushConstants pc = makeVideoTransformPushConstants(transform);
 
     VulkanGraphicsPassParams passParams{};
     passParams.commandBuffer = frame->commandBuffer;
@@ -350,6 +365,10 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     passParams.descriptorSet = descriptorSet;
     passParams.pipeline = s.graphicsPipeline->get();
     passParams.sourceImage = srcImage;
+    // Phase 4B2C: copy push constants into passParams.
+    static_assert(sizeof(passParams.uvTransformPushConstants) == 32,
+                  "uvTransformPushConstants size mismatch");
+    std::memcpy(passParams.uvTransformPushConstants, &pc, 32);
     if (currentLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
         passParams.transitionSourceImage = true;
         passParams.sourceOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -383,11 +402,6 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
             u64ToVkHandle<VkSemaphore>(pendingAcquireSemaphoreHandle);
     }
 
-    // Phase 2P1: Build signal semaphore array.
-    // presentReady is always signaled (required for present).
-    // releaseFenceSemaphore is signaled only when both the semaphore and the
-    // vkGetSemaphoreFdKHR function pointer are valid; otherwise only presentReady
-    // is signaled and the stale stored release FD is cleared to -1.
     const bool canExportRelease =
         (frame->releaseFenceSemaphore != VK_NULL_HANDLE) && (s.pfnGetSemaphoreFd != nullptr);
 
@@ -511,6 +525,7 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
 } // namespace render
 } // namespace vanguard
 
+
 #else // !defined(__ANDROID__) - Host build
 
 namespace vanguard {
@@ -555,6 +570,26 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     VulkanHardwareBufferImports& ahbImports,
     VulkanCoreShaderModules& /*coreShaders*/,
     HardwareBufferHandle handle) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    if (!swapchain.hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (!ahbImports.hasBuffer(handle) || ahbImports.getImage(handle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    return RenderFrameResult::kUnavailable;
+}
+
+// Phase 4B2C: host-build stub for renderFrame with transform.
+RenderFrameResult VulkanFrameRenderer::renderFrame(
+    void* /*queueHandle*/,
+    VulkanSurfaceSwapchain& swapchain,
+    VulkanHardwareBufferImports& ahbImports,
+    VulkanCoreShaderModules& /*coreShaders*/,
+    HardwareBufferHandle handle,
+    const VideoFrameTransform& /*transform*/) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }

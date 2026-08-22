@@ -50,6 +50,10 @@ public:
     // Phase 2O1: Frame rendering seam stub.
     RenderFrameResult renderFrame(HardwareBufferHandle handle) override;
 
+    // Phase 4B2C: renderFrame with rotation transform.
+    RenderFrameResult renderFrame(HardwareBufferHandle handle,
+                                  const VideoFrameTransform& transform) override;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

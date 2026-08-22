@@ -87,6 +87,9 @@ class AndroidDagSeekPrerollEngine {
         sessionId: String,
         videoWidth: Int,
         videoHeight: Int,
+        displayWidth: Int,
+        displayHeight: Int,
+        rotationDegrees: Int,
         seekTargetUs: Long,
         currentGenerationId: Long,
         renderedFramesBefore: Int,
@@ -202,14 +205,16 @@ class AndroidDagSeekPrerollEngine {
                         val imgPtsUs = image.timestamp / 1000L
                         val framePts = if (imgPtsUs > 0) imgPtsUs else ptsUs
 
+                        // Phase 4B2C: use display dimensions and rotationDegrees for render.
                         val renderStr = bridge.renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration(
                             sessionId,
                             hwBuf,
-                            videoWidth,
-                            videoHeight,
+                            displayWidth,
+                            displayHeight,
                             framePts,
                             renderedFrames,
                             currentGenerationId,
+                            rotationDegrees,
                         )
 
                         if (renderStr.startsWith("status=PASS;")) {

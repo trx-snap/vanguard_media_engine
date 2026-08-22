@@ -2,17 +2,21 @@ package com.connects.vanguard_media_engine.codec
 
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import android.os.Build
 
 /**
- * Vanguard Android True-DAG Phase 4B2B3A: Source Inspector.
+ * Vanguard Android True-DAG Phase 4B2C: Source Inspector.
  *
  * Encapsulates all source-level preflight and track-selection logic:
  *   - file existence / readability preflight
  *   - API level check (>= 29)
  *   - MediaExtractor creation, setDataSource, first-video-track selection
  *   - mime / width / height / durationUs extraction
- *   - optional rotationDegrees read-out (for future use; not applied)
+ *   - rotationDegrees: primary read from MediaFormat.KEY_ROTATION; falls back
+ *     to MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION only when KEY_ROTATION
+ *     is absent. 0 is valid and is NOT treated as "absent". Normalised to
+ *     cardinal 0/90/180/270; non-cardinal becomes 0. Retriever always released.
  *
  * On failure the helper releases any extractor it created and returns pass=false.
  * On success it hands extractor ownership to the caller; the caller is responsible
@@ -29,8 +33,9 @@ data class AndroidDagSourceInspectionResult(
     val height: Int,
     val durationUs: Long,
     /**
-     * Rotation from MediaFormat.KEY_ROTATION, if present. Stored for future use.
-     * Not applied to rendering, shader, or dimension swapping in this phase.
+     * Rotation from MediaFormat.KEY_ROTATION or MediaMetadataRetriever fallback.
+     * Normalised to cardinal 0/90/180/270; non-cardinal values become 0.
+     * Applied to display dimensions and render transform in Phase 4B2C.
      */
     val rotationDegrees: Int,
 )
@@ -84,11 +89,32 @@ class AndroidDagSourceInspector {
             } else {
                 0L
             }
-            // rotationDegrees: read for future use; NOT applied to layout/rendering/shader.
-            val rotationDegrees = if (format.containsKey(MediaFormat.KEY_ROTATION)) {
-                format.getInteger(MediaFormat.KEY_ROTATION)
-            } else {
-                0
+            // rotationDegrees: primary from KEY_ROTATION; fall back to MediaMetadataRetriever
+            // only when KEY_ROTATION key is entirely absent (0 is a valid value, not absent).
+            // Normalise to cardinal 0/90/180/270; non-cardinal becomes 0.
+            val rotationDegrees = run {
+                val raw: Int = if (format.containsKey(MediaFormat.KEY_ROTATION)) {
+                    format.getInteger(MediaFormat.KEY_ROTATION)
+                } else {
+                    // KEY_ROTATION absent: attempt MMR fallback.
+                    val mmr = MediaMetadataRetriever()
+                    try {
+                        mmr.setDataSource(videoPath)
+                        val rotStr = mmr.extractMetadata(
+                            MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                        rotStr?.toIntOrNull() ?: 0
+                    } catch (_: Throwable) {
+                        0
+                    } finally {
+                        try { mmr.release() } catch (_: Throwable) {}
+                    }
+                }
+                // Normalize to cardinal; non-cardinal (e.g. 45) becomes 0.
+                val normalized = ((raw % 360) + 360) % 360
+                when (normalized) {
+                    0, 90, 180, 270 -> normalized
+                    else -> 0
+                }
             }
 
             return AndroidDagSourceInspectionResult(

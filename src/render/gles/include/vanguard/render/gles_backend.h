@@ -37,6 +37,10 @@ public:
 
     // Phase 2O1: Frame rendering seam stub - GLES backend does not support this.
     RenderFrameResult renderFrame(HardwareBufferHandle handle) override;
+
+    // Phase 4B2C: transform overload stub - GLES backend does not support this.
+    RenderFrameResult renderFrame(HardwareBufferHandle handle,
+                                  const VideoFrameTransform& transform) override;
 };
 
 } // namespace render

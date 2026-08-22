@@ -112,6 +112,9 @@ class AndroidDagSurfaceRecoveryHandler {
         imageQueue: LinkedBlockingQueue<Image>,
         videoWidth: Int,
         videoHeight: Int,
+        displayWidth: Int,
+        displayHeight: Int,
+        rotationDegrees: Int,
         lastRenderedPtsUs: Long,
         renderedFrames: Int,
         currentGenerationId: Long,
@@ -137,11 +140,11 @@ class AndroidDagSurfaceRecoveryHandler {
                 return failure("surface_invalid_after_available", currentGenerationId, renderedFrames, lastRenderedPtsUs)
             }
 
-            // Step 2: Create native session
+            // Step 2: Create native session with display (post-rotation) dimensions
             val createResult = bridge.createAndroidDagPhase4B1TexturePlaybackSession(
                 newSurface,
-                videoWidth,
-                videoHeight,
+                displayWidth,
+                displayHeight,
             )
             if (!createResult.startsWith("status=OK;")) {
                 Log.e(TAG, "restoreSurface: native session create failed: $createResult")
@@ -208,6 +211,9 @@ class AndroidDagSurfaceRecoveryHandler {
                     sessionId = newSid,
                     videoWidth = videoWidth,
                     videoHeight = videoHeight,
+                    displayWidth = displayWidth,
+                    displayHeight = displayHeight,
+                    rotationDegrees = rotationDegrees,
                     seekTargetUs = lastRenderedPtsUs,
                     currentGenerationId = activeGenId,
                     renderedFramesBefore = renderedFrames,

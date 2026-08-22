@@ -51,6 +51,9 @@ class AndroidDagFrameRenderPump {
         sessionId: String?,
         videoWidth: Int,
         videoHeight: Int,
+        displayWidth: Int,
+        displayHeight: Int,
+        rotationDegrees: Int,
         currentGenerationId: Long,
         inputDone: Boolean,
         outputDone: Boolean,
@@ -127,14 +130,16 @@ class AndroidDagFrameRenderPump {
                     if (sid != null && nb != null) {
                         val ptsUs = image.timestamp / 1000L
                         localLastRenderedPtsUs = ptsUs
+                        // Phase 4B2C: pass displayWidth/displayHeight and rotationDegrees.
                         val renderStr = nb.renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration(
                             sid,
                             hwBuf,
-                            videoWidth,
-                            videoHeight,
+                            displayWidth,
+                            displayHeight,
                             ptsUs,
                             localRenderedFrames,
                             currentGenerationId,
+                            rotationDegrees,
                         )
 
                         if (renderStr.startsWith("status=PASS;")) {

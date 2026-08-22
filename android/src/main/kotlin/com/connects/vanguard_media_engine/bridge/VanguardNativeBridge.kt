@@ -98,6 +98,7 @@ class VanguardNativeBridge(
         timelinePtsUs: Long,
         frameIndex: Int,
         generationId: Long,
+        rotationDegrees: Int,
     ): String
 
     fun initialize() {

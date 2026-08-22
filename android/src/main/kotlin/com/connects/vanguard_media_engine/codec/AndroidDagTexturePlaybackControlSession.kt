@@ -77,10 +77,21 @@ class AndroidDagTexturePlaybackControlSession(
     private var outputDone = false
     private var frameRenderError: String? = null
     /**
-     * Video rotation from source metadata (MediaFormat.KEY_ROTATION).
-     * Phase 4B2B3A: stored for future use; NOT applied to layout/shader/rendering.
+     * Video rotation from source metadata. Phase 4B2C: applied to display dimensions
+     * and render transform. Normalised cardinal 0/90/180/270.
      */
     private var rotationDegrees: Int = 0
+
+    /**
+     * Display width after applying [rotationDegrees] swap (swapped for 90/270).
+     * Used for surfaceProducer size, native session, and render calls.
+     */
+    private var displayWidth = 0
+
+    /**
+     * Display height after applying [rotationDegrees] swap (swapped for 90/270).
+     */
+    private var displayHeight = 0
 
     /**
      * Initializes resources and prepares the playback session on the dedicated HandlerThread.
@@ -104,8 +115,12 @@ class AndroidDagTexturePlaybackControlSession(
         videoWidth = inspection.width
         videoHeight = inspection.height
         durationUs = inspection.durationUs
-        // rotationDegrees captured for future use; NOT applied to layout/shader/rendering.
+        // rotationDegrees is normalised cardinal (0/90/180/270) by the inspector.
         rotationDegrees = inspection.rotationDegrees
+        // Phase 4B2C: compute display dimensions - swap for 90/270 clockwise rotation.
+        val swapDims = rotationDegrees == 90 || rotationDegrees == 270
+        displayWidth  = if (swapDims) videoHeight else videoWidth
+        displayHeight = if (swapDims) videoWidth  else videoHeight
         val mime = inspection.mime
         val format = inspection.format!!
 
@@ -128,11 +143,13 @@ class AndroidDagTexturePlaybackControlSession(
                     @Suppress("DEPRECATION")
                     surfaceProducer.setCallback(adapter)
 
-                    // Configure Flutter texture buffer size and obtain Surface
-                    surfaceProducer.setSize(videoWidth, videoHeight)
+                    // Configure Flutter texture buffer size with display (post-rotation) dimensions
+                    // and obtain Surface. ImageReader and MediaCodec use raw decoded dimensions.
+                    surfaceProducer.setSize(displayWidth, displayHeight)
                     val surface = surfaceProducer.getSurface().also { flutterSurface = it }
 
                     // 4. Create ImageReader (PRIVATE, GPU_SAMPLED_IMAGE, API 29+)
+                    // Uses raw video dimensions: MediaCodec decodes at native resolution.
                     val reader = ImageReader.newInstance(
                         videoWidth,
                         videoHeight,
@@ -172,8 +189,8 @@ class AndroidDagTexturePlaybackControlSession(
 
                     val createResult = bridge.createAndroidDagPhase4B1TexturePlaybackSession(
                         surface,
-                        videoWidth,
-                        videoHeight,
+                        displayWidth,
+                        displayHeight,
                     )
 
                     if (!createResult.startsWith("status=OK;")) {
@@ -227,8 +244,8 @@ class AndroidDagTexturePlaybackControlSession(
                     onResult(mapOf(
                         "pass" to true,
                         "textureId" to surfaceProducer.id(),
-                        "width" to videoWidth,
-                        "height" to videoHeight,
+                        "width" to displayWidth,
+                        "height" to displayHeight,
                         "durationUs" to durationUs,
                         "state" to state.name,
                         "sessionId" to sessionId,
@@ -321,6 +338,9 @@ class AndroidDagTexturePlaybackControlSession(
                                 sessionId = sessionId,
                                 videoWidth = videoWidth,
                                 videoHeight = videoHeight,
+                                displayWidth = displayWidth,
+                                displayHeight = displayHeight,
+                                rotationDegrees = rotationDegrees,
                                 currentGenerationId = currentGenerationId,
                                 inputDone = inputDone,
                                 outputDone = outputDone,
@@ -540,6 +560,9 @@ class AndroidDagTexturePlaybackControlSession(
                     sessionId = sid,
                     videoWidth = videoWidth,
                     videoHeight = videoHeight,
+                    displayWidth = displayWidth,
+                    displayHeight = displayHeight,
+                    rotationDegrees = rotationDegrees,
                     seekTargetUs = targetPtsUs,
                     currentGenerationId = currentGenerationId,
                     renderedFramesBefore = renderedFrames,
@@ -738,6 +761,9 @@ class AndroidDagTexturePlaybackControlSession(
                 imageQueue = imageQueue,
                 videoWidth = videoWidth,
                 videoHeight = videoHeight,
+                displayWidth = displayWidth,
+                displayHeight = displayHeight,
+                rotationDegrees = rotationDegrees,
                 lastRenderedPtsUs = lastRenderedPtsUs,
                 renderedFrames = renderedFrames,
                 currentGenerationId = currentGenerationId,

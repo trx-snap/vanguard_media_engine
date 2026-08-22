@@ -161,6 +161,15 @@ RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle /*handle*/) {
     return RenderFrameResult::kUnavailable;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4B2C: renderFrame with transform stub - host build.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle /*handle*/,
+                                             const VideoFrameTransform& /*transform*/) {
+    return RenderFrameResult::kUnavailable;
+}
+
 #else // __ANDROID__
 
 // ---------------------------------------------------------------------------
@@ -811,6 +820,35 @@ RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle handle) {
         *s.ahbImports,
         *s.coreShaders,
         handle);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4B2C: renderFrame with rotation transform - Android.
+// Builds VideoTransformPushConstants and delegates to the frame renderer.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle handle,
+                                             const VideoFrameTransform& transform) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (!s.surfaceSwapchain || !s.surfaceSwapchain->hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (!s.ahbImports || !hasHardwareBuffer(handle) || s.ahbImports->getImage(handle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (!s.frameRenderer || !s.coreShaders) {
+        return RenderFrameResult::kUnavailable;
+    }
+    return s.frameRenderer->renderFrame(
+        static_cast<void*>(s.queue),
+        *s.surfaceSwapchain,
+        *s.ahbImports,
+        *s.coreShaders,
+        handle,
+        transform);
 }
 
 #endif // __ANDROID__

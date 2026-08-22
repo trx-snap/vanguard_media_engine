@@ -50,6 +50,11 @@ struct VulkanGraphicsPassParams {
     VkAccessFlags dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     uint32_t srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     uint32_t dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    // Phase 4B2C: UV transform push constants for vertex shader rotation.
+    float uvTransformPushConstants[8] = {
+        1.0f, 0.0f, 0.0f, 0.0f,  // row0 (u = x)
+        0.0f, 1.0f, 0.0f, 0.0f,  // row1 (v = y)
+    };
 #else
     void* commandBuffer = nullptr;
     void* renderPass = nullptr;
@@ -70,6 +75,11 @@ struct VulkanGraphicsPassParams {
     uint32_t dstAccessMask = 0;
     uint32_t srcQueueFamilyIndex = (~0U);
     uint32_t dstQueueFamilyIndex = (~0U);
+    // Phase 4B2C: UV transform push constants (identity defaults).
+    float uvTransformPushConstants[8] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+    };
 #endif
 };
 

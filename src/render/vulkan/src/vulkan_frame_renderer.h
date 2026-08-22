@@ -12,6 +12,7 @@
 
 #include "vanguard/render/hardware_buffer_import.h"
 #include "vanguard/render/render_backend.h"
+#include "vanguard/render/render_transform.h"
 
 #include <cstdint>
 #include <memory>
@@ -54,14 +55,23 @@ public:
     // Waits for device/GPU execution across all frames to complete.
     void waitAllFramesIdle();
 
-    // Frame rendering entry point. Validates preconditions and returns explicit result.
-    // In Phase 2O2B1, returns kUnavailable after validation without executing GPU commands.
+    // Frame rendering entry point (identity transform path).
+    // Validates preconditions and returns explicit result.
     RenderFrameResult renderFrame(
         void* queueHandle,
         VulkanSurfaceSwapchain& swapchain,
         VulkanHardwareBufferImports& ahbImports,
         VulkanCoreShaderModules& coreShaders,
         HardwareBufferHandle handle);
+
+    // Phase 4B2C: Frame rendering with rotation transform.
+    RenderFrameResult renderFrame(
+        void* queueHandle,
+        VulkanSurfaceSwapchain& swapchain,
+        VulkanHardwareBufferImports& ahbImports,
+        VulkanCoreShaderModules& coreShaders,
+        HardwareBufferHandle handle,
+        const VideoFrameTransform& transform);
 
 private:
     struct Impl;

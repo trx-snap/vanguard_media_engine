@@ -6,7 +6,10 @@
 //   - VkDescriptorSetLayout  (binding 0, COMBINED_IMAGE_SAMPLER, immutable)
 //   - VkDescriptorPool       (one descriptor, maxSets 1)
 //   - VkDescriptorSet        (written with the imageView; freed with the pool)
-//   - VkPipelineLayout       (one set layout, no push constants; Phase 2I)
+//   - VkPipelineLayout       (one set layout, Phase 4B2C: vertex push constants)
+//
+// Phase 4B2C: VkPushConstantRange for VideoTransformPushConstants (32 bytes,
+// VK_SHADER_STAGE_VERTEX_BIT) added to pipeline layout.
 //
 // Deferred to later phases: shader modules, pipeline objects, command buffers,
 // queue submit, render pass / framebuffer / dynamic rendering, presentation.

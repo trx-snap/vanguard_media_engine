@@ -82,5 +82,14 @@ RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle /*handle*/) {
     return RenderFrameResult::kUnavailable;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4B2C: renderFrame with transform stub - GLES backend.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle /*handle*/,
+                                           const VideoFrameTransform& /*transform*/) {
+    return RenderFrameResult::kUnavailable;
+}
+
 } // namespace render
 } // namespace vanguard

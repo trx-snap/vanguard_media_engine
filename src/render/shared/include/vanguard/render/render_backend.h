@@ -1,6 +1,7 @@
 #pragma once
 #include "vanguard/core/status.h"
 #include "vanguard/render/hardware_buffer_import.h"
+#include "vanguard/render/render_transform.h"
 #include <cstdint>
 
 namespace vanguard {
@@ -104,6 +105,20 @@ public:
     //
     // handle - must be a handle returned by a successful importHardwareBuffer.
     virtual RenderFrameResult renderFrame(HardwareBufferHandle handle) = 0;
+
+    // ---------------------------------------------------------------------------
+    // Phase 4B2C: renderFrame with spatial rotation transform.
+    //
+    // Identity path: default implementation calls renderFrame(handle) so existing
+    // callers compile and behave identically without modification.
+    //
+    // Backends that support push constants override this to apply the UV transform.
+    // ---------------------------------------------------------------------------
+    virtual RenderFrameResult renderFrame(HardwareBufferHandle handle,
+                                          const VideoFrameTransform& transform) {
+        (void)transform;
+        return renderFrame(handle);
+    }
 };
 
 } // namespace render
