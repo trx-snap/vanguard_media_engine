@@ -37,6 +37,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C5CManifestRenditionSmoke",
             "runAndroidDagPhase4C5DManifestPolicyValidation",
             "runAndroidDagPhase4C5ECompatibilityDecisionSmoke",
+            "runAndroidDagPhase4C5GPreflightAdvisorySmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -60,6 +61,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C5CManifestRenditionSmoke" -> runAdaptiveStreamingManifestRenditionSmoke(result)
             "runAndroidDagPhase4C5DManifestPolicyValidation" -> runAdaptiveStreamingManifestPolicyValidation(args, result)
             "runAndroidDagPhase4C5ECompatibilityDecisionSmoke" -> runAdaptiveStreamingCompatibilityDecisionSmoke(args, result)
+            "runAndroidDagPhase4C5GPreflightAdvisorySmoke" -> runAdaptiveStreamingPreflightAdvisorySmoke(args, result)
             else -> return false
         }
         return true
@@ -489,6 +491,33 @@ class AndroidDagStreamingPlaybackCoordinator(
                 AdaptiveStreamingCompatibilityDecisionSmokeHarness.runHostCompatibilityDecision(manifests)
             } else {
                 AdaptiveStreamingCompatibilityDecisionSmokeHarness.runDefaultPublicCompatibilityDecisionSmoke()
+            }
+            mainHandler.post { result.success(smokeResult) }
+        }.start()
+    }
+
+    private fun runAdaptiveStreamingPreflightAdvisorySmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        @Suppress("UNCHECKED_CAST")
+        val manifests = args?.get("manifests") as? List<Map<*, *>>
+        val requestedNetworkProfile = (args?.get("requestedNetworkProfile") as? String) ?: "CONSTRAINED"
+        val preferLowLatency = (args?.get("preferLowLatency") as? Boolean) ?: false
+        val allowLowLatencyOnConstrained = (args?.get("allowLowLatencyOnConstrained") as? Boolean) ?: false
+
+        Thread {
+            val smokeResult = if (manifests != null && manifests.isNotEmpty()) {
+                AdaptiveStreamingPreflightAdvisorySmokeHarness.runHostPreflightAdvisory(
+                    specs = manifests,
+                    requestedNetworkProfileRaw = requestedNetworkProfile,
+                    preferLowLatency = preferLowLatency,
+                    allowLowLatencyOnConstrained = allowLowLatencyOnConstrained,
+                )
+            } else {
+                AdaptiveStreamingPreflightAdvisorySmokeHarness.runHostPreflightAdvisory(
+                    specs = AdaptiveStreamingManifestPolicySmokeHarness.defaultPublicStreamSpecs(),
+                    requestedNetworkProfileRaw = requestedNetworkProfile,
+                    preferLowLatency = preferLowLatency,
+                    allowLowLatencyOnConstrained = allowLowLatencyOnConstrained,
+                )
             }
             mainHandler.post { result.success(smokeResult) }
         }.start()
