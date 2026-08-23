@@ -1,92 +1,104 @@
 # vanguard_media_engine
 
-A new Flutter FFI plugin project.
+Vanguard is a high-performance native media engine plugin for Flutter, providing timeline editing, camera capture and filters, hardware-accelerated playback, and streaming media cache capabilities.
 
-## Getting Started
+All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
-This project is a starting point for a Flutter
-[FFI plugin](https://flutter.dev/to/ffi-package),
-a specialized package that includes native code directly invoked with Dart FFI.
+## Streaming Cache API
 
-## Project structure
+The package exposes `VGStreamingCacheClient` to manage media prewarming and caching for streaming video/audio playback.
 
-This template uses the following structure:
+### Quick Start
 
-* `src`: Contains the native source code, and a CmakeFile.txt file for building
-  that source code into a dynamic library.
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
-* `lib`: Contains the Dart code that defines the API of the plugin, and which
-  calls into the native code using `dart:ffi`.
+// 1. Instantiate the streaming cache client
+final client = VGStreamingCacheClient();
 
-* platform folders (`android`, `ios`, `windows`, etc.): Contains the build files
-  for building and bundling the native code library with the platform application.
+// 2. Query cache status
+final status = await client.getStatus(
+  options: const VGPlaybackCacheOptions(
+    cacheEnabled: true,
+    cacheMaxBytes: 512 * 1024 * 1024,
+    cacheDirectoryName: 'vanguard_playback_cache',
+  ),
+);
+print('Cache available: ${status.cacheAvailable}, used bytes: ${status.cacheSpaceBytes}');
 
-## Building and bundling native code
+// 3. Prewarm streaming content (bounded background fetch)
+final prewarmResult = await client.prewarm(
+  requestId: 'feed_item_12345',
+  uri: Uri.parse('https://cdn.example.com/video/stream.mp4'),
+  maxBytes: 2 * 1024 * 1024, // 2 MiB budget
+  options: const VGPlaybackCacheOptions(
+    cacheEnabled: true,
+    minimumFreeBytesAfterPrewarm: 64 * 1024 * 1024, // 64 MiB headroom guard
+  ),
+);
 
-The `pubspec.yaml` specifies FFI plugins as follows:
+switch (prewarmResult.state) {
+  case VGPlaybackPrewarmStartState.accepted:
+    print('Prewarm queued: ${prewarmResult.requestId}');
+    break;
+  case VGPlaybackPrewarmStartState.blockedLowStorage:
+    print('Prewarm blocked by storage guard (insufficient disk space)');
+    break;
+  case VGPlaybackPrewarmStartState.storageGuardError:
+    print('Prewarm skipped: storage guard evaluation error');
+    break;
+  case VGPlaybackPrewarmStartState.duplicate:
+  case VGPlaybackPrewarmStartState.invalid:
+  case VGPlaybackPrewarmStartState.shutdown:
+  case VGPlaybackPrewarmStartState.unsupported:
+    print('Prewarm not started: ${prewarmResult.state}');
+    break;
+}
 
-```yaml
-  plugin:
-    platforms:
-      some_platform:
-        ffiPlugin: true
+// 4. Poll job status
+final jobStatus = await client.getPrewarmStatus('feed_item_12345');
+print('Job state: ${jobStatus.state}, cached: ${jobStatus.bytesCached} bytes');
+
+// 5. Cancel on scroll-away
+await client.cancelPrewarm('feed_item_12345');
+
+// 6. Clear cache on privacy/logout trigger
+final clearResult = await client.clear(
+  options: const VGPlaybackCacheOptions(cacheEnabled: true),
+);
+print('Cleared cache: pass=${clearResult.pass}, freed=${clearResult.beforeBytes - clearResult.afterBytes} bytes');
 ```
 
-This configuration invokes the native build for the various target platforms
-and bundles the binaries in Flutter applications using these FFI plugins.
+### Options and Error States
 
-This can be combined with dartPluginClass, such as when FFI is used for the
-implementation of one platform in a federated plugin:
+`VGPlaybackCacheOptions` parameters:
+- `cacheEnabled`: Enables or disables the cache substrate (defaults to `true`).
+- `cacheMaxBytes`: Total disk cache quota in bytes (default: 512 MiB).
+- `cacheDirectoryName`: Subdirectory in the application cache directory (default: `'vanguard_playback_cache'`).
+- `minimumFreeBytesAfterPrewarm`: Minimum required free disk space remaining after the prewarm write completes (default: 64 MiB).
 
-```yaml
-  plugin:
-    implements: some_other_plugin
-    platforms:
-      some_platform:
-        dartPluginClass: SomeClass
-        ffiPlugin: true
-```
+Prewarm start states (`VGPlaybackPrewarmStartState`):
+- `accepted`: Request accepted and queued for download.
+- `blockedLowStorage`: Prewarm blocked because free storage is below `minimumFreeBytesAfterPrewarm`.
+- `storageGuardError`: Prewarm skipped because storage headroom could not be evaluated.
+- `duplicate`: A job with the specified `requestId` is already running or queued.
+- `invalid`: Request parameters are invalid or cache is disabled.
+- `shutdown`: Cache coordinator has been shut down.
+- `unsupported`: Platform does not support native streaming cache.
 
-A plugin can have both FFI and method channels:
+### Ownership and Architectural Boundaries
 
-```yaml
-  plugin:
-    platforms:
-      some_platform:
-        pluginClass: SomeName
-        ffiPlugin: true
-```
+- **Vanguard Package Ownership**: Owns the native cache substrate, disk management, bounded prewarm coordinator, and public Dart client APIs.
+- **ConnectsApp Ownership**: Owns feed prefetch policy, viewport prediction, scroll-driven cancel triggers, and trigger timing.
+- **Scope Exclusion**: WebRTC and LiveKit interactive room audio/video streams are not cached by this API.
+- **Platform Support**:
+  - Android: Fully backed by the native Media3 SimpleCache substrate and prewarm coordinator.
+  - iOS: Native backend implementation is planned and frozen in UMF architecture documents, but not yet implemented. Calls on non-Android platforms safely catch `MissingPluginException` and return typed unsupported result objects (`phase: 'unsupported'`, `pass: false`).
+- **Physical Proof Status**: Phase 4C6F3 physical proof is pending device visibility while mechanical and API unit/integration tests are in place.
 
-The native build systems that are invoked by FFI (and method channel) plugins are:
+## Package Architecture
 
-* For Android: Gradle, which invokes the Android NDK for native builds.
-  * See the documentation in android/build.gradle.
-* For iOS and MacOS: Xcode, via CocoaPods.
-  * See the documentation in ios/vanguard_media_engine.podspec.
-  * See the documentation in macos/vanguard_media_engine.podspec.
-* For Linux and Windows: CMake.
-  * See the documentation in linux/CMakeLists.txt.
-  * See the documentation in windows/CMakeLists.txt.
-
-## Binding to native code
-
-To use the native code, bindings in Dart are needed.
-To avoid writing these by hand, they are generated from the header file
-(`src/vanguard_media_engine.h`) by `package:ffigen`.
-Regenerate the bindings by running `dart run ffigen --config ffigen.yaml`.
-
-## Invoking native code
-
-Very short-running native functions can be directly invoked from any isolate.
-For example, see `sum` in `lib/vanguard_media_engine.dart`.
-
-Longer-running functions should be invoked on a helper isolate to avoid
-dropping frames in Flutter applications.
-For example, see `sumAsync` in `lib/vanguard_media_engine.dart`.
-
-## Flutter help
-
-For help getting started with Flutter, view our
-[online documentation](https://docs.flutter.dev), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
-
+- `lib/`: Dart public API definitions and platform bridge clients.
+- `src/`: Native C++ engine implementation for timeline and composition.
+- `android/`: Android platform implementation including Media3 streaming cache coordinator and FFI glue.
+- `ios/`: iOS platform implementation (Metal rendering, AVFoundation integration).
