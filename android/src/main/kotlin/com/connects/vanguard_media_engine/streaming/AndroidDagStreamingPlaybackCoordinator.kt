@@ -32,6 +32,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "simulateAndroidDagPhase4C1D1StreamingSurfaceCleanup",
             "simulateAndroidDagPhase4C1D1StreamingSurfaceAvailable",
             "disposeAndroidDagPhase4C1D1StreamingPlayback",
+            "runAndroidDagPhase4C4GAdaptiveStreamTimelineSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -50,6 +51,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "simulateAndroidDagPhase4C1D1StreamingSurfaceCleanup" -> simulateStreamingSurfaceCleanup(args, result)
             "simulateAndroidDagPhase4C1D1StreamingSurfaceAvailable" -> simulateStreamingSurfaceAvailable(args, result)
             "disposeAndroidDagPhase4C1D1StreamingPlayback" -> disposeStreamingPlayback(args, result)
+            "runAndroidDagPhase4C4GAdaptiveStreamTimelineSmoke" -> runAdaptiveStreamTimelineSmoke(args, result)
             else -> return false
         }
         return true
@@ -416,5 +418,13 @@ class AndroidDagStreamingPlaybackCoordinator(
                 }
             } catch (_: Throwable) {}
         }
+    }
+
+    private fun runAdaptiveStreamTimelineSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val frameCount = (args?.get("frameCount") as? Number)?.toInt() ?: 5
+        Thread {
+            val smokeResult = AdaptiveStreamTimelineSmokeHarness.run(frameCount)
+            mainHandler.post { result.success(smokeResult) }
+        }.start()
     }
 }
