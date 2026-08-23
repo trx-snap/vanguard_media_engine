@@ -124,6 +124,10 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
       int displayHeight = 0;
       int effectiveDisplayWidth = 0;
       int effectiveDisplayHeight = 0;
+      int videoWidth = 0;
+      int videoHeight = 0;
+      int rawWidth = 0;
+      int rawHeight = 0;
       bool orientationMetadataPass = false;
 
       try {
@@ -265,10 +269,21 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
         displayHeight = status.displayHeight;
         effectiveDisplayWidth = status.effectiveDisplayWidth;
         effectiveDisplayHeight = status.effectiveDisplayHeight;
+        videoWidth = status.videoWidth;
+        videoHeight = status.videoHeight;
+        rawWidth = (diagMap['width'] as num?)?.toInt() ?? 0;
+        rawHeight = (diagMap['height'] as num?)?.toInt() ?? 0;
+        final rawVideoWidth = (diagMap['videoWidth'] as num?)?.toInt() ?? 0;
+        final rawVideoHeight = (diagMap['videoHeight'] as num?)?.toInt() ?? 0;
 
         final hasRotationKey = diagMap.containsKey('rotationDegrees');
         final hasDisplayWidthKey = diagMap.containsKey('displayWidth');
         final hasDisplayHeightKey = diagMap.containsKey('displayHeight');
+        final hasWidthKey = diagMap.containsKey('width');
+        final hasHeightKey = diagMap.containsKey('height');
+        final hasVideoWidthKey = diagMap.containsKey('videoWidth');
+        final hasVideoHeightKey = diagMap.containsKey('videoHeight');
+
         final validRotation =
             rotationDegrees == 0 ||
             rotationDegrees == 90 ||
@@ -276,14 +291,30 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
             rotationDegrees == 270;
         final positiveDisplayDimensions =
             effectiveDisplayWidth > 0 && effectiveDisplayHeight > 0;
+        final positiveEncodedDimensions =
+            videoWidth > 0 &&
+            videoHeight > 0 &&
+            rawVideoWidth > 0 &&
+            rawVideoHeight > 0;
+        final canvasDimensionsMatchDisplay =
+            rawWidth > 0 &&
+            rawHeight > 0 &&
+            rawWidth == effectiveDisplayWidth &&
+            rawHeight == effectiveDisplayHeight;
 
         orientationMetadataPass = true;
-        if (!hasRotationKey || !hasDisplayWidthKey || !hasDisplayHeightKey) {
+        if (!hasRotationKey ||
+            !hasDisplayWidthKey ||
+            !hasDisplayHeightKey ||
+            !hasWidthKey ||
+            !hasHeightKey ||
+            !hasVideoWidthKey ||
+            !hasVideoHeightKey) {
           orientationMetadataPass = false;
           // ignore: avoid_print
           print(
             'ANDROID_STREAMING_PLAYBACK_PUBLIC_API_${testCase.key.toUpperCase()}_ORIENTATION_FAIL:'
-            ' missing orientation/display keys (rotationDegrees=$hasRotationKey, displayWidth=$hasDisplayWidthKey, displayHeight=$hasDisplayHeightKey)',
+            ' missing orientation/display keys (rotationDegrees=$hasRotationKey, displayWidth=$hasDisplayWidthKey, displayHeight=$hasDisplayHeightKey, width=$hasWidthKey, height=$hasHeightKey, videoWidth=$hasVideoWidthKey, videoHeight=$hasVideoHeightKey)',
           );
         }
         if (!validRotation) {
@@ -300,6 +331,22 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
           print(
             'ANDROID_STREAMING_PLAYBACK_PUBLIC_API_${testCase.key.toUpperCase()}_ORIENTATION_FAIL:'
             ' non-positive effective display dimensions (${effectiveDisplayWidth}x$effectiveDisplayHeight)',
+          );
+        }
+        if (!positiveEncodedDimensions) {
+          orientationMetadataPass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_STREAMING_PLAYBACK_PUBLIC_API_${testCase.key.toUpperCase()}_ORIENTATION_FAIL:'
+            ' non-positive encoded dimensions (videoWidth=$videoWidth, videoHeight=$videoHeight, rawVideoWidth=$rawVideoWidth, rawVideoHeight=$rawVideoHeight)',
+          );
+        }
+        if (!canvasDimensionsMatchDisplay) {
+          orientationMetadataPass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_STREAMING_PLAYBACK_PUBLIC_API_${testCase.key.toUpperCase()}_ORIENTATION_FAIL:'
+            ' canvas dimensions do not match display dimensions (canvas=${rawWidth}x$rawHeight, display=${effectiveDisplayWidth}x$effectiveDisplayHeight)',
           );
         }
 
@@ -351,6 +398,10 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
         'displayHeight': displayHeight,
         'effectiveDisplayWidth': effectiveDisplayWidth,
         'effectiveDisplayHeight': effectiveDisplayHeight,
+        'videoWidth': videoWidth,
+        'videoHeight': videoHeight,
+        'width': rawWidth,
+        'height': rawHeight,
         'orientationMetadataPass': orientationMetadataPass,
         'adaptiveTimelineAttached': diagMap['adaptiveTimelineAttached'],
         'adaptiveTimelineStarted': diagMap['adaptiveTimelineStarted'],

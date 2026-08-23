@@ -129,13 +129,16 @@ Widget buildStreamingView(VGStreamingPlaybackControllerSnapshot snapshot) {
 
 `VGStreamingPlaybackTextureView` consumes `session.effectiveDisplayWidth` and `session.effectiveDisplayHeight` rather than raw encoded video dimensions. This automatically preserves display aspect ratio when explicit display dimensions (`displayWidth`, `displayHeight`) or cardinal rotation angles (`rotationDegrees` of 90° or 270°) are reported by the session.
 
-- **Native Metadata Propagation (Phase 4C7U)**: Android streaming playback (`HttpAdaptivePlaybackAdapter` -> `AndroidDagStreamingPlaybackSession` -> `renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration`) reads `player.videoFormat?.rotationDegrees`, normalizes cardinal values (0°, 90°, 180°, 270°), computes display dimensions, forwards them to the listener, and renders each frame with the native rotation transform.
+- **Display-Canvas Convention & Native Metadata Propagation (Phase 4C7U)**: Android streaming playback aligns with local playback's proven display-canvas convention:
+  - Encoded dimensions (`videoWidth`, `videoHeight`) remain video stream metadata and size the decoder output bridge (`HttpAdaptiveImageReaderBridge`).
+  - Display dimensions (`displayWidth`, `displayHeight` / `effectiveDisplayWidth`, `effectiveDisplayHeight`) configure the Flutter `SurfaceProducer.setSize` texture buffer and drive the native True-DAG render canvas (`renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration` width/height and Vulkan vertex shader push constants).
+  - Media3 track format reads `player.videoFormat?.rotationDegrees`, normalizes cardinal values (0°, 90°, 180°, 270°), computes display dimensions, forwards them to the listener, and renders each frame with the native rotation transform.
 - **Official Platform Baseline**:
   - Android `MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION` retrieves video rotation angle in degrees (values: 0, 90, 180, 270).
   - Android `MediaFormat.KEY_ROTATION` describes clockwise rotation on an output surface for surface-configured codecs (supported values: 0, 90, 180, 270; default: 0).
   - Media3 `Format.rotationDegrees` specifies clockwise rotation to apply for correct orientation (values: 0, 90, 180, 270).
   - Media3 `VideoSize.unappliedRotationDegrees` is deprecated (handled internally by player, returning 0).
-- **Metadata vs. Visual Proof Boundary**: Phase 4C7U/4C7V closes orientation and display metadata propagation and diagnostic reporting across all streaming formats. Visual correctness across every real rotated stream source still requires explicit fixture/device testing with rotated stream content.
+- **Metadata vs. Visual Proof Boundary**: Phase 4C7U/4C7V closes orientation and display metadata propagation and diagnostic reporting across all streaming formats. Current physical streams are 0-degree, so arbitrary rotated stream visual proof still needs a rotated streaming fixture.
 - **iOS Parity**: The iOS implementer will mirror these public fields (`rotationDegrees`, `displayWidth`, `displayHeight`) using AVFoundation track and video output metadata (`AVAssetTrack.preferredTransform`, display dimensions).
 
 ## Streaming Playback Controller Facade Recipe

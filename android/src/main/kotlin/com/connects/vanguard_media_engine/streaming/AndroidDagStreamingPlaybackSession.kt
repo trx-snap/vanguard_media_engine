@@ -188,10 +188,7 @@ class AndroidDagStreamingPlaybackSession(
                 ad.prepare(streamConfig)
                 state = AndroidDagPlaybackState.Prepared
 
-                onResult(diagnosticMap(pass = true, raw = createResult).toMutableMap().apply {
-                    put("width", initialWidth)
-                    put("height", initialHeight)
-                })
+                onResult(diagnosticMap(pass = true, raw = createResult))
             } catch (t: Throwable) {
                 Log.e(TAG, "Error during prepare", t)
                 lastError = "prepare_exception:${t.javaClass.simpleName}:${t.message}"
@@ -284,8 +281,8 @@ class AndroidDagStreamingPlaybackSession(
             "textureId" to surfaceProducer.id(),
             "sessionId" to sessionId,
             "generationId" to generationId,
-            "width" to currentWidth,
-            "height" to currentHeight,
+            "width" to currentDisplayWidth,
+            "height" to currentDisplayHeight,
             "videoWidth" to currentWidth,
             "videoHeight" to currentHeight,
             "rotationDegrees" to currentRotationDegrees,
@@ -385,8 +382,8 @@ class AndroidDagStreamingPlaybackSession(
             val ptsUs = frame.ptsUs
             val fIndex = frame.frameIndex.toInt()
             val gen = generationId
-            val w = if (currentWidth > 0) currentWidth else frame.width
-            val h = if (currentHeight > 0) currentHeight else frame.height
+            val renderWidth = if (currentDisplayWidth > 0) currentDisplayWidth else if (currentWidth > 0) currentWidth else frame.width
+            val renderHeight = if (currentDisplayHeight > 0) currentDisplayHeight else if (currentHeight > 0) currentHeight else frame.height
             val rot = currentRotationDegrees
 
             // Evaluate adaptive timeline -- diagnostic-only, result intentionally ignored.
@@ -406,8 +403,8 @@ class AndroidDagStreamingPlaybackSession(
                 nativeBridge.renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration(
                     sessionId = sid,
                     hardwareBuffer = hwBuf,
-                    width = w,
-                    height = h,
+                    width = renderWidth,
+                    height = renderHeight,
                     timelinePtsUs = ptsUs,
                     frameIndex = fIndex,
                     generationId = gen,
@@ -451,10 +448,12 @@ class AndroidDagStreamingPlaybackSession(
             currentWidth = width
             currentHeight = height
             currentRotationDegrees = rotationDegrees
-            currentDisplayWidth = if (displayWidth > 0) displayWidth else width
-            currentDisplayHeight = if (displayHeight > 0) displayHeight else height
+            val targetDisplayWidth = if (displayWidth > 0) displayWidth else width
+            val targetDisplayHeight = if (displayHeight > 0) displayHeight else height
+            currentDisplayWidth = targetDisplayWidth
+            currentDisplayHeight = targetDisplayHeight
             try {
-                surfaceProducer.setSize(width, height)
+                surfaceProducer.setSize(targetDisplayWidth, targetDisplayHeight)
             } catch (t: Throwable) {
                 Log.w(TAG, "Error updating surfaceProducer size during size change", t)
             }
@@ -478,7 +477,7 @@ class AndroidDagStreamingPlaybackSession(
             }
 
             try {
-                val createResult = nativeBridge.createAndroidDagPhase4B1TexturePlaybackSession(surface, width, height)
+                val createResult = nativeBridge.createAndroidDagPhase4B1TexturePlaybackSession(surface, targetDisplayWidth, targetDisplayHeight)
                 if (!createResult.startsWith("status=OK;")) {
                     val isSurfaceLost = createResult.contains("surface_lost")
                     failAndDestroyNativeSession("native_session_recreate_failed_on_size_change;$createResult", surfaceRelated = isSurfaceLost)
@@ -536,12 +535,12 @@ class AndroidDagStreamingPlaybackSession(
             }
 
             try {
-                val width = if (currentWidth > 0) currentWidth else initialWidth
-                val height = if (currentHeight > 0) currentHeight else initialHeight
-                surfaceProducer.setSize(width, height)
+                val restoreDisplayWidth = if (currentDisplayWidth > 0) currentDisplayWidth else if (currentWidth > 0) currentWidth else initialWidth
+                val restoreDisplayHeight = if (currentDisplayHeight > 0) currentDisplayHeight else if (currentHeight > 0) currentHeight else initialHeight
+                surfaceProducer.setSize(restoreDisplayWidth, restoreDisplayHeight)
                 val surface = surfaceProducer.getSurface().also { flutterSurface = it }
 
-                val createResult = nativeBridge.createAndroidDagPhase4B1TexturePlaybackSession(surface, width, height)
+                val createResult = nativeBridge.createAndroidDagPhase4B1TexturePlaybackSession(surface, restoreDisplayWidth, restoreDisplayHeight)
                 if (!createResult.startsWith("status=OK;")) {
                     failAndDestroyNativeSession("native_session_recreate_failed;$createResult", surfaceRelated = true)
                     return
@@ -606,8 +605,8 @@ class AndroidDagStreamingPlaybackSession(
             "textureId" to surfaceProducer.id(),
             "sessionId" to sessionId,
             "generationId" to generationId,
-            "width" to currentWidth,
-            "height" to currentHeight,
+            "width" to currentDisplayWidth,
+            "height" to currentDisplayHeight,
             "videoWidth" to currentWidth,
             "videoHeight" to currentHeight,
             "rotationDegrees" to currentRotationDegrees,
