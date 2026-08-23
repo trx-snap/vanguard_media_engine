@@ -67,7 +67,10 @@ if (ANDROID)
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
 
   # Support Android 15 16 KB page size
-  target_link_options(vanguard_media_engine PRIVATE "-Wl,-z,max-page-size=16384")
+  target_link_options(vanguard_media_engine PRIVATE
+    "-Wl,-z,max-page-size=16384"
+    "-Wl,-z,common-page-size=16384"
+  )
   # Link modular targets and Android native libraries
   target_link_libraries(vanguard_media_engine
     PRIVATE
