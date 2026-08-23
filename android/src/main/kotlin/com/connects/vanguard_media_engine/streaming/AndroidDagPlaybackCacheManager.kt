@@ -193,6 +193,41 @@ class AndroidDagPlaybackCacheManager private constructor(
         }
     }
 
+    // --- Phase 4C6D: Verification CacheDataSource API -------------------------------------------
+
+    /**
+     * Builds a concrete [CacheDataSource] backed by the owned [simpleCache] with a caller-provided
+     * upstream [upstreamDataSource] for diagnostic verification (such as Phase 4C6D cache-hit proof).
+     *
+     * Returns `null` if [config.enabled] is `false` or if the cache was not successfully
+     * initialised ([isCacheAvailable] is `false`). Does not expose [SimpleCache] itself.
+     *
+     * @param upstreamDataSource Custom upstream data source (e.g. failing network data source).
+     * @param flags Optional CacheDataSource flags. Defaults to 0.
+     * @return A configured [CacheDataSource], or `null` if cache is unavailable.
+     */
+    fun buildVerificationCacheDataSource(
+        upstreamDataSource: DataSource,
+        flags: Int = 0,
+    ): CacheDataSource? {
+        val cache = simpleCache
+        if (!config.enabled || cache == null || !isCacheAvailable) {
+            Log.d(TAG, "buildVerificationCacheDataSource: cache not available; returning null.")
+            return null
+        }
+
+        return try {
+            CacheDataSource(
+                cache,
+                upstreamDataSource,
+                flags,
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "buildVerificationCacheDataSource: CacheDataSource construction failed: ${t.message}", t)
+            null
+        }
+    }
+
     /**
      * Returns a diagnostic status map suitable for the smoke harness and MethodChannel responses.
      *

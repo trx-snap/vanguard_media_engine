@@ -40,6 +40,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C5GPreflightAdvisorySmoke",
             "runAndroidDagPhase4C6BPlaybackCacheBackendSmoke",
             "runAndroidDagPhase4C6CPrewarmSmoke",
+            "runAndroidDagPhase4C6DCacheHitSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -66,6 +67,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C5GPreflightAdvisorySmoke" -> runAdaptiveStreamingPreflightAdvisorySmoke(args, result)
             "runAndroidDagPhase4C6BPlaybackCacheBackendSmoke" -> runAndroidDagPhase4C6BPlaybackCacheBackendSmoke(result)
             "runAndroidDagPhase4C6CPrewarmSmoke" -> runAndroidDagPhase4C6CPrewarmSmoke(args, result)
+            "runAndroidDagPhase4C6DCacheHitSmoke" -> runAndroidDagPhase4C6DCacheHitSmoke(args, result)
             else -> return false
         }
         return true
@@ -623,6 +625,54 @@ class AndroidDagStreamingPlaybackCoordinator(
                     "completedPrewarm"             to false,
                     "cancelMissingSafe"            to false,
                     "prewarmImplemented"           to true,
+                    "adaptiveSegmentGraphPrefetch" to false,
+                    "playbackMutation"             to false,
+                    "webRtcCache"                  to false,
+                    "raw"                          to
+                        "status=FAIL;reason=harness_exception:${t.javaClass.simpleName}:${t.message}",
+                )
+            }
+            mainHandler.post { result.success(smokeResult) }
+        }.start()
+    }
+
+    /**
+     * Phase 4C6D: Diagnostic MethodChannel handler for playback cache hit proof smoke test.
+     *
+     * Parses optional args:
+     * - `uri`      : String  — prewarm / cache target URI; defaults to a small public HLS manifest.
+     * - `maxBytes` : Number  — maximum bytes to fetch/verify; defaults to 65536 (64 KiB); clamped to
+     *                          that value if larger.
+     *
+     * Runs [AndroidDagPlaybackCacheHitSmokeHarness.run] on a background [Thread] (never on the UI
+     * thread, Media3 playback looper, decoder callback, or Vulkan/Metal render loop) and posts
+     * the result map to Dart via [result.success].
+     *
+     * The harness does not instantiate ExoPlayer, create a Surface, create MediaCodec, or mutate
+     * ConnectsApp production state.
+     */
+    private fun runAndroidDagPhase4C6DCacheHitSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val overrideUri = args?.get("uri") as? String
+        val overrideMaxBytes = (args?.get("maxBytes") as? Number)?.toLong()
+
+        Thread {
+            val smokeResult = try {
+                AndroidDagPlaybackCacheHitSmokeHarness.run(
+                    applicationContext = context,
+                    overrideUri = overrideUri,
+                    overrideMaxBytes = overrideMaxBytes,
+                )
+            } catch (t: Throwable) {
+                Log.e(TAG, "Phase4C6D cache hit smoke threw unexpectedly", t)
+                mapOf(
+                    "phase"                        to "Phase4C6D",
+                    "pass"                         to false,
+                    "completedPrewarm"             to false,
+                    "cacheReadSucceeded"           to false,
+                    "cacheReadBytes"               to 0L,
+                    "networkOpenCount"             to 0,
+                    "cacheHitProof"                to false,
+                    "fullPlaybackHitProof"         to false,
                     "adaptiveSegmentGraphPrefetch" to false,
                     "playbackMutation"             to false,
                     "webRtcCache"                  to false,
