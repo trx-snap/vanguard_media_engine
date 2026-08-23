@@ -64,6 +64,62 @@ await client.dispose(session);
 - **Scope Exclusion**: WebRTC and LiveKit interactive rooms and room audio are outside this HTTP playback API.
 - **Physical Proof Status**: The current public physical smoke target exists, but physical proof is pending device visibility.
 
+## Streaming Preflight Advisory API
+
+The package exposes `VGStreamingPreflightClient` to evaluate candidate streaming manifest specifications against device codec capabilities and network policies before initiating playback.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+// 1. Instantiate the streaming preflight client
+final client = VGStreamingPreflightClient();
+
+// 2. Prepare candidate manifest specifications
+final manifests = [
+  VGStreamingManifestSpec(
+    key: 'mux_hls',
+    uri: Uri.parse('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8'),
+    formatHint: VGStreamingFormatHint.hls,
+    requireAdaptiveLadder: true,
+    requireAvcFallback: true,
+  ),
+  VGStreamingManifestSpec(
+    key: 'shaka_dash',
+    uri: Uri.parse(
+      'https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd',
+    ),
+    formatHint: VGStreamingFormatHint.dash,
+  ),
+];
+
+// 3. Evaluate preflight request
+final report = await client.evaluate(
+  VGStreamingPreflightRequest(
+    manifests: manifests,
+    requestedNetworkProfile: VGStreamingNetworkProfile.constrained,
+    preferLowLatency: false,
+  ),
+);
+
+// 4. Inspect advisory decisions and network policies
+if (report.pass) {
+  print('Preflight passed: recommended profile = ${report.recommendedNetworkProfile}');
+  print('Policy config: ${report.recommendedNetworkPolicy}');
+} else {
+  print('Preflight warnings: ${report.warnings}');
+}
+```
+
+### Advisory Guarantees & Boundaries
+
+- **Advisory-Only**: `report.advisoryOnly == true` and `report.playbackMutation == false`. Preflight evaluation performs static codec and manifest capability checks without allocating players, decoders, textures, or rendering pipelines.
+- **No Direct Channel Access**: Do not invoke `evaluateStreamingPreflightAdvisory` directly; always use `VGStreamingPreflightClient`.
+- **Platform Support**:
+  - Android: Backed by native codec capability inspection and adaptive network policy engine.
+  - iOS: Public Dart API is safe to import on iOS and returns typed unsupported report objects (`phase: 'unsupported'`, `pass: false`) until native AVPlayer preflight is implemented.
+
 ## Streaming Cache API
 
 The package exposes `VGStreamingCacheClient` to manage media prewarming and caching for streaming video/audio playback.
