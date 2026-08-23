@@ -3,8 +3,8 @@ package com.connects.vanguard_media_engine.rtc
 /**
  * Diagnostic smoke harness validating [RtcVideoJitterBufferController] metadata-only timeline evaluation,
  * sequential on-time frame acceptance, duplicate frame dropping, out-of-order frame dropping,
- * late frame threshold dropping, too-far-future frame rejection, invalid negative parameter rejection,
- * constructor argument validation, and reset behavior.
+ * late frame threshold dropping, too-far-future frame rejection, retryable future frame re-evaluation and acceptance,
+ * invalid negative parameter rejection, constructor argument validation, and reset behavior.
  *
  * ## Verification Invariants
  * - **Metadata Only / Zero Buffer Retention**: Operates strictly on numeric timestamps and frame indices.
@@ -113,7 +113,24 @@ object RtcVideoJitterBufferSmokeHarness {
                 futureDecision.status == RtcVideoJitterDecisionStatus.FAILED &&
                 futureDecision.retryable &&
                 futureDecision.raw.contains("too_far_in_future") &&
-                (futureSnap["failedFrames"] == 1L)
+                (futureSnap["failedFrames"] == 1L) &&
+                (futureSnap["acceptedFrames"] == effectiveFrameCount.toLong())
+
+            // 5b. Retry the same future frame later with a valid arrivalTimeNs (proving retryable semantics)
+            val validRetryArrivalTimeNs = futureTimestampNs // Arrives on time relative to future timestamp
+            val retryDecision = controller.evaluate(
+                frameIndex = futureFrameIndex,
+                timestampNs = futureTimestampNs,
+                arrivalTimeNs = validRetryArrivalTimeNs,
+            )
+            val retrySnap = controller.snapshot()
+            val futureRetryPass = retryDecision.accepted &&
+                retryDecision.status == RtcVideoJitterDecisionStatus.ACCEPTED &&
+                retryDecision.raw.contains("ACCEPTED") &&
+                (retrySnap["acceptedFrames"] == (effectiveFrameCount + 1).toLong()) &&
+                (retrySnap["lastAcceptedFrameIndex"] == futureFrameIndex) &&
+                (retrySnap["lastAcceptedTimestampNs"] == futureTimestampNs) &&
+                (retrySnap["failedFrames"] == 1L)
 
             // 6. Evaluate invalid negative inputs
             val negIndexDec = controller.evaluate(-1L, 1_000_000_000L, 1_000_000_000L)
@@ -175,14 +192,15 @@ object RtcVideoJitterBufferSmokeHarness {
                 outOfOrderPass &&
                 latePass &&
                 futurePass &&
+                futureRetryPass &&
                 negativeInputPass &&
                 constructorValidationPass &&
                 resetPass
 
             val rawStatus = if (overallPass) {
-                "status=OK;sequentialPass=true;duplicatePass=true;outOfOrderPass=true;latePass=true;futurePass=true;negativeInputPass=true;constructorValidationPass=true;resetPass=true"
+                "status=OK;sequentialPass=true;duplicatePass=true;outOfOrderPass=true;latePass=true;futurePass=true;futureRetryPass=true;negativeInputPass=true;constructorValidationPass=true;resetPass=true"
             } else {
-                "status=JITTER_BUFFER_VERIFICATION_FAILED;sequentialPass=$sequentialPass;duplicatePass=$duplicatePass;outOfOrderPass=$outOfOrderPass;latePass=$latePass;futurePass=$futurePass;negativeInputPass=$negativeInputPass;constructorValidationPass=$constructorValidationPass;resetPass=$resetPass"
+                "status=JITTER_BUFFER_VERIFICATION_FAILED;sequentialPass=$sequentialPass;duplicatePass=$duplicatePass;outOfOrderPass=$outOfOrderPass;latePass=$latePass;futurePass=$futurePass;futureRetryPass=$futureRetryPass;negativeInputPass=$negativeInputPass;constructorValidationPass=$constructorValidationPass;resetPass=$resetPass"
             }
 
             return mapOf(
@@ -194,6 +212,7 @@ object RtcVideoJitterBufferSmokeHarness {
                 "outOfOrderPass" to outOfOrderPass,
                 "latePass" to latePass,
                 "futurePass" to futurePass,
+                "futureRetryPass" to futureRetryPass,
                 "negativeInputPass" to negativeInputPass,
                 "constructorValidationPass" to constructorValidationPass,
                 "resetPass" to resetPass,

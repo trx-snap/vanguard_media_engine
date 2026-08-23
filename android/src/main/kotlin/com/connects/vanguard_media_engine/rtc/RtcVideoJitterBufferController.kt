@@ -156,8 +156,6 @@ class RtcVideoJitterBufferController(
             )
         }
 
-        lastSeenFrameIndex = frameIndex
-
         val targetPlayoutTimeNs = timestampNs + targetPlayoutDelayNs
 
         if (arrivalTimeNs - targetPlayoutTimeNs > maxLateThresholdNs) {
@@ -180,6 +178,7 @@ class RtcVideoJitterBufferController(
         acceptedFrames++
         lastAcceptedFrameIndex = frameIndex
         lastAcceptedTimestampNs = timestampNs
+        lastSeenFrameIndex = frameIndex
 
         return RtcVideoJitterDecision.accepted(
             raw = "status=ACCEPTED;frameIndex=$frameIndex;timestampNs=$timestampNs;targetPlayoutTimeNs=$targetPlayoutTimeNs;arrivalTimeNs=$arrivalTimeNs",
