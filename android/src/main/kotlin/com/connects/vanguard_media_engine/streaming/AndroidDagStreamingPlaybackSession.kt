@@ -71,6 +71,9 @@ class AndroidDagStreamingPlaybackSession(
 
     private var currentWidth: Int = initialWidth
     private var currentHeight: Int = initialHeight
+    private var currentRotationDegrees: Int = 0
+    private var currentDisplayWidth: Int = initialWidth
+    private var currentDisplayHeight: Int = initialHeight
     private var renderedFrames: Int = 0
     private var lastRenderedPtsUs: Long = 0L
     private var lastError: String? = null
@@ -102,6 +105,9 @@ class AndroidDagStreamingPlaybackSession(
 
                 currentWidth = initialWidth
                 currentHeight = initialHeight
+                currentRotationDegrees = 0
+                currentDisplayWidth = initialWidth
+                currentDisplayHeight = initialHeight
                 surfaceProducer.setSize(initialWidth, initialHeight)
                 val surface = surfaceProducer.getSurface().also { flutterSurface = it }
 
@@ -164,7 +170,13 @@ class AndroidDagStreamingPlaybackSession(
                         }
                     }
 
-                    override fun onVideoSizeChanged(width: Int, height: Int) = handleVideoSizeChanged(width, height)
+                    override fun onVideoSizeChanged(
+                        width: Int,
+                        height: Int,
+                        rotationDegrees: Int,
+                        displayWidth: Int,
+                        displayHeight: Int,
+                    ) = handleVideoSizeChanged(width, height, rotationDegrees, displayWidth, displayHeight)
                     override fun onBufferingProgress(bufferedPercent: Int) {}
                     override fun onPlaybackError(errorCode: Int, message: String) {
                         failAndDestroyNativeSession("playback_error:$errorCode:$message")
@@ -272,6 +284,13 @@ class AndroidDagStreamingPlaybackSession(
             "textureId" to surfaceProducer.id(),
             "sessionId" to sessionId,
             "generationId" to generationId,
+            "width" to currentWidth,
+            "height" to currentHeight,
+            "videoWidth" to currentWidth,
+            "videoHeight" to currentHeight,
+            "rotationDegrees" to currentRotationDegrees,
+            "displayWidth" to currentDisplayWidth,
+            "displayHeight" to currentDisplayHeight,
             "renderedFrames" to renderedFrames,
             "lastRenderedPtsUs" to lastRenderedPtsUs,
             "surfaceLost" to isSurfaceLost,
@@ -368,6 +387,7 @@ class AndroidDagStreamingPlaybackSession(
             val gen = generationId
             val w = if (currentWidth > 0) currentWidth else frame.width
             val h = if (currentHeight > 0) currentHeight else frame.height
+            val rot = currentRotationDegrees
 
             // Evaluate adaptive timeline -- diagnostic-only, result intentionally ignored.
             // If anchor is needed (first frame after prepare/seek/size-change/surface-restore),
@@ -391,7 +411,7 @@ class AndroidDagStreamingPlaybackSession(
                     timelinePtsUs = ptsUs,
                     frameIndex = fIndex,
                     generationId = gen,
-                    rotationDegrees = 0,
+                    rotationDegrees = rot,
                 )
             } catch (t: Throwable) {
                 Log.e(TAG, "renderFrame threw exception", t)
@@ -418,12 +438,21 @@ class AndroidDagStreamingPlaybackSession(
         }
     }
 
-    private fun handleVideoSizeChanged(width: Int, height: Int) {
+    private fun handleVideoSizeChanged(
+        width: Int,
+        height: Int,
+        rotationDegrees: Int = 0,
+        displayWidth: Int = width,
+        displayHeight: Int = height,
+    ) {
         if (width <= 0 || height <= 0) return
 
         synchronized(renderLock) {
             currentWidth = width
             currentHeight = height
+            currentRotationDegrees = rotationDegrees
+            currentDisplayWidth = if (displayWidth > 0) displayWidth else width
+            currentDisplayHeight = if (displayHeight > 0) displayHeight else height
             try {
                 surfaceProducer.setSize(width, height)
             } catch (t: Throwable) {
@@ -577,6 +606,13 @@ class AndroidDagStreamingPlaybackSession(
             "textureId" to surfaceProducer.id(),
             "sessionId" to sessionId,
             "generationId" to generationId,
+            "width" to currentWidth,
+            "height" to currentHeight,
+            "videoWidth" to currentWidth,
+            "videoHeight" to currentHeight,
+            "rotationDegrees" to currentRotationDegrees,
+            "displayWidth" to currentDisplayWidth,
+            "displayHeight" to currentDisplayHeight,
             "renderedFrames" to renderedFrames,
             "lastRenderedPtsUs" to lastRenderedPtsUs,
             "surfaceLost" to isSurfaceLost,

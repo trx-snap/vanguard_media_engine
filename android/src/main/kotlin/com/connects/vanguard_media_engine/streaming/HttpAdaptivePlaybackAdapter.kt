@@ -240,8 +240,18 @@ class HttpAdaptivePlaybackAdapter(
             val newWidth = videoSize.width
             val newHeight = videoSize.height
 
-            // Always forward the size change to the listener (external callers may need it).
-            listener.onVideoSizeChanged(newWidth, newHeight)
+            // AndroidX Media3: videoFormat.rotationDegrees describes clockwise rotation (0, 90, 180, 270).
+            // videoSize.unappliedRotationDegrees is deprecated and always 0.
+            val rawRotation = player?.videoFormat?.rotationDegrees ?: 0
+            val rotationDegrees = when (rawRotation) {
+                0, 90, 180, 270 -> rawRotation
+                else -> 0
+            }
+            val displayWidth = if (rotationDegrees == 90 || rotationDegrees == 270) newHeight else newWidth
+            val displayHeight = if (rotationDegrees == 90 || rotationDegrees == 270) newWidth else newHeight
+
+            // Always forward the size and orientation changes to the listener (external callers may need it).
+            listener.onVideoSizeChanged(newWidth, newHeight, rotationDegrees, displayWidth, displayHeight)
 
             // --- ABR / rendition resize seam (Phase 4C1C) -----------------------------------
             // If the headless bridge is active and the new size is positive and differs from the

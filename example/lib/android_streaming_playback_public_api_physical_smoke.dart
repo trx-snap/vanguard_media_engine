@@ -119,6 +119,12 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
       int renderedFrames = 0;
       String stateStr = '';
       bool surfaceLost = false;
+      int rotationDegrees = 0;
+      int displayWidth = 0;
+      int displayHeight = 0;
+      int effectiveDisplayWidth = 0;
+      int effectiveDisplayHeight = 0;
+      bool orientationMetadataPass = false;
 
       try {
         if (mounted) {
@@ -253,6 +259,50 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
           );
         }
 
+        // Orientation & display dimension telemetry assertions (Phases 4C7U/4C7V)
+        rotationDegrees = status.rotationDegrees;
+        displayWidth = status.displayWidth;
+        displayHeight = status.displayHeight;
+        effectiveDisplayWidth = status.effectiveDisplayWidth;
+        effectiveDisplayHeight = status.effectiveDisplayHeight;
+
+        final hasRotationKey = diagMap.containsKey('rotationDegrees');
+        final hasDisplayWidthKey = diagMap.containsKey('displayWidth');
+        final hasDisplayHeightKey = diagMap.containsKey('displayHeight');
+        final validRotation =
+            rotationDegrees == 0 ||
+            rotationDegrees == 90 ||
+            rotationDegrees == 180 ||
+            rotationDegrees == 270;
+        final positiveDisplayDimensions =
+            effectiveDisplayWidth > 0 && effectiveDisplayHeight > 0;
+
+        orientationMetadataPass = true;
+        if (!hasRotationKey || !hasDisplayWidthKey || !hasDisplayHeightKey) {
+          orientationMetadataPass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_STREAMING_PLAYBACK_PUBLIC_API_${testCase.key.toUpperCase()}_ORIENTATION_FAIL:'
+            ' missing orientation/display keys (rotationDegrees=$hasRotationKey, displayWidth=$hasDisplayWidthKey, displayHeight=$hasDisplayHeightKey)',
+          );
+        }
+        if (!validRotation) {
+          orientationMetadataPass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_STREAMING_PLAYBACK_PUBLIC_API_${testCase.key.toUpperCase()}_ORIENTATION_FAIL:'
+            ' invalid rotationDegrees=$rotationDegrees',
+          );
+        }
+        if (!positiveDisplayDimensions) {
+          orientationMetadataPass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_STREAMING_PLAYBACK_PUBLIC_API_${testCase.key.toUpperCase()}_ORIENTATION_FAIL:'
+            ' non-positive effective display dimensions (${effectiveDisplayWidth}x$effectiveDisplayHeight)',
+          );
+        }
+
         // 5. Assert pass criteria
         casePass =
             statusPass &&
@@ -260,7 +310,8 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
             !surfaceLost &&
             !isFailed &&
             timelinePass &&
-            networkProfilePass;
+            networkProfilePass &&
+            orientationMetadataPass;
       } catch (error, stack) {
         // ignore: avoid_print
         print(
@@ -295,6 +346,12 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
         'renderedFrames': renderedFrames,
         'state': stateStr,
         'surfaceLost': surfaceLost,
+        'rotationDegrees': rotationDegrees,
+        'displayWidth': displayWidth,
+        'displayHeight': displayHeight,
+        'effectiveDisplayWidth': effectiveDisplayWidth,
+        'effectiveDisplayHeight': effectiveDisplayHeight,
+        'orientationMetadataPass': orientationMetadataPass,
         'adaptiveTimelineAttached': diagMap['adaptiveTimelineAttached'],
         'adaptiveTimelineStarted': diagMap['adaptiveTimelineStarted'],
         'adaptiveTimelineAcceptedFrames':
@@ -334,6 +391,20 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
       'hlsRenderedFrames': results['hls']?['renderedFrames'] ?? 0,
       'dashRenderedFrames': results['dash']?['renderedFrames'] ?? 0,
       'llHlsRenderedFrames': results['llHls']?['renderedFrames'] ?? 0,
+      'hlsRotationDegrees': results['hls']?['rotationDegrees'] ?? 0,
+      'dashRotationDegrees': results['dash']?['rotationDegrees'] ?? 0,
+      'llHlsRotationDegrees': results['llHls']?['rotationDegrees'] ?? 0,
+      'hlsEffectiveDisplayWidth': results['hls']?['effectiveDisplayWidth'] ?? 0,
+      'hlsEffectiveDisplayHeight':
+          results['hls']?['effectiveDisplayHeight'] ?? 0,
+      'dashEffectiveDisplayWidth':
+          results['dash']?['effectiveDisplayWidth'] ?? 0,
+      'dashEffectiveDisplayHeight':
+          results['dash']?['effectiveDisplayHeight'] ?? 0,
+      'llHlsEffectiveDisplayWidth':
+          results['llHls']?['effectiveDisplayWidth'] ?? 0,
+      'llHlsEffectiveDisplayHeight':
+          results['llHls']?['effectiveDisplayHeight'] ?? 0,
       'hlsRaw': results['hls']?['raw'] ?? '',
       'dashRaw': results['dash']?['raw'] ?? '',
       'llHlsRaw': results['llHls']?['raw'] ?? '',

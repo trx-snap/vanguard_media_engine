@@ -1131,6 +1131,77 @@ void main() {
     );
 
     test(
+      'open and getStatus parse and propagate rotationDegrees, displayWidth, and displayHeight from native map',
+      () async {
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'createAndroidDagPhase4C1D1StreamingPlayback') {
+            return <Object?, Object?>{
+              'pass': true,
+              'phase': 'Phase4C1D1',
+              'textureId': 88,
+              'sessionId': 'stream_sess_88',
+              'state': 'Prepared',
+              'format': 'HLS',
+              'videoWidth': 1920,
+              'videoHeight': 1080,
+              'rotationDegrees': 90,
+              'displayWidth': 1080,
+              'displayHeight': 1920,
+              'raw': 'status=OK;state=Prepared',
+            };
+          } else if (call.method ==
+              'diagnoseAndroidDagPhase4C1D1StreamingPlayback') {
+            return <Object?, Object?>{
+              'pass': true,
+              'phase': 'Phase4C1D1',
+              'textureId': 88,
+              'sessionId': 'stream_sess_88',
+              'state': 'Playing',
+              'format': 'HLS',
+              'videoWidth': 1920,
+              'videoHeight': 1080,
+              'rotationDegrees': 270,
+              'displayWidth': 1080,
+              'displayHeight': 1920,
+              'renderedFrames': 120,
+              'raw': 'status=OK;state=Playing',
+            };
+          }
+          return null;
+        });
+
+        final client = VGStreamingPlaybackClient(channel: channel);
+        final options = VGStreamingPlaybackOptions(
+          uri: Uri.parse('https://example.com/stream.m3u8'),
+          initialWidth: 1080,
+          initialHeight: 1920,
+          formatHint: VGStreamingFormatHint.hls,
+        );
+
+        final openSession = await client.open(options);
+        expect(openSession.videoWidth, equals(1920));
+        expect(openSession.videoHeight, equals(1080));
+        expect(openSession.rotationDegrees, equals(90));
+        expect(openSession.displayWidth, equals(1080));
+        expect(openSession.displayHeight, equals(1920));
+        expect(openSession.effectiveDisplayWidth, equals(1080));
+        expect(openSession.effectiveDisplayHeight, equals(1920));
+        expect(openSession.hasRotationMetadata, isTrue);
+
+        final statusSession = await client.getStatus(openSession);
+        expect(statusSession.videoWidth, equals(1920));
+        expect(statusSession.videoHeight, equals(1080));
+        expect(statusSession.rotationDegrees, equals(270));
+        expect(statusSession.displayWidth, equals(1080));
+        expect(statusSession.displayHeight, equals(1920));
+        expect(statusSession.effectiveDisplayWidth, equals(1080));
+        expect(statusSession.effectiveDisplayHeight, equals(1920));
+        expect(statusSession.renderedFrames, equals(120));
+        expect(statusSession.hasRotationMetadata, isTrue);
+      },
+    );
+
+    test(
       'dispose forwards textureId to disposeAndroidDagPhase4C1D1StreamingPlayback',
       () async {
         MethodCall? recordedCall;

@@ -27,13 +27,22 @@ interface HttpAdaptivePlaybackListener {
     fun onStateChanged(state: HttpAdaptivePlaybackState)
 
     /**
-     * Called when the decoded video track dimensions are first known or change (e.g. mid-stream
-     * resolution switch during ABR adaptation).
+     * Called when the decoded video track dimensions or orientation are first known or change (e.g.
+     * mid-stream resolution switch during ABR adaptation).
      *
-     * @param width  New video width in pixels.
-     * @param height New video height in pixels.
+     * @param width           New video width in pixels.
+     * @param height          New video height in pixels.
+     * @param rotationDegrees Clockwise rotation in degrees (0, 90, 180, 270).
+     * @param displayWidth    Display width in pixels after applying rotation.
+     * @param displayHeight   Display height in pixels after applying rotation.
      */
-    fun onVideoSizeChanged(width: Int, height: Int)
+    fun onVideoSizeChanged(
+        width: Int,
+        height: Int,
+        rotationDegrees: Int = 0,
+        displayWidth: Int = width,
+        displayHeight: Int = height,
+    )
 
     /**
      * Periodic buffering progress notification while the player is filling its look-ahead buffer.
