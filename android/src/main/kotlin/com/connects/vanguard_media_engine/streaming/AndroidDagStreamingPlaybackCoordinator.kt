@@ -39,6 +39,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C5ECompatibilityDecisionSmoke",
             "runAndroidDagPhase4C5GPreflightAdvisorySmoke",
             "runAndroidDagPhase4C6BPlaybackCacheBackendSmoke",
+            "runAndroidDagPhase4C6CPrewarmSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -64,6 +65,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C5ECompatibilityDecisionSmoke" -> runAdaptiveStreamingCompatibilityDecisionSmoke(args, result)
             "runAndroidDagPhase4C5GPreflightAdvisorySmoke" -> runAdaptiveStreamingPreflightAdvisorySmoke(args, result)
             "runAndroidDagPhase4C6BPlaybackCacheBackendSmoke" -> runAndroidDagPhase4C6BPlaybackCacheBackendSmoke(result)
+            "runAndroidDagPhase4C6CPrewarmSmoke" -> runAndroidDagPhase4C6CPrewarmSmoke(args, result)
             else -> return false
         }
         return true
@@ -581,6 +583,51 @@ class AndroidDagStreamingPlaybackCoordinator(
                     "prewarmImplemented" to false,
                     "webRtcCache"       to false,
                     "raw"               to "status=FAIL;reason=harness_exception:${t.javaClass.simpleName}:${t.message}",
+                )
+            }
+            mainHandler.post { result.success(smokeResult) }
+        }.start()
+    }
+
+    /**
+     * Phase 4C6C: Diagnostic MethodChannel handler for the CacheWriter prewarm engine smoke test.
+     *
+     * Parses optional args:
+     * - `uri`      : String  — prewarm target URI; defaults to a small public HLS manifest.
+     * - `maxBytes` : Number  — maximum bytes to fetch; defaults to 65536 (64 KiB); clamped to
+     *                          that value if larger.
+     *
+     * Runs [AndroidDagPlaybackPrewarmSmokeHarness.run] on a background [Thread] (never on the UI
+     * thread, Media3 playback looper, decoder callback, or Vulkan/Metal render loop) and posts
+     * the result map to Dart via [result.success].
+     *
+     * The harness does not instantiate ExoPlayer, create a Surface, create MediaCodec, or mutate
+     * ConnectsApp production state.
+     */
+    private fun runAndroidDagPhase4C6CPrewarmSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val overrideUri = args?.get("uri") as? String
+        val overrideMaxBytes = (args?.get("maxBytes") as? Number)?.toLong()
+
+        Thread {
+            val smokeResult = try {
+                AndroidDagPlaybackPrewarmSmokeHarness.run(
+                    applicationContext = context,
+                    overrideUri = overrideUri,
+                    overrideMaxBytes = overrideMaxBytes,
+                )
+            } catch (t: Throwable) {
+                Log.e(TAG, "Phase4C6C prewarm smoke threw unexpectedly", t)
+                mapOf(
+                    "phase"                        to "Phase4C6C",
+                    "pass"                         to false,
+                    "completedPrewarm"             to false,
+                    "cancelMissingSafe"            to false,
+                    "prewarmImplemented"           to true,
+                    "adaptiveSegmentGraphPrefetch" to false,
+                    "playbackMutation"             to false,
+                    "webRtcCache"                  to false,
+                    "raw"                          to
+                        "status=FAIL;reason=harness_exception:${t.javaClass.simpleName}:${t.message}",
                 )
             }
             mainHandler.post { result.success(smokeResult) }

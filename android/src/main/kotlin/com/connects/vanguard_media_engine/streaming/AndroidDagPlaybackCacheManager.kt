@@ -36,7 +36,7 @@ import java.io.File
  *   HandlerThread or a background smoke thread).  It does not block the UI thread.
  *
  * ## Prewarm / CacheWriter
- * Not implemented in this slice.  Phase 4C6C will add prewarm support via CacheWriter.
+ * Phase 4C6C adds prewarm support via CacheWriter; see [buildPrewarmCacheDataSource].
  *
  * @param applicationContext Application-scoped context.  Must not be an Activity context.
  * @param config             Cache configuration controlling directory, max size, and enabled flag.
@@ -144,6 +144,52 @@ class AndroidDagPlaybackCacheManager private constructor(
             // fall back to the upstream factory to preserve playback.
             Log.w(TAG, "CacheDataSource.Factory build failed – using upstream: ${t.message}", t)
             upstreamFactory
+        }
+    }
+
+    // --- Phase 4C6C: Prewarm / CacheWriter API --------------------------------------------------
+
+    /**
+     * Builds a concrete [CacheDataSource] suitable for passing to [CacheWriter] during prewarm.
+     *
+     * Unlike [buildDataSourceFactory] (which returns a factory for ExoPlayer), this method
+     * creates a ready-to-use [CacheDataSource] instance.  [CacheWriter] requires an already-open
+     * [CacheDataSource], not a factory.
+     *
+     * Returns `null` if [config.enabled] is `false` or if the cache was not successfully
+     * initialised ([isCacheAvailable] is `false`).  The prewarm engine must treat a `null` return
+     * as a graceful abort and must not surface it as a playback error.
+     *
+     * Reuses the same [DefaultHttpDataSource] header behaviour as [buildDataSourceFactory]; no
+     * additional headers or custom cache key are applied (G-CACHE-KEY: URI-based key only).
+     *
+     * Must be called from a background thread; does not block the UI thread.
+     *
+     * @param httpHeaders Optional HTTP headers forwarded to [DefaultHttpDataSource].
+     * @return A configured [CacheDataSource], or `null` if cache is unavailable.
+     */
+    fun buildPrewarmCacheDataSource(
+        httpHeaders: Map<String, String>?,
+    ): CacheDataSource? {
+        val cache = simpleCache
+        if (!config.enabled || cache == null || !isCacheAvailable) {
+            Log.d(TAG, "buildPrewarmCacheDataSource: cache not available; returning null.")
+            return null
+        }
+
+        val upstreamFactory = buildUpstreamFactory(httpHeaders)
+        return try {
+            // Build a CacheDataSource (not a factory) for direct use by CacheWriter.
+            // FLAG_IGNORE_CACHE_ON_ERROR: cache I/O errors fall through to upstream network;
+            // this matches the same flag set in buildDataSourceFactory for playback consistency.
+            CacheDataSource(
+                cache,
+                upstreamFactory.createDataSource(),
+                CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR,
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "buildPrewarmCacheDataSource: CacheDataSource construction failed: ${t.message}", t)
+            null
         }
     }
 
