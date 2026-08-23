@@ -298,6 +298,35 @@ class RealtimeVideoOutputAdapter(
         )
     }
 
+    // -------------------------------------------------------------------------
+    // Processed-egress seam — lifecycle gate without frame construction
+    // -------------------------------------------------------------------------
+
+    /**
+     * Returns the current [RealtimeVideoOutputState] under the adapter lock.
+     *
+     * Provided as a minimal synchronized seam for [ProcessedVideoFrameEgressAdapter] so that it
+     * can check the lifecycle gate before performing any backpressure or timestamp work.
+     */
+    @Synchronized
+    fun currentState(): RealtimeVideoOutputState = state
+
+    /**
+     * Atomically increments [droppedNotReadyFrames] and returns a [RtcVideoFrameDeliveryResult]
+     * with [RtcVideoFrameDeliveryStatus.DROPPED_NOT_READY] encoding the current state in [raw].
+     *
+     * Callers must invoke this only when [currentState] is not [RealtimeVideoOutputState.STARTED].
+     * This allows the processed egress adapter to record a lifecycle drop without constructing
+     * a [RealtimeVideoFrame] or touching backpressure or timestamp machinery.
+     */
+    @Synchronized
+    fun dropNotReadyForCurrentState(): RtcVideoFrameDeliveryResult {
+        droppedNotReadyFrames++
+        return RtcVideoFrameDeliveryResult.droppedNotReady(
+            "status=DROPPED_NOT_READY;state=${state.name}"
+        )
+    }
+
     /**
      * Returns an immutable snapshot map of current lifecycle state and delivery counters.
      */

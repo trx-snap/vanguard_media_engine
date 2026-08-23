@@ -4,7 +4,7 @@ import android.os.Handler
 import io.flutter.plugin.common.MethodChannel
 
 /**
- * Diagnostic MethodChannel coordinator for Vanguard Android True-DAG Phase 4C3D / Phase 4C3G / Phase 4C3K / Phase 4C3N / Phase 4C3Q RTC video contracts, adapters, metadata, backpressure, and frame validator.
+ * Diagnostic MethodChannel coordinator for Vanguard Android True-DAG Phase 4C3D / Phase 4C3G / Phase 4C3K / Phase 4C3N / Phase 4C3Q / Phase 4C3U RTC video contracts, adapters, metadata, backpressure, frame validator, and processed video egress.
  *
  * ## Diagnostic & Video-Only Invariants
  * - **Diagnostic Only**: Exposes synthetic RTC video contract, adapter, metadata, backpressure, and frame validator verification harnesses over MethodChannel.
@@ -24,6 +24,7 @@ class AndroidRtcVideoCoordinator(
             "runAndroidDagPhase4C3KRtcMetadataSmoke",
             "runAndroidDagPhase4C3NRtcBackpressureSmoke",
             "runAndroidDagPhase4C3QRtcFrameValidatorSmoke",
+            "runAndroidDagPhase4C3UProcessedVideoEgressSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -38,6 +39,7 @@ class AndroidRtcVideoCoordinator(
             "runAndroidDagPhase4C3KRtcMetadataSmoke" -> runRtcMetadataSmoke(args, result)
             "runAndroidDagPhase4C3NRtcBackpressureSmoke" -> runRtcBackpressureSmoke(args, result)
             "runAndroidDagPhase4C3QRtcFrameValidatorSmoke" -> runRtcFrameValidatorSmoke(args, result)
+            "runAndroidDagPhase4C3UProcessedVideoEgressSmoke" -> runProcessedVideoEgressSmoke(args, result)
             else -> return false
         }
         return true
@@ -148,6 +150,23 @@ class AndroidRtcVideoCoordinator(
             val smokeResult = RtcVideoFrameValidatorSmokeHarness.run(
                 width = width,
                 height = height,
+            )
+            mainHandler.post {
+                result.success(smokeResult)
+            }
+        }.start()
+    }
+
+    private fun runProcessedVideoEgressSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        val frameCount = (args?.get("frameCount") as? Number)?.toInt() ?: 3
+
+        Thread {
+            val smokeResult = ProcessedVideoFrameEgressSmokeHarness.run(
+                width = width,
+                height = height,
+                frameCount = frameCount,
             )
             mainHandler.post {
                 result.success(smokeResult)
