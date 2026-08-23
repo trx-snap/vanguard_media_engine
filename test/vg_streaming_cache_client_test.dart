@@ -1,5 +1,5 @@
 // vg_streaming_cache_client_test.dart
-// Vanguard Media Engine — Phase 4C6F4: public streaming cache API Dart contract tests.
+// Vanguard Media Engine — Phase 4C6F5: public streaming cache API Dart contract tests.
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -246,6 +246,29 @@ void main() {
     );
 
     test(
+      'clear returns typed unsupported result when plugin is missing without throwing',
+      () async {
+        final client = VGStreamingCacheClient(channel: unhandledChannel);
+
+        final clearResult = await client.clear();
+
+        expect(clearResult.pass, isFalse);
+        expect(clearResult.phase, equals('unsupported'));
+        expect(clearResult.state, equals('unsupported'));
+        expect(clearResult.cacheAvailable, isFalse);
+        expect(clearResult.beforeBytes, equals(0));
+        expect(clearResult.afterBytes, equals(0));
+        expect(clearResult.resourceCountBefore, equals(0));
+        expect(clearResult.removedResourceCount, equals(0));
+        expect(clearResult.failedResourceCount, equals(0));
+        expect(
+          clearResult.raw,
+          equals('status=UNSUPPORTED;platform=non-android'),
+        );
+      },
+    );
+
+    test(
       'getPrewarmStatus, cancelPrewarm, and clear return typed unsupported results when plugin is missing',
       () async {
         final client = VGStreamingCacheClient(channel: unhandledChannel);
@@ -278,44 +301,66 @@ void main() {
   // Additional status and clear route coverage
   // ─────────────────────────────────────────────────────────────────────────
   group('VGStreamingCacheClient status, prewarmStatus, cancel, clear', () {
-    test('getStatus parses successful status map', () async {
-      binaryMessenger.setMockMethodCallHandler(channel, (call) async {
-        if (call.method == 'getPlaybackCacheStatus') {
-          return <Object?, Object?>{
-            'phase': 'Phase4C6E',
-            'metricsPhase': 'Phase4C6F2',
-            'pass': true,
-            'state': 'available',
-            'cacheAvailable': true,
-            'cacheEnabled': true,
-            'cacheDir': '/data/user/0/app/cache/vanguard_playback_cache',
-            'maxCacheBytes': 536870912,
-            'cacheSpaceBytes': 12345678,
-            'resourceCount': 42,
-            'raw': 'status=OK',
-          };
-        }
-        return null;
-      });
+    test(
+      'getStatus forwards options and parses Android status metrics',
+      () async {
+        MethodCall? recordedCall;
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          recordedCall = call;
+          if (call.method == 'getPlaybackCacheStatus') {
+            return <Object?, Object?>{
+              'phase': 'Phase4C6E',
+              'metricsPhase': 'Phase4C6F2',
+              'pass': true,
+              'state': 'available',
+              'cacheAvailable': true,
+              'cacheEnabled': true,
+              'cacheDir': '/data/user/0/app/cache/vanguard_playback_cache',
+              'maxCacheBytes': 536870912,
+              'cacheSpaceBytes': 12345678,
+              'resourceCount': 42,
+              'raw': 'status=OK',
+            };
+          }
+          return null;
+        });
 
-      final client = VGStreamingCacheClient(channel: channel);
-      final status = await client.getStatus();
+        final client = VGStreamingCacheClient(channel: channel);
+        const options = VGPlaybackCacheOptions(
+          cacheEnabled: true,
+          cacheMaxBytes: 536870912,
+          cacheDirectoryName: 'vanguard_playback_cache',
+          minimumFreeBytesAfterPrewarm: 67108864,
+        );
+        final status = await client.getStatus(options: options);
 
-      expect(status.pass, isTrue);
-      expect(status.phase, equals('Phase4C6E'));
-      expect(status.metricsPhase, equals('Phase4C6F2'));
-      expect(status.state, equals('available'));
-      expect(status.cacheAvailable, isTrue);
-      expect(status.cacheEnabled, isTrue);
-      expect(
-        status.cacheDir,
-        equals('/data/user/0/app/cache/vanguard_playback_cache'),
-      );
-      expect(status.maxCacheBytes, equals(536870912));
-      expect(status.cacheSpaceBytes, equals(12345678));
-      expect(status.resourceCount, equals(42));
-      expect(status.raw, equals('status=OK'));
-    });
+        expect(recordedCall, isNotNull);
+        expect(recordedCall!.method, equals('getPlaybackCacheStatus'));
+        final callArgs = recordedCall!.arguments as Map;
+        expect(callArgs['cacheEnabled'], isTrue);
+        expect(callArgs['cacheMaxBytes'], equals(536870912));
+        expect(
+          callArgs['cacheDirectoryName'],
+          equals('vanguard_playback_cache'),
+        );
+        expect(callArgs['minimumFreeBytesAfterPrewarm'], equals(67108864));
+
+        expect(status.phase, equals('Phase4C6E'));
+        expect(status.metricsPhase, equals('Phase4C6F2'));
+        expect(status.pass, isTrue);
+        expect(status.state, equals('available'));
+        expect(status.cacheAvailable, isTrue);
+        expect(status.cacheEnabled, isTrue);
+        expect(
+          status.cacheDir,
+          equals('/data/user/0/app/cache/vanguard_playback_cache'),
+        );
+        expect(status.maxCacheBytes, equals(536870912));
+        expect(status.cacheSpaceBytes, equals(12345678));
+        expect(status.resourceCount, equals(42));
+        expect(status.raw, equals('status=OK'));
+      },
+    );
 
     test('getPrewarmStatus parses job states', () async {
       binaryMessenger.setMockMethodCallHandler(channel, (call) async {
@@ -398,8 +443,8 @@ void main() {
       final callArgs = recordedCall!.arguments as Map;
       expect(callArgs['cacheDirectoryName'], equals('test_dir'));
 
-      expect(result.pass, isTrue);
       expect(result.phase, equals('Phase4C6F'));
+      expect(result.pass, isTrue);
       expect(result.state, equals('cleared'));
       expect(result.cacheAvailable, isTrue);
       expect(result.beforeBytes, equals(10000000));
@@ -407,6 +452,7 @@ void main() {
       expect(result.resourceCountBefore, equals(15));
       expect(result.removedResourceCount, equals(15));
       expect(result.failedResourceCount, equals(0));
+      expect(result.raw, equals('status=CLEARED'));
     });
   });
 }
