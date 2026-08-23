@@ -95,6 +95,8 @@ export 'vg_timeline_live_controls.dart';
 export 'vg_timeline_audio_mix_controls.dart';
 // Phase 4C6E: public package-level streaming cache/prewarm API surface (Android-backed).
 export 'vg_streaming_cache_client.dart';
+// Phase 4C7B: public package-level adaptive streaming playback API client.
+export 'vg_streaming_playback_client.dart';
 
 const String _libName = 'vanguard_media_engine';
 
