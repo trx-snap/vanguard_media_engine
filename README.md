@@ -4,6 +4,66 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Streaming All-Up Integration Recipe
+
+The package provides an end-to-end adaptive streaming pipeline: evaluate candidate manifests with `VGStreamingPreflightClient`, generate an immutable startup plan with `VGStreamingStartupPlanner`, build validated options guided by preflight network policies, and execute playback with `VGStreamingPlaybackClient`.
+
+### Quick Start
+
+```dart
+import 'package:flutter/widgets.dart';
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+Future<void> playAdaptiveStream() async {
+  // 1. Evaluate candidate manifests via preflight client
+  final preflightClient = VGStreamingPreflightClient();
+  final preflightReport = await preflightClient.evaluate(
+    VGStreamingPreflightRequest(
+      manifests: [
+        VGStreamingManifestSpec(
+          key: 'mux_hls',
+          uri: Uri.parse('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8'),
+          formatHint: VGStreamingFormatHint.hls,
+        ),
+      ],
+      requestedNetworkProfile: VGStreamingNetworkProfile.constrained,
+    ),
+  );
+
+  // 2. Synthesize startup plan from preflight advisory report
+  final plan = VGStreamingStartupPlanner.fromPreflight(preflightReport);
+  if (!plan.shouldProceed) {
+    print('Playback aborted by startup plan: ${plan.reason}');
+    return;
+  }
+
+  // 3. Build validated playback options guided by preflight-recommended profile
+  final options = plan.buildPlaybackOptions(
+    uri: Uri.parse('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8'),
+    initialWidth: 1080,
+    initialHeight: 1920,
+    formatHint: VGStreamingFormatHint.hls,
+    autoPlay: true,
+  );
+
+  // 4. Open playback session and render to Texture widget
+  final playbackClient = VGStreamingPlaybackClient();
+  var session = await playbackClient.open(options);
+  session = await playbackClient.play(session);
+
+  // 5. Query status and lifecycle controls
+  session = await playbackClient.getStatus(session);
+  session = await playbackClient.pause(session);
+  if (session.durationMs > 0) {
+    session = await playbackClient.seek(session, 5000);
+  }
+
+  // 6. Stop and release native resources
+  session = await playbackClient.stop(session);
+  await playbackClient.dispose(session);
+}
+```
+
 ## Streaming Playback API
 
 The package exposes `VGStreamingPlaybackClient` to manage adaptive streaming media playback (HLS / DASH) rendered into Flutter `Texture` widgets. All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
