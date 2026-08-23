@@ -49,6 +49,8 @@ class AndroidDagStreamingPlaybackCoordinator(
             "startPlaybackCachePrewarm",
             "cancelPlaybackCachePrewarm",
             "getPlaybackCachePrewarmStatus",
+            // Phase 4C6F: cache lifecycle controls.
+            "clearPlaybackCache",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -83,6 +85,8 @@ class AndroidDagStreamingPlaybackCoordinator(
             "startPlaybackCachePrewarm"    -> startPlaybackCachePrewarm(args, result)
             "cancelPlaybackCachePrewarm"   -> cancelPlaybackCachePrewarm(args, result)
             "getPlaybackCachePrewarmStatus" -> getPlaybackCachePrewarmStatus(args, result)
+            // Phase 4C6F: cache lifecycle controls.
+            "clearPlaybackCache"           -> clearPlaybackCache(args, result)
 
             else -> return false
         }
@@ -708,6 +712,87 @@ class AndroidDagStreamingPlaybackCoordinator(
             putIfAbsent("pass", get("state") != "failed")
         }
         result.success(statusMap)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 4C6F: Cache lifecycle controls
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Phase 4C6F: Clears all resources from the shared playback cache.
+     *
+     * Parses optional cache config args with [parseCacheConfigForPublicApi].
+     * Runs [AndroidDagPlaybackCacheManager.clearAllCachedResources] on a background thread
+     * (never on the main thread — removeResource may be slow per Media3 docs).
+     *
+     * Returns a structured result map with:
+     *   - `phase`                 : String  — "Phase4C6F"
+     *   - `pass`                  : Boolean — true if clear completed without a fatal error.
+     *   - `state`                 : String  — "cleared" | "unavailable" | "error"
+     *   - `cacheAvailable`        : Boolean — whether the SimpleCache was initialised.
+     *   - `beforeBytes`           : Long    — cache space before clearing.
+     *   - `afterBytes`            : Long    — cache space after clearing.
+     *   - `resourceCountBefore`   : Int     — key count before clearing.
+     *   - `removedResourceCount`  : Int     — keys removed successfully.
+     *   - `failedResourceCount`   : Int     — keys that threw on removeResource.
+     *   - `raw`                   : String  — diagnostic string.
+     */
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private fun clearPlaybackCache(args: Map<*, *>?, result: MethodChannel.Result) {
+        Thread {
+            val cacheConfig = parseCacheConfigForPublicApi(args)
+            val resultMap = try {
+                val manager = AndroidDagPlaybackCacheManager.getOrCreate(context, cacheConfig)
+                if (!manager.isCacheAvailable) {
+                    mapOf(
+                        "phase"                to "Phase4C6F",
+                        "pass"                 to true,
+                        "state"                to "unavailable",
+                        "cacheAvailable"       to false,
+                        "beforeBytes"          to 0L,
+                        "afterBytes"           to 0L,
+                        "resourceCountBefore"  to 0,
+                        "removedResourceCount" to 0,
+                        "failedResourceCount"  to 0,
+                        "raw"                  to "status=OK;cacheAvailable=false;skipped=true",
+                    )
+                } else {
+                    val counts = manager.clearAllCachedResources()
+                    val failedCount = (counts["failedResourceCount"] as? Int) ?: 0
+                    val removedCount = (counts["removedResourceCount"] as? Int) ?: 0
+                    val beforeBytes = counts["beforeBytes"] ?: 0L
+                    val afterBytes = counts["afterBytes"] ?: 0L
+                    mapOf(
+                        "phase"                to "Phase4C6F",
+                        "pass"                 to true,
+                        "state"                to "cleared",
+                        "cacheAvailable"       to manager.isCacheAvailable,
+                        "beforeBytes"          to beforeBytes,
+                        "afterBytes"           to afterBytes,
+                        "resourceCountBefore"  to (counts["resourceCountBefore"] ?: 0),
+                        "removedResourceCount" to removedCount,
+                        "failedResourceCount"  to failedCount,
+                        "raw"                  to "status=OK;removed=$removedCount;failed=$failedCount;" +
+                            "beforeBytes=$beforeBytes;afterBytes=$afterBytes",
+                    )
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Phase4C6F clearPlaybackCache: error: ${t.message}", t)
+                mapOf(
+                    "phase"                to "Phase4C6F",
+                    "pass"                 to false,
+                    "state"                to "error",
+                    "cacheAvailable"       to false,
+                    "beforeBytes"          to 0L,
+                    "afterBytes"           to 0L,
+                    "resourceCountBefore"  to 0,
+                    "removedResourceCount" to 0,
+                    "failedResourceCount"  to 0,
+                    "raw"                  to "status=FAIL;reason=${t.javaClass.simpleName}:${t.message}",
+                )
+            }
+            mainHandler.post { result.success(resultMap) }
+        }.start()
     }
 
     // ─────────────────────────────────────────────────────────────────────────

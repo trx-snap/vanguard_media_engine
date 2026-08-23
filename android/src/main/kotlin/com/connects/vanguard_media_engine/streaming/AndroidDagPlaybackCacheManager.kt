@@ -253,6 +253,110 @@ class AndroidDagPlaybackCacheManager private constructor(
         )
     }
 
+    // --- Phase 4C6F: Cache lifecycle controls ---------------------------------------------------
+
+    /**
+     * Returns the current total cache space (used disk bytes) via [Cache.getCacheSpace].
+     *
+     * Safe to call from any thread (does not block the UI thread for significant time).
+     * Returns 0 if the cache is not available.
+     *
+     * Must be called from a worker thread; [getCacheSpace] may involve I/O on first call.
+     */
+    fun cacheSpaceBytes(): Long {
+        val cache = simpleCache
+        if (!isCacheAvailable || cache == null) return 0L
+        return try {
+            cache.getCacheSpace()
+        } catch (t: Throwable) {
+            Log.w(TAG, "Phase4C6F cacheSpaceBytes: getCacheSpace threw: ${t.message}", t)
+            0L
+        }
+    }
+
+    /**
+     * Returns a snapshot copy of the set of cached resource keys via [Cache.getKeys].
+     *
+     * The returned set is a defensive copy so the caller is not affected by any subsequent
+     * eviction or write to the cache index.
+     *
+     * Returns an empty set if the cache is not available.
+     *
+     * Must be called from a worker thread.
+     */
+    fun cachedResourceKeys(): Set<String> {
+        val cache = simpleCache
+        if (!isCacheAvailable || cache == null) return emptySet()
+        return try {
+            HashSet(cache.keys)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Phase4C6F cachedResourceKeys: getKeys threw: ${t.message}", t)
+            emptySet()
+        }
+    }
+
+    /**
+     * Phase 4C6F: Removes all cached resources by iterating [Cache.getKeys] and calling
+     * [Cache.removeResource] for each key.
+     *
+     * Failures on individual keys are caught and counted; they do not abort the loop.
+     * Never manually deletes cache directory contents — uses only the [Cache] API so the
+     * internal index remains coherent.
+     *
+     * Must be called from a background/worker thread — [removeResource] may be slow.
+     *
+     * @return Structured result map with keys:
+     *   - `beforeBytes`           : Long — cache space before clearing.
+     *   - `afterBytes`            : Long — cache space after clearing.
+     *   - `resourceCountBefore`   : Int  — number of keys before clearing.
+     *   - `removedResourceCount`  : Int  — keys for which [removeResource] succeeded.
+     *   - `failedResourceCount`   : Int  — keys for which [removeResource] threw.
+     */
+    fun clearAllCachedResources(): Map<String, Any?> {
+        val cache = simpleCache
+        if (!isCacheAvailable || cache == null) {
+            Log.d(TAG, "Phase4C6F clearAllCachedResources: cache not available; returning zero counts.")
+            return mapOf(
+                "beforeBytes"          to 0L,
+                "afterBytes"           to 0L,
+                "resourceCountBefore"  to 0,
+                "removedResourceCount" to 0,
+                "failedResourceCount"  to 0,
+            )
+        }
+
+        val beforeBytes = try { cache.getCacheSpace() } catch (_: Throwable) { 0L }
+        val keys = try { ArrayList(cache.keys) } catch (_: Throwable) { arrayListOf() }
+        val resourceCountBefore = keys.size
+        var removedCount = 0
+        var failedCount = 0
+
+        for (key in keys) {
+            try {
+                cache.removeResource(key)
+                removedCount++
+            } catch (t: Throwable) {
+                Log.w(TAG, "Phase4C6F clearAllCachedResources: removeResource($key) threw: ${t.message}", t)
+                failedCount++
+            }
+        }
+
+        val afterBytes = try { cache.getCacheSpace() } catch (_: Throwable) { 0L }
+
+        Log.d(
+            TAG,
+            "Phase4C6F clearAllCachedResources: before=${beforeBytes}B after=${afterBytes}B " +
+                "keys=$resourceCountBefore removed=$removedCount failed=$failedCount",
+        )
+        return mapOf(
+            "beforeBytes"          to beforeBytes,
+            "afterBytes"           to afterBytes,
+            "resourceCountBefore"  to resourceCountBefore,
+            "removedResourceCount" to removedCount,
+            "failedResourceCount"  to failedCount,
+        )
+    }
+
     // --- Private helpers ------------------------------------------------------------------------
 
     /**

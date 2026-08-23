@@ -355,6 +355,94 @@ class VGPlaybackPrewarmCancelResult {
       'requestId=$requestId, state=$state)';
 }
 
+/// Result of [VGStreamingCacheClient.clear].
+///
+/// Phase 4C6F: returned by the `clearPlaybackCache` MethodChannel route.
+class VGPlaybackCacheClearResult {
+  /// Always `"Phase4C6F"` on Android; `"unsupported"` on iOS/other.
+  final String phase;
+
+  /// Whether the clear operation completed without a fatal error.
+  ///
+  /// `true` even when [cacheAvailable] is `false` (nothing to clear is still
+  /// a successful no-op per contract).
+  final bool pass;
+
+  /// Lifecycle state: `"cleared"`, `"unavailable"`, `"error"`, or `"unsupported"`.
+  final String state;
+
+  /// Whether the Android SimpleCache was successfully initialised.
+  final bool cacheAvailable;
+
+  /// Cache space in bytes before clearing.
+  final int beforeBytes;
+
+  /// Cache space in bytes after clearing.
+  final int afterBytes;
+
+  /// Number of resource keys present before clearing.
+  final int resourceCountBefore;
+
+  /// Number of keys for which [Cache.removeResource] succeeded.
+  final int removedResourceCount;
+
+  /// Number of keys for which [Cache.removeResource] threw.
+  final int failedResourceCount;
+
+  /// Raw diagnostic string from the platform.
+  final String raw;
+
+  const VGPlaybackCacheClearResult({
+    required this.phase,
+    required this.pass,
+    required this.state,
+    required this.cacheAvailable,
+    required this.beforeBytes,
+    required this.afterBytes,
+    required this.resourceCountBefore,
+    required this.removedResourceCount,
+    required this.failedResourceCount,
+    required this.raw,
+  });
+
+  factory VGPlaybackCacheClearResult.fromMap(Map<Object?, Object?> m) {
+    return VGPlaybackCacheClearResult(
+      phase: m['phase'] as String? ?? 'Phase4C6F',
+      pass: m['pass'] as bool? ?? false,
+      state: m['state'] as String? ?? 'unknown',
+      cacheAvailable: m['cacheAvailable'] as bool? ?? false,
+      beforeBytes: (m['beforeBytes'] as num?)?.toInt() ?? 0,
+      afterBytes: (m['afterBytes'] as num?)?.toInt() ?? 0,
+      resourceCountBefore: (m['resourceCountBefore'] as num?)?.toInt() ?? 0,
+      removedResourceCount: (m['removedResourceCount'] as num?)?.toInt() ?? 0,
+      failedResourceCount: (m['failedResourceCount'] as num?)?.toInt() ?? 0,
+      raw: m['raw'] as String? ?? '',
+    );
+  }
+
+  /// Returned when the native plugin is not available (e.g. iOS).
+  factory VGPlaybackCacheClearResult.unsupported() =>
+      const VGPlaybackCacheClearResult(
+        phase: 'unsupported',
+        pass: false,
+        state: 'unsupported',
+        cacheAvailable: false,
+        beforeBytes: 0,
+        afterBytes: 0,
+        resourceCountBefore: 0,
+        removedResourceCount: 0,
+        failedResourceCount: 0,
+        raw: 'status=UNSUPPORTED;platform=non-android',
+      );
+
+  @override
+  String toString() =>
+      'VGPlaybackCacheClearResult(phase=$phase, pass=$pass, state=$state, '
+      'cacheAvailable=$cacheAvailable, beforeBytes=$beforeBytes, '
+      'afterBytes=$afterBytes, removed=$removedResourceCount, '
+      'failed=$failedResourceCount)';
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Public client
 // ─────────────────────────────────────────────────────────────────────────────
@@ -478,6 +566,35 @@ class VGStreamingCacheClient {
       );
     } on MissingPluginException {
       return VGPlaybackPrewarmCancelResult.unsupported(requestId);
+    }
+  }
+
+  /// Phase 4C6F: Clears all resources from the Android streaming playback cache.
+  ///
+  /// Calls the `clearPlaybackCache` MethodChannel route on the Android backend.
+  /// The operation runs on a background thread; this future resolves when the
+  /// clear is complete.
+  ///
+  /// Returns a [VGPlaybackCacheClearResult] with counts and byte measurements.
+  /// On platforms where the plugin is not installed (e.g. iOS), silently catches
+  /// [MissingPluginException] and returns [VGPlaybackCacheClearResult.unsupported].
+  ///
+  /// [options] — optional cache configuration (directory, max bytes, enabled flag).
+  /// Defaults to `cacheEnabled=true` to match the backend's public API default.
+  Future<VGPlaybackCacheClearResult> clear({
+    VGPlaybackCacheOptions options = const VGPlaybackCacheOptions(),
+  }) async {
+    try {
+      final raw = await _channel.invokeMethod<Object?>(
+        'clearPlaybackCache',
+        options.toArgs(),
+      );
+      if (raw is! Map) {
+        return VGPlaybackCacheClearResult.unsupported();
+      }
+      return VGPlaybackCacheClearResult.fromMap(raw.cast<Object?, Object?>());
+    } on MissingPluginException {
+      return VGPlaybackCacheClearResult.unsupported();
     }
   }
 }
