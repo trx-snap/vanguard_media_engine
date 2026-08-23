@@ -4,6 +4,93 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Cached Streaming Playback All-Up Integration Recipe
+
+The package provides end-to-end composition across bounded cache prewarming, manifest preflight capability evaluation, startup decision planning, session-safe controller management, and presentation via `VGStreamingPlaybackTextureView`.
+
+### Quick Start
+
+```dart
+import 'package:flutter/material.dart';
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+Future<void> prewarmAndPlayCachedStream() async {
+  // 1. Define candidate stream sources with cache options
+  final sourceSet = VGStreamingSourceSet(
+    sources: [
+      VGStreamingSourceDescriptor(
+        key: 'hls',
+        uri: Uri.parse('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8'),
+        formatHint: VGStreamingFormatHint.hls,
+        initialWidth: 1080,
+        initialHeight: 1920,
+        cacheOptions: const VGPlaybackCacheOptions(cacheEnabled: true),
+      ),
+      VGStreamingSourceDescriptor(
+        key: 'dash',
+        uri: Uri.parse(
+          'https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd',
+        ),
+        formatHint: VGStreamingFormatHint.dash,
+        initialWidth: 1080,
+        initialHeight: 1920,
+        cacheOptions: const VGPlaybackCacheOptions(cacheEnabled: true),
+      ),
+    ],
+  );
+
+  // 2. Synthesize and dispatch bounded cache prewarm request
+  final cacheClient = VGStreamingCacheClient();
+  final prewarmPlan = VGStreamingCachePrewarmPlanner.planForSourceSet(
+    sourceSet: sourceSet,
+    requestIdPrefix: 'feed_prewarm',
+    sourceKeys: const ['hls'],
+    maxBytes: 2 * 1024 * 1024,
+    lowLatencyPolicy: VGStreamingCachePrewarmLowLatencyPolicy.skipLowLatency,
+  );
+
+  if (prewarmPlan.requests.isNotEmpty) {
+    await cacheClient.prewarmRequest(prewarmPlan.requests.first);
+  }
+
+  // 3. Evaluate preflight capabilities under network constraints
+  final preflightClient = VGStreamingPreflightClient();
+  final preflightReport = await preflightClient.evaluate(
+    sourceSet.toPreflightRequest(
+      requestedNetworkProfile: VGStreamingNetworkProfile.constrained,
+    ),
+  );
+
+  // 4. Plan playback decision using pure-Dart planner
+  final decision = VGStreamingPlaybackDecisionPlanner.plan(
+    VGStreamingPlaybackDecisionRequest(
+      sourceSet: sourceSet,
+      preflightReport: preflightReport,
+      preference: VGStreamingSourceSelectionPreference.preserveOrder,
+      preferredKeys: const ['hls'],
+    ),
+  );
+
+  // 5. Open session via playback controller
+  final controller = VGStreamingPlaybackController();
+  final snapshot = await controller.open(decision, startPlayback: true);
+
+  if (!snapshot.pass || snapshot.textureId == null) {
+    print('Playback failed to open: ${snapshot.reason}');
+    return;
+  }
+
+  // 6. Presentation via VGStreamingPlaybackTextureView
+  // (e.g. VGStreamingPlaybackTextureView(snapshot: snapshot))
+
+  // 7. Control media lifecycle
+  await controller.pause();
+  await controller.play();
+  await controller.stop();
+  await controller.dispose();
+}
+```
+
 ## Streaming Playback Texture View Widget Recipe
 
 The package exposes `VGStreamingPlaybackTextureView` as a presentation-only Flutter widget that renders the active session texture from a `VGStreamingPlaybackControllerSnapshot`. It automatically manages aspect ratio preservation via `FittedBox`, letterboxing/pillarboxing background color, placeholder builder, and error builder callbacks.
