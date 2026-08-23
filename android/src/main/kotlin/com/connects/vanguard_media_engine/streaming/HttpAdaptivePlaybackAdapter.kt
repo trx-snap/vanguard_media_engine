@@ -149,10 +149,15 @@ class HttpAdaptivePlaybackAdapter(
     /**
      * Bridges Media3 [Player.Listener] events into typed [HttpAdaptivePlaybackState] transitions.
      * All callbacks execute on the HandlerThread (guaranteed by `setLooper` during player build).
+     *
+     * Every callback starts with an early [released] guard (invariant 6): any callback that
+     * arrives after terminal release has begun is silently ignored.
      */
     private val playerListener = object : Player.Listener {
 
         override fun onPlaybackStateChanged(playbackState: Int) {
+            // Invariant 6: ignore late callbacks after terminal release has been requested.
+            if (released.get()) return
             val p = player ?: return
             when (playbackState) {
                 Player.STATE_BUFFERING -> {
@@ -202,6 +207,8 @@ class HttpAdaptivePlaybackAdapter(
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
+            // Invariant 6: ignore late callbacks after terminal release has been requested.
+            if (released.get()) return
             val p = player ?: return
             if (isPlaying) {
                 emitState(
@@ -226,6 +233,8 @@ class HttpAdaptivePlaybackAdapter(
         }
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
+            // Invariant 6: ignore late callbacks after terminal release has been requested.
+            if (released.get()) return
             val newWidth = videoSize.width
             val newHeight = videoSize.height
 
@@ -255,6 +264,8 @@ class HttpAdaptivePlaybackAdapter(
         }
 
         override fun onPlayerError(error: PlaybackException) {
+            // Invariant 6: ignore late error callbacks after terminal release has been requested.
+            if (released.get()) return
             val msg = "errorCode=${error.errorCode}; ${error.message ?: "unknown"}"
             val failedState = HttpAdaptivePlaybackState.Failed(
                 errorCode = error.errorCode,
@@ -551,11 +562,20 @@ class HttpAdaptivePlaybackAdapter(
      * Releases all resources.  Terminal and idempotent.
      *
      * Release order (executed on the HandlerThread):
-     * 1. `player.setVideoSurface(null)` - detach surface before decoder teardown.
-     * 2. `player.stop()` - cancel active network loaders and buffer allocations.
-     * 3. `player.release()` - destroy MediaCodec decoders and audio sinks.
-     * 4. Release headless bridge (closes ImageReader and its internal surface).
-     * 5. `handlerThread.quitSafely()` - shut down the dedicated Looper.
+     * 1. `player.setVideoSurface(null)` — detach surface before decoder teardown.
+     * 2. `player.removeListener(playerListener)` — unregister before stop/release (invariant 5).
+     * 3. `player.stop()` — cancel active network loaders and buffer allocations.
+     * 4. `player.release()` — destroy MediaCodec decoders and audio sinks.
+     * 5. Release headless bridge (closes ImageReader and its internal surface).
+     * 6. `handler.removeCallbacksAndMessages(null)` — drain any queued adapter work that was
+     *    posted before release() but has not yet executed (invariant 8).  The release runnable
+     *    itself is already executing at this point, so removal only affects later posts.
+     * 7. Emit [HttpAdaptivePlaybackState.Released] exactly once (invariant 7).
+     * 8. Schedule [handlerThread.quitSafely()] behind a [RELEASE_LOOPER_SHUTDOWN_GRACE_MS] grace
+     *    delay so that Media3's own ListenerSet release callbacks (dispatched via
+     *    `sendAtFrontOfQueue` onto the ExoPlayer application looper) can finish draining before
+     *    the Looper is torn down.  The grace period is cleanup-only: `released=true` already
+     *    makes all public methods permanent no-ops, so no new adapter work will be posted.
      *
      * Safe to call from any thread.  Subsequent calls are no-ops.
      */
@@ -563,13 +583,29 @@ class HttpAdaptivePlaybackAdapter(
         if (!released.compareAndSet(false, true)) return // idempotent guard
         handler.post {
             tearDownPlayerOnHandlerThread()
-            // Full release: clear surface reference so it cannot be rebound by any lingering post.
+            // Full release: clear all pending references that could be rebound by queued work.
+            // Invariant 8: drain surface, seek, config, and output references.
             pendingSurface = null
+            pendingSeekMs = null
+            activeConfig = null
             // Release the headless bridge after player teardown (player is already detached in
             // tearDownPlayerOnHandlerThread).
             releaseHeadlessBridgeOnHandlerThread()
+            // Drain any queued adapter work (play/pause/seek/setSurface posts) that was enqueued
+            // before release() ran but has not yet executed.  The current runnable (this block)
+            // is executing now, so removeCallbacksAndMessages only drops later queued entries.
+            // This prevents them from posting to a dead HandlerThread after quitSafely().
+            handler.removeCallbacksAndMessages(null)
             emitState(HttpAdaptivePlaybackState.Released)
-            handlerThread.quitSafely()
+            // Defer looper shutdown by a brief grace period so that Media3 ListenerSet events
+            // queued via sendAtFrontOfQueue onto this looper (during player.release() codec
+            // teardown) can drain without triggering "Handler on a dead thread" warnings.
+            // The adapter is already fully terminal at this point (released=true); this delay
+            // only affects the looper lifetime, not any observable adapter behaviour.
+            handler.postDelayed(
+                { handlerThread.quitSafely() },
+                RELEASE_LOOPER_SHUTDOWN_GRACE_MS,
+            )
         }
     }
 
@@ -596,10 +632,13 @@ class HttpAdaptivePlaybackAdapter(
 
         // 1. Detach surface before any decoder teardown (covers both external and bridge surfaces).
         p.setVideoSurface(null)
-        // 2. Cancel active network loaders / buffer allocations.
-        p.stop()
-        // 3. Destroy MediaCodec decoders and audio sinks.
+        // 2. Unregister listener BEFORE stop/release so that STATE_IDLE, STATE_ERROR, and any
+        //    other terminal ExoPlayer callbacks cannot fire back into adapter state.
+        //    Invariant 5: listener must be removed before stop() can emit stop/idle/error events.
         p.removeListener(playerListener)
+        // 3. Cancel active network loaders / buffer allocations.
+        p.stop()
+        // 4. Destroy MediaCodec decoders and audio sinks.
         p.release()
         // HandlerThread quitSafely() is called separately in release() after emitting Released.
     }
@@ -636,8 +675,12 @@ class HttpAdaptivePlaybackAdapter(
     /**
      * Emits [newState] to the listener and updates [currentState].
      * Must only be called from the HandlerThread.
+     *
+     * Once [released] is true, only [HttpAdaptivePlaybackState.Released] may be forwarded to the
+     * listener.  Any other state is silently dropped (invariant 7).
      */
     private fun emitState(newState: HttpAdaptivePlaybackState) {
+        if (released.get() && newState !is HttpAdaptivePlaybackState.Released) return
         currentState = newState
         listener.onStateChanged(newState)
     }
@@ -708,5 +751,16 @@ class HttpAdaptivePlaybackAdapter(
     companion object {
         /** Monotonically increasing counter used to produce unique HandlerThread names. */
         private val nextId: AtomicLong = AtomicLong(0L)
+
+        /**
+         * Grace period (ms) between emitting [HttpAdaptivePlaybackState.Released] and calling
+         * [HandlerThread.quitSafely].  Media3's [androidx.media3.common.util.ListenerSet] posts
+         * release callbacks via `sendAtFrontOfQueue` onto the ExoPlayer application looper after
+         * [ExoPlayer.release] returns.  Quitting the looper immediately causes those posts to hit
+         * a dead thread, producing logcat warnings.  A 500 ms window is ample for codec teardown
+         * callbacks to drain; the adapter itself is fully terminal (released=true) well before
+         * this fires.
+         */
+        private const val RELEASE_LOOPER_SHUTDOWN_GRACE_MS = 500L
     }
 }
