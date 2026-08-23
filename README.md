@@ -4,6 +4,79 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Streaming Playback Controller Facade Recipe
+
+The package exposes `VGStreamingPlaybackController` as a bounded, session-safe Dart facade over `VGStreamingPlaybackClient` and `VGStreamingPlaybackDecision`. It serializes operations with a private busy guard, owns exactly one active playback session at a time, and provides high-level control (`open`, `play`, `pause`, `seek`, `refresh`, `stop`, `dispose`).
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+Future<void> controlStreamingPlayback() async {
+  // 1. Define candidate stream sources in a source set
+  final sourceSet = VGStreamingSourceSet(
+    sources: [
+      VGStreamingSourceDescriptor(
+        key: 'primary_hls',
+        uri: Uri.parse('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8'),
+        formatHint: VGStreamingFormatHint.hls,
+        initialWidth: 1080,
+        initialHeight: 1920,
+      ),
+      VGStreamingSourceDescriptor(
+        key: 'backup_dash',
+        uri: Uri.parse(
+          'https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd',
+        ),
+        formatHint: VGStreamingFormatHint.dash,
+        initialWidth: 1080,
+        initialHeight: 1920,
+      ),
+    ],
+  );
+
+  // 2. Synthesize preflight request from source set and evaluate
+  final preflightClient = VGStreamingPreflightClient();
+  final preflightReport = await preflightClient.evaluate(
+    sourceSet.toPreflightRequest(
+      requestedNetworkProfile: VGStreamingNetworkProfile.constrained,
+    ),
+  );
+
+  // 3. Plan playback decision using pure-Dart planner
+  final decision = VGStreamingPlaybackDecisionPlanner.plan(
+    VGStreamingPlaybackDecisionRequest(
+      sourceSet: sourceSet,
+      preflightReport: preflightReport,
+      preference: VGStreamingSourceSelectionPreference.preserveOrder,
+      preferredKeys: const ['primary_hls'],
+    ),
+  );
+
+  // 4. Create controller and open session
+  final controller = VGStreamingPlaybackController();
+  final snapshot = await controller.open(decision, startPlayback: true);
+
+  if (!snapshot.pass || snapshot.textureId == null) {
+    print('Playback failed to open: ${snapshot.reason}');
+    return;
+  }
+
+  // Render Texture(textureId: snapshot.textureId!) in Flutter widget tree
+
+  // 5. Control playback
+  await controller.pause();
+  await controller.seek(5000);
+  await controller.play();
+  await controller.refresh();
+  await controller.stop();
+
+  // 6. Release resources
+  await controller.dispose();
+}
+```
+
 ## Streaming Playback Decision Planner Recipe
 
 The package exposes `VGStreamingPlaybackDecisionPlanner` to combine preflight advisories (`VGStreamingPreflightReport`), startup plans (`VGStreamingStartupPlan`), and source selection (`VGStreamingSourceSelector`) into a single immutable app-facing decision object (`VGStreamingPlaybackDecision`).
