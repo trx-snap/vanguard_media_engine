@@ -4,6 +4,66 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Streaming Playback API
+
+The package exposes `VGStreamingPlaybackClient` to manage adaptive streaming media playback (HLS / DASH) rendered into Flutter `Texture` widgets. All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
+
+### Quick Start
+
+```dart
+import 'package:flutter/widgets.dart';
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+// 1. Instantiate the streaming playback client
+final client = VGStreamingPlaybackClient();
+
+// 2. Open an adaptive stream session
+var session = await client.open(
+  VGStreamingPlaybackOptions(
+    uri: Uri.parse('https://cdn.example.com/live/master.m3u8'),
+    initialWidth: 1080,
+    initialHeight: 1920,
+    formatHint: VGStreamingFormatHint.hls,
+    networkProfile: VGStreamingNetworkProfile.auto,
+    autoPlay: true,
+    cacheOptions: const VGPlaybackCacheOptions(
+      cacheEnabled: true,
+      cacheMaxBytes: 512 * 1024 * 1024,
+    ),
+  ),
+);
+
+// 3. Render video frames onto a Flutter texture
+Widget buildVideoWidget(VGStreamingPlaybackSession session) {
+  return Texture(textureId: session.textureId);
+}
+
+// 4. Playback controls
+session = await client.pause(session);
+session = await client.play(session);
+session = await client.seek(session, 15000); // Seek to 15s
+
+// 5. Query playback diagnostics and status
+session = await client.getStatus(session);
+print('State: ${session.state}, Position: ${session.positionMs}ms / ${session.durationMs}ms');
+
+// 6. Stop and release native resources
+session = await client.stop(session);
+await client.dispose(session);
+```
+
+### Supported Formats
+
+- **Android**: Full native Media3 adaptive streaming backend supporting HLS, Apple LL-HLS via `VGStreamingFormatHint.hls`, and DASH (`VGStreamingFormatHint.dash`).
+- **iOS**: The public Dart API is safe to import on iOS, but native streaming playback backend is not yet implemented (returns typed unsupported session objects). Future AVPlayer HLS/LL-HLS parity is planned; iOS DASH remains deferred.
+
+### Boundaries & Guidelines
+
+- **No Direct Channel Access**: Do not call raw `MethodChannel` from ConnectsApp; always use `VGStreamingPlaybackClient`.
+- **Decoupled Cache Policy**: Direct playback should not be blocked by cache/prewarm policy or storage guards.
+- **Scope Exclusion**: WebRTC and LiveKit interactive rooms and room audio are outside this HTTP playback API.
+- **Physical Proof Status**: The current public physical smoke target exists, but physical proof is pending device visibility.
+
 ## Streaming Cache API
 
 The package exposes `VGStreamingCacheClient` to manage media prewarming and caching for streaming video/audio playback.
