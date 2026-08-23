@@ -41,6 +41,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C5DManifestPolicyValidation",
             "runAndroidDagPhase4C5ECompatibilityDecisionSmoke",
             "runAndroidDagPhase4C5GPreflightAdvisorySmoke",
+            "evaluateStreamingPreflightAdvisory",
             "runAndroidDagPhase4C6BPlaybackCacheBackendSmoke",
             "runAndroidDagPhase4C6CPrewarmSmoke",
             "runAndroidDagPhase4C6DCacheHitSmoke",
@@ -76,7 +77,8 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C5CManifestRenditionSmoke" -> runAdaptiveStreamingManifestRenditionSmoke(result)
             "runAndroidDagPhase4C5DManifestPolicyValidation" -> runAdaptiveStreamingManifestPolicyValidation(args, result)
             "runAndroidDagPhase4C5ECompatibilityDecisionSmoke" -> runAdaptiveStreamingCompatibilityDecisionSmoke(args, result)
-            "runAndroidDagPhase4C5GPreflightAdvisorySmoke" -> runAdaptiveStreamingPreflightAdvisorySmoke(args, result)
+            "runAndroidDagPhase4C5GPreflightAdvisorySmoke",
+            "evaluateStreamingPreflightAdvisory" -> runAdaptiveStreamingPreflightAdvisorySmoke(args, result)
             "runAndroidDagPhase4C6BPlaybackCacheBackendSmoke" -> runAndroidDagPhase4C6BPlaybackCacheBackendSmoke(result)
             "runAndroidDagPhase4C6CPrewarmSmoke" -> runAndroidDagPhase4C6CPrewarmSmoke(args, result)
             "runAndroidDagPhase4C6DCacheHitSmoke" -> runAndroidDagPhase4C6DCacheHitSmoke(args, result)
