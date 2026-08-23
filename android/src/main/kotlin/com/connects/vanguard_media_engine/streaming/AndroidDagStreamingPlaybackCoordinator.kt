@@ -513,9 +513,10 @@ class AndroidDagStreamingPlaybackCoordinator(
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Phase 4C6E: Returns a diagnostic status map for the streaming cache backend.
+     * Phase 4C6E / Phase 4C6F2: Returns a diagnostic status map for the streaming cache backend.
      *
      * Parses optional cache config args (`cacheEnabled`, `cacheMaxBytes`, `cacheDirectoryName`).
+     * Returns cache space and resource count metrics (Phase 4C6F2).
      * Never throws; always returns a structured result via [result.success].
      */
     @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
@@ -525,27 +526,36 @@ class AndroidDagStreamingPlaybackCoordinator(
             val statusMap = try {
                 val manager = AndroidDagPlaybackCacheManager.getOrCreate(context, cacheConfig)
                 val diag = manager.diagnosticStatus()
+                val spaceBytes = (diag["cacheSpaceBytes"] as? Long) ?: manager.cacheSpaceBytes()
+                val resCount = (diag["resourceCount"] as? Int) ?: manager.cachedResourceKeys().size
                 mapOf(
-                    "phase"          to "Phase4C6E",
-                    "pass"           to true,
-                    "state"          to "available",
-                    "cacheAvailable" to manager.isCacheAvailable,
-                    "cacheEnabled"   to cacheConfig.enabled,
-                    "cacheDir"       to diag["cacheDir"],
-                    "maxCacheBytes"  to diag["maxCacheBytes"],
-                    "cachedBytes"    to diag["cachedBytes"],
-                    "raw"            to "status=OK;cacheEnabled=${cacheConfig.enabled}" +
-                        ";cacheAvailable=${manager.isCacheAvailable}",
+                    "phase"           to "Phase4C6E",
+                    "metricsPhase"    to "Phase4C6F2",
+                    "pass"            to true,
+                    "state"           to "available",
+                    "cacheAvailable"  to manager.isCacheAvailable,
+                    "cacheEnabled"    to cacheConfig.enabled,
+                    "cacheDir"        to diag["cacheDir"],
+                    "maxCacheBytes"   to diag["maxCacheBytes"],
+                    "cachedBytes"     to diag["cachedBytes"],
+                    "cacheSpaceBytes" to spaceBytes,
+                    "resourceCount"   to resCount,
+                    "raw"             to "status=OK;cacheEnabled=${cacheConfig.enabled}" +
+                        ";cacheAvailable=${manager.isCacheAvailable}" +
+                        ";cacheSpaceBytes=$spaceBytes;resourceCount=$resCount",
                 )
             } catch (t: Throwable) {
                 Log.w(TAG, "Phase4C6E getPlaybackCacheStatus: error: ${t.message}", t)
                 mapOf(
-                    "phase"          to "Phase4C6E",
-                    "pass"           to false,
-                    "state"          to "error",
-                    "cacheAvailable" to false,
-                    "cacheEnabled"   to cacheConfig.enabled,
-                    "raw"            to "status=FAIL;reason=${t.javaClass.simpleName}:${t.message}",
+                    "phase"           to "Phase4C6E",
+                    "metricsPhase"    to "Phase4C6F2",
+                    "pass"            to false,
+                    "state"           to "error",
+                    "cacheAvailable"  to false,
+                    "cacheEnabled"    to cacheConfig.enabled,
+                    "cacheSpaceBytes" to 0L,
+                    "resourceCount"   to 0,
+                    "raw"             to "status=FAIL;reason=${t.javaClass.simpleName}:${t.message}",
                 )
             }
             mainHandler.post { result.success(statusMap) }

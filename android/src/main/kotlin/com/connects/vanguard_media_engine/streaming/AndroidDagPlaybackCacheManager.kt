@@ -240,8 +240,12 @@ class AndroidDagPlaybackCacheManager private constructor(
      *                                  [SimpleCache.getCachedBytes] requires a [DataSpec] and is
      *                                  deferred to Phase 4C6B physical verification; reporting
      *                                  "not_available" is honest per the spec).
+     * - `cacheSpaceBytes` : Long    — total disk space consumed by cached spans (Phase 4C6F2).
+     * - `resourceCount`   : Int     — number of distinct cached resource keys (Phase 4C6F2).
      */
     fun diagnosticStatus(): Map<String, Any?> {
+        val space = cacheSpaceBytes()
+        val count = cachedResourceKeys().size
         return mapOf(
             "cacheEnabled" to config.enabled,
             "cacheAvailable" to isCacheAvailable,
@@ -250,6 +254,8 @@ class AndroidDagPlaybackCacheManager private constructor(
             // Per the implementation spec: if reliable per-URL estimation is not straightforward,
             // report not_available without claiming hit proof.
             "cachedBytes" to "not_available",
+            "cacheSpaceBytes" to space,
+            "resourceCount" to count,
         )
     }
 

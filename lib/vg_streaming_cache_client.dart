@@ -51,6 +51,9 @@ class VGPlaybackCacheStatus {
   /// Always `"Phase4C6E"` on Android; `"unsupported"` on iOS/other.
   final String phase;
 
+  /// Metrics phase identifier, e.g. `"Phase4C6F2"`, or `null`.
+  final String? metricsPhase;
+
   /// Whether the call succeeded.
   final bool pass;
 
@@ -69,29 +72,41 @@ class VGPlaybackCacheStatus {
   /// Configured maximum cache size in bytes, or `null`.
   final int? maxCacheBytes;
 
+  /// Total cache space used in bytes on the Android backend, or 0 if unavailable/unsupported.
+  final int cacheSpaceBytes;
+
+  /// Number of distinct cached resources currently indexed on Android, or 0 if unavailable/unsupported.
+  final int resourceCount;
+
   /// Raw diagnostic string from the platform.
   final String raw;
 
   const VGPlaybackCacheStatus({
     required this.phase,
+    this.metricsPhase,
     required this.pass,
     required this.state,
     required this.cacheAvailable,
     required this.cacheEnabled,
     this.cacheDir,
     this.maxCacheBytes,
+    this.cacheSpaceBytes = 0,
+    this.resourceCount = 0,
     required this.raw,
   });
 
   factory VGPlaybackCacheStatus.fromMap(Map<Object?, Object?> m) {
     return VGPlaybackCacheStatus(
       phase: m['phase'] as String? ?? 'Phase4C6E',
+      metricsPhase: m['metricsPhase'] as String?,
       pass: m['pass'] as bool? ?? false,
       state: m['state'] as String? ?? 'unknown',
       cacheAvailable: m['cacheAvailable'] as bool? ?? false,
       cacheEnabled: m['cacheEnabled'] as bool? ?? false,
       cacheDir: m['cacheDir'] as String?,
       maxCacheBytes: (m['maxCacheBytes'] as num?)?.toInt(),
+      cacheSpaceBytes: (m['cacheSpaceBytes'] as num?)?.toInt() ?? 0,
+      resourceCount: (m['resourceCount'] as num?)?.toInt() ?? 0,
       raw: m['raw'] as String? ?? '',
     );
   }
@@ -103,13 +118,16 @@ class VGPlaybackCacheStatus {
     state: 'unsupported',
     cacheAvailable: false,
     cacheEnabled: false,
+    cacheSpaceBytes: 0,
+    resourceCount: 0,
     raw: 'status=UNSUPPORTED;platform=non-android',
   );
 
   @override
   String toString() =>
       'VGPlaybackCacheStatus(phase=$phase, pass=$pass, state=$state, '
-      'cacheAvailable=$cacheAvailable, cacheEnabled=$cacheEnabled)';
+      'cacheAvailable=$cacheAvailable, cacheEnabled=$cacheEnabled, '
+      'cacheSpaceBytes=$cacheSpaceBytes, resourceCount=$resourceCount)';
 }
 
 /// Accepted prewarm start states from the Android coordinator.
