@@ -1,4 +1,4 @@
-// Copyright (c) Connects — Vanguard Phase 4C3V.
+// Copyright (c) Connects — Vanguard Phase 4C3Y.
 // Public package-level RTC video diagnostics API client for Android True-DAG backend.
 //
 // Invariants:
@@ -133,7 +133,7 @@ class VGRtcVideoDiagnosticsCheckResult {
 
 /// Comprehensive report aggregating all seven Android RTC diagnostic routes.
 class VGRtcVideoDiagnosticsReport {
-  /// Diagnostic phase identifier (e.g. 'Phase4C3V' or 'unsupported').
+  /// Diagnostic phase identifier (e.g. 'Phase4C3Y' or 'unsupported').
   final String phase;
 
   /// Whether all seven RTC checks passed.
@@ -158,7 +158,7 @@ class VGRtcVideoDiagnosticsReport {
   final Map<String, dynamic> diagnostics;
 
   const VGRtcVideoDiagnosticsReport({
-    this.phase = 'Phase4C3V',
+    this.phase = 'Phase4C3Y',
     required this.pass,
     this.videoOnlyBoundaryPreserved = true,
     this.roomAudioBoundaryPreserved = true,
@@ -227,7 +227,7 @@ class VGRtcVideoDiagnosticsReport {
 // Public Diagnostics Client
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Phase 4C3V: Public Dart client for Android True-DAG RTC video diagnostics.
+/// Phase 4C3Y: Public Dart client for Android True-DAG RTC video diagnostics.
 ///
 /// Dispatches calls to all seven native Android RTC diagnostic MethodChannel routes:
 /// 1. `runAndroidDagPhase4C3DRtcContractSmoke` (Phase 4C3D: RTC video contracts)
@@ -350,7 +350,7 @@ class VGRtcVideoDiagnosticsClient {
     }
 
     return VGRtcVideoDiagnosticsReport(
-      phase: 'Phase4C3V',
+      phase: 'Phase4C3Y',
       pass: allPass,
       videoOnlyBoundaryPreserved: true,
       roomAudioBoundaryPreserved: true,

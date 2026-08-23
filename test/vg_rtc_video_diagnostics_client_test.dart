@@ -1,4 +1,4 @@
-// Copyright (c) Connects — Vanguard Phase 4C3V.
+// Copyright (c) Connects — Vanguard Phase 4C3Y.
 // Unit tests for public RTC video diagnostics client.
 
 import 'package:flutter/services.dart';
@@ -148,7 +148,7 @@ void main() {
       );
 
       final report = VGRtcVideoDiagnosticsReport(
-        phase: 'Phase4C3V',
+        phase: 'Phase4C3Y',
         pass: true,
         videoOnlyBoundaryPreserved: true,
         roomAudioBoundaryPreserved: true,
@@ -166,7 +166,7 @@ void main() {
         diagnostics: {'allPass': true},
       );
 
-      expect(report.phase, 'Phase4C3V');
+      expect(report.phase, 'Phase4C3Y');
       expect(report.pass, true);
       expect(report.videoOnlyBoundaryPreserved, true);
       expect(report.roomAudioBoundaryPreserved, true);
