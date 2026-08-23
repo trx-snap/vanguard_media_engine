@@ -94,4 +94,11 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer-hls:1.11.0")
     implementation("androidx.media3:media3-exoplayer-dash:1.11.0")
     implementation("androidx.media3:media3-common:1.11.0")
+
+    // -- Phase 4C6B: Media3 read-through playback cache substrate --
+    // media3-datasource : CacheDataSource, CacheDataSource.Factory, DefaultHttpDataSource
+    // media3-database   : StandaloneDatabaseProvider (SQLite-backed SimpleCache index)
+    // Both pinned to the same 1.11.0 stable line as all other media3 artifacts above.
+    implementation("androidx.media3:media3-datasource:1.11.0")
+    implementation("androidx.media3:media3-database:1.11.0")
 }

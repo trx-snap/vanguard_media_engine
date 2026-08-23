@@ -1,5 +1,6 @@
 // Copyright (c) Connects - Phase 4C1B: HttpAdaptivePlaybackAdapter scaffold.
 // Phase 4C5B: Added networkProfile for streaming network policy selection.
+// Phase 4C6B: Added optional cacheConfig for Android Media3 read-through cache substrate.
 
 package com.connects.vanguard_media_engine.streaming
 
@@ -39,6 +40,10 @@ enum class AdaptiveStreamFormat {
  *                       applied to the ExoPlayer instance built in [HttpAdaptivePlaybackAdapter].
  *                       Defaults to [AdaptiveStreamingNetworkProfile.AUTO], which preserves all
  *                       Media3 ExoPlayer defaults (no custom LoadControl or TrackSelector).
+ * @param cacheConfig    Optional Android Media3 read-through cache configuration (Phase 4C6B).
+ *                       Defaults to [AndroidDagPlaybackCacheConfig] with `enabled = false`, which
+ *                       preserves all pre-4C6B playback behaviour; existing callers that do not
+ *                       pass this parameter compile and behave identically to before.
  */
 data class HttpAdaptiveStreamConfig(
     val uri: String,
@@ -47,6 +52,7 @@ data class HttpAdaptiveStreamConfig(
     val startPositionMs: Long? = null,
     val autoPlay: Boolean = true,
     val networkProfile: AdaptiveStreamingNetworkProfile = AdaptiveStreamingNetworkProfile.AUTO,
+    val cacheConfig: AndroidDagPlaybackCacheConfig = AndroidDagPlaybackCacheConfig(),
 ) {
     init {
         require(uri.isNotBlank()) {

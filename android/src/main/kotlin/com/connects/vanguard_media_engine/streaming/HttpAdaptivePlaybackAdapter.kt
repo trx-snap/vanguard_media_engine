@@ -1,5 +1,6 @@
 // Copyright (c) Connects - Phase 4C1C: HttpAdaptivePlaybackAdapter with headless ImageReader bridge.
 // Phase 4C5B: Streaming network profile policy (AdaptiveStreamingNetworkPolicy) applied in prepare().
+// Phase 4C6B: Cache-aware DataSource.Factory routing via AndroidDagPlaybackCacheManager (opt-in).
 // Scaffold with headless decode surface bridge enabled.  No live network streaming is claimed or
 // verified here.  Physical network streaming proof is deferred to Phase 4C device validation.
 
@@ -15,6 +16,7 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
+import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.dash.DashMediaSource
@@ -696,6 +698,10 @@ class HttpAdaptivePlaybackAdapter(
      */
     private fun buildMediaSource(config: HttpAdaptiveStreamConfig): MediaSource {
         val uri = android.net.Uri.parse(config.uri)
+        // Phase 4C6B: obtain the appropriate DataSource.Factory (cache-backed or plain network)
+        // for this config.  Cache failures are fully handled inside buildDataSourceFactory and
+        // never propagate as exceptions here.
+        val dataSourceFactory = buildDataSourceFactory(config)
 
         return when (config.formatHint) {
             AdaptiveStreamFormat.HLS -> {
@@ -703,7 +709,7 @@ class HttpAdaptivePlaybackAdapter(
                     .setUri(uri)
                     .setMimeType(MimeTypes.APPLICATION_M3U8)
                     .build()
-                HlsMediaSource.Factory(buildHttpDataSourceFactory(config.httpHeaders))
+                HlsMediaSource.Factory(dataSourceFactory)
                     .createMediaSource(mediaItem)
             }
             AdaptiveStreamFormat.DASH -> {
@@ -711,32 +717,73 @@ class HttpAdaptivePlaybackAdapter(
                     .setUri(uri)
                     .setMimeType(MimeTypes.APPLICATION_MPD)
                     .build()
-                DashMediaSource.Factory(buildHttpDataSourceFactory(config.httpHeaders))
+                DashMediaSource.Factory(dataSourceFactory)
                     .createMediaSource(mediaItem)
             }
             AdaptiveStreamFormat.AUTO -> {
                 val mediaItem = MediaItem.fromUri(uri)
-                DefaultMediaSourceFactory(buildHttpDataSourceFactory(config.httpHeaders))
+                DefaultMediaSourceFactory(dataSourceFactory)
                     .createMediaSource(mediaItem)
             }
         }
     }
 
     /**
-     * Builds a [DefaultHttpDataSource.Factory] and applies [httpHeaders] (if any) via
-     * [DefaultHttpDataSource.Factory.setDefaultRequestProperties].
+     * Phase 4C6B: Builds a [DataSource.Factory] for the given [config], routing through the
+     * [AndroidDagPlaybackCacheManager] when [HttpAdaptiveStreamConfig.cacheConfig.enabled] is
+     * `true` and cache initialisation succeeded.
      *
-     * This is the correct API for forwarding custom headers to every HTTP request (manifest
-     * fetch, segment download, encryption key request) issued by Media3's network loaders.
-     * The headers are set once on the factory and applied to all [DefaultHttpDataSource]
-     * instances it creates.
+     * - **Cache disabled** ([AndroidDagPlaybackCacheConfig.enabled] = `false`, the default) or
+     *   **cache init failed**: returns a plain [DefaultHttpDataSource.Factory] with [httpHeaders]
+     *   applied — identical to pre-Phase-4C6B behaviour.  Existing callers are unaffected.
+     * - **Cache enabled and available**: returns a [androidx.media3.datasource.cache.CacheDataSource.Factory]
+     *   wrapping [SimpleCache] with an upstream [DefaultHttpDataSource.Factory] and
+     *   [androidx.media3.datasource.cache.CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR] so that
+     *   individual cache I/O failures fall back to network without interrupting playback.
+     *
+     * Cache failures inside [AndroidDagPlaybackCacheManager.buildDataSourceFactory] are swallowed
+     * by that class; this method never throws due to cache errors.
      *
      * Must only be called from the HandlerThread.
      *
-     * @param httpHeaders Optional header map from [HttpAdaptiveStreamConfig.httpHeaders].
-     *                    Null or empty means no custom headers.
+     * @param config Full [HttpAdaptiveStreamConfig]; [httpHeaders] and [cacheConfig] are read.
      */
-    private fun buildHttpDataSourceFactory(
+    private fun buildDataSourceFactory(config: HttpAdaptiveStreamConfig): DataSource.Factory {
+        val cacheConfig = config.cacheConfig
+        return if (cacheConfig.enabled) {
+            // Cache is opt-in: delegate to the manager which handles init failure safely.
+            try {
+                val manager = AndroidDagPlaybackCacheManager.getOrCreate(context, cacheConfig)
+                manager.buildDataSourceFactory(config.httpHeaders)
+            } catch (t: Throwable) {
+                // Defensive: manager construction should not throw, but if it does, fall back
+                // to plain DefaultHttpDataSource to preserve playback (cache failure must not
+                // fail playback per Phase 4C6B invariant).
+                android.util.Log.w(
+                    "HttpAdaptiveAdapter",
+                    "Phase4C6B: cache manager getOrCreate threw – falling back to DefaultHttpDataSource: ${t.message}",
+                    t,
+                )
+                buildFallbackHttpDataSourceFactory(config.httpHeaders)
+            }
+        } else {
+            // Cache is disabled (default): use plain DefaultHttpDataSource — behaviour-preserving.
+            buildFallbackHttpDataSourceFactory(config.httpHeaders)
+        }
+    }
+
+    /**
+     * Builds a plain [DefaultHttpDataSource.Factory] and applies [httpHeaders] (if any) via
+     * [DefaultHttpDataSource.Factory.setDefaultRequestProperties].
+     *
+     * This is the pre-Phase-4C6B factory path.  It is retained as the explicit fallback so that
+     * the cache-routing logic in [buildDataSourceFactory] has a clear, named escape hatch.
+     *
+     * Must only be called from the HandlerThread.
+     *
+     * @param httpHeaders Optional header map.  Null or empty means no custom headers.
+     */
+    private fun buildFallbackHttpDataSourceFactory(
         httpHeaders: Map<String, String>?,
     ): DefaultHttpDataSource.Factory {
         val factory = DefaultHttpDataSource.Factory()

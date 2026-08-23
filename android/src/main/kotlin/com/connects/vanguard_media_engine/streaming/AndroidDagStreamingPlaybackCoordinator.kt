@@ -38,6 +38,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C5DManifestPolicyValidation",
             "runAndroidDagPhase4C5ECompatibilityDecisionSmoke",
             "runAndroidDagPhase4C5GPreflightAdvisorySmoke",
+            "runAndroidDagPhase4C6BPlaybackCacheBackendSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -62,6 +63,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C5DManifestPolicyValidation" -> runAdaptiveStreamingManifestPolicyValidation(args, result)
             "runAndroidDagPhase4C5ECompatibilityDecisionSmoke" -> runAdaptiveStreamingCompatibilityDecisionSmoke(args, result)
             "runAndroidDagPhase4C5GPreflightAdvisorySmoke" -> runAdaptiveStreamingPreflightAdvisorySmoke(args, result)
+            "runAndroidDagPhase4C6BPlaybackCacheBackendSmoke" -> runAndroidDagPhase4C6BPlaybackCacheBackendSmoke(result)
             else -> return false
         }
         return true
@@ -133,6 +135,37 @@ class AndroidDagStreamingPlaybackCoordinator(
             }
         }
 
+        // --- Phase 4C6B: Optional cache config args ------------------------------------------
+        // Existing callers that do not send these keys get the safe default (enabled=false).
+        // Invalid cacheMaxBytes is silently clamped to the default rather than rejecting; cache
+        // is opt-in and a bad value should not block streaming from working.
+        // Phase 4C6B uses Media3 default cache-key derivation only (URI-based); no custom
+        // cache key is accepted or applied in this slice (see G-CACHE-KEY in CacheConfig).
+        val cacheEnabled: Boolean = (args["cacheEnabled"] as? Boolean) ?: false
+        val cacheMaxBytesRaw: Long? = (args["cacheMaxBytes"] as? Number)?.toLong()
+        val cacheDirName: String? = args["cacheDirectoryName"] as? String
+
+        val cacheConfig = try {
+            AndroidDagPlaybackCacheConfig(
+                enabled = cacheEnabled,
+                maxCacheBytes = if (cacheMaxBytesRaw != null && cacheMaxBytesRaw > 0L)
+                    cacheMaxBytesRaw
+                else
+                    AndroidDagPlaybackCacheConfig().maxCacheBytes,
+                cacheDirectoryName = if (!cacheDirName.isNullOrBlank()
+                    && !cacheDirName.contains('/') && !cacheDirName.contains('\\'))
+                    cacheDirName
+                else
+                    AndroidDagPlaybackCacheConfig().cacheDirectoryName,
+            )
+        } catch (t: Throwable) {
+            // Validation inside AndroidDagPlaybackCacheConfig.init should not fire given the
+            // guards above, but if it does, fall back to the safe disabled default.
+            Log.w(TAG, "Phase4C6B: cacheConfig validation threw - using disabled default: ${t.message}")
+            AndroidDagPlaybackCacheConfig()
+        }
+        // -----------------------------------------------------------------------------------------
+
         val streamConfig = try {
             HttpAdaptiveStreamConfig(
                 uri = uri,
@@ -141,6 +174,7 @@ class AndroidDagStreamingPlaybackCoordinator(
                 startPositionMs = startPositionMs,
                 autoPlay = autoPlay,
                 networkProfile = networkProfile,
+                cacheConfig = cacheConfig,
             )
         } catch (t: Throwable) {
             result.error("INVALID_ARG", "createAndroidDagPhase4C1D1StreamingPlayback: invalid config: ${t.message}", null)
@@ -517,6 +551,36 @@ class AndroidDagStreamingPlaybackCoordinator(
                     requestedNetworkProfileRaw = requestedNetworkProfile,
                     preferLowLatency = preferLowLatency,
                     allowLowLatencyOnConstrained = allowLowLatencyOnConstrained,
+                )
+            }
+            mainHandler.post { result.success(smokeResult) }
+        }.start()
+    }
+
+    /**
+     * Phase 4C6B: Diagnostic MethodChannel handler for the cache backend smoke test.
+     *
+     * Runs [AndroidDagPlaybackCacheSmokeHarness.run] on a background thread and returns the
+     * result map to Dart via [result.success].  The harness does not fetch network content,
+     * instantiate ExoPlayer, create a Surface, create MediaCodec, or mutate ConnectsApp state.
+     */
+    private fun runAndroidDagPhase4C6BPlaybackCacheBackendSmoke(result: MethodChannel.Result) {
+        Thread {
+            val smokeResult = try {
+                AndroidDagPlaybackCacheSmokeHarness.run(context)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Phase4C6B smoke threw unexpectedly", t)
+                mapOf(
+                    "phase"             to "Phase4C6B",
+                    "pass"              to false,
+                    "cacheEnabledDefault" to false,
+                    "cacheEnabledSmoke" to true,
+                    "cacheAvailable"    to false,
+                    "fallbackOnError"   to true,
+                    "playbackMutation"  to false,
+                    "prewarmImplemented" to false,
+                    "webRtcCache"       to false,
+                    "raw"               to "status=FAIL;reason=harness_exception:${t.javaClass.simpleName}:${t.message}",
                 )
             }
             mainHandler.post { result.success(smokeResult) }
