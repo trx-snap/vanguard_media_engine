@@ -1,11 +1,12 @@
-// Vanguard Android True-DAG Phase 4C3S: Physical RTC all-up smoke test.
+// Vanguard Android True-DAG Phase 4C3X: Physical RTC all-up smoke test.
 //
-// Sequentially invokes all five Android RTC MethodChannel smoke routes:
+// Sequentially invokes all six Android RTC MethodChannel smoke routes:
 //   1. runAndroidDagPhase4C3DRtcContractSmoke (Phase 4C3D: RTC video contracts)
 //   2. runAndroidDagPhase4C3GRealtimeVideoAdapterSmoke (Phase 4C3G: Realtime video adapters)
 //   3. runAndroidDagPhase4C3KRtcMetadataSmoke (Phase 4C3K: RTC timestamp & orientation metadata)
 //   4. runAndroidDagPhase4C3NRtcBackpressureSmoke (Phase 4C3N: RTC backpressure controller)
 //   5. runAndroidDagPhase4C3QRtcFrameValidatorSmoke (Phase 4C3Q: RTC frame validator)
+//   6. runAndroidDagPhase4C3UProcessedVideoEgressSmoke (Phase 4C3U: Processed video egress)
 
 import 'dart:async';
 import 'dart:convert';
@@ -226,6 +227,44 @@ class _AndroidRtcAllUpPhysicalSmokeAppState
       allPass = false;
     }
 
+    // 6. Phase 4C3U: Processed Video Egress Smoke
+    try {
+      if (mounted) {
+        setState(() {
+          _status = 'Running Phase 4C3U processed video egress smoke…';
+        });
+      }
+      final resp = await _channel.invokeMethod<Object?>(
+        'runAndroidDagPhase4C3UProcessedVideoEgressSmoke',
+        <String, dynamic>{
+          'width': _width,
+          'height': _height,
+          'frameCount': _frameCount,
+        },
+      );
+      if (resp == null || resp is! Map) {
+        throw Exception(
+          'runAndroidDagPhase4C3UProcessedVideoEgressSmoke returned invalid response: $resp',
+        );
+      }
+      final map = Map<String, dynamic>.from(resp);
+      final pass = map['pass'] == true;
+      results['processedEgress'] = <String, dynamic>{
+        'pass': pass,
+        'raw': map['raw']?.toString() ?? (pass ? 'status=OK' : 'status=FAIL'),
+        'details': map,
+      };
+      if (!pass) allPass = false;
+    } catch (e, st) {
+      // ignore: avoid_print
+      print('ANDROID_RTC_ALL_UP_PROCESSED_EGRESS_ERROR: $e\n$st');
+      results['processedEgress'] = <String, dynamic>{
+        'pass': false,
+        'raw': 'status=FAIL;reason=dart_exception:$e',
+      };
+      allPass = false;
+    }
+
     final diagMap = <String, dynamic>{
       'pass': allPass,
       'routes': results,
@@ -234,11 +273,13 @@ class _AndroidRtcAllUpPhysicalSmokeAppState
       'metadataPass': results['metadata']?['pass'] == true,
       'backpressurePass': results['backpressure']?['pass'] == true,
       'validatorPass': results['validator']?['pass'] == true,
+      'processedEgressPass': results['processedEgress']?['pass'] == true,
       'contractRaw': results['contract']?['raw'] ?? '',
       'adapterRaw': results['adapter']?['raw'] ?? '',
       'metadataRaw': results['metadata']?['raw'] ?? '',
       'backpressureRaw': results['backpressure']?['raw'] ?? '',
       'validatorRaw': results['validator']?['raw'] ?? '',
+      'processedEgressRaw': results['processedEgress']?['raw'] ?? '',
     };
 
     // Print diagnostic map and terminal marker
@@ -254,8 +295,8 @@ class _AndroidRtcAllUpPhysicalSmokeAppState
     if (mounted) {
       setState(() {
         _status = allPass
-            ? 'PASS (all 5 RTC smoke routes verified)'
-            : 'FAIL (contract=${results['contract']?['pass']}, adapter=${results['adapter']?['pass']}, metadata=${results['metadata']?['pass']}, backpressure=${results['backpressure']?['pass']}, validator=${results['validator']?['pass']})';
+            ? 'PASS (all 6 RTC smoke routes verified)'
+            : 'FAIL (contract=${results['contract']?['pass']}, adapter=${results['adapter']?['pass']}, metadata=${results['metadata']?['pass']}, backpressure=${results['backpressure']?['pass']}, validator=${results['validator']?['pass']}, processedEgress=${results['processedEgress']?['pass']})';
       });
     }
 
