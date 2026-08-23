@@ -1,12 +1,13 @@
-// Vanguard Android True-DAG Phase 4C3X: Physical RTC all-up smoke test.
+// Vanguard Android True-DAG Phase 4C4D: Physical RTC all-up smoke test.
 //
-// Sequentially invokes all six Android RTC MethodChannel smoke routes:
+// Sequentially invokes all seven Android RTC MethodChannel smoke routes:
 //   1. runAndroidDagPhase4C3DRtcContractSmoke (Phase 4C3D: RTC video contracts)
 //   2. runAndroidDagPhase4C3GRealtimeVideoAdapterSmoke (Phase 4C3G: Realtime video adapters)
 //   3. runAndroidDagPhase4C3KRtcMetadataSmoke (Phase 4C3K: RTC timestamp & orientation metadata)
 //   4. runAndroidDagPhase4C3NRtcBackpressureSmoke (Phase 4C3N: RTC backpressure controller)
 //   5. runAndroidDagPhase4C3QRtcFrameValidatorSmoke (Phase 4C3Q: RTC frame validator)
 //   6. runAndroidDagPhase4C3UProcessedVideoEgressSmoke (Phase 4C3U: Processed video egress)
+//   7. runAndroidDagPhase4C4BRtcJitterBufferSmoke (Phase 4C4B: RTC jitter buffer controller)
 
 import 'dart:async';
 import 'dart:convert';
@@ -265,6 +266,42 @@ class _AndroidRtcAllUpPhysicalSmokeAppState
       allPass = false;
     }
 
+    // 7. Phase 4C4B: RTC Jitter Buffer Smoke
+    try {
+      if (mounted) {
+        setState(() {
+          _status = 'Running Phase 4C4B RTC jitter buffer smoke…';
+        });
+      }
+      final resp = await _channel.invokeMethod<Object?>(
+        'runAndroidDagPhase4C4BRtcJitterBufferSmoke',
+        <String, dynamic>{
+          'frameCount': _frameCount,
+        },
+      );
+      if (resp == null || resp is! Map) {
+        throw Exception(
+          'runAndroidDagPhase4C4BRtcJitterBufferSmoke returned invalid response: $resp',
+        );
+      }
+      final map = Map<String, dynamic>.from(resp);
+      final pass = map['pass'] == true;
+      results['jitterBuffer'] = <String, dynamic>{
+        'pass': pass,
+        'raw': map['raw']?.toString() ?? (pass ? 'status=OK' : 'status=FAIL'),
+        'details': map,
+      };
+      if (!pass) allPass = false;
+    } catch (e, st) {
+      // ignore: avoid_print
+      print('ANDROID_RTC_ALL_UP_JITTER_BUFFER_ERROR: $e\n$st');
+      results['jitterBuffer'] = <String, dynamic>{
+        'pass': false,
+        'raw': 'status=FAIL;reason=dart_exception:$e',
+      };
+      allPass = false;
+    }
+
     final diagMap = <String, dynamic>{
       'pass': allPass,
       'routes': results,
@@ -274,12 +311,14 @@ class _AndroidRtcAllUpPhysicalSmokeAppState
       'backpressurePass': results['backpressure']?['pass'] == true,
       'validatorPass': results['validator']?['pass'] == true,
       'processedEgressPass': results['processedEgress']?['pass'] == true,
+      'jitterBufferPass': results['jitterBuffer']?['pass'] == true,
       'contractRaw': results['contract']?['raw'] ?? '',
       'adapterRaw': results['adapter']?['raw'] ?? '',
       'metadataRaw': results['metadata']?['raw'] ?? '',
       'backpressureRaw': results['backpressure']?['raw'] ?? '',
       'validatorRaw': results['validator']?['raw'] ?? '',
       'processedEgressRaw': results['processedEgress']?['raw'] ?? '',
+      'jitterBufferRaw': results['jitterBuffer']?['raw'] ?? '',
     };
 
     // Print diagnostic map and terminal marker
@@ -295,8 +334,8 @@ class _AndroidRtcAllUpPhysicalSmokeAppState
     if (mounted) {
       setState(() {
         _status = allPass
-            ? 'PASS (all 6 RTC smoke routes verified)'
-            : 'FAIL (contract=${results['contract']?['pass']}, adapter=${results['adapter']?['pass']}, metadata=${results['metadata']?['pass']}, backpressure=${results['backpressure']?['pass']}, validator=${results['validator']?['pass']}, processedEgress=${results['processedEgress']?['pass']})';
+            ? 'PASS (all 7 RTC smoke routes verified)'
+            : 'FAIL (contract=${results['contract']?['pass']}, adapter=${results['adapter']?['pass']}, metadata=${results['metadata']?['pass']}, backpressure=${results['backpressure']?['pass']}, validator=${results['validator']?['pass']}, processedEgress=${results['processedEgress']?['pass']}, jitterBuffer=${results['jitterBuffer']?['pass']})';
       });
     }
 
