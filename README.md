@@ -4,6 +4,40 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Streaming Playback Texture View Widget Recipe
+
+The package exposes `VGStreamingPlaybackTextureView` as a presentation-only Flutter widget that renders the active session texture from a `VGStreamingPlaybackControllerSnapshot`. It automatically manages aspect ratio preservation via `FittedBox`, letterboxing/pillarboxing background color, placeholder builder, and error builder callbacks.
+
+### Quick Start
+
+```dart
+import 'package:flutter/material.dart';
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+Widget buildStreamingView(VGStreamingPlaybackControllerSnapshot snapshot) {
+  return VGStreamingPlaybackTextureView(
+    snapshot: snapshot,
+    fit: BoxFit.contain,
+    alignment: Alignment.center,
+    backgroundColor: Colors.black,
+    placeholderBuilder: (context, snap) {
+      return Container(
+        color: Colors.black,
+        alignment: Alignment.center,
+        child: Text('Loading stream (${snap.reason})...'),
+      );
+    },
+    errorBuilder: (context, snap) {
+      return Container(
+        color: Colors.black,
+        alignment: Alignment.center,
+        child: Text('Stream failed: ${snap.lastError ?? snap.reason}'),
+      );
+    },
+  );
+}
+```
+
 ## Streaming Playback Controller Facade Recipe
 
 The package exposes `VGStreamingPlaybackController` as a bounded, session-safe Dart facade over `VGStreamingPlaybackClient` and `VGStreamingPlaybackDecision`. It serializes operations with a private busy guard, owns exactly one active playback session at a time, and provides high-level control (`open`, `play`, `pause`, `seek`, `refresh`, `stop`, `dispose`).
