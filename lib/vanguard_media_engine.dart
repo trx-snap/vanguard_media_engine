@@ -99,6 +99,8 @@ export 'vg_streaming_cache_client.dart';
 export 'vg_streaming_playback_client.dart';
 // Phase 4C7E: public streaming preflight advisory API client.
 export 'vg_streaming_preflight_client.dart';
+// Phase 4C7G: public streaming startup plan helper.
+export 'vg_streaming_startup_plan.dart';
 
 const String _libName = 'vanguard_media_engine';
 
