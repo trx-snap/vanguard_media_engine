@@ -35,6 +35,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C4GAdaptiveStreamTimelineSmoke",
             "runAndroidDagPhase4C5AStreamingCodecCapabilitySmoke",
             "runAndroidDagPhase4C5CManifestRenditionSmoke",
+            "runAndroidDagPhase4C5DManifestPolicyValidation",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -56,6 +57,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C4GAdaptiveStreamTimelineSmoke" -> runAdaptiveStreamTimelineSmoke(args, result)
             "runAndroidDagPhase4C5AStreamingCodecCapabilitySmoke" -> runAdaptiveStreamingCodecCapabilitySmoke(result)
             "runAndroidDagPhase4C5CManifestRenditionSmoke" -> runAdaptiveStreamingManifestRenditionSmoke(result)
+            "runAndroidDagPhase4C5DManifestPolicyValidation" -> runAdaptiveStreamingManifestPolicyValidation(args, result)
             else -> return false
         }
         return true
@@ -460,6 +462,19 @@ class AndroidDagStreamingPlaybackCoordinator(
     private fun runAdaptiveStreamingManifestRenditionSmoke(result: MethodChannel.Result) {
         Thread {
             val smokeResult = AdaptiveStreamingManifestRenditionSmokeHarness.run()
+            mainHandler.post { result.success(smokeResult) }
+        }.start()
+    }
+
+    private fun runAdaptiveStreamingManifestPolicyValidation(args: Map<*, *>?, result: MethodChannel.Result) {
+        @Suppress("UNCHECKED_CAST")
+        val manifests = args?.get("manifests") as? List<Map<*, *>>
+        Thread {
+            val smokeResult = if (manifests != null && manifests.isNotEmpty()) {
+                AdaptiveStreamingManifestPolicySmokeHarness.runHostManifestPolicyValidation(manifests)
+            } else {
+                AdaptiveStreamingManifestPolicySmokeHarness.runDefaultPublicManifestPolicySmoke()
+            }
             mainHandler.post { result.success(smokeResult) }
         }.start()
     }
