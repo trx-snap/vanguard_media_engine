@@ -622,52 +622,157 @@ class AndroidDagStreamingPlaybackCoordinator(
             return
         }
 
-        val request = try {
-            AndroidDagPlaybackPrewarmRequest(
-                requestId  = requestId,
-                uri        = uri,
-                httpHeaders = httpHeaders,
-                maxBytes   = maxBytes,
-                cacheConfig = cacheConfig,
+        // ── Phase 4C6F3: Parse minimumFreeBytesAfterPrewarm ──────────────────────
+        // Invalid (non-numeric) or negative → default 64 MiB.
+        // Zero → guard disabled (explicit opt-out).
+        val minFreeBytesRaw: Long? = (args?.get("minimumFreeBytesAfterPrewarm") as? Number)?.toLong()
+        val minimumFreeBytesAfterPrewarm: Long = when {
+            minFreeBytesRaw == null -> AndroidDagPlaybackStorageGuard.DEFAULT_MIN_FREE_BYTES
+            minFreeBytesRaw < 0L   -> AndroidDagPlaybackStorageGuard.DEFAULT_MIN_FREE_BYTES
+            else                   -> minFreeBytesRaw  // includes 0 (guard disabled)
+        }
+
+        // Evaluate storage guard on a background thread (includes a StatFs call).
+        // We launch the entire admission check + prewarm-start on the background thread.
+        Thread {
+            // Phase 4C6F3 P1 fix: compute cacheDirPath directly without touching
+            // AndroidDagPlaybackCacheManager or SimpleCache. The manager must not be
+            // initialised until after the guard passes, matching the invariant that
+            // no cache state is created for a blocked or errored prewarm.
+            val cacheDirPath = java.io.File(
+                context.applicationContext.cacheDir,
+                cacheConfig.cacheDirectoryName,
+            ).absolutePath
+
+            val guardResult = AndroidDagPlaybackStorageGuard.evaluate(
+                cacheDirPath = cacheDirPath,
+                requestedBytes = maxBytes,
+                minimumFreeBytesAfterPrewarm = minimumFreeBytesAfterPrewarm,
             )
-        } catch (iae: IllegalArgumentException) {
-            result.success(mapOf(
-                "phase"          to "Phase4C6E",
-                "pass"           to false,
-                "requestId"      to requestId,
-                "state"          to "invalid",
-                "cacheAvailable" to false,
-                "raw"            to "status=FAIL;reason=invalid_request:${iae.message}",
-            ))
-            return
-        }
 
-        val accepted = prewarmEngine.start(request) { jobResult ->
-            // Log terminal result on the executor thread; callers poll via getPlaybackCachePrewarmStatus.
-            val finalState = jobResult["state"] as? String ?: "unknown"
-            val bytesCached = jobResult["bytesCached"] ?: 0L
-            Log.d(TAG, "Phase4C6E prewarm terminal: requestId=$requestId state=$finalState bytesCached=$bytesCached")
-        }
+            when (guardResult) {
+                is AndroidDagPlaybackStorageGuard.StorageGuardResult.Blocked -> {
+                    // Blocked: return immediately without creating a job.
+                    Log.w(
+                        TAG,
+                        "Phase4C6F3 startPlaybackCachePrewarm: BLOCKED low storage " +
+                            "requestId=$requestId available=${guardResult.availableBytes}B " +
+                            "requested=${guardResult.requestedBytes}B " +
+                            "projected=${guardResult.projectedAvailableBytes}B " +
+                            "reserve=${guardResult.minimumFreeBytesAfterPrewarm}B",
+                    )
+                    val blockedMap = mapOf(
+                        "phase"                        to "Phase4C6F3",
+                        "pass"                         to false,
+                        "requestId"                    to requestId,
+                        "state"                        to "blocked_low_storage",
+                        "cacheAvailable"               to false,
+                        "cacheEnabled"                 to cacheConfig.enabled,
+                        "availableBytes"               to guardResult.availableBytes,
+                        "requestedBytes"               to guardResult.requestedBytes,
+                        "minimumFreeBytesAfterPrewarm" to guardResult.minimumFreeBytesAfterPrewarm,
+                        "projectedAvailableBytes"      to guardResult.projectedAvailableBytes,
+                        "storageGuardPhase"            to "Phase4C6F3",
+                        "storageGuardPass"             to false,
+                        "raw"                          to "status=BLOCKED;reason=low_storage;" +
+                            "requestId=$requestId;" +
+                            "available=${guardResult.availableBytes};" +
+                            "requested=${guardResult.requestedBytes};" +
+                            "projected=${guardResult.projectedAvailableBytes};" +
+                            "reserve=${guardResult.minimumFreeBytesAfterPrewarm}",
+                    )
+                    mainHandler.post { result.success(blockedMap) }
+                }
 
-        val state = when {
-            accepted -> "accepted"
-            prewarmEngine.status(requestId)["state"] != "not_found" -> "duplicate"
-            else -> "shutdown"
-        }
 
-        result.success(mapOf(
-            "phase"          to "Phase4C6E",
-            "pass"           to accepted,
-            "requestId"      to requestId,
-            "state"          to state,
-            // cacheAvailable is NOT set here: start returns immediately before the background job
-            // has initialised SimpleCache.  Report config intent via cacheEnabled only; runtime
-            // availability is proven later via getPlaybackCachePrewarmStatus / getPlaybackCacheStatus.
-            "cacheAvailable" to false,
-            "cacheEnabled"   to cacheConfig.enabled,
-            "raw"            to "status=OK;accepted=$accepted;state=$state;requestId=$requestId",
-        ))
+                is AndroidDagPlaybackStorageGuard.StorageGuardResult.Error -> {
+                    // Phase 4C6F3 P1 fix: storage measurement failure must skip cache prewarm
+                    // safely. Do NOT create a job; return a structured failure result so that
+                    // callers can distinguish a guard measurement error from a passed/blocked guard.
+                    Log.w(
+                        TAG,
+                        "Phase4C6F3 startPlaybackCachePrewarm: storage guard ERROR " +
+                            "requestId=$requestId reason=${guardResult.reason}",
+                    )
+                    val errorMap = mapOf(
+                        "phase"             to "Phase4C6F3",
+                        "pass"              to false,
+                        "requestId"         to requestId,
+                        "state"             to "storage_guard_error",
+                        "cacheAvailable"    to false,
+                        "cacheEnabled"      to cacheConfig.enabled,
+                        "storageGuardPhase" to "Phase4C6F3",
+                        "storageGuardPass"  to false,
+                        "raw"               to "status=FAIL;reason=storage_guard_error;" +
+                            "requestId=$requestId;guardReason=${guardResult.reason}",
+                    )
+                    mainHandler.post { result.success(errorMap) }
+                }
+
+                is AndroidDagPlaybackStorageGuard.StorageGuardResult.Pass -> {
+                    // Guard passed — build storage diagnostic fields and create the prewarm job.
+                    val storageAvailableBytes  = guardResult.availableBytes
+                    val storageRequestedBytes  = guardResult.requestedBytes
+                    val storageMin             = guardResult.minimumFreeBytesAfterPrewarm
+                    val storageProjected       = guardResult.projectedAvailableBytes
+
+                    val request = try {
+                        AndroidDagPlaybackPrewarmRequest(
+                            requestId   = requestId,
+                            uri         = uri,
+                            httpHeaders = httpHeaders,
+                            maxBytes    = maxBytes,
+                            cacheConfig = cacheConfig,
+                        )
+                    } catch (iae: IllegalArgumentException) {
+                        val invalidMap = mapOf(
+                            "phase"          to "Phase4C6E",
+                            "pass"           to false,
+                            "requestId"      to requestId,
+                            "state"          to "invalid",
+                            "cacheAvailable" to false,
+                            "raw"            to "status=FAIL;reason=invalid_request:${iae.message}",
+                        )
+                        mainHandler.post { result.success(invalidMap) }
+                        return@Thread
+                    }
+
+                    val accepted = prewarmEngine.start(request) { jobResult ->
+                        val finalState = jobResult["state"] as? String ?: "unknown"
+                        val bytesCached = jobResult["bytesCached"] ?: 0L
+                        Log.d(TAG, "Phase4C6E prewarm terminal: requestId=$requestId state=$finalState bytesCached=$bytesCached")
+                    }
+
+                    val state = when {
+                        accepted -> "accepted"
+                        prewarmEngine.status(requestId)["state"] != "not_found" -> "duplicate"
+                        else -> "shutdown"
+                    }
+
+                    val acceptedMap = mutableMapOf<String, Any?>(
+                        "phase"                        to "Phase4C6E",
+                        "pass"                         to accepted,
+                        "requestId"                    to requestId,
+                        "state"                        to state,
+                        "cacheAvailable"               to false,
+                        "cacheEnabled"                 to cacheConfig.enabled,
+                        "storageGuardPhase"            to "Phase4C6F3",
+                        "storageGuardPass"             to true,
+                        "raw"                          to "status=OK;accepted=$accepted;state=$state;requestId=$requestId",
+                    )
+                    // Include storage diagnostics when available (guard ran successfully).
+                    if (storageAvailableBytes != null) {
+                        acceptedMap["availableBytes"]               = storageAvailableBytes
+                        acceptedMap["requestedBytes"]               = storageRequestedBytes
+                        acceptedMap["minimumFreeBytesAfterPrewarm"] = storageMin
+                        acceptedMap["projectedAvailableBytes"]      = storageProjected
+                    }
+                    mainHandler.post { result.success(acceptedMap) }
+                }
+            }
+        }.start()
     }
+
 
     /**
      * Phase 4C6E: Cancels a public prewarm job.

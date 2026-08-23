@@ -29,16 +29,35 @@ class VGPlaybackCacheOptions {
   /// `null` → platform default (`"vanguard_playback_cache"`).
   final String? cacheDirectoryName;
 
+  /// Phase 4C6F3: Minimum bytes that must remain free on the app-cache
+  /// filesystem **after** the prewarm job has written [VGStreamingCacheClient.prewarm]'s
+  /// `maxBytes` worth of data.
+  ///
+  /// The Android backend evaluates:
+  /// ```
+  /// projectedAvailableBytes = availableBytes - maxBytes
+  /// pass when minimumFreeBytesAfterPrewarm <= 0
+  ///          OR projectedAvailableBytes >= minimumFreeBytesAfterPrewarm
+  /// ```
+  ///
+  /// - `null` → platform default (64 MiB).
+  /// - `0`    → guard disabled; prewarm is always admitted regardless of free space.
+  /// - Negative values on the Android side are treated as the default 64 MiB.
+  final int? minimumFreeBytesAfterPrewarm;
+
   const VGPlaybackCacheOptions({
     this.cacheEnabled = true,
     this.cacheMaxBytes,
     this.cacheDirectoryName,
+    this.minimumFreeBytesAfterPrewarm,
   });
 
   Map<String, Object?> toArgs() => {
     'cacheEnabled': cacheEnabled,
     if (cacheMaxBytes != null) 'cacheMaxBytes': cacheMaxBytes,
     if (cacheDirectoryName != null) 'cacheDirectoryName': cacheDirectoryName,
+    if (minimumFreeBytesAfterPrewarm != null)
+      'minimumFreeBytesAfterPrewarm': minimumFreeBytesAfterPrewarm,
   };
 }
 
@@ -144,13 +163,23 @@ enum VGPlaybackPrewarmStartState {
   /// The prewarm engine has been shut down.
   shutdown,
 
+  /// Phase 4C6F3: Prewarm was blocked because projected free storage after prewarm
+  /// would be below [VGPlaybackCacheOptions.minimumFreeBytesAfterPrewarm].
+  blockedLowStorage,
+
+  /// Phase 4C6F3: Prewarm was skipped because the storage guard could not evaluate
+  /// available filesystem headroom (StatFs error or path resolution failure).
+  /// No prewarm job is created.
+  storageGuardError,
+
   /// The platform is not supported.
   unsupported,
 }
 
 /// Result of [VGStreamingCacheClient.prewarm].
 class VGPlaybackPrewarmStartResult {
-  /// Always `"Phase4C6E"` on Android; `"unsupported"` on iOS/other.
+  /// Always `"Phase4C6E"` on Android when accepted; `"Phase4C6F3"` when blocked
+  /// by the storage guard; `"unsupported"` on iOS/other.
   final String phase;
 
   /// Whether the job was accepted.
@@ -165,12 +194,43 @@ class VGPlaybackPrewarmStartResult {
   /// Raw diagnostic string from the platform.
   final String raw;
 
+  // ── Phase 4C6F3: Storage guard diagnostic fields ──────────────────────────
+
+  /// Phase identifier from the storage guard evaluation, e.g. `"Phase4C6F3"`.
+  /// `null` when the result was not produced by the storage guard path.
+  final String? storageGuardPhase;
+
+  /// Whether the storage guard passed. `null` when no guard evaluation occurred.
+  final bool? storageGuardPass;
+
+  /// Available bytes on the app-cache filesystem at guard evaluation time.
+  /// `null` when unavailable or not evaluated.
+  final int? availableBytes;
+
+  /// Requested bytes (maxBytes) passed to the prewarm job.
+  /// `null` when unavailable or not evaluated.
+  final int? requestedBytes;
+
+  /// Minimum bytes after prewarm that the guard required.
+  /// `null` when unavailable or not evaluated.
+  final int? minimumFreeBytesAfterPrewarm;
+
+  /// Projected available bytes after prewarm (`availableBytes - requestedBytes`).
+  /// `null` when unavailable or not evaluated.
+  final int? projectedAvailableBytes;
+
   const VGPlaybackPrewarmStartResult({
     required this.phase,
     required this.pass,
     required this.requestId,
     required this.state,
     required this.raw,
+    this.storageGuardPhase,
+    this.storageGuardPass,
+    this.availableBytes,
+    this.requestedBytes,
+    this.minimumFreeBytesAfterPrewarm,
+    this.projectedAvailableBytes,
   });
 
   factory VGPlaybackPrewarmStartResult.fromMap(
@@ -182,6 +242,8 @@ class VGPlaybackPrewarmStartResult {
       'accepted' => VGPlaybackPrewarmStartState.accepted,
       'duplicate' => VGPlaybackPrewarmStartState.duplicate,
       'shutdown' => VGPlaybackPrewarmStartState.shutdown,
+      'blocked_low_storage' => VGPlaybackPrewarmStartState.blockedLowStorage,
+      'storage_guard_error' => VGPlaybackPrewarmStartState.storageGuardError,
       _ => VGPlaybackPrewarmStartState.invalid,
     };
     return VGPlaybackPrewarmStartResult(
@@ -190,6 +252,13 @@ class VGPlaybackPrewarmStartResult {
       requestId: m['requestId'] as String? ?? requestId,
       state: state,
       raw: m['raw'] as String? ?? '',
+      storageGuardPhase: m['storageGuardPhase'] as String?,
+      storageGuardPass: m['storageGuardPass'] as bool?,
+      availableBytes: (m['availableBytes'] as num?)?.toInt(),
+      requestedBytes: (m['requestedBytes'] as num?)?.toInt(),
+      minimumFreeBytesAfterPrewarm: (m['minimumFreeBytesAfterPrewarm'] as num?)
+          ?.toInt(),
+      projectedAvailableBytes: (m['projectedAvailableBytes'] as num?)?.toInt(),
     );
   }
 
@@ -206,7 +275,8 @@ class VGPlaybackPrewarmStartResult {
   @override
   String toString() =>
       'VGPlaybackPrewarmStartResult(phase=$phase, pass=$pass, '
-      'requestId=$requestId, state=${state.name})';
+      'requestId=$requestId, state=${state.name}, '
+      'storageGuardPass=$storageGuardPass, availableBytes=$availableBytes)';
 }
 
 /// Lifecycle states of an in-flight or completed prewarm job.
