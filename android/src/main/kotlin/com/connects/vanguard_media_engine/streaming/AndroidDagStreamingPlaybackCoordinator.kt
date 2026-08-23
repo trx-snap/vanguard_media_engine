@@ -108,6 +108,23 @@ class AndroidDagStreamingPlaybackCoordinator(
 
         val autoPlay = (args["autoPlay"] as? Boolean) ?: true
 
+        val networkProfileStr = (args["networkProfile"] as? String)?.trim()?.uppercase() ?: "AUTO"
+        val networkProfile = when (networkProfileStr) {
+            "AUTO"        -> AdaptiveStreamingNetworkProfile.AUTO
+            "STABLE"      -> AdaptiveStreamingNetworkProfile.STABLE
+            "CONSTRAINED" -> AdaptiveStreamingNetworkProfile.CONSTRAINED
+            "LOW_LATENCY" -> AdaptiveStreamingNetworkProfile.LOW_LATENCY
+            else -> {
+                result.error(
+                    "INVALID_ARG",
+                    "createAndroidDagPhase4C1D1StreamingPlayback: invalid networkProfile '$networkProfileStr'," +
+                        " expected AUTO, STABLE, CONSTRAINED, or LOW_LATENCY",
+                    null,
+                )
+                return
+            }
+        }
+
         val streamConfig = try {
             HttpAdaptiveStreamConfig(
                 uri = uri,
@@ -115,6 +132,7 @@ class AndroidDagStreamingPlaybackCoordinator(
                 httpHeaders = httpHeaders,
                 startPositionMs = startPositionMs,
                 autoPlay = autoPlay,
+                networkProfile = networkProfile,
             )
         } catch (t: Throwable) {
             result.error("INVALID_ARG", "createAndroidDagPhase4C1D1StreamingPlayback: invalid config: ${t.message}", null)

@@ -264,6 +264,8 @@ class AndroidDagStreamingPlaybackSession(
         val rawStatus = if (state == AndroidDagPlaybackState.Failed) "status=FAIL;state=${state.name};reason=${lastError ?: "unknown"}" else "status=OK;state=${state.name}"
         // Include adaptive timeline telemetry -- diagnostic-only.
         val tlSnapshot = adaptiveTimelineController.snapshot()
+        // Phase 4C5B: streaming network profile/policy diagnostics -- diagnostic-only.
+        val netPolicy = AdaptiveStreamingNetworkPolicy.forProfile(streamConfig.networkProfile)
         return mapOf(
             "pass" to (state != AndroidDagPlaybackState.Failed),
             "state" to state.name,
@@ -282,6 +284,8 @@ class AndroidDagStreamingPlaybackSession(
             "adaptiveTimelineStarted" to (tlSnapshot["isStarted"] as? Boolean),
             "adaptiveTimelineLastAcceptedPtsUs" to (tlSnapshot["lastAcceptedPtsUs"] as? Number)?.toLong(),
             "adaptiveTimelineLastAcceptedFrameIndex" to (tlSnapshot["lastAcceptedFrameIndex"] as? Number)?.toLong(),
+            "streamingNetworkProfile" to streamConfig.networkProfile.name,
+            "streamingNetworkPolicy" to netPolicy.toDiagnosticMap(),
         )
     }
 
@@ -565,6 +569,8 @@ class AndroidDagStreamingPlaybackSession(
         val isSurfaceLost = surfaceLost.get() || state == AndroidDagPlaybackState.SurfaceLost
         // Include adaptive timeline telemetry -- diagnostic-only.
         val tlSnapshot = adaptiveTimelineController.snapshot()
+        // Phase 4C5B: streaming network profile/policy diagnostics -- diagnostic-only.
+        val netPolicy = AdaptiveStreamingNetworkPolicy.forProfile(streamConfig.networkProfile)
         return mapOf(
             "pass" to pass,
             "state" to state.name,
@@ -583,6 +589,8 @@ class AndroidDagStreamingPlaybackSession(
             "adaptiveTimelineStarted" to (tlSnapshot["isStarted"] as? Boolean),
             "adaptiveTimelineLastAcceptedPtsUs" to (tlSnapshot["lastAcceptedPtsUs"] as? Number)?.toLong(),
             "adaptiveTimelineLastAcceptedFrameIndex" to (tlSnapshot["lastAcceptedFrameIndex"] as? Number)?.toLong(),
+            "streamingNetworkProfile" to streamConfig.networkProfile.name,
+            "streamingNetworkPolicy" to netPolicy.toDiagnosticMap(),
         )
     }
 }

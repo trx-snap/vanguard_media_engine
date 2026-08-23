@@ -1,5 +1,5 @@
 // Copyright (c) Connects - Phase 4C1B: HttpAdaptivePlaybackAdapter scaffold.
-// Scaffold only. No live network streaming is claimed or verified here.
+// Phase 4C5B: Added networkProfile for streaming network policy selection.
 
 package com.connects.vanguard_media_engine.streaming
 
@@ -35,6 +35,10 @@ enum class AdaptiveStreamFormat {
  *                        from the beginning (or live edge for live streams).
  * @param autoPlay       Whether playback should begin immediately once the player reaches
  *                       [HttpAdaptivePlaybackState.Ready].  Defaults to `true`.
+ * @param networkProfile Streaming network profile that controls the [AdaptiveStreamingNetworkPolicy]
+ *                       applied to the ExoPlayer instance built in [HttpAdaptivePlaybackAdapter].
+ *                       Defaults to [AdaptiveStreamingNetworkProfile.AUTO], which preserves all
+ *                       Media3 ExoPlayer defaults (no custom LoadControl or TrackSelector).
  */
 data class HttpAdaptiveStreamConfig(
     val uri: String,
@@ -42,6 +46,7 @@ data class HttpAdaptiveStreamConfig(
     val httpHeaders: Map<String, String>? = null,
     val startPositionMs: Long? = null,
     val autoPlay: Boolean = true,
+    val networkProfile: AdaptiveStreamingNetworkProfile = AdaptiveStreamingNetworkProfile.AUTO,
 ) {
     init {
         require(uri.isNotBlank()) {

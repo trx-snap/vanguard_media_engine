@@ -1,4 +1,5 @@
 // Copyright (c) Connects - Phase 4C1C: HttpAdaptivePlaybackAdapter with headless ImageReader bridge.
+// Phase 4C5B: Streaming network profile policy (AdaptiveStreamingNetworkPolicy) applied in prepare().
 // Scaffold with headless decode surface bridge enabled.  No live network streaming is claimed or
 // verified here.  Physical network streaming proof is deferred to Phase 4C device validation.
 
@@ -20,6 +21,7 @@ import androidx.media3.exoplayer.dash.DashMediaSource
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.trackselection.DefaultTrackSelector
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -118,6 +120,13 @@ class HttpAdaptivePlaybackAdapter(
 
     /** Current stream configuration.  Set during [prepare]. */
     private var activeConfig: HttpAdaptiveStreamConfig? = null
+
+    /**
+     * Network policy resolved for the currently prepared player (Phase 4C5B).
+     * Set in [prepare] from [AdaptiveStreamingNetworkPolicy.forProfile].
+     * Cleared to null in [tearDownPlayerOnHandlerThread] so it is absent after teardown/release.
+     */
+    private var activeNetworkPolicy: AdaptiveStreamingNetworkPolicy? = null
 
     // --- Headless bridge state (Phase 4C1C) --------------------------------------------------
 
@@ -281,9 +290,23 @@ class HttpAdaptivePlaybackAdapter(
 
             emitState(HttpAdaptivePlaybackState.Preparing)
 
-            val exo = ExoPlayer.Builder(context)
+            // --- Phase 4C5B: Resolve streaming network policy ----------------------------
+            // Compute the policy for this config's profile.  For AUTO the policy has
+            // customPolicyEnabled=false and no LoadControl / TrackSelector is installed,
+            // which preserves all Media3 ExoPlayer defaults unchanged.
+            val policy = AdaptiveStreamingNetworkPolicy.forProfile(config.networkProfile)
+            activeNetworkPolicy = policy
+
+            val exoBuilder = ExoPlayer.Builder(context)
                 .setLooper(handlerThread.looper)
-                .build()
+
+            if (policy.customPolicyEnabled) {
+                exoBuilder.setLoadControl(policy.buildLoadControl())
+                exoBuilder.setTrackSelector(policy.buildTrackSelector(context))
+            }
+            // AUTO: setLoadControl and setTrackSelector are not called; Media3 defaults apply.
+
+            val exo = exoBuilder.build()
 
             exo.addListener(playerListener)
             exo.playWhenReady = config.autoPlay
@@ -568,6 +591,8 @@ class HttpAdaptivePlaybackAdapter(
         val p = player ?: return
         player = null
         pendingSeekMs = null
+        // Phase 4C5B: clear policy reference so it is absent after teardown/release.
+        activeNetworkPolicy = null
 
         // 1. Detach surface before any decoder teardown (covers both external and bridge surfaces).
         p.setVideoSurface(null)

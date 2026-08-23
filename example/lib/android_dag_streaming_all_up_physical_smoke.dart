@@ -5,6 +5,9 @@
 //   1. HLS (Mux public test stream)
 //   2. DASH (Shaka demo Angel One stream)
 //   3. LL-HLS (Mux public low-latency stream)
+// Phase 4C5B: NETWORK_PROFILE dart-define selects the streaming network policy for this smoke.
+//   Default is CONSTRAINED (poor-network policy). Override with --dart-define=NETWORK_PROFILE=AUTO
+//   to use Media3 defaults.
 
 import 'dart:async';
 import 'dart:convert';
@@ -24,6 +27,14 @@ const int _initialHeight = int.fromEnvironment(
 );
 
 const int _waitSeconds = int.fromEnvironment('WAIT_SECONDS', defaultValue: 12);
+
+/// Streaming network profile to apply for every session in this smoke run.
+/// Defaults to CONSTRAINED (poor-network conservative policy).
+/// Override at build time: --dart-define=NETWORK_PROFILE=AUTO|STABLE|CONSTRAINED|LOW_LATENCY
+const String _networkProfile = String.fromEnvironment(
+  'NETWORK_PROFILE',
+  defaultValue: 'CONSTRAINED',
+);
 
 class _StreamTestCase {
   final String key;
@@ -120,6 +131,8 @@ class _AndroidDagStreamingAllUpPhysicalSmokeAppState
             'initialWidth': _initialWidth,
             'initialHeight': _initialHeight,
             'autoPlay': true,
+            // Phase 4C5B: forward the smoke-run network profile to Android.
+            'networkProfile': _networkProfile,
           },
         );
 
@@ -233,13 +246,36 @@ class _AndroidDagStreamingAllUpPhysicalSmokeAppState
           );
         }
 
+        // Phase 4C5B: Assert that the reported streamingNetworkProfile matches
+        // the profile we passed into create. Diagnostic-only assertion that
+        // does not alter existing frame/state pass criteria.
+        final reportedNetworkProfile =
+            diagMap['streamingNetworkProfile'] as String?;
+        bool networkProfilePass = true;
+        if (reportedNetworkProfile == null) {
+          networkProfilePass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_DAG_STREAMING_ALL_UP_${testCase.key.toUpperCase()}_NETWORK_PROFILE_FAIL:'
+            ' streamingNetworkProfile=null (expected $_networkProfile)',
+          );
+        } else if (reportedNetworkProfile != _networkProfile) {
+          networkProfilePass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_DAG_STREAMING_ALL_UP_${testCase.key.toUpperCase()}_NETWORK_PROFILE_FAIL:'
+            ' streamingNetworkProfile=$reportedNetworkProfile (expected $_networkProfile)',
+          );
+        }
+
         // 5. Pass only if renderedFrames > 0, pass != false, surfaceLost != true, state != Failed,
-        //    and all timeline assertions pass.
+        //    all timeline assertions pass, and network profile reported correctly.
         casePass = renderedFrames > 0 &&
             diagPass &&
             !surfaceLost &&
             state != 'Failed' &&
-            timelinePass;
+            timelinePass &&
+            networkProfilePass;
       } catch (error, stack) {
         // ignore: avoid_print
         print(
@@ -285,6 +321,8 @@ class _AndroidDagStreamingAllUpPhysicalSmokeAppState
             diagMap['adaptiveTimelineLastAcceptedPtsUs'],
         'adaptiveTimelineLastAcceptedFrameIndex':
             diagMap['adaptiveTimelineLastAcceptedFrameIndex'],
+        // Phase 4C5B: per-case network profile field.
+        'streamingNetworkProfile': diagMap['streamingNetworkProfile'],
         'raw':
             diagMap['raw']?.toString() ??
             (casePass ? 'status=OK' : 'status=FAIL'),
@@ -331,6 +369,14 @@ class _AndroidDagStreamingAllUpPhysicalSmokeAppState
           results['dash']?['adaptiveTimelineAcceptedFrames'],
       'llHlsAdaptiveTimelineAcceptedFrames':
           results['llHls']?['adaptiveTimelineAcceptedFrames'],
+      // Phase 4C5B: per-protocol streaming network profile fields.
+      'networkProfileUsed': _networkProfile,
+      'hlsStreamingNetworkProfile':
+          results['hls']?['streamingNetworkProfile'],
+      'dashStreamingNetworkProfile':
+          results['dash']?['streamingNetworkProfile'],
+      'llHlsStreamingNetworkProfile':
+          results['llHls']?['streamingNetworkProfile'],
       'cases': results,
     };
 
