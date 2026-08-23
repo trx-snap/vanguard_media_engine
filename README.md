@@ -484,6 +484,57 @@ if (report.pass) {
   - Android: Backed by native codec capability inspection and adaptive network policy engine.
   - iOS: Public Dart API is safe to import on iOS and returns typed unsupported report objects (`phase: 'unsupported'`, `pass: false`) until native AVPlayer preflight is implemented.
 
+## Streaming Cache Prewarm Planner Recipe
+
+The package exposes `VGStreamingCachePrewarmPlanner` to bridge candidate stream descriptors (`VGStreamingSourceDescriptor` / `VGStreamingSourceSet`) into deterministic, bounded cache prewarm requests (`VGPlaybackPrewarmRequest` / `VGStreamingCachePrewarmPlan`) without platform coupling or side effects. Requests can be dispatched directly via the `VGStreamingCacheClient.prewarmRequest` extension.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+Future<void> planAndPrewarmStreams() async {
+  // 1. Define candidate stream sources in a source set
+  final sourceSet = VGStreamingSourceSet(
+    sources: [
+      VGStreamingSourceDescriptor(
+        key: 'primary_hls',
+        uri: Uri.parse('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8'),
+        formatHint: VGStreamingFormatHint.hls,
+        initialWidth: 1080,
+        initialHeight: 1920,
+      ),
+      VGStreamingSourceDescriptor(
+        key: 'll_live',
+        uri: Uri.parse(
+          'https://stream.mux.com/v69RSHhFelSm4701snP22dYz2jICy4E4FUyk02rW4gxRM.m3u8',
+        ),
+        formatHint: VGStreamingFormatHint.hls,
+        initialWidth: 1080,
+        initialHeight: 1920,
+        requireLlHlsTags: true,
+      ),
+    ],
+  );
+
+  // 2. Synthesize prewarm plan with low-latency constraints
+  final plan = VGStreamingCachePrewarmPlanner.planForSourceSet(
+    sourceSet: sourceSet,
+    requestIdPrefix: 'feed_prewarm',
+    sourceKeys: const ['primary_hls', 'll_live'],
+    maxBytes: 2 * 1024 * 1024,
+    lowLatencyPolicy: VGStreamingCachePrewarmLowLatencyPolicy.skipLowLatency,
+  );
+
+  // 3. Dispatch planned prewarm requests to cache client
+  final client = VGStreamingCacheClient();
+  for (final request in plan.requests) {
+    final startResult = await client.prewarmRequest(request);
+    print('Started prewarm for ${request.requestId}: ${startResult.state}');
+  }
+}
+```
+
 ## Streaming Cache API
 
 The package exposes `VGStreamingCacheClient` to manage media prewarming and caching for streaming video/audio playback.
