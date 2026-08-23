@@ -4,6 +4,72 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Streaming Playback Decision Planner Recipe
+
+The package exposes `VGStreamingPlaybackDecisionPlanner` to combine preflight advisories (`VGStreamingPreflightReport`), startup plans (`VGStreamingStartupPlan`), and source selection (`VGStreamingSourceSelector`) into a single immutable app-facing decision object (`VGStreamingPlaybackDecision`).
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+Future<void> planAndPlayStream() async {
+  // 1. Define candidate stream sources in a source set
+  final sourceSet = VGStreamingSourceSet(
+    sources: [
+      VGStreamingSourceDescriptor(
+        key: 'primary_hls',
+        uri: Uri.parse('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8'),
+        formatHint: VGStreamingFormatHint.hls,
+        initialWidth: 1080,
+        initialHeight: 1920,
+      ),
+      VGStreamingSourceDescriptor(
+        key: 'backup_dash',
+        uri: Uri.parse(
+          'https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd',
+        ),
+        formatHint: VGStreamingFormatHint.dash,
+        initialWidth: 1080,
+        initialHeight: 1920,
+      ),
+    ],
+  );
+
+  // 2. Synthesize preflight request from source set and evaluate
+  final preflightClient = VGStreamingPreflightClient();
+  final preflightReport = await preflightClient.evaluate(
+    sourceSet.toPreflightRequest(
+      requestedNetworkProfile: VGStreamingNetworkProfile.constrained,
+    ),
+  );
+
+  // 3. Plan playback decision using pure-Dart planner
+  final decision = VGStreamingPlaybackDecisionPlanner.plan(
+    VGStreamingPlaybackDecisionRequest(
+      sourceSet: sourceSet,
+      preflightReport: preflightReport,
+      preference: VGStreamingSourceSelectionPreference.preserveOrder,
+      preferredKeys: const ['primary_hls'],
+    ),
+  );
+
+  if (!decision.canOpenPlayback || decision.playbackOptions == null) {
+    print('Playback blocked: ${decision.decision}, warnings: ${decision.warnings}');
+    return;
+  }
+
+  // 4. Open playback session using planned options and control media
+  final playbackClient = VGStreamingPlaybackClient();
+  var session = await playbackClient.open(decision.playbackOptions!);
+  session = await playbackClient.play(session);
+
+  // 5. Stop and release
+  session = await playbackClient.stop(session);
+  await playbackClient.dispose(session);
+}
+```
+
 ## Streaming Source Selector Recipe
 
 The package exposes `VGStreamingSourceSelector` to evaluate candidate streaming source descriptors against a validated `VGStreamingStartupPlan` and caller selection preferences (e.g. `preserveOrder`, `preferHls`, `preferDash`, `preferLowLatency`, `preferConstrainedReliability`, or specific `preferredKeys`).
