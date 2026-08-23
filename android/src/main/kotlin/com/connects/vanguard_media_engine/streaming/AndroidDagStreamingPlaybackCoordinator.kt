@@ -36,6 +36,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C5AStreamingCodecCapabilitySmoke",
             "runAndroidDagPhase4C5CManifestRenditionSmoke",
             "runAndroidDagPhase4C5DManifestPolicyValidation",
+            "runAndroidDagPhase4C5ECompatibilityDecisionSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -58,6 +59,7 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C5AStreamingCodecCapabilitySmoke" -> runAdaptiveStreamingCodecCapabilitySmoke(result)
             "runAndroidDagPhase4C5CManifestRenditionSmoke" -> runAdaptiveStreamingManifestRenditionSmoke(result)
             "runAndroidDagPhase4C5DManifestPolicyValidation" -> runAdaptiveStreamingManifestPolicyValidation(args, result)
+            "runAndroidDagPhase4C5ECompatibilityDecisionSmoke" -> runAdaptiveStreamingCompatibilityDecisionSmoke(args, result)
             else -> return false
         }
         return true
@@ -474,6 +476,19 @@ class AndroidDagStreamingPlaybackCoordinator(
                 AdaptiveStreamingManifestPolicySmokeHarness.runHostManifestPolicyValidation(manifests)
             } else {
                 AdaptiveStreamingManifestPolicySmokeHarness.runDefaultPublicManifestPolicySmoke()
+            }
+            mainHandler.post { result.success(smokeResult) }
+        }.start()
+    }
+
+    private fun runAdaptiveStreamingCompatibilityDecisionSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        @Suppress("UNCHECKED_CAST")
+        val manifests = args?.get("manifests") as? List<Map<*, *>>
+        Thread {
+            val smokeResult = if (manifests != null && manifests.isNotEmpty()) {
+                AdaptiveStreamingCompatibilityDecisionSmokeHarness.runHostCompatibilityDecision(manifests)
+            } else {
+                AdaptiveStreamingCompatibilityDecisionSmokeHarness.runDefaultPublicCompatibilityDecisionSmoke()
             }
             mainHandler.post { result.success(smokeResult) }
         }.start()
