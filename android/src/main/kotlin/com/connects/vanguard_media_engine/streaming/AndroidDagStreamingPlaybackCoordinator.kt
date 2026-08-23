@@ -13,6 +13,9 @@ import io.flutter.view.TextureRegistry
  * Exposes [AndroidDagStreamingPlaybackSession] instances behind a diagnostic MethodChannel
  * coordinator. Owns active streaming sessions keyed by SurfaceProducer textureId, mirroring
  * the AndroidDagTexturePlaybackCoordinator style.
+ *
+ * Phase 4C6E: owns a coordinator-level [AndroidDagPlaybackPrewarmEngine] for public prewarm
+ * jobs submitted via the four public MethodChannel routes.
  */
 class AndroidDagStreamingPlaybackCoordinator(
     private val context: Context,
@@ -41,10 +44,17 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C6BPlaybackCacheBackendSmoke",
             "runAndroidDagPhase4C6CPrewarmSmoke",
             "runAndroidDagPhase4C6DCacheHitSmoke",
+            // Phase 4C6E: public package-level streaming cache API surface.
+            "getPlaybackCacheStatus",
+            "startPlaybackCachePrewarm",
+            "cancelPlaybackCachePrewarm",
+            "getPlaybackCachePrewarmStatus",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
     }
+
+    private val prewarmEngine = AndroidDagPlaybackPrewarmEngine(context)
 
     fun ownsMethod(method: String): Boolean = Companion.ownsMethod(method)
 
@@ -68,6 +78,12 @@ class AndroidDagStreamingPlaybackCoordinator(
             "runAndroidDagPhase4C6BPlaybackCacheBackendSmoke" -> runAndroidDagPhase4C6BPlaybackCacheBackendSmoke(result)
             "runAndroidDagPhase4C6CPrewarmSmoke" -> runAndroidDagPhase4C6CPrewarmSmoke(args, result)
             "runAndroidDagPhase4C6DCacheHitSmoke" -> runAndroidDagPhase4C6DCacheHitSmoke(args, result)
+            // Phase 4C6E: public package-level streaming cache API surface.
+            "getPlaybackCacheStatus"       -> getPlaybackCacheStatus(args, result)
+            "startPlaybackCachePrewarm"    -> startPlaybackCachePrewarm(args, result)
+            "cancelPlaybackCachePrewarm"   -> cancelPlaybackCachePrewarm(args, result)
+            "getPlaybackCachePrewarmStatus" -> getPlaybackCachePrewarmStatus(args, result)
+
             else -> return false
         }
         return true
@@ -484,9 +500,254 @@ class AndroidDagStreamingPlaybackCoordinator(
                 }
             } catch (_: Throwable) {}
         }
+        // Phase 4C6E: shut down the public prewarm engine owned by this coordinator.
+        try { prewarmEngine.shutdown() } catch (_: Throwable) {}
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 4C6E: Public streaming cache API handlers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Phase 4C6E: Returns a diagnostic status map for the streaming cache backend.
+     *
+     * Parses optional cache config args (`cacheEnabled`, `cacheMaxBytes`, `cacheDirectoryName`).
+     * Never throws; always returns a structured result via [result.success].
+     */
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private fun getPlaybackCacheStatus(args: Map<*, *>?, result: MethodChannel.Result) {
+        Thread {
+            val cacheConfig = parseCacheConfigForPublicApi(args)
+            val statusMap = try {
+                val manager = AndroidDagPlaybackCacheManager.getOrCreate(context, cacheConfig)
+                val diag = manager.diagnosticStatus()
+                mapOf(
+                    "phase"          to "Phase4C6E",
+                    "pass"           to true,
+                    "state"          to "available",
+                    "cacheAvailable" to manager.isCacheAvailable,
+                    "cacheEnabled"   to cacheConfig.enabled,
+                    "cacheDir"       to diag["cacheDir"],
+                    "maxCacheBytes"  to diag["maxCacheBytes"],
+                    "cachedBytes"    to diag["cachedBytes"],
+                    "raw"            to "status=OK;cacheEnabled=${cacheConfig.enabled}" +
+                        ";cacheAvailable=${manager.isCacheAvailable}",
+                )
+            } catch (t: Throwable) {
+                Log.w(TAG, "Phase4C6E getPlaybackCacheStatus: error: ${t.message}", t)
+                mapOf(
+                    "phase"          to "Phase4C6E",
+                    "pass"           to false,
+                    "state"          to "error",
+                    "cacheAvailable" to false,
+                    "cacheEnabled"   to cacheConfig.enabled,
+                    "raw"            to "status=FAIL;reason=${t.javaClass.simpleName}:${t.message}",
+                )
+            }
+            mainHandler.post { result.success(statusMap) }
+        }.start()
+    }
+
+    /**
+     * Phase 4C6E: Starts a public prewarm job via the coordinator-level [prewarmEngine].
+     *
+     * Parses required `requestId`, `uri`, and optional `httpHeaders`, `maxBytes`, cache config
+     * args.  Rejects blank requestId/uri and disabled cache without throwing a native crash;
+     * invalid args return a structured error map via [result.success].
+     *
+     * Returns immediately with `state` = `accepted` | `duplicate` | `invalid` | `shutdown`.
+     * Completion is observable via [getPlaybackCachePrewarmStatus].
+     */
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private fun startPlaybackCachePrewarm(args: Map<*, *>?, result: MethodChannel.Result) {
+        val requestId = (args?.get("requestId") as? String)?.trim() ?: ""
+        val uri = (args?.get("uri") as? String)?.trim() ?: ""
+
+        if (requestId.isBlank()) {
+            result.success(mapOf(
+                "phase"          to "Phase4C6E",
+                "pass"           to false,
+                "requestId"      to requestId,
+                "state"          to "invalid",
+                "cacheAvailable" to false,
+                "raw"            to "status=FAIL;reason=blank_requestId",
+            ))
+            return
+        }
+        if (uri.isBlank()) {
+            result.success(mapOf(
+                "phase"          to "Phase4C6E",
+                "pass"           to false,
+                "requestId"      to requestId,
+                "state"          to "invalid",
+                "cacheAvailable" to false,
+                "raw"            to "status=FAIL;reason=blank_uri",
+            ))
+            return
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        val httpHeaders = (args?.get("httpHeaders") as? Map<*, *>)?.mapNotNull { (k, v) ->
+            if (k is String && v is String) k to v else null
+        }?.toMap()
+
+        val maxBytesRaw = (args?.get("maxBytes") as? Number)?.toLong()
+        val maxBytes = if (maxBytesRaw != null && maxBytesRaw > 0L) maxBytesRaw else 2L * 1024L * 1024L
+
+        val cacheConfig = parseCacheConfigForPublicApi(args)
+
+        if (!cacheConfig.enabled) {
+            result.success(mapOf(
+                "phase"          to "Phase4C6E",
+                "pass"           to false,
+                "requestId"      to requestId,
+                "state"          to "invalid",
+                "cacheAvailable" to false,
+                "raw"            to "status=FAIL;reason=cache_disabled_for_prewarm",
+            ))
+            return
+        }
+
+        val request = try {
+            AndroidDagPlaybackPrewarmRequest(
+                requestId  = requestId,
+                uri        = uri,
+                httpHeaders = httpHeaders,
+                maxBytes   = maxBytes,
+                cacheConfig = cacheConfig,
+            )
+        } catch (iae: IllegalArgumentException) {
+            result.success(mapOf(
+                "phase"          to "Phase4C6E",
+                "pass"           to false,
+                "requestId"      to requestId,
+                "state"          to "invalid",
+                "cacheAvailable" to false,
+                "raw"            to "status=FAIL;reason=invalid_request:${iae.message}",
+            ))
+            return
+        }
+
+        val accepted = prewarmEngine.start(request) { jobResult ->
+            // Log terminal result on the executor thread; callers poll via getPlaybackCachePrewarmStatus.
+            val finalState = jobResult["state"] as? String ?: "unknown"
+            val bytesCached = jobResult["bytesCached"] ?: 0L
+            Log.d(TAG, "Phase4C6E prewarm terminal: requestId=$requestId state=$finalState bytesCached=$bytesCached")
+        }
+
+        val state = when {
+            accepted -> "accepted"
+            prewarmEngine.status(requestId)["state"] != "not_found" -> "duplicate"
+            else -> "shutdown"
+        }
+
+        result.success(mapOf(
+            "phase"          to "Phase4C6E",
+            "pass"           to accepted,
+            "requestId"      to requestId,
+            "state"          to state,
+            // cacheAvailable is NOT set here: start returns immediately before the background job
+            // has initialised SimpleCache.  Report config intent via cacheEnabled only; runtime
+            // availability is proven later via getPlaybackCachePrewarmStatus / getPlaybackCacheStatus.
+            "cacheAvailable" to false,
+            "cacheEnabled"   to cacheConfig.enabled,
+            "raw"            to "status=OK;accepted=$accepted;state=$state;requestId=$requestId",
+        ))
+    }
+
+    /**
+     * Phase 4C6E: Cancels a public prewarm job.
+     *
+     * A missing [requestId] returns a structured error rather than crashing.
+     * Cancelling an already-finished job returns safe=true (idempotent from the caller's POV).
+     */
+    private fun cancelPlaybackCachePrewarm(args: Map<*, *>?, result: MethodChannel.Result) {
+        val requestId = (args?.get("requestId") as? String)?.trim() ?: ""
+        if (requestId.isBlank()) {
+            result.success(mapOf(
+                "phase"     to "Phase4C6E",
+                "pass"      to false,
+                "requestId" to requestId,
+                "state"     to "invalid",
+                "raw"       to "status=FAIL;reason=blank_requestId",
+            ))
+            return
+        }
+
+        val cancelled = prewarmEngine.cancel(requestId)
+        result.success(mapOf(
+            "phase"     to "Phase4C6E",
+            "pass"      to true,   // cancelling a missing/finished job is safe
+            "requestId" to requestId,
+            "state"     to if (cancelled) "cancel_requested" else "not_found_or_terminal",
+            "raw"       to "status=OK;cancelled=$cancelled;requestId=$requestId",
+        ))
+    }
+
+    /**
+     * Phase 4C6E: Returns the current status of a public prewarm job.
+     *
+     * A missing [requestId] is gracefully returned as state=not_found.
+     */
+    private fun getPlaybackCachePrewarmStatus(args: Map<*, *>?, result: MethodChannel.Result) {
+        val requestId = (args?.get("requestId") as? String)?.trim() ?: ""
+        if (requestId.isBlank()) {
+            result.success(mapOf(
+                "phase"          to "Phase4C6E",
+                "pass"           to false,
+                "requestId"      to requestId,
+                "state"          to "invalid",
+                "cacheAvailable" to false,
+                "raw"            to "status=FAIL;reason=blank_requestId",
+            ))
+            return
+        }
+
+        val statusMap = prewarmEngine.status(requestId).toMutableMap().apply {
+            put("phase", "Phase4C6E")
+            putIfAbsent("pass", get("state") != "failed")
+        }
+        result.success(statusMap)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Phase 4C6E: Shared arg-parsing helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Parses optional cache config args from a MethodChannel args map and returns a safe
+     * [AndroidDagPlaybackCacheConfig].  Mirrors the parsing pattern in [createStreamingPlayback].
+     *
+     * - `cacheEnabled` (Boolean) — defaults to `true` for public prewarm API callers.
+     * - `cacheMaxBytes` (Number) — clamped to config default if invalid.
+     * - `cacheDirectoryName` (String) — rejected if blank or contains path separators.
+     */
+    private fun parseCacheConfigForPublicApi(args: Map<*, *>?): AndroidDagPlaybackCacheConfig {
+        val cacheEnabled: Boolean = (args?.get("cacheEnabled") as? Boolean) ?: true
+        val cacheMaxBytesRaw: Long? = (args?.get("cacheMaxBytes") as? Number)?.toLong()
+        val cacheDirName: String? = args?.get("cacheDirectoryName") as? String
+
+        return try {
+            AndroidDagPlaybackCacheConfig(
+                enabled = cacheEnabled,
+                maxCacheBytes = if (cacheMaxBytesRaw != null && cacheMaxBytesRaw > 0L)
+                    cacheMaxBytesRaw
+                else
+                    AndroidDagPlaybackCacheConfig().maxCacheBytes,
+                cacheDirectoryName = if (!cacheDirName.isNullOrBlank()
+                    && !cacheDirName.contains('/') && !cacheDirName.contains('\\'))
+                    cacheDirName
+                else
+                    AndroidDagPlaybackCacheConfig().cacheDirectoryName,
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "Phase4C6E parseCacheConfig: validation threw - using enabled default: ${t.message}")
+            AndroidDagPlaybackCacheConfig(enabled = true)
+        }
     }
 
     private fun runAdaptiveStreamTimelineSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+
         val frameCount = (args?.get("frameCount") as? Number)?.toInt() ?: 5
         Thread {
             val smokeResult = AdaptiveStreamTimelineSmokeHarness.run(frameCount)

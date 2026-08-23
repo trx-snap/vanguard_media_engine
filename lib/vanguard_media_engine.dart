@@ -93,6 +93,8 @@ export 'src/roi/vg_imported_roi_sidecar_builder.dart';
 export 'vg_timeline_live_controls.dart';
 // V-B1/V-B2: per-track live mix-gain control (no updateDraft call).
 export 'vg_timeline_audio_mix_controls.dart';
+// Phase 4C6E: public package-level streaming cache/prewarm API surface (Android-backed).
+export 'vg_streaming_cache_client.dart';
 
 const String _libName = 'vanguard_media_engine';
 
