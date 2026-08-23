@@ -101,6 +101,8 @@ export 'vg_streaming_playback_client.dart';
 export 'vg_streaming_preflight_client.dart';
 // Phase 4C7G: public streaming startup plan helper.
 export 'vg_streaming_startup_plan.dart';
+// Phase 4C7I: public streaming source descriptor & source set.
+export 'vg_streaming_source_descriptor.dart';
 
 const String _libName = 'vanguard_media_engine';
 
