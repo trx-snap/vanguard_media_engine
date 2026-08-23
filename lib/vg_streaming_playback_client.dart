@@ -32,13 +32,17 @@ enum VGStreamingFormatHint {
     VGStreamingFormatHint.dash => 'DASH',
   };
 
-  /// Parses a string into [VGStreamingFormatHint], defaulting to [VGStreamingFormatHint.auto].
-  static VGStreamingFormatHint fromString(String? value) {
-    if (value == null) return VGStreamingFormatHint.auto;
+  /// Parses a string into [VGStreamingFormatHint], defaulting to [fallback].
+  static VGStreamingFormatHint fromString(
+    String? value, {
+    VGStreamingFormatHint fallback = VGStreamingFormatHint.auto,
+  }) {
+    if (value == null) return fallback;
     return switch (value.trim().toLowerCase()) {
       'hls' => VGStreamingFormatHint.hls,
       'dash' => VGStreamingFormatHint.dash,
-      _ => VGStreamingFormatHint.auto,
+      'auto' => VGStreamingFormatHint.auto,
+      _ => fallback,
     };
   }
 }
@@ -273,7 +277,10 @@ class VGStreamingPlaybackSession {
   });
 
   /// Constructs a [VGStreamingPlaybackSession] from a raw platform dictionary.
-  factory VGStreamingPlaybackSession.fromMap(Map<Object?, Object?> map) {
+  factory VGStreamingPlaybackSession.fromMap(
+    Map<Object?, Object?> map, {
+    VGStreamingFormatHint fallbackFormat = VGStreamingFormatHint.auto,
+  }) {
     final stringMap = _defensiveStringMap(map);
 
     final pass = stringMap['pass'] as bool? ?? false;
@@ -290,7 +297,10 @@ class VGStreamingPlaybackSession {
 
     final formatStr =
         stringMap['format'] as String? ?? stringMap['formatHint'] as String?;
-    final format = VGStreamingFormatHint.fromString(formatStr);
+    final format = VGStreamingFormatHint.fromString(
+      formatStr,
+      fallback: fallbackFormat,
+    );
 
     final durationMs = (stringMap['durationMs'] as num?)?.toInt() ?? -1;
     final positionMs = (stringMap['positionMs'] as num?)?.toInt() ?? 0;
@@ -403,7 +413,10 @@ class VGStreamingPlaybackClient {
       if (raw is! Map) {
         return VGStreamingPlaybackSession.unsupported();
       }
-      return VGStreamingPlaybackSession.fromMap(raw.cast<Object?, Object?>());
+      return VGStreamingPlaybackSession.fromMap(
+        raw.cast<Object?, Object?>(),
+        fallbackFormat: options.formatHint,
+      );
     } on MissingPluginException {
       return VGStreamingPlaybackSession.unsupported();
     }
@@ -421,7 +434,10 @@ class VGStreamingPlaybackClient {
       if (raw is! Map) {
         return VGStreamingPlaybackSession.unsupported();
       }
-      return VGStreamingPlaybackSession.fromMap(raw.cast<Object?, Object?>());
+      return VGStreamingPlaybackSession.fromMap(
+        raw.cast<Object?, Object?>(),
+        fallbackFormat: session.format,
+      );
     } on MissingPluginException {
       return VGStreamingPlaybackSession.unsupported();
     }
@@ -439,7 +455,10 @@ class VGStreamingPlaybackClient {
       if (raw is! Map) {
         return VGStreamingPlaybackSession.unsupported();
       }
-      return VGStreamingPlaybackSession.fromMap(raw.cast<Object?, Object?>());
+      return VGStreamingPlaybackSession.fromMap(
+        raw.cast<Object?, Object?>(),
+        fallbackFormat: session.format,
+      );
     } on MissingPluginException {
       return VGStreamingPlaybackSession.unsupported();
     }
@@ -461,7 +480,10 @@ class VGStreamingPlaybackClient {
       if (raw is! Map) {
         return VGStreamingPlaybackSession.unsupported();
       }
-      return VGStreamingPlaybackSession.fromMap(raw.cast<Object?, Object?>());
+      return VGStreamingPlaybackSession.fromMap(
+        raw.cast<Object?, Object?>(),
+        fallbackFormat: session.format,
+      );
     } on MissingPluginException {
       return VGStreamingPlaybackSession.unsupported();
     }
@@ -479,7 +501,10 @@ class VGStreamingPlaybackClient {
       if (raw is! Map) {
         return VGStreamingPlaybackSession.unsupported();
       }
-      return VGStreamingPlaybackSession.fromMap(raw.cast<Object?, Object?>());
+      return VGStreamingPlaybackSession.fromMap(
+        raw.cast<Object?, Object?>(),
+        fallbackFormat: session.format,
+      );
     } on MissingPluginException {
       return VGStreamingPlaybackSession.unsupported();
     }
@@ -497,7 +522,10 @@ class VGStreamingPlaybackClient {
       if (raw is! Map) {
         return VGStreamingPlaybackSession.unsupported();
       }
-      return VGStreamingPlaybackSession.fromMap(raw.cast<Object?, Object?>());
+      return VGStreamingPlaybackSession.fromMap(
+        raw.cast<Object?, Object?>(),
+        fallbackFormat: session.format,
+      );
     } on MissingPluginException {
       return VGStreamingPlaybackSession.unsupported();
     }

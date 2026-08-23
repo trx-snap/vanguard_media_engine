@@ -56,6 +56,44 @@ void main() {
         equals(VGStreamingFormatHint.auto),
       );
     });
+
+    test('fromString with fallback parameter works', () {
+      expect(
+        VGStreamingFormatHint.fromString(
+          null,
+          fallback: VGStreamingFormatHint.hls,
+        ),
+        equals(VGStreamingFormatHint.hls),
+      );
+      expect(
+        VGStreamingFormatHint.fromString(
+          'invalid',
+          fallback: VGStreamingFormatHint.dash,
+        ),
+        equals(VGStreamingFormatHint.dash),
+      );
+      expect(
+        VGStreamingFormatHint.fromString(
+          'hls',
+          fallback: VGStreamingFormatHint.dash,
+        ),
+        equals(VGStreamingFormatHint.hls),
+      );
+      expect(
+        VGStreamingFormatHint.fromString(
+          'dash',
+          fallback: VGStreamingFormatHint.hls,
+        ),
+        equals(VGStreamingFormatHint.dash),
+      );
+      expect(
+        VGStreamingFormatHint.fromString(
+          'auto',
+          fallback: VGStreamingFormatHint.hls,
+        ),
+        equals(VGStreamingFormatHint.auto),
+      );
+    });
   });
 
   group('VGStreamingNetworkProfile', () {
@@ -473,6 +511,47 @@ void main() {
       expect(session.raw, equals('status=UNSUPPORTED;platform=non-android'));
       expect(session.toString(), contains('unsupported'));
     });
+
+    test(
+      'fromMap preserves fallbackFormat when native format/formatHint is absent or unknown',
+      () {
+        final absentMap = <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'state': 'Playing',
+        };
+        final session1 = VGStreamingPlaybackSession.fromMap(
+          absentMap,
+          fallbackFormat: VGStreamingFormatHint.hls,
+        );
+        expect(session1.format, equals(VGStreamingFormatHint.hls));
+
+        final unknownMap = <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'format': 'unknown_format',
+        };
+        final session2 = VGStreamingPlaybackSession.fromMap(
+          unknownMap,
+          fallbackFormat: VGStreamingFormatHint.dash,
+        );
+        expect(session2.format, equals(VGStreamingFormatHint.dash));
+
+        final explicitMap = <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'format': 'DASH',
+        };
+        final session3 = VGStreamingPlaybackSession.fromMap(
+          explicitMap,
+          fallbackFormat: VGStreamingFormatHint.hls,
+        );
+        expect(session3.format, equals(VGStreamingFormatHint.dash));
+
+        final defaultFallback = VGStreamingPlaybackSession.fromMap(absentMap);
+        expect(defaultFallback.format, equals(VGStreamingFormatHint.auto));
+      },
+    );
   });
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -535,6 +614,68 @@ void main() {
     );
 
     test(
+      'open with formatHint HLS preserves format when native response omits format',
+      () async {
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'createAndroidDagPhase4C1D1StreamingPlayback') {
+            return <Object?, Object?>{
+              'pass': true,
+              'phase': 'Phase4C1D1',
+              'textureId': 88,
+              'sessionId': 'stream_sess_88',
+              'state': 'Playing',
+              'raw': 'status=OK;state=Playing',
+            };
+          }
+          return null;
+        });
+
+        final client = VGStreamingPlaybackClient(channel: channel);
+        final options = VGStreamingPlaybackOptions(
+          uri: Uri.parse('https://example.com/live.m3u8'),
+          initialWidth: 1280,
+          initialHeight: 720,
+          formatHint: VGStreamingFormatHint.hls,
+        );
+
+        final session = await client.open(options);
+        expect(session.pass, isTrue);
+        expect(session.format, equals(VGStreamingFormatHint.hls));
+      },
+    );
+
+    test(
+      'open with formatHint DASH preserves format when native response omits format',
+      () async {
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'createAndroidDagPhase4C1D1StreamingPlayback') {
+            return <Object?, Object?>{
+              'pass': true,
+              'phase': 'Phase4C1D1',
+              'textureId': 89,
+              'sessionId': 'stream_sess_89',
+              'state': 'Playing',
+              'raw': 'status=OK;state=Playing',
+            };
+          }
+          return null;
+        });
+
+        final client = VGStreamingPlaybackClient(channel: channel);
+        final options = VGStreamingPlaybackOptions(
+          uri: Uri.parse('https://example.com/manifest.mpd'),
+          initialWidth: 1920,
+          initialHeight: 1080,
+          formatHint: VGStreamingFormatHint.dash,
+        );
+
+        final session = await client.open(options);
+        expect(session.pass, isTrue);
+        expect(session.format, equals(VGStreamingFormatHint.dash));
+      },
+    );
+
+    test(
       'play forwards textureId to playAndroidDagPhase4C1D1StreamingPlayback',
       () async {
         MethodCall? recordedCall;
@@ -574,6 +715,7 @@ void main() {
         expect(recordedCall!.arguments, equals({'textureId': 77}));
         expect(result.pass, isTrue);
         expect(result.state, equals(VGStreamingPlaybackState.playing));
+        expect(result.format, equals(VGStreamingFormatHint.hls));
       },
     );
 
@@ -617,6 +759,7 @@ void main() {
         expect(recordedCall!.arguments, equals({'textureId': 77}));
         expect(result.pass, isTrue);
         expect(result.state, equals(VGStreamingPlaybackState.paused));
+        expect(result.format, equals(VGStreamingFormatHint.hls));
       },
     );
 
@@ -665,6 +808,7 @@ void main() {
         expect(result.pass, isTrue);
         expect(result.state, equals(VGStreamingPlaybackState.seeking));
         expect(result.positionMs, equals(5000));
+        expect(result.format, equals(VGStreamingFormatHint.hls));
       },
     );
 
@@ -708,6 +852,7 @@ void main() {
         expect(recordedCall!.arguments, equals({'textureId': 77}));
         expect(result.pass, isTrue);
         expect(result.state, equals(VGStreamingPlaybackState.idle));
+        expect(result.format, equals(VGStreamingFormatHint.hls));
       },
     );
 
@@ -753,6 +898,49 @@ void main() {
         expect(result.pass, isTrue);
         expect(result.renderedFrames, equals(450));
         expect(result.state, equals(VGStreamingPlaybackState.playing));
+        expect(result.format, equals(VGStreamingFormatHint.hls));
+      },
+    );
+
+    test(
+      'getStatus and control methods preserve prior session.format when native response omits format',
+      () async {
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          return <Object?, Object?>{
+            'pass': true,
+            'phase': 'Phase4C1D1',
+            'textureId': 77,
+            'state': 'Playing',
+            'raw': 'status=OK;state=Playing',
+          };
+        });
+
+        final client = VGStreamingPlaybackClient(channel: channel);
+        const session = VGStreamingPlaybackSession(
+          pass: true,
+          phase: 'Phase4C1D1',
+          sessionId: 'stream_sess_77',
+          textureId: 77,
+          format: VGStreamingFormatHint.dash,
+          state: VGStreamingPlaybackState.paused,
+          raw: 'status=OK;state=Paused',
+          diagnostics: {},
+        );
+
+        final statusResult = await client.getStatus(session);
+        expect(statusResult.format, equals(VGStreamingFormatHint.dash));
+
+        final playResult = await client.play(session);
+        expect(playResult.format, equals(VGStreamingFormatHint.dash));
+
+        final pauseResult = await client.pause(session);
+        expect(pauseResult.format, equals(VGStreamingFormatHint.dash));
+
+        final seekResult = await client.seek(session, 5000);
+        expect(seekResult.format, equals(VGStreamingFormatHint.dash));
+
+        final stopResult = await client.stop(session);
+        expect(stopResult.format, equals(VGStreamingFormatHint.dash));
       },
     );
 
