@@ -109,6 +109,8 @@ export 'vg_streaming_source_selector.dart';
 export 'vg_streaming_playback_decision.dart';
 // Phase 4C7O: public streaming playback controller facade.
 export 'vg_streaming_playback_controller.dart';
+// Phase 4C7Q: public streaming playback texture view widget.
+export 'vg_streaming_playback_view.dart';
 
 const String _libName = 'vanguard_media_engine';
 
