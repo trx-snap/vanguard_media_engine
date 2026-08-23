@@ -1,5 +1,6 @@
 // Copyright (c) Connects - Phase 4C1D1A: Android True-DAG Streaming Playback Session.
 // Non-exposed streaming session class bridging Media3 ExoPlayer decode frames to native DAG Vulkan render.
+// Phase 4C4J-M: Adaptive stream timeline telemetry (diagnostic-only).
 
 package com.connects.vanguard_media_engine.streaming
 
@@ -17,9 +18,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Vanguard Android True-DAG Phase 4C1D1A: Streaming playback session.
  *
- * Route: HttpAdaptivePlaybackAdapter (Media3 ExoPlayer) -> HttpAdaptiveImageReaderBridge ->
- *        HttpAdaptiveDecodedFrame (HardwareBuffer) -> native DAG generation-aware evaluation ->
- *        Vulkan render -> Flutter TextureRegistry SurfaceProducer.
+ * Route: HttpAdaptivePlaybackAdapter (Media3 ExoPlayer) ->
+ *        HttpAdaptiveImageReaderBridge -> HttpAdaptiveDecodedFrame (HardwareBuffer) ->
+ *        native DAG generation-aware evaluation -> Vulkan render ->
+ *        Flutter TextureRegistry SurfaceProducer.
+ *
+ * Phase 4C4J: Owns an AdaptiveStreamTimelineController for diagnostic-only timeline telemetry.
+ * Phase 4C4K: Streaming diagnostic state exposes timeline telemetry via diagnosticState/diagnosticMap.
  */
 class AndroidDagStreamingPlaybackSession(
     private val context: Context,
@@ -48,6 +53,15 @@ class AndroidDagStreamingPlaybackSession(
     private val diagnostics = VanguardDiagnostics()
     private val lifecycleObserver = VanguardLifecycleObserver(diagnostics)
     private val nativeBridge = VanguardNativeBridge(lifecycleObserver, diagnostics, null)
+
+    // Phase 4C4J: Adaptive timeline controller owned by this session. Diagnostic-only.
+    // Timeline evaluation must NOT gate, drop, delay, or alter native rendering behavior.
+    private val adaptiveTimelineController = AdaptiveStreamTimelineController()
+
+    // Frame-anchor flag (protected by renderLock). When true, the next decoded frame rebases
+    // the timeline to the actual first-decoded PTS before evaluate(), preventing false
+    // DROPPED_LATE on startup, post-seek, post-rendition-change, or post-surface-restore frames.
+    private var adaptiveTimelineNeedsFrameAnchor: Boolean = true
 
     private var adapter: HttpAdaptivePlaybackAdapter? = null
     private var lifecycleAdapter: AndroidDagSurfaceProducerLifecycleAdapter? = null
@@ -123,6 +137,13 @@ class AndroidDagStreamingPlaybackSession(
                     return
                 }
                 generationId = parsedGen
+
+                // Start adaptive timeline for diagnostic-only telemetry.
+                val initialTimelinePtsUs = (streamConfig.startPositionMs?.let { it * 1000L } ?: 0L)
+                    .coerceAtLeast(0L)
+                adaptiveTimelineController.start(System.nanoTime(), initialTimelinePtsUs)
+                // Anchor needed: first decoded frame rebases to actual stream-start PTS.
+                adaptiveTimelineNeedsFrameAnchor = true
 
                 val playbackListener = object : HttpAdaptivePlaybackListener {
                     override fun onStateChanged(newState: HttpAdaptivePlaybackState) {
@@ -205,6 +226,10 @@ class AndroidDagStreamingPlaybackSession(
                     if (parsedGen != null && parsedGen > 0L) generationId = parsedGen
                 }
             }
+            // Rebase adaptive timeline on seek -- diagnostic-only, does not affect rendering.
+            adaptiveTimelineController.rebase("seek", System.nanoTime(), positionMs * 1000L)
+            // Next decoded frame must re-anchor to actual post-seek PTS before evaluate().
+            adaptiveTimelineNeedsFrameAnchor = true
         }
         ad.seekTo(positionMs)
         onResult(diagnosticMap(pass = true, raw = "status=OK;state=Seeking;positionMs=$positionMs;generationId=$generationId"))
@@ -237,6 +262,8 @@ class AndroidDagStreamingPlaybackSession(
     fun diagnosticState(): Map<String, Any?> {
         val isSurfaceLost = surfaceLost.get() || state == AndroidDagPlaybackState.SurfaceLost
         val rawStatus = if (state == AndroidDagPlaybackState.Failed) "status=FAIL;state=${state.name};reason=${lastError ?: "unknown"}" else "status=OK;state=${state.name}"
+        // Include adaptive timeline telemetry -- diagnostic-only.
+        val tlSnapshot = adaptiveTimelineController.snapshot()
         return mapOf(
             "pass" to (state != AndroidDagPlaybackState.Failed),
             "state" to state.name,
@@ -248,6 +275,13 @@ class AndroidDagStreamingPlaybackSession(
             "surfaceLost" to isSurfaceLost,
             "lastError" to lastError,
             "raw" to rawStatus,
+            "adaptiveTimelineAttached" to true,
+            "adaptiveTimeline" to tlSnapshot,
+            "adaptiveTimelineAcceptedFrames" to (tlSnapshot["acceptedFrames"] as? Number)?.toLong(),
+            "adaptiveTimelineGenerationId" to (tlSnapshot["generationId"] as? Number)?.toLong(),
+            "adaptiveTimelineStarted" to (tlSnapshot["isStarted"] as? Boolean),
+            "adaptiveTimelineLastAcceptedPtsUs" to (tlSnapshot["lastAcceptedPtsUs"] as? Number)?.toLong(),
+            "adaptiveTimelineLastAcceptedFrameIndex" to (tlSnapshot["lastAcceptedFrameIndex"] as? Number)?.toLong(),
         )
     }
 
@@ -318,7 +352,7 @@ class AndroidDagStreamingPlaybackSession(
         }
     }
 
-    // ── Internal Lifecycle Handlers ──────────────────────────────────────────
+    // -- Internal Lifecycle Handlers --
 
     private fun handleDecodedFrame(frame: HttpAdaptiveDecodedFrame) {
         synchronized(renderLock) {
@@ -330,6 +364,19 @@ class AndroidDagStreamingPlaybackSession(
             val gen = generationId
             val w = if (currentWidth > 0) currentWidth else frame.width
             val h = if (currentHeight > 0) currentHeight else frame.height
+
+            // Evaluate adaptive timeline -- diagnostic-only, result intentionally ignored.
+            // If anchor is needed (first frame after prepare/seek/size-change/surface-restore),
+            // rebase to the actual decoded PTS to avoid false DROPPED_LATE on startup frames.
+            if (adaptiveTimelineNeedsFrameAnchor) {
+                adaptiveTimelineController.rebase("decoded_frame_anchor", System.nanoTime(), ptsUs)
+                adaptiveTimelineNeedsFrameAnchor = false
+            }
+            adaptiveTimelineController.evaluate(
+                frameIndex = frame.frameIndex,
+                samplePtsUs = ptsUs,
+                arrivalFrameTimeNanos = System.nanoTime(),
+            )
 
             val renderRes = try {
                 nativeBridge.renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration(
@@ -427,6 +474,12 @@ class AndroidDagStreamingPlaybackSession(
 
                 generationId = parsedGen
                 surfaceLost.set(false)
+
+                // Rebase adaptive timeline on rendition/size change -- diagnostic-only.
+                val rebaseMediaPtsUs = if (lastRenderedPtsUs > 0L) lastRenderedPtsUs else 0L
+                adaptiveTimelineController.rebase("video_size_change", System.nanoTime(), rebaseMediaPtsUs)
+                // Next decoded frame must re-anchor to actual post-rendition PTS before evaluate().
+                adaptiveTimelineNeedsFrameAnchor = true
             } catch (t: Throwable) {
                 Log.e(TAG, "Exception during video size change", t)
                 failAndDestroyNativeSession("size_change_exception:${t.javaClass.simpleName}:${t.message}", surfaceRelated = false)
@@ -482,6 +535,11 @@ class AndroidDagStreamingPlaybackSession(
 
                 generationId = parsedGen
                 surfaceLost.set(false)
+                // Rebase adaptive timeline on surface restore -- diagnostic-only, does not affect rendering.
+                val rebaseMediaPtsUs = if (lastRenderedPtsUs > 0L) lastRenderedPtsUs else 0L
+                adaptiveTimelineController.rebase("surface_available", System.nanoTime(), rebaseMediaPtsUs)
+                // Next decoded frame must re-anchor to actual post-restore PTS before evaluate().
+                adaptiveTimelineNeedsFrameAnchor = true
                 if (!disposed.get()) state = AndroidDagPlaybackState.Paused
             } catch (t: Throwable) {
                 Log.e(TAG, "Exception during handleSurfaceAvailable", t)
@@ -505,6 +563,8 @@ class AndroidDagStreamingPlaybackSession(
 
     private fun diagnosticMap(pass: Boolean, raw: String): Map<String, Any?> {
         val isSurfaceLost = surfaceLost.get() || state == AndroidDagPlaybackState.SurfaceLost
+        // Include adaptive timeline telemetry -- diagnostic-only.
+        val tlSnapshot = adaptiveTimelineController.snapshot()
         return mapOf(
             "pass" to pass,
             "state" to state.name,
@@ -516,6 +576,13 @@ class AndroidDagStreamingPlaybackSession(
             "surfaceLost" to isSurfaceLost,
             "lastError" to lastError,
             "raw" to raw,
+            "adaptiveTimelineAttached" to true,
+            "adaptiveTimeline" to tlSnapshot,
+            "adaptiveTimelineAcceptedFrames" to (tlSnapshot["acceptedFrames"] as? Number)?.toLong(),
+            "adaptiveTimelineGenerationId" to (tlSnapshot["generationId"] as? Number)?.toLong(),
+            "adaptiveTimelineStarted" to (tlSnapshot["isStarted"] as? Boolean),
+            "adaptiveTimelineLastAcceptedPtsUs" to (tlSnapshot["lastAcceptedPtsUs"] as? Number)?.toLong(),
+            "adaptiveTimelineLastAcceptedFrameIndex" to (tlSnapshot["lastAcceptedFrameIndex"] as? Number)?.toLong(),
         )
     }
 }

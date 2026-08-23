@@ -173,9 +173,73 @@ class _AndroidDagStreamingAllUpPhysicalSmokeAppState
         surfaceLost = diagMap['surfaceLost'] == true;
         state = diagMap['state'] as String? ?? '';
 
-        // 5. Pass only if renderedFrames > 0, pass != false, surfaceLost != true, state != Failed
-        casePass =
-            renderedFrames > 0 && diagPass && !surfaceLost && state != 'Failed';
+        // Phase 4C4L: Read adaptive timeline telemetry fields.
+        final adaptiveTimelineAttached =
+            diagMap['adaptiveTimelineAttached'] == true;
+        final adaptiveTimelineStarted =
+            diagMap['adaptiveTimelineStarted'] == true;
+        final adaptiveTimelineAcceptedFrames =
+            (diagMap['adaptiveTimelineAcceptedFrames'] as num?)?.toInt() ?? 0;
+        final adaptiveTimelineLastAcceptedPtsUs =
+            diagMap['adaptiveTimelineLastAcceptedPtsUs'];
+        final adaptiveTimelineLastAcceptedFrameIndex =
+            diagMap['adaptiveTimelineLastAcceptedFrameIndex'];
+
+        // Phase 4C4L: Validate timeline telemetry per-case.
+        // Timeline assertions are diagnostic-only and are added on top of existing pass criteria.
+        bool timelinePass = true;
+        if (!adaptiveTimelineAttached) {
+          timelinePass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_DAG_STREAMING_ALL_UP_${testCase.key.toUpperCase()}_TIMELINE_FAIL: adaptiveTimelineAttached=false',
+          );
+        }
+        if (!adaptiveTimelineStarted) {
+          timelinePass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_DAG_STREAMING_ALL_UP_${testCase.key.toUpperCase()}_TIMELINE_FAIL: adaptiveTimelineStarted=false',
+          );
+        }
+        if (adaptiveTimelineAcceptedFrames <= 0) {
+          timelinePass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_DAG_STREAMING_ALL_UP_${testCase.key.toUpperCase()}_TIMELINE_FAIL: adaptiveTimelineAcceptedFrames=$adaptiveTimelineAcceptedFrames',
+          );
+        }
+        // acceptedFrames must not exceed renderedFrames + 1 (one-frame lead is allowed because timeline evaluation occurs immediately before native render counting)
+        if (adaptiveTimelineAcceptedFrames > renderedFrames + 1) {
+          timelinePass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_DAG_STREAMING_ALL_UP_${testCase.key.toUpperCase()}_TIMELINE_FAIL: acceptedFrames($adaptiveTimelineAcceptedFrames) > renderedFrames($renderedFrames) + 1 (one-frame lead is allowed because timeline evaluation occurs immediately before native render counting)',
+          );
+        }
+        if (renderedFrames > 0 && adaptiveTimelineLastAcceptedPtsUs == null) {
+          timelinePass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_DAG_STREAMING_ALL_UP_${testCase.key.toUpperCase()}_TIMELINE_FAIL: lastAcceptedPtsUs=null when renderedFrames=$renderedFrames',
+          );
+        }
+        if (renderedFrames > 0 &&
+            adaptiveTimelineLastAcceptedFrameIndex == null) {
+          timelinePass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_DAG_STREAMING_ALL_UP_${testCase.key.toUpperCase()}_TIMELINE_FAIL: lastAcceptedFrameIndex=null when renderedFrames=$renderedFrames',
+          );
+        }
+
+        // 5. Pass only if renderedFrames > 0, pass != false, surfaceLost != true, state != Failed,
+        //    and all timeline assertions pass.
+        casePass = renderedFrames > 0 &&
+            diagPass &&
+            !surfaceLost &&
+            state != 'Failed' &&
+            timelinePass;
       } catch (error, stack) {
         // ignore: avoid_print
         print(
@@ -213,6 +277,14 @@ class _AndroidDagStreamingAllUpPhysicalSmokeAppState
         'renderedFrames': renderedFrames,
         'state': state,
         'surfaceLost': surfaceLost,
+        'adaptiveTimelineAttached': diagMap['adaptiveTimelineAttached'],
+        'adaptiveTimelineStarted': diagMap['adaptiveTimelineStarted'],
+        'adaptiveTimelineAcceptedFrames':
+            diagMap['adaptiveTimelineAcceptedFrames'],
+        'adaptiveTimelineLastAcceptedPtsUs':
+            diagMap['adaptiveTimelineLastAcceptedPtsUs'],
+        'adaptiveTimelineLastAcceptedFrameIndex':
+            diagMap['adaptiveTimelineLastAcceptedFrameIndex'],
         'raw':
             diagMap['raw']?.toString() ??
             (casePass ? 'status=OK' : 'status=FAIL'),
@@ -246,6 +318,19 @@ class _AndroidDagStreamingAllUpPhysicalSmokeAppState
       'hlsRaw': results['hls']?['raw'] ?? '',
       'dashRaw': results['dash']?['raw'] ?? '',
       'llHlsRaw': results['llHls']?['raw'] ?? '',
+      // Phase 4C4L: Adaptive timeline telemetry per protocol.
+      'hlsAdaptiveTimelineStarted':
+          results['hls']?['adaptiveTimelineStarted'],
+      'dashAdaptiveTimelineStarted':
+          results['dash']?['adaptiveTimelineStarted'],
+      'llHlsAdaptiveTimelineStarted':
+          results['llHls']?['adaptiveTimelineStarted'],
+      'hlsAdaptiveTimelineAcceptedFrames':
+          results['hls']?['adaptiveTimelineAcceptedFrames'],
+      'dashAdaptiveTimelineAcceptedFrames':
+          results['dash']?['adaptiveTimelineAcceptedFrames'],
+      'llHlsAdaptiveTimelineAcceptedFrames':
+          results['llHls']?['adaptiveTimelineAcceptedFrames'],
       'cases': results,
     };
 
