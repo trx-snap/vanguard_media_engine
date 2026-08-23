@@ -4,6 +4,75 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Streaming Source Selector Recipe
+
+The package exposes `VGStreamingSourceSelector` to evaluate candidate streaming source descriptors against a validated `VGStreamingStartupPlan` and caller selection preferences (e.g. `preserveOrder`, `preferHls`, `preferDash`, `preferLowLatency`, `preferConstrainedReliability`, or specific `preferredKeys`).
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+Future<void> selectAndPlayStream() async {
+  // 1. Define candidate stream sources in a source set
+  final sourceSet = VGStreamingSourceSet(
+    sources: [
+      VGStreamingSourceDescriptor(
+        key: 'primary_hls',
+        uri: Uri.parse('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8'),
+        formatHint: VGStreamingFormatHint.hls,
+        initialWidth: 1080,
+        initialHeight: 1920,
+      ),
+      VGStreamingSourceDescriptor(
+        key: 'backup_dash',
+        uri: Uri.parse(
+          'https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd',
+        ),
+        formatHint: VGStreamingFormatHint.dash,
+        initialWidth: 1080,
+        initialHeight: 1920,
+      ),
+    ],
+  );
+
+  // 2. Synthesize preflight request from source set and evaluate
+  final preflightClient = VGStreamingPreflightClient();
+  final preflightReport = await preflightClient.evaluate(
+    sourceSet.toPreflightRequest(
+      requestedNetworkProfile: VGStreamingNetworkProfile.constrained,
+    ),
+  );
+
+  // 3. Synthesize startup plan from preflight report
+  final plan = VGStreamingStartupPlanner.fromPreflight(preflightReport);
+
+  // 4. Select candidate source using pure-Dart selector
+  final selection = VGStreamingSourceSelector.select(
+    VGStreamingSourceSelectionRequest(
+      sourceSet: sourceSet,
+      startupPlan: plan,
+      preference: VGStreamingSourceSelectionPreference.preserveOrder,
+      preferredKeys: const ['primary_hls'],
+    ),
+  );
+
+  if (!selection.selected || selection.playbackOptions == null) {
+    print('Selection failed: ${selection.decision}, warnings: ${selection.warnings}');
+    return;
+  }
+
+  // 5. Open playback session and control media
+  final playbackClient = VGStreamingPlaybackClient();
+  var session = await playbackClient.open(selection.playbackOptions!);
+  session = await playbackClient.play(session);
+
+  // 6. Stop and release
+  session = await playbackClient.stop(session);
+  await playbackClient.dispose(session);
+}
+```
+
 ## Streaming Source Descriptor Recipe
 
 The package exposes `VGStreamingSourceDescriptor` and `VGStreamingSourceSet` to define stream metadata, preflight validation requirements, presentation dimensions, and cache options in a unified pure-Dart model. Candidate sources seamlessly generate preflight requests and derive validated `VGStreamingPlaybackOptions` via startup plans.
