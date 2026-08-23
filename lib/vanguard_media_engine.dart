@@ -107,6 +107,8 @@ export 'vg_streaming_source_descriptor.dart';
 export 'vg_streaming_source_selector.dart';
 // Phase 4C7M: public streaming playback decision planner.
 export 'vg_streaming_playback_decision.dart';
+// Phase 4C7O: public streaming playback controller facade.
+export 'vg_streaming_playback_controller.dart';
 
 const String _libName = 'vanguard_media_engine';
 
