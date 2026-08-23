@@ -714,9 +714,50 @@ Prewarm start states (`VGPlaybackPrewarmStartState`):
   - iOS: Native backend implementation is planned and frozen in UMF architecture documents, but not yet implemented. Calls on non-Android platforms safely catch `MissingPluginException` and return typed unsupported result objects (`phase: 'unsupported'`, `pass: false`).
 - **Physical Proof Status**: Phase 4C6F3 physical proof is pending device visibility while mechanical and API unit/integration tests are in place.
 
+## RTC Video Diagnostics API
+
+The package exposes `VGRtcVideoDiagnosticsClient` to run health checks and diagnostics against Vanguard True-DAG RTC video transport contracts and adapter seams without raw `MethodChannel` calls.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+Future<void> runRtcDiagnostics() async {
+  // 1. Instantiate diagnostics client
+  final client = VGRtcVideoDiagnosticsClient();
+
+  // 2. Execute all 7 Android RTC video diagnostic routes
+  final report = await client.runAll(
+    request: const VGRtcVideoDiagnosticsRequest(
+      width: 64,
+      height: 64,
+      frameCount: 3,
+    ),
+  );
+
+  // 3. Inspect report and boundary invariants
+  if (report.pass) {
+    print('RTC Video Diagnostics passed across all 7 routes');
+    print('Video-only boundary preserved: ${report.videoOnlyBoundaryPreserved}');
+    print('Room/Audio boundary preserved: ${report.roomAudioBoundaryPreserved}');
+    print('Transport-agnostic: ${report.transportAgnostic}');
+  } else {
+    print('RTC Diagnostics failed: ${report.raw}');
+  }
+}
+```
+
+### Invariants & Ownership Boundaries
+
+- **Diagnostic-Only Wrapper**: This API is a diagnostic wrapper over existing Android RTC video seams (`RtcVideoFramePublisher`, `RtcVideoFrameSink`, `RealtimeVideoOutputAdapter`, `RealtimeVideoInputAdapter`, backpressure controller, frame validator, processed egress, and jitter buffer). It is not a LiveKit/WebRTC bridge implementation.
+- **Product-Level Bridge**: Concrete WebRTC / LiveKit bridging remains strictly product-level (e.g. within ConnectsApp or an external bridge module) behind generic video seams per ADR-AND-09. Vanguard core has zero direct LiveKit or WebRTC SDK dependencies.
+- **Video-Only (No Audio / Room Ownership)**: Vanguard operates strictly on video transport contracts. All room tokens, session state, participant management, and microphone/speaker audio are strictly owned by ConnectsApp / Room layer and must never enter Vanguard.
+- **No WebRTC Caching**: Real-time WebRTC / LiveKit media streams are not cached by the Vanguard streaming playback cache.
+
 ## Package Architecture
 
 - `lib/`: Dart public API definitions and platform bridge clients.
 - `src/`: Native C++ engine implementation for timeline and composition.
-- `android/`: Android platform implementation including Media3 streaming cache coordinator and FFI glue.
+- `android/`: Android platform implementation including Media3 streaming cache coordinator, RTC video coordinator, and FFI glue.
 - `ios/`: iOS platform implementation (Metal rendering, AVFoundation integration).
