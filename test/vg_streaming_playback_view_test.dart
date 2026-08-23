@@ -228,6 +228,172 @@ void main() {
     );
 
     testWidgets(
+      'prefers explicit displayWidth/displayHeight over videoWidth/videoHeight',
+      (WidgetTester tester) async {
+        const session = VGStreamingPlaybackSession(
+          pass: true,
+          phase: 'Phase4C1D1',
+          sessionId: 'sess_explicit_display',
+          textureId: 10,
+          format: VGStreamingFormatHint.hls,
+          state: VGStreamingPlaybackState.playing,
+          videoWidth: 1920,
+          videoHeight: 1080,
+          rotationDegrees: 90,
+          displayWidth: 1080,
+          displayHeight: 1920,
+          raw: 'status=OK',
+          diagnostics: {},
+        );
+        const snapshot = VGStreamingPlaybackControllerSnapshot(
+          state: VGStreamingPlaybackControllerState.playing,
+          session: session,
+          pass: true,
+          reason: 'playing',
+        );
+
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(
+              body: VGStreamingPlaybackTextureView(snapshot: snapshot),
+            ),
+          ),
+        );
+
+        final sizedBoxes = tester.widgetList<SizedBox>(find.byType(SizedBox));
+        final innerSizedBox = sizedBoxes.firstWhere(
+          (box) => box.child is Texture,
+        );
+
+        expect(innerSizedBox.width, 1080.0);
+        expect(innerSizedBox.height, 1920.0);
+      },
+    );
+
+    testWidgets(
+      'swaps effective display dimensions when rotationDegrees is 90 and display dimensions are absent',
+      (WidgetTester tester) async {
+        const session = VGStreamingPlaybackSession(
+          pass: true,
+          phase: 'Phase4C1D1',
+          sessionId: 'sess_rot90',
+          textureId: 10,
+          format: VGStreamingFormatHint.hls,
+          state: VGStreamingPlaybackState.playing,
+          videoWidth: 1920,
+          videoHeight: 1080,
+          rotationDegrees: 90,
+          raw: 'status=OK',
+          diagnostics: {},
+        );
+        const snapshot = VGStreamingPlaybackControllerSnapshot(
+          state: VGStreamingPlaybackControllerState.playing,
+          session: session,
+          pass: true,
+          reason: 'playing',
+        );
+
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(
+              body: VGStreamingPlaybackTextureView(snapshot: snapshot),
+            ),
+          ),
+        );
+
+        final sizedBoxes = tester.widgetList<SizedBox>(find.byType(SizedBox));
+        final innerSizedBox = sizedBoxes.firstWhere(
+          (box) => box.child is Texture,
+        );
+
+        expect(innerSizedBox.width, 1080.0);
+        expect(innerSizedBox.height, 1920.0);
+      },
+    );
+
+    testWidgets(
+      'swaps effective display dimensions when rotationDegrees is 270 and display dimensions are absent',
+      (WidgetTester tester) async {
+        const session = VGStreamingPlaybackSession(
+          pass: true,
+          phase: 'Phase4C1D1',
+          sessionId: 'sess_rot270',
+          textureId: 10,
+          format: VGStreamingFormatHint.dash,
+          state: VGStreamingPlaybackState.playing,
+          videoWidth: 1280,
+          videoHeight: 720,
+          rotationDegrees: 270,
+          raw: 'status=OK',
+          diagnostics: {},
+        );
+        const snapshot = VGStreamingPlaybackControllerSnapshot(
+          state: VGStreamingPlaybackControllerState.playing,
+          session: session,
+          pass: true,
+          reason: 'playing',
+        );
+
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(
+              body: VGStreamingPlaybackTextureView(snapshot: snapshot),
+            ),
+          ),
+        );
+
+        final sizedBoxes = tester.widgetList<SizedBox>(find.byType(SizedBox));
+        final innerSizedBox = sizedBoxes.firstWhere(
+          (box) => box.child is Texture,
+        );
+
+        expect(innerSizedBox.width, 720.0);
+        expect(innerSizedBox.height, 1280.0);
+      },
+    );
+
+    testWidgets(
+      'does not swap dimensions when rotationDegrees is 180 and display dimensions are absent',
+      (WidgetTester tester) async {
+        const session = VGStreamingPlaybackSession(
+          pass: true,
+          phase: 'Phase4C1D1',
+          sessionId: 'sess_rot180',
+          textureId: 10,
+          format: VGStreamingFormatHint.hls,
+          state: VGStreamingPlaybackState.playing,
+          videoWidth: 1920,
+          videoHeight: 1080,
+          rotationDegrees: 180,
+          raw: 'status=OK',
+          diagnostics: {},
+        );
+        const snapshot = VGStreamingPlaybackControllerSnapshot(
+          state: VGStreamingPlaybackControllerState.playing,
+          session: session,
+          pass: true,
+          reason: 'playing',
+        );
+
+        await tester.pumpWidget(
+          const MaterialApp(
+            home: Scaffold(
+              body: VGStreamingPlaybackTextureView(snapshot: snapshot),
+            ),
+          ),
+        );
+
+        final sizedBoxes = tester.widgetList<SizedBox>(find.byType(SizedBox));
+        final innerSizedBox = sizedBoxes.firstWhere(
+          (box) => box.child is Texture,
+        );
+
+        expect(innerSizedBox.width, 1920.0);
+        expect(innerSizedBox.height, 1080.0);
+      },
+    );
+
+    testWidgets(
       'uses fallback size when session dimensions are zero or absent',
       (WidgetTester tester) async {
         const session = VGStreamingPlaybackSession(

@@ -245,6 +245,25 @@ class VGStreamingPlaybackSession {
   /// Current video stream height in pixels.
   final int videoHeight;
 
+  /// Clockwise rotation in degrees to be applied for correct display orientation (0, 90, 180, 270).
+  ///
+  /// Official platform reference baselines:
+  /// - `MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION`: retrieves video rotation angle in degrees (0, 90, 180, 270).
+  /// - `MediaFormat.KEY_ROTATION`: describes clockwise rotation on output surface (0, 90, 180, 270; default 0).
+  /// - Media3 `Format.rotationDegrees`: clockwise rotation for correct orientation (0, 90, 180, 270).
+  /// - Media3 `VideoSize.unappliedRotationDegrees`: deprecated (player handles rotation internally and returns 0).
+  final int rotationDegrees;
+
+  /// Target presentation display width in pixels after applying orientation/rotation transform.
+  ///
+  /// When positive (> 0), overrides [videoWidth] for presentation layout.
+  final int displayWidth;
+
+  /// Target presentation display height in pixels after applying orientation/rotation transform.
+  ///
+  /// When positive (> 0), overrides [videoHeight] for presentation layout.
+  final int displayHeight;
+
   /// Total rendered frames presented to the texture surface.
   final int renderedFrames;
 
@@ -270,11 +289,46 @@ class VGStreamingPlaybackSession {
     this.liveOffsetMs,
     this.videoWidth = 0,
     this.videoHeight = 0,
+    this.rotationDegrees = 0,
+    this.displayWidth = 0,
+    this.displayHeight = 0,
     this.renderedFrames = 0,
     this.decodedFrames = 0,
     required this.raw,
     required this.diagnostics,
   });
+
+  /// The effective presentation display width in pixels.
+  ///
+  /// Prefers positive [displayWidth] when present; otherwise derives from
+  /// [videoWidth] / [videoHeight] and cardinal [rotationDegrees] (swapping for 90° and 270°).
+  /// Returns 0 when source dimensions are not positive.
+  int get effectiveDisplayWidth {
+    if (displayWidth > 0) return displayWidth;
+    if (videoWidth <= 0 || videoHeight <= 0) return 0;
+    if (rotationDegrees == 90 || rotationDegrees == 270) {
+      return videoHeight;
+    }
+    return videoWidth;
+  }
+
+  /// The effective presentation display height in pixels.
+  ///
+  /// Prefers positive [displayHeight] when present; otherwise derives from
+  /// [videoWidth] / [videoHeight] and cardinal [rotationDegrees] (swapping for 90° and 270°).
+  /// Returns 0 when source dimensions are not positive.
+  int get effectiveDisplayHeight {
+    if (displayHeight > 0) return displayHeight;
+    if (videoWidth <= 0 || videoHeight <= 0) return 0;
+    if (rotationDegrees == 90 || rotationDegrees == 270) {
+      return videoWidth;
+    }
+    return videoHeight;
+  }
+
+  /// Whether the session carries non-zero rotation or explicit display dimensions.
+  bool get hasRotationMetadata =>
+      rotationDegrees != 0 || (displayWidth > 0 && displayHeight > 0);
 
   /// Constructs a [VGStreamingPlaybackSession] from a raw platform dictionary.
   factory VGStreamingPlaybackSession.fromMap(
@@ -317,6 +371,15 @@ class VGStreamingPlaybackSession {
         (stringMap['height'] as num?)?.toInt() ??
         (stringMap['initialHeight'] as num?)?.toInt() ??
         0;
+    final rotationDegrees = _parseRotation(
+      stringMap['rotationDegrees'] ?? stringMap['rotation'],
+    );
+    final displayWidth = _parseDimension(
+      stringMap['displayWidth'] ?? stringMap['display_width'],
+    );
+    final displayHeight = _parseDimension(
+      stringMap['displayHeight'] ?? stringMap['display_height'],
+    );
     final renderedFrames = (stringMap['renderedFrames'] as num?)?.toInt() ?? 0;
     final decodedFrames = (stringMap['decodedFrames'] as num?)?.toInt() ?? 0;
     final raw = stringMap['raw'] as String? ?? '';
@@ -334,6 +397,9 @@ class VGStreamingPlaybackSession {
       liveOffsetMs: liveOffsetMs,
       videoWidth: videoWidth,
       videoHeight: videoHeight,
+      rotationDegrees: rotationDegrees,
+      displayWidth: displayWidth,
+      displayHeight: displayHeight,
       renderedFrames: renderedFrames,
       decodedFrames: decodedFrames,
       raw: raw,
@@ -356,6 +422,9 @@ class VGStreamingPlaybackSession {
         liveOffsetMs: null,
         videoWidth: 0,
         videoHeight: 0,
+        rotationDegrees: 0,
+        displayWidth: 0,
+        displayHeight: 0,
         renderedFrames: 0,
         decodedFrames: 0,
         raw: 'status=UNSUPPORTED;platform=non-android',
@@ -366,6 +435,37 @@ class VGStreamingPlaybackSession {
           'raw': 'status=UNSUPPORTED;platform=non-android',
         },
       );
+
+  static int _parseRotation(Object? raw) {
+    if (raw == null) return 0;
+    int? degrees;
+    if (raw is num) {
+      degrees = raw.toInt();
+    } else if (raw is String) {
+      degrees = int.tryParse(raw.trim());
+    }
+    if (degrees == null) return 0;
+    final normalized = ((degrees % 360) + 360) % 360;
+    if (normalized == 0 ||
+        normalized == 90 ||
+        normalized == 180 ||
+        normalized == 270) {
+      return normalized;
+    }
+    return 0;
+  }
+
+  static int _parseDimension(Object? raw) {
+    if (raw == null) return 0;
+    int? dim;
+    if (raw is num) {
+      dim = raw.toInt();
+    } else if (raw is String) {
+      dim = int.tryParse(raw.trim());
+    }
+    if (dim == null || dim < 0) return 0;
+    return dim;
+  }
 
   static Map<String, Object?> _defensiveStringMap(Map<Object?, Object?> map) {
     final result = <String, Object?>{};
@@ -383,6 +483,7 @@ class VGStreamingPlaybackSession {
       'VGStreamingPlaybackSession(pass=$pass, phase=$phase, sessionId=$sessionId, '
       'textureId=$textureId, format=$format, state=$state, positionMs=$positionMs, '
       'durationMs=$durationMs, videoWidth=$videoWidth, videoHeight=$videoHeight, '
+      'rotationDegrees=$rotationDegrees, displayWidth=$displayWidth, displayHeight=$displayHeight, '
       'renderedFrames=$renderedFrames)';
 }
 

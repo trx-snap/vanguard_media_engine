@@ -125,6 +125,19 @@ Widget buildStreamingView(VGStreamingPlaybackControllerSnapshot snapshot) {
 }
 ```
 
+### Orientation & Display Dimension Handling (Phases 4C7S & 4C7T)
+
+`VGStreamingPlaybackTextureView` consumes `session.effectiveDisplayWidth` and `session.effectiveDisplayHeight` rather than raw encoded video dimensions. This automatically preserves display aspect ratio when explicit display dimensions (`displayWidth`, `displayHeight`) or cardinal rotation angles (`rotationDegrees` of 90° or 270°) are reported by the session.
+
+- **Contract Readiness Only**: This Dart layer model and widget preparation establishes the public metadata contract. It does NOT fix native streaming rotation by itself.
+- **Official Platform Baseline**:
+  - Android `MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION` retrieves video rotation angle in degrees (values: 0, 90, 180, 270).
+  - Android `MediaFormat.KEY_ROTATION` describes clockwise rotation on an output surface for surface-configured codecs (supported values: 0, 90, 180, 270; default: 0).
+  - Media3 `Format.rotationDegrees` specifies clockwise rotation to apply for correct orientation (values: 0, 90, 180, 270).
+  - Media3 `VideoSize.unappliedRotationDegrees` is deprecated (handled internally by player, returning 0).
+- **Future Native Work**: A subsequent native slice will emit real rotation and display dimensions from the Android streaming session and apply/propagate the spatial transform consistently across presentation surfaces.
+- **iOS Parity**: The iOS implementer will mirror these public fields (`rotationDegrees`, `displayWidth`, `displayHeight`) using AVFoundation track and video output metadata (`AVAssetTrack.preferredTransform`, display dimensions).
+
 ## Streaming Playback Controller Facade Recipe
 
 The package exposes `VGStreamingPlaybackController` as a bounded, session-safe Dart facade over `VGStreamingPlaybackClient` and `VGStreamingPlaybackDecision`. It serializes operations with a private busy guard, owns exactly one active playback session at a time, and provides high-level control (`open`, `play`, `pause`, `seek`, `refresh`, `stop`, `dispose`).

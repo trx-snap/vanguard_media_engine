@@ -1,11 +1,15 @@
-// Copyright (c) Connects — Vanguard Phase 4C7Q.
+// Copyright (c) Connects — Vanguard Phase 4C7Q / Phase 4C7T.
 // Public streaming playback texture view widget.
 //
 // Pure presentation widget that renders the controller/session texture from
-// VGStreamingPlaybackControllerSnapshot and preserves the video aspect ratio.
-// This widget is presentation-only: it does NOT own playback lifecycle,
+// VGStreamingPlaybackControllerSnapshot and preserves the video display aspect ratio.
+// Uses session.effectiveDisplayWidth / session.effectiveDisplayHeight (which prefers
+// explicit display dimensions or accounts for 90°/270° rotation) to correctly scale
+// and position the presentation surface within the configured bounds.
+//
+// Note: This widget is presentation-only: it does NOT own playback lifecycle,
 // invoke platform channels, start/stop sessions, preflight streams, apply filters,
-// force ABR, interpret product policy, or correct native rotation metadata.
+// force ABR, interpret product policy, or correct native rotation metadata in the engine.
 
 import 'package:flutter/material.dart';
 
@@ -29,7 +33,7 @@ typedef VGStreamingPlaybackErrorBuilder =
 /// video texture from [VGStreamingPlaybackControllerSnapshot].
 ///
 /// Automatically scales and centers the presentation surface using [FittedBox],
-/// preserving the reported aspect ratio from the underlying session dimensions
+/// preserving the reported aspect ratio from the underlying session display dimensions
 /// (or [fallbackSize] when dimensions are unavailable or non-positive).
 class VGStreamingPlaybackTextureView extends StatelessWidget {
   /// The current immutable snapshot from [VGStreamingPlaybackController].
@@ -91,9 +95,11 @@ class VGStreamingPlaybackTextureView extends StatelessWidget {
     final double sourceWidth;
     final double sourceHeight;
 
-    if (session != null && session.videoWidth > 0 && session.videoHeight > 0) {
-      sourceWidth = session.videoWidth.toDouble();
-      sourceHeight = session.videoHeight.toDouble();
+    if (session != null &&
+        session.effectiveDisplayWidth > 0 &&
+        session.effectiveDisplayHeight > 0) {
+      sourceWidth = session.effectiveDisplayWidth.toDouble();
+      sourceHeight = session.effectiveDisplayHeight.toDouble();
     } else if (fallbackSize.width > 0 && fallbackSize.height > 0) {
       sourceWidth = fallbackSize.width;
       sourceHeight = fallbackSize.height;

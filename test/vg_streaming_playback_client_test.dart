@@ -452,11 +452,188 @@ void main() {
         expect(session.liveOffsetMs, equals(1500));
         expect(session.videoWidth, equals(1280));
         expect(session.videoHeight, equals(720));
+        expect(session.rotationDegrees, equals(0));
+        expect(session.displayWidth, equals(0));
+        expect(session.displayHeight, equals(0));
+        expect(session.effectiveDisplayWidth, equals(1280));
+        expect(session.effectiveDisplayHeight, equals(720));
+        expect(session.hasRotationMetadata, isFalse);
         expect(session.renderedFrames, equals(360));
         expect(session.decodedFrames, equals(365));
         expect(session.raw, equals('status=OK;state=Playing'));
         expect(session.diagnostics['pass'], isTrue);
         expect(session.diagnostics['123'], equals('integer_key_value'));
+      },
+    );
+
+    test(
+      'fromMap parses explicit displayWidth and displayHeight and prioritizes them',
+      () {
+        final rawMap = <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'state': 'Playing',
+          'videoWidth': 1920,
+          'videoHeight': 1080,
+          'rotationDegrees': 90,
+          'displayWidth': 1080,
+          'displayHeight': 1920,
+        };
+
+        final session = VGStreamingPlaybackSession.fromMap(rawMap);
+        expect(session.videoWidth, equals(1920));
+        expect(session.videoHeight, equals(1080));
+        expect(session.rotationDegrees, equals(90));
+        expect(session.displayWidth, equals(1080));
+        expect(session.displayHeight, equals(1920));
+        expect(session.effectiveDisplayWidth, equals(1080));
+        expect(session.effectiveDisplayHeight, equals(1920));
+        expect(session.hasRotationMetadata, isTrue);
+      },
+    );
+
+    test(
+      'fromMap parses rotationDegrees 90 and 270 and swaps effective display dimensions when display dimensions absent',
+      () {
+        final rot90Map = <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'state': 'Playing',
+          'videoWidth': 1920,
+          'videoHeight': 1080,
+          'rotationDegrees': 90,
+        };
+
+        final session90 = VGStreamingPlaybackSession.fromMap(rot90Map);
+        expect(session90.videoWidth, equals(1920));
+        expect(session90.videoHeight, equals(1080));
+        expect(session90.rotationDegrees, equals(90));
+        expect(session90.displayWidth, equals(0));
+        expect(session90.displayHeight, equals(0));
+        expect(session90.effectiveDisplayWidth, equals(1080));
+        expect(session90.effectiveDisplayHeight, equals(1920));
+        expect(session90.hasRotationMetadata, isTrue);
+
+        final rot270Map = <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'state': 'Playing',
+          'videoWidth': 1280,
+          'videoHeight': 720,
+          'rotation': 270,
+        };
+
+        final session270 = VGStreamingPlaybackSession.fromMap(rot270Map);
+        expect(session270.videoWidth, equals(1280));
+        expect(session270.videoHeight, equals(720));
+        expect(session270.rotationDegrees, equals(270));
+        expect(session270.effectiveDisplayWidth, equals(720));
+        expect(session270.effectiveDisplayHeight, equals(1280));
+        expect(session270.hasRotationMetadata, isTrue);
+      },
+    );
+
+    test(
+      'fromMap preserves aspect ratio for rotation 0 and 180 without swapping dimensions',
+      () {
+        final rot0Map = <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'state': 'Playing',
+          'videoWidth': 1920,
+          'videoHeight': 1080,
+          'rotationDegrees': 0,
+        };
+        final session0 = VGStreamingPlaybackSession.fromMap(rot0Map);
+        expect(session0.effectiveDisplayWidth, equals(1920));
+        expect(session0.effectiveDisplayHeight, equals(1080));
+        expect(session0.hasRotationMetadata, isFalse);
+
+        final rot180Map = <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'state': 'Playing',
+          'videoWidth': 1920,
+          'videoHeight': 1080,
+          'rotationDegrees': 180,
+        };
+        final session180 = VGStreamingPlaybackSession.fromMap(rot180Map);
+        expect(session180.effectiveDisplayWidth, equals(1920));
+        expect(session180.effectiveDisplayHeight, equals(1080));
+        expect(session180.hasRotationMetadata, isTrue);
+      },
+    );
+
+    test(
+      'fromMap normalizes non-cardinal, negative, or invalid rotation strings to 0 safely',
+      () {
+        final invalidMap1 = <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'videoWidth': 1280,
+          'videoHeight': 720,
+          'rotationDegrees': 45,
+        };
+        final session1 = VGStreamingPlaybackSession.fromMap(invalidMap1);
+        expect(session1.rotationDegrees, equals(0));
+        expect(session1.effectiveDisplayWidth, equals(1280));
+        expect(session1.effectiveDisplayHeight, equals(720));
+
+        final invalidMap2 = <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'videoWidth': 1280,
+          'videoHeight': 720,
+          'rotationDegrees': 'not_a_number',
+        };
+        final session2 = VGStreamingPlaybackSession.fromMap(invalidMap2);
+        expect(session2.rotationDegrees, equals(0));
+
+        final cardinalStringMap = <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'videoWidth': 1280,
+          'videoHeight': 720,
+          'rotationDegrees': '90',
+        };
+        final session3 = VGStreamingPlaybackSession.fromMap(cardinalStringMap);
+        expect(session3.rotationDegrees, equals(90));
+        expect(session3.effectiveDisplayWidth, equals(720));
+        expect(session3.effectiveDisplayHeight, equals(1280));
+
+        final modulo360Map = <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'videoWidth': 1280,
+          'videoHeight': 720,
+          'rotationDegrees': -90,
+        };
+        final session4 = VGStreamingPlaybackSession.fromMap(modulo360Map);
+        expect(session4.rotationDegrees, equals(270));
+        expect(session4.effectiveDisplayWidth, equals(720));
+        expect(session4.effectiveDisplayHeight, equals(1280));
+      },
+    );
+
+    test(
+      'effectiveDisplayWidth and effectiveDisplayHeight return 0 when source dimensions are non-positive',
+      () {
+        const session = VGStreamingPlaybackSession(
+          pass: true,
+          phase: 'Phase4C1D1',
+          sessionId: 'zero_dim',
+          textureId: 10,
+          format: VGStreamingFormatHint.hls,
+          state: VGStreamingPlaybackState.playing,
+          videoWidth: 0,
+          videoHeight: 0,
+          rotationDegrees: 90,
+          raw: '',
+          diagnostics: {},
+        );
+        expect(session.effectiveDisplayWidth, equals(0));
+        expect(session.effectiveDisplayHeight, equals(0));
+        expect(session.hasRotationMetadata, isTrue);
       },
     );
 
@@ -506,10 +683,19 @@ void main() {
       expect(session.liveOffsetMs, isNull);
       expect(session.videoWidth, equals(0));
       expect(session.videoHeight, equals(0));
+      expect(session.rotationDegrees, equals(0));
+      expect(session.displayWidth, equals(0));
+      expect(session.displayHeight, equals(0));
+      expect(session.effectiveDisplayWidth, equals(0));
+      expect(session.effectiveDisplayHeight, equals(0));
+      expect(session.hasRotationMetadata, isFalse);
       expect(session.renderedFrames, equals(0));
       expect(session.decodedFrames, equals(0));
       expect(session.raw, equals('status=UNSUPPORTED;platform=non-android'));
       expect(session.toString(), contains('unsupported'));
+      expect(session.toString(), contains('rotationDegrees=0'));
+      expect(session.toString(), contains('displayWidth=0'));
+      expect(session.toString(), contains('displayHeight=0'));
     });
 
     test(
