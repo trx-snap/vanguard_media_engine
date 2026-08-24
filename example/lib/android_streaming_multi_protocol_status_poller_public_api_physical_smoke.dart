@@ -9,7 +9,9 @@
 //   5. Execution of adaptive streaming playback via VGStreamingPlaybackController and presentation via VGStreamingPlaybackTextureView.
 //   6. Attaching VGStreamingPlaybackStatusPoller over VGStreamingPlaybackController for each protocol.
 //   7. Starting the poller and collecting emitted summaries from broadcast Stream<VGStreamingPlaybackStatusSummary>.
-//   8. Asserting all status summary invariants across all 3 protocols:
+//   8. Continuing polling until at least two summaries are collected AND real playback progress evidence
+//      (renderedFrames > 0, isPlaying == true, positionMs > 0, or bufferedPositionMs > 0) is observed.
+//   9. Asserting all status summary invariants across all 3 protocols:
 //      - at least two emitted summaries collected
 //      - at least one summary has hasSession == true
 //      - durationMs >= -1
@@ -19,15 +21,16 @@
 //      - progressFraction in 0.0..1.0
 //      - bufferedFraction in 0.0..1.0
 //      - effectiveDisplayWidth > 0 and effectiveDisplayHeight > 0
-//   9. Stopping and disposing poller cleanly without disposing underlying controller.
-//  10. Verifying disposed poller refreshOnce() does not throw.
-//  11. Stopping and disposing controller before proceeding to the next protocol.
+//      - playback progress / render evidence observed (renderedFrames > 0, isPlaying == true, positionMs > 0, or bufferedPositionMs > 0)
+//  10. Stopping and disposing poller cleanly without disposing underlying controller.
+//  11. Verifying disposed poller refreshOnce() does not throw.
+//  12. Stopping and disposing controller before proceeding to the next protocol.
 //
 // Verification Invariants & Boundaries:
 // - Imports ONLY package:vanguard_media_engine/vanguard_media_engine.dart.
 // - Does NOT import package:flutter/services.dart.
 // - Does NOT construct raw MethodChannel.
-// - Tests all three Android HTTP adaptive playback protocols (HLS, DASH, LL-HLS) sequentially.
+// - Tests all three Android HTTP adaptive playback protocols (HLS, DASH, LL-HLS) sequentially with real playback progress evidence.
 // - Bounded convenience verification only; does not make product feed decisions, ABR policy, or caching policy.
 
 import 'dart:async';
@@ -172,6 +175,11 @@ class _AndroidStreamingMultiProtocolStatusPollerPhysicalSmokeAppState
         final collectedSummaries = <VGStreamingPlaybackStatusSummary>[];
         bool casePass = false;
         Map<String, dynamic> pollerDiag = <String, dynamic>{};
+        int maxRenderedFrames = 0;
+        int maxPositionMs = 0;
+        int maxBufferedPositionMs = 0;
+        bool sawPlaying = false;
+        bool playbackProgressObserved = false;
 
         try {
           // 2a. Build decision & open controller
@@ -225,7 +233,20 @@ class _AndroidStreamingMultiProtocolStatusPollerPhysicalSmokeAppState
 
           pollerSub = poller.summaries.listen((summary) {
             collectedSummaries.add(summary);
+            if (summary.isPlaying) {
+              sawPlaying = true;
+            }
+            if (summary.positionMs > maxPositionMs) {
+              maxPositionMs = summary.positionMs;
+            }
+            if (summary.bufferedPositionMs > maxBufferedPositionMs) {
+              maxBufferedPositionMs = summary.bufferedPositionMs;
+            }
             if (mounted && controller != null) {
+              final frames = controller!.snapshot.session?.renderedFrames ?? 0;
+              if (frames > maxRenderedFrames) {
+                maxRenderedFrames = frames;
+              }
               setState(() {
                 _currentSnapshot = controller!.snapshot;
               });
@@ -240,24 +261,87 @@ class _AndroidStreamingMultiProtocolStatusPollerPhysicalSmokeAppState
             );
           }
 
-          // 2c. Wait for at least 2 emitted summaries and valid display metrics (timeout 15s)
-          const maxWaitSeconds = 15;
+          // 2c. Wait for at least 2 emitted summaries, valid display metrics, and real playback progress evidence (timeout 30s)
+          const maxWaitSeconds = 30;
           final stopwatch = Stopwatch()..start();
 
           while (stopwatch.elapsed < const Duration(seconds: maxWaitSeconds)) {
             await Future<void>.delayed(const Duration(milliseconds: 300));
+            final currentFrames =
+                controller.snapshot.session?.renderedFrames ?? 0;
+            if (currentFrames > maxRenderedFrames) {
+              maxRenderedFrames = currentFrames;
+            }
             final latest = poller.latest;
+            if (latest.isPlaying) {
+              sawPlaying = true;
+            }
+            if (latest.positionMs > maxPositionMs) {
+              maxPositionMs = latest.positionMs;
+            }
+            if (latest.bufferedPositionMs > maxBufferedPositionMs) {
+              maxBufferedPositionMs = latest.bufferedPositionMs;
+            }
+
+            playbackProgressObserved =
+                maxRenderedFrames > 0 ||
+                sawPlaying ||
+                latest.isPlaying ||
+                maxPositionMs > 0 ||
+                latest.positionMs > 0 ||
+                maxBufferedPositionMs > 0 ||
+                latest.bufferedPositionMs > 0;
+
             if (collectedSummaries.length >= 2 &&
                 latest.hasSession &&
                 latest.effectiveDisplayWidth > 0 &&
-                latest.effectiveDisplayHeight > 0) {
-              break;
+                latest.effectiveDisplayHeight > 0 &&
+                playbackProgressObserved) {
+              // Prefer observing actual rendered frames when available
+              if (maxRenderedFrames > 0 ||
+                  stopwatch.elapsed >= const Duration(seconds: 6)) {
+                break;
+              }
             }
           }
+
+          final currentFrames =
+              controller.snapshot.session?.renderedFrames ?? 0;
+          if (currentFrames > maxRenderedFrames) {
+            maxRenderedFrames = currentFrames;
+          }
+          final latest = poller.latest;
+          if (latest.isPlaying) {
+            sawPlaying = true;
+          }
+          if (latest.positionMs > maxPositionMs) {
+            maxPositionMs = latest.positionMs;
+          }
+          if (latest.bufferedPositionMs > maxBufferedPositionMs) {
+            maxBufferedPositionMs = latest.bufferedPositionMs;
+          }
+
+          playbackProgressObserved =
+              maxRenderedFrames > 0 ||
+              sawPlaying ||
+              latest.isPlaying ||
+              maxPositionMs > 0 ||
+              latest.positionMs > 0 ||
+              maxBufferedPositionMs > 0 ||
+              latest.bufferedPositionMs > 0;
 
           if (collectedSummaries.length < 2) {
             throw Exception(
               'Expected at least 2 emitted summaries for ${testCase.label}, but collected ${collectedSummaries.length}',
+            );
+          }
+
+          if (!playbackProgressObserved) {
+            throw Exception(
+              'Playback progress evidence not observed for ${testCase.label}: '
+              'maxRenderedFrames=$maxRenderedFrames, sawPlaying=$sawPlaying, '
+              'maxPositionMs=$maxPositionMs, maxBufferedPositionMs=$maxBufferedPositionMs, '
+              'latest=${latest.toJson()}',
             );
           }
 
@@ -317,6 +401,11 @@ class _AndroidStreamingMultiProtocolStatusPollerPhysicalSmokeAppState
             'collectedCount': collectedSummaries.length,
             'hasActiveSession': hasActiveSessionSummary,
             'hasDisplayDimensions': hasDisplayDimensions,
+            'playbackProgressObserved': playbackProgressObserved,
+            'maxRenderedFrames': maxRenderedFrames,
+            'maxPositionMs': maxPositionMs,
+            'maxBufferedPositionMs': maxBufferedPositionMs,
+            'sawPlaying': sawPlaying,
             'latest': poller.latest.toJson(),
           };
 
@@ -367,7 +456,8 @@ class _AndroidStreamingMultiProtocolStatusPollerPhysicalSmokeAppState
           casePass =
               hasActiveSessionSummary &&
               hasDisplayDimensions &&
-              collectedSummaries.length >= 2;
+              collectedSummaries.length >= 2 &&
+              playbackProgressObserved;
         } catch (error, stack) {
           // ignore: avoid_print
           print(
@@ -396,6 +486,11 @@ class _AndroidStreamingMultiProtocolStatusPollerPhysicalSmokeAppState
           'protocol': testCase.label,
           'pass': casePass,
           'summariesCount': collectedSummaries.length,
+          'playbackProgressObserved': playbackProgressObserved,
+          'maxRenderedFrames': maxRenderedFrames,
+          'maxPositionMs': maxPositionMs,
+          'maxBufferedPositionMs': maxBufferedPositionMs,
+          'sawPlaying': sawPlaying,
           'poller': pollerDiag,
         };
 
@@ -430,6 +525,28 @@ class _AndroidStreamingMultiProtocolStatusPollerPhysicalSmokeAppState
       'hlsSummariesCount': caseResults['hls']?['summariesCount'] ?? 0,
       'dashSummariesCount': caseResults['dash']?['summariesCount'] ?? 0,
       'llHlsSummariesCount': caseResults['ll_hls']?['summariesCount'] ?? 0,
+      'hlsPlaybackProgressObserved':
+          caseResults['hls']?['playbackProgressObserved'] == true,
+      'dashPlaybackProgressObserved':
+          caseResults['dash']?['playbackProgressObserved'] == true,
+      'llHlsPlaybackProgressObserved':
+          caseResults['ll_hls']?['playbackProgressObserved'] == true,
+      'hlsMaxRenderedFrames': caseResults['hls']?['maxRenderedFrames'] ?? 0,
+      'dashMaxRenderedFrames': caseResults['dash']?['maxRenderedFrames'] ?? 0,
+      'llHlsMaxRenderedFrames':
+          caseResults['ll_hls']?['maxRenderedFrames'] ?? 0,
+      'hlsMaxPositionMs': caseResults['hls']?['maxPositionMs'] ?? 0,
+      'dashMaxPositionMs': caseResults['dash']?['maxPositionMs'] ?? 0,
+      'llHlsMaxPositionMs': caseResults['ll_hls']?['maxPositionMs'] ?? 0,
+      'hlsMaxBufferedPositionMs':
+          caseResults['hls']?['maxBufferedPositionMs'] ?? 0,
+      'dashMaxBufferedPositionMs':
+          caseResults['dash']?['maxBufferedPositionMs'] ?? 0,
+      'llHlsMaxBufferedPositionMs':
+          caseResults['ll_hls']?['maxBufferedPositionMs'] ?? 0,
+      'hlsSawPlaying': caseResults['hls']?['sawPlaying'] == true,
+      'dashSawPlaying': caseResults['dash']?['sawPlaying'] == true,
+      'llHlsSawPlaying': caseResults['ll_hls']?['sawPlaying'] == true,
       'preflight': preflightDiag,
       'cases': caseResults,
     };

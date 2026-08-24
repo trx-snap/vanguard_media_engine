@@ -73,7 +73,7 @@ class _StreamingPlayerWidgetState extends State<StreamingPlayerWidget> {
 
 ### Invariants & Non-Claims
 
-- **Protocol Neutrality Across HLS, DASH, and LL-HLS**: The exact same `VGStreamingPlaybackStatusPoller` API operates identically across HLS, DASH, and LL-HLS streams on Android. Physical verification proves polling and summary derivation are protocol-agnostic.
+- **Protocol Neutrality Across HLS, DASH, and LL-HLS**: The exact same `VGStreamingPlaybackStatusPoller` API operates identically across HLS, DASH, and LL-HLS streams on Android. Physical verification proves polling, summary derivation, and real playback progress / render evidence (`renderedFrames > 0`, `isPlaying == true`, `positionMs > 0`, or `bufferedPositionMs > 0`) are protocol-agnostic rather than relying solely on initial buffering metadata.
 - **Media3 Adaptive Engine Ownership**: AndroidX Media3 retains full ownership of underlying manifest parsing, adaptive bitrate (ABR) switching, buffering policies, network connection management, and segment loading.
 - **Controller Ownership**: `VGStreamingPlaybackStatusPoller` does NOT own or dispose the underlying `VGStreamingPlaybackController`. The poller should be stopped and disposed by the host UI widget lifecycle.
 - **Convenience Only**: The poller makes no product feed decisions, no retry policy, no ABR decisions, no caching policy, and makes no native lifecycle decisions.
