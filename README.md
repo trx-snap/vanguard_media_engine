@@ -1211,6 +1211,43 @@ Future<void> planAndPlayStream() async {
 }
 ```
 
+### Composite Preflight Playback Decision Planner Bridge (Phase 4C7M2)
+
+The planner also provides `VGStreamingPlaybackDecisionPlanner.planFromComposite` to evaluate candidate sources against a composite streaming preflight evaluation (`VGStreamingPreflightCompositeEvaluation` from Phase 4C5P) alongside preflight network advisories (`VGStreamingPreflightReport`).
+
+```dart
+// 1. Evaluate composite preflight synchronously (manifest policy, codec capability, compatibility decision)
+final compositeEvaluation = VGStreamingPreflightCompositeEvaluator.evaluate(
+  manifestReport: manifestReport,
+  codecReport: codecReport,
+  compatibilityReport: compatibilityReport,
+  preflightReport: preflightReport,
+);
+
+// 2. Plan playback decision using composite decision request
+final compositeDecision = VGStreamingPlaybackDecisionPlanner.planFromComposite(
+  VGStreamingPlaybackCompositeDecisionRequest(
+    sourceSet: sourceSet,
+    preflightReport: preflightReport,
+    compositeEvaluation: compositeEvaluation,
+    preference: VGStreamingSourceSelectionPreference.preserveOrder,
+    preferredKeys: const ['primary_hls'],
+  ),
+);
+
+// 3. Inspect composite gating and diagnostics
+if (!compositeDecision.canOpenPlayback || compositeDecision.playbackOptions == null) {
+  print('Blocked: ${compositeDecision.decision}'); // e.g. composite_preflight_blocked:<status> or startup_plan_blocked
+  print('Warnings: ${compositeDecision.warnings}');
+  return;
+}
+```
+
+#### Guarantees & Boundaries
+- **Pure Advisory Gate**: `VGStreamingPlaybackDecisionPlanner.planFromComposite` performs pure Dart deterministic evaluation without `MethodChannel` interaction, native player allocation, cache I/O, or playback side effects.
+- **Precedence & Blocking**: If `compositeEvaluation.pass == false`, playback is blocked (`canOpenPlayback: false`, `decision: 'composite_preflight_blocked:<status>'`, `playbackOptions: null`, `selectedSource: null`) and warnings include deduplicated composite and startup plan warnings. If composite passes, evaluation delegates to standard startup plan and source selection gating with composite diagnostics attached.
+- **No Product Policy**: Source preferences remain caller-provided, ABR remains Media3/AVPlayer-owned, and retry policies remain external to the planner.
+
 ## Streaming Source Selector Recipe
 
 The package exposes `VGStreamingSourceSelector` to evaluate candidate streaming source descriptors against a validated `VGStreamingStartupPlan` and caller selection preferences (e.g. `preserveOrder`, `preferHls`, `preferDash`, `preferLowLatency`, `preferConstrainedReliability`, or specific `preferredKeys`).

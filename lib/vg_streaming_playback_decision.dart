@@ -6,6 +6,7 @@
 // object without platform coupling, native calls, or side effects.
 
 import 'vg_streaming_playback_client.dart';
+import 'vg_streaming_preflight_composite_evaluator.dart';
 import 'vg_streaming_source_selector.dart';
 import 'vg_streaming_startup_plan.dart';
 
@@ -15,6 +16,10 @@ export 'vg_streaming_playback_client.dart'
         VGStreamingNetworkProfile,
         VGStreamingPlaybackOptions;
 export 'vg_streaming_preflight_client.dart' show VGStreamingPreflightReport;
+export 'vg_streaming_preflight_composite_evaluator.dart'
+    show
+        VGStreamingPreflightCompositeEvaluation,
+        VGStreamingPreflightCompositeEvaluator;
 export 'vg_streaming_source_descriptor.dart'
     show VGStreamingSourceDescriptor, VGStreamingSourceSet;
 export 'vg_streaming_source_selector.dart'
@@ -55,6 +60,43 @@ class VGStreamingPlaybackDecisionRequest {
   String toString() =>
       'VGStreamingPlaybackDecisionRequest(preference=$preference, '
       'preferredKeys=$preferredKeys, requirePlanToProceed=$requirePlanToProceed)';
+}
+
+/// Immutable request configuration for streaming playback decision planning
+/// with composite preflight evaluation.
+class VGStreamingPlaybackCompositeDecisionRequest {
+  /// Candidate set of streaming sources.
+  final VGStreamingSourceSet sourceSet;
+
+  /// Preflight advisory report evaluating device and network readiness.
+  final VGStreamingPreflightReport preflightReport;
+
+  /// Composite preflight evaluation combining manifest, codec, and compatibility reports.
+  final VGStreamingPreflightCompositeEvaluation compositeEvaluation;
+
+  /// Preference strategy for candidate source selection.
+  final VGStreamingSourceSelectionPreference preference;
+
+  /// Optional prioritized list of source keys to evaluate.
+  final List<String> preferredKeys;
+
+  /// Whether preflight startup plan must pass to proceed to playback.
+  final bool requirePlanToProceed;
+
+  const VGStreamingPlaybackCompositeDecisionRequest({
+    required this.sourceSet,
+    required this.preflightReport,
+    required this.compositeEvaluation,
+    this.preference = VGStreamingSourceSelectionPreference.preserveOrder,
+    this.preferredKeys = const [],
+    this.requirePlanToProceed = true,
+  });
+
+  @override
+  String toString() =>
+      'VGStreamingPlaybackCompositeDecisionRequest(preference=$preference, '
+      'preferredKeys=$preferredKeys, requirePlanToProceed=$requirePlanToProceed, '
+      'compositeStatus=${compositeEvaluation.status})';
 }
 
 /// Immutable result of a streaming playback decision evaluation.
@@ -179,6 +221,139 @@ abstract final class VGStreamingPlaybackDecisionPlanner {
       decision: decision,
       warnings: List<String>.unmodifiable(combinedWarnings),
       diagnostics: Map<String, Object?>.unmodifiable(diagnostics),
+    );
+  }
+
+  /// Evaluates composite [request] and produces an immutable [VGStreamingPlaybackDecision].
+  static VGStreamingPlaybackDecision planFromComposite(
+    VGStreamingPlaybackCompositeDecisionRequest request,
+  ) {
+    // 1. Synthesize startup plan from preflight report.
+    final startupPlan = VGStreamingStartupPlanner.fromPreflight(
+      request.preflightReport,
+    );
+
+    final composite = request.compositeEvaluation;
+
+    // 2. Build composite diagnostics helper map.
+    Map<String, Object?> buildCompositeDiagnostics({
+      required Map<String, Object?> baseDiagnostics,
+      required bool canOpenPlayback,
+    }) {
+      final map = <String, Object?>{
+        ...baseDiagnostics,
+        'compositeStatus': composite.status,
+        'compositePass': composite.pass,
+        'compositeAdvisoryOnly': composite.advisoryOnly,
+        'compositePlaybackMutation': composite.playbackMutation,
+        'compositeAvcBaselinePass': composite.avcBaselinePass,
+        'compositeServerLadderPolicyPass': composite.serverLadderPolicyPass,
+        'compositeTotalStreamsEvaluated': composite.totalStreamsEvaluated,
+        'compositePassedStreams': composite.passedStreams,
+        'compositeFailedStreams': composite.failedStreams,
+        'canOpenPlayback': canOpenPlayback,
+      };
+      return Map<String, Object?>.unmodifiable(map);
+    }
+
+    // 3. Composite block branch if composite evaluation fails.
+    if (!composite.pass) {
+      final blockDecision = 'composite_preflight_blocked:${composite.status}';
+
+      // Deduplicate warnings in encounter order: composite.warnings -> startupPlan.warnings -> blockDecision
+      final combinedWarnings = <String>[];
+      for (final w in composite.warnings) {
+        if (!combinedWarnings.contains(w)) {
+          combinedWarnings.add(w);
+        }
+      }
+      for (final w in startupPlan.warnings) {
+        if (!combinedWarnings.contains(w)) {
+          combinedWarnings.add(w);
+        }
+      }
+      if (!combinedWarnings.contains(blockDecision)) {
+        combinedWarnings.add(blockDecision);
+      }
+
+      final unmodifiableWarnings = List<String>.unmodifiable(combinedWarnings);
+
+      final nonSelectedSelection = VGStreamingSourceSelection(
+        selected: false,
+        selectedKey: null,
+        source: null,
+        playbackOptions: null,
+        decision: blockDecision,
+        consideredKeys: const [],
+        warnings: unmodifiableWarnings,
+        diagnostics: const {},
+      );
+
+      final baseDiagnostics = <String, Object?>{
+        'preflightPhase': request.preflightReport.phase,
+        'preflightPass': request.preflightReport.pass,
+        'startupReason': startupPlan.reason,
+        'selectionDecision': nonSelectedSelection.decision,
+        'preference': request.preference.name,
+        'selectedKey': null,
+        'requirePlanToProceed': request.requirePlanToProceed,
+        'recommendedNetworkProfile': startupPlan.recommendedNetworkProfile
+            .toNative(),
+      };
+
+      return VGStreamingPlaybackDecision(
+        startupPlan: startupPlan,
+        selection: nonSelectedSelection,
+        canOpenPlayback: false,
+        selectedKey: null,
+        selectedSource: null,
+        playbackOptions: null,
+        decision: blockDecision,
+        warnings: unmodifiableWarnings,
+        diagnostics: buildCompositeDiagnostics(
+          baseDiagnostics: baseDiagnostics,
+          canOpenPlayback: false,
+        ),
+      );
+    }
+
+    // 4. Composite pass: delegate to existing base planning.
+    final baseDecision = plan(
+      VGStreamingPlaybackDecisionRequest(
+        sourceSet: request.sourceSet,
+        preflightReport: request.preflightReport,
+        preference: request.preference,
+        preferredKeys: request.preferredKeys,
+        requirePlanToProceed: request.requirePlanToProceed,
+      ),
+    );
+
+    // Merge base decision warnings with composite warnings (deduped in encounter order: baseDecision -> composite)
+    final combinedWarnings = <String>[];
+    for (final w in baseDecision.warnings) {
+      if (!combinedWarnings.contains(w)) {
+        combinedWarnings.add(w);
+      }
+    }
+    for (final w in composite.warnings) {
+      if (!combinedWarnings.contains(w)) {
+        combinedWarnings.add(w);
+      }
+    }
+
+    return VGStreamingPlaybackDecision(
+      startupPlan: baseDecision.startupPlan,
+      selection: baseDecision.selection,
+      canOpenPlayback: baseDecision.canOpenPlayback,
+      selectedKey: baseDecision.selectedKey,
+      selectedSource: baseDecision.selectedSource,
+      playbackOptions: baseDecision.playbackOptions,
+      decision: baseDecision.decision,
+      warnings: List<String>.unmodifiable(combinedWarnings),
+      diagnostics: buildCompositeDiagnostics(
+        baseDiagnostics: baseDecision.diagnostics,
+        canOpenPlayback: baseDecision.canOpenPlayback,
+      ),
     );
   }
 }
