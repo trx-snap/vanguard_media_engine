@@ -537,6 +537,61 @@ void checkRetryBudget({
 - **Stream Key Isolation**: Optional `streamKey` scoping enables per-stream budget tracking across multi-stream feeds.
 - **iOS Parity**: Pure Dart implementation over public streaming models runs identically on iOS without native platform code dependencies.
 
+## Public Streaming Playback Retry Attempt Journal (Phase 4C7AS / Phase 4C7AT)
+
+The package exposes `VGStreamingPlaybackRetryJournal` as a pure Dart in-memory journal helper for recording, pruning, snapshotting, and evaluating streaming playback retry attempts (`VGStreamingPlaybackRetryAttempt`) with `VGStreamingPlaybackRetryBudgetPlanner` without manual bookkeeping or custom list pruning logic.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+void manageRetryJournal({
+  required VGStreamingPlaybackRecoveryPlan recoveryPlan,
+}) {
+  // 1. Instantiate in-memory journal with optional config
+  final journal = VGStreamingPlaybackRetryJournal(
+    config: const VGStreamingPlaybackRetryJournalConfig(
+      maxStoredAttempts: 32,
+      defaultWindowMs: 120000, // 2-minute default pruning window
+    ),
+  );
+
+  final nowMs = DateTime.now().millisecondsSinceEpoch;
+
+  // 2. Evaluate retry budget directly via journal
+  final budgetResult = journal.evaluateBudget(
+    recoveryPlan: recoveryPlan,
+    nowMs: nowMs,
+    streamKey: 'stream_primary',
+  );
+
+  if (budgetResult.canRetry) {
+    // 3. Record attempt into journal when executing retry
+    journal.recordNow(
+      nowMs: nowMs,
+      intent: recoveryPlan.intent,
+      streamKey: 'stream_primary',
+      reason: 'rebuffer_timeout',
+    );
+  }
+
+  // 4. Prune expired attempts older than rolling window
+  journal.prune(nowMs: nowMs);
+
+  // 5. Inspect immutable journal snapshot
+  final snapshot = journal.snapshot(streamKey: 'stream_primary');
+  print('Attempts for stream: ${snapshot.count}');
+}
+```
+
+### Invariants & Boundaries
+
+- **Pure In-Memory Helper**: `snapshot.advisoryOnly == true` and `snapshot.playbackMutation == false`. `VGStreamingPlaybackRetryJournal` owns only an in-memory `List<VGStreamingPlaybackRetryAttempt>`, never writes to disk, never runs background timers, never mutates playback, and calls zero native platform channels.
+- **Deterministic Time**: Clocks are caller-provided (`nowMs`); the journal never reads system clocks internally.
+- **Defensive JSON Import**: `VGStreamingPlaybackRetryJournal.fromJson` defensively parses valid attempt maps and silently skips malformed items without throwing exceptions.
+- **iOS Parity**: Pure Dart implementation over public streaming models runs identically on iOS without native platform code dependencies.
+
 ## Cached Streaming Playback All-Up Integration Recipe
 
 The package provides end-to-end composition across bounded cache prewarming, manifest preflight capability evaluation, startup decision planning, session-safe controller management, presentation via `VGStreamingPlaybackTextureView`, and snapshot-level playback timing and buffer telemetry.
