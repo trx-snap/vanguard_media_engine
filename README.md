@@ -351,6 +351,57 @@ void checkPlaybackHealth({
 - **Poor-Network Strategy**: On rough, high-jitter, or bandwidth-constrained mobile networks, applications should favor standard HLS/DASH streams with `VGStreamingNetworkProfile.constrained` over Apple LL-HLS (`lowLatency`), which operates with shallow buffer depths and higher rebuffering risk, unless explicit low-latency live interaction is strictly required by the product.
 - **iOS Parity Expectation**: Because `VGStreamingPlaybackHealthAdvisor` is written in pure Dart and operates on public summary and preflight data structures, it behaves identically across platforms without native code dependencies.
 
+## Public Streaming Playback Recovery Planner (Phase 4C7AK / Phase 4C7AL)
+
+The package exposes `VGStreamingPlaybackRecoveryPlanner` as a pure Dart helper that transforms health advice (`VGStreamingPlaybackHealthAdvice`), playback status (`VGStreamingPlaybackStatusSummary`), and active session options (`VGStreamingPlaybackOptions`) into a typed, immutable host recovery plan (`VGStreamingPlaybackRecoveryPlan`) without mutating playback or calling platform channels.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+void planPlaybackRecovery({
+  required VGStreamingPlaybackHealthAdvice advice,
+  VGStreamingPlaybackStatusSummary? currentStatus,
+  VGStreamingPlaybackOptions? currentOptions,
+}) {
+  // 1. Construct immutable recovery plan request
+  final request = VGStreamingPlaybackRecoveryPlanRequest(
+    advice: advice,
+    currentStatus: currentStatus,
+    currentOptions: currentOptions,
+    allowAutomaticRetry: false,
+    retryDelayMs: 750,
+    preserveCacheOptions: true,
+  );
+
+  // 2. Synthesize typed recovery plan
+  final plan = VGStreamingPlaybackRecoveryPlanner.plan(request);
+
+  // 3. Inspect typed recovery instructions
+  print('Intent: ${plan.intent}');                   // none, waitForBuffer, retryCurrentProfile, retryConstrainedProfile, reopenStandardLatency, stopTerminal
+  print('Urgency: ${plan.urgency}');                 // none, passive, active, immediate
+  print('Should Reopen: ${plan.shouldReopenPlayback}');
+  print('Requires Host Action: ${plan.requiresHostAction}');
+  print('Can Build Options: ${plan.canBuildPlaybackOptions}');
+  print('Resume Position: ${plan.resumePositionMs}ms');
+  print('Retry Delay: ${plan.retryDelayMs}ms');
+
+  // 4. If host chooses to act, use cloned and adjusted playback options
+  if (plan.shouldReopenPlayback && plan.playbackOptions != null) {
+    // e.g. controller.open(plan.playbackOptions!) or playbackClient.open(plan.playbackOptions!)
+  }
+}
+```
+
+### Invariants & Architectural Boundaries
+
+- **Pure Advisory Helper**: `plan.advisoryOnly == true` and `plan.playbackMutation == false`. The recovery planner never calls `VGStreamingPlaybackClient.open`, `play`, `pause`, `stop`, `dispose`, or cache APIs.
+- **Product Ownership**: The host application retains full ownership over when, whether, and how to execute playback retries, stream switches, and user-facing recovery indicators.
+- **Option Cloning & Cache Preservation**: When options are provided, the planner safely clones options with adjusted network profiles (`constrained`, `stable`) while preserving format hints, headers, geometry, and cache options when requested.
+- **Live vs. VOD Resume Logic**: For VOD streams (`isLive == false`), the planner preserves current playhead position as the resume point. For live streams, resume position remains `null` to automatically track the live edge unless an explicit override is provided.
+- **iOS Parity**: Pure Dart implementation over public models runs identically on iOS without platform code dependencies.
+
 ## Cached Streaming Playback All-Up Integration Recipe
 
 The package provides end-to-end composition across bounded cache prewarming, manifest preflight capability evaluation, startup decision planning, session-safe controller management, presentation via `VGStreamingPlaybackTextureView`, and snapshot-level playback timing and buffer telemetry.
