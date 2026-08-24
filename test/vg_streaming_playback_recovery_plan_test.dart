@@ -255,7 +255,7 @@ void main() {
           planWithOptions.urgency,
           equals(VGStreamingPlaybackRecoveryUrgency.active),
         );
-        expect(planWithOptions.shouldReopenPlayback, isFalse);
+        expect(planWithOptions.shouldReopenPlayback, isTrue);
         expect(planWithOptions.canBuildPlaybackOptions, isTrue);
         expect(
           planWithOptions.playbackOptions!.networkProfile,
@@ -265,6 +265,20 @@ void main() {
           planWithOptions.requiresHostAction,
           isTrue,
         ); // host owns action when allowAutoRetry is false
+        expect(planWithOptions.advisoryOnly, isTrue);
+        expect(planWithOptions.playbackMutation, isFalse);
+
+        // With allowAutomaticRetry = true
+        final reqAuto = VGStreamingPlaybackRecoveryPlanRequest(
+          advice: advice,
+          currentOptions: options,
+          allowAutomaticRetry: true,
+        );
+        final planAuto = VGStreamingPlaybackRecoveryPlanner.plan(reqAuto);
+        expect(planAuto.shouldReopenPlayback, isTrue);
+        expect(planAuto.requiresHostAction, isFalse);
+        expect(planAuto.advisoryOnly, isTrue);
+        expect(planAuto.playbackMutation, isFalse);
 
         // Without options -> requires host action and cannot build options
         final reqNoOptions = VGStreamingPlaybackRecoveryPlanRequest(
@@ -274,9 +288,12 @@ void main() {
           reqNoOptions,
         );
 
+        expect(planNoOptions.shouldReopenPlayback, isTrue);
         expect(planNoOptions.canBuildPlaybackOptions, isFalse);
         expect(planNoOptions.playbackOptions, isNull);
         expect(planNoOptions.requiresHostAction, isTrue);
+        expect(planNoOptions.advisoryOnly, isTrue);
+        expect(planNoOptions.playbackMutation, isFalse);
       },
     );
 

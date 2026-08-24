@@ -308,7 +308,7 @@ abstract final class VGStreamingPlaybackRecoveryPlanner {
       case VGStreamingPlaybackHealthAction.preferConstrainedProfile:
         intent = VGStreamingPlaybackRecoveryIntent.retryConstrainedProfile;
         urgency = VGStreamingPlaybackRecoveryUrgency.active;
-        shouldReopenPlayback = false;
+        shouldReopenPlayback = true;
 
         if (currentOptions != null) {
           canBuildPlaybackOptions = true;
