@@ -4,6 +4,42 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Public Streaming Playback Status Summary Helper (Phase 4C7AA / Phase 4C7AB)
+
+The package exposes `VGStreamingPlaybackStatusSummary` as a pure Dart immutable summary object providing safe, UI-friendly telemetry for progress bars, buffer indicators, live vs. VOD distinction, display dimensions, and cache-read observability.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+// Derive from controller snapshot:
+final summary = VGStreamingPlaybackStatusSummary.fromControllerSnapshot(controller.snapshot);
+
+// Or derive directly from a session:
+// final summary = VGStreamingPlaybackStatusSummary.fromSession(session);
+
+// Safe UI consumption:
+final double progress = summary.progressFraction;   // Clamped 0.0..1.0 (0.0 for live / non-positive duration)
+final double buffered = summary.bufferedFraction;   // Clamped 0.0..1.0
+final bool isLive = summary.isLive;                 // true if liveOffsetMs != null or durationMs < 0
+final bool isSeekable = summary.isSeekable;         // true only for positive VOD duration
+final bool isPlaying = summary.isPlaying;
+final bool isBuffering = summary.isBufferingOrOpening;
+final bool isTerminal = summary.isTerminal;
+
+// Telemetry & cache observability:
+if (summary.playbackCacheReadObserved) {
+  print('Cache bytes read: ${summary.playbackCacheBytesRead} / ${summary.playbackCacheSizeBytes}');
+}
+```
+
+### Invariants & Non-Claims
+
+- **Convenience / Read Model Only**: `VGStreamingPlaybackStatusSummary` is purely a derived presentation and status helper. It makes no product feed decisions, no ABR rendition selections, no retry policy, no caching policy, and triggers no platform channel mutations.
+- **Defensive Telemetry Clamping**: Out-of-bounds metrics (negative positions, overflow percentages, negative cache byte counters) are defensively sanitized and clamped to their valid ranges.
+- **iOS Parity Expectation**: Because `VGStreamingPlaybackStatusSummary` is written entirely in pure Dart and operates on `VGStreamingPlaybackSession` / `VGStreamingPlaybackControllerSnapshot`, the exact same summary helper works automatically on iOS as soon as the iOS backend populates the matching session fields.
+
 ## Cached Streaming Playback All-Up Integration Recipe
 
 The package provides end-to-end composition across bounded cache prewarming, manifest preflight capability evaluation, startup decision planning, session-safe controller management, presentation via `VGStreamingPlaybackTextureView`, and snapshot-level playback timing and buffer telemetry.

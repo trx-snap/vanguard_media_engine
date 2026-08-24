@@ -113,6 +113,8 @@ export 'vg_streaming_playback_decision.dart';
 export 'vg_streaming_playback_controller.dart';
 // Phase 4C7Q: public streaming playback texture view widget.
 export 'vg_streaming_playback_view.dart';
+// Phase 4C7AA: public streaming playback status summary helper.
+export 'vg_streaming_playback_status_summary.dart';
 // Phase 4C3V: public RTC video diagnostics client.
 export 'vg_rtc_video_diagnostics_client.dart';
 // Phase 4C4J: public adaptive stream timeline diagnostics client.
