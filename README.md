@@ -846,6 +846,50 @@ Future<void> runRtcDiagnostics() async {
 - **Video-Only (No Audio / Room Ownership)**: Vanguard operates strictly on video transport contracts. All room tokens, session state, participant management, and microphone/speaker audio are strictly owned by ConnectsApp / Room layer and must never enter Vanguard.
 - **No WebRTC Caching**: Real-time WebRTC / LiveKit media streams are not cached by the Vanguard streaming playback cache.
 
+## Adaptive Stream Timeline Diagnostics API
+
+The package exposes `VGStreamingTimelineDiagnosticsClient` to run timeline monotonicity, duplicate dropping, out-of-order rejection, late dropping, future frame retryability, seek rebasing, rendition rebasing, and live-offset speed policy diagnostics against the native adaptive stream timeline controller without raw `MethodChannel` calls.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+Future<void> runTimelineDiagnostics() async {
+  // 1. Instantiate timeline diagnostics client
+  final client = VGStreamingTimelineDiagnosticsClient();
+
+  // 2. Execute adaptive stream timeline diagnostic smoke suite
+  final report = await client.run(
+    request: const VGStreamingTimelineDiagnosticsRequest(
+      frameCount: 5,
+    ),
+  );
+
+  // 3. Inspect report and timeline invariants
+  if (report.pass) {
+    print('Adaptive Stream Timeline Diagnostics passed across all 11 invariants');
+    print('Sequential pass: ${report.sequentialPass}');
+    print('Duplicate pass: ${report.duplicatePass}');
+    print('Out-of-order pass: ${report.outOfOrderPass}');
+    print('Late pass: ${report.latePass}');
+    print('Future & retry pass: ${report.futurePass} / ${report.futureRetryPass}');
+    print('Seek & rendition rebase pass: ${report.seekRebasePass} / ${report.renditionRebasePass}');
+    print('Live offset policy pass: ${report.liveOffsetPolicyPass}');
+    print('Negative input & reset pass: ${report.negativeInputPass} / ${report.resetPass}');
+  } else {
+    print('Timeline Diagnostics failed: ${report.raw}');
+  }
+}
+```
+
+### Invariants & Ownership Boundaries
+
+- **Diagnostic-Only Wrapper**: This API is a diagnostic-only wrapper over the native `AdaptiveStreamTimelineController` and `AdaptiveStreamLiveOffsetPolicy` verification harness (`runAndroidDagPhase4C4GAdaptiveStreamTimelineSmoke`). It validates timestamp normalization, frame ordering, and rebasing math without controlling native playback ABR rendition switches or mutating product feed policies.
+- **ABR & Player Boundary**: The native Media3 / ExoPlayer runtime continues to own ABR rendition selection and segment loading.
+- **Product Boundary**: Zero ConnectsApp feed prediction or playback policy wiring in this API.
+- **iOS Parity Expectation**: Safe to import on iOS (catches `MissingPluginException` and returns typed unsupported report). The iOS implementer will expose equivalent public diagnostics once the AVPlayer timeline backend lands.
+
 ## Package Architecture
 
 - `lib/`: Dart public API definitions and platform bridge clients.

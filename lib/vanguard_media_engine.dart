@@ -115,6 +115,8 @@ export 'vg_streaming_playback_controller.dart';
 export 'vg_streaming_playback_view.dart';
 // Phase 4C3V: public RTC video diagnostics client.
 export 'vg_rtc_video_diagnostics_client.dart';
+// Phase 4C4J: public adaptive stream timeline diagnostics client.
+export 'vg_streaming_timeline_diagnostics_client.dart';
 
 const String _libName = 'vanguard_media_engine';
 
