@@ -398,5 +398,145 @@ void main() {
       expect(selection.toString(), contains('selected=true'));
       expect(selection.toString(), contains('selectedKey=hls_main'));
     });
+
+    group('Client Capabilities', () {
+      test(
+        'appleAvPlayer with preferDash selects HLS/LL-HLS fallback, never DASH',
+        () {
+          final request = VGStreamingSourceSelectionRequest(
+            sourceSet: sourceSet,
+            startupPlan: validPlan,
+            preference: VGStreamingSourceSelectionPreference.preferDash,
+            clientCapabilities:
+                const VGStreamingSourceClientCapabilities.appleAvPlayer(),
+          );
+
+          final selection = VGStreamingSourceSelector.select(request);
+
+          expect(selection.selected, isTrue);
+          expect(selection.selectedKey, equals('hls_main'));
+          expect(
+            selection.warnings,
+            contains('source_incompatible:dash_main:dash_not_supported'),
+          );
+          expect(selection.diagnostics['clientType'], equals('apple_avplayer'));
+          expect(selection.diagnostics['supportsDash'], isFalse);
+          expect(selection.diagnostics['supportsHls'], isTrue);
+        },
+      );
+
+      test(
+        'appleAvPlayer with preferLowLatency true prefers LL-HLS when available',
+        () {
+          final request = VGStreamingSourceSelectionRequest(
+            sourceSet: sourceSet,
+            startupPlan: validPlan,
+            preference: VGStreamingSourceSelectionPreference.preferHls,
+            clientCapabilities:
+                const VGStreamingSourceClientCapabilities.appleAvPlayer(
+                  preferLowLatency: true,
+                ),
+          );
+
+          final selection = VGStreamingSourceSelector.select(request);
+
+          expect(selection.selected, isTrue);
+          expect(selection.selectedKey, equals('ll_hls_main'));
+          expect(selection.diagnostics['preferLowLatency'], isTrue);
+        },
+      );
+
+      test('androidMedia3 with preferDash still selects DASH', () {
+        final request = VGStreamingSourceSelectionRequest(
+          sourceSet: sourceSet,
+          startupPlan: validPlan,
+          preference: VGStreamingSourceSelectionPreference.preferDash,
+          clientCapabilities:
+              const VGStreamingSourceClientCapabilities.androidMedia3(),
+        );
+
+        final selection = VGStreamingSourceSelector.select(request);
+
+        expect(selection.selected, isTrue);
+        expect(selection.selectedKey, equals('dash_main'));
+        expect(selection.diagnostics['clientType'], equals('android_media3'));
+        expect(selection.diagnostics['supportsDash'], isTrue);
+        expect(selection.warnings, isEmpty);
+      });
+
+      test('webDashCapable with preferDash still selects DASH', () {
+        final request = VGStreamingSourceSelectionRequest(
+          sourceSet: sourceSet,
+          startupPlan: validPlan,
+          preference: VGStreamingSourceSelectionPreference.preferDash,
+          clientCapabilities:
+              const VGStreamingSourceClientCapabilities.webDashCapable(),
+        );
+
+        final selection = VGStreamingSourceSelector.select(request);
+
+        expect(selection.selected, isTrue);
+        expect(selection.selectedKey, equals('dash_main'));
+        expect(selection.diagnostics['clientType'], equals('web_dash_capable'));
+        expect(selection.diagnostics['supportsDash'], isTrue);
+      });
+
+      test(
+        'hlsOnly with a DASH-only source set returns no_compatible_source with typed warnings',
+        () {
+          final dashOnlySet = VGStreamingSourceSet(sources: [dashSource]);
+          final request = VGStreamingSourceSelectionRequest(
+            sourceSet: dashOnlySet,
+            startupPlan: validPlan,
+            preference: VGStreamingSourceSelectionPreference.preserveOrder,
+            clientCapabilities:
+                const VGStreamingSourceClientCapabilities.hlsOnly(),
+          );
+
+          final selection = VGStreamingSourceSelector.select(request);
+
+          expect(selection.selected, isFalse);
+          expect(selection.selectedKey, isNull);
+          expect(selection.source, isNull);
+          expect(selection.playbackOptions, isNull);
+          expect(selection.decision, equals('no_compatible_source'));
+          expect(selection.warnings, contains('no_compatible_source'));
+          expect(
+            selection.warnings,
+            contains('source_incompatible:dash_main:dash_not_supported'),
+          );
+          expect(selection.diagnostics['clientType'], equals('hls_only'));
+          expect(selection.diagnostics['compatibleCandidateCount'], equals(0));
+        },
+      );
+
+      test(
+        'custom capabilities filtering works accurately for LL-HLS and HLS',
+        () {
+          const noLlCaps = VGStreamingSourceClientCapabilities(
+            clientType: 'legacy_hls',
+            supportsHls: true,
+            supportsDash: false,
+            supportsLowLatencyHls: false,
+          );
+
+          final request = VGStreamingSourceSelectionRequest(
+            sourceSet: VGStreamingSourceSet(sources: [llHlsSource, hlsSource]),
+            startupPlan: validPlan,
+            preference: VGStreamingSourceSelectionPreference.preserveOrder,
+            clientCapabilities: noLlCaps,
+          );
+
+          final selection = VGStreamingSourceSelector.select(request);
+
+          expect(selection.selected, isTrue);
+          expect(selection.selectedKey, equals('hls_main'));
+          expect(
+            selection.warnings,
+            contains('source_incompatible:ll_hls_main:ll_hls_not_supported'),
+          );
+        },
+      );
+    });
   });
 }

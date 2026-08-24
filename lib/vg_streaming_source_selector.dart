@@ -34,6 +34,84 @@ enum VGStreamingSourceSelectionPreference {
   preferConstrainedReliability,
 }
 
+/// Pure Dart advisory client capabilities/profile model for streaming source selection.
+class VGStreamingSourceClientCapabilities {
+  /// Identifier describing the playback client / engine type.
+  final String clientType;
+
+  /// Whether the client engine supports standard HLS (.m3u8).
+  final bool supportsHls;
+
+  /// Whether the client engine supports DASH (.mpd).
+  final bool supportsDash;
+
+  /// Whether the client engine supports Low-Latency HLS (LL-HLS).
+  final bool supportsLowLatencyHls;
+
+  /// Advisory preference to prioritize Low-Latency sources when supported.
+  final bool preferLowLatency;
+
+  const VGStreamingSourceClientCapabilities({
+    required this.clientType,
+    this.supportsHls = true,
+    this.supportsDash = true,
+    this.supportsLowLatencyHls = true,
+    this.preferLowLatency = false,
+  }) : assert(clientType.length > 0, 'clientType must not be empty');
+
+  /// Apple native AVPlayer capabilities (supports HLS and LL-HLS, does not support DASH).
+  const VGStreamingSourceClientCapabilities.appleAvPlayer({
+    bool preferLowLatency = false,
+  }) : this(
+         clientType: 'apple_avplayer',
+         supportsHls: true,
+         supportsDash: false,
+         supportsLowLatencyHls: true,
+         preferLowLatency: preferLowLatency,
+       );
+
+  /// Android Media3 / ExoPlayer capabilities (supports HLS, DASH, and LL-HLS).
+  const VGStreamingSourceClientCapabilities.androidMedia3({
+    bool preferLowLatency = false,
+  }) : this(
+         clientType: 'android_media3',
+         supportsHls: true,
+         supportsDash: true,
+         supportsLowLatencyHls: true,
+         preferLowLatency: preferLowLatency,
+       );
+
+  /// Web DASH-capable capabilities (supports HLS, DASH, and LL-HLS).
+  const VGStreamingSourceClientCapabilities.webDashCapable({
+    bool preferLowLatency = false,
+  }) : this(
+         clientType: 'web_dash_capable',
+         supportsHls: true,
+         supportsDash: true,
+         supportsLowLatencyHls: true,
+         preferLowLatency: preferLowLatency,
+       );
+
+  /// Generic HLS-only client capabilities (supports HLS/LL-HLS, not DASH).
+  const VGStreamingSourceClientCapabilities.hlsOnly({
+    String clientType = 'hls_only',
+    bool preferLowLatency = false,
+  }) : this(
+         clientType: clientType,
+         supportsHls: true,
+         supportsDash: false,
+         supportsLowLatencyHls: true,
+         preferLowLatency: preferLowLatency,
+       );
+
+  @override
+  String toString() =>
+      'VGStreamingSourceClientCapabilities(clientType=$clientType, '
+      'supportsHls=$supportsHls, supportsDash=$supportsDash, '
+      'supportsLowLatencyHls=$supportsLowLatencyHls, '
+      'preferLowLatency=$preferLowLatency)';
+}
+
 /// Immutable request configuration for streaming source selection.
 class VGStreamingSourceSelectionRequest {
   /// Candidate set of streaming sources.
@@ -51,18 +129,23 @@ class VGStreamingSourceSelectionRequest {
   /// Whether preflight [startupPlan.shouldProceed] must be true to select a source.
   final bool requirePlanToProceed;
 
+  /// Optional client capability profile for advisory compatibility filtering.
+  final VGStreamingSourceClientCapabilities? clientCapabilities;
+
   const VGStreamingSourceSelectionRequest({
     required this.sourceSet,
     required this.startupPlan,
     this.preference = VGStreamingSourceSelectionPreference.preserveOrder,
     this.preferredKeys = const [],
     this.requirePlanToProceed = true,
+    this.clientCapabilities,
   });
 
   @override
   String toString() =>
       'VGStreamingSourceSelectionRequest(preference=$preference, '
-      'preferredKeys=$preferredKeys, requirePlanToProceed=$requirePlanToProceed)';
+      'preferredKeys=$preferredKeys, requirePlanToProceed=$requirePlanToProceed, '
+      'clientCapabilities=$clientCapabilities)';
 }
 
 /// Immutable result of a streaming source selection evaluation.
@@ -157,45 +240,140 @@ abstract final class VGStreamingSourceSelector {
 
     final consideredKeys = candidates.map((s) => s.key).toList();
 
-    // Rule 4: Apply preference strategy.
+    // Rule 4: Apply client capabilities compatibility filtering if provided.
+    final caps = request.clientCapabilities;
+    final compatibleCandidates = <VGStreamingSourceDescriptor>[];
+    if (caps != null) {
+      for (final candidate in candidates) {
+        final isDash =
+            candidate.formatHint == VGStreamingFormatHint.dash ||
+            candidate.uri.path.toLowerCase().endsWith('.mpd');
+        final isHls =
+            candidate.formatHint == VGStreamingFormatHint.hls ||
+            candidate.uri.path.toLowerCase().endsWith('.m3u8');
+        final isLlHls = candidate.requireLlHlsTags == true;
+
+        if (isDash && !caps.supportsDash) {
+          warnings.add(
+            'source_incompatible:${candidate.key}:dash_not_supported',
+          );
+          continue;
+        }
+
+        if (isLlHls && !caps.supportsLowLatencyHls) {
+          warnings.add(
+            'source_incompatible:${candidate.key}:ll_hls_not_supported',
+          );
+          continue;
+        }
+
+        if (isHls && !caps.supportsHls) {
+          warnings.add(
+            'source_incompatible:${candidate.key}:hls_not_supported',
+          );
+          continue;
+        }
+
+        compatibleCandidates.add(candidate);
+      }
+
+      if (compatibleCandidates.isEmpty) {
+        warnings.add('no_compatible_source');
+        final diagnostics = <String, Object?>{
+          'preference': request.preference.name,
+          'clientType': caps.clientType,
+          'supportsHls': caps.supportsHls,
+          'supportsDash': caps.supportsDash,
+          'supportsLowLatencyHls': caps.supportsLowLatencyHls,
+          'preferLowLatency': caps.preferLowLatency,
+          'candidateCount': candidates.length,
+          'compatibleCandidateCount': 0,
+        };
+
+        return VGStreamingSourceSelection(
+          selected: false,
+          selectedKey: null,
+          source: null,
+          playbackOptions: null,
+          decision: 'no_compatible_source',
+          consideredKeys: List<String>.unmodifiable(consideredKeys),
+          warnings: List<String>.unmodifiable(warnings),
+          diagnostics: Map<String, Object?>.unmodifiable(diagnostics),
+        );
+      }
+    } else {
+      compatibleCandidates.addAll(candidates);
+    }
+
+    // Rule 5: Apply preference strategy on compatible candidates.
     VGStreamingSourceDescriptor chosenSource;
     switch (request.preference) {
       case VGStreamingSourceSelectionPreference.preserveOrder:
-        chosenSource = candidates.first;
+        if (caps != null && caps.preferLowLatency) {
+          chosenSource = compatibleCandidates.firstWhere(
+            (s) => s.requireLlHlsTags == true,
+            orElse: () => compatibleCandidates.first,
+          );
+        } else {
+          chosenSource = compatibleCandidates.first;
+        }
         break;
       case VGStreamingSourceSelectionPreference.preferHls:
-        chosenSource = candidates.firstWhere(
-          (s) => s.formatHint == VGStreamingFormatHint.hls,
-          orElse: () => candidates.first,
-        );
+        if (caps != null && caps.preferLowLatency) {
+          chosenSource = compatibleCandidates.firstWhere(
+            (s) =>
+                s.formatHint == VGStreamingFormatHint.hls &&
+                s.requireLlHlsTags == true,
+            orElse: () => compatibleCandidates.firstWhere(
+              (s) => s.formatHint == VGStreamingFormatHint.hls,
+              orElse: () => compatibleCandidates.first,
+            ),
+          );
+        } else {
+          chosenSource = compatibleCandidates.firstWhere(
+            (s) => s.formatHint == VGStreamingFormatHint.hls,
+            orElse: () => compatibleCandidates.first,
+          );
+        }
         break;
       case VGStreamingSourceSelectionPreference.preferDash:
-        chosenSource = candidates.firstWhere(
+        chosenSource = compatibleCandidates.firstWhere(
           (s) => s.formatHint == VGStreamingFormatHint.dash,
-          orElse: () => candidates.first,
+          orElse: () => compatibleCandidates.first,
         );
         break;
       case VGStreamingSourceSelectionPreference.preferLowLatency:
-        chosenSource = candidates.firstWhere(
+        chosenSource = compatibleCandidates.firstWhere(
           (s) => s.requireLlHlsTags == true,
-          orElse: () => candidates.first,
+          orElse: () => compatibleCandidates.first,
         );
         break;
       case VGStreamingSourceSelectionPreference.preferConstrainedReliability:
-        chosenSource = candidates.firstWhere(
+        chosenSource = compatibleCandidates.firstWhere(
           (s) => s.requireLlHlsTags == false,
-          orElse: () => candidates.first,
+          orElse: () => compatibleCandidates.first,
         );
         break;
     }
 
-    // Rule 5 & 6: Derive playback options using the chosen source and startup plan.
+    // Rule 6: Derive playback options using the chosen source and startup plan.
     VGStreamingPlaybackOptions? playbackOptions;
     try {
       playbackOptions = chosenSource.toPlaybackOptions(request.startupPlan);
     } catch (e) {
       warnings.add('playback_options_blocked');
       warnings.add('option_derivation_error:$e');
+      final diagnostics = <String, Object?>{
+        'error': e.toString(),
+        'preference': request.preference.name,
+        if (caps != null) ...{
+          'clientType': caps.clientType,
+          'supportsHls': caps.supportsHls,
+          'supportsDash': caps.supportsDash,
+          'supportsLowLatencyHls': caps.supportsLowLatencyHls,
+          'preferLowLatency': caps.preferLowLatency,
+        },
+      };
       return VGStreamingSourceSelection(
         selected: false,
         selectedKey: chosenSource.key,
@@ -204,12 +382,22 @@ abstract final class VGStreamingSourceSelector {
         decision: 'playback_options_blocked',
         consideredKeys: List<String>.unmodifiable(consideredKeys),
         warnings: List<String>.unmodifiable(warnings),
-        diagnostics: {
-          'error': e.toString(),
-          'preference': request.preference.name,
-        },
+        diagnostics: Map<String, Object?>.unmodifiable(diagnostics),
       );
     }
+
+    final diagnostics = <String, Object?>{
+      'preference': request.preference.name,
+      'formatHint': chosenSource.formatHint.name,
+      'requireLlHlsTags': chosenSource.requireLlHlsTags,
+      if (caps != null) ...{
+        'clientType': caps.clientType,
+        'supportsHls': caps.supportsHls,
+        'supportsDash': caps.supportsDash,
+        'supportsLowLatencyHls': caps.supportsLowLatencyHls,
+        'preferLowLatency': caps.preferLowLatency,
+      },
+    };
 
     return VGStreamingSourceSelection(
       selected: true,
@@ -219,11 +407,7 @@ abstract final class VGStreamingSourceSelector {
       decision: 'source_selected',
       consideredKeys: List<String>.unmodifiable(consideredKeys),
       warnings: List<String>.unmodifiable(warnings),
-      diagnostics: {
-        'preference': request.preference.name,
-        'formatHint': chosenSource.formatHint.name,
-        'requireLlHlsTags': chosenSource.requireLlHlsTags,
-      },
+      diagnostics: Map<String, Object?>.unmodifiable(diagnostics),
     );
   }
 }

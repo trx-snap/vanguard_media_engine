@@ -24,6 +24,7 @@ export 'vg_streaming_source_descriptor.dart'
     show VGStreamingSourceDescriptor, VGStreamingSourceSet;
 export 'vg_streaming_source_selector.dart'
     show
+        VGStreamingSourceClientCapabilities,
         VGStreamingSourceSelection,
         VGStreamingSourceSelectionPreference,
         VGStreamingSourceSelectionRequest,
@@ -48,18 +49,23 @@ class VGStreamingPlaybackDecisionRequest {
   /// Whether preflight startup plan must pass to proceed to playback.
   final bool requirePlanToProceed;
 
+  /// Optional client capability profile for advisory compatibility filtering.
+  final VGStreamingSourceClientCapabilities? clientCapabilities;
+
   const VGStreamingPlaybackDecisionRequest({
     required this.sourceSet,
     required this.preflightReport,
     this.preference = VGStreamingSourceSelectionPreference.preserveOrder,
     this.preferredKeys = const [],
     this.requirePlanToProceed = true,
+    this.clientCapabilities,
   });
 
   @override
   String toString() =>
       'VGStreamingPlaybackDecisionRequest(preference=$preference, '
-      'preferredKeys=$preferredKeys, requirePlanToProceed=$requirePlanToProceed)';
+      'preferredKeys=$preferredKeys, requirePlanToProceed=$requirePlanToProceed, '
+      'clientCapabilities=$clientCapabilities)';
 }
 
 /// Immutable request configuration for streaming playback decision planning
@@ -83,6 +89,9 @@ class VGStreamingPlaybackCompositeDecisionRequest {
   /// Whether preflight startup plan must pass to proceed to playback.
   final bool requirePlanToProceed;
 
+  /// Optional client capability profile for advisory compatibility filtering.
+  final VGStreamingSourceClientCapabilities? clientCapabilities;
+
   const VGStreamingPlaybackCompositeDecisionRequest({
     required this.sourceSet,
     required this.preflightReport,
@@ -90,13 +99,15 @@ class VGStreamingPlaybackCompositeDecisionRequest {
     this.preference = VGStreamingSourceSelectionPreference.preserveOrder,
     this.preferredKeys = const [],
     this.requirePlanToProceed = true,
+    this.clientCapabilities,
   });
 
   @override
   String toString() =>
       'VGStreamingPlaybackCompositeDecisionRequest(preference=$preference, '
       'preferredKeys=$preferredKeys, requirePlanToProceed=$requirePlanToProceed, '
-      'compositeStatus=${compositeEvaluation.status})';
+      'compositeStatus=${compositeEvaluation.status}, '
+      'clientCapabilities=$clientCapabilities)';
 }
 
 /// Immutable result of a streaming playback decision evaluation.
@@ -165,6 +176,7 @@ abstract final class VGStreamingPlaybackDecisionPlanner {
       preference: request.preference,
       preferredKeys: request.preferredKeys,
       requirePlanToProceed: request.requirePlanToProceed,
+      clientCapabilities: request.clientCapabilities,
     );
     final selection = VGStreamingSourceSelector.select(selectionRequest);
 
@@ -209,6 +221,8 @@ abstract final class VGStreamingPlaybackDecisionPlanner {
       'requirePlanToProceed': request.requirePlanToProceed,
       'recommendedNetworkProfile': startupPlan.recommendedNetworkProfile
           .toNative(),
+      if (request.clientCapabilities != null)
+        'clientType': request.clientCapabilities!.clientType,
     };
 
     return VGStreamingPlaybackDecision(
@@ -299,6 +313,8 @@ abstract final class VGStreamingPlaybackDecisionPlanner {
         'requirePlanToProceed': request.requirePlanToProceed,
         'recommendedNetworkProfile': startupPlan.recommendedNetworkProfile
             .toNative(),
+        if (request.clientCapabilities != null)
+          'clientType': request.clientCapabilities!.clientType,
       };
 
       return VGStreamingPlaybackDecision(
@@ -325,6 +341,7 @@ abstract final class VGStreamingPlaybackDecisionPlanner {
         preference: request.preference,
         preferredKeys: request.preferredKeys,
         requirePlanToProceed: request.requirePlanToProceed,
+        clientCapabilities: request.clientCapabilities,
       ),
     );
 

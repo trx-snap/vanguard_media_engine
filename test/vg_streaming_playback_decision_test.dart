@@ -298,5 +298,231 @@ void main() {
       expect(decision.toString(), contains('selectedKey=dash_main'));
       expect(decision.toString(), contains('decision=playback_ready'));
     });
+
+    group('Client Capabilities in Decision Planner', () {
+      test(
+        'plan with Apple AVPlayer capabilities and preferDash produces playback_ready with HLS, not DASH',
+        () {
+          final request = VGStreamingPlaybackDecisionRequest(
+            sourceSet: sourceSet,
+            preflightReport: validReport,
+            preference: VGStreamingSourceSelectionPreference.preferDash,
+            clientCapabilities:
+                const VGStreamingSourceClientCapabilities.appleAvPlayer(),
+          );
+
+          final decision = VGStreamingPlaybackDecisionPlanner.plan(request);
+
+          expect(decision.canOpenPlayback, isTrue);
+          expect(decision.decision, equals('playback_ready'));
+          expect(decision.selectedKey, equals('hls_main'));
+          expect(decision.selectedSource, equals(hlsSource));
+          expect(
+            decision.playbackOptions?.formatHint,
+            equals(VGStreamingFormatHint.hls),
+          );
+          expect(
+            decision.playbackOptions?.uri,
+            equals(Uri.parse('https://example.com/main.m3u8')),
+          );
+          expect(
+            decision.warnings,
+            contains('source_incompatible:dash_main:dash_not_supported'),
+          );
+          expect(decision.diagnostics['clientType'], equals('apple_avplayer'));
+        },
+      );
+
+      test(
+        'planFromComposite passes clientCapabilities through on pass path',
+        () {
+          final compositePass = VGStreamingPreflightCompositeEvaluation(
+            pass: true,
+            status: 'composite_pass',
+            avcBaselinePass: true,
+            serverLadderPolicyPass: true,
+            serverLadderPolicy: '',
+            iosMirrorNote: '',
+            warnings: const [],
+            preferredCodecs: const {},
+            fallbackCodecs: const {},
+            streamDecisions: const {},
+            totalStreamsEvaluated: 1,
+            passedStreams: 1,
+            failedStreams: 0,
+            manifestReport: const VGStreamingManifestPolicyValidationReport(
+              pass: true,
+              phase: 'Phase4C5D',
+              totalManifestsValidated: 1,
+              passedManifests: 1,
+              failedManifests: 0,
+              segmentRejectionPass: true,
+              serverLadderPolicy: '',
+              iosMirrorNote: '',
+              results: [],
+              segmentRejectionResult: {},
+              raw: '',
+              diagnostics: {},
+            ),
+            codecReport: const VGStreamingCodecCapabilityReport(
+              pass: true,
+              phase: 'Phase4C5A',
+              avcPass: true,
+              codecCountPass: true,
+              fallbackPolicyPass: true,
+              iosMirrorNotePass: true,
+              avcSupported: true,
+              hevcSupported: true,
+              av1Supported: false,
+              androidSdk: 34,
+              serverLadderPolicy: '',
+              iosMirrorNote: '',
+              codecs: [],
+              probe: {},
+              raw: '',
+              diagnostics: {},
+            ),
+            compatibilityReport: const VGStreamingCompatibilityDecisionReport(
+              pass: true,
+              phase: 'Phase4C5E',
+              totalReports: 1,
+              passedReports: 1,
+              failedReports: 0,
+              codecProbePass: true,
+              avcSupported: true,
+              hevcSupported: true,
+              av1Supported: false,
+              av1HardwareSafe: false,
+              deviceWarnings: [],
+              serverLadderPolicy: '',
+              iosMirrorNote: '',
+              reports: [],
+              raw: '',
+              diagnostics: {},
+            ),
+            diagnostics: const {},
+          );
+
+          final request = VGStreamingPlaybackCompositeDecisionRequest(
+            sourceSet: sourceSet,
+            preflightReport: validReport,
+            compositeEvaluation: compositePass,
+            preference: VGStreamingSourceSelectionPreference.preferDash,
+            clientCapabilities:
+                const VGStreamingSourceClientCapabilities.appleAvPlayer(),
+          );
+
+          final decision = VGStreamingPlaybackDecisionPlanner.planFromComposite(
+            request,
+          );
+
+          expect(decision.canOpenPlayback, isTrue);
+          expect(decision.decision, equals('playback_ready'));
+          expect(decision.selectedKey, equals('hls_main'));
+          expect(decision.selectedSource, equals(hlsSource));
+          expect(
+            decision.playbackOptions?.formatHint,
+            equals(VGStreamingFormatHint.hls),
+          );
+          expect(
+            decision.warnings,
+            contains('source_incompatible:dash_main:dash_not_supported'),
+          );
+          expect(decision.diagnostics['clientType'], equals('apple_avplayer'));
+        },
+      );
+
+      test(
+        'planFromComposite passes clientCapabilities to diagnostics on block path',
+        () {
+          final compositeBlock = VGStreamingPreflightCompositeEvaluation(
+            pass: false,
+            status: 'codec_unsupported',
+            avcBaselinePass: false,
+            serverLadderPolicyPass: false,
+            serverLadderPolicy: '',
+            iosMirrorNote: '',
+            warnings: const ['codec_unsupported'],
+            preferredCodecs: const {},
+            fallbackCodecs: const {},
+            streamDecisions: const {},
+            totalStreamsEvaluated: 1,
+            passedStreams: 0,
+            failedStreams: 1,
+            manifestReport: const VGStreamingManifestPolicyValidationReport(
+              pass: true,
+              phase: 'Phase4C5D',
+              totalManifestsValidated: 1,
+              passedManifests: 1,
+              failedManifests: 0,
+              segmentRejectionPass: true,
+              serverLadderPolicy: '',
+              iosMirrorNote: '',
+              results: [],
+              segmentRejectionResult: {},
+              raw: '',
+              diagnostics: {},
+            ),
+            codecReport: const VGStreamingCodecCapabilityReport(
+              pass: false,
+              phase: 'Phase4C5A',
+              avcPass: false,
+              codecCountPass: true,
+              fallbackPolicyPass: true,
+              iosMirrorNotePass: true,
+              avcSupported: false,
+              hevcSupported: false,
+              av1Supported: false,
+              androidSdk: 34,
+              serverLadderPolicy: '',
+              iosMirrorNote: '',
+              codecs: [],
+              probe: {},
+              raw: '',
+              diagnostics: {},
+            ),
+            compatibilityReport: const VGStreamingCompatibilityDecisionReport(
+              pass: false,
+              phase: 'Phase4C5E',
+              totalReports: 1,
+              passedReports: 0,
+              failedReports: 1,
+              codecProbePass: false,
+              avcSupported: false,
+              hevcSupported: false,
+              av1Supported: false,
+              av1HardwareSafe: false,
+              deviceWarnings: [],
+              serverLadderPolicy: '',
+              iosMirrorNote: '',
+              reports: [],
+              raw: '',
+              diagnostics: {},
+            ),
+            diagnostics: const {},
+          );
+
+          final request = VGStreamingPlaybackCompositeDecisionRequest(
+            sourceSet: sourceSet,
+            preflightReport: validReport,
+            compositeEvaluation: compositeBlock,
+            preference: VGStreamingSourceSelectionPreference.preferDash,
+            clientCapabilities:
+                const VGStreamingSourceClientCapabilities.appleAvPlayer(),
+          );
+
+          final decision = VGStreamingPlaybackDecisionPlanner.planFromComposite(
+            request,
+          );
+
+          expect(decision.canOpenPlayback, isFalse);
+          expect(
+            decision.decision,
+            equals('composite_preflight_blocked:codec_unsupported'),
+          );
+          expect(decision.diagnostics['clientType'], equals('apple_avplayer'));
+        },
+      );
+    });
   });
 }
