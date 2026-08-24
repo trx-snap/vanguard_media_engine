@@ -4,6 +4,80 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Public Streaming Playback Status Poller (Phase 4C7AC / Phase 4C7AD)
+
+The package exposes `VGStreamingPlaybackStatusPoller` as a pure Dart periodic polling helper over `VGStreamingPlaybackController`. It periodically refreshes controller telemetry, converts snapshots into immutable `VGStreamingPlaybackStatusSummary` objects, and emits them over a broadcast stream without busy-polling collisions.
+
+### Quick Start
+
+```dart
+import 'package:flutter/material.dart';
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+class StreamingPlayerWidget extends StatefulWidget {
+  final VGStreamingPlaybackController controller;
+  const StreamingPlayerWidget({super.key, required this.controller});
+
+  @override
+  State<StreamingPlayerWidget> createState() => _StreamingPlayerWidgetState();
+}
+
+class _StreamingPlayerWidgetState extends State<StreamingPlayerWidget> {
+  late final VGStreamingPlaybackStatusPoller _poller;
+  StreamSubscription<VGStreamingPlaybackStatusSummary>? _sub;
+  VGStreamingPlaybackStatusSummary _summary =
+      const VGStreamingPlaybackStatusSummary.empty();
+
+  @override
+  void initState() {
+    super.initState();
+    // 1. Create poller with optional configuration
+    _poller = VGStreamingPlaybackStatusPoller(
+      controller: widget.controller,
+      config: VGStreamingPlaybackStatusPollerConfig(
+        interval: const Duration(milliseconds: 500),
+        emitInitialSummary: true,
+      ),
+    );
+
+    // 2. Listen to broadcast stream
+    _sub = _poller.summaries.listen((summary) {
+      setState(() {
+        _summary = summary;
+      });
+    });
+
+    // 3. Start periodic polling
+    _poller.start();
+  }
+
+  @override
+  void dispose() {
+    // 4. Stop and dispose poller with UI lifecycle (does NOT dispose controller)
+    _sub?.cancel();
+    _poller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        LinearProgressIndicator(value: _summary.progressFraction),
+        Text('Position: ${_summary.positionMs}ms / ${_summary.durationMs}ms'),
+      ],
+    );
+  }
+}
+```
+
+### Invariants & Non-Claims
+
+- **Controller Ownership**: `VGStreamingPlaybackStatusPoller` does NOT own or dispose the underlying `VGStreamingPlaybackController`. The poller should be stopped and disposed by the host UI widget lifecycle.
+- **Convenience Only**: The poller makes no product feed decisions, no retry policy, no ABR decisions, no caching policy, and makes no native lifecycle decisions.
+- **Concurrency Guard**: If a refresh tick is in flight, overlapping periodic ticks are skipped to prevent concurrent native channel calls.
+- **iOS Parity Expectation**: Because `VGStreamingPlaybackStatusPoller` is written entirely in pure Dart and operates on public controller and summary interfaces, it works automatically on iOS as soon as the iOS backend populates the matching session fields.
+
 ## Public Streaming Playback Status Summary Helper (Phase 4C7AA / Phase 4C7AB)
 
 The package exposes `VGStreamingPlaybackStatusSummary` as a pure Dart immutable summary object providing safe, UI-friendly telemetry for progress bars, buffer indicators, live vs. VOD distinction, display dimensions, and cache-read observability.
