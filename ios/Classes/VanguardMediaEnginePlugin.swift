@@ -121,6 +121,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // state for all waveformCache_* MethodChannel routes.
     private let waveformCacheHandler = VGWaveformCacheMethodHandler()
 
+    // ── Phase 4C6H: iOS streaming cache manager ───────────────────────────────
+    // Singleton that owns AVAssetDownloadURLSession lifecycle, active prewarm
+    // job tracking, storage headroom evaluation, and cache clear.
+    // Plugin is a thin router only — no cache or lifecycle logic lives here.
+    private let streamingCacheManager = VGStreamingCacheManager.shared
+
     // ── Phase 10-C Slice T: managed audio extraction handler ─────────────────
     // Owns the operation registry, VGAudioOnlyExporter instances, and
     // terminal/cancellation bookkeeping for beginAudioExtraction and
@@ -914,6 +920,50 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // guarding using the same target-provider pattern as VGTimelineLiveControlHandler.
         if call.method == "timeline_setAudioMixGain" {
             _mixGainHandler.handle(args: args, result: result)
+            return
+        }
+
+        // ── Phase 4C6H: iOS streaming cache routes ────────────────────────────
+        // The five cache MethodChannel routes are forwarded to
+        // VGStreamingCacheManager.shared. No cache or lifecycle logic lives here.
+        if call.method == "getPlaybackCacheStatus" {
+            let cacheEnabled = args?["cacheEnabled"] as? Bool ?? true
+            streamingCacheManager.getStatus(cacheEnabled: cacheEnabled, result: result)
+            return
+        }
+        if call.method == "startPlaybackCachePrewarm" {
+            let requestId  = (args?["requestId"] as? String) ?? ""
+            let uri        = (args?["uri"] as? String) ?? ""
+            let maxBytesRaw = (args?["maxBytes"] as? NSNumber)?.int64Value ?? 0
+            let maxBytes   = maxBytesRaw > 0 ? maxBytesRaw : 2 * 1024 * 1024
+            let minFreeRaw = (args?["minimumFreeBytesAfterPrewarm"] as? NSNumber)?.int64Value
+            let minFree: Int64 = {
+                guard let v = minFreeRaw else { return VGStorageHeadroomGuard.defaultMinFreeBytes }
+                return v < 0 ? VGStorageHeadroomGuard.defaultMinFreeBytes : v
+            }()
+            let cacheEnabled = args?["cacheEnabled"] as? Bool ?? true
+            streamingCacheManager.startPrewarm(
+                requestId: requestId,
+                uri: uri,
+                maxBytes: maxBytes,
+                minimumFreeBytesAfterPrewarm: minFree,
+                cacheEnabled: cacheEnabled,
+                result: result
+            )
+            return
+        }
+        if call.method == "getPlaybackCachePrewarmStatus" {
+            let requestId = (args?["requestId"] as? String) ?? ""
+            streamingCacheManager.getPrewarmStatus(requestId: requestId, result: result)
+            return
+        }
+        if call.method == "cancelPlaybackCachePrewarm" {
+            let requestId = (args?["requestId"] as? String) ?? ""
+            streamingCacheManager.cancelPrewarm(requestId: requestId, result: result)
+            return
+        }
+        if call.method == "clearPlaybackCache" {
+            streamingCacheManager.clearCache(result: result)
             return
         }
 

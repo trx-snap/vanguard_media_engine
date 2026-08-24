@@ -220,46 +220,8 @@ NS_ASSUME_NONNULL_BEGIN
 NS_ASSUME_NONNULL_END
 
 // ─── [Beauty-Still]: Offline still-image helpers ────────────────────────────
-// Declared here so Swift sees them through the already-registered
-// VGCameraGraphSession.h umbrella import. Implementations are inlined in
-// VGCameraGraphSession.m; the standalone VGOfflineFilterBundle.h and
-// VGStillImageFilterFactory.h files are not required for Swift visibility.
-
-#import <CoreVideo/CoreVideo.h>
-#import <Metal/Metal.h>
-
-NS_ASSUME_NONNULL_BEGIN
-
-/// Ownership container for isolated offline filter nodes and their output pool.
-/// The bundle ADOPTS a +1 CVPixelBufferPoolRef and releases it in dealloc.
-@interface VGOfflineFilterBundle : NSObject
-
-/// Ordered array of isolated filter nodes for VGImageExportSession.
-@property (nonatomic, readonly) NSArray *nodes;
-
-- (instancetype)initWithNodes:(NSArray *)nodes
-                  adoptedPool:(CVPixelBufferPoolRef)adoptedPool NS_DESIGNATED_INITIALIZER;
-- (instancetype)init NS_UNAVAILABLE;
-
-@end
-
-/// Factory for isolated offline still-image filter nodes.
-/// All methods are class methods; this class must not be instantiated.
-@interface VGStillImageFilterFactory : NSObject
-
-/// Create isolated offline Beauty filter nodes sized for the decoded still-image dimensions.
-///
-/// Supported: type=="beauty" with faceAwareEnabled != true.
-/// Rejects any other type or faceAwareEnabled==true with a non-nil outError.
-/// Returns nil on any failure.
-+ (nullable VGOfflineFilterBundle *)createOfflineFilterBundleFromSpecs:(NSArray<NSDictionary *> *)specs
-                                                                 width:(size_t)width
-                                                                height:(size_t)height
-                                                                device:(id<MTLDevice>)device
-                                                                 error:(NSError * _Nullable * _Nullable)outError;
-
-- (instancetype)init NS_UNAVAILABLE;
-
-@end
-
-NS_ASSUME_NONNULL_END
+// Import the authoritative standalone headers so Swift sees these classes
+// through the already-registered VGCameraGraphSession.h umbrella import
+// without duplicating @interface definitions.
+#import "VGOfflineFilterBundle.h"
+#import "VGStillImageFilterFactory.h"
