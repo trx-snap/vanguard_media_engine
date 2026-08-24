@@ -4,6 +4,55 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Public Streaming Preflight Composite Evaluator (Phase 4C5P)
+
+The package exposes `VGStreamingPreflightCompositeEvaluator` as a pure Dart synchronous composite evaluation helper that combines `VGStreamingManifestPolicyValidationReport`, `VGStreamingCodecCapabilityReport`, `VGStreamingCompatibilityDecisionReport`, and optional `VGStreamingPreflightReport` into a unified `VGStreamingPreflightCompositeEvaluation` result before playback.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+void evaluateCompositeStreamingPreflight({
+  required VGStreamingManifestPolicyValidationReport manifestReport,
+  required VGStreamingCodecCapabilityReport codecReport,
+  required VGStreamingCompatibilityDecisionReport compatibilityReport,
+  VGStreamingPreflightReport? preflightReport,
+}) {
+  // 1. Evaluate composite streaming preflight synchronously
+  final evaluation = VGStreamingPreflightCompositeEvaluator.evaluate(
+    manifestReport: manifestReport,
+    codecReport: codecReport,
+    compatibilityReport: compatibilityReport,
+    preflightReport: preflightReport,
+  );
+
+  // 2. Inspect overall pass/block status and deterministic status code
+  print('Evaluation pass: ${evaluation.pass}, status: ${evaluation.status}');
+  print('AVC baseline pass: ${evaluation.avcBaselinePass}');
+  print('Server ladder policy pass: ${evaluation.serverLadderPolicyPass}');
+  print('Total streams evaluated: ${evaluation.totalStreamsEvaluated} (${evaluation.passedStreams} passed, ${evaluation.failedStreams} failed)');
+
+  // 3. Access unmodifiable codec and decision mappings
+  print('Preferred codecs: ${evaluation.preferredCodecs}');
+  print('Fallback codecs: ${evaluation.fallbackCodecs}');
+  print('Stream decisions: ${evaluation.streamDecisions}');
+
+  // 4. Check deduplicated warnings
+  if (evaluation.warnings.isNotEmpty) {
+    print('Warnings: ${evaluation.warnings}');
+  }
+}
+```
+
+### Guarantees, Invariants & Boundaries
+
+- **Pure Dart Synchronous Evaluation**: `evaluation.advisoryOnly == true` and `evaluation.playbackMutation == false`. `VGStreamingPreflightCompositeEvaluator` performs synchronous aggregation over typed Dart reports without `MethodChannel` interaction, native code execution, player allocation, codec instantiation, cache mutation, or playback side effects.
+- **Deterministic Status Progression**: Emits structured status codes in order of precedence: `unsupported_platform`, `advisory_invariant_violated`, `manifest_policy_failed`, `codec_capability_failed`, `compatibility_decision_failed`, `preflight_report_failed`, or `evaluation_passed`.
+- **Additive Server Ladder Policy Enforcement**: Combines manifest segment rejection, codec fallback policy, and compatibility checks to verify adherence to `add_hevc_av1_renditions_but_keep_avc_fallback`.
+- **Deduplicated Order-Preserved Warnings**: Diagnostics and warnings from all input reports are merged and deduplicated while preserving encounter order.
+- **Physical Proof Independence**: The pure Dart composite contract operates entirely on typed in-memory Dart models; physical proof is not required for this Dart contract, while prior platform physical proofs remain separate and authoritative.
+
 ## Public Streaming Compatibility Decision Client (Phase 4C5N / Phase 4C5O)
 
 The package exposes `VGStreamingCompatibilityDecisionClient` as a typed public Dart client to evaluate compatibility decisions combining device video decoder capabilities (AVC/HEVC/AV1) with candidate streaming manifest ladders (HLS/DASH/LL-HLS) before playback without raw `MethodChannel` interaction.
