@@ -4,6 +4,42 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Public Streaming Manifest Rendition Diagnostics Client (Phase 4C5L / Phase 4C5M)
+
+The package exposes `VGStreamingManifestRenditionClient` as a typed public Dart client to inspect canonical HLS, DASH, and LL-HLS manifest rendition ladders and verify server ladder policies before playback without raw `MethodChannel` interaction.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+Future<void> inspectCanonicalStreamRenditionLadders() async {
+  // 1. Instantiate the streaming manifest rendition diagnostics client
+  final client = VGStreamingManifestRenditionClient();
+
+  // 2. Inspect canonical test streams across HLS, DASH, and LL-HLS
+  final report = await client.inspectCanonicalStreams();
+
+  if (report.pass) {
+    print('Manifest rendition diagnostics passed (total variants: ${report.totalVariantsDiscovered})');
+    print('HLS variants: ${report.hlsVariantCount}, DASH representations: ${report.dashRepresentationCount}, LL-HLS variants: ${report.llHlsVariantCount}');
+    print('Server ladder policy satisfied: ${report.serverLadderPolicy}');
+    print('Mandatory AVC fallback present: ${report.hasAvcFallback}');
+    print('Advanced codecs discovered: ${report.hasAnyAdvancedCodecRendition}');
+  } else {
+    print('Manifest rendition inspection failed: ${report.raw}');
+  }
+}
+```
+
+### Guarantees, Invariants & Boundaries
+
+- **Bounded Manifest-Only Diagnostics**: Inspection fetches remote HLS (`.m3u8`), LL-HLS, and MPEG-DASH (`.mpd`) multivariant manifests over bounded HTTP GETs without downloading media segments, allocating `ExoPlayer`/Media3 players, creating `MediaCodec` decoders, allocating GPU textures/surfaces, or mutating playback.
+- **Additive Server Ladder Policy (`add_hevc_av1_renditions_but_keep_avc_fallback`)**: Multi-codec streaming ladders must maintain an AVC/H.264 fallback rendition. While HEVC and AV1 renditions provide compression efficiency on supported devices, baseline AVC must remain present so older devices and iOS mirrors do not fail.
+- **Canonical Reference Smoke vs. Arbitrary Host Manifests**: `VGStreamingManifestRenditionClient` wraps the canonical platform smoke suite over built-in reference test streams. It does NOT validate arbitrary production server/CDN endpoints; for validating host-supplied or caller-configured manifest specifications, use `VGStreamingManifestPolicyClient`.
+- **Pre-Fetch Segment Rejection**: Enforces pre-fetch security assertions to ensure media segment URLs (`.ts`, `.m4s`, `.mp4`, etc.) are rejected and never fetched during manifest inspection.
+- **iOS Parity Expectation & DASH Decision Boundary**: The same public Dart contract (`VGStreamingManifestRenditionClient`, `VGStreamingManifestRenditionReport`, `VGStreamingManifestStreamDiagnostics`, `VGStreamingRenditionInfo`) will be backed on iOS by AVPlayer/HLS manifest inspection while preserving mandatory AVC fallback; DASH on iOS remains the already-deferred architecture/product decision. Non-Android platforms return typed unsupported reports (`phase: 'unsupported'`, `pass: false`) via `unsupported()` without crashing.
+
 ## Public Streaming Codec Capability Client (Phase 4C5J / Phase 4C5K)
 
 The package exposes `VGStreamingCodecCapabilityClient` as a typed public Dart client to inspect device streaming decoder capabilities across AVC/H.264, HEVC/H.265, and AV1 before playback without raw `MethodChannel` interaction.
