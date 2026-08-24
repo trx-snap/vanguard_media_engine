@@ -18,6 +18,7 @@ import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.dash.DashMediaSource
 import androidx.media3.exoplayer.hls.HlsMediaSource
@@ -763,8 +764,32 @@ class HttpAdaptivePlaybackAdapter(
         return if (cacheConfig.enabled) {
             // Cache is opt-in: delegate to the manager which handles init failure safely.
             try {
+                val eventListener = object : CacheDataSource.EventListener {
+                    override fun onCachedBytesRead(cacheSizeBytes: Long, cachedBytesRead: Long) {
+                        listener.onPlaybackCacheTelemetry(
+                            cacheSizeBytes = if (cacheSizeBytes >= 0L) cacheSizeBytes else 0L,
+                            cachedBytesReadDelta = if (cachedBytesRead >= 0L) cachedBytesRead else 0L,
+                            cacheIgnoredDelta = 0,
+                            lastCacheIgnoredReason = null,
+                        )
+                    }
+
+                    override fun onCacheIgnored(reason: Int) {
+                        val reasonStr = when (reason) {
+                            CacheDataSource.CACHE_IGNORED_REASON_ERROR -> "error"
+                            CacheDataSource.CACHE_IGNORED_REASON_UNSET_LENGTH -> "unset_length"
+                            else -> "unknown_$reason"
+                        }
+                        listener.onPlaybackCacheTelemetry(
+                            cacheSizeBytes = -1L,
+                            cachedBytesReadDelta = 0L,
+                            cacheIgnoredDelta = 1,
+                            lastCacheIgnoredReason = reasonStr,
+                        )
+                    }
+                }
                 val manager = AndroidDagPlaybackCacheManager.getOrCreate(context, cacheConfig)
-                manager.buildDataSourceFactory(config.httpHeaders)
+                manager.buildDataSourceFactory(config.httpHeaders, eventListener)
             } catch (t: Throwable) {
                 // Defensive: manager construction should not throw, but if it does, fall back
                 // to plain DefaultHttpDataSource to preserve playback (cache failure must not

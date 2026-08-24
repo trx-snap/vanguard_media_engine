@@ -83,14 +83,18 @@ Future<void> prewarmAndPlayCachedStream() async {
   // 6. Presentation via VGStreamingPlaybackTextureView
   // (e.g. VGStreamingPlaybackTextureView(snapshot: snapshot))
 
-  // 7. Poll and read snapshot-level timing and buffer telemetry
+  // 7. Poll and read snapshot-level timing, buffer, and cache event telemetry
   final refreshed = await controller.refresh();
   if (refreshed.hasPlaybackTelemetry) {
     print(
       'Cached playback telemetry: duration=${refreshed.durationMs}ms, '
       'position=${refreshed.positionMs}ms, '
       'buffered=${refreshed.bufferedPercent}% (${refreshed.bufferedPositionMs}ms ahead), '
-      'liveOffset=${refreshed.liveOffsetMs}',
+      'liveOffset=${refreshed.liveOffsetMs}, '
+      'cacheEnabled=${refreshed.playbackCacheEnabled}, '
+      'cacheBytesRead=${refreshed.playbackCacheBytesRead}B, '
+      'cacheSizeBytes=${refreshed.playbackCacheSizeBytes}B, '
+      'cacheIgnoredCount=${refreshed.playbackCacheIgnoredCount}',
     );
   }
 
@@ -104,8 +108,8 @@ Future<void> prewarmAndPlayCachedStream() async {
 
 ### Verification & Invariants
 
-- **Composition Proof**: Proves end-to-end composition across cache prewarm (`VGStreamingCacheClient`), preflight capability evaluation (`VGStreamingPreflightClient`), decision planning (`VGStreamingPlaybackDecisionPlanner`), controller facade (`VGStreamingPlaybackController`), presentation (`VGStreamingPlaybackTextureView`), and snapshot timing/buffer telemetry.
-- **Cache Hit Scope**: Proves public API composition and prewarm completion, not full ExoPlayer adaptive segment-graph cache hit or hit ratio.
+- **Composition & Telemetry Proof**: Proves end-to-end composition across cache prewarm (`VGStreamingCacheClient`), preflight capability evaluation (`VGStreamingPreflightClient`), decision planning (`VGStreamingPlaybackDecisionPlanner`), controller facade (`VGStreamingPlaybackController`), presentation (`VGStreamingPlaybackTextureView`), snapshot timing/buffer telemetry, and native Media3 `CacheDataSource.EventListener` cache event telemetry.
+- **Cache Hit Scope**: Proves public API composition, prewarm completion, and actual cache-read byte reporting via Media3 `CacheDataSource.EventListener`. Does not guarantee every subsequent ABR rendition or segment is cached (Media3 owns ABR / segment loading).
 - **ABR Ownership**: Media3 runtime still owns ABR rendition selection.
 - **ConnectsApp & Platform Boundaries**: Zero ConnectsApp feed prediction wiring; iOS cache backend remains planned and frozen in UMF architecture documents.
 
@@ -240,17 +244,23 @@ Future<void> controlStreamingPlayback() async {
 }
 ```
 
-### Controller Playback Timing & Buffer Telemetry (Phases 4C7Y, 4C7Z)
+### Controller Playback Timing & Buffer Telemetry (Phases 4C7Y, 4C7Z, 4C6P)
 
-`VGStreamingPlaybackControllerSnapshot` exposes read-only convenience getters for stream timing and buffer telemetry delegating directly to the underlying session:
+`VGStreamingPlaybackControllerSnapshot` exposes read-only convenience getters for stream timing, buffer, and cache event telemetry delegating directly to the underlying session:
 - `durationMs`: Total media duration in milliseconds (`-1` for live/unbounded streams or when idle/unsupported).
 - `positionMs`: Current playhead position in milliseconds (`0` when idle/unsupported).
 - `bufferedPositionMs`: Look-ahead buffered duration in milliseconds ahead of current playhead (`0` when idle/unsupported).
 - `bufferedPercent`: 0–100 percentage of the look-ahead buffer filled (`0` when idle/unsupported).
 - `liveOffsetMs`: Current distance from live edge in milliseconds (`null` for VOD or when idle/unsupported).
+- `playbackCacheEnabled`: Whether the active session was opened with playback cache enabled (`false` when no session).
+- `playbackCacheTelemetryAttached`: Whether the Media3 `CacheDataSource` event telemetry listener is attached (`false` when no session).
+- `playbackCacheBytesRead`: Cumulative bytes read from cache during playback (`0` when no session).
+- `playbackCacheSizeBytes`: Latest reported total cache size in bytes (`0` when no session).
+- `playbackCacheIgnoredCount`: Cumulative count of ignored cache read events (`0` when no session).
+- `playbackCacheLastIgnoredReason`: Reason string for the last ignored cache event, or `null` if none occurred.
 - `hasPlaybackTelemetry`: Whether an active playback session is present.
 
-These accessors allow app integrators and UI layers to consume playback metrics directly from the controller snapshot without repeatedly drilling into `snapshot.session`.
+These accessors allow app integrators and UI layers to consume playback and cache event metrics directly from the controller snapshot without repeatedly drilling into `snapshot.session`.
 
 ## Streaming Playback Decision Planner Recipe
 
@@ -568,6 +578,21 @@ App integrators can read typed stream timing and buffer metrics directly from `V
 - `liveOffsetMs`: Distance from live edge in milliseconds (`null` for VOD).
 
 These fields are populated defensively via `client.getStatus(session)` and state transition responses (`open`, `play`, `pause`, `seek`, `stop`) without requiring raw `MethodChannel` access.
+
+### Playback Cache Event Telemetry (Phases 4C6P, 4C6Q)
+
+When streaming playback is opened with cache enabled (`VGPlaybackCacheOptions(cacheEnabled: true)`), the Android Media3 engine attaches a `CacheDataSource.EventListener` to report honest cache-read diagnostics:
+- `playbackCacheEnabled`: Whether the session requested read-through playback cache.
+- `playbackCacheTelemetryAttached`: Whether the Media3 `CacheDataSource` event telemetry listener was attached to the active session.
+- `playbackCacheBytesRead`: Cumulative bytes read from cache during playback.
+- `playbackCacheSizeBytes`: Latest reported total cache size in bytes.
+- `playbackCacheIgnoredCount`: Cumulative count of ignored cache read events (e.g. on cache I/O errors or unset length).
+- `playbackCacheLastIgnoredReason`: Reason string for the last ignored cache event (`"error"`, `"unset_length"`, or `null`).
+
+**Non-Claims & Invariants**:
+- Telemetry reports actual Media3 `CacheDataSource` events observed during active playback;
+- It does **not** prove every adaptive segment was served from cache (ExoPlayer Media3 runtime retains full ownership over ABR adaptation and segment-graph loading);
+- Physical proof verified on hardware (`RRGL207K8GB`) via `android_streaming_cached_playback_all_up_public_api_physical_smoke.dart`.
 
 ### Supported Formats
 

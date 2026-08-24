@@ -65,4 +65,21 @@ interface HttpAdaptivePlaybackListener {
      * @param message   Human-readable diagnostic string (error code + underlying cause chain).
      */
     fun onPlaybackError(errorCode: Int, message: String)
+
+    /**
+     * Called when Media3 CacheDataSource reports cache event telemetry during playback.
+     *
+     * Diagnostic-only; does not alter rendering, ABR, or playback timing.
+     *
+     * @param cacheSizeBytes Latest reported total cache size in bytes (or -1 if not reported in this event).
+     * @param cachedBytesReadDelta Bytes read from cache in this event window.
+     * @param cacheIgnoredDelta Number of cache-ignored events in this window (typically 0 or 1).
+     * @param lastCacheIgnoredReason Nullable reason string if a cache-ignored event occurred.
+     */
+    fun onPlaybackCacheTelemetry(
+        cacheSizeBytes: Long,
+        cachedBytesReadDelta: Long,
+        cacheIgnoredDelta: Int,
+        lastCacheIgnoredReason: String?,
+    ) {}
 }

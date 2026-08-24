@@ -740,6 +740,12 @@ void main() {
         expect(controller.snapshot.bufferedPositionMs, equals(0));
         expect(controller.snapshot.bufferedPercent, equals(0));
         expect(controller.snapshot.liveOffsetMs, isNull);
+        expect(controller.snapshot.playbackCacheEnabled, isFalse);
+        expect(controller.snapshot.playbackCacheTelemetryAttached, isFalse);
+        expect(controller.snapshot.playbackCacheBytesRead, equals(0));
+        expect(controller.snapshot.playbackCacheSizeBytes, equals(0));
+        expect(controller.snapshot.playbackCacheIgnoredCount, equals(0));
+        expect(controller.snapshot.playbackCacheLastIgnoredReason, isNull);
         expect(controller.snapshot.hasPlaybackTelemetry, isFalse);
 
         // Open
@@ -774,6 +780,12 @@ void main() {
           bufferedPercent: 50,
           liveOffsetMs: 800,
           renderedFrames: 120,
+          playbackCacheEnabled: true,
+          playbackCacheTelemetryAttached: true,
+          playbackCacheBytesRead: 16384,
+          playbackCacheSizeBytes: 32768,
+          playbackCacheIgnoredCount: 1,
+          playbackCacheLastIgnoredReason: 'unset_length',
           raw: 'status=OK',
           diagnostics: {'refresh': 'success'},
         );
@@ -785,11 +797,23 @@ void main() {
         expect(refreshSnapshot.bufferedPositionMs, equals(60000));
         expect(refreshSnapshot.bufferedPercent, equals(50));
         expect(refreshSnapshot.liveOffsetMs, equals(800));
+        expect(refreshSnapshot.playbackCacheEnabled, isTrue);
+        expect(refreshSnapshot.playbackCacheTelemetryAttached, isTrue);
+        expect(refreshSnapshot.playbackCacheBytesRead, equals(16384));
+        expect(refreshSnapshot.playbackCacheSizeBytes, equals(32768));
+        expect(refreshSnapshot.playbackCacheIgnoredCount, equals(1));
+        expect(
+          refreshSnapshot.playbackCacheLastIgnoredReason,
+          equals('unset_length'),
+        );
         expect(refreshSnapshot.hasPlaybackTelemetry, isTrue);
         expect(controller.snapshot.positionMs, equals(45000));
         expect(controller.snapshot.bufferedPositionMs, equals(60000));
         expect(controller.snapshot.bufferedPercent, equals(50));
         expect(controller.snapshot.liveOffsetMs, equals(800));
+        expect(controller.snapshot.playbackCacheEnabled, isTrue);
+        expect(controller.snapshot.playbackCacheBytesRead, equals(16384));
+        expect(controller.snapshot.playbackCacheSizeBytes, equals(32768));
 
         // Dispose clears session and reverts snapshot getters to safe defaults
         final disposeSnapshot = await controller.dispose();
@@ -798,9 +822,17 @@ void main() {
         expect(disposeSnapshot.bufferedPositionMs, equals(0));
         expect(disposeSnapshot.bufferedPercent, equals(0));
         expect(disposeSnapshot.liveOffsetMs, isNull);
+        expect(disposeSnapshot.playbackCacheEnabled, isFalse);
+        expect(disposeSnapshot.playbackCacheTelemetryAttached, isFalse);
+        expect(disposeSnapshot.playbackCacheBytesRead, equals(0));
+        expect(disposeSnapshot.playbackCacheSizeBytes, equals(0));
+        expect(disposeSnapshot.playbackCacheIgnoredCount, equals(0));
+        expect(disposeSnapshot.playbackCacheLastIgnoredReason, isNull);
         expect(disposeSnapshot.hasPlaybackTelemetry, isFalse);
         expect(controller.snapshot.durationMs, equals(-1));
         expect(controller.snapshot.positionMs, equals(0));
+        expect(controller.snapshot.playbackCacheEnabled, isFalse);
+        expect(controller.snapshot.playbackCacheBytesRead, equals(0));
         expect(controller.snapshot.hasPlaybackTelemetry, isFalse);
       },
     );

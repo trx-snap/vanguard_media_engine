@@ -85,6 +85,14 @@ class AndroidDagStreamingPlaybackSession(
     private var currentBufferedPositionMs: Long = 0L
     private var currentLiveOffsetMs: Long? = null
 
+    // Phase 4C6P: Playback cache event telemetry fields (protected by renderLock).
+    private var playbackCacheEnabled: Boolean = false
+    private var playbackCacheTelemetryAttached: Boolean = false
+    private var playbackCacheBytesRead: Long = 0L
+    private var playbackCacheSizeBytes: Long = 0L
+    private var playbackCacheIgnoredCount: Int = 0
+    private var playbackCacheLastIgnoredReason: String? = null
+
     /**
      * Updates playback timing and buffer telemetry from adapter state transitions or buffering callbacks.
      * Diagnostic-only; does not alter native rendering or ABR behavior.
@@ -111,6 +119,32 @@ class AndroidDagStreamingPlaybackSession(
                     .coerceAtMost(currentDurationMs)
             } else {
                 currentBufferedPositionMs = 0L
+            }
+        }
+    }
+
+    /**
+     * Updates playback cache event telemetry from CacheDataSource event listener callbacks.
+     * Diagnostic-only; does not alter native rendering, ABR, or playback timing.
+     */
+    private fun recordPlaybackCacheTelemetry(
+        cacheSizeBytes: Long,
+        cachedBytesReadDelta: Long,
+        cacheIgnoredDelta: Int,
+        lastCacheIgnoredReason: String?,
+    ) {
+        synchronized(renderLock) {
+            if (cacheSizeBytes >= 0L) {
+                playbackCacheSizeBytes = cacheSizeBytes
+            }
+            if (cachedBytesReadDelta > 0L) {
+                playbackCacheBytesRead += cachedBytesReadDelta
+            }
+            if (cacheIgnoredDelta > 0) {
+                playbackCacheIgnoredCount += cacheIgnoredDelta
+            }
+            if (lastCacheIgnoredReason != null) {
+                playbackCacheLastIgnoredReason = lastCacheIgnoredReason
             }
         }
     }
@@ -145,6 +179,12 @@ class AndroidDagStreamingPlaybackSession(
                 currentRotationDegrees = 0
                 currentDisplayWidth = initialWidth
                 currentDisplayHeight = initialHeight
+                playbackCacheEnabled = streamConfig.cacheConfig.enabled
+                playbackCacheTelemetryAttached = streamConfig.cacheConfig.enabled
+                playbackCacheBytesRead = 0L
+                playbackCacheSizeBytes = 0L
+                playbackCacheIgnoredCount = 0
+                playbackCacheLastIgnoredReason = null
                 surfaceProducer.setSize(initialWidth, initialHeight)
                 val surface = surfaceProducer.getSurface().also { flutterSurface = it }
 
@@ -254,6 +294,19 @@ class AndroidDagStreamingPlaybackSession(
                     }
                     override fun onPlaybackError(errorCode: Int, message: String) {
                         failAndDestroyNativeSession("playback_error:$errorCode:$message")
+                    }
+                    override fun onPlaybackCacheTelemetry(
+                        cacheSizeBytes: Long,
+                        cachedBytesReadDelta: Long,
+                        cacheIgnoredDelta: Int,
+                        lastCacheIgnoredReason: String?,
+                    ) {
+                        recordPlaybackCacheTelemetry(
+                            cacheSizeBytes = cacheSizeBytes,
+                            cachedBytesReadDelta = cachedBytesReadDelta,
+                            cacheIgnoredDelta = cacheIgnoredDelta,
+                            lastCacheIgnoredReason = lastCacheIgnoredReason,
+                        )
                     }
                 }
 
@@ -382,6 +435,12 @@ class AndroidDagStreamingPlaybackSession(
             "adaptiveTimelineLastAcceptedFrameIndex" to (tlSnapshot["lastAcceptedFrameIndex"] as? Number)?.toLong(),
             "streamingNetworkProfile" to streamConfig.networkProfile.name,
             "streamingNetworkPolicy" to netPolicy.toDiagnosticMap(),
+            "playbackCacheEnabled" to playbackCacheEnabled,
+            "playbackCacheTelemetryAttached" to playbackCacheTelemetryAttached,
+            "playbackCacheBytesRead" to playbackCacheBytesRead,
+            "playbackCacheSizeBytes" to playbackCacheSizeBytes,
+            "playbackCacheIgnoredCount" to playbackCacheIgnoredCount,
+            "playbackCacheLastIgnoredReason" to playbackCacheLastIgnoredReason,
         )
     }
 
@@ -711,6 +770,12 @@ class AndroidDagStreamingPlaybackSession(
             "adaptiveTimelineLastAcceptedFrameIndex" to (tlSnapshot["lastAcceptedFrameIndex"] as? Number)?.toLong(),
             "streamingNetworkProfile" to streamConfig.networkProfile.name,
             "streamingNetworkPolicy" to netPolicy.toDiagnosticMap(),
+            "playbackCacheEnabled" to playbackCacheEnabled,
+            "playbackCacheTelemetryAttached" to playbackCacheTelemetryAttached,
+            "playbackCacheBytesRead" to playbackCacheBytesRead,
+            "playbackCacheSizeBytes" to playbackCacheSizeBytes,
+            "playbackCacheIgnoredCount" to playbackCacheIgnoredCount,
+            "playbackCacheLastIgnoredReason" to playbackCacheLastIgnoredReason,
         )
     }
 }

@@ -122,6 +122,7 @@ class AndroidDagPlaybackCacheManager private constructor(
      */
     fun buildDataSourceFactory(
         httpHeaders: Map<String, String>?,
+        eventListener: CacheDataSource.EventListener? = null,
     ): DataSource.Factory {
         val upstreamFactory = buildUpstreamFactory(httpHeaders)
 
@@ -132,13 +133,17 @@ class AndroidDagPlaybackCacheManager private constructor(
         }
 
         return try {
-            CacheDataSource.Factory()
+            val factory = CacheDataSource.Factory()
                 .setCache(cache)
                 .setUpstreamDataSourceFactory(upstreamFactory)
                 // FLAG_IGNORE_CACHE_ON_ERROR: on any cache read/write failure, fall through to
                 // network upstream.  This satisfies the Phase 4C6B requirement that cache I/O
                 // failures must never fail playback.
                 .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+            if (eventListener != null) {
+                factory.setEventListener(eventListener)
+            }
+            factory
         } catch (t: Throwable) {
             // Defensive: CacheDataSource.Factory construction should not throw, but if it does,
             // fall back to the upstream factory to preserve playback.

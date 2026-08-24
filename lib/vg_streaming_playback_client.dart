@@ -273,6 +273,24 @@ class VGStreamingPlaybackSession {
   /// Total decoded frames processed by decoder.
   final int decodedFrames;
 
+  /// Whether the session was opened with read-through playback cache enabled.
+  final bool playbackCacheEnabled;
+
+  /// Whether the Media3 CacheDataSource event telemetry listener is attached to the active session.
+  final bool playbackCacheTelemetryAttached;
+
+  /// Cumulative bytes read from cache during playback.
+  final int playbackCacheBytesRead;
+
+  /// Latest reported total cache size in bytes.
+  final int playbackCacheSizeBytes;
+
+  /// Cumulative count of ignored cache read events during playback.
+  final int playbackCacheIgnoredCount;
+
+  /// Reason string for the last ignored cache event, or `null` if none occurred.
+  final String? playbackCacheLastIgnoredReason;
+
   /// Raw diagnostic status string from platform engine.
   final String raw;
 
@@ -298,6 +316,12 @@ class VGStreamingPlaybackSession {
     this.displayHeight = 0,
     this.renderedFrames = 0,
     this.decodedFrames = 0,
+    this.playbackCacheEnabled = false,
+    this.playbackCacheTelemetryAttached = false,
+    this.playbackCacheBytesRead = 0,
+    this.playbackCacheSizeBytes = 0,
+    this.playbackCacheIgnoredCount = 0,
+    this.playbackCacheLastIgnoredReason,
     required this.raw,
     required this.diagnostics,
   });
@@ -389,6 +413,29 @@ class VGStreamingPlaybackSession {
     );
     final renderedFrames = (stringMap['renderedFrames'] as num?)?.toInt() ?? 0;
     final decodedFrames = (stringMap['decodedFrames'] as num?)?.toInt() ?? 0;
+    final playbackCacheEnabled =
+        stringMap['playbackCacheEnabled'] as bool? ??
+        stringMap['playback_cache_enabled'] as bool? ??
+        false;
+    final playbackCacheTelemetryAttached =
+        stringMap['playbackCacheTelemetryAttached'] as bool? ??
+        stringMap['playback_cache_telemetry_attached'] as bool? ??
+        false;
+    final playbackCacheBytesRead = _parseNonNegativeInt(
+      stringMap['playbackCacheBytesRead'] ??
+          stringMap['playback_cache_bytes_read'],
+    );
+    final playbackCacheSizeBytes = _parseNonNegativeInt(
+      stringMap['playbackCacheSizeBytes'] ??
+          stringMap['playback_cache_size_bytes'],
+    );
+    final playbackCacheIgnoredCount = _parseNonNegativeInt(
+      stringMap['playbackCacheIgnoredCount'] ??
+          stringMap['playback_cache_ignored_count'],
+    );
+    final playbackCacheLastIgnoredReason =
+        stringMap['playbackCacheLastIgnoredReason'] as String? ??
+        stringMap['playback_cache_last_ignored_reason'] as String?;
     final raw = stringMap['raw'] as String? ?? '';
 
     return VGStreamingPlaybackSession(
@@ -410,6 +457,12 @@ class VGStreamingPlaybackSession {
       displayHeight: displayHeight,
       renderedFrames: renderedFrames,
       decodedFrames: decodedFrames,
+      playbackCacheEnabled: playbackCacheEnabled,
+      playbackCacheTelemetryAttached: playbackCacheTelemetryAttached,
+      playbackCacheBytesRead: playbackCacheBytesRead,
+      playbackCacheSizeBytes: playbackCacheSizeBytes,
+      playbackCacheIgnoredCount: playbackCacheIgnoredCount,
+      playbackCacheLastIgnoredReason: playbackCacheLastIgnoredReason,
       raw: raw,
       diagnostics: stringMap,
     );
@@ -436,6 +489,12 @@ class VGStreamingPlaybackSession {
         displayHeight: 0,
         renderedFrames: 0,
         decodedFrames: 0,
+        playbackCacheEnabled: false,
+        playbackCacheTelemetryAttached: false,
+        playbackCacheBytesRead: 0,
+        playbackCacheSizeBytes: 0,
+        playbackCacheIgnoredCount: 0,
+        playbackCacheLastIgnoredReason: null,
         raw: 'status=UNSUPPORTED;platform=non-android',
         diagnostics: <String, Object?>{
           'pass': false,
@@ -488,6 +547,18 @@ class VGStreamingPlaybackSession {
     return val.clamp(0, 100);
   }
 
+  static int _parseNonNegativeInt(Object? raw) {
+    if (raw == null) return 0;
+    int? val;
+    if (raw is num) {
+      val = raw.toInt();
+    } else if (raw is String) {
+      val = int.tryParse(raw.trim());
+    }
+    if (val == null || val < 0) return 0;
+    return val;
+  }
+
   static Map<String, Object?> _defensiveStringMap(Map<Object?, Object?> map) {
     final result = <String, Object?>{};
     for (final entry in map.entries) {
@@ -506,7 +577,11 @@ class VGStreamingPlaybackSession {
       'durationMs=$durationMs, bufferedPercent=$bufferedPercent, '
       'bufferedPositionMs=$bufferedPositionMs, videoWidth=$videoWidth, videoHeight=$videoHeight, '
       'rotationDegrees=$rotationDegrees, displayWidth=$displayWidth, displayHeight=$displayHeight, '
-      'renderedFrames=$renderedFrames)';
+      'renderedFrames=$renderedFrames, playbackCacheEnabled=$playbackCacheEnabled, '
+      'playbackCacheTelemetryAttached=$playbackCacheTelemetryAttached, '
+      'playbackCacheBytesRead=$playbackCacheBytesRead, playbackCacheSizeBytes=$playbackCacheSizeBytes, '
+      'playbackCacheIgnoredCount=$playbackCacheIgnoredCount, '
+      'playbackCacheLastIgnoredReason=$playbackCacheLastIgnoredReason)';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

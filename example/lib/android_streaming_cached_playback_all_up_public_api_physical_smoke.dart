@@ -1,5 +1,5 @@
-// Copyright (c) Connects — Vanguard Phase 4C6N.
-// Public cache prewarm -> playback controller/view all-up physical smoke with timing and buffer telemetry.
+// Copyright (c) Connects — Vanguard Phase 4C6Q.
+// Public cache prewarm -> playback controller/view all-up physical smoke with timing, buffer, and cache event telemetry.
 //
 // Sequentially verifies:
 //   1. Definition of candidate streams via pure-Dart VGStreamingSourceSet and VGStreamingSourceDescriptor:
@@ -23,6 +23,8 @@
 //      - presentation via VGStreamingPlaybackTextureView
 //      - polling controller.refresh() until renderedFrames > 0
 //      - reading and asserting snapshot telemetry: durationMs, positionMs, bufferedPositionMs, bufferedPercent, liveOffsetMs, hasPlaybackTelemetry
+//      - reading and asserting playback cache event telemetry: playbackCacheEnabled == true, playbackCacheTelemetryAttached == true,
+//        playbackCacheBytesRead >= 0, playbackCacheSizeBytes >= 0, playbackCacheIgnoredCount >= 0, playbackCacheHitObserved
 //      - pause(), optional safe seek(), play(), stop(), dispose()
 //      - asserting controller snapshot state is disposed
 //   7. Resource cleanup and teardown in finally block (controller disposal + cache clear).
@@ -31,7 +33,7 @@
 // - Imports ONLY package:vanguard_media_engine/vanguard_media_engine.dart.
 // - No direct MethodChannel or package:flutter/services.dart imports.
 // - Presentation via VGStreamingPlaybackTextureView (no direct raw Flutter Texture widget).
-// - Proof of public API composition of cache prewarm, controller/view, and timing/buffer telemetry.
+// - Proof of public API composition of cache prewarm, controller/view, timing/buffer telemetry, and Media3 CacheDataSource event telemetry.
 // - Not proof that ExoPlayer subsequently reads all segments from cache (Media3 owns ABR / segment loading).
 
 import 'dart:async';
@@ -419,6 +421,17 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
         }
       }
 
+      final playbackCacheEnabled = refreshSnapshot.playbackCacheEnabled;
+      final playbackCacheTelemetryAttached =
+          refreshSnapshot.playbackCacheTelemetryAttached;
+      final playbackCacheBytesRead = refreshSnapshot.playbackCacheBytesRead;
+      final playbackCacheSizeBytes = refreshSnapshot.playbackCacheSizeBytes;
+      final playbackCacheIgnoredCount =
+          refreshSnapshot.playbackCacheIgnoredCount;
+      final playbackCacheLastIgnoredReason =
+          refreshSnapshot.playbackCacheLastIgnoredReason;
+      final playbackCacheHitObserved = playbackCacheBytesRead > 0;
+
       diagMap['playbackRenderedFrames'] = renderedFrames;
       diagMap['playbackDurationMs'] = durationMs;
       diagMap['playbackPositionMs'] = positionMs;
@@ -427,6 +440,15 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
       diagMap['playbackLiveOffsetMs'] = liveOffsetMs;
       diagMap['playbackHasTelemetry'] = hasPlaybackTelemetry;
       diagMap['playbackRefreshState'] = refreshSnapshot.state.name;
+      diagMap['playbackCacheEnabled'] = playbackCacheEnabled;
+      diagMap['playbackCacheTelemetryAttached'] =
+          playbackCacheTelemetryAttached;
+      diagMap['playbackCacheBytesRead'] = playbackCacheBytesRead;
+      diagMap['playbackCacheSizeBytes'] = playbackCacheSizeBytes;
+      diagMap['playbackCacheIgnoredCount'] = playbackCacheIgnoredCount;
+      diagMap['playbackCacheLastIgnoredReason'] =
+          playbackCacheLastIgnoredReason;
+      diagMap['playbackCacheHitObserved'] = playbackCacheHitObserved;
 
       if (renderedFrames <= 0) {
         throw Exception(
@@ -457,6 +479,30 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
           'hasPlaybackTelemetry=$hasPlaybackTelemetry, durationMs=$durationMs, '
           'positionMs=$positionMs, bufferedPositionMs=$bufferedPositionMs, '
           'bufferedPercent=$bufferedPercent, liveOffsetMs=$liveOffsetMs',
+        );
+      }
+
+      if (!playbackCacheEnabled) {
+        throw Exception('Expected playbackCacheEnabled == true, got false');
+      }
+      if (!playbackCacheTelemetryAttached) {
+        throw Exception(
+          'Expected playbackCacheTelemetryAttached == true, got false',
+        );
+      }
+      if (playbackCacheBytesRead < 0) {
+        throw Exception(
+          'Expected playbackCacheBytesRead >= 0, got $playbackCacheBytesRead',
+        );
+      }
+      if (playbackCacheSizeBytes < 0) {
+        throw Exception(
+          'Expected playbackCacheSizeBytes >= 0, got $playbackCacheSizeBytes',
+        );
+      }
+      if (playbackCacheIgnoredCount < 0) {
+        throw Exception(
+          'Expected playbackCacheIgnoredCount >= 0, got $playbackCacheIgnoredCount',
         );
       }
 
@@ -550,10 +596,12 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
           statusPass &&
           renderedFrames > 0 &&
           telemetryValid &&
+          playbackCacheEnabled &&
+          playbackCacheTelemetryAttached &&
           !isFailed &&
           isDisposed;
 
-      diagMap['phase'] = 'Phase4C6N';
+      diagMap['phase'] = 'Phase4C6Q';
       diagMap['pass'] = pass;
       diagMap['raw'] =
           'status=PASS;bytesCached=${finalPrewarmStatus.bytesCached};'
@@ -567,6 +615,12 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
           'bufferedPercent=$bufferedPercent;'
           'liveOffsetMs=$liveOffsetMs;'
           'hasPlaybackTelemetry=$hasPlaybackTelemetry;'
+          'playbackCacheEnabled=$playbackCacheEnabled;'
+          'playbackCacheTelemetryAttached=$playbackCacheTelemetryAttached;'
+          'playbackCacheBytesRead=$playbackCacheBytesRead;'
+          'playbackCacheSizeBytes=$playbackCacheSizeBytes;'
+          'playbackCacheIgnoredCount=$playbackCacheIgnoredCount;'
+          'playbackCacheHitObserved=$playbackCacheHitObserved;'
           'finalState=${disposeSnapshot.state.name}';
     } catch (error, stack) {
       // ignore: avoid_print
@@ -574,7 +628,7 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
         'ANDROID_STREAMING_CACHED_PLAYBACK_ALL_UP_PUBLIC_API_PHYSICAL_ERROR: $error\n$stack',
       );
       diagMap['pass'] = false;
-      diagMap['phase'] = 'Phase4C6N';
+      diagMap['phase'] = 'Phase4C6Q';
       diagMap['raw'] = 'status=FAIL;reason=dart_exception:$error';
       pass = false;
     } finally {
@@ -599,6 +653,10 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
 
     final rawStatus = diagMap['raw'] ?? 'unknown';
 
+    // ignore: avoid_print
+    print(
+      'ANDROID_STREAMING_CACHED_PLAYBACK_ALL_UP_PUBLIC_API_PHYSICAL_RAW:$rawStatus',
+    );
     // ignore: avoid_print
     print(
       'ANDROID_STREAMING_CACHED_PLAYBACK_ALL_UP_PUBLIC_API_PHYSICAL_JSON:${jsonEncode(diagMap)}',

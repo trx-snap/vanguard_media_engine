@@ -436,6 +436,12 @@ void main() {
           'videoHeight': 720,
           'renderedFrames': 360,
           'decodedFrames': 365,
+          'playbackCacheEnabled': true,
+          'playbackCacheTelemetryAttached': true,
+          'playbackCacheBytesRead': 8192,
+          'playbackCacheSizeBytes': 65536,
+          'playbackCacheIgnoredCount': 2,
+          'playbackCacheLastIgnoredReason': 'unset_length',
           'raw': 'status=OK;state=Playing',
           123: 'integer_key_value',
         };
@@ -462,6 +468,12 @@ void main() {
         expect(session.hasRotationMetadata, isFalse);
         expect(session.renderedFrames, equals(360));
         expect(session.decodedFrames, equals(365));
+        expect(session.playbackCacheEnabled, isTrue);
+        expect(session.playbackCacheTelemetryAttached, isTrue);
+        expect(session.playbackCacheBytesRead, equals(8192));
+        expect(session.playbackCacheSizeBytes, equals(65536));
+        expect(session.playbackCacheIgnoredCount, equals(2));
+        expect(session.playbackCacheLastIgnoredReason, equals('unset_length'));
         expect(session.raw, equals('status=OK;state=Playing'));
         expect(session.diagnostics['pass'], isTrue);
         expect(session.diagnostics['123'], equals('integer_key_value'));
@@ -694,6 +706,12 @@ void main() {
       expect(session.hasRotationMetadata, isFalse);
       expect(session.renderedFrames, equals(0));
       expect(session.decodedFrames, equals(0));
+      expect(session.playbackCacheEnabled, isFalse);
+      expect(session.playbackCacheTelemetryAttached, isFalse);
+      expect(session.playbackCacheBytesRead, equals(0));
+      expect(session.playbackCacheSizeBytes, equals(0));
+      expect(session.playbackCacheIgnoredCount, equals(0));
+      expect(session.playbackCacheLastIgnoredReason, isNull);
       expect(session.raw, equals('status=UNSUPPORTED;platform=non-android'));
       expect(session.toString(), contains('unsupported'));
       expect(session.toString(), contains('bufferedPercent=0'));
@@ -701,6 +719,50 @@ void main() {
       expect(session.toString(), contains('rotationDegrees=0'));
       expect(session.toString(), contains('displayWidth=0'));
       expect(session.toString(), contains('displayHeight=0'));
+      expect(session.toString(), contains('playbackCacheEnabled=false'));
+      expect(session.toString(), contains('playbackCacheBytesRead=0'));
+    });
+
+    test('fromMap parses and defaults cache telemetry safely', () {
+      final defaultSession = VGStreamingPlaybackSession.fromMap(
+        <Object?, Object?>{'pass': true, 'textureId': 10},
+      );
+      expect(defaultSession.playbackCacheEnabled, isFalse);
+      expect(defaultSession.playbackCacheTelemetryAttached, isFalse);
+      expect(defaultSession.playbackCacheBytesRead, equals(0));
+      expect(defaultSession.playbackCacheSizeBytes, equals(0));
+      expect(defaultSession.playbackCacheIgnoredCount, equals(0));
+      expect(defaultSession.playbackCacheLastIgnoredReason, isNull);
+
+      final negativeSession =
+          VGStreamingPlaybackSession.fromMap(<Object?, Object?>{
+            'pass': true,
+            'textureId': 10,
+            'playbackCacheEnabled': true,
+            'playbackCacheTelemetryAttached': true,
+            'playbackCacheBytesRead': -500,
+            'playbackCacheSizeBytes': -1000,
+            'playbackCacheIgnoredCount': -5,
+            'playbackCacheLastIgnoredReason': 'error',
+          });
+      expect(negativeSession.playbackCacheEnabled, isTrue);
+      expect(negativeSession.playbackCacheTelemetryAttached, isTrue);
+      expect(negativeSession.playbackCacheBytesRead, equals(0));
+      expect(negativeSession.playbackCacheSizeBytes, equals(0));
+      expect(negativeSession.playbackCacheIgnoredCount, equals(0));
+      expect(negativeSession.playbackCacheLastIgnoredReason, equals('error'));
+
+      final stringNumberSession =
+          VGStreamingPlaybackSession.fromMap(<Object?, Object?>{
+            'pass': true,
+            'textureId': 10,
+            'playbackCacheBytesRead': '4096',
+            'playbackCacheSizeBytes': '16384',
+            'playbackCacheIgnoredCount': '3',
+          });
+      expect(stringNumberSession.playbackCacheBytesRead, equals(4096));
+      expect(stringNumberSession.playbackCacheSizeBytes, equals(16384));
+      expect(stringNumberSession.playbackCacheIgnoredCount, equals(3));
     });
 
     test('fromMap parses and clamps bufferedPercent safely', () {

@@ -90,6 +90,26 @@ class VGStreamingPlaybackControllerSnapshot {
   /// Current distance from live edge in milliseconds (live streams only; `null` for VOD or when no session).
   int? get liveOffsetMs => session?.liveOffsetMs;
 
+  /// Whether playback cache is enabled for the active session (false when no session).
+  bool get playbackCacheEnabled => session?.playbackCacheEnabled ?? false;
+
+  /// Whether playback cache telemetry listener is attached to the active session (false when no session).
+  bool get playbackCacheTelemetryAttached =>
+      session?.playbackCacheTelemetryAttached ?? false;
+
+  /// Cumulative bytes read from cache during playback (0 when no session or no cache reads).
+  int get playbackCacheBytesRead => session?.playbackCacheBytesRead ?? 0;
+
+  /// Latest reported total cache size in bytes (0 when no session).
+  int get playbackCacheSizeBytes => session?.playbackCacheSizeBytes ?? 0;
+
+  /// Cumulative ignored cache read events during playback (0 when no session).
+  int get playbackCacheIgnoredCount => session?.playbackCacheIgnoredCount ?? 0;
+
+  /// Reason string for the last ignored cache event, or `null` if none occurred or no session.
+  String? get playbackCacheLastIgnoredReason =>
+      session?.playbackCacheLastIgnoredReason;
+
   /// Whether playback session telemetry is available.
   bool get hasPlaybackTelemetry => session != null;
 
