@@ -12,6 +12,8 @@ export 'vg_streaming_cache_client.dart'
     show VGPlaybackCacheOptions, VGPlaybackCacheStatus;
 export 'vg_streaming_cache_prewarm_plan.dart'
     show VGPlaybackPrewarmRequest, VGStreamingCachePrewarmLowLatencyPolicy;
+export 'vg_streaming_source_descriptor.dart'
+    show VGStreamingSourceDescriptor, VGStreamingSourceSet;
 
 /// Priority level for a streaming cache prewarm candidate.
 enum VGStreamingCachePrewarmPriority {
@@ -23,6 +25,58 @@ enum VGStreamingCachePrewarmPriority {
   final int rank;
 
   const VGStreamingCachePrewarmPriority(this.rank);
+}
+
+/// Immutable request to bridge a [VGStreamingSourceSet] into prioritized cache prewarm planning.
+class VGStreamingCacheSourcePriorityPlanRequest {
+  final VGStreamingSourceSet sourceSet;
+  final String requestIdPrefix;
+  final List<String> sourceKeys;
+  final int maxBytes;
+  final VGPlaybackCacheOptions options;
+  final VGStreamingCachePrewarmLowLatencyPolicy lowLatencyPolicy;
+  final Map<String, VGStreamingCachePrewarmPriority> prioritiesBySourceKey;
+  final Map<String, double> weightsBySourceKey;
+  final Map<String, String> reasonsBySourceKey;
+  final VGStreamingCachePrewarmPriority defaultPriority;
+  final double defaultWeight;
+  final int? maxTotalBytesBudget;
+  final VGPlaybackCacheStatus? cacheStatus;
+
+  VGStreamingCacheSourcePriorityPlanRequest({
+    required this.sourceSet,
+    required this.requestIdPrefix,
+    List<String> sourceKeys = const [],
+    this.maxBytes = 2 * 1024 * 1024,
+    this.options = const VGPlaybackCacheOptions(),
+    this.lowLatencyPolicy =
+        VGStreamingCachePrewarmLowLatencyPolicy.skipLowLatency,
+    Map<String, VGStreamingCachePrewarmPriority> prioritiesBySourceKey =
+        const {},
+    Map<String, double> weightsBySourceKey = const {},
+    Map<String, String> reasonsBySourceKey = const {},
+    this.defaultPriority = VGStreamingCachePrewarmPriority.normal,
+    this.defaultWeight = 1.0,
+    this.maxTotalBytesBudget,
+    this.cacheStatus,
+  }) : sourceKeys = List.unmodifiable(sourceKeys),
+       prioritiesBySourceKey = Map.unmodifiable(prioritiesBySourceKey),
+       weightsBySourceKey = Map.unmodifiable(weightsBySourceKey),
+       reasonsBySourceKey = Map.unmodifiable(reasonsBySourceKey),
+       assert(requestIdPrefix.isNotEmpty, 'requestIdPrefix must not be empty'),
+       assert(maxBytes > 0, 'maxBytes must be > 0'),
+       assert(defaultWeight > 0.0, 'defaultWeight must be > 0.0'),
+       assert(
+         maxTotalBytesBudget == null || maxTotalBytesBudget >= 0,
+         'maxTotalBytesBudget must be null or >= 0',
+       );
+
+  @override
+  String toString() =>
+      'VGStreamingCacheSourcePriorityPlanRequest(requestIdPrefix=$requestIdPrefix, '
+      'sourceKeys=$sourceKeys, maxBytes=$maxBytes, lowLatencyPolicy=${lowLatencyPolicy.name}, '
+      'defaultPriority=${defaultPriority.name}, defaultWeight=$defaultWeight, '
+      'maxTotalBytesBudget=$maxTotalBytesBudget)';
 }
 
 /// Candidate streaming cache prewarm request submitted for priority evaluation.
@@ -352,6 +406,115 @@ abstract final class VGStreamingCachePriorityPlanner {
       evictionAdvisory: evictionAdvisory,
       warnings: warnings,
       diagnostics: diagnostics,
+    );
+  }
+
+  /// Bridges a [VGStreamingSourceSet] and caller-provided priorities into a [VGStreamingCachePriorityPlan].
+  ///
+  /// - Resolves sources in [request.sourceKeys] order if non-empty, otherwise uses [request.sourceSet.sources] order.
+  /// - Unknown source keys emit an `unknown_source_key:<key>` warning and do not become candidates.
+  /// - Low-latency sources (`requireLlHlsTags == true`) under [VGStreamingCachePrewarmLowLatencyPolicy.skipLowLatency]
+  ///   are skipped before priority planning with warning `low_latency_cache_constrained:<key>`.
+  /// - Valid candidate sources are converted to [VGPlaybackPrewarmRequest] instances via [VGStreamingCachePrewarmPlanner.requestForSource]
+  ///   preserving URI, headers, cache options, and deterministic request IDs (`${requestIdPrefix}_${source.key}_${index}`).
+  /// - Candidates are wrapped in [VGStreamingCachePrewarmCandidate] with caller-configured or default priority, weight, and reason.
+  /// - Evaluates candidates against budget and cache status via [plan], returning merged warnings and extended diagnostics.
+  static VGStreamingCachePriorityPlan planForSourceSet(
+    VGStreamingCacheSourcePriorityPlanRequest request,
+  ) {
+    final warnings = <String>[];
+    final candidateSources = <VGStreamingSourceDescriptor>[];
+    var skippedSourceCount = 0;
+
+    // 1. Resolve candidate sources
+    if (request.sourceKeys.isNotEmpty) {
+      for (final key in request.sourceKeys) {
+        final source = request.sourceSet.trySourceForKey(key);
+        if (source != null) {
+          candidateSources.add(source);
+        } else {
+          warnings.add('unknown_source_key:$key');
+        }
+      }
+    } else {
+      candidateSources.addAll(request.sourceSet.sources);
+    }
+
+    final overrideOptions =
+        identical(request.options, const VGPlaybackCacheOptions())
+        ? null
+        : request.options;
+
+    final candidates = <VGStreamingCachePrewarmCandidate>[];
+
+    // 2. Build prewarm candidates
+    for (var i = 0; i < candidateSources.length; i++) {
+      final source = candidateSources[i];
+
+      if (source.requireLlHlsTags &&
+          request.lowLatencyPolicy ==
+              VGStreamingCachePrewarmLowLatencyPolicy.skipLowLatency) {
+        skippedSourceCount++;
+        warnings.add('low_latency_cache_constrained:${source.key}');
+        continue;
+      }
+
+      final requestId = '${request.requestIdPrefix}_${source.key}_$i';
+      final prewarmRequest = VGStreamingCachePrewarmPlanner.requestForSource(
+        requestId: requestId,
+        source: source,
+        maxBytes: request.maxBytes,
+        options: overrideOptions,
+      );
+
+      final priority =
+          request.prioritiesBySourceKey[source.key] ?? request.defaultPriority;
+      final weight =
+          request.weightsBySourceKey[source.key] ?? request.defaultWeight;
+      final reason = request.reasonsBySourceKey[source.key];
+
+      candidates.add(
+        VGStreamingCachePrewarmCandidate(
+          request: prewarmRequest,
+          priority: priority,
+          weight: weight,
+          isLowLatency: source.requireLlHlsTags,
+          reason: reason,
+        ),
+      );
+    }
+
+    // 3. Delegate to priority plan
+    final innerPlan = plan(
+      candidates: candidates,
+      maxTotalBytesBudget: request.maxTotalBytesBudget,
+      cacheStatus: request.cacheStatus,
+      allowLowLatency:
+          request.lowLatencyPolicy ==
+          VGStreamingCachePrewarmLowLatencyPolicy.allowBoundedManifestOnly,
+    );
+
+    final mergedWarnings = <String>[...warnings, ...innerPlan.warnings];
+
+    final mergedDiagnostics = <String, Object?>{
+      'sourceCount': request.sourceSet.sources.length,
+      'sourceKeysProvided': request.sourceKeys.isNotEmpty,
+      'resolvedSourceCount': candidateSources.length,
+      'candidateCount': candidates.length,
+      'skippedSourceCount': skippedSourceCount,
+      'lowLatencyPolicy': request.lowLatencyPolicy.name,
+      'requestIdPrefix': request.requestIdPrefix,
+      ...innerPlan.diagnostics,
+    };
+
+    return VGStreamingCachePriorityPlan(
+      admittedRequests: innerPlan.admittedRequests,
+      droppedCandidates: innerPlan.droppedCandidates,
+      totalAdmittedBytes: innerPlan.totalAdmittedBytes,
+      totalRequestedBytes: innerPlan.totalRequestedBytes,
+      evictionAdvisory: innerPlan.evictionAdvisory,
+      warnings: mergedWarnings,
+      diagnostics: mergedDiagnostics,
     );
   }
 }

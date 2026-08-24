@@ -1686,6 +1686,44 @@ void planPrioritizedPrewarm() {
 - **Advisory Eviction Only**: If current cache space plus admitted bytes exceeds `maxCacheBytes`, `VGStreamingCacheEvictionAdvisory` recommends bytes to free. The planner is a pure Dart contract and **never** calls `clear`, deletes files, or evicts native resources.
 - **Boundaries**: Pure Dart contract helper; no `MethodChannel`/native calls, no cache I/O, no playback mutation, no ABR forcing, and no ConnectsApp feed policy ownership.
 
+### Public Streaming Source-Set Cache Priority Planner Bridge (Phase 4C6S)
+
+`VGStreamingCachePriorityPlanner.planForSourceSet` provides a pure Dart bridge from `VGStreamingSourceSet` and `VGStreamingSourceDescriptor` into prioritized prewarm planning via `VGStreamingCacheSourcePriorityPlanRequest`.
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+void planPrioritizedSourceSet(VGStreamingSourceSet sourceSet) {
+  final plan = VGStreamingCachePriorityPlanner.planForSourceSet(
+    VGStreamingCacheSourcePriorityPlanRequest(
+      sourceSet: sourceSet,
+      requestIdPrefix: 'feed_hero',
+      sourceKeys: ['hero_stream', 'next_stream'],
+      maxBytes: 1024 * 1024,
+      prioritiesBySourceKey: {
+        'hero_stream': VGStreamingCachePrewarmPriority.urgent,
+        'next_stream': VGStreamingCachePrewarmPriority.normal,
+      },
+      weightsBySourceKey: {
+        'hero_stream': 2.0,
+        'next_stream': 1.0,
+      },
+      lowLatencyPolicy: VGStreamingCachePrewarmLowLatencyPolicy.skipLowLatency,
+      maxTotalBytesBudget: 1536 * 1024,
+    ),
+  );
+
+  print('Admitted requests: ${plan.admittedRequests.length}');
+  for (final req in plan.admittedRequests) {
+    print('Prewarm candidate: ${req.requestId} -> ${req.uri} (${req.maxBytes} bytes)');
+  }
+}
+```
+
+- **Source Resolution**: Resolves candidate descriptors in `request.sourceKeys` order when non-empty, falling back to `sourceSet.sources` order. Emits `unknown_source_key:<key>` warnings for unrecognized keys.
+- **Low-Latency Handling**: Automatically checks descriptor `requireLlHlsTags` against `lowLatencyPolicy`; `skipLowLatency` skips candidate creation and records `low_latency_cache_constrained:<key>`.
+- **Caller-Owned Policy**: Host application retains full ownership over priority maps, weights, reasons, and whether admitted requests are actually dispatched to `VGStreamingCacheClient.prewarmRequest`. Pure Dart, side-effect free planning with no cache I/O, no file deletion, no playback mutation, and no ABR forcing.
+
 ## Streaming Cache API
 
 The package exposes `VGStreamingCacheClient` to manage media prewarming and caching for streaming video/audio playback.
