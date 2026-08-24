@@ -402,6 +402,65 @@ void planPlaybackRecovery({
 - **Live vs. VOD Resume Logic**: For VOD streams (`isLive == false`), the planner preserves current playhead position as the resume point. For live streams, resume position remains `null` to automatically track the live edge unless an explicit override is provided.
 - **iOS Parity**: Pure Dart implementation over public models runs identically on iOS without platform code dependencies.
 
+## Public Streaming Playback Resilience Monitor (Phase 4C7AM / Phase 4C7AN)
+
+The package exposes `VGStreamingPlaybackResilienceMonitor` as a pure Dart resilience stream monitor. It consumes a `Stream<VGStreamingPlaybackStatusSummary>` (such as from `VGStreamingPlaybackStatusPoller.summaries`), maintains a bounded chronological history, evaluates real-time health advice via `VGStreamingPlaybackHealthAdvisor`, and synthesizes host recovery plans via `VGStreamingPlaybackRecoveryPlanner` into composite resilience snapshots (`VGStreamingPlaybackResilienceSnapshot`).
+
+### Quick Start
+
+```dart
+import 'package:flutter/material.dart';
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+void monitorPlaybackResilience({
+  required Stream<VGStreamingPlaybackStatusSummary> summaryStream,
+  VGStreamingPlaybackOptions? currentOptions,
+}) {
+  // 1. Instantiate the resilience monitor with optional config
+  final monitor = VGStreamingPlaybackResilienceMonitor(
+    summaries: summaryStream,
+    config: VGStreamingPlaybackResilienceMonitorConfig(
+      maxHistoryLength: 8,
+      currentNetworkProfile: VGStreamingNetworkProfile.auto,
+      currentOptions: currentOptions,
+      allowAutomaticRetry: false,
+      retryDelayMs: 750,
+      preserveCacheOptions: true,
+    ),
+  );
+
+  // 2. Listen to broadcast stream of composite resilience snapshots
+  final subscription = monitor.snapshots.listen((snapshot) {
+    print('Severity: ${snapshot.healthAdvice.severity}');
+    print('Recommended Action: ${snapshot.healthAdvice.recommendedAction}');
+    print('Recovery Intent: ${snapshot.recoveryPlan.intent}');
+    print('Urgency: ${snapshot.recoveryPlan.urgency}');
+    print('History Depth: ${snapshot.historyLength}');
+    print('Reasons: ${snapshot.reasons}');
+
+    if (snapshot.recoveryPlan.shouldReopenPlayback &&
+        snapshot.recoveryPlan.playbackOptions != null) {
+      // Host application can safely act on the adjusted options
+    }
+  });
+
+  // 3. Start monitoring
+  monitor.start();
+
+  // 4. Teardown with widget / controller lifecycle
+  // subscription.cancel();
+  // monitor.dispose();
+}
+```
+
+### Invariants & Non-Claims
+
+- **Pure Dart Stream Monitor**: `snapshot.advisoryOnly == true` and `snapshot.playbackMutation == false`. The resilience monitor does not own or dispose the player, does not own `VGStreamingPlaybackController` or `VGStreamingPlaybackStatusPoller`, does not call `MethodChannel` or native code, and does not automatically retry or reopen playback.
+- **Media3 ABR Engine Ownership**: AndroidX Media3 retains sole ownership over underlying segment fetching and adaptive bitrate track switching. The monitor evaluates telemetry trends and suggests macro network profile adjustments.
+- **Product Recovery Control**: The host application retains complete authority over executing recovery actions and presenting user-facing recovery indicators.
+- **Error Resilience & Safe Disposal**: Input stream errors are recorded in snapshot diagnostics without throwing or terminating the monitor. Disposed monitors safely ignore further emissions and can be disposed idempotently.
+- **iOS Parity**: Pure Dart implementation over public streaming models runs identically on iOS without native code dependencies.
+
 ## Cached Streaming Playback All-Up Integration Recipe
 
 The package provides end-to-end composition across bounded cache prewarming, manifest preflight capability evaluation, startup decision planning, session-safe controller management, presentation via `VGStreamingPlaybackTextureView`, and snapshot-level playback timing and buffer telemetry.
