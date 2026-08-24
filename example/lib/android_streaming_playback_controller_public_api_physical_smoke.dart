@@ -1,4 +1,4 @@
-// Vanguard Android True-DAG Phase 4C7P: Public streaming playback controller -> physical playback smoke.
+// Vanguard Android True-DAG Phase 4C7P/4C7Z: Public streaming playback controller -> physical playback smoke & telemetry.
 //
 // Sequentially verifies:
 //   1. Definition of candidate streams via pure-Dart VGStreamingSourceSet and VGStreamingSourceDescriptor.
@@ -12,6 +12,7 @@
 //      - open(decision, startPlayback: true) allocating textureId
 //      - Texture widget rendering
 //      - polling refresh() until renderedFrames > 0
+//      - validating snapshot-level timing and buffer telemetry (durationMs, positionMs, bufferedPositionMs, bufferedPercent, liveOffsetMs)
 //      - pause(), optional seek(), play(), stop(), dispose()
 //      - asserting snapshot.state is disposed after dispose()
 //
@@ -20,7 +21,7 @@
 // - No direct MethodChannel or services.dart imports.
 // - Pure advisory validation before playback: advisoryOnly == true, playbackMutation == false.
 // - Single active session per controller; idempotent cleanup.
-// - Physical pass requires preflight pass, canOpenPlayback == true, decision == 'playback_ready', positive rendered frame counts, and final disposed state across all sources.
+// - Physical pass requires preflight pass, canOpenPlayback == true, decision == 'playback_ready', positive rendered frame counts, valid snapshot telemetry, and final disposed state across all sources.
 
 import 'dart:async';
 import 'dart:convert';
@@ -189,6 +190,11 @@ class _AndroidStreamingPlaybackControllerPublicApiPhysicalSmokeAppState
         bool casePass = false;
         int renderedFrames = 0;
         int durationMs = -1;
+        int positionMs = 0;
+        int bufferedPositionMs = 0;
+        int bufferedPercent = 0;
+        int? liveOffsetMs;
+        bool hasPlaybackTelemetry = false;
         String finalStateStr = '';
 
         try {
@@ -248,7 +254,12 @@ class _AndroidStreamingPlaybackControllerPublicApiPhysicalSmokeAppState
             refreshSnapshot = await controller.refresh();
             caseDiag = Map<String, dynamic>.from(refreshSnapshot.diagnostics);
             renderedFrames = refreshSnapshot.session?.renderedFrames ?? 0;
-            durationMs = refreshSnapshot.session?.durationMs ?? -1;
+            durationMs = refreshSnapshot.durationMs;
+            positionMs = refreshSnapshot.positionMs;
+            bufferedPositionMs = refreshSnapshot.bufferedPositionMs;
+            bufferedPercent = refreshSnapshot.bufferedPercent;
+            liveOffsetMs = refreshSnapshot.liveOffsetMs;
+            hasPlaybackTelemetry = refreshSnapshot.hasPlaybackTelemetry;
             if (renderedFrames > 0) {
               break;
             }
@@ -313,8 +324,30 @@ class _AndroidStreamingPlaybackControllerPublicApiPhysicalSmokeAppState
               disposeSnapshot.state ==
               VGStreamingPlaybackControllerState.disposed;
 
+          // Sane telemetry assertions: duration >= -1, position >= 0, bufferedPosition >= 0, bufferedPercent 0..100
+          final telemetryValid =
+              hasPlaybackTelemetry &&
+              durationMs >= -1 &&
+              positionMs >= 0 &&
+              bufferedPositionMs >= 0 &&
+              bufferedPercent >= 0 &&
+              bufferedPercent <= 100;
+
+          if (!telemetryValid) {
+            throw Exception(
+              'Telemetry validation failed for ${testCase.expectedKey}: '
+              'hasPlaybackTelemetry=$hasPlaybackTelemetry, durationMs=$durationMs, '
+              'positionMs=$positionMs, bufferedPositionMs=$bufferedPositionMs, '
+              'bufferedPercent=$bufferedPercent, liveOffsetMs=$liveOffsetMs',
+            );
+          }
+
           casePass =
-              statusPass && renderedFrames > 0 && !isFailed && isDisposed;
+              statusPass &&
+              renderedFrames > 0 &&
+              telemetryValid &&
+              !isFailed &&
+              isDisposed;
         } catch (error, stack) {
           // ignore: avoid_print
           print(
@@ -349,6 +382,11 @@ class _AndroidStreamingPlaybackControllerPublicApiPhysicalSmokeAppState
           'pass': casePass,
           'renderedFrames': renderedFrames,
           'durationMs': durationMs,
+          'positionMs': positionMs,
+          'bufferedPositionMs': bufferedPositionMs,
+          'bufferedPercent': bufferedPercent,
+          'liveOffsetMs': liveOffsetMs,
+          'hasPlaybackTelemetry': hasPlaybackTelemetry,
           'finalState': finalStateStr,
           'raw':
               caseDiag['raw']?.toString() ??
@@ -360,7 +398,7 @@ class _AndroidStreamingPlaybackControllerPublicApiPhysicalSmokeAppState
           setState(() {
             _textureId = null;
             _status =
-                '${testCase.label}: ${casePass ? "PASS ($renderedFrames frames)" : "FAIL"}';
+                '${testCase.label}: ${casePass ? "PASS ($renderedFrames frames, ${durationMs}ms, ${bufferedPercent}%)" : "FAIL"}';
           });
         }
 
@@ -381,8 +419,37 @@ class _AndroidStreamingPlaybackControllerPublicApiPhysicalSmokeAppState
       'pass': allPass,
       'preflightPass': preflightPass,
       'allCasesPass': allCasesPass,
-      'preflight': preflightDiag,
       'cases': caseResults,
+      'hlsRenderedFrames':
+          caseResults['case_1_preserve_order_hls']?['renderedFrames'],
+      'hlsDurationMs': caseResults['case_1_preserve_order_hls']?['durationMs'],
+      'hlsPositionMs': caseResults['case_1_preserve_order_hls']?['positionMs'],
+      'hlsBufferedPositionMs':
+          caseResults['case_1_preserve_order_hls']?['bufferedPositionMs'],
+      'hlsBufferedPercent':
+          caseResults['case_1_preserve_order_hls']?['bufferedPercent'],
+      'hlsLiveOffsetMs':
+          caseResults['case_1_preserve_order_hls']?['liveOffsetMs'],
+      'dashRenderedFrames':
+          caseResults['case_2_preferred_dash']?['renderedFrames'],
+      'dashDurationMs': caseResults['case_2_preferred_dash']?['durationMs'],
+      'dashPositionMs': caseResults['case_2_preferred_dash']?['positionMs'],
+      'dashBufferedPositionMs':
+          caseResults['case_2_preferred_dash']?['bufferedPositionMs'],
+      'dashBufferedPercent':
+          caseResults['case_2_preferred_dash']?['bufferedPercent'],
+      'dashLiveOffsetMs': caseResults['case_2_preferred_dash']?['liveOffsetMs'],
+      'llHlsRenderedFrames':
+          caseResults['case_3_preferred_ll_hls']?['renderedFrames'],
+      'llHlsDurationMs': caseResults['case_3_preferred_ll_hls']?['durationMs'],
+      'llHlsPositionMs': caseResults['case_3_preferred_ll_hls']?['positionMs'],
+      'llHlsBufferedPositionMs':
+          caseResults['case_3_preferred_ll_hls']?['bufferedPositionMs'],
+      'llHlsBufferedPercent':
+          caseResults['case_3_preferred_ll_hls']?['bufferedPercent'],
+      'llHlsLiveOffsetMs':
+          caseResults['case_3_preferred_ll_hls']?['liveOffsetMs'],
+      'preflight': preflightDiag,
     };
 
     // Print structured JSON and terminal markers

@@ -202,17 +202,37 @@ Future<void> controlStreamingPlayback() async {
 
   // Render Texture(textureId: snapshot.textureId!) in Flutter widget tree
 
-  // 5. Control playback
+  // 5. Control playback and read controller snapshot telemetry
   await controller.pause();
   await controller.seek(5000);
   await controller.play();
-  await controller.refresh();
+
+  final refreshed = await controller.refresh();
+  print(
+    'Playback status: duration=${refreshed.durationMs}ms, '
+    'position=${refreshed.positionMs}ms, '
+    'buffered=${refreshed.bufferedPercent}% (${refreshed.bufferedPositionMs}ms ahead), '
+    'liveOffset=${refreshed.liveOffsetMs}',
+  );
+
   await controller.stop();
 
   // 6. Release resources
   await controller.dispose();
 }
 ```
+
+### Controller Playback Timing & Buffer Telemetry (Phases 4C7Y, 4C7Z)
+
+`VGStreamingPlaybackControllerSnapshot` exposes read-only convenience getters for stream timing and buffer telemetry delegating directly to the underlying session:
+- `durationMs`: Total media duration in milliseconds (`-1` for live/unbounded streams or when idle/unsupported).
+- `positionMs`: Current playhead position in milliseconds (`0` when idle/unsupported).
+- `bufferedPositionMs`: Look-ahead buffered duration in milliseconds ahead of current playhead (`0` when idle/unsupported).
+- `bufferedPercent`: 0–100 percentage of the look-ahead buffer filled (`0` when idle/unsupported).
+- `liveOffsetMs`: Current distance from live edge in milliseconds (`null` for VOD or when idle/unsupported).
+- `hasPlaybackTelemetry`: Whether an active playback session is present.
+
+These accessors allow app integrators and UI layers to consume playback metrics directly from the controller snapshot without repeatedly drilling into `snapshot.session`.
 
 ## Streaming Playback Decision Planner Recipe
 

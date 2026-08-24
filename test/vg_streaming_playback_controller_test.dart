@@ -70,6 +70,16 @@ class FakeStreamingPlaybackClient extends VGStreamingPlaybackClient {
       textureId: session.textureId,
       format: session.format,
       state: VGStreamingPlaybackState.playing,
+      durationMs: session.durationMs,
+      positionMs: session.positionMs,
+      bufferedPositionMs: session.bufferedPositionMs,
+      bufferedPercent: session.bufferedPercent,
+      liveOffsetMs: session.liveOffsetMs,
+      videoWidth: session.videoWidth,
+      videoHeight: session.videoHeight,
+      rotationDegrees: session.rotationDegrees,
+      displayWidth: session.displayWidth,
+      displayHeight: session.displayHeight,
       renderedFrames: 1,
       raw: 'status=OK',
       diagnostics: {'play': 'success'},
@@ -91,6 +101,17 @@ class FakeStreamingPlaybackClient extends VGStreamingPlaybackClient {
       textureId: session.textureId,
       format: session.format,
       state: VGStreamingPlaybackState.paused,
+      durationMs: session.durationMs,
+      positionMs: session.positionMs,
+      bufferedPositionMs: session.bufferedPositionMs,
+      bufferedPercent: session.bufferedPercent,
+      liveOffsetMs: session.liveOffsetMs,
+      videoWidth: session.videoWidth,
+      videoHeight: session.videoHeight,
+      rotationDegrees: session.rotationDegrees,
+      displayWidth: session.displayWidth,
+      displayHeight: session.displayHeight,
+      renderedFrames: session.renderedFrames,
       raw: 'status=OK',
       diagnostics: {'pause': 'success'},
     );
@@ -113,7 +134,17 @@ class FakeStreamingPlaybackClient extends VGStreamingPlaybackClient {
       textureId: session.textureId,
       format: session.format,
       state: VGStreamingPlaybackState.seeking,
+      durationMs: session.durationMs,
       positionMs: positionMs,
+      bufferedPositionMs: session.bufferedPositionMs,
+      bufferedPercent: session.bufferedPercent,
+      liveOffsetMs: session.liveOffsetMs,
+      videoWidth: session.videoWidth,
+      videoHeight: session.videoHeight,
+      rotationDegrees: session.rotationDegrees,
+      displayWidth: session.displayWidth,
+      displayHeight: session.displayHeight,
+      renderedFrames: session.renderedFrames,
       raw: 'status=OK',
       diagnostics: {'seek': 'success'},
     );
@@ -134,6 +165,17 @@ class FakeStreamingPlaybackClient extends VGStreamingPlaybackClient {
       textureId: session.textureId,
       format: session.format,
       state: VGStreamingPlaybackState.idle,
+      durationMs: session.durationMs,
+      positionMs: session.positionMs,
+      bufferedPositionMs: session.bufferedPositionMs,
+      bufferedPercent: session.bufferedPercent,
+      liveOffsetMs: session.liveOffsetMs,
+      videoWidth: session.videoWidth,
+      videoHeight: session.videoHeight,
+      rotationDegrees: session.rotationDegrees,
+      displayWidth: session.displayWidth,
+      displayHeight: session.displayHeight,
+      renderedFrames: session.renderedFrames,
       raw: 'status=OK',
       diagnostics: {'stop': 'success'},
     );
@@ -154,6 +196,16 @@ class FakeStreamingPlaybackClient extends VGStreamingPlaybackClient {
       textureId: session.textureId,
       format: session.format,
       state: session.state,
+      durationMs: session.durationMs,
+      positionMs: session.positionMs,
+      bufferedPositionMs: session.bufferedPositionMs,
+      bufferedPercent: session.bufferedPercent,
+      liveOffsetMs: session.liveOffsetMs,
+      videoWidth: session.videoWidth,
+      videoHeight: session.videoHeight,
+      rotationDegrees: session.rotationDegrees,
+      displayWidth: session.displayWidth,
+      displayHeight: session.displayHeight,
       renderedFrames: 10,
       raw: 'status=OK',
       diagnostics: {'refresh': 'success'},
@@ -256,25 +308,39 @@ void main() {
       expect(controller.snapshot.decision, isNull);
       expect(controller.snapshot.lastError, isNull);
       expect(controller.snapshot.diagnostics, isEmpty);
+      expect(controller.snapshot.durationMs, equals(-1));
+      expect(controller.snapshot.positionMs, equals(0));
+      expect(controller.snapshot.bufferedPositionMs, equals(0));
+      expect(controller.snapshot.bufferedPercent, equals(0));
+      expect(controller.snapshot.liveOffsetMs, isNull);
+      expect(controller.snapshot.hasPlaybackTelemetry, isFalse);
       expect(controller.isDisposed, isFalse);
     });
 
     // 2. Blocked decision does not call open
-    test('2. blocked decision does not call open and moves to failed', () async {
-      final client = FakeStreamingPlaybackClient();
-      final controller = VGStreamingPlaybackController(playbackClient: client);
+    test(
+      '2. blocked decision does not call open and moves to failed',
+      () async {
+        final client = FakeStreamingPlaybackClient();
+        final controller = VGStreamingPlaybackController(
+          playbackClient: client,
+        );
 
-      final snapshot = await controller.open(blockedDecision);
+        final snapshot = await controller.open(blockedDecision);
 
-      expect(client.openCalls, equals(0));
-      expect(snapshot.state, equals(VGStreamingPlaybackControllerState.failed));
-      expect(snapshot.pass, isFalse);
-      expect(snapshot.reason, equals('decision_blocked'));
-      expect(snapshot.session, isNull);
-      expect(snapshot.textureId, isNull);
-      expect(snapshot.decision, equals(blockedDecision));
-      expect(snapshot.diagnostics['canOpenPlayback'], isFalse);
-    });
+        expect(client.openCalls, equals(0));
+        expect(
+          snapshot.state,
+          equals(VGStreamingPlaybackControllerState.failed),
+        );
+        expect(snapshot.pass, isFalse);
+        expect(snapshot.reason, equals('decision_blocked'));
+        expect(snapshot.session, isNull);
+        expect(snapshot.textureId, isNull);
+        expect(snapshot.decision, equals(blockedDecision));
+        expect(snapshot.diagnostics['canOpenPlayback'], isFalse);
+      },
+    );
 
     // 3. Successful open with startPlayback calls open then play and exposes textureId
     test(
@@ -307,32 +373,40 @@ void main() {
     );
 
     // 4. Open with startPlayback false retains session without play
-    test('4. open with startPlayback false retains session without play', () async {
-      final client = FakeStreamingPlaybackClient();
-      client.onOpen = (options) => const VGStreamingPlaybackSession(
-        pass: true,
-        phase: 'Phase4C1D1',
-        sessionId: 'sess_102',
-        textureId: 102,
-        format: VGStreamingFormatHint.hls,
-        state: VGStreamingPlaybackState.paused,
-        raw: 'status=OK',
-        diagnostics: {},
-      );
+    test(
+      '4. open with startPlayback false retains session without play',
+      () async {
+        final client = FakeStreamingPlaybackClient();
+        client.onOpen = (options) => const VGStreamingPlaybackSession(
+          pass: true,
+          phase: 'Phase4C1D1',
+          sessionId: 'sess_102',
+          textureId: 102,
+          format: VGStreamingFormatHint.hls,
+          state: VGStreamingPlaybackState.paused,
+          raw: 'status=OK',
+          diagnostics: {},
+        );
 
-      final controller = VGStreamingPlaybackController(playbackClient: client);
-      final snapshot = await controller.open(
-        validDecision,
-        startPlayback: false,
-      );
+        final controller = VGStreamingPlaybackController(
+          playbackClient: client,
+        );
+        final snapshot = await controller.open(
+          validDecision,
+          startPlayback: false,
+        );
 
-      expect(client.openCalls, equals(1));
-      expect(client.playCalls, equals(0));
-      expect(snapshot.state, equals(VGStreamingPlaybackControllerState.paused));
-      expect(snapshot.pass, isTrue);
-      expect(snapshot.reason, equals('opened'));
-      expect(snapshot.textureId, equals(102));
-    });
+        expect(client.openCalls, equals(1));
+        expect(client.playCalls, equals(0));
+        expect(
+          snapshot.state,
+          equals(VGStreamingPlaybackControllerState.paused),
+        );
+        expect(snapshot.pass, isTrue);
+        expect(snapshot.reason, equals('opened'));
+        expect(snapshot.textureId, equals(102));
+      },
+    );
 
     // 5. Second open while active returns session_already_active and does not open again
     test(
@@ -544,7 +618,10 @@ void main() {
       );
       expect(snapshot.pass, isFalse);
       expect(snapshot.reason, equals('open_failed'));
-      expect(snapshot.session?.state, equals(VGStreamingPlaybackState.unsupported));
+      expect(
+        snapshot.session?.state,
+        equals(VGStreamingPlaybackState.unsupported),
+      );
       expect(snapshot.textureId, isNull);
     });
 
@@ -595,7 +672,10 @@ void main() {
 
       // Now open a second time after stopping
       final secondOpen = await controller.open(validDecision);
-      expect(client.disposeCalls, equals(1)); // disposed the old stopped session
+      expect(
+        client.disposeCalls,
+        equals(1),
+      ); // disposed the old stopped session
       expect(client.openCalls, equals(2));
       expect(secondOpen.pass, isTrue);
       expect(
@@ -609,7 +689,8 @@ void main() {
       'exception in dispose sets pass false and reason dispose_failed but is disposed',
       () async {
         final client = FakeStreamingPlaybackClient();
-        client.onDispose = (session) => throw Exception('Native dispose crashed');
+        client.onDispose = (session) =>
+            throw Exception('Native dispose crashed');
 
         final controller = VGStreamingPlaybackController(
           playbackClient: client,
@@ -625,6 +706,102 @@ void main() {
         expect(disposeSnap.reason, equals('dispose_failed'));
         expect(disposeSnap.lastError, contains('Native dispose crashed'));
         expect(controller.isDisposed, isTrue);
+      },
+    );
+
+    // 11. Snapshot convenience getters mirror active session telemetry and update on refresh
+    test(
+      '11. snapshot convenience getters mirror active session telemetry and update on refresh',
+      () async {
+        final client = FakeStreamingPlaybackClient();
+        client.onOpen = (options) => const VGStreamingPlaybackSession(
+          pass: true,
+          phase: 'Phase4C1D1',
+          sessionId: 'sess_111',
+          textureId: 111,
+          format: VGStreamingFormatHint.hls,
+          state: VGStreamingPlaybackState.playing,
+          durationMs: 120000,
+          positionMs: 15000,
+          bufferedPositionMs: 30000,
+          bufferedPercent: 25,
+          liveOffsetMs: 1200,
+          raw: 'status=OK',
+          diagnostics: {'telemetry': 'active'},
+        );
+
+        final controller = VGStreamingPlaybackController(
+          playbackClient: client,
+        );
+
+        // Before open: safe defaults
+        expect(controller.snapshot.durationMs, equals(-1));
+        expect(controller.snapshot.positionMs, equals(0));
+        expect(controller.snapshot.bufferedPositionMs, equals(0));
+        expect(controller.snapshot.bufferedPercent, equals(0));
+        expect(controller.snapshot.liveOffsetMs, isNull);
+        expect(controller.snapshot.hasPlaybackTelemetry, isFalse);
+
+        // Open
+        final openSnapshot = await controller.open(
+          validDecision,
+          startPlayback: true,
+        );
+        expect(openSnapshot.durationMs, equals(120000));
+        expect(openSnapshot.positionMs, equals(15000));
+        expect(openSnapshot.bufferedPositionMs, equals(30000));
+        expect(openSnapshot.bufferedPercent, equals(25));
+        expect(openSnapshot.liveOffsetMs, equals(1200));
+        expect(openSnapshot.hasPlaybackTelemetry, isTrue);
+        expect(controller.snapshot.durationMs, equals(120000));
+        expect(controller.snapshot.positionMs, equals(15000));
+        expect(controller.snapshot.bufferedPositionMs, equals(30000));
+        expect(controller.snapshot.bufferedPercent, equals(25));
+        expect(controller.snapshot.liveOffsetMs, equals(1200));
+        expect(controller.snapshot.hasPlaybackTelemetry, isTrue);
+
+        // Update getStatus mock
+        client.onGetStatus = (session) => VGStreamingPlaybackSession(
+          pass: true,
+          phase: session.phase,
+          sessionId: session.sessionId,
+          textureId: session.textureId,
+          format: session.format,
+          state: session.state,
+          durationMs: 120000,
+          positionMs: 45000,
+          bufferedPositionMs: 60000,
+          bufferedPercent: 50,
+          liveOffsetMs: 800,
+          renderedFrames: 120,
+          raw: 'status=OK',
+          diagnostics: {'refresh': 'success'},
+        );
+
+        // Refresh updates snapshot-level telemetry
+        final refreshSnapshot = await controller.refresh();
+        expect(refreshSnapshot.durationMs, equals(120000));
+        expect(refreshSnapshot.positionMs, equals(45000));
+        expect(refreshSnapshot.bufferedPositionMs, equals(60000));
+        expect(refreshSnapshot.bufferedPercent, equals(50));
+        expect(refreshSnapshot.liveOffsetMs, equals(800));
+        expect(refreshSnapshot.hasPlaybackTelemetry, isTrue);
+        expect(controller.snapshot.positionMs, equals(45000));
+        expect(controller.snapshot.bufferedPositionMs, equals(60000));
+        expect(controller.snapshot.bufferedPercent, equals(50));
+        expect(controller.snapshot.liveOffsetMs, equals(800));
+
+        // Dispose clears session and reverts snapshot getters to safe defaults
+        final disposeSnapshot = await controller.dispose();
+        expect(disposeSnapshot.durationMs, equals(-1));
+        expect(disposeSnapshot.positionMs, equals(0));
+        expect(disposeSnapshot.bufferedPositionMs, equals(0));
+        expect(disposeSnapshot.bufferedPercent, equals(0));
+        expect(disposeSnapshot.liveOffsetMs, isNull);
+        expect(disposeSnapshot.hasPlaybackTelemetry, isFalse);
+        expect(controller.snapshot.durationMs, equals(-1));
+        expect(controller.snapshot.positionMs, equals(0));
+        expect(controller.snapshot.hasPlaybackTelemetry, isFalse);
       },
     );
   });

@@ -75,6 +75,24 @@ class VGStreamingPlaybackControllerSnapshot {
   int? get textureId =>
       (session != null && session!.textureId >= 0) ? session!.textureId : null;
 
+  /// Total media duration in milliseconds (-1 for live/unbounded streams or when no session).
+  int get durationMs => session?.durationMs ?? -1;
+
+  /// Current playhead position in milliseconds (0 when no session).
+  int get positionMs => session?.positionMs ?? 0;
+
+  /// Buffered duration in milliseconds ahead of current playhead (0 when no session).
+  int get bufferedPositionMs => session?.bufferedPositionMs ?? 0;
+
+  /// Look-ahead buffer fill percentage (0 to 100, 0 when no session).
+  int get bufferedPercent => session?.bufferedPercent ?? 0;
+
+  /// Current distance from live edge in milliseconds (live streams only; `null` for VOD or when no session).
+  int? get liveOffsetMs => session?.liveOffsetMs;
+
+  /// Whether playback session telemetry is available.
+  bool get hasPlaybackTelemetry => session != null;
+
   /// Returns a copy of this snapshot with updated fields.
   VGStreamingPlaybackControllerSnapshot copyWith({
     VGStreamingPlaybackControllerState? state,
