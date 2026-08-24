@@ -6,7 +6,7 @@ All public APIs are exported from `package:vanguard_media_engine/vanguard_media_
 
 ## Cached Streaming Playback All-Up Integration Recipe
 
-The package provides end-to-end composition across bounded cache prewarming, manifest preflight capability evaluation, startup decision planning, session-safe controller management, and presentation via `VGStreamingPlaybackTextureView`.
+The package provides end-to-end composition across bounded cache prewarming, manifest preflight capability evaluation, startup decision planning, session-safe controller management, presentation via `VGStreamingPlaybackTextureView`, and snapshot-level playback timing and buffer telemetry.
 
 ### Quick Start
 
@@ -83,13 +83,31 @@ Future<void> prewarmAndPlayCachedStream() async {
   // 6. Presentation via VGStreamingPlaybackTextureView
   // (e.g. VGStreamingPlaybackTextureView(snapshot: snapshot))
 
-  // 7. Control media lifecycle
+  // 7. Poll and read snapshot-level timing and buffer telemetry
+  final refreshed = await controller.refresh();
+  if (refreshed.hasPlaybackTelemetry) {
+    print(
+      'Cached playback telemetry: duration=${refreshed.durationMs}ms, '
+      'position=${refreshed.positionMs}ms, '
+      'buffered=${refreshed.bufferedPercent}% (${refreshed.bufferedPositionMs}ms ahead), '
+      'liveOffset=${refreshed.liveOffsetMs}',
+    );
+  }
+
+  // 8. Control media lifecycle
   await controller.pause();
   await controller.play();
   await controller.stop();
   await controller.dispose();
 }
 ```
+
+### Verification & Invariants
+
+- **Composition Proof**: Proves end-to-end composition across cache prewarm (`VGStreamingCacheClient`), preflight capability evaluation (`VGStreamingPreflightClient`), decision planning (`VGStreamingPlaybackDecisionPlanner`), controller facade (`VGStreamingPlaybackController`), presentation (`VGStreamingPlaybackTextureView`), and snapshot timing/buffer telemetry.
+- **Cache Hit Scope**: Proves public API composition and prewarm completion, not full ExoPlayer adaptive segment-graph cache hit or hit ratio.
+- **ABR Ownership**: Media3 runtime still owns ABR rendition selection.
+- **ConnectsApp & Platform Boundaries**: Zero ConnectsApp feed prediction wiring; iOS cache backend remains planned and frozen in UMF architecture documents.
 
 ## Streaming Playback Texture View Widget Recipe
 

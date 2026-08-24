@@ -1,5 +1,5 @@
-// Copyright (c) Connects — Vanguard Phase 4C6M.
-// Public cache prewarm -> playback controller/view all-up physical smoke.
+// Copyright (c) Connects — Vanguard Phase 4C6N.
+// Public cache prewarm -> playback controller/view all-up physical smoke with timing and buffer telemetry.
 //
 // Sequentially verifies:
 //   1. Definition of candidate streams via pure-Dart VGStreamingSourceSet and VGStreamingSourceDescriptor:
@@ -7,7 +7,7 @@
 //      - 'dash' (Shaka DASH with cache enabled)
 //      - 'll_hls' (Mux LL-HLS with requireLlHlsTags: true)
 //   2. Bounded cache prewarm planning via VGStreamingCachePrewarmPlanner:
-//      - sourceKeys: ['hls', 'll_hls'], lowLatencyPolicy: skipLowLatency, requestIdPrefix: 'phase4c6m'
+//      - sourceKeys: ['hls', 'll_hls'], lowLatencyPolicy: skipLowLatency, requestIdPrefix: 'phase4c6n'
 //      - asserts exactly 1 planned request for 'hls', 'll_hls' skipped with constraint warning
 //   3. Dispatching planned prewarm request via VGStreamingCacheClient.prewarmRequest extension:
 //      - polling getPrewarmStatus until succeeded
@@ -22,6 +22,7 @@
 //      - open(decision, startPlayback: true) allocating textureId
 //      - presentation via VGStreamingPlaybackTextureView
 //      - polling controller.refresh() until renderedFrames > 0
+//      - reading and asserting snapshot telemetry: durationMs, positionMs, bufferedPositionMs, bufferedPercent, liveOffsetMs, hasPlaybackTelemetry
 //      - pause(), optional safe seek(), play(), stop(), dispose()
 //      - asserting controller snapshot state is disposed
 //   7. Resource cleanup and teardown in finally block (controller disposal + cache clear).
@@ -30,7 +31,8 @@
 // - Imports ONLY package:vanguard_media_engine/vanguard_media_engine.dart.
 // - No direct MethodChannel or package:flutter/services.dart imports.
 // - Presentation via VGStreamingPlaybackTextureView (no direct raw Flutter Texture widget).
-// - Proof of public API composition and bounded cache prewarm, not proof that ExoPlayer subsequently reads all segments from cache.
+// - Proof of public API composition of cache prewarm, controller/view, and timing/buffer telemetry.
+// - Not proof that ExoPlayer subsequently reads all segments from cache (Media3 owns ABR / segment loading).
 
 import 'dart:async';
 import 'dart:convert';
@@ -142,7 +144,7 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
 
       final prewarmPlan = VGStreamingCachePrewarmPlanner.planForSourceSet(
         sourceSet: sourceSet,
-        requestIdPrefix: 'phase4c6m',
+        requestIdPrefix: 'phase4c6n',
         sourceKeys: const ['hls', 'll_hls'],
         maxBytes: 2 * 1024 * 1024,
         lowLatencyPolicy:
@@ -160,9 +162,9 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
         );
       }
       final prewarmReq = prewarmPlan.requests.single;
-      if (prewarmReq.requestId != 'phase4c6m_hls_0') {
+      if (prewarmReq.requestId != 'phase4c6n_hls_0') {
         throw Exception(
-          'Expected prewarm requestId "phase4c6m_hls_0", got "${prewarmReq.requestId}"',
+          'Expected prewarm requestId "phase4c6n_hls_0", got "${prewarmReq.requestId}"',
         );
       }
       if (!prewarmPlan.skippedKeys.contains('ll_hls')) {
@@ -391,12 +393,22 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
       VGStreamingPlaybackControllerSnapshot refreshSnapshot = openSnapshot;
       int renderedFrames = 0;
       int durationMs = -1;
+      int positionMs = 0;
+      int bufferedPositionMs = 0;
+      int bufferedPercent = 0;
+      int? liveOffsetMs;
+      bool hasPlaybackTelemetry = false;
 
       while (stopwatch.elapsed < const Duration(seconds: maxWaitSeconds)) {
         await Future<void>.delayed(const Duration(milliseconds: 500));
         refreshSnapshot = await controller.refresh();
         renderedFrames = refreshSnapshot.session?.renderedFrames ?? 0;
-        durationMs = refreshSnapshot.session?.durationMs ?? -1;
+        durationMs = refreshSnapshot.durationMs;
+        positionMs = refreshSnapshot.positionMs;
+        bufferedPositionMs = refreshSnapshot.bufferedPositionMs;
+        bufferedPercent = refreshSnapshot.bufferedPercent;
+        liveOffsetMs = refreshSnapshot.liveOffsetMs;
+        hasPlaybackTelemetry = refreshSnapshot.hasPlaybackTelemetry;
         if (mounted) {
           setState(() {
             _currentSnapshot = refreshSnapshot;
@@ -409,11 +421,42 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
 
       diagMap['playbackRenderedFrames'] = renderedFrames;
       diagMap['playbackDurationMs'] = durationMs;
+      diagMap['playbackPositionMs'] = positionMs;
+      diagMap['playbackBufferedPositionMs'] = bufferedPositionMs;
+      diagMap['playbackBufferedPercent'] = bufferedPercent;
+      diagMap['playbackLiveOffsetMs'] = liveOffsetMs;
+      diagMap['playbackHasTelemetry'] = hasPlaybackTelemetry;
       diagMap['playbackRefreshState'] = refreshSnapshot.state.name;
 
       if (renderedFrames <= 0) {
         throw Exception(
           'No rendered frames after ${stopwatch.elapsed.inSeconds}s (renderedFrames=$renderedFrames)',
+        );
+      }
+
+      // Sane telemetry assertions:
+      // - hasPlaybackTelemetry == true once a session exists and frames render;
+      // - durationMs >= -1;
+      // - positionMs >= 0;
+      // - bufferedPositionMs >= 0;
+      // - bufferedPercent >= 0 && bufferedPercent <= 100;
+      // - do NOT require positive duration;
+      // - do NOT require nonzero buffer;
+      // - do NOT claim full cache-hit or segment-cache playback proof.
+      final telemetryValid =
+          hasPlaybackTelemetry &&
+          durationMs >= -1 &&
+          positionMs >= 0 &&
+          bufferedPositionMs >= 0 &&
+          bufferedPercent >= 0 &&
+          bufferedPercent <= 100;
+
+      if (!telemetryValid) {
+        throw Exception(
+          'Telemetry validation failed: '
+          'hasPlaybackTelemetry=$hasPlaybackTelemetry, durationMs=$durationMs, '
+          'positionMs=$positionMs, bufferedPositionMs=$bufferedPositionMs, '
+          'bufferedPercent=$bufferedPercent, liveOffsetMs=$liveOffsetMs',
         );
       }
 
@@ -503,9 +546,14 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
       final isDisposed =
           disposeSnapshot.state == VGStreamingPlaybackControllerState.disposed;
 
-      pass = statusPass && renderedFrames > 0 && !isFailed && isDisposed;
+      pass =
+          statusPass &&
+          renderedFrames > 0 &&
+          telemetryValid &&
+          !isFailed &&
+          isDisposed;
 
-      diagMap['phase'] = 'Phase4C6M';
+      diagMap['phase'] = 'Phase4C6N';
       diagMap['pass'] = pass;
       diagMap['raw'] =
           'status=PASS;bytesCached=${finalPrewarmStatus.bytesCached};'
@@ -513,6 +561,12 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
           'resourceCount=${statusMetrics.resourceCount};'
           'selectedKey=${decision.selectedKey};'
           'renderedFrames=$renderedFrames;'
+          'durationMs=$durationMs;'
+          'positionMs=$positionMs;'
+          'bufferedPositionMs=$bufferedPositionMs;'
+          'bufferedPercent=$bufferedPercent;'
+          'liveOffsetMs=$liveOffsetMs;'
+          'hasPlaybackTelemetry=$hasPlaybackTelemetry;'
           'finalState=${disposeSnapshot.state.name}';
     } catch (error, stack) {
       // ignore: avoid_print
@@ -520,7 +574,7 @@ class _AndroidStreamingCachedPlaybackAllUpPublicApiPhysicalSmokeAppState
         'ANDROID_STREAMING_CACHED_PLAYBACK_ALL_UP_PUBLIC_API_PHYSICAL_ERROR: $error\n$stack',
       );
       diagMap['pass'] = false;
-      diagMap['phase'] = 'Phase4C6M';
+      diagMap['phase'] = 'Phase4C6N';
       diagMap['raw'] = 'status=FAIL;reason=dart_exception:$error';
       pass = false;
     } finally {
