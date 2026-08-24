@@ -402,7 +402,7 @@ void planPlaybackRecovery({
 - **Live vs. VOD Resume Logic**: For VOD streams (`isLive == false`), the planner preserves current playhead position as the resume point. For live streams, resume position remains `null` to automatically track the live edge unless an explicit override is provided.
 - **iOS Parity**: Pure Dart implementation over public models runs identically on iOS without platform code dependencies.
 
-## Public Streaming Playback Resilience Monitor (Phase 4C7AM / Phase 4C7AN)
+## Public Streaming Playback Resilience Monitor (Phase 4C7AM / Phase 4C7AN / Phase 4C7AO / Phase 4C7AP)
 
 The package exposes `VGStreamingPlaybackResilienceMonitor` as a pure Dart resilience stream monitor. It consumes a `Stream<VGStreamingPlaybackStatusSummary>` (such as from `VGStreamingPlaybackStatusPoller.summaries`), maintains a bounded chronological history, evaluates real-time health advice via `VGStreamingPlaybackHealthAdvisor`, and synthesizes host recovery plans via `VGStreamingPlaybackRecoveryPlanner` into composite resilience snapshots (`VGStreamingPlaybackResilienceSnapshot`).
 
@@ -452,6 +452,14 @@ void monitorPlaybackResilience({
   // monitor.dispose();
 }
 ```
+
+### Physical Verification & Lifecycle Boundaries (Phase 4C7AO / Phase 4C7AP)
+
+The resilience monitor is physically verified on real Android hardware (`SM-A566B` / `RRGL207K8GB` on Android 16 API 36) via `example/lib/android_streaming_resilience_monitor_public_api_physical_smoke.dart`, exercising the full composition chain:
+`VGStreamingSourceSet` -> `VGStreamingPreflightClient` -> `VGStreamingPlaybackDecisionPlanner` -> `VGStreamingPlaybackController` -> `VGStreamingPlaybackTextureView` -> `VGStreamingPlaybackStatusPoller` -> `VGStreamingPlaybackResilienceMonitor` -> `VGStreamingPlaybackHealthAdvice` + `VGStreamingPlaybackRecoveryPlan`.
+
+- **Lifecycle Decoupling & Independent Teardown**: Monitor disposal closes its output stream and cancels its input subscription without disposing or altering the underlying `VGStreamingPlaybackStatusPoller` or `VGStreamingPlaybackController`. Similarly, poller disposal does not dispose the underlying controller.
+- **Pure Advisory Invariants**: All evaluated snapshots strictly guarantee `snapshot.advisoryOnly == true`, `snapshot.playbackMutation == false`, `healthAdvice.advisoryOnly == true`, `healthAdvice.playbackMutation == false`, `recoveryPlan.advisoryOnly == true`, and `recoveryPlan.playbackMutation == false`.
 
 ### Invariants & Non-Claims
 
