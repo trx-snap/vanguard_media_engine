@@ -4,6 +4,41 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Public Streaming Codec Capability Client (Phase 4C5J / Phase 4C5K)
+
+The package exposes `VGStreamingCodecCapabilityClient` as a typed public Dart client to inspect device streaming decoder capabilities across AVC/H.264, HEVC/H.265, and AV1 before playback without raw `MethodChannel` interaction.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+Future<void> inspectDeviceCodecCapabilities() async {
+  // 1. Instantiate the streaming codec capability client
+  final client = VGStreamingCodecCapabilityClient();
+
+  // 2. Probe device video decoders
+  final report = await client.probe();
+
+  if (report.pass) {
+    print('Codec capability probe passed (SDK ${report.androidSdk})');
+    print('AVC supported: ${report.avcSupported}');
+    print('HEVC supported: ${report.hevcSupported} (Hardware: ${report.hasHardwareHevc})');
+    print('AV1 supported: ${report.av1Supported} (Hardware: ${report.hasHardwareAv1})');
+    print('Server ladder policy: ${report.serverLadderPolicy}');
+  } else {
+    print('Codec capability probe failed: ${report.raw}');
+  }
+}
+```
+
+### Guarantees, Invariants & Boundaries
+
+- **Metadata-Only Codec Inspection**: Probing queries platform decoder metadata via Android `MediaCodecList(MediaCodecList.REGULAR_CODECS)` and `MediaCodecInfo`. There is zero `MediaCodec` allocation, zero video decoding execution, zero ExoPlayer/Media3 player creation, zero network I/O, zero `Surface`/`Image`/`HardwareBuffer` allocation, and zero playback mutation.
+- **Additive Server Ladder Policy (`add_hevc_av1_renditions_but_keep_avc_fallback`)**: Server streaming ladders must remain additive: AVC/H.264 fallback is mandatory across all streams. Advanced codecs (HEVC and AV1) provide compression efficiency where supported, but baseline AVC must remain available for compatibility.
+- **Advisory / Telemetry Status for HEVC & AV1**: HEVC and AV1 capabilities are reported as advisory telemetry. Absence of HEVC/AV1 or presence of software-only decoders (e.g. `c2.android.av1-dav1d.decoder` without hardware acceleration) does NOT cause probe failure as long as baseline AVC decoder support is confirmed.
+- **iOS Parity Expectation**: The same public Dart contract (`VGStreamingCodecCapabilityClient`, `VGStreamingCodecCapabilityReport`, `VGStreamingCodecInfo`) will be backed on iOS by `AVFoundation` / `CoreMedia` / `VideoToolbox` capability queries while preserving baseline H.264 fallback. Non-Android platforms return typed unsupported reports (`phase: 'unsupported'`, `pass: false`) via `unsupported()` without crashing.
+
 ## Public Streaming Manifest Policy Validation Client (Phase 4C5H / Phase 4C5I)
 
 The package exposes `VGStreamingManifestPolicyClient` as a typed public Dart client to validate candidate HLS, DASH, and LL-HLS multivariant manifest ladders against server ladder policies before playback without raw `MethodChannel` interaction.
