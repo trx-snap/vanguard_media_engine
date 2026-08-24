@@ -4,7 +4,7 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
-## Public Streaming Playback Status Poller (Phase 4C7AC / Phase 4C7AD / Phase 4C7AE)
+## Public Streaming Playback Status Poller (Phase 4C7AC / Phase 4C7AD / Phase 4C7AE / Phase 4C7AG / Phase 4C7AH)
 
 The package exposes `VGStreamingPlaybackStatusPoller` as a pure Dart periodic polling helper over `VGStreamingPlaybackController`. It periodically refreshes controller telemetry, converts snapshots into immutable `VGStreamingPlaybackStatusSummary` objects, and emits them over a broadcast stream without busy-polling collisions.
 
@@ -73,11 +73,13 @@ class _StreamingPlayerWidgetState extends State<StreamingPlayerWidget> {
 
 ### Invariants & Non-Claims
 
+- **Protocol Neutrality Across HLS, DASH, and LL-HLS**: The exact same `VGStreamingPlaybackStatusPoller` API operates identically across HLS, DASH, and LL-HLS streams on Android. Physical verification proves polling and summary derivation are protocol-agnostic.
+- **Media3 Adaptive Engine Ownership**: AndroidX Media3 retains full ownership of underlying manifest parsing, adaptive bitrate (ABR) switching, buffering policies, network connection management, and segment loading.
 - **Controller Ownership**: `VGStreamingPlaybackStatusPoller` does NOT own or dispose the underlying `VGStreamingPlaybackController`. The poller should be stopped and disposed by the host UI widget lifecycle.
 - **Convenience Only**: The poller makes no product feed decisions, no retry policy, no ABR decisions, no caching policy, and makes no native lifecycle decisions.
 - **Cache-Read Observability**: When playback cache is enabled on the active source descriptor, status poller summaries (`VGStreamingPlaybackStatusSummary`) seamlessly convey cache-read telemetry (`playbackCacheBytesRead`, `playbackCacheSizeBytes`, `playbackCacheIgnoredCount`, `playbackCacheReadObserved`, `playbackCacheTelemetryAttached`). This provides UI/diagnostics observation only: it does not make ABR or cache policy decisions, does not perform feed prediction or prefetching algorithms, and does not apply to WebRTC/LiveKit caching.
 - **Concurrency Guard**: If a refresh tick is in flight, overlapping periodic ticks are skipped to prevent concurrent native channel calls.
-- **iOS Parity Expectation**: Because `VGStreamingPlaybackStatusPoller` is written entirely in pure Dart and operates on public controller and summary interfaces, it works automatically on iOS as soon as the iOS backend populates the matching session fields.
+- **iOS Parity & DASH Decision Boundary**: Because `VGStreamingPlaybackStatusPoller` is written entirely in pure Dart and operates on public controller and summary interfaces, it works automatically on iOS as soon as the iOS backend populates the matching session fields. DASH on iOS remains the already-deferred product/architecture decision; the Dart poller remains reusable once iOS fills session fields.
 
 ## Public Streaming Playback Status Summary Helper (Phase 4C7AA / Phase 4C7AB)
 
