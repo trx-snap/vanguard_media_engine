@@ -764,6 +764,80 @@ void coordinateStreamingResilience({
 - **Scope & Non-Claims**: Multi-protocol physical proof verifies HLS, DASH, and LL-HLS coordinator intake and advisory evaluation on Android only. In physical smoke testing where no real retry is executed, `recordHostRetryAttempted()` is deliberately not called as recording is strictly host/product behavior following real retry execution. Media3 retains sole ownership over playback and ABR. No ConnectsApp wiring, no LiveKit/WebRTC room or audio ownership, and no iOS code changes are included.
 - **iOS Parity Implication**: The pure Dart coordinator layer is shared across platforms; iOS later maps AVPlayer status into the same public layer without native code divergence, while DASH remains an explicit future iOS decision/dependency.
 
+## Public Streaming Playback Resilience Evaluation Binder (Phase 4C7BC)
+
+The package exposes `VGStreamingPlaybackResilienceBinder` as a pure Dart continuous evaluation binder. It connects an upstream stream of resilience snapshots (typically from `VGStreamingPlaybackResilienceMonitor.snapshots`) directly to a `VGStreamingPlaybackResilienceCoordinator`, emits immutable broadcast `VGStreamingPlaybackResilienceCoordinatorEvaluation` events, and exposes synchronous getters (`latest`, `isRunning`, `isDisposed`, `lastStreamError`) and control methods (`start()`, `stop()`, `dispose()`, `evaluateOnce()`).
+
+### Quick Start
+
+```dart
+import 'dart:async';
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+void bindResiliencePipeline({
+  required VGStreamingPlaybackResilienceMonitor monitor,
+  required VGStreamingPlaybackResilienceCoordinator coordinator,
+  required VGStreamingPlaybackController controller,
+  String? streamKey,
+}) {
+  // 1. Instantiate the resilience evaluation binder with optional config
+  final binder = VGStreamingPlaybackResilienceBinder(
+    snapshots: monitor.snapshots,
+    coordinator: coordinator,
+    config: VGStreamingPlaybackResilienceBinderConfig(
+      streamKey: streamKey,
+      emitLatestOnStart: true,
+    ),
+  );
+
+  // 2. Listen to broadcast evaluations stream
+  final subscription = binder.evaluations.listen((evaluation) {
+    print('Action: ${evaluation.action}');
+    print('Reasons: ${evaluation.reasons}');
+    print('Can retry now: ${evaluation.canRetryNow}');
+
+    // 3. Act on advisory decision in host UI / product controller
+    if (evaluation.action ==
+            VGStreamingPlaybackResilienceDecisionAction.scheduleRetry &&
+        evaluation.canRetryNow &&
+        evaluation.decision.playbackOptions != null) {
+      if (evaluation.shouldRecordAttemptOnHostRetry) {
+        coordinator.recordHostRetryAttempted(
+          decision: evaluation.decision,
+          streamKey: streamKey,
+        );
+      }
+      controller.open(
+        evaluation.decision.playbackOptions!,
+        startPlayback: true,
+        initialPositionMs: evaluation.decision.resumePositionMs,
+      );
+    }
+  });
+
+  // 4. Start listening to snapshot stream
+  binder.start();
+
+  // 5. Lifecycle teardown
+  // subscription.cancel();
+  // binder.dispose(); // Cancels subscription and closes evaluations stream without disposing monitor or coordinator
+}
+```
+
+### Invariants & Boundaries
+
+- **Pure Advisory Helper**: `evaluation.advisoryOnly == true` and `evaluation.playbackMutation == false`. `VGStreamingPlaybackResilienceBinder` does not execute retries, does not record retry attempts automatically, does not mutate playback, does not call `MethodChannel`, and does not read native platform state.
+- **Explicit Host Retry Recording**: The binder never calls `recordHostRetryAttempted()` on the coordinator. Attempt recording remains host/product-owned and must be called only after real host retry execution when `evaluation.shouldRecordAttemptOnHostRetry == true`.
+- **Decoupled Lifecycle & Safe Disposal**:
+  - `start()` is idempotent and subscribes to the snapshot stream if not disposed.
+  - `stop()` cancels only the upstream subscription and leaves `evaluations` stream open for manual `evaluateOnce()` calls or resumption.
+  - `dispose()` is idempotent, cancels the upstream subscription, and closes only the binder's output stream.
+  - The binder does not own, dispose, or clear the upstream monitor, poller, controller, or coordinator.
+  - Upstream snapshot stream errors are captured in `lastStreamError` without terminating or crashing the binder.
+- **Deterministic Time Injection**: Supports optional `nowProvider` (`VGStreamingPlaybackResilienceNowProvider`) for fully deterministic simulation and test clocks.
+- **Physical Verification Baseline**: No new physical proof is required for this pure Dart contract helper. It operates on top of the previously physically verified HLS/DASH/LL-HLS coordinator pipeline (`ANDROID_STREAMING_MULTI_PROTOCOL_RESILIENCE_COORDINATOR_PUBLIC_API_PHYSICAL_PASS` on Samsung `SM-A566B` / `RRGL207K8GB`, Android 16 API 36).
+- **Platform & Product Boundaries**: Media3 retains full ownership of Android playback and ABR; iOS later maps AVPlayer status into the same pure Dart advisory contracts; DASH on iOS remains a future product/technical decision; WebRTC/LiveKit bridge remains an unowned product-level adapter with no room or audio lifecycle in Vanguard; WebRTC media is never cached.
+
 ## Cached Streaming Playback All-Up Integration Recipe
 
 The package provides end-to-end composition across bounded cache prewarming, manifest preflight capability evaluation, startup decision planning, session-safe controller management, presentation via `VGStreamingPlaybackTextureView`, and snapshot-level playback timing and buffer telemetry.

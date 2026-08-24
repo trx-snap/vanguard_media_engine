@@ -131,6 +131,8 @@ export 'vg_streaming_playback_retry_journal.dart';
 export 'vg_streaming_playback_resilience_decision.dart';
 // Phase 4C7AW: public streaming playback resilience coordinator.
 export 'vg_streaming_playback_resilience_coordinator.dart';
+// Phase 4C7BC: public streaming playback resilience evaluation binder.
+export 'vg_streaming_playback_resilience_binder.dart';
 // Phase 4C3V: public RTC video diagnostics client.
 export 'vg_rtc_video_diagnostics_client.dart';
 // Phase 4C4J: public adaptive stream timeline diagnostics client.
