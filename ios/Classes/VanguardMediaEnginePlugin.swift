@@ -143,6 +143,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         return VGStreamingPlaybackCoordinator(textureRegistry: self.registrar.textures())
     }()
 
+    // ── Phase 4C8C: iOS streaming preflight advisory coordinator ──────────────
+    // Sole owner of HLS/LL-HLS manifest fetch, parsing, network-profile
+    // arbitration, and result-map construction for evaluateStreamingPreflightAdvisory.
+    // Pure diagnostic: allocates no AVPlayer, FlutterTexture, or media objects.
+    private let streamingPreflightCoordinator = VGStreamingPreflightCoordinator()
+
     // ── Phase 10-C Slice T: managed audio extraction handler ─────────────────
     // Owns the operation registry, VGAudioOnlyExporter instances, and
     // terminal/cancellation bookkeeping for beginAudioExtraction and
@@ -995,6 +1001,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         }
         if call.method == "clearPlaybackCache" {
             streamingCacheManager.clearCache(result: result)
+            return
+        }
+
+        // ── Phase 4C8C: iOS streaming preflight advisory route ────────────────
+        // One early guard; all logic lives in VGStreamingPreflightCoordinator.
+        if call.method == "evaluateStreamingPreflightAdvisory" {
+            streamingPreflightCoordinator.evaluate(args: args, result: result)
             return
         }
 
