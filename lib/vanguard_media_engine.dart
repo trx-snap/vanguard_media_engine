@@ -123,6 +123,8 @@ export 'vg_streaming_playback_health_advisor.dart';
 export 'vg_streaming_playback_recovery_plan.dart';
 // Phase 4C7AM: public streaming playback resilience monitor.
 export 'vg_streaming_playback_resilience_monitor.dart';
+// Phase 4C7AQ: public streaming playback retry budget planner.
+export 'vg_streaming_playback_retry_budget.dart';
 // Phase 4C3V: public RTC video diagnostics client.
 export 'vg_rtc_video_diagnostics_client.dart';
 // Phase 4C4J: public adaptive stream timeline diagnostics client.

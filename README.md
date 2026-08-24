@@ -469,6 +469,72 @@ The resilience monitor is physically verified on real Android hardware (`SM-A566
 - **Error Resilience & Safe Disposal**: Input stream errors are recorded in snapshot diagnostics without throwing or terminating the monitor. Disposed monitors safely ignore further emissions and can be disposed idempotently.
 - **iOS Parity**: Pure Dart implementation over public streaming models runs identically on iOS without native code dependencies.
 
+## Public Streaming Playback Retry Budget Planner (Phase 4C7AQ / Phase 4C7AR)
+
+The package exposes `VGStreamingPlaybackRetryBudgetPlanner` as a pure Dart advisory helper that bounds playback retries over a rolling time window with minimum cooldown delays to prevent infinite retry loops and runaway network usage on mobile devices over poor or degraded networks.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+void checkRetryBudget({
+  required VGStreamingPlaybackRecoveryPlan recoveryPlan,
+  required List<VGStreamingPlaybackRetryAttempt> recentAttempts,
+  String? streamKey,
+}) {
+  // 1. Construct immutable retry budget request with deterministic timestamp
+  final request = VGStreamingPlaybackRetryBudgetRequest(
+    recoveryPlan: recoveryPlan,
+    recentAttempts: recentAttempts,
+    config: const VGStreamingPlaybackRetryBudgetConfig(
+      maxAttempts: 3,
+      windowMs: 120000, // 2-minute rolling window
+      minimumDelayMs: 750, // 750 ms minimum cooldown
+      blockTerminalStop: true,
+      requirePlaybackOptionsForReopen: true,
+    ),
+    nowMs: DateTime.now().millisecondsSinceEpoch,
+    streamKey: streamKey,
+  );
+
+  // 2. Evaluate retry budget decision
+  final result = VGStreamingPlaybackRetryBudgetPlanner.evaluate(request);
+
+  // 3. Inspect typed decision and telemetry
+  print('Decision: ${result.decision}'); // allow, delay, block, notRetryable
+  print('Can Retry: ${result.canRetry}'); // true only if allow
+  print('Attempts in Window: ${result.attemptsInWindow}');
+  print('Remaining Attempts: ${result.remainingAttempts}');
+  print('Retry After: ${result.retryAfterMs}ms');
+  print('Reasons: ${result.reasons}');
+
+  // 4. Act according to host application policy
+  switch (result.decision) {
+    case VGStreamingPlaybackRetryBudgetDecision.allow:
+      // Record attempt and execute recovery plan reopening
+      break;
+    case VGStreamingPlaybackRetryBudgetDecision.delay:
+      // Schedule cooldown timer before retrying (wait result.retryAfterMs)
+      break;
+    case VGStreamingPlaybackRetryBudgetDecision.block:
+      // Budget exhausted or blocked; show user fallback UI
+      break;
+    case VGStreamingPlaybackRetryBudgetDecision.notRetryable:
+      // Plan does not support retry (terminal stop, passive wait, healthy)
+      break;
+  }
+}
+```
+
+### Invariants, Scope & Non-Claims
+
+- **Pure Advisory Helper**: `result.advisoryOnly == true` and `result.playbackMutation == false`. `VGStreamingPlaybackRetryBudgetPlanner` never executes retries, never opens/stops sessions, never creates timers/clocks, never mutates `recentAttempts`, and calls zero native platform channels.
+- **Product Ownership**: The host application owns recording `VGStreamingPlaybackRetryAttempt` instances, scheduling retry timers, and determining user recovery presentation.
+- **Deterministic & Pure**: All evaluations are synchronous functions of `nowMs`, `recentAttempts`, `config`, and `recoveryPlan`.
+- **Stream Key Isolation**: Optional `streamKey` scoping enables per-stream budget tracking across multi-stream feeds.
+- **iOS Parity**: Pure Dart implementation over public streaming models runs identically on iOS without native platform code dependencies.
+
 ## Cached Streaming Playback All-Up Integration Recipe
 
 The package provides end-to-end composition across bounded cache prewarming, manifest preflight capability evaluation, startup decision planning, session-safe controller management, presentation via `VGStreamingPlaybackTextureView`, and snapshot-level playback timing and buffer telemetry.
