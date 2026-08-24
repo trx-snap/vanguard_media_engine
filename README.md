@@ -678,6 +678,90 @@ void planResilienceDecision({
 - **Ordered Rationale Deduplication**: Reasons and warnings combine upstream recovery plan reasons, retry budget reason codes, and decision-specific rationale while preserving encounter order and eliminating duplicates.
 - **iOS Parity**: Pure Dart layer is shared across platforms; the iOS player implementation maps identical decision outputs to AVPlayer / host behaviors without native platform code dependencies.
 
+## Public Streaming Playback Resilience Coordinator (Phase 4C7AW / Phase 4C7AX)
+
+The package exposes `VGStreamingPlaybackResilienceCoordinator` as a pure Dart stateful coordinator that cohesively combines the in-memory retry attempt journal, rolling-window retry budget evaluation, and resilience decision planning into a single advisory facade.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+void coordinateStreamingResilience({
+  required VGStreamingPlaybackResilienceCoordinator coordinator,
+  required VGStreamingPlaybackResilienceSnapshot snapshot,
+  required VGStreamingPlaybackController controller,
+  String? streamKey,
+}) {
+  final nowMs = DateTime.now().millisecondsSinceEpoch;
+
+  // 1. Evaluate resilience decision (prunes expired attempts, checks budget, renders decision)
+  // Invariant: evaluate() does NOT automatically record retry attempts in the journal.
+  final evaluation = coordinator.evaluate(
+    snapshot: snapshot,
+    nowMs: nowMs,
+    streamKey: streamKey,
+  );
+
+  // 2. Dispatch host execution based on pure advisory evaluation
+  switch (evaluation.action) {
+    case VGStreamingPlaybackResilienceDecisionAction.observe:
+      // Playback healthy; continue passive status monitoring
+      break;
+
+    case VGStreamingPlaybackResilienceDecisionAction.showBuffering:
+      // Transient buffering; display loading indicator
+      break;
+
+    case VGStreamingPlaybackResilienceDecisionAction.hostActionRequired:
+      // Manual intervention required; prompt user / show manual retry UI
+      print('Host action required: ${evaluation.warnings}');
+      break;
+
+    case VGStreamingPlaybackResilienceDecisionAction.scheduleRetry:
+      if (evaluation.canRetryNow && evaluation.decision.playbackOptions != null) {
+        // Record retry attempt in coordinator journal ONLY when actually executing retry
+        if (evaluation.shouldRecordAttemptOnHostRetry) {
+          coordinator.recordHostRetryAttempted(
+            nowMs: nowMs,
+            decision: evaluation.decision,
+            streamKey: streamKey,
+          );
+        }
+        // Execute playback reopen via controller
+        controller.open(
+          evaluation.decision.playbackOptions!,
+          startPlayback: true,
+          initialPositionMs: evaluation.decision.resumePositionMs,
+        );
+      }
+      break;
+
+    case VGStreamingPlaybackResilienceDecisionAction.waitForRetryDelay:
+      // Cooldown delay active; wait retryAfterMs before retrying
+      print('Wait ${evaluation.retryAfterMs}ms before retrying');
+      break;
+
+    case VGStreamingPlaybackResilienceDecisionAction.retryBlocked:
+      // Retry budget exhausted or invalid; display error UI
+      print('Retry blocked: ${evaluation.warnings}');
+      break;
+
+    case VGStreamingPlaybackResilienceDecisionAction.stopTerminal:
+      // Unrecoverable state reached; stop playback session
+      controller.stop();
+      break;
+  }
+}
+```
+
+### Invariants & Boundaries
+
+- **Pure Advisory Coordinator**: `evaluation.advisoryOnly == true` and `evaluation.playbackMutation == false`. `VGStreamingPlaybackResilienceCoordinator` does not execute playback, call platform channels, own timers, read clocks, touch Media3/AVPlayer/WebRTC, or edit native code.
+- **Single Owned Journal**: The coordinator owns exactly one in-memory `VGStreamingPlaybackRetryJournal`. `evaluate()` performs time-bounded pruning housekeeping and evaluates budget constraints without mutating attempt history.
+- **Explicit Host Recording**: `recordHostRetryAttempted()` is invoked strictly by the host application only after retry/open is initiated, recording an attempt when `decision.shouldRecordAttemptOnHostRetry == true`.
+- **iOS Parity**: Because `VGStreamingPlaybackResilienceCoordinator` is implemented in pure Dart, it executes identically on iOS without native code dependencies. Concrete LiveKit/WebRTC bridge remains product-level/future adapter with no room or audio ownership.
+
 ## Cached Streaming Playback All-Up Integration Recipe
 
 The package provides end-to-end composition across bounded cache prewarming, manifest preflight capability evaluation, startup decision planning, session-safe controller management, presentation via `VGStreamingPlaybackTextureView`, and snapshot-level playback timing and buffer telemetry.
