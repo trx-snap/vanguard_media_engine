@@ -121,7 +121,7 @@ class _AndroidStreamingCodecCapabilityPublicApiPhysicalSmokeAppState
     print(
       pass
           ? 'ANDROID_STREAMING_CODEC_CAPABILITY_PUBLIC_API_PHYSICAL_PASS'
-          : 'ANDROID_STREAMING_CODEC_CAPABILITY_PHYSICAL_FAIL',
+          : 'ANDROID_STREAMING_CODEC_CAPABILITY_PUBLIC_API_PHYSICAL_FAIL',
     );
 
     if (mounted) {
