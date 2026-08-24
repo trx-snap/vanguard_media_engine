@@ -117,6 +117,8 @@ export 'vg_streaming_playback_view.dart';
 export 'vg_streaming_playback_status_summary.dart';
 // Phase 4C7AC: public streaming playback status poller.
 export 'vg_streaming_playback_status_poller.dart';
+// Phase 4C7AI: public streaming playback health advisor.
+export 'vg_streaming_playback_health_advisor.dart';
 // Phase 4C3V: public RTC video diagnostics client.
 export 'vg_rtc_video_diagnostics_client.dart';
 // Phase 4C4J: public adaptive stream timeline diagnostics client.

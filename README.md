@@ -305,6 +305,52 @@ if (summary.playbackCacheReadObserved) {
 - **Defensive Telemetry Clamping**: Out-of-bounds metrics (negative positions, overflow percentages, negative cache byte counters) are defensively sanitized and clamped to their valid ranges.
 - **iOS Parity Expectation**: Because `VGStreamingPlaybackStatusSummary` is written entirely in pure Dart and operates on `VGStreamingPlaybackSession` / `VGStreamingPlaybackControllerSnapshot`, the exact same summary helper works automatically on iOS as soon as the iOS backend populates the matching session fields.
 
+## Public Streaming Playback Health Advisor (Phase 4C7AI / Phase 4C7AJ)
+
+The package exposes `VGStreamingPlaybackHealthAdvisor` as a pure Dart advisory helper that combines `VGStreamingPlaybackStatusSummary` streams, historical buffer samples, and optional `VGStreamingPreflightReport` preflight results to provide actionable, typed health guidance (`VGStreamingPlaybackHealthAdvice`) for mobile applications operating over poor, choppy, or degraded networks.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+void checkPlaybackHealth({
+  required VGStreamingPlaybackStatusSummary currentSummary,
+  required List<VGStreamingPlaybackStatusSummary> recentSummaries,
+  VGStreamingPreflightReport? preflightReport,
+}) {
+  // 1. Construct immutable health advisor request
+  final request = VGStreamingPlaybackHealthAdvisorRequest(
+    current: currentSummary,
+    recent: recentSummaries,
+    preflightReport: preflightReport,
+    currentNetworkProfile: VGStreamingNetworkProfile.auto,
+    lowBufferPercentThreshold: 15,
+    lowBufferMsThreshold: 2000,
+    repeatedBufferingCountThreshold: 2,
+    stalledPositionCountThreshold: 3,
+  );
+
+  // 2. Evaluate health advisory
+  final advice = VGStreamingPlaybackHealthAdvisor.evaluate(request);
+
+  // 3. Act on typed guidance in UI or product policy
+  print('Severity: ${advice.severity}');                 // healthy, watch, degraded, stalled, terminal
+  print('Recommended Action: ${advice.recommendedAction}'); // keepCurrentProfile, preferConstrainedProfile, leaveLowLatency, waitForBuffer, retryPlayback, doNotRetryTerminal
+  print('Recommended Profile: ${advice.recommendedNetworkProfile}'); // auto, stable, constrained, lowLatency
+  print('Should Leave Low Latency: ${advice.shouldLeaveLowLatency}');
+  print('Should Retry: ${advice.shouldRetry}');
+  print('Reasons: ${advice.reasons}');
+}
+```
+
+### Invariants, Scope & Network Policy Guidance
+
+- **UI & Product Policy Only**: `VGStreamingPlaybackHealthAdvisor` is strictly a pure Dart diagnostic and decision helper. It does not own the player, mutate playback, reopen streams, touch the cache substrate, force rendition tracks, or control product feed ranking.
+- **Media3 Owns ABR**: AndroidX Media3 / ExoPlayer remains the authoritative ABR and playback engine. The advisor provides high-level network profile hints (`VGStreamingNetworkProfile`) and UI recommendations rather than manipulating individual segment requests.
+- **Poor-Network Strategy**: On rough, high-jitter, or bandwidth-constrained mobile networks, applications should favor standard HLS/DASH streams with `VGStreamingNetworkProfile.constrained` over Apple LL-HLS (`lowLatency`), which operates with shallow buffer depths and higher rebuffering risk, unless explicit low-latency live interaction is strictly required by the product.
+- **iOS Parity Expectation**: Because `VGStreamingPlaybackHealthAdvisor` is written in pure Dart and operates on public summary and preflight data structures, it behaves identically across platforms without native code dependencies.
+
 ## Cached Streaming Playback All-Up Integration Recipe
 
 The package provides end-to-end composition across bounded cache prewarming, manifest preflight capability evaluation, startup decision planning, session-safe controller management, presentation via `VGStreamingPlaybackTextureView`, and snapshot-level playback timing and buffer telemetry.
