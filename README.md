@@ -4,6 +4,69 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Public Streaming Compatibility Decision Client (Phase 4C5N / Phase 4C5O)
+
+The package exposes `VGStreamingCompatibilityDecisionClient` as a typed public Dart client to evaluate compatibility decisions combining device video decoder capabilities (AVC/HEVC/AV1) with candidate streaming manifest ladders (HLS/DASH/LL-HLS) before playback without raw `MethodChannel` interaction.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+Future<void> evaluateStreamCompatibility() async {
+  // 1. Instantiate the streaming compatibility decision client
+  final client = VGStreamingCompatibilityDecisionClient();
+
+  // 2. Prepare candidate streaming manifest specifications
+  final request = VGStreamingCompatibilityDecisionRequest(
+    manifests: [
+      VGStreamingManifestSpec(
+        key: 'hls_stream',
+        uri: Uri.parse('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8'),
+        formatHint: VGStreamingFormatHint.hls,
+        requireAdaptiveLadder: true,
+        requireAvcFallback: true,
+      ),
+      VGStreamingManifestSpec(
+        key: 'dash_stream',
+        uri: Uri.parse(
+          'https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd',
+        ),
+        formatHint: VGStreamingFormatHint.dash,
+        requireAdaptiveLadder: true,
+        requireAvcFallback: true,
+      ),
+    ],
+  );
+
+  // 3. Evaluate compatibility decisions against real device codec capabilities
+  final report = await client.evaluate(request);
+
+  if (report.pass) {
+    print('Compatibility decision passed (total reports: ${report.totalReports})');
+    print('Codec probe pass: ${report.codecProbePass}, AVC supported: ${report.avcSupported}');
+    print('Server ladder policy: ${report.serverLadderPolicy}');
+    if (report.hasDeviceWarnings) {
+      print('Device warnings: ${report.deviceWarnings}');
+    }
+
+    for (final entry in report.reports) {
+      print('Stream [${entry.key}]: decision=${entry.decision}, preferred=${entry.preferredCodecFamily}, fallback=${entry.fallbackCodecFamily}');
+      print('Safe codecs: ${entry.safeCodecFamilies}, renditions=${entry.renditionCount}, bitrate range=${entry.lowestBandwidth}..${entry.highestBandwidth} bps');
+    }
+  } else {
+    print('Compatibility evaluation failed: ${report.raw}');
+  }
+}
+```
+
+### Guarantees, Invariants & Boundaries
+
+- **Pure Diagnostic Compatibility Brain**: Combines device codec capability probing (`AdaptiveStreamingCodecCapabilityProbe`) with manifest ladder policy validation (`AdaptiveStreamingManifestPolicyValidator`) into safe, deterministic decisions (`prefer_av1_hardware`, `prefer_hevc_hardware`, `prefer_avc_fallback`, `blocked_*`). There is zero `ExoPlayer`/Media3 player allocation, zero `MediaCodec` decoding, zero `Surface`/`ImageReader`/`HardwareBuffer` allocation, and zero playback mutation.
+- **Additive Server Ladder Policy (`add_hevc_av1_renditions_but_keep_avc_fallback`)**: Multi-codec streaming ladders must maintain an AVC/H.264 fallback rendition. While HEVC and AV1 renditions provide compression efficiency on supported devices, baseline AVC must remain present so older devices and iOS mirrors do not fail.
+- **Advisory Only — Zero Track Selection / ABR Forcing**: The decisions produced by `VGStreamingCompatibilityDecisionClient` are diagnostic and advisory only. They do NOT force Media3 track selection, ABR rendition switching, playback caching, or product feed policies.
+- **iOS Parity Expectation & DASH Decision Boundary**: The same public Dart contract (`VGStreamingCompatibilityDecisionClient`, `VGStreamingCompatibilityDecisionRequest`, `VGStreamingCompatibilityDecisionReport`, `VGStreamingCompatibilityDecisionEntry`) will be backed on iOS by AVFoundation/CoreMedia codec capabilities combined with HLS manifest ladders while preserving mandatory AVC fallback; DASH on iOS remains the already-deferred architecture/product decision. Non-Android platforms return typed unsupported reports (`phase: 'unsupported'`, `pass: false`) via `unsupported()` without crashing.
+
 ## Public Streaming Manifest Rendition Diagnostics Client (Phase 4C5L / Phase 4C5M)
 
 The package exposes `VGStreamingManifestRenditionClient` as a typed public Dart client to inspect canonical HLS, DASH, and LL-HLS manifest rendition ladders and verify server ladder policies before playback without raw `MethodChannel` interaction.

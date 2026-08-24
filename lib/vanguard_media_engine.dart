@@ -127,6 +127,8 @@ export 'vg_streaming_manifest_policy_client.dart';
 export 'vg_streaming_codec_capability_client.dart';
 // Phase 4C5L: public streaming manifest rendition diagnostics client.
 export 'vg_streaming_manifest_rendition_client.dart';
+// Phase 4C5N: public streaming compatibility decision client.
+export 'vg_streaming_compatibility_decision_client.dart';
 
 const String _libName = 'vanguard_media_engine';
 
