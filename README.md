@@ -1547,6 +1547,59 @@ Future<void> planAndPrewarmStreams() async {
 }
 ```
 
+## Streaming Cache Prewarm Priority & Eviction Planner (Phase 4C6R)
+
+The package exposes `VGStreamingCachePriorityPlanner` to arbitrate multiple candidate prewarm requests against priority levels, weights, explicit low-latency flags, byte budgets, and cache backend status. It produces an admitted request list, dropped candidate diagnostics, warnings, and non-mutating advisory eviction recommendations.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+void planPrioritizedPrewarm() {
+  final candidate1 = VGStreamingCachePrewarmCandidate(
+    request: VGPlaybackPrewarmRequest(
+      requestId: 'feed_hero_0',
+      uri: Uri.parse('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8'),
+      maxBytes: 1024 * 1024,
+    ),
+    priority: VGStreamingCachePrewarmPriority.urgent,
+    weight: 2.0,
+  );
+
+  final candidate2 = VGStreamingCachePrewarmCandidate(
+    request: VGPlaybackPrewarmRequest(
+      requestId: 'feed_next_1',
+      uri: Uri.parse('https://stream.mux.com/v69RSHhFelSm4701snP22dYz2jICy4E4FUyk02rW4gxRM.m3u8'),
+      maxBytes: 512 * 1024,
+    ),
+    priority: VGStreamingCachePrewarmPriority.normal,
+    weight: 1.0,
+    isLowLatency: true,
+  );
+
+  final priorityPlan = VGStreamingCachePriorityPlanner.plan(
+    candidates: [candidate1, candidate2],
+    maxTotalBytesBudget: 1536 * 1024,
+    allowLowLatency: false,
+  );
+
+  print('Admitted requests: ${priorityPlan.admittedRequests.length}');
+  print('Dropped candidates: ${priorityPlan.droppedCandidates.length}');
+  if (priorityPlan.evictionAdvisory != null) {
+    print('Advisory eviction: ${priorityPlan.evictionAdvisory!.recommendedBytesToFree} bytes to free');
+  }
+}
+```
+
+### Ordering, Drops & Invariants
+
+- **Deterministic Ordering**: Sorts candidates by `priority` rank descending (`urgent` > `high` > `normal` > `low`), `weight` descending, then original submission index.
+- **Deduplication**: Duplicate request IDs retain the strongest candidate; weaker duplicates are dropped with `duplicate_request_id:<id>`.
+- **Drop Reasons**: Dropped candidates report typed reason tags such as `cache_disabled:<requestId>`, `low_latency_cache_constrained:<requestId>`, `cache_status_disabled`, `cache_unavailable`, or `budget_exceeded`.
+- **Advisory Eviction Only**: If current cache space plus admitted bytes exceeds `maxCacheBytes`, `VGStreamingCacheEvictionAdvisory` recommends bytes to free. The planner is a pure Dart contract and **never** calls `clear`, deletes files, or evicts native resources.
+- **Boundaries**: Pure Dart contract helper; no `MethodChannel`/native calls, no cache I/O, no playback mutation, no ABR forcing, and no ConnectsApp feed policy ownership.
+
 ## Streaming Cache API
 
 The package exposes `VGStreamingCacheClient` to manage media prewarming and caching for streaming video/audio playback.
