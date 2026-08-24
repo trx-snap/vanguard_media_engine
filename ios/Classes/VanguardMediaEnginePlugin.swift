@@ -127,6 +127,22 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // Plugin is a thin router only — no cache or lifecycle logic lives here.
     private let streamingCacheManager = VGStreamingCacheManager.shared
 
+    // ── Phase 4C8A: iOS streaming playback coordinator ────────────────────────
+    // Owns all AVPlayer HLS/LL-HLS session state and Flutter texture registration
+    // for the seven public VGStreamingPlaybackClient routes.
+    // Lazy so that `registrar` (set in register(with:)) is available at first use.
+    // P1-A: does NOT interact with VanguardEngineMode or switchToMode — AVPlayer
+    // playback does not contend for camera/editor/export encoder ownership.
+    //
+    // _streamingPlaybackCoordinatorCreated: set to true the first time the lazy
+    // property is accessed, so that detachFromEngine can call disposeAll without
+    // force-initialising the coordinator merely to tear it down.
+    private var _streamingPlaybackCoordinatorCreated = false
+    private lazy var streamingPlaybackCoordinator: VGStreamingPlaybackCoordinator = {
+        _streamingPlaybackCoordinatorCreated = true
+        return VGStreamingPlaybackCoordinator(textureRegistry: self.registrar.textures())
+    }()
+
     // ── Phase 10-C Slice T: managed audio extraction handler ─────────────────
     // Owns the operation registry, VGAudioOnlyExporter instances, and
     // terminal/cancellation bookkeeping for beginAudioExtraction and
@@ -403,6 +419,21 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     private func switchToMode(_ mode: VanguardEngineMode) {
         teardownCurrentMode()
         currentMode = mode
+    }
+
+    // ─── Plugin detach lifecycle ───────────────────────────────────────────────
+
+    /// Called by Flutter when the plugin is detached from the engine (e.g. hot
+    /// restart, engine shutdown, or explicit detach).  Tears down the streaming
+    /// playback coordinator — invalidating all CADisplayLinks, KVO observers, and
+    /// registered Flutter textures — but only if the coordinator was ever lazily
+    /// initialised.  Does NOT instantiate the coordinator if it was never used.
+    /// Does NOT interact with VanguardEngineMode, switchToMode, AVAudioSession,
+    /// LiveKit, WebRTC, cache state, or any other unrelated engine state.
+    public func detachFromEngine(for registrar: FlutterPluginRegistrar) {
+        if _streamingPlaybackCoordinatorCreated {
+            streamingPlaybackCoordinator.disposeAll()
+        }
     }
 
     // Phase 7 Stage 7.5C: shared compositor init + runtime prepare helper.
@@ -964,6 +995,39 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         }
         if call.method == "clearPlaybackCache" {
             streamingCacheManager.clearCache(result: result)
+            return
+        }
+
+        // ── Phase 4C8A: iOS streaming playback routes ─────────────────────────
+        // Seven early guards forwarded to VGStreamingPlaybackCoordinator.
+        // Mirrors the Phase 4C6H cache routing pattern above (P1-B compliant).
+        // P1-A: no VanguardEngineMode or switchToMode interaction.
+        if call.method == "createAndroidDagPhase4C1D1StreamingPlayback" {
+            streamingPlaybackCoordinator.create(args: args, result: result)
+            return
+        }
+        if call.method == "playAndroidDagPhase4C1D1StreamingPlayback" {
+            streamingPlaybackCoordinator.play(args: args, result: result)
+            return
+        }
+        if call.method == "pauseAndroidDagPhase4C1D1StreamingPlayback" {
+            streamingPlaybackCoordinator.pause(args: args, result: result)
+            return
+        }
+        if call.method == "seekAndroidDagPhase4C1D1StreamingPlayback" {
+            streamingPlaybackCoordinator.seek(args: args, result: result)
+            return
+        }
+        if call.method == "stopAndroidDagPhase4C1D1StreamingPlayback" {
+            streamingPlaybackCoordinator.stop(args: args, result: result)
+            return
+        }
+        if call.method == "diagnoseAndroidDagPhase4C1D1StreamingPlayback" {
+            streamingPlaybackCoordinator.diagnose(args: args, result: result)
+            return
+        }
+        if call.method == "disposeAndroidDagPhase4C1D1StreamingPlayback" {
+            streamingPlaybackCoordinator.dispose(args: args, result: result)
             return
         }
 
