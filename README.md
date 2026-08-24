@@ -510,14 +510,26 @@ session = await client.pause(session);
 session = await client.play(session);
 session = await client.seek(session, 15000); // Seek to 15s
 
-// 5. Query playback diagnostics and status
+// 5. Query playback diagnostics, timing, and buffer status
 session = await client.getStatus(session);
-print('State: ${session.state}, Position: ${session.positionMs}ms / ${session.durationMs}ms');
+print('State: ${session.state}, Position: ${session.positionMs}ms / ${session.durationMs}ms, '
+      'Buffered: ${session.bufferedPositionMs}ms (${session.bufferedPercent}%), LiveOffset: ${session.liveOffsetMs}ms');
 
 // 6. Stop and release native resources
 session = await client.stop(session);
 await client.dispose(session);
 ```
+
+### Playback Timing & Buffer Telemetry (Phases 4C7W, 4C7X)
+
+App integrators can read typed stream timing and buffer metrics directly from `VGStreamingPlaybackSession`:
+- `durationMs`: Total stream duration in milliseconds (`-1` for live/unbounded streams; normalized from Media3 `C.TIME_UNSET`).
+- `positionMs`: Current playhead position in milliseconds.
+- `bufferedPositionMs`: Look-ahead buffered duration in milliseconds ahead of the playhead.
+- `bufferedPercent`: 0–100 percentage of the look-ahead buffer filled.
+- `liveOffsetMs`: Distance from live edge in milliseconds (`null` for VOD).
+
+These fields are populated defensively via `client.getStatus(session)` and state transition responses (`open`, `play`, `pause`, `seek`, `stop`) without requiring raw `MethodChannel` access.
 
 ### Supported Formats
 
@@ -529,7 +541,7 @@ await client.dispose(session);
 - **No Direct Channel Access**: Do not call raw `MethodChannel` from ConnectsApp; always use `VGStreamingPlaybackClient`.
 - **Decoupled Cache Policy**: Direct playback should not be blocked by cache/prewarm policy or storage guards.
 - **Scope Exclusion**: WebRTC and LiveKit interactive rooms and room audio are outside this HTTP playback API.
-- **Physical Proof Status**: The current public physical smoke target exists, but physical proof is pending device visibility.
+- **Physical Proof Status**: Verified on physical hardware via `android_streaming_playback_public_api_physical_smoke.dart`.
 
 ## Streaming Preflight Advisory API
 

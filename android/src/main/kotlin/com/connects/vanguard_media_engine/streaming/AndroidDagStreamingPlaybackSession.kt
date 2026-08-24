@@ -78,6 +78,43 @@ class AndroidDagStreamingPlaybackSession(
     private var lastRenderedPtsUs: Long = 0L
     private var lastError: String? = null
 
+    // Phase 4C7W: Stream playback timing and buffer telemetry fields.
+    private var currentDurationMs: Long = -1L
+    private var currentPositionMs: Long = 0L
+    private var currentBufferedPercent: Int = 0
+    private var currentBufferedPositionMs: Long = 0L
+    private var currentLiveOffsetMs: Long? = null
+
+    /**
+     * Updates playback timing and buffer telemetry from adapter state transitions or buffering callbacks.
+     * Diagnostic-only; does not alter native rendering or ABR behavior.
+     */
+    private fun recordPlaybackTelemetry(
+        positionMs: Long? = null,
+        durationMs: Long? = null,
+        bufferedPercent: Int? = null,
+    ) {
+        synchronized(renderLock) {
+            if (positionMs != null && positionMs >= 0L) {
+                currentPositionMs = positionMs
+            }
+            if (durationMs != null) {
+                currentDurationMs = if (durationMs < 0L) -1L else durationMs
+            }
+            if (bufferedPercent != null) {
+                currentBufferedPercent = bufferedPercent.coerceIn(0, 100)
+            }
+            if (currentDurationMs > 0L) {
+                val bufferedAbsolutePositionMs = (currentDurationMs * currentBufferedPercent) / 100L
+                currentBufferedPositionMs = (bufferedAbsolutePositionMs - currentPositionMs)
+                    .coerceAtLeast(0L)
+                    .coerceAtMost(currentDurationMs)
+            } else {
+                currentBufferedPositionMs = 0L
+            }
+        }
+    }
+
     /** Prepares adaptive streaming playback and native True-DAG rendering pipeline. */
     fun prepare(onResult: (Map<String, Any?>) -> Unit) {
         if (disposed.get()) {
@@ -151,18 +188,53 @@ class AndroidDagStreamingPlaybackSession(
                 // Anchor needed: first decoded frame rebases to actual stream-start PTS.
                 adaptiveTimelineNeedsFrameAnchor = true
 
+                streamConfig.startPositionMs?.let { startMs ->
+                    if (startMs > 0L) {
+                        recordPlaybackTelemetry(positionMs = startMs)
+                    }
+                }
+
                 val playbackListener = object : HttpAdaptivePlaybackListener {
                     override fun onStateChanged(newState: HttpAdaptivePlaybackState) {
                         if (disposed.get() || surfaceLost.get()) return
                         when (newState) {
                             is HttpAdaptivePlaybackState.Idle -> state = AndroidDagPlaybackState.Idle
                             is HttpAdaptivePlaybackState.Preparing -> state = AndroidDagPlaybackState.Preparing
-                            is HttpAdaptivePlaybackState.Ready -> state = AndroidDagPlaybackState.Prepared
-                            is HttpAdaptivePlaybackState.Playing -> state = AndroidDagPlaybackState.Playing
-                            is HttpAdaptivePlaybackState.Paused -> state = AndroidDagPlaybackState.Paused
-                            is HttpAdaptivePlaybackState.Buffering -> if (state == AndroidDagPlaybackState.Preparing) state = AndroidDagPlaybackState.Preparing
-                            is HttpAdaptivePlaybackState.Seeking -> state = AndroidDagPlaybackState.Seeking
-                            is HttpAdaptivePlaybackState.Ended -> state = AndroidDagPlaybackState.Completed
+                            is HttpAdaptivePlaybackState.Ready -> {
+                                recordPlaybackTelemetry(durationMs = newState.durationMs)
+                                state = AndroidDagPlaybackState.Prepared
+                            }
+                            is HttpAdaptivePlaybackState.Playing -> {
+                                recordPlaybackTelemetry(
+                                    positionMs = newState.positionMs,
+                                    durationMs = newState.durationMs,
+                                    bufferedPercent = newState.bufferedPercent,
+                                )
+                                state = AndroidDagPlaybackState.Playing
+                            }
+                            is HttpAdaptivePlaybackState.Paused -> {
+                                recordPlaybackTelemetry(
+                                    positionMs = newState.positionMs,
+                                    durationMs = newState.durationMs,
+                                )
+                                state = AndroidDagPlaybackState.Paused
+                            }
+                            is HttpAdaptivePlaybackState.Buffering -> {
+                                recordPlaybackTelemetry(bufferedPercent = newState.bufferedPercent)
+                                if (state == AndroidDagPlaybackState.Preparing) state = AndroidDagPlaybackState.Preparing
+                            }
+                            is HttpAdaptivePlaybackState.Seeking -> {
+                                recordPlaybackTelemetry(positionMs = newState.targetPositionMs)
+                                state = AndroidDagPlaybackState.Seeking
+                            }
+                            is HttpAdaptivePlaybackState.Ended -> {
+                                recordPlaybackTelemetry(
+                                    positionMs = if (newState.durationMs > 0L) newState.durationMs else null,
+                                    durationMs = newState.durationMs,
+                                    bufferedPercent = 100,
+                                )
+                                state = AndroidDagPlaybackState.Completed
+                            }
                             is HttpAdaptivePlaybackState.Failed -> {
                                 failAndDestroyNativeSession("adapter_error:${newState.errorCode}:${newState.message}")
                             }
@@ -177,7 +249,9 @@ class AndroidDagStreamingPlaybackSession(
                         displayWidth: Int,
                         displayHeight: Int,
                     ) = handleVideoSizeChanged(width, height, rotationDegrees, displayWidth, displayHeight)
-                    override fun onBufferingProgress(bufferedPercent: Int) {}
+                    override fun onBufferingProgress(bufferedPercent: Int) {
+                        recordPlaybackTelemetry(bufferedPercent = bufferedPercent)
+                    }
                     override fun onPlaybackError(errorCode: Int, message: String) {
                         failAndDestroyNativeSession("playback_error:$errorCode:$message")
                     }
@@ -226,6 +300,7 @@ class AndroidDagStreamingPlaybackSession(
         if (surfaceLost.get() || state == AndroidDagPlaybackState.SurfaceLost) return onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=surface_lost"))
         val ad = adapter ?: return onResult(diagnosticMap(pass = false, raw = "status=FAIL;reason=adapter_null"))
         state = AndroidDagPlaybackState.Seeking
+        recordPlaybackTelemetry(positionMs = positionMs)
         synchronized(renderLock) {
             val sid = sessionId
             if (sid != null) {
@@ -281,6 +356,11 @@ class AndroidDagStreamingPlaybackSession(
             "textureId" to surfaceProducer.id(),
             "sessionId" to sessionId,
             "generationId" to generationId,
+            "durationMs" to currentDurationMs,
+            "positionMs" to currentPositionMs,
+            "bufferedPositionMs" to currentBufferedPositionMs,
+            "bufferedPercent" to currentBufferedPercent,
+            "liveOffsetMs" to currentLiveOffsetMs,
             "width" to currentDisplayWidth,
             "height" to currentDisplayHeight,
             "videoWidth" to currentWidth,
@@ -605,6 +685,11 @@ class AndroidDagStreamingPlaybackSession(
             "textureId" to surfaceProducer.id(),
             "sessionId" to sessionId,
             "generationId" to generationId,
+            "durationMs" to currentDurationMs,
+            "positionMs" to currentPositionMs,
+            "bufferedPositionMs" to currentBufferedPositionMs,
+            "bufferedPercent" to currentBufferedPercent,
+            "liveOffsetMs" to currentLiveOffsetMs,
             "width" to currentDisplayWidth,
             "height" to currentDisplayHeight,
             "videoWidth" to currentWidth,

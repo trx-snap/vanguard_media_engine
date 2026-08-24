@@ -129,6 +129,12 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
       int rawWidth = 0;
       int rawHeight = 0;
       bool orientationMetadataPass = false;
+      int durationMs = -1;
+      int positionMs = 0;
+      int bufferedPositionMs = 0;
+      int bufferedPercent = 0;
+      int? liveOffsetMs;
+      bool timingBufferPass = false;
 
       try {
         if (mounted) {
@@ -350,6 +356,67 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
           );
         }
 
+        // Timing and buffer telemetry assertions (Phases 4C7W/4C7X)
+        durationMs = status.durationMs;
+        positionMs = status.positionMs;
+        bufferedPositionMs = status.bufferedPositionMs;
+        bufferedPercent = status.bufferedPercent;
+        liveOffsetMs = status.liveOffsetMs;
+
+        final hasDurationKey = diagMap.containsKey('durationMs');
+        final hasPositionKey = diagMap.containsKey('positionMs');
+        final hasBufferedPositionKey = diagMap.containsKey(
+          'bufferedPositionMs',
+        );
+        final hasBufferedPercentKey = diagMap.containsKey('bufferedPercent');
+        final hasLiveOffsetKey = diagMap.containsKey('liveOffsetMs');
+
+        timingBufferPass = true;
+        if (!hasDurationKey ||
+            !hasPositionKey ||
+            !hasBufferedPositionKey ||
+            !hasBufferedPercentKey ||
+            !hasLiveOffsetKey) {
+          timingBufferPass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_STREAMING_PLAYBACK_PUBLIC_API_${testCase.key.toUpperCase()}_TIMING_BUFFER_FAIL:'
+            ' missing timing/buffer keys (durationMs=$hasDurationKey, positionMs=$hasPositionKey, bufferedPositionMs=$hasBufferedPositionKey, bufferedPercent=$hasBufferedPercentKey, liveOffsetMs=$hasLiveOffsetKey)',
+          );
+        }
+        if (durationMs < -1) {
+          timingBufferPass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_STREAMING_PLAYBACK_PUBLIC_API_${testCase.key.toUpperCase()}_TIMING_BUFFER_FAIL:'
+            ' invalid durationMs=$durationMs (< -1)',
+          );
+        }
+        if (positionMs < 0) {
+          timingBufferPass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_STREAMING_PLAYBACK_PUBLIC_API_${testCase.key.toUpperCase()}_TIMING_BUFFER_FAIL:'
+            ' invalid positionMs=$positionMs (< 0)',
+          );
+        }
+        if (bufferedPositionMs < 0) {
+          timingBufferPass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_STREAMING_PLAYBACK_PUBLIC_API_${testCase.key.toUpperCase()}_TIMING_BUFFER_FAIL:'
+            ' invalid bufferedPositionMs=$bufferedPositionMs (< 0)',
+          );
+        }
+        if (bufferedPercent < 0 || bufferedPercent > 100) {
+          timingBufferPass = false;
+          // ignore: avoid_print
+          print(
+            'ANDROID_STREAMING_PLAYBACK_PUBLIC_API_${testCase.key.toUpperCase()}_TIMING_BUFFER_FAIL:'
+            ' invalid bufferedPercent=$bufferedPercent (not in 0..100)',
+          );
+        }
+
         // 5. Assert pass criteria
         casePass =
             statusPass &&
@@ -358,7 +425,8 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
             !isFailed &&
             timelinePass &&
             networkProfilePass &&
-            orientationMetadataPass;
+            orientationMetadataPass &&
+            timingBufferPass;
       } catch (error, stack) {
         // ignore: avoid_print
         print(
@@ -393,6 +461,12 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
         'renderedFrames': renderedFrames,
         'state': stateStr,
         'surfaceLost': surfaceLost,
+        'durationMs': durationMs,
+        'positionMs': positionMs,
+        'bufferedPositionMs': bufferedPositionMs,
+        'bufferedPercent': bufferedPercent,
+        'liveOffsetMs': liveOffsetMs,
+        'timingBufferPass': timingBufferPass,
         'rotationDegrees': rotationDegrees,
         'displayWidth': displayWidth,
         'displayHeight': displayHeight,
@@ -442,6 +516,18 @@ class _AndroidStreamingPlaybackPublicApiPhysicalSmokeAppState
       'hlsRenderedFrames': results['hls']?['renderedFrames'] ?? 0,
       'dashRenderedFrames': results['dash']?['renderedFrames'] ?? 0,
       'llHlsRenderedFrames': results['llHls']?['renderedFrames'] ?? 0,
+      'hlsDurationMs': results['hls']?['durationMs'],
+      'hlsPositionMs': results['hls']?['positionMs'],
+      'hlsBufferedPercent': results['hls']?['bufferedPercent'],
+      'hlsBufferedPositionMs': results['hls']?['bufferedPositionMs'],
+      'dashDurationMs': results['dash']?['durationMs'],
+      'dashPositionMs': results['dash']?['positionMs'],
+      'dashBufferedPercent': results['dash']?['bufferedPercent'],
+      'dashBufferedPositionMs': results['dash']?['bufferedPositionMs'],
+      'llHlsDurationMs': results['llHls']?['durationMs'],
+      'llHlsPositionMs': results['llHls']?['positionMs'],
+      'llHlsBufferedPercent': results['llHls']?['bufferedPercent'],
+      'llHlsBufferedPositionMs': results['llHls']?['bufferedPositionMs'],
       'hlsRotationDegrees': results['hls']?['rotationDegrees'] ?? 0,
       'dashRotationDegrees': results['dash']?['rotationDegrees'] ?? 0,
       'llHlsRotationDegrees': results['llHls']?['rotationDegrees'] ?? 0,

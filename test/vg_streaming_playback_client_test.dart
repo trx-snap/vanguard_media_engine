@@ -430,6 +430,7 @@ void main() {
           'durationMs': 60000,
           'positionMs': 12000,
           'bufferedPositionMs': 18000,
+          'bufferedPercent': 75,
           'liveOffsetMs': 1500,
           'videoWidth': 1280,
           'videoHeight': 720,
@@ -449,6 +450,7 @@ void main() {
         expect(session.durationMs, equals(60000));
         expect(session.positionMs, equals(12000));
         expect(session.bufferedPositionMs, equals(18000));
+        expect(session.bufferedPercent, equals(75));
         expect(session.liveOffsetMs, equals(1500));
         expect(session.videoWidth, equals(1280));
         expect(session.videoHeight, equals(720));
@@ -680,6 +682,7 @@ void main() {
       expect(session.durationMs, equals(-1));
       expect(session.positionMs, equals(0));
       expect(session.bufferedPositionMs, equals(0));
+      expect(session.bufferedPercent, equals(0));
       expect(session.liveOffsetMs, isNull);
       expect(session.videoWidth, equals(0));
       expect(session.videoHeight, equals(0));
@@ -693,9 +696,54 @@ void main() {
       expect(session.decodedFrames, equals(0));
       expect(session.raw, equals('status=UNSUPPORTED;platform=non-android'));
       expect(session.toString(), contains('unsupported'));
+      expect(session.toString(), contains('bufferedPercent=0'));
+      expect(session.toString(), contains('bufferedPositionMs=0'));
       expect(session.toString(), contains('rotationDegrees=0'));
       expect(session.toString(), contains('displayWidth=0'));
       expect(session.toString(), contains('displayHeight=0'));
+    });
+
+    test('fromMap parses and clamps bufferedPercent safely', () {
+      final normalSession = VGStreamingPlaybackSession.fromMap(
+        <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'bufferedPercent': 45,
+        },
+      );
+      expect(normalSession.bufferedPercent, equals(45));
+
+      final clampedUnderSession = VGStreamingPlaybackSession.fromMap(
+        <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'bufferedPercent': -15,
+        },
+      );
+      expect(clampedUnderSession.bufferedPercent, equals(0));
+
+      final clampedOverSession = VGStreamingPlaybackSession.fromMap(
+        <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'bufferedPercent': 150,
+        },
+      );
+      expect(clampedOverSession.bufferedPercent, equals(100));
+
+      final missingSession = VGStreamingPlaybackSession.fromMap(
+        <Object?, Object?>{'pass': true, 'textureId': 10},
+      );
+      expect(missingSession.bufferedPercent, equals(0));
+
+      final nonNumSession = VGStreamingPlaybackSession.fromMap(
+        <Object?, Object?>{
+          'pass': true,
+          'textureId': 10,
+          'bufferedPercent': 'invalid',
+        },
+      );
+      expect(nonNumSession.bufferedPercent, equals(0));
     });
 
     test(

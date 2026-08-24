@@ -236,6 +236,9 @@ class VGStreamingPlaybackSession {
   /// Buffered duration in milliseconds ahead of current playhead.
   final int bufferedPositionMs;
 
+  /// Look-ahead buffer fill percentage (0 to 100).
+  final int bufferedPercent;
+
   /// Current distance from live edge in milliseconds (live streams only; `null` for VOD).
   final int? liveOffsetMs;
 
@@ -286,6 +289,7 @@ class VGStreamingPlaybackSession {
     this.durationMs = -1,
     this.positionMs = 0,
     this.bufferedPositionMs = 0,
+    this.bufferedPercent = 0,
     this.liveOffsetMs,
     this.videoWidth = 0,
     this.videoHeight = 0,
@@ -360,6 +364,9 @@ class VGStreamingPlaybackSession {
     final positionMs = (stringMap['positionMs'] as num?)?.toInt() ?? 0;
     final bufferedPositionMs =
         (stringMap['bufferedPositionMs'] as num?)?.toInt() ?? 0;
+    final bufferedPercent = _parseBufferedPercent(
+      stringMap['bufferedPercent'] ?? stringMap['buffered_percent'],
+    );
     final liveOffsetMs = (stringMap['liveOffsetMs'] as num?)?.toInt();
     final videoWidth =
         (stringMap['videoWidth'] as num?)?.toInt() ??
@@ -394,6 +401,7 @@ class VGStreamingPlaybackSession {
       durationMs: durationMs,
       positionMs: positionMs,
       bufferedPositionMs: bufferedPositionMs,
+      bufferedPercent: bufferedPercent,
       liveOffsetMs: liveOffsetMs,
       videoWidth: videoWidth,
       videoHeight: videoHeight,
@@ -419,6 +427,7 @@ class VGStreamingPlaybackSession {
         durationMs: -1,
         positionMs: 0,
         bufferedPositionMs: 0,
+        bufferedPercent: 0,
         liveOffsetMs: null,
         videoWidth: 0,
         videoHeight: 0,
@@ -467,6 +476,18 @@ class VGStreamingPlaybackSession {
     return dim;
   }
 
+  static int _parseBufferedPercent(Object? raw) {
+    if (raw == null) return 0;
+    int? val;
+    if (raw is num) {
+      val = raw.toInt();
+    } else if (raw is String) {
+      val = int.tryParse(raw.trim());
+    }
+    if (val == null) return 0;
+    return val.clamp(0, 100);
+  }
+
   static Map<String, Object?> _defensiveStringMap(Map<Object?, Object?> map) {
     final result = <String, Object?>{};
     for (final entry in map.entries) {
@@ -482,7 +503,8 @@ class VGStreamingPlaybackSession {
   String toString() =>
       'VGStreamingPlaybackSession(pass=$pass, phase=$phase, sessionId=$sessionId, '
       'textureId=$textureId, format=$format, state=$state, positionMs=$positionMs, '
-      'durationMs=$durationMs, videoWidth=$videoWidth, videoHeight=$videoHeight, '
+      'durationMs=$durationMs, bufferedPercent=$bufferedPercent, '
+      'bufferedPositionMs=$bufferedPositionMs, videoWidth=$videoWidth, videoHeight=$videoHeight, '
       'rotationDegrees=$rotationDegrees, displayWidth=$displayWidth, displayHeight=$displayHeight, '
       'renderedFrames=$renderedFrames)';
 }
