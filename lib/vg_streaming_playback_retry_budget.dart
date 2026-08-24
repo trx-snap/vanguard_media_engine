@@ -45,6 +45,9 @@ enum VGStreamingPlaybackRetryBudgetReason {
   /// The recovery plan cannot be retried (e.g. missing required playback options).
   recoveryNotRetryable,
 
+  /// The recovery plan requires host action before retry is permitted.
+  hostActionRequired,
+
   /// Sufficient attempt budget is available and cooldown conditions are satisfied.
   attemptBudgetAvailable,
 
@@ -145,7 +148,8 @@ class VGStreamingPlaybackRetryBudgetConfig {
       'VGStreamingPlaybackRetryBudgetConfig(maxAttempts=$maxAttempts, '
       'windowMs=$windowMs, minimumDelayMs=$minimumDelayMs, '
       'blockTerminalStop=$blockTerminalStop, '
-      'requirePlaybackOptionsForReopen=$requirePlaybackOptionsForReopen)';
+      'requirePlaybackOptionsForReopen=$requirePlaybackOptionsForReopen, '
+      'requireHostActionRespect=$requireHostActionRespect)';
 }
 
 /// Immutable request for evaluating streaming playback retry budget.
@@ -457,7 +461,47 @@ abstract final class VGStreamingPlaybackRetryBudgetPlanner {
 
     final attemptsInWindow = matchingAttempts.length;
 
-    // 7. Check if attempt budget in window is exhausted
+    // 7. Host action respect guard: block automatic retry if recovery plan requires host action.
+    if (config.requireHostActionRespect && recoveryPlan.requiresHostAction) {
+      final remainingAttempts = math.max(
+        0,
+        config.maxAttempts - attemptsInWindow,
+      );
+      const reasons = <VGStreamingPlaybackRetryBudgetReason>[
+        VGStreamingPlaybackRetryBudgetReason.hostActionRequired,
+      ];
+      final reasonCodes = <String>['host_action_required'];
+      final diagnostics = <String, Object?>{
+        'decision': VGStreamingPlaybackRetryBudgetDecision.block.name,
+        'canRetry': false,
+        'requiresHostAction': true,
+        'requireHostActionRespect': true,
+        'attemptsInWindow': attemptsInWindow,
+        'remainingAttempts': remainingAttempts,
+        'retryAfterMs': 0,
+        'nowMs': nowMs,
+        'streamKey': ?targetStreamKey,
+        'advisoryOnly': true,
+        'playbackMutation': false,
+        'reasons': reasonCodes,
+      };
+      return VGStreamingPlaybackRetryBudgetResult(
+        decision: VGStreamingPlaybackRetryBudgetDecision.block,
+        canRetry: false,
+        attemptsInWindow: attemptsInWindow,
+        remainingAttempts: remainingAttempts,
+        retryAfterMs: 0,
+        advisoryOnly: true,
+        playbackMutation: false,
+        reasons: List<VGStreamingPlaybackRetryBudgetReason>.unmodifiable(
+          reasons,
+        ),
+        reasonCodes: List<String>.unmodifiable(reasonCodes),
+        diagnostics: Map<String, Object?>.unmodifiable(diagnostics),
+      );
+    }
+
+    // 8. Check if attempt budget in window is exhausted
     if (attemptsInWindow >= config.maxAttempts) {
       final earliestAttemptMs = matchingAttempts.first.timestampMs;
       final retryAfterMs = math.max(
@@ -499,7 +543,7 @@ abstract final class VGStreamingPlaybackRetryBudgetPlanner {
       );
     }
 
-    // 8. Check minimum cooldown delay since the latest attempt
+    // 9. Check minimum cooldown delay since the latest attempt
     final requiredCooldownMs = math.max(
       config.minimumDelayMs,
       recoveryPlan.retryDelayMs,
@@ -553,7 +597,7 @@ abstract final class VGStreamingPlaybackRetryBudgetPlanner {
       }
     }
 
-    // 9. Retry is permitted and budget is available
+    // 10. Retry is permitted and budget is available
     final remainingAttempts = math.max(
       0,
       config.maxAttempts - attemptsInWindow - 1,

@@ -493,6 +493,7 @@ void checkRetryBudget({
       minimumDelayMs: 750, // 750 ms minimum cooldown
       blockTerminalStop: true,
       requirePlaybackOptionsForReopen: true,
+      requireHostActionRespect: true, // Default: blocks automatic retry when host action is required
     ),
     nowMs: DateTime.now().millisecondsSinceEpoch,
     streamKey: streamKey,
@@ -518,7 +519,7 @@ void checkRetryBudget({
       // Schedule cooldown timer before retrying (wait result.retryAfterMs)
       break;
     case VGStreamingPlaybackRetryBudgetDecision.block:
-      // Budget exhausted or blocked; show user fallback UI
+      // Budget exhausted, blocked, or host action required; show user fallback UI
       break;
     case VGStreamingPlaybackRetryBudgetDecision.notRetryable:
       // Plan does not support retry (terminal stop, passive wait, healthy)
@@ -530,6 +531,7 @@ void checkRetryBudget({
 ### Invariants, Scope & Non-Claims
 
 - **Pure Advisory Helper**: `result.advisoryOnly == true` and `result.playbackMutation == false`. `VGStreamingPlaybackRetryBudgetPlanner` never executes retries, never opens/stops sessions, never creates timers/clocks, never mutates `recentAttempts`, and calls zero native platform channels.
+- **Host Action Respect Guard**: By default (`requireHostActionRespect == true`), the retry budget will not authorize automatic retry (`decision == block`, `canRetry == false`, reason `hostActionRequired` / code `host_action_required`) when the upstream recovery plan requires host action (`recoveryPlan.requiresHostAction == true`). Product code must opt out of this guard (`requireHostActionRespect: false`) only when it is deliberately executing the host-approved action.
 - **Product Ownership**: The host application owns recording `VGStreamingPlaybackRetryAttempt` instances, scheduling retry timers, and determining user recovery presentation.
 - **Deterministic & Pure**: All evaluations are synchronous functions of `nowMs`, `recentAttempts`, `config`, and `recoveryPlan`.
 - **Stream Key Isolation**: Optional `streamKey` scoping enables per-stream budget tracking across multi-stream feeds.

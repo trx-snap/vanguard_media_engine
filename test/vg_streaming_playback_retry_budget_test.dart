@@ -26,7 +26,7 @@ void main() {
       VGStreamingPlaybackRecoveryUrgency urgency =
           VGStreamingPlaybackRecoveryUrgency.active,
       bool shouldReopenPlayback = true,
-      bool requiresHostAction = true,
+      bool requiresHostAction = false,
       bool canBuildPlaybackOptions = true,
       VGStreamingPlaybackOptions? playbackOptions,
       int? resumePositionMs,
@@ -283,7 +283,89 @@ void main() {
     });
 
     test(
-      '8. Budget available allows retry and calculates remaining attempts',
+      '8. Host action respect blocks retry by default and allows when override configured',
+      () {
+        final planHostAction = createPlan(requiresHostAction: true);
+
+        // Case A: Default config (requireHostActionRespect = true) blocks automatic retry
+        final resBlocked = VGStreamingPlaybackRetryBudgetPlanner.evaluate(
+          VGStreamingPlaybackRetryBudgetRequest(
+            recoveryPlan: planHostAction,
+            recentAttempts: const [],
+            nowMs: 50000,
+          ),
+        );
+        expect(
+          resBlocked.decision,
+          equals(VGStreamingPlaybackRetryBudgetDecision.block),
+        );
+        expect(resBlocked.canRetry, isFalse);
+        expect(resBlocked.attemptsInWindow, equals(0));
+        expect(resBlocked.remainingAttempts, equals(3));
+        expect(resBlocked.retryAfterMs, equals(0));
+        expect(
+          resBlocked.reasons,
+          contains(VGStreamingPlaybackRetryBudgetReason.hostActionRequired),
+        );
+        expect(resBlocked.reasonCodes, contains('host_action_required'));
+        expect(resBlocked.diagnostics['requiresHostAction'], isTrue);
+        expect(resBlocked.diagnostics['requireHostActionRespect'], isTrue);
+
+        // Case B: With recent attempts, attemptsInWindow and remainingAttempts are accurately reflected
+        final resBlockedWithAttempts =
+            VGStreamingPlaybackRetryBudgetPlanner.evaluate(
+              VGStreamingPlaybackRetryBudgetRequest(
+                recoveryPlan: planHostAction,
+                recentAttempts: [
+                  const VGStreamingPlaybackRetryAttempt(
+                    timestampMs: 45000,
+                    intent:
+                        VGStreamingPlaybackRecoveryIntent.retryCurrentProfile,
+                  ),
+                ],
+                nowMs: 50000,
+              ),
+            );
+        expect(
+          resBlockedWithAttempts.decision,
+          equals(VGStreamingPlaybackRetryBudgetDecision.block),
+        );
+        expect(resBlockedWithAttempts.canRetry, isFalse);
+        expect(resBlockedWithAttempts.attemptsInWindow, equals(1));
+        expect(resBlockedWithAttempts.remainingAttempts, equals(2));
+        expect(
+          resBlockedWithAttempts.reasons,
+          contains(VGStreamingPlaybackRetryBudgetReason.hostActionRequired),
+        );
+
+        // Case C: requireHostActionRespect = false allows existing budget calculation to proceed
+        final resAllowed = VGStreamingPlaybackRetryBudgetPlanner.evaluate(
+          VGStreamingPlaybackRetryBudgetRequest(
+            recoveryPlan: planHostAction,
+            config: const VGStreamingPlaybackRetryBudgetConfig(
+              requireHostActionRespect: false,
+            ),
+            recentAttempts: const [],
+            nowMs: 50000,
+          ),
+        );
+        expect(
+          resAllowed.decision,
+          equals(VGStreamingPlaybackRetryBudgetDecision.allow),
+        );
+        expect(resAllowed.canRetry, isTrue);
+        expect(resAllowed.attemptsInWindow, equals(0));
+        expect(resAllowed.remainingAttempts, equals(2));
+        expect(
+          resAllowed.reasons,
+          contains(VGStreamingPlaybackRetryBudgetReason.attemptBudgetAvailable),
+        );
+        expect(resAllowed.reasonCodes, contains('attempt_budget_available'));
+      },
+    );
+
+    test(
+      '9. Budget available allows retry and calculates remaining attempts',
       () {
         final plan = createPlan();
 
@@ -359,46 +441,49 @@ void main() {
       },
     );
 
-    test('9. Minimum delay not elapsed returns delay and exact retryAfterMs', () {
-      final plan = createPlan(retryDelayMs: 1000); // 1000 ms plan cooldown
+    test(
+      '10. Minimum delay not elapsed returns delay and exact retryAfterMs',
+      () {
+        final plan = createPlan(retryDelayMs: 1000); // 1000 ms plan cooldown
 
-      // Prior attempt was 300 ms ago at nowMs = 50000 (attempt at 49700)
-      final res = VGStreamingPlaybackRetryBudgetPlanner.evaluate(
-        VGStreamingPlaybackRetryBudgetRequest(
-          recoveryPlan: plan,
-          config: const VGStreamingPlaybackRetryBudgetConfig(
-            minimumDelayMs: 750,
-          ),
-          recentAttempts: [
-            const VGStreamingPlaybackRetryAttempt(
-              timestampMs: 49700,
-              intent: VGStreamingPlaybackRecoveryIntent.retryCurrentProfile,
+        // Prior attempt was 300 ms ago at nowMs = 50000 (attempt at 49700)
+        final res = VGStreamingPlaybackRetryBudgetPlanner.evaluate(
+          VGStreamingPlaybackRetryBudgetRequest(
+            recoveryPlan: plan,
+            config: const VGStreamingPlaybackRetryBudgetConfig(
+              minimumDelayMs: 750,
             ),
-          ],
-          nowMs: 50000,
-        ),
-      );
+            recentAttempts: [
+              const VGStreamingPlaybackRetryAttempt(
+                timestampMs: 49700,
+                intent: VGStreamingPlaybackRecoveryIntent.retryCurrentProfile,
+              ),
+            ],
+            nowMs: 50000,
+          ),
+        );
 
-      expect(
-        res.decision,
-        equals(VGStreamingPlaybackRetryBudgetDecision.delay),
-      );
-      expect(res.canRetry, isFalse);
-      expect(res.attemptsInWindow, equals(1));
-      expect(res.remainingAttempts, equals(2)); // 3 - 1 = 2
-      // Cooldown = max(750, 1000) = 1000. Elapsed = 300. Remaining delay = 700.
-      expect(res.retryAfterMs, equals(700));
-      expect(
-        res.reasons,
-        contains(VGStreamingPlaybackRetryBudgetReason.minimumDelayNotElapsed),
-      );
-      expect(res.reasonCodes, contains('minimum_delay_not_elapsed'));
-      expect(res.diagnostics['requiredCooldownMs'], equals(1000));
-      expect(res.diagnostics['elapsedSinceLatestMs'], equals(300));
-    });
+        expect(
+          res.decision,
+          equals(VGStreamingPlaybackRetryBudgetDecision.delay),
+        );
+        expect(res.canRetry, isFalse);
+        expect(res.attemptsInWindow, equals(1));
+        expect(res.remainingAttempts, equals(2)); // 3 - 1 = 2
+        // Cooldown = max(750, 1000) = 1000. Elapsed = 300. Remaining delay = 700.
+        expect(res.retryAfterMs, equals(700));
+        expect(
+          res.reasons,
+          contains(VGStreamingPlaybackRetryBudgetReason.minimumDelayNotElapsed),
+        );
+        expect(res.reasonCodes, contains('minimum_delay_not_elapsed'));
+        expect(res.diagnostics['requiredCooldownMs'], equals(1000));
+        expect(res.diagnostics['elapsedSinceLatestMs'], equals(300));
+      },
+    );
 
     test(
-      '10. Attempt budget exhausted returns block and retryAfterMs until window expiry',
+      '11. Attempt budget exhausted returns block and retryAfterMs until window expiry',
       () {
         final plan = createPlan();
         // Config: maxAttempts = 3, windowMs = 120000 (2 minutes)
@@ -448,7 +533,7 @@ void main() {
     );
 
     test(
-      '11. Stream key filtering scopes budget tracking to specific stream',
+      '12. Stream key filtering scopes budget tracking to specific stream',
       () {
         final plan = createPlan();
 
@@ -512,7 +597,7 @@ void main() {
       },
     );
 
-    test('12. Null stream key counts all attempts across stream keys', () {
+    test('13. Null stream key counts all attempts across stream keys', () {
       final plan = createPlan();
 
       final attempts = [
@@ -550,7 +635,7 @@ void main() {
       expect(resNullKey.attemptsInWindow, equals(3));
     });
 
-    test('13. Old attempts outside rolling window are ignored', () {
+    test('14. Old attempts outside rolling window are ignored', () {
       final plan = createPlan();
 
       // Window is 120000 ms. nowMs = 200000.
@@ -596,7 +681,7 @@ void main() {
     });
 
     test(
-      '14. Pure & deterministic: no mutation of input recentAttempts list',
+      '15. Pure & deterministic: no mutation of input recentAttempts list',
       () {
         final plan = createPlan();
         final initialAttempts = <VGStreamingPlaybackRetryAttempt>[
@@ -627,7 +712,7 @@ void main() {
     );
 
     test(
-      '15. Serialization and toString work properly for all models and enums',
+      '16. Serialization and toString work properly for all models and enums',
       () {
         final plan = createPlan();
         const config = VGStreamingPlaybackRetryBudgetConfig(
@@ -656,10 +741,12 @@ void main() {
         expect(configJson['windowMs'], equals(60000));
         expect(configJson['minimumDelayMs'], equals(500));
         expect(configJson['blockTerminalStop'], isTrue);
+        expect(configJson['requireHostActionRespect'], isTrue);
         expect(
           config.toString(),
           contains('VGStreamingPlaybackRetryBudgetConfig'),
         );
+        expect(config.toString(), contains('requireHostActionRespect=true'));
 
         // Request toJson & toString
         final request = VGStreamingPlaybackRetryBudgetRequest(
@@ -716,6 +803,10 @@ void main() {
         expect(
           VGStreamingPlaybackRetryBudgetReason.attemptBudgetAvailable.toJson(),
           equals('attemptBudgetAvailable'),
+        );
+        expect(
+          VGStreamingPlaybackRetryBudgetReason.hostActionRequired.toJson(),
+          equals('hostActionRequired'),
         );
       },
     );
