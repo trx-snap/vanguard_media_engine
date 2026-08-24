@@ -255,16 +255,21 @@ class VGStreamingPlaybackRetryJournal {
                 .where((i) => i.name == intentName)
                 .firstOrNull;
             if (intent != null) {
-              final streamKey = map['streamKey'] as String?;
-              final reason = map['reason'] as String?;
-              attempts.add(
-                VGStreamingPlaybackRetryAttempt(
-                  timestampMs: ts.toInt(),
-                  intent: intent,
-                  streamKey: streamKey,
-                  reason: reason,
-                ),
-              );
+              final rawStreamKey = map['streamKey'];
+              final rawReason = map['reason'];
+              final streamKeyValid =
+                  rawStreamKey == null || rawStreamKey is String;
+              final reasonValid = rawReason == null || rawReason is String;
+              if (streamKeyValid && reasonValid) {
+                attempts.add(
+                  VGStreamingPlaybackRetryAttempt(
+                    timestampMs: ts.toInt(),
+                    intent: intent,
+                    streamKey: rawStreamKey as String?,
+                    reason: rawReason as String?,
+                  ),
+                );
+              }
             }
           }
         }

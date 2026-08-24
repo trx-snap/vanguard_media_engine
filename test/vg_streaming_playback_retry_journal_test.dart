@@ -536,5 +536,82 @@ void main() {
       final emptyJournal = VGStreamingPlaybackRetryJournal.fromJson({});
       expect(emptyJournal.isEmpty, isTrue);
     });
+
+    test(
+      '12. fromJson defensively skips entries with non-string optional fields without throwing',
+      () {
+        final json = <String, Object?>{
+          'attempts': [
+            // Valid entry with null optional fields
+            {
+              'timestampMs': 1000,
+              'intent': 'retryCurrentProfile',
+              'streamKey': null,
+              'reason': null,
+            },
+            // Valid entry with String optional fields
+            {
+              'timestampMs': 2000,
+              'intent': 'retryCurrentProfile',
+              'streamKey': 'validStream',
+              'reason': 'validReason',
+            },
+            // Malformed optional field: streamKey is int
+            {
+              'timestampMs': 3000,
+              'intent': 'retryCurrentProfile',
+              'streamKey': 12345,
+              'reason': 'validReason',
+            },
+            // Malformed optional field: streamKey is bool
+            {
+              'timestampMs': 4000,
+              'intent': 'retryCurrentProfile',
+              'streamKey': true,
+            },
+            // Malformed optional field: streamKey is List
+            {
+              'timestampMs': 5000,
+              'intent': 'retryCurrentProfile',
+              'streamKey': ['invalidList'],
+            },
+            // Malformed optional field: reason is int
+            {
+              'timestampMs': 6000,
+              'intent': 'retryCurrentProfile',
+              'streamKey': 'validStream',
+              'reason': 500,
+            },
+            // Malformed optional field: reason is Map
+            {
+              'timestampMs': 7000,
+              'intent': 'retryCurrentProfile',
+              'reason': {'error': 'fatal'},
+            },
+            // Malformed optional field: reason is bool
+            {
+              'timestampMs': 8000,
+              'intent': 'retryCurrentProfile',
+              'reason': false,
+            },
+          ],
+        };
+
+        late VGStreamingPlaybackRetryJournal journal;
+        expect(
+          () => journal = VGStreamingPlaybackRetryJournal.fromJson(json),
+          returnsNormally,
+        );
+
+        expect(journal.length, equals(2));
+        expect(journal.attempts()[0].timestampMs, equals(1000));
+        expect(journal.attempts()[0].streamKey, isNull);
+        expect(journal.attempts()[0].reason, isNull);
+
+        expect(journal.attempts()[1].timestampMs, equals(2000));
+        expect(journal.attempts()[1].streamKey, equals('validStream'));
+        expect(journal.attempts()[1].reason, equals('validReason'));
+      },
+    );
   });
 }
