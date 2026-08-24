@@ -4,6 +4,60 @@ Vanguard is a high-performance native media engine plugin for Flutter, providing
 
 All public APIs are exported from `package:vanguard_media_engine/vanguard_media_engine.dart`.
 
+## Public Streaming Manifest Policy Validation Client (Phase 4C5H / Phase 4C5I)
+
+The package exposes `VGStreamingManifestPolicyClient` as a typed public Dart client to validate candidate HLS, DASH, and LL-HLS multivariant manifest ladders against server ladder policies before playback without raw `MethodChannel` interaction.
+
+### Quick Start
+
+```dart
+import 'package:vanguard_media_engine/vanguard_media_engine.dart';
+
+Future<void> validateCandidateManifests() async {
+  // 1. Instantiate the streaming manifest policy client
+  final client = VGStreamingManifestPolicyClient();
+
+  // 2. Prepare candidate manifest specifications
+  final request = VGStreamingManifestPolicyValidationRequest(
+    manifests: [
+      VGStreamingManifestSpec(
+        key: 'hls_stream',
+        uri: Uri.parse('https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8'),
+        formatHint: VGStreamingFormatHint.hls,
+        requireAdaptiveLadder: true,
+        requireAvcFallback: true,
+      ),
+      VGStreamingManifestSpec(
+        key: 'dash_stream',
+        uri: Uri.parse(
+          'https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd',
+        ),
+        formatHint: VGStreamingFormatHint.dash,
+        requireAdaptiveLadder: true,
+        requireAvcFallback: true,
+      ),
+    ],
+  );
+
+  // 3. Validate candidate manifests against server ladder policy
+  final report = await client.validate(request);
+
+  if (report.pass) {
+    print('Manifest policy validation passed: ${report.serverLadderPolicy}');
+    print('Total validated: ${report.totalManifestsValidated}');
+  } else {
+    print('Manifest policy validation failed: ${report.raw}');
+  }
+}
+```
+
+### Guarantees, Invariants & Boundaries
+
+- **Manifest-Only Validation**: Validation inspects only multivariant playlist tags and DASH MPD representation structures. There is zero playback session allocation, zero ExoPlayer/Media3 player creation, zero MediaCodec decoding, zero surface allocation, zero segment fetching beyond bounded manifest inspection, and no ABR forcing.
+- **Server Ladder Policy Enforcement**: Enforces the additive server ladder policy: `add_hevc_av1_renditions_but_keep_avc_fallback`. If HEVC or AV1 renditions are present, an AVC/H.264 fallback rendition remains mandatory.
+- **Pre-Fetch Segment Rejection**: Enforces pre-fetch security assertions to ensure media segment URLs are rejected and never fetched during manifest inspection.
+- **iOS Parity Expectation**: The same public Dart contract (`VGStreamingManifestPolicyClient`, `VGStreamingManifestPolicyValidationRequest`, `VGStreamingManifestPolicyValidationReport`) will be backed on iOS by AVFoundation/HLS manifest validation preserving AVC fallback; DASH on iOS remains the already-deferred architecture/product decision. Non-Android platforms return typed unsupported reports (`phase: 'unsupported'`, `pass: false`) via `fromMap`/`unsupported()` without crashing.
+
 ## Public Streaming Playback Status Poller (Phase 4C7AC / Phase 4C7AD / Phase 4C7AE / Phase 4C7AG / Phase 4C7AH)
 
 The package exposes `VGStreamingPlaybackStatusPoller` as a pure Dart periodic polling helper over `VGStreamingPlaybackController`. It periodically refreshes controller telemetry, converts snapshots into immutable `VGStreamingPlaybackStatusSummary` objects, and emits them over a broadcast stream without busy-polling collisions.
