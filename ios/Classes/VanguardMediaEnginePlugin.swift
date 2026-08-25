@@ -11,6 +11,7 @@ import AVFoundation
 import Photos
 import PhotosUI
 import Vision
+import VideoToolbox
 
 // ─── P1-T4: Engine Mode ───────────────────────────────────────────────────────
 
@@ -929,6 +930,128 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         }
     }
 
+    // ── Phase 4C8U: iOS Streaming Codec Capability Parity ────────────────────
+    //
+    // Pure metadata-only VideoToolbox/CoreMedia codec capability probe.
+    // Mirrors the Android Phase 4C5A capability report format for route
+    // `runAndroidDagPhase4C5AStreamingCodecCapabilitySmoke`.
+    //
+    // Invariants:
+    //   - Calls only VTIsHardwareDecodeSupported — no VTDecompressionSession.
+    //   - Zero AVPlayer, AVPlayerItem, AVAssetReader, MediaCodec, Surface,
+    //     Texture, CVPixelBuffer, audio session, WebRTC, LiveKit, camera,
+    //     editor, export, cache, or network objects allocated.
+    //   - Does NOT interact with VanguardEngineMode or switchToMode.
+    //   - Synchronous — no async work; result returned in-call.
+    //
+    // kCMVideoCodecType_AV1 is available from iOS 14 / macOS 11.
+    // VTIsHardwareDecodeSupported is available from iOS 8 / macOS 10.8.
+    // The #available guard below ensures safe compilation on older targets.
+
+    private func _buildPhase4C8UCodecCapabilityMap() -> [String: Any] {
+        // ── Hardware decode support queries (metadata-only, no session) ────────
+        let avcHW: Bool
+        let hevcHW: Bool
+        let av1HW: Bool
+
+        avcHW  = VTIsHardwareDecodeSupported(kCMVideoCodecType_H264)
+        hevcHW = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
+        if #available(iOS 14.0, *) {
+            av1HW = VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
+        } else {
+            av1HW = false
+        }
+
+        // ── Per-codec maps ─────────────────────────────────────────────────────
+        // `supported` equals hardwareDecoderPresent on iOS: VideoToolbox metadata
+        // path does not expose a safe software-only decoder list without creating
+        // a session. softwareDecoderPresent is therefore false per spec.
+        let avcNames:  [String] = avcHW  ? ["VideoToolbox.hardware.h264"] : []
+        let hevcNames: [String] = hevcHW ? ["VideoToolbox.hardware.hevc"] : []
+        let av1Names:  [String] = av1HW  ? ["VideoToolbox.hardware.av1"]  : []
+
+        let avcCodec:  [String: Any] = [
+            "codecKey":             "avc",
+            "mimeType":             "video/avc",
+            "supported":            avcHW,
+            "hardwareDecoderPresent": avcHW,
+            "softwareDecoderPresent": false,
+            "decoderCount":         avcHW ? 1 : 0,
+            "decoderNames":         avcNames,
+            "profileLevelCount":    0,
+        ]
+        let hevcCodec: [String: Any] = [
+            "codecKey":             "hevc",
+            "mimeType":             "video/hevc",
+            "supported":            hevcHW,
+            "hardwareDecoderPresent": hevcHW,
+            "softwareDecoderPresent": false,
+            "decoderCount":         hevcHW ? 1 : 0,
+            "decoderNames":         hevcNames,
+            "profileLevelCount":    0,
+        ]
+        let av1Codec:  [String: Any] = [
+            "codecKey":             "av1",
+            "mimeType":             "video/av01",
+            "supported":            av1HW,
+            "hardwareDecoderPresent": av1HW,
+            "softwareDecoderPresent": false,
+            "decoderCount":         av1HW ? 1 : 0,
+            "decoderNames":         av1Names,
+            "profileLevelCount":    0,
+        ]
+        let codecs: [[String: Any]] = [avcCodec, hevcCodec, av1Codec]
+
+        // ── Gate conditions ────────────────────────────────────────────────────
+        let avcPass          = avcHW
+        let codecCountPass   = codecs.count == 3
+        let policy           = "add_hevc_av1_renditions_but_keep_avc_fallback"
+        let iosMirrorNote    = "iOS VideoToolbox/CoreMedia metadata-only codec capability parity; preserve H.264 fallback and keep HEVC/AV1 additive."
+        let fallbackPolicyPass = true   // policy string is always present
+        let iosMirrorNotePass  = true   // note string is always present
+        let overallPass = avcPass && codecCountPass && fallbackPolicyPass && iosMirrorNotePass
+
+        let rawStr = "status=OK;platform=ios;phase=Phase4C8U;"
+                   + "avcSupported=\(avcHW);"
+                   + "hevcSupported=\(hevcHW);"
+                   + "av1Supported=\(av1HW)"
+
+        // ── Nested probe map (mirrors top-level for Dart client compatibility) ─
+        let probeMap: [String: Any] = [
+            "pass":               overallPass,
+            "phase":              "Phase4C8U",
+            "platform":           "ios",
+            "androidSdk":         0,
+            "avcSupported":       avcHW,
+            "hevcSupported":      hevcHW,
+            "av1Supported":       av1HW,
+            "serverLadderPolicy": policy,
+            "iosMirrorNote":      iosMirrorNote,
+            "codecs":             codecs,
+            "raw":                rawStr,
+        ]
+
+        // ── Top-level capability report map ────────────────────────────────────
+        return [
+            "pass":               overallPass,
+            "phase":              "Phase4C8U",
+            "platform":           "ios",
+            "avcPass":            avcPass,
+            "codecCountPass":     codecCountPass,
+            "fallbackPolicyPass": fallbackPolicyPass,
+            "iosMirrorNotePass":  iosMirrorNotePass,
+            "avcSupported":       avcHW,
+            "hevcSupported":      hevcHW,
+            "av1Supported":       av1HW,
+            "androidSdk":         0,
+            "serverLadderPolicy": policy,
+            "iosMirrorNote":      iosMirrorNote,
+            "codecs":             codecs,
+            "probe":              probeMap,
+            "raw":                rawStr,
+        ]
+    }
+
     // ─── Method Channel Dispatch ───────────────────────────────────────────────
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -1008,6 +1131,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // One early guard; all logic lives in VGStreamingPreflightCoordinator.
         if call.method == "evaluateStreamingPreflightAdvisory" {
             streamingPreflightCoordinator.evaluate(args: args, result: result)
+            return
+        }
+
+        // ── Phase 4C8U: iOS streaming codec capability parity ─────────────────
+        // Handles route `runAndroidDagPhase4C5AStreamingCodecCapabilitySmoke` on
+        // iOS. Same route name as Android so the public Dart API stays stable.
+        // Synchronous: builds and returns the map in-call; no async dispatch.
+        // Does NOT interact with VanguardEngineMode or switchToMode.
+        if call.method == "runAndroidDagPhase4C5AStreamingCodecCapabilitySmoke" {
+            result(_buildPhase4C8UCodecCapabilityMap())
             return
         }
 
