@@ -1,5 +1,6 @@
 // VGStreamingPlaybackCoordinator.swift
 // Phase 4C8A — Native iOS Public Streaming Playback Parity Scaffold
+// Phase 4C8Y — iOS playback network-profile policy parity with Android Phase 4C5B
 //
 // Implements AVPlayer HLS / LL-HLS backend for VGStreamingPlaybackClient
 // public Dart routes. Owns FlutterTextureRegistry, session map, AVURLAsset,
@@ -18,6 +19,153 @@ import AVFoundation
 import Flutter
 import UIKit
 
+// MARK: - Network-profile policy (Phase 4C8Y)
+
+/// Maps a raw Dart networkProfile string to the Android Phase 4C5B buffer/bitrate
+/// policy and the equivalent AVFoundation knobs for AVPlayerItem and AVPlayer.
+///
+/// Profiles: AUTO | STABLE | CONSTRAINED | LOW_LATENCY
+/// Invalid / unknown raw strings default to AUTO.
+///
+/// Android Phase 4C5B reference values (AdaptiveStreamingNetworkPolicy.kt L147-215):
+///   AUTO        — customPolicyEnabled=false, all buffer/bitrate values nil/default.
+///   STABLE      — min/max/start/rebuffer = 15000/50000/2500/5000 ms, no bitrate cap.
+///   CONSTRAINED — min/max/start/rebuffer = 25000/60000/5000/8000 ms,
+///                  maxVideoBitrate=800000, maxAudioBitrate=96000.
+///   LOW_LATENCY — min/max/start/rebuffer = 3000/10000/1000/1500 ms, no bitrate cap.
+private struct VGStreamingNetworkPolicy {
+
+    // ── Normalised profile ─────────────────────────────────────────────────────
+    let profile: String   // "AUTO" | "STABLE" | "CONSTRAINED" | "LOW_LATENCY"
+    let raw:     String   // original value passed from Dart (before normalisation)
+
+    // ── Android Phase 4C5B diagnostic fields ──────────────────────────────────
+    let customPolicyEnabled:                  Bool
+    let minBufferMs:                          Int?
+    let maxBufferMs:                          Int?
+    let bufferForPlaybackMs:                  Int?
+    let bufferForPlaybackAfterRebufferMs:     Int?
+    let maxVideoBitrate:                      Int?
+    let maxAudioBitrate:                      Int?
+    let forceLowestBitrate:                   Bool
+    let exceedVideoConstraintsIfNecessary:    Bool
+
+    // ── AVFoundation application fields ───────────────────────────────────────
+    let preferredForwardBufferDurationSeconds: Double
+    let preferredPeakBitRate:                  Double
+    let automaticallyWaitsToMinimizeStalling:  Bool
+
+    // MARK: Factory
+
+    /// Normalises `rawProfile` to a known profile string (defaulting unknown
+    /// values to AUTO) and returns the fully-populated policy for that profile.
+    static func make(rawProfile: String) -> VGStreamingNetworkPolicy {
+        let known: Set<String> = ["AUTO", "STABLE", "CONSTRAINED", "LOW_LATENCY"]
+        let normalised = known.contains(rawProfile) ? rawProfile : "AUTO"
+        return VGStreamingNetworkPolicy(profile: normalised, raw: rawProfile)
+    }
+
+    private init(profile: String, raw: String) {
+        self.profile = profile
+        self.raw     = raw
+
+        switch profile {
+        case "STABLE":
+            customPolicyEnabled                 = true
+            minBufferMs                         = 15_000
+            maxBufferMs                         = 50_000
+            bufferForPlaybackMs                 = 2_500
+            bufferForPlaybackAfterRebufferMs    = 5_000
+            maxVideoBitrate                     = nil
+            maxAudioBitrate                     = nil
+            forceLowestBitrate                  = false
+            exceedVideoConstraintsIfNecessary   = true
+            preferredForwardBufferDurationSeconds = 15.0
+            preferredPeakBitRate                = 0.0
+            automaticallyWaitsToMinimizeStalling = true
+
+        case "CONSTRAINED":
+            customPolicyEnabled                 = true
+            minBufferMs                         = 25_000
+            maxBufferMs                         = 60_000
+            bufferForPlaybackMs                 = 5_000
+            bufferForPlaybackAfterRebufferMs    = 8_000
+            maxVideoBitrate                     = 800_000
+            maxAudioBitrate                     = 96_000
+            forceLowestBitrate                  = false
+            exceedVideoConstraintsIfNecessary   = true
+            preferredForwardBufferDurationSeconds = 25.0
+            preferredPeakBitRate                = 896_000.0  // 800000 + 96000
+            automaticallyWaitsToMinimizeStalling = true
+
+        case "LOW_LATENCY":
+            customPolicyEnabled                 = true
+            minBufferMs                         = 3_000
+            maxBufferMs                         = 10_000
+            bufferForPlaybackMs                 = 1_000
+            bufferForPlaybackAfterRebufferMs    = 1_500
+            maxVideoBitrate                     = nil
+            maxAudioBitrate                     = nil
+            forceLowestBitrate                  = false
+            exceedVideoConstraintsIfNecessary   = true
+            preferredForwardBufferDurationSeconds = 3.0
+            preferredPeakBitRate                = 0.0
+            automaticallyWaitsToMinimizeStalling = false
+
+        default: // AUTO — preserve AVPlayer defaults
+            customPolicyEnabled                 = false
+            minBufferMs                         = nil
+            maxBufferMs                         = nil
+            bufferForPlaybackMs                 = nil
+            bufferForPlaybackAfterRebufferMs    = nil
+            maxVideoBitrate                     = nil
+            maxAudioBitrate                     = nil
+            forceLowestBitrate                  = false
+            exceedVideoConstraintsIfNecessary   = false
+            preferredForwardBufferDurationSeconds = 0.0
+            preferredPeakBitRate                = 0.0
+            automaticallyWaitsToMinimizeStalling = true
+        }
+    }
+
+    // MARK: AVFoundation application
+
+    /// Applies the policy to `item` immediately after item creation.
+    func apply(to item: AVPlayerItem) {
+        item.preferredForwardBufferDuration = preferredForwardBufferDurationSeconds
+        item.preferredPeakBitRate           = preferredPeakBitRate
+    }
+
+    /// Applies the policy to `player` immediately after player creation.
+    func apply(to player: AVPlayer) {
+        player.automaticallyWaitsToMinimizeStalling = automaticallyWaitsToMinimizeStalling
+    }
+
+    // MARK: Diagnostics map
+
+    /// Returns the full diagnostic map with Android Phase 4C5B keys.
+    func diagnosticsMap() -> [String: Any] {
+        var map: [String: Any] = [
+            "profile":                               profile,
+            "customPolicyEnabled":                   customPolicyEnabled,
+            "forceLowestBitrate":                    forceLowestBitrate,
+            "exceedVideoConstraintsIfNecessary":     exceedVideoConstraintsIfNecessary,
+            "preferredForwardBufferDurationSeconds": preferredForwardBufferDurationSeconds,
+            "preferredPeakBitRate":                  preferredPeakBitRate,
+            "automaticallyWaitsToMinimizeStalling":  automaticallyWaitsToMinimizeStalling,
+            "raw":                                   raw,
+        ]
+        // Optional Int fields — include as NSNull when nil so Dart sees them as null.
+        map["minBufferMs"]                      = minBufferMs.map { $0 as Any } ?? NSNull()
+        map["maxBufferMs"]                      = maxBufferMs.map { $0 as Any } ?? NSNull()
+        map["bufferForPlaybackMs"]              = bufferForPlaybackMs.map { $0 as Any } ?? NSNull()
+        map["bufferForPlaybackAfterRebufferMs"] = bufferForPlaybackAfterRebufferMs.map { $0 as Any } ?? NSNull()
+        map["maxVideoBitrate"]                  = maxVideoBitrate.map { $0 as Any } ?? NSNull()
+        map["maxAudioBitrate"]                  = maxAudioBitrate.map { $0 as Any } ?? NSNull()
+        return map
+    }
+}
+
 // MARK: - Internal session record
 
 /// Internal per-session state held by VGStreamingPlaybackCoordinator.
@@ -28,10 +176,13 @@ private final class VGPlaybackSession {
     let sessionId:  String
 
     // ── Options (stored for snapshot cold-start before presentationSize) ──────
-    let initialWidth:  Int
-    let initialHeight: Int
-    let formatHint:    String   // "AUTO" | "HLS" | "DASH"
-    let networkProfile: String
+    let initialWidth:   Int
+    let initialHeight:  Int
+    let formatHint:     String   // "AUTO" | "HLS" | "DASH"
+    let networkProfile: String   // normalised profile string from VGStreamingNetworkPolicy
+
+    // ── Network policy (Phase 4C8Y) ───────────────────────────────────────────
+    let networkPolicy: VGStreamingNetworkPolicy
 
     // ── AVFoundation objects ──────────────────────────────────────────────────
     let asset:       AVURLAsset
@@ -67,7 +218,7 @@ private final class VGPlaybackSession {
         initialWidth:   Int,
         initialHeight:  Int,
         formatHint:     String,
-        networkProfile: String,
+        networkPolicy:  VGStreamingNetworkPolicy,
         asset:          AVURLAsset,
         item:           AVPlayerItem,
         player:         AVPlayer,
@@ -80,7 +231,8 @@ private final class VGPlaybackSession {
         self.initialWidth   = initialWidth
         self.initialHeight  = initialHeight
         self.formatHint     = formatHint
-        self.networkProfile = networkProfile
+        self.networkProfile = networkPolicy.profile
+        self.networkPolicy  = networkPolicy
         self.asset          = asset
         self.item           = item
         self.player         = player
@@ -191,10 +343,11 @@ final class VGStreamingPlaybackCoordinator {
             let raw = args?["initialHeight"]
             return (raw as? NSNumber)?.intValue ?? (raw as? Int) ?? 0
         }()
-        let formatHint     = ((args?["formatHint"]    as? String) ?? "AUTO").uppercased()
-        let networkProfile = ((args?["networkProfile"] as? String) ?? "AUTO").uppercased()
-        let httpHeaders    = args?["httpHeaders"]   as? [String: String]
-        let autoPlay       = args?["autoPlay"]      as? Bool ?? true
+        let formatHint      = ((args?["formatHint"]    as? String) ?? "AUTO").uppercased()
+        let rawNetworkProfile = ((args?["networkProfile"] as? String) ?? "AUTO").uppercased().trimmingCharacters(in: .whitespaces)
+        let networkPolicy   = VGStreamingNetworkPolicy.make(rawProfile: rawNetworkProfile)
+        let httpHeaders     = args?["httpHeaders"]   as? [String: String]
+        let autoPlay        = args?["autoPlay"]      as? Bool ?? true
         // Accept NSNumber or Int for startPositionMs — mirrors seek/dispose defensive style.
         let startPositionMs: Int? = {
             guard let raw = args?["startPositionMs"] else { return nil }
@@ -269,10 +422,13 @@ final class VGStreamingPlaybackCoordinator {
         let videoOutput = AVPlayerItemVideoOutput(pixelBufferAttributes: outputSettings)
         let item = AVPlayerItem(asset: asset)
         item.add(videoOutput)
+        // Apply network-profile policy to item (Phase 4C8Y).
+        networkPolicy.apply(to: item)
 
         // ── 7. Build AVPlayer ─────────────────────────────────────────────────
         let player = AVPlayer(playerItem: item)
-        player.automaticallyWaitsToMinimizeStalling = (networkProfile != "LOW_LATENCY")
+        // Apply network-profile policy to player (Phase 4C8Y).
+        networkPolicy.apply(to: player)
 
         // ── 8. Register Flutter texture ───────────────────────────────────────
         let texture   = VGPlaybackFlutterTexture()
@@ -284,18 +440,18 @@ final class VGStreamingPlaybackCoordinator {
 
         // ── 10. Build and store session record ────────────────────────────────
         let session = VGPlaybackSession(
-            textureId:      textureId,
-            sessionId:      sessionId,
-            initialWidth:   initialWidth,
-            initialHeight:  initialHeight,
-            formatHint:     formatHint,
-            networkProfile: networkProfile,
-            asset:          asset,
-            item:           item,
-            player:         player,
-            videoOutput:    videoOutput,
-            texture:        texture,
-            registry:       textureRegistry
+            textureId:     textureId,
+            sessionId:     sessionId,
+            initialWidth:  initialWidth,
+            initialHeight: initialHeight,
+            formatHint:    formatHint,
+            networkPolicy: networkPolicy,
+            asset:         asset,
+            item:          item,
+            player:        player,
+            videoOutput:   videoOutput,
+            texture:       texture,
+            registry:      textureRegistry
         )
         sessions[textureId] = session
 
@@ -652,7 +808,10 @@ final class VGStreamingPlaybackCoordinator {
 
         let pass = stateStr != "failed" && stateStr != "disposed"
 
-        return [
+        // ── Network policy diagnostics (Phase 4C8Y) ───────────────────────────
+        let policy = session.networkPolicy
+
+        var map: [String: Any] = [
             "pass":      pass,
             "phase":     "Phase4C8A",
             "sessionId": session.sessionId,
@@ -675,8 +834,16 @@ final class VGStreamingPlaybackCoordinator {
             "playbackCacheBytesRead":         0,
             "playbackCacheSizeBytes":         0,
             "playbackCacheIgnoredCount":      0,
+            // Network-profile diagnostics (Phase 4C8Y)
+            "networkProfile":                            policy.profile,
+            "streamingNetworkProfile":                   policy.profile,
+            "streamingNetworkPolicy":                    policy.diagnosticsMap(),
+            "preferredForwardBufferDurationSeconds":     policy.preferredForwardBufferDurationSeconds,
+            "preferredPeakBitRate":                      policy.preferredPeakBitRate,
+            "automaticallyWaitsToMinimizeStalling":      policy.automaticallyWaitsToMinimizeStalling,
             "raw": "phase=Phase4C8A;sessionId=\(session.sessionId);state=\(stateStr);format=\(formatStr)"
-        ] as [String: Any]
+        ]
+        return map
     }
 
     // MARK: - Helpers

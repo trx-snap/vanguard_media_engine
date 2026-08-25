@@ -52,39 +52,124 @@ private enum Phase4C8C {
         "#EXT-X-RENDITION-REPORT",
     ]
 
-    // Network policy maps (mirror Android AdaptiveStreamingNetworkPolicy constants)
+    // Network policy maps (aligned with Android Phase 4C5B AdaptiveStreamingNetworkPolicy values)
+    //
+    // Android Phase 4C5B reference (AdaptiveStreamingNetworkPolicy.kt L147-215):
+    //   AUTO        — customPolicyEnabled=false, all buffer/bitrate values nil/default.
+    //   STABLE      — min/max/start/rebuffer = 15000/50000/2500/5000 ms, no bitrate cap.
+    //   CONSTRAINED — min/max/start/rebuffer = 25000/60000/5000/8000 ms,
+    //                 maxVideoBitrate=800000, maxAudioBitrate=96000.
+    //   LOW_LATENCY — min/max/start/rebuffer = 3000/10000/1000/1500 ms, no bitrate cap.
+    //
+    // AVFoundation mapping:
+    //   preferredForwardBufferDurationSeconds derived from minBufferMs / 1000.
+    //   preferredPeakBitRate = (maxVideoBitrate ?? 0) + (maxAudioBitrate ?? 0); 0 means uncapped.
+    //   automaticallyWaitsToMinimizeStalling = (profile != LOW_LATENCY).
     static func policyMap(
-        profile: String,
-        bufferMs: Int,
-        minBufferMs: Int,
-        maxBufferMs: Int,
-        allowLowLatency: Bool,
-        pass: Bool
+        profile:                               String,
+        customPolicyEnabled:                   Bool,
+        minBufferMs:                           Int?,
+        maxBufferMs:                           Int?,
+        bufferForPlaybackMs:                   Int?,
+        bufferForPlaybackAfterRebufferMs:      Int?,
+        maxVideoBitrate:                       Int?,
+        maxAudioBitrate:                       Int?,
+        forceLowestBitrate:                    Bool,
+        exceedVideoConstraintsIfNecessary:     Bool,
+        preferredForwardBufferDurationSeconds: Double,
+        preferredPeakBitRate:                  Double,
+        automaticallyWaitsToMinimizeStalling:  Bool,
+        pass:                                  Bool
     ) -> [String: Any] {
-        return [
-            "profile":         profile,
-            "bufferMs":        bufferMs,
-            "minBufferMs":     minBufferMs,
-            "maxBufferMs":     maxBufferMs,
-            "allowLowLatency": allowLowLatency,
-            "pass":            pass,
+        var map: [String: Any] = [
+            "profile":                               profile,
+            "customPolicyEnabled":                   customPolicyEnabled,
+            "forceLowestBitrate":                    forceLowestBitrate,
+            "exceedVideoConstraintsIfNecessary":     exceedVideoConstraintsIfNecessary,
+            "preferredForwardBufferDurationSeconds": preferredForwardBufferDurationSeconds,
+            "preferredPeakBitRate":                  preferredPeakBitRate,
+            "automaticallyWaitsToMinimizeStalling":  automaticallyWaitsToMinimizeStalling,
+            "pass":                                  pass,
         ]
+        map["minBufferMs"]                      = minBufferMs.map { $0 as Any } ?? NSNull()
+        map["maxBufferMs"]                      = maxBufferMs.map { $0 as Any } ?? NSNull()
+        map["bufferForPlaybackMs"]              = bufferForPlaybackMs.map { $0 as Any } ?? NSNull()
+        map["bufferForPlaybackAfterRebufferMs"] = bufferForPlaybackAfterRebufferMs.map { $0 as Any } ?? NSNull()
+        map["maxVideoBitrate"]                  = maxVideoBitrate.map { $0 as Any } ?? NSNull()
+        map["maxAudioBitrate"]                  = maxAudioBitrate.map { $0 as Any } ?? NSNull()
+        return map
     }
 
     static func policyForProfile(_ profile: String) -> [String: Any] {
         switch profile {
         case profileConstrained:
-            return policyMap(profile: profile, bufferMs: 15_000, minBufferMs: 5_000,
-                             maxBufferMs: 30_000, allowLowLatency: false, pass: true)
+            return policyMap(
+                profile:                               profile,
+                customPolicyEnabled:                   true,
+                minBufferMs:                           25_000,
+                maxBufferMs:                           60_000,
+                bufferForPlaybackMs:                   5_000,
+                bufferForPlaybackAfterRebufferMs:      8_000,
+                maxVideoBitrate:                       800_000,
+                maxAudioBitrate:                       96_000,
+                forceLowestBitrate:                    false,
+                exceedVideoConstraintsIfNecessary:     true,
+                preferredForwardBufferDurationSeconds: 25.0,
+                preferredPeakBitRate:                  896_000.0,  // 800000 + 96000
+                automaticallyWaitsToMinimizeStalling:  true,
+                pass:                                  true
+            )
         case profileLowLatency, profilePreferLl:
-            return policyMap(profile: profile, bufferMs: 1_000, minBufferMs: 500,
-                             maxBufferMs: 5_000, allowLowLatency: true, pass: true)
+            return policyMap(
+                profile:                               profile,
+                customPolicyEnabled:                   true,
+                minBufferMs:                           3_000,
+                maxBufferMs:                           10_000,
+                bufferForPlaybackMs:                   1_000,
+                bufferForPlaybackAfterRebufferMs:      1_500,
+                maxVideoBitrate:                       nil,
+                maxAudioBitrate:                       nil,
+                forceLowestBitrate:                    false,
+                exceedVideoConstraintsIfNecessary:     true,
+                preferredForwardBufferDurationSeconds: 3.0,
+                preferredPeakBitRate:                  0.0,
+                automaticallyWaitsToMinimizeStalling:  false,
+                pass:                                  true
+            )
         case profileStable:
-            return policyMap(profile: profile, bufferMs: 5_000, minBufferMs: 2_500,
-                             maxBufferMs: 15_000, allowLowLatency: false, pass: true)
-        default: // AUTO → STABLE equivalent
-            return policyMap(profile: profileStable, bufferMs: 5_000, minBufferMs: 2_500,
-                             maxBufferMs: 15_000, allowLowLatency: false, pass: true)
+            return policyMap(
+                profile:                               profile,
+                customPolicyEnabled:                   true,
+                minBufferMs:                           15_000,
+                maxBufferMs:                           50_000,
+                bufferForPlaybackMs:                   2_500,
+                bufferForPlaybackAfterRebufferMs:      5_000,
+                maxVideoBitrate:                       nil,
+                maxAudioBitrate:                       nil,
+                forceLowestBitrate:                    false,
+                exceedVideoConstraintsIfNecessary:     true,
+                preferredForwardBufferDurationSeconds: 15.0,
+                preferredPeakBitRate:                  0.0,
+                automaticallyWaitsToMinimizeStalling:  true,
+                pass:                                  true
+            )
+        default: // AUTO — customPolicyEnabled=false, all buffer/bitrate values nil/default
+            return policyMap(
+                profile:                               profileAuto,
+                customPolicyEnabled:                   false,
+                minBufferMs:                           nil,
+                maxBufferMs:                           nil,
+                bufferForPlaybackMs:                   nil,
+                bufferForPlaybackAfterRebufferMs:      nil,
+                maxVideoBitrate:                       nil,
+                maxAudioBitrate:                       nil,
+                forceLowestBitrate:                    false,
+                exceedVideoConstraintsIfNecessary:     false,
+                preferredForwardBufferDurationSeconds: 0.0,
+                preferredPeakBitRate:                  0.0,
+                automaticallyWaitsToMinimizeStalling:  true,
+                pass:                                  true
+            )
         }
     }
 }
