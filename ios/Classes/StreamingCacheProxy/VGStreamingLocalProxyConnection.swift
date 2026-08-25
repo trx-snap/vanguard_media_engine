@@ -1,5 +1,5 @@
 // VGStreamingLocalProxyConnection.swift
-// Phase 4C6H2A — iOS hardened local loopback streaming proxy substrate
+// Phase 4C6H2B — iOS local proxy disk read-through cache storage & cache-hit substrate
 //
 // Inspired by KTVHTTPCache local media proxy/cache architecture.
 // Rewritten and hardened for Vanguard; no external Pod dependency.
@@ -9,9 +9,10 @@
 //   - Max request header buffer: 16 KiB.
 //   - Accepted methods: GET, HEAD only.
 //   - Looks up token in registry; returns 404 for unknown tokens.
+//   - Checks VGStreamingLocalProxyDiskCache for eligible GET requests before upstream.
 //   - Forwards Range header to upstream; strips hop-by-hop headers from upstream response.
-//   - Buffers response body in memory (pass-through slice; no disk cache).
-//   - Rewrites HLS manifests via VGStreamingLocalProxyHLSRewriter.
+//   - Buffers response body in memory; stores eligible bodies to disk cache.
+//   - Rewrites HLS manifests via VGStreamingLocalProxyHLSRewriter (never cached).
 //   - Never logs caller HTTP headers.
 
 import Foundation
@@ -50,7 +51,7 @@ final class VGStreamingLocalProxyConnection {
         self.proxyBaseURL = proxyBaseURL
         self.registry     = registry
         self.onComplete   = onComplete
-        // Dedicated ephemeral session; no cookies, no caching — this slice is pass-through only.
+        // Dedicated ephemeral session; no cookies, no URLCache — disk cache is managed separately.
         let cfg = URLSessionConfiguration.ephemeral
         cfg.urlCache = nil
         cfg.httpCookieStorage = nil
@@ -163,7 +164,30 @@ final class VGStreamingLocalProxyConnection {
             return
         }
 
-        fetchUpstream(record: record, method: method, clientRangeHeader: requestHeaders["range"])
+        // Phase 4C6H2B — disk cache read-through.
+        // For eligible GET requests with no Range header, check the disk cache first.
+        let clientRangeHeader = requestHeaders["range"]
+        let isGetMethod = (method == "GET")
+        let hasRange    = (clientRangeHeader != nil)
+
+        if isGetMethod, !hasRange {
+            let diskCache = VGStreamingLocalProxyDiskCache.shared
+            // Check eligibility based on URL only (manifest guard; content type known only after fetch).
+            let lastComp = record.originalURL.lastPathComponent
+            let urlLooksLikeManifest = lastComp.hasSuffix(".m3u8") || lastComp.hasSuffix(".m3u")
+            if !urlLooksLikeManifest, let hit = diskCache.read(for: record.originalURL) {
+                // Cache hit — serve directly without opening upstream.
+                registry.recordCacheHit(routeId: record.routeId, bytes: hit.body.count)
+                let headers: [(String, String)] = [
+                    ("Content-Type",   hit.contentType),
+                    ("Content-Length", "\(hit.body.count)")
+                ]
+                sendHTTPResponse(statusCode: 200, headers: headers, body: hit.body)
+                return
+            }
+        }
+
+        fetchUpstream(record: record, method: method, clientRangeHeader: clientRangeHeader)
     }
 
     // MARK: - Upstream fetch (URLSession, memory-buffered)
@@ -208,11 +232,11 @@ final class VGStreamingLocalProxyConnection {
             let statusCode = httpResponse.statusCode
             let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"
 
-            // Update metrics.
+            // Update upstream-fetch metrics.
             self.registry.recordFetch(routeId: record.routeId, bytes: body.count)
 
-            // HLS manifest rewriting.
-            let isManifest = isHLSContentType(contentType) ||
+            // HLS manifest rewriting (manifests are never cached).
+            let isManifest = vgIsHLSContentType(contentType) ||
                 record.originalURL.lastPathComponent.hasSuffix(".m3u8") ||
                 record.originalURL.lastPathComponent.hasSuffix(".m3u")
 
@@ -228,6 +252,29 @@ final class VGStreamingLocalProxyConnection {
                     ownerRouteId:   record.ownerRouteId
                 )
                 body = Data(rewritten.utf8)
+            }
+
+            // Phase 4C6H2B — disk cache store for eligible non-manifest GET 200 responses.
+            // This runs before building the response headers so body.count is final.
+            if !isManifest, method == "GET", clientRangeHeader == nil, statusCode == 200 {
+                let upstreamCLString = httpResponse.value(forHTTPHeaderField: "Content-Length")
+                let upstreamCL: Int? = upstreamCLString.flatMap {
+                    Int($0.trimmingCharacters(in: .whitespaces))
+                }
+                let diskCache = VGStreamingLocalProxyDiskCache.shared
+                if diskCache.isCacheable(
+                    method:                method,
+                    clientHasRange:        clientRangeHeader != nil,
+                    statusCode:            statusCode,
+                    contentType:           contentType,
+                    originalURL:           record.originalURL,
+                    body:                  body,
+                    upstreamContentLength: upstreamCL
+                ) {
+                    if diskCache.store(body: body, contentType: contentType, statusCode: statusCode, for: record.originalURL) {
+                        self.registry.recordCacheStore(routeId: record.routeId, bytes: body.count)
+                    }
+                }
             }
 
             // Build stripped response headers.
@@ -305,9 +352,4 @@ final class VGStreamingLocalProxyConnection {
         default:  return "Unknown"
         }
     }
-}
-
-private func isHLSContentType(_ ct: String) -> Bool {
-    let lower = ct.lowercased()
-    return lower.contains("mpegurl") || lower.contains("m3u")
 }

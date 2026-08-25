@@ -901,7 +901,7 @@ final class VGStreamingPlaybackCoordinator {
                 }
                 return 0
             }(),
-            "playbackCacheSizeBytes":         0,  // disk cache not implemented in this slice
+            "playbackCacheSizeBytes":         VGStreamingLocalProxyDiskCache.shared.totalCacheSizeBytes(),
             "playbackCacheIgnoredCount":      session.playbackCacheIgnoredCount,
             // Network-profile diagnostics (Phase 4C8Y)
             "networkProfile":                            policy.profile,
@@ -934,6 +934,18 @@ final class VGStreamingPlaybackCoordinator {
             let bytesFetch = m["bytesFetched"]  as? Int ?? 0
             parts.append("proxyRequestCount=\(reqCount)")
             parts.append("proxyBytesFetched=\(bytesFetch)")
+            // Phase 4C6H2B — disk cache counters (safe numerics only).
+            let cacheHits       = m["cacheHitCount"]   as? Int ?? 0
+            let cacheMisses     = m["cacheMissCount"]  as? Int ?? 0
+            let cacheBytesRead  = m["cacheBytesRead"]  as? Int ?? 0
+            parts.append("proxyCacheHits=\(cacheHits)")
+            parts.append("proxyCacheMisses=\(cacheMisses)")
+            parts.append("proxyCacheBytesRead=\(cacheBytesRead)")
+        }
+        // Disk size is global (not per-route); always append when non-zero.
+        let diskSize = VGStreamingLocalProxyDiskCache.shared.totalCacheSizeBytes()
+        if diskSize > 0 {
+            parts.append("proxyDiskSizeBytes=\(diskSize)")
         }
 
         // ── AVPlayerItem error ────────────────────────────────────────────────

@@ -559,19 +559,34 @@ final class VGStreamingCacheManager: NSObject {
                 afterBytes += self.directoryBytes(at: locURL)
             }
 
+            // Phase4C6H2B: Also clear the local-proxy disk cache so that a full
+            // playback-cache clear is coherent and the harness can start from a
+            // deterministic empty state.  Stats are folded into the existing totals
+            // and also exposed as optional numeric-only diagnostic fields.
+            let proxyClear = VGStreamingLocalProxyDiskCache.shared.clearProxyDiskCache()
+            beforeBytes   += Int64(proxyClear.beforeBytes)
+            afterBytes    += Int64(proxyClear.afterBytes)
+            removedCount  += proxyClear.removedResourceCount
+            failedCount   += proxyClear.failedResourceCount
+
             let map: [String: Any] = [
-                "phase":                "Phase4C6F",
-                "pass":                 true,
-                "state":                "cleared",
-                "cacheAvailable":       true,
-                "cacheDir":             dirURL.path,
-                "beforeBytes":          beforeBytes,
-                "afterBytes":           afterBytes,
-                "resourceCountBefore":  beforeCount,
-                "removedResourceCount": removedCount,
-                "failedResourceCount":  failedCount,
-                "raw":                  "status=OK;removed=\(removedCount);failed=\(failedCount)" +
-                                        ";beforeBytes=\(beforeBytes);afterBytes=\(afterBytes)",
+                "phase":                        "Phase4C6F",
+                "pass":                         true,
+                "state":                        "cleared",
+                "cacheAvailable":               true,
+                "cacheDir":                     dirURL.path,
+                "beforeBytes":                  beforeBytes,
+                "afterBytes":                   afterBytes,
+                "resourceCountBefore":          beforeCount,
+                "removedResourceCount":         removedCount,
+                "failedResourceCount":          failedCount,
+                // Optional numeric-only proxy diagnostics (privacy-safe).
+                "proxyBeforeBytes":             proxyClear.beforeBytes,
+                "proxyAfterBytes":              proxyClear.afterBytes,
+                "proxyRemovedResourceCount":    proxyClear.removedResourceCount,
+                "proxyFailedResourceCount":     proxyClear.failedResourceCount,
+                "raw":                          "status=OK;removed=\(removedCount);failed=\(failedCount)" +
+                                                ";beforeBytes=\(beforeBytes);afterBytes=\(afterBytes)",
             ]
             DispatchQueue.main.async { result(map) }
         }

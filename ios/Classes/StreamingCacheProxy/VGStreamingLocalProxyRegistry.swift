@@ -33,6 +33,11 @@ struct VGStreamingLocalProxyRouteRecord {
 
     var requestCount:   Int = 0
     var bytesFetched:   Int = 0           // upstream bytes received (pass-through slice)
+    // Phase 4C6H2B — disk cache counters
+    var cacheHitCount:   Int = 0          // responses served from disk cache
+    var cacheMissCount:  Int = 0          // eligible upstream fetches stored to disk cache
+    var cacheBytesRead:  Int = 0          // body bytes served from disk cache
+    var cacheStoreBytes: Int = 0          // body bytes written to disk cache
 }
 
 /// Route handle returned to callers.
@@ -162,6 +167,26 @@ final class VGStreamingLocalProxyRegistry {
         }
     }
 
+    /// Record a disk cache hit for `routeId`.
+    func recordCacheHit(routeId: String, bytes: Int) {
+        queue.async(flags: .barrier) {
+            guard var r = self.routes[routeId] else { return }
+            r.cacheHitCount  += 1
+            r.cacheBytesRead += bytes
+            self.routes[routeId] = r
+        }
+    }
+
+    /// Record a successful disk cache store for `routeId`.
+    func recordCacheStore(routeId: String, bytes: Int) {
+        queue.async(flags: .barrier) {
+            guard var r = self.routes[routeId] else { return }
+            r.cacheMissCount  += 1
+            r.cacheStoreBytes += bytes
+            self.routes[routeId] = r
+        }
+    }
+
     // MARK: Release
 
     /// Release a root route and **all child routes in its group** synchronously.
@@ -199,18 +224,26 @@ final class VGStreamingLocalProxyRegistry {
     /// `routeCount` is the total number of routes in the group (root + children).
     func metrics(routeId: String) -> [String: Any] {
         var root: VGStreamingLocalProxyRouteRecord?
-        var totalRequests = 0
-        var totalBytes    = 0
-        var routeCount    = 0
+        var totalRequests    = 0
+        var totalBytes       = 0
+        var routeCount       = 0
+        var cacheHitCount    = 0
+        var cacheMissCount   = 0
+        var cacheBytesRead   = 0
+        var cacheStoreBytes  = 0
 
         queue.sync {
             guard let r = self.routes[routeId] else { return }
             root = r
             let ownerRouteId = r.ownerRouteId
             for record in self.routes.values where record.ownerRouteId == ownerRouteId {
-                totalRequests += record.requestCount
-                totalBytes    += record.bytesFetched
-                routeCount    += 1
+                totalRequests   += record.requestCount
+                totalBytes      += record.bytesFetched
+                routeCount      += 1
+                cacheHitCount   += record.cacheHitCount
+                cacheMissCount  += record.cacheMissCount
+                cacheBytesRead  += record.cacheBytesRead
+                cacheStoreBytes += record.cacheStoreBytes
             }
         }
 
@@ -225,7 +258,12 @@ final class VGStreamingLocalProxyRegistry {
             "requestCount":   totalRequests,
             "bytesFetched":   totalBytes,
             "routeCount":     routeCount,
-            "ageSeconds":     -r.createdAt.timeIntervalSinceNow
+            "ageSeconds":     -r.createdAt.timeIntervalSinceNow,
+            // Phase 4C6H2B disk cache counters
+            "cacheHitCount":   cacheHitCount,
+            "cacheMissCount":  cacheMissCount,
+            "cacheBytesRead":  cacheBytesRead,
+            "cacheStoreBytes": cacheStoreBytes
         ]
     }
 }
