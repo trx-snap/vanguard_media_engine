@@ -156,6 +156,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // allocates no AVPlayer, FlutterTexture, cache, audio, or media objects.
     private let streamingManifestPolicyValidator = VGStreamingManifestPolicyValidator()
 
+    // ── Phase 4C8X: iOS streaming compatibility decision (mirrors Android Phase 4C5E) ─
+    // Sole owner of all Phase 4C8X compatibility decision logic for the route
+    // `runAndroidDagPhase4C5ECompatibilityDecisionSmoke`. Pure diagnostic:
+    // allocates no AVPlayer, FlutterTexture, cache, audio, or media objects.
+    private let streamingCompatibilityDecisionReporter = VGStreamingCompatibilityDecisionReporter()
+
     // ── Phase 10-C Slice T: managed audio extraction handler ─────────────────
     // Owns the operation registry, VGAudioOnlyExporter instances, and
     // terminal/cancellation bookkeeping for beginAudioExtraction and
@@ -1750,6 +1756,24 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // LiveKit, camera, editor, export, or VanguardEngineMode interaction.
         if call.method == "runAndroidDagPhase4C5DManifestPolicyValidation" {
             streamingManifestPolicyValidator.validate(args: args, result: result)
+            return
+        }
+
+        // ── Phase 4C8X: iOS streaming compatibility decision parity ───────────
+        // Handles route `runAndroidDagPhase4C5ECompatibilityDecisionSmoke` on iOS.
+        // Same route name as Android so VGStreamingCompatibilityDecisionClient.evaluate
+        // stays stable across platforms. Joins Phase 4C8U codec capability diagnostics
+        // with Phase 4C8W manifest policy validation into Phase 4C5E-schema decision maps.
+        // Network work runs on the reporter's background queue; result() is called exactly
+        // once on the main thread. Pure diagnostic — no AVPlayer, FlutterTexture, cache,
+        // audio, WebRTC, LiveKit, camera, editor, export, or VanguardEngineMode interaction.
+        if call.method == "runAndroidDagPhase4C5ECompatibilityDecisionSmoke" {
+            streamingCompatibilityDecisionReporter.evaluate(
+                args: args,
+                codecProbe: _buildPhase4C8UCodecCapabilityMap(),
+                manifestPolicyValidator: streamingManifestPolicyValidator,
+                result: result
+            )
             return
         }
 

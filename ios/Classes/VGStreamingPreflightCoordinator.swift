@@ -694,6 +694,16 @@ final class VGStreamingManifestPolicyValidator {
         }
     }
 
+    // MARK: - Package-internal synchronous spec validation
+
+    /// Synchronous per-spec validation reused by `VGStreamingCompatibilityDecisionReporter`.
+    /// MUST be called only from a background queue — never the main thread.
+    /// Delegates to the same private `_validateSpec` used by the manifest policy validation
+    /// route, so no network/parsing logic is duplicated.
+    func validateSpecSync(_ spec: [String: Any]) -> [String: Any] {
+        return _validateSpec(spec)
+    }
+
     // MARK: - Orchestration (runs on bgQueue)
 
     private func _runValidation(args: [String: Any]?) -> [String: Any] {
@@ -1477,6 +1487,401 @@ final class VGStreamingManifestPolicyValidator {
                 "key":                  "mux_ll_hls_test",
                 "uri":                  defaultLlHlsUri,
                 "formatHint":           "HLS",
+                "requireAdaptiveLadder": true,
+                "requireAvcFallback":    true,
+                "requireLlHlsTags":      false,
+                "allowMediaPlaylist":    false,
+            ],
+        ]
+    }
+}
+
+// MARK: - VGStreamingCompatibilityDecisionReporter (Phase 4C8X)
+//
+// iOS native parity for Android Phase 4C5E
+// (AdaptiveStreamingCompatibilityDecisionReport + AdaptiveStreamingCompatibilityDecisionSmokeHarness).
+//
+// Joins Phase 4C8U device codec capability diagnostics with Phase 4C8W manifest policy
+// validation into a single structured decision report compatible with the public Dart
+// VGStreamingCompatibilityDecisionClient.evaluate() API.
+//
+// Invariants (mirrors Android mechanical invariants exactly):
+//   - Pure diagnostic brain: MUST NEVER instantiate AVPlayer, AVPlayerItem, AVAssetReader,
+//     VTDecompressionSession, CVPixelBuffer, FlutterTexture, cache, audio, WebRTC, LiveKit,
+//     camera, editor, export, VanguardEngineMode, switchToMode, ABR, or playback mutations.
+//   - Calls only validateSpecSync on VGStreamingManifestPolicyValidator and reads the
+//     codec-probe map supplied by _buildPhase4C8UCodecCapabilityMap().
+//   - Does NOT perform direct network fetches itself; all manifest fetching is delegated
+//     to VGStreamingManifestPolicyValidator.validateSpecSync.
+//   - All network work on a background queue; FlutterResult called exactly once, on the
+//     main thread (DispatchQueue.main).
+//   - DASH remains manifest-diagnostic only on iOS; no AVPlayer DASH playback is claimed
+//     or implemented.
+
+/// Package-internal reporter that produces Android Phase 4C5E-compatible compatibility
+/// decision maps on iOS. The plugin holds an instance and forwards the single method-channel
+/// route `runAndroidDagPhase4C5ECompatibilityDecisionSmoke` here.
+final class VGStreamingCompatibilityDecisionReporter {
+
+    // ── Phase / policy / note constants (match Android strings exactly) ────────
+
+    private static let phase            = "Phase4C5E"
+    private static let serverLadderPolicy = "add_hevc_av1_renditions_but_keep_avc_fallback"
+    private static let iosMirrorNote    =
+        "iOS implementer must combine AVFoundation/CoreMedia capability with HLS manifest ladders and preserve AVC fallback; iOS DASH remains deferred."
+
+    // ── Warning constants (match Android exactly) ─────────────────────────────
+
+    private static let warningMissingAvcFallback    = "missing_avc_fallback"
+    private static let warningAv1SoftwareOnly       = "av1_software_only"
+    private static let warningAv1Unsupported        = "av1_unsupported"
+    private static let warningHevcSoftwareOnly      = "hevc_software_only"
+    private static let warningHevcUnsupported       = "hevc_unsupported"
+    private static let warningNoDeviceSafeVideoCodec = "no_device_safe_video_codec"
+    private static let warningManifestPolicyFailed  = "manifest_policy_failed"
+    private static let warningNoAdaptiveLadder      = "no_adaptive_ladder"
+
+    // ── Decision constants (match Android exactly) ────────────────────────────
+
+    private static let decisionPreferAv1Hardware           = "prefer_av1_hardware"
+    private static let decisionPreferHevcHardware          = "prefer_hevc_hardware"
+    private static let decisionPreferAvcFallback           = "prefer_avc_fallback"
+    private static let decisionBlockedNoSafeCodec          = "blocked_no_safe_codec"
+    private static let decisionBlockedManifestPolicyFailed = "blocked_manifest_policy_failed"
+
+    // ── Background queue ──────────────────────────────────────────────────────
+
+    private let bgQueue = DispatchQueue(
+        label: "com.vanguard.p4c8x.compatibilityDecision",
+        qos: .userInitiated
+    )
+
+    // MARK: - Public entry point
+
+    /// Called from the plugin's `handle(_:result:)` dispatch guard.
+    /// Resolves specs from `args`, runs all network/validation work on `bgQueue`,
+    /// and delivers the aggregate decision map exactly once on `DispatchQueue.main`.
+    ///
+    /// - Parameters:
+    ///   - args: Raw MethodChannel call arguments (may be nil or empty).
+    ///   - codecProbe: Pre-built codec capability map from `_buildPhase4C8UCodecCapabilityMap()`.
+    ///   - manifestPolicyValidator: Shared validator instance; `validateSpecSync` is called
+    ///     only from this method's `bgQueue` — never the main thread.
+    ///   - result: FlutterResult closure; called exactly once on `DispatchQueue.main`.
+    func evaluate(
+        args: [String: Any]?,
+        codecProbe: [String: Any],
+        manifestPolicyValidator: VGStreamingManifestPolicyValidator,
+        result: @escaping FlutterResult
+    ) {
+        bgQueue.async { [self] in
+            let output = self._runDecision(
+                args: args,
+                codecProbe: codecProbe,
+                manifestPolicyValidator: manifestPolicyValidator
+            )
+            DispatchQueue.main.async { result(output) }
+        }
+    }
+
+    // MARK: - Orchestration (runs on bgQueue)
+
+    private func _runDecision(
+        args: [String: Any]?,
+        codecProbe: [String: Any],
+        manifestPolicyValidator: VGStreamingManifestPolicyValidator
+    ) -> [String: Any] {
+        // Resolve manifest specs: use host-supplied list or fall back to canonical defaults
+        // (same resolution logic as VGStreamingManifestPolicyValidator._runValidation).
+        let specs: [[String: Any]]
+        if let raw = args?["manifests"] as? [[String: Any]], !raw.isEmpty {
+            specs = raw
+        } else if let raw = args?["manifests"] as? [Any], !raw.isEmpty,
+                  let typed = raw.compactMap({ $0 as? [String: Any] }) as [[String: Any]]?,
+                  !typed.isEmpty {
+            specs = typed
+        } else {
+            specs = Self._defaultPublicSpecs()
+        }
+
+        guard !specs.isEmpty else {
+            return _emptySpecsResult(codecProbe: codecProbe)
+        }
+
+        do {
+            let reports = specs.map { spec -> [String: Any] in
+                let manifestValidation = manifestPolicyValidator.validateSpecSync(spec)
+                return _buildReport(spec: spec, manifestValidation: manifestValidation,
+                                    codecProbe: codecProbe)
+            }
+            return _buildAggregateResult(reports: reports, codecProbe: codecProbe)
+        }
+    }
+
+    // MARK: - Per-spec report (mirrors Android AdaptiveStreamingCompatibilityDecisionReport.buildReport)
+
+    private func _buildReport(
+        spec: [String: Any],
+        manifestValidation: [String: Any],
+        codecProbe: [String: Any]
+    ) -> [String: Any] {
+        let key        = (spec["key"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
+        let uri        = (spec["uri"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
+        let formatHint = ((spec["formatHint"] as? String)?.trimmingCharacters(in: .whitespaces)
+                            .uppercased()) ?? "AUTO"
+
+        // ── Manifest-side booleans ─────────────────────────────────────────────
+        let manifestPolicyPass  = manifestValidation["pass"] as? Bool ?? false
+        let hasAdaptiveLadder   = manifestValidation["hasAdaptiveLadder"] as? Bool ?? false
+        let avcManifestPresent  = manifestValidation["hasAvc"] as? Bool ?? false
+        let hevcManifestPresent = manifestValidation["hasHevc"] as? Bool ?? false
+        let av1ManifestPresent  = manifestValidation["hasAv1"] as? Bool ?? false
+
+        // ── Device codec support ───────────────────────────────────────────────
+        let avcDeviceSupported  = codecProbe["avcSupported"] as? Bool ?? false
+        let hevcDeviceSupported = codecProbe["hevcSupported"] as? Bool ?? false
+        let av1DeviceSupported  = codecProbe["av1Supported"] as? Bool ?? false
+
+        // ── Hardware safety from codecs list (mirrors Android exactly) ─────────
+        let codecsList = codecProbe["codecs"] as? [[String: Any]] ?? []
+        let avcEntry   = codecsList.first { $0["codecKey"] as? String == "avc" }
+        let hevcEntry  = codecsList.first { $0["codecKey"] as? String == "hevc" }
+        let av1Entry   = codecsList.first { $0["codecKey"] as? String == "av1" }
+
+        let avcHardwareSafe  = avcEntry?["hardwareDecoderPresent"] as? Bool ?? false
+        let hevcHardwareSafe = hevcEntry?["hardwareDecoderPresent"] as? Bool ?? false
+        let av1HardwareSafe  = av1Entry?["hardwareDecoderPresent"] as? Bool ?? false
+
+        // ── Renditions and bandwidth stats ────────────────────────────────────
+        // Extract renditionCount from variantCount then representationCount (Android parity).
+        let inspection = manifestValidation["inspection"] as? [String: Any]
+        let variantCountRaw = (manifestValidation["variantCount"] as? Int)
+            ?? (manifestValidation["variantCount"] as? NSNumber)?.intValue
+        let repCountRaw = (manifestValidation["representationCount"] as? Int)
+            ?? (manifestValidation["representationCount"] as? NSNumber)?.intValue
+
+        // Variants/representations for bandwidth extraction.
+        let variantsAny = inspection?["variants"] as? [[String: Any]]
+            ?? inspection?["representations"] as? [[String: Any]]
+            ?? []
+
+        let renditionCount = variantCountRaw ?? repCountRaw ?? variantsAny.count
+
+        let bandwidths: [Int] = variantsAny.compactMap {
+            let bw = ($0["bandwidth"] as? Int)
+                ?? ($0["bandwidth"] as? NSNumber)?.intValue
+            guard let b = bw, b > 0 else { return nil }
+            return b
+        }
+        let lowestBandwidth  = bandwidths.min() ?? 0
+        let highestBandwidth = bandwidths.max() ?? 0
+
+        // ── Codec selection (mirrors Android preferredCodecFamily logic) ────────
+        let preferredCodecFamily: String
+        if av1ManifestPresent && av1HardwareSafe {
+            preferredCodecFamily = "av1"
+        } else if hevcManifestPresent && hevcHardwareSafe {
+            preferredCodecFamily = "hevc"
+        } else if avcManifestPresent && avcDeviceSupported {
+            preferredCodecFamily = "avc"
+        } else {
+            preferredCodecFamily = "none"
+        }
+
+        let fallbackCodecFamily: String = (avcManifestPresent && avcDeviceSupported) ? "avc" : "none"
+
+        var safeCodecFamilies = [String]()
+        if avcManifestPresent && avcDeviceSupported  { safeCodecFamilies.append("avc") }
+        if hevcManifestPresent && hevcHardwareSafe   { safeCodecFamilies.append("hevc") }
+        if av1ManifestPresent  && av1HardwareSafe    { safeCodecFamilies.append("av1") }
+
+        var riskyCodecFamilies = [String]()
+        if hevcManifestPresent && (!hevcDeviceSupported || !hevcHardwareSafe) { riskyCodecFamilies.append("hevc") }
+        if av1ManifestPresent  && (!av1DeviceSupported  || !av1HardwareSafe)  { riskyCodecFamilies.append("av1") }
+
+        // ── Warnings (mirrors Android exactly) ────────────────────────────────
+        var warnings = [String]()
+        if !manifestPolicyPass                                              { warnings.append(Self.warningManifestPolicyFailed) }
+        if !hasAdaptiveLadder || renditionCount <= 1                        { warnings.append(Self.warningNoAdaptiveLadder) }
+        if !avcManifestPresent || !avcDeviceSupported                       { warnings.append(Self.warningMissingAvcFallback) }
+        if hevcManifestPresent && !hevcDeviceSupported                      { warnings.append(Self.warningHevcUnsupported) }
+        if hevcManifestPresent && hevcDeviceSupported && !hevcHardwareSafe  { warnings.append(Self.warningHevcSoftwareOnly) }
+        if av1ManifestPresent  && !av1DeviceSupported                       { warnings.append(Self.warningAv1Unsupported) }
+        if av1ManifestPresent  && av1DeviceSupported  && !av1HardwareSafe   { warnings.append(Self.warningAv1SoftwareOnly) }
+        if safeCodecFamilies.isEmpty                                        { warnings.append(Self.warningNoDeviceSafeVideoCodec) }
+
+        // ── Decision (mirrors Android exactly) ────────────────────────────────
+        let decision: String
+        if !manifestPolicyPass {
+            decision = Self.decisionBlockedManifestPolicyFailed
+        } else if preferredCodecFamily == "none" || safeCodecFamilies.isEmpty {
+            decision = Self.decisionBlockedNoSafeCodec
+        } else if preferredCodecFamily == "av1" {
+            decision = Self.decisionPreferAv1Hardware
+        } else if preferredCodecFamily == "hevc" {
+            decision = Self.decisionPreferHevcHardware
+        } else if preferredCodecFamily == "avc" {
+            decision = Self.decisionPreferAvcFallback
+        } else {
+            decision = Self.decisionBlockedNoSafeCodec
+        }
+
+        // ── Pass (mirrors Android pass rule exactly) ───────────────────────────
+        // manifest policy passes, preferred codec is not none,
+        // if HEVC/AV1 is present then fallback is avc,
+        // decision does not start with "blocked_".
+        let pass = manifestPolicyPass
+            && preferredCodecFamily != "none"
+            && ((!hevcManifestPresent && !av1ManifestPresent) || fallbackCodecFamily == "avc")
+            && !decision.hasPrefix("blocked_")
+
+        // ── Raw diagnostic string ─────────────────────────────────────────────
+        let rawStatus: String
+        if pass {
+            rawStatus = "status=OK;key=\(key);decision=\(decision);preferred=\(preferredCodecFamily);" +
+                "fallback=\(fallbackCodecFamily);safeCodecs=\(safeCodecFamilies.joined(separator: ","));" +
+                "renditionCount=\(renditionCount);lowestBandwidth=\(lowestBandwidth);highestBandwidth=\(highestBandwidth)"
+        } else {
+            rawStatus = "status=COMPATIBILITY_DECISION_FAILED;key=\(key);decision=\(decision);" +
+                "preferred=\(preferredCodecFamily);fallback=\(fallbackCodecFamily);" +
+                "warnings=\(warnings.joined(separator: ","));manifestPolicyPass=\(manifestPolicyPass)"
+        }
+
+        return [
+            "key":                  key,
+            "uri":                  uri,
+            "formatHint":           formatHint,
+            "pass":                 pass,
+            "manifestPolicyPass":   manifestPolicyPass,
+            "avcManifestPresent":   avcManifestPresent,
+            "hevcManifestPresent":  hevcManifestPresent,
+            "av1ManifestPresent":   av1ManifestPresent,
+            "avcDeviceSupported":   avcDeviceSupported,
+            "hevcDeviceSupported":  hevcDeviceSupported,
+            "av1DeviceSupported":   av1DeviceSupported,
+            "avcHardwareSafe":      avcHardwareSafe,
+            "hevcHardwareSafe":     hevcHardwareSafe,
+            "av1HardwareSafe":      av1HardwareSafe,
+            "preferredCodecFamily": preferredCodecFamily,
+            "fallbackCodecFamily":  fallbackCodecFamily,
+            "safeCodecFamilies":    safeCodecFamilies,
+            "riskyCodecFamilies":   riskyCodecFamilies,
+            "warnings":             warnings,
+            "renditionCount":       renditionCount,
+            "lowestBandwidth":      lowestBandwidth,
+            "highestBandwidth":     highestBandwidth,
+            "decision":             decision,
+            "raw":                  rawStatus,
+            "manifestValidation":   manifestValidation,
+        ]
+    }
+
+    // MARK: - Aggregate result (mirrors Android AdaptiveStreamingCompatibilityDecisionReport.buildReports)
+
+    private func _buildAggregateResult(
+        reports: [[String: Any]],
+        codecProbe: [String: Any]
+    ) -> [String: Any] {
+        let totalReports  = reports.count
+        let passedReports = reports.filter { $0["pass"] as? Bool == true }.count
+        let failedReports = totalReports - passedReports
+
+        let codecProbePass = codecProbe["pass"] as? Bool ?? false
+        let avcSupported   = codecProbe["avcSupported"] as? Bool ?? false
+        let hevcSupported  = codecProbe["hevcSupported"] as? Bool ?? false
+        let av1Supported   = codecProbe["av1Supported"] as? Bool ?? false
+
+        let codecsList = codecProbe["codecs"] as? [[String: Any]] ?? []
+        let hevcCodec  = codecsList.first { $0["codecKey"] as? String == "hevc" }
+        let hevcHardwareSafe = hevcCodec?["hardwareDecoderPresent"] as? Bool ?? false
+        let av1Codec   = codecsList.first { $0["codecKey"] as? String == "av1" }
+        let av1HardwareSafe  = av1Codec?["hardwareDecoderPresent"] as? Bool ?? false
+
+        var deviceWarnings = [String]()
+        if !avcSupported   { deviceWarnings.append(Self.warningMissingAvcFallback) }
+        if !hevcSupported  { deviceWarnings.append(Self.warningHevcUnsupported) }
+        else if !hevcHardwareSafe { deviceWarnings.append(Self.warningHevcSoftwareOnly) }
+        if !av1Supported   { deviceWarnings.append(Self.warningAv1Unsupported) }
+        else if !av1HardwareSafe  { deviceWarnings.append(Self.warningAv1SoftwareOnly) }
+
+        let allReportsPass = totalReports > 0 && failedReports == 0
+        let pass = allReportsPass && codecProbePass && avcSupported
+
+        let rawStatus: String
+        if pass {
+            rawStatus = "status=OK;total=\(totalReports);passed=\(passedReports);failed=0;codecProbePass=true;avcSupported=true"
+        } else {
+            rawStatus = "status=COMPATIBILITY_DECISION_FAILED;total=\(totalReports);passed=\(passedReports);" +
+                "failed=\(failedReports);codecProbePass=\(codecProbePass);avcSupported=\(avcSupported)"
+        }
+
+        return [
+            "phase":             Self.phase,
+            "pass":              pass,
+            "totalReports":      totalReports,
+            "passedReports":     passedReports,
+            "failedReports":     failedReports,
+            "codecProbePass":    codecProbePass,
+            "avcSupported":      avcSupported,
+            "hevcSupported":     hevcSupported,
+            "av1Supported":      av1Supported,
+            "av1HardwareSafe":   av1HardwareSafe,
+            "deviceWarnings":    deviceWarnings,
+            "serverLadderPolicy": Self.serverLadderPolicy,
+            "iosMirrorNote":     Self.iosMirrorNote,
+            "reports":           reports,
+            "raw":               rawStatus,
+        ]
+    }
+
+    // MARK: - Empty-specs guard (mirrors Android AdaptiveStreamingCompatibilityDecisionSmokeHarness)
+
+    private func _emptySpecsResult(codecProbe: [String: Any]) -> [String: Any] {
+        return [
+            "phase":             Self.phase,
+            "pass":              false,
+            "totalReports":      0,
+            "passedReports":     0,
+            "failedReports":     0,
+            "codecProbePass":    false,
+            "avcSupported":      false,
+            "hevcSupported":     false,
+            "av1Supported":      false,
+            "av1HardwareSafe":   false,
+            "deviceWarnings":    [String](),
+            "serverLadderPolicy": Self.serverLadderPolicy,
+            "iosMirrorNote":     Self.iosMirrorNote,
+            "reports":           [[String: Any]](),
+            "raw":               "status=FAIL;reason=no_manifest_specs",
+        ]
+    }
+
+    // MARK: - Canonical default public stream specs (match Android defaults exactly)
+
+    private static func _defaultPublicSpecs() -> [[String: Any]] {
+        return [
+            [
+                "key":                   "mux_hls_test",
+                "uri":                   "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8",
+                "formatHint":            "HLS",
+                "requireAdaptiveLadder": true,
+                "requireAvcFallback":    true,
+                "requireLlHlsTags":      false,
+                "allowMediaPlaylist":    false,
+            ],
+            [
+                "key":                   "shaka_angel_one_dash",
+                "uri":                   "https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd",
+                "formatHint":            "DASH",
+                "requireAdaptiveLadder": true,
+                "requireAvcFallback":    true,
+                "requireLlHlsTags":      false,
+                "allowMediaPlaylist":    false,
+            ],
+            [
+                "key":                   "mux_ll_hls_test",
+                "uri":                   "https://stream.mux.com/v69RSHhFelSm4701snP22dYz2jICy4E4FUyk02rW4gxRM.m3u8",
+                "formatHint":            "HLS",
                 "requireAdaptiveLadder": true,
                 "requireAvcFallback":    true,
                 "requireLlHlsTags":      false,
