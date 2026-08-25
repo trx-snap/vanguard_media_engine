@@ -150,6 +150,12 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // Pure diagnostic: allocates no AVPlayer, FlutterTexture, or media objects.
     private let streamingPreflightCoordinator = VGStreamingPreflightCoordinator()
 
+    // ── Phase 4C8W: iOS manifest policy validation (mirrors Android Phase 4C5D) ─
+    // Sole owner of all Phase 4C8W manifest-policy logic for the route
+    // `runAndroidDagPhase4C5DManifestPolicyValidation`. Pure diagnostic:
+    // allocates no AVPlayer, FlutterTexture, cache, audio, or media objects.
+    private let streamingManifestPolicyValidator = VGStreamingManifestPolicyValidator()
+
     // ── Phase 10-C Slice T: managed audio extraction handler ─────────────────
     // Owns the operation registry, VGAudioOnlyExporter instances, and
     // terminal/cancellation bookkeeping for beginAudioExtraction and
@@ -1732,6 +1738,18 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // exactly once on the main thread. Pure diagnostic — no playback mutation.
         if call.method == "runAndroidDagPhase4C5CManifestRenditionSmoke" {
             _runPhase4C8VManifestRenditionSmoke(result: result)
+            return
+        }
+
+        // ── Phase 4C8W: iOS streaming manifest policy validation parity ───────
+        // Handles route `runAndroidDagPhase4C5DManifestPolicyValidation` on iOS.
+        // Same route name as Android so VGStreamingManifestPolicyClient.validate
+        // stays stable. Network work runs on a background queue inside the helper;
+        // result() is called exactly once on the main thread.
+        // Pure diagnostic — no AVPlayer, FlutterTexture, cache, audio, WebRTC,
+        // LiveKit, camera, editor, export, or VanguardEngineMode interaction.
+        if call.method == "runAndroidDagPhase4C5DManifestPolicyValidation" {
+            streamingManifestPolicyValidator.validate(args: args, result: result)
             return
         }
 

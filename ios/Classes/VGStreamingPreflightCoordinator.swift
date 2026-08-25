@@ -584,3 +584,904 @@ final class VGStreamingPreflightCoordinator {
         ]
     }
 }
+
+// MARK: - VGStreamingManifestPolicyValidator (Phase 4C8W)
+//
+// Moved from the standalone VGStreamingManifestPolicyValidator.swift (now deleted)
+// into this already-compiled file so it is included in the current Pods build
+// without requiring CocoaPods regeneration.
+//
+// Mirrors Android Phase 4C5D (AdaptiveStreamingManifestPolicySmokeHarness +
+// AdaptiveStreamingManifestPolicyValidator) behind the shared MethodChannel route
+// `runAndroidDagPhase4C5DManifestPolicyValidation` so the public Dart API
+// (VGStreamingManifestPolicyClient.validate) stays stable across platforms.
+//
+// Invariants:
+//   - Zero AVPlayer / AVPlayerItem / AVAssetReader / VTDecompressionSession /
+//     CVPixelBuffer / FlutterTexture / cache / audio / WebRTC / LiveKit / camera /
+//     editor / export / VanguardEngineMode / switchToMode interaction.
+//   - Manifest-only: media segment / container URLs rejected before any network fetch.
+//   - 2 MB response cap; ephemeral URLSession (no caching); custom headers
+//     copied only when both key and value are String instances.
+//   - All network work on a background queue; FlutterResult called exactly once,
+//     on the main thread.
+//   - DASH is manifest-diagnostic only on iOS (no AVPlayer involvement).
+//   - validate(args:result:) captures self strongly — FlutterResult is always
+//     delivered even if the plugin drops its reference to this instance.
+//   - _fetchManifest uses a bounded DispatchSemaphore.wait(timeout:); on expiry
+//     the URLSessionDataTask is cancelled and the session is invalidated, then a
+//     timeout error is thrown. URLRequest timeout alone does not satisfy this invariant.
+
+/// Package-internal helper that owns all Phase 4C8W manifest-policy logic.
+/// The plugin holds an instance and forwards the single method-channel call here.
+final class VGStreamingManifestPolicyValidator {
+
+    // ── Phase / policy constants (match Android strings exactly) ──────────────
+
+    static let phase              = "Phase4C5D"
+    static let serverLadderPolicy = "add_hevc_av1_renditions_but_keep_avc_fallback"
+    static let iosMirrorNote      =
+        "iOS AVPlayer/AVFoundation manifest selection must maintain H.264/AVC fallback renditions alongside HEVC/AV1."
+
+    // ── Policy failure reason strings (match Android constants exactly) ───────
+
+    private static let failureFetchFailed            = "fetch_failed"
+    private static let failureParseFailed            = "parse_failed"
+    private static let failureAdaptiveLadderRequired = "adaptive_ladder_required"
+    private static let failureMediaPlaylistNotAllowed = "media_playlist_not_allowed"
+    private static let failureAvcFallbackRequired    = "avc_fallback_required_for_modern_codecs"
+    private static let failureLlHlsTagsRequired      = "ll_hls_tags_required"
+    private static let failureInvalidManifestSpec    = "invalid_manifest_spec"
+
+    // ── Canonical default public streams (match Android defaults exactly) ─────
+
+    private static let defaultHlsUri   = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+    private static let defaultDashUri  = "https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd"
+    private static let defaultLlHlsUri = "https://stream.mux.com/v69RSHhFelSm4701snP22dYz2jICy4E4FUyk02rW4gxRM.m3u8"
+
+    // ── Segment rejection probe URI (match Android exactly) ───────────────────
+
+    private static let fakeSegmentUri = "https://example.com/video/segment_00001.m4s"
+
+    // ── Valid format hints ────────────────────────────────────────────────────
+
+    private static let validFormatHints: Set<String> = ["AUTO", "HLS", "DASH"]
+
+    // ── Media segment / container extensions to reject before fetch ───────────
+
+    private static let segmentExtensions: Set<String> = [
+        "ts", "m4s", "mp4", "webm", "m4a", "m4v", "m4b", "m4p",
+        "aac", "mp3", "ogg", "oga", "opus", "flac", "wav",
+        "f4v", "f4f", "cmfv", "cmfa",
+    ]
+
+    // ── Max manifest response size ────────────────────────────────────────────
+
+    private static let maxManifestBytes = 2 * 1024 * 1024  // 2 MB
+
+    // ── Fetch timeouts ────────────────────────────────────────────────────────
+    // requestTimeout  — URLRequest / URLSession per-request timeout.
+    // resourceTimeout — URLSession per-resource timeout (upper bound for transfer).
+    // semaphoreTimeout — Bounded semaphore deadline; on expiry the task is
+    //                    cancelled and the session invalidated before throwing.
+    //                    Must exceed resourceTimeout so URLSession can fire its
+    //                    own error first in the normal case, while still providing
+    //                    a hard OS-level resource-release guarantee.
+
+    private static let requestTimeout:   TimeInterval = 12.0
+    private static let resourceTimeout:  TimeInterval = 20.0
+    private static let semaphoreTimeout: TimeInterval = 24.0   // requestTimeout + margin
+
+    // ── Background queue ──────────────────────────────────────────────────────
+
+    private let bgQueue = DispatchQueue(
+        label: "com.vanguard.p4c8w.manifestPolicy",
+        qos: .userInitiated
+    )
+
+    // MARK: - Public entry point
+
+    /// Called from the plugin's `handle(_:result:)` dispatch guard.
+    /// Runs all network I/O on `bgQueue`; delivers result exactly once on `DispatchQueue.main`.
+    ///
+    /// Uses `[self]` (strong capture) intentionally: the validator must remain alive
+    /// for the duration of its network calls so that `result(...)` is never dropped
+    /// by an early `guard let self = self else { return }` path.
+    func validate(args: [String: Any]?, result: @escaping FlutterResult) {
+        bgQueue.async { [self] in
+            let output = self._runValidation(args: args)
+            DispatchQueue.main.async { result(output) }
+        }
+    }
+
+    // MARK: - Orchestration (runs on bgQueue)
+
+    private func _runValidation(args: [String: Any]?) -> [String: Any] {
+        // Resolve manifest specs: use host-supplied list or fall back to canonical defaults.
+        let specs: [[String: Any]]
+        if let raw = args?["manifests"] as? [[String: Any]], !raw.isEmpty {
+            specs = raw
+        } else if let raw = args?["manifests"] as? [Any], !raw.isEmpty,
+                  let typed = raw.compactMap({ $0 as? [String: Any] }) as [[String: Any]]?,
+                  !typed.isEmpty {
+            specs = typed
+        } else {
+            specs = Self._defaultPublicSpecs()
+        }
+
+        guard !specs.isEmpty else {
+            return _emptySpecsResult()
+        }
+
+        do {
+            // 1. Validate each spec.
+            let results: [[String: Any]] = specs.map { _validateSpec($0) }
+            let total    = results.count
+            let passed   = results.filter { $0["pass"] as? Bool == true }.count
+            let failed   = total - passed
+
+            // 2. Internal segment-rejection security probe.
+            let segmentSpec: [String: Any] = [
+                "key":        "segment_rejection_probe",
+                "uri":        Self.fakeSegmentUri,
+                "formatHint": "AUTO",
+            ]
+            let segmentResult = _validateSpec(segmentSpec)
+            let segmentRaw    = segmentResult["raw"] as? String ?? ""
+            let segmentInspRaw = (segmentResult["inspection"] as? [String: Any])?["raw"] as? String ?? ""
+            let segPolicyFails = segmentResult["policyFailures"] as? [String] ?? []
+
+            // Segment must be rejected before fetch:
+            // fetchSuccess == false AND (raw or inspectionRaw contains media_segment_uri_rejected
+            // OR policyFailures == [fetch_failed]).
+            let segmentFetchSuccess = segmentResult["fetchSuccess"] as? Bool ?? false
+            let segmentRejectionPass = !segmentFetchSuccess &&
+                (segmentRaw.contains("media_segment_uri_rejected") ||
+                 segmentInspRaw.contains("media_segment_uri_rejected") ||
+                 segPolicyFails == [Self.failureFetchFailed])
+
+            // 3. Overall pass: all manifests passed, at least 1 validated, segment rejected.
+            let allManifestsPass = failed == 0 && total > 0
+            let overallPass      = allManifestsPass && segmentRejectionPass
+
+            let rawStatus: String
+            if overallPass {
+                rawStatus = "status=OK;total=\(total);passed=\(passed);failed=0;" +
+                    "segmentRejectionPass=true;allManifestsPass=true"
+            } else {
+                rawStatus = "status=MANIFEST_POLICY_VALIDATION_FAILED;total=\(total);passed=\(passed);" +
+                    "failed=\(failed);segmentRejectionPass=\(segmentRejectionPass);" +
+                    "allManifestsPass=\(allManifestsPass)"
+            }
+
+            return [
+                "phase":                   Self.phase,
+                "pass":                    overallPass,
+                "totalManifestsValidated": total,
+                "passedManifests":         passed,
+                "failedManifests":         failed,
+                "segmentRejectionPass":    segmentRejectionPass,
+                "serverLadderPolicy":      Self.serverLadderPolicy,
+                "iosMirrorNote":           Self.iosMirrorNote,
+                "results":                 results,
+                "segmentRejectionResult":  segmentResult,
+                "raw":                     rawStatus,
+            ]
+        }
+    }
+
+    // MARK: - Per-spec validation
+
+    private func _validateSpec(_ spec: [String: Any]?) -> [String: Any] {
+        guard let spec = spec else {
+            return _buildInvalidResult(key: "", uri: "", formatHint: "AUTO",
+                                       failures: [Self.failureInvalidManifestSpec])
+        }
+
+        let key        = (spec["key"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
+        let uri        = (spec["uri"] as? String)?.trimmingCharacters(in: .whitespaces) ?? ""
+        let formatHint = ((spec["formatHint"] as? String)?.trimmingCharacters(in: .whitespaces)
+                            .uppercased()) ?? "AUTO"
+
+        guard !key.isEmpty, !uri.isEmpty, Self.validFormatHints.contains(formatHint) else {
+            return _buildInvalidResult(key: key, uri: uri, formatHint: formatHint,
+                                       failures: [Self.failureInvalidManifestSpec])
+        }
+
+        let requireAdaptiveLadder = spec["requireAdaptiveLadder"] as? Bool ?? true
+        let requireAvcFallback    = spec["requireAvcFallback"]    as? Bool ?? true
+        let requireLlHlsTags      = spec["requireLlHlsTags"]      as? Bool ?? false
+        let allowMediaPlaylist    = spec["allowMediaPlaylist"]     as? Bool ?? false
+
+        // Copy HTTP headers only when both key and value are strings.
+        var httpHeaders: [String: String]? = nil
+        if let rawHeaders = spec["httpHeaders"] as? [String: Any] {
+            var h = [String: String]()
+            for (k, v) in rawHeaders {
+                if let sv = v as? String { h[k] = sv }
+            }
+            if !h.isEmpty { httpHeaders = h }
+        } else if let rawHeaders = spec["httpHeaders"] as? [String: String] {
+            httpHeaders = rawHeaders
+        }
+
+        // Run the inspection (includes media-segment-extension pre-filter).
+        let hintArg: String? = formatHint == "AUTO" ? nil : formatHint
+        let inspection = _inspectUri(uri: uri, formatHint: hintArg, httpHeaders: httpHeaders)
+
+        let fetchSuccess    = inspection["fetchSuccess"]  as? Bool ?? false
+        let parseSuccess    = inspection["parseSuccess"]  as? Bool ?? false
+        let isMediaPlaylist = inspection["isMediaPlaylist"] as? Bool ?? false
+        let variantCount    = inspection["variantCount"]  as? Int  ?? 0
+        let repCount        = (inspection["representationCount"] as? Int) ?? variantCount
+        let hasAdaptiveLadder = inspection["hasAdaptiveLadder"] as? Bool ?? false
+        let hasAvc          = inspection["hasAvc"]          as? Bool ?? false
+        let hasHevc         = inspection["hasHevc"]         as? Bool ?? false
+        let hasAv1          = inspection["hasAv1"]          as? Bool ?? false
+        let serverPolicyPass = inspection["serverPolicyPass"] as? Bool ?? false
+
+        var policyFailures = [String]()
+
+        if !fetchSuccess {
+            policyFailures.append(Self.failureFetchFailed)
+        } else if !parseSuccess {
+            policyFailures.append(Self.failureParseFailed)
+        } else {
+            if !allowMediaPlaylist && isMediaPlaylist {
+                policyFailures.append(Self.failureMediaPlaylistNotAllowed)
+            }
+            if requireAdaptiveLadder && !hasAdaptiveLadder {
+                policyFailures.append(Self.failureAdaptiveLadderRequired)
+            }
+            if requireAvcFallback && !serverPolicyPass {
+                policyFailures.append(Self.failureAvcFallbackRequired)
+            }
+            if requireLlHlsTags {
+                let llIndicators = inspection["llHlsIndicators"] as? [String: Any]
+                let isLlHls      = llIndicators?["isLlHls"] as? Bool ?? false
+                if !isLlHls {
+                    policyFailures.append(Self.failureLlHlsTagsRequired)
+                }
+            }
+        }
+
+        let pass = policyFailures.isEmpty
+        let rawStatus: String
+        if pass {
+            rawStatus = "status=OK;key=\(key);formatHint=\(formatHint);variantCount=\(variantCount);" +
+                "hasAdaptiveLadder=\(hasAdaptiveLadder);hasAvc=\(hasAvc);hasHevc=\(hasHevc);" +
+                "hasAv1=\(hasAv1);serverPolicyPass=\(serverPolicyPass)"
+        } else {
+            rawStatus = "status=FAIL;key=\(key);formatHint=\(formatHint);" +
+                "failures=\(policyFailures.joined(separator: ","));" +
+                "rawInspection=\(inspection["raw"] as? String ?? "")"
+        }
+
+        return [
+            "key":               key,
+            "uri":               uri,
+            "formatHint":        formatHint,
+            "pass":              pass,
+            "fetchSuccess":      fetchSuccess,
+            "parseSuccess":      parseSuccess,
+            "hasAdaptiveLadder": hasAdaptiveLadder,
+            "variantCount":      variantCount,
+            "representationCount": repCount,
+            "hasAvc":            hasAvc,
+            "hasHevc":           hasHevc,
+            "hasAv1":            hasAv1,
+            "serverPolicyPass":  serverPolicyPass,
+            "policyFailures":    policyFailures,
+            "raw":               rawStatus,
+            "inspection":        inspection,
+        ]
+    }
+
+    // MARK: - URI inspection (fetch + parse)
+
+    /// Inspects a single URI. Rejects segment extensions before fetch.
+    /// Returns a structured inspection map (fetchSuccess, parseSuccess, …).
+    private func _inspectUri(uri: String,
+                              formatHint: String?,
+                              httpHeaders: [String: String]?) -> [String: Any] {
+        // Pre-filter: reject media segment / container extensions without a network round-trip.
+        if _isMediaSegmentUri(uri) {
+            let raw = "status=FAIL;reason=media_segment_uri_rejected;\(uri)"
+            return _fetchFailResult(uri: uri, formatHint: formatHint,
+                                    reason: "media_segment_uri_rejected", rawOverride: raw)
+        }
+
+        do {
+            let (body, resolvedUri) = try _fetchManifest(urlStr: uri, httpHeaders: httpHeaders)
+            let format = _determineFormat(uri: resolvedUri, body: body, hint: formatHint)
+            switch format {
+            case "DASH":
+                return _inspectDash(originalUri: uri, resolvedUri: resolvedUri, body: body)
+            default:
+                return _inspectHls(originalUri: uri, resolvedUri: resolvedUri, body: body)
+            }
+        } catch {
+            let msg = error.localizedDescription
+            let isMsgSegRejected = msg.contains("media_segment_uri_rejected")
+            let raw = isMsgSegRejected
+                ? "status=FAIL;reason=\(msg)"
+                : "status=FAIL;reason=fetch_or_parse_exception:\(msg)"
+            return _fetchFailResult(uri: uri, formatHint: formatHint, reason: msg, rawOverride: raw)
+        }
+    }
+
+    // MARK: - Network fetch
+
+    private func _isMediaSegmentUri(_ uriStr: String) -> Bool {
+        guard !uriStr.isEmpty else { return false }
+        let pathPart: String
+        if let url = URL(string: uriStr) {
+            pathPart = url.path
+        } else {
+            pathPart = uriStr.components(separatedBy: "?").first ?? uriStr
+        }
+        let filename = (pathPart as NSString).lastPathComponent.lowercased()
+        let ext      = (filename as NSString).pathExtension
+        return !ext.isEmpty && Self.segmentExtensions.contains(ext)
+    }
+
+    /// Fetches a manifest synchronously (called from the bgQueue thread).
+    ///
+    /// Bounded-timeout invariant:
+    ///   A `DispatchSemaphore.wait(timeout:)` with `semaphoreTimeout` (24 s) is used
+    ///   in addition to the URLRequest/URLSession timeout so that a hung OS socket
+    ///   does not block the caller thread forever. On expiry the task is cancelled,
+    ///   the session is invalidated, and a `timeout_fetch_failure` error is thrown.
+    private func _fetchManifest(urlStr: String,
+                                 httpHeaders: [String: String]?) throws -> (String, String) {
+        // Media-segment extension guard (also catches segment URIs that bypass the outer check).
+        guard !_isMediaSegmentUri(urlStr) else {
+            throw NSError(
+                domain: "VGP4C8W", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "media_segment_uri_rejected: \(urlStr)"]
+            )
+        }
+        guard let url = URL(string: urlStr) else {
+            throw NSError(
+                domain: "VGP4C8W", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "invalid_url: \(urlStr)"]
+            )
+        }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest  = Self.requestTimeout
+        cfg.timeoutIntervalForResource = Self.resourceTimeout
+        cfg.requestCachePolicy         = .reloadIgnoringLocalAndRemoteCacheData
+        let session = URLSession(configuration: cfg)
+
+        var request = URLRequest(url: url)
+        request.setValue("Vanguard-Manifest-PolicyInspector/1.0", forHTTPHeaderField: "User-Agent")
+        // Copy custom headers; only String key+value pairs (already filtered at call site).
+        httpHeaders?.forEach { k, v in request.setValue(v, forHTTPHeaderField: k) }
+
+        var resultData:     Data?
+        var resultResponse: URLResponse?
+        var resultError:    Error?
+        let semaphore = DispatchSemaphore(value: 0)
+
+        let task = session.dataTask(with: request) { data, response, error in
+            resultData     = data
+            resultResponse = response
+            resultError    = error
+            semaphore.signal()
+        }
+        task.resume()
+
+        // Bounded wait: semaphoreTimeout exceeds resourceTimeout so URLSession
+        // normally fires its own error first. On expiry, cancel the task and
+        // invalidate the session immediately to release OS sockets and callbacks.
+        let waitOutcome = semaphore.wait(timeout: .now() + Self.semaphoreTimeout)
+        if waitOutcome == .timedOut {
+            task.cancel()
+            session.invalidateAndCancel()
+            throw NSError(
+                domain: "VGP4C8W", code: 7,
+                userInfo: [NSLocalizedDescriptionKey: "timeout_fetch_failure: semaphore expired after \(Int(Self.semaphoreTimeout))s"]
+            )
+        }
+        // Completed normally — finish session to release delegate/callback references.
+        session.finishTasksAndInvalidate()
+
+        if let error = resultError { throw error }
+        guard let httpResponse = resultResponse as? HTTPURLResponse else {
+            throw NSError(domain: "VGP4C8W", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "non_http_response"])
+        }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            throw NSError(domain: "VGP4C8W", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: "http_error:\(httpResponse.statusCode)"])
+        }
+        guard let data = resultData else {
+            throw NSError(domain: "VGP4C8W", code: 5,
+                          userInfo: [NSLocalizedDescriptionKey: "no_data"])
+        }
+        guard data.count <= Self.maxManifestBytes else {
+            throw NSError(domain: "VGP4C8W", code: 6,
+                          userInfo: [NSLocalizedDescriptionKey: "manifest_exceeds_max_bytes"])
+        }
+        let body       = String(data: data, encoding: .utf8)
+            ?? String(data: data, encoding: .isoLatin1)
+            ?? ""
+        let resolvedUri = httpResponse.url?.absoluteString ?? urlStr
+        return (body, resolvedUri)
+    }
+
+    // MARK: - Format determination
+
+    private func _determineFormat(uri: String, body: String, hint: String?) -> String {
+        if let h = hint?.uppercased(), h == "HLS" || h == "DASH" { return h }
+        let lower = uri.lowercased()
+        if lower.contains(".m3u8") { return "HLS" }
+        if lower.contains(".mpd")  { return "DASH" }
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("#EXTM3U") { return "HLS" }
+        if trimmed.uppercased().hasPrefix("<MPD") || trimmed.hasPrefix("<?xml") { return "DASH" }
+        return "HLS"
+    }
+
+    // MARK: - HLS inspection
+
+    private func _inspectHls(originalUri: String,
+                              resolvedUri: String,
+                              body: String) -> [String: Any] {
+        let lines = body.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        var variants       = [[String: Any]]()
+        var pendingAttrs: [String: String]? = nil
+
+        var hasExtXPart          = false
+        var hasExtXServerControl = false
+        var hasExtXPreloadHint   = false
+        var hasExtXPartInf       = false
+        var hasExtInf            = false
+        var hasTargetDuration    = false
+
+        for line in lines {
+            if line.isEmpty { continue }
+            if line.hasPrefix("#EXT-X-PART:")          || line.hasPrefix("#EXT-X-PART ")          { hasExtXPart          = true }
+            if line.hasPrefix("#EXT-X-SERVER-CONTROL:") || line.hasPrefix("#EXT-X-SERVER-CONTROL ") { hasExtXServerControl = true }
+            if line.hasPrefix("#EXT-X-PRELOAD-HINT:")  || line.hasPrefix("#EXT-X-PRELOAD-HINT ")  { hasExtXPreloadHint   = true }
+            if line.hasPrefix("#EXT-X-PART-INF:")      || line.hasPrefix("#EXT-X-PART-INF ")      { hasExtXPartInf       = true }
+            if line.hasPrefix("#EXTINF:")               || line.hasPrefix("#EXTINF ")              { hasExtInf            = true }
+            if line.hasPrefix("#EXT-X-TARGETDURATION:") || line.hasPrefix("#EXT-X-TARGETDURATION ") { hasTargetDuration  = true }
+
+            if line.hasPrefix("#EXT-X-STREAM-INF:") {
+                let attrStr = String(line.dropFirst("#EXT-X-STREAM-INF:".count))
+                pendingAttrs = _parseHlsAttrList(attrStr)
+                continue
+            }
+            if let attrs = pendingAttrs {
+                if !line.hasPrefix("#") {
+                    let variantUri = _resolveUri(base: resolvedUri, relative: line)
+                    let bw         = Int(attrs["BANDWIDTH"] ?? "") ?? 0
+                    let avgBw      = Int(attrs["AVERAGE-BANDWIDTH"] ?? "") ?? bw
+                    let res        = attrs["RESOLUTION"] ?? ""
+                    let resParts   = res.split(separator: "x").map { String($0) }
+                    let w          = Int(resParts.first ?? "") ?? 0
+                    let h          = Int(resParts.dropFirst().first ?? "") ?? 0
+                    let codecs     = attrs["CODECS"] ?? ""
+                    let frameRate  = attrs["FRAME-RATE"] ?? "0.0"
+                    let name       = attrs["NAME"] ?? ""
+                    let cf         = _detectCodecs(codecs)
+                    let idx        = variants.count
+                    let v: [String: Any] = [
+                        "index":            idx,
+                        "id":               "",
+                        "uri":              variantUri,
+                        "rawUri":           line,
+                        "adaptationSetId":  "",
+                        "bandwidth":        bw,
+                        "averageBandwidth": avgBw,
+                        "resolution":       res,
+                        "width":            w,
+                        "height":           h,
+                        "codecs":           codecs,
+                        "mimeType":         "",
+                        "frameRate":        frameRate,
+                        "name":             name,
+                        "hasAvc":           cf.hasAvc,
+                        "hasHevc":          cf.hasHevc,
+                        "hasAv1":           cf.hasAv1,
+                        "detectedFamilies": cf.families,
+                    ]
+                    variants.append(v)
+                }
+                pendingAttrs = nil
+            }
+        }
+
+        let isMediaPlaylist   = variants.isEmpty && (hasExtInf || hasTargetDuration)
+        let variantCount      = variants.count
+        let hasAdaptiveLadder = variantCount > 1
+        let hasAvc            = variants.contains { $0["hasAvc"]  as? Bool == true }
+        let hasHevc           = variants.contains { $0["hasHevc"] as? Bool == true }
+        let hasAv1            = variants.contains { $0["hasAv1"]  as? Bool == true }
+        let serverPolicyPass  = (!hasHevc && !hasAv1) || hasAvc
+        let isLlHls           = hasExtXPart || hasExtXServerControl || hasExtXPreloadHint || hasExtXPartInf
+
+        let rawStatus = "status=OK;format=HLS;variantCount=\(variantCount);" +
+            "hasAdaptiveLadder=\(hasAdaptiveLadder);hasAvc=\(hasAvc);" +
+            "hasHevc=\(hasHevc);hasAv1=\(hasAv1);serverPolicyPass=\(serverPolicyPass);" +
+            "isLlHls=\(isLlHls);isMediaPlaylist=\(isMediaPlaylist)"
+
+        return [
+            "format":              "HLS",
+            "uri":                 originalUri.isEmpty ? resolvedUri : originalUri,
+            "resolvedUri":         resolvedUri,
+            "fetchSuccess":        true,
+            "parseSuccess":        true,
+            "isMediaPlaylist":     isMediaPlaylist,
+            "variantCount":        variantCount,
+            "representationCount": variantCount,
+            "hasAdaptiveLadder":   hasAdaptiveLadder,
+            "hasAvc":              hasAvc,
+            "hasHevc":             hasHevc,
+            "hasAv1":              hasAv1,
+            "serverPolicyPass":    serverPolicyPass,
+            "llHlsIndicators": [
+                "hasExtXPart":          hasExtXPart,
+                "hasExtXServerControl": hasExtXServerControl,
+                "hasExtXPreloadHint":   hasExtXPreloadHint,
+                "hasExtXPartInf":       hasExtXPartInf,
+                "isLlHls":              isLlHls,
+            ] as [String: Any],
+            "variants":        variants,
+            "representations": variants,
+            "raw":             rawStatus,
+        ]
+    }
+
+    // MARK: - DASH inspection (manifest-diagnostic only; no AVPlayer)
+
+    private func _inspectDash(originalUri: String,
+                               resolvedUri: String,
+                               body: String) -> [String: Any] {
+        class DashSaxDelegate: NSObject, XMLParserDelegate {
+            var videoReps       = [[String: Any]]()
+            var asId            = ""
+            var asContentType   = ""
+            var asMimeType      = ""
+            var asCodecs        = ""
+            var asWidth         = ""
+            var asHeight        = ""
+            var asFrameRate     = ""
+
+            func parser(_ parser: XMLParser,
+                         didStartElement elementName: String,
+                         namespaceURI: String?,
+                         qualifiedName qName: String?,
+                         attributes attrs: [String: String] = [:]) {
+                let tag = elementName.components(separatedBy: ":").last ?? elementName
+
+                if tag == "AdaptationSet" {
+                    asId          = attrs["id"]          ?? ""
+                    asContentType = attrs["contentType"] ?? ""
+                    asMimeType    = attrs["mimeType"]    ?? ""
+                    asCodecs      = attrs["codecs"]      ?? ""
+                    asWidth       = attrs["width"]       ?? attrs["maxWidth"]  ?? ""
+                    asHeight      = attrs["height"]      ?? attrs["maxHeight"] ?? ""
+                    asFrameRate   = attrs["frameRate"]   ?? ""
+                }
+
+                if tag == "Representation" {
+                    let repId    = attrs["id"]        ?? ""
+                    let repBw    = Int(attrs["bandwidth"] ?? "") ?? 0
+                    let repW     = Int(attrs["width"]     ?? asWidth)  ?? 0
+                    let repH     = Int(attrs["height"]    ?? asHeight) ?? 0
+                    let repCodecs = (attrs["codecs"]   ?? "").isEmpty ? asCodecs : (attrs["codecs"] ?? "")
+                    let repMime  = (attrs["mimeType"]  ?? "").isEmpty ? asMimeType : (attrs["mimeType"] ?? "")
+                    let repFR    = (attrs["frameRate"] ?? "").isEmpty ? asFrameRate : (attrs["frameRate"] ?? "")
+
+                    let isVideo = asContentType.lowercased() == "video"
+                        || asMimeType.lowercased().hasPrefix("video/")
+                        || repMime.lowercased().hasPrefix("video/")
+                        || (repW > 0 && repH > 0)
+                    guard isVideo else { return }
+
+                    let lower   = repCodecs.lowercased()
+                    let hasAvc  = lower.contains("avc1") || lower.contains("avc3")
+                    let hasHevc = lower.contains("hvc1") || lower.contains("hev1")
+                    let hasAv1  = lower.contains("av01")
+                    var families = [String]()
+                    if hasAvc  { families.append("avc") }
+                    if hasHevc { families.append("hevc") }
+                    if hasAv1  { families.append("av1") }
+                    if lower.contains("vp09") || lower.contains("vp9") { families.append("vp9") }
+                    if lower.contains("mp4a") || lower.contains("aac") { families.append("aac") }
+
+                    let idx = videoReps.count
+                    videoReps.append([
+                        "index":            idx,
+                        "id":               repId,
+                        "uri":              "",
+                        "rawUri":           "",
+                        "adaptationSetId":  asId,
+                        "bandwidth":        repBw,
+                        "averageBandwidth": repBw,
+                        "resolution":       repW > 0 && repH > 0 ? "\(repW)x\(repH)" : "",
+                        "width":            repW,
+                        "height":           repH,
+                        "codecs":           repCodecs,
+                        "mimeType":         repMime,
+                        "frameRate":        repFR,
+                        "name":             "",
+                        "hasAvc":           hasAvc,
+                        "hasHevc":          hasHevc,
+                        "hasAv1":           hasAv1,
+                        "detectedFamilies": families,
+                    ] as [String: Any])
+                }
+            }
+
+            func parser(_ parser: XMLParser,
+                         didEndElement elementName: String,
+                         namespaceURI: String?,
+                         qualifiedName qName: String?) {
+                let tag = elementName.components(separatedBy: ":").last ?? elementName
+                if tag == "AdaptationSet" {
+                    asId = ""; asContentType = ""; asMimeType = ""
+                    asCodecs = ""; asWidth = ""; asHeight = ""; asFrameRate = ""
+                }
+            }
+        }
+
+        guard let data = body.data(using: .utf8) else {
+            return _dashParseFailResult(originalUri: originalUri, resolvedUri: resolvedUri,
+                                        reason: "utf8_encode_failed")
+        }
+        let delegate = DashSaxDelegate()
+        let parser   = XMLParser(data: data)
+        parser.shouldProcessNamespaces      = true
+        parser.shouldReportNamespacePrefixes = false
+        parser.delegate = delegate
+        guard parser.parse() else {
+            let reason = parser.parserError?.localizedDescription ?? "xml_parse_error"
+            return _dashParseFailResult(originalUri: originalUri, resolvedUri: resolvedUri,
+                                        reason: reason)
+        }
+
+        let reps              = delegate.videoReps
+        let repCount          = reps.count
+        let hasAdaptiveLadder = repCount > 1
+        let hasAvc            = reps.contains { $0["hasAvc"]  as? Bool == true }
+        let hasHevc           = reps.contains { $0["hasHevc"] as? Bool == true }
+        let hasAv1            = reps.contains { $0["hasAv1"]  as? Bool == true }
+        let serverPolicyPass  = (!hasHevc && !hasAv1) || hasAvc
+
+        let rawStatus = "status=OK;format=DASH;representationCount=\(repCount);" +
+            "hasAdaptiveLadder=\(hasAdaptiveLadder);hasAvc=\(hasAvc);" +
+            "hasHevc=\(hasHevc);hasAv1=\(hasAv1);serverPolicyPass=\(serverPolicyPass)"
+
+        return [
+            "format":              "DASH",
+            "uri":                 originalUri.isEmpty ? resolvedUri : originalUri,
+            "resolvedUri":         resolvedUri,
+            "fetchSuccess":        true,
+            "parseSuccess":        true,
+            "isMediaPlaylist":     false,
+            "variantCount":        repCount,
+            "representationCount": repCount,
+            "hasAdaptiveLadder":   hasAdaptiveLadder,
+            "hasAvc":              hasAvc,
+            "hasHevc":             hasHevc,
+            "hasAv1":              hasAv1,
+            "serverPolicyPass":    serverPolicyPass,
+            "llHlsIndicators":     [String: Any](),
+            "variants":            reps,
+            "representations":     reps,
+            "raw":                 rawStatus,
+        ]
+    }
+
+    private func _dashParseFailResult(originalUri: String,
+                                       resolvedUri: String,
+                                       reason: String) -> [String: Any] {
+        return [
+            "format":              "DASH",
+            "uri":                 originalUri.isEmpty ? resolvedUri : originalUri,
+            "resolvedUri":         resolvedUri,
+            "fetchSuccess":        true,
+            "parseSuccess":        false,
+            "isMediaPlaylist":     false,
+            "variantCount":        0,
+            "representationCount": 0,
+            "hasAdaptiveLadder":   false,
+            "hasAvc":              false,
+            "hasHevc":             false,
+            "hasAv1":              false,
+            "serverPolicyPass":    false,
+            "llHlsIndicators":     [String: Any](),
+            "variants":            [[String: Any]](),
+            "representations":     [[String: Any]](),
+            "raw":                 "status=FAIL;reason=dash_parse_exception:\(reason)",
+        ]
+    }
+
+    // MARK: - Shared helpers
+
+    private struct _CodecFlags {
+        let hasAvc: Bool; let hasHevc: Bool; let hasAv1: Bool
+        let families: [String]
+    }
+
+    private func _detectCodecs(_ codecsStr: String?) -> _CodecFlags {
+        guard let s = codecsStr, !s.isEmpty else {
+            return _CodecFlags(hasAvc: false, hasHevc: false, hasAv1: false, families: [])
+        }
+        var hasAvc = false; var hasHevc = false; var hasAv1 = false
+        var families = [String]()
+        for c in s.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces).lowercased() }) {
+            if c.hasPrefix("avc1") || c.hasPrefix("avc3") {
+                hasAvc = true; if !families.contains("avc") { families.append("avc") }
+            } else if c.hasPrefix("hvc1") || c.hasPrefix("hev1") {
+                hasHevc = true; if !families.contains("hevc") { families.append("hevc") }
+            } else if c.hasPrefix("av01") {
+                hasAv1 = true; if !families.contains("av1") { families.append("av1") }
+            } else if c.hasPrefix("vp09") || c.hasPrefix("vp9") {
+                if !families.contains("vp9") { families.append("vp9") }
+            } else if c.hasPrefix("mp4a") || c.hasPrefix("aac") {
+                if !families.contains("aac") { families.append("aac") }
+            } else if c.hasPrefix("opus") {
+                if !families.contains("opus") { families.append("opus") }
+            }
+        }
+        return _CodecFlags(hasAvc: hasAvc, hasHevc: hasHevc, hasAv1: hasAv1, families: families)
+    }
+
+    /// Parses a comma-separated HLS attribute list honouring quoted strings.
+    private func _parseHlsAttrList(_ attrString: String) -> [String: String] {
+        var result = [String: String]()
+        var i      = attrString.startIndex
+        let end    = attrString.endIndex
+
+        while i < end {
+            while i < end && (attrString[i] == " " || attrString[i] == "," ||
+                               attrString[i] == "\t" || attrString[i] == "\r" || attrString[i] == "\n") {
+                i = attrString.index(after: i)
+            }
+            guard i < end else { break }
+            guard let eqIdx = attrString[i...].firstIndex(of: "=") else { break }
+
+            let key = String(attrString[i..<eqIdx]).trimmingCharacters(in: .whitespaces)
+            i = attrString.index(after: eqIdx)
+            guard i < end else { break }
+
+            let value: String
+            if attrString[i] == "\"" {
+                i = attrString.index(after: i)  // skip opening quote
+                if let closeQ = attrString[i...].firstIndex(of: "\"") {
+                    value = String(attrString[i..<closeQ])
+                    i = attrString.index(after: closeQ)
+                } else {
+                    value = String(attrString[i...])
+                    i = end
+                }
+            } else {
+                if let commaIdx = attrString[i...].firstIndex(of: ",") {
+                    value = String(attrString[i..<commaIdx]).trimmingCharacters(in: .whitespaces)
+                    i = attrString.index(after: commaIdx)
+                } else {
+                    value = String(attrString[i...]).trimmingCharacters(in: .whitespaces)
+                    i = end
+                }
+            }
+            result[key] = value
+        }
+        return result
+    }
+
+    private func _resolveUri(base: String, relative: String) -> String {
+        guard !base.isEmpty, let baseURL = URL(string: base) else { return relative }
+        return URL(string: relative, relativeTo: baseURL)?.absoluteString ?? relative
+    }
+
+    // MARK: - Result builders
+
+    /// Builds a structured result for a fetch-failed spec (e.g. segment-extension rejection).
+    private func _fetchFailResult(uri: String,
+                                   formatHint: String?,
+                                   reason: String,
+                                   rawOverride: String? = nil) -> [String: Any] {
+        let raw = rawOverride ?? "status=FAIL;reason=fetch_or_parse_exception:\(reason)"
+        return [
+            "format":              formatHint ?? "UNKNOWN",
+            "uri":                 uri,
+            "resolvedUri":         uri,
+            "fetchSuccess":        false,
+            "parseSuccess":        false,
+            "isMediaPlaylist":     false,
+            "variantCount":        0,
+            "representationCount": 0,
+            "hasAdaptiveLadder":   false,
+            "hasAvc":              false,
+            "hasHevc":             false,
+            "hasAv1":              false,
+            "serverPolicyPass":    false,
+            "llHlsIndicators":     [String: Any](),
+            "variants":            [[String: Any]](),
+            "representations":     [[String: Any]](),
+            "raw":                 raw,
+        ]
+    }
+
+    /// Builds an invalid-spec validation result (mirrors Android's `buildInvalidResult`).
+    private func _buildInvalidResult(key: String,
+                                      uri: String,
+                                      formatHint: String,
+                                      failures: [String]) -> [String: Any] {
+        return [
+            "key":               key,
+            "uri":               uri,
+            "formatHint":        formatHint,
+            "pass":              false,
+            "fetchSuccess":      false,
+            "parseSuccess":      false,
+            "hasAdaptiveLadder": false,
+            "variantCount":      0,
+            "representationCount": 0,
+            "hasAvc":            false,
+            "hasHevc":           false,
+            "hasAv1":            false,
+            "serverPolicyPass":  false,
+            "policyFailures":    failures,
+            "raw":               "status=FAIL;key=\(key);failures=\(failures.joined(separator: ","))",
+            "inspection":        [String: Any](),
+        ]
+    }
+
+    /// Returns the result for an empty-specs call (mirrors Android's no-spec guard).
+    private func _emptySpecsResult() -> [String: Any] {
+        return [
+            "phase":                   Self.phase,
+            "pass":                    false,
+            "totalManifestsValidated": 0,
+            "passedManifests":         0,
+            "failedManifests":         0,
+            "segmentRejectionPass":    false,
+            "serverLadderPolicy":      Self.serverLadderPolicy,
+            "iosMirrorNote":           Self.iosMirrorNote,
+            "results":                 [[String: Any]](),
+            "segmentRejectionResult":  [String: Any](),
+            "raw":                     "status=FAIL;reason=no_manifest_specs",
+        ]
+    }
+
+    // MARK: - Default public stream specs (match Android defaults exactly)
+
+    private static func _defaultPublicSpecs() -> [[String: Any]] {
+        return [
+            [
+                "key":                  "mux_hls_test",
+                "uri":                  defaultHlsUri,
+                "formatHint":           "HLS",
+                "requireAdaptiveLadder": true,
+                "requireAvcFallback":    true,
+                "requireLlHlsTags":      false,
+                "allowMediaPlaylist":    false,
+            ],
+            [
+                "key":                  "shaka_angel_one_dash",
+                "uri":                  defaultDashUri,
+                "formatHint":           "DASH",
+                "requireAdaptiveLadder": true,
+                "requireAvcFallback":    true,
+                "requireLlHlsTags":      false,
+                "allowMediaPlaylist":    false,
+            ],
+            [
+                "key":                  "mux_ll_hls_test",
+                "uri":                  defaultLlHlsUri,
+                "formatHint":           "HLS",
+                "requireAdaptiveLadder": true,
+                "requireAvcFallback":    true,
+                "requireLlHlsTags":      false,
+                "allowMediaPlaylist":    false,
+            ],
+        ]
+    }
+}
