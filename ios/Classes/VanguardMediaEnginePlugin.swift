@@ -1052,6 +1052,587 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         ]
     }
 
+    // ── Phase 4C8V: iOS Public Streaming Manifest Rendition Native Parity ────
+    //
+    // Bounded manifest-only HTTP GETs for HLS, DASH, and LL-HLS canonical
+    // test streams. Mirrors Android Phase 4C5C behaviour behind the same
+    // MethodChannel route so the public Dart API (VGStreamingManifestRenditionClient)
+    // stays stable across platforms.
+    //
+    // Invariants:
+    //   - No AVPlayer, AVPlayerItem, AVAssetReader, VTDecompressionSession,
+    //     CVPixelBuffer, Texture, cache, audio session, WebRTC, LiveKit, camera,
+    //     editor, export, VanguardEngineMode, or switchToMode interaction.
+    //   - Manifest-only: rejects media segment extensions before fetch.
+    //   - 2 MB response cap; ephemeral URLSession (no caching).
+    //   - Background queue for network work; result() called once on main thread.
+    //   - Diagnostic-only: does NOT mutate playback, ABR, cache, or source selectors.
+
+    private static let _p4c8vPhase            = "Phase4C8V"
+    private static let _p4c8vPlatform         = "ios"
+    private static let _p4c8vPolicy           = "add_hevc_av1_renditions_but_keep_avc_fallback"
+    private static let _p4c8vIosMirrorNote    = "iOS AVFoundation/VideoToolbox manifest rendition diagnostics mirror Android policy while preserving H.264 fallback; DASH remains diagnostic-only on iOS."
+    private static let _p4c8vMaxManifestBytes = 2 * 1024 * 1024 // 2 MB
+
+    private static let _p4c8vHlsUri   = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8"
+    private static let _p4c8vDashUri  = "https://storage.googleapis.com/shaka-demo-assets/angel-one/dash.mpd"
+    private static let _p4c8vLlHlsUri = "https://stream.mux.com/v69RSHhFelSm4701snP22dYz2jICy4E4FUyk02rW4gxRM.m3u8"
+
+    private static let _p4c8vSegmentExtensions: Set<String> = [
+        "ts", "m4s", "mp4", "webm", "m4a", "m4v", "m4b", "m4p",
+        "aac", "mp3", "ogg", "oga", "opus", "flac", "wav",
+        "f4v", "f4f", "cmfv", "cmfa",
+    ]
+
+    /// Returns true when the URI path extension identifies a media segment/container.
+    private func _p4c8vIsMediaSegmentUri(_ uriStr: String) -> Bool {
+        guard !uriStr.isEmpty else { return false }
+        let pathPart: String
+        if let url = URL(string: uriStr) {
+            pathPart = url.path
+        } else {
+            pathPart = uriStr.components(separatedBy: "?").first ?? uriStr
+        }
+        let filename = (pathPart as NSString).lastPathComponent.lowercased()
+        let ext = (filename as NSString).pathExtension
+        return !ext.isEmpty && VanguardMediaEnginePlugin._p4c8vSegmentExtensions.contains(ext)
+    }
+
+    /// Performs a bounded, ephemeral GET and returns (body, resolvedURL).
+    private func _p4c8vFetchManifest(urlStr: String) throws -> (String, String) {
+        guard !_p4c8vIsMediaSegmentUri(urlStr) else {
+            throw NSError(domain: "VGP4C8V", code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "media_segment_uri_rejected: \(urlStr)"])
+        }
+        guard let url = URL(string: urlStr) else {
+            throw NSError(domain: "VGP4C8V", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "invalid_url: \(urlStr)"])
+        }
+
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest  = 12.0
+        cfg.timeoutIntervalForResource = 20.0
+        cfg.requestCachePolicy         = .reloadIgnoringLocalAndRemoteCacheData
+        let session = URLSession(configuration: cfg)
+        defer { session.finishTasksAndInvalidate() }
+
+        var request = URLRequest(url: url)
+        request.setValue("Vanguard-Manifest-Inspector/1.0", forHTTPHeaderField: "User-Agent")
+
+        var resultData: Data?
+        var resultResponse: URLResponse?
+        var resultError: Error?
+
+        let semaphore = DispatchSemaphore(value: 0)
+        session.dataTask(with: request) { data, response, error in
+            resultData     = data
+            resultResponse = response
+            resultError    = error
+            semaphore.signal()
+        }.resume()
+        semaphore.wait()
+
+        if let error = resultError { throw error }
+        guard let httpResponse = resultResponse as? HTTPURLResponse else {
+            throw NSError(domain: "VGP4C8V", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "non_http_response"])
+        }
+        guard (200...299).contains(httpResponse.statusCode) else {
+            throw NSError(domain: "VGP4C8V", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: "http_error:\(httpResponse.statusCode)"])
+        }
+        guard let data = resultData else {
+            throw NSError(domain: "VGP4C8V", code: 5,
+                          userInfo: [NSLocalizedDescriptionKey: "no_data"])
+        }
+        if data.count > VanguardMediaEnginePlugin._p4c8vMaxManifestBytes {
+            throw NSError(domain: "VGP4C8V", code: 6,
+                          userInfo: [NSLocalizedDescriptionKey: "manifest_exceeds_max_chars"])
+        }
+        let body = String(data: data, encoding: .utf8)
+            ?? String(data: data, encoding: .isoLatin1)
+            ?? ""
+        let resolvedUri = httpResponse.url?.absoluteString ?? urlStr
+        return (body, resolvedUri)
+    }
+
+    // ── HLS attribute list parser ─────────────────────────────────────────────
+    /// Parses a comma-separated HLS attribute list honouring quoted strings.
+    private func _p4c8vParseHlsAttrList(_ attrString: String) -> [String: String] {
+        var result = [String: String]()
+        var i = attrString.startIndex
+        let end = attrString.endIndex
+
+        while i < end {
+            while i < end && (attrString[i] == " " || attrString[i] == "," ||
+                               attrString[i] == "\t" || attrString[i] == "\r" || attrString[i] == "\n") {
+                i = attrString.index(after: i)
+            }
+            guard i < end else { break }
+            guard let eqIdx = attrString[i...].firstIndex(of: "=") else { break }
+
+            let key = String(attrString[i..<eqIdx]).trimmingCharacters(in: .whitespaces)
+            i = attrString.index(after: eqIdx)
+            guard i < end else { break }
+
+            let value: String
+            if attrString[i] == "\"" {
+                i = attrString.index(after: i) // skip opening quote
+                if let closeQ = attrString[i...].firstIndex(of: "\"") {
+                    value = String(attrString[i..<closeQ])
+                    i = attrString.index(after: closeQ)
+                } else {
+                    value = String(attrString[i...])
+                    i = end
+                }
+            } else {
+                if let commaIdx = attrString[i...].firstIndex(of: ",") {
+                    value = String(attrString[i..<commaIdx]).trimmingCharacters(in: .whitespaces)
+                    i = attrString.index(after: commaIdx)
+                } else {
+                    value = String(attrString[i...]).trimmingCharacters(in: .whitespaces)
+                    i = end
+                }
+            }
+            result[key] = value
+        }
+        return result
+    }
+
+    // ── Codec family detection ────────────────────────────────────────────────
+    private struct _P4C8VCodecFlags {
+        let hasAvc: Bool; let hasHevc: Bool; let hasAv1: Bool
+        let detectedFamilies: [String]
+    }
+    private func _p4c8vDetectCodecs(_ codecsStr: String?) -> _P4C8VCodecFlags {
+        guard let codecsStr = codecsStr, !codecsStr.isEmpty else {
+            return _P4C8VCodecFlags(hasAvc: false, hasHevc: false, hasAv1: false, detectedFamilies: [])
+        }
+        var hasAvc = false; var hasHevc = false; var hasAv1 = false
+        var families = [String]()
+        for c in codecsStr.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespaces).lowercased() }) {
+            if c.hasPrefix("avc1") || c.hasPrefix("avc3") {
+                hasAvc = true; if !families.contains("avc") { families.append("avc") }
+            } else if c.hasPrefix("hvc1") || c.hasPrefix("hev1") {
+                hasHevc = true; if !families.contains("hevc") { families.append("hevc") }
+            } else if c.hasPrefix("av01") {
+                hasAv1 = true; if !families.contains("av1") { families.append("av1") }
+            } else if c.hasPrefix("vp09") || c.hasPrefix("vp9") {
+                if !families.contains("vp9") { families.append("vp9") }
+            } else if c.hasPrefix("mp4a") || c.hasPrefix("aac") {
+                if !families.contains("aac") { families.append("aac") }
+            } else if c.hasPrefix("opus") {
+                if !families.contains("opus") { families.append("opus") }
+            }
+        }
+        return _P4C8VCodecFlags(hasAvc: hasAvc, hasHevc: hasHevc, hasAv1: hasAv1, detectedFamilies: families)
+    }
+
+    // ── URI resolution ────────────────────────────────────────────────────────
+    private func _p4c8vResolveUri(base: String, relative: String) -> String {
+        guard !base.isEmpty, let baseURL = URL(string: base) else { return relative }
+        return URL(string: relative, relativeTo: baseURL)?.absoluteString ?? relative
+    }
+
+    // ── HLS manifest inspection ───────────────────────────────────────────────
+    private func _p4c8vInspectHls(
+        originalUri: String,
+        resolvedUri: String,
+        body: String
+    ) -> [String: Any] {
+        let lines = body.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        var variants = [[String: Any]]()
+        var pendingAttrs: [String: String]? = nil
+
+        var hasExtXPart = false
+        var hasExtXServerControl = false
+        var hasExtXPreloadHint = false
+        var hasExtXPartInf = false
+        var hasExtInf = false
+        var hasTargetDuration = false
+
+        for line in lines {
+            if line.isEmpty { continue }
+            if line.hasPrefix("#EXT-X-PART:") || line.hasPrefix("#EXT-X-PART ") { hasExtXPart = true }
+            if line.hasPrefix("#EXT-X-SERVER-CONTROL:") || line.hasPrefix("#EXT-X-SERVER-CONTROL ") { hasExtXServerControl = true }
+            if line.hasPrefix("#EXT-X-PRELOAD-HINT:") || line.hasPrefix("#EXT-X-PRELOAD-HINT ") { hasExtXPreloadHint = true }
+            if line.hasPrefix("#EXT-X-PART-INF:") || line.hasPrefix("#EXT-X-PART-INF ") { hasExtXPartInf = true }
+            if line.hasPrefix("#EXTINF:") || line.hasPrefix("#EXTINF ") { hasExtInf = true }
+            if line.hasPrefix("#EXT-X-TARGETDURATION:") || line.hasPrefix("#EXT-X-TARGETDURATION ") { hasTargetDuration = true }
+
+            if line.hasPrefix("#EXT-X-STREAM-INF:") {
+                let attrStr = String(line.dropFirst("#EXT-X-STREAM-INF:".count))
+                pendingAttrs = _p4c8vParseHlsAttrList(attrStr)
+                continue
+            }
+            if let attrs = pendingAttrs {
+                if !line.hasPrefix("#") {
+                    let variantUri = _p4c8vResolveUri(base: resolvedUri, relative: line)
+                    let bw     = Int(attrs["BANDWIDTH"] ?? "") ?? 0
+                    let avgBw  = Int(attrs["AVERAGE-BANDWIDTH"] ?? "") ?? bw
+                    let res    = attrs["RESOLUTION"] ?? ""
+                    let resParts = res.split(separator: "x").map { String($0) }
+                    let w      = Int(resParts.first ?? "") ?? 0
+                    let h      = Int(resParts.dropFirst().first ?? "") ?? 0
+                    let codecs = attrs["CODECS"] ?? ""
+                    let frameRate = attrs["FRAME-RATE"] ?? "0.0"
+                    let name   = attrs["NAME"] ?? ""
+                    let codecFlags = _p4c8vDetectCodecs(codecs)
+                    let idx    = variants.count
+
+                    let v: [String: Any] = [
+                        "index":            idx,
+                        "id":               "",
+                        "uri":              variantUri,
+                        "rawUri":           line,
+                        "adaptationSetId":  "",
+                        "bandwidth":        bw,
+                        "averageBandwidth": avgBw,
+                        "resolution":       res,
+                        "width":            w,
+                        "height":           h,
+                        "codecs":           codecs,
+                        "mimeType":         "",
+                        "frameRate":        frameRate,
+                        "name":             name,
+                        "hasAvc":           codecFlags.hasAvc,
+                        "hasHevc":          codecFlags.hasHevc,
+                        "hasAv1":           codecFlags.hasAv1,
+                        "detectedFamilies": codecFlags.detectedFamilies,
+                    ]
+                    variants.append(v)
+                }
+                pendingAttrs = nil
+            }
+        }
+
+        let isMediaPlaylist   = variants.isEmpty && (hasExtInf || hasTargetDuration)
+        let variantCount      = variants.count
+        let hasAdaptiveLadder = variantCount > 1
+        let hasAvc  = variants.contains { $0["hasAvc"]  as? Bool == true }
+        let hasHevc = variants.contains { $0["hasHevc"] as? Bool == true }
+        let hasAv1  = variants.contains { $0["hasAv1"]  as? Bool == true }
+        let serverPolicyPass  = (!hasHevc && !hasAv1) || hasAvc
+        let isLlHls = hasExtXPart || hasExtXServerControl || hasExtXPreloadHint || hasExtXPartInf
+        let rawStatus = "status=OK;format=HLS;variantCount=\(variantCount);hasAdaptiveLadder=\(hasAdaptiveLadder);" +
+            "hasAvc=\(hasAvc);hasHevc=\(hasHevc);hasAv1=\(hasAv1);serverPolicyPass=\(serverPolicyPass);" +
+            "isLlHls=\(isLlHls);isMediaPlaylist=\(isMediaPlaylist)"
+
+        return [
+            "format":              "HLS",
+            "uri":                 originalUri.isEmpty ? resolvedUri : originalUri,
+            "resolvedUri":         resolvedUri,
+            "fetchSuccess":        true,
+            "parseSuccess":        true,
+            "isMediaPlaylist":     isMediaPlaylist,
+            "variantCount":        variantCount,
+            "representationCount": variantCount,
+            "hasAdaptiveLadder":   hasAdaptiveLadder,
+            "hasAvc":              hasAvc,
+            "hasHevc":             hasHevc,
+            "hasAv1":              hasAv1,
+            "serverPolicyPass":    serverPolicyPass,
+            "serverLadderPolicy":  VanguardMediaEnginePlugin._p4c8vPolicy,
+            "iosMirrorNote":       VanguardMediaEnginePlugin._p4c8vIosMirrorNote,
+            "llHlsIndicators": [
+                "hasExtXPart":          hasExtXPart,
+                "hasExtXServerControl": hasExtXServerControl,
+                "hasExtXPreloadHint":   hasExtXPreloadHint,
+                "hasExtXPartInf":       hasExtXPartInf,
+                "isLlHls":              isLlHls,
+            ] as [String: Any],
+            "variants":        variants,
+            "representations": variants,
+            "raw":             rawStatus,
+        ]
+    }
+
+    // ── DASH MPD manifest inspection ──────────────────────────────────────────
+    // Uses NSXMLParser (SAX) to extract <Representation> elements from DASH MPD.
+    // Video representations are identified by mimeType, contentType, or
+    // non-zero width/height (matching Android parity logic).
+    private func _p4c8vInspectDash(
+        originalUri: String,
+        resolvedUri: String,
+        body: String
+    ) -> [String: Any] {
+        // SAX delegate collecting Representation nodes with AdaptationSet context.
+        class DashSaxDelegate: NSObject, XMLParserDelegate {
+            var videoReps = [[String: Any]]()
+            var asId = ""; var asContentType = ""
+            var asMimeType = ""; var asCodecs = ""
+            var asWidth = ""; var asHeight = ""; var asFrameRate = ""
+
+            func parser(_ parser: XMLParser,
+                        didStartElement elementName: String,
+                        namespaceURI: String?,
+                        qualifiedName qName: String?,
+                        attributes attrs: [String: String] = [:]) {
+                // Strip namespace prefix for comparison
+                let tag = elementName.components(separatedBy: ":").last ?? elementName
+
+                if tag == "AdaptationSet" {
+                    asId          = attrs["id"] ?? ""
+                    asContentType = attrs["contentType"] ?? ""
+                    asMimeType    = attrs["mimeType"] ?? ""
+                    asCodecs      = attrs["codecs"] ?? ""
+                    asWidth       = attrs["width"] ?? attrs["maxWidth"] ?? ""
+                    asHeight      = attrs["height"] ?? attrs["maxHeight"] ?? ""
+                    asFrameRate   = attrs["frameRate"] ?? ""
+                }
+                if tag == "Representation" {
+                    let repId    = attrs["id"] ?? ""
+                    let repBw    = Int(attrs["bandwidth"] ?? "") ?? 0
+                    let repW     = Int(attrs["width"] ?? asWidth) ?? 0
+                    let repH     = Int(attrs["height"] ?? asHeight) ?? 0
+                    let repCodecs = (attrs["codecs"] ?? "").isEmpty ? asCodecs : (attrs["codecs"] ?? "")
+                    let repMime  = (attrs["mimeType"] ?? "").isEmpty ? asMimeType : (attrs["mimeType"] ?? "")
+                    let repFR    = (attrs["frameRate"] ?? "").isEmpty ? asFrameRate : (attrs["frameRate"] ?? "")
+
+                    let isVideo = asContentType.lowercased() == "video"
+                        || asMimeType.lowercased().hasPrefix("video/")
+                        || repMime.lowercased().hasPrefix("video/")
+                        || (repW > 0 && repH > 0)
+                    guard isVideo else { return }
+
+                    let lower  = repCodecs.lowercased()
+                    let hasAvc  = lower.contains("avc1") || lower.contains("avc3")
+                    let hasHevc = lower.contains("hvc1") || lower.contains("hev1")
+                    let hasAv1  = lower.contains("av01")
+                    var families = [String]()
+                    if hasAvc  { families.append("avc") }
+                    if hasHevc { families.append("hevc") }
+                    if hasAv1  { families.append("av1") }
+                    if lower.contains("vp09") || lower.contains("vp9") { families.append("vp9") }
+                    if lower.contains("mp4a") || lower.contains("aac") { families.append("aac") }
+
+                    let idx = videoReps.count
+                    let rep: [String: Any] = [
+                        "index":            idx,
+                        "id":               repId,
+                        "uri":              "",
+                        "rawUri":           "",
+                        "adaptationSetId":  asId,
+                        "bandwidth":        repBw,
+                        "averageBandwidth": repBw,
+                        "resolution":       repW > 0 && repH > 0 ? "\(repW)x\(repH)" : "",
+                        "width":            repW,
+                        "height":           repH,
+                        "codecs":           repCodecs,
+                        "mimeType":         repMime,
+                        "frameRate":        repFR,
+                        "name":             "",
+                        "hasAvc":           hasAvc,
+                        "hasHevc":          hasHevc,
+                        "hasAv1":           hasAv1,
+                        "detectedFamilies": families,
+                    ]
+                    videoReps.append(rep)
+                }
+            }
+
+            func parser(_ parser: XMLParser,
+                        didEndElement elementName: String,
+                        namespaceURI: String?,
+                        qualifiedName qName: String?) {
+                let tag = elementName.components(separatedBy: ":").last ?? elementName
+                if tag == "AdaptationSet" {
+                    asId = ""; asContentType = ""; asMimeType = ""
+                    asCodecs = ""; asWidth = ""; asHeight = ""; asFrameRate = ""
+                }
+            }
+        }
+
+        guard let data = body.data(using: .utf8) else {
+            return _p4c8vDashFailResult(originalUri: originalUri, resolvedUri: resolvedUri,
+                                        reason: "utf8_encode_failed")
+        }
+        let delegate = DashSaxDelegate()
+        let parser = XMLParser(data: data)
+        parser.shouldProcessNamespaces = true
+        parser.shouldReportNamespacePrefixes = false
+        parser.delegate = delegate
+        guard parser.parse() else {
+            let reason = parser.parserError?.localizedDescription ?? "xml_parse_error"
+            return _p4c8vDashFailResult(originalUri: originalUri, resolvedUri: resolvedUri,
+                                        reason: reason)
+        }
+
+        let reps = delegate.videoReps
+        let repCount = reps.count
+        let hasAdaptiveLadder = repCount > 1
+        let hasAvc  = reps.contains { $0["hasAvc"]  as? Bool == true }
+        let hasHevc = reps.contains { $0["hasHevc"] as? Bool == true }
+        let hasAv1  = reps.contains { $0["hasAv1"]  as? Bool == true }
+        let serverPolicyPass = (!hasHevc && !hasAv1) || hasAvc
+        let rawStatus = "status=OK;format=DASH;representationCount=\(repCount);hasAdaptiveLadder=\(hasAdaptiveLadder);" +
+            "hasAvc=\(hasAvc);hasHevc=\(hasHevc);hasAv1=\(hasAv1);serverPolicyPass=\(serverPolicyPass)"
+
+        return [
+            "format":              "DASH",
+            "uri":                 originalUri.isEmpty ? resolvedUri : originalUri,
+            "resolvedUri":         resolvedUri,
+            "fetchSuccess":        true,
+            "parseSuccess":        true,
+            "isMediaPlaylist":     false,
+            "variantCount":        repCount,
+            "representationCount": repCount,
+            "hasAdaptiveLadder":   hasAdaptiveLadder,
+            "hasAvc":              hasAvc,
+            "hasHevc":             hasHevc,
+            "hasAv1":              hasAv1,
+            "serverPolicyPass":    serverPolicyPass,
+            "serverLadderPolicy":  VanguardMediaEnginePlugin._p4c8vPolicy,
+            "iosMirrorNote":       VanguardMediaEnginePlugin._p4c8vIosMirrorNote,
+            "llHlsIndicators":     [String: Any](),
+            "variants":            reps,
+            "representations":     reps,
+            "raw":                 rawStatus,
+        ]
+    }
+
+    private func _p4c8vDashFailResult(originalUri: String, resolvedUri: String, reason: String) -> [String: Any] {
+        return [
+            "format":              "DASH",
+            "uri":                 originalUri.isEmpty ? resolvedUri : originalUri,
+            "resolvedUri":         resolvedUri,
+            "fetchSuccess":        true,
+            "parseSuccess":        false,
+            "isMediaPlaylist":     false,
+            "variantCount":        0,
+            "representationCount": 0,
+            "hasAdaptiveLadder":   false,
+            "hasAvc":              false,
+            "hasHevc":             false,
+            "hasAv1":              false,
+            "serverPolicyPass":    false,
+            "serverLadderPolicy":  VanguardMediaEnginePlugin._p4c8vPolicy,
+            "iosMirrorNote":       VanguardMediaEnginePlugin._p4c8vIosMirrorNote,
+            "llHlsIndicators":     [String: Any](),
+            "variants":            [[String: Any]](),
+            "representations":     [[String: Any]](),
+            "raw":                 "status=FAIL;reason=dash_parse_exception:\(reason)",
+        ]
+    }
+
+    // ── Format determination ──────────────────────────────────────────────────
+    private func _p4c8vDetermineFormat(uri: String, body: String, hint: String?) -> String {
+        if let h = hint?.uppercased(), h == "HLS" || h == "DASH" { return h }
+        let lower = uri.lowercased()
+        if lower.contains(".m3u8") { return "HLS" }
+        if lower.contains(".mpd")  { return "DASH" }
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("#EXTM3U") { return "HLS" }
+        if trimmed.uppercased().hasPrefix("<MPD") || trimmed.hasPrefix("<?xml") { return "DASH" }
+        return "HLS"
+    }
+
+    // ── Single-URI inspection ─────────────────────────────────────────────────
+    private func _p4c8vInspectUri(uri: String, formatHint: String?) -> [String: Any] {
+        do {
+            let (body, resolvedUri) = try _p4c8vFetchManifest(urlStr: uri)
+            let format = _p4c8vDetermineFormat(uri: resolvedUri, body: body, hint: formatHint)
+            switch format {
+            case "DASH": return _p4c8vInspectDash(originalUri: uri, resolvedUri: resolvedUri, body: body)
+            default:     return _p4c8vInspectHls(originalUri: uri, resolvedUri: resolvedUri, body: body)
+            }
+        } catch {
+            let msg = error.localizedDescription
+            return [
+                "format":              formatHint ?? "UNKNOWN",
+                "uri":                 uri,
+                "resolvedUri":         uri,
+                "fetchSuccess":        false,
+                "parseSuccess":        false,
+                "isMediaPlaylist":     false,
+                "variantCount":        0,
+                "representationCount": 0,
+                "hasAdaptiveLadder":   false,
+                "hasAvc":              false,
+                "hasHevc":             false,
+                "hasAv1":              false,
+                "serverPolicyPass":    false,
+                "serverLadderPolicy":  VanguardMediaEnginePlugin._p4c8vPolicy,
+                "iosMirrorNote":       VanguardMediaEnginePlugin._p4c8vIosMirrorNote,
+                "llHlsIndicators":     [String: Any](),
+                "variants":            [[String: Any]](),
+                "representations":     [[String: Any]](),
+                "raw":                 "status=FAIL;reason=fetch_or_parse_exception:\(msg)",
+            ]
+        }
+    }
+
+    // ── Orchestrator: runs on bgQueue, posts result once on main thread ────────
+    private func _runPhase4C8VManifestRenditionSmoke(result: @escaping FlutterResult) {
+        let bgQueue = DispatchQueue(label: "com.vanguard.p4c8v.manifestRendition", qos: .userInitiated)
+        bgQueue.async { [weak self] in
+            guard let self = self else { return }
+
+            let hlsResult   = self._p4c8vInspectUri(uri: VanguardMediaEnginePlugin._p4c8vHlsUri,   formatHint: "HLS")
+            let dashResult  = self._p4c8vInspectUri(uri: VanguardMediaEnginePlugin._p4c8vDashUri,  formatHint: "DASH")
+            let llHlsResult = self._p4c8vInspectUri(uri: VanguardMediaEnginePlugin._p4c8vLlHlsUri, formatHint: "HLS")
+
+            let hlsFetch = hlsResult["fetchSuccess"]    as? Bool ?? false
+            let hlsParse = hlsResult["parseSuccess"]    as? Bool ?? false
+            let hlsVc    = hlsResult["variantCount"]    as? Int  ?? 0
+            let hlsSpp   = hlsResult["serverPolicyPass"] as? Bool ?? false
+            let hlsPass  = hlsFetch && hlsParse && hlsVc > 0 && hlsSpp
+
+            let dashFetch = dashResult["fetchSuccess"]       as? Bool ?? false
+            let dashParse = dashResult["parseSuccess"]       as? Bool ?? false
+            let dashRc    = dashResult["representationCount"] as? Int
+                ?? (dashResult["variantCount"] as? Int ?? 0)
+            let dashSpp   = dashResult["serverPolicyPass"]  as? Bool ?? false
+            let dashPass  = dashFetch && dashParse && dashRc > 0 && dashSpp
+
+            let llFetch = llHlsResult["fetchSuccess"]    as? Bool ?? false
+            let llParse = llHlsResult["parseSuccess"]    as? Bool ?? false
+            let llVc    = llHlsResult["variantCount"]    as? Int  ?? 0
+            let llSpp   = llHlsResult["serverPolicyPass"] as? Bool ?? false
+            let llPass  = llFetch && llParse && llVc > 0 && llSpp
+
+            let allServerPoliciesPass = hlsSpp && dashSpp && llSpp
+            let totalVariants = hlsVc + dashRc + llVc
+            let overallPass = hlsPass && dashPass && llPass && allServerPoliciesPass
+
+            let rawStatus: String
+            if overallPass {
+                rawStatus = "status=OK;phase=Phase4C8V;platform=ios;" +
+                    "hlsPass=true(variants=\(hlsVc));dashPass=true(reps=\(dashRc));" +
+                    "llHlsPass=true(variants=\(llVc));totalVariants=\(totalVariants);allServerPoliciesPass=true"
+            } else {
+                rawStatus = "status=MANIFEST_RENDITION_VERIFICATION_FAILED;phase=Phase4C8V;platform=ios;" +
+                    "hlsPass=\(hlsPass);dashPass=\(dashPass);llHlsPass=\(llPass);" +
+                    "allServerPoliciesPass=\(allServerPoliciesPass)"
+            }
+
+            let report: [String: Any] = [
+                "pass":                    overallPass,
+                "phase":                   VanguardMediaEnginePlugin._p4c8vPhase,
+                "platform":                VanguardMediaEnginePlugin._p4c8vPlatform,
+                "hlsPass":                 hlsPass,
+                "dashPass":                dashPass,
+                "llHlsPass":               llPass,
+                "allServerPoliciesPass":   allServerPoliciesPass,
+                "totalStreamsInspected":   3,
+                "totalVariantsDiscovered": totalVariants,
+                "hlsVariantCount":         hlsVc,
+                "dashRepresentationCount": dashRc,
+                "llHlsVariantCount":       llVc,
+                "serverLadderPolicy":      VanguardMediaEnginePlugin._p4c8vPolicy,
+                "iosMirrorNote":           VanguardMediaEnginePlugin._p4c8vIosMirrorNote,
+                "hls":                     hlsResult,
+                "dash":                    dashResult,
+                "llHls":                   llHlsResult,
+                "raw":                     rawStatus,
+            ]
+
+            DispatchQueue.main.async {
+                result(report)
+            }
+        }
+    }
+
     // ─── Method Channel Dispatch ───────────────────────────────────────────────
 
     public func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -1141,6 +1722,16 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         // Does NOT interact with VanguardEngineMode or switchToMode.
         if call.method == "runAndroidDagPhase4C5AStreamingCodecCapabilitySmoke" {
             result(_buildPhase4C8UCodecCapabilityMap())
+            return
+        }
+
+        // ── Phase 4C8V: iOS streaming manifest rendition parity ───────────────
+        // Handles route `runAndroidDagPhase4C5CManifestRenditionSmoke` on iOS.
+        // Same route name as Android so VGStreamingManifestRenditionClient stays
+        // stable. Network work runs on a background queue; result() is called
+        // exactly once on the main thread. Pure diagnostic — no playback mutation.
+        if call.method == "runAndroidDagPhase4C5CManifestRenditionSmoke" {
+            _runPhase4C8VManifestRenditionSmoke(result: result)
             return
         }
 
