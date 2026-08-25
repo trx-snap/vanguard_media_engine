@@ -72,5 +72,10 @@
 	<string>This app uses the microphone when recording videos.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>This app saves captured photos and videos to your photo library.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 </dict>
 </plist>

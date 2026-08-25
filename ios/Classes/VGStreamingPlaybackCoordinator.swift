@@ -17,6 +17,7 @@
 
 import AVFoundation
 import Flutter
+import Network
 import UIKit
 
 // MARK: - Network-profile policy (Phase 4C8Y)
@@ -211,6 +212,16 @@ private final class VGPlaybackSession {
 
     // ── Disposed guard ────────────────────────────────────────────────────────
     var disposed = false
+
+    // ── Proxy route (Phase 4C6H2A) ────────────────────────────────────────────
+    /// Non-nil when playback is routed through VGStreamingLocalProxyServer.
+    var proxyRouteId: String? = nil
+    /// Whether cache/proxy was requested by the Dart caller.
+    var playbackCacheEnabled: Bool = false
+    /// True once a proxy route is successfully attached and telemetry is live.
+    var playbackCacheTelemetryAttached: Bool = false
+    /// Non-zero when proxy setup failed and direct playback is used as fallback.
+    var playbackCacheIgnoredCount: Int = 0
 
     init(
         textureId:      Int64,
@@ -408,12 +419,53 @@ final class VGStreamingPlaybackCoordinator {
             return
         }
 
-        // ── 5. Build AVURLAsset with optional HTTP headers ─────────────────────
+        // ── 4a. Parse cache/proxy options (Phase 4C6H2A) ─────────────────────
+        let cacheEnabled: Bool = {
+            // cacheOptions is a nested dict; support both flat and nested forms.
+            if let cacheOpts = args?["cacheOptions"] as? [String: Any] {
+                return cacheOpts["cacheEnabled"] as? Bool ?? false
+            }
+            return args?["cacheEnabled"] as? Bool ?? false
+        }()
+
+        // ── 5. Build AVURLAsset — proxy route when cacheEnabled && HLS/AUTO ──
+        // DASH is already rejected above; HLS/AUTO are eligible.
+        // If proxy setup fails, fall back to direct URL (playback must not fail).
+        var assetURL = url
         var assetOptions: [String: Any] = [:]
-        if let headers = httpHeaders, !headers.isEmpty {
-            assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = headers
+        var sessionProxyRouteId: String? = nil
+        var sessionCacheTelemetry = false
+        var sessionCacheIgnored = 0
+
+        if cacheEnabled {
+            do {
+                let route = try VGStreamingLocalProxyServer.shared.proxiedURL(
+                    for:            url,
+                    headers:        httpHeaders,
+                    formatHint:     formatHint,
+                    networkProfile: networkPolicy.profile
+                )
+                assetURL = route.proxyURL
+                sessionProxyRouteId = route.routeId
+                sessionCacheTelemetry = true
+                // Do NOT attach httpHeaders to AVURLAsset when proxied;
+                // the proxy owns upstream headers.
+            } catch {
+                // Proxy setup failed — fall back to direct origin URL.
+                assetURL = url
+                if let headers = httpHeaders, !headers.isEmpty {
+                    assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = headers
+                }
+                sessionCacheIgnored = 1
+            }
+        } else {
+            // Cache not requested — direct playback with caller headers on AVURLAsset.
+            if let headers = httpHeaders, !headers.isEmpty {
+                assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = headers
+            }
         }
-        let asset = AVURLAsset(url: url, options: assetOptions.isEmpty ? nil : assetOptions)
+
+        let asset = AVURLAsset(url: assetURL, options: assetOptions.isEmpty ? nil : assetOptions)
 
         // ── 6. Build AVPlayerItem + AVPlayerItemVideoOutput ────────────────────
         let outputSettings: [String: Any] = [
@@ -453,6 +505,11 @@ final class VGStreamingPlaybackCoordinator {
             texture:       texture,
             registry:      textureRegistry
         )
+        // ── Phase 4C6H2A: populate proxy state on session ─────────────────────
+        session.playbackCacheEnabled          = cacheEnabled
+        session.proxyRouteId                  = sessionProxyRouteId
+        session.playbackCacheTelemetryAttached = sessionCacheTelemetry
+        session.playbackCacheIgnoredCount     = sessionCacheIgnored
         sessions[textureId] = session
 
         // ── 11. Observe item status ───────────────────────────────────────────
@@ -708,6 +765,11 @@ final class VGStreamingPlaybackCoordinator {
         guard !session.disposed else { return }
         session.disposed = true
 
+        // ── Phase 4C6H2A: release proxy route before player cleanup ───────────
+        if let routeId = session.proxyRouteId {
+            VGStreamingLocalProxyServer.shared.release(routeId: routeId)
+        }
+
         // Invalidate display link.
         session.displayLink?.invalidate()
         session.displayLink = nil
@@ -829,11 +891,18 @@ final class VGStreamingPlaybackCoordinator {
             "displayHeight":                 displayHeight,
             "renderedFrames":                session.renderedFrames,
             "decodedFrames":                 session.decodedFrames,
-            "playbackCacheEnabled":           false,
-            "playbackCacheTelemetryAttached": false,
-            "playbackCacheBytesRead":         0,
-            "playbackCacheSizeBytes":         0,
-            "playbackCacheIgnoredCount":      0,
+            "playbackCacheEnabled":           session.playbackCacheEnabled,
+            "playbackCacheTelemetryAttached": session.playbackCacheTelemetryAttached,
+            "playbackCacheBytesRead":         {
+                // Live bytes-fetched counter from the proxy registry (pass-through slice).
+                if let routeId = session.proxyRouteId {
+                    let m = VGStreamingLocalProxyServer.shared.metrics(routeId: routeId)
+                    return m["bytesFetched"] as? Int ?? 0
+                }
+                return 0
+            }(),
+            "playbackCacheSizeBytes":         0,  // disk cache not implemented in this slice
+            "playbackCacheIgnoredCount":      session.playbackCacheIgnoredCount,
             // Network-profile diagnostics (Phase 4C8Y)
             "networkProfile":                            policy.profile,
             "streamingNetworkProfile":                   policy.profile,
@@ -842,8 +911,68 @@ final class VGStreamingPlaybackCoordinator {
             "preferredPeakBitRate":                      policy.preferredPeakBitRate,
             "automaticallyWaitsToMinimizeStalling":      policy.automaticallyWaitsToMinimizeStalling,
             "raw": "phase=Phase4C8A;sessionId=\(session.sessionId);state=\(stateStr);format=\(formatStr)"
+                  + vgRawDiagnosticsSuffix(session: session)
         ]
         return map
+    }
+
+    // MARK: - Phase 4C6H2A raw-diagnostics suffix
+
+    /// Builds the semicolon-delimited suffix appended to the `raw` snapshot field.
+    ///
+    /// Safe rules:
+    ///  - No URLs, signed query strings, headers, auth values, cookies, or server addresses.
+    ///  - ASCII only; values are stripped of non-ASCII / non-printable bytes.
+    ///  - Returns "" when no extra information is available.
+    private func vgRawDiagnosticsSuffix(session: VGPlaybackSession) -> String {
+        var parts: [String] = []
+
+        // ── Proxy route metrics ───────────────────────────────────────────────
+        if let routeId = session.proxyRouteId {
+            let m = VGStreamingLocalProxyServer.shared.metrics(routeId: routeId)
+            let reqCount   = m["requestCount"] as? Int ?? 0
+            let bytesFetch = m["bytesFetched"]  as? Int ?? 0
+            parts.append("proxyRequestCount=\(reqCount)")
+            parts.append("proxyBytesFetched=\(bytesFetch)")
+        }
+
+        // ── AVPlayerItem error ────────────────────────────────────────────────
+        if let itemErr = session.item.error as NSError? {
+            parts.append("itemErrorDomain=\(vgSanitizeRawToken(itemErr.domain))")
+            parts.append("itemErrorCode=\(itemErr.code)")
+        }
+
+        // ── AVPlayer error ────────────────────────────────────────────────────
+        if let playerErr = session.player.error as NSError? {
+            parts.append("playerErrorDomain=\(vgSanitizeRawToken(playerErr.domain))")
+            parts.append("playerErrorCode=\(playerErr.code)")
+        }
+
+        // ── AVPlayerItem error-log last entry ─────────────────────────────────
+        if let errorLog = session.item.errorLog(),
+           let last = errorLog.events.last {
+            parts.append("itemErrorLogStatus=\(last.errorStatusCode)")
+            let comment = vgSanitizeRawToken(last.errorComment ?? "")
+            if !comment.isEmpty {
+                parts.append("itemErrorLogComment=\(comment)")
+            }
+        }
+
+        guard !parts.isEmpty else { return "" }
+        return ";" + parts.joined(separator: ";")
+    }
+
+    /// Strips non-ASCII, non-printable bytes, and semicolons from a token
+    /// destined for the raw diagnostic string.  Capped at 80 chars to bound log size.
+    private func vgSanitizeRawToken(_ s: String) -> String {
+        let sanitized = s.unicodeScalars.compactMap { scalar -> Character? in
+            let v = scalar.value
+            // Allow printable ASCII (0x20–0x7E) excluding semicolons (0x3B).
+            guard v >= 0x20, v <= 0x7E, v != 0x3B else { return nil }
+            return Character(scalar)
+        }
+        let result = String(sanitized.prefix(80))
+        return result.isEmpty ? "unknown" : result
     }
 
     // MARK: - Helpers

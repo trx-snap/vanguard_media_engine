@@ -86,7 +86,7 @@ Pod::Spec.new do |s|
   s.platform         = :ios, '14.0'
 
   # Frameworks required for the GPU pipeline + Vision (Phase 4C face detection, DEC-61)
-  s.frameworks       = 'Metal', 'MetalKit', 'AVFoundation', 'CoreVideo', 'CoreMedia', 'VideoToolbox', 'Vision', 'AudioToolbox'
+  s.frameworks       = 'Metal', 'MetalKit', 'AVFoundation', 'CoreVideo', 'CoreMedia', 'VideoToolbox', 'Vision', 'AudioToolbox', 'Network'
 
   s.pod_target_xcconfig = {
     'DEFINES_MODULE'                                          => 'YES',
