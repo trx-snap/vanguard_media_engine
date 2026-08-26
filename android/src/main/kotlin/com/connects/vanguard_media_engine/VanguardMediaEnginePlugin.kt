@@ -10,7 +10,7 @@ import android.os.Looper
 import android.util.Log
 import androidx.annotation.NonNull
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
-import com.connects.vanguard_media_engine.diagnostics.AndroidDagRenderSmokeHarness
+import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.rtc.AndroidRtcVideoCoordinator
 import com.connects.vanguard_media_engine.streaming.AndroidDagStreamingPlaybackCoordinator
@@ -40,6 +40,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
 
     // ── Phase 7.8A-Android: editor playback control coordinator ───────────────
     private var editorPlaybackCoordinator: AndroidEditorPlaybackCoordinator? = null
+
+    // ── Diagnostic smoke routes (Phases 2O2B3/2O2B4/2Q/3C/4A/5 + Audio Unit B) ─
+    private var dagDiagnosticsCoordinator: AndroidDagDiagnosticsCoordinator? = null
 
     // ── Camera session state (B2: single camera instance invariant) ───────────
     // Mirrors iOS plugin: cameraSource + renderer stored at plugin level.
@@ -83,6 +86,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             textureRegistry = binding.textureRegistry,
             channel         = channel,
             mainHandler     = mainHandler,
+        )
+        dagDiagnosticsCoordinator = AndroidDagDiagnosticsCoordinator(
+            mainHandler = mainHandler,
         )
     }
 
@@ -129,86 +135,17 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             return
         }
 
+        if (AndroidDagDiagnosticsCoordinator.ownsMethod(call.method)) {
+            val coord = dagDiagnosticsCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android DAG diagnostics coordinator unavailable", null)
+            }
+            return
+        }
+
         when (call.method) {
-
-            "runAndroidDagPhase2O2B3PhysicalSmoke" -> {
-                val width = (args?.get("width") as? Number)?.toInt() ?: 64
-                val height = (args?.get("height") as? Number)?.toInt() ?: 64
-                Thread {
-                    val smokeResult = AndroidDagRenderSmokeHarness.run(width, height)
-                    mainHandler.post { result.success(smokeResult) }
-                }.start()
-            }
-
-            "runAndroidDagPhase2O2B4MultiFrameSmoke" -> {
-                val width = (args?.get("width") as? Number)?.toInt() ?: 64
-                val height = (args?.get("height") as? Number)?.toInt() ?: 64
-                val frameCount = (args?.get("frameCount") as? Number)?.toInt() ?: 30
-                Thread {
-                    val smokeResult = AndroidDagRenderSmokeHarness.runMultiFrame(width, height, frameCount)
-                    mainHandler.post { result.success(smokeResult) }
-                }.start()
-            }
-
-            "runAndroidDagPhase2QCapabilityProbe" -> {
-                Thread {
-                    val probeResult = AndroidDagRenderSmokeHarness.runCapabilityProbe()
-                    mainHandler.post { result.success(probeResult) }
-                }.start()
-            }
-
-            "runAndroidDagPhase3CEvalRenderSmoke" -> {
-                val width          = (args?.get("width")          as? Number)?.toInt()  ?: 64
-                val height         = (args?.get("height")         as? Number)?.toInt()  ?: 64
-                val frameCount     = (args?.get("frameCount")     as? Number)?.toInt()  ?: 30
-                val frameDurationUs = (args?.get("frameDurationUs") as? Number)?.toLong() ?: 33333L
-                Thread {
-                    val smokeResult = AndroidDagRenderSmokeHarness.runDagEvaluationSmoke(
-                        width, height, frameCount, frameDurationUs,
-                    )
-                    mainHandler.post { result.success(smokeResult) }
-                }.start()
-            }
-
-            "runAndroidDagPhase4ADecoderSmoke" -> {
-                val path       = args?.get("path")       as? String
-                val frameCount = (args?.get("frameCount") as? Number)?.toInt() ?: 10
-                if (path == null) {
-                    result.error("INVALID_ARG", "runAndroidDagPhase4ADecoderSmoke: path required", null)
-                    return
-                }
-                Thread {
-                    val smokeResult = AndroidDagRenderSmokeHarness.runDecoderSmoke(
-                        videoPath  = path,
-                        frameCount = frameCount,
-                    )
-                    mainHandler.post { result.success(smokeResult) }
-                }.start()
-            }
-
-            "runAndroidDagPhase5EncoderSurfaceSmoke" -> {
-                val outputPath      = args?.get("outputPath")      as? String
-                if (outputPath.isNullOrBlank()) {
-                    result.error("INVALID_ARG", "runAndroidDagPhase5EncoderSurfaceSmoke: outputPath required", null)
-                    return
-                }
-                val width           = (args?.get("width")           as? Number)?.toInt()  ?: 64
-                val height          = (args?.get("height")          as? Number)?.toInt()  ?: 64
-                val frameCount      = (args?.get("frameCount")      as? Number)?.toInt()  ?: 10
-                val frameDurationUs = (args?.get("frameDurationUs") as? Number)?.toLong() ?: 33333L
-                val bitrate         = (args?.get("bitrate")         as? Number)?.toInt()  ?: 1_000_000
-                Thread {
-                    val smokeResult = AndroidDagRenderSmokeHarness.runEncoderSurfaceSmoke(
-                        width           = width,
-                        height          = height,
-                        frameCount      = frameCount,
-                        frameDurationUs = frameDurationUs,
-                        bitrate         = bitrate,
-                        outputPath      = outputPath,
-                    )
-                    mainHandler.post { result.success(smokeResult) }
-                }.start()
-            }
 
             "createTexture" -> {
                 val path = args?.get("path") as? String
@@ -1197,5 +1134,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         // Tear down Phase 7.8A-Android editor playback coordinator.
         editorPlaybackCoordinator?.disposeAll()
         editorPlaybackCoordinator = null
+        // Diagnostics coordinator holds no native resources — just drop it.
+        dagDiagnosticsCoordinator = null
     }
 }
