@@ -137,6 +137,8 @@ export 'vg_streaming_playback_resilience_coordinator.dart';
 export 'vg_streaming_playback_resilience_binder.dart';
 // Phase 4C7BD: public streaming playback route planner.
 export 'vg_streaming_playback_route_plan.dart';
+// Phase 4C7BE: public streaming offline asset eligibility planner.
+export 'vg_streaming_offline_asset_eligibility.dart';
 // Phase 4C3V: public RTC video diagnostics client.
 export 'vg_rtc_video_diagnostics_client.dart';
 // Phase 4C4J: public adaptive stream timeline diagnostics client.
