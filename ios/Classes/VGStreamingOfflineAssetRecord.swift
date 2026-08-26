@@ -70,9 +70,26 @@ extension VGStreamingOfflineAssetRecord {
     /// an AVAssetDownloadTask's on-disk location across relaunch: the app
     /// container's absolute path is not guaranteed stable, but paths
     /// relative to the container root are.
+    ///
+    /// Both sides are run through `standardizingPath` before comparison.
+    /// `NSHomeDirectory()` and AVFoundation-delivered asset URLs are not
+    /// guaranteed to agree on `/var` vs. `/private/var` spelling (the
+    /// former is a symlink to the latter on-device), and a raw
+    /// `hasPrefix` check would spuriously fail whenever they disagree —
+    /// `standardizingPath` resolves exactly that class of symlink
+    /// (`/tmp`, `/etc`, `/var`) without requiring the path to exist on
+    /// disk, so this stays safe to call before the file is written.
     static func relativePath(fromAbsoluteURL url: URL) -> String? {
-        let home = NSHomeDirectory()
-        let path = url.path
+        let home = (NSHomeDirectory() as NSString).standardizingPath
+        var rawPath = url.path
+        // Some AVFoundation-delivered asset URLs are prefixed with the
+        // non-standard `/.nofollow` path component (e.g.
+        // `/.nofollow/private/var/...`). It carries no meaning for our
+        // relative-to-home comparison, so strip it before standardizing.
+        if rawPath.hasPrefix("/.nofollow/") {
+            rawPath = String(rawPath.dropFirst("/.nofollow".count))
+        }
+        let path = (rawPath as NSString).standardizingPath
         guard path.hasPrefix(home) else { return nil }
         var relative = String(path.dropFirst(home.count))
         if relative.hasPrefix("/") { relative.removeFirst() }
@@ -81,9 +98,12 @@ extension VGStreamingOfflineAssetRecord {
 
     /// Reconstructs an absolute URL from a path previously produced by
     /// `relativePath(fromAbsoluteURL:)`, resolved against the *current*
-    /// process's home directory.
+    /// process's home directory. Standardized for consistency with
+    /// `relativePath(fromAbsoluteURL:)`, though `/var` and `/private/var`
+    /// resolve to the same file either way.
     static func absoluteURL(fromRelativePath relativePath: String) -> URL {
-        URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent(relativePath)
+        let home = (NSHomeDirectory() as NSString).standardizingPath
+        return URL(fileURLWithPath: home).appendingPathComponent(relativePath)
     }
 
     /// Builds a minimal, credential-safe catalog entry snapshot of this
