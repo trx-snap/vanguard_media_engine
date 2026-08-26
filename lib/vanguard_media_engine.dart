@@ -147,6 +147,8 @@ export 'vg_streaming_offline_playback_preparation_plan.dart';
 export 'vg_streaming_offline_asset_lifecycle.dart';
 // Phase 4C7BI: public streaming offline asset MethodChannel client contract.
 export 'vg_streaming_offline_asset_client.dart';
+// Phase 4C7BJ: public streaming offline asset status poller.
+export 'vg_streaming_offline_asset_status_poller.dart';
 // Phase 4C3V: public RTC video diagnostics client.
 export 'vg_rtc_video_diagnostics_client.dart';
 // Phase 4C4J: public adaptive stream timeline diagnostics client.
