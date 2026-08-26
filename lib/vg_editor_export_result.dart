@@ -25,6 +25,7 @@ final class VGEditorExportResult {
     this.width,
     this.height,
     this.fps,
+    this.exportRoiSidecarPath,
   });
 
   // ── Fields ─────────────────────────────────────────────────────────────────
@@ -43,6 +44,10 @@ final class VGEditorExportResult {
 
   /// Frame rate of the exported video, or null if not reported.
   final int? fps;
+
+  /// Absolute local path to the ROI sidecar emitted alongside the exported
+  /// video, or null if not reported.
+  final String? exportRoiSidecarPath;
 
   // ── Deserialisation ────────────────────────────────────────────────────────
 
@@ -78,6 +83,7 @@ final class VGEditorExportResult {
       width: (map['width'] as num?)?.toInt(),
       height: (map['height'] as num?)?.toInt(),
       fps: (map['fps'] as num?)?.toInt(),
+      exportRoiSidecarPath: map['exportRoiSidecarPath'] as String?,
     );
   }
 
@@ -85,12 +91,14 @@ final class VGEditorExportResult {
 
   /// Serialises this result to a JSON-compatible map.
   Map<String, Object?> toMap() => <String, Object?>{
-        'path': path,
-        'durationSeconds': durationSeconds,
-        if (width != null) 'width': width,
-        if (height != null) 'height': height,
-        if (fps != null) 'fps': fps,
-      };
+    'path': path,
+    'durationSeconds': durationSeconds,
+    if (width != null) 'width': width,
+    if (height != null) 'height': height,
+    if (fps != null) 'fps': fps,
+    if (exportRoiSidecarPath != null)
+      'exportRoiSidecarPath': exportRoiSidecarPath,
+  };
 
   // ── Equality ───────────────────────────────────────────────────────────────
 
@@ -102,16 +110,25 @@ final class VGEditorExportResult {
           other.durationSeconds == durationSeconds &&
           other.width == width &&
           other.height == height &&
-          other.fps == fps;
+          other.fps == fps &&
+          other.exportRoiSidecarPath == exportRoiSidecarPath;
 
   @override
-  int get hashCode =>
-      Object.hash(path, durationSeconds, width, height, fps);
+  int get hashCode => Object.hash(
+    path,
+    durationSeconds,
+    width,
+    height,
+    fps,
+    exportRoiSidecarPath,
+  );
 
   @override
-  String toString() => 'VGEditorExportResult('
+  String toString() =>
+      'VGEditorExportResult('
       'path: ${path.split('/').last}, '
       'duration: ${durationSeconds.toStringAsFixed(2)}s, '
       '${width != null ? '$width×$height' : 'dims: unknown'}, '
-      'fps: ${fps ?? 'unknown'})';
+      'fps: ${fps ?? 'unknown'}, '
+      'exportRoiSidecarPath: ${exportRoiSidecarPath ?? 'unknown'})';
 }

@@ -253,11 +253,14 @@ class AndroidTimelineExportSession(private val context: Context) {
         val videoTempPath = File(context.cacheDir, "vg_timeline_export_video_$exportId.mp4").absolutePath
         val audioTempPath = File(context.cacheDir, "vg_timeline_export_audio_$exportId.m4a").absolutePath
         val finalTmpPath = "$outputPath.vgtmp"
+        val roiSidecarPath = AndroidTimelineRoiSidecarEmitter.sidecarPathForVideoPath(outputPath)
+        val roiSidecarTempPath = AndroidTimelineRoiSidecarEmitter.tempPathForSidecarPath(roiSidecarPath)
 
         fun deleteOwnedTemps() {
             try { File(videoTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
             try { File(audioTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
             try { File(finalTmpPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
+            try { File(roiSidecarTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
         }
 
         if (cancelRequested) {
@@ -336,9 +339,26 @@ class AndroidTimelineExportSession(private val context: Context) {
             return
         }
 
+        // Sidecar-first finalization: the ROI sidecar is staged and finalized
+        // before the video rename, so a sidecar failure never leaves behind a
+        // finalized video with a missing/incorrect sidecar.
+        if (!AndroidTimelineRoiSidecarEmitter.stageEmptySidecar(roiSidecarTempPath)) {
+            deleteOwnedTemps()
+            onError("EXPORT_FAILED", "exportTimeline: failed to stage ROI sidecar at $roiSidecarTempPath")
+            return
+        }
+        if (!AndroidTimelineRoiSidecarEmitter.finalizeSidecar(roiSidecarTempPath, roiSidecarPath)) {
+            deleteOwnedTemps()
+            onError("EXPORT_FAILED", "exportTimeline: failed to finalize ROI sidecar at $roiSidecarPath")
+            return
+        }
+
         val finalFile = File(finalTmpPath)
         val destFile = File(outputPath)
         if (!finalFile.renameTo(destFile)) {
+            // The ROI sidecar has already been finalized at this point and is
+            // not recoverable here -- wrong ROI is worse than empty ROI, and
+            // this sidecar is empty either way, so it is left in place.
             deleteOwnedTemps()
             onError("EXPORT_FAILED", "exportTimeline: failed to finalize output at $outputPath")
             return
@@ -354,6 +374,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                 "width" to requestWidth,
                 "height" to requestHeight,
                 "fps" to requestFps,
+                "exportRoiSidecarPath" to roiSidecarPath,
             ),
         )
     }
