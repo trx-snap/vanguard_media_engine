@@ -206,7 +206,7 @@ final class VGEditorPreviewReadinessReport {
 /// const evaluator = VGEditorPreviewReadinessEvaluator();
 /// final report = evaluator.evaluate(draft);
 /// if (report.canUseAndroidEditorPlaybackRoute) {
-///   await controller.setDraft(draft);
+///   await controller.updateDraft(draft);
 /// } else {
 ///   print('Editor preview blocked: ${report.issues}');
 /// }
