@@ -128,6 +128,13 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
     // Plugin is a thin router only — no cache or lifecycle logic lives here.
     private let streamingCacheManager = VGStreamingCacheManager.shared
 
+    // ── Phase 4C6H3B: iOS streaming offline HLS foreground lifecycle manager ──
+    // Singleton that owns AVAssetDownloadURLSession lifecycle for offline HLS
+    // asset acquisition, storage headroom evaluation, and in-memory catalog
+    // bookkeeping for the six VGStreamingOfflineAssetClient routes.
+    // Plugin is a thin router only — no offline-asset or lifecycle logic lives here.
+    private let streamingOfflineAssetManager = VGStreamingOfflineAssetManager.shared
+
     // ── Phase 4C8A: iOS streaming playback coordinator ────────────────────────
     // Owns all AVPlayer HLS/LL-HLS session state and Flutter texture registration
     // for the seven public VGStreamingPlaybackClient routes.
@@ -1717,6 +1724,58 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         }
         if call.method == "clearPlaybackCache" {
             streamingCacheManager.clearCache(result: result)
+            return
+        }
+
+        // ── Phase 4C6H3B: iOS streaming offline HLS foreground lifecycle routes ─
+        // The six offline asset MethodChannel routes are forwarded to
+        // VGStreamingOfflineAssetManager.shared. No lifecycle logic lives here.
+        if call.method == "startStreamingOfflineAssetAcquisition" {
+            let requestId = (args?["requestId"] as? String) ?? ""
+            let sourceKey = (args?["sourceKey"] as? String) ?? ""
+            let uri = (args?["uri"] as? String) ?? ""
+            let httpHeaders = args?["httpHeaders"] as? [String: String]
+            let formatHint = args?["formatHint"] as? String
+            let requireLlHlsTags = args?["requireLlHlsTags"] as? Bool ?? false
+            let estimatedBytes = (args?["estimatedBytes"] as? NSNumber)?.int64Value ?? 0
+            let minimumFreeBytes = (args?["minimumFreeBytes"] as? NSNumber)?.int64Value ?? -1
+            streamingOfflineAssetManager.startAcquisition(
+                requestId: requestId,
+                sourceKey: sourceKey,
+                uri: uri,
+                httpHeaders: httpHeaders,
+                formatHint: formatHint,
+                requireLlHlsTags: requireLlHlsTags,
+                estimatedBytes: estimatedBytes,
+                minimumFreeBytes: minimumFreeBytes,
+                result: result
+            )
+            return
+        }
+        if call.method == "getStreamingOfflineAssetStatus" {
+            let requestId = (args?["requestId"] as? String) ?? ""
+            let sourceKey = args?["sourceKey"] as? String
+            streamingOfflineAssetManager.getStatus(requestId: requestId, sourceKey: sourceKey, result: result)
+            return
+        }
+        if call.method == "cancelStreamingOfflineAssetAcquisition" {
+            let requestId = (args?["requestId"] as? String) ?? ""
+            streamingOfflineAssetManager.cancelAcquisition(requestId: requestId, result: result)
+            return
+        }
+        if call.method == "deleteStreamingOfflineAsset" {
+            let requestId = args?["requestId"] as? String
+            let sourceKey = args?["sourceKey"] as? String
+            streamingOfflineAssetManager.deleteAsset(requestId: requestId, sourceKey: sourceKey, result: result)
+            return
+        }
+        if call.method == "clearStreamingOfflineAssets" {
+            streamingOfflineAssetManager.clearAssets(result: result)
+            return
+        }
+        if call.method == "queryStreamingOfflineAssetAvailability" {
+            let sourceKeys = args?["sourceKeys"] as? [String]
+            streamingOfflineAssetManager.queryAvailability(sourceKeys: sourceKeys, result: result)
             return
         }
 
