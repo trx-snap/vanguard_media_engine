@@ -101,6 +101,26 @@ class VanguardNativeBridge(
         rotationDegrees: Int,
     ): String
 
+    // ── Phase 5: MediaCodec encoder input surface smoke ─────────────────────
+    external fun createAndroidDagPhase5EncoderSmokeSession(
+        surface: Surface,
+        width: Int,
+        height: Int,
+    ): String
+
+    external fun renderAndroidDagPhase5EncoderSmokeFrame(
+        sessionId: String,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        timelinePtsUs: Long,
+        frameIndex: Int,
+    ): String
+
+    external fun destroyAndroidDagPhase5EncoderSmokeSession(
+        sessionId: String,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
