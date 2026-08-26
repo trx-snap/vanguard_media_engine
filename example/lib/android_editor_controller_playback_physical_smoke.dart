@@ -1,12 +1,16 @@
-// Vanguard Android True-DAG Phase 7.8A: Public VGEditorController playback route parity physical smoke test.
+// Vanguard Android True-DAG Phase 7.8E: Public VGEditorController playback route parity, preview readiness, and presentation physical smoke test.
 //
 // Proves Android public VGEditorController routes work for one local video clip using public Dart API only:
+//   - VGEditorPreviewReadinessEvaluator -> evaluates initial draft as ready before initialize
 //   - VGEditorController.initialize -> native createTimelineTexture
+//   - VGEditorTextureView -> renders editor timeline texture from VGEditorValue with aspect preservation
 //   - VGEditorController.play -> native timelinePlay
 //   - VGEditorController.pause -> native timelinePause
 //   - VGEditorController.seek -> native timelineSeek
+//   - VGEditorPreviewReadinessEvaluator -> evaluates fresh draft as ready before updateDraft
 //   - VGEditorController.updateDraft -> native updateTimeline
 //   - VGEditorController.disposeAsyncConfirmed/dispose -> native disposeTimeline
+//   - VGEditorPreviewReadinessEvaluator -> evaluates multi-clip draft as blocked with multiClipTimeline
 //   - negative multi-clip initialize returns PlatformException code UNSUPPORTED_TIMELINE
 
 // ignore_for_file: avoid_print
@@ -35,8 +39,7 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
     extends State<AndroidEditorControllerPlaybackPhysicalSmokeApp> {
   String _status =
       'Initializing Android VGEditorController playback physical smoke…';
-  int? _textureId;
-  double? _aspectRatio;
+  VGEditorValue? _editorValue;
 
   @override
   void initState() {
@@ -55,12 +58,16 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
     StreamSubscription<double>? ptsSubscription;
     final List<double> ptsValues = [];
 
+    var initialReadinessPass = false;
     var initPass = false;
+    var presentationWidgetPass = false;
     var playPass = false;
     var pausePass = false;
     var seekPass = false;
+    var updateReadinessPass = false;
     var updatePass = false;
     var replayPass = false;
+    var multiClipReadinessPass = false;
     var multiClipRejectPass = false;
     var disposePass = false;
 
@@ -83,6 +90,13 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
     String? multiClipErrorCode;
     String? errorMessage;
 
+    Map<String, Object?>? initialReadinessReport;
+    Map<String, Object?>? updateReadinessReport;
+    Map<String, Object?>? multiClipReadinessReport;
+    VGEditorPreviewReadinessReport? initialReport;
+    VGEditorPreviewReadinessReport? updateReport;
+    VGEditorPreviewReadinessReport? multiReport;
+
     try {
       // 0. Copy assets/manual_test_clips/clip_B.mov from rootBundle to Directory.systemTemp
       final clipBytes = await rootBundle.load(
@@ -98,8 +112,10 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
         flush: true,
       );
 
-      // 1. INIT
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_INIT: START');
+      const evaluator = VGEditorPreviewReadinessEvaluator();
+
+      // 1. INITIAL READINESS
+      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_INITIAL_READINESS: START');
       final clipDescriptor = VGClipDescriptor(
         id: 'clip_b_0',
         mediaKind: VGMediaKind.video,
@@ -117,6 +133,26 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
         fps: 30,
       );
 
+      initialReport = evaluator.evaluate(initialDraft);
+      initialReadinessReport = initialReport.toMap();
+      initialReadinessPass =
+          initialReport.canUseAndroidEditorPlaybackRoute &&
+          initialReport.decision == VGEditorPreviewReadinessDecision.ready &&
+          initialReport.issues.isEmpty &&
+          initialReport.diagnostics['clipCount'] == 1 &&
+          initialReport.diagnostics['issueCount'] == 0;
+
+      if (!initialReadinessPass) {
+        throw Exception(
+          'Initial readiness evaluation failed: decision=${initialReport.decision.name}, '
+          'canUse=${initialReport.canUseAndroidEditorPlaybackRoute}, '
+          'issues=${initialReport.issues}, diagnostics=${initialReport.diagnostics}',
+        );
+      }
+      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_INITIAL_READINESS: DONE');
+
+      // 2. INIT
+      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_INIT: START');
       final controller = VGEditorController(initialDraft: initialDraft);
       cleanupController = controller;
       ptsSubscription = controller.ptsStream.listen((pts) {
@@ -152,17 +188,20 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
         );
       }
 
+      presentationWidgetPass =
+          controller.value.textureId != null &&
+          controller.value.textureId! >= 0;
+
       if (mounted) {
         setState(() {
-          _textureId = initialTextureId;
-          _aspectRatio = initialAspectRatio;
+          _editorValue = controller.value;
           _status =
               'Initialized: textureId=$initialTextureId (${initialRenderWidth}x$initialRenderHeight)';
         });
       }
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_INIT: DONE');
 
-      // 2. PLAY
+      // 3. PLAY
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_PLAY: START');
       final positivePtsCompleter = Completer<double>();
       final playSub = controller.ptsStream.listen((pts) {
@@ -193,7 +232,7 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
       }
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_PLAY: DONE');
 
-      // 3. PAUSE
+      // 4. PAUSE
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_PAUSE: START');
       await controller.pause();
       pausePass = !controller.isPlaying;
@@ -207,7 +246,7 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
       }
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_PAUSE: DONE');
 
-      // 4. SEEK
+      // 5. SEEK
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_SEEK: START');
       final seekPtsCompleter = Completer<double>();
       final seekSub = controller.ptsStream.listen((pts) {
@@ -244,8 +283,8 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
       }
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_SEEK: DONE');
 
-      // 5. UPDATE
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_UPDATE: START');
+      // 6. UPDATE READINESS
+      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_UPDATE_READINESS: START');
       final freshClip = VGClipDescriptor(
         id: 'clip_b_fresh',
         mediaKind: VGMediaKind.video,
@@ -263,6 +302,26 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
         fps: 30,
       );
 
+      updateReport = evaluator.evaluate(freshDraft);
+      updateReadinessReport = updateReport.toMap();
+      updateReadinessPass =
+          updateReport.canUseAndroidEditorPlaybackRoute &&
+          updateReport.decision == VGEditorPreviewReadinessDecision.ready &&
+          updateReport.issues.isEmpty &&
+          updateReport.diagnostics['clipCount'] == 1 &&
+          updateReport.diagnostics['issueCount'] == 0;
+
+      if (!updateReadinessPass) {
+        throw Exception(
+          'Update readiness evaluation failed: decision=${updateReport.decision.name}, '
+          'canUse=${updateReport.canUseAndroidEditorPlaybackRoute}, '
+          'issues=${updateReport.issues}, diagnostics=${updateReport.diagnostics}',
+        );
+      }
+      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_UPDATE_READINESS: DONE');
+
+      // 7. UPDATE
+      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_UPDATE: START');
       await controller
           .updateDraft(freshDraft)
           .timeout(const Duration(seconds: 10));
@@ -294,15 +353,14 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
       }
       if (mounted) {
         setState(() {
-          _textureId = updatedTextureId;
-          _aspectRatio = updatedAspectRatio;
+          _editorValue = controller.value;
           _status =
               'Updated draft (textureId=$updatedTextureId, ${updatedRenderWidth}x$updatedRenderHeight)';
         });
       }
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_UPDATE: DONE');
 
-      // 6. REPLAY
+      // 8. REPLAY
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_REPLAY: START');
       final replayPtsCompleter = Completer<double>();
       final replaySub = controller.ptsStream.listen((pts) {
@@ -337,7 +395,7 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
       }
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_REPLAY: DONE');
 
-      // 7. DISPOSE
+      // 9. DISPOSE
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_DISPOSE: START');
       await controller.disposeAsyncConfirmed().timeout(
         const Duration(seconds: 5),
@@ -347,8 +405,10 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
       disposePass = true;
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_DISPOSE: DONE');
 
-      // 8. MULTI_CLIP_REJECT
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_MULTI_CLIP_REJECT: START');
+      // 10. MULTI_CLIP_READINESS
+      print(
+        'ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_MULTI_CLIP_READINESS: START',
+      );
       final multiClip1 = VGClipDescriptor(
         id: 'clip_multi_1',
         mediaKind: VGMediaKind.video,
@@ -373,6 +433,31 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
         fps: 30,
       );
 
+      multiReport = evaluator.evaluate(multiClipDraft);
+      multiClipReadinessReport = multiReport.toMap();
+      final hasMultiClipIssue = multiReport.issues.any(
+        (issue) =>
+            issue.code == VGEditorPreviewReadinessIssueCode.multiClipTimeline,
+      );
+      multiClipReadinessPass =
+          multiReport.decision == VGEditorPreviewReadinessDecision.blocked &&
+          !multiReport.canUseAndroidEditorPlaybackRoute &&
+          hasMultiClipIssue &&
+          multiReport.diagnostics['clipCount'] == 2;
+
+      if (!multiClipReadinessPass) {
+        throw Exception(
+          'Multi-clip readiness evaluation failed: decision=${multiReport.decision.name}, '
+          'canUse=${multiReport.canUseAndroidEditorPlaybackRoute}, '
+          'hasMultiClipIssue=$hasMultiClipIssue, diagnostics=${multiReport.diagnostics}',
+        );
+      }
+      print(
+        'ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_MULTI_CLIP_READINESS: DONE',
+      );
+
+      // 11. MULTI_CLIP_REJECT
+      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_MULTI_CLIP_REJECT: START');
       final multiController = VGEditorController(initialDraft: multiClipDraft);
       try {
         await multiController.initialize().timeout(const Duration(seconds: 5));
@@ -420,7 +505,11 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
         updatePass &&
         replayPass &&
         multiClipRejectPass &&
-        disposePass;
+        disposePass &&
+        initialReadinessPass &&
+        updateReadinessPass &&
+        multiClipReadinessPass &&
+        presentationWidgetPass;
 
     final jsonSummary = <String, dynamic>{
       'pass': overallPass,
@@ -432,6 +521,19 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
       'replayPass': replayPass,
       'multiClipRejectPass': multiClipRejectPass,
       'disposePass': disposePass,
+      'initialReadinessPass': initialReadinessPass,
+      'updateReadinessPass': updateReadinessPass,
+      'multiClipReadinessPass': multiClipReadinessPass,
+      'presentationWidgetPass': presentationWidgetPass,
+      'initialReadinessDecision': initialReport?.decision.name,
+      'initialReadinessDiagnostics': initialReport?.diagnostics,
+      'initialReadinessReport': initialReadinessReport,
+      'updateReadinessDecision': updateReport?.decision.name,
+      'updateReadinessDiagnostics': updateReport?.diagnostics,
+      'updateReadinessReport': updateReadinessReport,
+      'multiClipReadinessDecision': multiReport?.decision.name,
+      'multiClipReadinessDiagnostics': multiReport?.diagnostics,
+      'multiClipReadinessReport': multiClipReadinessReport,
       'initialTextureId': initialTextureId,
       'updatedTextureId': updatedTextureId,
       'initialRenderWidth': initialRenderWidth,
@@ -464,7 +566,7 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
     if (mounted) {
       setState(() {
         _status = overallPass
-            ? 'PASS: Android VGEditorController playback routes verified.'
+            ? 'PASS: Android VGEditorController playback routes, readiness, and presentation verified.'
             : 'FAIL: $errorMessage';
       });
     }
@@ -483,12 +585,13 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              if (_textureId != null)
+              if (_editorValue != null)
                 SizedBox(
                   height: 360,
-                  child: AspectRatio(
-                    aspectRatio: _aspectRatio ?? (9.0 / 16.0),
-                    child: Texture(textureId: _textureId!),
+                  child: VGEditorTextureView(
+                    value: _editorValue!,
+                    fit: BoxFit.contain,
+                    backgroundColor: Colors.black,
                   ),
                 ),
               const SizedBox(height: 16),
