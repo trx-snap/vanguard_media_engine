@@ -141,6 +141,8 @@ export 'vg_streaming_playback_route_plan.dart';
 export 'vg_streaming_offline_asset_eligibility.dart';
 // Phase 4C7BF: public streaming offline asset acquisition request planner.
 export 'vg_streaming_offline_asset_acquisition_plan.dart';
+// Phase 4C7BG: public streaming offline playback preparation planner.
+export 'vg_streaming_offline_playback_preparation_plan.dart';
 // Phase 4C3V: public RTC video diagnostics client.
 export 'vg_rtc_video_diagnostics_client.dart';
 // Phase 4C4J: public adaptive stream timeline diagnostics client.
