@@ -339,6 +339,11 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
         instance.channel   = channel
         registrar.addMethodCallDelegate(instance, channel: channel)
 
+        // Phase 4C6H3F: register for UIApplicationDelegate callbacks so
+        // application(_:handleEventsForBackgroundURLSession:completionHandler:)
+        // below is invoked on a background AVAssetDownloadURLSession relaunch.
+        registrar.addApplicationDelegate(instance)
+
         // Phase 2 Step 6: sessionRegistry is now a let constant on the instance;
         // no explicit instantiation needed here.
 
@@ -390,6 +395,25 @@ public class VanguardMediaEnginePlugin: NSObject, FlutterPlugin {
             // including extension (e.g. "flutter_assets/assets/stickers/star.png").
             return Bundle.main.path(forResource: bundleKey, ofType: nil)
         }
+    }
+
+    // ─── Background URLSession relaunch (Phase 4C6H3F) ─────────────────────────
+
+    /// Called by the OS when relaunching the app to handle background
+    /// AVAssetDownloadURLSession events (identifier:
+    /// com.connects.vanguard.offlinehls). Delegates ownership of the
+    /// completion handler to VGStreamingOfflineBackgroundSessionHandler,
+    /// which returns `false` for any identifier it does not own so other
+    /// plugins/the host app can still handle it.
+    public func application(
+        _ application: UIApplication,
+        handleEventsForBackgroundURLSession identifier: String,
+        completionHandler: @escaping () -> Void
+    ) -> Bool {
+        return VGStreamingOfflineBackgroundSessionHandler.shared.handleEventsForBackgroundURLSession(
+            identifier: identifier,
+            completionHandler: completionHandler
+        )
     }
 
     // ─── Mode teardown ─────────────────────────────────────────────────────────

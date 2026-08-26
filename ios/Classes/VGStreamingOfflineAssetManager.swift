@@ -13,10 +13,13 @@
 //
 // AVAssetDownloadURLSession deterministic identifier: com.connects.vanguard.offlinehls
 //
-// Scope: foreground lifecycle only. Does NOT implement app-delegate relaunch
-// handling for background URLSession completion, UI wiring, or DASH support.
-// Terminal records are retained in memory only — not claimed to survive
-// process death.
+// Phase 4C6H3F additions: best-effort catalog persistence (see
+// VGStreamingOfflineAssetCatalog) and background-relaunch reconciliation
+// (see wakeForBackgroundRelaunch / urlSessionDidFinishEvents below), wired to
+// the app delegate via VGStreamingOfflineBackgroundSessionHandler. Terminal
+// and succeeded records now survive process death on a best-effort,
+// credential-free basis. Does NOT force ABR, add DASH support, or touch
+// Media3/Android/ConnectsApp.
 
 import AVFoundation
 import Foundation
@@ -77,10 +80,52 @@ final class VGStreamingOfflineAssetManager: NSObject {
     /// used by queryAvailability and delete-by-sourceKey lookups.
     private var succeededRequestIdBySourceKey: [String: String] = [:]
 
+    /// Best-effort on-disk persistence (Phase 4C6H3F). All access is on
+    /// workerQueue; failures are diagnostic-only and never fail a foreground
+    /// operation.
+    private let catalog = VGStreamingOfflineAssetCatalog.shared
+
     // MARK: - Init
 
     override private init() {
         super.init()
+        // Best-effort restore of terminal/succeeded state from a prior
+        // process, so a plain cold foreground launch (not just a background
+        // URLSession relaunch) can still answer status/availability queries
+        // for previously-completed downloads.
+        workerQueue.async { [weak self] in
+            self?.loadPersistedCatalogOnWorker()
+        }
+    }
+
+    /// Must be called on workerQueue. Restores only terminal/succeeded
+    /// entries — active (queued/running) entries require live-task
+    /// reconciliation and are handled exclusively by
+    /// `wakeForBackgroundRelaunch()`.
+    private func loadPersistedCatalogOnWorker() {
+        let entries = catalog.load()
+        for entry in entries {
+            guard entry.state == "succeeded" || entry.state == "failed" || entry.state == "cancelled" else { continue }
+            let record = VGStreamingOfflineAssetRecord.restoringFromCatalog(entry)
+            retainTerminal(record)
+            if entry.state == "succeeded" {
+                succeededRequestIdBySourceKey[entry.sourceKey] = entry.requestId
+                if let assetUri = record.assetUri {
+                    finishedLocations[entry.requestId] = assetUri
+                }
+            }
+        }
+    }
+
+    /// Must be called on workerQueue. Best-effort persist of a single
+    /// record's current state to the catalog, stripping the original
+    /// (possibly authenticated) `uri` down to a sanitized diagnostic origin
+    /// before it ever reaches disk. Never throws; a persistence failure is
+    /// diagnostic-only and must not fail the caller's foreground operation.
+    private func persistRecord(_ record: VGStreamingOfflineAssetRecord) {
+        record.updatedAtUnixMs = VGStreamingOfflineAssetRecord.nowUnixMs()
+        let sanitizedOrigin = VGStreamingOfflineAssetCatalog.sanitizedSourceOrigin(fromURI: record.uri)
+        catalog.upsert(record.toCatalogEntry(sanitizedSourceOrigin: sanitizedOrigin))
     }
 
     // MARK: - Session
@@ -328,6 +373,12 @@ final class VGStreamingOfflineAssetManager: NSObject {
             return
         }
 
+        // taskDescription carries requestId across process relaunch — it is
+        // the only way to re-associate an OS-retained AVAssetDownloadTask
+        // (from URLSession.getAllTasks) back to its record, since the task
+        // object itself cannot be reconstructed. Must be set before resume.
+        task.taskDescription = requestId
+
         // Register state "queued" before resume so a status poll racing the
         // resume call always observes a tracked record.
         let record = VGStreamingOfflineAssetRecord(
@@ -335,6 +386,7 @@ final class VGStreamingOfflineAssetManager: NSObject {
             uri: parsedURL.absoluteString, task: task
         )
         self.activeRecords[requestId] = record
+        self.persistRecord(record)
         task.resume()
 
         var acceptedMap: [String: Any] = [
@@ -456,6 +508,7 @@ final class VGStreamingOfflineAssetManager: NSObject {
             record.raw = "status=CANCELLED;requestId=\(trimmedRequestId);reason=caller_cancel"
             self.activeRecords.removeValue(forKey: trimmedRequestId)
             self.retainTerminal(record)
+            self.persistRecord(record)
 
             let map: [String: Any] = [
                 "phase": Self.phase, "pass": true,
@@ -526,6 +579,8 @@ final class VGStreamingOfflineAssetManager: NSObject {
                 lastRequestId = rid
             }
 
+            self.catalog.remove(requestIds: targetRequestIds)
+
             var map: [String: Any] = [
                 "phase": Self.phase, "pass": true,
                 "state": "deleted",
@@ -566,6 +621,7 @@ final class VGStreamingOfflineAssetManager: NSObject {
                 }
             }
             self.finishedLocations.removeAll()
+            self.catalog.clearAll()
 
             let rootURL = self.offlineAssetRootURL()
             if FileManager.default.fileExists(atPath: rootURL.path) {
@@ -661,7 +717,13 @@ final class VGStreamingOfflineAssetManager: NSObject {
     func invalidateAndCancel() {
         workerQueue.async { [weak self] in
             guard let self = self else { return }
-            for record in self.activeRecords.values { record.task?.cancel() }
+            for record in self.activeRecords.values {
+                record.task?.cancel()
+                record.state = "cancelled"
+                record.errorMessage = "manager_shutdown"
+                record.raw = "status=CANCELLED;requestId=\(record.requestId);reason=manager_shutdown"
+                self.persistRecord(record)
+            }
             self.activeRecords.removeAll()
             self.terminalRecords.removeAll()
             self.terminalOrder.removeAll()
@@ -669,6 +731,96 @@ final class VGStreamingOfflineAssetManager: NSObject {
             self.succeededRequestIdBySourceKey.removeAll()
             self._session?.invalidateAndCancel()
             self._session = nil
+        }
+    }
+
+    // MARK: - Background relaunch reconciliation (Phase 4C6H3F)
+
+    /// Package-internal wake/reconcile entrypoint for background relaunch.
+    /// Called by VGStreamingOfflineBackgroundSessionHandler from
+    /// `application(_:handleEventsForBackgroundURLSession:completionHandler:)`.
+    ///
+    /// Non-blocking: all work is dispatched onto workerQueue, so this call
+    /// never blocks the main thread. Ensures the background
+    /// AVAssetDownloadURLSession exists (which reconnects this process to any
+    /// tasks the OS retained across relaunch), then reconciles OS task state
+    /// against in-memory + persisted records. Idempotent — safe to call more
+    /// than once (e.g. if the OS relaunches the app again before the first
+    /// reconciliation drains).
+    func wakeForBackgroundRelaunch() {
+        workerQueue.async { [weak self] in
+            guard let self = self else { return }
+            let dlSession = self.session()
+            dlSession.getAllTasks { [weak self] tasks in
+                guard let self = self else { return }
+                self.workerQueue.async {
+                    self.reconcileOnWorker(withOSTasks: tasks)
+                }
+            }
+        }
+    }
+
+    /// Must be called on workerQueue. Maps OS-reported tasks (from
+    /// `getAllTasks`) by `taskDescription` (== requestId, set at task-start
+    /// time) and reconciles them against in-memory active records and the
+    /// persisted catalog:
+    ///   - a known active record whose OS task still exists is reattached;
+    ///   - a persisted active (queued/running) entry not yet in memory is
+    ///     reattached if its OS task exists, otherwise marked terminal
+    ///     failed with a clear diagnostic reason;
+    ///   - an in-memory active record with no matching OS task is stale and
+    ///     is marked terminal failed rather than left stuck;
+    ///   - succeeded/failed/cancelled records already loaded are untouched.
+    private func reconcileOnWorker(withOSTasks tasks: [URLSessionTask]) {
+        var taskByRequestId: [String: AVAssetDownloadTask] = [:]
+        for task in tasks {
+            guard let assetTask = task as? AVAssetDownloadTask,
+                  let reqId = assetTask.taskDescription, !reqId.isEmpty
+            else { continue }
+            taskByRequestId[reqId] = assetTask
+        }
+
+        for (reqId, record) in activeRecords {
+            if let task = taskByRequestId[reqId] {
+                record.task = task
+            }
+        }
+
+        let persistedEntries = catalog.load()
+        for entry in persistedEntries {
+            guard activeRecords[entry.requestId] == nil, terminalRecords[entry.requestId] == nil else { continue }
+            guard entry.state == "queued" || entry.state == "running" else { continue }
+
+            let record = VGStreamingOfflineAssetRecord.restoringFromCatalog(entry)
+            if let task = taskByRequestId[entry.requestId] {
+                record.task = task
+                activeRecords[entry.requestId] = record
+            } else {
+                record.task = nil
+                record.state = "failed"
+                record.errorMessage = "interrupted_no_os_task_on_relaunch"
+                record.raw = "status=FAILED;requestId=\(entry.requestId)" +
+                             ";reason=interrupted_no_os_task_on_relaunch;source=background_relaunch_reconcile"
+                retainTerminal(record)
+                persistRecord(record)
+            }
+        }
+
+        // Collect stale ids first — mutating `activeRecords` while iterating
+        // over it is unsafe under Swift's exclusivity rules.
+        var staleRequestIds: [String] = []
+        for (reqId, record) in activeRecords where taskByRequestId[reqId] == nil {
+            record.state = "failed"
+            record.errorMessage = "interrupted_no_os_task_on_relaunch"
+            record.raw = "status=FAILED;requestId=\(reqId)" +
+                         ";reason=interrupted_no_os_task_on_relaunch;source=background_relaunch_reconcile"
+            record.task = nil
+            retainTerminal(record)
+            persistRecord(record)
+            staleRequestIds.append(reqId)
+        }
+        for reqId in staleRequestIds {
+            activeRecords.removeValue(forKey: reqId)
         }
     }
 }
@@ -705,6 +857,7 @@ extension VGStreamingOfflineAssetManager: AVAssetDownloadDelegate {
                 record.state = "running"
                 record.raw = "status=RUNNING;requestId=\(record.requestId)" +
                              ";fraction=\(String(format: "%.3f", fraction))"
+                self.persistRecord(record)
                 break
             }
         }
@@ -724,6 +877,7 @@ extension VGStreamingOfflineAssetManager: AVAssetDownloadDelegate {
             self.finishedLocations[reqId] = location
             if let record = self.activeRecords[reqId] {
                 record.assetUri = location
+                self.persistRecord(record)
             }
         }
     }
@@ -756,7 +910,31 @@ extension VGStreamingOfflineAssetManager: AVAssetDownloadDelegate {
                 record.task = nil
                 self.activeRecords.removeValue(forKey: reqId)
                 self.retainTerminal(record)
+                self.persistRecord(record)
                 break
+            }
+        }
+    }
+
+    /// Called by the OS once all queued background session events (task
+    /// completions, progress) have been delivered to the app following a
+    /// background-relaunch invocation of
+    /// `application(_:handleEventsForBackgroundURLSession:completionHandler:)`.
+    /// Drains the stored completion handler exactly once, on main, per
+    /// Apple's documented contract. Ignores any session other than the
+    /// package-owned offline HLS identifier.
+    func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        guard session.configuration.identifier == VGStreamingOfflineBackgroundSessionHandler.offlineHlsIdentifier else {
+            return
+        }
+        // Hop through workerQueue first so every state/catalog mutation already
+        // enqueued by prior delegate callbacks (didLoad/didFinishDownloadingTo/
+        // didCompleteWithError) has run before we tell iOS events are drained.
+        workerQueue.async {
+            DispatchQueue.main.async {
+                VGStreamingOfflineBackgroundSessionHandler.shared.drainCompletionHandler(
+                    forIdentifier: VGStreamingOfflineBackgroundSessionHandler.offlineHlsIdentifier
+                )
             }
         }
     }
