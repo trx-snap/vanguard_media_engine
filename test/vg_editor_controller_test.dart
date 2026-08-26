@@ -170,22 +170,32 @@ void main() {
       addTearDown(() => controller.dispose());
     });
 
-    test('EC-3b initialize sets isReady=true and textureId', () async {
-      _setMockHandler((method, args) async {
-        if (method == 'createTimelineTexture') {
-          return {'textureId': 42, 'width': 640, 'height': 360};
-        }
-        if (method == 'disposeTimeline') return null;
-        return null;
-      });
+    test(
+      'EC-3b initialize sets isReady=true, textureId, and render dimensions',
+      () async {
+        _setMockHandler((method, args) async {
+          if (method == 'createTimelineTexture') {
+            return {'textureId': 42, 'width': 1080, 'height': 1920};
+          }
+          if (method == 'disposeTimeline') return null;
+          return null;
+        });
 
-      final controller = VGEditorController(initialDraft: _twoClipDraft());
-      await controller.initialize();
+        final controller = VGEditorController(initialDraft: _twoClipDraft());
+        await controller.initialize();
 
-      expect(controller.value.isReady, isTrue);
-      expect(controller.value.textureId, 42);
-      addTearDown(() => controller.dispose());
-    });
+        expect(controller.value.isReady, isTrue);
+        expect(controller.value.textureId, 42);
+        expect(controller.value.renderWidth, 1080);
+        expect(controller.value.renderHeight, 1920);
+        expect(controller.value.renderAspectRatio, closeTo(1080 / 1920, 0.001));
+        expect(controller.textureId, 42);
+        expect(controller.renderWidth, 1080);
+        expect(controller.renderHeight, 1920);
+        expect(controller.renderAspectRatio, closeTo(1080 / 1920, 0.001));
+        addTearDown(() => controller.dispose());
+      },
+    );
 
     test('EC-3c initialize sends draft.toMap() under draft key', () async {
       dynamic capturedArgs;
@@ -500,6 +510,23 @@ void main() {
       await controller.updateDraft(trimmedDraft);
       expect(controller.value.durationSeconds, closeTo(7.0, 0.001));
     });
+
+    test(
+      'EC-9e updateDraft updates render dimensions and aspect ratio',
+      () async {
+        final trimmedDraft = VGEditorDraft(
+          id: 'draft-test',
+          clips: [_clip(id: 'clip-A', trimEnd: 4.0)],
+        );
+        await controller.updateDraft(trimmedDraft);
+
+        expect(controller.value.renderWidth, 640);
+        expect(controller.value.renderHeight, 360);
+        expect(controller.renderWidth, 640);
+        expect(controller.renderHeight, 360);
+        expect(controller.renderAspectRatio, closeTo(640 / 360, 0.001));
+      },
+    );
   });
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -743,18 +770,41 @@ void main() {
   // ───────────────────────────────────────────────────────────────────────────
 
   group('VGEditorValue — copyWith and equality', () {
-    test('EV-1  copyWith replaces textureId', () {
+    test('EV-1  copyWith replaces textureId and render dimensions', () {
       final v = VGEditorValue.initial(_twoClipDraft());
-      final v2 = v.copyWith(textureId: 42);
+      final v2 = v.copyWith(
+        textureId: 42,
+        renderWidth: 1080,
+        renderHeight: 1920,
+      );
       expect(v2.textureId, 42);
+      expect(v2.renderWidth, 1080);
+      expect(v2.renderHeight, 1920);
+      expect(v2.renderAspectRatio, closeTo(1080 / 1920, 0.001));
       expect(v.textureId, isNull);
+      expect(v.renderWidth, isNull);
+      expect(v.renderHeight, isNull);
     });
 
-    test('EV-2  copyWith clears textureId with explicit null', () {
-      final v = VGEditorValue(draft: _twoClipDraft(), textureId: 7);
-      final v2 = v.copyWith(textureId: null);
-      expect(v2.textureId, isNull);
-    });
+    test(
+      'EV-2  copyWith clears textureId and render dimensions with explicit null',
+      () {
+        final v = VGEditorValue(
+          draft: _twoClipDraft(),
+          textureId: 7,
+          renderWidth: 1080,
+          renderHeight: 1920,
+        );
+        final v2 = v.copyWith(
+          textureId: null,
+          renderWidth: null,
+          renderHeight: null,
+        );
+        expect(v2.textureId, isNull);
+        expect(v2.renderWidth, isNull);
+        expect(v2.renderHeight, isNull);
+      },
+    );
 
     test('EV-3  equal values are equal', () {
       final draft = _twoClipDraft();
@@ -776,6 +826,38 @@ void main() {
       final v = VGEditorValue.initial(draft);
       expect(v.durationSeconds, closeTo(draft.durationSeconds, 0.001));
     });
+
+    test(
+      'EV-6  renderAspectRatio fallback to draft canvas when render dimensions are null',
+      () {
+        final draft = VGEditorDraft(
+          id: 'draft-canvas',
+          clips: [_clip()],
+          canvasWidth: 1280,
+          canvasHeight: 720,
+        );
+        final v = VGEditorValue.initial(draft);
+        expect(v.renderAspectRatio, closeTo(1280 / 720, 0.001));
+      },
+    );
+
+    test(
+      'EV-7  renderAspectRatio prioritizes render dimensions over draft canvas dimensions',
+      () {
+        final draft = VGEditorDraft(
+          id: 'draft-canvas',
+          clips: [_clip()],
+          canvasWidth: 1280,
+          canvasHeight: 720,
+        );
+        final v = VGEditorValue(
+          draft: draft,
+          renderWidth: 1080,
+          renderHeight: 1920,
+        );
+        expect(v.renderAspectRatio, closeTo(1080 / 1920, 0.001));
+      },
+    );
   });
 
   // ───────────────────────────────────────────────────────────────────────────

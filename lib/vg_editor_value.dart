@@ -27,6 +27,8 @@ final class VGEditorValue {
   const VGEditorValue({
     required this.draft,
     this.textureId,
+    this.renderWidth,
+    this.renderHeight,
     this.currentPTS = 0.0,
     this.isPlaying = false,
     this.isReady = false,
@@ -37,12 +39,10 @@ final class VGEditorValue {
   /// Convenience factory for the initial controller state.
   ///
   /// Sets [isReady] = false, [isPlaying] = false, [currentPTS] = 0.0,
-  /// [textureId] = null, [isExporting] = false.
+  /// [textureId] = null, [renderWidth] = null, [renderHeight] = null,
+  /// [isExporting] = false.
   factory VGEditorValue.initial(VGEditorDraft draft) {
-    return VGEditorValue(
-      draft: draft,
-      statusMessage: 'Initializing…',
-    );
+    return VGEditorValue(draft: draft, statusMessage: 'Initializing…');
   }
 
   // ── Fields ─────────────────────────────────────────────────────────────────
@@ -56,6 +56,18 @@ final class VGEditorValue {
   /// Also becomes null transiently during [VGEditorController.updateDraft]
   /// while the native timeline is being rebuilt.
   final int? textureId;
+
+  /// Native render width in pixels returned by the active timeline renderer.
+  ///
+  /// Null until [VGEditorController.initialize] completes successfully or while
+  /// the native timeline is being rebuilt during [VGEditorController.updateDraft].
+  final int? renderWidth;
+
+  /// Native render height in pixels returned by the active timeline renderer.
+  ///
+  /// Null until [VGEditorController.initialize] completes successfully or while
+  /// the native timeline is being rebuilt during [VGEditorController.updateDraft].
+  final int? renderHeight;
 
   /// Current playhead position in seconds.
   ///
@@ -85,6 +97,26 @@ final class VGEditorValue {
   /// Convenience alias for [draft.durationSeconds].
   double get durationSeconds => draft.durationSeconds;
 
+  /// Aspect ratio for displaying the rendered timeline texture (width / height).
+  ///
+  /// Returns `renderWidth / renderHeight` when both native render dimensions
+  /// are non-null and positive.
+  /// Otherwise falls back to `draft.canvasWidth / draft.canvasHeight` when both
+  /// draft canvas dimensions are positive.
+  /// Returns `null` if neither native render dimensions nor draft canvas
+  /// dimensions are positive.
+  double? get renderAspectRatio {
+    final rw = renderWidth;
+    final rh = renderHeight;
+    if (rw != null && rh != null && rw > 0 && rh > 0) {
+      return rw / rh;
+    }
+    if (draft.canvasWidth > 0 && draft.canvasHeight > 0) {
+      return draft.canvasWidth / draft.canvasHeight;
+    }
+    return null;
+  }
+
   // ── copyWith ───────────────────────────────────────────────────────────────
 
   /// Returns a copy of this value with the specified fields replaced.
@@ -94,6 +126,8 @@ final class VGEditorValue {
   VGEditorValue copyWith({
     VGEditorDraft? draft,
     Object? textureId = _kNoValue,
+    Object? renderWidth = _kNoValue,
+    Object? renderHeight = _kNoValue,
     double? currentPTS,
     bool? isPlaying,
     bool? isReady,
@@ -103,6 +137,12 @@ final class VGEditorValue {
     return VGEditorValue(
       draft: draft ?? this.draft,
       textureId: textureId == _kNoValue ? this.textureId : textureId as int?,
+      renderWidth: renderWidth == _kNoValue
+          ? this.renderWidth
+          : renderWidth as int?,
+      renderHeight: renderHeight == _kNoValue
+          ? this.renderHeight
+          : renderHeight as int?,
       currentPTS: currentPTS ?? this.currentPTS,
       isPlaying: isPlaying ?? this.isPlaying,
       isReady: isReady ?? this.isReady,
@@ -121,6 +161,8 @@ final class VGEditorValue {
       other is VGEditorValue &&
           other.draft == draft &&
           other.textureId == textureId &&
+          other.renderWidth == renderWidth &&
+          other.renderHeight == renderHeight &&
           other.currentPTS == currentPTS &&
           other.isPlaying == isPlaying &&
           other.isReady == isReady &&
@@ -129,19 +171,23 @@ final class VGEditorValue {
 
   @override
   int get hashCode => Object.hash(
-        draft,
-        textureId,
-        currentPTS,
-        isPlaying,
-        isReady,
-        isExporting,
-        statusMessage,
-      );
+    draft,
+    textureId,
+    renderWidth,
+    renderHeight,
+    currentPTS,
+    isPlaying,
+    isReady,
+    isExporting,
+    statusMessage,
+  );
 
   @override
-  String toString() => 'VGEditorValue('
+  String toString() =>
+      'VGEditorValue('
       'draft: ${draft.id}, '
       'textureId: $textureId, '
+      'renderSize: ${renderWidth}x$renderHeight, '
       'pts: ${currentPTS.toStringAsFixed(2)}s, '
       'playing: $isPlaying, '
       'ready: $isReady, '

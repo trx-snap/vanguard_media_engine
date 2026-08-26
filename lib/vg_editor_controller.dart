@@ -272,6 +272,17 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// Null until [initialize] completes.
   int? get textureId => value.textureId;
 
+  /// Native render width in pixels returned by the active timeline renderer.
+  /// Null until [initialize] completes or while rebuilding.
+  int? get renderWidth => value.renderWidth;
+
+  /// Native render height in pixels returned by the active timeline renderer.
+  /// Null until [initialize] completes or while rebuilding.
+  int? get renderHeight => value.renderHeight;
+
+  /// Aspect ratio (width / height) of the rendered timeline texture.
+  double? get renderAspectRatio => value.renderAspectRatio;
+
   /// Current playhead position in seconds.
   double get currentPTS => value.currentPTS;
 
@@ -391,8 +402,9 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   ///   - The returned draft is ephemeral — must not be persisted.
   ///   - Calling twice with the same unchanged source produces equal output.
   VGEditorDraft _derivePreviewDraft(VGEditorDraft source) {
-    if (_previewDraftDeriver != null) {
-      return _previewDraftDeriver!(source);
+    final deriver = _previewDraftDeriver;
+    if (deriver != null) {
+      return deriver(source);
     }
     return source.flattenOriginalClipAudio().applyAudioCompositionPolicy();
   }
@@ -416,6 +428,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     value = value.copyWith(
       isReady: false,
       textureId: null,
+      renderWidth: null,
+      renderHeight: null,
       statusMessage: 'Preparing timeline…',
     );
     notifyListeners();
@@ -440,6 +454,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
           '[VGEditorController] initialize: native returned invalid textureId=$id',
         );
       }
+      final width = (result?['width'] as num?)?.toInt();
+      final height = (result?['height'] as num?)?.toInt();
 
       // Unregister any previous subscription before registering a new one.
       // This prevents stale map entries if initialize() is called more than once.
@@ -456,6 +472,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
       value = value.copyWith(
         textureId: id,
+        renderWidth: width,
+        renderHeight: height,
         isReady: true,
         currentPTS: 0.0,
         isPlaying: false,
@@ -647,6 +665,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     value = value.copyWith(
       draft: nextDraft,
       textureId: null,
+      renderWidth: null,
+      renderHeight: null,
       isReady: false,
       currentPTS: 0.0,
       isPlaying: false,
@@ -675,6 +695,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
           '[VGEditorController] updateDraft: native returned invalid textureId=$id',
         );
       }
+      final width = (result?['width'] as num?)?.toInt();
+      final height = (result?['height'] as num?)?.toInt();
 
       // Safe listener handoff: register new before unregistering old to avoid gaps.
       final dispatcher = VanguardChannelDispatcher.instance;
@@ -696,6 +718,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
 
       value = value.copyWith(
         textureId: id,
+        renderWidth: width,
+        renderHeight: height,
         isReady: true,
         statusMessage:
             'Timeline rebuilt — ${nextDraft.durationSeconds.toStringAsFixed(1)}s',

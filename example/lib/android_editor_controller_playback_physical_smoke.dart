@@ -36,6 +36,7 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
   String _status =
       'Initializing Android VGEditorController playback physical smoke…';
   int? _textureId;
+  double? _aspectRatio;
 
   @override
   void initState() {
@@ -64,7 +65,17 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
     var disposePass = false;
 
     int? initialTextureId;
+    int? initialRenderWidth;
+    int? initialRenderHeight;
+    double? initialAspectRatio;
+    var initialAspectPass = false;
+
     int? updatedTextureId;
+    int? updatedRenderWidth;
+    int? updatedRenderHeight;
+    double? updatedAspectRatio;
+    var updateAspectPass = false;
+
     double? firstPositivePts;
     double? currentPtsAfterSeek;
     double? ptsAfterSeek;
@@ -115,20 +126,38 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
       await controller.initialize().timeout(const Duration(seconds: 10));
 
       initialTextureId = controller.textureId;
+      initialRenderWidth = controller.renderWidth;
+      initialRenderHeight = controller.renderHeight;
+      initialAspectRatio = controller.renderAspectRatio;
+
+      initialAspectPass =
+          initialRenderWidth != null &&
+          initialRenderHeight != null &&
+          initialRenderWidth > 0 &&
+          initialRenderHeight > 0 &&
+          initialRenderHeight > initialRenderWidth &&
+          initialAspectRatio != null &&
+          (initialAspectRatio - (1080.0 / 1920.0)).abs() < 0.02;
+
       initPass =
           (initialTextureId != null &&
           initialTextureId >= 0 &&
-          controller.isReady);
+          controller.isReady &&
+          initialAspectPass);
       if (!initPass) {
         throw Exception(
-          'Init failed: textureId=$initialTextureId, isReady=${controller.isReady}',
+          'Init failed: textureId=$initialTextureId, isReady=${controller.isReady}, '
+          'renderWidth=$initialRenderWidth, renderHeight=$initialRenderHeight, '
+          'aspectRatio=$initialAspectRatio, aspectPass=$initialAspectPass',
         );
       }
 
       if (mounted) {
         setState(() {
           _textureId = initialTextureId;
-          _status = 'Initialized: textureId=$initialTextureId';
+          _aspectRatio = initialAspectRatio;
+          _status =
+              'Initialized: textureId=$initialTextureId (${initialRenderWidth}x$initialRenderHeight)';
         });
       }
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_INIT: DONE');
@@ -238,19 +267,37 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
           .updateDraft(freshDraft)
           .timeout(const Duration(seconds: 10));
       updatedTextureId = controller.textureId;
+      updatedRenderWidth = controller.renderWidth;
+      updatedRenderHeight = controller.renderHeight;
+      updatedAspectRatio = controller.renderAspectRatio;
+
+      updateAspectPass =
+          updatedRenderWidth != null &&
+          updatedRenderHeight != null &&
+          updatedRenderWidth > 0 &&
+          updatedRenderHeight > 0 &&
+          updatedRenderHeight > updatedRenderWidth &&
+          updatedAspectRatio != null &&
+          (updatedAspectRatio - (1080.0 / 1920.0)).abs() < 0.02;
+
       updatePass =
           (updatedTextureId != null &&
           updatedTextureId >= 0 &&
-          controller.isReady);
+          controller.isReady &&
+          updateAspectPass);
       if (!updatePass) {
         throw Exception(
-          'UpdateDraft failed: textureId=$updatedTextureId, isReady=${controller.isReady}',
+          'UpdateDraft failed: textureId=$updatedTextureId, isReady=${controller.isReady}, '
+          'renderWidth=$updatedRenderWidth, renderHeight=$updatedRenderHeight, '
+          'aspectRatio=$updatedAspectRatio, aspectPass=$updateAspectPass',
         );
       }
       if (mounted) {
         setState(() {
           _textureId = updatedTextureId;
-          _status = 'Updated draft (textureId=$updatedTextureId)';
+          _aspectRatio = updatedAspectRatio;
+          _status =
+              'Updated draft (textureId=$updatedTextureId, ${updatedRenderWidth}x$updatedRenderHeight)';
         });
       }
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_UPDATE: DONE');
@@ -387,6 +434,14 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
       'disposePass': disposePass,
       'initialTextureId': initialTextureId,
       'updatedTextureId': updatedTextureId,
+      'initialRenderWidth': initialRenderWidth,
+      'initialRenderHeight': initialRenderHeight,
+      'initialAspectRatio': initialAspectRatio,
+      'initialAspectPass': initialAspectPass,
+      'updatedRenderWidth': updatedRenderWidth,
+      'updatedRenderHeight': updatedRenderHeight,
+      'updatedAspectRatio': updatedAspectRatio,
+      'updateAspectPass': updateAspectPass,
       'firstPositivePts': firstPositivePts,
       'currentPtsAfterSeek': currentPtsAfterSeek,
       'ptsAfterSeek': ptsAfterSeek,
@@ -430,9 +485,11 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
             children: [
               if (_textureId != null)
                 SizedBox(
-                  width: 320,
-                  height: 180,
-                  child: Texture(textureId: _textureId!),
+                  height: 360,
+                  child: AspectRatio(
+                    aspectRatio: _aspectRatio ?? (9.0 / 16.0),
+                    child: Texture(textureId: _textureId!),
+                  ),
                 ),
               const SizedBox(height: 16),
               Padding(
