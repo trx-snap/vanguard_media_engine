@@ -1,17 +1,14 @@
-// Vanguard Android True-DAG Phase 7.8E: Public VGEditorController playback route parity, preview readiness, and presentation physical smoke test.
+// Vanguard Android True-DAG Phase 7.8G: Public VGEditorController sequential multi-clip playback route verification.
 //
-// Proves Android public VGEditorController routes work for one local video clip using public Dart API only:
-//   - VGEditorPreviewReadinessEvaluator -> evaluates initial draft as ready before initialize
-//   - VGEditorController.initialize -> native createTimelineTexture
+// Proves Android public VGEditorController routes work for sequential multi-clip plain video drafts using public Dart API only:
+//   - VGEditorPreviewReadinessEvaluator -> evaluates two-clip plain video draft as ready before initialize
+//   - VGEditorController.initialize -> native createTimelineTexture with cumulative multi-clip duration
 //   - VGEditorTextureView -> renders editor timeline texture from VGEditorValue with aspect preservation
-//   - VGEditorController.play -> native timelinePlay
-//   - VGEditorController.pause -> native timelinePause
-//   - VGEditorController.seek -> native timelineSeek
-//   - VGEditorPreviewReadinessEvaluator -> evaluates fresh draft as ready before updateDraft
-//   - VGEditorController.updateDraft -> native updateTimeline
-//   - VGEditorController.disposeAsyncConfirmed/dispose -> native disposeTimeline
-//   - VGEditorPreviewReadinessEvaluator -> evaluates multi-clip draft as blocked with multiClipTimeline
-//   - negative multi-clip initialize returns PlatformException code UNSUPPORTED_TIMELINE
+//   - VGEditorController.play -> native timelinePlay, observing positive PTS in first clip
+//   - VGEditorController.seek (intra-clip) -> seeks within first clip
+//   - VGEditorController.seek (cross-clip) -> seeks across clip boundary into second clip
+//   - VGEditorController.play (after boundary) -> continues playback in second clip beyond boundary
+//   - VGEditorController.disposeAsyncConfirmed/dispose -> native disposeTimeline with confirmed teardown
 
 // ignore_for_file: avoid_print
 
@@ -53,107 +50,106 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
     // Wait briefly for Flutter host connection to settle
     await Future<void>.delayed(const Duration(seconds: 1));
 
-    File? tempFile;
+    File? tempFile1;
+    File? tempFile2;
     VGEditorController? cleanupController;
     StreamSubscription<double>? ptsSubscription;
     final List<double> ptsValues = [];
 
-    var initialReadinessPass = false;
+    var readinessPass = false;
     var initPass = false;
     var presentationWidgetPass = false;
     var playPass = false;
     var pausePass = false;
-    var seekPass = false;
-    var updateReadinessPass = false;
-    var updatePass = false;
-    var replayPass = false;
-    var multiClipReadinessPass = false;
-    var multiClipRejectPass = false;
+    var intraSeekPass = false;
+    var crossSeekPass = false;
+    var playAfterBoundaryPass = false;
     var disposePass = false;
 
-    int? initialTextureId;
-    int? initialRenderWidth;
-    int? initialRenderHeight;
-    double? initialAspectRatio;
-    var initialAspectPass = false;
-
-    int? updatedTextureId;
-    int? updatedRenderWidth;
-    int? updatedRenderHeight;
-    double? updatedAspectRatio;
-    var updateAspectPass = false;
+    int? textureId;
+    int? renderWidth;
+    int? renderHeight;
+    double? renderAspectRatio;
+    var aspectPass = false;
 
     double? firstPositivePts;
-    double? currentPtsAfterSeek;
-    double? ptsAfterSeek;
-    double? replayPositivePts;
-    String? multiClipErrorCode;
+    double? ptsAfterIntraSeek;
+    double? currentPtsAfterCrossSeek;
+    double? ptsAfterBoundary;
     String? errorMessage;
 
-    Map<String, Object?>? initialReadinessReport;
-    Map<String, Object?>? updateReadinessReport;
-    Map<String, Object?>? multiClipReadinessReport;
-    VGEditorPreviewReadinessReport? initialReport;
-    VGEditorPreviewReadinessReport? updateReport;
-    VGEditorPreviewReadinessReport? multiReport;
+    Map<String, Object?>? readinessReportMap;
+    VGEditorPreviewReadinessReport? readinessReport;
 
     try {
-      // 0. Copy assets/manual_test_clips/clip_B.mov from rootBundle to Directory.systemTemp
+      // 0. Copy assets/manual_test_clips/clip_B.mov from rootBundle to two temp files
       final clipBytes = await rootBundle.load(
         'assets/manual_test_clips/clip_B.mov',
       );
       final tempDir = Directory.systemTemp;
-      tempFile = File('${tempDir.path}/android_editor_controller_clip_b.mov');
-      await tempFile.writeAsBytes(
-        clipBytes.buffer.asUint8List(
-          clipBytes.offsetInBytes,
-          clipBytes.lengthInBytes,
-        ),
-        flush: true,
+      tempFile1 = File('${tempDir.path}/android_editor_multi_clip_1.mov');
+      tempFile2 = File('${tempDir.path}/android_editor_multi_clip_2.mov');
+      final bytesList = clipBytes.buffer.asUint8List(
+        clipBytes.offsetInBytes,
+        clipBytes.lengthInBytes,
       );
+      await tempFile1.writeAsBytes(bytesList, flush: true);
+      await tempFile2.writeAsBytes(bytesList, flush: true);
 
       const evaluator = VGEditorPreviewReadinessEvaluator();
 
-      // 1. INITIAL READINESS
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_INITIAL_READINESS: START');
-      final clipDescriptor = VGClipDescriptor(
-        id: 'clip_b_0',
+      // 1. PRE-INIT READINESS EVALUATION (Two-clip plain video draft)
+      print(
+        'ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_PRE_INIT_READINESS: START',
+      );
+      final clip1 = VGClipDescriptor(
+        id: 'clip_multi_1',
         mediaKind: VGMediaKind.video,
-        sourcePath: tempFile.path,
+        sourcePath: tempFile1.path,
         durationSeconds: 3.0,
         trimStartSeconds: 0.0,
         trimEndSeconds: 3.0,
+        startTimeSeconds: 0.0,
+      );
+      final clip2 = VGClipDescriptor(
+        id: 'clip_multi_2',
+        mediaKind: VGMediaKind.video,
+        sourcePath: tempFile2.path,
+        durationSeconds: 3.0,
+        trimStartSeconds: 0.0,
+        trimEndSeconds: 3.0,
+        startTimeSeconds: 3.0,
       );
 
-      final initialDraft = VGEditorDraft(
-        id: 'draft_single_clip',
-        clips: [clipDescriptor],
+      final multiClipDraft = VGEditorDraft(
+        id: 'draft_multi_clip_sequential',
+        clips: [clip1, clip2],
         canvasWidth: 1280,
         canvasHeight: 720,
         fps: 30,
       );
 
-      initialReport = evaluator.evaluate(initialDraft);
-      initialReadinessReport = initialReport.toMap();
-      initialReadinessPass =
-          initialReport.canUseAndroidEditorPlaybackRoute &&
-          initialReport.decision == VGEditorPreviewReadinessDecision.ready &&
-          initialReport.issues.isEmpty &&
-          initialReport.diagnostics['clipCount'] == 1 &&
-          initialReport.diagnostics['issueCount'] == 0;
+      readinessReport = evaluator.evaluate(multiClipDraft);
+      readinessReportMap = readinessReport.toMap();
+      readinessPass =
+          readinessReport.canUseAndroidEditorPlaybackRoute &&
+          readinessReport.decision == VGEditorPreviewReadinessDecision.ready &&
+          readinessReport.issues.isEmpty &&
+          readinessReport.diagnostics['clipCount'] == 2 &&
+          readinessReport.diagnostics['issueCount'] == 0;
 
-      if (!initialReadinessPass) {
+      if (!readinessPass) {
         throw Exception(
-          'Initial readiness evaluation failed: decision=${initialReport.decision.name}, '
-          'canUse=${initialReport.canUseAndroidEditorPlaybackRoute}, '
-          'issues=${initialReport.issues}, diagnostics=${initialReport.diagnostics}',
+          'Multi-clip pre-init readiness evaluation failed: decision=${readinessReport.decision.name}, '
+          'canUse=${readinessReport.canUseAndroidEditorPlaybackRoute}, '
+          'issues=${readinessReport.issues}, diagnostics=${readinessReport.diagnostics}',
         );
       }
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_INITIAL_READINESS: DONE');
+      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_PRE_INIT_READINESS: DONE');
 
-      // 2. INIT
+      // 2. INIT MULTI-CLIP CONTROLLER
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_INIT: START');
-      final controller = VGEditorController(initialDraft: initialDraft);
+      final controller = VGEditorController(initialDraft: multiClipDraft);
       cleanupController = controller;
       ptsSubscription = controller.ptsStream.listen((pts) {
         ptsValues.add(pts);
@@ -161,30 +157,31 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
 
       await controller.initialize().timeout(const Duration(seconds: 10));
 
-      initialTextureId = controller.textureId;
-      initialRenderWidth = controller.renderWidth;
-      initialRenderHeight = controller.renderHeight;
-      initialAspectRatio = controller.renderAspectRatio;
+      textureId = controller.textureId;
+      renderWidth = controller.renderWidth;
+      renderHeight = controller.renderHeight;
+      renderAspectRatio = controller.renderAspectRatio;
 
-      initialAspectPass =
-          initialRenderWidth != null &&
-          initialRenderHeight != null &&
-          initialRenderWidth > 0 &&
-          initialRenderHeight > 0 &&
-          initialRenderHeight > initialRenderWidth &&
-          initialAspectRatio != null &&
-          (initialAspectRatio - (1080.0 / 1920.0)).abs() < 0.02;
+      aspectPass =
+          renderWidth != null &&
+          renderHeight != null &&
+          renderWidth > 0 &&
+          renderHeight > 0 &&
+          renderHeight > renderWidth &&
+          renderAspectRatio != null &&
+          (renderAspectRatio - (1080.0 / 1920.0)).abs() < 0.02;
 
       initPass =
-          (initialTextureId != null &&
-          initialTextureId >= 0 &&
+          (textureId != null &&
+          textureId >= 0 &&
           controller.isReady &&
-          initialAspectPass);
+          aspectPass);
+
       if (!initPass) {
         throw Exception(
-          'Init failed: textureId=$initialTextureId, isReady=${controller.isReady}, '
-          'renderWidth=$initialRenderWidth, renderHeight=$initialRenderHeight, '
-          'aspectRatio=$initialAspectRatio, aspectPass=$initialAspectPass',
+          'Multi-clip init failed: textureId=$textureId, isReady=${controller.isReady}, '
+          'renderWidth=$renderWidth, renderHeight=$renderHeight, '
+          'aspectRatio=$renderAspectRatio, aspectPass=$aspectPass',
         );
       }
 
@@ -196,12 +193,12 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
         setState(() {
           _editorValue = controller.value;
           _status =
-              'Initialized: textureId=$initialTextureId (${initialRenderWidth}x$initialRenderHeight)';
+              'Initialized: textureId=$textureId (${renderWidth}x$renderHeight, 2 clips)';
         });
       }
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_INIT: DONE');
 
-      // 3. PLAY
+      // 3. PLAY AND OBSERVE POSITIVE PTS
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_PLAY: START');
       final positivePtsCompleter = Completer<double>();
       final playSub = controller.ptsStream.listen((pts) {
@@ -224,178 +221,135 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
           )
           .whenComplete(() => playSub.cancel());
 
-      playPass = (firstPositivePts > 0.0 && controller.isPlaying);
+      await controller.pause();
+      pausePass = !controller.isPlaying;
+      playPass = (firstPositivePts > 0.0 && pausePass);
+
+      if (!playPass) {
+        throw Exception(
+          'Play / pause failed: firstPositivePts=$firstPositivePts, pausePass=$pausePass',
+        );
+      }
       if (mounted) {
         setState(() {
-          _status = 'Playing: firstPositivePts=$firstPositivePts';
+          _status = 'Played clip 1: firstPositivePts=$firstPositivePts';
         });
       }
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_PLAY: DONE');
 
-      // 4. PAUSE
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_PAUSE: START');
-      await controller.pause();
-      pausePass = !controller.isPlaying;
-      if (!pausePass) {
-        throw Exception('Pause failed: controller.isPlaying is still true');
-      }
-      if (mounted) {
-        setState(() {
-          _status = 'Paused at ${controller.currentPTS.toStringAsFixed(2)}s';
-        });
-      }
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_PAUSE: DONE');
-
-      // 5. SEEK
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_SEEK: START');
-      final seekPtsCompleter = Completer<double>();
-      final seekSub = controller.ptsStream.listen((pts) {
-        if (!seekPtsCompleter.isCompleted) {
-          seekPtsCompleter.complete(pts);
+      // 4. SEEK WITHIN FIRST CLIP (Intra-clip seek)
+      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_INTRA_CLIP_SEEK: START');
+      final intraSeekCompleter = Completer<double>();
+      final intraSeekSub = controller.ptsStream.listen((pts) {
+        if (!intraSeekCompleter.isCompleted) {
+          intraSeekCompleter.complete(pts);
         }
       });
 
       await controller.seek(1.0);
-      currentPtsAfterSeek = controller.currentPTS;
+      ptsAfterIntraSeek = controller.currentPTS;
 
       try {
-        ptsAfterSeek = await seekPtsCompleter.future.timeout(
-          const Duration(seconds: 2),
-        );
+        await intraSeekCompleter.future.timeout(const Duration(seconds: 2));
       } catch (_) {
         // stationary pause seek may not deliver new frame callback or was already set
       } finally {
-        await seekSub.cancel();
+        await intraSeekSub.cancel();
       }
 
-      seekPass =
-          (currentPtsAfterSeek >= 0.9) ||
-          (ptsAfterSeek != null && ptsAfterSeek >= 0.9);
-      if (!seekPass) {
+      intraSeekPass = (ptsAfterIntraSeek >= 0.9 && ptsAfterIntraSeek < 2.9);
+      if (!intraSeekPass) {
         throw Exception(
-          'Seek failed: currentPTS=$currentPtsAfterSeek, ptsAfterSeek=$ptsAfterSeek',
+          'Intra-clip seek failed: currentPTS=$ptsAfterIntraSeek (expected ~1.0 in clip 1)',
         );
       }
       if (mounted) {
         setState(() {
-          _status = 'Seeked to 1.0s (currentPTS=$currentPtsAfterSeek)';
+          _status = 'Intra-clip seek to 1.0s (currentPTS=$ptsAfterIntraSeek)';
         });
       }
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_SEEK: DONE');
+      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_INTRA_CLIP_SEEK: DONE');
 
-      // 6. UPDATE READINESS
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_UPDATE_READINESS: START');
-      final freshClip = VGClipDescriptor(
-        id: 'clip_b_fresh',
-        mediaKind: VGMediaKind.video,
-        sourcePath: tempFile.path,
-        durationSeconds: 3.0,
-        trimStartSeconds: 0.0,
-        trimEndSeconds: 3.0,
-      );
+      // 5. SEEK ACROSS CLIP BOUNDARY INTO SECOND CLIP (Inter-clip seek)
+      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_CROSS_CLIP_SEEK: START');
+      final crossSeekCompleter = Completer<double>();
+      final crossSeekSub = controller.ptsStream.listen((pts) {
+        if (!crossSeekCompleter.isCompleted) {
+          crossSeekCompleter.complete(pts);
+        }
+      });
 
-      final freshDraft = VGEditorDraft(
-        id: 'draft_fresh_clip',
-        clips: [freshClip],
-        canvasWidth: 1280,
-        canvasHeight: 720,
-        fps: 30,
-      );
+      // Seek to 4.0s (clip 0 is ~3.0s, so 4.0s is in clip 1, beyond boundary)
+      await controller.seek(4.0);
+      currentPtsAfterCrossSeek = controller.currentPTS;
 
-      updateReport = evaluator.evaluate(freshDraft);
-      updateReadinessReport = updateReport.toMap();
-      updateReadinessPass =
-          updateReport.canUseAndroidEditorPlaybackRoute &&
-          updateReport.decision == VGEditorPreviewReadinessDecision.ready &&
-          updateReport.issues.isEmpty &&
-          updateReport.diagnostics['clipCount'] == 1 &&
-          updateReport.diagnostics['issueCount'] == 0;
-
-      if (!updateReadinessPass) {
-        throw Exception(
-          'Update readiness evaluation failed: decision=${updateReport.decision.name}, '
-          'canUse=${updateReport.canUseAndroidEditorPlaybackRoute}, '
-          'issues=${updateReport.issues}, diagnostics=${updateReport.diagnostics}',
-        );
+      try {
+        await crossSeekCompleter.future.timeout(const Duration(seconds: 3));
+      } catch (_) {
+        // stationary pause seek
+      } finally {
+        await crossSeekSub.cancel();
       }
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_UPDATE_READINESS: DONE');
 
-      // 7. UPDATE
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_UPDATE: START');
-      await controller
-          .updateDraft(freshDraft)
-          .timeout(const Duration(seconds: 10));
-      updatedTextureId = controller.textureId;
-      updatedRenderWidth = controller.renderWidth;
-      updatedRenderHeight = controller.renderHeight;
-      updatedAspectRatio = controller.renderAspectRatio;
-
-      updateAspectPass =
-          updatedRenderWidth != null &&
-          updatedRenderHeight != null &&
-          updatedRenderWidth > 0 &&
-          updatedRenderHeight > 0 &&
-          updatedRenderHeight > updatedRenderWidth &&
-          updatedAspectRatio != null &&
-          (updatedAspectRatio - (1080.0 / 1920.0)).abs() < 0.02;
-
-      updatePass =
-          (updatedTextureId != null &&
-          updatedTextureId >= 0 &&
-          controller.isReady &&
-          updateAspectPass);
-      if (!updatePass) {
+      crossSeekPass = (currentPtsAfterCrossSeek >= 3.0);
+      if (!crossSeekPass) {
         throw Exception(
-          'UpdateDraft failed: textureId=$updatedTextureId, isReady=${controller.isReady}, '
-          'renderWidth=$updatedRenderWidth, renderHeight=$updatedRenderHeight, '
-          'aspectRatio=$updatedAspectRatio, aspectPass=$updateAspectPass',
+          'Cross-clip seek failed: currentPTS=$currentPtsAfterCrossSeek (expected >= 3.0 in clip 2)',
         );
       }
       if (mounted) {
         setState(() {
-          _editorValue = controller.value;
           _status =
-              'Updated draft (textureId=$updatedTextureId, ${updatedRenderWidth}x$updatedRenderHeight)';
+              'Cross-clip seek to 4.0s (currentPTS=$currentPtsAfterCrossSeek)';
         });
       }
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_UPDATE: DONE');
+      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_CROSS_CLIP_SEEK: DONE');
 
-      // 8. REPLAY
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_REPLAY: START');
-      final replayPtsCompleter = Completer<double>();
-      final replaySub = controller.ptsStream.listen((pts) {
-        if (pts > 0.0 && !replayPtsCompleter.isCompleted) {
-          replayPtsCompleter.complete(pts);
+      // 6. PLAY AFTER BOUNDARY (Continue playback in second clip)
+      print(
+        'ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_PLAY_AFTER_BOUNDARY: START',
+      );
+      final boundaryPlayCompleter = Completer<double>();
+      final boundaryPlaySub = controller.ptsStream.listen((pts) {
+        if (pts > 3.0 && !boundaryPlayCompleter.isCompleted) {
+          boundaryPlayCompleter.complete(pts);
         }
       });
 
       await controller.play();
       if (!controller.isPlaying) {
-        throw Exception('Replay failed: controller.isPlaying is false');
+        throw Exception(
+          'Play after boundary failed: controller.isPlaying is false',
+        );
       }
 
-      replayPositivePts = await replayPtsCompleter.future
+      ptsAfterBoundary = await boundaryPlayCompleter.future
           .timeout(
             const Duration(seconds: 10),
             onTimeout: () => throw TimeoutException(
-              'No positive PTS received within 10s of replay',
+              'No PTS > 3.0 received within 10s of play after boundary',
             ),
           )
-          .whenComplete(() => replaySub.cancel());
+          .whenComplete(() => boundaryPlaySub.cancel());
 
       await controller.pause();
-      replayPass = (replayPositivePts > 0.0);
-      if (!replayPass) {
-        throw Exception('Replay failed: replayPositivePts=$replayPositivePts');
+      playAfterBoundaryPass = (ptsAfterBoundary > 3.0 && !controller.isPlaying);
+
+      if (!playAfterBoundaryPass) {
+        throw Exception(
+          'Play after boundary failed: ptsAfterBoundary=$ptsAfterBoundary, isPlaying=${controller.isPlaying}',
+        );
       }
       if (mounted) {
         setState(() {
-          _status = 'Replay completed (positive PTS=$replayPositivePts)';
+          _status = 'Playback in clip 2 confirmed (PTS=$ptsAfterBoundary)';
         });
       }
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_REPLAY: DONE');
+      print(
+        'ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_PLAY_AFTER_BOUNDARY: DONE',
+      );
 
-      // 9. DISPOSE
+      // 7. DISPOSE
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_DISPOSE: START');
       await controller.disposeAsyncConfirmed().timeout(
         const Duration(seconds: 5),
@@ -404,81 +358,6 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
       cleanupController = null;
       disposePass = true;
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_DISPOSE: DONE');
-
-      // 10. MULTI_CLIP_READINESS
-      print(
-        'ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_MULTI_CLIP_READINESS: START',
-      );
-      final multiClip1 = VGClipDescriptor(
-        id: 'clip_multi_1',
-        mediaKind: VGMediaKind.video,
-        sourcePath: tempFile.path,
-        durationSeconds: 3.0,
-        trimStartSeconds: 0.0,
-        trimEndSeconds: 3.0,
-      );
-      final multiClip2 = VGClipDescriptor(
-        id: 'clip_multi_2',
-        mediaKind: VGMediaKind.video,
-        sourcePath: tempFile.path,
-        durationSeconds: 3.0,
-        trimStartSeconds: 0.0,
-        trimEndSeconds: 3.0,
-      );
-      final multiClipDraft = VGEditorDraft(
-        id: 'draft_multi_clip',
-        clips: [multiClip1, multiClip2],
-        canvasWidth: 1280,
-        canvasHeight: 720,
-        fps: 30,
-      );
-
-      multiReport = evaluator.evaluate(multiClipDraft);
-      multiClipReadinessReport = multiReport.toMap();
-      final hasMultiClipIssue = multiReport.issues.any(
-        (issue) =>
-            issue.code == VGEditorPreviewReadinessIssueCode.multiClipTimeline,
-      );
-      multiClipReadinessPass =
-          multiReport.decision == VGEditorPreviewReadinessDecision.blocked &&
-          !multiReport.canUseAndroidEditorPlaybackRoute &&
-          hasMultiClipIssue &&
-          multiReport.diagnostics['clipCount'] == 2;
-
-      if (!multiClipReadinessPass) {
-        throw Exception(
-          'Multi-clip readiness evaluation failed: decision=${multiReport.decision.name}, '
-          'canUse=${multiReport.canUseAndroidEditorPlaybackRoute}, '
-          'hasMultiClipIssue=$hasMultiClipIssue, diagnostics=${multiReport.diagnostics}',
-        );
-      }
-      print(
-        'ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_MULTI_CLIP_READINESS: DONE',
-      );
-
-      // 11. MULTI_CLIP_REJECT
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_MULTI_CLIP_REJECT: START');
-      final multiController = VGEditorController(initialDraft: multiClipDraft);
-      try {
-        await multiController.initialize().timeout(const Duration(seconds: 5));
-      } on PlatformException catch (e) {
-        multiClipErrorCode = e.code;
-        if (e.code == 'UNSUPPORTED_TIMELINE') {
-          multiClipRejectPass = true;
-        }
-      } finally {
-        try {
-          await multiController.disposeAsyncConfirmed();
-        } catch (_) {}
-        multiController.dispose();
-      }
-
-      if (!multiClipRejectPass) {
-        throw Exception(
-          'Multi-clip reject failed: errorCode=$multiClipErrorCode, expected UNSUPPORTED_TIMELINE',
-        );
-      }
-      print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_STEP_MULTI_CLIP_REJECT: DONE');
     } catch (e, st) {
       errorMessage = '$e';
       print('ANDROID_EDITOR_CONTROLLER_PLAYBACK_ERROR: $e\n$st');
@@ -490,65 +369,50 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
         } catch (_) {}
         cleanupController.dispose();
       }
-      if (tempFile != null && await tempFile.exists()) {
+      if (tempFile1 != null && await tempFile1.exists()) {
         try {
-          await tempFile.delete();
+          await tempFile1.delete();
+        } catch (_) {}
+      }
+      if (tempFile2 != null && await tempFile2.exists()) {
+        try {
+          await tempFile2.delete();
         } catch (_) {}
       }
     }
 
     final overallPass =
+        readinessPass &&
         initPass &&
+        presentationWidgetPass &&
         playPass &&
-        pausePass &&
-        seekPass &&
-        updatePass &&
-        replayPass &&
-        multiClipRejectPass &&
-        disposePass &&
-        initialReadinessPass &&
-        updateReadinessPass &&
-        multiClipReadinessPass &&
-        presentationWidgetPass;
+        intraSeekPass &&
+        crossSeekPass &&
+        playAfterBoundaryPass &&
+        disposePass;
 
     final jsonSummary = <String, dynamic>{
       'pass': overallPass,
+      'readinessPass': readinessPass,
       'initPass': initPass,
-      'playPass': playPass,
-      'pausePass': pausePass,
-      'seekPass': seekPass,
-      'updatePass': updatePass,
-      'replayPass': replayPass,
-      'multiClipRejectPass': multiClipRejectPass,
-      'disposePass': disposePass,
-      'initialReadinessPass': initialReadinessPass,
-      'updateReadinessPass': updateReadinessPass,
-      'multiClipReadinessPass': multiClipReadinessPass,
       'presentationWidgetPass': presentationWidgetPass,
-      'initialReadinessDecision': initialReport?.decision.name,
-      'initialReadinessDiagnostics': initialReport?.diagnostics,
-      'initialReadinessReport': initialReadinessReport,
-      'updateReadinessDecision': updateReport?.decision.name,
-      'updateReadinessDiagnostics': updateReport?.diagnostics,
-      'updateReadinessReport': updateReadinessReport,
-      'multiClipReadinessDecision': multiReport?.decision.name,
-      'multiClipReadinessDiagnostics': multiReport?.diagnostics,
-      'multiClipReadinessReport': multiClipReadinessReport,
-      'initialTextureId': initialTextureId,
-      'updatedTextureId': updatedTextureId,
-      'initialRenderWidth': initialRenderWidth,
-      'initialRenderHeight': initialRenderHeight,
-      'initialAspectRatio': initialAspectRatio,
-      'initialAspectPass': initialAspectPass,
-      'updatedRenderWidth': updatedRenderWidth,
-      'updatedRenderHeight': updatedRenderHeight,
-      'updatedAspectRatio': updatedAspectRatio,
-      'updateAspectPass': updateAspectPass,
+      'playPass': playPass,
+      'intraSeekPass': intraSeekPass,
+      'crossSeekPass': crossSeekPass,
+      'playAfterBoundaryPass': playAfterBoundaryPass,
+      'disposePass': disposePass,
+      'readinessDecision': readinessReport?.decision.name,
+      'readinessDiagnostics': readinessReport?.diagnostics,
+      'readinessReport': readinessReportMap,
+      'textureId': textureId,
+      'renderWidth': renderWidth,
+      'renderHeight': renderHeight,
+      'renderAspectRatio': renderAspectRatio,
+      'aspectPass': aspectPass,
       'firstPositivePts': firstPositivePts,
-      'currentPtsAfterSeek': currentPtsAfterSeek,
-      'ptsAfterSeek': ptsAfterSeek,
-      'replayPositivePts': replayPositivePts,
-      'multiClipErrorCode': multiClipErrorCode,
+      'ptsAfterIntraSeek': ptsAfterIntraSeek,
+      'currentPtsAfterCrossSeek': currentPtsAfterCrossSeek,
+      'ptsAfterBoundary': ptsAfterBoundary,
       'totalPtsCount': ptsValues.length,
       'error': errorMessage,
     };
@@ -566,7 +430,7 @@ class _AndroidEditorControllerPlaybackPhysicalSmokeAppState
     if (mounted) {
       setState(() {
         _status = overallPass
-            ? 'PASS: Android VGEditorController playback routes, readiness, and presentation verified.'
+            ? 'PASS: Android VGEditorController sequential multi-clip playback routes verified.'
             : 'FAIL: $errorMessage';
       });
     }

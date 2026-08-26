@@ -2,20 +2,23 @@ package com.connects.vanguard_media_engine.editor
 
 import android.os.Handler
 import android.util.Log
-import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackControlSession
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 
 /**
- * Phase 7.8A-Android: owns the public Dart VGEditorController playback routes
+ * Phase 7.8G-Android: owns the public Dart VGEditorController playback routes
  * (createTimelineTexture, updateTimeline, timelinePlay, timelinePause,
- * timelineSeek, disposeTimeline) for exactly one local video clip.
+ * timelineSeek, disposeTimeline) for sequential plain local video clips
+ * (one or more clips, hard-cut concatenation only).
  *
- * Delegates execution to [AndroidDagTexturePlaybackControlSession]. Does not
- * own streaming/cache/RTC/export/multi-clip compositor policy — those remain
- * owned by their respective coordinators or are left unimplemented for this
- * slice (multi-clip, transitions, overlays, transforms, audio sidecars,
- * reverse sidecars, timeline cache stats, exportTimeline, clearTimelineCache).
+ * Validates each draft against the current unsupported-feature guardrails
+ * (transitions, overlays, audio sidecar, per-clip transform, non-default
+ * fit/crop, freeze frame, reverse playback, dual camera, time remap,
+ * transform track, color matrix) and delegates execution to
+ * [AndroidEditorSequentialPlaybackSession]. Does not own streaming/cache/
+ * RTC/export/compositor policy — those remain owned by their respective
+ * coordinators or are left unimplemented for this slice (exportTimeline,
+ * clearTimelineCache, timeline cache stats).
  */
 class AndroidEditorPlaybackCoordinator(
     private val textureRegistry: TextureRegistry,
@@ -39,7 +42,7 @@ class AndroidEditorPlaybackCoordinator(
 
     private data class ActiveEntry(
         val textureId: Long,
-        val session: AndroidDagTexturePlaybackControlSession,
+        val session: AndroidEditorSequentialPlaybackSession,
         val surfaceProducer: TextureRegistry.SurfaceProducer,
     )
 
@@ -74,27 +77,97 @@ class AndroidEditorPlaybackCoordinator(
             return
         }
 
-        if (clips.size != 1) {
-            result.error("UNSUPPORTED_TIMELINE", "exactly one clip is supported in this slice", null)
+        // Draft-level unsupported-feature guardrails. 'transitions' and 'overlays'
+        // are always-present keys in VGEditorDraft.toMap() (possibly empty lists);
+        // 'audioSidecar' is present only when a plan is set.
+        val transitions = draft["transitions"] as? List<*>
+        if (transitions != null && transitions.isNotEmpty()) {
+            result.error("UNSUPPORTED_TIMELINE_FEATURE", "transitions are not supported in this slice", null)
+            return
+        }
+        val overlays = draft["overlays"] as? List<*>
+        if (overlays != null && overlays.isNotEmpty()) {
+            result.error("UNSUPPORTED_TIMELINE_FEATURE", "overlays are not supported in this slice", null)
             return
         }
 
-        val clip = clips[0] as? Map<*, *>
-        val mediaKind = clip?.get("mediaKind") as? String
-        if (mediaKind != null && mediaKind != "video") {
-            result.error("UNSUPPORTED_MEDIA_KIND", "mediaKind=$mediaKind is not supported", null)
-            return
+        val sourcePaths = mutableListOf<String>()
+        for (rawClip in clips) {
+            val clip = rawClip as? Map<*, *>
+            if (clip == null) {
+                result.error("INVALID_CLIP", "each clip must be a map", null)
+                return
+            }
+
+            val mediaKind = clip["mediaKind"] as? String
+            if (mediaKind != null && mediaKind != "video") {
+                result.error("UNSUPPORTED_MEDIA_KIND", "mediaKind=$mediaKind is not supported", null)
+                return
+            }
+
+            // Per-clip unsupported-feature guardrails. Each of these wire keys is
+            // present in VGClipDescriptor.toMap() only when the field differs from
+            // its supported default (see vg_clip_descriptor.dart), so presence
+            // alone identifies an unsupported clip.
+            if (clip["transform"] != null ||
+                clip["fitMode"] != null ||
+                clip["cropRect"] != null ||
+                clip["freezePTS"] != null ||
+                clip["isReversed"] != null ||
+                clip["dualCamera"] != null ||
+                clip["timeRemap"] != null ||
+                clip["transformTrack"] != null ||
+                clip["colorMatrix"] != null
+            ) {
+                result.error(
+                    "UNSUPPORTED_TIMELINE_FEATURE",
+                    "clip \"${clip["id"]}\" uses an unsupported timeline feature",
+                    null,
+                )
+                return
+            }
+
+            val sourcePath = clip["sourcePath"] as? String
+            if (sourcePath.isNullOrBlank()) {
+                result.error("FILE_UNREADABLE", "sourcePath is missing or blank", null)
+                return
+            }
+            val file = java.io.File(sourcePath)
+            if (!file.exists() || !file.canRead()) {
+                result.error("FILE_UNREADABLE", "sourcePath is not readable: $sourcePath", null)
+                return
+            }
+            sourcePaths.add(sourcePath)
         }
 
-        val sourcePath = clip?.get("sourcePath") as? String
-        if (sourcePath.isNullOrBlank()) {
-            result.error("FILE_UNREADABLE", "sourcePath is missing or blank", null)
-            return
-        }
-        val file = java.io.File(sourcePath)
-        if (!file.exists() || !file.canRead()) {
-            result.error("FILE_UNREADABLE", "sourcePath is not readable: $sourcePath", null)
-            return
+        // 'audioSidecar' is present in VGEditorDraft.toMap() only when a plan is
+        // set. This route ignores audio entirely, so the only sidecar shape it
+        // may accept is the controller's own derived original-clip-audio plan
+        // (VGEditorDraft.flattenOriginalClipAudio()) — one synthetic track per
+        // clip's own already-validated sourcePath, tagged role="original" with a
+        // trackId of "original-<clipId>". Anything else (real mixing/added
+        // audio) must still be rejected.
+        val audioSidecar = draft["audioSidecar"]
+        if (audioSidecar != null) {
+            val sidecarMap = audioSidecar as? Map<*, *>
+            val tracks = sidecarMap?.get("tracks") as? List<*>
+            val isDerivedOriginalOnly = tracks != null && tracks.isNotEmpty() && tracks.all { rawTrack ->
+                val track = rawTrack as? Map<*, *> ?: return@all false
+                val trackId = track["trackId"] as? String
+                val url = track["url"] as? String
+                track["role"] == "original" &&
+                    trackId != null && trackId.startsWith("original-") &&
+                    !url.isNullOrBlank() &&
+                    sourcePaths.contains(url)
+            }
+            if (!isDerivedOriginalOnly) {
+                result.error(
+                    "UNSUPPORTED_TIMELINE_FEATURE",
+                    "non-original audio sidecars are not supported in this slice",
+                    null,
+                )
+                return
+            }
         }
 
         // Exactly one active editor timeline at a time — dispose and fully
@@ -103,8 +176,8 @@ class AndroidEditorPlaybackCoordinator(
             val surfaceProducer = textureRegistry.createSurfaceProducer(TextureRegistry.SurfaceLifecycle.resetInBackground)
             val textureId = surfaceProducer.id()
 
-            val session = AndroidDagTexturePlaybackControlSession(
-                videoPath = sourcePath,
+            val session = AndroidEditorSequentialPlaybackSession(
+                clipSourcePaths = sourcePaths,
                 surfaceProducer = surfaceProducer,
                 onTimelineFrame = { id, ptsSeconds, generationId ->
                     mainHandler.post {
@@ -236,7 +309,7 @@ class AndroidEditorPlaybackCoordinator(
     // ── active-entry helpers ───────────────────────────────────────────────────
 
     /** True if [active] still refers to the given [textureId] / [session] pair. */
-    private fun isActiveEntry(textureId: Long, session: AndroidDagTexturePlaybackControlSession): Boolean {
+    private fun isActiveEntry(textureId: Long, session: AndroidEditorSequentialPlaybackSession): Boolean {
         return synchronized(lock) {
             active?.textureId == textureId && active?.session === session
         }
@@ -248,7 +321,7 @@ class AndroidEditorPlaybackCoordinator(
      * owned the entry and must finish its own cleanup), false if it had
      * already been disposed/replaced by someone else.
      */
-    private fun removeActiveIfSame(textureId: Long, session: AndroidDagTexturePlaybackControlSession): Boolean {
+    private fun removeActiveIfSame(textureId: Long, session: AndroidEditorSequentialPlaybackSession): Boolean {
         return synchronized(lock) {
             if (active?.textureId == textureId && active?.session === session) {
                 active = null

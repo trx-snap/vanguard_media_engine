@@ -8,12 +8,12 @@
 // Pure-Dart public readiness evaluator for preflighting VGEditorDraft instances
 // before passing them to the Android native VGEditorController playback route.
 //
-// Android VGEditorController public playback route currently supports a single
-// plain local video clip and rejects multi-clip natively (UNSUPPORTED_TIMELINE).
-// It does not yet execute editor compositor features such as transitions,
-// overlays, spatial clip transforms, still-image crop/fit, freeze frames,
-// reverse playback, dual-camera composition, time remap, transform tracks,
-// color matrix filtering, or audio sidecar mixing.
+// Android VGEditorController public playback route supports sequential plain
+// local video clips (one or more, hard-cut concatenation only). It does not
+// yet execute editor compositor features such as transitions, overlays,
+// spatial clip transforms, still-image crop/fit, freeze frames, reverse
+// playback, dual-camera composition, time remap, transform tracks, color
+// matrix filtering, or audio sidecar mixing.
 //
 // This pure Dart evaluator preflights a VGEditorDraft and returns a structured
 // report (ready vs blocked) with strongly-typed issue codes, descriptive
@@ -45,7 +45,11 @@ enum VGEditorPreviewReadinessIssueCode {
   /// The draft contains zero clips.
   emptyTimeline,
 
-  /// The draft contains more than one clip (native Android currently rejects with UNSUPPORTED_TIMELINE).
+  /// Reserved for backward compatibility with earlier single-clip-only
+  /// readiness reports. Android editor playback now supports sequential
+  /// plain multi-video drafts (Phase 7.8G), so this code is never emitted by
+  /// [VGEditorPreviewReadinessEvaluator.evaluate]; a multi-clip draft is only
+  /// blocked when it also trips one of the other issue codes below.
   multiClipTimeline,
 
   /// A clip uses a non-video media kind (e.g. image, audio).
@@ -187,8 +191,9 @@ final class VGEditorPreviewReadinessReport {
 /// Pure-Dart evaluator that checks whether a [VGEditorDraft] is ready for the
 /// Android native editor playback route.
 ///
-/// **Android Editor Playback Support Contract (Phase 7.8D):**
-/// - Exactly one [VGClipDescriptor] with [VGMediaKind.video].
+/// **Android Editor Playback Support Contract (Phase 7.8G):**
+/// - One or more [VGClipDescriptor] entries, each with [VGMediaKind.video]
+///   (sequential hard-cut concatenation; no transitions between clips).
 /// - No transitions ([VGEditorDraft.transitions] must be empty).
 /// - No overlays ([VGEditorDraft.overlays] must be empty).
 /// - No audio sidecar plan ([VGEditorDraft.audioSidecarPlan] must be null).
@@ -219,21 +224,15 @@ final class VGEditorPreviewReadinessEvaluator {
   VGEditorPreviewReadinessReport evaluate(VGEditorDraft draft) {
     final issues = <VGEditorPreviewReadinessIssue>[];
 
-    // 1. Timeline clip count validation.
+    // 1. Timeline clip count validation. Sequential plain multi-video drafts
+    // (Phase 7.8G) are ready as long as no clip trips an unsupported-feature
+    // check below; only an empty timeline is blocked outright.
     if (draft.clips.isEmpty) {
       issues.add(
         const VGEditorPreviewReadinessIssue(
           code: VGEditorPreviewReadinessIssueCode.emptyTimeline,
           message:
               'Draft has no clips; editor preview requires a valid video clip.',
-        ),
-      );
-    } else if (draft.clips.length > 1) {
-      issues.add(
-        VGEditorPreviewReadinessIssue(
-          code: VGEditorPreviewReadinessIssueCode.multiClipTimeline,
-          message:
-              'Draft contains ${draft.clips.length} clips; Android editor playback route currently supports single-clip playback only (multi-clip is UNSUPPORTED_TIMELINE).',
         ),
       );
     }

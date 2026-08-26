@@ -88,30 +88,21 @@ void main() {
       expect(report.issues, isEmpty);
     });
 
-    test(
-      'multi-clip draft evaluates as blocked with multiClipTimeline issue',
-      () {
-        final clip1 = makePlainVideoClip(id: 'clip-1');
-        final clip2 = makePlainVideoClip(id: 'clip-2', startTimeSeconds: 10.0);
-        final draft = VGEditorDraft(id: 'draft-multi', clips: [clip1, clip2]);
+    test('plain multi-clip video draft evaluates as ready', () {
+      final clip1 = makePlainVideoClip(id: 'clip-1');
+      final clip2 = makePlainVideoClip(id: 'clip-2', startTimeSeconds: 10.0);
+      final draft = VGEditorDraft(id: 'draft-multi', clips: [clip1, clip2]);
 
-        final report = evaluator.evaluate(draft);
+      final report = evaluator.evaluate(draft);
 
-        expect(report.decision, VGEditorPreviewReadinessDecision.blocked);
-        expect(report.isReady, isFalse);
-        expect(report.isBlocked, isTrue);
-        expect(report.canUseAndroidEditorPlaybackRoute, isFalse);
-        expect(
-          report.issues.any(
-            (i) =>
-                i.code == VGEditorPreviewReadinessIssueCode.multiClipTimeline,
-          ),
-          isTrue,
-        );
-        expect(report.diagnostics['clipCount'], 2);
-        expect(report.diagnostics['issueCount'], greaterThanOrEqualTo(1));
-      },
-    );
+      expect(report.decision, VGEditorPreviewReadinessDecision.ready);
+      expect(report.isReady, isTrue);
+      expect(report.isBlocked, isFalse);
+      expect(report.canUseAndroidEditorPlaybackRoute, isTrue);
+      expect(report.issues, isEmpty);
+      expect(report.diagnostics['clipCount'], 2);
+      expect(report.diagnostics['issueCount'], 0);
+    });
 
     test(
       'non-video media kinds evaluate as blocked with unsupportedMediaKind',
