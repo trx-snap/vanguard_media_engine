@@ -58,6 +58,8 @@ export 'vg_editor_value.dart';
 export 'vg_editor_controller.dart';
 export 'vg_editor_export_request.dart';
 export 'vg_editor_export_result.dart';
+// Phase 7.8C: public editor texture presentation view widget.
+export 'vg_editor_texture_view.dart';
 // Audio Slice M: recording result models.
 export 'vg_audio_recording_models.dart';
 // Phase 8: canvas and overlay descriptors
