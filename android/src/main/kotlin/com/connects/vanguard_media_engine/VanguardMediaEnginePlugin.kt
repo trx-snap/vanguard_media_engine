@@ -12,6 +12,7 @@ import androidx.annotation.NonNull
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
+import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
 import com.connects.vanguard_media_engine.rtc.AndroidRtcVideoCoordinator
 import com.connects.vanguard_media_engine.streaming.AndroidDagStreamingPlaybackCoordinator
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -43,6 +44,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
 
     // ── Diagnostic smoke routes (Phases 2O2B3/2O2B4/2Q/3C/4A/5 + Audio Unit B) ─
     private var dagDiagnosticsCoordinator: AndroidDagDiagnosticsCoordinator? = null
+
+    // ── Export Unit C: production exportTimeline coordinator ──────────────────
+    // Owns only "exportTimeline". Does NOT own "cancelExport" — the plugin
+    // tries this coordinator's cancelActiveExport() first, then falls back to
+    // the legacy activeEncoder cancel path below.
+    private var editorExportCoordinator: AndroidEditorExportCoordinator? = null
 
     // ── Camera session state (B2: single camera instance invariant) ───────────
     // Mirrors iOS plugin: cameraSource + renderer stored at plugin level.
@@ -88,6 +95,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             mainHandler     = mainHandler,
         )
         dagDiagnosticsCoordinator = AndroidDagDiagnosticsCoordinator(
+            mainHandler = mainHandler,
+        )
+        editorExportCoordinator = AndroidEditorExportCoordinator(
+            context     = binding.applicationContext,
+            channel     = channel,
             mainHandler = mainHandler,
         )
     }
@@ -629,6 +641,18 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 )
             }
 
+            // ─── Export Unit C: production exportTimeline ──────────────────────────────
+            // Delegates entirely to AndroidEditorExportCoordinator. Independent of the
+            // legacy startExport/VanguardMediaCodecEncoder dev-proof path below.
+            "exportTimeline" -> {
+                val coord = editorExportCoordinator
+                if (coord != null) {
+                    coord.exportTimeline(args, result)
+                } else {
+                    result.error("UNAVAILABLE", "Android editor export coordinator unavailable", null)
+                }
+            }
+
             "startExport" -> {
                 // B3: Dart sends List<Map<String,dynamic>> {path, trimStart, trimEnd}.
                 // B4-S2: per-clip trim seek + EOS boundary.
@@ -965,15 +989,25 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             // stop feeding input, let the decoder drain to EOS, then call encoder.finish()
             // which cleans up temp files and resolves the pending startExport Future.
             "cancelExport" -> {
-                val enc = activeEncoder
-                if (enc != null) {
-                    enc.cancel()
-                    activeEncoder = null
-                    Log.i(TAG, "cancelExport: cancellation signalled")
+                // Export Unit C: try the production coordinator first. If it had an
+                // active export, it replies EXPORT_CANCELLED to the pending
+                // exportTimeline call itself — cancelExport just acks immediately.
+                val coordCancelled = editorExportCoordinator?.cancelActiveExport() ?: false
+                if (coordCancelled) {
+                    Log.i(TAG, "cancelExport: Unit C export cancellation signalled")
+                    result.success(null)
                 } else {
-                    Log.d(TAG, "cancelExport: no active export")
+                    // Legacy startExport / VanguardMediaCodecEncoder cancel path — unchanged.
+                    val enc = activeEncoder
+                    if (enc != null) {
+                        enc.cancel()
+                        activeEncoder = null
+                        Log.i(TAG, "cancelExport: cancellation signalled")
+                    } else {
+                        Log.d(TAG, "cancelExport: no active export")
+                    }
+                    result.success(null)
                 }
-                result.success(null)
             }
 
             // ─── B4-S1: extractAudio ──────────────────────────────────────────────────
@@ -1136,5 +1170,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         editorPlaybackCoordinator = null
         // Diagnostics coordinator holds no native resources — just drop it.
         dagDiagnosticsCoordinator = null
+        // Export Unit C: cancel any in-flight exportTimeline and drop temps.
+        editorExportCoordinator?.disposeAll()
+        editorExportCoordinator = null
     }
 }
