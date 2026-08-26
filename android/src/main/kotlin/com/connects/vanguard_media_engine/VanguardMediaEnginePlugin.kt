@@ -11,6 +11,7 @@ import android.util.Log
 import androidx.annotation.NonNull
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagRenderSmokeHarness
+import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.rtc.AndroidRtcVideoCoordinator
 import com.connects.vanguard_media_engine.streaming.AndroidDagStreamingPlaybackCoordinator
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -36,6 +37,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
 
     // ── Phase 4C3D: RTC video coordinator ─────────────────────────────────────
     private var rtcVideoCoordinator: AndroidRtcVideoCoordinator? = null
+
+    // ── Phase 7.8A-Android: editor playback control coordinator ───────────────
+    private var editorPlaybackCoordinator: AndroidEditorPlaybackCoordinator? = null
 
     // ── Camera session state (B2: single camera instance invariant) ───────────
     // Mirrors iOS plugin: cameraSource + renderer stored at plugin level.
@@ -75,6 +79,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         rtcVideoCoordinator = AndroidRtcVideoCoordinator(
             mainHandler = mainHandler,
         )
+        editorPlaybackCoordinator = AndroidEditorPlaybackCoordinator(
+            textureRegistry = binding.textureRegistry,
+            channel         = channel,
+            mainHandler     = mainHandler,
+        )
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
@@ -106,6 +115,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android RTC video coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidEditorPlaybackCoordinator.ownsMethod(call.method)) {
+            val coord = editorPlaybackCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android editor playback coordinator unavailable", null)
             }
             return
         }
@@ -1151,5 +1170,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         dagStreamingPlaybackCoordinator = null
         // Tear down Phase 4C3D RTC video coordinator.
         rtcVideoCoordinator = null
+        // Tear down Phase 7.8A-Android editor playback coordinator.
+        editorPlaybackCoordinator?.disposeAll()
+        editorPlaybackCoordinator = null
     }
 }

@@ -28,6 +28,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 class AndroidDagTexturePlaybackControlSession(
     private val videoPath: String,
     private val surfaceProducer: TextureRegistry.SurfaceProducer,
+    private val onTimelineFrame: ((textureId: Long, ptsSeconds: Double, generationId: Long) -> Unit)? = null,
+    private val onTimelineEOS: ((textureId: Long) -> Unit)? = null,
 ) {
     companion object {
         private const val TAG = "DagTexturePlaybackCtrl"
@@ -353,6 +355,10 @@ class AndroidDagTexturePlaybackControlSession(
                             lastRenderedPtsUs = pumpResult.lastRenderedPtsUs
                             frameRenderError = pumpResult.frameRenderError
 
+                            if (frameRenderError == null) {
+                                onTimelineFrame?.invoke(surfaceProducer.id(), lastRenderedPtsUs / 1_000_000.0, currentGenerationId)
+                            }
+
                             // Check completion/termination
                             val target = targetFrameCount
                             if (target != null && renderedFrames >= target) {
@@ -368,6 +374,9 @@ class AndroidDagTexturePlaybackControlSession(
                                     "raw" to "status=OK;target_reached;renderedFrames=$renderedFrames",
                                 ))
                             } else if (outputDone && imageQueue.isEmpty()) {
+                                if (target == null) {
+                                    onTimelineEOS?.invoke(surfaceProducer.id())
+                                }
                                 state = AndroidDagPlaybackState.Completed
                                 activeFrameCallback = null
                                 val cb = pendingPlayCallback
@@ -584,6 +593,9 @@ class AndroidDagTexturePlaybackControlSession(
                     } else {
                         state = AndroidDagPlaybackState.Paused
                     }
+
+                    val renderedOrTargetPts = if (engineResult.seekRenderedPtsUs >= 0) engineResult.seekRenderedPtsUs else targetPtsUs
+                    onTimelineFrame?.invoke(surfaceProducer.id(), renderedOrTargetPts / 1_000_000.0, engineResult.generationId)
 
                     onResult(mapOf(
                         "pass" to true,
