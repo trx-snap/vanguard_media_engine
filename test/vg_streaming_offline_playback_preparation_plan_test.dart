@@ -136,13 +136,14 @@ void main() {
         );
         expect(plan.canOpenNow, isTrue);
         expect(plan.isBlocked, isFalse);
-        expect(plan.requiresOfflineAssetPlayback, isTrue);
-        expect(plan.canOpenWithCurrentPlaybackClient, isFalse);
+        expect(plan.requiresOfflineAssetPlayback, isFalse);
+        expect(plan.canOpenWithCurrentPlaybackClient, isTrue);
         expect(plan.shouldAcquireOfflineAsset, isFalse);
         expect(plan.selectedKey, equals('hls_cached'));
         expect(plan.diagnostics['action'], equals('openOfflineAsset'));
         expect(plan.diagnostics['routeMode'], equals('offlineAsset'));
-        expect(plan.diagnostics['requiresOfflineAssetPlayback'], isTrue);
+        expect(plan.diagnostics['requiresOfflineAssetPlayback'], isFalse);
+        expect(plan.diagnostics['canOpenWithCurrentPlaybackClient'], isTrue);
       },
     );
 

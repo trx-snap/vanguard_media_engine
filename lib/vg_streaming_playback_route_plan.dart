@@ -170,7 +170,7 @@ class VGStreamingPlaybackRoutePlan {
   /// Selected streaming source descriptor, or `null` if blocked.
   final VGStreamingSourceDescriptor? selectedSource;
 
-  /// Validated playback options ready for client consumption, or `null` for offline/blocked routes.
+  /// Validated playback options ready for client consumption, or `null` for blocked routes.
   final VGStreamingPlaybackOptions? playbackOptions;
 
   /// Resolved offline asset availability descriptor if evaluated, or `null`.
@@ -319,9 +319,30 @@ abstract final class VGStreamingPlaybackRoutePlanner {
       if (!unsupportedOffline &&
           availability != null &&
           availability.isPlayableOffline) {
+        final offlineFormatHint =
+            playbackOptions.formatHint == VGStreamingFormatHint.dash
+            ? VGStreamingFormatHint.hls
+            : playbackOptions.formatHint;
+
+        final offlinePlaybackOptions = VGStreamingPlaybackOptions(
+          uri: availability.assetUri!,
+          initialWidth: playbackOptions.initialWidth,
+          initialHeight: playbackOptions.initialHeight,
+          httpHeaders: null,
+          formatHint: offlineFormatHint,
+          networkProfile: playbackOptions.networkProfile,
+          autoPlay: playbackOptions.autoPlay,
+          initialPositionMs: playbackOptions.initialPositionMs,
+          cacheOptions: null,
+        );
+
         final diagnostics = <String, Object?>{
           'offlineAssetState': availability.state.name,
           'hasOfflineAssetUri': availability.assetUri != null,
+          if (availability.assetUri != null)
+            'offlineAssetUriScheme': availability.assetUri!.scheme,
+          'canOpenWithCurrentPlaybackClient': true,
+          'requiresOfflineAssetPlayback': false,
           'allowNetworkFallback': request.allowNetworkFallback,
           'preferOffline': true,
           'selectedFormat': formatName,
@@ -335,10 +356,10 @@ abstract final class VGStreamingPlaybackRoutePlanner {
           decision: 'offline_asset_ready',
           selectedKey: selectedKey,
           selectedSource: selectedSource,
-          playbackOptions: null,
+          playbackOptions: offlinePlaybackOptions,
           offlineAsset: availability,
-          canOpenWithCurrentPlaybackClient: false,
-          requiresOfflineAssetPlayback: true,
+          canOpenWithCurrentPlaybackClient: true,
+          requiresOfflineAssetPlayback: false,
           advisoryOnly: true,
           playbackMutation: false,
           warnings: warnings,

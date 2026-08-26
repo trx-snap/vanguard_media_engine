@@ -210,15 +210,28 @@ void main() {
       expect(plan.shouldUseOfflineAsset, isTrue);
       expect(plan.shouldUseOnlineCache, isFalse);
       expect(plan.shouldUseNetwork, isFalse);
-      expect(plan.requiresOfflineAssetPlayback, isTrue);
-      expect(plan.canOpenWithCurrentPlaybackClient, isFalse);
-      expect(plan.playbackOptions, isNull);
+      expect(plan.requiresOfflineAssetPlayback, isFalse);
+      expect(plan.canOpenWithCurrentPlaybackClient, isTrue);
+      expect(plan.playbackOptions, isNotNull);
+      expect(plan.playbackOptions?.uri, equals(assetUri));
+      expect(plan.playbackOptions?.cacheOptions, isNull);
+      expect(plan.playbackOptions?.httpHeaders, isNull);
+      expect(plan.playbackOptions?.initialWidth, equals(1920));
+      expect(plan.playbackOptions?.initialHeight, equals(1080));
+      expect(plan.playbackOptions?.autoPlay, isTrue);
+      expect(
+        plan.playbackOptions?.formatHint,
+        equals(VGStreamingFormatHint.hls),
+      );
       expect(plan.decision, equals('offline_asset_ready'));
       expect(plan.offlineAsset, isNotNull);
       expect(plan.offlineAsset?.isPlayableOffline, isTrue);
       expect(plan.offlineAsset?.sourceKey, equals('hls_cached'));
       expect(plan.diagnostics['offlineAssetState'], equals('available'));
       expect(plan.diagnostics['hasOfflineAssetUri'], isTrue);
+      expect(plan.diagnostics['offlineAssetUriScheme'], equals('file'));
+      expect(plan.diagnostics['canOpenWithCurrentPlaybackClient'], isTrue);
+      expect(plan.diagnostics['requiresOfflineAssetPlayback'], isFalse);
       expect(plan.diagnostics['downloadedBytes'], equals(15728640));
 
       final json = availability.toJson();
@@ -230,6 +243,54 @@ void main() {
       expect(json['reason'], equals('fully_downloaded'));
       expect(json['isPlayableOffline'], isTrue);
     });
+
+    test(
+      'offline HLS playback options strip headers and cacheOptions while preserving dimensions and timing',
+      () {
+        final sourceWithHeadersAndCache = VGStreamingSourceDescriptor(
+          key: 'hls_custom',
+          uri: Uri.parse('https://example.com/custom.m3u8'),
+          initialWidth: 1280,
+          initialHeight: 720,
+          formatHint: VGStreamingFormatHint.hls,
+          autoPlay: false,
+          initialPositionMs: 12345,
+          httpHeaders: const {'Authorization': 'Bearer test-token'},
+          cacheOptions: const VGPlaybackCacheOptions(
+            cacheEnabled: true,
+            cacheMaxBytes: 100 * 1024 * 1024,
+          ),
+        );
+        final decision = makeDecisionForSource(sourceWithHeadersAndCache);
+        final assetUri = Uri.parse('file:///data/local/offline.movpkg');
+        final availability = VGStreamingOfflineAssetAvailability(
+          sourceKey: 'hls_custom',
+          state: VGStreamingOfflineAssetState.available,
+          assetUri: assetUri,
+        );
+
+        final plan = VGStreamingPlaybackRoutePlanner.plan(
+          VGStreamingPlaybackRouteRequest(
+            decision: decision,
+            preferOffline: true,
+            offlineAssetsBySourceKey: {'hls_custom': availability},
+          ),
+        );
+
+        expect(plan.mode, equals(VGStreamingPlaybackRouteMode.offlineAsset));
+        expect(plan.playbackOptions, isNotNull);
+        final opts = plan.playbackOptions!;
+        expect(opts.uri, equals(assetUri));
+        expect(opts.httpHeaders, isNull);
+        expect(opts.cacheOptions, isNull);
+        expect(opts.initialWidth, equals(1280));
+        expect(opts.initialHeight, equals(720));
+        expect(opts.autoPlay, isFalse);
+        expect(opts.initialPositionMs, equals(12345));
+        expect(opts.networkProfile, equals(VGStreamingNetworkProfile.stable));
+        expect(opts.formatHint, equals(VGStreamingFormatHint.hls));
+      },
+    );
 
     test(
       'offline unavailable with allowNetworkFallback falls through to online cache or network',
