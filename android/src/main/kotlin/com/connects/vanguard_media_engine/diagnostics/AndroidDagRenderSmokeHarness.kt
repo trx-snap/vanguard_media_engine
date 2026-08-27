@@ -1894,4 +1894,286 @@ object AndroidDagRenderSmokeHarness {
             "rot90CenterPixelMatches=false;releaseBuffer=not_run;releaseFence=-1;hasAfterRelease=false;postReleaseDiagnosticRender=not_run;" +
             "postReleaseLastError=;detach=not_run;surfaceKindAfterDetach=none;postDetachRead=not_run;postDetachLastError=;" +
             "shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_renderFrame_rgba_texture_content_readback_no_swap_no_yuv_no_fence_no_product;lastError=$reason"
+
+    // ── Phase 1-Unit AD: Android GLES renderFrame asymmetric UV mapping physical smoke ──
+    private const val RESULT_MARKER_PHASE1AD = "ANDROID_GLES_RENDERFRAME_TRANSFORM_MAPPING_UNIT_AD_NATIVE_RESULT"
+
+    fun runGlesRenderFrameTransformMappingSmoke(width: Int = 64, height: Int = 64): Map<String, Any?> {
+        var surfaceTexture: SurfaceTexture? = null
+        var surface: Surface? = null
+        var hardwareBuffer: HardwareBuffer? = null
+        var raw = glesRenderFrameTransformMappingFailure("not_run")
+
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                raw = glesRenderFrameTransformMappingFailure("api_below_26")
+                return parseGlesRenderFrameTransformMappingResult(raw)
+            }
+            if (width <= 0 || height <= 0) {
+                raw = glesRenderFrameTransformMappingFailure("invalid_dimensions")
+                return parseGlesRenderFrameTransformMappingResult(raw)
+            }
+
+            surfaceTexture = SurfaceTexture(false).apply {
+                setDefaultBufferSize(width, height)
+            }
+            surface = Surface(surfaceTexture)
+
+            hardwareBuffer = HardwareBuffer.create(
+                width,
+                height,
+                HardwareBuffer.RGBA_8888,
+                1,
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_CPU_WRITE_OFTEN,
+            )
+
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1ADGlesRenderFrameTransformMappingSmoke(
+                surface,
+                hardwareBuffer,
+                width,
+                height,
+            )
+            return parseGlesRenderFrameTransformMappingResult(raw)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = glesRenderFrameTransformMappingFailure("exception:$reason")
+            return parseGlesRenderFrameTransformMappingResult(raw)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1AD $raw")
+            try {
+                hardwareBuffer?.close()
+            } catch (_: Throwable) {
+            }
+            try {
+                surface?.release()
+            } catch (_: Throwable) {
+            }
+            try {
+                surfaceTexture?.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun parseGlesRenderFrameTransformMappingResult(raw: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val clientVersion = parsed["clientVersion"]?.toIntOrNull() ?: 0
+        val vendor = parsed["vendor"] ?: ""
+        val renderer = parsed["renderer"] ?: ""
+        val version = parsed["version"] ?: ""
+        val bufferDescribe = parsed["bufferDescribe"] ?: "not_run"
+        val bufferWidth = parsed["bufferWidth"]?.toIntOrNull() ?: 0
+        val bufferHeight = parsed["bufferHeight"]?.toIntOrNull() ?: 0
+        val bufferLayers = parsed["bufferLayers"]?.toIntOrNull() ?: 0
+        val bufferFormat = parsed["bufferFormat"]?.toIntOrNull() ?: 0
+        val bufferUsage = parsed["bufferUsage"]?.toLongOrNull() ?: 0L
+        val bufferStride = parsed["bufferStride"]?.toIntOrNull() ?: 0
+        val bufferFill = parsed["bufferFill"] ?: "not_run"
+        val writeFenceFd = parsed["writeFenceFd"]?.toIntOrNull() ?: -1
+        val writeFenceWait = parsed["writeFenceWait"] ?: "none"
+        val preInitDiagnosticRender = parsed["preInitDiagnosticRender"] ?: "not_run"
+        val preInitLastError = parsed["preInitLastError"] ?: ""
+        val initialize = parsed["initialize"] ?: "not_run"
+        val attach = parsed["attach"] ?: "not_run"
+        val hasSurfaceAfterAttach = parsed["hasSurfaceAfterAttach"]?.equals("true", ignoreCase = true) ?: false
+        val surfaceKindAfterAttach = parsed["surfaceKindAfterAttach"] ?: "none"
+        val widthAfterAttach = parsed["widthAfterAttach"]?.toIntOrNull() ?: 0
+        val heightAfterAttach = parsed["heightAfterAttach"]?.toIntOrNull() ?: 0
+        val importBuffer = parsed["importBuffer"] ?: "not_run"
+        val handle = parsed["handle"]?.toLongOrNull() ?: 0L
+        val descriptorWidth = parsed["descriptorWidth"]?.toIntOrNull() ?: 0
+        val descriptorHeight = parsed["descriptorHeight"]?.toIntOrNull() ?: 0
+        val descriptorLayers = parsed["descriptorLayers"]?.toIntOrNull() ?: 0
+        val descriptorFormat = parsed["descriptorFormat"]?.toIntOrNull() ?: 0
+        val descriptorUsageSampled = parsed["descriptorUsageSampled"]?.equals("true", ignoreCase = true) ?: false
+        val hasAfterImport = parsed["hasAfterImport"]?.equals("true", ignoreCase = true) ?: false
+        val invalidHandleDiagnosticRender = parsed["invalidHandleDiagnosticRender"] ?: "not_run"
+        val invalidHandleLastError = parsed["invalidHandleLastError"] ?: ""
+        val identityDiagnosticRender = parsed["identityDiagnosticRender"] ?: "not_run"
+        val identityDiagnosticLastError = parsed["identityDiagnosticLastError"] ?: ""
+        val identityColorsDistinct = parsed["identityColorsDistinct"]?.equals("true", ignoreCase = true) ?: false
+        val uv00R = parsed["uv00R"]?.toIntOrNull() ?: 0
+        val uv00G = parsed["uv00G"]?.toIntOrNull() ?: 0
+        val uv00B = parsed["uv00B"]?.toIntOrNull() ?: 0
+        val uv00A = parsed["uv00A"]?.toIntOrNull() ?: 0
+        val uv00Label = parsed["uv00Label"] ?: "unknown"
+        val uv10R = parsed["uv10R"]?.toIntOrNull() ?: 0
+        val uv10G = parsed["uv10G"]?.toIntOrNull() ?: 0
+        val uv10B = parsed["uv10B"]?.toIntOrNull() ?: 0
+        val uv10A = parsed["uv10A"]?.toIntOrNull() ?: 0
+        val uv10Label = parsed["uv10Label"] ?: "unknown"
+        val uv01R = parsed["uv01R"]?.toIntOrNull() ?: 0
+        val uv01G = parsed["uv01G"]?.toIntOrNull() ?: 0
+        val uv01B = parsed["uv01B"]?.toIntOrNull() ?: 0
+        val uv01A = parsed["uv01A"]?.toIntOrNull() ?: 0
+        val uv01Label = parsed["uv01Label"] ?: "unknown"
+        val uv11R = parsed["uv11R"]?.toIntOrNull() ?: 0
+        val uv11G = parsed["uv11G"]?.toIntOrNull() ?: 0
+        val uv11B = parsed["uv11B"]?.toIntOrNull() ?: 0
+        val uv11A = parsed["uv11A"]?.toIntOrNull() ?: 0
+        val uv11Label = parsed["uv11Label"] ?: "unknown"
+        val identityPass = parsed["identityPass"]?.equals("true", ignoreCase = true) ?: false
+        val rot90DiagnosticRender = parsed["rot90DiagnosticRender"] ?: "not_run"
+        val rot90DiagnosticLastError = parsed["rot90DiagnosticLastError"] ?: ""
+        val rot90Pass = parsed["rot90Pass"]?.equals("true", ignoreCase = true) ?: false
+        val rot180DiagnosticRender = parsed["rot180DiagnosticRender"] ?: "not_run"
+        val rot180DiagnosticLastError = parsed["rot180DiagnosticLastError"] ?: ""
+        val rot180Pass = parsed["rot180Pass"]?.equals("true", ignoreCase = true) ?: false
+        val rot270DiagnosticRender = parsed["rot270DiagnosticRender"] ?: "not_run"
+        val rot270DiagnosticLastError = parsed["rot270DiagnosticLastError"] ?: ""
+        val rot270Pass = parsed["rot270Pass"]?.equals("true", ignoreCase = true) ?: false
+        val mirror0DiagnosticRender = parsed["mirror0DiagnosticRender"] ?: "not_run"
+        val mirror0DiagnosticLastError = parsed["mirror0DiagnosticLastError"] ?: ""
+        val mirror0Pass = parsed["mirror0Pass"]?.equals("true", ignoreCase = true) ?: false
+        val mirror90DiagnosticRender = parsed["mirror90DiagnosticRender"] ?: "not_run"
+        val mirror90DiagnosticLastError = parsed["mirror90DiagnosticLastError"] ?: ""
+        val mirror90Pass = parsed["mirror90Pass"]?.equals("true", ignoreCase = true) ?: false
+        val mirror180DiagnosticRender = parsed["mirror180DiagnosticRender"] ?: "not_run"
+        val mirror180DiagnosticLastError = parsed["mirror180DiagnosticLastError"] ?: ""
+        val mirror180Pass = parsed["mirror180Pass"]?.equals("true", ignoreCase = true) ?: false
+        val mirror270DiagnosticRender = parsed["mirror270DiagnosticRender"] ?: "not_run"
+        val mirror270DiagnosticLastError = parsed["mirror270DiagnosticLastError"] ?: ""
+        val mirror270Pass = parsed["mirror270Pass"]?.equals("true", ignoreCase = true) ?: false
+        val allTransformsPass = parsed["allTransformsPass"]?.equals("true", ignoreCase = true) ?: false
+        val releaseBuffer = parsed["releaseBuffer"] ?: "not_run"
+        val releaseFence = parsed["releaseFence"]?.toIntOrNull() ?: -1
+        val hasAfterRelease = parsed["hasAfterRelease"]?.equals("true", ignoreCase = true) ?: false
+        val postReleaseDiagnosticRender = parsed["postReleaseDiagnosticRender"] ?: "not_run"
+        val postReleaseLastError = parsed["postReleaseLastError"] ?: ""
+        val detach = parsed["detach"] ?: "not_run"
+        val surfaceKindAfterDetach = parsed["surfaceKindAfterDetach"] ?: "none"
+        val postDetachRead = parsed["postDetachRead"] ?: "not_run"
+        val postDetachLastError = parsed["postDetachLastError"] ?: ""
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_renderFrame_asymmetric_uv_mapping_rgba_quadrants_no_swap_no_yuv_no_fence_no_product"
+        val lastError = parsed["lastError"] ?: ""
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "clientVersion" to clientVersion,
+            "vendor" to vendor,
+            "renderer" to renderer,
+            "version" to version,
+            "bufferDescribe" to bufferDescribe,
+            "bufferWidth" to bufferWidth,
+            "bufferHeight" to bufferHeight,
+            "bufferLayers" to bufferLayers,
+            "bufferFormat" to bufferFormat,
+            "bufferUsage" to bufferUsage,
+            "bufferStride" to bufferStride,
+            "bufferFill" to bufferFill,
+            "writeFenceFd" to writeFenceFd,
+            "writeFenceWait" to writeFenceWait,
+            "preInitDiagnosticRender" to preInitDiagnosticRender,
+            "preInitLastError" to preInitLastError,
+            "initialize" to initialize,
+            "attach" to attach,
+            "hasSurfaceAfterAttach" to hasSurfaceAfterAttach,
+            "surfaceKindAfterAttach" to surfaceKindAfterAttach,
+            "widthAfterAttach" to widthAfterAttach,
+            "heightAfterAttach" to heightAfterAttach,
+            "importBuffer" to importBuffer,
+            "handle" to handle,
+            "descriptorWidth" to descriptorWidth,
+            "descriptorHeight" to descriptorHeight,
+            "descriptorLayers" to descriptorLayers,
+            "descriptorFormat" to descriptorFormat,
+            "descriptorUsageSampled" to descriptorUsageSampled,
+            "hasAfterImport" to hasAfterImport,
+            "invalidHandleDiagnosticRender" to invalidHandleDiagnosticRender,
+            "invalidHandleLastError" to invalidHandleLastError,
+            "identityDiagnosticRender" to identityDiagnosticRender,
+            "identityDiagnosticLastError" to identityDiagnosticLastError,
+            "identityColorsDistinct" to identityColorsDistinct,
+            "uv00R" to uv00R,
+            "uv00G" to uv00G,
+            "uv00B" to uv00B,
+            "uv00A" to uv00A,
+            "uv00Label" to uv00Label,
+            "uv10R" to uv10R,
+            "uv10G" to uv10G,
+            "uv10B" to uv10B,
+            "uv10A" to uv10A,
+            "uv10Label" to uv10Label,
+            "uv01R" to uv01R,
+            "uv01G" to uv01G,
+            "uv01B" to uv01B,
+            "uv01A" to uv01A,
+            "uv01Label" to uv01Label,
+            "uv11R" to uv11R,
+            "uv11G" to uv11G,
+            "uv11B" to uv11B,
+            "uv11A" to uv11A,
+            "uv11Label" to uv11Label,
+            "identityPass" to identityPass,
+            "rot90DiagnosticRender" to rot90DiagnosticRender,
+            "rot90DiagnosticLastError" to rot90DiagnosticLastError,
+            "rot90Pass" to rot90Pass,
+            "rot180DiagnosticRender" to rot180DiagnosticRender,
+            "rot180DiagnosticLastError" to rot180DiagnosticLastError,
+            "rot180Pass" to rot180Pass,
+            "rot270DiagnosticRender" to rot270DiagnosticRender,
+            "rot270DiagnosticLastError" to rot270DiagnosticLastError,
+            "rot270Pass" to rot270Pass,
+            "mirror0DiagnosticRender" to mirror0DiagnosticRender,
+            "mirror0DiagnosticLastError" to mirror0DiagnosticLastError,
+            "mirror0Pass" to mirror0Pass,
+            "mirror90DiagnosticRender" to mirror90DiagnosticRender,
+            "mirror90DiagnosticLastError" to mirror90DiagnosticLastError,
+            "mirror90Pass" to mirror90Pass,
+            "mirror180DiagnosticRender" to mirror180DiagnosticRender,
+            "mirror180DiagnosticLastError" to mirror180DiagnosticLastError,
+            "mirror180Pass" to mirror180Pass,
+            "mirror270DiagnosticRender" to mirror270DiagnosticRender,
+            "mirror270DiagnosticLastError" to mirror270DiagnosticLastError,
+            "mirror270Pass" to mirror270Pass,
+            "allTransformsPass" to allTransformsPass,
+            "releaseBuffer" to releaseBuffer,
+            "releaseFence" to releaseFence,
+            "hasAfterRelease" to hasAfterRelease,
+            "postReleaseDiagnosticRender" to postReleaseDiagnosticRender,
+            "postReleaseLastError" to postReleaseLastError,
+            "detach" to detach,
+            "surfaceKindAfterDetach" to surfaceKindAfterDetach,
+            "postDetachRead" to postDetachRead,
+            "postDetachLastError" to postDetachLastError,
+            "shutdown" to shutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "proofBoundary" to proofBoundary,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun glesRenderFrameTransformMappingFailure(reason: String): String =
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;bufferDescribe=$reason;bufferWidth=0;bufferHeight=0;" +
+            "bufferLayers=0;bufferFormat=0;bufferUsage=0;bufferStride=0;bufferFill=not_run;writeFenceFd=-1;writeFenceWait=none;" +
+            "preInitDiagnosticRender=not_run;preInitLastError=;initialize=not_run;attach=not_run;hasSurfaceAfterAttach=false;" +
+            "surfaceKindAfterAttach=none;widthAfterAttach=0;heightAfterAttach=0;importBuffer=not_run;handle=0;" +
+            "descriptorWidth=0;descriptorHeight=0;descriptorLayers=0;descriptorFormat=0;descriptorUsageSampled=false;" +
+            "hasAfterImport=false;invalidHandleDiagnosticRender=not_run;invalidHandleLastError=;identityDiagnosticRender=not_run;" +
+            "identityDiagnosticLastError=;identityColorsDistinct=false;uv00R=0;uv00G=0;uv00B=0;uv00A=0;uv00Label=unknown;" +
+            "uv10R=0;uv10G=0;uv10B=0;uv10A=0;uv10Label=unknown;uv01R=0;uv01G=0;uv01B=0;uv01A=0;uv01Label=unknown;" +
+            "uv11R=0;uv11G=0;uv11B=0;uv11A=0;uv11Label=unknown;identityPass=false;rot90DiagnosticRender=not_run;rot90DiagnosticLastError=;" +
+            "rot90Pass=false;rot180DiagnosticRender=not_run;rot180DiagnosticLastError=;rot180Pass=false;rot270DiagnosticRender=not_run;" +
+            "rot270DiagnosticLastError=;rot270Pass=false;mirror0DiagnosticRender=not_run;mirror0DiagnosticLastError=;mirror0Pass=false;" +
+            "mirror90DiagnosticRender=not_run;mirror90DiagnosticLastError=;mirror90Pass=false;mirror180DiagnosticRender=not_run;" +
+            "mirror180DiagnosticLastError=;mirror180Pass=false;mirror270DiagnosticRender=not_run;mirror270DiagnosticLastError=;mirror270Pass=false;" +
+            "allTransformsPass=false;releaseBuffer=not_run;releaseFence=-1;hasAfterRelease=false;postReleaseDiagnosticRender=not_run;" +
+            "postReleaseLastError=;detach=not_run;surfaceKindAfterDetach=none;postDetachRead=not_run;postDetachLastError=;" +
+            "shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_renderFrame_asymmetric_uv_mapping_rgba_quadrants_no_swap_no_yuv_no_fence_no_product;lastError=$reason"
 }

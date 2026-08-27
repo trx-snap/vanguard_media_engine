@@ -51,6 +51,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ZGlesRenderFrameSmoke",
             "runAndroidDagPhase1ABGlesReadPixelsSmoke",
             "runAndroidDagPhase1ACGlesRenderFrameContentSmoke",
+            "runAndroidDagPhase1ADGlesRenderFrameTransformMappingSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -88,6 +89,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ZGlesRenderFrameSmoke" -> runPhase1ZGlesRenderFrameSmoke(args, result)
             "runAndroidDagPhase1ABGlesReadPixelsSmoke" -> runPhase1ABGlesReadPixelsSmoke(args, result)
             "runAndroidDagPhase1ACGlesRenderFrameContentSmoke" -> runPhase1ACGlesRenderFrameContentSmoke(args, result)
+            "runAndroidDagPhase1ADGlesRenderFrameTransformMappingSmoke" -> runPhase1ADGlesRenderFrameTransformMappingSmoke(args, result)
             else -> return false
         }
         return true
@@ -508,6 +510,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_RENDER_FRAME_CONTENT_SMOKE_FAILED",
                         "runAndroidDagPhase1ACGlesRenderFrameContentSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AD: Android GLES renderFrame asymmetric UV mapping physical smoke ──
+    private fun runPhase1ADGlesRenderFrameTransformMappingSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesRenderFrameTransformMappingSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_RENDER_FRAME_TRANSFORM_MAPPING_SMOKE_FAILED",
+                        "runAndroidDagPhase1ADGlesRenderFrameTransformMappingSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
