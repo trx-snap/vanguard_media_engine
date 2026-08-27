@@ -1,12 +1,12 @@
-// Phase 1 Unit AS: Android GLES two-texture compositor RGBA blend foundation physical smoke JNI bridge.
+// Phase 1 Unit AT: Android GLES mixed texture compositor OES/2D permutation foundation physical smoke JNI bridge.
 //
 // Android-only translation unit added via CMake target_sources block.
 //
-// Non-claim: two-texture GL_TEXTURE_2D composition foundation and AT-compatible mixed draw/readback verification only;
+// Non-claim: OES/2D mixed-target composition permutation foundation only;
 // no color-correct YUV conversion claim, no timeline DAG integration, no transitions/PiP, no product UI.
 //
 // JNI entry point:
-//   runAndroidDagPhase1ASGlesTwoTextureCompositorSmoke -> jstring
+//   runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke -> jstring
 
 #include <jni.h>
 #include <android/hardware_buffer.h>
@@ -80,7 +80,7 @@ std::string SanitizeString(const char* input) {
     return s;
 }
 
-std::string BuildFailureString(const char* lastErrorReason) {
+std::string BuildPhase1ATFailureString(const char* lastErrorReason) {
     std::ostringstream oss;
     oss << "status=FAIL;"
         << "clientVersion=0;"
@@ -97,10 +97,14 @@ std::string BuildFailureString(const char* lastErrorReason) {
         << "bufferBUsage=0;"
         << "bufferBStride=0;"
         << "bufferBFill=not_run;"
-        << "ycbcrBufferDescribe=not_run;"
-        << "ycbcrBufferFormat=0;"
-        << "ycbcrBufferUsage=0;"
-        << "ycbcrFormatIs420888=false;"
+        << "ycbcrBufferADescribe=not_run;"
+        << "ycbcrBufferAFormat=0;"
+        << "ycbcrBufferAUsage=0;"
+        << "ycbcrFormatAIs420888=false;"
+        << "ycbcrBufferBDescribe=not_run;"
+        << "ycbcrBufferBFormat=0;"
+        << "ycbcrBufferBUsage=0;"
+        << "ycbcrFormatBIs420888=false;"
         << "preInitDiagnosticComposite=not_run;"
         << "preInitLastError=;"
         << "initialize=not_run;"
@@ -115,58 +119,59 @@ std::string BuildFailureString(const char* lastErrorReason) {
         << "importBufferB=not_run;"
         << "handleB=0;"
         << "targetB=0;"
+        << "importYcbcrA=not_run;"
+        << "handleYcbcrA=0;"
+        << "targetYcbcrA=0;"
+        << "importYcbcrB=not_run;"
+        << "handleYcbcrB=0;"
+        << "targetYcbcrB=0;"
         << "distinctHandles=false;"
-        << "importYcbcr=not_run;"
-        << "handleYcbcr=0;"
-        << "targetYcbcr=0;"
-        << "mixedTargetDiagnosticComposite=not_run;"
-        << "mixedTargetCenterRead=not_run;"
-        << "mixedTargetCenterR=0;"
-        << "mixedTargetCenterG=0;"
-        << "mixedTargetCenterB=0;"
-        << "mixedTargetCenterA=0;"
-        << "mixedTargetLastError=;"
-        << "releaseYcbcr=not_run;"
-        << "releaseYcbcrFence=-1;"
-        << "hasYcbcrAfterRelease=false;"
         << "invalidWeightDiagnosticComposite=not_run;"
         << "invalidWeightLastError=;"
-        << "weight0DiagnosticComposite=not_run;"
-        << "weight0CenterRead=not_run;"
-        << "weight0CenterR=0;"
-        << "weight0CenterG=0;"
-        << "weight0CenterB=0;"
-        << "weight0CenterA=0;"
-        << "weight0CenterPixelMatches=false;"
-        << "weight1DiagnosticComposite=not_run;"
-        << "weight1CenterRead=not_run;"
-        << "weight1CenterR=0;"
-        << "weight1CenterG=0;"
-        << "weight1CenterB=0;"
-        << "weight1CenterA=0;"
-        << "weight1CenterPixelMatches=false;"
-        << "weight05DiagnosticComposite=not_run;"
-        << "weight05CenterRead=not_run;"
-        << "weight05CenterR=0;"
-        << "weight05CenterG=0;"
-        << "weight05CenterB=0;"
-        << "weight05CenterA=0;"
-        << "weight05CenterPixelMatches=false;"
-        << "presentComposite=not_run;"
-        << "presentCompositeLastError=;"
+        << "twoDTwoDComposite=not_run;"
+        << "twoDTwoDCenterRead=not_run;"
+        << "twoDTwoDCenterR=0;"
+        << "twoDTwoDCenterG=0;"
+        << "twoDTwoDCenterB=0;"
+        << "twoDTwoDCenterA=0;"
+        << "twoDTwoDWeight05CenterPixelMatches=false;"
+        << "oesTwoDComposite=not_run;"
+        << "oesTwoDCenterRead=not_run;"
+        << "oesTwoDCenterR=0;"
+        << "oesTwoDCenterG=0;"
+        << "oesTwoDCenterB=0;"
+        << "oesTwoDCenterA=0;"
+        << "twoDOesComposite=not_run;"
+        << "twoDOesCenterRead=not_run;"
+        << "twoDOesCenterR=0;"
+        << "twoDOesCenterG=0;"
+        << "twoDOesCenterB=0;"
+        << "twoDOesCenterA=0;"
+        << "oesOesComposite=not_run;"
+        << "oesOesCenterRead=not_run;"
+        << "oesOesCenterR=0;"
+        << "oesOesCenterG=0;"
+        << "oesOesCenterB=0;"
+        << "oesOesCenterA=0;"
         << "releaseBufferA=not_run;"
         << "releaseBufferAFence=-1;"
         << "hasAAfterRelease=false;"
         << "releaseBufferB=not_run;"
         << "releaseBufferBFence=-1;"
         << "hasBAfterRelease=false;"
+        << "releaseYcbcrA=not_run;"
+        << "releaseYcbcrAFence=-1;"
+        << "hasYcbcrAAfterRelease=false;"
+        << "releaseYcbcrB=not_run;"
+        << "releaseYcbcrBFence=-1;"
+        << "hasYcbcrBAfterRelease=false;"
         << "postReleaseDiagnosticComposite=not_run;"
         << "postReleaseLastError=;"
         << "detach=not_run;"
         << "surfaceKindAfterDetach=none;"
         << "shutdown=not_run;"
         << "idempotentShutdown=not_run;"
-        << "proofBoundary=gles_two_texture_compositor_rgba_blend_foundation_at_compatible_no_color_conversion_no_product;"
+        << "proofBoundary=gles_mixed_texture_compositor_oes_permutation_foundation_no_color_conversion_no_product;"
         << "lastError=" << lastErrorReason;
     return oss.str();
 }
@@ -174,37 +179,39 @@ std::string BuildFailureString(const char* lastErrorReason) {
 } // namespace
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroidDagPhase1ASGlesTwoTextureCompositorSmoke(
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke(
     JNIEnv* env,
     jobject /* this */,
     jobject jSurface,
-    jobject jBufferA,
-    jobject jBufferB,
-    jobject jYcbcrBuffer,
+    jobject jRgbaBufferA,
+    jobject jRgbaBufferB,
+    jobject jYcbcrBufferA,
+    jobject jYcbcrBufferB,
     jint width,
     jint height) {
 
-    if (!jSurface || !jBufferA || !jBufferB || !jYcbcrBuffer || width <= 0 || height <= 0) {
-        return env->NewStringUTF(BuildFailureString("invalid_arguments").c_str());
+    if (!jSurface || !jRgbaBufferA || !jRgbaBufferB || !jYcbcrBufferA || !jYcbcrBufferB || width <= 0 || height <= 0) {
+        return env->NewStringUTF(BuildPhase1ATFailureString("invalid_arguments").c_str());
     }
 
     NativeHardwareBufferFunctions ahbFns = ResolveNativeHardwareBufferFunctions();
     if (!ahbFns.isValid()) {
-        return env->NewStringUTF(BuildFailureString("hardware_buffer_symbols_unavailable").c_str());
+        return env->NewStringUTF(BuildPhase1ATFailureString("hardware_buffer_symbols_unavailable").c_str());
     }
 
     ANativeWindow* window = ANativeWindow_fromSurface(env, jSurface);
     if (!window) {
-        return env->NewStringUTF(BuildFailureString("native_window_from_surface_failed").c_str());
+        return env->NewStringUTF(BuildPhase1ATFailureString("native_window_from_surface_failed").c_str());
     }
 
-    AHardwareBuffer* ahbA = ahbFns.fromHardwareBuffer(env, jBufferA);
-    AHardwareBuffer* ahbB = ahbFns.fromHardwareBuffer(env, jBufferB);
-    AHardwareBuffer* ahbYcbcr = ahbFns.fromHardwareBuffer(env, jYcbcrBuffer);
+    AHardwareBuffer* ahbA = ahbFns.fromHardwareBuffer(env, jRgbaBufferA);
+    AHardwareBuffer* ahbB = ahbFns.fromHardwareBuffer(env, jRgbaBufferB);
+    AHardwareBuffer* ahbYcbcrA = ahbFns.fromHardwareBuffer(env, jYcbcrBufferA);
+    AHardwareBuffer* ahbYcbcrB = ahbFns.fromHardwareBuffer(env, jYcbcrBufferB);
 
-    if (!ahbA || !ahbB || !ahbYcbcr) {
+    if (!ahbA || !ahbB || !ahbYcbcrA || !ahbYcbcrB) {
         ANativeWindow_release(window);
-        return env->NewStringUTF(BuildFailureString("hardware_buffer_from_jobject_failed").c_str());
+        return env->NewStringUTF(BuildPhase1ATFailureString("hardware_buffer_from_jobject_failed").c_str());
     }
 
     // 1. Validate descriptors
@@ -228,18 +235,27 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                                    ((descB.usage & AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN) != 0) &&
                                    (descB.stride >= descB.width);
 
-    AHardwareBuffer_Desc descYcbcrBuf{};
-    ahbFns.describe(ahbYcbcr, &descYcbcrBuf);
-    const bool ycbcrFormatIs420888 = (descYcbcrBuf.format == AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420);
-    const bool ycbcrBufferDescribeOk = (descYcbcrBuf.width == static_cast<uint32_t>(width)) &&
-                                       (descYcbcrBuf.height == static_cast<uint32_t>(height)) &&
-                                       (descYcbcrBuf.layers == 1) &&
-                                       ycbcrFormatIs420888 &&
-                                       ((descYcbcrBuf.usage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) != 0);
+    AHardwareBuffer_Desc descYcbcrA{};
+    ahbFns.describe(ahbYcbcrA, &descYcbcrA);
+    const bool ycbcrFormatAIs420888 = (descYcbcrA.format == AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420);
+    const bool ycbcrBufferADescribeOk = (descYcbcrA.width == static_cast<uint32_t>(width)) &&
+                                        (descYcbcrA.height == static_cast<uint32_t>(height)) &&
+                                        (descYcbcrA.layers == 1) &&
+                                        ycbcrFormatAIs420888 &&
+                                        ((descYcbcrA.usage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) != 0);
 
-    if (!bufferADescribeOk || !bufferBDescribeOk || !ycbcrBufferDescribeOk) {
+    AHardwareBuffer_Desc descYcbcrB{};
+    ahbFns.describe(ahbYcbcrB, &descYcbcrB);
+    const bool ycbcrFormatBIs420888 = (descYcbcrB.format == AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420);
+    const bool ycbcrBufferBDescribeOk = (descYcbcrB.width == static_cast<uint32_t>(width)) &&
+                                        (descYcbcrB.height == static_cast<uint32_t>(height)) &&
+                                        (descYcbcrB.layers == 1) &&
+                                        ycbcrFormatBIs420888 &&
+                                        ((descYcbcrB.usage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) != 0);
+
+    if (!bufferADescribeOk || !bufferBDescribeOk || !ycbcrBufferADescribeOk || !ycbcrBufferBDescribeOk) {
         ANativeWindow_release(window);
-        return env->NewStringUTF(BuildFailureString("hardware_buffer_descriptor_mismatch").c_str());
+        return env->NewStringUTF(BuildPhase1ATFailureString("hardware_buffer_descriptor_mismatch").c_str());
     }
 
     // 2. CPU-fill bufferA solid red [255, 0, 0, 255] and bufferB solid blue [0, 0, 255, 255]
@@ -283,7 +299,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
 
     if (!bufferAFillOk || !bufferBFillOk) {
         ANativeWindow_release(window);
-        return env->NewStringUTF(BuildFailureString("hardware_buffer_fill_failed").c_str());
+        return env->NewStringUTF(BuildPhase1ATFailureString("hardware_buffer_fill_failed").c_str());
     }
 
     vanguard::render::GlesBackend backend;
@@ -318,7 +334,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                                (widthAfterAttach == static_cast<uint32_t>(width)) &&
                                (heightAfterAttach == static_cast<uint32_t>(height));
 
-    // 5. Import bufferA and bufferB; assert handles valid, distinct, target 0x0DE1 for each
+    // 5. Import all four buffers: RGBA buffers (target 0x0DE1) and YCBCR buffers (target 0x8D65)
     vanguard::render::HardwareBufferHandle handleA = vanguard::render::kInvalidHardwareBufferHandle;
     vanguard::render::HardwareBufferDescriptor descImportA{};
     const auto resImportA = backend.importHardwareBuffer(ahbA, -1, &handleA, &descImportA);
@@ -339,49 +355,31 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                                  hasBAfterImport &&
                                  (targetB == 0x0DE1);
 
-    const bool distinctHandles = (handleA != handleB);
+    vanguard::render::HardwareBufferHandle handleYcbcrA = vanguard::render::kInvalidHardwareBufferHandle;
+    vanguard::render::HardwareBufferDescriptor descImportYcbcrA{};
+    const auto resImportYcbcrA = backend.importHardwareBuffer(ahbYcbcrA, -1, &handleYcbcrA, &descImportYcbcrA);
+    const bool hasYcbcrAAfterImport = backend.hasHardwareBuffer(handleYcbcrA);
+    const uint32_t targetYcbcrA = backend.diagnosticTextureTargetForHardwareBuffer(handleYcbcrA);
+    const bool importYcbcrAOk = (resImportYcbcrA == vanguard::render::HardwareBufferImportResult::kSuccess) &&
+                                (handleYcbcrA != vanguard::render::kInvalidHardwareBufferHandle) &&
+                                hasYcbcrAAfterImport &&
+                                (targetYcbcrA == 0x8D65);
 
-    // 6. Import ycbcrBuffer; assert target 0x8D65, verify AT-compatible mixed composite and readback succeed without color claim, then release ycbcr
-    vanguard::render::HardwareBufferHandle handleYcbcr = vanguard::render::kInvalidHardwareBufferHandle;
-    vanguard::render::HardwareBufferDescriptor descImportYcbcr{};
-    const auto resImportYcbcr = backend.importHardwareBuffer(ahbYcbcr, -1, &handleYcbcr, &descImportYcbcr);
-    const bool hasYcbcrAfterImport = backend.hasHardwareBuffer(handleYcbcr);
-    const uint32_t targetYcbcr = backend.diagnosticTextureTargetForHardwareBuffer(handleYcbcr);
-    const bool importYcbcrOk = (resImportYcbcr == vanguard::render::HardwareBufferImportResult::kSuccess) &&
-                               (handleYcbcr != vanguard::render::kInvalidHardwareBufferHandle) &&
-                               hasYcbcrAfterImport &&
-                               (targetYcbcr == 0x8D65);
+    vanguard::render::HardwareBufferHandle handleYcbcrB = vanguard::render::kInvalidHardwareBufferHandle;
+    vanguard::render::HardwareBufferDescriptor descImportYcbcrB{};
+    const auto resImportYcbcrB = backend.importHardwareBuffer(ahbYcbcrB, -1, &handleYcbcrB, &descImportYcbcrB);
+    const bool hasYcbcrBAfterImport = backend.hasHardwareBuffer(handleYcbcrB);
+    const uint32_t targetYcbcrB = backend.diagnosticTextureTargetForHardwareBuffer(handleYcbcrB);
+    const bool importYcbcrBOk = (resImportYcbcrB == vanguard::render::HardwareBufferImportResult::kSuccess) &&
+                                (handleYcbcrB != vanguard::render::kInvalidHardwareBufferHandle) &&
+                                hasYcbcrBAfterImport &&
+                                (targetYcbcrB == 0x8D65);
 
-    const bool mixedTargetRes = backend.diagnosticCompositeFramesForReadback(
-        handleA, handleYcbcr, 0.5f,
-        vanguard::render::VideoFrameTransform{},
-        vanguard::render::VideoFrameTransform{});
-    const std::string mixedTargetLastError = SanitizeString(backend.lastError());
-    std::vector<uint8_t> pixelMixedTarget(4, 0);
-    const bool mixedTargetReadRes = backend.diagnosticReadPixels(
-        static_cast<uint32_t>(width / 2),
-        static_cast<uint32_t>(height / 2),
-        1, 1,
-        pixelMixedTarget.data(),
-        4);
-    const int mixedTargetCenterR = static_cast<int>(pixelMixedTarget[0]);
-    const int mixedTargetCenterG = static_cast<int>(pixelMixedTarget[1]);
-    const int mixedTargetCenterB = static_cast<int>(pixelMixedTarget[2]);
-    const int mixedTargetCenterA = static_cast<int>(pixelMixedTarget[3]);
-    const bool mixedTargetOk = mixedTargetRes && mixedTargetReadRes &&
-                               (mixedTargetLastError.empty() || mixedTargetLastError == "none");
+    const bool distinctHandles = (handleA != handleB) && (handleA != handleYcbcrA) &&
+                                 (handleA != handleYcbcrB) && (handleB != handleYcbcrA) &&
+                                 (handleB != handleYcbcrB) && (handleYcbcrA != handleYcbcrB);
 
-    int releaseFenceYcbcr = -999;
-    const auto resReleaseYcbcr = backend.releaseHardwareBuffer(handleYcbcr, &releaseFenceYcbcr);
-    const bool hasYcbcrAfterRelease = backend.hasHardwareBuffer(handleYcbcr);
-    const bool releaseYcbcrOk = (resReleaseYcbcr == vanguard::render::HardwareBufferImportResult::kSuccess) &&
-                                (releaseFenceYcbcr >= -1) &&
-                                !hasYcbcrAfterRelease;
-    if (releaseFenceYcbcr >= 0) {
-        close(releaseFenceYcbcr);
-    }
-
-    // 7. Invalid weight lane: NaN weight fails with gles_two_texture_compositor_invalid_weight
+    // 6. Invalid weight lane: NaN weight fails with gles_two_texture_compositor_invalid_weight
     const float nanWeight = std::numeric_limits<float>::quiet_NaN();
     const bool invalidWeightRes = backend.diagnosticCompositeFramesForReadback(
         handleA, handleB, nanWeight,
@@ -391,83 +389,83 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     const bool invalidWeightOk = (!invalidWeightRes &&
         invalidWeightLastError == "gles_two_texture_compositor_invalid_weight");
 
-    // 8. Weight lanes using two RGBA handles
-    // weight 0.0: red > 200, green < 50, blue < 50, alpha > 200
-    const bool weight0Res = backend.diagnosticCompositeFramesForReadback(
-        handleA, handleB, 0.0f,
-        vanguard::render::VideoFrameTransform{},
-        vanguard::render::VideoFrameTransform{});
-    std::vector<uint8_t> pixelWeight0(4, 0);
-    const bool weight0ReadRes = backend.diagnosticReadPixels(
-        static_cast<uint32_t>(width / 2),
-        static_cast<uint32_t>(height / 2),
-        1, 1,
-        pixelWeight0.data(),
-        4);
-    const int weight0CenterR = static_cast<int>(pixelWeight0[0]);
-    const int weight0CenterG = static_cast<int>(pixelWeight0[1]);
-    const int weight0CenterB = static_cast<int>(pixelWeight0[2]);
-    const int weight0CenterA = static_cast<int>(pixelWeight0[3]);
-    const bool weight0PixelMatches = (weight0CenterR > 200) &&
-                                     (weight0CenterG < 50) &&
-                                     (weight0CenterB < 50) &&
-                                     (weight0CenterA > 200);
-    const bool laneWeight0Ok = weight0Res && weight0ReadRes && weight0PixelMatches;
-
-    // weight 1.0: red < 50, green < 50, blue > 200, alpha > 200
-    const bool weight1Res = backend.diagnosticCompositeFramesForReadback(
-        handleA, handleB, 1.0f,
-        vanguard::render::VideoFrameTransform{},
-        vanguard::render::VideoFrameTransform{});
-    std::vector<uint8_t> pixelWeight1(4, 0);
-    const bool weight1ReadRes = backend.diagnosticReadPixels(
-        static_cast<uint32_t>(width / 2),
-        static_cast<uint32_t>(height / 2),
-        1, 1,
-        pixelWeight1.data(),
-        4);
-    const int weight1CenterR = static_cast<int>(pixelWeight1[0]);
-    const int weight1CenterG = static_cast<int>(pixelWeight1[1]);
-    const int weight1CenterB = static_cast<int>(pixelWeight1[2]);
-    const int weight1CenterA = static_cast<int>(pixelWeight1[3]);
-    const bool weight1PixelMatches = (weight1CenterR < 50) &&
-                                     (weight1CenterG < 50) &&
-                                     (weight1CenterB > 200) &&
-                                     (weight1CenterA > 200);
-    const bool laneWeight1Ok = weight1Res && weight1ReadRes && weight1PixelMatches;
-
-    // weight 0.5: red in [100, 155], green < 50, blue in [100, 155], alpha > 200
-    const bool weight05Res = backend.diagnosticCompositeFramesForReadback(
+    // 7. 2D+2D blend lane (weight 0.5): purple match assertion
+    const bool twoDTwoDRes = backend.diagnosticCompositeFramesForReadback(
         handleA, handleB, 0.5f,
         vanguard::render::VideoFrameTransform{},
         vanguard::render::VideoFrameTransform{});
-    std::vector<uint8_t> pixelWeight05(4, 0);
-    const bool weight05ReadRes = backend.diagnosticReadPixels(
+    std::vector<uint8_t> pixelTwoDTwoD(4, 0);
+    const bool twoDTwoDReadRes = backend.diagnosticReadPixels(
         static_cast<uint32_t>(width / 2),
         static_cast<uint32_t>(height / 2),
         1, 1,
-        pixelWeight05.data(),
+        pixelTwoDTwoD.data(),
         4);
-    const int weight05CenterR = static_cast<int>(pixelWeight05[0]);
-    const int weight05CenterG = static_cast<int>(pixelWeight05[1]);
-    const int weight05CenterB = static_cast<int>(pixelWeight05[2]);
-    const int weight05CenterA = static_cast<int>(pixelWeight05[3]);
-    const bool weight05PixelMatches = (weight05CenterR >= 100 && weight05CenterR <= 155) &&
-                                      (weight05CenterG < 50) &&
-                                      (weight05CenterB >= 100 && weight05CenterB <= 155) &&
-                                      (weight05CenterA > 200);
-    const bool laneWeight05Ok = weight05Res && weight05ReadRes && weight05PixelMatches;
+    const int twoDTwoDCenterR = static_cast<int>(pixelTwoDTwoD[0]);
+    const int twoDTwoDCenterG = static_cast<int>(pixelTwoDTwoD[1]);
+    const int twoDTwoDCenterB = static_cast<int>(pixelTwoDTwoD[2]);
+    const int twoDTwoDCenterA = static_cast<int>(pixelTwoDTwoD[3]);
+    const bool twoDTwoDWeight05CenterPixelMatches = (twoDTwoDCenterR >= 100 && twoDTwoDCenterR <= 155) &&
+                                                    (twoDTwoDCenterG < 50) &&
+                                                    (twoDTwoDCenterB >= 100 && twoDTwoDCenterB <= 155) &&
+                                                    (twoDTwoDCenterA > 200);
+    const bool laneTwoDTwoDOk = twoDTwoDRes && twoDTwoDReadRes && twoDTwoDWeight05CenterPixelMatches;
 
-    // 9. Present lane: diagnosticPresentCompositeFrames returns true
-    const bool presentCompositeRes = backend.diagnosticPresentCompositeFrames(
-        handleA, handleB, 0.5f,
+    // 8. OES+2D lane (weight 0.5): composite and readback succeed, record center RGBA
+    const bool oesTwoDRes = backend.diagnosticCompositeFramesForReadback(
+        handleYcbcrA, handleB, 0.5f,
         vanguard::render::VideoFrameTransform{},
         vanguard::render::VideoFrameTransform{});
-    const std::string presentCompositeLastError = SanitizeString(backend.lastError());
-    const bool presentCompositeOk = presentCompositeRes &&
-        (presentCompositeLastError.empty() || presentCompositeLastError == "none");
+    std::vector<uint8_t> pixelOesTwoD(4, 0);
+    const bool oesTwoDReadRes = backend.diagnosticReadPixels(
+        static_cast<uint32_t>(width / 2),
+        static_cast<uint32_t>(height / 2),
+        1, 1,
+        pixelOesTwoD.data(),
+        4);
+    const int oesTwoDCenterR = static_cast<int>(pixelOesTwoD[0]);
+    const int oesTwoDCenterG = static_cast<int>(pixelOesTwoD[1]);
+    const int oesTwoDCenterB = static_cast<int>(pixelOesTwoD[2]);
+    const int oesTwoDCenterA = static_cast<int>(pixelOesTwoD[3]);
+    const bool laneOesTwoDOk = oesTwoDRes && oesTwoDReadRes;
 
-    // 10. Release A and B buffers
+    // 9. 2D+OES lane (weight 0.5): composite and readback succeed, record center RGBA
+    const bool twoDOesRes = backend.diagnosticCompositeFramesForReadback(
+        handleA, handleYcbcrB, 0.5f,
+        vanguard::render::VideoFrameTransform{},
+        vanguard::render::VideoFrameTransform{});
+    std::vector<uint8_t> pixelTwoDOes(4, 0);
+    const bool twoDOesReadRes = backend.diagnosticReadPixels(
+        static_cast<uint32_t>(width / 2),
+        static_cast<uint32_t>(height / 2),
+        1, 1,
+        pixelTwoDOes.data(),
+        4);
+    const int twoDOesCenterR = static_cast<int>(pixelTwoDOes[0]);
+    const int twoDOesCenterG = static_cast<int>(pixelTwoDOes[1]);
+    const int twoDOesCenterB = static_cast<int>(pixelTwoDOes[2]);
+    const int twoDOesCenterA = static_cast<int>(pixelTwoDOes[3]);
+    const bool laneTwoDOesOk = twoDOesRes && twoDOesReadRes;
+
+    // 10. OES+OES lane (weight 0.5): composite and readback succeed, record center RGBA
+    const bool oesOesRes = backend.diagnosticCompositeFramesForReadback(
+        handleYcbcrA, handleYcbcrB, 0.5f,
+        vanguard::render::VideoFrameTransform{},
+        vanguard::render::VideoFrameTransform{});
+    std::vector<uint8_t> pixelOesOes(4, 0);
+    const bool oesOesReadRes = backend.diagnosticReadPixels(
+        static_cast<uint32_t>(width / 2),
+        static_cast<uint32_t>(height / 2),
+        1, 1,
+        pixelOesOes.data(),
+        4);
+    const int oesOesCenterR = static_cast<int>(pixelOesOes[0]);
+    const int oesOesCenterG = static_cast<int>(pixelOesOes[1]);
+    const int oesOesCenterB = static_cast<int>(pixelOesOes[2]);
+    const int oesOesCenterA = static_cast<int>(pixelOesOes[3]);
+    const bool laneOesOesOk = oesOesRes && oesOesReadRes;
+
+    // 11. Release all four imported buffers
     int releaseFenceA = -999;
     const auto resReleaseA = backend.releaseHardwareBuffer(handleA, &releaseFenceA);
     const bool hasAAfterRelease = backend.hasHardwareBuffer(handleA);
@@ -488,7 +486,27 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         close(releaseFenceB);
     }
 
-    // 11. Post-release lane: readback seam fails with invalid_buffer_handle
+    int releaseFenceYcbcrA = -999;
+    const auto resReleaseYcbcrA = backend.releaseHardwareBuffer(handleYcbcrA, &releaseFenceYcbcrA);
+    const bool hasYcbcrAAfterRelease = backend.hasHardwareBuffer(handleYcbcrA);
+    const bool releaseYcbcrAOk = (resReleaseYcbcrA == vanguard::render::HardwareBufferImportResult::kSuccess) &&
+                                 (releaseFenceYcbcrA >= -1) &&
+                                 !hasYcbcrAAfterRelease;
+    if (releaseFenceYcbcrA >= 0) {
+        close(releaseFenceYcbcrA);
+    }
+
+    int releaseFenceYcbcrB = -999;
+    const auto resReleaseYcbcrB = backend.releaseHardwareBuffer(handleYcbcrB, &releaseFenceYcbcrB);
+    const bool hasYcbcrBAfterRelease = backend.hasHardwareBuffer(handleYcbcrB);
+    const bool releaseYcbcrBOk = (resReleaseYcbcrB == vanguard::render::HardwareBufferImportResult::kSuccess) &&
+                                 (releaseFenceYcbcrB >= -1) &&
+                                 !hasYcbcrBAfterRelease;
+    if (releaseFenceYcbcrB >= 0) {
+        close(releaseFenceYcbcrB);
+    }
+
+    // 12. Post-release lane: readback seam fails with invalid_buffer_handle
     const bool postReleaseRes = backend.diagnosticCompositeFramesForReadback(
         handleA, handleB, 0.5f,
         vanguard::render::VideoFrameTransform{},
@@ -496,7 +514,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     const std::string postReleaseLastError = SanitizeString(backend.lastError());
     const bool postReleaseOk = (!postReleaseRes && postReleaseLastError == "invalid_buffer_handle");
 
-    // 12. Detach, shutdown, idempotent shutdown
+    // 13. Detach, shutdown, idempotent shutdown
     backend.detachSurface();
     const bool hasSurfaceAfterDetach = backend.hasSurface();
     const std::string surfaceKindAfterDetach = SanitizeString(backend.activeSurfaceKind());
@@ -512,7 +530,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
 
     const bool allChecksPass = bufferADescribeOk &&
                                bufferBDescribeOk &&
-                               ycbcrBufferDescribeOk &&
+                               ycbcrBufferADescribeOk &&
+                               ycbcrBufferBDescribeOk &&
                                bufferAFillOk &&
                                bufferBFillOk &&
                                preInitDiagnosticCompositeOk &&
@@ -520,17 +539,18 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                                attachCheckOk &&
                                importBufferAOk &&
                                importBufferBOk &&
+                               importYcbcrAOk &&
+                               importYcbcrBOk &&
                                distinctHandles &&
-                                importYcbcrOk &&
-                               mixedTargetOk &&
-                               releaseYcbcrOk &&
                                invalidWeightOk &&
-                               laneWeight0Ok &&
-                               laneWeight1Ok &&
-                               laneWeight05Ok &&
-                               presentCompositeOk &&
+                               laneTwoDTwoDOk &&
+                               laneOesTwoDOk &&
+                               laneTwoDOesOk &&
+                               laneOesOesOk &&
                                releaseAOk &&
                                releaseBOk &&
+                               releaseYcbcrAOk &&
+                               releaseYcbcrBOk &&
                                postReleaseOk &&
                                detachOk &&
                                shutdownOk &&
@@ -554,10 +574,14 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "bufferBUsage=" << descB.usage << ";"
         << "bufferBStride=" << descB.stride << ";"
         << "bufferBFill=" << (bufferBFillOk ? "success" : "failed") << ";"
-        << "ycbcrBufferDescribe=" << (ycbcrBufferDescribeOk ? "success" : "failed") << ";"
-        << "ycbcrBufferFormat=" << descYcbcrBuf.format << ";"
-        << "ycbcrBufferUsage=" << descYcbcrBuf.usage << ";"
-        << "ycbcrFormatIs420888=" << (ycbcrFormatIs420888 ? "true" : "false") << ";"
+        << "ycbcrBufferADescribe=" << (ycbcrBufferADescribeOk ? "success" : "failed") << ";"
+        << "ycbcrBufferAFormat=" << descYcbcrA.format << ";"
+        << "ycbcrBufferAUsage=" << descYcbcrA.usage << ";"
+        << "ycbcrFormatAIs420888=" << (ycbcrFormatAIs420888 ? "true" : "false") << ";"
+        << "ycbcrBufferBDescribe=" << (ycbcrBufferBDescribeOk ? "success" : "failed") << ";"
+        << "ycbcrBufferBFormat=" << descYcbcrB.format << ";"
+        << "ycbcrBufferBUsage=" << descYcbcrB.usage << ";"
+        << "ycbcrFormatBIs420888=" << (ycbcrFormatBIs420888 ? "true" : "false") << ";"
         << "preInitDiagnosticComposite=" << (preInitDiagnosticCompositeOk ? "rejected_as_expected" : "failed") << ";"
         << "preInitLastError=" << preInitLastError << ";"
         << "initialize=" << (initCheckOk ? "success" : "failed") << ";"
@@ -572,58 +596,59 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "importBufferB=" << (importBufferBOk ? "success" : "failed") << ";"
         << "handleB=" << handleB << ";"
         << "targetB=" << targetB << ";"
+        << "importYcbcrA=" << (importYcbcrAOk ? "success" : "failed") << ";"
+        << "handleYcbcrA=" << handleYcbcrA << ";"
+        << "targetYcbcrA=" << targetYcbcrA << ";"
+        << "importYcbcrB=" << (importYcbcrBOk ? "success" : "failed") << ";"
+        << "handleYcbcrB=" << handleYcbcrB << ";"
+        << "targetYcbcrB=" << targetYcbcrB << ";"
         << "distinctHandles=" << (distinctHandles ? "true" : "false") << ";"
-        << "importYcbcr=" << (importYcbcrOk ? "success" : "failed") << ";"
-        << "handleYcbcr=" << handleYcbcr << ";"
-        << "targetYcbcr=" << targetYcbcr << ";"
-        << "mixedTargetDiagnosticComposite=" << (mixedTargetRes ? "success" : "failed") << ";"
-        << "mixedTargetCenterRead=" << (mixedTargetReadRes ? "success" : "failed") << ";"
-        << "mixedTargetCenterR=" << mixedTargetCenterR << ";"
-        << "mixedTargetCenterG=" << mixedTargetCenterG << ";"
-        << "mixedTargetCenterB=" << mixedTargetCenterB << ";"
-        << "mixedTargetCenterA=" << mixedTargetCenterA << ";"
-        << "mixedTargetLastError=" << (mixedTargetLastError.empty() ? "none" : mixedTargetLastError) << ";"
-        << "releaseYcbcr=" << (releaseYcbcrOk ? "success" : "failed") << ";"
-        << "releaseYcbcrFence=" << releaseFenceYcbcr << ";"
-        << "hasYcbcrAfterRelease=" << (hasYcbcrAfterRelease ? "true" : "false") << ";"
         << "invalidWeightDiagnosticComposite=" << (invalidWeightOk ? "rejected_as_expected" : "failed") << ";"
         << "invalidWeightLastError=" << invalidWeightLastError << ";"
-        << "weight0DiagnosticComposite=" << (weight0Res ? "success" : "failed") << ";"
-        << "weight0CenterRead=" << (weight0ReadRes ? "success" : "failed") << ";"
-        << "weight0CenterR=" << weight0CenterR << ";"
-        << "weight0CenterG=" << weight0CenterG << ";"
-        << "weight0CenterB=" << weight0CenterB << ";"
-        << "weight0CenterA=" << weight0CenterA << ";"
-        << "weight0CenterPixelMatches=" << (weight0PixelMatches ? "true" : "false") << ";"
-        << "weight1DiagnosticComposite=" << (weight1Res ? "success" : "failed") << ";"
-        << "weight1CenterRead=" << (weight1ReadRes ? "success" : "failed") << ";"
-        << "weight1CenterR=" << weight1CenterR << ";"
-        << "weight1CenterG=" << weight1CenterG << ";"
-        << "weight1CenterB=" << weight1CenterB << ";"
-        << "weight1CenterA=" << weight1CenterA << ";"
-        << "weight1CenterPixelMatches=" << (weight1PixelMatches ? "true" : "false") << ";"
-        << "weight05DiagnosticComposite=" << (weight05Res ? "success" : "failed") << ";"
-        << "weight05CenterRead=" << (weight05ReadRes ? "success" : "failed") << ";"
-        << "weight05CenterR=" << weight05CenterR << ";"
-        << "weight05CenterG=" << weight05CenterG << ";"
-        << "weight05CenterB=" << weight05CenterB << ";"
-        << "weight05CenterA=" << weight05CenterA << ";"
-        << "weight05CenterPixelMatches=" << (weight05PixelMatches ? "true" : "false") << ";"
-        << "presentComposite=" << (presentCompositeOk ? "success" : "failed") << ";"
-        << "presentCompositeLastError=" << (presentCompositeLastError.empty() ? "none" : presentCompositeLastError) << ";"
+        << "twoDTwoDComposite=" << (twoDTwoDRes ? "success" : "failed") << ";"
+        << "twoDTwoDCenterRead=" << (twoDTwoDReadRes ? "success" : "failed") << ";"
+        << "twoDTwoDCenterR=" << twoDTwoDCenterR << ";"
+        << "twoDTwoDCenterG=" << twoDTwoDCenterG << ";"
+        << "twoDTwoDCenterB=" << twoDTwoDCenterB << ";"
+        << "twoDTwoDCenterA=" << twoDTwoDCenterA << ";"
+        << "twoDTwoDWeight05CenterPixelMatches=" << (twoDTwoDWeight05CenterPixelMatches ? "true" : "false") << ";"
+        << "oesTwoDComposite=" << (oesTwoDRes ? "success" : "failed") << ";"
+        << "oesTwoDCenterRead=" << (oesTwoDReadRes ? "success" : "failed") << ";"
+        << "oesTwoDCenterR=" << oesTwoDCenterR << ";"
+        << "oesTwoDCenterG=" << oesTwoDCenterG << ";"
+        << "oesTwoDCenterB=" << oesTwoDCenterB << ";"
+        << "oesTwoDCenterA=" << oesTwoDCenterA << ";"
+        << "twoDOesComposite=" << (twoDOesRes ? "success" : "failed") << ";"
+        << "twoDOesCenterRead=" << (twoDOesReadRes ? "success" : "failed") << ";"
+        << "twoDOesCenterR=" << twoDOesCenterR << ";"
+        << "twoDOesCenterG=" << twoDOesCenterG << ";"
+        << "twoDOesCenterB=" << twoDOesCenterB << ";"
+        << "twoDOesCenterA=" << twoDOesCenterA << ";"
+        << "oesOesComposite=" << (oesOesRes ? "success" : "failed") << ";"
+        << "oesOesCenterRead=" << (oesOesReadRes ? "success" : "failed") << ";"
+        << "oesOesCenterR=" << oesOesCenterR << ";"
+        << "oesOesCenterG=" << oesOesCenterG << ";"
+        << "oesOesCenterB=" << oesOesCenterB << ";"
+        << "oesOesCenterA=" << oesOesCenterA << ";"
         << "releaseBufferA=" << (releaseAOk ? "success" : "failed") << ";"
         << "releaseBufferAFence=" << releaseFenceA << ";"
         << "hasAAfterRelease=" << (hasAAfterRelease ? "true" : "false") << ";"
         << "releaseBufferB=" << (releaseBOk ? "success" : "failed") << ";"
         << "releaseBufferBFence=" << releaseFenceB << ";"
         << "hasBAfterRelease=" << (hasBAfterRelease ? "true" : "false") << ";"
+        << "releaseYcbcrA=" << (releaseYcbcrAOk ? "success" : "failed") << ";"
+        << "releaseYcbcrAFence=" << releaseFenceYcbcrA << ";"
+        << "hasYcbcrAAfterRelease=" << (hasYcbcrAAfterRelease ? "true" : "false") << ";"
+        << "releaseYcbcrB=" << (releaseYcbcrBOk ? "success" : "failed") << ";"
+        << "releaseYcbcrBFence=" << releaseFenceYcbcrB << ";"
+        << "hasYcbcrBAfterRelease=" << (hasYcbcrBAfterRelease ? "true" : "false") << ";"
         << "postReleaseDiagnosticComposite=" << (postReleaseOk ? "rejected_as_expected" : "failed") << ";"
         << "postReleaseLastError=" << postReleaseLastError << ";"
         << "detach=" << (detachOk ? "success" : "failed") << ";"
         << "surfaceKindAfterDetach=" << surfaceKindAfterDetach << ";"
         << "shutdown=" << (shutdownOk ? "success" : "failed") << ";"
         << "idempotentShutdown=" << (idempotentShutdownOk ? "success" : "failed") << ";"
-        << "proofBoundary=gles_two_texture_compositor_rgba_blend_foundation_at_compatible_no_color_conversion_no_product;"
+        << "proofBoundary=gles_mixed_texture_compositor_oes_permutation_foundation_no_color_conversion_no_product;"
         << "lastError=" << (backendLastError.empty() ? "none" : backendLastError);
 
     return env->NewStringUTF(oss.str().c_str());
