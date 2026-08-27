@@ -96,6 +96,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             mainHandler     = mainHandler,
         )
         dagDiagnosticsCoordinator = AndroidDagDiagnosticsCoordinator(
+            context     = binding.applicationContext,
             mainHandler = mainHandler,
         )
         editorExportCoordinator = AndroidEditorExportCoordinator(

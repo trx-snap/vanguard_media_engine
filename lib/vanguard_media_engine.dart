@@ -26,6 +26,8 @@ export 'vg_camera_preview.dart';
 export 'vg_multicam_preview.dart';
 // Phase 6: continuous device-aware zoom capability model.
 export 'vg_camera_zoom_capabilities.dart';
+// Phase 3-Unit A: Android Camera2 hardware/thermal capability probe report.
+export 'vg_camera_hardware_capability_report.dart';
 
 // Phase 6D.3: typed recording result.
 export 'vg_recording_stats.dart';

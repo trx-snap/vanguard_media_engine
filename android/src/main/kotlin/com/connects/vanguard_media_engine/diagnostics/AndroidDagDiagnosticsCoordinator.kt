@@ -1,6 +1,8 @@
 package com.connects.vanguard_media_engine.diagnostics
 
+import android.content.Context
 import android.os.Handler
+import com.connects.vanguard_media_engine.camera.AndroidCamera2CapabilityProbe
 import com.connects.vanguard_media_engine.export.AndroidAudioFoundationSmokeHarness
 import io.flutter.plugin.common.MethodChannel
 
@@ -9,12 +11,14 @@ import io.flutter.plugin.common.MethodChannel
  *
  * Owns the diagnostic-only smoke methods previously routed inline by
  * VanguardMediaEnginePlugin (Phase 2O2B3/2O2B4/2Q/3C/4A/5) plus the
- * Export/Audio Unit B audio foundation smoke. Every route runs on a background
- * Thread and posts exactly one result.success/result.error to [mainHandler].
+ * Export/Audio Unit B audio foundation smoke and the Phase 3-Unit A Camera2
+ * capability probe. Every route runs on a background Thread and posts exactly
+ * one result.success/result.error to [mainHandler].
  *
  * Diagnostic only: no production export, playback, or UI wiring lives here.
  */
 class AndroidDagDiagnosticsCoordinator(
+    private val context: Context,
     private val mainHandler: Handler,
 ) {
     companion object {
@@ -26,6 +30,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase4ADecoderSmoke",
             "runAndroidDagPhase5EncoderSurfaceSmoke",
             "runAndroidDagAudioFoundationSmoke",
+            "runAndroidDagPhase3UnitACameraCapabilityProbe",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -42,6 +47,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase4ADecoderSmoke" -> runPhase4ADecoderSmoke(args, result)
             "runAndroidDagPhase5EncoderSurfaceSmoke" -> runPhase5EncoderSurfaceSmoke(args, result)
             "runAndroidDagAudioFoundationSmoke" -> runAudioFoundationSmoke(args, result)
+            "runAndroidDagPhase3UnitACameraCapabilityProbe" -> runPhase3UnitACameraCapabilityProbe(result)
             else -> return false
         }
         return true
@@ -154,6 +160,24 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "AUDIO_FOUNDATION_SMOKE_FAILED",
                         "runAndroidDagAudioFoundationSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 3-Unit A: Android Camera2 capability probe ─────────────────────
+    private fun runPhase3UnitACameraCapabilityProbe(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val probeResult = AndroidCamera2CapabilityProbe(context).probe()
+                mainHandler.post { result.success(probeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "CAMERA_CAPABILITY_PROBE_FAILED",
+                        "runAndroidDagPhase3UnitACameraCapabilityProbe: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
