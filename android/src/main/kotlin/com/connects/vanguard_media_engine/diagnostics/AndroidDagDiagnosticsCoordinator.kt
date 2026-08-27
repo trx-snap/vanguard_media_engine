@@ -639,7 +639,7 @@ class AndroidDagDiagnosticsCoordinator(
     private fun runPhase1AIGlesExtensionCapabilitySmoke(result: MethodChannel.Result) {
         Thread {
             try {
-                val smokeResult = AndroidDagRenderSmokeHarness.runGlesExtensionCapabilitySmoke()
+                val smokeResult = AndroidGlesCapabilitySmokeHarness.runGlesExtensionCapabilitySmoke()
                 mainHandler.post { result.success(smokeResult) }
             } catch (t: Throwable) {
                 mainHandler.post {
