@@ -221,6 +221,9 @@ class VanguardNativeBridge(
     // ── Phase 1-Unit AI: Android GLES/EGL extension and native-fence capability inventory physical proof ──
     external fun runAndroidDagPhase1AIGlesExtensionCapabilitySmoke(): String
 
+    // ── Phase 1-Unit AJ: Android GLES EGL native-fence FD lifecycle physical proof ──
+    external fun runAndroidDagPhase1AJGlesNativeFenceFdSmoke(): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

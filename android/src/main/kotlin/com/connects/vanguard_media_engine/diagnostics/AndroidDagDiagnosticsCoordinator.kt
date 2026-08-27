@@ -57,6 +57,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AGGlesImportGuardSmoke",
             "runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke",
             "runAndroidDagPhase1AIGlesExtensionCapabilitySmoke",
+            "runAndroidDagPhase1AJGlesNativeFenceFdSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -100,6 +101,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AGGlesImportGuardSmoke" -> runPhase1AGGlesImportGuardSmoke(args, result)
             "runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke" -> runPhase1AHGlesYcbcrImportGuardSmoke(args, result)
             "runAndroidDagPhase1AIGlesExtensionCapabilitySmoke" -> runPhase1AIGlesExtensionCapabilitySmoke(result)
+            "runAndroidDagPhase1AJGlesNativeFenceFdSmoke" -> runPhase1AJGlesNativeFenceFdSmoke(result)
             else -> return false
         }
         return true
@@ -638,6 +640,24 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_EXTENSION_CAPABILITY_SMOKE_FAILED",
                         "runAndroidDagPhase1AIGlesExtensionCapabilitySmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AJ: Android GLES EGL native-fence FD lifecycle physical proof ──
+    private fun runPhase1AJGlesNativeFenceFdSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesNativeFenceFdSmoke()
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_NATIVE_FENCE_FD_SMOKE_FAILED",
+                        "runAndroidDagPhase1AJGlesNativeFenceFdSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

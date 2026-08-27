@@ -3071,4 +3071,90 @@ object AndroidDagRenderSmokeHarness {
             "symbolEglCreateSyncKhr=false;symbolEglDestroySyncKhr=false;symbolEglDupNativeFenceFdAndroid=false;" +
             "shutdown=not_run;idempotentShutdown=not_run;" +
             "proofBoundary=gles_egl_extension_capability_inventory_no_import_no_render_no_product;lastError=$reason"
+
+    // ── Phase 1-Unit AJ: Android GLES EGL native-fence FD lifecycle physical proof ──
+    private const val RESULT_MARKER_PHASE1AJ = "ANDROID_GLES_NATIVE_FENCE_FD_UNIT_AJ_NATIVE_RESULT"
+
+    fun runGlesNativeFenceFdSmoke(): Map<String, Any?> {
+        var raw = glesNativeFenceFdFailure("not_run")
+        try {
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1AJGlesNativeFenceFdSmoke()
+            return parseGlesNativeFenceFdResult(raw)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = glesNativeFenceFdFailure("exception:$reason")
+            return parseGlesNativeFenceFdResult(raw)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1AJ $raw")
+        }
+    }
+
+    private fun parseGlesNativeFenceFdResult(raw: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val clientVersion = parsed["clientVersion"]?.toIntOrNull() ?: 0
+        val vendor = parsed["vendor"] ?: ""
+        val renderer = parsed["renderer"] ?: ""
+        val version = parsed["version"] ?: ""
+        val initialize = parsed["initialize"] ?: "not_run"
+        val eglCurrentDisplayOk = parsed["eglCurrentDisplayOk"]?.equals("true", ignoreCase = true) ?: false
+        val symbolsResolved = parsed["symbolsResolved"]?.equals("true", ignoreCase = true) ?: false
+        val nativeFenceSyncCreate = parsed["nativeFenceSyncCreate"] ?: "not_run"
+        val glFlushOk = parsed["glFlushOk"]?.equals("true", ignoreCase = true) ?: false
+        val dupNativeFenceFd = parsed["dupNativeFenceFd"]?.toIntOrNull() ?: -1
+        val fdOpenBeforeClose = parsed["fdOpenBeforeClose"]?.equals("true", ignoreCase = true) ?: false
+        val waitOutcome = parsed["waitOutcome"] ?: "not_run"
+        val waitSignaled = parsed["waitSignaled"]?.equals("true", ignoreCase = true) ?: false
+        val closeResult = parsed["closeResult"] ?: "not_run"
+        val fdClosedAfterClose = parsed["fdClosedAfterClose"]?.equals("true", ignoreCase = true) ?: false
+        val destroySync = parsed["destroySync"] ?: "not_run"
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_native_fence_fd_lifecycle_no_release_fence_production_no_import_no_product"
+        val lastError = parsed["lastError"] ?: ""
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "clientVersion" to clientVersion,
+            "vendor" to vendor,
+            "renderer" to renderer,
+            "version" to version,
+            "initialize" to initialize,
+            "eglCurrentDisplayOk" to eglCurrentDisplayOk,
+            "symbolsResolved" to symbolsResolved,
+            "nativeFenceSyncCreate" to nativeFenceSyncCreate,
+            "glFlushOk" to glFlushOk,
+            "dupNativeFenceFd" to dupNativeFenceFd,
+            "fdOpenBeforeClose" to fdOpenBeforeClose,
+            "waitOutcome" to waitOutcome,
+            "waitSignaled" to waitSignaled,
+            "closeResult" to closeResult,
+            "fdClosedAfterClose" to fdClosedAfterClose,
+            "destroySync" to destroySync,
+            "shutdown" to shutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "proofBoundary" to proofBoundary,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun glesNativeFenceFdFailure(reason: String): String =
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;initialize=not_run;" +
+            "eglCurrentDisplayOk=false;symbolsResolved=false;nativeFenceSyncCreate=not_run;glFlushOk=false;" +
+            "dupNativeFenceFd=-1;fdOpenBeforeClose=false;waitOutcome=not_run;waitSignaled=false;" +
+            "closeResult=not_run;fdClosedAfterClose=false;destroySync=not_run;shutdown=not_run;idempotentShutdown=not_run;" +
+            "proofBoundary=gles_native_fence_fd_lifecycle_no_release_fence_production_no_import_no_product;lastError=$reason"
 }
