@@ -299,6 +299,9 @@ class VanguardNativeBridge(
     // Phase 1-Unit AY extends this route with a diagnostic-only frameDelayMs
     // (default 0, AX-compatible) used to hold the frame loop open long
     // enough for an active-dispose/cancellation physical proof.
+    // Phase 1-Unit AZ extends this route with rotationDegrees (default 0)
+    // and mirrorHorizontal (default false) render-transform arguments,
+    // preserving AX/AY-compatible defaults.
     external fun runAndroidDagPhase1AXGlesTextureRenderSmoke(
         surface: Surface,
         hardwareBuffer: HardwareBuffer,
@@ -307,6 +310,8 @@ class VanguardNativeBridge(
         frameCount: Int,
         frameDurationUs: Long,
         frameDelayMs: Int,
+        rotationDegrees: Int,
+        mirrorHorizontal: Boolean,
     ): String
 
     fun initialize() {

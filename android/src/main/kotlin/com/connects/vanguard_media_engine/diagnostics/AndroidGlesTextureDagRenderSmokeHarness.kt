@@ -28,6 +28,8 @@ class AndroidGlesTextureDagRenderSmokeHarness {
         private const val DEFAULT_FRAME_COUNT = 30
         private const val DEFAULT_FRAME_DURATION_US = 33333L
         private const val DEFAULT_FRAME_DELAY_MS = 0
+        private const val DEFAULT_ROTATION_DEGREES = 0
+        private const val DEFAULT_MIRROR_HORIZONTAL = false
         private const val PROOF_BOUNDARY =
             "gles_surfaceproducer_texture_dag_render_foundation_no_decoded_input_no_product_ui"
 
@@ -69,6 +71,9 @@ class AndroidGlesTextureDagRenderSmokeHarness {
                 "releaseFenceExported" to (parsed["releaseFenceExported"]?.equals("true", ignoreCase = true) ?: false),
                 "proofBoundary" to (parsed["proofBoundary"] ?: PROOF_BOUNDARY),
                 "lastError" to (parsed["lastError"] ?: "none"),
+                "rotationDegrees" to (parsed["rotationDegrees"]?.toIntOrNull() ?: DEFAULT_ROTATION_DEGREES),
+                "mirrorHorizontal" to (parsed["mirrorHorizontal"]?.equals("true", ignoreCase = true) ?: DEFAULT_MIRROR_HORIZONTAL),
+                "normalizedRotationDegrees" to (parsed["normalizedRotationDegrees"]?.toIntOrNull() ?: DEFAULT_ROTATION_DEGREES),
             )
         }
 
@@ -90,6 +95,10 @@ class AndroidGlesTextureDagRenderSmokeHarness {
         // call can be proven to land while the render worker is still
         // active. Absent/non-positive defaults to 0, preserving AX behavior.
         val frameDelayMs = clampInt((args?.get("frameDelayMs") as? Number)?.toInt(), DEFAULT_FRAME_DELAY_MS)
+        // Phase 1-Unit AZ: rotation/mirror render-transform arguments, both
+        // AX/AY-compatible (default 0 / false when absent).
+        val rotationDegrees = (args?.get("rotationDegrees") as? Number)?.toInt() ?: DEFAULT_ROTATION_DEGREES
+        val mirrorHorizontal = (args?.get("mirrorHorizontal") as? Boolean) ?: DEFAULT_MIRROR_HORIZONTAL
 
         var surface: Surface? = null
         var hardwareBuffer: HardwareBuffer? = null
@@ -130,6 +139,8 @@ class AndroidGlesTextureDagRenderSmokeHarness {
                 frameCount,
                 frameDurationUs,
                 frameDelayMs,
+                rotationDegrees,
+                mirrorHorizontal,
             )
             return parseResult(raw)
         } catch (throwable: Throwable) {

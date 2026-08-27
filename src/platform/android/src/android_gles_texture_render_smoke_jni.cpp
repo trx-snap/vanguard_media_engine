@@ -32,6 +32,7 @@
 #include "vanguard/graph/frame_request.h"
 #include "vanguard/graph/graph.h"
 #include "vanguard/render/gles_backend.h"
+#include "vanguard/render/render_transform.h"
 
 namespace {
 
@@ -158,6 +159,9 @@ jstring NewTextureDagRenderSmokeStatus(
     jint        height,
     jint        releaseFenceFd,
     bool        releaseFenceExported,
+    jint        rotationDegrees,
+    bool        mirrorHorizontal,
+    jint        normalizedRotationDegrees,
     const char* lastError) {
     char status[kTextureDagRenderSmokeStatusCapacity];
     std::snprintf(
@@ -167,7 +171,8 @@ jstring NewTextureDagRenderSmokeStatus(
         "evaluation=%s;renderedFrames=%d;frameCount=%d;evaluatedPtsUs=%lld;"
         "renderFrame=%s;failingFrame=%d;release=%s;"
         "width=%d;height=%d;textureSurface=true;releaseFenceFd=%d;"
-        "releaseFenceExported=%s;"
+        "releaseFenceExported=%s;rotationDegrees=%d;mirrorHorizontal=%s;"
+        "normalizedRotationDegrees=%d;"
         "proofBoundary=gles_surfaceproducer_texture_dag_render_foundation_no_decoded_input_no_product_ui;"
         "lastError=%s",
         pass ? "PASS" : "FAIL",
@@ -186,6 +191,9 @@ jstring NewTextureDagRenderSmokeStatus(
         height,
         releaseFenceFd,
         releaseFenceExported ? "true" : "false",
+        rotationDegrees,
+        mirrorHorizontal ? "true" : "false",
+        normalizedRotationDegrees,
         (lastError && lastError[0] != '\0') ? lastError : "none");
     return env->NewStringUTF(status);
 }
@@ -203,7 +211,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     jint     height,
     jint     frameCount,
     jlong    frameDurationUs,
-    jint     frameDelayMs) {
+    jint     frameDelayMs,
+    jint     rotationDegrees,
+    jboolean mirrorHorizontal) {
 
     const char* notRun  = "not_run";
     jlong       zeroPts = 0LL;
@@ -211,13 +221,20 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     // to no delay rather than rejecting the call (AX omits this arg / sends
     // 0, which must keep behaving identically).
     const jint effectiveFrameDelayMs = (frameDelayMs > 0) ? frameDelayMs : 0;
+    // Phase 1-Unit AZ: render-transform arguments; both AX/AY-compatible
+    // (rotationDegrees=0, mirrorHorizontal=false) when omitted by the caller.
+    const bool mirrorHorizontalBool = (mirrorHorizontal == JNI_TRUE);
+    const jint normalizedRotationDegrees = static_cast<jint>(
+        vanguard::render::normalizeRotation(static_cast<uint32_t>(rotationDegrees)));
 
     if (surface == nullptr || hardwareBuffer == nullptr ||
         width <= 0 || height <= 0 || frameCount <= 0 || frameDurationUs <= 0) {
         return NewTextureDagRenderSmokeStatus(
             env, false, notRun, notRun, notRun, notRun, notRun,
             0, frameCount, zeroPts, notRun, -1, notRun,
-            width, height, -1, false, "invalid_arguments");
+            width, height, -1, false,
+            rotationDegrees, mirrorHorizontalBool, normalizedRotationDegrees,
+            "invalid_arguments");
     }
 
     ANativeWindow* nativeWindow = ANativeWindow_fromSurface(env, surface);
@@ -225,7 +242,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         return NewTextureDagRenderSmokeStatus(
             env, false, notRun, "native_window_failed", notRun, notRun, notRun,
             0, frameCount, zeroPts, notRun, -1, notRun,
-            width, height, -1, false, "native_window_from_surface_failed");
+            width, height, -1, false,
+            rotationDegrees, mirrorHorizontalBool, normalizedRotationDegrees,
+            "native_window_from_surface_failed");
     }
 
     void* libAndroid = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
@@ -234,7 +253,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         return NewTextureDagRenderSmokeStatus(
             env, false, notRun, notRun, notRun, "hardware_buffer_jni_unavailable", notRun,
             0, frameCount, zeroPts, notRun, -1, notRun,
-            width, height, -1, false, "hardware_buffer_jni_unavailable");
+            width, height, -1, false,
+            rotationDegrees, mirrorHorizontalBool, normalizedRotationDegrees,
+            "hardware_buffer_jni_unavailable");
     }
 
     auto fnFromHardwareBuffer = reinterpret_cast<FnAHardwareBuffer_fromHardwareBuffer>(
@@ -245,7 +266,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         return NewTextureDagRenderSmokeStatus(
             env, false, notRun, notRun, notRun, "hardware_buffer_jni_unavailable", notRun,
             0, frameCount, zeroPts, notRun, -1, notRun,
-            width, height, -1, false, "hardware_buffer_jni_unavailable");
+            width, height, -1, false,
+            rotationDegrees, mirrorHorizontalBool, normalizedRotationDegrees,
+            "hardware_buffer_jni_unavailable");
     }
 
     AHardwareBuffer* borrowedHardwareBuffer = fnFromHardwareBuffer(env, hardwareBuffer);
@@ -337,6 +360,10 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             renderStatus     = "success";
             evaluationStatus = "success";
 
+            vanguard::render::VideoFrameTransform transform;
+            transform.rotationDegrees  = static_cast<uint32_t>(rotationDegrees);
+            transform.mirrorHorizontal = mirrorHorizontalBool;
+
             for (int f = 0; f < frameCount; ++f) {
                 vanguard::graph::FrameRequest request;
                 request.timelinePtsUs = static_cast<uint64_t>(f) *
@@ -359,7 +386,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                     break;
                 }
 
-                const auto renderResult = backend.renderFrame(handle);
+                const auto renderResult = backend.renderFrame(handle, transform);
                 if (renderResult == vanguard::render::RenderFrameResult::kSuccess ||
                     renderResult == vanguard::render::RenderFrameResult::kSuboptimal) {
                     renderedFrames++;
@@ -429,5 +456,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         height,
         capturedReleaseFenceFd,
         releaseFenceExported,
+        rotationDegrees,
+        mirrorHorizontalBool,
+        normalizedRotationDegrees,
         lastErrorMessage.c_str());
 }
