@@ -45,6 +45,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase3UnitLCameraNativeRenderLoopSmoke",
             "runAndroidDagPhase1UGlesBackendSmoke",
             "runAndroidDagPhase1VGlesSurfaceSmoke",
+            "runAndroidDagPhase1WGlesWindowPresentSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -76,6 +77,7 @@ class AndroidDagDiagnosticsCoordinator(
                 runPhase3UnitLCameraNativeRenderLoopSmoke(args, result)
             "runAndroidDagPhase1UGlesBackendSmoke" -> runPhase1UGlesBackendSmoke(result)
             "runAndroidDagPhase1VGlesSurfaceSmoke" -> runPhase1VGlesSurfaceSmoke(args, result)
+            "runAndroidDagPhase1WGlesWindowPresentSmoke" -> runPhase1WGlesWindowPresentSmoke(args, result)
             else -> return false
         }
         return true
@@ -376,6 +378,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_SURFACE_SMOKE_FAILED",
                         "runAndroidDagPhase1VGlesSurfaceSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit W: Android GLES backend window-surface clear/swap presentation diagnostic ──
+    private fun runPhase1WGlesWindowPresentSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesWindowPresentSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_WINDOW_PRESENT_SMOKE_FAILED",
+                        "runAndroidDagPhase1WGlesWindowPresentSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

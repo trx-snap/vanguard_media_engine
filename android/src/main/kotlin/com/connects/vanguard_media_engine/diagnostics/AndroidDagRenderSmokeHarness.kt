@@ -890,4 +890,121 @@ object AndroidDagRenderSmokeHarness {
             "hasSurfaceAfterResize=false;detach=not_run;surfaceKindAfterDetach=none;widthAfterDetach=0;heightAfterDetach=0;" +
             "reattach=not_run;finalDetach=not_run;shutdown=not_run;idempotentShutdown=not_run;" +
             "import=not_run;renderFrame=not_run;proofBoundary=gles_window_surface_attach_detach_no_render;lastError=$reason"
+
+    // ── Phase 1-Unit W: Android GLES backend window-surface clear/swap presentation diagnostic ──
+    private const val RESULT_MARKER_PHASE1W = "ANDROID_GLES_BACKEND_UNIT_W_NATIVE_RESULT"
+
+    fun runGlesWindowPresentSmoke(width: Int = 64, height: Int = 64): Map<String, Any?> {
+        var surfaceTexture: SurfaceTexture? = null
+        var surface: Surface? = null
+        var raw = glesWindowPresentFailure("not_run", width, height)
+
+        try {
+            if (width <= 0 || height <= 0) {
+                raw = glesWindowPresentFailure("invalid_dimensions", width, height)
+                return parseGlesWindowPresentResult(raw)
+            }
+
+            surfaceTexture = SurfaceTexture(false).apply {
+                setDefaultBufferSize(width, height)
+            }
+            surface = Surface(surfaceTexture)
+
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1WGlesWindowPresentSmoke(
+                surface,
+                width,
+                height,
+            )
+            return parseGlesWindowPresentResult(raw)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = glesWindowPresentFailure("exception:$reason", width, height)
+            return parseGlesWindowPresentResult(raw)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1W $raw")
+            try {
+                surface?.release()
+            } catch (_: Throwable) {
+            }
+            try {
+                surfaceTexture?.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun parseGlesWindowPresentResult(raw: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val clientVersion = parsed["clientVersion"]?.toIntOrNull() ?: 0
+        val vendor = parsed["vendor"] ?: ""
+        val renderer = parsed["renderer"] ?: ""
+        val version = parsed["version"] ?: ""
+        val preAttachPresent = parsed["preAttachPresent"] ?: "not_run"
+        val preAttachLastError = parsed["preAttachLastError"] ?: ""
+        val attach = parsed["attach"] ?: "not_run"
+        val firstPresent = parsed["firstPresent"] ?: "not_run"
+        val secondPresent = parsed["secondPresent"] ?: "not_run"
+        val invalidColorPresent = parsed["invalidColorPresent"] ?: "not_run"
+        val invalidColorLastError = parsed["invalidColorLastError"] ?: ""
+        val hasSurfaceAfterPresent = parsed["hasSurfaceAfterPresent"]?.equals("true", ignoreCase = true) ?: false
+        val surfaceKindAfterPresent = parsed["surfaceKindAfterPresent"] ?: "none"
+        val widthAfterPresent = parsed["widthAfterPresent"]?.toIntOrNull() ?: 0
+        val heightAfterPresent = parsed["heightAfterPresent"]?.toIntOrNull() ?: 0
+        val detach = parsed["detach"] ?: "not_run"
+        val surfaceKindAfterDetach = parsed["surfaceKindAfterDetach"] ?: "none"
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val import = parsed["import"] ?: "not_run"
+        val renderFrame = parsed["renderFrame"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_window_clear_swap_no_import_no_renderFrame"
+        val lastError = parsed["lastError"] ?: ""
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "clientVersion" to clientVersion,
+            "vendor" to vendor,
+            "renderer" to renderer,
+            "version" to version,
+            "preAttachPresent" to preAttachPresent,
+            "preAttachLastError" to preAttachLastError,
+            "attach" to attach,
+            "firstPresent" to firstPresent,
+            "secondPresent" to secondPresent,
+            "invalidColorPresent" to invalidColorPresent,
+            "invalidColorLastError" to invalidColorLastError,
+            "hasSurfaceAfterPresent" to hasSurfaceAfterPresent,
+            "surfaceKindAfterPresent" to surfaceKindAfterPresent,
+            "widthAfterPresent" to widthAfterPresent,
+            "heightAfterPresent" to heightAfterPresent,
+            "detach" to detach,
+            "surfaceKindAfterDetach" to surfaceKindAfterDetach,
+            "shutdown" to shutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "import" to import,
+            "renderFrame" to renderFrame,
+            "proofBoundary" to proofBoundary,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun glesWindowPresentFailure(reason: String, width: Int, height: Int): String =
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;preAttachPresent=not_run;preAttachLastError=;" +
+            "attach=$reason;firstPresent=not_run;secondPresent=not_run;invalidColorPresent=not_run;invalidColorLastError=;" +
+            "hasSurfaceAfterPresent=false;surfaceKindAfterPresent=none;widthAfterPresent=0;heightAfterPresent=0;" +
+            "detach=not_run;surfaceKindAfterDetach=none;shutdown=not_run;idempotentShutdown=not_run;" +
+            "import=not_run;renderFrame=not_run;proofBoundary=gles_window_clear_swap_no_import_no_renderFrame;lastError=$reason"
 }

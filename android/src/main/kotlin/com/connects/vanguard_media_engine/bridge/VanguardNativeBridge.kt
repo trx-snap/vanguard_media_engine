@@ -132,6 +132,13 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // ── Phase 1-Unit W: Android GLES backend window-surface clear/swap presentation diagnostic ──
+    external fun runAndroidDagPhase1WGlesWindowPresentSmoke(
+        surface: Surface,
+        width: Int,
+        height: Int,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

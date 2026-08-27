@@ -1,4 +1,4 @@
-// Unit U/V: GlesBackend implementation.
+// Unit U/V/W: GlesBackend implementation.
 //
 // On Android (__ANDROID__):
 //   - EGL/GLES headers included here only, never in the public header.
@@ -11,6 +11,9 @@
 //     the offscreen pbuffer current whenever no window surface is attached.
 //     resizeSurface() cannot recreate the window surface (the backend does
 //     not store the native window) and always fails while attached.
+//   - Unit W: diagnosticPresentWindowClear() makes the attached window
+//     surface current, performs a diagnostic glClear + eglSwapBuffers, and
+//     restores no other surface (the window surface remains current).
 //
 // On non-Android host builds:
 //   - No EGL/GLES headers included.
@@ -18,6 +21,8 @@
 //     diagnostic fields reporting unavailable/stub state.
 //   - attachSurface()/resizeSurface() remain unavailable; hasSurface() is
 //     always false.
+//   - Unit W: diagnosticPresentWindowClear() on an initialized backend
+//     always fails with lastError="window_present_unavailable_on_host".
 
 #include "vanguard/render/gles_backend.h"
 
@@ -30,6 +35,7 @@
 #include <unistd.h>   // close()
 #endif
 
+#include <cmath>
 #include <string>
 
 namespace vanguard {
@@ -415,6 +421,61 @@ bool GlesBackend::hasSurface() const {
 #if defined(__ANDROID__)
     return impl_->windowSurface != EGL_NO_SURFACE;
 #else
+    return false;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Unit W: window-surface clear/swap presentation diagnostic.
+// ---------------------------------------------------------------------------
+
+namespace {
+bool isValidClearComponent(float value) {
+    return std::isfinite(value) && value >= 0.0f && value <= 1.0f;
+}
+} // namespace
+
+bool GlesBackend::diagnosticPresentWindowClear(float red, float green, float blue, float alpha) {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return false;
+    }
+
+#if defined(__ANDROID__)
+    if (!hasSurface()) {
+        impl_->lastError = "no_surface_attached";
+        return false;
+    }
+    if (!isValidClearComponent(red) || !isValidClearComponent(green) ||
+        !isValidClearComponent(blue) || !isValidClearComponent(alpha)) {
+        impl_->lastError = "invalid_clear_color";
+        return false;
+    }
+
+    if (eglMakeCurrent(impl_->display, impl_->windowSurface, impl_->windowSurface, impl_->context) != EGL_TRUE) {
+        impl_->lastError = "eglMakeCurrent failed for window clear";
+        return false;
+    }
+
+    glViewport(0, 0, static_cast<GLsizei>(impl_->surfaceWidth), static_cast<GLsizei>(impl_->surfaceHeight));
+    glClearColor(red, green, blue, alpha);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (glGetError() != GL_NO_ERROR) {
+        impl_->lastError = "diagnostic window glClear failed";
+        return false;
+    }
+
+    if (eglSwapBuffers(impl_->display, impl_->windowSurface) != EGL_TRUE) {
+        impl_->lastError = "diagnostic window eglSwapBuffers failed";
+        return false;
+    }
+
+    impl_->lastError.clear();
+    return true;
+#else
+    impl_->lastError = "window_present_unavailable_on_host";
     return false;
 #endif
 }

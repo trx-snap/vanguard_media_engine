@@ -6,10 +6,12 @@
 namespace vanguard {
 namespace render {
 
-// Phase Unit U/V: GlesBackend owns an offscreen EGL/GLES lifecycle on Android,
-// plus (Unit V) attach/detach of a window EGLSurface built from a borrowed
-// ANativeWindow*. EGL/GLES headers must never appear in this public header;
-// all such state lives exclusively in gles_backend.cpp behind the Impl pimpl.
+// Phase Unit U/V/W: GlesBackend owns an offscreen EGL/GLES lifecycle on
+// Android, plus (Unit V) attach/detach of a window EGLSurface built from a
+// borrowed ANativeWindow*, plus (Unit W) a diagnostic clear/swap presentation
+// on an already-attached window surface. EGL/GLES headers must never appear
+// in this public header; all such state lives exclusively in
+// gles_backend.cpp behind the Impl pimpl.
 class GlesBackend : public RenderBackend {
 public:
     GlesBackend();
@@ -89,6 +91,14 @@ public:
     // initialized with only the offscreen pbuffer current, or "none" when
     // not initialized.
     const char* activeSurfaceKind() const;
+
+    // Unit W: makes the already-attached window EGLSurface current, clears it
+    // to the given color, and swaps it, proving presentation on an attached
+    // window surface without importing or rendering any frame. Does not
+    // attach, detach, or destroy any surface. Returns false (with lastError
+    // set) when not initialized, when no window surface is attached, or when
+    // the color components are not finite values in [0.0, 1.0].
+    bool diagnosticPresentWindowClear(float red, float green, float blue, float alpha);
 
 private:
     struct Impl;
