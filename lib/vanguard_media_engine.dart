@@ -30,6 +30,8 @@ export 'vg_camera_zoom_capabilities.dart';
 export 'vg_camera_hardware_capability_report.dart';
 // Phase 3-Unit C: Android Camera2 readiness & fallback planner.
 export 'vg_camera2_readiness_plan.dart';
+// Phase 3-Unit E: Android Camera2 Session Configuration Eligibility Planner.
+export 'vg_camera2_session_configuration_plan.dart';
 
 // Phase 6D.3: typed recording result.
 export 'vg_recording_stats.dart';
