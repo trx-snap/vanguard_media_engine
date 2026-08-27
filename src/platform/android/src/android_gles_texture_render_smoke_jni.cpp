@@ -202,10 +202,15 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     jint     width,
     jint     height,
     jint     frameCount,
-    jlong    frameDurationUs) {
+    jlong    frameDurationUs,
+    jint     frameDelayMs) {
 
     const char* notRun  = "not_run";
     jlong       zeroPts = 0LL;
+    // Phase 1-Unit AY: diagnostic-only per-frame delay; clamp negative input
+    // to no delay rather than rejecting the call (AX omits this arg / sends
+    // 0, which must keep behaving identically).
+    const jint effectiveFrameDelayMs = (frameDelayMs > 0) ? frameDelayMs : 0;
 
     if (surface == nullptr || hardwareBuffer == nullptr ||
         width <= 0 || height <= 0 || frameCount <= 0 || frameDurationUs <= 0) {
@@ -358,6 +363,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                 if (renderResult == vanguard::render::RenderFrameResult::kSuccess ||
                     renderResult == vanguard::render::RenderFrameResult::kSuboptimal) {
                     renderedFrames++;
+                    if (effectiveFrameDelayMs > 0) {
+                        usleep(static_cast<useconds_t>(effectiveFrameDelayMs) * 1000);
+                    }
                 } else {
                     renderStatus = RenderFrameResultName(renderResult);
                     failingFrame = f;

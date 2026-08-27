@@ -27,6 +27,7 @@ class AndroidGlesTextureDagRenderSmokeHarness {
         private const val DEFAULT_HEIGHT = 64
         private const val DEFAULT_FRAME_COUNT = 30
         private const val DEFAULT_FRAME_DURATION_US = 33333L
+        private const val DEFAULT_FRAME_DELAY_MS = 0
         private const val PROOF_BOUNDARY =
             "gles_surfaceproducer_texture_dag_render_foundation_no_decoded_input_no_product_ui"
 
@@ -85,6 +86,10 @@ class AndroidGlesTextureDagRenderSmokeHarness {
         val frameCount = clampInt((args?.get("frameCount") as? Number)?.toInt(), DEFAULT_FRAME_COUNT)
         val frameDurationUs = (args?.get("frameDurationUs") as? Number)?.toLong()?.takeIf { it > 0 }
             ?: DEFAULT_FRAME_DURATION_US
+        // Phase 1-Unit AY: diagnostic-only per-frame delay so a dispose()
+        // call can be proven to land while the render worker is still
+        // active. Absent/non-positive defaults to 0, preserving AX behavior.
+        val frameDelayMs = clampInt((args?.get("frameDelayMs") as? Number)?.toInt(), DEFAULT_FRAME_DELAY_MS)
 
         var surface: Surface? = null
         var hardwareBuffer: HardwareBuffer? = null
@@ -124,6 +129,7 @@ class AndroidGlesTextureDagRenderSmokeHarness {
                 height,
                 frameCount,
                 frameDurationUs,
+                frameDelayMs,
             )
             return parseResult(raw)
         } catch (throwable: Throwable) {
