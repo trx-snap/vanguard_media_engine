@@ -53,6 +53,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ACGlesRenderFrameContentSmoke",
             "runAndroidDagPhase1ADGlesRenderFrameTransformMappingSmoke",
             "runAndroidDagPhase1AEGlesAcquireFenceSmoke",
+            "runAndroidDagPhase1AFGlesRgbxRenderFrameContentSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -92,6 +93,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ACGlesRenderFrameContentSmoke" -> runPhase1ACGlesRenderFrameContentSmoke(args, result)
             "runAndroidDagPhase1ADGlesRenderFrameTransformMappingSmoke" -> runPhase1ADGlesRenderFrameTransformMappingSmoke(args, result)
             "runAndroidDagPhase1AEGlesAcquireFenceSmoke" -> runPhase1AEGlesAcquireFenceSmoke(args, result)
+            "runAndroidDagPhase1AFGlesRgbxRenderFrameContentSmoke" -> runPhase1AFGlesRgbxRenderFrameContentSmoke(args, result)
             else -> return false
         }
         return true
@@ -552,6 +554,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_ACQUIRE_FENCE_SMOKE_FAILED",
                         "runAndroidDagPhase1AEGlesAcquireFenceSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AF: Android GLES RGBX AHardwareBuffer renderFrame content readback physical smoke ──
+    private fun runPhase1AFGlesRgbxRenderFrameContentSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesRgbxRenderFrameContentSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_RGBX_RENDER_FRAME_CONTENT_SMOKE_FAILED",
+                        "runAndroidDagPhase1AFGlesRgbxRenderFrameContentSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
