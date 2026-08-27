@@ -66,6 +66,8 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
         private const val CLOSE_WAIT_MS = 2000L
         private const val IMAGE_READER_MAX_IMAGES = 3
         private const val FENCE_AWAIT_MS = 1000L
+        private val VALID_LENS_FACINGS = setOf("front", "back", "external", "unknown")
+        private val VALID_SENSOR_ORIENTATIONS = setOf(0, 90, 180, 270)
     }
 
     // Instance-scoped so an external cancel() (from the coordinator's dispose
@@ -99,6 +101,8 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
         val apiLevel = Build.VERSION.SDK_INT
         val hasCameraPermission = hasCameraPermission()
         val requestedCameraId = (args?.get("cameraId") as? String)?.trim()
+        val rawLensFacing = (args?.get("lensFacing") as? String)?.trim()?.lowercase()
+        val requestedLensFacing = rawLensFacing?.takeIf { it.isNotBlank() }
         val timeoutMs = clampLong((args?.get("timeoutMs") as? Number)?.toLong(), DEFAULT_TIMEOUT_MS, MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)
         val maxWidth = clampInt((args?.get("maxWidth") as? Number)?.toInt(), DEFAULT_MAX_WIDTH, MIN_DIMENSION, MAX_DIMENSION)
         val maxHeight = clampInt((args?.get("maxHeight") as? Number)?.toInt(), DEFAULT_MAX_HEIGHT, MIN_DIMENSION, MAX_DIMENSION)
@@ -114,6 +118,7 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
         var selectedLensFacing = "unknown"
         var selectedWidth = 0
         var selectedHeight = 0
+        var selectedSensorOrientationDegrees = -1
 
         fun buildResult(
             decision: String,
@@ -161,7 +166,8 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
                 TAG,
                 "decision=$decision success=$success attemptedOpen=$attemptedOpen opened=$opened " +
                     "renderedFrames=$renderedFrames targetFrameCount=$targetFrameCount " +
-                    "cameraId=$selectedCameraId textureId=$textureId durationMs=$durationMs",
+                    "cameraId=$selectedCameraId selectedSensorOrientationDegrees=$selectedSensorOrientationDegrees " +
+                    "textureId=$textureId durationMs=$durationMs",
             )
             return mapOf(
                 "success" to success,
@@ -177,6 +183,7 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
                 "selectedLensFacing" to selectedLensFacing,
                 "selectedWidth" to selectedWidth,
                 "selectedHeight" to selectedHeight,
+                "selectedSensorOrientationDegrees" to selectedSensorOrientationDegrees,
                 "imageFormatName" to "PRIVATE",
                 "targetFrameCount" to targetFrameCount,
                 "renderedFrames" to renderedFrames,
@@ -237,10 +244,26 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
             return buildResult("noCamera")
         }
 
-        val cameraId: String = if (!requestedCameraId.isNullOrBlank()) {
+        // Guard 2a: nonblank invalid lensFacing fails closed only when requestedCameraId is blank/null.
+        if (requestedCameraId.isNullOrBlank() && requestedLensFacing != null && !VALID_LENS_FACINGS.contains(requestedLensFacing)) {
+            selectedLensFacing = requestedLensFacing
+            reasons.add("requested_lens_facing_invalid")
+            return buildResult("cameraUnavailable")
+        }
+
+        val cameraId: String? = if (!requestedCameraId.isNullOrBlank()) {
             requestedCameraId
+        } else if (requestedLensFacing != null) {
+            cameraIds.firstOrNull { lensFacingName(cameraManager, it) == requestedLensFacing }
         } else {
             cameraIds.firstOrNull { lensFacingName(cameraManager, it) == "back" } ?: cameraIds.first()
+        }
+
+        // Guard 2b: an explicitly requested lensFacing (no cameraId given) matched no camera.
+        if (cameraId == null) {
+            selectedLensFacing = requestedLensFacing ?: "unknown"
+            reasons.add("requested_lens_facing_not_found")
+            return buildResult("cameraUnavailable")
         }
         selectedCameraId = cameraId
         selectedLensFacing = lensFacingName(cameraManager, cameraId)
@@ -264,6 +287,18 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
             Log.w(TAG, "getCameraCharacteristics($cameraId) failed: ${t.javaClass.simpleName}: ${t.message}")
             diagnosticsMap["cameraCharacteristicsError"] = "${t.javaClass.simpleName}: ${t.message}"
             null
+        }
+        val sensorOrientation = try {
+            characteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION)
+        } catch (t: Throwable) {
+            Log.w(TAG, "SENSOR_ORIENTATION($cameraId) failed: ${t.javaClass.simpleName}: ${t.message}")
+            diagnosticsMap["sensorOrientationError"] = "${t.javaClass.simpleName}: ${t.message}"
+            null
+        }
+        if (sensorOrientation != null) {
+            selectedSensorOrientationDegrees = sensorOrientation
+        } else {
+            diagnosticsMap["sensorOrientationMissing"] = true
         }
         val streamConfigurationMap = try {
             characteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
@@ -485,7 +520,12 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
                                                 events.add("nativeRenderPassed:renderedFrames=$newCount")
                                                 if (newCount >= targetFrameCount) {
                                                     if (terminalReached.compareAndSet(false, true)) {
-                                                        decisionRef.set("textureNativeRenderLoopPassed")
+                                                        if (selectedSensorOrientationDegrees in VALID_SENSOR_ORIENTATIONS) {
+                                                            decisionRef.set("textureNativeRenderLoopPassed")
+                                                        } else {
+                                                            decisionRef.set("invalidSensorOrientation")
+                                                            reasons.add("invalid_sensor_orientation")
+                                                        }
                                                         frameLatch.countDown()
                                                     }
                                                 }

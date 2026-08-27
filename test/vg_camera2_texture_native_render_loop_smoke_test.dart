@@ -20,6 +20,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) => {
   'selectedLensFacing': 'back',
   'selectedWidth': 640,
   'selectedHeight': 480,
+  'selectedSensorOrientationDegrees': 90,
   'imageFormatName': 'PRIVATE',
   'targetFrameCount': 5,
   'renderedFrames': 5,
@@ -91,7 +92,7 @@ void main() {
   });
 
   group('VGCamera2TextureNativeRenderLoopSmokeDecision enum & fromRaw', () {
-    test('enum has exact expected 19 values in order', () {
+    test('enum has exact expected 20 values in order', () {
       expect(
         VGCamera2TextureNativeRenderLoopSmokeDecision.values,
         orderedEquals(const [
@@ -117,11 +118,13 @@ void main() {
           VGCamera2TextureNativeRenderLoopSmokeDecision.nativeRenderFailed,
           VGCamera2TextureNativeRenderLoopSmokeDecision.captureFailed,
           VGCamera2TextureNativeRenderLoopSmokeDecision.disposed,
+          VGCamera2TextureNativeRenderLoopSmokeDecision
+              .invalidSensorOrientation,
         ]),
       );
       expect(
         VGCamera2TextureNativeRenderLoopSmokeDecision.values.length,
-        equals(19),
+        equals(20),
       );
     });
 
@@ -179,6 +182,7 @@ void main() {
         expect(report.selectedLensFacing, equals('back'));
         expect(report.selectedWidth, equals(640));
         expect(report.selectedHeight, equals(480));
+        expect(report.selectedSensorOrientationDegrees, equals(90));
         expect(report.imageFormatName, equals('PRIVATE'));
         expect(report.targetFrameCount, equals(5));
         expect(report.renderedFrames, equals(5));
@@ -221,6 +225,7 @@ void main() {
         expect(report.isDisposed, isFalse);
         expect(report.isAttempted, isTrue);
         expect(report.completedTargetFrames, isTrue);
+        expect(report.hasValidSensorOrientation, isTrue);
         expect(report.isCleanedUp, isTrue);
 
         final serialized = report.toMap();
@@ -237,6 +242,7 @@ void main() {
         expect(serialized['selectedLensFacing'], equals('back'));
         expect(serialized['selectedWidth'], equals(640));
         expect(serialized['selectedHeight'], equals(480));
+        expect(serialized['selectedSensorOrientationDegrees'], equals(90));
         expect(serialized['imageFormatName'], equals('PRIVATE'));
         expect(serialized['targetFrameCount'], equals(5));
         expect(serialized['renderedFrames'], equals(5));
@@ -576,6 +582,7 @@ void main() {
               selectedLensFacing: 'unknown',
               selectedWidth: 0,
               selectedHeight: 0,
+              selectedSensorOrientationDegrees: -1,
               imageFormatName: 'PRIVATE',
               targetFrameCount: 0,
               renderedFrames: 0,
@@ -613,6 +620,7 @@ void main() {
           'apiLevel': 34.0,
           'selectedWidth': 640.0,
           'selectedHeight': 480.0,
+          'selectedSensorOrientationDegrees': 90.0,
           'targetFrameCount': 5.0,
           'renderedFrames': 5.0,
           'hardwareBufferFrameCount': 5.0,
@@ -637,6 +645,7 @@ void main() {
         expect(parsed.apiLevel, equals(34));
         expect(parsed.selectedWidth, equals(640));
         expect(parsed.selectedHeight, equals(480));
+        expect(parsed.selectedSensorOrientationDegrees, equals(90));
         expect(parsed.targetFrameCount, equals(5));
         expect(parsed.renderedFrames, equals(5));
         expect(parsed.hardwareBufferFrameCount, equals(5));
@@ -795,6 +804,28 @@ void main() {
         );
       },
     );
+
+    test(
+      'hasValidSensorOrientation accepts 0, 90, 180, 270 and rejects others',
+      () {
+        for (final valid in const [0, 90, 180, 270]) {
+          expect(
+            _createSampleReport({
+              'selectedSensorOrientationDegrees': valid,
+            }).hasValidSensorOrientation,
+            isTrue,
+          );
+        }
+        for (final invalid in const [-1, 45, 100, 360]) {
+          expect(
+            _createSampleReport({
+              'selectedSensorOrientationDegrees': invalid,
+            }).hasValidSensorOrientation,
+            isFalse,
+          );
+        }
+      },
+    );
   });
 
   group('VGCamera2TextureNativeRenderLoopSmokeReport value semantics', () {
@@ -815,6 +846,7 @@ void main() {
         'cameraId: 0',
         'selectedWidth: 640',
         'selectedHeight: 480',
+        'selectedSensorOrientationDegrees: 90',
         'targetFrameCount: 5',
         'renderedFrames: 5',
         'hardwareBufferFrameCount: 5',
@@ -870,6 +902,7 @@ void main() {
         {'selectedLensFacing': 'front'},
         {'selectedWidth': 1280},
         {'selectedHeight': 720},
+        {'selectedSensorOrientationDegrees': 270},
         {'imageFormatName': 'YUV_420_888'},
         {'targetFrameCount': 10},
         {'renderedFrames': 4},
@@ -1008,6 +1041,60 @@ void main() {
         expect(arguments['maxHeight'], equals(480));
         expect(arguments['frameCount'], equals(5));
       });
+
+      test('start trims and lowercases lensFacing to front', () async {
+        final call = await captureCall(
+          action: (channel) =>
+              VGCamera2TextureNativeRenderLoopSmokeReport.startAndroidCamera2TextureNativeRenderLoopSmoke(
+                lensFacing: ' Front ',
+                channel: channel,
+              ),
+          response: {'textureId': 42, 'targetFrameCount': 5},
+        );
+
+        expect(
+          call.method,
+          equals(
+            'startAndroidDagPhase3UnitMCameraTextureNativeRenderLoopSmoke',
+          ),
+        );
+        final arguments = call.arguments as Map<Object?, Object?>;
+        expect(arguments['lensFacing'], equals('front'));
+        expect(arguments.containsKey('cameraId'), isFalse);
+      });
+
+      test('start omits blank or whitespace-only lensFacing', () async {
+        final call = await captureCall(
+          action: (channel) =>
+              VGCamera2TextureNativeRenderLoopSmokeReport.startAndroidCamera2TextureNativeRenderLoopSmoke(
+                lensFacing: '   ',
+                channel: channel,
+              ),
+          response: {'textureId': 42, 'targetFrameCount': 5},
+        );
+
+        final arguments = call.arguments as Map<Object?, Object?>;
+        expect(arguments.containsKey('lensFacing'), isFalse);
+      });
+
+      test(
+        'start passes both nonblank cameraId and lensFacing so native can apply cameraId precedence',
+        () async {
+          final call = await captureCall(
+            action: (channel) =>
+                VGCamera2TextureNativeRenderLoopSmokeReport.startAndroidCamera2TextureNativeRenderLoopSmoke(
+                  cameraId: ' 1 ',
+                  lensFacing: ' Front ',
+                  channel: channel,
+                ),
+            response: {'textureId': 42, 'targetFrameCount': 5},
+          );
+
+          final arguments = call.arguments as Map<Object?, Object?>;
+          expect(arguments['cameraId'], equals('1'));
+          expect(arguments['lensFacing'], equals('front'));
+        },
+      );
 
       test(
         'start uses default vanguard_media_engine channel when omitted',

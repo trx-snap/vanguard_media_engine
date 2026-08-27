@@ -80,7 +80,12 @@ enum VGCamera2TextureNativeRenderLoopSmokeDecision {
   captureFailed,
 
   /// The run was cancelled via dispose before/while it was still active.
-  disposed;
+  disposed,
+
+  /// All target frames were rendered but the selected camera's
+  /// `CameraCharacteristics.SENSOR_ORIENTATION` was missing or not one of
+  /// 0/90/180/270; the run is not reported as passed.
+  invalidSensorOrientation;
 
   /// Maps a raw native decision string to the matching enum value, falling
   /// back to [captureFailed] for unrecognised/missing values.
@@ -114,6 +119,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
     required this.selectedLensFacing,
     required this.selectedWidth,
     required this.selectedHeight,
+    required this.selectedSensorOrientationDegrees,
     required this.imageFormatName,
     required this.targetFrameCount,
     required this.renderedFrames,
@@ -187,6 +193,10 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
 
   /// The selected `ImageReader` output height in pixels.
   final int selectedHeight;
+
+  /// The selected camera's `CameraCharacteristics.SENSOR_ORIENTATION` in
+  /// degrees, or `-1` if unavailable.
+  final int selectedSensorOrientationDegrees;
 
   /// Always `PRIVATE` for this harness.
   final String imageFormatName;
@@ -297,6 +307,10 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
   /// Whether the harness rendered at least the target number of frames.
   bool get completedTargetFrames => renderedFrames >= targetFrameCount;
 
+  /// Whether [selectedSensorOrientationDegrees] is one of 0/90/180/270.
+  bool get hasValidSensorOrientation =>
+      const <int>{0, 90, 180, 270}.contains(selectedSensorOrientationDegrees);
+
   /// Whether the capture session, device, ImageReader, and native session
   /// were all confirmed torn down.
   bool get isCleanedUp =>
@@ -326,6 +340,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
         selectedLensFacing: 'unknown',
         selectedWidth: 0,
         selectedHeight: 0,
+        selectedSensorOrientationDegrees: -1,
         imageFormatName: 'PRIVATE',
         targetFrameCount: 0,
         renderedFrames: 0,
@@ -397,6 +412,8 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
       selectedLensFacing: (raw['selectedLensFacing'] as String?) ?? 'unknown',
       selectedWidth: (raw['selectedWidth'] as num?)?.toInt() ?? 0,
       selectedHeight: (raw['selectedHeight'] as num?)?.toInt() ?? 0,
+      selectedSensorOrientationDegrees:
+          (raw['selectedSensorOrientationDegrees'] as num?)?.toInt() ?? -1,
       imageFormatName: (raw['imageFormatName'] as String?) ?? 'PRIVATE',
       targetFrameCount: (raw['targetFrameCount'] as num?)?.toInt() ?? 0,
       renderedFrames: (raw['renderedFrames'] as num?)?.toInt() ?? 0,
@@ -446,6 +463,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
       'selectedLensFacing': selectedLensFacing,
       'selectedWidth': selectedWidth,
       'selectedHeight': selectedHeight,
+      'selectedSensorOrientationDegrees': selectedSensorOrientationDegrees,
       'imageFormatName': imageFormatName,
       'targetFrameCount': targetFrameCount,
       'renderedFrames': renderedFrames,
@@ -492,9 +510,13 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
   /// library does not install one on the shared channel, which is owned by
   /// `VanguardChannelDispatcher`).
   ///
-  /// [cameraId] selects a specific camera id; omit or pass blank to let the
-  /// native harness select the first back-facing camera (falling back to the
-  /// first camera in `getCameraIdList()`).
+  /// [cameraId] selects a specific camera id taking precedence over [lensFacing];
+  /// omit or pass blank to let [lensFacing] or the default fallback determine
+  /// the camera.
+  ///
+  /// [lensFacing] optionally selects camera facing (`front`, `back`, `external`,
+  /// `unknown`); ignored when [cameraId] is nonblank. Omit or pass blank to
+  /// default to back-facing selection.
   ///
   /// [timeout] bounds how long the harness waits for each lifecycle stage to
   /// reach a terminal state; the native side clamps this to 3–30 seconds.
@@ -511,6 +533,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
   static Future<({int textureId, int targetFrameCount})>
   startAndroidCamera2TextureNativeRenderLoopSmoke({
     String? cameraId,
+    String? lensFacing,
     Duration timeout = const Duration(seconds: 10),
     int maxWidth = 640,
     int maxHeight = 480,
@@ -518,8 +541,13 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
     MethodChannel? channel,
   }) async {
     final ch = channel ?? _defaultChannel;
+    final trimmedCameraId = cameraId?.trim();
+    final normalizedLensFacing = lensFacing?.trim().toLowerCase();
     final args = <String, Object?>{
-      if (cameraId != null && cameraId.trim().isNotEmpty) 'cameraId': cameraId,
+      if (trimmedCameraId != null && trimmedCameraId.isNotEmpty)
+        'cameraId': trimmedCameraId,
+      if (normalizedLensFacing != null && normalizedLensFacing.isNotEmpty)
+        'lensFacing': normalizedLensFacing,
       'timeoutMs': timeout.inMilliseconds,
       'maxWidth': maxWidth,
       'maxHeight': maxHeight,
@@ -568,6 +596,8 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
         other.selectedLensFacing == selectedLensFacing &&
         other.selectedWidth == selectedWidth &&
         other.selectedHeight == selectedHeight &&
+        other.selectedSensorOrientationDegrees ==
+            selectedSensorOrientationDegrees &&
         other.imageFormatName == imageFormatName &&
         other.targetFrameCount == targetFrameCount &&
         other.renderedFrames == renderedFrames &&
@@ -611,6 +641,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
       selectedLensFacing,
       selectedWidth,
       selectedHeight,
+      selectedSensorOrientationDegrees,
       imageFormatName,
       targetFrameCount,
       renderedFrames,
@@ -665,6 +696,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
       'selectedLensFacing: $selectedLensFacing, '
       'selectedWidth: $selectedWidth, '
       'selectedHeight: $selectedHeight, '
+      'selectedSensorOrientationDegrees: $selectedSensorOrientationDegrees, '
       'imageFormatName: $imageFormatName, '
       'targetFrameCount: $targetFrameCount, '
       'renderedFrames: $renderedFrames, '
