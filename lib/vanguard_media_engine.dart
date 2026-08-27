@@ -28,6 +28,8 @@ export 'vg_multicam_preview.dart';
 export 'vg_camera_zoom_capabilities.dart';
 // Phase 3-Unit A: Android Camera2 hardware/thermal capability probe report.
 export 'vg_camera_hardware_capability_report.dart';
+// Phase 3-Unit C: Android Camera2 readiness & fallback planner.
+export 'vg_camera2_readiness_plan.dart';
 
 // Phase 6D.3: typed recording result.
 export 'vg_recording_stats.dart';
