@@ -63,6 +63,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AMGlesRenderFenceChainSmoke",
             "runAndroidDagPhase1ANGlesAcquireFenceRenderContentSmoke",
             "runAndroidDagPhase1ARGlesExternalTextureSmoke",
+            "runAndroidDagPhase1ASGlesTwoTextureCompositorSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -112,6 +113,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AMGlesRenderFenceChainSmoke" -> runPhase1AMGlesRenderFenceChainSmoke(args, result)
             "runAndroidDagPhase1ANGlesAcquireFenceRenderContentSmoke" -> runPhase1ANGlesAcquireFenceRenderContentSmoke(args, result)
             "runAndroidDagPhase1ARGlesExternalTextureSmoke" -> runPhase1ARGlesExternalTextureSmoke(args, result)
+            "runAndroidDagPhase1ASGlesTwoTextureCompositorSmoke" -> runPhase1ASGlesTwoTextureCompositorSmoke(args, result)
             else -> return false
         }
         return true
@@ -768,6 +770,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_EXTERNAL_TEXTURE_SMOKE_FAILED",
                         "runAndroidDagPhase1ARGlesExternalTextureSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AS: Android GLES two-texture compositor RGBA blend foundation smoke ──
+    private fun runPhase1ASGlesTwoTextureCompositorSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidGlesTwoTextureCompositorSmokeHarness.runGlesTwoTextureCompositorSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_TWO_TEXTURE_COMPOSITOR_SMOKE_FAILED",
+                        "runAndroidDagPhase1ASGlesTwoTextureCompositorSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

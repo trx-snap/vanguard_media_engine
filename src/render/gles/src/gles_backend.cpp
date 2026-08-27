@@ -54,6 +54,19 @@
 //     eglSwapBuffers, so a physical harness can pair it with
 //     diagnosticReadPixels() against the still-unswapped window surface to
 //     verify rendered texture content before presentation.
+//   - Unit AS: diagnosticCompositeFramesForReadback() and
+//     diagnosticPresentCompositeFrames() resolve handleA/handleB to their
+//     imported textures/targets via the same ahbImports lookup as
+//     renderFrame(), then delegate to the private GlesTwoTextureCompositor
+//     helper to draw them composited into a single full-window quad via
+//     gl_FragColor = mix(colorA, colorB, weightB), each texture's UVs
+//     independently mapped through transformA/transformB. The readback
+//     variant omits eglSwapBuffers (pair with diagnosticReadPixels()); the
+//     present variant swaps. Unit AS is a two-texture GL_TEXTURE_2D
+//     composition foundation only: the compositor fails closed on any
+//     non-GL_TEXTURE_2D target (including GL_TEXTURE_EXTERNAL_OES per Unit
+//     AR). No external/OES mixed composition, no timeline DAG integration,
+//     no transitions/PiP, no product UI.
 //
 // On non-Android host builds:
 //   - No EGL/GLES headers included.
@@ -73,10 +86,16 @@
 //   - Unit AC: diagnosticRenderFrameForReadback() on an initialized backend
 //     always fails with
 //     lastError="diagnostic_render_frame_readback_unavailable_on_host".
+//   - Unit AS: diagnosticCompositeFramesForReadback() and
+//     diagnosticPresentCompositeFrames() on an initialized backend always
+//     fail with lastError="diagnostic_composite_frames_readback_unavailable_on_host"
+//     / "diagnostic_present_composite_frames_unavailable_on_host"
+//     respectively.
 
 #include "vanguard/render/gles_backend.h"
 #include "gles_hardware_buffer_imports.h"
 #include "gles_texture_frame_renderer.h"
+#include "gles_two_texture_compositor.h"
 
 #if defined(__ANDROID__)
 #include <EGL/egl.h>
@@ -125,6 +144,13 @@ struct GlesBackend::Impl {
     // non-Android host builds.
     std::unique_ptr<GlesTextureFrameRenderer> textureFrameRenderer =
         std::make_unique<GlesTextureFrameRenderer>();
+
+    // Unit AS: two-texture GL_TEXTURE_2D composition draw helper for
+    // diagnosticCompositeFramesForReadback()/diagnosticPresentCompositeFrames().
+    // Owned regardless of platform; preserves safe unavailable-stub behavior
+    // on non-Android host builds.
+    std::unique_ptr<GlesTwoTextureCompositor> twoTextureCompositor =
+        std::make_unique<GlesTwoTextureCompositor>();
 };
 
 // ---------------------------------------------------------------------------
@@ -973,6 +999,131 @@ bool GlesBackend::diagnosticRenderFrameForReadback(HardwareBufferHandle handle,
     (void)handle;
     (void)transform;
     impl_->lastError = "diagnostic_render_frame_readback_unavailable_on_host";
+    return false;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Unit AS: diagnostic two-texture GL_TEXTURE_2D composition seams. Both
+// resolve handleA/handleB to their imported textures/targets via the same
+// ahbImports lookup as renderFrame(), then delegate to the private
+// GlesTwoTextureCompositor helper, which fails closed
+// ("gles_two_texture_compositor_unsupported_texture_target") on any
+// non-GL_TEXTURE_2D target -- no external/OES mixed composition, no timeline
+// DAG integration, no transitions/PiP, no product UI.
+// ---------------------------------------------------------------------------
+
+bool GlesBackend::diagnosticCompositeFramesForReadback(HardwareBufferHandle handleA,
+                                                        HardwareBufferHandle handleB,
+                                                        float weightB,
+                                                        const VideoFrameTransform& transformA,
+                                                        const VideoFrameTransform& transformB) {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return false;
+    }
+
+#if defined(__ANDROID__)
+    if (!hasSurface()) {
+        impl_->lastError = "no_surface_attached";
+        return false;
+    }
+
+    const uint32_t textureA = impl_->ahbImports->textureForHandle(handleA);
+    const uint32_t textureTargetA = impl_->ahbImports->textureTargetForHandle(handleA);
+    const uint32_t textureB = impl_->ahbImports->textureForHandle(handleB);
+    const uint32_t textureTargetB = impl_->ahbImports->textureTargetForHandle(handleB);
+    if (textureA == 0 || textureTargetA == 0 || textureB == 0 || textureTargetB == 0) {
+        impl_->lastError = "invalid_buffer_handle";
+        return false;
+    }
+
+    if (eglMakeCurrent(impl_->display, impl_->windowSurface, impl_->windowSurface, impl_->context) != EGL_TRUE) {
+        impl_->lastError = "diagnostic_composite_frames_readback_make_current_failed";
+        return false;
+    }
+
+    std::string drawError;
+    const bool drawOk = impl_->twoTextureCompositor->drawCompositedQuad(
+        textureA, textureTargetA, textureB, textureTargetB,
+        impl_->surfaceWidth, impl_->surfaceHeight, weightB,
+        transformA, transformB, &drawError);
+    if (!drawOk) {
+        impl_->lastError = !drawError.empty() ? drawError : "diagnostic_composite_frames_readback_draw_failed";
+        return false;
+    }
+
+    impl_->lastError.clear();
+    return true;
+#else
+    (void)handleA;
+    (void)handleB;
+    (void)weightB;
+    (void)transformA;
+    (void)transformB;
+    impl_->lastError = "diagnostic_composite_frames_readback_unavailable_on_host";
+    return false;
+#endif
+}
+
+bool GlesBackend::diagnosticPresentCompositeFrames(HardwareBufferHandle handleA,
+                                                    HardwareBufferHandle handleB,
+                                                    float weightB,
+                                                    const VideoFrameTransform& transformA,
+                                                    const VideoFrameTransform& transformB) {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return false;
+    }
+
+#if defined(__ANDROID__)
+    if (!hasSurface()) {
+        impl_->lastError = "no_surface_attached";
+        return false;
+    }
+
+    const uint32_t textureA = impl_->ahbImports->textureForHandle(handleA);
+    const uint32_t textureTargetA = impl_->ahbImports->textureTargetForHandle(handleA);
+    const uint32_t textureB = impl_->ahbImports->textureForHandle(handleB);
+    const uint32_t textureTargetB = impl_->ahbImports->textureTargetForHandle(handleB);
+    if (textureA == 0 || textureTargetA == 0 || textureB == 0 || textureTargetB == 0) {
+        impl_->lastError = "invalid_buffer_handle";
+        return false;
+    }
+
+    if (eglMakeCurrent(impl_->display, impl_->windowSurface, impl_->windowSurface, impl_->context) != EGL_TRUE) {
+        impl_->lastError = "diagnostic_present_composite_frames_make_current_failed";
+        return false;
+    }
+
+    std::string drawError;
+    const bool drawOk = impl_->twoTextureCompositor->drawCompositedQuad(
+        textureA, textureTargetA, textureB, textureTargetB,
+        impl_->surfaceWidth, impl_->surfaceHeight, weightB,
+        transformA, transformB, &drawError);
+    if (!drawOk) {
+        impl_->lastError = !drawError.empty() ? drawError : "diagnostic_present_composite_frames_draw_failed";
+        return false;
+    }
+
+    if (eglSwapBuffers(impl_->display, impl_->windowSurface) != EGL_TRUE) {
+        impl_->lastError = "diagnostic_present_composite_frames_swap_failed";
+        return false;
+    }
+
+    impl_->lastError.clear();
+    return true;
+#else
+    (void)handleA;
+    (void)handleB;
+    (void)weightB;
+    (void)transformA;
+    (void)transformB;
+    impl_->lastError = "diagnostic_present_composite_frames_unavailable_on_host";
     return false;
 #endif
 }

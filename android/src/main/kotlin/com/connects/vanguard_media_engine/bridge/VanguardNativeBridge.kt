@@ -264,6 +264,16 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // ── Phase 1-Unit AS: Android GLES two-texture compositor RGBA blend foundation smoke ──
+    external fun runAndroidDagPhase1ASGlesTwoTextureCompositorSmoke(
+        surface: Surface,
+        bufferA: HardwareBuffer,
+        bufferB: HardwareBuffer,
+        ycbcrBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
