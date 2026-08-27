@@ -210,6 +210,14 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // ── Phase 1-Unit AH: Android GLES YCBCR_420_888 AHardwareBuffer import guard fail-closed physical proof ──
+    external fun runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke(
+        validBuffer: HardwareBuffer,
+        ycbcrBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

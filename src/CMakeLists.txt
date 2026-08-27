@@ -77,6 +77,7 @@ if (ANDROID)
     "platform/android/src/android_gles_acquire_fence_smoke_jni.cpp"
     "platform/android/src/android_gles_rgbx_render_frame_content_smoke_jni.cpp"
     "platform/android/src/android_gles_import_guard_smoke_jni.cpp"
+    "platform/android/src/android_gles_ycbcr_import_guard_smoke_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
 

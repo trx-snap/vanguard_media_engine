@@ -2779,4 +2779,191 @@ object AndroidDagRenderSmokeHarness {
             "validPostImport=not_run;validPostHandle=0;validPostDescWidth=0;validPostDescHeight=0;validPostDescLayers=0;validPostDescFormat=0;" +
             "validPostDescUsageSampled=false;hasValidPostAfterImport=false;validPostRelease=not_run;validPostReleaseFence=-1;hasValidPostAfterRelease=false;" +
             "shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_ahb_import_guard_fail_closed_no_yuv_no_oes_no_release_fence_no_product;lastError=$reason"
+
+    // ── Phase 1-Unit AH: Android GLES YCBCR_420_888 AHardwareBuffer import guard fail-closed physical proof ──
+    private const val RESULT_MARKER_PHASE1AH = "ANDROID_GLES_YCBCR_IMPORT_GUARD_UNIT_AH_NATIVE_RESULT"
+
+    fun runGlesYcbcrImportGuardSmoke(width: Int = 64, height: Int = 64): Map<String, Any?> {
+        var validRgbaBuffer: HardwareBuffer? = null
+        var ycbcrBuffer: HardwareBuffer? = null
+        var ycbcrAllocation = "not_run"
+        var raw = glesYcbcrImportGuardFailure("not_run", "not_run")
+
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                raw = glesYcbcrImportGuardFailure("api_below_26", "not_run")
+                return parseGlesYcbcrImportGuardResult(raw, "not_run")
+            }
+            if (width <= 0 || height <= 0) {
+                raw = glesYcbcrImportGuardFailure("invalid_dimensions", "not_run")
+                return parseGlesYcbcrImportGuardResult(raw, "not_run")
+            }
+
+            validRgbaBuffer = HardwareBuffer.create(
+                width,
+                height,
+                HardwareBuffer.RGBA_8888,
+                1,
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+            )
+
+            try {
+                ycbcrBuffer = HardwareBuffer.create(
+                    width,
+                    height,
+                    HardwareBuffer.YCBCR_420_888,
+                    1,
+                    HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+                )
+                ycbcrAllocation = "success"
+            } catch (t: Throwable) {
+                val excReason = t.javaClass.simpleName.ifEmpty { "allocation_exception" }
+                ycbcrAllocation = "exception:$excReason"
+                raw = glesYcbcrImportGuardFailure("ycbcr_allocation_failed", ycbcrAllocation)
+                return parseGlesYcbcrImportGuardResult(raw, ycbcrAllocation)
+            }
+
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke(
+                validRgbaBuffer,
+                ycbcrBuffer,
+                width,
+                height,
+            )
+            return parseGlesYcbcrImportGuardResult(raw, ycbcrAllocation)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = glesYcbcrImportGuardFailure("exception:$reason", ycbcrAllocation)
+            return parseGlesYcbcrImportGuardResult(raw, ycbcrAllocation)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1AH $raw")
+            try {
+                validRgbaBuffer?.close()
+            } catch (_: Throwable) {
+            }
+            try {
+                ycbcrBuffer?.close()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun parseGlesYcbcrImportGuardResult(raw: String, ycbcrAllocation: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val clientVersion = parsed["clientVersion"]?.toIntOrNull() ?: 0
+        val vendor = parsed["vendor"] ?: ""
+        val renderer = parsed["renderer"] ?: ""
+        val version = parsed["version"] ?: ""
+        val validBufferDescribe = parsed["validBufferDescribe"] ?: "not_run"
+        val validBufferFormat = parsed["validBufferFormat"]?.toIntOrNull() ?: 0
+        val validBufferUsage = parsed["validBufferUsage"]?.toLongOrNull() ?: 0L
+        val ycbcrBufferDescribe = parsed["ycbcrBufferDescribe"] ?: "not_run"
+        val ycbcrBufferFormat = parsed["ycbcrBufferFormat"]?.toIntOrNull() ?: 0
+        val ycbcrBufferUsage = parsed["ycbcrBufferUsage"]?.toLongOrNull() ?: 0L
+        val ycbcrFormatIs420888 = parsed["ycbcrFormatIs420888"]?.equals("true", ignoreCase = true) ?: false
+        val initialize = parsed["initialize"] ?: "not_run"
+        val validPreImport = parsed["validPreImport"] ?: "not_run"
+        val validPreHandle = parsed["validPreHandle"]?.toLongOrNull() ?: 0L
+        val validPreDescWidth = parsed["validPreDescWidth"]?.toIntOrNull() ?: 0
+        val validPreDescHeight = parsed["validPreDescHeight"]?.toIntOrNull() ?: 0
+        val validPreDescLayers = parsed["validPreDescLayers"]?.toIntOrNull() ?: 0
+        val validPreDescFormat = parsed["validPreDescFormat"]?.toIntOrNull() ?: 0
+        val validPreDescUsageSampled = parsed["validPreDescUsageSampled"]?.equals("true", ignoreCase = true) ?: false
+        val hasValidPreAfterImport = parsed["hasValidPreAfterImport"]?.equals("true", ignoreCase = true) ?: false
+        val validPreRelease = parsed["validPreRelease"] ?: "not_run"
+        val validPreReleaseFence = parsed["validPreReleaseFence"]?.toIntOrNull() ?: -1
+        val hasValidPreAfterRelease = parsed["hasValidPreAfterRelease"]?.equals("true", ignoreCase = true) ?: false
+        val ycbcrImport = parsed["ycbcrImport"] ?: "not_run"
+        val ycbcrHandle = parsed["ycbcrHandle"]?.toLongOrNull() ?: 0L
+        val ycbcrDescZero = parsed["ycbcrDescZero"]?.equals("true", ignoreCase = true) ?: false
+        val ycbcrLastError = parsed["ycbcrLastError"] ?: ""
+        val hasYcbcrAfterImport = parsed["hasYcbcrAfterImport"]?.equals("true", ignoreCase = true) ?: false
+        val validPostImport = parsed["validPostImport"] ?: "not_run"
+        val validPostHandle = parsed["validPostHandle"]?.toLongOrNull() ?: 0L
+        val validPostDescWidth = parsed["validPostDescWidth"]?.toIntOrNull() ?: 0
+        val validPostDescHeight = parsed["validPostDescHeight"]?.toIntOrNull() ?: 0
+        val validPostDescLayers = parsed["validPostDescLayers"]?.toIntOrNull() ?: 0
+        val validPostDescFormat = parsed["validPostDescFormat"]?.toIntOrNull() ?: 0
+        val validPostDescUsageSampled = parsed["validPostDescUsageSampled"]?.equals("true", ignoreCase = true) ?: false
+        val hasValidPostAfterImport = parsed["hasValidPostAfterImport"]?.equals("true", ignoreCase = true) ?: false
+        val validPostRelease = parsed["validPostRelease"] ?: "not_run"
+        val validPostReleaseFence = parsed["validPostReleaseFence"]?.toIntOrNull() ?: -1
+        val hasValidPostAfterRelease = parsed["hasValidPostAfterRelease"]?.equals("true", ignoreCase = true) ?: false
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_ycbcr_ahb_import_guard_fail_closed_no_oes_no_release_fence_no_product"
+        val lastError = parsed["lastError"] ?: ""
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "ycbcrAllocation" to ycbcrAllocation,
+            "clientVersion" to clientVersion,
+            "vendor" to vendor,
+            "renderer" to renderer,
+            "version" to version,
+            "validBufferDescribe" to validBufferDescribe,
+            "validBufferFormat" to validBufferFormat,
+            "validBufferUsage" to validBufferUsage,
+            "ycbcrBufferDescribe" to ycbcrBufferDescribe,
+            "ycbcrBufferFormat" to ycbcrBufferFormat,
+            "ycbcrBufferUsage" to ycbcrBufferUsage,
+            "ycbcrFormatIs420888" to ycbcrFormatIs420888,
+            "initialize" to initialize,
+            "validPreImport" to validPreImport,
+            "validPreHandle" to validPreHandle,
+            "validPreDescWidth" to validPreDescWidth,
+            "validPreDescHeight" to validPreDescHeight,
+            "validPreDescLayers" to validPreDescLayers,
+            "validPreDescFormat" to validPreDescFormat,
+            "validPreDescUsageSampled" to validPreDescUsageSampled,
+            "hasValidPreAfterImport" to hasValidPreAfterImport,
+            "validPreRelease" to validPreRelease,
+            "validPreReleaseFence" to validPreReleaseFence,
+            "hasValidPreAfterRelease" to hasValidPreAfterRelease,
+            "ycbcrImport" to ycbcrImport,
+            "ycbcrHandle" to ycbcrHandle,
+            "ycbcrDescZero" to ycbcrDescZero,
+            "ycbcrLastError" to ycbcrLastError,
+            "hasYcbcrAfterImport" to hasYcbcrAfterImport,
+            "validPostImport" to validPostImport,
+            "validPostHandle" to validPostHandle,
+            "validPostDescWidth" to validPostDescWidth,
+            "validPostDescHeight" to validPostDescHeight,
+            "validPostDescLayers" to validPostDescLayers,
+            "validPostDescFormat" to validPostDescFormat,
+            "validPostDescUsageSampled" to validPostDescUsageSampled,
+            "hasValidPostAfterImport" to hasValidPostAfterImport,
+            "validPostRelease" to validPostRelease,
+            "validPostReleaseFence" to validPostReleaseFence,
+            "hasValidPostAfterRelease" to hasValidPostAfterRelease,
+            "shutdown" to shutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "proofBoundary" to proofBoundary,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun glesYcbcrImportGuardFailure(reason: String, ycbcrAllocation: String): String =
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;validBufferDescribe=not_run;validBufferFormat=0;validBufferUsage=0;" +
+            "ycbcrBufferDescribe=not_run;ycbcrBufferFormat=0;ycbcrBufferUsage=0;ycbcrFormatIs420888=false;" +
+            "ycbcrAllocation=$ycbcrAllocation;" +
+            "initialize=not_run;validPreImport=not_run;validPreHandle=0;validPreDescWidth=0;validPreDescHeight=0;validPreDescLayers=0;validPreDescFormat=0;" +
+            "validPreDescUsageSampled=false;hasValidPreAfterImport=false;validPreRelease=not_run;validPreReleaseFence=-1;hasValidPreAfterRelease=false;" +
+            "ycbcrImport=not_run;ycbcrHandle=0;ycbcrDescZero=false;ycbcrLastError=none;hasYcbcrAfterImport=false;" +
+            "validPostImport=not_run;validPostHandle=0;validPostDescWidth=0;validPostDescHeight=0;validPostDescLayers=0;validPostDescFormat=0;" +
+            "validPostDescUsageSampled=false;hasValidPostAfterImport=false;validPostRelease=not_run;validPostReleaseFence=-1;hasValidPostAfterRelease=false;" +
+            "shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_ycbcr_ahb_import_guard_fail_closed_no_oes_no_release_fence_no_product;lastError=$reason"
 }

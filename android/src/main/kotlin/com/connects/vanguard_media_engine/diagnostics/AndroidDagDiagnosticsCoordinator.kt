@@ -55,6 +55,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AEGlesAcquireFenceSmoke",
             "runAndroidDagPhase1AFGlesRgbxRenderFrameContentSmoke",
             "runAndroidDagPhase1AGGlesImportGuardSmoke",
+            "runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -96,6 +97,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AEGlesAcquireFenceSmoke" -> runPhase1AEGlesAcquireFenceSmoke(args, result)
             "runAndroidDagPhase1AFGlesRgbxRenderFrameContentSmoke" -> runPhase1AFGlesRgbxRenderFrameContentSmoke(args, result)
             "runAndroidDagPhase1AGGlesImportGuardSmoke" -> runPhase1AGGlesImportGuardSmoke(args, result)
+            "runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke" -> runPhase1AHGlesYcbcrImportGuardSmoke(args, result)
             else -> return false
         }
         return true
@@ -596,6 +598,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_IMPORT_GUARD_SMOKE_FAILED",
                         "runAndroidDagPhase1AGGlesImportGuardSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AH: Android GLES YCBCR_420_888 AHardwareBuffer import guard fail-closed physical proof ──
+    private fun runPhase1AHGlesYcbcrImportGuardSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesYcbcrImportGuardSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_YCBCR_IMPORT_GUARD_SMOKE_FAILED",
+                        "runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
