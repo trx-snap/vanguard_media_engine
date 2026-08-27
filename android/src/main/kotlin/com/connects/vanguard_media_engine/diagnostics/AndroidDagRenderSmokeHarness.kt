@@ -281,6 +281,7 @@ object AndroidDagRenderSmokeHarness {
             diagnostics.logCapabilities(report)
 
             val pass = report.vulkanSupported &&
+                report.glesSupported &&
                 report.selectedBackend == 0 &&
                 report.fallbackReason == "none" &&
                 report.profileGateStatus == "avp2022_partial_pass" &&
@@ -295,6 +296,7 @@ object AndroidDagRenderSmokeHarness {
             val result = mapOf<String, Any?>(
                 "pass" to pass,
                 "vulkanSupported" to report.vulkanSupported,
+                "glesSupported" to report.glesSupported,
                 "selectedBackend" to report.selectedBackend,
                 "fallbackReason" to report.fallbackReason,
                 "gpuVendor" to report.gpuVendor,
@@ -313,6 +315,7 @@ object AndroidDagRenderSmokeHarness {
             val result = mapOf<String, Any?>(
                 "pass" to false,
                 "vulkanSupported" to false,
+                "glesSupported" to false,
                 "selectedBackend" to 2,
                 "fallbackReason" to "exception:$simpleName",
                 "gpuVendor" to "",

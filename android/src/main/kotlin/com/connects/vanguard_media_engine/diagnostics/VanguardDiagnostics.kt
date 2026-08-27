@@ -5,6 +5,7 @@ import android.util.Log
 class VanguardDiagnostics {
     fun logCapabilities(report: BackendCapabilityReport) {
         Log.i(TAG, "capability: vulkan=${report.vulkanSupported}" +
+            " gles=${report.glesSupported}" +
             " backend=${report.selectedBackend}" +
             " fallback=${report.fallbackReason}" +
             " vendor=${report.gpuVendor}" +

@@ -238,8 +238,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_probeCapab
     jclass reportClass = env->FindClass("com/connects/vanguard_media_engine/diagnostics/BackendCapabilityReport");
     if (!reportClass) return nullptr;
 
-    // Descriptor matches the Phase 2Q Kotlin constructor field order:
+    // Descriptor matches the Phase 2Q / Unit T Kotlin constructor field order:
     //   vulkanSupported: Boolean  -> Z
+    //   glesSupported: Boolean    -> Z
     //   selectedBackend: Int      -> I
     //   fallbackReason: String    -> Ljava/lang/String;
     //   gpuVendor: String         -> Ljava/lang/String;
@@ -252,7 +253,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_probeCapab
     //   blacklistStatus: String   -> Ljava/lang/String;
     jmethodID ctor = env->GetMethodID(
         reportClass, "<init>",
-        "(ZILjava/lang/String;Ljava/lang/String;Ljava/lang/String;JJJJLjava/lang/String;Ljava/lang/String;)V");
+        "(ZZILjava/lang/String;Ljava/lang/String;Ljava/lang/String;JJJJLjava/lang/String;Ljava/lang/String;)V");
     if (!ctor) return nullptr;
 
     int selectedInt = (caps.selected == vanguard::render::RenderBackendType::kVulkan) ? 0 :
@@ -267,6 +268,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_probeCapab
     jobject report = env->NewObject(
         reportClass, ctor,
         static_cast<jboolean>(caps.vulkanSupported),
+        static_cast<jboolean>(caps.glesSupported),
         static_cast<jint>(selectedInt),
         fallbackReasonStr,
         gpuVendorStr,
