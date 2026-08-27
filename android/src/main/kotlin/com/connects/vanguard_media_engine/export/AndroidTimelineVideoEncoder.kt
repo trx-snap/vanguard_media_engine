@@ -19,6 +19,10 @@ import android.view.Surface
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.FloatBuffer
+import kotlin.math.cos
+import kotlin.math.min
+import kotlin.math.sin
 
 // ── AndroidTimelineVideoEncoder (Export Unit C) ───────────────────────────────
 //
@@ -44,10 +48,16 @@ import java.nio.ByteOrder
 // bookkeeping.
 //
 // Guardrails enforced upstream by AndroidTimelineExportSession (not here):
-// video-only clips, speed == 1.0, zero rotation, identical decoded
-// width/height across clips and matching the requested output width/height.
-// This encoder therefore never scales, rotates, or crops -- it is a 1:1
-// pixel passthrough from decoder OES texture to encoder surface.
+// video-only clips, speed == 1.0, canvas contentMode == "fit", clip rotation
+// metadata normalized to 0/90/180/270.
+//
+// Canvas contentMode="fit" (Unit G): each clip's decoded frame is centered
+// and aspect-preserving scaled to fit within the fixed encoder output surface
+// over a black background, then rotated in output vertex space by the clip's
+// rotation metadata -- see [updateClipGeometry]. Texture coordinates are
+// left unrotated; SurfaceTexture's own transform matrix (uSTMatrix) remains
+// the only texture-space transform. Vertex geometry is recomputed once per
+// clip, not per frame.
 class AndroidTimelineVideoEncoder(
     private val outputPath: String,
     private val width: Int,
@@ -59,6 +69,9 @@ class AndroidTimelineVideoEncoder(
         val sourcePath: String,
         val trimStartSeconds: Double,
         val trimEndSeconds: Double,
+        val decodedWidth: Int,
+        val decodedHeight: Int,
+        val rotationDegrees: Int,
     )
 
     data class EncodeResult(
@@ -337,6 +350,9 @@ class AndroidTimelineVideoEncoder(
             dec.start()
             decoder = dec
 
+            val geometryFailure = updateClipGeometry(clip)
+            if (geometryFailure != null) return geometryFailure
+
             val info = MediaCodec.BufferInfo()
             var inputDone = false
             var renderedFramesInClip = 0
@@ -426,8 +442,65 @@ class AndroidTimelineVideoEncoder(
         return true
     }
 
-    private val quadCoords = floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)
     private val texCoords = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)
+
+    // Reused per-clip geometry buffers (Unit G) — uploaded once per clip via
+    // [updateClipGeometry], never reallocated per frame. Vertex order is
+    // BL, BR, TL, TR, matching the GL_TRIANGLE_STRIP draw call below.
+    private val quadBuffer: FloatBuffer = ByteBuffer.allocateDirect(8 * 4)
+        .order(ByteOrder.nativeOrder()).asFloatBuffer()
+    private val texBuffer: FloatBuffer = ByteBuffer.allocateDirect(texCoords.size * 4)
+        .order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+            put(texCoords)
+            position(0)
+        }
+
+    /// Computes the centered, aspect-preserving "fit" quad for [clip]'s
+    /// decoded geometry against the fixed encoder output surface, rotates it
+    /// by the clip's normalized rotation metadata, and uploads it into
+    /// [quadBuffer]. Texture coordinates are left unrotated — SurfaceTexture's
+    /// own transform matrix (uSTMatrix), applied in [drawAndSubmitFrame],
+    /// remains the only texture-space transform; clip rotation metadata is
+    /// applied entirely in output vertex space. Returns a failure reason
+    /// string for degenerate geometry instead of throwing; never called with
+    /// per-frame allocation.
+    private fun updateClipGeometry(clip: ClipInput): String? {
+        val decodedWidth = clip.decodedWidth
+        val decodedHeight = clip.decodedHeight
+        if (decodedWidth <= 0 || decodedHeight <= 0 || width <= 0 || height <= 0) {
+            return "invalid_geometry:${clip.sourcePath}"
+        }
+
+        val displayWidth: Float
+        val displayHeight: Float
+        if (clip.rotationDegrees == 90 || clip.rotationDegrees == 270) {
+            displayWidth = decodedHeight.toFloat()
+            displayHeight = decodedWidth.toFloat()
+        } else {
+            displayWidth = decodedWidth.toFloat()
+            displayHeight = decodedHeight.toFloat()
+        }
+        val scale = min(width.toFloat() / displayWidth, height.toFloat() / displayHeight)
+        val halfX = (decodedWidth * scale) / width.toFloat()
+        val halfY = (decodedHeight * scale) / height.toFloat()
+
+        // Mathematical positive angles are CCW; clip rotation metadata is
+        // clockwise, hence the negated angle here.
+        val radians = Math.toRadians(-clip.rotationDegrees.toDouble())
+        val cosR = cos(radians).toFloat()
+        val sinR = sin(radians).toFloat()
+        fun rotated(x: Float, y: Float) = floatArrayOf(x * cosR - y * sinR, x * sinR + y * cosR)
+
+        val bl = rotated(-halfX, -halfY)
+        val br = rotated(halfX, -halfY)
+        val tl = rotated(-halfX, halfY)
+        val tr = rotated(halfX, halfY)
+
+        quadBuffer.position(0)
+        quadBuffer.put(floatArrayOf(bl[0], bl[1], br[0], br[1], tl[0], tl[1], tr[0], tr[1]))
+        quadBuffer.position(0)
+        return null
+    }
 
     /// Draws the current OES texture (decoded frame) into the encoder's EGL
     /// surface and submits it via eglSwapBuffers. Real GPU frame transfer —
@@ -441,17 +514,13 @@ class AndroidTimelineVideoEncoder(
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glUseProgram(glProgram)
 
-        val quadBuf = ByteBuffer.allocateDirect(quadCoords.size * 4)
-            .order(ByteOrder.nativeOrder()).asFloatBuffer()
-        quadBuf.put(quadCoords).position(0)
+        quadBuffer.position(0)
         GLES20.glEnableVertexAttribArray(aPositionLoc)
-        GLES20.glVertexAttribPointer(aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quadBuf)
+        GLES20.glVertexAttribPointer(aPositionLoc, 2, GLES20.GL_FLOAT, false, 0, quadBuffer)
 
-        val texBuf = ByteBuffer.allocateDirect(texCoords.size * 4)
-            .order(ByteOrder.nativeOrder()).asFloatBuffer()
-        texBuf.put(texCoords).position(0)
+        texBuffer.position(0)
         GLES20.glEnableVertexAttribArray(aTexCoordLoc)
-        GLES20.glVertexAttribPointer(aTexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, texBuf)
+        GLES20.glVertexAttribPointer(aTexCoordLoc, 2, GLES20.GL_FLOAT, false, 0, texBuffer)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)

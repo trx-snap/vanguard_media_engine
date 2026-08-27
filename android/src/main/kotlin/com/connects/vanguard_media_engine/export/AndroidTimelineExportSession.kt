@@ -22,12 +22,16 @@ import kotlin.math.abs
 // posts to the main thread exactly once. No progress events are emitted for
 // Unit C (out of scope for the minimal hard-cut export slice).
 //
-// Scope (minimal hard-cut, sequential, local-video export -- Unit C):
-//   - video-only clips, speed == 1.0, zero rotation metadata, no transitions,
-//     no overlays, no canvas contentMode override, no per-clip transform/
-//     crop/freeze/reverse/time-remap/dual-camera/color-matrix.
-//   - decoded clip width/height must be identical across all clips and must
-//     match the resolved output width/height (no scaling is performed).
+// Scope (minimal hard-cut, sequential, local-video export -- Unit C, extended
+// by Unit G with rotation metadata + canvas scaling normalization):
+//   - video-only clips, speed == 1.0, no transitions, no overlays, no canvas
+//     contentMode other than "fit", no per-clip transform/crop/freeze/
+//     reverse/time-remap/dual-camera/color-matrix.
+//   - clip rotation metadata (0/90/180/270 after normalization) and decoded
+//     clip dimensions that differ from each other or from the requested
+//     output geometry are supported: each clip is centered and
+//     aspect-preserving "fit"-scaled into the fixed output surface over a
+//     black background (AndroidTimelineVideoEncoder).
 //   - Anything outside this scope is rejected with UNSUPPORTED_EXPORT_FEATURE
 //     rather than silently ignored -- a minimal exporter that ignores a
 //     feature would silently produce wrong output, which this Unit must not do.
@@ -67,6 +71,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         val trimEndSeconds: Double,
         val decodedWidth: Int,
         val decodedHeight: Int,
+        val rotationDegrees: Int,
     )
 
     private fun run(
@@ -194,8 +199,14 @@ class AndroidTimelineExportSession(private val context: Context) {
                 onError("FILE_UNREADABLE", "exportTimeline: no readable video track in ${clip.sourcePath}")
                 return
             }
-            if (probe.rotationDegrees != 0) {
-                onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: clip rotation metadata is not supported")
+            val normalizedRotation = normalizeRotationDegrees(probe.rotationDegrees)
+            if (normalizedRotation != 0 && normalizedRotation != 90 &&
+                normalizedRotation != 180 && normalizedRotation != 270
+            ) {
+                onError(
+                    "UNSUPPORTED_EXPORT_FEATURE",
+                    "exportTimeline: clip rotation metadata ${probe.rotationDegrees} is not supported",
+                )
                 return
             }
             clipContexts.add(
@@ -205,15 +216,9 @@ class AndroidTimelineExportSession(private val context: Context) {
                     trimEndSeconds = clip.trimEnd,
                     decodedWidth = probe.width,
                     decodedHeight = probe.height,
+                    rotationDegrees = normalizedRotation,
                 ),
             )
-        }
-
-        val firstWidth = clipContexts.first().decodedWidth
-        val firstHeight = clipContexts.first().decodedHeight
-        if (clipContexts.any { it.decodedWidth != firstWidth || it.decodedHeight != firstHeight }) {
-            onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: clips have heterogeneous decoded dimensions")
-            return
         }
 
         // ── 4. Resolve request geometry / bitrate / output path ─────────────
@@ -231,11 +236,10 @@ class AndroidTimelineExportSession(private val context: Context) {
             return
         }
 
-        if (requestWidth != firstWidth || requestHeight != firstHeight) {
+        if (requestWidth <= 0 || requestWidth % 2 != 0 || requestHeight <= 0 || requestHeight % 2 != 0) {
             onError(
-                "UNSUPPORTED_EXPORT_FEATURE",
-                "exportTimeline: requested output ${requestWidth}x$requestHeight does not match " +
-                    "decoded clip dimensions ${firstWidth}x$firstHeight (no scaling in Unit C)",
+                "INVALID_ARG",
+                "exportTimeline: requested output ${requestWidth}x$requestHeight must be positive even integers",
             )
             return
         }
@@ -284,6 +288,9 @@ class AndroidTimelineExportSession(private val context: Context) {
                     sourcePath = it.sourcePath,
                     trimStartSeconds = it.trimStartSeconds,
                     trimEndSeconds = it.trimEndSeconds,
+                    decodedWidth = it.decodedWidth,
+                    decodedHeight = it.decodedHeight,
+                    rotationDegrees = it.rotationDegrees,
                 )
             },
         )
@@ -442,6 +449,11 @@ class AndroidTimelineExportSession(private val context: Context) {
     // ─────────────────────────────────────────────────────────────────────────
     // Probing helpers
     // ─────────────────────────────────────────────────────────────────────────
+
+    /// Normalizes arbitrary (including negative) rotation-metadata degrees into
+    /// the [0, 360) range. Callers must still validate the result is one of
+    /// 0/90/180/270 -- this normalization alone does not guarantee that.
+    private fun normalizeRotationDegrees(degrees: Int): Int = ((degrees % 360) + 360) % 360
 
     private data class VideoProbe(val width: Int, val height: Int, val rotationDegrees: Int)
 
