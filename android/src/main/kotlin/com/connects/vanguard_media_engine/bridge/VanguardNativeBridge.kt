@@ -239,6 +239,14 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // ── Phase 1-Unit AN: Android GLES acquire-fence import -> renderFrame content physical proof ──
+    external fun runAndroidDagPhase1ANGlesAcquireFenceRenderContentSmoke(
+        surface: Surface,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
