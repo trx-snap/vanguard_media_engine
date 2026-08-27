@@ -21,6 +21,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) => {
   'selectedWidth': 640,
   'selectedHeight': 480,
   'selectedSensorOrientationDegrees': 90,
+  'renderedRotationDegrees': 90,
   'imageFormatName': 'PRIVATE',
   'targetFrameCount': 5,
   'renderedFrames': 5,
@@ -183,6 +184,8 @@ void main() {
         expect(report.selectedWidth, equals(640));
         expect(report.selectedHeight, equals(480));
         expect(report.selectedSensorOrientationDegrees, equals(90));
+        expect(report.renderedRotationDegrees, equals(90));
+        expect(report.hasExpectedRenderRotation, isTrue);
         expect(report.imageFormatName, equals('PRIVATE'));
         expect(report.targetFrameCount, equals(5));
         expect(report.renderedFrames, equals(5));
@@ -243,6 +246,7 @@ void main() {
         expect(serialized['selectedWidth'], equals(640));
         expect(serialized['selectedHeight'], equals(480));
         expect(serialized['selectedSensorOrientationDegrees'], equals(90));
+        expect(serialized['renderedRotationDegrees'], equals(90));
         expect(serialized['imageFormatName'], equals('PRIVATE'));
         expect(serialized['targetFrameCount'], equals(5));
         expect(serialized['renderedFrames'], equals(5));
@@ -583,6 +587,7 @@ void main() {
               selectedWidth: 0,
               selectedHeight: 0,
               selectedSensorOrientationDegrees: -1,
+              renderedRotationDegrees: 0,
               imageFormatName: 'PRIVATE',
               targetFrameCount: 0,
               renderedFrames: 0,
@@ -621,6 +626,7 @@ void main() {
           'selectedWidth': 640.0,
           'selectedHeight': 480.0,
           'selectedSensorOrientationDegrees': 90.0,
+          'renderedRotationDegrees': 90.0,
           'targetFrameCount': 5.0,
           'renderedFrames': 5.0,
           'hardwareBufferFrameCount': 5.0,
@@ -646,6 +652,7 @@ void main() {
         expect(parsed.selectedWidth, equals(640));
         expect(parsed.selectedHeight, equals(480));
         expect(parsed.selectedSensorOrientationDegrees, equals(90));
+        expect(parsed.renderedRotationDegrees, equals(90));
         expect(parsed.targetFrameCount, equals(5));
         expect(parsed.renderedFrames, equals(5));
         expect(parsed.hardwareBufferFrameCount, equals(5));
@@ -847,6 +854,7 @@ void main() {
         'selectedWidth: 640',
         'selectedHeight: 480',
         'selectedSensorOrientationDegrees: 90',
+        'renderedRotationDegrees: 90',
         'targetFrameCount: 5',
         'renderedFrames: 5',
         'hardwareBufferFrameCount: 5',
@@ -903,6 +911,7 @@ void main() {
         {'selectedWidth': 1280},
         {'selectedHeight': 720},
         {'selectedSensorOrientationDegrees': 270},
+        {'renderedRotationDegrees': 180},
         {'imageFormatName': 'YUV_420_888'},
         {'targetFrameCount': 10},
         {'renderedFrames': 4},
@@ -986,6 +995,7 @@ void main() {
           );
           final arguments = call.arguments as Map<Object?, Object?>;
           expect(arguments.containsKey('cameraId'), isFalse);
+          expect(arguments['applySensorOrientationTransform'], isTrue);
           expect(arguments['timeoutMs'], equals(10000));
           expect(arguments['maxWidth'], equals(640));
           expect(arguments['maxHeight'], equals(480));
@@ -1017,6 +1027,7 @@ void main() {
           );
           final arguments = call.arguments as Map<Object?, Object?>;
           expect(arguments['cameraId'], equals('1'));
+          expect(arguments['applySensorOrientationTransform'], isTrue);
           expect(arguments['timeoutMs'], equals(12000));
           expect(arguments['maxWidth'], equals(1280));
           expect(arguments['maxHeight'], equals(720));
@@ -1036,6 +1047,7 @@ void main() {
 
         final arguments = call.arguments as Map<Object?, Object?>;
         expect(arguments.containsKey('cameraId'), isFalse);
+        expect(arguments['applySensorOrientationTransform'], isTrue);
         expect(arguments['timeoutMs'], equals(10000));
         expect(arguments['maxWidth'], equals(640));
         expect(arguments['maxHeight'], equals(480));
@@ -1061,6 +1073,7 @@ void main() {
         final arguments = call.arguments as Map<Object?, Object?>;
         expect(arguments['lensFacing'], equals('front'));
         expect(arguments.containsKey('cameraId'), isFalse);
+        expect(arguments['applySensorOrientationTransform'], isTrue);
       });
 
       test('start omits blank or whitespace-only lensFacing', () async {
@@ -1075,6 +1088,7 @@ void main() {
 
         final arguments = call.arguments as Map<Object?, Object?>;
         expect(arguments.containsKey('lensFacing'), isFalse);
+        expect(arguments['applySensorOrientationTransform'], isTrue);
       });
 
       test(
@@ -1093,6 +1107,7 @@ void main() {
           final arguments = call.arguments as Map<Object?, Object?>;
           expect(arguments['cameraId'], equals('1'));
           expect(arguments['lensFacing'], equals('front'));
+          expect(arguments['applySensorOrientationTransform'], isTrue);
         },
       );
 

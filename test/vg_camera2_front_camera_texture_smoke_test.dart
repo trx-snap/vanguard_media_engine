@@ -38,6 +38,7 @@ void main() {
             'selectedWidth': 640,
             'selectedHeight': 480,
             'selectedSensorOrientationDegrees': 270,
+            'renderedRotationDegrees': 270,
             'imageFormatName': 'PRIVATE',
             'targetFrameCount': 5,
             'renderedFrames': 5,
@@ -108,6 +109,8 @@ void main() {
           expect(report.selectedWidth, equals(640));
           expect(report.selectedHeight, equals(480));
           expect(report.selectedSensorOrientationDegrees, equals(270));
+          expect(report.renderedRotationDegrees, equals(270));
+          expect(report.hasExpectedRenderRotation, isTrue);
           expect(report.hasValidSensorOrientation, isTrue);
           expect(report.imageFormatName, equals('PRIVATE'));
           expect(report.targetFrameCount, equals(5));
@@ -168,6 +171,7 @@ void main() {
           expect(serialized['selectedWidth'], equals(640));
           expect(serialized['selectedHeight'], equals(480));
           expect(serialized['selectedSensorOrientationDegrees'], equals(270));
+          expect(serialized['renderedRotationDegrees'], equals(270));
           expect(serialized['imageFormatName'], equals('PRIVATE'));
           expect(serialized['targetFrameCount'], equals(5));
           expect(serialized['renderedFrames'], equals(5));
@@ -220,6 +224,7 @@ void main() {
             'selectedWidth': 640,
             'selectedHeight': 480,
             'selectedSensorOrientationDegrees': 45,
+            'renderedRotationDegrees': 0,
             'imageFormatName': 'PRIVATE',
             'targetFrameCount': 5,
             'renderedFrames': 5,
@@ -278,6 +283,8 @@ void main() {
           );
           expect(report.selectedLensFacing, equals('front'));
           expect(report.selectedSensorOrientationDegrees, equals(45));
+          expect(report.renderedRotationDegrees, equals(0));
+          expect(report.hasExpectedRenderRotation, isFalse);
           expect(report.hasValidSensorOrientation, isFalse);
           expect(report.isTextureNativeRenderLoopPassed, isFalse);
           expect(report.reasons, equals(const ['invalid_sensor_orientation']));
@@ -285,6 +292,7 @@ void main() {
           final serialized = report.toMap();
           expect(serialized['decision'], equals('invalidSensorOrientation'));
           expect(serialized['selectedSensorOrientationDegrees'], equals(45));
+          expect(serialized['renderedRotationDegrees'], equals(0));
           expect(
             serialized['reasons'],
             equals(const ['invalid_sensor_orientation']),
@@ -295,6 +303,7 @@ void main() {
           );
           expect(roundTrip, equals(report));
           expect(roundTrip.hasValidSensorOrientation, isFalse);
+          expect(roundTrip.hasExpectedRenderRotation, isFalse);
         },
       );
 
@@ -512,6 +521,7 @@ void main() {
           final arguments = call.arguments as Map<Object?, Object?>;
           expect(arguments['lensFacing'], equals('front'));
           expect(arguments.containsKey('cameraId'), isFalse);
+          expect(arguments['applySensorOrientationTransform'], isTrue);
           expect(arguments['timeoutMs'], equals(10000));
           expect(arguments['maxWidth'], equals(640));
           expect(arguments['maxHeight'], equals(480));
@@ -541,6 +551,7 @@ void main() {
           final arguments = call.arguments as Map<Object?, Object?>;
           expect(arguments['cameraId'], equals('front_camera_0'));
           expect(arguments['lensFacing'], equals('front'));
+          expect(arguments['applySensorOrientationTransform'], isTrue);
         },
       );
     },

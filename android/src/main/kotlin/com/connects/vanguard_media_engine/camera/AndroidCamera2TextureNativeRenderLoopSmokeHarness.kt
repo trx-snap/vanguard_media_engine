@@ -103,6 +103,7 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
         val requestedCameraId = (args?.get("cameraId") as? String)?.trim()
         val rawLensFacing = (args?.get("lensFacing") as? String)?.trim()?.lowercase()
         val requestedLensFacing = rawLensFacing?.takeIf { it.isNotBlank() }
+        val applySensorOrientationTransform = (args?.get("applySensorOrientationTransform") as? Boolean) ?: true
         val timeoutMs = clampLong((args?.get("timeoutMs") as? Number)?.toLong(), DEFAULT_TIMEOUT_MS, MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)
         val maxWidth = clampInt((args?.get("maxWidth") as? Number)?.toInt(), DEFAULT_MAX_WIDTH, MIN_DIMENSION, MAX_DIMENSION)
         val maxHeight = clampInt((args?.get("maxHeight") as? Number)?.toInt(), DEFAULT_MAX_HEIGHT, MIN_DIMENSION, MAX_DIMENSION)
@@ -119,6 +120,7 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
         var selectedWidth = 0
         var selectedHeight = 0
         var selectedSensorOrientationDegrees = -1
+        var renderedRotationDegrees = 0
 
         fun buildResult(
             decision: String,
@@ -167,6 +169,7 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
                 "decision=$decision success=$success attemptedOpen=$attemptedOpen opened=$opened " +
                     "renderedFrames=$renderedFrames targetFrameCount=$targetFrameCount " +
                     "cameraId=$selectedCameraId selectedSensorOrientationDegrees=$selectedSensorOrientationDegrees " +
+                    "renderedRotationDegrees=$renderedRotationDegrees " +
                     "textureId=$textureId durationMs=$durationMs",
             )
             return mapOf(
@@ -184,6 +187,7 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
                 "selectedWidth" to selectedWidth,
                 "selectedHeight" to selectedHeight,
                 "selectedSensorOrientationDegrees" to selectedSensorOrientationDegrees,
+                "renderedRotationDegrees" to renderedRotationDegrees,
                 "imageFormatName" to "PRIVATE",
                 "targetFrameCount" to targetFrameCount,
                 "renderedFrames" to renderedFrames,
@@ -297,8 +301,14 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
         }
         if (sensorOrientation != null) {
             selectedSensorOrientationDegrees = sensorOrientation
+            if (applySensorOrientationTransform && sensorOrientation in VALID_SENSOR_ORIENTATIONS) {
+                renderedRotationDegrees = sensorOrientation
+            } else {
+                renderedRotationDegrees = 0
+            }
         } else {
             diagnosticsMap["sensorOrientationMissing"] = true
+            renderedRotationDegrees = 0
         }
         val streamConfigurationMap = try {
             characteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
@@ -496,7 +506,7 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
                                                     image.timestamp / 1000,
                                                     frameIndex,
                                                     activeGenerationId,
-                                                    0,
+                                                    renderedRotationDegrees,
                                                 )
                                             } catch (t: Throwable) {
                                                 Log.w(TAG, "renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration failed: ${t.javaClass.simpleName}: ${t.message}")
