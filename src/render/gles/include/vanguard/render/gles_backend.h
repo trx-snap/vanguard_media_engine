@@ -30,8 +30,14 @@ namespace render {
 // releaseHardwareBuffer() attempting a fail-soft native release fence on
 // Android when the caller passes a non-null outReleaseFenceFd (see the
 // releaseHardwareBuffer() declaration below for exact conditions and
-// fallback behavior). No product pixel-readback API, no YUV/external
-// texture, no multi-node composition, no product UI wiring. EGL/GLES/
+// fallback behavior), plus (Unit AR) importHardwareBuffer() also accepting
+// Y8Cb8Cr8_420/IMPLEMENTATION_DEFINED GPU-sampled buffers, imported as
+// GL_TEXTURE_EXTERNAL_OES (RGBA_8888/RGBX_8888 remain GL_TEXTURE_2D as
+// above), with renderFrame()/diagnosticRenderFrameForReadback() resolving
+// and drawing whichever texture target the handle was imported as. No
+// color-correct YUV->RGB conversion, no Camera2 product wiring, no
+// multi-node DAG composition. No product pixel-readback API, no product UI
+// wiring. EGL/GLES/
 // Android headers must never appear in this public header; all such state
 // lives exclusively in gles_backend.cpp and the private
 // GlesHardwareBufferImports / GlesTextureFrameRenderer helpers behind the
@@ -60,9 +66,12 @@ public:
     bool hasSurface() const override;
 
     // Phase 2C / Unit Y: AHardwareBuffer import. On Android, supports
-    // RGBA_8888/RGBX_8888 GPU-sampled buffers only (see
-    // GlesHardwareBufferImports); all other formats/usages are rejected.
-    // Remains unavailable on non-Android host builds.
+    // RGBA_8888/RGBX_8888 GPU-sampled buffers, imported as GL_TEXTURE_2D,
+    // plus (Unit AR) Y8Cb8Cr8_420/IMPLEMENTATION_DEFINED GPU-sampled
+    // buffers, imported as GL_TEXTURE_EXTERNAL_OES (see
+    // GlesHardwareBufferImports); all other formats/usages are rejected. No
+    // color-correct YUV->RGB conversion is performed. Remains unavailable on
+    // non-Android host builds.
     //
     // Unit AE: if acquireFenceFd >= 0, it is waited on synchronously
     // (bounded poll(), 1000ms) before the buffer is imported, then always
@@ -205,12 +214,22 @@ public:
     //
     // Non-claims: this is diagnostic/proof infrastructure only, not a
     // product no-swap rendering API; callers should use it only paired with
-    // diagnosticReadPixels() in physical proof harnesses. It does not
-    // support YUV or external (OES) textures, does not perform fence sync,
-    // and does not compose multiple render nodes. Unavailable on non-
-    // Android host builds.
+    // diagnosticReadPixels() in physical proof harnesses. It resolves and
+    // draws whichever texture target `handle` was imported as (GL_TEXTURE_2D
+    // or, per Unit AR, GL_TEXTURE_EXTERNAL_OES), but performs no color-
+    // correct YUV->RGB conversion, no fence sync, and no composition of
+    // multiple render nodes. Unavailable on non-Android host builds.
     bool diagnosticRenderFrameForReadback(HardwareBufferHandle handle,
                                           const VideoFrameTransform& transform);
+
+    // Unit AR: returns the raw GL texture target (0x0DE1 GL_TEXTURE_2D or
+    // 0x8D65 GL_TEXTURE_EXTERNAL_OES) that `handle` was imported as, or 0 if
+    // `handle` does not identify an active imported buffer, on non-Android
+    // host builds, or if otherwise unavailable. Diagnostic/proof-only seam
+    // for physical harnesses to assert the resolved texture target without
+    // including private helper headers; performs no ownership transfer and
+    // exposes no GL headers in this public header.
+    uint32_t diagnosticTextureTargetForHardwareBuffer(HardwareBufferHandle handle) const;
 
 private:
     struct Impl;

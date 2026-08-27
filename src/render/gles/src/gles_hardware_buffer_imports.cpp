@@ -3,12 +3,18 @@
 // Phase 1 Unit AE: importBuffer() synchronously waits on and closes the
 // caller-supplied acquire fence before importing.
 //
-// RGBA_8888/RGBX_8888 GPU-sampled buffers only. AHardwareBuffer_acquire/
-// release/describe are loaded via dlopen/dlsym from libandroid.so (no strong
-// symbol references). eglGetNativeClientBufferANDROID, eglCreateImageKHR,
-// eglDestroyImageKHR, and glEGLImageTargetTexture2DOES are loaded via
-// eglGetProcAddress, since extension entry points are not guaranteed to be
-// strong-linked symbols even though EGL/GLESv3 are linked.
+// RGBA_8888/RGBX_8888 GPU-sampled buffers import as GL_TEXTURE_2D.
+// AHardwareBuffer_acquire/release/describe are loaded via dlopen/dlsym from
+// libandroid.so (no strong symbol references). eglGetNativeClientBufferANDROID,
+// eglCreateImageKHR, eglDestroyImageKHR, and glEGLImageTargetTexture2DOES are
+// loaded via eglGetProcAddress, since extension entry points are not
+// guaranteed to be strong-linked symbols even though EGL/GLESv3 are linked.
+//
+// Unit AR: Y8Cb8Cr8_420/IMPLEMENTATION_DEFINED GPU-sampled buffers are also
+// accepted and import as GL_TEXTURE_EXTERNAL_OES, since those formats are
+// only defined for external-image sampling on Android GLES. This is import-
+// foundation work only: no color-correct YUV->RGB conversion, no Camera2
+// product wiring, and no multi-node DAG composition are claimed.
 //
 // Unit AE: if the caller passes a valid acquireFenceFd (>= 0), it is waited
 // on with a bounded poll() (1000ms) before AHardwareBuffer acquire/describe/
@@ -64,6 +70,18 @@
 #endif
 #ifndef EGL_NO_NATIVE_FENCE_FD_ANDROID
 #define EGL_NO_NATIVE_FENCE_FD_ANDROID -1
+#endif
+
+// Unit AR: fallbacks in case the NDK headers in use predate these tokens.
+// Values mirror the Khronos-registered / AOSP-published constants.
+#ifndef GL_TEXTURE_EXTERNAL_OES
+#define GL_TEXTURE_EXTERNAL_OES 0x8D65
+#endif
+#ifndef AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420
+#define AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420 0x23
+#endif
+#ifndef AHARDWAREBUFFER_FORMAT_IMPLEMENTATION_DEFINED
+#define AHARDWAREBUFFER_FORMAT_IMPLEMENTATION_DEFINED 0x22
 #endif
 
 namespace vanguard {
@@ -173,6 +191,9 @@ struct GlesHardwareBufferImports::Impl {
         AHardwareBuffer* ahbPtr = nullptr;   // acquired ref
         EGLImageKHR      image = EGL_NO_IMAGE_KHR;
         GLuint           texture = 0;
+        GLenum           textureTarget = GL_TEXTURE_2D; // Unit AR: GL_TEXTURE_2D
+                                               // for RGBA/RGBX, GL_TEXTURE_EXTERNAL_OES
+                                               // for Y8Cb8Cr8_420/IMPLEMENTATION_DEFINED.
         int              acquireFenceFd = -1; // Unit AE: always -1 -- the
                                                // acquire fence is waited on
                                                // and closed before import
@@ -437,14 +458,20 @@ HardwareBufferImportResult GlesHardwareBufferImports::importBuffer(
                     "ahb_import_invalid_dimensions", ahbRef);
     }
 
-    // RGBA-only Unit Y: reject every format except R8G8B8A8/R8G8B8X8 UNORM.
-    const bool formatOk =
+    // Unit Y: RGBA_8888/RGBX_8888 import as GL_TEXTURE_2D. Unit AR adds
+    // Y8Cb8Cr8_420/IMPLEMENTATION_DEFINED, imported as GL_TEXTURE_EXTERNAL_OES.
+    // Every other format still fails closed as before.
+    const bool isTexture2DFormat =
         desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM ||
         desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8X8_UNORM;
-    if (!formatOk) {
+    const bool isExternalOesFormat =
+        desc.format == AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420 ||
+        desc.format == AHARDWAREBUFFER_FORMAT_IMPLEMENTATION_DEFINED;
+    if (!isTexture2DFormat && !isExternalOesFormat) {
         return fail(HardwareBufferImportResult::kIncompatibleBuffer,
                     "ahb_import_unsupported_format", ahbRef);
     }
+    const GLenum textureTarget = isExternalOesFormat ? GL_TEXTURE_EXTERNAL_OES : GL_TEXTURE_2D;
 
     if (!(desc.usage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE)) {
         return fail(HardwareBufferImportResult::kIncompatibleBuffer,
@@ -466,7 +493,10 @@ HardwareBufferImportResult GlesHardwareBufferImports::importBuffer(
                     "ahb_import_create_image_failed", ahbRef);
     }
 
-    // --- Create and bind GL_TEXTURE_2D, attach the EGLImage ---
+    // --- Create and bind the selected target, attach the EGLImage ---
+    // Unit AR: GL_TEXTURE_EXTERNAL_OES only supports GL_LINEAR filtering and
+    // GL_CLAMP_TO_EDGE wrapping, and never mipmaps; GL_TEXTURE_2D keeps the
+    // Unit Y parameters unchanged.
     GLuint texture = 0;
     glGenTextures(1, &texture);
     if (texture == 0) {
@@ -475,14 +505,14 @@ HardwareBufferImportResult GlesHardwareBufferImports::importBuffer(
                     "ahb_import_gen_texture_failed", ahbRef);
     }
 
-    glBindTexture(GL_TEXTURE_2D, texture);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    s.fnImageTargetTexture2D(GL_TEXTURE_2D, static_cast<GLeglImageOES>(image));
+    glBindTexture(textureTarget, texture);
+    glTexParameteri(textureTarget, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(textureTarget, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(textureTarget, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(textureTarget, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    s.fnImageTargetTexture2D(textureTarget, static_cast<GLeglImageOES>(image));
     const bool attachOk = (glGetError() == GL_NO_ERROR);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindTexture(textureTarget, 0);
 
     if (!attachOk) {
         glDeleteTextures(1, &texture);
@@ -498,6 +528,7 @@ HardwareBufferImportResult GlesHardwareBufferImports::importBuffer(
     rec.ahbPtr = ahbRef;
     rec.image = image;
     rec.texture = texture;
+    rec.textureTarget = textureTarget;
     // Unit AE: acquireFenceFd is already -1 here -- either the caller passed
     // no fence, or it was waited on and closed above. Never store a waited
     // fd in the record.
@@ -578,6 +609,19 @@ uint32_t GlesHardwareBufferImports::textureForHandle(HardwareBufferHandle handle
 }
 
 // ---------------------------------------------------------------------------
+// textureTargetForHandle() -- Unit AR
+// ---------------------------------------------------------------------------
+
+uint32_t GlesHardwareBufferImports::textureTargetForHandle(HardwareBufferHandle handle) const {
+    const Impl& s = *impl_;
+    auto it = s.records.find(handle);
+    if (it == s.records.end()) {
+        return 0;
+    }
+    return static_cast<uint32_t>(it->second.textureTarget);
+}
+
+// ---------------------------------------------------------------------------
 // lastError()
 // ---------------------------------------------------------------------------
 
@@ -645,6 +689,10 @@ bool GlesHardwareBufferImports::hasBuffer(HardwareBufferHandle /*handle*/) const
 }
 
 uint32_t GlesHardwareBufferImports::textureForHandle(HardwareBufferHandle /*handle*/) const {
+    return 0;
+}
+
+uint32_t GlesHardwareBufferImports::textureTargetForHandle(HardwareBufferHandle /*handle*/) const {
     return 0;
 }
 

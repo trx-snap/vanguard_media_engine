@@ -10,8 +10,14 @@
 // [1,1] are remapped through VideoTransformPushConstants (see
 // makeVideoTransformPushConstants in render_transform.h) before upload,
 // supporting rotationDegrees 0/90/180/270 plus mirrorHorizontal. No pixel
-// readback/content proof, no YUV/external texture, no fence sync, no
-// product wiring.
+// readback/content proof, no fence sync, no product wiring.
+//
+// Unit AR: drawTexturedQuad() gains a textureTarget parameter. GL_TEXTURE_2D
+// keeps the existing sampler2D fragment shader; GL_TEXTURE_EXTERNAL_OES uses
+// a separate fragment shader sampling via samplerExternalOES, for the
+// GlesHardwareBufferImports YUV/implementation-defined import foundation.
+// No color-correct YUV->RGB conversion, Camera2 product wiring, or
+// multi-node DAG composition is claimed.
 
 #include "gles_texture_frame_renderer.h"
 
@@ -19,6 +25,16 @@
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #endif
+
+namespace {
+// Raw GLenum values for the texture targets this renderer accepts, kept
+// independent of platform headers so the legacy convenience overloads'
+// delegation (shared by Android and non-Android builds) compiles without
+// needing GLES headers outside the #if defined(__ANDROID__) block. Match
+// GL_TEXTURE_2D / GL_TEXTURE_EXTERNAL_OES exactly.
+constexpr uint32_t kTextureTarget2D = 0x0DE1;
+constexpr uint32_t kTextureTargetExternalOes = 0x8D65;
+} // namespace
 
 namespace vanguard {
 namespace render {
@@ -42,6 +58,17 @@ const char* kUnitZFragmentShaderSrc =
     "precision mediump float;\n"
     "varying vec2 vTexCoord;\n"
     "uniform sampler2D uTexture;\n"
+    "void main() {\n"
+    "    gl_FragColor = texture2D(uTexture, vTexCoord);\n"
+    "}\n";
+
+// Unit AR: GL_TEXTURE_EXTERNAL_OES fragment shader. The #extension directive
+// must be the shader's first line.
+const char* kUnitArExternalOesFragmentShaderSrc =
+    "#extension GL_OES_EGL_image_external : require\n"
+    "precision mediump float;\n"
+    "varying vec2 vTexCoord;\n"
+    "uniform samplerExternalOES uTexture;\n"
     "void main() {\n"
     "    gl_FragColor = texture2D(uTexture, vTexCoord);\n"
     "}\n";
@@ -79,6 +106,15 @@ bool GlesTextureFrameRenderer::drawTexturedQuad(uint32_t texture,
                                                 uint32_t height,
                                                 const VideoFrameTransform& transform,
                                                 std::string* outError) {
+    return drawTexturedQuad(texture, kTextureTarget2D, width, height, transform, outError);
+}
+
+bool GlesTextureFrameRenderer::drawTexturedQuad(uint32_t texture,
+                                                uint32_t textureTarget,
+                                                uint32_t width,
+                                                uint32_t height,
+                                                const VideoFrameTransform& transform,
+                                                std::string* outError) {
     if (outError) {
         outError->clear();
     }
@@ -88,6 +124,14 @@ bool GlesTextureFrameRenderer::drawTexturedQuad(uint32_t texture,
         if (outError) *outError = "gles_texture_frame_renderer_invalid_argument";
         return false;
     }
+    if (textureTarget != kTextureTarget2D && textureTarget != kTextureTargetExternalOes) {
+        if (outError) *outError = "gles_texture_frame_renderer_invalid_texture_target";
+        return false;
+    }
+    const GLenum glTextureTarget = static_cast<GLenum>(textureTarget);
+    const char* fragmentShaderSrc = (textureTarget == kTextureTargetExternalOes)
+        ? kUnitArExternalOesFragmentShaderSrc
+        : kUnitZFragmentShaderSrc;
 
     GLuint vertexShader = compileUnitZShader(GL_VERTEX_SHADER, kUnitZVertexShaderSrc);
     GLuint fragmentShader = 0;
@@ -98,7 +142,7 @@ bool GlesTextureFrameRenderer::drawTexturedQuad(uint32_t texture,
     if (vertexShader == 0) {
         ok = false;
     } else {
-        fragmentShader = compileUnitZShader(GL_FRAGMENT_SHADER, kUnitZFragmentShaderSrc);
+        fragmentShader = compileUnitZShader(GL_FRAGMENT_SHADER, fragmentShaderSrc);
         if (fragmentShader == 0) {
             ok = false;
         }
@@ -189,7 +233,7 @@ bool GlesTextureFrameRenderer::drawTexturedQuad(uint32_t texture,
                                   reinterpret_cast<const void*>(2 * sizeof(GLfloat)));
 
             glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, texture);
+            glBindTexture(glTextureTarget, texture);
             glUniform1i(textureLoc, 0);
 
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -199,7 +243,7 @@ bool GlesTextureFrameRenderer::drawTexturedQuad(uint32_t texture,
                 if (outError) *outError = "gles_texture_frame_renderer_draw_failed";
             }
 
-            glBindTexture(GL_TEXTURE_2D, 0);
+            glBindTexture(glTextureTarget, 0);
             glDisableVertexAttribArray(static_cast<GLuint>(texCoordLoc));
             glDisableVertexAttribArray(static_cast<GLuint>(positionLoc));
         }
@@ -224,6 +268,7 @@ bool GlesTextureFrameRenderer::drawTexturedQuad(uint32_t texture,
     return ok;
 #else
     (void)texture;
+    (void)textureTarget;
     (void)width;
     (void)height;
     (void)transform;

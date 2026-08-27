@@ -4,22 +4,22 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 void main() {
-  runApp(const AndroidGlesYcbcrImportGuardPhysicalSmokeApp());
+  runApp(const AndroidGlesExternalTexturePhysicalSmokeApp());
 }
 
-class AndroidGlesYcbcrImportGuardPhysicalSmokeApp extends StatefulWidget {
-  const AndroidGlesYcbcrImportGuardPhysicalSmokeApp({super.key});
+class AndroidGlesExternalTexturePhysicalSmokeApp extends StatefulWidget {
+  const AndroidGlesExternalTexturePhysicalSmokeApp({super.key});
 
   @override
-  State<AndroidGlesYcbcrImportGuardPhysicalSmokeApp> createState() =>
-      _AndroidGlesYcbcrImportGuardPhysicalSmokeAppState();
+  State<AndroidGlesExternalTexturePhysicalSmokeApp> createState() =>
+      _AndroidGlesExternalTexturePhysicalSmokeAppState();
 }
 
-class _AndroidGlesYcbcrImportGuardPhysicalSmokeAppState
-    extends State<AndroidGlesYcbcrImportGuardPhysicalSmokeApp> {
+class _AndroidGlesExternalTexturePhysicalSmokeAppState
+    extends State<AndroidGlesExternalTexturePhysicalSmokeApp> {
   static const _channel = MethodChannel('vanguard_media_engine');
   String _status =
-      'Running Android GLES YCBCR_420_888 AHardwareBuffer import smoke (superseded by Unit AR external texture import foundation)...';
+      'Running Android GLES external texture YCBCR_420_888 AHardwareBuffer import foundation Unit AR physical smoke...';
 
   @override
   void initState() {
@@ -31,7 +31,7 @@ class _AndroidGlesYcbcrImportGuardPhysicalSmokeAppState
     Map<String, dynamic> payload;
     try {
       final response = await _channel.invokeMethod<Object?>(
-        'runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke',
+        'runAndroidDagPhase1ARGlesExternalTextureSmoke',
         <String, dynamic>{'width': 64, 'height': 64},
       );
       payload = Map<String, dynamic>.from(response! as Map);
@@ -231,14 +231,12 @@ class _AndroidGlesYcbcrImportGuardPhysicalSmokeAppState
             'gles_external_texture_ycbcr_import_foundation_no_color_conversion_no_camera_product_no_multinode';
 
     // ignore: avoid_print
-    print(
-      'ANDROID_GLES_YCBCR_IMPORT_GUARD_UNIT_AH_JSON:${jsonEncode(payload)}',
-    );
+    print('ANDROID_GLES_EXTERNAL_TEXTURE_UNIT_AR_JSON:${jsonEncode(payload)}');
     // ignore: avoid_print
     print(
       isPass
-          ? 'ANDROID_GLES_YCBCR_IMPORT_GUARD_UNIT_AH_PHYSICAL_PASS'
-          : 'ANDROID_GLES_YCBCR_IMPORT_GUARD_UNIT_AH_PHYSICAL_FAIL',
+          ? 'ANDROID_GLES_EXTERNAL_TEXTURE_UNIT_AR_PHYSICAL_PASS'
+          : 'ANDROID_GLES_EXTERNAL_TEXTURE_UNIT_AR_PHYSICAL_FAIL',
     );
 
     if (mounted) {

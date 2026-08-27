@@ -255,6 +255,15 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // ── Phase 1-Unit AR: Android GLES external texture YCBCR_420_888 AHardwareBuffer import foundation physical smoke ──
+    external fun runAndroidDagPhase1ARGlesExternalTextureSmoke(
+        surface: Surface,
+        rgbaBuffer: HardwareBuffer,
+        ycbcrBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

@@ -62,6 +62,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ALGlesReleaseNullFenceSmoke",
             "runAndroidDagPhase1AMGlesRenderFenceChainSmoke",
             "runAndroidDagPhase1ANGlesAcquireFenceRenderContentSmoke",
+            "runAndroidDagPhase1ARGlesExternalTextureSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -110,6 +111,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ALGlesReleaseNullFenceSmoke" -> runPhase1ALGlesReleaseNullFenceSmoke(args, result)
             "runAndroidDagPhase1AMGlesRenderFenceChainSmoke" -> runPhase1AMGlesRenderFenceChainSmoke(args, result)
             "runAndroidDagPhase1ANGlesAcquireFenceRenderContentSmoke" -> runPhase1ANGlesAcquireFenceRenderContentSmoke(args, result)
+            "runAndroidDagPhase1ARGlesExternalTextureSmoke" -> runPhase1ARGlesExternalTextureSmoke(args, result)
             else -> return false
         }
         return true
@@ -617,13 +619,13 @@ class AndroidDagDiagnosticsCoordinator(
         }.start()
     }
 
-    // ── Phase 1-Unit AH: Android GLES YCBCR_420_888 AHardwareBuffer import guard fail-closed physical proof ──
+    // ── Phase 1-Unit AH: Android GLES YCBCR_420_888 AHardwareBuffer import guard physical smoke (superseded by Unit AR) ──
     private fun runPhase1AHGlesYcbcrImportGuardSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
         val width = (args?.get("width") as? Number)?.toInt() ?: 64
         val height = (args?.get("height") as? Number)?.toInt() ?: 64
         Thread {
             try {
-                val smokeResult = AndroidDagRenderSmokeHarness.runGlesYcbcrImportGuardSmoke(width, height)
+                val smokeResult = AndroidGlesExternalTextureSmokeHarness.runGlesExternalTextureSmoke(width, height)
                 mainHandler.post { result.success(smokeResult) }
             } catch (t: Throwable) {
                 mainHandler.post {
@@ -746,6 +748,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_ACQUIRE_FENCE_RENDER_CONTENT_SMOKE_FAILED",
                         "runAndroidDagPhase1ANGlesAcquireFenceRenderContentSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AR: Android GLES external texture YCBCR_420_888 AHardwareBuffer import foundation physical smoke ──
+    private fun runPhase1ARGlesExternalTextureSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidGlesExternalTextureSmokeHarness.runGlesExternalTextureSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_EXTERNAL_TEXTURE_SMOKE_FAILED",
+                        "runAndroidDagPhase1ARGlesExternalTextureSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

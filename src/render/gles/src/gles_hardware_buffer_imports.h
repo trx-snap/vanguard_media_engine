@@ -23,8 +23,13 @@
 //
 // Unit AK: releaseBuffer() attempts a fail-soft native release fence when
 // given a non-null outReleaseFenceFd; see the releaseBuffer() comment below
-// for the exact conditions and fallback behavior. No YUV/external texture,
-// multi-node composition, or product UI wiring.
+// for the exact conditions and fallback behavior.
+//
+// Unit AR: importBuffer() also accepts AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420
+// and AHARDWAREBUFFER_FORMAT_IMPLEMENTATION_DEFINED buffers, imported as
+// GL_TEXTURE_EXTERNAL_OES instead of GL_TEXTURE_2D. This is import-foundation
+// work only: no color-correct YUV->RGB conversion, no Camera2 product
+// wiring, and no multi-node DAG composition are claimed.
 
 #pragma once
 #include "vanguard/render/hardware_buffer_import.h"
@@ -91,12 +96,20 @@ public:
 
     bool hasBuffer(HardwareBufferHandle handle) const;
 
-    // Phase 1 Unit Z: returns the GL_TEXTURE_2D name stored for an active
+    // Phase 1 Unit Z: returns the GL texture name stored for an active
     // import, or 0 if handle is unknown, no texture was created for it, or
     // on non-Android host builds. Not part of the public GlesBackend API;
     // consumed only by GlesBackend::renderFrame(). Never exposes EGL/GLES
     // types through this header.
     uint32_t textureForHandle(HardwareBufferHandle handle) const;
+
+    // Unit AR: returns the GL texture target (GL_TEXTURE_2D or
+    // GL_TEXTURE_EXTERNAL_OES, as a raw GLenum value) the texture returned
+    // by textureForHandle() was created with, or 0 if handle is unknown, no
+    // texture was created for it, or on non-Android host builds. Not part
+    // of the public GlesBackend API; consumed only by GlesBackend's render
+    // paths alongside textureForHandle().
+    uint32_t textureTargetForHandle(HardwareBufferHandle handle) const;
 
     // Human-readable description of the last importBuffer()/releaseBuffer()
     // failure, or "" if the last call succeeded.

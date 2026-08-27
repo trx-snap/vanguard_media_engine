@@ -30,9 +30,16 @@
 //     quad's UVs support rotationDegrees 0/90/180/270 plus
 //     mirrorHorizontal via the shared UV-mapping helper. Non-cardinal
 //     rotations normalize to identity through that shared helper. No pixel
-//     readback/content proof, no YUV/external texture, no fence sync, no
-//     product wiring. renderFrame(handle) delegates to this overload with
-//     the identity VideoFrameTransform{}.
+//     readback/content proof, no fence sync, no product wiring.
+//     renderFrame(handle) delegates to this overload with the identity
+//     VideoFrameTransform{}.
+//   - Unit AR: renderFrame()/diagnosticRenderFrameForReadback() also resolve
+//     handle to its imported texture target via
+//     GlesHardwareBufferImports::textureTargetForHandle() and pass it to
+//     GlesTextureFrameRenderer, so GL_TEXTURE_EXTERNAL_OES (YUV/
+//     implementation-defined) imports draw correctly alongside GL_TEXTURE_2D
+//     ones. No color-correct YUV->RGB conversion, Camera2 product wiring, or
+//     multi-node DAG composition is claimed.
 //   - Unit AB: diagnosticReadPixels() makes the attached window surface
 //     current and reads back a rectangle of RGBA/UNSIGNED_BYTE pixels via
 //     glReadPixels(). The attached-surface requirement and rectangle-
@@ -763,6 +770,14 @@ bool GlesBackend::hasHardwareBuffer(HardwareBufferHandle handle) const {
     return impl_->ahbImports->hasBuffer(handle);
 }
 
+// Unit AR: diagnostic seam exposing the resolved GL texture target for an
+// imported handle without leaking GL headers into the public header. On
+// non-Android host builds, GlesHardwareBufferImports::textureTargetForHandle()
+// stubs to 0, which this delegates through unchanged.
+uint32_t GlesBackend::diagnosticTextureTargetForHardwareBuffer(HardwareBufferHandle handle) const {
+    return impl_->ahbImports->textureTargetForHandle(handle);
+}
+
 // ---------------------------------------------------------------------------
 // Phase 1 Unit Z: identity renderFrame - delegates to the Unit AA transform
 // overload with the identity VideoFrameTransform{}.
@@ -774,11 +789,14 @@ RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle handle) {
 
 // ---------------------------------------------------------------------------
 // Phase 4B2C / Unit AA: renderFrame with transform - draws the imported
-// GL_TEXTURE_2D as a full-window textured quad on the attached window
-// surface with UVs mapped for rotationDegrees 0/90/180/270 plus
-// mirrorHorizontal (via the shared UV-mapping helper; non-cardinal
-// rotations normalize to identity) and swaps. No pixel readback/content
-// proof, no YUV/external texture, no fence sync, no product wiring.
+// texture (GL_TEXTURE_2D, or GL_TEXTURE_EXTERNAL_OES per Unit AR) as a
+// full-window textured quad on the attached window surface with UVs mapped
+// for rotationDegrees 0/90/180/270 plus mirrorHorizontal (via the shared
+// UV-mapping helper; non-cardinal rotations normalize to identity) and
+// swaps. No pixel readback/content proof, no fence sync, no product wiring.
+// Unit AR's GL_TEXTURE_EXTERNAL_OES support is import-foundation only: no
+// color-correct YUV->RGB conversion, Camera2 product wiring, or multi-node
+// DAG composition is claimed.
 // ---------------------------------------------------------------------------
 
 RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle handle,
@@ -797,7 +815,8 @@ RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle handle,
     }
 
     const uint32_t texture = impl_->ahbImports->textureForHandle(handle);
-    if (texture == 0) {
+    const uint32_t textureTarget = impl_->ahbImports->textureTargetForHandle(handle);
+    if (texture == 0 || textureTarget == 0) {
         impl_->lastError = "invalid_buffer_handle";
         return RenderFrameResult::kInvalidBufferHandle;
     }
@@ -809,7 +828,7 @@ RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle handle,
 
     std::string drawError;
     const bool drawOk = impl_->textureFrameRenderer->drawTexturedQuad(
-        texture, impl_->surfaceWidth, impl_->surfaceHeight, transform, &drawError);
+        texture, textureTarget, impl_->surfaceWidth, impl_->surfaceHeight, transform, &drawError);
     if (!drawOk) {
         impl_->lastError = !drawError.empty() ? drawError : "gles_render_frame_draw_failed";
         return RenderFrameResult::kUnavailable;
@@ -929,7 +948,8 @@ bool GlesBackend::diagnosticRenderFrameForReadback(HardwareBufferHandle handle,
     }
 
     const uint32_t texture = impl_->ahbImports->textureForHandle(handle);
-    if (texture == 0) {
+    const uint32_t textureTarget = impl_->ahbImports->textureTargetForHandle(handle);
+    if (texture == 0 || textureTarget == 0) {
         impl_->lastError = "invalid_buffer_handle";
         return false;
     }
@@ -941,7 +961,7 @@ bool GlesBackend::diagnosticRenderFrameForReadback(HardwareBufferHandle handle,
 
     std::string drawError;
     const bool drawOk = impl_->textureFrameRenderer->drawTexturedQuad(
-        texture, impl_->surfaceWidth, impl_->surfaceHeight, transform, &drawError);
+        texture, textureTarget, impl_->surfaceWidth, impl_->surfaceHeight, transform, &drawError);
     if (!drawOk) {
         impl_->lastError = !drawError.empty() ? drawError : "diagnostic_render_frame_readback_draw_failed";
         return false;
