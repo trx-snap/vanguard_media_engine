@@ -121,6 +121,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
     required this.selectedHeight,
     required this.selectedSensorOrientationDegrees,
     required this.renderedRotationDegrees,
+    required this.renderedMirrorHorizontal,
     required this.imageFormatName,
     required this.targetFrameCount,
     required this.renderedFrames,
@@ -202,6 +203,9 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
   /// The effective rotation degrees (0, 90, 180, 270) passed to the native
   /// Vulkan render call.
   final int renderedRotationDegrees;
+
+  /// Whether horizontal mirroring was applied in the native Vulkan render call.
+  final bool renderedMirrorHorizontal;
 
   /// Always `PRIVATE` for this harness.
   final String imageFormatName;
@@ -320,6 +324,11 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
   bool get hasExpectedRenderRotation =>
       renderedRotationDegrees == selectedSensorOrientationDegrees;
 
+  /// Whether [renderedMirrorHorizontal] matches the expected front-facing mirror
+  /// behavior (`true` for front-facing, `false` otherwise).
+  bool get hasExpectedRenderMirror =>
+      renderedMirrorHorizontal == (selectedLensFacing == 'front');
+
   /// Whether the capture session, device, ImageReader, and native session
   /// were all confirmed torn down.
   bool get isCleanedUp =>
@@ -351,6 +360,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
         selectedHeight: 0,
         selectedSensorOrientationDegrees: -1,
         renderedRotationDegrees: 0,
+        renderedMirrorHorizontal: false,
         imageFormatName: 'PRIVATE',
         targetFrameCount: 0,
         renderedFrames: 0,
@@ -426,6 +436,8 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
           (raw['selectedSensorOrientationDegrees'] as num?)?.toInt() ?? -1,
       renderedRotationDegrees:
           (raw['renderedRotationDegrees'] as num?)?.toInt() ?? 0,
+      renderedMirrorHorizontal:
+          raw['renderedMirrorHorizontal'] as bool? ?? false,
       imageFormatName: (raw['imageFormatName'] as String?) ?? 'PRIVATE',
       targetFrameCount: (raw['targetFrameCount'] as num?)?.toInt() ?? 0,
       renderedFrames: (raw['renderedFrames'] as num?)?.toInt() ?? 0,
@@ -477,6 +489,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
       'selectedHeight': selectedHeight,
       'selectedSensorOrientationDegrees': selectedSensorOrientationDegrees,
       'renderedRotationDegrees': renderedRotationDegrees,
+      'renderedMirrorHorizontal': renderedMirrorHorizontal,
       'imageFormatName': imageFormatName,
       'targetFrameCount': targetFrameCount,
       'renderedFrames': renderedFrames,
@@ -548,6 +561,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
     String? cameraId,
     String? lensFacing,
     bool applySensorOrientationTransform = true,
+    bool? mirrorHorizontal,
     Duration timeout = const Duration(seconds: 10),
     int maxWidth = 640,
     int maxHeight = 480,
@@ -563,6 +577,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
       if (normalizedLensFacing != null && normalizedLensFacing.isNotEmpty)
         'lensFacing': normalizedLensFacing,
       'applySensorOrientationTransform': applySensorOrientationTransform,
+      'mirrorHorizontal': ?mirrorHorizontal,
       'timeoutMs': timeout.inMilliseconds,
       'maxWidth': maxWidth,
       'maxHeight': maxHeight,
@@ -614,6 +629,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
         other.selectedSensorOrientationDegrees ==
             selectedSensorOrientationDegrees &&
         other.renderedRotationDegrees == renderedRotationDegrees &&
+        other.renderedMirrorHorizontal == renderedMirrorHorizontal &&
         other.imageFormatName == imageFormatName &&
         other.targetFrameCount == targetFrameCount &&
         other.renderedFrames == renderedFrames &&
@@ -659,6 +675,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
       selectedHeight,
       selectedSensorOrientationDegrees,
       renderedRotationDegrees,
+      renderedMirrorHorizontal,
       imageFormatName,
       targetFrameCount,
       renderedFrames,
@@ -715,6 +732,7 @@ class VGCamera2TextureNativeRenderLoopSmokeReport {
       'selectedHeight: $selectedHeight, '
       'selectedSensorOrientationDegrees: $selectedSensorOrientationDegrees, '
       'renderedRotationDegrees: $renderedRotationDegrees, '
+      'renderedMirrorHorizontal: $renderedMirrorHorizontal, '
       'imageFormatName: $imageFormatName, '
       'targetFrameCount: $targetFrameCount, '
       'renderedFrames: $renderedFrames, '

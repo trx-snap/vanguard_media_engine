@@ -499,6 +499,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_bumpAndroi
 // ---------------------------------------------------------------------------
 // JNI: renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration
 // Phase 4B2C: added jint rotationDegrees parameter for UV-space transform.
+// Phase 3-Unit Q: added jboolean mirrorHorizontal parameter for horizontal mirror.
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration(
@@ -511,7 +512,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     jlong    timelinePtsUs,
     jint     frameIndex,
     jlong    generationIdJ,
-    jint     rotationDegrees) {
+    jint     rotationDegrees,
+    jboolean mirrorHorizontal) {
 
     char status[512];
 
@@ -601,8 +603,10 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 
     // Phase 4B2C: build VideoFrameTransform from jint rotationDegrees and call
     // the transform-aware renderFrame overload for UV-space rotation.
+    // Phase 3-Unit Q: set mirrorHorizontal from jboolean mirrorHorizontal.
     vanguard::render::VideoFrameTransform transform;
     transform.rotationDegrees = static_cast<uint32_t>(rotationDegrees);
+    transform.mirrorHorizontal = (mirrorHorizontal == JNI_TRUE);
 
     const auto renderResult = session->backend.renderFrame(handle, transform);
     const bool renderOk =
@@ -641,11 +645,13 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 
     std::snprintf(status, sizeof(status),
         "status=PASS;frameIndex=%d;renderedFrames=%d;generationId=%llu;"
-        "renderResult=%s;releaseResult=%s",
+        "renderResult=%s;releaseResult=%s;rotationDegrees=%d;mirrorHorizontal=%s",
         static_cast<int>(frameIndex),
         session->renderedFrames,
         static_cast<unsigned long long>(generationIdJ),
         RenderResultName(renderResult),
-        HwBufResultName(releaseResult));
+        HwBufResultName(releaseResult),
+        static_cast<int>(rotationDegrees),
+        (mirrorHorizontal == JNI_TRUE) ? "true" : "false");
     return env->NewStringUTF(status);
 }

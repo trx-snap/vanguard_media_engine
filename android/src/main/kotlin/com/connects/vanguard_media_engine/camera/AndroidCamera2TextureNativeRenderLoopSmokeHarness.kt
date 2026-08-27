@@ -104,6 +104,7 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
         val rawLensFacing = (args?.get("lensFacing") as? String)?.trim()?.lowercase()
         val requestedLensFacing = rawLensFacing?.takeIf { it.isNotBlank() }
         val applySensorOrientationTransform = (args?.get("applySensorOrientationTransform") as? Boolean) ?: true
+        val requestedMirrorHorizontal = args?.get("mirrorHorizontal") as? Boolean
         val timeoutMs = clampLong((args?.get("timeoutMs") as? Number)?.toLong(), DEFAULT_TIMEOUT_MS, MIN_TIMEOUT_MS, MAX_TIMEOUT_MS)
         val maxWidth = clampInt((args?.get("maxWidth") as? Number)?.toInt(), DEFAULT_MAX_WIDTH, MIN_DIMENSION, MAX_DIMENSION)
         val maxHeight = clampInt((args?.get("maxHeight") as? Number)?.toInt(), DEFAULT_MAX_HEIGHT, MIN_DIMENSION, MAX_DIMENSION)
@@ -121,6 +122,7 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
         var selectedHeight = 0
         var selectedSensorOrientationDegrees = -1
         var renderedRotationDegrees = 0
+        var renderedMirrorHorizontal = requestedMirrorHorizontal ?: false
 
         fun buildResult(
             decision: String,
@@ -170,6 +172,7 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
                     "renderedFrames=$renderedFrames targetFrameCount=$targetFrameCount " +
                     "cameraId=$selectedCameraId selectedSensorOrientationDegrees=$selectedSensorOrientationDegrees " +
                     "renderedRotationDegrees=$renderedRotationDegrees " +
+                    "renderedMirrorHorizontal=$renderedMirrorHorizontal " +
                     "textureId=$textureId durationMs=$durationMs",
             )
             return mapOf(
@@ -188,6 +191,7 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
                 "selectedHeight" to selectedHeight,
                 "selectedSensorOrientationDegrees" to selectedSensorOrientationDegrees,
                 "renderedRotationDegrees" to renderedRotationDegrees,
+                "renderedMirrorHorizontal" to renderedMirrorHorizontal,
                 "imageFormatName" to "PRIVATE",
                 "targetFrameCount" to targetFrameCount,
                 "renderedFrames" to renderedFrames,
@@ -251,6 +255,7 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
         // Guard 2a: nonblank invalid lensFacing fails closed only when requestedCameraId is blank/null.
         if (requestedCameraId.isNullOrBlank() && requestedLensFacing != null && !VALID_LENS_FACINGS.contains(requestedLensFacing)) {
             selectedLensFacing = requestedLensFacing
+            renderedMirrorHorizontal = requestedMirrorHorizontal ?: (selectedLensFacing == "front")
             reasons.add("requested_lens_facing_invalid")
             return buildResult("cameraUnavailable")
         }
@@ -266,11 +271,13 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
         // Guard 2b: an explicitly requested lensFacing (no cameraId given) matched no camera.
         if (cameraId == null) {
             selectedLensFacing = requestedLensFacing ?: "unknown"
+            renderedMirrorHorizontal = requestedMirrorHorizontal ?: (selectedLensFacing == "front")
             reasons.add("requested_lens_facing_not_found")
             return buildResult("cameraUnavailable")
         }
         selectedCameraId = cameraId
         selectedLensFacing = lensFacingName(cameraManager, cameraId)
+        renderedMirrorHorizontal = requestedMirrorHorizontal ?: (selectedLensFacing == "front")
 
         // Guard 3: permission absent.
         if (!hasCameraPermission) {
@@ -507,6 +514,7 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
                                                     frameIndex,
                                                     activeGenerationId,
                                                     renderedRotationDegrees,
+                                                    renderedMirrorHorizontal,
                                                 )
                                             } catch (t: Throwable) {
                                                 Log.w(TAG, "renderAndroidDagPhase4B1TexturePlaybackFrameForGeneration failed: ${t.javaClass.simpleName}: ${t.message}")

@@ -24,6 +24,7 @@ struct VideoFrameTransform {
     // Cardinal clockwise rotation of the recorded video content.
     // Valid values: 0, 90, 180, 270. All other values are treated as 0.
     uint32_t rotationDegrees = 0;
+    bool mirrorHorizontal = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -66,7 +67,7 @@ inline uint32_t normalizeRotation(uint32_t degrees) {
 
 // ---------------------------------------------------------------------------
 // makeVideoTransformPushConstants
-// Builds the push constants for the given cardinal rotation.
+// Builds the push constants for the given cardinal rotation and horizontal mirror.
 // ---------------------------------------------------------------------------
 
 inline VideoTransformPushConstants makeVideoTransformPushConstants(
@@ -75,45 +76,87 @@ inline VideoTransformPushConstants makeVideoTransformPushConstants(
     VideoTransformPushConstants pc{};
     const uint32_t rot = normalizeRotation(transform.rotationDegrees);
 
-    // Rotation      u formula         v formula
-    // 0 deg      u = x            v = y
-    // 90 CW      u = y            v = 1 - x
-    // 180        u = 1 - x        v = 1 - y
-    // 270 CW     u = 1 - y        v = x
+    if (transform.mirrorHorizontal) {
+        // Mirrored cases use display-space horizontal mirror before rotation:
+        // rot0:   u = 1 - x, v = y   => [-1, 0, 0, 1], [ 0,  1, 0, 0]
+        // rot90:  u = y,     v = x   => [ 0, 1, 0, 0], [ 1,  0, 0, 0]
+        // rot180: u = x,     v = 1-y => [ 1, 0, 0, 0], [ 0, -1, 0, 1]
+        // rot270: u = 1 - y, v = 1-x => [ 0, -1, 0, 1], [-1,  0, 0, 1]
+        switch (rot) {
+            case 90:
+                // u = y    -> [0, 1, 0, 0]
+                // v = x    -> [1, 0, 0, 0]
+                pc.uvTransform0[0] =  0.0f; pc.uvTransform0[1] =  1.0f;
+                pc.uvTransform0[2] =  0.0f; pc.uvTransform0[3] =  0.0f;
+                pc.uvTransform1[0] =  1.0f; pc.uvTransform1[1] =  0.0f;
+                pc.uvTransform1[2] =  0.0f; pc.uvTransform1[3] =  0.0f;
+                break;
+            case 180:
+                // u = x    -> [1,  0, 0, 0]
+                // v = 1-y  -> [0, -1, 0, 1]
+                pc.uvTransform0[0] =  1.0f; pc.uvTransform0[1] =  0.0f;
+                pc.uvTransform0[2] =  0.0f; pc.uvTransform0[3] =  0.0f;
+                pc.uvTransform1[0] =  0.0f; pc.uvTransform1[1] = -1.0f;
+                pc.uvTransform1[2] =  0.0f; pc.uvTransform1[3] =  1.0f;
+                break;
+            case 270:
+                // u = 1-y  -> [ 0, -1, 0, 1]
+                // v = 1-x  -> [-1,  0, 0, 1]
+                pc.uvTransform0[0] =  0.0f; pc.uvTransform0[1] = -1.0f;
+                pc.uvTransform0[2] =  0.0f; pc.uvTransform0[3] =  1.0f;
+                pc.uvTransform1[0] = -1.0f; pc.uvTransform1[1] =  0.0f;
+                pc.uvTransform1[2] =  0.0f; pc.uvTransform1[3] =  1.0f;
+                break;
+            default: // 0 deg mirrored
+                // u = 1-x  -> [-1, 0, 0, 1]
+                // v = y    -> [ 0, 1, 0, 0]
+                pc.uvTransform0[0] = -1.0f; pc.uvTransform0[1] =  0.0f;
+                pc.uvTransform0[2] =  0.0f; pc.uvTransform0[3] =  1.0f;
+                pc.uvTransform1[0] =  0.0f; pc.uvTransform1[1] =  1.0f;
+                pc.uvTransform1[2] =  0.0f; pc.uvTransform1[3] =  0.0f;
+                break;
+        }
+    } else {
+        // Rotation      u formula         v formula
+        // 0 deg      u = x            v = y
+        // 90 CW      u = y            v = 1 - x
+        // 180        u = 1 - x        v = 1 - y
+        // 270 CW     u = 1 - y        v = x
 
-    switch (rot) {
-        case 90:
-            // u = y    -> [0, 1, 0, 0]
-            // v = 1-x  -> [-1, 0, 0, 1]
-            pc.uvTransform0[0] =  0.0f; pc.uvTransform0[1] =  1.0f;
-            pc.uvTransform0[2] =  0.0f; pc.uvTransform0[3] =  0.0f;
-            pc.uvTransform1[0] = -1.0f; pc.uvTransform1[1] =  0.0f;
-            pc.uvTransform1[2] =  0.0f; pc.uvTransform1[3] =  1.0f;
-            break;
-        case 180:
-            // u = 1-x  -> [-1, 0, 0, 1]
-            // v = 1-y  -> [0, -1, 0, 1]
-            pc.uvTransform0[0] = -1.0f; pc.uvTransform0[1] =  0.0f;
-            pc.uvTransform0[2] =  0.0f; pc.uvTransform0[3] =  1.0f;
-            pc.uvTransform1[0] =  0.0f; pc.uvTransform1[1] = -1.0f;
-            pc.uvTransform1[2] =  0.0f; pc.uvTransform1[3] =  1.0f;
-            break;
-        case 270:
-            // u = 1-y  -> [0, -1, 0, 1]
-            // v = x    -> [1,  0, 0, 0]
-            pc.uvTransform0[0] =  0.0f; pc.uvTransform0[1] = -1.0f;
-            pc.uvTransform0[2] =  0.0f; pc.uvTransform0[3] =  1.0f;
-            pc.uvTransform1[0] =  1.0f; pc.uvTransform1[1] =  0.0f;
-            pc.uvTransform1[2] =  0.0f; pc.uvTransform1[3] =  0.0f;
-            break;
-        default: // 0 deg identity
-            // u = x    -> [1, 0, 0, 0]
-            // v = y    -> [0, 1, 0, 0]
-            pc.uvTransform0[0] =  1.0f; pc.uvTransform0[1] =  0.0f;
-            pc.uvTransform0[2] =  0.0f; pc.uvTransform0[3] =  0.0f;
-            pc.uvTransform1[0] =  0.0f; pc.uvTransform1[1] =  1.0f;
-            pc.uvTransform1[2] =  0.0f; pc.uvTransform1[3] =  0.0f;
-            break;
+        switch (rot) {
+            case 90:
+                // u = y    -> [0, 1, 0, 0]
+                // v = 1-x  -> [-1, 0, 0, 1]
+                pc.uvTransform0[0] =  0.0f; pc.uvTransform0[1] =  1.0f;
+                pc.uvTransform0[2] =  0.0f; pc.uvTransform0[3] =  0.0f;
+                pc.uvTransform1[0] = -1.0f; pc.uvTransform1[1] =  0.0f;
+                pc.uvTransform1[2] =  0.0f; pc.uvTransform1[3] =  1.0f;
+                break;
+            case 180:
+                // u = 1-x  -> [-1, 0, 0, 1]
+                // v = 1-y  -> [0, -1, 0, 1]
+                pc.uvTransform0[0] = -1.0f; pc.uvTransform0[1] =  0.0f;
+                pc.uvTransform0[2] =  0.0f; pc.uvTransform0[3] =  1.0f;
+                pc.uvTransform1[0] =  0.0f; pc.uvTransform1[1] = -1.0f;
+                pc.uvTransform1[2] =  0.0f; pc.uvTransform1[3] =  1.0f;
+                break;
+            case 270:
+                // u = 1-y  -> [0, -1, 0, 1]
+                // v = x    -> [1,  0, 0, 0]
+                pc.uvTransform0[0] =  0.0f; pc.uvTransform0[1] = -1.0f;
+                pc.uvTransform0[2] =  0.0f; pc.uvTransform0[3] =  1.0f;
+                pc.uvTransform1[0] =  1.0f; pc.uvTransform1[1] =  0.0f;
+                pc.uvTransform1[2] =  0.0f; pc.uvTransform1[3] =  0.0f;
+                break;
+            default: // 0 deg identity
+                // u = x    -> [1, 0, 0, 0]
+                // v = y    -> [0, 1, 0, 0]
+                pc.uvTransform0[0] =  1.0f; pc.uvTransform0[1] =  0.0f;
+                pc.uvTransform0[2] =  0.0f; pc.uvTransform0[3] =  0.0f;
+                pc.uvTransform1[0] =  0.0f; pc.uvTransform1[1] =  1.0f;
+                pc.uvTransform1[2] =  0.0f; pc.uvTransform1[3] =  0.0f;
+                break;
+        }
     }
     return pc;
 }

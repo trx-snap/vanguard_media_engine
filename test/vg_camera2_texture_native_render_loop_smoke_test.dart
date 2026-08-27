@@ -22,6 +22,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) => {
   'selectedHeight': 480,
   'selectedSensorOrientationDegrees': 90,
   'renderedRotationDegrees': 90,
+  'renderedMirrorHorizontal': false,
   'imageFormatName': 'PRIVATE',
   'targetFrameCount': 5,
   'renderedFrames': 5,
@@ -185,7 +186,9 @@ void main() {
         expect(report.selectedHeight, equals(480));
         expect(report.selectedSensorOrientationDegrees, equals(90));
         expect(report.renderedRotationDegrees, equals(90));
+        expect(report.renderedMirrorHorizontal, isFalse);
         expect(report.hasExpectedRenderRotation, isTrue);
+        expect(report.hasExpectedRenderMirror, isTrue);
         expect(report.imageFormatName, equals('PRIVATE'));
         expect(report.targetFrameCount, equals(5));
         expect(report.renderedFrames, equals(5));
@@ -247,6 +250,7 @@ void main() {
         expect(serialized['selectedHeight'], equals(480));
         expect(serialized['selectedSensorOrientationDegrees'], equals(90));
         expect(serialized['renderedRotationDegrees'], equals(90));
+        expect(serialized['renderedMirrorHorizontal'], isFalse);
         expect(serialized['imageFormatName'], equals('PRIVATE'));
         expect(serialized['targetFrameCount'], equals(5));
         expect(serialized['renderedFrames'], equals(5));
@@ -588,6 +592,7 @@ void main() {
               selectedHeight: 0,
               selectedSensorOrientationDegrees: -1,
               renderedRotationDegrees: 0,
+              renderedMirrorHorizontal: false,
               imageFormatName: 'PRIVATE',
               targetFrameCount: 0,
               renderedFrames: 0,
@@ -627,6 +632,7 @@ void main() {
           'selectedHeight': 480.0,
           'selectedSensorOrientationDegrees': 90.0,
           'renderedRotationDegrees': 90.0,
+          'renderedMirrorHorizontal': true,
           'targetFrameCount': 5.0,
           'renderedFrames': 5.0,
           'hardwareBufferFrameCount': 5.0,
@@ -653,6 +659,7 @@ void main() {
         expect(parsed.selectedHeight, equals(480));
         expect(parsed.selectedSensorOrientationDegrees, equals(90));
         expect(parsed.renderedRotationDegrees, equals(90));
+        expect(parsed.renderedMirrorHorizontal, isTrue);
         expect(parsed.targetFrameCount, equals(5));
         expect(parsed.renderedFrames, equals(5));
         expect(parsed.hardwareBufferFrameCount, equals(5));
@@ -833,6 +840,46 @@ void main() {
         }
       },
     );
+    test(
+      'hasExpectedRenderMirror evaluates true for matching lensFacing and mirror settings',
+      () {
+        expect(
+          _createSampleReport({
+            'selectedLensFacing': 'front',
+            'renderedMirrorHorizontal': true,
+          }).hasExpectedRenderMirror,
+          isTrue,
+        );
+        expect(
+          _createSampleReport({
+            'selectedLensFacing': 'back',
+            'renderedMirrorHorizontal': false,
+          }).hasExpectedRenderMirror,
+          isTrue,
+        );
+        expect(
+          _createSampleReport({
+            'selectedLensFacing': 'external',
+            'renderedMirrorHorizontal': false,
+          }).hasExpectedRenderMirror,
+          isTrue,
+        );
+        expect(
+          _createSampleReport({
+            'selectedLensFacing': 'front',
+            'renderedMirrorHorizontal': false,
+          }).hasExpectedRenderMirror,
+          isFalse,
+        );
+        expect(
+          _createSampleReport({
+            'selectedLensFacing': 'back',
+            'renderedMirrorHorizontal': true,
+          }).hasExpectedRenderMirror,
+          isFalse,
+        );
+      },
+    );
   });
 
   group('VGCamera2TextureNativeRenderLoopSmokeReport value semantics', () {
@@ -855,6 +902,7 @@ void main() {
         'selectedHeight: 480',
         'selectedSensorOrientationDegrees: 90',
         'renderedRotationDegrees: 90',
+        'renderedMirrorHorizontal: false',
         'targetFrameCount: 5',
         'renderedFrames: 5',
         'hardwareBufferFrameCount: 5',
@@ -912,6 +960,7 @@ void main() {
         {'selectedHeight': 720},
         {'selectedSensorOrientationDegrees': 270},
         {'renderedRotationDegrees': 180},
+        {'renderedMirrorHorizontal': true},
         {'imageFormatName': 'YUV_420_888'},
         {'targetFrameCount': 10},
         {'renderedFrames': 4},

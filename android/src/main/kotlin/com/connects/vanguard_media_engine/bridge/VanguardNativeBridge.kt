@@ -99,6 +99,7 @@ class VanguardNativeBridge(
         frameIndex: Int,
         generationId: Long,
         rotationDegrees: Int,
+        mirrorHorizontal: Boolean,
     ): String
 
     // ── Phase 5: MediaCodec encoder input surface smoke ─────────────────────

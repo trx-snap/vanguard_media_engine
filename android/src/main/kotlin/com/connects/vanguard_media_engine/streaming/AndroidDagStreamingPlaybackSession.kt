@@ -548,6 +548,7 @@ class AndroidDagStreamingPlaybackSession(
                     frameIndex = fIndex,
                     generationId = gen,
                     rotationDegrees = rot,
+                    mirrorHorizontal = false,
                 )
             } catch (t: Throwable) {
                 Log.e(TAG, "renderFrame threw exception", t)

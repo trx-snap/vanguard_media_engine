@@ -140,6 +140,7 @@ class AndroidDagFrameRenderPump {
                             localRenderedFrames,
                             currentGenerationId,
                             rotationDegrees,
+                            false,
                         )
 
                         if (renderStr.startsWith("status=PASS;")) {

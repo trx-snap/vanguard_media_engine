@@ -295,6 +295,7 @@ class AndroidDagTexturePlaybackSmokeSession(
                                                     renderedFrames,
                                                     currentGenerationId,
                                                     rotationDegrees,
+                                                    false,
                                                 )
 
                                                 if (renderStr.startsWith("status=PASS;")) {

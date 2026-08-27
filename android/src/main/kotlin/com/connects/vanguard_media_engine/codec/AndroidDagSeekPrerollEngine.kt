@@ -215,6 +215,7 @@ class AndroidDagSeekPrerollEngine {
                             renderedFrames,
                             currentGenerationId,
                             rotationDegrees,
+                            false,
                         )
 
                         if (renderStr.startsWith("status=PASS;")) {
