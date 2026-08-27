@@ -6,16 +6,20 @@
 namespace vanguard {
 namespace render {
 
-// Phase Unit U/V/W/X/Y: GlesBackend owns an offscreen EGL/GLES lifecycle on
+// Phase Unit U/V/W/X/Y/Z: GlesBackend owns an offscreen EGL/GLES lifecycle on
 // Android, plus (Unit V) attach/detach of a window EGLSurface built from a
 // borrowed ANativeWindow*, plus (Unit W) a diagnostic clear/swap presentation
 // on an already-attached window surface, plus (Unit X) a diagnostic minimal
 // ES2 shader-quad draw/swap on an already-attached window surface, plus
 // (Unit Y) AHardwareBuffer import/release for RGBA_8888/RGBX_8888
-// GPU-sampled buffers (EGLImage + GL_TEXTURE_2D only; no renderFrame()
-// sampling support yet). EGL/GLES/Android headers must never appear in this
-// public header; all such state lives exclusively in gles_backend.cpp and
-// the private GlesHardwareBufferImports helper behind the Impl pimpl.
+// GPU-sampled buffers (EGLImage + GL_TEXTURE_2D only), plus (Unit Z) an
+// identity renderFrame(handle) that draws the imported GL_TEXTURE_2D as a
+// full-window textured quad on the attached window surface and swaps.
+// Rotation/mirror transforms are not yet supported; the transform overload
+// only accepts the identity transform. EGL/GLES/Android headers must never
+// appear in this public header; all such state lives exclusively in
+// gles_backend.cpp and the private GlesHardwareBufferImports /
+// GlesTextureFrameRenderer helpers behind the Impl pimpl.
 class GlesBackend : public RenderBackend {
 public:
     GlesBackend();
@@ -55,10 +59,18 @@ public:
 
     bool hasHardwareBuffer(HardwareBufferHandle handle) const override;
 
-    // Phase 2O1: Frame rendering seam stub - GLES backend does not support this.
+    // Phase 1 Unit Z: draws the imported GL_TEXTURE_2D identified by handle
+    // as a full-window textured quad on the attached window EGLSurface and
+    // swaps it. Requires an initialized backend with a window surface
+    // attached and a handle from a successful importHardwareBuffer(); see
+    // RenderFrameResult for explicit failure states. Unavailable on
+    // non-Android host builds.
     RenderFrameResult renderFrame(HardwareBufferHandle handle) override;
 
-    // Phase 4B2C: transform overload stub - GLES backend does not support this.
+    // Phase 4B2C: identity-only transform overload. Delegates to
+    // renderFrame(handle) when transform normalizes to no rotation and no
+    // horizontal mirror; otherwise returns kUnavailable (rotation/mirror
+    // sampling is not yet implemented).
     RenderFrameResult renderFrame(HardwareBufferHandle handle,
                                   const VideoFrameTransform& transform) override;
 

@@ -14,6 +14,11 @@
 // renderFrame(), shader sampling, YUV/external-texture formats, or waiting
 // on the acquire fence's native fence sync (the fd is owned/closed, never
 // waited on).
+//
+// Unit Z adds textureForHandle(), a read-only accessor to the GL texture
+// name already owned by an active import record, so GlesBackend::renderFrame
+// can sample it. It does not change import/release/duplicate/shutdown
+// ownership or behavior.
 
 #pragma once
 #include "vanguard/render/hardware_buffer_import.h"
@@ -63,6 +68,13 @@ public:
         int* outReleaseFenceFd);
 
     bool hasBuffer(HardwareBufferHandle handle) const;
+
+    // Phase 1 Unit Z: returns the GL_TEXTURE_2D name stored for an active
+    // import, or 0 if handle is unknown, no texture was created for it, or
+    // on non-Android host builds. Not part of the public GlesBackend API;
+    // consumed only by GlesBackend::renderFrame(). Never exposes EGL/GLES
+    // types through this header.
+    uint32_t textureForHandle(HardwareBufferHandle handle) const;
 
     // Human-readable description of the last importBuffer()/releaseBuffer()
     // failure, or "" if the last call succeeded.

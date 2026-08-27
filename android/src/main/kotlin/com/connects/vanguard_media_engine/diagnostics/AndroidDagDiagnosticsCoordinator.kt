@@ -48,6 +48,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1WGlesWindowPresentSmoke",
             "runAndroidDagPhase1XGlesShaderQuadSmoke",
             "runAndroidDagPhase1YGlesImportSmoke",
+            "runAndroidDagPhase1ZGlesRenderFrameSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -82,6 +83,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1WGlesWindowPresentSmoke" -> runPhase1WGlesWindowPresentSmoke(args, result)
             "runAndroidDagPhase1XGlesShaderQuadSmoke" -> runPhase1XGlesShaderQuadSmoke(args, result)
             "runAndroidDagPhase1YGlesImportSmoke" -> runPhase1YGlesImportSmoke(args, result)
+            "runAndroidDagPhase1ZGlesRenderFrameSmoke" -> runPhase1ZGlesRenderFrameSmoke(args, result)
             else -> return false
         }
         return true
@@ -442,6 +444,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_IMPORT_SMOKE_FAILED",
                         "runAndroidDagPhase1YGlesImportSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit Z: Android GLES backend identity renderFrame textured-quad presentation smoke ──
+    private fun runPhase1ZGlesRenderFrameSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesRenderFrameSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_RENDER_FRAME_SMOKE_FAILED",
+                        "runAndroidDagPhase1ZGlesRenderFrameSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

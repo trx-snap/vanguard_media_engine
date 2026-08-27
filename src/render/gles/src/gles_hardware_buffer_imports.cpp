@@ -349,6 +349,19 @@ bool GlesHardwareBufferImports::hasBuffer(HardwareBufferHandle handle) const {
 }
 
 // ---------------------------------------------------------------------------
+// textureForHandle() -- Unit Z
+// ---------------------------------------------------------------------------
+
+uint32_t GlesHardwareBufferImports::textureForHandle(HardwareBufferHandle handle) const {
+    const Impl& s = *impl_;
+    auto it = s.records.find(handle);
+    if (it == s.records.end()) {
+        return 0;
+    }
+    return static_cast<uint32_t>(it->second.texture);
+}
+
+// ---------------------------------------------------------------------------
 // lastError()
 // ---------------------------------------------------------------------------
 
@@ -413,6 +426,10 @@ HardwareBufferImportResult GlesHardwareBufferImports::releaseBuffer(
 
 bool GlesHardwareBufferImports::hasBuffer(HardwareBufferHandle /*handle*/) const {
     return false;
+}
+
+uint32_t GlesHardwareBufferImports::textureForHandle(HardwareBufferHandle /*handle*/) const {
+    return 0;
 }
 
 const char* GlesHardwareBufferImports::lastError() const {

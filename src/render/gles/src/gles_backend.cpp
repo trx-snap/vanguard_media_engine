@@ -18,6 +18,13 @@
 //     surface current, compiles/links a minimal ES2 shader program, draws a
 //     full-window solid-color quad with it, and swaps, cleaning up the
 //     temporary shader/program/buffer objects on every path.
+//   - Unit Z: renderFrame(handle) makes the attached window surface current,
+//     resolves handle to its imported GL_TEXTURE_2D via
+//     GlesHardwareBufferImports::textureForHandle(), draws it as a
+//     full-window textured quad via the private GlesTextureFrameRenderer
+//     helper, and swaps. The imported texture is never deleted or otherwise
+//     mutated by this path. The transform overload supports the identity
+//     transform only.
 //
 // On non-Android host builds:
 //   - No EGL/GLES headers included.
@@ -29,9 +36,12 @@
 //     always fails with lastError="window_present_unavailable_on_host".
 //   - Unit X: diagnosticPresentWindowShaderQuad() on an initialized backend
 //     always fails with lastError="window_shader_unavailable_on_host".
+//   - Unit Z: renderFrame(handle) on an initialized backend always fails
+//     with lastError="gles_render_frame_unavailable_on_host".
 
 #include "vanguard/render/gles_backend.h"
 #include "gles_hardware_buffer_imports.h"
+#include "gles_texture_frame_renderer.h"
 
 #if defined(__ANDROID__)
 #include <EGL/egl.h>
@@ -73,6 +83,12 @@ struct GlesBackend::Impl {
     // stub behavior on non-Android host builds.
     std::unique_ptr<GlesHardwareBufferImports> ahbImports =
         std::make_unique<GlesHardwareBufferImports>();
+
+    // Unit Z: identity textured-quad draw helper for renderFrame(). Owned
+    // regardless of platform; preserves safe unavailable-stub behavior on
+    // non-Android host builds.
+    std::unique_ptr<GlesTextureFrameRenderer> textureFrameRenderer =
+        std::make_unique<GlesTextureFrameRenderer>();
 };
 
 // ---------------------------------------------------------------------------
@@ -716,19 +732,69 @@ bool GlesBackend::hasHardwareBuffer(HardwareBufferHandle handle) const {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2O1: renderFrame stub - GLES backend.
+// Phase 1 Unit Z: identity renderFrame - draws the imported GL_TEXTURE_2D as
+// a full-window textured quad on the attached window surface and swaps.
 // ---------------------------------------------------------------------------
 
-RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle /*handle*/) {
+RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle handle) {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+
+#if defined(__ANDROID__)
+    if (!hasSurface()) {
+        impl_->lastError = "no_surface_attached";
+        return RenderFrameResult::kNoSurface;
+    }
+
+    const uint32_t texture = impl_->ahbImports->textureForHandle(handle);
+    if (texture == 0) {
+        impl_->lastError = "invalid_buffer_handle";
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+
+    if (eglMakeCurrent(impl_->display, impl_->windowSurface, impl_->windowSurface, impl_->context) != EGL_TRUE) {
+        impl_->lastError = "gles_render_frame_make_current_failed";
+        return RenderFrameResult::kUnavailable;
+    }
+
+    std::string drawError;
+    const bool drawOk = impl_->textureFrameRenderer->drawTexturedQuad(
+        texture, impl_->surfaceWidth, impl_->surfaceHeight, &drawError);
+    if (!drawOk) {
+        impl_->lastError = !drawError.empty() ? drawError : "gles_render_frame_draw_failed";
+        return RenderFrameResult::kUnavailable;
+    }
+
+    if (eglSwapBuffers(impl_->display, impl_->windowSurface) != EGL_TRUE) {
+        impl_->lastError = "gles_render_frame_swap_failed";
+        return RenderFrameResult::kUnavailable;
+    }
+
+    impl_->lastError.clear();
+    return RenderFrameResult::kSuccess;
+#else
+    (void)handle;
+    impl_->lastError = "gles_render_frame_unavailable_on_host";
     return RenderFrameResult::kUnavailable;
+#endif
 }
 
 // ---------------------------------------------------------------------------
-// Phase 4B2C: renderFrame with transform stub - GLES backend.
+// Phase 4B2C: renderFrame with transform - GLES backend supports the
+// identity transform only (Unit Z scope); any rotation or horizontal mirror
+// is not yet implemented.
 // ---------------------------------------------------------------------------
 
-RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle /*handle*/,
-                                           const VideoFrameTransform& /*transform*/) {
+RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle handle,
+                                           const VideoFrameTransform& transform) {
+    if (normalizeRotation(transform.rotationDegrees) == 0 && !transform.mirrorHorizontal) {
+        return renderFrame(handle);
+    }
+    impl_->lastError = "gles_render_frame_transform_unavailable";
     return RenderFrameResult::kUnavailable;
 }
 

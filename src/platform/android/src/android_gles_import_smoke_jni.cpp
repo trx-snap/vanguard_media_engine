@@ -189,9 +189,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     const bool hasAAfterDuplicate = backend.hasHardwareBuffer(hA);
     const bool duplicateCheckOk = duplicateOk && hasAAfterDuplicate;
 
-    // 6. renderFrame(handleA) remains kUnavailable
+    // 6. renderFrame(handleA) before attach returns kNoSurface (Unit Z foundation)
     const auto renderRes = backend.renderFrame(hA);
-    const bool renderUnavailable = (renderRes == vanguard::render::RenderFrameResult::kUnavailable);
+    const bool renderNoSurface = (renderRes == vanguard::render::RenderFrameResult::kNoSurface);
 
     // 7. Import bufferB succeeds with distinct handle; both handles active
     vanguard::render::HardwareBufferHandle hB = vanguard::render::kInvalidHardwareBufferHandle;
@@ -234,7 +234,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                                nullDescOk &&
                                importACheckOk &&
                                duplicateCheckOk &&
-                               renderUnavailable &&
+                               renderNoSurface &&
                                importBCheckOk &&
                                releaseCheckOk &&
                                shutdownCheckOk;
@@ -261,7 +261,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "duplicateImport=" << (duplicateOk ? "rejected_as_expected" : "failed") << ";"
         << "duplicateHandle=" << hDup << ";"
         << "hasAAfterDuplicate=" << (hasAAfterDuplicate ? "true" : "false") << ";"
-        << "renderFrame=" << (renderUnavailable ? "unavailable" : "unexpected_result") << ";"
+        << "renderFrame=" << (renderNoSurface ? "no_surface" : "unexpected_result") << ";"
         << "validImportB=" << (validImportB ? "success" : "failed") << ";"
         << "handleB=" << hB << ";"
         << "distinctHandles=" << (distinctHandles ? "true" : "false") << ";"

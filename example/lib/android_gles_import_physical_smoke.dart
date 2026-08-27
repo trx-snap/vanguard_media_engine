@@ -130,7 +130,7 @@ class _AndroidGlesImportPhysicalSmokeAppState
         duplicateImport == 'rejected_as_expected' &&
         duplicateHandle == 0 &&
         hasAAfterDuplicate &&
-        renderFrame == 'unavailable' &&
+        renderFrame == 'no_surface' &&
         validImportB == 'success' &&
         handleB > 0 &&
         distinctHandles &&
