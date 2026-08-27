@@ -183,13 +183,22 @@ class AndroidCamera2TextureSmokeCoordinator(
         if (!entry.released.compareAndSet(false, true)) {
             return false
         }
-        return try {
-            entry.surfaceProducer.release()
-            true
-        } catch (t: Throwable) {
-            Log.w(TAG, "surfaceProducer.release() failed: ${t.javaClass.simpleName}: ${t.message}")
-            false
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            try {
+                entry.surfaceProducer.release()
+            } catch (t: Throwable) {
+                Log.w(TAG, "surfaceProducer.release() failed: ${t.javaClass.simpleName}: ${t.message}")
+            }
+        } else {
+            mainHandler.post {
+                try {
+                    entry.surfaceProducer.release()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "surfaceProducer.release() on mainHandler failed: ${t.javaClass.simpleName}: ${t.message}")
+                }
+            }
         }
+        return true
     }
 
     private fun clampInt(raw: Int?, default: Int, min: Int, max: Int): Int {

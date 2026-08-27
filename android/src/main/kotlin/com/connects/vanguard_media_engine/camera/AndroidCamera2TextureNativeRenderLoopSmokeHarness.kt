@@ -532,6 +532,20 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
 
                             val deviceStateCallback = object : CameraDevice.StateCallback() {
                                 override fun onOpened(device: CameraDevice) {
+                                    if (terminalReached.get()) {
+                                        events.add("onOpenedAfterTerminal")
+                                        openedFlag.set(true)
+                                        deviceRef.set(device)
+                                        try {
+                                            device.close()
+                                        } catch (t: Throwable) {
+                                            Log.w(TAG, "device.close() on late open failed: ${t.javaClass.simpleName}: ${t.message}")
+                                        }
+                                        openLatch.countDown()
+                                        configureLatch.countDown()
+                                        frameLatch.countDown()
+                                        return
+                                    }
                                     events.add("onOpened")
                                     openedFlag.set(true)
                                     deviceRef.set(device)
@@ -617,6 +631,19 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
 
                                             val sessionStateCallback = object : CameraCaptureSession.StateCallback() {
                                                 override fun onConfigured(session: CameraCaptureSession) {
+                                                    if (terminalReached.get()) {
+                                                        events.add("onConfiguredAfterTerminal")
+                                                        sessionRef.set(session)
+                                                        sessionConfiguredFlag.set(true)
+                                                        try {
+                                                            session.close()
+                                                        } catch (t: Throwable) {
+                                                            Log.w(TAG, "session.close() on late configure failed: ${t.javaClass.simpleName}: ${t.message}")
+                                                        }
+                                                        configureLatch.countDown()
+                                                        frameLatch.countDown()
+                                                        return
+                                                    }
                                                     events.add("onConfigured")
                                                     sessionRef.set(session)
                                                     sessionConfiguredFlag.set(true)
@@ -775,6 +802,51 @@ class AndroidCamera2TextureNativeRenderLoopSmokeHarness(private val context: Con
             }
             if (ignoredFramesAfterTerminal.get() > 0) {
                 diagnosticsMap["ignoredFramesAfterTerminal"] = ignoredFramesAfterTerminal.get()
+            }
+
+            if (decisionRef.get() == "disposed" && attemptedOpen) {
+                val lateSession = sessionRef.get()
+                if (lateSession != null) {
+                    try {
+                        lateSession.close()
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "late session.close() failed: ${t.javaClass.simpleName}: ${t.message}")
+                    }
+                }
+                if (!sessionClosedFlag.get() && (lateSession != null || sessionConfiguredFlag.get())) {
+                    try {
+                        sessionClosedLatch.await(CLOSE_WAIT_MS, TimeUnit.MILLISECONDS)
+                    } catch (t: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                }
+
+                val lateDevice = deviceRef.get()
+                if (lateDevice != null) {
+                    try {
+                        lateDevice.close()
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "late device.close() failed: ${t.javaClass.simpleName}: ${t.message}")
+                    }
+                }
+                if (!deviceClosedFlag.get()) {
+                    try {
+                        deviceClosedLatch.await(CLOSE_WAIT_MS, TimeUnit.MILLISECONDS)
+                    } catch (t: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                }
+
+                try {
+                    sessionRef.get()?.close()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "final late session.close() failed: ${t.javaClass.simpleName}: ${t.message}")
+                }
+                try {
+                    deviceRef.get()?.close()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "final late device.close() failed: ${t.javaClass.simpleName}: ${t.message}")
+                }
             }
 
             handlerThread.quitSafely()
