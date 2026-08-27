@@ -89,6 +89,7 @@ if (ANDROID)
     "platform/android/src/android_gles_two_texture_compositor_smoke_jni.cpp"
     "platform/android/src/android_gles_mixed_texture_compositor_smoke_jni.cpp"
     "platform/android/src/android_gles_eval_render_smoke_jni.cpp"
+    "platform/android/src/android_gles_texture_render_smoke_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
 

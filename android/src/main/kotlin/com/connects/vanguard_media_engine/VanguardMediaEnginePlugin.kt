@@ -12,6 +12,7 @@ import androidx.annotation.NonNull
 import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
 import com.connects.vanguard_media_engine.image.AndroidImageOptimizer
@@ -49,6 +50,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
 
     // ── Diagnostic smoke routes (Phases 2O2B3/2O2B4/2Q/3C/4A/5 + Audio Unit B) ─
     private var dagDiagnosticsCoordinator: AndroidDagDiagnosticsCoordinator? = null
+
+    // ── Phase 1-Unit AX: GLES SurfaceProducer texture DAG render smoke coordinator ──
+    private var glesTextureSmokeCoordinator: AndroidGlesTextureSmokeCoordinator? = null
 
     // ── Export Unit C: production exportTimeline coordinator ──────────────────
     // Owns only "exportTimeline". Does NOT own "cancelExport" — the plugin
@@ -114,6 +118,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             channel     = channel,
             mainHandler = mainHandler,
         )
+        glesTextureSmokeCoordinator = AndroidGlesTextureSmokeCoordinator(
+            textureRegistry = binding.textureRegistry,
+            channel         = channel,
+            mainHandler     = mainHandler,
+        )
     }
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
@@ -175,6 +184,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android DAG diagnostics coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidGlesTextureSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = glesTextureSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android GLES texture smoke coordinator unavailable", null)
             }
             return
         }
@@ -1204,5 +1223,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         // Export Unit C: cancel any in-flight exportTimeline and drop temps.
         editorExportCoordinator?.disposeAll()
         editorExportCoordinator = null
+        // Tear down Phase 1-Unit AX active GLES texture smoke runs and release their producers.
+        glesTextureSmokeCoordinator?.disposeAll()
+        glesTextureSmokeCoordinator = null
     }
 }

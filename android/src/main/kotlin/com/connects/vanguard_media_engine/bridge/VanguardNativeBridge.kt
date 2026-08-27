@@ -295,6 +295,16 @@ class VanguardNativeBridge(
         frameDurationUs: Long,
     ): String
 
+    // ── Phase 1-Unit AX: Android GLES SurfaceProducer texture DAG render smoke ──
+    external fun runAndroidDagPhase1AXGlesTextureRenderSmoke(
+        surface: Surface,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        frameCount: Int,
+        frameDurationUs: Long,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
