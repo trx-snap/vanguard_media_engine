@@ -7,6 +7,7 @@ import com.connects.vanguard_media_engine.camera.AndroidCamera2ConcurrentSession
 import com.connects.vanguard_media_engine.camera.AndroidCamera2HardwareBufferFrameSmokeHarness
 import com.connects.vanguard_media_engine.camera.AndroidCamera2ImageReaderFrameSmokeHarness
 import com.connects.vanguard_media_engine.camera.AndroidCamera2NativeRenderFrameSmokeHarness
+import com.connects.vanguard_media_engine.camera.AndroidCamera2NativeRenderLoopSmokeHarness
 import com.connects.vanguard_media_engine.camera.AndroidCamera2OpenCloseSmokeHarness
 import com.connects.vanguard_media_engine.export.AndroidAudioFoundationSmokeHarness
 import io.flutter.plugin.common.MethodChannel
@@ -41,6 +42,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase3UnitIImageReaderFrameSmoke",
             "runAndroidDagPhase3UnitJHardwareBufferFrameSmoke",
             "runAndroidDagPhase3UnitKCameraNativeRenderSmoke",
+            "runAndroidDagPhase3UnitLCameraNativeRenderLoopSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -68,6 +70,8 @@ class AndroidDagDiagnosticsCoordinator(
                 runPhase3UnitJHardwareBufferFrameSmoke(args, result)
             "runAndroidDagPhase3UnitKCameraNativeRenderSmoke" ->
                 runPhase3UnitKCameraNativeRenderSmoke(args, result)
+            "runAndroidDagPhase3UnitLCameraNativeRenderLoopSmoke" ->
+                runPhase3UnitLCameraNativeRenderLoopSmoke(args, result)
             else -> return false
         }
         return true
@@ -307,6 +311,28 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "CAMERA_NATIVE_RENDER_SMOKE_FAILED",
                         "runAndroidDagPhase3UnitKCameraNativeRenderSmoke: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 3-Unit L: Android Camera2 PRIVATE ImageReader HardwareBuffer native-render multi-frame render loop smoke ──
+    private fun runPhase3UnitLCameraNativeRenderLoopSmoke(
+        args: Map<*, *>?,
+        result: MethodChannel.Result,
+    ) {
+        Thread {
+            try {
+                val smokeResult = AndroidCamera2NativeRenderLoopSmokeHarness(context).run(args)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "CAMERA_NATIVE_RENDER_LOOP_SMOKE_FAILED",
+                        "runAndroidDagPhase3UnitLCameraNativeRenderLoopSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
