@@ -163,6 +163,13 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // ── Phase 1-Unit AB: Android GLES backend diagnostic read-pixels physical smoke ──
+    external fun runAndroidDagPhase1ABGlesReadPixelsSmoke(
+        surface: Surface,
+        width: Int,
+        height: Int,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

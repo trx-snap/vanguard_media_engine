@@ -33,6 +33,14 @@
 //     readback/content proof, no YUV/external texture, no fence sync, no
 //     product wiring. renderFrame(handle) delegates to this overload with
 //     the identity VideoFrameTransform{}.
+//   - Unit AB: diagnosticReadPixels() makes the attached window surface
+//     current and reads back a rectangle of RGBA/UNSIGNED_BYTE pixels via
+//     glReadPixels(). The attached-surface requirement and rectangle-
+//     within-bounds check are Android-only since they depend on
+//     hasSurface(); argument/dimension/capacity validation (non-null
+//     outPixels, non-zero width/height, sufficient outPixelCapacityBytes)
+//     happens before any Android-only code so it runs identically on both
+//     platforms.
 //
 // On non-Android host builds:
 //   - No EGL/GLES headers included.
@@ -46,6 +54,9 @@
 //     always fails with lastError="window_shader_unavailable_on_host".
 //   - Unit Z: renderFrame(handle) on an initialized backend always fails
 //     with lastError="gles_render_frame_unavailable_on_host".
+//   - Unit AB: diagnosticReadPixels() on an initialized backend, once
+//     argument/dimension/capacity validation passes, always fails with
+//     lastError="diagnostic_read_pixels_unavailable_on_host".
 
 #include "vanguard/render/gles_backend.h"
 #include "gles_hardware_buffer_imports.h"
@@ -57,6 +68,7 @@
 #endif
 
 #include <cmath>
+#include <limits>
 #include <string>
 
 namespace vanguard {
@@ -803,6 +815,81 @@ RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle handle,
     (void)transform;
     impl_->lastError = "gles_render_frame_unavailable_on_host";
     return RenderFrameResult::kUnavailable;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Unit AB: window-surface diagnostic pixel readback.
+// ---------------------------------------------------------------------------
+
+bool GlesBackend::diagnosticReadPixels(uint32_t x,
+                                       uint32_t y,
+                                       uint32_t width,
+                                       uint32_t height,
+                                       uint8_t* outPixels,
+                                       uint64_t outPixelCapacityBytes) {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return false;
+    }
+    if (outPixels == nullptr) {
+        impl_->lastError = "diagnostic_read_pixels_invalid_argument";
+        return false;
+    }
+    if (width == 0 || height == 0) {
+        impl_->lastError = "diagnostic_read_pixels_invalid_dimensions";
+        return false;
+    }
+
+    const uint64_t pixelCount = static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
+    if (pixelCount > std::numeric_limits<uint64_t>::max() / 4) {
+        impl_->lastError = "diagnostic_read_pixels_capacity_too_small";
+        return false;
+    }
+    const uint64_t requiredBytes = pixelCount * 4;
+    if (outPixelCapacityBytes < requiredBytes) {
+        impl_->lastError = "diagnostic_read_pixels_capacity_too_small";
+        return false;
+    }
+
+#if defined(__ANDROID__)
+    if (!hasSurface()) {
+        impl_->lastError = "no_surface_attached";
+        return false;
+    }
+    if (static_cast<uint64_t>(x) + static_cast<uint64_t>(width) > static_cast<uint64_t>(impl_->surfaceWidth) ||
+        static_cast<uint64_t>(y) + static_cast<uint64_t>(height) > static_cast<uint64_t>(impl_->surfaceHeight)) {
+        impl_->lastError = "diagnostic_read_pixels_out_of_bounds";
+        return false;
+    }
+
+    if (eglMakeCurrent(impl_->display, impl_->windowSurface, impl_->windowSurface, impl_->context) != EGL_TRUE) {
+        impl_->lastError = "diagnostic_read_pixels_make_current_failed";
+        return false;
+    }
+
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glReadPixels(static_cast<GLint>(x), static_cast<GLint>(y),
+                 static_cast<GLsizei>(width), static_cast<GLsizei>(height),
+                 GL_RGBA, GL_UNSIGNED_BYTE, outPixels);
+    if (glGetError() != GL_NO_ERROR) {
+        impl_->lastError = "diagnostic_read_pixels_failed";
+        return false;
+    }
+
+    impl_->lastError.clear();
+    return true;
+#else
+    (void)x;
+    (void)y;
+    (void)width;
+    (void)height;
+    (void)outPixels;
+    (void)outPixelCapacityBytes;
+    impl_->lastError = "diagnostic_read_pixels_unavailable_on_host";
+    return false;
 #endif
 }
 

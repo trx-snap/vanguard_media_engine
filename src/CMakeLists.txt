@@ -71,6 +71,7 @@ if (ANDROID)
     "platform/android/src/android_gles_backend_smoke_jni.cpp"
     "platform/android/src/android_gles_import_smoke_jni.cpp"
     "platform/android/src/android_gles_render_frame_smoke_jni.cpp"
+    "platform/android/src/android_gles_read_pixels_smoke_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
 

@@ -17,8 +17,10 @@ namespace render {
 // draws the imported GL_TEXTURE_2D as a full-window textured quad on the
 // attached window surface and swaps, plus (Unit AA) renderFrame(handle,
 // transform) support for rotationDegrees 0/90/180/270 plus
-// mirrorHorizontal via shared UV mapping. No pixel readback/content proof,
-// no YUV/external texture, no fence sync, no product wiring. EGL/GLES/
+// mirrorHorizontal via shared UV mapping, plus (Unit AB) a diagnostic
+// glReadPixels() seam over the attached window surface for later physical
+// pixel-content verification. No product pixel-readback API, no YUV/
+// external texture, no fence sync, no product wiring. EGL/GLES/
 // Android headers must never appear in this public header; all such state
 // lives exclusively in gles_backend.cpp and the private
 // GlesHardwareBufferImports / GlesTextureFrameRenderer helpers behind the
@@ -134,6 +136,30 @@ public:
     // not initialized, when no window surface is attached, or when the color
     // components are not finite values in [0.0, 1.0].
     bool diagnosticPresentWindowShaderQuad(float red, float green, float blue, float alpha);
+
+    // Unit AB: makes the already-attached window EGLSurface current and reads
+    // back the requested [x, y, width, height) rectangle of RGBA/UNSIGNED_BYTE
+    // pixels from it into outPixels, so a later physical harness can verify
+    // actual rendered pixels after clear/shader/renderFrame operations.
+    //
+    // Preconditions: an initialized backend, a window surface already
+    // attached (see attachSurface()/hasSurface()), a non-null outPixels,
+    // non-zero width and height, the requested rectangle fully within the
+    // attached surface's bounds (see surfaceWidth()/surfaceHeight()), and
+    // outPixelCapacityBytes >= width * height * 4 without integer overflow.
+    // Returns false (with lastError set) on any precondition failure or GLES
+    // readback failure; otherwise fills outPixels and returns true.
+    //
+    // Non-claims: this is diagnostic/proof infrastructure only, not a product
+    // API; it does not support YUV or external (OES) textures, does not
+    // perform fence sync, and does not compose multiple render nodes.
+    // Unavailable on non-Android host builds.
+    bool diagnosticReadPixels(uint32_t x,
+                              uint32_t y,
+                              uint32_t width,
+                              uint32_t height,
+                              uint8_t* outPixels,
+                              uint64_t outPixelCapacityBytes);
 
 private:
     struct Impl;

@@ -1514,4 +1514,162 @@ object AndroidDagRenderSmokeHarness {
             "releaseA=not_run;releaseAFence=-1;hasAAfterRelease=false;hasBAfterReleaseA=false;releasedHandleRender=not_run;releasedHandleLastError=;" +
             "detach=not_run;surfaceKindAfterDetach=none;postDetachRenderB=not_run;postDetachLastError=;shutdown=not_run;" +
             "hasBAfterShutdown=false;idempotentShutdown=not_run;proofBoundary=gles_renderFrame_rgba_texture_quad_transform_uv_no_yuv_no_fence_sync;lastError=$reason"
+
+    // ── Phase 1-Unit AB: Android GLES backend diagnostic read-pixels physical smoke ──
+    private const val RESULT_MARKER_PHASE1AB = "ANDROID_GLES_READ_PIXELS_UNIT_AB_NATIVE_RESULT"
+
+    fun runGlesReadPixelsSmoke(width: Int = 64, height: Int = 64): Map<String, Any?> {
+        var surfaceTexture: SurfaceTexture? = null
+        var surface: Surface? = null
+        var raw = glesReadPixelsFailure("not_run")
+
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                raw = glesReadPixelsFailure("api_below_26")
+                return parseGlesReadPixelsResult(raw)
+            }
+            if (width <= 0 || height <= 0) {
+                raw = glesReadPixelsFailure("invalid_dimensions")
+                return parseGlesReadPixelsResult(raw)
+            }
+
+            surfaceTexture = SurfaceTexture(false).apply {
+                setDefaultBufferSize(width, height)
+            }
+            surface = Surface(surfaceTexture)
+
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1ABGlesReadPixelsSmoke(
+                surface,
+                width,
+                height,
+            )
+            return parseGlesReadPixelsResult(raw)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = glesReadPixelsFailure("exception:$reason")
+            return parseGlesReadPixelsResult(raw)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1AB $raw")
+            try {
+                surface?.release()
+            } catch (_: Throwable) {
+            }
+            try {
+                surfaceTexture?.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun parseGlesReadPixelsResult(raw: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val clientVersion = parsed["clientVersion"]?.toIntOrNull() ?: 0
+        val vendor = parsed["vendor"] ?: ""
+        val renderer = parsed["renderer"] ?: ""
+        val version = parsed["version"] ?: ""
+        val preInitRead = parsed["preInitRead"] ?: "not_run"
+        val preInitLastError = parsed["preInitLastError"] ?: ""
+        val initialize = parsed["initialize"] ?: "not_run"
+        val preAttachRead = parsed["preAttachRead"] ?: "not_run"
+        val preAttachLastError = parsed["preAttachLastError"] ?: ""
+        val attach = parsed["attach"] ?: "not_run"
+        val hasSurfaceAfterAttach = parsed["hasSurfaceAfterAttach"]?.equals("true", ignoreCase = true) ?: false
+        val surfaceKindAfterAttach = parsed["surfaceKindAfterAttach"] ?: "none"
+        val widthAfterAttach = parsed["widthAfterAttach"]?.toIntOrNull() ?: 0
+        val heightAfterAttach = parsed["heightAfterAttach"]?.toIntOrNull() ?: 0
+        val nullRead = parsed["nullRead"] ?: "not_run"
+        val nullReadLastError = parsed["nullReadLastError"] ?: ""
+        val zeroRead = parsed["zeroRead"] ?: "not_run"
+        val zeroReadLastError = parsed["zeroReadLastError"] ?: ""
+        val smallCapacityRead = parsed["smallCapacityRead"] ?: "not_run"
+        val smallCapacityLastError = parsed["smallCapacityLastError"] ?: ""
+        val outOfBoundsRead = parsed["outOfBoundsRead"] ?: "not_run"
+        val outOfBoundsLastError = parsed["outOfBoundsLastError"] ?: ""
+        val directClearForReadback = parsed["directClearForReadback"] ?: "not_run"
+        val centerRead = parsed["centerRead"] ?: "not_run"
+        val centerReadLastError = parsed["centerReadLastError"] ?: ""
+        val centerR = parsed["centerR"]?.toIntOrNull() ?: 0
+        val centerG = parsed["centerG"]?.toIntOrNull() ?: 0
+        val centerB = parsed["centerB"]?.toIntOrNull() ?: 0
+        val centerA = parsed["centerA"]?.toIntOrNull() ?: 0
+        val centerPixelMatches = parsed["centerPixelMatches"]?.equals("true", ignoreCase = true) ?: false
+        val fullRead = parsed["fullRead"] ?: "not_run"
+        val fullReadLastError = parsed["fullReadLastError"] ?: ""
+        val detach = parsed["detach"] ?: "not_run"
+        val surfaceKindAfterDetach = parsed["surfaceKindAfterDetach"] ?: "none"
+        val postDetachRead = parsed["postDetachRead"] ?: "not_run"
+        val postDetachLastError = parsed["postDetachLastError"] ?: ""
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_diagnostic_read_pixels_rgba_window_surface_no_yuv_no_fence_no_product"
+        val lastError = parsed["lastError"] ?: ""
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "clientVersion" to clientVersion,
+            "vendor" to vendor,
+            "renderer" to renderer,
+            "version" to version,
+            "preInitRead" to preInitRead,
+            "preInitLastError" to preInitLastError,
+            "initialize" to initialize,
+            "preAttachRead" to preAttachRead,
+            "preAttachLastError" to preAttachLastError,
+            "attach" to attach,
+            "hasSurfaceAfterAttach" to hasSurfaceAfterAttach,
+            "surfaceKindAfterAttach" to surfaceKindAfterAttach,
+            "widthAfterAttach" to widthAfterAttach,
+            "heightAfterAttach" to heightAfterAttach,
+            "nullRead" to nullRead,
+            "nullReadLastError" to nullReadLastError,
+            "zeroRead" to zeroRead,
+            "zeroReadLastError" to zeroReadLastError,
+            "smallCapacityRead" to smallCapacityRead,
+            "smallCapacityLastError" to smallCapacityLastError,
+            "outOfBoundsRead" to outOfBoundsRead,
+            "outOfBoundsLastError" to outOfBoundsLastError,
+            "directClearForReadback" to directClearForReadback,
+            "centerRead" to centerRead,
+            "centerReadLastError" to centerReadLastError,
+            "centerR" to centerR,
+            "centerG" to centerG,
+            "centerB" to centerB,
+            "centerA" to centerA,
+            "centerPixelMatches" to centerPixelMatches,
+            "fullRead" to fullRead,
+            "fullReadLastError" to fullReadLastError,
+            "detach" to detach,
+            "surfaceKindAfterDetach" to surfaceKindAfterDetach,
+            "postDetachRead" to postDetachRead,
+            "postDetachLastError" to postDetachLastError,
+            "shutdown" to shutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "proofBoundary" to proofBoundary,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun glesReadPixelsFailure(reason: String): String =
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;preInitRead=$reason;preInitLastError=;" +
+            "initialize=not_run;preAttachRead=not_run;preAttachLastError=;attach=not_run;hasSurfaceAfterAttach=false;" +
+            "surfaceKindAfterAttach=none;widthAfterAttach=0;heightAfterAttach=0;nullRead=not_run;nullReadLastError=;" +
+            "zeroRead=not_run;zeroReadLastError=;smallCapacityRead=not_run;smallCapacityLastError=;" +
+            "outOfBoundsRead=not_run;outOfBoundsLastError=;directClearForReadback=not_run;centerRead=not_run;centerReadLastError=;" +
+            "centerR=0;centerG=0;centerB=0;centerA=0;centerPixelMatches=false;fullRead=not_run;fullReadLastError=;" +
+            "detach=not_run;surfaceKindAfterDetach=none;postDetachRead=not_run;postDetachLastError=;shutdown=not_run;" +
+            "idempotentShutdown=not_run;proofBoundary=gles_diagnostic_read_pixels_rgba_window_surface_no_yuv_no_fence_no_product;lastError=$reason"
 }

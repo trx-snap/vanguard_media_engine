@@ -49,6 +49,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1XGlesShaderQuadSmoke",
             "runAndroidDagPhase1YGlesImportSmoke",
             "runAndroidDagPhase1ZGlesRenderFrameSmoke",
+            "runAndroidDagPhase1ABGlesReadPixelsSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -84,6 +85,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1XGlesShaderQuadSmoke" -> runPhase1XGlesShaderQuadSmoke(args, result)
             "runAndroidDagPhase1YGlesImportSmoke" -> runPhase1YGlesImportSmoke(args, result)
             "runAndroidDagPhase1ZGlesRenderFrameSmoke" -> runPhase1ZGlesRenderFrameSmoke(args, result)
+            "runAndroidDagPhase1ABGlesReadPixelsSmoke" -> runPhase1ABGlesReadPixelsSmoke(args, result)
             else -> return false
         }
         return true
@@ -464,6 +466,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_RENDER_FRAME_SMOKE_FAILED",
                         "runAndroidDagPhase1ZGlesRenderFrameSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AB: Android GLES backend diagnostic read-pixels physical smoke ──
+    private fun runPhase1ABGlesReadPixelsSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesReadPixelsSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_READ_PIXELS_SMOKE_FAILED",
+                        "runAndroidDagPhase1ABGlesReadPixelsSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
