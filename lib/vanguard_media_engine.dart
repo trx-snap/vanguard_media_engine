@@ -32,6 +32,8 @@ export 'vg_camera_hardware_capability_report.dart';
 export 'vg_camera2_readiness_plan.dart';
 // Phase 3-Unit E: Android Camera2 Session Configuration Eligibility Planner.
 export 'vg_camera2_session_configuration_plan.dart';
+// Phase 3-Unit F: Android Camera2 guarded concurrent SessionConfiguration validation.
+export 'vg_camera2_concurrent_session_validation.dart';
 
 // Phase 6D.3: typed recording result.
 export 'vg_recording_stats.dart';

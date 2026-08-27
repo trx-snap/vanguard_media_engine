@@ -3,6 +3,7 @@ package com.connects.vanguard_media_engine.diagnostics
 import android.content.Context
 import android.os.Handler
 import com.connects.vanguard_media_engine.camera.AndroidCamera2CapabilityProbe
+import com.connects.vanguard_media_engine.camera.AndroidCamera2ConcurrentSessionValidator
 import com.connects.vanguard_media_engine.export.AndroidAudioFoundationSmokeHarness
 import io.flutter.plugin.common.MethodChannel
 
@@ -31,6 +32,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase5EncoderSurfaceSmoke",
             "runAndroidDagAudioFoundationSmoke",
             "runAndroidDagPhase3UnitACameraCapabilityProbe",
+            "runAndroidDagPhase3UnitFConcurrentSessionValidation",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -48,6 +50,8 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase5EncoderSurfaceSmoke" -> runPhase5EncoderSurfaceSmoke(args, result)
             "runAndroidDagAudioFoundationSmoke" -> runAudioFoundationSmoke(args, result)
             "runAndroidDagPhase3UnitACameraCapabilityProbe" -> runPhase3UnitACameraCapabilityProbe(result)
+            "runAndroidDagPhase3UnitFConcurrentSessionValidation" ->
+                runPhase3UnitFConcurrentSessionValidation(args, result)
             else -> return false
         }
         return true
@@ -178,6 +182,28 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "CAMERA_CAPABILITY_PROBE_FAILED",
                         "runAndroidDagPhase3UnitACameraCapabilityProbe: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 3-Unit F: Android Camera2 guarded concurrent SessionConfiguration validation ──
+    private fun runPhase3UnitFConcurrentSessionValidation(
+        args: Map<*, *>?,
+        result: MethodChannel.Result,
+    ) {
+        Thread {
+            try {
+                val validationResult = AndroidCamera2ConcurrentSessionValidator(context).validate(args)
+                mainHandler.post { result.success(validationResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "CONCURRENT_SESSION_VALIDATION_FAILED",
+                        "runAndroidDagPhase3UnitFConcurrentSessionValidation: " +
+                            "${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
