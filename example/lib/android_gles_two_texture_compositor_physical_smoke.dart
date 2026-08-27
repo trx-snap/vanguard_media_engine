@@ -76,8 +76,13 @@ class _AndroidGlesTwoTextureCompositorPhysicalSmokeAppState
         'importYcbcr': 'not_run',
         'handleYcbcr': 0,
         'targetYcbcr': 0,
-        'unsupportedTargetDiagnosticComposite': 'not_run',
-        'unsupportedTargetLastError': '',
+        'mixedTargetDiagnosticComposite': 'not_run',
+        'mixedTargetCenterRead': 'not_run',
+        'mixedTargetCenterR': 0,
+        'mixedTargetCenterG': 0,
+        'mixedTargetCenterB': 0,
+        'mixedTargetCenterA': 0,
+        'mixedTargetLastError': '',
         'releaseYcbcr': 'not_run',
         'releaseYcbcrFence': -1,
         'hasYcbcrAfterRelease': false,
@@ -119,7 +124,7 @@ class _AndroidGlesTwoTextureCompositorPhysicalSmokeAppState
         'shutdown': 'not_run',
         'idempotentShutdown': 'not_run',
         'proofBoundary':
-            'gles_two_texture_compositor_rgba_blend_foundation_no_oes_mixed_no_product',
+            'gles_two_texture_compositor_rgba_blend_foundation_at_compatible_no_color_conversion_no_product',
         'lastError': 'exception:${error.runtimeType}',
       };
     }
@@ -169,10 +174,12 @@ class _AndroidGlesTwoTextureCompositorPhysicalSmokeAppState
     final importYcbcr = (payload['importYcbcr'] as String?) ?? '';
     final handleYcbcr = (payload['handleYcbcr'] as num?)?.toInt() ?? 0;
     final targetYcbcr = (payload['targetYcbcr'] as num?)?.toInt() ?? 0;
-    final unsupportedTargetDiagnosticComposite =
-        (payload['unsupportedTargetDiagnosticComposite'] as String?) ?? '';
-    final unsupportedTargetLastError =
-        (payload['unsupportedTargetLastError'] as String?) ?? '';
+    final mixedTargetDiagnosticComposite =
+        (payload['mixedTargetDiagnosticComposite'] as String?) ?? '';
+    final mixedTargetCenterRead =
+        (payload['mixedTargetCenterRead'] as String?) ?? '';
+    final mixedTargetLastError =
+        (payload['mixedTargetLastError'] as String?) ?? '';
     final releaseYcbcr = (payload['releaseYcbcr'] as String?) ?? '';
     final releaseYcbcrFence =
         (payload['releaseYcbcrFence'] as num?)?.toInt() ?? -1;
@@ -269,9 +276,9 @@ class _AndroidGlesTwoTextureCompositorPhysicalSmokeAppState
         importYcbcr == 'success' &&
         handleYcbcr > 0 &&
         targetYcbcr == 0x8D65 &&
-        unsupportedTargetDiagnosticComposite == 'rejected_as_expected' &&
-        unsupportedTargetLastError ==
-            'gles_two_texture_compositor_unsupported_texture_target' &&
+        mixedTargetDiagnosticComposite == 'success' &&
+        mixedTargetCenterRead == 'success' &&
+        (mixedTargetLastError.isEmpty || mixedTargetLastError == 'none') &&
         releaseYcbcr == 'success' &&
         releaseYcbcrFence >= -1 &&
         !hasYcbcrAfterRelease &&
@@ -317,7 +324,7 @@ class _AndroidGlesTwoTextureCompositorPhysicalSmokeAppState
         shutdown == 'success' &&
         idempotentShutdown == 'success' &&
         proofBoundary ==
-            'gles_two_texture_compositor_rgba_blend_foundation_no_oes_mixed_no_product';
+            'gles_two_texture_compositor_rgba_blend_foundation_at_compatible_no_color_conversion_no_product';
 
     // ignore: avoid_print
     print(

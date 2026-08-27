@@ -38,13 +38,15 @@ namespace render {
 // color-correct YUV->RGB conversion, no Camera2 product wiring, no
 // multi-node DAG composition. No product pixel-readback API, no product UI
 // wiring, plus (Unit AS) diagnosticCompositeFramesForReadback() and
-// diagnosticPresentCompositeFrames(), which draw two imported
-// GL_TEXTURE_2D handles composited into a single full-window quad via
+// diagnosticPresentCompositeFrames(), which draw two imported texture
+// handles composited into a single full-window quad via
 // mix(colorA, colorB, weightB) using the private GlesTwoTextureCompositor
-// helper. Unit AS is a two-texture GL_TEXTURE_2D composition foundation
-// only: mismatched or non-2D texture targets fail closed. No external/OES
-// mixed composition, no timeline DAG integration, no transitions/PiP, no
-// product UI. EGL/GLES/
+// helper. Unit AS is a two-texture GL_TEXTURE_2D composition foundation;
+// Unit AT extends the compositor to independently accept
+// GL_TEXTURE_EXTERNAL_OES for either handle, covering all four target
+// permutations, while any other/mismatched-unsupported target still fails
+// closed. No timeline DAG integration, no transitions/PiP, no product UI.
+// EGL/GLES/
 // Android headers must never appear in this public header; all such state
 // lives exclusively in gles_backend.cpp and the private
 // GlesHardwareBufferImports / GlesTextureFrameRenderer / GlesTwoTextureCompositor
@@ -253,18 +255,22 @@ public:
     // identifying an active imported buffer (see importHardwareBuffer()).
     // Returns false with lastError="invalid_buffer_handle" if either handle
     // does not resolve to an active imported texture/target. Unit AS scope
-    // supports only GL_TEXTURE_2D + GL_TEXTURE_2D; if either resolved target
-    // is not GL_TEXTURE_2D (including GL_TEXTURE_EXTERNAL_OES per Unit AR),
-    // this fails with the compositor's
-    // "gles_two_texture_compositor_unsupported_texture_target" error and
-    // performs no GL draw. weightB is clamped into [0.0, 1.0] if finite;
-    // non-finite weightB fails with the compositor's invalid-weight error.
+    // supported only GL_TEXTURE_2D + GL_TEXTURE_2D; Unit AT extends the
+    // compositor to independently accept GL_TEXTURE_EXTERNAL_OES for either
+    // resolved target as well, covering all four target permutations (2D+2D,
+    // OES+2D, 2D+OES, OES+OES). If either resolved target is neither
+    // GL_TEXTURE_2D nor GL_TEXTURE_EXTERNAL_OES, this still fails with the
+    // compositor's "gles_two_texture_compositor_unsupported_texture_target"
+    // error and performs no GL draw. weightB is clamped into [0.0, 1.0] if
+    // finite; non-finite weightB fails with the compositor's invalid-weight
+    // error.
     //
     // Non-claims: this is diagnostic/proof infrastructure only, not a
     // product compositing API; callers should use it only paired with
-    // diagnosticReadPixels() in physical proof harnesses. No external/OES
-    // mixed composition, no timeline DAG integration, no transitions/PiP, no
-    // product UI. Unavailable on non-Android host builds.
+    // diagnosticReadPixels() in physical proof harnesses. No color-correct
+    // YUV conversion policy, no timeline DAG integration, no
+    // transitions/PiP, no product UI. Unavailable on non-Android host
+    // builds.
     bool diagnosticCompositeFramesForReadback(HardwareBufferHandle handleA,
                                               HardwareBufferHandle handleB,
                                               float weightB,

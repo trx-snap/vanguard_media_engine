@@ -274,6 +274,17 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // ── Phase 1-Unit AT: Android GLES mixed external/OES two-texture composition foundation physical proof ──
+    external fun runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke(
+        surface: Surface,
+        rgbaBufferA: HardwareBuffer,
+        rgbaBufferB: HardwareBuffer,
+        ycbcrBufferA: HardwareBuffer,
+        ycbcrBufferB: HardwareBuffer,
+        width: Int,
+        height: Int,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

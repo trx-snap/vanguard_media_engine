@@ -63,10 +63,11 @@
 //     independently mapped through transformA/transformB. The readback
 //     variant omits eglSwapBuffers (pair with diagnosticReadPixels()); the
 //     present variant swaps. Unit AS is a two-texture GL_TEXTURE_2D
-//     composition foundation only: the compositor fails closed on any
-//     non-GL_TEXTURE_2D target (including GL_TEXTURE_EXTERNAL_OES per Unit
-//     AR). No external/OES mixed composition, no timeline DAG integration,
-//     no transitions/PiP, no product UI.
+//     composition foundation; Unit AT extends the compositor to also accept
+//     GL_TEXTURE_EXTERNAL_OES independently for each source, covering all
+//     four target permutations. The compositor still fails closed on any
+//     other target value. No timeline DAG integration, no transitions/PiP,
+//     no product UI.
 //
 // On non-Android host builds:
 //   - No EGL/GLES headers included.
@@ -1004,13 +1005,17 @@ bool GlesBackend::diagnosticRenderFrameForReadback(HardwareBufferHandle handle,
 }
 
 // ---------------------------------------------------------------------------
-// Unit AS: diagnostic two-texture GL_TEXTURE_2D composition seams. Both
-// resolve handleA/handleB to their imported textures/targets via the same
+// Unit AS: diagnostic two-texture composition seams. Both resolve
+// handleA/handleB to their imported textures/targets via the same
 // ahbImports lookup as renderFrame(), then delegate to the private
 // GlesTwoTextureCompositor helper, which fails closed
 // ("gles_two_texture_compositor_unsupported_texture_target") on any
-// non-GL_TEXTURE_2D target -- no external/OES mixed composition, no timeline
-// DAG integration, no transitions/PiP, no product UI.
+// unsupported target -- no timeline DAG integration, no transitions/PiP, no
+// product UI.
+// Unit AT: GlesTwoTextureCompositor now accepts GL_TEXTURE_EXTERNAL_OES
+// independently for each of textureTargetA/textureTargetB (already forwarded
+// as-is below), so mixed external/OES + GL_TEXTURE_2D composition is
+// supported here too. No color-correct YUV conversion policy is added.
 // ---------------------------------------------------------------------------
 
 bool GlesBackend::diagnosticCompositeFramesForReadback(HardwareBufferHandle handleA,

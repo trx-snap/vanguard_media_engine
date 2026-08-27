@@ -64,6 +64,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ANGlesAcquireFenceRenderContentSmoke",
             "runAndroidDagPhase1ARGlesExternalTextureSmoke",
             "runAndroidDagPhase1ASGlesTwoTextureCompositorSmoke",
+            "runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -114,6 +115,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ANGlesAcquireFenceRenderContentSmoke" -> runPhase1ANGlesAcquireFenceRenderContentSmoke(args, result)
             "runAndroidDagPhase1ARGlesExternalTextureSmoke" -> runPhase1ARGlesExternalTextureSmoke(args, result)
             "runAndroidDagPhase1ASGlesTwoTextureCompositorSmoke" -> runPhase1ASGlesTwoTextureCompositorSmoke(args, result)
+            "runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke" -> runPhase1ATGlesMixedTextureCompositorSmoke(args, result)
             else -> return false
         }
         return true
@@ -790,6 +792,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_TWO_TEXTURE_COMPOSITOR_SMOKE_FAILED",
                         "runAndroidDagPhase1ASGlesTwoTextureCompositorSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AT: Android GLES mixed external/OES two-texture composition foundation physical proof ──
+    private fun runPhase1ATGlesMixedTextureCompositorSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidGlesTwoTextureCompositorSmokeHarness.runGlesMixedTextureCompositorSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_MIXED_TEXTURE_COMPOSITOR_SMOKE_FAILED",
+                        "runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
