@@ -58,6 +58,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke",
             "runAndroidDagPhase1AIGlesExtensionCapabilitySmoke",
             "runAndroidDagPhase1AJGlesNativeFenceFdSmoke",
+            "runAndroidDagPhase1AKGlesReleaseFenceProductionSmoke",
             "runAndroidDagPhase1ALGlesReleaseNullFenceSmoke",
             "runAndroidDagPhase1AMGlesRenderFenceChainSmoke",
             "runAndroidDagPhase1ANGlesAcquireFenceRenderContentSmoke",
@@ -105,6 +106,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke" -> runPhase1AHGlesYcbcrImportGuardSmoke(args, result)
             "runAndroidDagPhase1AIGlesExtensionCapabilitySmoke" -> runPhase1AIGlesExtensionCapabilitySmoke(result)
             "runAndroidDagPhase1AJGlesNativeFenceFdSmoke" -> runPhase1AJGlesNativeFenceFdSmoke(result)
+            "runAndroidDagPhase1AKGlesReleaseFenceProductionSmoke" -> runPhase1AKGlesReleaseFenceProductionSmoke(args, result)
             "runAndroidDagPhase1ALGlesReleaseNullFenceSmoke" -> runPhase1ALGlesReleaseNullFenceSmoke(args, result)
             "runAndroidDagPhase1AMGlesRenderFenceChainSmoke" -> runPhase1AMGlesRenderFenceChainSmoke(args, result)
             "runAndroidDagPhase1ANGlesAcquireFenceRenderContentSmoke" -> runPhase1ANGlesAcquireFenceRenderContentSmoke(args, result)
@@ -664,6 +666,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_NATIVE_FENCE_FD_SMOKE_FAILED",
                         "runAndroidDagPhase1AJGlesNativeFenceFdSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AK: Android GLES releaseHardwareBuffer live release-fence output physical proof ──
+    private fun runPhase1AKGlesReleaseFenceProductionSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidGlesReleaseFenceProductionSmokeHarness.runGlesReleaseFenceProductionSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_RELEASE_FENCE_PRODUCTION_SMOKE_FAILED",
+                        "runAndroidDagPhase1AKGlesReleaseFenceProductionSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

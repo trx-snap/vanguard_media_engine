@@ -218,7 +218,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "destroySync=" << (destroySyncOk ? "success" : "failed") << ";"
         << "shutdown=" << (shutdownOk ? "success" : "failed") << ";"
         << "idempotentShutdown=" << (idempotentShutdownOk ? "success" : "failed") << ";"
-        << "proofBoundary=gles_native_fence_fd_lifecycle_no_release_fence_production_no_import_no_product;"
+        << "proofBoundary=gles_native_fence_fd_lifecycle_no_releaseHardwareBuffer_path_no_import_no_product;"
         << "lastError=" << (backendLastError.empty() ? "none" : backendLastError);
 
     const std::string resultStr = oss.str();

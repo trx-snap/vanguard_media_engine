@@ -15,8 +15,18 @@
 // EGLImage creation; POLLIN within the timeout is treated as signaled, and
 // timeout/error/POLLERR/POLLNVAL fail the import closed. The fd is always
 // closed exactly once after the wait attempt and never stored in an
-// ImportRecord. No release fence is produced, no EGL native-fence GPU
-// chaining, no YUV/external texture, no multi-node composition, and no
+// ImportRecord.
+//
+// Unit AK: releaseBuffer() attempts a fail-soft native release fence when
+// the caller passes a non-null outReleaseFenceFd. eglCreateSyncKHR/
+// eglDestroySyncKHR/eglDupNativeFenceFDANDROID are resolved via
+// eglGetProcAddress, and EGL_ANDROID_native_fence_sync capability is
+// determined by token-safe matching of eglQueryString(display,
+// EGL_EXTENSIONS). A release fence is only attempted when capability/
+// symbols are present and an EGL context is actually current on this
+// instance's display (eglMakeCurrent is never called here). Any guard or
+// EGL/GL failure falls back silently to fd -1; release still proceeds and
+// succeeds. No YUV/external texture, no multi-node composition, and no
 // product UI wiring.
 //
 // Android-only: real implementation is inside #if defined(__ANDROID__).
@@ -41,6 +51,20 @@
 #include <atomic>
 #include <string>
 #include <unordered_map>
+
+// Unit AK: fallbacks for EGL_ANDROID_native_fence_sync tokens in case the
+// NDK's EGL/eglext.h in use predates this extension block. Values mirror
+// the Khronos-registered constants (also mirrored by the Unit AI/AN/AO
+// smoke JNI bridges).
+#ifndef EGL_SYNC_NATIVE_FENCE_ANDROID
+#define EGL_SYNC_NATIVE_FENCE_ANDROID 0x3144
+#endif
+#ifndef EGL_SYNC_NATIVE_FENCE_FD_ANDROID
+#define EGL_SYNC_NATIVE_FENCE_FD_ANDROID 0x3145
+#endif
+#ifndef EGL_NO_NATIVE_FENCE_FD_ANDROID
+#define EGL_NO_NATIVE_FENCE_FD_ANDROID -1
+#endif
 
 namespace vanguard {
 namespace render {
@@ -81,6 +105,35 @@ FenceWaitOutcome waitOnAcquireFence(int fd) {
 } // namespace
 
 // ---------------------------------------------------------------------------
+// Unit AK: token-safe EGL extension string matching.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Returns true iff `token` appears in the space-delimited `extensions`
+// string as a whole token (bounded by string start/end or spaces on both
+// sides), never as a bare substring match.
+bool hasEglExtensionToken(const std::string& extensions, const char* token) {
+    if (extensions.empty() || !token || !*token) {
+        return false;
+    }
+    const std::string needle(token);
+    size_t pos = 0;
+    while ((pos = extensions.find(needle, pos)) != std::string::npos) {
+        const bool matchStart = (pos == 0 || extensions[pos - 1] == ' ');
+        const size_t endPos = pos + needle.length();
+        const bool matchEnd = (endPos == extensions.length() || extensions[endPos] == ' ');
+        if (matchStart && matchEnd) {
+            return true;
+        }
+        pos += needle.length();
+    }
+    return false;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
 // AHardwareBuffer function pointer typedefs (loaded from libandroid.so).
 // ---------------------------------------------------------------------------
 
@@ -104,6 +157,14 @@ struct GlesHardwareBufferImports::Impl {
     PFNEGLCREATEIMAGEKHRPROC               fnCreateImage           = nullptr;
     PFNEGLDESTROYIMAGEKHRPROC              fnDestroyImage          = nullptr;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC    fnImageTargetTexture2D  = nullptr;
+
+    // Unit AK: release-fence symbols/capability. Resolved best-effort in
+    // initialize(); a missing symbol or extension token simply keeps
+    // releaseFenceCapable false and releaseBuffer() fails soft to fd -1.
+    PFNEGLCREATESYNCKHRPROC             fnCreateSyncKHR           = nullptr;
+    PFNEGLDESTROYSYNCKHRPROC            fnDestroySyncKHR          = nullptr;
+    PFNEGLDUPNATIVEFENCEFDANDROIDPROC   fnDupNativeFenceFDANDROID = nullptr;
+    bool releaseFenceCapable = false;
 
     bool symbolsResolved = false;
     std::string lastError;
@@ -143,6 +204,53 @@ struct GlesHardwareBufferImports::Impl {
             ::close(rec.acquireFenceFd);
             rec.acquireFenceFd = -1;
         }
+    }
+
+    // Unit AK: attempts to create an owned release-fence fd for the buffer
+    // currently being released. Returns fd >= 0 (caller-owned; this backend
+    // never closes it) on success, or -1 on any capability/symbol/current-
+    // context guard failure or EGL/GL failure along the way. Never sets
+    // lastError -- failure here is an expected, silent fail-soft fallback;
+    // releaseBuffer() still proceeds and returns kSuccess.
+    int createReleaseFenceFd() {
+        if (!releaseFenceCapable || !fnCreateSyncKHR || !fnDestroySyncKHR ||
+            !fnDupNativeFenceFDANDROID || display == EGL_NO_DISPLAY) {
+            return -1;
+        }
+
+        // Only chain a release fence off a context that is actually current
+        // right now, and only off the EGLDisplay this instance was
+        // initialized with; never call eglMakeCurrent here.
+        if (eglGetCurrentContext() == EGL_NO_CONTEXT) {
+            return -1;
+        }
+        if (eglGetCurrentDisplay() != display) {
+            return -1;
+        }
+
+        const EGLint syncAttribs[] = {
+            EGL_SYNC_NATIVE_FENCE_FD_ANDROID, EGL_NO_NATIVE_FENCE_FD_ANDROID,
+            EGL_NONE
+        };
+        EGLSyncKHR sync = fnCreateSyncKHR(display, EGL_SYNC_NATIVE_FENCE_ANDROID, syncAttribs);
+        if (sync == EGL_NO_SYNC_KHR) {
+            return -1;
+        }
+
+        while (glGetError() != GL_NO_ERROR) {}
+        glFlush();
+        if (glGetError() != GL_NO_ERROR) {
+            fnDestroySyncKHR(display, sync);
+            return -1;
+        }
+
+        const EGLint dupFd = fnDupNativeFenceFDANDROID(display, sync);
+        fnDestroySyncKHR(display, sync);
+
+        if (dupFd < 0) {
+            return -1;
+        }
+        return static_cast<int>(dupFd);
     }
 };
 
@@ -187,6 +295,27 @@ void GlesHardwareBufferImports::initialize(void* eglDisplayHandle) {
     s.symbolsResolved = s.fnAcquire && s.fnRelease && s.fnDescribe &&
                          s.fnGetNativeClientBuffer && s.fnCreateImage &&
                          s.fnDestroyImage && s.fnImageTargetTexture2D;
+
+    // Unit AK: resolve release-fence symbols and query token-safe
+    // EGL_ANDROID_native_fence_sync capability. Missing symbols/extension
+    // does not fail initialize(); releaseBuffer() falls back to fd -1.
+    s.fnCreateSyncKHR = reinterpret_cast<PFNEGLCREATESYNCKHRPROC>(
+        eglGetProcAddress("eglCreateSyncKHR"));
+    s.fnDestroySyncKHR = reinterpret_cast<PFNEGLDESTROYSYNCKHRPROC>(
+        eglGetProcAddress("eglDestroySyncKHR"));
+    s.fnDupNativeFenceFDANDROID = reinterpret_cast<PFNEGLDUPNATIVEFENCEFDANDROIDPROC>(
+        eglGetProcAddress("eglDupNativeFenceFDANDROID"));
+
+    std::string eglExtensions;
+    if (s.display != EGL_NO_DISPLAY) {
+        const char* extStr = eglQueryString(s.display, EGL_EXTENSIONS);
+        if (extStr) {
+            eglExtensions = extStr;
+        }
+    }
+    s.releaseFenceCapable =
+        hasEglExtensionToken(eglExtensions, "EGL_ANDROID_native_fence_sync") &&
+        s.fnCreateSyncKHR && s.fnDestroySyncKHR && s.fnDupNativeFenceFDANDROID;
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +344,10 @@ void GlesHardwareBufferImports::shutdown() {
     s.fnDestroyImage = nullptr;
     s.fnImageTargetTexture2D = nullptr;
     s.symbolsResolved = false;
+    s.fnCreateSyncKHR = nullptr;
+    s.fnDestroySyncKHR = nullptr;
+    s.fnDupNativeFenceFDANDROID = nullptr;
+    s.releaseFenceCapable = false;
     s.display = EGL_NO_DISPLAY;
     s.lastError.clear();
 }
@@ -404,6 +537,16 @@ HardwareBufferImportResult GlesHardwareBufferImports::releaseBuffer(
     if (it == s.records.end()) {
         s.lastError = "ahb_release_unknown_handle";
         return HardwareBufferImportResult::kUnknownHandle;
+    }
+
+    // Unit AK: attempt a release fence only when the caller wants one. Any
+    // capability/symbol/current-context guard failure or EGL/GL failure
+    // falls back silently to fd -1; release still proceeds and succeeds.
+    if (outReleaseFenceFd) {
+        const int releaseFenceFd = s.createReleaseFenceFd();
+        if (releaseFenceFd >= 0) {
+            *outReleaseFenceFd = releaseFenceFd;
+        }
     }
 
     s.destroyRecord(it->second);

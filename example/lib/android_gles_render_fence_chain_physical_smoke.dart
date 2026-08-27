@@ -79,7 +79,7 @@ class _AndroidGlesRenderFenceChainPhysicalSmokeAppState
         'shutdown': 'not_run',
         'idempotentShutdown': 'not_run',
         'proofBoundary':
-            'gles_renderFrame_native_fence_chain_no_release_fence_production_no_yuv_no_product',
+            'gles_renderFrame_native_fence_chain_release_fence_optional_no_yuv_no_product',
         'lastError': 'exception:${error.runtimeType}',
       };
     }
@@ -119,7 +119,7 @@ class _AndroidGlesRenderFenceChainPhysicalSmokeAppState
     final fdClosedAfterClose = payload['fdClosedAfterClose'] == true;
     final destroySync = payload['destroySync'];
     final releaseBuffer = payload['releaseBuffer'];
-    final releaseFence = (payload['releaseFence'] as num?)?.toInt() ?? 0;
+    final releaseFence = (payload['releaseFence'] as num?)?.toInt() ?? -1;
     final hasAfterRelease = payload['hasAfterRelease'] == true;
     final detach = payload['detach'];
     final surfaceKindAfterDetach =
@@ -163,7 +163,7 @@ class _AndroidGlesRenderFenceChainPhysicalSmokeAppState
         fdClosedAfterClose &&
         (destroySync == 'success' || destroySync == true) &&
         (releaseBuffer == 'success' || releaseBuffer == true) &&
-        releaseFence == -1 &&
+        releaseFence >= -1 &&
         !hasAfterRelease &&
         (detach == 'success' || detach == true) &&
         (surfaceKindAfterDetach == 'offscreen' ||
@@ -171,7 +171,7 @@ class _AndroidGlesRenderFenceChainPhysicalSmokeAppState
         (shutdown == 'success' || shutdown == true) &&
         (idempotentShutdown == 'success' || idempotentShutdown == true) &&
         proofBoundary ==
-            'gles_renderFrame_native_fence_chain_no_release_fence_production_no_yuv_no_product';
+            'gles_renderFrame_native_fence_chain_release_fence_optional_no_yuv_no_product';
 
     // ignore: avoid_print
     print(

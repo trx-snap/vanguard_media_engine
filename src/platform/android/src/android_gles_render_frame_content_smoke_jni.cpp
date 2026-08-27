@@ -366,12 +366,12 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         (rot90CenterReadLastError.empty() || rot90CenterReadLastError == "none") &&
         rot90CenterPixelMatches;
 
-    // 10. releaseBuffer: expect releaseFence == -1, has false
+    // 10. releaseBuffer: expect releaseFence >= -1, has false
     int releaseFence = -999;
     const auto releaseRes = backend.releaseHardwareBuffer(handle, &releaseFence);
     const bool hasAfterRelease = backend.hasHardwareBuffer(handle);
     const bool releaseCheckOk = (releaseRes == vanguard::render::HardwareBufferImportResult::kSuccess) &&
-                                (releaseFence == -1) &&
+                                (releaseFence >= -1) &&
                                 !hasAfterRelease;
 
     // 11. postReleaseDiagnosticRender: expect false with lastError "invalid_buffer_handle"
@@ -411,6 +411,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
 
     // Release ANativeWindow acquired from JNI Surface
     ANativeWindow_release(window);
+
+    // Close any non-negative fds returned by releaseHardwareBuffer exactly once after capturing
+    if (releaseFence >= 0) {
+        ::close(releaseFence);
+    }
 
     const bool allChecksPass = bufferDescribeOk &&
                                bufferFillOk &&

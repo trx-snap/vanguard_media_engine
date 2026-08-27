@@ -61,7 +61,7 @@ object AndroidGlesFenceSmokeHarness {
         val destroySync = parsed["destroySync"] ?: "not_run"
         val shutdown = parsed["shutdown"] ?: "not_run"
         val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
-        val proofBoundary = parsed["proofBoundary"] ?: "gles_native_fence_fd_lifecycle_no_release_fence_production_no_import_no_product"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_native_fence_fd_lifecycle_no_releaseHardwareBuffer_path_no_import_no_product"
         val lastError = parsed["lastError"] ?: ""
 
         return mapOf(
@@ -95,7 +95,7 @@ object AndroidGlesFenceSmokeHarness {
             "eglCurrentDisplayOk=false;symbolsResolved=false;nativeFenceSyncCreate=not_run;glFlushOk=false;" +
             "dupNativeFenceFd=-1;fdOpenBeforeClose=false;waitOutcome=not_run;waitSignaled=false;" +
             "closeResult=not_run;fdClosedAfterClose=false;destroySync=not_run;shutdown=not_run;idempotentShutdown=not_run;" +
-            "proofBoundary=gles_native_fence_fd_lifecycle_no_release_fence_production_no_import_no_product;lastError=$reason"
+            "proofBoundary=gles_native_fence_fd_lifecycle_no_releaseHardwareBuffer_path_no_import_no_product;lastError=$reason"
 
     // ── Phase 1-Unit AL: Android GLES releaseHardwareBuffer nullptr release-fence output physical proof ──
     private const val RESULT_MARKER_PHASE1AL = "ANDROID_GLES_RELEASE_NULL_FENCE_UNIT_AL_NATIVE_RESULT"
@@ -191,7 +191,7 @@ object AndroidGlesFenceSmokeHarness {
         val hasAfterRelease2 = parsed["hasAfterRelease2"]?.equals("true", ignoreCase = true) ?: false
         val shutdown = parsed["shutdown"] ?: "not_run"
         val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
-        val proofBoundary = parsed["proofBoundary"] ?: "gles_release_null_fence_output_contract_no_release_fence_production_no_render_no_product"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_release_null_fence_output_contract_release_fence_optional_no_render_no_product"
         val lastError = parsed["lastError"] ?: ""
 
         return mapOf(
@@ -242,7 +242,7 @@ object AndroidGlesFenceSmokeHarness {
             "initialize=not_run;import1=not_run;handle1=0;desc1Width=0;desc1Height=0;desc1Layers=0;desc1Format=0;desc1UsageSampled=false;hasAfterImport1=false;" +
             "nullFenceRelease1=not_run;hasAfterNullFenceRelease1=false;nullFenceDoubleRelease1=not_run;import2=not_run;handle2=0;desc2Width=0;desc2Height=0;desc2Layers=0;desc2Format=0;desc2UsageSampled=false;hasAfterImport2=false;" +
             "release2=not_run;release2Fence=-1;hasAfterRelease2=false;shutdown=not_run;idempotentShutdown=not_run;" +
-            "proofBoundary=gles_release_null_fence_output_contract_no_release_fence_production_no_render_no_product;lastError=$reason"
+            "proofBoundary=gles_release_null_fence_output_contract_release_fence_optional_no_render_no_product;lastError=$reason"
 
     // ── Phase 1-Unit AM: Android GLES renderFrame -> EGL native-fence GPU chain physical proof ──
     private const val RESULT_MARKER_PHASE1AM = "ANDROID_GLES_RENDER_FENCE_CHAIN_UNIT_AM_NATIVE_RESULT"
@@ -358,7 +358,7 @@ object AndroidGlesFenceSmokeHarness {
         val surfaceKindAfterDetach = parsed["surfaceKindAfterDetach"] ?: "none"
         val shutdown = parsed["shutdown"] ?: "not_run"
         val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
-        val proofBoundary = parsed["proofBoundary"] ?: "gles_renderFrame_native_fence_chain_no_release_fence_production_no_yuv_no_product"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_renderFrame_native_fence_chain_release_fence_optional_no_yuv_no_product"
         val lastError = parsed["lastError"] ?: ""
 
         return mapOf(
@@ -409,7 +409,7 @@ object AndroidGlesFenceSmokeHarness {
     }
 
     private fun glesRenderFenceChainFailure(reason: String): String =
-        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;bufferDescribe=not_run;bufferWidth=0;bufferHeight=0;bufferLayers=0;bufferFormat=0;bufferUsageSampled=false;bufferUsageCpuWrite=false;bufferFill=not_run;writeFenceFd=-1;writeFenceWait=none;initialize=not_run;attach=not_run;hasSurfaceAfterAttach=false;import=not_run;handle=0;hasAfterImport=false;renderFrame=not_run;eglCurrentDisplayOk=false;symbolsResolved=false;nativeFenceSyncCreate=not_run;glFlushOk=false;dupNativeFenceFd=-1;fdOpenBeforeClose=false;waitOutcome=not_run;waitSignaled=false;closeResult=not_run;fdClosedAfterClose=false;destroySync=not_run;releaseBuffer=not_run;releaseFence=-1;hasAfterRelease=false;detach=not_run;surfaceKindAfterDetach=none;shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_renderFrame_native_fence_chain_no_release_fence_production_no_yuv_no_product;lastError=$reason"
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;bufferDescribe=not_run;bufferWidth=0;bufferHeight=0;bufferLayers=0;bufferFormat=0;bufferUsageSampled=false;bufferUsageCpuWrite=false;bufferFill=not_run;writeFenceFd=-1;writeFenceWait=none;initialize=not_run;attach=not_run;hasSurfaceAfterAttach=false;import=not_run;handle=0;hasAfterImport=false;renderFrame=not_run;eglCurrentDisplayOk=false;symbolsResolved=false;nativeFenceSyncCreate=not_run;glFlushOk=false;dupNativeFenceFd=-1;fdOpenBeforeClose=false;waitOutcome=not_run;waitSignaled=false;closeResult=not_run;fdClosedAfterClose=false;destroySync=not_run;releaseBuffer=not_run;releaseFence=-1;hasAfterRelease=false;detach=not_run;surfaceKindAfterDetach=none;shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_renderFrame_native_fence_chain_release_fence_optional_no_yuv_no_product;lastError=$reason"
 
     // ── Phase 1-Unit AN: Android GLES acquire-fence import -> renderFrame content physical proof ──
     private const val RESULT_MARKER_PHASE1AN = "ANDROID_GLES_ACQUIRE_FENCE_RENDER_CONTENT_UNIT_AN_NATIVE_RESULT"
@@ -533,7 +533,7 @@ object AndroidGlesFenceSmokeHarness {
         val surfaceKindAfterDetach = parsed["surfaceKindAfterDetach"] ?: "none"
         val shutdown = parsed["shutdown"] ?: "not_run"
         val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
-        val proofBoundary = parsed["proofBoundary"] ?: "gles_acquire_fence_import_render_content_no_release_fence_production_no_yuv_no_product"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_acquire_fence_import_render_content_release_fence_optional_no_yuv_no_product"
         val lastError = parsed["lastError"] ?: ""
 
         return mapOf(
@@ -592,5 +592,5 @@ object AndroidGlesFenceSmokeHarness {
     }
 
     private fun glesAcquireFenceRenderContentFailure(reason: String): String =
-        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;bufferDescribe=not_run;bufferWidth=0;bufferHeight=0;bufferLayers=0;bufferFormat=0;bufferUsageSampled=false;bufferUsageCpuWrite=false;bufferFill=not_run;writeFenceFd=-1;writeFenceWait=none;initialize=not_run;eglCurrentDisplayOk=false;symbolsResolved=false;acquireFenceCreate=not_run;glFlushOk=false;acquireFenceFd=-1;acquireFenceOpenBeforeImport=false;acquireFenceDestroyed=false;attach=not_run;hasSurfaceAfterAttach=false;import=not_run;acquireFenceClosedAfterImport=false;handle=0;descriptorWidth=0;descriptorHeight=0;descriptorLayers=0;descriptorFormat=0;descriptorUsageSampled=false;hasAfterImport=false;diagnosticRender=not_run;centerRead=not_run;centerR=0;centerG=0;centerB=0;centerA=0;centerPixelMatches=false;releaseBuffer=not_run;releaseFence=-1;hasAfterRelease=false;detach=not_run;surfaceKindAfterDetach=none;shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_acquire_fence_import_render_content_no_release_fence_production_no_yuv_no_product;lastError=$reason"
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;bufferDescribe=not_run;bufferWidth=0;bufferHeight=0;bufferLayers=0;bufferFormat=0;bufferUsageSampled=false;bufferUsageCpuWrite=false;bufferFill=not_run;writeFenceFd=-1;writeFenceWait=none;initialize=not_run;eglCurrentDisplayOk=false;symbolsResolved=false;acquireFenceCreate=not_run;glFlushOk=false;acquireFenceFd=-1;acquireFenceOpenBeforeImport=false;acquireFenceDestroyed=false;attach=not_run;hasSurfaceAfterAttach=false;import=not_run;acquireFenceClosedAfterImport=false;handle=0;descriptorWidth=0;descriptorHeight=0;descriptorLayers=0;descriptorFormat=0;descriptorUsageSampled=false;hasAfterImport=false;diagnosticRender=not_run;centerRead=not_run;centerR=0;centerG=0;centerB=0;centerA=0;centerPixelMatches=false;releaseBuffer=not_run;releaseFence=-1;hasAfterRelease=false;detach=not_run;surfaceKindAfterDetach=none;shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_acquire_fence_import_render_content_release_fence_optional_no_yuv_no_product;lastError=$reason"
 }

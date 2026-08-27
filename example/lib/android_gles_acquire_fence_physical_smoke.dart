@@ -77,7 +77,7 @@ class _AndroidGlesAcquireFencePhysicalSmokeAppState
         'shutdown': 'not_run',
         'idempotentShutdown': 'not_run',
         'proofBoundary':
-            'gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_no_release_fence_no_product',
+            'gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_release_fence_optional_no_product',
         'lastError': 'exception:${error.runtimeType}',
       };
     }
@@ -124,7 +124,7 @@ class _AndroidGlesAcquireFencePhysicalSmokeAppState
     final descriptorUsageSampled = payload['descriptorUsageSampled'] == true;
     final hasAfterImport = payload['hasAfterImport'] == true;
     final release = (payload['release'] as String?) ?? '';
-    final releaseFence = (payload['releaseFence'] as num?)?.toInt() ?? 0;
+    final releaseFence = (payload['releaseFence'] as num?)?.toInt() ?? -1;
     final hasAfterRelease = payload['hasAfterRelease'] == true;
     final shutdown = (payload['shutdown'] as String?) ?? '';
     final idempotentShutdown = (payload['idempotentShutdown'] as String?) ?? '';
@@ -165,12 +165,12 @@ class _AndroidGlesAcquireFencePhysicalSmokeAppState
         descriptorUsageSampled &&
         hasAfterImport &&
         release == 'success' &&
-        releaseFence == -1 &&
+        releaseFence >= -1 &&
         !hasAfterRelease &&
         shutdown == 'success' &&
         idempotentShutdown == 'success' &&
         proofBoundary ==
-            'gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_no_release_fence_no_product';
+            'gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_release_fence_optional_no_product';
 
     // ignore: avoid_print
     print('ANDROID_GLES_ACQUIRE_FENCE_UNIT_AE_JSON:${jsonEncode(payload)}');

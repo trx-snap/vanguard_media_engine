@@ -154,7 +154,7 @@ class _AndroidGlesRenderFramePhysicalSmokeAppState
     final hasSurfaceAfterTransform =
         payload['hasSurfaceAfterTransform'] == true;
     final releaseA = (payload['releaseA'] as String?) ?? '';
-    final releaseAFence = (payload['releaseAFence'] as num?)?.toInt() ?? 0;
+    final releaseAFence = (payload['releaseAFence'] as num?)?.toInt() ?? -1;
     final hasAAfterRelease = payload['hasAAfterRelease'] == true;
     final hasBAfterReleaseA = payload['hasBAfterReleaseA'] == true;
     final releasedHandleRender =
@@ -215,7 +215,7 @@ class _AndroidGlesRenderFramePhysicalSmokeAppState
             nonIdentityTransformLastError == 'none') &&
         hasSurfaceAfterTransform &&
         releaseA == 'success' &&
-        releaseAFence == -1 &&
+        releaseAFence >= -1 &&
         !hasAAfterRelease &&
         hasBAfterReleaseA &&
         releasedHandleRender == 'rejected_as_expected' &&

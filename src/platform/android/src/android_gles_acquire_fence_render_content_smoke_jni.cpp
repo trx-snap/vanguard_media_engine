@@ -159,7 +159,7 @@ std::string BuildFailureString(const char* lastErrorReason) {
         << "surfaceKindAfterDetach=none;"
         << "shutdown=not_run;"
         << "idempotentShutdown=not_run;"
-        << "proofBoundary=gles_acquire_fence_import_render_content_no_release_fence_production_no_yuv_no_product;"
+        << "proofBoundary=gles_acquire_fence_import_render_content_release_fence_optional_no_yuv_no_product;"
         << "lastError=" << lastErrorReason;
     return oss.str();
 }
@@ -420,7 +420,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         const auto releaseRes = backend.releaseHardwareBuffer(handle, &releaseFence);
         hasAfterRelease = backend.hasHardwareBuffer(handle);
         releaseBufferOk = (releaseRes == vanguard::render::HardwareBufferImportResult::kSuccess) &&
-                          (releaseFence == -1) &&
+                          (releaseFence >= -1) &&
                           !hasAfterRelease;
     }
 
@@ -438,6 +438,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
 
     backend.shutdown();
     const bool idempotentShutdownOk = !backend.isInitialized();
+
+    // Close any non-negative fds returned by releaseHardwareBuffer exactly once after capturing
+    if (releaseFence >= 0) {
+        ::close(releaseFence);
+    }
 
     const bool allChecksPass = bufferDescribeOk &&
                                bufferFillOk &&
@@ -461,7 +466,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                                centerReadOk &&
                                centerPixelMatches &&
                                releaseBufferOk &&
-                               (releaseFence == -1) &&
+                               (releaseFence >= -1) &&
                                !hasAfterRelease &&
                                detachOk &&
                                shutdownOk &&
@@ -518,7 +523,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "surfaceKindAfterDetach=" << surfaceKindAfterDetach << ";"
         << "shutdown=" << (shutdownOk ? "success" : "failed") << ";"
         << "idempotentShutdown=" << (idempotentShutdownOk ? "success" : "failed") << ";"
-        << "proofBoundary=gles_acquire_fence_import_render_content_no_release_fence_production_no_yuv_no_product;"
+        << "proofBoundary=gles_acquire_fence_import_render_content_release_fence_optional_no_yuv_no_product;"
         << "lastError=" << (backendLastError.empty() ? "none" : backendLastError);
 
     const std::string resultStr = oss.str();

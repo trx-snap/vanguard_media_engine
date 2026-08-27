@@ -91,7 +91,7 @@ class _AndroidGlesImportGuardPhysicalSmokeAppState
         'shutdown': 'not_run',
         'idempotentShutdown': 'not_run',
         'proofBoundary':
-            'gles_ahb_import_guard_fail_closed_no_yuv_no_oes_no_release_fence_no_product',
+            'gles_ahb_import_guard_fail_closed_no_yuv_no_oes_release_fence_optional_no_product',
         'lastError': 'exception:${error.runtimeType}',
       };
     }
@@ -140,7 +140,7 @@ class _AndroidGlesImportGuardPhysicalSmokeAppState
     final hasValidPreAfterImport = payload['hasValidPreAfterImport'] == true;
     final validPreRelease = (payload['validPreRelease'] as String?) ?? '';
     final validPreReleaseFence =
-        (payload['validPreReleaseFence'] as num?)?.toInt() ?? 0;
+        (payload['validPreReleaseFence'] as num?)?.toInt() ?? -1;
     final hasValidPreAfterRelease = payload['hasValidPreAfterRelease'] == true;
     final missingUsageImport = (payload['missingUsageImport'] as String?) ?? '';
     final missingUsageHandle =
@@ -175,7 +175,7 @@ class _AndroidGlesImportGuardPhysicalSmokeAppState
     final hasValidPostAfterImport = payload['hasValidPostAfterImport'] == true;
     final validPostRelease = (payload['validPostRelease'] as String?) ?? '';
     final validPostReleaseFence =
-        (payload['validPostReleaseFence'] as num?)?.toInt() ?? 0;
+        (payload['validPostReleaseFence'] as num?)?.toInt() ?? -1;
     final hasValidPostAfterRelease =
         payload['hasValidPostAfterRelease'] == true;
     final shutdown = (payload['shutdown'] as String?) ?? '';
@@ -210,7 +210,7 @@ class _AndroidGlesImportGuardPhysicalSmokeAppState
         validPreDescUsageSampled &&
         hasValidPreAfterImport &&
         validPreRelease == 'success' &&
-        validPreReleaseFence == -1 &&
+        validPreReleaseFence >= -1 &&
         !hasValidPreAfterRelease &&
         missingUsageImport == 'rejected_as_expected' &&
         missingUsageHandle == 0 &&
@@ -231,12 +231,12 @@ class _AndroidGlesImportGuardPhysicalSmokeAppState
         validPostDescUsageSampled &&
         hasValidPostAfterImport &&
         validPostRelease == 'success' &&
-        validPostReleaseFence == -1 &&
+        validPostReleaseFence >= -1 &&
         !hasValidPostAfterRelease &&
         shutdown == 'success' &&
         idempotentShutdown == 'success' &&
         proofBoundary ==
-            'gles_ahb_import_guard_fail_closed_no_yuv_no_oes_no_release_fence_no_product';
+            'gles_ahb_import_guard_fail_closed_no_yuv_no_oes_release_fence_optional_no_product';
 
     // ignore: avoid_print
     print('ANDROID_GLES_IMPORT_GUARD_UNIT_AG_JSON:${jsonEncode(payload)}');

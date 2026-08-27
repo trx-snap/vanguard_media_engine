@@ -3,7 +3,7 @@
 // Android-only translation unit added via CMake target_sources block.
 //
 // Non-claim: fail-closed import guard proof for YCBCR_420_888 format only;
-// no YUV or external/OES import, no release fence production, no product API/UI wiring.
+// no YUV or external/OES import, optional/fail-soft release fence is allowed, no product API/UI wiring.
 //
 // JNI entry point:
 //   runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke -> jstring
@@ -11,6 +11,7 @@
 #include <jni.h>
 #include <android/hardware_buffer.h>
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <sstream>
@@ -104,7 +105,7 @@ std::string BuildFailureString(const char* lastErrorReason) {
         << "hasValidPostAfterRelease=false;"
         << "shutdown=not_run;"
         << "idempotentShutdown=not_run;"
-        << "proofBoundary=gles_ycbcr_ahb_import_guard_fail_closed_no_oes_no_release_fence_no_product;"
+        << "proofBoundary=gles_ycbcr_ahb_import_guard_fail_closed_no_oes_release_fence_optional_no_product;"
         << "lastError=" << lastErrorReason;
     return oss.str();
 }
@@ -182,7 +183,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     int releaseFenceValidPre = -999;
     const auto resReleaseValidPre = backend.releaseHardwareBuffer(hValidPre, &releaseFenceValidPre);
     const bool validPreReleaseOk = (resReleaseValidPre == vanguard::render::HardwareBufferImportResult::kSuccess) &&
-                                   (releaseFenceValidPre == -1);
+                                   (releaseFenceValidPre >= -1);
     const bool hasValidPreAfterRelease = backend.hasHardwareBuffer(hValidPre);
     const bool lane1Ok = validPreImportOk && validPreDescOk && hasValidPreAfterImport &&
                          validPreReleaseOk && !hasValidPreAfterRelease;
@@ -218,7 +219,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     int releaseFenceValidPost = -999;
     const auto resReleaseValidPost = backend.releaseHardwareBuffer(hValidPost, &releaseFenceValidPost);
     const bool validPostReleaseOk = (resReleaseValidPost == vanguard::render::HardwareBufferImportResult::kSuccess) &&
-                                    (releaseFenceValidPost == -1);
+                                    (releaseFenceValidPost >= -1);
     const bool hasValidPostAfterRelease = backend.hasHardwareBuffer(hValidPost);
     const bool lane3Ok = validPostImportOk && validPostDescOk && hasValidPostAfterImport &&
                          validPostReleaseOk && !hasValidPostAfterRelease;
@@ -230,6 +231,14 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     backend.shutdown();
     const bool idempotentShutdownOk = !backend.isInitialized();
     const bool lane4Ok = !isInitAfterShutdown && idempotentShutdownOk;
+
+    // Close any non-negative fds returned by releaseHardwareBuffer exactly once after capturing
+    if (releaseFenceValidPre >= 0) {
+        ::close(releaseFenceValidPre);
+    }
+    if (releaseFenceValidPost >= 0) {
+        ::close(releaseFenceValidPost);
+    }
 
     // Overall check evaluation
     const bool allChecksPass = validBufferDescribeOk &&
@@ -285,7 +294,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "hasValidPostAfterRelease=" << (hasValidPostAfterRelease ? "true" : "false") << ";"
         << "shutdown=" << (!isInitAfterShutdown ? "success" : "failed") << ";"
         << "idempotentShutdown=" << (idempotentShutdownOk ? "success" : "failed") << ";"
-        << "proofBoundary=gles_ycbcr_ahb_import_guard_fail_closed_no_oes_no_release_fence_no_product;"
+        << "proofBoundary=gles_ycbcr_ahb_import_guard_fail_closed_no_oes_release_fence_optional_no_product;"
         << "lastError=" << (backendLastError.empty() ? "none" : backendLastError);
 
     const std::string resultStr = oss.str();

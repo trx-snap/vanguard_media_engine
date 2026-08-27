@@ -178,7 +178,7 @@ class _AndroidGlesRgbxRenderFrameContentPhysicalSmokeAppState
     final rot90CenterA = (payload['rot90CenterA'] as num?)?.toInt() ?? 0;
     final rot90CenterPixelMatches = payload['rot90CenterPixelMatches'] == true;
     final releaseBuffer = (payload['releaseBuffer'] as String?) ?? '';
-    final releaseFence = (payload['releaseFence'] as num?)?.toInt() ?? 0;
+    final releaseFence = (payload['releaseFence'] as num?)?.toInt() ?? -1;
     final hasAfterRelease = payload['hasAfterRelease'] == true;
     final postReleaseDiagnosticRender =
         (payload['postReleaseDiagnosticRender'] as String?) ?? '';
@@ -259,7 +259,7 @@ class _AndroidGlesRgbxRenderFrameContentPhysicalSmokeAppState
         rot90CenterPixelMatches &&
         rot90CenterColorMatch &&
         releaseBuffer == 'success' &&
-        releaseFence == -1 &&
+        releaseFence >= -1 &&
         !hasAfterRelease &&
         postReleaseDiagnosticRender == 'rejected_as_expected' &&
         postReleaseLastError == 'invalid_buffer_handle' &&

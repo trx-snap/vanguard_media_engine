@@ -79,8 +79,12 @@ public:
     // Release a previously imported buffer by handle.
     //
     // handle            - handle returned by a successful importHardwareBuffer.
-    // outReleaseFenceFd - optional; if non-null set to -1 (Phase 2C does not
-    //                     produce a release fence).
+    // outReleaseFenceFd - optional; if non-null, set to -1 first. On
+    //                     kSuccess a backend may instead return an owned
+    //                     sync fd (fd >= 0) that the caller must close; the
+    //                     backend never closes it. A value of -1 simply
+    //                     means no fence was produced for this release and
+    //                     is not itself an error condition.
     //
     // Destroys GPU resources, releases the AHardwareBuffer ref, closes the
     // stored acquireFenceFd, and removes the entry from the handle table.

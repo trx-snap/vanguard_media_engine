@@ -224,6 +224,14 @@ class VanguardNativeBridge(
     // ── Phase 1-Unit AJ: Android GLES EGL native-fence FD lifecycle physical proof ──
     external fun runAndroidDagPhase1AJGlesNativeFenceFdSmoke(): String
 
+    // ── Phase 1-Unit AK: Android GLES releaseHardwareBuffer live release-fence output physical proof ──
+    external fun runAndroidDagPhase1AKGlesReleaseFenceProductionSmoke(
+        surface: Surface,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+    ): String
+
     // ── Phase 1-Unit AL: Android GLES releaseHardwareBuffer nullptr release-fence output physical proof ──
     external fun runAndroidDagPhase1ALGlesReleaseNullFenceSmoke(
         hardwareBuffer: HardwareBuffer,

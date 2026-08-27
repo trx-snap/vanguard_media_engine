@@ -8,6 +8,7 @@
 #include <jni.h>
 #include <android/hardware_buffer.h>
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <sstream>
 #include <string>
@@ -204,11 +205,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     const bool hasAStillActive = backend.hasHardwareBuffer(hA);
     const bool importBCheckOk = validImportB && distinctHandles && hasBAfterImport && hasAStillActive;
 
-    // 8. Release handleA returns kSuccess, outReleaseFenceFd=-1, has false; double release handleA returns kUnknownHandle
+    // 8. Release handleA returns kSuccess, outReleaseFenceFd >= -1, has false; double release handleA returns kUnknownHandle
     int releaseFenceA = -999;
     const auto releaseARes = backend.releaseHardwareBuffer(hA, &releaseFenceA);
     const bool releaseAOk = (releaseARes == vanguard::render::HardwareBufferImportResult::kSuccess) &&
-                            (releaseFenceA == -1);
+                            (releaseFenceA >= -1);
     const bool hasAAfterRelease = backend.hasHardwareBuffer(hA);
 
     int doubleReleaseFenceA = -999;
@@ -225,6 +226,14 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     backend.shutdown();
     const bool idempotentShutdownOk = !backend.hasHardwareBuffer(hB) && !backend.isInitialized();
     const bool shutdownCheckOk = !hasBAfterShutdown && !isInitAfterShutdown && idempotentShutdownOk;
+
+    // Close any non-negative fds returned by releaseHardwareBuffer exactly once after capturing
+    if (releaseFenceA >= 0) {
+        ::close(releaseFenceA);
+    }
+    if (doubleReleaseFenceA >= 0) {
+        ::close(doubleReleaseFenceA);
+    }
 
     // Overall check pass evaluation
     const bool allChecksPass = preInitCheckOk &&

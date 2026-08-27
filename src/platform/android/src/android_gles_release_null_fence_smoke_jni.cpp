@@ -12,6 +12,7 @@
 #include <jni.h>
 #include <android/hardware_buffer.h>
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <sstream>
@@ -99,7 +100,7 @@ std::string BuildFailureString(const char* lastErrorReason) {
         << "hasAfterRelease2=false;"
         << "shutdown=not_run;"
         << "idempotentShutdown=not_run;"
-        << "proofBoundary=gles_release_null_fence_output_contract_no_release_fence_production_no_render_no_product;"
+        << "proofBoundary=gles_release_null_fence_output_contract_release_fence_optional_no_render_no_product;"
         << "lastError=" << lastErrorReason;
     return oss.str();
 }
@@ -193,7 +194,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     int release2Fence = -999;
     const auto resRelease2 = backend.releaseHardwareBuffer(handle2, &release2Fence);
     const bool release2Ok = (resRelease2 == vanguard::render::HardwareBufferImportResult::kSuccess) &&
-                            (release2Fence == -1);
+                            (release2Fence >= -1);
     const bool hasAfterRelease2 = backend.hasHardwareBuffer(handle2);
     const bool lane5Ok = import2Ok && desc2Ok && hasAfterImport2 && release2Ok && !hasAfterRelease2;
 
@@ -204,6 +205,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     backend.shutdown();
     const bool idempotentShutdownOk = !backend.isInitialized();
     const bool lane6Ok = !isInitAfterShutdown && idempotentShutdownOk;
+
+    // Close any non-negative fds returned by releaseHardwareBuffer exactly once after capturing
+    if (release2Fence >= 0) {
+        ::close(release2Fence);
+    }
 
     const bool allChecksPass = bufferDescribeOk &&
                                initCheckOk &&
@@ -252,7 +258,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "hasAfterRelease2=" << (hasAfterRelease2 ? "true" : "false") << ";"
         << "shutdown=" << (!isInitAfterShutdown ? "success" : "failed") << ";"
         << "idempotentShutdown=" << (idempotentShutdownOk ? "success" : "failed") << ";"
-        << "proofBoundary=gles_release_null_fence_output_contract_no_release_fence_production_no_render_no_product;"
+        << "proofBoundary=gles_release_null_fence_output_contract_release_fence_optional_no_render_no_product;"
         << "lastError=" << (backendLastError.empty() ? "none" : backendLastError);
 
     const std::string resultStr = oss.str();

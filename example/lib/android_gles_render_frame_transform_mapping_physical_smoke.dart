@@ -233,7 +233,7 @@ class _AndroidGlesRenderFrameTransformMappingPhysicalSmokeAppState
     final allTransformsPass = payload['allTransformsPass'] == true;
 
     final releaseBuffer = (payload['releaseBuffer'] as String?) ?? '';
-    final releaseFence = (payload['releaseFence'] as num?)?.toInt() ?? 0;
+    final releaseFence = (payload['releaseFence'] as num?)?.toInt() ?? -1;
     final hasAfterRelease = payload['hasAfterRelease'] == true;
     final postReleaseDiagnosticRender =
         (payload['postReleaseDiagnosticRender'] as String?) ?? '';
@@ -323,7 +323,7 @@ class _AndroidGlesRenderFrameTransformMappingPhysicalSmokeAppState
         mirror270Pass &&
         allTransformsPass &&
         releaseBuffer == 'success' &&
-        releaseFence == -1 &&
+        releaseFence >= -1 &&
         !hasAfterRelease &&
         postReleaseDiagnosticRender == 'rejected_as_expected' &&
         postReleaseLastError == 'invalid_buffer_handle' &&

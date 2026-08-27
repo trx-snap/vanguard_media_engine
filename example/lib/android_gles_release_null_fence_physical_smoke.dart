@@ -75,7 +75,7 @@ class _AndroidGlesReleaseNullFencePhysicalSmokeAppState
         'shutdown': 'not_run',
         'idempotentShutdown': 'not_run',
         'proofBoundary':
-            'gles_release_null_fence_output_contract_no_release_fence_production_no_render_no_product',
+            'gles_release_null_fence_output_contract_release_fence_optional_no_render_no_product',
         'lastError': 'exception:${error.runtimeType}',
       };
     }
@@ -113,7 +113,7 @@ class _AndroidGlesReleaseNullFencePhysicalSmokeAppState
     final desc2UsageSampled = payload['desc2UsageSampled'] == true;
     final hasAfterImport2 = payload['hasAfterImport2'] == true;
     final release2 = payload['release2'];
-    final release2Fence = (payload['release2Fence'] as num?)?.toInt() ?? 0;
+    final release2Fence = (payload['release2Fence'] as num?)?.toInt() ?? -1;
     final hasAfterRelease2 = payload['hasAfterRelease2'] == true;
     final shutdown = payload['shutdown'];
     final idempotentShutdown = payload['idempotentShutdown'];
@@ -153,12 +153,12 @@ class _AndroidGlesReleaseNullFencePhysicalSmokeAppState
         desc2UsageSampled &&
         hasAfterImport2 &&
         (release2 == 'success' || release2 == true) &&
-        release2Fence == -1 &&
+        release2Fence >= -1 &&
         !hasAfterRelease2 &&
         (shutdown == 'success' || shutdown == true) &&
         (idempotentShutdown == 'success' || idempotentShutdown == true) &&
         proofBoundary ==
-            'gles_release_null_fence_output_contract_no_release_fence_production_no_render_no_product';
+            'gles_release_null_fence_output_contract_release_fence_optional_no_render_no_product';
 
     // ignore: avoid_print
     print(

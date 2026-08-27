@@ -729,9 +729,12 @@ bool GlesBackend::diagnosticPresentWindowShaderQuad(float red, float green, floa
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2C / Unit Y: AHardwareBuffer import - delegates to
+// Phase 2C / Unit Y: AHardwareBuffer import/release - delegates to
 // GlesHardwareBufferImports, which preserves the prior unavailable-stub
-// behavior on non-Android host builds.
+// behavior on non-Android host builds. Unit AK: releaseHardwareBuffer()
+// delegation is unchanged here; the fail-soft native release-fence attempt
+// (capability/symbol/current-context guarded) lives entirely inside
+// GlesHardwareBufferImports::releaseBuffer().
 // ---------------------------------------------------------------------------
 
 HardwareBufferImportResult GlesBackend::importHardwareBuffer(

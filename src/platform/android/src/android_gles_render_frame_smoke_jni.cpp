@@ -9,6 +9,7 @@
 #include <android/hardware_buffer.h>
 #include <android/native_window_jni.h>
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <sstream>
 #include <string>
@@ -410,13 +411,13 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
 
     const bool hasSurfaceAfterAllTransforms = backend.hasSurface();
 
-    // 13. Release handleA succeeds; releaseFenceFd == -1; has handleA false, handleB true
+    // 13. Release handleA succeeds; releaseFenceFd >= -1; has handleA false, handleB true
     int releaseFenceA = -999;
     const auto releaseARes = backend.releaseHardwareBuffer(handleA, &releaseFenceA);
     const bool hasAAfterRelease = backend.hasHardwareBuffer(handleA);
     const bool hasBAfterReleaseA = backend.hasHardwareBuffer(handleB);
     const bool releaseAOk = (releaseARes == vanguard::render::HardwareBufferImportResult::kSuccess) &&
-                            (releaseFenceA == -1) &&
+                            (releaseFenceA >= -1) &&
                             !hasAAfterRelease &&
                             hasBAfterReleaseA;
 
@@ -447,6 +448,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
 
     // Release ANativeWindow reference owned by JNI harness
     ANativeWindow_release(window);
+
+    // Close any non-negative fds returned by releaseHardwareBuffer exactly once after capturing
+    if (releaseFenceA >= 0) {
+        ::close(releaseFenceA);
+    }
 
     const bool allChecksPass = preInitRenderOk &&
                                initCheckOk &&

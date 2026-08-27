@@ -57,7 +57,7 @@ class _AndroidGlesNativeFenceFdPhysicalSmokeAppState
         'shutdown': 'not_run',
         'idempotentShutdown': 'not_run',
         'proofBoundary':
-            'gles_native_fence_fd_lifecycle_no_release_fence_production_no_import_no_product',
+            'gles_native_fence_fd_lifecycle_no_releaseHardwareBuffer_path_no_import_no_product',
         'lastError': 'exception:${error.runtimeType}',
       };
     }
@@ -105,7 +105,7 @@ class _AndroidGlesNativeFenceFdPhysicalSmokeAppState
         (shutdown == 'success' || shutdown == true) &&
         (idempotentShutdown == 'success' || idempotentShutdown == true) &&
         proofBoundary ==
-            'gles_native_fence_fd_lifecycle_no_release_fence_production_no_import_no_product';
+            'gles_native_fence_fd_lifecycle_no_releaseHardwareBuffer_path_no_import_no_product';
 
     // ignore: avoid_print
     print('ANDROID_GLES_NATIVE_FENCE_FD_UNIT_AJ_JSON:${jsonEncode(payload)}');

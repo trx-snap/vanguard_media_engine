@@ -26,9 +26,12 @@ namespace render {
 // diagnosticReadPixels() to verify rendered texture content before
 // presentation, plus (Unit AE) importHardwareBuffer() synchronously waiting
 // on and closing the caller-supplied acquire fence (bounded poll(),
-// fail-closed on timeout/error) before import. No product pixel-readback
-// API, no YUV/external texture, no release fence, no EGL native-fence GPU
-// chaining, no multi-node composition, no product UI wiring. EGL/GLES/
+// fail-closed on timeout/error) before import, plus (Unit AK)
+// releaseHardwareBuffer() attempting a fail-soft native release fence on
+// Android when the caller passes a non-null outReleaseFenceFd (see the
+// releaseHardwareBuffer() declaration below for exact conditions and
+// fallback behavior). No product pixel-readback API, no YUV/external
+// texture, no multi-node composition, no product UI wiring. EGL/GLES/
 // Android headers must never appear in this public header; all such state
 // lives exclusively in gles_backend.cpp and the private
 // GlesHardwareBufferImports / GlesTextureFrameRenderer helpers behind the
@@ -64,13 +67,22 @@ public:
     // Unit AE: if acquireFenceFd >= 0, it is waited on synchronously
     // (bounded poll(), 1000ms) before the buffer is imported, then always
     // closed exactly once; never stored. Wait timeout or failure fails the
-    // import closed. No release fence is produced.
+    // import closed. This call does not itself produce a release fence; see
+    // releaseHardwareBuffer below for release-fence behavior.
     HardwareBufferImportResult importHardwareBuffer(
         void* hardwareBuffer,
         int acquireFenceFd,
         HardwareBufferHandle* outHandle,
         HardwareBufferDescriptor* outDescriptor) override;
 
+    // Unit AK: outReleaseFenceFd is set to -1 at entry. If nullptr, no fence
+    // is ever created. If non-null, on Android this may return an owned
+    // sync fd (fd >= 0, caller must close it; this backend never closes it)
+    // when EGL_ANDROID_native_fence_sync capability, resolved sync symbols,
+    // and an actually-current EGL context on this backend's display are all
+    // present at call time; otherwise it fails soft, leaving the output at
+    // -1 without failing the call. Unavailable on non-Android host builds
+    // (output stays -1).
     HardwareBufferImportResult releaseHardwareBuffer(
         HardwareBufferHandle handle,
         int* outReleaseFenceFd) override;

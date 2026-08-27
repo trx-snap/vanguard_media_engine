@@ -102,7 +102,7 @@ class _AndroidGlesImportPhysicalSmokeAppState
     final distinctHandles = payload['distinctHandles'] == true;
     final hasBAfterImport = payload['hasBAfterImport'] == true;
     final releaseA = (payload['releaseA'] as String?) ?? '';
-    final releaseAFence = (payload['releaseAFence'] as num?)?.toInt() ?? 0;
+    final releaseAFence = (payload['releaseAFence'] as num?)?.toInt() ?? -1;
     final hasAAfterRelease = payload['hasAAfterRelease'] == true;
     final doubleReleaseA = (payload['doubleReleaseA'] as String?) ?? '';
     final shutdown = (payload['shutdown'] as String?) ?? '';
@@ -136,7 +136,7 @@ class _AndroidGlesImportPhysicalSmokeAppState
         distinctHandles &&
         hasBAfterImport &&
         releaseA == 'success' &&
-        releaseAFence == -1 &&
+        releaseAFence >= -1 &&
         !hasAAfterRelease &&
         doubleReleaseA == 'rejected_as_expected' &&
         shutdown == 'success' &&

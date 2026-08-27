@@ -19,9 +19,12 @@
 // ownership or behavior.
 //
 // Unit AE: importBuffer() waits on and closes the caller-supplied acquire
-// fence (bounded poll(), fail-closed on timeout/error) before importing; no
-// release fence is produced. No EGL native-fence GPU chaining, YUV/external
-// texture, multi-node composition, or product UI wiring.
+// fence (bounded poll(), fail-closed on timeout/error) before importing.
+//
+// Unit AK: releaseBuffer() attempts a fail-soft native release fence when
+// given a non-null outReleaseFenceFd; see the releaseBuffer() comment below
+// for the exact conditions and fallback behavior. No YUV/external texture,
+// multi-node composition, or product UI wiring.
 
 #pragma once
 #include "vanguard/render/hardware_buffer_import.h"
@@ -67,8 +70,21 @@ public:
         HardwareBufferHandle* outHandle,
         HardwareBufferDescriptor* outDescriptor);
 
-    // outReleaseFenceFd - optional; always set to -1 (Unit Y never produces
-    // a release fence).
+    // outReleaseFenceFd - optional. Set to -1 at entry. If nullptr, no
+    //                     sync/fd is ever created (preserves the prior
+    //                     null-output behavior). If non-null, a native
+    //                     release fence is attempted fail-soft on Android:
+    //                     it requires EGL_ANDROID_native_fence_sync
+    //                     capability, resolved sync symbols, and an EGL
+    //                     context actually current on this instance's
+    //                     display at call time (GL-thread call only; this
+    //                     method never makes any context current). Any
+    //                     unmet condition or EGL/GL failure leaves the
+    //                     output at -1 and does not fail the call. A
+    //                     returned fd >= 0 is owned by the caller, who must
+    //                     close it; this class never closes it. Does not
+    //                     claim multi-node GPU fence chaining or product
+    //                     wiring beyond the fd handoff itself.
     HardwareBufferImportResult releaseBuffer(
         HardwareBufferHandle handle,
         int* outReleaseFenceFd);

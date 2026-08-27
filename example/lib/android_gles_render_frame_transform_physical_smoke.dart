@@ -246,7 +246,7 @@ class _AndroidGlesRenderFrameTransformPhysicalSmokeAppState
             mirrorTransformLastError == 'none') &&
         hasSurfaceAfterAllTransforms &&
         releaseA == 'success' &&
-        releaseAFence == -1 &&
+        releaseAFence >= -1 &&
         !hasAAfterRelease &&
         hasBAfterReleaseA &&
         releasedHandleRender == 'rejected_as_expected' &&

@@ -88,7 +88,7 @@ class _AndroidGlesAcquireFenceRenderContentPhysicalSmokeAppState
         'shutdown': 'not_run',
         'idempotentShutdown': 'not_run',
         'proofBoundary':
-            'gles_acquire_fence_import_render_content_no_release_fence_production_no_yuv_no_product',
+            'gles_acquire_fence_import_render_content_release_fence_optional_no_yuv_no_product',
         'lastError': 'exception:${error.runtimeType}',
       };
     }
@@ -140,7 +140,7 @@ class _AndroidGlesAcquireFenceRenderContentPhysicalSmokeAppState
     final centerA = (payload['centerA'] as num?)?.toInt() ?? 0;
     final centerPixelMatches = payload['centerPixelMatches'] == true;
     final releaseBuffer = payload['releaseBuffer'];
-    final releaseFence = (payload['releaseFence'] as num?)?.toInt() ?? 0;
+    final releaseFence = (payload['releaseFence'] as num?)?.toInt() ?? -1;
     final hasAfterRelease = payload['hasAfterRelease'] == true;
     final detach = payload['detach'];
     final surfaceKindAfterDetach =
@@ -195,7 +195,7 @@ class _AndroidGlesAcquireFenceRenderContentPhysicalSmokeAppState
         centerPixelMatches &&
         centerColorMatch &&
         (releaseBuffer == 'success' || releaseBuffer == true) &&
-        releaseFence == -1 &&
+        releaseFence >= -1 &&
         !hasAfterRelease &&
         (detach == 'success' || detach == true) &&
         (surfaceKindAfterDetach == 'offscreen' ||
@@ -203,7 +203,7 @@ class _AndroidGlesAcquireFenceRenderContentPhysicalSmokeAppState
         (shutdown == 'success' || shutdown == true) &&
         (idempotentShutdown == 'success' || idempotentShutdown == true) &&
         proofBoundary ==
-            'gles_acquire_fence_import_render_content_no_release_fence_production_no_yuv_no_product';
+            'gles_acquire_fence_import_render_content_release_fence_optional_no_yuv_no_product';
 
     // ignore: avoid_print
     print(

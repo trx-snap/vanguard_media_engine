@@ -2273,7 +2273,7 @@ object AndroidDagRenderSmokeHarness {
         val hasAfterRelease = parsed["hasAfterRelease"]?.equals("true", ignoreCase = true) ?: false
         val shutdown = parsed["shutdown"] ?: "not_run"
         val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
-        val proofBoundary = parsed["proofBoundary"] ?: "gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_no_release_fence_no_product"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_release_fence_optional_no_product"
         val lastError = parsed["lastError"] ?: ""
 
         return mapOf(
@@ -2331,7 +2331,7 @@ object AndroidDagRenderSmokeHarness {
             "signaledHandle=0;descriptorWidth=0;descriptorHeight=0;descriptorLayers=0;descriptorFormat=0;" +
             "descriptorUsageSampled=false;hasAfterImport=false;release=not_run;releaseFence=-1;" +
             "hasAfterRelease=false;shutdown=not_run;idempotentShutdown=not_run;" +
-            "proofBoundary=gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_no_release_fence_no_product;lastError=$reason"
+            "proofBoundary=gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_release_fence_optional_no_product;lastError=$reason"
 
     // ── Phase 1-Unit AF: Android GLES RGBX AHardwareBuffer renderFrame content readback physical smoke ──
     private const val RESULT_MARKER_PHASE1AF = "ANDROID_GLES_RGBX_RENDERFRAME_CONTENT_UNIT_AF_NATIVE_RESULT"
@@ -2705,7 +2705,7 @@ object AndroidDagRenderSmokeHarness {
         val hasValidPostAfterRelease = parsed["hasValidPostAfterRelease"]?.equals("true", ignoreCase = true) ?: false
         val shutdown = parsed["shutdown"] ?: "not_run"
         val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
-        val proofBoundary = parsed["proofBoundary"] ?: "gles_ahb_import_guard_fail_closed_no_yuv_no_oes_no_release_fence_no_product"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_ahb_import_guard_fail_closed_no_yuv_no_oes_release_fence_optional_no_product"
         val lastError = parsed["lastError"] ?: ""
 
         return mapOf(
@@ -2778,7 +2778,7 @@ object AndroidDagRenderSmokeHarness {
             "unsupportedFormatImport=not_run;unsupportedFormatHandle=0;unsupportedFormatDescZero=false;unsupportedFormatLastError=none;hasUnsupportedFormatAfterImport=false;" +
             "validPostImport=not_run;validPostHandle=0;validPostDescWidth=0;validPostDescHeight=0;validPostDescLayers=0;validPostDescFormat=0;" +
             "validPostDescUsageSampled=false;hasValidPostAfterImport=false;validPostRelease=not_run;validPostReleaseFence=-1;hasValidPostAfterRelease=false;" +
-            "shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_ahb_import_guard_fail_closed_no_yuv_no_oes_no_release_fence_no_product;lastError=$reason"
+            "shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_ahb_import_guard_fail_closed_no_yuv_no_oes_release_fence_optional_no_product;lastError=$reason"
 
     // ── Phase 1-Unit AH: Android GLES YCBCR_420_888 AHardwareBuffer import guard fail-closed physical proof ──
     private const val RESULT_MARKER_PHASE1AH = "ANDROID_GLES_YCBCR_IMPORT_GUARD_UNIT_AH_NATIVE_RESULT"
@@ -2903,7 +2903,7 @@ object AndroidDagRenderSmokeHarness {
         val hasValidPostAfterRelease = parsed["hasValidPostAfterRelease"]?.equals("true", ignoreCase = true) ?: false
         val shutdown = parsed["shutdown"] ?: "not_run"
         val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
-        val proofBoundary = parsed["proofBoundary"] ?: "gles_ycbcr_ahb_import_guard_fail_closed_no_oes_no_release_fence_no_product"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_ycbcr_ahb_import_guard_fail_closed_no_oes_release_fence_optional_no_product"
         val lastError = parsed["lastError"] ?: ""
 
         return mapOf(
@@ -2965,6 +2965,6 @@ object AndroidDagRenderSmokeHarness {
             "ycbcrImport=not_run;ycbcrHandle=0;ycbcrDescZero=false;ycbcrLastError=none;hasYcbcrAfterImport=false;" +
             "validPostImport=not_run;validPostHandle=0;validPostDescWidth=0;validPostDescHeight=0;validPostDescLayers=0;validPostDescFormat=0;" +
             "validPostDescUsageSampled=false;hasValidPostAfterImport=false;validPostRelease=not_run;validPostReleaseFence=-1;hasValidPostAfterRelease=false;" +
-            "shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_ycbcr_ahb_import_guard_fail_closed_no_oes_no_release_fence_no_product;lastError=$reason"
+            "shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_ycbcr_ahb_import_guard_fail_closed_no_oes_release_fence_optional_no_product;lastError=$reason"
     // ── Phase 1-Unit AI moved to AndroidGlesCapabilitySmokeHarness ──
 }

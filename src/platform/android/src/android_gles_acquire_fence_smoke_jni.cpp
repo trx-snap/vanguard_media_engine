@@ -130,7 +130,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             << "hasAfterRelease=false;"
             << "shutdown=not_run;"
             << "idempotentShutdown=not_run;"
-            << "proofBoundary=gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_no_release_fence_no_product;"
+            << "proofBoundary=gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_release_fence_optional_no_product;"
             << "lastError=invalid_arguments";
         return env->NewStringUTF(oss.str().c_str());
     }
@@ -176,7 +176,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             << "hasAfterRelease=false;"
             << "shutdown=not_run;"
             << "idempotentShutdown=not_run;"
-            << "proofBoundary=gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_no_release_fence_no_product;"
+            << "proofBoundary=gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_release_fence_optional_no_product;"
             << "lastError=hardware_buffer_from_jobject_failed";
         return env->NewStringUTF(oss.str().c_str());
     }
@@ -308,11 +308,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                                  descOk &&
                                  hasAfterImport;
 
-    // 6. Release handle: releaseFence=-1, has false
+    // 6. Release handle: releaseFence >= -1, has false
     int releaseFence = -999;
     const auto releaseRes = backend.releaseHardwareBuffer(handle, &releaseFence);
     const bool releaseOk = (releaseRes == vanguard::render::HardwareBufferImportResult::kSuccess) &&
-                           (releaseFence == -1);
+                           (releaseFence >= -1);
     const bool hasAfterRelease = backend.hasHardwareBuffer(handle);
     const bool releaseCheckOk = releaseOk && !hasAfterRelease;
 
@@ -324,6 +324,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     backend.shutdown();
     const bool idempotentShutdownOk = !backend.hasHardwareBuffer(handle) && !backend.isInitialized();
     const bool shutdownCheckOk = !hasAfterShutdown && !isInitAfterShutdown && idempotentShutdownOk;
+
+    // Close any non-negative fds returned by releaseHardwareBuffer exactly once after capturing
+    if (releaseFence >= 0) {
+        ::close(releaseFence);
+    }
 
     // Overall check pass evaluation
     const bool allChecksPass = preInitCheckOk &&
@@ -375,7 +380,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "hasAfterRelease=" << (hasAfterRelease ? "true" : "false") << ";"
         << "shutdown=" << (!hasAfterShutdown ? "success" : "failed") << ";"
         << "idempotentShutdown=" << (idempotentShutdownOk ? "success" : "failed") << ";"
-        << "proofBoundary=gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_no_release_fence_no_product;"
+        << "proofBoundary=gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_release_fence_optional_no_product;"
         << "lastError=" << (backendLastError.empty() ? "none" : backendLastError);
 
     const std::string resultStr = oss.str();
