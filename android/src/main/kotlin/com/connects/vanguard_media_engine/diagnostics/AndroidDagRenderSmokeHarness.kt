@@ -1007,4 +1007,123 @@ object AndroidDagRenderSmokeHarness {
             "hasSurfaceAfterPresent=false;surfaceKindAfterPresent=none;widthAfterPresent=0;heightAfterPresent=0;" +
             "detach=not_run;surfaceKindAfterDetach=none;shutdown=not_run;idempotentShutdown=not_run;" +
             "import=not_run;renderFrame=not_run;proofBoundary=gles_window_clear_swap_no_import_no_renderFrame;lastError=$reason"
+
+    // ── Phase 1-Unit X: Android GLES backend window-surface shader-quad draw/swap presentation diagnostic ──
+    private const val RESULT_MARKER_PHASE1X = "ANDROID_GLES_BACKEND_UNIT_X_NATIVE_RESULT"
+
+    fun runGlesShaderQuadSmoke(width: Int = 64, height: Int = 64): Map<String, Any?> {
+        var surfaceTexture: SurfaceTexture? = null
+        var surface: Surface? = null
+        var raw = glesShaderQuadFailure("not_run", width, height)
+
+        try {
+            if (width <= 0 || height <= 0) {
+                raw = glesShaderQuadFailure("invalid_dimensions", width, height)
+                return parseGlesShaderQuadResult(raw)
+            }
+
+            surfaceTexture = SurfaceTexture(false).apply {
+                setDefaultBufferSize(width, height)
+            }
+            surface = Surface(surfaceTexture)
+
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1XGlesShaderQuadSmoke(
+                surface,
+                width,
+                height,
+            )
+            return parseGlesShaderQuadResult(raw)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = glesShaderQuadFailure("exception:$reason", width, height)
+            return parseGlesShaderQuadResult(raw)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1X $raw")
+            try {
+                surface?.release()
+            } catch (_: Throwable) {
+            }
+            try {
+                surfaceTexture?.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun parseGlesShaderQuadResult(raw: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val clientVersion = parsed["clientVersion"]?.toIntOrNull() ?: 0
+        val vendor = parsed["vendor"] ?: ""
+        val renderer = parsed["renderer"] ?: ""
+        val version = parsed["version"] ?: ""
+        val preAttachShader = parsed["preAttachShader"] ?: "not_run"
+        val preAttachLastError = parsed["preAttachLastError"] ?: ""
+        val attach = parsed["attach"] ?: "not_run"
+        val firstShaderQuad = parsed["firstShaderQuad"] ?: "not_run"
+        val secondShaderQuad = parsed["secondShaderQuad"] ?: "not_run"
+        val invalidColorShaderQuad = parsed["invalidColorShaderQuad"] ?: "not_run"
+        val invalidColorLastError = parsed["invalidColorLastError"] ?: ""
+        val clearAfterShader = parsed["clearAfterShader"] ?: "not_run"
+        val hasSurfaceAfterShader = parsed["hasSurfaceAfterShader"]?.equals("true", ignoreCase = true) ?: false
+        val surfaceKindAfterShader = parsed["surfaceKindAfterShader"] ?: "none"
+        val widthAfterShader = parsed["widthAfterShader"]?.toIntOrNull() ?: 0
+        val heightAfterShader = parsed["heightAfterShader"]?.toIntOrNull() ?: 0
+        val detach = parsed["detach"] ?: "not_run"
+        val surfaceKindAfterDetach = parsed["surfaceKindAfterDetach"] ?: "none"
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val import = parsed["import"] ?: "not_run"
+        val renderFrame = parsed["renderFrame"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_window_shader_quad_no_import_no_renderFrame"
+        val lastError = parsed["lastError"] ?: ""
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "clientVersion" to clientVersion,
+            "vendor" to vendor,
+            "renderer" to renderer,
+            "version" to version,
+            "preAttachShader" to preAttachShader,
+            "preAttachLastError" to preAttachLastError,
+            "attach" to attach,
+            "firstShaderQuad" to firstShaderQuad,
+            "secondShaderQuad" to secondShaderQuad,
+            "invalidColorShaderQuad" to invalidColorShaderQuad,
+            "invalidColorLastError" to invalidColorLastError,
+            "clearAfterShader" to clearAfterShader,
+            "hasSurfaceAfterShader" to hasSurfaceAfterShader,
+            "surfaceKindAfterShader" to surfaceKindAfterShader,
+            "widthAfterShader" to widthAfterShader,
+            "heightAfterShader" to heightAfterShader,
+            "detach" to detach,
+            "surfaceKindAfterDetach" to surfaceKindAfterDetach,
+            "shutdown" to shutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "import" to import,
+            "renderFrame" to renderFrame,
+            "proofBoundary" to proofBoundary,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun glesShaderQuadFailure(reason: String, width: Int, height: Int): String =
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;preAttachShader=not_run;preAttachLastError=;" +
+            "attach=$reason;firstShaderQuad=not_run;secondShaderQuad=not_run;invalidColorShaderQuad=not_run;invalidColorLastError=;" +
+            "clearAfterShader=not_run;hasSurfaceAfterShader=false;surfaceKindAfterShader=none;widthAfterShader=0;heightAfterShader=0;" +
+            "detach=not_run;surfaceKindAfterDetach=none;shutdown=not_run;idempotentShutdown=not_run;" +
+            "import=not_run;renderFrame=not_run;proofBoundary=gles_window_shader_quad_no_import_no_renderFrame;lastError=$reason"
 }

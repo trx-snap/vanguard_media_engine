@@ -6,12 +6,13 @@
 namespace vanguard {
 namespace render {
 
-// Phase Unit U/V/W: GlesBackend owns an offscreen EGL/GLES lifecycle on
+// Phase Unit U/V/W/X: GlesBackend owns an offscreen EGL/GLES lifecycle on
 // Android, plus (Unit V) attach/detach of a window EGLSurface built from a
 // borrowed ANativeWindow*, plus (Unit W) a diagnostic clear/swap presentation
-// on an already-attached window surface. EGL/GLES headers must never appear
-// in this public header; all such state lives exclusively in
-// gles_backend.cpp behind the Impl pimpl.
+// on an already-attached window surface, plus (Unit X) a diagnostic minimal
+// ES2 shader-quad draw/swap on an already-attached window surface. EGL/GLES
+// headers must never appear in this public header; all such state lives
+// exclusively in gles_backend.cpp behind the Impl pimpl.
 class GlesBackend : public RenderBackend {
 public:
     GlesBackend();
@@ -99,6 +100,15 @@ public:
     // set) when not initialized, when no window surface is attached, or when
     // the color components are not finite values in [0.0, 1.0].
     bool diagnosticPresentWindowClear(float red, float green, float blue, float alpha);
+
+    // Unit X: makes the already-attached window EGLSurface current, compiles
+    // and links a minimal ES2 shader program, draws a full-window solid-color
+    // quad with it, and swaps. Proves shader draw/swap on an attached window
+    // surface without importing or rendering any frame. Does not attach,
+    // detach, or destroy any surface. Returns false (with lastError set) when
+    // not initialized, when no window surface is attached, or when the color
+    // components are not finite values in [0.0, 1.0].
+    bool diagnosticPresentWindowShaderQuad(float red, float green, float blue, float alpha);
 
 private:
     struct Impl;

@@ -14,6 +14,10 @@
 //   - Unit W: diagnosticPresentWindowClear() makes the attached window
 //     surface current, performs a diagnostic glClear + eglSwapBuffers, and
 //     restores no other surface (the window surface remains current).
+//   - Unit X: diagnosticPresentWindowShaderQuad() makes the attached window
+//     surface current, compiles/links a minimal ES2 shader program, draws a
+//     full-window solid-color quad with it, and swaps, cleaning up the
+//     temporary shader/program/buffer objects on every path.
 //
 // On non-Android host builds:
 //   - No EGL/GLES headers included.
@@ -23,6 +27,8 @@
 //     always false.
 //   - Unit W: diagnosticPresentWindowClear() on an initialized backend
 //     always fails with lastError="window_present_unavailable_on_host".
+//   - Unit X: diagnosticPresentWindowShaderQuad() on an initialized backend
+//     always fails with lastError="window_shader_unavailable_on_host".
 
 #include "vanguard/render/gles_backend.h"
 
@@ -476,6 +482,189 @@ bool GlesBackend::diagnosticPresentWindowClear(float red, float green, float blu
     return true;
 #else
     impl_->lastError = "window_present_unavailable_on_host";
+    return false;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Unit X: window-surface shader-quad draw/swap presentation diagnostic.
+// ---------------------------------------------------------------------------
+
+#if defined(__ANDROID__)
+namespace {
+
+const char* kUnitXVertexShaderSrc =
+    "attribute vec2 aPosition;\n"
+    "void main() {\n"
+    "    gl_Position = vec4(aPosition, 0.0, 1.0);\n"
+    "}\n";
+
+const char* kUnitXFragmentShaderSrc =
+    "precision mediump float;\n"
+    "uniform vec4 uColor;\n"
+    "void main() {\n"
+    "    gl_FragColor = uColor;\n"
+    "}\n";
+
+// Compiles a shader of the given type; returns 0 on failure (deleting the
+// shader object before returning).
+GLuint compileUnitXShader(GLenum type, const char* source) {
+    GLuint shader = glCreateShader(type);
+    if (shader == 0) {
+        return 0;
+    }
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+    GLint compiled = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+    if (compiled != GL_TRUE) {
+        glDeleteShader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+} // namespace
+#endif
+
+bool GlesBackend::diagnosticPresentWindowShaderQuad(float red, float green, float blue, float alpha) {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return false;
+    }
+
+#if defined(__ANDROID__)
+    if (!hasSurface()) {
+        impl_->lastError = "no_surface_attached";
+        return false;
+    }
+    if (!isValidClearComponent(red) || !isValidClearComponent(green) ||
+        !isValidClearComponent(blue) || !isValidClearComponent(alpha)) {
+        impl_->lastError = "invalid_clear_color";
+        return false;
+    }
+
+    if (eglMakeCurrent(impl_->display, impl_->windowSurface, impl_->windowSurface, impl_->context) != EGL_TRUE) {
+        impl_->lastError = "eglMakeCurrent failed for window shader quad";
+        return false;
+    }
+
+    GLuint vertexShader = compileUnitXShader(GL_VERTEX_SHADER, kUnitXVertexShaderSrc);
+    GLuint fragmentShader = 0;
+    GLuint program = 0;
+    GLuint vertexBuffer = 0;
+    bool ok = true;
+
+    if (vertexShader == 0) {
+        ok = false;
+    } else {
+        fragmentShader = compileUnitXShader(GL_FRAGMENT_SHADER, kUnitXFragmentShaderSrc);
+        if (fragmentShader == 0) {
+            ok = false;
+        }
+    }
+    if (!ok) {
+        impl_->lastError = "diagnostic_shader_compile_failed";
+    }
+
+    if (ok) {
+        program = glCreateProgram();
+        if (program == 0) {
+            ok = false;
+            impl_->lastError = "diagnostic_program_link_failed";
+        } else {
+            glAttachShader(program, vertexShader);
+            glAttachShader(program, fragmentShader);
+            glLinkProgram(program);
+            GLint linked = GL_FALSE;
+            glGetProgramiv(program, GL_LINK_STATUS, &linked);
+            if (linked != GL_TRUE) {
+                ok = false;
+                impl_->lastError = "diagnostic_program_link_failed";
+            }
+        }
+    }
+
+    if (ok) {
+        static const GLfloat kQuadVertices[] = {
+            -1.0f, -1.0f,
+             1.0f, -1.0f,
+            -1.0f,  1.0f,
+             1.0f,  1.0f,
+        };
+
+        glGenBuffers(1, &vertexBuffer);
+        if (vertexBuffer == 0) {
+            ok = false;
+            impl_->lastError = "diagnostic_window_shader_draw_failed";
+        } else {
+            glBindBuffer(GL_ARRAY_BUFFER, vertexBuffer);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(kQuadVertices), kQuadVertices, GL_STATIC_DRAW);
+            if (glGetError() != GL_NO_ERROR) {
+                ok = false;
+                impl_->lastError = "diagnostic_window_shader_draw_failed";
+            }
+        }
+    }
+
+    if (ok) {
+        glViewport(0, 0, static_cast<GLsizei>(impl_->surfaceWidth), static_cast<GLsizei>(impl_->surfaceHeight));
+        glUseProgram(program);
+
+        GLint positionLoc = glGetAttribLocation(program, "aPosition");
+        GLint colorLoc = glGetUniformLocation(program, "uColor");
+        if (positionLoc < 0 || colorLoc < 0) {
+            ok = false;
+            impl_->lastError = "diagnostic_window_shader_draw_failed";
+        } else {
+            glEnableVertexAttribArray(static_cast<GLuint>(positionLoc));
+            glVertexAttribPointer(static_cast<GLuint>(positionLoc), 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+            glUniform4f(colorLoc, red, green, blue, alpha);
+
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+            glDisableVertexAttribArray(static_cast<GLuint>(positionLoc));
+
+            if (glGetError() != GL_NO_ERROR) {
+                ok = false;
+                impl_->lastError = "diagnostic_window_shader_draw_failed";
+            }
+        }
+
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glUseProgram(0);
+    }
+
+    if (ok) {
+        if (eglSwapBuffers(impl_->display, impl_->windowSurface) != EGL_TRUE) {
+            ok = false;
+            impl_->lastError = "diagnostic_window_shader_swap_failed";
+        }
+    }
+
+    if (vertexBuffer != 0) {
+        glDeleteBuffers(1, &vertexBuffer);
+    }
+    if (program != 0) {
+        glDeleteProgram(program);
+    }
+    if (fragmentShader != 0) {
+        glDeleteShader(fragmentShader);
+    }
+    if (vertexShader != 0) {
+        glDeleteShader(vertexShader);
+    }
+
+    if (!ok) {
+        return false;
+    }
+
+    impl_->lastError.clear();
+    return true;
+#else
+    impl_->lastError = "window_shader_unavailable_on_host";
     return false;
 #endif
 }

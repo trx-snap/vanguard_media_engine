@@ -1,13 +1,14 @@
-// Unit U/V/W: Android GLES backend offscreen EGL lifecycle, window-surface attach/detach & clear/swap presentation smoke JNI bridge.
+// Unit U/V/W/X: Android GLES backend offscreen EGL lifecycle, window-surface attach/detach, clear/swap & shader-quad draw/swap presentation smoke JNI bridge.
 //
 // This translation unit is Android-only and must NOT be included in iOS or
 // host builds. It is added via the Android-only target_sources block in
 // src/CMakeLists.txt.
 //
-// JNI entry points (matching VanguardNativeBridge.kt Phase 1-Unit U/V/W declarations):
+// JNI entry points (matching VanguardNativeBridge.kt Phase 1-Unit U/V/W/X declarations):
 //   runAndroidDagPhase1UGlesBackendSmoke -> jstring
 //   runAndroidDagPhase1VGlesSurfaceSmoke -> jstring
 //   runAndroidDagPhase1WGlesWindowPresentSmoke -> jstring
+//   runAndroidDagPhase1XGlesShaderQuadSmoke -> jstring
 
 #include <jni.h>
 #include <android/native_window_jni.h>
@@ -595,6 +596,253 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "import=" << (importUnavailable ? "unavailable" : "unexpected_result") << ";"
         << "renderFrame=" << (renderUnavailable ? "unavailable" : "unexpected_result") << ";"
         << "proofBoundary=gles_window_clear_swap_no_import_no_renderFrame;"
+        << "lastError=" << (backendLastError.empty() ? "none" : backendLastError);
+
+    const std::string resultStr = oss.str();
+    return env->NewStringUTF(resultStr.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroidDagPhase1XGlesShaderQuadSmoke(
+    JNIEnv* env,
+    jobject /* this */,
+    jobject jsurface,
+    jint width,
+    jint height) {
+
+    if (!jsurface || width <= 0 || height <= 0) {
+        std::ostringstream oss;
+        oss << "status=FAIL;"
+            << "clientVersion=0;"
+            << "vendor=;"
+            << "renderer=;"
+            << "version=;"
+            << "preAttachShader=not_run;"
+            << "preAttachLastError=;"
+            << "attach=not_run;"
+            << "firstShaderQuad=not_run;"
+            << "secondShaderQuad=not_run;"
+            << "invalidColorShaderQuad=not_run;"
+            << "invalidColorLastError=;"
+            << "clearAfterShader=not_run;"
+            << "hasSurfaceAfterShader=false;"
+            << "surfaceKindAfterShader=none;"
+            << "widthAfterShader=0;"
+            << "heightAfterShader=0;"
+            << "detach=not_run;"
+            << "surfaceKindAfterDetach=none;"
+            << "shutdown=not_run;"
+            << "idempotentShutdown=not_run;"
+            << "import=not_run;"
+            << "renderFrame=not_run;"
+            << "proofBoundary=gles_window_shader_quad_no_import_no_renderFrame;"
+            << "lastError=invalid_arguments";
+        return env->NewStringUTF(oss.str().c_str());
+    }
+
+    ANativeWindow* window = ANativeWindow_fromSurface(env, jsurface);
+    if (!window) {
+        std::ostringstream oss;
+        oss << "status=FAIL;"
+            << "clientVersion=0;"
+            << "vendor=;"
+            << "renderer=;"
+            << "version=;"
+            << "preAttachShader=not_run;"
+            << "preAttachLastError=;"
+            << "attach=not_run;"
+            << "firstShaderQuad=not_run;"
+            << "secondShaderQuad=not_run;"
+            << "invalidColorShaderQuad=not_run;"
+            << "invalidColorLastError=;"
+            << "clearAfterShader=not_run;"
+            << "hasSurfaceAfterShader=false;"
+            << "surfaceKindAfterShader=none;"
+            << "widthAfterShader=0;"
+            << "heightAfterShader=0;"
+            << "detach=not_run;"
+            << "surfaceKindAfterDetach=none;"
+            << "shutdown=not_run;"
+            << "idempotentShutdown=not_run;"
+            << "import=not_run;"
+            << "renderFrame=not_run;"
+            << "proofBoundary=gles_window_shader_quad_no_import_no_renderFrame;"
+            << "lastError=native_window_from_surface_failed";
+        return env->NewStringUTF(oss.str().c_str());
+    }
+
+    vanguard::render::GlesBackend backend;
+
+    // 1. Initial initialize()
+    const bool initOk = backend.initialize();
+    const bool isInitializedAfterInit = backend.isInitialized();
+    const int clientVersion = backend.clientVersion();
+    const std::string vendor = SanitizeString(backend.diagnosticVendor());
+    const std::string renderer = SanitizeString(backend.diagnosticRenderer());
+    const std::string version = SanitizeString(backend.diagnosticVersion());
+
+    // 2. Pre-attach diagnosticPresentWindowShaderQuad(0, 0, 0, 1) returns false with lastError "no_surface_attached"
+    const bool preAttachShader = backend.diagnosticPresentWindowShaderQuad(0.0f, 0.0f, 0.0f, 1.0f);
+    const std::string preAttachLastError = SanitizeString(backend.lastError());
+    const bool preAttachCheckOk = !preAttachShader && (preAttachLastError == "no_surface_attached");
+
+    // 3. attachSurface(window, width, height) succeeds; surface kind "window", hasSurface true, dimensions match
+    const bool attachOk = backend.attachSurface(window, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    const bool hasSurfaceAfterAttach = backend.hasSurface();
+    const std::string surfaceKindAfterAttach = SanitizeString(backend.activeSurfaceKind());
+    const uint32_t widthAfterAttach = backend.surfaceWidth();
+    const uint32_t heightAfterAttach = backend.surfaceHeight();
+    const bool attachCheckOk = attachOk && hasSurfaceAfterAttach &&
+                               (surfaceKindAfterAttach == "window") &&
+                               (widthAfterAttach == static_cast<uint32_t>(width)) &&
+                               (heightAfterAttach == static_cast<uint32_t>(height));
+
+    // 4. First diagnosticPresentWindowShaderQuad(0.1, 0.2, 0.3, 1.0) succeeds; surface remains attached/kind window/dimensions unchanged/lastError none
+    const bool firstShaderQuadOk = backend.diagnosticPresentWindowShaderQuad(0.1f, 0.2f, 0.3f, 1.0f);
+    const std::string firstShaderQuadLastError = SanitizeString(backend.lastError());
+    const bool hasSurfaceAfterFirst = backend.hasSurface();
+    const std::string surfaceKindAfterFirst = SanitizeString(backend.activeSurfaceKind());
+    const uint32_t widthAfterFirst = backend.surfaceWidth();
+    const uint32_t heightAfterFirst = backend.surfaceHeight();
+    const bool firstShaderQuadCheckOk = firstShaderQuadOk &&
+                                        (firstShaderQuadLastError.empty() || firstShaderQuadLastError == "none") &&
+                                        hasSurfaceAfterFirst &&
+                                        (surfaceKindAfterFirst == "window") &&
+                                        (widthAfterFirst == static_cast<uint32_t>(width)) &&
+                                        (heightAfterFirst == static_cast<uint32_t>(height));
+
+    // 5. Second diagnosticPresentWindowShaderQuad(0.8, 0.1, 0.2, 1.0) succeeds; surface remains attached
+    const bool secondShaderQuadOk = backend.diagnosticPresentWindowShaderQuad(0.8f, 0.1f, 0.2f, 1.0f);
+    const std::string secondShaderQuadLastError = SanitizeString(backend.lastError());
+    const bool hasSurfaceAfterSecond = backend.hasSurface();
+    const std::string surfaceKindAfterSecond = SanitizeString(backend.activeSurfaceKind());
+    const uint32_t widthAfterSecond = backend.surfaceWidth();
+    const uint32_t heightAfterSecond = backend.surfaceHeight();
+    const bool secondShaderQuadCheckOk = secondShaderQuadOk &&
+                                         (secondShaderQuadLastError.empty() || secondShaderQuadLastError == "none") &&
+                                         hasSurfaceAfterSecond &&
+                                         (surfaceKindAfterSecond == "window") &&
+                                         (widthAfterSecond == static_cast<uint32_t>(width)) &&
+                                         (heightAfterSecond == static_cast<uint32_t>(height));
+
+    // 6. Invalid color diagnosticPresentWindowShaderQuad(-1, 0, 0, 1) returns false with lastError "invalid_clear_color"; surface remains attached
+    const bool invalidColorShaderQuad = backend.diagnosticPresentWindowShaderQuad(-1.0f, 0.0f, 0.0f, 1.0f);
+    const std::string invalidColorLastError = SanitizeString(backend.lastError());
+    const bool hasSurfaceAfterInvalid = backend.hasSurface();
+    const std::string surfaceKindAfterInvalid = SanitizeString(backend.activeSurfaceKind());
+    const uint32_t widthAfterInvalid = backend.surfaceWidth();
+    const uint32_t heightAfterInvalid = backend.surfaceHeight();
+    const bool invalidColorCheckOk = !invalidColorShaderQuad &&
+                                     (invalidColorLastError == "invalid_clear_color") &&
+                                     hasSurfaceAfterInvalid &&
+                                     (surfaceKindAfterInvalid == "window") &&
+                                     (widthAfterInvalid == static_cast<uint32_t>(width)) &&
+                                     (heightAfterInvalid == static_cast<uint32_t>(height));
+
+    // 7. Unit W diagnosticPresentWindowClear(0, 0, 0, 1) still succeeds after shader draw
+    const bool clearAfterShaderOk = backend.diagnosticPresentWindowClear(0.0f, 0.0f, 0.0f, 1.0f);
+    const std::string clearAfterShaderLastError = SanitizeString(backend.lastError());
+    const bool hasSurfaceAfterClear = backend.hasSurface();
+    const std::string surfaceKindAfterClear = SanitizeString(backend.activeSurfaceKind());
+    const uint32_t widthAfterClear = backend.surfaceWidth();
+    const uint32_t heightAfterClear = backend.surfaceHeight();
+    const bool clearAfterShaderCheckOk = clearAfterShaderOk &&
+                                         (clearAfterShaderLastError.empty() || clearAfterShaderLastError == "none") &&
+                                         hasSurfaceAfterClear &&
+                                         (surfaceKindAfterClear == "window") &&
+                                         (widthAfterClear == static_cast<uint32_t>(width)) &&
+                                         (heightAfterClear == static_cast<uint32_t>(height));
+
+    // 8. detachSurface() makes hasSurface false, activeSurfaceKind offscreen, dimensions 0, isInitialized true
+    backend.detachSurface();
+    const bool hasSurfaceAfterDetach = backend.hasSurface();
+    const std::string surfaceKindAfterDetach = SanitizeString(backend.activeSurfaceKind());
+    const uint32_t widthAfterDetach = backend.surfaceWidth();
+    const uint32_t heightAfterDetach = backend.surfaceHeight();
+    const bool isInitAfterDetach = backend.isInitialized();
+    const bool detachCheckOk = !hasSurfaceAfterDetach &&
+                               (surfaceKindAfterDetach == "offscreen") &&
+                               (widthAfterDetach == 0) &&
+                               (heightAfterDetach == 0) &&
+                               isInitAfterDetach;
+
+    // 9. Shutdown clears initialized state and activeSurfaceKind "none"; idempotent shutdown safe
+    backend.shutdown();
+    const bool postShutdownInit = backend.isInitialized();
+    const std::string postShutdownSurfaceKind = SanitizeString(backend.activeSurfaceKind());
+    const bool postShutdownHasSurface = backend.hasSurface();
+    const uint32_t postShutdownWidth = backend.surfaceWidth();
+    const uint32_t postShutdownHeight = backend.surfaceHeight();
+    const bool shutdown1Ok = !postShutdownInit &&
+                             (postShutdownSurfaceKind == "none") &&
+                             !postShutdownHasSurface &&
+                             (postShutdownWidth == 0) &&
+                             (postShutdownHeight == 0);
+
+    backend.shutdown();
+    const bool idempotentShutdownOk = !backend.isInitialized() &&
+                                       (std::string(backend.activeSurfaceKind()) == "none") &&
+                                       !backend.hasSurface() &&
+                                       (backend.surfaceWidth() == 0) &&
+                                       (backend.surfaceHeight() == 0);
+
+    // 10. Stubs validation: importHardwareBuffer(nullptr, -1, ...) and renderFrame(kInvalidHardwareBufferHandle) remain kUnavailable
+    vanguard::render::HardwareBufferHandle handle = vanguard::render::kInvalidHardwareBufferHandle;
+    vanguard::render::HardwareBufferDescriptor desc{};
+    const auto importRes = backend.importHardwareBuffer(nullptr, -1, &handle, &desc);
+    const bool importUnavailable = (importRes == vanguard::render::HardwareBufferImportResult::kUnavailable);
+
+    const auto renderRes = backend.renderFrame(vanguard::render::kInvalidHardwareBufferHandle);
+    const bool renderUnavailable = (renderRes == vanguard::render::RenderFrameResult::kUnavailable);
+
+    // Release ANativeWindow reference owned by JNI harness
+    ANativeWindow_release(window);
+
+    const bool allChecksPass = initOk &&
+                               isInitializedAfterInit &&
+                               (clientVersion >= 2) &&
+                               !vendor.empty() &&
+                               !renderer.empty() &&
+                               !version.empty() &&
+                               preAttachCheckOk &&
+                               attachCheckOk &&
+                               firstShaderQuadCheckOk &&
+                               secondShaderQuadCheckOk &&
+                               invalidColorCheckOk &&
+                               clearAfterShaderCheckOk &&
+                               detachCheckOk &&
+                               shutdown1Ok &&
+                               idempotentShutdownOk &&
+                               importUnavailable &&
+                               renderUnavailable;
+
+    const std::string backendLastError = SanitizeString(backend.lastError());
+
+    std::ostringstream oss;
+    oss << "status=" << (allChecksPass ? "PASS" : "FAIL") << ";"
+        << "clientVersion=" << clientVersion << ";"
+        << "vendor=" << vendor << ";"
+        << "renderer=" << renderer << ";"
+        << "version=" << version << ";"
+        << "preAttachShader=" << (preAttachShader ? "unexpected_success" : "rejected_as_expected") << ";"
+        << "preAttachLastError=" << preAttachLastError << ";"
+        << "attach=" << (attachOk ? "success" : "failed") << ";"
+        << "firstShaderQuad=" << (firstShaderQuadOk ? "success" : "failed") << ";"
+        << "secondShaderQuad=" << (secondShaderQuadOk ? "success" : "failed") << ";"
+        << "invalidColorShaderQuad=" << (invalidColorShaderQuad ? "unexpected_success" : "rejected_as_expected") << ";"
+        << "invalidColorLastError=" << invalidColorLastError << ";"
+        << "clearAfterShader=" << (clearAfterShaderOk ? "success" : "failed") << ";"
+        << "hasSurfaceAfterShader=" << (hasSurfaceAfterSecond ? "true" : "false") << ";"
+        << "surfaceKindAfterShader=" << surfaceKindAfterSecond << ";"
+        << "widthAfterShader=" << widthAfterSecond << ";"
+        << "heightAfterShader=" << heightAfterSecond << ";"
+        << "detach=" << (detachCheckOk ? "success" : "failed") << ";"
+        << "surfaceKindAfterDetach=" << surfaceKindAfterDetach << ";"
+        << "shutdown=" << (shutdown1Ok ? "success" : "failed") << ";"
+        << "idempotentShutdown=" << (idempotentShutdownOk ? "success" : "failed") << ";"
+        << "import=" << (importUnavailable ? "unavailable" : "unexpected_result") << ";"
+        << "renderFrame=" << (renderUnavailable ? "unavailable" : "unexpected_result") << ";"
+        << "proofBoundary=gles_window_shader_quad_no_import_no_renderFrame;"
         << "lastError=" << (backendLastError.empty() ? "none" : backendLastError);
 
     const std::string resultStr = oss.str();

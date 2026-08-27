@@ -46,6 +46,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1UGlesBackendSmoke",
             "runAndroidDagPhase1VGlesSurfaceSmoke",
             "runAndroidDagPhase1WGlesWindowPresentSmoke",
+            "runAndroidDagPhase1XGlesShaderQuadSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -78,6 +79,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1UGlesBackendSmoke" -> runPhase1UGlesBackendSmoke(result)
             "runAndroidDagPhase1VGlesSurfaceSmoke" -> runPhase1VGlesSurfaceSmoke(args, result)
             "runAndroidDagPhase1WGlesWindowPresentSmoke" -> runPhase1WGlesWindowPresentSmoke(args, result)
+            "runAndroidDagPhase1XGlesShaderQuadSmoke" -> runPhase1XGlesShaderQuadSmoke(args, result)
             else -> return false
         }
         return true
@@ -398,6 +400,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_WINDOW_PRESENT_SMOKE_FAILED",
                         "runAndroidDagPhase1WGlesWindowPresentSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit X: Android GLES backend window-surface shader-quad draw/swap presentation diagnostic ──
+    private fun runPhase1XGlesShaderQuadSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesShaderQuadSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_SHADER_QUAD_SMOKE_FAILED",
+                        "runAndroidDagPhase1XGlesShaderQuadSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

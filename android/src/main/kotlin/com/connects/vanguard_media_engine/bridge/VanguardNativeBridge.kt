@@ -139,6 +139,13 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // ── Phase 1-Unit X: Android GLES backend window-surface shader-quad draw/swap presentation diagnostic ──
+    external fun runAndroidDagPhase1XGlesShaderQuadSmoke(
+        surface: Surface,
+        width: Int,
+        height: Int,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
