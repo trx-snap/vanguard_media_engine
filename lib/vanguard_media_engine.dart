@@ -38,6 +38,8 @@ export 'vg_camera2_concurrent_session_validation.dart';
 export 'vg_camera2_open_close_smoke.dart';
 // Phase 3-Unit I: Android Camera2 single-camera ImageReader frame smoke foundation.
 export 'vg_camera2_image_reader_frame_smoke.dart';
+// Phase 3-Unit J: Android Camera2 single-camera PRIVATE ImageReader HardwareBuffer frame smoke foundation.
+export 'vg_camera2_hardware_buffer_frame_smoke.dart';
 
 // Phase 6D.3: typed recording result.
 export 'vg_recording_stats.dart';
