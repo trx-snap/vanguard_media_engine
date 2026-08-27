@@ -44,6 +44,8 @@ export 'vg_camera2_hardware_buffer_frame_smoke.dart';
 export 'vg_camera2_native_render_frame_smoke.dart';
 // Phase 3-Unit L: Android Camera2 PRIVATE ImageReader HardwareBuffer Multi-Frame Native Render Loop Smoke Foundation.
 export 'vg_camera2_native_render_loop_smoke.dart';
+// Phase 3-Unit M: Android Camera2 PRIVATE ImageReader HardwareBuffer Flutter Texture Native Render Loop Smoke Foundation.
+export 'vg_camera2_texture_native_render_loop_smoke.dart';
 
 // Phase 6D.3: typed recording result.
 export 'vg_recording_stats.dart';

@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.annotation.NonNull
+import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
@@ -33,6 +34,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
 
     // ── Phase 4B1: DAG texture playback coordinator ───────────────────────────
     private var dagTexturePlaybackCoordinator: AndroidDagTexturePlaybackCoordinator? = null
+
+    // ── Phase 3-Unit M: Camera2 texture native-render loop smoke coordinator ──
+    private var camera2TextureSmokeCoordinator: AndroidCamera2TextureSmokeCoordinator? = null
 
     // ── Phase 4C1D1: DAG streaming playback coordinator ───────────────────────
     private var dagStreamingPlaybackCoordinator: AndroidDagStreamingPlaybackCoordinator? = null
@@ -82,6 +86,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             channel         = channel,
             mainHandler     = mainHandler,
         )
+        camera2TextureSmokeCoordinator = AndroidCamera2TextureSmokeCoordinator(
+            context         = binding.applicationContext,
+            textureRegistry = binding.textureRegistry,
+            channel         = channel,
+            mainHandler     = mainHandler,
+        )
         dagStreamingPlaybackCoordinator = AndroidDagStreamingPlaybackCoordinator(
             context         = binding.applicationContext,
             textureRegistry = binding.textureRegistry,
@@ -115,6 +125,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android DAG texture playback coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidCamera2TextureSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = camera2TextureSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android Camera2 texture smoke coordinator unavailable", null)
             }
             return
         }
@@ -1168,6 +1188,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         // Tear down Phase 4B1 active sessions (4B1A & 4B1B) and release their texture entries.
         dagTexturePlaybackCoordinator?.disposeAll()
         dagTexturePlaybackCoordinator = null
+        // Tear down Phase 3-Unit M active camera texture smoke runs and release their producers.
+        camera2TextureSmokeCoordinator?.disposeAll()
+        camera2TextureSmokeCoordinator = null
         // Tear down Phase 4C1D1 active streaming sessions.
         dagStreamingPlaybackCoordinator?.disposeAll()
         dagStreamingPlaybackCoordinator = null
