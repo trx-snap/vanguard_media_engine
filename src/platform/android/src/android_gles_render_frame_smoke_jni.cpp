@@ -104,6 +104,13 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             << "nonIdentityTransformRender=not_run;"
             << "nonIdentityTransformLastError=;"
             << "hasSurfaceAfterTransform=false;"
+            << "rot180TransformRender=not_run;"
+            << "rot180TransformLastError=;"
+            << "rot270TransformRender=not_run;"
+            << "rot270TransformLastError=;"
+            << "mirrorTransformRender=not_run;"
+            << "mirrorTransformLastError=;"
+            << "hasSurfaceAfterAllTransforms=false;"
             << "releaseA=not_run;"
             << "releaseAFence=-1;"
             << "hasAAfterRelease=false;"
@@ -117,7 +124,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             << "shutdown=not_run;"
             << "hasBAfterShutdown=false;"
             << "idempotentShutdown=not_run;"
-            << "proofBoundary=gles_renderFrame_rgba_texture_quad_no_transform_no_yuv_no_fence_sync;"
+            << "proofBoundary=gles_renderFrame_rgba_texture_quad_transform_uv_no_yuv_no_fence_sync;"
             << "lastError=invalid_arguments";
         return env->NewStringUTF(oss.str().c_str());
     }
@@ -167,6 +174,13 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             << "nonIdentityTransformRender=not_run;"
             << "nonIdentityTransformLastError=;"
             << "hasSurfaceAfterTransform=false;"
+            << "rot180TransformRender=not_run;"
+            << "rot180TransformLastError=;"
+            << "rot270TransformRender=not_run;"
+            << "rot270TransformLastError=;"
+            << "mirrorTransformRender=not_run;"
+            << "mirrorTransformLastError=;"
+            << "hasSurfaceAfterAllTransforms=false;"
             << "releaseA=not_run;"
             << "releaseAFence=-1;"
             << "hasAAfterRelease=false;"
@@ -180,7 +194,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             << "shutdown=not_run;"
             << "hasBAfterShutdown=false;"
             << "idempotentShutdown=not_run;"
-            << "proofBoundary=gles_renderFrame_rgba_texture_quad_no_transform_no_yuv_no_fence_sync;"
+            << "proofBoundary=gles_renderFrame_rgba_texture_quad_transform_uv_no_yuv_no_fence_sync;"
             << "lastError=native_window_from_surface_failed";
         return env->NewStringUTF(oss.str().c_str());
     }
@@ -233,6 +247,13 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             << "nonIdentityTransformRender=not_run;"
             << "nonIdentityTransformLastError=;"
             << "hasSurfaceAfterTransform=false;"
+            << "rot180TransformRender=not_run;"
+            << "rot180TransformLastError=;"
+            << "rot270TransformRender=not_run;"
+            << "rot270TransformLastError=;"
+            << "mirrorTransformRender=not_run;"
+            << "mirrorTransformLastError=;"
+            << "hasSurfaceAfterAllTransforms=false;"
             << "releaseA=not_run;"
             << "releaseAFence=-1;"
             << "hasAAfterRelease=false;"
@@ -246,7 +267,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             << "shutdown=not_run;"
             << "hasBAfterShutdown=false;"
             << "idempotentShutdown=not_run;"
-            << "proofBoundary=gles_renderFrame_rgba_texture_quad_no_transform_no_yuv_no_fence_sync;"
+            << "proofBoundary=gles_renderFrame_rgba_texture_quad_transform_uv_no_yuv_no_fence_sync;"
             << "lastError=hardware_buffer_from_jobject_failed";
         return env->NewStringUTF(oss.str().c_str());
     }
@@ -351,14 +372,43 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     const bool identityTransformOk = (identityTransformRes == vanguard::render::RenderFrameResult::kSuccess) &&
                                      (identityTransformLastError.empty() || identityTransformLastError == "none");
 
-    // 12. Non-identity transform overload (rotationDegrees=90) returns kUnavailable with lastError "gles_render_frame_transform_unavailable"; surface remains attached
+    // 12. Non-identity transform overload (rotationDegrees=90) returns kSuccess; surface remains attached
     const vanguard::render::VideoFrameTransform rot90Transform{90, false};
     const auto nonIdentityTransformRes = backend.renderFrame(handleA, rot90Transform);
     const std::string nonIdentityTransformLastError = SanitizeString(backend.lastError());
     const bool hasSurfaceAfterTransform = backend.hasSurface();
-    const bool nonIdentityTransformOk = (nonIdentityTransformRes == vanguard::render::RenderFrameResult::kUnavailable) &&
-                                        (nonIdentityTransformLastError == "gles_render_frame_transform_unavailable") &&
+    const bool nonIdentityTransformOk = (nonIdentityTransformRes == vanguard::render::RenderFrameResult::kSuccess) &&
+                                        (nonIdentityTransformLastError.empty() || nonIdentityTransformLastError == "none") &&
                                         hasSurfaceAfterTransform;
+
+    // 12b. rot180 transform overload (VideoFrameTransform{180, false}) returns kSuccess; surface remains attached
+    const vanguard::render::VideoFrameTransform rot180Transform{180, false};
+    const auto rot180TransformRes = backend.renderFrame(handleA, rot180Transform);
+    const std::string rot180TransformLastError = SanitizeString(backend.lastError());
+    const bool hasSurfaceAfterRot180 = backend.hasSurface();
+    const bool rot180TransformOk = (rot180TransformRes == vanguard::render::RenderFrameResult::kSuccess) &&
+                                   (rot180TransformLastError.empty() || rot180TransformLastError == "none") &&
+                                   hasSurfaceAfterRot180;
+
+    // 12c. rot270 transform overload (VideoFrameTransform{270, false}) returns kSuccess; surface remains attached
+    const vanguard::render::VideoFrameTransform rot270Transform{270, false};
+    const auto rot270TransformRes = backend.renderFrame(handleA, rot270Transform);
+    const std::string rot270TransformLastError = SanitizeString(backend.lastError());
+    const bool hasSurfaceAfterRot270 = backend.hasSurface();
+    const bool rot270TransformOk = (rot270TransformRes == vanguard::render::RenderFrameResult::kSuccess) &&
+                                   (rot270TransformLastError.empty() || rot270TransformLastError == "none") &&
+                                   hasSurfaceAfterRot270;
+
+    // 12d. mirror transform overload (VideoFrameTransform{0, true}) returns kSuccess; surface remains attached
+    const vanguard::render::VideoFrameTransform mirrorTransform{0, true};
+    const auto mirrorTransformRes = backend.renderFrame(handleA, mirrorTransform);
+    const std::string mirrorTransformLastError = SanitizeString(backend.lastError());
+    const bool hasSurfaceAfterMirror = backend.hasSurface();
+    const bool mirrorTransformOk = (mirrorTransformRes == vanguard::render::RenderFrameResult::kSuccess) &&
+                                   (mirrorTransformLastError.empty() || mirrorTransformLastError == "none") &&
+                                   hasSurfaceAfterMirror;
+
+    const bool hasSurfaceAfterAllTransforms = backend.hasSurface();
 
     // 13. Release handleA succeeds; releaseFenceFd == -1; has handleA false, handleB true
     int releaseFenceA = -999;
@@ -410,6 +460,10 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                                renderBOk &&
                                identityTransformOk &&
                                nonIdentityTransformOk &&
+                               rot180TransformOk &&
+                               rot270TransformOk &&
+                               mirrorTransformOk &&
+                               hasSurfaceAfterAllTransforms &&
                                releaseAOk &&
                                releasedHandleRenderOk &&
                                detachCheckOk &&
@@ -457,9 +511,16 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "renderB=" << (renderBOk ? "success" : "failed") << ";"
         << "renderBLastError=" << renderBLastError << ";"
         << "identityTransformRender=" << (identityTransformOk ? "success" : "failed") << ";"
-        << "nonIdentityTransformRender=" << (nonIdentityTransformOk ? "rejected_as_expected" : "failed") << ";"
+        << "nonIdentityTransformRender=" << (nonIdentityTransformOk ? "success" : "failed") << ";"
         << "nonIdentityTransformLastError=" << nonIdentityTransformLastError << ";"
         << "hasSurfaceAfterTransform=" << (hasSurfaceAfterTransform ? "true" : "false") << ";"
+        << "rot180TransformRender=" << (rot180TransformOk ? "success" : "failed") << ";"
+        << "rot180TransformLastError=" << rot180TransformLastError << ";"
+        << "rot270TransformRender=" << (rot270TransformOk ? "success" : "failed") << ";"
+        << "rot270TransformLastError=" << rot270TransformLastError << ";"
+        << "mirrorTransformRender=" << (mirrorTransformOk ? "success" : "failed") << ";"
+        << "mirrorTransformLastError=" << mirrorTransformLastError << ";"
+        << "hasSurfaceAfterAllTransforms=" << (hasSurfaceAfterAllTransforms ? "true" : "false") << ";"
         << "releaseA=" << (releaseAOk ? "success" : "failed") << ";"
         << "releaseAFence=" << releaseFenceA << ";"
         << "hasAAfterRelease=" << (hasAAfterRelease ? "true" : "false") << ";"
@@ -473,7 +534,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "shutdown=" << (shutdownCheckOk ? "success" : "failed") << ";"
         << "hasBAfterShutdown=" << (hasBAfterShutdown ? "true" : "false") << ";"
         << "idempotentShutdown=" << (idempotentShutdownOk ? "success" : "failed") << ";"
-        << "proofBoundary=gles_renderFrame_rgba_texture_quad_no_transform_no_yuv_no_fence_sync;"
+        << "proofBoundary=gles_renderFrame_rgba_texture_quad_transform_uv_no_yuv_no_fence_sync;"
         << "lastError=" << (backendLastError.empty() ? "none" : backendLastError);
 
     const std::string resultStr = oss.str();

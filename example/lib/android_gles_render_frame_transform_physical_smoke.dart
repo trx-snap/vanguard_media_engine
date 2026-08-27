@@ -4,21 +4,21 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 void main() {
-  runApp(const AndroidGlesRenderFramePhysicalSmokeApp());
+  runApp(const AndroidGlesRenderFrameTransformPhysicalSmokeApp());
 }
 
-class AndroidGlesRenderFramePhysicalSmokeApp extends StatefulWidget {
-  const AndroidGlesRenderFramePhysicalSmokeApp({super.key});
+class AndroidGlesRenderFrameTransformPhysicalSmokeApp extends StatefulWidget {
+  const AndroidGlesRenderFrameTransformPhysicalSmokeApp({super.key});
 
   @override
-  State<AndroidGlesRenderFramePhysicalSmokeApp> createState() =>
-      _AndroidGlesRenderFramePhysicalSmokeAppState();
+  State<AndroidGlesRenderFrameTransformPhysicalSmokeApp> createState() =>
+      _AndroidGlesRenderFrameTransformPhysicalSmokeAppState();
 }
 
-class _AndroidGlesRenderFramePhysicalSmokeAppState
-    extends State<AndroidGlesRenderFramePhysicalSmokeApp> {
+class _AndroidGlesRenderFrameTransformPhysicalSmokeAppState
+    extends State<AndroidGlesRenderFrameTransformPhysicalSmokeApp> {
   static const _channel = MethodChannel('vanguard_media_engine');
-  String _status = 'Running Android GLES renderFrame Unit Z physical smoke...';
+  String _status = 'Running Android GLES renderFrame Unit AA physical smoke...';
 
   @override
   void initState() {
@@ -79,6 +79,13 @@ class _AndroidGlesRenderFramePhysicalSmokeAppState
         'nonIdentityTransformRender': 'not_run',
         'nonIdentityTransformLastError': '',
         'hasSurfaceAfterTransform': false,
+        'rot180TransformRender': 'not_run',
+        'rot180TransformLastError': '',
+        'rot270TransformRender': 'not_run',
+        'rot270TransformLastError': '',
+        'mirrorTransformRender': 'not_run',
+        'mirrorTransformLastError': '',
+        'hasSurfaceAfterAllTransforms': false,
         'releaseA': 'not_run',
         'releaseAFence': -1,
         'hasAAfterRelease': false,
@@ -153,6 +160,20 @@ class _AndroidGlesRenderFramePhysicalSmokeAppState
         (payload['nonIdentityTransformLastError'] as String?) ?? '';
     final hasSurfaceAfterTransform =
         payload['hasSurfaceAfterTransform'] == true;
+    final rot180TransformRender =
+        (payload['rot180TransformRender'] as String?) ?? '';
+    final rot180TransformLastError =
+        (payload['rot180TransformLastError'] as String?) ?? '';
+    final rot270TransformRender =
+        (payload['rot270TransformRender'] as String?) ?? '';
+    final rot270TransformLastError =
+        (payload['rot270TransformLastError'] as String?) ?? '';
+    final mirrorTransformRender =
+        (payload['mirrorTransformRender'] as String?) ?? '';
+    final mirrorTransformLastError =
+        (payload['mirrorTransformLastError'] as String?) ?? '';
+    final hasSurfaceAfterAllTransforms =
+        payload['hasSurfaceAfterAllTransforms'] == true;
     final releaseA = (payload['releaseA'] as String?) ?? '';
     final releaseAFence = (payload['releaseAFence'] as num?)?.toInt() ?? 0;
     final hasAAfterRelease = payload['hasAAfterRelease'] == true;
@@ -214,6 +235,16 @@ class _AndroidGlesRenderFramePhysicalSmokeAppState
         (nonIdentityTransformLastError.isEmpty ||
             nonIdentityTransformLastError == 'none') &&
         hasSurfaceAfterTransform &&
+        rot180TransformRender == 'success' &&
+        (rot180TransformLastError.isEmpty ||
+            rot180TransformLastError == 'none') &&
+        rot270TransformRender == 'success' &&
+        (rot270TransformLastError.isEmpty ||
+            rot270TransformLastError == 'none') &&
+        mirrorTransformRender == 'success' &&
+        (mirrorTransformLastError.isEmpty ||
+            mirrorTransformLastError == 'none') &&
+        hasSurfaceAfterAllTransforms &&
         releaseA == 'success' &&
         releaseAFence == -1 &&
         !hasAAfterRelease &&
@@ -231,17 +262,19 @@ class _AndroidGlesRenderFramePhysicalSmokeAppState
             'gles_renderFrame_rgba_texture_quad_transform_uv_no_yuv_no_fence_sync';
 
     // ignore: avoid_print
-    print('ANDROID_GLES_RENDERFRAME_UNIT_Z_JSON:${jsonEncode(payload)}');
+    print(
+      'ANDROID_GLES_RENDERFRAME_TRANSFORM_UNIT_AA_JSON:${jsonEncode(payload)}',
+    );
     // ignore: avoid_print
     print(
       isPass
-          ? 'ANDROID_GLES_RENDERFRAME_UNIT_Z_PHYSICAL_PASS'
-          : 'ANDROID_GLES_RENDERFRAME_UNIT_Z_PHYSICAL_FAIL',
+          ? 'ANDROID_GLES_RENDERFRAME_TRANSFORM_UNIT_AA_PHYSICAL_PASS'
+          : 'ANDROID_GLES_RENDERFRAME_TRANSFORM_UNIT_AA_PHYSICAL_FAIL',
     );
 
     if (mounted) {
       setState(() {
-        _status = isPass ? 'PASS' : 'FAIL';
+        _status = isPass ? 'Unit AA PASS' : 'Unit AA FAIL';
       });
     }
   }
@@ -249,7 +282,11 @@ class _AndroidGlesRenderFramePhysicalSmokeAppState
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      home: Scaffold(body: Center(child: Text(_status))),
+      home: Scaffold(
+        body: Center(
+          child: Text(_status, key: const ValueKey('unit_aa_status_text')),
+        ),
+      ),
     );
   }
 }

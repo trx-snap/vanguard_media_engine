@@ -23,8 +23,16 @@
 //     GlesHardwareBufferImports::textureForHandle(), draws it as a
 //     full-window textured quad via the private GlesTextureFrameRenderer
 //     helper, and swaps. The imported texture is never deleted or otherwise
-//     mutated by this path. The transform overload supports the identity
-//     transform only.
+//     mutated by this path.
+//   - Unit AA: renderFrame(handle, transform) shares the same precondition
+//     checks, make-current, resolve, and swap path as renderFrame(handle),
+//     passing `transform` through to GlesTextureFrameRenderer so the drawn
+//     quad's UVs support rotationDegrees 0/90/180/270 plus
+//     mirrorHorizontal via the shared UV-mapping helper. Non-cardinal
+//     rotations normalize to identity through that shared helper. No pixel
+//     readback/content proof, no YUV/external texture, no fence sync, no
+//     product wiring. renderFrame(handle) delegates to this overload with
+//     the identity VideoFrameTransform{}.
 //
 // On non-Android host builds:
 //   - No EGL/GLES headers included.
@@ -732,11 +740,25 @@ bool GlesBackend::hasHardwareBuffer(HardwareBufferHandle handle) const {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1 Unit Z: identity renderFrame - draws the imported GL_TEXTURE_2D as
-// a full-window textured quad on the attached window surface and swaps.
+// Phase 1 Unit Z: identity renderFrame - delegates to the Unit AA transform
+// overload with the identity VideoFrameTransform{}.
 // ---------------------------------------------------------------------------
 
 RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle handle) {
+    return renderFrame(handle, VideoFrameTransform{});
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4B2C / Unit AA: renderFrame with transform - draws the imported
+// GL_TEXTURE_2D as a full-window textured quad on the attached window
+// surface with UVs mapped for rotationDegrees 0/90/180/270 plus
+// mirrorHorizontal (via the shared UV-mapping helper; non-cardinal
+// rotations normalize to identity) and swaps. No pixel readback/content
+// proof, no YUV/external texture, no fence sync, no product wiring.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle handle,
+                                           const VideoFrameTransform& transform) {
     impl_->lastError.clear();
 
     if (!impl_->initialized) {
@@ -763,7 +785,7 @@ RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle handle) {
 
     std::string drawError;
     const bool drawOk = impl_->textureFrameRenderer->drawTexturedQuad(
-        texture, impl_->surfaceWidth, impl_->surfaceHeight, &drawError);
+        texture, impl_->surfaceWidth, impl_->surfaceHeight, transform, &drawError);
     if (!drawOk) {
         impl_->lastError = !drawError.empty() ? drawError : "gles_render_frame_draw_failed";
         return RenderFrameResult::kUnavailable;
@@ -778,24 +800,10 @@ RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle handle) {
     return RenderFrameResult::kSuccess;
 #else
     (void)handle;
+    (void)transform;
     impl_->lastError = "gles_render_frame_unavailable_on_host";
     return RenderFrameResult::kUnavailable;
 #endif
-}
-
-// ---------------------------------------------------------------------------
-// Phase 4B2C: renderFrame with transform - GLES backend supports the
-// identity transform only (Unit Z scope); any rotation or horizontal mirror
-// is not yet implemented.
-// ---------------------------------------------------------------------------
-
-RenderFrameResult GlesBackend::renderFrame(HardwareBufferHandle handle,
-                                           const VideoFrameTransform& transform) {
-    if (normalizeRotation(transform.rotationDegrees) == 0 && !transform.mirrorHorizontal) {
-        return renderFrame(handle);
-    }
-    impl_->lastError = "gles_render_frame_transform_unavailable";
-    return RenderFrameResult::kUnavailable;
 }
 
 } // namespace render

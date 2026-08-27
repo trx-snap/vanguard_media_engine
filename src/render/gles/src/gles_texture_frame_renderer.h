@@ -1,5 +1,5 @@
 // gles_texture_frame_renderer.h
-// Phase 1 Unit Z: Private helper - GlesTextureFrameRenderer.
+// Phase 1 Unit Z/AA: Private helper - GlesTextureFrameRenderer.
 //
 // Draws an already-imported GL_TEXTURE_2D as a full-window textured quad on
 // whichever EGL surface is current when drawTexturedQuad() is called. Owns
@@ -14,10 +14,14 @@
 // headers must never appear in this header; the .cpp translation unit
 // confines all such includes behind #if defined(__ANDROID__).
 //
-// Unit Z scope: identity textured-quad draw only. No orientation/rotation
-// correction, no mirroring, no YUV/external-texture sampling.
+// Unit AA scope: supports rotationDegrees 0/90/180/270 plus mirrorHorizontal
+// via the shared UV-mapping helper (VideoFrameTransform /
+// makeVideoTransformPushConstants). No pixel readback/content proof, no
+// YUV/external-texture sampling, no fence sync, no product wiring.
 
 #pragma once
+#include "vanguard/render/render_transform.h"
+
 #include <cstdint>
 #include <string>
 
@@ -35,18 +39,29 @@ public:
     // Compiles/links a temporary minimal ES2 textured-quad shader program,
     // binds `texture` (an existing GL_TEXTURE_2D name, not owned by this
     // helper) on texture unit 0, and draws a full-window triangle-strip quad
-    // via glViewport(0, 0, width, height). Deletes every temporary
-    // program/shader/VBO object it created before returning, on every path.
-    // Never deletes `texture`.
+    // via glViewport(0, 0, width, height), sampling with UVs mapped through
+    // `transform` (see makeVideoTransformPushConstants). Deletes every
+    // temporary program/shader/VBO object it created before returning, on
+    // every path. Never deletes `texture`.
     //
     // texture  - non-zero GL_TEXTURE_2D name already bound to valid image data.
     // width, height - target viewport dimensions; both must be > 0.
+    // transform - rotation/mirror applied to the sampled UVs; non-cardinal
+    //             rotationDegrees normalize to identity via normalizeRotation().
     // outError - non-null; set to "" on success or an ASCII failure reason.
     //
     // Returns true only if shader compile/link, buffer upload, and the draw
     // itself all report GL_NO_ERROR. Returns false with
     // outError="gles_texture_frame_renderer_unavailable_on_host" and no GL
     // calls on non-Android builds.
+    bool drawTexturedQuad(uint32_t texture,
+                          uint32_t width,
+                          uint32_t height,
+                          const VideoFrameTransform& transform,
+                          std::string* outError);
+
+    // Convenience wrapper delegating to the transform overload with the
+    // default identity VideoFrameTransform{}.
     bool drawTexturedQuad(uint32_t texture,
                           uint32_t width,
                           uint32_t height,

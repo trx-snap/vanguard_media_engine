@@ -1408,6 +1408,13 @@ object AndroidDagRenderSmokeHarness {
         val nonIdentityTransformRender = parsed["nonIdentityTransformRender"] ?: "not_run"
         val nonIdentityTransformLastError = parsed["nonIdentityTransformLastError"] ?: ""
         val hasSurfaceAfterTransform = parsed["hasSurfaceAfterTransform"]?.equals("true", ignoreCase = true) ?: false
+        val rot180TransformRender = parsed["rot180TransformRender"] ?: "not_run"
+        val rot180TransformLastError = parsed["rot180TransformLastError"] ?: ""
+        val rot270TransformRender = parsed["rot270TransformRender"] ?: "not_run"
+        val rot270TransformLastError = parsed["rot270TransformLastError"] ?: ""
+        val mirrorTransformRender = parsed["mirrorTransformRender"] ?: "not_run"
+        val mirrorTransformLastError = parsed["mirrorTransformLastError"] ?: ""
+        val hasSurfaceAfterAllTransforms = parsed["hasSurfaceAfterAllTransforms"]?.equals("true", ignoreCase = true) ?: false
         val releaseA = parsed["releaseA"] ?: "not_run"
         val releaseAFence = parsed["releaseAFence"]?.toIntOrNull() ?: -1
         val hasAAfterRelease = parsed["hasAAfterRelease"]?.equals("true", ignoreCase = true) ?: false
@@ -1421,7 +1428,7 @@ object AndroidDagRenderSmokeHarness {
         val shutdown = parsed["shutdown"] ?: "not_run"
         val hasBAfterShutdown = parsed["hasBAfterShutdown"]?.equals("true", ignoreCase = true) ?: false
         val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
-        val proofBoundary = parsed["proofBoundary"] ?: "gles_renderFrame_rgba_texture_quad_no_transform_no_yuv_no_fence_sync"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_renderFrame_rgba_texture_quad_transform_uv_no_yuv_no_fence_sync"
         val lastError = parsed["lastError"] ?: ""
 
         return mapOf(
@@ -1468,6 +1475,13 @@ object AndroidDagRenderSmokeHarness {
             "nonIdentityTransformRender" to nonIdentityTransformRender,
             "nonIdentityTransformLastError" to nonIdentityTransformLastError,
             "hasSurfaceAfterTransform" to hasSurfaceAfterTransform,
+            "rot180TransformRender" to rot180TransformRender,
+            "rot180TransformLastError" to rot180TransformLastError,
+            "rot270TransformRender" to rot270TransformRender,
+            "rot270TransformLastError" to rot270TransformLastError,
+            "mirrorTransformRender" to mirrorTransformRender,
+            "mirrorTransformLastError" to mirrorTransformLastError,
+            "hasSurfaceAfterAllTransforms" to hasSurfaceAfterAllTransforms,
             "releaseA" to releaseA,
             "releaseAFence" to releaseAFence,
             "hasAAfterRelease" to hasAAfterRelease,
@@ -1495,7 +1509,9 @@ object AndroidDagRenderSmokeHarness {
             "secondRenderA=not_run;hasSurfaceAfterSecond=false;surfaceKindAfterSecond=none;widthAfterSecond=0;heightAfterSecond=0;" +
             "importB=not_run;handleB=0;distinctHandles=false;hasBAfterImport=false;renderB=not_run;renderBLastError=;" +
             "identityTransformRender=not_run;nonIdentityTransformRender=not_run;nonIdentityTransformLastError=;hasSurfaceAfterTransform=false;" +
+            "rot180TransformRender=not_run;rot180TransformLastError=;rot270TransformRender=not_run;rot270TransformLastError=;" +
+            "mirrorTransformRender=not_run;mirrorTransformLastError=;hasSurfaceAfterAllTransforms=false;" +
             "releaseA=not_run;releaseAFence=-1;hasAAfterRelease=false;hasBAfterReleaseA=false;releasedHandleRender=not_run;releasedHandleLastError=;" +
             "detach=not_run;surfaceKindAfterDetach=none;postDetachRenderB=not_run;postDetachLastError=;shutdown=not_run;" +
-            "hasBAfterShutdown=false;idempotentShutdown=not_run;proofBoundary=gles_renderFrame_rgba_texture_quad_no_transform_no_yuv_no_fence_sync;lastError=$reason"
+            "hasBAfterShutdown=false;idempotentShutdown=not_run;proofBoundary=gles_renderFrame_rgba_texture_quad_transform_uv_no_yuv_no_fence_sync;lastError=$reason"
 }

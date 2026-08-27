@@ -1,10 +1,17 @@
 // gles_texture_frame_renderer.cpp
-// Phase 1 Unit Z: GlesTextureFrameRenderer implementation.
+// Phase 1 Unit Z/AA: GlesTextureFrameRenderer implementation.
 //
 // Android-only real implementation is inside #if defined(__ANDROID__).
 // Non-Android translation unit compiles to a safe stub that performs no GL
 // calls and reports unavailable, matching the style of
 // GlesHardwareBufferImports' host stub.
+//
+// Unit AA: UV coordinates for the four base corners [0,0], [1,0], [0,1],
+// [1,1] are remapped through VideoTransformPushConstants (see
+// makeVideoTransformPushConstants in render_transform.h) before upload,
+// supporting rotationDegrees 0/90/180/270 plus mirrorHorizontal. No pixel
+// readback/content proof, no YUV/external texture, no fence sync, no
+// product wiring.
 
 #include "gles_texture_frame_renderer.h"
 
@@ -64,6 +71,14 @@ bool GlesTextureFrameRenderer::drawTexturedQuad(uint32_t texture,
                                                 uint32_t width,
                                                 uint32_t height,
                                                 std::string* outError) {
+    return drawTexturedQuad(texture, width, height, VideoFrameTransform{}, outError);
+}
+
+bool GlesTextureFrameRenderer::drawTexturedQuad(uint32_t texture,
+                                                uint32_t width,
+                                                uint32_t height,
+                                                const VideoFrameTransform& transform,
+                                                std::string* outError) {
     if (outError) {
         outError->clear();
     }
@@ -111,14 +126,30 @@ bool GlesTextureFrameRenderer::drawTexturedQuad(uint32_t texture,
     }
 
     if (ok) {
-        // Full-window NDC quad interleaved with [0,0]..[1,1] UVs as
-        // (x, y, u, v) per vertex, triangle-strip order. No orientation
-        // correction in this slice.
-        static const GLfloat kQuadVertices[] = {
-            -1.0f, -1.0f, 0.0f, 0.0f,
-             1.0f, -1.0f, 1.0f, 0.0f,
-            -1.0f,  1.0f, 0.0f, 1.0f,
-             1.0f,  1.0f, 1.0f, 1.0f,
+        // Full-window NDC quad interleaved with UVs as (x, y, u, v) per
+        // vertex, triangle-strip order. Base UVs [0,0], [1,0], [0,1], [1,1]
+        // are remapped through the shared VideoTransformPushConstants rows
+        // for the requested rotation/mirror.
+        const VideoTransformPushConstants pc = makeVideoTransformPushConstants(transform);
+        const GLfloat kBaseUvs[4][2] = {
+            {0.0f, 0.0f},
+            {1.0f, 0.0f},
+            {0.0f, 1.0f},
+            {1.0f, 1.0f},
+        };
+        GLfloat mappedUvs[4][2];
+        for (int i = 0; i < 4; ++i) {
+            const GLfloat baseU = kBaseUvs[i][0];
+            const GLfloat baseV = kBaseUvs[i][1];
+            mappedUvs[i][0] = pc.uvTransform0[0] * baseU + pc.uvTransform0[1] * baseV + pc.uvTransform0[3];
+            mappedUvs[i][1] = pc.uvTransform1[0] * baseU + pc.uvTransform1[1] * baseV + pc.uvTransform1[3];
+        }
+
+        const GLfloat kQuadVertices[] = {
+            -1.0f, -1.0f, mappedUvs[0][0], mappedUvs[0][1],
+             1.0f, -1.0f, mappedUvs[1][0], mappedUvs[1][1],
+            -1.0f,  1.0f, mappedUvs[2][0], mappedUvs[2][1],
+             1.0f,  1.0f, mappedUvs[3][0], mappedUvs[3][1],
         };
 
         glGenBuffers(1, &vertexBuffer);
@@ -195,6 +226,7 @@ bool GlesTextureFrameRenderer::drawTexturedQuad(uint32_t texture,
     (void)texture;
     (void)width;
     (void)height;
+    (void)transform;
     if (outError) {
         *outError = "gles_texture_frame_renderer_unavailable_on_host";
     }
