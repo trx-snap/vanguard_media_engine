@@ -657,7 +657,7 @@ class AndroidDagDiagnosticsCoordinator(
     private fun runPhase1AJGlesNativeFenceFdSmoke(result: MethodChannel.Result) {
         Thread {
             try {
-                val smokeResult = AndroidDagRenderSmokeHarness.runGlesNativeFenceFdSmoke()
+                val smokeResult = AndroidGlesFenceSmokeHarness.runGlesNativeFenceFdSmoke()
                 mainHandler.post { result.success(smokeResult) }
             } catch (t: Throwable) {
                 mainHandler.post {
@@ -677,7 +677,7 @@ class AndroidDagDiagnosticsCoordinator(
         val height = (args?.get("height") as? Number)?.toInt() ?: 64
         Thread {
             try {
-                val smokeResult = AndroidDagRenderSmokeHarness.runGlesReleaseNullFenceSmoke(width, height)
+                val smokeResult = AndroidGlesFenceSmokeHarness.runGlesReleaseNullFenceSmoke(width, height)
                 mainHandler.post { result.success(smokeResult) }
             } catch (t: Throwable) {
                 mainHandler.post {

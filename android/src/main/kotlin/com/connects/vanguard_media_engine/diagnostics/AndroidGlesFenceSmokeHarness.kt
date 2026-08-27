@@ -11,6 +11,239 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 object AndroidGlesFenceSmokeHarness {
     private const val TAG = "VanguardDagSmoke"
 
+    // ── Phase 1-Unit AJ: Android GLES EGL native-fence FD lifecycle physical proof ──
+    private const val RESULT_MARKER_PHASE1AJ = "ANDROID_GLES_NATIVE_FENCE_FD_UNIT_AJ_NATIVE_RESULT"
+
+    fun runGlesNativeFenceFdSmoke(): Map<String, Any?> {
+        var raw = glesNativeFenceFdFailure("not_run")
+        try {
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1AJGlesNativeFenceFdSmoke()
+            return parseGlesNativeFenceFdResult(raw)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = glesNativeFenceFdFailure("exception:$reason")
+            return parseGlesNativeFenceFdResult(raw)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1AJ $raw")
+        }
+    }
+
+    private fun parseGlesNativeFenceFdResult(raw: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val clientVersion = parsed["clientVersion"]?.toIntOrNull() ?: 0
+        val vendor = parsed["vendor"] ?: ""
+        val renderer = parsed["renderer"] ?: ""
+        val version = parsed["version"] ?: ""
+        val initialize = parsed["initialize"] ?: "not_run"
+        val eglCurrentDisplayOk = parsed["eglCurrentDisplayOk"]?.equals("true", ignoreCase = true) ?: false
+        val symbolsResolved = parsed["symbolsResolved"]?.equals("true", ignoreCase = true) ?: false
+        val nativeFenceSyncCreate = parsed["nativeFenceSyncCreate"] ?: "not_run"
+        val glFlushOk = parsed["glFlushOk"]?.equals("true", ignoreCase = true) ?: false
+        val dupNativeFenceFd = parsed["dupNativeFenceFd"]?.toIntOrNull() ?: -1
+        val fdOpenBeforeClose = parsed["fdOpenBeforeClose"]?.equals("true", ignoreCase = true) ?: false
+        val waitOutcome = parsed["waitOutcome"] ?: "not_run"
+        val waitSignaled = parsed["waitSignaled"]?.equals("true", ignoreCase = true) ?: false
+        val closeResult = parsed["closeResult"] ?: "not_run"
+        val fdClosedAfterClose = parsed["fdClosedAfterClose"]?.equals("true", ignoreCase = true) ?: false
+        val destroySync = parsed["destroySync"] ?: "not_run"
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_native_fence_fd_lifecycle_no_release_fence_production_no_import_no_product"
+        val lastError = parsed["lastError"] ?: ""
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "clientVersion" to clientVersion,
+            "vendor" to vendor,
+            "renderer" to renderer,
+            "version" to version,
+            "initialize" to initialize,
+            "eglCurrentDisplayOk" to eglCurrentDisplayOk,
+            "symbolsResolved" to symbolsResolved,
+            "nativeFenceSyncCreate" to nativeFenceSyncCreate,
+            "glFlushOk" to glFlushOk,
+            "dupNativeFenceFd" to dupNativeFenceFd,
+            "fdOpenBeforeClose" to fdOpenBeforeClose,
+            "waitOutcome" to waitOutcome,
+            "waitSignaled" to waitSignaled,
+            "closeResult" to closeResult,
+            "fdClosedAfterClose" to fdClosedAfterClose,
+            "destroySync" to destroySync,
+            "shutdown" to shutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "proofBoundary" to proofBoundary,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun glesNativeFenceFdFailure(reason: String): String =
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;initialize=not_run;" +
+            "eglCurrentDisplayOk=false;symbolsResolved=false;nativeFenceSyncCreate=not_run;glFlushOk=false;" +
+            "dupNativeFenceFd=-1;fdOpenBeforeClose=false;waitOutcome=not_run;waitSignaled=false;" +
+            "closeResult=not_run;fdClosedAfterClose=false;destroySync=not_run;shutdown=not_run;idempotentShutdown=not_run;" +
+            "proofBoundary=gles_native_fence_fd_lifecycle_no_release_fence_production_no_import_no_product;lastError=$reason"
+
+    // ── Phase 1-Unit AL: Android GLES releaseHardwareBuffer nullptr release-fence output physical proof ──
+    private const val RESULT_MARKER_PHASE1AL = "ANDROID_GLES_RELEASE_NULL_FENCE_UNIT_AL_NATIVE_RESULT"
+
+    fun runGlesReleaseNullFenceSmoke(width: Int = 64, height: Int = 64): Map<String, Any?> {
+        var hardwareBuffer: HardwareBuffer? = null
+        var raw = glesReleaseNullFenceFailure("not_run")
+
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                raw = glesReleaseNullFenceFailure("api_below_26")
+                return parseGlesReleaseNullFenceResult(raw)
+            }
+            if (width <= 0 || height <= 0) {
+                raw = glesReleaseNullFenceFailure("invalid_dimensions")
+                return parseGlesReleaseNullFenceResult(raw)
+            }
+
+            hardwareBuffer = HardwareBuffer.create(
+                width,
+                height,
+                HardwareBuffer.RGBA_8888,
+                1,
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+            )
+
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1ALGlesReleaseNullFenceSmoke(
+                hardwareBuffer,
+                width,
+                height,
+            )
+            return parseGlesReleaseNullFenceResult(raw)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = glesReleaseNullFenceFailure("exception:$reason")
+            return parseGlesReleaseNullFenceResult(raw)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1AL $raw")
+            try {
+                hardwareBuffer?.close()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun parseGlesReleaseNullFenceResult(raw: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val clientVersion = parsed["clientVersion"]?.toIntOrNull() ?: 0
+        val vendor = parsed["vendor"] ?: ""
+        val renderer = parsed["renderer"] ?: ""
+        val version = parsed["version"] ?: ""
+        val bufferDescribe = parsed["bufferDescribe"] ?: "not_run"
+        val bufferWidth = parsed["bufferWidth"]?.toIntOrNull() ?: 0
+        val bufferHeight = parsed["bufferHeight"]?.toIntOrNull() ?: 0
+        val bufferLayers = parsed["bufferLayers"]?.toIntOrNull() ?: 0
+        val bufferFormat = parsed["bufferFormat"]?.toIntOrNull() ?: 0
+        val bufferUsageSampled = parsed["bufferUsageSampled"]?.equals("true", ignoreCase = true) ?: false
+        val initialize = parsed["initialize"] ?: "not_run"
+        val import1 = parsed["import1"] ?: "not_run"
+        val handle1 = parsed["handle1"]?.toLongOrNull() ?: 0L
+        val desc1Width = parsed["desc1Width"]?.toIntOrNull() ?: 0
+        val desc1Height = parsed["desc1Height"]?.toIntOrNull() ?: 0
+        val desc1Layers = parsed["desc1Layers"]?.toIntOrNull() ?: 0
+        val desc1Format = parsed["desc1Format"]?.toIntOrNull() ?: 0
+        val desc1UsageSampled = parsed["desc1UsageSampled"]?.equals("true", ignoreCase = true) ?: false
+        val hasAfterImport1 = parsed["hasAfterImport1"]?.equals("true", ignoreCase = true) ?: false
+        val nullFenceRelease1 = parsed["nullFenceRelease1"] ?: "not_run"
+        val hasAfterNullFenceRelease1 = parsed["hasAfterNullFenceRelease1"]?.equals("true", ignoreCase = true) ?: false
+        val nullFenceDoubleRelease1 = parsed["nullFenceDoubleRelease1"] ?: "not_run"
+        val import2 = parsed["import2"] ?: "not_run"
+        val handle2 = parsed["handle2"]?.toLongOrNull() ?: 0L
+        val desc2Width = parsed["desc2Width"]?.toIntOrNull() ?: 0
+        val desc2Height = parsed["desc2Height"]?.toIntOrNull() ?: 0
+        val desc2Layers = parsed["desc2Layers"]?.toIntOrNull() ?: 0
+        val desc2Format = parsed["desc2Format"]?.toIntOrNull() ?: 0
+        val desc2UsageSampled = parsed["desc2UsageSampled"]?.equals("true", ignoreCase = true) ?: false
+        val hasAfterImport2 = parsed["hasAfterImport2"]?.equals("true", ignoreCase = true) ?: false
+        val release2 = parsed["release2"] ?: "not_run"
+        val release2Fence = parsed["release2Fence"]?.toIntOrNull() ?: -1
+        val hasAfterRelease2 = parsed["hasAfterRelease2"]?.equals("true", ignoreCase = true) ?: false
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_release_null_fence_output_contract_no_release_fence_production_no_render_no_product"
+        val lastError = parsed["lastError"] ?: ""
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "clientVersion" to clientVersion,
+            "vendor" to vendor,
+            "renderer" to renderer,
+            "version" to version,
+            "bufferDescribe" to bufferDescribe,
+            "bufferWidth" to bufferWidth,
+            "bufferHeight" to bufferHeight,
+            "bufferLayers" to bufferLayers,
+            "bufferFormat" to bufferFormat,
+            "bufferUsageSampled" to bufferUsageSampled,
+            "initialize" to initialize,
+            "import1" to import1,
+            "handle1" to handle1,
+            "desc1Width" to desc1Width,
+            "desc1Height" to desc1Height,
+            "desc1Layers" to desc1Layers,
+            "desc1Format" to desc1Format,
+            "desc1UsageSampled" to desc1UsageSampled,
+            "hasAfterImport1" to hasAfterImport1,
+            "nullFenceRelease1" to nullFenceRelease1,
+            "hasAfterNullFenceRelease1" to hasAfterNullFenceRelease1,
+            "nullFenceDoubleRelease1" to nullFenceDoubleRelease1,
+            "import2" to import2,
+            "handle2" to handle2,
+            "desc2Width" to desc2Width,
+            "desc2Height" to desc2Height,
+            "desc2Layers" to desc2Layers,
+            "desc2Format" to desc2Format,
+            "desc2UsageSampled" to desc2UsageSampled,
+            "hasAfterImport2" to hasAfterImport2,
+            "release2" to release2,
+            "release2Fence" to release2Fence,
+            "hasAfterRelease2" to hasAfterRelease2,
+            "shutdown" to shutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "proofBoundary" to proofBoundary,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun glesReleaseNullFenceFailure(reason: String): String =
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;bufferDescribe=not_run;bufferWidth=0;bufferHeight=0;bufferLayers=0;bufferFormat=0;bufferUsageSampled=false;" +
+            "initialize=not_run;import1=not_run;handle1=0;desc1Width=0;desc1Height=0;desc1Layers=0;desc1Format=0;desc1UsageSampled=false;hasAfterImport1=false;" +
+            "nullFenceRelease1=not_run;hasAfterNullFenceRelease1=false;nullFenceDoubleRelease1=not_run;import2=not_run;handle2=0;desc2Width=0;desc2Height=0;desc2Layers=0;desc2Format=0;desc2UsageSampled=false;hasAfterImport2=false;" +
+            "release2=not_run;release2Fence=-1;hasAfterRelease2=false;shutdown=not_run;idempotentShutdown=not_run;" +
+            "proofBoundary=gles_release_null_fence_output_contract_no_release_fence_production_no_render_no_product;lastError=$reason"
+
     // ── Phase 1-Unit AM: Android GLES renderFrame -> EGL native-fence GPU chain physical proof ──
     private const val RESULT_MARKER_PHASE1AM = "ANDROID_GLES_RENDER_FENCE_CHAIN_UNIT_AM_NATIVE_RESULT"
 
