@@ -81,6 +81,7 @@ if (ANDROID)
     "platform/android/src/android_gles_extension_capability_smoke_jni.cpp"
     "platform/android/src/android_gles_native_fence_fd_smoke_jni.cpp"
     "platform/android/src/android_gles_release_null_fence_smoke_jni.cpp"
+    "platform/android/src/android_gles_render_fence_chain_smoke_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
 

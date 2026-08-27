@@ -59,6 +59,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AIGlesExtensionCapabilitySmoke",
             "runAndroidDagPhase1AJGlesNativeFenceFdSmoke",
             "runAndroidDagPhase1ALGlesReleaseNullFenceSmoke",
+            "runAndroidDagPhase1AMGlesRenderFenceChainSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -104,6 +105,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AIGlesExtensionCapabilitySmoke" -> runPhase1AIGlesExtensionCapabilitySmoke(result)
             "runAndroidDagPhase1AJGlesNativeFenceFdSmoke" -> runPhase1AJGlesNativeFenceFdSmoke(result)
             "runAndroidDagPhase1ALGlesReleaseNullFenceSmoke" -> runPhase1ALGlesReleaseNullFenceSmoke(args, result)
+            "runAndroidDagPhase1AMGlesRenderFenceChainSmoke" -> runPhase1AMGlesRenderFenceChainSmoke(args, result)
             else -> return false
         }
         return true
@@ -680,6 +682,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_RELEASE_NULL_FENCE_SMOKE_FAILED",
                         "runAndroidDagPhase1ALGlesReleaseNullFenceSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AM: Android GLES renderFrame -> EGL native-fence GPU chain physical proof ──
+    private fun runPhase1AMGlesRenderFenceChainSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesRenderFenceChainSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_RENDER_FENCE_CHAIN_SMOKE_FAILED",
+                        "runAndroidDagPhase1AMGlesRenderFenceChainSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
