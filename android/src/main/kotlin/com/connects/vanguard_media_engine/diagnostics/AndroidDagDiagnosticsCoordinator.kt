@@ -65,6 +65,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ARGlesExternalTextureSmoke",
             "runAndroidDagPhase1ASGlesTwoTextureCompositorSmoke",
             "runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke",
+            "runAndroidDagPhase1AVGlesEvalRenderSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -116,6 +117,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ARGlesExternalTextureSmoke" -> runPhase1ARGlesExternalTextureSmoke(args, result)
             "runAndroidDagPhase1ASGlesTwoTextureCompositorSmoke" -> runPhase1ASGlesTwoTextureCompositorSmoke(args, result)
             "runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke" -> runPhase1ATGlesMixedTextureCompositorSmoke(args, result)
+            "runAndroidDagPhase1AVGlesEvalRenderSmoke" -> runPhase1AVGlesEvalRenderSmoke(args, result)
             else -> return false
         }
         return true
@@ -812,6 +814,30 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_MIXED_TEXTURE_COMPOSITOR_SMOKE_FAILED",
                         "runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AV: Android GLES DAG playhead evaluation + multi-frame render smoke ──
+    private fun runPhase1AVGlesEvalRenderSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width           = (args?.get("width")           as? Number)?.toInt()  ?: 64
+        val height          = (args?.get("height")          as? Number)?.toInt()  ?: 64
+        val frameCount      = (args?.get("frameCount")      as? Number)?.toInt()  ?: 30
+        val frameDurationUs = (args?.get("frameDurationUs") as? Number)?.toLong() ?: 33333L
+        Thread {
+            try {
+                val smokeResult = AndroidGlesDagEvalSmokeHarness.runGlesDagEvalRenderSmoke(
+                    width, height, frameCount, frameDurationUs,
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_DAG_EVAL_RENDER_SMOKE_FAILED",
+                        "runAndroidDagPhase1AVGlesEvalRenderSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

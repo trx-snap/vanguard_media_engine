@@ -285,6 +285,16 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // ── Phase 1-Unit AV: Android GLES DAG playhead evaluation + multi-frame render smoke ──
+    external fun runAndroidDagPhase1AVGlesEvalRenderSmoke(
+        surface: Surface,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        frameCount: Int,
+        frameDurationUs: Long,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
