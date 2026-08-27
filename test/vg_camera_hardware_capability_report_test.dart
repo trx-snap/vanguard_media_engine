@@ -195,7 +195,543 @@ void main() {
   });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // 4. VGCameraHardwareDeviceCapability Unit Tests
+  // 4. VGCameraMandatoryConcurrentStreamInfo Helper Tests
+  // ─────────────────────────────────────────────────────────────────────────
+  group('VGCameraMandatoryConcurrentStreamInfo', () {
+    test('fromMap parses valid stream info and converts toMap', () {
+      final map = <Object?, Object?>{
+        'isInput': true,
+        'format': 35,
+        'formatName': 'YUV_420_888',
+        'tenBitFormat': 54,
+        'tenBitFormatName': 'YCBCR_P010',
+        'is10BitCapable': true,
+        'isMaximumSize': false,
+        'isUltraHighResolution': true,
+        'streamUseCase': 3,
+        'streamUseCaseName': 'VIDEO_RECORD',
+        'availableSizes': <Object?>[
+          <Object?, Object?>{'width': 1920, 'height': 1080},
+          <Object?, Object?>{'width': 1280, 'height': 720},
+        ],
+      };
+
+      final info = VGCameraMandatoryConcurrentStreamInfo.fromMap(map);
+      expect(info, isNotNull);
+      expect(info!.isInput, isTrue);
+      expect(info.format, equals(35));
+      expect(info.formatName, equals('YUV_420_888'));
+      expect(info.tenBitFormat, equals(54));
+      expect(info.tenBitFormatName, equals('YCBCR_P010'));
+      expect(info.is10BitCapable, isTrue);
+      expect(info.isMaximumSize, isFalse);
+      expect(info.isUltraHighResolution, isTrue);
+      expect(info.streamUseCase, equals(3));
+      expect(info.streamUseCaseName, equals('VIDEO_RECORD'));
+      expect(
+        info.availableSizes,
+        equals([const VGCameraSize(1920, 1080), const VGCameraSize(1280, 720)]),
+      );
+
+      final roundTrip = info.toMap();
+      expect(roundTrip['isInput'], isTrue);
+      expect(roundTrip['format'], equals(35));
+      expect(roundTrip['formatName'], equals('YUV_420_888'));
+      expect(roundTrip['tenBitFormat'], equals(54));
+      expect(roundTrip['tenBitFormatName'], equals('YCBCR_P010'));
+      expect(roundTrip['is10BitCapable'], isTrue);
+      expect(roundTrip['isMaximumSize'], isFalse);
+      expect(roundTrip['isUltraHighResolution'], isTrue);
+      expect(roundTrip['streamUseCase'], equals(3));
+      expect(roundTrip['streamUseCaseName'], equals('VIDEO_RECORD'));
+      expect(
+        roundTrip['availableSizes'],
+        equals([
+          {'width': 1920, 'height': 1080},
+          {'width': 1280, 'height': 720},
+        ]),
+      );
+
+      final fromRoundTrip = VGCameraMandatoryConcurrentStreamInfo.fromMap(
+        roundTrip,
+      );
+      expect(fromRoundTrip, equals(info));
+      expect(fromRoundTrip.hashCode, equals(info.hashCode));
+    });
+
+    test('fromMap returns null on non-map input', () {
+      expect(VGCameraMandatoryConcurrentStreamInfo.fromMap(null), isNull);
+      expect(
+        VGCameraMandatoryConcurrentStreamInfo.fromMap('not_a_map'),
+        isNull,
+      );
+      expect(VGCameraMandatoryConcurrentStreamInfo.fromMap(123), isNull);
+      expect(
+        VGCameraMandatoryConcurrentStreamInfo.fromMap(const <Object?>[]),
+        isNull,
+      );
+    });
+
+    test('fromMap defaults optional and malformed fields gracefully', () {
+      final map = <Object?, Object?>{
+        'isInput': null,
+        'format': null,
+        'formatName': null,
+        'tenBitFormat': null,
+        'tenBitFormatName': null,
+        'is10BitCapable': null,
+        'isMaximumSize': null,
+        'isUltraHighResolution': null,
+        'streamUseCase': null,
+        'streamUseCaseName': null,
+        'availableSizes': 'not_a_list',
+      };
+
+      final info = VGCameraMandatoryConcurrentStreamInfo.fromMap(map);
+      expect(info, isNotNull);
+      expect(info!.isInput, isFalse);
+      expect(info.format, equals(-1));
+      expect(info.formatName, equals('none'));
+      expect(info.tenBitFormat, equals(-1));
+      expect(info.tenBitFormatName, equals('none'));
+      expect(info.is10BitCapable, isFalse);
+      expect(info.isMaximumSize, isFalse);
+      expect(info.isUltraHighResolution, isFalse);
+      expect(info.streamUseCase, equals(0));
+      expect(info.streamUseCaseName, equals('DEFAULT'));
+      expect(info.availableSizes, isEmpty);
+    });
+
+    test(
+      'fromMap handles numeric type conversions for formats and use cases',
+      () {
+        final map = <Object?, Object?>{
+          'format': 35.0,
+          'tenBitFormat': 54.0,
+          'streamUseCase': 2.0,
+        };
+
+        final info = VGCameraMandatoryConcurrentStreamInfo.fromMap(map);
+        expect(info, isNotNull);
+        expect(info!.format, equals(35));
+        expect(info.tenBitFormat, equals(54));
+        expect(info.streamUseCase, equals(2));
+      },
+    );
+
+    test('fromMap filters out invalid entries in availableSizes list', () {
+      final map = <Object?, Object?>{
+        'format': 34,
+        'formatName': 'PRIVATE',
+        'availableSizes': <Object?>[
+          null,
+          'invalid_size',
+          <Object?, Object?>{'width': 1920, 'height': 1080},
+          <Object?, Object?>{'width': null, 'height': 720},
+          <Object?, Object?>{'width': 1280, 'height': 720},
+        ],
+      };
+
+      final info = VGCameraMandatoryConcurrentStreamInfo.fromMap(map);
+      expect(info, isNotNull);
+      expect(
+        info!.availableSizes,
+        equals([const VGCameraSize(1920, 1080), const VGCameraSize(1280, 720)]),
+      );
+    });
+
+    test('equality, hashCode, and toString verify value semantics', () {
+      const a = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 34,
+        formatName: 'PRIVATE',
+        tenBitFormat: -1,
+        tenBitFormatName: 'none',
+        is10BitCapable: false,
+        isMaximumSize: false,
+        isUltraHighResolution: false,
+        streamUseCase: 1,
+        streamUseCaseName: 'PREVIEW',
+        availableSizes: [VGCameraSize(1920, 1080)],
+      );
+      const b = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 34,
+        formatName: 'PRIVATE',
+        tenBitFormat: -1,
+        tenBitFormatName: 'none',
+        is10BitCapable: false,
+        isMaximumSize: false,
+        isUltraHighResolution: false,
+        streamUseCase: 1,
+        streamUseCaseName: 'PREVIEW',
+        availableSizes: [VGCameraSize(1920, 1080)],
+      );
+
+      const diffInput = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: true,
+        format: 34,
+        formatName: 'PRIVATE',
+        tenBitFormat: -1,
+        tenBitFormatName: 'none',
+        is10BitCapable: false,
+        isMaximumSize: false,
+        isUltraHighResolution: false,
+        streamUseCase: 1,
+        streamUseCaseName: 'PREVIEW',
+        availableSizes: [VGCameraSize(1920, 1080)],
+      );
+      const diffFormat = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 35,
+        formatName: 'PRIVATE',
+        tenBitFormat: -1,
+        tenBitFormatName: 'none',
+        is10BitCapable: false,
+        isMaximumSize: false,
+        isUltraHighResolution: false,
+        streamUseCase: 1,
+        streamUseCaseName: 'PREVIEW',
+        availableSizes: [VGCameraSize(1920, 1080)],
+      );
+      const diffFormatName = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 34,
+        formatName: 'YUV_420_888',
+        tenBitFormat: -1,
+        tenBitFormatName: 'none',
+        is10BitCapable: false,
+        isMaximumSize: false,
+        isUltraHighResolution: false,
+        streamUseCase: 1,
+        streamUseCaseName: 'PREVIEW',
+        availableSizes: [VGCameraSize(1920, 1080)],
+      );
+      const diffTenBitFormat = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 34,
+        formatName: 'PRIVATE',
+        tenBitFormat: 54,
+        tenBitFormatName: 'none',
+        is10BitCapable: false,
+        isMaximumSize: false,
+        isUltraHighResolution: false,
+        streamUseCase: 1,
+        streamUseCaseName: 'PREVIEW',
+        availableSizes: [VGCameraSize(1920, 1080)],
+      );
+      const diffTenBitFormatName = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 34,
+        formatName: 'PRIVATE',
+        tenBitFormat: -1,
+        tenBitFormatName: 'YCBCR_P010',
+        is10BitCapable: false,
+        isMaximumSize: false,
+        isUltraHighResolution: false,
+        streamUseCase: 1,
+        streamUseCaseName: 'PREVIEW',
+        availableSizes: [VGCameraSize(1920, 1080)],
+      );
+      const diff10BitCapable = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 34,
+        formatName: 'PRIVATE',
+        tenBitFormat: -1,
+        tenBitFormatName: 'none',
+        is10BitCapable: true,
+        isMaximumSize: false,
+        isUltraHighResolution: false,
+        streamUseCase: 1,
+        streamUseCaseName: 'PREVIEW',
+        availableSizes: [VGCameraSize(1920, 1080)],
+      );
+      const diffMaxSize = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 34,
+        formatName: 'PRIVATE',
+        tenBitFormat: -1,
+        tenBitFormatName: 'none',
+        is10BitCapable: false,
+        isMaximumSize: true,
+        isUltraHighResolution: false,
+        streamUseCase: 1,
+        streamUseCaseName: 'PREVIEW',
+        availableSizes: [VGCameraSize(1920, 1080)],
+      );
+      const diffUltraHigh = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 34,
+        formatName: 'PRIVATE',
+        tenBitFormat: -1,
+        tenBitFormatName: 'none',
+        is10BitCapable: false,
+        isMaximumSize: false,
+        isUltraHighResolution: true,
+        streamUseCase: 1,
+        streamUseCaseName: 'PREVIEW',
+        availableSizes: [VGCameraSize(1920, 1080)],
+      );
+      const diffUseCase = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 34,
+        formatName: 'PRIVATE',
+        tenBitFormat: -1,
+        tenBitFormatName: 'none',
+        is10BitCapable: false,
+        isMaximumSize: false,
+        isUltraHighResolution: false,
+        streamUseCase: 2,
+        streamUseCaseName: 'PREVIEW',
+        availableSizes: [VGCameraSize(1920, 1080)],
+      );
+      const diffUseCaseName = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 34,
+        formatName: 'PRIVATE',
+        tenBitFormat: -1,
+        tenBitFormatName: 'none',
+        is10BitCapable: false,
+        isMaximumSize: false,
+        isUltraHighResolution: false,
+        streamUseCase: 1,
+        streamUseCaseName: 'STILL_CAPTURE',
+        availableSizes: [VGCameraSize(1920, 1080)],
+      );
+      const diffSizes = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 34,
+        formatName: 'PRIVATE',
+        tenBitFormat: -1,
+        tenBitFormatName: 'none',
+        is10BitCapable: false,
+        isMaximumSize: false,
+        isUltraHighResolution: false,
+        streamUseCase: 1,
+        streamUseCaseName: 'PREVIEW',
+        availableSizes: [VGCameraSize(1280, 720)],
+      );
+
+      expect(a, equals(b));
+      expect(a.hashCode, equals(b.hashCode));
+      expect(a, isNot(equals(diffInput)));
+      expect(a, isNot(equals(diffFormat)));
+      expect(a, isNot(equals(diffFormatName)));
+      expect(a, isNot(equals(diffTenBitFormat)));
+      expect(a, isNot(equals(diffTenBitFormatName)));
+      expect(a, isNot(equals(diff10BitCapable)));
+      expect(a, isNot(equals(diffMaxSize)));
+      expect(a, isNot(equals(diffUltraHigh)));
+      expect(a, isNot(equals(diffUseCase)));
+      expect(a, isNot(equals(diffUseCaseName)));
+      expect(a, isNot(equals(diffSizes)));
+
+      expect(
+        a.toString(),
+        equals(
+          'VGCameraMandatoryConcurrentStreamInfo('
+          'isInput: false, '
+          'format: 34, '
+          'formatName: PRIVATE, '
+          'tenBitFormat: -1, '
+          'tenBitFormatName: none, '
+          'is10BitCapable: false, '
+          'isMaximumSize: false, '
+          'isUltraHighResolution: false, '
+          'streamUseCase: 1, '
+          'streamUseCaseName: PREVIEW, '
+          'availableSizes: [VGCameraSize(width: 1920, height: 1080)])',
+        ),
+      );
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // 5. VGCameraMandatoryConcurrentStreamCombination Helper Tests
+  // ─────────────────────────────────────────────────────────────────────────
+  group('VGCameraMandatoryConcurrentStreamCombination', () {
+    test('fromMap parses valid combination and converts toMap', () {
+      final map = <Object?, Object?>{
+        'description': '[YUV, PREVIEW] [JPEG, STILL]',
+        'isReprocessable': false,
+        'streams': <Object?>[
+          <Object?, Object?>{
+            'isInput': false,
+            'format': 35,
+            'formatName': 'YUV_420_888',
+            'tenBitFormat': -1,
+            'tenBitFormatName': 'none',
+            'is10BitCapable': false,
+            'isMaximumSize': false,
+            'isUltraHighResolution': false,
+            'streamUseCase': 1,
+            'streamUseCaseName': 'PREVIEW',
+            'availableSizes': <Object?>[
+              <Object?, Object?>{'width': 1920, 'height': 1080},
+            ],
+          },
+          <Object?, Object?>{
+            'isInput': false,
+            'format': 256,
+            'formatName': 'JPEG',
+            'tenBitFormat': -1,
+            'tenBitFormatName': 'none',
+            'is10BitCapable': false,
+            'isMaximumSize': false,
+            'isUltraHighResolution': false,
+            'streamUseCase': 2,
+            'streamUseCaseName': 'STILL_CAPTURE',
+            'availableSizes': <Object?>[
+              <Object?, Object?>{'width': 4000, 'height': 3000},
+            ],
+          },
+        ],
+      };
+
+      final combo = VGCameraMandatoryConcurrentStreamCombination.fromMap(map);
+      expect(combo, isNotNull);
+      expect(combo!.description, equals('[YUV, PREVIEW] [JPEG, STILL]'));
+      expect(combo.isReprocessable, isFalse);
+      expect(combo.streams.length, equals(2));
+      expect(combo.streams[0].formatName, equals('YUV_420_888'));
+      expect(combo.streams[1].formatName, equals('JPEG'));
+
+      final roundTrip = combo.toMap();
+      expect(roundTrip['description'], equals('[YUV, PREVIEW] [JPEG, STILL]'));
+      expect(roundTrip['isReprocessable'], isFalse);
+      expect((roundTrip['streams'] as List).length, equals(2));
+
+      final fromRoundTrip =
+          VGCameraMandatoryConcurrentStreamCombination.fromMap(roundTrip);
+      expect(fromRoundTrip, equals(combo));
+      expect(fromRoundTrip.hashCode, equals(combo.hashCode));
+    });
+
+    test('fromMap returns null on non-map input', () {
+      expect(
+        VGCameraMandatoryConcurrentStreamCombination.fromMap(null),
+        isNull,
+      );
+      expect(
+        VGCameraMandatoryConcurrentStreamCombination.fromMap('not_a_map'),
+        isNull,
+      );
+      expect(VGCameraMandatoryConcurrentStreamCombination.fromMap(789), isNull);
+      expect(
+        VGCameraMandatoryConcurrentStreamCombination.fromMap(const <Object?>[]),
+        isNull,
+      );
+    });
+
+    test('fromMap defaults missing fields and filters malformed streams', () {
+      final map = <Object?, Object?>{
+        'description': null,
+        'isReprocessable': null,
+        'streams': <Object?>[
+          null,
+          'invalid_stream',
+          <Object?, Object?>{
+            'isInput': false,
+            'format': 34,
+            'formatName': 'PRIVATE',
+          },
+        ],
+      };
+
+      final combo = VGCameraMandatoryConcurrentStreamCombination.fromMap(map);
+      expect(combo, isNotNull);
+      expect(combo!.description, equals(''));
+      expect(combo.isReprocessable, isFalse);
+      expect(combo.streams.length, equals(1));
+      expect(combo.streams.first.formatName, equals('PRIVATE'));
+    });
+
+    test('fromMap handles non-list streams gracefully', () {
+      final map = <Object?, Object?>{
+        'description': 'test combo',
+        'isReprocessable': true,
+        'streams': 'not_a_list',
+      };
+
+      final combo = VGCameraMandatoryConcurrentStreamCombination.fromMap(map);
+      expect(combo, isNotNull);
+      expect(combo!.description, equals('test combo'));
+      expect(combo.isReprocessable, isTrue);
+      expect(combo.streams, isEmpty);
+    });
+
+    test('equality, hashCode, and toString verify value semantics', () {
+      const streamA = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 34,
+        formatName: 'PRIVATE',
+        tenBitFormat: -1,
+        tenBitFormatName: 'none',
+        is10BitCapable: false,
+        isMaximumSize: false,
+        isUltraHighResolution: false,
+        streamUseCase: 1,
+        streamUseCaseName: 'PREVIEW',
+      );
+      const streamB = VGCameraMandatoryConcurrentStreamInfo(
+        isInput: false,
+        format: 256,
+        formatName: 'JPEG',
+        tenBitFormat: -1,
+        tenBitFormatName: 'none',
+        is10BitCapable: false,
+        isMaximumSize: false,
+        isUltraHighResolution: false,
+        streamUseCase: 2,
+        streamUseCaseName: 'STILL_CAPTURE',
+      );
+
+      const a = VGCameraMandatoryConcurrentStreamCombination(
+        description: 'combo 1',
+        isReprocessable: false,
+        streams: [streamA],
+      );
+      const b = VGCameraMandatoryConcurrentStreamCombination(
+        description: 'combo 1',
+        isReprocessable: false,
+        streams: [streamA],
+      );
+      const diffDesc = VGCameraMandatoryConcurrentStreamCombination(
+        description: 'combo 2',
+        isReprocessable: false,
+        streams: [streamA],
+      );
+      const diffReprocess = VGCameraMandatoryConcurrentStreamCombination(
+        description: 'combo 1',
+        isReprocessable: true,
+        streams: [streamA],
+      );
+      const diffStreams = VGCameraMandatoryConcurrentStreamCombination(
+        description: 'combo 1',
+        isReprocessable: false,
+        streams: [streamB],
+      );
+
+      expect(a, equals(b));
+      expect(a.hashCode, equals(b.hashCode));
+      expect(a, isNot(equals(diffDesc)));
+      expect(a, isNot(equals(diffReprocess)));
+      expect(a, isNot(equals(diffStreams)));
+
+      expect(
+        a.toString(),
+        equals(
+          'VGCameraMandatoryConcurrentStreamCombination('
+          'description: combo 1, '
+          'isReprocessable: false, '
+          'streams: [${streamA.toString()}])',
+        ),
+      );
+    });
+  });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // 6. VGCameraHardwareDeviceCapability Unit Tests
   // ─────────────────────────────────────────────────────────────────────────
   group('VGCameraHardwareDeviceCapability', () {
     test(
@@ -687,6 +1223,21 @@ void main() {
         capabilities: ['BACKWARD_COMPATIBLE'],
         sensorPixelArraySize: VGCameraSize(1920, 1080),
       );
+      const diffMandatoryCombinations = VGCameraHardwareDeviceCapability(
+        cameraId: '0',
+        lensFacing: 'back',
+        sensorOrientation: 90,
+        hardwareLevel: 'full',
+        isLogicalMultiCamera: true,
+        physicalCameraIds: ['2', '3'],
+        capabilities: ['BACKWARD_COMPATIBLE'],
+        mandatoryConcurrentStreamCombinations: [
+          VGCameraMandatoryConcurrentStreamCombination(
+            description: 'combo 1',
+            isReprocessable: false,
+          ),
+        ],
+      );
 
       expect(a, equals(b));
       expect(a.hashCode, equals(b.hashCode));
@@ -707,11 +1258,121 @@ void main() {
       expect(a, isNot(equals(diffOpticalStab)));
       expect(a, isNot(equals(diffActiveArray)));
       expect(a, isNot(equals(diffPixelArray)));
+      expect(a, isNot(equals(diffMandatoryCombinations)));
     });
+
+    test(
+      'fromMap parses mandatoryConcurrentStreamCombinations and handles backward compatibility',
+      () {
+        final mapWithCombinations = <Object?, Object?>{
+          'cameraId': '0',
+          'lensFacing': 'back',
+          'hardwareLevel': 'full',
+          'mandatoryConcurrentStreamCombinations': <Object?>[
+            <Object?, Object?>{
+              'description': 'combo A',
+              'isReprocessable': false,
+              'streams': <Object?>[
+                <Object?, Object?>{
+                  'isInput': false,
+                  'format': 34,
+                  'formatName': 'PRIVATE',
+                  'tenBitFormat': -1,
+                  'tenBitFormatName': 'none',
+                  'is10BitCapable': false,
+                  'isMaximumSize': false,
+                  'isUltraHighResolution': false,
+                  'streamUseCase': 0,
+                  'streamUseCaseName': 'DEFAULT',
+                  'availableSizes': <Object?>[
+                    <Object?, Object?>{'width': 1920, 'height': 1080},
+                  ],
+                },
+              ],
+            },
+          ],
+        };
+
+        final capability = VGCameraHardwareDeviceCapability.fromMap(
+          mapWithCombinations,
+        );
+        expect(capability, isNotNull);
+        expect(
+          capability!.mandatoryConcurrentStreamCombinations.length,
+          equals(1),
+        );
+        expect(
+          capability.mandatoryConcurrentStreamCombinations.first.description,
+          equals('combo A'),
+        );
+        expect(
+          capability.mandatoryConcurrentStreamCombinations.first.streams.length,
+          equals(1),
+        );
+
+        final roundTrip = capability.toMap();
+        expect(
+          (roundTrip['mandatoryConcurrentStreamCombinations'] as List).length,
+          equals(1),
+        );
+        final fromRoundTrip = VGCameraHardwareDeviceCapability.fromMap(
+          roundTrip,
+        );
+        expect(fromRoundTrip, equals(capability));
+        expect(fromRoundTrip.hashCode, equals(capability.hashCode));
+
+        // Test backward compatibility: absent
+        final mapWithoutCombinations = <Object?, Object?>{
+          'cameraId': '0',
+          'lensFacing': 'back',
+          'hardwareLevel': 'full',
+        };
+        final legacyCap = VGCameraHardwareDeviceCapability.fromMap(
+          mapWithoutCombinations,
+        );
+        expect(legacyCap, isNotNull);
+        expect(legacyCap!.mandatoryConcurrentStreamCombinations, isEmpty);
+
+        // Test malformed mandatoryConcurrentStreamCombinations list entries
+        final mapMalformed = <Object?, Object?>{
+          'cameraId': '0',
+          'mandatoryConcurrentStreamCombinations': <Object?>[
+            null,
+            'not_a_map',
+            <Object?, Object?>{
+              'description': 'valid',
+              'isReprocessable': true,
+              'streams': const <Object?>[],
+            },
+          ],
+        };
+        final malformedCap = VGCameraHardwareDeviceCapability.fromMap(
+          mapMalformed,
+        );
+        expect(malformedCap, isNotNull);
+        expect(
+          malformedCap!.mandatoryConcurrentStreamCombinations.length,
+          equals(1),
+        );
+        expect(
+          malformedCap.mandatoryConcurrentStreamCombinations.first.description,
+          equals('valid'),
+        );
+
+        // Test non-list mandatoryConcurrentStreamCombinations
+        final mapNonList = <Object?, Object?>{
+          'cameraId': '0',
+          'mandatoryConcurrentStreamCombinations': 'not_a_list',
+        };
+        final nonListCap = VGCameraHardwareDeviceCapability.fromMap(mapNonList);
+        expect(nonListCap, isNotNull);
+        expect(nonListCap!.mandatoryConcurrentStreamCombinations, isEmpty);
+      },
+    );
   });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // 5. VGCameraHardwareCapabilityReport Unit Tests
+  // 7. VGCameraHardwareCapabilityReport Unit Tests
   // ─────────────────────────────────────────────────────────────────────────
   group('VGCameraHardwareCapabilityReport', () {
     test('fromMap parses valid full capability report and converts toMap', () {
@@ -1059,10 +1720,83 @@ void main() {
       expect(a, isNot(equals(diffConcurrent)));
       expect(a, isNot(equals(diffRecommendation)));
     });
+
+    test(
+      'fromMap parses cameras with mandatoryConcurrentStreamCombinations and round-trips correctly',
+      () {
+        final rawMap = <Object?, Object?>{
+          'success': true,
+          'apiLevel': 34,
+          'hasCameraPermission': true,
+          'thermalStatus': 0,
+          'thermalStatusName': 'none',
+          'cameraCount': 1,
+          'supportsConcurrentCamera': true,
+          'concurrentCameraIdSets': <Object?>[
+            <Object?>['0'],
+          ],
+          'cameras': <Object?>[
+            <Object?, Object?>{
+              'cameraId': '0',
+              'lensFacing': 'back',
+              'sensorOrientation': 90,
+              'hardwareLevel': 'full',
+              'isLogicalMultiCamera': false,
+              'physicalCameraIds': <Object?>[],
+              'capabilities': <Object?>['BACKWARD_COMPATIBLE'],
+              'mandatoryConcurrentStreamCombinations': <Object?>[
+                <Object?, Object?>{
+                  'description': 'Mandatory combo 1',
+                  'isReprocessable': false,
+                  'streams': <Object?>[
+                    <Object?, Object?>{
+                      'isInput': false,
+                      'format': 34,
+                      'formatName': 'PRIVATE',
+                      'tenBitFormat': -1,
+                      'tenBitFormatName': 'none',
+                      'is10BitCapable': false,
+                      'isMaximumSize': false,
+                      'isUltraHighResolution': false,
+                      'streamUseCase': 1,
+                      'streamUseCaseName': 'PREVIEW',
+                      'availableSizes': <Object?>[
+                        <Object?, Object?>{'width': 1920, 'height': 1080},
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+          'fallbackRecommendation': 'concurrent_supported',
+        };
+
+        final report = VGCameraHardwareCapabilityReport.fromMap(rawMap);
+        expect(report.success, isTrue);
+        expect(report.cameras.length, equals(1));
+        final cam = report.cameras.first;
+        expect(cam.mandatoryConcurrentStreamCombinations.length, equals(1));
+        final combo = cam.mandatoryConcurrentStreamCombinations.first;
+        expect(combo.description, equals('Mandatory combo 1'));
+        expect(combo.streams.length, equals(1));
+        expect(combo.streams.first.formatName, equals('PRIVATE'));
+        expect(
+          combo.streams.first.availableSizes,
+          equals([const VGCameraSize(1920, 1080)]),
+        );
+
+        final roundTrip = VGCameraHardwareCapabilityReport.fromMap(
+          report.toMap(),
+        );
+        expect(roundTrip, equals(report));
+        expect(roundTrip.hashCode, equals(report.hashCode));
+      },
+    );
   });
 
   // ─────────────────────────────────────────────────────────────────────────
-  // 6. MethodChannel Contract Tests
+  // 8. MethodChannel Contract Tests
   // ─────────────────────────────────────────────────────────────────────────
   group('VGCameraHardwareCapabilityReport.probeAndroidCamera2Capabilities', () {
     test(

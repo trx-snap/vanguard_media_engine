@@ -7,12 +7,15 @@ import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.params.MandatoryStreamCombination
 import android.hardware.camera2.params.StreamConfigurationMap
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.PowerManager
 import android.util.Log
 import android.util.Size
+import androidx.annotation.RequiresApi
 
 /**
  * Phase 3-Unit A: read-only Android Camera2 hardware/thermal capability probe.
@@ -241,10 +244,14 @@ class AndroidCamera2CapabilityProbe(private val context: Context) {
             null
         }
 
+        val mandatoryConcurrentStreamCombinations =
+            mandatoryConcurrentStreamCombinations(characteristics, cameraId)
+
         Log.i(
             TAG,
             "camera=$cameraId previewSizes=${previewSizes.size} videoSizes=${videoSizes.size} " +
-                "jpegSizes=${jpegSizes.size} yuv420Sizes=${yuv420Sizes.size} flashAvailable=$flashAvailable",
+                "jpegSizes=${jpegSizes.size} yuv420Sizes=${yuv420Sizes.size} flashAvailable=$flashAvailable " +
+                "mandatoryConcurrentStreamCombinationCount=${mandatoryConcurrentStreamCombinations.size}",
         )
 
         return mapOf(
@@ -265,7 +272,120 @@ class AndroidCamera2CapabilityProbe(private val context: Context) {
             "opticalStabilizationModes" to opticalStabilizationModes,
             "sensorActiveArraySize" to sensorActiveArraySize,
             "sensorPixelArraySize" to sensorPixelArraySize,
+            "mandatoryConcurrentStreamCombinations" to mandatoryConcurrentStreamCombinations,
         )
+    }
+
+    private fun mandatoryConcurrentStreamCombinations(
+        characteristics: CameraCharacteristics,
+        cameraId: String,
+    ): List<Map<String, Any?>> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return emptyList()
+        return try {
+            val combinations = characteristics.get(
+                CameraCharacteristics.SCALER_MANDATORY_CONCURRENT_STREAM_COMBINATIONS,
+            ) ?: return emptyList()
+            combinations.map { mandatoryStreamCombinationMap(it) }
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "SCALER_MANDATORY_CONCURRENT_STREAM_COMBINATIONS($cameraId) failed: " +
+                    "${t.javaClass.simpleName}: ${t.message}",
+            )
+            emptyList()
+        }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun mandatoryStreamCombinationMap(
+        combination: MandatoryStreamCombination,
+    ): Map<String, Any?> {
+        return mapOf(
+            "description" to combination.getDescription().toString(),
+            "isReprocessable" to combination.isReprocessable(),
+            "streams" to combination.getStreamsInformation().map { mandatoryStreamInfoMap(it) },
+        )
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun mandatoryStreamInfoMap(
+        stream: MandatoryStreamCombination.MandatoryStreamInformation,
+    ): Map<String, Any?> {
+        val format = stream.getFormat()
+        val tenBitFormat = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            stream.get10BitFormat()
+        } else {
+            -1
+        }
+        val is10BitCapable = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            stream.is10BitCapable()
+        } else {
+            false
+        }
+        val isMaximumSize = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            stream.isMaximumSize()
+        } else {
+            false
+        }
+        val isUltraHighResolution = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            stream.isUltraHighResolution()
+        } else {
+            false
+        }
+        val streamUseCase = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            stream.getStreamUseCase()
+        } else {
+            0L
+        }
+
+        return mapOf(
+            "isInput" to stream.isInput(),
+            "format" to format,
+            "formatName" to imageFormatName(format),
+            "tenBitFormat" to tenBitFormat,
+            "tenBitFormatName" to imageFormatName(tenBitFormat),
+            "is10BitCapable" to is10BitCapable,
+            "isMaximumSize" to isMaximumSize,
+            "isUltraHighResolution" to isUltraHighResolution,
+            "streamUseCase" to streamUseCase,
+            "streamUseCaseName" to streamUseCaseName(streamUseCase),
+            "availableSizes" to sortedSizes(stream.getAvailableSizes()?.toTypedArray()),
+        )
+    }
+
+    private fun imageFormatName(format: Int): String {
+        return when (format) {
+            -1 -> "none"
+            ImageFormat.PRIVATE -> "PRIVATE"
+            ImageFormat.YUV_420_888 -> "YUV_420_888"
+            ImageFormat.JPEG -> "JPEG"
+            ImageFormat.RAW_SENSOR -> "RAW_SENSOR"
+            ImageFormat.RAW_PRIVATE -> "RAW_PRIVATE"
+            ImageFormat.RAW10 -> "RAW10"
+            ImageFormat.RAW12 -> "RAW12"
+            ImageFormat.DEPTH16 -> "DEPTH16"
+            ImageFormat.DEPTH_POINT_CLOUD -> "DEPTH_POINT_CLOUD"
+            ImageFormat.HEIC -> "HEIC"
+            ImageFormat.DEPTH_JPEG -> "DEPTH_JPEG"
+            else -> "format_$format"
+        }
+    }
+
+    private fun streamUseCaseName(useCase: Long): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return if (useCase == 0L) "DEFAULT" else "unknown_$useCase"
+        }
+        return when (useCase) {
+            CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_DEFAULT.toLong() -> "DEFAULT"
+            CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW.toLong() -> "PREVIEW"
+            CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_STILL_CAPTURE.toLong() -> "STILL_CAPTURE"
+            CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_RECORD.toLong() -> "VIDEO_RECORD"
+            CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_PREVIEW_VIDEO_STILL.toLong() ->
+                "PREVIEW_VIDEO_STILL"
+            CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_VIDEO_CALL.toLong() -> "VIDEO_CALL"
+            CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_CROPPED_RAW.toLong() -> "CROPPED_RAW"
+            else -> "unknown_$useCase"
+        }
     }
 
     private fun <T> outputSizes(

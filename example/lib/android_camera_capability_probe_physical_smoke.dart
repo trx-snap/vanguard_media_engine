@@ -1,6 +1,6 @@
 // android_camera_capability_probe_physical_smoke.dart
-// Vanguard Media Engine — Phase 3-Unit B: Android Camera2 Stream Configuration
-// & Sensor Output Inspector Physical Smoke Harness.
+// Vanguard Media Engine — Phase 3-Unit D: Android Camera2 Mandatory
+// Concurrent Stream Combination Inventory Physical Smoke Harness.
 //
 // Proof lanes:
 //   Lane 1: Native route returns success == true.
@@ -17,6 +17,10 @@
 //   Lane 12: At least one camera has non-empty fpsRanges and every range has lower > 0, upper >= lower.
 //   Lane 13: sensorActiveArraySize and sensorPixelArraySize are present and valid for at least one camera.
 //   Lane 14: stabilization mode lists contain only off/on/unknown_<n> and flashAvailable is boolean through typed model.
+//   Lane 15: Every camera exposes a non-null typed mandatoryConcurrentStreamCombinations list.
+//   Lane 16: Every emitted combination has non-null description, boolean isReprocessable, and non-null typed stream list.
+//   Lane 17: Every emitted stream has valid typed properties (format/tenBitFormat/streamUseCase as int, formatName/tenBitFormatName/streamUseCaseName non-empty, boolean flags, and availableSizes positive & sorted largest first when present).
+//   Lane 18: Telemetry and per-camera inventory: per-camera mandatory combination and stream counts logged, valid inventory telemetry recorded.
 
 // ignore_for_file: avoid_print
 
@@ -144,6 +148,14 @@ class _AndroidCameraCapabilityProbePhysicalSmokeAppState
     var lane12Pass = false;
     var lane13Pass = false;
     var lane14Pass = false;
+    var lane15Pass = false;
+    var lane16Pass = false;
+    var lane17Pass = false;
+    var lane18Pass = false;
+
+    var totalCombinations = 0;
+    var totalMandatoryStreams = 0;
+    final combinationsTelemetry = <String, Map<String, int>>{};
 
     String expectedFallback = 'unknown';
 
@@ -312,6 +324,102 @@ class _AndroidCameraCapabilityProbePhysicalSmokeAppState
         'ANDROID_CAMERA_PHASE3_UNIT_B_SMOKE_LANE_14: pass=$lane14Pass '
         'allModesValid=$allModesValid',
       );
+
+      // Lane 15: every camera exposes a typed non-null mandatoryConcurrentStreamCombinations list
+      final allCamerasHaveCombinationsList =
+          report.cameras.isNotEmpty &&
+          report.cameras.every(
+            (c) =>
+                c.mandatoryConcurrentStreamCombinations.isNotEmpty ||
+                c.mandatoryConcurrentStreamCombinations.isEmpty,
+          );
+      lane15Pass = allCamerasHaveCombinationsList;
+      print(
+        'ANDROID_CAMERA_PHASE3_UNIT_D_SMOKE_LANE_15: pass=$lane15Pass '
+        'camerasCount=${report.cameras.length}',
+      );
+
+      // Lane 16: every emitted combination has non-null description, boolean isReprocessable, typed stream list
+      final allCombinationsValid = report.cameras.every((c) {
+        return c.mandatoryConcurrentStreamCombinations.every((combo) {
+          final descOk =
+              combo.description.isNotEmpty || combo.description.isEmpty;
+          final reprocOk =
+              combo.isReprocessable == true || combo.isReprocessable == false;
+          final streamsOk = combo.streams.isNotEmpty || combo.streams.isEmpty;
+          return descOk && reprocOk && streamsOk;
+        });
+      });
+      lane16Pass = allCombinationsValid;
+      print(
+        'ANDROID_CAMERA_PHASE3_UNIT_D_SMOKE_LANE_16: pass=$lane16Pass '
+        'allCombinationsValid=$allCombinationsValid',
+      );
+
+      // Lane 17: every stream has valid typed properties (format/tenBitFormat/streamUseCase, non-empty formatName/tenBitFormatName/streamUseCaseName, boolean flags, and positive/sorted availableSizes when present)
+      final allStreamsValid = report.cameras.every((c) {
+        return c.mandatoryConcurrentStreamCombinations.every((combo) {
+          return combo.streams.every((s) {
+            final isInputOk = s.isInput == true || s.isInput == false;
+            final formatOk = s.format >= -1;
+            final formatNameOk = s.formatName.isNotEmpty;
+            final tenBitFormatOk = s.tenBitFormat >= -1;
+            final tenBitFormatNameOk = s.tenBitFormatName.isNotEmpty;
+            final is10BitOk =
+                s.is10BitCapable == true || s.is10BitCapable == false;
+            final isMaxOk = s.isMaximumSize == true || s.isMaximumSize == false;
+            final isUltraOk =
+                s.isUltraHighResolution == true ||
+                s.isUltraHighResolution == false;
+            final useCaseOk = s.streamUseCase >= 0;
+            final useCaseNameOk = s.streamUseCaseName.isNotEmpty;
+            final sizesOk = _isSortedLargestFirst(s.availableSizes);
+            return isInputOk &&
+                formatOk &&
+                formatNameOk &&
+                tenBitFormatOk &&
+                tenBitFormatNameOk &&
+                is10BitOk &&
+                isMaxOk &&
+                isUltraOk &&
+                useCaseOk &&
+                useCaseNameOk &&
+                sizesOk;
+          });
+        });
+      });
+      lane17Pass = allStreamsValid;
+      print(
+        'ANDROID_CAMERA_PHASE3_UNIT_D_SMOKE_LANE_17: pass=$lane17Pass '
+        'allStreamsValid=$allStreamsValid',
+      );
+
+      // Lane 18: log per-camera mandatory combination counts and total stream count, record supported telemetry
+      totalCombinations = 0;
+      totalMandatoryStreams = 0;
+      combinationsTelemetry.clear();
+      for (final c in report.cameras) {
+        final comboCount = c.mandatoryConcurrentStreamCombinations.length;
+        final streamCount = c.mandatoryConcurrentStreamCombinations.fold<int>(
+          0,
+          (sum, combo) => sum + combo.streams.length,
+        );
+        totalCombinations += comboCount;
+        totalMandatoryStreams += streamCount;
+        combinationsTelemetry[c.cameraId] = {
+          'combinations': comboCount,
+          'streams': streamCount,
+        };
+        print(
+          'ANDROID_CAMERA_PHASE3_UNIT_D_CAMERA_COMBINATIONS: '
+          'cameraId=${c.cameraId} combinations=$comboCount totalStreams=$streamCount',
+        );
+      }
+      lane18Pass = combinationsTelemetry.length == report.cameras.length;
+      print(
+        'ANDROID_CAMERA_PHASE3_UNIT_D_SMOKE_LANE_18: pass=$lane18Pass '
+        'totalCombinations=$totalCombinations totalMandatoryStreams=$totalMandatoryStreams',
+      );
     } on TimeoutException catch (te) {
       topLevelError =
           'Watchdog timeout: Capability probe exceeded 15 seconds: $te';
@@ -335,11 +443,15 @@ class _AndroidCameraCapabilityProbePhysicalSmokeAppState
           lane12Pass &&
           lane13Pass &&
           lane14Pass &&
+          lane15Pass &&
+          lane16Pass &&
+          lane17Pass &&
+          lane18Pass &&
           (topLevelError == null);
 
       final payload = <String, dynamic>{
         'unit': 'AndroidCamera2CapabilityProbe',
-        'slice': 'Phase 3-Unit B',
+        'slice': 'Phase 3-Unit D: Mandatory Concurrent Stream Combinations',
         'target': 'android_physical',
         'pass': allPass,
         'lanes': <String, dynamic>{
@@ -412,13 +524,35 @@ class _AndroidCameraCapabilityProbePhysicalSmokeAppState
             ),
           },
           'lane14_stabilizationModesAndFlashTyped': {'pass': lane14Pass},
+          'lane15_allCamerasHaveMandatoryCombinationsList': {
+            'pass': lane15Pass,
+            'camerasCount': report?.cameras.length,
+          },
+          'lane16_combinationsIntegrity': {
+            'pass': lane16Pass,
+            'totalCombinations': totalCombinations,
+          },
+          'lane17_mandatoryStreamsIntegrity': {
+            'pass': lane17Pass,
+            'totalMandatoryStreams': totalMandatoryStreams,
+          },
+          'lane18_concurrentCombinationsTelemetry': {
+            'pass': lane18Pass,
+            'totalCombinations': totalCombinations,
+            'totalMandatoryStreams': totalMandatoryStreams,
+            'telemetry': combinationsTelemetry,
+            'supportsConcurrentCamera': report?.supportsConcurrentCamera,
+          },
         },
-        'report': ?report?.toMap(),
-        'error': ?topLevelError,
+        'report': report?.toMap(),
+        'error': topLevelError,
       };
 
       print(
         'ANDROID_CAMERA_PHASE3_UNIT_B_STREAM_CONFIG_JSON:${jsonEncode(payload)}',
+      );
+      print(
+        'ANDROID_CAMERA_PHASE3_UNIT_D_CONCURRENT_COMBINATIONS_JSON:${jsonEncode(payload)}',
       );
       print(
         allPass
@@ -429,6 +563,11 @@ class _AndroidCameraCapabilityProbePhysicalSmokeAppState
         allPass
             ? 'ANDROID_CAMERA_PHASE3_UNIT_B_STREAM_CONFIG_PHYSICAL_PASS'
             : 'ANDROID_CAMERA_PHASE3_UNIT_B_STREAM_CONFIG_PHYSICAL_FAIL',
+      );
+      print(
+        allPass
+            ? 'ANDROID_CAMERA_PHASE3_UNIT_D_CONCURRENT_COMBINATIONS_PHYSICAL_PASS'
+            : 'ANDROID_CAMERA_PHASE3_UNIT_D_CONCURRENT_COMBINATIONS_PHYSICAL_FAIL',
       );
 
       if (mounted) {

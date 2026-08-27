@@ -132,6 +132,213 @@ class VGCameraFpsRange {
   String toString() => 'VGCameraFpsRange(lower: $lower, upper: $upper)';
 }
 
+/// A single mandatory concurrent stream's characteristics, as reported by
+/// `CameraCharacteristics.MandatoryStreamInformation` (API 30+).
+@immutable
+class VGCameraMandatoryConcurrentStreamInfo {
+  const VGCameraMandatoryConcurrentStreamInfo({
+    required this.isInput,
+    required this.format,
+    required this.formatName,
+    required this.tenBitFormat,
+    required this.tenBitFormatName,
+    required this.is10BitCapable,
+    required this.isMaximumSize,
+    required this.isUltraHighResolution,
+    required this.streamUseCase,
+    required this.streamUseCaseName,
+    this.availableSizes = const <VGCameraSize>[],
+  });
+
+  /// Whether this stream is a reprocessing input stream.
+  final bool isInput;
+
+  /// Native `ImageFormat`/`PixelFormat` value for this stream.
+  final int format;
+
+  /// Symbolic name for [format] (e.g. `YUV_420_888`); unrecognised values
+  /// are preserved as `format_<n>`.
+  final String formatName;
+
+  /// Equivalent 10-bit format, or `-1` when unavailable (API < 34 or not
+  /// part of a 10-bit capable combination).
+  final int tenBitFormat;
+
+  /// Symbolic name for [tenBitFormat]; `none` when `-1`.
+  final String tenBitFormatName;
+
+  /// Whether this stream is part of a 10-bit capable combination (API 34+).
+  final bool is10BitCapable;
+
+  /// Whether this stream must be configured at the maximum supported size
+  /// (API 33+).
+  final bool isMaximumSize;
+
+  /// Whether this stream is an ultra-high-resolution sensor stream
+  /// (API 33+).
+  final bool isUltraHighResolution;
+
+  /// Native `CameraMetadata.SCALER_AVAILABLE_STREAM_USE_CASES_*` value
+  /// (API 33+); `0` (`DEFAULT`) when unavailable.
+  final int streamUseCase;
+
+  /// Symbolic name for [streamUseCase]; unrecognised values are preserved
+  /// as `unknown_<n>`.
+  final String streamUseCaseName;
+
+  /// Supported sizes for this stream, largest area first.
+  final List<VGCameraSize> availableSizes;
+
+  static VGCameraMandatoryConcurrentStreamInfo? fromMap(Object? raw) {
+    if (raw is! Map) return null;
+    return VGCameraMandatoryConcurrentStreamInfo(
+      isInput: raw['isInput'] as bool? ?? false,
+      format: (raw['format'] as num?)?.toInt() ?? -1,
+      formatName: (raw['formatName'] as String?) ?? 'none',
+      tenBitFormat: (raw['tenBitFormat'] as num?)?.toInt() ?? -1,
+      tenBitFormatName: (raw['tenBitFormatName'] as String?) ?? 'none',
+      is10BitCapable: raw['is10BitCapable'] as bool? ?? false,
+      isMaximumSize: raw['isMaximumSize'] as bool? ?? false,
+      isUltraHighResolution: raw['isUltraHighResolution'] as bool? ?? false,
+      streamUseCase: (raw['streamUseCase'] as num?)?.toInt() ?? 0,
+      streamUseCaseName: (raw['streamUseCaseName'] as String?) ?? 'DEFAULT',
+      availableSizes: VGCameraHardwareDeviceCapability._sizeList(
+        raw['availableSizes'],
+      ),
+    );
+  }
+
+  Map<String, Object?> toMap() {
+    return <String, Object?>{
+      'isInput': isInput,
+      'format': format,
+      'formatName': formatName,
+      'tenBitFormat': tenBitFormat,
+      'tenBitFormatName': tenBitFormatName,
+      'is10BitCapable': is10BitCapable,
+      'isMaximumSize': isMaximumSize,
+      'isUltraHighResolution': isUltraHighResolution,
+      'streamUseCase': streamUseCase,
+      'streamUseCaseName': streamUseCaseName,
+      'availableSizes': availableSizes
+          .map((s) => s.toMap())
+          .toList(growable: false),
+    };
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is VGCameraMandatoryConcurrentStreamInfo &&
+        other.isInput == isInput &&
+        other.format == format &&
+        other.formatName == formatName &&
+        other.tenBitFormat == tenBitFormat &&
+        other.tenBitFormatName == tenBitFormatName &&
+        other.is10BitCapable == is10BitCapable &&
+        other.isMaximumSize == isMaximumSize &&
+        other.isUltraHighResolution == isUltraHighResolution &&
+        other.streamUseCase == streamUseCase &&
+        other.streamUseCaseName == streamUseCaseName &&
+        listEquals(other.availableSizes, availableSizes);
+  }
+
+  @override
+  int get hashCode => Object.hash(
+    isInput,
+    format,
+    formatName,
+    tenBitFormat,
+    tenBitFormatName,
+    is10BitCapable,
+    isMaximumSize,
+    isUltraHighResolution,
+    streamUseCase,
+    streamUseCaseName,
+    Object.hashAll(availableSizes),
+  );
+
+  @override
+  String toString() =>
+      'VGCameraMandatoryConcurrentStreamInfo('
+      'isInput: $isInput, '
+      'format: $format, '
+      'formatName: $formatName, '
+      'tenBitFormat: $tenBitFormat, '
+      'tenBitFormatName: $tenBitFormatName, '
+      'is10BitCapable: $is10BitCapable, '
+      'isMaximumSize: $isMaximumSize, '
+      'isUltraHighResolution: $isUltraHighResolution, '
+      'streamUseCase: $streamUseCase, '
+      'streamUseCaseName: $streamUseCaseName, '
+      'availableSizes: $availableSizes)';
+}
+
+/// A single mandatory concurrent stream combination, as reported by
+/// `CameraCharacteristics.SCALER_MANDATORY_CONCURRENT_STREAM_COMBINATIONS`
+/// (API 30+).
+@immutable
+class VGCameraMandatoryConcurrentStreamCombination {
+  const VGCameraMandatoryConcurrentStreamCombination({
+    required this.description,
+    required this.isReprocessable,
+    this.streams = const <VGCameraMandatoryConcurrentStreamInfo>[],
+  });
+
+  /// Human-readable description of this combination.
+  final String description;
+
+  /// Whether this combination supports reprocessing.
+  final bool isReprocessable;
+
+  /// The streams that make up this combination.
+  final List<VGCameraMandatoryConcurrentStreamInfo> streams;
+
+  static VGCameraMandatoryConcurrentStreamCombination? fromMap(Object? raw) {
+    if (raw is! Map) return null;
+    final streamsRaw = raw['streams'];
+    final streams = streamsRaw is List
+        ? streamsRaw
+              .map(VGCameraMandatoryConcurrentStreamInfo.fromMap)
+              .whereType<VGCameraMandatoryConcurrentStreamInfo>()
+              .toList(growable: false)
+        : const <VGCameraMandatoryConcurrentStreamInfo>[];
+    return VGCameraMandatoryConcurrentStreamCombination(
+      description: (raw['description'] as String?) ?? '',
+      isReprocessable: raw['isReprocessable'] as bool? ?? false,
+      streams: streams,
+    );
+  }
+
+  Map<String, Object?> toMap() {
+    return <String, Object?>{
+      'description': description,
+      'isReprocessable': isReprocessable,
+      'streams': streams.map((s) => s.toMap()).toList(growable: false),
+    };
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is VGCameraMandatoryConcurrentStreamCombination &&
+        other.description == description &&
+        other.isReprocessable == isReprocessable &&
+        listEquals(other.streams, streams);
+  }
+
+  @override
+  int get hashCode =>
+      Object.hash(description, isReprocessable, Object.hashAll(streams));
+
+  @override
+  String toString() =>
+      'VGCameraMandatoryConcurrentStreamCombination('
+      'description: $description, '
+      'isReprocessable: $isReprocessable, '
+      'streams: $streams)';
+}
+
 /// A single camera device's static hardware capabilities, as reported by
 /// `CameraManager.getCameraCharacteristics` on Android.
 @immutable
@@ -154,6 +361,8 @@ class VGCameraHardwareDeviceCapability {
     this.opticalStabilizationModes = const <String>[],
     this.sensorActiveArraySize,
     this.sensorPixelArraySize,
+    this.mandatoryConcurrentStreamCombinations =
+        const <VGCameraMandatoryConcurrentStreamCombination>[],
   });
 
   /// Native Camera2 camera id string (`CameraManager.getCameraIdList()` entry).
@@ -211,6 +420,12 @@ class VGCameraHardwareDeviceCapability {
   /// Full sensor pixel array size, or `null` if unavailable.
   final VGCameraSize? sensorPixelArraySize;
 
+  /// Mandatory concurrent stream combinations this device must support
+  /// (`CameraCharacteristics.SCALER_MANDATORY_CONCURRENT_STREAM_COMBINATIONS`,
+  /// API 30+). Empty on older API levels or when unreported.
+  final List<VGCameraMandatoryConcurrentStreamCombination>
+  mandatoryConcurrentStreamCombinations;
+
   /// Parses a single camera entry. Returns `null` when [raw] is not a map or
   /// `cameraId` is absent/empty — the only field required to address a
   /// device on the native side.
@@ -237,7 +452,22 @@ class VGCameraHardwareDeviceCapability {
       opticalStabilizationModes: _stringList(raw['opticalStabilizationModes']),
       sensorActiveArraySize: VGCameraRect.fromMap(raw['sensorActiveArraySize']),
       sensorPixelArraySize: VGCameraSize.fromMap(raw['sensorPixelArraySize']),
+      mandatoryConcurrentStreamCombinations:
+          _mandatoryConcurrentStreamCombinationList(
+            raw['mandatoryConcurrentStreamCombinations'],
+          ),
     );
+  }
+
+  static List<VGCameraMandatoryConcurrentStreamCombination>
+  _mandatoryConcurrentStreamCombinationList(Object? raw) {
+    if (raw is! List) {
+      return const <VGCameraMandatoryConcurrentStreamCombination>[];
+    }
+    return raw
+        .map(VGCameraMandatoryConcurrentStreamCombination.fromMap)
+        .whereType<VGCameraMandatoryConcurrentStreamCombination>()
+        .toList(growable: false);
   }
 
   static List<String> _stringList(Object? raw) {
@@ -285,6 +515,10 @@ class VGCameraHardwareDeviceCapability {
       'opticalStabilizationModes': opticalStabilizationModes,
       'sensorActiveArraySize': sensorActiveArraySize?.toMap(),
       'sensorPixelArraySize': sensorPixelArraySize?.toMap(),
+      'mandatoryConcurrentStreamCombinations':
+          mandatoryConcurrentStreamCombinations
+              .map((c) => c.toMap())
+              .toList(growable: false),
     };
   }
 
@@ -311,7 +545,11 @@ class VGCameraHardwareDeviceCapability {
           opticalStabilizationModes,
         ) &&
         other.sensorActiveArraySize == sensorActiveArraySize &&
-        other.sensorPixelArraySize == sensorPixelArraySize;
+        other.sensorPixelArraySize == sensorPixelArraySize &&
+        listEquals(
+          other.mandatoryConcurrentStreamCombinations,
+          mandatoryConcurrentStreamCombinations,
+        );
   }
 
   @override
@@ -334,6 +572,7 @@ class VGCameraHardwareDeviceCapability {
       Object.hashAll(opticalStabilizationModes),
       sensorActiveArraySize,
       sensorPixelArraySize,
+      Object.hashAll(mandatoryConcurrentStreamCombinations),
     ),
   );
 
@@ -356,7 +595,9 @@ class VGCameraHardwareDeviceCapability {
       'videoStabilizationModes: $videoStabilizationModes, '
       'opticalStabilizationModes: $opticalStabilizationModes, '
       'sensorActiveArraySize: $sensorActiveArraySize, '
-      'sensorPixelArraySize: $sensorPixelArraySize)';
+      'sensorPixelArraySize: $sensorPixelArraySize, '
+      'mandatoryConcurrentStreamCombinations: '
+      '$mandatoryConcurrentStreamCombinations)';
 }
 
 /// Device-wide Android Camera2 hardware/thermal capability report, as
