@@ -31,14 +31,11 @@
 //     always fails with lastError="window_shader_unavailable_on_host".
 
 #include "vanguard/render/gles_backend.h"
+#include "gles_hardware_buffer_imports.h"
 
 #if defined(__ANDROID__)
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
-#endif
-
-#if !defined(_WIN32)
-#include <unistd.h>   // close()
 #endif
 
 #include <cmath>
@@ -70,6 +67,12 @@ struct GlesBackend::Impl {
     std::string lastError;
     uint32_t surfaceWidth = 0;
     uint32_t surfaceHeight = 0;
+
+    // Unit Y: AHardwareBuffer -> EGLImage -> GL_TEXTURE_2D import table.
+    // Owned regardless of platform; the helper itself preserves the prior
+    // stub behavior on non-Android host builds.
+    std::unique_ptr<GlesHardwareBufferImports> ahbImports =
+        std::make_unique<GlesHardwareBufferImports>();
 };
 
 // ---------------------------------------------------------------------------
@@ -212,6 +215,12 @@ bool GlesBackend::initialize() {
         return false;
     }
 
+    // Unit Y: resolve AHardwareBuffer/EGL-extension import symbols now that
+    // the offscreen EGL display/context is up. Failure to resolve symbols
+    // does not fail backend initialize(); importHardwareBuffer() will return
+    // kUnavailable instead.
+    impl_->ahbImports->initialize(reinterpret_cast<void*>(impl_->display));
+
     impl_->initialized = true;
     return true;
 #else
@@ -225,6 +234,11 @@ void GlesBackend::shutdown() {
     if (!impl_) {
         return;
     }
+
+    // Unit Y: destroy all active AHardwareBuffer import records (GL texture,
+    // EGLImage, AHB ref, stored acquireFenceFd) while the EGL context is
+    // still current, before tearing down the EGL context/display below.
+    impl_->ahbImports->shutdown();
 
 #if defined(__ANDROID__)
     if (impl_->display != EGL_NO_DISPLAY) {
@@ -670,44 +684,35 @@ bool GlesBackend::diagnosticPresentWindowShaderQuad(float red, float green, floa
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2C: AHardwareBuffer import stubs - GLES backend does not support this.
+// Phase 2C / Unit Y: AHardwareBuffer import - delegates to
+// GlesHardwareBufferImports, which preserves the prior unavailable-stub
+// behavior on non-Android host builds.
 // ---------------------------------------------------------------------------
 
 HardwareBufferImportResult GlesBackend::importHardwareBuffer(
-    void* /*hardwareBuffer*/,
+    void* hardwareBuffer,
     int acquireFenceFd,
     HardwareBufferHandle* outHandle,
     HardwareBufferDescriptor* outDescriptor)
 {
-    // Ownership of acquireFenceFd transfers at call entry; close it if valid.
-#if !defined(_WIN32)
-    if (acquireFenceFd >= 0) {
-        ::close(acquireFenceFd);
-    }
-#else
-    (void)acquireFenceFd;
-#endif
-    if (outHandle) {
-        *outHandle = kInvalidHardwareBufferHandle;
-    }
-    if (outDescriptor) {
-        *outDescriptor = HardwareBufferDescriptor{};
-    }
-    return HardwareBufferImportResult::kUnavailable;
+    HardwareBufferImportResult result = impl_->ahbImports->importBuffer(
+        hardwareBuffer, acquireFenceFd, outHandle, outDescriptor);
+    impl_->lastError = impl_->ahbImports->lastError();
+    return result;
 }
 
 HardwareBufferImportResult GlesBackend::releaseHardwareBuffer(
-    HardwareBufferHandle /*handle*/,
+    HardwareBufferHandle handle,
     int* outReleaseFenceFd)
 {
-    if (outReleaseFenceFd) {
-        *outReleaseFenceFd = -1;
-    }
-    return HardwareBufferImportResult::kUnavailable;
+    HardwareBufferImportResult result =
+        impl_->ahbImports->releaseBuffer(handle, outReleaseFenceFd);
+    impl_->lastError = impl_->ahbImports->lastError();
+    return result;
 }
 
-bool GlesBackend::hasHardwareBuffer(HardwareBufferHandle /*handle*/) const {
-    return false;
+bool GlesBackend::hasHardwareBuffer(HardwareBufferHandle handle) const {
+    return impl_->ahbImports->hasBuffer(handle);
 }
 
 // ---------------------------------------------------------------------------

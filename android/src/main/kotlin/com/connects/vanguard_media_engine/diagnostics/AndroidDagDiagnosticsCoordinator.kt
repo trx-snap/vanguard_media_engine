@@ -47,6 +47,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1VGlesSurfaceSmoke",
             "runAndroidDagPhase1WGlesWindowPresentSmoke",
             "runAndroidDagPhase1XGlesShaderQuadSmoke",
+            "runAndroidDagPhase1YGlesImportSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -80,6 +81,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1VGlesSurfaceSmoke" -> runPhase1VGlesSurfaceSmoke(args, result)
             "runAndroidDagPhase1WGlesWindowPresentSmoke" -> runPhase1WGlesWindowPresentSmoke(args, result)
             "runAndroidDagPhase1XGlesShaderQuadSmoke" -> runPhase1XGlesShaderQuadSmoke(args, result)
+            "runAndroidDagPhase1YGlesImportSmoke" -> runPhase1YGlesImportSmoke(args, result)
             else -> return false
         }
         return true
@@ -420,6 +422,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_SHADER_QUAD_SMOKE_FAILED",
                         "runAndroidDagPhase1XGlesShaderQuadSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit Y: Android GLES backend AHardwareBuffer RGBA import foundation smoke ──
+    private fun runPhase1YGlesImportSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesImportSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_IMPORT_SMOKE_FAILED",
+                        "runAndroidDagPhase1YGlesImportSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

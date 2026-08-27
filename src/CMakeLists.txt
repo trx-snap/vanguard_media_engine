@@ -39,7 +39,10 @@ target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include"
 )
 target_link_libraries(vanguard_render_vulkan PRIVATE vanguard_render_shared vanguard_core)
 
-add_library(vanguard_render_gles STATIC "render/gles/src/gles_backend.cpp")
+add_library(vanguard_render_gles STATIC
+    "render/gles/src/gles_backend.cpp"
+    "render/gles/src/gles_hardware_buffer_imports.cpp"
+)
 target_include_directories(vanguard_render_gles PUBLIC "render/gles/include")
 target_link_libraries(vanguard_render_gles PRIVATE vanguard_render_shared vanguard_core)
 
@@ -65,6 +68,7 @@ if (ANDROID)
     "platform/android/src/android_phase4b1_texture_playback_jni.cpp"
     "platform/android/src/android_phase5_encoder_smoke_jni.cpp"
     "platform/android/src/android_gles_backend_smoke_jni.cpp"
+    "platform/android/src/android_gles_import_smoke_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
 

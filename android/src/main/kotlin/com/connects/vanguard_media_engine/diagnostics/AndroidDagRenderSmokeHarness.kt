@@ -1126,4 +1126,156 @@ object AndroidDagRenderSmokeHarness {
             "clearAfterShader=not_run;hasSurfaceAfterShader=false;surfaceKindAfterShader=none;widthAfterShader=0;heightAfterShader=0;" +
             "detach=not_run;surfaceKindAfterDetach=none;shutdown=not_run;idempotentShutdown=not_run;" +
             "import=not_run;renderFrame=not_run;proofBoundary=gles_window_shader_quad_no_import_no_renderFrame;lastError=$reason"
+
+    // ── Phase 1-Unit Y: Android GLES backend AHardwareBuffer RGBA import foundation smoke ──
+    private const val RESULT_MARKER_PHASE1Y = "ANDROID_GLES_IMPORT_UNIT_Y_NATIVE_RESULT"
+
+    fun runGlesImportSmoke(width: Int = 64, height: Int = 64): Map<String, Any?> {
+        var bufferA: HardwareBuffer? = null
+        var bufferB: HardwareBuffer? = null
+        var raw = glesImportFailure("not_run")
+
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                raw = glesImportFailure("api_below_26")
+                return parseGlesImportResult(raw)
+            }
+            if (width <= 0 || height <= 0) {
+                raw = glesImportFailure("invalid_dimensions")
+                return parseGlesImportResult(raw)
+            }
+
+            bufferA = HardwareBuffer.create(
+                width,
+                height,
+                HardwareBuffer.RGBA_8888,
+                1,
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+            )
+            bufferB = HardwareBuffer.create(
+                width,
+                height,
+                HardwareBuffer.RGBA_8888,
+                1,
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+            )
+
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1YGlesImportSmoke(
+                bufferA,
+                bufferB,
+                width,
+                height,
+            )
+            return parseGlesImportResult(raw)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = glesImportFailure("exception:$reason")
+            return parseGlesImportResult(raw)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1Y $raw")
+            try {
+                bufferA?.close()
+            } catch (_: Throwable) {
+            }
+            try {
+                bufferB?.close()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun parseGlesImportResult(raw: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val preInitImport = parsed["preInitImport"] ?: "not_run"
+        val preInitHandle = parsed["preInitHandle"]?.toLongOrNull() ?: 0L
+        val preInitDescriptorZero = parsed["preInitDescriptorZero"]?.equals("true", ignoreCase = true) ?: false
+        val initialize = parsed["initialize"] ?: "not_run"
+        val nullBufferImport = parsed["nullBufferImport"] ?: "not_run"
+        val nullHandleImport = parsed["nullHandleImport"] ?: "not_run"
+        val nullDescriptorImport = parsed["nullDescriptorImport"] ?: "not_run"
+        val validImportA = parsed["validImportA"] ?: "not_run"
+        val handleA = parsed["handleA"]?.toLongOrNull() ?: 0L
+        val descriptorWidth = parsed["descriptorWidth"]?.toIntOrNull() ?: 0
+        val descriptorHeight = parsed["descriptorHeight"]?.toIntOrNull() ?: 0
+        val descriptorLayers = parsed["descriptorLayers"]?.toIntOrNull() ?: 0
+        val descriptorFormat = parsed["descriptorFormat"]?.toIntOrNull() ?: 0
+        val descriptorUsageSampled = parsed["descriptorUsageSampled"]?.equals("true", ignoreCase = true) ?: false
+        val hasAAfterImport = parsed["hasAAfterImport"]?.equals("true", ignoreCase = true) ?: false
+        val duplicateImport = parsed["duplicateImport"] ?: "not_run"
+        val duplicateHandle = parsed["duplicateHandle"]?.toLongOrNull() ?: 0L
+        val hasAAfterDuplicate = parsed["hasAAfterDuplicate"]?.equals("true", ignoreCase = true) ?: false
+        val renderFrame = parsed["renderFrame"] ?: "not_run"
+        val validImportB = parsed["validImportB"] ?: "not_run"
+        val handleB = parsed["handleB"]?.toLongOrNull() ?: 0L
+        val distinctHandles = parsed["distinctHandles"]?.equals("true", ignoreCase = true) ?: false
+        val hasBAfterImport = parsed["hasBAfterImport"]?.equals("true", ignoreCase = true) ?: false
+        val releaseA = parsed["releaseA"] ?: "not_run"
+        val releaseAFence = parsed["releaseAFence"]?.toIntOrNull() ?: -1
+        val hasAAfterRelease = parsed["hasAAfterRelease"]?.equals("true", ignoreCase = true) ?: false
+        val doubleReleaseA = parsed["doubleReleaseA"] ?: "not_run"
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val hasBAfterShutdown = parsed["hasBAfterShutdown"]?.equals("true", ignoreCase = true) ?: false
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_ahb_rgba_import_no_renderFrame"
+        val lastError = parsed["lastError"] ?: ""
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "preInitImport" to preInitImport,
+            "preInitHandle" to preInitHandle,
+            "preInitDescriptorZero" to preInitDescriptorZero,
+            "initialize" to initialize,
+            "nullBufferImport" to nullBufferImport,
+            "nullHandleImport" to nullHandleImport,
+            "nullDescriptorImport" to nullDescriptorImport,
+            "validImportA" to validImportA,
+            "handleA" to handleA,
+            "descriptorWidth" to descriptorWidth,
+            "descriptorHeight" to descriptorHeight,
+            "descriptorLayers" to descriptorLayers,
+            "descriptorFormat" to descriptorFormat,
+            "descriptorUsageSampled" to descriptorUsageSampled,
+            "hasAAfterImport" to hasAAfterImport,
+            "duplicateImport" to duplicateImport,
+            "duplicateHandle" to duplicateHandle,
+            "hasAAfterDuplicate" to hasAAfterDuplicate,
+            "renderFrame" to renderFrame,
+            "validImportB" to validImportB,
+            "handleB" to handleB,
+            "distinctHandles" to distinctHandles,
+            "hasBAfterImport" to hasBAfterImport,
+            "releaseA" to releaseA,
+            "releaseAFence" to releaseAFence,
+            "hasAAfterRelease" to hasAAfterRelease,
+            "doubleReleaseA" to doubleReleaseA,
+            "shutdown" to shutdown,
+            "hasBAfterShutdown" to hasBAfterShutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "proofBoundary" to proofBoundary,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun glesImportFailure(reason: String): String =
+        "status=FAIL;preInitImport=$reason;preInitHandle=0;preInitDescriptorZero=false;" +
+            "initialize=not_run;nullBufferImport=not_run;nullHandleImport=not_run;nullDescriptorImport=not_run;" +
+            "validImportA=not_run;handleA=0;descriptorWidth=0;descriptorHeight=0;descriptorLayers=0;descriptorFormat=0;" +
+            "descriptorUsageSampled=false;hasAAfterImport=false;duplicateImport=not_run;duplicateHandle=0;hasAAfterDuplicate=false;" +
+            "renderFrame=not_run;validImportB=not_run;handleB=0;distinctHandles=false;hasBAfterImport=false;" +
+            "releaseA=not_run;releaseAFence=-1;hasAAfterRelease=false;doubleReleaseA=not_run;shutdown=not_run;" +
+            "hasBAfterShutdown=false;idempotentShutdown=not_run;proofBoundary=gles_ahb_rgba_import_no_renderFrame;lastError=$reason"
 }

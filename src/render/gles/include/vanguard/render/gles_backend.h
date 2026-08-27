@@ -6,13 +6,16 @@
 namespace vanguard {
 namespace render {
 
-// Phase Unit U/V/W/X: GlesBackend owns an offscreen EGL/GLES lifecycle on
+// Phase Unit U/V/W/X/Y: GlesBackend owns an offscreen EGL/GLES lifecycle on
 // Android, plus (Unit V) attach/detach of a window EGLSurface built from a
 // borrowed ANativeWindow*, plus (Unit W) a diagnostic clear/swap presentation
 // on an already-attached window surface, plus (Unit X) a diagnostic minimal
-// ES2 shader-quad draw/swap on an already-attached window surface. EGL/GLES
-// headers must never appear in this public header; all such state lives
-// exclusively in gles_backend.cpp behind the Impl pimpl.
+// ES2 shader-quad draw/swap on an already-attached window surface, plus
+// (Unit Y) AHardwareBuffer import/release for RGBA_8888/RGBX_8888
+// GPU-sampled buffers (EGLImage + GL_TEXTURE_2D only; no renderFrame()
+// sampling support yet). EGL/GLES/Android headers must never appear in this
+// public header; all such state lives exclusively in gles_backend.cpp and
+// the private GlesHardwareBufferImports helper behind the Impl pimpl.
 class GlesBackend : public RenderBackend {
 public:
     GlesBackend();
@@ -36,7 +39,10 @@ public:
     void detachSurface() override;
     bool hasSurface() const override;
 
-    // Phase 2C: AHardwareBuffer import - not supported on GLES backend.
+    // Phase 2C / Unit Y: AHardwareBuffer import. On Android, supports
+    // RGBA_8888/RGBX_8888 GPU-sampled buffers only (see
+    // GlesHardwareBufferImports); all other formats/usages are rejected.
+    // Remains unavailable on non-Android host builds.
     HardwareBufferImportResult importHardwareBuffer(
         void* hardwareBuffer,
         int acquireFenceFd,

@@ -146,6 +146,14 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // ── Phase 1-Unit Y: Android GLES backend AHardwareBuffer RGBA import foundation smoke ──
+    external fun runAndroidDagPhase1YGlesImportSmoke(
+        bufferA: HardwareBuffer,
+        bufferB: HardwareBuffer,
+        width: Int,
+        height: Int,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
