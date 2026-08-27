@@ -11,14 +11,17 @@
 // and not exposed through the public gles_backend.h.
 //
 // Unit Y scope: RGBA_8888/RGBX_8888 GPU_SAMPLED_IMAGE buffers only. No
-// renderFrame(), shader sampling, YUV/external-texture formats, or waiting
-// on the acquire fence's native fence sync (the fd is owned/closed, never
-// waited on).
+// renderFrame(), shader sampling, or YUV/external-texture formats.
 //
 // Unit Z adds textureForHandle(), a read-only accessor to the GL texture
 // name already owned by an active import record, so GlesBackend::renderFrame
 // can sample it. It does not change import/release/duplicate/shutdown
 // ownership or behavior.
+//
+// Unit AE: importBuffer() waits on and closes the caller-supplied acquire
+// fence (bounded poll(), fail-closed on timeout/error) before importing; no
+// release fence is produced. No EGL native-fence GPU chaining, YUV/external
+// texture, multi-node composition, or product UI wiring.
 
 #pragma once
 #include "vanguard/render/hardware_buffer_import.h"
@@ -50,8 +53,11 @@ public:
 
     // hardwareBuffer  - non-null AHardwareBuffer* cast to void*.
     // acquireFenceFd  - ownership transfers at call entry on all return
-    //                   paths; closed on failure, stored (unwaited) on
-    //                   success.
+    //                   paths. If < 0, ignored. If >= 0, waited on
+    //                   synchronously (bounded poll(), 1000ms) before the
+    //                   AHardwareBuffer is acquired/described/imported, then
+    //                   always closed exactly once; never stored. Wait
+    //                   timeout or failure fails the import closed.
     // outHandle       - non-null; set to kInvalidHardwareBufferHandle on
     //                   failure.
     // outDescriptor   - non-null; zeroed on failure.

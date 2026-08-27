@@ -1,5 +1,7 @@
 // gles_hardware_buffer_imports.cpp
 // Phase 1 Unit Y: AHardwareBuffer -> EGLImage -> GL_TEXTURE_2D import table.
+// Phase 1 Unit AE: importBuffer() synchronously waits on and closes the
+// caller-supplied acquire fence before importing.
 //
 // RGBA_8888/RGBX_8888 GPU-sampled buffers only. AHardwareBuffer_acquire/
 // release/describe are loaded via dlopen/dlsym from libandroid.so (no strong
@@ -7,6 +9,15 @@
 // eglDestroyImageKHR, and glEGLImageTargetTexture2DOES are loaded via
 // eglGetProcAddress, since extension entry points are not guaranteed to be
 // strong-linked symbols even though EGL/GLESv3 are linked.
+//
+// Unit AE: if the caller passes a valid acquireFenceFd (>= 0), it is waited
+// on with a bounded poll() (1000ms) before AHardwareBuffer acquire/describe/
+// EGLImage creation; POLLIN within the timeout is treated as signaled, and
+// timeout/error/POLLERR/POLLNVAL fail the import closed. The fd is always
+// closed exactly once after the wait attempt and never stored in an
+// ImportRecord. No release fence is produced, no EGL native-fence GPU
+// chaining, no YUV/external texture, no multi-node composition, and no
+// product UI wiring.
 //
 // Android-only: real implementation is inside #if defined(__ANDROID__).
 // Non-Android translation unit compiles to stubs only, preserving the prior
@@ -24,6 +35,7 @@
 #include <android/hardware_buffer.h>
 
 #include <dlfcn.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -32,6 +44,41 @@
 
 namespace vanguard {
 namespace render {
+
+// ---------------------------------------------------------------------------
+// Unit AE: bounded synchronous acquire-fence wait.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Bounded wait applied to a caller-supplied acquire fence fd before an
+// AHardwareBuffer is acquired/described/imported into an EGLImage. Fail-
+// closed: only a POLLIN-signaled fd within the timeout counts as success.
+constexpr int kAcquireFenceWaitTimeoutMs = 1000;
+
+enum class FenceWaitOutcome { kSignaled, kTimeout, kFailed };
+
+FenceWaitOutcome waitOnAcquireFence(int fd) {
+    struct pollfd pfd{};
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    const int pollResult = ::poll(&pfd, 1, kAcquireFenceWaitTimeoutMs);
+    if (pollResult == 0) {
+        return FenceWaitOutcome::kTimeout;
+    }
+    if (pollResult < 0) {
+        return FenceWaitOutcome::kFailed;
+    }
+    if (pfd.revents & (POLLERR | POLLNVAL)) {
+        return FenceWaitOutcome::kFailed;
+    }
+    if (pfd.revents & POLLIN) {
+        return FenceWaitOutcome::kSignaled;
+    }
+    return FenceWaitOutcome::kFailed;
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // AHardwareBuffer function pointer typedefs (loaded from libandroid.so).
@@ -65,7 +112,10 @@ struct GlesHardwareBufferImports::Impl {
         AHardwareBuffer* ahbPtr = nullptr;   // acquired ref
         EGLImageKHR      image = EGL_NO_IMAGE_KHR;
         GLuint           texture = 0;
-        int              acquireFenceFd = -1; // owned, never waited on
+        int              acquireFenceFd = -1; // Unit AE: always -1 -- the
+                                               // acquire fence is waited on
+                                               // and closed before import
+                                               // completes, never stored.
     };
 
     std::unordered_map<HardwareBufferHandle, ImportRecord> records;
@@ -73,7 +123,9 @@ struct GlesHardwareBufferImports::Impl {
 
     // Destroys a single record's resources. Does NOT remove it from any
     // container. Order: GL texture -> EGLImage -> AHardwareBuffer ref ->
-    // stored acquireFenceFd.
+    // stored acquireFenceFd (Unit AE: always -1 by the time a record is
+    // constructed, since the acquire fence is waited on and closed inside
+    // importBuffer(); this close is retained defensively).
     void destroyRecord(ImportRecord& rec) {
         if (rec.texture != 0) {
             glDeleteTextures(1, &rec.texture);
@@ -220,6 +272,25 @@ HardwareBufferImportResult GlesHardwareBufferImports::importBuffer(
         }
     }
 
+    // --- Unit AE: bounded synchronous wait on the acquire fence, if any,
+    // before AHardwareBuffer acquire/describe/EGLImage creation. The fd is
+    // closed exactly once here regardless of outcome and never stored. ---
+    if (acquireFenceFd >= 0) {
+        const int fenceFd = acquireFenceFd;
+        acquireFenceFd = -1;
+        const FenceWaitOutcome outcome = waitOnAcquireFence(fenceFd);
+        ::close(fenceFd);
+
+        if (outcome == FenceWaitOutcome::kTimeout) {
+            return fail(HardwareBufferImportResult::kUnavailable,
+                        "ahb_import_acquire_fence_wait_timeout", nullptr);
+        }
+        if (outcome != FenceWaitOutcome::kSignaled) {
+            return fail(HardwareBufferImportResult::kUnavailable,
+                        "ahb_import_acquire_fence_wait_failed", nullptr);
+        }
+    }
+
     // --- Acquire AHardwareBuffer ref ---
     s.fnAcquire(ahbRaw);
     AHardwareBuffer* ahbRef = ahbRaw;
@@ -294,8 +365,10 @@ HardwareBufferImportResult GlesHardwareBufferImports::importBuffer(
     rec.ahbPtr = ahbRef;
     rec.image = image;
     rec.texture = texture;
-    rec.acquireFenceFd = acquireFenceFd; // ownership now held by the record
-    acquireFenceFd = -1;
+    // Unit AE: acquireFenceFd is already -1 here -- either the caller passed
+    // no fence, or it was waited on and closed above. Never store a waited
+    // fd in the record.
+    rec.acquireFenceFd = acquireFenceFd;
 
     s.records.emplace(handle, rec);
 

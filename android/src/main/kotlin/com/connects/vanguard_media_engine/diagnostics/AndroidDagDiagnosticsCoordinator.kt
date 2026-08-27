@@ -52,6 +52,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ABGlesReadPixelsSmoke",
             "runAndroidDagPhase1ACGlesRenderFrameContentSmoke",
             "runAndroidDagPhase1ADGlesRenderFrameTransformMappingSmoke",
+            "runAndroidDagPhase1AEGlesAcquireFenceSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -90,6 +91,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ABGlesReadPixelsSmoke" -> runPhase1ABGlesReadPixelsSmoke(args, result)
             "runAndroidDagPhase1ACGlesRenderFrameContentSmoke" -> runPhase1ACGlesRenderFrameContentSmoke(args, result)
             "runAndroidDagPhase1ADGlesRenderFrameTransformMappingSmoke" -> runPhase1ADGlesRenderFrameTransformMappingSmoke(args, result)
+            "runAndroidDagPhase1AEGlesAcquireFenceSmoke" -> runPhase1AEGlesAcquireFenceSmoke(args, result)
             else -> return false
         }
         return true
@@ -530,6 +532,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_RENDER_FRAME_TRANSFORM_MAPPING_SMOKE_FAILED",
                         "runAndroidDagPhase1ADGlesRenderFrameTransformMappingSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AE: Android GLES backend AHardwareBuffer acquire-fence wait/close foundation smoke ──
+    private fun runPhase1AEGlesAcquireFenceSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesAcquireFenceSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_ACQUIRE_FENCE_SMOKE_FAILED",
+                        "runAndroidDagPhase1AEGlesAcquireFenceSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

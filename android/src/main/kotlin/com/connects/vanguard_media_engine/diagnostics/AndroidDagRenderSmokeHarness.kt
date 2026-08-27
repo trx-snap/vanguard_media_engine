@@ -2176,4 +2176,160 @@ object AndroidDagRenderSmokeHarness {
             "allTransformsPass=false;releaseBuffer=not_run;releaseFence=-1;hasAfterRelease=false;postReleaseDiagnosticRender=not_run;" +
             "postReleaseLastError=;detach=not_run;surfaceKindAfterDetach=none;postDetachRead=not_run;postDetachLastError=;" +
             "shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_renderFrame_asymmetric_uv_mapping_rgba_quadrants_no_swap_no_yuv_no_fence_no_product;lastError=$reason"
+
+    // ── Phase 1-Unit AE: Android GLES backend AHardwareBuffer acquire-fence wait/close foundation smoke ──
+    private const val RESULT_MARKER_PHASE1AE = "ANDROID_GLES_ACQUIRE_FENCE_UNIT_AE_NATIVE_RESULT"
+
+    fun runGlesAcquireFenceSmoke(width: Int = 64, height: Int = 64): Map<String, Any?> {
+        var buffer: HardwareBuffer? = null
+        var raw = glesAcquireFenceFailure("not_run")
+
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                raw = glesAcquireFenceFailure("api_below_26")
+                return parseGlesAcquireFenceResult(raw)
+            }
+            if (width <= 0 || height <= 0) {
+                raw = glesAcquireFenceFailure("invalid_dimensions")
+                return parseGlesAcquireFenceResult(raw)
+            }
+
+            buffer = HardwareBuffer.create(
+                width,
+                height,
+                HardwareBuffer.RGBA_8888,
+                1,
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+            )
+
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1AEGlesAcquireFenceSmoke(
+                buffer,
+                width,
+                height,
+            )
+            return parseGlesAcquireFenceResult(raw)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = glesAcquireFenceFailure("exception:$reason")
+            return parseGlesAcquireFenceResult(raw)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1AE $raw")
+            try {
+                buffer?.close()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun parseGlesAcquireFenceResult(raw: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val clientVersion = parsed["clientVersion"]?.toIntOrNull() ?: 0
+        val vendor = parsed["vendor"] ?: ""
+        val renderer = parsed["renderer"] ?: ""
+        val version = parsed["version"] ?: ""
+        val symbolsResolved = parsed["symbolsResolved"]?.equals("true", ignoreCase = true) ?: false
+        val nativeFenceExtension = parsed["nativeFenceExtension"] ?: "not_run"
+        val preInitImport = parsed["preInitImport"] ?: "not_run"
+        val preInitHandle = parsed["preInitHandle"]?.toLongOrNull() ?: 0L
+        val preInitDescriptorZero = parsed["preInitDescriptorZero"]?.equals("true", ignoreCase = true) ?: false
+        val initialize = parsed["initialize"] ?: "not_run"
+        val invalidFenceImport = parsed["invalidFenceImport"] ?: "not_run"
+        val invalidFenceLastError = parsed["invalidFenceLastError"] ?: ""
+        val invalidFenceDescriptorZero = parsed["invalidFenceDescriptorZero"]?.equals("true", ignoreCase = true) ?: false
+        val invalidFenceHandle = parsed["invalidFenceHandle"]?.toLongOrNull() ?: 0L
+        val invalidFenceClosed = parsed["invalidFenceClosed"]?.equals("true", ignoreCase = true) ?: false
+        val timeoutImport = parsed["timeoutImport"] ?: "not_run"
+        val timeoutLastError = parsed["timeoutLastError"] ?: ""
+        val timeoutDescriptorZero = parsed["timeoutDescriptorZero"]?.equals("true", ignoreCase = true) ?: false
+        val timeoutHandle = parsed["timeoutHandle"]?.toLongOrNull() ?: 0L
+        val timeoutFdClosed = parsed["timeoutFdClosed"]?.equals("true", ignoreCase = true) ?: false
+        val signaledFenceCreate = parsed["signaledFenceCreate"] ?: "not_run"
+        val signaledFenceDup = parsed["signaledFenceDup"] ?: "not_run"
+        val signaledFenceFd = parsed["signaledFenceFd"]?.toIntOrNull() ?: -1
+        val signaledImport = parsed["signaledImport"] ?: "not_run"
+        val signaledFdClosed = parsed["signaledFdClosed"]?.equals("true", ignoreCase = true) ?: false
+        val signaledHandle = parsed["signaledHandle"]?.toLongOrNull() ?: 0L
+        val descriptorWidth = parsed["descriptorWidth"]?.toIntOrNull() ?: 0
+        val descriptorHeight = parsed["descriptorHeight"]?.toIntOrNull() ?: 0
+        val descriptorLayers = parsed["descriptorLayers"]?.toIntOrNull() ?: 0
+        val descriptorFormat = parsed["descriptorFormat"]?.toIntOrNull() ?: 0
+        val descriptorUsageSampled = parsed["descriptorUsageSampled"]?.equals("true", ignoreCase = true) ?: false
+        val hasAfterImport = parsed["hasAfterImport"]?.equals("true", ignoreCase = true) ?: false
+        val release = parsed["release"] ?: "not_run"
+        val releaseFence = parsed["releaseFence"]?.toIntOrNull() ?: -1
+        val hasAfterRelease = parsed["hasAfterRelease"]?.equals("true", ignoreCase = true) ?: false
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_no_release_fence_no_product"
+        val lastError = parsed["lastError"] ?: ""
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "clientVersion" to clientVersion,
+            "vendor" to vendor,
+            "renderer" to renderer,
+            "version" to version,
+            "symbolsResolved" to symbolsResolved,
+            "nativeFenceExtension" to nativeFenceExtension,
+            "preInitImport" to preInitImport,
+            "preInitHandle" to preInitHandle,
+            "preInitDescriptorZero" to preInitDescriptorZero,
+            "initialize" to initialize,
+            "invalidFenceImport" to invalidFenceImport,
+            "invalidFenceLastError" to invalidFenceLastError,
+            "invalidFenceDescriptorZero" to invalidFenceDescriptorZero,
+            "invalidFenceHandle" to invalidFenceHandle,
+            "invalidFenceClosed" to invalidFenceClosed,
+            "timeoutImport" to timeoutImport,
+            "timeoutLastError" to timeoutLastError,
+            "timeoutDescriptorZero" to timeoutDescriptorZero,
+            "timeoutHandle" to timeoutHandle,
+            "timeoutFdClosed" to timeoutFdClosed,
+            "signaledFenceCreate" to signaledFenceCreate,
+            "signaledFenceDup" to signaledFenceDup,
+            "signaledFenceFd" to signaledFenceFd,
+            "signaledImport" to signaledImport,
+            "signaledFdClosed" to signaledFdClosed,
+            "signaledHandle" to signaledHandle,
+            "descriptorWidth" to descriptorWidth,
+            "descriptorHeight" to descriptorHeight,
+            "descriptorLayers" to descriptorLayers,
+            "descriptorFormat" to descriptorFormat,
+            "descriptorUsageSampled" to descriptorUsageSampled,
+            "hasAfterImport" to hasAfterImport,
+            "release" to release,
+            "releaseFence" to releaseFence,
+            "hasAfterRelease" to hasAfterRelease,
+            "shutdown" to shutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "proofBoundary" to proofBoundary,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun glesAcquireFenceFailure(reason: String): String =
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;symbolsResolved=false;" +
+            "nativeFenceExtension=not_run;preInitImport=not_run;preInitHandle=0;preInitDescriptorZero=false;" +
+            "initialize=not_run;invalidFenceImport=not_run;invalidFenceLastError=none;invalidFenceDescriptorZero=false;" +
+            "invalidFenceHandle=0;invalidFenceClosed=false;timeoutImport=not_run;timeoutLastError=none;" +
+            "timeoutDescriptorZero=false;timeoutHandle=0;timeoutFdClosed=false;signaledFenceCreate=not_run;" +
+            "signaledFenceDup=not_run;signaledFenceFd=-1;signaledImport=not_run;signaledFdClosed=false;" +
+            "signaledHandle=0;descriptorWidth=0;descriptorHeight=0;descriptorLayers=0;descriptorFormat=0;" +
+            "descriptorUsageSampled=false;hasAfterImport=false;release=not_run;releaseFence=-1;" +
+            "hasAfterRelease=false;shutdown=not_run;idempotentShutdown=not_run;" +
+            "proofBoundary=gles_ahb_rgba_import_acquire_fence_wait_close_no_yuv_no_release_fence_no_product;lastError=$reason"
 }

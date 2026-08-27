@@ -24,8 +24,11 @@ namespace render {
 // renderFrame(handle, transform) draw path but intentionally omits
 // eglSwapBuffers so a physical harness can pair it with
 // diagnosticReadPixels() to verify rendered texture content before
-// presentation. No product pixel-readback API, no YUV/
-// external texture, no fence sync, no product wiring. EGL/GLES/
+// presentation, plus (Unit AE) importHardwareBuffer() synchronously waiting
+// on and closing the caller-supplied acquire fence (bounded poll(),
+// fail-closed on timeout/error) before import. No product pixel-readback
+// API, no YUV/external texture, no release fence, no EGL native-fence GPU
+// chaining, no multi-node composition, no product UI wiring. EGL/GLES/
 // Android headers must never appear in this public header; all such state
 // lives exclusively in gles_backend.cpp and the private
 // GlesHardwareBufferImports / GlesTextureFrameRenderer helpers behind the
@@ -57,6 +60,11 @@ public:
     // RGBA_8888/RGBX_8888 GPU-sampled buffers only (see
     // GlesHardwareBufferImports); all other formats/usages are rejected.
     // Remains unavailable on non-Android host builds.
+    //
+    // Unit AE: if acquireFenceFd >= 0, it is waited on synchronously
+    // (bounded poll(), 1000ms) before the buffer is imported, then always
+    // closed exactly once; never stored. Wait timeout or failure fails the
+    // import closed. No release fence is produced.
     HardwareBufferImportResult importHardwareBuffer(
         void* hardwareBuffer,
         int acquireFenceFd,
@@ -83,8 +91,10 @@ public:
     // non-cardinal rotations normalize to identity) on the attached window
     // EGLSurface and swaps. Same preconditions and failure states as
     // renderFrame(handle); see RenderFrameResult. No pixel readback/content
-    // proof, no YUV/external texture, no fence sync, no product wiring.
-    // Unavailable on non-Android host builds.
+    // proof, no YUV/external texture, no product wiring. (The acquire fence
+    // for `handle` was already waited on and closed during
+    // importHardwareBuffer(); see Unit AE. This call performs no fence sync
+    // of its own.) Unavailable on non-Android host builds.
     RenderFrameResult renderFrame(HardwareBufferHandle handle,
                                   const VideoFrameTransform& transform) override;
 
