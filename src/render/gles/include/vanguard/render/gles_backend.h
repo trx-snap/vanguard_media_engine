@@ -19,7 +19,12 @@ namespace render {
 // transform) support for rotationDegrees 0/90/180/270 plus
 // mirrorHorizontal via shared UV mapping, plus (Unit AB) a diagnostic
 // glReadPixels() seam over the attached window surface for later physical
-// pixel-content verification. No product pixel-readback API, no YUV/
+// pixel-content verification, plus (Unit AC) a diagnostic no-swap
+// renderFrame seam (diagnosticRenderFrameForReadback()) that shares the
+// renderFrame(handle, transform) draw path but intentionally omits
+// eglSwapBuffers so a physical harness can pair it with
+// diagnosticReadPixels() to verify rendered texture content before
+// presentation. No product pixel-readback API, no YUV/
 // external texture, no fence sync, no product wiring. EGL/GLES/
 // Android headers must never appear in this public header; all such state
 // lives exclusively in gles_backend.cpp and the private
@@ -160,6 +165,30 @@ public:
                               uint32_t height,
                               uint8_t* outPixels,
                               uint64_t outPixelCapacityBytes);
+
+    // Unit AC: draws the imported GL_TEXTURE_2D identified by handle as a
+    // full-window textured quad on the attached window EGLSurface using the
+    // same source texture lookup and transformed textured-quad draw path as
+    // renderFrame(handle, transform), but intentionally does not call
+    // eglSwapBuffers, so a physical harness can call diagnosticReadPixels()
+    // against the still-unswapped window surface to verify rendered texture
+    // content.
+    //
+    // Preconditions: an initialized backend, a window surface already
+    // attached (see attachSurface()/hasSurface()), and `handle` identifying
+    // an active imported GL_TEXTURE_2D (see importHardwareBuffer()). Returns
+    // false (with lastError set) on any precondition failure or if the draw
+    // path fails; otherwise returns true with the frame drawn but not
+    // presented.
+    //
+    // Non-claims: this is diagnostic/proof infrastructure only, not a
+    // product no-swap rendering API; callers should use it only paired with
+    // diagnosticReadPixels() in physical proof harnesses. It does not
+    // support YUV or external (OES) textures, does not perform fence sync,
+    // and does not compose multiple render nodes. Unavailable on non-
+    // Android host builds.
+    bool diagnosticRenderFrameForReadback(HardwareBufferHandle handle,
+                                          const VideoFrameTransform& transform);
 
 private:
     struct Impl;

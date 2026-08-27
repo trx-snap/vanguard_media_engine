@@ -41,6 +41,12 @@
 //     outPixels, non-zero width/height, sufficient outPixelCapacityBytes)
 //     happens before any Android-only code so it runs identically on both
 //     platforms.
+//   - Unit AC: diagnosticRenderFrameForReadback() shares the same
+//     precondition checks, make-current, texture resolve, and draw path as
+//     renderFrame(handle, transform), but intentionally does not call
+//     eglSwapBuffers, so a physical harness can pair it with
+//     diagnosticReadPixels() against the still-unswapped window surface to
+//     verify rendered texture content before presentation.
 //
 // On non-Android host builds:
 //   - No EGL/GLES headers included.
@@ -57,6 +63,9 @@
 //   - Unit AB: diagnosticReadPixels() on an initialized backend, once
 //     argument/dimension/capacity validation passes, always fails with
 //     lastError="diagnostic_read_pixels_unavailable_on_host".
+//   - Unit AC: diagnosticRenderFrameForReadback() on an initialized backend
+//     always fails with
+//     lastError="diagnostic_render_frame_readback_unavailable_on_host".
 
 #include "vanguard/render/gles_backend.h"
 #include "gles_hardware_buffer_imports.h"
@@ -889,6 +898,58 @@ bool GlesBackend::diagnosticReadPixels(uint32_t x,
     (void)outPixels;
     (void)outPixelCapacityBytes;
     impl_->lastError = "diagnostic_read_pixels_unavailable_on_host";
+    return false;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Unit AC: diagnostic no-swap renderFrame seam for pixel-content readback.
+// Shares the same source texture lookup and transformed textured-quad draw
+// path as renderFrame(handle, transform), but intentionally omits
+// eglSwapBuffers so a physical harness can call diagnosticReadPixels()
+// against the still-unswapped window surface.
+// ---------------------------------------------------------------------------
+
+bool GlesBackend::diagnosticRenderFrameForReadback(HardwareBufferHandle handle,
+                                                   const VideoFrameTransform& transform) {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return false;
+    }
+
+#if defined(__ANDROID__)
+    if (!hasSurface()) {
+        impl_->lastError = "no_surface_attached";
+        return false;
+    }
+
+    const uint32_t texture = impl_->ahbImports->textureForHandle(handle);
+    if (texture == 0) {
+        impl_->lastError = "invalid_buffer_handle";
+        return false;
+    }
+
+    if (eglMakeCurrent(impl_->display, impl_->windowSurface, impl_->windowSurface, impl_->context) != EGL_TRUE) {
+        impl_->lastError = "diagnostic_render_frame_readback_make_current_failed";
+        return false;
+    }
+
+    std::string drawError;
+    const bool drawOk = impl_->textureFrameRenderer->drawTexturedQuad(
+        texture, impl_->surfaceWidth, impl_->surfaceHeight, transform, &drawError);
+    if (!drawOk) {
+        impl_->lastError = !drawError.empty() ? drawError : "diagnostic_render_frame_readback_draw_failed";
+        return false;
+    }
+
+    impl_->lastError.clear();
+    return true;
+#else
+    (void)handle;
+    (void)transform;
+    impl_->lastError = "diagnostic_render_frame_readback_unavailable_on_host";
     return false;
 #endif
 }

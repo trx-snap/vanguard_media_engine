@@ -1672,4 +1672,226 @@ object AndroidDagRenderSmokeHarness {
             "centerR=0;centerG=0;centerB=0;centerA=0;centerPixelMatches=false;fullRead=not_run;fullReadLastError=;" +
             "detach=not_run;surfaceKindAfterDetach=none;postDetachRead=not_run;postDetachLastError=;shutdown=not_run;" +
             "idempotentShutdown=not_run;proofBoundary=gles_diagnostic_read_pixels_rgba_window_surface_no_yuv_no_fence_no_product;lastError=$reason"
+
+    // ── Phase 1-Unit AC: Android GLES renderFrame texture-content readback physical smoke ──
+    private const val RESULT_MARKER_PHASE1AC = "ANDROID_GLES_RENDERFRAME_CONTENT_UNIT_AC_NATIVE_RESULT"
+
+    fun runGlesRenderFrameContentSmoke(width: Int = 64, height: Int = 64): Map<String, Any?> {
+        var surfaceTexture: SurfaceTexture? = null
+        var surface: Surface? = null
+        var hardwareBuffer: HardwareBuffer? = null
+        var raw = glesRenderFrameContentFailure("not_run")
+
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                raw = glesRenderFrameContentFailure("api_below_26")
+                return parseGlesRenderFrameContentResult(raw)
+            }
+            if (width <= 0 || height <= 0) {
+                raw = glesRenderFrameContentFailure("invalid_dimensions")
+                return parseGlesRenderFrameContentResult(raw)
+            }
+
+            surfaceTexture = SurfaceTexture(false).apply {
+                setDefaultBufferSize(width, height)
+            }
+            surface = Surface(surfaceTexture)
+
+            hardwareBuffer = HardwareBuffer.create(
+                width,
+                height,
+                HardwareBuffer.RGBA_8888,
+                1,
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_CPU_WRITE_OFTEN,
+            )
+
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1ACGlesRenderFrameContentSmoke(
+                surface,
+                hardwareBuffer,
+                width,
+                height,
+            )
+            return parseGlesRenderFrameContentResult(raw)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = glesRenderFrameContentFailure("exception:$reason")
+            return parseGlesRenderFrameContentResult(raw)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1AC $raw")
+            try {
+                hardwareBuffer?.close()
+            } catch (_: Throwable) {
+            }
+            try {
+                surface?.release()
+            } catch (_: Throwable) {
+            }
+            try {
+                surfaceTexture?.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun parseGlesRenderFrameContentResult(raw: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val clientVersion = parsed["clientVersion"]?.toIntOrNull() ?: 0
+        val vendor = parsed["vendor"] ?: ""
+        val renderer = parsed["renderer"] ?: ""
+        val version = parsed["version"] ?: ""
+        val bufferDescribe = parsed["bufferDescribe"] ?: "not_run"
+        val bufferWidth = parsed["bufferWidth"]?.toIntOrNull() ?: 0
+        val bufferHeight = parsed["bufferHeight"]?.toIntOrNull() ?: 0
+        val bufferLayers = parsed["bufferLayers"]?.toIntOrNull() ?: 0
+        val bufferFormat = parsed["bufferFormat"]?.toIntOrNull() ?: 0
+        val bufferUsage = parsed["bufferUsage"]?.toLongOrNull() ?: 0L
+        val bufferStride = parsed["bufferStride"]?.toIntOrNull() ?: 0
+        val bufferFill = parsed["bufferFill"] ?: "not_run"
+        val writeFenceFd = parsed["writeFenceFd"]?.toIntOrNull() ?: -1
+        val writeFenceWait = parsed["writeFenceWait"] ?: "none"
+        val preInitDiagnosticRender = parsed["preInitDiagnosticRender"] ?: "not_run"
+        val preInitLastError = parsed["preInitLastError"] ?: ""
+        val initialize = parsed["initialize"] ?: "not_run"
+        val attach = parsed["attach"] ?: "not_run"
+        val hasSurfaceAfterAttach = parsed["hasSurfaceAfterAttach"]?.equals("true", ignoreCase = true) ?: false
+        val surfaceKindAfterAttach = parsed["surfaceKindAfterAttach"] ?: "none"
+        val widthAfterAttach = parsed["widthAfterAttach"]?.toIntOrNull() ?: 0
+        val heightAfterAttach = parsed["heightAfterAttach"]?.toIntOrNull() ?: 0
+        val importBuffer = parsed["importBuffer"] ?: "not_run"
+        val handle = parsed["handle"]?.toLongOrNull() ?: 0L
+        val descriptorWidth = parsed["descriptorWidth"]?.toIntOrNull() ?: 0
+        val descriptorHeight = parsed["descriptorHeight"]?.toIntOrNull() ?: 0
+        val descriptorLayers = parsed["descriptorLayers"]?.toIntOrNull() ?: 0
+        val descriptorFormat = parsed["descriptorFormat"]?.toIntOrNull() ?: 0
+        val descriptorUsageSampled = parsed["descriptorUsageSampled"]?.equals("true", ignoreCase = true) ?: false
+        val hasAfterImport = parsed["hasAfterImport"]?.equals("true", ignoreCase = true) ?: false
+        val invalidHandleDiagnosticRender = parsed["invalidHandleDiagnosticRender"] ?: "not_run"
+        val invalidHandleLastError = parsed["invalidHandleLastError"] ?: ""
+        val identityDiagnosticRender = parsed["identityDiagnosticRender"] ?: "not_run"
+        val identityDiagnosticLastError = parsed["identityDiagnosticLastError"] ?: ""
+        val identityCenterRead = parsed["identityCenterRead"] ?: "not_run"
+        val identityCenterReadLastError = parsed["identityCenterReadLastError"] ?: ""
+        val identityCenterR = parsed["identityCenterR"]?.toIntOrNull() ?: 0
+        val identityCenterG = parsed["identityCenterG"]?.toIntOrNull() ?: 0
+        val identityCenterB = parsed["identityCenterB"]?.toIntOrNull() ?: 0
+        val identityCenterA = parsed["identityCenterA"]?.toIntOrNull() ?: 0
+        val identityCenterPixelMatches = parsed["identityCenterPixelMatches"]?.equals("true", ignoreCase = true) ?: false
+        val rot90DiagnosticRender = parsed["rot90DiagnosticRender"] ?: "not_run"
+        val rot90DiagnosticLastError = parsed["rot90DiagnosticLastError"] ?: ""
+        val rot90CenterRead = parsed["rot90CenterRead"] ?: "not_run"
+        val rot90CenterReadLastError = parsed["rot90CenterReadLastError"] ?: ""
+        val rot90CenterR = parsed["rot90CenterR"]?.toIntOrNull() ?: 0
+        val rot90CenterG = parsed["rot90CenterG"]?.toIntOrNull() ?: 0
+        val rot90CenterB = parsed["rot90CenterB"]?.toIntOrNull() ?: 0
+        val rot90CenterA = parsed["rot90CenterA"]?.toIntOrNull() ?: 0
+        val rot90CenterPixelMatches = parsed["rot90CenterPixelMatches"]?.equals("true", ignoreCase = true) ?: false
+        val releaseBuffer = parsed["releaseBuffer"] ?: "not_run"
+        val releaseFence = parsed["releaseFence"]?.toIntOrNull() ?: -1
+        val hasAfterRelease = parsed["hasAfterRelease"]?.equals("true", ignoreCase = true) ?: false
+        val postReleaseDiagnosticRender = parsed["postReleaseDiagnosticRender"] ?: "not_run"
+        val postReleaseLastError = parsed["postReleaseLastError"] ?: ""
+        val detach = parsed["detach"] ?: "not_run"
+        val surfaceKindAfterDetach = parsed["surfaceKindAfterDetach"] ?: "none"
+        val postDetachRead = parsed["postDetachRead"] ?: "not_run"
+        val postDetachLastError = parsed["postDetachLastError"] ?: ""
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_renderFrame_rgba_texture_content_readback_no_swap_no_yuv_no_fence_no_product"
+        val lastError = parsed["lastError"] ?: ""
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "clientVersion" to clientVersion,
+            "vendor" to vendor,
+            "renderer" to renderer,
+            "version" to version,
+            "bufferDescribe" to bufferDescribe,
+            "bufferWidth" to bufferWidth,
+            "bufferHeight" to bufferHeight,
+            "bufferLayers" to bufferLayers,
+            "bufferFormat" to bufferFormat,
+            "bufferUsage" to bufferUsage,
+            "bufferStride" to bufferStride,
+            "bufferFill" to bufferFill,
+            "writeFenceFd" to writeFenceFd,
+            "writeFenceWait" to writeFenceWait,
+            "preInitDiagnosticRender" to preInitDiagnosticRender,
+            "preInitLastError" to preInitLastError,
+            "initialize" to initialize,
+            "attach" to attach,
+            "hasSurfaceAfterAttach" to hasSurfaceAfterAttach,
+            "surfaceKindAfterAttach" to surfaceKindAfterAttach,
+            "widthAfterAttach" to widthAfterAttach,
+            "heightAfterAttach" to heightAfterAttach,
+            "importBuffer" to importBuffer,
+            "handle" to handle,
+            "descriptorWidth" to descriptorWidth,
+            "descriptorHeight" to descriptorHeight,
+            "descriptorLayers" to descriptorLayers,
+            "descriptorFormat" to descriptorFormat,
+            "descriptorUsageSampled" to descriptorUsageSampled,
+            "hasAfterImport" to hasAfterImport,
+            "invalidHandleDiagnosticRender" to invalidHandleDiagnosticRender,
+            "invalidHandleLastError" to invalidHandleLastError,
+            "identityDiagnosticRender" to identityDiagnosticRender,
+            "identityDiagnosticLastError" to identityDiagnosticLastError,
+            "identityCenterRead" to identityCenterRead,
+            "identityCenterReadLastError" to identityCenterReadLastError,
+            "identityCenterR" to identityCenterR,
+            "identityCenterG" to identityCenterG,
+            "identityCenterB" to identityCenterB,
+            "identityCenterA" to identityCenterA,
+            "identityCenterPixelMatches" to identityCenterPixelMatches,
+            "rot90DiagnosticRender" to rot90DiagnosticRender,
+            "rot90DiagnosticLastError" to rot90DiagnosticLastError,
+            "rot90CenterRead" to rot90CenterRead,
+            "rot90CenterReadLastError" to rot90CenterReadLastError,
+            "rot90CenterR" to rot90CenterR,
+            "rot90CenterG" to rot90CenterG,
+            "rot90CenterB" to rot90CenterB,
+            "rot90CenterA" to rot90CenterA,
+            "rot90CenterPixelMatches" to rot90CenterPixelMatches,
+            "releaseBuffer" to releaseBuffer,
+            "releaseFence" to releaseFence,
+            "hasAfterRelease" to hasAfterRelease,
+            "postReleaseDiagnosticRender" to postReleaseDiagnosticRender,
+            "postReleaseLastError" to postReleaseLastError,
+            "detach" to detach,
+            "surfaceKindAfterDetach" to surfaceKindAfterDetach,
+            "postDetachRead" to postDetachRead,
+            "postDetachLastError" to postDetachLastError,
+            "shutdown" to shutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "proofBoundary" to proofBoundary,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun glesRenderFrameContentFailure(reason: String): String =
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;bufferDescribe=$reason;bufferWidth=0;bufferHeight=0;" +
+            "bufferLayers=0;bufferFormat=0;bufferUsage=0;bufferStride=0;bufferFill=not_run;writeFenceFd=-1;writeFenceWait=none;" +
+            "preInitDiagnosticRender=not_run;preInitLastError=;initialize=not_run;attach=not_run;hasSurfaceAfterAttach=false;" +
+            "surfaceKindAfterAttach=none;widthAfterAttach=0;heightAfterAttach=0;importBuffer=not_run;handle=0;" +
+            "descriptorWidth=0;descriptorHeight=0;descriptorLayers=0;descriptorFormat=0;descriptorUsageSampled=false;" +
+            "hasAfterImport=false;invalidHandleDiagnosticRender=not_run;invalidHandleLastError=;identityDiagnosticRender=not_run;" +
+            "identityDiagnosticLastError=;identityCenterRead=not_run;identityCenterReadLastError=;identityCenterR=0;identityCenterG=0;" +
+            "identityCenterB=0;identityCenterA=0;identityCenterPixelMatches=false;rot90DiagnosticRender=not_run;rot90DiagnosticLastError=;" +
+            "rot90CenterRead=not_run;rot90CenterReadLastError=;rot90CenterR=0;rot90CenterG=0;rot90CenterB=0;rot90CenterA=0;" +
+            "rot90CenterPixelMatches=false;releaseBuffer=not_run;releaseFence=-1;hasAfterRelease=false;postReleaseDiagnosticRender=not_run;" +
+            "postReleaseLastError=;detach=not_run;surfaceKindAfterDetach=none;postDetachRead=not_run;postDetachLastError=;" +
+            "shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_renderFrame_rgba_texture_content_readback_no_swap_no_yuv_no_fence_no_product;lastError=$reason"
 }

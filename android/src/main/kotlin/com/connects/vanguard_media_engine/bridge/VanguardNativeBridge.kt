@@ -170,6 +170,14 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // ── Phase 1-Unit AC: Android GLES renderFrame texture-content readback physical smoke ──
+    external fun runAndroidDagPhase1ACGlesRenderFrameContentSmoke(
+        surface: Surface,
+        buffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

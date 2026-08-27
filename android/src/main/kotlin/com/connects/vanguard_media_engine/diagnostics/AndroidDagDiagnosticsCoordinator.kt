@@ -50,6 +50,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1YGlesImportSmoke",
             "runAndroidDagPhase1ZGlesRenderFrameSmoke",
             "runAndroidDagPhase1ABGlesReadPixelsSmoke",
+            "runAndroidDagPhase1ACGlesRenderFrameContentSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -86,6 +87,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1YGlesImportSmoke" -> runPhase1YGlesImportSmoke(args, result)
             "runAndroidDagPhase1ZGlesRenderFrameSmoke" -> runPhase1ZGlesRenderFrameSmoke(args, result)
             "runAndroidDagPhase1ABGlesReadPixelsSmoke" -> runPhase1ABGlesReadPixelsSmoke(args, result)
+            "runAndroidDagPhase1ACGlesRenderFrameContentSmoke" -> runPhase1ACGlesRenderFrameContentSmoke(args, result)
             else -> return false
         }
         return true
@@ -486,6 +488,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_READ_PIXELS_SMOKE_FAILED",
                         "runAndroidDagPhase1ABGlesReadPixelsSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AC: Android GLES renderFrame texture-content readback physical smoke ──
+    private fun runPhase1ACGlesRenderFrameContentSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesRenderFrameContentSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_RENDER_FRAME_CONTENT_SMOKE_FAILED",
+                        "runAndroidDagPhase1ACGlesRenderFrameContentSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
