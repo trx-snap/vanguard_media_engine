@@ -62,6 +62,8 @@ export 'vg_editor_export_result.dart';
 export 'vg_editor_texture_view.dart';
 // Phase 7.8D: public editor preview readiness evaluator.
 export 'vg_editor_preview_readiness.dart';
+// Phase 5-Unit J: public editor export readiness evaluator.
+export 'vg_editor_export_readiness.dart';
 // Audio Slice M: recording result models.
 export 'vg_audio_recording_models.dart';
 // Phase 8: canvas and overlay descriptors
