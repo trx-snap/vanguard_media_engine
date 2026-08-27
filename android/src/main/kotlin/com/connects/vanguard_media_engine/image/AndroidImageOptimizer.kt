@@ -15,16 +15,16 @@ import java.io.FileOutputStream
 import java.util.UUID
 import kotlin.math.roundToInt
 
-// ── AndroidImageOptimizer (Phase 5 Unit E) ────────────────────────────────────
+// ── AndroidImageOptimizer (Phase 5 Unit E/F) ──────────────────────────────────
 //
 // Thin owner of the `optimizeImage` MethodChannel route. All decode/resize/
 // encode policy lives here; VanguardMediaEnginePlugin only forwards the call.
 //
 // Baseline native route: BitmapFactory decode + EXIF-aware rotation + a
-// single-pass bounding-box resize + Bitmap.compress encode. No adaptive
-// quality search, no ROI compositing, no metadata preservation -- those are
-// Unit E's documented deferrals (advisory fields are accepted and logged,
-// never enforced).
+// single-pass bounding-box resize + Bitmap.compress encode. Unit F adds a
+// bounded adaptive JPEG quality/size search on top of that baseline. ROI
+// compositing and metadata preservation remain deferred (advisory fields are
+// accepted and logged, never enforced).
 internal object AndroidImageOptimizer {
     private const val TAG = "VanguardImageOptimizer"
 
@@ -82,8 +82,10 @@ internal object AndroidImageOptimizer {
         if (enhancementConfig != null) {
             Log.i(TAG, "optimizeImage: enhancementConfig present — accepted/ignored in Unit E")
         }
-        // Advisory-only fields, parsed for parity but never enforced in Unit E.
-        args.get("fileSizeTargetBytes")
+        // fileSizeTargetBytes drives Unit F's adaptive JPEG quality search below.
+        // Null, missing, zero, or negative means no adaptive target.
+        val fileSizeTargetBytes = (args.get("fileSizeTargetBytes") as? Number)?.toLong()?.takeIf { it > 0L }
+        // Advisory-only fields, parsed for parity but never enforced.
         args.get("colorPolicy")
         args.get("destinationIntent")
 
@@ -97,6 +99,7 @@ internal object AndroidImageOptimizer {
                 maxHeight = maxHeight,
                 maxLongEdge = maxLongEdge,
                 qualityArg = qualityArg,
+                fileSizeTargetBytes = fileSizeTargetBytes,
                 roiConfig = roiConfig,
                 onSuccess = ::replySuccess,
                 onError = ::replyError,
@@ -139,6 +142,7 @@ internal object AndroidImageOptimizer {
         maxHeight: Int?,
         maxLongEdge: Int?,
         qualityArg: Double?,
+        fileSizeTargetBytes: Long?,
         roiConfig: Map<*, *>?,
         onSuccess: (Map<String, Any?>) -> Unit,
         onError: (String, String?) -> Unit,
@@ -149,6 +153,7 @@ internal object AndroidImageOptimizer {
         var resized: Bitmap? = null
         var encodeSource: Bitmap? = null
         var tempFile: File? = null
+        val candidateFiles = mutableListOf<File>()
 
         try {
             // ── Bounds pass ───────────────────────────────────────────────────
@@ -244,27 +249,67 @@ internal object AndroidImageOptimizer {
                 }
             }
 
-            val quality = (qualityArg ?: DEFAULT_QUALITY).coerceIn(0.0, 1.0)
-            val qualityInt = (quality * 100).roundToInt().coerceIn(0, 100)
+            val startQuality = (qualityArg ?: DEFAULT_QUALITY).coerceIn(0.0, 1.0)
 
-            // ── Encode to a unique sibling temp file ───────────────────────────
+            // ── Encode candidate(s) to unique sibling temp files ───────────────
             val finalFile = File(finalOutputPath)
             val parentDir = finalFile.absoluteFile.parentFile
             parentDir?.mkdirs()
-            tempFile = File(parentDir, "${finalFile.name}.tmp-${UUID.randomUUID()}")
 
-            FileOutputStream(tempFile).use { out ->
-                val compressed = encodeSource.compress(resolved.compressFormat, qualityInt, out)
-                out.flush()
-                if (!compressed) {
-                    onError("IMAGE_OPTIMIZER_FAILED", "optimizeImage: bitmap compress failed")
-                    return
+            val adaptiveEligible = resolved.wireName == "jpeg" && fileSizeTargetBytes != null
+            val candidates = mutableListOf<EncodeCandidate>()
+
+            if (!adaptiveEligible) {
+                candidates.add(
+                    encodeCandidate(
+                        encodeSource, resolved.compressFormat, startQuality, parentDir, finalFile.name, candidateFiles,
+                    ),
+                )
+            } else {
+                val targetBytes = fileSizeTargetBytes!!
+                val qualitySchedule = buildAdaptiveQualitySchedule(startQuality, ADAPTIVE_QUALITY_FLOOR)
+                for ((index, quality) in qualitySchedule.withIndex()) {
+                    val candidate = encodeCandidate(
+                        encodeSource, resolved.compressFormat, quality, parentDir, finalFile.name, candidateFiles,
+                    )
+                    candidates.add(candidate)
+                    if (index == 0 && candidate.sizeBytes <= targetBytes) {
+                        break // pass 1 already meets target -- no adaptive search needed
+                    }
                 }
             }
-            if (tempFile!!.length() == 0L) {
-                onError("IMAGE_OPTIMIZER_FAILED", "optimizeImage: encoded temp file is empty")
-                return
+
+            val meetingTarget = if (fileSizeTargetBytes != null) {
+                candidates.filter { it.sizeBytes <= fileSizeTargetBytes }
+            } else {
+                emptyList()
             }
+            val selected = if (meetingTarget.isNotEmpty()) {
+                meetingTarget.maxByOrNull { it.quality }!!
+            } else if (fileSizeTargetBytes != null) {
+                candidates.minByOrNull { it.sizeBytes }!!
+            } else {
+                candidates.first()
+            }
+
+            if (adaptiveEligible) {
+                Log.i(
+                    TAG,
+                    "optimizeImage: adaptive search targetBytes=$fileSizeTargetBytes " +
+                        "passCount=${candidates.size} selectedQuality=${selected.quality} " +
+                        "selectedSize=${selected.sizeBytes} targetMet=${meetingTarget.isNotEmpty()}",
+                )
+            }
+
+            // Non-selected candidates are no longer needed; drop them now so only
+            // the winner's temp file participates in the commit below.
+            for (candidate in candidates) {
+                if (candidate !== selected && candidate.file.exists()) {
+                    candidate.file.delete()
+                }
+            }
+
+            tempFile = selected.file
 
             // ── Commit temp → final with backup/rollback ───────────────────────
             var backupFile: File? = null
@@ -298,8 +343,8 @@ internal object AndroidImageOptimizer {
                 "height" to encodeSource.height,
                 "fileSizeBytes" to fileSizeBytes,
                 "format" to resolved.wireName,
-                "passCount" to 1,
-                "chosenQuality" to quality,
+                "passCount" to candidates.size,
+                "chosenQuality" to selected.quality,
             )
 
             if (roiConfig != null && roiConfig.get("enabled") == true) {
@@ -324,7 +369,58 @@ internal object AndroidImageOptimizer {
             if (resized != null && resized !== oriented) resized.recycle()
             if (encodeSource != null && encodeSource !== resized) encodeSource.recycle()
             tempFile?.let { if (it.exists()) it.delete() }
+            candidateFiles.forEach { if (it.exists()) it.delete() }
         }
+    }
+
+    // ── Adaptive JPEG quality/size search (Phase 5 Unit F) ───────────────────
+
+    private const val ADAPTIVE_MAX_ATTEMPTS = 4
+    private const val ADAPTIVE_QUALITY_FLOOR = 0.35
+
+    // Deterministic, distinct quality attempts: pass 1 is the requested quality;
+    // passes 2..ADAPTIVE_MAX_ATTEMPTS linearly descend to the floor so the last
+    // pass lands exactly on it. If the request is already at/below the floor,
+    // there is nothing to descend toward -- run a single pass at that quality.
+    private fun buildAdaptiveQualitySchedule(startQuality: Double, floor: Double): List<Double> {
+        if (startQuality <= floor) {
+            return listOf(startQuality)
+        }
+        val schedule = mutableListOf(startQuality)
+        for (attempt in 2..ADAPTIVE_MAX_ATTEMPTS) {
+            val quality = startQuality - (startQuality - floor) * (attempt - 1) / (ADAPTIVE_MAX_ATTEMPTS - 1)
+            schedule.add(quality.coerceIn(floor, startQuality))
+        }
+        return schedule.distinct()
+    }
+
+    private class EncodeCandidate(val quality: Double, val file: File, val sizeBytes: Long)
+
+    private class EncodeAttemptFailure(message: String) : Exception(message)
+
+    private fun encodeCandidate(
+        encodeSource: Bitmap,
+        compressFormat: Bitmap.CompressFormat,
+        quality: Double,
+        parentDir: File?,
+        finalFileName: String,
+        candidateFiles: MutableList<File>,
+    ): EncodeCandidate {
+        val qualityInt = (quality * 100).roundToInt().coerceIn(0, 100)
+        val candidateFile = File(parentDir, "$finalFileName.tmp-${UUID.randomUUID()}")
+        candidateFiles.add(candidateFile)
+        FileOutputStream(candidateFile).use { out ->
+            val compressed = encodeSource.compress(compressFormat, qualityInt, out)
+            out.flush()
+            if (!compressed) {
+                throw EncodeAttemptFailure("bitmap compress failed")
+            }
+        }
+        val size = candidateFile.length()
+        if (size == 0L) {
+            throw EncodeAttemptFailure("encoded temp file is empty")
+        }
+        return EncodeCandidate(quality, candidateFile, size)
     }
 
     // ── EXIF helpers ─────────────────────────────────────────────────────────
