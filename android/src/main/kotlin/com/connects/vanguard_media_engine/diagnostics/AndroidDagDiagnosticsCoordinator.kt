@@ -697,7 +697,7 @@ class AndroidDagDiagnosticsCoordinator(
         val height = (args?.get("height") as? Number)?.toInt() ?: 64
         Thread {
             try {
-                val smokeResult = AndroidDagRenderSmokeHarness.runGlesRenderFenceChainSmoke(width, height)
+                val smokeResult = AndroidGlesFenceSmokeHarness.runGlesRenderFenceChainSmoke(width, height)
                 mainHandler.post { result.success(smokeResult) }
             } catch (t: Throwable) {
                 mainHandler.post {
@@ -717,7 +717,7 @@ class AndroidDagDiagnosticsCoordinator(
         val height = (args?.get("height") as? Number)?.toInt() ?: 64
         Thread {
             try {
-                val smokeResult = AndroidDagRenderSmokeHarness.runGlesAcquireFenceRenderContentSmoke(width, height)
+                val smokeResult = AndroidGlesFenceSmokeHarness.runGlesAcquireFenceRenderContentSmoke(width, height)
                 mainHandler.post { result.success(smokeResult) }
             } catch (t: Throwable) {
                 mainHandler.post {
