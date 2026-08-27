@@ -56,6 +56,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AFGlesRgbxRenderFrameContentSmoke",
             "runAndroidDagPhase1AGGlesImportGuardSmoke",
             "runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke",
+            "runAndroidDagPhase1AIGlesExtensionCapabilitySmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -98,6 +99,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AFGlesRgbxRenderFrameContentSmoke" -> runPhase1AFGlesRgbxRenderFrameContentSmoke(args, result)
             "runAndroidDagPhase1AGGlesImportGuardSmoke" -> runPhase1AGGlesImportGuardSmoke(args, result)
             "runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke" -> runPhase1AHGlesYcbcrImportGuardSmoke(args, result)
+            "runAndroidDagPhase1AIGlesExtensionCapabilitySmoke" -> runPhase1AIGlesExtensionCapabilitySmoke(result)
             else -> return false
         }
         return true
@@ -618,6 +620,24 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_YCBCR_IMPORT_GUARD_SMOKE_FAILED",
                         "runAndroidDagPhase1AHGlesYcbcrImportGuardSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit AI: Android GLES/EGL extension and native-fence capability inventory physical proof ──
+    private fun runPhase1AIGlesExtensionCapabilitySmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesExtensionCapabilitySmoke()
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_EXTENSION_CAPABILITY_SMOKE_FAILED",
+                        "runAndroidDagPhase1AIGlesExtensionCapabilitySmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
