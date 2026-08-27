@@ -34,6 +34,8 @@ export 'vg_camera2_readiness_plan.dart';
 export 'vg_camera2_session_configuration_plan.dart';
 // Phase 3-Unit F: Android Camera2 guarded concurrent SessionConfiguration validation.
 export 'vg_camera2_concurrent_session_validation.dart';
+// Phase 3-Unit H: Android Camera2 single-camera open/close lifecycle smoke foundation.
+export 'vg_camera2_open_close_smoke.dart';
 
 // Phase 6D.3: typed recording result.
 export 'vg_recording_stats.dart';
