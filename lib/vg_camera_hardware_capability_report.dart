@@ -10,6 +10,128 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
+/// A single output stream size (width x height) in pixels, as reported by
+/// `StreamConfigurationMap.getOutputSizes`.
+@immutable
+class VGCameraSize {
+  const VGCameraSize(this.width, this.height);
+
+  final int width;
+  final int height;
+
+  static VGCameraSize? fromMap(Object? raw) {
+    if (raw is! Map) return null;
+    final width = (raw['width'] as num?)?.toInt();
+    final height = (raw['height'] as num?)?.toInt();
+    if (width == null || height == null) return null;
+    return VGCameraSize(width, height);
+  }
+
+  Map<String, Object?> toMap() {
+    return <String, Object?>{'width': width, 'height': height};
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is VGCameraSize &&
+        other.width == width &&
+        other.height == height;
+  }
+
+  @override
+  int get hashCode => Object.hash(width, height);
+
+  @override
+  String toString() => 'VGCameraSize(width: $width, height: $height)';
+}
+
+/// A sensor rectangle (e.g. the active pixel array), as reported by
+/// `CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE`.
+@immutable
+class VGCameraRect {
+  const VGCameraRect(this.left, this.top, this.right, this.bottom);
+
+  final int left;
+  final int top;
+  final int right;
+  final int bottom;
+
+  static VGCameraRect? fromMap(Object? raw) {
+    if (raw is! Map) return null;
+    final left = (raw['left'] as num?)?.toInt();
+    final top = (raw['top'] as num?)?.toInt();
+    final right = (raw['right'] as num?)?.toInt();
+    final bottom = (raw['bottom'] as num?)?.toInt();
+    if (left == null || top == null || right == null || bottom == null) {
+      return null;
+    }
+    return VGCameraRect(left, top, right, bottom);
+  }
+
+  Map<String, Object?> toMap() {
+    return <String, Object?>{
+      'left': left,
+      'top': top,
+      'right': right,
+      'bottom': bottom,
+    };
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is VGCameraRect &&
+        other.left == left &&
+        other.top == top &&
+        other.right == right &&
+        other.bottom == bottom;
+  }
+
+  @override
+  int get hashCode => Object.hash(left, top, right, bottom);
+
+  @override
+  String toString() =>
+      'VGCameraRect(left: $left, top: $top, right: $right, bottom: $bottom)';
+}
+
+/// A supported target FPS range, as reported by
+/// `CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES`.
+@immutable
+class VGCameraFpsRange {
+  const VGCameraFpsRange(this.lower, this.upper);
+
+  final int lower;
+  final int upper;
+
+  static VGCameraFpsRange? fromMap(Object? raw) {
+    if (raw is! Map) return null;
+    final lower = (raw['lower'] as num?)?.toInt();
+    final upper = (raw['upper'] as num?)?.toInt();
+    if (lower == null || upper == null) return null;
+    return VGCameraFpsRange(lower, upper);
+  }
+
+  Map<String, Object?> toMap() {
+    return <String, Object?>{'lower': lower, 'upper': upper};
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is VGCameraFpsRange &&
+        other.lower == lower &&
+        other.upper == upper;
+  }
+
+  @override
+  int get hashCode => Object.hash(lower, upper);
+
+  @override
+  String toString() => 'VGCameraFpsRange(lower: $lower, upper: $upper)';
+}
+
 /// A single camera device's static hardware capabilities, as reported by
 /// `CameraManager.getCameraCharacteristics` on Android.
 @immutable
@@ -22,6 +144,16 @@ class VGCameraHardwareDeviceCapability {
     required this.isLogicalMultiCamera,
     required this.physicalCameraIds,
     required this.capabilities,
+    this.previewSizes = const <VGCameraSize>[],
+    this.videoSizes = const <VGCameraSize>[],
+    this.jpegSizes = const <VGCameraSize>[],
+    this.yuv420Sizes = const <VGCameraSize>[],
+    this.fpsRanges = const <VGCameraFpsRange>[],
+    this.flashAvailable = false,
+    this.videoStabilizationModes = const <String>[],
+    this.opticalStabilizationModes = const <String>[],
+    this.sensorActiveArraySize,
+    this.sensorPixelArraySize,
   });
 
   /// Native Camera2 camera id string (`CameraManager.getCameraIdList()` entry).
@@ -48,6 +180,37 @@ class VGCameraHardwareDeviceCapability {
   /// `capability_<n>`.
   final List<String> capabilities;
 
+  /// Supported preview (`SurfaceTexture`) output sizes, largest area first.
+  final List<VGCameraSize> previewSizes;
+
+  /// Supported video (`MediaRecorder`) output sizes, largest area first.
+  final List<VGCameraSize> videoSizes;
+
+  /// Supported JPEG (`ImageFormat.JPEG`) output sizes, largest area first.
+  final List<VGCameraSize> jpegSizes;
+
+  /// Supported YUV_420_888 output sizes, largest area first.
+  final List<VGCameraSize> yuv420Sizes;
+
+  /// Supported auto-exposure target FPS ranges.
+  final List<VGCameraFpsRange> fpsRanges;
+
+  /// Whether the device reports a flash unit (`FLASH_INFO_AVAILABLE`).
+  final bool flashAvailable;
+
+  /// Supported video stabilization modes (`off` / `on` / `unknown_<n>`).
+  final List<String> videoStabilizationModes;
+
+  /// Supported optical image stabilization modes (`off` / `on` /
+  /// `unknown_<n>`).
+  final List<String> opticalStabilizationModes;
+
+  /// Sensor active pixel array rectangle, or `null` if unavailable.
+  final VGCameraRect? sensorActiveArraySize;
+
+  /// Full sensor pixel array size, or `null` if unavailable.
+  final VGCameraSize? sensorPixelArraySize;
+
   /// Parses a single camera entry. Returns `null` when [raw] is not a map or
   /// `cameraId` is absent/empty — the only field required to address a
   /// device on the native side.
@@ -64,6 +227,16 @@ class VGCameraHardwareDeviceCapability {
       isLogicalMultiCamera: raw['isLogicalMultiCamera'] as bool? ?? false,
       physicalCameraIds: _stringList(raw['physicalCameraIds']),
       capabilities: _stringList(raw['capabilities']),
+      previewSizes: _sizeList(raw['previewSizes']),
+      videoSizes: _sizeList(raw['videoSizes']),
+      jpegSizes: _sizeList(raw['jpegSizes']),
+      yuv420Sizes: _sizeList(raw['yuv420Sizes']),
+      fpsRanges: _fpsRangeList(raw['fpsRanges']),
+      flashAvailable: raw['flashAvailable'] as bool? ?? false,
+      videoStabilizationModes: _stringList(raw['videoStabilizationModes']),
+      opticalStabilizationModes: _stringList(raw['opticalStabilizationModes']),
+      sensorActiveArraySize: VGCameraRect.fromMap(raw['sensorActiveArraySize']),
+      sensorPixelArraySize: VGCameraSize.fromMap(raw['sensorPixelArraySize']),
     );
   }
 
@@ -72,6 +245,22 @@ class VGCameraHardwareDeviceCapability {
     return raw
         .whereType<Object>()
         .map((e) => e.toString())
+        .toList(growable: false);
+  }
+
+  static List<VGCameraSize> _sizeList(Object? raw) {
+    if (raw is! List) return const <VGCameraSize>[];
+    return raw
+        .map(VGCameraSize.fromMap)
+        .whereType<VGCameraSize>()
+        .toList(growable: false);
+  }
+
+  static List<VGCameraFpsRange> _fpsRangeList(Object? raw) {
+    if (raw is! List) return const <VGCameraFpsRange>[];
+    return raw
+        .map(VGCameraFpsRange.fromMap)
+        .whereType<VGCameraFpsRange>()
         .toList(growable: false);
   }
 
@@ -84,6 +273,18 @@ class VGCameraHardwareDeviceCapability {
       'isLogicalMultiCamera': isLogicalMultiCamera,
       'physicalCameraIds': physicalCameraIds,
       'capabilities': capabilities,
+      'previewSizes': previewSizes
+          .map((s) => s.toMap())
+          .toList(growable: false),
+      'videoSizes': videoSizes.map((s) => s.toMap()).toList(growable: false),
+      'jpegSizes': jpegSizes.map((s) => s.toMap()).toList(growable: false),
+      'yuv420Sizes': yuv420Sizes.map((s) => s.toMap()).toList(growable: false),
+      'fpsRanges': fpsRanges.map((r) => r.toMap()).toList(growable: false),
+      'flashAvailable': flashAvailable,
+      'videoStabilizationModes': videoStabilizationModes,
+      'opticalStabilizationModes': opticalStabilizationModes,
+      'sensorActiveArraySize': sensorActiveArraySize?.toMap(),
+      'sensorPixelArraySize': sensorPixelArraySize?.toMap(),
     };
   }
 
@@ -97,7 +298,20 @@ class VGCameraHardwareDeviceCapability {
         other.hardwareLevel == hardwareLevel &&
         other.isLogicalMultiCamera == isLogicalMultiCamera &&
         listEquals(other.physicalCameraIds, physicalCameraIds) &&
-        listEquals(other.capabilities, capabilities);
+        listEquals(other.capabilities, capabilities) &&
+        listEquals(other.previewSizes, previewSizes) &&
+        listEquals(other.videoSizes, videoSizes) &&
+        listEquals(other.jpegSizes, jpegSizes) &&
+        listEquals(other.yuv420Sizes, yuv420Sizes) &&
+        listEquals(other.fpsRanges, fpsRanges) &&
+        other.flashAvailable == flashAvailable &&
+        listEquals(other.videoStabilizationModes, videoStabilizationModes) &&
+        listEquals(
+          other.opticalStabilizationModes,
+          opticalStabilizationModes,
+        ) &&
+        other.sensorActiveArraySize == sensorActiveArraySize &&
+        other.sensorPixelArraySize == sensorPixelArraySize;
   }
 
   @override
@@ -109,6 +323,18 @@ class VGCameraHardwareDeviceCapability {
     isLogicalMultiCamera,
     Object.hashAll(physicalCameraIds),
     Object.hashAll(capabilities),
+    Object.hashAll(previewSizes),
+    Object.hashAll(videoSizes),
+    Object.hashAll(jpegSizes),
+    Object.hash(
+      Object.hashAll(yuv420Sizes),
+      Object.hashAll(fpsRanges),
+      flashAvailable,
+      Object.hashAll(videoStabilizationModes),
+      Object.hashAll(opticalStabilizationModes),
+      sensorActiveArraySize,
+      sensorPixelArraySize,
+    ),
   );
 
   @override
@@ -120,7 +346,17 @@ class VGCameraHardwareDeviceCapability {
       'hardwareLevel: $hardwareLevel, '
       'isLogicalMultiCamera: $isLogicalMultiCamera, '
       'physicalCameraIds: $physicalCameraIds, '
-      'capabilities: $capabilities)';
+      'capabilities: $capabilities, '
+      'previewSizes: $previewSizes, '
+      'videoSizes: $videoSizes, '
+      'jpegSizes: $jpegSizes, '
+      'yuv420Sizes: $yuv420Sizes, '
+      'fpsRanges: $fpsRanges, '
+      'flashAvailable: $flashAvailable, '
+      'videoStabilizationModes: $videoStabilizationModes, '
+      'opticalStabilizationModes: $opticalStabilizationModes, '
+      'sensorActiveArraySize: $sensorActiveArraySize, '
+      'sensorPixelArraySize: $sensorPixelArraySize)';
 }
 
 /// Device-wide Android Camera2 hardware/thermal capability report, as

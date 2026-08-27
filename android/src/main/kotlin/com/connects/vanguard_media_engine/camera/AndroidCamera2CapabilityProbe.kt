@@ -3,11 +3,16 @@ package com.connects.vanguard_media_engine.camera
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.ImageFormat
+import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.params.StreamConfigurationMap
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.PowerManager
 import android.util.Log
+import android.util.Size
 
 /**
  * Phase 3-Unit A: read-only Android Camera2 hardware/thermal capability probe.
@@ -20,6 +25,7 @@ class AndroidCamera2CapabilityProbe(private val context: Context) {
 
     companion object {
         private const val TAG = "AndroidCamera2CapabilityProbe"
+        private const val MAX_SIZES_PER_CATEGORY = 64
     }
 
     fun probe(): Map<String, Any?> {
@@ -163,6 +169,84 @@ class AndroidCamera2CapabilityProbe(private val context: Context) {
             emptyList()
         }
 
+        val streamConfigurationMap = try {
+            characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        } catch (t: Throwable) {
+            Log.w(TAG, "SCALER_STREAM_CONFIGURATION_MAP($cameraId) failed: ${t.javaClass.simpleName}: ${t.message}")
+            null
+        }
+
+        val previewSizes = outputSizes(cameraId, streamConfigurationMap, SurfaceTexture::class.java)
+        val videoSizes = outputSizes(cameraId, streamConfigurationMap, MediaRecorder::class.java)
+        val jpegSizes = outputSizes(cameraId, streamConfigurationMap, ImageFormat.JPEG)
+        val yuv420Sizes = outputSizes(cameraId, streamConfigurationMap, ImageFormat.YUV_420_888)
+
+        val fpsRanges = try {
+            characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+                ?.map { mapOf("lower" to it.lower, "upper" to it.upper) }
+                ?: emptyList()
+        } catch (t: Throwable) {
+            Log.w(TAG, "CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES($cameraId) failed: ${t.javaClass.simpleName}: ${t.message}")
+            emptyList()
+        }
+
+        val flashAvailable = try {
+            characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) ?: false
+        } catch (t: Throwable) {
+            Log.w(TAG, "FLASH_INFO_AVAILABLE($cameraId) failed: ${t.javaClass.simpleName}: ${t.message}")
+            false
+        }
+
+        val videoStabilizationModes = try {
+            characteristics.get(CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES)
+                ?.map { stabilizationModeName(it) }
+                ?: emptyList()
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES($cameraId) failed: " +
+                    "${t.javaClass.simpleName}: ${t.message}",
+            )
+            emptyList()
+        }
+
+        val opticalStabilizationModes = try {
+            characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+                ?.map { stabilizationModeName(it) }
+                ?: emptyList()
+        } catch (t: Throwable) {
+            Log.w(
+                TAG,
+                "LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION($cameraId) failed: " +
+                    "${t.javaClass.simpleName}: ${t.message}",
+            )
+            emptyList()
+        }
+
+        val sensorActiveArraySize = try {
+            characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)?.let {
+                mapOf("left" to it.left, "top" to it.top, "right" to it.right, "bottom" to it.bottom)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "SENSOR_INFO_ACTIVE_ARRAY_SIZE($cameraId) failed: ${t.javaClass.simpleName}: ${t.message}")
+            null
+        }
+
+        val sensorPixelArraySize = try {
+            characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)?.let {
+                mapOf("width" to it.width, "height" to it.height)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "SENSOR_INFO_PIXEL_ARRAY_SIZE($cameraId) failed: ${t.javaClass.simpleName}: ${t.message}")
+            null
+        }
+
+        Log.i(
+            TAG,
+            "camera=$cameraId previewSizes=${previewSizes.size} videoSizes=${videoSizes.size} " +
+                "jpegSizes=${jpegSizes.size} yuv420Sizes=${yuv420Sizes.size} flashAvailable=$flashAvailable",
+        )
+
         return mapOf(
             "cameraId" to cameraId,
             "lensFacing" to lensFacing,
@@ -171,7 +255,65 @@ class AndroidCamera2CapabilityProbe(private val context: Context) {
             "isLogicalMultiCamera" to isLogicalMultiCamera,
             "physicalCameraIds" to physicalCameraIds,
             "capabilities" to capabilities,
+            "previewSizes" to previewSizes,
+            "videoSizes" to videoSizes,
+            "jpegSizes" to jpegSizes,
+            "yuv420Sizes" to yuv420Sizes,
+            "fpsRanges" to fpsRanges,
+            "flashAvailable" to flashAvailable,
+            "videoStabilizationModes" to videoStabilizationModes,
+            "opticalStabilizationModes" to opticalStabilizationModes,
+            "sensorActiveArraySize" to sensorActiveArraySize,
+            "sensorPixelArraySize" to sensorPixelArraySize,
         )
+    }
+
+    private fun <T> outputSizes(
+        cameraId: String,
+        map: StreamConfigurationMap?,
+        klass: Class<T>,
+    ): List<Map<String, Int>> {
+        if (map == null) return emptyList()
+        return try {
+            sortedSizes(map.getOutputSizes(klass))
+        } catch (t: Throwable) {
+            Log.w(TAG, "getOutputSizes($cameraId, $klass) failed: ${t.javaClass.simpleName}: ${t.message}")
+            emptyList()
+        }
+    }
+
+    private fun outputSizes(
+        cameraId: String,
+        map: StreamConfigurationMap?,
+        format: Int,
+    ): List<Map<String, Int>> {
+        if (map == null) return emptyList()
+        return try {
+            sortedSizes(map.getOutputSizes(format))
+        } catch (t: Throwable) {
+            Log.w(TAG, "getOutputSizes($cameraId, format=$format) failed: ${t.javaClass.simpleName}: ${t.message}")
+            emptyList()
+        }
+    }
+
+    private fun sortedSizes(sizes: Array<Size>?): List<Map<String, Int>> {
+        if (sizes == null || sizes.isEmpty()) return emptyList()
+        return sizes
+            .sortedWith(
+                compareByDescending<Size> { it.width.toLong() * it.height.toLong() }
+                    .thenByDescending { it.width }
+                    .thenByDescending { it.height },
+            )
+            .take(MAX_SIZES_PER_CATEGORY)
+            .map { mapOf("width" to it.width, "height" to it.height) }
+    }
+
+    private fun stabilizationModeName(value: Int): String {
+        return when (value) {
+            0 -> "off"
+            1 -> "on"
+            else -> "unknown_$value"
+        }
     }
 
     private fun capabilityName(value: Int): String {
