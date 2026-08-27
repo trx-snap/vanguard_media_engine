@@ -64,6 +64,7 @@ if (ANDROID)
     "platform/android/src/android_phase4a_decoder_smoke_jni.cpp"
     "platform/android/src/android_phase4b1_texture_playback_jni.cpp"
     "platform/android/src/android_phase5_encoder_smoke_jni.cpp"
+    "platform/android/src/android_gles_backend_smoke_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
 

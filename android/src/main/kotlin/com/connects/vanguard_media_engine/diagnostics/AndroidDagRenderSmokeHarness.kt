@@ -699,4 +699,71 @@ object AndroidDagRenderSmokeHarness {
         "status=FAIL;reason=$reason;renderedFrames=$renderedFrames;" +
             "writtenSamples=$writtenSamples;frameCount=$frameCount;width=$width;height=$height;" +
             "outputPath=$outputPath"
+
+    // ── Phase 1-Unit U: Android GLES backend offscreen EGL lifecycle smoke ──
+    private const val RESULT_MARKER_PHASE1U = "ANDROID_GLES_BACKEND_UNIT_U_NATIVE_RESULT"
+
+    fun runGlesBackendSmoke(): Map<String, Any?> {
+        var raw = "status=FAIL;clientVersion=0;vendor=;renderer=;version=;initialize=not_run;idempotentInitialize=not_run;clear=not_run;swap=not_run;hasSurface=false;import=not_run;renderFrame=not_run;shutdown=not_run;idempotentShutdown=not_run;proofBoundary=offscreen_egl_pbuffer_no_window_surface;lastError=exception"
+        try {
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1UGlesBackendSmoke()
+            return parseGlesBackendResult(raw)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = "status=FAIL;clientVersion=0;vendor=;renderer=;version=;initialize=exception:$reason;idempotentInitialize=not_run;clear=not_run;swap=not_run;hasSurface=false;import=not_run;renderFrame=not_run;shutdown=not_run;idempotentShutdown=not_run;proofBoundary=offscreen_egl_pbuffer_no_window_surface;lastError=exception:$reason"
+            return parseGlesBackendResult(raw)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1U $raw")
+        }
+    }
+
+    private fun parseGlesBackendResult(raw: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val clientVersion = parsed["clientVersion"]?.toIntOrNull() ?: 0
+        val vendor = parsed["vendor"] ?: ""
+        val renderer = parsed["renderer"] ?: ""
+        val version = parsed["version"] ?: ""
+        val initialize = parsed["initialize"] ?: "not_run"
+        val idempotentInitialize = parsed["idempotentInitialize"] ?: "not_run"
+        val clear = parsed["clear"] ?: "not_run"
+        val swap = parsed["swap"] ?: "not_run"
+        val hasSurface = parsed["hasSurface"]?.equals("true", ignoreCase = true) ?: false
+        val import = parsed["import"] ?: "not_run"
+        val renderFrame = parsed["renderFrame"] ?: "not_run"
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "offscreen_egl_pbuffer_no_window_surface"
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "clientVersion" to clientVersion,
+            "vendor" to vendor,
+            "renderer" to renderer,
+            "version" to version,
+            "initialize" to initialize,
+            "idempotentInitialize" to idempotentInitialize,
+            "clear" to clear,
+            "swap" to swap,
+            "hasSurface" to hasSurface,
+            "import" to import,
+            "renderFrame" to renderFrame,
+            "shutdown" to shutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "proofBoundary" to proofBoundary,
+        )
+    }
 }

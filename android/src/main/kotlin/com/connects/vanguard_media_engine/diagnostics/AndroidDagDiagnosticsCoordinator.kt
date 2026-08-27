@@ -43,6 +43,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase3UnitJHardwareBufferFrameSmoke",
             "runAndroidDagPhase3UnitKCameraNativeRenderSmoke",
             "runAndroidDagPhase3UnitLCameraNativeRenderLoopSmoke",
+            "runAndroidDagPhase1UGlesBackendSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -72,6 +73,7 @@ class AndroidDagDiagnosticsCoordinator(
                 runPhase3UnitKCameraNativeRenderSmoke(args, result)
             "runAndroidDagPhase3UnitLCameraNativeRenderLoopSmoke" ->
                 runPhase3UnitLCameraNativeRenderLoopSmoke(args, result)
+            "runAndroidDagPhase1UGlesBackendSmoke" -> runPhase1UGlesBackendSmoke(result)
             else -> return false
         }
         return true
@@ -334,6 +336,24 @@ class AndroidDagDiagnosticsCoordinator(
                         "CAMERA_NATIVE_RENDER_LOOP_SMOKE_FAILED",
                         "runAndroidDagPhase3UnitLCameraNativeRenderLoopSmoke: " +
                             "${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit U: Android GLES backend offscreen EGL lifecycle smoke ──
+    private fun runPhase1UGlesBackendSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesBackendSmoke()
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_BACKEND_SMOKE_FAILED",
+                        "runAndroidDagPhase1UGlesBackendSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

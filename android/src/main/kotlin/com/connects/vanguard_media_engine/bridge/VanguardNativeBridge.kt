@@ -122,6 +122,9 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
+    // ── Phase 1-Unit U: Android GLES backend offscreen EGL lifecycle smoke ──
+    external fun runAndroidDagPhase1UGlesBackendSmoke(): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
