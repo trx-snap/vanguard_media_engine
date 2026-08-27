@@ -2558,4 +2558,225 @@ object AndroidDagRenderSmokeHarness {
             "rot90CenterPixelMatches=false;releaseBuffer=not_run;releaseFence=-1;hasAfterRelease=false;postReleaseDiagnosticRender=not_run;" +
             "postReleaseLastError=;detach=not_run;surfaceKindAfterDetach=none;postDetachRead=not_run;postDetachLastError=;" +
             "shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_renderFrame_rgbx_texture_content_readback_no_swap_no_yuv_no_fence_no_product;lastError=$reason"
+
+    // ── Phase 1-Unit AG: Android GLES AHardwareBuffer import guard fail-closed physical smoke ──
+    private const val RESULT_MARKER_PHASE1AG = "ANDROID_GLES_IMPORT_GUARD_UNIT_AG_NATIVE_RESULT"
+
+    fun runGlesImportGuardSmoke(width: Int = 64, height: Int = 64): Map<String, Any?> {
+        var validRgbaBuffer: HardwareBuffer? = null
+        var missingUsageBuffer: HardwareBuffer? = null
+        var unsupportedFormatBuffer: HardwareBuffer? = null
+        var unsupportedFormatAllocation = "not_run"
+        var raw = glesImportGuardFailure("not_run", "not_run")
+
+        try {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                raw = glesImportGuardFailure("api_below_26", "not_run")
+                return parseGlesImportGuardResult(raw, "not_run")
+            }
+            if (width <= 0 || height <= 0) {
+                raw = glesImportGuardFailure("invalid_dimensions", "not_run")
+                return parseGlesImportGuardResult(raw, "not_run")
+            }
+
+            validRgbaBuffer = HardwareBuffer.create(
+                width,
+                height,
+                HardwareBuffer.RGBA_8888,
+                1,
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+            )
+
+            missingUsageBuffer = HardwareBuffer.create(
+                width,
+                height,
+                HardwareBuffer.RGBA_8888,
+                1,
+                HardwareBuffer.USAGE_CPU_WRITE_OFTEN,
+            )
+
+            try {
+                unsupportedFormatBuffer = HardwareBuffer.create(
+                    width,
+                    height,
+                    HardwareBuffer.RGB_565,
+                    1,
+                    HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+                )
+                unsupportedFormatAllocation = "success"
+            } catch (t: Throwable) {
+                val excReason = t.javaClass.simpleName.ifEmpty { "allocation_exception" }
+                unsupportedFormatAllocation = "exception:$excReason"
+                raw = glesImportGuardFailure("unsupported_format_allocation_failed", unsupportedFormatAllocation)
+                return parseGlesImportGuardResult(raw, unsupportedFormatAllocation)
+            }
+
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1AGGlesImportGuardSmoke(
+                validRgbaBuffer,
+                missingUsageBuffer,
+                unsupportedFormatBuffer,
+                width,
+                height,
+            )
+            return parseGlesImportGuardResult(raw, unsupportedFormatAllocation)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = glesImportGuardFailure("exception:$reason", unsupportedFormatAllocation)
+            return parseGlesImportGuardResult(raw, unsupportedFormatAllocation)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1AG $raw")
+            try {
+                validRgbaBuffer?.close()
+            } catch (_: Throwable) {
+            }
+            try {
+                missingUsageBuffer?.close()
+            } catch (_: Throwable) {
+            }
+            try {
+                unsupportedFormatBuffer?.close()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun parseGlesImportGuardResult(raw: String, unsupportedFormatAllocation: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val clientVersion = parsed["clientVersion"]?.toIntOrNull() ?: 0
+        val vendor = parsed["vendor"] ?: ""
+        val renderer = parsed["renderer"] ?: ""
+        val version = parsed["version"] ?: ""
+        val validBufferDescribe = parsed["validBufferDescribe"] ?: "not_run"
+        val validBufferFormat = parsed["validBufferFormat"]?.toIntOrNull() ?: 0
+        val validBufferUsage = parsed["validBufferUsage"]?.toLongOrNull() ?: 0L
+        val missingUsageBufferDescribe = parsed["missingUsageBufferDescribe"] ?: "not_run"
+        val missingUsageBufferFormat = parsed["missingUsageBufferFormat"]?.toIntOrNull() ?: 0
+        val missingUsageBufferUsage = parsed["missingUsageBufferUsage"]?.toLongOrNull() ?: 0L
+        val missingUsageHasSampled = parsed["missingUsageHasSampled"]?.equals("true", ignoreCase = true) ?: false
+        val unsupportedFormatBufferDescribe = parsed["unsupportedFormatBufferDescribe"] ?: "not_run"
+        val unsupportedFormatBufferFormat = parsed["unsupportedFormatBufferFormat"]?.toIntOrNull() ?: 0
+        val unsupportedFormatBufferUsage = parsed["unsupportedFormatBufferUsage"]?.toLongOrNull() ?: 0L
+        val unsupportedFormatIsRgb565 = parsed["unsupportedFormatIsRgb565"]?.equals("true", ignoreCase = true) ?: false
+        val initialize = parsed["initialize"] ?: "not_run"
+        val validPreImport = parsed["validPreImport"] ?: "not_run"
+        val validPreHandle = parsed["validPreHandle"]?.toLongOrNull() ?: 0L
+        val validPreDescWidth = parsed["validPreDescWidth"]?.toIntOrNull() ?: 0
+        val validPreDescHeight = parsed["validPreDescHeight"]?.toIntOrNull() ?: 0
+        val validPreDescLayers = parsed["validPreDescLayers"]?.toIntOrNull() ?: 0
+        val validPreDescFormat = parsed["validPreDescFormat"]?.toIntOrNull() ?: 0
+        val validPreDescUsageSampled = parsed["validPreDescUsageSampled"]?.equals("true", ignoreCase = true) ?: false
+        val hasValidPreAfterImport = parsed["hasValidPreAfterImport"]?.equals("true", ignoreCase = true) ?: false
+        val validPreRelease = parsed["validPreRelease"] ?: "not_run"
+        val validPreReleaseFence = parsed["validPreReleaseFence"]?.toIntOrNull() ?: -1
+        val hasValidPreAfterRelease = parsed["hasValidPreAfterRelease"]?.equals("true", ignoreCase = true) ?: false
+        val missingUsageImport = parsed["missingUsageImport"] ?: "not_run"
+        val missingUsageHandle = parsed["missingUsageHandle"]?.toLongOrNull() ?: 0L
+        val missingUsageDescZero = parsed["missingUsageDescZero"]?.equals("true", ignoreCase = true) ?: false
+        val missingUsageLastError = parsed["missingUsageLastError"] ?: ""
+        val hasMissingUsageAfterImport = parsed["hasMissingUsageAfterImport"]?.equals("true", ignoreCase = true) ?: false
+        val unsupportedFormatImport = parsed["unsupportedFormatImport"] ?: "not_run"
+        val unsupportedFormatHandle = parsed["unsupportedFormatHandle"]?.toLongOrNull() ?: 0L
+        val unsupportedFormatDescZero = parsed["unsupportedFormatDescZero"]?.equals("true", ignoreCase = true) ?: false
+        val unsupportedFormatLastError = parsed["unsupportedFormatLastError"] ?: ""
+        val hasUnsupportedFormatAfterImport = parsed["hasUnsupportedFormatAfterImport"]?.equals("true", ignoreCase = true) ?: false
+        val validPostImport = parsed["validPostImport"] ?: "not_run"
+        val validPostHandle = parsed["validPostHandle"]?.toLongOrNull() ?: 0L
+        val validPostDescWidth = parsed["validPostDescWidth"]?.toIntOrNull() ?: 0
+        val validPostDescHeight = parsed["validPostDescHeight"]?.toIntOrNull() ?: 0
+        val validPostDescLayers = parsed["validPostDescLayers"]?.toIntOrNull() ?: 0
+        val validPostDescFormat = parsed["validPostDescFormat"]?.toIntOrNull() ?: 0
+        val validPostDescUsageSampled = parsed["validPostDescUsageSampled"]?.equals("true", ignoreCase = true) ?: false
+        val hasValidPostAfterImport = parsed["hasValidPostAfterImport"]?.equals("true", ignoreCase = true) ?: false
+        val validPostRelease = parsed["validPostRelease"] ?: "not_run"
+        val validPostReleaseFence = parsed["validPostReleaseFence"]?.toIntOrNull() ?: -1
+        val hasValidPostAfterRelease = parsed["hasValidPostAfterRelease"]?.equals("true", ignoreCase = true) ?: false
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_ahb_import_guard_fail_closed_no_yuv_no_oes_no_release_fence_no_product"
+        val lastError = parsed["lastError"] ?: ""
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "unsupportedFormatAllocation" to unsupportedFormatAllocation,
+            "clientVersion" to clientVersion,
+            "vendor" to vendor,
+            "renderer" to renderer,
+            "version" to version,
+            "validBufferDescribe" to validBufferDescribe,
+            "validBufferFormat" to validBufferFormat,
+            "validBufferUsage" to validBufferUsage,
+            "missingUsageBufferDescribe" to missingUsageBufferDescribe,
+            "missingUsageBufferFormat" to missingUsageBufferFormat,
+            "missingUsageBufferUsage" to missingUsageBufferUsage,
+            "missingUsageHasSampled" to missingUsageHasSampled,
+            "unsupportedFormatBufferDescribe" to unsupportedFormatBufferDescribe,
+            "unsupportedFormatBufferFormat" to unsupportedFormatBufferFormat,
+            "unsupportedFormatBufferUsage" to unsupportedFormatBufferUsage,
+            "unsupportedFormatIsRgb565" to unsupportedFormatIsRgb565,
+            "initialize" to initialize,
+            "validPreImport" to validPreImport,
+            "validPreHandle" to validPreHandle,
+            "validPreDescWidth" to validPreDescWidth,
+            "validPreDescHeight" to validPreDescHeight,
+            "validPreDescLayers" to validPreDescLayers,
+            "validPreDescFormat" to validPreDescFormat,
+            "validPreDescUsageSampled" to validPreDescUsageSampled,
+            "hasValidPreAfterImport" to hasValidPreAfterImport,
+            "validPreRelease" to validPreRelease,
+            "validPreReleaseFence" to validPreReleaseFence,
+            "hasValidPreAfterRelease" to hasValidPreAfterRelease,
+            "missingUsageImport" to missingUsageImport,
+            "missingUsageHandle" to missingUsageHandle,
+            "missingUsageDescZero" to missingUsageDescZero,
+            "missingUsageLastError" to missingUsageLastError,
+            "hasMissingUsageAfterImport" to hasMissingUsageAfterImport,
+            "unsupportedFormatImport" to unsupportedFormatImport,
+            "unsupportedFormatHandle" to unsupportedFormatHandle,
+            "unsupportedFormatDescZero" to unsupportedFormatDescZero,
+            "unsupportedFormatLastError" to unsupportedFormatLastError,
+            "hasUnsupportedFormatAfterImport" to hasUnsupportedFormatAfterImport,
+            "validPostImport" to validPostImport,
+            "validPostHandle" to validPostHandle,
+            "validPostDescWidth" to validPostDescWidth,
+            "validPostDescHeight" to validPostDescHeight,
+            "validPostDescLayers" to validPostDescLayers,
+            "validPostDescFormat" to validPostDescFormat,
+            "validPostDescUsageSampled" to validPostDescUsageSampled,
+            "hasValidPostAfterImport" to hasValidPostAfterImport,
+            "validPostRelease" to validPostRelease,
+            "validPostReleaseFence" to validPostReleaseFence,
+            "hasValidPostAfterRelease" to hasValidPostAfterRelease,
+            "shutdown" to shutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "proofBoundary" to proofBoundary,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun glesImportGuardFailure(reason: String, unsupportedFormatAllocation: String): String =
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;validBufferDescribe=not_run;validBufferFormat=0;validBufferUsage=0;" +
+            "missingUsageBufferDescribe=not_run;missingUsageBufferFormat=0;missingUsageBufferUsage=0;missingUsageHasSampled=false;" +
+            "unsupportedFormatBufferDescribe=not_run;unsupportedFormatBufferFormat=0;unsupportedFormatBufferUsage=0;unsupportedFormatIsRgb565=false;" +
+            "unsupportedFormatAllocation=$unsupportedFormatAllocation;" +
+            "initialize=not_run;validPreImport=not_run;validPreHandle=0;validPreDescWidth=0;validPreDescHeight=0;validPreDescLayers=0;validPreDescFormat=0;" +
+            "validPreDescUsageSampled=false;hasValidPreAfterImport=false;validPreRelease=not_run;validPreReleaseFence=-1;hasValidPreAfterRelease=false;" +
+            "missingUsageImport=not_run;missingUsageHandle=0;missingUsageDescZero=false;missingUsageLastError=none;hasMissingUsageAfterImport=false;" +
+            "unsupportedFormatImport=not_run;unsupportedFormatHandle=0;unsupportedFormatDescZero=false;unsupportedFormatLastError=none;hasUnsupportedFormatAfterImport=false;" +
+            "validPostImport=not_run;validPostHandle=0;validPostDescWidth=0;validPostDescHeight=0;validPostDescLayers=0;validPostDescFormat=0;" +
+            "validPostDescUsageSampled=false;hasValidPostAfterImport=false;validPostRelease=not_run;validPostReleaseFence=-1;hasValidPostAfterRelease=false;" +
+            "shutdown=not_run;idempotentShutdown=not_run;proofBoundary=gles_ahb_import_guard_fail_closed_no_yuv_no_oes_no_release_fence_no_product;lastError=$reason"
 }
