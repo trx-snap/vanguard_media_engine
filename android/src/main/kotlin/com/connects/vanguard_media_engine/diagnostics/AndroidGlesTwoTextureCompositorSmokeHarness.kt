@@ -16,6 +16,50 @@ object AndroidGlesTwoTextureCompositorSmokeHarness {
 
     fun runGlesTwoTextureCompositorSmoke(width: Int = 64, height: Int = 64): Map<String, Any?> {
         var surfaceTexture: SurfaceTexture? = null
+        return executeGlesTwoTextureCompositorSmoke(
+            width,
+            height,
+            surfaceProvider = {
+                surfaceTexture = SurfaceTexture(false).apply {
+                    setDefaultBufferSize(width, height)
+                }
+                Surface(surfaceTexture)
+            },
+            releaseSurface = { ownedSurface ->
+                try {
+                    ownedSurface.release()
+                } catch (_: Throwable) {
+                }
+                try {
+                    surfaceTexture?.release()
+                } catch (_: Throwable) {
+                }
+            },
+        )
+    }
+
+    // Phase 1-Unit BA: runs the AS lane against a caller-owned Surface (e.g. a
+    // Flutter TextureRegistry.SurfaceProducer surface). The provided Surface
+    // is never released here — the caller retains sole ownership of it.
+    fun runGlesTwoTextureCompositorSmokeForSurface(
+        surface: Surface,
+        width: Int = 64,
+        height: Int = 64,
+    ): Map<String, Any?> {
+        return executeGlesTwoTextureCompositorSmoke(
+            width,
+            height,
+            surfaceProvider = { surface },
+            releaseSurface = { /* caller-owned; not released here */ },
+        )
+    }
+
+    private fun executeGlesTwoTextureCompositorSmoke(
+        width: Int,
+        height: Int,
+        surfaceProvider: () -> Surface,
+        releaseSurface: (Surface) -> Unit,
+    ): Map<String, Any?> {
         var surface: Surface? = null
         var bufferA: HardwareBuffer? = null
         var bufferB: HardwareBuffer? = null
@@ -33,10 +77,7 @@ object AndroidGlesTwoTextureCompositorSmokeHarness {
                 return parseGlesTwoTextureCompositorResult(raw, "not_run")
             }
 
-            surfaceTexture = SurfaceTexture(false).apply {
-                setDefaultBufferSize(width, height)
-            }
-            surface = Surface(surfaceTexture)
+            surface = surfaceProvider()
 
             bufferA = HardwareBuffer.create(
                 width,
@@ -103,14 +144,7 @@ object AndroidGlesTwoTextureCompositorSmokeHarness {
                 ycbcrBuffer?.close()
             } catch (_: Throwable) {
             }
-            try {
-                surface?.release()
-            } catch (_: Throwable) {
-            }
-            try {
-                surfaceTexture?.release()
-            } catch (_: Throwable) {
-            }
+            surface?.let(releaseSurface)
         }
     }
 
@@ -320,6 +354,50 @@ object AndroidGlesTwoTextureCompositorSmokeHarness {
 
     fun runGlesMixedTextureCompositorSmoke(width: Int = 64, height: Int = 64): Map<String, Any?> {
         var surfaceTexture: SurfaceTexture? = null
+        return executeGlesMixedTextureCompositorSmoke(
+            width,
+            height,
+            surfaceProvider = {
+                surfaceTexture = SurfaceTexture(false).apply {
+                    setDefaultBufferSize(width, height)
+                }
+                Surface(surfaceTexture)
+            },
+            releaseSurface = { ownedSurface ->
+                try {
+                    ownedSurface.release()
+                } catch (_: Throwable) {
+                }
+                try {
+                    surfaceTexture?.release()
+                } catch (_: Throwable) {
+                }
+            },
+        )
+    }
+
+    // Phase 1-Unit BA: runs the AT lane against a caller-owned Surface (e.g. a
+    // Flutter TextureRegistry.SurfaceProducer surface). The provided Surface
+    // is never released here — the caller retains sole ownership of it.
+    fun runGlesMixedTextureCompositorSmokeForSurface(
+        surface: Surface,
+        width: Int = 64,
+        height: Int = 64,
+    ): Map<String, Any?> {
+        return executeGlesMixedTextureCompositorSmoke(
+            width,
+            height,
+            surfaceProvider = { surface },
+            releaseSurface = { /* caller-owned; not released here */ },
+        )
+    }
+
+    private fun executeGlesMixedTextureCompositorSmoke(
+        width: Int,
+        height: Int,
+        surfaceProvider: () -> Surface,
+        releaseSurface: (Surface) -> Unit,
+    ): Map<String, Any?> {
         var surface: Surface? = null
         var rgbaBufferA: HardwareBuffer? = null
         var rgbaBufferB: HardwareBuffer? = null
@@ -338,10 +416,7 @@ object AndroidGlesTwoTextureCompositorSmokeHarness {
                 return parseGlesMixedTextureCompositorResult(raw, "not_run")
             }
 
-            surfaceTexture = SurfaceTexture(false).apply {
-                setDefaultBufferSize(width, height)
-            }
-            surface = Surface(surfaceTexture)
+            surface = surfaceProvider()
 
             rgbaBufferA = HardwareBuffer.create(
                 width,
@@ -420,14 +495,7 @@ object AndroidGlesTwoTextureCompositorSmokeHarness {
                 ycbcrBufferB?.close()
             } catch (_: Throwable) {
             }
-            try {
-                surface?.release()
-            } catch (_: Throwable) {
-            }
-            try {
-                surfaceTexture?.release()
-            } catch (_: Throwable) {
-            }
+            surface?.let(releaseSurface)
         }
     }
 
