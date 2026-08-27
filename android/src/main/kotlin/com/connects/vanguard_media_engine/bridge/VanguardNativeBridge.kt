@@ -125,6 +125,13 @@ class VanguardNativeBridge(
     // ── Phase 1-Unit U: Android GLES backend offscreen EGL lifecycle smoke ──
     external fun runAndroidDagPhase1UGlesBackendSmoke(): String
 
+    // ── Phase 1-Unit V: Android GLES backend window-surface attach/detach smoke ──
+    external fun runAndroidDagPhase1VGlesSurfaceSmoke(
+        surface: Surface,
+        width: Int,
+        height: Int,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

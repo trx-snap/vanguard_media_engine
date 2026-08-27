@@ -766,4 +766,128 @@ object AndroidDagRenderSmokeHarness {
             "proofBoundary" to proofBoundary,
         )
     }
+
+    // ── Phase 1-Unit V: Android GLES backend window-surface attach/detach smoke ──
+    private const val RESULT_MARKER_PHASE1V = "ANDROID_GLES_BACKEND_UNIT_V_NATIVE_RESULT"
+
+    fun runGlesSurfaceSmoke(width: Int = 64, height: Int = 64): Map<String, Any?> {
+        var surfaceTexture: SurfaceTexture? = null
+        var surface: Surface? = null
+        var raw = glesSurfaceFailure("not_run", width, height)
+
+        try {
+            if (width <= 0 || height <= 0) {
+                raw = glesSurfaceFailure("invalid_dimensions", width, height)
+                return parseGlesSurfaceResult(raw)
+            }
+
+            surfaceTexture = SurfaceTexture(false).apply {
+                setDefaultBufferSize(width, height)
+            }
+            surface = Surface(surfaceTexture)
+
+            val diagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                VanguardLifecycleObserver(diagnostics),
+                diagnostics,
+                null,
+            )
+            raw = nativeBridge.runAndroidDagPhase1VGlesSurfaceSmoke(
+                surface,
+                width,
+                height,
+            )
+            return parseGlesSurfaceResult(raw)
+        } catch (throwable: Throwable) {
+            val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
+            raw = glesSurfaceFailure("exception:$reason", width, height)
+            return parseGlesSurfaceResult(raw)
+        } finally {
+            Log.i(TAG, "$RESULT_MARKER_PHASE1V $raw")
+            try {
+                surface?.release()
+            } catch (_: Throwable) {
+            }
+            try {
+                surfaceTexture?.release()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun parseGlesSurfaceResult(raw: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val clientVersion = parsed["clientVersion"]?.toIntOrNull() ?: 0
+        val vendor = parsed["vendor"] ?: ""
+        val renderer = parsed["renderer"] ?: ""
+        val version = parsed["version"] ?: ""
+        val initialSurfaceKind = parsed["initialSurfaceKind"] ?: "none"
+        val firstAttach = parsed["firstAttach"] ?: "not_run"
+        val hasSurfaceAfterAttach = parsed["hasSurfaceAfterAttach"]?.equals("true", ignoreCase = true) ?: false
+        val widthAfterAttach = parsed["widthAfterAttach"]?.toIntOrNull() ?: 0
+        val heightAfterAttach = parsed["heightAfterAttach"]?.toIntOrNull() ?: 0
+        val doubleAttach = parsed["doubleAttach"] ?: "not_run"
+        val doubleAttachLastError = parsed["doubleAttachLastError"] ?: ""
+        val resize = parsed["resize"] ?: "not_run"
+        val resizeLastError = parsed["resizeLastError"] ?: ""
+        val hasSurfaceAfterResize = parsed["hasSurfaceAfterResize"]?.equals("true", ignoreCase = true) ?: false
+        val detach = parsed["detach"] ?: "not_run"
+        val surfaceKindAfterDetach = parsed["surfaceKindAfterDetach"] ?: "none"
+        val widthAfterDetach = parsed["widthAfterDetach"]?.toIntOrNull() ?: 0
+        val heightAfterDetach = parsed["heightAfterDetach"]?.toIntOrNull() ?: 0
+        val reattach = parsed["reattach"] ?: "not_run"
+        val finalDetach = parsed["finalDetach"] ?: "not_run"
+        val shutdown = parsed["shutdown"] ?: "not_run"
+        val idempotentShutdown = parsed["idempotentShutdown"] ?: "not_run"
+        val import = parsed["import"] ?: "not_run"
+        val renderFrame = parsed["renderFrame"] ?: "not_run"
+        val proofBoundary = parsed["proofBoundary"] ?: "gles_window_surface_attach_detach_no_render"
+        val lastError = parsed["lastError"] ?: ""
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "clientVersion" to clientVersion,
+            "vendor" to vendor,
+            "renderer" to renderer,
+            "version" to version,
+            "initialSurfaceKind" to initialSurfaceKind,
+            "firstAttach" to firstAttach,
+            "hasSurfaceAfterAttach" to hasSurfaceAfterAttach,
+            "widthAfterAttach" to widthAfterAttach,
+            "heightAfterAttach" to heightAfterAttach,
+            "doubleAttach" to doubleAttach,
+            "doubleAttachLastError" to doubleAttachLastError,
+            "resize" to resize,
+            "resizeLastError" to resizeLastError,
+            "hasSurfaceAfterResize" to hasSurfaceAfterResize,
+            "detach" to detach,
+            "surfaceKindAfterDetach" to surfaceKindAfterDetach,
+            "widthAfterDetach" to widthAfterDetach,
+            "heightAfterDetach" to heightAfterDetach,
+            "reattach" to reattach,
+            "finalDetach" to finalDetach,
+            "shutdown" to shutdown,
+            "idempotentShutdown" to idempotentShutdown,
+            "import" to import,
+            "renderFrame" to renderFrame,
+            "proofBoundary" to proofBoundary,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun glesSurfaceFailure(reason: String, width: Int, height: Int): String =
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;initialSurfaceKind=none;" +
+            "firstAttach=$reason;hasSurfaceAfterAttach=false;widthAfterAttach=0;heightAfterAttach=0;" +
+            "doubleAttach=not_run;doubleAttachLastError=;resize=not_run;resizeLastError=;" +
+            "hasSurfaceAfterResize=false;detach=not_run;surfaceKindAfterDetach=none;widthAfterDetach=0;heightAfterDetach=0;" +
+            "reattach=not_run;finalDetach=not_run;shutdown=not_run;idempotentShutdown=not_run;" +
+            "import=not_run;renderFrame=not_run;proofBoundary=gles_window_surface_attach_detach_no_render;lastError=$reason"
 }

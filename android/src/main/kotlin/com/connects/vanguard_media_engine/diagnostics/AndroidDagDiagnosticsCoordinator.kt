@@ -44,6 +44,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase3UnitKCameraNativeRenderSmoke",
             "runAndroidDagPhase3UnitLCameraNativeRenderLoopSmoke",
             "runAndroidDagPhase1UGlesBackendSmoke",
+            "runAndroidDagPhase1VGlesSurfaceSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -74,6 +75,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase3UnitLCameraNativeRenderLoopSmoke" ->
                 runPhase3UnitLCameraNativeRenderLoopSmoke(args, result)
             "runAndroidDagPhase1UGlesBackendSmoke" -> runPhase1UGlesBackendSmoke(result)
+            "runAndroidDagPhase1VGlesSurfaceSmoke" -> runPhase1VGlesSurfaceSmoke(args, result)
             else -> return false
         }
         return true
@@ -354,6 +356,26 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_BACKEND_SMOKE_FAILED",
                         "runAndroidDagPhase1UGlesBackendSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 1-Unit V: Android GLES backend window-surface attach/detach smoke ──
+    private fun runPhase1VGlesSurfaceSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val width = (args?.get("width") as? Number)?.toInt() ?: 64
+        val height = (args?.get("height") as? Number)?.toInt() ?: 64
+        Thread {
+            try {
+                val smokeResult = AndroidDagRenderSmokeHarness.runGlesSurfaceSmoke(width, height)
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_SURFACE_SMOKE_FAILED",
+                        "runAndroidDagPhase1VGlesSurfaceSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

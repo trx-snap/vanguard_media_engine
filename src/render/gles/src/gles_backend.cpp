@@ -1,4 +1,4 @@
-// Unit U: GlesBackend implementation.
+// Unit U/V: GlesBackend implementation.
 //
 // On Android (__ANDROID__):
 //   - EGL/GLES headers included here only, never in the public header.
@@ -6,13 +6,18 @@
 //     GLES context (ES3 preferred, falling back to ES2), makes it current,
 //     queries GL_VENDOR/GL_RENDERER/GL_VERSION, and performs a diagnostic
 //     glClear + eglSwapBuffers.
-//   - Window/swapchain surface support (attachSurface/resizeSurface) remains
-//     unavailable; this unit only establishes the offscreen EGL lifecycle.
+//   - Unit V: attachSurface()/detachSurface() create/destroy a window
+//     EGLSurface from a borrowed ANativeWindow* and make it current, leaving
+//     the offscreen pbuffer current whenever no window surface is attached.
+//     resizeSurface() cannot recreate the window surface (the backend does
+//     not store the native window) and always fails while attached.
 //
 // On non-Android host builds:
 //   - No EGL/GLES headers included.
 //   - initialize() preserves the prior scaffold behavior (returns true) with
 //     diagnostic fields reporting unavailable/stub state.
+//   - attachSurface()/resizeSurface() remain unavailable; hasSurface() is
+//     always false.
 
 #include "vanguard/render/gles_backend.h"
 
@@ -39,7 +44,8 @@ struct GlesBackend::Impl {
     EGLDisplay display = EGL_NO_DISPLAY;
     EGLConfig  config  = nullptr;
     EGLContext context = EGL_NO_CONTEXT;
-    EGLSurface surface = EGL_NO_SURFACE;
+    EGLSurface offscreenSurface = EGL_NO_SURFACE;
+    EGLSurface windowSurface = EGL_NO_SURFACE;
 #endif
 
     bool initialized = false;
@@ -50,6 +56,8 @@ struct GlesBackend::Impl {
     std::string renderer;
     std::string version;
     std::string lastError;
+    uint32_t surfaceWidth = 0;
+    uint32_t surfaceHeight = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -96,7 +104,7 @@ bool GlesBackend::initialize() {
     }
 
     const EGLint configAttribs[] = {
-        EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT,
+        EGL_SURFACE_TYPE,    EGL_PBUFFER_BIT | EGL_WINDOW_BIT,
         EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
         EGL_RED_SIZE,   8,
         EGL_GREEN_SIZE, 8,
@@ -134,8 +142,8 @@ bool GlesBackend::initialize() {
     impl_->clientVersion = clientVersion;
 
     const EGLint pbufferAttribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
-    EGLSurface surface = eglCreatePbufferSurface(impl_->display, impl_->config, pbufferAttribs);
-    if (surface == EGL_NO_SURFACE) {
+    EGLSurface offscreenSurface = eglCreatePbufferSurface(impl_->display, impl_->config, pbufferAttribs);
+    if (offscreenSurface == EGL_NO_SURFACE) {
         impl_->lastError = "eglCreatePbufferSurface failed";
         eglDestroyContext(impl_->display, impl_->context);
         impl_->context = EGL_NO_CONTEXT;
@@ -145,12 +153,12 @@ bool GlesBackend::initialize() {
         impl_->clientVersion = 0;
         return false;
     }
-    impl_->surface = surface;
+    impl_->offscreenSurface = offscreenSurface;
 
-    if (eglMakeCurrent(impl_->display, impl_->surface, impl_->surface, impl_->context) != EGL_TRUE) {
+    if (eglMakeCurrent(impl_->display, impl_->offscreenSurface, impl_->offscreenSurface, impl_->context) != EGL_TRUE) {
         impl_->lastError = "eglMakeCurrent failed";
-        eglDestroySurface(impl_->display, impl_->surface);
-        impl_->surface = EGL_NO_SURFACE;
+        eglDestroySurface(impl_->display, impl_->offscreenSurface);
+        impl_->offscreenSurface = EGL_NO_SURFACE;
         eglDestroyContext(impl_->display, impl_->context);
         impl_->context = EGL_NO_CONTEXT;
         impl_->config = nullptr;
@@ -184,7 +192,7 @@ bool GlesBackend::initialize() {
         return false;
     }
 
-    impl_->diagnosticSwapOk = (eglSwapBuffers(impl_->display, impl_->surface) == EGL_TRUE);
+    impl_->diagnosticSwapOk = (eglSwapBuffers(impl_->display, impl_->offscreenSurface) == EGL_TRUE);
     if (!impl_->diagnosticSwapOk) {
         std::string error = "diagnostic eglSwapBuffers failed";
         shutdown();
@@ -209,8 +217,11 @@ void GlesBackend::shutdown() {
 #if defined(__ANDROID__)
     if (impl_->display != EGL_NO_DISPLAY) {
         eglMakeCurrent(impl_->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        if (impl_->surface != EGL_NO_SURFACE) {
-            eglDestroySurface(impl_->display, impl_->surface);
+        if (impl_->windowSurface != EGL_NO_SURFACE) {
+            eglDestroySurface(impl_->display, impl_->windowSurface);
+        }
+        if (impl_->offscreenSurface != EGL_NO_SURFACE) {
+            eglDestroySurface(impl_->display, impl_->offscreenSurface);
         }
         if (impl_->context != EGL_NO_CONTEXT) {
             eglDestroyContext(impl_->display, impl_->context);
@@ -219,7 +230,8 @@ void GlesBackend::shutdown() {
     }
     impl_->display = EGL_NO_DISPLAY;
     impl_->context = EGL_NO_CONTEXT;
-    impl_->surface = EGL_NO_SURFACE;
+    impl_->windowSurface = EGL_NO_SURFACE;
+    impl_->offscreenSurface = EGL_NO_SURFACE;
     impl_->config  = nullptr;
 #endif
 
@@ -231,6 +243,8 @@ void GlesBackend::shutdown() {
     impl_->renderer.clear();
     impl_->version.clear();
     impl_->lastError.clear();
+    impl_->surfaceWidth = 0;
+    impl_->surfaceHeight = 0;
 }
 
 RenderBackendType GlesBackend::type() const {
@@ -238,7 +252,7 @@ RenderBackendType GlesBackend::type() const {
 }
 
 // ---------------------------------------------------------------------------
-// Unit U: offscreen EGL/GLES diagnostic accessors.
+// Unit U/V: offscreen + window-surface EGL/GLES diagnostic accessors.
 // ---------------------------------------------------------------------------
 
 bool GlesBackend::isInitialized() const {
@@ -273,23 +287,136 @@ const char* GlesBackend::lastError() const {
     return impl_->lastError.c_str();
 }
 
+uint32_t GlesBackend::surfaceWidth() const {
+    return impl_->surfaceWidth;
+}
+
+uint32_t GlesBackend::surfaceHeight() const {
+    return impl_->surfaceHeight;
+}
+
+const char* GlesBackend::activeSurfaceKind() const {
+    if (hasSurface()) {
+        return "window";
+    }
+    if (impl_->initialized) {
+        return "offscreen";
+    }
+    return "none";
+}
+
 // ---------------------------------------------------------------------------
-// Surface lifecycle: window/swapchain presentation remains unavailable.
-// Offscreen EGL init above does not imply external surface support.
+// Unit V: window EGLSurface attach/detach lifecycle.
+//
+// nativeWindow is a borrowed ANativeWindow* cast to void*; it is never
+// acquired, released, retained, or stored beyond this call (see
+// RenderBackend::attachSurface).
 // ---------------------------------------------------------------------------
 
-bool GlesBackend::attachSurface(void*, uint32_t, uint32_t) {
+bool GlesBackend::attachSurface(void* nativeWindow, uint32_t width, uint32_t height) {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return false;
+    }
+    if (nativeWindow == nullptr) {
+        impl_->lastError = "null_native_window";
+        return false;
+    }
+    if (width == 0 || height == 0) {
+        impl_->lastError = "invalid_surface_dimensions";
+        return false;
+    }
+    if (hasSurface()) {
+        impl_->lastError = "surface_already_attached";
+        return false;
+    }
+
+#if defined(__ANDROID__)
+    const EGLint windowAttribs[] = { EGL_NONE };
+    EGLSurface windowSurface = eglCreateWindowSurface(
+        impl_->display,
+        impl_->config,
+        reinterpret_cast<EGLNativeWindowType>(nativeWindow),
+        windowAttribs);
+    if (windowSurface == EGL_NO_SURFACE) {
+        impl_->lastError = "eglCreateWindowSurface failed";
+        return false;
+    }
+
+    if (eglMakeCurrent(impl_->display, windowSurface, windowSurface, impl_->context) != EGL_TRUE) {
+        impl_->lastError = "eglMakeCurrent failed for window surface";
+        eglDestroySurface(impl_->display, windowSurface);
+        // Best-effort restore of the offscreen pbuffer as current; hasSurface()
+        // remains false either way.
+        eglMakeCurrent(impl_->display, impl_->offscreenSurface, impl_->offscreenSurface, impl_->context);
+        return false;
+    }
+
+    impl_->windowSurface = windowSurface;
+    impl_->surfaceWidth = width;
+    impl_->surfaceHeight = height;
+    impl_->lastError.clear();
+    return true;
+#else
+    (void)width;
+    (void)height;
+    impl_->lastError = "window_surface_unavailable_on_host";
+    return false;
+#endif
+}
+
+bool GlesBackend::resizeSurface(uint32_t width, uint32_t height) {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return false;
+    }
+    if (width == 0 || height == 0) {
+        impl_->lastError = "invalid_surface_dimensions";
+        return false;
+    }
+    if (!hasSurface()) {
+        impl_->lastError = "no_surface_attached";
+        return false;
+    }
+
+    // The backend does not store the borrowed ANativeWindow*, so the window
+    // EGLSurface cannot be recreated in place; callers must detachSurface()
+    // and attachSurface() again with the new dimensions.
+    impl_->lastError = "resize_requires_reattach";
     return false;
 }
 
-bool GlesBackend::resizeSurface(uint32_t, uint32_t) {
-    return false;
-}
+void GlesBackend::detachSurface() {
+#if defined(__ANDROID__)
+    if (impl_->windowSurface == EGL_NO_SURFACE) {
+        return;
+    }
 
-void GlesBackend::detachSurface() {}
+    impl_->lastError.clear();
+
+    if (impl_->display != EGL_NO_DISPLAY && impl_->offscreenSurface != EGL_NO_SURFACE) {
+        if (eglMakeCurrent(impl_->display, impl_->offscreenSurface, impl_->offscreenSurface, impl_->context) != EGL_TRUE) {
+            impl_->lastError = "eglMakeCurrent failed while restoring offscreen surface during detach";
+        }
+    }
+
+    eglDestroySurface(impl_->display, impl_->windowSurface);
+    impl_->windowSurface = EGL_NO_SURFACE;
+    impl_->surfaceWidth = 0;
+    impl_->surfaceHeight = 0;
+#endif
+}
 
 bool GlesBackend::hasSurface() const {
+#if defined(__ANDROID__)
+    return impl_->windowSurface != EGL_NO_SURFACE;
+#else
     return false;
+#endif
 }
 
 // ---------------------------------------------------------------------------

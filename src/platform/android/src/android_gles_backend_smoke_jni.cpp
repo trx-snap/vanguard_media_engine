@@ -1,13 +1,15 @@
-// Unit U: Android GLES backend offscreen EGL lifecycle smoke JNI bridge.
+// Unit U/V: Android GLES backend offscreen EGL lifecycle & window-surface attach/detach smoke JNI bridge.
 //
 // This translation unit is Android-only and must NOT be included in iOS or
 // host builds. It is added via the Android-only target_sources block in
 // src/CMakeLists.txt.
 //
-// JNI entry point (matching VanguardNativeBridge.kt Phase 1-Unit U declaration):
+// JNI entry points (matching VanguardNativeBridge.kt Phase 1-Unit U/V declarations):
 //   runAndroidDagPhase1UGlesBackendSmoke -> jstring
+//   runAndroidDagPhase1VGlesSurfaceSmoke -> jstring
 
 #include <jni.h>
+#include <android/native_window_jni.h>
 
 #include <algorithm>
 #include <cstring>
@@ -126,6 +128,244 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         << "idempotentShutdown=" << (idempotentShutdownOk ? "success" : "failed") << ";"
         << "proofBoundary=offscreen_egl_pbuffer_no_window_surface;"
         << "lastError=" << (lastErrorAfterInit.empty() ? "none" : lastErrorAfterInit);
+
+    const std::string resultStr = oss.str();
+    return env->NewStringUTF(resultStr.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroidDagPhase1VGlesSurfaceSmoke(
+    JNIEnv* env,
+    jobject /* this */,
+    jobject jsurface,
+    jint width,
+    jint height) {
+
+    if (!jsurface || width <= 0 || height <= 0) {
+        std::ostringstream oss;
+        oss << "status=FAIL;"
+            << "clientVersion=0;"
+            << "vendor=;"
+            << "renderer=;"
+            << "version=;"
+            << "initialSurfaceKind=none;"
+            << "firstAttach=not_run;"
+            << "hasSurfaceAfterAttach=false;"
+            << "widthAfterAttach=0;"
+            << "heightAfterAttach=0;"
+            << "doubleAttach=not_run;"
+            << "doubleAttachLastError=;"
+            << "resize=not_run;"
+            << "resizeLastError=;"
+            << "hasSurfaceAfterResize=false;"
+            << "detach=not_run;"
+            << "surfaceKindAfterDetach=none;"
+            << "widthAfterDetach=0;"
+            << "heightAfterDetach=0;"
+            << "reattach=not_run;"
+            << "finalDetach=not_run;"
+            << "shutdown=not_run;"
+            << "idempotentShutdown=not_run;"
+            << "import=not_run;"
+            << "renderFrame=not_run;"
+            << "proofBoundary=gles_window_surface_attach_detach_no_render;"
+            << "lastError=invalid_arguments";
+        return env->NewStringUTF(oss.str().c_str());
+    }
+
+    ANativeWindow* window = ANativeWindow_fromSurface(env, jsurface);
+    if (!window) {
+        std::ostringstream oss;
+        oss << "status=FAIL;"
+            << "clientVersion=0;"
+            << "vendor=;"
+            << "renderer=;"
+            << "version=;"
+            << "initialSurfaceKind=none;"
+            << "firstAttach=not_run;"
+            << "hasSurfaceAfterAttach=false;"
+            << "widthAfterAttach=0;"
+            << "heightAfterAttach=0;"
+            << "doubleAttach=not_run;"
+            << "doubleAttachLastError=;"
+            << "resize=not_run;"
+            << "resizeLastError=;"
+            << "hasSurfaceAfterResize=false;"
+            << "detach=not_run;"
+            << "surfaceKindAfterDetach=none;"
+            << "widthAfterDetach=0;"
+            << "heightAfterDetach=0;"
+            << "reattach=not_run;"
+            << "finalDetach=not_run;"
+            << "shutdown=not_run;"
+            << "idempotentShutdown=not_run;"
+            << "import=not_run;"
+            << "renderFrame=not_run;"
+            << "proofBoundary=gles_window_surface_attach_detach_no_render;"
+            << "lastError=native_window_from_surface_failed";
+        return env->NewStringUTF(oss.str().c_str());
+    }
+
+    vanguard::render::GlesBackend backend;
+
+    // 1. Initial initialize()
+    const bool initOk = backend.initialize();
+    const bool isInitializedAfterInit = backend.isInitialized();
+    const int clientVersion = backend.clientVersion();
+    const std::string vendor = SanitizeString(backend.diagnosticVendor());
+    const std::string renderer = SanitizeString(backend.diagnosticRenderer());
+    const std::string version = SanitizeString(backend.diagnosticVersion());
+    const bool hasSurfaceInitial = backend.hasSurface();
+    const std::string initialSurfaceKind = SanitizeString(backend.activeSurfaceKind());
+    const bool initCheckOk = initOk && isInitializedAfterInit && !hasSurfaceInitial &&
+                             (initialSurfaceKind == "offscreen") && (clientVersion >= 2) &&
+                             !vendor.empty() && !renderer.empty() && !version.empty();
+
+    // 2. First attachSurface(window, width, height)
+    const bool firstAttachOk = backend.attachSurface(window, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    const bool hasSurfaceAfterAttach = backend.hasSurface();
+    const std::string surfaceKindAfterAttach = SanitizeString(backend.activeSurfaceKind());
+    const uint32_t widthAfterAttach = backend.surfaceWidth();
+    const uint32_t heightAfterAttach = backend.surfaceHeight();
+    const bool firstAttachCheckOk = firstAttachOk && hasSurfaceAfterAttach &&
+                                   (surfaceKindAfterAttach == "window") &&
+                                   (widthAfterAttach == static_cast<uint32_t>(width)) &&
+                                   (heightAfterAttach == static_cast<uint32_t>(height));
+
+    // 3. Double attach while attached returns false; lastError surface_already_attached; original surface remains attached and dimensions unchanged.
+    const bool doubleAttachResult = backend.attachSurface(window, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    const std::string doubleAttachLastError = SanitizeString(backend.lastError());
+    const bool hasSurfaceAfterDoubleAttach = backend.hasSurface();
+    const uint32_t widthAfterDoubleAttach = backend.surfaceWidth();
+    const uint32_t heightAfterDoubleAttach = backend.surfaceHeight();
+    const bool doubleAttachCheckOk = !doubleAttachResult &&
+                                    (doubleAttachLastError == "surface_already_attached") &&
+                                    hasSurfaceAfterDoubleAttach &&
+                                    (widthAfterDoubleAttach == static_cast<uint32_t>(width)) &&
+                                    (heightAfterDoubleAttach == static_cast<uint32_t>(height));
+
+    // 4. resizeSurface(width+16, height+16) returns false; lastError resize_requires_reattach; original surface remains attached and dimensions unchanged.
+    const bool resizeResult = backend.resizeSurface(static_cast<uint32_t>(width + 16), static_cast<uint32_t>(height + 16));
+    const std::string resizeLastError = SanitizeString(backend.lastError());
+    const bool hasSurfaceAfterResize = backend.hasSurface();
+    const uint32_t widthAfterResize = backend.surfaceWidth();
+    const uint32_t heightAfterResize = backend.surfaceHeight();
+    const bool resizeCheckOk = !resizeResult &&
+                               (resizeLastError == "resize_requires_reattach") &&
+                               hasSurfaceAfterResize &&
+                               (widthAfterResize == static_cast<uint32_t>(width)) &&
+                               (heightAfterResize == static_cast<uint32_t>(height));
+
+    // 5. detachSurface() makes hasSurface false, activeSurfaceKind offscreen, dimensions 0, isInitialized true.
+    backend.detachSurface();
+    const bool hasSurfaceAfterDetach = backend.hasSurface();
+    const std::string surfaceKindAfterDetach = SanitizeString(backend.activeSurfaceKind());
+    const uint32_t widthAfterDetach = backend.surfaceWidth();
+    const uint32_t heightAfterDetach = backend.surfaceHeight();
+    const bool isInitAfterDetach = backend.isInitialized();
+    const bool detachCheckOk = !hasSurfaceAfterDetach &&
+                               (surfaceKindAfterDetach == "offscreen") &&
+                               (widthAfterDetach == 0) &&
+                               (heightAfterDetach == 0) &&
+                               isInitAfterDetach;
+
+    // 6. Reattach after detach succeeds
+    const bool reattachOk = backend.attachSurface(window, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    const bool hasSurfaceAfterReattach = backend.hasSurface();
+    const std::string surfaceKindAfterReattach = SanitizeString(backend.activeSurfaceKind());
+    const uint32_t widthAfterReattach = backend.surfaceWidth();
+    const uint32_t heightAfterReattach = backend.surfaceHeight();
+    const bool reattachCheckOk = reattachOk &&
+                                 hasSurfaceAfterReattach &&
+                                 (surfaceKindAfterReattach == "window") &&
+                                 (widthAfterReattach == static_cast<uint32_t>(width)) &&
+                                 (heightAfterReattach == static_cast<uint32_t>(height));
+
+    // 7. Final detach succeeds
+    backend.detachSurface();
+    const bool hasSurfaceAfterFinalDetach = backend.hasSurface();
+    const std::string surfaceKindAfterFinalDetach = SanitizeString(backend.activeSurfaceKind());
+    const uint32_t widthAfterFinalDetach = backend.surfaceWidth();
+    const uint32_t heightAfterFinalDetach = backend.surfaceHeight();
+    const bool finalDetachCheckOk = !hasSurfaceAfterFinalDetach &&
+                                    (surfaceKindAfterFinalDetach == "offscreen") &&
+                                    (widthAfterFinalDetach == 0) &&
+                                    (heightAfterFinalDetach == 0);
+
+    // 8. Shutdown clears initialized state and activeSurfaceKind none; second shutdown safe.
+    backend.shutdown();
+    const bool postShutdownInit = backend.isInitialized();
+    const std::string postShutdownSurfaceKind = SanitizeString(backend.activeSurfaceKind());
+    const bool postShutdownHasSurface = backend.hasSurface();
+    const uint32_t postShutdownWidth = backend.surfaceWidth();
+    const uint32_t postShutdownHeight = backend.surfaceHeight();
+    const bool shutdown1Ok = !postShutdownInit &&
+                             (postShutdownSurfaceKind == "none") &&
+                             !postShutdownHasSurface &&
+                             (postShutdownWidth == 0) &&
+                             (postShutdownHeight == 0);
+
+    backend.shutdown();
+    const bool idempotentShutdownOk = !backend.isInitialized() &&
+                                       (std::string(backend.activeSurfaceKind()) == "none") &&
+                                       !backend.hasSurface() &&
+                                       (backend.surfaceWidth() == 0) &&
+                                       (backend.surfaceHeight() == 0);
+
+    // 9. Stubs validation: renderFrame(kInvalidHardwareBufferHandle) remains kUnavailable and importHardwareBuffer(nullptr,-1,...) remains kUnavailable.
+    vanguard::render::HardwareBufferHandle handle = vanguard::render::kInvalidHardwareBufferHandle;
+    vanguard::render::HardwareBufferDescriptor desc{};
+    const auto importRes = backend.importHardwareBuffer(nullptr, -1, &handle, &desc);
+    const bool importUnavailable = (importRes == vanguard::render::HardwareBufferImportResult::kUnavailable);
+
+    const auto renderRes = backend.renderFrame(vanguard::render::kInvalidHardwareBufferHandle);
+    const bool renderUnavailable = (renderRes == vanguard::render::RenderFrameResult::kUnavailable);
+
+    // Release ANativeWindow reference owned by JNI harness
+    ANativeWindow_release(window);
+
+    const bool allChecksPass = initCheckOk &&
+                               firstAttachCheckOk &&
+                               doubleAttachCheckOk &&
+                               resizeCheckOk &&
+                               detachCheckOk &&
+                               reattachCheckOk &&
+                               finalDetachCheckOk &&
+                               shutdown1Ok &&
+                               idempotentShutdownOk &&
+                               importUnavailable &&
+                               renderUnavailable;
+
+    const std::string backendLastError = SanitizeString(backend.lastError());
+
+    std::ostringstream oss;
+    oss << "status=" << (allChecksPass ? "PASS" : "FAIL") << ";"
+        << "clientVersion=" << clientVersion << ";"
+        << "vendor=" << vendor << ";"
+        << "renderer=" << renderer << ";"
+        << "version=" << version << ";"
+        << "initialSurfaceKind=" << initialSurfaceKind << ";"
+        << "firstAttach=" << (firstAttachOk ? "success" : "failed") << ";"
+        << "hasSurfaceAfterAttach=" << (hasSurfaceAfterAttach ? "true" : "false") << ";"
+        << "widthAfterAttach=" << widthAfterAttach << ";"
+        << "heightAfterAttach=" << heightAfterAttach << ";"
+        << "doubleAttach=" << (doubleAttachResult ? "unexpected_success" : "rejected_as_expected") << ";"
+        << "doubleAttachLastError=" << doubleAttachLastError << ";"
+        << "resize=" << (resizeResult ? "unexpected_success" : "rejected_as_expected") << ";"
+        << "resizeLastError=" << resizeLastError << ";"
+        << "hasSurfaceAfterResize=" << (hasSurfaceAfterResize ? "true" : "false") << ";"
+        << "detach=" << (detachCheckOk ? "success" : "failed") << ";"
+        << "surfaceKindAfterDetach=" << surfaceKindAfterDetach << ";"
+        << "widthAfterDetach=" << widthAfterDetach << ";"
+        << "heightAfterDetach=" << heightAfterDetach << ";"
+        << "reattach=" << (reattachOk ? "success" : "failed") << ";"
+        << "finalDetach=" << (finalDetachCheckOk ? "success" : "failed") << ";"
+        << "shutdown=" << (shutdown1Ok ? "success" : "failed") << ";"
+        << "idempotentShutdown=" << (idempotentShutdownOk ? "success" : "failed") << ";"
+        << "import=" << (importUnavailable ? "unavailable" : "unexpected_result") << ";"
+        << "renderFrame=" << (renderUnavailable ? "unavailable" : "unexpected_result") << ";"
+        << "proofBoundary=gles_window_surface_attach_detach_no_render;"
+        << "lastError=" << (backendLastError.empty() ? "none" : backendLastError);
 
     const std::string resultStr = oss.str();
     return env->NewStringUTF(resultStr.c_str());
