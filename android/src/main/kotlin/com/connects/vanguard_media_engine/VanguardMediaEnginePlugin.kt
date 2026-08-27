@@ -13,6 +13,7 @@ import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordin
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
+import com.connects.vanguard_media_engine.image.AndroidImageOptimizer
 import com.connects.vanguard_media_engine.rtc.AndroidRtcVideoCoordinator
 import com.connects.vanguard_media_engine.streaming.AndroidDagStreamingPlaybackCoordinator
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -521,6 +522,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                         mainHandler.post { result.error("COMPRESS_FAILED", e.message, null) }
                     }
                 }.start()
+            }
+
+            // ── optimizeImage (Phase 5 Unit E) ──────────────────────────────────────────
+            // Thin route -- all decode/resize/encode policy lives in AndroidImageOptimizer.
+            "optimizeImage" -> {
+                AndroidImageOptimizer.optimize(context, args, result, mainHandler)
             }
 
             "generateThumbnails" -> {
