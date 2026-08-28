@@ -1,6 +1,7 @@
 package com.connects.vanguard_media_engine.export
 
 import android.content.Context
+import android.media.ExifInterface
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
@@ -8,6 +9,7 @@ import android.util.Log
 import java.io.File
 import java.util.UUID
 import kotlin.math.abs
+import kotlin.math.floor
 
 // ── AndroidTimelineExportSession (Export Unit C) ──────────────────────────────
 //
@@ -63,7 +65,12 @@ class AndroidTimelineExportSession(private val context: Context) {
 
     // ─────────────────────────────────────────────────────────────────────────
 
-    private data class ParsedClip(val sourcePath: String, val trimStart: Double, val trimEnd: Double)
+    private data class ParsedClip(
+        val sourcePath: String,
+        val trimStart: Double,
+        val trimEnd: Double,
+        val mediaKind: String,
+    )
 
     private data class ClipContext(
         val sourcePath: String,
@@ -72,6 +79,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         val decodedWidth: Int,
         val decodedHeight: Int,
         val rotationDegrees: Int,
+        val mediaKind: String,
     )
 
     private fun run(
@@ -145,8 +153,13 @@ class AndroidTimelineExportSession(private val context: Context) {
                 return
             }
             val mediaKind = map["mediaKind"] as? String ?: "video"
-            if (mediaKind != "video") {
+            if (mediaKind != "video" && mediaKind != "image") {
                 onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: clip.mediaKind '$mediaKind' is not supported")
+                return
+            }
+            val fitMode = map["fitMode"] as? String
+            if (fitMode != null && fitMode != "fit") {
+                onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: clip.fitMode '$fitMode' is not supported")
                 return
             }
             val trimStart = (map["trimStartSeconds"] as? Number)?.toDouble()
@@ -188,12 +201,39 @@ class AndroidTimelineExportSession(private val context: Context) {
                 onError("FILE_UNREADABLE", "exportTimeline: cannot read clip source: $sourcePath")
                 return
             }
-            parsedClips.add(ParsedClip(sourcePath, trimStart, trimEnd))
+            parsedClips.add(ParsedClip(sourcePath, trimStart, trimEnd, mediaKind))
         }
 
         // ── 3. Probe decoded geometry + rotation for every clip ─────────────
         val clipContexts = mutableListOf<ClipContext>()
         for (clip in parsedClips) {
+            if (clip.mediaKind == "image") {
+                val imageProbe = probeImageClip(clip.sourcePath)
+                if (imageProbe == null) {
+                    onError("FILE_UNREADABLE", "exportTimeline: no readable image data in ${clip.sourcePath}")
+                    return
+                }
+                if (imageProbe.exifOrientation != ExifInterface.ORIENTATION_NORMAL) {
+                    onError(
+                        "UNSUPPORTED_EXPORT_FEATURE",
+                        "exportTimeline: image EXIF orientation ${imageProbe.exifOrientation} is not supported",
+                    )
+                    return
+                }
+                clipContexts.add(
+                    ClipContext(
+                        sourcePath = clip.sourcePath,
+                        trimStartSeconds = clip.trimStart,
+                        trimEndSeconds = clip.trimEnd,
+                        decodedWidth = imageProbe.width,
+                        decodedHeight = imageProbe.height,
+                        rotationDegrees = 0,
+                        mediaKind = clip.mediaKind,
+                    ),
+                )
+                continue
+            }
+
             val probe = probeVideoTrack(clip.sourcePath)
             if (probe == null) {
                 onError("FILE_UNREADABLE", "exportTimeline: no readable video track in ${clip.sourcePath}")
@@ -217,6 +257,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     decodedWidth = probe.width,
                     decodedHeight = probe.height,
                     rotationDegrees = normalizedRotation,
+                    mediaKind = clip.mediaKind,
                 ),
             )
         }
@@ -273,6 +314,35 @@ class AndroidTimelineExportSession(private val context: Context) {
             return
         }
 
+        val clipInputs = mutableListOf<AndroidTimelineVideoEncoder.ClipInput>()
+        for (ctx in clipContexts) {
+            var stillFrameCount = 0
+            if (ctx.mediaKind == "image") {
+                val duration = ctx.trimEndSeconds - ctx.trimStartSeconds
+                stillFrameCount = floor(duration * requestFps + 0.5).toInt().coerceAtLeast(1)
+                if (stillFrameCount > MAX_STILL_FRAME_COUNT) {
+                    deleteOwnedTemps()
+                    onError(
+                        "UNSUPPORTED_EXPORT_FEATURE",
+                        "exportTimeline: still image clip frame count $stillFrameCount exceeds limit of $MAX_STILL_FRAME_COUNT",
+                    )
+                    return
+                }
+            }
+            clipInputs.add(
+                AndroidTimelineVideoEncoder.ClipInput(
+                    sourcePath = ctx.sourcePath,
+                    trimStartSeconds = ctx.trimStartSeconds,
+                    trimEndSeconds = ctx.trimEndSeconds,
+                    decodedWidth = ctx.decodedWidth,
+                    decodedHeight = ctx.decodedHeight,
+                    rotationDegrees = ctx.rotationDegrees,
+                    mediaKind = ctx.mediaKind,
+                    stillFrameCount = stillFrameCount,
+                ),
+            )
+        }
+
         val encoder = AndroidTimelineVideoEncoder(
             outputPath = videoTempPath,
             width = requestWidth,
@@ -282,18 +352,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         )
         activeEncoder = encoder
 
-        val encodeResult = encoder.encode(
-            clipContexts.map {
-                AndroidTimelineVideoEncoder.ClipInput(
-                    sourcePath = it.sourcePath,
-                    trimStartSeconds = it.trimStartSeconds,
-                    trimEndSeconds = it.trimEndSeconds,
-                    decodedWidth = it.decodedWidth,
-                    decodedHeight = it.decodedHeight,
-                    rotationDegrees = it.rotationDegrees,
-                )
-            },
-        )
+        val encodeResult = encoder.encode(clipInputs)
         activeEncoder = null
 
         if (!encodeResult.success) {
@@ -460,6 +519,14 @@ class AndroidTimelineExportSession(private val context: Context) {
 
     private data class VideoProbe(val width: Int, val height: Int, val rotationDegrees: Int)
 
+    private data class ImageProbe(val width: Int, val height: Int, val exifOrientation: Int)
+
+    private fun probeImageClip(path: String): ImageProbe? {
+        val bounds = AndroidStillImageDecoder.probeBounds(path) ?: return null
+        val exifOrientation = AndroidStillImageDecoder.readExifOrientation(path)
+        return ImageProbe(bounds.width, bounds.height, exifOrientation)
+    }
+
     private fun probeVideoTrack(path: String): VideoProbe? {
         val extractor = MediaExtractor()
         try {
@@ -507,6 +574,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         private const val DEFAULT_BITRATE_BPS = 4_000_000
         private const val TRIM_START_TOLERANCE_SECONDS = 0.001
         private const val DURATION_TOLERANCE_SECONDS = 0.05
+        private const val MAX_STILL_FRAME_COUNT = 36_000
 
         // Clip-level wire keys for features not implemented by Unit C's minimal
         // hard-cut passthrough. Presence of any of these (non-null) means the

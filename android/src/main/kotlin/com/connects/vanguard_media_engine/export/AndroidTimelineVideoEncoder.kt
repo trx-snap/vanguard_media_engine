@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.export
 
+import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -14,6 +15,7 @@ import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
+import android.opengl.GLUtils
 import android.util.Log
 import android.view.Surface
 import java.io.File
@@ -72,6 +74,8 @@ class AndroidTimelineVideoEncoder(
         val decodedWidth: Int,
         val decodedHeight: Int,
         val rotationDegrees: Int,
+        val mediaKind: String = "video",
+        val stillFrameCount: Int = 0,
     )
 
     data class EncodeResult(
@@ -109,6 +113,12 @@ class AndroidTimelineVideoEncoder(
     private var uSTMatrixLoc = 0
     private var framesSubmitted = 0
 
+    // ─── 2D GL program (still-image clips) — distinct locations from the OES
+    // program above; never reused between the two draw paths. ────────────────
+    private var glProgram2D = 0
+    private var aPositionLoc2D = 0
+    private var aTexCoordLoc2D = 0
+
     // ─── Decode-side transfer surface (OES texture target for the decoder) ──
     private var decodeSurfaceTexture: SurfaceTexture? = null
     private var decodeInputSurface: Surface? = null
@@ -128,7 +138,11 @@ class AndroidTimelineVideoEncoder(
 
             for (clip in clips) {
                 if (cancelRequested) break
-                val failureReason = decodeClipIntoEncoder(clip)
+                val failureReason = if (clip.mediaKind == "image") {
+                    renderStillClipIntoEncoder(clip)
+                } else {
+                    decodeClipIntoEncoder(clip)
+                }
                 if (failureReason != null) {
                     if (cancelRequested) break
                     reason = failureReason
@@ -256,6 +270,7 @@ class AndroidTimelineVideoEncoder(
         decodeInputSurface = Surface(texture)
 
         setupShaderProgram()
+        setup2DShaderProgram()
     }
 
     private fun setupShaderProgram() {
@@ -300,6 +315,50 @@ class AndroidTimelineVideoEncoder(
         uSTMatrixLoc = GLES20.glGetUniformLocation(program, "uSTMatrix")
     }
 
+    /// Second GLES2 program used only for still-image clips: a plain 2D
+    /// texture sampler with no uSTMatrix uniform (still images are uploaded
+    /// directly via GLUtils.texImage2D, not through a SurfaceTexture). Kept
+    /// fully separate from [setupShaderProgram]'s OES program and its
+    /// attribute/uniform locations.
+    private fun setup2DShaderProgram() {
+        val vertexSrc = """
+            attribute vec4 aPosition;
+            attribute vec4 aTextureCoord;
+            varying vec2 vTextureCoord;
+            void main() {
+                gl_Position = aPosition;
+                vTextureCoord = aTextureCoord.xy;
+            }
+        """.trimIndent()
+
+        val fragmentSrc = """
+            precision mediump float;
+            varying vec2 vTextureCoord;
+            uniform sampler2D sTexture;
+            void main() {
+                gl_FragColor = texture2D(sTexture, vTextureCoord);
+            }
+        """.trimIndent()
+
+        val vertexShader = compileShader(GLES20.GL_VERTEX_SHADER, vertexSrc)
+        val fragmentShader = compileShader(GLES20.GL_FRAGMENT_SHADER, fragmentSrc)
+
+        val program = GLES20.glCreateProgram()
+        GLES20.glAttachShader(program, vertexShader)
+        GLES20.glAttachShader(program, fragmentShader)
+        GLES20.glLinkProgram(program)
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        if (linkStatus[0] == 0) {
+            val log = GLES20.glGetProgramInfoLog(program)
+            GLES20.glDeleteProgram(program)
+            throw IllegalStateException("GL 2D program link failed: $log")
+        }
+        glProgram2D = program
+        aPositionLoc2D = GLES20.glGetAttribLocation(program, "aPosition")
+        aTexCoordLoc2D = GLES20.glGetAttribLocation(program, "aTextureCoord")
+    }
+
     private fun compileShader(type: Int, src: String): Int {
         val shader = GLES20.glCreateShader(type)
         GLES20.glShaderSource(shader, src)
@@ -321,6 +380,7 @@ class AndroidTimelineVideoEncoder(
     /// Returns null on success, or a machine-readable failure reason string
     /// for any non-cancel decode/transfer failure.
     private fun decodeClipIntoEncoder(clip: ClipInput): String? {
+        synchronized(frameSyncLock) { frameAvailable = false }
         val extractor = MediaExtractor()
         var decoder: MediaCodec? = null
         try {
@@ -455,6 +515,16 @@ class AndroidTimelineVideoEncoder(
             position(0)
         }
 
+    // 2D texture coordinates (still-image clips) — flipped vertically
+    // relative to [texCoords] so BitmapFactory's top-down row order lands
+    // right-side-up in the encoder's bottom-up NDC output space.
+    private val texCoords2D = floatArrayOf(0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f)
+    private val texBuffer2D: FloatBuffer = ByteBuffer.allocateDirect(texCoords2D.size * 4)
+        .order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+            put(texCoords2D)
+            position(0)
+        }
+
     /// Computes the centered, aspect-preserving "fit" quad for [clip]'s
     /// decoded geometry against the fixed encoder output surface, rotates it
     /// by the clip's normalized rotation metadata, and uploads it into
@@ -536,6 +606,104 @@ class AndroidTimelineVideoEncoder(
         EGL14.eglSwapBuffers(eglDisplay, eglSurface)
     }
 
+    /// Draws [textureId] (a plain 2D texture uploaded from a decoded still
+    /// image) into the encoder's EGL surface and submits it via
+    /// eglSwapBuffers, using the separate 2D program/locations — never the
+    /// OES program or its uSTMatrix uniform.
+    private fun drawAndSubmitFrame2D(textureId: Int) {
+        EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+
+        GLES20.glViewport(0, 0, width, height)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        GLES20.glUseProgram(glProgram2D)
+
+        quadBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(aPositionLoc2D)
+        GLES20.glVertexAttribPointer(aPositionLoc2D, 2, GLES20.GL_FLOAT, false, 0, quadBuffer)
+
+        texBuffer2D.position(0)
+        GLES20.glEnableVertexAttribArray(aTexCoordLoc2D)
+        GLES20.glVertexAttribPointer(aTexCoordLoc2D, 2, GLES20.GL_FLOAT, false, 0, texBuffer2D)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        GLES20.glDisableVertexAttribArray(aPositionLoc2D)
+        GLES20.glDisableVertexAttribArray(aTexCoordLoc2D)
+
+        EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, framesSubmitted * frameDurationUs * 1000L)
+        framesSubmitted++
+        EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+    }
+
+    /// Decodes [clip]'s local still-image file (BitmapFactory, sample-size
+    /// clamped to the current EGL context's GL_MAX_TEXTURE_SIZE), uploads it
+    /// as a plain 2D texture, and draws it into the encoder for
+    /// [ClipInput.stillFrameCount] frames -- the still-image analogue of
+    /// [decodeClipIntoEncoder]. Returns null on success (including an
+    /// early-cancelled loop), or a machine-readable failure reason string.
+    private fun renderStillClipIntoEncoder(clip: ClipInput): String? {
+        var textureId = 0
+        var bitmapToRecycle: Bitmap? = null
+        try {
+            EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+
+            val maxTextureSize = IntArray(1)
+            GLES20.glGetIntegerv(GLES20.GL_MAX_TEXTURE_SIZE, maxTextureSize, 0)
+
+            val inSampleSize = AndroidStillImageDecoder.computeInSampleSize(
+                clip.decodedWidth, clip.decodedHeight, width, height, maxTextureSize[0],
+            )
+            val decoded = AndroidStillImageDecoder.decodeBitmap(clip.sourcePath, inSampleSize)
+                ?: return "still_image_decode_failed:${clip.sourcePath}"
+            val bitmap = AndroidStillImageDecoder.clampToMaxTextureSize(decoded, maxTextureSize[0])
+            bitmapToRecycle = bitmap
+
+            val geometryFailure = updateClipGeometry(clip)
+            if (geometryFailure != null) return geometryFailure
+
+            val textures = IntArray(1)
+            GLES20.glGenTextures(1, textures, 0)
+            textureId = textures[0]
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+            val texUploadError = GLES20.glGetError()
+            bitmap.recycle()
+            bitmapToRecycle = null
+            if (texUploadError != GLES20.GL_NO_ERROR) {
+                return "still_texture_upload_failed:$texUploadError:${clip.sourcePath}"
+            }
+
+            var framesRendered = 0
+            for (i in 0 until clip.stillFrameCount) {
+                if (cancelRequested) break
+                drawAndSubmitFrame2D(textureId)
+                drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
+                framesRendered++
+            }
+
+            if (framesRendered == 0 && !cancelRequested) {
+                return "no_frames_in_still_clip:${clip.sourcePath}"
+            }
+            return null
+        } catch (t: Throwable) {
+            Log.e(TAG, "renderStillClipIntoEncoder failed for ${clip.sourcePath}: $t", t)
+            return "still_clip_render_exception:${t.javaClass.simpleName}:${clip.sourcePath}"
+        } finally {
+            try { bitmapToRecycle?.recycle() } catch (_: Throwable) {}
+            if (textureId != 0) {
+                try { GLES20.glDeleteTextures(1, intArrayOf(textureId), 0) } catch (_: Throwable) {}
+            }
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Encoder output drain (fixed frame clock — frozen PTS mechanism)
     // ─────────────────────────────────────────────────────────────────────────
@@ -605,6 +773,7 @@ class AndroidTimelineVideoEncoder(
             try {
                 EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
                 if (glProgram != 0) GLES20.glDeleteProgram(glProgram)
+                if (glProgram2D != 0) GLES20.glDeleteProgram(glProgram2D)
                 if (oesTextureId != 0) GLES20.glDeleteTextures(1, intArrayOf(oesTextureId), 0)
             } catch (_: Throwable) {}
         }

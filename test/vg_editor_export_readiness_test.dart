@@ -267,12 +267,12 @@ void main() {
     });
 
     test('non-video media kind blocks readiness', () {
-      final imageClip = makePlainVideoClip(
-        id: 'clip-img',
-        sourcePath: '/path/to/photo.jpg',
-        mediaKind: VGMediaKind.image,
+      final audioClip = makePlainVideoClip(
+        id: 'clip-aud',
+        sourcePath: '/path/to/audio.mp3',
+        mediaKind: VGMediaKind.audio,
       );
-      final draft = makeSingleClipDraft(clip: imageClip);
+      final draft = makeSingleClipDraft(clip: audioClip);
 
       final report = evaluator.evaluate(draft: draft);
 
@@ -281,9 +281,123 @@ void main() {
       final issue = report.issues.firstWhere(
         (i) => i.code == VGEditorExportReadinessIssueCode.unsupportedMediaKind,
       );
-      expect(issue.clipId, 'clip-img');
-      expect(issue.message, contains('only video clips are supported'));
+      expect(issue.clipId, 'clip-aud');
+      expect(
+        issue.message,
+        contains('only video and image clips are supported'),
+      );
     });
+
+    test(
+      'single local image clip with default fit/crop null evaluates ready',
+      () {
+        final imageClip = makePlainVideoClip(
+          id: 'clip-img',
+          sourcePath: '/path/to/photo.jpg',
+          mediaKind: VGMediaKind.image,
+          durationSeconds: 3.0,
+          trimEndSeconds: 3.0,
+        );
+        final draft = makeSingleClipDraft(clip: imageClip);
+
+        final report = evaluator.evaluate(draft: draft);
+
+        expect(report.decision, VGEditorExportReadinessDecision.ready);
+        expect(report.isReady, isTrue);
+        expect(report.isBlocked, isFalse);
+        expect(report.canUseAndroidEditorExportRoute, isTrue);
+        expect(report.issues, isEmpty);
+        expect(report.diagnostics['clipCount'], 1);
+      },
+    );
+
+    test('mixed local video + image hard-cut draft evaluates ready', () {
+      final videoClip = makePlainVideoClip(
+        id: 'clip-vid',
+        durationSeconds: 5.0,
+        trimEndSeconds: 5.0,
+      );
+      final imageClip = makePlainVideoClip(
+        id: 'clip-img',
+        sourcePath: '/path/to/still.png',
+        mediaKind: VGMediaKind.image,
+        startTimeSeconds: 5.0,
+        durationSeconds: 3.0,
+        trimEndSeconds: 3.0,
+      );
+      final draft = VGEditorDraft(
+        id: 'draft-mixed',
+        clips: [videoClip, imageClip],
+        canvasWidth: 720,
+        canvasHeight: 1280,
+        fps: 30,
+      );
+
+      final report = evaluator.evaluate(draft: draft);
+
+      expect(report.decision, VGEditorExportReadinessDecision.ready);
+      expect(report.isReady, isTrue);
+      expect(report.isBlocked, isFalse);
+      expect(report.canUseAndroidEditorExportRoute, isTrue);
+      expect(report.issues, isEmpty);
+      expect(report.diagnostics['clipCount'], 2);
+    });
+
+    test(
+      'image clip with fitMode: VGStillImageFitMode.fill blocks with stillImageFitOrCropPresent',
+      () {
+        final fillImageClip = makePlainVideoClip(
+          id: 'clip-fill-img',
+          sourcePath: '/path/to/photo.jpg',
+          mediaKind: VGMediaKind.image,
+          fitMode: VGStillImageFitMode.fill,
+        );
+        final draft = makeSingleClipDraft(clip: fillImageClip);
+
+        final report = evaluator.evaluate(draft: draft);
+
+        expect(report.decision, VGEditorExportReadinessDecision.blocked);
+        expect(report.canUseAndroidEditorExportRoute, isFalse);
+        final issue = report.issues.firstWhere(
+          (i) =>
+              i.code ==
+              VGEditorExportReadinessIssueCode.stillImageFitOrCropPresent,
+        );
+        expect(issue.clipId, 'clip-fill-img');
+        expect(
+          issue.message,
+          contains('still-image fit/crop is not supported'),
+        );
+      },
+    );
+
+    test(
+      'image clip with non-null cropRect blocks with stillImageFitOrCropPresent',
+      () {
+        final cropImageClip = makePlainVideoClip(
+          id: 'clip-crop-img',
+          sourcePath: '/path/to/photo.jpg',
+          mediaKind: VGMediaKind.image,
+          cropRect: const [0.0, 0.0, 0.5, 0.5],
+        );
+        final draft = makeSingleClipDraft(clip: cropImageClip);
+
+        final report = evaluator.evaluate(draft: draft);
+
+        expect(report.decision, VGEditorExportReadinessDecision.blocked);
+        expect(report.canUseAndroidEditorExportRoute, isFalse);
+        final issue = report.issues.firstWhere(
+          (i) =>
+              i.code ==
+              VGEditorExportReadinessIssueCode.stillImageFitOrCropPresent,
+        );
+        expect(issue.clipId, 'clip-crop-img');
+        expect(
+          issue.message,
+          contains('still-image fit/crop is not supported'),
+        );
+      },
+    );
 
     test('empty sourcePath blocks readiness with emptySourcePath', () {
       final emptyPathClip = makePlainVideoClip(

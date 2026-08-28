@@ -10,12 +10,13 @@
 // exportTimeline route.
 //
 // Android VGEditorController public export route supports sequential plain
-// local video clips (one or more, hard-cut concatenation only) with direct-copy
-// or PCM mixdown audio sidecar export (Unit H). It does not yet execute editor
-// compositor features such as transitions, overlays, spatial clip transforms,
-// still-image crop/fit, freeze frames, reverse playback, dual-camera
-// composition, time remap, transform tracks, color matrix filtering, or GPU
-// temporal denoise.
+// local video and still-image clips (one or more, hard-cut concatenation
+// only) with direct-copy or PCM mixdown audio sidecar export (Unit H). Still
+// image clips are local files only, fitMode must be 'fit' (default), and
+// cropRect must be null. It does not yet execute editor compositor features
+// such as transitions, overlays, spatial clip transforms, still-image
+// crop/fill, freeze frames, reverse playback, dual-camera composition, time
+// remap, transform tracks, color matrix filtering, or GPU temporal denoise.
 //
 // This pure Dart evaluator preflights a VGEditorDraft and VGEditorExportRequest
 // and returns a structured report (ready vs blocked) with strongly-typed issue
@@ -216,9 +217,10 @@ final class VGEditorExportReadinessReport {
 /// Pure-Dart evaluator that checks whether a [VGEditorDraft] and optional
 /// [VGEditorExportRequest] are ready for the Android native editor export route.
 ///
-/// **Android Editor Export Support Contract (Phase 5-Unit J / Unit H):**
-/// - One or more [VGClipDescriptor] entries with [VGMediaKind.video]
-///   (sequential hard-cut concatenation; no transitions between clips).
+/// **Android Editor Export Support Contract (Phase 5-Unit J / Unit H / Unit R):**
+/// - One or more [VGClipDescriptor] entries with [VGMediaKind.video] or
+///   [VGMediaKind.image] (sequential hard-cut concatenation; no transitions
+///   between clips).
 /// - No transitions ([VGEditorDraft.transitions] must be empty).
 /// - No overlays ([VGEditorDraft.overlays] must be empty).
 /// - Canvas content mode must be [VGCanvasContentMode.fit] (default).
@@ -356,14 +358,15 @@ final class VGEditorExportReadinessEvaluator {
         );
       }
 
-      // Media kind: only video is supported.
-      if (clip.mediaKind != VGMediaKind.video) {
+      // Media kind: video and local still-image clips are supported.
+      if (clip.mediaKind != VGMediaKind.video &&
+          clip.mediaKind != VGMediaKind.image) {
         issues.add(
           VGEditorExportReadinessIssue(
             code: VGEditorExportReadinessIssueCode.unsupportedMediaKind,
             clipId: clip.id,
             message:
-                'Clip "${clip.id}" has media kind "${clip.mediaKind.value}"; only video clips are supported on the Android export route.',
+                'Clip "${clip.id}" has media kind "${clip.mediaKind.value}"; only video and image clips are supported on the Android export route.',
           ),
         );
       }
