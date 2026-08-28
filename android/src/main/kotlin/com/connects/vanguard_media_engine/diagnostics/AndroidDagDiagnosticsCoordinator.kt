@@ -11,6 +11,7 @@ import com.connects.vanguard_media_engine.camera.AndroidCamera2NativeRenderLoopS
 import com.connects.vanguard_media_engine.camera.AndroidCamera2OpenCloseSmokeHarness
 import com.connects.vanguard_media_engine.camera.AndroidCamera2ThermalListenerSmokeHarness
 import com.connects.vanguard_media_engine.export.AndroidAudioFoundationSmokeHarness
+import com.connects.vanguard_media_engine.export.AndroidPassthroughRemuxCapabilityProbe
 import com.connects.vanguard_media_engine.export.AndroidPassthroughRemuxSmokeHarness
 import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
 import io.flutter.plugin.common.MethodChannel
@@ -41,6 +42,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase5EncoderSurfaceSmoke",
             "runAndroidDagAudioFoundationSmoke",
             "runAndroidPassthroughRemuxNativeSmoke",
+            "runAndroidPassthroughRemuxCapabilityProbeSmoke",
             "runAndroidDagPhase3UnitACameraCapabilityProbe",
             "runAndroidDagPhase3UnitFConcurrentSessionValidation",
             "runAndroidDagPhase3UnitHCameraOpenCloseSmoke",
@@ -89,6 +91,8 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase5EncoderSurfaceSmoke" -> runPhase5EncoderSurfaceSmoke(args, result)
             "runAndroidDagAudioFoundationSmoke" -> runAudioFoundationSmoke(args, result)
             "runAndroidPassthroughRemuxNativeSmoke" -> runPassthroughRemuxNativeSmoke(args, result)
+            "runAndroidPassthroughRemuxCapabilityProbeSmoke" ->
+                runPassthroughRemuxCapabilityProbeSmoke(args, result)
             "runAndroidDagPhase3UnitACameraCapabilityProbe" -> runPhase3UnitACameraCapabilityProbe(result)
             "runAndroidDagPhase3UnitFConcurrentSessionValidation" ->
                 runPhase3UnitFConcurrentSessionValidation(args, result)
@@ -269,6 +273,36 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "PASSTHROUGH_REMUX_NATIVE_SMOKE_FAILED",
                         "runAndroidPassthroughRemuxNativeSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 2-Unit Z: Android native passthrough remux capability probe smoke ──
+    private fun runPassthroughRemuxCapabilityProbeSmoke(
+        args: Map<*, *>?,
+        result: MethodChannel.Result,
+    ) {
+        val sourcePath = args?.get("sourcePath") as? String
+        if (sourcePath.isNullOrBlank()) {
+            result.error(
+                "INVALID_ARG",
+                "runAndroidPassthroughRemuxCapabilityProbeSmoke: sourcePath required",
+                null,
+            )
+            return
+        }
+        Thread {
+            try {
+                val probeResult = AndroidPassthroughRemuxCapabilityProbe.probe(sourcePath)
+                mainHandler.post { result.success(probeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "PASSTHROUGH_REMUX_CAPABILITY_PROBE_FAILED",
+                        "runAndroidPassthroughRemuxCapabilityProbeSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
