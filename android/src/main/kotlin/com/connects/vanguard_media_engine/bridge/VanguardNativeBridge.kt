@@ -315,6 +315,10 @@ class VanguardNativeBridge(
     ): String
 
     // ── Phase 1-Unit BB: Android GLES SurfaceProducer texture DAG two-source composition & playhead evaluation smoke ──
+    // Phase 1-Unit BC extends this route with a diagnostic-only frameDelayMs
+    // (default 0, BB-compatible), matching the Unit AY pattern, used to hold
+    // the frame loop open long enough for an active-dispose/cancellation
+    // physical proof.
     external fun runAndroidDagPhase1BBGlesTextureCompositionDagSmoke(
         surface: Surface,
         bufferA: HardwareBuffer,
@@ -323,6 +327,7 @@ class VanguardNativeBridge(
         height: Int,
         frameCount: Int,
         frameDurationUs: Long,
+        frameDelayMs: Int,
     ): String
 
     fun initialize() {

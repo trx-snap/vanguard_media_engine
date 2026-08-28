@@ -19,6 +19,11 @@ import io.flutter.view.TextureRegistry
  * `TextureRegistry.SurfaceProducer` surface via
  * GlesBackend::diagnosticPresentCompositeFrames(). Never uses MediaCodec or
  * ImageReader.PRIVATE.
+ *
+ * Phase 1-Unit BC extends this route with a diagnostic-only frameDelayMs
+ * (default 0, BB-compatible) used to hold the frame loop open long enough
+ * for an active-dispose/cancellation physical proof, matching the Unit AY
+ * pattern.
  */
 class AndroidGlesTextureCompositionDagSmokeHarness {
 
@@ -29,13 +34,22 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
         private const val DEFAULT_HEIGHT = 64
         private const val DEFAULT_FRAME_COUNT = 30
         private const val DEFAULT_FRAME_DURATION_US = 33333L
+        private const val DEFAULT_FRAME_DELAY_MS = 0
         private const val PROOF_BOUNDARY =
             "gles_surfaceproducer_texture_dag_two_source_composition_no_decoded_input_no_product_ui"
 
         /** Failure result map for exceptions raised outside [run] itself (e.g. thread crash). */
         fun exceptionResult(throwable: Throwable): Map<String, Any?> {
             val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
-            return parseResult(failureStatus("harness_exception:$reason", DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_FRAME_COUNT))
+            return parseResult(
+                failureStatus(
+                    "harness_exception:$reason",
+                    DEFAULT_WIDTH,
+                    DEFAULT_HEIGHT,
+                    DEFAULT_FRAME_COUNT,
+                    DEFAULT_FRAME_DELAY_MS,
+                )
+            )
         }
 
         private fun clampInt(raw: Int?, default: Int): Int = raw?.takeIf { it > 0 } ?: default
@@ -60,6 +74,7 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
                 "evaluation" to (parsed["evaluation"] ?: "not_run"),
                 "renderedFrames" to (parsed["renderedFrames"]?.toIntOrNull() ?: 0),
                 "frameCount" to (parsed["frameCount"]?.toIntOrNull() ?: 0),
+                "frameDelayMs" to (parsed["frameDelayMs"]?.toIntOrNull() ?: DEFAULT_FRAME_DELAY_MS),
                 "lastEvaluatedPtsUs" to (parsed["lastEvaluatedPtsUs"]?.toLongOrNull() ?: 0L),
                 "graphGeneration" to (parsed["graphGeneration"]?.toLongOrNull() ?: 0L),
                 "activeNodeCount" to (parsed["activeNodeCount"]?.toIntOrNull() ?: 0),
@@ -82,9 +97,9 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
             )
         }
 
-        private fun failureStatus(reason: String, width: Int, height: Int, frameCount: Int): String =
+        private fun failureStatus(reason: String, width: Int, height: Int, frameCount: Int, frameDelayMs: Int): String =
             "status=FAIL;initialize=not_run;attach=not_run;graphBuild=not_run;importA=not_run;importB=not_run;" +
-            "evaluation=not_run;renderedFrames=0;frameCount=$frameCount;lastEvaluatedPtsUs=0;" +
+            "evaluation=not_run;renderedFrames=0;frameCount=$frameCount;frameDelayMs=$frameDelayMs;lastEvaluatedPtsUs=0;" +
             "graphGeneration=0;activeNodeCount=0;compositorActive=false;startWeightB=0.0;endWeightB=0.0;" +
             "monotonicWeights=false;renderFrame=not_run;failingFrame=-1;releaseA=not_run;releaseB=not_run;" +
             "width=$width;height=$height;textureSurface=false;releaseFenceAFd=-1;releaseFenceBFd=-1;" +
@@ -97,19 +112,23 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
         val frameCount = clampInt((args?.get("frameCount") as? Number)?.toInt(), DEFAULT_FRAME_COUNT)
         val frameDurationUs = (args?.get("frameDurationUs") as? Number)?.toLong()?.takeIf { it > 0 }
             ?: DEFAULT_FRAME_DURATION_US
+        // Phase 1-Unit BC: diagnostic-only per-frame delay so a dispose()
+        // call can be proven to land while the render worker is still
+        // active. Absent/non-positive defaults to 0, preserving BB behavior.
+        val frameDelayMs = clampInt((args?.get("frameDelayMs") as? Number)?.toInt(), DEFAULT_FRAME_DELAY_MS)
 
         var surface: Surface? = null
         var bufferA: HardwareBuffer? = null
         var bufferB: HardwareBuffer? = null
-        var raw = failureStatus("not_run", width, height, frameCount)
+        var raw = failureStatus("not_run", width, height, frameCount, frameDelayMs)
 
         try {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-                raw = failureStatus("api_below_26", width, height, frameCount)
+                raw = failureStatus("api_below_26", width, height, frameCount, frameDelayMs)
                 return parseResult(raw)
             }
             if (width <= 0 || height <= 0 || frameCount <= 0 || frameDurationUs <= 0) {
-                raw = failureStatus("invalid_arguments", width, height, frameCount)
+                raw = failureStatus("invalid_arguments", width, height, frameCount, frameDelayMs)
                 return parseResult(raw)
             }
 
@@ -145,11 +164,12 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
                 height,
                 frameCount,
                 frameDurationUs,
+                frameDelayMs,
             )
             return parseResult(raw)
         } catch (throwable: Throwable) {
             val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
-            raw = failureStatus("exception:$reason", width, height, frameCount)
+            raw = failureStatus("exception:$reason", width, height, frameCount, frameDelayMs)
             return parseResult(raw)
         } finally {
             Log.i(TAG, "$RESULT_MARKER $raw")

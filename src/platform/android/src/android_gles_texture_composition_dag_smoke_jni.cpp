@@ -19,6 +19,14 @@
 // ImageReader.PRIVATE, no product UI, no ConnectsApp wiring, no Phase 1
 // closure.
 //
+// Phase 1-Unit BC extends this entry point with a diagnostic-only
+// frameDelayMs argument (default 0, BB-compatible), matching the Unit AY
+// pattern: after each successful diagnosticPresentCompositeFrames() call the
+// loop sleeps for frameDelayMs milliseconds, holding the worker active long
+// enough for an active-dispose/cancellation physical proof. The native loop
+// always finishes its delayed iterations; it is never preemptively
+// interrupted.
+//
 // JNI entry point:
 //   runAndroidDagPhase1BBGlesTextureCompositionDagSmoke -> jstring
 
@@ -268,6 +276,7 @@ struct BBStatusFields {
     std::string evaluation = "not_run";
     int renderedFrames = 0;
     int frameCount = 0;
+    int frameDelayMs = 0;
     int64_t lastEvaluatedPtsUs = 0;
     uint64_t graphGeneration = 0;
     int activeNodeCount = 0;
@@ -300,6 +309,7 @@ std::string BuildStatusString(const BBStatusFields& f) {
         << "evaluation=" << f.evaluation << ";"
         << "renderedFrames=" << f.renderedFrames << ";"
         << "frameCount=" << f.frameCount << ";"
+        << "frameDelayMs=" << f.frameDelayMs << ";"
         << "lastEvaluatedPtsUs=" << f.lastEvaluatedPtsUs << ";"
         << "graphGeneration=" << f.graphGeneration << ";"
         << "activeNodeCount=" << f.activeNodeCount << ";"
@@ -335,12 +345,19 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     jint     width,
     jint     height,
     jint     frameCount,
-    jlong    frameDurationUs) {
+    jlong    frameDurationUs,
+    jint     frameDelayMs) {
+
+    // Phase 1-Unit BC: diagnostic-only per-frame delay; clamp negative input
+    // to no delay rather than rejecting the call (BB omits this arg / sends
+    // 0, which must keep behaving identically).
+    const jint effectiveFrameDelayMs = (frameDelayMs > 0) ? frameDelayMs : 0;
 
     BBStatusFields status;
     status.width = width;
     status.height = height;
     status.frameCount = frameCount;
+    status.frameDelayMs = effectiveFrameDelayMs;
 
     if (surface == nullptr || bufferA == nullptr || bufferB == nullptr ||
         width <= 0 || height <= 0 || frameCount <= 0 || frameDurationUs <= 0) {
@@ -526,6 +543,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                     break;
                 }
                 status.renderedFrames++;
+                if (effectiveFrameDelayMs > 0) {
+                    usleep(static_cast<useconds_t>(effectiveFrameDelayMs) * 1000);
+                }
             }
 
             status.compositorActive = compositorFoundEveryFrame;
