@@ -48,6 +48,8 @@ export 'vg_camera2_native_render_loop_smoke.dart';
 export 'vg_camera2_texture_native_render_loop_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
+// Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.
+export 'vg_camera2_thermal_load_shedding_monitor.dart';
 
 // Phase 6D.3: typed recording result.
 export 'vg_recording_stats.dart';
