@@ -586,4 +586,158 @@ void main() {
       expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
     },
   );
+
+  // ── EX-10 ────────────────────────────────────────────────────────────────────
+  test(
+    'EX-10: still-image draft with explicit sourceRoiSidecarPath triggers post-processing and writes non-empty mapped export sidecar',
+    () async {
+      final tempDir = Directory.systemTemp.createTempSync(
+        'vg_timeline_exp_still_image_roi_test_',
+      );
+      addTearDown(() {
+        if (tempDir.existsSync()) {
+          tempDir.deleteSync(recursive: true);
+        }
+      });
+
+      final stillImageFile = File('${tempDir.path}/still_input.jpg');
+      await stillImageFile.writeAsBytes([255, 216, 255, 224]);
+
+      final customSidecarDir = Directory('${tempDir.path}/custom_roi_dir')
+        ..createSync(recursive: true);
+      final explicitSourceSidecarFile = File(
+        '${customSidecarDir.path}/still_capture.roi.json',
+      );
+      final explicitSourceSidecar = VGROISidecar(
+        version: 1,
+        sourceType: 'app_recorded',
+        platform: 'android',
+        coordinateSpace: 'display_source_normalized',
+        recordingSessionId: 'session-still-test',
+        videoIdentity: VGROIIdentity(
+          durationMs: 0,
+          width: 1080,
+          height: 1920,
+          hash: null,
+        ),
+        coverage: VGROICoverage(
+          coveragePercent: 1.0,
+          missingIntervals: const [],
+        ),
+        samples: [
+          VGROISample(
+            timestampMs: 0,
+            framePtsMs: 0,
+            recordingRelativeMs: 0,
+            box: VGROIBox(x: 0.15, y: 0.25, w: 0.35, h: 0.45),
+            quality: 'detected',
+          ),
+        ],
+        finalized: true,
+      );
+      await explicitSourceSidecarFile.writeAsString(
+        jsonEncode(explicitSourceSidecar.toJson()),
+      );
+
+      final outputPath = '${tempDir.path}/still_timeline_out.mp4';
+      final exportRoiSidecarPath =
+          '${tempDir.path}/still_timeline_out.roi.json';
+
+      // Pre-create native empty fallback sidecar
+      final nativeEmptySidecar = File(exportRoiSidecarPath);
+      await nativeEmptySidecar.writeAsString(
+        '{"version":1,"nativeEmpty":true}',
+      );
+
+      final draft = VGEditorDraft(
+        id: 'test-still-image-roi-draft',
+        clips: [
+          VGClipDescriptor(
+            id: 'clip-still-1',
+            sourcePath: stillImageFile.path,
+            sourceRoiSidecarPath: explicitSourceSidecarFile.path,
+            mediaKind: VGMediaKind.image,
+            durationSeconds: 3.0,
+            trimStartSeconds: 0.0,
+            trimEndSeconds: 3.0,
+          ),
+        ],
+        canvasWidth: 1080,
+        canvasHeight: 1920,
+        fps: 30,
+      );
+
+      setHandler((call) async {
+        if (call.method == 'inspectMedia') {
+          return <String, dynamic>{
+            'kind': 'image',
+            'container': 'jpeg',
+            'videoCodec': '',
+            'audioCodec': '',
+            'width': 1080,
+            'height': 1920,
+            'encodedWidth': 1080,
+            'encodedHeight': 1920,
+            'displayWidth': 1080,
+            'displayHeight': 1920,
+            'durationSeconds': 0.0,
+            'bitrateKbps': 0,
+            'fps': 0.0,
+            'fileSizeBytes': 10240,
+            'hasVideo': false,
+            'hasAudio': false,
+            'isHDR': false,
+            'hasMoovAtFront': false,
+            'hasRotationTransform': false,
+            'hasEmbeddedMetadata': false,
+            'rotationDegrees': 0,
+            'orientationStatus': 'valid',
+          };
+        }
+        if (call.method == 'exportTimeline') {
+          return <String, dynamic>{
+            'success': true,
+            'path': outputPath,
+            'durationSeconds': 3.0,
+            'width': 1080,
+            'height': 1920,
+            'fps': 30,
+            'exportRoiSidecarPath': exportRoiSidecarPath,
+          };
+        }
+        return null;
+      });
+
+      final result = await VanguardTimelineExporter.exportDraft(
+        draft: draft,
+        request: VGEditorExportRequest(outputPath: outputPath),
+        channel: channel,
+      );
+
+      expect(result.path, outputPath);
+      expect(result.exportRoiSidecarPath, exportRoiSidecarPath);
+
+      final sidecarFile = File(exportRoiSidecarPath);
+      expect(sidecarFile.existsSync(), isTrue);
+
+      final decoded = jsonDecode(await sidecarFile.readAsString());
+      final parsedSidecar = VGROISidecar.fromJson(decoded);
+
+      expect(parsedSidecar.coordinateSpace, 'export_output_normalized');
+      expect(parsedSidecar.videoIdentity.width, 1080);
+      expect(parsedSidecar.videoIdentity.height, 1920);
+      expect(parsedSidecar.videoIdentity.durationMs, 3000);
+      expect(parsedSidecar.samples.length, 1);
+
+      expect(parsedSidecar.samples[0].timestampMs, 0);
+      expect(parsedSidecar.samples[0].box, isNotNull);
+      final mappedBox = parsedSidecar.samples[0].box!;
+      expect(mappedBox.x, closeTo(0.15, 1e-4));
+      expect(mappedBox.y, closeTo(0.25, 1e-4));
+      expect(mappedBox.w, closeTo(0.35, 1e-4));
+      expect(mappedBox.h, closeTo(0.45, 1e-4));
+
+      expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
+    },
+  );
 }

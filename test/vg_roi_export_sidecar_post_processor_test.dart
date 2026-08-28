@@ -1583,4 +1583,544 @@ void main() {
       },
     );
   });
+
+  // ---------------------------------------------------------------------------
+  // 8. Phase 5-Unit U: Still-Image ROI Ingestion & Slideshow Export Mapping
+  // ---------------------------------------------------------------------------
+  group('Phase 5-Unit U: Still-Image ROI Ingestion & Slideshow Export Mapping', () {
+    const sentinelContent =
+        '{"sentinel":"pre_existing_empty_sidecar_must_remain"}';
+
+    void mockInspectMediaImage({
+      int width = 4000,
+      int height = 3000,
+      int displayWidth = 4000,
+      int displayHeight = 3000,
+      int rotationDegrees = 0,
+      String orientationStatus = 'valid',
+      bool hasRotationTransform = false,
+    }) {
+      binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+        if (call.method == 'inspectMedia') {
+          return <String, dynamic>{
+            'kind': 'image',
+            'container': 'jpeg',
+            'videoCodec': '',
+            'audioCodec': '',
+            'width': width,
+            'height': height,
+            'encodedWidth': width,
+            'encodedHeight': height,
+            'displayWidth': displayWidth,
+            'displayHeight': displayHeight,
+            'durationSeconds': 0.0,
+            'bitrateKbps': 0,
+            'fps': 0.0,
+            'fileSizeBytes': 10240,
+            'hasVideo': false,
+            'hasAudio': false,
+            'isHDR': false,
+            'hasMoovAtFront': false,
+            'hasRotationTransform': hasRotationTransform,
+            'hasEmbeddedMetadata': false,
+            'rotationDegrees': rotationDegrees,
+            'orientationStatus': orientationStatus,
+            'transformA': 1.0,
+            'transformB': 0.0,
+            'transformC': 0.0,
+            'transformD': 1.0,
+            'transformTx': 0.0,
+            'transformTy': 0.0,
+          };
+        }
+        return null;
+      });
+    }
+
+    test(
+      'single still-image display_source_normalized maps with aspect-fit geometry to export_output_normalized',
+      () async {
+        // Still image raw and display bounds: 4000x3000 (aspect 4:3)
+        mockInspectMediaImage(
+          width: 4000,
+          height: 3000,
+          displayWidth: 4000,
+          displayHeight: 3000,
+        );
+
+        final stillFile = File('${tempDir.path}/unit_u_still.jpg');
+        await stillFile.writeAsBytes([255, 216, 255, 224]);
+
+        final sourceBox = VGROIBox(x: 0.1, y: 0.2, w: 0.3, h: 0.4);
+        final sample = _makeSample(
+          timestampMs: 0,
+          framePtsMs: 0,
+          recordingRelativeMs: 0,
+          box: sourceBox,
+        );
+        final sourceSidecar = _makeSourceSidecar(
+          coordinateSpace: 'display_source_normalized',
+          width: 4000,
+          height: 3000,
+          durationMs: 3000,
+          samples: [sample],
+        );
+        final sourceSidecarFile = File('${tempDir.path}/unit_u_still.roi.json');
+        await sourceSidecarFile.writeAsString(
+          jsonEncode(sourceSidecar.toJson()),
+        );
+
+        final outputVideoPath = '${tempDir.path}/unit_u_still_out.mp4';
+        final exportRoiSidecarPath =
+            '${tempDir.path}/unit_u_still_out.roi.json';
+
+        final nativeEmptySidecar = File(exportRoiSidecarPath);
+        await nativeEmptySidecar.writeAsString('{"version":1,"native":true}');
+
+        // Canvas is 1080x1920 (aspect 9:16).
+        // 4000x3000 fitted in 1080x1920 gives:
+        // fitScale = min(1080/4000, 1920/3000) = 0.27
+        // fittedW = 1080, fittedH = 810, yOffset = (1920 - 810) / 2 = 555
+        // expected x = 0.1
+        // expected y = (555 + 0.2 * 810) / 1920 = 717 / 1920 = 0.3734375
+        // expected w = 0.3
+        // expected h = 0.4 * 810 / 1920 = 324 / 1920 = 0.16875
+        final processed = await VGRoiExportSidecarPostProcessor.process(
+          sourceVideoPath: stillFile.path,
+          outputVideoPath: outputVideoPath,
+          exportRoiSidecarPath: exportRoiSidecarPath,
+          canvasWidth: 1080,
+          canvasHeight: 1920,
+        );
+
+        expect(processed, isTrue);
+
+        final outputSidecarFile = File(exportRoiSidecarPath);
+        expect(outputSidecarFile.existsSync(), isTrue);
+
+        final decoded = jsonDecode(await outputSidecarFile.readAsString());
+        final resultSidecar = VGROISidecar.fromJson(decoded);
+
+        expect(
+          resultSidecar.coordinateSpace,
+          equals('export_output_normalized'),
+        );
+        expect(resultSidecar.videoIdentity.width, equals(1080));
+        expect(resultSidecar.videoIdentity.height, equals(1920));
+        expect(resultSidecar.samples.length, equals(1));
+        _expectBoxCloseTo(
+          resultSidecar.samples[0].box,
+          VGROIBox(x: 0.1, y: 0.3734375, w: 0.3, h: 0.16875),
+        );
+
+        expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
+      },
+    );
+
+    test(
+      'EXIF display-bounds case: raw landscape dimensions with swapped portrait displayWidth/displayHeight map using display dimensions for display_source_normalized',
+      () async {
+        // Raw landscape dimensions 4000x3000, EXIF rotate90 -> displayWidth: 3000, displayHeight: 4000 (aspect 3:4)
+        mockInspectMediaImage(
+          width: 4000,
+          height: 3000,
+          displayWidth: 3000,
+          displayHeight: 4000,
+          rotationDegrees: 90,
+          hasRotationTransform: true,
+        );
+
+        final stillFile = File('${tempDir.path}/unit_u_exif_still.jpg');
+        await stillFile.writeAsBytes([255, 216, 255, 224]);
+
+        final sourceBox = VGROIBox(x: 0.1, y: 0.2, w: 0.3, h: 0.4);
+        final sample = _makeSample(
+          timestampMs: 0,
+          framePtsMs: 0,
+          recordingRelativeMs: 0,
+          box: sourceBox,
+        );
+        final sourceSidecar = _makeSourceSidecar(
+          coordinateSpace: 'display_source_normalized',
+          width: 3000,
+          height: 4000,
+          durationMs: 3000,
+          samples: [sample],
+        );
+        final sourceSidecarFile = File(
+          '${tempDir.path}/unit_u_exif_still.roi.json',
+        );
+        await sourceSidecarFile.writeAsString(
+          jsonEncode(sourceSidecar.toJson()),
+        );
+
+        final outputVideoPath = '${tempDir.path}/unit_u_exif_still_out.mp4';
+        final exportRoiSidecarPath =
+            '${tempDir.path}/unit_u_exif_still_out.roi.json';
+
+        final nativeEmptySidecar = File(exportRoiSidecarPath);
+        await nativeEmptySidecar.writeAsString('{"version":1,"native":true}');
+
+        // Canvas is 1080x1920 (9:16).
+        // Display source is 3000x4000 (3:4).
+        // fitScale = min(1080/3000, 1920/4000) = min(0.36, 0.48) = 0.36
+        // fittedW = 3000 * 0.36 = 1080, fittedH = 4000 * 0.36 = 1440
+        // yOffset = (1920 - 1440) / 2 = 240
+        // expected x = 0.1
+        // expected y = (240 + 0.2 * 1440) / 1920 = 528 / 1920 = 0.275
+        // expected w = 0.3
+        // expected h = 0.4 * 1440 / 1920 = 576 / 1920 = 0.3
+        final processed = await VGRoiExportSidecarPostProcessor.process(
+          sourceVideoPath: stillFile.path,
+          outputVideoPath: outputVideoPath,
+          exportRoiSidecarPath: exportRoiSidecarPath,
+          canvasWidth: 1080,
+          canvasHeight: 1920,
+        );
+
+        expect(processed, isTrue);
+
+        final outputSidecarFile = File(exportRoiSidecarPath);
+        expect(outputSidecarFile.existsSync(), isTrue);
+
+        final decoded = jsonDecode(await outputSidecarFile.readAsString());
+        final resultSidecar = VGROISidecar.fromJson(decoded);
+
+        expect(
+          resultSidecar.coordinateSpace,
+          equals('export_output_normalized'),
+        );
+        expect(resultSidecar.videoIdentity.width, equals(1080));
+        expect(resultSidecar.videoIdentity.height, equals(1920));
+        expect(resultSidecar.samples.length, equals(1));
+        _expectBoxCloseTo(
+          resultSidecar.samples[0].box,
+          VGROIBox(x: 0.1, y: 0.275, w: 0.3, h: 0.3),
+        );
+
+        expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
+      },
+    );
+
+    test(
+      'multi-clip still-image timeline aggregation (still + still + video) with cumulative timestamp shifts',
+      () async {
+        final still1File = File('${tempDir.path}/unit_u_multi_still1.jpg');
+        await still1File.writeAsBytes([255, 216, 255, 224]);
+        final still1Box = VGROIBox(x: 0.1, y: 0.1, w: 0.2, h: 0.2);
+        final still1Sidecar = _makeSourceSidecar(
+          coordinateSpace: 'display_source_normalized',
+          width: 1080,
+          height: 1920,
+          durationMs: 3000,
+          samples: [
+            _makeSample(
+              timestampMs: 500,
+              framePtsMs: 500,
+              recordingRelativeMs: 500,
+              box: still1Box,
+            ),
+          ],
+        );
+        final still1SidecarFile = File(
+          '${tempDir.path}/unit_u_multi_still1.roi.json',
+        );
+        await still1SidecarFile.writeAsString(
+          jsonEncode(still1Sidecar.toJson()),
+        );
+
+        final still2File = File('${tempDir.path}/unit_u_multi_still2.jpg');
+        await still2File.writeAsBytes([255, 216, 255, 224]);
+        final still2Box = VGROIBox(x: 0.2, y: 0.2, w: 0.3, h: 0.3);
+        final still2Sidecar = _makeSourceSidecar(
+          coordinateSpace: 'display_source_normalized',
+          width: 1080,
+          height: 1920,
+          durationMs: 2500,
+          samples: [
+            _makeSample(
+              timestampMs: 1000,
+              framePtsMs: 1000,
+              recordingRelativeMs: 1000,
+              box: still2Box,
+            ),
+          ],
+        );
+        final still2SidecarFile = File(
+          '${tempDir.path}/unit_u_multi_still2.roi.json',
+        );
+        await still2SidecarFile.writeAsString(
+          jsonEncode(still2Sidecar.toJson()),
+        );
+
+        final video3File = File('${tempDir.path}/unit_u_multi_video3.mov');
+        await video3File.writeAsBytes([1, 2, 3, 4]);
+        final video3Box = VGROIBox(x: 0.3, y: 0.3, w: 0.4, h: 0.4);
+        final video3Sidecar = _makeSourceSidecar(
+          coordinateSpace: 'display_source_normalized',
+          width: 1080,
+          height: 1920,
+          durationMs: 4000,
+          samples: [
+            _makeSample(
+              timestampMs: 1500,
+              framePtsMs: 1500,
+              recordingRelativeMs: 1500,
+              box: video3Box,
+            ),
+          ],
+        );
+        final video3SidecarFile = File(
+          '${tempDir.path}/unit_u_multi_video3.roi.json',
+        );
+        await video3SidecarFile.writeAsString(
+          jsonEncode(video3Sidecar.toJson()),
+        );
+
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'inspectMedia') {
+            final path = (call.arguments as Map)['path'] as String;
+            if (path.contains('still')) {
+              return <String, dynamic>{
+                'kind': 'image',
+                'container': 'jpeg',
+                'videoCodec': '',
+                'audioCodec': '',
+                'width': 1080,
+                'height': 1920,
+                'encodedWidth': 1080,
+                'encodedHeight': 1920,
+                'displayWidth': 1080,
+                'displayHeight': 1920,
+                'durationSeconds': 0.0,
+                'bitrateKbps': 0,
+                'fps': 0.0,
+                'fileSizeBytes': 10240,
+                'hasVideo': false,
+                'hasAudio': false,
+                'isHDR': false,
+                'hasMoovAtFront': false,
+                'hasRotationTransform': false,
+                'hasEmbeddedMetadata': false,
+                'rotationDegrees': 0,
+                'orientationStatus': 'valid',
+              };
+            } else {
+              return <String, dynamic>{
+                'kind': 'video',
+                'container': 'mov',
+                'videoCodec': 'h264',
+                'audioCodec': 'aac',
+                'width': 1080,
+                'height': 1920,
+                'encodedWidth': 1080,
+                'encodedHeight': 1920,
+                'displayWidth': 1080,
+                'displayHeight': 1920,
+                'durationSeconds': 4.0,
+                'bitrateKbps': 4000,
+                'fps': 30.0,
+                'fileSizeBytes': 20480,
+                'hasVideo': true,
+                'hasAudio': true,
+                'isHDR': false,
+                'hasMoovAtFront': false,
+                'hasRotationTransform': false,
+                'hasEmbeddedMetadata': false,
+                'rotationDegrees': 0,
+                'orientationStatus': 'valid',
+              };
+            }
+          }
+          return null;
+        });
+
+        final clip1 = VGClipDescriptor(
+          id: 'u_c1',
+          sourcePath: still1File.path,
+          durationSeconds: 3.0,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 3.0,
+        );
+        final clip2 = VGClipDescriptor(
+          id: 'u_c2',
+          sourcePath: still2File.path,
+          durationSeconds: 2.5,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 2.5,
+        );
+        final clip3 = VGClipDescriptor(
+          id: 'u_c3',
+          sourcePath: video3File.path,
+          durationSeconds: 4.0,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 4.0,
+        );
+
+        final outputVideoPath = '${tempDir.path}/unit_u_multi_timeline.mp4';
+        final exportRoiSidecarPath =
+            '${tempDir.path}/unit_u_multi_timeline.roi.json';
+        await File(exportRoiSidecarPath).writeAsString('{"version":1}');
+
+        final processed = await VGRoiExportSidecarPostProcessor.processTimeline(
+          clips: [clip1, clip2, clip3],
+          outputVideoPath: outputVideoPath,
+          exportRoiSidecarPath: exportRoiSidecarPath,
+          canvasWidth: 1080,
+          canvasHeight: 1920,
+          exportDurationSeconds: 9.5,
+        );
+
+        expect(processed, isTrue);
+
+        final outputSidecarFile = File(exportRoiSidecarPath);
+        final decoded = jsonDecode(await outputSidecarFile.readAsString());
+        final resultSidecar = VGROISidecar.fromJson(decoded);
+
+        expect(resultSidecar.samples.length, equals(3));
+        expect(resultSidecar.videoIdentity.durationMs, equals(9500));
+        expect(resultSidecar.videoIdentity.width, equals(1080));
+        expect(resultSidecar.videoIdentity.height, equals(1920));
+
+        // Sample 1 from clip 1 at 500ms
+        expect(resultSidecar.samples[0].timestampMs, equals(500));
+        _expectBoxCloseTo(resultSidecar.samples[0].box, still1Box);
+
+        // Sample 2 from clip 2 at 1000ms + 3000ms (clip 1 duration) = 4000ms
+        expect(resultSidecar.samples[1].timestampMs, equals(4000));
+        _expectBoxCloseTo(resultSidecar.samples[1].box, still2Box);
+
+        // Sample 3 from clip 3 at 1500ms + 3000ms + 2500ms = 7000ms
+        expect(resultSidecar.samples[2].timestampMs, equals(7000));
+        _expectBoxCloseTo(resultSidecar.samples[2].box, video3Box);
+
+        expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
+      },
+    );
+
+    test(
+      'fail-closed case: missing still-image source sidecar leaves native fallback sidecar unchanged and returns false',
+      () async {
+        mockInspectMediaImage();
+
+        final stillFile = File('${tempDir.path}/unit_u_missing_sidecar.jpg');
+        await stillFile.writeAsBytes([255, 216, 255, 224]);
+
+        // Do NOT create source sidecar file
+
+        final outputVideoPath = '${tempDir.path}/unit_u_missing_out.mp4';
+        final exportRoiSidecarPath =
+            '${tempDir.path}/unit_u_missing_out.roi.json';
+
+        final nativeEmptySidecar = File(exportRoiSidecarPath);
+        await nativeEmptySidecar.writeAsString(sentinelContent);
+
+        final processed = await VGRoiExportSidecarPostProcessor.process(
+          sourceVideoPath: stillFile.path,
+          outputVideoPath: outputVideoPath,
+          exportRoiSidecarPath: exportRoiSidecarPath,
+          canvasWidth: 1080,
+          canvasHeight: 1920,
+        );
+
+        expect(processed, isFalse);
+        expect(
+          await nativeEmptySidecar.readAsString(),
+          equals(sentinelContent),
+        );
+        expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
+      },
+    );
+
+    test(
+      'fail-closed case: malformed still-image source sidecar leaves native fallback sidecar unchanged and returns false',
+      () async {
+        mockInspectMediaImage();
+
+        final stillFile = File('${tempDir.path}/unit_u_malformed_sidecar.jpg');
+        await stillFile.writeAsBytes([255, 216, 255, 224]);
+
+        final sourceSidecarFile = File(
+          '${tempDir.path}/unit_u_malformed_sidecar.roi.json',
+        );
+        await sourceSidecarFile.writeAsString('{not valid json at all!');
+
+        final outputVideoPath = '${tempDir.path}/unit_u_malformed_out.mp4';
+        final exportRoiSidecarPath =
+            '${tempDir.path}/unit_u_malformed_out.roi.json';
+
+        final nativeEmptySidecar = File(exportRoiSidecarPath);
+        await nativeEmptySidecar.writeAsString(sentinelContent);
+
+        final processed = await VGRoiExportSidecarPostProcessor.process(
+          sourceVideoPath: stillFile.path,
+          outputVideoPath: outputVideoPath,
+          exportRoiSidecarPath: exportRoiSidecarPath,
+          canvasWidth: 1080,
+          canvasHeight: 1920,
+        );
+
+        expect(processed, isFalse);
+        expect(
+          await nativeEmptySidecar.readAsString(),
+          equals(sentinelContent),
+        );
+        expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
+      },
+    );
+
+    test(
+      'fail-closed case: unsupported coordinate space in still-image source sidecar leaves native fallback sidecar unchanged and returns false',
+      () async {
+        mockInspectMediaImage();
+
+        final stillFile = File(
+          '${tempDir.path}/unit_u_unsupported_sidecar.jpg',
+        );
+        await stillFile.writeAsBytes([255, 216, 255, 224]);
+
+        final sourceSidecar = _makeSourceSidecar(
+          coordinateSpace: 'unsupported_space_xyz',
+          width: 1080,
+          height: 1920,
+          samples: [
+            _makeSample(
+              timestampMs: 0,
+              framePtsMs: 0,
+              recordingRelativeMs: 0,
+              box: VGROIBox(x: 0.1, y: 0.1, w: 0.2, h: 0.2),
+            ),
+          ],
+        );
+        final sourceSidecarFile = File(
+          '${tempDir.path}/unit_u_unsupported_sidecar.roi.json',
+        );
+        await sourceSidecarFile.writeAsString(
+          jsonEncode(sourceSidecar.toJson()),
+        );
+
+        final outputVideoPath = '${tempDir.path}/unit_u_unsupported_out.mp4';
+        final exportRoiSidecarPath =
+            '${tempDir.path}/unit_u_unsupported_out.roi.json';
+
+        final nativeEmptySidecar = File(exportRoiSidecarPath);
+        await nativeEmptySidecar.writeAsString(sentinelContent);
+
+        final processed = await VGRoiExportSidecarPostProcessor.process(
+          sourceVideoPath: stillFile.path,
+          outputVideoPath: outputVideoPath,
+          exportRoiSidecarPath: exportRoiSidecarPath,
+          canvasWidth: 1080,
+          canvasHeight: 1920,
+        );
+
+        expect(processed, isFalse);
+        expect(
+          await nativeEmptySidecar.readAsString(),
+          equals(sentinelContent),
+        );
+        expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
+      },
+    );
+  });
 }

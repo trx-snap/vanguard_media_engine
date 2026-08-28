@@ -1,6 +1,7 @@
 package com.connects.vanguard_media_engine
 
 import android.content.Context
+import android.media.ExifInterface
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -15,6 +16,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoord
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
+import com.connects.vanguard_media_engine.export.AndroidStillImageDecoder
 import com.connects.vanguard_media_engine.image.AndroidImageOptimizer
 import com.connects.vanguard_media_engine.rtc.AndroidRtcVideoCoordinator
 import com.connects.vanguard_media_engine.sidecar.AndroidReverseSidecarCoordinator
@@ -355,6 +357,104 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                     result.error("INVALID_ARG", "inspectMedia: path required", null)
                     return
                 }
+
+                // Container / kind classification computed up front (extension-based fast
+                // path) so still images can bypass MediaMetadataRetriever/MediaExtractor
+                // entirely below -- neither API can read still-image bounds/EXIF reliably.
+                val ext = path.substringAfterLast('.', "").lowercase()
+                val container = when (ext) {
+                    "mp4", "m4v"   -> "mp4"
+                    "mov"          -> "mov"
+                    "mkv"          -> "mkv"
+                    "webm"         -> "webm"
+                    "avi"          -> "avi"
+                    "jpg", "jpeg"  -> "jpeg"
+                    "png"          -> "png"
+                    "heic"         -> "heic"
+                    "webp"         -> "webp"
+                    "m4a"          -> "m4a"
+                    "mp3"          -> "mp3"
+                    "aac"          -> "aac"
+                    else           -> ext
+                }
+                val imageExts = setOf("jpg","jpeg","png","heic","webp","gif","bmp","tiff")
+                val audioExts = setOf("m4a","aac","mp3","wav","flac","ogg")
+
+                // Phase 5-Unit U: still-image path — probes real bounds/EXIF via
+                // AndroidStillImageDecoder instead of failing closed on zero dimensions.
+                if (imageExts.contains(ext)) {
+                    Thread {
+                        val bounds = AndroidStillImageDecoder.probeBounds(path)
+                        if (bounds == null) {
+                            mainHandler.post {
+                                result.error("INSPECT_FAILED", "inspectMedia: unreadable image bounds", null)
+                            }
+                            return@Thread
+                        }
+                        val exifOrientation = AndroidStillImageDecoder.readExifOrientation(path)
+                        val displayBounds = AndroidStillImageDecoder.getDisplayBounds(
+                            bounds.width, bounds.height, exifOrientation,
+                        )
+
+                        // rotationDegrees is null for mirrored/transpose/transverse/undefined —
+                        // Unit U does not claim raw portrait-space EXIF coordinate rotation.
+                        val rotationDeg = when (exifOrientation) {
+                            ExifInterface.ORIENTATION_NORMAL     -> 0
+                            ExifInterface.ORIENTATION_ROTATE_90  -> 90
+                            ExifInterface.ORIENTATION_ROTATE_180 -> 180
+                            ExifInterface.ORIENTATION_ROTATE_270 -> 270
+                            else -> null
+                        }
+                        val orientationStatus = if (rotationDeg != null) "valid" else "ambiguous"
+                        val hasRotationTransform = rotationDeg == 90 || rotationDeg == 180 || rotationDeg == 270
+
+                        // Matrix values mirror the existing video cardinal-rotation mapping below.
+                        val tA: Double; val tB: Double; val tC: Double; val tD: Double
+                        when (rotationDeg ?: 0) {
+                            90  -> { tA =  0.0; tB =  1.0; tC = -1.0; tD =  0.0 }
+                            180 -> { tA = -1.0; tB =  0.0; tC =  0.0; tD = -1.0 }
+                            270 -> { tA =  0.0; tB = -1.0; tC =  1.0; tD =  0.0 }
+                            else -> { tA =  1.0; tB =  0.0; tC =  0.0; tD =  1.0 }
+                        }
+
+                        val fileSizeBytes = java.io.File(path).length()
+
+                        mainHandler.post {
+                            result.success(mapOf(
+                                "kind"                 to "image",
+                                "container"            to container,
+                                "videoCodec"           to "",
+                                "audioCodec"           to "",
+                                "width"                to bounds.width,
+                                "height"               to bounds.height,
+                                "durationSeconds"      to 0.0,
+                                "bitrateKbps"          to 0,
+                                "fps"                  to 0.0,
+                                "fileSizeBytes"        to fileSizeBytes,
+                                "hasVideo"             to false,
+                                "hasAudio"             to false,
+                                "isHDR"                to false,
+                                "hasMoovAtFront"       to false,
+                                "hasRotationTransform" to hasRotationTransform,
+                                "hasEmbeddedMetadata"  to false,
+                                "encodedWidth"         to bounds.width,
+                                "encodedHeight"        to bounds.height,
+                                "displayWidth"         to displayBounds.width,
+                                "displayHeight"        to displayBounds.height,
+                                "rotationDegrees"      to rotationDeg,
+                                "transformA"           to tA,
+                                "transformB"           to tB,
+                                "transformC"           to tC,
+                                "transformD"           to tD,
+                                "transformTx"          to 0.0,
+                                "transformTy"          to 0.0,
+                                "orientationStatus"    to orientationStatus,
+                            ))
+                        }
+                    }.start()
+                    return
+                }
+
                 Thread {
                     val retriever = MediaMetadataRetriever()
                     try {
@@ -474,27 +574,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                         // File size
                         val fileSizeBytes = java.io.File(path).length()
 
-                        // Container (extension-based fast path)
-                        val ext = path.substringAfterLast('.', "").lowercase()
-                        val container = when (ext) {
-                            "mp4", "m4v"   -> "mp4"
-                            "mov"          -> "mov"
-                            "mkv"          -> "mkv"
-                            "webm"         -> "webm"
-                            "avi"          -> "avi"
-                            "jpg", "jpeg"  -> "jpeg"
-                            "png"          -> "png"
-                            "heic"         -> "heic"
-                            "webp"         -> "webp"
-                            "m4a"          -> "m4a"
-                            "mp3"          -> "mp3"
-                            "aac"          -> "aac"
-                            else           -> ext
-                        }
-
-                        // MediaKind
-                        val imageExts = setOf("jpg","jpeg","png","heic","webp","gif","bmp","tiff")
-                        val audioExts = setOf("m4a","aac","mp3","wav","flac","ogg")
+                        // MediaKind (ext/container/imageExts/audioExts derived above,
+                        // before the still-image bypass check).
                         val kind = when {
                             imageExts.contains(ext)  -> "image"
                             audioExts.contains(ext)  -> "audio"

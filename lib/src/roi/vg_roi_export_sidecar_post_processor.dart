@@ -326,6 +326,8 @@ class VGRoiExportSidecarPostProcessor {
       double effectiveCanvasWidth = canvasWidth.toDouble();
       double effectiveCanvasHeight = canvasHeight.toDouble();
       switch (captureSidecar.coordinateSpace) {
+        // Phase 5-Unit U: supports still images now that Android inspectMedia
+        // returns real EXIF display bounds instead of zero dimensions.
         case 'display_source_normalized':
           sourceWidth = mediaInfo.displayWidth.toDouble();
           sourceHeight = mediaInfo.displayHeight.toDouble();
@@ -334,6 +336,7 @@ class VGRoiExportSidecarPostProcessor {
             effectiveCanvasHeight = sourceHeight;
           }
           break;
+        // portrait_capture_normalized for EXIF-rotated stills remains deferred.
         case 'portrait_capture_normalized':
           sourceWidth = mediaInfo.width.toDouble();
           sourceHeight = mediaInfo.height.toDouble();
