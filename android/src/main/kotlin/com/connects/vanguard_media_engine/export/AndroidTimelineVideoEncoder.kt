@@ -2,6 +2,7 @@ package com.connects.vanguard_media_engine.export
 
 import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
+import android.media.ExifInterface
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaExtractor
@@ -76,6 +77,7 @@ class AndroidTimelineVideoEncoder(
         val rotationDegrees: Int,
         val mediaKind: String = "video",
         val stillFrameCount: Int = 0,
+        val exifOrientation: Int = ExifInterface.ORIENTATION_NORMAL,
     )
 
     data class EncodeResult(
@@ -534,9 +536,26 @@ class AndroidTimelineVideoEncoder(
     /// applied entirely in output vertex space. Returns a failure reason
     /// string for degenerate geometry instead of throwing; never called with
     /// per-frame allocation.
+    ///
+    /// For still-image clips, EXIF orientation is baked into the uploaded
+    /// texture's pixels (see [renderStillClipIntoEncoder] /
+    /// AndroidStillImageDecoder.applyExifOrientation) rather than applied as
+    /// a vertex-space rotation, so the fit geometry here must be computed
+    /// against the EXIF-adjusted display bounds -- not the raw decode
+    /// dimensions -- while [ClipInput.rotationDegrees] stays 0 for images.
     private fun updateClipGeometry(clip: ClipInput): String? {
-        val decodedWidth = clip.decodedWidth
-        val decodedHeight = clip.decodedHeight
+        val decodedWidth: Int
+        val decodedHeight: Int
+        if (clip.mediaKind == "image") {
+            val displayBounds = AndroidStillImageDecoder.getDisplayBounds(
+                clip.decodedWidth, clip.decodedHeight, clip.exifOrientation,
+            )
+            decodedWidth = displayBounds.width
+            decodedHeight = displayBounds.height
+        } else {
+            decodedWidth = clip.decodedWidth
+            decodedHeight = clip.decodedHeight
+        }
         if (decodedWidth <= 0 || decodedHeight <= 0 || width <= 0 || height <= 0) {
             return "invalid_geometry:${clip.sourcePath}"
         }
@@ -655,11 +674,14 @@ class AndroidTimelineVideoEncoder(
             GLES20.glGetIntegerv(GLES20.GL_MAX_TEXTURE_SIZE, maxTextureSize, 0)
 
             val inSampleSize = AndroidStillImageDecoder.computeInSampleSize(
-                clip.decodedWidth, clip.decodedHeight, width, height, maxTextureSize[0],
+                clip.decodedWidth, clip.decodedHeight, width, height, maxTextureSize[0], clip.exifOrientation,
             )
             val decoded = AndroidStillImageDecoder.decodeBitmap(clip.sourcePath, inSampleSize)
                 ?: return "still_image_decode_failed:${clip.sourcePath}"
-            val bitmap = AndroidStillImageDecoder.clampToMaxTextureSize(decoded, maxTextureSize[0])
+            bitmapToRecycle = decoded
+            val oriented = AndroidStillImageDecoder.applyExifOrientation(decoded, clip.exifOrientation)
+            bitmapToRecycle = oriented
+            val bitmap = AndroidStillImageDecoder.clampToMaxTextureSize(oriented, maxTextureSize[0])
             bitmapToRecycle = bitmap
 
             val geometryFailure = updateClipGeometry(clip)

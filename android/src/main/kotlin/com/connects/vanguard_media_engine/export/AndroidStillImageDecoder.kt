@@ -2,11 +2,12 @@ package com.connects.vanguard_media_engine.export
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.media.ExifInterface
 import android.util.Log
 import java.io.File
 
-// -- AndroidStillImageDecoder (Export Unit R) --------------------------------
+// -- AndroidStillImageDecoder (Export Unit R/S) ------------------------------
 //
 // Local-file still-image decode helpers for the exportTimeline still-image
 // clip path. Uses BitmapFactory (not ImageDecoder) for bounds probing, EXIF
@@ -15,9 +16,11 @@ import java.io.File
 // AndroidTimelineExportSession (probe) and AndroidTimelineVideoEncoder
 // (render) without crossing ownership boundaries.
 //
-// Scope (Unit R): local absolute file paths only. This object performs no
-// EXIF auto-rotation -- callers must reject any orientation other than
-// ORIENTATION_NORMAL before treating a decoded bitmap as usable.
+// Scope (Unit R): local absolute file paths only.
+// Scope (Unit S): valid EXIF orientations 1..8 are normalized via
+// [getDisplayBounds] (geometry) and [applyExifOrientation] (pixels) -- see
+// AndroidImageOptimizer for the reference EXIF transform mapping this
+// mirrors.
 object AndroidStillImageDecoder {
 
     data class ImageBounds(val width: Int, val height: Int)
@@ -44,9 +47,10 @@ object AndroidStillImageDecoder {
 
     /**
      * Reads the EXIF orientation tag for the image at [path]. Defaults to
-     * ExifInterface.ORIENTATION_NORMAL when the tag is missing or the file
-     * cannot be parsed as EXIF (e.g. PNG). Callers must reject any value
-     * other than ORIENTATION_NORMAL -- this object performs no auto-rotation.
+     * ExifInterface.ORIENTATION_NORMAL when the tag is missing, unparseable,
+     * or undefined (e.g. PNG). Valid non-normal EXIF orientations (1..8) are
+     * returned as-is for downstream normalization by getDisplayBounds and
+     * applyExifOrientation -- this method itself does not rotate pixels.
      */
     fun readExifOrientation(path: String): Int {
         return try {
@@ -66,6 +70,21 @@ object AndroidStillImageDecoder {
     }
 
     /**
+     * Returns the display-space (post-EXIF-rotation) width/height for a raw
+     * decode of [rawWidth]x[rawHeight] with EXIF tag [orientation]. Swaps the
+     * axes for the four orientations that rotate content 90 degrees
+     * (TRANSPOSE, ROTATE_90, TRANSVERSE, ROTATE_270); all other values,
+     * including undefined/unknown, keep the raw axes unchanged.
+     */
+    fun getDisplayBounds(rawWidth: Int, rawHeight: Int, orientation: Int): ImageBounds {
+        val swapDims = orientation == ExifInterface.ORIENTATION_TRANSPOSE ||
+            orientation == ExifInterface.ORIENTATION_ROTATE_90 ||
+            orientation == ExifInterface.ORIENTATION_TRANSVERSE ||
+            orientation == ExifInterface.ORIENTATION_ROTATE_270
+        return if (swapDims) ImageBounds(rawHeight, rawWidth) else ImageBounds(rawWidth, rawHeight)
+    }
+
+    /**
      * Computes a power-of-two BitmapFactory.Options.inSampleSize so the
      * decoded bitmap fits within [maxTextureSize] (the GL_MAX_TEXTURE_SIZE of
      * the current EGL context) and is reasonably close to the requested
@@ -76,7 +95,11 @@ object AndroidStillImageDecoder {
      *
      * Both sampled axes are independently bounded (not "both exceed"): a
      * panorama or tall image that is oversized on only one axis must still
-     * be downsampled on that axis rather than decoded at full size.
+     * be downsampled on that axis rather than decoded at full size. The
+     * bounded loop runs against the [orientation]-adjusted display bounds
+     * (see [getDisplayBounds]) so a 90-degree-rotated raw decode is compared
+     * against [targetWidth]x[targetHeight] on the correct (post-rotation)
+     * axes; undefined/unknown orientation behaves as normal (no swap).
      */
     fun computeInSampleSize(
         rawWidth: Int,
@@ -84,18 +107,20 @@ object AndroidStillImageDecoder {
         targetWidth: Int,
         targetHeight: Int,
         maxTextureSize: Int,
+        orientation: Int = ExifInterface.ORIENTATION_NORMAL,
     ): Int {
         if (rawWidth <= 0 || rawHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) return 1
         var inSampleSize = 1
         val boundedWidth = if (maxTextureSize > 0) minOf(targetWidth, maxTextureSize) else targetWidth
         val boundedHeight = if (maxTextureSize > 0) minOf(targetHeight, maxTextureSize) else targetHeight
         if (boundedWidth <= 0 || boundedHeight <= 0) return inSampleSize
-        var sampledWidth = rawWidth
-        var sampledHeight = rawHeight
+        val displayBounds = getDisplayBounds(rawWidth, rawHeight, orientation)
+        var sampledWidth = displayBounds.width
+        var sampledHeight = displayBounds.height
         while (sampledWidth > boundedWidth || sampledHeight > boundedHeight) {
             inSampleSize *= 2
-            sampledWidth = rawWidth / inSampleSize
-            sampledHeight = rawHeight / inSampleSize
+            sampledWidth = displayBounds.width / inSampleSize
+            sampledHeight = displayBounds.height / inSampleSize
         }
         return inSampleSize
     }
@@ -116,6 +141,40 @@ object AndroidStillImageDecoder {
             Log.e(TAG, "decodeBitmap failed for $path: $t")
             null
         }
+    }
+
+    /**
+     * Applies the EXIF rotate/flip transform for [orientation] to [bitmap]
+     * using a [Matrix], mirroring AndroidImageOptimizer's EXIF transform
+     * mapping. Returns [bitmap] unchanged for
+     * ORIENTATION_NORMAL/ORIENTATION_UNDEFINED/unknown values. Recycles the
+     * original [bitmap] only when a distinct transformed bitmap is returned.
+     */
+    fun applyExifOrientation(bitmap: Bitmap, orientation: Int): Bitmap {
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_NORMAL, ExifInterface.ORIENTATION_UNDEFINED -> return bitmap
+            ExifInterface.ORIENTATION_FLIP_HORIZONTAL -> matrix.postScale(-1f, 1f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_FLIP_VERTICAL -> {
+                matrix.postRotate(180f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_TRANSPOSE -> {
+                matrix.postRotate(90f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_TRANSVERSE -> {
+                matrix.postRotate(270f)
+                matrix.postScale(-1f, 1f)
+            }
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            else -> return bitmap
+        }
+        val transformed = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        if (transformed !== bitmap) bitmap.recycle()
+        return transformed
     }
 
     /**

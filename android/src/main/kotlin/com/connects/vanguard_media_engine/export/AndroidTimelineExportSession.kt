@@ -80,6 +80,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         val decodedHeight: Int,
         val rotationDegrees: Int,
         val mediaKind: String,
+        val exifOrientation: Int = ExifInterface.ORIENTATION_NORMAL,
     )
 
     private fun run(
@@ -213,13 +214,6 @@ class AndroidTimelineExportSession(private val context: Context) {
                     onError("FILE_UNREADABLE", "exportTimeline: no readable image data in ${clip.sourcePath}")
                     return
                 }
-                if (imageProbe.exifOrientation != ExifInterface.ORIENTATION_NORMAL) {
-                    onError(
-                        "UNSUPPORTED_EXPORT_FEATURE",
-                        "exportTimeline: image EXIF orientation ${imageProbe.exifOrientation} is not supported",
-                    )
-                    return
-                }
                 clipContexts.add(
                     ClipContext(
                         sourcePath = clip.sourcePath,
@@ -229,6 +223,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                         decodedHeight = imageProbe.height,
                         rotationDegrees = 0,
                         mediaKind = clip.mediaKind,
+                        exifOrientation = imageProbe.exifOrientation,
                     ),
                 )
                 continue
@@ -339,6 +334,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     rotationDegrees = ctx.rotationDegrees,
                     mediaKind = ctx.mediaKind,
                     stillFrameCount = stillFrameCount,
+                    exifOrientation = ctx.exifOrientation,
                 ),
             )
         }
