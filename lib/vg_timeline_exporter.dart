@@ -154,12 +154,19 @@ final class VanguardTimelineExporter {
           exportResult.durationSeconds > 0) {
         if (draft.clips.length == 1) {
           final clip = draft.clips.single;
+          final clipTransform = clip.transform;
           await VGRoiExportSidecarPostProcessor.process(
             sourceVideoPath: clip.sourcePath,
             outputVideoPath: exportResult.path,
             exportRoiSidecarPath: sidecarPath,
             canvasWidth: width,
             canvasHeight: height,
+            sourceRoiSidecarPath: clip.sourceRoiSidecarPath,
+            scaleX: clipTransform?.scaleX ?? 1.0,
+            scaleY: clipTransform?.scaleY ?? 1.0,
+            rotation: clipTransform?.rotation ?? 0.0,
+            translationX: clipTransform?.translationX ?? 0.0,
+            translationY: clipTransform?.translationY ?? 0.0,
             trimStartSeconds: clip.trimStartSeconds,
             trimEndSeconds: clip.trimEndSeconds,
           );

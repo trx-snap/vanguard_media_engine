@@ -20,6 +20,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/src/roi/vg_roi_models.dart';
 import 'package:vanguard_media_engine/vg_clip_descriptor.dart';
+import 'package:vanguard_media_engine/vg_clip_transform_descriptor.dart';
 import 'package:vanguard_media_engine/vg_editor_draft.dart';
 import 'package:vanguard_media_engine/vg_editor_export_request.dart';
 import 'package:vanguard_media_engine/vg_timeline_exporter.dart';
@@ -414,6 +415,172 @@ void main() {
       // Clip 2 sample: 1200ms + 3000ms (clip 1 duration) = 4200ms
       expect(parsedSidecar.samples[1].timestampMs, 4200);
       expect(parsedSidecar.finalized, isTrue);
+
+      // Verify no temp file residue
+      expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
+    },
+  );
+
+  // ── EX-9 ─────────────────────────────────────────────────────────────────────
+  test(
+    'EX-9: clip with non-adjacent sourceRoiSidecarPath triggers post-processing from explicit source path',
+    () async {
+      final tempDir = Directory.systemTemp.createTempSync(
+        'vg_timeline_exp_explicit_roi_test_',
+      );
+      addTearDown(() {
+        if (tempDir.existsSync()) {
+          tempDir.deleteSync(recursive: true);
+        }
+      });
+
+      final clipFile = File('${tempDir.path}/clip_explicit.mov');
+      await clipFile.writeAsBytes([1, 2, 3]);
+
+      // Ensure no adjacent sidecar exists
+      final adjacentSidecarFile = File(
+        '${tempDir.path}/clip_explicit.roi.json',
+      );
+      expect(adjacentSidecarFile.existsSync(), isFalse);
+
+      // Create explicit source sidecar in a non-adjacent path
+      final customSidecarDir = Directory('${tempDir.path}/custom_roi_dir')
+        ..createSync(recursive: true);
+      final explicitSourceSidecarFile = File(
+        '${customSidecarDir.path}/explicit_capture.roi.json',
+      );
+      final explicitSourceSidecar = VGROISidecar(
+        version: 1,
+        sourceType: 'app_recorded',
+        platform: 'android',
+        coordinateSpace: 'display_source_normalized',
+        recordingSessionId: 'session-explicit-test',
+        videoIdentity: VGROIIdentity(
+          durationMs: 4000,
+          width: 1080,
+          height: 1920,
+          hash: null,
+        ),
+        coverage: VGROICoverage(
+          coveragePercent: 1.0,
+          missingIntervals: const [],
+        ),
+        samples: [
+          VGROISample(
+            timestampMs: 1500,
+            framePtsMs: 1500,
+            recordingRelativeMs: 1500,
+            box: VGROIBox(x: 0.2, y: 0.3, w: 0.4, h: 0.5),
+            quality: 'detected',
+          ),
+        ],
+        finalized: true,
+      );
+      await explicitSourceSidecarFile.writeAsString(
+        jsonEncode(explicitSourceSidecar.toJson()),
+      );
+
+      final outputPath = '${tempDir.path}/explicit_timeline_out.mp4';
+      final exportRoiSidecarPath =
+          '${tempDir.path}/explicit_timeline_out.roi.json';
+
+      // Pre-create native empty fallback sidecar
+      final nativeEmptySidecar = File(exportRoiSidecarPath);
+      await nativeEmptySidecar.writeAsString(
+        '{"version":1,"nativeEmpty":true}',
+      );
+
+      final draft = VGEditorDraft(
+        id: 'test-explicit-roi-draft',
+        clips: [
+          VGClipDescriptor(
+            id: 'clip-explicit-1',
+            sourcePath: clipFile.path,
+            sourceRoiSidecarPath: explicitSourceSidecarFile.path,
+            durationSeconds: 4.0,
+            trimStartSeconds: 0.5,
+            trimEndSeconds: 3.5,
+            transform: const VGClipTransformDescriptor(
+              scaleX: 1.2,
+              scaleY: 1.2,
+            ),
+          ),
+        ],
+        canvasWidth: 1080,
+        canvasHeight: 1920,
+        fps: 30,
+      );
+
+      setHandler((call) async {
+        if (call.method == 'inspectMedia') {
+          return <String, dynamic>{
+            'kind': 'video',
+            'container': 'mov',
+            'videoCodec': 'h264',
+            'audioCodec': 'aac',
+            'width': 1080,
+            'height': 1920,
+            'encodedWidth': 1080,
+            'encodedHeight': 1920,
+            'displayWidth': 1080,
+            'displayHeight': 1920,
+            'durationSeconds': 4.0,
+            'bitrateKbps': 4000,
+            'fps': 30.0,
+            'fileSizeBytes': 2048,
+            'hasVideo': true,
+            'hasAudio': true,
+            'isHDR': false,
+            'hasMoovAtFront': false,
+            'hasRotationTransform': false,
+            'hasEmbeddedMetadata': false,
+            'rotationDegrees': 0,
+            'orientationStatus': 'valid',
+          };
+        }
+        if (call.method == 'exportTimeline') {
+          return <String, dynamic>{
+            'success': true,
+            'path': outputPath,
+            'durationSeconds': 3.0,
+            'width': 1080,
+            'height': 1920,
+            'fps': 30,
+            'exportRoiSidecarPath': exportRoiSidecarPath,
+          };
+        }
+        return null;
+      });
+
+      final result = await VanguardTimelineExporter.exportDraft(
+        draft: draft,
+        request: VGEditorExportRequest(outputPath: outputPath),
+        channel: channel,
+      );
+
+      expect(result.path, outputPath);
+      expect(result.exportRoiSidecarPath, exportRoiSidecarPath);
+
+      final sidecarFile = File(exportRoiSidecarPath);
+      expect(sidecarFile.existsSync(), isTrue);
+
+      final decoded = jsonDecode(await sidecarFile.readAsString());
+      final parsedSidecar = VGROISidecar.fromJson(decoded);
+
+      expect(parsedSidecar.coordinateSpace, 'export_output_normalized');
+      expect(parsedSidecar.videoIdentity.width, 1080);
+      expect(parsedSidecar.videoIdentity.height, 1920);
+      expect(parsedSidecar.videoIdentity.durationMs, 3000);
+      expect(parsedSidecar.samples.length, 1);
+
+      // Sample at 1500ms trimmed by trimStart (500ms) = 1000ms
+      expect(parsedSidecar.samples[0].timestampMs, 1000);
+      expect(parsedSidecar.samples[0].framePtsMs, 1000);
+      expect(parsedSidecar.samples[0].recordingRelativeMs, 1000);
+
+      // Box must be non-null and transformed by scale 1.2
+      final mappedBox = parsedSidecar.samples[0].box;
+      expect(mappedBox, isNotNull);
 
       // Verify no temp file residue
       expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);

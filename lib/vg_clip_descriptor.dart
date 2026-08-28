@@ -86,6 +86,19 @@
 //   - Wire key: 'colorMatrix'. Omitted from toMap() when null.
 //   - Backward-compatible: existing maps without 'colorMatrix' produce null.
 //
+// Phase 5-Unit O addition:
+//   - [sourceRoiSidecarPath]: optional String — the local path to this clip's
+//     source capture-time ROI sidecar (`.roi.json`), when one exists.
+//   - This is Dart-owned metadata only. It is never read by the native
+//     compositor and never mutates the source media at [sourcePath]. Native
+//     consumers of a serialized clip map MUST ignore this key.
+//   - It exists purely so the Dart-side export-time ROI post-processing
+//     (`VGRoiExportSidecarPostProcessor`) can resolve each clip's own source
+//     sidecar explicitly, instead of deriving it from [sourcePath].
+//   - Wire key: 'sourceRoiSidecarPath'. Omitted from toMap() when null or
+//     empty. Backward-compatible: existing maps without this key, or with a
+//     non-String/empty value, produce null.
+//
 // Serialisation:
 //   toMap() produces a JSON-compatible map:
 //   {
@@ -218,52 +231,55 @@ final class VGClipDescriptor {
     this.timeRemap,
     this.transformTrack,
     this.colorMatrix,
-  })  : assert(startTimeSeconds >= 0, 'startTimeSeconds must be >= 0'),
-        // Phase 10: colorMatrix must be exactly 20 elements when non-null.
-        assert(
-          colorMatrix == null || colorMatrix.length == 20,
-          'colorMatrix must have exactly 20 elements (4×5 row-major matrix)',
-        ),
-        assert(durationSeconds >= 0, 'durationSeconds must be >= 0'),
-        assert(trimStartSeconds >= 0, 'trimStartSeconds must be >= 0'),
-        assert(trimEndSeconds > trimStartSeconds,
-            'trimEndSeconds must be > trimStartSeconds'),
-        assert(speed > 0, 'speed must be > 0'),
-        // Phase 7.16: cropRect validation.
-        // When non-null: length == 4, all finite, all in [0.0, 1.0],
-        // width > 0, height > 0, x + width <= 1.0, y + height <= 1.0.
-        assert(
-          cropRect == null || cropRect.length == 4,
-          'cropRect must have exactly 4 elements [x, y, width, height]',
-        ),
-        assert(
-          cropRect == null ||
-              (cropRect[0] >= 0.0 &&
-                  cropRect[0] <= 1.0 &&
-                  cropRect[1] >= 0.0 &&
-                  cropRect[1] <= 1.0 &&
-                  cropRect[2] > 0.0 &&
-                  cropRect[2] <= 1.0 &&
-                  cropRect[3] > 0.0 &&
-                  cropRect[3] <= 1.0),
-          'cropRect values must be finite and in (0.0, 1.0]',
-        ),
-        assert(
-          cropRect == null || cropRect[0] + cropRect[2] <= 1.0,
-          'cropRect x + width must be <= 1.0',
-        ),
-        assert(
-          cropRect == null || cropRect[1] + cropRect[3] <= 1.0,
-          'cropRect y + height must be <= 1.0',
-        ),
-        // Phase 7.17: freezePTS validation.
-        // When non-null: must be non-negative and finite.
-        // Descriptor-level check only; VGEditorDraft.freezeClip() ensures the
-        // value lies within the original clip's active trim window at split time.
-        assert(
-          freezePTS == null || (freezePTS >= 0.0),
-          'freezePTS must be non-negative (source-local PTS for frame extraction)',
-        );
+    this.sourceRoiSidecarPath,
+  }) : assert(startTimeSeconds >= 0, 'startTimeSeconds must be >= 0'),
+       // Phase 10: colorMatrix must be exactly 20 elements when non-null.
+       assert(
+         colorMatrix == null || colorMatrix.length == 20,
+         'colorMatrix must have exactly 20 elements (4×5 row-major matrix)',
+       ),
+       assert(durationSeconds >= 0, 'durationSeconds must be >= 0'),
+       assert(trimStartSeconds >= 0, 'trimStartSeconds must be >= 0'),
+       assert(
+         trimEndSeconds > trimStartSeconds,
+         'trimEndSeconds must be > trimStartSeconds',
+       ),
+       assert(speed > 0, 'speed must be > 0'),
+       // Phase 7.16: cropRect validation.
+       // When non-null: length == 4, all finite, all in [0.0, 1.0],
+       // width > 0, height > 0, x + width <= 1.0, y + height <= 1.0.
+       assert(
+         cropRect == null || cropRect.length == 4,
+         'cropRect must have exactly 4 elements [x, y, width, height]',
+       ),
+       assert(
+         cropRect == null ||
+             (cropRect[0] >= 0.0 &&
+                 cropRect[0] <= 1.0 &&
+                 cropRect[1] >= 0.0 &&
+                 cropRect[1] <= 1.0 &&
+                 cropRect[2] > 0.0 &&
+                 cropRect[2] <= 1.0 &&
+                 cropRect[3] > 0.0 &&
+                 cropRect[3] <= 1.0),
+         'cropRect values must be finite and in (0.0, 1.0]',
+       ),
+       assert(
+         cropRect == null || cropRect[0] + cropRect[2] <= 1.0,
+         'cropRect x + width must be <= 1.0',
+       ),
+       assert(
+         cropRect == null || cropRect[1] + cropRect[3] <= 1.0,
+         'cropRect y + height must be <= 1.0',
+       ),
+       // Phase 7.17: freezePTS validation.
+       // When non-null: must be non-negative and finite.
+       // Descriptor-level check only; VGEditorDraft.freezeClip() ensures the
+       // value lies within the original clip's active trim window at split time.
+       assert(
+         freezePTS == null || (freezePTS >= 0.0),
+         'freezePTS must be non-negative (source-local PTS for frame extraction)',
+       );
 
   // ── Identity ───────────────────────────────────────────────────────────────
 
@@ -503,6 +519,23 @@ final class VGClipDescriptor {
   /// - Backward-compatible: existing clip maps without 'colorMatrix' produce null.
   final List<double>? colorMatrix;
 
+  // ── Source ROI sidecar (Phase 5-Unit O) ──────────────────────────────────
+
+  /// Local path to this clip's source capture-time ROI sidecar (`.roi.json`),
+  /// when one exists.
+  ///
+  /// **Phase 5-Unit O** — pure Dart-owned metadata. It is never sent to, or
+  /// interpreted by, the native compositor: native consumers of a serialized
+  /// clip map MUST ignore this key. It does not mutate the source media at
+  /// [sourcePath] in any way.
+  ///
+  /// Consumed exclusively by Dart-side export-time ROI post-processing
+  /// (`VGRoiExportSidecarPostProcessor`) to resolve this clip's own source
+  /// sidecar explicitly, instead of deriving a path from [sourcePath].
+  ///
+  /// Null means no known source sidecar for this clip.
+  final String? sourceRoiSidecarPath;
+
   // ── Crop rect convenience accessors (Phase 7.16) ─────────────────────────
 
   /// The normalized X origin of the crop rectangle. Null when [cropRect] is null.
@@ -619,6 +652,11 @@ final class VGClipDescriptor {
     // this 4×5 color matrix to each decoded video frame during timeline export.
     if (colorMatrix != null) {
       m['colorMatrix'] = colorMatrix!;
+    }
+    // Phase 5-Unit O: Dart-owned metadata only. Native consumers must ignore
+    // this key. Omitted when null or empty.
+    if (sourceRoiSidecarPath != null && sourceRoiSidecarPath!.isNotEmpty) {
+      m['sourceRoiSidecarPath'] = sourceRoiSidecarPath!;
     }
     return m;
   }
@@ -775,7 +813,9 @@ final class VGClipDescriptor {
       } else {
         transformTrack = VGTransformTrackDescriptor.fromMap(rawTransformTrack);
       }
-      if (transformTrack == null) return null; // malformed transform track payload
+      if (transformTrack == null) {
+        return null; // malformed transform track payload
+      }
     }
 
     // Phase 10: parse optional colorMatrix.
@@ -795,6 +835,16 @@ final class VGClipDescriptor {
       colorMatrix = doubles;
     }
 
+    // Phase 5-Unit O: parse optional sourceRoiSidecarPath.
+    // Only a non-empty String is accepted; any other type or an empty string
+    // produces null (preserves old maps without this key as null).
+    final rawSourceRoiSidecarPath = map['sourceRoiSidecarPath'];
+    final sourceRoiSidecarPath =
+        (rawSourceRoiSidecarPath is String &&
+            rawSourceRoiSidecarPath.isNotEmpty)
+        ? rawSourceRoiSidecarPath
+        : null;
+
     return VGClipDescriptor(
       id: id as String,
       sourcePath: sourcePath as String,
@@ -813,6 +863,7 @@ final class VGClipDescriptor {
       timeRemap: timeRemap,
       transformTrack: transformTrack,
       colorMatrix: colorMatrix,
+      sourceRoiSidecarPath: sourceRoiSidecarPath,
     );
   }
 
@@ -846,6 +897,8 @@ final class VGClipDescriptor {
     Object? transformTrack = _kClipNoValue,
     // Use sentinel to allow explicit null assignment (clear colorMatrix).
     Object? colorMatrix = _kClipNoValue,
+    // Use sentinel to allow explicit null assignment (clear sourceRoiSidecarPath).
+    Object? sourceRoiSidecarPath = _kClipNoValue,
   }) {
     return VGClipDescriptor(
       id: id ?? this.id,
@@ -879,6 +932,9 @@ final class VGClipDescriptor {
       colorMatrix: colorMatrix == _kClipNoValue
           ? this.colorMatrix
           : colorMatrix as List<double>?,
+      sourceRoiSidecarPath: sourceRoiSidecarPath == _kClipNoValue
+          ? this.sourceRoiSidecarPath
+          : sourceRoiSidecarPath as String?,
     );
   }
 
@@ -904,7 +960,8 @@ final class VGClipDescriptor {
           other.dualCamera == dualCamera &&
           other.timeRemap == timeRemap &&
           other.transformTrack == transformTrack &&
-          _colorMatrixEqual(other.colorMatrix, colorMatrix);
+          _colorMatrixEqual(other.colorMatrix, colorMatrix) &&
+          other.sourceRoiSidecarPath == sourceRoiSidecarPath;
 
   /// Deep-equality helper for the [cropRect] list field.
   static bool _cropRectEqual(List<double>? a, List<double>? b) {
@@ -930,29 +987,31 @@ final class VGClipDescriptor {
 
   @override
   int get hashCode => Object.hash(
-        id,
-        sourcePath,
-        mediaKind,
-        startTimeSeconds,
-        durationSeconds,
-        trimStartSeconds,
-        trimEndSeconds,
-        speed,
-        transform,
-        fitMode,
-        // Hash cropRect elements individually for stable hash.
-        Object.hashAll(cropRect ?? const []),
-        freezePTS,
-        isReversed,
-        dualCamera,
-        timeRemap,
-        transformTrack,
-        // Hash colorMatrix elements individually for stable hash.
-        Object.hashAll(colorMatrix ?? const []),
-      );
+    id,
+    sourcePath,
+    mediaKind,
+    startTimeSeconds,
+    durationSeconds,
+    trimStartSeconds,
+    trimEndSeconds,
+    speed,
+    transform,
+    fitMode,
+    // Hash cropRect elements individually for stable hash.
+    Object.hashAll(cropRect ?? const []),
+    freezePTS,
+    isReversed,
+    dualCamera,
+    timeRemap,
+    transformTrack,
+    // Hash colorMatrix elements individually for stable hash.
+    Object.hashAll(colorMatrix ?? const []),
+    sourceRoiSidecarPath,
+  );
 
   @override
-  String toString() => 'VGClipDescriptor('
+  String toString() =>
+      'VGClipDescriptor('
       'id: $id, '
       'sourcePath: ${sourcePath.split('/').last}, '
       'kind: ${mediaKind.value}, '
@@ -968,7 +1027,8 @@ final class VGClipDescriptor {
       'dualCamera: ${dualCamera != null ? "<present layoutMode=${dualCamera!.layoutMode.value}>" : null}, '
       'timeRemap: ${timeRemap != null ? "<present segments=${timeRemap!.segments.length}>" : null}, '
       'transformTrack: ${transformTrack != null ? "<present keyframes=${transformTrack!.keyframes.length} interp=${transformTrack!.interpolation.value}>" : null}, '
-      'colorMatrix: ${colorMatrix != null ? "<present ${colorMatrix!.length} elements>" : null})';
+      'colorMatrix: ${colorMatrix != null ? "<present ${colorMatrix!.length} elements>" : null}, '
+      'sourceRoiSidecarPath: $sourceRoiSidecarPath)';
 }
 
 // ── Sentinel for copyWith nullable fields ─────────────────────────────────────────

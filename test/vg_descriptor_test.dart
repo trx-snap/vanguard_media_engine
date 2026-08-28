@@ -603,15 +603,14 @@ void main() {
       double durationSeconds = 5.0,
       double trimStart = 0.0,
       double trimEnd = 5.0,
-    }) =>
-        VGClipDescriptor(
-          id: id,
-          sourcePath: sourcePath,
-          mediaKind: VGMediaKind.image,
-          durationSeconds: durationSeconds,
-          trimStartSeconds: trimStart,
-          trimEndSeconds: trimEnd,
-        );
+    }) => VGClipDescriptor(
+      id: id,
+      sourcePath: sourcePath,
+      mediaKind: VGMediaKind.image,
+      durationSeconds: durationSeconds,
+      trimStartSeconds: trimStart,
+      trimEndSeconds: trimEnd,
+    );
 
     test('IK-1  VGClipDescriptor with VGMediaKind.image is constructible', () {
       final clip = _imageClip();
@@ -625,43 +624,52 @@ void main() {
       expect(m['mediaKind'], 'image');
     });
 
-    test('IK-3  fromMap() deserialises mediaKind="image" to VGMediaKind.image', () {
-      final m = _imageClip().toMap();
-      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
-      expect(clip, isNotNull);
-      expect(clip!.mediaKind, VGMediaKind.image);
-    });
+    test(
+      'IK-3  fromMap() deserialises mediaKind="image" to VGMediaKind.image',
+      () {
+        final m = _imageClip().toMap();
+        final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+        expect(clip, isNotNull);
+        expect(clip!.mediaKind, VGMediaKind.image);
+      },
+    );
 
-    test('IK-4  fromMap() round-trip preserves all fields for an image clip', () {
-      final original = _imageClip(
-        id: 'img-rt',
-        sourcePath: '/tmp/photo.jpg',
-        durationSeconds: 10.0,
-        trimStart: 0.0,
-        trimEnd: 4.0,
-      );
-      final clone = VGClipDescriptor.fromMap(
-        Map<Object?, Object?>.from(original.toMap()),
-      );
-      expect(clone, isNotNull);
-      expect(clone!.id, original.id);
-      expect(clone.sourcePath, original.sourcePath);
-      expect(clone.mediaKind, VGMediaKind.image);
-      expect(clone.durationSeconds, original.durationSeconds);
-      expect(clone.trimStartSeconds, original.trimStartSeconds);
-      expect(clone.trimEndSeconds, original.trimEndSeconds);
-      expect(clone.speed, original.speed);
-    });
+    test(
+      'IK-4  fromMap() round-trip preserves all fields for an image clip',
+      () {
+        final original = _imageClip(
+          id: 'img-rt',
+          sourcePath: '/tmp/photo.jpg',
+          durationSeconds: 10.0,
+          trimStart: 0.0,
+          trimEnd: 4.0,
+        );
+        final clone = VGClipDescriptor.fromMap(
+          Map<Object?, Object?>.from(original.toMap()),
+        );
+        expect(clone, isNotNull);
+        expect(clone!.id, original.id);
+        expect(clone.sourcePath, original.sourcePath);
+        expect(clone.mediaKind, VGMediaKind.image);
+        expect(clone.durationSeconds, original.durationSeconds);
+        expect(clone.trimStartSeconds, original.trimStartSeconds);
+        expect(clone.trimEndSeconds, original.trimEndSeconds);
+        expect(clone.speed, original.speed);
+      },
+    );
 
-    test('IK-5  fromMap() with unknown mediaKind string returns VGMediaKind.unknown', () {
-      // VGMediaKind.fromValue returns unknown for unrecognised strings;
-      // fromMap should still succeed (not return null) for unknown kinds.
-      final m = _imageClip().toMap()
-        ..['mediaKind'] = 'hologram'; // unrecognised
-      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
-      expect(clip, isNotNull);
-      expect(clip!.mediaKind, VGMediaKind.unknown);
-    });
+    test(
+      'IK-5  fromMap() with unknown mediaKind string returns VGMediaKind.unknown',
+      () {
+        // VGMediaKind.fromValue returns unknown for unrecognised strings;
+        // fromMap should still succeed (not return null) for unknown kinds.
+        final m = _imageClip().toMap()
+          ..['mediaKind'] = 'hologram'; // unrecognised
+        final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+        expect(clip, isNotNull);
+        expect(clip!.mediaKind, VGMediaKind.unknown);
+      },
+    );
 
     test('IK-6  fromMap() defaults mediaKind to video when key is absent', () {
       final m = _imageClip().toMap()..remove('mediaKind');
@@ -671,10 +679,13 @@ void main() {
       expect(clip!.mediaKind, VGMediaKind.video);
     });
 
-    test('IK-7  timelineDuration for image clip equals trimEnd - trimStart', () {
-      final clip = _imageClip(trimStart: 0.0, trimEnd: 3.5);
-      expect(clip.timelineDuration, closeTo(3.5, 1e-10));
-    });
+    test(
+      'IK-7  timelineDuration for image clip equals trimEnd - trimStart',
+      () {
+        final clip = _imageClip(trimStart: 0.0, trimEnd: 3.5);
+        expect(clip.timelineDuration, closeTo(3.5, 1e-10));
+      },
+    );
 
     // ── Phase 7.16: VGStillImageFitMode and cropRect ─────────────────────────
     // Tests added by Phase 7.16 Implementer.
@@ -724,15 +735,15 @@ void main() {
         fitMode: VGStillImageFitMode.fill,
       );
       final clone = VGClipDescriptor.fromMap(
-          Map<Object?, Object?>.from(original.toMap()));
+        Map<Object?, Object?>.from(original.toMap()),
+      );
       expect(clone, isNotNull);
       expect(clone!.fitMode, VGStillImageFitMode.fill);
     });
 
     test('IK-13 fitMode defaults to fit when key absent in fromMap()', () {
       final m = _imageClip().toMap()..remove('fitMode');
-      final clip =
-          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
       expect(clip, isNotNull);
       expect(clip!.fitMode, VGStillImageFitMode.fit);
     });
@@ -740,8 +751,7 @@ void main() {
     test('IK-14 unknown fitMode string resolves to fit (safe default)', () {
       final m = _imageClip().toMap();
       m['fitMode'] = 'stretch'; // unrecognised
-      final clip =
-          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
       expect(clip, isNotNull);
       expect(clip!.fitMode, VGStillImageFitMode.fit);
     });
@@ -757,7 +767,8 @@ void main() {
         cropRect: [0.1, 0.2, 0.6, 0.5],
       );
       final clone = VGClipDescriptor.fromMap(
-          Map<Object?, Object?>.from(original.toMap()));
+        Map<Object?, Object?>.from(original.toMap()),
+      );
       expect(clone, isNotNull);
       expect(clone!.cropRect, isNotNull);
       expect(clone.cropRect, hasLength(4));
@@ -871,96 +882,98 @@ void main() {
 
     // ── Crop rect validation ──────────────────────────────────────────────────
 
-    test('CV-1  cropRect with wrong length (3 elements) is rejected by fromMap()', () {
-      final m = _imageClip().toMap();
-      m['cropRect'] = [0.1, 0.1, 0.8]; // length 3 — invalid
-      final clip =
-          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
-      expect(clip, isNull);
-    });
+    test(
+      'CV-1  cropRect with wrong length (3 elements) is rejected by fromMap()',
+      () {
+        final m = _imageClip().toMap();
+        m['cropRect'] = [0.1, 0.1, 0.8]; // length 3 — invalid
+        final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+        expect(clip, isNull);
+      },
+    );
 
     test('CV-2  cropRect with length 5 is rejected by fromMap()', () {
       final m = _imageClip().toMap();
       m['cropRect'] = [0.1, 0.1, 0.5, 0.5, 0.0]; // length 5 — invalid
-      final clip =
-          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
       expect(clip, isNull);
     });
 
     test('CV-3  cropRect with x < 0 is rejected by fromMap()', () {
       final m = _imageClip().toMap();
       m['cropRect'] = [-0.1, 0.0, 0.5, 0.5];
-      final clip =
-          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
       expect(clip, isNull);
     });
 
     test('CV-4  cropRect with width == 0 is rejected by fromMap()', () {
       final m = _imageClip().toMap();
       m['cropRect'] = [0.0, 0.0, 0.0, 0.5];
-      final clip =
-          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
       expect(clip, isNull);
     });
 
     test('CV-5  cropRect with height == 0 is rejected by fromMap()', () {
       final m = _imageClip().toMap();
       m['cropRect'] = [0.0, 0.0, 0.5, 0.0];
-      final clip =
-          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
       expect(clip, isNull);
     });
 
     test('CV-6  cropRect x + width > 1.0 is rejected by fromMap()', () {
       final m = _imageClip().toMap();
       m['cropRect'] = [0.8, 0.0, 0.5, 0.5]; // 0.8 + 0.5 = 1.3 > 1.0
-      final clip =
-          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
       expect(clip, isNull);
     });
 
     test('CV-7  cropRect y + height > 1.0 is rejected by fromMap()', () {
       final m = _imageClip().toMap();
       m['cropRect'] = [0.0, 0.8, 0.5, 0.5]; // 0.8 + 0.5 = 1.3 > 1.0
-      final clip =
-          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
       expect(clip, isNull);
     });
 
     test('CV-8  cropRect with value > 1.0 is rejected by fromMap()', () {
       final m = _imageClip().toMap();
       m['cropRect'] = [0.0, 0.0, 1.5, 0.5]; // width 1.5 out of range
-      final clip =
-          VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+      final clip = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
       expect(clip, isNull);
     });
 
-    test('CV-9  valid cropRect [0.0, 0.0, 1.0, 1.0] (full frame) is accepted', () {
-      final clip = VGClipDescriptor(
-        id: 'cv-full',
-        sourcePath: '/tmp/img.jpg',
-        mediaKind: VGMediaKind.image,
-        durationSeconds: 3.0,
-        trimStartSeconds: 0.0,
-        trimEndSeconds: 3.0,
-        cropRect: [0.0, 0.0, 1.0, 1.0],
-      );
-      expect(clip.cropRect, isNotNull);
-    });
+    test(
+      'CV-9  valid cropRect [0.0, 0.0, 1.0, 1.0] (full frame) is accepted',
+      () {
+        final clip = VGClipDescriptor(
+          id: 'cv-full',
+          sourcePath: '/tmp/img.jpg',
+          mediaKind: VGMediaKind.image,
+          durationSeconds: 3.0,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 3.0,
+          cropRect: [0.0, 0.0, 1.0, 1.0],
+        );
+        expect(clip.cropRect, isNotNull);
+      },
+    );
 
     test('CV-10 VGStillImageFitMode.fromValue("fill") resolves to fill', () {
-      expect(
-          VGStillImageFitMode.fromValue('fill'), VGStillImageFitMode.fill);
+      expect(VGStillImageFitMode.fromValue('fill'), VGStillImageFitMode.fill);
     });
 
     test('CV-11 VGStillImageFitMode.fromValue("fit") resolves to fit', () {
       expect(VGStillImageFitMode.fromValue('fit'), VGStillImageFitMode.fit);
     });
 
-    test('CV-12 VGStillImageFitMode.fromValue unknown string resolves to fit', () {
-      expect(
-          VGStillImageFitMode.fromValue('stretch'), VGStillImageFitMode.fit);
-    });
+    test(
+      'CV-12 VGStillImageFitMode.fromValue unknown string resolves to fit',
+      () {
+        expect(
+          VGStillImageFitMode.fromValue('stretch'),
+          VGStillImageFitMode.fit,
+        );
+      },
+    );
   });
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -976,16 +989,15 @@ void main() {
       double trimStart = 0.0,
       double trimEnd = 10.0,
       double? freezePTS,
-    }) =>
-        VGClipDescriptor(
-          id: id,
-          sourcePath: sourcePath,
-          mediaKind: VGMediaKind.video,
-          durationSeconds: durationSeconds,
-          trimStartSeconds: trimStart,
-          trimEndSeconds: trimEnd,
-          freezePTS: freezePTS,
-        );
+    }) => VGClipDescriptor(
+      id: id,
+      sourcePath: sourcePath,
+      mediaKind: VGMediaKind.video,
+      durationSeconds: durationSeconds,
+      trimStartSeconds: trimStart,
+      trimEndSeconds: trimEnd,
+      freezePTS: freezePTS,
+    );
 
     test('FF-1  freezePTS defaults to null', () {
       final clip = _videoClip();
@@ -1018,7 +1030,8 @@ void main() {
     test('FF-6  freezePTS round-trip via fromMap()', () {
       final original = _videoClip(freezePTS: 4.25);
       final clone = VGClipDescriptor.fromMap(
-          Map<Object?, Object?>.from(original.toMap()));
+        Map<Object?, Object?>.from(original.toMap()),
+      );
       expect(clone, isNotNull);
       expect(clone!.freezePTS, closeTo(4.25, 1e-10));
     });
@@ -1071,22 +1084,22 @@ void main() {
   group('VGEditorDraft.freezeClip — Phase 7.17', () {
     // Helper: a draft with a single 10s video clip.
     VGEditorDraft _singleClipDraft() => VGEditorDraft.sequentialWithTransitions(
-          id: 'draft-freeze',
-          clips: [
-            VGClipDescriptor(
-              id: 'clip-A',
-              sourcePath: '/tmp/video.mp4',
-              mediaKind: VGMediaKind.video,
-              durationSeconds: 10.0,
-              trimStartSeconds: 0.0,
-              trimEndSeconds: 10.0,
-            ),
-          ],
-          transitions: const [],
-          canvasWidth: 1920,
-          canvasHeight: 1080,
-          fps: 30,
-        );
+      id: 'draft-freeze',
+      clips: [
+        VGClipDescriptor(
+          id: 'clip-A',
+          sourcePath: '/tmp/video.mp4',
+          mediaKind: VGMediaKind.video,
+          durationSeconds: 10.0,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 10.0,
+        ),
+      ],
+      transitions: const [],
+      canvasWidth: 1920,
+      canvasHeight: 1080,
+      fps: 30,
+    );
 
     test('FC-1  freezeClip returns a draft with 3 clips', () {
       final result = _singleClipDraft().freezeClip('clip-A', 5.0, 2.0);
@@ -1170,10 +1183,7 @@ void main() {
         canvasHeight: 1080,
         fps: 30,
       );
-      expect(
-        () => draft.freezeClip('img-clip', 2.0, 1.0),
-        throwsArgumentError,
-      );
+      expect(() => draft.freezeClip('img-clip', 2.0, 1.0), throwsArgumentError);
     });
   });
 
@@ -1186,16 +1196,15 @@ void main() {
     VGClipDescriptor _videoClipRV({
       String id = 'vid-rv',
       bool isReversed = false,
-    }) =>
-        VGClipDescriptor(
-          id: id,
-          sourcePath: '/tmp/video.mp4',
-          mediaKind: VGMediaKind.video,
-          durationSeconds: 10.0,
-          trimStartSeconds: 0.0,
-          trimEndSeconds: 10.0,
-          isReversed: isReversed,
-        );
+    }) => VGClipDescriptor(
+      id: id,
+      sourcePath: '/tmp/video.mp4',
+      mediaKind: VGMediaKind.video,
+      durationSeconds: 10.0,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 10.0,
+      isReversed: isReversed,
+    );
 
     test('RV-1  isReversed defaults to false', () {
       final clip = _videoClipRV();
@@ -1223,7 +1232,8 @@ void main() {
     test('RV-5  isReversed=true round-trips via fromMap()', () {
       final original = _videoClipRV(isReversed: true);
       final clone = VGClipDescriptor.fromMap(
-          Map<Object?, Object?>.from(original.toMap()));
+        Map<Object?, Object?>.from(original.toMap()),
+      );
       expect(clone, isNotNull);
       expect(clone!.isReversed, isTrue);
     });
@@ -1259,6 +1269,168 @@ void main() {
       final a = _videoClipRV(isReversed: false);
       final b = _videoClipRV(isReversed: true);
       expect(a == b, isFalse);
+    });
+  });
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // Phase 5-Unit O: VGClipDescriptor.sourceRoiSidecarPath
+  // ───────────────────────────────────────────────────────────────────────────
+
+  group('VGClipDescriptor — sourceRoiSidecarPath (Phase 5-Unit O)', () {
+    VGClipDescriptor clipWithSidecar({
+      String id = 'clip-roi',
+      String? sourceRoiSidecarPath,
+    }) => VGClipDescriptor(
+      id: id,
+      sourcePath: '/tmp/video.mp4',
+      mediaKind: VGMediaKind.video,
+      durationSeconds: 10.0,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 10.0,
+      sourceRoiSidecarPath: sourceRoiSidecarPath,
+    );
+
+    test('SR-1  sourceRoiSidecarPath defaults to null', () {
+      final clip = clipWithSidecar();
+      expect(clip.sourceRoiSidecarPath, isNull);
+    });
+
+    test('SR-2  non-null sourceRoiSidecarPath is stored correctly', () {
+      final clip = clipWithSidecar(
+        sourceRoiSidecarPath: '/tmp/custom/source.roi.json',
+      );
+      expect(clip.sourceRoiSidecarPath, '/tmp/custom/source.roi.json');
+    });
+
+    test('SR-3  null sourceRoiSidecarPath is omitted from toMap()', () {
+      final clip = clipWithSidecar();
+      final m = clip.toMap();
+      expect(m.containsKey('sourceRoiSidecarPath'), isFalse);
+    });
+
+    test('SR-4  empty sourceRoiSidecarPath is omitted from toMap()', () {
+      final clip = clipWithSidecar(sourceRoiSidecarPath: '');
+      final m = clip.toMap();
+      expect(m.containsKey('sourceRoiSidecarPath'), isFalse);
+    });
+
+    test(
+      'SR-5  non-empty sourceRoiSidecarPath serialises to toMap() under sourceRoiSidecarPath',
+      () {
+        final clip = clipWithSidecar(
+          sourceRoiSidecarPath: '/custom/path.roi.json',
+        );
+        final m = clip.toMap();
+        expect(m['sourceRoiSidecarPath'], '/custom/path.roi.json');
+      },
+    );
+
+    test(
+      'SR-6  sourceRoiSidecarPath round-trips via fromMap() when non-empty',
+      () {
+        final original = clipWithSidecar(
+          sourceRoiSidecarPath: '/var/data/capture.roi.json',
+        );
+        final clone = VGClipDescriptor.fromMap(
+          Map<Object?, Object?>.from(original.toMap()),
+        );
+        expect(clone, isNotNull);
+        expect(clone!.sourceRoiSidecarPath, '/var/data/capture.roi.json');
+      },
+    );
+
+    test(
+      'SR-7  absent sourceRoiSidecarPath key in fromMap() defaults to null',
+      () {
+        final m = clipWithSidecar().toMap();
+        expect(m.containsKey('sourceRoiSidecarPath'), isFalse);
+        final clone = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+        expect(clone, isNotNull);
+        expect(clone!.sourceRoiSidecarPath, isNull);
+      },
+    );
+
+    test(
+      'SR-8  empty string sourceRoiSidecarPath in fromMap() returns null',
+      () {
+        final m = clipWithSidecar().toMap();
+        m['sourceRoiSidecarPath'] = '';
+        final clone = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m));
+        expect(clone, isNotNull);
+        expect(clone!.sourceRoiSidecarPath, isNull);
+      },
+    );
+
+    test(
+      'SR-9  non-String sourceRoiSidecarPath produces null without failing deserialization',
+      () {
+        // Integer
+        final m1 = clipWithSidecar().toMap()..['sourceRoiSidecarPath'] = 12345;
+        final clone1 = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m1));
+        expect(clone1, isNotNull);
+        expect(clone1!.sourceRoiSidecarPath, isNull);
+
+        // Boolean
+        final m2 = clipWithSidecar().toMap()..['sourceRoiSidecarPath'] = true;
+        final clone2 = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m2));
+        expect(clone2, isNotNull);
+        expect(clone2!.sourceRoiSidecarPath, isNull);
+
+        // Map
+        final m3 = clipWithSidecar().toMap()
+          ..['sourceRoiSidecarPath'] = {'path': '/some/path'};
+        final clone3 = VGClipDescriptor.fromMap(Map<Object?, Object?>.from(m3));
+        expect(clone3, isNotNull);
+        expect(clone3!.sourceRoiSidecarPath, isNull);
+      },
+    );
+
+    test(
+      'SR-10 copyWith preserves sourceRoiSidecarPath when not overridden',
+      () {
+        final clip = clipWithSidecar(
+          sourceRoiSidecarPath: '/original/sidecar.roi.json',
+        );
+        final copy = clip.copyWith(id: 'clip-copy');
+        expect(copy.sourceRoiSidecarPath, '/original/sidecar.roi.json');
+      },
+    );
+
+    test('SR-11 copyWith can update sourceRoiSidecarPath', () {
+      final clip = clipWithSidecar(sourceRoiSidecarPath: '/old/path.roi.json');
+      final copy = clip.copyWith(sourceRoiSidecarPath: '/new/path.roi.json');
+      expect(copy.sourceRoiSidecarPath, '/new/path.roi.json');
+    });
+
+    test(
+      'SR-12 copyWith can clear sourceRoiSidecarPath to null via sentinel',
+      () {
+        final clip = clipWithSidecar(
+          sourceRoiSidecarPath: '/custom/path.roi.json',
+        );
+        final cleared = clip.copyWith(sourceRoiSidecarPath: null);
+        expect(cleared.sourceRoiSidecarPath, isNull);
+      },
+    );
+
+    test('SR-13 equality and hashCode include sourceRoiSidecarPath', () {
+      final a = clipWithSidecar(
+        sourceRoiSidecarPath: '/path/to/sidecar.roi.json',
+      );
+      final b = clipWithSidecar(
+        sourceRoiSidecarPath: '/path/to/sidecar.roi.json',
+      );
+      expect(a, equals(b));
+      expect(a.hashCode, equals(b.hashCode));
+    });
+
+    test('SR-14 equality differs when sourceRoiSidecarPath differs', () {
+      final a = clipWithSidecar(sourceRoiSidecarPath: '/path/a.roi.json');
+      final b = clipWithSidecar(sourceRoiSidecarPath: '/path/b.roi.json');
+      final c = clipWithSidecar(sourceRoiSidecarPath: null);
+      expect(a == b, isFalse);
+      expect(a == c, isFalse);
+      expect(b == c, isFalse);
     });
   });
 }

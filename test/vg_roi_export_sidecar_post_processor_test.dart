@@ -1161,4 +1161,426 @@ void main() {
       },
     );
   });
+
+  // ---------------------------------------------------------------------------
+  // 7. Explicit sourceRoiSidecarPath and Transform Forwarding (Phase 5-Unit O)
+  // ---------------------------------------------------------------------------
+  group('Explicit sourceRoiSidecarPath and Transform Forwarding (Phase 5-Unit O)', () {
+    test(
+      'explicit non-adjacent sidecar path maps successfully when no adjacent sidecar exists',
+      () async {
+        mockInspectMedia(
+          width: 1080,
+          height: 1920,
+          displayWidth: 1080,
+          displayHeight: 1920,
+        );
+
+        final sourceVideoFile = File('${tempDir.path}/no_adjacent_source.mov');
+        await sourceVideoFile.writeAsBytes([1, 2, 3]);
+
+        // Explicit sidecar located in a separate subdirectory/name
+        final explicitSubdir = Directory('${tempDir.path}/custom_sidecars')
+          ..createSync(recursive: true);
+        final explicitSidecarFile = File(
+          '${explicitSubdir.path}/explicit_source.roi.json',
+        );
+
+        final box = VGROIBox(x: 0.15, y: 0.25, w: 0.35, h: 0.45);
+        final sample = _makeSample(
+          timestampMs: 1200,
+          framePtsMs: 1200,
+          recordingRelativeMs: 1200,
+          box: box,
+        );
+        final sourceSidecar = _makeSourceSidecar(
+          coordinateSpace: 'display_source_normalized',
+          width: 1080,
+          height: 1920,
+          samples: [sample],
+        );
+        await explicitSidecarFile.writeAsString(
+          jsonEncode(sourceSidecar.toJson()),
+        );
+
+        // Verify that NO adjacent sidecar exists
+        final adjacentSidecarFile = File(
+          '${tempDir.path}/no_adjacent_source.roi.json',
+        );
+        expect(adjacentSidecarFile.existsSync(), isFalse);
+
+        final outputVideoPath = '${tempDir.path}/explicit_out.mp4';
+        final exportRoiSidecarPath = '${tempDir.path}/explicit_out.roi.json';
+        final nativeEmptySidecar = File(exportRoiSidecarPath);
+        await nativeEmptySidecar.writeAsString('{"version":1,"native":true}');
+
+        final processed = await VGRoiExportSidecarPostProcessor.process(
+          sourceVideoPath: sourceVideoFile.path,
+          outputVideoPath: outputVideoPath,
+          exportRoiSidecarPath: exportRoiSidecarPath,
+          canvasWidth: 720,
+          canvasHeight: 1280,
+          sourceRoiSidecarPath: explicitSidecarFile.path,
+        );
+
+        expect(processed, isTrue);
+
+        final outputSidecarFile = File(exportRoiSidecarPath);
+        expect(outputSidecarFile.existsSync(), isTrue);
+
+        final decoded = jsonDecode(await outputSidecarFile.readAsString());
+        final resultSidecar = VGROISidecar.fromJson(decoded);
+
+        expect(
+          resultSidecar.coordinateSpace,
+          equals('export_output_normalized'),
+        );
+        expect(resultSidecar.samples.length, equals(1));
+        _expectBoxCloseTo(resultSidecar.samples[0].box, box);
+
+        expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
+      },
+    );
+
+    test(
+      'explicit missing path fails closed and does NOT fall back to valid adjacent sidecar',
+      () async {
+        mockInspectMedia(
+          width: 1080,
+          height: 1920,
+          displayWidth: 1080,
+          displayHeight: 1920,
+        );
+
+        final sourceVideoFile = File('${tempDir.path}/has_adjacent.mov');
+        await sourceVideoFile.writeAsBytes([1, 2, 3]);
+
+        // Create a valid adjacent sidecar
+        final adjacentSidecarFile = File(
+          '${tempDir.path}/has_adjacent.roi.json',
+        );
+        final adjacentSidecar = _makeSourceSidecar(
+          coordinateSpace: 'display_source_normalized',
+          width: 1080,
+          height: 1920,
+          samples: [
+            _makeSample(
+              timestampMs: 500,
+              framePtsMs: 500,
+              recordingRelativeMs: 500,
+              box: VGROIBox(x: 0.1, y: 0.1, w: 0.2, h: 0.2),
+            ),
+          ],
+        );
+        await adjacentSidecarFile.writeAsString(
+          jsonEncode(adjacentSidecar.toJson()),
+        );
+
+        final outputVideoPath = '${tempDir.path}/fail_closed_out.mp4';
+        final exportRoiSidecarPath = '${tempDir.path}/fail_closed_out.roi.json';
+        const sentinel = '{"sentinel":"fallback_sidecar_must_remain"}';
+        final nativeEmptySidecar = File(exportRoiSidecarPath);
+        await nativeEmptySidecar.writeAsString(sentinel);
+
+        // Point to a non-existent explicit path
+        final nonExistentExplicitPath =
+            '${tempDir.path}/does_not_exist_explicit.roi.json';
+
+        final processed = await VGRoiExportSidecarPostProcessor.process(
+          sourceVideoPath: sourceVideoFile.path,
+          outputVideoPath: outputVideoPath,
+          exportRoiSidecarPath: exportRoiSidecarPath,
+          canvasWidth: 720,
+          canvasHeight: 1280,
+          sourceRoiSidecarPath: nonExistentExplicitPath,
+        );
+
+        // Must fail closed (return false) and leave native sidecar intact
+        expect(processed, isFalse);
+        expect(await nativeEmptySidecar.readAsString(), equals(sentinel));
+        expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
+      },
+    );
+
+    test(
+      'explicit malformed path fails closed and does NOT fall back to valid adjacent sidecar',
+      () async {
+        mockInspectMedia(
+          width: 1080,
+          height: 1920,
+          displayWidth: 1080,
+          displayHeight: 1920,
+        );
+
+        final sourceVideoFile = File('${tempDir.path}/has_adjacent_mal.mov');
+        await sourceVideoFile.writeAsBytes([1, 2, 3]);
+
+        // Create a valid adjacent sidecar
+        final adjacentSidecarFile = File(
+          '${tempDir.path}/has_adjacent_mal.roi.json',
+        );
+        final adjacentSidecar = _makeSourceSidecar(
+          coordinateSpace: 'display_source_normalized',
+          width: 1080,
+          height: 1920,
+          samples: [
+            _makeSample(
+              timestampMs: 500,
+              framePtsMs: 500,
+              recordingRelativeMs: 500,
+              box: VGROIBox(x: 0.1, y: 0.1, w: 0.2, h: 0.2),
+            ),
+          ],
+        );
+        await adjacentSidecarFile.writeAsString(
+          jsonEncode(adjacentSidecar.toJson()),
+        );
+
+        // Create a malformed explicit sidecar
+        final malformedExplicitFile = File(
+          '${tempDir.path}/malformed_explicit.roi.json',
+        );
+        await malformedExplicitFile.writeAsString('{not valid json at all!');
+
+        final outputVideoPath = '${tempDir.path}/fail_mal_out.mp4';
+        final exportRoiSidecarPath = '${tempDir.path}/fail_mal_out.roi.json';
+        const sentinel = '{"sentinel":"fallback_sidecar_must_remain"}';
+        final nativeEmptySidecar = File(exportRoiSidecarPath);
+        await nativeEmptySidecar.writeAsString(sentinel);
+
+        final processed = await VGRoiExportSidecarPostProcessor.process(
+          sourceVideoPath: sourceVideoFile.path,
+          outputVideoPath: outputVideoPath,
+          exportRoiSidecarPath: exportRoiSidecarPath,
+          canvasWidth: 720,
+          canvasHeight: 1280,
+          sourceRoiSidecarPath: malformedExplicitFile.path,
+        );
+
+        expect(processed, isFalse);
+        expect(await nativeEmptySidecar.readAsString(), equals(sentinel));
+        expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
+      },
+    );
+
+    test(
+      'transform parameters are forwarded and affect output ROI box',
+      () async {
+        mockInspectMedia(
+          width: 1080,
+          height: 1920,
+          displayWidth: 1080,
+          displayHeight: 1920,
+        );
+
+        final sourceVideoFile = File('${tempDir.path}/transform_src.mov');
+        await sourceVideoFile.writeAsBytes([1, 2, 3]);
+
+        final box = VGROIBox(x: 0.2, y: 0.2, w: 0.4, h: 0.4);
+        final sourceSidecar = _makeSourceSidecar(
+          coordinateSpace: 'display_source_normalized',
+          width: 1080,
+          height: 1920,
+          samples: [
+            _makeSample(
+              timestampMs: 1000,
+              framePtsMs: 1000,
+              recordingRelativeMs: 1000,
+              box: box,
+            ),
+          ],
+        );
+        final sidecarFile = File('${tempDir.path}/transform_src.roi.json');
+        await sidecarFile.writeAsString(jsonEncode(sourceSidecar.toJson()));
+
+        // Pass 1: Identity transform
+        final outPathIdentity = '${tempDir.path}/out_identity.mp4';
+        final exportSidecarIdentity = '${tempDir.path}/out_identity.roi.json';
+        await File(exportSidecarIdentity).writeAsString('{"version":1}');
+
+        final processedIdentity = await VGRoiExportSidecarPostProcessor.process(
+          sourceVideoPath: sourceVideoFile.path,
+          outputVideoPath: outPathIdentity,
+          exportRoiSidecarPath: exportSidecarIdentity,
+          canvasWidth: 1080,
+          canvasHeight: 1920,
+          scaleX: 1.0,
+          scaleY: 1.0,
+          rotation: 0.0,
+          translationX: 0.0,
+          translationY: 0.0,
+        );
+        expect(processedIdentity, isTrue);
+
+        final identityDecoded = jsonDecode(
+          await File(exportSidecarIdentity).readAsString(),
+        );
+        final identitySidecar = VGROISidecar.fromJson(identityDecoded);
+        final identityBox = identitySidecar.samples.first.box!;
+
+        // Pass 2: Scaled and translated transform
+        final outPathTransformed = '${tempDir.path}/out_transformed.mp4';
+        final exportSidecarTransformed =
+            '${tempDir.path}/out_transformed.roi.json';
+        await File(exportSidecarTransformed).writeAsString('{"version":1}');
+
+        final processedTransformed =
+            await VGRoiExportSidecarPostProcessor.process(
+              sourceVideoPath: sourceVideoFile.path,
+              outputVideoPath: outPathTransformed,
+              exportRoiSidecarPath: exportSidecarTransformed,
+              canvasWidth: 1080,
+              canvasHeight: 1920,
+              scaleX: 1.5,
+              scaleY: 1.5,
+              translationX: 50.0,
+              translationY: -30.0,
+              rotation: 0.0,
+            );
+        expect(processedTransformed, isTrue);
+
+        final transformedDecoded = jsonDecode(
+          await File(exportSidecarTransformed).readAsString(),
+        );
+        final transformedSidecar = VGROISidecar.fromJson(transformedDecoded);
+        final transformedBox = transformedSidecar.samples.first.box!;
+
+        // The transformed box must differ from the identity box
+        expect(
+          transformedBox.x != identityBox.x ||
+              transformedBox.y != identityBox.y ||
+              transformedBox.w != identityBox.w ||
+              transformedBox.h != identityBox.h,
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'processTimeline multi-clip uses each clip’s own explicit sidecar path and transform',
+      () async {
+        mockInspectMedia(
+          width: 1080,
+          height: 1920,
+          displayWidth: 1080,
+          displayHeight: 1920,
+          durationSeconds: 5.0,
+        );
+
+        final clip1Video = File('${tempDir.path}/mc_explicit_c1.mov');
+        await clip1Video.writeAsBytes([1, 2, 3]);
+        final clip1ExplicitSidecar = File('${tempDir.path}/custom_c1.roi.json');
+        final clip1Box = VGROIBox(x: 0.1, y: 0.1, w: 0.3, h: 0.3);
+        await clip1ExplicitSidecar.writeAsString(
+          jsonEncode(
+            _makeSourceSidecar(
+              coordinateSpace: 'display_source_normalized',
+              width: 1080,
+              height: 1920,
+              samples: [
+                _makeSample(
+                  timestampMs: 600,
+                  framePtsMs: 600,
+                  recordingRelativeMs: 600,
+                  box: clip1Box,
+                ),
+              ],
+            ).toJson(),
+          ),
+        );
+
+        final clip2Video = File('${tempDir.path}/mc_explicit_c2.mov');
+        await clip2Video.writeAsBytes([4, 5, 6]);
+        final clip2ExplicitSidecar = File('${tempDir.path}/custom_c2.roi.json');
+        final clip2Box = VGROIBox(x: 0.2, y: 0.2, w: 0.4, h: 0.4);
+        await clip2ExplicitSidecar.writeAsString(
+          jsonEncode(
+            _makeSourceSidecar(
+              coordinateSpace: 'display_source_normalized',
+              width: 1080,
+              height: 1920,
+              samples: [
+                _makeSample(
+                  timestampMs: 800,
+                  framePtsMs: 800,
+                  recordingRelativeMs: 800,
+                  box: clip2Box,
+                ),
+              ],
+            ).toJson(),
+          ),
+        );
+
+        // Neither clip has an adjacent sidecar
+        expect(
+          File('${tempDir.path}/mc_explicit_c1.roi.json').existsSync(),
+          isFalse,
+        );
+        expect(
+          File('${tempDir.path}/mc_explicit_c2.roi.json').existsSync(),
+          isFalse,
+        );
+
+        final clip1 = VGClipDescriptor(
+          id: 'mc_c1',
+          sourcePath: clip1Video.path,
+          sourceRoiSidecarPath: clip1ExplicitSidecar.path,
+          durationSeconds: 3.0,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 3.0,
+        );
+
+        final clip2 = VGClipDescriptor(
+          id: 'mc_c2',
+          sourcePath: clip2Video.path,
+          sourceRoiSidecarPath: clip2ExplicitSidecar.path,
+          durationSeconds: 4.0,
+          trimStartSeconds: 0.0,
+          trimEndSeconds: 4.0,
+          transform: const VGClipTransformDescriptor(
+            scaleX: 1.5,
+            scaleY: 1.5,
+            translationX: 20.0,
+            translationY: 10.0,
+          ),
+        );
+
+        final outputVideoPath = '${tempDir.path}/mc_explicit_timeline.mp4';
+        final exportRoiSidecarPath =
+            '${tempDir.path}/mc_explicit_timeline.roi.json';
+        await File(exportRoiSidecarPath).writeAsString('{"version":1}');
+
+        final processed = await VGRoiExportSidecarPostProcessor.processTimeline(
+          clips: [clip1, clip2],
+          outputVideoPath: outputVideoPath,
+          exportRoiSidecarPath: exportRoiSidecarPath,
+          canvasWidth: 720,
+          canvasHeight: 1280,
+          exportDurationSeconds: 7.0,
+        );
+
+        expect(processed, isTrue);
+
+        final outputSidecarFile = File(exportRoiSidecarPath);
+        final decoded = jsonDecode(await outputSidecarFile.readAsString());
+        final resultSidecar = VGROISidecar.fromJson(decoded);
+
+        expect(resultSidecar.samples.length, equals(2));
+        // Sample 1 from clip 1 at 600ms
+        expect(resultSidecar.samples[0].timestampMs, equals(600));
+        _expectBoxCloseTo(resultSidecar.samples[0].box, clip1Box);
+
+        // Sample 2 from clip 2 at 800ms + 3000ms (clip 1 output duration) = 3800ms
+        expect(resultSidecar.samples[1].timestampMs, equals(3800));
+        // Clip 2's box should be transformed (not identical to raw clip2Box)
+        final clip2MappedBox = resultSidecar.samples[1].box!;
+        expect(
+          clip2MappedBox.w != clip2Box.w || clip2MappedBox.h != clip2Box.h,
+          isTrue,
+        );
+
+        expect(File('$exportRoiSidecarPath.vgroitmp').existsSync(), isFalse);
+      },
+    );
+  });
 }

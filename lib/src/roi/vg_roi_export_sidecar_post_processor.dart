@@ -28,6 +28,23 @@
 // failure never aborts the whole timeline -- it only drops that clip's
 // samples, and the timeline cursor still advances so later clips stay
 // aligned.
+//
+// Phase 5-Unit O adds explicit per-clip source sidecar and transform
+// support:
+//   - [process] / [_mapClipSidecar] accept an optional explicit
+//     `sourceRoiSidecarPath`, preferred over the derived
+//     `_sidecarPathForVideoPath(sourceVideoPath)` path. When an explicit path
+//     is supplied but is missing, malformed, or unsupported, mapping fails
+//     closed -- it never silently falls back to the derived adjacent path.
+//     When no explicit path is supplied, the existing derived-path fallback
+//     is preserved unchanged.
+//   - [process] / [_mapClipSidecar] also accept scaleX/scaleY/rotation/
+//     translationX/translationY and forward them to
+//     [VGROISidecarExportMapper.mapSidecar] so editor-applied spatial
+//     transforms are reflected in the mapped ROI boxes.
+//   - [processTimeline] reads each clip's own `clip.sourceRoiSidecarPath` and
+//     `clip.transform` -- there is no single scalar sidecar path or transform
+//     applied uniformly across all clips.
 
 import 'dart:convert';
 import 'dart:io';
@@ -56,6 +73,18 @@ class VGRoiExportSidecarPostProcessor {
   /// [trimStartSeconds] / [trimEndSeconds] describe the trim window applied
   /// to the single source clip, in source-asset seconds.
   ///
+  /// [sourceRoiSidecarPath] is an optional explicit path to the source
+  /// clip's capture-time sidecar (Phase 5-Unit O, e.g.
+  /// [VGClipDescriptor.sourceRoiSidecarPath]). When supplied it takes strict
+  /// precedence over the path derived from [sourceVideoPath]: if the
+  /// explicit path is missing, malformed, or unsupported, this call returns
+  /// false without falling back to the derived adjacent path. When omitted,
+  /// the existing derived-path fallback behavior is preserved.
+  ///
+  /// [scaleX] / [scaleY] / [rotation] / [translationX] / [translationY]
+  /// describe the editor-applied spatial transform for this clip and are
+  /// forwarded to [VGROISidecarExportMapper.mapSidecar] unchanged.
+  ///
   /// [passthroughPreservesSourceGeometry] must be set only for a zero-reencode
   /// passthrough remux, where the encoded track dimensions in
   /// [canvasWidth]/[canvasHeight] are storage geometry, not playable display
@@ -71,6 +100,12 @@ class VGRoiExportSidecarPostProcessor {
     required String exportRoiSidecarPath,
     required int canvasWidth,
     required int canvasHeight,
+    String? sourceRoiSidecarPath,
+    double scaleX = 1.0,
+    double scaleY = 1.0,
+    double rotation = 0.0,
+    double translationX = 0.0,
+    double translationY = 0.0,
     double trimStartSeconds = 0.0,
     double trimEndSeconds = double.infinity,
     bool passthroughPreservesSourceGeometry = false,
@@ -87,6 +122,12 @@ class VGRoiExportSidecarPostProcessor {
         sourceVideoPath: sourceVideoPath,
         canvasWidth: canvasWidth,
         canvasHeight: canvasHeight,
+        explicitSourceRoiSidecarPath: sourceRoiSidecarPath,
+        scaleX: scaleX,
+        scaleY: scaleY,
+        rotation: rotation,
+        translationX: translationX,
+        translationY: translationY,
         trimStartSeconds: trimStartSeconds,
         trimEndSeconds: trimEndSeconds,
         passthroughPreservesSourceGeometry: passthroughPreservesSourceGeometry,
@@ -107,8 +148,10 @@ class VGRoiExportSidecarPostProcessor {
   /// by cumulative output time.
   ///
   /// [clips] is the ordered list of clips exactly as exported (hard cuts
-  /// only -- no transitions, no compositor transforms are accounted for by
-  /// this mapping). [outputVideoPath] and [exportRoiSidecarPath] are used for
+  /// only -- transitions and animated compositor behavior are not modeled by
+  /// this mapping, but each clip's own static [VGClipDescriptor.transform] is
+  /// forwarded to [_mapClipSidecar] when present). [outputVideoPath] and
+  /// [exportRoiSidecarPath] are used for
   /// the same output-sidecar-path consistency check as [process].
   /// [canvasWidth] / [canvasHeight] describe the export output canvas.
   /// [exportDurationSeconds] is the measured duration of the exported output.
@@ -160,10 +203,17 @@ class VGRoiExportSidecarPostProcessor {
         // no cursor advance) rather than risk misaligning later clips.
         if (!hasValidDuration) continue;
 
+        final clipTransform = clip.transform;
         final mapped = await _mapClipSidecar(
           sourceVideoPath: clip.sourcePath,
           canvasWidth: canvasWidth,
           canvasHeight: canvasHeight,
+          explicitSourceRoiSidecarPath: clip.sourceRoiSidecarPath,
+          scaleX: clipTransform?.scaleX ?? 1.0,
+          scaleY: clipTransform?.scaleY ?? 1.0,
+          rotation: clipTransform?.rotation ?? 0.0,
+          translationX: clipTransform?.translationX ?? 0.0,
+          translationY: clipTransform?.translationY ?? 0.0,
           trimStartSeconds: clip.trimStartSeconds,
           trimEndSeconds: clip.trimEndSeconds,
         );
@@ -224,18 +274,36 @@ class VGRoiExportSidecarPostProcessor {
 
   /// Maps a single clip's source capture-time ROI sidecar into export-space,
   /// mirroring the coordinate-space / source-dimension policy of [process].
+  ///
+  /// [explicitSourceRoiSidecarPath], when non-null, takes strict precedence
+  /// over the path derived from [sourceVideoPath] via
+  /// [_sidecarPathForVideoPath]: if the explicit path is missing, malformed,
+  /// or unsupported, this returns null -- it never falls back to the derived
+  /// adjacent path. When null, the existing derived-path lookup is used.
+  ///
   /// Returns null on any missing, unsupported, or malformed input -- never
   /// throws.
   static Future<VGROISidecar?> _mapClipSidecar({
     required String sourceVideoPath,
     required int canvasWidth,
     required int canvasHeight,
+    String? explicitSourceRoiSidecarPath,
+    double scaleX = 1.0,
+    double scaleY = 1.0,
+    double rotation = 0.0,
+    double translationX = 0.0,
+    double translationY = 0.0,
     double trimStartSeconds = 0.0,
     double trimEndSeconds = double.infinity,
     bool passthroughPreservesSourceGeometry = false,
   }) async {
     try {
-      final sourceSidecarPath = _sidecarPathForVideoPath(sourceVideoPath);
+      final bool hasExplicitPath =
+          explicitSourceRoiSidecarPath != null &&
+          explicitSourceRoiSidecarPath.isNotEmpty;
+      final sourceSidecarPath = hasExplicitPath
+          ? explicitSourceRoiSidecarPath
+          : _sidecarPathForVideoPath(sourceVideoPath);
       final sourceSidecarFile = File(sourceSidecarPath);
       if (!sourceSidecarFile.existsSync()) return null;
 
@@ -310,6 +378,11 @@ class VGRoiExportSidecarPostProcessor {
         sourceHeight: sourceHeight,
         canvasWidth: effectiveCanvasWidth,
         canvasHeight: effectiveCanvasHeight,
+        scaleX: scaleX,
+        scaleY: scaleY,
+        rotation: rotation,
+        translationX: translationX,
+        translationY: translationY,
         trimStartSeconds: trimStartSeconds,
         trimEndSeconds: trimEndSeconds,
       );
