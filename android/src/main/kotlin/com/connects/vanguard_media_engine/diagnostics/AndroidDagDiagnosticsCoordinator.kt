@@ -9,7 +9,9 @@ import com.connects.vanguard_media_engine.camera.AndroidCamera2ImageReaderFrameS
 import com.connects.vanguard_media_engine.camera.AndroidCamera2NativeRenderFrameSmokeHarness
 import com.connects.vanguard_media_engine.camera.AndroidCamera2NativeRenderLoopSmokeHarness
 import com.connects.vanguard_media_engine.camera.AndroidCamera2OpenCloseSmokeHarness
+import com.connects.vanguard_media_engine.camera.AndroidCamera2ThermalListenerSmokeHarness
 import com.connects.vanguard_media_engine.export.AndroidAudioFoundationSmokeHarness
+import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
 import io.flutter.plugin.common.MethodChannel
 
 /**
@@ -26,6 +28,7 @@ import io.flutter.plugin.common.MethodChannel
 class AndroidDagDiagnosticsCoordinator(
     private val context: Context,
     private val mainHandler: Handler,
+    private val thermalBridge: AndroidThermalStateBridge,
 ) {
     companion object {
         private val OWNED_METHODS = setOf(
@@ -66,6 +69,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ASGlesTwoTextureCompositorSmoke",
             "runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke",
             "runAndroidDagPhase1AVGlesEvalRenderSmoke",
+            "runAndroidDagPhase3UnitTThermalListenerSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -118,6 +122,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ASGlesTwoTextureCompositorSmoke" -> runPhase1ASGlesTwoTextureCompositorSmoke(args, result)
             "runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke" -> runPhase1ATGlesMixedTextureCompositorSmoke(args, result)
             "runAndroidDagPhase1AVGlesEvalRenderSmoke" -> runPhase1AVGlesEvalRenderSmoke(args, result)
+            "runAndroidDagPhase3UnitTThermalListenerSmoke" -> runPhase3UnitTThermalListenerSmoke(result)
             else -> return false
         }
         return true
@@ -838,6 +843,24 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "GLES_DAG_EVAL_RENDER_SMOKE_FAILED",
                         "runAndroidDagPhase1AVGlesEvalRenderSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 3-Unit T: Android Camera2 dynamic thermal listener & fallback telemetry smoke ──
+    private fun runPhase3UnitTThermalListenerSmoke(result: MethodChannel.Result) {
+        Thread {
+            try {
+                val smokeResult = AndroidCamera2ThermalListenerSmokeHarness(thermalBridge).run()
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "THERMAL_LISTENER_SMOKE_FAILED",
+                        "runAndroidDagPhase3UnitTThermalListenerSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

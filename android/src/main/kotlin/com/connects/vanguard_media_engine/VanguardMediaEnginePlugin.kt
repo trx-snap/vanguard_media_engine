@@ -18,6 +18,7 @@ import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
 import com.connects.vanguard_media_engine.image.AndroidImageOptimizer
 import com.connects.vanguard_media_engine.rtc.AndroidRtcVideoCoordinator
 import com.connects.vanguard_media_engine.streaming.AndroidDagStreamingPlaybackCoordinator
+import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
@@ -50,6 +51,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
 
     // ── Diagnostic smoke routes (Phases 2O2B3/2O2B4/2Q/3C/4A/5 + Audio Unit B) ─
     private var dagDiagnosticsCoordinator: AndroidDagDiagnosticsCoordinator? = null
+
+    // ── Phase 3-Unit T: Android OS thermal listener lifecycle bridge ──────────
+    private var thermalStateBridge: AndroidThermalStateBridge? = null
 
     // ── Phase 1-Unit AX: GLES SurfaceProducer texture DAG render smoke coordinator ──
     private var glesTextureSmokeCoordinator: AndroidGlesTextureSmokeCoordinator? = null
@@ -85,6 +89,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         this.context = binding.applicationContext
         channel = MethodChannel(binding.binaryMessenger, "vanguard_media_engine")
         channel.setMethodCallHandler(this)
+        thermalStateBridge = AndroidThermalStateBridge(
+            context     = binding.applicationContext,
+            channel     = channel,
+            mainHandler = mainHandler,
+        ).also { it.start() }
         dagTexturePlaybackCoordinator = AndroidDagTexturePlaybackCoordinator(
             textureRegistry = binding.textureRegistry,
             channel         = channel,
@@ -110,8 +119,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             mainHandler     = mainHandler,
         )
         dagDiagnosticsCoordinator = AndroidDagDiagnosticsCoordinator(
-            context     = binding.applicationContext,
-            mainHandler = mainHandler,
+            context       = binding.applicationContext,
+            mainHandler   = mainHandler,
+            thermalBridge = thermalStateBridge!!,
         )
         editorExportCoordinator = AndroidEditorExportCoordinator(
             context     = binding.applicationContext,
@@ -194,6 +204,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android GLES texture smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidThermalStateBridge.ownsMethod(call.method)) {
+            val bridge = thermalStateBridge
+            if (bridge != null) {
+                bridge.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android thermal state bridge unavailable", null)
             }
             return
         }
@@ -1190,6 +1210,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
     }
 
         override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+        // Phase 3-Unit T: unregister the OS thermal listener before dropping the channel handler.
+        thermalStateBridge?.shutdown()
+        thermalStateBridge = null
         channel.setMethodCallHandler(null)
         // B2: Tear down camera session first — prevents leaked CameraX session
         // on hot-restart (Flutter re-attaches the engine to a new surface).
