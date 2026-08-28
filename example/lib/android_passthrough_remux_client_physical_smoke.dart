@@ -21,6 +21,25 @@ String sidecarPathForVideoPath(String videoPath) {
   return '${videoPath.substring(0, lastDot)}.roi.json';
 }
 
+bool _isValidEmptyRoiSidecar(String content) {
+  try {
+    final decoded = jsonDecode(content);
+    if (decoded is! Map<String, dynamic>) return false;
+    final sidecar = VGROISidecar.fromJson(decoded);
+    return sidecar.version == 1 &&
+        sidecar.sourceType == 'export' &&
+        sidecar.platform == 'android' &&
+        sidecar.coordinateSpace == 'export_output_normalized' &&
+        sidecar.recordingSessionId == 'android-empty-export' &&
+        sidecar.coverage.coveragePercent == 0.0 &&
+        sidecar.coverage.missingIntervals.isEmpty &&
+        sidecar.samples.isEmpty &&
+        sidecar.finalized == true;
+  } catch (_) {
+    return false;
+  }
+}
+
 void main() {
   runApp(const AndroidPassthroughRemuxClientPhysicalSmokeApp());
 }
@@ -144,8 +163,7 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
         final sidecarContent = sidecarExists
             ? await lane1SidecarFile.readAsString()
             : '';
-        const expectedSidecarJson = '{"version":1,"rois":[]}';
-        final sidecarContentValid = sidecarContent == expectedSidecarJson;
+        final sidecarContentValid = _isValidEmptyRoiSidecar(sidecarContent);
         final sidecarPathMatches =
             (lane1Report.exportRoiSidecarPath == lane1ExpectedSidecarPath) &&
             (lane1Report.roiSidecarPath == lane1ExpectedSidecarPath);
@@ -479,8 +497,7 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
         final firstSidecarContent = firstSidecarExists
             ? await lane5FirstSidecarFile.readAsString()
             : '';
-        const expectedSidecarJson = '{"version":1,"rois":[]}';
-        final firstSidecarValid = firstSidecarContent == expectedSidecarJson;
+        final firstSidecarValid = _isValidEmptyRoiSidecar(firstSidecarContent);
         final firstSidecarPathMatch =
             (firstReport.exportRoiSidecarPath ==
                 lane5FirstExpectedSidecarPath) &&
@@ -607,12 +624,16 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
         lane5SecondSidecarFile,
         if (lane1OutputFile != null) File('${lane1OutputFile.path}.vgptmp'),
         if (lane1SidecarFile != null) File('${lane1SidecarFile.path}.vgtmp'),
+        if (lane1SidecarFile != null) File('${lane1SidecarFile.path}.vgroitmp'),
         if (lane2OutputFile != null) File('${lane2OutputFile.path}.vgptmp'),
         if (lane2SidecarFile != null) File('${lane2SidecarFile.path}.vgtmp'),
+        if (lane2SidecarFile != null) File('${lane2SidecarFile.path}.vgroitmp'),
         if (lane3Mp4SentinelFile != null)
           File('${lane3Mp4SentinelFile.path}.vgptmp'),
         if (lane3SidecarSentinelFile != null)
           File('${lane3SidecarSentinelFile.path}.vgtmp'),
+        if (lane3SidecarSentinelFile != null)
+          File('${lane3SidecarSentinelFile.path}.vgroitmp'),
         if (lane3SidecarOutputFile != null)
           File('${lane3SidecarOutputFile.path}.vgptmp'),
         if (lane4EmptySourceOutputFile != null)
@@ -621,10 +642,14 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
           File('${lane5FirstOutputFile.path}.vgptmp'),
         if (lane5FirstSidecarFile != null)
           File('${lane5FirstSidecarFile.path}.vgtmp'),
+        if (lane5FirstSidecarFile != null)
+          File('${lane5FirstSidecarFile.path}.vgroitmp'),
         if (lane5SecondOutputFile != null)
           File('${lane5SecondOutputFile.path}.vgptmp'),
         if (lane5SecondSidecarFile != null)
           File('${lane5SecondSidecarFile.path}.vgtmp'),
+        if (lane5SecondSidecarFile != null)
+          File('${lane5SecondSidecarFile.path}.vgroitmp'),
       ]) {
         if (f != null) {
           try {

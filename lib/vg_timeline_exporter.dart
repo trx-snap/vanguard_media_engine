@@ -30,6 +30,7 @@
 import 'package:flutter/services.dart';
 
 import 'src/channel/vanguard_channel_dispatcher.dart';
+import 'src/roi/vg_roi_export_sidecar_post_processor.dart';
 import 'vg_editor_draft.dart';
 import 'vg_editor_export_request.dart';
 import 'vg_editor_export_result.dart';
@@ -71,8 +72,9 @@ final class VanguardTimelineExporter {
   // Private constructor: stateless static API only.
   const VanguardTimelineExporter._();
 
-  static const MethodChannel _defaultChannel =
-      MethodChannel('vanguard_media_engine');
+  static const MethodChannel _defaultChannel = MethodChannel(
+    'vanguard_media_engine',
+  );
 
   /// Exports a timeline draft as an MP4 file.
   ///
@@ -116,10 +118,7 @@ final class VanguardTimelineExporter {
     try {
       final result = await channel.invokeMapMethod<String, dynamic>(
         'exportTimeline',
-        <String, Object?>{
-          'draft': draft.toMap(),
-          ...request.toMap(),
-        },
+        <String, Object?>{'draft': draft.toMap(), ...request.toMap()},
       );
 
       if (result == null) {
@@ -136,6 +135,33 @@ final class VanguardTimelineExporter {
         throw StateError(
           '[VanguardTimelineExporter] exportDraft: native returned failure result',
         );
+      }
+
+      // Best-effort ROI sidecar upgrade for the single-clip case only.
+      // Multi-clip ROI composition is deferred. Never affects the returned
+      // result: the post-processor fails closed and leaves the native empty
+      // sidecar in place on any error.
+      if (draft.clips.length == 1) {
+        final sidecarPath = exportResult.exportRoiSidecarPath;
+        final width = exportResult.width;
+        final height = exportResult.height;
+        if (sidecarPath != null &&
+            width != null &&
+            width > 0 &&
+            height != null &&
+            height > 0 &&
+            exportResult.durationSeconds > 0) {
+          final clip = draft.clips.single;
+          await VGRoiExportSidecarPostProcessor.process(
+            sourceVideoPath: clip.sourcePath,
+            outputVideoPath: exportResult.path,
+            exportRoiSidecarPath: sidecarPath,
+            canvasWidth: width,
+            canvasHeight: height,
+            trimStartSeconds: clip.trimStartSeconds,
+            trimEndSeconds: clip.trimEndSeconds,
+          );
+        }
       }
 
       return exportResult;

@@ -1,19 +1,21 @@
 package com.connects.vanguard_media_engine.export
 
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.nio.charset.StandardCharsets
 
-// ── AndroidTimelineRoiSidecarEmitter (Export Unit D) ──────────────────────────
+// ── AndroidTimelineRoiSidecarEmitter (Export Unit D / Phase 5-Unit M) ─────────
 //
 // Emits a mandatory empty ROI sidecar JSON file alongside a successful Android
-// `exportTimeline` output. Android Unit C performs a pass-1 MediaCodec video
-// re-encode rather than a passthrough/remux export, so there is no source ROI
-// content to carry forward -- this emitter always writes the empty-ROI
-// literal. The `rois` vs `samples` schema divergence from the Dart
-// `VGROISidecar` model is intentionally deferred to a later slice.
+// `exportTimeline` / `exportPassthroughRemux` output. Neither Android export
+// route currently produces detected ROI samples, so this emitter always
+// writes a schema-valid, sample-less sidecar -- one that a Dart caller can
+// parse as a `VGROISidecar` (coordinateSpace "export_output_normalized",
+// zero samples, zero coverage, finalized true).
 object AndroidTimelineRoiSidecarEmitter {
 
-    private const val EMPTY_SIDECAR_JSON = "{\"version\":1,\"rois\":[]}"
+    private const val EMPTY_RECORDING_SESSION_ID = "android-empty-export"
 
     /**
      * Derives the ROI sidecar path for [videoPath] using extension
@@ -33,21 +35,47 @@ object AndroidTimelineRoiSidecarEmitter {
     fun tempPathForSidecarPath(sidecarPath: String): String = "$sidecarPath.vgtmp"
 
     /**
-     * Writes the empty-ROI literal to [tempPath] and verifies the staged
-     * content by re-reading it back byte-for-byte. Returns true only if the
-     * staged file's bytes exactly match the expected literal.
+     * Writes a `VGROISidecar`-compatible empty-samples sidecar to [tempPath],
+     * describing an export of [width]x[height] pixels and [durationSeconds]
+     * seconds, and verifies the staged content by re-reading it back
+     * byte-for-byte. Returns true only if the staged file's bytes exactly
+     * match the freshly-built literal.
      */
-    fun stageEmptySidecar(tempPath: String): Boolean {
+    fun stageEmptySidecar(tempPath: String, width: Int, height: Int, durationSeconds: Double): Boolean {
         return try {
             val tempFile = File(tempPath)
             tempFile.parentFile?.mkdirs()
-            val bytes = EMPTY_SIDECAR_JSON.toByteArray(StandardCharsets.UTF_8)
+            val bytes = buildEmptySidecarJson(width, height, durationSeconds)
+                .toByteArray(StandardCharsets.UTF_8)
             tempFile.writeBytes(bytes)
             val readBack = tempFile.readBytes()
             readBack.contentEquals(bytes)
         } catch (_: Throwable) {
             false
         }
+    }
+
+    private fun buildEmptySidecarJson(width: Int, height: Int, durationSeconds: Double): String {
+        val durationMs = Math.round(durationSeconds * 1000.0).coerceAtLeast(0L)
+        val videoIdentity = JSONObject()
+            .put("durationMs", durationMs)
+            .put("width", width)
+            .put("height", height)
+            .put("hash", JSONObject.NULL)
+        val coverage = JSONObject()
+            .put("coveragePercent", 0.0)
+            .put("missingIntervals", JSONArray())
+        val root = JSONObject()
+            .put("version", 1)
+            .put("sourceType", "export")
+            .put("platform", "android")
+            .put("coordinateSpace", "export_output_normalized")
+            .put("recordingSessionId", EMPTY_RECORDING_SESSION_ID)
+            .put("videoIdentity", videoIdentity)
+            .put("coverage", coverage)
+            .put("samples", JSONArray())
+            .put("finalized", true)
+        return root.toString()
     }
 
     /**

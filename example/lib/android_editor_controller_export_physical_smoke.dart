@@ -12,7 +12,24 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
-const String expectedEmptyRoiSidecar = '{"version":1,"rois":[]}';
+bool _isValidEmptyRoiSidecar(String content) {
+  try {
+    final decoded = jsonDecode(content);
+    if (decoded is! Map<String, dynamic>) return false;
+    final sidecar = VGROISidecar.fromJson(decoded);
+    return sidecar.version == 1 &&
+        sidecar.sourceType == 'export' &&
+        sidecar.platform == 'android' &&
+        sidecar.coordinateSpace == 'export_output_normalized' &&
+        sidecar.recordingSessionId == 'android-empty-export' &&
+        sidecar.coverage.coveragePercent == 0.0 &&
+        sidecar.coverage.missingIntervals.isEmpty &&
+        sidecar.samples.isEmpty &&
+        sidecar.finalized == true;
+  } catch (_) {
+    return false;
+  }
+}
 
 String sidecarPathForVideoPath(String videoPath) {
   final lastSeparator = videoPath.lastIndexOf('/');
@@ -309,7 +326,7 @@ class _AndroidEditorControllerExportPhysicalSmokeAppState
       final sidecarContent = sidecarExists
           ? await tempSidecarFile.readAsString()
           : '';
-      final sidecarContentExact = sidecarContent == expectedEmptyRoiSidecar;
+      final sidecarContentExact = _isValidEmptyRoiSidecar(sidecarContent);
 
       sidecarPass = sidecarPathMatch && sidecarExists && sidecarContentExact;
 
@@ -410,6 +427,12 @@ class _AndroidEditorControllerExportPhysicalSmokeAppState
         if (await vgtmpFile.exists()) {
           try {
             await vgtmpFile.delete();
+          } catch (_) {}
+        }
+        final vgroitmpFile = File('$expectedSidecarPath.vgroitmp');
+        if (await vgroitmpFile.exists()) {
+          try {
+            await vgroitmpFile.delete();
           } catch (_) {}
         }
       }

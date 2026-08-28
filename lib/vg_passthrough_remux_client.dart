@@ -14,6 +14,8 @@ import 'dart:async';
 
 import 'package:flutter/services.dart';
 
+import 'src/roi/vg_roi_export_sidecar_post_processor.dart';
+
 // -----------------------------------------------------------------------------
 // Request Model
 // -----------------------------------------------------------------------------
@@ -372,9 +374,38 @@ class VGPassthroughRemuxClient {
           'unexpected response type: ${raw.runtimeType}',
         );
       }
-      return VGPassthroughRemuxExecutionReport.fromMap(
+      final report = VGPassthroughRemuxExecutionReport.fromMap(
         raw.cast<Object?, Object?>(),
       );
+
+      // Best-effort ROI sidecar upgrade. Never affects success/error state:
+      // the post-processor fails closed and leaves the native empty sidecar
+      // in place on any error.
+      if (report.success) {
+        final sourcePath = report.sourcePath;
+        final outputPath = report.outputPath;
+        final sidecarPath = report.exportRoiSidecarPath;
+        final width = report.width;
+        final height = report.height;
+        if (sourcePath != null &&
+            outputPath != null &&
+            sidecarPath != null &&
+            width != null &&
+            width > 0 &&
+            height != null &&
+            height > 0) {
+          await VGRoiExportSidecarPostProcessor.process(
+            sourceVideoPath: sourcePath,
+            outputVideoPath: outputPath,
+            exportRoiSidecarPath: sidecarPath,
+            canvasWidth: width,
+            canvasHeight: height,
+            passthroughPreservesSourceGeometry: true,
+          );
+        }
+      }
+
+      return report;
     } on MissingPluginException {
       return VGPassthroughRemuxExecutionReport.unsupported();
     } on PlatformException catch (e) {

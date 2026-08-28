@@ -22,7 +22,24 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
-const String expectedEmptyRoiSidecar = '{"version":1,"rois":[]}';
+bool _isValidEmptyRoiSidecar(String content) {
+  try {
+    final decoded = jsonDecode(content);
+    if (decoded is! Map<String, dynamic>) return false;
+    final sidecar = VGROISidecar.fromJson(decoded);
+    return sidecar.version == 1 &&
+        sidecar.sourceType == 'export' &&
+        sidecar.platform == 'android' &&
+        sidecar.coordinateSpace == 'export_output_normalized' &&
+        sidecar.recordingSessionId == 'android-empty-export' &&
+        sidecar.coverage.coveragePercent == 0.0 &&
+        sidecar.coverage.missingIntervals.isEmpty &&
+        sidecar.samples.isEmpty &&
+        sidecar.finalized == true;
+  } catch (_) {
+    return false;
+  }
+}
 
 Map<String, dynamic> _mediaInfoToMap(MediaInfo info) {
   return <String, dynamic>{
@@ -239,7 +256,7 @@ class _AndroidDagExportUnitHSmokeAppState
         final sidecarContent = sidecarExists
             ? await laneASidecarFile.readAsString()
             : '';
-        final sidecarContentExact = sidecarContent == expectedEmptyRoiSidecar;
+        final sidecarContentExact = _isValidEmptyRoiSidecar(sidecarContent);
 
         print(
           'ANDROID_EXPORT_UNIT_H_SMOKE_LANE_A: Inspecting exported output media info...',
@@ -405,7 +422,7 @@ class _AndroidDagExportUnitHSmokeAppState
         final sidecarContent = sidecarExists
             ? await laneBSidecarFile.readAsString()
             : '';
-        final sidecarContentExact = sidecarContent == expectedEmptyRoiSidecar;
+        final sidecarContentExact = _isValidEmptyRoiSidecar(sidecarContent);
 
         print(
           'ANDROID_EXPORT_UNIT_H_SMOKE_LANE_B: Inspecting exported output media info...',
@@ -852,8 +869,20 @@ class _AndroidDagExportUnitHSmokeAppState
         'tempSourceClipB': tempSourceClipB,
         'laneAOutputFile': laneAOutputFile,
         'laneASidecarFile': laneASidecarFile,
+        'laneASidecarTemp': laneASidecarFile != null
+            ? File('${laneASidecarFile.path}.vgtmp')
+            : null,
+        'laneASidecarRoiTemp': laneASidecarFile != null
+            ? File('${laneASidecarFile.path}.vgroitmp')
+            : null,
         'laneBOutputFile': laneBOutputFile,
         'laneBSidecarFile': laneBSidecarFile,
+        'laneBSidecarTemp': laneBSidecarFile != null
+            ? File('${laneBSidecarFile.path}.vgtmp')
+            : null,
+        'laneBSidecarRoiTemp': laneBSidecarFile != null
+            ? File('${laneBSidecarFile.path}.vgroitmp')
+            : null,
         'laneCOutputFile': laneCOutputFile,
         'laneCSidecarFile': laneCSidecarFile,
         'laneCSecondOutputFile': laneCSecondOutputFile,

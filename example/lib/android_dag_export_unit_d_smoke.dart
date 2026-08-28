@@ -16,7 +16,24 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
-const String expectedEmptyRoiSidecar = '{"version":1,"rois":[]}';
+bool _isValidEmptyRoiSidecar(String content) {
+  try {
+    final decoded = jsonDecode(content);
+    if (decoded is! Map<String, dynamic>) return false;
+    final sidecar = VGROISidecar.fromJson(decoded);
+    return sidecar.version == 1 &&
+        sidecar.sourceType == 'export' &&
+        sidecar.platform == 'android' &&
+        sidecar.coordinateSpace == 'export_output_normalized' &&
+        sidecar.recordingSessionId == 'android-empty-export' &&
+        sidecar.coverage.coveragePercent == 0.0 &&
+        sidecar.coverage.missingIntervals.isEmpty &&
+        sidecar.samples.isEmpty &&
+        sidecar.finalized == true;
+  } catch (_) {
+    return false;
+  }
+}
 
 String sidecarPathForVideoPath(String videoPath) {
   final lastSeparator = videoPath.lastIndexOf('/');
@@ -205,7 +222,7 @@ class _AndroidDagExportUnitDSmokeAppState
         final sidecarContent = sidecarExists
             ? await laneASidecarFile.readAsString()
             : '';
-        final sidecarContentExact = sidecarContent == expectedEmptyRoiSidecar;
+        final sidecarContentExact = _isValidEmptyRoiSidecar(sidecarContent);
 
         laneAPass =
             outExists &&
@@ -326,7 +343,7 @@ class _AndroidDagExportUnitDSmokeAppState
         final sidecarContent = sidecarExists
             ? await laneBSidecarFile.readAsString()
             : '';
-        final sidecarContentExact = sidecarContent == expectedEmptyRoiSidecar;
+        final sidecarContentExact = _isValidEmptyRoiSidecar(sidecarContent);
 
         laneBPass =
             outExists &&
@@ -529,6 +546,12 @@ class _AndroidDagExportUnitDSmokeAppState
             await laneASidecarFile.delete();
           }
         } catch (_) {}
+        try {
+          final vgtmp = File('${laneASidecarFile.path}.vgtmp');
+          if (await vgtmp.exists()) await vgtmp.delete();
+          final vgroitmp = File('${laneASidecarFile.path}.vgroitmp');
+          if (await vgroitmp.exists()) await vgroitmp.delete();
+        } catch (_) {}
       }
       if (laneBOutputFile != null) {
         try {
@@ -542,6 +565,12 @@ class _AndroidDagExportUnitDSmokeAppState
           if (await laneBSidecarFile.exists()) {
             await laneBSidecarFile.delete();
           }
+        } catch (_) {}
+        try {
+          final vgtmp = File('${laneBSidecarFile.path}.vgtmp');
+          if (await vgtmp.exists()) await vgtmp.delete();
+          final vgroitmp = File('${laneBSidecarFile.path}.vgroitmp');
+          if (await vgroitmp.exists()) await vgroitmp.delete();
         } catch (_) {}
       }
       if (laneCSentinelVideoFile != null) {
@@ -574,9 +603,7 @@ class _AndroidDagExportUnitDSmokeAppState
         'unsupportedScalingPreservesOutput':
             laneCResults ?? {'pass': false, 'error': 'not run'},
       },
-      'openQuestions': const <String>[
-        'rois versus samples schema divergence deferred: emitter writes {"version":1,"rois":[]} while VGROISidecar models use samples array',
-      ],
+      'openQuestions': const <String>[],
       'nonClaims': const <String>[
         'no source ROI mapping',
         'no ROI model parse',

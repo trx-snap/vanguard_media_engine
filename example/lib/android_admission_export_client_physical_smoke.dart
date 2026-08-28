@@ -21,6 +21,25 @@ String sidecarPathForVideoPath(String videoPath) {
   return '${videoPath.substring(0, lastDot)}.roi.json';
 }
 
+bool _isValidEmptyRoiSidecar(String content) {
+  try {
+    final decoded = jsonDecode(content);
+    if (decoded is! Map<String, dynamic>) return false;
+    final sidecar = VGROISidecar.fromJson(decoded);
+    return sidecar.version == 1 &&
+        sidecar.sourceType == 'export' &&
+        sidecar.platform == 'android' &&
+        sidecar.coordinateSpace == 'export_output_normalized' &&
+        sidecar.recordingSessionId == 'android-empty-export' &&
+        sidecar.coverage.coveragePercent == 0.0 &&
+        sidecar.coverage.missingIntervals.isEmpty &&
+        sidecar.samples.isEmpty &&
+        sidecar.finalized == true;
+  } catch (_) {
+    return false;
+  }
+}
+
 void main() {
   runApp(const AndroidAdmissionExportClientPhysicalSmokeApp());
 }
@@ -163,8 +182,7 @@ class _AndroidAdmissionExportClientPhysicalSmokeAppState
         final sidecarContent = sidecarExists
             ? await lane1SidecarFile.readAsString()
             : '';
-        const expectedSidecarJson = '{"version":1,"rois":[]}';
-        final sidecarContentValid = sidecarContent == expectedSidecarJson;
+        final sidecarContentValid = _isValidEmptyRoiSidecar(sidecarContent);
         final sidecarPathMatch =
             passthroughReport != null &&
             (passthroughReport.exportRoiSidecarPath ==
@@ -488,14 +506,20 @@ class _AndroidAdmissionExportClientPhysicalSmokeAppState
         lane4ExpectedSidecarFile,
         if (lane1OutputFile != null) File('${lane1OutputFile.path}.vgptmp'),
         if (lane1SidecarFile != null) File('${lane1SidecarFile.path}.vgtmp'),
+        if (lane1SidecarFile != null) File('${lane1SidecarFile.path}.vgroitmp'),
         if (lane2OutputFile != null) File('${lane2OutputFile.path}.vgptmp'),
         if (lane2SidecarFile != null) File('${lane2SidecarFile.path}.vgtmp'),
+        if (lane2SidecarFile != null) File('${lane2SidecarFile.path}.vgroitmp'),
         if (lane4RenderOutputFile != null)
           File('${lane4RenderOutputFile.path}.vgptmp'),
         if (lane4ReportedSidecarFile != null)
           File('${lane4ReportedSidecarFile.path}.vgtmp'),
+        if (lane4ReportedSidecarFile != null)
+          File('${lane4ReportedSidecarFile.path}.vgroitmp'),
         if (lane4ExpectedSidecarFile != null)
           File('${lane4ExpectedSidecarFile.path}.vgtmp'),
+        if (lane4ExpectedSidecarFile != null)
+          File('${lane4ExpectedSidecarFile.path}.vgroitmp'),
       ]) {
         if (f != null) {
           try {

@@ -206,7 +206,10 @@ class AndroidPassthroughRemuxSession(private val context: Context) {
             return
         }
 
-        if (!AndroidTimelineRoiSidecarEmitter.stageEmptySidecar(roiSidecarTempPath)) {
+        if (!AndroidTimelineRoiSidecarEmitter.stageEmptySidecar(
+                roiSidecarTempPath, probe.width, probe.height, probe.durationUs / 1_000_000.0,
+            )
+        ) {
             deleteOwnedTemps()
             onError("EXPORT_FAILED", "exportPassthroughRemux: failed to stage ROI sidecar at $roiSidecarTempPath")
             return

@@ -349,7 +349,10 @@ class AndroidTimelineExportSession(private val context: Context) {
         // Sidecar-first finalization: the ROI sidecar is staged and finalized
         // before the video rename, so a sidecar failure never leaves behind a
         // finalized video with a missing/incorrect sidecar.
-        if (!AndroidTimelineRoiSidecarEmitter.stageEmptySidecar(roiSidecarTempPath)) {
+        if (!AndroidTimelineRoiSidecarEmitter.stageEmptySidecar(
+                roiSidecarTempPath, requestWidth, requestHeight, durationSeconds,
+            )
+        ) {
             deleteOwnedTemps()
             onError("EXPORT_FAILED", "exportTimeline: failed to stage ROI sidecar at $roiSidecarTempPath")
             return
