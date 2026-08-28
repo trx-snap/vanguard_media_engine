@@ -314,6 +314,17 @@ class VanguardNativeBridge(
         mirrorHorizontal: Boolean,
     ): String
 
+    // ── Phase 1-Unit BB: Android GLES SurfaceProducer texture DAG two-source composition & playhead evaluation smoke ──
+    external fun runAndroidDagPhase1BBGlesTextureCompositionDagSmoke(
+        surface: Surface,
+        bufferA: HardwareBuffer,
+        bufferB: HardwareBuffer,
+        width: Int,
+        height: Int,
+        frameCount: Int,
+        frameDurationUs: Long,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

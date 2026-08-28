@@ -38,11 +38,17 @@ class AndroidGlesTextureSmokeCoordinator(
         private const val BA_PROOF_BOUNDARY =
             "gles_surfaceproducer_two_texture_compositor_foundation_no_decoded_input_no_product_ui"
 
+        // Phase 1-Unit BB: SurfaceProducer two-source composition DAG +
+        // playhead evaluation physical proof.
+        private const val BB_COMPLETE_METHOD = "onAndroidDagPhase1BBGlesTextureCompositionDagSmokeComplete"
+
         private val OWNED_METHODS = setOf(
             "startAndroidDagPhase1AXGlesTextureRenderSmoke",
             "disposeAndroidDagPhase1AXGlesTextureRenderSmoke",
             "startAndroidDagPhase1BAGlesTextureCompositorSmoke",
             "disposeAndroidDagPhase1BAGlesTextureCompositorSmoke",
+            "startAndroidDagPhase1BBGlesTextureCompositionDagSmoke",
+            "disposeAndroidDagPhase1BBGlesTextureCompositionDagSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -73,12 +79,27 @@ class AndroidGlesTextureSmokeCoordinator(
 
     private val baActiveEntries = mutableMapOf<Long, BaActiveEntry>()
 
+    // Phase 1-Unit BB: kept separate from [activeEntries] and
+    // [baActiveEntries] so AX/BA/BB texture IDs can never collide in state
+    // ownership, even though all are keyed by SurfaceProducer id.
+    private data class BbActiveEntry(
+        val harness: AndroidGlesTextureCompositionDagSmokeHarness,
+        val surfaceProducer: TextureRegistry.SurfaceProducer,
+        val released: AtomicBoolean = AtomicBoolean(false),
+        val runCompleted: AtomicBoolean = AtomicBoolean(false),
+        val disposeRequested: AtomicBoolean = AtomicBoolean(false),
+    )
+
+    private val bbActiveEntries = mutableMapOf<Long, BbActiveEntry>()
+
     fun handleMethodCall(method: String, args: Map<*, *>?, result: MethodChannel.Result): Boolean {
         when (method) {
             "startAndroidDagPhase1AXGlesTextureRenderSmoke" -> start(args, result)
             "disposeAndroidDagPhase1AXGlesTextureRenderSmoke" -> dispose(args, result)
             "startAndroidDagPhase1BAGlesTextureCompositorSmoke" -> startBa(args, result)
             "disposeAndroidDagPhase1BAGlesTextureCompositorSmoke" -> disposeBa(args, result)
+            "startAndroidDagPhase1BBGlesTextureCompositionDagSmoke" -> startBb(args, result)
+            "disposeAndroidDagPhase1BBGlesTextureCompositionDagSmoke" -> disposeBb(args, result)
             else -> return false
         }
         return true
@@ -200,6 +221,21 @@ class AndroidGlesTextureSmokeCoordinator(
             synchronized(entry) {
                 if (entry.runCompleted.get()) {
                     releaseOnceBa(entry)
+                } else {
+                    entry.disposeRequested.set(true)
+                }
+            }
+        }
+
+        val bbEntriesToDispose = synchronized(bbActiveEntries) {
+            val list = bbActiveEntries.values.toList()
+            bbActiveEntries.clear()
+            list
+        }
+        bbEntriesToDispose.forEach { entry ->
+            synchronized(entry) {
+                if (entry.runCompleted.get()) {
+                    releaseOnceBb(entry)
                 } else {
                     entry.disposeRequested.set(true)
                 }
@@ -408,5 +444,137 @@ class AndroidGlesTextureSmokeCoordinator(
             "raw" to "status=FAIL;lastError=$reason",
             "lastError" to reason,
         )
+    }
+
+    // ── Phase 1-Unit BB: SurfaceProducer two-source composition DAG smoke ──
+
+    private fun startBb(args: Map<*, *>?, result: MethodChannel.Result) {
+        val widthArg = (args?.get("width") as? Number)?.toInt()
+        val heightArg = (args?.get("height") as? Number)?.toInt()
+        val frameCountArg = (args?.get("frameCount") as? Number)?.toInt()
+        val frameDurationUsArg = (args?.get("frameDurationUs") as? Number)?.toLong()
+        if (widthArg != null && widthArg <= 0) {
+            result.error("INVALID_ARG", "startAndroidDagPhase1BBGlesTextureCompositionDagSmoke: width must be positive", null)
+            return
+        }
+        if (heightArg != null && heightArg <= 0) {
+            result.error("INVALID_ARG", "startAndroidDagPhase1BBGlesTextureCompositionDagSmoke: height must be positive", null)
+            return
+        }
+        if (frameCountArg != null && frameCountArg <= 0) {
+            result.error("INVALID_ARG", "startAndroidDagPhase1BBGlesTextureCompositionDagSmoke: frameCount must be positive", null)
+            return
+        }
+        if (frameDurationUsArg != null && frameDurationUsArg <= 0) {
+            result.error("INVALID_ARG", "startAndroidDagPhase1BBGlesTextureCompositionDagSmoke: frameDurationUs must be positive", null)
+            return
+        }
+
+        val surfaceProducer = textureRegistry.createSurfaceProducer()
+        val textureId = surfaceProducer.id()
+        val harness = AndroidGlesTextureCompositionDagSmokeHarness()
+
+        val entry = BbActiveEntry(harness, surfaceProducer)
+        synchronized(bbActiveEntries) {
+            bbActiveEntries[textureId] = entry
+        }
+
+        Thread {
+            val smokeResult = try {
+                harness.run(surfaceProducer, args)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Phase 1-Unit BB harness execution error", t)
+                AndroidGlesTextureCompositionDagSmokeHarness.exceptionResult(t)
+            }
+            entry.runCompleted.set(true)
+            // Same ownership rule as AX: the producer is released here only if
+            // a dispose() arrived while the harness was still running; a
+            // normal completion with no prior dispose leaves it alive for Dart.
+            var released = false
+            synchronized(entry) {
+                if (entry.disposeRequested.get()) {
+                    released = releaseOnceBb(entry)
+                }
+            }
+            if (released) {
+                synchronized(bbActiveEntries) { bbActiveEntries.remove(textureId) }
+            }
+            val finalResult = smokeResult + mapOf(
+                "textureId" to textureId,
+                "surfaceProducerReleased" to released,
+            )
+            mainHandler.post {
+                channel.invokeMethod(BB_COMPLETE_METHOD, finalResult)
+            }
+        }.start()
+
+        result.success(mapOf(
+            "started" to true,
+            "textureId" to textureId,
+        ))
+    }
+
+    private fun disposeBb(args: Map<*, *>?, result: MethodChannel.Result) {
+        val textureId = (args?.get("textureId") as? Number)?.toLong()
+        if (textureId == null) {
+            result.error("INVALID_ARG", "disposeAndroidDagPhase1BBGlesTextureCompositionDagSmoke: textureId required", null)
+            return
+        }
+        val entry = synchronized(bbActiveEntries) { bbActiveEntries[textureId] }
+        if (entry == null) {
+            result.success(mapOf(
+                "pass" to true,
+                "textureId" to textureId,
+                "surfaceProducerReleased" to false,
+                "raw" to "status=OK;already_disposed_or_not_found;textureId=$textureId",
+            ))
+            return
+        }
+
+        var released = false
+        var completedNow = false
+        synchronized(entry) {
+            if (entry.runCompleted.get()) {
+                released = releaseOnceBb(entry)
+                completedNow = true
+            } else {
+                entry.disposeRequested.set(true)
+            }
+        }
+        if (completedNow) {
+            synchronized(bbActiveEntries) { bbActiveEntries.remove(textureId) }
+        }
+        result.success(mapOf(
+            "pass" to true,
+            "textureId" to textureId,
+            "surfaceProducerReleased" to released,
+            "raw" to if (completedNow) {
+                "status=OK;disposed=true;textureId=$textureId"
+            } else {
+                "status=OK;dispose_requested_pending_completion;textureId=$textureId"
+            },
+        ))
+    }
+
+    private fun releaseOnceBb(entry: BbActiveEntry): Boolean {
+        if (!entry.released.compareAndSet(false, true)) {
+            return false
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            try {
+                entry.surfaceProducer.release()
+            } catch (t: Throwable) {
+                Log.w(TAG, "BB surfaceProducer.release() failed: ${t.javaClass.simpleName}: ${t.message}")
+            }
+        } else {
+            mainHandler.post {
+                try {
+                    entry.surfaceProducer.release()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "BB surfaceProducer.release() on mainHandler failed: ${t.javaClass.simpleName}: ${t.message}")
+                }
+            }
+        }
+        return true
     }
 }
