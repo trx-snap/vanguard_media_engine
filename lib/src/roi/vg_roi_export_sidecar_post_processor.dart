@@ -1,6 +1,8 @@
 // vg_roi_export_sidecar_post_processor.dart
 // Vanguard Media Engine — Phase 5-Unit M (Android Source ROI Sidecar
-// Ingestion & Export Transform Mapping Parity).
+// Ingestion & Export Transform Mapping Parity) / Phase 5-Unit N (Android
+// hard-cut multi-clip source ROI sidecar composition and export mapping
+// parity).
 //
 // Best-effort post-processor that upgrades the native mandatory empty ROI
 // sidecar (always written by the Android export/passthrough-remux native
@@ -8,10 +10,10 @@
 // capture-time sidecar exists alongside the source video.
 //
 // Design rules:
-//   - Pure Dart orchestration: reads the source sidecar, probes source media
-//     via [VanguardMediaPreparer.inspectMedia], and delegates all coordinate
-//     math to [VGROISidecarExportMapper.mapSidecar] -- no coordinate math is
-//     duplicated here.
+//   - Pure Dart orchestration: reads the source sidecar(s), probes source
+//     media via [VanguardMediaPreparer.inspectMedia], and delegates all
+//     coordinate math to [VGROISidecarExportMapper.mapSidecar] -- no
+//     coordinate math is duplicated here.
 //   - Fails closed: any missing, unsupported, or malformed input leaves the
 //     native empty sidecar in place untouched and returns false. Wrong ROI is
 //     worse than missing ROI.
@@ -19,6 +21,13 @@
 //     place, so the final sidecar is never observed in a partially-written
 //     state. On any failure, only this processor's own temp file is deleted;
 //     the native empty sidecar already at the final path is never touched.
+//
+// Phase 5-Unit N adds [processTimeline], which composes per-clip mapped ROI
+// samples across a hard-cut multi-clip timeline into a single export-space
+// sidecar, timestamp-shifted by cumulative output time. A single clip's ROI
+// failure never aborts the whole timeline -- it only drops that clip's
+// samples, and the timeline cursor still advances so later clips stay
+// aligned.
 
 import 'dart:convert';
 import 'dart:io';
@@ -26,6 +35,7 @@ import 'dart:io';
 import 'vg_roi_export_mapper.dart';
 import 'vg_roi_models.dart';
 import '../../vanguard_media_preparer.dart';
+import '../../vg_clip_descriptor.dart';
 
 /// Best-effort export-space ROI sidecar post-processor for Android exports.
 class VGRoiExportSidecarPostProcessor {
@@ -73,18 +83,170 @@ class VGRoiExportSidecarPostProcessor {
       );
       if (derivedOutputSidecarPath != exportRoiSidecarPath) return false;
 
+      final exportSidecar = await _mapClipSidecar(
+        sourceVideoPath: sourceVideoPath,
+        canvasWidth: canvasWidth,
+        canvasHeight: canvasHeight,
+        trimStartSeconds: trimStartSeconds,
+        trimEndSeconds: trimEndSeconds,
+        passthroughPreservesSourceGeometry: passthroughPreservesSourceGeometry,
+      );
+      if (exportSidecar == null) return false;
+
+      return await _writeSidecarAtomically(exportSidecar, exportRoiSidecarPath);
+    } catch (_) {
+      // Any ROI failure (parse error, mapper ArgumentError, I/O error, etc.)
+      // must leave the native empty sidecar in place, never propagate.
+      return false;
+    }
+  }
+
+  /// Attempts to compose a single export-space ROI sidecar for a hard-cut
+  /// multi-clip timeline by mapping each clip's source capture-time sidecar
+  /// independently and concatenating the surviving samples, timestamp-shifted
+  /// by cumulative output time.
+  ///
+  /// [clips] is the ordered list of clips exactly as exported (hard cuts
+  /// only -- no transitions, no compositor transforms are accounted for by
+  /// this mapping). [outputVideoPath] and [exportRoiSidecarPath] are used for
+  /// the same output-sidecar-path consistency check as [process].
+  /// [canvasWidth] / [canvasHeight] describe the export output canvas.
+  /// [exportDurationSeconds] is the measured duration of the exported output.
+  ///
+  /// A clip's own ROI mapping failure (missing/malformed source sidecar,
+  /// unsupported coordinate space, mapper error, or media probe failure)
+  /// only drops that clip's samples -- it never aborts the whole timeline.
+  /// The output timeline cursor still advances by that clip's output
+  /// duration so later clips remain aligned.
+  ///
+  /// Returns true only if at least one sample survived across all clips and
+  /// the composed sidecar was written and finalized. Never throws.
+  static Future<bool> processTimeline({
+    required List<VGClipDescriptor> clips,
+    required String outputVideoPath,
+    required String exportRoiSidecarPath,
+    required int canvasWidth,
+    required int canvasHeight,
+    required double exportDurationSeconds,
+  }) async {
+    try {
+      if (canvasWidth <= 0 || canvasHeight <= 0) return false;
+      if (exportDurationSeconds.isNaN ||
+          exportDurationSeconds.isInfinite ||
+          exportDurationSeconds <= 0) {
+        return false;
+      }
+
+      final derivedOutputSidecarPath = _sidecarPathForVideoPath(
+        outputVideoPath,
+      );
+      if (derivedOutputSidecarPath != exportRoiSidecarPath) return false;
+
+      if (clips.isEmpty) return false;
+
+      final List<VGROISample> aggregatedSamples = [];
+      VGROISidecar? metadataSource;
+      int cumulativeOutputMs = 0;
+
+      for (final clip in clips) {
+        final clipOutputDurationSeconds =
+            clip.trimEndSeconds - clip.trimStartSeconds;
+        final hasValidDuration =
+            !clipOutputDurationSeconds.isNaN &&
+            !clipOutputDurationSeconds.isInfinite &&
+            clipOutputDurationSeconds > 0;
+        // A clip with a degenerate output duration cannot safely advance the
+        // shared output cursor, so it is skipped entirely (no ROI mapping,
+        // no cursor advance) rather than risk misaligning later clips.
+        if (!hasValidDuration) continue;
+
+        final mapped = await _mapClipSidecar(
+          sourceVideoPath: clip.sourcePath,
+          canvasWidth: canvasWidth,
+          canvasHeight: canvasHeight,
+          trimStartSeconds: clip.trimStartSeconds,
+          trimEndSeconds: clip.trimEndSeconds,
+        );
+
+        if (mapped != null && mapped.samples.isNotEmpty) {
+          metadataSource ??= mapped;
+          for (final sample in mapped.samples) {
+            aggregatedSamples.add(
+              VGROISample(
+                timestampMs: sample.timestampMs + cumulativeOutputMs,
+                framePtsMs: sample.framePtsMs + cumulativeOutputMs,
+                recordingRelativeMs:
+                    sample.recordingRelativeMs + cumulativeOutputMs,
+                box: sample.box,
+                quality: sample.quality,
+                confidence: sample.confidence,
+                paddingPolicy: sample.paddingPolicy,
+              ),
+            );
+          }
+        }
+
+        cumulativeOutputMs += (clipOutputDurationSeconds * 1000).round();
+      }
+
+      if (aggregatedSamples.isEmpty || metadataSource == null) return false;
+
+      aggregatedSamples.sort((a, b) {
+        final byTimestamp = a.timestampMs.compareTo(b.timestampMs);
+        if (byTimestamp != 0) return byTimestamp;
+        return a.framePtsMs.compareTo(b.framePtsMs);
+      });
+
+      final exportSidecar = VGROISidecar(
+        version: metadataSource.version,
+        sourceType: metadataSource.sourceType,
+        platform: metadataSource.platform,
+        coordinateSpace: 'export_output_normalized',
+        recordingSessionId: metadataSource.recordingSessionId,
+        videoIdentity: VGROIIdentity(
+          durationMs: (exportDurationSeconds * 1000).round(),
+          width: canvasWidth,
+          height: canvasHeight,
+          hash: null,
+        ),
+        coverage: metadataSource.coverage,
+        samples: aggregatedSamples,
+        finalized: true,
+      );
+
+      return await _writeSidecarAtomically(exportSidecar, exportRoiSidecarPath);
+    } catch (_) {
+      // Any ROI failure must leave the native empty sidecar in place, never
+      // propagate.
+      return false;
+    }
+  }
+
+  /// Maps a single clip's source capture-time ROI sidecar into export-space,
+  /// mirroring the coordinate-space / source-dimension policy of [process].
+  /// Returns null on any missing, unsupported, or malformed input -- never
+  /// throws.
+  static Future<VGROISidecar?> _mapClipSidecar({
+    required String sourceVideoPath,
+    required int canvasWidth,
+    required int canvasHeight,
+    double trimStartSeconds = 0.0,
+    double trimEndSeconds = double.infinity,
+    bool passthroughPreservesSourceGeometry = false,
+  }) async {
+    try {
       final sourceSidecarPath = _sidecarPathForVideoPath(sourceVideoPath);
       final sourceSidecarFile = File(sourceSidecarPath);
-      if (!sourceSidecarFile.existsSync()) return false;
+      if (!sourceSidecarFile.existsSync()) return null;
 
       final decoded = jsonDecode(await sourceSidecarFile.readAsString());
-      if (decoded is! Map<String, dynamic>) return false;
+      if (decoded is! Map<String, dynamic>) return null;
       final captureSidecar = VGROISidecar.fromJson(decoded);
 
       final mediaInfo = await VanguardMediaPreparer.inspectMedia(
         sourceVideoPath,
       );
-      if (mediaInfo == null) return false;
+      if (mediaInfo == null) return null;
 
       final isPassthroughNoTrim =
           trimStartSeconds == 0.0 && trimEndSeconds.isInfinite;
@@ -115,11 +277,11 @@ class VGRoiExportSidecarPostProcessor {
         case 'export_output_normalized':
           // Only valid to reuse as a "source" space for a passthrough
           // export with no trim.
-          if (!isPassthroughNoTrim) return false;
+          if (!isPassthroughNoTrim) return null;
           if (preserveSourceGeometry) {
             final identityWidth = captureSidecar.videoIdentity.width;
             final identityHeight = captureSidecar.videoIdentity.height;
-            if (identityWidth <= 0 || identityHeight <= 0) return false;
+            if (identityWidth <= 0 || identityHeight <= 0) return null;
             sourceWidth = identityWidth.toDouble();
             sourceHeight = identityHeight.toDouble();
             effectiveCanvasWidth = sourceWidth;
@@ -127,22 +289,22 @@ class VGRoiExportSidecarPostProcessor {
           } else {
             if (captureSidecar.videoIdentity.width != canvasWidth ||
                 captureSidecar.videoIdentity.height != canvasHeight) {
-              return false;
+              return null;
             }
             sourceWidth = canvasWidth.toDouble();
             sourceHeight = canvasHeight.toDouble();
           }
           break;
         default:
-          return false;
+          return null;
       }
 
-      if (sourceWidth <= 0 || sourceHeight <= 0) return false;
+      if (sourceWidth <= 0 || sourceHeight <= 0) return null;
       if (effectiveCanvasWidth <= 0 || effectiveCanvasHeight <= 0) {
-        return false;
+        return null;
       }
 
-      final exportSidecar = VGROISidecarExportMapper.mapSidecar(
+      return VGROISidecarExportMapper.mapSidecar(
         captureSidecar: captureSidecar,
         sourceWidth: sourceWidth,
         sourceHeight: sourceHeight,
@@ -151,24 +313,32 @@ class VGRoiExportSidecarPostProcessor {
         trimStartSeconds: trimStartSeconds,
         trimEndSeconds: trimEndSeconds,
       );
-
-      final tempPath = '$exportRoiSidecarPath.vgroitmp';
-      final tempFile = File(tempPath);
-      try {
-        await tempFile.writeAsString(jsonEncode(exportSidecar.toJson()));
-        await tempFile.rename(exportRoiSidecarPath);
-        return true;
-      } catch (_) {
-        try {
-          if (await tempFile.exists()) await tempFile.delete();
-        } catch (_) {
-          // Best-effort cleanup only.
-        }
-        return false;
-      }
     } catch (_) {
-      // Any ROI failure (parse error, mapper ArgumentError, I/O error, etc.)
-      // must leave the native empty sidecar in place, never propagate.
+      // Any per-clip failure (parse error, mapper ArgumentError, I/O error,
+      // etc.) must only drop this clip's ROI, never propagate.
+      return null;
+    }
+  }
+
+  /// Writes [sidecar] to [exportRoiSidecarPath] via a temp file next to it,
+  /// then renames into place. On any write failure, only the temp file is
+  /// deleted; the file already at [exportRoiSidecarPath] is never touched.
+  static Future<bool> _writeSidecarAtomically(
+    VGROISidecar sidecar,
+    String exportRoiSidecarPath,
+  ) async {
+    final tempPath = '$exportRoiSidecarPath.vgroitmp';
+    final tempFile = File(tempPath);
+    try {
+      await tempFile.writeAsString(jsonEncode(sidecar.toJson()));
+      await tempFile.rename(exportRoiSidecarPath);
+      return true;
+    } catch (_) {
+      try {
+        if (await tempFile.exists()) await tempFile.delete();
+      } catch (_) {
+        // Best-effort cleanup only.
+      }
       return false;
     }
   }

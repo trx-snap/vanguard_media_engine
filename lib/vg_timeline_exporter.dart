@@ -137,20 +137,22 @@ final class VanguardTimelineExporter {
         );
       }
 
-      // Best-effort ROI sidecar upgrade for the single-clip case only.
-      // Multi-clip ROI composition is deferred. Never affects the returned
-      // result: the post-processor fails closed and leaves the native empty
-      // sidecar in place on any error.
-      if (draft.clips.length == 1) {
-        final sidecarPath = exportResult.exportRoiSidecarPath;
-        final width = exportResult.width;
-        final height = exportResult.height;
-        if (sidecarPath != null &&
-            width != null &&
-            width > 0 &&
-            height != null &&
-            height > 0 &&
-            exportResult.durationSeconds > 0) {
+      // Best-effort ROI sidecar upgrade. Single-clip exports use the direct
+      // per-clip mapping; any other clip count (including hard-cut
+      // multi-clip timelines, Phase 5-Unit N) is composed via
+      // processTimeline. Never affects the returned result: the
+      // post-processor fails closed and leaves the native empty sidecar in
+      // place on any error.
+      final sidecarPath = exportResult.exportRoiSidecarPath;
+      final width = exportResult.width;
+      final height = exportResult.height;
+      if (sidecarPath != null &&
+          width != null &&
+          width > 0 &&
+          height != null &&
+          height > 0 &&
+          exportResult.durationSeconds > 0) {
+        if (draft.clips.length == 1) {
           final clip = draft.clips.single;
           await VGRoiExportSidecarPostProcessor.process(
             sourceVideoPath: clip.sourcePath,
@@ -160,6 +162,15 @@ final class VanguardTimelineExporter {
             canvasHeight: height,
             trimStartSeconds: clip.trimStartSeconds,
             trimEndSeconds: clip.trimEndSeconds,
+          );
+        } else {
+          await VGRoiExportSidecarPostProcessor.processTimeline(
+            clips: draft.clips,
+            outputVideoPath: exportResult.path,
+            exportRoiSidecarPath: sidecarPath,
+            canvasWidth: width,
+            canvasHeight: height,
+            exportDurationSeconds: exportResult.durationSeconds,
           );
         }
       }
