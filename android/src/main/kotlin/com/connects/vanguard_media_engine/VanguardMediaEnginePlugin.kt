@@ -58,10 +58,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
     // ── Phase 1-Unit AX: GLES SurfaceProducer texture DAG render smoke coordinator ──
     private var glesTextureSmokeCoordinator: AndroidGlesTextureSmokeCoordinator? = null
 
-    // ── Export Unit C: production exportTimeline coordinator ──────────────────
-    // Owns only "exportTimeline". Does NOT own "cancelExport" — the plugin
-    // tries this coordinator's cancelActiveExport() first, then falls back to
-    // the legacy activeEncoder cancel path below.
+    // -- Export Unit C / Phase 2-Unit AD: production export coordinator --------
+    // Owns "exportTimeline" and "exportPassthroughRemux" (shared export lock).
+    // Does NOT own "cancelExport" -- the plugin tries this coordinator's
+    // cancelActiveExport() first, then falls back to the legacy activeEncoder
+    // cancel path below.
     private var editorExportCoordinator: AndroidEditorExportCoordinator? = null
 
     // ── Camera session state (B2: single camera instance invariant) ───────────
@@ -720,6 +721,18 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 }
             }
 
+            // --- Phase 2-Unit AD: production exportPassthroughRemux --------------------
+            // Delegates entirely to AndroidEditorExportCoordinator, sharing its
+            // single-export lock with exportTimeline.
+            "exportPassthroughRemux" -> {
+                val coord = editorExportCoordinator
+                if (coord != null) {
+                    coord.exportPassthroughRemux(args, result)
+                } else {
+                    result.error("UNAVAILABLE", "Android editor export coordinator unavailable", null)
+                }
+            }
+
             "startExport" -> {
                 // B3: Dart sends List<Map<String,dynamic>> {path, trimStart, trimEnd}.
                 // B4-S2: per-clip trim seek + EOS boundary.
@@ -1056,12 +1069,13 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             // stop feeding input, let the decoder drain to EOS, then call encoder.finish()
             // which cleans up temp files and resolves the pending startExport Future.
             "cancelExport" -> {
-                // Export Unit C: try the production coordinator first. If it had an
-                // active export, it replies EXPORT_CANCELLED to the pending
-                // exportTimeline call itself — cancelExport just acks immediately.
+                // Export Unit C / Phase 2-Unit AD: try the production coordinator
+                // first. If it had an active export (exportTimeline or
+                // exportPassthroughRemux), it replies EXPORT_CANCELLED to the
+                // pending call itself -- cancelExport just acks immediately.
                 val coordCancelled = editorExportCoordinator?.cancelActiveExport() ?: false
                 if (coordCancelled) {
-                    Log.i(TAG, "cancelExport: Unit C export cancellation signalled")
+                    Log.i(TAG, "cancelExport: coordinator export cancellation signalled")
                     result.success(null)
                 } else {
                     // Legacy startExport / VanguardMediaCodecEncoder cancel path — unchanged.
@@ -1243,7 +1257,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         editorPlaybackCoordinator = null
         // Diagnostics coordinator holds no native resources — just drop it.
         dagDiagnosticsCoordinator = null
-        // Export Unit C: cancel any in-flight exportTimeline and drop temps.
+        // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
+        // or exportPassthroughRemux and drop temps.
         editorExportCoordinator?.disposeAll()
         editorExportCoordinator = null
         // Tear down Phase 1-Unit AX active GLES texture smoke runs and release their producers.
