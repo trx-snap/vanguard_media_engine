@@ -97,6 +97,8 @@ export 'vg_passthrough_remux_decision.dart';
 export 'vg_editor_export_admission.dart';
 // Phase 2-Unit AE: public Android passthrough remux execution client.
 export 'vg_passthrough_remux_client.dart';
+// Phase 2-Unit AF: public admission-driven export execution client.
+export 'vg_editor_admission_export_client.dart';
 // Audio Slice M: recording result models.
 export 'vg_audio_recording_models.dart';
 // Phase 8: canvas and overlay descriptors
