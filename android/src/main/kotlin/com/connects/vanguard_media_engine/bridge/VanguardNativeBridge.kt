@@ -322,6 +322,10 @@ class VanguardNativeBridge(
     // Phase 1-Unit BD extends this route with independent per-source
     // rotationDegrees/mirrorHorizontal render-transform arguments (default
     // 0 / false, BB/BC-compatible), matching the Unit AZ pattern.
+    // Phase 1-Unit BE extends this route with independent per-source
+    // sourceKindA/sourceKindB arguments ("2d" or "oes", default "2d",
+    // BB/BC/BD-compatible) selecting the target permutation (2D vs OES) for
+    // each source's HardwareBuffer import.
     external fun runAndroidDagPhase1BBGlesTextureCompositionDagSmoke(
         surface: Surface,
         bufferA: HardwareBuffer,
@@ -335,6 +339,8 @@ class VanguardNativeBridge(
         mirrorHorizontalA: Boolean,
         rotationDegreesB: Int,
         mirrorHorizontalB: Boolean,
+        sourceKindA: String,
+        sourceKindB: String,
     ): String
 
     fun initialize() {

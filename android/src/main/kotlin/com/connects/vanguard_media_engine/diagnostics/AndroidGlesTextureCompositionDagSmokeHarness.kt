@@ -24,6 +24,13 @@ import io.flutter.view.TextureRegistry
  * (default 0, BB-compatible) used to hold the frame loop open long enough
  * for an active-dispose/cancellation physical proof, matching the Unit AY
  * pattern.
+ *
+ * Phase 1-Unit BE extends this route with independent per-source
+ * sourceKindA/sourceKindB arguments ("2d" or "oes", default "2d",
+ * BB/BC/BD-compatible) so the same two-source DAG/compositor loop can
+ * render all four source target permutations (2D+2D, OES+2D, 2D+OES,
+ * OES+OES). "oes" sources allocate a YCBCR_420_888 HardwareBuffer with
+ * USAGE_GPU_SAMPLED_IMAGE only (no CPU_WRITE_OFTEN, never CPU-filled).
  */
 class AndroidGlesTextureCompositionDagSmokeHarness {
 
@@ -37,6 +44,7 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
         private const val DEFAULT_FRAME_DELAY_MS = 0
         private const val DEFAULT_ROTATION_DEGREES = 0
         private const val DEFAULT_MIRROR_HORIZONTAL = false
+        private const val DEFAULT_SOURCE_KIND = "2d"
         private const val PROOF_BOUNDARY =
             "gles_surfaceproducer_texture_dag_two_source_composition_no_decoded_input_no_product_ui"
 
@@ -54,11 +62,44 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
                     DEFAULT_MIRROR_HORIZONTAL,
                     DEFAULT_ROTATION_DEGREES,
                     DEFAULT_MIRROR_HORIZONTAL,
+                    DEFAULT_SOURCE_KIND,
+                    DEFAULT_SOURCE_KIND,
                 )
             )
         }
 
         private fun clampInt(raw: Int?, default: Int): Int = raw?.takeIf { it > 0 } ?: default
+
+        // Phase 1-Unit BE: only "2d"/"oes" are accepted; anything else falls
+        // back to the BB/BC/BD-compatible "2d" default.
+        private fun normalizeSourceKind(raw: String?): String =
+            when (raw) {
+                "2d", "oes" -> raw
+                else -> DEFAULT_SOURCE_KIND
+            }
+
+        // Phase 1-Unit BE: "2d" sources allocate an RGBA_8888 buffer with
+        // GPU_SAMPLED_IMAGE|CPU_WRITE_OFTEN (CPU-filled natively); "oes"
+        // sources allocate a YCBCR_420_888 buffer with GPU_SAMPLED_IMAGE only
+        // and are never CPU-filled.
+        private fun createSourceBuffer(sourceKind: String, width: Int, height: Int): HardwareBuffer =
+            if (sourceKind == "oes") {
+                HardwareBuffer.create(
+                    width,
+                    height,
+                    HardwareBuffer.YCBCR_420_888,
+                    1,
+                    HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+                )
+            } else {
+                HardwareBuffer.create(
+                    width,
+                    height,
+                    HardwareBuffer.RGBA_8888,
+                    1,
+                    HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_CPU_WRITE_OFTEN,
+                )
+            }
 
         // Phase 1-Unit BD: mirrors vanguard::render::normalizeRotation — maps
         // any integer degrees to a cardinal 0/90/180/270 value; non-cardinal
@@ -115,6 +156,14 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
                 "rotationDegreesB" to (parsed["rotationDegreesB"]?.toIntOrNull() ?: DEFAULT_ROTATION_DEGREES),
                 "mirrorHorizontalB" to (parsed["mirrorHorizontalB"]?.equals("true", ignoreCase = true) ?: DEFAULT_MIRROR_HORIZONTAL),
                 "normalizedRotationDegreesB" to (parsed["normalizedRotationDegreesB"]?.toIntOrNull() ?: DEFAULT_ROTATION_DEGREES),
+                "sourceKindA" to (parsed["sourceKindA"] ?: DEFAULT_SOURCE_KIND),
+                "sourceKindB" to (parsed["sourceKindB"] ?: DEFAULT_SOURCE_KIND),
+                "bufferAFormat" to (parsed["bufferAFormat"] ?: "not_run"),
+                "bufferBFormat" to (parsed["bufferBFormat"] ?: "not_run"),
+                "targetA" to (parsed["targetA"]?.toIntOrNull() ?: -1),
+                "targetB" to (parsed["targetB"]?.toIntOrNull() ?: -1),
+                "bufferFillA" to (parsed["bufferFillA"] ?: "not_run"),
+                "bufferFillB" to (parsed["bufferFillB"] ?: "not_run"),
                 "proofBoundary" to (parsed["proofBoundary"] ?: PROOF_BOUNDARY),
                 "lastError" to (parsed["lastError"] ?: "none"),
             )
@@ -130,6 +179,8 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
             mirrorHorizontalA: Boolean,
             rotationDegreesB: Int,
             mirrorHorizontalB: Boolean,
+            sourceKindA: String = DEFAULT_SOURCE_KIND,
+            sourceKindB: String = DEFAULT_SOURCE_KIND,
         ): String =
             "status=FAIL;initialize=not_run;attach=not_run;graphBuild=not_run;importA=not_run;importB=not_run;" +
             "evaluation=not_run;renderedFrames=0;frameCount=$frameCount;frameDelayMs=$frameDelayMs;lastEvaluatedPtsUs=0;" +
@@ -141,6 +192,9 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
             "normalizedRotationDegreesA=${normalizeRotationDegrees(rotationDegreesA)};" +
             "rotationDegreesB=$rotationDegreesB;mirrorHorizontalB=$mirrorHorizontalB;" +
             "normalizedRotationDegreesB=${normalizeRotationDegrees(rotationDegreesB)};" +
+            "sourceKindA=$sourceKindA;sourceKindB=$sourceKindB;" +
+            "bufferAFormat=not_run;bufferBFormat=not_run;targetA=-1;targetB=-1;" +
+            "bufferFillA=not_run;bufferFillB=not_run;" +
             "proofBoundary=$PROOF_BOUNDARY;lastError=$reason"
     }
 
@@ -161,6 +215,11 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
         val mirrorHorizontalA = (args?.get("mirrorHorizontalA") as? Boolean) ?: DEFAULT_MIRROR_HORIZONTAL
         val rotationDegreesB = (args?.get("rotationDegreesB") as? Number)?.toInt() ?: DEFAULT_ROTATION_DEGREES
         val mirrorHorizontalB = (args?.get("mirrorHorizontalB") as? Boolean) ?: DEFAULT_MIRROR_HORIZONTAL
+        // Phase 1-Unit BE: independent per-source kind arguments ("2d" or
+        // "oes"), both BB/BC/BD-compatible (default "2d" when absent or
+        // unrecognized).
+        val sourceKindA = normalizeSourceKind(args?.get("sourceKindA") as? String)
+        val sourceKindB = normalizeSourceKind(args?.get("sourceKindB") as? String)
 
         var surface: Surface? = null
         var bufferA: HardwareBuffer? = null
@@ -168,6 +227,7 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
         var raw = failureStatus(
             "not_run", width, height, frameCount, frameDelayMs,
             rotationDegreesA, mirrorHorizontalA, rotationDegreesB, mirrorHorizontalB,
+            sourceKindA, sourceKindB,
         )
 
         try {
@@ -175,6 +235,7 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
                 raw = failureStatus(
                     "api_below_26", width, height, frameCount, frameDelayMs,
                     rotationDegreesA, mirrorHorizontalA, rotationDegreesB, mirrorHorizontalB,
+                    sourceKindA, sourceKindB,
                 )
                 return parseResult(raw)
             }
@@ -182,6 +243,7 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
                 raw = failureStatus(
                     "invalid_arguments", width, height, frameCount, frameDelayMs,
                     rotationDegreesA, mirrorHorizontalA, rotationDegreesB, mirrorHorizontalB,
+                    sourceKindA, sourceKindB,
                 )
                 return parseResult(raw)
             }
@@ -189,20 +251,8 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
             surfaceProducer.setSize(width, height)
             surface = surfaceProducer.getSurface()
 
-            bufferA = HardwareBuffer.create(
-                width,
-                height,
-                HardwareBuffer.RGBA_8888,
-                1,
-                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_CPU_WRITE_OFTEN,
-            )
-            bufferB = HardwareBuffer.create(
-                width,
-                height,
-                HardwareBuffer.RGBA_8888,
-                1,
-                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_CPU_WRITE_OFTEN,
-            )
+            bufferA = createSourceBuffer(sourceKindA, width, height)
+            bufferB = createSourceBuffer(sourceKindB, width, height)
 
             val diagnostics = VanguardDiagnostics()
             val nativeBridge = VanguardNativeBridge(
@@ -223,6 +273,8 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
                 mirrorHorizontalA,
                 rotationDegreesB,
                 mirrorHorizontalB,
+                sourceKindA,
+                sourceKindB,
             )
             return parseResult(raw)
         } catch (throwable: Throwable) {
@@ -230,6 +282,7 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
             raw = failureStatus(
                 "exception:$reason", width, height, frameCount, frameDelayMs,
                 rotationDegreesA, mirrorHorizontalA, rotationDegreesB, mirrorHorizontalB,
+                sourceKindA, sourceKindB,
             )
             return parseResult(raw)
         } finally {

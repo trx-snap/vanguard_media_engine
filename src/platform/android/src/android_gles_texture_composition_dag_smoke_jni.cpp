@@ -34,6 +34,17 @@
 // received; vanguard::render::normalizeRotation is used only to populate the
 // diagnostic normalizedRotationDegreesA/B status fields.
 //
+// Phase 1-Unit BE extends this entry point with independent per-source
+// sourceKindA/sourceKindB string arguments ("2d" or "oes", default "2d",
+// BB/BC/BD-compatible), proving all four source target permutations (2D+2D,
+// OES+2D, 2D+OES, OES+OES). A "2d" source is validated as an RGBA_8888
+// descriptor with GPU_SAMPLED_IMAGE|CPU_WRITE_OFTEN usage, is CPU-filled,
+// and is required to import as GL_TEXTURE_2D (0x0DE1/3553). An "oes" source
+// is validated as a YCBCR_420_888 descriptor with GPU_SAMPLED_IMAGE-only
+// usage, is never CPU-filled, and is required to import as
+// GL_TEXTURE_EXTERNAL_OES (0x8D65/36197). Import/release handle usage is
+// otherwise identical regardless of source kind.
+//
 // JNI entry point:
 //   runAndroidDagPhase1BBGlesTextureCompositionDagSmoke -> jstring
 
@@ -273,6 +284,55 @@ private:
 constexpr const char* kProofBoundary =
     "gles_surfaceproducer_texture_dag_two_source_composition_no_decoded_input_no_product_ui";
 
+// Phase 1-Unit BE: GL texture target constants required for each source
+// kind's import (mirrors GlesBackend::diagnosticTextureTargetForHardwareBuffer).
+constexpr uint32_t kGlTextureTarget2D = 0x0DE1;    // GL_TEXTURE_2D
+constexpr uint32_t kGlTextureTargetOes = 0x8D65;   // GL_TEXTURE_EXTERNAL_OES
+
+// Normalizes a caller-provided source kind string to the two accepted
+// values ("2d"/"oes"); anything else falls back to the BB/BC/BD-compatible
+// "2d" default, mirroring the Kotlin-side normalizeSourceKind.
+std::string NormalizeSourceKind(const std::string& raw) {
+    return (raw == "oes") ? "oes" : "2d";
+}
+
+std::string JStringToStdString(JNIEnv* env, jstring str) {
+    if (str == nullptr) {
+        return "2d";
+    }
+    const char* chars = env->GetStringUTFChars(str, nullptr);
+    if (chars == nullptr) {
+        return "2d";
+    }
+    std::string result(chars);
+    env->ReleaseStringUTFChars(str, chars);
+    return result;
+}
+
+// Validates an AHardwareBuffer_Desc against the expected format/usage for
+// the given (already-normalized) source kind.
+bool ValidateSourceDescriptor(
+    const AHardwareBuffer_Desc& desc,
+    const std::string& sourceKind,
+    uint32_t width,
+    uint32_t height) {
+    if (desc.width != width || desc.height != height || desc.layers != 1) {
+        return false;
+    }
+    if (sourceKind == "oes") {
+        return (desc.format == AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420) &&
+               ((desc.usage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) != 0);
+    }
+    return (desc.format == AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM) &&
+           ((desc.usage & AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE) != 0) &&
+           ((desc.usage & AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN) != 0) &&
+           (desc.stride >= desc.width);
+}
+
+const char* BufferFormatLabel(const std::string& sourceKind) {
+    return (sourceKind == "oes") ? "ycbcr_420_888" : "rgba_8888";
+}
+
 struct BBStatusFields {
     bool pass = false;
     std::string initialize = "not_run";
@@ -311,6 +371,17 @@ struct BBStatusFields {
     int rotationDegreesB = 0;
     bool mirrorHorizontalB = false;
     int normalizedRotationDegreesB = 0;
+    // Phase 1-Unit BE: independent per-source kind ("2d"/"oes") status
+    // fields proving the two-source DAG smoke over all four source target
+    // permutations.
+    std::string sourceKindA = "2d";
+    std::string sourceKindB = "2d";
+    std::string bufferAFormat = "not_run";
+    std::string bufferBFormat = "not_run";
+    int32_t targetA = -1;
+    int32_t targetB = -1;
+    std::string bufferFillA = "not_run";
+    std::string bufferFillB = "not_run";
     std::string lastError = "none";
 };
 
@@ -350,6 +421,14 @@ std::string BuildStatusString(const BBStatusFields& f) {
         << "rotationDegreesB=" << f.rotationDegreesB << ";"
         << "mirrorHorizontalB=" << (f.mirrorHorizontalB ? "true" : "false") << ";"
         << "normalizedRotationDegreesB=" << f.normalizedRotationDegreesB << ";"
+        << "sourceKindA=" << f.sourceKindA << ";"
+        << "sourceKindB=" << f.sourceKindB << ";"
+        << "bufferAFormat=" << f.bufferAFormat << ";"
+        << "bufferBFormat=" << f.bufferBFormat << ";"
+        << "targetA=" << f.targetA << ";"
+        << "targetB=" << f.targetB << ";"
+        << "bufferFillA=" << f.bufferFillA << ";"
+        << "bufferFillB=" << f.bufferFillB << ";"
         << "proofBoundary=" << kProofBoundary << ";"
         << "lastError=" << (f.lastError.empty() ? "none" : f.lastError);
     return oss.str();
@@ -373,7 +452,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     jint     rotationDegreesA,
     jboolean mirrorHorizontalA,
     jint     rotationDegreesB,
-    jboolean mirrorHorizontalB) {
+    jboolean mirrorHorizontalB,
+    jstring  sourceKindA,
+    jstring  sourceKindB) {
 
     // Phase 1-Unit BC: diagnostic-only per-frame delay; clamp negative input
     // to no delay rather than rejecting the call (BB omits this arg / sends
@@ -392,6 +473,15 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     const jint normalizedRotationDegreesB = static_cast<jint>(
         vanguard::render::normalizeRotation(static_cast<uint32_t>(rotationDegreesB)));
 
+    // Phase 1-Unit BE: independent per-source kind arguments; both
+    // BB/BC/BD-compatible ("2d") when omitted/unrecognized by the caller.
+    const std::string sourceKindAValue = NormalizeSourceKind(JStringToStdString(env, sourceKindA));
+    const std::string sourceKindBValue = NormalizeSourceKind(JStringToStdString(env, sourceKindB));
+    const uint32_t expectedTargetA =
+        (sourceKindAValue == "oes") ? kGlTextureTargetOes : kGlTextureTarget2D;
+    const uint32_t expectedTargetB =
+        (sourceKindBValue == "oes") ? kGlTextureTargetOes : kGlTextureTarget2D;
+
     BBStatusFields status;
     status.width = width;
     status.height = height;
@@ -403,6 +493,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     status.rotationDegreesB = rotationDegreesB;
     status.mirrorHorizontalB = mirrorHorizontalBBool;
     status.normalizedRotationDegreesB = normalizedRotationDegreesB;
+    status.sourceKindA = sourceKindAValue;
+    status.sourceKindB = sourceKindBValue;
 
     if (surface == nullptr || bufferA == nullptr || bufferB == nullptr ||
         width <= 0 || height <= 0 || frameCount <= 0 || frameDurationUs <= 0) {
@@ -433,12 +525,44 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         return env->NewStringUTF(BuildStatusString(status).c_str());
     }
 
-    // CPU-fill bufferA solid red [255,0,0,255] and bufferB solid blue
-    // [0,0,255,255] so the composited blend is deterministic.
-    const bool fillAOk = FillHardwareBufferSolidColor(
-        ahbFns, ahbA, static_cast<uint32_t>(width), static_cast<uint32_t>(height), 255, 0, 0, 255);
-    const bool fillBOk = FillHardwareBufferSolidColor(
-        ahbFns, ahbB, static_cast<uint32_t>(width), static_cast<uint32_t>(height), 0, 0, 255, 255);
+    // Phase 1-Unit BE: validate each source descriptor according to its
+    // source kind ("2d" -> RGBA_8888 + GPU_SAMPLED_IMAGE|CPU_WRITE_OFTEN,
+    // "oes" -> YCBCR_420_888 + GPU_SAMPLED_IMAGE only).
+    AHardwareBuffer_Desc nativeDescA{};
+    ahbFns.describe(ahbA, &nativeDescA);
+    AHardwareBuffer_Desc nativeDescB{};
+    ahbFns.describe(ahbB, &nativeDescB);
+    const bool descAOk = ValidateSourceDescriptor(
+        nativeDescA, sourceKindAValue, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    const bool descBOk = ValidateSourceDescriptor(
+        nativeDescB, sourceKindBValue, static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    if (!descAOk || !descBOk) {
+        ANativeWindow_release(nativeWindow);
+        status.lastError = "hardware_buffer_descriptor_mismatch";
+        return env->NewStringUTF(BuildStatusString(status).c_str());
+    }
+    status.bufferAFormat = BufferFormatLabel(sourceKindAValue);
+    status.bufferBFormat = BufferFormatLabel(sourceKindBValue);
+
+    // CPU-fill only "2d"/RGBA sources solid red [255,0,0,255] / solid blue
+    // [0,0,255,255] so the composited blend is deterministic; "oes"/YCBCR
+    // sources are never CPU-filled.
+    bool fillAOk = true;
+    if (sourceKindAValue == "oes") {
+        status.bufferFillA = "skipped_oes";
+    } else {
+        fillAOk = FillHardwareBufferSolidColor(
+            ahbFns, ahbA, static_cast<uint32_t>(width), static_cast<uint32_t>(height), 255, 0, 0, 255);
+        status.bufferFillA = fillAOk ? "success" : "failed";
+    }
+    bool fillBOk = true;
+    if (sourceKindBValue == "oes") {
+        status.bufferFillB = "skipped_oes";
+    } else {
+        fillBOk = FillHardwareBufferSolidColor(
+            ahbFns, ahbB, static_cast<uint32_t>(width), static_cast<uint32_t>(height), 0, 0, 255, 255);
+        status.bufferFillB = fillBOk ? "success" : "failed";
+    }
     if (!fillAOk || !fillBOk) {
         ANativeWindow_release(nativeWindow);
         status.lastError = "hardware_buffer_fill_failed";
@@ -498,29 +622,48 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
         }
         status.graphGeneration = graphGenId;
 
-        // ── 4. Import the two RGBA HardwareBuffers directly into the backend ─
+        // ── 4. Import the two HardwareBuffers directly into the backend ─────
+        //         (target 0x0DE1/3553 for "2d", 0x8D65/36197 for "oes")
         vanguard::render::HardwareBufferHandle handleA =
             vanguard::render::kInvalidHardwareBufferHandle;
         vanguard::render::HardwareBufferHandle handleB =
             vanguard::render::kInvalidHardwareBufferHandle;
         bool importedA = false;
         bool importedB = false;
+        bool targetAOk = false;
+        bool targetBOk = false;
 
         if (graphOk) {
-            vanguard::render::HardwareBufferDescriptor descA{};
-            const auto importResultA = backend.importHardwareBuffer(ahbA, -1, &handleA, &descA);
+            vanguard::render::HardwareBufferDescriptor importDescA{};
+            const auto importResultA = backend.importHardwareBuffer(ahbA, -1, &handleA, &importDescA);
             status.importA = HardwareBufferResultName(importResultA);
             importedA = (importResultA == vanguard::render::HardwareBufferImportResult::kSuccess);
+            if (importedA) {
+                status.targetA = static_cast<int32_t>(
+                    backend.diagnosticTextureTargetForHardwareBuffer(handleA));
+                targetAOk = (static_cast<uint32_t>(status.targetA) == expectedTargetA);
+            }
 
-            vanguard::render::HardwareBufferDescriptor descB{};
-            const auto importResultB = backend.importHardwareBuffer(ahbB, -1, &handleB, &descB);
+            vanguard::render::HardwareBufferDescriptor importDescB{};
+            const auto importResultB = backend.importHardwareBuffer(ahbB, -1, &handleB, &importDescB);
             status.importB = HardwareBufferResultName(importResultB);
             importedB = (importResultB == vanguard::render::HardwareBufferImportResult::kSuccess);
+            if (importedB) {
+                status.targetB = static_cast<int32_t>(
+                    backend.diagnosticTextureTargetForHardwareBuffer(handleB));
+                targetBOk = (static_cast<uint32_t>(status.targetB) == expectedTargetB);
+            }
         }
 
         // ── 5. Per-frame: evaluatePlayhead -> extract compositor weight ->
         //         diagnosticPresentCompositeFrames ─────────────────────────
-        if (importedA && importedB) {
+        if (importedA && importedB && !targetAOk) {
+            status.evaluation = "target_mismatch_a";
+        } else if (importedA && importedB && !targetBOk) {
+            status.evaluation = "target_mismatch_b";
+        }
+
+        if (importedA && importedB && targetAOk && targetBOk) {
             status.evaluation = "success";
             status.renderFrame = "success";
 
@@ -640,6 +783,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
                       (status.attach == "success") &&
                       (status.graphBuild == "success") &&
                       importedA && importedB &&
+                      targetAOk && targetBOk &&
                       (status.evaluation == "success") &&
                       status.compositorActive &&
                       status.monotonicWeights &&
