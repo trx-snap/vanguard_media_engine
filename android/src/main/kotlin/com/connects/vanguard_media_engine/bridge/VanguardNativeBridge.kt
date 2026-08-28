@@ -319,6 +319,9 @@ class VanguardNativeBridge(
     // (default 0, BB-compatible), matching the Unit AY pattern, used to hold
     // the frame loop open long enough for an active-dispose/cancellation
     // physical proof.
+    // Phase 1-Unit BD extends this route with independent per-source
+    // rotationDegrees/mirrorHorizontal render-transform arguments (default
+    // 0 / false, BB/BC-compatible), matching the Unit AZ pattern.
     external fun runAndroidDagPhase1BBGlesTextureCompositionDagSmoke(
         surface: Surface,
         bufferA: HardwareBuffer,
@@ -328,6 +331,10 @@ class VanguardNativeBridge(
         frameCount: Int,
         frameDurationUs: Long,
         frameDelayMs: Int,
+        rotationDegreesA: Int,
+        mirrorHorizontalA: Boolean,
+        rotationDegreesB: Int,
+        mirrorHorizontalB: Boolean,
     ): String
 
     fun initialize() {

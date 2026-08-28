@@ -35,6 +35,8 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
         private const val DEFAULT_FRAME_COUNT = 30
         private const val DEFAULT_FRAME_DURATION_US = 33333L
         private const val DEFAULT_FRAME_DELAY_MS = 0
+        private const val DEFAULT_ROTATION_DEGREES = 0
+        private const val DEFAULT_MIRROR_HORIZONTAL = false
         private const val PROOF_BOUNDARY =
             "gles_surfaceproducer_texture_dag_two_source_composition_no_decoded_input_no_product_ui"
 
@@ -48,11 +50,26 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
                     DEFAULT_HEIGHT,
                     DEFAULT_FRAME_COUNT,
                     DEFAULT_FRAME_DELAY_MS,
+                    DEFAULT_ROTATION_DEGREES,
+                    DEFAULT_MIRROR_HORIZONTAL,
+                    DEFAULT_ROTATION_DEGREES,
+                    DEFAULT_MIRROR_HORIZONTAL,
                 )
             )
         }
 
         private fun clampInt(raw: Int?, default: Int): Int = raw?.takeIf { it > 0 } ?: default
+
+        // Phase 1-Unit BD: mirrors vanguard::render::normalizeRotation — maps
+        // any integer degrees to a cardinal 0/90/180/270 value; non-cardinal
+        // input normalizes to 0 (identity).
+        private fun normalizeRotationDegrees(degrees: Int): Int {
+            val normalized = ((degrees % 360) + 360) % 360
+            return when (normalized) {
+                0, 90, 180, 270 -> normalized
+                else -> 0
+            }
+        }
 
         private fun parseResult(raw: String): Map<String, Any?> {
             val parsed = mutableMapOf<String, String>()
@@ -92,18 +109,39 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
                 "releaseFenceAFd" to (parsed["releaseFenceAFd"]?.toIntOrNull() ?: -1),
                 "releaseFenceBFd" to (parsed["releaseFenceBFd"]?.toIntOrNull() ?: -1),
                 "releaseFenceExported" to (parsed["releaseFenceExported"]?.equals("true", ignoreCase = true) ?: false),
+                "rotationDegreesA" to (parsed["rotationDegreesA"]?.toIntOrNull() ?: DEFAULT_ROTATION_DEGREES),
+                "mirrorHorizontalA" to (parsed["mirrorHorizontalA"]?.equals("true", ignoreCase = true) ?: DEFAULT_MIRROR_HORIZONTAL),
+                "normalizedRotationDegreesA" to (parsed["normalizedRotationDegreesA"]?.toIntOrNull() ?: DEFAULT_ROTATION_DEGREES),
+                "rotationDegreesB" to (parsed["rotationDegreesB"]?.toIntOrNull() ?: DEFAULT_ROTATION_DEGREES),
+                "mirrorHorizontalB" to (parsed["mirrorHorizontalB"]?.equals("true", ignoreCase = true) ?: DEFAULT_MIRROR_HORIZONTAL),
+                "normalizedRotationDegreesB" to (parsed["normalizedRotationDegreesB"]?.toIntOrNull() ?: DEFAULT_ROTATION_DEGREES),
                 "proofBoundary" to (parsed["proofBoundary"] ?: PROOF_BOUNDARY),
                 "lastError" to (parsed["lastError"] ?: "none"),
             )
         }
 
-        private fun failureStatus(reason: String, width: Int, height: Int, frameCount: Int, frameDelayMs: Int): String =
+        private fun failureStatus(
+            reason: String,
+            width: Int,
+            height: Int,
+            frameCount: Int,
+            frameDelayMs: Int,
+            rotationDegreesA: Int,
+            mirrorHorizontalA: Boolean,
+            rotationDegreesB: Int,
+            mirrorHorizontalB: Boolean,
+        ): String =
             "status=FAIL;initialize=not_run;attach=not_run;graphBuild=not_run;importA=not_run;importB=not_run;" +
             "evaluation=not_run;renderedFrames=0;frameCount=$frameCount;frameDelayMs=$frameDelayMs;lastEvaluatedPtsUs=0;" +
             "graphGeneration=0;activeNodeCount=0;compositorActive=false;startWeightB=0.0;endWeightB=0.0;" +
             "monotonicWeights=false;renderFrame=not_run;failingFrame=-1;releaseA=not_run;releaseB=not_run;" +
             "width=$width;height=$height;textureSurface=false;releaseFenceAFd=-1;releaseFenceBFd=-1;" +
-            "releaseFenceExported=false;proofBoundary=$PROOF_BOUNDARY;lastError=$reason"
+            "releaseFenceExported=false;" +
+            "rotationDegreesA=$rotationDegreesA;mirrorHorizontalA=$mirrorHorizontalA;" +
+            "normalizedRotationDegreesA=${normalizeRotationDegrees(rotationDegreesA)};" +
+            "rotationDegreesB=$rotationDegreesB;mirrorHorizontalB=$mirrorHorizontalB;" +
+            "normalizedRotationDegreesB=${normalizeRotationDegrees(rotationDegreesB)};" +
+            "proofBoundary=$PROOF_BOUNDARY;lastError=$reason"
     }
 
     fun run(surfaceProducer: TextureRegistry.SurfaceProducer, args: Map<*, *>?): Map<String, Any?> {
@@ -116,19 +154,35 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
         // call can be proven to land while the render worker is still
         // active. Absent/non-positive defaults to 0, preserving BB behavior.
         val frameDelayMs = clampInt((args?.get("frameDelayMs") as? Number)?.toInt(), DEFAULT_FRAME_DELAY_MS)
+        // Phase 1-Unit BD: independent per-source rotation/mirror
+        // render-transform arguments, both BB/BC-compatible (default 0 /
+        // false when absent).
+        val rotationDegreesA = (args?.get("rotationDegreesA") as? Number)?.toInt() ?: DEFAULT_ROTATION_DEGREES
+        val mirrorHorizontalA = (args?.get("mirrorHorizontalA") as? Boolean) ?: DEFAULT_MIRROR_HORIZONTAL
+        val rotationDegreesB = (args?.get("rotationDegreesB") as? Number)?.toInt() ?: DEFAULT_ROTATION_DEGREES
+        val mirrorHorizontalB = (args?.get("mirrorHorizontalB") as? Boolean) ?: DEFAULT_MIRROR_HORIZONTAL
 
         var surface: Surface? = null
         var bufferA: HardwareBuffer? = null
         var bufferB: HardwareBuffer? = null
-        var raw = failureStatus("not_run", width, height, frameCount, frameDelayMs)
+        var raw = failureStatus(
+            "not_run", width, height, frameCount, frameDelayMs,
+            rotationDegreesA, mirrorHorizontalA, rotationDegreesB, mirrorHorizontalB,
+        )
 
         try {
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-                raw = failureStatus("api_below_26", width, height, frameCount, frameDelayMs)
+                raw = failureStatus(
+                    "api_below_26", width, height, frameCount, frameDelayMs,
+                    rotationDegreesA, mirrorHorizontalA, rotationDegreesB, mirrorHorizontalB,
+                )
                 return parseResult(raw)
             }
             if (width <= 0 || height <= 0 || frameCount <= 0 || frameDurationUs <= 0) {
-                raw = failureStatus("invalid_arguments", width, height, frameCount, frameDelayMs)
+                raw = failureStatus(
+                    "invalid_arguments", width, height, frameCount, frameDelayMs,
+                    rotationDegreesA, mirrorHorizontalA, rotationDegreesB, mirrorHorizontalB,
+                )
                 return parseResult(raw)
             }
 
@@ -165,11 +219,18 @@ class AndroidGlesTextureCompositionDagSmokeHarness {
                 frameCount,
                 frameDurationUs,
                 frameDelayMs,
+                rotationDegreesA,
+                mirrorHorizontalA,
+                rotationDegreesB,
+                mirrorHorizontalB,
             )
             return parseResult(raw)
         } catch (throwable: Throwable) {
             val reason = throwable.javaClass.simpleName.ifEmpty { "unknown_exception" }
-            raw = failureStatus("exception:$reason", width, height, frameCount, frameDelayMs)
+            raw = failureStatus(
+                "exception:$reason", width, height, frameCount, frameDelayMs,
+                rotationDegreesA, mirrorHorizontalA, rotationDegreesB, mirrorHorizontalB,
+            )
             return parseResult(raw)
         } finally {
             Log.i(TAG, "$RESULT_MARKER $raw")

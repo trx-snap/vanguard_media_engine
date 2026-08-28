@@ -27,6 +27,13 @@
 // always finishes its delayed iterations; it is never preemptively
 // interrupted.
 //
+// Phase 1-Unit BD extends this entry point with independent per-source
+// rotationDegrees/mirrorHorizontal render-transform arguments (default 0 /
+// false, BB/BC-compatible), matching the Unit AZ pattern. Each source's raw
+// transform is passed to diagnosticPresentCompositeFrames() exactly as
+// received; vanguard::render::normalizeRotation is used only to populate the
+// diagnostic normalizedRotationDegreesA/B status fields.
+//
 // JNI entry point:
 //   runAndroidDagPhase1BBGlesTextureCompositionDagSmoke -> jstring
 
@@ -294,6 +301,16 @@ struct BBStatusFields {
     int releaseFenceAFd = -1;
     int releaseFenceBFd = -1;
     bool releaseFenceExported = false;
+    // Phase 1-Unit BD: independent per-source diagnostic render-transform
+    // status fields. rotationDegrees*/mirrorHorizontal* echo the raw caller
+    // input (what the renderer actually receives); normalizedRotationDegrees*
+    // is diagnostic-only, via vanguard::render::normalizeRotation.
+    int rotationDegreesA = 0;
+    bool mirrorHorizontalA = false;
+    int normalizedRotationDegreesA = 0;
+    int rotationDegreesB = 0;
+    bool mirrorHorizontalB = false;
+    int normalizedRotationDegreesB = 0;
     std::string lastError = "none";
 };
 
@@ -327,6 +344,12 @@ std::string BuildStatusString(const BBStatusFields& f) {
         << "releaseFenceAFd=" << f.releaseFenceAFd << ";"
         << "releaseFenceBFd=" << f.releaseFenceBFd << ";"
         << "releaseFenceExported=" << (f.releaseFenceExported ? "true" : "false") << ";"
+        << "rotationDegreesA=" << f.rotationDegreesA << ";"
+        << "mirrorHorizontalA=" << (f.mirrorHorizontalA ? "true" : "false") << ";"
+        << "normalizedRotationDegreesA=" << f.normalizedRotationDegreesA << ";"
+        << "rotationDegreesB=" << f.rotationDegreesB << ";"
+        << "mirrorHorizontalB=" << (f.mirrorHorizontalB ? "true" : "false") << ";"
+        << "normalizedRotationDegreesB=" << f.normalizedRotationDegreesB << ";"
         << "proofBoundary=" << kProofBoundary << ";"
         << "lastError=" << (f.lastError.empty() ? "none" : f.lastError);
     return oss.str();
@@ -346,18 +369,40 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
     jint     height,
     jint     frameCount,
     jlong    frameDurationUs,
-    jint     frameDelayMs) {
+    jint     frameDelayMs,
+    jint     rotationDegreesA,
+    jboolean mirrorHorizontalA,
+    jint     rotationDegreesB,
+    jboolean mirrorHorizontalB) {
 
     // Phase 1-Unit BC: diagnostic-only per-frame delay; clamp negative input
     // to no delay rather than rejecting the call (BB omits this arg / sends
     // 0, which must keep behaving identically).
     const jint effectiveFrameDelayMs = (frameDelayMs > 0) ? frameDelayMs : 0;
 
+    // Phase 1-Unit BD: independent per-source render-transform arguments;
+    // both BB/BC-compatible (rotationDegrees=0, mirrorHorizontal=false) when
+    // omitted by the caller. The renderer receives the raw rotation value
+    // (matching the AZ/single-source route); normalizeRotation is used only
+    // for the diagnostic status fields below.
+    const bool mirrorHorizontalABool = (mirrorHorizontalA == JNI_TRUE);
+    const bool mirrorHorizontalBBool = (mirrorHorizontalB == JNI_TRUE);
+    const jint normalizedRotationDegreesA = static_cast<jint>(
+        vanguard::render::normalizeRotation(static_cast<uint32_t>(rotationDegreesA)));
+    const jint normalizedRotationDegreesB = static_cast<jint>(
+        vanguard::render::normalizeRotation(static_cast<uint32_t>(rotationDegreesB)));
+
     BBStatusFields status;
     status.width = width;
     status.height = height;
     status.frameCount = frameCount;
     status.frameDelayMs = effectiveFrameDelayMs;
+    status.rotationDegreesA = rotationDegreesA;
+    status.mirrorHorizontalA = mirrorHorizontalABool;
+    status.normalizedRotationDegreesA = normalizedRotationDegreesA;
+    status.rotationDegreesB = rotationDegreesB;
+    status.mirrorHorizontalB = mirrorHorizontalBBool;
+    status.normalizedRotationDegreesB = normalizedRotationDegreesB;
 
     if (surface == nullptr || bufferA == nullptr || bufferB == nullptr ||
         width <= 0 || height <= 0 || frameCount <= 0 || frameDurationUs <= 0) {
@@ -479,8 +524,13 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_runAndroid
             status.evaluation = "success";
             status.renderFrame = "success";
 
-            const vanguard::render::VideoFrameTransform transformA{};
-            const vanguard::render::VideoFrameTransform transformB{};
+            vanguard::render::VideoFrameTransform transformA{};
+            transformA.rotationDegrees = static_cast<uint32_t>(rotationDegreesA);
+            transformA.mirrorHorizontal = mirrorHorizontalABool;
+
+            vanguard::render::VideoFrameTransform transformB{};
+            transformB.rotationDegrees = static_cast<uint32_t>(rotationDegreesB);
+            transformB.mirrorHorizontal = mirrorHorizontalBBool;
 
             bool evalLoopOk = true;
             bool compositorFoundEveryFrame = true;
