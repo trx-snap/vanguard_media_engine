@@ -17,6 +17,7 @@ import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinato
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
 import com.connects.vanguard_media_engine.image.AndroidImageOptimizer
 import com.connects.vanguard_media_engine.rtc.AndroidRtcVideoCoordinator
+import com.connects.vanguard_media_engine.sidecar.AndroidReverseSidecarCoordinator
 import com.connects.vanguard_media_engine.streaming.AndroidDagStreamingPlaybackCoordinator
 import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -64,6 +65,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
     // cancelActiveExport() first, then falls back to the legacy activeEncoder
     // cancel path below.
     private var editorExportCoordinator: AndroidEditorExportCoordinator? = null
+
+    // ── Phase 5-Unit Q / Phase 7.20: reverse sidecar coordinator ──────────────
+    // Owns "prepareReverseSidecars", "getSidecarStatus", "cleanupReverseSidecars".
+    // Never emits state=ready in this slice — see AndroidReverseSidecarCoordinator.
+    private var reverseSidecarCoordinator: AndroidReverseSidecarCoordinator? = null
 
     // ── Camera session state (B2: single camera instance invariant) ───────────
     // Mirrors iOS plugin: cameraSource + renderer stored at plugin level.
@@ -133,6 +139,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             textureRegistry = binding.textureRegistry,
             channel         = channel,
             mainHandler     = mainHandler,
+        )
+        reverseSidecarCoordinator = AndroidReverseSidecarCoordinator(
+            context     = binding.applicationContext,
+            mainHandler = mainHandler,
         )
     }
 
@@ -215,6 +225,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 bridge.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android thermal state bridge unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidReverseSidecarCoordinator.ownsMethod(call.method)) {
+            val coord = reverseSidecarCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android reverse sidecar coordinator unavailable", null)
             }
             return
         }
@@ -1264,5 +1284,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         // Tear down Phase 1-Unit AX active GLES texture smoke runs and release their producers.
         glesTextureSmokeCoordinator?.disposeAll()
         glesTextureSmokeCoordinator = null
+        // Tear down Phase 5-Unit Q reverse sidecar coordinator state + executor.
+        reverseSidecarCoordinator?.disposeAll()
+        reverseSidecarCoordinator = null
     }
 }

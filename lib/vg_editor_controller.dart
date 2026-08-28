@@ -1038,6 +1038,9 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
     } on PlatformException catch (_) {
       // Best-effort — native may have no active compositor.
       return const [];
+    } on MissingPluginException catch (_) {
+      // Best-effort — native route not implemented on this platform.
+      return const [];
     }
   }
 
@@ -1073,6 +1076,11 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
         clipId: clipId,
         state: VGReverseSidecarState.idle,
       );
+    } on MissingPluginException catch (_) {
+      return VGReverseSidecarStatus(
+        clipId: clipId,
+        state: VGReverseSidecarState.idle,
+      );
     }
   }
 
@@ -1088,6 +1096,8 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
       await _channel.invokeMethod<void>('cleanupReverseSidecars');
     } on PlatformException catch (_) {
       // Best-effort.
+    } on MissingPluginException catch (_) {
+      // Best-effort — native route not implemented on this platform.
     }
   }
 

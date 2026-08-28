@@ -2038,6 +2038,29 @@ void main() {
     );
 
     test(
+      'PS-MP1 prepareReverseSidecars returns empty list on MissingPluginException',
+      () async {
+        _setMockHandler((method, args) async {
+          if (method == 'prepareReverseSidecars') {
+            throw MissingPluginException(
+              'No implementation found for method prepareReverseSidecars',
+            );
+          }
+          if (method == 'disposeTimeline') return null;
+          return null;
+        });
+
+        final result = await controller.prepareReverseSidecars();
+        expect(
+          result,
+          isEmpty,
+          reason:
+              'MissingPluginException must be swallowed and return empty list',
+        );
+      },
+    );
+
+    test(
       'PS-5  prepareReverseSidecars throws StateError after dispose',
       () async {
         controller.dispose();
@@ -2085,6 +2108,25 @@ void main() {
       expect(status.clipId, 'clip-A');
     });
 
+    test(
+      'PS-MP2 getSidecarStatus returns idle on MissingPluginException',
+      () async {
+        _setMockHandler((method, args) async {
+          if (method == 'getSidecarStatus') {
+            throw MissingPluginException(
+              'No implementation found for method getSidecarStatus',
+            );
+          }
+          if (method == 'disposeTimeline') return null;
+          return null;
+        });
+
+        final status = await controller.getSidecarStatus(clipId: 'clip-A');
+        expect(status.state, VGReverseSidecarState.idle);
+        expect(status.clipId, 'clip-A');
+      },
+    );
+
     test('PS-9  getSidecarStatus throws StateError after dispose', () async {
       controller.dispose();
       await expectLater(
@@ -2116,6 +2158,27 @@ void main() {
           controller.cleanupReverseSidecars(),
           completes,
           reason: 'PlatformException must be silently swallowed',
+        );
+      },
+    );
+
+    test(
+      'PS-MP3 cleanupReverseSidecars completes without error on MissingPluginException',
+      () async {
+        _setMockHandler((method, args) async {
+          if (method == 'cleanupReverseSidecars') {
+            throw MissingPluginException(
+              'No implementation found for method cleanupReverseSidecars',
+            );
+          }
+          if (method == 'disposeTimeline') return null;
+          return null;
+        });
+
+        await expectLater(
+          controller.cleanupReverseSidecars(),
+          completes,
+          reason: 'MissingPluginException must be silently swallowed',
         );
       },
     );
