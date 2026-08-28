@@ -92,6 +92,8 @@ export 'vg_editor_export_readiness.dart';
 export 'vg_passthrough_remux_evaluator.dart';
 // Phase 2-Unit AA: public Android passthrough remux capability client.
 export 'vg_passthrough_remux_capability_client.dart';
+// Phase 2-Unit AB: public passthrough remux decision planner.
+export 'vg_passthrough_remux_decision.dart';
 // Audio Slice M: recording result models.
 export 'vg_audio_recording_models.dart';
 // Phase 8: canvas and overlay descriptors
