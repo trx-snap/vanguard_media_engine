@@ -106,19 +106,41 @@ class AndroidPassthroughRemuxSession(private val context: Context) {
             return
         }
 
+        // Mandatory empty ROI sidecar path, derived the same way as the
+        // production exportTimeline route (AndroidTimelineRoiSidecarEmitter),
+        // so passthrough remux output carries the same output contract.
+        val roiSidecarPath = AndroidTimelineRoiSidecarEmitter.sidecarPathForVideoPath(outputPath)
+        val roiSidecarTempPath = AndroidTimelineRoiSidecarEmitter.tempPathForSidecarPath(roiSidecarPath)
+        val roiSidecarFile = File(roiSidecarPath)
+        if (roiSidecarFile.exists()) {
+            onError("OUTPUT_EXISTS", "exportPassthroughRemux: ROI sidecar already exists: $roiSidecarPath")
+            return
+        }
+
         val tempPath = "$outputPath.vgptmp"
         val tempFile = File(tempPath)
         if (tempFile.exists() && !tempFile.delete()) {
             onError("OUTPUT_UNWRITABLE", "exportPassthroughRemux: cannot clear stale temp file: $tempPath")
             return
         }
+        val roiSidecarTempFile = File(roiSidecarTempPath)
+        if (roiSidecarTempFile.exists() && !roiSidecarTempFile.delete()) {
+            onError("OUTPUT_UNWRITABLE", "exportPassthroughRemux: cannot clear stale ROI sidecar temp file: $roiSidecarTempPath")
+            return
+        }
 
-        fun deleteTemp() {
+        var sidecarFinalized = false
+
+        fun deleteOwnedTemps() {
             try { tempFile.takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
+            try { roiSidecarTempFile.takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
+            if (sidecarFinalized) {
+                try { roiSidecarFile.takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
+            }
         }
 
         if (cancelRequested) {
-            deleteTemp()
+            deleteOwnedTemps()
             onError("EXPORT_CANCELLED", "exportPassthroughRemux: cancelled before remux started")
             return
         }
@@ -139,7 +161,7 @@ class AndroidPassthroughRemuxSession(private val context: Context) {
         }
 
         if (cancelRequested) {
-            deleteTemp()
+            deleteOwnedTemps()
             onError("EXPORT_CANCELLED", "exportPassthroughRemux: cancelled before remux started")
             return
         }
@@ -152,26 +174,52 @@ class AndroidPassthroughRemuxSession(private val context: Context) {
         )
 
         if (cancelRequested) {
-            deleteTemp()
+            deleteOwnedTemps()
             onError("EXPORT_CANCELLED", "exportPassthroughRemux: cancelled")
             return
         }
 
         if (!remux.success || remux.outputSizeBytes <= 0L) {
-            deleteTemp()
+            deleteOwnedTemps()
             onError("EXPORT_FAILED", "exportPassthroughRemux: remux failed: ${remux.reason}")
             return
         }
 
-        // -- 7. Finalize: rename temp to the requested output. Re-check for a
-        // racing writer so a pre-existing outputPath is never clobbered. --
+        // -- 7. Finalize: re-check cancellation and racing writers, then stage
+        // and finalize the mandatory empty ROI sidecar before renaming the
+        // temp video to the requested output. Sidecar-first ordering: the
+        // video rename only happens after sidecar finalization succeeds, so a
+        // finalized video is never left behind without a sidecar. --
+        if (cancelRequested) {
+            deleteOwnedTemps()
+            onError("EXPORT_CANCELLED", "exportPassthroughRemux: cancelled after remux")
+            return
+        }
         if (outputFile.exists()) {
-            deleteTemp()
+            deleteOwnedTemps()
             onError("OUTPUT_EXISTS", "exportPassthroughRemux: output already exists: $outputPath")
             return
         }
+        if (roiSidecarFile.exists()) {
+            deleteOwnedTemps()
+            onError("OUTPUT_EXISTS", "exportPassthroughRemux: ROI sidecar already exists: $roiSidecarPath")
+            return
+        }
+
+        if (!AndroidTimelineRoiSidecarEmitter.stageEmptySidecar(roiSidecarTempPath)) {
+            deleteOwnedTemps()
+            onError("EXPORT_FAILED", "exportPassthroughRemux: failed to stage ROI sidecar at $roiSidecarTempPath")
+            return
+        }
+        if (!AndroidTimelineRoiSidecarEmitter.finalizeSidecar(roiSidecarTempPath, roiSidecarPath)) {
+            deleteOwnedTemps()
+            onError("EXPORT_FAILED", "exportPassthroughRemux: failed to finalize ROI sidecar at $roiSidecarPath")
+            return
+        }
+        sidecarFinalized = true
+
         if (!tempFile.renameTo(outputFile)) {
-            deleteTemp()
+            deleteOwnedTemps()
             onError("EXPORT_FAILED", "exportPassthroughRemux: failed to finalize output at $outputPath")
             return
         }
@@ -190,6 +238,8 @@ class AndroidPassthroughRemuxSession(private val context: Context) {
                 "audioSamples" to remux.audioSamples,
                 "outputSizeBytes" to remux.outputSizeBytes,
                 "hasAudioTrack" to probe.hasAudioTrack,
+                "exportRoiSidecarPath" to roiSidecarPath,
+                "roiSidecarPath" to roiSidecarPath,
                 "proofBoundary" to PROOF_BOUNDARY,
                 "nonClaims" to NON_CLAIMS,
                 "diagnosticHoldBeforeRemuxMs" to diagnosticHoldBeforeRemuxMs,

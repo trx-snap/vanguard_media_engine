@@ -12,6 +12,15 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
+String sidecarPathForVideoPath(String videoPath) {
+  final lastSeparator = videoPath.lastIndexOf('/');
+  final lastDot = videoPath.lastIndexOf('.');
+  if (lastDot <= lastSeparator) {
+    return '$videoPath.roi.json';
+  }
+  return '${videoPath.substring(0, lastDot)}.roi.json';
+}
+
 void main() {
   runApp(const AndroidPassthroughRemuxClientPhysicalSmokeApp());
 }
@@ -56,11 +65,17 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
 
     File? fixtureFile;
     File? lane1OutputFile;
+    File? lane1SidecarFile;
     File? lane2OutputFile;
-    File? lane3SentinelFile;
+    File? lane2SidecarFile;
+    File? lane3Mp4SentinelFile;
+    File? lane3SidecarSentinelFile;
+    File? lane3SidecarOutputFile;
     File? lane4EmptySourceOutputFile;
     File? lane5FirstOutputFile;
+    File? lane5FirstSidecarFile;
     File? lane5SecondOutputFile;
+    File? lane5SecondSidecarFile;
 
     var lane1Pass = false;
     var lane2Pass = false;
@@ -103,7 +118,11 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
       // -- Lane 1: Primary valid client remux ---------------------------------
       print('ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE1: START');
       final lane1OutputPath = '${tempDir.path}/${runId}_lane1_out.mp4';
+      final lane1ExpectedSidecarPath = sidecarPathForVideoPath(lane1OutputPath);
       lane1OutputFile = File(lane1OutputPath);
+      lane1SidecarFile = File(lane1ExpectedSidecarPath);
+      final lane1TempFile = File('$lane1OutputPath.vgptmp');
+      final lane1SidecarTempFile = File('$lane1ExpectedSidecarPath.vgtmp');
       try {
         final lane1Report = await client.export(
           VGPassthroughRemuxRequest(
@@ -120,6 +139,18 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
             outExists &&
             (outDiskBytes == outputSizeBytes) &&
             (outDiskBytes > 0);
+
+        final sidecarExists = await lane1SidecarFile.exists();
+        final sidecarContent = sidecarExists
+            ? await lane1SidecarFile.readAsString()
+            : '';
+        const expectedSidecarJson = '{"version":1,"rois":[]}';
+        final sidecarContentValid = sidecarContent == expectedSidecarJson;
+        final sidecarPathMatches =
+            (lane1Report.exportRoiSidecarPath == lane1ExpectedSidecarPath) &&
+            (lane1Report.roiSidecarPath == lane1ExpectedSidecarPath);
+        final sidecarTempExists = await lane1SidecarTempFile.exists();
+        final outTempExists = await lane1TempFile.exists();
 
         final successFlag = lane1Report.success;
         final pathMatch =
@@ -149,13 +180,32 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
             durationSeconds > 0 &&
             hasAudioTrack &&
             proofBoundaryMatch &&
-            nonClaimsMatch;
+            nonClaimsMatch &&
+            sidecarExists &&
+            sidecarContentValid &&
+            sidecarPathMatches &&
+            !sidecarTempExists &&
+            !outTempExists;
 
         lane1Map['computed_pass'] = lane1Pass;
         lane1Map['outDiskBytes'] = outDiskBytes;
         lane1Map['outExists'] = outExists;
+        lane1Map['sidecarExists'] = sidecarExists;
+        lane1Map['sidecarContentValid'] = sidecarContentValid;
+        lane1Map['sidecarPathMatches'] = sidecarPathMatches;
+        lane1Map['exportRoiSidecarPath'] = lane1Report.exportRoiSidecarPath;
+        lane1Map['roiSidecarPath'] = lane1Report.roiSidecarPath;
         print(
-          'ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE1: DONE (pass=$lane1Pass, videoSamples=$videoSamples, audioSamples=$audioSamples, bytes=$outDiskBytes)',
+          'ANDROID_PASSTHROUGH_REMUX_ROI_SIDECAR_UNIT_L_LANE1_SIDECAR_EXISTS: $sidecarExists',
+        );
+        print(
+          'ANDROID_PASSTHROUGH_REMUX_ROI_SIDECAR_UNIT_L_LANE1_SIDECAR_CONTENT_VALID: $sidecarContentValid',
+        );
+        print(
+          'ANDROID_PASSTHROUGH_REMUX_ROI_SIDECAR_UNIT_L_LANE1_REPORT_SIDECAR_PATH_MATCH: $sidecarPathMatches',
+        );
+        print(
+          'ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE1: DONE (pass=$lane1Pass, videoSamples=$videoSamples, audioSamples=$audioSamples, bytes=$outDiskBytes, sidecar=$sidecarExists)',
         );
       } catch (e, st) {
         print('ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE1: ERROR: $e\n$st');
@@ -168,8 +218,11 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
       final missingSourcePath =
           '${tempDir.path}/${runId}_missing_nonexistent.mov';
       final lane2OutputPath = '${tempDir.path}/${runId}_lane2_out.mp4';
+      final lane2ExpectedSidecarPath = sidecarPathForVideoPath(lane2OutputPath);
       lane2OutputFile = File(lane2OutputPath);
       final lane2TempFile = File('$lane2OutputPath.vgptmp');
+      lane2SidecarFile = File(lane2ExpectedSidecarPath);
+      final lane2SidecarTempFile = File('$lane2ExpectedSidecarPath.vgtmp');
       try {
         final lane2Report = await client.export(
           VGPassthroughRemuxRequest(
@@ -181,15 +234,27 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
 
         final outExists = await lane2OutputFile.exists();
         final tempExists = await lane2TempFile.exists();
+        final sidecarExists = await lane2SidecarFile.exists();
+        final sidecarTempExists = await lane2SidecarTempFile.exists();
         final codeMatch = lane2Report.errorCode == 'FILE_UNREADABLE';
         lane2Pass =
-            !lane2Report.success && codeMatch && !outExists && !tempExists;
+            !lane2Report.success &&
+            codeMatch &&
+            !outExists &&
+            !tempExists &&
+            !sidecarExists &&
+            !sidecarTempExists;
 
         lane2Map['computed_pass'] = lane2Pass;
         lane2Map['outExists'] = outExists;
         lane2Map['tempExists'] = tempExists;
+        lane2Map['sidecarExists'] = sidecarExists;
+        lane2Map['sidecarTempExists'] = sidecarTempExists;
         print(
-          'ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE2: DONE (pass=$lane2Pass, code=${lane2Report.errorCode}, outExists=$outExists, tempExists=$tempExists)',
+          'ANDROID_PASSTHROUGH_REMUX_ROI_SIDECAR_UNIT_L_LANE2_CLEANUP_VALID: ${!sidecarExists && !sidecarTempExists}',
+        );
+        print(
+          'ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE2: DONE (pass=$lane2Pass, code=${lane2Report.errorCode}, outExists=$outExists, tempExists=$tempExists, sidecarExists=$sidecarExists)',
         );
       } catch (e, st) {
         print('ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE2: ERROR: $e\n$st');
@@ -197,44 +262,106 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
         lane2Pass = false;
       }
 
-      // -- Lane 3: Existing output sentinel through client --------------------
+      // -- Lane 3: Existing output sentinel and existing sidecar sentinel -----
       print('ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE3: START');
-      final lane3OutputPath = '${tempDir.path}/${runId}_lane3_sentinel.mp4';
-      lane3SentinelFile = File(lane3OutputPath);
-      final lane3TempFile = File('$lane3OutputPath.vgptmp');
-      const sentinelContent =
+      final lane3Mp4OutputPath = '${tempDir.path}/${runId}_lane3_sentinel.mp4';
+      lane3Mp4SentinelFile = File(lane3Mp4OutputPath);
+      final lane3Mp4TempFile = File('$lane3Mp4OutputPath.vgptmp');
+      const sentinelMp4Content =
           'SENTINEL_PRE_EXISTING_UNIT_AE_OUTPUT_BYTES_GUARD';
-      try {
-        await lane3SentinelFile.writeAsString(sentinelContent, flush: true);
 
-        final lane3Report = await client.export(
+      final lane3SidecarOutputPath =
+          '${tempDir.path}/${runId}_lane3_sidecar_sentinel.mp4';
+      final lane3ExpectedSidecarSentinelPath = sidecarPathForVideoPath(
+        lane3SidecarOutputPath,
+      );
+      lane3SidecarSentinelFile = File(lane3ExpectedSidecarSentinelPath);
+      lane3SidecarOutputFile = File(lane3SidecarOutputPath);
+      final lane3SidecarOutputTempFile = File('$lane3SidecarOutputPath.vgptmp');
+      final lane3SidecarTempFile = File(
+        '$lane3ExpectedSidecarSentinelPath.vgtmp',
+      );
+      const sentinelSidecarContent =
+          'SENTINEL_PRE_EXISTING_UNIT_L_SIDECAR_BYTES_GUARD';
+
+      try {
+        // Part A: Pre-existing output MP4 sentinel
+        await lane3Mp4SentinelFile.writeAsString(
+          sentinelMp4Content,
+          flush: true,
+        );
+        final lane3ReportA = await client.export(
           VGPassthroughRemuxRequest(
             sourcePath: sourcePath,
-            outputPath: lane3OutputPath,
+            outputPath: lane3Mp4OutputPath,
           ),
         );
-        lane3Map = lane3Report.toMap();
 
-        final sentinelStillExists = await lane3SentinelFile.exists();
-        final currentSentinelContent = sentinelStillExists
-            ? await lane3SentinelFile.readAsString()
+        final mp4SentinelStillExists = await lane3Mp4SentinelFile.exists();
+        final currentMp4SentinelContent = mp4SentinelStillExists
+            ? await lane3Mp4SentinelFile.readAsString()
             : '';
-        final sentinelPreserved =
-            sentinelStillExists && (currentSentinelContent == sentinelContent);
-        final tempExists = await lane3TempFile.exists();
-        final codeMatch = lane3Report.errorCode == 'OUTPUT_EXISTS';
+        final mp4SentinelPreserved =
+            mp4SentinelStillExists &&
+            (currentMp4SentinelContent == sentinelMp4Content);
+        final mp4TempExists = await lane3Mp4TempFile.exists();
+        final partAPass =
+            !lane3ReportA.success &&
+            lane3ReportA.errorCode == 'OUTPUT_EXISTS' &&
+            mp4SentinelPreserved &&
+            !mp4TempExists;
 
-        lane3Pass =
-            !lane3Report.success &&
-            codeMatch &&
-            sentinelPreserved &&
-            !tempExists;
+        // Part B: Pre-existing sidecar sentinel for absent output MP4
+        await lane3SidecarSentinelFile.writeAsString(
+          sentinelSidecarContent,
+          flush: true,
+        );
+        final lane3ReportB = await client.export(
+          VGPassthroughRemuxRequest(
+            sourcePath: sourcePath,
+            outputPath: lane3SidecarOutputPath,
+          ),
+        );
 
-        lane3Map['computed_pass'] = lane3Pass;
-        lane3Map['sentinelPreserved'] = sentinelPreserved;
-        lane3Map['tempExists'] = tempExists;
+        final sidecarSentinelStillExists = await lane3SidecarSentinelFile
+            .exists();
+        final currentSidecarSentinelContent = sidecarSentinelStillExists
+            ? await lane3SidecarSentinelFile.readAsString()
+            : '';
+        final sidecarSentinelPreserved =
+            sidecarSentinelStillExists &&
+            (currentSidecarSentinelContent == sentinelSidecarContent);
+        final sidecarOutExists = await lane3SidecarOutputFile.exists();
+        final sidecarOutTempExists = await lane3SidecarOutputTempFile.exists();
+        final sidecarTempExists = await lane3SidecarTempFile.exists();
+        final partBPass =
+            !lane3ReportB.success &&
+            lane3ReportB.errorCode == 'OUTPUT_EXISTS' &&
+            sidecarSentinelPreserved &&
+            !sidecarOutExists &&
+            !sidecarOutTempExists &&
+            !sidecarTempExists;
+
+        lane3Pass = partAPass && partBPass;
+
+        lane3Map = <String, dynamic>{
+          'pass': lane3Pass,
+          'partAPass': partAPass,
+          'partBPass': partBPass,
+          'codeA': lane3ReportA.errorCode,
+          'codeB': lane3ReportB.errorCode,
+          'mp4SentinelPreserved': mp4SentinelPreserved,
+          'sidecarSentinelPreserved': sidecarSentinelPreserved,
+          'sidecarOutExists': sidecarOutExists,
+          'sidecarOutTempExists': sidecarOutTempExists,
+          'sidecarTempExists': sidecarTempExists,
+        };
+
         print(
-          'ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE3: DONE (pass=$lane3Pass, code=${lane3Report.errorCode}, sentinelPreserved=$sentinelPreserved, tempExists=$tempExists)',
+          'ANDROID_PASSTHROUGH_REMUX_ROI_SIDECAR_UNIT_L_LANE3_SIDECAR_SENTINEL_GUARD: $partBPass',
+        );
+        print(
+          'ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE3: DONE (pass=$lane3Pass, partA=$partAPass, partB=$partBPass)',
         );
       } catch (e, st) {
         print('ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE3: ERROR: $e\n$st');
@@ -300,11 +427,29 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
       print('ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE5: START');
       final lane5FirstOutputPath =
           '${tempDir.path}/${runId}_lane5_first_out.mp4';
+      final lane5FirstExpectedSidecarPath = sidecarPathForVideoPath(
+        lane5FirstOutputPath,
+      );
       final lane5SecondOutputPath =
           '${tempDir.path}/${runId}_lane5_second_out.mp4';
+      final lane5SecondExpectedSidecarPath = sidecarPathForVideoPath(
+        lane5SecondOutputPath,
+      );
+
       lane5FirstOutputFile = File(lane5FirstOutputPath);
+      lane5FirstSidecarFile = File(lane5FirstExpectedSidecarPath);
+      final lane5FirstTempFile = File('$lane5FirstOutputPath.vgptmp');
+      final lane5FirstTempSidecarFile = File(
+        '$lane5FirstExpectedSidecarPath.vgtmp',
+      );
+
       lane5SecondOutputFile = File(lane5SecondOutputPath);
+      lane5SecondSidecarFile = File(lane5SecondExpectedSidecarPath);
       final lane5SecondTempFile = File('$lane5SecondOutputPath.vgptmp');
+      final lane5SecondTempSidecarFile = File(
+        '$lane5SecondExpectedSidecarPath.vgtmp',
+      );
+
       try {
         final firstFuture = client.export(
           VGPassthroughRemuxRequest(
@@ -330,31 +475,71 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
         final firstOutBytes = firstOutExists
             ? await lane5FirstOutputFile.length()
             : 0;
+        final firstSidecarExists = await lane5FirstSidecarFile.exists();
+        final firstSidecarContent = firstSidecarExists
+            ? await lane5FirstSidecarFile.readAsString()
+            : '';
+        const expectedSidecarJson = '{"version":1,"rois":[]}';
+        final firstSidecarValid = firstSidecarContent == expectedSidecarJson;
+        final firstSidecarPathMatch =
+            (firstReport.exportRoiSidecarPath ==
+                lane5FirstExpectedSidecarPath) &&
+            (firstReport.roiSidecarPath == lane5FirstExpectedSidecarPath);
+        final firstTempExists = await lane5FirstTempFile.exists();
+        final firstTempSidecarExists = await lane5FirstTempSidecarFile.exists();
+
         final secondCodeMatch = secondReport.errorCode == 'EXPORT_IN_PROGRESS';
         final secondSuccessFalse = !secondReport.success;
         final secondOutExists = await lane5SecondOutputFile.exists();
         final secondTempExists = await lane5SecondTempFile.exists();
+        final secondSidecarExists = await lane5SecondSidecarFile.exists();
+        final secondTempSidecarExists = await lane5SecondTempSidecarFile
+            .exists();
 
-        lane5Pass =
-            secondCodeMatch &&
-            secondSuccessFalse &&
+        final firstPass =
             firstSuccess &&
             firstOutExists &&
             firstOutBytes > 0 &&
+            firstSidecarExists &&
+            firstSidecarValid &&
+            firstSidecarPathMatch &&
+            !firstTempExists &&
+            !firstTempSidecarExists;
+
+        final secondPass =
+            secondCodeMatch &&
+            secondSuccessFalse &&
             !secondOutExists &&
-            !secondTempExists;
+            !secondTempExists &&
+            !secondSidecarExists &&
+            !secondTempSidecarExists;
+
+        lane5Pass = firstPass && secondPass;
 
         lane5Map = <String, dynamic>{
           'pass': lane5Pass,
+          'firstPass': firstPass,
+          'secondPass': secondPass,
           'secondErrorCode': secondReport.errorCode,
           'firstSuccess': firstSuccess,
           'firstOutExists': firstOutExists,
           'firstOutBytes': firstOutBytes,
+          'firstSidecarExists': firstSidecarExists,
+          'firstSidecarValid': firstSidecarValid,
+          'firstSidecarPathMatch': firstSidecarPathMatch,
           'secondOutExists': secondOutExists,
           'secondTempExists': secondTempExists,
+          'secondSidecarExists': secondSidecarExists,
+          'secondTempSidecarExists': secondTempSidecarExists,
         };
         print(
-          'ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE5: DONE (pass=$lane5Pass, secondCode=${secondReport.errorCode}, firstSuccess=$firstSuccess, firstBytes=$firstOutBytes)',
+          'ANDROID_PASSTHROUGH_REMUX_ROI_SIDECAR_UNIT_L_LANE5_FIRST_SIDECAR_VALID: $firstSidecarValid',
+        );
+        print(
+          'ANDROID_PASSTHROUGH_REMUX_ROI_SIDECAR_UNIT_L_LANE5_SECOND_CLEANUP_VALID: ${!secondSidecarExists && !secondTempSidecarExists}',
+        );
+        print(
+          'ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE5: DONE (pass=$lane5Pass, secondCode=${secondReport.errorCode}, firstSuccess=$firstSuccess, firstBytes=$firstOutBytes, firstSidecar=$firstSidecarExists)',
         );
       } catch (e, st) {
         print('ANDROID_PASSTHROUGH_REMUX_CLIENT_UNIT_AE_LANE5: ERROR: $e\n$st');
@@ -409,20 +594,37 @@ class _AndroidPassthroughRemuxClientPhysicalSmokeAppState
       for (final f in [
         fixtureFile,
         lane1OutputFile,
+        lane1SidecarFile,
         lane2OutputFile,
-        lane3SentinelFile,
+        lane2SidecarFile,
+        lane3Mp4SentinelFile,
+        lane3SidecarSentinelFile,
+        lane3SidecarOutputFile,
         lane4EmptySourceOutputFile,
         lane5FirstOutputFile,
+        lane5FirstSidecarFile,
         lane5SecondOutputFile,
+        lane5SecondSidecarFile,
         if (lane1OutputFile != null) File('${lane1OutputFile.path}.vgptmp'),
+        if (lane1SidecarFile != null) File('${lane1SidecarFile.path}.vgtmp'),
         if (lane2OutputFile != null) File('${lane2OutputFile.path}.vgptmp'),
-        if (lane3SentinelFile != null) File('${lane3SentinelFile.path}.vgptmp'),
+        if (lane2SidecarFile != null) File('${lane2SidecarFile.path}.vgtmp'),
+        if (lane3Mp4SentinelFile != null)
+          File('${lane3Mp4SentinelFile.path}.vgptmp'),
+        if (lane3SidecarSentinelFile != null)
+          File('${lane3SidecarSentinelFile.path}.vgtmp'),
+        if (lane3SidecarOutputFile != null)
+          File('${lane3SidecarOutputFile.path}.vgptmp'),
         if (lane4EmptySourceOutputFile != null)
           File('${lane4EmptySourceOutputFile.path}.vgptmp'),
         if (lane5FirstOutputFile != null)
           File('${lane5FirstOutputFile.path}.vgptmp'),
+        if (lane5FirstSidecarFile != null)
+          File('${lane5FirstSidecarFile.path}.vgtmp'),
         if (lane5SecondOutputFile != null)
           File('${lane5SecondOutputFile.path}.vgptmp'),
+        if (lane5SecondSidecarFile != null)
+          File('${lane5SecondSidecarFile.path}.vgtmp'),
       ]) {
         if (f != null) {
           try {

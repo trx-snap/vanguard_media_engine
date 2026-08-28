@@ -135,6 +135,8 @@ void main() {
           'audioSamples': 160,
           'outputSizeBytes': 1048576,
           'hasAudioTrack': true,
+          'exportRoiSidecarPath': '/data/user/0/cache/output.roi.json',
+          'roiSidecarPath': '/data/user/0/cache/output.roi.json',
           'proofBoundary':
               'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
           'nonClaims': <Object?, Object?>{
@@ -162,6 +164,14 @@ void main() {
         expect(report.audioSamples, equals(160));
         expect(report.outputSizeBytes, equals(1048576));
         expect(report.hasAudioTrack, isTrue);
+        expect(
+          report.exportRoiSidecarPath,
+          equals('/data/user/0/cache/output.roi.json'),
+        );
+        expect(
+          report.roiSidecarPath,
+          equals('/data/user/0/cache/output.roi.json'),
+        );
         expect(
           report.proofBoundary,
           equals(
@@ -196,6 +206,14 @@ void main() {
         expect(roundTrip['outputSizeBytes'], equals(1048576));
         expect(roundTrip['hasAudioTrack'], isTrue);
         expect(
+          roundTrip['exportRoiSidecarPath'],
+          equals('/data/user/0/cache/output.roi.json'),
+        );
+        expect(
+          roundTrip['roiSidecarPath'],
+          equals('/data/user/0/cache/output.roi.json'),
+        );
+        expect(
           roundTrip['proofBoundary'],
           equals(
             'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
@@ -204,6 +222,63 @@ void main() {
         expect(roundTrip['diagnosticHoldBeforeRemuxMs'], equals(250));
         expect(roundTrip['nonClaims'], isA<Map<String, bool>>());
         expect(report.toString(), contains('success: true'));
+      },
+    );
+
+    test(
+      'fromMap parses exportRoiSidecarPath, roiSidecarPath alias getter returns same path, and toMap includes both keys',
+      () {
+        const sidecar = '/data/user/0/cache/custom_roi.json';
+        final rawMap = <Object?, Object?>{
+          'success': true,
+          'outputPath': '/data/user/0/cache/video.mp4',
+          'exportRoiSidecarPath': sidecar,
+          'roiSidecarPath': sidecar,
+          'proofBoundary':
+              'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+          'nonClaims': <Object?, Object?>{
+            'mediaCodecAllocated': false,
+            'productionExportTimelineBypass': false,
+            'cppPassthroughRemuxSinkNode': false,
+            'connectAppTouched': false,
+          },
+        };
+
+        final report = VGPassthroughRemuxExecutionReport.fromMap(rawMap);
+        expect(report.exportRoiSidecarPath, equals(sidecar));
+        expect(report.roiSidecarPath, equals(sidecar));
+
+        final map = report.toMap();
+        expect(map['exportRoiSidecarPath'], equals(sidecar));
+        expect(map['roiSidecarPath'], equals(sidecar));
+      },
+    );
+
+    test(
+      'fromMap backward compatibility: when map only contains roiSidecarPath, exportRoiSidecarPath and alias are populated',
+      () {
+        const sidecar = '/data/user/0/cache/legacy_roi.json';
+        final rawMap = <Object?, Object?>{
+          'success': true,
+          'outputPath': '/data/user/0/cache/video.mp4',
+          'roiSidecarPath': sidecar,
+          'proofBoundary':
+              'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+          'nonClaims': <Object?, Object?>{
+            'mediaCodecAllocated': false,
+            'productionExportTimelineBypass': false,
+            'cppPassthroughRemuxSinkNode': false,
+            'connectAppTouched': false,
+          },
+        };
+
+        final report = VGPassthroughRemuxExecutionReport.fromMap(rawMap);
+        expect(report.exportRoiSidecarPath, equals(sidecar));
+        expect(report.roiSidecarPath, equals(sidecar));
+
+        final map = report.toMap();
+        expect(map['exportRoiSidecarPath'], equals(sidecar));
+        expect(map['roiSidecarPath'], equals(sidecar));
       },
     );
 
@@ -348,6 +423,25 @@ void main() {
       expect(report.diagnosticNonClaimsHold, isTrue);
       expect(report.diagnostics['errorCode'], equals('unsupported_platform'));
     });
+
+    test('failure() and unsupported() omit sidecar fields from toMap()', () {
+      final failureReport = VGPassthroughRemuxExecutionReport.failure(
+        'OUTPUT_EXISTS',
+        'Output exists',
+      );
+      final failureMap = failureReport.toMap();
+      expect(failureReport.exportRoiSidecarPath, isNull);
+      expect(failureReport.roiSidecarPath, isNull);
+      expect(failureMap.containsKey('exportRoiSidecarPath'), isFalse);
+      expect(failureMap.containsKey('roiSidecarPath'), isFalse);
+
+      final unsupportedReport = VGPassthroughRemuxExecutionReport.unsupported();
+      final unsupportedMap = unsupportedReport.toMap();
+      expect(unsupportedReport.exportRoiSidecarPath, isNull);
+      expect(unsupportedReport.roiSidecarPath, isNull);
+      expect(unsupportedMap.containsKey('exportRoiSidecarPath'), isFalse);
+      expect(unsupportedMap.containsKey('roiSidecarPath'), isFalse);
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -374,6 +468,8 @@ void main() {
               'audioSamples': 230,
               'outputSizeBytes': 2048576,
               'hasAudioTrack': true,
+              'exportRoiSidecarPath': '/storage/output.roi.json',
+              'roiSidecarPath': '/storage/output.roi.json',
               'proofBoundary':
                   'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
               'nonClaims': <Object?, Object?>{
@@ -413,10 +509,56 @@ void main() {
         expect(report.sourcePath, equals('/storage/input.mov'));
         expect(report.videoSamples, equals(150));
         expect(report.audioSamples, equals(230));
+        expect(report.exportRoiSidecarPath, equals('/storage/output.roi.json'));
+        expect(report.roiSidecarPath, equals('/storage/output.roi.json'));
         expect(report.outputWritten, isTrue);
         expect(report.proofBoundaryMatches, isTrue);
         expect(report.diagnosticNonClaimsHold, isTrue);
         expect(report.diagnosticHoldBeforeRemuxMs, equals(1200));
+      },
+    );
+
+    test(
+      'VGPassthroughRemuxClient.export method-channel mock with success sidecar fields returns a report with matching sidecar fields',
+      () async {
+        const expectedSidecar = '/data/user/0/cache/lane1.roi.json';
+        binaryMessenger.setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'exportPassthroughRemux') {
+            return <Object?, Object?>{
+              'success': true,
+              'path': call.arguments['outputPath'],
+              'outputPath': call.arguments['outputPath'],
+              'sourcePath': call.arguments['sourcePath'],
+              'outputSizeBytes': 1024,
+              'exportRoiSidecarPath': expectedSidecar,
+              'roiSidecarPath': expectedSidecar,
+              'proofBoundary':
+                  'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+              'nonClaims': <Object?, Object?>{
+                'mediaCodecAllocated': false,
+                'productionExportTimelineBypass': false,
+                'cppPassthroughRemuxSinkNode': false,
+                'connectAppTouched': false,
+              },
+            };
+          }
+          return null;
+        });
+
+        final client = VGPassthroughRemuxClient(channel: channel);
+        final report = await client.export(
+          const VGPassthroughRemuxRequest(
+            sourcePath: '/data/user/0/cache/input.mov',
+            outputPath: '/data/user/0/cache/lane1.mp4',
+          ),
+        );
+
+        expect(report.success, isTrue);
+        expect(report.exportRoiSidecarPath, equals(expectedSidecar));
+        expect(report.roiSidecarPath, equals(expectedSidecar));
+        final map = report.toMap();
+        expect(map['exportRoiSidecarPath'], equals(expectedSidecar));
+        expect(map['roiSidecarPath'], equals(expectedSidecar));
       },
     );
 

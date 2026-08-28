@@ -84,7 +84,9 @@ class _AndroidAdmissionExportClientPhysicalSmokeAppState
 
     File? fixtureFile;
     File? lane1OutputFile;
+    File? lane1SidecarFile;
     File? lane2OutputFile;
+    File? lane2SidecarFile;
     File? lane4RenderOutputFile;
     File? lane4ReportedSidecarFile;
     File? lane4ExpectedSidecarFile;
@@ -128,7 +130,11 @@ class _AndroidAdmissionExportClientPhysicalSmokeAppState
       // -- Lane 1: Default client with single valid clip + outputPath --------
       print('ANDROID_ADMISSION_EXPORT_CLIENT_UNIT_AF_LANE1: START');
       final lane1OutputPath = '${tempDir.path}/${runId}_lane1_out.mp4';
+      final lane1ExpectedSidecarPath = sidecarPathForVideoPath(lane1OutputPath);
       lane1OutputFile = File(lane1OutputPath);
+      lane1SidecarFile = File(lane1ExpectedSidecarPath);
+      final lane1TempFile = File('$lane1OutputPath.vgptmp');
+      final lane1SidecarTempFile = File('$lane1ExpectedSidecarPath.vgtmp');
       try {
         final lane1Draft = VGEditorDraft(
           id: 'draft-lane-1',
@@ -152,6 +158,20 @@ class _AndroidAdmissionExportClientPhysicalSmokeAppState
             outExists &&
             (outDiskBytes == passthroughOutputBytes) &&
             (outDiskBytes > 0);
+
+        final sidecarExists = await lane1SidecarFile.exists();
+        final sidecarContent = sidecarExists
+            ? await lane1SidecarFile.readAsString()
+            : '';
+        const expectedSidecarJson = '{"version":1,"rois":[]}';
+        final sidecarContentValid = sidecarContent == expectedSidecarJson;
+        final sidecarPathMatch =
+            passthroughReport != null &&
+            (passthroughReport.exportRoiSidecarPath ==
+                lane1ExpectedSidecarPath) &&
+            (passthroughReport.roiSidecarPath == lane1ExpectedSidecarPath);
+        final sidecarTempExists = await lane1SidecarTempFile.exists();
+        final outTempExists = await lane1TempFile.exists();
 
         final successFlag = lane1Report.success;
         final isPassthrough = lane1Report.isPassthrough;
@@ -178,13 +198,33 @@ class _AndroidAdmissionExportClientPhysicalSmokeAppState
             passthroughSuccess &&
             passthroughProofMatch &&
             passthroughNonClaimsHold &&
-            afProofBoundaryMatch;
+            afProofBoundaryMatch &&
+            sidecarExists &&
+            sidecarContentValid &&
+            sidecarPathMatch &&
+            !sidecarTempExists &&
+            !outTempExists;
 
         lane1Map['computed_pass'] = lane1Pass;
         lane1Map['outDiskBytes'] = outDiskBytes;
         lane1Map['outExists'] = outExists;
+        lane1Map['sidecarExists'] = sidecarExists;
+        lane1Map['sidecarContentValid'] = sidecarContentValid;
+        lane1Map['sidecarPathMatch'] = sidecarPathMatch;
+        lane1Map['exportRoiSidecarPath'] =
+            passthroughReport?.exportRoiSidecarPath;
+        lane1Map['roiSidecarPath'] = passthroughReport?.roiSidecarPath;
         print(
-          'ANDROID_ADMISSION_EXPORT_CLIENT_UNIT_AF_LANE1: DONE (pass=$lane1Pass, route=${lane1Report.routeMode.name}, bytes=$outDiskBytes)',
+          'ANDROID_PASSTHROUGH_REMUX_ROI_SIDECAR_UNIT_L_LANE1_SIDECAR_EXISTS: $sidecarExists',
+        );
+        print(
+          'ANDROID_PASSTHROUGH_REMUX_ROI_SIDECAR_UNIT_L_LANE1_SIDECAR_CONTENT_VALID: $sidecarContentValid',
+        );
+        print(
+          'ANDROID_PASSTHROUGH_REMUX_ROI_SIDECAR_UNIT_L_LANE1_REPORT_SIDECAR_PATH_MATCH: $sidecarPathMatch',
+        );
+        print(
+          'ANDROID_ADMISSION_EXPORT_CLIENT_UNIT_AF_LANE1: DONE (pass=$lane1Pass, route=${lane1Report.routeMode.name}, bytes=$outDiskBytes, sidecar=$sidecarExists)',
         );
       } catch (e, st) {
         print('ANDROID_ADMISSION_EXPORT_CLIENT_UNIT_AF_LANE1: ERROR: $e\n$st');
@@ -197,8 +237,11 @@ class _AndroidAdmissionExportClientPhysicalSmokeAppState
       final missingSourcePath =
           '${tempDir.path}/${runId}_missing_nonexistent.mov';
       final lane2OutputPath = '${tempDir.path}/${runId}_lane2_out.mp4';
+      final lane2ExpectedSidecarPath = sidecarPathForVideoPath(lane2OutputPath);
       lane2OutputFile = File(lane2OutputPath);
       final lane2TempFile = File('$lane2OutputPath.vgptmp');
+      lane2SidecarFile = File(lane2ExpectedSidecarPath);
+      final lane2SidecarTempFile = File('$lane2ExpectedSidecarPath.vgtmp');
       try {
         final lane2Draft = VGEditorDraft(
           id: 'draft-lane-2',
@@ -216,6 +259,8 @@ class _AndroidAdmissionExportClientPhysicalSmokeAppState
 
         final outExists = await lane2OutputFile.exists();
         final tempExists = await lane2TempFile.exists();
+        final sidecarExists = await lane2SidecarFile.exists();
+        final sidecarTempExists = await lane2SidecarTempFile.exists();
         final isBlocked = lane2Report.isBlocked;
         final routeBlocked =
             lane2Report.routeMode == VGEditorExportRouteMode.blocked;
@@ -230,11 +275,18 @@ class _AndroidAdmissionExportClientPhysicalSmokeAppState
             routeBlocked &&
             reasonMatch &&
             !outExists &&
-            !tempExists;
+            !tempExists &&
+            !sidecarExists &&
+            !sidecarTempExists;
 
         lane2Map['computed_pass'] = lane2Pass;
         lane2Map['outExists'] = outExists;
         lane2Map['tempExists'] = tempExists;
+        lane2Map['sidecarExists'] = sidecarExists;
+        lane2Map['sidecarTempExists'] = sidecarTempExists;
+        print(
+          'ANDROID_PASSTHROUGH_REMUX_ROI_SIDECAR_UNIT_L_LANE2_CLEANUP_VALID: ${!sidecarExists && !sidecarTempExists}',
+        );
         print(
           'ANDROID_ADMISSION_EXPORT_CLIENT_UNIT_AF_LANE2: DONE (pass=$lane2Pass, route=${lane2Report.routeMode.name}, reason=${lane2Report.reason})',
         );
@@ -428,14 +480,22 @@ class _AndroidAdmissionExportClientPhysicalSmokeAppState
       for (final f in [
         fixtureFile,
         lane1OutputFile,
+        lane1SidecarFile,
         lane2OutputFile,
+        lane2SidecarFile,
         lane4RenderOutputFile,
         lane4ReportedSidecarFile,
         lane4ExpectedSidecarFile,
         if (lane1OutputFile != null) File('${lane1OutputFile.path}.vgptmp'),
+        if (lane1SidecarFile != null) File('${lane1SidecarFile.path}.vgtmp'),
         if (lane2OutputFile != null) File('${lane2OutputFile.path}.vgptmp'),
+        if (lane2SidecarFile != null) File('${lane2SidecarFile.path}.vgtmp'),
         if (lane4RenderOutputFile != null)
           File('${lane4RenderOutputFile.path}.vgptmp'),
+        if (lane4ReportedSidecarFile != null)
+          File('${lane4ReportedSidecarFile.path}.vgtmp'),
+        if (lane4ExpectedSidecarFile != null)
+          File('${lane4ExpectedSidecarFile.path}.vgtmp'),
       ]) {
         if (f != null) {
           try {

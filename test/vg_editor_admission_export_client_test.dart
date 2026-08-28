@@ -64,6 +64,7 @@ VGPassthroughRemuxExecutionReport _makePassthroughReport({
   bool success = true,
   String sourcePath = '/data/user/0/cache/input.mov',
   String outputPath = '/data/user/0/cache/output.mp4',
+  String? exportRoiSidecarPath,
   int outputSizeBytes = 1048576,
   String proofBoundary =
       'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
@@ -85,6 +86,7 @@ VGPassthroughRemuxExecutionReport _makePassthroughReport({
     audioSamples: 440,
     outputSizeBytes: outputSizeBytes,
     hasAudioTrack: true,
+    exportRoiSidecarPath: exportRoiSidecarPath,
     proofBoundary: proofBoundary,
     nonClaims:
         nonClaims ??
@@ -705,6 +707,66 @@ void main() {
           report.proofBoundary,
           equals(VGEditorAdmissionExportReport.expectedProofBoundary),
         );
+      },
+    );
+
+    test(
+      'passthrough success report containing exportRoiSidecarPath is preserved inside passthroughReport and nested toMap',
+      () async {
+        const sidecarPath = '/data/user/0/cache/output.roi.json';
+        final admissionReport = _makeAdmissionReport(
+          routeMode: VGEditorExportRouteMode.passthroughRemux,
+          reason: 'passthrough_ready',
+          passthroughDecisionAttempted: true,
+        );
+
+        final expectedPassthroughReport = _makePassthroughReport(
+          sourcePath: '/data/user/0/cache/input.mov',
+          outputPath: '/data/user/0/cache/output.mp4',
+          exportRoiSidecarPath: sidecarPath,
+        );
+
+        final client = VGEditorAdmissionExportClient(
+          admissionProbe:
+              ({
+                required draft,
+                request = const VGEditorExportRequest(),
+              }) async {
+                return admissionReport;
+              },
+          passthroughExecutor: (request) async {
+            return expectedPassthroughReport;
+          },
+        );
+
+        final draft = _makeDraft(
+          clips: [_makeClip(sourcePath: '/data/user/0/cache/input.mov')],
+        );
+
+        final report = await client.export(
+          draft: draft,
+          request: const VGEditorExportRequest(
+            outputPath: '/data/user/0/cache/output.mp4',
+          ),
+        );
+
+        expect(report.success, isTrue);
+        expect(report.passthroughReport, isNotNull);
+        expect(
+          report.passthroughReport!.exportRoiSidecarPath,
+          equals(sidecarPath),
+        );
+        expect(report.passthroughReport!.roiSidecarPath, equals(sidecarPath));
+
+        final map = report.toMap();
+        expect(map['passthroughReport'], isA<Map<String, Object?>>());
+        final nestedPassthroughMap =
+            map['passthroughReport'] as Map<String, Object?>;
+        expect(
+          nestedPassthroughMap['exportRoiSidecarPath'],
+          equals(sidecarPath),
+        );
+        expect(nestedPassthroughMap['roiSidecarPath'], equals(sidecarPath));
       },
     );
   });

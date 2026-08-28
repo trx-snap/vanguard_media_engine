@@ -134,6 +134,14 @@ class VGPassthroughRemuxExecutionReport {
   /// Whether the source media contained an audio track.
   final bool? hasAudioTrack;
 
+  /// Local filesystem path of the mandatory empty ROI sidecar JSON file
+  /// written alongside the remuxed output, matching the production
+  /// `exportTimeline` output contract.
+  final String? exportRoiSidecarPath;
+
+  /// Alias for [exportRoiSidecarPath].
+  String? get roiSidecarPath => exportRoiSidecarPath;
+
   /// Proof boundary token returned by the native execution session.
   final String proofBoundary;
 
@@ -169,6 +177,7 @@ class VGPassthroughRemuxExecutionReport {
     this.audioSamples,
     this.outputSizeBytes,
     this.hasAudioTrack,
+    this.exportRoiSidecarPath,
     required this.proofBoundary,
     required this.nonClaims,
     this.diagnosticHoldBeforeRemuxMs,
@@ -207,6 +216,9 @@ class VGPassthroughRemuxExecutionReport {
       audioSamples: _asInt(stringMap['audioSamples']),
       outputSizeBytes: _asInt(stringMap['outputSizeBytes']),
       hasAudioTrack: _asNullableBool(stringMap['hasAudioTrack']),
+      exportRoiSidecarPath:
+          _asNullableString(stringMap['exportRoiSidecarPath']) ??
+          _asNullableString(stringMap['roiSidecarPath']),
       proofBoundary: _asString(stringMap['proofBoundary']),
       nonClaims: Map<String, bool>.unmodifiable(nonClaims),
       diagnosticHoldBeforeRemuxMs: _asInt(
@@ -299,6 +311,9 @@ class VGPassthroughRemuxExecutionReport {
     if (audioSamples != null) 'audioSamples': audioSamples,
     if (outputSizeBytes != null) 'outputSizeBytes': outputSizeBytes,
     if (hasAudioTrack != null) 'hasAudioTrack': hasAudioTrack,
+    if (exportRoiSidecarPath != null)
+      'exportRoiSidecarPath': exportRoiSidecarPath,
+    if (roiSidecarPath != null) 'roiSidecarPath': roiSidecarPath,
     'proofBoundary': proofBoundary,
     'nonClaims': nonClaims,
     if (diagnosticHoldBeforeRemuxMs != null)
@@ -310,7 +325,7 @@ class VGPassthroughRemuxExecutionReport {
 
   @override
   String toString() =>
-      'VGPassthroughRemuxExecutionReport(success: $success, outputPath: $outputPath, sourcePath: $sourcePath, errorCode: $errorCode, errorMessage: $errorMessage, proofBoundary: $proofBoundary)';
+      'VGPassthroughRemuxExecutionReport(success: $success, outputPath: $outputPath, sourcePath: $sourcePath, exportRoiSidecarPath: $exportRoiSidecarPath, errorCode: $errorCode, errorMessage: $errorMessage, proofBoundary: $proofBoundary)';
 }
 
 // -----------------------------------------------------------------------------
