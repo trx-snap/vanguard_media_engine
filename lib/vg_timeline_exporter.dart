@@ -22,10 +22,14 @@
 //   - Progress values are clamped to [0.0, 1.0] by the dispatcher.
 //
 // Export concurrency note:
-//   exportTimeline has no native single-export guard. Concurrent exports
-//   may both execute. The most recent export subscription receives shared
-//   onExportProgress events. Older export Futures complete via their own
-//   result() callbacks regardless.
+//   On Android, exportTimeline and exportPassthroughRemux share a single
+//   native export lock (AndroidEditorExportCoordinator): a concurrent second
+//   call is rejected with EXPORT_IN_PROGRESS rather than running in parallel.
+//   Export progress listeners are a LIFO stack in VanguardChannelDispatcher,
+//   not a single slot: this exporter's [onProgress] registration temporarily
+//   takes over onExportProgress delivery, and its own unregister (in the
+//   finally block below) restores whichever listener -- e.g. a
+//   VanguardEngine.onExportProgress consumer -- was registered before it.
 
 import 'package:flutter/services.dart';
 
@@ -54,9 +58,12 @@ import 'vg_editor_export_result.dart';
 /// **Cancellation:** The native compositor is not cancellable once started.
 /// Post-export output cleanup is the caller's responsibility.
 ///
-/// **Concurrency:** [exportTimeline] has no native single-export guard.
-/// Concurrent calls may both execute natively. The most recent progress
-/// registration receives shared progress events; older Futures still complete.
+/// **Concurrency:** On Android, [exportTimeline] shares a single native
+/// export lock with `exportPassthroughRemux`; a concurrent second call is
+/// rejected with EXPORT_IN_PROGRESS rather than running in parallel. Export
+/// progress listeners are a LIFO stack: this call's [onProgress] temporarily
+/// takes over delivery and restores the previous listener (if any) on its
+/// own unregister.
 ///
 /// ```dart
 /// final exportDraft =

@@ -35,10 +35,10 @@ Future<void> _invokeNative(String method, [dynamic arguments]) async {
   final data = codec.encodeMethodCall(MethodCall(method, arguments));
   await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
       .handlePlatformMessage(
-    'vanguard_media_engine',
-    data,
-    (ByteData? reply) {},
-  );
+        'vanguard_media_engine',
+        data,
+        (ByteData? reply) {},
+      );
 }
 
 void main() {
@@ -71,7 +71,7 @@ void main() {
       expect(dispatcher.isHandlerRegistered, isFalse);
       final sub = dispatcher.registerTimelineListener(
         textureId: 1,
-        onFrame: (_) {},
+        onFrame: (pts, gen) {},
         onEOS: () {},
       );
       expect(dispatcher.isHandlerRegistered, isTrue);
@@ -89,11 +89,15 @@ void main() {
 
       final sub = dispatcher.registerTimelineListener(
         textureId: tid,
-        onFrame: (pts) => receivedPts = pts,
+        onFrame: (pts, gen) => receivedPts = pts,
         onEOS: () => eosReceived = true,
       );
 
-      await _invokeNative('onTimelineFrame', {'textureId': tid, 'pts': 1.5, 'generation': 1});
+      await _invokeNative('onTimelineFrame', {
+        'textureId': tid,
+        'pts': 1.5,
+        'generation': 1,
+      });
       expect(receivedPts, closeTo(1.5, 0.001));
       expect(eosReceived, isFalse);
 
@@ -106,7 +110,7 @@ void main() {
 
       final sub = dispatcher.registerTimelineListener(
         textureId: tid,
-        onFrame: (_) {},
+        onFrame: (pts, gen) {},
         onEOS: () => eosReceived = true,
       );
 
@@ -138,16 +142,20 @@ void main() {
 
       final sub1 = dispatcher.registerTimelineListener(
         textureId: 1,
-        onFrame: (pts) => pts1 = pts,
+        onFrame: (pts, gen) => pts1 = pts,
         onEOS: () {},
       );
       final sub2 = dispatcher.registerTimelineListener(
         textureId: 2,
-        onFrame: (pts) => pts2 = pts,
+        onFrame: (pts, gen) => pts2 = pts,
         onEOS: () {},
       );
 
-      await _invokeNative('onTimelineFrame', {'textureId': 1, 'pts': 3.0, 'generation': 0});
+      await _invokeNative('onTimelineFrame', {
+        'textureId': 1,
+        'pts': 3.0,
+        'generation': 0,
+      });
       expect(pts1, closeTo(3.0, 0.001));
       expect(pts2, isNull); // tid=2 must NOT fire
 
@@ -165,21 +173,25 @@ void main() {
 
       final oldSub = dispatcher.registerTimelineListener(
         textureId: tid,
-        onFrame: (_) => callCount++,
+        onFrame: (pts, gen) => callCount++,
         onEOS: () {},
       );
 
       // Replace with a new subscription.
       final newSub = dispatcher.registerTimelineListener(
         textureId: tid,
-        onFrame: (_) => callCount += 10,
+        onFrame: (pts, gen) => callCount += 10,
         onEOS: () {},
       );
 
       // Unregister old token — must NOT remove the new subscription.
       dispatcher.unregisterTimelineListener(oldSub);
 
-      await _invokeNative('onTimelineFrame', {'textureId': tid, 'pts': 0.5, 'generation': 0});
+      await _invokeNative('onTimelineFrame', {
+        'textureId': tid,
+        'pts': 0.5,
+        'generation': 0,
+      });
       expect(callCount, 10); // new callback fired, old one is gone
 
       dispatcher.unregisterTimelineListener(newSub);
@@ -200,14 +212,16 @@ void main() {
 
   // ── DISP-8 ──────────────────────────────────────────────────────────────────
 
-  group('DISP-8: export stale token is no-op', () {
+  group('DISP-8: export progress listener stack behavior', () {
     test('old export token does not unregister newer subscription', () async {
       double? received;
 
       final old = dispatcher.registerExportListener((_) {});
       final fresh = dispatcher.registerExportListener((p) => received = p);
 
-      dispatcher.unregisterExportListener(old); // stale — must be no-op
+      dispatcher.unregisterExportListener(
+        old,
+      ); // stale/older unregister — must not remove newer
 
       await _invokeNative('onExportProgress', 0.5);
       expect(received, closeTo(0.5, 0.001));
@@ -215,10 +229,52 @@ void main() {
       dispatcher.unregisterExportListener(fresh);
     });
 
-    test('after unregister no more callbacks fire', () async {
+    test('newest listener receives events', () async {
+      final eventsOld = <double>[];
+      final eventsNew = <double>[];
+
+      final old = dispatcher.registerExportListener((p) => eventsOld.add(p));
+      final fresh = dispatcher.registerExportListener((p) => eventsNew.add(p));
+
+      await _invokeNative('onExportProgress', 0.3);
+
+      expect(eventsOld, isEmpty);
+      expect(eventsNew, [closeTo(0.3, 0.001)]);
+
+      dispatcher.unregisterExportListener(fresh);
+      dispatcher.unregisterExportListener(old);
+    });
+
+    test('unregistering newest restores older listener', () async {
+      final eventsOld = <double>[];
+      final eventsNew = <double>[];
+
+      final old = dispatcher.registerExportListener((p) => eventsOld.add(p));
+      final fresh = dispatcher.registerExportListener((p) => eventsNew.add(p));
+
+      await _invokeNative('onExportProgress', 0.2);
+      expect(eventsNew, [closeTo(0.2, 0.001)]);
+      expect(eventsOld, isEmpty);
+
+      // Unregister newest listener — older listener must be restored to top.
+      dispatcher.unregisterExportListener(fresh);
+
+      await _invokeNative('onExportProgress', 0.7);
+      expect(eventsOld, [closeTo(0.7, 0.001)]);
+      expect(eventsNew.length, 1); // No new events for unregistered fresh
+
+      dispatcher.unregisterExportListener(old);
+    });
+
+    test('final unregister clears the slot', () async {
+      expect(dispatcher.hasExportListenerForTesting, isFalse);
+
       double? received;
       final sub = dispatcher.registerExportListener((p) => received = p);
+      expect(dispatcher.hasExportListenerForTesting, isTrue);
+
       dispatcher.unregisterExportListener(sub);
+      expect(dispatcher.hasExportListenerForTesting, isFalse);
 
       await _invokeNative('onExportProgress', 0.9);
       expect(received, isNull);
@@ -230,7 +286,9 @@ void main() {
   group('DISP-9: playback complete routing', () {
     test('onPlaybackComplete routes with textureId', () async {
       int? receivedId;
-      final sub = dispatcher.registerPlaybackCompleteListener((tid) => receivedId = tid);
+      final sub = dispatcher.registerPlaybackCompleteListener(
+        (tid) => receivedId = tid,
+      );
       await _invokeNative('onPlaybackComplete', {'textureId': 99});
       expect(receivedId, 99);
       dispatcher.unregisterPlaybackCompleteListener(sub);
@@ -240,7 +298,9 @@ void main() {
       int? receivedId;
 
       final old = dispatcher.registerPlaybackCompleteListener((_) {});
-      final fresh = dispatcher.registerPlaybackCompleteListener((tid) => receivedId = tid);
+      final fresh = dispatcher.registerPlaybackCompleteListener(
+        (tid) => receivedId = tid,
+      );
 
       dispatcher.unregisterPlaybackCompleteListener(old);
 
@@ -263,7 +323,10 @@ void main() {
         receivedDuration = dur;
       });
 
-      await _invokeNative('onNodeDurationProbed', {'path': '/tmp/clip.mp4', 'duration': 7.25});
+      await _invokeNative('onNodeDurationProbed', {
+        'path': '/tmp/clip.mp4',
+        'duration': 7.25,
+      });
       expect(receivedPath, '/tmp/clip.mp4');
       expect(receivedDuration, closeTo(7.25, 0.001));
 
@@ -276,7 +339,9 @@ void main() {
   group('DISP-11: thermal state routing', () {
     test('onThermalStateChanged routes rawValue', () async {
       int? receivedRaw;
-      final sub = dispatcher.registerThermalStateListener((raw) => receivedRaw = raw);
+      final sub = dispatcher.registerThermalStateListener(
+        (raw) => receivedRaw = raw,
+      );
       await _invokeNative('onThermalStateChanged', 2);
       expect(receivedRaw, 2);
       dispatcher.unregisterThermalStateListener(sub);
@@ -286,33 +351,45 @@ void main() {
   // ── DISP-12 ─────────────────────────────────────────────────────────────────
 
   group('DISP-12: int-as-double tolerance (Flutter codec int delivery)', () {
-    test('onTimelineFrame pts delivered as int still parsed correctly', () async {
-      const tid = 55;
-      double? receivedPts;
+    test(
+      'onTimelineFrame pts delivered as int still parsed correctly',
+      () async {
+        const tid = 55;
+        double? receivedPts;
 
-      final sub = dispatcher.registerTimelineListener(
-        textureId: tid,
-        onFrame: (pts) => receivedPts = pts,
-        onEOS: () {},
-      );
+        final sub = dispatcher.registerTimelineListener(
+          textureId: tid,
+          onFrame: (pts, _) => receivedPts = pts,
+          onEOS: () {},
+        );
 
-      // Simulate native sending pts=0 as an int (common for first frame).
-      await _invokeNative('onTimelineFrame', {'textureId': tid, 'pts': 0, 'generation': 0});
-      expect(receivedPts, closeTo(0.0, 0.001));
+        // Simulate native sending pts=0 as an int (common for first frame).
+        await _invokeNative('onTimelineFrame', {
+          'textureId': tid,
+          'pts': 0,
+          'generation': 0,
+        });
+        expect(receivedPts, closeTo(0.0, 0.001));
 
-      dispatcher.unregisterTimelineListener(sub);
-    });
+        dispatcher.unregisterTimelineListener(sub);
+      },
+    );
 
-    test('onThermalStateChanged rawValue delivered as double still parsed', () async {
-      int? receivedRaw;
-      final sub = dispatcher.registerThermalStateListener((raw) => receivedRaw = raw);
+    test(
+      'onThermalStateChanged rawValue delivered as double still parsed',
+      () async {
+        int? receivedRaw;
+        final sub = dispatcher.registerThermalStateListener(
+          (raw) => receivedRaw = raw,
+        );
 
-      // Native may deliver int as double (e.g. 3.0 → toInt → 3)
-      await _invokeNative('onThermalStateChanged', 3.0);
-      expect(receivedRaw, 3);
+        // Native may deliver int as double (e.g. 3.0 → toInt → 3)
+        await _invokeNative('onThermalStateChanged', 3.0);
+        expect(receivedRaw, 3);
 
-      dispatcher.unregisterThermalStateListener(sub);
-    });
+        dispatcher.unregisterThermalStateListener(sub);
+      },
+    );
   });
 
   // ── DISP-13 ─────────────────────────────────────────────────────────────────
@@ -323,7 +400,7 @@ void main() {
 
       final sub = dispatcher.registerTimelineListener(
         textureId: 100,
-        onFrame: (_) => fireCount++,
+        onFrame: (pts, gen) => fireCount++,
         onEOS: () => fireCount++,
       );
 
@@ -339,7 +416,7 @@ void main() {
 
       final sub = dispatcher.registerTimelineListener(
         textureId: 101,
-        onFrame: (_) => fireCount++,
+        onFrame: (pts, gen) => fireCount++,
         onEOS: () => fireCount++,
       );
 
@@ -360,21 +437,25 @@ void main() {
 
       final old = dispatcher.registerTimelineListener(
         textureId: tid,
-        onFrame: (_) => oldCallCount++,
+        onFrame: (pts, gen) => oldCallCount++,
         onEOS: () {},
       );
 
       // Replace — old must be gone.
       final fresh = dispatcher.registerTimelineListener(
         textureId: tid,
-        onFrame: (_) => newCallCount++,
+        onFrame: (pts, gen) => newCallCount++,
         onEOS: () {},
       );
       // old subscription is superseded — we do not unregister it (stale token test).
       // ignore: unused_local_variable
       addTearDown(() => dispatcher.unregisterTimelineListener(old));
 
-      await _invokeNative('onTimelineFrame', {'textureId': tid, 'pts': 1.0, 'generation': 0});
+      await _invokeNative('onTimelineFrame', {
+        'textureId': tid,
+        'pts': 1.0,
+        'generation': 0,
+      });
       expect(oldCallCount, 0);
       expect(newCallCount, 1);
 

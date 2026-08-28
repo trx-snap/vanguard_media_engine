@@ -19,10 +19,14 @@
 //   - Malformed payloads are silently dropped (no throw in production).
 //
 // Export concurrency note:
-//   exportTimeline has no native single-export guard. Concurrent exports
-//   may both execute on native. The most recent export registration receives
-//   shared onExportProgress events; older export Futures complete via
-//   their result() callbacks regardless.
+//   Android's exportTimeline/exportPassthroughRemux routes share a single
+//   native export lock (AndroidEditorExportCoordinator): a concurrent second
+//   call is rejected with EXPORT_IN_PROGRESS rather than running in parallel.
+//   Export progress listeners are a LIFO stack (see below), not a
+//   single-slot: a nested exportDraft(onProgress:) call temporarily takes
+//   over onExportProgress delivery and its own unregister restores whichever
+//   listener was registered before it (e.g. a VanguardEngine.onExportProgress
+//   consumer), rather than clobbering it.
 //
 // Lifecycle:
 //   - Singleton exists for the Dart isolate lifetime.
@@ -59,7 +63,7 @@ final class VGTimelineSubscription {
 
 /// Subscription token for export progress callbacks.
 ///
-/// Single-slot global. Unregister via
+/// LIFO stack — see [VanguardChannelDispatcher] class docs. Unregister via
 /// [VanguardChannelDispatcher.unregisterExportListener].
 final class VGExportSubscription {
   final Object _token;
@@ -106,6 +110,12 @@ class _TimelineEntry {
   });
 }
 
+class _ExportEntry {
+  final Object token;
+  final void Function(double progress) onProgress;
+  _ExportEntry({required this.token, required this.onProgress});
+}
+
 // ── Dispatcher ────────────────────────────────────────────────────────────────
 
 /// The package-level singleton MethodChannel callback router.
@@ -121,13 +131,22 @@ class _TimelineEntry {
 ///
 /// ## Subscription semantics
 ///
-/// | Category           | Slot policy    | Identity key |
-/// |--------------------|----------------|--------------|
-/// | Timeline           | Per textureId  | textureId    |
-/// | Export progress    | Single-slot    | token        |
-/// | Playback complete  | Single-slot    | token        |
-/// | Duration probed    | Single-slot    | token        |
-/// | Thermal state      | Single-slot    | token        |
+/// | Category           | Slot policy      | Identity key |
+/// |--------------------|------------------|--------------|
+/// | Timeline           | Per textureId    | textureId    |
+/// | Export progress    | LIFO stack       | token        |
+/// | Playback complete  | Single-slot      | token        |
+/// | Duration probed    | Single-slot      | token        |
+/// | Thermal state      | Single-slot      | token        |
+///
+/// Export progress is a stack rather than a single slot so that a
+/// short-lived registration (e.g. a nested [VanguardTimelineExporter]
+/// call made while a longer-lived listener such as [VanguardEngine]'s is
+/// already registered) can temporarily take over delivery and, on its own
+/// unregister, restore the listener that was registered before it —
+/// instead of clobbering it permanently. Unregister removes only the entry
+/// matching the given token (wherever it is in the stack); dispatch always
+/// calls the top (most recently registered) entry.
 ///
 /// Stale-token unregister is always a no-op.
 final class VanguardChannelDispatcher {
@@ -147,9 +166,8 @@ final class VanguardChannelDispatcher {
   // Timeline: keyed by textureId.
   final Map<int, _TimelineEntry> _timelineListeners = {};
 
-  // Export progress: single-slot.
-  void Function(double progress)? _exportProgressCallback;
-  Object? _exportProgressToken;
+  // Export progress: LIFO stack — see class docs.
+  final List<_ExportEntry> _exportProgressStack = [];
 
   // Playback completion: single-slot.
   void Function(int textureId)? _playbackCompleteCallback;
@@ -190,8 +208,8 @@ final class VanguardChannelDispatcher {
       case 'onExportProgress':
         // Payload: bare num (Double on iOS, Double on Android).
         final progress = (call.arguments as num?)?.toDouble();
-        if (progress != null) {
-          _exportProgressCallback?.call(progress.clamp(0.0, 1.0));
+        if (progress != null && _exportProgressStack.isNotEmpty) {
+          _exportProgressStack.last.onProgress(progress.clamp(0.0, 1.0));
         }
         break;
 
@@ -298,26 +316,30 @@ final class VanguardChannelDispatcher {
 
   /// Registers an export progress listener.
   ///
-  /// Single-slot: replaces any existing registration.
-  /// A stale token cannot unregister a newer callback.
+  /// LIFO stack: pushes a new entry on top. Dispatch always calls the top
+  /// entry, so this registration takes over `onExportProgress` delivery
+  /// until it (or a still-newer registration) is unregistered — see class
+  /// docs for the nested-exportDraft rationale.
   VGExportSubscription registerExportListener(
     void Function(double progress) onProgress,
   ) {
     ensureHandlerRegistered();
     final token = Object();
-    _exportProgressCallback = onProgress;
-    _exportProgressToken = token;
+    _exportProgressStack.add(
+      _ExportEntry(token: token, onProgress: onProgress),
+    );
     return VGExportSubscription._(token);
   }
 
   /// Unregisters an export listener.
   ///
-  /// Stale tokens are safe no-ops.
+  /// Removes only the entry matching [subscription]'s token, wherever it is
+  /// in the stack, restoring whichever entry is now on top (if any). Stale
+  /// tokens are safe no-ops.
   void unregisterExportListener(VGExportSubscription subscription) {
-    if (identical(_exportProgressToken, subscription._token)) {
-      _exportProgressCallback = null;
-      _exportProgressToken = null;
-    }
+    _exportProgressStack.removeWhere(
+      (entry) => identical(entry.token, subscription._token),
+    );
   }
 
   // ── Playback-completion registration ──────────────────────────────────────
@@ -409,8 +431,7 @@ final class VanguardChannelDispatcher {
   @visibleForTesting
   void resetForTesting({MethodChannel? channel}) {
     _timelineListeners.clear();
-    _exportProgressCallback = null;
-    _exportProgressToken = null;
+    _exportProgressStack.clear();
     _playbackCompleteCallback = null;
     _playbackCompleteToken = null;
     _durationProbedCallback = null;
@@ -432,5 +453,5 @@ final class VanguardChannelDispatcher {
 
   /// Whether an export progress listener is currently registered. **Test-only.**
   @visibleForTesting
-  bool get hasExportListenerForTesting => _exportProgressCallback != null;
+  bool get hasExportListenerForTesting => _exportProgressStack.isNotEmpty;
 }

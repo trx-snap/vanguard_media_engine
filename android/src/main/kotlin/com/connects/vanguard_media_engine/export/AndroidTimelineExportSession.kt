@@ -21,8 +21,9 @@ import kotlin.math.floor
 // AndroidAudioRemuxer). Runs entirely on a background thread; never touches a
 // MethodChannel or Flutter main-thread APIs directly -- results are delivered
 // via [onSuccess]/[onError] callbacks, which AndroidEditorExportCoordinator
-// posts to the main thread exactly once. No progress events are emitted for
-// Unit C (out of scope for the minimal hard-cut export slice).
+// posts to the main thread exactly once. Optional [onProgress] progress
+// events (Phase 5-Unit T) are delivered the same way -- this class never
+// touches a MethodChannel directly, even for progress.
 //
 // Scope (minimal hard-cut, sequential, local-video export -- Unit C, extended
 // by Unit G with rotation metadata + canvas scaling normalization):
@@ -48,14 +49,25 @@ class AndroidTimelineExportSession(private val context: Context) {
         activeEncoder?.cancel()
     }
 
+    /// [onProgress], when non-null, receives overall export progress in
+    /// [0.0, 1.0]: pass-1 (video encode) sample progress is mapped into
+    /// [0.0, PASS1_PROGRESS_SAMPLE_MAX] (strictly below 0.85) via the
+    /// encoder's own sample-ratio progress; the exact 0.85 checkpoint is
+    /// emitted exactly once, immediately after pass-1 succeeds and the
+    /// following cancel check passes; 0.98 is emitted immediately after
+    /// pass-2 succeeds and the following cancel check passes. This session
+    /// never emits 1.0 -- that terminal value is owned by
+    /// AndroidEditorExportCoordinator. No progress is emitted after any
+    /// cancel/error check fails.
     fun start(
         args: Map<*, *>?,
         onSuccess: (Map<String, Any?>) -> Unit,
         onError: (code: String, message: String?) -> Unit,
+        onProgress: ((Double) -> Unit)? = null,
     ) {
         Thread {
             try {
-                run(args, onSuccess, onError)
+                run(args, onSuccess, onError, onProgress)
             } catch (t: Throwable) {
                 Log.e(TAG, "unhandled exception in export session: $t", t)
                 onError("EXPORT_FAILED", t.message ?: t.javaClass.simpleName)
@@ -87,6 +99,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         args: Map<*, *>?,
         onSuccess: (Map<String, Any?>) -> Unit,
         onError: (String, String?) -> Unit,
+        onProgress: ((Double) -> Unit)? = null,
     ) {
         // ── 1. Top-level args / draft parsing ───────────────────────────────
         if (args == null) {
@@ -348,7 +361,9 @@ class AndroidTimelineExportSession(private val context: Context) {
         )
         activeEncoder = encoder
 
-        val encodeResult = encoder.encode(clipInputs)
+        val encodeResult = encoder.encode(clipInputs) { p ->
+            onProgress?.invoke((p * PASS1_PROGRESS_SAMPLE_MAX).coerceIn(0.0, PASS1_PROGRESS_SAMPLE_MAX))
+        }
         activeEncoder = null
 
         if (!encodeResult.success) {
@@ -366,6 +381,7 @@ class AndroidTimelineExportSession(private val context: Context) {
             onError("EXPORT_CANCELLED", "exportTimeline: cancelled after video encode")
             return
         }
+        onProgress?.invoke(PASS1_PROGRESS_WEIGHT)
 
         // ── 6. Pass 2: audio mux / mixdown ───────────────────────────────────
         val rawSidecar = draftMap["audioSidecar"] as? Map<*, *>
@@ -389,6 +405,7 @@ class AndroidTimelineExportSession(private val context: Context) {
             onError("EXPORT_CANCELLED", "exportTimeline: cancelled after audio mux")
             return
         }
+        onProgress?.invoke(PASS2_PROGRESS_CHECKPOINT)
 
         // ── 7. Finalize: measure duration on the completed temp, then rename ──
         // to the requested output. Rename only happens once every success
@@ -571,6 +588,17 @@ class AndroidTimelineExportSession(private val context: Context) {
         private const val TRIM_START_TOLERANCE_SECONDS = 0.001
         private const val DURATION_TOLERANCE_SECONDS = 0.05
         private const val MAX_STILL_FRAME_COUNT = 36_000
+
+        // Progress checkpoints (frozen — see [start] doc comment). PASS1_PROGRESS_WEIGHT is
+        // the exact value emitted as the pass-1-complete checkpoint (after the post-pass-1
+        // cancel check), so AndroidEditorExportCoordinator can recognize it by exact Double
+        // equality and bypass its normal throttle. The encoder's own [0.0, 1.0] sample-ratio
+        // progress is scaled into [0.0, PASS1_PROGRESS_SAMPLE_MAX] instead -- strictly below
+        // PASS1_PROGRESS_WEIGHT -- so no sampled value can collide with, or precede an
+        // unresolved cancel check for, the exact 0.85 checkpoint.
+        private const val PASS1_PROGRESS_WEIGHT = 0.85
+        private const val PASS1_PROGRESS_SAMPLE_MAX = 0.849999
+        private const val PASS2_PROGRESS_CHECKPOINT = 0.98
 
         // Clip-level wire keys for features not implemented by Unit C's minimal
         // hard-cut passthrough. Presence of any of these (non-null) means the

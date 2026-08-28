@@ -568,11 +568,13 @@ class VanguardEngine {
       calloc.free(pathPtr);
       onNodeDurationProbed?.call(path, duration);
     });
-    // Export progress: forward to the UI callback when this engine is the
-    // most recently registered consumer. Single-slot: if VanguardTimelineExporter
-    // concurrently registers, its subscription overwrites this one while its
-    // export is running; this registration is restored as the last subscriber
-    // only when the exporter's finally block unregisters.
+    // Export progress: forward to the UI callback. VanguardChannelDispatcher
+    // stores export listeners as a LIFO stack, not a single slot: if
+    // VanguardTimelineExporter concurrently registers its own listener for a
+    // headless export, its registration temporarily takes over
+    // onExportProgress delivery while running, and this registration
+    // resumes receiving events once the exporter's finally block
+    // unregisters -- it is never clobbered.
     _exportProgressSub = dispatcher.registerExportListener((double progress) {
       if (_disposed) return;
       onExportProgress?.call(progress);

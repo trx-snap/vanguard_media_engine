@@ -23,6 +23,7 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import kotlin.math.ceil
 import kotlin.math.cos
 import kotlin.math.min
 import kotlin.math.sin
@@ -104,6 +105,11 @@ class AndroidTimelineVideoEncoder(
     private var videoTrackIndex = -1
     private var writtenVideoSamples = 0
 
+    // ─── Pass-1 sample-ratio progress (owned solely by this encoder — no
+    // knowledge of MethodChannel, Handler, or session pass weights) ─────────
+    private var totalExpectedSamples = 0
+    private var onProgress: ((Double) -> Unit)? = null
+
     // ─── EGL / GL state (bound to the encoder's input surface) ──────────────
     private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
     private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
@@ -130,7 +136,23 @@ class AndroidTimelineVideoEncoder(
 
     /// Encodes [clips] sequentially (hard-cut concatenation) into [outputPath]
     /// as a video-only MP4. Returns a structured result; never throws.
-    fun encode(clips: List<ClipInput>): EncodeResult {
+    ///
+    /// [onProgress], when non-null, receives the pass-1 sample-write ratio in
+    /// [0.0, 1.0] as each muxed sample is written (see [drainEncoder]). This
+    /// encoder computes [totalExpectedSamples] once, up front, as the sum
+    /// over [clips] of each clip's expected sample count -- still-image
+    /// clips contribute [ClipInput.stillFrameCount]; video clips contribute
+    /// ceil((trimEndSeconds - trimStartSeconds) * fps), floored at 1. When
+    /// the total is <= 0, no sample progress is emitted.
+    fun encode(clips: List<ClipInput>, onProgress: ((Double) -> Unit)? = null): EncodeResult {
+        this.onProgress = onProgress
+        totalExpectedSamples = clips.sumOf { clip ->
+            if (clip.mediaKind == "image") {
+                clip.stillFrameCount
+            } else {
+                ceil((clip.trimEndSeconds - clip.trimStartSeconds) * fps).toInt().coerceAtLeast(1)
+            }
+        }
         var succeeded = false
         var muxerStoppedCleanly = false
         var reason = "not_run"
@@ -769,6 +791,9 @@ class AndroidTimelineVideoEncoder(
                             info.presentationTimeUs = writtenVideoSamples * frameDurationUs
                             mx.writeSampleData(videoTrackIndex, buf, info)
                             writtenVideoSamples++
+                            if (totalExpectedSamples > 0) {
+                                onProgress?.invoke(min(writtenVideoSamples.toDouble() / totalExpectedSamples, 1.0))
+                            }
                         }
                     }
                     enc.releaseOutputBuffer(outIdx, false)

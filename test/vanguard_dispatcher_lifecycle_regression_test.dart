@@ -13,6 +13,8 @@
 //   DREG-4: After VanguardTimelineExporter.exportDraft() completes, the
 //           export subscription is unregistered — stale progress callbacks
 //           are not delivered.
+//   DREG-5: A short-lived exportDraft(onProgress:) registration that fails or is
+//           rejected does not permanently clear a previously registered export listener.
 
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -32,12 +34,21 @@ Future<void> _invokeNative(String method, [dynamic arguments]) async {
   final codec = const StandardMethodCodec();
   final data = codec.encodeMethodCall(MethodCall(method, arguments));
   await TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-      .handlePlatformMessage('vanguard_media_engine', data, (ByteData? reply) {});
+      .handlePlatformMessage(
+        'vanguard_media_engine',
+        data,
+        (ByteData? reply) {},
+      );
 }
 
-void _setMockHandler(Future<Object?> Function(String method, dynamic args) handler) {
+void _setMockHandler(
+  Future<Object?> Function(String method, dynamic args) handler,
+) {
   TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-      .setMockMethodCallHandler(_kChannel, (call) => handler(call.method, call.arguments));
+      .setMockMethodCallHandler(
+        _kChannel,
+        (call) => handler(call.method, call.arguments),
+      );
 }
 
 void _clearMockHandler() {
@@ -46,34 +57,34 @@ void _clearMockHandler() {
 }
 
 VGEditorDraft _makeDraft() => VGEditorDraft(
-      id: 'dreg-draft',
-      clips: [
-        VGClipDescriptor(
-          id: 'clip-dreg',
-          sourcePath: '/tmp/dreg.mp4',
-          durationSeconds: 5.0,
-          trimStartSeconds: 0.0,
-          trimEndSeconds: 5.0,
-        ),
-      ],
-      canvasWidth: 1080,
-      canvasHeight: 1920,
-      fps: 30,
-    );
+  id: 'dreg-draft',
+  clips: [
+    VGClipDescriptor(
+      id: 'clip-dreg',
+      sourcePath: '/tmp/dreg.mp4',
+      durationSeconds: 5.0,
+      trimStartSeconds: 0.0,
+      trimEndSeconds: 5.0,
+    ),
+  ],
+  canvasWidth: 1080,
+  canvasHeight: 1920,
+  fps: 30,
+);
 
 VGEditorExportRequest _makeExportRequest() => const VGEditorExportRequest(
-      outputPath: '/tmp/dreg_out.mp4',
-      bitrateBps: 8000000,
-    );
+  outputPath: '/tmp/dreg_out.mp4',
+  bitrateBps: 8000000,
+);
 
 Map<String, dynamic> _exportSuccessResponse() => {
-      'success': true,
-      'path': '/tmp/dreg_out.mp4',
-      'durationSeconds': 5.0,
-      'width': 1080,
-      'height': 1920,
-      'fps': 30,
-    };
+  'success': true,
+  'path': '/tmp/dreg_out.mp4',
+  'durationSeconds': 5.0,
+  'width': 1080,
+  'height': 1920,
+  'fps': 30,
+};
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -89,20 +100,29 @@ void main() {
 
   // DREG-1 ────────────────────────────────────────────────────────────────────
 
-  test('DREG-1: VanguardChannelDispatcher.instance is accessible via src path', () {
-    // If this compiles, the src import path is valid.
-    // The dispatcher must NOT be imported via the public barrel.
-    final dispatcher = VanguardChannelDispatcher.instance;
-    expect(dispatcher, isNotNull);
-    // Starts idle — handler only registered on first consumer.
-    expect(dispatcher.isHandlerRegistered, isFalse);
-    // No timeline listener exists before any controller is initialized.
-    expect(dispatcher.hasTimelineListenerForTesting(42), isFalse,
-        reason: 'No timeline listener must exist in a freshly-reset dispatcher');
-    // No export listener exists before any export is started.
-    expect(dispatcher.hasExportListenerForTesting, isFalse,
-        reason: 'No export listener must exist in a freshly-reset dispatcher');
-  });
+  test(
+    'DREG-1: VanguardChannelDispatcher.instance is accessible via src path',
+    () {
+      // If this compiles, the src import path is valid.
+      // The dispatcher must NOT be imported via the public barrel.
+      final dispatcher = VanguardChannelDispatcher.instance;
+      expect(dispatcher, isNotNull);
+      // Starts idle — handler only registered on first consumer.
+      expect(dispatcher.isHandlerRegistered, isFalse);
+      // No timeline listener exists before any controller is initialized.
+      expect(
+        dispatcher.hasTimelineListenerForTesting(42),
+        isFalse,
+        reason: 'No timeline listener must exist in a freshly-reset dispatcher',
+      );
+      // No export listener exists before any export is started.
+      expect(
+        dispatcher.hasExportListenerForTesting,
+        isFalse,
+        reason: 'No export listener must exist in a freshly-reset dispatcher',
+      );
+    },
+  );
 
   // DREG-2 ────────────────────────────────────────────────────────────────────
 
@@ -135,8 +155,11 @@ void main() {
         'generation': 1,
       });
 
-      expect(receivedPts, closeTo(2.5, 0.001),
-          reason: 'onTimelineFrame must reach controller via dispatcher');
+      expect(
+        receivedPts,
+        closeTo(2.5, 0.001),
+        reason: 'onTimelineFrame must reach controller via dispatcher',
+      );
 
       controller.dispose();
     },
@@ -161,20 +184,24 @@ void main() {
 
       // Direct state assertion: subscription registered for kTextureId.
       expect(
-        VanguardChannelDispatcher.instance
-            .hasTimelineListenerForTesting(kTextureId),
+        VanguardChannelDispatcher.instance.hasTimelineListenerForTesting(
+          kTextureId,
+        ),
         isTrue,
-        reason: 'Timeline listener must be registered for kTextureId after initialize()',
+        reason:
+            'Timeline listener must be registered for kTextureId after initialize()',
       );
 
       controller.dispose();
 
       // Direct state assertion: subscription cleared after dispose.
       expect(
-        VanguardChannelDispatcher.instance
-            .hasTimelineListenerForTesting(kTextureId),
+        VanguardChannelDispatcher.instance.hasTimelineListenerForTesting(
+          kTextureId,
+        ),
         isFalse,
-        reason: 'Timeline listener must be cleared for kTextureId after dispose()',
+        reason:
+            'Timeline listener must be cleared for kTextureId after dispose()',
       );
 
       // Behavioral check: injecting a frame callback must complete silently
@@ -186,7 +213,8 @@ void main() {
           'generation': 2,
         }),
         completes,
-        reason: 'Dispatcher must silently drop callbacks for unregistered '
+        reason:
+            'Dispatcher must silently drop callbacks for unregistered '
             'textureId after controller dispose',
       );
     },
@@ -224,12 +252,87 @@ void main() {
 
       await _invokeNative('onExportProgress', 0.5);
 
-      expect(progressReceived, isTrue,
-          reason:
-              'Freshly registered listener must receive event — confirming the '
-              'exporter released the slot in its finally block');
+      expect(
+        progressReceived,
+        isTrue,
+        reason:
+            'Freshly registered listener must receive event — confirming the '
+            'exporter released the slot in its finally block',
+      );
 
       VanguardChannelDispatcher.instance.unregisterExportListener(sub);
+    },
+  );
+
+  // DREG-5 ────────────────────────────────────────────────────────────────────
+
+  test(
+    'DREG-5: rejected/failed exportDraft(onProgress:) does not clear previously registered export listener',
+    () async {
+      _setMockHandler((method, args) async {
+        if (method == 'exportTimeline') {
+          throw PlatformException(
+            code: 'EXPORT_IN_PROGRESS',
+            message: 'exportTimeline: an export is already in progress',
+          );
+        }
+        return null;
+      });
+
+      // 1. Simulate an existing outer export progress listener (e.g. VanguardEngine).
+      final outerProgressEvents = <double>[];
+      final outerSub = VanguardChannelDispatcher.instance
+          .registerExportListener(
+            (progress) => outerProgressEvents.add(progress),
+          );
+
+      expect(
+        VanguardChannelDispatcher.instance.hasExportListenerForTesting,
+        isTrue,
+      );
+
+      // 2. Attempt a short-lived exportDraft with its own listener that fails/rejects.
+      final innerProgressEvents = <double>[];
+      var exportRejected = false;
+      try {
+        await VanguardTimelineExporter.exportDraft(
+          draft: _makeDraft(),
+          request: _makeExportRequest(),
+          onProgress: (p) => innerProgressEvents.add(p),
+          channel: _kChannel,
+        );
+      } on PlatformException catch (e) {
+        if (e.code == 'EXPORT_IN_PROGRESS') {
+          exportRejected = true;
+        }
+      }
+
+      expect(exportRejected, isTrue);
+      expect(innerProgressEvents, isEmpty);
+
+      // 3. Direct state assertion: outer subscription is still registered.
+      expect(
+        VanguardChannelDispatcher.instance.hasExportListenerForTesting,
+        isTrue,
+        reason:
+            'Outer listener must remain in the stack after inner exporter failure',
+      );
+
+      // 4. Behavioral check: native onExportProgress event routes to the restored outer listener.
+      await _invokeNative('onExportProgress', 0.85);
+
+      expect(
+        outerProgressEvents,
+        [closeTo(0.85, 0.001)],
+        reason:
+            'Restored outer listener must receive subsequent progress events',
+      );
+
+      VanguardChannelDispatcher.instance.unregisterExportListener(outerSub);
+      expect(
+        VanguardChannelDispatcher.instance.hasExportListenerForTesting,
+        isFalse,
+      );
     },
   );
 }
