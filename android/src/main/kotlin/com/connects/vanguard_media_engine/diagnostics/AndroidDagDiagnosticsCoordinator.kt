@@ -11,6 +11,7 @@ import com.connects.vanguard_media_engine.camera.AndroidCamera2NativeRenderLoopS
 import com.connects.vanguard_media_engine.camera.AndroidCamera2OpenCloseSmokeHarness
 import com.connects.vanguard_media_engine.camera.AndroidCamera2ThermalListenerSmokeHarness
 import com.connects.vanguard_media_engine.export.AndroidAudioFoundationSmokeHarness
+import com.connects.vanguard_media_engine.export.AndroidPassthroughRemuxSmokeHarness
 import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
 import io.flutter.plugin.common.MethodChannel
 
@@ -39,6 +40,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase4ADecoderSmoke",
             "runAndroidDagPhase5EncoderSurfaceSmoke",
             "runAndroidDagAudioFoundationSmoke",
+            "runAndroidPassthroughRemuxNativeSmoke",
             "runAndroidDagPhase3UnitACameraCapabilityProbe",
             "runAndroidDagPhase3UnitFConcurrentSessionValidation",
             "runAndroidDagPhase3UnitHCameraOpenCloseSmoke",
@@ -86,6 +88,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase4ADecoderSmoke" -> runPhase4ADecoderSmoke(args, result)
             "runAndroidDagPhase5EncoderSurfaceSmoke" -> runPhase5EncoderSurfaceSmoke(args, result)
             "runAndroidDagAudioFoundationSmoke" -> runAudioFoundationSmoke(args, result)
+            "runAndroidPassthroughRemuxNativeSmoke" -> runPassthroughRemuxNativeSmoke(args, result)
             "runAndroidDagPhase3UnitACameraCapabilityProbe" -> runPhase3UnitACameraCapabilityProbe(result)
             "runAndroidDagPhase3UnitFConcurrentSessionValidation" ->
                 runPhase3UnitFConcurrentSessionValidation(args, result)
@@ -235,6 +238,37 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "AUDIO_FOUNDATION_SMOKE_FAILED",
                         "runAndroidDagAudioFoundationSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 2-Unit X: Android native passthrough remux diagnostic smoke ────
+    private fun runPassthroughRemuxNativeSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val sourcePath = args?.get("sourcePath") as? String
+        val outputDir = args?.get("outputDir") as? String
+        if (sourcePath.isNullOrBlank() || outputDir.isNullOrBlank()) {
+            result.error(
+                "INVALID_ARG",
+                "runAndroidPassthroughRemuxNativeSmoke: sourcePath and outputDir required",
+                null,
+            )
+            return
+        }
+        Thread {
+            try {
+                val smokeResult = AndroidPassthroughRemuxSmokeHarness.run(
+                    sourcePath = sourcePath,
+                    outputDir = outputDir,
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "PASSTHROUGH_REMUX_NATIVE_SMOKE_FAILED",
+                        "runAndroidPassthroughRemuxNativeSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
