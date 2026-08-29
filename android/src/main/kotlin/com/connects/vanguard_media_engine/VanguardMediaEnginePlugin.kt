@@ -922,6 +922,18 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 }
             }
 
+            // --- Phase 5-Unit AA / Phase 2-Unit AI: production normalizeVideo -----------
+            // Delegates entirely to AndroidEditorExportCoordinator, sharing its
+            // single-export lock with exportTimeline / exportPassthroughRemux.
+            "normalizeVideo" -> {
+                val coord = editorExportCoordinator
+                if (coord != null) {
+                    coord.normalizeVideo(args, result)
+                } else {
+                    result.error("UNAVAILABLE", "Android editor export coordinator unavailable", null)
+                }
+            }
+
             "startExport" -> {
                 // B3: Dart sends List<Map<String,dynamic>> {path, trimStart, trimEnd}.
                 // B4-S2: per-clip trim seek + EOS boundary.

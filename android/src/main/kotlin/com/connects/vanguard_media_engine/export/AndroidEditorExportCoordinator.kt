@@ -15,10 +15,11 @@ import java.util.concurrent.atomic.AtomicBoolean
 // `activeEncoder` cancel path when there is no active coordinator-owned
 // export (see VanguardMediaEnginePlugin.onMethodCall "cancelExport").
 //
-// One export at a time across BOTH routes: a second concurrent `exportTimeline`
-// or `exportPassthroughRemux` call while either an [AndroidTimelineExportSession]
-// or an [AndroidPassthroughRemuxSession] is active is rejected with
-// EXPORT_IN_PROGRESS rather than silently queued or run in parallel.
+// One export at a time across ALL THREE routes: a second concurrent
+// `exportTimeline`, `exportPassthroughRemux`, or `normalizeVideo` call while
+// any of [AndroidTimelineExportSession], [AndroidPassthroughRemuxSession], or
+// [AndroidNormalizeVideoSession] is active is rejected with EXPORT_IN_PROGRESS
+// rather than silently queued or run in parallel.
 //
 // Every [MethodChannel.Result] reply happens exactly once, posted to
 // [mainHandler], guarded by a per-call [AtomicBoolean] -- the underlying
@@ -45,11 +46,12 @@ class AndroidEditorExportCoordinator(
 ) {
     @Volatile private var activeTimelineSession: AndroidTimelineExportSession? = null
     @Volatile private var activePassthroughSession: AndroidPassthroughRemuxSession? = null
+    @Volatile private var activeNormalizeSession: AndroidNormalizeVideoSession? = null
     @Volatile private var activeTimelineProgressGate: AtomicBoolean? = null
     @Volatile private var detached = false
 
     private fun isAnyExportActive(): Boolean =
-        activeTimelineSession != null || activePassthroughSession != null
+        activeTimelineSession != null || activePassthroughSession != null || activeNormalizeSession != null
 
     /// Handles the `exportTimeline` MethodChannel call. Also owns
     /// `onExportProgress` emission for the lifetime of the export -- see the
@@ -187,6 +189,55 @@ class AndroidEditorExportCoordinator(
         }
     }
 
+    /// Handles the `normalizeVideo` MethodChannel call (Phase 5-Unit AA /
+    /// Phase 2-Unit AI). Shares this coordinator's single-export lock with
+    /// [exportTimeline] and [exportPassthroughRemux]. No progress events.
+    fun normalizeVideo(args: Map<*, *>?, result: MethodChannel.Result) {
+        val repliedOnce = AtomicBoolean(false)
+
+        fun replySuccess(map: Map<String, Any?>) {
+            if (repliedOnce.compareAndSet(false, true)) {
+                mainHandler.post {
+                    if (detached) return@post
+                    result.success(map)
+                }
+            }
+        }
+
+        fun replyError(code: String, message: String?) {
+            if (repliedOnce.compareAndSet(false, true)) {
+                mainHandler.post {
+                    if (detached) return@post
+                    result.error(code, message, null)
+                }
+            }
+        }
+
+        synchronized(this) {
+            if (isAnyExportActive()) {
+                replyError("EXPORT_IN_PROGRESS", "normalizeVideo: an export is already in progress")
+                return
+            }
+            val session = AndroidNormalizeVideoSession(context)
+            activeNormalizeSession = session
+            session.start(
+                args = args,
+                onSuccess = { map ->
+                    synchronized(this) {
+                        if (activeNormalizeSession === session) activeNormalizeSession = null
+                    }
+                    replySuccess(map)
+                },
+                onError = { code, message ->
+                    synchronized(this) {
+                        if (activeNormalizeSession === session) activeNormalizeSession = null
+                    }
+                    replyError(code, message)
+                },
+            )
+        }
+    }
+
     /// Requests cancellation of the active export (either route), if any.
     /// Non-blocking -- the underlying session resolves its own pending result
     /// as EXPORT_CANCELLED. Returns true only if there was an active session
@@ -198,10 +249,12 @@ class AndroidEditorExportCoordinator(
         synchronized(this) {
             val timeline = activeTimelineSession
             val passthrough = activePassthroughSession
-            if (timeline == null && passthrough == null) return false
+            val normalize = activeNormalizeSession
+            if (timeline == null && passthrough == null && normalize == null) return false
             activeTimelineProgressGate?.set(false)
             timeline?.requestCancel()
             passthrough?.requestCancel()
+            normalize?.requestCancel()
             return true
         }
     }
@@ -217,11 +270,14 @@ class AndroidEditorExportCoordinator(
             activeTimelineProgressGate?.set(false)
             val timeline = activeTimelineSession
             val passthrough = activePassthroughSession
+            val normalize = activeNormalizeSession
             activeTimelineSession = null
             activePassthroughSession = null
+            activeNormalizeSession = null
             activeTimelineProgressGate = null
             timeline?.requestCancel()
             passthrough?.requestCancel()
+            normalize?.requestCancel()
         }
     }
 

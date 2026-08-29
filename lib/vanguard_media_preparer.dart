@@ -4,8 +4,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
-
-
 // ─── Enums ────────────────────────────────────────────────────────────────────
 
 enum MediaKind { video, image, audio, unknown }
@@ -50,15 +48,15 @@ class MediaInfo {
     required this.hasEmbeddedMetadata,
     // ── ROI-5A.1 Orientation Evidence ──────────────────────────────────────
     // Additive fields. Existing width/height remain encoded/raw (naturalSize).
-    this.encodedWidth  = 0,
+    this.encodedWidth = 0,
     this.encodedHeight = 0,
-    this.displayWidth  = 0,
+    this.displayWidth = 0,
     this.displayHeight = 0,
     this.rotationDegrees,
-    this.transformA  = 1.0,
-    this.transformB  = 0.0,
-    this.transformC  = 0.0,
-    this.transformD  = 1.0,
+    this.transformA = 1.0,
+    this.transformB = 0.0,
+    this.transformC = 0.0,
+    this.transformD = 1.0,
     this.transformTx = 0.0,
     this.transformTy = 0.0,
     this.orientationStatus = 'valid',
@@ -169,38 +167,38 @@ class MediaInfo {
       'video' => MediaKind.video,
       'image' => MediaKind.image,
       'audio' => MediaKind.audio,
-      _       => MediaKind.unknown,
+      _ => MediaKind.unknown,
     };
-    final rawWidth  = (raw['width']  as num?)?.toInt() ?? 0;
+    final rawWidth = (raw['width'] as num?)?.toInt() ?? 0;
     final rawHeight = (raw['height'] as num?)?.toInt() ?? 0;
     return MediaInfo(
-      kind:                  kind,
-      container:             raw['container']             as String? ?? '',
-      videoCodec:            raw['videoCodec']            as String? ?? '',
-      audioCodec:            raw['audioCodec']            as String? ?? '',
-      width:                 rawWidth,
-      height:                rawHeight,
-      durationSeconds:       (raw['durationSeconds']      as num?)?.toDouble() ?? -1.0,
-      bitrateKbps:           (raw['bitrateKbps']          as num?)?.toInt() ?? 0,
-      fps:                   (raw['fps']                  as num?)?.toDouble() ?? 0.0,
-      fileSizeBytes:         (raw['fileSizeBytes']        as num?)?.toInt() ?? 0,
-      hasVideo:              raw['hasVideo']              as bool? ?? false,
-      hasAudio:              raw['hasAudio']              as bool? ?? false,
-      isHDR:                 raw['isHDR']                 as bool? ?? false,
-      hasMoovAtFront:        raw['hasMoovAtFront']        as bool? ?? false,
-      hasRotationTransform:  raw['hasRotationTransform']  as bool? ?? false,
-      hasEmbeddedMetadata:   raw['hasEmbeddedMetadata']   as bool? ?? false,
+      kind: kind,
+      container: raw['container'] as String? ?? '',
+      videoCodec: raw['videoCodec'] as String? ?? '',
+      audioCodec: raw['audioCodec'] as String? ?? '',
+      width: rawWidth,
+      height: rawHeight,
+      durationSeconds: (raw['durationSeconds'] as num?)?.toDouble() ?? -1.0,
+      bitrateKbps: (raw['bitrateKbps'] as num?)?.toInt() ?? 0,
+      fps: (raw['fps'] as num?)?.toDouble() ?? 0.0,
+      fileSizeBytes: (raw['fileSizeBytes'] as num?)?.toInt() ?? 0,
+      hasVideo: raw['hasVideo'] as bool? ?? false,
+      hasAudio: raw['hasAudio'] as bool? ?? false,
+      isHDR: raw['isHDR'] as bool? ?? false,
+      hasMoovAtFront: raw['hasMoovAtFront'] as bool? ?? false,
+      hasRotationTransform: raw['hasRotationTransform'] as bool? ?? false,
+      hasEmbeddedMetadata: raw['hasEmbeddedMetadata'] as bool? ?? false,
       // ROI-5A.1 Orientation Evidence — fall back to raw width/height when
       // the native side does not yet return these keys (older plugin builds).
-      encodedWidth:     (raw['encodedWidth']     as num?)?.toInt() ?? rawWidth,
-      encodedHeight:    (raw['encodedHeight']    as num?)?.toInt() ?? rawHeight,
-      displayWidth:     (raw['displayWidth']     as num?)?.toInt() ?? rawWidth,
-      displayHeight:    (raw['displayHeight']    as num?)?.toInt() ?? rawHeight,
-      rotationDegrees:  (raw['rotationDegrees']  as num?)?.toInt(),
-      transformA:  (raw['transformA']  as num?)?.toDouble() ?? 1.0,
-      transformB:  (raw['transformB']  as num?)?.toDouble() ?? 0.0,
-      transformC:  (raw['transformC']  as num?)?.toDouble() ?? 0.0,
-      transformD:  (raw['transformD']  as num?)?.toDouble() ?? 1.0,
+      encodedWidth: (raw['encodedWidth'] as num?)?.toInt() ?? rawWidth,
+      encodedHeight: (raw['encodedHeight'] as num?)?.toInt() ?? rawHeight,
+      displayWidth: (raw['displayWidth'] as num?)?.toInt() ?? rawWidth,
+      displayHeight: (raw['displayHeight'] as num?)?.toInt() ?? rawHeight,
+      rotationDegrees: (raw['rotationDegrees'] as num?)?.toInt(),
+      transformA: (raw['transformA'] as num?)?.toDouble() ?? 1.0,
+      transformB: (raw['transformB'] as num?)?.toDouble() ?? 0.0,
+      transformC: (raw['transformC'] as num?)?.toDouble() ?? 0.0,
+      transformD: (raw['transformD'] as num?)?.toDouble() ?? 1.0,
       transformTx: (raw['transformTx'] as num?)?.toDouble() ?? 0.0,
       transformTy: (raw['transformTy'] as num?)?.toDouble() ?? 0.0,
       orientationStatus: raw['orientationStatus'] as String? ?? 'valid',
@@ -241,41 +239,41 @@ class UploadConstraints {
 
   /// Post / feed video. Mirrors file_compress.dart limits.
   const UploadConstraints.post()
-      : maxDurationSeconds = 180,
-        maxShortSidePx     = 720,
-        maxBitrateKbps     = 1500,
-        maxFileSizeMb      = 200,
-        targetBitrateKbps  = 1000,
-        imageMaxWidthPx    = 1080,
-        imageJpegQuality   = 0.82;
+    : maxDurationSeconds = 180,
+      maxShortSidePx = 720,
+      maxBitrateKbps = 1500,
+      maxFileSizeMb = 200,
+      targetBitrateKbps = 1000,
+      imageMaxWidthPx = 1080,
+      imageJpegQuality = 0.82;
 
   const UploadConstraints.reels()
-      : maxDurationSeconds = 180,
-        maxShortSidePx     = 720,
-        maxBitrateKbps     = 1500,
-        maxFileSizeMb      = 200,
-        targetBitrateKbps  = 1000,
-        imageMaxWidthPx    = 1080,
-        imageJpegQuality   = 0.82;
+    : maxDurationSeconds = 180,
+      maxShortSidePx = 720,
+      maxBitrateKbps = 1500,
+      maxFileSizeMb = 200,
+      targetBitrateKbps = 1000,
+      imageMaxWidthPx = 1080,
+      imageJpegQuality = 0.82;
 
   const UploadConstraints.chat()
-      : maxDurationSeconds = 180,
-        maxShortSidePx     = 720,
-        maxBitrateKbps     = 1500,
-        maxFileSizeMb      = 200,
-        targetBitrateKbps  = 1000,
-        imageMaxWidthPx    = 1080,
-        imageJpegQuality   = 0.82;
+    : maxDurationSeconds = 180,
+      maxShortSidePx = 720,
+      maxBitrateKbps = 1500,
+      maxFileSizeMb = 200,
+      targetBitrateKbps = 1000,
+      imageMaxWidthPx = 1080,
+      imageJpegQuality = 0.82;
 
   /// Gallery-picked story clip. Camera clips bypass this via alreadyExported gate.
   const UploadConstraints.story()
-      : maxDurationSeconds = 30,
-        maxShortSidePx     = 720,
-        maxBitrateKbps     = 1500,
-        maxFileSizeMb      = 200,
-        targetBitrateKbps  = 1000,
-        imageMaxWidthPx    = 1080,
-        imageJpegQuality   = 0.82;
+    : maxDurationSeconds = 30,
+      maxShortSidePx = 720,
+      maxBitrateKbps = 1500,
+      maxFileSizeMb = 200,
+      targetBitrateKbps = 1000,
+      imageMaxWidthPx = 1080,
+      imageJpegQuality = 0.82;
 }
 
 // ─── UploadPolicy ─────────────────────────────────────────────────────────────
@@ -304,17 +302,17 @@ class UploadPolicy {
 
   /// Default policy for all upload surfaces.
   const UploadPolicy.standard()
-      : stripMetadata    = true,
-        requireFastStart = true,
-        allowNormalize   = true,
-        allowPassThrough = true;
+    : stripMetadata = true,
+      requireFastStart = true,
+      allowNormalize = true,
+      allowPassThrough = true;
 
   /// Strict policy: always normalize at minimum. Never return raw input file.
   const UploadPolicy.strict()
-      : stripMetadata    = true,
-        requireFastStart = true,
-        allowNormalize   = true,
-        allowPassThrough = false;
+    : stripMetadata = true,
+      requireFastStart = true,
+      allowNormalize = true,
+      allowPassThrough = false;
 }
 
 // ─── PrepareResult ────────────────────────────────────────────────────────────
@@ -345,9 +343,9 @@ class PrepareResult {
   bool get succeeded => outcome != PrepareOutcome.rejected;
 
   PrepareResult._reject(this.info, this.error)
-      : file    = File(''),
-        outcome = PrepareOutcome.rejected,
-        tempPath = null;
+    : file = File(''),
+      outcome = PrepareOutcome.rejected,
+      tempPath = null;
 }
 
 // ─── Exceptions ───────────────────────────────────────────────────────────────
@@ -394,7 +392,9 @@ class VanguardMediaPreparer {
     // lookupMimeType usage in file_compress.dart:221).
     // Native call follows for actual track-level info.
     try {
-      final raw = await _channel.invokeMethod<Map>('inspectMedia', {'path': path});
+      final raw = await _channel.invokeMethod<Map>('inspectMedia', {
+        'path': path,
+      });
       if (raw == null) return null;
       return MediaInfo._fromRaw(raw);
     } on PlatformException catch (e) {
@@ -538,7 +538,8 @@ class VanguardMediaPreparer {
     UploadConstraints constraints,
     UploadPolicy policy, {
     void Function(double progress)? onProgress,
-    Future<File> Function(File, {void Function(double)? onProgress})? videoFallback,
+    Future<File> Function(File, {void Function(double)? onProgress})?
+    videoFallback,
   }) async {
     // ── Step 1: Inspect ──────────────────────────────────────────────────────
     final info = await inspectMedia(input.path);
@@ -546,10 +547,22 @@ class VanguardMediaPreparer {
       return PrepareResult._reject(
         // Return a minimal fallback info for the rejected result
         const MediaInfo(
-          kind: MediaKind.unknown, container: '', videoCodec: '', audioCodec: '',
-          width: 0, height: 0, durationSeconds: -1, bitrateKbps: 0, fps: 0,
-          fileSizeBytes: 0, hasVideo: false, hasAudio: false, isHDR: false,
-          hasMoovAtFront: false, hasRotationTransform: false, hasEmbeddedMetadata: false,
+          kind: MediaKind.unknown,
+          container: '',
+          videoCodec: '',
+          audioCodec: '',
+          width: 0,
+          height: 0,
+          durationSeconds: -1,
+          bitrateKbps: 0,
+          fps: 0,
+          fileSizeBytes: 0,
+          hasVideo: false,
+          hasAudio: false,
+          isHDR: false,
+          hasMoovAtFront: false,
+          hasRotationTransform: false,
+          hasEmbeddedMetadata: false,
           // Orientation evidence defaults — safe for rejected/unknown files.
           orientationStatus: 'noVideoTrack',
         ),
@@ -566,19 +579,30 @@ class VanguardMediaPreparer {
       if (info.durationSeconds > 0 &&
           info.durationSeconds > constraints.maxDurationSeconds) {
         throw MediaTooLongException(
-            info.durationSeconds, constraints.maxDurationSeconds);
+          info.durationSeconds,
+          constraints.maxDurationSeconds,
+        );
       }
     }
 
     if (info.fileSizeBytes > constraints.maxFileSizeMb * 1024 * 1024) {
       return PrepareResult._reject(
-          info, 'File exceeds ${constraints.maxFileSizeMb}MB limit');
+        info,
+        'File exceeds ${constraints.maxFileSizeMb}MB limit',
+      );
     }
 
     // ── Step 3: Classify and execute ─────────────────────────────────────────
     switch (info.kind) {
       case MediaKind.video:
-        return _handleVideo(input, info, constraints, policy, onProgress, videoFallback);
+        return _handleVideo(
+          input,
+          info,
+          constraints,
+          policy,
+          onProgress,
+          videoFallback,
+        );
 
       case MediaKind.image:
         return _handleImage(input, info, constraints, policy);
@@ -586,7 +610,10 @@ class VanguardMediaPreparer {
       case MediaKind.audio:
         // No audio compression spec yet — pass through unchanged.
         return PrepareResult(
-            file: input, info: info, outcome: PrepareOutcome.passThrough);
+          file: input,
+          info: info,
+          outcome: PrepareOutcome.passThrough,
+        );
 
       case MediaKind.unknown:
         return PrepareResult._reject(info, 'Unsupported media format');
@@ -606,7 +633,9 @@ class VanguardMediaPreparer {
         final f = File(path);
         if (f.existsSync()) f.deleteSync();
       } catch (e) {
-        debugPrint('VanguardMediaPreparer.cleanupTempFiles: failed to delete $path — $e');
+        debugPrint(
+          'VanguardMediaPreparer.cleanupTempFiles: failed to delete $path — $e',
+        );
       }
     }
   }
@@ -619,27 +648,36 @@ class VanguardMediaPreparer {
     UploadConstraints constraints,
     UploadPolicy policy,
     void Function(double)? onProgress,
-    Future<File> Function(File, {void Function(double)? onProgress})? videoFallback,
+    Future<File> Function(File, {void Function(double)? onProgress})?
+    videoFallback,
   ) async {
     final outcome = _classifyVideo(info, constraints, policy);
 
     switch (outcome) {
       case PrepareOutcome.passThrough:
         return PrepareResult(
-            file: input, info: info, outcome: PrepareOutcome.passThrough);
+          file: input,
+          info: info,
+          outcome: PrepareOutcome.passThrough,
+        );
 
       case PrepareOutcome.normalized:
         // iOS: native normalizeVideo handler (AVAssetExportPresetPassthrough).
-        // Android: falls back to videoFallback (FFmpegKit) until native handler exists.
-        if (Platform.isIOS) {
+        // Android: native normalizeVideo handler (MediaExtractor + MediaMuxer
+        // passthrough remux, Phase 5-Unit AA / Phase 2-Unit AI). Both platforms
+        // fall back to videoFallback (or pass-through) on PlatformException.
+        if (Platform.isIOS || Platform.isAndroid) {
           return _normalizeVideoNative(input: input, info: info);
         }
-        debugPrint(
-            'VanguardMediaPreparer: normalize fallback (Android) '
-            'for ${p.basename(input.path)}');
-        if (videoFallback != null) return _runVideoFallback(input, info, onProgress, videoFallback);
+        if (videoFallback != null) {
+          return _runVideoFallback(input, info, onProgress, videoFallback);
+        }
         // No fallback: pass through rather than block upload.
-        return PrepareResult(file: input, info: info, outcome: PrepareOutcome.passThrough);
+        return PrepareResult(
+          file: input,
+          info: info,
+          outcome: PrepareOutcome.passThrough,
+        );
 
       case PrepareOutcome.transcoded:
         // iOS native compressVideo handler not yet implemented (plan step 8).
@@ -647,11 +685,18 @@ class VanguardMediaPreparer {
         // TODO(step-8): replace with native compressVideo on iOS;
         //               Android retains this fallback until hardware validation.
         debugPrint(
-            'VanguardMediaPreparer: transcode fallback '
-            'for ${p.basename(input.path)} '
-            '(native compressVideo pending plan step 8)');
-        if (videoFallback != null) return _runVideoFallback(input, info, onProgress, videoFallback);
-        return PrepareResult(file: input, info: info, outcome: PrepareOutcome.transcoded);
+          'VanguardMediaPreparer: transcode fallback '
+          'for ${p.basename(input.path)} '
+          '(native compressVideo pending plan step 8)',
+        );
+        if (videoFallback != null) {
+          return _runVideoFallback(input, info, onProgress, videoFallback);
+        }
+        return PrepareResult(
+          file: input,
+          info: info,
+          outcome: PrepareOutcome.transcoded,
+        );
 
       case PrepareOutcome.rejected:
         return PrepareResult._reject(info, 'Video failed validation');
@@ -668,56 +713,84 @@ class VanguardMediaPreparer {
     final tempOut = compressed.path != input.path ? compressed.path : null;
     if (tempOut != null) _tempPaths.add(tempOut);
     return PrepareResult(
-      file:     compressed,
-      info:     info,
-      outcome:  PrepareOutcome.transcoded,
+      file: compressed,
+      info: info,
+      outcome: PrepareOutcome.transcoded,
       tempPath: tempOut,
     );
   }
 
   /// Calls the native `normalizeVideo` handler.
-  /// iOS only. Performs lossless passthrough remux:
-  /// - moov repositioned to file head (faststart)
-  /// - privacy metadata stripped via AVMetadataItemFilter.forSharing()
+  /// iOS + Android. Performs lossless passthrough remux:
+  /// - video/audio samples unchanged (stream copy, no re-encode)
   /// - container-level rotation preserved (no pixel bake)
-  /// - video/audio samples unchanged
+  /// iOS-only: moov repositioned to file head (faststart); privacy metadata
+  /// stripped via AVMetadataItemFilter.forSharing().
+  /// Android non-claims: no faststart guarantee (moov is not repositioned);
+  /// metadata is not selectively filtered like AVMetadataItemFilter.forSharing()
+  /// -- the Android muxer only ever writes the track headers it was given plus
+  /// the orientation hint, and never calls setLocation().
   static Future<PrepareResult> _normalizeVideoNative({
     required File input,
     required MediaInfo info,
   }) async {
-    final dir      = p.dirname(input.path);
+    final dir = p.dirname(input.path);
     final baseName = p.basenameWithoutExtension(input.path);
-    final outPath  = p.join(dir, '${baseName}_vg_normalized.mp4');
+    final outPath = p.join(dir, '${baseName}_vg_normalized.mp4');
+
+    // Delete any stale derived output before invoking native: both native
+    // sides fail closed with OUTPUT_EXISTS rather than overwrite, so a
+    // leftover file from a previous run would otherwise permanently disable
+    // normalization for this input path. Mirrors ConnectsApp's
+    // vanguard_app_export_service.dart _tryNoEditNormalizeVideo, which calls
+    // _safeDelete(outputPath) before invoking normalizeVideo.
+    try {
+      final stale = File(outPath);
+      if (stale.existsSync()) stale.deleteSync();
+    } catch (_) {
+      // Best-effort — a leftover file still surfaces as OUTPUT_EXISTS below.
+    }
 
     try {
       final raw = await _channel.invokeMethod<Map>('normalizeVideo', {
-        'inputPath':  input.path,
+        'inputPath': input.path,
         'outputPath': outPath,
       });
 
       if (raw == null || raw['outputPath'] == null) {
-        debugPrint('VanguardMediaPreparer.normalizeVideo: native returned null — using original');
+        debugPrint(
+          'VanguardMediaPreparer.normalizeVideo: native returned null — using original',
+        );
         return PrepareResult(
-            file: input, info: info, outcome: PrepareOutcome.passThrough);
+          file: input,
+          info: info,
+          outcome: PrepareOutcome.passThrough,
+        );
       }
 
       final outFile = File(raw['outputPath'] as String);
       _tempPaths.add(outPath);
       return PrepareResult(
-        file:     outFile,
-        info:     info,
-        outcome:  PrepareOutcome.normalized,
+        file: outFile,
+        info: info,
+        outcome: PrepareOutcome.normalized,
         tempPath: outPath,
       );
     } on PlatformException catch (e) {
       // EXPORT_UNAVAILABLE means the asset format is incompatible with
-      // AVAssetExportPresetPassthrough (e.g. MKV, WebM containers).
+      // AVAssetExportPresetPassthrough (iOS) or has no readable video track /
+      // a non-cardinal rotation (Android; e.g. MKV, WebM containers).
       // EXPORT_FAILED means the export started but failed mid-run.
-      // In both cases: pass original through rather than blocking upload.
+      // EXPORT_IN_PROGRESS (Android) means another exportTimeline /
+      // exportPassthroughRemux / normalizeVideo call is already using the
+      // single-export lock — this call degrades to the original file exactly
+      // like the other codes rather than retrying or queuing.
+      // In all cases: pass original through rather than blocking upload.
       // TODO: escalate EXPORT_UNAVAILABLE to compressVideo once that handler exists.
       debugPrint(
-          'VanguardMediaPreparer.normalizeVideo PlatformException [${e.code}]: '
-          '${e.message} — using original for ${p.basename(input.path)}');
+        'VanguardMediaPreparer.normalizeVideo PlatformException [${e.code}]: '
+        '${e.message} — using original for ${p.basename(input.path)}',
+      );
       // Clean up any partial output the native side may have written before failing.
       try {
         final partial = File(outPath);
@@ -726,12 +799,14 @@ class VanguardMediaPreparer {
         // Best-effort — ignore secondary cleanup failure
       }
       return PrepareResult(
-          file: input, info: info, outcome: PrepareOutcome.passThrough);
+        file: input,
+        info: info,
+        outcome: PrepareOutcome.passThrough,
+      );
     }
   }
 
   // ── Image handler ─────────────────────────────────────────────────────────
-
 
   static Future<PrepareResult> _handleImage(
     File input,
@@ -744,7 +819,10 @@ class VanguardMediaPreparer {
     switch (outcome) {
       case PrepareOutcome.passThrough:
         return PrepareResult(
-            file: input, info: info, outcome: PrepareOutcome.passThrough);
+          file: input,
+          info: info,
+          outcome: PrepareOutcome.passThrough,
+        );
 
       case PrepareOutcome.normalized:
         // Image normalize = EXIF strip only, no resize.
@@ -752,16 +830,16 @@ class VanguardMediaPreparer {
         // TODO: add a lightweight native EXIF-strip-only path that avoids pixel re-encode.
         return _compressImageNative(
           input: input,
-          info:  info,
-          maxWidthPx:  info.width > 0 ? info.width : constraints.imageMaxWidthPx,
+          info: info,
+          maxWidthPx: info.width > 0 ? info.width : constraints.imageMaxWidthPx,
           jpegQuality: constraints.imageJpegQuality,
         );
 
       case PrepareOutcome.transcoded:
         return _compressImageNative(
-          input:       input,
-          info:        info,
-          maxWidthPx:  constraints.imageMaxWidthPx,
+          input: input,
+          info: info,
+          maxWidthPx: constraints.imageMaxWidthPx,
           jpegQuality: constraints.imageJpegQuality,
         );
 
@@ -777,37 +855,47 @@ class VanguardMediaPreparer {
     required double jpegQuality,
   }) async {
     // Build output path: same dir, _compressed suffix, always .jpg
-    final dir      = p.dirname(input.path);
+    final dir = p.dirname(input.path);
     final baseName = p.basenameWithoutExtension(input.path);
-    final outPath  = p.join(dir, '${baseName}_vg_compressed.jpg');
+    final outPath = p.join(dir, '${baseName}_vg_compressed.jpg');
 
     try {
       final raw = await _channel.invokeMethod<Map>('compressImage', {
-        'inputPath':   input.path,
-        'outputPath':  outPath,
-        'maxWidthPx':  maxWidthPx,
+        'inputPath': input.path,
+        'outputPath': outPath,
+        'maxWidthPx': maxWidthPx,
         'jpegQuality': jpegQuality,
       });
 
       if (raw == null || raw['outputPath'] == null) {
         // Fallback: return original image rather than throwing
-        debugPrint('VanguardMediaPreparer.compressImage: native returned null — using original');
+        debugPrint(
+          'VanguardMediaPreparer.compressImage: native returned null — using original',
+        );
         return PrepareResult(
-            file: input, info: info, outcome: PrepareOutcome.passThrough);
+          file: input,
+          info: info,
+          outcome: PrepareOutcome.passThrough,
+        );
       }
 
       final outFile = File(raw['outputPath'] as String);
       _tempPaths.add(outPath);
       return PrepareResult(
-        file:     outFile,
-        info:     info,
-        outcome:  PrepareOutcome.transcoded,
+        file: outFile,
+        info: info,
+        outcome: PrepareOutcome.transcoded,
         tempPath: outPath,
       );
     } on PlatformException catch (e) {
-      debugPrint('VanguardMediaPreparer.compressImage PlatformException: ${e.message} — using original');
+      debugPrint(
+        'VanguardMediaPreparer.compressImage PlatformException: ${e.message} — using original',
+      );
       return PrepareResult(
-          file: input, info: info, outcome: PrepareOutcome.passThrough);
+        file: input,
+        info: info,
+        outcome: PrepareOutcome.passThrough,
+      );
     }
   }
 
@@ -836,16 +924,16 @@ class VanguardMediaPreparer {
 
     // Audio codec check: treat '' (unknown Android) as safe (aac assumed).
     // See implementation plan §B4 amendment: unknown audioCodec → do not force transcode.
-    final audioOk = info.audioCodec.isEmpty ||
-        info.audioCodec == 'aac' ||
-        !info.hasAudio;
+    final audioOk =
+        info.audioCodec.isEmpty || info.audioCodec == 'aac' || !info.hasAudio;
     if (!audioOk) return PrepareOutcome.transcoded;
 
     // From here: codec/res/bitrate is acceptable for upload.
     // Check if normalization is still needed even though quality is good.
-    final needsNormalize = info.hasRotationTransform ||
-        info.container != 'mp4' ||          // MKV, WebM, AVI → remux to MP4
-        !info.hasMoovAtFront ||             // false by default (plan §B2); triggers remux
+    final needsNormalize =
+        info.hasRotationTransform ||
+        info.container != 'mp4' || // MKV, WebM, AVI → remux to MP4
+        !info.hasMoovAtFront || // false by default (plan §B2); triggers remux
         (policy.requireFastStart && !info.hasMoovAtFront) ||
         (policy.stripMetadata && info.hasEmbeddedMetadata);
 
@@ -867,7 +955,7 @@ class VanguardMediaPreparer {
     UploadConstraints constraints,
     UploadPolicy policy,
   ) {
-    final isJpeg  = info.container == 'jpeg';
+    final isJpeg = info.container == 'jpeg';
     final fitsRes = info.width <= constraints.imageMaxWidthPx;
 
     // Pass through: already JPEG at target size with no metadata issue
