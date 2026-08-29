@@ -14,6 +14,7 @@ import com.connects.vanguard_media_engine.audio.AndroidWaveformCacheCoordinator
 import com.connects.vanguard_media_engine.audio.AndroidWaveformExtractor
 import com.connects.vanguard_media_engine.audio.AndroidWaveformResult
 import com.connects.vanguard_media_engine.audio_extraction.AndroidAudioExtractionCoordinator
+import com.connects.vanguard_media_engine.audio_playback.AndroidAudioPlaybackCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
@@ -87,6 +88,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
     // Owns the six "waveformCache_*" routes -- Android parity with
     // VGWaveformCacheMethodHandler.swift.
     private var waveformCacheCoordinator: AndroidWaveformCacheCoordinator? = null
+
+    // ── Phase 5-Unit Y / Phase 4-Unit G: standalone audio playback coordinator ─
+    // Owns the seven "audioPlayback_*" routes -- Android parity with
+    // VGAudioPlaybackService.m (iOS).
+    private var audioPlaybackCoordinator: AndroidAudioPlaybackCoordinator? = null
 
     // ── Camera session state (B2: single camera instance invariant) ───────────
     // Mirrors iOS plugin: cameraSource + renderer stored at plugin level.
@@ -173,6 +179,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         )
         waveformCacheCoordinator = AndroidWaveformCacheCoordinator(
             context     = binding.applicationContext,
+            mainHandler = mainHandler,
+        )
+        audioPlaybackCoordinator = AndroidAudioPlaybackCoordinator(
             mainHandler = mainHandler,
         )
     }
@@ -286,6 +295,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android waveform cache coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidAudioPlaybackCoordinator.ownsMethod(call.method)) {
+            val coord = audioPlaybackCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android audio playback coordinator unavailable", null)
             }
             return
         }
@@ -1466,5 +1485,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         // Tear down Phase 5-Unit X / Phase 4-Unit F waveform cache coordinator.
         waveformCacheCoordinator?.disposeAll()
         waveformCacheCoordinator = null
+        // Tear down Phase 5-Unit Y / Phase 4-Unit G audio playback coordinator.
+        audioPlaybackCoordinator?.disposeAll()
+        audioPlaybackCoordinator = null
     }
 }

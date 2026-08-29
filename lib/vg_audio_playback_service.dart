@@ -1,7 +1,8 @@
 // vg_audio_playback_service.dart
-// vanguard_media_engine — Phase 8.16
+// vanguard_media_engine — Phase 8.16 / Phase 5-Unit Y / Phase 4-Unit G
 //
-// Dart bridge for native iOS AVPlayer-backed audio playback service.
+// Dart bridge for the native standalone audio playback service (iOS AVPlayer,
+// Android MediaPlayer).
 //
 // Scope:
 //   - VGAudioPlaybackService: static API calling audioPlayback_* MethodChannel methods.
@@ -11,7 +12,6 @@
 //   - No EventChannel/stream for position/state — poll getPosition() if needed.
 //   - No setRate/setSpeed (Phase 15).
 //   - No looping.
-//   - No Android implementation.
 //   - No AVAudioSession configuration (handled by native plugin at startup).
 
 import 'package:flutter/services.dart';
@@ -20,14 +20,15 @@ import 'package:flutter/services.dart';
 // VGAudioPlaybackService
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Standalone AVPlayer-backed audio playback service.
+/// Standalone native audio playback service (iOS AVPlayer, Android MediaPlayer).
 ///
-/// iOS only. Routes through the `audioPlayback_*` MethodChannel methods.
+/// Routes through the `audioPlayback_*` MethodChannel methods.
 /// Supports exactly one active audio file at a time — calling [load] while
 /// audio is playing stops the prior audio automatically on the native side.
 ///
-/// The native service does NOT configure AVAudioSession; the pre-activated
-/// `.playback` session shared with the rest of the Vanguard engine is used.
+/// On iOS, the native service does NOT configure AVAudioSession; the
+/// pre-activated `.playback` session shared with the rest of the Vanguard
+/// engine is used.
 ///
 /// Errors:
 ///   - [ArgumentError] for invalid Dart-side arguments.
@@ -89,16 +90,11 @@ abstract final class VGAudioPlaybackService {
   /// No-op natively if no audio is loaded.
   static Future<void> seekTo(double seconds) async {
     if (!seconds.isFinite || seconds < 0.0) {
-      throw ArgumentError.value(
-        seconds,
-        'seconds',
-        'must be finite and >= 0',
-      );
+      throw ArgumentError.value(seconds, 'seconds', 'must be finite and >= 0');
     }
-    await _channel.invokeMethod<void>(
-      'audioPlayback_seekTo',
-      {'seconds': seconds},
-    );
+    await _channel.invokeMethod<void>('audioPlayback_seekTo', {
+      'seconds': seconds,
+    });
   }
 
   /// Sets the playback volume.
@@ -116,10 +112,9 @@ abstract final class VGAudioPlaybackService {
         'must be finite and in range [0.0, 1.0]',
       );
     }
-    await _channel.invokeMethod<void>(
-      'audioPlayback_setVolume',
-      {'volume': volume},
-    );
+    await _channel.invokeMethod<void>('audioPlayback_setVolume', {
+      'volume': volume,
+    });
   }
 
   /// Returns the current playback position in seconds.
