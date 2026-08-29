@@ -76,6 +76,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke",
             "runAndroidDagPhase1AVGlesEvalRenderSmoke",
             "runAndroidDagPhase3UnitTThermalListenerSmoke",
+            "runAndroidVulkanExportNativeSeamSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -134,6 +135,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1ATGlesMixedTextureCompositorSmoke" -> runPhase1ATGlesMixedTextureCompositorSmoke(args, result)
             "runAndroidDagPhase1AVGlesEvalRenderSmoke" -> runPhase1AVGlesEvalRenderSmoke(args, result)
             "runAndroidDagPhase3UnitTThermalListenerSmoke" -> runPhase3UnitTThermalListenerSmoke(result)
+            "runAndroidVulkanExportNativeSeamSmoke" -> runAndroidVulkanExportNativeSeamSmoke(args, result)
             else -> return false
         }
         return true
@@ -215,6 +217,40 @@ class AndroidDagDiagnosticsCoordinator(
                 outputPath      = outputPath,
             )
             mainHandler.post { result.success(smokeResult) }
+        }.start()
+    }
+
+    private fun runAndroidVulkanExportNativeSeamSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val outputPath = args?.get("outputPath") as? String
+        if (outputPath.isNullOrBlank()) {
+            result.error("INVALID_ARG", "runAndroidVulkanExportNativeSeamSmoke: outputPath required", null)
+            return
+        }
+        val width           = (args["width"]           as? Number)?.toInt()  ?: 64
+        val height          = (args["height"]          as? Number)?.toInt()  ?: 64
+        val frameCount      = (args["frameCount"]      as? Number)?.toInt()  ?: 10
+        val frameDurationUs = (args["frameDurationUs"] as? Number)?.toLong() ?: 33333L
+        val bitrate         = (args["bitrate"]         as? Number)?.toInt()  ?: 1_000_000
+        Thread {
+            try {
+                val smokeResult = AndroidVulkanExportNativeSeamSmokeHarness.runSmoke(
+                    width           = width,
+                    height          = height,
+                    frameCount      = frameCount,
+                    frameDurationUs = frameDurationUs,
+                    bitrate         = bitrate,
+                    outputPath      = outputPath,
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "VULKAN_EXPORT_NATIVE_SEAM_SMOKE_FAILED",
+                        "runAndroidVulkanExportNativeSeamSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
         }.start()
     }
 

@@ -123,6 +123,26 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
+    // ── Vulkan-first export: native session seam (create/render/destroy) ────
+    external fun createAndroidTimelineVulkanExportSession(
+        surface: Surface,
+        width: Int,
+        height: Int,
+    ): String
+
+    external fun renderAndroidTimelineVulkanExportFrame(
+        sessionId: String,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        timelinePtsUs: Long,
+        frameIndex: Int,
+    ): String
+
+    external fun destroyAndroidTimelineVulkanExportSession(
+        sessionId: String,
+    ): String
+
     // ── Phase 1-Unit U: Android GLES backend offscreen EGL lifecycle smoke ──
     external fun runAndroidDagPhase1UGlesBackendSmoke(): String
 

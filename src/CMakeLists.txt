@@ -69,6 +69,7 @@ if (ANDROID)
     "platform/android/src/android_phase4a_decoder_smoke_jni.cpp"
     "platform/android/src/android_phase4b1_texture_playback_jni.cpp"
     "platform/android/src/android_phase5_encoder_smoke_jni.cpp"
+    "platform/android/src/android_vulkan_export_jni.cpp"
     "platform/android/src/android_gles_backend_smoke_jni.cpp"
     "platform/android/src/android_gles_import_smoke_jni.cpp"
     "platform/android/src/android_gles_render_frame_smoke_jni.cpp"
