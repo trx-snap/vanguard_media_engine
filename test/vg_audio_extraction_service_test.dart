@@ -66,7 +66,7 @@ void main() {
 
   group('2. Begin Contract', () {
     test(
-      'forced iOS returns VGAudioExtractionBeginStarted synchronously',
+      'forced supported platform (iOS/Android override) returns VGAudioExtractionBeginStarted synchronously',
       () async {
         VGAudioExtractionService.debugSetIsIOSOverrideForTesting(true);
         setHandler((call) async => {'outputPath': '/path/out.m4a'});

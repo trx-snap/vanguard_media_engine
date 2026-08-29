@@ -9,8 +9,8 @@
 //   VGAudioOnlyExporter  — AVAssetReader/Writer execution + quiescence (ObjC)
 //   VanguardMediaEnginePlugin  — thin routing only (Swift plugin)
 //
-// iOS only. Returns [VGAudioExtractionBeginResult.unsupportedPlatform] on
-// Android or any other unsupported platform. Does NOT modify Android code.
+// iOS and Android. Returns [VGAudioExtractionBeginResult.unsupportedPlatform]
+// on any other unsupported platform.
 //
 // Channel contract:
 //   beginAudioExtraction   → Map | FlutterError
@@ -285,14 +285,15 @@ final class VGAudioExtractionBeginUnsupported
 /// Uses the existing `vanguard_media_engine` [MethodChannel]. No separate
 /// channel is created — all routing goes through the shared plugin channel.
 ///
-/// Platform support: **iOS only**. On Android or any other platform, [begin]
+/// Platform support: **iOS and Android**. On any other platform, [begin]
 /// returns [VGAudioExtractionBeginResult.unsupportedPlatform] synchronously
 /// without invoking any channel method.
 ///
 /// [begin] is **synchronous** — it returns immediately with a
-/// [VGAudioExtractionBeginResult]. On iOS the native `beginAudioExtraction`
-/// call is sent asynchronously; [VGAudioExtractionOperation.result] resolves
-/// when the native pipeline reaches a terminal state.
+/// [VGAudioExtractionBeginResult]. On iOS/Android the native
+/// `beginAudioExtraction` call is sent asynchronously;
+/// [VGAudioExtractionOperation.result] resolves when the native pipeline
+/// reaches a terminal state.
 ///
 /// Usage:
 /// ```dart
@@ -340,11 +341,11 @@ final class VGAudioExtractionService {
   ///   [VGAudioExtractionError.invalidArgument] on [operation.result].
   ///
   /// Returns [VGAudioExtractionBeginResult.unsupportedPlatform] immediately on
-  /// non-iOS platforms — no operation is created, no channel method is invoked.
+  /// unsupported platforms — no operation is created, no channel method is invoked.
   ///
-  /// On iOS, returns [VGAudioExtractionBeginStarted] immediately. The native
-  /// `beginAudioExtraction` call is sent asynchronously and its completion
-  /// resolves [VGAudioExtractionOperation.result].
+  /// On iOS/Android, returns [VGAudioExtractionBeginStarted] immediately. The
+  /// native `beginAudioExtraction` call is sent asynchronously and its
+  /// completion resolves [VGAudioExtractionOperation.result].
   static VGAudioExtractionBeginResult begin({
     required String operationId,
     required String sourcePath,
@@ -352,9 +353,10 @@ final class VGAudioExtractionService {
     double? trimStartSeconds,
     double? trimEndSeconds,
   }) {
-    // Platform gate — iOS only (or overridden for testing).
-    final isIOS = _debugIsIOSOverride ?? Platform.isIOS;
-    if (!isIOS) {
+    // Platform gate — iOS/Android only (or overridden for testing).
+    final isSupportedPlatform =
+        _debugIsIOSOverride ?? (Platform.isIOS || Platform.isAndroid);
+    if (!isSupportedPlatform) {
       return VGAudioExtractionBeginResult.unsupportedPlatform;
     }
 

@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.annotation.NonNull
+import com.connects.vanguard_media_engine.audio_extraction.AndroidAudioExtractionCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
@@ -72,6 +73,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
     // Owns "prepareReverseSidecars", "getSidecarStatus", "cleanupReverseSidecars".
     // Never emits state=ready in this slice — see AndroidReverseSidecarCoordinator.
     private var reverseSidecarCoordinator: AndroidReverseSidecarCoordinator? = null
+
+    // ── Phase 5-Unit V / Phase 4-Unit D: managed audio extraction coordinator ──
+    // Owns "beginAudioExtraction" and "cancelAudioExtraction" -- Android parity
+    // with VanguardAudioExtractionHandler.swift.
+    private var audioExtractionCoordinator: AndroidAudioExtractionCoordinator? = null
 
     // ── Camera session state (B2: single camera instance invariant) ───────────
     // Mirrors iOS plugin: cameraSource + renderer stored at plugin level.
@@ -143,6 +149,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             mainHandler     = mainHandler,
         )
         reverseSidecarCoordinator = AndroidReverseSidecarCoordinator(
+            context     = binding.applicationContext,
+            mainHandler = mainHandler,
+        )
+        audioExtractionCoordinator = AndroidAudioExtractionCoordinator(
             context     = binding.applicationContext,
             mainHandler = mainHandler,
         )
@@ -237,6 +247,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android reverse sidecar coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidAudioExtractionCoordinator.ownsMethod(call.method)) {
+            val coord = audioExtractionCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android audio extraction coordinator unavailable", null)
             }
             return
         }
@@ -1368,5 +1388,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         // Tear down Phase 5-Unit Q reverse sidecar coordinator state + executor.
         reverseSidecarCoordinator?.disposeAll()
         reverseSidecarCoordinator = null
+        // Tear down Phase 5-Unit V / Phase 4-Unit D audio extraction coordinator.
+        audioExtractionCoordinator?.disposeAll()
+        audioExtractionCoordinator = null
     }
 }
