@@ -11,7 +11,7 @@
 // JNI entry points (matching VanguardNativeBridge.kt declarations):
 //   createAndroidTimelineVulkanExportSession         -> jstring
 //   renderAndroidTimelineVulkanExportFrame           -> jstring
-//   renderAndroidTimelineVulkanExportFrameCropped     -> jstring
+//   renderAndroidTimelineVulkanExportFrameCropped     -> jstring (crop + rotationDegrees, 0/180 only)
 //   destroyAndroidTimelineVulkanExportSession        -> jstring
 
 #include <jni.h>
@@ -341,6 +341,10 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 // HardwareBufferDescriptor (the source of truth), not the Kotlin-supplied
 // width/height, which are cross-checked against the session's own attached
 // surface extent instead. Any mismatch fails closed without rendering.
+// [rotationDegrees] must be exactly 0 or 180 (this Vulkan export slice is
+// same-geometry 0/180 only; 90/270 stay on the GLES backend) -- an invalid
+// value fails closed with a distinct reason before the HardwareBuffer is
+// even imported.
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidTimelineVulkanExportFrameCropped(
     JNIEnv*  env,
@@ -353,6 +357,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     jint     cropTop,
     jint     cropRight,
     jint     cropBottom,
+    jint     rotationDegrees,
     jlong    timelinePtsUs,
     jint     frameIndex) {
 
@@ -363,6 +368,13 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         std::snprintf(status, sizeof(status),
             "status=FAIL;frameIndex=%d;reason=invalid_crop:invalid_args",
             static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (rotationDegrees != 0 && rotationDegrees != 180) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=vulkan_rotation_unsupported:%d",
+            static_cast<int>(frameIndex), static_cast<int>(rotationDegrees));
         return env->NewStringUTF(status);
     }
 
@@ -461,6 +473,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         // Fall through without rendering; buffer is still released below.
     } else {
         vanguard::render::VideoFrameTransform transform{};
+        transform.rotationDegrees = static_cast<uint32_t>(rotationDegrees);
         transform.cropScaleU =
             static_cast<float>(cropRight - cropLeft) / static_cast<float>(descriptor.width);
         transform.cropScaleV =

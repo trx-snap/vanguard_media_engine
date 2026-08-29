@@ -148,7 +148,9 @@ class VanguardNativeBridge(
     // ([cropLeft],[cropTop])-([cropRight],[cropBottom]) of [hardwareBuffer],
     // which may be padded larger than [width]x[height]. Native cross-checks
     // the crop against the AHardwareBuffer's own imported descriptor
-    // dimensions, not just the Kotlin-supplied width/height.
+    // dimensions, not just the Kotlin-supplied width/height. [rotationDegrees]
+    // must be exactly 0 or 180 -- native fails closed before importing or
+    // rendering the buffer for any other value (90/270 stay GLES-only).
     external fun renderAndroidTimelineVulkanExportFrameCropped(
         sessionId: String,
         hardwareBuffer: HardwareBuffer,
@@ -158,6 +160,7 @@ class VanguardNativeBridge(
         cropTop: Int,
         cropRight: Int,
         cropBottom: Int,
+        rotationDegrees: Int,
         timelinePtsUs: Long,
         frameIndex: Int,
     ): String

@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
+import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
@@ -37,9 +38,23 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         fps: Int = 30,
         bitrateBps: Int = 4_000_000,
         trimEndSeconds: Double = 1.0,
+        sourceRotationDegrees: Int = 0,
     ): Map<String, Any?> {
         val outDirFile = File(outputDir)
         val sourceMode = if (useSyntheticSource) "synthetic" else "provided"
+
+        if (sourceRotationDegrees !in setOf(0, 90, 180, 270)) {
+            return failMap(
+                reason = "invalid_source_rotation_degrees: $sourceRotationDegrees",
+                sourceMode = sourceMode,
+                sourcePath = sourcePath ?: "",
+                generatedSourcePath = null,
+                generatedSourceSize = 0L,
+                sourceRotationDegrees = sourceRotationDegrees,
+                prodPath = "",
+                glesPath = "",
+            )
+        }
 
         if (!outDirFile.exists() || !outDirFile.isDirectory) {
             return failMap(
@@ -48,6 +63,7 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                 sourcePath = sourcePath ?: "",
                 generatedSourcePath = null,
                 generatedSourceSize = 0L,
+                sourceRotationDegrees = sourceRotationDegrees,
                 prodPath = "",
                 glesPath = "",
             )
@@ -68,6 +84,7 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                 fps = fps,
                 bitrateBps = bitrateBps,
                 trimEndSeconds = trimEndSeconds,
+                sourceRotationDegrees = sourceRotationDegrees,
             )
             val genFile = File(genPath)
             if (!genSuccess || !genFile.exists() || genFile.length() <= 0L) {
@@ -78,6 +95,7 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                     sourcePath = genPath,
                     generatedSourcePath = genPath,
                     generatedSourceSize = 0L,
+                    sourceRotationDegrees = sourceRotationDegrees,
                     prodPath = "",
                     glesPath = "",
                 )
@@ -92,6 +110,7 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                     sourcePath = "",
                     generatedSourcePath = null,
                     generatedSourceSize = 0L,
+                    sourceRotationDegrees = sourceRotationDegrees,
                     prodPath = "",
                     glesPath = "",
                 )
@@ -104,11 +123,27 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                     sourcePath = sourcePath,
                     generatedSourcePath = null,
                     generatedSourceSize = 0L,
+                    sourceRotationDegrees = sourceRotationDegrees,
                     prodPath = "",
                     glesPath = "",
                 )
             }
             effectiveSourcePath = sourcePath
+        }
+
+        val sourceMetadataRotationDegrees = readSourceMetadataRotationDegrees(effectiveSourcePath)
+        if (sourceRotationDegrees != 0 && sourceMetadataRotationDegrees != sourceRotationDegrees) {
+            return failMap(
+                reason = "source_rotation_metadata_mismatch:expected=$sourceRotationDegrees:actual=$sourceMetadataRotationDegrees",
+                sourceMode = sourceMode,
+                sourcePath = effectiveSourcePath,
+                generatedSourcePath = generatedSourcePath,
+                generatedSourceSize = generatedSourceSize,
+                sourceRotationDegrees = sourceRotationDegrees,
+                sourceMetadataRotationDegrees = sourceMetadataRotationDegrees,
+                prodPath = "",
+                glesPath = "",
+            )
         }
 
         val prodOutputPath = File(outDirFile, "vulkan_production_wiring_${timestamp}_production.mp4").absolutePath
@@ -216,6 +251,8 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                     sourcePath = effectiveSourcePath,
                     generatedSourcePath = generatedSourcePath,
                     generatedSourceSize = generatedSourceSize,
+                    sourceRotationDegrees = sourceRotationDegrees,
+                    sourceMetadataRotationDegrees = sourceMetadataRotationDegrees,
                     prodPass = prodPass,
                     glesPass = glesPass,
                     pixelPass = pixelPass,
@@ -250,7 +287,7 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                 trimEndSeconds = trimEndSeconds,
                 decodedWidth = width,
                 decodedHeight = height,
-                rotationDegrees = 0,
+                rotationDegrees = sourceRotationDegrees,
                 mediaKind = "video",
             )
 
@@ -279,6 +316,8 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                     sourcePath = effectiveSourcePath,
                     generatedSourcePath = generatedSourcePath,
                     generatedSourceSize = generatedSourceSize,
+                    sourceRotationDegrees = sourceRotationDegrees,
+                    sourceMetadataRotationDegrees = sourceMetadataRotationDegrees,
                     prodPass = prodPass,
                     glesPass = glesPass,
                     pixelPass = pixelPass,
@@ -348,6 +387,8 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                 sourcePath = effectiveSourcePath,
                 generatedSourcePath = generatedSourcePath,
                 generatedSourceSize = generatedSourceSize,
+                sourceRotationDegrees = sourceRotationDegrees,
+                sourceMetadataRotationDegrees = sourceMetadataRotationDegrees,
                 prodPass = prodPass,
                 glesPass = glesPass,
                 pixelPass = pixelPass,
@@ -375,6 +416,8 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                 sourcePath = effectiveSourcePath,
                 generatedSourcePath = generatedSourcePath,
                 generatedSourceSize = generatedSourceSize,
+                sourceRotationDegrees = sourceRotationDegrees,
+                sourceMetadataRotationDegrees = sourceMetadataRotationDegrees,
                 prodPass = prodPass,
                 glesPass = glesPass,
                 pixelPass = pixelPass,
@@ -411,7 +454,13 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         fps: Int,
         bitrateBps: Int,
         trimEndSeconds: Double,
+        sourceRotationDegrees: Int = 0,
     ): Boolean {
+        if (sourceRotationDegrees !in setOf(0, 90, 180, 270)) {
+            Log.e(TAG, "generateSyntheticSourceVideo: non-cardinal rotationDegrees: $sourceRotationDegrees")
+            return false
+        }
+
         val targetFrames = max(1, (fps * trimEndSeconds).toInt())
         val framesToDraw = targetFrames + 1
         val frameDurationUs = (1_000_000L / fps).coerceAtLeast(1L)
@@ -436,6 +485,7 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             encoderSurface = codec.createInputSurface()
             muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            muxer.setOrientationHint(sourceRotationDegrees)
             codec.start()
 
             val bufferInfo = MediaCodec.BufferInfo()
@@ -543,6 +593,49 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         }
     }
 
+    private fun readSourceMetadataRotationDegrees(videoPath: String): Int {
+        var rawRotation: Int? = null
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(videoPath)
+            val trackCount = extractor.trackCount
+            for (i in 0 until trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME)
+                if (mime != null && mime.startsWith("video/")) {
+                    if (format.containsKey(MediaFormat.KEY_ROTATION)) {
+                        rawRotation = format.getInteger(MediaFormat.KEY_ROTATION)
+                    }
+                    break
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "readSourceMetadataRotationDegrees: MediaExtractor failed for $videoPath: $t")
+        } finally {
+            try { extractor.release() } catch (_: Throwable) {}
+        }
+
+        if (rawRotation == null) {
+            val mmr = MediaMetadataRetriever()
+            try {
+                mmr.setDataSource(videoPath)
+                val rotStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                rawRotation = rotStr?.toIntOrNull()
+            } catch (t: Throwable) {
+                Log.w(TAG, "readSourceMetadataRotationDegrees: MediaMetadataRetriever fallback failed for $videoPath: $t")
+            } finally {
+                try { mmr.release() } catch (_: Throwable) {}
+            }
+        }
+
+        val raw = rawRotation ?: 0
+        val normalized = ((raw % 360) + 360) % 360
+        return when (normalized) {
+            0, 90, 180, 270 -> normalized
+            else -> 0
+        }
+    }
+
     private data class RgbTriple(val r: Double, val g: Double, val b: Double)
 
     private fun extractFrame(videoPath: String, timeUs: Long): Bitmap? {
@@ -597,6 +690,8 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         sourcePath: String,
         generatedSourcePath: String?,
         generatedSourceSize: Long,
+        sourceRotationDegrees: Int,
+        sourceMetadataRotationDegrees: Int = 0,
         prodPass: Boolean,
         glesPass: Boolean,
         pixelPass: Boolean,
@@ -617,7 +712,7 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         val statusStr = if (pass) "PASS" else "FAIL"
         Log.i(
             TAG,
-            "ANDROID_VULKAN_EXPORT_PRODUCTION_WIRING_RESULT status=$statusStr;reason=$reason;sourceMode=$sourceMode;productionBytes=$prodSize;glesBytes=$glesSize;meanAbsDiff=$meanAbsDiff",
+            "ANDROID_VULKAN_EXPORT_PRODUCTION_WIRING_RESULT status=$statusStr;reason=$reason;sourceMode=$sourceMode;sourceRotationDegrees=$sourceRotationDegrees;sourceMetadataRotationDegrees=$sourceMetadataRotationDegrees;productionBytes=$prodSize;glesBytes=$glesSize;meanAbsDiff=$meanAbsDiff",
         )
 
         if (!pass) {
@@ -640,6 +735,8 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             "sourcePath" to sourcePath,
             "generatedSourcePath" to generatedSourcePath,
             "generatedSourceSize" to generatedSourceSize,
+            "sourceRotationDegrees" to sourceRotationDegrees,
+            "sourceMetadataRotationDegrees" to sourceMetadataRotationDegrees,
             "productionPass" to prodPass,
             "glesPass" to glesPass,
             "pixelPass" to pixelPass,
@@ -666,6 +763,8 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         sourcePath: String,
         generatedSourcePath: String?,
         generatedSourceSize: Long,
+        sourceRotationDegrees: Int = 0,
+        sourceMetadataRotationDegrees: Int = 0,
         prodPath: String,
         glesPath: String,
     ): Map<String, Any?> {
@@ -676,6 +775,8 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             sourcePath = sourcePath,
             generatedSourcePath = generatedSourcePath,
             generatedSourceSize = generatedSourceSize,
+            sourceRotationDegrees = sourceRotationDegrees,
+            sourceMetadataRotationDegrees = sourceMetadataRotationDegrees,
             prodPass = false,
             glesPass = false,
             pixelPass = false,

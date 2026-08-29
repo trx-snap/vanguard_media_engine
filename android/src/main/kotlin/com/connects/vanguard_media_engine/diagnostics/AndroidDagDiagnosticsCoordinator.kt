@@ -1040,6 +1040,7 @@ class AndroidDagDiagnosticsCoordinator(
         val fps = (args["fps"] as? Number)?.toInt() ?: 30
         val bitrateBps = (args["bitrateBps"] as? Number)?.toInt() ?: 4_000_000
         val trimEndSeconds = (args["trimEndSeconds"] as? Number)?.toDouble() ?: 1.0
+        val sourceRotationDegrees = (args["sourceRotationDegrees"] as? Number)?.toInt() ?: 0
 
         Thread {
             try {
@@ -1053,6 +1054,7 @@ class AndroidDagDiagnosticsCoordinator(
                     fps = fps,
                     bitrateBps = bitrateBps,
                     trimEndSeconds = trimEndSeconds,
+                    sourceRotationDegrees = sourceRotationDegrees,
                 )
                 mainHandler.post { result.success(smokeResult) }
             } catch (t: Throwable) {

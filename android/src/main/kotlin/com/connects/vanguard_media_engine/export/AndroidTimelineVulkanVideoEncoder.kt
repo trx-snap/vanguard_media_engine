@@ -281,7 +281,13 @@ class AndroidTimelineVulkanVideoEncoder(
 
             val mime = trackFormat.getString(MediaFormat.KEY_MIME)!!
             val dec = MediaCodec.createDecoderByType(mime)
-            dec.configure(trackFormat, reader.surface, null, 0)
+            // Zero any decoder/vendor KEY_ROTATION metadata before configure --
+            // this class applies clip.rotationDegrees explicitly via the native
+            // render transform, so leaving track KEY_ROTATION intact would
+            // double-rotate the ImageReader buffer.
+            val decodeFormat = MediaFormat(trackFormat)
+            decodeFormat.setInteger(MediaFormat.KEY_ROTATION, 0)
+            dec.configure(decodeFormat, reader.surface, null, 0)
             dec.start()
             decoder = dec
 
@@ -324,7 +330,7 @@ class AndroidTimelineVulkanVideoEncoder(
                             dec.releaseOutputBuffer(outIdx, true)
                             val image = imageQueue.poll(IMAGE_ACQUIRE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                                 ?: return "vulkan_image_acquire_timeout:${clip.sourcePath}"
-                            val frameFailure = renderImageIntoSession(image)
+                            val frameFailure = renderImageIntoSession(image, clip.rotationDegrees)
                             if (frameFailure != null) return frameFailure
                             renderedFramesInClip++
                         } else {
@@ -367,6 +373,13 @@ class AndroidTimelineVulkanVideoEncoder(
     /// [image]'s HardwareBuffer, then [image] itself, before returning on
     /// every path. Returns a machine-readable failure reason, or null.
     ///
+    /// [rotationDegrees] is the clip's rotation (already validated to 0 or
+    /// 180 by AndroidExportRenderBackendSelector's safe-scope gate for the
+    /// clip list as a whole, but re-checked here per frame since this method
+    /// fails closed independently of that upstream gate) -- passed into the
+    /// native crop-aware render seam so the Vulkan render transform, not
+    /// decoder/vendor metadata, applies the rotation.
+    ///
     /// Enforces the Opus P1 real-buffer geometry guard on every frame (not
     /// just a clip's first frame): real decoder HardwareBuffers can be
     /// padded larger than the display crop even when track metadata (and
@@ -375,9 +388,13 @@ class AndroidTimelineVulkanVideoEncoder(
     /// valid, same-size, even-aligned slice of the (possibly padded) buffer
     /// is rendered via the native crop-aware seam; anything else fails
     /// closed without rendering partial output.
-    private fun renderImageIntoSession(image: Image): String? {
+    private fun renderImageIntoSession(image: Image, rotationDegrees: Int): String? {
         var hwBuf: HardwareBuffer? = null
         try {
+            if (rotationDegrees != 0 && rotationDegrees != 180) {
+                return "vulkan_rotation_unsupported:$rotationDegrees"
+            }
+
             hwBuf = image.hardwareBuffer
                 ?: return "vulkan_decoder_buffer_geometry_mismatch:hardware_buffer_null"
 
@@ -430,6 +447,7 @@ class AndroidTimelineVulkanVideoEncoder(
                 cropTop = cropRect.top,
                 cropRight = cropRect.right,
                 cropBottom = cropRect.bottom,
+                rotationDegrees = rotationDegrees,
                 timelinePtsUs = timelinePtsUs,
                 frameIndex = renderedFrames,
             )
