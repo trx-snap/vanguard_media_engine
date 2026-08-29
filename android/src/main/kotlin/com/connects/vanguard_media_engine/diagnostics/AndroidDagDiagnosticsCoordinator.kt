@@ -78,6 +78,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase3UnitTThermalListenerSmoke",
             "runAndroidVulkanExportNativeSeamSmoke",
             "runAndroidVulkanExportProductionWiringSmoke",
+            "runAndroidGlesExportFitGeometrySmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -138,6 +139,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase3UnitTThermalListenerSmoke" -> runPhase3UnitTThermalListenerSmoke(result)
             "runAndroidVulkanExportNativeSeamSmoke" -> runAndroidVulkanExportNativeSeamSmoke(args, result)
             "runAndroidVulkanExportProductionWiringSmoke" -> runAndroidVulkanExportProductionWiringSmoke(args, result)
+            "runAndroidGlesExportFitGeometrySmoke" -> runAndroidGlesExportFitGeometrySmoke(args, result)
             else -> return false
         }
         return true
@@ -1070,6 +1072,40 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "VULKAN_EXPORT_PRODUCTION_WIRING_SMOKE_FAILED",
                         "runAndroidVulkanExportProductionWiringSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── GLES fallback 90/270 fit geometry smoke harness ─────────────────────
+    private fun runAndroidGlesExportFitGeometrySmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val outputDir = args?.get("outputDir") as? String
+        if (outputDir.isNullOrBlank()) {
+            result.error(
+                "INVALID_ARG",
+                "runAndroidGlesExportFitGeometrySmoke: outputDir required",
+                null,
+            )
+            return
+        }
+        val fps = (args["fps"] as? Number)?.toInt() ?: 30
+        val bitrateBps = (args["bitrateBps"] as? Number)?.toInt() ?: 4_000_000
+
+        Thread {
+            try {
+                val smokeResult = AndroidGlesExportFitGeometrySmokeHarness.run(
+                    outputDir = outputDir,
+                    fps = fps,
+                    bitrateBps = bitrateBps,
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "GLES_EXPORT_FIT_GEOMETRY_SMOKE_FAILED",
+                        "runAndroidGlesExportFitGeometrySmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

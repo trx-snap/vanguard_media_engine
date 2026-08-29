@@ -598,20 +598,25 @@ class AndroidTimelineVideoEncoder(
             displayHeight = decodedHeight.toFloat()
         }
         val scale = min(width.toFloat() / displayWidth, height.toFloat() / displayHeight)
-        val halfX = (decodedWidth * scale) / width.toFloat()
-        val halfY = (decodedHeight * scale) / height.toFloat()
+        val halfPixelX = decodedWidth.toFloat() * scale / 2f
+        val halfPixelY = decodedHeight.toFloat() * scale / 2f
 
         // Mathematical positive angles are CCW; clip rotation metadata is
         // clockwise, hence the negated angle here.
         val radians = Math.toRadians(-clip.rotationDegrees.toDouble())
         val cosR = cos(radians).toFloat()
         val sinR = sin(radians).toFloat()
-        fun rotated(x: Float, y: Float) = floatArrayOf(x * cosR - y * sinR, x * sinR + y * cosR)
+        fun rotatedPixel(x: Float, y: Float) = floatArrayOf(x * cosR - y * sinR, x * sinR + y * cosR)
+        // Rotate in pixel space first, then convert per-axis to NDC -- on
+        // non-square canvases NDC is anisotropic, so rotating already-
+        // normalized NDC coordinates would transpose/distort 90/270 fit.
+        fun toNdc(p: FloatArray) =
+            floatArrayOf(p[0] / (width.toFloat() / 2f), p[1] / (height.toFloat() / 2f))
 
-        val bl = rotated(-halfX, -halfY)
-        val br = rotated(halfX, -halfY)
-        val tl = rotated(-halfX, halfY)
-        val tr = rotated(halfX, halfY)
+        val bl = toNdc(rotatedPixel(-halfPixelX, -halfPixelY))
+        val br = toNdc(rotatedPixel(halfPixelX, -halfPixelY))
+        val tl = toNdc(rotatedPixel(-halfPixelX, halfPixelY))
+        val tr = toNdc(rotatedPixel(halfPixelX, halfPixelY))
 
         quadBuffer.position(0)
         quadBuffer.put(floatArrayOf(bl[0], bl[1], br[0], br[1], tl[0], tl[1], tr[0], tr[1]))
