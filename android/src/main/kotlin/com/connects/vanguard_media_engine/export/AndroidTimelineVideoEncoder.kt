@@ -30,8 +30,14 @@ import kotlin.math.sin
 
 // ── AndroidTimelineVideoEncoder (Export Unit C) ───────────────────────────────
 //
-// Export-owned H.264 surface-input encoder for the production `exportTimeline`
-// route. Fully independent of the legacy `VanguardMediaCodecEncoder` (dev/proof
+// GLES fallback / frozen-export-path implementation of
+// [AndroidTimelineVideoPassEncoder] for the production `exportTimeline`
+// route. Vulkan is the preferred/default render backend for new export
+// development (see AndroidExportRenderBackendSelector); this class remains
+// the only implemented pass-1 render path until a Vulkan export baseline
+// exists, and is not the architectural primary for future parity features --
+// it must not grow new rendering behaviour beyond what it already does.
+// Fully independent of the legacy `VanguardMediaCodecEncoder` (dev/proof
 // path) -- no shared state, no MethodChannel calls, no onExportComplete
 // callback. This class is never reused by legacy `startExport`.
 //
@@ -68,7 +74,7 @@ class AndroidTimelineVideoEncoder(
     private val height: Int,
     private val fps: Int,
     private val bitrateBps: Int,
-) {
+) : AndroidTimelineVideoPassEncoder {
     data class ClipInput(
         val sourcePath: String,
         val trimStartSeconds: Double,
@@ -91,7 +97,7 @@ class AndroidTimelineVideoEncoder(
     @Volatile private var cancelRequested = false
 
     /** Signals the encode loop to stop feeding new frames. Thread-safe. */
-    fun cancel() {
+    override fun cancel() {
         cancelRequested = true
     }
 
@@ -144,7 +150,7 @@ class AndroidTimelineVideoEncoder(
     /// clips contribute [ClipInput.stillFrameCount]; video clips contribute
     /// ceil((trimEndSeconds - trimStartSeconds) * fps), floored at 1. When
     /// the total is <= 0, no sample progress is emitted.
-    fun encode(clips: List<ClipInput>, onProgress: ((Double) -> Unit)? = null): EncodeResult {
+    override fun encode(clips: List<ClipInput>, onProgress: ((Double) -> Unit)?): EncodeResult {
         this.onProgress = onProgress
         totalExpectedSamples = clips.sumOf { clip ->
             if (clip.mediaKind == "image") {

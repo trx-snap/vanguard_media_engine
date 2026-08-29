@@ -41,7 +41,7 @@ import kotlin.math.floor
 class AndroidTimelineExportSession(private val context: Context) {
 
     @Volatile private var cancelRequested = false
-    @Volatile private var activeEncoder: AndroidTimelineVideoEncoder? = null
+    @Volatile private var activeEncoder: AndroidTimelineVideoPassEncoder? = null
 
     /** Requests cancellation of the in-flight export. Thread-safe, non-blocking. */
     fun requestCancel() {
@@ -318,6 +318,7 @@ class AndroidTimelineExportSession(private val context: Context) {
 
         if (cancelRequested) {
             deleteOwnedTemps()
+            logTerminal("cancelled_before_encode", backend = null)
             onError("EXPORT_CANCELLED", "exportTimeline: cancelled before encode started")
             return
         }
@@ -352,7 +353,9 @@ class AndroidTimelineExportSession(private val context: Context) {
             )
         }
 
-        val encoder = AndroidTimelineVideoEncoder(
+        val backendDecision = AndroidExportRenderBackendSelector().select()
+
+        val encoder: AndroidTimelineVideoPassEncoder = AndroidTimelineVideoEncoder(
             outputPath = videoTempPath,
             width = requestWidth,
             height = requestHeight,
@@ -369,8 +372,10 @@ class AndroidTimelineExportSession(private val context: Context) {
         if (!encodeResult.success) {
             deleteOwnedTemps()
             if (cancelRequested || encodeResult.reason == "cancelled") {
+                logTerminal("cancelled_during_encode", backendDecision.actualBackend)
                 onError("EXPORT_CANCELLED", "exportTimeline: cancelled during video encode")
             } else {
+                logTerminal("pass1_failed", backendDecision.actualBackend)
                 onError("EXPORT_FAILED", "exportTimeline: pass-1 video encode failed: ${encodeResult.reason}")
             }
             return
@@ -378,6 +383,7 @@ class AndroidTimelineExportSession(private val context: Context) {
 
         if (cancelRequested) {
             deleteOwnedTemps()
+            logTerminal("cancelled_after_encode", backendDecision.actualBackend)
             onError("EXPORT_CANCELLED", "exportTimeline: cancelled after video encode")
             return
         }
@@ -396,12 +402,14 @@ class AndroidTimelineExportSession(private val context: Context) {
         )
         if (pass2Failure != null) {
             deleteOwnedTemps()
+            logTerminal("pass2_failed", backendDecision.actualBackend)
             onError("EXPORT_FAILED", "exportTimeline: pass-2 audio mux failed: $pass2Failure")
             return
         }
 
         if (cancelRequested) {
             deleteOwnedTemps()
+            logTerminal("cancelled_after_audio_mux", backendDecision.actualBackend)
             onError("EXPORT_CANCELLED", "exportTimeline: cancelled after audio mux")
             return
         }
@@ -414,6 +422,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         val durationSeconds = probeMediaDurationSeconds(finalTmpPath)
         if (durationSeconds == null) {
             deleteOwnedTemps()
+            logTerminal("finalize_failed", backendDecision.actualBackend)
             onError("EXPORT_FAILED", "exportTimeline: failed to measure output duration")
             return
         }
@@ -426,11 +435,13 @@ class AndroidTimelineExportSession(private val context: Context) {
             )
         ) {
             deleteOwnedTemps()
+            logTerminal("finalize_failed", backendDecision.actualBackend)
             onError("EXPORT_FAILED", "exportTimeline: failed to stage ROI sidecar at $roiSidecarTempPath")
             return
         }
         if (!AndroidTimelineRoiSidecarEmitter.finalizeSidecar(roiSidecarTempPath, roiSidecarPath)) {
             deleteOwnedTemps()
+            logTerminal("finalize_failed", backendDecision.actualBackend)
             onError("EXPORT_FAILED", "exportTimeline: failed to finalize ROI sidecar at $roiSidecarPath")
             return
         }
@@ -442,12 +453,14 @@ class AndroidTimelineExportSession(private val context: Context) {
             // not recoverable here -- wrong ROI is worse than empty ROI, and
             // this sidecar is empty either way, so it is left in place.
             deleteOwnedTemps()
+            logTerminal("finalize_failed", backendDecision.actualBackend)
             onError("EXPORT_FAILED", "exportTimeline: failed to finalize output at $outputPath")
             return
         }
         try { File(videoTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
         try { File(audioTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
 
+        logTerminal("success", backendDecision.actualBackend)
         onSuccess(
             mapOf(
                 "success" to true,
@@ -519,6 +532,17 @@ class AndroidTimelineExportSession(private val context: Context) {
         if (abs(track.duration - pass1VideoDuration) > DURATION_TOLERANCE_SECONDS) return false
 
         return true
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Terminal-state logging (one row per export run -- never per-frame)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Logs exactly one VG_EXPORT_TERMINAL row for a terminal exit from [run].
+    /// [backend] is null only for the exit path preceding backend selection
+    /// (cancelled before pass-1 encoder creation).
+    private fun logTerminal(state: String, backend: ExportRenderBackend?) {
+        Log.i(TAG, "VG_EXPORT_TERMINAL state=$state backend=${backend?.wireName() ?: "unset"}")
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -604,6 +628,10 @@ class AndroidTimelineExportSession(private val context: Context) {
         // hard-cut passthrough. Presence of any of these (non-null) means the
         // clip requires rendering behaviour this exporter does not perform --
         // rejecting explicitly avoids silently producing wrong output.
+        // colorMatrix specifically remains rejected until a Vulkan export
+        // baseline and its filter contract are implemented -- this slice
+        // (AndroidExportRenderBackendSelector) only makes backend selection
+        // explicit and does not implement colorMatrix or native Vulkan export.
         private val UNSUPPORTED_CLIP_KEYS = listOf(
             "freezePTS",
             "dualCamera",
