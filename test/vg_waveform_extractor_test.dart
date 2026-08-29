@@ -17,7 +17,8 @@
 //   WAVE-11: Argument payload contains correct keys.
 //   WAVE-12: Mock result parsing — samples, durationSeconds, samplesPerSecond, pointCount.
 //   WAVE-13: PlatformException propagation.
-//   WAVE-14: Uint8List bytes from channel are reinterpreted as Float32List.
+//   WAVE-14: Float32List direct channel response accepted.
+//   WAVE-14B: All known native error codes propagate unchanged.
 //   WAVE-15: VGAudioWaveformResult.toString contains pointCount.
 //
 //   Phase 8.18 cache integration tests:
@@ -293,6 +294,42 @@ void main() {
       expect(result.samples.length, 5);
       expect(result.samples[4], closeTo(0.5, 0.001));
     });
+
+    // ── WAVE-14B ──────────────────────────────────────────────────────────────
+    test(
+      'WAVE-14B: all known native error codes propagate unchanged',
+      () async {
+        const errorCodes = [
+          'NO_AUDIO_TRACK',
+          'ZERO_DURATION',
+          'DURATION_EXCEEDED',
+          'READER_SETUP_FAILED',
+          'READER_FAILED',
+          'WAVEFORM_ERROR',
+          'INVALID_ARG',
+        ];
+
+        for (final code in errorCodes) {
+          TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+              .setMockMethodCallHandler(channel, (call) async {
+                if (call.method == 'extractWaveform') {
+                  throw PlatformException(
+                    code: code,
+                    message: 'Native failure for $code',
+                  );
+                }
+                return null;
+              });
+
+          await expectLater(
+            () => VGAudioWaveformExtractor.extract(path: '/tmp/test.mp4'),
+            throwsA(
+              isA<PlatformException>().having((e) => e.code, 'code', code),
+            ),
+          );
+        }
+      },
+    );
   });
 
   // ── WAVE-15 ─────────────────────────────────────────────────────────────────
@@ -404,8 +441,9 @@ void main() {
         TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
             .setMockMethodCallHandler(channel, (call) async {
               capturedCalls.add(call);
-              if (call.method == 'waveformCache_load')
+              if (call.method == 'waveformCache_load') {
                 return cachedResultPayload;
+              }
               if (call.method == 'extractWaveform') {
                 fail('Native extraction must not be called on cache hit');
               }
@@ -436,8 +474,9 @@ void main() {
         TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
             .setMockMethodCallHandler(channel, (call) async {
               capturedCalls.add(call);
-              if (call.method == 'waveformCache_load')
+              if (call.method == 'waveformCache_load') {
                 return null; // cache miss
+              }
               if (call.method == 'extractWaveform') return nativeResult;
               if (call.method == 'waveformCache_save') return null;
               return null;

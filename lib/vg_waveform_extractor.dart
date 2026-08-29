@@ -1,7 +1,7 @@
 // vg_waveform_extractor.dart
 // vanguard_media_engine — Phase 8.15C / Phase 8.18 / Slice Q
 //
-// Dart bridge for native iOS offline audio waveform extraction.
+// Dart bridge for native iOS and Android offline audio waveform extraction.
 //
 // Scope:
 //   - VGAudioWaveformResult: typed result (Float32List samples + metadata).
@@ -16,7 +16,6 @@
 // Non-goals:
 //   - No real-time audio graph.
 //   - No playback service.
-//   - No Android implementation.
 //   - No peak extraction (RMS only).
 
 import 'dart:typed_data';
@@ -83,9 +82,10 @@ final class VGAudioWaveformResult {
 // Extractor
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Offline audio waveform extractor backed by native iOS AVAssetReader.
+/// Offline audio waveform extractor backed by native iOS AVAssetReader and
+/// Android MediaExtractor/MediaCodec.
 ///
-/// iOS only. Calls the native `extractWaveform` MethodChannel endpoint.
+/// iOS and Android. Calls the native `extractWaveform` MethodChannel endpoint.
 /// Returns RMS Float32 samples normalised to [0.0, 1.0].
 ///
 /// Errors:

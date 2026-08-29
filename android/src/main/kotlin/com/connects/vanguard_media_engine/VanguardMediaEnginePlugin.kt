@@ -10,6 +10,8 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.annotation.NonNull
+import com.connects.vanguard_media_engine.audio.AndroidWaveformExtractor
+import com.connects.vanguard_media_engine.audio.AndroidWaveformResult
 import com.connects.vanguard_media_engine.audio_extraction.AndroidAudioExtractionCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
@@ -29,6 +31,7 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 import io.flutter.view.TextureRegistry
+import java.util.concurrent.atomic.AtomicBoolean
 
 class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
     private lateinit var channel: MethodChannel
@@ -95,11 +98,17 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
     // Cleared in encoder.finish{} callback and on cancelExport.
     @Volatile private var activeEncoder: VanguardMediaCodecEncoder? = null
 
+    // ── Phase 5-Unit W / Phase 4-Unit E: extractWaveform detach guard ─────────
+    // Checked before every extractWaveform reply so no channel call happens
+    // after onDetachedFromEngine.
+    @Volatile private var detached = false
+
     companion object {
         private const val TAG = "VanguardPlugin"
     }
 
     override fun onAttachedToEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+        detached = false
         this.binding = binding
         this.context = binding.applicationContext
         channel = MethodChannel(binding.binaryMessenger, "vanguard_media_engine")
@@ -1242,6 +1251,47 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 }.start()
             }
 
+            // ─── Phase 5-Unit W / Phase 4-Unit E: extractWaveform ──────────────────────
+            // Android parity with VGWaveformExtractor.m (iOS). The plugin only parses
+            // args and launches a daemon thread; AndroidWaveformExtractor owns all
+            // decode/validation logic and returns a synchronous result.
+            "extractWaveform" -> {
+                val path = args?.get("path") as? String
+                val samplesPerSecond = (args?.get("samplesPerSecond") as? Number)?.toInt()
+                val maxDurationSeconds = (args?.get("maxDurationSeconds") as? Number)?.toDouble()
+
+                val fired = AtomicBoolean(false)
+                fun replySuccess(map: Map<String, Any?>) {
+                    if (fired.compareAndSet(false, true)) {
+                        mainHandler.post { if (!detached) result.success(map) }
+                    }
+                }
+                fun replyError(code: String, message: String?) {
+                    if (fired.compareAndSet(false, true)) {
+                        mainHandler.post { if (!detached) result.error(code, message, null) }
+                    }
+                }
+
+                try {
+                    Thread({
+                        when (val outcome = AndroidWaveformExtractor.extract(path, samplesPerSecond, maxDurationSeconds)) {
+                            is AndroidWaveformResult.Success -> replySuccess(
+                                mapOf(
+                                    "samples" to outcome.samples,
+                                    "durationSeconds" to outcome.durationSeconds,
+                                    "samplesPerSecond" to outcome.samplesPerSecond,
+                                    "pointCount" to outcome.pointCount,
+                                )
+                            )
+                            is AndroidWaveformResult.Failure -> replyError(outcome.code, outcome.message)
+                        }
+                    }, "VGWaveformExtractor").apply { isDaemon = true }.start()
+                } catch (t: Throwable) {
+                    Log.e(TAG, "extractWaveform: failed to start thread: $t")
+                    replyError("WAVEFORM_ERROR", t.message ?: t.javaClass.simpleName)
+                }
+            }
+
             else -> result.notImplemented()
         }
     }
@@ -1345,6 +1395,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
     }
 
         override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+        // Phase 5-Unit W / Phase 4-Unit E: block any further extractWaveform replies.
+        detached = true
         // Phase 3-Unit T: unregister the OS thermal listener before dropping the channel handler.
         thermalStateBridge?.shutdown()
         thermalStateBridge = null
