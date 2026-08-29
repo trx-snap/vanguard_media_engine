@@ -12,6 +12,7 @@ import com.connects.vanguard_media_engine.camera.AndroidCamera2OpenCloseSmokeHar
 import com.connects.vanguard_media_engine.camera.AndroidCamera2ThermalListenerSmokeHarness
 import com.connects.vanguard_media_engine.export.AndroidAudioFoundationSmokeHarness
 import com.connects.vanguard_media_engine.export.AndroidPassthroughRemuxCapabilityProbe
+import com.connects.vanguard_media_engine.export.AndroidPassthroughRemuxSampleIntegritySmokeHarness
 import com.connects.vanguard_media_engine.export.AndroidPassthroughRemuxSmokeHarness
 import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
 import io.flutter.plugin.common.MethodChannel
@@ -42,6 +43,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase5EncoderSurfaceSmoke",
             "runAndroidDagAudioFoundationSmoke",
             "runAndroidPassthroughRemuxNativeSmoke",
+            "runAndroidPassthroughRemuxSampleIntegritySmoke",
             "runAndroidPassthroughRemuxCapabilityProbeSmoke",
             "runAndroidDagPhase3UnitACameraCapabilityProbe",
             "runAndroidDagPhase3UnitFConcurrentSessionValidation",
@@ -91,6 +93,8 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase5EncoderSurfaceSmoke" -> runPhase5EncoderSurfaceSmoke(args, result)
             "runAndroidDagAudioFoundationSmoke" -> runAudioFoundationSmoke(args, result)
             "runAndroidPassthroughRemuxNativeSmoke" -> runPassthroughRemuxNativeSmoke(args, result)
+            "runAndroidPassthroughRemuxSampleIntegritySmoke" ->
+                runPassthroughRemuxSampleIntegritySmoke(args, result)
             "runAndroidPassthroughRemuxCapabilityProbeSmoke" ->
                 runPassthroughRemuxCapabilityProbeSmoke(args, result)
             "runAndroidDagPhase3UnitACameraCapabilityProbe" -> runPhase3UnitACameraCapabilityProbe(result)
@@ -273,6 +277,39 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "PASSTHROUGH_REMUX_NATIVE_SMOKE_FAILED",
                         "runAndroidPassthroughRemuxNativeSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Phase 2-Unit Y: Android passthrough remux sample-integrity smoke ─────
+    private fun runPassthroughRemuxSampleIntegritySmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val sourcePath = args?.get("sourcePath") as? String
+        val outputDir = args?.get("outputDir") as? String
+        val secondSourcePath = args?.get("secondSourcePath") as? String
+        if (sourcePath.isNullOrBlank() || outputDir.isNullOrBlank()) {
+            result.error(
+                "INVALID_ARG",
+                "runAndroidPassthroughRemuxSampleIntegritySmoke: sourcePath and outputDir required",
+                null,
+            )
+            return
+        }
+        Thread {
+            try {
+                val smokeResult = AndroidPassthroughRemuxSampleIntegritySmokeHarness.run(
+                    sourcePath = sourcePath,
+                    secondSourcePath = secondSourcePath,
+                    outputDir = outputDir,
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "PASSTHROUGH_REMUX_SAMPLE_INTEGRITY_SMOKE_FAILED",
+                        "runAndroidPassthroughRemuxSampleIntegritySmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
