@@ -24,6 +24,7 @@ import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinato
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
 import com.connects.vanguard_media_engine.export.AndroidStillImageDecoder
 import com.connects.vanguard_media_engine.export.AndroidStillImageExportCoordinator
+import com.connects.vanguard_media_engine.image.AndroidImageCompressionCoordinator
 import com.connects.vanguard_media_engine.image.AndroidImageOptimizer
 import com.connects.vanguard_media_engine.photo_library.AndroidPhotoLibrarySaveCoordinator
 import com.connects.vanguard_media_engine.photo_library.AndroidVideoAssetPickerCoordinator
@@ -85,6 +86,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // VanguardMediaEnginePlugin.swift (colorMatrix filters + "preserve"
     // orientation policy only; see AndroidStillImageExportCoordinator).
     private var stillImageExportCoordinator: AndroidStillImageExportCoordinator? = null
+
+    // ── Phase 5-Unit AE / Phase 10-C-3M: still-image compression coordinator ──
+    // Owns "compressImage" -- Android parity with the compressImage case in
+    // VanguardMediaEnginePlugin.swift.
+    private var imageCompressionCoordinator: AndroidImageCompressionCoordinator? = null
 
     // ── Phase 5-Unit Q / Phase 7.20: reverse sidecar coordinator ──────────────
     // Owns "prepareReverseSidecars", "getSidecarStatus", "cleanupReverseSidecars".
@@ -202,6 +208,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler     = mainHandler,
         )
         stillImageExportCoordinator = AndroidStillImageExportCoordinator(
+            context     = binding.applicationContext,
+            mainHandler = mainHandler,
+        )
+        imageCompressionCoordinator = AndroidImageCompressionCoordinator(
             context     = binding.applicationContext,
             mainHandler = mainHandler,
         )
@@ -393,6 +403,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android still-image export coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidImageCompressionCoordinator.ownsMethod(call.method)) {
+            val coord = imageCompressionCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android image compression coordinator unavailable", null)
             }
             return
         }
@@ -789,55 +809,6 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                         }
                     } finally {
                         try { retriever.release() } catch (_: Exception) {}
-                    }
-                }.start()
-            }
-
-            // ── compressImage ─────────────────────────────────────────────────────────
-            // Resizes and JPEG-encodes an image file.
-            // Bitmap.compress(JPEG) strips all EXIF metadata by design — safe by default.
-            "compressImage" -> {
-                val inputPath  = args?.get("inputPath")  as? String
-                val outputPath = args?.get("outputPath") as? String
-                val maxWidthPx = (args?.get("maxWidthPx") as? Number)?.toInt() ?: 1080
-                val quality    = ((args?.get("jpegQuality") as? Number)?.toDouble() ?: 0.82)
-                    .let { (it * 100).toInt().coerceIn(1, 100) }
-
-                if (inputPath == null || outputPath == null) {
-                    result.error("INVALID_ARG",
-                        "compressImage: inputPath and outputPath required", null)
-                    return
-                }
-                Thread {
-                    try {
-                        val opts = android.graphics.BitmapFactory.Options().apply {
-                            inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
-                        }
-                        val src = android.graphics.BitmapFactory.decodeFile(inputPath, opts)
-                            ?: throw IllegalArgumentException("Cannot decode: $inputPath")
-
-                        val srcW = src.width
-                        val srcH = src.height
-                        val scaled: android.graphics.Bitmap = if (srcW > maxWidthPx) {
-                            val scale = maxWidthPx.toFloat() / srcW.toFloat()
-                            val targetH = (srcH * scale).toInt().coerceAtLeast(1)
-                            android.graphics.Bitmap.createScaledBitmap(src, maxWidthPx, targetH, true)
-                        } else {
-                            src
-                        }
-
-                        java.io.FileOutputStream(outputPath).use { out ->
-                            // Bitmap.compress JPEG never writes EXIF — metadata stripped
-                            scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, out)
-                        }
-
-                        if (scaled !== src) src.recycle()
-                        scaled.recycle()
-
-                        mainHandler.post { result.success(mapOf("outputPath" to outputPath)) }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "compressImage: $e")
-                        mainHandler.post { result.error("COMPRESS_FAILED", e.message, null) }
                     }
                 }.start()
             }
@@ -1607,6 +1578,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // Tear down Phase 5-Unit AD / Phase 10-C-3L still-image export coordinator.
         stillImageExportCoordinator?.disposeAll()
         stillImageExportCoordinator = null
+        // Tear down Phase 5-Unit AE / Phase 10-C-3M image compression coordinator.
+        imageCompressionCoordinator?.disposeAll()
+        imageCompressionCoordinator = null
     }
 
     // ── ActivityAware (Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B) ─
