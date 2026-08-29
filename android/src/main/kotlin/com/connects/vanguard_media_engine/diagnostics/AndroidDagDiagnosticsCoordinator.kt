@@ -1044,6 +1044,7 @@ class AndroidDagDiagnosticsCoordinator(
         val trimEndSeconds = (args["trimEndSeconds"] as? Number)?.toDouble() ?: 1.0
         val sourceRotationDegrees = (args["sourceRotationDegrees"] as? Number)?.toInt() ?: 0
         val oracleMode = (args["oracleMode"] as? String) ?: "gles_pixel_parity"
+        val scenarioMode = (args["scenarioMode"] as? String) ?: "single_clip"
 
         Thread {
             try {
@@ -1061,6 +1062,7 @@ class AndroidDagDiagnosticsCoordinator(
                     trimEndSeconds = trimEndSeconds,
                     sourceRotationDegrees = sourceRotationDegrees,
                     oracleMode = oracleMode,
+                    scenarioMode = scenarioMode,
                 )
                 mainHandler.post { result.success(smokeResult) }
             } catch (t: Throwable) {

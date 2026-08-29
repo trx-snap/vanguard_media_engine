@@ -30,10 +30,20 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
     private const val PROOF_BOUNDARY_GLES_PARITY = "production_exportTimeline_vulkan_vs_direct_gles_pixel_parity"
     private const val PROOF_BOUNDARY_ROTATION_REGION = "production_exportTimeline_vulkan_rotation_region_oracle"
     private const val PROOF_BOUNDARY_FIT_REGION = "production_exportTimeline_vulkan_fit_region_oracle"
+    private const val PROOF_BOUNDARY_MULTICLIP_FIT_ROTATION = "production_exportTimeline_vulkan_multiclip_fit_rotation_oracle"
 
     data class ExpectedFitRect(val x: Int, val y: Int, val width: Int, val height: Int) {
         fun toMap(): Map<String, Int> = mapOf("x" to x, "y" to y, "width" to width, "height" to height)
     }
+
+    private data class FitRegionEvaluation(
+        val fitRegionOraclePass: Boolean,
+        val blackBarOraclePass: Boolean,
+        val nonBlank: Boolean,
+        val meanRgb: RgbTriple,
+        val sampledRegions: Map<String, Any?>,
+        val failureReason: String?,
+    )
 
     fun run(
         context: Context,
@@ -49,7 +59,20 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         trimEndSeconds: Double = 1.0,
         sourceRotationDegrees: Int = 0,
         oracleMode: String = "gles_pixel_parity",
+        scenarioMode: String = "single_clip",
     ): Map<String, Any?> {
+        if (scenarioMode == "multi_clip_fit_rotation") {
+            return runMultiClipFitRotation(
+                context = context,
+                outputDir = outputDir,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
+                fps = fps,
+                bitrateBps = bitrateBps,
+                oracleMode = oracleMode,
+            )
+        }
+
         val outDirFile = File(outputDir)
         val sourceMode = if (useSyntheticSource) "synthetic" else "provided"
 
@@ -426,137 +449,27 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             if (prodBitmap == null) {
                 failureReason = "pixel_extraction_failed_production"
             } else if (oracleMode == "fit_region") {
-                val pRgb = computeMeanRgb(prodBitmap)
-                prodMeanRgb = mapOf("r" to pRgb.r, "g" to pRgb.g, "b" to pRgb.b)
-                val prodAvg = (pRgb.r + pRgb.g + pRgb.b) / 3.0
-                val prodNonBlank = prodAvg in 3.0..252.0
+                val eval = evaluateFitRegionOracle(
+                    bitmap = prodBitmap,
+                    outputWidth = outputWidth,
+                    outputHeight = outputHeight,
+                    fitRect = computedExpectedFitRect ?: ExpectedFitRect(0, 0, outputWidth, outputHeight),
+                    rotationDegrees = sourceRotationDegrees,
+                )
+                prodMeanRgb = mapOf("r" to eval.meanRgb.r, "g" to eval.meanRgb.g, "b" to eval.meanRgb.b)
+                fitRegionOraclePass = eval.fitRegionOraclePass
+                blackBarOraclePass = eval.blackBarOraclePass
+                sampledRegions = eval.sampledRegions
 
                 val dimensionsMatch = (prodOutputWidth == outputWidth && prodOutputHeight == outputHeight)
-
                 if (computedExpectedFitRect == null) {
                     failureReason = "expected_fit_rect_computation_failed"
+                } else if (!dimensionsMatch) {
+                    failureReason = "production_output_dimensions_mismatch:expected=${outputWidth}x${outputHeight}:actual=${prodOutputWidth}x${prodOutputHeight}"
+                } else if (eval.failureReason != null) {
+                    failureReason = eval.failureReason
                 } else {
-                    val fitRect = computedExpectedFitRect
-                    val fitX = fitRect.x
-                    val fitY = fitRect.y
-                    val fitW = fitRect.width
-                    val fitH = fitRect.height
-
-                    val tlStartX = fitX + (fitW * 0.15f).toInt()
-                    val tlEndX = fitX + (fitW * 0.35f).toInt()
-                    val tlStartY = fitY + (fitH * 0.15f).toInt()
-                    val tlEndY = fitY + (fitH * 0.35f).toInt()
-                    val tlRgb = samplePixelRectMeanRgb(prodBitmap, tlStartX, tlEndX, tlStartY, tlEndY)
-
-                    val trStartX = fitX + (fitW * 0.65f).toInt()
-                    val trEndX = fitX + (fitW * 0.85f).toInt()
-                    val trStartY = fitY + (fitH * 0.15f).toInt()
-                    val trEndY = fitY + (fitH * 0.35f).toInt()
-                    val trRgb = samplePixelRectMeanRgb(prodBitmap, trStartX, trEndX, trStartY, trEndY)
-
-                    val blStartX = fitX + (fitW * 0.15f).toInt()
-                    val blEndX = fitX + (fitW * 0.35f).toInt()
-                    val blStartY = fitY + (fitH * 0.65f).toInt()
-                    val blEndY = fitY + (fitH * 0.85f).toInt()
-                    val blRgb = samplePixelRectMeanRgb(prodBitmap, blStartX, blEndX, blStartY, blEndY)
-
-                    val brStartX = fitX + (fitW * 0.65f).toInt()
-                    val brEndX = fitX + (fitW * 0.85f).toInt()
-                    val brStartY = fitY + (fitH * 0.65f).toInt()
-                    val brEndY = fitY + (fitH * 0.85f).toInt()
-                    val brRgb = samplePixelRectMeanRgb(prodBitmap, brStartX, brEndX, brStartY, brEndY)
-
-                    val tlColor = classifyColor(tlRgb)
-                    val trColor = classifyColor(trRgb)
-                    val blColor = classifyColor(blRgb)
-                    val brColor = classifyColor(brRgb)
-
-                    val expected = expectedQuadrantColors(sourceRotationDegrees)
-
-                    val matchTL = tlColor == expected["TL"]
-                    val matchTR = trColor == expected["TR"]
-                    val matchBL = blColor == expected["BL"]
-                    val matchBR = brColor == expected["BR"]
-                    fitRegionOraclePass = matchTL && matchTR && matchBL && matchBR
-
-                    val regions = mutableMapOf<String, Any?>(
-                        "TL" to mapOf("r" to tlRgb.r, "g" to tlRgb.g, "b" to tlRgb.b, "classified" to tlColor, "expected" to expected["TL"]),
-                        "TR" to mapOf("r" to trRgb.r, "g" to trRgb.g, "b" to trRgb.b, "classified" to trColor, "expected" to expected["TR"]),
-                        "BL" to mapOf("r" to blRgb.r, "g" to blRgb.g, "b" to blRgb.b, "classified" to blColor, "expected" to expected["BL"]),
-                        "BR" to mapOf("r" to brRgb.r, "g" to brRgb.g, "b" to brRgb.b, "classified" to brColor, "expected" to expected["BR"]),
-                    )
-
-                    fun isBlack(rgb: RgbTriple): Boolean {
-                        val avg = (rgb.r + rgb.g + rgb.b) / 3.0
-                        return rgb.r < 35.0 && rgb.g < 35.0 && rgb.b < 35.0 && avg < 25.0
-                    }
-
-                    var barsPass = true
-
-                    // Left bar
-                    if (fitX > 0) {
-                        val startX = (fitX * 0.25f).toInt()
-                        val endX = (fitX * 0.75f).toInt().coerceAtLeast(startX + 1)
-                        val startY = (outputHeight * 0.25f).toInt()
-                        val endY = (outputHeight * 0.75f).toInt().coerceAtLeast(startY + 1)
-                        val rgb = samplePixelRectMeanRgb(prodBitmap, startX, endX, startY, endY)
-                        val pass = isBlack(rgb)
-                        if (!pass) barsPass = false
-                        regions["barLeft"] = mapOf("r" to rgb.r, "g" to rgb.g, "b" to rgb.b, "isBlack" to pass)
-                    }
-
-                    // Right bar
-                    if (fitX + fitW < outputWidth) {
-                        val barWidth = outputWidth - (fitX + fitW)
-                        val startX = ((fitX + fitW) + barWidth * 0.25f).toInt()
-                        val endX = ((fitX + fitW) + barWidth * 0.75f).toInt().coerceAtLeast(startX + 1)
-                        val startY = (outputHeight * 0.25f).toInt()
-                        val endY = (outputHeight * 0.75f).toInt().coerceAtLeast(startY + 1)
-                        val rgb = samplePixelRectMeanRgb(prodBitmap, startX, endX, startY, endY)
-                        val pass = isBlack(rgb)
-                        if (!pass) barsPass = false
-                        regions["barRight"] = mapOf("r" to rgb.r, "g" to rgb.g, "b" to rgb.b, "isBlack" to pass)
-                    }
-
-                    // Top bar
-                    if (fitY > 0) {
-                        val startX = (outputWidth * 0.25f).toInt()
-                        val endX = (outputWidth * 0.75f).toInt().coerceAtLeast(startX + 1)
-                        val startY = (fitY * 0.25f).toInt()
-                        val endY = (fitY * 0.75f).toInt().coerceAtLeast(startY + 1)
-                        val rgb = samplePixelRectMeanRgb(prodBitmap, startX, endX, startY, endY)
-                        val pass = isBlack(rgb)
-                        if (!pass) barsPass = false
-                        regions["barTop"] = mapOf("r" to rgb.r, "g" to rgb.g, "b" to rgb.b, "isBlack" to pass)
-                    }
-
-                    // Bottom bar
-                    if (fitY + fitH < outputHeight) {
-                        val barHeight = outputHeight - (fitY + fitH)
-                        val startX = (outputWidth * 0.25f).toInt()
-                        val endX = (outputWidth * 0.75f).toInt().coerceAtLeast(startX + 1)
-                        val startY = ((fitY + fitH) + barHeight * 0.25f).toInt()
-                        val endY = ((fitY + fitH) + barHeight * 0.75f).toInt().coerceAtLeast(startY + 1)
-                        val rgb = samplePixelRectMeanRgb(prodBitmap, startX, endX, startY, endY)
-                        val pass = isBlack(rgb)
-                        if (!pass) barsPass = false
-                        regions["barBottom"] = mapOf("r" to rgb.r, "g" to rgb.g, "b" to rgb.b, "isBlack" to pass)
-                    }
-
-                    blackBarOraclePass = barsPass
-                    sampledRegions = regions
-
-                    if (!dimensionsMatch) {
-                        failureReason = "production_output_dimensions_mismatch:expected=${outputWidth}x${outputHeight}:actual=${prodOutputWidth}x${prodOutputHeight}"
-                    } else if (!prodNonBlank) {
-                        failureReason = "pixel_production_blank_sentinel: avg=$prodAvg"
-                    } else if (!blackBarOraclePass) {
-                        failureReason = "black_bar_oracle_mismatch:barsPass=false"
-                    } else if (!fitRegionOraclePass) {
-                        failureReason = "fit_region_oracle_mismatch:expected=$expected:actual=TL:$tlColor,TR:$trColor,BL:$blColor,BR:$brColor"
-                    } else {
-                        pixelPass = true
-                    }
+                    pixelPass = true
                 }
             } else if (oracleMode == "rotation_region") {
                 val pRgb = computeMeanRgb(prodBitmap)
@@ -1111,6 +1024,606 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         return if (incremented <= maxValue) incremented else value
     }
 
+    private fun evaluateFitRegionOracle(
+        bitmap: Bitmap,
+        outputWidth: Int,
+        outputHeight: Int,
+        fitRect: ExpectedFitRect,
+        rotationDegrees: Int,
+    ): FitRegionEvaluation {
+        val pRgb = computeMeanRgb(bitmap)
+        val avg = (pRgb.r + pRgb.g + pRgb.b) / 3.0
+        val nonBlank = avg in 3.0..252.0
+
+        val fitX = fitRect.x
+        val fitY = fitRect.y
+        val fitW = fitRect.width
+        val fitH = fitRect.height
+
+        val tlStartX = fitX + (fitW * 0.15f).toInt()
+        val tlEndX = fitX + (fitW * 0.35f).toInt()
+        val tlStartY = fitY + (fitH * 0.15f).toInt()
+        val tlEndY = fitY + (fitH * 0.35f).toInt()
+        val tlRgb = samplePixelRectMeanRgb(bitmap, tlStartX, tlEndX, tlStartY, tlEndY)
+
+        val trStartX = fitX + (fitW * 0.65f).toInt()
+        val trEndX = fitX + (fitW * 0.85f).toInt()
+        val trStartY = fitY + (fitH * 0.15f).toInt()
+        val trEndY = fitY + (fitH * 0.35f).toInt()
+        val trRgb = samplePixelRectMeanRgb(bitmap, trStartX, trEndX, trStartY, trEndY)
+
+        val blStartX = fitX + (fitW * 0.15f).toInt()
+        val blEndX = fitX + (fitW * 0.35f).toInt()
+        val blStartY = fitY + (fitH * 0.65f).toInt()
+        val blEndY = fitY + (fitH * 0.85f).toInt()
+        val blRgb = samplePixelRectMeanRgb(bitmap, blStartX, blEndX, blStartY, blEndY)
+
+        val brStartX = fitX + (fitW * 0.65f).toInt()
+        val brEndX = fitX + (fitW * 0.85f).toInt()
+        val brStartY = fitY + (fitH * 0.65f).toInt()
+        val brEndY = fitY + (fitH * 0.85f).toInt()
+        val brRgb = samplePixelRectMeanRgb(bitmap, brStartX, brEndX, brStartY, brEndY)
+
+        val tlColor = classifyColor(tlRgb)
+        val trColor = classifyColor(trRgb)
+        val blColor = classifyColor(blRgb)
+        val brColor = classifyColor(brRgb)
+
+        val expected = expectedQuadrantColors(rotationDegrees)
+
+        val matchTL = tlColor == expected["TL"]
+        val matchTR = trColor == expected["TR"]
+        val matchBL = blColor == expected["BL"]
+        val matchBR = brColor == expected["BR"]
+        val fitRegionOraclePass = matchTL && matchTR && matchBL && matchBR
+
+        val regions = mutableMapOf<String, Any?>(
+            "TL" to mapOf("r" to tlRgb.r, "g" to tlRgb.g, "b" to tlRgb.b, "classified" to tlColor, "expected" to expected["TL"]),
+            "TR" to mapOf("r" to trRgb.r, "g" to trRgb.g, "b" to trRgb.b, "classified" to trColor, "expected" to expected["TR"]),
+            "BL" to mapOf("r" to blRgb.r, "g" to blRgb.g, "b" to blRgb.b, "classified" to blColor, "expected" to expected["BL"]),
+            "BR" to mapOf("r" to brRgb.r, "g" to brRgb.g, "b" to brRgb.b, "classified" to brColor, "expected" to expected["BR"]),
+        )
+
+        fun isBlack(rgb: RgbTriple): Boolean {
+            val a = (rgb.r + rgb.g + rgb.b) / 3.0
+            return rgb.r < 35.0 && rgb.g < 35.0 && rgb.b < 35.0 && a < 25.0
+        }
+
+        var barsPass = true
+
+        // Left bar
+        if (fitX > 0) {
+            val startX = (fitX * 0.25f).toInt()
+            val endX = (fitX * 0.75f).toInt().coerceAtLeast(startX + 1)
+            val startY = (outputHeight * 0.25f).toInt()
+            val endY = (outputHeight * 0.75f).toInt().coerceAtLeast(startY + 1)
+            val rgb = samplePixelRectMeanRgb(bitmap, startX, endX, startY, endY)
+            val pass = isBlack(rgb)
+            if (!pass) barsPass = false
+            regions["barLeft"] = mapOf("r" to rgb.r, "g" to rgb.g, "b" to rgb.b, "isBlack" to pass)
+        }
+
+        // Right bar
+        if (fitX + fitW < outputWidth) {
+            val barWidth = outputWidth - (fitX + fitW)
+            val startX = ((fitX + fitW) + barWidth * 0.25f).toInt()
+            val endX = ((fitX + fitW) + barWidth * 0.75f).toInt().coerceAtLeast(startX + 1)
+            val startY = (outputHeight * 0.25f).toInt()
+            val endY = (outputHeight * 0.75f).toInt().coerceAtLeast(startY + 1)
+            val rgb = samplePixelRectMeanRgb(bitmap, startX, endX, startY, endY)
+            val pass = isBlack(rgb)
+            if (!pass) barsPass = false
+            regions["barRight"] = mapOf("r" to rgb.r, "g" to rgb.g, "b" to rgb.b, "isBlack" to pass)
+        }
+
+        // Top bar
+        if (fitY > 0) {
+            val startX = (outputWidth * 0.25f).toInt()
+            val endX = (outputWidth * 0.75f).toInt().coerceAtLeast(startX + 1)
+            val startY = (fitY * 0.25f).toInt()
+            val endY = (fitY * 0.75f).toInt().coerceAtLeast(startY + 1)
+            val rgb = samplePixelRectMeanRgb(bitmap, startX, endX, startY, endY)
+            val pass = isBlack(rgb)
+            if (!pass) barsPass = false
+            regions["barTop"] = mapOf("r" to rgb.r, "g" to rgb.g, "b" to rgb.b, "isBlack" to pass)
+        }
+
+        // Bottom bar
+        if (fitY + fitH < outputHeight) {
+            val barHeight = outputHeight - (fitY + fitH)
+            val startX = (outputWidth * 0.25f).toInt()
+            val endX = (outputWidth * 0.75f).toInt().coerceAtLeast(startX + 1)
+            val startY = ((fitY + fitH) + barHeight * 0.25f).toInt()
+            val endY = ((fitY + fitH) + barHeight * 0.75f).toInt().coerceAtLeast(startY + 1)
+            val rgb = samplePixelRectMeanRgb(bitmap, startX, endX, startY, endY)
+            val pass = isBlack(rgb)
+            if (!pass) barsPass = false
+            regions["barBottom"] = mapOf("r" to rgb.r, "g" to rgb.g, "b" to rgb.b, "isBlack" to pass)
+        }
+
+        val failureReason = when {
+            !nonBlank -> "pixel_production_blank_sentinel: avg=$avg"
+            !barsPass -> "black_bar_oracle_mismatch:barsPass=false"
+            !fitRegionOraclePass -> "fit_region_oracle_mismatch:expected=$expected:actual=TL:$tlColor,TR:$trColor,BL:$blColor,BR:$brColor"
+            else -> null
+        }
+
+        return FitRegionEvaluation(
+            fitRegionOraclePass = fitRegionOraclePass,
+            blackBarOraclePass = barsPass,
+            nonBlank = nonBlank,
+            meanRgb = pRgb,
+            sampledRegions = regions,
+            failureReason = failureReason,
+        )
+    }
+
+    private fun readVideoDurationSeconds(videoPath: String): Double? {
+        val mmr = MediaMetadataRetriever()
+        return try {
+            mmr.setDataSource(videoPath)
+            val durStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+            val durMs = durStr?.toLongOrNull()
+            if (durMs != null && durMs > 0) durMs / 1000.0 else null
+        } catch (t: Throwable) {
+            Log.w(TAG, "readVideoDurationSeconds: MediaMetadataRetriever failed for $videoPath: $t")
+            null
+        } finally {
+            try { mmr.release() } catch (_: Throwable) {}
+        }
+    }
+
+    private fun runMultiClipFitRotation(
+        context: Context,
+        outputDir: String,
+        outputWidth: Int,
+        outputHeight: Int,
+        fps: Int,
+        bitrateBps: Int,
+        oracleMode: String,
+    ): Map<String, Any?> {
+        val outDirFile = File(outputDir)
+        if (!outDirFile.exists() || !outDirFile.isDirectory) {
+            return failMap(
+                reason = "output_dir_missing_or_not_directory: $outputDir",
+                sourceMode = "synthetic",
+                sourcePath = "",
+                generatedSourcePath = null,
+                generatedSourceSize = 0L,
+                sourceRotationDegrees = 0,
+                prodPath = "",
+                glesPath = "",
+                oracleMode = oracleMode,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
+                scenarioMode = "multi_clip_fit_rotation",
+            )
+        }
+
+        val timestamp = System.currentTimeMillis()
+        val genPathA = File(outDirFile, "vulkan_multiclip_${timestamp}_clip_a_synthetic.mp4").absolutePath
+        val genPathB = File(outDirFile, "vulkan_multiclip_${timestamp}_clip_b_synthetic.mp4").absolutePath
+        var genASize = 0L
+        var genBSize = 0L
+
+        val prodOutputPath = File(outDirFile, "vulkan_multiclip_${timestamp}_production.mp4").absolutePath
+        val prodSidecarPath = AndroidTimelineRoiSidecarEmitter.sidecarPathForVideoPath(prodOutputPath)
+
+        var prodPass = false
+        var pixelPass = false
+        var multiClipFitRegionOraclePass = false
+        var failureReason: String? = null
+
+        var prodOutputSize = 0L
+        var prodSidecarExists = false
+        var prodErrorCode: String? = null
+        var prodErrorMessage: String? = null
+
+        val prodProgressSamples = Collections.synchronizedList(mutableListOf<Double>())
+        var prodOutputWidth = 0
+        var prodOutputHeight = 0
+        var outputDurationSeconds = 0.0
+        var clipResults: List<Map<String, Any?>> = emptyList()
+        var sampledRegionsCombined: Map<String, Any?> = emptyMap()
+
+        try {
+            // Step 1: Generate synthetic source A (640x640, rot 0, duration 1.0s)
+            val genSuccessA = generateSyntheticSourceVideo(
+                outputPath = genPathA,
+                width = 640,
+                height = 640,
+                fps = fps,
+                bitrateBps = bitrateBps,
+                trimEndSeconds = 1.0,
+                sourceRotationDegrees = 0,
+            )
+            val fileA = File(genPathA)
+            if (!genSuccessA || !fileA.exists() || fileA.length() <= 0L) {
+                return failMap(
+                    reason = "synthetic_source_generation_failed_clip_A",
+                    sourceMode = "synthetic",
+                    sourcePath = genPathA,
+                    generatedSourcePath = genPathA,
+                    generatedSourceSize = 0L,
+                    sourceRotationDegrees = 0,
+                    prodPath = "",
+                    glesPath = "",
+                    oracleMode = oracleMode,
+                    outputWidth = outputWidth,
+                    outputHeight = outputHeight,
+                    scenarioMode = "multi_clip_fit_rotation",
+                    generatedSourcePaths = listOf(genPathA),
+                    generatedSourceSizes = listOf(0L),
+                )
+            }
+            genASize = fileA.length()
+
+            // Step 2: Generate synthetic source B (640x360, rot 90, duration 1.0s)
+            val genSuccessB = generateSyntheticSourceVideo(
+                outputPath = genPathB,
+                width = 640,
+                height = 360,
+                fps = fps,
+                bitrateBps = bitrateBps,
+                trimEndSeconds = 1.0,
+                sourceRotationDegrees = 90,
+            )
+            val fileB = File(genPathB)
+            if (!genSuccessB || !fileB.exists() || fileB.length() <= 0L) {
+                return failMap(
+                    reason = "synthetic_source_generation_failed_clip_B",
+                    sourceMode = "synthetic",
+                    sourcePath = genPathB,
+                    generatedSourcePath = genPathB,
+                    generatedSourceSize = 0L,
+                    sourceRotationDegrees = 90,
+                    prodPath = "",
+                    glesPath = "",
+                    oracleMode = oracleMode,
+                    outputWidth = outputWidth,
+                    outputHeight = outputHeight,
+                    scenarioMode = "multi_clip_fit_rotation",
+                    generatedSourcePaths = listOf(genPathA, genPathB),
+                    generatedSourceSizes = listOf(genASize, 0L),
+                )
+            }
+            genBSize = fileB.length()
+
+            // Step 3: Run production AndroidTimelineExportSession
+            val session = AndroidTimelineExportSession(context)
+            val latch = CountDownLatch(1)
+            var sessionSuccessMap: Map<String, Any?>? = null
+
+            val draftClipA = mapOf(
+                "id" to "vulkan_multiclip_clip_A",
+                "sourcePath" to genPathA,
+                "mediaKind" to "video",
+                "durationSeconds" to 1.0,
+                "trimStartSeconds" to 0.0,
+                "trimEndSeconds" to 1.0,
+                "startTimeSeconds" to 0.0,
+                "speed" to 1.0,
+            )
+            val draftClipB = mapOf(
+                "id" to "vulkan_multiclip_clip_B",
+                "sourcePath" to genPathB,
+                "mediaKind" to "video",
+                "durationSeconds" to 1.0,
+                "trimStartSeconds" to 0.0,
+                "trimEndSeconds" to 1.0,
+                "startTimeSeconds" to 1.0,
+                "speed" to 1.0,
+            )
+            val draftMap = mapOf(
+                "id" to "vulkan_multiclip_draft",
+                "clips" to listOf(draftClipA, draftClipB),
+                "canvasWidth" to outputWidth,
+                "canvasHeight" to outputHeight,
+                "fps" to fps,
+                "canvas" to mapOf(
+                    "width" to outputWidth,
+                    "height" to outputHeight,
+                    "contentMode" to "fit",
+                ),
+            )
+            val exportArgs = mapOf(
+                "outputPath" to prodOutputPath,
+                "width" to outputWidth,
+                "height" to outputHeight,
+                "fps" to fps,
+                "bitrateBps" to bitrateBps,
+                "draft" to draftMap,
+            )
+
+            session.start(
+                args = exportArgs,
+                onSuccess = { res ->
+                    sessionSuccessMap = res
+                    latch.countDown()
+                },
+                onError = { code, msg ->
+                    prodErrorCode = code
+                    prodErrorMessage = msg
+                    latch.countDown()
+                },
+                onProgress = { p ->
+                    prodProgressSamples.add(p)
+                },
+            )
+
+            val timedOut = !latch.await(120, TimeUnit.SECONDS)
+            val prodFile = File(prodOutputPath)
+            val prodSidecarFile = File(prodSidecarPath)
+            prodOutputSize = if (prodFile.exists()) prodFile.length() else 0L
+            prodSidecarExists = prodSidecarFile.exists()
+
+            if (timedOut) {
+                failureReason = "production_export_timeout_120s"
+            } else if (prodErrorCode != null) {
+                failureReason = "production_export_error: $prodErrorCode - $prodErrorMessage"
+            } else if (sessionSuccessMap == null) {
+                failureReason = "production_export_no_result"
+            } else if (!prodFile.exists() || prodOutputSize <= 0L) {
+                failureReason = "production_output_missing_or_empty"
+            } else if (!prodSidecarExists) {
+                failureReason = "production_sidecar_missing"
+            } else {
+                prodPass = true
+            }
+
+            if (!prodPass) {
+                return finishResult(
+                    pass = false,
+                    reason = failureReason ?: "production_lane_failed",
+                    sourceMode = "synthetic",
+                    sourcePath = "$genPathA,$genPathB",
+                    generatedSourcePath = genPathA,
+                    generatedSourceSize = genASize + genBSize,
+                    sourceRotationDegrees = 0,
+                    sourceMetadataRotationDegrees = 0,
+                    prodPass = prodPass,
+                    glesPass = true,
+                    pixelPass = pixelPass,
+                    prodPath = prodOutputPath,
+                    glesPath = "",
+                    prodSize = prodOutputSize,
+                    glesSize = 0L,
+                    prodSidecarPath = prodSidecarPath,
+                    prodSidecarExists = prodSidecarExists,
+                    prodErrorCode = prodErrorCode,
+                    prodErrorMessage = prodErrorMessage,
+                    prodProgressSamples = prodProgressSamples,
+                    glesProgressSamples = emptyList(),
+                    prodMeanRgb = mapOf("r" to 0.0, "g" to 0.0, "b" to 0.0),
+                    glesMeanRgb = mapOf("r" to 0.0, "g" to 0.0, "b" to 0.0),
+                    meanAbsDiff = -1.0,
+                    oracleMode = oracleMode,
+                    glesBaselineSkipped = true,
+                    rotationRegionOraclePass = false,
+                    fitRegionOraclePass = false,
+                    blackBarOraclePass = false,
+                    expectedFitRect = emptyMap(),
+                    prodOutputWidth = prodOutputWidth,
+                    prodOutputHeight = prodOutputHeight,
+                    sampledRegions = emptyMap(),
+                    scenarioMode = "multi_clip_fit_rotation",
+                    multiClipFitRegionOraclePass = false,
+                    clipResults = emptyList(),
+                    generatedSourcePaths = listOf(genPathA, genPathB),
+                    generatedSourceSizes = listOf(genASize, genBSize),
+                    outputDurationSeconds = 0.0,
+                )
+            }
+
+            // Step 4: Validate output dimensions and duration
+            val prodDimensions = readVideoDimensions(prodOutputPath)
+            prodOutputWidth = prodDimensions?.first ?: 0
+            prodOutputHeight = prodDimensions?.second ?: 0
+            val dimensionsMatch = (prodOutputWidth == outputWidth && prodOutputHeight == outputHeight)
+
+            val measuredDuration = readVideoDurationSeconds(prodOutputPath)
+                ?: (sessionSuccessMap?.get("durationSeconds") as? Number)?.toDouble()
+                ?: 0.0
+            outputDurationSeconds = measuredDuration
+            val durationValid = abs(outputDurationSeconds - 2.0) <= 0.15
+
+            // Step 5: Extract frame A (~500,000us) and frame B (~1,500,000us)
+            val bitmapA = extractFrame(prodOutputPath, 500_000L)
+            val bitmapB = extractFrame(prodOutputPath, 1_500_000L)
+
+            val expectedFitRectA = computeExpectedFitRect(
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
+                sourceWidth = 640,
+                sourceHeight = 640,
+                rotationDegrees = 0,
+            )
+            val expectedFitRectB = computeExpectedFitRect(
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
+                sourceWidth = 640,
+                sourceHeight = 360,
+                rotationDegrees = 90,
+            )
+
+            if (bitmapA == null) {
+                failureReason = "pixel_extraction_failed_clip_A"
+            } else if (bitmapB == null) {
+                failureReason = "pixel_extraction_failed_clip_B"
+            } else if (expectedFitRectA == null || expectedFitRectB == null) {
+                failureReason = "expected_fit_rect_computation_failed"
+            } else {
+                val evalA = evaluateFitRegionOracle(
+                    bitmap = bitmapA,
+                    outputWidth = outputWidth,
+                    outputHeight = outputHeight,
+                    fitRect = expectedFitRectA,
+                    rotationDegrees = 0,
+                )
+                val evalB = evaluateFitRegionOracle(
+                    bitmap = bitmapB,
+                    outputWidth = outputWidth,
+                    outputHeight = outputHeight,
+                    fitRect = expectedFitRectB,
+                    rotationDegrees = 90,
+                )
+
+                val clipAData = mapOf(
+                    "clipIndex" to 0,
+                    "clipId" to "clip_A_640x640_rot0",
+                    "sourcePath" to genPathA,
+                    "sourceWidth" to 640,
+                    "sourceHeight" to 640,
+                    "sourceRotationDegrees" to 0,
+                    "sampleTimeUs" to 500_000L,
+                    "expectedFitRect" to expectedFitRectA.toMap(),
+                    "fitRegionOraclePass" to evalA.fitRegionOraclePass,
+                    "blackBarOraclePass" to evalA.blackBarOraclePass,
+                    "nonBlank" to evalA.nonBlank,
+                    "meanRgb" to mapOf("r" to evalA.meanRgb.r, "g" to evalA.meanRgb.g, "b" to evalA.meanRgb.b),
+                    "sampledRegions" to evalA.sampledRegions,
+                )
+
+                val clipBData = mapOf(
+                    "clipIndex" to 1,
+                    "clipId" to "clip_B_640x360_rot90",
+                    "sourcePath" to genPathB,
+                    "sourceWidth" to 640,
+                    "sourceHeight" to 360,
+                    "sourceRotationDegrees" to 90,
+                    "sampleTimeUs" to 1_500_000L,
+                    "expectedFitRect" to expectedFitRectB.toMap(),
+                    "fitRegionOraclePass" to evalB.fitRegionOraclePass,
+                    "blackBarOraclePass" to evalB.blackBarOraclePass,
+                    "nonBlank" to evalB.nonBlank,
+                    "meanRgb" to mapOf("r" to evalB.meanRgb.r, "g" to evalB.meanRgb.g, "b" to evalB.meanRgb.b),
+                    "sampledRegions" to evalB.sampledRegions,
+                )
+
+                clipResults = listOf(clipAData, clipBData)
+                sampledRegionsCombined = mapOf(
+                    "clipA" to evalA.sampledRegions,
+                    "clipB" to evalB.sampledRegions,
+                )
+
+                multiClipFitRegionOraclePass = evalA.fitRegionOraclePass && evalA.blackBarOraclePass &&
+                    evalB.fitRegionOraclePass && evalB.blackBarOraclePass
+
+                if (!dimensionsMatch) {
+                    failureReason = "production_output_dimensions_mismatch:expected=${outputWidth}x${outputHeight}:actual=${prodOutputWidth}x${prodOutputHeight}"
+                } else if (!durationValid) {
+                    failureReason = "production_output_duration_mismatch:expected=2.0s(+/-0.15s):actual=${outputDurationSeconds}s"
+                } else if (!evalA.nonBlank) {
+                    failureReason = "pixel_production_blank_clip_A: ${evalA.failureReason}"
+                } else if (!evalB.nonBlank) {
+                    failureReason = "pixel_production_blank_clip_B: ${evalB.failureReason}"
+                } else if (!evalA.blackBarOraclePass) {
+                    failureReason = "black_bar_oracle_mismatch_clip_A: ${evalA.failureReason}"
+                } else if (!evalB.blackBarOraclePass) {
+                    failureReason = "black_bar_oracle_mismatch_clip_B: ${evalB.failureReason}"
+                } else if (!evalA.fitRegionOraclePass) {
+                    failureReason = "fit_region_oracle_mismatch_clip_A: ${evalA.failureReason}"
+                } else if (!evalB.fitRegionOraclePass) {
+                    failureReason = "fit_region_oracle_mismatch_clip_B: ${evalB.failureReason}"
+                } else {
+                    pixelPass = true
+                }
+            }
+
+            val overallPass = prodPass && pixelPass && multiClipFitRegionOraclePass
+            val meanRgbA = (clipResults.getOrNull(0)?.get("meanRgb") as? Map<String, Double>) ?: mapOf("r" to 0.0, "g" to 0.0, "b" to 0.0)
+
+            return finishResult(
+                pass = overallPass,
+                reason = if (overallPass) "pass" else (failureReason ?: "pixel_lane_failed"),
+                sourceMode = "synthetic",
+                sourcePath = "$genPathA,$genPathB",
+                generatedSourcePath = genPathA,
+                generatedSourceSize = genASize + genBSize,
+                sourceRotationDegrees = 0,
+                sourceMetadataRotationDegrees = 0,
+                prodPass = prodPass,
+                glesPass = true,
+                pixelPass = pixelPass,
+                prodPath = prodOutputPath,
+                glesPath = "",
+                prodSize = prodOutputSize,
+                glesSize = 0L,
+                prodSidecarPath = prodSidecarPath,
+                prodSidecarExists = prodSidecarExists,
+                prodErrorCode = prodErrorCode,
+                prodErrorMessage = prodErrorMessage,
+                prodProgressSamples = prodProgressSamples,
+                glesProgressSamples = emptyList(),
+                prodMeanRgb = meanRgbA,
+                glesMeanRgb = mapOf("r" to 0.0, "g" to 0.0, "b" to 0.0),
+                meanAbsDiff = -1.0,
+                oracleMode = oracleMode,
+                glesBaselineSkipped = true,
+                rotationRegionOraclePass = false,
+                fitRegionOraclePass = multiClipFitRegionOraclePass,
+                blackBarOraclePass = multiClipFitRegionOraclePass,
+                expectedFitRect = expectedFitRectA?.toMap() ?: emptyMap(),
+                prodOutputWidth = prodOutputWidth,
+                prodOutputHeight = prodOutputHeight,
+                sampledRegions = sampledRegionsCombined,
+                scenarioMode = "multi_clip_fit_rotation",
+                multiClipFitRegionOraclePass = multiClipFitRegionOraclePass,
+                clipResults = clipResults,
+                generatedSourcePaths = listOf(genPathA, genPathB),
+                generatedSourceSizes = listOf(genASize, genBSize),
+                outputDurationSeconds = outputDurationSeconds,
+            )
+        } catch (t: Throwable) {
+            val exReason = "exception: ${t.javaClass.simpleName}: ${t.message}"
+            Log.e(TAG, "AndroidVulkanExportProductionWiringSmokeHarness multiclip uncaught exception", t)
+            return finishResult(
+                pass = false,
+                reason = exReason,
+                sourceMode = "synthetic",
+                sourcePath = "$genPathA,$genPathB",
+                generatedSourcePath = genPathA,
+                generatedSourceSize = genASize + genBSize,
+                sourceRotationDegrees = 0,
+                sourceMetadataRotationDegrees = 0,
+                prodPass = prodPass,
+                glesPass = true,
+                pixelPass = pixelPass,
+                prodPath = prodOutputPath,
+                glesPath = "",
+                prodSize = prodOutputSize,
+                glesSize = 0L,
+                prodSidecarPath = prodSidecarPath,
+                prodSidecarExists = prodSidecarExists,
+                prodErrorCode = prodErrorCode,
+                prodErrorMessage = prodErrorMessage,
+                prodProgressSamples = prodProgressSamples,
+                glesProgressSamples = emptyList(),
+                prodMeanRgb = mapOf("r" to 0.0, "g" to 0.0, "b" to 0.0),
+                glesMeanRgb = mapOf("r" to 0.0, "g" to 0.0, "b" to 0.0),
+                meanAbsDiff = -1.0,
+                oracleMode = oracleMode,
+                glesBaselineSkipped = true,
+                rotationRegionOraclePass = false,
+                fitRegionOraclePass = false,
+                blackBarOraclePass = false,
+                expectedFitRect = emptyMap(),
+                prodOutputWidth = prodOutputWidth,
+                prodOutputHeight = prodOutputHeight,
+                sampledRegions = sampledRegionsCombined,
+                scenarioMode = "multi_clip_fit_rotation",
+                multiClipFitRegionOraclePass = false,
+                clipResults = clipResults,
+                generatedSourcePaths = listOf(genPathA, genPathB),
+                generatedSourceSizes = listOf(genASize, genBSize),
+                outputDurationSeconds = outputDurationSeconds,
+            )
+        } finally {
+            try { File(genPathA).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
+            try { File(genPathB).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
+        }
+    }
+
     private fun finishResult(
         pass: Boolean,
         reason: String,
@@ -1145,16 +1658,23 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         prodOutputWidth: Int = 0,
         prodOutputHeight: Int = 0,
         sampledRegions: Map<String, Any?> = emptyMap(),
+        scenarioMode: String = "single_clip",
+        multiClipFitRegionOraclePass: Boolean = false,
+        clipResults: List<Map<String, Any?>> = emptyList(),
+        generatedSourcePaths: List<String> = if (generatedSourcePath != null) listOf(generatedSourcePath) else emptyList(),
+        generatedSourceSizes: List<Long> = if (generatedSourceSize > 0) listOf(generatedSourceSize) else emptyList(),
+        outputDurationSeconds: Double = 0.0,
     ): Map<String, Any?> {
-        val proofBoundary = when (oracleMode) {
-            "fit_region" -> PROOF_BOUNDARY_FIT_REGION
-            "rotation_region" -> PROOF_BOUNDARY_ROTATION_REGION
+        val proofBoundary = when {
+            scenarioMode == "multi_clip_fit_rotation" -> PROOF_BOUNDARY_MULTICLIP_FIT_ROTATION
+            oracleMode == "fit_region" -> PROOF_BOUNDARY_FIT_REGION
+            oracleMode == "rotation_region" -> PROOF_BOUNDARY_ROTATION_REGION
             else -> PROOF_BOUNDARY_GLES_PARITY
         }
         val statusStr = if (pass) "PASS" else "FAIL"
         Log.i(
             TAG,
-            "ANDROID_VULKAN_EXPORT_PRODUCTION_WIRING_RESULT status=$statusStr;reason=$reason;oracleMode=$oracleMode;sourceMode=$sourceMode;sourceRotationDegrees=$sourceRotationDegrees;sourceMetadataRotationDegrees=$sourceMetadataRotationDegrees;productionOutputWidth=$prodOutputWidth;productionOutputHeight=$prodOutputHeight;productionBytes=$prodSize;glesBytes=$glesSize;meanAbsDiff=$meanAbsDiff;rotationRegionOraclePass=$rotationRegionOraclePass;fitRegionOraclePass=$fitRegionOraclePass;blackBarOraclePass=$blackBarOraclePass;expectedFitRect=$expectedFitRect",
+            "ANDROID_VULKAN_EXPORT_PRODUCTION_WIRING_RESULT status=$statusStr;reason=$reason;scenarioMode=$scenarioMode;oracleMode=$oracleMode;sourceMode=$sourceMode;sourceRotationDegrees=$sourceRotationDegrees;sourceMetadataRotationDegrees=$sourceMetadataRotationDegrees;productionOutputWidth=$prodOutputWidth;productionOutputHeight=$prodOutputHeight;productionBytes=$prodSize;glesBytes=$glesSize;meanAbsDiff=$meanAbsDiff;rotationRegionOraclePass=$rotationRegionOraclePass;fitRegionOraclePass=$fitRegionOraclePass;blackBarOraclePass=$blackBarOraclePass;multiClipFitRegionOraclePass=$multiClipFitRegionOraclePass;expectedFitRect=$expectedFitRect",
         )
 
         if (!pass) {
@@ -1173,15 +1693,20 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         return mapOf(
             "pass" to pass,
             "reason" to reason,
+            "scenarioMode" to scenarioMode,
             "sourceMode" to sourceMode,
             "sourcePath" to sourcePath,
             "generatedSourcePath" to generatedSourcePath,
+            "generatedSourcePaths" to generatedSourcePaths,
             "generatedSourceSize" to generatedSourceSize,
+            "generatedSourceSizes" to generatedSourceSizes,
             "sourceRotationDegrees" to sourceRotationDegrees,
             "sourceMetadataRotationDegrees" to sourceMetadataRotationDegrees,
             "productionPass" to prodPass,
             "glesPass" to glesPass,
             "pixelPass" to pixelPass,
+            "multiClipFitRegionOraclePass" to multiClipFitRegionOraclePass,
+            "clipResults" to clipResults,
             "productionOutputPath" to prodPath,
             "glesOutputPath" to glesPath,
             "productionOutputSize" to prodSize,
@@ -1205,6 +1730,7 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             "productionOutputWidth" to prodOutputWidth,
             "productionOutputHeight" to prodOutputHeight,
             "sampledRegions" to sampledRegions,
+            "outputDurationSeconds" to outputDurationSeconds,
         )
     }
 
@@ -1222,6 +1748,9 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         outputWidth: Int = 0,
         outputHeight: Int = 0,
         expectedFitRect: Map<String, Int> = emptyMap(),
+        scenarioMode: String = "single_clip",
+        generatedSourcePaths: List<String> = if (generatedSourcePath != null) listOf(generatedSourcePath) else emptyList(),
+        generatedSourceSizes: List<Long> = if (generatedSourceSize > 0) listOf(generatedSourceSize) else emptyList(),
     ): Map<String, Any?> {
         return finishResult(
             pass = false,
@@ -1229,7 +1758,9 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             sourceMode = sourceMode,
             sourcePath = sourcePath,
             generatedSourcePath = generatedSourcePath,
+            generatedSourcePaths = generatedSourcePaths,
             generatedSourceSize = generatedSourceSize,
+            generatedSourceSizes = generatedSourceSizes,
             sourceRotationDegrees = sourceRotationDegrees,
             sourceMetadataRotationDegrees = sourceMetadataRotationDegrees,
             prodPass = false,
@@ -1249,7 +1780,7 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             glesMeanRgb = mapOf("r" to 0.0, "g" to 0.0, "b" to 0.0),
             meanAbsDiff = -1.0,
             oracleMode = oracleMode,
-            glesBaselineSkipped = (oracleMode == "rotation_region" || oracleMode == "fit_region"),
+            glesBaselineSkipped = (oracleMode == "rotation_region" || oracleMode == "fit_region" || scenarioMode == "multi_clip_fit_rotation"),
             rotationRegionOraclePass = false,
             fitRegionOraclePass = false,
             blackBarOraclePass = false,
@@ -1257,6 +1788,10 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             prodOutputWidth = outputWidth,
             prodOutputHeight = outputHeight,
             sampledRegions = emptyMap(),
+            scenarioMode = scenarioMode,
+            multiClipFitRegionOraclePass = false,
+            clipResults = emptyList(),
+            outputDurationSeconds = 0.0,
         )
     }
 }
