@@ -45,7 +45,21 @@ namespace render {
 // Unit AT extends the compositor to independently accept
 // GL_TEXTURE_EXTERNAL_OES for either handle, covering all four target
 // permutations, while any other/mismatched-unsupported target still fails
-// closed. No timeline DAG integration, no transitions/PiP, no product UI.
+// closed. No timeline DAG integration, no transitions/PiP, no product UI,
+// plus (Unit AW-OES) createDiagnosticExternalOesTexture()/
+// deleteDiagnosticExternalOesTexture(), a raw GL_TEXTURE_EXTERNAL_OES
+// texture-name allocator/deleter independent of the AHardwareBuffer import
+// table (for binding to an Android SurfaceTexture(int texName)), plus
+// diagnosticMakeSurfaceCurrent() and presentDiagnosticExternalOesTexture(),
+// which draw such a texture (already refreshed by the caller's prior
+// SurfaceTexture.updateTexImage()) via the existing GlesTextureFrameRenderer.
+// Unit AW-OES remains a decoded-SurfaceTexture/OES render foundation only:
+// no AHardwareBuffer import, no ImageReader.PRIVATE, no color-correct
+// YUV->RGB conversion policy beyond what GlesTextureFrameRenderer already
+// performs for other GL_TEXTURE_EXTERNAL_OES draws, no product UI. It does
+// not fix or touch the still-DEFERRED Phase 1-Unit AW
+// ImageReader.PRIVATE/AHardwareBuffer import failure
+// (`ahb_import_unsupported_format`).
 // EGL/GLES/
 // Android headers must never appear in this public header; all such state
 // lives exclusively in gles_backend.cpp and the private
@@ -288,6 +302,58 @@ public:
                                           float weightB,
                                           const VideoFrameTransform& transformA,
                                           const VideoFrameTransform& transformB);
+
+    // Unit AW-OES: allocates a raw GL_TEXTURE_EXTERNAL_OES texture name
+    // (glGenTextures + minimal LINEAR/CLAMP_TO_EDGE parameters), independent
+    // of the AHardwareBuffer import table above -- suitable for passing to
+    // the Android SurfaceTexture(int texName) constructor from the same
+    // thread immediately after this call returns (that constructor requires
+    // a current GL context, which this call's caller must already have via
+    // an initialized backend). Returns the non-zero texture name on success,
+    // or 0 (with lastError set) when not initialized, when texture
+    // generation fails, or on non-Android host builds
+    // (lastError="diagnostic_external_oes_texture_unavailable_on_host").
+    // The caller owns the returned name and must eventually pass it to
+    // deleteDiagnosticExternalOesTexture(); this call does not track it in
+    // any handle table. Diagnostic/proof-only: not a product texture
+    // allocation API.
+    uint32_t createDiagnosticExternalOesTexture();
+
+    // Unit AW-OES: deletes a texture name previously returned by
+    // createDiagnosticExternalOesTexture(). A textureId of 0 is a no-op.
+    // Safe to call even if the backend has already been shut down (no-op in
+    // that case, aside from an Android host build with a non-zero
+    // textureId, which still requires a current context to be meaningful --
+    // callers must call this before shutdown()).
+    void deleteDiagnosticExternalOesTexture(uint32_t textureId);
+
+    // Unit AW-OES: makes the already-attached window EGLSurface current
+    // without clearing, drawing, or swapping, so a caller can safely invoke
+    // SurfaceTexture.updateTexImage() (which requires the EGL context that
+    // owns the target texture to be current) immediately afterward. Returns
+    // false (with lastError set) when not initialized, when no window
+    // surface is attached, or on non-Android host builds
+    // (lastError="diagnostic_make_surface_current_unavailable_on_host").
+    // Does not attach, detach, or destroy any surface.
+    bool diagnosticMakeSurfaceCurrent();
+
+    // Unit AW-OES: draws `textureId` -- a raw GL_TEXTURE_EXTERNAL_OES
+    // texture name (e.g. from createDiagnosticExternalOesTexture(), already
+    // refreshed by the caller's prior SurfaceTexture.updateTexImage()) --
+    // as a full-window textured quad on the attached window EGLSurface via
+    // the existing GlesTextureFrameRenderer, with UVs mapped through
+    // `transform`, and swaps. Shares the same make-current/draw/swap path
+    // as renderFrame(handle, transform), except texture identity is the
+    // caller-owned raw `textureId` rather than a handle resolved through the
+    // AHardwareBuffer import table. Returns false with
+    // lastError="invalid_texture_id" if textureId == 0, or
+    // lastError="backend_not_initialized"/"no_surface_attached" per the same
+    // preconditions as renderFrame(). Unavailable on non-Android host builds
+    // (lastError="diagnostic_present_external_oes_texture_unavailable_on_host").
+    // Diagnostic/proof-only: no AHardwareBuffer import, no
+    // ImageReader.PRIVATE, no product UI.
+    bool presentDiagnosticExternalOesTexture(uint32_t textureId,
+                                             const VideoFrameTransform& transform);
 
 private:
     struct Impl;

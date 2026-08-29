@@ -42,6 +42,10 @@ class AndroidGlesTextureSmokeCoordinator(
         // playhead evaluation physical proof.
         private const val BB_COMPLETE_METHOD = "onAndroidDagPhase1BBGlesTextureCompositionDagSmokeComplete"
 
+        // Phase 1-Unit AW-OES: decoded SurfaceTexture/OES DAG render
+        // foundation physical proof.
+        private const val AW_OES_COMPLETE_METHOD = "onAndroidDagPhase1AWOESGlesDecodedOesSmokeComplete"
+
         private val OWNED_METHODS = setOf(
             "startAndroidDagPhase1AXGlesTextureRenderSmoke",
             "disposeAndroidDagPhase1AXGlesTextureRenderSmoke",
@@ -49,6 +53,8 @@ class AndroidGlesTextureSmokeCoordinator(
             "disposeAndroidDagPhase1BAGlesTextureCompositorSmoke",
             "startAndroidDagPhase1BBGlesTextureCompositionDagSmoke",
             "disposeAndroidDagPhase1BBGlesTextureCompositionDagSmoke",
+            "startAndroidDagPhase1AWOESGlesDecodedOesSmoke",
+            "disposeAndroidDagPhase1AWOESGlesDecodedOesSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -92,6 +98,19 @@ class AndroidGlesTextureSmokeCoordinator(
 
     private val bbActiveEntries = mutableMapOf<Long, BbActiveEntry>()
 
+    // Phase 1-Unit AW-OES: kept separate from all entries above so AX/BA/BB/
+    // AW-OES texture IDs can never collide in state ownership, even though
+    // all are keyed by SurfaceProducer id.
+    private data class AwOesActiveEntry(
+        val harness: AndroidGlesDecodedOesSmokeHarness,
+        val surfaceProducer: TextureRegistry.SurfaceProducer,
+        val released: AtomicBoolean = AtomicBoolean(false),
+        val runCompleted: AtomicBoolean = AtomicBoolean(false),
+        val disposeRequested: AtomicBoolean = AtomicBoolean(false),
+    )
+
+    private val awOesActiveEntries = mutableMapOf<Long, AwOesActiveEntry>()
+
     fun handleMethodCall(method: String, args: Map<*, *>?, result: MethodChannel.Result): Boolean {
         when (method) {
             "startAndroidDagPhase1AXGlesTextureRenderSmoke" -> start(args, result)
@@ -100,6 +119,8 @@ class AndroidGlesTextureSmokeCoordinator(
             "disposeAndroidDagPhase1BAGlesTextureCompositorSmoke" -> disposeBa(args, result)
             "startAndroidDagPhase1BBGlesTextureCompositionDagSmoke" -> startBb(args, result)
             "disposeAndroidDagPhase1BBGlesTextureCompositionDagSmoke" -> disposeBb(args, result)
+            "startAndroidDagPhase1AWOESGlesDecodedOesSmoke" -> startAwOes(args, result)
+            "disposeAndroidDagPhase1AWOESGlesDecodedOesSmoke" -> disposeAwOes(args, result)
             else -> return false
         }
         return true
@@ -238,6 +259,22 @@ class AndroidGlesTextureSmokeCoordinator(
                     releaseOnceBb(entry)
                 } else {
                     entry.disposeRequested.set(true)
+                }
+            }
+        }
+
+        val awOesEntriesToDispose = synchronized(awOesActiveEntries) {
+            val list = awOesActiveEntries.values.toList()
+            awOesActiveEntries.clear()
+            list
+        }
+        awOesEntriesToDispose.forEach { entry ->
+            synchronized(entry) {
+                if (entry.runCompleted.get()) {
+                    releaseOnceAwOes(entry)
+                } else {
+                    entry.disposeRequested.set(true)
+                    entry.harness.cancel()
                 }
             }
         }
@@ -572,6 +609,135 @@ class AndroidGlesTextureSmokeCoordinator(
                     entry.surfaceProducer.release()
                 } catch (t: Throwable) {
                     Log.w(TAG, "BB surfaceProducer.release() on mainHandler failed: ${t.javaClass.simpleName}: ${t.message}")
+                }
+            }
+        }
+        return true
+    }
+
+    // ── Phase 1-Unit AW-OES: decoded SurfaceTexture/OES DAG render smoke ──
+
+    private fun startAwOes(args: Map<*, *>?, result: MethodChannel.Result) {
+        val videoPath = args?.get("videoPath") as? String
+        if (videoPath.isNullOrEmpty()) {
+            result.error("INVALID_ARG", "startAndroidDagPhase1AWOESGlesDecodedOesSmoke: videoPath required", null)
+            return
+        }
+        val maxFramesArg = (args.get("maxFrames") as? Number)?.toInt()
+        if (maxFramesArg != null && maxFramesArg <= 0) {
+            result.error("INVALID_ARG", "startAndroidDagPhase1AWOESGlesDecodedOesSmoke: maxFrames must be positive", null)
+            return
+        }
+
+        val surfaceProducer = textureRegistry.createSurfaceProducer()
+        val textureId = surfaceProducer.id()
+        val harness = AndroidGlesDecodedOesSmokeHarness()
+
+        val entry = AwOesActiveEntry(harness, surfaceProducer)
+        synchronized(awOesActiveEntries) {
+            awOesActiveEntries[textureId] = entry
+        }
+
+        Thread {
+            val smokeResult = try {
+                harness.run(surfaceProducer, args)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Phase 1-Unit AW-OES harness execution error", t)
+                AndroidGlesDecodedOesSmokeHarness.exceptionResult(t)
+            }
+            entry.runCompleted.set(true)
+            // Same ownership rule as AX/BB: the producer is released here
+            // only if a dispose() arrived while the harness was still
+            // running; a normal completion with no prior dispose leaves it
+            // alive for Dart to display via a Texture widget.
+            var released = false
+            synchronized(entry) {
+                if (entry.disposeRequested.get()) {
+                    released = releaseOnceAwOes(entry)
+                }
+            }
+            if (released) {
+                synchronized(awOesActiveEntries) { awOesActiveEntries.remove(textureId) }
+            }
+            val finalResult = smokeResult + mapOf(
+                "textureId" to textureId,
+                "surfaceProducerReleased" to released,
+            )
+            mainHandler.post {
+                channel.invokeMethod(AW_OES_COMPLETE_METHOD, finalResult)
+            }
+        }.start()
+
+        result.success(mapOf(
+            "started" to true,
+            "textureId" to textureId,
+        ))
+    }
+
+    private fun disposeAwOes(args: Map<*, *>?, result: MethodChannel.Result) {
+        val textureId = (args?.get("textureId") as? Number)?.toLong()
+        if (textureId == null) {
+            result.error("INVALID_ARG", "disposeAndroidDagPhase1AWOESGlesDecodedOesSmoke: textureId required", null)
+            return
+        }
+        val entry = synchronized(awOesActiveEntries) { awOesActiveEntries[textureId] }
+        if (entry == null) {
+            result.success(mapOf(
+                "pass" to true,
+                "textureId" to textureId,
+                "surfaceProducerReleased" to false,
+                "raw" to "status=OK;already_disposed_or_not_found;textureId=$textureId",
+            ))
+            return
+        }
+
+        // Same ownership rule as AX/BB's dispose(): never release the
+        // producer while the worker thread may still be rendering into it.
+        // Unlike AX/BB, the AW-OES harness also honors an explicit cancel()
+        // request so its MediaCodec decode loop can exit early instead of
+        // always running to completion.
+        var released = false
+        var completedNow = false
+        synchronized(entry) {
+            if (entry.runCompleted.get()) {
+                released = releaseOnceAwOes(entry)
+                completedNow = true
+            } else {
+                entry.disposeRequested.set(true)
+                entry.harness.cancel()
+            }
+        }
+        if (completedNow) {
+            synchronized(awOesActiveEntries) { awOesActiveEntries.remove(textureId) }
+        }
+        result.success(mapOf(
+            "pass" to true,
+            "textureId" to textureId,
+            "surfaceProducerReleased" to released,
+            "raw" to if (completedNow) {
+                "status=OK;disposed=true;textureId=$textureId"
+            } else {
+                "status=OK;dispose_requested_pending_completion;textureId=$textureId"
+            },
+        ))
+    }
+
+    private fun releaseOnceAwOes(entry: AwOesActiveEntry): Boolean {
+        if (!entry.released.compareAndSet(false, true)) {
+            return false
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            try {
+                entry.surfaceProducer.release()
+            } catch (t: Throwable) {
+                Log.w(TAG, "AW-OES surfaceProducer.release() failed: ${t.javaClass.simpleName}: ${t.message}")
+            }
+        } else {
+            mainHandler.post {
+                try {
+                    entry.surfaceProducer.release()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "AW-OES surfaceProducer.release() on mainHandler failed: ${t.javaClass.simpleName}: ${t.message}")
                 }
             }
         }

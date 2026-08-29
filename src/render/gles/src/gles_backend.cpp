@@ -68,6 +68,18 @@
 //     four target permutations. The compositor still fails closed on any
 //     other target value. No timeline DAG integration, no transitions/PiP,
 //     no product UI.
+//   - Unit AW-OES: createDiagnosticExternalOesTexture()/
+//     deleteDiagnosticExternalOesTexture() allocate/delete a raw
+//     GL_TEXTURE_EXTERNAL_OES texture name directly (glGenTextures/
+//     glDeleteTextures), independent of GlesHardwareBufferImports, for a
+//     caller to bind to an Android SurfaceTexture(int texName).
+//     diagnosticMakeSurfaceCurrent() makes the attached window surface
+//     current without drawing, so a caller can safely call
+//     SurfaceTexture.updateTexImage() next.
+//     presentDiagnosticExternalOesTexture() then draws that raw texture name
+//     via the same GlesTextureFrameRenderer draw path as renderFrame(handle,
+//     transform) and swaps. No AHardwareBuffer import, no
+//     ImageReader.PRIVATE, no product UI.
 //
 // On non-Android host builds:
 //   - No EGL/GLES headers included.
@@ -92,6 +104,13 @@
 //     fail with lastError="diagnostic_composite_frames_readback_unavailable_on_host"
 //     / "diagnostic_present_composite_frames_unavailable_on_host"
 //     respectively.
+//   - Unit AW-OES: createDiagnosticExternalOesTexture() always returns 0
+//     with lastError="diagnostic_external_oes_texture_unavailable_on_host";
+//     diagnosticMakeSurfaceCurrent() and presentDiagnosticExternalOesTexture()
+//     on an initialized backend always fail with
+//     lastError="diagnostic_make_surface_current_unavailable_on_host" /
+//     "diagnostic_present_external_oes_texture_unavailable_on_host"
+//     respectively; deleteDiagnosticExternalOesTexture() is a no-op.
 
 #include "vanguard/render/gles_backend.h"
 #include "gles_hardware_buffer_imports.h"
@@ -101,6 +120,13 @@
 #if defined(__ANDROID__)
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+
+// Unit AW-OES: GL_TEXTURE_EXTERNAL_OES is defined by GLES2/gl2ext.h, which
+// this translation unit does not otherwise need; mirrors the same guarded
+// definition already used by gles_hardware_buffer_imports.cpp.
+#ifndef GL_TEXTURE_EXTERNAL_OES
+#define GL_TEXTURE_EXTERNAL_OES 0x8D65
+#endif
 #endif
 
 #include <cmath>
@@ -1129,6 +1155,140 @@ bool GlesBackend::diagnosticPresentCompositeFrames(HardwareBufferHandle handleA,
     (void)transformA;
     (void)transformB;
     impl_->lastError = "diagnostic_present_composite_frames_unavailable_on_host";
+    return false;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Unit AW-OES: raw GL_TEXTURE_EXTERNAL_OES texture allocator/deleter,
+// current-surface seam, and present-from-raw-texture-name draw path. Unlike
+// importHardwareBuffer(), these do not go through GlesHardwareBufferImports
+// or its handle table -- the returned texture name is owned entirely by the
+// caller (a Kotlin/JNI harness binding it to an Android
+// SurfaceTexture(int texName)).
+// ---------------------------------------------------------------------------
+
+uint32_t GlesBackend::createDiagnosticExternalOesTexture() {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return 0;
+    }
+
+#if defined(__ANDROID__)
+    GLuint texture = 0;
+    glGenTextures(1, &texture);
+    if (texture == 0 || glGetError() != GL_NO_ERROR) {
+        impl_->lastError = "diagnostic_external_oes_texture_gen_failed";
+        return 0;
+    }
+
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, texture);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    const bool paramsOk = (glGetError() == GL_NO_ERROR);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, 0);
+
+    if (!paramsOk) {
+        glDeleteTextures(1, &texture);
+        impl_->lastError = "diagnostic_external_oes_texture_parameter_failed";
+        return 0;
+    }
+
+    impl_->lastError.clear();
+    return static_cast<uint32_t>(texture);
+#else
+    impl_->lastError = "diagnostic_external_oes_texture_unavailable_on_host";
+    return 0;
+#endif
+}
+
+void GlesBackend::deleteDiagnosticExternalOesTexture(uint32_t textureId) {
+    if (textureId == 0) {
+        return;
+    }
+
+#if defined(__ANDROID__)
+    GLuint texture = static_cast<GLuint>(textureId);
+    glDeleteTextures(1, &texture);
+#else
+    (void)textureId;
+#endif
+}
+
+bool GlesBackend::diagnosticMakeSurfaceCurrent() {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return false;
+    }
+
+#if defined(__ANDROID__)
+    if (!hasSurface()) {
+        impl_->lastError = "no_surface_attached";
+        return false;
+    }
+
+    if (eglMakeCurrent(impl_->display, impl_->windowSurface, impl_->windowSurface, impl_->context) != EGL_TRUE) {
+        impl_->lastError = "diagnostic_make_surface_current_failed";
+        return false;
+    }
+
+    impl_->lastError.clear();
+    return true;
+#else
+    impl_->lastError = "diagnostic_make_surface_current_unavailable_on_host";
+    return false;
+#endif
+}
+
+bool GlesBackend::presentDiagnosticExternalOesTexture(uint32_t textureId,
+                                                       const VideoFrameTransform& transform) {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return false;
+    }
+    if (textureId == 0) {
+        impl_->lastError = "invalid_texture_id";
+        return false;
+    }
+
+#if defined(__ANDROID__)
+    if (!hasSurface()) {
+        impl_->lastError = "no_surface_attached";
+        return false;
+    }
+
+    if (eglMakeCurrent(impl_->display, impl_->windowSurface, impl_->windowSurface, impl_->context) != EGL_TRUE) {
+        impl_->lastError = "diagnostic_present_external_oes_texture_make_current_failed";
+        return false;
+    }
+
+    std::string drawError;
+    const bool drawOk = impl_->textureFrameRenderer->drawTexturedQuad(
+        textureId, static_cast<uint32_t>(GL_TEXTURE_EXTERNAL_OES),
+        impl_->surfaceWidth, impl_->surfaceHeight, transform, &drawError);
+    if (!drawOk) {
+        impl_->lastError = !drawError.empty() ? drawError : "diagnostic_present_external_oes_texture_draw_failed";
+        return false;
+    }
+
+    if (eglSwapBuffers(impl_->display, impl_->windowSurface) != EGL_TRUE) {
+        impl_->lastError = "diagnostic_present_external_oes_texture_swap_failed";
+        return false;
+    }
+
+    impl_->lastError.clear();
+    return true;
+#else
+    (void)transform;
+    impl_->lastError = "diagnostic_present_external_oes_texture_unavailable_on_host";
     return false;
 #endif
 }

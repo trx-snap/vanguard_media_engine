@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.bridge
 
+import android.graphics.SurfaceTexture
 import android.hardware.HardwareBuffer
 import android.view.Surface
 import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
@@ -341,6 +342,33 @@ class VanguardNativeBridge(
         mirrorHorizontalB: Boolean,
         sourceKindA: String,
         sourceKindB: String,
+    ): String
+
+    // ── Phase 1-Unit AW-OES: Android GLES decoded SurfaceTexture/OES DAG render foundation ──
+    // Session-based route (create/render/destroy), matching the Phase 4A
+    // pattern. Original Phase 1-Unit AW (ImageReader.PRIVATE +
+    // AHardwareBuffer import of the decoded frame) remains DEFERRED /
+    // VERIFIED_PHYSICAL_FAILURE (`ahb_import_unsupported_format`); this route
+    // decodes onto a SurfaceTexture bound to a native-allocated
+    // GL_TEXTURE_EXTERNAL_OES texture instead and never imports an
+    // AHardwareBuffer.
+    external fun createAndroidDagPhase1AWOESSession(
+        surface: Surface,
+        width: Int,
+        height: Int,
+    ): String
+
+    external fun renderAndroidDagPhase1AWOESFrame(
+        sessionId: String,
+        surfaceTexture: SurfaceTexture,
+        presentationTimeUs: Long,
+        frameIndex: Int,
+        rotationDegrees: Int,
+        mirrorHorizontal: Boolean,
+    ): String
+
+    external fun destroyAndroidDagPhase1AWOESSession(
+        sessionId: String,
     ): String
 
     fun initialize() {
