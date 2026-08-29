@@ -26,8 +26,10 @@
 // 0.5× ultra-wide or telephoto parity until that task is implemented and
 // real-device validated.
 //
-// Android: Not yet implemented. Returns fallback values on Android until
-// CameraX ZoomState capability exposure is added in a future phase.
+// Android: Backed by CameraX ZoomState. Android has no separate optical/
+// lossless-crop threshold, so technicalMaxZoomFactor is reused as
+// upscaleThresholdZoomFactor. virtualDeviceSwitchOverZoomFactors is []
+// and isVirtualDevice is false in the current CameraX wide-angle-only phase.
 
 import 'package:flutter/foundation.dart';
 
@@ -70,9 +72,10 @@ enum VGZoomCameraPosition {
 /// are empty and [isVirtualDevice] is `false`. [supportsUltraWide] and
 /// [supportsTelephoto] are therefore `false`.
 ///
-/// ## Android deferral
-/// Android zoom capability exposure is deferred. On Android, all values
-/// are [fallback] values until CameraX `ZoomState` is surfaced.
+/// ## Android
+/// Backed by CameraX `ZoomState`. `technicalMaxZoomFactor` is reused as
+/// `upscaleThresholdZoomFactor` since CameraX has no equivalent of
+/// AVFoundation's lossless-crop threshold.
 final class VGCameraZoomCapabilities {
   const VGCameraZoomCapabilities({
     required this.minZoomFactor,
@@ -161,7 +164,7 @@ final class VGCameraZoomCapabilities {
   /// iOS source: `AVCaptureDevice.displayVideoZoomFactorMultiplier` (**iOS 18+**).
   /// On iOS < 18 this is `1.0` (no additional scaling needed for wide-angle).
   ///
-  /// Android: always `1.0` (not yet implemented).
+  /// Android: always `1.0` (CameraX exposes no equivalent multiplier).
   final double displayZoomFactorMultiplier;
 
   /// Zoom factor thresholds at which a virtual device switches between its

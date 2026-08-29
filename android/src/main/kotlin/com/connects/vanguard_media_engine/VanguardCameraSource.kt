@@ -34,9 +34,14 @@ package com.connects.vanguard_media_engine
 
 import android.content.Context
 import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.TotalCaptureResult
 import android.net.Uri
 import android.util.Log
 import android.view.Surface
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
@@ -124,6 +129,15 @@ class VanguardCameraSource(
     // ── State guard (I-2: exactly one camera session at a time) ──────────────────
     private var isRunning = false
 
+    // ── Camera readiness signal (Android parity with iOS isCameraReady) ──────
+    // False until the Camera2 capture session behind the CameraX Preview
+    // use-case has actually delivered a completed capture — mirrors iOS
+    // VanguardCameraMediaSource, which reports ready only after the first
+    // native frame buffer exists. Reset false on every start() before binding
+    // and on stop(); set true from the Camera2Interop session capture
+    // callback below, which fires off the main thread.
+    @Volatile private var cameraReadyFlag = false
+
     // ── Async-start cancellation flag ──────────────────────────────────────
     // stop() sets this to true even when isRunning=false (i.e. during the
     // ProcessCameraProvider.getInstance() async gap). The providerFuture
@@ -167,6 +181,9 @@ class VanguardCameraSource(
         // Reset cancellation flag for this fresh start attempt.
         stopRequested = false
 
+        // Reset readiness — a new session has not delivered a capture yet.
+        cameraReadyFlag = false
+
         // Advance fake lifecycle to RESUMED so CameraX considers the session active.
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_CREATE)
         lifecycleRegistry.handleLifecycleEvent(Lifecycle.Event.ON_START)
@@ -204,6 +221,7 @@ class VanguardCameraSource(
 
     // ── Use-case construction + binding ──────────────────────────────────────
 
+    @OptIn(ExperimentalCamera2Interop::class)
     private fun bindUseCases(provider: ProcessCameraProvider) {
         // Tear down any previously bound use-cases first.
         provider.unbindAll()
@@ -217,7 +235,25 @@ class VanguardCameraSource(
         // Frames route into the Flutter SurfaceTexture via a custom SurfaceProvider.
         // NO PreviewView is involved — this is identical in concept to iOS where
         // AVCaptureVideoDataOutput delivers CVPixelBuffer to VanguardMetalRenderer.
-        val previewUseCase = Preview.Builder()
+        val previewBuilder = Preview.Builder()
+
+        // Camera2 interop: observe real preview capture delivery so isCameraReady
+        // reflects an actual frame from the sensor, not just "use-cases bound".
+        // This does NOT touch the Flutter SurfaceTexture's frame-available listener
+        // (that ownership stays with TextureRegistry/Flutter) — it only observes
+        // the underlying Camera2 capture session CameraX drives internally.
+        Camera2Interop.Extender<Preview>(previewBuilder)
+            .setSessionCaptureCallback(object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    result: TotalCaptureResult,
+                ) {
+                    cameraReadyFlag = true
+                }
+            })
+
+        val previewUseCase = previewBuilder
             .build()
             .also { preview = it }
 
@@ -330,6 +366,7 @@ class VanguardCameraSource(
         videoCapture  = null
         cameraProvider = null
         isRunning     = false
+        cameraReadyFlag = false
 
         Log.d(TAG, "stop() — complete")
     }
@@ -559,6 +596,54 @@ class VanguardCameraSource(
     }
 
     /**
+     * Returns zoom capability keys matching the Dart
+     * `VGCameraZoomCapabilities.fromMap` parser, or `null` if no active
+     * capture device is available yet (e.g. [ZoomState] hasn't been
+     * populated by CameraX).
+     *
+     * Mirrors iOS `VanguardCameraMediaSource.zoomCapabilities`. CameraX
+     * exposes no separate optical/lossless-crop threshold the way AVFoundation
+     * does, so [technicalMaxZoomFactor] is reused as a conservative
+     * `upscaleThresholdZoomFactor`. Virtual-device fields are left at their
+     * "none" values ([] / false) — CameraX logical multi-camera switch-over
+     * points aren't surfaced in this wide-angle-only phase.
+     *
+     * Recommended-max policy (no AVFoundation upscale threshold to build
+     * from): front camera `min(2.0, technicalMax)`; back camera
+     * `min(10.0, technicalMax)`.
+     */
+    fun zoomCapabilities(): Map<String, Any>? {
+        val cam = camera ?: return null
+        val zoomState = cam.cameraInfo.zoomState.value ?: return null
+
+        val minZoom = zoomState.minZoomRatio
+        val technicalMax = zoomState.maxZoomRatio
+        val isFront = lensFacing == CameraSelector.LENS_FACING_FRONT
+
+        var recommendedMax = if (isFront) {
+            minOf(2.0f, technicalMax)
+        } else {
+            minOf(10.0f, technicalMax)
+        }
+        // Guard degenerate values so max is at least min.
+        recommendedMax = maxOf(recommendedMax, minZoom)
+
+        val defaultZoom = 1.0f.coerceIn(minZoom, recommendedMax)
+
+        return mapOf(
+            "minZoomFactor" to minZoom.toDouble(),
+            "maxZoomFactor" to recommendedMax.toDouble(),
+            "defaultZoomFactor" to defaultZoom.toDouble(),
+            "technicalMaxZoomFactor" to technicalMax.toDouble(),
+            "upscaleThresholdZoomFactor" to technicalMax.toDouble(),
+            "cameraPosition" to if (isFront) "front" else "back",
+            "displayZoomFactorMultiplier" to 1.0,
+            "virtualDeviceSwitchOverZoomFactors" to emptyList<Double>(),
+            "isVirtualDevice" to false
+        )
+    }
+
+    /**
      * Enables or disables the torch (flash).
      * No-op on front camera (torch not available — caller guards this).
      *
@@ -613,4 +698,11 @@ class VanguardCameraSource(
 
     /** True when camera session is active. */
     val running: Boolean get() = isRunning
+
+    /**
+     * True once the Camera2 capture session behind the Preview use-case has
+     * delivered at least one completed capture for the current start()
+     * session. Mirrors iOS `cameraSource?.isCameraReady`.
+     */
+    val isCameraReady: Boolean get() = cameraReadyFlag
 }

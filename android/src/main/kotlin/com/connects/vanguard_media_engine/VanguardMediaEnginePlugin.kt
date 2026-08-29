@@ -17,6 +17,7 @@ import com.connects.vanguard_media_engine.audio_extraction.AndroidAudioExtractio
 import com.connects.vanguard_media_engine.audio_playback.AndroidAudioPlaybackCoordinator
 import com.connects.vanguard_media_engine.audio_recording.AndroidAudioRecordingCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
+import com.connects.vanguard_media_engine.camera.AndroidCameraGraphTransactionCoordinator
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoordinator
@@ -71,6 +72,13 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // implement live visual filter evaluation on Android; see
     // AndroidTimelineLiveControlCoordinator's header for the full non-claims.
     private var timelineLiveControlCoordinator: AndroidTimelineLiveControlCoordinator? = null
+
+    // ── Camera graph transaction guard bridge ──────────────────────────────────
+    // Owns "applyGraphTransaction" -- honest guard route only. Does NOT
+    // implement camera graph filter execution on Android; see
+    // AndroidCameraGraphTransactionCoordinator's header for the full
+    // non-claims.
+    private var cameraGraphTransactionCoordinator: AndroidCameraGraphTransactionCoordinator? = null
 
     // ── Diagnostic smoke routes (Phases 2O2B3/2O2B4/2Q/3C/4A/5 + Audio Unit B) ─
     private var dagDiagnosticsCoordinator: AndroidDagDiagnosticsCoordinator? = null
@@ -201,6 +209,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         )
         timelineLiveControlCoordinator = AndroidTimelineLiveControlCoordinator(
             activeTextureIdProvider = { editorPlaybackCoordinator?.activeTimelineTextureId() },
+        )
+        cameraGraphTransactionCoordinator = AndroidCameraGraphTransactionCoordinator(
+            hasActiveCameraProvider = { cameraSource != null },
         )
         dagDiagnosticsCoordinator = AndroidDagDiagnosticsCoordinator(
             context       = binding.applicationContext,
@@ -433,6 +444,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android timeline live control coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidCameraGraphTransactionCoordinator.ownsMethod(call.method)) {
+            val coord = cameraGraphTransactionCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android camera graph transaction coordinator unavailable", null)
             }
             return
         }
@@ -1302,9 +1323,26 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             }
 
             "setZoom" -> {
-                val level = (args?.get("level") as? Number)?.toFloat() ?: 1.0f
-                cameraSource?.setZoom(level)
+                // Dart sends the factor as "factor" (see vg_camera_session.dart);
+                // "level" kept as a fallback for backwards compatibility.
+                val factor = (args?.get("factor") as? Number)?.toFloat()
+                    ?: (args?.get("level") as? Number)?.toFloat() ?: 1.0f
+                cameraSource?.setZoom(factor)
                 result.success(null)
+            }
+
+            "getCameraZoomCapabilities" -> {
+                val src = cameraSource
+                if (src == null) {
+                    result.error("NO_CAMERA", "getCameraZoomCapabilities: no active camera session", null)
+                    return
+                }
+                val caps = src.zoomCapabilities()
+                if (caps == null) {
+                    result.error("NO_DEVICE", "getCameraZoomCapabilities: no active capture device", null)
+                    return
+                }
+                result.success(caps)
             }
 
             "setTorchMode" -> {
@@ -1322,6 +1360,25 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.success(null)
             }
 
+            // ── isCameraReady: Android parity with iOS cameraSource?.isCameraReady ──
+            // Backs the Dart post-startCamera readiness poll (vg_camera_session.dart).
+            // Read-only — does not allocate, start, or stop any camera session.
+            "isCameraReady" -> {
+                result.success(cameraSource?.isCameraReady ?: false)
+            }
+
+            // ── MultiCam capability fallback (read-only, parity with iOS routes) ────
+            // Android does not implement live MultiCam/Duet capture in this slice.
+            // These exist only so the Dart startup capability probe resolves instead
+            // of hitting MissingPluginException; false/[] is a capability fallback,
+            // not a Duet implementation.
+            "isMultiCamSupported" -> {
+                result.success(false)
+            }
+
+            "getMultiCamDeviceSets" -> {
+                result.success(emptyList<List<Map<String, String>>>())
+            }
 
             // ─── B4-S5: cancelExport ──────────────────────────────────────────────────
             // Stops the active encoder by setting its cancelled flag.
@@ -1604,6 +1661,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // Phase 10-C-3N timeline live control coordinator is stateless (no native
         // resources) -- just drop the reference, no disposeAll() to call.
         timelineLiveControlCoordinator = null
+        // Camera graph transaction coordinator is stateless (no native
+        // resources) -- just drop the reference, no disposeAll() to call.
+        cameraGraphTransactionCoordinator = null
     }
 
     // ── ActivityAware (Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B) ─

@@ -1151,9 +1151,12 @@ final class VGCameraSession {
   ///   - [VGCameraZoomCapabilities.supportsTelephoto] is `false`.
   ///
   /// ## Android
-  /// Android zoom capability exposure is not yet implemented. On Android the
-  /// native handler is absent so [VGCameraZoomCapabilities.fallback] is
-  /// returned silently.
+  /// Android CameraX exposes no separate optical/lossless-crop threshold the
+  /// way AVFoundation does, so `technicalMaxZoomFactor` is reused as a
+  /// conservative `upscaleThresholdZoomFactor`. Virtual-device fields
+  /// ([VGCameraZoomCapabilities.virtualDeviceSwitchOverZoomFactors],
+  /// [VGCameraZoomCapabilities.isVirtualDevice]) are left at their "none"
+  /// values in the current CameraX wide-angle-only phase.
   ///
   /// ## Failure behaviour
   /// Returns [VGCameraZoomCapabilities.fallback] on any of:
