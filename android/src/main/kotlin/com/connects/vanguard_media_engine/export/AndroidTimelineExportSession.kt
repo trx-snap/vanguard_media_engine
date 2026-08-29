@@ -6,6 +6,9 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.util.Log
+import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
+import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
+import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import java.io.File
 import java.util.UUID
 import kotlin.math.abs
@@ -15,7 +18,12 @@ import kotlin.math.floor
 //
 // One-shot native handler for a single `exportTimeline` MethodChannel call.
 // Owns argument/draft parsing, Unit C guardrail validation, pass-1 video
-// encode (via AndroidTimelineVideoEncoder), and pass-2 audio mux/mixdown
+// encode -- via AndroidTimelineVulkanVideoEncoder when
+// AndroidExportRenderBackendSelector resolves its narrow Vulkan safe scope,
+// falling back mid-export to AndroidTimelineVideoEncoder (GLES) if that
+// Vulkan attempt fails before pass-2/finalization and cancellation has not
+// been requested, otherwise using AndroidTimelineVideoEncoder directly --
+// and pass-2 audio mux/mixdown
 // (via the existing Unit B audio foundation: AndroidAudioTrackSpec,
 // AndroidAudioDirectCopyValidator, AndroidAudioMixdownEngine, AndroidAacEncoder,
 // AndroidAudioRemuxer). Runs entirely on a background thread; never touches a
@@ -353,29 +361,104 @@ class AndroidTimelineExportSession(private val context: Context) {
             )
         }
 
-        val backendDecision = AndroidExportRenderBackendSelector().select()
+        // Session-owned diagnostics/lifecycle/native-bridge triple for this
+        // export run -- reused for backend selection and, when Vulkan is
+        // selected, for AndroidTimelineVulkanVideoEncoder, instead of each
+        // owner constructing its own VanguardNativeBridge.
+        val sessionDiagnostics = VanguardDiagnostics()
+        val sessionLifecycleObserver = VanguardLifecycleObserver(sessionDiagnostics)
+        val sessionNativeBridge = VanguardNativeBridge(sessionLifecycleObserver, sessionDiagnostics, null)
 
-        val encoder: AndroidTimelineVideoPassEncoder = AndroidTimelineVideoEncoder(
-            outputPath = videoTempPath,
-            width = requestWidth,
-            height = requestHeight,
-            fps = requestFps,
-            bitrateBps = requestBitrate,
+        val backendDecision = AndroidExportRenderBackendSelector().select(
+            ExportRenderScope(
+                clips = clipInputs,
+                requestedWidth = requestWidth,
+                requestedHeight = requestHeight,
+            ),
+            nativeBridge = sessionNativeBridge,
         )
-        activeEncoder = encoder
+        // Backend that actually produced pass-1's output -- starts as the
+        // selector's decision, and is updated to GLES if a Vulkan attempt
+        // fails and this session falls back mid-export. Every terminal log
+        // after pass-1 reports this value, not the original selector decision.
+        var effectiveBackend = backendDecision.actualBackend
 
-        val encodeResult = encoder.encode(clipInputs) { p ->
-            onProgress?.invoke((p * PASS1_PROGRESS_SAMPLE_MAX).coerceIn(0.0, PASS1_PROGRESS_SAMPLE_MAX))
+        // Pass-1 progress is scaled into [0.0, PASS1_PROGRESS_SAMPLE_MAX]; a
+        // GLES fallback attempt reuses the same scaled callback and restarts
+        // its own sample-ratio progress from 0, so a max-seen clamp is
+        // required to prevent the fallback from regressing progress already
+        // emitted by a partially-progressed Vulkan attempt.
+        var maxPass1ProgressSeen = 0.0
+        fun emitPass1Progress(sampleRatio: Double) {
+            val scaled = (sampleRatio * PASS1_PROGRESS_SAMPLE_MAX).coerceIn(0.0, PASS1_PROGRESS_SAMPLE_MAX)
+            if (scaled > maxPass1ProgressSeen) {
+                maxPass1ProgressSeen = scaled
+                onProgress?.invoke(scaled)
+            }
         }
-        activeEncoder = null
+
+        fun buildPass1Encoder(backend: ExportRenderBackend): AndroidTimelineVideoPassEncoder {
+            return if (backend == ExportRenderBackend.VULKAN) {
+                AndroidTimelineVulkanVideoEncoder(
+                    outputPath = videoTempPath,
+                    width = requestWidth,
+                    height = requestHeight,
+                    fps = requestFps,
+                    bitrateBps = requestBitrate,
+                    nativeBridge = sessionNativeBridge,
+                )
+            } else {
+                AndroidTimelineVideoEncoder(
+                    outputPath = videoTempPath,
+                    width = requestWidth,
+                    height = requestHeight,
+                    fps = requestFps,
+                    bitrateBps = requestBitrate,
+                )
+            }
+        }
+
+        // [activeEncoder] is always cleared in `finally`, even if an encoder
+        // unexpectedly throws instead of returning a failed EncodeResult, so
+        // a later requestCancel() never holds a reference to a dead encoder.
+        fun encodeWithActiveTracking(enc: AndroidTimelineVideoPassEncoder): AndroidTimelineVideoEncoder.EncodeResult {
+            activeEncoder = enc
+            try {
+                return enc.encode(clipInputs) { p -> emitPass1Progress(p) }
+            } finally {
+                activeEncoder = null
+            }
+        }
+
+        var encoder = buildPass1Encoder(effectiveBackend)
+        var encodeResult = encodeWithActiveTracking(encoder)
+
+        if (!encodeResult.success && effectiveBackend == ExportRenderBackend.VULKAN &&
+            !cancelRequested && encodeResult.reason != "cancelled"
+        ) {
+            Log.i(TAG, "VG_EXPORT_BACKEND_FALLBACK from=vulkan to=gles reason=${encodeResult.reason}")
+            try { File(videoTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
+            // Re-check cancellation after temp cleanup, immediately before
+            // constructing/starting the GLES retry -- a requestCancel() that
+            // lands in the gap between the Vulkan attempt ending and the GLES
+            // retry starting has no in-flight encoder to signal, so it must
+            // be observed here instead of racing the retry.
+            if (!cancelRequested) {
+                effectiveBackend = ExportRenderBackend.GLES
+                encoder = buildPass1Encoder(effectiveBackend)
+                encodeResult = encodeWithActiveTracking(encoder)
+            } else {
+                encodeResult = AndroidTimelineVideoEncoder.EncodeResult(false, "cancelled", 0, 0L)
+            }
+        }
 
         if (!encodeResult.success) {
             deleteOwnedTemps()
             if (cancelRequested || encodeResult.reason == "cancelled") {
-                logTerminal("cancelled_during_encode", backendDecision.actualBackend)
+                logTerminal("cancelled_during_encode", effectiveBackend)
                 onError("EXPORT_CANCELLED", "exportTimeline: cancelled during video encode")
             } else {
-                logTerminal("pass1_failed", backendDecision.actualBackend)
+                logTerminal("pass1_failed", effectiveBackend)
                 onError("EXPORT_FAILED", "exportTimeline: pass-1 video encode failed: ${encodeResult.reason}")
             }
             return
@@ -383,7 +466,7 @@ class AndroidTimelineExportSession(private val context: Context) {
 
         if (cancelRequested) {
             deleteOwnedTemps()
-            logTerminal("cancelled_after_encode", backendDecision.actualBackend)
+            logTerminal("cancelled_after_encode", effectiveBackend)
             onError("EXPORT_CANCELLED", "exportTimeline: cancelled after video encode")
             return
         }
@@ -402,14 +485,14 @@ class AndroidTimelineExportSession(private val context: Context) {
         )
         if (pass2Failure != null) {
             deleteOwnedTemps()
-            logTerminal("pass2_failed", backendDecision.actualBackend)
+            logTerminal("pass2_failed", effectiveBackend)
             onError("EXPORT_FAILED", "exportTimeline: pass-2 audio mux failed: $pass2Failure")
             return
         }
 
         if (cancelRequested) {
             deleteOwnedTemps()
-            logTerminal("cancelled_after_audio_mux", backendDecision.actualBackend)
+            logTerminal("cancelled_after_audio_mux", effectiveBackend)
             onError("EXPORT_CANCELLED", "exportTimeline: cancelled after audio mux")
             return
         }
@@ -422,7 +505,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         val durationSeconds = probeMediaDurationSeconds(finalTmpPath)
         if (durationSeconds == null) {
             deleteOwnedTemps()
-            logTerminal("finalize_failed", backendDecision.actualBackend)
+            logTerminal("finalize_failed", effectiveBackend)
             onError("EXPORT_FAILED", "exportTimeline: failed to measure output duration")
             return
         }
@@ -435,13 +518,13 @@ class AndroidTimelineExportSession(private val context: Context) {
             )
         ) {
             deleteOwnedTemps()
-            logTerminal("finalize_failed", backendDecision.actualBackend)
+            logTerminal("finalize_failed", effectiveBackend)
             onError("EXPORT_FAILED", "exportTimeline: failed to stage ROI sidecar at $roiSidecarTempPath")
             return
         }
         if (!AndroidTimelineRoiSidecarEmitter.finalizeSidecar(roiSidecarTempPath, roiSidecarPath)) {
             deleteOwnedTemps()
-            logTerminal("finalize_failed", backendDecision.actualBackend)
+            logTerminal("finalize_failed", effectiveBackend)
             onError("EXPORT_FAILED", "exportTimeline: failed to finalize ROI sidecar at $roiSidecarPath")
             return
         }
@@ -453,14 +536,14 @@ class AndroidTimelineExportSession(private val context: Context) {
             // not recoverable here -- wrong ROI is worse than empty ROI, and
             // this sidecar is empty either way, so it is left in place.
             deleteOwnedTemps()
-            logTerminal("finalize_failed", backendDecision.actualBackend)
+            logTerminal("finalize_failed", effectiveBackend)
             onError("EXPORT_FAILED", "exportTimeline: failed to finalize output at $outputPath")
             return
         }
         try { File(videoTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
         try { File(audioTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
 
-        logTerminal("success", backendDecision.actualBackend)
+        logTerminal("success", effectiveBackend)
         onSuccess(
             mapOf(
                 "success" to true,

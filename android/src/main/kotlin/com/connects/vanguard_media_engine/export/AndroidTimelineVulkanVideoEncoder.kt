@@ -1,0 +1,510 @@
+package com.connects.vanguard_media_engine.export
+
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.hardware.HardwareBuffer
+import android.media.Image
+import android.media.ImageReader
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMuxer
+import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
+import android.util.Log
+import android.view.Surface
+import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
+import java.io.File
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
+import kotlin.math.ceil
+import kotlin.math.min
+
+// ── AndroidTimelineVulkanVideoEncoder (Vulkan-first export, pass-1) ──────────
+//
+// Preferred/default [AndroidTimelineVideoPassEncoder] implementation, used by
+// AndroidTimelineExportSession only when AndroidExportRenderBackendSelector
+// resolves the Vulkan backend for its narrow first-production safe scope:
+// video-only clips, no rotation, decoded dimensions exactly matching the
+// requested output geometry. AndroidTimelineExportSession falls back to
+// AndroidTimelineVideoEncoder (GLES) whenever this class fails before
+// pass-2/finalization and cancellation has not been requested -- this class
+// itself never falls back; it only reports a distinct machine-readable
+// failure reason and lets the caller decide.
+//
+// Frame path: MediaExtractor + MediaCodec decode -> ImageReader.PRIVATE
+// (HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE, API 29+) -> native Vulkan session
+// (VanguardNativeBridge.createAndroidTimelineVulkanExportSession /
+// renderAndroidTimelineVulkanExportFrame / destroyAndroidTimelineVulkanExportSession),
+// which renders the decoded HardwareBuffer directly into the MediaCodec
+// encoder's own input Surface. No native/JNI code is added or altered here.
+//
+// PTS mechanism (must stay compatible with AndroidTimelineVideoEncoder's
+// frozen fixed frame clock, since a mid-export fallback re-runs the same
+// clips through the GLES encoder from sample 0): both the native-render
+// timelinePtsUs and the muxed sample presentationTimeUs are
+// `sampleIndex * frameDurationUs`, driven off this encoder's own
+// [renderedFrames] / [writtenVideoSamples] counters respectively.
+//
+// Guardrails enforced upstream by AndroidExportRenderBackendSelector /
+// AndroidTimelineExportSession (not here): video-only clips, no rotation,
+// decoded dimensions matching the requested output. This class additionally
+// verifies the *real* decoder HardwareBuffer/Image geometry before rendering
+// each clip's first in-window frame (Opus P1 guard) because real decoder
+// buffers can be padded/cropped even when track metadata reports matching
+// dimensions -- and because a fresh MediaCodec decoder is created per clip,
+// this guard runs once per clip, not just once for the whole encode.
+class AndroidTimelineVulkanVideoEncoder(
+    private val outputPath: String,
+    private val width: Int,
+    private val height: Int,
+    private val fps: Int,
+    private val bitrateBps: Int,
+    private val nativeBridge: VanguardNativeBridge,
+) : AndroidTimelineVideoPassEncoder {
+
+    @Volatile private var cancelRequested = false
+
+    /** Signals the encode loop to stop feeding new frames. Thread-safe. */
+    override fun cancel() {
+        cancelRequested = true
+    }
+
+    private val frameDurationUs = 1_000_000L / fps.coerceAtLeast(1)
+
+    // ─── MediaCodec / MediaMuxer / native session state ──────────────────────
+    private var codec: MediaCodec? = null
+    private var encoderInputSurface: Surface? = null
+    private var muxer: MediaMuxer? = null
+    private var muxerStarted = false
+    private var videoTrackIndex = -1
+    private var writtenVideoSamples = 0
+    private var renderedFrames = 0
+    private var nativeSessionId: String? = null
+
+    // ─── Pass-1 sample-ratio progress ─────────────────────────────────────────
+    private var totalExpectedSamples = 0
+    private var onProgress: ((Double) -> Unit)? = null
+
+    /// Encodes [clips] sequentially (hard-cut concatenation) into [outputPath]
+    /// as a video-only MP4, using the native Vulkan export session for every
+    /// frame. Returns a structured result; never throws.
+    override fun encode(
+        clips: List<AndroidTimelineVideoEncoder.ClipInput>,
+        onProgress: ((Double) -> Unit)?,
+    ): AndroidTimelineVideoEncoder.EncodeResult {
+        this.onProgress = onProgress
+        totalExpectedSamples = clips.sumOf { clip ->
+            ceil((clip.trimEndSeconds - clip.trimStartSeconds) * fps).toInt().coerceAtLeast(1)
+        }
+
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return failResult("api_below_29")
+        }
+
+        var succeeded = false
+        var muxerStoppedCleanly = false
+        var reason = "not_run"
+        try {
+            setupEncoderMuxerAndSession()
+
+            for (clip in clips) {
+                if (cancelRequested) break
+                val failureReason = decodeClipIntoSession(clip)
+                if (failureReason != null) {
+                    if (cancelRequested) break
+                    reason = failureReason
+                    return failResult(reason)
+                }
+            }
+
+            if (cancelRequested) {
+                reason = "cancelled"
+                return failResult(reason)
+            }
+
+            codec!!.signalEndOfInputStream()
+            val eosObserved = drainEncoder(endOfStream = true, deadlineMs = ENCODE_EOS_DEADLINE_MS)
+            if (!eosObserved) {
+                reason = "encoder_eos_drain_timeout"
+                return failResult(reason)
+            }
+
+            if (!muxerStarted || writtenVideoSamples <= 0) {
+                reason = "no_video_samples_written"
+                return failResult(reason)
+            }
+
+            if (renderedFrames <= 0 || writtenVideoSamples != renderedFrames) {
+                reason = "vulkan_sample_count_mismatch:written=$writtenVideoSamples:rendered=$renderedFrames"
+                return failResult(reason)
+            }
+
+            muxer!!.stop()
+            muxerStoppedCleanly = true
+
+            val outFile = File(outputPath)
+            val outSize = if (outFile.exists()) outFile.length() else 0L
+            if (outSize <= 0L) {
+                reason = "output_file_empty_or_missing"
+                return failResult(reason)
+            }
+
+            succeeded = true
+            reason = "success"
+            Log.i(
+                TAG,
+                "VG_VULKAN_ENCODE_RESULT status=success rendered=$renderedFrames " +
+                    "written=$writtenVideoSamples outputSize=$outSize",
+            )
+            return AndroidTimelineVideoEncoder.EncodeResult(true, reason, writtenVideoSamples, outSize)
+        } catch (t: Throwable) {
+            reason = "exception:${t.javaClass.simpleName}"
+            Log.e(TAG, "vulkan encode failed: $t", t)
+            return failResult(reason)
+        } finally {
+            if (muxerStarted && !muxerStoppedCleanly) {
+                try { muxer?.stop() } catch (_: Throwable) {}
+            }
+            releaseAll()
+            if (!succeeded) {
+                try {
+                    val f = File(outputPath)
+                    if (f.exists()) f.delete()
+                } catch (_: Throwable) {}
+            }
+        }
+    }
+
+    private fun failResult(reason: String): AndroidTimelineVideoEncoder.EncodeResult {
+        Log.w(
+            TAG,
+            "VG_VULKAN_ENCODE_RESULT status=fail reason=$reason rendered=$renderedFrames " +
+                "written=$writtenVideoSamples",
+        )
+        return AndroidTimelineVideoEncoder.EncodeResult(false, reason, writtenVideoSamples, 0L)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Setup
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun setupEncoderMuxerAndSession() {
+        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+            setInteger(MediaFormat.KEY_BIT_RATE, bitrateBps)
+            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+        }
+        val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        val surface = enc.createInputSurface()
+        enc.start()
+        codec = enc
+        encoderInputSurface = surface
+        muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+
+        val createResult = nativeBridge.createAndroidTimelineVulkanExportSession(surface, width, height)
+        if (!createResult.startsWith("status=OK;")) {
+            throw IllegalStateException("vulkan_session_create_failed:${createResult.take(120)}")
+        }
+        nativeSessionId = createResult.substringAfter("sessionId=").substringBefore(";").ifEmpty { null }
+            ?: throw IllegalStateException("vulkan_session_id_parse_failed")
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Per-clip decode -> native Vulkan render -> encoder drain
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Returns null on success, or a machine-readable failure reason string
+    /// for any non-cancel decode/render failure. Every clip's first in-window
+    /// rendered frame is checked against the Opus P1 real-buffer geometry
+    /// guard (see [renderImageIntoSession]) -- a per-clip decoder can produce
+    /// a differently padded/cropped HardwareBuffer than an earlier clip's
+    /// decoder even when both clips report matching track-metadata geometry.
+    private fun decodeClipIntoSession(clip: AndroidTimelineVideoEncoder.ClipInput): String? {
+        val extractor = MediaExtractor()
+        var decoder: MediaCodec? = null
+        var imageReader: ImageReader? = null
+        var thread: HandlerThread? = null
+        val imageQueue = LinkedBlockingQueue<Image>(IMAGE_READER_MAX_IMAGES + 2)
+        try {
+            extractor.setDataSource(clip.sourcePath)
+            var trackIndex = -1
+            var trackFormat: MediaFormat? = null
+            for (i in 0 until extractor.trackCount) {
+                val f = extractor.getTrackFormat(i)
+                if (f.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
+                    trackIndex = i
+                    trackFormat = f
+                    break
+                }
+            }
+            if (trackIndex < 0 || trackFormat == null) return "clip_no_video_track:${clip.sourcePath}"
+            extractor.selectTrack(trackIndex)
+
+            val trimStartUs = (clip.trimStartSeconds * 1_000_000L).toLong()
+            if (trimStartUs > 0L) {
+                extractor.seekTo(trimStartUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+            }
+            val trimEndUs = (clip.trimEndSeconds * 1_000_000L).toLong()
+
+            thread = HandlerThread("VGVulkanExportImageReader").also { it.start() }
+            val handler = Handler(thread.looper)
+
+            val reader = ImageReader.newInstance(
+                width,
+                height,
+                ImageFormat.PRIVATE,
+                IMAGE_READER_MAX_IMAGES,
+                HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
+            )
+            reader.setOnImageAvailableListener(
+                { r ->
+                    try {
+                        val img = r.acquireNextImage()
+                        if (img != null && !imageQueue.offer(img)) {
+                            img.close()
+                        }
+                    } catch (_: Exception) {
+                        // Listener callback -- nothing actionable beyond dropping the frame.
+                    }
+                },
+                handler,
+            )
+            imageReader = reader
+
+            val mime = trackFormat.getString(MediaFormat.KEY_MIME)!!
+            val dec = MediaCodec.createDecoderByType(mime)
+            dec.configure(trackFormat, reader.surface, null, 0)
+            dec.start()
+            decoder = dec
+
+            val info = MediaCodec.BufferInfo()
+            var inputDone = false
+            var renderedFramesInClip = 0
+
+            while (true) {
+                if (cancelRequested && !inputDone) {
+                    val inIdx = dec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
+                    if (inIdx >= 0) {
+                        dec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        inputDone = true
+                    }
+                } else if (!inputDone) {
+                    val inIdx = dec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
+                    if (inIdx >= 0) {
+                        val buf = dec.getInputBuffer(inIdx)!!
+                        val size = extractor.readSampleData(buf, 0)
+                        if (size < 0 || extractor.sampleTime > trimEndUs) {
+                            dec.queueInputBuffer(inIdx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputDone = true
+                        } else {
+                            dec.queueInputBuffer(inIdx, 0, size, extractor.sampleTime, 0)
+                            extractor.advance()
+                        }
+                    }
+                }
+
+                val outIdx = dec.dequeueOutputBuffer(info, DEQUEUE_TIMEOUT_US)
+                if (outIdx >= 0) {
+                    val isEos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                    if (info.size > 0) {
+                        // Trim window is [trimStartUs, trimEndUs) — decoded pre-roll
+                        // needed for the sync seek, and any frame at/after trimEnd,
+                        // must be dropped rather than rendered.
+                        val inWindow = info.presentationTimeUs >= trimStartUs &&
+                            info.presentationTimeUs < trimEndUs
+                        if (inWindow) {
+                            dec.releaseOutputBuffer(outIdx, true)
+                            val image = imageQueue.poll(IMAGE_ACQUIRE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                                ?: return "vulkan_image_acquire_timeout:${clip.sourcePath}"
+                            val frameFailure = renderImageIntoSession(
+                                image,
+                                isFirstFrameInClip = renderedFramesInClip == 0,
+                            )
+                            if (frameFailure != null) return frameFailure
+                            renderedFramesInClip++
+                        } else {
+                            dec.releaseOutputBuffer(outIdx, false)
+                        }
+                    } else {
+                        dec.releaseOutputBuffer(outIdx, false)
+                    }
+                    if (isEos) break
+                }
+                if (cancelRequested && inputDone && outIdx == MediaCodec.INFO_TRY_AGAIN_LATER) {
+                    // Cancellation requested and no more input pending — stop waiting for
+                    // a decoder drain that may never come from a codec we've EOS'd.
+                    break
+                }
+            }
+
+            if (renderedFramesInClip == 0 && !cancelRequested) {
+                return "no_frames_in_trim_window:${clip.sourcePath}"
+            }
+            return null
+        } catch (t: Throwable) {
+            Log.e(TAG, "decodeClipIntoSession failed for ${clip.sourcePath}: $t", t)
+            return "clip_decode_exception:${t.javaClass.simpleName}:${clip.sourcePath}"
+        } finally {
+            while (true) {
+                val img = imageQueue.poll() ?: break
+                try { img.close() } catch (_: Throwable) {}
+            }
+            try { decoder?.stop() } catch (_: Throwable) {}
+            try { decoder?.release() } catch (_: Throwable) {}
+            try { imageReader?.close() } catch (_: Throwable) {}
+            try { thread?.quitSafely() } catch (_: Throwable) {}
+            try { extractor.release() } catch (_: Throwable) {}
+        }
+    }
+
+    /// Renders one decoded [image] into the native Vulkan session, then
+    /// drains the encoder for the corresponding muxed sample. Closes
+    /// [image]'s HardwareBuffer, then [image] itself, before returning on
+    /// every path. Returns a machine-readable failure reason, or null.
+    ///
+    /// When [isFirstFrameInClip] is true, enforces the Opus P1 real-buffer
+    /// geometry guard before rendering: real decoder HardwareBuffers can be
+    /// padded/cropped even when track metadata (and this encoder's own
+    /// width/height) reports matching dimensions, and a fresh MediaCodec
+    /// decoder instance is created per clip -- so this guard runs once per
+    /// clip, on that clip's own first in-window frame, before any of its
+    /// frames are handed to the native session.
+    private fun renderImageIntoSession(image: Image, isFirstFrameInClip: Boolean): String? {
+        var hwBuf: HardwareBuffer? = null
+        try {
+            hwBuf = image.hardwareBuffer
+                ?: return "vulkan_hardware_buffer_null"
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                val fence = image.fence
+                try {
+                    if (fence.isValid) {
+                        fence.await(java.time.Duration.ofMillis(FENCE_WAIT_TIMEOUT_MS))
+                    }
+                } catch (_: Exception) {
+                    // Bounded best-effort wait -- rendering proceeds either way.
+                } finally {
+                    try { fence.close() } catch (_: Throwable) {}
+                }
+            }
+
+            if (isFirstFrameInClip) {
+                val expectedRect = Rect(0, 0, width, height)
+                if (hwBuf.width != width || hwBuf.height != height || image.cropRect != expectedRect) {
+                    return "vulkan_decoder_buffer_geometry_mismatch:" +
+                        "bufW=${hwBuf.width}:bufH=${hwBuf.height}:crop=${image.cropRect}"
+                }
+            }
+
+            val timelinePtsUs = renderedFrames * frameDurationUs
+            val renderStr = nativeBridge.renderAndroidTimelineVulkanExportFrame(
+                sessionId = nativeSessionId!!,
+                hardwareBuffer = hwBuf,
+                width = width,
+                height = height,
+                timelinePtsUs = timelinePtsUs,
+                frameIndex = renderedFrames,
+            )
+            if (!renderStr.startsWith("status=OK;")) {
+                return "vulkan_render_failed:${renderStr.take(120)}"
+            }
+            renderedFrames++
+            drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
+            return null
+        } finally {
+            try { hwBuf?.close() } catch (_: Throwable) {}
+            try { image.close() } catch (_: Throwable) {}
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Encoder output drain (fixed frame clock — mirrors AndroidTimelineVideoEncoder)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Drains encoder output into the muxer. When [endOfStream] is true,
+    /// returns whether the encoder's own EOS buffer was actually observed
+    /// before [deadlineMs] elapsed. When [endOfStream] is false (per-frame
+    /// drain), always returns true.
+    private fun drainEncoder(endOfStream: Boolean, deadlineMs: Long): Boolean {
+        val enc = codec!!
+        val mx = muxer!!
+        val info = MediaCodec.BufferInfo()
+        val deadline = System.currentTimeMillis() + deadlineMs
+        var draining = true
+        var eosObserved = false
+        while (draining) {
+            if (endOfStream && System.currentTimeMillis() > deadline) break
+            val outIdx = enc.dequeueOutputBuffer(info, DEQUEUE_TIMEOUT_US)
+            when {
+                outIdx == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                    if (!endOfStream) draining = false
+                }
+                outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    if (videoTrackIndex < 0) {
+                        videoTrackIndex = mx.addTrack(enc.outputFormat)
+                        mx.start()
+                        muxerStarted = true
+                    }
+                }
+                outIdx >= 0 -> {
+                    val isConfig = (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0
+                    val isEos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
+                    if (!isConfig && info.size > 0 && muxerStarted && videoTrackIndex >= 0) {
+                        val buf = enc.getOutputBuffer(outIdx)
+                        if (buf != null) {
+                            buf.position(info.offset)
+                            buf.limit(info.offset + info.size)
+                            // Frozen mechanism: fixed frame clock, matching
+                            // AndroidTimelineVideoEncoder's drain.
+                            info.presentationTimeUs = writtenVideoSamples * frameDurationUs
+                            mx.writeSampleData(videoTrackIndex, buf, info)
+                            writtenVideoSamples++
+                            if (totalExpectedSamples > 0) {
+                                onProgress?.invoke(min(writtenVideoSamples.toDouble() / totalExpectedSamples, 1.0))
+                            }
+                        }
+                    }
+                    enc.releaseOutputBuffer(outIdx, false)
+                    if (isEos) {
+                        eosObserved = true
+                        draining = false
+                    }
+                }
+            }
+        }
+        return !endOfStream || eosObserved
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Cleanup
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Destroys the native Vulkan session before releasing the encoder's own
+    /// surface/codec/muxer, per the required cleanup ordering.
+    private fun releaseAll() {
+        val sid = nativeSessionId
+        if (sid != null) {
+            try { nativeBridge.destroyAndroidTimelineVulkanExportSession(sid) } catch (_: Throwable) {}
+        }
+        try { codec?.stop() } catch (_: Throwable) {}
+        try { codec?.release() } catch (_: Throwable) {}
+        try { muxer?.release() } catch (_: Throwable) {}
+        try { encoderInputSurface?.release() } catch (_: Throwable) {}
+    }
+
+    companion object {
+        private const val TAG = "VGTimelineVulkanEnc"
+        private const val DEQUEUE_TIMEOUT_US = 10_000L
+        private const val IMAGE_ACQUIRE_TIMEOUT_MS = 2_000L
+        private const val FENCE_WAIT_TIMEOUT_MS = 1_000L
+        private const val ENCODE_DRAIN_DEADLINE_MS = 2_000L
+        private const val ENCODE_EOS_DEADLINE_MS = 5_000L
+        private const val IMAGE_READER_MAX_IMAGES = 3
+    }
+}

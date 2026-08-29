@@ -77,6 +77,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AVGlesEvalRenderSmoke",
             "runAndroidDagPhase3UnitTThermalListenerSmoke",
             "runAndroidVulkanExportNativeSeamSmoke",
+            "runAndroidVulkanExportProductionWiringSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -136,6 +137,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase1AVGlesEvalRenderSmoke" -> runPhase1AVGlesEvalRenderSmoke(args, result)
             "runAndroidDagPhase3UnitTThermalListenerSmoke" -> runPhase3UnitTThermalListenerSmoke(result)
             "runAndroidVulkanExportNativeSeamSmoke" -> runAndroidVulkanExportNativeSeamSmoke(args, result)
+            "runAndroidVulkanExportProductionWiringSmoke" -> runAndroidVulkanExportProductionWiringSmoke(args, result)
             else -> return false
         }
         return true
@@ -1002,6 +1004,62 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "THERMAL_LISTENER_SMOKE_FAILED",
                         "runAndroidDagPhase3UnitTThermalListenerSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Vulkan-first export production wiring smoke harness ─────────────────
+    private fun runAndroidVulkanExportProductionWiringSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val sourcePath = args?.get("sourcePath") as? String
+        val outputDir = args?.get("outputDir") as? String
+        val useSyntheticSource = (args?.get("useSyntheticSource") as? Boolean) ?: sourcePath.isNullOrBlank()
+
+        if (outputDir.isNullOrBlank()) {
+            result.error(
+                "INVALID_ARG",
+                "runAndroidVulkanExportProductionWiringSmoke: outputDir required",
+                null,
+            )
+            return
+        }
+
+        if (!useSyntheticSource && sourcePath.isNullOrBlank()) {
+            result.error(
+                "INVALID_ARG",
+                "runAndroidVulkanExportProductionWiringSmoke: sourcePath required when useSyntheticSource is false",
+                null,
+            )
+            return
+        }
+
+        val width = (args["width"] as? Number)?.toInt() ?: 1280
+        val height = (args["height"] as? Number)?.toInt() ?: 720
+        val fps = (args["fps"] as? Number)?.toInt() ?: 30
+        val bitrateBps = (args["bitrateBps"] as? Number)?.toInt() ?: 4_000_000
+        val trimEndSeconds = (args["trimEndSeconds"] as? Number)?.toDouble() ?: 1.0
+
+        Thread {
+            try {
+                val smokeResult = AndroidVulkanExportProductionWiringSmokeHarness.run(
+                    context = context,
+                    sourcePath = sourcePath,
+                    outputDir = outputDir,
+                    useSyntheticSource = useSyntheticSource,
+                    width = width,
+                    height = height,
+                    fps = fps,
+                    bitrateBps = bitrateBps,
+                    trimEndSeconds = trimEndSeconds,
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "VULKAN_EXPORT_PRODUCTION_WIRING_SMOKE_FAILED",
+                        "runAndroidVulkanExportProductionWiringSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
