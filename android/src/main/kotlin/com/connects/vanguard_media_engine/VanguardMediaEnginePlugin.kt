@@ -15,6 +15,7 @@ import com.connects.vanguard_media_engine.audio.AndroidWaveformExtractor
 import com.connects.vanguard_media_engine.audio.AndroidWaveformResult
 import com.connects.vanguard_media_engine.audio_extraction.AndroidAudioExtractionCoordinator
 import com.connects.vanguard_media_engine.audio_playback.AndroidAudioPlaybackCoordinator
+import com.connects.vanguard_media_engine.audio_recording.AndroidAudioRecordingCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
@@ -108,6 +109,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // routes -- Android parity with VGVideoAssetPickerHandler.swift (iOS).
     // Also an ActivityAware-driven PluginRegistry.RequestPermissionsResultListener.
     private var videoAssetPickerCoordinator: AndroidVideoAssetPickerCoordinator? = null
+
+    // ── Phase 4-Unit H / Phase 5-Unit AC: audio recording coordinator ─────────
+    // Owns "startAudioRecording" and "stopAudioRecording" -- Android parity
+    // with VGAudioRecordingHandler.swift (iOS), bounded to a timeline-independent
+    // slice (startPTS frozen to 0.0; no NO_TIMELINE dependency).
+    private var audioRecordingCoordinator: AndroidAudioRecordingCoordinator? = null
 
     // ── ActivityAware binding (needed by videoAssetPickerCoordinator only) ────
     private var activityBinding: ActivityPluginBinding? = null
@@ -207,6 +214,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         videoAssetPickerCoordinator = AndroidVideoAssetPickerCoordinator(
+            context     = binding.applicationContext,
+            mainHandler = mainHandler,
+        )
+        audioRecordingCoordinator = AndroidAudioRecordingCoordinator(
             context     = binding.applicationContext,
             mainHandler = mainHandler,
         )
@@ -351,6 +362,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android video asset picker coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidAudioRecordingCoordinator.ownsMethod(call.method)) {
+            val coord = audioRecordingCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android audio recording coordinator unavailable", null)
             }
             return
         }
@@ -1559,6 +1580,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         activityBinding = null
         videoAssetPickerCoordinator?.disposeAll()
         videoAssetPickerCoordinator = null
+        // Tear down Phase 4-Unit H / Phase 5-Unit AC audio recording coordinator.
+        audioRecordingCoordinator?.disposeAll()
+        audioRecordingCoordinator = null
     }
 
     // ── ActivityAware (Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B) ─
