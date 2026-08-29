@@ -26,7 +26,8 @@ import kotlin.math.max
 
 object AndroidVulkanExportProductionWiringSmokeHarness {
     private const val TAG = "VanguardVulkanExportWiring"
-    private const val PROOF_BOUNDARY = "production_exportTimeline_vulkan_vs_direct_gles_pixel_parity"
+    private const val PROOF_BOUNDARY_GLES_PARITY = "production_exportTimeline_vulkan_vs_direct_gles_pixel_parity"
+    private const val PROOF_BOUNDARY_ROTATION_REGION = "production_exportTimeline_vulkan_rotation_region_oracle"
 
     fun run(
         context: Context,
@@ -35,10 +36,13 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         useSyntheticSource: Boolean = sourcePath.isNullOrBlank(),
         width: Int = 1280,
         height: Int = 720,
+        outputWidth: Int = width,
+        outputHeight: Int = height,
         fps: Int = 30,
         bitrateBps: Int = 4_000_000,
         trimEndSeconds: Double = 1.0,
         sourceRotationDegrees: Int = 0,
+        oracleMode: String = "gles_pixel_parity",
     ): Map<String, Any?> {
         val outDirFile = File(outputDir)
         val sourceMode = if (useSyntheticSource) "synthetic" else "provided"
@@ -53,6 +57,9 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                 sourceRotationDegrees = sourceRotationDegrees,
                 prodPath = "",
                 glesPath = "",
+                oracleMode = oracleMode,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
             )
         }
 
@@ -66,6 +73,9 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                 sourceRotationDegrees = sourceRotationDegrees,
                 prodPath = "",
                 glesPath = "",
+                oracleMode = oracleMode,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
             )
         }
 
@@ -98,6 +108,9 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                     sourceRotationDegrees = sourceRotationDegrees,
                     prodPath = "",
                     glesPath = "",
+                    oracleMode = oracleMode,
+                    outputWidth = outputWidth,
+                    outputHeight = outputHeight,
                 )
             }
             generatedSourceSize = genFile.length()
@@ -113,6 +126,9 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                     sourceRotationDegrees = sourceRotationDegrees,
                     prodPath = "",
                     glesPath = "",
+                    oracleMode = oracleMode,
+                    outputWidth = outputWidth,
+                    outputHeight = outputHeight,
                 )
             }
             val sourceFile = File(sourcePath)
@@ -126,6 +142,9 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                     sourceRotationDegrees = sourceRotationDegrees,
                     prodPath = "",
                     glesPath = "",
+                    oracleMode = oracleMode,
+                    outputWidth = outputWidth,
+                    outputHeight = outputHeight,
                 )
             }
             effectiveSourcePath = sourcePath
@@ -143,11 +162,14 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                 sourceMetadataRotationDegrees = sourceMetadataRotationDegrees,
                 prodPath = "",
                 glesPath = "",
+                oracleMode = oracleMode,
+                outputWidth = outputWidth,
+                outputHeight = outputHeight,
             )
         }
 
         val prodOutputPath = File(outDirFile, "vulkan_production_wiring_${timestamp}_production.mp4").absolutePath
-        val glesOutputPath = File(outDirFile, "vulkan_production_wiring_${timestamp}_gles_baseline.mp4").absolutePath
+        val glesOutputPath = if (oracleMode == "rotation_region") "" else File(outDirFile, "vulkan_production_wiring_${timestamp}_gles_baseline.mp4").absolutePath
         val prodSidecarPath = AndroidTimelineRoiSidecarEmitter.sidecarPathForVideoPath(prodOutputPath)
 
         var prodPass = false
@@ -167,6 +189,12 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         var prodMeanRgb = mapOf("r" to 0.0, "g" to 0.0, "b" to 0.0)
         var glesMeanRgb = mapOf("r" to 0.0, "g" to 0.0, "b" to 0.0)
         var meanAbsDiff = -1.0
+
+        var glesBaselineSkipped = false
+        var rotationRegionOraclePass = false
+        var prodOutputWidth = 0
+        var prodOutputHeight = 0
+        var sampledRegions: Map<String, Any?> = emptyMap()
 
         try {
             // ── Lane A: Production route under test ──────────────────────────
@@ -188,20 +216,20 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             val draftMap = mapOf(
                 "id" to "vulkan_prod_draft",
                 "clips" to listOf(draftClip),
-                "canvasWidth" to width,
-                "canvasHeight" to height,
+                "canvasWidth" to outputWidth,
+                "canvasHeight" to outputHeight,
                 "fps" to fps,
                 "canvas" to mapOf(
-                    "width" to width,
-                    "height" to height,
+                    "width" to outputWidth,
+                    "height" to outputHeight,
                     "contentMode" to "fit",
                 ),
             )
 
             val exportArgs = mapOf(
                 "outputPath" to prodOutputPath,
-                "width" to width,
-                "height" to height,
+                "width" to outputWidth,
+                "height" to outputHeight,
                 "fps" to fps,
                 "bitrateBps" to bitrateBps,
                 "draft" to draftMap,
@@ -269,75 +297,92 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                     prodMeanRgb = prodMeanRgb,
                     glesMeanRgb = glesMeanRgb,
                     meanAbsDiff = meanAbsDiff,
+                    oracleMode = oracleMode,
+                    glesBaselineSkipped = glesBaselineSkipped,
+                    rotationRegionOraclePass = rotationRegionOraclePass,
+                    prodOutputWidth = prodOutputWidth,
+                    prodOutputHeight = prodOutputHeight,
+                    sampledRegions = sampledRegions,
                 )
             }
 
             // ── Lane B: Direct GLES baseline ────────────────────────────────
-            val glesEncoder = AndroidTimelineVideoEncoder(
-                outputPath = glesOutputPath,
-                width = width,
-                height = height,
-                fps = fps,
-                bitrateBps = bitrateBps,
-            )
+            if (oracleMode != "rotation_region") {
+                val glesEncoder = AndroidTimelineVideoEncoder(
+                    outputPath = glesOutputPath,
+                    width = outputWidth,
+                    height = outputHeight,
+                    fps = fps,
+                    bitrateBps = bitrateBps,
+                )
 
-            val clipInput = AndroidTimelineVideoEncoder.ClipInput(
-                sourcePath = effectiveSourcePath,
-                trimStartSeconds = 0.0,
-                trimEndSeconds = trimEndSeconds,
-                decodedWidth = width,
-                decodedHeight = height,
-                rotationDegrees = sourceRotationDegrees,
-                mediaKind = "video",
-            )
+                val clipInput = AndroidTimelineVideoEncoder.ClipInput(
+                    sourcePath = effectiveSourcePath,
+                    trimStartSeconds = 0.0,
+                    trimEndSeconds = trimEndSeconds,
+                    decodedWidth = width,
+                    decodedHeight = height,
+                    rotationDegrees = sourceRotationDegrees,
+                    mediaKind = "video",
+                )
 
-            val glesResult = glesEncoder.encode(listOf(clipInput)) { p ->
-                glesProgressSamples.add(p)
-            }
+                val glesResult = glesEncoder.encode(listOf(clipInput)) { p ->
+                    glesProgressSamples.add(p)
+                }
 
-            val glesFile = File(glesOutputPath)
-            glesOutputSize = if (glesFile.exists()) glesFile.length() else 0L
+                val glesFile = File(glesOutputPath)
+                glesOutputSize = if (glesFile.exists()) glesFile.length() else 0L
 
-            if (!glesResult.success) {
-                failureReason = "gles_encode_failed: ${glesResult.reason}"
-            } else if (!glesFile.exists() || glesOutputSize <= 0L) {
-                failureReason = "gles_output_missing_or_empty"
-            } else if (glesResult.writtenVideoSamples <= 0) {
-                failureReason = "gles_no_video_samples_written"
+                if (!glesResult.success) {
+                    failureReason = "gles_encode_failed: ${glesResult.reason}"
+                } else if (!glesFile.exists() || glesOutputSize <= 0L) {
+                    failureReason = "gles_output_missing_or_empty"
+                } else if (glesResult.writtenVideoSamples <= 0) {
+                    failureReason = "gles_no_video_samples_written"
+                } else {
+                    glesPass = true
+                }
+
+                if (!glesPass) {
+                    return finishResult(
+                        pass = false,
+                        reason = failureReason ?: "gles_lane_failed",
+                        sourceMode = sourceMode,
+                        sourcePath = effectiveSourcePath,
+                        generatedSourcePath = generatedSourcePath,
+                        generatedSourceSize = generatedSourceSize,
+                        sourceRotationDegrees = sourceRotationDegrees,
+                        sourceMetadataRotationDegrees = sourceMetadataRotationDegrees,
+                        prodPass = prodPass,
+                        glesPass = glesPass,
+                        pixelPass = pixelPass,
+                        prodPath = prodOutputPath,
+                        glesPath = glesOutputPath,
+                        prodSize = prodOutputSize,
+                        glesSize = glesOutputSize,
+                        prodSidecarPath = prodSidecarPath,
+                        prodSidecarExists = prodSidecarExists,
+                        prodErrorCode = prodErrorCode,
+                        prodErrorMessage = prodErrorMessage,
+                        prodProgressSamples = prodProgressSamples,
+                        glesProgressSamples = glesProgressSamples,
+                        prodMeanRgb = prodMeanRgb,
+                        glesMeanRgb = glesMeanRgb,
+                        meanAbsDiff = meanAbsDiff,
+                        oracleMode = oracleMode,
+                        glesBaselineSkipped = false,
+                        rotationRegionOraclePass = false,
+                        prodOutputWidth = prodOutputWidth,
+                        prodOutputHeight = prodOutputHeight,
+                        sampledRegions = sampledRegions,
+                    )
+                }
             } else {
                 glesPass = true
+                glesBaselineSkipped = true
             }
 
-            if (!glesPass) {
-                return finishResult(
-                    pass = false,
-                    reason = failureReason ?: "gles_lane_failed",
-                    sourceMode = sourceMode,
-                    sourcePath = effectiveSourcePath,
-                    generatedSourcePath = generatedSourcePath,
-                    generatedSourceSize = generatedSourceSize,
-                    sourceRotationDegrees = sourceRotationDegrees,
-                    sourceMetadataRotationDegrees = sourceMetadataRotationDegrees,
-                    prodPass = prodPass,
-                    glesPass = glesPass,
-                    pixelPass = pixelPass,
-                    prodPath = prodOutputPath,
-                    glesPath = glesOutputPath,
-                    prodSize = prodOutputSize,
-                    glesSize = glesOutputSize,
-                    prodSidecarPath = prodSidecarPath,
-                    prodSidecarExists = prodSidecarExists,
-                    prodErrorCode = prodErrorCode,
-                    prodErrorMessage = prodErrorMessage,
-                    prodProgressSamples = prodProgressSamples,
-                    glesProgressSamples = glesProgressSamples,
-                    prodMeanRgb = prodMeanRgb,
-                    glesMeanRgb = glesMeanRgb,
-                    meanAbsDiff = meanAbsDiff,
-                )
-            }
-
-            // ── Lane C: Pixel sanity / parity ───────────────────────────────
+            // ── Lane C: Pixel sanity / parity / region oracle ───────────────
             val targetTimeUs = if (trimEndSeconds < 0.6) {
                 (trimEndSeconds * 500_000.0).toLong().coerceAtLeast(0L)
             } else {
@@ -345,41 +390,93 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             }
 
             val prodBitmap = extractFrame(prodOutputPath, targetTimeUs)
-            val glesBitmap = extractFrame(glesOutputPath, targetTimeUs)
+            val prodDimensions = readVideoDimensions(prodOutputPath) ?: (prodBitmap?.let { it.width to it.height })
+            prodOutputWidth = prodDimensions?.first ?: 0
+            prodOutputHeight = prodDimensions?.second ?: 0
 
             if (prodBitmap == null) {
                 failureReason = "pixel_extraction_failed_production"
-            } else if (glesBitmap == null) {
-                failureReason = "pixel_extraction_failed_gles"
-            } else {
+            } else if (oracleMode == "rotation_region") {
                 val pRgb = computeMeanRgb(prodBitmap)
-                val gRgb = computeMeanRgb(glesBitmap)
-
                 prodMeanRgb = mapOf("r" to pRgb.r, "g" to pRgb.g, "b" to pRgb.b)
-                glesMeanRgb = mapOf("r" to gRgb.r, "g" to gRgb.g, "b" to gRgb.b)
-
-                val diff = (abs(pRgb.r - gRgb.r) + abs(pRgb.g - gRgb.g) + abs(pRgb.b - gRgb.b)) / 3.0
-                meanAbsDiff = diff
-
                 val prodAvg = (pRgb.r + pRgb.g + pRgb.b) / 3.0
-                val glesAvg = (gRgb.r + gRgb.g + gRgb.b) / 3.0
-
                 val prodNonBlank = prodAvg in 3.0..252.0
-                val glesNonBlank = glesAvg in 3.0..252.0
-                val diffAcceptable = diff <= 30.0
 
-                if (!prodNonBlank) {
+                val dimensionsMatch = (prodOutputWidth == outputWidth && prodOutputHeight == outputHeight)
+
+                val tlRgb = sampleRegionMeanRgb(prodBitmap, 0.15f, 0.35f, 0.15f, 0.35f)
+                val trRgb = sampleRegionMeanRgb(prodBitmap, 0.65f, 0.85f, 0.15f, 0.35f)
+                val blRgb = sampleRegionMeanRgb(prodBitmap, 0.15f, 0.35f, 0.65f, 0.85f)
+                val brRgb = sampleRegionMeanRgb(prodBitmap, 0.65f, 0.85f, 0.65f, 0.85f)
+
+                val tlColor = classifyColor(tlRgb)
+                val trColor = classifyColor(trRgb)
+                val blColor = classifyColor(blRgb)
+                val brColor = classifyColor(brRgb)
+
+                val expected = expectedQuadrantColors(sourceRotationDegrees)
+
+                sampledRegions = mapOf(
+                    "TL" to mapOf("r" to tlRgb.r, "g" to tlRgb.g, "b" to tlRgb.b, "classified" to tlColor, "expected" to expected["TL"]),
+                    "TR" to mapOf("r" to trRgb.r, "g" to trRgb.g, "b" to trRgb.b, "classified" to trColor, "expected" to expected["TR"]),
+                    "BL" to mapOf("r" to blRgb.r, "g" to blRgb.g, "b" to blRgb.b, "classified" to blColor, "expected" to expected["BL"]),
+                    "BR" to mapOf("r" to brRgb.r, "g" to brRgb.g, "b" to brRgb.b, "classified" to brColor, "expected" to expected["BR"]),
+                )
+
+                val matchTL = tlColor == expected["TL"]
+                val matchTR = trColor == expected["TR"]
+                val matchBL = blColor == expected["BL"]
+                val matchBR = brColor == expected["BR"]
+                rotationRegionOraclePass = matchTL && matchTR && matchBL && matchBR
+
+                if (!dimensionsMatch) {
+                    failureReason = "production_output_dimensions_mismatch:expected=${outputWidth}x${outputHeight}:actual=${prodOutputWidth}x${prodOutputHeight}"
+                } else if (!prodNonBlank) {
                     failureReason = "pixel_production_blank_sentinel: avg=$prodAvg"
-                } else if (!glesNonBlank) {
-                    failureReason = "pixel_gles_blank_sentinel: avg=$glesAvg"
-                } else if (!diffAcceptable) {
-                    failureReason = "pixel_diff_exceeds_threshold: diff=$diff > 30.0"
+                } else if (!rotationRegionOraclePass) {
+                    failureReason = "rotation_region_oracle_mismatch:expected=$expected:actual=TL:$tlColor,TR:$trColor,BL:$blColor,BR:$brColor"
                 } else {
                     pixelPass = true
                 }
+            } else {
+                val glesBitmap = extractFrame(glesOutputPath, targetTimeUs)
+                if (glesBitmap == null) {
+                    failureReason = "pixel_extraction_failed_gles"
+                } else {
+                    val pRgb = computeMeanRgb(prodBitmap)
+                    val gRgb = computeMeanRgb(glesBitmap)
+
+                    prodMeanRgb = mapOf("r" to pRgb.r, "g" to pRgb.g, "b" to pRgb.b)
+                    glesMeanRgb = mapOf("r" to gRgb.r, "g" to gRgb.g, "b" to gRgb.b)
+
+                    val diff = (abs(pRgb.r - gRgb.r) + abs(pRgb.g - gRgb.g) + abs(pRgb.b - gRgb.b)) / 3.0
+                    meanAbsDiff = diff
+
+                    val prodAvg = (pRgb.r + pRgb.g + pRgb.b) / 3.0
+                    val glesAvg = (gRgb.r + gRgb.g + gRgb.b) / 3.0
+
+                    val prodNonBlank = prodAvg in 3.0..252.0
+                    val glesNonBlank = glesAvg in 3.0..252.0
+                    val diffAcceptable = diff <= 30.0
+
+                    if (!prodNonBlank) {
+                        failureReason = "pixel_production_blank_sentinel: avg=$prodAvg"
+                    } else if (!glesNonBlank) {
+                        failureReason = "pixel_gles_blank_sentinel: avg=$glesAvg"
+                    } else if (!diffAcceptable) {
+                        failureReason = "pixel_diff_exceeds_threshold: diff=$diff > 30.0"
+                    } else {
+                        pixelPass = true
+                    }
+                }
             }
 
-            val overallPass = prodPass && glesPass && pixelPass
+            val overallPass = if (oracleMode == "rotation_region") {
+                prodPass && pixelPass && rotationRegionOraclePass
+            } else {
+                prodPass && glesPass && pixelPass
+            }
+
             return finishResult(
                 pass = overallPass,
                 reason = if (overallPass) "pass" else (failureReason ?: "pixel_lane_failed"),
@@ -405,6 +502,12 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                 prodMeanRgb = prodMeanRgb,
                 glesMeanRgb = glesMeanRgb,
                 meanAbsDiff = meanAbsDiff,
+                oracleMode = oracleMode,
+                glesBaselineSkipped = glesBaselineSkipped,
+                rotationRegionOraclePass = rotationRegionOraclePass,
+                prodOutputWidth = prodOutputWidth,
+                prodOutputHeight = prodOutputHeight,
+                sampledRegions = sampledRegions,
             )
         } catch (t: Throwable) {
             val exReason = "exception: ${t.javaClass.simpleName}: ${t.message}"
@@ -434,6 +537,12 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                 prodMeanRgb = prodMeanRgb,
                 glesMeanRgb = glesMeanRgb,
                 meanAbsDiff = meanAbsDiff,
+                oracleMode = oracleMode,
+                glesBaselineSkipped = (oracleMode == "rotation_region"),
+                rotationRegionOraclePass = false,
+                prodOutputWidth = prodOutputWidth,
+                prodOutputHeight = prodOutputHeight,
+                sampledRegions = sampledRegions,
             )
         } finally {
             if (useSyntheticSource && generatedSourcePath != null) {
@@ -532,6 +641,13 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                 }
             }
 
+            val halfW = width / 2f
+            val halfH = height / 2f
+            val paintTL = Paint().apply { color = Color.rgb(220, 40, 40) }   // Red
+            val paintTR = Paint().apply { color = Color.rgb(40, 200, 40) }  // Green
+            val paintBL = Paint().apply { color = Color.rgb(40, 60, 220) }  // Blue
+            val paintBR = Paint().apply { color = Color.rgb(230, 220, 40) } // Yellow
+
             for (frameIdx in 0 until framesToDraw) {
                 val canvas = try {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
@@ -543,26 +659,17 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                     encoderSurface.lockCanvas(null)
                 }
 
-                val bandHeight = height / 3f
-                val paint1 = Paint().apply { color = Color.rgb(40, 90, 200) }
-                val paint2 = Paint().apply { color = Color.rgb(50, 180, 80) }
-                val paint3 = Paint().apply { color = Color.rgb(210, 80, 40) }
+                canvas.drawRect(0f, 0f, halfW, halfH, paintTL)
+                canvas.drawRect(halfW, 0f, width.toFloat(), halfH, paintTR)
+                canvas.drawRect(0f, halfH, halfW, height.toFloat(), paintBL)
+                canvas.drawRect(halfW, halfH, width.toFloat(), height.toFloat(), paintBR)
 
-                canvas.drawRect(0f, 0f, width.toFloat(), bandHeight, paint1)
-                canvas.drawRect(0f, bandHeight, width.toFloat(), bandHeight * 2f, paint2)
-                canvas.drawRect(0f, bandHeight * 2f, width.toFloat(), height.toFloat(), paint3)
-
-                val boxW = width / 4f
-                val boxH = height / 4f
+                val boxW = width / 6f
+                val boxH = height / 6f
                 val shiftX = if (framesToDraw > 1) (frameIdx.toFloat() / (framesToDraw - 1)) * (width - boxW) else 0f
                 val boxY = (height - boxH) / 2f
-                val boxPaint = Paint().apply { color = Color.rgb(240, 210, 40) }
+                val boxPaint = Paint().apply { color = Color.rgb(240, 240, 240) }
                 canvas.drawRect(shiftX, boxY, shiftX + boxW, boxY + boxH, boxPaint)
-
-                val barPaint = Paint().apply { color = Color.rgb(180, 50, 220) }
-                val barHeight = 16f
-                val barW = if (framesToDraw > 1) ((frameIdx + 1).toFloat() / framesToDraw) * width else width.toFloat()
-                canvas.drawRect(0f, height - barHeight, barW, height.toFloat(), barPaint)
 
                 encoderSurface.unlockCanvasAndPost(canvas)
                 drainOutput(endOfStream = false, timeoutMs = 100L)
@@ -636,6 +743,43 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         }
     }
 
+    private fun readVideoDimensions(videoPath: String): Pair<Int, Int>? {
+        val mmr = MediaMetadataRetriever()
+        try {
+            mmr.setDataSource(videoPath)
+            val wStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
+            val hStr = mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
+            val w = wStr?.toIntOrNull()
+            val h = hStr?.toIntOrNull()
+            if (w != null && w > 0 && h != null && h > 0) {
+                return w to h
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "readVideoDimensions: MediaMetadataRetriever failed for $videoPath: $t")
+        } finally {
+            try { mmr.release() } catch (_: Throwable) {}
+        }
+
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(videoPath)
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME)
+                if (mime != null && mime.startsWith("video/")) {
+                    val w = if (format.containsKey(MediaFormat.KEY_WIDTH)) format.getInteger(MediaFormat.KEY_WIDTH) else 0
+                    val h = if (format.containsKey(MediaFormat.KEY_HEIGHT)) format.getInteger(MediaFormat.KEY_HEIGHT) else 0
+                    if (w > 0 && h > 0) return w to h
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "readVideoDimensions: MediaExtractor failed for $videoPath: $t")
+        } finally {
+            try { extractor.release() } catch (_: Throwable) {}
+        }
+        return null
+    }
+
     private data class RgbTriple(val r: Double, val g: Double, val b: Double)
 
     private fun extractFrame(videoPath: String, timeUs: Long): Bitmap? {
@@ -667,12 +811,9 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             var x = 0
             while (x < w) {
                 val pixel = bitmap.getPixel(x, y)
-                val r = Color.red(pixel)
-                val g = Color.green(pixel)
-                val b = Color.blue(pixel)
-                totalR += r
-                totalG += g
-                totalB += b
+                totalR += Color.red(pixel)
+                totalG += Color.green(pixel)
+                totalB += Color.blue(pixel)
                 count++
                 x += stepX
             }
@@ -681,6 +822,68 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
 
         if (count == 0L) return RgbTriple(0.0, 0.0, 0.0)
         return RgbTriple(totalR / count, totalG / count, totalB / count)
+    }
+
+    private fun sampleRegionMeanRgb(
+        bitmap: Bitmap,
+        xStartFraction: Float,
+        xEndFraction: Float,
+        yStartFraction: Float,
+        yEndFraction: Float,
+    ): RgbTriple {
+        val w = bitmap.width
+        val h = bitmap.height
+        val startX = (w * xStartFraction).toInt().coerceIn(0, w - 1)
+        val endX = (w * xEndFraction).toInt().coerceIn(startX + 1, w)
+        val startY = (h * yStartFraction).toInt().coerceIn(0, h - 1)
+        val endY = (h * yEndFraction).toInt().coerceIn(startY + 1, h)
+
+        val stepX = max(1, (endX - startX) / 16)
+        val stepY = max(1, (endY - startY) / 16)
+
+        var totalR = 0.0
+        var totalG = 0.0
+        var totalB = 0.0
+        var count = 0L
+
+        var y = startY
+        while (y < endY) {
+            var x = startX
+            while (x < endX) {
+                val pixel = bitmap.getPixel(x, y)
+                totalR += Color.red(pixel)
+                totalG += Color.green(pixel)
+                totalB += Color.blue(pixel)
+                count++
+                x += stepX
+            }
+            y += stepY
+        }
+
+        if (count == 0L) return RgbTriple(0.0, 0.0, 0.0)
+        return RgbTriple(totalR / count, totalG / count, totalB / count)
+    }
+
+    private fun classifyColor(rgb: RgbTriple): String {
+        val r = rgb.r
+        val g = rgb.g
+        val b = rgb.b
+        return when {
+            r > 130.0 && g > 120.0 && b < 100.0 && (r + g) > (2.0 * b + 80.0) -> "YELLOW"
+            r > 130.0 && r > g + 40.0 && r > b + 40.0 -> "RED"
+            g > 120.0 && g > r + 30.0 && g > b + 30.0 -> "GREEN"
+            b > 130.0 && b > r + 30.0 && b > g + 30.0 -> "BLUE"
+            else -> "UNKNOWN(r=${r.toInt()},g=${g.toInt()},b=${b.toInt()})"
+        }
+    }
+
+    private fun expectedQuadrantColors(rotationDegrees: Int): Map<String, String> {
+        return when (rotationDegrees) {
+            90 -> mapOf("TL" to "BLUE", "TR" to "RED", "BL" to "YELLOW", "BR" to "GREEN")
+            270 -> mapOf("TL" to "GREEN", "TR" to "YELLOW", "BL" to "RED", "BR" to "BLUE")
+            180 -> mapOf("TL" to "YELLOW", "TR" to "BLUE", "BL" to "GREEN", "BR" to "RED")
+            else -> mapOf("TL" to "RED", "TR" to "GREEN", "BL" to "BLUE", "BR" to "YELLOW")
+        }
     }
 
     private fun finishResult(
@@ -708,11 +911,21 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         prodMeanRgb: Map<String, Double>,
         glesMeanRgb: Map<String, Double>,
         meanAbsDiff: Double,
+        oracleMode: String = "gles_pixel_parity",
+        glesBaselineSkipped: Boolean = false,
+        rotationRegionOraclePass: Boolean = false,
+        prodOutputWidth: Int = 0,
+        prodOutputHeight: Int = 0,
+        sampledRegions: Map<String, Any?> = emptyMap(),
     ): Map<String, Any?> {
+        val proofBoundary = when (oracleMode) {
+            "rotation_region" -> PROOF_BOUNDARY_ROTATION_REGION
+            else -> PROOF_BOUNDARY_GLES_PARITY
+        }
         val statusStr = if (pass) "PASS" else "FAIL"
         Log.i(
             TAG,
-            "ANDROID_VULKAN_EXPORT_PRODUCTION_WIRING_RESULT status=$statusStr;reason=$reason;sourceMode=$sourceMode;sourceRotationDegrees=$sourceRotationDegrees;sourceMetadataRotationDegrees=$sourceMetadataRotationDegrees;productionBytes=$prodSize;glesBytes=$glesSize;meanAbsDiff=$meanAbsDiff",
+            "ANDROID_VULKAN_EXPORT_PRODUCTION_WIRING_RESULT status=$statusStr;reason=$reason;oracleMode=$oracleMode;sourceMode=$sourceMode;sourceRotationDegrees=$sourceRotationDegrees;sourceMetadataRotationDegrees=$sourceMetadataRotationDegrees;productionOutputWidth=$prodOutputWidth;productionOutputHeight=$prodOutputHeight;productionBytes=$prodSize;glesBytes=$glesSize;meanAbsDiff=$meanAbsDiff;rotationRegionOraclePass=$rotationRegionOraclePass",
         )
 
         if (!pass) {
@@ -753,7 +966,13 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             "productionMeanRgb" to prodMeanRgb,
             "glesMeanRgb" to glesMeanRgb,
             "meanAbsDiff" to meanAbsDiff,
-            "proofBoundary" to PROOF_BOUNDARY,
+            "proofBoundary" to proofBoundary,
+            "oracleMode" to oracleMode,
+            "glesBaselineSkipped" to glesBaselineSkipped,
+            "rotationRegionOraclePass" to rotationRegionOraclePass,
+            "productionOutputWidth" to prodOutputWidth,
+            "productionOutputHeight" to prodOutputHeight,
+            "sampledRegions" to sampledRegions,
         )
     }
 
@@ -767,6 +986,9 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         sourceMetadataRotationDegrees: Int = 0,
         prodPath: String,
         glesPath: String,
+        oracleMode: String = "gles_pixel_parity",
+        outputWidth: Int = 0,
+        outputHeight: Int = 0,
     ): Map<String, Any?> {
         return finishResult(
             pass = false,
@@ -793,6 +1015,12 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             prodMeanRgb = mapOf("r" to 0.0, "g" to 0.0, "b" to 0.0),
             glesMeanRgb = mapOf("r" to 0.0, "g" to 0.0, "b" to 0.0),
             meanAbsDiff = -1.0,
+            oracleMode = oracleMode,
+            glesBaselineSkipped = (oracleMode == "rotation_region"),
+            rotationRegionOraclePass = false,
+            prodOutputWidth = outputWidth,
+            prodOutputHeight = outputHeight,
+            sampledRegions = emptyMap(),
         )
     }
 }

@@ -26,8 +26,9 @@ import kotlin.math.min
 // Preferred/default [AndroidTimelineVideoPassEncoder] implementation, used by
 // AndroidTimelineExportSession only when AndroidExportRenderBackendSelector
 // resolves the Vulkan backend for its narrow first-production safe scope:
-// video-only clips, no rotation, decoded dimensions exactly matching the
-// requested output geometry. AndroidTimelineExportSession falls back to
+// video-only clips, cardinal 0/90/180/270 rotation, decoded dimensions
+// exactly matching the requested output geometry (0/180) or the swapped
+// output geometry (90/270). AndroidTimelineExportSession falls back to
 // AndroidTimelineVideoEncoder (GLES) whenever this class fails before
 // pass-2/finalization and cancellation has not been requested -- this class
 // itself never falls back; it only reports a distinct machine-readable
@@ -48,8 +49,9 @@ import kotlin.math.min
 // [renderedFrames] / [writtenVideoSamples] counters respectively.
 //
 // Guardrails enforced upstream by AndroidExportRenderBackendSelector /
-// AndroidTimelineExportSession (not here): video-only clips, no rotation,
-// decoded dimensions matching the requested output. This class additionally
+// AndroidTimelineExportSession (not here): video-only clips, cardinal
+// 0/90/180/270 rotation, decoded dimensions matching the requested output
+// (0/180) or swapped output (90/270) geometry. This class additionally
 // verifies the *real* decoder HardwareBuffer/Image geometry before rendering
 // every frame (Opus P1 guard) because real decoder buffers can be
 // padded/cropped even when track metadata reports matching dimensions.
@@ -248,6 +250,25 @@ class AndroidTimelineVulkanVideoEncoder(
             if (trackIndex < 0 || trackFormat == null) return "clip_no_video_track:${clip.sourcePath}"
             extractor.selectTrack(trackIndex)
 
+            // Expected decoder-buffer source extent, derived from this clip's
+            // rotation and the encoder's fixed output geometry: 0/180 leaves
+            // width/height unchanged, 90/270 swaps them (the rotation is
+            // applied by the native render transform, not by decoder/vendor
+            // metadata -- see the KEY_ROTATION zeroing below). Fails closed
+            // for any non-cardinal rotation before an ImageReader is even
+            // created.
+            val (expectedSourceWidth, expectedSourceHeight) = when (clip.rotationDegrees) {
+                0, 180 -> width to height
+                90, 270 -> height to width
+                else -> return "vulkan_rotation_unsupported:${clip.rotationDegrees}"
+            }
+            if (clip.decodedWidth != expectedSourceWidth || clip.decodedHeight != expectedSourceHeight) {
+                return "vulkan_rotated_geometry_unsupported:" +
+                    "decodedW=${clip.decodedWidth}:decodedH=${clip.decodedHeight}:" +
+                    "expectedW=$expectedSourceWidth:expectedH=$expectedSourceHeight:" +
+                    "rotation=${clip.rotationDegrees}"
+            }
+
             val trimStartUs = (clip.trimStartSeconds * 1_000_000L).toLong()
             if (trimStartUs > 0L) {
                 extractor.seekTo(trimStartUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
@@ -258,8 +279,8 @@ class AndroidTimelineVulkanVideoEncoder(
             val handler = Handler(thread.looper)
 
             val reader = ImageReader.newInstance(
-                width,
-                height,
+                expectedSourceWidth,
+                expectedSourceHeight,
                 ImageFormat.PRIVATE,
                 IMAGE_READER_MAX_IMAGES,
                 HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
@@ -330,7 +351,12 @@ class AndroidTimelineVulkanVideoEncoder(
                             dec.releaseOutputBuffer(outIdx, true)
                             val image = imageQueue.poll(IMAGE_ACQUIRE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                                 ?: return "vulkan_image_acquire_timeout:${clip.sourcePath}"
-                            val frameFailure = renderImageIntoSession(image, clip.rotationDegrees)
+                            val frameFailure = renderImageIntoSession(
+                                image,
+                                clip.rotationDegrees,
+                                expectedSourceWidth,
+                                expectedSourceHeight,
+                            )
                             if (frameFailure != null) return frameFailure
                             renderedFramesInClip++
                         } else {
@@ -373,12 +399,19 @@ class AndroidTimelineVulkanVideoEncoder(
     /// [image]'s HardwareBuffer, then [image] itself, before returning on
     /// every path. Returns a machine-readable failure reason, or null.
     ///
-    /// [rotationDegrees] is the clip's rotation (already validated to 0 or
-    /// 180 by AndroidExportRenderBackendSelector's safe-scope gate for the
-    /// clip list as a whole, but re-checked here per frame since this method
-    /// fails closed independently of that upstream gate) -- passed into the
-    /// native crop-aware render seam so the Vulkan render transform, not
-    /// decoder/vendor metadata, applies the rotation.
+    /// [rotationDegrees] is the clip's rotation (already validated to a
+    /// cardinal 0/90/180/270 value by AndroidExportRenderBackendSelector's
+    /// safe-scope gate for the clip list as a whole and by
+    /// [decodeClipIntoSession]'s per-clip expected-extent check, but
+    /// re-checked here per frame since this method fails closed
+    /// independently of those upstream gates) -- passed into the native
+    /// crop-aware render seam so the Vulkan render transform, not
+    /// decoder/vendor metadata, applies the rotation. [expectedCropWidth]/
+    /// [expectedCropHeight] are the decoder *source* extent for this clip's
+    /// rotation ([decodeClipIntoSession]'s expectedSourceWidth/Height,
+    /// swapped from this encoder's own output width/height for 90/270) --
+    /// the real decoder crop is validated against this source extent, not
+    /// against the (possibly swapped) output width/height.
     ///
     /// Enforces the Opus P1 real-buffer geometry guard on every frame (not
     /// just a clip's first frame): real decoder HardwareBuffers can be
@@ -388,10 +421,17 @@ class AndroidTimelineVulkanVideoEncoder(
     /// valid, same-size, even-aligned slice of the (possibly padded) buffer
     /// is rendered via the native crop-aware seam; anything else fails
     /// closed without rendering partial output.
-    private fun renderImageIntoSession(image: Image, rotationDegrees: Int): String? {
+    private fun renderImageIntoSession(
+        image: Image,
+        rotationDegrees: Int,
+        expectedCropWidth: Int,
+        expectedCropHeight: Int,
+    ): String? {
         var hwBuf: HardwareBuffer? = null
         try {
-            if (rotationDegrees != 0 && rotationDegrees != 180) {
+            if (rotationDegrees != 0 && rotationDegrees != 90 &&
+                rotationDegrees != 180 && rotationDegrees != 270
+            ) {
                 return "vulkan_rotation_unsupported:$rotationDegrees"
             }
 
@@ -426,9 +466,10 @@ class AndroidTimelineVulkanVideoEncoder(
 
             val cropWidth = cropRect.right - cropRect.left
             val cropHeight = cropRect.bottom - cropRect.top
-            if (cropWidth != width || cropHeight != height) {
+            if (cropWidth != expectedCropWidth || cropHeight != expectedCropHeight) {
                 return "vulkan_decoder_crop_unsupported:size_mismatch:" +
-                    "bufW=$bufW:bufH=$bufH:crop=$cropRect:expectedW=$width:expectedH=$height"
+                    "bufW=$bufW:bufH=$bufH:crop=$cropRect:" +
+                    "expectedW=$expectedCropWidth:expectedH=$expectedCropHeight"
             }
 
             if (cropRect.left % 2 != 0 || cropRect.top % 2 != 0 ||

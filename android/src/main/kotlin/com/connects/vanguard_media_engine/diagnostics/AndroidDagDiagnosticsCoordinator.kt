@@ -1037,10 +1037,13 @@ class AndroidDagDiagnosticsCoordinator(
 
         val width = (args["width"] as? Number)?.toInt() ?: 1280
         val height = (args["height"] as? Number)?.toInt() ?: 720
+        val outputWidth = (args["outputWidth"] as? Number)?.toInt() ?: width
+        val outputHeight = (args["outputHeight"] as? Number)?.toInt() ?: height
         val fps = (args["fps"] as? Number)?.toInt() ?: 30
         val bitrateBps = (args["bitrateBps"] as? Number)?.toInt() ?: 4_000_000
         val trimEndSeconds = (args["trimEndSeconds"] as? Number)?.toDouble() ?: 1.0
         val sourceRotationDegrees = (args["sourceRotationDegrees"] as? Number)?.toInt() ?: 0
+        val oracleMode = (args["oracleMode"] as? String) ?: "gles_pixel_parity"
 
         Thread {
             try {
@@ -1051,10 +1054,13 @@ class AndroidDagDiagnosticsCoordinator(
                     useSyntheticSource = useSyntheticSource,
                     width = width,
                     height = height,
+                    outputWidth = outputWidth,
+                    outputHeight = outputHeight,
                     fps = fps,
                     bitrateBps = bitrateBps,
                     trimEndSeconds = trimEndSeconds,
                     sourceRotationDegrees = sourceRotationDegrees,
+                    oracleMode = oracleMode,
                 )
                 mainHandler.post { result.success(smokeResult) }
             } catch (t: Throwable) {

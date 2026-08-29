@@ -144,13 +144,14 @@ class VanguardNativeBridge(
     ): String
 
     // ── Vulkan-first export: padded/cropped decoder-buffer render seam ──────
-    // Renders [width]x[height] sourced from the crop rect
+    // Renders [width]x[height] output geometry sourced from the crop rect
     // ([cropLeft],[cropTop])-([cropRight],[cropBottom]) of [hardwareBuffer],
-    // which may be padded larger than [width]x[height]. Native cross-checks
-    // the crop against the AHardwareBuffer's own imported descriptor
-    // dimensions, not just the Kotlin-supplied width/height. [rotationDegrees]
-    // must be exactly 0 or 180 -- native fails closed before importing or
-    // rendering the buffer for any other value (90/270 stay GLES-only).
+    // which may be padded larger than the source extent implied by
+    // [rotationDegrees] (identity for 0/180, swapped for 90/270). Native
+    // cross-checks the crop against the AHardwareBuffer's own imported
+    // descriptor dimensions, not just the Kotlin-supplied width/height.
+    // [rotationDegrees] must be exactly 0, 90, 180, or 270 -- native fails
+    // closed before importing or rendering the buffer for any other value.
     external fun renderAndroidTimelineVulkanExportFrameCropped(
         sessionId: String,
         hardwareBuffer: HardwareBuffer,

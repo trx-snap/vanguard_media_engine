@@ -11,7 +11,7 @@
 // JNI entry points (matching VanguardNativeBridge.kt declarations):
 //   createAndroidTimelineVulkanExportSession         -> jstring
 //   renderAndroidTimelineVulkanExportFrame           -> jstring
-//   renderAndroidTimelineVulkanExportFrameCropped     -> jstring (crop + rotationDegrees, 0/180 only)
+//   renderAndroidTimelineVulkanExportFrameCropped     -> jstring (crop + rotationDegrees, 0/90/180/270)
 //   destroyAndroidTimelineVulkanExportSession        -> jstring
 
 #include <jni.h>
@@ -335,16 +335,20 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 // ---------------------------------------------------------------------------
 // JNI: renderAndroidTimelineVulkanExportFrameCropped
 // ---------------------------------------------------------------------------
-// Renders a [width]x[height] crop rect out of a decoder HardwareBuffer that
-// may be padded larger than the display crop (e.g. bufW=1920:bufH=1088 with
-// crop 0,0-1920,1080). Crop is normalized against the *imported* buffer's own
-// HardwareBufferDescriptor (the source of truth), not the Kotlin-supplied
-// width/height, which are cross-checked against the session's own attached
-// surface extent instead. Any mismatch fails closed without rendering.
-// [rotationDegrees] must be exactly 0 or 180 (this Vulkan export slice is
-// same-geometry 0/180 only; 90/270 stay on the GLES backend) -- an invalid
-// value fails closed with a distinct reason before the HardwareBuffer is
-// even imported.
+// Renders a [width]x[height] output crop out of a decoder HardwareBuffer that
+// may be padded larger than the source extent implied by [rotationDegrees].
+// [width]/[height] are always the encoder's fixed output geometry and are
+// cross-checked against the session's own attached surface extent. The crop
+// rect ([cropLeft],[cropTop])-([cropRight],[cropBottom]) is validated against
+// the *expected source* extent instead: identical to [width]x[height] for
+// 0/180 rotation, or swapped (height x width) for 90/270 rotation, since a
+// 90/270 rotation reads the decoder buffer with width/height transposed
+// relative to the rotated output. Crop bounds are also normalized against the
+// *imported* buffer's own HardwareBufferDescriptor (the source of truth for
+// the real, possibly padded, buffer geometry), not just the Kotlin-supplied
+// crop rect. Any mismatch fails closed without rendering. [rotationDegrees]
+// must be exactly 0, 90, 180, or 270 -- an invalid value fails closed with a
+// distinct reason before the HardwareBuffer is even imported.
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidTimelineVulkanExportFrameCropped(
     JNIEnv*  env,
@@ -371,7 +375,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         return env->NewStringUTF(status);
     }
 
-    if (rotationDegrees != 0 && rotationDegrees != 180) {
+    if (rotationDegrees != 0 && rotationDegrees != 90 &&
+        rotationDegrees != 180 && rotationDegrees != 270) {
         std::snprintf(status, sizeof(status),
             "status=FAIL;frameIndex=%d;reason=vulkan_rotation_unsupported:%d",
             static_cast<int>(frameIndex), static_cast<int>(rotationDegrees));
@@ -419,16 +424,28 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         return env->NewStringUTF(status);
     }
 
-    // Cross-check the Kotlin-supplied output/crop extent against the
-    // session's own attached surface extent before touching the buffer.
+    // Expected decoder-buffer *source* extent for this rotation: identical
+    // to the output extent for 0/180, swapped for 90/270 (a 90/270 rotation
+    // reads the source buffer with width/height transposed relative to the
+    // rotated output).
+    const jint expectedCropWidth =
+        (rotationDegrees == 90 || rotationDegrees == 270) ? height : width;
+    const jint expectedCropHeight =
+        (rotationDegrees == 90 || rotationDegrees == 270) ? width : height;
+
+    // Cross-check the Kotlin-supplied output extent against the session's
+    // own attached surface extent, and the crop extent against the expected
+    // source extent for this rotation, before touching the buffer.
     if (width != session->width || height != session->height ||
-        (cropRight - cropLeft) != width || (cropBottom - cropTop) != height) {
+        (cropRight - cropLeft) != expectedCropWidth ||
+        (cropBottom - cropTop) != expectedCropHeight) {
         std::snprintf(status, sizeof(status),
             "status=FAIL;frameIndex=%d;reason=vulkan_decoder_buffer_geometry_mismatch:"
             "invalid_crop:sessionW=%d:sessionH=%d:outW=%d:outH=%d:"
-            "crop=%d,%d-%d,%d",
+            "expectedCropW=%d:expectedCropH=%d:crop=%d,%d-%d,%d",
             static_cast<int>(frameIndex), session->width, session->height,
             static_cast<int>(width), static_cast<int>(height),
+            static_cast<int>(expectedCropWidth), static_cast<int>(expectedCropHeight),
             static_cast<int>(cropLeft), static_cast<int>(cropTop),
             static_cast<int>(cropRight), static_cast<int>(cropBottom));
         return env->NewStringUTF(status);
