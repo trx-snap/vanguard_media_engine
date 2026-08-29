@@ -369,6 +369,15 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     static_assert(sizeof(passParams.uvTransformPushConstants) == 32,
                   "uvTransformPushConstants size mismatch");
     std::memcpy(passParams.uvTransformPushConstants, &pc, 32);
+    // Aspect-fit destination rect: copy through as-is. A default (all-zero)
+    // rect leaves passParams.destination* at their own zero defaults, which
+    // VulkanGraphicsCommandRecorder treats as "full extent" (pre-existing
+    // behavior); a non-default rect is validated for non-emptiness and
+    // extent bounds by the recorder before it is used.
+    passParams.destinationX = transform.destinationRect.x;
+    passParams.destinationY = transform.destinationRect.y;
+    passParams.destinationWidth = static_cast<uint32_t>(transform.destinationRect.width);
+    passParams.destinationHeight = static_cast<uint32_t>(transform.destinationRect.height);
     if (currentLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
         passParams.transitionSourceImage = true;
         passParams.sourceOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;

@@ -144,14 +144,19 @@ class VanguardNativeBridge(
     ): String
 
     // ── Vulkan-first export: padded/cropped decoder-buffer render seam ──────
-    // Renders [width]x[height] output geometry sourced from the crop rect
+    // Renders an aspect-preserving-fit destination sub-rect
+    // ([destFitX],[destFitY])-([destFitX]+[destFitWidth],[destFitY]+[destFitHeight])
+    // of the [width]x[height] output geometry, sourced from the crop rect
     // ([cropLeft],[cropTop])-([cropRight],[cropBottom]) of [hardwareBuffer],
-    // which may be padded larger than the source extent implied by
-    // [rotationDegrees] (identity for 0/180, swapped for 90/270). Native
-    // cross-checks the crop against the AHardwareBuffer's own imported
-    // descriptor dimensions, not just the Kotlin-supplied width/height.
-    // [rotationDegrees] must be exactly 0, 90, 180, or 270 -- native fails
-    // closed before importing or rendering the buffer for any other value.
+    // which may be padded larger than the clip's real decoded source extent.
+    // Native cross-checks the crop against the AHardwareBuffer's own
+    // imported descriptor dimensions, not just the Kotlin-supplied crop
+    // rect, and validates the destination rect lies fully within
+    // [width]x[height]. [rotationDegrees] must be exactly 0, 90, 180, or 270
+    // -- native fails closed before importing or rendering the buffer for
+    // any other value. Callers that want the full output extent (no
+    // letterbox/pillarbox) pass destFitX=0, destFitY=0, destFitWidth=width,
+    // destFitHeight=height.
     external fun renderAndroidTimelineVulkanExportFrameCropped(
         sessionId: String,
         hardwareBuffer: HardwareBuffer,
@@ -162,6 +167,10 @@ class VanguardNativeBridge(
         cropRight: Int,
         cropBottom: Int,
         rotationDegrees: Int,
+        destFitX: Int,
+        destFitY: Int,
+        destFitWidth: Int,
+        destFitHeight: Int,
         timelinePtsUs: Long,
         frameIndex: Int,
     ): String

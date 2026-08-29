@@ -146,30 +146,28 @@ class AndroidExportRenderBackendSelector {
         return decision
     }
 
-    /// The narrow safe scope this slice implements for
+    /// The safe scope this slice implements for
     /// AndroidTimelineVulkanVideoEncoder: API 29+ (ImageReader hardware-buffer
-    /// path), at least one clip, every clip video-kind, with exact output
-    /// geometry for 0/180 rotation or exact swapped geometry for 90/270
-    /// rotation. A 90/270 rotation swaps display width/height, so those
-    /// clips must have decoded dimensions equal to the requested output's
-    /// swapped dimensions (decodedWidth == requestedHeight, decodedHeight ==
-    /// requestedWidth) rather than the output's own dimensions -- this is an
-    /// explicit per-rotation branch, applied uniformly including for square
-    /// clips, not an inferred geometry-only admission. Any other shape
-    /// (still images, unsupported/non-cardinal rotation, scaling/fit,
-    /// mismatched geometry, empty clip list, API < 29, or no scope at all)
-    /// is outside this first production scope and resolves to GLES.
+    /// path), at least one clip, every clip video-kind, positive requested
+    /// output dimensions, positive decoded clip dimensions, and cardinal
+    /// 0/90/180/270 rotation. AndroidTimelineVulkanVideoEncoder itself
+    /// computes an aspect-preserving-fit destination rect per clip (see its
+    /// own geometry computation) rather than requiring decoded dimensions to
+    /// exactly match the (possibly rotation-swapped) output geometry, so
+    /// this predicate no longer checks for that exact/swapped equality. Any
+    /// other shape (still images, unsupported/non-cardinal rotation,
+    /// non-positive output or decoded dimensions, empty clip list, API < 29,
+    /// or no scope at all) is outside this scope and resolves to GLES.
     private fun isSafeVulkanScope(scope: ExportRenderScope?): Boolean {
         if (scope == null) return false
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
         if (scope.clips.isEmpty()) return false
+        if (scope.requestedWidth <= 0 || scope.requestedHeight <= 0) return false
         return scope.clips.all { clip ->
             if (clip.mediaKind != "video") return@all false
+            if (clip.decodedWidth <= 0 || clip.decodedHeight <= 0) return@all false
             when (clip.rotationDegrees) {
-                0, 180 -> clip.decodedWidth == scope.requestedWidth &&
-                    clip.decodedHeight == scope.requestedHeight
-                90, 270 -> clip.decodedWidth == scope.requestedHeight &&
-                    clip.decodedHeight == scope.requestedWidth
+                0, 90, 180, 270 -> true
                 else -> false
             }
         }

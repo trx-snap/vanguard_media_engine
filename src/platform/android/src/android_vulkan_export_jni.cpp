@@ -11,7 +11,7 @@
 // JNI entry points (matching VanguardNativeBridge.kt declarations):
 //   createAndroidTimelineVulkanExportSession         -> jstring
 //   renderAndroidTimelineVulkanExportFrame           -> jstring
-//   renderAndroidTimelineVulkanExportFrameCropped     -> jstring (crop + rotationDegrees, 0/90/180/270)
+//   renderAndroidTimelineVulkanExportFrameCropped     -> jstring (crop + rotationDegrees, 0/90/180/270, dest fit rect)
 //   destroyAndroidTimelineVulkanExportSession        -> jstring
 
 #include <jni.h>
@@ -335,20 +335,24 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 // ---------------------------------------------------------------------------
 // JNI: renderAndroidTimelineVulkanExportFrameCropped
 // ---------------------------------------------------------------------------
-// Renders a [width]x[height] output crop out of a decoder HardwareBuffer that
-// may be padded larger than the source extent implied by [rotationDegrees].
+// Renders an aspect-preserving-fit destination sub-rect
+// ([destFitX],[destFitY])-([destFitX]+[destFitWidth],[destFitY]+[destFitHeight])
+// of the [width]x[height] output surface, sourced from the crop rect
+// ([cropLeft],[cropTop])-([cropRight],[cropBottom]) of [hardwareBuffer], which
+// may be padded larger than the clip's real decoded source extent.
 // [width]/[height] are always the encoder's fixed output geometry and are
 // cross-checked against the session's own attached surface extent. The crop
-// rect ([cropLeft],[cropTop])-([cropRight],[cropBottom]) is validated against
-// the *expected source* extent instead: identical to [width]x[height] for
-// 0/180 rotation, or swapped (height x width) for 90/270 rotation, since a
-// 90/270 rotation reads the decoder buffer with width/height transposed
-// relative to the rotated output. Crop bounds are also normalized against the
-// *imported* buffer's own HardwareBufferDescriptor (the source of truth for
-// the real, possibly padded, buffer geometry), not just the Kotlin-supplied
-// crop rect. Any mismatch fails closed without rendering. [rotationDegrees]
-// must be exactly 0, 90, 180, or 270 -- an invalid value fails closed with a
-// distinct reason before the HardwareBuffer is even imported.
+// rect is only validated against the *imported* buffer's own
+// HardwareBufferDescriptor (the source of truth for the real, possibly
+// padded, buffer geometry) -- there is no longer an output/rotation-derived
+// expected crop size, since a clip's decoded source extent may legitimately
+// differ from the output extent under aspect-preserving fit/scaling. The
+// destination rect is validated to be non-empty and to lie fully within the
+// [width]x[height] output surface; any invalid destination rect fails closed
+// with a machine-readable reason before the HardwareBuffer is even resolved.
+// [rotationDegrees] must be exactly 0, 90, 180, or 270 -- an invalid value
+// fails closed with a distinct reason before the HardwareBuffer is even
+// imported.
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidTimelineVulkanExportFrameCropped(
     JNIEnv*  env,
@@ -362,6 +366,10 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     jint     cropRight,
     jint     cropBottom,
     jint     rotationDegrees,
+    jint     destFitX,
+    jint     destFitY,
+    jint     destFitWidth,
+    jint     destFitHeight,
     jlong    timelinePtsUs,
     jint     frameIndex) {
 
@@ -380,6 +388,23 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         std::snprintf(status, sizeof(status),
             "status=FAIL;frameIndex=%d;reason=vulkan_rotation_unsupported:%d",
             static_cast<int>(frameIndex), static_cast<int>(rotationDegrees));
+        return env->NewStringUTF(status);
+    }
+
+    // Destination fit rect must be non-empty and lie fully within the
+    // session's [width]x[height] output surface. Validated before the
+    // session lookup / buffer import so an invalid destination never reaches
+    // render.
+    if (destFitWidth <= 0 || destFitHeight <= 0 || destFitX < 0 || destFitY < 0 ||
+        (static_cast<int64_t>(destFitX) + destFitWidth) > width ||
+        (static_cast<int64_t>(destFitY) + destFitHeight) > height) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=vulkan_dest_fit_rect_invalid:"
+            "destFit=%d,%d-%dx%d:outW=%d:outH=%d",
+            static_cast<int>(frameIndex),
+            static_cast<int>(destFitX), static_cast<int>(destFitY),
+            static_cast<int>(destFitWidth), static_cast<int>(destFitHeight),
+            static_cast<int>(width), static_cast<int>(height));
         return env->NewStringUTF(status);
     }
 
@@ -424,30 +449,18 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         return env->NewStringUTF(status);
     }
 
-    // Expected decoder-buffer *source* extent for this rotation: identical
-    // to the output extent for 0/180, swapped for 90/270 (a 90/270 rotation
-    // reads the source buffer with width/height transposed relative to the
-    // rotated output).
-    const jint expectedCropWidth =
-        (rotationDegrees == 90 || rotationDegrees == 270) ? height : width;
-    const jint expectedCropHeight =
-        (rotationDegrees == 90 || rotationDegrees == 270) ? width : height;
-
     // Cross-check the Kotlin-supplied output extent against the session's
-    // own attached surface extent, and the crop extent against the expected
-    // source extent for this rotation, before touching the buffer.
-    if (width != session->width || height != session->height ||
-        (cropRight - cropLeft) != expectedCropWidth ||
-        (cropBottom - cropTop) != expectedCropHeight) {
+    // own attached surface extent before touching the buffer. There is no
+    // longer an output/rotation-derived expected crop size here: the crop
+    // extent is validated below against the *imported* buffer's own
+    // descriptor instead, since a clip's real decoded source extent may
+    // legitimately differ from the output extent under aspect-fit scaling.
+    if (width != session->width || height != session->height) {
         std::snprintf(status, sizeof(status),
-            "status=FAIL;frameIndex=%d;reason=vulkan_decoder_buffer_geometry_mismatch:"
-            "invalid_crop:sessionW=%d:sessionH=%d:outW=%d:outH=%d:"
-            "expectedCropW=%d:expectedCropH=%d:crop=%d,%d-%d,%d",
+            "status=FAIL;frameIndex=%d;reason=vulkan_output_geometry_mismatch:"
+            "sessionW=%d:sessionH=%d:outW=%d:outH=%d",
             static_cast<int>(frameIndex), session->width, session->height,
-            static_cast<int>(width), static_cast<int>(height),
-            static_cast<int>(expectedCropWidth), static_cast<int>(expectedCropHeight),
-            static_cast<int>(cropLeft), static_cast<int>(cropTop),
-            static_cast<int>(cropRight), static_cast<int>(cropBottom));
+            static_cast<int>(width), static_cast<int>(height));
         return env->NewStringUTF(status);
     }
 
@@ -499,6 +512,10 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
             static_cast<float>(cropLeft) / static_cast<float>(descriptor.width);
         transform.cropBiasV =
             static_cast<float>(cropTop) / static_cast<float>(descriptor.height);
+        transform.destinationRect.x = static_cast<int32_t>(destFitX);
+        transform.destinationRect.y = static_cast<int32_t>(destFitY);
+        transform.destinationRect.width = static_cast<int32_t>(destFitWidth);
+        transform.destinationRect.height = static_cast<int32_t>(destFitHeight);
 
         renderResult = session->backend.renderFrame(handle, transform);
         renderOk =
@@ -548,13 +565,16 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 
     std::snprintf(status, sizeof(status),
         "status=OK;frameIndex=%d;timelinePtsUs=%lld;renderedFrames=%d;"
-        "renderResult=%s;releaseResult=%s;descW=%u;descH=%u",
+        "renderResult=%s;releaseResult=%s;descW=%u;descH=%u;"
+        "destFit=%d,%d-%dx%d",
         static_cast<int>(frameIndex),
         static_cast<long long>(timelinePtsUs),
         session->renderedFrames,
         RenderResultName(renderResult),
         HwBufResultName(releaseResult),
-        descriptor.width, descriptor.height);
+        descriptor.width, descriptor.height,
+        static_cast<int>(destFitX), static_cast<int>(destFitY),
+        static_cast<int>(destFitWidth), static_cast<int>(destFitHeight));
     return env->NewStringUTF(status);
 }
 

@@ -25,10 +25,14 @@ import kotlin.math.min
 //
 // Preferred/default [AndroidTimelineVideoPassEncoder] implementation, used by
 // AndroidTimelineExportSession only when AndroidExportRenderBackendSelector
-// resolves the Vulkan backend for its narrow first-production safe scope:
-// video-only clips, cardinal 0/90/180/270 rotation, decoded dimensions
-// exactly matching the requested output geometry (0/180) or the swapped
-// output geometry (90/270). AndroidTimelineExportSession falls back to
+// resolves the Vulkan backend for its production safe scope: video-only
+// clips, cardinal 0/90/180/270 rotation, positive requested output and
+// decoded clip dimensions. Decoded clip dimensions need not match the
+// requested output geometry: this class computes a per-clip
+// aspect-preserving-fit destination rect (see [computeAspectFitRect]) that
+// centers the clip's rotated display geometry within the fixed output
+// surface, letterboxed/pillarboxed over black where the aspect ratios
+// differ. AndroidTimelineExportSession falls back to
 // AndroidTimelineVideoEncoder (GLES) whenever this class fails before
 // pass-2/finalization and cancellation has not been requested -- this class
 // itself never falls back; it only reports a distinct machine-readable
@@ -50,11 +54,12 @@ import kotlin.math.min
 //
 // Guardrails enforced upstream by AndroidExportRenderBackendSelector /
 // AndroidTimelineExportSession (not here): video-only clips, cardinal
-// 0/90/180/270 rotation, decoded dimensions matching the requested output
-// (0/180) or swapped output (90/270) geometry. This class additionally
-// verifies the *real* decoder HardwareBuffer/Image geometry before rendering
-// every frame (Opus P1 guard) because real decoder buffers can be
-// padded/cropped even when track metadata reports matching dimensions.
+// 0/90/180/270 rotation, positive requested output and decoded clip
+// dimensions. This class computes a per-clip aspect-preserving-fit
+// destination rect (see [computeAspectFitRect]) and additionally verifies
+// the *real* decoder HardwareBuffer/Image geometry before rendering every
+// frame (Opus P1 guard) because real decoder buffers can be padded/cropped
+// even when track metadata reports matching dimensions.
 // When the crop is a valid, same-size, even-aligned slice of a padded
 // buffer (e.g. bufW=1920:bufH=1088 with crop 0,0-1920,1080), the frame is
 // still rendered via the native crop-aware render seam rather than
@@ -250,24 +255,42 @@ class AndroidTimelineVulkanVideoEncoder(
             if (trackIndex < 0 || trackFormat == null) return "clip_no_video_track:${clip.sourcePath}"
             extractor.selectTrack(trackIndex)
 
-            // Expected decoder-buffer source extent, derived from this clip's
-            // rotation and the encoder's fixed output geometry: 0/180 leaves
-            // width/height unchanged, 90/270 swaps them (the rotation is
+            // The decoder-buffer source extent is now the clip's own actual
+            // decoded dimensions -- no exact/swapped-exact match against the
+            // encoder's fixed output geometry is required. The rotation is
             // applied by the native render transform, not by decoder/vendor
-            // metadata -- see the KEY_ROTATION zeroing below). Fails closed
-            // for any non-cardinal rotation before an ImageReader is even
+            // metadata (see the KEY_ROTATION zeroing below); [rotationDegrees]
+            // must still be cardinal, and decoded dimensions must be
+            // positive, or this fails closed before an ImageReader is even
             // created.
-            val (expectedSourceWidth, expectedSourceHeight) = when (clip.rotationDegrees) {
-                0, 180 -> width to height
-                90, 270 -> height to width
-                else -> return "vulkan_rotation_unsupported:${clip.rotationDegrees}"
+            if (clip.decodedWidth <= 0 || clip.decodedHeight <= 0) {
+                return "vulkan_decoded_dims_invalid:" +
+                    "decodedW=${clip.decodedWidth}:decodedH=${clip.decodedHeight}"
             }
-            if (clip.decodedWidth != expectedSourceWidth || clip.decodedHeight != expectedSourceHeight) {
-                return "vulkan_rotated_geometry_unsupported:" +
-                    "decodedW=${clip.decodedWidth}:decodedH=${clip.decodedHeight}:" +
-                    "expectedW=$expectedSourceWidth:expectedH=$expectedSourceHeight:" +
-                    "rotation=${clip.rotationDegrees}"
+            if (clip.rotationDegrees != 0 && clip.rotationDegrees != 90 &&
+                clip.rotationDegrees != 180 && clip.rotationDegrees != 270
+            ) {
+                return "vulkan_rotation_unsupported:${clip.rotationDegrees}"
             }
+            val sourceWidth = clip.decodedWidth
+            val sourceHeight = clip.decodedHeight
+
+            // Per-clip aspect-preserving-fit destination rect within the
+            // fixed output surface; letterboxed/pillarboxed over black where
+            // this clip's rotated display aspect ratio differs from the
+            // output's. Fails closed if the computed rect would be invalid
+            // (should not happen given the positive-dimension checks above,
+            // but validated defensively since this is the destination rect
+            // that gates native rendering).
+            val destFitRect = computeAspectFitRect(
+                outputWidth = width,
+                outputHeight = height,
+                decodedWidth = clip.decodedWidth,
+                decodedHeight = clip.decodedHeight,
+                rotationDegrees = clip.rotationDegrees,
+            ) ?: return "vulkan_dest_fit_rect_invalid:" +
+                "decodedW=${clip.decodedWidth}:decodedH=${clip.decodedHeight}:" +
+                "rotation=${clip.rotationDegrees}:outW=$width:outH=$height"
 
             val trimStartUs = (clip.trimStartSeconds * 1_000_000L).toLong()
             if (trimStartUs > 0L) {
@@ -279,8 +302,8 @@ class AndroidTimelineVulkanVideoEncoder(
             val handler = Handler(thread.looper)
 
             val reader = ImageReader.newInstance(
-                expectedSourceWidth,
-                expectedSourceHeight,
+                sourceWidth,
+                sourceHeight,
                 ImageFormat.PRIVATE,
                 IMAGE_READER_MAX_IMAGES,
                 HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE,
@@ -354,8 +377,9 @@ class AndroidTimelineVulkanVideoEncoder(
                             val frameFailure = renderImageIntoSession(
                                 image,
                                 clip.rotationDegrees,
-                                expectedSourceWidth,
-                                expectedSourceHeight,
+                                sourceWidth,
+                                sourceHeight,
+                                destFitRect,
                             )
                             if (frameFailure != null) return frameFailure
                             renderedFramesInClip++
@@ -400,18 +424,19 @@ class AndroidTimelineVulkanVideoEncoder(
     /// every path. Returns a machine-readable failure reason, or null.
     ///
     /// [rotationDegrees] is the clip's rotation (already validated to a
-    /// cardinal 0/90/180/270 value by AndroidExportRenderBackendSelector's
-    /// safe-scope gate for the clip list as a whole and by
-    /// [decodeClipIntoSession]'s per-clip expected-extent check, but
-    /// re-checked here per frame since this method fails closed
+    /// cardinal 0/90/180/270 value by [decodeClipIntoSession]'s per-clip
+    /// check, but re-checked here per frame since this method fails closed
     /// independently of those upstream gates) -- passed into the native
     /// crop-aware render seam so the Vulkan render transform, not
     /// decoder/vendor metadata, applies the rotation. [expectedCropWidth]/
-    /// [expectedCropHeight] are the decoder *source* extent for this clip's
-    /// rotation ([decodeClipIntoSession]'s expectedSourceWidth/Height,
-    /// swapped from this encoder's own output width/height for 90/270) --
-    /// the real decoder crop is validated against this source extent, not
-    /// against the (possibly swapped) output width/height.
+    /// [expectedCropHeight] are this clip's actual decoded source extent
+    /// ([decodeClipIntoSession]'s sourceWidth/sourceHeight, i.e.
+    /// clip.decodedWidth/decodedHeight directly, unswapped) -- the real
+    /// decoder crop is validated against this source extent. [destFitRect]
+    /// is the per-clip aspect-preserving-fit destination sub-rect within the
+    /// fixed output surface, computed once by [decodeClipIntoSession] via
+    /// [computeAspectFitRect] and passed through unchanged for every frame
+    /// of this clip.
     ///
     /// Enforces the Opus P1 real-buffer geometry guard on every frame (not
     /// just a clip's first frame): real decoder HardwareBuffers can be
@@ -426,6 +451,7 @@ class AndroidTimelineVulkanVideoEncoder(
         rotationDegrees: Int,
         expectedCropWidth: Int,
         expectedCropHeight: Int,
+        destFitRect: DestFitRect,
     ): String? {
         var hwBuf: HardwareBuffer? = null
         try {
@@ -489,6 +515,10 @@ class AndroidTimelineVulkanVideoEncoder(
                 cropRight = cropRect.right,
                 cropBottom = cropRect.bottom,
                 rotationDegrees = rotationDegrees,
+                destFitX = destFitRect.x,
+                destFitY = destFitRect.y,
+                destFitWidth = destFitRect.width,
+                destFitHeight = destFitRect.height,
                 timelinePtsUs = timelinePtsUs,
                 frameIndex = renderedFrames,
             )
@@ -502,6 +532,80 @@ class AndroidTimelineVulkanVideoEncoder(
             try { hwBuf?.close() } catch (_: Throwable) {}
             try { image.close() } catch (_: Throwable) {}
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Aspect-preserving-fit destination rect geometry
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Destination sub-rect, in output pixel coordinates, that a clip's
+    /// rotated display geometry is scaled/centered into within the fixed
+    /// output surface. Always non-empty ([width]/[height] >= 1) and fully
+    /// within the output surface ([x]/[y] >= 0, x+width <= outputWidth,
+    /// y+height <= outputHeight) when returned by [computeAspectFitRect].
+    private data class DestFitRect(val x: Int, val y: Int, val width: Int, val height: Int)
+
+    /// Computes this clip's aspect-preserving-fit destination rect: the
+    /// clip's rotated display geometry (decoded width/height, swapped for
+    /// 90/270 since a 90/270 rotation transposes width/height in display
+    /// space) is scaled down uniformly (never up) to fit within
+    /// [outputWidth]x[outputHeight], then centered. Returns null only if the
+    /// inputs are non-positive/non-cardinal or the resulting rect would
+    /// somehow fail its own bounds -- callers treat null as a hard failure.
+    ///
+    /// fitWidth/fitHeight are coerced to [1, output] and then nudged to the
+    /// nearest even value where possible (never exceeding output, never
+    /// below 1) to avoid one-pixel parity drift downstream; the destination
+    /// origin is recomputed from the (possibly nudged) fit size so the rect
+    /// stays centered. When the clip's rotated display size already exactly
+    /// matches the output size (no scaling needed) and the output
+    /// dimensions are themselves even, this naturally produces the full
+    /// output rect (x=0, y=0, width=outputWidth, height=outputHeight).
+    private fun computeAspectFitRect(
+        outputWidth: Int,
+        outputHeight: Int,
+        decodedWidth: Int,
+        decodedHeight: Int,
+        rotationDegrees: Int,
+    ): DestFitRect? {
+        if (outputWidth <= 0 || outputHeight <= 0 || decodedWidth <= 0 || decodedHeight <= 0) {
+            return null
+        }
+        val (displayWidth, displayHeight) = when (rotationDegrees) {
+            0, 180 -> decodedWidth to decodedHeight
+            90, 270 -> decodedHeight to decodedWidth
+            else -> return null
+        }
+
+        val scale = min(
+            outputWidth.toDouble() / displayWidth.toDouble(),
+            outputHeight.toDouble() / displayHeight.toDouble(),
+        )
+        var fitWidth = Math.round(displayWidth * scale).toInt().coerceIn(1, outputWidth)
+        var fitHeight = Math.round(displayHeight * scale).toInt().coerceIn(1, outputHeight)
+        fitWidth = forceEvenWherePossible(fitWidth, outputWidth)
+        fitHeight = forceEvenWherePossible(fitHeight, outputHeight)
+
+        val fitX = (outputWidth - fitWidth) / 2
+        val fitY = (outputHeight - fitHeight) / 2
+        if (fitX < 0 || fitY < 0 || fitX + fitWidth > outputWidth || fitY + fitHeight > outputHeight) {
+            return null
+        }
+        return DestFitRect(fitX, fitY, fitWidth, fitHeight)
+    }
+
+    /// Nudges [value] to the nearest even number without exceeding [maxValue]
+    /// or dropping below 1. Prefers decrementing (always safe once value >=
+    /// 2); falls back to incrementing only when decrementing would reach 0
+    /// (i.e. value == 1); leaves [value] as its original odd value in the
+    /// rare case where neither adjustment is possible without violating
+    /// [1, maxValue] (e.g. value == maxValue == 1).
+    private fun forceEvenWherePossible(value: Int, maxValue: Int): Int {
+        if (value % 2 == 0) return value
+        val decremented = value - 1
+        if (decremented >= 1) return decremented
+        val incremented = value + 1
+        return if (incremented <= maxValue) incremented else value
     }
 
     // ─────────────────────────────────────────────────────────────────────────

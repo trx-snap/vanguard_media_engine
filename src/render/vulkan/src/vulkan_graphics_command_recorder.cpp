@@ -66,6 +66,34 @@ static bool validateGraphicsPassParams(const VulkanGraphicsPassParams& params) {
             return false;
         }
     }
+    // A non-default destination rect (any field non-zero) must be a fully
+    // valid, non-empty sub-rect of the render pass's full extent.
+    const bool hasDestinationRect =
+        params.destinationX != 0 || params.destinationY != 0 ||
+        params.destinationWidth != 0 || params.destinationHeight != 0;
+    if (hasDestinationRect) {
+        if (params.destinationWidth == 0 || params.destinationHeight == 0) {
+            VGLOG_CR("Validation failed: destination rect has zero width/height (%u x %u)",
+                     params.destinationWidth, params.destinationHeight);
+            return false;
+        }
+        if (params.destinationX < 0 || params.destinationY < 0) {
+            VGLOG_CR("Validation failed: destination rect has negative origin (%d, %d)",
+                     params.destinationX, params.destinationY);
+            return false;
+        }
+        const uint64_t right =
+            static_cast<uint64_t>(params.destinationX) + static_cast<uint64_t>(params.destinationWidth);
+        const uint64_t bottom =
+            static_cast<uint64_t>(params.destinationY) + static_cast<uint64_t>(params.destinationHeight);
+        if (right > params.extentWidth || bottom > params.extentHeight) {
+            VGLOG_CR("Validation failed: destination rect (%d, %d, %u x %u) exceeds extent (%u x %u)",
+                     params.destinationX, params.destinationY,
+                     params.destinationWidth, params.destinationHeight,
+                     params.extentWidth, params.extentHeight);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -105,18 +133,32 @@ bool VulkanGraphicsCommandRecorder::recordGraphicsPass(const VulkanGraphicsPassP
 
     vkCmdBeginRenderPass(params.commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
 
+    // Aspect-fit destination sub-rect: renderArea/clear above always cover
+    // the full extent (so letterbox/pillarbox regions are cleared to
+    // clearColor), while the viewport/scissor below are scoped to the
+    // destination rect when one was supplied, so the source image is only
+    // drawn into that sub-rect. Validated by validateGraphicsPassParams
+    // above to be non-empty and within extent whenever any field is non-zero.
+    const bool hasDestinationRect =
+        params.destinationX != 0 || params.destinationY != 0 ||
+        params.destinationWidth != 0 || params.destinationHeight != 0;
+    const int32_t destX = hasDestinationRect ? params.destinationX : 0;
+    const int32_t destY = hasDestinationRect ? params.destinationY : 0;
+    const uint32_t destWidth = hasDestinationRect ? params.destinationWidth : params.extentWidth;
+    const uint32_t destHeight = hasDestinationRect ? params.destinationHeight : params.extentHeight;
+
     VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(params.extentWidth);
-    viewport.height = static_cast<float>(params.extentHeight);
+    viewport.x = static_cast<float>(destX);
+    viewport.y = static_cast<float>(destY);
+    viewport.width = static_cast<float>(destWidth);
+    viewport.height = static_cast<float>(destHeight);
     viewport.minDepth = 0.0f;
     viewport.maxDepth = 1.0f;
     vkCmdSetViewport(params.commandBuffer, 0, 1, &viewport);
 
     VkRect2D scissor{};
-    scissor.offset = {0, 0};
-    scissor.extent = {params.extentWidth, params.extentHeight};
+    scissor.offset = {destX, destY};
+    scissor.extent = {destWidth, destHeight};
     vkCmdSetScissor(params.commandBuffer, 0, 1, &scissor);
 
     vkCmdBindPipeline(params.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, params.pipeline);

@@ -17,6 +17,27 @@ namespace vanguard {
 namespace render {
 
 // ---------------------------------------------------------------------------
+// RenderDestinationRect
+// ---------------------------------------------------------------------------
+// Aspect-preserving-fit destination sub-rect within a backend's fixed output
+// surface extent, in output pixel coordinates. All-zero (x=0, y=0, width=0,
+// height=0 -- the default) means "no destination rect": the backend renders
+// to its full output extent, matching pre-existing behavior. A non-default
+// rect must have width > 0 and height > 0 and lie fully within the output
+// extent; validating that is the caller/backend's responsibility, not this
+// header's.
+struct RenderDestinationRect {
+    int32_t x = 0;
+    int32_t y = 0;
+    int32_t width = 0;
+    int32_t height = 0;
+
+    bool isDefault() const {
+        return x == 0 && y == 0 && width == 0 && height == 0;
+    }
+};
+
+// ---------------------------------------------------------------------------
 // VideoFrameTransform
 // ---------------------------------------------------------------------------
 
@@ -34,6 +55,11 @@ struct VideoFrameTransform {
     float cropScaleV = 1.0f;
     float cropBiasU = 0.0f;
     float cropBiasV = 0.0f;
+
+    // Aspect-preserving-fit destination sub-rect within the backend's fixed
+    // output extent. Default (RenderDestinationRect{}) means the full output
+    // extent, matching pre-existing behavior.
+    RenderDestinationRect destinationRect{};
 };
 
 // ---------------------------------------------------------------------------

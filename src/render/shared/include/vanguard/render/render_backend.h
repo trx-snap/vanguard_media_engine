@@ -114,13 +114,21 @@ public:
     // Phase 4B2C: renderFrame with spatial rotation transform.
     //
     // Identity path: default implementation calls renderFrame(handle) so existing
-    // callers compile and behave identically without modification.
+    // callers compile and behave identically without modification, as long as
+    // transform carries no non-default destination rect (aspect-fit scaling).
+    // A non-default destination rect requires backend support for scissor/
+    // viewport-scoped rendering; a backend that has not overridden this method
+    // cannot honor it, so this default fails closed with kUnavailable instead
+    // of silently rendering to the full output extent.
     //
-    // Backends that support push constants override this to apply the UV transform.
+    // Backends that support push constants and destination-rect scaling
+    // override this to apply the UV transform and scoped viewport/scissor.
     // ---------------------------------------------------------------------------
     virtual RenderFrameResult renderFrame(HardwareBufferHandle handle,
                                           const VideoFrameTransform& transform) {
-        (void)transform;
+        if (!transform.destinationRect.isDefault()) {
+            return RenderFrameResult::kUnavailable;
+        }
         return renderFrame(handle);
     }
 };

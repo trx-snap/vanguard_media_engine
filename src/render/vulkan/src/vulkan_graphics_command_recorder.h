@@ -55,6 +55,16 @@ struct VulkanGraphicsPassParams {
         1.0f, 0.0f, 0.0f, 0.0f,  // row0 (u = x)
         0.0f, 1.0f, 0.0f, 0.0f,  // row1 (v = y)
     };
+    // Aspect-fit destination sub-rect (viewport/scissor) within the render
+    // pass's full extent, in output pixel coordinates. All-zero (the
+    // default) means "no destination rect": viewport/scissor cover the full
+    // extentWidth x extentHeight, matching pre-existing behavior. The render
+    // pass's own renderArea/clear always covers the full extent regardless
+    // of this rect, so unfit regions are cleared to clearColor (black).
+    int32_t destinationX = 0;
+    int32_t destinationY = 0;
+    uint32_t destinationWidth = 0;
+    uint32_t destinationHeight = 0;
 #else
     void* commandBuffer = nullptr;
     void* renderPass = nullptr;
@@ -80,6 +90,12 @@ struct VulkanGraphicsPassParams {
         1.0f, 0.0f, 0.0f, 0.0f,
         0.0f, 1.0f, 0.0f, 0.0f,
     };
+    // Aspect-fit destination sub-rect (host-build mirror of the Android
+    // fields above; unused by the host stub implementation).
+    int32_t destinationX = 0;
+    int32_t destinationY = 0;
+    uint32_t destinationWidth = 0;
+    uint32_t destinationHeight = 0;
 #endif
 };
 
