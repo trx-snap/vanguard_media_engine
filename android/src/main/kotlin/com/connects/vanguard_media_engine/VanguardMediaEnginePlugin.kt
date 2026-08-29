@@ -23,6 +23,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoo
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
 import com.connects.vanguard_media_engine.export.AndroidStillImageDecoder
+import com.connects.vanguard_media_engine.export.AndroidStillImageExportCoordinator
 import com.connects.vanguard_media_engine.image.AndroidImageOptimizer
 import com.connects.vanguard_media_engine.photo_library.AndroidPhotoLibrarySaveCoordinator
 import com.connects.vanguard_media_engine.photo_library.AndroidVideoAssetPickerCoordinator
@@ -78,6 +79,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // cancelActiveExport() first, then falls back to the legacy activeEncoder
     // cancel path below.
     private var editorExportCoordinator: AndroidEditorExportCoordinator? = null
+
+    // ── Phase 5-Unit AD / Phase 10-C-3L: still-image export session bridge ───
+    // Owns "exportImage" -- Android parity with the exportImage case in
+    // VanguardMediaEnginePlugin.swift (colorMatrix filters + "preserve"
+    // orientation policy only; see AndroidStillImageExportCoordinator).
+    private var stillImageExportCoordinator: AndroidStillImageExportCoordinator? = null
 
     // ── Phase 5-Unit Q / Phase 7.20: reverse sidecar coordinator ──────────────
     // Owns "prepareReverseSidecars", "getSidecarStatus", "cleanupReverseSidecars".
@@ -193,6 +200,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             textureRegistry = binding.textureRegistry,
             channel         = channel,
             mainHandler     = mainHandler,
+        )
+        stillImageExportCoordinator = AndroidStillImageExportCoordinator(
+            context     = binding.applicationContext,
+            mainHandler = mainHandler,
         )
         reverseSidecarCoordinator = AndroidReverseSidecarCoordinator(
             context     = binding.applicationContext,
@@ -372,6 +383,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android audio recording coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidStillImageExportCoordinator.ownsMethod(call.method)) {
+            val coord = stillImageExportCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android still-image export coordinator unavailable", null)
             }
             return
         }
@@ -1583,6 +1604,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // Tear down Phase 4-Unit H / Phase 5-Unit AC audio recording coordinator.
         audioRecordingCoordinator?.disposeAll()
         audioRecordingCoordinator = null
+        // Tear down Phase 5-Unit AD / Phase 10-C-3L still-image export coordinator.
+        stillImageExportCoordinator?.disposeAll()
+        stillImageExportCoordinator = null
     }
 
     // ── ActivityAware (Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B) ─
