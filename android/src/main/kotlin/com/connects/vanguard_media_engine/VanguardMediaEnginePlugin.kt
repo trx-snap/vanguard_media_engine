@@ -24,11 +24,14 @@ import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
 import com.connects.vanguard_media_engine.export.AndroidStillImageDecoder
 import com.connects.vanguard_media_engine.image.AndroidImageOptimizer
 import com.connects.vanguard_media_engine.photo_library.AndroidPhotoLibrarySaveCoordinator
+import com.connects.vanguard_media_engine.photo_library.AndroidVideoAssetPickerCoordinator
 import com.connects.vanguard_media_engine.rtc.AndroidRtcVideoCoordinator
 import com.connects.vanguard_media_engine.sidecar.AndroidReverseSidecarCoordinator
 import com.connects.vanguard_media_engine.streaming.AndroidDagStreamingPlaybackCoordinator
 import com.connects.vanguard_media_engine.thermal.AndroidThermalStateBridge
 import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.embedding.engine.plugins.activity.ActivityAware
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
@@ -36,7 +39,7 @@ import io.flutter.plugin.common.MethodChannel.Result
 import io.flutter.view.TextureRegistry
 import java.util.concurrent.atomic.AtomicBoolean
 
-class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
+class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     private lateinit var channel: MethodChannel
     private lateinit var context: Context
     private lateinit var binding: FlutterPlugin.FlutterPluginBinding
@@ -99,6 +102,15 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
     // Owns "saveVideoToPhotoLibrary" -- Android parity with
     // VGPhotoLibrarySaveHandler.swift (iOS).
     private var photoLibrarySaveCoordinator: AndroidPhotoLibrarySaveCoordinator? = null
+
+    // ── Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B: video asset picker ──
+    // Owns the eight "checkPhotoLibraryPermission" / "fetchPhotoVideos" / ...
+    // routes -- Android parity with VGVideoAssetPickerHandler.swift (iOS).
+    // Also an ActivityAware-driven PluginRegistry.RequestPermissionsResultListener.
+    private var videoAssetPickerCoordinator: AndroidVideoAssetPickerCoordinator? = null
+
+    // ── ActivityAware binding (needed by videoAssetPickerCoordinator only) ────
+    private var activityBinding: ActivityPluginBinding? = null
 
     // ── Camera session state (B2: single camera instance invariant) ───────────
     // Mirrors iOS plugin: cameraSource + renderer stored at plugin level.
@@ -191,6 +203,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             mainHandler = mainHandler,
         )
         photoLibrarySaveCoordinator = AndroidPhotoLibrarySaveCoordinator(
+            context     = binding.applicationContext,
+            mainHandler = mainHandler,
+        )
+        videoAssetPickerCoordinator = AndroidVideoAssetPickerCoordinator(
             context     = binding.applicationContext,
             mainHandler = mainHandler,
         )
@@ -325,6 +341,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android photo library save coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidVideoAssetPickerCoordinator.ownsMethod(call.method)) {
+            val coord = videoAssetPickerCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android video asset picker coordinator unavailable", null)
             }
             return
         }
@@ -1523,5 +1549,52 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         // Tear down Phase 5-Unit Z / UMF V2 Slice 2A photo library save coordinator.
         photoLibrarySaveCoordinator?.disposeAll()
         photoLibrarySaveCoordinator = null
+        // Tear down Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B video
+        // asset picker coordinator -- settles any pending permission reply. Unregister
+        // the permission listener first so no Activity binding is retained past
+        // engine teardown.
+        videoAssetPickerCoordinator?.let { coord ->
+            activityBinding?.removeRequestPermissionsResultListener(coord)
+        }
+        activityBinding = null
+        videoAssetPickerCoordinator?.disposeAll()
+        videoAssetPickerCoordinator = null
+    }
+
+    // ── ActivityAware (Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B) ─
+    // Only videoAssetPickerCoordinator needs an Activity reference (requestPermissions /
+    // shouldShowRequestPermissionRationale / startActivity for settings + the
+    // limited-library re-picker). All other coordinators are Activity-agnostic.
+
+    override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+        val coord = videoAssetPickerCoordinator ?: return
+        activityBinding = binding
+        binding.addRequestPermissionsResultListener(coord)
+        coord.onActivityAttached(binding.activity)
+    }
+
+    override fun onDetachedFromActivityForConfigChanges() {
+        val coord = videoAssetPickerCoordinator
+        if (coord != null) {
+            activityBinding?.removeRequestPermissionsResultListener(coord)
+            coord.onActivityDetachedForConfigChanges()
+        }
+        activityBinding = null
+    }
+
+    override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+        activityBinding = binding
+        val coord = videoAssetPickerCoordinator ?: return
+        binding.addRequestPermissionsResultListener(coord)
+        coord.onActivityReattached(binding.activity)
+    }
+
+    override fun onDetachedFromActivity() {
+        val coord = videoAssetPickerCoordinator
+        if (coord != null) {
+            activityBinding?.removeRequestPermissionsResultListener(coord)
+            coord.onActivityDetachedFinal()
+        }
+        activityBinding = null
     }
 }
