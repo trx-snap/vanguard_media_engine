@@ -25,6 +25,15 @@ struct VideoFrameTransform {
     // Valid values: 0, 90, 180, 270. All other values are treated as 0.
     uint32_t rotationDegrees = 0;
     bool mirrorHorizontal = false;
+
+    // Normalized decoder-buffer crop, applied after the rotation/mirror
+    // mapping below. Identity defaults (1,1,0,0) leave rotation/mirror-only
+    // callers unaffected. Caller is responsible for clamping these to a
+    // valid [0,1] crop rect; this header performs no validation.
+    float cropScaleU = 1.0f;
+    float cropScaleV = 1.0f;
+    float cropBiasU = 0.0f;
+    float cropBiasV = 0.0f;
 };
 
 // ---------------------------------------------------------------------------
@@ -158,6 +167,18 @@ inline VideoTransformPushConstants makeVideoTransformPushConstants(
                 break;
         }
     }
+
+    // Compose crop after the rotation/mirror mapping above: final row
+    // coefficients are the crop scale multiplied into the existing row
+    // coefficients, final bias is cropBias + cropScale * existingBias.
+    pc.uvTransform0[0] *= transform.cropScaleU;
+    pc.uvTransform0[1] *= transform.cropScaleU;
+    pc.uvTransform0[3] = transform.cropBiasU + transform.cropScaleU * pc.uvTransform0[3];
+
+    pc.uvTransform1[0] *= transform.cropScaleV;
+    pc.uvTransform1[1] *= transform.cropScaleV;
+    pc.uvTransform1[3] = transform.cropBiasV + transform.cropScaleV * pc.uvTransform1[3];
+
     return pc;
 }
 

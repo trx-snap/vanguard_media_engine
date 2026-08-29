@@ -143,6 +143,25 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
+    // ── Vulkan-first export: padded/cropped decoder-buffer render seam ──────
+    // Renders [width]x[height] sourced from the crop rect
+    // ([cropLeft],[cropTop])-([cropRight],[cropBottom]) of [hardwareBuffer],
+    // which may be padded larger than [width]x[height]. Native cross-checks
+    // the crop against the AHardwareBuffer's own imported descriptor
+    // dimensions, not just the Kotlin-supplied width/height.
+    external fun renderAndroidTimelineVulkanExportFrameCropped(
+        sessionId: String,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        cropLeft: Int,
+        cropTop: Int,
+        cropRight: Int,
+        cropBottom: Int,
+        timelinePtsUs: Long,
+        frameIndex: Int,
+    ): String
+
     // ── Phase 1-Unit U: Android GLES backend offscreen EGL lifecycle smoke ──
     external fun runAndroidDagPhase1UGlesBackendSmoke(): String
 

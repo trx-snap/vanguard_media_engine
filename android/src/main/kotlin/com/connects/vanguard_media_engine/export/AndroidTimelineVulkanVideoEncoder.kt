@@ -1,7 +1,6 @@
 package com.connects.vanguard_media_engine.export
 
 import android.graphics.ImageFormat
-import android.graphics.Rect
 import android.hardware.HardwareBuffer
 import android.media.Image
 import android.media.ImageReader
@@ -52,10 +51,13 @@ import kotlin.math.min
 // AndroidTimelineExportSession (not here): video-only clips, no rotation,
 // decoded dimensions matching the requested output. This class additionally
 // verifies the *real* decoder HardwareBuffer/Image geometry before rendering
-// each clip's first in-window frame (Opus P1 guard) because real decoder
-// buffers can be padded/cropped even when track metadata reports matching
-// dimensions -- and because a fresh MediaCodec decoder is created per clip,
-// this guard runs once per clip, not just once for the whole encode.
+// every frame (Opus P1 guard) because real decoder buffers can be
+// padded/cropped even when track metadata reports matching dimensions.
+// When the crop is a valid, same-size, even-aligned slice of a padded
+// buffer (e.g. bufW=1920:bufH=1088 with crop 0,0-1920,1080), the frame is
+// still rendered via the native crop-aware render seam rather than
+// rejected outright; only a genuinely invalid/unsupported crop or buffer
+// geometry fails the frame.
 class AndroidTimelineVulkanVideoEncoder(
     private val outputPath: String,
     private val width: Int,
@@ -220,11 +222,11 @@ class AndroidTimelineVulkanVideoEncoder(
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Returns null on success, or a machine-readable failure reason string
-    /// for any non-cancel decode/render failure. Every clip's first in-window
-    /// rendered frame is checked against the Opus P1 real-buffer geometry
-    /// guard (see [renderImageIntoSession]) -- a per-clip decoder can produce
-    /// a differently padded/cropped HardwareBuffer than an earlier clip's
-    /// decoder even when both clips report matching track-metadata geometry.
+    /// for any non-cancel decode/render failure. Every rendered frame is
+    /// checked against the Opus P1 real-buffer geometry guard (see
+    /// [renderImageIntoSession]) -- a decoder can produce a differently
+    /// padded/cropped HardwareBuffer from frame to frame even within one
+    /// clip.
     private fun decodeClipIntoSession(clip: AndroidTimelineVideoEncoder.ClipInput): String? {
         val extractor = MediaExtractor()
         var decoder: MediaCodec? = null
@@ -322,10 +324,7 @@ class AndroidTimelineVulkanVideoEncoder(
                             dec.releaseOutputBuffer(outIdx, true)
                             val image = imageQueue.poll(IMAGE_ACQUIRE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                                 ?: return "vulkan_image_acquire_timeout:${clip.sourcePath}"
-                            val frameFailure = renderImageIntoSession(
-                                image,
-                                isFirstFrameInClip = renderedFramesInClip == 0,
-                            )
+                            val frameFailure = renderImageIntoSession(image)
                             if (frameFailure != null) return frameFailure
                             renderedFramesInClip++
                         } else {
@@ -368,18 +367,19 @@ class AndroidTimelineVulkanVideoEncoder(
     /// [image]'s HardwareBuffer, then [image] itself, before returning on
     /// every path. Returns a machine-readable failure reason, or null.
     ///
-    /// When [isFirstFrameInClip] is true, enforces the Opus P1 real-buffer
-    /// geometry guard before rendering: real decoder HardwareBuffers can be
-    /// padded/cropped even when track metadata (and this encoder's own
-    /// width/height) reports matching dimensions, and a fresh MediaCodec
-    /// decoder instance is created per clip -- so this guard runs once per
-    /// clip, on that clip's own first in-window frame, before any of its
-    /// frames are handed to the native session.
-    private fun renderImageIntoSession(image: Image, isFirstFrameInClip: Boolean): String? {
+    /// Enforces the Opus P1 real-buffer geometry guard on every frame (not
+    /// just a clip's first frame): real decoder HardwareBuffers can be
+    /// padded larger than the display crop even when track metadata (and
+    /// this encoder's own width/height) reports matching dimensions, and
+    /// that padding can in principle vary frame to frame. A crop that is a
+    /// valid, same-size, even-aligned slice of the (possibly padded) buffer
+    /// is rendered via the native crop-aware seam; anything else fails
+    /// closed without rendering partial output.
+    private fun renderImageIntoSession(image: Image): String? {
         var hwBuf: HardwareBuffer? = null
         try {
             hwBuf = image.hardwareBuffer
-                ?: return "vulkan_hardware_buffer_null"
+                ?: return "vulkan_decoder_buffer_geometry_mismatch:hardware_buffer_null"
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 val fence = image.fence
@@ -394,20 +394,42 @@ class AndroidTimelineVulkanVideoEncoder(
                 }
             }
 
-            if (isFirstFrameInClip) {
-                val expectedRect = Rect(0, 0, width, height)
-                if (hwBuf.width != width || hwBuf.height != height || image.cropRect != expectedRect) {
-                    return "vulkan_decoder_buffer_geometry_mismatch:" +
-                        "bufW=${hwBuf.width}:bufH=${hwBuf.height}:crop=${image.cropRect}"
-                }
+            // Read the crop rect before the image (and its buffer) is closed.
+            val cropRect = image.cropRect
+            val bufW = hwBuf.width
+            val bufH = hwBuf.height
+
+            if (cropRect.left < 0 || cropRect.top < 0 ||
+                cropRect.right <= cropRect.left || cropRect.bottom <= cropRect.top ||
+                cropRect.right > bufW || cropRect.bottom > bufH
+            ) {
+                return "vulkan_decoder_buffer_geometry_mismatch:" +
+                    "bufW=$bufW:bufH=$bufH:crop=$cropRect"
+            }
+
+            val cropWidth = cropRect.right - cropRect.left
+            val cropHeight = cropRect.bottom - cropRect.top
+            if (cropWidth != width || cropHeight != height) {
+                return "vulkan_decoder_crop_unsupported:size_mismatch:" +
+                    "bufW=$bufW:bufH=$bufH:crop=$cropRect:expectedW=$width:expectedH=$height"
+            }
+
+            if (cropRect.left % 2 != 0 || cropRect.top % 2 != 0 ||
+                cropRect.right % 2 != 0 || cropRect.bottom % 2 != 0
+            ) {
+                return "vulkan_decoder_crop_unsupported:odd_crop_bounds:crop=$cropRect"
             }
 
             val timelinePtsUs = renderedFrames * frameDurationUs
-            val renderStr = nativeBridge.renderAndroidTimelineVulkanExportFrame(
+            val renderStr = nativeBridge.renderAndroidTimelineVulkanExportFrameCropped(
                 sessionId = nativeSessionId!!,
                 hardwareBuffer = hwBuf,
                 width = width,
                 height = height,
+                cropLeft = cropRect.left,
+                cropTop = cropRect.top,
+                cropRight = cropRect.right,
+                cropBottom = cropRect.bottom,
                 timelinePtsUs = timelinePtsUs,
                 frameIndex = renderedFrames,
             )

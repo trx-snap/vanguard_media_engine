@@ -9,9 +9,10 @@
 // src/CMakeLists.txt.
 //
 // JNI entry points (matching VanguardNativeBridge.kt declarations):
-//   createAndroidTimelineVulkanExportSession  -> jstring
-//   renderAndroidTimelineVulkanExportFrame    -> jstring
-//   destroyAndroidTimelineVulkanExportSession -> jstring
+//   createAndroidTimelineVulkanExportSession         -> jstring
+//   renderAndroidTimelineVulkanExportFrame           -> jstring
+//   renderAndroidTimelineVulkanExportFrameCropped     -> jstring
+//   destroyAndroidTimelineVulkanExportSession        -> jstring
 
 #include <jni.h>
 
@@ -328,6 +329,202 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         session->renderedFrames,
         RenderResultName(renderResult),
         HwBufResultName(releaseResult));
+    return env->NewStringUTF(status);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: renderAndroidTimelineVulkanExportFrameCropped
+// ---------------------------------------------------------------------------
+// Renders a [width]x[height] crop rect out of a decoder HardwareBuffer that
+// may be padded larger than the display crop (e.g. bufW=1920:bufH=1088 with
+// crop 0,0-1920,1080). Crop is normalized against the *imported* buffer's own
+// HardwareBufferDescriptor (the source of truth), not the Kotlin-supplied
+// width/height, which are cross-checked against the session's own attached
+// surface extent instead. Any mismatch fails closed without rendering.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidTimelineVulkanExportFrameCropped(
+    JNIEnv*  env,
+    jobject  /* this */,
+    jstring  sessionIdJ,
+    jobject  hardwareBufferJ,
+    jint     width,
+    jint     height,
+    jint     cropLeft,
+    jint     cropTop,
+    jint     cropRight,
+    jint     cropBottom,
+    jlong    timelinePtsUs,
+    jint     frameIndex) {
+
+    char status[512];
+
+    if (!sessionIdJ || !hardwareBufferJ || width <= 0 || height <= 0 ||
+        cropLeft < 0 || cropTop < 0 || cropRight <= cropLeft || cropBottom <= cropTop) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=invalid_crop:invalid_args",
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    const char* sidCStr = env->GetStringUTFChars(sessionIdJ, nullptr);
+    std::string sid(sidCStr ? sidCStr : "");
+    if (sidCStr) env->ReleaseStringUTFChars(sessionIdJ, sidCStr);
+
+    VulkanExportSession* session = nullptr;
+    {
+        // See renderAndroidTimelineVulkanExportFrame above for the claim/
+        // erase-and-wait lifetime argument; this route follows the same
+        // registry protocol.
+        std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+        auto it = gVulkanExportSessions.find(sid);
+        if (it != gVulkanExportSessions.end()) {
+            session = it->second;
+            session->activeRenderCount++;
+        }
+    }
+
+    if (!session) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=session_not_found;sessionId=%s",
+            static_cast<int>(frameIndex), sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    struct ReleaseGuard {
+        VulkanExportSession* s;
+        ~ReleaseGuard() {
+            std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+            if (--s->activeRenderCount == 0) {
+                gVulkanExportSessionIdleCv.notify_all();
+            }
+        }
+    } releaseGuard{session};
+
+    if (!session->initialized || !session->surfaceAttached) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=session_not_ready",
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    // Cross-check the Kotlin-supplied output/crop extent against the
+    // session's own attached surface extent before touching the buffer.
+    if (width != session->width || height != session->height ||
+        (cropRight - cropLeft) != width || (cropBottom - cropTop) != height) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=vulkan_decoder_buffer_geometry_mismatch:"
+            "invalid_crop:sessionW=%d:sessionH=%d:outW=%d:outH=%d:"
+            "crop=%d,%d-%d,%d",
+            static_cast<int>(frameIndex), session->width, session->height,
+            static_cast<int>(width), static_cast<int>(height),
+            static_cast<int>(cropLeft), static_cast<int>(cropTop),
+            static_cast<int>(cropRight), static_cast<int>(cropBottom));
+        return env->NewStringUTF(status);
+    }
+
+    AHardwareBuffer* ahwb = ResolveAHardwareBufferFromJObject(env, hardwareBufferJ);
+    if (!ahwb) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=ahardwarebuffer_resolve_failed",
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    vanguard::render::HardwareBufferHandle handle =
+        vanguard::render::kInvalidHardwareBufferHandle;
+    vanguard::render::HardwareBufferDescriptor descriptor{};
+    const auto importResult = session->backend.importHardwareBuffer(
+        ahwb, -1, &handle, &descriptor);
+
+    if (importResult != vanguard::render::HardwareBufferImportResult::kSuccess) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=import_failed;importResult=%s",
+            static_cast<int>(frameIndex),
+            HwBufResultName(importResult));
+        return env->NewStringUTF(status);
+    }
+
+    // Normalize the crop against the *imported* descriptor -- the
+    // authoritative source of truth for the real (possibly padded) buffer
+    // geometry, per Opus P0. Any failure past this point still releases the
+    // successfully imported buffer before returning.
+    const bool cropWithinBuffer =
+        descriptor.width > 0 && descriptor.height > 0 &&
+        static_cast<uint32_t>(cropRight) <= descriptor.width &&
+        static_cast<uint32_t>(cropBottom) <= descriptor.height;
+
+    vanguard::render::RenderFrameResult renderResult =
+        vanguard::render::RenderFrameResult::kInvalidBufferHandle;
+    bool renderOk = false;
+
+    if (!cropWithinBuffer) {
+        // Fall through without rendering; buffer is still released below.
+    } else {
+        vanguard::render::VideoFrameTransform transform{};
+        transform.cropScaleU =
+            static_cast<float>(cropRight - cropLeft) / static_cast<float>(descriptor.width);
+        transform.cropScaleV =
+            static_cast<float>(cropBottom - cropTop) / static_cast<float>(descriptor.height);
+        transform.cropBiasU =
+            static_cast<float>(cropLeft) / static_cast<float>(descriptor.width);
+        transform.cropBiasV =
+            static_cast<float>(cropTop) / static_cast<float>(descriptor.height);
+
+        renderResult = session->backend.renderFrame(handle, transform);
+        renderOk =
+            renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+            renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+    }
+
+    int releaseFenceFd = -1;
+    const auto releaseResult =
+        session->backend.releaseHardwareBuffer(handle, &releaseFenceFd);
+    if (releaseFenceFd >= 0) {
+        ::close(releaseFenceFd);
+        releaseFenceFd = -1;
+    }
+
+    if (!cropWithinBuffer) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=vulkan_decoder_crop_unsupported:"
+            "crop=%d,%d-%d,%d:descW=%u:descH=%u",
+            static_cast<int>(frameIndex),
+            static_cast<int>(cropLeft), static_cast<int>(cropTop),
+            static_cast<int>(cropRight), static_cast<int>(cropBottom),
+            descriptor.width, descriptor.height);
+        return env->NewStringUTF(status);
+    }
+
+    if (!renderOk) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=render_failed;renderResult=%s",
+            static_cast<int>(frameIndex),
+            RenderResultName(renderResult));
+        return env->NewStringUTF(status);
+    }
+
+    const bool releaseOk =
+        releaseResult == vanguard::render::HardwareBufferImportResult::kSuccess;
+
+    if (!releaseOk) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=release_failed;releaseResult=%s",
+            static_cast<int>(frameIndex),
+            HwBufResultName(releaseResult));
+        return env->NewStringUTF(status);
+    }
+
+    session->renderedFrames++;
+
+    std::snprintf(status, sizeof(status),
+        "status=OK;frameIndex=%d;timelinePtsUs=%lld;renderedFrames=%d;"
+        "renderResult=%s;releaseResult=%s;descW=%u;descH=%u",
+        static_cast<int>(frameIndex),
+        static_cast<long long>(timelinePtsUs),
+        session->renderedFrames,
+        RenderResultName(renderResult),
+        HwBufResultName(releaseResult),
+        descriptor.width, descriptor.height);
     return env->NewStringUTF(status);
 }
 

@@ -412,7 +412,8 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
         bitrateBps: Int,
         trimEndSeconds: Double,
     ): Boolean {
-        val totalFrames = max(1, (fps * trimEndSeconds).toInt())
+        val targetFrames = max(1, (fps * trimEndSeconds).toInt())
+        val framesToDraw = targetFrames + 1
         val frameDurationUs = (1_000_000L / fps).coerceAtLeast(1L)
 
         var codec: MediaCodec? = null
@@ -481,7 +482,7 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
                 }
             }
 
-            for (frameIdx in 0 until totalFrames) {
+            for (frameIdx in 0 until framesToDraw) {
                 val canvas = try {
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                         encoderSurface.lockHardwareCanvas()
@@ -503,14 +504,14 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
 
                 val boxW = width / 4f
                 val boxH = height / 4f
-                val shiftX = if (totalFrames > 1) (frameIdx.toFloat() / (totalFrames - 1)) * (width - boxW) else 0f
+                val shiftX = if (framesToDraw > 1) (frameIdx.toFloat() / (framesToDraw - 1)) * (width - boxW) else 0f
                 val boxY = (height - boxH) / 2f
                 val boxPaint = Paint().apply { color = Color.rgb(240, 210, 40) }
                 canvas.drawRect(shiftX, boxY, shiftX + boxW, boxY + boxH, boxPaint)
 
                 val barPaint = Paint().apply { color = Color.rgb(180, 50, 220) }
                 val barHeight = 16f
-                val barW = if (totalFrames > 1) ((frameIdx + 1).toFloat() / totalFrames) * width else width.toFloat()
+                val barW = if (framesToDraw > 1) ((frameIdx + 1).toFloat() / framesToDraw) * width else width.toFloat()
                 canvas.drawRect(0f, height - barHeight, barW, height.toFloat(), barPaint)
 
                 encoderSurface.unlockCanvasAndPost(canvas)
@@ -530,7 +531,7 @@ object AndroidVulkanExportProductionWiringSmokeHarness {
             }
 
             val outFile = File(outputPath)
-            return writtenVideoSamples >= totalFrames && muxerStoppedCleanly && outFile.exists() && outFile.length() > 0L
+            return writtenVideoSamples >= targetFrames && muxerStoppedCleanly && outFile.exists() && outFile.length() > 0L
         } catch (t: Throwable) {
             Log.e(TAG, "generateSyntheticSourceVideo failed", t)
             return false
