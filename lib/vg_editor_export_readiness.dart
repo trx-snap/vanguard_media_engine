@@ -13,10 +13,12 @@
 // local video and still-image clips (one or more, hard-cut concatenation
 // only) with direct-copy or PCM mixdown audio sidecar export (Unit H). Still
 // image clips are local files only, fitMode must be 'fit' (default), and
-// cropRect must be null. It does not yet execute editor compositor features
-// such as transitions, overlays, spatial clip transforms, still-image
-// crop/fill, freeze frames, reverse playback, dual-camera composition, time
-// remap, transform tracks, color matrix filtering, or GPU temporal denoise.
+// cropRect must be null. Per-clip colorMatrix filtering is supported (applied
+// to decoded video frames; accepted but not applied for still-image clips).
+// It does not yet execute editor compositor features such as transitions,
+// overlays, spatial clip transforms, still-image crop/fill, freeze frames,
+// reverse playback, dual-camera composition, time remap, transform tracks,
+// or GPU temporal denoise.
 //
 // This pure Dart evaluator preflights a VGEditorDraft and VGEditorExportRequest
 // and returns a structured report (ready vs blocked) with strongly-typed issue
@@ -108,7 +110,9 @@ enum VGEditorExportReadinessIssueCode {
   /// A clip specifies an animated transform track (transform tracks not supported on Android export route).
   transformTrackPresent,
 
-  /// A clip specifies a color matrix filter (color matrix not supported on Android export route).
+  /// Unused: color matrix filtering is supported on the Android export
+  /// route and this code is no longer produced. Retained for source/wire
+  /// compatibility with existing consumers of this enum.
   colorMatrixPresent,
 
   /// The export request enables temporal denoise (temporal denoise not supported on Android export route).
@@ -235,7 +239,8 @@ final class VGEditorExportReadinessReport {
 /// - No dual camera (`clip.dualCamera == null`).
 /// - No time remap (`clip.timeRemap == null`).
 /// - No transform track (`clip.transformTrack == null`).
-/// - No color matrix filter (`clip.colorMatrix == null`).
+/// - Color matrix filtering is supported (`clip.colorMatrix` may be non-null;
+///   applied to decoded video frames, accepted-but-not-applied for images).
 /// - Audio sidecar plans are allowed (Unit H proves direct-copy and PCM mixdown export).
 /// - Export request dimensions must resolve to positive even integers.
 /// - Frame rates (draft fps, request fps) must be positive.
@@ -475,18 +480,6 @@ final class VGEditorExportReadinessEvaluator {
             clipId: clip.id,
             message:
                 'Clip "${clip.id}" has a transform track descriptor; keyframed transform animation is not supported on the Android export route.',
-          ),
-        );
-      }
-
-      // Color matrix: not supported.
-      if (clip.colorMatrix != null) {
-        issues.add(
-          VGEditorExportReadinessIssue(
-            code: VGEditorExportReadinessIssueCode.colorMatrixPresent,
-            clipId: clip.id,
-            message:
-                'Clip "${clip.id}" has a color matrix descriptor; color matrix filtering is not supported on the Android export route.',
           ),
         );
       }

@@ -34,10 +34,15 @@ import kotlin.math.floor
 // touches a MethodChannel directly, even for progress.
 //
 // Scope (minimal hard-cut, sequential, local-video export -- Unit C, extended
-// by Unit G with rotation metadata + canvas scaling normalization):
+// by Unit G with rotation metadata + canvas scaling normalization, and by
+// Phase 10 with per-clip colorMatrix parity):
 //   - video-only clips, speed == 1.0, no transitions, no overlays, no canvas
 //     contentMode other than "fit", no per-clip transform/crop/freeze/
-//     reverse/time-remap/dual-camera/color-matrix.
+//     reverse/time-remap/dual-camera. Per-clip colorMatrix is accepted and
+//     applied to decoded video/OES frames (GLES backend); still-image clips
+//     accept/carry colorMatrix but never apply it. A clip with colorMatrix
+//     forces the Vulkan-capable backend selector to fall back to GLES (see
+//     AndroidExportRenderBackendSelector).
 //   - clip rotation metadata (0/90/180/270 after normalization) and decoded
 //     clip dimensions that differ from each other or from the requested
 //     output geometry are supported: each clip is centered and
@@ -90,6 +95,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         val trimStart: Double,
         val trimEnd: Double,
         val mediaKind: String,
+        val colorMatrix: FloatArray? = null,
     )
 
     private data class ClipContext(
@@ -101,6 +107,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         val rotationDegrees: Int,
         val mediaKind: String,
         val exifOrientation: Int = ExifInterface.ORIENTATION_NORMAL,
+        val colorMatrix: FloatArray? = null,
     )
 
     private fun run(
@@ -210,6 +217,43 @@ class AndroidTimelineExportSession(private val context: Context) {
                     return
                 }
             }
+            // Phase 10: colorMatrix is accepted (not in UNSUPPORTED_CLIP_KEYS).
+            // A missing/null key means no filter. When present it must be a
+            // list of exactly 20 finite numbers (4x5 row-major, matching
+            // Flutter's ColorFilter.matrix convention) -- anything else is a
+            // precise INVALID_ARG rather than a silently-ignored filter.
+            val rawColorMatrix = map["colorMatrix"]
+            var colorMatrix: FloatArray? = null
+            if (rawColorMatrix != null) {
+                if (rawColorMatrix !is List<*> || rawColorMatrix.size != 20) {
+                    onError(
+                        "INVALID_ARG",
+                        "exportTimeline: clip.colorMatrix must be a list of exactly 20 numbers",
+                    )
+                    return
+                }
+                val parsedMatrix = FloatArray(20)
+                for ((index, entry) in rawColorMatrix.withIndex()) {
+                    val number = entry as? Number
+                    if (number == null) {
+                        onError(
+                            "INVALID_ARG",
+                            "exportTimeline: clip.colorMatrix[$index] must be a number",
+                        )
+                        return
+                    }
+                    val value = number.toDouble()
+                    if (!value.isFinite()) {
+                        onError(
+                            "INVALID_ARG",
+                            "exportTimeline: clip.colorMatrix[$index] must be finite",
+                        )
+                        return
+                    }
+                    parsedMatrix[index] = value.toFloat()
+                }
+                colorMatrix = parsedMatrix
+            }
             if (sourcePath.startsWith("http://") || sourcePath.startsWith("https://")) {
                 onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: remote clip sources are not supported")
                 return
@@ -223,7 +267,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                 onError("FILE_UNREADABLE", "exportTimeline: cannot read clip source: $sourcePath")
                 return
             }
-            parsedClips.add(ParsedClip(sourcePath, trimStart, trimEnd, mediaKind))
+            parsedClips.add(ParsedClip(sourcePath, trimStart, trimEnd, mediaKind, colorMatrix))
         }
 
         // ── 3. Probe decoded geometry + rotation for every clip ─────────────
@@ -245,6 +289,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                         rotationDegrees = 0,
                         mediaKind = clip.mediaKind,
                         exifOrientation = imageProbe.exifOrientation,
+                        colorMatrix = clip.colorMatrix,
                     ),
                 )
                 continue
@@ -274,6 +319,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     decodedHeight = probe.height,
                     rotationDegrees = normalizedRotation,
                     mediaKind = clip.mediaKind,
+                    colorMatrix = clip.colorMatrix,
                 ),
             )
         }
@@ -357,6 +403,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     mediaKind = ctx.mediaKind,
                     stillFrameCount = stillFrameCount,
                     exifOrientation = ctx.exifOrientation,
+                    colorMatrix = ctx.colorMatrix,
                 ),
             )
         }
@@ -711,17 +758,18 @@ class AndroidTimelineExportSession(private val context: Context) {
         // hard-cut passthrough. Presence of any of these (non-null) means the
         // clip requires rendering behaviour this exporter does not perform --
         // rejecting explicitly avoids silently producing wrong output.
-        // colorMatrix specifically remains rejected until a Vulkan export
-        // baseline and its filter contract are implemented -- this slice
-        // (AndroidExportRenderBackendSelector) only makes backend selection
-        // explicit and does not implement colorMatrix or native Vulkan export.
+        // colorMatrix is intentionally absent from this list (Phase 10): it is
+        // parsed and validated explicitly above, then carried through
+        // ParsedClip/ClipContext/ClipInput and applied by the GLES backend --
+        // see AndroidTimelineVideoEncoder. A clip with colorMatrix still
+        // forces AndroidExportRenderBackendSelector to fall back to GLES,
+        // since the Vulkan export path does not implement it.
         private val UNSUPPORTED_CLIP_KEYS = listOf(
             "freezePTS",
             "dualCamera",
             "timeRemap",
             "transformTrack",
             "transform",
-            "colorMatrix",
             "cropRect",
         )
     }

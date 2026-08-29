@@ -336,7 +336,6 @@ class _AndroidEditorExportReadinessSmokeAppState
               ],
             ),
           ),
-          _makeClip(id: 'c-matrix', colorMatrix: List<double>.filled(20, 0.0)),
         ],
       );
       final lane9Report = evaluator.evaluate(draft: lane9Draft);
@@ -349,7 +348,6 @@ class _AndroidEditorExportReadinessSmokeAppState
         VGEditorExportReadinessIssueCode.dualCameraPresent,
         VGEditorExportReadinessIssueCode.timeRemapPresent,
         VGEditorExportReadinessIssueCode.transformTrackPresent,
-        VGEditorExportReadinessIssueCode.colorMatrixPresent,
       };
       final lane9ActualCodes = lane9Report.issues.map((i) => i.code).toSet();
       final lane9Pass =
@@ -402,13 +400,35 @@ class _AndroidEditorExportReadinessSmokeAppState
       print(
         'ANDROID_EXPORT_READINESS_UNIT_J_LANE_10_BLOCKED_TRANSITIONS_AND_OVERLAYS: ${lane10Pass ? "PASS" : "FAIL"}',
       );
+
+      // ── Lane 11: READY_COLOR_MATRIX ────────────────────────────────────────
+      final lane11Draft = VGEditorDraft(
+        id: 'draft-lane-11',
+        clips: [
+          _makeClip(id: 'c-matrix', colorMatrix: List<double>.filled(20, 0.0)),
+        ],
+        canvasWidth: 1080,
+        canvasHeight: 1920,
+        fps: 30,
+      );
+      final lane11Report = evaluator.evaluate(draft: lane11Draft);
+      final lane11Pass =
+          lane11Report.isReady &&
+          lane11Report.canUseAndroidEditorExportRoute &&
+          !lane11Report.isBlocked &&
+          lane11Report.issues.isEmpty &&
+          lane11Report.diagnostics['clipCount'] == 1;
+      results['LANE_11_READY_COLOR_MATRIX'] = lane11Pass;
+      print(
+        'ANDROID_EXPORT_READINESS_UNIT_J_LANE_11_READY_COLOR_MATRIX: ${lane11Pass ? "PASS" : "FAIL"}',
+      );
     } catch (e, st) {
       print('ANDROID_EXPORT_READINESS_UNIT_J_ERROR: $e\n$st');
     }
 
     final int passedCount = results.values.where((v) => v).length;
     final int totalCount = results.length;
-    final bool allPass = totalCount == 10 && passedCount == 10;
+    final bool allPass = totalCount == 11 && passedCount == 11;
 
     print(
       'ANDROID_EXPORT_READINESS_UNIT_J_JSON:${jsonEncode(<String, Object?>{'totalLanes': totalCount, 'passedLanes': passedCount, 'allPass': allPass, 'results': results})}',

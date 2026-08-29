@@ -14,7 +14,10 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // (AndroidTimelineVideoEncoder) is the fallback for unsupported capability,
 // hardware/driver/init/render failure, or a request/clip shape outside the
 // narrow safe scope this slice implements for the native Vulkan export path
-// (AndroidTimelineVulkanVideoEncoder) -- see [isSafeVulkanScope].
+// (AndroidTimelineVulkanVideoEncoder) -- see [vulkanScopeFailureReason]. Any
+// clip carrying a non-null colorMatrix (Phase 10) also falls outside this
+// scope -- the Vulkan export path does not implement colorMatrix -- and that
+// check is evaluated deterministically before any other scope failure.
 // AndroidTimelineExportSession additionally falls back to GLES mid-export if
 // a selected Vulkan encode attempt fails before pass-2/finalization; that
 // runtime fallback is session-owned and does not change this selector's
@@ -59,9 +62,11 @@ class AndroidExportRenderBackendSelector {
     /// the decision's [ExportRenderBackendDecision.reason] and still resolves
     /// to GLES. When the native capability probe itself resolves to Vulkan,
     /// [ExportRenderBackendDecision.actualBackend] only becomes Vulkan if
-    /// [scope] is non-null and passes [isSafeVulkanScope]; otherwise this
-    /// resolves to GLES with reason "vulkan_scope_not_supported", even though
-    /// the device itself is Vulkan-capable. Logs exactly one
+    /// [scope] is non-null and [vulkanScopeFailureReason] returns null;
+    /// otherwise this resolves to GLES with that failure reason (e.g.
+    /// "vulkan_scope_not_supported", or "vulkan_color_matrix_not_supported"
+    /// when any clip carries a colorMatrix), even though the device itself is
+    /// Vulkan-capable. Logs exactly one
     /// VG_EXPORT_BACKEND_SELECTED row; never logs per-frame.
     ///
     /// [nativeBridge], when non-null, is reused as-is (e.g. the same
@@ -103,12 +108,13 @@ class AndroidExportRenderBackendSelector {
             val reason: String
             when (capabilityBackend) {
                 ExportRenderBackend.VULKAN -> {
-                    if (isSafeVulkanScope(scope)) {
+                    val scopeFailureReason = vulkanScopeFailureReason(scope)
+                    if (scopeFailureReason == null) {
                         actualBackend = ExportRenderBackend.VULKAN
                         reason = "vulkan_export_scope_supported"
                     } else {
                         actualBackend = ExportRenderBackend.GLES
-                        reason = "vulkan_scope_not_supported"
+                        reason = scopeFailureReason
                     }
                 }
                 ExportRenderBackend.GLES, ExportRenderBackend.UNAVAILABLE -> {
@@ -149,21 +155,32 @@ class AndroidExportRenderBackendSelector {
     /// The safe scope this slice implements for
     /// AndroidTimelineVulkanVideoEncoder: API 29+ (ImageReader hardware-buffer
     /// path), at least one clip, every clip video-kind, positive requested
-    /// output dimensions, positive decoded clip dimensions, and cardinal
-    /// 0/90/180/270 rotation. AndroidTimelineVulkanVideoEncoder itself
-    /// computes an aspect-preserving-fit destination rect per clip (see its
-    /// own geometry computation) rather than requiring decoded dimensions to
-    /// exactly match the (possibly rotation-swapped) output geometry, so
-    /// this predicate no longer checks for that exact/swapped equality. Any
-    /// other shape (still images, unsupported/non-cardinal rotation,
+    /// output dimensions, positive decoded clip dimensions, cardinal
+    /// 0/90/180/270 rotation, and no clip carrying a colorMatrix (Phase 10 --
+    /// the Vulkan export path does not implement colorMatrix).
+    /// AndroidTimelineVulkanVideoEncoder itself computes an
+    /// aspect-preserving-fit destination rect per clip (see its own geometry
+    /// computation) rather than requiring decoded dimensions to exactly match
+    /// the (possibly rotation-swapped) output geometry, so this predicate no
+    /// longer checks for that exact/swapped equality.
+    ///
+    /// Returns null when [scope] is safe for Vulkan, or a machine-readable
+    /// failure reason otherwise. The colorMatrix check is evaluated first --
+    /// deterministically, before any other scope failure -- so a clip with a
+    /// colorMatrix always resolves to reason "vulkan_color_matrix_not_supported"
+    /// regardless of what else about [scope] might also be unsafe. Any other
+    /// unsafe shape (still images, unsupported/non-cardinal rotation,
     /// non-positive output or decoded dimensions, empty clip list, API < 29,
-    /// or no scope at all) is outside this scope and resolves to GLES.
-    private fun isSafeVulkanScope(scope: ExportRenderScope?): Boolean {
-        if (scope == null) return false
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return false
-        if (scope.clips.isEmpty()) return false
-        if (scope.requestedWidth <= 0 || scope.requestedHeight <= 0) return false
-        return scope.clips.all { clip ->
+    /// or no scope at all) resolves to "vulkan_scope_not_supported".
+    private fun vulkanScopeFailureReason(scope: ExportRenderScope?): String? {
+        if (scope != null && scope.clips.any { it.colorMatrix != null }) {
+            return "vulkan_color_matrix_not_supported"
+        }
+        if (scope == null) return "vulkan_scope_not_supported"
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return "vulkan_scope_not_supported"
+        if (scope.clips.isEmpty()) return "vulkan_scope_not_supported"
+        if (scope.requestedWidth <= 0 || scope.requestedHeight <= 0) return "vulkan_scope_not_supported"
+        val allSafe = scope.clips.all { clip ->
             if (clip.mediaKind != "video") return@all false
             if (clip.decodedWidth <= 0 || clip.decodedHeight <= 0) return@all false
             when (clip.rotationDegrees) {
@@ -171,6 +188,7 @@ class AndroidExportRenderBackendSelector {
                 else -> false
             }
         }
+        return if (allSafe) null else "vulkan_scope_not_supported"
     }
 
     companion object {

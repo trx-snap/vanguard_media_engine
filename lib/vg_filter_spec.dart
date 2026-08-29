@@ -129,7 +129,13 @@ bool _mapEquals(Map<String, Object?> a, Map<String, Object?> b) {
 /// The native plugin's `setFilterChain` handler maps each type to a concrete
 /// filter node class. Extend this set when a new filter node is added to both
 /// the native handler and the UMF protocol conformers.
-const Set<String> _validTypes = {'lut', 'beauty', 'segmentation', 'colorMatrix', 'transform'};
+const Set<String> _validTypes = {
+  'lut',
+  'beauty',
+  'segmentation',
+  'colorMatrix',
+  'transform',
+};
 
 /// Typed factory constructors and validation for [VGFilterSpec].
 ///
@@ -323,7 +329,7 @@ extension VGFilterSpecs on VGFilterSpec {
   static VGFilterSpec segmentation() =>
       const VGFilterSpec(type: 'segmentation');
 
-  /// Creates a color-matrix filter for still-image export.
+  /// Creates a color-matrix filter for export and timeline pipelines.
   ///
   /// [matrix] must be exactly 20 floats arranged as a 4×5 row-major matrix
   /// matching Flutter's [ColorFilter.matrix] convention:
@@ -348,7 +354,6 @@ extension VGFilterSpecs on VGFilterSpec {
   /// ]);
   /// ```
   ///
-  /// Phase 10-C-3L.1C — still-image export only.
   /// Do NOT use for live preview (use Flutter [ColorFilter.matrix] there).
   static VGFilterSpec colorMatrix({required List<double> matrix}) {
     assert(

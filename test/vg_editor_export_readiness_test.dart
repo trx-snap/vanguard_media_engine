@@ -620,19 +620,21 @@ void main() {
       expect(issue.clipId, 'c-track');
     });
 
-    test('color matrix blocks readiness with colorMatrixPresent', () {
+    test('color matrix does not block readiness for plain video clip', () {
       final matrix = List<double>.filled(20, 0.0);
       final clip = makePlainVideoClip(id: 'c-matrix', colorMatrix: matrix);
       final draft = makeSingleClipDraft(clip: clip);
 
       final report = evaluator.evaluate(draft: draft);
 
-      expect(report.decision, VGEditorExportReadinessDecision.blocked);
-      expect(report.canUseAndroidEditorExportRoute, isFalse);
-      final issue = report.issues.firstWhere(
-        (i) => i.code == VGEditorExportReadinessIssueCode.colorMatrixPresent,
+      expect(report.decision, VGEditorExportReadinessDecision.ready);
+      expect(report.canUseAndroidEditorExportRoute, isTrue);
+      expect(
+        report.issues.any(
+          (i) => i.code == VGEditorExportReadinessIssueCode.colorMatrixPresent,
+        ),
+        isFalse,
       );
-      expect(issue.clipId, 'c-matrix');
     });
 
     test('transitions and overlays block readiness', () {
