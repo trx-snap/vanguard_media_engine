@@ -1322,6 +1322,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 )
             }
 
+            "isRecordingActive" -> {
+                result.success(cameraSource?.isRecordingActive ?: false)
+            }
+
             "setZoom" -> {
                 // Dart sends the factor as "factor" (see vg_camera_session.dart);
                 // "level" kept as a fallback for backwards compatibility.

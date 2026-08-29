@@ -50,6 +50,8 @@ import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.SurfaceRequest
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.FileOutputOptions
 import androidx.camera.video.FallbackStrategy
@@ -90,10 +92,6 @@ class VanguardCameraSource(
 
     companion object {
         private const val TAG = "VanguardCameraSource"
-
-        // Portrait 1080p — matches iOS VanguardCameraMediaSource 1080×1920 preset.
-        private const val PREVIEW_WIDTH  = 1080
-        private const val PREVIEW_HEIGHT = 1920
     }
 
     // ── Fake lifecycle owner ─────────────────────────────────────────────────
@@ -125,6 +123,13 @@ class VanguardCameraSource(
     private var pendingFinalizeCallback: ((filePath: String, droppedFrames: Int, totalFrames: Int) -> Unit)? = null
     private var pendingFinalizeError: ((Exception) -> Unit)? = null
     private var activeRecordingPath: String = ""
+
+    // ── Recording-active signal (Android parity with iOS isRecordingActive) ──
+    // False until CameraX has actually signalled VideoRecordEvent.Start, and
+    // set back to false as soon as teardown begins (Finalize, stopRecording,
+    // or stop()) — mirrors iOS VanguardCameraMediaSource.isRecordingActive,
+    // which is true only once the writer is actively writing.
+    @Volatile private var recordingActiveFlag = false
 
     // ── State guard (I-2: exactly one camera session at a time) ──────────────────
     private var isRunning = false
@@ -231,11 +236,21 @@ class VanguardCameraSource(
             .requireLensFacing(lensFacing)
             .build()
 
+        // ── Resolution selector ──────────────────────────────────────────────
+        // Negotiates a 16:9 buffer family (falling back automatically if the
+        // device has no exact 16:9 stream) so Preview and ImageCapture agree on
+        // the same portrait-compatible aspect ratio as the iOS 1080×1920/16:9
+        // preset — matching the app's fixed 9:16 FittedBox(BoxFit.cover) layout.
+        val resolutionSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
+            .build()
+
         // ── Preview use-case ─────────────────────────────────────────────────
         // Frames route into the Flutter SurfaceTexture via a custom SurfaceProvider.
         // NO PreviewView is involved — this is identical in concept to iOS where
         // AVCaptureVideoDataOutput delivers CVPixelBuffer to VanguardMetalRenderer.
         val previewBuilder = Preview.Builder()
+            .setResolutionSelector(resolutionSelector)
 
         // Camera2 interop: observe real preview capture delivery so isCameraReady
         // reflects an actual frame from the sensor, not just "use-cases bound".
@@ -264,6 +279,7 @@ class VanguardCameraSource(
         // ── ImageCapture use-case ─────────────────────────────────────────────
         val imageCaptureUseCase = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setResolutionSelector(resolutionSelector)
             .build()
             .also { imageCapture = it }
 
@@ -301,8 +317,8 @@ class VanguardCameraSource(
 
     private fun provideSurface(request: SurfaceRequest) {
         // Prepare the Flutter SurfaceTexture to receive camera frames at the
-        // negotiated resolution. CameraX fills in the exact size after binding;
-        // we set 1080×1920 as a hint and let the request size override if needed.
+        // resolution CameraX actually negotiated (16:9-family, via the
+        // ResolutionSelector set on Preview.Builder — see bindUseCases()).
         val surfaceTexture: SurfaceTexture = textureEntry.surfaceTexture()
         val size = request.resolution
         surfaceTexture.setDefaultBufferSize(size.width, size.height)
@@ -351,6 +367,7 @@ class VanguardCameraSource(
         // This matches iOS teardownCameraAsync which calls stopRecording first.
         activeRecording?.stop()
         activeRecording = null
+        recordingActiveFlag = false
 
         // Move fake lifecycle to DESTROYED — CameraX interprets this as the
         // "Activity finished" event and cleans up all hardware resources.
@@ -474,6 +491,14 @@ class VanguardCameraSource(
     val isRecording: Boolean get() = activeRecording != null
 
     /**
+     * Returns true only once CameraX has signalled that recording has
+     * actually started (VideoRecordEvent.Start) and false again as soon as
+     * teardown begins. Mirrors iOS cameraSource.isRecordingActive, which the
+     * plugin exposes to Dart's isRecordingActive() polling.
+     */
+    val isRecordingActive: Boolean get() = isRecording && recordingActiveFlag
+
+    /**
      * Begins recording video to [outputPath].
      *
      * @param outputPath Absolute path for the MP4 output file.
@@ -490,6 +515,8 @@ class VanguardCameraSource(
             onError(IllegalStateException("Already recording — call stopRecording() first"))
             return
         }
+
+        recordingActiveFlag = false
 
         val vc = videoCapture
         if (vc == null) {
@@ -511,9 +538,11 @@ class VanguardCameraSource(
             when (event) {
                 is VideoRecordEvent.Start -> {
                     Log.d(TAG, "startRecording: recording started → $outputPath")
+                    recordingActiveFlag = true
                     onStarted()
                 }
                 is VideoRecordEvent.Finalize -> {
+                    recordingActiveFlag = false
                     activeRecording = null
                     val callback = pendingFinalizeCallback
                     val errCb    = pendingFinalizeError
@@ -574,6 +603,7 @@ class VanguardCameraSource(
 
         Log.d(TAG, "stopRecording: signalling stop → $activeRecordingPath")
         rec.stop()
+        recordingActiveFlag = false
         // VideoRecordEvent.Finalize will fire asynchronously on the mainExecutor
         // and invoke pendingFinalizeCallback with the final file path.
     }
