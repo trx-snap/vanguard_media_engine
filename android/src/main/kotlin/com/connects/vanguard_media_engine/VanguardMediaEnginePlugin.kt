@@ -10,6 +10,7 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import androidx.annotation.NonNull
+import com.connects.vanguard_media_engine.audio.AndroidWaveformCacheCoordinator
 import com.connects.vanguard_media_engine.audio.AndroidWaveformExtractor
 import com.connects.vanguard_media_engine.audio.AndroidWaveformResult
 import com.connects.vanguard_media_engine.audio_extraction.AndroidAudioExtractionCoordinator
@@ -81,6 +82,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
     // Owns "beginAudioExtraction" and "cancelAudioExtraction" -- Android parity
     // with VanguardAudioExtractionHandler.swift.
     private var audioExtractionCoordinator: AndroidAudioExtractionCoordinator? = null
+
+    // ── Phase 5-Unit X / Phase 4-Unit F: disk-backed waveform result cache ────
+    // Owns the six "waveformCache_*" routes -- Android parity with
+    // VGWaveformCacheMethodHandler.swift.
+    private var waveformCacheCoordinator: AndroidWaveformCacheCoordinator? = null
 
     // ── Camera session state (B2: single camera instance invariant) ───────────
     // Mirrors iOS plugin: cameraSource + renderer stored at plugin level.
@@ -162,6 +168,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             mainHandler = mainHandler,
         )
         audioExtractionCoordinator = AndroidAudioExtractionCoordinator(
+            context     = binding.applicationContext,
+            mainHandler = mainHandler,
+        )
+        waveformCacheCoordinator = AndroidWaveformCacheCoordinator(
             context     = binding.applicationContext,
             mainHandler = mainHandler,
         )
@@ -266,6 +276,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android audio extraction coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidWaveformCacheCoordinator.ownsMethod(call.method)) {
+            val coord = waveformCacheCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android waveform cache coordinator unavailable", null)
             }
             return
         }
@@ -1443,5 +1463,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         // Tear down Phase 5-Unit V / Phase 4-Unit D audio extraction coordinator.
         audioExtractionCoordinator?.disposeAll()
         audioExtractionCoordinator = null
+        // Tear down Phase 5-Unit X / Phase 4-Unit F waveform cache coordinator.
+        waveformCacheCoordinator?.disposeAll()
+        waveformCacheCoordinator = null
     }
 }

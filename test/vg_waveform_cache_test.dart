@@ -542,4 +542,126 @@ void main() {
       );
     },
   );
+
+  test('WC-23: invalidateAsset propagates PlatformException', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'waveformCache_invalidateAsset') {
+            throw PlatformException(
+              code: 'CACHE_UNSAFE_PATH',
+              message: 'Symlink detected',
+            );
+          }
+          return null;
+        });
+
+    expect(
+      () => VGAudioWaveformCache.invalidateAsset(
+        namespace: 'ns1',
+        assetKey: 'ak1',
+      ),
+      throwsA(
+        isA<PlatformException>().having(
+          (e) => e.code,
+          'code',
+          'CACHE_UNSAFE_PATH',
+        ),
+      ),
+    );
+  });
+
+  test('WC-24: invalidateNamespace propagates PlatformException', () async {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(channel, (call) async {
+          if (call.method == 'waveformCache_invalidateNamespace') {
+            throw PlatformException(
+              code: 'CACHE_INVALIDATION_FAILED',
+              message: 'IO error',
+            );
+          }
+          return null;
+        });
+
+    expect(
+      () => VGAudioWaveformCache.invalidateNamespace(namespace: 'ns1'),
+      throwsA(
+        isA<PlatformException>().having(
+          (e) => e.code,
+          'code',
+          'CACHE_INVALIDATION_FAILED',
+        ),
+      ),
+    );
+  });
+
+  test(
+    'WC-25: saveNamespaced propagates PlatformException on native error',
+    () async {
+      setHandler((call) async {
+        if (call.method == 'waveformCache_lookupNamespaced') {
+          return {'status': 'miss', 'writeLease': 'valid.token'};
+        }
+        if (call.method == 'waveformCache_saveNamespaced') {
+          throw PlatformException(
+            code: 'CACHE_LEASE_MISMATCH',
+            message: 'Mismatched SPS',
+          );
+        }
+        return null;
+      });
+
+      final lookup =
+          await VGAudioWaveformCache.lookupNamespaced(
+                namespace: 'ns1',
+                assetKey: 'ak1',
+                samplesPerSecond: 100,
+              )
+              as VGAudioWaveformLookupMiss;
+
+      expect(
+        () => VGAudioWaveformCache.saveNamespaced(
+          lease: lookup.lease,
+          result: makeResult(pointCount: 2, duration: 1.0, sps: 100),
+        ),
+        throwsA(
+          isA<PlatformException>().having(
+            (e) => e.code,
+            'code',
+            'CACHE_LEASE_MISMATCH',
+          ),
+        ),
+      );
+    },
+  );
+
+  test(
+    'WC-26: lookupNamespaced propagates PlatformException on native error',
+    () async {
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            if (call.method == 'waveformCache_lookupNamespaced') {
+              throw PlatformException(
+                code: 'CACHE_UNSAFE_PATH',
+                message: 'Unsafe path',
+              );
+            }
+            return null;
+          });
+
+      expect(
+        () => VGAudioWaveformCache.lookupNamespaced(
+          namespace: 'ns1',
+          assetKey: 'ak1',
+          samplesPerSecond: 100,
+        ),
+        throwsA(
+          isA<PlatformException>().having(
+            (e) => e.code,
+            'code',
+            'CACHE_UNSAFE_PATH',
+          ),
+        ),
+      );
+    },
+  );
 }
