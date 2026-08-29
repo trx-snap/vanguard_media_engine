@@ -21,6 +21,7 @@ import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordin
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
+import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
 import com.connects.vanguard_media_engine.export.AndroidStillImageDecoder
 import com.connects.vanguard_media_engine.export.AndroidStillImageExportCoordinator
@@ -64,6 +65,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
     // ── Phase 7.8A-Android: editor playback control coordinator ───────────────
     private var editorPlaybackCoordinator: AndroidEditorPlaybackCoordinator? = null
+
+    // ── Phase 10-C-3N: timeline live filter-chain control guard bridge ────────
+    // Owns "timeline_setFilterChain" -- honest guard route only. Does NOT
+    // implement live visual filter evaluation on Android; see
+    // AndroidTimelineLiveControlCoordinator's header for the full non-claims.
+    private var timelineLiveControlCoordinator: AndroidTimelineLiveControlCoordinator? = null
 
     // ── Diagnostic smoke routes (Phases 2O2B3/2O2B4/2Q/3C/4A/5 + Audio Unit B) ─
     private var dagDiagnosticsCoordinator: AndroidDagDiagnosticsCoordinator? = null
@@ -191,6 +198,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             textureRegistry = binding.textureRegistry,
             channel         = channel,
             mainHandler     = mainHandler,
+        )
+        timelineLiveControlCoordinator = AndroidTimelineLiveControlCoordinator(
+            activeTextureIdProvider = { editorPlaybackCoordinator?.activeTimelineTextureId() },
         )
         dagDiagnosticsCoordinator = AndroidDagDiagnosticsCoordinator(
             context       = binding.applicationContext,
@@ -413,6 +423,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android image compression coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidTimelineLiveControlCoordinator.ownsMethod(call.method)) {
+            val coord = timelineLiveControlCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android timeline live control coordinator unavailable", null)
             }
             return
         }
@@ -1581,6 +1601,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // Tear down Phase 5-Unit AE / Phase 10-C-3M image compression coordinator.
         imageCompressionCoordinator?.disposeAll()
         imageCompressionCoordinator = null
+        // Phase 10-C-3N timeline live control coordinator is stateless (no native
+        // resources) -- just drop the reference, no disposeAll() to call.
+        timelineLiveControlCoordinator = null
     }
 
     // ── ActivityAware (Phase 5-Unit AB / Phase 10F-Slice 2B / UMF V2 Slice 2B) ─

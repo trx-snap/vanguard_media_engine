@@ -43,6 +43,11 @@ import 'vg_filter_spec.dart';
 /// - `NO_TIMELINE`    — no current timeline target on the native side.
 /// - `STALE_TIMELINE` — [textureId] does not match the active timeline target.
 /// - `UNKNOWN_FILTER` — a filter type is not recognised by the native runtime.
+/// - `UNSUPPORTED_TIMELINE_FEATURE` — Android only: the filter chain is
+///   otherwise valid and recognised, but Android live playback does not
+///   implement visual filter evaluation in this slice, so no enabled filter
+///   can actually be applied. An empty or all-disabled chain still succeeds
+///   on Android since no filters need to be applied in that case.
 ///
 /// ## Lifecycle
 ///
@@ -63,8 +68,7 @@ final class VGTimelineLiveControls {
   /// [channel] defaults to the shared `'vanguard_media_engine'` channel.
   /// Inject an alternate channel only in tests.
   VGTimelineLiveControls({MethodChannel? channel})
-      : _channel =
-            channel ?? const MethodChannel('vanguard_media_engine');
+    : _channel = channel ?? const MethodChannel('vanguard_media_engine');
 
   // ── Public API ─────────────────────────────────────────────────────────────
 
@@ -86,6 +90,9 @@ final class VGTimelineLiveControls {
   /// - `NO_TIMELINE`    — no active timeline on the native side.
   /// - `STALE_TIMELINE` — [textureId] does not match the active timeline.
   /// - `UNKNOWN_FILTER` — a filter type is not recognised by the native runtime.
+  /// - `UNSUPPORTED_TIMELINE_FEATURE` — Android only: a recognised, non-empty
+  ///   enabled filter chain cannot be applied because Android live playback
+  ///   lacks visual filter evaluation in this slice.
   Future<void> setFilterChain({
     required int textureId,
     required List<VGFilterSpec> filters,

@@ -370,4 +370,9 @@ class AndroidEditorPlaybackCoordinator(
     fun disposeAll() {
         disposeActiveSession {}
     }
+
+    // ── Phase 10-C-3N: read-only accessor for AndroidTimelineLiveControlCoordinator ──
+
+    /** The textureId of the active timeline, or null if none is active. */
+    fun activeTimelineTextureId(): Long? = synchronized(lock) { active?.textureId }
 }
