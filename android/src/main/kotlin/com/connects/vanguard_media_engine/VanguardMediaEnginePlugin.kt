@@ -23,6 +23,7 @@ import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinato
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
 import com.connects.vanguard_media_engine.export.AndroidStillImageDecoder
 import com.connects.vanguard_media_engine.image.AndroidImageOptimizer
+import com.connects.vanguard_media_engine.photo_library.AndroidPhotoLibrarySaveCoordinator
 import com.connects.vanguard_media_engine.rtc.AndroidRtcVideoCoordinator
 import com.connects.vanguard_media_engine.sidecar.AndroidReverseSidecarCoordinator
 import com.connects.vanguard_media_engine.streaming.AndroidDagStreamingPlaybackCoordinator
@@ -93,6 +94,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
     // Owns the seven "audioPlayback_*" routes -- Android parity with
     // VGAudioPlaybackService.m (iOS).
     private var audioPlaybackCoordinator: AndroidAudioPlaybackCoordinator? = null
+
+    // ── Phase 5-Unit Z / UMF V2 Slice 2A: photo library save coordinator ──────
+    // Owns "saveVideoToPhotoLibrary" -- Android parity with
+    // VGPhotoLibrarySaveHandler.swift (iOS).
+    private var photoLibrarySaveCoordinator: AndroidPhotoLibrarySaveCoordinator? = null
 
     // ── Camera session state (B2: single camera instance invariant) ───────────
     // Mirrors iOS plugin: cameraSource + renderer stored at plugin level.
@@ -182,6 +188,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
             mainHandler = mainHandler,
         )
         audioPlaybackCoordinator = AndroidAudioPlaybackCoordinator(
+            mainHandler = mainHandler,
+        )
+        photoLibrarySaveCoordinator = AndroidPhotoLibrarySaveCoordinator(
+            context     = binding.applicationContext,
             mainHandler = mainHandler,
         )
     }
@@ -305,6 +315,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android audio playback coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidPhotoLibrarySaveCoordinator.ownsMethod(call.method)) {
+            val coord = photoLibrarySaveCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android photo library save coordinator unavailable", null)
             }
             return
         }
@@ -1488,5 +1508,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler {
         // Tear down Phase 5-Unit Y / Phase 4-Unit G audio playback coordinator.
         audioPlaybackCoordinator?.disposeAll()
         audioPlaybackCoordinator = null
+        // Tear down Phase 5-Unit Z / UMF V2 Slice 2A photo library save coordinator.
+        photoLibrarySaveCoordinator?.disposeAll()
+        photoLibrarySaveCoordinator = null
     }
 }

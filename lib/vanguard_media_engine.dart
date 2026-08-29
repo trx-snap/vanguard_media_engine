@@ -1195,13 +1195,16 @@ class VanguardEngine {
   }
 
   /// UMF V2 Slice 2A: Saves a local video file (.mp4, .mov, .m4v) to the platform
-  /// photo library (iOS Photos / PHPhotoLibrary).
+  /// photo library (iOS Photos / PHPhotoLibrary; Android MediaStore / Gallery).
   ///
   /// - [filePath]: absolute POSIX path to the local video file.
   /// - [channel]: optional [MethodChannel] override for unit testing.
   ///
   /// Returns `true` on success.
-  /// Throws [PlatformException] on native permission denial or PhotoKit failure.
+  /// Throws [PlatformException] on native permission denial, PhotoKit failure
+  /// (iOS), or MediaStore/legacy-storage failure (Android — saved under
+  /// Movies/ConnectsApp via MediaStore on API 29+, or a scoped legacy fallback
+  /// on API 24-28).
   static Future<bool> saveVideoToPhotoLibrary(
     String filePath, {
     MethodChannel? channel,
