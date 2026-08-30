@@ -431,6 +431,31 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
+    // ── P2-CONCURRENT-DEC: Multi-stream concurrent hardware decode ingest ───
+    // validation diagnostic. Additive-only: validates sourceNodeId admission and
+    // imports/releases an AHardwareBuffer within one JNI call per ingest, with no
+    // cross-call buffer retention and no PiP/compositor presentation.
+    external fun createAndroidDagPhase2ConcurrentDecodeSession(
+        sourceNodeIds: Array<String>,
+    ): String
+
+    external fun ingestAndroidDagPhase2ConcurrentDecodeFrame(
+        sessionId: String,
+        sourceNodeId: String,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        timelinePtsUs: Long,
+        frameIndex: Int,
+        generationId: Long,
+        rotationDegrees: Int,
+        mirrorHorizontal: Boolean,
+    ): String
+
+    external fun destroyAndroidDagPhase2ConcurrentDecodeSession(
+        sessionId: String,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

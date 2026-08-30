@@ -19,6 +19,7 @@ import com.connects.vanguard_media_engine.audio_recording.AndroidAudioRecordingC
 import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCameraGraphTransactionCoordinator
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidConcurrentDecodeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
@@ -82,6 +83,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
     // ── Diagnostic smoke routes (Phases 2O2B3/2O2B4/2Q/3C/4A/5 + Audio Unit B) ─
     private var dagDiagnosticsCoordinator: AndroidDagDiagnosticsCoordinator? = null
+
+    // ── Phase 2: concurrent decode verification smoke coordinator ─────────────
+    private var concurrentDecodeSmokeCoordinator: AndroidConcurrentDecodeSmokeCoordinator? = null
 
     // ── Phase 3-Unit T: Android OS thermal listener lifecycle bridge ──────────
     private var thermalStateBridge: AndroidThermalStateBridge? = null
@@ -219,6 +223,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler   = mainHandler,
             thermalBridge = thermalStateBridge!!,
         )
+        concurrentDecodeSmokeCoordinator = AndroidConcurrentDecodeSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
         editorExportCoordinator = AndroidEditorExportCoordinator(
             context     = binding.applicationContext,
             channel     = channel,
@@ -325,6 +332,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android DAG diagnostics coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidConcurrentDecodeSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = concurrentDecodeSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android concurrent decode smoke coordinator unavailable", null)
             }
             return
         }
@@ -1622,6 +1639,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         editorPlaybackCoordinator = null
         // Diagnostics coordinator holds no native resources — just drop it.
         dagDiagnosticsCoordinator = null
+        concurrentDecodeSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.
         editorExportCoordinator?.disposeAll()
