@@ -46,6 +46,8 @@ export 'vg_camera2_native_render_frame_smoke.dart';
 export 'vg_camera2_native_render_loop_smoke.dart';
 // Phase 3-Unit M: Android Camera2 PRIVATE ImageReader HardwareBuffer Flutter Texture Native Render Loop Smoke Foundation.
 export 'vg_camera2_texture_native_render_loop_smoke.dart';
+// P3-CAM-CONCURRENT: Android Camera2 dual-camera concurrent PRIVATE AHardwareBuffer ingest smoke foundation.
+export 'vg_camera2_concurrent_ingest_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.

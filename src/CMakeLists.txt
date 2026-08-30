@@ -77,6 +77,7 @@ if (ANDROID)
     "platform/android/src/android_phase4a_decoder_smoke_jni.cpp"
     "platform/android/src/android_phase4b1_texture_playback_jni.cpp"
     "platform/android/src/android_phase2_concurrent_decode_jni.cpp"
+    "platform/android/src/android_phase3_camera_concurrent_ingest_jni.cpp"
     "platform/android/src/android_passthrough_remux_sink_jni.cpp"
     "platform/android/src/android_phase5_encoder_smoke_jni.cpp"
     "platform/android/src/android_vulkan_export_jni.cpp"

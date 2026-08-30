@@ -512,6 +512,35 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
+    // ── P3-CAM-CONCURRENT: Camera2 dual-camera concurrent PRIVATE AHardwareBuffer ─
+    // ingest validation diagnostic. Kotlin remains the sole owner of Camera2
+    // device/session lifecycle (CameraManager.openCamera, CameraCaptureSession);
+    // native only validates cameraSourceNodeId admission and imports/releases an
+    // AHardwareBuffer within one JNI call per ingest, with no cross-call buffer
+    // retention, no Camera2 ownership in C++, and no compositor/PiP/split/
+    // recording/export claim. Mirrors the P2-CONCURRENT-DEC registry pattern with
+    // P3 camera-specific naming.
+    external fun createAndroidDagPhase3CameraConcurrentIngestSession(
+        cameraSourceNodeIds: Array<String>,
+    ): String
+
+    external fun ingestAndroidDagPhase3CameraConcurrentFrame(
+        sessionId: String,
+        cameraSourceNodeId: String,
+        hardwareBuffer: HardwareBuffer,
+        width: Int,
+        height: Int,
+        cameraTimestampNs: Long,
+        frameIndex: Int,
+        generationId: Long,
+        rotationDegrees: Int,
+        mirrorHorizontal: Boolean,
+    ): String
+
+    external fun destroyAndroidDagPhase3CameraConcurrentIngestSession(
+        sessionId: String,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
