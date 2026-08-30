@@ -17,6 +17,7 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import io.flutter.view.TextureRegistry
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Vanguard Android True-DAG Phase 4B1B: Diagnostic physical playback control session.
@@ -30,6 +31,12 @@ class AndroidDagTexturePlaybackControlSession(
     private val surfaceProducer: TextureRegistry.SurfaceProducer,
     private val onTimelineFrame: ((textureId: Long, ptsSeconds: Double, generationId: Long) -> Unit)? = null,
     private val onTimelineEOS: ((textureId: Long) -> Unit)? = null,
+    /**
+     * Optional trim-end boundary (source PTS, us). When non-null, continuous playback
+     * completes/EOS once the next decoded frame's PTS reaches this boundary, without ever
+     * rendering a frame at or beyond it. Null preserves untrimmed (full-source) behavior.
+     */
+    private val playbackEndPtsUs: Long? = null,
 ) {
     companion object {
         private const val TAG = "DagTexturePlaybackCtrl"
@@ -40,6 +47,14 @@ class AndroidDagTexturePlaybackControlSession(
 
     /** Set atomically the moment onSurfaceCleanup fires; cleared on restore. */
     private val surfaceLostFlag = AtomicBoolean(false)
+
+    // Phase 4B2B3F: diagnostic-only counters distinguishing real Flutter SurfaceProducer
+    // callbacks from the simulateSurfaceCleanup/simulateSurfaceAvailable diagnostic seams.
+    private val realSurfaceCleanupCallbackCount = AtomicInteger(0)
+    private val realSurfaceAvailableCallbackCount = AtomicInteger(0)
+
+    @Volatile
+    private var lastSurfaceLifecycleEvent: String? = null
 
     private val imageQueue = LinkedBlockingQueue<Image>(IMAGE_READER_MAX_IMAGES)
 
@@ -67,6 +82,9 @@ class AndroidDagTexturePlaybackControlSession(
 
     private var choreographer: Choreographer? = null
     private var activeFrameCallback: Choreographer.FrameCallback? = null
+
+    /** Paces rendered frames by media PTS at 1.0x instead of one source frame per vsync. */
+    private val timelineClock = AndroidDagTimelineClock()
     private var pendingPlayCallback: ((Map<String, Any?>) -> Unit)? = null
     private var targetFrameCount: Int? = null
 
@@ -94,6 +112,16 @@ class AndroidDagTexturePlaybackControlSession(
      * Display height after applying [rotationDegrees] swap (swapped for 90/270).
      */
     private var displayHeight = 0
+
+    /**
+     * Freezes [timelineClock] at [ptsUs] (the actually-displayed media position), so a later
+     * resume anchors from here rather than an interpolated/stale position.
+     */
+    private fun freezeClockAt(ptsUs: Long) {
+        val now = System.nanoTime()
+        timelineClock.pause(now)
+        timelineClock.seek(ptsUs, now)
+    }
 
     /**
      * Initializes resources and prepares the playback session on the dedicated HandlerThread.
@@ -139,8 +167,8 @@ class AndroidDagTexturePlaybackControlSession(
                 try {
                     // 3. Register surface lifecycle callback BEFORE first getSurface()
                     val adapter = AndroidDagSurfaceProducerLifecycleAdapter(
-                        onAvailable = { handleSurfaceAvailable() },
-                        onCleanup   = { handleSurfaceCleanup() },
+                        onAvailable = { handleSurfaceAvailable(countAsRealCallback = true) },
+                        onCleanup   = { handleSurfaceCleanup(countAsRealCallback = true) },
                     ).also { lifecycleAdapter = it }
                     @Suppress("DEPRECATION")
                     surfaceProducer.setCallback(adapter)
@@ -331,6 +359,10 @@ class AndroidDagTexturePlaybackControlSession(
                         }
 
                         try {
+                            // Resume is a no-op when already playing; on the first tick after
+                            // play()/resume it anchors the clock at this vsync's frameTimeNanos.
+                            val dueMediaPtsUs = timelineClock.resume(frameTimeNanos)
+
                             // Feed, drain, and render - delegated to AndroidDagFrameRenderPump.
                             val pumpResult = AndroidDagFrameRenderPump().pumpOnce(
                                 extractor = extractor,
@@ -348,6 +380,8 @@ class AndroidDagTexturePlaybackControlSession(
                                 outputDone = outputDone,
                                 renderedFrames = renderedFrames,
                                 lastRenderedPtsUs = lastRenderedPtsUs,
+                                dueMediaPtsUs = dueMediaPtsUs,
+                                sourceEndPtsUs = playbackEndPtsUs,
                             )
                             inputDone = pumpResult.inputDone
                             outputDone = pumpResult.outputDone
@@ -355,13 +389,14 @@ class AndroidDagTexturePlaybackControlSession(
                             lastRenderedPtsUs = pumpResult.lastRenderedPtsUs
                             frameRenderError = pumpResult.frameRenderError
 
-                            if (frameRenderError == null) {
+                            if (frameRenderError == null && pumpResult.renderedFrame) {
                                 onTimelineFrame?.invoke(surfaceProducer.id(), lastRenderedPtsUs / 1_000_000.0, currentGenerationId)
                             }
 
                             // Check completion/termination
                             val target = targetFrameCount
                             if (target != null && renderedFrames >= target) {
+                                freezeClockAt(lastRenderedPtsUs)
                                 activeFrameCallback = null
                                 val cb = pendingPlayCallback
                                 pendingPlayCallback = null
@@ -373,11 +408,42 @@ class AndroidDagTexturePlaybackControlSession(
                                     "lastPtsUs" to lastRenderedPtsUs,
                                     "raw" to "status=OK;target_reached;renderedFrames=$renderedFrames",
                                 ))
+                            } else if (pumpResult.playbackEndReached) {
+                                // Trim-end boundary reached: complete/EOS immediately regardless
+                                // of remaining queue state — the pump has already closed/drained
+                                // every boundary-or-later image it owned, so nothing is left
+                                // queued as normal playback state to wait on.
+                                if (target == null) {
+                                    onTimelineEOS?.invoke(surfaceProducer.id())
+                                }
+                                state = AndroidDagPlaybackState.Completed
+                                val freezePtsUs = playbackEndPtsUs?.let { boundary ->
+                                    minOf(lastRenderedPtsUs, boundary)
+                                } ?: lastRenderedPtsUs
+                                freezeClockAt(freezePtsUs)
+                                activeFrameCallback = null
+                                val cb = pendingPlayCallback
+                                pendingPlayCallback = null
+                                targetFrameCount = null
+                                val isPass = target == null || renderedFrames >= target
+                                val raw = if (isPass) {
+                                    "status=OK;completed=true;reason=playback_end_reached"
+                                } else {
+                                    "status=FAIL;reason=playback_end_before_target;renderedFrames=$renderedFrames;targetFrameCount=$target"
+                                }
+                                cb?.invoke(mapOf(
+                                    "pass" to isPass,
+                                    "state" to state.name,
+                                    "renderedFrames" to renderedFrames,
+                                    "lastPtsUs" to lastRenderedPtsUs,
+                                    "raw" to raw,
+                                ))
                             } else if (outputDone && imageQueue.isEmpty()) {
                                 if (target == null) {
                                     onTimelineEOS?.invoke(surfaceProducer.id())
                                 }
                                 state = AndroidDagPlaybackState.Completed
+                                freezeClockAt(lastRenderedPtsUs)
                                 activeFrameCallback = null
                                 val cb = pendingPlayCallback
                                 pendingPlayCallback = null
@@ -449,6 +515,7 @@ class AndroidDagTexturePlaybackControlSession(
                 choreographer?.removeFrameCallback(cb)
                 activeFrameCallback = null
             }
+            freezeClockAt(lastRenderedPtsUs)
 
             val pendingCb = pendingPlayCallback
             pendingPlayCallback = null
@@ -587,6 +654,10 @@ class AndroidDagTexturePlaybackControlSession(
 
                 // j. Resume or hold Paused
                 if (engineResult.pass) {
+                    val renderedOrTargetPts = if (engineResult.seekRenderedPtsUs >= 0) engineResult.seekRenderedPtsUs else targetPtsUs
+                    // Reset the pacing anchor to the seek-rendered PTS before any resumed playback.
+                    freezeClockAt(renderedOrTargetPts)
+
                     if (resumeAfterSeek) {
                         state = AndroidDagPlaybackState.Playing
                         play(null) { /* continuous */ }
@@ -594,7 +665,6 @@ class AndroidDagTexturePlaybackControlSession(
                         state = AndroidDagPlaybackState.Paused
                     }
 
-                    val renderedOrTargetPts = if (engineResult.seekRenderedPtsUs >= 0) engineResult.seekRenderedPtsUs else targetPtsUs
                     onTimelineFrame?.invoke(surfaceProducer.id(), renderedOrTargetPts / 1_000_000.0, engineResult.generationId)
 
                     onResult(mapOf(
@@ -645,6 +715,8 @@ class AndroidDagTexturePlaybackControlSession(
             try { choreographer?.removeFrameCallback(cb) } catch (_: Throwable) {}
             activeFrameCallback = null
         }
+        // Freeze the pacing clock so a stale anchor can't fast-forward a later resume/restore.
+        freezeClockAt(lastRenderedPtsUs)
         // 2. Invoke and clear pending play callback only when requested
         if (cancelPendingPlay) {
             val reason = if (targetState == AndroidDagPlaybackState.SurfaceLost) "surface_lost" else "session_disposed"
@@ -704,7 +776,11 @@ class AndroidDagTexturePlaybackControlSession(
      * Contract: Do NOT call getSurface() after this until the next onSurfaceAvailable.
      * Do NOT release MediaCodec / ImageReader / MediaExtractor / HandlerThread.
      */
-    private fun handleSurfaceCleanup() {
+    private fun handleSurfaceCleanup(countAsRealCallback: Boolean = false) {
+        if (countAsRealCallback) {
+            realSurfaceCleanupCallbackCount.incrementAndGet()
+            lastSurfaceLifecycleEvent = "real_cleanup"
+        }
         // Set flag immediately on platform thread so render loop abort is synchronous.
         surfaceLostFlag.set(true)
 
@@ -731,7 +807,11 @@ class AndroidDagTexturePlaybackControlSession(
      * this method keeps the spurious-available guard, nativeBridge null check, and all
      * session field / state assignments.
      */
-    private fun handleSurfaceAvailable() {
+    private fun handleSurfaceAvailable(countAsRealCallback: Boolean = false) {
+        if (countAsRealCallback) {
+            realSurfaceAvailableCallbackCount.incrementAndGet()
+            lastSurfaceLifecycleEvent = "real_available"
+        }
         val h = handler ?: return
         h.post {
             if (disposed.get() || state == AndroidDagPlaybackState.Failed) {
@@ -764,6 +844,10 @@ class AndroidDagTexturePlaybackControlSession(
                 outputDone = false
             }
 
+            // Clear the stale flag from the loss that triggered this restore so shouldCancel
+            // below only fires on a *new* cleanup/loss or disposal that happens during restore.
+            surfaceLostFlag.set(false)
+
             val result = AndroidDagSurfaceRecoveryHandler().restoreSurface(
                 surfaceProducer = surfaceProducer,
                 bridge = nb,
@@ -789,6 +873,8 @@ class AndroidDagTexturePlaybackControlSession(
                 currentGenerationId = result.generationId
                 renderedFrames = result.renderedFrames
                 lastRenderedPtsUs = result.lastRenderedPtsUs
+                // Re-anchor pacing to the actually-restored PTS (preroll may differ from the pre-loss PTS).
+                freezeClockAt(lastRenderedPtsUs)
                 surfaceLostFlag.set(false)
                 lastRestoreFailureReason = null
                 state = AndroidDagPlaybackState.Paused
@@ -815,6 +901,9 @@ class AndroidDagTexturePlaybackControlSession(
         "lastRenderedPtsUs" to lastRenderedPtsUs,
         "lastRestoreFailureReason" to lastRestoreFailureReason,
         "disposed" to disposed.get(),
+        "realSurfaceCleanupCallbackCount" to realSurfaceCleanupCallbackCount.get(),
+        "realSurfaceAvailableCallbackCount" to realSurfaceAvailableCallbackCount.get(),
+        "lastSurfaceLifecycleEvent" to lastSurfaceLifecycleEvent,
     )
 
     /**
@@ -824,6 +913,8 @@ class AndroidDagTexturePlaybackControlSession(
      */
     fun simulateSurfaceCleanup(onDone: ((Map<String, Any?>) -> Unit)? = null) {
         Log.d(TAG, "simulateSurfaceCleanup: diagnostic trigger")
+        // Simulated seam: does not touch the real-callback counters.
+        lastSurfaceLifecycleEvent = "simulated_cleanup"
         // Set flag synchronously then post the cleanup. After cleanup, post onDone if provided.
         surfaceLostFlag.set(true)
         val h = handler ?: run { onDone?.invoke(diagnosticState()); return }
@@ -849,7 +940,8 @@ class AndroidDagTexturePlaybackControlSession(
         val h = handler ?: run { onDone?.invoke(diagnosticState()); return }
         // handleSurfaceAvailable posts work onto h; the onDone post queued after it
         // executes in FIFO order, so onDone always fires after the restore is complete.
-        handleSurfaceAvailable()
+        // Simulated seam: countAsRealCallback=false keeps the real-callback counters untouched.
+        handleSurfaceAvailable(countAsRealCallback = false)
         h.post {
             onDone?.invoke(diagnosticState())
         }

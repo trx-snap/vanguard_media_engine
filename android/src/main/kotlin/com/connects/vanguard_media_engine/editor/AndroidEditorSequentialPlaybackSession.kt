@@ -11,49 +11,62 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 /**
+ * Trim/timeline timing for one clip in an editor preview sequence.
+ *
+ * Built by [AndroidEditorPlaybackCoordinator] from a validated VGClipDescriptor map (see
+ * vg_clip_descriptor.dart) and owned/consumed by [AndroidEditorSequentialPlaybackSession].
+ * All fields are microseconds. [sourceTrimStartUs] / [sourceTrimEndUs] are measured from the
+ * start of the source file at [sourcePath] (decoder/source-local PTS space); [timelineStartUs]
+ * is this clip's position on the global editor timeline. [timelineDurationUs] is this clip's
+ * contribution to the global timeline — for the 1.0x-speed-only clips this slice supports, it
+ * equals `sourceTrimEndUs - sourceTrimStartUs`.
+ */
+data class AndroidEditorClipPlaybackSpec(
+    val sourcePath: String,
+    val timelineStartUs: Long,
+    val sourceTrimStartUs: Long,
+    val sourceTrimEndUs: Long,
+    val timelineDurationUs: Long,
+)
+
+/**
  * Phase 7.8G-Android: sequential multi-clip editor playback session.
  *
- * Wraps exactly one active [AndroidDagTexturePlaybackControlSession] at a time
- * — one per plain local video clip in [clipSourcePaths] — reusing the same
- * [surfaceProducer] across clip switches, and maps clip-local decoder PTS onto
- * a single global timeline PTS (`globalPts = clipStartOffsetSeconds + localPts`).
+ * Wraps exactly one active [AndroidDagTexturePlaybackControlSession] at a time — one per plain
+ * local video clip in [clipSpecs] — reusing the same [surfaceProducer] across clip switches, and
+ * maps clip-local (source-file) decoder PTS onto a single global timeline PTS using each clip's
+ * [AndroidEditorClipPlaybackSpec] trim window, so trimmed drafts preserve clip trim/timeline
+ * timing instead of playing each clip's untrimmed full source.
  *
- * Clip layout is a plain concatenation of each clip's own full source
- * duration (no transitions, no trim window — matches the existing
- * single-clip route's parity, which likewise ignores trim). Cross-clip
- * transitions/overlays/audio-sidecar/transform features are rejected by
+ * Cross-clip transitions/overlays/audio-sidecar/transform/speed features are rejected by
  * [AndroidEditorPlaybackCoordinator] before this session is constructed.
  *
- * Ownership: [AndroidEditorPlaybackCoordinator] owns this session and the
- * [surfaceProducer]. This session never releases the [surfaceProducer] —
- * only the [AndroidDagTexturePlaybackControlSession] it wraps is disposed
- * and recreated on clip switches / disposal.
+ * Ownership: [AndroidEditorPlaybackCoordinator] owns this session and the [surfaceProducer].
+ * This session never releases the [surfaceProducer] — only the
+ * [AndroidDagTexturePlaybackControlSession] it wraps is disposed and recreated on clip
+ * switches / disposal.
  *
- * Concurrency: all orchestration (prepare / play / pause / seek / clip-switch
- * on EOS / dispose) is serialized on a single dedicated [HandlerThread] owned
- * by this session (`orchHandler`). Clip activation
- * ([activateClipBlocking]) blocks that thread until the wrapped session's
- * asynchronous prepare/seek callback fires (via [CountDownLatch]), so no two
- * activations — and no command racing an in-flight activation — can ever
- * observe or mutate [activeSession] / [activeClipIndex] concurrently. This
- * mirrors [AndroidDagTexturePlaybackControlSession]'s own single-HandlerThread
- * confinement, bridged across the extra thread hop that wrapping introduces.
+ * Concurrency: all orchestration (prepare / play / pause / seek / clip-switch on EOS / dispose)
+ * is serialized on a single dedicated [HandlerThread] owned by this session (`orchHandler`).
+ * Clip activation ([activateClipBlocking]) blocks that thread until the wrapped session's
+ * asynchronous prepare/seek callback fires (via [CountDownLatch]), so no two activations — and
+ * no command racing an in-flight activation — can ever observe or mutate [activeSession] /
+ * [activeClipIndex] concurrently. This mirrors [AndroidDagTexturePlaybackControlSession]'s own
+ * single-HandlerThread confinement, bridged across the extra thread hop that wrapping
+ * introduces.
  */
 class AndroidEditorSequentialPlaybackSession(
-    private val clipSourcePaths: List<String>,
+    private val clipSpecs: List<AndroidEditorClipPlaybackSpec>,
     private val surfaceProducer: TextureRegistry.SurfaceProducer,
     private val onTimelineFrame: (textureId: Long, ptsSeconds: Double, generationId: Long) -> Unit,
     private val onTimelineEOS: (textureId: Long) -> Unit,
 ) {
     companion object {
         private const val TAG = "EditorSeqPlaybackSession"
-    }
 
-    private data class ClipEntry(
-        val sourcePath: String,
-        val startOffsetUs: Long,
-        val durationUs: Long,
-    )
+        /** Tolerance for validating a clip's requested trimEnd against its inspected source duration. */
+        private const val TRIM_DURATION_TOLERANCE_US = 2_000L
+    }
 
     private val disposed = AtomicBoolean(false)
 
@@ -80,7 +93,6 @@ class AndroidEditorSequentialPlaybackSession(
     private var orchThread: HandlerThread? = null
     private var orchHandler: Handler? = null
 
-    private var clipEntries: List<ClipEntry> = emptyList()
     private var totalDurationUs: Long = 0L
     private var activeClipIndex: Int = -1
     private var activeSession: AndroidDagTexturePlaybackControlSession? = null
@@ -89,14 +101,16 @@ class AndroidEditorSequentialPlaybackSession(
     // ── prepare ────────────────────────────────────────────────────────────
 
     /**
-     * Inspects every clip (metadata only) to compute the cumulative timeline
-     * layout, then activates clip 0. [onResult] receives `{pass, textureId,
-     * width, height, durationUs, raw}` on success, matching the shape
+     * Inspects every clip (metadata only, verifying readability and that each clip's
+     * requested trim window fits within its actual source duration), computes the
+     * global timeline duration from [clipSpecs], then activates clip 0 (prerolling to
+     * its trim start when non-zero). [onResult] receives `{pass, textureId, width,
+     * height, durationUs, raw}` on success, matching the shape
      * [AndroidEditorPlaybackCoordinator] already expects from a single-clip
      * [AndroidDagTexturePlaybackControlSession.prepare].
      */
     fun prepare(onResult: (Map<String, Any?>) -> Unit) {
-        if (clipSourcePaths.isEmpty()) {
+        if (clipSpecs.isEmpty()) {
             onResult(mapOf("pass" to false, "raw" to "status=FAIL;reason=empty_clip_list"))
             return
         }
@@ -113,21 +127,26 @@ class AndroidEditorSequentialPlaybackSession(
                 return@post
             }
 
-            val entries = mutableListOf<ClipEntry>()
-            var cursorUs = 0L
-            for (path in clipSourcePaths) {
-                val inspection = AndroidDagSourceInspector().inspect(path)
+            for (spec in clipSpecs) {
+                val inspection = AndroidDagSourceInspector().inspect(spec.sourcePath)
                 try {
                     if (!inspection.pass) {
                         dispose(null)
                         onResult(mapOf(
                             "pass" to false,
-                            "raw" to "status=FAIL;reason=clip_inspect_failed;path=$path;detail=${inspection.failureReason}",
+                            "raw" to "status=FAIL;reason=clip_inspect_failed;path=${spec.sourcePath};detail=${inspection.failureReason}",
                         ))
                         return@post
                     }
-                    entries.add(ClipEntry(path, cursorUs, inspection.durationUs))
-                    cursorUs += inspection.durationUs
+                    if (spec.sourceTrimEndUs > inspection.durationUs + TRIM_DURATION_TOLERANCE_US) {
+                        dispose(null)
+                        onResult(mapOf(
+                            "pass" to false,
+                            "raw" to "status=FAIL;reason=trim_exceeds_source_duration;path=${spec.sourcePath};" +
+                                "trimEndUs=${spec.sourceTrimEndUs};sourceDurationUs=${inspection.durationUs}",
+                        ))
+                        return@post
+                    }
                 } finally {
                     // Metadata-only probe: release immediately. The active clip's own
                     // AndroidDagTexturePlaybackControlSession performs its own independent
@@ -136,10 +155,9 @@ class AndroidEditorSequentialPlaybackSession(
                 }
             }
 
-            clipEntries = entries
-            totalDurationUs = cursorUs
+            totalDurationUs = clipSpecs.maxOf { it.timelineStartUs + it.timelineDurationUs }
 
-            val activateResult = activateClipBlocking(0, seekLocalUs = null, resumeAfterSeek = false)
+            val activateResult = activateClipBlocking(0, explicitSourceSeekUs = null, resumeAfterSeek = false)
             val pass = activateResult["pass"] as? Boolean ?: false
             if (!pass) {
                 dispose(null)
@@ -155,7 +173,7 @@ class AndroidEditorSequentialPlaybackSession(
                 "width" to width,
                 "height" to height,
                 "durationUs" to totalDurationUs,
-                "raw" to "status=OK;clipCount=${entries.size};totalDurationUs=$totalDurationUs",
+                "raw" to "status=OK;clipCount=${clipSpecs.size};totalDurationUs=$totalDurationUs",
             ))
         }
     }
@@ -199,11 +217,11 @@ class AndroidEditorSequentialPlaybackSession(
     // ── seek ───────────────────────────────────────────────────────────────
 
     /**
-     * Maps [targetGlobalPtsUs] (global timeline microseconds) to a target
-     * clip + clip-local PTS. An intra-clip seek delegates directly to the
-     * active [AndroidDagTexturePlaybackControlSession]; a cross-clip seek
-     * switches the active session first (via [activateClipBlocking]) and then
-     * seeks the freshly-activated session to the local target.
+     * Maps [targetGlobalPtsUs] (global timeline microseconds) to a target clip + source-local
+     * PTS via [mapGlobalToSourcePts]. An intra-clip seek delegates directly to the active
+     * [AndroidDagTexturePlaybackControlSession]; a cross-clip seek switches the active session
+     * first (via [activateClipBlocking]) and then seeks the freshly-activated session to the
+     * mapped source-local target.
      */
     fun seek(targetGlobalPtsUs: Long, resumeAfterSeek: Boolean, onResult: (Map<String, Any?>) -> Unit) {
         val h = orchHandler
@@ -212,45 +230,76 @@ class AndroidEditorSequentialPlaybackSession(
             return
         }
         h.post {
-            if (disposed.get() || clipEntries.isEmpty()) {
+            if (disposed.get() || clipSpecs.isEmpty()) {
                 onResult(mapOf("pass" to false, "raw" to "status=FAIL;reason=session_disposed_or_uninitialized"))
                 return@post
             }
 
             val clampedUs = targetGlobalPtsUs.coerceIn(0L, (totalDurationUs - 1L).coerceAtLeast(0L))
             val targetIndex = resolveClipIndex(clampedUs)
-            val targetEntry = clipEntries[targetIndex]
-            val localTargetUs = clampedUs - targetEntry.startOffsetUs
+            val targetSpec = clipSpecs[targetIndex]
+            val sourceTargetUs = mapGlobalToSourcePts(clampedUs, targetSpec)
             isPlaying = resumeAfterSeek
 
             val activeNow = activeSession
             if (targetIndex == activeClipIndex && activeNow != null) {
-                activeNow.seek(localTargetUs, resumeAfterSeek) { seekResult ->
-                    onResult(translateSeekResult(seekResult, targetEntry))
+                activeNow.seek(sourceTargetUs, resumeAfterSeek) { seekResult ->
+                    onResult(translateSeekResult(seekResult, targetSpec))
                 }
             } else {
                 val activateResult = activateClipBlocking(
                     targetIndex,
-                    seekLocalUs = localTargetUs,
+                    explicitSourceSeekUs = sourceTargetUs,
                     resumeAfterSeek = resumeAfterSeek,
                 )
-                onResult(translateSeekResult(activateResult, targetEntry))
+                onResult(translateSeekResult(activateResult, targetSpec))
             }
         }
     }
 
+    /** Resolves [globalPtsUs] to the clip whose `[timelineStartUs, timelineStartUs + timelineDurationUs)` range contains it. */
     private fun resolveClipIndex(globalPtsUs: Long): Int {
         var idx = 0
-        for (i in clipEntries.indices) {
-            if (clipEntries[i].startOffsetUs <= globalPtsUs) idx = i else break
+        for (i in clipSpecs.indices) {
+            if (clipSpecs[i].timelineStartUs <= globalPtsUs) idx = i else break
         }
         return idx
     }
 
-    private fun translateSeekResult(result: Map<String, Any?>, entry: ClipEntry): Map<String, Any?> {
+    /**
+     * Maps a global timeline PTS to the corresponding source-local PTS for [spec], clamped to
+     * its trim window `[sourceTrimStartUs, sourceTrimEndUs)` so an out-of-range global target
+     * (e.g. the final-clip-inclusive end of the timeline) never produces a seek target at or
+     * past this clip's trim end.
+     */
+    private fun mapGlobalToSourcePts(globalPtsUs: Long, spec: AndroidEditorClipPlaybackSpec): Long {
+        val sourcePtsUs = spec.sourceTrimStartUs + (globalPtsUs - spec.timelineStartUs)
+        val maxSourceUs = (spec.sourceTrimEndUs - 1L).coerceAtLeast(spec.sourceTrimStartUs)
+        return sourcePtsUs.coerceIn(spec.sourceTrimStartUs, maxSourceUs)
+    }
+
+    /**
+     * Maps a source-local PTS back to the global timeline PTS for [spec], unclamped — used only
+     * for translating diagnostic seek-result fields, not for gating what is ever rendered.
+     */
+    private fun sourceToGlobalPtsRaw(sourcePtsUs: Long, spec: AndroidEditorClipPlaybackSpec): Long =
+        spec.timelineStartUs + (sourcePtsUs - spec.sourceTrimStartUs)
+
+    /**
+     * Maps a source-local PTS back to the global timeline PTS for [spec], clamped into this
+     * clip's timeline window so a decoder callback never surfaces a PTS outside the trimmed
+     * window to [onTimelineFrame].
+     */
+    private fun sourceToGlobalPtsClamped(sourcePtsUs: Long, spec: AndroidEditorClipPlaybackSpec): Long {
+        val globalPtsUs = sourceToGlobalPtsRaw(sourcePtsUs, spec)
+        val maxGlobalUs = (spec.timelineStartUs + spec.timelineDurationUs - 1L).coerceAtLeast(spec.timelineStartUs)
+        return globalPtsUs.coerceIn(spec.timelineStartUs, maxGlobalUs)
+    }
+
+    private fun translateSeekResult(result: Map<String, Any?>, spec: AndroidEditorClipPlaybackSpec): Map<String, Any?> {
         val out = result.toMutableMap()
-        (result["seekTargetUs"] as? Number)?.let { out["seekTargetUs"] = entry.startOffsetUs + it.toLong() }
-        (result["seekRenderedPtsUs"] as? Number)?.let { out["seekRenderedPtsUs"] = entry.startOffsetUs + it.toLong() }
+        (result["seekTargetUs"] as? Number)?.let { out["seekTargetUs"] = sourceToGlobalPtsRaw(it.toLong(), spec) }
+        (result["seekRenderedPtsUs"] as? Number)?.let { out["seekRenderedPtsUs"] = sourceToGlobalPtsRaw(it.toLong(), spec) }
         return out
     }
 
@@ -261,15 +310,19 @@ class AndroidEditorSequentialPlaybackSession(
      * (waiting for its teardown to fully complete — in particular, releasing
      * its [TextureRegistry.SurfaceProducer.SurfaceCallback] registration —
      * before the replacement session touches the shared [surfaceProducer]),
-     * then creates, prepares, and (optionally) seeks the session for
-     * `clipEntries[index]`. Blocks the calling thread on each async step via
+     * then creates, prepares, and preroll-seeks the session for
+     * `clipSpecs[index]`. When [explicitSourceSeekUs] is null, activation
+     * preroll-seeks to the clip's own `sourceTrimStartUs` if non-zero (so a
+     * default clip activation always lands on the trimmed-in frame); when
+     * non-null (an explicit cross-clip seek target), that value is used
+     * directly. Blocks the calling thread on each async step via
      * [CountDownLatch] so the whole activation is atomic from the perspective
      * of every other orchHandler-serialized command (no interleaved seek/play/
      * EOS-switch can observe a partially-activated state).
      */
     private fun activateClipBlocking(
         index: Int,
-        seekLocalUs: Long?,
+        explicitSourceSeekUs: Long?,
         resumeAfterSeek: Boolean,
     ): Map<String, Any?> {
         val old = activeSession
@@ -283,13 +336,12 @@ class AndroidEditorSequentialPlaybackSession(
         if (disposed.get()) {
             return mapOf("pass" to false, "raw" to "status=FAIL;reason=disposed")
         }
-        if (index !in clipEntries.indices) {
+        if (index !in clipSpecs.indices) {
             return mapOf("pass" to false, "raw" to "status=FAIL;reason=clip_index_out_of_range;index=$index")
         }
 
         val mySessionToken = sessionToken.incrementAndGet()
-        val entry = clipEntries[index]
-        val startOffsetSeconds = entry.startOffsetUs / 1_000_000.0
+        val spec = clipSpecs[index]
 
         // Tracks the wrapped session's own inner `generationId` (bumped by it on
         // every internal seek) so a change can be detected and translated into a
@@ -301,7 +353,7 @@ class AndroidEditorSequentialPlaybackSession(
         var sessionPublicGeneration = 0L
 
         val newSession = AndroidDagTexturePlaybackControlSession(
-            videoPath = entry.sourcePath,
+            videoPath = spec.sourcePath,
             surfaceProducer = surfaceProducer,
             onTimelineFrame = { textureId, localPtsSeconds, innerGenerationId ->
                 if (sessionToken.get() == mySessionToken) {
@@ -309,7 +361,9 @@ class AndroidEditorSequentialPlaybackSession(
                         lastInnerGeneration = innerGenerationId
                         sessionPublicGeneration = publicGeneration.incrementAndGet()
                     }
-                    onTimelineFrame(textureId, startOffsetSeconds + localPtsSeconds, sessionPublicGeneration)
+                    val sourcePtsUs = Math.round(localPtsSeconds * 1_000_000.0)
+                    val globalPtsUs = sourceToGlobalPtsClamped(sourcePtsUs, spec)
+                    onTimelineFrame(textureId, globalPtsUs / 1_000_000.0, sessionPublicGeneration)
                 }
             },
             onTimelineEOS = { _ ->
@@ -319,6 +373,7 @@ class AndroidEditorSequentialPlaybackSession(
                     }
                 }
             },
+            playbackEndPtsUs = spec.sourceTrimEndUs,
         )
 
         activeSession = newSession
@@ -336,10 +391,12 @@ class AndroidEditorSequentialPlaybackSession(
         if (!preparePass) {
             return prepareResult
         }
-        if (seekLocalUs == null || seekLocalUs <= 0L) {
-            // Already at (or targeting) local PTS 0 — no explicit seek needed, since
-            // a freshly prepared session starts decoding from the beginning of the
-            // file. Still honor a requested resume-after-activation.
+
+        val seekTargetUs = explicitSourceSeekUs ?: if (spec.sourceTrimStartUs > 0L) spec.sourceTrimStartUs else null
+        if (seekTargetUs == null) {
+            // Already at (and this clip's trim start is) source PTS 0 — no explicit seek
+            // needed, since a freshly prepared session starts decoding from the beginning
+            // of the file. Still honor a requested resume-after-activation.
             if (resumeAfterSeek) {
                 newSession.play(null) { /* continuous playback; callbacks drive state */ }
             }
@@ -348,19 +405,22 @@ class AndroidEditorSequentialPlaybackSession(
 
         val seekLatch = CountDownLatch(1)
         var seekResult: Map<String, Any?> = emptyMap()
-        newSession.seek(seekLocalUs, resumeAfterSeek) { r ->
+        newSession.seek(seekTargetUs, resumeAfterSeek) { r ->
             seekResult = r
             seekLatch.countDown()
         }
         seekLatch.await()
-        return seekResult
+        // seekResult lacks the prepared textureId/width/height/durationUs (seek's map only
+        // carries seek-specific fields); merge so callers still see prepared metadata alongside
+        // the post-seek state/raw/generationId, which take priority via the right-hand overlay.
+        return prepareResult + seekResult
     }
 
     /** Must be called from [orchHandler]. Handles non-final vs. final clip EOS. */
     private fun handleClipEOS(finishedIndex: Int) {
         if (disposed.get()) return
 
-        if (finishedIndex >= clipEntries.size - 1) {
+        if (finishedIndex >= clipSpecs.size - 1) {
             // Final clip EOS: preserve the completed session (holds last frame),
             // matching the single-clip route's Completed-state behavior.
             isPlaying = false
@@ -369,7 +429,7 @@ class AndroidEditorSequentialPlaybackSession(
         }
 
         val wasPlaying = isPlaying
-        val activateResult = activateClipBlocking(finishedIndex + 1, seekLocalUs = null, resumeAfterSeek = false)
+        val activateResult = activateClipBlocking(finishedIndex + 1, explicitSourceSeekUs = null, resumeAfterSeek = false)
         val pass = activateResult["pass"] as? Boolean ?: false
         if (!pass) {
             isPlaying = false

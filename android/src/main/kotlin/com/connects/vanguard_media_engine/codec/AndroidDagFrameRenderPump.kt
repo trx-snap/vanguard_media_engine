@@ -21,6 +21,14 @@ data class AndroidDagFrameRenderPumpResult(
     val renderedFrames: Int,
     val lastRenderedPtsUs: Long,
     val frameRenderError: String?,
+    /** True only when this pumpOnce call actually rendered a new frame (localRenderedFrames incremented). */
+    val renderedFrame: Boolean,
+    /**
+     * True when the next decoded frame's PTS is at or beyond [AndroidDagFrameRenderPump.pumpOnce]'s
+     * `sourceEndPtsUs` boundary. The frame is left queued (unrendered, unclosed) rather than
+     * dropped, since the caller is expected to terminate/dispose shortly after this fires.
+     */
+    val playbackEndReached: Boolean = false,
 )
 
 /**
@@ -41,6 +49,9 @@ class AndroidDagFrameRenderPump {
 
     companion object {
         private const val TAG = "DagFrameRenderPump"
+
+        /** Tolerance for treating a slightly-early decoded frame as "due" for render. */
+        const val DEFAULT_DUE_TOLERANCE_US = 2_000L
     }
 
     fun pumpOnce(
@@ -59,12 +70,18 @@ class AndroidDagFrameRenderPump {
         outputDone: Boolean,
         renderedFrames: Int,
         lastRenderedPtsUs: Long,
+        /** Media-clock PTS (us) up to which a decoded frame is considered due; null = no pacing gate. */
+        dueMediaPtsUs: Long? = null,
+        dueToleranceUs: Long = DEFAULT_DUE_TOLERANCE_US,
+        /** Trim-end boundary (source PTS, us); frames at/after this are never rendered. Null = untrimmed. */
+        sourceEndPtsUs: Long? = null,
     ): AndroidDagFrameRenderPumpResult {
         var localInputDone = inputDone
         var localOutputDone = outputDone
         var localRenderedFrames = renderedFrames
         var localLastRenderedPtsUs = lastRenderedPtsUs
         var localFrameRenderError: String? = null
+        var localRenderedFrame = false
 
         // Feed MediaCodec input buffers
         while (!localInputDone) {
@@ -104,8 +121,29 @@ class AndroidDagFrameRenderPump {
             }
         }
 
-        // Render at most ONE frame per call
-        val image: Image? = imageQueue.poll()
+        // Render at most ONE frame per call, and only once its PTS is due per the playback clock.
+        // Peek first so an early frame is left queued (not dropped) until its due time arrives.
+        val peeked = imageQueue.peek()
+        val peekedPtsUs = peeked?.timestamp?.div(1000L)
+        val hitPlaybackEnd = peekedPtsUs != null && sourceEndPtsUs != null && peekedPtsUs >= sourceEndPtsUs
+        val image: Image? = if (peeked != null && !hitPlaybackEnd &&
+            (dueMediaPtsUs == null || peekedPtsUs!! <= dueMediaPtsUs + dueToleranceUs)
+        ) {
+            imageQueue.poll()
+        } else {
+            null
+        }
+        if (hitPlaybackEnd) {
+            // Trim-end boundary reached: this pump owns every queued image at/after the
+            // boundary (decode order is PTS-monotonic, so nothing behind the peeked frame
+            // is before it) and must close/drain them here rather than leaving them queued
+            // as normal playback state — the caller completes on playbackEndReached and
+            // must never observe or render a boundary-or-later frame from this queue.
+            while (true) {
+                val queuedImage = imageQueue.poll() ?: break
+                try { queuedImage.close() } catch (_: Throwable) {}
+            }
+        }
         if (image != null) {
             var hwBuf: HardwareBuffer? = null
             try {
@@ -145,6 +183,7 @@ class AndroidDagFrameRenderPump {
 
                         if (renderStr.startsWith("status=PASS;")) {
                             localRenderedFrames++
+                            localRenderedFrame = true
                         } else {
                             Log.w(TAG, "renderFrame FAIL at index $localRenderedFrames: $renderStr")
                             localFrameRenderError = renderStr
@@ -163,6 +202,8 @@ class AndroidDagFrameRenderPump {
             renderedFrames = localRenderedFrames,
             lastRenderedPtsUs = localLastRenderedPtsUs,
             frameRenderError = localFrameRenderError,
+            renderedFrame = localRenderedFrame,
+            playbackEndReached = hitPlaybackEnd,
         )
     }
 }

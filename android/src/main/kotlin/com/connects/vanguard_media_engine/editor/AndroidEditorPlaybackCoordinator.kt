@@ -28,6 +28,12 @@ class AndroidEditorPlaybackCoordinator(
     companion object {
         private const val TAG = "EditorPlaybackCoord"
 
+        /** Tolerance (seconds) for a clip's trimEndSeconds vs. its declared durationSeconds. */
+        private const val TRIM_DURATION_TOLERANCE_SECONDS = 0.002
+
+        /** Tolerance (us) for advisory wire startTimeSeconds vs. the computed sequential cursor. */
+        private const val STARTTIME_TOLERANCE_US = 1_000L
+
         private val OWNED_METHODS = setOf(
             "createTimelineTexture",
             "updateTimeline",
@@ -91,7 +97,11 @@ class AndroidEditorPlaybackCoordinator(
             return
         }
 
-        val sourcePaths = mutableListOf<String>()
+        val clipSpecs = mutableListOf<AndroidEditorClipPlaybackSpec>()
+        // Native layout is a running cursor over each clip's derived timeline duration —
+        // not the wire startTimeSeconds, which VGEditorDraft may leave at 0.0 for every
+        // clip. See correction below where each clip is appended.
+        var cursorUs = 0L
         for (rawClip in clips) {
             val clip = rawClip as? Map<*, *>
             if (clip == null) {
@@ -137,7 +147,94 @@ class AndroidEditorPlaybackCoordinator(
                 result.error("FILE_UNREADABLE", "sourcePath is not readable: $sourcePath", null)
                 return
             }
-            sourcePaths.add(sourcePath)
+
+            // Timing/trim fields are unconditionally present in VGClipDescriptor.toMap()
+            // (see vg_clip_descriptor.dart:604-614). speed != 1.0 is rejected here because
+            // speed audio/video parity is not part of this slice.
+            val speed = (clip["speed"] as? Number)?.toDouble()
+            if (speed == null || !speed.isFinite()) {
+                result.error("INVALID_CLIP", "clip \"${clip["id"]}\" has a missing or non-finite speed", null)
+                return
+            }
+            if (speed != 1.0) {
+                result.error(
+                    "UNSUPPORTED_TIMELINE_FEATURE",
+                    "clip \"${clip["id"]}\" uses speed=$speed, which is not supported in this slice",
+                    null,
+                )
+                return
+            }
+
+            val startTimeSeconds = (clip["startTimeSeconds"] as? Number)?.toDouble()
+            val durationSeconds = (clip["durationSeconds"] as? Number)?.toDouble()
+            val trimStartSeconds = (clip["trimStartSeconds"] as? Number)?.toDouble()
+            val trimEndSeconds = (clip["trimEndSeconds"] as? Number)?.toDouble()
+            if (startTimeSeconds == null || !startTimeSeconds.isFinite() ||
+                durationSeconds == null || !durationSeconds.isFinite() ||
+                trimStartSeconds == null || !trimStartSeconds.isFinite() ||
+                trimEndSeconds == null || !trimEndSeconds.isFinite()
+            ) {
+                result.error("INVALID_CLIP", "clip \"${clip["id"]}\" has missing or non-finite timing fields", null)
+                return
+            }
+            if (startTimeSeconds < 0.0) {
+                result.error("INVALID_CLIP", "clip \"${clip["id"]}\" startTimeSeconds must be >= 0", null)
+                return
+            }
+            // durationSeconds is the clip's full source duration, not its timeline
+            // contribution, and 0.0 is a documented sentinel for "unknown duration" —
+            // AndroidDagSourceInspector validates the real source duration against the
+            // trim window once this clip becomes active (see
+            // AndroidEditorSequentialPlaybackSession.prepare).
+            if (trimStartSeconds < 0.0) {
+                result.error("INVALID_CLIP", "clip \"${clip["id"]}\" trimStartSeconds must be >= 0", null)
+                return
+            }
+            if (trimEndSeconds <= trimStartSeconds) {
+                result.error("INVALID_CLIP", "clip \"${clip["id"]}\" trimEndSeconds must be > trimStartSeconds", null)
+                return
+            }
+            if (durationSeconds > 0.0 && trimEndSeconds > durationSeconds + TRIM_DURATION_TOLERANCE_SECONDS) {
+                result.error(
+                    "INVALID_CLIP",
+                    "clip \"${clip["id"]}\" trimEndSeconds exceeds durationSeconds",
+                    null,
+                )
+                return
+            }
+
+            val sourceTrimStartUs = (trimStartSeconds * 1_000_000.0).toLong()
+            val sourceTrimEndUs = (trimEndSeconds * 1_000_000.0).toLong()
+            val timelineDurationUs = sourceTrimEndUs - sourceTrimStartUs
+            if (timelineDurationUs <= 0L) {
+                result.error("INVALID_CLIP", "clip \"${clip["id"]}\" has a non-positive trim duration", null)
+                return
+            }
+
+            // Wire startTimeSeconds is advisory only: reject a non-zero value that
+            // disagrees with the computed sequential cursor by more than 1ms, but never
+            // treat it as authoritative layout (multiple clips may all report 0.0).
+            val wireStartTimeUs = (startTimeSeconds * 1_000_000.0).toLong()
+            if (startTimeSeconds != 0.0 && Math.abs(wireStartTimeUs - cursorUs) > STARTTIME_TOLERANCE_US) {
+                result.error(
+                    "INVALID_CLIP",
+                    "clip \"${clip["id"]}\" startTimeSeconds=$startTimeSeconds disagrees with " +
+                        "computed sequential position ${cursorUs / 1_000_000.0}",
+                    null,
+                )
+                return
+            }
+
+            clipSpecs.add(
+                AndroidEditorClipPlaybackSpec(
+                    sourcePath = sourcePath,
+                    timelineStartUs = cursorUs,
+                    sourceTrimStartUs = sourceTrimStartUs,
+                    sourceTrimEndUs = sourceTrimEndUs,
+                    timelineDurationUs = timelineDurationUs,
+                ),
+            )
+            cursorUs += timelineDurationUs
         }
 
         // 'audioSidecar' is present in VGEditorDraft.toMap() only when a plan is
@@ -158,7 +255,7 @@ class AndroidEditorPlaybackCoordinator(
                 track["role"] == "original" &&
                     trackId != null && trackId.startsWith("original-") &&
                     !url.isNullOrBlank() &&
-                    sourcePaths.contains(url)
+                    clipSpecs.any { it.sourcePath == url }
             }
             if (!isDerivedOriginalOnly) {
                 result.error(
@@ -177,7 +274,7 @@ class AndroidEditorPlaybackCoordinator(
             val textureId = surfaceProducer.id()
 
             val session = AndroidEditorSequentialPlaybackSession(
-                clipSourcePaths = sourcePaths,
+                clipSpecs = clipSpecs,
                 surfaceProducer = surfaceProducer,
                 onTimelineFrame = { id, ptsSeconds, generationId ->
                     mainHandler.post {
