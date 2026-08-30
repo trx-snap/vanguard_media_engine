@@ -50,6 +50,8 @@ object AndroidAudioFoundationSmokeHarness {
     private const val MIXDOWN_FILE = "mixdown.mp4"
     private const val DUCKING_MIXDOWN_AUDIO_FILE = "ducking_mixdown_audio.m4a"
     private const val DUCKING_MIXDOWN_FILE = "ducking_mixdown.mp4"
+    private const val MULTITRACK_MIXDOWN_AUDIO_FILE = "multitrack_mixdown_audio.m4a"
+    private const val MULTITRACK_MIXDOWN_FILE = "multitrack_mixdown.mp4"
 
     fun run(videoPath: String, audioPath: String, outputDir: String): Map<String, Any?> {
         var raw = "status=FAIL;reason=not_run"
@@ -57,19 +59,19 @@ object AndroidAudioFoundationSmokeHarness {
             if (!File(videoPath).exists() || !File(audioPath).exists()) {
                 raw = "status=FAIL;reason=input_fixture_missing;" +
                     "videoPath=$videoPath;audioPath=$audioPath"
-                return overallResult(false, raw, null, null, null)
+                return overallResult(false, raw, null, null, null, null)
             }
             val outDir = File(outputDir)
             if (!outDir.isDirectory) {
                 raw = "status=FAIL;reason=output_dir_missing;outputDir=$outputDir"
-                return overallResult(false, raw, null, null, null)
+                return overallResult(false, raw, null, null, null, null)
             }
 
             val audioDurationSec = probeAudioDurationSeconds(audioPath)
             if (audioDurationSec < 1.0) {
                 raw = "status=FAIL;reason=fixture_audio_too_short;" +
                     "durationSec=$audioDurationSec"
-                return overallResult(false, raw, null, null, null)
+                return overallResult(false, raw, null, null, null, null)
             }
 
             // Remove stale generated outputs from previous runs; the input
@@ -81,21 +83,26 @@ object AndroidAudioFoundationSmokeHarness {
                 MIXDOWN_FILE,
                 DUCKING_MIXDOWN_AUDIO_FILE,
                 DUCKING_MIXDOWN_FILE,
+                MULTITRACK_MIXDOWN_AUDIO_FILE,
+                MULTITRACK_MIXDOWN_FILE,
             )
 
             val directCopy = runDirectCopyScenario(videoPath, audioPath, audioDurationSec, outDir)
             val pcmMixdown = runPcmMixdownScenario(videoPath, audioPath, audioDurationSec, outDir)
             val duckingMixdown = runDuckingMixdownScenario(videoPath, audioPath, audioDurationSec, outDir)
+            val multitrackMixdown = runMultitrackMixdownScenario(videoPath, audioPath, audioDurationSec, outDir)
 
             val directCopyPass = directCopy["pass"] == true
             val pcmMixdownPass = pcmMixdown["pass"] == true
             val duckingMixdownPass = duckingMixdown["pass"] == true
-            val pass = directCopyPass && pcmMixdownPass && duckingMixdownPass
+            val multitrackMixdownPass = multitrackMixdown["pass"] == true
+            val pass = directCopyPass && pcmMixdownPass && duckingMixdownPass && multitrackMixdownPass
             raw = (if (pass) "status=PASS;" else "status=FAIL;") +
                 "directCopy=${directCopy["raw"]};pcmMixdown=${pcmMixdown["raw"]};" +
                 "duckingMixdown=${duckingMixdown["raw"]};" +
+                "multitrackMixdown=${multitrackMixdown["raw"]};" +
                 "fixtureAudioDurationSec=$audioDurationSec"
-            return overallResult(pass, raw, directCopy, pcmMixdown, duckingMixdown)
+            return overallResult(pass, raw, directCopy, pcmMixdown, duckingMixdown, multitrackMixdown)
         } catch (t: Throwable) {
             val reason = t.javaClass.simpleName.ifEmpty { "unknown_exception" }
             raw = "status=FAIL;reason=exception:$reason"
@@ -107,8 +114,10 @@ object AndroidAudioFoundationSmokeHarness {
                 MIXDOWN_FILE,
                 DUCKING_MIXDOWN_AUDIO_FILE,
                 DUCKING_MIXDOWN_FILE,
+                MULTITRACK_MIXDOWN_AUDIO_FILE,
+                MULTITRACK_MIXDOWN_FILE,
             )
-            return overallResult(false, raw, null, null, null)
+            return overallResult(false, raw, null, null, null, null)
         } finally {
             Log.i(TAG, "$RESULT_MARKER $raw")
         }
@@ -563,6 +572,223 @@ object AndroidAudioFoundationSmokeHarness {
         )
     }
 
+    // ── Scenario 4: multitrack mixdown (P4-MULTITRACK-EXPORT) ─────────────────
+
+    private fun runMultitrackMixdownScenario(
+        videoPath: String,
+        audioPath: String,
+        audioDurationSec: Double,
+        outDir: File,
+    ): Map<String, Any?> {
+        val mixedAudioPath = File(outDir, MULTITRACK_MIXDOWN_AUDIO_FILE).path
+        val outputPath = File(outDir, MULTITRACK_MIXDOWN_FILE).path
+        val mixDurationSec = minOf(audioDurationSec, 3.0)
+
+        if (audioDurationSec < 2.0) {
+            return scenarioFailure(
+                "multitrackMixdown",
+                "fixture_audio_too_short_for_multitrack:durationSec=$audioDurationSec",
+                outputPath,
+            )
+        }
+
+        // Direct chunk-mixer preflight assertion: 9 synthetic 1-frame tracks
+        // must fail closed with overlap_depth_exceeded:9 and chunkCount=0 before native create.
+        val syntheticEnvelope = AndroidAudioVolumeEnvelope.fromStatic(
+            volume = 1.0,
+            mixGain = 1.0,
+            fadeInSeconds = 0.0,
+            fadeOutSeconds = 0.0,
+            trackStartSec = 0.0,
+            trackEndSec = 1.0,
+        )
+        val syntheticTracks = (0 until 9).map { i ->
+            AndroidNativeAudioMixBusChunkMixer.ChunkTrackInput(
+                trackId = "synthetic_$i",
+                startFrame = 0,
+                pcm = shortArrayOf(100),
+                srcChannelCount = 1,
+                frameCount = 1,
+                envelope = syntheticEnvelope,
+            )
+        }
+        val preflight = AndroidNativeAudioMixBusChunkMixer.mix(
+            tracks = syntheticTracks,
+            outputSampleRate = 48000,
+            outputChannelCount = 1,
+            totalFrames = 1,
+        )
+        val preflightPass = !preflight.success &&
+            preflight.reason == "overlap_depth_exceeded:9" &&
+            preflight.chunkCount == 0
+        if (!preflightPass) {
+            return scenarioFailure(
+                "multitrackMixdown",
+                "preflight_overlap_depth_rejection_failed:reason=${preflight.reason};chunks=${preflight.chunkCount}",
+                outputPath,
+            )
+        }
+
+        // Timeline tracks:
+        // music at 0.0 for mixDurationSec with ducking-style keyframes
+        val epsilon = 1e-6
+        val musicKeyframeMaps = mutableListOf(
+            mapOf("time" to 0.0, "volume" to 1.0),
+            mapOf("time" to 0.35, "volume" to 1.0),
+            mapOf("time" to 0.5, "volume" to 0.4),
+            mapOf("time" to 1.8, "volume" to 0.4),
+            mapOf("time" to 2.0, "volume" to 1.0),
+        )
+        if (mixDurationSec > 2.0 + epsilon) {
+            musicKeyframeMaps.add(mapOf("time" to mixDurationSec, "volume" to 1.0))
+        }
+
+        val musicTrack = mapOf(
+            "trackId" to "unitP4_mt_music",
+            "url" to audioPath,
+            "startTime" to 0.0,
+            "duration" to mixDurationSec,
+            "volume" to 1.0,
+            "role" to "music",
+            "volumeKeyframes" to musicKeyframeMaps,
+        )
+
+        val voDuration = minOf(1.5, mixDurationSec - 0.5)
+        val voTrack = mapOf(
+            "trackId" to "unitP4_mt_voiceover",
+            "url" to audioPath,
+            "startTime" to 0.5,
+            "duration" to voDuration,
+            "volume" to 1.0,
+            "role" to "voiceover",
+        )
+
+        val sfx1Duration = minOf(0.6, mixDurationSec - 0.8)
+        val sfx1Track = mapOf(
+            "trackId" to "unitP4_mt_sfx1",
+            "url" to audioPath,
+            "startTime" to 0.8,
+            "duration" to sfx1Duration,
+            "volume" to 0.8,
+            "role" to "sfx",
+        )
+
+        val sfx2Duration = minOf(0.6, mixDurationSec - 1.2)
+        val sfx2Track = mapOf(
+            "trackId" to "unitP4_mt_sfx2",
+            "url" to audioPath,
+            "startTime" to 1.2,
+            "duration" to sfx2Duration,
+            "volume" to 0.7,
+            "role" to "sfx",
+        )
+
+        // 1. Parse exactly 4 valid specs and zero skipped.
+        val (specs, skippedIndices) = AndroidAudioTrackSpec.parseList(
+            listOf(musicTrack, voTrack, sfx1Track, sfx2Track),
+        )
+        if (specs.size != 4 || skippedIndices.isNotEmpty()) {
+            return scenarioFailure(
+                "multitrackMixdown",
+                "parser_evidence_mismatch:parsed=${specs.size};skipped=${skippedIndices.size}",
+                outputPath,
+            )
+        }
+
+        // 2. Direct-copy validator over all four specs must be ineligible with exact reason active_track_count=4.
+        val directCopyVerdict = AndroidAudioDirectCopyValidator.validate(specs)
+        if (directCopyVerdict.eligible || directCopyVerdict.reason != "active_track_count=4") {
+            return scenarioFailure(
+                "multitrackMixdown",
+                "validator_reason_mismatch:eligible=${directCopyVerdict.eligible};reason=${directCopyVerdict.reason}",
+                outputPath,
+                extra = mapOf(
+                    "eligible" to directCopyVerdict.eligible,
+                    "eligibilityReason" to directCopyVerdict.reason,
+                ),
+            )
+        }
+
+        // 3. Run AndroidAudioMixdownEngine.mix(specs).
+        val mix = AndroidAudioMixdownEngine.mix(specs)
+        if (!mix.success || mix.pcm == null) {
+            return scenarioFailure("multitrackMixdown", "mixdown_failed:${mix.reason}", outputPath)
+        }
+        if (!mix.nativeMixBusUsed || mix.nativeChunkCount <= 0 || mix.nativeMixReason != "success" || mix.mixedTrackCount != 4) {
+            return scenarioFailure(
+                "multitrackMixdown",
+                "native_mix_bus_evidence_missing:used=${mix.nativeMixBusUsed};" +
+                    "chunks=${mix.nativeChunkCount};nativeReason=${mix.nativeMixReason};mixedTracks=${mix.mixedTrackCount}",
+                outputPath,
+            )
+        }
+
+        // 4. AAC Encode to M4A.
+        val encode = AndroidAacEncoder.encodePcm16ToM4a(
+            pcm = mix.pcm,
+            sampleRate = mix.sampleRate,
+            channelCount = mix.channelCount,
+            outputPath = mixedAudioPath,
+        )
+        if (!encode.success || encode.outputSizeBytes <= 0L || encode.encodedSamples <= 0) {
+            deleteGenerated(outDir, MULTITRACK_MIXDOWN_AUDIO_FILE)
+            return scenarioFailure("multitrackMixdown", "aac_encode_failed:${encode.reason}", outputPath)
+        }
+
+        // 5. Remux with fixture video.
+        val remux = AndroidAudioRemuxer.remux(
+            videoPath = videoPath,
+            audioPath = mixedAudioPath,
+            finalPath = outputPath,
+        )
+        val pass = remux.success &&
+            remux.videoSamples > 0 &&
+            remux.audioSamples > 0 &&
+            remux.outputSizeBytes > 0L
+        if (!pass) {
+            deleteGenerated(outDir, MULTITRACK_MIXDOWN_AUDIO_FILE, MULTITRACK_MIXDOWN_FILE)
+        }
+
+        val raw = if (pass) {
+            "ok(preflightNineTrackOverlapReason=${preflight.reason},preflightPass=$preflightPass," +
+                "directCopyEligible=false,directCopyReason=${directCopyVerdict.reason}," +
+                "mixedTracks=${mix.mixedTrackCount},nativeMixBusUsed=${mix.nativeMixBusUsed}," +
+                "nativeChunkCount=${mix.nativeChunkCount},nativeSilentChunks=${mix.nativeSilentChunks}," +
+                "nativeGainClamped=${mix.nativeGainClamped},aacSamples=${encode.encodedSamples}," +
+                "video=${remux.videoSamples},audio=${remux.audioSamples}," +
+                "bytes=${remux.outputSizeBytes})"
+        } else {
+            "fail(pass2_remux:${remux.reason};video=${remux.videoSamples};audio=${remux.audioSamples})"
+        }
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "eligible" to false,
+            "eligibilityReason" to directCopyVerdict.reason,
+            "preflightPass" to preflightPass,
+            "preflightReason" to preflight.reason,
+            "mixedTrackCount" to mix.mixedTrackCount,
+            "skippedInvalidTracks" to skippedIndices.size,
+            "skippedDecodeTracks" to mix.skippedTracks,
+            "sampleRate" to mix.sampleRate,
+            "channelCount" to mix.channelCount,
+            "frameCount" to mix.frameCount,
+            "nativeMixBusUsed" to mix.nativeMixBusUsed,
+            "nativeChunkCount" to mix.nativeChunkCount,
+            "nativeSilentChunks" to mix.nativeSilentChunks,
+            "nativeMixReason" to mix.nativeMixReason,
+            "nativeGainClamped" to mix.nativeGainClamped,
+            "encodedSamples" to encode.encodedSamples,
+            "mixedAudioPath" to mixedAudioPath,
+            "mixedAudioSize" to encode.outputSizeBytes,
+            "outputPath" to outputPath,
+            "outputSize" to remux.outputSizeBytes,
+            "videoSamples" to remux.videoSamples,
+            "audioSamples" to remux.audioSamples,
+        )
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun probeAudioDurationSeconds(path: String): Double {
@@ -621,11 +847,13 @@ object AndroidAudioFoundationSmokeHarness {
         directCopy: Map<String, Any?>?,
         pcmMixdown: Map<String, Any?>?,
         duckingMixdown: Map<String, Any?>?,
+        multitrackMixdown: Map<String, Any?>?,
     ): Map<String, Any?> = mapOf(
         "pass" to pass,
         "raw" to raw,
         "directCopy" to directCopy,
         "pcmMixdown" to pcmMixdown,
         "duckingMixdown" to duckingMixdown,
+        "multitrackMixdown" to multitrackMixdown,
     )
 }

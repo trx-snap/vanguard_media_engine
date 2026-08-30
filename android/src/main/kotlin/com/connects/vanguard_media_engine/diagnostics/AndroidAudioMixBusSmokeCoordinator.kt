@@ -87,11 +87,16 @@ class AndroidAudioMixBusSmokeCoordinator(
                     laneNegativeDownmixDivision(nativeBridge),
                     laneShorterTrackSilence(nativeBridge),
                     laneLongerTrackShortWindowMix(nativeBridge),
+                    laneFourTrackDeterministicMix(nativeBridge),
+                    laneNoPrematureClip(nativeBridge),
+                    laneFinalSaturation(nativeBridge),
+                    laneEightTrackCapacity(nativeBridge),
                     laneInvalidGainRejection(nativeBridge),
                     laneNonFiniteGainRejection(nativeBridge),
                     laneSampleRateMismatchRejection(nativeBridge),
                     laneInsufficientOutputCapacityRejection(nativeBridge),
                     laneInvalidSessionRejection(nativeBridge),
+                    laneNineTrackReject(nativeBridge),
                     laneDestroyAndIdempotentDestroy(nativeBridge),
                 )
 
@@ -269,6 +274,57 @@ class AndroidAudioMixBusSmokeCoordinator(
         )
     }
 
+    private fun laneFourTrackDeterministicMix(bridge: VanguardNativeBridge): LaneResult {
+        val tracks = listOf(
+            TrackSpec(pcm = shortArrayOf(1000, -2000, 3000), frameCount = 3, sampleRate = 48000, channelCount = 1, gain = 1.0),
+            TrackSpec(pcm = shortArrayOf(10, 20, 30), frameCount = 3, sampleRate = 48000, channelCount = 1, gain = 1.0),
+            TrackSpec(pcm = shortArrayOf(-100, 200, -300), frameCount = 3, sampleRate = 48000, channelCount = 1, gain = 1.0),
+            TrackSpec(pcm = shortArrayOf(1, 2, 3), frameCount = 3, sampleRate = 48000, channelCount = 1, gain = 1.0),
+        )
+        return runSuccessMixLane(
+            bridge, "fourTrackDeterministicMix",
+            nodeSampleRate = 48000, nodeChannelCount = 1, maxFramesPerMix = 4,
+            tracks = tracks, framesToMix = 3,
+        )
+    }
+
+    private fun laneNoPrematureClip(bridge: VanguardNativeBridge): LaneResult {
+        val tracks = listOf(
+            TrackSpec(pcm = shortArrayOf(28000), frameCount = 1, sampleRate = 48000, channelCount = 1, gain = 1.0),
+            TrackSpec(pcm = shortArrayOf(20000), frameCount = 1, sampleRate = 48000, channelCount = 1, gain = 1.0),
+            TrackSpec(pcm = shortArrayOf(-25000), frameCount = 1, sampleRate = 48000, channelCount = 1, gain = 1.0),
+        )
+        return runSuccessMixLane(
+            bridge, "noPrematureClip",
+            nodeSampleRate = 48000, nodeChannelCount = 1, maxFramesPerMix = 2,
+            tracks = tracks, framesToMix = 1,
+        )
+    }
+
+    private fun laneFinalSaturation(bridge: VanguardNativeBridge): LaneResult {
+        val tracks = listOf(
+            TrackSpec(pcm = shortArrayOf(25000), frameCount = 1, sampleRate = 48000, channelCount = 1, gain = 1.0),
+            TrackSpec(pcm = shortArrayOf(20000), frameCount = 1, sampleRate = 48000, channelCount = 1, gain = 1.0),
+            TrackSpec(pcm = shortArrayOf(15000), frameCount = 1, sampleRate = 48000, channelCount = 1, gain = 1.0),
+        )
+        return runSuccessMixLane(
+            bridge, "finalSaturation",
+            nodeSampleRate = 48000, nodeChannelCount = 1, maxFramesPerMix = 2,
+            tracks = tracks, framesToMix = 1,
+        )
+    }
+
+    private fun laneEightTrackCapacity(bridge: VanguardNativeBridge): LaneResult {
+        val tracks = List(8) {
+            TrackSpec(pcm = shortArrayOf(1000, -1000), frameCount = 2, sampleRate = 48000, channelCount = 1, gain = 1.0)
+        }
+        return runSuccessMixLane(
+            bridge, "eightTrackCapacity",
+            nodeSampleRate = 48000, nodeChannelCount = 1, maxFramesPerMix = 4,
+            tracks = tracks, framesToMix = 2,
+        )
+    }
+
     // ── Lanes: rejection / lifecycle cases ─────────────────────────────────────
 
     private fun laneInvalidGainRejection(bridge: VanguardNativeBridge): LaneResult {
@@ -374,6 +430,62 @@ class AndroidAudioMixBusSmokeCoordinator(
         )
     }
 
+    private fun laneNineTrackReject(bridge: VanguardNativeBridge): LaneResult {
+        val raw = mutableMapOf<String, String>()
+        val createRaw = bridge.createAndroidDagPhase4AudioMixBusSession(
+            nodeId = "nineTrackReject",
+            sampleRate = 48000,
+            channelCount = 1,
+            maxFramesPerMix = 2,
+        )
+        raw["create"] = createRaw
+        val sessionId = extractField(createRaw, "sessionId")
+        if (sessionId == null || !createRaw.startsWith("status=PASS")) {
+            return LaneResult("nineTrackReject", false, raw, "session create failed: $createRaw")
+        }
+
+        var adds0To7Pass = true
+        for (i in 0 until 8) {
+            val addRaw = bridge.addAndroidDagPhase4AudioMixBusTrack(
+                sessionId = sessionId,
+                pcm16Buffer = directBuffer(shortArrayOf(100)),
+                frameCount = 1,
+                sampleRate = 48000,
+                channelCount = 1,
+                gain = 1.0,
+            )
+            raw["add$i"] = addRaw
+            if (!addRaw.startsWith("status=PASS")) {
+                adds0To7Pass = false
+            }
+        }
+
+        val add8Raw = bridge.addAndroidDagPhase4AudioMixBusTrack(
+            sessionId = sessionId,
+            pcm16Buffer = directBuffer(shortArrayOf(100)),
+            frameCount = 1,
+            sampleRate = 48000,
+            channelCount = 1,
+            gain = 1.0,
+        )
+        raw["add8"] = add8Raw
+
+        val destroyRaw = bridge.destroyAndroidDagPhase4AudioMixBusSession(sessionId)
+        raw["destroy"] = destroyRaw
+
+        val add8Fail = add8Raw.startsWith("status=FAIL") &&
+            extractField(add8Raw, "reason") == "track_limit_exceeded"
+        val destroyPass = destroyRaw.startsWith("status=PASS")
+
+        val pass = adds0To7Pass && add8Fail && destroyPass
+        return LaneResult(
+            name = "nineTrackReject",
+            pass = pass,
+            raw = raw,
+            detail = if (pass) "ok" else "expected add0..7 PASS, add8 FAIL/track_limit_exceeded, destroy PASS: $raw",
+        )
+    }
+
     private fun laneDestroyAndIdempotentDestroy(bridge: VanguardNativeBridge): LaneResult {
         val createRaw = bridge.createAndroidDagPhase4AudioMixBusSession(
             nodeId = "mixbus_destroy_idempotent",
@@ -421,9 +533,15 @@ class AndroidAudioMixBusSmokeCoordinator(
         val topologyOk = createRaw.startsWith("status=PASS") &&
             extractField(createRaw, "kind") == "processing" &&
             extractField(createRaw, "type") == "audio_mix_bus" &&
-            extractField(createRaw, "inputPortCount") == "2" &&
+            extractField(createRaw, "inputPortCount") == "8" &&
             extractField(createRaw, "inputPort0") == "primary_audio_in" &&
             extractField(createRaw, "inputPort1") == "secondary_audio_in" &&
+            extractField(createRaw, "inputPort2") == "audio_in_2" &&
+            extractField(createRaw, "inputPort3") == "audio_in_3" &&
+            extractField(createRaw, "inputPort4") == "audio_in_4" &&
+            extractField(createRaw, "inputPort5") == "audio_in_5" &&
+            extractField(createRaw, "inputPort6") == "audio_in_6" &&
+            extractField(createRaw, "inputPort7") == "audio_in_7" &&
             extractField(createRaw, "outputPortCount") == "1" &&
             extractField(createRaw, "outputPort0") == "mixed_audio_out"
 

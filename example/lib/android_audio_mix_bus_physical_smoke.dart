@@ -6,10 +6,11 @@
 //   - Mixed-Math group: stereoStereoDeterministic, monoToStereoUpmix,
 //     stereoToMonoDownmix, positiveSaturation, negativeSaturation,
 //     oddSampleTruncation, negativeDownmixDivision, shorterTrackSilence,
-//     longerTrackShortWindowMix.
+//     longerTrackShortWindowMix, fourTrackDeterministicMix, noPrematureClip,
+//     finalSaturation, eightTrackCapacity.
 //   - Error Rejection group: invalidGainRejection, nonFiniteGainRejection,
 //     sampleRateMismatchRejection, insufficientOutputCapacityRejection,
-//     invalidSessionRejection.
+//     invalidSessionRejection, nineTrackReject.
 //   - Topology & Lifecycle group: topologyPorts, destroyIdempotent.
 //   - Proof-Boundary & Summary group: hasCanonicalProofBoundary,
 //     allNativeLanesPass, laneCount, lanePassCount, lastError.
@@ -95,7 +96,11 @@ class _AndroidAudioMixBusPhysicalSmokeAppState
       'oddSampleTruncation=${activeReport.oddSampleTruncation}, '
       'negativeDownmixDivision=${activeReport.negativeDownmixDivision}, '
       'shorterTrackSilence=${activeReport.shorterTrackSilence}, '
-      'longerTrackShortWindowMix=${activeReport.longerTrackShortWindowMix}',
+      'longerTrackShortWindowMix=${activeReport.longerTrackShortWindowMix}, '
+      'fourTrackDeterministicMix=${activeReport.fourTrackDeterministicMix}, '
+      'noPrematureClip=${activeReport.noPrematureClip}, '
+      'finalSaturation=${activeReport.finalSaturation}, '
+      'eightTrackCapacity=${activeReport.eightTrackCapacity}',
     );
 
     // 2. Rejection group
@@ -105,7 +110,8 @@ class _AndroidAudioMixBusPhysicalSmokeAppState
       'nonFiniteGain=${activeReport.nonFiniteGainRejection}, '
       'sampleRateMismatch=${activeReport.sampleRateMismatchRejection}, '
       'insufficientOutputCapacity=${activeReport.insufficientOutputCapacityRejection}, '
-      'invalidSession=${activeReport.invalidSessionRejection}',
+      'invalidSession=${activeReport.invalidSessionRejection}, '
+      'nineTrackReject=${activeReport.nineTrackReject}',
     );
 
     // 3. Topology & Lifecycle group

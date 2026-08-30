@@ -130,12 +130,32 @@ class VGAudioMixBusSmokeReport {
   bool get destroyIdempotent => _lanePass('destroyIdempotent');
   bool get destroyIdempotentPass => destroyIdempotent;
 
+  /// Whether 4-track deterministic mix math passed.
+  bool get fourTrackDeterministicMix => _lanePass('fourTrackDeterministicMix');
+  bool get fourTrackDeterministicMixPass => fourTrackDeterministicMix;
+
+  /// Whether no-premature-clipping intermediate mix math passed.
+  bool get noPrematureClip => _lanePass('noPrematureClip');
+  bool get noPrematureClipPass => noPrematureClip;
+
+  /// Whether final int16 saturation clamping passed.
+  bool get finalSaturation => _lanePass('finalSaturation');
+  bool get finalSaturationPass => finalSaturation;
+
+  /// Whether 8-track maximum capacity mix passed.
+  bool get eightTrackCapacity => _lanePass('eightTrackCapacity');
+  bool get eightTrackCapacityPass => eightTrackCapacity;
+
+  /// Whether 9-track rejection admission lane passed.
+  bool get nineTrackReject => _lanePass('nineTrackReject');
+  bool get nineTrackRejectPass => nineTrackReject;
+
   /// Total number of diagnostic lanes reported.
   int get laneCount {
     final val = metrics['laneCount'];
     if (val is num) return val.toInt();
-    if (val is String) return int.tryParse(val) ?? 16;
-    return 16;
+    if (val is String) return int.tryParse(val) ?? 21;
+    return 21;
   }
 
   /// Number of diagnostic lanes that passed.
@@ -158,16 +178,21 @@ class VGAudioMixBusSmokeReport {
     if (negativeDownmixDivision) count++;
     if (shorterTrackSilence) count++;
     if (longerTrackShortWindowMix) count++;
+    if (fourTrackDeterministicMix) count++;
+    if (noPrematureClip) count++;
+    if (finalSaturation) count++;
+    if (eightTrackCapacity) count++;
     if (invalidGainRejection) count++;
     if (nonFiniteGainRejection) count++;
     if (sampleRateMismatchRejection) count++;
     if (insufficientOutputCapacityRejection) count++;
     if (invalidSessionRejection) count++;
+    if (nineTrackReject) count++;
     if (destroyIdempotent) count++;
     return count;
   }
 
-  /// Whether all 16 native diagnostic lanes passed.
+  /// Whether all 21 native diagnostic lanes passed.
   bool get allNativeLanesPass =>
       topologyPorts &&
       stereoStereoDeterministic &&
@@ -179,11 +204,16 @@ class VGAudioMixBusSmokeReport {
       negativeDownmixDivision &&
       shorterTrackSilence &&
       longerTrackShortWindowMix &&
+      fourTrackDeterministicMix &&
+      noPrematureClip &&
+      finalSaturation &&
+      eightTrackCapacity &&
       invalidGainRejection &&
       nonFiniteGainRejection &&
       sampleRateMismatchRejection &&
       insufficientOutputCapacityRejection &&
       invalidSessionRejection &&
+      nineTrackReject &&
       destroyIdempotent;
 
   /// Parses a report from the raw native map. Defensive against non-map,
@@ -195,7 +225,7 @@ class VGAudioMixBusSmokeReport {
         proofBoundary: '',
         raw: <String, String>{'reason': 'native_result_not_a_map'},
         metrics: <String, Object?>{
-          'laneCount': 16,
+          'laneCount': 21,
           'lanePassCount': 0,
           'reason': 'native_result_not_a_map',
         },
@@ -295,7 +325,7 @@ class VGAudioMixBusSmokeReport {
           'status': 'FAIL',
           'reason': 'timeout',
           'error': te.toString(),
-          'laneCount': 16,
+          'laneCount': 21,
           'lanePassCount': 0,
         },
         lastError: 'timeout: $te',
@@ -313,7 +343,7 @@ class VGAudioMixBusSmokeReport {
           'reason': 'platform_exception',
           'code': pe.code,
           'message': pe.message ?? '',
-          'laneCount': 16,
+          'laneCount': 21,
           'lanePassCount': 0,
         },
         lastError: 'platform_exception:${pe.code}:${pe.message}',
@@ -327,7 +357,7 @@ class VGAudioMixBusSmokeReport {
           'status': 'FAIL',
           'reason': 'exception',
           'error': e.toString(),
-          'laneCount': 16,
+          'laneCount': 21,
           'lanePassCount': 0,
         },
         lastError: 'exception:$e',

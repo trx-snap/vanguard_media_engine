@@ -31,6 +31,12 @@ AudioMixBusNode::AudioMixBusNode(std::string id,
 
     inputPorts_.push_back({"primary_audio_in", vanguard::graph::PortDataType::kAudioPacket});
     inputPorts_.push_back({"secondary_audio_in", vanguard::graph::PortDataType::kAudioPacket});
+    inputPorts_.push_back({"audio_in_2", vanguard::graph::PortDataType::kAudioPacket});
+    inputPorts_.push_back({"audio_in_3", vanguard::graph::PortDataType::kAudioPacket});
+    inputPorts_.push_back({"audio_in_4", vanguard::graph::PortDataType::kAudioPacket});
+    inputPorts_.push_back({"audio_in_5", vanguard::graph::PortDataType::kAudioPacket});
+    inputPorts_.push_back({"audio_in_6", vanguard::graph::PortDataType::kAudioPacket});
+    inputPorts_.push_back({"audio_in_7", vanguard::graph::PortDataType::kAudioPacket});
     outputPorts_.push_back({"mixed_audio_out", vanguard::graph::PortDataType::kAudioPacket});
 
     accumulator_.assign(static_cast<size_t>(maxFramesPerMix_) * static_cast<size_t>(channelCount_), 0);

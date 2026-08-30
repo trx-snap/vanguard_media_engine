@@ -20,11 +20,16 @@ const _kAllLanes = <String>[
   'negativeDownmixDivision',
   'shorterTrackSilence',
   'longerTrackShortWindowMix',
+  'fourTrackDeterministicMix',
+  'noPrematureClip',
+  'finalSaturation',
+  'eightTrackCapacity',
   'invalidGainRejection',
   'nonFiniteGainRejection',
   'sampleRateMismatchRejection',
   'insufficientOutputCapacityRejection',
   'invalidSessionRejection',
+  'nineTrackReject',
   'destroyIdempotent',
 ];
 
@@ -40,14 +45,19 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'negativeDownmixDivision.pass': true,
     'shorterTrackSilence.pass': true,
     'longerTrackShortWindowMix.pass': true,
+    'fourTrackDeterministicMix.pass': true,
+    'noPrematureClip.pass': true,
+    'finalSaturation.pass': true,
+    'eightTrackCapacity.pass': true,
     'invalidGainRejection.pass': true,
     'nonFiniteGainRejection.pass': true,
     'sampleRateMismatchRejection.pass': true,
     'insufficientOutputCapacityRejection.pass': true,
     'invalidSessionRejection.pass': true,
+    'nineTrackReject.pass': true,
     'destroyIdempotent.pass': true,
-    'laneCount': 16,
-    'lanePassCount': 16,
+    'laneCount': 21,
+    'lanePassCount': 21,
   };
 
   final raw = <String, String>{
@@ -66,6 +76,10 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'negativeDownmixDivision.mix': 'status=PASS;checksum=78901;clipped=false',
     'shorterTrackSilence.mix': 'status=PASS;checksum=89012;clipped=false',
     'longerTrackShortWindowMix.mix': 'status=PASS;checksum=90123;clipped=false',
+    'fourTrackDeterministicMix.mix': 'status=PASS;checksum=11111;clipped=false',
+    'noPrematureClip.mix': 'status=PASS;checksum=22222;clipped=false',
+    'finalSaturation.mix': 'status=PASS;checksum=33333;clipped=true',
+    'eightTrackCapacity.mix': 'status=PASS;checksum=44444;clipped=false',
     'invalidGainRejection.mix': 'status=FAIL;reason=invalid_gain',
     'nonFiniteGainRejection.mix': 'status=FAIL;reason=invalid_gain',
     'sampleRateMismatchRejection.mix':
@@ -74,6 +88,8 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
         'status=FAIL;reason=insufficient_output_capacity',
     'invalidSessionRejection.add': 'status=FAIL;reason=session_not_found',
     'invalidSessionRejection.mix': 'status=FAIL;reason=session_not_found',
+    'nineTrackReject.add8': 'status=FAIL;reason=track_limit_exceeded',
+    'nineTrackReject.destroy': 'status=PASS',
     'destroyIdempotent.destroy1': 'status=PASS',
     'destroyIdempotent.destroy2': 'status=FAIL;reason=session_not_found',
   };
@@ -105,7 +121,7 @@ void main() {
 
   group('VGAudioMixBusSmokeReport fromMap and toMap', () {
     test(
-      'pass report parses and round-trips all 16 lanes and fields cleanly',
+      'pass report parses and round-trips all 21 lanes and fields cleanly',
       () {
         final report = VGAudioMixBusSmokeReport.fromMap(_createSampleRawMap());
 
@@ -113,8 +129,8 @@ void main() {
         expect(report.hasCanonicalProofBoundary, isTrue);
         expect(report.proofBoundary, equals(_kCanonicalProofBoundary));
         expect(report.lastError, equals('none'));
-        expect(report.laneCount, equals(16));
-        expect(report.lanePassCount, equals(16));
+        expect(report.laneCount, equals(21));
+        expect(report.lanePassCount, equals(21));
 
         // Math lanes
         expect(report.stereoStereoDeterministic, isTrue);
@@ -135,6 +151,14 @@ void main() {
         expect(report.shorterTrackSilencePass, isTrue);
         expect(report.longerTrackShortWindowMix, isTrue);
         expect(report.longerTrackShortWindowMixPass, isTrue);
+        expect(report.fourTrackDeterministicMix, isTrue);
+        expect(report.fourTrackDeterministicMixPass, isTrue);
+        expect(report.noPrematureClip, isTrue);
+        expect(report.noPrematureClipPass, isTrue);
+        expect(report.finalSaturation, isTrue);
+        expect(report.finalSaturationPass, isTrue);
+        expect(report.eightTrackCapacity, isTrue);
+        expect(report.eightTrackCapacityPass, isTrue);
 
         // Rejection lanes
         expect(report.invalidGainRejection, isTrue);
@@ -147,6 +171,8 @@ void main() {
         expect(report.insufficientOutputCapacityRejectionPass, isTrue);
         expect(report.invalidSessionRejection, isTrue);
         expect(report.invalidSessionRejectionPass, isTrue);
+        expect(report.nineTrackReject, isTrue);
+        expect(report.nineTrackRejectPass, isTrue);
 
         // Lifecycle & topology lanes
         expect(report.topologyPorts, isTrue);
@@ -184,14 +210,19 @@ void main() {
             'negativeDownmixDivision.pass': true,
             'shorterTrackSilence.pass': true,
             'longerTrackShortWindowMix.pass': true,
+            'fourTrackDeterministicMix.pass': true,
+            'noPrematureClip.pass': true,
+            'finalSaturation.pass': true,
+            'eightTrackCapacity.pass': true,
             'invalidGainRejection.pass': true,
             'nonFiniteGainRejection.pass': true,
             'sampleRateMismatchRejection.pass': true,
             'insufficientOutputCapacityRejection.pass': true,
             'invalidSessionRejection.pass': true,
+            'nineTrackReject.pass': true,
             'destroyIdempotent.pass': true,
-            'laneCount': 16,
-            'lanePassCount': 15,
+            'laneCount': 21,
+            'lanePassCount': 20,
           },
           'lastError': 'stereoStereoDeterministic: output PCM mismatch',
         }),
@@ -201,7 +232,7 @@ void main() {
       expect(report.stereoStereoDeterministic, isFalse);
       expect(report.monoToStereoUpmix, isTrue);
       expect(report.allNativeLanesPass, isFalse);
-      expect(report.lanePassCount, equals(15));
+      expect(report.lanePassCount, equals(20));
       expect(
         report.lastError,
         equals('stereoStereoDeterministic: output PCM mismatch'),
@@ -226,7 +257,7 @@ void main() {
         );
         expect(report.lastError, equals('native_result_not_a_map'));
         expect(report.allNativeLanesPass, isFalse);
-        expect(report.laneCount, equals(16));
+        expect(report.laneCount, equals(21));
         expect(report.lanePassCount, equals(0));
       }
     });
@@ -248,11 +279,16 @@ void main() {
           'negativeDownmixDivision.pass': true,
           'shorterTrackSilence.pass': true,
           'longerTrackShortWindowMix.pass': true,
+          'fourTrackDeterministicMix.pass': true,
+          'noPrematureClip.pass': true,
+          'finalSaturation.pass': true,
+          'eightTrackCapacity.pass': true,
           'invalidGainRejection.pass': true,
           'nonFiniteGainRejection.pass': true,
           'sampleRateMismatchRejection.pass': true,
           'insufficientOutputCapacityRejection.pass': true,
           'invalidSessionRejection.pass': true,
+          'nineTrackReject.pass': true,
           'destroyIdempotent.pass': true,
         },
       });
@@ -305,7 +341,7 @@ void main() {
         final base = _createSampleRawMap();
         final baseMetrics = Map<String, Object?>.from(base['metrics'] as Map);
 
-        expect(_kAllLanes.length, equals(16));
+        expect(_kAllLanes.length, equals(21));
 
         for (final lane in _kAllLanes) {
           final modifiedMetrics = Map<String, Object?>.from(baseMetrics);
@@ -326,8 +362,8 @@ void main() {
 
           expect(
             report.lanePassCount,
-            equals(15),
-            reason: 'Failing lane $lane must decrement lanePassCount to 15',
+            equals(20),
+            reason: 'Failing lane $lane must decrement lanePassCount to 20',
           );
 
           // Verify specific getter reflects failure
@@ -372,6 +408,22 @@ void main() {
               expect(report.longerTrackShortWindowMix, isFalse);
               expect(report.longerTrackShortWindowMixPass, isFalse);
               break;
+            case 'fourTrackDeterministicMix':
+              expect(report.fourTrackDeterministicMix, isFalse);
+              expect(report.fourTrackDeterministicMixPass, isFalse);
+              break;
+            case 'noPrematureClip':
+              expect(report.noPrematureClip, isFalse);
+              expect(report.noPrematureClipPass, isFalse);
+              break;
+            case 'finalSaturation':
+              expect(report.finalSaturation, isFalse);
+              expect(report.finalSaturationPass, isFalse);
+              break;
+            case 'eightTrackCapacity':
+              expect(report.eightTrackCapacity, isFalse);
+              expect(report.eightTrackCapacityPass, isFalse);
+              break;
             case 'invalidGainRejection':
               expect(report.invalidGainRejection, isFalse);
               expect(report.invalidGainRejectionPass, isFalse);
@@ -391,6 +443,10 @@ void main() {
             case 'invalidSessionRejection':
               expect(report.invalidSessionRejection, isFalse);
               expect(report.invalidSessionRejectionPass, isFalse);
+              break;
+            case 'nineTrackReject':
+              expect(report.nineTrackReject, isFalse);
+              expect(report.nineTrackRejectPass, isFalse);
               break;
             case 'destroyIdempotent':
               expect(report.destroyIdempotent, isFalse);
@@ -417,7 +473,7 @@ void main() {
       });
 
       expect(report.allNativeLanesPass, isFalse);
-      expect(report.lanePassCount, equals(13));
+      expect(report.lanePassCount, equals(18));
       expect(report.topologyPorts, isFalse);
       expect(report.stereoStereoDeterministic, isFalse);
       expect(report.positiveSaturation, isFalse);

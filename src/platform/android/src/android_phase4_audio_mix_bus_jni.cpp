@@ -101,11 +101,11 @@ std::unordered_map<std::string, std::shared_ptr<Phase4AudioMixBusSession>>      
 std::atomic<uint64_t>                                                            gNextPhase4MixBusSessionId{1};
 
 // Structural safety bound on how many samples a single session may hold
-// across all admitted tracks (2 tracks * 8192 frames * 2 channels, doubled
+// across all admitted tracks (8 tracks * 8192 frames * 2 channels, doubled
 // for headroom). This is a JNI-level admission bound only; the semantic
 // track-count/channel/sample-rate/gain rules live entirely in
 // AudioMixBusNode::mix().
-constexpr int64_t kMaxSessionTotalSamples = 8192LL * 2LL * 2LL * 2LL;
+constexpr int64_t kMaxSessionTotalSamples = 8192LL * 2LL * 8LL * 2LL;
 constexpr int32_t kMaxAdmittedFrameCount  = 8192;
 constexpr int32_t kMaxAdmittedChannelCount = 8;
 
@@ -186,7 +186,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_createAndr
     std::snprintf(status, sizeof(status),
         "status=PASS;sessionId=%s;sampleRate=%d;channelCount=%d;maxFramesPerMix=%d;"
         "kind=processing;type=audio_mix_bus;inputPortCount=%zu;inputPort0=%s;"
-        "inputPort1=%s;outputPortCount=%zu;outputPort0=%s",
+        "inputPort1=%s;inputPort2=%s;inputPort3=%s;inputPort4=%s;inputPort5=%s;"
+        "inputPort6=%s;inputPort7=%s;outputPortCount=%zu;outputPort0=%s",
         session->sessionId.c_str(),
         static_cast<int>(sampleRate),
         static_cast<int>(channelCount),
@@ -194,6 +195,12 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_createAndr
         inputPorts.size(),
         inputPorts.size() > 0 ? inputPorts[0].id.c_str() : "",
         inputPorts.size() > 1 ? inputPorts[1].id.c_str() : "",
+        inputPorts.size() > 2 ? inputPorts[2].id.c_str() : "",
+        inputPorts.size() > 3 ? inputPorts[3].id.c_str() : "",
+        inputPorts.size() > 4 ? inputPorts[4].id.c_str() : "",
+        inputPorts.size() > 5 ? inputPorts[5].id.c_str() : "",
+        inputPorts.size() > 6 ? inputPorts[6].id.c_str() : "",
+        inputPorts.size() > 7 ? inputPorts[7].id.c_str() : "",
         outputPorts.size(),
         outputPorts.size() > 0 ? outputPorts[0].id.c_str() : "");
     return env->NewStringUTF(status);

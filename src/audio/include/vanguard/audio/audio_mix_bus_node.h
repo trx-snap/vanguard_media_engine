@@ -9,7 +9,7 @@ namespace vanguard {
 namespace audio {
 
 // P4-AUDIO-MIXBUS: bounded native PCM16 mix-bus foundation. Platform-neutral
-// C++ only: no JNI/Android APIs, no threads, no file IO. Mixes up to two
+// C++ only: no JNI/Android APIs, no threads, no file IO. Mixes up to eight
 // already-decoded interleaved PCM16 tracks into one output buffer using pure
 // in-memory integer/double math. Kotlin remains the sole owner of
 // MediaExtractor/MediaCodec/AudioTrack; this node never touches those APIs.
@@ -87,7 +87,7 @@ public:
     static constexpr int32_t kMaxChannelCount    = 2;
     static constexpr int64_t kMinMaxFramesPerMix = 1;
     static constexpr int64_t kMaxMaxFramesPerMix = 8192;
-    static constexpr size_t  kMaxTrackCount      = 2;
+    static constexpr size_t  kMaxTrackCount      = 8;
 
 private:
     std::string id_;

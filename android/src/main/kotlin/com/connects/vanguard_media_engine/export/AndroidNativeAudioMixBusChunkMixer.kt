@@ -10,7 +10,7 @@ import java.nio.ByteOrder
 //
 // Chunked bridge from AndroidAudioMixdownEngine's decoded-track output-timeline
 // placement to the native vanguard::audio::AudioMixBusNode PCM16 mix bus
-// (fixed two inputs, maxFramesPerMix<=8192, append-only addTrack, explicit
+// (up to eight inputs, maxFramesPerMix<=8192, append-only addTrack, explicit
 // session destroy per VanguardNativeBridge's P4-AUDIO-MIXBUS externs). Kotlin
 // remains the sole owner of decode/AAC/envelope evaluation; this object only
 // slices already-decoded PCM16 spans into kChunkFrames windows, evaluates
@@ -19,15 +19,15 @@ import java.nio.ByteOrder
 // summation, int16 clamp, and checksum/clipped metrics.
 //
 // Stateless: every mix() call allocates its own VanguardNativeBridge and
-// reuses exactly two direct track buffers plus one direct output buffer
-// (ByteOrder.nativeOrder()) across every chunk of that call; nothing is
-// retained across calls or across JNI boundaries (JNI addTrack copies the
-// buffer contents internally, so Kotlin is free to overwrite it on the next
-// chunk once the call returns).
+// reuses exactly MAX_ACTIVE_TRACKS direct track buffers plus one direct
+// output buffer (ByteOrder.nativeOrder()) across every chunk of that call;
+// nothing is retained across calls or across JNI boundaries (JNI addTrack
+// copies the buffer contents internally, so Kotlin is free to overwrite it
+// on the next chunk once the call returns).
 //
-// A chunk with more than two simultaneously active tracks fails closed with
-// "overlap_depth_exceeded:<n>" before any native session is created -- an
-// explicit non-claim left to P4-MULTITRACK-EXPORT, never a silent drop.
+// A chunk with more than MAX_ACTIVE_TRACKS simultaneously active tracks fails
+// closed with "overlap_depth_exceeded:<n>" before any native session is
+// created -- an explicit non-claim, never a silent drop.
 //
 // Because Kotlin now applies the per-output-frame volume envelope BEFORE
 // handing PCM16 to native for stereo<->mono channel mapping/downmix (instead
@@ -38,7 +38,7 @@ import java.nio.ByteOrder
 object AndroidNativeAudioMixBusChunkMixer {
 
     private const val CHUNK_FRAMES = 4096
-    private const val MAX_ACTIVE_TRACKS = 2
+    private const val MAX_ACTIVE_TRACKS = 8
 
     /// One decoded track's placement on the output timeline, ready for native
     /// chunked mixing. [startFrame] and [frameCount] are output-timeline
@@ -115,10 +115,10 @@ object AndroidNativeAudioMixBusChunkMixer {
         var silentChunks = 0
         var gainClamped = false
 
-        // Reused for every chunk of this call -- two track buffers (fixed
-        // two-input native mix bus) plus one output buffer, all sized for the
-        // largest possible chunk (kChunkFrames * outputChannelCount); every
-        // track's srcChannelCount <= outputChannelCount by construction
+        // Reused for every chunk of this call -- MAX_ACTIVE_TRACKS track
+        // buffers plus one output buffer, all sized for the largest possible
+        // chunk (kChunkFrames * outputChannelCount); every track's
+        // srcChannelCount <= outputChannelCount by construction
         // (outputChannelCount is the max channel count across decoded
         // tracks), so these sizes are always sufficient.
         val trackBuffers = Array(MAX_ACTIVE_TRACKS) {
