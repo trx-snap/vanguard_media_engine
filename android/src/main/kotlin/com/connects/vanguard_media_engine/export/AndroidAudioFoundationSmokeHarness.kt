@@ -19,8 +19,12 @@ import java.io.File
 //   the clamp / sub-ms merge / synthesized-start / synthesized-terminal rules,
 //   plus one invalid track map that the parser must skip with evidence. The
 //   validator must report NOT eligible; the track is decoded to PCM, mixed
-//   through the volume envelope, AAC-encoded to <outputDir>/mixdown_audio.m4a
-//   and remuxed with the fixture video into <outputDir>/mixdown.mp4.
+//   through the volume envelope and the P4-AUDIO-MIXBUS native chunked mix
+//   bus (AndroidNativeAudioMixBusChunkMixer) -- this scenario requires
+//   nativeMixBusUsed, a non-zero native chunk count, and a native "success"
+//   reason, never a Kotlin-only fallback -- AAC-encoded to
+//   <outputDir>/mixdown_audio.m4a and remuxed with the fixture video into
+//   <outputDir>/mixdown.mp4.
 //
 // The harness never deletes the input fixture; partial generated outputs are
 // deleted on failure. Every run logs exactly one
@@ -228,6 +232,19 @@ object AndroidAudioFoundationSmokeHarness {
         if (!mix.success || mix.pcm == null) {
             return scenarioFailure("pcmMixdown", "mixdown_failed:${mix.reason}", outputPath)
         }
+        // P4-AUDIO-MIXBUS: the PCM mixdown route must go through the native
+        // chunked mix bus (AndroidNativeAudioMixBusChunkMixer), not a Kotlin
+        // fallback -- this is not a byte-equality check against the old
+        // all-Kotlin summation, only evidence that native mixing actually ran
+        // and reported success for at least one chunk.
+        if (!mix.nativeMixBusUsed || mix.nativeChunkCount <= 0 || mix.nativeMixReason != "success") {
+            return scenarioFailure(
+                "pcmMixdown",
+                "native_mix_bus_evidence_missing:used=${mix.nativeMixBusUsed};" +
+                    "chunks=${mix.nativeChunkCount};nativeReason=${mix.nativeMixReason}",
+                outputPath,
+            )
+        }
 
         val encode = AndroidAacEncoder.encodePcm16ToM4a(
             pcm = mix.pcm,
@@ -256,7 +273,9 @@ object AndroidAudioFoundationSmokeHarness {
             "ok(normalizedKf=${normalized.size},mixedTracks=${mix.mixedTrackCount}," +
                 "invalidSkipped=${skippedIndices.size},aacSamples=${encode.encodedSamples}," +
                 "video=${remux.videoSamples},audio=${remux.audioSamples}," +
-                "bytes=${remux.outputSizeBytes})"
+                "bytes=${remux.outputSizeBytes},nativeMixBusUsed=${mix.nativeMixBusUsed}," +
+                "nativeChunkCount=${mix.nativeChunkCount},nativeSilentChunks=${mix.nativeSilentChunks}," +
+                "nativeGainClamped=${mix.nativeGainClamped})"
         } else {
             "fail(pass2_remux:${remux.reason};video=${remux.videoSamples};" +
                 "audio=${remux.audioSamples})"
@@ -273,6 +292,11 @@ object AndroidAudioFoundationSmokeHarness {
             "sampleRate" to mix.sampleRate,
             "channelCount" to mix.channelCount,
             "frameCount" to mix.frameCount,
+            "nativeMixBusUsed" to mix.nativeMixBusUsed,
+            "nativeChunkCount" to mix.nativeChunkCount,
+            "nativeSilentChunks" to mix.nativeSilentChunks,
+            "nativeMixReason" to mix.nativeMixReason,
+            "nativeGainClamped" to mix.nativeGainClamped,
             "encodedSamples" to encode.encodedSamples,
             "mixedAudioPath" to mixedAudioPath,
             "mixedAudioSize" to encode.outputSizeBytes,

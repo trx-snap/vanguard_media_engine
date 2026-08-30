@@ -5,9 +5,14 @@ import android.util.Log
 // ── AndroidAudioMixdownEngine (Export/Audio Unit B) ───────────────────────────
 //
 // Diagnostic PCM mixdown: decodes each valid sidecar track, places it at its
-// startTime on an output-timeline buffer, applies the per-track
-// AndroidAudioVolumeEnvelope gain per sample frame, sums into an integer
-// accumulator, and clamps to 16-bit.
+// startTime on an output-timeline, and routes the placement to
+// AndroidNativeAudioMixBusChunkMixer, which slices the timeline into
+// kChunkFrames windows and mixes each non-silent window through the native
+// vanguard::audio::AudioMixBusNode PCM16 mix bus (per-frame
+// AndroidAudioVolumeEnvelope gain is still evaluated in Kotlin; native owns
+// channel mapping, summation, and the 16-bit clamp). See
+// AndroidNativeAudioMixBusChunkMixer's header for the +/-1 LSB rounding-order
+// note versus the old all-Kotlin summation.
 //
 // Constraints in this slice:
 //   - Output sample rate follows the FIRST successfully decoded track
@@ -18,9 +23,14 @@ import android.util.Log
 //     channels; stereo → mono averages. More than 2 channels is unsupported.
 //   - Tracks that fail parsing/decoding are skipped with evidence in
 //     [AndroidAudioMixdownResult.skippedTracks]; at least one track must mix.
+//   - More than 2 simultaneously active tracks in any output chunk is an
+//     explicit non-claim left to P4-MULTITRACK-EXPORT: mixing fails closed
+//     with reason "native_audio_mix_bus:overlap_depth_exceeded:<n>".
 
 /// Structured mixdown outcome. [pcm] is 16-bit interleaved output-timeline
-/// samples on success.
+/// samples on success. The native* fields are diagnostic evidence of the
+/// P4-AUDIO-MIXBUS chunked native routing and default to their "not used"
+/// values for failures that occur before native mixing is attempted.
 data class AndroidAudioMixdownResult(
     val success: Boolean,
     val reason: String,
@@ -30,6 +40,11 @@ data class AndroidAudioMixdownResult(
     val frameCount: Int,
     val mixedTrackCount: Int,
     val skippedTracks: List<String>,
+    val nativeMixBusUsed: Boolean = false,
+    val nativeChunkCount: Int = 0,
+    val nativeSilentChunks: Int = 0,
+    val nativeMixReason: String = "",
+    val nativeGainClamped: Boolean = false,
 ) {
     override fun equals(other: Any?): Boolean = this === other
     override fun hashCode(): Int = System.identityHashCode(this)
@@ -102,64 +117,69 @@ object AndroidAudioMixdownEngine {
         }
 
         val totalFrames = Math.ceil(timelineEndSec * outputSampleRate).toInt()
-        val accumulator = IntArray(totalFrames * outputChannels)
 
-        for (d in decoded) {
+        val chunkTrackInputs = decoded.map { d ->
             val spec = d.spec
             val decode = d.decode
-            val pcm = decode.pcm!!
-            val srcChannels = decode.channelCount
-            val placedFrames = decode.frameCount
             val startFrame = Math.round(spec.startTime * outputSampleRate).toInt()
             val trackStartSec = spec.startTime
-            val trackEndSec = spec.startTime + placedFrames.toDouble() / outputSampleRate
+            val trackEndSec = spec.startTime + decode.frameCount.toDouble() / outputSampleRate
             val envelope = AndroidAudioVolumeEnvelope.forTrack(spec, trackStartSec, trackEndSec)
-
-            for (frame in 0 until placedFrames) {
-                val outFrame = startFrame + frame
-                if (outFrame >= totalFrames) break
-                val timeSec = outFrame.toDouble() / outputSampleRate
-                val gain = envelope.evaluate(timeSec)
-                if (gain == 0.0) continue
-
-                val srcBase = frame * srcChannels
-                val outBase = outFrame * outputChannels
-                if (srcChannels == outputChannels) {
-                    for (ch in 0 until outputChannels) {
-                        accumulator[outBase + ch] += (pcm[srcBase + ch] * gain).toInt()
-                    }
-                } else if (srcChannels == 1) {
-                    // Mono source → duplicate into each output channel.
-                    val scaled = (pcm[srcBase] * gain).toInt()
-                    for (ch in 0 until outputChannels) {
-                        accumulator[outBase + ch] += scaled
-                    }
-                } else {
-                    // Stereo source → mono output: simple average downmix.
-                    val avg = (pcm[srcBase].toInt() + pcm[srcBase + 1].toInt()) / 2
-                    accumulator[outBase] += (avg * gain).toInt()
-                }
-            }
+            AndroidNativeAudioMixBusChunkMixer.ChunkTrackInput(
+                trackId = spec.trackId,
+                startFrame = startFrame,
+                pcm = decode.pcm!!,
+                srcChannelCount = decode.channelCount,
+                frameCount = decode.frameCount,
+                envelope = envelope,
+            )
         }
 
-        val mixedPcm = ShortArray(accumulator.size) { i ->
-            accumulator[i].coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt()).toShort()
+        val nativeResult = AndroidNativeAudioMixBusChunkMixer.mix(
+            tracks = chunkTrackInputs,
+            outputSampleRate = outputSampleRate,
+            outputChannelCount = outputChannels,
+            totalFrames = totalFrames,
+        )
+        if (!nativeResult.success || nativeResult.pcm == null) {
+            Log.e(TAG, "native mix bus failed — reason=${nativeResult.reason}")
+            return AndroidAudioMixdownResult(
+                success = false,
+                reason = "native_audio_mix_bus:${nativeResult.reason}",
+                pcm = null,
+                sampleRate = 0,
+                channelCount = 0,
+                frameCount = 0,
+                mixedTrackCount = 0,
+                skippedTracks = skipped,
+                nativeMixBusUsed = true,
+                nativeChunkCount = nativeResult.chunkCount,
+                nativeSilentChunks = nativeResult.silentChunks,
+                nativeMixReason = nativeResult.reason,
+                nativeGainClamped = nativeResult.gainClamped,
+            )
         }
 
         Log.i(
             TAG,
             "mix OK — tracks=${decoded.size} skipped=${skipped.size} " +
-                "frames=$totalFrames rate=$outputSampleRate ch=$outputChannels",
+                "frames=$totalFrames rate=$outputSampleRate ch=$outputChannels " +
+                "nativeChunks=${nativeResult.chunkCount} nativeSilentChunks=${nativeResult.silentChunks}",
         )
         return AndroidAudioMixdownResult(
             success = true,
             reason = "success",
-            pcm = mixedPcm,
+            pcm = nativeResult.pcm,
             sampleRate = outputSampleRate,
             channelCount = outputChannels,
             frameCount = totalFrames,
             mixedTrackCount = decoded.size,
             skippedTracks = skipped,
+            nativeMixBusUsed = true,
+            nativeChunkCount = nativeResult.chunkCount,
+            nativeSilentChunks = nativeResult.silentChunks,
+            nativeMixReason = nativeResult.reason,
+            nativeGainClamped = nativeResult.gainClamped,
         )
     }
 
