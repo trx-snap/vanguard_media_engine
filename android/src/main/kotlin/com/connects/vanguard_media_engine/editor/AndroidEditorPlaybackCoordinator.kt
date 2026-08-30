@@ -264,10 +264,12 @@ class AndroidEditorPlaybackCoordinator(
         // user-added role="music" track and at most one user-added role="voiceover"
         // track, both only for a single-clip timeline (Phase 7.8L-Android: a
         // single-clip draft may carry both at once), each with a finite
-        // non-negative startTime (Phase 7.8K-Android: delayed start/end). Any
+        // non-negative startTime (Phase 7.8K-Android: delayed start/end) and
+        // finite non-negative fadeInSeconds/fadeOutSeconds and/or volumeKeyframes
+        // (Phase 7.8M-Android: volume automation; see
+        // AndroidEditorAddedAudioPreviewRuntime/AndroidEditorAudioAutomation). Any
         // other role (sfx, unknown, null), a duplicate music or voiceover track,
-        // any added track on a multi-clip timeline, non-zero fades, or non-empty
-        // volumeKeyframes are all unsupported in this slice.
+        // or any added track on a multi-clip timeline is unsupported in this slice.
         val audioSidecar = draft["audioSidecar"]
         val pendingAddedAudioConfigs = mutableListOf<AndroidEditorAddedAudioTrackConfig>()
         if (audioSidecar != null) {
@@ -380,21 +382,76 @@ class AndroidEditorPlaybackCoordinator(
                     return
                 }
 
-                if (fadeInSeconds != 0.0 || fadeOutSeconds != 0.0) {
+                if (fadeInSeconds < 0.0 || fadeOutSeconds < 0.0) {
                     result.error(
-                        "UNSUPPORTED_TIMELINE_FEATURE",
-                        "$role track \"$trackId\" fades are not supported in this slice",
+                        "INVALID_AUDIO_SIDECAR",
+                        "$role track \"$trackId\" has a negative fadeInSeconds or fadeOutSeconds",
                         null,
                     )
                     return
                 }
+
+                // Phase 7.8M-Android: volumeKeyframes overrides volume/fades when non-empty (wire
+                // contract: packages/vanguard_media_engine/lib/vg_audio_sidecar_plan.dart). Absent
+                // or empty parses to emptyList(); AndroidEditorAudioAutomation sorts/deduplicates
+                // by timeUs, so only per-entry validation and an ascending sort happen here.
+                val parsedKeyframes = mutableListOf<AndroidEditorVolumeKeyframe>()
                 if (volumeKeyframes != null && volumeKeyframes.isNotEmpty()) {
-                    result.error(
-                        "UNSUPPORTED_TIMELINE_FEATURE",
-                        "$role track \"$trackId\" volumeKeyframes are not supported in this slice",
-                        null,
-                    )
-                    return
+                    for (rawKeyframe in volumeKeyframes) {
+                        val keyframe = rawKeyframe as? Map<*, *>
+                        if (keyframe == null) {
+                            result.error(
+                                "INVALID_AUDIO_SIDECAR",
+                                "$role track \"$trackId\" has a malformed volumeKeyframes entry",
+                                null,
+                            )
+                            return
+                        }
+                        val keyframeTime = (keyframe["time"] as? Number)?.toDouble()
+                        val keyframeVolume = (keyframe["volume"] as? Number)?.toDouble()
+                        if (keyframeTime == null || !keyframeTime.isFinite() ||
+                            keyframeVolume == null || !keyframeVolume.isFinite()
+                        ) {
+                            result.error(
+                                "INVALID_AUDIO_SIDECAR",
+                                "$role track \"$trackId\" has a volumeKeyframes entry with a missing or non-finite time or volume",
+                                null,
+                            )
+                            return
+                        }
+                        if (keyframeTime < 0.0) {
+                            result.error(
+                                "INVALID_AUDIO_SIDECAR",
+                                "$role track \"$trackId\" has a volumeKeyframes entry with a negative time",
+                                null,
+                            )
+                            return
+                        }
+                        if (keyframeVolume < 0.0 || keyframeVolume > 1.0) {
+                            result.error(
+                                "INVALID_AUDIO_SIDECAR",
+                                "$role track \"$trackId\" has a volumeKeyframes entry with volume outside [0.0, 1.0]",
+                                null,
+                            )
+                            return
+                        }
+                        val keyframeCurve = keyframe["curve"] as? String
+                        if (keyframeCurve != null && keyframeCurve != "linear") {
+                            result.error(
+                                "INVALID_AUDIO_SIDECAR",
+                                "$role track \"$trackId\" has a volumeKeyframes entry with unsupported curve \"$keyframeCurve\"",
+                                null,
+                            )
+                            return
+                        }
+                        parsedKeyframes.add(
+                            AndroidEditorVolumeKeyframe(
+                                timeUs = (keyframeTime * 1_000_000.0).toLong(),
+                                volume = keyframeVolume.toFloat(),
+                            ),
+                        )
+                    }
+                    parsedKeyframes.sortBy { it.timeUs }
                 }
 
                 val addedAudioFile = java.io.File(url)
@@ -410,7 +467,11 @@ class AndroidEditorPlaybackCoordinator(
                         durationUs = (duration * 1_000_000.0).toLong(),
                         sourceTrimStartUs = (sourceTrimStart * 1_000_000.0).toLong(),
                         trackStartUs = (startTime * 1_000_000.0).toLong(),
-                        effectiveGain = volume * mixGain,
+                        volume = volume.toFloat(),
+                        mixGain = mixGain.toFloat(),
+                        fadeInUs = (fadeInSeconds * 1_000_000.0).toLong(),
+                        fadeOutUs = (fadeOutSeconds * 1_000_000.0).toLong(),
+                        volumeKeyframes = parsedKeyframes,
                         role = role,
                     ),
                 )

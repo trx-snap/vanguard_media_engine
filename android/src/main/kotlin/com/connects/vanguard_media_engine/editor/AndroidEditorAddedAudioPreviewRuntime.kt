@@ -17,12 +17,15 @@ import java.util.concurrent.atomic.AtomicBoolean
  * `role="music"` and `role="voiceover"` added-audio tracks (Phase 7.8L-Android); SFX remains
  * deferred.
  *
- * [durationUs] / [sourceTrimStartUs] / [trackStartUs] are microseconds; [effectiveGain] is
- * linear gain (volume * mixGain from the wire sidecar track) clamped to `[0.0, 1.0]` by the
- * runtime. [trackStartUs] is this track's delayed start position on the global editor timeline
- * (Phase 7.8K-Android): the track is silent outside `[trackStartUs, trackStartUs + durationUs)`.
- * [role] is `"music"` or `"voiceover"`; it never affects playback timing/mixing math, only
- * logging and the [AudioAttributes] content type used for focus requests.
+ * [durationUs] / [sourceTrimStartUs] / [trackStartUs] / [fadeInUs] / [fadeOutUs] are
+ * microseconds. [trackStartUs] is this track's delayed start position on the global editor
+ * timeline (Phase 7.8K-Android): the track is silent outside `[trackStartUs, trackStartUs +
+ * durationUs)`. [volume], [mixGain], [fadeInUs], [fadeOutUs], and [volumeKeyframes] feed
+ * [AndroidEditorAudioAutomation.computeEffectiveGain] (Phase 7.8M-Android) to compute the
+ * runtime's per-tick linear gain, clamped to `[0.0, 1.0]`; a non-empty [volumeKeyframes]
+ * overrides [volume]/[fadeInUs]/[fadeOutUs]. [role] is `"music"` or `"voiceover"`; it never
+ * affects playback timing/mixing math, only logging and the [AudioAttributes] content type used
+ * for focus requests.
  */
 data class AndroidEditorAddedAudioTrackConfig(
     val trackId: String,
@@ -30,7 +33,11 @@ data class AndroidEditorAddedAudioTrackConfig(
     val durationUs: Long,
     val sourceTrimStartUs: Long,
     val trackStartUs: Long,
-    val effectiveGain: Double,
+    val volume: Float,
+    val mixGain: Float,
+    val fadeInUs: Long,
+    val fadeOutUs: Long,
+    val volumeKeyframes: List<AndroidEditorVolumeKeyframe>,
     val role: String,
 )
 
@@ -41,9 +48,11 @@ data class AndroidEditorAddedAudioTrackConfig(
  * a single [MediaPlayer] confined to its own dedicated [HandlerThread]/[Handler]
  * (`audioHandler`) — mirroring [AndroidEditorOriginalAudioPreviewRuntime]'s confinement style.
  * One coordinator-owned instance exists per added-audio track; a single-clip draft may have one
- * music instance and one voiceover instance active at once (Phase 7.8L-Android). Preview only;
- * never touches export/mux behavior, fades, keyframes, SFX, multi-clip added audio, multi-clip
- * clocking, ducking, or waveform logic.
+ * music instance and one voiceover instance active at once (Phase 7.8L-Android). Volume
+ * automation (static fades and/or [AndroidEditorVolumeKeyframe] keyframes, Phase 7.8M-Android) is
+ * applied live via [android.media.MediaPlayer.setVolume] on a periodic tick while playing — see
+ * [AndroidEditorAudioAutomation]. Preview only; never touches export/mux behavior, SFX,
+ * multi-clip added audio, multi-clip clocking, ducking, or waveform logic.
  *
  * A global timeline PTS ([currentTimelinePtsUs]) maps onto this track's own timeline via
  * [AndroidEditorAddedAudioTrackConfig.trackStartUs] (Phase 7.8K-Android: the track may start/end
@@ -65,9 +74,10 @@ class AndroidEditorAddedAudioPreviewRuntime(
     companion object {
         private const val TAG = "EditorAddedAudioPreview"
         private const val LOG_PREFIX = "VG_EDITOR_ADDED_AUDIO_PREVIEW"
-    }
 
-    private val gain = config.effectiveGain.coerceIn(0.0, 1.0).toFloat()
+        /** Volume automation tick interval while playing, milliseconds (Phase 7.8M-Android). */
+        private const val VOLUME_TICK_INTERVAL_MS = 33L
+    }
 
     /** Exclusive end of this track's window on the global timeline, microseconds. */
     private val trackEndUs = config.trackStartUs + config.durationUs
@@ -105,8 +115,16 @@ class AndroidEditorAddedAudioPreviewRuntime(
     /** [SystemClock.uptimeMillis] recorded when the current before-start [playing] wait began. */
     private var playBaselineUptimeMs: Long = 0L
 
+    /**
+     * True while [volumeTickRunnable] is scheduled to keep reposting (i.e. a volume-automation
+     * tick loop is active for the current [playing] session) — gates the `volume_tick_stopped`
+     * log so it only fires once per started loop.
+     */
+    private var tickingVolume = false
+
     private val startRunnable = Runnable { onDelayedStartFiredLocked() }
     private val endRunnable = Runnable { onTrackEndReachedLocked() }
+    private val volumeTickRunnable = Runnable { onVolumeTickLocked() }
 
     // ── prepare ────────────────────────────────────────────────────────────
 
@@ -158,11 +176,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
                     currentTimelinePtsUs = 0L
                     playing = false
                     mediaStarted = false
-                    try {
-                        mp.setVolume(gain, gain)
-                    } catch (t: Throwable) {
-                        Log.w(TAG, "$LOG_PREFIX prepare_set_volume_error trackId=${config.trackId} role=${config.role}", t)
-                    }
+                    applyVolumeLocked(mp, timelinePtsUs = 0L)
                     val targetMs = (config.sourceTrimStartUs / 1000L)
                         .coerceIn(0L, mp.duration.toLong().coerceAtLeast(0L))
                     if (targetMs > 0L) {
@@ -262,10 +276,12 @@ class AndroidEditorAddedAudioPreviewRuntime(
     private fun startMediaAtCurrentPtsLocked(mp: MediaPlayer, seekFirst: Boolean) {
         fun doStart() {
             requestFocusLocked()
+            applyVolumeLocked(mp, currentTimelinePtsUs)
             try {
                 mp.start()
                 mediaStarted = true
                 scheduleEndRunnableLocked()
+                startVolumeTicksLocked()
                 Log.i(TAG, "$LOG_PREFIX play_started trackId=${config.trackId} role=${config.role} currentTimelinePtsUs=$currentTimelinePtsUs")
             } catch (t: Throwable) {
                 Log.w(TAG, "$LOG_PREFIX play_start_error trackId=${config.trackId} role=${config.role}", t)
@@ -300,6 +316,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
             Log.i(TAG, "$LOG_PREFIX pause_start trackId=${config.trackId} role=${config.role}")
             audioHandler.removeCallbacks(startRunnable)
             audioHandler.removeCallbacks(endRunnable)
+            stopVolumeTicksLocked()
             abandonFocusLocked()
             if (released.get() || !enabled) {
                 playing = false
@@ -355,6 +372,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
         audioHandler.post {
             audioHandler.removeCallbacks(startRunnable)
             audioHandler.removeCallbacks(endRunnable)
+            stopVolumeTicksLocked()
             playing = false
             mediaStarted = false
             abandonFocusLocked()
@@ -413,6 +431,8 @@ class AndroidEditorAddedAudioPreviewRuntime(
                     try {
                         mp.setOnSeekCompleteListener {
                             currentTimelinePtsUs = targetTimelinePtsUs
+                            val appliedGain = applyVolumeLocked(mp, targetTimelinePtsUs)
+                            Log.i(TAG, "$LOG_PREFIX volume_seek_apply trackId=${config.trackId} role=${config.role} targetTimelinePtsUs=$targetTimelinePtsUs effectiveGain=$appliedGain")
                             if (resumeAfterSeek) {
                                 playing = true
                                 playBaselineUptimeMs = SystemClock.uptimeMillis()
@@ -448,6 +468,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
             Log.i(TAG, "$LOG_PREFIX release_start trackId=${config.trackId} role=${config.role}")
             audioHandler.removeCallbacks(startRunnable)
             audioHandler.removeCallbacks(endRunnable)
+            stopVolumeTicksLocked()
             abandonFocusLocked()
             teardownPlayerLocked()
             Log.i(TAG, "$LOG_PREFIX release_done trackId=${config.trackId} role=${config.role}")
@@ -474,6 +495,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
         currentTimelinePtsUs = trackEndUs
         playing = false
         mediaStarted = false
+        stopVolumeTicksLocked()
         abandonFocusLocked()
         Log.i(TAG, "$LOG_PREFIX track_end_reached trackId=${config.trackId} role=${config.role}")
     }
@@ -485,6 +507,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
         mediaStarted = false
         audioHandler.removeCallbacks(startRunnable)
         audioHandler.removeCallbacks(endRunnable)
+        stopVolumeTicksLocked()
         abandonFocusLocked()
         if (player === mp) {
             player = null
@@ -499,11 +522,67 @@ class AndroidEditorAddedAudioPreviewRuntime(
         mediaStarted = false
         audioHandler.removeCallbacks(startRunnable)
         audioHandler.removeCallbacks(endRunnable)
+        stopVolumeTicksLocked()
         val mp = player
         player = null
         if (mp != null) {
             try { mp.reset() } catch (_: Throwable) {}
             try { mp.release() } catch (_: Throwable) {}
+        }
+    }
+
+    /**
+     * Applies [AndroidEditorAudioAutomation.computeEffectiveGain] at [timelinePtsUs] to [mp] via
+     * [MediaPlayer.setVolume]. Returns the applied gain (for logging).
+     */
+    private fun applyVolumeLocked(mp: MediaPlayer, timelinePtsUs: Long): Float {
+        val appliedGain = AndroidEditorAudioAutomation.computeEffectiveGain(config, timelinePtsUs)
+        try {
+            mp.setVolume(appliedGain, appliedGain)
+        } catch (t: Throwable) {
+            Log.w(TAG, "$LOG_PREFIX volume_apply_error trackId=${config.trackId} role=${config.role}", t)
+        }
+        return appliedGain
+    }
+
+    /**
+     * (Re)starts the [volumeTickRunnable] loop for the current [playing] session. Logs
+     * `volume_tick_started` once per call (i.e. once per started session — never per tick).
+     */
+    private fun startVolumeTicksLocked() {
+        audioHandler.removeCallbacks(volumeTickRunnable)
+        tickingVolume = true
+        Log.i(TAG, "$LOG_PREFIX volume_tick_started trackId=${config.trackId} role=${config.role}")
+        audioHandler.postDelayed(volumeTickRunnable, VOLUME_TICK_INTERVAL_MS)
+    }
+
+    /** Cancels the [volumeTickRunnable] loop, logging `volume_tick_stopped` only if it was active. */
+    private fun stopVolumeTicksLocked() {
+        audioHandler.removeCallbacks(volumeTickRunnable)
+        if (tickingVolume) {
+            tickingVolume = false
+            Log.i(TAG, "$LOG_PREFIX volume_tick_stopped trackId=${config.trackId} role=${config.role}")
+        }
+    }
+
+    /**
+     * Applies the current volume-automation gain from [mp]'s live position and reposts itself
+     * every [VOLUME_TICK_INTERVAL_MS] while still [playing] and [mediaStarted]. Never logs (would
+     * log every tick).
+     */
+    private fun onVolumeTickLocked() {
+        if (released.get() || !enabled || !playing || !mediaStarted) return
+        val mp = player ?: return
+        try {
+            val sourcePosUs = mp.currentPosition.toLong() * 1000L
+            val timelinePtsUs = (sourcePosUs - config.sourceTrimStartUs + config.trackStartUs)
+                .coerceIn(config.trackStartUs, trackEndUs)
+            applyVolumeLocked(mp, timelinePtsUs)
+        } catch (t: Throwable) {
+            Log.w(TAG, "$LOG_PREFIX volume_tick_error trackId=${config.trackId} role=${config.role}", t)
+        }
+        if (playing && mediaStarted) {
+            audioHandler.postDelayed(volumeTickRunnable, VOLUME_TICK_INTERVAL_MS)
         }
     }
 
