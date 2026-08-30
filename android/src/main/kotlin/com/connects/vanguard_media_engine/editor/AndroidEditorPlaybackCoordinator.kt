@@ -399,8 +399,10 @@ class AndroidEditorPlaybackCoordinator(
             return
         }
 
+        val resumeAfterSeek = args?.get("resumeAfterSeek") as? Boolean ?: false
+
         val targetPtsUs = (seconds * 1_000_000.0).toLong()
-        entry.session.seek(targetPtsUs, resumeAfterSeek = false) { seekResult ->
+        entry.session.seek(targetPtsUs, resumeAfterSeek = resumeAfterSeek) { seekResult ->
             mainHandler.post {
                 val pass = seekResult["pass"] as? Boolean ?: false
                 if (pass) {

@@ -560,13 +560,20 @@ class VGEditorController extends ValueNotifier<VGEditorValue> {
   /// Maps to `timelineSeek` (Phase 7.8 production route).
   /// No-op if not ready.
   ///
+  /// [resumeAfterSeek] tells the native session whether to continue playback
+  /// from the seek target instead of holding paused there. Defaults to
+  /// `false`, preserving prior pause-on-seek behaviour for existing callers.
+  ///
   /// Throws [StateError] if disposed.
-  Future<void> seek(double seconds) async {
+  Future<void> seek(double seconds, {bool resumeAfterSeek = false}) async {
     _assertNotDisposed();
     if (!value.isReady) return;
 
     try {
-      await _channel.invokeMethod<void>('timelineSeek', {'seconds': seconds});
+      await _channel.invokeMethod<void>('timelineSeek', {
+        'seconds': seconds,
+        'resumeAfterSeek': resumeAfterSeek,
+      });
       value = value.copyWith(
         currentPTS: seconds,
         statusMessage: 'Seeked to ${seconds.toStringAsFixed(2)}s',

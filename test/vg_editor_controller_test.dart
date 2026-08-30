@@ -359,11 +359,16 @@ void main() {
   group('VGEditorController — seek() [production route]', () {
     late VGEditorController controller;
     final List<String> calledMethods = [];
+    final List<Map<String, dynamic>> capturedSeekArgs = [];
 
     setUp(() async {
       calledMethods.clear();
+      capturedSeekArgs.clear();
       _setMockHandler((method, args) async {
         calledMethods.add(method);
+        if (method == 'timelineSeek') {
+          capturedSeekArgs.add(Map<String, dynamic>.from(args as Map));
+        }
         if (method == 'createTimelineTexture') {
           return {'textureId': 55, 'width': 640, 'height': 360};
         }
@@ -377,15 +382,33 @@ void main() {
 
     test('EC-SK1 seek() invokes timelineSeek (not dev_timelineSeek)', () async {
       calledMethods.clear();
+      capturedSeekArgs.clear();
       await controller.seek(2.5);
       expect(calledMethods, contains('timelineSeek'));
       expect(calledMethods, isNot(contains('dev_timelineSeek')));
+      expect(capturedSeekArgs, isNotEmpty);
+      expect(capturedSeekArgs.last['seconds'], closeTo(2.5, 0.001));
+      expect(capturedSeekArgs.last['resumeAfterSeek'], isFalse);
     });
 
     test('EC-SK2 seek() updates currentPTS', () async {
       await controller.seek(3.7);
       expect(controller.value.currentPTS, closeTo(3.7, 0.001));
     });
+
+    test(
+      'EC-SK3 seek() with resumeAfterSeek: true sends resumeAfterSeek true and updates currentPTS',
+      () async {
+        calledMethods.clear();
+        capturedSeekArgs.clear();
+        await controller.seek(2.5, resumeAfterSeek: true);
+        expect(calledMethods, contains('timelineSeek'));
+        expect(capturedSeekArgs, isNotEmpty);
+        expect(capturedSeekArgs.last['seconds'], closeTo(2.5, 0.001));
+        expect(capturedSeekArgs.last['resumeAfterSeek'], isTrue);
+        expect(controller.value.currentPTS, closeTo(2.5, 0.001));
+      },
+    );
   });
 
   // ───────────────────────────────────────────────────────────────────────────
