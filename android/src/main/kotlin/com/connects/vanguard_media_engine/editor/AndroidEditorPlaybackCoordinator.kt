@@ -259,9 +259,10 @@ class AndroidEditorPlaybackCoordinator(
         // .flattenOriginalClipAudio()) — one synthetic track per clip's own
         // already-validated sourcePath, tagged role="original" with a trackId of
         // "original-<clipId>" — passed through unchanged; and (2) exactly one
-        // user-added role="music" track, only for a single-clip timeline. Any
-        // other role (sfx, voiceover, unknown), a second music track, music on a
-        // multi-clip timeline, a non-zero startTime, non-zero fades, or non-empty
+        // user-added role="music" track, only for a single-clip timeline, with a
+        // finite non-negative startTime (Phase 7.8K-Android: delayed music
+        // start/end). Any other role (sfx, voiceover, unknown), a second music
+        // track, music on a multi-clip timeline, non-zero fades, or non-empty
         // volumeKeyframes are all unsupported in this slice.
         val audioSidecar = draft["audioSidecar"]
         var pendingMusicConfig: AndroidEditorAddedAudioTrackConfig? = null
@@ -353,23 +354,15 @@ class AndroidEditorPlaybackCoordinator(
                     )
                     return
                 }
-                if (duration <= 0.0 || sourceTrimStart < 0.0) {
+                if (duration <= 0.0 || sourceTrimStart < 0.0 || startTime < 0.0) {
                     result.error(
                         "INVALID_AUDIO_SIDECAR",
-                        "music track \"$trackId\" has an invalid duration or sourceTrimStart",
+                        "music track \"$trackId\" has an invalid duration, sourceTrimStart, or startTime",
                         null,
                     )
                     return
                 }
 
-                if (startTime != 0.0) {
-                    result.error(
-                        "UNSUPPORTED_TIMELINE_FEATURE",
-                        "music track \"$trackId\" startTime must be 0.0 in this slice",
-                        null,
-                    )
-                    return
-                }
                 if (fadeInSeconds != 0.0 || fadeOutSeconds != 0.0) {
                     result.error(
                         "UNSUPPORTED_TIMELINE_FEATURE",
@@ -398,6 +391,7 @@ class AndroidEditorPlaybackCoordinator(
                     sourcePath = url,
                     durationUs = (duration * 1_000_000.0).toLong(),
                     sourceTrimStartUs = (sourceTrimStart * 1_000_000.0).toLong(),
+                    trackStartUs = (startTime * 1_000_000.0).toLong(),
                     effectiveGain = volume * mixGain,
                 )
             }

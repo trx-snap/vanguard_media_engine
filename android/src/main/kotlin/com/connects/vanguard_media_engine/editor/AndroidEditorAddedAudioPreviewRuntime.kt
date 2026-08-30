@@ -7,6 +7,7 @@ import android.media.AudioManager
 import android.media.MediaPlayer
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Log
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
@@ -14,16 +15,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * Immutable added-music track config for [AndroidEditorAddedAudioPreviewRuntime].
  *
- * [durationUs] / [sourceTrimStartUs] are microseconds; [effectiveGain] is linear gain
- * (volume * mixGain from the wire sidecar track) clamped to `[0.0, 1.0]` by the runtime.
- * This slice requires the track's wire `startTime` to be exactly `0.0`, so the added
- * track's own timeline is the same PTS space as the global editor timeline.
+ * [durationUs] / [sourceTrimStartUs] / [trackStartUs] are microseconds; [effectiveGain] is
+ * linear gain (volume * mixGain from the wire sidecar track) clamped to `[0.0, 1.0]` by the
+ * runtime. [trackStartUs] is this track's delayed start position on the global editor timeline
+ * (Phase 7.8K-Android): the track is silent outside `[trackStartUs, trackStartUs + durationUs)`.
  */
 data class AndroidEditorAddedAudioTrackConfig(
     val trackId: String,
     val sourcePath: String,
     val durationUs: Long,
     val sourceTrimStartUs: Long,
+    val trackStartUs: Long,
     val effectiveGain: Double,
 )
 
@@ -33,12 +35,14 @@ data class AndroidEditorAddedAudioTrackConfig(
  * Plays back exactly one added music sidecar track using a single [MediaPlayer] confined to its
  * own dedicated [HandlerThread]/[Handler] (`audioHandler`) — mirroring
  * [AndroidEditorOriginalAudioPreviewRuntime]'s confinement style. Preview only; never touches
- * export/mux behavior, fades, keyframes, SFX, voiceover, delayed start, multi-track mixing,
- * multi-clip clocking, ducking, or waveform logic.
+ * export/mux behavior, fades, keyframes, SFX, voiceover, multi-track mixing, multi-clip clocking,
+ * ducking, or waveform logic.
  *
- * Since [AndroidEditorAddedAudioTrackConfig] always has wire `startTime == 0.0` in this slice,
- * a global timeline PTS maps 1:1 onto this track's own timeline PTS, and onto source-file PTS via
- * `sourceTrimStartUs + timelinePtsUs`.
+ * A global timeline PTS ([currentTimelinePtsUs]) maps onto this track's own timeline via
+ * [AndroidEditorAddedAudioTrackConfig.trackStartUs] (Phase 7.8K-Android: the track may start/end
+ * anywhere on the global timeline, not just at PTS 0), and onto source-file PTS via
+ * `sourceTrimStartUs + (timelinePtsUs - trackStartUs)` while inside the track's window
+ * `[trackStartUs, trackStartUs + durationUs)`.
  *
  * Failure handling: any MediaPlayer setup/prepare/seek/start error disables this instance
  * (`enabled = false`) and every subsequent call becomes a silent no-op — a corrupt/unsupported
@@ -58,6 +62,9 @@ class AndroidEditorAddedAudioPreviewRuntime(
 
     private val gain = config.effectiveGain.coerceIn(0.0, 1.0).toFloat()
 
+    /** Exclusive end of this track's window on the global timeline, microseconds. */
+    private val trackEndUs = config.trackStartUs + config.durationUs
+
     private val audioThread = HandlerThread("EditorAddedAudioPreview_${config.trackId}").also { it.start() }
     private val audioHandler = Handler(audioThread.looper)
 
@@ -73,13 +80,25 @@ class AndroidEditorAddedAudioPreviewRuntime(
     private var enabled = false
 
     /**
-     * This track's own current position on the global/track timeline (they are the same space —
-     * see class doc), microseconds. Updated on successful [seek] and on [pause] (read back from
-     * [MediaPlayer.getCurrentPosition]); used to gate [play] and to compute the remaining-duration
-     * end runnable.
+     * This track's current position on the *global* editor timeline, microseconds. While the
+     * position is before [AndroidEditorAddedAudioTrackConfig.trackStartUs], the [MediaPlayer]
+     * (if any) is kept parked, paused, at [AndroidEditorAddedAudioTrackConfig.sourceTrimStartUs]
+     * — that invariant lets a scheduled [startRunnable] fire without a re-seek. Updated on
+     * successful [seek], on [pause] (from wall-clock while waiting to start, or read back from
+     * [MediaPlayer.getCurrentPosition] once started), and on [onTrackEndReachedLocked].
      */
     private var currentTimelinePtsUs: Long = 0L
 
+    /** True from a [play] call (or a resuming [seek]) until [pause]/EOS/[seek] ends the session. */
+    private var playing = false
+
+    /** True once [MediaPlayer.start] has actually been invoked for the current [playing] session. */
+    private var mediaStarted = false
+
+    /** [SystemClock.uptimeMillis] recorded when the current before-start [playing] wait began. */
+    private var playBaselineUptimeMs: Long = 0L
+
+    private val startRunnable = Runnable { onDelayedStartFiredLocked() }
     private val endRunnable = Runnable { onTrackEndReachedLocked() }
 
     // ── prepare ────────────────────────────────────────────────────────────
@@ -130,6 +149,8 @@ class AndroidEditorAddedAudioPreviewRuntime(
                     player = mp
                     enabled = true
                     currentTimelinePtsUs = 0L
+                    playing = false
+                    mediaStarted = false
                     try {
                         mp.setVolume(gain, gain)
                     } catch (t: Throwable) {
@@ -168,9 +189,15 @@ class AndroidEditorAddedAudioPreviewRuntime(
     // ── play / pause ───────────────────────────────────────────────────────
 
     /**
-     * Requests audio focus (best-effort) and starts playback if enabled and the current timeline
-     * position is within `[0, durationUs)`. No-op otherwise. Schedules [endRunnable] for the
-     * remaining track duration.
+     * Starts (or schedules the delayed start of) this track, if enabled and the current global
+     * timeline position is before [trackEndUs]. No-op otherwise (including a repeat call while
+     * already [playing]).
+     *
+     * - Before [AndroidEditorAddedAudioTrackConfig.trackStartUs]: schedules [startRunnable] for
+     *   the remaining delay and does not request audio focus or touch the [MediaPlayer] until it
+     *   actually fires.
+     * - Inside the track window: seeks (if needed) and starts the [MediaPlayer] immediately,
+     *   requests focus immediately, and schedules [endRunnable] for the remaining duration.
      */
     fun play() {
         audioHandler.post {
@@ -183,51 +210,124 @@ class AndroidEditorAddedAudioPreviewRuntime(
                 Log.i(TAG, "$LOG_PREFIX play_skip reason=no_player trackId=${config.trackId}")
                 return@post
             }
-            if (currentTimelinePtsUs < 0L || currentTimelinePtsUs >= config.durationUs) {
-                Log.i(TAG, "$LOG_PREFIX play_skip reason=out_of_range currentTimelinePtsUs=$currentTimelinePtsUs durationUs=${config.durationUs} trackId=${config.trackId}")
+            if (playing) {
+                Log.i(TAG, "$LOG_PREFIX play_skip reason=already_playing trackId=${config.trackId}")
                 return@post
             }
-            requestFocusLocked()
-            try {
-                mp.start()
-                scheduleEndRunnableLocked()
-                Log.i(TAG, "$LOG_PREFIX play_started trackId=${config.trackId} currentTimelinePtsUs=$currentTimelinePtsUs")
-            } catch (t: Throwable) {
-                Log.w(TAG, "$LOG_PREFIX play_start_error trackId=${config.trackId}", t)
-                disableLocked(mp, "play_start_error")
+            if (currentTimelinePtsUs >= trackEndUs) {
+                Log.i(TAG, "$LOG_PREFIX play_skip reason=out_of_range currentTimelinePtsUs=$currentTimelinePtsUs trackEndUs=$trackEndUs trackId=${config.trackId}")
+                return@post
+            }
+
+            playing = true
+            playBaselineUptimeMs = SystemClock.uptimeMillis()
+            if (currentTimelinePtsUs < config.trackStartUs) {
+                val delayMs = (config.trackStartUs - currentTimelinePtsUs) / 1000L
+                audioHandler.removeCallbacks(startRunnable)
+                audioHandler.postDelayed(startRunnable, delayMs)
+                Log.i(TAG, "$LOG_PREFIX delayed_start_scheduled trackId=${config.trackId} delayMs=$delayMs currentTimelinePtsUs=$currentTimelinePtsUs trackStartUs=${config.trackStartUs}")
+            } else {
+                startMediaAtCurrentPtsLocked(mp, seekFirst = true)
             }
         }
     }
 
     /**
-     * Cancels the end runnable, updates [currentTimelinePtsUs] from the player's current
-     * position where possible, pauses playback (if playing), and abandons audio focus.
+     * Fires when a delayed start's schedule elapses. By the before-start invariant the
+     * [MediaPlayer] is already parked at [AndroidEditorAddedAudioTrackConfig.sourceTrimStartUs]
+     * (== the source position at [AndroidEditorAddedAudioTrackConfig.trackStartUs]), so this
+     * starts it directly without a re-seek. A no-op if [pause]/[seek] cancelled this wait first.
+     */
+    private fun onDelayedStartFiredLocked() {
+        if (released.get() || !enabled || !playing || mediaStarted) return
+        val mp = player ?: return
+        currentTimelinePtsUs = config.trackStartUs
+        startMediaAtCurrentPtsLocked(mp, seekFirst = false)
+    }
+
+    /**
+     * Starts [mp] at the source position mapped from [currentTimelinePtsUs], requests audio
+     * focus, and schedules [endRunnable]. [seekFirst] seeks to the mapped source position before
+     * starting (needed when entering the track window directly via [play]/[seek], since the
+     * MediaPlayer may still be parked elsewhere); false skips the seek when the caller already
+     * knows the MediaPlayer is correctly positioned (the delayed-start-fired path).
+     */
+    private fun startMediaAtCurrentPtsLocked(mp: MediaPlayer, seekFirst: Boolean) {
+        fun doStart() {
+            requestFocusLocked()
+            try {
+                mp.start()
+                mediaStarted = true
+                scheduleEndRunnableLocked()
+                Log.i(TAG, "$LOG_PREFIX play_started trackId=${config.trackId} currentTimelinePtsUs=$currentTimelinePtsUs")
+            } catch (t: Throwable) {
+                Log.w(TAG, "$LOG_PREFIX play_start_error trackId=${config.trackId}", t)
+                playing = false
+                disableLocked(mp, "play_start_error")
+            }
+        }
+
+        if (!seekFirst) {
+            doStart()
+            return
+        }
+        val targetSourceUs = config.sourceTrimStartUs + (currentTimelinePtsUs - config.trackStartUs)
+        val targetMs = (targetSourceUs / 1000L).coerceIn(0L, mp.duration.toLong().coerceAtLeast(0L))
+        try {
+            mp.setOnSeekCompleteListener { doStart() }
+            mp.seekTo(targetMs.toInt())
+        } catch (t: Throwable) {
+            Log.w(TAG, "$LOG_PREFIX play_seek_error trackId=${config.trackId}", t)
+            playing = false
+            disableLocked(mp, "play_seek_error")
+        }
+    }
+
+    /**
+     * Cancels the start/end runnables, updates [currentTimelinePtsUs] (from wall-clock if the
+     * track had not started yet, or from the player's current position otherwise), pauses
+     * playback (if playing), and abandons audio focus.
      */
     fun pause() {
         audioHandler.post {
             Log.i(TAG, "$LOG_PREFIX pause_start trackId=${config.trackId}")
+            audioHandler.removeCallbacks(startRunnable)
             audioHandler.removeCallbacks(endRunnable)
             abandonFocusLocked()
             if (released.get() || !enabled) {
+                playing = false
+                mediaStarted = false
                 Log.i(TAG, "$LOG_PREFIX pause_done reason=${if (released.get()) "released" else "disabled"} trackId=${config.trackId}")
                 return@post
             }
             val mp = player
             if (mp == null) {
+                playing = false
+                mediaStarted = false
                 Log.i(TAG, "$LOG_PREFIX pause_done reason=no_player trackId=${config.trackId}")
                 return@post
             }
-            try {
-                val sourcePosUs = mp.currentPosition.toLong() * 1000L
-                currentTimelinePtsUs = (sourcePosUs - config.sourceTrimStartUs).coerceIn(0L, config.durationUs)
-            } catch (t: Throwable) {
-                Log.w(TAG, "$LOG_PREFIX pause_position_read_error trackId=${config.trackId}", t)
+            if (playing) {
+                if (mediaStarted) {
+                    try {
+                        val sourcePosUs = mp.currentPosition.toLong() * 1000L
+                        currentTimelinePtsUs = (sourcePosUs - config.sourceTrimStartUs + config.trackStartUs)
+                            .coerceIn(config.trackStartUs, trackEndUs)
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "$LOG_PREFIX pause_position_read_error trackId=${config.trackId}", t)
+                    }
+                } else {
+                    val elapsedMs = SystemClock.uptimeMillis() - playBaselineUptimeMs
+                    currentTimelinePtsUs += elapsedMs.coerceAtLeast(0L) * 1000L
+                }
+                try {
+                    if (mp.isPlaying) mp.pause()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "$LOG_PREFIX pause_error trackId=${config.trackId}", t)
+                }
             }
-            try {
-                if (mp.isPlaying) mp.pause()
-            } catch (t: Throwable) {
-                Log.w(TAG, "$LOG_PREFIX pause_error trackId=${config.trackId}", t)
-            }
+            playing = false
+            mediaStarted = false
             Log.i(TAG, "$LOG_PREFIX pause_done trackId=${config.trackId} currentTimelinePtsUs=$currentTimelinePtsUs")
         }
     }
@@ -235,15 +335,23 @@ class AndroidEditorAddedAudioPreviewRuntime(
     // ── seek ───────────────────────────────────────────────────────────────
 
     /**
-     * Seeks this track to [targetTimelinePtsUs]. A target outside `[0, durationUs)` pauses/seeks
-     * to [AndroidEditorAddedAudioTrackConfig.sourceTrimStartUs] (this track's timeline 0) and
-     * never resumes; a target inside seeks to the mapped source position and resumes only when
-     * [resumeAfterSeek] is true and the seek succeeds. [onDone] always fires exactly once, posted
-     * on [audioHandler].
+     * Seeks this track to [targetTimelinePtsUs] (a global timeline PTS). Cancels the start/end
+     * runnables and pauses/abandons focus first. A target before
+     * [AndroidEditorAddedAudioTrackConfig.trackStartUs] parks the [MediaPlayer] at
+     * [AndroidEditorAddedAudioTrackConfig.sourceTrimStartUs] and, if [resumeAfterSeek], schedules
+     * a fresh delayed [play] using the retained target; a target inside the window seeks to the
+     * mapped source position and starts immediately when [resumeAfterSeek]; a target at/after the
+     * window end just records the position (no MediaPlayer seek, never starts). [onDone] always
+     * fires exactly once, posted on [audioHandler].
      */
     fun seek(targetTimelinePtsUs: Long, resumeAfterSeek: Boolean, onDone: () -> Unit) {
         audioHandler.post {
+            audioHandler.removeCallbacks(startRunnable)
             audioHandler.removeCallbacks(endRunnable)
+            playing = false
+            mediaStarted = false
+            abandonFocusLocked()
+
             val mp = player
             if (released.get() || !enabled || mp == null) {
                 val reason = when {
@@ -261,54 +369,58 @@ class AndroidEditorAddedAudioPreviewRuntime(
                 if (doneOnce.compareAndSet(false, true)) onDone()
             }
 
-            val inRange = targetTimelinePtsUs >= 0L && targetTimelinePtsUs < config.durationUs
-            if (!inRange) {
-                try {
-                    if (mp.isPlaying) mp.pause()
-                } catch (t: Throwable) {
-                    Log.w(TAG, "$LOG_PREFIX seek_out_of_range_pause_error trackId=${config.trackId}", t)
-                }
-                abandonFocusLocked()
-                val targetMs = (config.sourceTrimStartUs / 1000L)
-                    .coerceIn(0L, mp.duration.toLong().coerceAtLeast(0L))
-                try {
-                    mp.setOnSeekCompleteListener {
-                        currentTimelinePtsUs = 0L
-                        Log.i(TAG, "$LOG_PREFIX seek_completed resume=false outOfRange=true trackId=${config.trackId}")
-                        finish()
-                    }
-                    mp.seekTo(targetMs.toInt())
-                } catch (t: Throwable) {
-                    Log.w(TAG, "$LOG_PREFIX seek_error trackId=${config.trackId}", t)
-                    disableLocked(mp, "seek_error")
-                    finish()
-                }
-                return@post
+            try {
+                if (mp.isPlaying) mp.pause()
+            } catch (t: Throwable) {
+                Log.w(TAG, "$LOG_PREFIX seek_pause_error trackId=${config.trackId}", t)
             }
 
-            val targetSourceUs = config.sourceTrimStartUs + targetTimelinePtsUs
-            val targetMs = (targetSourceUs / 1000L).coerceIn(0L, mp.duration.toLong().coerceAtLeast(0L))
-            try {
-                mp.setOnSeekCompleteListener {
+            when {
+                targetTimelinePtsUs >= trackEndUs -> {
                     currentTimelinePtsUs = targetTimelinePtsUs
-                    if (resumeAfterSeek) {
-                        requestFocusLocked()
-                        try {
-                            mp.start()
-                            scheduleEndRunnableLocked()
-                        } catch (t: Throwable) {
-                            Log.w(TAG, "$LOG_PREFIX seek_resume_error trackId=${config.trackId}", t)
-                            disableLocked(mp, "seek_resume_error")
-                        }
-                    }
-                    Log.i(TAG, "$LOG_PREFIX seek_completed resume=$resumeAfterSeek outOfRange=false trackId=${config.trackId} targetTimelinePtsUs=$targetTimelinePtsUs")
+                    Log.i(TAG, "$LOG_PREFIX seek_completed resume=false region=at_or_after_end trackId=${config.trackId} targetTimelinePtsUs=$targetTimelinePtsUs")
                     finish()
                 }
-                mp.seekTo(targetMs.toInt())
-            } catch (t: Throwable) {
-                Log.w(TAG, "$LOG_PREFIX seek_error trackId=${config.trackId}", t)
-                disableLocked(mp, "seek_error")
-                finish()
+                targetTimelinePtsUs < config.trackStartUs -> {
+                    val targetMs = (config.sourceTrimStartUs / 1000L)
+                        .coerceIn(0L, mp.duration.toLong().coerceAtLeast(0L))
+                    try {
+                        mp.setOnSeekCompleteListener {
+                            currentTimelinePtsUs = targetTimelinePtsUs
+                            Log.i(TAG, "$LOG_PREFIX seek_completed resume=$resumeAfterSeek region=before_start trackId=${config.trackId} targetTimelinePtsUs=$targetTimelinePtsUs")
+                            if (resumeAfterSeek) {
+                                play()
+                            }
+                            finish()
+                        }
+                        mp.seekTo(targetMs.toInt())
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "$LOG_PREFIX seek_error trackId=${config.trackId}", t)
+                        disableLocked(mp, "seek_error")
+                        finish()
+                    }
+                }
+                else -> {
+                    val targetSourceUs = config.sourceTrimStartUs + (targetTimelinePtsUs - config.trackStartUs)
+                    val targetMs = (targetSourceUs / 1000L).coerceIn(0L, mp.duration.toLong().coerceAtLeast(0L))
+                    try {
+                        mp.setOnSeekCompleteListener {
+                            currentTimelinePtsUs = targetTimelinePtsUs
+                            if (resumeAfterSeek) {
+                                playing = true
+                                playBaselineUptimeMs = SystemClock.uptimeMillis()
+                                startMediaAtCurrentPtsLocked(mp, seekFirst = false)
+                            }
+                            Log.i(TAG, "$LOG_PREFIX seek_completed resume=$resumeAfterSeek region=inside_window trackId=${config.trackId} targetTimelinePtsUs=$targetTimelinePtsUs")
+                            finish()
+                        }
+                        mp.seekTo(targetMs.toInt())
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "$LOG_PREFIX seek_error trackId=${config.trackId}", t)
+                        disableLocked(mp, "seek_error")
+                        finish()
+                    }
+                }
             }
         }
     }
@@ -327,6 +439,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
         }
         audioHandler.post {
             Log.i(TAG, "$LOG_PREFIX release_start trackId=${config.trackId}")
+            audioHandler.removeCallbacks(startRunnable)
             audioHandler.removeCallbacks(endRunnable)
             abandonFocusLocked()
             teardownPlayerLocked()
@@ -340,7 +453,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
 
     private fun scheduleEndRunnableLocked() {
         audioHandler.removeCallbacks(endRunnable)
-        val remainingUs = (config.durationUs - currentTimelinePtsUs).coerceAtLeast(0L)
+        val remainingUs = (trackEndUs - currentTimelinePtsUs).coerceAtLeast(0L)
         audioHandler.postDelayed(endRunnable, remainingUs / 1000L)
     }
 
@@ -351,7 +464,9 @@ class AndroidEditorAddedAudioPreviewRuntime(
         } catch (t: Throwable) {
             Log.w(TAG, "$LOG_PREFIX track_end_pause_error trackId=${config.trackId}", t)
         }
-        currentTimelinePtsUs = config.durationUs
+        currentTimelinePtsUs = trackEndUs
+        playing = false
+        mediaStarted = false
         abandonFocusLocked()
         Log.i(TAG, "$LOG_PREFIX track_end_reached trackId=${config.trackId}")
     }
@@ -359,6 +474,10 @@ class AndroidEditorAddedAudioPreviewRuntime(
     private fun disableLocked(mp: MediaPlayer, reason: String = "unknown") {
         Log.w(TAG, "$LOG_PREFIX disable reason=$reason trackId=${config.trackId}")
         enabled = false
+        playing = false
+        mediaStarted = false
+        audioHandler.removeCallbacks(startRunnable)
+        audioHandler.removeCallbacks(endRunnable)
         abandonFocusLocked()
         if (player === mp) {
             player = null
@@ -369,6 +488,10 @@ class AndroidEditorAddedAudioPreviewRuntime(
 
     private fun teardownPlayerLocked() {
         enabled = false
+        playing = false
+        mediaStarted = false
+        audioHandler.removeCallbacks(startRunnable)
+        audioHandler.removeCallbacks(endRunnable)
         val mp = player
         player = null
         if (mp != null) {
