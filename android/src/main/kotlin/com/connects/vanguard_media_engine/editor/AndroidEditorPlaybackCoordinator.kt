@@ -13,14 +13,15 @@ import java.util.concurrent.atomic.AtomicInteger
  * timelineSeek, disposeTimeline) for sequential plain local video clips
  * (one or more clips, hard-cut concatenation only).
  *
- * Validates each draft against the current unsupported-feature guardrails
- * (transitions, overlays, audio sidecar, per-clip transform, non-default
- * fit/crop, freeze frame, reverse playback, dual camera, time remap,
- * transform track, color matrix) and delegates execution to
- * [AndroidEditorSequentialPlaybackSession]. Does not own streaming/cache/
- * RTC/export/compositor policy — those remain owned by their respective
- * coordinators or are left unimplemented for this slice (exportTimeline,
- * clearTimelineCache, timeline cache stats).
+ * Supports plain hard-cut video plus validated added-audio sidecar preview
+ * for the original/music/sfx/voiceover lanes (Phase 7.8O-Android). Validates
+ * each draft against the current unsupported-feature guardrails (transitions,
+ * overlays, per-clip transform, non-default fit/crop, freeze frame, reverse
+ * playback, dual camera, time remap, transform track, color matrix) and
+ * delegates execution to [AndroidEditorSequentialPlaybackSession]. Does not
+ * own streaming/cache/RTC/export/compositor policy — those remain owned by
+ * their respective coordinators or are left unimplemented for this slice
+ * (exportTimeline, clearTimelineCache, timeline cache stats).
  */
 class AndroidEditorPlaybackCoordinator(
     private val textureRegistry: TextureRegistry,
@@ -44,6 +45,14 @@ class AndroidEditorPlaybackCoordinator(
         /** Tolerance (us) for advisory wire startTimeSeconds vs. the computed sequential cursor. */
         private const val STARTTIME_TOLERANCE_US = 1_000L
 
+        /**
+         * Phase 7.8O-Android: native eager-MediaPlayer preview safety cap — each lane
+         * (added music+sfx, or voiceover) may hold at most this many non-overlapping
+         * tracks. Not a product UX rule; purely a guard against unbounded MediaPlayer
+         * instantiation for this preview slice.
+         */
+        private const val MAX_TRACKS_PER_LANE = 8
+
         private val OWNED_METHODS = setOf(
             "createTimelineTexture",
             "updateTimeline",
@@ -54,18 +63,30 @@ class AndroidEditorPlaybackCoordinator(
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
+
+        /** Added lane = `music` and `sfx` (Phase 7.8O-Android); `voiceover` is its own lane. */
+        private fun isAddedLaneRole(role: String?) = role == "music" || role == "sfx"
     }
+
+    /** One track's timeline window within a lane, used only for same-lane overlap validation. */
+    private data class AddedAudioLaneWindow(
+        val trackId: String,
+        val role: String,
+        val startUs: Long,
+        val endUs: Long,
+    )
 
     private data class ActiveEntry(
         val textureId: Long,
         val session: AndroidEditorSequentialPlaybackSession,
         val surfaceProducer: TextureRegistry.SurfaceProducer,
         /**
-         * Single-clip added-audio preview runtimes: zero, one, or two entries (at most one
-         * `role == "music"` and at most one `role == "voiceover"`, Phase 7.8L-Android). Attached
-         * after [AndroidEditorSequentialPlaybackSession.prepare] succeeds (see
-         * [createOrUpdateTimeline]); owned/released by this coordinator, never by the session
-         * (which only owns per-clip original-audio runtimes).
+         * Added-audio preview runtimes: zero or more, one per validated audioSidecar track
+         * (Phase 7.8O-Android: multiple non-overlapping `music`/`sfx` tracks share the added
+         * lane, multiple non-overlapping `voiceover` tracks share the voiceover lane; see
+         * [validateAndAddLaneWindow]). Attached after [AndroidEditorSequentialPlaybackSession
+         * .prepare] succeeds (see [createOrUpdateTimeline]); owned/released by this coordinator,
+         * never by the session (which only owns per-clip original-audio runtimes).
          */
         val addedAudioRuntimes: List<AndroidEditorAddedAudioPreviewRuntime> = emptyList(),
     )
@@ -84,6 +105,33 @@ class AndroidEditorPlaybackCoordinator(
             else -> return false
         }
         return true
+    }
+
+    /**
+     * Validates [candidate] against the other tracks already accepted into its lane
+     * ([windows]) and, if it passes, appends it to [windows]. Returns a human-readable
+     * error message (never throws/errors itself) if the lane is already at
+     * [MAX_TRACKS_PER_LANE] or [candidate] half-open-overlaps an existing window in the
+     * same lane; returns null on success. Touching endpoints (candidate.startUs ==
+     * existing.endUs or vice versa) are not a conflict.
+     */
+    private fun validateAndAddLaneWindow(
+        windows: MutableList<AddedAudioLaneWindow>,
+        laneName: String,
+        candidate: AddedAudioLaneWindow,
+    ): String? {
+        if (windows.size >= MAX_TRACKS_PER_LANE) {
+            return "$laneName lane exceeds the preview safety cap of $MAX_TRACKS_PER_LANE tracks " +
+                "(rejected track \"${candidate.trackId}\")"
+        }
+        for (existing in windows) {
+            if (candidate.startUs < existing.endUs && existing.startUs < candidate.endUs) {
+                return "$laneName track \"${candidate.trackId}\" (role=${candidate.role}) overlaps " +
+                    "existing $laneName track \"${existing.trackId}\" (role=${existing.role})"
+            }
+        }
+        windows.add(candidate)
+        return null
     }
 
     // ── createTimelineTexture / updateTimeline ────────────────────────────────
@@ -260,18 +308,24 @@ class AndroidEditorPlaybackCoordinator(
         // own derived original-clip-audio tracks (VGEditorDraft
         // .flattenOriginalClipAudio()) — one synthetic track per clip's own
         // already-validated sourcePath, tagged role="original" with a trackId of
-        // "original-<clipId>" — passed through unchanged; and (2) at most one
-        // user-added role="music" track and at most one user-added role="voiceover"
-        // track (Phase 7.8L-Android: a single-clip draft may carry both at once),
-        // supported on hard-cut single- or multi-clip timelines (Phase
-        // 7.8N-Android: multi-clip added-audio preview), each with a finite
-        // non-negative startTime (Phase 7.8K-Android: delayed start/end) and
-        // finite non-negative fadeInSeconds/fadeOutSeconds and/or volumeKeyframes
-        // (Phase 7.8M-Android: volume automation; see
-        // AndroidEditorAddedAudioPreviewRuntime/AndroidEditorAudioAutomation). Any
-        // other role (sfx, unknown, null), a duplicate music or voiceover track,
-        // or unsupported video features on the timeline remain unsupported in
-        // this slice.
+        // "original-<clipId>" — passed through unchanged; and (2) any number of
+        // user-added role="music"/"sfx" tracks (the shared added lane, matching
+        // the shared placement policy) and role="voiceover" tracks (its own lane,
+        // Phase 7.8O-Android: sfx parity + multi-track added lanes), supported on
+        // hard-cut single- or multi-clip timelines (Phase 7.8N-Android: multi-clip
+        // added-audio preview), each with a finite non-negative startTime (Phase
+        // 7.8K-Android: delayed start/end) and finite non-negative
+        // fadeInSeconds/fadeOutSeconds and/or volumeKeyframes (Phase 7.8M-Android:
+        // volume automation; see
+        // AndroidEditorAddedAudioPreviewRuntime/AndroidEditorAudioAutomation).
+        // Tracks sharing a lane must not overlap ([startUs, startUs+durationUs) is
+        // half-open; touching endpoints are allowed) and each lane is capped at
+        // [MAX_TRACKS_PER_LANE] tracks (a native eager-MediaPlayer preview safety
+        // guard, not a product rule — see [validateAndAddLaneWindow]). Any other
+        // role (unknown, null), a same-lane overlap, a lane over its cap, or
+        // unsupported video features on the timeline remain unsupported in this
+        // slice; iOS-style dynamic same-lane priority selection is intentionally
+        // not implemented here.
         val audioSidecar = draft["audioSidecar"]
         val pendingAddedAudioConfigs = mutableListOf<AndroidEditorAddedAudioTrackConfig>()
         if (audioSidecar != null) {
@@ -282,8 +336,9 @@ class AndroidEditorPlaybackCoordinator(
                 return
             }
 
-            var sawMusicTrack = false
-            var sawVoiceoverTrack = false
+            val addedLaneWindows = mutableListOf<AddedAudioLaneWindow>()
+            val voiceoverLaneWindows = mutableListOf<AddedAudioLaneWindow>()
+            val seenAddedTrackIds = mutableSetOf<String>()
             for (rawTrack in tracks) {
                 val track = rawTrack as? Map<*, *>
                 if (track == null) {
@@ -309,7 +364,7 @@ class AndroidEditorPlaybackCoordinator(
                     continue
                 }
 
-                if (role != "music" && role != "voiceover") {
+                if (!isAddedLaneRole(role) && role != "voiceover") {
                     result.error(
                         "UNSUPPORTED_TIMELINE_FEATURE",
                         "audioSidecar track role=\"$role\" is not supported in this slice",
@@ -318,30 +373,17 @@ class AndroidEditorPlaybackCoordinator(
                     return
                 }
 
-                if (role == "music") {
-                    if (sawMusicTrack) {
-                        result.error(
-                            "UNSUPPORTED_TIMELINE_FEATURE",
-                            "only one added music track is supported in this slice",
-                            null,
-                        )
-                        return
-                    }
-                    sawMusicTrack = true
-                } else {
-                    if (sawVoiceoverTrack) {
-                        result.error(
-                            "UNSUPPORTED_TIMELINE_FEATURE",
-                            "only one added voiceover track is supported in this slice",
-                            null,
-                        )
-                        return
-                    }
-                    sawVoiceoverTrack = true
-                }
-
                 if (trackId.isNullOrBlank() || url.isNullOrBlank()) {
                     result.error("INVALID_AUDIO_SIDECAR", "$role track is missing trackId or url", null)
+                    return
+                }
+
+                if (!seenAddedTrackIds.add(trackId!!)) {
+                    result.error(
+                        "INVALID_AUDIO_SIDECAR",
+                        "duplicate added-audio trackId \"$trackId\"",
+                        null,
+                    )
                     return
                 }
 
@@ -373,6 +415,23 @@ class AndroidEditorPlaybackCoordinator(
                         "$role track \"$trackId\" has an invalid duration, sourceTrimStart, or startTime",
                         null,
                     )
+                    return
+                }
+
+                val laneWindows = if (isAddedLaneRole(role)) addedLaneWindows else voiceoverLaneWindows
+                val laneName = if (isAddedLaneRole(role)) "added (music/sfx)" else "voiceover"
+                val laneError = validateAndAddLaneWindow(
+                    laneWindows,
+                    laneName,
+                    AddedAudioLaneWindow(
+                        trackId = trackId,
+                        role = role!!,
+                        startUs = (startTime * 1_000_000.0).toLong(),
+                        endUs = ((startTime + duration) * 1_000_000.0).toLong(),
+                    ),
+                )
+                if (laneError != null) {
+                    result.error("UNSUPPORTED_TIMELINE_FEATURE", laneError, null)
                     return
                 }
 

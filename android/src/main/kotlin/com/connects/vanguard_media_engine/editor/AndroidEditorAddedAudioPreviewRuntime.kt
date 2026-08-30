@@ -13,9 +13,9 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Immutable added-audio track config for [AndroidEditorAddedAudioPreviewRuntime]. Covers both
- * `role="music"` and `role="voiceover"` added-audio tracks (Phase 7.8L-Android); SFX remains
- * deferred.
+ * Immutable added-audio track config for [AndroidEditorAddedAudioPreviewRuntime]. Covers
+ * `role="music"`, `role="sfx"`, and `role="voiceover"` added-audio tracks (Phase 7.8L-Android;
+ * `sfx` added in Phase 7.8O-Android).
  *
  * [durationUs] / [sourceTrimStartUs] / [trackStartUs] / [fadeInUs] / [fadeOutUs] are
  * microseconds. [trackStartUs] is this track's delayed start position on the global editor
@@ -23,9 +23,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * durationUs)`. [volume], [mixGain], [fadeInUs], [fadeOutUs], and [volumeKeyframes] feed
  * [AndroidEditorAudioAutomation.computeEffectiveGain] (Phase 7.8M-Android) to compute the
  * runtime's per-tick linear gain, clamped to `[0.0, 1.0]`; a non-empty [volumeKeyframes]
- * overrides [volume]/[fadeInUs]/[fadeOutUs]. [role] is `"music"` or `"voiceover"`; it never
- * affects playback timing/mixing math, only logging and the [AudioAttributes] content type used
- * for focus requests.
+ * overrides [volume]/[fadeInUs]/[fadeOutUs]. [role] is `"music"`, `"sfx"`, or `"voiceover"`; it
+ * never affects playback timing/mixing math, only logging and the [AudioAttributes] content type
+ * used for focus requests.
  */
 data class AndroidEditorAddedAudioTrackConfig(
     val trackId: String,
@@ -42,17 +42,19 @@ data class AndroidEditorAddedAudioTrackConfig(
 )
 
 /**
- * Single-clip editor-preview added audio runtime.
+ * Editor-preview added audio runtime.
  *
- * Plays back exactly one added audio sidecar track (`role="music"` or `role="voiceover"`) using
- * a single [MediaPlayer] confined to its own dedicated [HandlerThread]/[Handler]
- * (`audioHandler`) — mirroring [AndroidEditorOriginalAudioPreviewRuntime]'s confinement style.
- * One coordinator-owned instance exists per added-audio track; a single-clip draft may have one
- * music instance and one voiceover instance active at once (Phase 7.8L-Android). Volume
- * automation (static fades and/or [AndroidEditorVolumeKeyframe] keyframes, Phase 7.8M-Android) is
- * applied live via [android.media.MediaPlayer.setVolume] on a periodic tick while playing — see
- * [AndroidEditorAudioAutomation]. Preview only; never touches export/mux behavior, SFX,
- * multi-clip added audio, multi-clip clocking, ducking, or waveform logic.
+ * Plays back exactly one added audio sidecar track (`role="music"`, `role="sfx"`, or
+ * `role="voiceover"`) using a single [MediaPlayer] confined to its own dedicated
+ * [HandlerThread]/[Handler] (`audioHandler`) — mirroring
+ * [AndroidEditorOriginalAudioPreviewRuntime]'s confinement style. One coordinator-owned instance
+ * exists per validated added-audio sidecar track: `music` and `sfx` share the added-audio lane
+ * and `voiceover` uses its own lane; lane overlap/cap validation is owned by
+ * [AndroidEditorPlaybackCoordinator] (Phase 7.8L-Android; `sfx` sharing the added lane added in
+ * Phase 7.8O-Android). Volume automation (static fades and/or [AndroidEditorVolumeKeyframe]
+ * keyframes, Phase 7.8M-Android) is applied live via [android.media.MediaPlayer.setVolume] on a
+ * periodic tick while playing — see [AndroidEditorAudioAutomation]. Preview only; never touches
+ * export/mux behavior, multi-clip clocking, ducking, or waveform logic.
  *
  * A global timeline PTS ([currentTimelinePtsUs]) maps onto this track's own timeline via
  * [AndroidEditorAddedAudioTrackConfig.trackStartUs] (Phase 7.8K-Android: the track may start/end
