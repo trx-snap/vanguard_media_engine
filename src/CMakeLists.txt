@@ -15,6 +15,10 @@ add_library(vanguard_graph STATIC "graph/src/graph.cpp")
 target_include_directories(vanguard_graph PUBLIC "graph/include")
 target_link_libraries(vanguard_graph PRIVATE vanguard_core)
 
+add_library(vanguard_sinks STATIC "sinks/src/passthrough_remux_sink_node.cpp")
+target_include_directories(vanguard_sinks PUBLIC "sinks/include")
+target_link_libraries(vanguard_sinks PRIVATE vanguard_graph vanguard_core)
+
 add_library(vanguard_render_shared STATIC "render/shared/src/backend_capability.cpp")
 target_include_directories(vanguard_render_shared PUBLIC "render/shared/include")
 target_link_libraries(vanguard_render_shared PRIVATE vanguard_core)
@@ -69,6 +73,7 @@ if (ANDROID)
     "platform/android/src/android_phase4a_decoder_smoke_jni.cpp"
     "platform/android/src/android_phase4b1_texture_playback_jni.cpp"
     "platform/android/src/android_phase2_concurrent_decode_jni.cpp"
+    "platform/android/src/android_passthrough_remux_sink_jni.cpp"
     "platform/android/src/android_phase5_encoder_smoke_jni.cpp"
     "platform/android/src/android_vulkan_export_jni.cpp"
     "platform/android/src/android_gles_backend_smoke_jni.cpp"
@@ -107,6 +112,7 @@ if (ANDROID)
     PRIVATE
     vanguard_core
     vanguard_graph
+    vanguard_sinks
     vanguard_render_shared
     vanguard_render_vulkan
     vanguard_render_gles

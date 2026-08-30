@@ -456,6 +456,31 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
+    // ── P2-CPP-PASSTHROUGH: PassthroughRemuxSinkNode native foundation ──────
+    // validation. Additive-only: validates DAG topology/timeline correctness
+    // for a passthrough remux sink ahead of any production remux work. Kotlin
+    // remains the sole owner of MediaExtractor/MediaMuxer; native never
+    // touches media file IO here.
+    external fun createAndroidDagPhase2PassthroughRemuxSinkSession(
+        sourceNodeId: String,
+        sinkNodeId: String,
+        startPtsUs: Long,
+        durationUs: Long,
+        requiresAudio: Boolean,
+    ): String
+
+    external fun validateAndroidDagPhase2PassthroughRemuxSinkSession(
+        sessionId: String,
+        timelinePtsUs: Long,
+        connectVideo: Boolean,
+        connectAudio: Boolean,
+        processingNodeCount: Int,
+    ): String
+
+    external fun destroyAndroidDagPhase2PassthroughRemuxSinkSession(
+        sessionId: String,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
