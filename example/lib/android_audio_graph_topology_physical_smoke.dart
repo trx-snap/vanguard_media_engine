@@ -3,7 +3,7 @@
 // AudioMixBusNode DAG topology & graph-gated diagnostic mix physical harness.
 //
 // Proof lanes:
-//   - DAG Topology & Order group: topologyOk, topoOrderOk, portTypeOk, capacityOk, cycleRejectOk.
+//   - DAG Topology & Order group: topologyOk, topoOrderOk, portTypeOk, capacityOk, cycleRejectOk, inputFanInRejectOk.
 //   - Graph Evaluation & Gating group: staleGenerationOk, mediaFlagsOk, graphGatedMixOk, invalidGainOk.
 //   - Lifecycle & Scope group: lifecycleOk, stackScoped, hasAudio, hasVideo.
 //   - Metrics group: nodeCount, edgeCount, activeNodeCount, mixCallCount, staleMixCallCount, framesMixed, mixChecksum, expectedChecksum, maxAccumulatorAbs.
@@ -13,7 +13,7 @@
 //   native_audio_mix_bus_graph_topology_and_graph_gated_diagnostic_mix_only_no_realtime_no_playback_no_audio_track_no_graph_buffer_transport_no_product
 //   Pure in-memory native C++ AudioMixBusNode DAG topology and graph-gated diagnostic mix only.
 //   No audible or realtime playback, no C++ graph buffer transport, no audio timeline gating,
-//   no input-port fan-in enforcement, no Pass-2 export graph reroute, does not close P4-AUDIO-MIXBUS.
+//   no Pass-2 export graph reroute, does not close P4-AUDIO-MIXBUS.
 
 // ignore_for_file: avoid_print
 
@@ -87,7 +87,8 @@ class _AndroidAudioGraphTopologyPhysicalSmokeAppState
       'topoOrderOk=${activeReport.topoOrderOk}, '
       'portTypeOk=${activeReport.portTypeOk}, '
       'capacityOk=${activeReport.capacityOk}, '
-      'cycleRejectOk=${activeReport.cycleRejectOk}',
+      'cycleRejectOk=${activeReport.cycleRejectOk}, '
+      'inputFanInRejectOk=${activeReport.inputFanInRejectOk}',
     );
 
     // 2. Graph Evaluation & Gating group
@@ -168,7 +169,7 @@ class _AndroidAudioGraphTopologyPhysicalSmokeAppState
       });
     }
 
-    await Future<void>.delayed(const Duration(milliseconds: 500));
+    await Future<void>.delayed(const Duration(milliseconds: 1500));
     exit(pass ? 0 : 1);
   }
 

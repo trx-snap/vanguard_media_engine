@@ -13,7 +13,6 @@
 // - Does not claim audible or realtime audio playback.
 // - Does not claim C++ graph buffer transport; evaluatePlayhead moves no PCM.
 // - Does not claim audio timeline gating; current audio nodes inherit always-active/identity defaults.
-// - Does not claim input-port fan-in enforcement.
 // - Does not claim Pass-2 export now runs through Graph.
 // - Does not close P4-AUDIO-MIXBUS.
 
@@ -87,6 +86,9 @@ class VGAudioGraphTopologySmokeReport {
   /// Whether self-loop cycle rejection succeeded without mutating edge count.
   bool get cycleRejectOk => _boolMetric('cycleRejectOk');
 
+  /// Whether second edge targeting an occupied input port fails closed without mutating edge count.
+  bool get inputFanInRejectOk => _boolMetric('inputFanInRejectOk');
+
   /// Whether stale generation evaluatePlayhead failed closed and executed zero mix calls.
   bool get staleGenerationOk => _boolMetric('staleGenerationOk');
 
@@ -157,6 +159,7 @@ class VGAudioGraphTopologySmokeReport {
       portTypeOk &&
       capacityOk &&
       cycleRejectOk &&
+      inputFanInRejectOk &&
       staleGenerationOk &&
       mediaFlagsOk &&
       graphGatedMixOk &&

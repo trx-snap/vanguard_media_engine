@@ -15,6 +15,7 @@ const _kAllLanes = <String>[
   'portTypeOk',
   'capacityOk',
   'cycleRejectOk',
+  'inputFanInRejectOk',
   'staleGenerationOk',
   'mediaFlagsOk',
   'graphGatedMixOk',
@@ -32,6 +33,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'portTypeOk': true,
     'capacityOk': true,
     'cycleRejectOk': true,
+    'inputFanInRejectOk': true,
     'staleGenerationOk': true,
     'mediaFlagsOk': true,
     'graphGatedMixOk': true,
@@ -60,6 +62,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'portTypeOk': 'true',
     'capacityOk': 'true',
     'cycleRejectOk': 'true',
+    'inputFanInRejectOk': 'true',
     'staleGenerationOk': 'true',
     'mediaFlagsOk': 'true',
     'graphGatedMixOk': 'true',
@@ -124,6 +127,7 @@ void main() {
         expect(report.portTypeOk, isTrue);
         expect(report.capacityOk, isTrue);
         expect(report.cycleRejectOk, isTrue);
+        expect(report.inputFanInRejectOk, isTrue);
         expect(report.staleGenerationOk, isTrue);
         expect(report.mediaFlagsOk, isTrue);
         expect(report.graphGatedMixOk, isTrue);
@@ -171,6 +175,7 @@ void main() {
             'portTypeOk': true,
             'capacityOk': true,
             'cycleRejectOk': true,
+            'inputFanInRejectOk': true,
             'staleGenerationOk': true,
             'mediaFlagsOk': true,
             'graphGatedMixOk': true,
@@ -226,6 +231,7 @@ void main() {
             'portTypeOk=true;'
             'capacityOk=true;'
             'cycleRejectOk=true;'
+            'inputFanInRejectOk=true;'
             'staleGenerationOk=true;'
             'mediaFlagsOk=true;'
             'graphGatedMixOk=true;'
@@ -339,6 +345,9 @@ void main() {
               break;
             case 'cycleRejectOk':
               expect(report.cycleRejectOk, isFalse);
+              break;
+            case 'inputFanInRejectOk':
+              expect(report.inputFanInRejectOk, isFalse);
               break;
             case 'staleGenerationOk':
               expect(report.staleGenerationOk, isFalse);

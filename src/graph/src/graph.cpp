@@ -133,6 +133,14 @@ core::Status Graph::connect(const std::string& fromNodeId,
                                 "connect: duplicate edge");
         }
     }
+    // Reject fan-in: an input port may only be targeted by one edge.
+    for (const auto& c : edges_) {
+        if (c.toNodeId == toNodeId && c.toPortId == toPortId) {
+            return core::Status(core::StatusCode::kError,
+                                "connect: input port already connected: " +
+                                toPortId + " on node " + toNodeId);
+        }
+    }
     // Cycle check: tentatively add the edge.
     edges_.push_back({fromNodeId, fromPortId, toNodeId, toPortId});
     std::vector<std::shared_ptr<Node>> dummy;

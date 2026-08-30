@@ -17,7 +17,6 @@ import io.flutter.plugin.common.MethodChannel
  * - Does not claim audible or realtime audio playback.
  * - Does not claim C++ graph buffer transport; evaluatePlayhead moves no PCM.
  * - Does not claim audio timeline gating; current audio nodes inherit always-active/identity defaults.
- * - Does not claim input-port fan-in enforcement.
  * - Does not claim Pass-2 export now runs through Graph.
  * - Does not close P4-AUDIO-MIXBUS.
  */

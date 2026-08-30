@@ -5,7 +5,6 @@
 // - Does not claim audible or realtime audio playback.
 // - Does not claim C++ graph buffer transport; evaluatePlayhead moves no PCM.
 // - Does not claim audio timeline gating; current audio nodes inherit always-active/identity defaults.
-// - Does not claim input-port fan-in enforcement.
 // - Does not claim Pass-2 export now runs through Graph.
 // - Does not close P4-AUDIO-MIXBUS.
 //
@@ -86,6 +85,7 @@ std::string RunAudioGraphTopologySmokeInternal() {
     bool portTypeOk = false;
     bool capacityOk = false;
     bool cycleRejectOk = false;
+    bool inputFanInRejectOk = false;
     bool staleGenerationOk = false;
     bool mediaFlagsOk = false;
     bool graphGatedMixOk = false;
@@ -238,16 +238,48 @@ std::string RunAudioGraphTopologySmokeInternal() {
         }
     }
 
-    // ── 5. cycleRejectOk: mix.mixed_audio_out -> mix.primary_audio_in self-loop fails closed and edgeCount unchanged ──
+    // ── 5. cycleRejectOk: mix.mixed_audio_out -> mix.audio_in_3 self-loop fails closed and edgeCount unchanged ──
     {
         const size_t edgeCountBefore = graph.edgeCount();
-        vanguard::core::Status sCycle = graph.connect("mix0", "mixed_audio_out", "mix0", "primary_audio_in");
+        vanguard::core::Status sCycle = graph.connect("mix0", "mixed_audio_out", "mix0", "audio_in_3");
         const size_t edgeCountAfter = graph.edgeCount();
 
-        if (!sCycle.ok() && edgeCountBefore == edgeCountAfter) {
+        if (!sCycle.ok() && edgeCountBefore == edgeCountAfter &&
+            sCycle.message().find("would create a cycle") != std::string::npos) {
             cycleRejectOk = true;
         } else {
             if (failureReason.empty()) failureReason = "cycle_rejection_failed";
+        }
+    }
+
+    // ── 5b. inputFanInRejectOk: second edge targeting an already-occupied input port fails closed ──
+    {
+        vanguard::graph::Graph fanInGraph;
+        auto fanSrcA = std::make_shared<vanguard::audio::DecodedAudioPcmSourceNode>("fan_src_a", 48000, 2, 4800, 0);
+        auto fanSrcB = std::make_shared<vanguard::audio::DecodedAudioPcmSourceNode>("fan_src_b", 48000, 2, 4800, 0);
+        auto fanMix = std::make_shared<vanguard::audio::AudioMixBusNode>("fan_mix", 48000, 2, 512);
+        fanInGraph.addNode(fanSrcA);
+        fanInGraph.addNode(fanSrcB);
+        fanInGraph.addNode(fanMix);
+
+        vanguard::core::Status sFanFirst =
+            fanInGraph.connect("fan_src_a", "audio_out", "fan_mix", "primary_audio_in");
+        const size_t fanEdgeCountAfterFirst = fanInGraph.edgeCount();
+        const uint64_t fanGenerationAfterFirst = fanInGraph.generationId();
+
+        vanguard::core::Status sFanSecond =
+            fanInGraph.connect("fan_src_b", "audio_out", "fan_mix", "primary_audio_in");
+        const size_t fanEdgeCountAfterSecond = fanInGraph.edgeCount();
+        const uint64_t fanGenerationAfterSecond = fanInGraph.generationId();
+
+        if (sFanFirst.ok() &&
+            !sFanSecond.ok() &&
+            sFanSecond.message().find("input port already connected") != std::string::npos &&
+            fanEdgeCountAfterSecond == fanEdgeCountAfterFirst &&
+            fanGenerationAfterSecond == fanGenerationAfterFirst) {
+            inputFanInRejectOk = true;
+        } else {
+            if (failureReason.empty()) failureReason = "input_fan_in_rejection_failed";
         }
     }
 
@@ -431,7 +463,7 @@ std::string RunAudioGraphTopologySmokeInternal() {
     }
 
     const bool allPass = topologyOk && topoOrderOk && portTypeOk && capacityOk &&
-                         cycleRejectOk && staleGenerationOk && mediaFlagsOk &&
+                         cycleRejectOk && inputFanInRejectOk && staleGenerationOk && mediaFlagsOk &&
                          graphGatedMixOk && invalidGainOk && lifecycleOk;
 
     std::ostringstream oss;
@@ -443,6 +475,7 @@ std::string RunAudioGraphTopologySmokeInternal() {
             << "portTypeOk=true;"
             << "capacityOk=true;"
             << "cycleRejectOk=true;"
+            << "inputFanInRejectOk=true;"
             << "staleGenerationOk=true;"
             << "mediaFlagsOk=true;"
             << "graphGatedMixOk=true;"
@@ -470,6 +503,7 @@ std::string RunAudioGraphTopologySmokeInternal() {
             << "portTypeOk=" << (portTypeOk ? "true" : "false") << ";"
             << "capacityOk=" << (capacityOk ? "true" : "false") << ";"
             << "cycleRejectOk=" << (cycleRejectOk ? "true" : "false") << ";"
+            << "inputFanInRejectOk=" << (inputFanInRejectOk ? "true" : "false") << ";"
             << "staleGenerationOk=" << (staleGenerationOk ? "true" : "false") << ";"
             << "mediaFlagsOk=" << (mediaFlagsOk ? "true" : "false") << ";"
             << "graphGatedMixOk=" << (graphGatedMixOk ? "true" : "false") << ";"
