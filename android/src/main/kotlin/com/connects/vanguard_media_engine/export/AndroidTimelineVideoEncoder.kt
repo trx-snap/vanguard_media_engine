@@ -126,21 +126,26 @@ class AndroidTimelineVideoEncoder(
     private var aPositionLoc = 0
     private var aTexCoordLoc = 0
     private var uSTMatrixLoc = 0
-    // Phase 10: colorMatrix uniforms (OES program only -- never uploaded to
-    // the 2D still-image program, which does not apply colorMatrix).
+    // Phase 10: colorMatrix uniforms for the OES program. The 2D still-image
+    // program has its own separate set of uniform locations below -- never
+    // shared between the two draw paths.
     private var uColorMatrixRow0Loc = 0
     private var uColorMatrixRow1Loc = 0
     private var uColorMatrixRow2Loc = 0
     private var uColorMatrixRow3Loc = 0
     private var uColorMatrixOffsetLoc = 0
     private var framesSubmitted = 0
-    @Volatile private var loggedColorMatrixSkippedForImage = false
 
     // ─── 2D GL program (still-image clips) — distinct locations from the OES
     // program above; never reused between the two draw paths. ────────────────
     private var glProgram2D = 0
     private var aPositionLoc2D = 0
     private var aTexCoordLoc2D = 0
+    private var uColorMatrixRow0Loc2D = 0
+    private var uColorMatrixRow1Loc2D = 0
+    private var uColorMatrixRow2Loc2D = 0
+    private var uColorMatrixRow3Loc2D = 0
+    private var uColorMatrixOffsetLoc2D = 0
 
     // ─── Decode-side transfer surface (OES texture target for the decoder) ──
     private var decodeSurfaceTexture: SurfaceTexture? = null
@@ -381,7 +386,9 @@ class AndroidTimelineVideoEncoder(
     /// texture sampler with no uSTMatrix uniform (still images are uploaded
     /// directly via GLUtils.texImage2D, not through a SurfaceTexture). Kept
     /// fully separate from [setupShaderProgram]'s OES program and its
-    /// attribute/uniform locations.
+    /// attribute/uniform locations, but applies the same 4x5 row-major
+    /// colorMatrix semantics via its own uniform set -- see
+    /// [uploadColorMatrixUniforms].
     private fun setup2DShaderProgram() {
         val vertexSrc = """
             attribute vec4 aPosition;
@@ -394,11 +401,23 @@ class AndroidTimelineVideoEncoder(
         """.trimIndent()
 
         val fragmentSrc = """
-            precision mediump float;
+            precision highp float;
             varying vec2 vTextureCoord;
             uniform sampler2D sTexture;
+            uniform vec4 uColorMatrixRow0;
+            uniform vec4 uColorMatrixRow1;
+            uniform vec4 uColorMatrixRow2;
+            uniform vec4 uColorMatrixRow3;
+            uniform vec4 uColorMatrixOffset;
             void main() {
-                gl_FragColor = texture2D(sTexture, vTextureCoord);
+                vec4 rgba = texture2D(sTexture, vTextureCoord);
+                vec4 outColor = vec4(
+                    dot(uColorMatrixRow0, rgba) + uColorMatrixOffset.r,
+                    dot(uColorMatrixRow1, rgba) + uColorMatrixOffset.g,
+                    dot(uColorMatrixRow2, rgba) + uColorMatrixOffset.b,
+                    dot(uColorMatrixRow3, rgba) + uColorMatrixOffset.a
+                );
+                gl_FragColor = clamp(outColor, 0.0, 1.0);
             }
         """.trimIndent()
 
@@ -419,6 +438,11 @@ class AndroidTimelineVideoEncoder(
         glProgram2D = program
         aPositionLoc2D = GLES20.glGetAttribLocation(program, "aPosition")
         aTexCoordLoc2D = GLES20.glGetAttribLocation(program, "aTextureCoord")
+        uColorMatrixRow0Loc2D = GLES20.glGetUniformLocation(program, "uColorMatrixRow0")
+        uColorMatrixRow1Loc2D = GLES20.glGetUniformLocation(program, "uColorMatrixRow1")
+        uColorMatrixRow2Loc2D = GLES20.glGetUniformLocation(program, "uColorMatrixRow2")
+        uColorMatrixRow3Loc2D = GLES20.glGetUniformLocation(program, "uColorMatrixRow3")
+        uColorMatrixOffsetLoc2D = GLES20.glGetUniformLocation(program, "uColorMatrixOffset")
     }
 
     private fun compileShader(type: Int, src: String): Int {
@@ -684,7 +708,14 @@ class AndroidTimelineVideoEncoder(
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
         GLES20.glUniformMatrix4fv(uSTMatrixLoc, 1, false, stMatrix, 0)
-        uploadColorMatrixUniforms(colorMatrix)
+        uploadColorMatrixUniforms(
+            colorMatrix,
+            uColorMatrixRow0Loc,
+            uColorMatrixRow1Loc,
+            uColorMatrixRow2Loc,
+            uColorMatrixRow3Loc,
+            uColorMatrixOffsetLoc,
+        )
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
@@ -697,27 +728,37 @@ class AndroidTimelineVideoEncoder(
     }
 
     /// Uploads [colorMatrix] (20-element, 4x5 row-major -- R,G,B,A,offset per
-    /// output channel) into the OES program's row/offset uniforms. A null
-    /// [colorMatrix] uploads identity rows and a zero offset, so the shader's
-    /// dot-product path is a no-op passthrough. The 5th (offset) column of
-    /// each row is divided by 255.0 before upload, matching Flutter/Android
-    /// ColorFilter.matrix's 0-255 offset convention against this shader's
-    /// [0.0, 1.0] color space.
-    private fun uploadColorMatrixUniforms(colorMatrix: FloatArray?) {
+    /// output channel) into the row/offset uniforms at the given locations --
+    /// shared by both the OES program (see [drawAndSubmitFrame]) and the 2D
+    /// still-image program (see [drawAndSubmitFrame2D]), each passing its own
+    /// distinct uniform locations so the two programs' uniform state never
+    /// cross-contaminates. A null [colorMatrix] uploads identity rows and a
+    /// zero offset, so the shader's dot-product path is a no-op passthrough.
+    /// The 5th (offset) column of each row is divided by 255.0 before upload,
+    /// matching Flutter/Android ColorFilter.matrix's 0-255 offset convention
+    /// against this shader's [0.0, 1.0] color space.
+    private fun uploadColorMatrixUniforms(
+        colorMatrix: FloatArray?,
+        row0Loc: Int,
+        row1Loc: Int,
+        row2Loc: Int,
+        row3Loc: Int,
+        offsetLoc: Int,
+    ) {
         if (colorMatrix == null) {
-            GLES20.glUniform4f(uColorMatrixRow0Loc, 1f, 0f, 0f, 0f)
-            GLES20.glUniform4f(uColorMatrixRow1Loc, 0f, 1f, 0f, 0f)
-            GLES20.glUniform4f(uColorMatrixRow2Loc, 0f, 0f, 1f, 0f)
-            GLES20.glUniform4f(uColorMatrixRow3Loc, 0f, 0f, 0f, 1f)
-            GLES20.glUniform4f(uColorMatrixOffsetLoc, 0f, 0f, 0f, 0f)
+            GLES20.glUniform4f(row0Loc, 1f, 0f, 0f, 0f)
+            GLES20.glUniform4f(row1Loc, 0f, 1f, 0f, 0f)
+            GLES20.glUniform4f(row2Loc, 0f, 0f, 1f, 0f)
+            GLES20.glUniform4f(row3Loc, 0f, 0f, 0f, 1f)
+            GLES20.glUniform4f(offsetLoc, 0f, 0f, 0f, 0f)
             return
         }
-        GLES20.glUniform4f(uColorMatrixRow0Loc, colorMatrix[0], colorMatrix[1], colorMatrix[2], colorMatrix[3])
-        GLES20.glUniform4f(uColorMatrixRow1Loc, colorMatrix[5], colorMatrix[6], colorMatrix[7], colorMatrix[8])
-        GLES20.glUniform4f(uColorMatrixRow2Loc, colorMatrix[10], colorMatrix[11], colorMatrix[12], colorMatrix[13])
-        GLES20.glUniform4f(uColorMatrixRow3Loc, colorMatrix[15], colorMatrix[16], colorMatrix[17], colorMatrix[18])
+        GLES20.glUniform4f(row0Loc, colorMatrix[0], colorMatrix[1], colorMatrix[2], colorMatrix[3])
+        GLES20.glUniform4f(row1Loc, colorMatrix[5], colorMatrix[6], colorMatrix[7], colorMatrix[8])
+        GLES20.glUniform4f(row2Loc, colorMatrix[10], colorMatrix[11], colorMatrix[12], colorMatrix[13])
+        GLES20.glUniform4f(row3Loc, colorMatrix[15], colorMatrix[16], colorMatrix[17], colorMatrix[18])
         GLES20.glUniform4f(
-            uColorMatrixOffsetLoc,
+            offsetLoc,
             colorMatrix[4] / 255.0f,
             colorMatrix[9] / 255.0f,
             colorMatrix[14] / 255.0f,
@@ -729,7 +770,12 @@ class AndroidTimelineVideoEncoder(
     /// image) into the encoder's EGL surface and submits it via
     /// eglSwapBuffers, using the separate 2D program/locations — never the
     /// OES program or its uSTMatrix uniform.
-    private fun drawAndSubmitFrame2D(textureId: Int) {
+    ///
+    /// [colorMatrix], when non-null, is the active clip's 20-element (4x5
+    /// row-major) filter, applied by the 2D fragment shader for this frame
+    /// only -- same semantics/upload path as the OES program's
+    /// [drawAndSubmitFrame], via the 2D program's own uniform locations.
+    private fun drawAndSubmitFrame2D(textureId: Int, colorMatrix: FloatArray?) {
         EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
 
         GLES20.glViewport(0, 0, width, height)
@@ -747,6 +793,14 @@ class AndroidTimelineVideoEncoder(
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
+        uploadColorMatrixUniforms(
+            colorMatrix,
+            uColorMatrixRow0Loc2D,
+            uColorMatrixRow1Loc2D,
+            uColorMatrixRow2Loc2D,
+            uColorMatrixRow3Loc2D,
+            uColorMatrixOffsetLoc2D,
+        )
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
@@ -768,15 +822,6 @@ class AndroidTimelineVideoEncoder(
         var textureId = 0
         var bitmapToRecycle: Bitmap? = null
         try {
-            // Phase 10: colorMatrix is accepted/carried for image clips (to
-            // match iOS timeline policy) but never applied in this 2D
-            // still-image draw path -- logged once per encoder instance, not
-            // per frame, since [ClipInput.stillFrameCount] frames are drawn
-            // identically below.
-            if (clip.colorMatrix != null && !loggedColorMatrixSkippedForImage) {
-                loggedColorMatrixSkippedForImage = true
-                Log.i(TAG, "VG_EXPORT_COLOR_MATRIX_SKIPPED_FOR_IMAGE clip=${clip.sourcePath}")
-            }
             EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
 
             val maxTextureSize = IntArray(1)
@@ -815,7 +860,7 @@ class AndroidTimelineVideoEncoder(
             var framesRendered = 0
             for (i in 0 until clip.stillFrameCount) {
                 if (cancelRequested) break
-                drawAndSubmitFrame2D(textureId)
+                drawAndSubmitFrame2D(textureId, clip.colorMatrix)
                 drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
                 framesRendered++
             }

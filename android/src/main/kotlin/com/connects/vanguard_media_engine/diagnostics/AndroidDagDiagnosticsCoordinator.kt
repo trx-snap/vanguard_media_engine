@@ -81,6 +81,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidVulkanExportProductionWiringSmoke",
             "runAndroidGlesExportFitGeometrySmoke",
             "runAndroidTimelineColorMatrixExportSmoke",
+            "runAndroidStillImageColorMatrixExportSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -144,6 +145,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidVulkanExportProductionWiringSmoke" -> runAndroidVulkanExportProductionWiringSmoke(args, result)
             "runAndroidGlesExportFitGeometrySmoke" -> runAndroidGlesExportFitGeometrySmoke(args, result)
             "runAndroidTimelineColorMatrixExportSmoke" -> runAndroidTimelineColorMatrixExportSmoke(args, result)
+            "runAndroidStillImageColorMatrixExportSmoke" -> runAndroidStillImageColorMatrixExportSmoke(args, result)
             else -> return false
         }
         return true
@@ -1186,6 +1188,47 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "TIMELINE_COLOR_MATRIX_EXPORT_SMOKE_FAILED",
                         "runAndroidTimelineColorMatrixExportSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── GLES still-image colorMatrix export smoke harness ───────────────────
+    private fun runAndroidStillImageColorMatrixExportSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val outputDir = args?.get("outputDir") as? String
+        if (outputDir.isNullOrBlank()) {
+            result.error(
+                "INVALID_ARG",
+                "runAndroidStillImageColorMatrixExportSmoke: outputDir required",
+                null,
+            )
+            return
+        }
+        val width = (args["width"] as? Number)?.toInt() ?: 1280
+        val height = (args["height"] as? Number)?.toInt() ?: 720
+        val fps = (args["fps"] as? Number)?.toInt() ?: 30
+        val bitrateBps = (args["bitrateBps"] as? Number)?.toInt() ?: 4_000_000
+        val durationSeconds = (args["durationSeconds"] as? Number)?.toDouble() ?: 1.0
+
+        Thread {
+            try {
+                val smokeResult = AndroidStillImageColorMatrixExportSmokeHarness.run(
+                    context = context,
+                    outputDir = outputDir,
+                    width = width,
+                    height = height,
+                    fps = fps,
+                    bitrateBps = bitrateBps,
+                    durationSeconds = durationSeconds,
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "STILL_IMAGE_COLOR_MATRIX_EXPORT_SMOKE_FAILED",
+                        "runAndroidStillImageColorMatrixExportSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }

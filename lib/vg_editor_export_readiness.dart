@@ -13,8 +13,8 @@
 // local video and still-image clips (one or more, hard-cut concatenation
 // only) with direct-copy or PCM mixdown audio sidecar export (Unit H). Still
 // image clips are local files only, fitMode must be 'fit' (default), and
-// cropRect must be null. Per-clip colorMatrix filtering is supported (applied
-// to decoded video frames; accepted but not applied for still-image clips).
+// cropRect must be null. Per-clip colorMatrix filtering is supported and
+// applied to both decoded video frames and still-image frames.
 // It does not yet execute editor compositor features such as transitions,
 // overlays, spatial clip transforms, still-image crop/fill, freeze frames,
 // reverse playback, dual-camera composition, time remap, transform tracks,
@@ -240,7 +240,7 @@ final class VGEditorExportReadinessReport {
 /// - No time remap (`clip.timeRemap == null`).
 /// - No transform track (`clip.transformTrack == null`).
 /// - Color matrix filtering is supported (`clip.colorMatrix` may be non-null;
-///   applied to decoded video frames, accepted-but-not-applied for images).
+///   applied to both decoded video frames and still-image frames).
 /// - Audio sidecar plans are allowed (Unit H proves direct-copy and PCM mixdown export).
 /// - Export request dimensions must resolve to positive even integers.
 /// - Frame rates (draft fps, request fps) must be positive.

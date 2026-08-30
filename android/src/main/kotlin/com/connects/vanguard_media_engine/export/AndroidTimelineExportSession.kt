@@ -38,10 +38,14 @@ import kotlin.math.floor
 //   - video-only clips, speed == 1.0, no transitions, no overlays, no canvas
 //     contentMode other than "fit", no per-clip transform/crop/freeze/
 //     reverse/time-remap/dual-camera. Per-clip colorMatrix is accepted and
-//     applied to decoded video frames by whichever backend renders the clip
-//     (Vulkan-native color-matrix push constants, or the GLES OES program's
-//     colorMatrix uniforms -- see AndroidExportRenderBackendSelector); still-
-//     image clips accept/carry colorMatrix but never apply it.
+//     applied for both decoded video frames and still-image frames by
+//     whichever backend renders the clip (Vulkan-native color-matrix push
+//     constants for supported video clips, or the GLES program's colorMatrix
+//     uniforms -- see AndroidExportRenderBackendSelector). Vulkan remains the
+//     preferred/default backend for supported video clips within its narrow
+//     safe scope; still-image clips fall outside that Vulkan scope and always
+//     render via the GLES fallback (AndroidTimelineVideoEncoder), which
+//     applies colorMatrix in its 2D still-image shader path.
 //   - clip rotation metadata (0/90/180/270 after normalization) and decoded
 //     clip dimensions that differ from each other or from the requested
 //     output geometry are supported: each clip is centered and
