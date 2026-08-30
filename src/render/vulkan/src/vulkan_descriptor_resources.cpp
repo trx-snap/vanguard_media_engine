@@ -70,15 +70,17 @@ HardwareBufferImportResult VulkanDescriptorResources::create(
     }
 
     // -------------------------------------------------------------------------
-    // 2. VkPipelineLayout (Phase 4B2C)
+    // 2. VkPipelineLayout (Phase 4B2C, extended Phase 10)
     //    One descriptor set layout.
-    //    Phase 4B2C: vertex-stage push constant range for
-    //    VideoTransformPushConstants (offset 0, size derived from struct).
+    //    Phase 10: vertex|fragment-stage push constant range for
+    //    VideoTransformFullPushConstants (UV transform + color matrix,
+    //    offset 0, size derived from struct) -- the fragment stage now also
+    //    reads its color-matrix half of the same combined push-constant block.
     // -------------------------------------------------------------------------
     VkPushConstantRange pushConstantRange{};
-    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     pushConstantRange.offset     = 0;
-    pushConstantRange.size       = sizeof(vanguard::render::VideoTransformPushConstants);
+    pushConstantRange.size       = sizeof(vanguard::render::VideoTransformFullPushConstants);
 
     VkPipelineLayoutCreateInfo plCI{};
     plCI.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;

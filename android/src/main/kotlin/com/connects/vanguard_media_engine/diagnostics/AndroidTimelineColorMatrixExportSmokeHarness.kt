@@ -25,12 +25,17 @@ import kotlin.math.max
  * Physical proof harness for Android timeline video export colorMatrix parity.
  *
  * Proof boundary: [PROOF_BOUNDARY]
- * ("production_exportTimeline_color_matrix_gles_fallback_pixel_oracle")
+ * ("production_exportTimeline_color_matrix_vulkan_native_pixel_oracle")
  *
  * Directly exercises [AndroidTimelineExportSession] with a synthetic solid-color
  * video clip carrying a non-trivial 20-element [colorMatrix] (4x5 row-major with
  * row weights and non-zero additive offsets). Validates:
- * 1. Automatic routing from Vulkan-preferred to GLES backend due to colorMatrix.
+ * 1. The production session resolves and renders via the native Vulkan export
+ *    backend (renderBackend == "vulkan") -- a GLES fallback/retry must not be
+ *    able to pass this oracle, since colorMatrix is applied natively on the
+ *    Vulkan path (see AndroidTimelineVulkanVideoEncoder /
+ *    android_vulkan_export_jni.cpp) and is within Vulkan's safe scope (see
+ *    AndroidExportRenderBackendSelector).
  * 2. Successful timeline video export completion via production session.
  * 3. Content-region pixel oracle verifying that the decoded frame output matches
  *    the expected matrix transform within codec tolerance (<=40 per channel)
@@ -38,7 +43,7 @@ import kotlin.math.max
  */
 object AndroidTimelineColorMatrixExportSmokeHarness {
     private const val TAG = "VanguardColorMatrixExport"
-    const val PROOF_BOUNDARY = "production_exportTimeline_color_matrix_gles_fallback_pixel_oracle"
+    const val PROOF_BOUNDARY = "production_exportTimeline_color_matrix_vulkan_native_pixel_oracle"
 
     const val SOURCE_R = 96.0
     const val SOURCE_G = 64.0
@@ -120,6 +125,7 @@ object AndroidTimelineColorMatrixExportSmokeHarness {
         var actualOutputHeight = 0
         var prodErrorCode: String? = null
         var prodErrorMessage: String? = null
+        var renderBackend: String? = null
 
         val prodProgressSamples = Collections.synchronizedList(mutableListOf<Double>())
         var actualMeanRgb = RgbTriple(0.0, 0.0, 0.0)
@@ -184,6 +190,7 @@ object AndroidTimelineColorMatrixExportSmokeHarness {
             val timedOut = !latch.await(120, TimeUnit.SECONDS)
             val prodFile = File(prodOutputPath)
             prodOutputSize = if (prodFile.exists()) prodFile.length() else 0L
+            renderBackend = sessionSuccessMap?.get("renderBackend") as? String
 
             if (timedOut) {
                 failureReason = "production_export_timeout_120s"
@@ -217,6 +224,7 @@ object AndroidTimelineColorMatrixExportSmokeHarness {
                     progressSamples = prodProgressSamples,
                     errorCode = prodErrorCode,
                     errorMessage = prodErrorMessage,
+                    renderBackend = renderBackend,
                 )
             }
 
@@ -265,11 +273,21 @@ object AndroidTimelineColorMatrixExportSmokeHarness {
                 }
             }
 
-            val overallPass = prodPass && pixelPass && filterAppliedOraclePass
+            // Vulkan-native proof boundary (see class doc): the production session
+            // must have actually rendered via the Vulkan backend -- a GLES
+            // retry/fallback must not be able to pass this oracle.
+            val renderBackendPass = renderBackend == "vulkan"
+            val overallPass = prodPass && pixelPass && filterAppliedOraclePass && renderBackendPass
 
             val result = finishResult(
                 pass = overallPass,
-                reason = if (overallPass) "pass" else (failureReason ?: "pixel_oracle_failed"),
+                reason = if (overallPass) {
+                    "pass"
+                } else if (!renderBackendPass) {
+                    "render_backend_not_vulkan: renderBackend=$renderBackend"
+                } else {
+                    failureReason ?: "pixel_oracle_failed"
+                },
                 sourcePath = syntheticSourcePath,
                 outputPath = prodOutputPath,
                 outputSize = prodOutputSize,
@@ -286,6 +304,7 @@ object AndroidTimelineColorMatrixExportSmokeHarness {
                 progressSamples = prodProgressSamples,
                 errorCode = prodErrorCode,
                 errorMessage = prodErrorMessage,
+                renderBackend = renderBackend,
             )
 
             Log.i(TAG, "ANDROID_TIMELINE_COLOR_MATRIX_EXPORT pass=$overallPass reason=${result["reason"]}")
@@ -312,6 +331,7 @@ object AndroidTimelineColorMatrixExportSmokeHarness {
                 progressSamples = prodProgressSamples,
                 errorCode = prodErrorCode ?: t.javaClass.simpleName,
                 errorMessage = prodErrorMessage ?: t.message,
+                renderBackend = renderBackend,
             )
         }
     }
@@ -335,6 +355,7 @@ object AndroidTimelineColorMatrixExportSmokeHarness {
         progressSamples: List<Double>,
         errorCode: String?,
         errorMessage: String?,
+        renderBackend: String?,
     ): Map<String, Any?> {
         return mapOf(
             "pass" to pass,
@@ -358,6 +379,7 @@ object AndroidTimelineColorMatrixExportSmokeHarness {
             "errorCode" to errorCode,
             "errorMessage" to errorMessage,
             "contentRegionOnly" to true,
+            "renderBackend" to renderBackend,
         )
     }
 
@@ -389,6 +411,7 @@ object AndroidTimelineColorMatrixExportSmokeHarness {
             progressSamples = emptyList(),
             errorCode = null,
             errorMessage = null,
+            renderBackend = null,
         )
     }
 

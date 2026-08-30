@@ -14,12 +14,13 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // (AndroidTimelineVideoEncoder) is the fallback for unsupported capability,
 // hardware/driver/init/render failure, or a request/clip shape outside the
 // narrow safe scope this slice implements for the native Vulkan export path
-// (AndroidTimelineVulkanVideoEncoder) -- see [vulkanScopeFailureReason]. Any
-// clip carrying a non-null colorMatrix (Phase 10) also falls outside this
-// scope -- the Vulkan export path does not implement colorMatrix -- and that
-// check is evaluated deterministically before any other scope failure.
-// AndroidTimelineExportSession additionally falls back to GLES mid-export if
-// a selected Vulkan encode attempt fails before pass-2/finalization; that
+// (AndroidTimelineVulkanVideoEncoder) -- see [vulkanScopeFailureReason]. Phase
+// 10: a clip carrying a non-null colorMatrix is within the Vulkan safe scope
+// -- the native Vulkan export path applies colorMatrix itself (see
+// AndroidTimelineVulkanVideoEncoder / android_vulkan_export_jni.cpp), so it no
+// longer forces a GLES fallback. AndroidTimelineExportSession additionally
+// falls back to GLES mid-export if a selected Vulkan encode attempt fails
+// before pass-2/finalization (a genuine capability/init/render failure); that
 // runtime fallback is session-owned and does not change this selector's
 // [select] decision.
 enum class ExportRenderBackend {
@@ -64,8 +65,7 @@ class AndroidExportRenderBackendSelector {
     /// [ExportRenderBackendDecision.actualBackend] only becomes Vulkan if
     /// [scope] is non-null and [vulkanScopeFailureReason] returns null;
     /// otherwise this resolves to GLES with that failure reason (e.g.
-    /// "vulkan_scope_not_supported", or "vulkan_color_matrix_not_supported"
-    /// when any clip carries a colorMatrix), even though the device itself is
+    /// "vulkan_scope_not_supported"), even though the device itself is
     /// Vulkan-capable. Logs exactly one
     /// VG_EXPORT_BACKEND_SELECTED row; never logs per-frame.
     ///
@@ -155,9 +155,12 @@ class AndroidExportRenderBackendSelector {
     /// The safe scope this slice implements for
     /// AndroidTimelineVulkanVideoEncoder: API 29+ (ImageReader hardware-buffer
     /// path), at least one clip, every clip video-kind, positive requested
-    /// output dimensions, positive decoded clip dimensions, cardinal
-    /// 0/90/180/270 rotation, and no clip carrying a colorMatrix (Phase 10 --
-    /// the Vulkan export path does not implement colorMatrix).
+    /// output dimensions, positive decoded clip dimensions, and cardinal
+    /// 0/90/180/270 rotation. Phase 10: a clip carrying a colorMatrix is
+    /// within this safe scope -- AndroidTimelineVulkanVideoEncoder /
+    /// android_vulkan_export_jni.cpp apply it natively via the Vulkan
+    /// fragment-shader color-matrix push constants, matching the GLES
+    /// backend's pixel semantics -- so it is no longer excluded here.
     /// AndroidTimelineVulkanVideoEncoder itself computes an
     /// aspect-preserving-fit destination rect per clip (see its own geometry
     /// computation) rather than requiring decoded dimensions to exactly match
@@ -165,17 +168,11 @@ class AndroidExportRenderBackendSelector {
     /// longer checks for that exact/swapped equality.
     ///
     /// Returns null when [scope] is safe for Vulkan, or a machine-readable
-    /// failure reason otherwise. The colorMatrix check is evaluated first --
-    /// deterministically, before any other scope failure -- so a clip with a
-    /// colorMatrix always resolves to reason "vulkan_color_matrix_not_supported"
-    /// regardless of what else about [scope] might also be unsafe. Any other
-    /// unsafe shape (still images, unsupported/non-cardinal rotation,
-    /// non-positive output or decoded dimensions, empty clip list, API < 29,
-    /// or no scope at all) resolves to "vulkan_scope_not_supported".
+    /// failure reason otherwise. Any unsafe shape (still images,
+    /// unsupported/non-cardinal rotation, non-positive output or decoded
+    /// dimensions, empty clip list, API < 29, or no scope at all) resolves to
+    /// "vulkan_scope_not_supported".
     private fun vulkanScopeFailureReason(scope: ExportRenderScope?): String? {
-        if (scope != null && scope.clips.any { it.colorMatrix != null }) {
-            return "vulkan_color_matrix_not_supported"
-        }
         if (scope == null) return "vulkan_scope_not_supported"
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return "vulkan_scope_not_supported"
         if (scope.clips.isEmpty()) return "vulkan_scope_not_supported"

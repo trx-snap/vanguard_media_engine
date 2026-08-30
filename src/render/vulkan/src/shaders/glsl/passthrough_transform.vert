@@ -1,24 +1,38 @@
 // passthrough_transform.vert
 // Vanguard Android True-DAG Phase 4B2C: fullscreen triangle vertex shader
 // with push-constant UV rotation transform.
+// Phase 10: push constant block extended with a color-matrix half (read only
+// by passthrough_transform.frag) so both stages share one identical 7-vec4
+// push-constant block layout/offsets.
 //
 // Draws a single fullscreen triangle using gl_VertexIndex 0/1/2.
 // UV coordinates are transformed via push constants before passing to fragment shader.
 //
-// Push constants (VideoTransformPushConstants, 32 bytes, offset 0):
+// Push constants (VideoTransformFullPushConstants, 112 bytes, offset 0):
 //   layout(push_constant) uniform Transform {
-//     vec4 uvTransform0;  // row0 coefficients [cx, cy, 0, bias] for u
-//     vec4 uvTransform1;  // row1 coefficients [cx, cy, 0, bias] for v
+//     vec4 uvTransform0;      // offset  0: row0 coefficients [cx, cy, 0, bias] for u
+//     vec4 uvTransform1;      // offset 16: row1 coefficients [cx, cy, 0, bias] for v
+//     vec4 colorMatrixRow0;   // offset 32: fragment-only
+//     vec4 colorMatrixRow1;   // offset 48: fragment-only
+//     vec4 colorMatrixRow2;   // offset 64: fragment-only
+//     vec4 colorMatrixRow3;   // offset 80: fragment-only
+//     vec4 colorMatrixOffset; // offset 96: fragment-only
 //   } xf;
 //
 // Fragment UV: uv = vec2(dot(xf.uvTransform0, vec4(x,y,0,1)),
 //                        dot(xf.uvTransform1, vec4(x,y,0,1)))
+// This vertex shader reads only uvTransform0/uvTransform1.
 
 #version 450
 
 layout(push_constant) uniform Transform {
     vec4 uvTransform0;
     vec4 uvTransform1;
+    vec4 colorMatrixRow0;
+    vec4 colorMatrixRow1;
+    vec4 colorMatrixRow2;
+    vec4 colorMatrixRow3;
+    vec4 colorMatrixOffset;
 } xf;
 
 layout(location = 0) out vec2 outUv;

@@ -352,9 +352,6 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     const VkImageLayout currentLayout =
         static_cast<VkImageLayout>(ahbImports.getImageLayout(handle));
 
-    // Phase 4B2C: build push constants from transform.
-    const VideoTransformPushConstants pc = makeVideoTransformPushConstants(transform);
-
     VulkanGraphicsPassParams passParams{};
     passParams.commandBuffer = frame->commandBuffer;
     passParams.renderPass = renderPass;
@@ -365,10 +362,10 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     passParams.descriptorSet = descriptorSet;
     passParams.pipeline = s.graphicsPipeline->get();
     passParams.sourceImage = srcImage;
-    // Phase 4B2C: copy push constants into passParams.
-    static_assert(sizeof(passParams.uvTransformPushConstants) == 32,
-                  "uvTransformPushConstants size mismatch");
-    std::memcpy(passParams.uvTransformPushConstants, &pc, 32);
+    // Phase 10: build combined UV transform + color matrix push constants
+    // from transform (identity color matrix when transform.colorMatrixEnabled
+    // is false).
+    passParams.pushConstants = makeVideoTransformFullPushConstants(transform);
     // Aspect-fit destination rect: copy through as-is. A default (all-zero)
     // rect leaves passParams.destination* at their own zero defaults, which
     // VulkanGraphicsCommandRecorder treats as "full extent" (pre-existing

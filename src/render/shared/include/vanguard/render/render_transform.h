@@ -60,6 +60,22 @@ struct VideoFrameTransform {
     // output extent. Default (RenderDestinationRect{}) means the full output
     // extent, matching pre-existing behavior.
     RenderDestinationRect destinationRect{};
+
+    // Phase 10: optional per-frame color matrix (Vulkan-native colorMatrix
+    // parity with GLES/Flutter ColorFilter.matrix). When false (the
+    // default), rendering uses the identity color matrix. Row-major 4x4 plus
+    // an additive per-channel offset, matching the same 4x5 layout as
+    // AndroidTimelineVideoEncoder's GLES uColorMatrixRow0..3/uColorMatrixOffset
+    // uniforms: rows are already the [R,G,B,A] weights for the corresponding
+    // output channel; [colorMatrixOffset] entries are already normalized into
+    // [0,1] (i.e. raw/255.0), matching that same GLES upload convention --
+    // this header performs no further normalization.
+    bool colorMatrixEnabled = false;
+    float colorMatrixRow0[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    float colorMatrixRow1[4] = {0.0f, 1.0f, 0.0f, 0.0f};
+    float colorMatrixRow2[4] = {0.0f, 0.0f, 1.0f, 0.0f};
+    float colorMatrixRow3[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    float colorMatrixOffset[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 
 // ---------------------------------------------------------------------------
@@ -82,6 +98,53 @@ static_assert(sizeof(VideoTransformPushConstants) == 32,
               "VideoTransformPushConstants must be exactly 32 bytes");
 static_assert(alignof(VideoTransformPushConstants) == 16,
               "VideoTransformPushConstants must be 16-byte aligned");
+
+// ---------------------------------------------------------------------------
+// VideoColorMatrixPushConstants / VideoTransformFullPushConstants
+// ---------------------------------------------------------------------------
+// Phase 10: Vulkan-native colorMatrix parity push constants, appended after
+// VideoTransformPushConstants in a single combined push-constant block shared
+// by the vertex (UV only) and fragment (color matrix) stages. GLSL push
+// constant offsets (both stages must declare an identical 7-vec4 block):
+//   uv.uvTransform0    @  0
+//   uv.uvTransform1    @ 16
+//   color.row0         @ 32
+//   color.row1         @ 48
+//   color.row2         @ 64
+//   color.row3         @ 80
+//   color.offset       @ 96
+//
+// rgba' = clamp(vec4(dot(row0, rgba) + offset.r,
+//                     dot(row1, rgba) + offset.g,
+//                     dot(row2, rgba) + offset.b,
+//                     dot(row3, rgba) + offset.a), 0.0, 1.0)
+// -- matching GLES/Flutter ColorFilter.matrix semantics exactly.
+
+struct alignas(16) VideoColorMatrixPushConstants {
+    float row0[4];
+    float row1[4];
+    float row2[4];
+    float row3[4];
+    float offset[4];
+};
+
+static_assert(sizeof(VideoColorMatrixPushConstants) == 80,
+              "VideoColorMatrixPushConstants must be exactly 80 bytes");
+static_assert(alignof(VideoColorMatrixPushConstants) == 16,
+              "VideoColorMatrixPushConstants must be 16-byte aligned");
+
+struct alignas(16) VideoTransformFullPushConstants {
+    VideoTransformPushConstants uv;
+    VideoColorMatrixPushConstants color;
+};
+
+static_assert(sizeof(VideoTransformFullPushConstants) == 112,
+              "VideoTransformFullPushConstants must be exactly 112 bytes");
+static_assert(alignof(VideoTransformFullPushConstants) == 16,
+              "VideoTransformFullPushConstants must be 16-byte aligned");
+static_assert(sizeof(VideoTransformFullPushConstants) <= 128,
+              "VideoTransformFullPushConstants must fit the guaranteed minimum "
+              "Vulkan push constant budget (128 bytes)");
 
 // ---------------------------------------------------------------------------
 // normalizeRotation
@@ -206,6 +269,38 @@ inline VideoTransformPushConstants makeVideoTransformPushConstants(
     pc.uvTransform1[3] = transform.cropBiasV + transform.cropScaleV * pc.uvTransform1[3];
 
     return pc;
+}
+
+// ---------------------------------------------------------------------------
+// makeVideoTransformFullPushConstants
+// Builds the combined UV-transform + color-matrix push constants. The color
+// matrix is the identity (matching [VideoFrameTransform]'s own defaults) when
+// [VideoFrameTransform::colorMatrixEnabled] is false.
+// ---------------------------------------------------------------------------
+
+inline VideoTransformFullPushConstants makeVideoTransformFullPushConstants(
+    const VideoFrameTransform& transform)
+{
+    VideoTransformFullPushConstants full{};
+    full.uv = makeVideoTransformPushConstants(transform);
+
+    if (transform.colorMatrixEnabled) {
+        for (int i = 0; i < 4; ++i) {
+            full.color.row0[i] = transform.colorMatrixRow0[i];
+            full.color.row1[i] = transform.colorMatrixRow1[i];
+            full.color.row2[i] = transform.colorMatrixRow2[i];
+            full.color.row3[i] = transform.colorMatrixRow3[i];
+            full.color.offset[i] = transform.colorMatrixOffset[i];
+        }
+    } else {
+        full.color.row0[0] = 1.0f; full.color.row0[1] = 0.0f; full.color.row0[2] = 0.0f; full.color.row0[3] = 0.0f;
+        full.color.row1[0] = 0.0f; full.color.row1[1] = 1.0f; full.color.row1[2] = 0.0f; full.color.row1[3] = 0.0f;
+        full.color.row2[0] = 0.0f; full.color.row2[1] = 0.0f; full.color.row2[2] = 1.0f; full.color.row2[3] = 0.0f;
+        full.color.row3[0] = 0.0f; full.color.row3[1] = 0.0f; full.color.row3[2] = 0.0f; full.color.row3[3] = 1.0f;
+        full.color.offset[0] = 0.0f; full.color.offset[1] = 0.0f; full.color.offset[2] = 0.0f; full.color.offset[3] = 0.0f;
+    }
+
+    return full;
 }
 
 } // namespace render

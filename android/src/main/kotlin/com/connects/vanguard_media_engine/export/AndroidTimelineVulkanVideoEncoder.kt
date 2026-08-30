@@ -380,6 +380,7 @@ class AndroidTimelineVulkanVideoEncoder(
                                 sourceWidth,
                                 sourceHeight,
                                 destFitRect,
+                                clip.colorMatrix,
                             )
                             if (frameFailure != null) return frameFailure
                             renderedFramesInClip++
@@ -436,7 +437,10 @@ class AndroidTimelineVulkanVideoEncoder(
     /// is the per-clip aspect-preserving-fit destination sub-rect within the
     /// fixed output surface, computed once by [decodeClipIntoSession] via
     /// [computeAspectFitRect] and passed through unchanged for every frame
-    /// of this clip.
+    /// of this clip. [colorMatrix] (Phase 10) is the active clip's raw
+    /// (un-normalized) 20-element colorMatrix, passed through unchanged to
+    /// the native Vulkan render seam -- null means identity (no filter); see
+    /// [VanguardNativeBridge.renderAndroidTimelineVulkanExportFrameCropped].
     ///
     /// Enforces the Opus P1 real-buffer geometry guard on every frame (not
     /// just a clip's first frame): real decoder HardwareBuffers can be
@@ -452,6 +456,7 @@ class AndroidTimelineVulkanVideoEncoder(
         expectedCropWidth: Int,
         expectedCropHeight: Int,
         destFitRect: DestFitRect,
+        colorMatrix: FloatArray?,
     ): String? {
         var hwBuf: HardwareBuffer? = null
         try {
@@ -521,6 +526,7 @@ class AndroidTimelineVulkanVideoEncoder(
                 destFitHeight = destFitRect.height,
                 timelinePtsUs = timelinePtsUs,
                 frameIndex = renderedFrames,
+                colorMatrix = colorMatrix,
             )
             if (!renderStr.startsWith("status=OK;")) {
                 return "vulkan_render_failed:${renderStr.take(120)}"

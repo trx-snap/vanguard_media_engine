@@ -1,9 +1,12 @@
 // android_timeline_color_matrix_export_smoke.dart
 // Vanguard Media Engine — Android timeline video export colorMatrix parity smoke harness.
 //
-// Proof boundary: production_exportTimeline_color_matrix_gles_fallback_pixel_oracle
+// Proof boundary: production_exportTimeline_color_matrix_vulkan_native_pixel_oracle
 // Validates:
-// 1. Automatic GLES fallback on Vulkan devices when a clip has colorMatrix.
+// 1. The production export session renders via the native Vulkan backend
+//    (renderBackend == "vulkan") -- a GLES fallback/retry must not be able to
+//    pass this oracle, since colorMatrix is applied natively on the Vulkan
+//    export path and is within Vulkan's safe scope.
 // 2. Production export session success with 20-element 4x5 color matrix.
 // 3. Pixel oracle verification comparing extracted frame mean RGB against
 //    expected transformed RGB and ensuring difference from source color.
@@ -79,13 +82,14 @@ class _AndroidTimelineColorMatrixExportSmokeAppState
         'productionPass': false,
         'pixelPass': false,
         'proofBoundary':
-            'production_exportTimeline_color_matrix_gles_fallback_pixel_oracle',
+            'production_exportTimeline_color_matrix_vulkan_native_pixel_oracle',
         'matrixMode': 'row_major_4x5_with_offsets',
         'colorMatrix': <double>[],
         'progressSamples': <double>[],
         'errorCode': null,
         'errorMessage': '$error',
         'contentRegionOnly': true,
+        'renderBackend': null,
       };
     }
 
@@ -110,6 +114,7 @@ class _AndroidTimelineColorMatrixExportSmokeAppState
       'colorMatrix',
       'progressSamples',
       'contentRegionOnly',
+      'renderBackend',
     ];
 
     final missingKeys = requiredKeys
@@ -118,11 +123,12 @@ class _AndroidTimelineColorMatrixExportSmokeAppState
     final bool fieldsValid =
         missingKeys.isEmpty &&
         payload['proofBoundary'] ==
-            'production_exportTimeline_color_matrix_gles_fallback_pixel_oracle' &&
+            'production_exportTimeline_color_matrix_vulkan_native_pixel_oracle' &&
         payload['productionPass'] == true &&
         payload['pixelPass'] == true &&
         payload['filterAppliedOraclePass'] == true &&
-        payload['contentRegionOnly'] == true;
+        payload['contentRegionOnly'] == true &&
+        payload['renderBackend'] == 'vulkan';
 
     final pass = (payload['pass'] == true) && fieldsValid;
 

@@ -39,10 +39,10 @@ import kotlin.math.floor
 //   - video-only clips, speed == 1.0, no transitions, no overlays, no canvas
 //     contentMode other than "fit", no per-clip transform/crop/freeze/
 //     reverse/time-remap/dual-camera. Per-clip colorMatrix is accepted and
-//     applied to decoded video/OES frames (GLES backend); still-image clips
-//     accept/carry colorMatrix but never apply it. A clip with colorMatrix
-//     forces the Vulkan-capable backend selector to fall back to GLES (see
-//     AndroidExportRenderBackendSelector).
+//     applied to decoded video frames by whichever backend renders the clip
+//     (Vulkan-native color-matrix push constants, or the GLES OES program's
+//     colorMatrix uniforms -- see AndroidExportRenderBackendSelector); still-
+//     image clips accept/carry colorMatrix but never apply it.
 //   - clip rotation metadata (0/90/180/270 after normalization) and decoded
 //     clip dimensions that differ from each other or from the requested
 //     output geometry are supported: each clip is centered and
@@ -600,6 +600,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                 "height" to requestHeight,
                 "fps" to requestFps,
                 "exportRoiSidecarPath" to roiSidecarPath,
+                "renderBackend" to effectiveBackend.wireName(),
             ),
         )
     }
@@ -760,10 +761,9 @@ class AndroidTimelineExportSession(private val context: Context) {
         // rejecting explicitly avoids silently producing wrong output.
         // colorMatrix is intentionally absent from this list (Phase 10): it is
         // parsed and validated explicitly above, then carried through
-        // ParsedClip/ClipContext/ClipInput and applied by the GLES backend --
-        // see AndroidTimelineVideoEncoder. A clip with colorMatrix still
-        // forces AndroidExportRenderBackendSelector to fall back to GLES,
-        // since the Vulkan export path does not implement it.
+        // ParsedClip/ClipContext/ClipInput and applied by whichever backend
+        // renders the clip -- see AndroidTimelineVulkanVideoEncoder (Vulkan)
+        // and AndroidTimelineVideoEncoder (GLES).
         private val UNSUPPORTED_CLIP_KEYS = listOf(
             "freezePTS",
             "dualCamera",

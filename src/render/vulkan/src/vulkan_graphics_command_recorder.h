@@ -12,6 +12,8 @@
 
 #include <cstdint>
 
+#include "vanguard/render/render_transform.h"
+
 #if defined(__ANDROID__)
 #ifndef VK_USE_PLATFORM_ANDROID_KHR
 #define VK_USE_PLATFORM_ANDROID_KHR
@@ -50,10 +52,21 @@ struct VulkanGraphicsPassParams {
     VkAccessFlags dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     uint32_t srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     uint32_t dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    // Phase 4B2C: UV transform push constants for vertex shader rotation.
-    float uvTransformPushConstants[8] = {
-        1.0f, 0.0f, 0.0f, 0.0f,  // row0 (u = x)
-        0.0f, 1.0f, 0.0f, 0.0f,  // row1 (v = y)
+    // Phase 10: combined UV transform (vertex) + color matrix (fragment)
+    // push constants, identity defaults (UV identity mapping, identity
+    // color matrix, zero offset).
+    VideoTransformFullPushConstants pushConstants = {
+        {
+            {1.0f, 0.0f, 0.0f, 0.0f},  // uvTransform0 (u = x)
+            {0.0f, 1.0f, 0.0f, 0.0f},  // uvTransform1 (v = y)
+        },
+        {
+            {1.0f, 0.0f, 0.0f, 0.0f},  // color.row0
+            {0.0f, 1.0f, 0.0f, 0.0f},  // color.row1
+            {0.0f, 0.0f, 1.0f, 0.0f},  // color.row2
+            {0.0f, 0.0f, 0.0f, 1.0f},  // color.row3
+            {0.0f, 0.0f, 0.0f, 0.0f},  // color.offset
+        },
     };
     // Aspect-fit destination sub-rect (viewport/scissor) within the render
     // pass's full extent, in output pixel coordinates. All-zero (the
@@ -85,10 +98,20 @@ struct VulkanGraphicsPassParams {
     uint32_t dstAccessMask = 0;
     uint32_t srcQueueFamilyIndex = (~0U);
     uint32_t dstQueueFamilyIndex = (~0U);
-    // Phase 4B2C: UV transform push constants (identity defaults).
-    float uvTransformPushConstants[8] = {
-        1.0f, 0.0f, 0.0f, 0.0f,
-        0.0f, 1.0f, 0.0f, 0.0f,
+    // Phase 10: combined UV transform + color matrix push constants
+    // (identity defaults), host-build mirror of the Android field above.
+    VideoTransformFullPushConstants pushConstants = {
+        {
+            {1.0f, 0.0f, 0.0f, 0.0f},
+            {0.0f, 1.0f, 0.0f, 0.0f},
+        },
+        {
+            {1.0f, 0.0f, 0.0f, 0.0f},
+            {0.0f, 1.0f, 0.0f, 0.0f},
+            {0.0f, 0.0f, 1.0f, 0.0f},
+            {0.0f, 0.0f, 0.0f, 1.0f},
+            {0.0f, 0.0f, 0.0f, 0.0f},
+        },
     };
     // Aspect-fit destination sub-rect (host-build mirror of the Android
     // fields above; unused by the host stub implementation).

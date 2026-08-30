@@ -157,6 +157,13 @@ class VanguardNativeBridge(
     // any other value. Callers that want the full output extent (no
     // letterbox/pillarbox) pass destFitX=0, destFitY=0, destFitWidth=width,
     // destFitHeight=height.
+    // [colorMatrix] (Phase 10), when non-null, must be exactly 20 raw
+    // (un-normalized) finite floats -- the same 4x5 row-major
+    // ColorFilter.matrix convention as AndroidTimelineVideoEncoder's GLES
+    // uniform upload. Native validates the length before importing the
+    // buffer and fails closed with "vulkan_color_matrix_invalid:len=N" on
+    // mismatch; native normalizes the four additive offset entries (indices
+    // 4, 9, 14, 19) by /255.0 exactly once. Null means identity (no filter).
     external fun renderAndroidTimelineVulkanExportFrameCropped(
         sessionId: String,
         hardwareBuffer: HardwareBuffer,
@@ -173,6 +180,7 @@ class VanguardNativeBridge(
         destFitHeight: Int,
         timelinePtsUs: Long,
         frameIndex: Int,
+        colorMatrix: FloatArray?,
     ): String
 
     // ── Phase 1-Unit U: Android GLES backend offscreen EGL lifecycle smoke ──

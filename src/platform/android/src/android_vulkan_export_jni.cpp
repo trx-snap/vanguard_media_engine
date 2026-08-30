@@ -11,7 +11,8 @@
 // JNI entry points (matching VanguardNativeBridge.kt declarations):
 //   createAndroidTimelineVulkanExportSession         -> jstring
 //   renderAndroidTimelineVulkanExportFrame           -> jstring
-//   renderAndroidTimelineVulkanExportFrameCropped     -> jstring (crop + rotationDegrees, 0/90/180/270, dest fit rect)
+//   renderAndroidTimelineVulkanExportFrameCropped     -> jstring (crop + rotationDegrees, 0/90/180/270, dest fit rect,
+//                                                                  Phase 10: optional 20-element raw colorMatrix)
 //   destroyAndroidTimelineVulkanExportSession        -> jstring
 
 #include <jni.h>
@@ -353,6 +354,15 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 // [rotationDegrees] must be exactly 0, 90, 180, or 270 -- an invalid value
 // fails closed with a distinct reason before the HardwareBuffer is even
 // imported.
+// [colorMatrix] (Phase 10), when non-null, must be exactly 20 elements (4x5
+// row-major, matching Flutter's ColorFilter.matrix / the GLES backend's
+// upload convention) -- native validates the length before the HardwareBuffer
+// is even resolved and fails closed with "vulkan_color_matrix_invalid:len=N"
+// on any other length. A null colorMatrix renders with the identity color
+// matrix (no filter). The four additive offset entries (indices 4, 9, 14, 19)
+// are raw (un-normalized) on the wire; native normalizes them by /255.0
+// exactly once when building the render transform, matching the GLES
+// backend's uColorMatrixOffset upload.
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidTimelineVulkanExportFrameCropped(
     JNIEnv*  env,
@@ -371,7 +381,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     jint     destFitWidth,
     jint     destFitHeight,
     jlong    timelinePtsUs,
-    jint     frameIndex) {
+    jint     frameIndex,
+    jfloatArray colorMatrix) {
 
     char status[512];
 
@@ -406,6 +417,25 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
             static_cast<int>(destFitWidth), static_cast<int>(destFitHeight),
             static_cast<int>(width), static_cast<int>(height));
         return env->NewStringUTF(status);
+    }
+
+    // Phase 10: colorMatrix length must be validated before the buffer is
+    // even resolved/imported -- this check is independent of the session and
+    // buffer, so it fails closed early alongside the other pre-import
+    // argument validation above. [colorMatrixValues] is copied out now (while
+    // the jfloatArray reference is guaranteed live) for use after import.
+    float colorMatrixValues[20];
+    bool hasColorMatrix = false;
+    if (colorMatrix != nullptr) {
+        const jsize colorMatrixLen = env->GetArrayLength(colorMatrix);
+        if (colorMatrixLen != 20) {
+            std::snprintf(status, sizeof(status),
+                "status=FAIL;frameIndex=%d;reason=vulkan_color_matrix_invalid:len=%d",
+                static_cast<int>(frameIndex), static_cast<int>(colorMatrixLen));
+            return env->NewStringUTF(status);
+        }
+        env->GetFloatArrayRegion(colorMatrix, 0, 20, colorMatrixValues);
+        hasColorMatrix = true;
     }
 
     const char* sidCStr = env->GetStringUTFChars(sessionIdJ, nullptr);
@@ -517,6 +547,35 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         transform.destinationRect.width = static_cast<int32_t>(destFitWidth);
         transform.destinationRect.height = static_cast<int32_t>(destFitHeight);
 
+        // Phase 10: colorMatrix was already validated (length == 20) before
+        // the buffer was imported above; [colorMatrixValues] holds the raw
+        // (un-normalized) 4x5 row-major values. Offsets (indices 4, 9, 14,
+        // 19) are normalized by /255.0 exactly once here, matching the GLES
+        // backend's uColorMatrixOffset upload convention.
+        if (hasColorMatrix) {
+            transform.colorMatrixEnabled = true;
+            transform.colorMatrixRow0[0] = colorMatrixValues[0];
+            transform.colorMatrixRow0[1] = colorMatrixValues[1];
+            transform.colorMatrixRow0[2] = colorMatrixValues[2];
+            transform.colorMatrixRow0[3] = colorMatrixValues[3];
+            transform.colorMatrixRow1[0] = colorMatrixValues[5];
+            transform.colorMatrixRow1[1] = colorMatrixValues[6];
+            transform.colorMatrixRow1[2] = colorMatrixValues[7];
+            transform.colorMatrixRow1[3] = colorMatrixValues[8];
+            transform.colorMatrixRow2[0] = colorMatrixValues[10];
+            transform.colorMatrixRow2[1] = colorMatrixValues[11];
+            transform.colorMatrixRow2[2] = colorMatrixValues[12];
+            transform.colorMatrixRow2[3] = colorMatrixValues[13];
+            transform.colorMatrixRow3[0] = colorMatrixValues[15];
+            transform.colorMatrixRow3[1] = colorMatrixValues[16];
+            transform.colorMatrixRow3[2] = colorMatrixValues[17];
+            transform.colorMatrixRow3[3] = colorMatrixValues[18];
+            transform.colorMatrixOffset[0] = colorMatrixValues[4] / 255.0f;
+            transform.colorMatrixOffset[1] = colorMatrixValues[9] / 255.0f;
+            transform.colorMatrixOffset[2] = colorMatrixValues[14] / 255.0f;
+            transform.colorMatrixOffset[3] = colorMatrixValues[19] / 255.0f;
+        }
+
         renderResult = session->backend.renderFrame(handle, transform);
         renderOk =
             renderResult == vanguard::render::RenderFrameResult::kSuccess ||
@@ -566,7 +625,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     std::snprintf(status, sizeof(status),
         "status=OK;frameIndex=%d;timelinePtsUs=%lld;renderedFrames=%d;"
         "renderResult=%s;releaseResult=%s;descW=%u;descH=%u;"
-        "destFit=%d,%d-%dx%d",
+        "destFit=%d,%d-%dx%d;colorMatrix=%d",
         static_cast<int>(frameIndex),
         static_cast<long long>(timelinePtsUs),
         session->renderedFrames,
@@ -574,7 +633,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         HwBufResultName(releaseResult),
         descriptor.width, descriptor.height,
         static_cast<int>(destFitX), static_cast<int>(destFitY),
-        static_cast<int>(destFitWidth), static_cast<int>(destFitHeight));
+        static_cast<int>(destFitWidth), static_cast<int>(destFitHeight),
+        hasColorMatrix ? 1 : 0);
     return env->NewStringUTF(status);
 }
 
