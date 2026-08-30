@@ -102,12 +102,9 @@ std::atomic<uint64_t>                                                           
 
 // Structural safety bound on how many samples a single session may hold
 // across all admitted tracks (8 tracks * 8192 frames * 2 channels, doubled
-// for headroom). This is a JNI-level admission bound only; the semantic
-// track-count/channel/sample-rate/gain rules live entirely in
-// AudioMixBusNode::mix().
+// for headroom).
 constexpr int64_t kMaxSessionTotalSamples = 8192LL * 2LL * 8LL * 2LL;
 constexpr int32_t kMaxAdmittedFrameCount  = 8192;
-constexpr int32_t kMaxAdmittedChannelCount = 8;
 
 std::shared_ptr<Phase4AudioMixBusSession> FindSession(const std::string& sessionId) {
     std::lock_guard<std::mutex> lock(gPhase4MixBusSessionRegistryMutex);
@@ -240,7 +237,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_addAndroid
             "status=FAIL;reason=invalid_frame_count;sessionId=%s", sid.c_str());
         return env->NewStringUTF(status);
     }
-    if (channelCount < 1 || channelCount > kMaxAdmittedChannelCount) {
+    if (channelCount < vanguard::audio::AudioMixBusNode::kMinChannelCount ||
+        channelCount > vanguard::audio::AudioMixBusNode::kMaxChannelCount) {
         std::snprintf(status, sizeof(status),
             "status=FAIL;reason=invalid_channel_count;sessionId=%s", sid.c_str());
         return env->NewStringUTF(status);

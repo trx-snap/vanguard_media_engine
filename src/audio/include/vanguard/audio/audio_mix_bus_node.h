@@ -45,11 +45,10 @@ public:
     // `frameCount * channelCount` interleaved int16_t samples and must
     // outlive the mix() call; this node never retains the pointer.
     //
-    // NOTE: Kotlin's AndroidAudioVolumeEnvelope.fromStatic can emit an
-    // effective gain > 1.0 today (unclamped `track.volume` feeding
-    // `volume * mixGain`); production integration must clamp or explicitly
-    // decide to widen the accepted range later. This diagnostic bus rejects
-    // any gain outside [0,1] via kInvalidGain.
+    // NOTE: Native `MixTrack.gain` accepts only finite `[0,1]` (rejected via
+    // kInvalidGain). Android production integration evaluates the volume
+    // envelope and clamps before calling native, recording clamping via
+    // `nativeGainClamped`. Any future widening is a separate policy decision.
     struct MixTrack {
         const int16_t* pcm;
         int64_t        frameCount;

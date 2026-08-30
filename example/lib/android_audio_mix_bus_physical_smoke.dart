@@ -9,8 +9,9 @@
 //     longerTrackShortWindowMix, fourTrackDeterministicMix, noPrematureClip,
 //     finalSaturation, eightTrackCapacity.
 //   - Error Rejection group: invalidGainRejection, nonFiniteGainRejection,
-//     sampleRateMismatchRejection, insufficientOutputCapacityRejection,
-//     invalidSessionRejection, nineTrackReject.
+//     sampleRateMismatchRejection, invalidTrackChannelCountRejection,
+//     insufficientOutputCapacityRejection, invalidSessionRejection,
+//     nineTrackReject.
 //   - Topology & Lifecycle group: topologyPorts, destroyIdempotent.
 //   - Proof-Boundary & Summary group: hasCanonicalProofBoundary,
 //     allNativeLanesPass, laneCount, lanePassCount, lastError.
@@ -109,6 +110,7 @@ class _AndroidAudioMixBusPhysicalSmokeAppState
       'invalidGain=${activeReport.invalidGainRejection}, '
       'nonFiniteGain=${activeReport.nonFiniteGainRejection}, '
       'sampleRateMismatch=${activeReport.sampleRateMismatchRejection}, '
+      'invalidTrackChannelCount=${activeReport.invalidTrackChannelCountRejection}, '
       'insufficientOutputCapacity=${activeReport.insufficientOutputCapacityRejection}, '
       'invalidSession=${activeReport.invalidSessionRejection}, '
       'nineTrackReject=${activeReport.nineTrackReject}',
@@ -167,7 +169,7 @@ class _AndroidAudioMixBusPhysicalSmokeAppState
       });
     }
 
-    await Future<void>.delayed(const Duration(milliseconds: 500));
+    await Future<void>.delayed(const Duration(milliseconds: 1500));
     exit(pass ? 0 : 1);
   }
 

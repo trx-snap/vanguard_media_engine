@@ -116,6 +116,12 @@ class VGAudioMixBusSmokeReport {
       _lanePass('sampleRateMismatchRejection');
   bool get sampleRateMismatchRejectionPass => sampleRateMismatchRejection;
 
+  /// Whether out-of-range track channel count rejection passed.
+  bool get invalidTrackChannelCountRejection =>
+      _lanePass('invalidTrackChannelCountRejection');
+  bool get invalidTrackChannelCountRejectionPass =>
+      invalidTrackChannelCountRejection;
+
   /// Whether insufficient output buffer capacity rejection passed.
   bool get insufficientOutputCapacityRejection =>
       _lanePass('insufficientOutputCapacityRejection');
@@ -154,8 +160,8 @@ class VGAudioMixBusSmokeReport {
   int get laneCount {
     final val = metrics['laneCount'];
     if (val is num) return val.toInt();
-    if (val is String) return int.tryParse(val) ?? 21;
-    return 21;
+    if (val is String) return int.tryParse(val) ?? 22;
+    return 22;
   }
 
   /// Number of diagnostic lanes that passed.
@@ -185,6 +191,7 @@ class VGAudioMixBusSmokeReport {
     if (invalidGainRejection) count++;
     if (nonFiniteGainRejection) count++;
     if (sampleRateMismatchRejection) count++;
+    if (invalidTrackChannelCountRejection) count++;
     if (insufficientOutputCapacityRejection) count++;
     if (invalidSessionRejection) count++;
     if (nineTrackReject) count++;
@@ -192,7 +199,7 @@ class VGAudioMixBusSmokeReport {
     return count;
   }
 
-  /// Whether all 21 native diagnostic lanes passed.
+  /// Whether all 22 native diagnostic lanes passed.
   bool get allNativeLanesPass =>
       topologyPorts &&
       stereoStereoDeterministic &&
@@ -211,6 +218,7 @@ class VGAudioMixBusSmokeReport {
       invalidGainRejection &&
       nonFiniteGainRejection &&
       sampleRateMismatchRejection &&
+      invalidTrackChannelCountRejection &&
       insufficientOutputCapacityRejection &&
       invalidSessionRejection &&
       nineTrackReject &&
@@ -225,7 +233,7 @@ class VGAudioMixBusSmokeReport {
         proofBoundary: '',
         raw: <String, String>{'reason': 'native_result_not_a_map'},
         metrics: <String, Object?>{
-          'laneCount': 21,
+          'laneCount': 22,
           'lanePassCount': 0,
           'reason': 'native_result_not_a_map',
         },
@@ -325,7 +333,7 @@ class VGAudioMixBusSmokeReport {
           'status': 'FAIL',
           'reason': 'timeout',
           'error': te.toString(),
-          'laneCount': 21,
+          'laneCount': 22,
           'lanePassCount': 0,
         },
         lastError: 'timeout: $te',
@@ -343,7 +351,7 @@ class VGAudioMixBusSmokeReport {
           'reason': 'platform_exception',
           'code': pe.code,
           'message': pe.message ?? '',
-          'laneCount': 21,
+          'laneCount': 22,
           'lanePassCount': 0,
         },
         lastError: 'platform_exception:${pe.code}:${pe.message}',
@@ -357,7 +365,7 @@ class VGAudioMixBusSmokeReport {
           'status': 'FAIL',
           'reason': 'exception',
           'error': e.toString(),
-          'laneCount': 21,
+          'laneCount': 22,
           'lanePassCount': 0,
         },
         lastError: 'exception:$e',

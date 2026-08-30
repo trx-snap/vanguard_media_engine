@@ -27,6 +27,7 @@ const _kAllLanes = <String>[
   'invalidGainRejection',
   'nonFiniteGainRejection',
   'sampleRateMismatchRejection',
+  'invalidTrackChannelCountRejection',
   'insufficientOutputCapacityRejection',
   'invalidSessionRejection',
   'nineTrackReject',
@@ -52,12 +53,13 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'invalidGainRejection.pass': true,
     'nonFiniteGainRejection.pass': true,
     'sampleRateMismatchRejection.pass': true,
+    'invalidTrackChannelCountRejection.pass': true,
     'insufficientOutputCapacityRejection.pass': true,
     'invalidSessionRejection.pass': true,
     'nineTrackReject.pass': true,
     'destroyIdempotent.pass': true,
-    'laneCount': 21,
-    'lanePassCount': 21,
+    'laneCount': 22,
+    'lanePassCount': 22,
   };
 
   final raw = <String, String>{
@@ -84,6 +86,10 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'nonFiniteGainRejection.mix': 'status=FAIL;reason=invalid_gain',
     'sampleRateMismatchRejection.mix':
         'status=FAIL;reason=sample_rate_mismatch',
+    'invalidTrackChannelCountRejection.add0':
+        'status=FAIL;reason=invalid_channel_count',
+    'invalidTrackChannelCountRejection.mix': 'not_run_after_add_rejection',
+    'invalidTrackChannelCountRejection.destroy': 'status=PASS',
     'insufficientOutputCapacityRejection.mix':
         'status=FAIL;reason=insufficient_output_capacity',
     'invalidSessionRejection.add': 'status=FAIL;reason=session_not_found',
@@ -121,7 +127,7 @@ void main() {
 
   group('VGAudioMixBusSmokeReport fromMap and toMap', () {
     test(
-      'pass report parses and round-trips all 21 lanes and fields cleanly',
+      'pass report parses and round-trips all 22 lanes and fields cleanly',
       () {
         final report = VGAudioMixBusSmokeReport.fromMap(_createSampleRawMap());
 
@@ -129,8 +135,8 @@ void main() {
         expect(report.hasCanonicalProofBoundary, isTrue);
         expect(report.proofBoundary, equals(_kCanonicalProofBoundary));
         expect(report.lastError, equals('none'));
-        expect(report.laneCount, equals(21));
-        expect(report.lanePassCount, equals(21));
+        expect(report.laneCount, equals(22));
+        expect(report.lanePassCount, equals(22));
 
         // Math lanes
         expect(report.stereoStereoDeterministic, isTrue);
@@ -167,6 +173,8 @@ void main() {
         expect(report.nonFiniteGainRejectionPass, isTrue);
         expect(report.sampleRateMismatchRejection, isTrue);
         expect(report.sampleRateMismatchRejectionPass, isTrue);
+        expect(report.invalidTrackChannelCountRejection, isTrue);
+        expect(report.invalidTrackChannelCountRejectionPass, isTrue);
         expect(report.insufficientOutputCapacityRejection, isTrue);
         expect(report.insufficientOutputCapacityRejectionPass, isTrue);
         expect(report.invalidSessionRejection, isTrue);
@@ -217,12 +225,13 @@ void main() {
             'invalidGainRejection.pass': true,
             'nonFiniteGainRejection.pass': true,
             'sampleRateMismatchRejection.pass': true,
+            'invalidTrackChannelCountRejection.pass': true,
             'insufficientOutputCapacityRejection.pass': true,
             'invalidSessionRejection.pass': true,
             'nineTrackReject.pass': true,
             'destroyIdempotent.pass': true,
-            'laneCount': 21,
-            'lanePassCount': 20,
+            'laneCount': 22,
+            'lanePassCount': 21,
           },
           'lastError': 'stereoStereoDeterministic: output PCM mismatch',
         }),
@@ -232,7 +241,7 @@ void main() {
       expect(report.stereoStereoDeterministic, isFalse);
       expect(report.monoToStereoUpmix, isTrue);
       expect(report.allNativeLanesPass, isFalse);
-      expect(report.lanePassCount, equals(20));
+      expect(report.lanePassCount, equals(21));
       expect(
         report.lastError,
         equals('stereoStereoDeterministic: output PCM mismatch'),
@@ -257,7 +266,7 @@ void main() {
         );
         expect(report.lastError, equals('native_result_not_a_map'));
         expect(report.allNativeLanesPass, isFalse);
-        expect(report.laneCount, equals(21));
+        expect(report.laneCount, equals(22));
         expect(report.lanePassCount, equals(0));
       }
     });
@@ -286,6 +295,7 @@ void main() {
           'invalidGainRejection.pass': true,
           'nonFiniteGainRejection.pass': true,
           'sampleRateMismatchRejection.pass': true,
+          'invalidTrackChannelCountRejection.pass': true,
           'insufficientOutputCapacityRejection.pass': true,
           'invalidSessionRejection.pass': true,
           'nineTrackReject.pass': true,
@@ -341,7 +351,7 @@ void main() {
         final base = _createSampleRawMap();
         final baseMetrics = Map<String, Object?>.from(base['metrics'] as Map);
 
-        expect(_kAllLanes.length, equals(21));
+        expect(_kAllLanes.length, equals(22));
 
         for (final lane in _kAllLanes) {
           final modifiedMetrics = Map<String, Object?>.from(baseMetrics);
@@ -362,8 +372,8 @@ void main() {
 
           expect(
             report.lanePassCount,
-            equals(20),
-            reason: 'Failing lane $lane must decrement lanePassCount to 20',
+            equals(21),
+            reason: 'Failing lane $lane must decrement lanePassCount to 21',
           );
 
           // Verify specific getter reflects failure
@@ -436,6 +446,10 @@ void main() {
               expect(report.sampleRateMismatchRejection, isFalse);
               expect(report.sampleRateMismatchRejectionPass, isFalse);
               break;
+            case 'invalidTrackChannelCountRejection':
+              expect(report.invalidTrackChannelCountRejection, isFalse);
+              expect(report.invalidTrackChannelCountRejectionPass, isFalse);
+              break;
             case 'insufficientOutputCapacityRejection':
               expect(report.insufficientOutputCapacityRejection, isFalse);
               expect(report.insufficientOutputCapacityRejectionPass, isFalse);
@@ -473,7 +487,7 @@ void main() {
       });
 
       expect(report.allNativeLanesPass, isFalse);
-      expect(report.lanePassCount, equals(18));
+      expect(report.lanePassCount, equals(19));
       expect(report.topologyPorts, isFalse);
       expect(report.stereoStereoDeterministic, isFalse);
       expect(report.positiveSaturation, isFalse);

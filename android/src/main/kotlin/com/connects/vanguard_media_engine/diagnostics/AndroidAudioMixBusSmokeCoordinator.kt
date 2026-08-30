@@ -94,6 +94,7 @@ class AndroidAudioMixBusSmokeCoordinator(
                     laneInvalidGainRejection(nativeBridge),
                     laneNonFiniteGainRejection(nativeBridge),
                     laneSampleRateMismatchRejection(nativeBridge),
+                    laneInvalidTrackChannelCountRejection(nativeBridge),
                     laneInsufficientOutputCapacityRejection(nativeBridge),
                     laneInvalidSessionRejection(nativeBridge),
                     laneNineTrackReject(nativeBridge),
@@ -357,6 +358,56 @@ class AndroidAudioMixBusSmokeCoordinator(
             bridge, "sampleRateMismatchRejection",
             nodeSampleRate = 48000, nodeChannelCount = 1, maxFramesPerMix = 1,
             tracks = tracks, framesToMix = 1, expectedReason = "sample_rate_mismatch",
+        )
+    }
+
+    private fun laneInvalidTrackChannelCountRejection(bridge: VanguardNativeBridge): LaneResult {
+        val raw = mutableMapOf<String, String>()
+
+        val createRaw = bridge.createAndroidDagPhase4AudioMixBusSession(
+            nodeId = "mixbus_invalid_track_channel_count",
+            sampleRate = 48000,
+            channelCount = 2,
+            maxFramesPerMix = 4,
+        )
+        raw["create"] = createRaw
+        val sessionId = extractField(createRaw, "sessionId")
+        if (sessionId == null || !createRaw.startsWith("status=PASS")) {
+            return LaneResult(
+                "invalidTrackChannelCountRejection",
+                false,
+                raw,
+                "session create failed: $createRaw",
+            )
+        }
+
+        val add0Raw = bridge.addAndroidDagPhase4AudioMixBusTrack(
+            sessionId = sessionId,
+            pcm16Buffer = directBuffer(shortArrayOf(100, 200, 300)),
+            frameCount = 1,
+            sampleRate = 48000,
+            channelCount = 3,
+            gain = 1.0,
+        )
+        raw["add0"] = add0Raw
+        raw["mix"] = "not_run_after_add_rejection"
+
+        val destroyRaw = bridge.destroyAndroidDagPhase4AudioMixBusSession(sessionId)
+        raw["destroy"] = destroyRaw
+
+        val pass = add0Raw.startsWith("status=FAIL") &&
+            extractField(add0Raw, "reason") == "invalid_channel_count" &&
+            destroyRaw.startsWith("status=PASS")
+
+        return LaneResult(
+            name = "invalidTrackChannelCountRejection",
+            pass = pass,
+            raw = raw,
+            detail = if (pass) {
+                "ok"
+            } else {
+                "expected add0 FAIL/invalid_channel_count and destroy PASS: add0=$add0Raw destroy=$destroyRaw"
+            },
         )
     }
 
