@@ -262,14 +262,16 @@ class AndroidEditorPlaybackCoordinator(
         // already-validated sourcePath, tagged role="original" with a trackId of
         // "original-<clipId>" — passed through unchanged; and (2) at most one
         // user-added role="music" track and at most one user-added role="voiceover"
-        // track, both only for a single-clip timeline (Phase 7.8L-Android: a
-        // single-clip draft may carry both at once), each with a finite
+        // track (Phase 7.8L-Android: a single-clip draft may carry both at once),
+        // supported on hard-cut single- or multi-clip timelines (Phase
+        // 7.8N-Android: multi-clip added-audio preview), each with a finite
         // non-negative startTime (Phase 7.8K-Android: delayed start/end) and
         // finite non-negative fadeInSeconds/fadeOutSeconds and/or volumeKeyframes
         // (Phase 7.8M-Android: volume automation; see
         // AndroidEditorAddedAudioPreviewRuntime/AndroidEditorAudioAutomation). Any
         // other role (sfx, unknown, null), a duplicate music or voiceover track,
-        // or any added track on a multi-clip timeline is unsupported in this slice.
+        // or unsupported video features on the timeline remain unsupported in
+        // this slice.
         val audioSidecar = draft["audioSidecar"]
         val pendingAddedAudioConfigs = mutableListOf<AndroidEditorAddedAudioTrackConfig>()
         if (audioSidecar != null) {
@@ -316,14 +318,6 @@ class AndroidEditorPlaybackCoordinator(
                     return
                 }
 
-                if (clipSpecs.size != 1) {
-                    result.error(
-                        "UNSUPPORTED_TIMELINE_FEATURE",
-                        "added audio is only supported for single-clip timelines in this slice",
-                        null,
-                    )
-                    return
-                }
                 if (role == "music") {
                     if (sawMusicTrack) {
                         result.error(
