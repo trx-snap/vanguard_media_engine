@@ -730,7 +730,7 @@ class _AndroidStillImageExportUnitRPhysicalSmokeAppState
       }
       print("ANDROID_STILL_IMAGE_EXPORT_UNIT_R_LANE2_PASS: $lane2Pass");
 
-      // Lane 3: Fail-closed source/feature guards
+      // Lane 3: Fail-closed source guards & EXIF regression verification
       print("ANDROID_STILL_IMAGE_EXPORT_UNIT_R_LANE3: START");
       final lane3aOutputPath = "${tempDir.path}/${runId}_lane3a_out.mp4";
       final lane3aExpectedSidecar = sidecarPathForVideoPath(lane3aOutputPath);
@@ -858,7 +858,8 @@ class _AndroidStillImageExportUnitRPhysicalSmokeAppState
       lane3bPass =
           (lane3bCode == "FILE_UNREADABLE") && !out3bExists && !sidecar3bExists;
 
-      // Sublane 3(c): EXIF-rotated JPEG fixture
+      // Sublane 3(c): EXIF-rotated JPEG fixture (orientation 6 - supported as of Unit S)
+      Map<String, dynamic>? lane3cResultMap;
       try {
         lane3cSourceFile = File("${tempDir.path}/${runId}_exif_rotated.jpg");
         await lane3cSourceFile.writeAsBytes(_exifRotatedJpegBytes, flush: true);
@@ -892,25 +893,138 @@ class _AndroidStillImageExportUnitRPhysicalSmokeAppState
           bitrateBps: 4000000,
         );
 
-        await VanguardTimelineExporter.exportDraft(
+        final result3c = await VanguardTimelineExporter.exportDraft(
           draft: draft3c,
           request: request3c,
         );
+
+        final out3cExists = await lane3cOutputFile.exists();
+        final out3cBytes = out3cExists ? await lane3cOutputFile.length() : 0;
+        final pathMatch3c = result3c.path == lane3cOutputPath;
+        final dimsMatch3c =
+            result3c.width == 720 &&
+            result3c.height == 1280 &&
+            result3c.fps == 30;
+
+        print(
+          "ANDROID_STILL_IMAGE_EXPORT_UNIT_R_LANE3C: Inspecting exported output media...",
+        );
+        final lane3cMediaInfo = await VanguardMediaPreparer.inspectMedia(
+          lane3cOutputPath,
+        );
+        print(
+          "ANDROID_STILL_IMAGE_EXPORT_UNIT_R_LANE3C: MediaInfo: $lane3cMediaInfo",
+        );
+
+        final duration3cMeasured =
+            lane3cMediaInfo?.durationSeconds ?? result3c.durationSeconds;
+        final duration3cValid = (duration3cMeasured - 1.0).abs() <= 0.25;
+
+        final sidecar3cExists = await lane3cSidecarFile.exists();
+        final sidecar3cContent = sidecar3cExists
+            ? await lane3cSidecarFile.readAsString()
+            : "";
+        final sidecar3cValid = _isValidExportRoiSidecar(
+          content: sidecar3cContent,
+          expectedWidth: 720,
+          expectedHeight: 1280,
+          expectedDurationSeconds: 1.0,
+          durationToleranceSeconds: 0.25,
+        );
+
+        final mediaValid3c =
+            lane3cMediaInfo != null &&
+            lane3cMediaInfo.hasVideo &&
+            lane3cMediaInfo.width == 720 &&
+            lane3cMediaInfo.height == 1280;
+
+        lane3cPass =
+            out3cExists &&
+            out3cBytes > 0 &&
+            pathMatch3c &&
+            dimsMatch3c &&
+            duration3cValid &&
+            sidecar3cExists &&
+            sidecar3cValid &&
+            mediaValid3c;
+
+        lane3cResultMap = <String, dynamic>{
+          "pass": lane3cPass,
+          "expectedBehavior": "supported_exif_orientation_6",
+          "expectedCode": null,
+          "errorCode": lane3cCode,
+          "outputPath": result3c.path,
+          "outputBytes": out3cBytes,
+          "durationSeconds": duration3cMeasured,
+          "width": result3c.width,
+          "height": result3c.height,
+          "fps": result3c.fps,
+          "exportRoiSidecarPath": result3c.exportRoiSidecarPath,
+          "expectedRoiSidecarPath": lane3cExpectedSidecar,
+          "sidecarExists": sidecar3cExists,
+          "sidecarValid": sidecar3cValid,
+          "mediaInfo": lane3cMediaInfo != null
+              ? _mediaInfoToMap(lane3cMediaInfo)
+              : null,
+          "exifRotatedFixtureAvailable": true,
+          "error": lane3cPass
+              ? null
+              : "Validation failed (code=$lane3cCode, exists=$out3cExists, bytes=$out3cBytes, pathMatch=$pathMatch3c, dimsMatch=$dimsMatch3c, durationValid=$duration3cValid, sidecarExists=$sidecar3cExists, sidecarValid=$sidecar3cValid, mediaValid=$mediaValid3c)",
+        };
       } on PlatformException catch (pe) {
         lane3cCode = pe.code;
+        final out3cExists = await lane3cOutputFile.exists();
+        final sidecar3cExists = await lane3cSidecarFile.exists();
+        final out3cBytes = out3cExists ? await lane3cOutputFile.length() : 0;
         print(
           "ANDROID_STILL_IMAGE_EXPORT_UNIT_R_LANE3C: Caught PlatformException code: ${pe.code}",
         );
-      } catch (e) {
-        print("ANDROID_STILL_IMAGE_EXPORT_UNIT_R_LANE3C: Caught exception: $e");
+        lane3cPass = false;
+        lane3cResultMap = <String, dynamic>{
+          "pass": false,
+          "expectedBehavior": "supported_exif_orientation_6",
+          "expectedCode": null,
+          "errorCode": lane3cCode,
+          "outputPath": lane3cOutputPath,
+          "outputBytes": out3cBytes,
+          "durationSeconds": 0.0,
+          "width": 0,
+          "height": 0,
+          "fps": 0,
+          "exportRoiSidecarPath": null,
+          "expectedRoiSidecarPath": lane3cExpectedSidecar,
+          "sidecarExists": sidecar3cExists,
+          "sidecarValid": false,
+          "mediaInfo": null,
+          "exifRotatedFixtureAvailable": true,
+          "error": "Caught PlatformException code: ${pe.code} (${pe.message})",
+        };
+      } catch (e, st) {
+        final out3cExists = await lane3cOutputFile.exists();
+        final sidecar3cExists = await lane3cSidecarFile.exists();
+        final out3cBytes = out3cExists ? await lane3cOutputFile.length() : 0;
+        print("ANDROID_STILL_IMAGE_EXPORT_UNIT_R_LANE3C: ERROR: $e\n$st");
+        lane3cPass = false;
+        lane3cResultMap = <String, dynamic>{
+          "pass": false,
+          "expectedBehavior": "supported_exif_orientation_6",
+          "expectedCode": null,
+          "errorCode": lane3cCode,
+          "outputPath": lane3cOutputPath,
+          "outputBytes": out3cBytes,
+          "durationSeconds": 0.0,
+          "width": 0,
+          "height": 0,
+          "fps": 0,
+          "exportRoiSidecarPath": null,
+          "expectedRoiSidecarPath": lane3cExpectedSidecar,
+          "sidecarExists": sidecar3cExists,
+          "sidecarValid": false,
+          "mediaInfo": null,
+          "exifRotatedFixtureAvailable": true,
+          "error": "$e",
+        };
       }
-
-      final out3cExists = await lane3cOutputFile.exists();
-      final sidecar3cExists = await lane3cSidecarFile.exists();
-      lane3cPass =
-          (lane3cCode == "UNSUPPORTED_EXPORT_FEATURE") &&
-          !out3cExists &&
-          !sidecar3cExists;
 
       lane3Pass = lane3aPass && lane3bPass && lane3cPass;
       lane3Results = <String, dynamic>{
@@ -929,14 +1043,7 @@ class _AndroidStillImageExportUnitRPhysicalSmokeAppState
           "outputResidue": out3bExists,
           "sidecarResidue": sidecar3bExists,
         },
-        "sublane3c_exif_rotated_jpeg": <String, dynamic>{
-          "pass": lane3cPass,
-          "errorCode": lane3cCode,
-          "expectedCode": "UNSUPPORTED_EXPORT_FEATURE",
-          "outputResidue": out3cExists,
-          "sidecarResidue": sidecar3cExists,
-          "exifRotatedFixtureAvailable": true,
-        },
+        "sublane3c_exif_rotated_jpeg": lane3cResultMap,
         "exifRotatedFixtureAvailable": true,
       };
       print(
@@ -1101,6 +1208,12 @@ class _AndroidStillImageExportUnitRPhysicalSmokeAppState
         "lane3cSourceFile": lane3cSourceFile,
         "lane3cOutputFile": lane3cOutputFile,
         "lane3cSidecarFile": lane3cSidecarFile,
+        "lane3cTempVideo": lane3cOutputFile != null
+            ? File("${lane3cOutputFile.path}.vgtmp")
+            : null,
+        "lane3cTempRoi": lane3cSidecarFile != null
+            ? File("${lane3cSidecarFile.path}.vgroitmp")
+            : null,
         "lane4OutputFile": lane4OutputFile,
         "lane4SidecarFile": lane4SidecarFile,
         "lane4TempVideo": lane4OutputFile != null
@@ -1159,7 +1272,7 @@ class _AndroidStillImageExportUnitRPhysicalSmokeAppState
             lane1Results ?? {"pass": false, "error": "not run"},
         "lane2_mixed_video_and_image_export":
             lane2Results ?? {"pass": false, "error": "not run"},
-        "lane3_fail_closed_source_guards":
+        "lane3_fail_closed_source_guards_and_exif_regression":
             lane3Results ?? {"pass": false, "error": "not run"},
         "lane4_cancellation":
             lane4Results ?? {"pass": false, "error": "not run"},
