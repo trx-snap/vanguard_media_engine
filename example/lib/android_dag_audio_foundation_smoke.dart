@@ -2,7 +2,8 @@
 // Copies the clip_B.mov fixture to a temp file, then invokes the native
 // runAndroidDagAudioFoundationSmoke route with videoPath/audioPath both set to
 // the copied fixture and outputDir set to the system temp directory. The
-// native harness proves both the direct-copy and PCM-mixdown scenarios.
+// native harness proves the direct-copy, PCM-mixdown, and dynamic ducking
+// mixdown scenarios.
 
 // ignore_for_file: avoid_print
 
@@ -63,7 +64,20 @@ class _AndroidDagAudioFoundationSmokeAppState
         },
       );
       resultMap = _deepStringKeyed(response! as Map);
-      pass = resultMap['pass'] == true;
+      final topLevelPass = resultMap['pass'] == true;
+      final directCopy = resultMap['directCopy'] as Map<String, dynamic>?;
+      final pcmMixdown = resultMap['pcmMixdown'] as Map<String, dynamic>?;
+      final duckingMixdown =
+          resultMap['duckingMixdown'] as Map<String, dynamic>?;
+      final directCopyPass = directCopy != null && directCopy['pass'] == true;
+      final pcmMixdownPass = pcmMixdown != null && pcmMixdown['pass'] == true;
+      final duckingMixdownPass =
+          duckingMixdown != null && duckingMixdown['pass'] == true;
+      pass =
+          topLevelPass &&
+          directCopyPass &&
+          pcmMixdownPass &&
+          duckingMixdownPass;
     } catch (e, st) {
       print('ANDROID_DAG_AUDIO_FOUNDATION_SMOKE: ERROR: $e\n$st');
       resultMap = <String, dynamic>{'pass': false, 'error': '$e'};
@@ -84,6 +98,8 @@ class _AndroidDagAudioFoundationSmokeAppState
       'pass': pass,
       'result': resultMap,
       'nonClaims': const <String>[
+        'no >2 multitrack export',
+        'no realtime playback',
         'no production exportTimeline',
         'no UI/editor wiring',
         'no ConnectsApp touched',
