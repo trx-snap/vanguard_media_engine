@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.editor
 
+import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -60,6 +61,14 @@ class AndroidEditorSequentialPlaybackSession(
     private val surfaceProducer: TextureRegistry.SurfaceProducer,
     private val onTimelineFrame: (textureId: Long, ptsSeconds: Double, generationId: Long) -> Unit,
     private val onTimelineEOS: (textureId: Long) -> Unit,
+    /**
+     * Phase 7.8I-Android: optional application [Context], used only to request/abandon
+     * [android.media.AudioManager] playback focus for original-clip audio preview (see
+     * [AndroidEditorOriginalAudioPreviewRuntime]). Focus is a courtesy to other apps, not a
+     * precondition for local-file [android.media.MediaPlayer] output, so a null context simply
+     * skips focus management without otherwise affecting audio or video preview.
+     */
+    private val context: Context? = null,
 ) {
     companion object {
         private const val TAG = "EditorSeqPlaybackSession"
@@ -98,6 +107,21 @@ class AndroidEditorSequentialPlaybackSession(
     private var activeSession: AndroidDagTexturePlaybackControlSession? = null
     private var isPlaying: Boolean = false
 
+    /**
+     * Phase 7.8I-Android: per-clip original-audio availability, indexed by [clipSpecs] position.
+     * Populated during [prepare]'s metadata-inspection pass from [AndroidDagSourceInspector]'s
+     * `hasAudio`. A clip with no audio track never gets an [AndroidEditorOriginalAudioPreviewRuntime]
+     * instance at all.
+     */
+    private var clipHasAudio: List<Boolean> = emptyList()
+
+    /**
+     * Original-clip audio preview runtime for the currently active clip, or null when the
+     * active clip has no audio track. Owned/replaced in lockstep with [activeSession] — see
+     * [activateClipBlocking].
+     */
+    private var activeAudioRuntime: AndroidEditorOriginalAudioPreviewRuntime? = null
+
     // ── prepare ────────────────────────────────────────────────────────────
 
     /**
@@ -127,6 +151,7 @@ class AndroidEditorSequentialPlaybackSession(
                 return@post
             }
 
+            val hasAudioByIndex = mutableListOf<Boolean>()
             for (spec in clipSpecs) {
                 val inspection = AndroidDagSourceInspector().inspect(spec.sourcePath)
                 try {
@@ -147,6 +172,7 @@ class AndroidEditorSequentialPlaybackSession(
                         ))
                         return@post
                     }
+                    hasAudioByIndex.add(inspection.hasAudio)
                 } finally {
                     // Metadata-only probe: release immediately. The active clip's own
                     // AndroidDagTexturePlaybackControlSession performs its own independent
@@ -154,6 +180,7 @@ class AndroidEditorSequentialPlaybackSession(
                     try { inspection.extractor?.release() } catch (_: Throwable) {}
                 }
             }
+            clipHasAudio = hasAudioByIndex
 
             totalDurationUs = clipSpecs.maxOf { it.timelineStartUs + it.timelineDurationUs }
 
@@ -193,7 +220,14 @@ class AndroidEditorSequentialPlaybackSession(
                 return@post
             }
             isPlaying = true
-            session.play(frameCount, onResult)
+            activeAudioRuntime?.play()
+            session.play(frameCount) { playResult ->
+                val playPass = playResult["pass"] as? Boolean ?: false
+                if (!playPass) {
+                    activeAudioRuntime?.pause()
+                }
+                onResult(playResult)
+            }
         }
     }
 
@@ -210,6 +244,7 @@ class AndroidEditorSequentialPlaybackSession(
                 return@post
             }
             isPlaying = false
+            activeAudioRuntime?.pause()
             session.pause(onResult)
         }
     }
@@ -243,7 +278,15 @@ class AndroidEditorSequentialPlaybackSession(
 
             val activeNow = activeSession
             if (targetIndex == activeClipIndex && activeNow != null) {
+                // Pause audio before the video seek so it never resumes ahead of a video seek
+                // that might still fail; only seek/resume audio once the video seek's pass/fail
+                // outcome is known (see defect #2).
+                activeAudioRuntime?.pause()
                 activeNow.seek(sourceTargetUs, resumeAfterSeek) { seekResult ->
+                    val seekPass = seekResult["pass"] as? Boolean ?: false
+                    if (seekPass) {
+                        activeAudioRuntime?.seek(sourceTargetUs, resumeAfterSeek) { /* no-op */ }
+                    }
                     onResult(translateSeekResult(seekResult, targetSpec))
                 }
             } else {
@@ -333,6 +376,16 @@ class AndroidEditorSequentialPlaybackSession(
             disposeLatch.await()
         }
 
+        // Release the outgoing clip's audio before the replacement runtime is created, so two
+        // clips' original-clip audio never overlaps even briefly.
+        val oldAudio = activeAudioRuntime
+        activeAudioRuntime = null
+        if (oldAudio != null) {
+            val audioReleaseLatch = CountDownLatch(1)
+            oldAudio.release { audioReleaseLatch.countDown() }
+            audioReleaseLatch.await()
+        }
+
         if (disposed.get()) {
             return mapOf("pass" to false, "raw" to "status=FAIL;reason=disposed")
         }
@@ -342,6 +395,21 @@ class AndroidEditorSequentialPlaybackSession(
 
         val mySessionToken = sessionToken.incrementAndGet()
         val spec = clipSpecs[index]
+
+        // Prepare (and preroll-seek) this clip's original-clip audio, if it has any, before
+        // touching video — mirrors the video preroll below and keeps both media confined to
+        // their own dedicated threads. A clip with no audio track never gets a runtime at all;
+        // any MediaPlayer setup/seek failure disables the runtime internally without ever
+        // failing this activation (see AndroidEditorOriginalAudioPreviewRuntime).
+        val hasAudio = clipHasAudio.getOrNull(index) ?: false
+        val newAudio = if (hasAudio) AndroidEditorOriginalAudioPreviewRuntime(context) else null
+        if (newAudio != null) {
+            val initialAudioPtsUs = explicitSourceSeekUs ?: spec.sourceTrimStartUs
+            val audioPrepareLatch = CountDownLatch(1)
+            newAudio.prepare(spec.sourcePath, initialAudioPtsUs) { audioPrepareLatch.countDown() }
+            audioPrepareLatch.await()
+        }
+        activeAudioRuntime = newAudio
 
         // Tracks the wrapped session's own inner `generationId` (bumped by it on
         // every internal seek) so a change can be detected and translated into a
@@ -374,6 +442,15 @@ class AndroidEditorSequentialPlaybackSession(
                 }
             },
             playbackEndPtsUs = spec.sourceTrimEndUs,
+            onPlaybackInterrupted = { reason ->
+                orchHandler?.post {
+                    if (sessionToken.get() == mySessionToken && !disposed.get()) {
+                        Log.w(TAG, "onPlaybackInterrupted: pausing audio; reason=$reason")
+                        isPlaying = false
+                        activeAudioRuntime?.pause()
+                    }
+                }
+            },
         )
 
         activeSession = newSession
@@ -392,13 +469,22 @@ class AndroidEditorSequentialPlaybackSession(
             return prepareResult
         }
 
+        // Audio was already prerolled to initialAudioPtsUs above; only resume it here, in
+        // lockstep with whichever video path below (no-seek or seek) also resumes.
         val seekTargetUs = explicitSourceSeekUs ?: if (spec.sourceTrimStartUs > 0L) spec.sourceTrimStartUs else null
         if (seekTargetUs == null) {
             // Already at (and this clip's trim start is) source PTS 0 — no explicit seek
             // needed, since a freshly prepared session starts decoding from the beginning
-            // of the file. Still honor a requested resume-after-activation.
+            // of the file. Still honor a requested resume-after-activation. video `play(null)`
+            // returns immediately with a pass/fail callback; a fail pauses audio right away.
             if (resumeAfterSeek) {
-                newSession.play(null) { /* continuous playback; callbacks drive state */ }
+                newAudio?.play()
+                newSession.play(null) { playResult ->
+                    val playPass = playResult["pass"] as? Boolean ?: false
+                    if (!playPass) {
+                        newAudio?.pause()
+                    }
+                }
             }
             return prepareResult
         }
@@ -410,6 +496,12 @@ class AndroidEditorSequentialPlaybackSession(
             seekLatch.countDown()
         }
         seekLatch.await()
+        // Only resume audio once the video seek's pass/fail outcome is known (see defect #3):
+        // a failed video seek must never let audio resume ahead of it.
+        val seekPass = seekResult["pass"] as? Boolean ?: false
+        if (resumeAfterSeek && seekPass) {
+            newAudio?.play()
+        }
         // seekResult lacks the prepared textureId/width/height/durationUs (seek's map only
         // carries seek-specific fields); merge so callers still see prepared metadata alongside
         // the post-seek state/raw/generationId, which take priority via the right-hand overlay.
@@ -424,6 +516,7 @@ class AndroidEditorSequentialPlaybackSession(
             // Final clip EOS: preserve the completed session (holds last frame),
             // matching the single-clip route's Completed-state behavior.
             isPlaying = false
+            activeAudioRuntime?.pause()
             onTimelineEOS(surfaceProducer.id())
             return
         }
@@ -437,7 +530,13 @@ class AndroidEditorSequentialPlaybackSession(
             return
         }
         if (wasPlaying) {
-            activeSession?.play(null) { /* continuous playback; onTimelineFrame/onTimelineEOS drive state */ }
+            activeAudioRuntime?.play()
+            activeSession?.play(null) { playResult ->
+                val playPass = playResult["pass"] as? Boolean ?: false
+                if (!playPass) {
+                    activeAudioRuntime?.pause()
+                }
+            }
         }
     }
 
@@ -464,16 +563,25 @@ class AndroidEditorSequentialPlaybackSession(
         h.post {
             val session = activeSession
             activeSession = null
+            val audio = activeAudioRuntime
+            activeAudioRuntime = null
             val finish: () -> Unit = {
                 onResult?.invoke(mapOf("pass" to true, "raw" to "status=OK;disposed=true"))
                 try { orchThread?.quitSafely() } catch (_: Throwable) {}
                 orchThread = null
                 orchHandler = null
             }
-            if (session != null) {
-                session.dispose { finish() }
+            val disposeVideoThenFinish: () -> Unit = {
+                if (session != null) {
+                    session.dispose { finish() }
+                } else {
+                    finish()
+                }
+            }
+            if (audio != null) {
+                audio.release { disposeVideoThenFinish() }
             } else {
-                finish()
+                disposeVideoThenFinish()
             }
         }
     }

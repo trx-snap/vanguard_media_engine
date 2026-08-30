@@ -38,6 +38,13 @@ data class AndroidDagSourceInspectionResult(
      * Applied to display dimensions and render transform in Phase 4B2C.
      */
     val rotationDegrees: Int,
+    /**
+     * Phase 7.8I-Android: true if any track on the source has an "audio/" mime,
+     * regardless of which track is selected on [extractor] (always the first
+     * "video/" track). Used to gate editor-preview original-audio playback
+     * without changing video track selection.
+     */
+    val hasAudio: Boolean = false,
 )
 
 class AndroidDagSourceInspector {
@@ -60,16 +67,21 @@ class AndroidDagSourceInspector {
         try {
             ex.setDataSource(videoPath)
 
-            // 4. Find first video track
+            // 4. Find first video track. Scans every track (rather than stopping at the
+            // first video match) so hasAudio below reflects the whole source, while still
+            // selecting only the first "video/*" track — video selection is unchanged.
             var trackIndex = -1
             var format: MediaFormat? = null
+            var hasAudio = false
             for (i in 0 until ex.trackCount) {
                 val f = ex.getTrackFormat(i)
                 val mime = f.getString(MediaFormat.KEY_MIME) ?: ""
-                if (mime.startsWith("video/")) {
+                if (mime.startsWith("audio/")) {
+                    hasAudio = true
+                }
+                if (trackIndex < 0 && mime.startsWith("video/")) {
                     trackIndex = i
                     format = f
-                    break
                 }
             }
 
@@ -127,6 +139,7 @@ class AndroidDagSourceInspector {
                 height = height,
                 durationUs = durationUs,
                 rotationDegrees = rotationDegrees,
+                hasAudio = hasAudio,
             )
         } catch (t: Throwable) {
             try { ex.release() } catch (_: Throwable) {}

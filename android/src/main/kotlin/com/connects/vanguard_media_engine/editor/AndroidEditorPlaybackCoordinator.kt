@@ -1,5 +1,6 @@
 package com.connects.vanguard_media_engine.editor
 
+import android.content.Context
 import android.os.Handler
 import android.util.Log
 import io.flutter.plugin.common.MethodChannel
@@ -24,6 +25,14 @@ class AndroidEditorPlaybackCoordinator(
     private val textureRegistry: TextureRegistry,
     private val channel: MethodChannel,
     private val mainHandler: Handler,
+    /**
+     * Phase 7.8I-Android: optional application [Context], forwarded to
+     * [AndroidEditorSequentialPlaybackSession] for original-clip audio preview's
+     * [android.media.AudioManager] focus requests only. Defaults to null so existing callers
+     * that do not yet supply it keep compiling and behaving exactly as before (audio focus
+     * management is simply skipped; playback itself does not require a Context).
+     */
+    private val context: Context? = null,
 ) {
     companion object {
         private const val TAG = "EditorPlaybackCoord"
@@ -276,6 +285,7 @@ class AndroidEditorPlaybackCoordinator(
             val session = AndroidEditorSequentialPlaybackSession(
                 clipSpecs = clipSpecs,
                 surfaceProducer = surfaceProducer,
+                context = context,
                 onTimelineFrame = { id, ptsSeconds, generationId ->
                     mainHandler.post {
                         channel.invokeMethod(

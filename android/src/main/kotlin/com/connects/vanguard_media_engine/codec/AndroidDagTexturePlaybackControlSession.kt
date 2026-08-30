@@ -37,6 +37,14 @@ class AndroidDagTexturePlaybackControlSession(
      * rendering a frame at or beyond it. Null preserves untrimmed (full-source) behavior.
      */
     private val playbackEndPtsUs: Long? = null,
+    /**
+     * Phase 7.8I-Android: optional callback invoked when video playback stops
+     * unexpectedly — real/simulated surface cleanup, or a terminal Failed-state
+     * transition mid-playback (as opposed to a normal pause/EOS/dispose). Used
+     * by editor callers to pause a mirrored audio-preview runtime immediately.
+     * [reason] is a short diagnostic tag; never null-checked by video logic.
+     */
+    private val onPlaybackInterrupted: ((reason: String) -> Unit)? = null,
 ) {
     companion object {
         private const val TAG = "DagTexturePlaybackCtrl"
@@ -466,6 +474,7 @@ class AndroidDagTexturePlaybackControlSession(
                                 activeFrameCallback = null
                                 val cb = pendingPlayCallback
                                 pendingPlayCallback = null
+                                onPlaybackInterrupted?.invoke("frame_render_error")
                                 cb?.invoke(mapOf(
                                     "pass" to false,
                                     "state" to state.name,
@@ -481,6 +490,7 @@ class AndroidDagTexturePlaybackControlSession(
                             activeFrameCallback = null
                             val cb = pendingPlayCallback
                             pendingPlayCallback = null
+                            onPlaybackInterrupted?.invoke("callback_exception:${t.javaClass.simpleName}")
                             cb?.invoke(mapOf(
                                 "pass" to false,
                                 "state" to state.name,
@@ -789,6 +799,7 @@ class AndroidDagTexturePlaybackControlSession(
             if (disposed.get()) return@post
 
             Log.i(TAG, "handleSurfaceCleanup: posting surface-loss cleanup; state=$state")
+            onPlaybackInterrupted?.invoke("surface_cleanup")
             cleanupResources(
                 targetState = AndroidDagPlaybackState.SurfaceLost,
                 cancelPendingPlay = true,
@@ -920,6 +931,7 @@ class AndroidDagTexturePlaybackControlSession(
         val h = handler ?: run { onDone?.invoke(diagnosticState()); return }
         h.post {
             if (!disposed.get()) {
+                onPlaybackInterrupted?.invoke("simulated_surface_cleanup")
                 cleanupResources(
                     targetState = AndroidDagPlaybackState.SurfaceLost,
                     cancelPendingPlay = true,

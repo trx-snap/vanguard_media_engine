@@ -206,6 +206,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             textureRegistry = binding.textureRegistry,
             channel         = channel,
             mainHandler     = mainHandler,
+            context         = binding.applicationContext,
         )
         timelineLiveControlCoordinator = AndroidTimelineLiveControlCoordinator(
             activeTextureIdProvider = { editorPlaybackCoordinator?.activeTimelineTextureId() },
