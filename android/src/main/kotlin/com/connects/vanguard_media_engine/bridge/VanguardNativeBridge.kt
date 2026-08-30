@@ -541,6 +541,13 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
+    // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + PiP/split ──
+    // layout-math foundation diagnostic. Pure in-memory C++ math only: builds
+    // MultiCamCompositorNode instances and calls the free ComputeMultiCamLayout()
+    // function with synthetic inputs. No threads, no Camera2, no GLES/Vulkan,
+    // no file IO, no recording/export claim.
+    external fun runAndroidDagPhase3MultiCamCompositorSmoke(): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

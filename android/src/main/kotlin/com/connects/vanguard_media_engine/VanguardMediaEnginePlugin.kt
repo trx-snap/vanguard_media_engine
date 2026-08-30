@@ -24,6 +24,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidAudioDecodeBridgeSm
 import com.connects.vanguard_media_engine.diagnostics.AndroidConcurrentDecodeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidMultiCamCompositorSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidPassthroughRemuxSinkSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
@@ -95,6 +96,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
     // ── P2-AUDIO-DEC-BRIDGE: native decoded-PCM audio source bridge smoke ─────
     private var audioDecodeBridgeSmokeCoordinator: AndroidAudioDecodeBridgeSmokeCoordinator? = null
+
+    // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
+    // math smoke coordinator.
+    private var multiCamCompositorSmokeCoordinator: AndroidMultiCamCompositorSmokeCoordinator? = null
 
     // ── P3-CAM-CONCURRENT: Camera2 dual-camera concurrent ingest smoke ────────
     private var camera2ConcurrentSmokeCoordinator: AndroidCamera2ConcurrentSmokeCoordinator? = null
@@ -242,6 +247,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         audioDecodeBridgeSmokeCoordinator = AndroidAudioDecodeBridgeSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
             mainHandler = mainHandler,
         )
         camera2ConcurrentSmokeCoordinator = AndroidCamera2ConcurrentSmokeCoordinator(
@@ -394,6 +402,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android audio decode bridge smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidMultiCamCompositorSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = multiCamCompositorSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android multi-cam compositor smoke coordinator unavailable", null)
             }
             return
         }
