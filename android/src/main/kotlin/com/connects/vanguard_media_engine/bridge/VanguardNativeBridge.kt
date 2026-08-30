@@ -544,6 +544,13 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
+    // ── P4-AUDIO-GRAPH-TOPOLOGY: native AudioMixBusNode DAG topology & gated mix ─
+    // diagnostic. Pure in-memory C++ graph topology + playhead evaluation gating +
+    // synthetic PCM mix micro-proof. Stack-scoped, single-threaded, synchronous.
+    // No threads, AudioTrack, AAudio, Oboe, MediaCodec, MediaExtractor, files,
+    // Surface, GL, export/muxer, editor playback, or product UI.
+    external fun runAndroidDagPhase4AudioGraphTopologySmoke(): String
+
     // ── P3-CAM-CONCURRENT: Camera2 dual-camera concurrent PRIVATE AHardwareBuffer ─
     // ingest validation diagnostic. Kotlin remains the sole owner of Camera2
     // device/session lifecycle (CameraManager.openCamera, CameraCaptureSession);

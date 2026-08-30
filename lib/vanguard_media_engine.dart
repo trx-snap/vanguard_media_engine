@@ -54,6 +54,8 @@ export 'vg_multicam_compositor_smoke.dart';
 export 'vg_multicam_spatial_gles_render_smoke.dart';
 // P4-AUDIO-MIXBUS: Android True-DAG Phase 4 AudioMixBusNode PCM16 mix-math diagnostic smoke foundation.
 export 'vg_audio_mix_bus_smoke.dart';
+// P4-AUDIO-GRAPH-TOPOLOGY: Android True-DAG Phase 4 AudioMixBusNode DAG topology & graph-gated diagnostic mix smoke foundation.
+export 'vg_audio_graph_topology_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.

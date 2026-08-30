@@ -114,6 +114,7 @@ if (ANDROID)
     "platform/android/src/android_gles_decoded_oes_smoke_jni.cpp"
     "platform/android/src/android_phase2_audio_decode_bridge_jni.cpp"
     "platform/android/src/android_phase4_audio_mix_bus_jni.cpp"
+    "platform/android/src/android_phase4_audio_graph_topology_jni.cpp"
     "platform/android/src/android_phase3_multicam_compositor_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_render_jni.cpp"
   )
