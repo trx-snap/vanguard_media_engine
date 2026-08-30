@@ -7,7 +7,7 @@ import java.io.File
 
 // ── AndroidAudioFoundationSmokeHarness (Export/Audio Unit B) ──────────────────
 //
-// Diagnostic audio foundation proof against a fixture video. Runs three
+// Diagnostic audio foundation proof against a fixture video. Runs five
 // scenarios end-to-end against the same fixture file:
 //
 //   directCopy — one original unity-gain AAC track. The direct-copy validator
@@ -36,6 +36,21 @@ import java.io.File
 //   overlap depth excess), PCM attenuation oracle, AAC encoding, and remux into
 //   <outputDir>/ducking_mixdown.mp4.
 //
+//   multitrackMixdown (P4-MULTITRACK-EXPORT) — a 4-track pass-2 mix (music with
+//   ducking automation, voiceover, and two SFX sidecars), asserting 9-track
+//   overlap depth rejection preflight, direct-copy rejection, PCM mixdown via
+//   native AudioMixBus with 4 simultaneous tracks, AAC encoding, and remux into
+//   <outputDir>/multitrack_mixdown.mp4.
+//
+//   staticCurveMixdown (P4-AUDIO-MIXBUS volume curves) — an 8-track mix proving
+//   static volume curve parity across fade-in only, fade-out only, non-overlapping
+//   fades, overlapping fades with proportional scaling and no inversion, out-of-range
+//   mixGain reset to unity, zero-volume silence preservation, static above-unity gain
+//   sustain > 1.0 triggering nativeGainClamped == true, and composed fade + ducking
+//   keyframes. Runs full pass-2 decode, native chunked AudioMixBus mixdown, AAC encode
+//   into <outputDir>/static_curve_mixdown_audio.m4a, and remux into
+//   <outputDir>/static_curve_mixdown.mp4.
+//
 // The harness never deletes the input fixture; partial generated outputs are
 // deleted on failure. Every run logs exactly one
 // ANDROID_DAG_AUDIO_FOUNDATION_SMOKE_RESULT <raw> marker.
@@ -52,6 +67,8 @@ object AndroidAudioFoundationSmokeHarness {
     private const val DUCKING_MIXDOWN_FILE = "ducking_mixdown.mp4"
     private const val MULTITRACK_MIXDOWN_AUDIO_FILE = "multitrack_mixdown_audio.m4a"
     private const val MULTITRACK_MIXDOWN_FILE = "multitrack_mixdown.mp4"
+    private const val STATIC_CURVE_MIXDOWN_AUDIO_FILE = "static_curve_mixdown_audio.m4a"
+    private const val STATIC_CURVE_MIXDOWN_FILE = "static_curve_mixdown.mp4"
 
     fun run(videoPath: String, audioPath: String, outputDir: String): Map<String, Any?> {
         var raw = "status=FAIL;reason=not_run"
@@ -59,19 +76,19 @@ object AndroidAudioFoundationSmokeHarness {
             if (!File(videoPath).exists() || !File(audioPath).exists()) {
                 raw = "status=FAIL;reason=input_fixture_missing;" +
                     "videoPath=$videoPath;audioPath=$audioPath"
-                return overallResult(false, raw, null, null, null, null)
+                return overallResult(false, raw, null, null, null, null, null)
             }
             val outDir = File(outputDir)
             if (!outDir.isDirectory) {
                 raw = "status=FAIL;reason=output_dir_missing;outputDir=$outputDir"
-                return overallResult(false, raw, null, null, null, null)
+                return overallResult(false, raw, null, null, null, null, null)
             }
 
             val audioDurationSec = probeAudioDurationSeconds(audioPath)
             if (audioDurationSec < 1.0) {
                 raw = "status=FAIL;reason=fixture_audio_too_short;" +
                     "durationSec=$audioDurationSec"
-                return overallResult(false, raw, null, null, null, null)
+                return overallResult(false, raw, null, null, null, null, null)
             }
 
             // Remove stale generated outputs from previous runs; the input
@@ -85,24 +102,29 @@ object AndroidAudioFoundationSmokeHarness {
                 DUCKING_MIXDOWN_FILE,
                 MULTITRACK_MIXDOWN_AUDIO_FILE,
                 MULTITRACK_MIXDOWN_FILE,
+                STATIC_CURVE_MIXDOWN_AUDIO_FILE,
+                STATIC_CURVE_MIXDOWN_FILE,
             )
 
             val directCopy = runDirectCopyScenario(videoPath, audioPath, audioDurationSec, outDir)
             val pcmMixdown = runPcmMixdownScenario(videoPath, audioPath, audioDurationSec, outDir)
             val duckingMixdown = runDuckingMixdownScenario(videoPath, audioPath, audioDurationSec, outDir)
             val multitrackMixdown = runMultitrackMixdownScenario(videoPath, audioPath, audioDurationSec, outDir)
+            val staticCurveMixdown = runStaticCurveMixdownScenario(videoPath, audioPath, audioDurationSec, outDir)
 
             val directCopyPass = directCopy["pass"] == true
             val pcmMixdownPass = pcmMixdown["pass"] == true
             val duckingMixdownPass = duckingMixdown["pass"] == true
             val multitrackMixdownPass = multitrackMixdown["pass"] == true
-            val pass = directCopyPass && pcmMixdownPass && duckingMixdownPass && multitrackMixdownPass
+            val staticCurveMixdownPass = staticCurveMixdown["pass"] == true
+            val pass = directCopyPass && pcmMixdownPass && duckingMixdownPass && multitrackMixdownPass && staticCurveMixdownPass
             raw = (if (pass) "status=PASS;" else "status=FAIL;") +
                 "directCopy=${directCopy["raw"]};pcmMixdown=${pcmMixdown["raw"]};" +
                 "duckingMixdown=${duckingMixdown["raw"]};" +
                 "multitrackMixdown=${multitrackMixdown["raw"]};" +
+                "staticCurveMixdown=${staticCurveMixdown["raw"]};" +
                 "fixtureAudioDurationSec=$audioDurationSec"
-            return overallResult(pass, raw, directCopy, pcmMixdown, duckingMixdown, multitrackMixdown)
+            return overallResult(pass, raw, directCopy, pcmMixdown, duckingMixdown, multitrackMixdown, staticCurveMixdown)
         } catch (t: Throwable) {
             val reason = t.javaClass.simpleName.ifEmpty { "unknown_exception" }
             raw = "status=FAIL;reason=exception:$reason"
@@ -116,8 +138,10 @@ object AndroidAudioFoundationSmokeHarness {
                 DUCKING_MIXDOWN_FILE,
                 MULTITRACK_MIXDOWN_AUDIO_FILE,
                 MULTITRACK_MIXDOWN_FILE,
+                STATIC_CURVE_MIXDOWN_AUDIO_FILE,
+                STATIC_CURVE_MIXDOWN_FILE,
             )
-            return overallResult(false, raw, null, null, null, null)
+            return overallResult(false, raw, null, null, null, null, null)
         } finally {
             Log.i(TAG, "$RESULT_MARKER $raw")
         }
@@ -789,6 +813,374 @@ object AndroidAudioFoundationSmokeHarness {
         )
     }
 
+    // ── Scenario 5: static curve mixdown (P4-AUDIO-MIXBUS volume curves) ──────
+
+    private fun runStaticCurveMixdownScenario(
+        videoPath: String,
+        audioPath: String,
+        audioDurationSec: Double,
+        outDir: File,
+    ): Map<String, Any?> {
+        val mixedAudioPath = File(outDir, STATIC_CURVE_MIXDOWN_AUDIO_FILE).path
+        val outputPath = File(outDir, STATIC_CURVE_MIXDOWN_FILE).path
+        val mixDurationSec = minOf(audioDurationSec, 3.0)
+
+        if (audioDurationSec < 2.0) {
+            return scenarioFailure(
+                "staticCurveMixdown",
+                "fixture_audio_too_short_for_static_curve:durationSec=$audioDurationSec",
+                outputPath,
+            )
+        }
+
+        // Track 1: fade-in only (start 0.0, mid-ramp ~0.4, sustain 0.8)
+        val fadeInDuration = minOf(2.0, mixDurationSec)
+        val fadeInTrack = mapOf(
+            "trackId" to "unitP4_sc_fade_in",
+            "url" to audioPath,
+            "startTime" to 0.0,
+            "duration" to fadeInDuration,
+            "volume" to 0.8,
+            "fadeInSeconds" to 0.6,
+            "fadeOutSeconds" to 0.0,
+            "mixGain" to 1.0,
+            "role" to "music",
+        )
+
+        // Track 2: fade-out only (sustain 0.6, mid-fade ~0.3, end 0.0)
+        val fadeOutDuration = minOf(2.0, mixDurationSec)
+        val fadeOutTrack = mapOf(
+            "trackId" to "unitP4_sc_fade_out",
+            "url" to audioPath,
+            "startTime" to 0.0,
+            "duration" to fadeOutDuration,
+            "volume" to 0.6,
+            "fadeInSeconds" to 0.0,
+            "fadeOutSeconds" to 0.6,
+            "mixGain" to 1.0,
+            "role" to "sfx",
+        )
+
+        // Track 3: both fades with non-overlap (start 0.0, sustain 0.4, mid-fade-out ~0.2, end 0.0)
+        val bothFadesDuration = minOf(2.0, mixDurationSec)
+        val bothFadesTrack = mapOf(
+            "trackId" to "unitP4_sc_both_fades",
+            "url" to audioPath,
+            "startTime" to 0.0,
+            "duration" to bothFadesDuration,
+            "volume" to 0.8,
+            "fadeInSeconds" to 0.4,
+            "fadeOutSeconds" to 0.4,
+            "mixGain" to 0.5,
+            "role" to "music",
+        )
+
+        // Track 4: overlapping fades where fadeIn + fadeOut > duration (proportional scaling, no inversion)
+        val overlapDuration = 1.0
+        val overlapTrack = mapOf(
+            "trackId" to "unitP4_sc_overlap_fades",
+            "url" to audioPath,
+            "startTime" to 0.0,
+            "duration" to overlapDuration,
+            "volume" to 0.8,
+            "fadeInSeconds" to 1.0,
+            "fadeOutSeconds" to 1.0,
+            "mixGain" to 1.0,
+            "role" to "sfx",
+        )
+
+        // Track 5: mixGain outside [0,1] resets to unity
+        val mixGainDuration = minOf(1.5, mixDurationSec)
+        val mixGainTrack = mapOf(
+            "trackId" to "unitP4_sc_mixgain_reset",
+            "url" to audioPath,
+            "startTime" to 0.0,
+            "duration" to mixGainDuration,
+            "volume" to 0.5,
+            "fadeInSeconds" to 0.0,
+            "fadeOutSeconds" to 0.0,
+            "mixGain" to 2.5,
+            "role" to "voiceover",
+        )
+
+        // Track 6: volume == 0.0 stays silent, not unity
+        val zeroVolDuration = minOf(1.5, mixDurationSec)
+        val zeroVolTrack = mapOf(
+            "trackId" to "unitP4_sc_silent_zero",
+            "url" to audioPath,
+            "startTime" to 0.0,
+            "duration" to zeroVolDuration,
+            "volume" to 0.0,
+            "fadeInSeconds" to 0.2,
+            "fadeOutSeconds" to 0.2,
+            "mixGain" to 1.0,
+            "role" to "music",
+        )
+
+        // Track 7: static above-unity track with volume > 1.0 (sustain > 1.0, triggers nativeGainClamped == true)
+        val aboveUnityDuration = minOf(1.5, mixDurationSec)
+        val aboveUnityTrack = mapOf(
+            "trackId" to "unitP4_sc_above_unity",
+            "url" to audioPath,
+            "startTime" to 0.0,
+            "duration" to aboveUnityDuration,
+            "volume" to 1.5,
+            "fadeInSeconds" to 0.0,
+            "fadeOutSeconds" to 0.0,
+            "mixGain" to 1.0,
+            "role" to "music",
+        )
+
+        // Track 8: composed fade + ducking keyframes consumed through the keyframe path
+        val composedDuration = minOf(2.0, mixDurationSec)
+        val composedKeyframes = listOf(
+            mapOf("time" to 0.0, "volume" to 0.0),
+            mapOf("time" to 0.3, "volume" to 1.0),
+            mapOf("time" to 0.6, "volume" to 0.25),
+            mapOf("time" to 1.4, "volume" to 0.25),
+            mapOf("time" to 1.7, "volume" to 1.0),
+            mapOf("time" to composedDuration, "volume" to 0.0),
+        )
+        val composedTrack = mapOf(
+            "trackId" to "unitP4_sc_composed_fade_ducking",
+            "url" to audioPath,
+            "startTime" to 0.0,
+            "duration" to composedDuration,
+            "volume" to 1.0,
+            "mixGain" to 1.0,
+            "role" to "music",
+            "volumeKeyframes" to composedKeyframes,
+        )
+
+        // 1. Parse exactly 8 valid specs and zero skipped.
+        val (specs, skippedIndices) = AndroidAudioTrackSpec.parseList(
+            listOf(
+                fadeInTrack,
+                fadeOutTrack,
+                bothFadesTrack,
+                overlapTrack,
+                mixGainTrack,
+                zeroVolTrack,
+                aboveUnityTrack,
+                composedTrack,
+            ),
+        )
+        if (specs.size != 8 || skippedIndices.isNotEmpty()) {
+            return scenarioFailure(
+                "staticCurveMixdown",
+                "parser_evidence_mismatch:parsed=${specs.size};skipped=${skippedIndices.size}",
+                outputPath,
+            )
+        }
+
+        // 2. Direct-copy validator over all eight specs must be ineligible with reason active_track_count=8.
+        val directCopyVerdict = AndroidAudioDirectCopyValidator.validate(specs)
+        if (directCopyVerdict.eligible || directCopyVerdict.reason != "active_track_count=8") {
+            return scenarioFailure(
+                "staticCurveMixdown",
+                "validator_reason_mismatch:eligible=${directCopyVerdict.eligible};reason=${directCopyVerdict.reason}",
+                outputPath,
+                extra = mapOf(
+                    "eligible" to directCopyVerdict.eligible,
+                    "eligibilityReason" to directCopyVerdict.reason,
+                ),
+            )
+        }
+
+        // 3. Assert envelope evaluations for each proof case:
+        val specFadeIn = specs[0]
+        val envFadeIn = AndroidAudioVolumeEnvelope.forTrack(specFadeIn, 0.0, specFadeIn.duration)
+        val fadeInStart = envFadeIn.evaluate(0.0)
+        val fadeInMid = envFadeIn.evaluate(0.3)
+        val fadeInSustain = envFadeIn.evaluate(1.0)
+        val fadeInOnlyOk = kotlin.math.abs(fadeInStart - 0.0) <= 0.01 &&
+            kotlin.math.abs(fadeInMid - 0.4) <= 0.01 &&
+            kotlin.math.abs(fadeInSustain - 0.8) <= 0.01
+
+        val specFadeOut = specs[1]
+        val envFadeOut = AndroidAudioVolumeEnvelope.forTrack(specFadeOut, 0.0, specFadeOut.duration)
+        val fadeOutSustain = envFadeOut.evaluate(0.5)
+        val fadeOutMid = envFadeOut.evaluate(fadeOutDuration - 0.3)
+        val fadeOutEnd = envFadeOut.evaluate(fadeOutDuration)
+        val fadeOutOnlyOk = kotlin.math.abs(fadeOutSustain - 0.6) <= 0.01 &&
+            kotlin.math.abs(fadeOutMid - 0.3) <= 0.01 &&
+            kotlin.math.abs(fadeOutEnd - 0.0) <= 0.01
+
+        val specBothFades = specs[2]
+        val envBothFades = AndroidAudioVolumeEnvelope.forTrack(specBothFades, 0.0, specBothFades.duration)
+        val bothFadesStart = envBothFades.evaluate(0.0)
+        val bothFadesSustain = envBothFades.evaluate(1.0)
+        val bothFadesMidOut = envBothFades.evaluate(bothFadesDuration - 0.2)
+        val bothFadesEnd = envBothFades.evaluate(bothFadesDuration)
+        val bothFadesNonOverlapOk = kotlin.math.abs(bothFadesStart - 0.0) <= 0.01 &&
+            kotlin.math.abs(bothFadesSustain - 0.4) <= 0.01 &&
+            kotlin.math.abs(bothFadesMidOut - 0.2) <= 0.01 &&
+            kotlin.math.abs(bothFadesEnd - 0.0) <= 0.01
+
+        val specOverlap = specs[3]
+        val envOverlap = AndroidAudioVolumeEnvelope.forTrack(specOverlap, 0.0, specOverlap.duration)
+        val overlapStart = envOverlap.evaluate(0.0)
+        val overlapMid = envOverlap.evaluate(0.5)
+        val overlapEnd = envOverlap.evaluate(1.0)
+        val overlapRampUp = envOverlap.evaluate(0.25)
+        val overlapRampDown = envOverlap.evaluate(0.75)
+        val overlappingFadesOk = kotlin.math.abs(overlapStart - 0.0) <= 0.01 &&
+            kotlin.math.abs(overlapMid - 0.8) <= 0.01 &&
+            kotlin.math.abs(overlapEnd - 0.0) <= 0.01 &&
+            kotlin.math.abs(overlapRampUp - 0.4) <= 0.01 &&
+            kotlin.math.abs(overlapRampDown - 0.4) <= 0.01
+
+        val specMixGain = specs[4]
+        val envMixGain = AndroidAudioVolumeEnvelope.forTrack(specMixGain, 0.0, specMixGain.duration)
+        val envMixGainNeg = AndroidAudioVolumeEnvelope.fromStatic(
+            volume = 0.5,
+            mixGain = -0.5,
+            fadeInSeconds = 0.0,
+            fadeOutSeconds = 0.0,
+            trackStartSec = 0.0,
+            trackEndSec = mixGainDuration,
+        )
+        val mixGainSustain = envMixGain.evaluate(0.5)
+        val mixGainNegSustain = envMixGainNeg.evaluate(0.5)
+        val mixGainResetOk = kotlin.math.abs(mixGainSustain - 0.5) <= 0.01 &&
+            kotlin.math.abs(mixGainNegSustain - 0.5) <= 0.01
+
+        val specZeroVol = specs[5]
+        val envZeroVol = AndroidAudioVolumeEnvelope.forTrack(specZeroVol, 0.0, specZeroVol.duration)
+        val zeroVolStart = envZeroVol.evaluate(0.0)
+        val zeroVolMid = envZeroVol.evaluate(0.5)
+        val zeroVolEnd = envZeroVol.evaluate(zeroVolDuration)
+        val zeroVolumeSilentOk = kotlin.math.abs(zeroVolStart - 0.0) <= 0.01 &&
+            kotlin.math.abs(zeroVolMid - 0.0) <= 0.01 &&
+            kotlin.math.abs(zeroVolEnd - 0.0) <= 0.01
+
+        val specAboveUnity = specs[6]
+        val envAboveUnity = AndroidAudioVolumeEnvelope.forTrack(specAboveUnity, 0.0, specAboveUnity.duration)
+        val aboveUnitySustain = envAboveUnity.evaluate(0.5)
+        val aboveUnitySustainOk = aboveUnitySustain > 1.0 && kotlin.math.abs(aboveUnitySustain - 1.5) <= 0.01
+
+        val specComposed = specs[7]
+        val envComposed = AndroidAudioVolumeEnvelope.forTrack(specComposed, 0.0, specComposed.duration)
+        val composedStart = envComposed.evaluate(0.0)
+        val composedDuckHold = envComposed.evaluate(1.0)
+        val composedEnd = envComposed.evaluate(composedDuration)
+        val composedFadeDuckingOk = kotlin.math.abs(composedStart - 0.0) <= 0.01 &&
+            kotlin.math.abs(composedDuckHold - 0.25) <= 0.01 &&
+            kotlin.math.abs(composedEnd - 0.0) <= 0.01
+
+        val allVolumeCurveAssertionsOk = fadeInOnlyOk &&
+            fadeOutOnlyOk &&
+            bothFadesNonOverlapOk &&
+            overlappingFadesOk &&
+            mixGainResetOk &&
+            zeroVolumeSilentOk &&
+            aboveUnitySustainOk &&
+            composedFadeDuckingOk
+
+        if (!allVolumeCurveAssertionsOk) {
+            return scenarioFailure(
+                "staticCurveMixdown",
+                "volume_curve_assertion_mismatch:fadeIn=$fadeInOnlyOk;fadeOut=$fadeOutOnlyOk;" +
+                    "bothFades=$bothFadesNonOverlapOk;overlap=$overlappingFadesOk;" +
+                    "mixGain=$mixGainResetOk;zeroVol=$zeroVolumeSilentOk;" +
+                    "aboveUnity=$aboveUnitySustainOk;composed=$composedFadeDuckingOk",
+                outputPath,
+            )
+        }
+
+        // 4. Mix tracks through AndroidAudioMixdownEngine (using native AudioMixBus).
+        val mix = AndroidAudioMixdownEngine.mix(specs)
+        if (!mix.success || mix.pcm == null) {
+            return scenarioFailure("staticCurveMixdown", "mixdown_failed:${mix.reason}", outputPath)
+        }
+        if (!mix.nativeMixBusUsed || mix.nativeChunkCount <= 0 || mix.nativeMixReason != "success" ||
+            mix.mixedTrackCount != 8 || !mix.nativeGainClamped
+        ) {
+            return scenarioFailure(
+                "staticCurveMixdown",
+                "native_mix_bus_evidence_missing:used=${mix.nativeMixBusUsed};" +
+                    "chunks=${mix.nativeChunkCount};nativeReason=${mix.nativeMixReason};" +
+                    "mixedTracks=${mix.mixedTrackCount};nativeGainClamped=${mix.nativeGainClamped}",
+                outputPath,
+            )
+        }
+
+        // 5. AAC Encode to M4A.
+        val encode = AndroidAacEncoder.encodePcm16ToM4a(
+            pcm = mix.pcm,
+            sampleRate = mix.sampleRate,
+            channelCount = mix.channelCount,
+            outputPath = mixedAudioPath,
+        )
+        if (!encode.success || encode.outputSizeBytes <= 0L || encode.encodedSamples <= 0) {
+            deleteGenerated(outDir, STATIC_CURVE_MIXDOWN_AUDIO_FILE)
+            return scenarioFailure("staticCurveMixdown", "aac_encode_failed:${encode.reason}", outputPath)
+        }
+
+        // 6. Remux with fixture video.
+        val remux = AndroidAudioRemuxer.remux(
+            videoPath = videoPath,
+            audioPath = mixedAudioPath,
+            finalPath = outputPath,
+        )
+        val pass = remux.success &&
+            remux.videoSamples > 0 &&
+            remux.audioSamples > 0 &&
+            remux.outputSizeBytes > 0L
+        if (!pass) {
+            deleteGenerated(outDir, STATIC_CURVE_MIXDOWN_AUDIO_FILE, STATIC_CURVE_MIXDOWN_FILE)
+        }
+
+        val raw = if (pass) {
+            "ok(curvesOk=$allVolumeCurveAssertionsOk,fadeInOnlyOk=$fadeInOnlyOk," +
+                "fadeOutOnlyOk=$fadeOutOnlyOk,bothFadesOk=$bothFadesNonOverlapOk," +
+                "overlapOk=$overlappingFadesOk,mixGainResetOk=$mixGainResetOk," +
+                "zeroVolSilentOk=$zeroVolumeSilentOk,aboveUnitySustainOk=$aboveUnitySustainOk," +
+                "composedDuckOk=$composedFadeDuckingOk,directCopyEligible=false," +
+                "directCopyReason=${directCopyVerdict.reason},mixedTracks=${mix.mixedTrackCount}," +
+                "nativeMixBusUsed=${mix.nativeMixBusUsed},nativeChunkCount=${mix.nativeChunkCount}," +
+                "nativeSilentChunks=${mix.nativeSilentChunks},nativeGainClamped=${mix.nativeGainClamped}," +
+                "aacSamples=${encode.encodedSamples},video=${remux.videoSamples}," +
+                "audio=${remux.audioSamples},bytes=${remux.outputSizeBytes})"
+        } else {
+            "fail(pass2_remux:${remux.reason};video=${remux.videoSamples};audio=${remux.audioSamples})"
+        }
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "eligible" to false,
+            "eligibilityReason" to directCopyVerdict.reason,
+            "curvesOk" to allVolumeCurveAssertionsOk,
+            "fadeInOnlyOk" to fadeInOnlyOk,
+            "fadeOutOnlyOk" to fadeOutOnlyOk,
+            "bothFadesNonOverlapOk" to bothFadesNonOverlapOk,
+            "overlappingFadesOk" to overlappingFadesOk,
+            "mixGainResetOk" to mixGainResetOk,
+            "zeroVolumeSilentOk" to zeroVolumeSilentOk,
+            "aboveUnitySustainOk" to aboveUnitySustainOk,
+            "composedFadeDuckingOk" to composedFadeDuckingOk,
+            "mixedTrackCount" to mix.mixedTrackCount,
+            "skippedInvalidTracks" to skippedIndices.size,
+            "skippedDecodeTracks" to mix.skippedTracks,
+            "sampleRate" to mix.sampleRate,
+            "channelCount" to mix.channelCount,
+            "frameCount" to mix.frameCount,
+            "nativeMixBusUsed" to mix.nativeMixBusUsed,
+            "nativeChunkCount" to mix.nativeChunkCount,
+            "nativeSilentChunks" to mix.nativeSilentChunks,
+            "nativeMixReason" to mix.nativeMixReason,
+            "nativeGainClamped" to mix.nativeGainClamped,
+            "encodedSamples" to encode.encodedSamples,
+            "mixedAudioPath" to mixedAudioPath,
+            "mixedAudioSize" to encode.outputSizeBytes,
+            "outputPath" to outputPath,
+            "outputSize" to remux.outputSizeBytes,
+            "videoSamples" to remux.videoSamples,
+            "audioSamples" to remux.audioSamples,
+        )
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private fun probeAudioDurationSeconds(path: String): Double {
@@ -848,6 +1240,7 @@ object AndroidAudioFoundationSmokeHarness {
         pcmMixdown: Map<String, Any?>?,
         duckingMixdown: Map<String, Any?>?,
         multitrackMixdown: Map<String, Any?>?,
+        staticCurveMixdown: Map<String, Any?>? = null,
     ): Map<String, Any?> = mapOf(
         "pass" to pass,
         "raw" to raw,
@@ -855,5 +1248,6 @@ object AndroidAudioFoundationSmokeHarness {
         "pcmMixdown" to pcmMixdown,
         "duckingMixdown" to duckingMixdown,
         "multitrackMixdown" to multitrackMixdown,
+        "staticCurveMixdown" to staticCurveMixdown,
     )
 }
