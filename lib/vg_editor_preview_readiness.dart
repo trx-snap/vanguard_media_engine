@@ -1,19 +1,21 @@
 // vg_editor_preview_readiness.dart
-// Vanguard Media Engine — Phase 7.8D-Android
+// Vanguard Media Engine — Phase 7.8P-Android
 //
 // ═══════════════════════════════════════════════════════════════════════════════
-// PHASE 7.8D-ANDROID — EDITOR PREVIEW READINESS EVALUATOR
+// PHASE 7.8P-ANDROID — EDITOR PREVIEW READINESS EVALUATOR
 // ═══════════════════════════════════════════════════════════════════════════════
 //
 // Pure-Dart public readiness evaluator for preflighting VGEditorDraft instances
 // before passing them to the Android native VGEditorController playback route.
 //
 // Android VGEditorController public playback route supports sequential plain
-// local video clips (one or more, hard-cut concatenation only). It does not
+// local video clips (one or more, hard-cut concatenation only) plus a
+// validated subset of the audio sidecar plan: derived original clip audio
+// tracks and user-added music/sfx/voiceover tracks (Phase 7.8P). It does not
 // yet execute editor compositor features such as transitions, overlays,
 // spatial clip transforms, still-image crop/fit, freeze frames, reverse
-// playback, dual-camera composition, time remap, transform tracks, color
-// matrix filtering, or audio sidecar mixing.
+// playback, dual-camera composition, time remap, transform tracks, or color
+// matrix filtering.
 //
 // This pure Dart evaluator preflights a VGEditorDraft and returns a structured
 // report (ready vs blocked) with strongly-typed issue codes, descriptive
@@ -28,6 +30,7 @@
 
 import 'package:flutter/foundation.dart';
 
+import 'vg_audio_sidecar_plan.dart';
 import 'vg_clip_descriptor.dart';
 import 'vg_editor_draft.dart';
 
@@ -85,8 +88,35 @@ enum VGEditorPreviewReadinessIssueCode {
   /// A clip specifies a color matrix filter (color matrix not executed on Android playback route).
   colorMatrixPresent,
 
-  /// The draft specifies an audio sidecar plan (audio sidecar mixing not supported on Android playback route).
+  /// Reserved for backward compatibility with earlier readiness reports.
+  /// Android editor playback now supports a validated subset of the audio
+  /// sidecar plan (Phase 7.8P: derived original / music / sfx / voiceover
+  /// tracks), so this code is never emitted by
+  /// [VGEditorPreviewReadinessEvaluator.evaluate]; an audio sidecar plan is
+  /// only blocked when it also trips one of the more specific sidecar issue
+  /// codes below.
   audioSidecarPresent,
+
+  /// An audio sidecar track has a role other than `music`, `sfx`,
+  /// `voiceover`, or `original` (or no role at all).
+  unsupportedAudioSidecarRole,
+
+  /// A user-added audio sidecar track id (`music`/`sfx`/`voiceover`) is
+  /// reused by more than one track, including across different lanes.
+  duplicateAudioSidecarTrackId,
+
+  /// A user-added audio sidecar lane (`music`+`sfx` share one lane;
+  /// `voiceover` is a separate lane) exceeds the 8-track safety cap.
+  audioSidecarLaneCapacityExceeded,
+
+  /// Two user-added audio sidecar tracks in the same lane overlap in time.
+  audioSidecarLaneOverlap,
+
+  /// An audio sidecar track fails structural validation (blank id/url,
+  /// non-finite or out-of-range numeric field, unsupported volume keyframe
+  /// curve, or a declared "original" track that does not match a derived
+  /// original clip track).
+  invalidAudioSidecarTrack,
 }
 
 /// A specific readiness issue found in a [VGEditorDraft].
@@ -191,12 +221,32 @@ final class VGEditorPreviewReadinessReport {
 /// Pure-Dart evaluator that checks whether a [VGEditorDraft] is ready for the
 /// Android native editor playback route.
 ///
-/// **Android Editor Playback Support Contract (Phase 7.8G):**
+/// **Android Editor Playback Support Contract (Phase 7.8P):**
 /// - One or more [VGClipDescriptor] entries, each with [VGMediaKind.video]
 ///   (sequential hard-cut concatenation; no transitions between clips).
 /// - No transitions ([VGEditorDraft.transitions] must be empty).
 /// - No overlays ([VGEditorDraft.overlays] must be empty).
-/// - No audio sidecar plan ([VGEditorDraft.audioSidecarPlan] must be null).
+/// - [VGEditorDraft.audioSidecarPlan] may be present if every track is a
+///   validated subset track:
+///   - Derived original tracks (`role == "original"`): `trackId` starts with
+///     `"original-"` and `url` matches a [VGClipDescriptor.sourcePath] in the
+///     draft. These pass through and are excluded from user-added duplicate
+///     id and lane checks.
+///   - User-added tracks: `role` must be `"music"`, `"sfx"`, or `"voiceover"`.
+///     `music` and `sfx` share one added-audio lane; `voiceover` uses a
+///     separate lane. Each lane allows at most 8 tracks. Same-lane tracks
+///     must not overlap in time (half-open `[start, start + duration)`
+///     intervals; touching endpoints are allowed). User-added track ids must
+///     be unique across both lanes.
+///   - Every track must pass structural validation: non-blank `trackId`/
+///     `url`; finite `startTime`, `duration`, `volume`, `mixGain`,
+///     `fadeInSeconds`, `fadeOutSeconds`, `sourceTrimStartSeconds`;
+///     `duration > 0`; `startTime >= 0`; `sourceTrimStartSeconds >= 0`;
+///     `fadeInSeconds >= 0`; `fadeOutSeconds >= 0`; and, when present, each
+///     volume keyframe has a finite `time >= 0`, a finite `volume` within
+///     `[0.0, 1.0]`, and an omitted or `"linear"` curve.
+///   - This evaluator performs no file I/O and does not check codec support;
+///     it validates only the structural/descriptor-level contract above.
 /// - No spatial clip transform ([VGClipDescriptor.transform] must be null).
 /// - No still-image fit mode or crop ([VGClipDescriptor.fitMode] == [VGStillImageFitMode.fit], [VGClipDescriptor.cropRect] == null).
 /// - No freeze frame ([VGClipDescriptor.freezePTS] must be null).
@@ -259,16 +309,13 @@ final class VGEditorPreviewReadinessEvaluator {
       );
     }
 
-    // 4. Audio sidecar plan validation.
-    if (draft.audioSidecarPlan != null) {
-      issues.add(
-        const VGEditorPreviewReadinessIssue(
-          code: VGEditorPreviewReadinessIssueCode.audioSidecarPresent,
-          message:
-              'Draft has an audio sidecar plan; audio sidecar mixing is not supported on the Android editor playback route.',
-        ),
-      );
-    }
+    // 4. Audio sidecar plan validation: a validated subset (derived original
+    // + user-added music/sfx/voiceover tracks) is supported (Phase 7.8P).
+    final sidecarPlan = draft.audioSidecarPlan;
+    final sidecarEvaluation = sidecarPlan != null
+        ? _evaluateAudioSidecarPlan(sidecarPlan, draft)
+        : const _AudioSidecarEvaluation.empty();
+    issues.addAll(sidecarEvaluation.issues);
 
     // 5. Per-clip feature inspection.
     for (final clip in draft.clips) {
@@ -391,6 +438,10 @@ final class VGEditorPreviewReadinessEvaluator {
       'overlayCount': draft.overlays.length,
       'issueCount': issues.length,
       'hasAudioSidecarPlan': draft.audioSidecarPlan != null,
+      'audioSidecarTrackCount': sidecarEvaluation.trackCount,
+      'audioSidecarAddedLaneCount': sidecarEvaluation.addedLaneCount,
+      'audioSidecarVoiceoverLaneCount': sidecarEvaluation.voiceoverLaneCount,
+      'audioSidecarOriginalTrackCount': sidecarEvaluation.originalTrackCount,
     };
 
     return VGEditorPreviewReadinessReport(
@@ -403,4 +454,220 @@ final class VGEditorPreviewReadinessEvaluator {
   /// Convenience static evaluation entry point.
   static VGEditorPreviewReadinessReport evaluateDraft(VGEditorDraft draft) =>
       const VGEditorPreviewReadinessEvaluator().evaluate(draft);
+}
+
+/// Result of validating a [VGAudioSidecarPlan] against the Phase 7.8P
+/// Android editor playback route's supported subset.
+final class _AudioSidecarEvaluation {
+  const _AudioSidecarEvaluation({
+    required this.issues,
+    required this.trackCount,
+    required this.addedLaneCount,
+    required this.voiceoverLaneCount,
+    required this.originalTrackCount,
+  });
+
+  const _AudioSidecarEvaluation.empty()
+    : issues = const <VGEditorPreviewReadinessIssue>[],
+      trackCount = 0,
+      addedLaneCount = 0,
+      voiceoverLaneCount = 0,
+      originalTrackCount = 0;
+
+  final List<VGEditorPreviewReadinessIssue> issues;
+  final int trackCount;
+  final int addedLaneCount;
+  final int voiceoverLaneCount;
+  final int originalTrackCount;
+}
+
+/// A half-open `[start, end)` time interval occupied by a lane track.
+final class _AudioSidecarLaneInterval {
+  const _AudioSidecarLaneInterval(this.start, this.end);
+  final double start;
+  final double end;
+}
+
+const _kSupportedAudioSidecarRoles = <String>{
+  'music',
+  'sfx',
+  'voiceover',
+  'original',
+};
+
+const _kAudioSidecarLaneCapacity = 8;
+
+/// Validates every track in [plan] against the Android editor playback
+/// route's supported audio sidecar subset and returns the aggregated issues
+/// and diagnostic counts. Pure Dart: no file I/O, no codec checks.
+_AudioSidecarEvaluation _evaluateAudioSidecarPlan(
+  VGAudioSidecarPlan plan,
+  VGEditorDraft draft,
+) {
+  final issues = <VGEditorPreviewReadinessIssue>[];
+  final sourcePaths = draft.clips.map((clip) => clip.sourcePath).toSet();
+
+  var addedLaneCount = 0;
+  var voiceoverLaneCount = 0;
+  var originalTrackCount = 0;
+
+  final userAddedTrackIds = <String>{};
+  final addedLane = <_AudioSidecarLaneInterval>[];
+  final voiceoverLane = <_AudioSidecarLaneInterval>[];
+
+  for (final track in plan.tracks) {
+    final fieldIssue = _validateAudioSidecarTrackFields(track);
+    if (fieldIssue != null) {
+      issues.add(
+        VGEditorPreviewReadinessIssue(
+          code: VGEditorPreviewReadinessIssueCode.invalidAudioSidecarTrack,
+          message:
+              'Audio sidecar track "${track.trackId}" is invalid: '
+              '$fieldIssue.',
+        ),
+      );
+      continue;
+    }
+
+    final role = track.role;
+    if (role == null || !_kSupportedAudioSidecarRoles.contains(role)) {
+      issues.add(
+        VGEditorPreviewReadinessIssue(
+          code: VGEditorPreviewReadinessIssueCode.unsupportedAudioSidecarRole,
+          message:
+              'Audio sidecar track "${track.trackId}" has unsupported role '
+              '"${role ?? 'null'}"; only "music", "sfx", "voiceover", and '
+              '"original" are supported on the Android editor playback route.',
+        ),
+      );
+      continue;
+    }
+
+    if (role == 'original') {
+      originalTrackCount++;
+      final isDerivedOriginal =
+          track.trackId.startsWith('original-') &&
+          sourcePaths.contains(track.url);
+      if (!isDerivedOriginal) {
+        issues.add(
+          VGEditorPreviewReadinessIssue(
+            code: VGEditorPreviewReadinessIssueCode.invalidAudioSidecarTrack,
+            message:
+                'Audio sidecar track "${track.trackId}" declares role '
+                '"original" but its trackId does not start with "original-" '
+                'or its url does not match any clip sourcePath in the draft.',
+          ),
+        );
+      }
+      continue;
+    }
+
+    // User-added track: music, sfx, or voiceover.
+    final isVoiceover = role == 'voiceover';
+    final lane = isVoiceover ? voiceoverLane : addedLane;
+    final laneName = isVoiceover ? 'voiceover' : 'music/sfx';
+
+    if (isVoiceover) {
+      voiceoverLaneCount++;
+    } else {
+      addedLaneCount++;
+    }
+
+    if (!userAddedTrackIds.add(track.trackId)) {
+      issues.add(
+        VGEditorPreviewReadinessIssue(
+          code: VGEditorPreviewReadinessIssueCode.duplicateAudioSidecarTrackId,
+          message:
+              'Audio sidecar track id "${track.trackId}" is used by more '
+              'than one user-added (music/sfx/voiceover) track.',
+        ),
+      );
+    }
+
+    if (lane.length >= _kAudioSidecarLaneCapacity) {
+      issues.add(
+        VGEditorPreviewReadinessIssue(
+          code: VGEditorPreviewReadinessIssueCode
+              .audioSidecarLaneCapacityExceeded,
+          message:
+              'Audio sidecar track "${track.trackId}" exceeds the '
+              '$_kAudioSidecarLaneCapacity-track safety cap for the '
+              '$laneName lane.',
+        ),
+      );
+      continue;
+    }
+
+    final candidate = _AudioSidecarLaneInterval(
+      track.startTime,
+      track.startTime + track.duration,
+    );
+    final overlaps = lane.any(
+      (existing) =>
+          candidate.start < existing.end && existing.start < candidate.end,
+    );
+    if (overlaps) {
+      issues.add(
+        VGEditorPreviewReadinessIssue(
+          code: VGEditorPreviewReadinessIssueCode.audioSidecarLaneOverlap,
+          message:
+              'Audio sidecar track "${track.trackId}" overlaps another '
+              'track in the $laneName lane.',
+        ),
+      );
+    }
+
+    lane.add(candidate);
+  }
+
+  return _AudioSidecarEvaluation(
+    issues: issues,
+    trackCount: plan.tracks.length,
+    addedLaneCount: addedLaneCount,
+    voiceoverLaneCount: voiceoverLaneCount,
+    originalTrackCount: originalTrackCount,
+  );
+}
+
+/// Validates the structural fields of a single [VGAudioSidecarTrack].
+/// Returns null when valid, or a human-readable reason when invalid.
+String? _validateAudioSidecarTrackFields(VGAudioSidecarTrack track) {
+  if (track.trackId.trim().isEmpty) return 'trackId must not be blank';
+  if (track.url.trim().isEmpty) return 'url must not be blank';
+  if (!track.startTime.isFinite) return 'startTime must be finite';
+  if (!track.duration.isFinite) return 'duration must be finite';
+  if (!track.volume.isFinite) return 'volume must be finite';
+  if (!track.mixGain.isFinite) return 'mixGain must be finite';
+  if (!track.fadeInSeconds.isFinite) return 'fadeInSeconds must be finite';
+  if (!track.fadeOutSeconds.isFinite) return 'fadeOutSeconds must be finite';
+  if (!track.sourceTrimStartSeconds.isFinite) {
+    return 'sourceTrimStartSeconds must be finite';
+  }
+  if (track.duration <= 0) return 'duration must be greater than zero';
+  if (track.startTime < 0) return 'startTime must be >= 0';
+  if (track.sourceTrimStartSeconds < 0) {
+    return 'sourceTrimStartSeconds must be >= 0';
+  }
+  if (track.fadeInSeconds < 0) return 'fadeInSeconds must be >= 0';
+  if (track.fadeOutSeconds < 0) return 'fadeOutSeconds must be >= 0';
+
+  final keyframes = track.volumeKeyframes;
+  if (keyframes != null) {
+    for (final keyframe in keyframes) {
+      if (!keyframe.time.isFinite || keyframe.time < 0) {
+        return 'volume keyframe time must be finite and >= 0';
+      }
+      if (!keyframe.volume.isFinite ||
+          keyframe.volume < 0.0 ||
+          keyframe.volume > 1.0) {
+        return 'volume keyframe volume must be finite and within [0.0, 1.0]';
+      }
+      if (keyframe.curve != 'linear') {
+        return 'volume keyframe curve "${keyframe.curve}" is not supported '
+            '(only linear)';
+      }
+    }
+  }
+
+  return null;
 }

@@ -1,5 +1,5 @@
 // vg_editor_preview_readiness_test.dart
-// Vanguard Media Engine — Phase 7.8D-Android Unit Tests
+// Vanguard Media Engine — Phase 7.8P-Android Unit Tests
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
@@ -178,7 +178,7 @@ void main() {
     });
 
     test(
-      'audio sidecar plan blocks readiness with audioSidecarPresent issue',
+      'supported music audio sidecar plan is ready and does not emit audioSidecarPresent',
       () {
         final plan = VGAudioSidecarPlan(
           tracks: const [
@@ -187,6 +187,154 @@ void main() {
               url: '/path/to/music.aac',
               startTime: 0.0,
               duration: 10.0,
+              role: 'music',
+            ),
+          ],
+        );
+        final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+        final report = evaluator.evaluate(draft);
+
+        expect(report.decision, VGEditorPreviewReadinessDecision.ready);
+        expect(report.canUseAndroidEditorPlaybackRoute, isTrue);
+        expect(report.issues, isEmpty);
+        expect(
+          report.issues.any(
+            (i) =>
+                i.code == VGEditorPreviewReadinessIssueCode.audioSidecarPresent,
+          ),
+          isFalse,
+        );
+        expect(report.diagnostics['hasAudioSidecarPlan'], isTrue);
+        expect(report.diagnostics['audioSidecarTrackCount'], 1);
+        expect(report.diagnostics['audioSidecarAddedLaneCount'], 1);
+      },
+    );
+
+    test(
+      'valid sidecar with one music, one sfx, one voiceover, and one derived original track is ready',
+      () {
+        final clip = makePlainVideoClip(
+          id: 'clip-1',
+          sourcePath: '/path/to/video.mp4',
+        );
+        final plan = VGAudioSidecarPlan(
+          tracks: const [
+            VGAudioSidecarTrack(
+              trackId: 'music-1',
+              url: '/path/to/music.aac',
+              startTime: 0.0,
+              duration: 5.0,
+              role: 'music',
+            ),
+            VGAudioSidecarTrack(
+              trackId: 'sfx-1',
+              url: '/path/to/sfx.aac',
+              startTime: 5.0,
+              duration: 2.0,
+              role: 'sfx',
+            ),
+            VGAudioSidecarTrack(
+              trackId: 'voiceover-1',
+              url: '/path/to/vo.aac',
+              startTime: 0.0,
+              duration: 10.0,
+              role: 'voiceover',
+            ),
+            VGAudioSidecarTrack(
+              trackId: 'original-clip-1',
+              url: '/path/to/video.mp4',
+              startTime: 0.0,
+              duration: 10.0,
+              role: 'original',
+            ),
+          ],
+        );
+        final draft = VGEditorDraft(
+          id: 'draft-sidecar',
+          clips: [clip],
+          audioSidecarPlan: plan,
+        );
+
+        final report = evaluator.evaluate(draft);
+
+        expect(report.decision, VGEditorPreviewReadinessDecision.ready);
+        expect(report.issues, isEmpty);
+        expect(report.diagnostics['audioSidecarTrackCount'], 4);
+        expect(report.diagnostics['audioSidecarAddedLaneCount'], 2);
+        expect(report.diagnostics['audioSidecarVoiceoverLaneCount'], 1);
+        expect(report.diagnostics['audioSidecarOriginalTrackCount'], 1);
+      },
+    );
+
+    test(
+      'same-lane touching endpoints (music [0,2) and sfx [2,3)) are ready',
+      () {
+        final plan = VGAudioSidecarPlan(
+          tracks: const [
+            VGAudioSidecarTrack(
+              trackId: 'music-1',
+              url: '/path/to/music.aac',
+              startTime: 0.0,
+              duration: 2.0,
+              role: 'music',
+            ),
+            VGAudioSidecarTrack(
+              trackId: 'sfx-1',
+              url: '/path/to/sfx.aac',
+              startTime: 2.0,
+              duration: 1.0,
+              role: 'sfx',
+            ),
+          ],
+        );
+        final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+        final report = evaluator.evaluate(draft);
+
+        expect(report.decision, VGEditorPreviewReadinessDecision.ready);
+        expect(report.issues, isEmpty);
+      },
+    );
+
+    test('cross-lane overlap between music/sfx and voiceover is ready', () {
+      final plan = VGAudioSidecarPlan(
+        tracks: const [
+          VGAudioSidecarTrack(
+            trackId: 'music-1',
+            url: '/path/to/music.aac',
+            startTime: 0.0,
+            duration: 10.0,
+            role: 'music',
+          ),
+          VGAudioSidecarTrack(
+            trackId: 'voiceover-1',
+            url: '/path/to/vo.aac',
+            startTime: 1.0,
+            duration: 3.0,
+            role: 'voiceover',
+          ),
+        ],
+      );
+      final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+      final report = evaluator.evaluate(draft);
+
+      expect(report.decision, VGEditorPreviewReadinessDecision.ready);
+      expect(report.issues, isEmpty);
+    });
+
+    test(
+      'unsupported string audio sidecar role blocks readiness with unsupportedAudioSidecarRole',
+      () {
+        final plan = VGAudioSidecarPlan(
+          tracks: const [
+            VGAudioSidecarTrack(
+              trackId: 'unknown-1',
+              url: '/path/to/track.aac',
+              startTime: 0.0,
+              duration: 5.0,
+              role: 'ambience',
             ),
           ],
         );
@@ -195,15 +343,334 @@ void main() {
         final report = evaluator.evaluate(draft);
 
         expect(report.decision, VGEditorPreviewReadinessDecision.blocked);
-        expect(report.canUseAndroidEditorPlaybackRoute, isFalse);
         expect(
           report.issues.any(
             (i) =>
-                i.code == VGEditorPreviewReadinessIssueCode.audioSidecarPresent,
+                i.code ==
+                VGEditorPreviewReadinessIssueCode.unsupportedAudioSidecarRole,
           ),
           isTrue,
         );
-        expect(report.diagnostics['hasAudioSidecarPlan'], isTrue);
+      },
+    );
+
+    test(
+      'null audio sidecar role blocks readiness with unsupportedAudioSidecarRole',
+      () {
+        final plan = VGAudioSidecarPlan(
+          tracks: const [
+            VGAudioSidecarTrack(
+              trackId: 'unknown-2',
+              url: '/path/to/track.aac',
+              startTime: 0.0,
+              duration: 5.0,
+            ),
+          ],
+        );
+        final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+        final report = evaluator.evaluate(draft);
+
+        expect(report.decision, VGEditorPreviewReadinessDecision.blocked);
+        expect(
+          report.issues.any(
+            (i) =>
+                i.code ==
+                VGEditorPreviewReadinessIssueCode.unsupportedAudioSidecarRole,
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'more than 8 tracks in the added (music/sfx) lane blocks readiness with audioSidecarLaneCapacityExceeded',
+      () {
+        final tracks = List<VGAudioSidecarTrack>.generate(
+          9,
+          (i) => VGAudioSidecarTrack(
+            trackId: 'music-$i',
+            url: '/path/to/music-$i.aac',
+            startTime: i * 1.0,
+            duration: 1.0,
+            role: 'music',
+          ),
+        );
+        final plan = VGAudioSidecarPlan(tracks: tracks);
+        final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+        final report = evaluator.evaluate(draft);
+
+        expect(report.decision, VGEditorPreviewReadinessDecision.blocked);
+        expect(
+          report.issues.any(
+            (i) =>
+                i.code ==
+                VGEditorPreviewReadinessIssueCode
+                    .audioSidecarLaneCapacityExceeded,
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'more than 8 tracks in the voiceover lane blocks readiness with audioSidecarLaneCapacityExceeded',
+      () {
+        final tracks = List<VGAudioSidecarTrack>.generate(
+          9,
+          (i) => VGAudioSidecarTrack(
+            trackId: 'voiceover-$i',
+            url: '/path/to/voiceover-$i.aac',
+            startTime: i * 1.0,
+            duration: 1.0,
+            role: 'voiceover',
+          ),
+        );
+        final plan = VGAudioSidecarPlan(tracks: tracks);
+        final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+        final report = evaluator.evaluate(draft);
+
+        expect(report.decision, VGEditorPreviewReadinessDecision.blocked);
+        expect(
+          report.issues.any(
+            (i) =>
+                i.code ==
+                VGEditorPreviewReadinessIssueCode
+                    .audioSidecarLaneCapacityExceeded,
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'overlapping music/sfx same-lane tracks block readiness with audioSidecarLaneOverlap',
+      () {
+        final plan = VGAudioSidecarPlan(
+          tracks: const [
+            VGAudioSidecarTrack(
+              trackId: 'music-1',
+              url: '/path/to/music.aac',
+              startTime: 0.0,
+              duration: 5.0,
+              role: 'music',
+            ),
+            VGAudioSidecarTrack(
+              trackId: 'sfx-1',
+              url: '/path/to/sfx.aac',
+              startTime: 4.0,
+              duration: 2.0,
+              role: 'sfx',
+            ),
+          ],
+        );
+        final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+        final report = evaluator.evaluate(draft);
+
+        expect(report.decision, VGEditorPreviewReadinessDecision.blocked);
+        expect(
+          report.issues.any(
+            (i) =>
+                i.code ==
+                VGEditorPreviewReadinessIssueCode.audioSidecarLaneOverlap,
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'duplicate user-added track id across lanes blocks readiness with duplicateAudioSidecarTrackId',
+      () {
+        final plan = VGAudioSidecarPlan(
+          tracks: const [
+            VGAudioSidecarTrack(
+              trackId: 'dup-1',
+              url: '/path/to/music.aac',
+              startTime: 0.0,
+              duration: 5.0,
+              role: 'music',
+            ),
+            VGAudioSidecarTrack(
+              trackId: 'dup-1',
+              url: '/path/to/vo.aac',
+              startTime: 0.0,
+              duration: 5.0,
+              role: 'voiceover',
+            ),
+          ],
+        );
+        final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+        final report = evaluator.evaluate(draft);
+
+        expect(report.decision, VGEditorPreviewReadinessDecision.blocked);
+        expect(
+          report.issues.any(
+            (i) =>
+                i.code ==
+                VGEditorPreviewReadinessIssueCode.duplicateAudioSidecarTrackId,
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'original track URL not matching any clip sourcePath blocks readiness with invalidAudioSidecarTrack',
+      () {
+        final plan = VGAudioSidecarPlan(
+          tracks: const [
+            VGAudioSidecarTrack(
+              trackId: 'original-clip-1',
+              url: '/path/to/unrelated.mp4',
+              startTime: 0.0,
+              duration: 10.0,
+              role: 'original',
+            ),
+          ],
+        );
+        final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+        final report = evaluator.evaluate(draft);
+
+        expect(report.decision, VGEditorPreviewReadinessDecision.blocked);
+        expect(
+          report.issues.any(
+            (i) =>
+                i.code ==
+                VGEditorPreviewReadinessIssueCode.invalidAudioSidecarTrack,
+          ),
+          isTrue,
+        );
+      },
+    );
+
+    test(
+      'negative duration/start/fade/sourceTrimStart or non-finite numeric fields block readiness with invalidAudioSidecarTrack',
+      () {
+        final invalidTracks = <VGAudioSidecarTrack>[
+          const VGAudioSidecarTrack(
+            trackId: 'neg-duration',
+            url: '/path/to/a.aac',
+            startTime: 0.0,
+            duration: -1.0,
+            role: 'music',
+          ),
+          const VGAudioSidecarTrack(
+            trackId: 'neg-start',
+            url: '/path/to/b.aac',
+            startTime: -1.0,
+            duration: 2.0,
+            role: 'music',
+          ),
+          const VGAudioSidecarTrack(
+            trackId: 'neg-fade-in',
+            url: '/path/to/c.aac',
+            startTime: 0.0,
+            duration: 2.0,
+            role: 'music',
+            fadeInSeconds: -0.5,
+          ),
+          const VGAudioSidecarTrack(
+            trackId: 'neg-fade-out',
+            url: '/path/to/d.aac',
+            startTime: 0.0,
+            duration: 2.0,
+            role: 'music',
+            fadeOutSeconds: -0.5,
+          ),
+          const VGAudioSidecarTrack(
+            trackId: 'neg-trim',
+            url: '/path/to/e.aac',
+            startTime: 0.0,
+            duration: 2.0,
+            role: 'music',
+            sourceTrimStartSeconds: -0.5,
+          ),
+          VGAudioSidecarTrack(
+            trackId: 'nonfinite-duration',
+            url: '/path/to/f.aac',
+            startTime: 0.0,
+            duration: double.nan,
+            role: 'music',
+          ),
+        ];
+
+        for (final track in invalidTracks) {
+          final plan = VGAudioSidecarPlan(tracks: [track]);
+          final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+          final report = evaluator.evaluate(draft);
+
+          expect(
+            report.decision,
+            VGEditorPreviewReadinessDecision.blocked,
+            reason: 'track "${track.trackId}" should block readiness',
+          );
+          expect(
+            report.issues.any(
+              (i) =>
+                  i.code ==
+                  VGEditorPreviewReadinessIssueCode.invalidAudioSidecarTrack,
+            ),
+            isTrue,
+            reason:
+                'track "${track.trackId}" should emit invalidAudioSidecarTrack',
+          );
+        }
+      },
+    );
+
+    test(
+      'volume keyframe unsupported curve or out-of-range volume blocks readiness with invalidAudioSidecarTrack',
+      () {
+        final unsupportedCurveTrack = VGAudioSidecarTrack(
+          trackId: 'kf-curve',
+          url: '/path/to/a.aac',
+          startTime: 0.0,
+          duration: 5.0,
+          role: 'music',
+          volumeKeyframes: const [
+            VGAudioVolumeKeyframe(time: 0.0, volume: 0.5, curve: 'easeIn'),
+          ],
+        );
+        final outOfRangeVolumeTrack = VGAudioSidecarTrack(
+          trackId: 'kf-range',
+          url: '/path/to/b.aac',
+          startTime: 0.0,
+          duration: 5.0,
+          role: 'music',
+          volumeKeyframes: const [
+            VGAudioVolumeKeyframe(time: 0.0, volume: 1.5),
+          ],
+        );
+
+        for (final track in [unsupportedCurveTrack, outOfRangeVolumeTrack]) {
+          final plan = VGAudioSidecarPlan(tracks: [track]);
+          final draft = makeSingleClipDraft(audioSidecarPlan: plan);
+
+          final report = evaluator.evaluate(draft);
+
+          expect(
+            report.decision,
+            VGEditorPreviewReadinessDecision.blocked,
+            reason: 'track "${track.trackId}" should block readiness',
+          );
+          expect(
+            report.issues.any(
+              (i) =>
+                  i.code ==
+                  VGEditorPreviewReadinessIssueCode.invalidAudioSidecarTrack,
+            ),
+            isTrue,
+            reason:
+                'track "${track.trackId}" should emit invalidAudioSidecarTrack',
+          );
+        }
       },
     );
 
@@ -440,6 +907,15 @@ void main() {
         );
         expect(issue, equals(sameIssue));
         expect(issue.hashCode, equals(sameIssue.hashCode));
+
+        const sidecarIssue = VGEditorPreviewReadinessIssue(
+          code: VGEditorPreviewReadinessIssueCode.audioSidecarLaneOverlap,
+          message: 'Overlapping sidecar tracks',
+        );
+        final sidecarIssueMap = sidecarIssue.toMap();
+        expect(sidecarIssueMap['code'], 'audioSidecarLaneOverlap');
+        expect(sidecarIssueMap.containsKey('clipId'), isFalse);
+        expect(sidecarIssue.toString(), contains('audioSidecarLaneOverlap'));
 
         final report = VGEditorPreviewReadinessReport(
           decision: VGEditorPreviewReadinessDecision.blocked,
