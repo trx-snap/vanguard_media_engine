@@ -24,6 +24,7 @@ class AndroidDagTexturePlaybackCoordinator(
             "runAndroidDagPhase4B2AClockStateSmoke",
             "simulateAndroidDagPhase4B2B2SurfaceCleanup",
             "simulateAndroidDagPhase4B2B2SurfaceAvailable",
+            "getAndroidDagPhase4B2B3SurfaceLifecycleStatus",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -43,6 +44,7 @@ class AndroidDagTexturePlaybackCoordinator(
             "runAndroidDagPhase4B2AClockStateSmoke" -> runPhase4B2AClockStateSmoke(args, result)
             "simulateAndroidDagPhase4B2B2SurfaceCleanup" -> simulatePhase4B2B2SurfaceCleanup(args, result)
             "simulateAndroidDagPhase4B2B2SurfaceAvailable" -> simulatePhase4B2B2SurfaceAvailable(args, result)
+            "getAndroidDagPhase4B2B3SurfaceLifecycleStatus" -> getPhase4B2B3SurfaceLifecycleStatus(args, result)
             else -> return false
         }
         return true
@@ -157,7 +159,10 @@ class AndroidDagTexturePlaybackCoordinator(
             return
         }
 
-        val surfaceProducer = textureRegistry.createSurfaceProducer()
+        // Opt into real background surface reset callbacks (rather than the default
+        // manual lifecycle) so this DAG control session can prove Home/Resume
+        // recovery via genuine onSurfaceCleanup/onSurfaceAvailable callbacks.
+        val surfaceProducer = textureRegistry.createSurfaceProducer(TextureRegistry.SurfaceLifecycle.resetInBackground)
         val textureId = surfaceProducer.id()
 
         val session = AndroidDagTexturePlaybackControlSession(
@@ -485,6 +490,36 @@ class AndroidDagTexturePlaybackCoordinator(
                 })
             }
         }
+    }
+
+    // ── Phase 4B2B3F: real vs. simulated surface lifecycle diagnostics ──────
+
+    /**
+     * Diagnostic seam: returns [AndroidDagTexturePlaybackControlSession.diagnosticState] for
+     * the given textureId, including the real-callback counters that distinguish genuine
+     * Flutter SurfaceProducer callbacks from the simulate* diagnostic seams above.
+     */
+    fun getPhase4B2B3SurfaceLifecycleStatus(args: Map<*, *>?, result: MethodChannel.Result) {
+        val textureId = (args?.get("textureId") as? Number)?.toLong()
+        if (textureId == null) {
+            result.error("INVALID_ARG", "getAndroidDagPhase4B2B3SurfaceLifecycleStatus: textureId required", null)
+            return
+        }
+        val entry = synchronized(controlSessions) { controlSessions[textureId] }
+        if (entry == null) {
+            result.success(mapOf(
+                "pass" to false,
+                "textureId" to textureId,
+                "raw" to "status=FAIL;reason=session_not_found;textureId=$textureId",
+            ))
+            return
+        }
+        val diag = entry.session.diagnosticState()
+        result.success(diag.toMutableMap().apply {
+            put("pass", true)
+            put("textureId", textureId)
+            put("raw", "status=OK;surface_lifecycle_status;state=${diag["state"]}")
+        })
     }
 
     fun disposeAll() {
