@@ -11,7 +11,6 @@ import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
 import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import java.io.File
 import java.util.UUID
-import kotlin.math.abs
 import kotlin.math.floor
 
 // ── AndroidTimelineExportSession (Export Unit C) ──────────────────────────────
@@ -524,7 +523,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         val rawTracks = (rawSidecar?.get("tracks") as? List<*>) ?: emptyList<Any?>()
         val (specs, _) = AndroidAudioTrackSpec.parseList(rawTracks)
 
-        val pass2Failure = runPass2Audio(
+        val pass2Failure = AndroidTimelineAudioPass2Muxer().run(
             specs = specs,
             videoTempPath = videoTempPath,
             audioTempPath = audioTempPath,
@@ -606,66 +605,6 @@ class AndroidTimelineExportSession(private val context: Context) {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Pass 2: audio mux / mixdown helpers
-    // ─────────────────────────────────────────────────────────────────────────
-
-    /// Returns null on success, or a machine-readable failure reason string.
-    private fun runPass2Audio(
-        specs: List<AndroidAudioTrackSpec>,
-        videoTempPath: String,
-        audioTempPath: String,
-        finalTmpPath: String,
-    ): String? {
-        if (specs.isEmpty()) {
-            val remux = AndroidAudioRemuxer.remux(videoTempPath, null, finalTmpPath)
-            return if (remux.success) null else "remux:${remux.reason}"
-        }
-
-        if (tryDirectCopy(specs, videoTempPath)) {
-            val track = specs.first()
-            val remux = AndroidAudioRemuxer.remux(videoTempPath, track.url, finalTmpPath)
-            if (remux.success) return null
-            return "direct_copy_remux:${remux.reason}"
-        }
-
-        val mix = AndroidAudioMixdownEngine.mix(specs)
-        if (!mix.success || mix.pcm == null) {
-            return "mixdown:${mix.reason}"
-        }
-        val aacResult = AndroidAacEncoder.encodePcm16ToM4a(
-            pcm = mix.pcm,
-            sampleRate = mix.sampleRate,
-            channelCount = mix.channelCount,
-            outputPath = audioTempPath,
-        )
-        if (!aacResult.success) {
-            return "aac_encode:${aacResult.reason}"
-        }
-        val remux = AndroidAudioRemuxer.remux(videoTempPath, audioTempPath, finalTmpPath)
-        return if (remux.success) null else "mixdown_remux:${remux.reason}"
-    }
-
-    /// Unit C direct-copy eligibility additionally requires (beyond Unit B's
-    /// validator): sourceTrimStart ≈ 0.0, and the track duration must match
-    /// both the probed source audio duration and the pass-1 video duration
-    /// within 50 ms. Any mismatch falls back to the mixdown path.
-    private fun tryDirectCopy(specs: List<AndroidAudioTrackSpec>, videoTempPath: String): Boolean {
-        val verdict = AndroidAudioDirectCopyValidator.validate(specs)
-        if (!verdict.eligible) return false
-
-        val track = specs.first()
-        if (abs(track.sourceTrimStart) > TRIM_START_TOLERANCE_SECONDS) return false
-
-        val sourceAudioDuration = probeMediaDurationSeconds(track.url) ?: return false
-        val pass1VideoDuration = probeMediaDurationSeconds(videoTempPath) ?: return false
-
-        if (abs(track.duration - sourceAudioDuration) > DURATION_TOLERANCE_SECONDS) return false
-        if (abs(track.duration - pass1VideoDuration) > DURATION_TOLERANCE_SECONDS) return false
-
-        return true
-    }
-
-    // ─────────────────────────────────────────────────────────────────────────
     // Terminal-state logging (one row per export run -- never per-frame)
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -740,8 +679,6 @@ class AndroidTimelineExportSession(private val context: Context) {
     companion object {
         private const val TAG = "VGTimelineExportSession"
         private const val DEFAULT_BITRATE_BPS = 4_000_000
-        private const val TRIM_START_TOLERANCE_SECONDS = 0.001
-        private const val DURATION_TOLERANCE_SECONDS = 0.05
         private const val MAX_STILL_FRAME_COUNT = 36_000
 
         // Progress checkpoints (frozen — see [start] doc comment). PASS1_PROGRESS_WEIGHT is

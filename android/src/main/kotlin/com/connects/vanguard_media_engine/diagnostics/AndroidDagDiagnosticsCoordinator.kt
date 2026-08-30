@@ -42,6 +42,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase4ADecoderSmoke",
             "runAndroidDagPhase5EncoderSurfaceSmoke",
             "runAndroidDagAudioFoundationSmoke",
+            "runAndroidAudioDirectCopyFallbackSmoke",
             "runAndroidPassthroughRemuxNativeSmoke",
             "runAndroidPassthroughRemuxSampleIntegritySmoke",
             "runAndroidPassthroughRemuxCapabilityProbeSmoke",
@@ -96,6 +97,7 @@ class AndroidDagDiagnosticsCoordinator(
             "runAndroidDagPhase4ADecoderSmoke" -> runPhase4ADecoderSmoke(args, result)
             "runAndroidDagPhase5EncoderSurfaceSmoke" -> runPhase5EncoderSurfaceSmoke(args, result)
             "runAndroidDagAudioFoundationSmoke" -> runAudioFoundationSmoke(args, result)
+            "runAndroidAudioDirectCopyFallbackSmoke" -> runAudioDirectCopyFallbackSmoke(args, result)
             "runAndroidPassthroughRemuxNativeSmoke" -> runPassthroughRemuxNativeSmoke(args, result)
             "runAndroidPassthroughRemuxSampleIntegritySmoke" ->
                 runPassthroughRemuxSampleIntegritySmoke(args, result)
@@ -288,6 +290,37 @@ class AndroidDagDiagnosticsCoordinator(
                     result.error(
                         "AUDIO_FOUNDATION_SMOKE_FAILED",
                         "runAndroidDagAudioFoundationSmoke: ${t.javaClass.simpleName}: ${t.message}",
+                        null,
+                    )
+                }
+            }
+        }.start()
+    }
+
+    // ── Android True-DAG Pass-2 Audio Direct-Copy Failure Fallback smoke ─────
+    private fun runAudioDirectCopyFallbackSmoke(args: Map<*, *>?, result: MethodChannel.Result) {
+        val sourcePath = args?.get("sourcePath") as? String
+        val outputDir = args?.get("outputDir") as? String
+        if (sourcePath.isNullOrBlank() || outputDir.isNullOrBlank()) {
+            result.error(
+                "INVALID_ARG",
+                "runAndroidAudioDirectCopyFallbackSmoke: sourcePath and outputDir required",
+                null,
+            )
+            return
+        }
+        Thread {
+            try {
+                val smokeResult = AndroidAudioDirectCopyFallbackSmokeHarness.run(
+                    sourcePath = sourcePath,
+                    outputDir = outputDir,
+                )
+                mainHandler.post { result.success(smokeResult) }
+            } catch (t: Throwable) {
+                mainHandler.post {
+                    result.error(
+                        "AUDIO_DIRECT_COPY_FALLBACK_SMOKE_FAILED",
+                        "runAndroidAudioDirectCopyFallbackSmoke: ${t.javaClass.simpleName}: ${t.message}",
                         null,
                     )
                 }
