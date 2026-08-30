@@ -52,6 +52,9 @@ class AndroidDagFrameRenderPump {
 
         /** Tolerance for treating a slightly-early decoded frame as "due" for render. */
         const val DEFAULT_DUE_TOLERANCE_US = 2_000L
+
+        /** Bound on how many stale queued images a single pumpOnce call may drop for catch-up. */
+        const val DEFAULT_MAX_CATCH_UP_DROPS_PER_PUMP = 2
     }
 
     fun pumpOnce(
@@ -75,6 +78,14 @@ class AndroidDagFrameRenderPump {
         dueToleranceUs: Long = DEFAULT_DUE_TOLERANCE_US,
         /** Trim-end boundary (source PTS, us); frames at/after this are never rendered. Null = untrimmed. */
         sourceEndPtsUs: Long? = null,
+        /**
+         * Continuous-playback-only option: when true and decoded frames have fallen behind
+         * [dueMediaPtsUs] by more than [dueToleranceUs], drop a bounded number of stale queued
+         * images before rendering so preview can catch back up to wall-clock. Defaults to false
+         * (existing behavior) so target-frame-count proof callers are unaffected.
+         */
+        allowCatchUpDrop: Boolean = false,
+        maxCatchUpDropsPerPump: Int = DEFAULT_MAX_CATCH_UP_DROPS_PER_PUMP,
     ): AndroidDagFrameRenderPumpResult {
         var localInputDone = inputDone
         var localOutputDone = outputDone
@@ -118,6 +129,27 @@ class AndroidDagFrameRenderPump {
 
             if (isEos) {
                 localOutputDone = true
+            }
+        }
+
+        // Catch-up (continuous playback only, opt-in): drop a small bounded number of stale
+        // queued images so a decode backlog doesn't keep preview permanently behind wall-clock.
+        // Never touches a boundary-or-later frame (left for the playbackEnd drain below) and
+        // always leaves at least one queued image behind for the normal render selection.
+        if (allowCatchUpDrop && dueMediaPtsUs != null) {
+            var catchUpDrops = 0
+            val staleThresholdUs = dueMediaPtsUs - dueToleranceUs
+            while (catchUpDrops < maxCatchUpDropsPerPump && imageQueue.size > 1) {
+                val front = imageQueue.peek() ?: break
+                val frontPtsUs = front.timestamp / 1000L
+                if (sourceEndPtsUs != null && frontPtsUs >= sourceEndPtsUs) break
+                if (frontPtsUs >= staleThresholdUs) break
+                val dropped = imageQueue.poll() ?: break
+                try { dropped.close() } catch (_: Throwable) {}
+                catchUpDrops++
+            }
+            if (catchUpDrops > 0) {
+                Log.d(TAG, "catch-up: dropped $catchUpDrops stale frame(s) behind dueMediaPtsUs=$dueMediaPtsUs")
             }
         }
 

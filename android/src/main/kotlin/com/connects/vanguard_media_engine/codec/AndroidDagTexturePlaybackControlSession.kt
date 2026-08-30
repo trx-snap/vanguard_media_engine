@@ -390,6 +390,9 @@ class AndroidDagTexturePlaybackControlSession(
                                 lastRenderedPtsUs = lastRenderedPtsUs,
                                 dueMediaPtsUs = dueMediaPtsUs,
                                 sourceEndPtsUs = playbackEndPtsUs,
+                                // Catch-up drop is only safe for continuous playback: a non-null
+                                // targetFrameCount is a proof that must render an exact frame count.
+                                allowCatchUpDrop = targetFrameCount == null,
                             )
                             inputDone = pumpResult.inputDone
                             outputDone = pumpResult.outputDone
