@@ -10,11 +10,12 @@
 // graph-gated mix calculation, and invalid gain rejection.
 //
 // Honest non-claims:
+// - Proves DecodedAudioPcmSourceNode timeline gating and PTS mapping only; AudioMixBusNode remains always-active.
 // - Does not claim audible or realtime audio playback.
-// - Does not claim C++ graph buffer transport; evaluatePlayhead moves no PCM.
-// - Does not claim audio timeline gating; current audio nodes inherit always-active/identity defaults.
+// - Does not claim C++ graph buffer transport / PCM transport; evaluatePlayhead moves no PCM.
+// - Does not claim AudioTrack integration.
 // - Does not claim Pass-2 export now runs through Graph.
-// - Does not close P4-AUDIO-MIXBUS.
+// - Does not close P4-AUDIO-MIXBUS or Phase 4.
 
 import 'dart:async';
 
@@ -101,6 +102,12 @@ class VGAudioGraphTopologySmokeReport {
   /// Whether out-of-range gain rejection (gain=1.5 -> kInvalidGain) succeeded.
   bool get invalidGainOk => _boolMetric('invalidGainOk');
 
+  /// Whether DecodedAudioPcmSourceNode timeline gating at active and inactive playheads succeeded.
+  bool get audioTimelineGatingOk => _boolMetric('audioTimelineGatingOk');
+
+  /// Whether DecodedAudioPcmSourceNode timeline PTS to local PTS mapping and defensive clamping succeeded.
+  bool get audioPtsMappingOk => _boolMetric('audioPtsMappingOk');
+
   /// Whether graph and node lifecycle tear-down succeeded cleanly.
   bool get lifecycleOk => _boolMetric('lifecycleOk');
 
@@ -164,6 +171,8 @@ class VGAudioGraphTopologySmokeReport {
       mediaFlagsOk &&
       graphGatedMixOk &&
       invalidGainOk &&
+      audioTimelineGatingOk &&
+      audioPtsMappingOk &&
       lifecycleOk &&
       stackScoped &&
       hasAudio &&

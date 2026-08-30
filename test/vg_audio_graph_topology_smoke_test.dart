@@ -20,6 +20,8 @@ const _kAllLanes = <String>[
   'mediaFlagsOk',
   'graphGatedMixOk',
   'invalidGainOk',
+  'audioTimelineGatingOk',
+  'audioPtsMappingOk',
   'lifecycleOk',
   'stackScoped',
   'hasAudio',
@@ -38,6 +40,8 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'mediaFlagsOk': true,
     'graphGatedMixOk': true,
     'invalidGainOk': true,
+    'audioTimelineGatingOk': true,
+    'audioPtsMappingOk': true,
     'lifecycleOk': true,
     'stackScoped': true,
     'hasAudio': true,
@@ -67,6 +71,8 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'mediaFlagsOk': 'true',
     'graphGatedMixOk': 'true',
     'invalidGainOk': 'true',
+    'audioTimelineGatingOk': 'true',
+    'audioPtsMappingOk': 'true',
     'lifecycleOk': 'true',
     'stackScoped': 'true',
     'nodeCount': '5',
@@ -132,6 +138,8 @@ void main() {
         expect(report.mediaFlagsOk, isTrue);
         expect(report.graphGatedMixOk, isTrue);
         expect(report.invalidGainOk, isTrue);
+        expect(report.audioTimelineGatingOk, isTrue);
+        expect(report.audioPtsMappingOk, isTrue);
         expect(report.lifecycleOk, isTrue);
         expect(report.stackScoped, isTrue);
         expect(report.hasAudio, isTrue);
@@ -180,6 +188,8 @@ void main() {
             'mediaFlagsOk': true,
             'graphGatedMixOk': true,
             'invalidGainOk': true,
+            'audioTimelineGatingOk': true,
+            'audioPtsMappingOk': true,
             'lifecycleOk': true,
             'stackScoped': true,
             'hasAudio': true,
@@ -236,6 +246,8 @@ void main() {
             'mediaFlagsOk=true;'
             'graphGatedMixOk=true;'
             'invalidGainOk=true;'
+            'audioTimelineGatingOk=true;'
+            'audioPtsMappingOk=true;'
             'lifecycleOk=true;'
             'stackScoped=true;'
             'hasAudio=true;'
@@ -262,6 +274,8 @@ void main() {
       expect(reportFromRaw.activeNodeCount, equals(5));
       expect(reportFromRaw.mixChecksum, equals(99999));
       expect(reportFromRaw.topologyOk, isTrue);
+      expect(reportFromRaw.audioTimelineGatingOk, isTrue);
+      expect(reportFromRaw.audioPtsMappingOk, isTrue);
       expect(reportFromRaw.hasAudio, isTrue);
       expect(reportFromRaw.hasVideo, isFalse);
       expect(reportFromRaw.hasCanonicalProofBoundary, isTrue);
@@ -360,6 +374,12 @@ void main() {
               break;
             case 'invalidGainOk':
               expect(report.invalidGainOk, isFalse);
+              break;
+            case 'audioTimelineGatingOk':
+              expect(report.audioTimelineGatingOk, isFalse);
+              break;
+            case 'audioPtsMappingOk':
+              expect(report.audioPtsMappingOk, isFalse);
               break;
             case 'lifecycleOk':
               expect(report.lifecycleOk, isFalse);

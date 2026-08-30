@@ -1,5 +1,6 @@
 #include "vanguard/audio/decoded_audio_pcm_source_node.h"
 
+#include <limits>
 #include <stdexcept>
 #include <utility>
 
@@ -67,6 +68,29 @@ int64_t DecodedAudioPcmSourceNode::expectedFrameCount() const {
 
 uint64_t DecodedAudioPcmSourceNode::timelineStartPtsUs() const {
     return timelineStartPtsUs_;
+}
+
+bool DecodedAudioPcmSourceNode::isActiveAt(uint64_t timelinePtsUs) const {
+    const uint64_t durationUs =
+        (static_cast<uint64_t>(expectedFrameCount_) * 1000000ULL) / static_cast<uint64_t>(sampleRate_);
+    const uint64_t endPtsUs =
+        (std::numeric_limits<uint64_t>::max() - timelineStartPtsUs_ < durationUs)
+            ? std::numeric_limits<uint64_t>::max()
+            : timelineStartPtsUs_ + durationUs;
+
+    return timelinePtsUs >= timelineStartPtsUs_ && timelinePtsUs < endPtsUs;
+}
+
+uint64_t DecodedAudioPcmSourceNode::mapTimelineToLocalPts(uint64_t timelinePtsUs) const {
+    const uint64_t durationUs =
+        (static_cast<uint64_t>(expectedFrameCount_) * 1000000ULL) / static_cast<uint64_t>(sampleRate_);
+
+    if (timelinePtsUs < timelineStartPtsUs_) {
+        return 0;
+    }
+
+    const uint64_t elapsedUs = timelinePtsUs - timelineStartPtsUs_;
+    return elapsedUs < durationUs ? elapsedUs : durationUs;
 }
 
 int64_t DecodedAudioPcmSourceNode::ingestedFrameCount() const {

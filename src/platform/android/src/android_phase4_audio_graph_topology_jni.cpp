@@ -4,9 +4,15 @@
 // Honest non-claims:
 // - Does not claim audible or realtime audio playback.
 // - Does not claim C++ graph buffer transport; evaluatePlayhead moves no PCM.
-// - Does not claim audio timeline gating; current audio nodes inherit always-active/identity defaults.
+// - Does not claim AudioTrack playback.
 // - Does not claim Pass-2 export now runs through Graph.
 // - Does not close P4-AUDIO-MIXBUS.
+//
+// P4-AUDIO-NODE-TIMELINE (sub-slice A): DecodedAudioPcmSourceNode now
+// implements per-node timeline gating (isActiveAt/mapTimelineToLocalPts)
+// against its own [timelineStartPtsUs, timelineStartPtsUs + durationUs)
+// window. AudioMixBusNode and sink nodes remain always-active with
+// identity-mapped localPtsUs, inherited unchanged from Node's defaults.
 //
 // This translation unit is Android-only and must NOT be included in iOS or
 // host builds. It is added via the Android-only target_sources block in
@@ -90,6 +96,8 @@ std::string RunAudioGraphTopologySmokeInternal() {
     bool mediaFlagsOk = false;
     bool graphGatedMixOk = false;
     bool invalidGainOk = false;
+    bool audioTimelineGatingOk = false;
+    bool audioPtsMappingOk = false;
     bool lifecycleOk = true;
     bool stackScoped = true;
 
@@ -462,9 +470,65 @@ std::string RunAudioGraphTopologySmokeInternal() {
         }
     }
 
+    // ── 10. audioTimelineGatingOk: at timelinePtsUs=200000, the 100ms-duration sources (src0/src1/src2)
+    //        are timeline-inactive while mix0/sink0 (identity-mapped defaults) remain active ──
+    {
+        vanguard::graph::FrameRequest pts200Req;
+        pts200Req.generationId = graph.generationId();
+        pts200Req.timelinePtsUs = 200000;
+        vanguard::graph::FrameEvaluationResult pts200Result;
+        vanguard::core::Status sPts200 = graph.evaluatePlayhead(pts200Req, pts200Result);
+
+        if (sPts200.ok() && pts200Result.ok() && pts200Result.activeNodeDetails.size() == 2) {
+            std::vector<std::string> activeIds;
+            bool localPtsOk = true;
+            for (const auto& info : pts200Result.activeNodeDetails) {
+                activeIds.push_back(info.nodeId);
+                if (info.localPtsUs != 200000) {
+                    localPtsOk = false;
+                }
+            }
+            std::sort(activeIds.begin(), activeIds.end());
+            const std::vector<std::string> expectedActiveIds = {"mix0", "sink0"};
+
+            if (activeIds == expectedActiveIds && localPtsOk) {
+                audioTimelineGatingOk = true;
+            } else {
+                if (failureReason.empty()) failureReason = "audio_timeline_gating_active_set_mismatch";
+            }
+        } else {
+            if (failureReason.empty()) failureReason = "audio_timeline_gating_evaluation_failed";
+        }
+    }
+
+    // ── 11. audioPtsMappingOk: standalone DecodedAudioPcmSourceNode isActiveAt/mapTimelineToLocalPts
+    //        boundary semantics for [timelineStartPtsUs, timelineStartPtsUs + durationUs) ──
+    {
+        vanguard::audio::DecodedAudioPcmSourceNode ptsNode("pts_probe", 48000, 2, 4800, 50000);
+
+        const bool activeChecks =
+            !ptsNode.isActiveAt(49999) &&
+            ptsNode.isActiveAt(50000) &&
+            ptsNode.isActiveAt(149999) &&
+            !ptsNode.isActiveAt(150000);
+
+        const bool mappingChecks =
+            ptsNode.mapTimelineToLocalPts(40000) == 0 &&
+            ptsNode.mapTimelineToLocalPts(60000) == 10000 &&
+            ptsNode.mapTimelineToLocalPts(150000) == 100000 &&
+            ptsNode.mapTimelineToLocalPts(9999999) == 100000;
+
+        if (activeChecks && mappingChecks) {
+            audioPtsMappingOk = true;
+        } else {
+            if (failureReason.empty()) failureReason = "audio_pts_mapping_check_failed";
+        }
+    }
+
     const bool allPass = topologyOk && topoOrderOk && portTypeOk && capacityOk &&
                          cycleRejectOk && inputFanInRejectOk && staleGenerationOk && mediaFlagsOk &&
-                         graphGatedMixOk && invalidGainOk && lifecycleOk;
+                         graphGatedMixOk && invalidGainOk && audioTimelineGatingOk && audioPtsMappingOk &&
+                         lifecycleOk;
 
     std::ostringstream oss;
     if (allPass) {
@@ -480,6 +544,8 @@ std::string RunAudioGraphTopologySmokeInternal() {
             << "mediaFlagsOk=true;"
             << "graphGatedMixOk=true;"
             << "invalidGainOk=true;"
+            << "audioTimelineGatingOk=true;"
+            << "audioPtsMappingOk=true;"
             << "lifecycleOk=true;"
             << "stackScoped=true;"
             << "nodeCount=" << reportedNodeCount << ";"
@@ -508,6 +574,8 @@ std::string RunAudioGraphTopologySmokeInternal() {
             << "mediaFlagsOk=" << (mediaFlagsOk ? "true" : "false") << ";"
             << "graphGatedMixOk=" << (graphGatedMixOk ? "true" : "false") << ";"
             << "invalidGainOk=" << (invalidGainOk ? "true" : "false") << ";"
+            << "audioTimelineGatingOk=" << (audioTimelineGatingOk ? "true" : "false") << ";"
+            << "audioPtsMappingOk=" << (audioPtsMappingOk ? "true" : "false") << ";"
             << "lifecycleOk=" << (lifecycleOk ? "true" : "false") << ";"
             << "stackScoped=" << (stackScoped ? "true" : "false") << ";"
             << "nodeCount=" << reportedNodeCount << ";"

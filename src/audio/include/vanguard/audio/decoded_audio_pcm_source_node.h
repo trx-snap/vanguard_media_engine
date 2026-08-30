@@ -29,6 +29,9 @@ public:
     const std::vector<vanguard::graph::PortDescriptor>& inputPorts()  const override;
     const std::vector<vanguard::graph::PortDescriptor>& outputPorts() const override;
 
+    bool     isActiveAt(uint64_t timelinePtsUs) const override;
+    uint64_t mapTimelineToLocalPts(uint64_t timelinePtsUs) const override;
+
     int32_t  sampleRate()          const;
     int32_t  channelCount()        const;
     int64_t  expectedFrameCount()  const;

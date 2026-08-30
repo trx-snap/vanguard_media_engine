@@ -14,11 +14,12 @@ import io.flutter.plugin.common.MethodChannel
  * a synthetic PCM mix is reachable only after successful graph evaluation.
  *
  * Honest non-claims:
+ * - Proves DecodedAudioPcmSourceNode timeline gating and PTS mapping only; AudioMixBusNode remains always-active.
  * - Does not claim audible or realtime audio playback.
- * - Does not claim C++ graph buffer transport; evaluatePlayhead moves no PCM.
- * - Does not claim audio timeline gating; current audio nodes inherit always-active/identity defaults.
+ * - Does not claim C++ graph buffer transport / PCM transport; evaluatePlayhead moves no PCM.
+ * - Does not claim AudioTrack integration.
  * - Does not claim Pass-2 export now runs through Graph.
- * - Does not close P4-AUDIO-MIXBUS.
+ * - Does not close P4-AUDIO-MIXBUS or Phase 4.
  */
 class AndroidAudioGraphTopologySmokeCoordinator(
     private val mainHandler: Handler,
