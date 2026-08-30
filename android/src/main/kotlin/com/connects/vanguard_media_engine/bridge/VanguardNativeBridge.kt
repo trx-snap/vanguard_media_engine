@@ -512,6 +512,38 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
+    // ── P4-AUDIO-MIXBUS: bounded native PCM16 mix-bus foundation diagnostic ──
+    // AudioMixBusNode is platform-neutral C++: no JNI/Android/thread/file IO
+    // inside the node itself. Native only mixes already-decoded interleaved
+    // PCM16 tracks handed across direct java.nio.ByteBuffers; Kotlin remains
+    // the sole owner of MediaExtractor/MediaCodec/AudioTrack. No decoder, no
+    // AAC, no export/mixdown route, no realtime playback wiring here.
+    external fun createAndroidDagPhase4AudioMixBusSession(
+        nodeId: String,
+        sampleRate: Int,
+        channelCount: Int,
+        maxFramesPerMix: Int,
+    ): String
+
+    external fun addAndroidDagPhase4AudioMixBusTrack(
+        sessionId: String,
+        pcm16Buffer: java.nio.ByteBuffer,
+        frameCount: Int,
+        sampleRate: Int,
+        channelCount: Int,
+        gain: Double,
+    ): String
+
+    external fun mixAndroidDagPhase4AudioMixBusSession(
+        sessionId: String,
+        framesToMix: Int,
+        outBuffer: java.nio.ByteBuffer,
+    ): String
+
+    external fun destroyAndroidDagPhase4AudioMixBusSession(
+        sessionId: String,
+    ): String
+
     // ── P3-CAM-CONCURRENT: Camera2 dual-camera concurrent PRIVATE AHardwareBuffer ─
     // ingest validation diagnostic. Kotlin remains the sole owner of Camera2
     // device/session lifecycle (CameraManager.openCamera, CameraCaptureSession);

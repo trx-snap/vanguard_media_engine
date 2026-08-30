@@ -19,7 +19,10 @@ add_library(vanguard_sinks STATIC "sinks/src/passthrough_remux_sink_node.cpp")
 target_include_directories(vanguard_sinks PUBLIC "sinks/include")
 target_link_libraries(vanguard_sinks PRIVATE vanguard_graph vanguard_core)
 
-add_library(vanguard_audio STATIC "audio/src/decoded_audio_pcm_source_node.cpp")
+add_library(vanguard_audio STATIC
+    "audio/src/decoded_audio_pcm_source_node.cpp"
+    "audio/src/audio_mix_bus_node.cpp"
+)
 target_include_directories(vanguard_audio PUBLIC "audio/include")
 target_link_libraries(vanguard_audio PRIVATE vanguard_graph vanguard_core)
 
@@ -110,6 +113,7 @@ if (ANDROID)
     "platform/android/src/android_gles_texture_composition_dag_smoke_jni.cpp"
     "platform/android/src/android_gles_decoded_oes_smoke_jni.cpp"
     "platform/android/src/android_phase2_audio_decode_bridge_jni.cpp"
+    "platform/android/src/android_phase4_audio_mix_bus_jni.cpp"
     "platform/android/src/android_phase3_multicam_compositor_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_render_jni.cpp"
   )
