@@ -45,6 +45,7 @@ class AndroidEditorOriginalAudioPreviewRuntime(
 ) {
     companion object {
         private const val TAG = "EditorOrigAudioPreview"
+        private const val LOG_PREFIX = "VG_EDITOR_AUDIO_PREVIEW"
     }
 
     private val audioThread = HandlerThread("EditorOrigAudioPreview").also { it.start() }
@@ -74,6 +75,7 @@ class AndroidEditorOriginalAudioPreviewRuntime(
     fun prepare(sourcePath: String, initialSourcePtsUs: Long, onDone: () -> Unit) {
         audioHandler.post {
             if (released.get()) {
+                Log.i(TAG, "$LOG_PREFIX prepare_skip_released")
                 onDone()
                 return@post
             }
@@ -81,6 +83,7 @@ class AndroidEditorOriginalAudioPreviewRuntime(
 
             val file = File(sourcePath)
             if (!file.exists() || !file.canRead()) {
+                Log.w(TAG, "$LOG_PREFIX prepare_missing_file exist=${file.exists()} canRead=${file.canRead()}")
                 onDone()
                 return@post
             }
@@ -91,10 +94,11 @@ class AndroidEditorOriginalAudioPreviewRuntime(
             }
 
             val mp = MediaPlayer()
+            Log.i(TAG, "$LOG_PREFIX prepare_start file=${file.name} initialSourcePtsUs=$initialSourcePtsUs")
             try {
                 mp.setOnErrorListener { _, what, extra ->
-                    Log.w(TAG, "prepare: MediaPlayer error what=$what extra=$extra for $sourcePath")
-                    disableLocked(mp)
+                    Log.w(TAG, "$LOG_PREFIX prepare_error_listener what=$what extra=$extra")
+                    disableLocked(mp, "prepare_error_listener")
                     finish()
                     true
                 }
@@ -108,8 +112,13 @@ class AndroidEditorOriginalAudioPreviewRuntime(
                     enabled = true
                     val targetMs = (initialSourcePtsUs / 1000L)
                         .coerceIn(0L, mp.duration.toLong().coerceAtLeast(0L))
+                    Log.i(TAG, "$LOG_PREFIX prepared durationMs=${mp.duration} targetMs=$targetMs enabled=$enabled")
                     if (targetMs > 0L) {
-                        mp.setOnSeekCompleteListener { finish() }
+                        mp.setOnSeekCompleteListener {
+                            Log.i(TAG, "$LOG_PREFIX prepare_seek_complete targetMs=$targetMs")
+                            finish()
+                        }
+                        Log.i(TAG, "$LOG_PREFIX prepare_seek_start targetMs=$targetMs")
                         try {
                             mp.seekTo(targetMs.toInt())
                         } catch (t: Throwable) {
@@ -123,7 +132,7 @@ class AndroidEditorOriginalAudioPreviewRuntime(
                 mp.setDataSource(sourcePath)
                 mp.prepareAsync()
             } catch (t: Throwable) {
-                Log.w(TAG, "prepare: MediaPlayer setup failed for $sourcePath", t)
+                Log.w(TAG, "$LOG_PREFIX prepare_setup_error", t)
                 try { mp.release() } catch (_: Throwable) {}
                 finish()
             }
@@ -135,14 +144,24 @@ class AndroidEditorOriginalAudioPreviewRuntime(
     /** Requests audio focus (best-effort) and starts playback if enabled. No-op otherwise. */
     fun play() {
         audioHandler.post {
-            if (released.get() || !enabled) return@post
-            val mp = player ?: return@post
+            if (released.get() || !enabled) {
+                Log.i(TAG, "$LOG_PREFIX play_skip reason=${if (released.get()) "released" else "disabled"}")
+                return@post
+            }
+            val mp = player
+            if (mp == null) {
+                Log.i(TAG, "$LOG_PREFIX play_skip reason=no_player")
+                return@post
+            }
+            val hasFocusBefore = hasFocus
             requestFocusLocked()
+            Log.i(TAG, "$LOG_PREFIX play_start hasFocusBefore=$hasFocusBefore hasFocusAfter=$hasFocus")
             try {
                 mp.start()
+                Log.i(TAG, "$LOG_PREFIX play_started isPlaying=${mp.isPlaying} currentPositionMs=${mp.currentPosition}")
             } catch (t: Throwable) {
-                Log.w(TAG, "play: MediaPlayer.start failed", t)
-                disableLocked(mp)
+                Log.w(TAG, "$LOG_PREFIX play_start_error", t)
+                disableLocked(mp, "play_start_error")
             }
         }
     }
@@ -150,14 +169,23 @@ class AndroidEditorOriginalAudioPreviewRuntime(
     /** Pauses playback (if playing) and abandons audio focus. No-op if disabled/released. */
     fun pause() {
         audioHandler.post {
+            Log.i(TAG, "$LOG_PREFIX pause_start")
             abandonFocusLocked()
-            if (released.get() || !enabled) return@post
-            val mp = player ?: return@post
+            if (released.get() || !enabled) {
+                Log.i(TAG, "$LOG_PREFIX pause_done reason=${if (released.get()) "released" else "disabled"}")
+                return@post
+            }
+            val mp = player
+            if (mp == null) {
+                Log.i(TAG, "$LOG_PREFIX pause_done reason=no_player")
+                return@post
+            }
             try {
                 if (mp.isPlaying) mp.pause()
             } catch (t: Throwable) {
                 Log.w(TAG, "pause: MediaPlayer.pause failed", t)
             }
+            Log.i(TAG, "$LOG_PREFIX pause_done")
         }
     }
 
@@ -172,6 +200,12 @@ class AndroidEditorOriginalAudioPreviewRuntime(
         audioHandler.post {
             val mp = player
             if (released.get() || !enabled || mp == null) {
+                val reason = when {
+                    released.get() -> "released"
+                    !enabled -> "disabled"
+                    else -> "no_player"
+                }
+                Log.i(TAG, "$LOG_PREFIX seek_skip reason=$reason")
                 onDone()
                 return@post
             }
@@ -183,15 +217,18 @@ class AndroidEditorOriginalAudioPreviewRuntime(
 
             val targetMs = (sourcePtsUs / 1000L)
                 .coerceIn(0L, mp.duration.toLong().coerceAtLeast(0L))
+            Log.i(TAG, "$LOG_PREFIX seek_start targetMs=$targetMs resumeAfterSeek=$resumeAfterSeek")
             try {
                 mp.setOnSeekCompleteListener {
+                    Log.i(TAG, "$LOG_PREFIX seek_complete targetMs=$targetMs")
                     if (resumeAfterSeek) {
                         requestFocusLocked()
                         try {
                             mp.start()
+                            Log.i(TAG, "$LOG_PREFIX seek_resume_started")
                         } catch (t: Throwable) {
-                            Log.w(TAG, "seek: MediaPlayer.start after seek failed", t)
-                            disableLocked(mp)
+                            Log.w(TAG, "$LOG_PREFIX seek_resume_error", t)
+                            disableLocked(mp, "seek_resume_error")
                         }
                     }
                     finish()
@@ -199,7 +236,7 @@ class AndroidEditorOriginalAudioPreviewRuntime(
                 mp.seekTo(targetMs.toInt())
             } catch (t: Throwable) {
                 Log.w(TAG, "seek: MediaPlayer.seekTo failed", t)
-                disableLocked(mp)
+                disableLocked(mp, "seek_error")
                 finish()
             }
         }
@@ -218,8 +255,10 @@ class AndroidEditorOriginalAudioPreviewRuntime(
             return
         }
         audioHandler.post {
+            Log.i(TAG, "$LOG_PREFIX release_start")
             abandonFocusLocked()
             teardownPlayerLocked()
+            Log.i(TAG, "$LOG_PREFIX release_done")
             onDone?.invoke()
             try { audioThread.quitSafely() } catch (_: Throwable) {}
         }
@@ -227,7 +266,8 @@ class AndroidEditorOriginalAudioPreviewRuntime(
 
     // ── internal helpers (confined to audioHandler) ─────────────────────────
 
-    private fun disableLocked(mp: MediaPlayer) {
+    private fun disableLocked(mp: MediaPlayer, reason: String = "unknown") {
+        Log.w(TAG, "$LOG_PREFIX disable reason=$reason")
         enabled = false
         abandonFocusLocked()
         if (player === mp) {
@@ -248,13 +288,23 @@ class AndroidEditorOriginalAudioPreviewRuntime(
     }
 
     private fun requestFocusLocked() {
-        if (hasFocus) return
-        val ctx = context ?: return
+        if (hasFocus) {
+            Log.i(TAG, "$LOG_PREFIX focus_result skipped reason=already_has_focus")
+            return
+        }
+        val ctx = context
+        if (ctx == null) {
+            Log.i(TAG, "$LOG_PREFIX focus_result skipped reason=no_context")
+            return
+        }
         try {
             val am = audioManager ?: (ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager)?.also {
                 audioManager = it
             }
-            if (am == null) return
+            if (am == null) {
+                Log.i(TAG, "$LOG_PREFIX focus_result skipped reason=no_audio_manager")
+                return
+            }
             val attrs = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
@@ -264,8 +314,9 @@ class AndroidEditorOriginalAudioPreviewRuntime(
                 .build()
             focusRequest = request
             hasFocus = am.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            Log.i(TAG, "$LOG_PREFIX focus_result ${if (hasFocus) "granted" else "not_granted"}")
         } catch (t: Throwable) {
-            Log.w(TAG, "requestFocusLocked: failed", t)
+            Log.w(TAG, "$LOG_PREFIX focus_result error", t)
             hasFocus = false
         }
     }
