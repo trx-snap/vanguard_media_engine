@@ -138,14 +138,19 @@ void main() {
           'exportRoiSidecarPath': '/data/user/0/cache/output.roi.json',
           'roiSidecarPath': '/data/user/0/cache/output.roi.json',
           'proofBoundary':
-              'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+              'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass',
           'nonClaims': <Object?, Object?>{
             'mediaCodecAllocated': false,
             'productionExportTimelineBypass': false,
-            'cppPassthroughRemuxSinkNode': false,
+            'cppPassthroughRemuxSinkNodeOwnsMuxing': false,
             'connectAppTouched': false,
           },
           'diagnosticHoldBeforeRemuxMs': 250,
+          'cppPassthroughRemuxSinkNodeValidated': true,
+          'nativePassthroughSinkValidationRaw':
+              'status=PASS;directPath=true;sinkActive=true',
+          'nativePassthroughSinkDestroyRaw': 'status=PASS',
+          'nativePassthroughSinkDurationUsCoerced': 3500000,
           'customTelemetry': 'telemetry_val_123',
         };
 
@@ -175,13 +180,29 @@ void main() {
         expect(
           report.proofBoundary,
           equals(
-            'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+            'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass',
           ),
         );
         expect(report.proofBoundaryMatches, isTrue);
         expect(report.outputWritten, isTrue);
         expect(report.diagnosticNonClaimsHold, isTrue);
         expect(report.diagnosticHoldBeforeRemuxMs, equals(250));
+        expect(report.cppPassthroughRemuxSinkNodeValidated, isTrue);
+        expect(
+          report.nativePassthroughSinkValidationRaw,
+          contains('status=PASS'),
+        );
+        expect(
+          report.nativePassthroughSinkValidationRaw,
+          contains('directPath=true'),
+        );
+        expect(
+          report.nativePassthroughSinkValidationRaw,
+          contains('sinkActive=true'),
+        );
+        expect(report.nativePassthroughSinkDestroyRaw, contains('status=PASS'));
+        expect(report.nativePassthroughSinkDurationUsCoerced, isNotNull);
+        expect(report.nativePassthroughSinkDurationUsCoerced!, greaterThan(0));
         expect(report.errorCode, isNull);
         expect(report.errorMessage, isNull);
         expect(
@@ -216,11 +237,24 @@ void main() {
         expect(
           roundTrip['proofBoundary'],
           equals(
-            'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+            'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass',
           ),
         );
         expect(roundTrip['diagnosticHoldBeforeRemuxMs'], equals(250));
         expect(roundTrip['nonClaims'], isA<Map<String, bool>>());
+        expect(roundTrip['cppPassthroughRemuxSinkNodeValidated'], isTrue);
+        expect(
+          roundTrip['nativePassthroughSinkValidationRaw'],
+          equals('status=PASS;directPath=true;sinkActive=true'),
+        );
+        expect(
+          roundTrip['nativePassthroughSinkDestroyRaw'],
+          equals('status=PASS'),
+        );
+        expect(
+          roundTrip['nativePassthroughSinkDurationUsCoerced'],
+          equals(3500000),
+        );
         expect(report.toString(), contains('success: true'));
       },
     );
@@ -235,11 +269,11 @@ void main() {
           'exportRoiSidecarPath': sidecar,
           'roiSidecarPath': sidecar,
           'proofBoundary':
-              'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+              'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass',
           'nonClaims': <Object?, Object?>{
             'mediaCodecAllocated': false,
             'productionExportTimelineBypass': false,
-            'cppPassthroughRemuxSinkNode': false,
+            'cppPassthroughRemuxSinkNodeOwnsMuxing': false,
             'connectAppTouched': false,
           },
         };
@@ -263,11 +297,11 @@ void main() {
           'outputPath': '/data/user/0/cache/video.mp4',
           'roiSidecarPath': sidecar,
           'proofBoundary':
-              'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+              'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass',
           'nonClaims': <Object?, Object?>{
             'mediaCodecAllocated': false,
             'productionExportTimelineBypass': false,
-            'cppPassthroughRemuxSinkNode': false,
+            'cppPassthroughRemuxSinkNodeOwnsMuxing': false,
             'connectAppTouched': false,
           },
         };
@@ -289,11 +323,11 @@ void main() {
           'success': true,
           'outputSizeBytes': 0,
           'proofBoundary':
-              'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+              'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass',
           'nonClaims': <Object?, Object?>{
             'mediaCodecAllocated': false,
             'productionExportTimelineBypass': false,
-            'cppPassthroughRemuxSinkNode': false,
+            'cppPassthroughRemuxSinkNodeOwnsMuxing': false,
             'connectAppTouched': false,
           },
         });
@@ -303,11 +337,11 @@ void main() {
           'success': false,
           'outputSizeBytes': 1024,
           'proofBoundary':
-              'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+              'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass',
           'nonClaims': <Object?, Object?>{
             'mediaCodecAllocated': false,
             'productionExportTimelineBypass': false,
-            'cppPassthroughRemuxSinkNode': false,
+            'cppPassthroughRemuxSinkNodeOwnsMuxing': false,
             'connectAppTouched': false,
           },
         });
@@ -321,11 +355,11 @@ void main() {
         final missingKeyReport = VGPassthroughRemuxExecutionReport.fromMap({
           'success': true,
           'proofBoundary':
-              'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+              'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass',
           'nonClaims': <Object?, Object?>{
             'mediaCodecAllocated': false,
             'productionExportTimelineBypass': false,
-            'cppPassthroughRemuxSinkNode': false,
+            'cppPassthroughRemuxSinkNodeOwnsMuxing': false,
             // connectAppTouched missing!
           },
         });
@@ -334,11 +368,11 @@ void main() {
         final trueClaimReport = VGPassthroughRemuxExecutionReport.fromMap({
           'success': true,
           'proofBoundary':
-              'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+              'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass',
           'nonClaims': <Object?, Object?>{
             'mediaCodecAllocated': true, // Violated non-claim!
             'productionExportTimelineBypass': false,
-            'cppPassthroughRemuxSinkNode': false,
+            'cppPassthroughRemuxSinkNodeOwnsMuxing': false,
             'connectAppTouched': false,
           },
         });
@@ -350,11 +384,11 @@ void main() {
       final extraClaimReport = VGPassthroughRemuxExecutionReport.fromMap({
         'success': true,
         'proofBoundary':
-            'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+            'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass',
         'nonClaims': <Object?, Object?>{
           'mediaCodecAllocated': false,
           'productionExportTimelineBypass': false,
-          'cppPassthroughRemuxSinkNode': false,
+          'cppPassthroughRemuxSinkNodeOwnsMuxing': false,
           'connectAppTouched': false,
           'mediaMuxerStarted':
               false, // Extra advisory key not in standardNonClaims!
@@ -396,6 +430,7 @@ void main() {
       expect(report.errorMessage, equals('Cannot open source'));
       expect(report.proofBoundary, equals('client_failure'));
       expect(report.proofBoundaryMatches, isFalse);
+      expect(report.cppPassthroughRemuxSinkNodeValidated, isFalse);
       expect(report.diagnosticNonClaimsHold, isTrue);
       expect(report.diagnostics['code'], equals(404));
       expect(report.diagnostics['sourcePath'], equals('/missing/file.mov'));
@@ -405,6 +440,7 @@ void main() {
       );
       expect(defaultReport.errorCode, equals('generic_failure'));
       expect(defaultReport.errorMessage, isNull);
+      expect(defaultReport.cppPassthroughRemuxSinkNodeValidated, isFalse);
       expect(defaultReport.diagnostics['errorCode'], equals('generic_failure'));
     });
 
@@ -420,6 +456,7 @@ void main() {
       );
       expect(report.proofBoundary, equals('unsupported'));
       expect(report.proofBoundaryMatches, isFalse);
+      expect(report.cppPassthroughRemuxSinkNodeValidated, isFalse);
       expect(report.diagnosticNonClaimsHold, isTrue);
       expect(report.diagnostics['errorCode'], equals('unsupported_platform'));
     });
@@ -471,11 +508,11 @@ void main() {
               'exportRoiSidecarPath': '/storage/output.roi.json',
               'roiSidecarPath': '/storage/output.roi.json',
               'proofBoundary':
-                  'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+                  'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass',
               'nonClaims': <Object?, Object?>{
                 'mediaCodecAllocated': false,
                 'productionExportTimelineBypass': false,
-                'cppPassthroughRemuxSinkNode': false,
+                'cppPassthroughRemuxSinkNodeOwnsMuxing': false,
                 'connectAppTouched': false,
               },
               'diagnosticHoldBeforeRemuxMs':
@@ -533,11 +570,11 @@ void main() {
               'exportRoiSidecarPath': expectedSidecar,
               'roiSidecarPath': expectedSidecar,
               'proofBoundary':
-                  'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+                  'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass',
               'nonClaims': <Object?, Object?>{
                 'mediaCodecAllocated': false,
                 'productionExportTimelineBypass': false,
-                'cppPassthroughRemuxSinkNode': false,
+                'cppPassthroughRemuxSinkNodeOwnsMuxing': false,
                 'connectAppTouched': false,
               },
             };
@@ -689,11 +726,11 @@ void main() {
               'sourcePath': call.arguments['sourcePath'],
               'outputSizeBytes': 512,
               'proofBoundary':
-                  'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass',
+                  'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass',
               'nonClaims': <Object?, Object?>{
                 'mediaCodecAllocated': false,
                 'productionExportTimelineBypass': false,
-                'cppPassthroughRemuxSinkNode': false,
+                'cppPassthroughRemuxSinkNodeOwnsMuxing': false,
                 'connectAppTouched': false,
               },
             };

@@ -90,13 +90,13 @@ class VGPassthroughRemuxRequest {
 class VGPassthroughRemuxExecutionReport {
   /// Expected native proof boundary token.
   static const String expectedProofBoundary =
-      'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass';
+      'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass';
 
   /// The four Unit AD execution non-claims that must all hold false.
   static const List<String> standardNonClaims = <String>[
     'mediaCodecAllocated',
     'productionExportTimelineBypass',
-    'cppPassthroughRemuxSinkNode',
+    'cppPassthroughRemuxSinkNodeOwnsMuxing',
     'connectAppTouched',
   ];
 
@@ -153,6 +153,24 @@ class VGPassthroughRemuxExecutionReport {
   /// Diagnostic hold (milliseconds) applied before the remux started.
   final int? diagnosticHoldBeforeRemuxMs;
 
+  /// Whether the native C++ PassthroughRemuxSinkNode DAG topology session
+  /// was created, validated (direct-path, sink active), and destroyed
+  /// before the remux started. Does not imply the native sink node owns
+  /// muxing or media file IO -- see [nonClaims].
+  final bool? cppPassthroughRemuxSinkNodeValidated;
+
+  /// Raw `status=...` response string from the native
+  /// `validateAndroidDagPhase2PassthroughRemuxSinkSession` call.
+  final String? nativePassthroughSinkValidationRaw;
+
+  /// Raw `status=...` response string from the native
+  /// `destroyAndroidDagPhase2PassthroughRemuxSinkSession` call.
+  final String? nativePassthroughSinkDestroyRaw;
+
+  /// The `durationUs` value passed to the native session create call,
+  /// coerced to be at least `1` (native rejects `durationUs <= 0`).
+  final int? nativePassthroughSinkDurationUsCoerced;
+
   /// Native error code for fail-closed outcomes (e.g. `INVALID_ARG`,
   /// `FILE_UNREADABLE`, `UNSUPPORTED_SOURCE`, `OUTPUT_EXISTS`,
   /// `OUTPUT_UNWRITABLE`, `EXPORT_CANCELLED`, `EXPORT_FAILED`,
@@ -183,6 +201,10 @@ class VGPassthroughRemuxExecutionReport {
     required this.proofBoundary,
     required this.nonClaims,
     this.diagnosticHoldBeforeRemuxMs,
+    this.cppPassthroughRemuxSinkNodeValidated,
+    this.nativePassthroughSinkValidationRaw,
+    this.nativePassthroughSinkDestroyRaw,
+    this.nativePassthroughSinkDurationUsCoerced,
     this.errorCode,
     this.errorMessage,
     required this.diagnostics,
@@ -226,6 +248,18 @@ class VGPassthroughRemuxExecutionReport {
       diagnosticHoldBeforeRemuxMs: _asInt(
         stringMap['diagnosticHoldBeforeRemuxMs'],
       ),
+      cppPassthroughRemuxSinkNodeValidated: _asNullableBool(
+        stringMap['cppPassthroughRemuxSinkNodeValidated'],
+      ),
+      nativePassthroughSinkValidationRaw: _asNullableString(
+        stringMap['nativePassthroughSinkValidationRaw'],
+      ),
+      nativePassthroughSinkDestroyRaw: _asNullableString(
+        stringMap['nativePassthroughSinkDestroyRaw'],
+      ),
+      nativePassthroughSinkDurationUsCoerced: _asInt(
+        stringMap['nativePassthroughSinkDurationUsCoerced'],
+      ),
       errorCode: _asNullableString(stringMap['errorCode']),
       errorMessage: _asNullableString(stringMap['errorMessage']),
       diagnostics: Map<String, Object?>.unmodifiable(stringMap),
@@ -248,9 +282,10 @@ class VGPassthroughRemuxExecutionReport {
       nonClaims: const <String, bool>{
         'mediaCodecAllocated': false,
         'productionExportTimelineBypass': false,
-        'cppPassthroughRemuxSinkNode': false,
+        'cppPassthroughRemuxSinkNodeOwnsMuxing': false,
         'connectAppTouched': false,
       },
+      cppPassthroughRemuxSinkNodeValidated: false,
       errorCode: errorCode,
       errorMessage: errorMessage,
       diagnostics: Map<String, Object?>.unmodifiable(diag),
@@ -266,9 +301,10 @@ class VGPassthroughRemuxExecutionReport {
         nonClaims: <String, bool>{
           'mediaCodecAllocated': false,
           'productionExportTimelineBypass': false,
-          'cppPassthroughRemuxSinkNode': false,
+          'cppPassthroughRemuxSinkNodeOwnsMuxing': false,
           'connectAppTouched': false,
         },
+        cppPassthroughRemuxSinkNodeValidated: false,
         errorCode: 'unsupported_platform',
         errorMessage: 'vanguard_media_engine plugin is not available',
         diagnostics: <String, Object?>{
@@ -320,6 +356,16 @@ class VGPassthroughRemuxExecutionReport {
     'nonClaims': nonClaims,
     if (diagnosticHoldBeforeRemuxMs != null)
       'diagnosticHoldBeforeRemuxMs': diagnosticHoldBeforeRemuxMs,
+    if (cppPassthroughRemuxSinkNodeValidated != null)
+      'cppPassthroughRemuxSinkNodeValidated':
+          cppPassthroughRemuxSinkNodeValidated,
+    if (nativePassthroughSinkValidationRaw != null)
+      'nativePassthroughSinkValidationRaw': nativePassthroughSinkValidationRaw,
+    if (nativePassthroughSinkDestroyRaw != null)
+      'nativePassthroughSinkDestroyRaw': nativePassthroughSinkDestroyRaw,
+    if (nativePassthroughSinkDurationUsCoerced != null)
+      'nativePassthroughSinkDurationUsCoerced':
+          nativePassthroughSinkDurationUsCoerced,
     if (errorCode != null) 'errorCode': errorCode,
     if (errorMessage != null) 'errorMessage': errorMessage,
     'diagnostics': diagnostics,

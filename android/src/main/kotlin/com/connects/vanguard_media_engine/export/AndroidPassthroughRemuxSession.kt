@@ -4,6 +4,9 @@ import android.content.Context
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.util.Log
+import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
+import com.connects.vanguard_media_engine.diagnostics.VanguardDiagnostics
+import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import java.io.File
 
 // -- AndroidPassthroughRemuxSession (Phase 2-Unit AD) --------------------------
@@ -14,12 +17,13 @@ import java.io.File
 // AndroidEditorExportCoordinator export lock with `exportTimeline`.
 //
 // Execution boundary (what this Unit DOES do, unlike Unit Z's metadata-only
-// capability probe): calls AndroidAudioRemuxer.remux(), which starts a real
-// MediaMuxer and reads/writes real samples via MediaExtractor. What it still
-// does NOT do: allocate a MediaCodec, bypass or touch the production
-// `exportTimeline` pipeline, touch the native C++ passthrough remux sink
-// node, or touch ConnectsApp -- see [NON_CLAIMS] / `proofBoundary` in the
-// success payload.
+// capability probe): validates native C++ PassthroughRemuxSinkNode DAG
+// topology/timeline eligibility (create/validate/destroy, no media file IO),
+// then calls AndroidAudioRemuxer.remux(), which starts a real MediaMuxer and
+// reads/writes real samples via MediaExtractor. What it still does NOT do:
+// allocate a MediaCodec, bypass or touch the production `exportTimeline`
+// pipeline, let the native C++ sink node own muxing/media IO, or touch
+// ConnectsApp -- see [NON_CLAIMS] / `proofBoundary` in the success payload.
 //
 // Cancellation: [requestCancel] is honored before the remux call starts and
 // after it returns (temp is deleted, EXPORT_CANCELLED). AndroidAudioRemuxer's
@@ -166,6 +170,79 @@ class AndroidPassthroughRemuxSession(private val context: Context) {
             return
         }
 
+        // -- 5.5. Native C++ PassthroughRemuxSinkNode topology validation ---
+        // Additive-only: creates a native DAG session, validates direct-path
+        // topology/timeline eligibility, and destroys the session -- all
+        // before any MediaExtractor/MediaMuxer IO starts. Native never
+        // touches media file IO; AndroidAudioRemuxer remains the sole owner
+        // of muxing. Exactly one create/validate/destroy cycle; destroy runs
+        // in `finally` with no early return between create and destroy.
+        var nativeSessionId: String? = null
+        var nativeCreateRaw = "status=FAIL;reason=not_run"
+        var nativeValidateRaw = "status=FAIL;reason=not_run"
+        var nativeDestroyRaw = "status=FAIL;reason=not_run"
+        val nativeDurationUsCoerced = probe.durationUs.coerceAtLeast(1L)
+        var nativeValidationPassed = false
+
+        try {
+            val nativeDiagnostics = VanguardDiagnostics()
+            val nativeBridge = VanguardNativeBridge(
+                lifecycleObserver = VanguardLifecycleObserver(nativeDiagnostics),
+                diagnostics = nativeDiagnostics,
+                codecAdapter = null,
+            )
+            try {
+                nativeCreateRaw = nativeBridge.createAndroidDagPhase2PassthroughRemuxSinkSession(
+                    sourceNodeId = "source_node",
+                    sinkNodeId = "passthrough_sink",
+                    startPtsUs = 0L,
+                    durationUs = nativeDurationUsCoerced,
+                    requiresAudio = probe.hasAudioTrack,
+                )
+                nativeSessionId = extractNativeSessionId(nativeCreateRaw)
+                nativeValidateRaw = if (nativeSessionId != null && nativeCreateRaw.startsWith("status=PASS")) {
+                    nativeBridge.validateAndroidDagPhase2PassthroughRemuxSinkSession(
+                        sessionId = nativeSessionId,
+                        timelinePtsUs = 0L,
+                        connectVideo = true,
+                        connectAudio = probe.hasAudioTrack,
+                        processingNodeCount = 0,
+                    )
+                } else {
+                    "status=FAIL;reason=session_create_failed"
+                }
+                nativeValidationPassed = nativeValidateRaw.startsWith("status=PASS") &&
+                    nativeValidateRaw.contains("directPath=true") &&
+                    nativeValidateRaw.contains("sinkActive=true")
+            } finally {
+                val sessionToDestroy = nativeSessionId
+                if (sessionToDestroy != null) {
+                    nativeDestroyRaw = nativeBridge.destroyAndroidDagPhase2PassthroughRemuxSinkSession(sessionToDestroy)
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "native passthrough sink validation failed: $t", t)
+            nativeValidateRaw = "status=FAIL;reason=exception:${t.javaClass.simpleName}:${t.message}"
+            nativeValidationPassed = false
+        }
+
+        val nativeDestroyPassed = nativeDestroyRaw.startsWith("status=PASS")
+        if (!nativeValidationPassed || !nativeDestroyPassed) {
+            deleteOwnedTemps()
+            onError(
+                "EXPORT_FAILED",
+                "exportPassthroughRemux: native passthrough sink validation failed: " +
+                    "create=$nativeCreateRaw validate=$nativeValidateRaw destroy=$nativeDestroyRaw",
+            )
+            return
+        }
+
+        if (cancelRequested) {
+            deleteOwnedTemps()
+            onError("EXPORT_CANCELLED", "exportPassthroughRemux: cancelled before remux started")
+            return
+        }
+
         // -- 6. Remux (execution boundary: real MediaMuxer + real samples) --
         val remux = AndroidAudioRemuxer.remux(
             videoPath = sourcePath,
@@ -246,8 +323,24 @@ class AndroidPassthroughRemuxSession(private val context: Context) {
                 "proofBoundary" to PROOF_BOUNDARY,
                 "nonClaims" to NON_CLAIMS,
                 "diagnosticHoldBeforeRemuxMs" to diagnosticHoldBeforeRemuxMs,
+                "cppPassthroughRemuxSinkNodeValidated" to true,
+                "nativePassthroughSinkValidationRaw" to nativeValidateRaw,
+                "nativePassthroughSinkDestroyRaw" to nativeDestroyRaw,
+                "nativePassthroughSinkDurationUsCoerced" to nativeDurationUsCoerced,
             ),
         )
+    }
+
+    /// Extracts `sessionId=...` from a native `status=PASS;sessionId=...;...`
+    /// response string. Returns null if absent or malformed.
+    private fun extractNativeSessionId(raw: String): String? {
+        for (part in raw.split(";")) {
+            val kv = part.split("=")
+            if (kv.size == 2 && kv[0] == "sessionId") {
+                return kv[1]
+            }
+        }
+        return null
     }
 
     /// Metadata-only probe: track formats only, never readSampleData(). Returns
@@ -303,12 +396,12 @@ class AndroidPassthroughRemuxSession(private val context: Context) {
         private const val MAX_DIAGNOSTIC_HOLD_MS = 5000L
         private const val DIAGNOSTIC_HOLD_STEP_MS = 50L
         private const val PROOF_BOUNDARY =
-            "native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass"
+            "native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass"
 
         private val NON_CLAIMS = mapOf(
             "mediaCodecAllocated" to false,
             "productionExportTimelineBypass" to false,
-            "cppPassthroughRemuxSinkNode" to false,
+            "cppPassthroughRemuxSinkNodeOwnsMuxing" to false,
             "connectAppTouched" to false,
         )
     }

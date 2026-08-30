@@ -27,7 +27,7 @@ class _AndroidPassthroughRemuxSessionPhysicalSmokeAppState
     extends State<AndroidPassthroughRemuxSessionPhysicalSmokeApp> {
   static const MethodChannel _channel = MethodChannel('vanguard_media_engine');
   static const String _expectedProofBoundary =
-      'native_passthrough_remux_execution_session_no_codec_no_exporttimeline_bypass';
+      'native_passthrough_remux_execution_session_cpp_sink_validated_no_codec_no_exporttimeline_bypass';
 
   String _status =
       'Initializing Android Passthrough Remux Session Physical Smoke (Unit AD)...';
@@ -148,8 +148,25 @@ class _AndroidPassthroughRemuxSessionPhysicalSmokeAppState
         final nonClaimsMatch =
             nonClaims['mediaCodecAllocated'] == false &&
             nonClaims['productionExportTimelineBypass'] == false &&
-            nonClaims['cppPassthroughRemuxSinkNode'] == false &&
+            nonClaims['cppPassthroughRemuxSinkNodeOwnsMuxing'] == false &&
             nonClaims['connectAppTouched'] == false;
+
+        final cppSinkValidated =
+            lane1Map['cppPassthroughRemuxSinkNodeValidated'] == true;
+        final validationRaw =
+            lane1Map['nativePassthroughSinkValidationRaw'] as String? ?? '';
+        final validationRawMatch =
+            validationRaw.contains('status=PASS') &&
+            validationRaw.contains('directPath=true') &&
+            validationRaw.contains('sinkActive=true');
+        final destroyRaw =
+            lane1Map['nativePassthroughSinkDestroyRaw'] as String? ?? '';
+        final destroyRawMatch = destroyRaw.contains('status=PASS');
+        final durationUsCoerced =
+            (lane1Map['nativePassthroughSinkDurationUsCoerced'] as num?)
+                ?.toInt() ??
+            0;
+        final durationUsCoercedMatch = durationUsCoerced > 0;
 
         lane1Pass =
             successFlag &&
@@ -163,6 +180,10 @@ class _AndroidPassthroughRemuxSessionPhysicalSmokeAppState
             durationSeconds > 0 &&
             hasAudioTrack &&
             proofBoundaryMatch &&
+            cppSinkValidated &&
+            validationRawMatch &&
+            destroyRawMatch &&
+            durationUsCoercedMatch &&
             nonClaimsMatch;
 
         lane1Map['computed_pass'] = lane1Pass;
@@ -407,10 +428,37 @@ class _AndroidPassthroughRemuxSessionPhysicalSmokeAppState
         final nonClaimsValid =
             lane1NonClaims['mediaCodecAllocated'] == false &&
             lane1NonClaims['productionExportTimelineBypass'] == false &&
-            lane1NonClaims['cppPassthroughRemuxSinkNode'] == false &&
+            lane1NonClaims['cppPassthroughRemuxSinkNodeOwnsMuxing'] == false &&
             lane1NonClaims['connectAppTouched'] == false;
 
-        lane6Pass = lane1Pass && boundaryValid && nonClaimsValid;
+        final cppSinkValidated =
+            lane1Map['cppPassthroughRemuxSinkNodeValidated'] == true;
+        final validationRaw =
+            lane1Map['nativePassthroughSinkValidationRaw'] as String? ?? '';
+        final validationRawValid =
+            validationRaw.contains('status=PASS') &&
+            validationRaw.contains('directPath=true') &&
+            validationRaw.contains('sinkActive=true');
+        final destroyRaw =
+            lane1Map['nativePassthroughSinkDestroyRaw'] as String? ?? '';
+        final destroyRawValid = destroyRaw.contains('status=PASS');
+        final durationUsCoerced =
+            (lane1Map['nativePassthroughSinkDurationUsCoerced'] as num?)
+                ?.toInt() ??
+            0;
+        final durationUsCoercedValid = durationUsCoerced > 0;
+
+        final positiveValidationValid =
+            cppSinkValidated &&
+            validationRawValid &&
+            destroyRawValid &&
+            durationUsCoercedValid;
+
+        lane6Pass =
+            lane1Pass &&
+            boundaryValid &&
+            nonClaimsValid &&
+            positiveValidationValid;
 
         lane6Map = <String, dynamic>{
           'pass': lane6Pass,
@@ -418,9 +466,14 @@ class _AndroidPassthroughRemuxSessionPhysicalSmokeAppState
           'proofBoundaryValid': boundaryValid,
           'nonClaims': lane1NonClaims,
           'nonClaimsValid': nonClaimsValid,
+          'cppPassthroughRemuxSinkNodeValidated': cppSinkValidated,
+          'nativePassthroughSinkValidationRaw': validationRaw,
+          'nativePassthroughSinkDestroyRaw': destroyRaw,
+          'nativePassthroughSinkDurationUsCoerced': durationUsCoerced,
+          'positiveValidationValid': positiveValidationValid,
         };
         print(
-          'ANDROID_PASSTHROUGH_REMUX_SESSION_UNIT_AD_LANE6: DONE (pass=$lane6Pass, boundaryValid=$boundaryValid, nonClaimsValid=$nonClaimsValid)',
+          'ANDROID_PASSTHROUGH_REMUX_SESSION_UNIT_AD_LANE6: DONE (pass=$lane6Pass, boundaryValid=$boundaryValid, nonClaimsValid=$nonClaimsValid, positiveValidationValid=$positiveValidationValid)',
         );
       } catch (e, st) {
         print(
