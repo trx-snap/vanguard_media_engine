@@ -116,6 +116,7 @@
 #include "gles_hardware_buffer_imports.h"
 #include "gles_texture_frame_renderer.h"
 #include "gles_two_texture_compositor.h"
+#include "gles_multicam_spatial_compositor.h"
 
 #if defined(__ANDROID__)
 #include <EGL/egl.h>
@@ -178,6 +179,14 @@ struct GlesBackend::Impl {
     // on non-Android host builds.
     std::unique_ptr<GlesTwoTextureCompositor> twoTextureCompositor =
         std::make_unique<GlesTwoTextureCompositor>();
+
+    // P3-MULTICAM-NODE: two-rectangle spatial layout draw helper for
+    // diagnosticRenderMultiCamSpatialCompositeForReadback()/
+    // diagnosticPresentMultiCamSpatialComposite(). Owned regardless of
+    // platform; preserves safe unavailable-stub behavior on non-Android
+    // host builds.
+    std::unique_ptr<GlesMultiCamSpatialCompositor> multiCamSpatialCompositor =
+        std::make_unique<GlesMultiCamSpatialCompositor>();
 };
 
 // ---------------------------------------------------------------------------
@@ -1289,6 +1298,171 @@ bool GlesBackend::presentDiagnosticExternalOesTexture(uint32_t textureId,
 #else
     (void)transform;
     impl_->lastError = "diagnostic_present_external_oes_texture_unavailable_on_host";
+    return false;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// P3-MULTICAM-NODE: GLES-first spatial multi-texture diagnostic render pass.
+// Both seams resolve handleA/handleB to their imported textures/targets via
+// the same ahbImports lookup as renderFrame(), then delegate to the private
+// GlesMultiCamSpatialCompositor helper, which fails closed
+// ("gles_multicam_spatial_compositor_unsupported_texture_target",
+// "gles_multicam_spatial_compositor_invalid_rect") on any unsupported
+// target or non-positive rectangle -- no camera, no Vulkan, no
+// recording/export, no product UI. Before the compositor draw, this backend
+// clears the attached window surface to an opaque green sentinel
+// (0, 1, 0, 1), so a physical harness's readback assertions can prove the
+// two draws actually painted every sampled point (sentinelClearOk: no
+// sampled point should ever read back as green).
+// ---------------------------------------------------------------------------
+
+namespace {
+GlesSpatialViewportRectPx ToSpatialRectPx(const GlesViewportRectPx& rect) {
+    GlesSpatialViewportRectPx out{};
+    out.x = rect.x;
+    out.yBottom = rect.yBottom;
+    out.width = rect.width;
+    out.height = rect.height;
+    return out;
+}
+} // namespace
+
+bool GlesBackend::diagnosticRenderMultiCamSpatialCompositeForReadback(
+    HardwareBufferHandle handleA,
+    HardwareBufferHandle handleB,
+    const GlesViewportRectPx& primaryRect,
+    const GlesViewportRectPx& secondaryRect,
+    const VideoFrameTransform& transformA,
+    const VideoFrameTransform& transformB) {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return false;
+    }
+
+#if defined(__ANDROID__)
+    if (!hasSurface()) {
+        impl_->lastError = "no_surface_attached";
+        return false;
+    }
+
+    const uint32_t textureA = impl_->ahbImports->textureForHandle(handleA);
+    const uint32_t textureTargetA = impl_->ahbImports->textureTargetForHandle(handleA);
+    const uint32_t textureB = impl_->ahbImports->textureForHandle(handleB);
+    const uint32_t textureTargetB = impl_->ahbImports->textureTargetForHandle(handleB);
+    if (textureA == 0 || textureTargetA == 0 || textureB == 0 || textureTargetB == 0) {
+        impl_->lastError = "invalid_buffer_handle";
+        return false;
+    }
+
+    if (eglMakeCurrent(impl_->display, impl_->windowSurface, impl_->windowSurface, impl_->context) != EGL_TRUE) {
+        impl_->lastError = "diagnostic_multicam_spatial_readback_make_current_failed";
+        return false;
+    }
+
+    glViewport(0, 0, static_cast<GLsizei>(impl_->surfaceWidth), static_cast<GLsizei>(impl_->surfaceHeight));
+    glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (glGetError() != GL_NO_ERROR) {
+        impl_->lastError = "diagnostic_multicam_spatial_readback_sentinel_clear_failed";
+        return false;
+    }
+
+    std::string drawError;
+    const bool drawOk = impl_->multiCamSpatialCompositor->drawSpatialComposite(
+        textureA, textureTargetA, textureB, textureTargetB,
+        impl_->surfaceWidth, impl_->surfaceHeight,
+        ToSpatialRectPx(primaryRect), ToSpatialRectPx(secondaryRect),
+        transformA, transformB, &drawError);
+    if (!drawOk) {
+        impl_->lastError = !drawError.empty() ? drawError : "diagnostic_multicam_spatial_readback_draw_failed";
+        return false;
+    }
+
+    impl_->lastError.clear();
+    return true;
+#else
+    (void)handleA;
+    (void)handleB;
+    (void)primaryRect;
+    (void)secondaryRect;
+    (void)transformA;
+    (void)transformB;
+    impl_->lastError = "diagnostic_multicam_spatial_readback_unavailable_on_host";
+    return false;
+#endif
+}
+
+bool GlesBackend::diagnosticPresentMultiCamSpatialComposite(
+    HardwareBufferHandle handleA,
+    HardwareBufferHandle handleB,
+    const GlesViewportRectPx& primaryRect,
+    const GlesViewportRectPx& secondaryRect,
+    const VideoFrameTransform& transformA,
+    const VideoFrameTransform& transformB) {
+    impl_->lastError.clear();
+
+    if (!impl_->initialized) {
+        impl_->lastError = "backend_not_initialized";
+        return false;
+    }
+
+#if defined(__ANDROID__)
+    if (!hasSurface()) {
+        impl_->lastError = "no_surface_attached";
+        return false;
+    }
+
+    const uint32_t textureA = impl_->ahbImports->textureForHandle(handleA);
+    const uint32_t textureTargetA = impl_->ahbImports->textureTargetForHandle(handleA);
+    const uint32_t textureB = impl_->ahbImports->textureForHandle(handleB);
+    const uint32_t textureTargetB = impl_->ahbImports->textureTargetForHandle(handleB);
+    if (textureA == 0 || textureTargetA == 0 || textureB == 0 || textureTargetB == 0) {
+        impl_->lastError = "invalid_buffer_handle";
+        return false;
+    }
+
+    if (eglMakeCurrent(impl_->display, impl_->windowSurface, impl_->windowSurface, impl_->context) != EGL_TRUE) {
+        impl_->lastError = "diagnostic_multicam_spatial_present_make_current_failed";
+        return false;
+    }
+
+    glViewport(0, 0, static_cast<GLsizei>(impl_->surfaceWidth), static_cast<GLsizei>(impl_->surfaceHeight));
+    glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    if (glGetError() != GL_NO_ERROR) {
+        impl_->lastError = "diagnostic_multicam_spatial_present_sentinel_clear_failed";
+        return false;
+    }
+
+    std::string drawError;
+    const bool drawOk = impl_->multiCamSpatialCompositor->drawSpatialComposite(
+        textureA, textureTargetA, textureB, textureTargetB,
+        impl_->surfaceWidth, impl_->surfaceHeight,
+        ToSpatialRectPx(primaryRect), ToSpatialRectPx(secondaryRect),
+        transformA, transformB, &drawError);
+    if (!drawOk) {
+        impl_->lastError = !drawError.empty() ? drawError : "diagnostic_multicam_spatial_present_draw_failed";
+        return false;
+    }
+
+    if (eglSwapBuffers(impl_->display, impl_->windowSurface) != EGL_TRUE) {
+        impl_->lastError = "diagnostic_multicam_spatial_present_swap_failed";
+        return false;
+    }
+
+    impl_->lastError.clear();
+    return true;
+#else
+    (void)handleA;
+    (void)handleB;
+    (void)primaryRect;
+    (void)secondaryRect;
+    (void)transformA;
+    (void)transformB;
+    impl_->lastError = "diagnostic_multicam_spatial_present_unavailable_on_host";
     return false;
 #endif
 }

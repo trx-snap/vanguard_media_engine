@@ -548,6 +548,23 @@ class VanguardNativeBridge(
     // no file IO, no recording/export claim.
     external fun runAndroidDagPhase3MultiCamCompositorSmoke(): String
 
+    // ── P3-MULTICAM-NODE: GLES-first spatial multi-texture diagnostic render ──
+    // pass physical proof. Render-only: draws two already-imported textures
+    // into two independent glViewport-scoped pixel rectangles derived from
+    // vanguard::compositors::ComputeMultiCamLayout() (PiP/split layout math),
+    // via GlesBackend::diagnosticRenderMultiCamSpatialCompositeForReadback()/
+    // diagnosticPresentMultiCamSpatialComposite(). Native fills bufferA solid
+    // opaque red and bufferB solid opaque blue; the caller allocates both
+    // buffers uninitialized. No camera open, no Vulkan, no OES physical
+    // proof, no recording/export, no product UI.
+    external fun runAndroidDagPhase3MultiCamSpatialGlesRenderSmoke(
+        surface: Surface,
+        bufferA: HardwareBuffer,
+        bufferB: HardwareBuffer,
+        width: Int,
+        height: Int,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

@@ -1,9 +1,13 @@
 package com.connects.vanguard_media_engine.diagnostics
 
+import android.hardware.HardwareBuffer
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.Surface
+import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
+import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
 import java.util.concurrent.atomic.AtomicBoolean
@@ -46,6 +50,13 @@ class AndroidGlesTextureSmokeCoordinator(
         // foundation physical proof.
         private const val AW_OES_COMPLETE_METHOD = "onAndroidDagPhase1AWOESGlesDecodedOesSmokeComplete"
 
+        // P3-MULTICAM-NODE: GLES-first spatial multi-texture diagnostic
+        // render pass physical proof.
+        private const val SPATIAL_COMPLETE_METHOD = "onAndroidDagPhase3MultiCamSpatialGlesRenderSmokeComplete"
+        private const val SPATIAL_DEFAULT_DIMENSION = 128
+        private const val SPATIAL_PROOF_BOUNDARY =
+            "native_multicam_spatial_gles_two_texture_layout_render_readback_only_no_vulkan_no_camera_no_oes_proof_no_opacity_no_corner_radius_no_recording_no_product"
+
         private val OWNED_METHODS = setOf(
             "startAndroidDagPhase1AXGlesTextureRenderSmoke",
             "disposeAndroidDagPhase1AXGlesTextureRenderSmoke",
@@ -55,6 +66,8 @@ class AndroidGlesTextureSmokeCoordinator(
             "disposeAndroidDagPhase1BBGlesTextureCompositionDagSmoke",
             "startAndroidDagPhase1AWOESGlesDecodedOesSmoke",
             "disposeAndroidDagPhase1AWOESGlesDecodedOesSmoke",
+            "startAndroidDagPhase3MultiCamSpatialGlesRenderSmoke",
+            "disposeAndroidDagPhase3MultiCamSpatialGlesRenderSmoke",
         )
 
         fun ownsMethod(method: String): Boolean = method in OWNED_METHODS
@@ -111,6 +124,20 @@ class AndroidGlesTextureSmokeCoordinator(
 
     private val awOesActiveEntries = mutableMapOf<Long, AwOesActiveEntry>()
 
+    // P3-MULTICAM-NODE: kept separate from all entries above so AX/BA/BB/
+    // AW-OES/spatial texture IDs can never collide in state ownership, even
+    // though all are keyed by SurfaceProducer id. No harness object is
+    // owned here -- the native call is made directly on the worker thread,
+    // matching the "extend the coordinator, not plugin dispatch" contract.
+    private data class SpatialActiveEntry(
+        val surfaceProducer: TextureRegistry.SurfaceProducer,
+        val released: AtomicBoolean = AtomicBoolean(false),
+        val runCompleted: AtomicBoolean = AtomicBoolean(false),
+        val disposeRequested: AtomicBoolean = AtomicBoolean(false),
+    )
+
+    private val spatialActiveEntries = mutableMapOf<Long, SpatialActiveEntry>()
+
     fun handleMethodCall(method: String, args: Map<*, *>?, result: MethodChannel.Result): Boolean {
         when (method) {
             "startAndroidDagPhase1AXGlesTextureRenderSmoke" -> start(args, result)
@@ -121,6 +148,8 @@ class AndroidGlesTextureSmokeCoordinator(
             "disposeAndroidDagPhase1BBGlesTextureCompositionDagSmoke" -> disposeBb(args, result)
             "startAndroidDagPhase1AWOESGlesDecodedOesSmoke" -> startAwOes(args, result)
             "disposeAndroidDagPhase1AWOESGlesDecodedOesSmoke" -> disposeAwOes(args, result)
+            "startAndroidDagPhase3MultiCamSpatialGlesRenderSmoke" -> startSpatial(args, result)
+            "disposeAndroidDagPhase3MultiCamSpatialGlesRenderSmoke" -> disposeSpatial(args, result)
             else -> return false
         }
         return true
@@ -275,6 +304,21 @@ class AndroidGlesTextureSmokeCoordinator(
                 } else {
                     entry.disposeRequested.set(true)
                     entry.harness.cancel()
+                }
+            }
+        }
+
+        val spatialEntriesToDispose = synchronized(spatialActiveEntries) {
+            val list = spatialActiveEntries.values.toList()
+            spatialActiveEntries.clear()
+            list
+        }
+        spatialEntriesToDispose.forEach { entry ->
+            synchronized(entry) {
+                if (entry.runCompleted.get()) {
+                    releaseOnceSpatial(entry)
+                } else {
+                    entry.disposeRequested.set(true)
                 }
             }
         }
@@ -743,4 +787,275 @@ class AndroidGlesTextureSmokeCoordinator(
         }
         return true
     }
+
+    // ── P3-MULTICAM-NODE: GLES-first spatial multi-texture diagnostic render pass ──
+
+    private fun startSpatial(args: Map<*, *>?, result: MethodChannel.Result) {
+        val widthArg = (args?.get("width") as? Number)?.toInt()
+        val heightArg = (args?.get("height") as? Number)?.toInt()
+        if (widthArg != null && widthArg <= 0) {
+            result.error("INVALID_ARG", "startAndroidDagPhase3MultiCamSpatialGlesRenderSmoke: width must be positive", null)
+            return
+        }
+        if (heightArg != null && heightArg <= 0) {
+            result.error("INVALID_ARG", "startAndroidDagPhase3MultiCamSpatialGlesRenderSmoke: height must be positive", null)
+            return
+        }
+        val width = widthArg ?: SPATIAL_DEFAULT_DIMENSION
+        val height = heightArg ?: SPATIAL_DEFAULT_DIMENSION
+
+        val surfaceProducer = textureRegistry.createSurfaceProducer()
+        val textureId = surfaceProducer.id()
+        val entry = SpatialActiveEntry(surfaceProducer)
+        synchronized(spatialActiveEntries) {
+            spatialActiveEntries[textureId] = entry
+        }
+
+        Thread {
+            var producerSurface: Surface? = null
+            var bufferA: HardwareBuffer? = null
+            var bufferB: HardwareBuffer? = null
+            var raw = spatialFailureResult("not_run")
+            try {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+                    raw = spatialFailureResult("api_below_26")
+                } else {
+                    surfaceProducer.setSize(width, height)
+                    val surface = surfaceProducer.getSurface()
+                    producerSurface = surface
+
+                    val allocatedBufferA = HardwareBuffer.create(
+                        width,
+                        height,
+                        HardwareBuffer.RGBA_8888,
+                        1,
+                        HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_CPU_WRITE_OFTEN,
+                    )
+                    bufferA = allocatedBufferA
+                    val allocatedBufferB = HardwareBuffer.create(
+                        width,
+                        height,
+                        HardwareBuffer.RGBA_8888,
+                        1,
+                        HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE or HardwareBuffer.USAGE_CPU_WRITE_OFTEN,
+                    )
+                    bufferB = allocatedBufferB
+
+                    val diagnostics = VanguardDiagnostics()
+                    val nativeBridge = VanguardNativeBridge(
+                        VanguardLifecycleObserver(diagnostics),
+                        diagnostics,
+                        null,
+                    )
+                    raw = nativeBridge.runAndroidDagPhase3MultiCamSpatialGlesRenderSmoke(
+                        surface,
+                        allocatedBufferA,
+                        allocatedBufferB,
+                        width,
+                        height,
+                    )
+                }
+            } catch (t: Throwable) {
+                Log.e(TAG, "P3-MULTICAM-NODE spatial render smoke execution error", t)
+                raw = spatialFailureResult("exception:${t.javaClass.simpleName.ifEmpty { "unknown_exception" }}")
+            } finally {
+                try {
+                    bufferA?.close()
+                } catch (_: Throwable) {
+                }
+                try {
+                    bufferB?.close()
+                } catch (_: Throwable) {
+                }
+                try {
+                    producerSurface?.release()
+                } catch (_: Throwable) {
+                }
+            }
+
+            entry.runCompleted.set(true)
+            // Same ownership rule as AX/BB/AW-OES: the producer is released
+            // here only if a dispose() arrived while still running; a
+            // normal completion with no prior dispose leaves it alive for
+            // Dart to display via a Texture widget.
+            var released = false
+            synchronized(entry) {
+                if (entry.disposeRequested.get()) {
+                    released = releaseOnceSpatial(entry)
+                }
+            }
+            if (released) {
+                synchronized(spatialActiveEntries) { spatialActiveEntries.remove(textureId) }
+            }
+
+            val finalResult = parseSpatialResult(raw) + mapOf(
+                "textureId" to textureId,
+                "surfaceProducerReleased" to released,
+                "width" to width,
+                "height" to height,
+            )
+            mainHandler.post {
+                channel.invokeMethod(SPATIAL_COMPLETE_METHOD, finalResult)
+            }
+        }.start()
+
+        result.success(mapOf(
+            "started" to true,
+            "textureId" to textureId,
+        ))
+    }
+
+    private fun disposeSpatial(args: Map<*, *>?, result: MethodChannel.Result) {
+        val textureId = (args?.get("textureId") as? Number)?.toLong()
+        if (textureId == null) {
+            result.error("INVALID_ARG", "disposeAndroidDagPhase3MultiCamSpatialGlesRenderSmoke: textureId required", null)
+            return
+        }
+        val entry = synchronized(spatialActiveEntries) { spatialActiveEntries[textureId] }
+        if (entry == null) {
+            result.success(mapOf(
+                "pass" to true,
+                "textureId" to textureId,
+                "surfaceProducerReleased" to false,
+                "raw" to "status=OK;already_disposed_or_not_found;textureId=$textureId",
+            ))
+            return
+        }
+
+        // Same ownership rule as AX/BB/AW-OES's dispose(): never release the
+        // producer while the worker thread may still be rendering into it.
+        var released = false
+        var completedNow = false
+        synchronized(entry) {
+            if (entry.runCompleted.get()) {
+                released = releaseOnceSpatial(entry)
+                completedNow = true
+            } else {
+                entry.disposeRequested.set(true)
+            }
+        }
+        if (completedNow) {
+            synchronized(spatialActiveEntries) { spatialActiveEntries.remove(textureId) }
+        }
+        result.success(mapOf(
+            "pass" to true,
+            "textureId" to textureId,
+            "surfaceProducerReleased" to released,
+            "raw" to if (completedNow) {
+                "status=OK;disposed=true;textureId=$textureId"
+            } else {
+                "status=OK;dispose_requested_pending_completion;textureId=$textureId"
+            },
+        ))
+    }
+
+    private fun releaseOnceSpatial(entry: SpatialActiveEntry): Boolean {
+        if (!entry.released.compareAndSet(false, true)) {
+            return false
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            try {
+                entry.surfaceProducer.release()
+            } catch (t: Throwable) {
+                Log.w(TAG, "Spatial surfaceProducer.release() failed: ${t.javaClass.simpleName}: ${t.message}")
+            }
+        } else {
+            mainHandler.post {
+                try {
+                    entry.surfaceProducer.release()
+                } catch (t: Throwable) {
+                    Log.w(TAG, "Spatial surfaceProducer.release() on mainHandler failed: ${t.javaClass.simpleName}: ${t.message}")
+                }
+            }
+        }
+        return true
+    }
+
+    private fun parseSpatialResult(raw: String): Map<String, Any?> {
+        val parsed = mutableMapOf<String, String>()
+        raw.split(';').forEach { token ->
+            val eq = token.indexOf('=')
+            if (eq > 0) {
+                parsed[token.substring(0, eq).trim()] = token.substring(eq + 1).trim()
+            }
+        }
+        val pass = raw.startsWith("status=PASS;")
+        val proofBoundary = parsed["proofBoundary"] ?: SPATIAL_PROOF_BOUNDARY
+        val lastError = parsed["lastError"] ?: ""
+        val metrics = mapOf(
+            "clientVersion" to (parsed["clientVersion"]?.toIntOrNull() ?: 0),
+            "vendor" to (parsed["vendor"] ?: ""),
+            "renderer" to (parsed["renderer"] ?: ""),
+            "version" to (parsed["version"] ?: ""),
+            "bufferADescribe" to (parsed["bufferADescribe"] ?: "not_run"),
+            "bufferAFill" to (parsed["bufferAFill"] ?: "not_run"),
+            "bufferBDescribe" to (parsed["bufferBDescribe"] ?: "not_run"),
+            "bufferBFill" to (parsed["bufferBFill"] ?: "not_run"),
+            "preInitLane" to (parsed["preInitLane"] ?: "not_run"),
+            "preInitLastError" to (parsed["preInitLastError"] ?: ""),
+            "initialize" to (parsed["initialize"] ?: "not_run"),
+            "attach" to (parsed["attach"] ?: "not_run"),
+            "importBufferA" to (parsed["importBufferA"] ?: "not_run"),
+            "handleA" to (parsed["handleA"]?.toLongOrNull() ?: 0L),
+            "targetA" to (parsed["targetA"]?.toLongOrNull() ?: 0L),
+            "importBufferB" to (parsed["importBufferB"] ?: "not_run"),
+            "handleB" to (parsed["handleB"]?.toLongOrNull() ?: 0L),
+            "targetB" to (parsed["targetB"]?.toLongOrNull() ?: 0L),
+            "invalidHandleLane" to (parsed["invalidHandleLane"] ?: "not_run"),
+            "invalidHandleLastError" to (parsed["invalidHandleLastError"] ?: ""),
+            "invalidRectLane" to (parsed["invalidRectLane"] ?: "not_run"),
+            "invalidRectLastError" to (parsed["invalidRectLastError"] ?: ""),
+            "topBottomSplitOk" to (parsed["topBottomSplitOk"]?.equals("true", ignoreCase = true) ?: false),
+            "topBottomSplitLastError" to (parsed["topBottomSplitLastError"] ?: ""),
+            "leftRightSplitOk" to (parsed["leftRightSplitOk"]?.equals("true", ignoreCase = true) ?: false),
+            "leftRightSplitLastError" to (parsed["leftRightSplitLastError"] ?: ""),
+            "pipTopLeftOk" to (parsed["pipTopLeftOk"]?.equals("true", ignoreCase = true) ?: false),
+            "pipTopLeftLastError" to (parsed["pipTopLeftLastError"] ?: ""),
+            "pipFreeFloatingOk" to (parsed["pipFreeFloatingOk"]?.equals("true", ignoreCase = true) ?: false),
+            "pipFreeFloatingLastError" to (parsed["pipFreeFloatingLastError"] ?: ""),
+            "sentinelClearOk" to (parsed["sentinelClearOk"]?.equals("true", ignoreCase = true) ?: false),
+            "presentComposite" to (parsed["presentComposite"] ?: "not_run"),
+            "presentCompositeLastError" to (parsed["presentCompositeLastError"] ?: ""),
+            "releaseBufferA" to (parsed["releaseBufferA"] ?: "not_run"),
+            "releaseBufferAFence" to (parsed["releaseBufferAFence"]?.toIntOrNull() ?: -1),
+            "hasAAfterRelease" to (parsed["hasAAfterRelease"]?.equals("true", ignoreCase = true) ?: false),
+            "releaseBufferB" to (parsed["releaseBufferB"] ?: "not_run"),
+            "releaseBufferBFence" to (parsed["releaseBufferBFence"]?.toIntOrNull() ?: -1),
+            "hasBAfterRelease" to (parsed["hasBAfterRelease"]?.equals("true", ignoreCase = true) ?: false),
+            "postReleaseLane" to (parsed["postReleaseLane"] ?: "not_run"),
+            "postReleaseLastError" to (parsed["postReleaseLastError"] ?: ""),
+            "detach" to (parsed["detach"] ?: "not_run"),
+            "shutdown" to (parsed["shutdown"] ?: "not_run"),
+            "idempotentShutdown" to (parsed["idempotentShutdown"] ?: "not_run"),
+        )
+
+        return mapOf(
+            "pass" to pass,
+            "raw" to raw,
+            "proofBoundary" to proofBoundary,
+            "metrics" to metrics,
+            "lastError" to lastError,
+        )
+    }
+
+    private fun spatialFailureResult(reason: String): String =
+        "status=FAIL;clientVersion=0;vendor=;renderer=;version=;" +
+        "bufferADescribe=not_run;bufferAFill=not_run;bufferBDescribe=not_run;bufferBFill=not_run;" +
+        "preInitLane=not_run;preInitLastError=;" +
+        "initialize=not_run;attach=not_run;" +
+        "importBufferA=not_run;handleA=0;targetA=0;importBufferB=not_run;handleB=0;targetB=0;" +
+        "invalidHandleLane=not_run;invalidHandleLastError=;" +
+        "invalidRectLane=not_run;invalidRectLastError=;" +
+        "topBottomSplitOk=false;topBottomSplitLastError=;" +
+        "leftRightSplitOk=false;leftRightSplitLastError=;" +
+        "pipTopLeftOk=false;pipTopLeftLastError=;" +
+        "pipFreeFloatingOk=false;pipFreeFloatingLastError=;" +
+        "sentinelClearOk=false;" +
+        "presentComposite=not_run;presentCompositeLastError=;" +
+        "releaseBufferA=not_run;releaseBufferAFence=-1;hasAAfterRelease=false;" +
+        "releaseBufferB=not_run;releaseBufferBFence=-1;hasBAfterRelease=false;" +
+        "postReleaseLane=not_run;postReleaseLastError=;" +
+        "detach=not_run;shutdown=not_run;idempotentShutdown=not_run;" +
+        "proofBoundary=$SPATIAL_PROOF_BOUNDARY;" +
+        "lastError=$reason"
 }

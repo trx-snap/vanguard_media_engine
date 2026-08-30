@@ -63,8 +63,32 @@ namespace render {
 // EGL/GLES/
 // Android headers must never appear in this public header; all such state
 // lives exclusively in gles_backend.cpp and the private
-// GlesHardwareBufferImports / GlesTextureFrameRenderer / GlesTwoTextureCompositor
-// helpers behind the Impl pimpl.
+// GlesHardwareBufferImports / GlesTextureFrameRenderer / GlesTwoTextureCompositor /
+// GlesMultiCamSpatialCompositor helpers behind the Impl pimpl. The latter
+// (P3-MULTICAM-NODE) draws two imported texture handles into two
+// independent glViewport-scoped pixel rectangles via
+// diagnosticRenderMultiCamSpatialCompositeForReadback() /
+// diagnosticPresentMultiCamSpatialComposite() below -- two sequential
+// opaque single-texture draws, no mix()/opacity blending, unlike the Unit
+// AS/AT two-texture compositor above. Render-only spatial layout proof: no
+// camera, no Vulkan, no recording/export, no product UI.
+// P3-MULTICAM-NODE: bottom-left-origin pixel viewport rectangle, as
+// consumed by diagnosticRenderMultiCamSpatialCompositeForReadback() /
+// diagnosticPresentMultiCamSpatialComposite() below. `x`/`yBottom` are the
+// rectangle's bottom-left corner in the attached window surface's pixel
+// space (origin at the surface's bottom-left, Y increasing upward, matching
+// glViewport()/glReadPixels() convention -- not the top-left/Y-down
+// convention used by vanguard::compositors::NormalizedRect). Callers
+// converting a top-left/Y-down normalized rect into this type are
+// responsible for the axis flip (see the JNI composition root for the exact
+// rounding rule).
+struct GlesViewportRectPx {
+    int32_t x;
+    int32_t yBottom;
+    uint32_t width;
+    uint32_t height;
+};
+
 class GlesBackend : public RenderBackend {
 public:
     GlesBackend();
@@ -354,6 +378,74 @@ public:
     // ImageReader.PRIVATE, no product UI.
     bool presentDiagnosticExternalOesTexture(uint32_t textureId,
                                              const VideoFrameTransform& transform);
+
+    // ---------------------------------------------------------------------------
+    // P3-MULTICAM-NODE: GLES-first spatial multi-texture diagnostic render
+    // pass. Render-only proof that two already-imported textures can be
+    // drawn into two independent, non-overlapping-by-construction pixel
+    // rectangles of the attached window surface -- a physical stand-in for
+    // MultiCamCompositorNode's PiP/split layout math
+    // (vanguard::compositors::ComputeMultiCamLayout()), which this backend
+    // never calls directly (that stays the JNI composition root's job; see
+    // android_phase3_multicam_spatial_render_jni.cpp). No camera open, no
+    // decoded/camera PRIVATE AHardwareBuffer claim, no Vulkan, no
+    // GL_TEXTURE_EXTERNAL_OES physical proof (structurally accepted, see
+    // GlesMultiCamSpatialCompositor), no product descriptors, no
+    // recording/export, no app/editor UI, no background cutout.
+    // ---------------------------------------------------------------------------
+
+    // Resolves handleA/handleB to their imported textures/targets via the
+    // same ahbImports lookup as renderFrame(), then delegates to the
+    // private GlesMultiCamSpatialCompositor helper to draw handleA scoped
+    // to primaryRect and handleB scoped to secondaryRect via glViewport --
+    // two sequential opaque single-texture draws, no mix()/weight/opacity
+    // blending -- but intentionally does not call eglSwapBuffers, so a
+    // physical harness can pair it with diagnosticReadPixels() against the
+    // still-unswapped window surface to verify placed pixel content before
+    // presentation.
+    //
+    // Preconditions: an initialized backend, a window surface already
+    // attached (see attachSurface()/hasSurface()), and handleA/handleB each
+    // identifying an active imported buffer (see importHardwareBuffer()).
+    // Returns false with lastError="invalid_buffer_handle" if either handle
+    // does not resolve to an active imported texture/target, or with
+    // lastError set to the GlesMultiCamSpatialCompositor failure reason
+    // (e.g. "gles_multicam_spatial_compositor_unsupported_texture_target",
+    // "gles_multicam_spatial_compositor_invalid_rect" -- the latter covers a
+    // zero-size rect, a negative x/yBottom, or a rect whose far edge exceeds
+    // the attached surface's width/height) on any other draw failure.
+    //
+    // Non-claims: diagnostic/proof infrastructure only, not a product
+    // compositing API; callers should use it only paired with
+    // diagnosticReadPixels() in physical proof harnesses. secondaryOpacity,
+    // crop rects, and corner radius are explicit non-claims and ignored --
+    // every caller passes opacity 1.0/identity crops by construction (this
+    // backend has no opacity/crop parameters at all). No color-correct YUV
+    // conversion policy, no timeline DAG integration, no recording/export,
+    // no product UI. Unavailable on non-Android host builds.
+    bool diagnosticRenderMultiCamSpatialCompositeForReadback(
+        HardwareBufferHandle handleA,
+        HardwareBufferHandle handleB,
+        const GlesViewportRectPx& primaryRect,
+        const GlesViewportRectPx& secondaryRect,
+        const VideoFrameTransform& transformA,
+        const VideoFrameTransform& transformB);
+
+    // Shares the same preconditions, handle resolution, and draw path as
+    // diagnosticRenderMultiCamSpatialCompositeForReadback(), but
+    // additionally calls eglSwapBuffers to present the composited frame on
+    // the attached window EGLSurface. This is the final draw only -- it is
+    // not paired with a readback in this slice's physical proof. Same
+    // failure states and non-claims as
+    // diagnosticRenderMultiCamSpatialCompositeForReadback(); see its
+    // comment above. Unavailable on non-Android host builds.
+    bool diagnosticPresentMultiCamSpatialComposite(
+        HardwareBufferHandle handleA,
+        HardwareBufferHandle handleB,
+        const GlesViewportRectPx& primaryRect,
+        const GlesViewportRectPx& secondaryRect,
+        const VideoFrameTransform& transformA,
+        const VideoFrameTransform& transformB);
 
 private:
     struct Impl;

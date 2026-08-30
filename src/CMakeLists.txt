@@ -56,6 +56,7 @@ add_library(vanguard_render_gles STATIC
     "render/gles/src/gles_hardware_buffer_imports.cpp"
     "render/gles/src/gles_texture_frame_renderer.cpp"
     "render/gles/src/gles_two_texture_compositor.cpp"
+    "render/gles/src/gles_multicam_spatial_compositor.cpp"
 )
 target_include_directories(vanguard_render_gles PUBLIC "render/gles/include")
 target_link_libraries(vanguard_render_gles PRIVATE vanguard_render_shared vanguard_core)
@@ -110,6 +111,7 @@ if (ANDROID)
     "platform/android/src/android_gles_decoded_oes_smoke_jni.cpp"
     "platform/android/src/android_phase2_audio_decode_bridge_jni.cpp"
     "platform/android/src/android_phase3_multicam_compositor_jni.cpp"
+    "platform/android/src/android_phase3_multicam_spatial_render_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
 
