@@ -13,12 +13,16 @@ import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Immutable added-music track config for [AndroidEditorAddedAudioPreviewRuntime].
+ * Immutable added-audio track config for [AndroidEditorAddedAudioPreviewRuntime]. Covers both
+ * `role="music"` and `role="voiceover"` added-audio tracks (Phase 7.8L-Android); SFX remains
+ * deferred.
  *
  * [durationUs] / [sourceTrimStartUs] / [trackStartUs] are microseconds; [effectiveGain] is
  * linear gain (volume * mixGain from the wire sidecar track) clamped to `[0.0, 1.0]` by the
  * runtime. [trackStartUs] is this track's delayed start position on the global editor timeline
  * (Phase 7.8K-Android): the track is silent outside `[trackStartUs, trackStartUs + durationUs)`.
+ * [role] is `"music"` or `"voiceover"`; it never affects playback timing/mixing math, only
+ * logging and the [AudioAttributes] content type used for focus requests.
  */
 data class AndroidEditorAddedAudioTrackConfig(
     val trackId: String,
@@ -27,16 +31,19 @@ data class AndroidEditorAddedAudioTrackConfig(
     val sourceTrimStartUs: Long,
     val trackStartUs: Long,
     val effectiveGain: Double,
+    val role: String,
 )
 
 /**
- * Single-clip editor-preview added music runtime.
+ * Single-clip editor-preview added audio runtime.
  *
- * Plays back exactly one added music sidecar track using a single [MediaPlayer] confined to its
- * own dedicated [HandlerThread]/[Handler] (`audioHandler`) — mirroring
- * [AndroidEditorOriginalAudioPreviewRuntime]'s confinement style. Preview only; never touches
- * export/mux behavior, fades, keyframes, SFX, voiceover, multi-track mixing, multi-clip clocking,
- * ducking, or waveform logic.
+ * Plays back exactly one added audio sidecar track (`role="music"` or `role="voiceover"`) using
+ * a single [MediaPlayer] confined to its own dedicated [HandlerThread]/[Handler]
+ * (`audioHandler`) — mirroring [AndroidEditorOriginalAudioPreviewRuntime]'s confinement style.
+ * One coordinator-owned instance exists per added-audio track; a single-clip draft may have one
+ * music instance and one voiceover instance active at once (Phase 7.8L-Android). Preview only;
+ * never touches export/mux behavior, fades, keyframes, SFX, multi-clip added audio, multi-clip
+ * clocking, ducking, or waveform logic.
  *
  * A global timeline PTS ([currentTimelinePtsUs]) maps onto this track's own timeline via
  * [AndroidEditorAddedAudioTrackConfig.trackStartUs] (Phase 7.8K-Android: the track may start/end
@@ -111,9 +118,9 @@ class AndroidEditorAddedAudioPreviewRuntime(
      */
     fun prepare(onDone: () -> Unit) {
         audioHandler.post {
-            Log.i(TAG, "$LOG_PREFIX prepare_started trackId=${config.trackId}")
+            Log.i(TAG, "$LOG_PREFIX prepare_started trackId=${config.trackId} role=${config.role}")
             if (released.get()) {
-                Log.i(TAG, "$LOG_PREFIX prepare_skip_released trackId=${config.trackId}")
+                Log.i(TAG, "$LOG_PREFIX prepare_skip_released trackId=${config.trackId} role=${config.role}")
                 onDone()
                 return@post
             }
@@ -121,7 +128,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
 
             val file = File(config.sourcePath)
             if (!file.exists() || !file.canRead()) {
-                Log.w(TAG, "$LOG_PREFIX prepare_failed reason=file_unreadable trackId=${config.trackId}")
+                Log.w(TAG, "$LOG_PREFIX prepare_failed reason=file_unreadable trackId=${config.trackId} role=${config.role}")
                 enabled = false
                 onDone()
                 return@post
@@ -135,7 +142,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
             val mp = MediaPlayer()
             try {
                 mp.setOnErrorListener { _, what, extra ->
-                    Log.w(TAG, "$LOG_PREFIX prepare_failed reason=error_listener what=$what extra=$extra trackId=${config.trackId}")
+                    Log.w(TAG, "$LOG_PREFIX prepare_failed reason=error_listener what=$what extra=$extra trackId=${config.trackId} role=${config.role}")
                     disableLocked(mp, "prepare_error_listener")
                     finish()
                     true
@@ -154,31 +161,31 @@ class AndroidEditorAddedAudioPreviewRuntime(
                     try {
                         mp.setVolume(gain, gain)
                     } catch (t: Throwable) {
-                        Log.w(TAG, "$LOG_PREFIX prepare_set_volume_error trackId=${config.trackId}", t)
+                        Log.w(TAG, "$LOG_PREFIX prepare_set_volume_error trackId=${config.trackId} role=${config.role}", t)
                     }
                     val targetMs = (config.sourceTrimStartUs / 1000L)
                         .coerceIn(0L, mp.duration.toLong().coerceAtLeast(0L))
                     if (targetMs > 0L) {
                         mp.setOnSeekCompleteListener {
-                            Log.i(TAG, "$LOG_PREFIX prepare_success trackId=${config.trackId} durationMs=${mp.duration}")
+                            Log.i(TAG, "$LOG_PREFIX prepare_success trackId=${config.trackId} role=${config.role} durationMs=${mp.duration}")
                             finish()
                         }
                         try {
                             mp.seekTo(targetMs.toInt())
                         } catch (t: Throwable) {
-                            Log.w(TAG, "$LOG_PREFIX prepare_failed reason=preroll_seek_error trackId=${config.trackId}", t)
+                            Log.w(TAG, "$LOG_PREFIX prepare_failed reason=preroll_seek_error trackId=${config.trackId} role=${config.role}", t)
                             disableLocked(mp, "prepare_preroll_seek_error")
                             finish()
                         }
                     } else {
-                        Log.i(TAG, "$LOG_PREFIX prepare_success trackId=${config.trackId} durationMs=${mp.duration}")
+                        Log.i(TAG, "$LOG_PREFIX prepare_success trackId=${config.trackId} role=${config.role} durationMs=${mp.duration}")
                         finish()
                     }
                 }
                 mp.setDataSource(config.sourcePath)
                 mp.prepareAsync()
             } catch (t: Throwable) {
-                Log.w(TAG, "$LOG_PREFIX prepare_failed reason=setup_error trackId=${config.trackId}", t)
+                Log.w(TAG, "$LOG_PREFIX prepare_failed reason=setup_error trackId=${config.trackId} role=${config.role}", t)
                 try { mp.release() } catch (_: Throwable) {}
                 enabled = false
                 finish()
@@ -202,20 +209,20 @@ class AndroidEditorAddedAudioPreviewRuntime(
     fun play() {
         audioHandler.post {
             if (released.get() || !enabled) {
-                Log.i(TAG, "$LOG_PREFIX play_skip reason=${if (released.get()) "released" else "disabled"} trackId=${config.trackId}")
+                Log.i(TAG, "$LOG_PREFIX play_skip reason=${if (released.get()) "released" else "disabled"} trackId=${config.trackId} role=${config.role}")
                 return@post
             }
             val mp = player
             if (mp == null) {
-                Log.i(TAG, "$LOG_PREFIX play_skip reason=no_player trackId=${config.trackId}")
+                Log.i(TAG, "$LOG_PREFIX play_skip reason=no_player trackId=${config.trackId} role=${config.role}")
                 return@post
             }
             if (playing) {
-                Log.i(TAG, "$LOG_PREFIX play_skip reason=already_playing trackId=${config.trackId}")
+                Log.i(TAG, "$LOG_PREFIX play_skip reason=already_playing trackId=${config.trackId} role=${config.role}")
                 return@post
             }
             if (currentTimelinePtsUs >= trackEndUs) {
-                Log.i(TAG, "$LOG_PREFIX play_skip reason=out_of_range currentTimelinePtsUs=$currentTimelinePtsUs trackEndUs=$trackEndUs trackId=${config.trackId}")
+                Log.i(TAG, "$LOG_PREFIX play_skip reason=out_of_range currentTimelinePtsUs=$currentTimelinePtsUs trackEndUs=$trackEndUs trackId=${config.trackId} role=${config.role}")
                 return@post
             }
 
@@ -225,7 +232,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
                 val delayMs = (config.trackStartUs - currentTimelinePtsUs) / 1000L
                 audioHandler.removeCallbacks(startRunnable)
                 audioHandler.postDelayed(startRunnable, delayMs)
-                Log.i(TAG, "$LOG_PREFIX delayed_start_scheduled trackId=${config.trackId} delayMs=$delayMs currentTimelinePtsUs=$currentTimelinePtsUs trackStartUs=${config.trackStartUs}")
+                Log.i(TAG, "$LOG_PREFIX delayed_start_scheduled trackId=${config.trackId} role=${config.role} delayMs=$delayMs currentTimelinePtsUs=$currentTimelinePtsUs trackStartUs=${config.trackStartUs}")
             } else {
                 startMediaAtCurrentPtsLocked(mp, seekFirst = true)
             }
@@ -259,9 +266,9 @@ class AndroidEditorAddedAudioPreviewRuntime(
                 mp.start()
                 mediaStarted = true
                 scheduleEndRunnableLocked()
-                Log.i(TAG, "$LOG_PREFIX play_started trackId=${config.trackId} currentTimelinePtsUs=$currentTimelinePtsUs")
+                Log.i(TAG, "$LOG_PREFIX play_started trackId=${config.trackId} role=${config.role} currentTimelinePtsUs=$currentTimelinePtsUs")
             } catch (t: Throwable) {
-                Log.w(TAG, "$LOG_PREFIX play_start_error trackId=${config.trackId}", t)
+                Log.w(TAG, "$LOG_PREFIX play_start_error trackId=${config.trackId} role=${config.role}", t)
                 playing = false
                 disableLocked(mp, "play_start_error")
             }
@@ -277,7 +284,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
             mp.setOnSeekCompleteListener { doStart() }
             mp.seekTo(targetMs.toInt())
         } catch (t: Throwable) {
-            Log.w(TAG, "$LOG_PREFIX play_seek_error trackId=${config.trackId}", t)
+            Log.w(TAG, "$LOG_PREFIX play_seek_error trackId=${config.trackId} role=${config.role}", t)
             playing = false
             disableLocked(mp, "play_seek_error")
         }
@@ -290,21 +297,21 @@ class AndroidEditorAddedAudioPreviewRuntime(
      */
     fun pause() {
         audioHandler.post {
-            Log.i(TAG, "$LOG_PREFIX pause_start trackId=${config.trackId}")
+            Log.i(TAG, "$LOG_PREFIX pause_start trackId=${config.trackId} role=${config.role}")
             audioHandler.removeCallbacks(startRunnable)
             audioHandler.removeCallbacks(endRunnable)
             abandonFocusLocked()
             if (released.get() || !enabled) {
                 playing = false
                 mediaStarted = false
-                Log.i(TAG, "$LOG_PREFIX pause_done reason=${if (released.get()) "released" else "disabled"} trackId=${config.trackId}")
+                Log.i(TAG, "$LOG_PREFIX pause_done reason=${if (released.get()) "released" else "disabled"} trackId=${config.trackId} role=${config.role}")
                 return@post
             }
             val mp = player
             if (mp == null) {
                 playing = false
                 mediaStarted = false
-                Log.i(TAG, "$LOG_PREFIX pause_done reason=no_player trackId=${config.trackId}")
+                Log.i(TAG, "$LOG_PREFIX pause_done reason=no_player trackId=${config.trackId} role=${config.role}")
                 return@post
             }
             if (playing) {
@@ -314,7 +321,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
                         currentTimelinePtsUs = (sourcePosUs - config.sourceTrimStartUs + config.trackStartUs)
                             .coerceIn(config.trackStartUs, trackEndUs)
                     } catch (t: Throwable) {
-                        Log.w(TAG, "$LOG_PREFIX pause_position_read_error trackId=${config.trackId}", t)
+                        Log.w(TAG, "$LOG_PREFIX pause_position_read_error trackId=${config.trackId} role=${config.role}", t)
                     }
                 } else {
                     val elapsedMs = SystemClock.uptimeMillis() - playBaselineUptimeMs
@@ -323,12 +330,12 @@ class AndroidEditorAddedAudioPreviewRuntime(
                 try {
                     if (mp.isPlaying) mp.pause()
                 } catch (t: Throwable) {
-                    Log.w(TAG, "$LOG_PREFIX pause_error trackId=${config.trackId}", t)
+                    Log.w(TAG, "$LOG_PREFIX pause_error trackId=${config.trackId} role=${config.role}", t)
                 }
             }
             playing = false
             mediaStarted = false
-            Log.i(TAG, "$LOG_PREFIX pause_done trackId=${config.trackId} currentTimelinePtsUs=$currentTimelinePtsUs")
+            Log.i(TAG, "$LOG_PREFIX pause_done trackId=${config.trackId} role=${config.role} currentTimelinePtsUs=$currentTimelinePtsUs")
         }
     }
 
@@ -359,7 +366,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
                     !enabled -> "disabled"
                     else -> "no_player"
                 }
-                Log.i(TAG, "$LOG_PREFIX seek_skip reason=$reason trackId=${config.trackId}")
+                Log.i(TAG, "$LOG_PREFIX seek_skip reason=$reason trackId=${config.trackId} role=${config.role}")
                 onDone()
                 return@post
             }
@@ -372,13 +379,13 @@ class AndroidEditorAddedAudioPreviewRuntime(
             try {
                 if (mp.isPlaying) mp.pause()
             } catch (t: Throwable) {
-                Log.w(TAG, "$LOG_PREFIX seek_pause_error trackId=${config.trackId}", t)
+                Log.w(TAG, "$LOG_PREFIX seek_pause_error trackId=${config.trackId} role=${config.role}", t)
             }
 
             when {
                 targetTimelinePtsUs >= trackEndUs -> {
                     currentTimelinePtsUs = targetTimelinePtsUs
-                    Log.i(TAG, "$LOG_PREFIX seek_completed resume=false region=at_or_after_end trackId=${config.trackId} targetTimelinePtsUs=$targetTimelinePtsUs")
+                    Log.i(TAG, "$LOG_PREFIX seek_completed resume=false region=at_or_after_end trackId=${config.trackId} role=${config.role} targetTimelinePtsUs=$targetTimelinePtsUs")
                     finish()
                 }
                 targetTimelinePtsUs < config.trackStartUs -> {
@@ -387,7 +394,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
                     try {
                         mp.setOnSeekCompleteListener {
                             currentTimelinePtsUs = targetTimelinePtsUs
-                            Log.i(TAG, "$LOG_PREFIX seek_completed resume=$resumeAfterSeek region=before_start trackId=${config.trackId} targetTimelinePtsUs=$targetTimelinePtsUs")
+                            Log.i(TAG, "$LOG_PREFIX seek_completed resume=$resumeAfterSeek region=before_start trackId=${config.trackId} role=${config.role} targetTimelinePtsUs=$targetTimelinePtsUs")
                             if (resumeAfterSeek) {
                                 play()
                             }
@@ -395,7 +402,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
                         }
                         mp.seekTo(targetMs.toInt())
                     } catch (t: Throwable) {
-                        Log.w(TAG, "$LOG_PREFIX seek_error trackId=${config.trackId}", t)
+                        Log.w(TAG, "$LOG_PREFIX seek_error trackId=${config.trackId} role=${config.role}", t)
                         disableLocked(mp, "seek_error")
                         finish()
                     }
@@ -411,12 +418,12 @@ class AndroidEditorAddedAudioPreviewRuntime(
                                 playBaselineUptimeMs = SystemClock.uptimeMillis()
                                 startMediaAtCurrentPtsLocked(mp, seekFirst = false)
                             }
-                            Log.i(TAG, "$LOG_PREFIX seek_completed resume=$resumeAfterSeek region=inside_window trackId=${config.trackId} targetTimelinePtsUs=$targetTimelinePtsUs")
+                            Log.i(TAG, "$LOG_PREFIX seek_completed resume=$resumeAfterSeek region=inside_window trackId=${config.trackId} role=${config.role} targetTimelinePtsUs=$targetTimelinePtsUs")
                             finish()
                         }
                         mp.seekTo(targetMs.toInt())
                     } catch (t: Throwable) {
-                        Log.w(TAG, "$LOG_PREFIX seek_error trackId=${config.trackId}", t)
+                        Log.w(TAG, "$LOG_PREFIX seek_error trackId=${config.trackId} role=${config.role}", t)
                         disableLocked(mp, "seek_error")
                         finish()
                     }
@@ -438,12 +445,12 @@ class AndroidEditorAddedAudioPreviewRuntime(
             return
         }
         audioHandler.post {
-            Log.i(TAG, "$LOG_PREFIX release_start trackId=${config.trackId}")
+            Log.i(TAG, "$LOG_PREFIX release_start trackId=${config.trackId} role=${config.role}")
             audioHandler.removeCallbacks(startRunnable)
             audioHandler.removeCallbacks(endRunnable)
             abandonFocusLocked()
             teardownPlayerLocked()
-            Log.i(TAG, "$LOG_PREFIX release_done trackId=${config.trackId}")
+            Log.i(TAG, "$LOG_PREFIX release_done trackId=${config.trackId} role=${config.role}")
             onDone?.invoke()
             try { audioThread.quitSafely() } catch (_: Throwable) {}
         }
@@ -462,17 +469,17 @@ class AndroidEditorAddedAudioPreviewRuntime(
         try {
             if (mp != null && mp.isPlaying) mp.pause()
         } catch (t: Throwable) {
-            Log.w(TAG, "$LOG_PREFIX track_end_pause_error trackId=${config.trackId}", t)
+            Log.w(TAG, "$LOG_PREFIX track_end_pause_error trackId=${config.trackId} role=${config.role}", t)
         }
         currentTimelinePtsUs = trackEndUs
         playing = false
         mediaStarted = false
         abandonFocusLocked()
-        Log.i(TAG, "$LOG_PREFIX track_end_reached trackId=${config.trackId}")
+        Log.i(TAG, "$LOG_PREFIX track_end_reached trackId=${config.trackId} role=${config.role}")
     }
 
     private fun disableLocked(mp: MediaPlayer, reason: String = "unknown") {
-        Log.w(TAG, "$LOG_PREFIX disable reason=$reason trackId=${config.trackId}")
+        Log.w(TAG, "$LOG_PREFIX disable reason=$reason trackId=${config.trackId} role=${config.role}")
         enabled = false
         playing = false
         mediaStarted = false
@@ -502,12 +509,12 @@ class AndroidEditorAddedAudioPreviewRuntime(
 
     private fun requestFocusLocked() {
         if (hasFocus) {
-            Log.i(TAG, "$LOG_PREFIX focus_result skipped reason=already_has_focus trackId=${config.trackId}")
+            Log.i(TAG, "$LOG_PREFIX focus_result skipped reason=already_has_focus trackId=${config.trackId} role=${config.role}")
             return
         }
         val ctx = context
         if (ctx == null) {
-            Log.i(TAG, "$LOG_PREFIX focus_result skipped reason=no_context trackId=${config.trackId}")
+            Log.i(TAG, "$LOG_PREFIX focus_result skipped reason=no_context trackId=${config.trackId} role=${config.role}")
             return
         }
         try {
@@ -515,21 +522,26 @@ class AndroidEditorAddedAudioPreviewRuntime(
                 audioManager = it
             }
             if (am == null) {
-                Log.i(TAG, "$LOG_PREFIX focus_result skipped reason=no_audio_manager trackId=${config.trackId}")
+                Log.i(TAG, "$LOG_PREFIX focus_result skipped reason=no_audio_manager trackId=${config.trackId} role=${config.role}")
                 return
+            }
+            val contentType = if (config.role == "voiceover") {
+                AudioAttributes.CONTENT_TYPE_SPEECH
+            } else {
+                AudioAttributes.CONTENT_TYPE_MUSIC
             }
             val attrs = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                .setContentType(contentType)
                 .build()
             val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
                 .setAudioAttributes(attrs)
                 .build()
             focusRequest = request
             hasFocus = am.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-            Log.i(TAG, "$LOG_PREFIX focus_result ${if (hasFocus) "granted" else "not_granted"} trackId=${config.trackId}")
+            Log.i(TAG, "$LOG_PREFIX focus_result ${if (hasFocus) "granted" else "not_granted"} trackId=${config.trackId} role=${config.role}")
         } catch (t: Throwable) {
-            Log.w(TAG, "$LOG_PREFIX focus_result error trackId=${config.trackId}", t)
+            Log.w(TAG, "$LOG_PREFIX focus_result error trackId=${config.trackId} role=${config.role}", t)
             hasFocus = false
         }
     }
@@ -544,7 +556,7 @@ class AndroidEditorAddedAudioPreviewRuntime(
             try {
                 am.abandonAudioFocusRequest(request)
             } catch (t: Throwable) {
-                Log.w(TAG, "$LOG_PREFIX abandonFocusLocked_error trackId=${config.trackId}", t)
+                Log.w(TAG, "$LOG_PREFIX abandonFocusLocked_error trackId=${config.trackId} role=${config.role}", t)
             }
         }
     }

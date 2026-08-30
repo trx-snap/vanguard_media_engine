@@ -5,6 +5,7 @@ import android.os.Handler
 import android.util.Log
 import io.flutter.plugin.common.MethodChannel
 import io.flutter.view.TextureRegistry
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Phase 7.8G-Android: owns the public Dart VGEditorController playback routes
@@ -60,12 +61,13 @@ class AndroidEditorPlaybackCoordinator(
         val session: AndroidEditorSequentialPlaybackSession,
         val surfaceProducer: TextureRegistry.SurfaceProducer,
         /**
-         * Single-clip added music preview runtime, or null when the active draft has no valid
-         * `role == "music"` sidecar track. Attached after [AndroidEditorSequentialPlaybackSession
-         * .prepare] succeeds (see [createOrUpdateTimeline]); owned/released by this coordinator,
-         * never by the session (which only owns per-clip original-audio runtimes).
+         * Single-clip added-audio preview runtimes: zero, one, or two entries (at most one
+         * `role == "music"` and at most one `role == "voiceover"`, Phase 7.8L-Android). Attached
+         * after [AndroidEditorSequentialPlaybackSession.prepare] succeeds (see
+         * [createOrUpdateTimeline]); owned/released by this coordinator, never by the session
+         * (which only owns per-clip original-audio runtimes).
          */
-        val addedAudioRuntime: AndroidEditorAddedAudioPreviewRuntime? = null,
+        val addedAudioRuntimes: List<AndroidEditorAddedAudioPreviewRuntime> = emptyList(),
     )
 
     private val lock = Any()
@@ -258,14 +260,16 @@ class AndroidEditorPlaybackCoordinator(
         // own derived original-clip-audio tracks (VGEditorDraft
         // .flattenOriginalClipAudio()) — one synthetic track per clip's own
         // already-validated sourcePath, tagged role="original" with a trackId of
-        // "original-<clipId>" — passed through unchanged; and (2) exactly one
-        // user-added role="music" track, only for a single-clip timeline, with a
-        // finite non-negative startTime (Phase 7.8K-Android: delayed music
-        // start/end). Any other role (sfx, voiceover, unknown), a second music
-        // track, music on a multi-clip timeline, non-zero fades, or non-empty
+        // "original-<clipId>" — passed through unchanged; and (2) at most one
+        // user-added role="music" track and at most one user-added role="voiceover"
+        // track, both only for a single-clip timeline (Phase 7.8L-Android: a
+        // single-clip draft may carry both at once), each with a finite
+        // non-negative startTime (Phase 7.8K-Android: delayed start/end). Any
+        // other role (sfx, unknown, null), a duplicate music or voiceover track,
+        // any added track on a multi-clip timeline, non-zero fades, or non-empty
         // volumeKeyframes are all unsupported in this slice.
         val audioSidecar = draft["audioSidecar"]
-        var pendingMusicConfig: AndroidEditorAddedAudioTrackConfig? = null
+        val pendingAddedAudioConfigs = mutableListOf<AndroidEditorAddedAudioTrackConfig>()
         if (audioSidecar != null) {
             val sidecarMap = audioSidecar as? Map<*, *>
             val tracks = sidecarMap?.get("tracks") as? List<*>
@@ -275,6 +279,7 @@ class AndroidEditorPlaybackCoordinator(
             }
 
             var sawMusicTrack = false
+            var sawVoiceoverTrack = false
             for (rawTrack in tracks) {
                 val track = rawTrack as? Map<*, *>
                 if (track == null) {
@@ -300,7 +305,7 @@ class AndroidEditorPlaybackCoordinator(
                     continue
                 }
 
-                if (role != "music") {
+                if (role != "music" && role != "voiceover") {
                     result.error(
                         "UNSUPPORTED_TIMELINE_FEATURE",
                         "audioSidecar track role=\"$role\" is not supported in this slice",
@@ -312,23 +317,35 @@ class AndroidEditorPlaybackCoordinator(
                 if (clipSpecs.size != 1) {
                     result.error(
                         "UNSUPPORTED_TIMELINE_FEATURE",
-                        "added music is only supported for single-clip timelines in this slice",
+                        "added audio is only supported for single-clip timelines in this slice",
                         null,
                     )
                     return
                 }
-                if (sawMusicTrack) {
-                    result.error(
-                        "UNSUPPORTED_TIMELINE_FEATURE",
-                        "only one added music track is supported in this slice",
-                        null,
-                    )
-                    return
+                if (role == "music") {
+                    if (sawMusicTrack) {
+                        result.error(
+                            "UNSUPPORTED_TIMELINE_FEATURE",
+                            "only one added music track is supported in this slice",
+                            null,
+                        )
+                        return
+                    }
+                    sawMusicTrack = true
+                } else {
+                    if (sawVoiceoverTrack) {
+                        result.error(
+                            "UNSUPPORTED_TIMELINE_FEATURE",
+                            "only one added voiceover track is supported in this slice",
+                            null,
+                        )
+                        return
+                    }
+                    sawVoiceoverTrack = true
                 }
-                sawMusicTrack = true
 
                 if (trackId.isNullOrBlank() || url.isNullOrBlank()) {
-                    result.error("INVALID_AUDIO_SIDECAR", "music track is missing trackId or url", null)
+                    result.error("INVALID_AUDIO_SIDECAR", "$role track is missing trackId or url", null)
                     return
                 }
 
@@ -349,7 +366,7 @@ class AndroidEditorPlaybackCoordinator(
                 ) {
                     result.error(
                         "INVALID_AUDIO_SIDECAR",
-                        "music track \"$trackId\" has missing or non-finite numeric fields",
+                        "$role track \"$trackId\" has missing or non-finite numeric fields",
                         null,
                     )
                     return
@@ -357,7 +374,7 @@ class AndroidEditorPlaybackCoordinator(
                 if (duration <= 0.0 || sourceTrimStart < 0.0 || startTime < 0.0) {
                     result.error(
                         "INVALID_AUDIO_SIDECAR",
-                        "music track \"$trackId\" has an invalid duration, sourceTrimStart, or startTime",
+                        "$role track \"$trackId\" has an invalid duration, sourceTrimStart, or startTime",
                         null,
                     )
                     return
@@ -366,7 +383,7 @@ class AndroidEditorPlaybackCoordinator(
                 if (fadeInSeconds != 0.0 || fadeOutSeconds != 0.0) {
                     result.error(
                         "UNSUPPORTED_TIMELINE_FEATURE",
-                        "music track \"$trackId\" fades are not supported in this slice",
+                        "$role track \"$trackId\" fades are not supported in this slice",
                         null,
                     )
                     return
@@ -374,25 +391,28 @@ class AndroidEditorPlaybackCoordinator(
                 if (volumeKeyframes != null && volumeKeyframes.isNotEmpty()) {
                     result.error(
                         "UNSUPPORTED_TIMELINE_FEATURE",
-                        "music track \"$trackId\" volumeKeyframes are not supported in this slice",
+                        "$role track \"$trackId\" volumeKeyframes are not supported in this slice",
                         null,
                     )
                     return
                 }
 
-                val musicFile = java.io.File(url)
-                if (!musicFile.exists() || !musicFile.canRead()) {
-                    result.error("FILE_UNREADABLE", "music track \"$trackId\" url is not readable: $url", null)
+                val addedAudioFile = java.io.File(url)
+                if (!addedAudioFile.exists() || !addedAudioFile.canRead()) {
+                    result.error("FILE_UNREADABLE", "$role track \"$trackId\" url is not readable: $url", null)
                     return
                 }
 
-                pendingMusicConfig = AndroidEditorAddedAudioTrackConfig(
-                    trackId = trackId,
-                    sourcePath = url,
-                    durationUs = (duration * 1_000_000.0).toLong(),
-                    sourceTrimStartUs = (sourceTrimStart * 1_000_000.0).toLong(),
-                    trackStartUs = (startTime * 1_000_000.0).toLong(),
-                    effectiveGain = volume * mixGain,
+                pendingAddedAudioConfigs.add(
+                    AndroidEditorAddedAudioTrackConfig(
+                        trackId = trackId,
+                        sourcePath = url,
+                        durationUs = (duration * 1_000_000.0).toLong(),
+                        sourceTrimStartUs = (sourceTrimStart * 1_000_000.0).toLong(),
+                        trackStartUs = (startTime * 1_000_000.0).toLong(),
+                        effectiveGain = volume * mixGain,
+                        role = role,
+                    ),
                 )
             }
         }
@@ -416,7 +436,7 @@ class AndroidEditorPlaybackCoordinator(
                     }
                 },
                 onTimelineEOS = { id ->
-                    pauseAddedAudioRuntimeIfActive(id)
+                    pauseAddedAudioRuntimesIfActive(id)
                     mainHandler.post {
                         channel.invokeMethod("onTimelineEOS", mapOf("textureId" to id))
                     }
@@ -453,8 +473,8 @@ class AndroidEditorPlaybackCoordinator(
                     val durationUs = (prepResult["durationUs"] as? Number)?.toLong() ?: 0L
                     val durationSeconds = durationUs / 1_000_000.0
 
-                    val musicConfig = pendingMusicConfig
-                    if (musicConfig == null) {
+                    val addedAudioConfigs = pendingAddedAudioConfigs
+                    if (addedAudioConfigs.isEmpty()) {
                         result.success(mapOf(
                             "textureId" to textureId,
                             "width" to width,
@@ -464,26 +484,35 @@ class AndroidEditorPlaybackCoordinator(
                         return@post
                     }
 
-                    val addedAudioRuntime = AndroidEditorAddedAudioPreviewRuntime(context, musicConfig)
-                    addedAudioRuntime.prepare {
-                        mainHandler.post {
-                            if (!attachAddedAudioRuntime(textureId, session, addedAudioRuntime)) {
-                                // disposeTimeline ran while added-audio prepare was in flight; it
-                                // already disposed the session/surface but never saw this runtime.
-                                addedAudioRuntime.release()
-                                result.error(
-                                    "TIMELINE_DISPOSED",
-                                    "timeline was disposed before prepare completed",
-                                    prepResult,
-                                )
-                                return@post
+                    val addedAudioRuntimes = addedAudioConfigs.map {
+                        AndroidEditorAddedAudioPreviewRuntime(context, it)
+                    }
+                    val remainingPrepares = AtomicInteger(addedAudioRuntimes.size)
+                    addedAudioRuntimes.forEach { runtime ->
+                        runtime.prepare {
+                            mainHandler.post {
+                                if (remainingPrepares.decrementAndGet() != 0) {
+                                    return@post
+                                }
+                                if (!attachAddedAudioRuntimes(textureId, session, addedAudioRuntimes)) {
+                                    // disposeTimeline ran while added-audio prepare was in flight;
+                                    // it already disposed the session/surface but never saw these
+                                    // runtimes.
+                                    addedAudioRuntimes.forEach { it.release() }
+                                    result.error(
+                                        "TIMELINE_DISPOSED",
+                                        "timeline was disposed before prepare completed",
+                                        prepResult,
+                                    )
+                                    return@post
+                                }
+                                result.success(mapOf(
+                                    "textureId" to textureId,
+                                    "width" to width,
+                                    "height" to height,
+                                    "durationSeconds" to durationSeconds,
+                                ))
                             }
-                            result.success(mapOf(
-                                "textureId" to textureId,
-                                "width" to width,
-                                "height" to height,
-                                "durationSeconds" to durationSeconds,
-                            ))
                         }
                     }
                 }
@@ -503,10 +532,10 @@ class AndroidEditorPlaybackCoordinator(
             mainHandler.post {
                 val pass = playResult["pass"] as? Boolean ?: false
                 if (pass) {
-                    entry.addedAudioRuntime?.play()
+                    entry.addedAudioRuntimes.forEach { it.play() }
                     result.success(null)
                 } else {
-                    entry.addedAudioRuntime?.pause()
+                    entry.addedAudioRuntimes.forEach { it.pause() }
                     val raw = playResult["raw"] as? String ?: "status=FAIL;reason=play_failed"
                     result.error("PLAY_FAILED", raw, playResult)
                 }
@@ -522,7 +551,7 @@ class AndroidEditorPlaybackCoordinator(
             result.error("NO_TIMELINE", "no active timeline session", null)
             return
         }
-        entry.addedAudioRuntime?.pause()
+        entry.addedAudioRuntimes.forEach { it.pause() }
         entry.session.pause { pauseResult ->
             mainHandler.post {
                 val pass = pauseResult["pass"] as? Boolean ?: false
@@ -554,23 +583,28 @@ class AndroidEditorPlaybackCoordinator(
         val resumeAfterSeek = args?.get("resumeAfterSeek") as? Boolean ?: false
 
         val targetPtsUs = (seconds * 1_000_000.0).toLong()
-        entry.addedAudioRuntime?.pause()
+        entry.addedAudioRuntimes.forEach { it.pause() }
         entry.session.seek(targetPtsUs, resumeAfterSeek = resumeAfterSeek) { seekResult ->
             mainHandler.post {
                 val pass = seekResult["pass"] as? Boolean ?: false
                 if (pass) {
-                    val runtime = entry.addedAudioRuntime
-                    if (runtime == null) {
+                    val runtimes = entry.addedAudioRuntimes
+                    if (runtimes.isEmpty()) {
                         result.success(null)
                     } else {
-                        runtime.seek(targetPtsUs, resumeAfterSeek) {
-                            mainHandler.post {
-                                result.success(null)
+                        val remainingSeeks = AtomicInteger(runtimes.size)
+                        runtimes.forEach { runtime ->
+                            runtime.seek(targetPtsUs, resumeAfterSeek) {
+                                mainHandler.post {
+                                    if (remainingSeeks.decrementAndGet() == 0) {
+                                        result.success(null)
+                                    }
+                                }
                             }
                         }
                     }
                 } else {
-                    // Session seek failed; leave the added-audio runtime paused (above) and
+                    // Session seek failed; leave the added-audio runtimes paused (above) and
                     // surface the existing session error.
                     val raw = seekResult["raw"] as? String ?: "status=FAIL;reason=seek_failed"
                     result.error("SEEK_FAILED", raw, seekResult)
@@ -606,32 +640,32 @@ class AndroidEditorPlaybackCoordinator(
     }
 
     /**
-     * Pauses [active]'s addedAudioRuntime under lock if it still refers to the given
+     * Pauses [active]'s addedAudioRuntimes under lock if it still refers to the given
      * [textureId] (i.e., this is still the active session and not one already replaced or
      * disposed). No-op if there is no active entry, the textureId no longer matches, or the
-     * active entry has no added runtime attached.
+     * active entry has no added runtimes attached.
      */
-    private fun pauseAddedAudioRuntimeIfActive(textureId: Long) {
-        val runtime = synchronized(lock) {
-            active?.takeIf { it.textureId == textureId }?.addedAudioRuntime
+    private fun pauseAddedAudioRuntimesIfActive(textureId: Long) {
+        val runtimes = synchronized(lock) {
+            active?.takeIf { it.textureId == textureId }?.addedAudioRuntimes ?: emptyList()
         }
-        runtime?.pause()
+        runtimes.forEach { it.pause() }
     }
 
     /**
-     * Attaches [runtime] to [active] under lock if it still refers to the given [textureId] /
+     * Attaches [runtimes] to [active] under lock if it still refers to the given [textureId] /
      * [session] pair. Returns true if attached, false if the entry was already
-     * disposed/replaced by someone else (in which case the caller must release [runtime] itself).
+     * disposed/replaced by someone else (in which case the caller must release [runtimes] itself).
      */
-    private fun attachAddedAudioRuntime(
+    private fun attachAddedAudioRuntimes(
         textureId: Long,
         session: AndroidEditorSequentialPlaybackSession,
-        runtime: AndroidEditorAddedAudioPreviewRuntime,
+        runtimes: List<AndroidEditorAddedAudioPreviewRuntime>,
     ): Boolean {
         return synchronized(lock) {
             val current = active
             if (current != null && current.textureId == textureId && current.session === session) {
-                active = current.copy(addedAudioRuntime = runtime)
+                active = current.copy(addedAudioRuntimes = runtimes)
                 true
             } else {
                 false
@@ -675,13 +709,18 @@ class AndroidEditorPlaybackCoordinator(
             }
         }
 
-        val addedAudioRuntime = entry.addedAudioRuntime
-        if (addedAudioRuntime == null) {
+        val addedAudioRuntimes = entry.addedAudioRuntimes
+        if (addedAudioRuntimes.isEmpty()) {
             disposeSessionAndSurface()
         } else {
-            addedAudioRuntime.release {
-                mainHandler.post {
-                    disposeSessionAndSurface()
+            val remainingReleases = AtomicInteger(addedAudioRuntimes.size)
+            addedAudioRuntimes.forEach { runtime ->
+                runtime.release {
+                    mainHandler.post {
+                        if (remainingReleases.decrementAndGet() == 0) {
+                            disposeSessionAndSurface()
+                        }
+                    }
                 }
             }
         }
