@@ -19,6 +19,7 @@ import com.connects.vanguard_media_engine.audio_recording.AndroidAudioRecordingC
 import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCameraGraphTransactionCoordinator
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidAudioDecodeBridgeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidConcurrentDecodeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoordinator
@@ -90,6 +91,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
     // ── P2-CPP-PASSTHROUGH: native passthrough remux sink smoke coordinator ───
     private var passthroughRemuxSinkSmokeCoordinator: AndroidPassthroughRemuxSinkSmokeCoordinator? = null
+
+    // ── P2-AUDIO-DEC-BRIDGE: native decoded-PCM audio source bridge smoke ─────
+    private var audioDecodeBridgeSmokeCoordinator: AndroidAudioDecodeBridgeSmokeCoordinator? = null
 
     // ── Phase 3-Unit T: Android OS thermal listener lifecycle bridge ──────────
     private var thermalStateBridge: AndroidThermalStateBridge? = null
@@ -233,6 +237,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         passthroughRemuxSinkSmokeCoordinator = AndroidPassthroughRemuxSinkSmokeCoordinator(
             mainHandler = mainHandler,
         )
+        audioDecodeBridgeSmokeCoordinator = AndroidAudioDecodeBridgeSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
         editorExportCoordinator = AndroidEditorExportCoordinator(
             context     = binding.applicationContext,
             channel     = channel,
@@ -369,6 +376,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android GLES texture smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidAudioDecodeBridgeSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = audioDecodeBridgeSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android audio decode bridge smoke coordinator unavailable", null)
             }
             return
         }
@@ -1658,6 +1675,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         dagDiagnosticsCoordinator = null
         concurrentDecodeSmokeCoordinator = null
         passthroughRemuxSinkSmokeCoordinator = null
+        audioDecodeBridgeSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.
         editorExportCoordinator?.disposeAll()

@@ -481,6 +481,37 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
+    // ── P2-AUDIO-DEC-BRIDGE: bounded native decoded-PCM audio source bridge ─
+    // foundation. Kotlin remains the sole owner of MediaExtractor/MediaCodec
+    // OS audio decoding; native only receives already-decoded 16-bit
+    // interleaved PCM chunks over a direct java.nio.ByteBuffer and
+    // validates/accumulates them as a DAG audio source boundary for future
+    // native C++ audio nodes. No file IO, no production mixdown/export route
+    // changes.
+    external fun createAndroidDagPhase2AudioDecodeBridgeSession(
+        sourceNodeId: String,
+        sampleRate: Int,
+        channelCount: Int,
+        expectedFrameCount: Int,
+        timelineStartPtsUs: Long,
+    ): String
+
+    external fun ingestAndroidDagPhase2AudioDecodeBridgePcm(
+        sessionId: String,
+        pcm16Buffer: java.nio.ByteBuffer,
+        frameCount: Int,
+        bufferPtsUs: Long,
+        isEndOfStream: Boolean,
+    ): String
+
+    external fun validateAndroidDagPhase2AudioDecodeBridgeSession(
+        sessionId: String,
+    ): String
+
+    external fun destroyAndroidDagPhase2AudioDecodeBridgeSession(
+        sessionId: String,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
