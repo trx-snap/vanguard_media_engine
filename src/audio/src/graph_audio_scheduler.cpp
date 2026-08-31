@@ -2,6 +2,7 @@
 
 #include "vanguard/audio/decoded_audio_pcm_source_node.h"
 
+#include <limits>
 #include <utility>
 
 namespace vanguard {
@@ -12,7 +13,8 @@ const std::string GraphAudioScheduler::kEmptySourceId;
 GraphAudioScheduler::GraphAudioScheduler(
     const graph::Graph& graph,
     std::string targetMixNodeId,
-    const std::unordered_map<std::string, AudioSampleProvider*>& providers)
+    const std::unordered_map<std::string, AudioSampleProvider*>& providers,
+    const std::unordered_map<std::string, SourceMixParams>* mixParams)
     : graph_(graph),
       targetMixNodeId_(std::move(targetMixNodeId)),
       snapshotGeneration_(graph.generationId()) {
@@ -67,15 +69,26 @@ GraphAudioScheduler::GraphAudioScheduler(
         // Cache the source node once so renderWindow() can gate on
         // Node::isActiveAt without a per-window graph lookup.
         std::shared_ptr<graph::Node> fromNode = graph_.getNode(c.fromNodeId);
-        routedSources_.push_back(
-            RoutedSource{c.fromNodeId, std::move(fromNode), it->second});
+        RoutedSource routed{c.fromNodeId, std::move(fromNode), it->second};
+        // P4-AUDIO-SCHEDULER-ENVELOPE-WIRING: per-source static gain and
+        // non-owning envelope resolved once here; no entry keeps the
+        // unit-gain/null-envelope defaults.
+        if (mixParams != nullptr) {
+            auto paramsIt = mixParams->find(c.fromNodeId);
+            if (paramsIt != mixParams->end()) {
+                routed.gain     = paramsIt->second.gain;
+                routed.envelope = paramsIt->second.envelope;
+            }
+        }
+        routedSources_.push_back(std::move(routed));
     }
 }
 
 GraphAudioScheduler::GraphAudioScheduler(
     const graph::Graph& graph,
     std::string targetMixNodeId,
-    AutoDiscoverSourceProviders)
+    AutoDiscoverSourceProviders,
+    const std::unordered_map<std::string, SourceMixParams>* mixParams)
     : graph_(graph),
       targetMixNodeId_(std::move(targetMixNodeId)),
       snapshotGeneration_(graph.generationId()) {
@@ -133,7 +146,18 @@ GraphAudioScheduler::GraphAudioScheduler(
         if (routedSources_.size() >= kMaxRoutedTracks) {
             break; // Bounded by the mix bus's own track-count ceiling.
         }
-        routedSources_.push_back(RoutedSource{c.fromNodeId, fromNode, provider});
+        RoutedSource routed{c.fromNodeId, fromNode, provider};
+        // P4-AUDIO-SCHEDULER-ENVELOPE-WIRING: mix params stay keyed by
+        // source node id even under auto-discovery; the node itself stores
+        // no envelope.
+        if (mixParams != nullptr) {
+            auto paramsIt = mixParams->find(c.fromNodeId);
+            if (paramsIt != mixParams->end()) {
+                routed.gain     = paramsIt->second.gain;
+                routed.envelope = paramsIt->second.envelope;
+            }
+        }
+        routedSources_.push_back(std::move(routed));
     }
 }
 
@@ -176,6 +200,20 @@ GraphAudioScheduler::SchedulerResult GraphAudioScheduler::renderWindow(
         return SchedulerResult::kInsufficientCapacity;
     }
 
+    // P4-AUDIO-SCHEDULER-ENVELOPE-WIRING: windowPtsUs is the scheduler-owned
+    // window origin stamped into every MixTrack.envelopeStartPtsUs (int64).
+    // Guard both the uint64 multiplication inside ComputeWindowPtsUs and the
+    // int64 cast, failing closed before any provider call or output
+    // mutation. startFrame is already known non-negative here.
+    if (static_cast<uint64_t>(startFrame) >
+        std::numeric_limits<uint64_t>::max() / 1000000ULL) {
+        return SchedulerResult::kWindowPtsOverflow;
+    }
+    const uint64_t windowPtsUs = ComputeWindowPtsUs(startFrame, sampleRate_);
+    if (windowPtsUs > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return SchedulerResult::kWindowPtsOverflow;
+    }
+
     if (routedSources_.empty()) {
         for (int64_t i = 0; i < requiredOutputSamples; ++i) {
             outPcm[i] = 0;
@@ -188,8 +226,6 @@ GraphAudioScheduler::SchedulerResult GraphAudioScheduler::renderWindow(
         }
         return SchedulerResult::kSilence;
     }
-
-    const uint64_t windowPtsUs = ComputeWindowPtsUs(startFrame, sampleRate_);
 
     size_t mixTracksUsed = 0;
     size_t routedIndex   = 0;
@@ -236,12 +272,17 @@ GraphAudioScheduler::SchedulerResult GraphAudioScheduler::renderWindow(
             continue;
         }
 
+        // Every MixTrack field is (re)populated on every use: the scratch
+        // descriptors are reused across windows and must never leak a stale
+        // gain/envelope from a previous window's track assignment.
         AudioMixBusNode::MixTrack& track = mixTracksScratch_[mixTracksUsed];
-        track.pcm          = buffer.pcm;
-        track.frameCount   = buffer.framesWritten;
-        track.sampleRate   = sampleRate_;
-        track.channelCount = channelCount_;
-        track.gain         = 1.0; // Unit gain: scheduler exposes no gain API.
+        track.pcm                = buffer.pcm;
+        track.frameCount         = buffer.framesWritten;
+        track.sampleRate         = sampleRate_;
+        track.channelCount       = channelCount_;
+        track.gain               = routed.gain;
+        track.envelope           = routed.envelope;
+        track.envelopeStartPtsUs = static_cast<int64_t>(windowPtsUs);
         ++mixTracksUsed;
     }
 
@@ -274,11 +315,15 @@ GraphAudioScheduler::SchedulerResult GraphAudioScheduler::renderWindow(
     }
 
     if (outResult != nullptr) {
-        outResult->framesRendered   = mixOutput.framesMixed;
-        outResult->checksum         = mixOutput.checksum;
-        outResult->routedTrackCount = mixTracksUsed;
-        outResult->mixCalled        = true;
-        outResult->silence          = false;
+        outResult->framesRendered      = mixOutput.framesMixed;
+        outResult->checksum            = mixOutput.checksum;
+        outResult->routedTrackCount    = mixTracksUsed;
+        outResult->mixCalled           = true;
+        outResult->silence             = false;
+        outResult->envelopeApplied     = mixOutput.envelopeApplied;
+        outResult->minEffectiveGain    = mixOutput.minEffectiveGain;
+        outResult->maxEffectiveGain    = mixOutput.maxEffectiveGain;
+        outResult->envelopeEvaluations = mixOutput.envelopeEvaluations;
     }
 
     return SchedulerResult::kOk;

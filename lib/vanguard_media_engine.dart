@@ -92,6 +92,8 @@ export 'vg_multi_source_node_owned_pipeline_smoke.dart';
 export 'vg_aaudio_node_owned_sink_smoke.dart';
 // P4-AUDIO-MIXBUS-TIMELINE-OWNERSHIP: Android True-DAG Phase 4 AudioMixBusNode timeline-aware per-frame volume envelope diagnostic smoke foundation.
 export 'vg_audio_mixbus_timeline_smoke.dart';
+// P4-AUDIO-SCHEDULER-ENVELOPE-WIRING: Android True-DAG Phase 4 GraphAudioScheduler per-source static-gain/envelope wiring diagnostic smoke foundation.
+export 'vg_audio_scheduler_envelope_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.

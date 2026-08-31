@@ -1,4 +1,5 @@
 #pragma once
+#include "vanguard/audio/audio_gain_envelope.h"
 #include "vanguard/audio/audio_mix_bus_node.h"
 #include "vanguard/audio/audio_sample_provider.h"
 #include "vanguard/core/status.h"
@@ -58,6 +59,22 @@ struct AutoDiscoverSourceProviders {
 // with zeroed output, unchanged. Each routed source's node shared_ptr is
 // cached at construction; renderWindow() never calls Graph::getNode().
 //
+// P4-AUDIO-SCHEDULER-ENVELOPE-WIRING: both constructors accept an optional
+// non-owning per-source mix-params map (static gain + AudioGainEnvelope
+// pointer, keyed by source node id) resolved once at construction into each
+// RoutedSource. The scheduler owns no envelope: it copies the static gain
+// value and stores the non-owning envelope pointer, so callers must keep
+// every referenced envelope alive for all renderWindow() calls (the params
+// map itself is only read during construction). Every renderWindow() then
+// populates each MixTrack's gain/envelope and stamps
+// envelopeStartPtsUs = windowPtsUs (the scheduler-owned window origin) so
+// AudioMixBusNode owns the per-frame gain math. A null params map, or a
+// source with no entry, keeps static gain 1.0 with a null envelope —
+// bit-identical to the prior unit-gain scheduler output. Because
+// windowPtsUs crosses into int64 envelopeStartPtsUs, a window whose derived
+// pts cannot fit positive int64 fails closed with kWindowPtsOverflow before
+// any provider call or output mutation.
+//
 // All scratch (per-track PCM windows, MixTrack descriptors) is preallocated
 // in the constructor from the target AudioMixBusNode's maxFramesPerMix(),
 // channelCount(), and the fixed AudioMixBusNode::kMaxTrackCount bound.
@@ -77,6 +94,17 @@ public:
         kProviderMissing,        // a resolved route has no live provider pointer
         kProviderError,          // a routed provider's provide() returned a non-ok Status
         kMixFailure,             // AudioMixBusNode::mix() returned a non-kOk MixResult
+        // Appended (P4-AUDIO-SCHEDULER-ENVELOPE-WIRING); never reorder the
+        // enumerators above.
+        kWindowPtsOverflow,      // derived windowPtsUs cannot fit positive int64; output untouched
+    };
+
+    // P4-AUDIO-SCHEDULER-ENVELOPE-WIRING: per-source static mix params.
+    // Non-owning: the envelope (when non-null) must outlive every
+    // renderWindow() call on the scheduler that received it.
+    struct SourceMixParams {
+        double                   gain{1.0};
+        const AudioGainEnvelope* envelope{nullptr};
     };
 
     struct SchedulerOutput {
@@ -85,14 +113,29 @@ public:
         size_t   routedTrackCount{0};
         bool     mixCalled{false};
         bool     silence{false};
+        // P4-AUDIO-SCHEDULER-ENVELOPE-WIRING: AudioMixBusNode::MixOutput
+        // envelope metrics propagated verbatim from the mix() call; all
+        // zero when mix() was not called (silence) or mixed no
+        // envelope-bearing track.
+        bool     envelopeApplied{false};
+        double   minEffectiveGain{0.0};
+        double   maxEffectiveGain{0.0};
+        int64_t  envelopeEvaluations{0};
     };
 
     // `graph` and every provider pointer in `providers` must outlive this
     // scheduler. `providers` maps a source node id to a non-owning
     // AudioSampleProvider*; scheduler never takes ownership.
+    // P4-AUDIO-SCHEDULER-ENVELOPE-WIRING: `mixParams` (optional, non-owning,
+    // keyed by source node id) supplies per-source static gain/envelope
+    // only; the providers map stays authoritative for routing. The map is
+    // read only during construction (gain copied, envelope pointer stored),
+    // but every non-null envelope must outlive all renderWindow() calls.
+    // Sources without an entry keep static gain 1.0 / null envelope.
     GraphAudioScheduler(const graph::Graph& graph,
                         std::string targetMixNodeId,
-                        const std::unordered_map<std::string, AudioSampleProvider*>& providers);
+                        const std::unordered_map<std::string, AudioSampleProvider*>& providers,
+                        const std::unordered_map<std::string, SourceMixParams>* mixParams = nullptr);
 
     // P4-AUDIO-DECODER-SOURCE-NODE-WIRING: tag-dispatched auto-discovery
     // overload. Instead of an external provider map, routing walks
@@ -105,9 +148,15 @@ public:
     // mirroring the map constructor's unregistered-provider behavior. The
     // scheduler still owns nothing: the graph and every discovered node
     // (and thus its provider) must outlive this scheduler.
+    // P4-AUDIO-SCHEDULER-ENVELOPE-WIRING: `mixParams` behaves exactly as on
+    // the provider-map constructor (per-source static gain/envelope, keyed
+    // by source node id, resolved once at construction); the provider still
+    // comes from DecodedAudioPcmSourceNode::audioSampleProvider() and the
+    // node itself stores no envelope.
     GraphAudioScheduler(const graph::Graph& graph,
                         std::string targetMixNodeId,
-                        AutoDiscoverSourceProviders);
+                        AutoDiscoverSourceProviders,
+                        const std::unordered_map<std::string, SourceMixParams>* mixParams = nullptr);
 
     // Derives the graph/timeline-gating pts for a frame cursor position:
     // ptsUs = floor(startFrame * 1000000 / sampleRate), computed purely with
@@ -144,6 +193,11 @@ private:
         // Node::isActiveAt without a per-window Graph::getNode() lookup.
         std::shared_ptr<graph::Node> node;
         AudioSampleProvider*         provider{nullptr};
+        // P4-AUDIO-SCHEDULER-ENVELOPE-WIRING: resolved once at construction
+        // from the optional mix-params map. `envelope` is non-owning; the
+        // caller keeps it alive across every renderWindow() call.
+        double                       gain{1.0};
+        const AudioGainEnvelope*     envelope{nullptr};
     };
 
     static constexpr size_t kMaxRoutedTracks = AudioMixBusNode::kMaxTrackCount;

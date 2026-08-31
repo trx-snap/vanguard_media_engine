@@ -26,6 +26,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidAudioGraphTopologyS
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioGraphTransportClockSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioMixBusSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioMixBusTimelineSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidAudioSchedulerEnvelopeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioRingBufferTransportSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioClockSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioDecoderRingWriterSmokeCoordinator
@@ -205,6 +206,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // per-frame volume envelope diagnostic smoke coordinator. Registration-only
     // glue mirroring the established one-shot diagnostic route wiring.
     private var audioMixBusTimelineSmokeCoordinator: AndroidAudioMixBusTimelineSmokeCoordinator? = null
+
+    // ── P4-AUDIO-SCHEDULER-ENVELOPE-WIRING: GraphAudioScheduler per-source ────
+    // static-gain/envelope wiring diagnostic smoke coordinator. Registration-only
+    // glue mirroring the established one-shot diagnostic route wiring.
+    private var audioSchedulerEnvelopeSmokeCoordinator: AndroidAudioSchedulerEnvelopeSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -416,6 +422,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         audioMixBusTimelineSmokeCoordinator = AndroidAudioMixBusTimelineSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        audioSchedulerEnvelopeSmokeCoordinator = AndroidAudioSchedulerEnvelopeSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -761,6 +770,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android audio mix-bus timeline smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidAudioSchedulerEnvelopeSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = audioSchedulerEnvelopeSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android audio scheduler envelope smoke coordinator unavailable", null)
             }
             return
         }
@@ -2148,6 +2167,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // in-flight reply after detach.
         audioMixBusTimelineSmokeCoordinator?.disposeAll()
         audioMixBusTimelineSmokeCoordinator = null
+        // P4-AUDIO-SCHEDULER-ENVELOPE-WIRING: the native route is one-shot
+        // and stack-scoped (no OS resource); dispose only drops any
+        // in-flight reply after detach.
+        audioSchedulerEnvelopeSmokeCoordinator?.disposeAll()
+        audioSchedulerEnvelopeSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.

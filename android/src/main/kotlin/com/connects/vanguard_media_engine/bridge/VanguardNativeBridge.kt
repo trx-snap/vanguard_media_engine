@@ -1279,6 +1279,23 @@ class VanguardNativeBridge(
     // streaming/cache, no iOS, no product/editor UI.
     external fun runAudioMixBusTimelineNativeSmoke(): String
 
+    // ── P4-AUDIO-SCHEDULER-ENVELOPE-WIRING: GraphAudioScheduler per-source gain/envelope wiring diagnostic ─
+    // One-shot, stack-scoped, single-threaded, synchronous native proof that
+    // GraphAudioScheduler resolves an optional non-owning per-source
+    // SourceMixParams map (static gain + AudioGainEnvelope pointer, keyed by
+    // source node id) once at construction, populates every
+    // AudioMixBusNode::MixTrack with that gain/envelope plus the
+    // scheduler-owned window origin (envelopeStartPtsUs = windowPtsUs), and
+    // propagates the mix-bus envelope metrics into SchedulerOutput; no
+    // params entry stays bit-identical to the prior unit-gain scheduler
+    // output, and a window pts that cannot fit positive int64 fails closed.
+    // Honest boundary: diagnostic only — no production mixdown change, no
+    // export/pass-2 reroute, no runtime queue, no backpressure, no realtime
+    // sink, no AudioTrack/AAudio/OpenSL/Oboe, no MediaCodec/MediaExtractor,
+    // no file IO, no native worker threads, no app/editor/product, no
+    // streaming/cache, no iOS.
+    external fun runAndroidDagPhase4AudioSchedulerEnvelopeSmoke(): String
+
     // ── P3-CAM-CONCURRENT: Camera2 dual-camera concurrent PRIVATE AHardwareBuffer ─
     // ingest validation diagnostic. Kotlin remains the sole owner of Camera2
     // device/session lifecycle (CameraManager.openCamera, CameraCaptureSession);
