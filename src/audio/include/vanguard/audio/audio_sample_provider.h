@@ -30,14 +30,23 @@ struct AudioWindowBuffer {
 
 // Synchronous, non-realtime, non-owning PCM window provider contract.
 //
-// Non-claims: this is not realtime clock ownership and not a queue.
-// Implementations must not use threads, locks, ring buffers, queues,
-// backpressure, file IO, or Android audio APIs (AudioTrack/AAudio/
-// OpenSL/Oboe/MediaCodec/MediaExtractor). provide() is called
-// synchronously on the caller's own thread; a realtime-safe implementation
-// must not allocate inside provide(), though bounded diagnostic-only
-// implementations (see VectorAudioSampleProvider) are explicitly exempt
-// since they are not production/realtime.
+// Non-claims: this is not realtime clock ownership. provide() is called
+// synchronously on the caller's own thread; this base class itself uses no
+// threads, file IO, or Android audio APIs (AudioTrack/AAudio/OpenSL/Oboe/
+// MediaCodec/MediaExtractor). Implementations differ in their own
+// contracts and must document which of these they are:
+//   - Bounded, diagnostic-only, replayable implementations (see
+//     VectorAudioSampleProvider) may allocate/retain state freely, since
+//     they are not production/realtime and support rewind via provide().
+//   - Diagnostic-only, stateful/sequential implementations backed by a
+//     lock-free ring buffer (see RingBufferAudioSampleProvider) are
+//     destructive FIFO: rewind via provide() fails closed, and
+//     repositioning is only available through an explicit seek-epoch
+//     handshake on the underlying ring buffer, not through provide()
+//     itself.
+// Any provide() implementation intended for a future realtime pull path
+// must not block, must not allocate, and must not acquire a lock inside
+// provide().
 class AudioSampleProvider {
 public:
     virtual ~AudioSampleProvider() = default;

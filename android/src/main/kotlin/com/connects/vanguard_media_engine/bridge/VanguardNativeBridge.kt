@@ -561,6 +561,15 @@ class VanguardNativeBridge(
     // product UI, streaming, or iOS.
     external fun runAndroidDagPhase4AudioGraphTransportClockSmoke(): String
 
+    // ── P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice B: native SPSC audio ring-buffer transport primitive + diagnostic provider adapter ─
+    // SPSC primitive + diagnostic provider only; no realtime/audible playback,
+    // no AudioTrack/AAudio/OpenSL/Oboe, no realtime clock ownership,
+    // no production decoder writer, no MediaCodec/MediaExtractor,
+    // no C++->Kotlin callback, no export reroute, no streaming/cache,
+    // no app/editor/product UI, no iOS, does not close P4-AUDIO-GRAPH-TRANSPORT-CLOCK
+    // or P4-AUDIO-MIXBUS.
+    external fun runAndroidDagPhase4AudioRingBufferTransportSmoke(): String
+
     // ── P3-CAM-CONCURRENT: Camera2 dual-camera concurrent PRIVATE AHardwareBuffer ─
     // ingest validation diagnostic. Kotlin remains the sole owner of Camera2
     // device/session lifecycle (CameraManager.openCamera, CameraCaptureSession);
