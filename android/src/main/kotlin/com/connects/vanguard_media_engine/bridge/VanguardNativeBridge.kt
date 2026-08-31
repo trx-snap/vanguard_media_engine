@@ -551,6 +551,16 @@ class VanguardNativeBridge(
     // Surface, GL, export/muxer, editor playback, or product UI.
     external fun runAndroidDagPhase4AudioGraphTopologySmoke(): String
 
+    // ── P4-AUDIO-GRAPH-TRANSPORT-CLOCK: synchronous graph-edge-routed audio window scheduler proof ─
+    // Pure in-memory C++ graph edge routing, exact frame window math, PTS derivation,
+    // microsecond drift prevention, timeline gating, mixed PCM checksum verification,
+    // silence windows, stale generation rejection, sample rate mismatch rejection,
+    // and capacity guard micro-proof. Stack-scoped, single-threaded, synchronous.
+    // No AudioTrack, AAudio, Oboe, realtime or audible playback, queues, backpressure,
+    // threads, files, MediaCodec, MediaExtractor, export reroute, editor playback,
+    // product UI, streaming, or iOS.
+    external fun runAndroidDagPhase4AudioGraphTransportClockSmoke(): String
+
     // ── P3-CAM-CONCURRENT: Camera2 dual-camera concurrent PRIVATE AHardwareBuffer ─
     // ingest validation diagnostic. Kotlin remains the sole owner of Camera2
     // device/session lifecycle (CameraManager.openCamera, CameraCaptureSession);

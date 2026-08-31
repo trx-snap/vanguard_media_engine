@@ -42,6 +42,13 @@ public:
 
     size_t edgeCount() const;
 
+    // Additive read-only accessor: returns every edge whose toNodeId matches
+    // `nodeId`, in deterministic edge-insertion order. Clears `out` first.
+    // Errors (leaving `out` empty) if `nodeId` is not present in the graph.
+    // Does not expose edges_ directly and never bumps generation.
+    core::Status inputConnections(const std::string& nodeId,
+                                  std::vector<Connection>& out) const;
+
     // Topology queries.
     bool         hasCycle() const;
     core::Status topologicalSort(std::vector<std::shared_ptr<Node>>& outOrder) const;

@@ -22,6 +22,7 @@ import com.connects.vanguard_media_engine.camera.AndroidCameraGraphTransactionCo
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioDecodeBridgeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioGraphTopologySmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidAudioGraphTransportClockSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioMixBusSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidConcurrentDecodeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
@@ -104,6 +105,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
     // ── P4-AUDIO-GRAPH-TOPOLOGY: native AudioMixBusNode DAG topology & gated mix smoke coordinator ────
     private var audioGraphTopologySmokeCoordinator: AndroidAudioGraphTopologySmokeCoordinator? = null
+
+    // ── P4-AUDIO-GRAPH-TRANSPORT-CLOCK: native graph-edge-routed audio window scheduler smoke coordinator ────
+    private var audioGraphTransportClockSmokeCoordinator: AndroidAudioGraphTransportClockSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -261,6 +265,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         audioGraphTopologySmokeCoordinator = AndroidAudioGraphTopologySmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        audioGraphTransportClockSmokeCoordinator = AndroidAudioGraphTransportClockSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -436,6 +443,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android audio graph topology smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidAudioGraphTransportClockSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = audioGraphTransportClockSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android audio graph transport clock smoke coordinator unavailable", null)
             }
             return
         }

@@ -178,6 +178,21 @@ size_t Graph::edgeCount() const {
     return edges_.size();
 }
 
+core::Status Graph::inputConnections(const std::string& nodeId,
+                                     std::vector<Connection>& out) const {
+    out.clear();
+    if (!getNode(nodeId)) {
+        return core::Status(core::StatusCode::kError,
+                            "inputConnections: node not found: " + nodeId);
+    }
+    for (const auto& c : edges_) {
+        if (c.toNodeId == nodeId) {
+            out.push_back(c);
+        }
+    }
+    return core::Status::OK();
+}
+
 // ---------------------------------------------------------------------------
 // Topology
 // ---------------------------------------------------------------------------
