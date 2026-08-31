@@ -218,22 +218,30 @@ class AndroidNodeOwnedAudioSourceGraphPipelineSmokeCoordinator(
                 if (SystemClock.elapsedRealtime() > deadline) throw FailClosed("deadline_exceeded")
             }
 
+            // The node's isActiveAt timeline window spans exactly
+            // expectedFrameCount frames, so it must cover every dispatched
+            // window plus the tail (tailFrames = mfpm/2+1 <= mfpm) or the
+            // scheduler timeline-gates the source into silence.
+            val expectedFrameCount =
+                (config.preSeekWindows + config.postSeekWindows + 1) * config.maxFramesPerMix
+
             // ── Lifecycle lane part 1: fail-closed construction validation ──
             // (invalid ring capacity must be rejected by the node-owned
             // AudioSpscAudioRingBuffer construction path, invalid channel
             // count by the shared 5-arg validation path).
             if (VanguardNativeBridge.createNodeOwnedAudioSourceGraphPipelineSmokeSession(
-                    sr, ch, 100, config.outputRingCapacityFrames, config.maxFramesPerMix) != 0L
+                    sr, ch, expectedFrameCount, 100,
+                    config.outputRingCapacityFrames, config.maxFramesPerMix) != 0L
             ) throw FailClosed("non_power_of_two_ring_session_not_rejected")
             if (VanguardNativeBridge.createNodeOwnedAudioSourceGraphPipelineSmokeSession(
-                    sr, 3, config.sourceRingCapacityFrames,
+                    sr, 3, expectedFrameCount, config.sourceRingCapacityFrames,
                     config.outputRingCapacityFrames, config.maxFramesPerMix) != 0L
             ) throw FailClosed("invalid_channel_count_session_not_rejected")
             t.invalidCreateRejectedOk = true
 
             // ── Create ──────────────────────────────────────────────────────
             handle = VanguardNativeBridge.createNodeOwnedAudioSourceGraphPipelineSmokeSession(
-                sr, ch, config.sourceRingCapacityFrames,
+                sr, ch, expectedFrameCount, config.sourceRingCapacityFrames,
                 config.outputRingCapacityFrames, config.maxFramesPerMix,
             )
             if (handle == 0L) throw FailClosed("native_session_create_failed")

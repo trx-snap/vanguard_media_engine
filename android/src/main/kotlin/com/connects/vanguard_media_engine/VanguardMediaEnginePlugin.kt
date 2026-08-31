@@ -40,6 +40,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidMultiCamCompositorS
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiSourceAudioGraphPipelineSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiSourceAudioTrackPlaybackSinkCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioSourceGraphPipelineSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioSourceRealDecoderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidPassthroughRemuxSinkSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
@@ -171,6 +172,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // oversized plugin is deferred because this slice only mirrors the
     // established diagnostic route wiring.
     private var nodeOwnedAudioSourceGraphPipelineSmokeCoordinator: AndroidNodeOwnedAudioSourceGraphPipelineSmokeCoordinator? = null
+
+    // ── P4-AUDIO-REAL-DECODER-NODE-OWNED-PIPELINE: real MediaExtractor/MediaCodec decoder to node-owned-source audio graph pipeline smoke coordinator ────
+    // Registration-only glue; cohesive coordinator extraction from this
+    // oversized plugin is deferred because this slice only mirrors the
+    // established diagnostic route wiring.
+    private var nodeOwnedAudioSourceRealDecoderSmokeCoordinator: AndroidNodeOwnedAudioSourceRealDecoderSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -367,6 +374,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         nodeOwnedAudioSourceGraphPipelineSmokeCoordinator = AndroidNodeOwnedAudioSourceGraphPipelineSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        nodeOwnedAudioSourceRealDecoderSmokeCoordinator = AndroidNodeOwnedAudioSourceRealDecoderSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -662,6 +672,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android node-owned audio source graph pipeline smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidNodeOwnedAudioSourceRealDecoderSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = nodeOwnedAudioSourceRealDecoderSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android node-owned audio source real decoder pipeline smoke coordinator unavailable", null)
             }
             return
         }
@@ -2020,6 +2040,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // its own thread and destroys its own native session.
         nodeOwnedAudioSourceGraphPipelineSmokeCoordinator?.disposeAll()
         nodeOwnedAudioSourceGraphPipelineSmokeCoordinator = null
+        // P4-AUDIO-REAL-DECODER-NODE-OWNED-PIPELINE: stop replying before
+        // dropping; an in-flight real-decoder node-owned run finishes
+        // naturally on its own thread and destroys its own native session.
+        nodeOwnedAudioSourceRealDecoderSmokeCoordinator?.disposeAll()
+        nodeOwnedAudioSourceRealDecoderSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.

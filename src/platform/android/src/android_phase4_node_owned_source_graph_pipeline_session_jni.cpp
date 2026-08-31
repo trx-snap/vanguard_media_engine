@@ -214,6 +214,7 @@ struct NodeOwnedPipelineSession {
 
     NodeOwnedPipelineSession(int32_t sampleRateIn,
                              int32_t channelCountIn,
+                             int64_t expectedFrameCountIn,
                              int64_t sourceRingCapacityFrames,
                              int64_t outputRingCapacityFrames,
                              int64_t maxFramesPerMixIn)
@@ -221,7 +222,7 @@ struct NodeOwnedPipelineSession {
           mixBus(std::make_shared<AudioMixBusNode>(
               kMixNodeId, sampleRateIn, channelCountIn, maxFramesPerMixIn)),
           sourceNode(std::make_shared<DecodedAudioPcmSourceNode>(
-              kSourceNodeId, sampleRateIn, channelCountIn, /*expectedFrameCount=*/4800,
+              kSourceNodeId, sampleRateIn, channelCountIn, expectedFrameCountIn,
               /*timelineStartPtsUs=*/0, sourceRingCapacityFrames)),
           outputRing(sampleRateIn, channelCountIn, outputRingCapacityFrames),
           scheduler(PrepareTopology(graphTopology, mixBus, sourceNode),
@@ -280,16 +281,23 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
     jobject /* companion */,
     jint sampleRate,
     jint channelCount,
+    jint expectedFrameCount,
     jint sourceRingCapacityFrames,
     jint outputRingCapacityFrames,
     jint maxFramesPerMix) {
 
-    const int64_t srcCap = static_cast<int64_t>(sourceRingCapacityFrames);
-    const int64_t outCap = static_cast<int64_t>(outputRingCapacityFrames);
-    const int64_t mfpm   = static_cast<int64_t>(maxFramesPerMix);
+    const int64_t expFrames = static_cast<int64_t>(expectedFrameCount);
+    const int64_t srcCap    = static_cast<int64_t>(sourceRingCapacityFrames);
+    const int64_t outCap    = static_cast<int64_t>(outputRingCapacityFrames);
+    const int64_t mfpm      = static_cast<int64_t>(maxFramesPerMix);
 
     if (sampleRate < 8000 || sampleRate > 192000) return 0;
     if (channelCount != 1 && channelCount != 2) return 0;
+    // Mirrors DecodedAudioPcmSourceNode's own (0, 10*sampleRate] bound so an
+    // out-of-range expected frame count fails closed as handle=0 here (the
+    // node constructor would throw the same rejection); no new semantic cap
+    // is introduced beyond the node's existing 10-second ceiling.
+    if (expFrames < 1 || expFrames > 10ll * static_cast<int64_t>(sampleRate)) return 0;
     if (mfpm < 1 || mfpm > 8192) return 0;
     if (!IsPowerOfTwoInRingRange(srcCap)) return 0;
     if (!IsPowerOfTwoInRingRange(outCap)) return 0;
@@ -301,7 +309,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
         session = std::make_shared<NodeOwnedPipelineSession>(
             static_cast<int32_t>(sampleRate),
             static_cast<int32_t>(channelCount),
-            srcCap, outCap, mfpm);
+            expFrames, srcCap, outCap, mfpm);
     } catch (...) {
         return 0;
     }

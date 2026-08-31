@@ -323,16 +323,21 @@ class VanguardNativeBridge(
 
         // Returns an opaque session handle, or 0 on invalid input
         // (sampleRate not in [8000, 192000], channelCount not in {1,2},
-        // maxFramesPerMix not in [1, 8192], ring capacities not powers of
-        // two in [64, 65536], outputRingCapacityFrames < maxFramesPerMix,
+        // expectedFrameCount not in [1, 10*sampleRate] — the node's own
+        // 10-second timeline-window ceiling, maxFramesPerMix not in
+        // [1, 8192], ring capacities not powers of two in [64, 65536],
+        // outputRingCapacityFrames < maxFramesPerMix,
         // sourceRingCapacityFrames < 2*maxFramesPerMix), when the
         // auto-discovered route did not resolve to exactly the one
         // node-owned source track, or when the 4-live-session registry cap
-        // is reached. sourceRingCapacityFrames is the node's explicit
+        // is reached. expectedFrameCount bounds the node's isActiveAt
+        // timeline window, so it must cover every frame the caller will
+        // dispatch; sourceRingCapacityFrames is the node's explicit
         // ringCapacityFrames constructor argument.
         external fun createNodeOwnedAudioSourceGraphPipelineSmokeSession(
             sampleRate: Int,
             channelCount: Int,
+            expectedFrameCount: Int,
             sourceRingCapacityFrames: Int,
             outputRingCapacityFrames: Int,
             maxFramesPerMix: Int,
