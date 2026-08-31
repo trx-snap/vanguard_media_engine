@@ -54,6 +54,19 @@ class AndroidMultiSourceAudioGraphPipelineNativeSession(
         val writerAvailableToWrite: Long,
     )
 
+    data class ReadReply(
+        val framesRead: Long,
+        val outputAvailableReadFrames: Long,
+        val seekAckConsumed: Boolean,
+        val discardedFramesOnSeek: Long,
+        val newStartFrame: Long,
+    )
+
+    data class TailStep(
+        val status: String,
+        val framesRendered: Long,
+    )
+
     companion object {
         private const val ANCHOR_SYS_TIME_NS = 1_000_000_000L
         // Matches the native per-call ingest clamp (AudioDecoderRingWriter
@@ -503,9 +516,196 @@ class AndroidMultiSourceAudioGraphPipelineNativeSession(
         return acceptedFrame
     }
 
+    // ── Sink-mode primitives (P4-AUDIO-MULTI-SOURCE-AUDIOTRACK-SINK) ────────
+    //
+    // Sub-slice K drains the output ring EXCLUSIVELY through readOutputPcm
+    // (including the maxFrames == 0 ack-only reads at start/seek):
+    // drainMultiSourceAudioGraphPipelineOutput is never called anywhere in a
+    // sink run, so the sink methods below never reuse the drain-embedding
+    // helpers above (startAndConsumeAck(), pumpWhileJointWindows(),
+    // flushTailAtEos(), the no-arg seekToAcceptedFrameBoundary()). The
+    // driver owns every read -> AudioTrack.write step.
+
+    // Sink-mode start: identical transport start to startAndConsumeAck()
+    // but the output-ring start ack is consumed through an ack-only
+    // readOutputPcm into [ackBuffer].
+    fun startAndConsumeAck(ackBuffer: ByteBuffer) {
+        anchorPtsUs = 0L
+        anchorSysNs = ANCHOR_SYS_TIME_NS
+        lastTickNs = anchorSysNs
+        localCursorFrame = 0L
+        val kv = parseNative(
+            VanguardNativeBridge.startMultiSourceAudioGraphPipeline(handle, 0L, anchorSysNs)
+        )
+        if (kv["status"] != "ok") throw Failure("start_status_${kv["status"]}")
+        val stepKv = stepRaw(anchorSysNs, flushTail = false)
+        if (stepKv["status"] != "awaiting_seek_ack") {
+            throw Failure("first_step_not_awaiting_seek_ack_${stepKv["status"]}")
+        }
+        readAckOnly(ackBuffer, expectedStartFrame = 0L)
+    }
+
+    // One non-tail joint dispatch attempt at the shared accepted-frame-axis
+    // tick; returns the status token so the sink caller routes dispatch_ok
+    // windows through its own read -> AudioTrack.write path.
+    fun stepJointWindow(): String {
+        val kv = stepRaw(tickForFrame(nativeNextDispatchFrame + mfpm), flushTail = false)
+        return kv["status"] ?: ""
+    }
+
+    // One joint tail-flush dispatch attempt (BOTH writers EOS required by
+    // native; identical residuals enforced there).
+    fun stepTailWindow(): TailStep {
+        val kv = stepRaw(tickForFrame(nativeNextDispatchFrame + mfpm), flushTail = true)
+        return TailStep(
+            status = kv["status"] ?: "",
+            framesRendered = longField(kv, "framesRendered"),
+        )
+    }
+
+    // Pops up to [maxFrames] frames into byte offset 0 of the caller's
+    // reused direct [sinkBuffer] through the sub-slice K JNI read entry
+    // point. A pending seek ack is consumed by native first; the caller
+    // states whether one is expected — a surprise ack (which would discard
+    // frames silently) or a missing expected ack fails closed.
+    fun readOutputPcm(
+        sinkBuffer: ByteBuffer,
+        maxFrames: Int,
+        expectSeekAck: Boolean = false,
+    ): ReadReply {
+        checkDeadline()
+        if (maxFrames < 0) throw Failure("read_invalid_max_frames")
+        val kv = parseNative(
+            VanguardNativeBridge.readMultiSourceAudioGraphPipelineOutputPcm16(
+                handle, sinkBuffer, maxFrames,
+            )
+        )
+        if (kv["status"] != "ok") throw Failure("read_status_${kv["status"]}")
+        val framesRead = longField(kv, "framesRead")
+        if (longField(kv, "bytesRead") != framesRead * bytesPerFrame) {
+            throw Failure("read_bytes_mismatch")
+        }
+        totalOutputFramesDrained = longField(kv, "totalOutputFramesDrained")
+        nativeOutputDrainChecksumHex = kv["nativeOutputDrainChecksumHex"] ?: ""
+        outputAvailableReadFrames = longField(kv, "outputAvailableReadFrames")
+        val ackConsumed = kv["seekAckConsumed"] == "true"
+        if (ackConsumed != expectSeekAck) {
+            throw Failure(
+                if (ackConsumed) "read_unexpected_seek_ack" else "read_seek_ack_missing"
+            )
+        }
+        return ReadReply(
+            framesRead = framesRead,
+            outputAvailableReadFrames = outputAvailableReadFrames,
+            seekAckConsumed = ackConsumed,
+            discardedFramesOnSeek = longField(kv, "discardedFramesOnSeek"),
+            newStartFrame = longField(kv, "newStartFrame"),
+        )
+    }
+
+    // Ack-only read (maxFrames = 0) after start/seek: the ack must land at
+    // [expectedStartFrame] with zero discards and zero frames read.
+    fun readAckOnly(sinkBuffer: ByteBuffer, expectedStartFrame: Long) {
+        val rr = readOutputPcm(sinkBuffer, 0, expectSeekAck = true)
+        if (rr.framesRead != 0L ||
+            rr.discardedFramesOnSeek != 0L ||
+            rr.newStartFrame != expectedStartFrame
+        ) {
+            throw Failure("ack_not_consumed_cleanly")
+        }
+    }
+
+    // Distinct pre-pause guard in the sink seek order: the shared accepted
+    // frame axis must be fully converged (both accepted totals, the drained
+    // output total, the local dispatch cursor, and the native dispatch
+    // cursor all on one frame) before the AudioTrack epoch closes.
+    fun verifySinkSeekBoundaryAlignment() {
+        val a = totalFramesAcceptedTrack0
+        if (a != totalFramesAcceptedTrack1 ||
+            a != totalOutputFramesDrained ||
+            a != localCursorFrame ||
+            a != nativeNextDispatchFrame
+        ) {
+            throw Failure("sink_seek_boundary_axis_mismatch")
+        }
+    }
+
+    // Sink-mode joint accepted-frame-axis seek (not media PTS), mirroring
+    // the no-arg seekToAcceptedFrameBoundary() but consuming the output
+    // ring ack through an ack-only readOutputPcm: with
+    // A = totalFramesAcceptedTrack0, the reply must re-anchor BOTH
+    // writers/providers at exactly A with zero discards, the first
+    // post-seek step must report awaiting_seek_ack, the ack-only read must
+    // land newStartFrame == A with zero discards, and the seek must clear
+    // both writer-local EOS flags. Returns A.
+    fun seekToAcceptedFrameBoundary(ackBuffer: ByteBuffer): Long {
+        val acceptedFrame = totalFramesAcceptedTrack0
+        if (acceptedFrame != totalFramesAcceptedTrack1) {
+            throw Failure("seek_boundary_track_axis_divergence")
+        }
+        if (acceptedFrame != totalOutputFramesDrained) {
+            throw Failure("seek_boundary_not_fully_drained")
+        }
+        if (acceptedFrame != localCursorFrame) throw Failure("seek_boundary_cursor_mismatch")
+        val seekPtsUs = ceilDiv(acceptedFrame * 1_000_000L, sampleRate.toLong())
+        // The tail-flush ticks overshoot the boundary tick, so anchor the
+        // seek at the monotonic maximum of the two (equality allowed).
+        val rawTick = anchorSysNs + (seekPtsUs - anchorPtsUs) * 1_000L
+        val seekSysNs = maxOf(rawTick, lastTickNs)
+        lastTickNs = seekSysNs
+        val kv = parseNative(
+            VanguardNativeBridge.seekMultiSourceAudioGraphPipeline(handle, seekPtsUs, seekSysNs)
+        )
+        if (kv["status"] != "ok") throw Failure("seek_status_${kv["status"]}")
+        if (longField(kv, "targetFrame") != acceptedFrame ||
+            longField(kv, "providerExpectedNextFrameTrack0") != acceptedFrame ||
+            longField(kv, "providerExpectedNextFrameTrack1") != acceptedFrame ||
+            longField(kv, "writerNextWriteFrameTrack0") != acceptedFrame ||
+            longField(kv, "writerNextWriteFrameTrack1") != acceptedFrame ||
+            longField(kv, "discardedFramesOnSeek") != 0L
+        ) {
+            throw Failure("seek_accepted_frame_axis_mismatch")
+        }
+        anchorPtsUs = seekPtsUs
+        anchorSysNs = seekSysNs
+        val stepKv = stepRaw(seekSysNs, flushTail = false)
+        if (stepKv["status"] != "awaiting_seek_ack") {
+            throw Failure("post_seek_step_not_awaiting_seek_ack_${stepKv["status"]}")
+        }
+        readAckOnly(ackBuffer, expectedStartFrame = acceptedFrame)
+        val snap = snapshot()
+        if (snap["writerEosTrack0"] != "false" || snap["writerEosTrack1"] != "false") {
+            throw Failure("seek_did_not_clear_writer_eos")
+        }
+        return acceptedFrame
+    }
+
     // ── Snapshot / probes / verdict helpers ─────────────────────────────────
 
     fun snapshotMetrics(): Map<String, String> = snapshot()
+
+    // Fail-closed no-fault sweep over the latest snapshot fold: any
+    // provider underrun/zero-fill/forward-skip/rewind-reject, coordinator
+    // silence window, ring-push shortfall, terminal latch, or still-pending
+    // seek ack fails with a distinct token.
+    fun verifyNoFaultCounters() {
+        if (providerUnderrunEventsTrack0 != 0L || providerUnderrunEventsTrack1 != 0L) {
+            throw Failure("provider_underrun_observed")
+        }
+        if (providerFramesZeroFilledTrack0 != 0L || providerFramesZeroFilledTrack1 != 0L) {
+            throw Failure("provider_zero_fill_observed")
+        }
+        if (providerForwardSkipFramesTrack0 != 0L || providerForwardSkipFramesTrack1 != 0L) {
+            throw Failure("provider_forward_skip_observed")
+        }
+        if (providerRewindRejectsTrack0 != 0L || providerRewindRejectsTrack1 != 0L) {
+            throw Failure("provider_rewind_reject_observed")
+        }
+        if (coordinatorSilenceCount != 0L) throw Failure("silence_window_observed")
+        if (ringPushShortfallSeen) throw Failure("ring_push_shortfall_observed")
+        if (snapshotTerminal) throw Failure("terminal_state_observed")
+        if (snapshotAwaitingSeekAck) throw Failure("seek_ack_still_pending")
+    }
 
     fun verifyZeroSteadyStateAllocation(snap: Map<String, String>): Boolean =
         dispatchCount >= MIN_STEADY_STATE_DISPATCHES &&

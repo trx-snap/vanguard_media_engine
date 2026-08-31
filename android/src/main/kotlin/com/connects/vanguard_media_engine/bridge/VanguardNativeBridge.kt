@@ -249,6 +249,20 @@ class VanguardNativeBridge(
             maxFrames: Int,
         ): String
 
+        // P4-AUDIO-MULTI-SOURCE-AUDIOTRACK-SINK (sub-slice K) output-ring
+        // reader: consumes a pending start/seek ack first, then pops up to
+        // maxFrames of mixed two-track PCM16 directly into the caller's
+        // direct ByteBuffer at byte offset 0 (single pop, no native
+        // scratch) so the same buffer can be handed to
+        // android.media.AudioTrack. maxFrames == 0 is a legal ack-only
+        // read. A single run must pop frames through exactly one of
+        // drain/read.
+        external fun readMultiSourceAudioGraphPipelineOutputPcm16(
+            sessionHandle: Long,
+            pcmBuffer: java.nio.ByteBuffer,
+            maxFrames: Int,
+        ): String
+
         // Forward-only joint seek. Requires a fully drained output ring,
         // both source rings empty, and the shared accepted-frame axis
         // intact (track_frame_axis_divergence otherwise); reanchors BOTH

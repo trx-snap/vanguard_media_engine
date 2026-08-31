@@ -38,6 +38,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoord
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiCamCompositorSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiSourceAudioGraphPipelineSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidMultiSourceAudioTrackPlaybackSinkCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidPassthroughRemuxSinkSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
@@ -157,6 +158,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // oversized plugin is deferred because this slice only mirrors the
     // established diagnostic route wiring.
     private var multiSourceAudioGraphPipelineSmokeCoordinator: AndroidMultiSourceAudioGraphPipelineSmokeCoordinator? = null
+
+    // ── P4-AUDIO-MULTI-SOURCE-AUDIOTRACK-SINK (P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice K): multi-source AudioTrack output sink smoke coordinator ────
+    // Registration-only glue; cohesive coordinator extraction from this
+    // oversized plugin is deferred because this slice only mirrors the
+    // established diagnostic route wiring.
+    private var multiSourceAudioTrackPlaybackSinkCoordinator: AndroidMultiSourceAudioTrackPlaybackSinkCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -347,6 +354,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         multiSourceAudioGraphPipelineSmokeCoordinator = AndroidMultiSourceAudioGraphPipelineSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        multiSourceAudioTrackPlaybackSinkCoordinator = AndroidMultiSourceAudioTrackPlaybackSinkCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -612,6 +622,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android AudioTrack output sink smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidMultiSourceAudioTrackPlaybackSinkCoordinator.ownsMethod(call.method)) {
+            val coord = multiSourceAudioTrackPlaybackSinkCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android multi-source AudioTrack output sink smoke coordinator unavailable", null)
             }
             return
         }
@@ -1970,6 +1990,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // codec/extractor and native session promptly; its reply is dropped.
         multiSourceAudioGraphPipelineSmokeCoordinator?.disposeAll()
         multiSourceAudioGraphPipelineSmokeCoordinator = null
+        // Sub-slice K: trips the driver cancellation flag so an in-flight
+        // multi-source sink run releases its AudioTrack, codec/extractor,
+        // and native session promptly; its reply is dropped.
+        multiSourceAudioTrackPlaybackSinkCoordinator?.disposeAll()
+        multiSourceAudioTrackPlaybackSinkCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.
