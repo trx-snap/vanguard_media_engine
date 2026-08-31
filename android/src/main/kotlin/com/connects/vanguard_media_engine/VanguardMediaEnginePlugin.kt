@@ -25,6 +25,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidAudioGraphTopologyS
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioGraphTransportClockSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioMixBusSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioRingBufferTransportSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidAudioClockSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidConcurrentDecodeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoordinator
@@ -112,6 +113,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
     // ── P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice B: native SPSC audio ring-buffer transport smoke coordinator ────
     private var audioRingBufferTransportSmokeCoordinator: AndroidAudioRingBufferTransportSmokeCoordinator? = null
+
+    // ── P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice C: platform-neutral native AudioClock smoke coordinator ────
+    private var audioClockSmokeCoordinator: AndroidAudioClockSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -275,6 +279,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         audioRingBufferTransportSmokeCoordinator = AndroidAudioRingBufferTransportSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        audioClockSmokeCoordinator = AndroidAudioClockSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -470,6 +477,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android audio ring buffer transport smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidAudioClockSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = audioClockSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android audio clock smoke coordinator unavailable", null)
             }
             return
         }
@@ -1780,6 +1797,8 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         concurrentDecodeSmokeCoordinator = null
         passthroughRemuxSinkSmokeCoordinator = null
         audioDecodeBridgeSmokeCoordinator = null
+        audioRingBufferTransportSmokeCoordinator = null
+        audioClockSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.

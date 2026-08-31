@@ -25,6 +25,7 @@ add_library(vanguard_audio STATIC
     "audio/src/graph_audio_scheduler.cpp"
     "audio/src/audio_ring_buffer.cpp"
     "audio/src/ring_buffer_audio_sample_provider.cpp"
+    "audio/src/audio_clock.cpp"
 )
 target_include_directories(vanguard_audio PUBLIC "audio/include")
 target_link_libraries(vanguard_audio PRIVATE vanguard_graph vanguard_core)
@@ -120,6 +121,7 @@ if (ANDROID)
     "platform/android/src/android_phase4_audio_graph_topology_jni.cpp"
     "platform/android/src/android_phase4_audio_graph_transport_jni.cpp"
     "platform/android/src/android_phase4_audio_ring_buffer_transport_jni.cpp"
+    "platform/android/src/android_phase4_audio_clock_jni.cpp"
     "platform/android/src/android_phase3_multicam_compositor_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_render_jni.cpp"
   )
