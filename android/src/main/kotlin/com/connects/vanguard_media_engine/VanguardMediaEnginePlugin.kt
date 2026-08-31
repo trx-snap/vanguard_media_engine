@@ -26,6 +26,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidAudioGraphTransport
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioMixBusSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioRingBufferTransportSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioClockSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidAudioDecoderRingWriterSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioTransportCoordinatorSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidConcurrentDecodeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
@@ -120,6 +121,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
     // ── P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice D: native ClockedAudioTransportCoordinator smoke coordinator ────
     private var audioTransportCoordinatorSmokeCoordinator: AndroidAudioTransportCoordinatorSmokeCoordinator? = null
+
+    // ── P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice E: native AudioDecoderRingWriter smoke coordinator ────
+    private var audioDecoderRingWriterSmokeCoordinator: AndroidAudioDecoderRingWriterSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -289,6 +293,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         audioTransportCoordinatorSmokeCoordinator = AndroidAudioTransportCoordinatorSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        audioDecoderRingWriterSmokeCoordinator = AndroidAudioDecoderRingWriterSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -504,6 +511,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android audio transport coordinator smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidAudioDecoderRingWriterSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = audioDecoderRingWriterSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android audio decoder ring writer smoke coordinator unavailable", null)
             }
             return
         }
