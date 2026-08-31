@@ -18,6 +18,57 @@ class VanguardNativeBridge(
         init {
             System.loadLibrary("vanguard_media_engine")
         }
+
+        // ── P4 True-DAG V4.3 sub-slice G1: audio decoder ring ingest diagnostic session core ─
+        // Native JNI session seam for the future real MediaCodec-to-
+        // AudioDecoderRingWriter ingest proof. Kotlin will remain the sole
+        // owner of MediaCodec/MediaExtractor; native only accepts
+        // already-decoded interleaved little-endian signed PCM16 handed
+        // across a direct java.nio.ByteBuffer (data starts at byte offset 0)
+        // and feeds it through AudioDecoderRingWriter into an
+        // AudioSpscAudioRingBuffer, then drains/verifies on the reader side.
+        // Every non-destroy call must run on the session's creating thread
+        // (native fails closed with status=wrong_owner_thread otherwise).
+        // No native worker threads, no AudioTrack/AAudio/OpenSL/Oboe, no
+        // realtime or audible playback, no file IO, no wall-clock reads.
+
+        // Returns an opaque session handle, or 0 on invalid input
+        // (sampleRate <= 0, channelCount not in {1,2}, ringCapacityFrames
+        // not a power of two in [64, 65536]) or when the 4-live-session
+        // registry cap is reached.
+        external fun createAudioDecoderRingIngestSmokeSession(
+            sampleRate: Int,
+            channelCount: Int,
+            ringCapacityFrames: Int,
+        ): Long
+
+        // Accepted frames are clamped to
+        // min(frameCount, 8192, framesThatFitInBuffer).
+        external fun ingestAudioDecoderRingPcm16(
+            sessionHandle: Long,
+            pcm: java.nio.ByteBuffer,
+            frameCount: Int,
+        ): String
+
+        external fun drainAudioDecoderRingIngestSession(
+            sessionHandle: Long,
+            maxFrames: Int,
+        ): String
+
+        external fun requestAudioDecoderRingIngestSeek(
+            sessionHandle: Long,
+            targetFrame: Long,
+        ): String
+
+        external fun setAudioDecoderRingIngestEos(
+            sessionHandle: Long,
+        ): String
+
+        // Idempotent erase-once; callable from any thread. Handle 0/unknown
+        // returns status=not_found.
+        external fun destroyAudioDecoderRingIngestSmokeSession(
+            sessionHandle: Long,
+        ): String
     }
 
     external fun probeCapabilities(): BackendCapabilityReport
