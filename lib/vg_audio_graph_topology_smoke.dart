@@ -10,7 +10,7 @@
 // graph-gated mix calculation, and invalid gain rejection.
 //
 // Honest non-claims:
-// - Proves DecodedAudioPcmSourceNode timeline gating and PTS mapping only; AudioMixBusNode remains always-active.
+// - Proves DecodedAudioPcmSourceNode timeline gating, PTS mapping, and GraphAudioScheduler renderWindow timeline gating only; AudioMixBusNode remains always-active.
 // - Does not claim audible or realtime audio playback.
 // - Does not claim C++ graph buffer transport / PCM transport; evaluatePlayhead moves no PCM.
 // - Does not claim AudioTrack integration.
@@ -108,6 +108,10 @@ class VGAudioGraphTopologySmokeReport {
   /// Whether DecodedAudioPcmSourceNode timeline PTS to local PTS mapping and defensive clamping succeeded.
   bool get audioPtsMappingOk => _boolMetric('audioPtsMappingOk');
 
+  /// Whether GraphAudioScheduler renderWindow timeline gating at active and inactive playheads succeeded.
+  bool get schedulerTimelineGatingOk =>
+      _boolMetric('schedulerTimelineGatingOk');
+
   /// Whether graph and node lifecycle tear-down succeeded cleanly.
   bool get lifecycleOk => _boolMetric('lifecycleOk');
 
@@ -173,6 +177,7 @@ class VGAudioGraphTopologySmokeReport {
       invalidGainOk &&
       audioTimelineGatingOk &&
       audioPtsMappingOk &&
+      schedulerTimelineGatingOk &&
       lifecycleOk &&
       stackScoped &&
       hasAudio &&

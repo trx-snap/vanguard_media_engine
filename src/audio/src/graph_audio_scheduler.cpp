@@ -64,7 +64,11 @@ GraphAudioScheduler::GraphAudioScheduler(
         if (routedSources_.size() >= kMaxRoutedTracks) {
             break; // Bounded by the mix bus's own track-count ceiling.
         }
-        routedSources_.push_back(RoutedSource{c.fromNodeId, it->second});
+        // Cache the source node once so renderWindow() can gate on
+        // Node::isActiveAt without a per-window graph lookup.
+        std::shared_ptr<graph::Node> fromNode = graph_.getNode(c.fromNodeId);
+        routedSources_.push_back(
+            RoutedSource{c.fromNodeId, std::move(fromNode), it->second});
     }
 }
 
@@ -129,7 +133,7 @@ GraphAudioScheduler::GraphAudioScheduler(
         if (routedSources_.size() >= kMaxRoutedTracks) {
             break; // Bounded by the mix bus's own track-count ceiling.
         }
-        routedSources_.push_back(RoutedSource{c.fromNodeId, provider});
+        routedSources_.push_back(RoutedSource{c.fromNodeId, fromNode, provider});
     }
 }
 
@@ -190,6 +194,15 @@ GraphAudioScheduler::SchedulerResult GraphAudioScheduler::renderWindow(
     size_t mixTracksUsed = 0;
     size_t routedIndex   = 0;
     for (const RoutedSource& routed : routedSources_) {
+        // P4-AUDIO-SCHEDULER-TIMELINE-GATING: a source node reporting
+        // inactive at this window's derived pts contributes no MixTrack,
+        // exactly like a silent provider — skipped before provider format
+        // checks and before provide(). A null cached node keeps the Node
+        // default (always active). mapTimelineToLocalPts is deliberately
+        // not consulted; the frame cursor stays authoritative.
+        if (routed.node != nullptr && !routed.node->isActiveAt(windowPtsUs)) {
+            continue;
+        }
         if (routed.provider == nullptr) {
             return SchedulerResult::kProviderMissing;
         }

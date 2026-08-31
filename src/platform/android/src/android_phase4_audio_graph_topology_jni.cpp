@@ -14,6 +14,13 @@
 // window. AudioMixBusNode and sink nodes remain always-active with
 // identity-mapped localPtsUs, inherited unchanged from Node's defaults.
 //
+// P4-AUDIO-SCHEDULER-TIMELINE-GATING: GraphAudioScheduler::renderWindow()
+// now consults each routed source node's isActiveAt at the window's derived
+// pts and skips inactive sources before provide() is called
+// (schedulerTimelineGatingOk lane). This proves scheduler-level gating, not
+// just Graph::evaluatePlayhead gating; mapTimelineToLocalPts is not used
+// and the frame cursor stays authoritative. No EOS/exhaustion semantics.
+//
 // This translation unit is Android-only and must NOT be included in iOS or
 // host builds. It is added via the Android-only target_sources block in
 // src/CMakeLists.txt.
@@ -36,6 +43,7 @@
 
 #include "vanguard/audio/audio_mix_bus_node.h"
 #include "vanguard/audio/decoded_audio_pcm_source_node.h"
+#include "vanguard/audio/graph_audio_scheduler.h"
 #include "vanguard/graph/frame_request.h"
 #include "vanguard/graph/graph.h"
 #include "vanguard/graph/node.h"
@@ -84,6 +92,52 @@ private:
     std::vector<vanguard::graph::PortDescriptor> outputPorts_;
 };
 
+// TU-local diagnostic provider: fills every requested frame with one
+// constant nonzero sample and counts provide() calls, so the
+// schedulerTimelineGatingOk lane can prove a timeline-inactive source's
+// provider is never consulted — a stray call would both bump the count and
+// poison the mix checksum/output with its distinct constant.
+class CountingConstantPcmProvider : public vanguard::audio::AudioSampleProvider {
+public:
+    CountingConstantPcmProvider(int32_t sampleRate, int32_t channelCount, int16_t sampleValue)
+        : sampleRate_(sampleRate), channelCount_(channelCount), sampleValue_(sampleValue) {}
+
+    int32_t sampleRate()   const override { return sampleRate_; }
+    int32_t channelCount() const override { return channelCount_; }
+
+    int provideCallCount() const { return provideCallCount_; }
+
+    vanguard::core::Status provide(const vanguard::audio::AudioWindowRequest& request,
+                                   vanguard::audio::AudioWindowBuffer& outBuffer) noexcept override {
+        ++provideCallCount_;
+        outBuffer.framesWritten = 0;
+        outBuffer.silent        = true;
+        if (outBuffer.pcm == nullptr || request.frameCount <= 0 ||
+            request.sampleRate != sampleRate_ || request.channelCount != channelCount_) {
+            return vanguard::core::Status(vanguard::core::StatusCode::kError,
+                                          "provide: invalid request");
+        }
+        const int64_t requiredSamples =
+            request.frameCount * static_cast<int64_t>(channelCount_);
+        if (outBuffer.capacitySamples < requiredSamples) {
+            return vanguard::core::Status(vanguard::core::StatusCode::kError,
+                                          "provide: insufficient capacity");
+        }
+        for (int64_t i = 0; i < requiredSamples; ++i) {
+            outBuffer.pcm[i] = sampleValue_;
+        }
+        outBuffer.framesWritten = request.frameCount;
+        outBuffer.silent        = false;
+        return vanguard::core::Status::OK();
+    }
+
+private:
+    int32_t sampleRate_;
+    int32_t channelCount_;
+    int16_t sampleValue_;
+    int     provideCallCount_{0};
+};
+
 std::string RunAudioGraphTopologySmokeInternal() {
 
     bool topologyOk = false;
@@ -98,6 +152,7 @@ std::string RunAudioGraphTopologySmokeInternal() {
     bool invalidGainOk = false;
     bool audioTimelineGatingOk = false;
     bool audioPtsMappingOk = false;
+    bool schedulerTimelineGatingOk = false;
     bool lifecycleOk = true;
     bool stackScoped = true;
 
@@ -525,10 +580,142 @@ std::string RunAudioGraphTopologySmokeInternal() {
         }
     }
 
+    // ── 12. schedulerTimelineGatingOk: GraphAudioScheduler::renderWindow consults
+    //        Node::isActiveAt per routed source at the window's derived pts. Both
+    //        sources stay routed at construction, but a timeline-inactive source is
+    //        skipped before provide(): its counting provider would otherwise bump
+    //        its call count and poison the checksum/output with a distinct nonzero
+    //        constant. An all-inactive window must preserve kSilence + zero output. ──
+    {
+        using SchedResult = vanguard::audio::GraphAudioScheduler::SchedulerResult;
+
+        vanguard::graph::Graph gateGraph;
+        auto gateActive = std::make_shared<vanguard::audio::DecodedAudioPcmSourceNode>(
+            "gate_active", 48000, 2, 4800, 0);      // timeline-active [0us, 100000us)
+        auto gateFuture = std::make_shared<vanguard::audio::DecodedAudioPcmSourceNode>(
+            "gate_future", 48000, 2, 4800, 500000); // timeline-active [500000us, 600000us)
+        auto gateMix = std::make_shared<vanguard::audio::AudioMixBusNode>("gate_mix", 48000, 2, 512);
+
+        const bool gateWiringOk =
+            gateGraph.addNode(gateActive).ok() &&
+            gateGraph.addNode(gateFuture).ok() &&
+            gateGraph.addNode(gateMix).ok() &&
+            gateGraph.connect("gate_active", "audio_out", "gate_mix", "primary_audio_in").ok() &&
+            gateGraph.connect("gate_future", "audio_out", "gate_mix", "secondary_audio_in").ok();
+
+        CountingConstantPcmProvider activeProvider(48000, 2, 400);
+        CountingConstantPcmProvider futureProvider(48000, 2, -9000);
+        std::unordered_map<std::string, vanguard::audio::AudioSampleProvider*> gateProviders = {
+            {"gate_active", &activeProvider},
+            {"gate_future", &futureProvider},
+        };
+
+        vanguard::audio::GraphAudioScheduler gateScheduler(gateGraph, "gate_mix", gateProviders);
+
+        constexpr int64_t kGateFrames  = 256;
+        constexpr int64_t kGateSamples = kGateFrames * 2;
+        int16_t gateOut[kGateSamples];
+
+        // Independent single-track unit-gain mix reference for a constant value.
+        auto constantMixChecksum = [&](int16_t value, uint64_t& outChecksum) -> bool {
+            int16_t refPcm[kGateSamples];
+            for (int64_t i = 0; i < kGateSamples; ++i) {
+                refPcm[i] = value;
+            }
+            vanguard::audio::AudioMixBusNode::MixTrack refTrack{refPcm, kGateFrames, 48000, 2, 1.0};
+            int16_t refOut[kGateSamples] = {0};
+            vanguard::audio::AudioMixBusNode::MixOutput refMixOut{};
+            const auto refRes = gateMix->mix(&refTrack, 1, kGateFrames, refOut, kGateSamples, &refMixOut);
+            outChecksum = refMixOut.checksum;
+            return refRes == vanguard::audio::AudioMixBusNode::MixResult::kOk;
+        };
+
+        auto allSamplesEqual = [&](int16_t value) -> bool {
+            for (int64_t i = 0; i < kGateSamples; ++i) {
+                if (gateOut[i] != value) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        // Window A: startFrame 0 -> ptsUs 0: only gate_active is timeline-active.
+        bool activeWindowOk = false;
+        if (gateWiringOk && gateScheduler.targetValid() && gateScheduler.routedSourceCount() == 2) {
+            for (int64_t i = 0; i < kGateSamples; ++i) {
+                gateOut[i] = 12345;
+            }
+            vanguard::audio::GraphAudioScheduler::SchedulerOutput outA{};
+            const auto resA = gateScheduler.renderWindow(0, kGateFrames, gateOut, kGateSamples, &outA);
+            uint64_t refChecksumA = 0;
+            activeWindowOk =
+                resA == SchedResult::kOk &&
+                outA.mixCalled && !outA.silence &&
+                outA.framesRendered == kGateFrames &&
+                outA.routedTrackCount == 1 &&
+                allSamplesEqual(400) &&
+                constantMixChecksum(400, refChecksumA) &&
+                outA.checksum == refChecksumA &&
+                activeProvider.provideCallCount() == 1 &&
+                futureProvider.provideCallCount() == 0;
+        }
+
+        // Window B: startFrame 6000 -> ptsUs 125000: both sources timeline-inactive;
+        // kSilence with zeroed output and no additional provide() calls.
+        bool allInactiveWindowOk = false;
+        {
+            for (int64_t i = 0; i < kGateSamples; ++i) {
+                gateOut[i] = 12345;
+            }
+            vanguard::audio::GraphAudioScheduler::SchedulerOutput outB{};
+            const auto resB = gateScheduler.renderWindow(6000, kGateFrames, gateOut, kGateSamples, &outB);
+            allInactiveWindowOk =
+                resB == SchedResult::kSilence &&
+                outB.silence && !outB.mixCalled &&
+                outB.framesRendered == kGateFrames &&
+                outB.routedTrackCount == 0 &&
+                allSamplesEqual(0) &&
+                activeProvider.provideCallCount() == 1 &&
+                futureProvider.provideCallCount() == 0;
+        }
+
+        // Window C: startFrame 24000 -> ptsUs 500000: gating flips per window; the
+        // previously skipped gate_future provider is now the only one consulted.
+        bool futureWindowOk = false;
+        {
+            for (int64_t i = 0; i < kGateSamples; ++i) {
+                gateOut[i] = 12345;
+            }
+            vanguard::audio::GraphAudioScheduler::SchedulerOutput outC{};
+            const auto resC = gateScheduler.renderWindow(24000, kGateFrames, gateOut, kGateSamples, &outC);
+            uint64_t refChecksumC = 0;
+            futureWindowOk =
+                resC == SchedResult::kOk &&
+                outC.mixCalled && !outC.silence &&
+                outC.framesRendered == kGateFrames &&
+                outC.routedTrackCount == 1 &&
+                allSamplesEqual(-9000) &&
+                constantMixChecksum(-9000, refChecksumC) &&
+                outC.checksum == refChecksumC &&
+                activeProvider.provideCallCount() == 1 &&
+                futureProvider.provideCallCount() == 1;
+        }
+
+        if (activeWindowOk && allInactiveWindowOk && futureWindowOk) {
+            schedulerTimelineGatingOk = true;
+        } else if (!activeWindowOk) {
+            if (failureReason.empty()) failureReason = "scheduler_gating_active_window_failed";
+        } else if (!allInactiveWindowOk) {
+            if (failureReason.empty()) failureReason = "scheduler_gating_all_inactive_window_failed";
+        } else {
+            if (failureReason.empty()) failureReason = "scheduler_gating_future_window_failed";
+        }
+    }
+
     const bool allPass = topologyOk && topoOrderOk && portTypeOk && capacityOk &&
                          cycleRejectOk && inputFanInRejectOk && staleGenerationOk && mediaFlagsOk &&
                          graphGatedMixOk && invalidGainOk && audioTimelineGatingOk && audioPtsMappingOk &&
-                         lifecycleOk;
+                         schedulerTimelineGatingOk && lifecycleOk;
 
     std::ostringstream oss;
     if (allPass) {
@@ -546,6 +733,7 @@ std::string RunAudioGraphTopologySmokeInternal() {
             << "invalidGainOk=true;"
             << "audioTimelineGatingOk=true;"
             << "audioPtsMappingOk=true;"
+            << "schedulerTimelineGatingOk=true;"
             << "lifecycleOk=true;"
             << "stackScoped=true;"
             << "nodeCount=" << reportedNodeCount << ";"
@@ -576,6 +764,7 @@ std::string RunAudioGraphTopologySmokeInternal() {
             << "invalidGainOk=" << (invalidGainOk ? "true" : "false") << ";"
             << "audioTimelineGatingOk=" << (audioTimelineGatingOk ? "true" : "false") << ";"
             << "audioPtsMappingOk=" << (audioPtsMappingOk ? "true" : "false") << ";"
+            << "schedulerTimelineGatingOk=" << (schedulerTimelineGatingOk ? "true" : "false") << ";"
             << "lifecycleOk=" << (lifecycleOk ? "true" : "false") << ";"
             << "stackScoped=" << (stackScoped ? "true" : "false") << ";"
             << "nodeCount=" << reportedNodeCount << ";"

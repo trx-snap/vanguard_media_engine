@@ -23,11 +23,13 @@ struct AutoDiscoverSourceProviders {
 // graph-edge-routed audio window scheduler proof.
 //
 // This is NOT a queue and does NOT own a realtime clock. GraphAudioScheduler
-// owns no Graph, no Node, and no AudioSampleProvider: it holds a non-owning
+// owns no Graph and no AudioSampleProvider: it holds a non-owning
 // `const Graph&`, a non-owning provider registry keyed by source node id,
-// and a snapshot of the graph's generation id taken at construction. It
-// does not mutate Node, does not add upstream pointers to Node, and does
-// not retain PCM inside DecodedAudioPcmSourceNode.
+// shared (not exclusive) references to the target mix bus and routed source
+// nodes resolved once at construction, and a snapshot of the graph's
+// generation id taken at construction. It does not mutate Node, does not
+// add upstream pointers to Node, and does not retain PCM inside
+// DecodedAudioPcmSourceNode.
 //
 // Provider/edge routing is resolved once, at construction, via
 // Graph::inputConnections(targetMixNodeId) (deterministic edge-insertion
@@ -45,6 +47,17 @@ struct AutoDiscoverSourceProviders {
 // Providers whose buffer is not silent are the only ones passed to
 // AudioMixBusNode::mix() as MixTrack entries.
 //
+// P4-AUDIO-SCHEDULER-TIMELINE-GATING: renderWindow() additionally consults
+// each routed source node's Node::isActiveAt(windowPtsUs) — with
+// windowPtsUs derived once per window via ComputeWindowPtsUs; the frame
+// cursor stays authoritative and mapTimelineToLocalPts is deliberately not
+// used. A source whose node reports inactive for the window is skipped
+// before provider format checks and before provide() is called, and
+// contributes no MixTrack, exactly like a silent provider. When every
+// routed source is inactive and/or silent, renderWindow() reports kSilence
+// with zeroed output, unchanged. Each routed source's node shared_ptr is
+// cached at construction; renderWindow() never calls Graph::getNode().
+//
 // All scratch (per-track PCM windows, MixTrack descriptors) is preallocated
 // in the constructor from the target AudioMixBusNode's maxFramesPerMix(),
 // channelCount(), and the fixed AudioMixBusNode::kMaxTrackCount bound.
@@ -53,9 +66,9 @@ class GraphAudioScheduler {
 public:
     enum class SchedulerResult {
         kOk,                    // mixed successfully; output written
-        kSilence,                // zero routed provider tracks, or every routed provider
-                                 // reported a silent buffer for this window; output zeroed,
-                                 // no mix() call
+        kSilence,                // zero routed provider tracks, or every routed source was
+                                 // timeline-inactive and/or its provider reported a silent
+                                 // buffer for this window; output zeroed, no mix() call
         kStaleGeneration,        // graph mutated since construction; output untouched
         kInvalidTarget,          // target node missing or not an AudioMixBusNode; output untouched
         kInvalidFrameCount,      // frameCount <= 0 or > target maxFramesPerMix; output untouched
@@ -126,8 +139,11 @@ public:
 
 private:
     struct RoutedSource {
-        std::string           nodeId;
-        AudioSampleProvider*  provider{nullptr};
+        std::string                  nodeId;
+        // Cached at construction so renderWindow() can consult
+        // Node::isActiveAt without a per-window Graph::getNode() lookup.
+        std::shared_ptr<graph::Node> node;
+        AudioSampleProvider*         provider{nullptr};
     };
 
     static constexpr size_t kMaxRoutedTracks = AudioMixBusNode::kMaxTrackCount;

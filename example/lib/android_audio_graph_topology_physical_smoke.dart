@@ -4,14 +4,14 @@
 //
 // Proof lanes:
 //   - DAG Topology & Order group: topologyOk, topoOrderOk, portTypeOk, capacityOk, cycleRejectOk, inputFanInRejectOk.
-//   - Graph Evaluation & Gating group: staleGenerationOk, mediaFlagsOk, graphGatedMixOk, invalidGainOk, audioTimelineGatingOk, audioPtsMappingOk.
+//   - Graph Evaluation & Gating group: staleGenerationOk, mediaFlagsOk, graphGatedMixOk, invalidGainOk, audioTimelineGatingOk, audioPtsMappingOk, schedulerTimelineGatingOk.
 //   - Lifecycle & Scope group: lifecycleOk, stackScoped, hasAudio, hasVideo.
 //   - Metrics group: nodeCount, edgeCount, activeNodeCount, mixCallCount, staleMixCallCount, framesMixed, mixChecksum, expectedChecksum, maxAccumulatorAbs.
 //   - Proof-Boundary & Summary group: hasCanonicalProofBoundary, allNativeLanesPass, lastError.
 //
 // Target / proof boundary:
 //   native_audio_mix_bus_graph_topology_and_graph_gated_diagnostic_mix_only_no_realtime_no_playback_no_audio_track_no_graph_buffer_transport_no_product
-//   Pure in-memory native C++ AudioMixBusNode DAG topology, DecodedAudioPcmSourceNode timeline gating & PTS mapping, and graph-gated diagnostic mix only.
+//   Pure in-memory native C++ AudioMixBusNode DAG topology, DecodedAudioPcmSourceNode timeline gating & PTS mapping, GraphAudioScheduler renderWindow timeline gating, and graph-gated diagnostic mix only.
 //   No audible or realtime playback, no C++ graph buffer transport / PCM transport, no AudioTrack,
 //   no Pass-2 export graph reroute, does not close P4-AUDIO-MIXBUS or Phase 4.
 
@@ -99,7 +99,8 @@ class _AndroidAudioGraphTopologyPhysicalSmokeAppState
       'graphGatedMixOk=${activeReport.graphGatedMixOk}, '
       'invalidGainOk=${activeReport.invalidGainOk}, '
       'audioTimelineGatingOk=${activeReport.audioTimelineGatingOk}, '
-      'audioPtsMappingOk=${activeReport.audioPtsMappingOk}',
+      'audioPtsMappingOk=${activeReport.audioPtsMappingOk}, '
+      'schedulerTimelineGatingOk=${activeReport.schedulerTimelineGatingOk}',
     );
 
     // 3. Lifecycle & Scope group

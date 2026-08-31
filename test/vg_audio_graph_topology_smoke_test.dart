@@ -22,6 +22,7 @@ const _kAllLanes = <String>[
   'invalidGainOk',
   'audioTimelineGatingOk',
   'audioPtsMappingOk',
+  'schedulerTimelineGatingOk',
   'lifecycleOk',
   'stackScoped',
   'hasAudio',
@@ -42,6 +43,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'invalidGainOk': true,
     'audioTimelineGatingOk': true,
     'audioPtsMappingOk': true,
+    'schedulerTimelineGatingOk': true,
     'lifecycleOk': true,
     'stackScoped': true,
     'hasAudio': true,
@@ -73,6 +75,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'invalidGainOk': 'true',
     'audioTimelineGatingOk': 'true',
     'audioPtsMappingOk': 'true',
+    'schedulerTimelineGatingOk': 'true',
     'lifecycleOk': 'true',
     'stackScoped': 'true',
     'nodeCount': '5',
@@ -140,6 +143,7 @@ void main() {
         expect(report.invalidGainOk, isTrue);
         expect(report.audioTimelineGatingOk, isTrue);
         expect(report.audioPtsMappingOk, isTrue);
+        expect(report.schedulerTimelineGatingOk, isTrue);
         expect(report.lifecycleOk, isTrue);
         expect(report.stackScoped, isTrue);
         expect(report.hasAudio, isTrue);
@@ -190,6 +194,7 @@ void main() {
             'invalidGainOk': true,
             'audioTimelineGatingOk': true,
             'audioPtsMappingOk': true,
+            'schedulerTimelineGatingOk': true,
             'lifecycleOk': true,
             'stackScoped': true,
             'hasAudio': true,
@@ -248,6 +253,7 @@ void main() {
             'invalidGainOk=true;'
             'audioTimelineGatingOk=true;'
             'audioPtsMappingOk=true;'
+            'schedulerTimelineGatingOk=true;'
             'lifecycleOk=true;'
             'stackScoped=true;'
             'hasAudio=true;'
@@ -276,6 +282,7 @@ void main() {
       expect(reportFromRaw.topologyOk, isTrue);
       expect(reportFromRaw.audioTimelineGatingOk, isTrue);
       expect(reportFromRaw.audioPtsMappingOk, isTrue);
+      expect(reportFromRaw.schedulerTimelineGatingOk, isTrue);
       expect(reportFromRaw.hasAudio, isTrue);
       expect(reportFromRaw.hasVideo, isFalse);
       expect(reportFromRaw.hasCanonicalProofBoundary, isTrue);
@@ -380,6 +387,9 @@ void main() {
               break;
             case 'audioPtsMappingOk':
               expect(report.audioPtsMappingOk, isFalse);
+              break;
+            case 'schedulerTimelineGatingOk':
+              expect(report.schedulerTimelineGatingOk, isFalse);
               break;
             case 'lifecycleOk':
               expect(report.lifecycleOk, isFalse);

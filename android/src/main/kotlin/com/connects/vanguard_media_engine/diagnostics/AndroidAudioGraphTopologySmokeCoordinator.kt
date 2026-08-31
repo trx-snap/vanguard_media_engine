@@ -14,7 +14,9 @@ import io.flutter.plugin.common.MethodChannel
  * a synthetic PCM mix is reachable only after successful graph evaluation.
  *
  * Honest non-claims:
- * - Proves DecodedAudioPcmSourceNode timeline gating and PTS mapping only; AudioMixBusNode remains always-active.
+ * - Proves DecodedAudioPcmSourceNode timeline gating, PTS mapping, and GraphAudioScheduler
+ *   renderWindow() isActiveAt gating (schedulerTimelineGatingOk) only; AudioMixBusNode remains
+ *   always-active and the generic parser below carries the new lane without special handling.
  * - Does not claim audible or realtime audio playback.
  * - Does not claim C++ graph buffer transport / PCM transport; evaluatePlayhead moves no PCM.
  * - Does not claim AudioTrack integration.
