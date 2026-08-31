@@ -62,6 +62,8 @@ export 'vg_audio_graph_transport_clock_smoke.dart';
 export 'vg_audio_ring_buffer_transport_smoke.dart';
 // P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice C: Android True-DAG Phase 4 platform-neutral native AudioClock diagnostic smoke foundation.
 export 'vg_audio_clock_smoke.dart';
+// P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice D: Android True-DAG Phase 4 native ClockedAudioTransportCoordinator smoke foundation.
+export 'vg_audio_transport_coordinator_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.

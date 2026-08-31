@@ -577,6 +577,15 @@ class VanguardNativeBridge(
     // no iOS, no product/editor UI, no internal wall-clock read.
     external fun runAndroidDagPhase4AudioClockSmoke(): String
 
+    // ── P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice D: native ClockedAudioTransportCoordinator diagnostic ─
+    // Caller-clocked, clock-driven audio transport coordinator native proof.
+    // Pure in-memory C++ proof; no AudioTrack/AAudio/OpenSL/Oboe, no OS callbacks,
+    // no production decoder writer, no export reroute, no streaming, no iOS,
+    // no product/editor UI, no internal wall-clock read, no threads, no locks,
+    // no float timebase, no resample, no speed change, no source provider ring seek,
+    // output ring only, unity speed only.
+    external fun runAndroidDagPhase4AudioTransportCoordinatorSmoke(): String
+
     // ── P3-CAM-CONCURRENT: Camera2 dual-camera concurrent PRIVATE AHardwareBuffer ─
     // ingest validation diagnostic. Kotlin remains the sole owner of Camera2
     // device/session lifecycle (CameraManager.openCamera, CameraCaptureSession);
