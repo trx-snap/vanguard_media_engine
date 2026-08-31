@@ -1264,6 +1264,21 @@ class VanguardNativeBridge(
     // ingest/retention). Writer-local EOS only.
     external fun runAndroidDagPhase4AudioPipelineIntegrationSmoke(): String
 
+    // ── P4-AUDIO-MIXBUS-TIMELINE-OWNERSHIP: native AudioMixBusNode timeline-aware per-frame volume envelope diagnostic ─
+    // One-shot, stack-scoped, single-threaded, synchronous native proof that
+    // the C++ AudioGainEnvelope is a parity port of the Kotlin
+    // AndroidAudioVolumeEnvelope rules (normalize / static fade / forTrack
+    // fallback / evaluate; linear interpolation only) and that
+    // AudioMixBusNode owns per-frame effective-gain math (static gain *
+    // envelope gain, single quantization, integer-microsecond floor PTS
+    // derivation, fail-before-output envelope validation) while the caller
+    // owns the window origin. Honest boundary: no GraphAudioScheduler
+    // wiring, no production mixdown change, no export/pass-2 reroute, no
+    // runtime queue, no backpressure, no realtime sink, no threads, no
+    // AudioTrack/AAudio, no MediaCodec/MediaExtractor, no file IO, no
+    // streaming/cache, no iOS, no product/editor UI.
+    external fun runAudioMixBusTimelineNativeSmoke(): String
+
     // ── P3-CAM-CONCURRENT: Camera2 dual-camera concurrent PRIVATE AHardwareBuffer ─
     // ingest validation diagnostic. Kotlin remains the sole owner of Camera2
     // device/session lifecycle (CameraManager.openCamera, CameraCaptureSession);

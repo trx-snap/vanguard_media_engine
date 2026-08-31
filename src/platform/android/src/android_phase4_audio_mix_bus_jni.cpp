@@ -51,6 +51,8 @@ const char* MixResultReason(vanguard::audio::AudioMixBusNode::MixResult r) {
         case R::kInvalidFrameCount:           return "invalid_frame_count";
         case R::kNullBuffer:                  return "null_buffer";
         case R::kInsufficientOutputCapacity:  return "insufficient_output_capacity";
+        case R::kInvalidEnvelopeStartPts:     return "invalid_envelope_start_pts";
+        case R::kInvalidEnvelopeGain:         return "invalid_envelope_gain";
     }
     return "unknown";
 }
@@ -385,9 +387,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_mixAndroid
 
     // Fixed-size array (never heap-allocates) since a session admits at most
     // kMaxTrackCount tracks; avoids any throwing container operation on the
-    // JNI boundary.
+    // JNI boundary. Value-initialized so the fields this route does not set
+    // (envelope pointer / envelopeStartPtsUs) are a guaranteed
+    // null-envelope static-gain configuration.
     vanguard::audio::AudioMixBusNode::MixTrack
-        mixTracksArr[vanguard::audio::AudioMixBusNode::kMaxTrackCount];
+        mixTracksArr[vanguard::audio::AudioMixBusNode::kMaxTrackCount]{};
     size_t mixTrackCount = 0;
     for (const Phase4AudioMixBusTrack& t : session->tracks) {
         if (mixTrackCount >= vanguard::audio::AudioMixBusNode::kMaxTrackCount) {

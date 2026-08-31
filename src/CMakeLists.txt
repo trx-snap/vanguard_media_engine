@@ -21,6 +21,7 @@ target_link_libraries(vanguard_sinks PRIVATE vanguard_graph vanguard_core)
 
 add_library(vanguard_audio STATIC
     "audio/src/decoded_audio_pcm_source_node.cpp"
+    "audio/src/audio_gain_envelope.cpp"
     "audio/src/audio_mix_bus_node.cpp"
     "audio/src/graph_audio_scheduler.cpp"
     "audio/src/audio_ring_buffer.cpp"
@@ -120,6 +121,7 @@ if (ANDROID)
     "platform/android/src/android_gles_decoded_oes_smoke_jni.cpp"
     "platform/android/src/android_phase2_audio_decode_bridge_jni.cpp"
     "platform/android/src/android_phase4_audio_mix_bus_jni.cpp"
+    "platform/android/src/android_phase4_audio_mixbus_timeline_jni.cpp"
     "platform/android/src/android_phase4_audio_graph_topology_jni.cpp"
     "platform/android/src/android_phase4_audio_graph_transport_jni.cpp"
     "platform/android/src/android_phase4_audio_ring_buffer_transport_jni.cpp"

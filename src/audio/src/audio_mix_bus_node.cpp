@@ -118,29 +118,81 @@ AudioMixBusNode::MixResult AudioMixBusNode::mix(const MixTrack* tracks,
         if (!std::isfinite(track.gain) || track.gain < 0.0 || track.gain > 1.0) {
             return MixResult::kInvalidGain;
         }
+        if (track.envelope != nullptr) {
+            if (track.envelopeStartPtsUs < 0) {
+                return MixResult::kInvalidEnvelopeStartPts;
+            }
+            // Fail-before-output: pre-scan every frame this track will mix
+            // (integer-microsecond floor PTS derivation) so an invalid
+            // envelope gain rejects before the accumulator or output buffer
+            // is touched. Cursor is call-local; no envelope state persists.
+            const int64_t scanFrames =
+                framesToMix < track.frameCount ? framesToMix : track.frameCount;
+            size_t cursor = 0;
+            for (int64_t f = 0; f < scanFrames; ++f) {
+                const int64_t ptsUs = track.envelopeStartPtsUs +
+                    (f * 1000000LL) / static_cast<int64_t>(sampleRate_);
+                const double envelopeGain = track.envelope->evaluateCursor(ptsUs, &cursor);
+                if (!std::isfinite(envelopeGain) || envelopeGain < 0.0 ||
+                    envelopeGain > 1.0) {
+                    return MixResult::kInvalidEnvelopeGain;
+                }
+            }
+        }
     }
 
     for (int64_t i = 0; i < requiredOutputSamples; ++i) {
         accumulator_[static_cast<size_t>(i)] = 0;
     }
 
+    bool    envelopeApplied     = false;
+    bool    effectiveGainSeen   = false;
+    double  minEffectiveGain    = 0.0;
+    double  maxEffectiveGain    = 0.0;
+    int64_t envelopeEvaluations = 0;
+
     for (size_t t = 0; t < trackCount; ++t) {
         const MixTrack& track = tracks[t];
+        // Per-track, per-call envelope cursor: reset here so repeated mix()
+        // calls are stateless and bit-reproducible.
+        size_t envelopeCursor = 0;
         for (int64_t f = 0; f < framesToMix; ++f) {
             if (f >= track.frameCount) {
                 continue; // Track has run out of frames; contributes silence.
+            }
+            // Single quantization: the sample (or integer-downmixed value)
+            // is multiplied by the one effective gain and truncated to the
+            // int32 accumulator exactly once; the only clamp happens at the
+            // final output stage below. A null envelope leaves
+            // effectiveGain == track.gain, bit-identical to the previous
+            // static-gain behaviour.
+            double effectiveGain = track.gain;
+            if (track.envelope != nullptr) {
+                const int64_t ptsUs = track.envelopeStartPtsUs +
+                    (f * 1000000LL) / static_cast<int64_t>(sampleRate_);
+                effectiveGain =
+                    track.gain * track.envelope->evaluateCursor(ptsUs, &envelopeCursor);
+                ++envelopeEvaluations;
+                envelopeApplied = true;
+                if (!effectiveGainSeen || effectiveGain < minEffectiveGain) {
+                    minEffectiveGain = effectiveGain;
+                }
+                if (!effectiveGainSeen || effectiveGain > maxEffectiveGain) {
+                    maxEffectiveGain = effectiveGain;
+                }
+                effectiveGainSeen = true;
             }
             if (track.channelCount == channelCount_) {
                 for (int32_t ch = 0; ch < channelCount_; ++ch) {
                     const int16_t sample = track.pcm[f * channelCount_ + ch];
                     const int32_t scaled =
-                        static_cast<int32_t>(static_cast<double>(sample) * track.gain);
+                        static_cast<int32_t>(static_cast<double>(sample) * effectiveGain);
                     accumulator_[static_cast<size_t>(f * channelCount_ + ch)] += scaled;
                 }
             } else if (track.channelCount == 1 && channelCount_ == 2) {
                 const int16_t mono = track.pcm[f];
                 const int32_t scaled =
-                    static_cast<int32_t>(static_cast<double>(mono) * track.gain);
+                    static_cast<int32_t>(static_cast<double>(mono) * effectiveGain);
                 accumulator_[static_cast<size_t>(f * 2 + 0)] += scaled;
                 accumulator_[static_cast<size_t>(f * 2 + 1)] += scaled;
             } else { // track.channelCount == 2 && channelCount_ == 1
@@ -149,7 +201,7 @@ AudioMixBusNode::MixResult AudioMixBusNode::mix(const MixTrack* tracks,
                 const int32_t downmixed =
                     (static_cast<int32_t>(l) + static_cast<int32_t>(r)) / 2;
                 const int32_t scaled =
-                    static_cast<int32_t>(static_cast<double>(downmixed) * track.gain);
+                    static_cast<int32_t>(static_cast<double>(downmixed) * effectiveGain);
                 accumulator_[static_cast<size_t>(f)] += scaled;
             }
         }
@@ -181,10 +233,14 @@ AudioMixBusNode::MixResult AudioMixBusNode::mix(const MixTrack* tracks,
     }
 
     if (outResult != nullptr) {
-        outResult->framesMixed        = framesToMix;
-        outResult->checksum           = checksum;
-        outResult->clipped            = clipped;
-        outResult->maxAccumulatorAbs  = maxAccumulatorAbs;
+        outResult->framesMixed         = framesToMix;
+        outResult->checksum            = checksum;
+        outResult->clipped             = clipped;
+        outResult->maxAccumulatorAbs   = maxAccumulatorAbs;
+        outResult->envelopeApplied     = envelopeApplied;
+        outResult->minEffectiveGain    = minEffectiveGain;
+        outResult->maxEffectiveGain    = maxEffectiveGain;
+        outResult->envelopeEvaluations = envelopeEvaluations;
     }
 
     return MixResult::kOk;
