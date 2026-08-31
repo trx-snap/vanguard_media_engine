@@ -80,6 +80,8 @@ export 'vg_audiotrack_output_sink_smoke.dart';
 export 'vg_multi_source_graph_pipeline_smoke.dart';
 // P4-AUDIO-MULTI-SOURCE-AUDIOTRACK-SINK: Android True-DAG Phase 4 multi-source AudioTrack output sink write diagnostic smoke foundation.
 export 'vg_multi_source_audio_track_sink_smoke.dart';
+// P4-AUDIO-DECODER-SOURCE-NODE-WIRING: Android True-DAG Phase 4 node-owned decoded audio source graph pipeline smoke foundation.
+export 'vg_node_owned_audio_source_graph_pipeline_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.

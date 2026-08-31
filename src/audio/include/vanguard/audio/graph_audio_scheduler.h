@@ -12,6 +12,13 @@
 namespace vanguard {
 namespace audio {
 
+// P4-AUDIO-DECODER-SOURCE-NODE-WIRING: tag type selecting the
+// auto-discovery GraphAudioScheduler constructor overload explicitly (no
+// implicit fallback from the external-provider-map constructor).
+struct AutoDiscoverSourceProviders {
+    explicit constexpr AutoDiscoverSourceProviders() = default;
+};
+
 // P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice A: synchronous, pull-model,
 // graph-edge-routed audio window scheduler proof.
 //
@@ -73,6 +80,21 @@ public:
     GraphAudioScheduler(const graph::Graph& graph,
                         std::string targetMixNodeId,
                         const std::unordered_map<std::string, AudioSampleProvider*>& providers);
+
+    // P4-AUDIO-DECODER-SOURCE-NODE-WIRING: tag-dispatched auto-discovery
+    // overload. Instead of an external provider map, routing walks
+    // Graph::inputConnections(targetMixNodeId) in the same deterministic
+    // edge-insertion order and, for each kAudioPacket edge into the target
+    // mix bus, resolves the source node via graph.getNode() and routes its
+    // DecodedAudioPcmSourceNode::audioSampleProvider() when non-null.
+    // Edges whose source node is missing, not a DecodedAudioPcmSourceNode,
+    // or a legacy (5-arg, non-ring-owning) node are skipped silently,
+    // mirroring the map constructor's unregistered-provider behavior. The
+    // scheduler still owns nothing: the graph and every discovered node
+    // (and thus its provider) must outlive this scheduler.
+    GraphAudioScheduler(const graph::Graph& graph,
+                        std::string targetMixNodeId,
+                        AutoDiscoverSourceProviders);
 
     // Derives the graph/timeline-gating pts for a frame cursor position:
     // ptsUs = floor(startFrame * 1000000 / sampleRate), computed purely with

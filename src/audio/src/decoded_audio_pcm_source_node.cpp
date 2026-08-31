@@ -1,6 +1,7 @@
 #include "vanguard/audio/decoded_audio_pcm_source_node.h"
 
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
@@ -32,6 +33,27 @@ DecodedAudioPcmSourceNode::DecodedAudioPcmSourceNode(std::string id,
     }
 
     outputPorts_.push_back({"audio_out", vanguard::graph::PortDataType::kAudioPacket});
+}
+
+DecodedAudioPcmSourceNode::DecodedAudioPcmSourceNode(std::string id,
+                                                      int32_t sampleRate,
+                                                      int32_t channelCount,
+                                                      int64_t expectedFrameCount,
+                                                      uint64_t timelineStartPtsUs,
+                                                      int64_t ringCapacityFrames)
+    : DecodedAudioPcmSourceNode(std::move(id),
+                                sampleRate,
+                                channelCount,
+                                expectedFrameCount,
+                                timelineStartPtsUs) {
+    // ringCapacityFrames is validated by AudioSpscAudioRingBuffer itself;
+    // its std::invalid_argument tokens propagate unchanged.
+    ring_ = std::make_unique<AudioSpscAudioRingBuffer>(
+        sampleRate_, channelCount_, ringCapacityFrames);
+    ringWriter_ = std::make_unique<AudioDecoderRingWriter>(
+        ring_.get(), sampleRate_, channelCount_);
+    provider_ = std::make_unique<RingBufferAudioSampleProvider>(
+        ring_.get(), /*startFrame=*/0);
 }
 
 const std::string& DecodedAudioPcmSourceNode::id() const {

@@ -296,6 +296,115 @@ class VanguardNativeBridge(
         external fun destroyMultiSourceAudioGraphPipelineSmokeSession(
             handle: Long,
         ): String
+
+        // ── P4-AUDIO-DECODER-SOURCE-NODE-WIRING: session-scoped node-owned-source closed-loop audio graph pipeline seam ─
+        // Step-driven native session over the node-owned-transport diagnostic
+        // rig: DecodedAudioPcmSourceNode (6-arg constructor) owns its source
+        // AudioSpscAudioRingBuffer + AudioDecoderRingWriter +
+        // RingBufferAudioSampleProvider triple by composition, and
+        // GraphAudioScheduler auto-discovers the provider from graph
+        // topology alone (tag-dispatched constructor; no external provider
+        // map, no hybrid routing) -> AudioMixBusNode ->
+        // ClockedAudioTransportCoordinator -> output ring -> consumer drain.
+        // Diagnostic node-owned decoded audio source ring/provider wiring
+        // proof only: no production export or pass-2 graph reroute, no
+        // product/editor UI, no ConnectsApp, no streaming/cache, no iOS.
+        // Kotlin hands synthetic interleaved little-endian signed PCM16
+        // across a direct java.nio.ByteBuffer and derives every clock tick
+        // itself (native never reads a wall clock). Every non-destroy call
+        // must run on the session's creating thread (native fails closed
+        // with status=wrong_owner_thread otherwise). No native worker
+        // threads, no MediaCodec/MediaExtractor ownership in C++, no
+        // AudioTrack/AAudio/OpenSL/Oboe, no realtime/audio-focus/route/
+        // dead-object/audible/speaker/latency/glitch claims, no file IO.
+        // Handles minted here are NOT interchangeable with any other
+        // pipeline session registry. Forward-only seek; writer-local EOS
+        // only.
+
+        // Returns an opaque session handle, or 0 on invalid input
+        // (sampleRate not in [8000, 192000], channelCount not in {1,2},
+        // maxFramesPerMix not in [1, 8192], ring capacities not powers of
+        // two in [64, 65536], outputRingCapacityFrames < maxFramesPerMix,
+        // sourceRingCapacityFrames < 2*maxFramesPerMix), when the
+        // auto-discovered route did not resolve to exactly the one
+        // node-owned source track, or when the 4-live-session registry cap
+        // is reached. sourceRingCapacityFrames is the node's explicit
+        // ringCapacityFrames constructor argument.
+        external fun createNodeOwnedAudioSourceGraphPipelineSmokeSession(
+            sampleRate: Int,
+            channelCount: Int,
+            sourceRingCapacityFrames: Int,
+            outputRingCapacityFrames: Int,
+            maxFramesPerMix: Int,
+        ): Long
+
+        // Producer side, writing through the NODE-OWNED ring writer.
+        // Accepted frames are clamped to
+        // min(frameCount, 8192, framesThatFitInBuffer).
+        external fun ingestNodeOwnedAudioSourceGraphPipelinePcm16(
+            handle: Long,
+            pcm: java.nio.ByteBuffer,
+            frameCount: Int,
+        ): String
+
+        // Starts the transport clock at (sysTimeNs, mediaPtsUs) and parks
+        // the dispatch cursor awaiting the output ring's seek ack; drain the
+        // ack before the first dispatching step.
+        external fun startNodeOwnedAudioSourceGraphPipeline(
+            handle: Long,
+            mediaPtsUs: Long,
+            sysTimeNs: Long,
+        ): String
+
+        // One bounded dispatch attempt at the caller-derived sysTimeNs tick;
+        // the scheduler pulls from the auto-discovered node-owned provider.
+        // flushTail=false requires a full window of source frames
+        // (status=deferred_insufficient_source otherwise, with no mutation);
+        // flushTail=true (writer EOS required) advances exactly the
+        // remaining source frames (tail_flush_partial_window /
+        // tail_flush_complete). Every step status reports
+        // sourceAvailableReadFrames.
+        external fun stepNodeOwnedAudioSourceGraphPipeline(
+            handle: Long,
+            sysTimeNs: Long,
+            flushTail: Boolean,
+        ): String
+
+        // Output-ring reader side: consumes a pending start/seek ack first,
+        // then pops and checksums up to maxFrames of mixed PCM.
+        external fun drainNodeOwnedAudioSourceGraphPipelineOutput(
+            handle: Long,
+            maxFrames: Int,
+        ): String
+
+        // Forward-only seek. Requires a fully drained output ring, an empty
+        // node-owned source ring, and targetFrame >= the node-owned
+        // provider's cursor; the caller must drain the output-ring ack next.
+        external fun seekNodeOwnedAudioSourceGraphPipeline(
+            handle: Long,
+            targetPtsUs: Long,
+            sysTimeNs: Long,
+        ): String
+
+        // Writer-local EOS only (cleared by the next successful seek).
+        external fun setNodeOwnedAudioSourceGraphPipelineEos(
+            handle: Long,
+        ): String
+
+        // Full diagnostic snapshot including the node-owned-wiring facts
+        // (routedSourceCount, routedSourceId0, nodeOwnsRing), provider
+        // underrun/skip/rewind metrics, and the fixed-at-construction
+        // scratch/storage capacities used to prove zero native steady-state
+        // allocation across repeated cycles.
+        external fun snapshotNodeOwnedAudioSourceGraphPipeline(
+            handle: Long,
+        ): String
+
+        // Idempotent erase-once; callable from any thread. Handle 0/unknown
+        // returns status=not_found.
+        external fun destroyNodeOwnedAudioSourceGraphPipelineSmokeSession(
+            handle: Long,
+        ): String
     }
 
     external fun probeCapabilities(): BackendCapabilityReport

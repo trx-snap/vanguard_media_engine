@@ -1,5 +1,7 @@
 #include "vanguard/audio/graph_audio_scheduler.h"
 
+#include "vanguard/audio/decoded_audio_pcm_source_node.h"
+
 #include <utility>
 
 namespace vanguard {
@@ -63,6 +65,71 @@ GraphAudioScheduler::GraphAudioScheduler(
             break; // Bounded by the mix bus's own track-count ceiling.
         }
         routedSources_.push_back(RoutedSource{c.fromNodeId, it->second});
+    }
+}
+
+GraphAudioScheduler::GraphAudioScheduler(
+    const graph::Graph& graph,
+    std::string targetMixNodeId,
+    AutoDiscoverSourceProviders)
+    : graph_(graph),
+      targetMixNodeId_(std::move(targetMixNodeId)),
+      snapshotGeneration_(graph.generationId()) {
+
+    std::shared_ptr<graph::Node> targetNode = graph_.getNode(targetMixNodeId_);
+    mixBus_ = std::dynamic_pointer_cast<AudioMixBusNode>(targetNode);
+    targetValid_ = (mixBus_ != nullptr);
+
+    if (targetValid_) {
+        sampleRate_      = mixBus_->sampleRate();
+        channelCount_    = mixBus_->channelCount();
+        maxFramesPerMix_ = mixBus_->maxFramesPerMix();
+    }
+
+    perTrackStrideSamples_ =
+        static_cast<int64_t>(maxFramesPerMix_) * static_cast<int64_t>(channelCount_);
+
+    // Preallocate once; renderWindow() never resizes these.
+    trackScratch_.assign(
+        static_cast<size_t>(perTrackStrideSamples_) * kMaxRoutedTracks, 0);
+    mixTracksScratch_.assign(kMaxRoutedTracks, AudioMixBusNode::MixTrack{});
+
+    if (!targetValid_) {
+        return;
+    }
+
+    std::vector<graph::Connection> conns;
+    const core::Status connStatus = graph_.inputConnections(targetMixNodeId_, conns);
+    if (!connStatus.ok()) {
+        return;
+    }
+
+    const auto& mixInputPorts = mixBus_->inputPorts();
+    for (const auto& c : conns) {
+        bool portOk = false;
+        for (const auto& p : mixInputPorts) {
+            if (p.id == c.toPortId && p.dataType == graph::PortDataType::kAudioPacket) {
+                portOk = true;
+                break;
+            }
+        }
+        if (!portOk) {
+            continue;
+        }
+        std::shared_ptr<graph::Node> fromNode = graph_.getNode(c.fromNodeId);
+        auto decodedSource =
+            std::dynamic_pointer_cast<DecodedAudioPcmSourceNode>(fromNode);
+        if (decodedSource == nullptr) {
+            continue; // Missing or non-decoded-audio source node: not routed.
+        }
+        AudioSampleProvider* provider = decodedSource->audioSampleProvider();
+        if (provider == nullptr) {
+            continue; // Legacy 5-arg node owns no transport: not routed.
+        }
+        if (routedSources_.size() >= kMaxRoutedTracks) {
+            break; // Bounded by the mix bus's own track-count ceiling.
+        }
+        routedSources_.push_back(RoutedSource{c.fromNodeId, provider});
     }
 }
 
