@@ -39,6 +39,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidGlesTextureSmokeCoo
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiCamCompositorSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiSourceAudioGraphPipelineSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiSourceAudioTrackPlaybackSinkCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidMultiSourceNodeOwnedPipelineSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioSourceGraphPipelineSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioSourceRealDecoderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator
@@ -167,6 +168,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // oversized plugin is deferred because this slice only mirrors the
     // established diagnostic route wiring.
     private var multiSourceAudioTrackPlaybackSinkCoordinator: AndroidMultiSourceAudioTrackPlaybackSinkCoordinator? = null
+
+    // ── P4-AUDIO-MULTI-SOURCE-NODE-OWNED-PIPELINE: two-source node-owned closed-loop audio graph pipeline smoke coordinator ────
+    // Registration-only glue; cohesive coordinator extraction from this
+    // oversized plugin is deferred because this slice only mirrors the
+    // established diagnostic route wiring.
+    private var multiSourceNodeOwnedPipelineSmokeCoordinator: AndroidMultiSourceNodeOwnedPipelineSmokeCoordinator? = null
 
     // ── P4-AUDIO-DECODER-SOURCE-NODE-WIRING: node-owned-source closed-loop audio graph pipeline smoke coordinator ────
     // Registration-only glue; cohesive coordinator extraction from this
@@ -378,6 +385,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         multiSourceAudioTrackPlaybackSinkCoordinator = AndroidMultiSourceAudioTrackPlaybackSinkCoordinator(
+            mainHandler = mainHandler,
+        )
+        multiSourceNodeOwnedPipelineSmokeCoordinator = AndroidMultiSourceNodeOwnedPipelineSmokeCoordinator(
             mainHandler = mainHandler,
         )
         nodeOwnedAudioSourceGraphPipelineSmokeCoordinator = AndroidNodeOwnedAudioSourceGraphPipelineSmokeCoordinator(
@@ -672,6 +682,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android multi-source audio graph pipeline smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidMultiSourceNodeOwnedPipelineSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = multiSourceNodeOwnedPipelineSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android multi-source node-owned pipeline smoke coordinator unavailable", null)
             }
             return
         }
@@ -2055,6 +2075,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // and native session promptly; its reply is dropped.
         multiSourceAudioTrackPlaybackSinkCoordinator?.disposeAll()
         multiSourceAudioTrackPlaybackSinkCoordinator = null
+        // P4-AUDIO-MULTI-SOURCE-NODE-OWNED-PIPELINE: trips the driver
+        // cancellation flag so an in-flight two-source node-owned run
+        // releases its codec/extractor and native session promptly; its
+        // reply is dropped.
+        multiSourceNodeOwnedPipelineSmokeCoordinator?.disposeAll()
+        multiSourceNodeOwnedPipelineSmokeCoordinator = null
         // P4-AUDIO-DECODER-SOURCE-NODE-WIRING: stop replying before
         // dropping; an in-flight node-owned-source run finishes naturally on
         // its own thread and destroys its own native session.

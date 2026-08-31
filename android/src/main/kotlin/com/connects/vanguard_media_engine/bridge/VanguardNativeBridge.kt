@@ -424,6 +424,130 @@ class VanguardNativeBridge(
         external fun destroyNodeOwnedAudioSourceGraphPipelineSmokeSession(
             handle: Long,
         ): String
+
+        // ── P4-AUDIO-MULTI-SOURCE-NODE-OWNED-PIPELINE: session-scoped two-source node-owned closed-loop audio graph pipeline seam ─
+        // Step-driven native session over the two-track NODE-OWNED-transport
+        // diagnostic rig: each DecodedAudioPcmSourceNode (6-arg constructor)
+        // owns its source AudioSpscAudioRingBuffer + AudioDecoderRingWriter
+        // + RingBufferAudioSampleProvider triple by composition, and
+        // GraphAudioScheduler auto-discovers BOTH providers from graph
+        // topology alone (tag-dispatched constructor; no external provider
+        // map, no hybrid routing) -> AudioMixBusNode
+        // (multi_source_node_owned_src0 -> primary_audio_in,
+        // multi_source_node_owned_src1 -> secondary_audio_in, unit gain) ->
+        // ClockedAudioTransportCoordinator -> output ring -> consumer drain.
+        // The native frame axis is the SHARED ACCEPTED FRAME COUNT (full
+        // overlap only): the joint dispatch gate needs a full window on BOTH
+        // source rings, the joint tail flush needs BOTH writers EOS with
+        // identical residuals, the single EOS entry point sets both writers
+        // together (no independent EOS), and the one forward seek reanchors
+        // BOTH tracks at a single accepted frame cursor. Handles minted here
+        // are NOT interchangeable with the external-provider-map
+        // multi-source seam or any other pipeline session registry. Every
+        // non-destroy call must run on the session's creating thread (native
+        // fails closed with status=wrong_owner_thread otherwise). No native
+        // worker threads, no MediaCodec/MediaExtractor ownership in C++, no
+        // AudioTrack/AAudio/OpenSL/Oboe, no sink-clocked transport, no
+        // realtime or audible playback, no file IO, no wall-clock reads.
+
+        // Returns an opaque session handle, or 0 on invalid input (same
+        // bounds as the external-provider-map multi-source seam plus
+        // expectedFrameCount in [1, 10*sampleRate] — the node's own
+        // 10-second timeline-window ceiling), when either source node does
+        // not own its transport, when the auto-discovered two-track route
+        // did not resolve exactly (routedSourceCount 2 in src0, src1 order),
+        // or the 4-live-session registry cap is reached. expectedFrameCount
+        // bounds each node's isActiveAt timeline window, so it must cover
+        // every frame the caller will dispatch; sourceRingCapacityFrames is
+        // each node's explicit ringCapacityFrames constructor argument.
+        external fun createMultiSourceNodeOwnedAudioGraphPipelineSmokeSession(
+            sampleRate: Int,
+            channelCount: Int,
+            expectedFrameCount: Int,
+            sourceRingCapacityFrames: Int,
+            outputRingCapacityFrames: Int,
+            maxFramesPerMix: Int,
+        ): Long
+
+        // Per-track producer side, writing through that track's NODE-OWNED
+        // ring writer; trackIndex must be 0 or 1
+        // (status=invalid_track_index otherwise, no mutation). Accepted
+        // frames are clamped to min(frameCount, 8192, framesThatFitInBuffer).
+        external fun ingestMultiSourceNodeOwnedAudioGraphPipelinePcm16(
+            handle: Long,
+            trackIndex: Int,
+            pcmBuffer: java.nio.ByteBuffer,
+            frameCount: Int,
+        ): String
+
+        // Starts the transport clock at (sysTimeNs, mediaPtsUs) and parks
+        // the dispatch cursor awaiting the output ring's seek ack; drain the
+        // ack before the first dispatching step.
+        external fun startMultiSourceNodeOwnedAudioGraphPipeline(
+            handle: Long,
+            mediaPtsUs: Long,
+            sysTimeNs: Long,
+        ): String
+
+        // One bounded dispatch attempt at the caller-derived sysTimeNs tick;
+        // the scheduler pulls from the two auto-discovered node-owned
+        // providers. flushTail=false requires a full window on BOTH source
+        // rings (status=deferred_insufficient_joint_source otherwise, with
+        // no mutation; no EOS term); flushTail=true requires BOTH writers
+        // EOS and identical per-track residuals
+        // (tail_flush_track_length_mismatch otherwise, no zero-fill) and
+        // advances exactly min(avail0, avail1, maxFramesPerMix) frames
+        // (tail_flush_partial_window / tail_flush_complete). Every step
+        // status reports both per-track sourceAvailableReadFrames.
+        external fun stepMultiSourceNodeOwnedAudioGraphPipeline(
+            handle: Long,
+            sysTimeNs: Long,
+            flushTail: Boolean,
+        ): String
+
+        // Output-ring reader side: consumes a pending start/seek ack first,
+        // then pops and checksums up to maxFrames of mixed PCM. Consumer
+        // drain is the ONLY output read path in this slice (no AudioTrack
+        // direct-read route).
+        external fun drainMultiSourceNodeOwnedAudioGraphPipelineOutput(
+            handle: Long,
+            maxFrames: Int,
+        ): String
+
+        // Forward-only joint seek. Requires a fully drained output ring,
+        // both node-owned source rings empty, and the shared accepted-frame
+        // axis intact (track_frame_axis_divergence otherwise); reanchors
+        // BOTH tracks at the same accepted frame. The caller must drain the
+        // output-ring ack next.
+        external fun seekMultiSourceNodeOwnedAudioGraphPipeline(
+            handle: Long,
+            targetPtsUs: Long,
+            sysTimeNs: Long,
+        ): String
+
+        // JOINT writer-local EOS: one call sets BOTH node-owned writers EOS
+        // together (cleared by the next successful seek). There is
+        // deliberately no per-track EOS entry point (no independent EOS).
+        external fun setMultiSourceNodeOwnedAudioGraphPipelineEos(
+            handle: Long,
+        ): String
+
+        // Full diagnostic snapshot with Track0/Track1-suffixed per-track
+        // keys, the node-owned/auto-discovery evidence (routedSourceCount,
+        // routedSourceId0/1, nodeOwnsRingTrack0/1), the
+        // fixed-at-construction scratch/storage capacities used to prove
+        // zero native steady-state allocation, and the verbatim proof
+        // boundary. Never silently truncated (status=snapshot_overflow
+        // fails closed instead).
+        external fun snapshotMultiSourceNodeOwnedAudioGraphPipeline(
+            handle: Long,
+        ): String
+
+        // Idempotent erase-once; callable from any thread. Handle 0/unknown
+        // returns status=not_found.
+        external fun destroyMultiSourceNodeOwnedAudioGraphPipelineSmokeSession(
+            handle: Long,
+        ): String
     }
 
     external fun probeCapabilities(): BackendCapabilityReport
