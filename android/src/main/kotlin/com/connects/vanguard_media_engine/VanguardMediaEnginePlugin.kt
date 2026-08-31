@@ -31,6 +31,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidAudioDecoderRingIng
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioGraphPipelineRealDecoderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioGraphPipelineSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioPipelineIntegrationSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidAudioTrackPlaybackSinkSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioTransportCoordinatorSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidConcurrentDecodeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
@@ -143,6 +144,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // oversized plugin is deferred because this slice only mirrors the
     // established diagnostic route wiring.
     private var audioGraphPipelineRealDecoderSmokeCoordinator: AndroidAudioGraphPipelineRealDecoderSmokeCoordinator? = null
+
+    // ── P4-AUDIO-AUDIOTRACK-OUTPUT-SINK-WRITE (P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice I): Kotlin AudioTrack output sink smoke coordinator ────
+    // Registration-only glue; cohesive coordinator extraction from this
+    // oversized plugin is deferred because this slice only mirrors the
+    // established diagnostic route wiring.
+    private var audioTrackPlaybackSinkSmokeCoordinator: AndroidAudioTrackPlaybackSinkSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -327,6 +334,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         audioGraphPipelineRealDecoderSmokeCoordinator = AndroidAudioGraphPipelineRealDecoderSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        audioTrackPlaybackSinkSmokeCoordinator = AndroidAudioTrackPlaybackSinkSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -582,6 +592,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android real decoder audio graph pipeline smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidAudioTrackPlaybackSinkSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = audioTrackPlaybackSinkSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android AudioTrack output sink smoke coordinator unavailable", null)
             }
             return
         }
@@ -1920,6 +1940,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // own native session.
         audioGraphPipelineRealDecoderSmokeCoordinator?.disposeAll()
         audioGraphPipelineRealDecoderSmokeCoordinator = null
+        // Sub-slice I: trips the driver cancellation flag so an in-flight
+        // sink run releases its AudioTrack and native session promptly; its
+        // reply is dropped.
+        audioTrackPlaybackSinkSmokeCoordinator?.disposeAll()
+        audioTrackPlaybackSinkSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.
