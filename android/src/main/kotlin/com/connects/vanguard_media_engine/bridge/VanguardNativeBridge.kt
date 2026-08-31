@@ -548,6 +548,131 @@ class VanguardNativeBridge(
         external fun destroyMultiSourceNodeOwnedAudioGraphPipelineSmokeSession(
             handle: Long,
         ): String
+
+        // ── P4-AUDIO-AAUDIO-NODE-OWNED-SINK-DIAGNOSTIC: two-source node-owned pipeline with a muted native AAudio callback sink ─
+        // Same two-source NODE-OWNED closed-loop graph rig as the
+        // multi-source node-owned seam (two DecodedAudioPcmSourceNode
+        // 6-arg-constructor nodes owning their ring/writer/provider triples,
+        // GraphAudioScheduler auto-discovery, AudioMixBusNode,
+        // ClockedAudioTransportCoordinator, output ring), plus a separate
+        // sink AudioSpscAudioRingBuffer that feeds a MUTED native AAudio
+        // data callback. AAudio is never direct-linked (minSdk 24): start
+        // gates on android_get_device_api_level() >= 26, then
+        // dlopen("libaaudio.so")/dlsym on the owner thread before opening,
+        // failing closed with status=aaudio_unavailable /
+        // status=aaudio_symbol_missing:<name>. The owner-thread pump
+        // checksums the REAL mixed PCM first, then zero-scales it before it
+        // enters the callback sink ring; the data callback only pops
+        // already-muted PCM or zero-fills and updates atomic counters (no
+        // allocation, no locks, no JNI, no stream lifecycle calls).
+        // Handles minted here are NOT interchangeable with any other
+        // diagnostic session registry. Every non-destroy call must run on
+        // the session's creating thread, and unlike the sibling seams
+        // DESTROY IS OWNER-THREAD-ONLY TOO (it performs the AAudio
+        // stop/wait/close). Diagnostic sink foundation only: no product
+        // playback, no audible-output claim, no audio focus/route/dead
+        // object handling, no low-latency/MMAP/EXCLUSIVE, no xrun-freedom
+        // or latency/glitch claim, no export/pass-2 reroute, no
+        // streaming/cache, no iOS.
+
+        // Returns an opaque session handle, or 0 on invalid input (same
+        // bounds as the multi-source node-owned seam plus
+        // sinkRingCapacityFrames: power of two in [64, 65536] and >=
+        // maxFramesPerMix), when either source node does not own its
+        // transport, when the auto-discovered two-track route did not
+        // resolve exactly, or when the 4-live-session registry cap is
+        // reached. Graph rig only: no AAudio touch until start.
+        external fun createAaudioNodeOwnedSinkSmokeSession(
+            sampleRate: Int,
+            channelCount: Int,
+            expectedFrameCount: Int,
+            sourceRingCapacityFrames: Int,
+            outputRingCapacityFrames: Int,
+            sinkRingCapacityFrames: Int,
+            maxFramesPerMix: Int,
+        ): Long
+
+        // Per-track producer side, writing through that track's NODE-OWNED
+        // ring writer; trackIndex must be 0 or 1. Accepted frames are
+        // clamped to min(frameCount, 8192, framesThatFitInBuffer).
+        external fun ingestAaudioNodeOwnedSinkPcm16(
+            handle: Long,
+            trackIndex: Int,
+            pcmBuffer: java.nio.ByteBuffer,
+            frameCount: Int,
+        ): String
+
+        // At most once per session. Staged owner-thread AAudio bring-up
+        // (runtime API gate, dlopen/dlsym, builder config: output/
+        // sampleRate/channelCount/PCM_I16/SHARED/performance NONE/data +
+        // error callback, open, actual-config verification failing closed
+        // with status=aaudio_config_mismatch), then coordinator start at
+        // (sysTimeNs, mediaPtsUs) parking the dispatch cursor awaiting the
+        // output ring's seek ack (pump that ack next), then requestStart
+        // with a bounded waitForStateChange to STARTED.
+        external fun startAaudioNodeOwnedSink(
+            handle: Long,
+            mediaPtsUs: Long,
+            sysTimeNs: Long,
+        ): String
+
+        // One bounded dispatch attempt at the caller-derived sysTimeNs
+        // tick; identical joint-gate / joint-tail-flush semantics to the
+        // multi-source node-owned step seam.
+        external fun stepAaudioNodeOwnedSink(
+            handle: Long,
+            sysTimeNs: Long,
+            flushTail: Boolean,
+        ): String
+
+        // Owner-thread MUTED-SINK pump, the ONLY output-ring read path in
+        // this slice: consumes a pending start/seek ack first, then pops
+        // REAL mixed PCM (checksummed as nativeOutputDrainChecksumHex),
+        // zero-scales it on the owner thread, and pushes the muted frames
+        // into the sink ring feeding the AAudio callback. Pops are clamped
+        // to sink write space so no checksummed frame is ever lost.
+        // maxFrames == 0 is a legal ack-only call.
+        external fun pumpAaudioNodeOwnedSink(
+            handle: Long,
+            maxFrames: Int,
+        ): String
+
+        // Forward-only joint seek on the shared accepted-frame axis
+        // (pumped total stands in for the drained total); the sink ring is
+        // not gated because it holds only already-muted zeros. The caller
+        // must pump the output-ring ack next.
+        external fun seekAaudioNodeOwnedSink(
+            handle: Long,
+            targetPtsUs: Long,
+            sysTimeNs: Long,
+        ): String
+
+        // JOINT writer-local EOS: one call sets BOTH node-owned writers EOS
+        // together (cleared by the next successful seek).
+        external fun setAaudioNodeOwnedSinkEos(
+            handle: Long,
+        ): String
+
+        // Full diagnostic snapshot: two-track node-owned evidence,
+        // fixed-at-construction capacities (including the sink ring) for
+        // the zero-steady-state-allocation lane, AAudio bring-up facts,
+        // callback atomics (mid-run reads may trail an in-flight callback
+        // burst; destroy reports the coherent finals), muted-sink evidence,
+        // and the verbatim proof boundary. Never silently truncated
+        // (status=snapshot_overflow fails closed instead).
+        external fun snapshotAaudioNodeOwnedSink(
+            handle: Long,
+        ): String
+
+        // OWNER-THREAD-ONLY destroy (fails closed with
+        // status=wrong_owner_thread from any other thread): performs the
+        // AAudio requestStop / bounded waitForStateChange / close on the
+        // owner thread, then replies with the coherent final callback
+        // counters and erases the handle once (second call / unknown handle
+        // returns status=not_found).
+        external fun destroyAaudioNodeOwnedSinkSmokeSession(
+            handle: Long,
+        ): String
     }
 
     external fun probeCapabilities(): BackendCapabilityReport

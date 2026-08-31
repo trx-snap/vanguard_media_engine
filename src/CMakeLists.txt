@@ -132,6 +132,7 @@ if (ANDROID)
     "platform/android/src/android_phase4_multi_source_graph_pipeline_session_jni.cpp"
     "platform/android/src/android_phase4_node_owned_source_graph_pipeline_session_jni.cpp"
     "platform/android/src/android_phase4_multi_source_node_owned_pipeline_session_jni.cpp"
+    "platform/android/src/android_phase4_aaudio_node_owned_sink_session_jni.cpp"
     "platform/android/src/android_phase3_multicam_compositor_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_render_jni.cpp"
   )
@@ -159,5 +160,10 @@ if (ANDROID)
     EGL
     mediandk
     vulkan
+    # dl only: AAudio (API 26) is reached exclusively via runtime
+    # dlopen("libaaudio.so")/dlsym behind an android_get_device_api_level()
+    # gate so the minSdk 24 load path never needs libaaudio; never add
+    # `aaudio` here.
+    dl
   )
 endif()

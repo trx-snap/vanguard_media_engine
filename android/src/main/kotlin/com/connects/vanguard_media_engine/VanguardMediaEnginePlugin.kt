@@ -20,6 +20,7 @@ import com.connects.vanguard_media_engine.camera.AndroidCamera2ConcurrentSmokeCo
 import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoordinator
 import com.connects.vanguard_media_engine.camera.AndroidCameraGraphTransactionCoordinator
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidAaudioNodeOwnedSinkSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioDecodeBridgeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioGraphTopologySmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioGraphTransportClockSmokeCoordinator
@@ -192,6 +193,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // oversized plugin is deferred because this slice only mirrors the
     // established diagnostic route wiring.
     private var nodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator: AndroidNodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator? = null
+
+    // ── P4-AUDIO-AAUDIO-NODE-OWNED-SINK-DIAGNOSTIC: two-source node-owned pipeline muted native AAudio callback sink smoke coordinator ────
+    // Registration-only glue; cohesive coordinator extraction from this
+    // oversized plugin is deferred because this slice only mirrors the
+    // established diagnostic route wiring.
+    private var aaudioNodeOwnedSinkSmokeCoordinator: AndroidAaudioNodeOwnedSinkSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -397,6 +404,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         nodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator = AndroidNodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        aaudioNodeOwnedSinkSmokeCoordinator = AndroidAaudioNodeOwnedSinkSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -722,6 +732,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android node-owned AudioTrack sink-clocked transport smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidAaudioNodeOwnedSinkSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = aaudioNodeOwnedSinkSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android AAudio node-owned sink smoke coordinator unavailable", null)
             }
             return
         }
@@ -2097,6 +2117,13 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // reply is dropped.
         nodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator?.disposeAll()
         nodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator = null
+        // P4-AUDIO-AAUDIO-NODE-OWNED-SINK-DIAGNOSTIC: trips the driver
+        // cancellation flag so an in-flight muted-AAudio-sink run releases
+        // its codec/extractor and native session (stopping/closing the
+        // AAudio stream on its own worker thread) promptly; its reply is
+        // dropped.
+        aaudioNodeOwnedSinkSmokeCoordinator?.disposeAll()
+        aaudioNodeOwnedSinkSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.
