@@ -70,6 +70,8 @@ export 'vg_audio_decoder_ring_writer_smoke.dart';
 export 'vg_audio_pipeline_integration_smoke.dart';
 // P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice G3: Android True-DAG Phase 4 native audio decoder ring ingest diagnostic smoke foundation.
 export 'vg_audio_decoder_ring_ingest_smoke.dart';
+// P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice H1: Android True-DAG Phase 4 session-scoped closed-loop native audio graph pipeline smoke foundation.
+export 'vg_audio_graph_pipeline_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.
