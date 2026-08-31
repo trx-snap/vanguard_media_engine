@@ -27,6 +27,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidAudioMixBusSmokeCoo
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioRingBufferTransportSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioClockSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioDecoderRingWriterSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidAudioPipelineIntegrationSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioTransportCoordinatorSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidConcurrentDecodeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidDagDiagnosticsCoordinator
@@ -124,6 +125,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
 
     // ── P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice E: native AudioDecoderRingWriter smoke coordinator ────
     private var audioDecoderRingWriterSmokeCoordinator: AndroidAudioDecoderRingWriterSmokeCoordinator? = null
+
+    // ── P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice F: native closed-loop audio pipeline integration smoke coordinator ────
+    private var audioPipelineIntegrationSmokeCoordinator: AndroidAudioPipelineIntegrationSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -296,6 +300,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         audioDecoderRingWriterSmokeCoordinator = AndroidAudioDecoderRingWriterSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        audioPipelineIntegrationSmokeCoordinator = AndroidAudioPipelineIntegrationSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -521,6 +528,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android audio decoder ring writer smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidAudioPipelineIntegrationSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = audioPipelineIntegrationSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android audio pipeline integration smoke coordinator unavailable", null)
             }
             return
         }
@@ -1834,6 +1851,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         audioRingBufferTransportSmokeCoordinator = null
         audioClockSmokeCoordinator = null
         audioTransportCoordinatorSmokeCoordinator = null
+        audioPipelineIntegrationSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.

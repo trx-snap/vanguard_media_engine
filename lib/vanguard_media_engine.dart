@@ -66,6 +66,8 @@ export 'vg_audio_clock_smoke.dart';
 export 'vg_audio_transport_coordinator_smoke.dart';
 // P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice E: Android True-DAG Phase 4 native AudioDecoderRingWriter smoke foundation.
 export 'vg_audio_decoder_ring_writer_smoke.dart';
+// P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice F: Android True-DAG Phase 4 native closed-loop ingest-to-transport audio graph pipeline integration smoke foundation.
+export 'vg_audio_pipeline_integration_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.

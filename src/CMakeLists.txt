@@ -126,6 +126,7 @@ if (ANDROID)
     "platform/android/src/android_phase4_audio_clock_jni.cpp"
     "platform/android/src/android_phase4_audio_transport_coordinator_jni.cpp"
     "platform/android/src/android_phase4_audio_decoder_ring_writer_jni.cpp"
+    "platform/android/src/android_phase4_audio_pipeline_integration_jni.cpp"
     "platform/android/src/android_phase3_multicam_compositor_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_render_jni.cpp"
   )

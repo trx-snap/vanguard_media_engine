@@ -596,6 +596,19 @@ class VanguardNativeBridge(
     // Writer-local EOS only.
     external fun runAndroidDagPhase4AudioDecoderRingWriterSmoke(): String
 
+    // ── P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice F: closed-loop ingest-to-transport audio graph pipeline integration diagnostic ─
+    // AudioDecoderRingWriter -> source AudioSpscAudioRingBuffer(s) ->
+    // RingBufferAudioSampleProvider(s) -> GraphAudioScheduler -> AudioMixBusNode ->
+    // ClockedAudioTransportCoordinator -> output AudioSpscAudioRingBuffer -> consumer
+    // drain, all inside one single-threaded native call. Pure in-memory C++ proof;
+    // no MediaCodec/MediaExtractor/AudioTrack/AAudio/OpenSL/Oboe, no realtime or
+    // audible playback, no OS callbacks, no threads, no locks, no file IO, no
+    // wall-clock read (caller-supplied sysTimeNs only), no resample, no speed change,
+    // no export or pass-2 graph reroute, no streaming/cache, no iOS, no
+    // product/editor UI. DecodedAudioPcmSourceNode is a topology anchor only (no PCM
+    // ingest/retention). Writer-local EOS only.
+    external fun runAndroidDagPhase4AudioPipelineIntegrationSmoke(): String
+
     // ── P3-CAM-CONCURRENT: Camera2 dual-camera concurrent PRIVATE AHardwareBuffer ─
     // ingest validation diagnostic. Kotlin remains the sole owner of Camera2
     // device/session lifecycle (CameraManager.openCamera, CameraCaptureSession);
