@@ -41,6 +41,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidMultiSourceAudioGra
 import com.connects.vanguard_media_engine.diagnostics.AndroidMultiSourceAudioTrackPlaybackSinkCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioSourceGraphPipelineSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioSourceRealDecoderSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidPassthroughRemuxSinkSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
@@ -178,6 +179,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // oversized plugin is deferred because this slice only mirrors the
     // established diagnostic route wiring.
     private var nodeOwnedAudioSourceRealDecoderSmokeCoordinator: AndroidNodeOwnedAudioSourceRealDecoderSmokeCoordinator? = null
+
+    // ── P4-AUDIO-NODE-OWNED-SINK-CLOCKED-TRANSPORT (P4-AUDIO-GRAPH-TRANSPORT-CLOCK sub-slice O): node-owned pipeline muted AudioTrack sink-clocked transport smoke coordinator ────
+    // Registration-only glue; cohesive coordinator extraction from this
+    // oversized plugin is deferred because this slice only mirrors the
+    // established diagnostic route wiring.
+    private var nodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator: AndroidNodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -377,6 +384,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         nodeOwnedAudioSourceRealDecoderSmokeCoordinator = AndroidNodeOwnedAudioSourceRealDecoderSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        nodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator = AndroidNodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -682,6 +692,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android node-owned audio source real decoder pipeline smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidNodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = nodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android node-owned AudioTrack sink-clocked transport smoke coordinator unavailable", null)
             }
             return
         }
@@ -2045,6 +2065,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // naturally on its own thread and destroys its own native session.
         nodeOwnedAudioSourceRealDecoderSmokeCoordinator?.disposeAll()
         nodeOwnedAudioSourceRealDecoderSmokeCoordinator = null
+        // P4-AUDIO-NODE-OWNED-SINK-CLOCKED-TRANSPORT: trips the driver
+        // cancellation flag so an in-flight sink-clocked run releases its
+        // AudioTrack, codec/extractor, and native session promptly; its
+        // reply is dropped.
+        nodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator?.disposeAll()
+        nodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.

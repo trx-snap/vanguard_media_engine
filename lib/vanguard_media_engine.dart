@@ -84,6 +84,8 @@ export 'vg_multi_source_audio_track_sink_smoke.dart';
 export 'vg_node_owned_audio_source_graph_pipeline_smoke.dart';
 // P4-AUDIO-REAL-DECODER-NODE-OWNED-PIPELINE: Android True-DAG Phase 4 real MediaExtractor/MediaCodec decoder node-owned audio source graph pipeline smoke foundation.
 export 'vg_node_owned_real_decoder_pipeline_smoke.dart';
+// P4-AUDIO-NODE-OWNED-SINK-CLOCKED-TRANSPORT: Android True-DAG Phase 4 node-owned sink-clocked transport smoke foundation.
+export 'vg_node_owned_sink_clocked_transport_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.

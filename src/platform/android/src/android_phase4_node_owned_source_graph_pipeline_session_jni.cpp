@@ -51,6 +51,7 @@
 //   startNodeOwnedAudioSourceGraphPipeline               -> jstring key=value
 //   stepNodeOwnedAudioSourceGraphPipeline                -> jstring key=value
 //   drainNodeOwnedAudioSourceGraphPipelineOutput         -> jstring key=value
+//   readNodeOwnedAudioSourceGraphPipelineOutputPcm16     -> jstring key=value
 //   seekNodeOwnedAudioSourceGraphPipeline                -> jstring key=value
 //   setNodeOwnedAudioSourceGraphPipelineEos              -> jstring key=value
 //   snapshotNodeOwnedAudioSourceGraphPipeline            -> jstring key=value
@@ -686,6 +687,115 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
         "seekAckConsumed=%s;discardedFramesOnSeek=%lld;newStartFrame=%lld",
         static_cast<int>(maxFrames),
         static_cast<long long>(framesDrained),
+        static_cast<long long>(session->outputRing.availableReadFrames()),
+        static_cast<unsigned long long>(session->nativeOutputDrainChecksum),
+        static_cast<long long>(session->totalOutputFramesDrained),
+        seekAckConsumed ? "true" : "false",
+        static_cast<long long>(discardedFramesOnSeek),
+        static_cast<long long>(newStartFrame));
+    return env->NewStringUTF(status);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: readNodeOwnedAudioSourceGraphPipelineOutputPcm16
+// P4-AUDIO-NODE-OWNED-SINK-CLOCKED-TRANSPORT (P4-AUDIO-GRAPH-TRANSPORT-CLOCK
+// sub-slice O). Owner-thread-only output-ring reader that pops mixed PCM16
+// from the NODE-OWNED pipeline's output ring directly into the caller's
+// direct ByteBuffer at byte offset 0 through a single tryPopFrames call (no
+// stack scratch), so Kotlin can hand the same buffer to
+// android.media.AudioTrack without an extra copy. The pop is clamped to
+// min(maxFrames, capacityFramesFromBuffer, kMaxRingCapacityFrames).
+// maxFrames == 0 is legal and still consumes a pending output-ring seek ack
+// (start/seek) before returning. Shares nativeOutputDrainChecksum /
+// totalOutputFramesDrained accounting with
+// drainNodeOwnedAudioSourceGraphPipelineOutput; a single run must pop
+// frames through exactly one of the two read paths.
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Companion_readNodeOwnedAudioSourceGraphPipelineOutputPcm16(
+    JNIEnv* env,
+    jobject /* companion */,
+    jlong sessionHandle,
+    jobject pcmBufferJ,
+    jint maxFrames) {
+
+    char status[640];
+
+    auto replyReject = [&](const char* token) -> jstring {
+        std::snprintf(status, sizeof(status),
+            "status=%s;framesRequested=%d;framesRead=0",
+            token, static_cast<int>(maxFrames));
+        return env->NewStringUTF(status);
+    };
+
+    const std::shared_ptr<NodeOwnedPipelineSession> session =
+        FindNodeOwnedPipelineSession(sessionHandle);
+    if (!session) {
+        return replyReject("not_found");
+    }
+    if (std::this_thread::get_id() != session->ownerThreadId) {
+        return replyReject("wrong_owner_thread");
+    }
+    if (maxFrames < 0) {
+        return replyReject("invalid_max_frames");
+    }
+    if (!pcmBufferJ) {
+        return replyReject("null_pcm_buffer");
+    }
+    const jlong bufferCapacityBytes = env->GetDirectBufferCapacity(pcmBufferJ);
+    if (bufferCapacityBytes < 0) {
+        return replyReject("non_direct_buffer");
+    }
+    void* rawAddr = env->GetDirectBufferAddress(pcmBufferJ);
+    if (!rawAddr) {
+        return replyReject("direct_buffer_address_unavailable");
+    }
+    const int64_t bytesPerFrame = 2ll * session->channelCount;
+    const int64_t capacityFramesFromBuffer =
+        static_cast<int64_t>(bufferCapacityBytes) / bytesPerFrame;
+    if (capacityFramesFromBuffer < static_cast<int64_t>(maxFrames)) {
+        return replyReject("insufficient_buffer_capacity");
+    }
+
+    // Consume a pending start/seek ack exactly like drain does, reporting
+    // any frames discarded at the boundary. This runs even for the legal
+    // maxFrames == 0 ack-only read.
+    bool    seekAckConsumed       = false;
+    int64_t discardedFramesOnSeek = 0;
+    int64_t newStartFrame         = -1;
+    {
+        const int64_t unreadBeforeAck = session->outputRing.availableReadFrames();
+        int64_t ackFrame = -1;
+        if (session->outputRing.consumePendingSeekOnReaderThread(&ackFrame)) {
+            seekAckConsumed       = true;
+            discardedFramesOnSeek = unreadBeforeAck;
+            newStartFrame         = ackFrame;
+        }
+    }
+
+    int16_t* out = static_cast<int16_t*>(rawAddr);
+    const int64_t framesToRead = std::min(
+        {static_cast<int64_t>(maxFrames), capacityFramesFromBuffer, kMaxRingCapacityFrames});
+    int64_t framesRead = 0;
+    if (framesToRead > 0) {
+        framesRead = session->outputRing.tryPopFrames(out, framesToRead);
+        if (framesRead > 0) {
+            session->nativeOutputDrainChecksum = AccumulateChecksum(
+                session->nativeOutputDrainChecksum, out,
+                framesRead * session->channelCount);
+        }
+    }
+    session->totalOutputFramesDrained += framesRead;
+
+    std::snprintf(status, sizeof(status),
+        "status=ok;framesRequested=%d;framesRead=%lld;bytesRead=%lld;channelCount=%d;"
+        "outputAvailableReadFrames=%lld;nativeOutputDrainChecksumHex=%016llx;"
+        "totalOutputFramesDrained=%lld;seekAckConsumed=%s;discardedFramesOnSeek=%lld;"
+        "newStartFrame=%lld",
+        static_cast<int>(maxFrames),
+        static_cast<long long>(framesRead),
+        static_cast<long long>(framesRead * bytesPerFrame),
+        static_cast<int>(session->channelCount),
         static_cast<long long>(session->outputRing.availableReadFrames()),
         static_cast<unsigned long long>(session->nativeOutputDrainChecksum),
         static_cast<long long>(session->totalOutputFramesDrained),

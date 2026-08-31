@@ -382,6 +382,20 @@ class VanguardNativeBridge(
             maxFrames: Int,
         ): String
 
+        // P4-AUDIO-NODE-OWNED-SINK-CLOCKED-TRANSPORT (sub-slice O)
+        // output-ring reader: consumes a pending start/seek ack first, then
+        // pops up to maxFrames of mixed PCM16 from the node-owned pipeline's
+        // output ring directly into the caller's direct ByteBuffer at byte
+        // offset 0 (single pop, no native scratch) so the same buffer can be
+        // handed to android.media.AudioTrack. maxFrames == 0 is a legal
+        // ack-only read. A single run must pop frames through exactly one of
+        // drain/read.
+        external fun readNodeOwnedAudioSourceGraphPipelineOutputPcm16(
+            handle: Long,
+            pcmBuffer: java.nio.ByteBuffer,
+            maxFrames: Int,
+        ): String
+
         // Forward-only seek. Requires a fully drained output ring, an empty
         // node-owned source ring, and targetFrame >= the node-owned
         // provider's cursor; the caller must drain the output-ring ack next.
