@@ -19,11 +19,15 @@
 //   - Lifecycle group: workerJoinOnDestroyOk, idempotentDestroyOk.
 //   - Proof-Boundary & Summary group: canonicalProofBoundaryOk, hasCanonicalProofBoundary, nativeProofBoundaryOk, allNativeLanesPass, lastError.
 //
-// After the X4 run, a second envelope-enabled run (sub-slice X5,
-// P4-AUDIO-ASYNC-RUNTIME-QUEUE-MULTI-SOURCE-DYNAMIC-GAIN-ENVELOPE) proves
-// the dynamic-gain-envelope reference mix identity and telemetry gates:
-//   - Dynamic Gain Envelope group: envelopeProofEnabled, envelopeApplied, envelopeEvaluations, minEffectiveGain, maxEffectiveGain, dynamicGainEnvelopeGatesHeld.
-// Overall exit is PASS only when BOTH runs pass; each phase prints its own
+// Additional sub-slices executed in sequence:
+//   - X5 (P4-AUDIO-ASYNC-RUNTIME-QUEUE-MULTI-SOURCE-DYNAMIC-GAIN-ENVELOPE):
+//     Dynamic Gain Envelope group (envelopeProofEnabled, envelopeApplied, envelopeEvaluations, minEffectiveGain, maxEffectiveGain, dynamicGainEnvelopeGatesHeld).
+//   - X6 (P4-AUDIO-REALTIME-PLAYBACK-SINK-BRIDGE): Non-zero AudioTrack output gain set path.
+//   - X7 (P4-AUDIO-FOCUS-NOISY-EVENT-HANDOFF): Focus request/abandon and becoming-noisy receiver registration/unregistration plus event-plane handoff.
+//   - X8 (P4-AUDIO-FOCUS-DUCK-RESTORE-RESPONSE): Transient duck (0.1) and restore (0.5) volume response.
+//   - X9 (P4-AUDIO-FOCUS-LOSS-PAUSE-RESUME-RESPONSE): Transient focus-loss pause, same-boundary gain resume, and terminal becoming-noisy pause response.
+//   - X10 (P4-AUDIO-FOCUS-LOSS-PERMANENT-STOP-RESPONSE): Terminal permanent focus-loss pause and rejected same-boundary focus-gain attempt (no play, no auto-resume) response.
+// Overall exit is PASS only when ALL runs pass; each phase prints its own
 // PHYSICAL_SMOKE_PASS/FAIL marker.
 
 // ignore_for_file: avoid_print
@@ -352,25 +356,41 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
     // restart policy. ───────────────────────────────────────────────────────
     final focusLossPauseResumePass = await _runFocusLossPauseResumeSmoke();
 
+    // ── X10 (P4-AUDIO-FOCUS-LOSS-PERMANENT-STOP-RESPONSE): permanent
+    // focus-loss pause (AudioTrack.pause() only, PLAYSTATE_PAUSED) at the
+    // terminal EOS point, with same owner-thread-boundary rejection of the
+    // synthetic focus-gain attempt (no play(), no auto-resume, autoResumeAllowed
+    // remains false), applied by the driver owner thread from
+    // coordinator-enqueued synthetic events over the implied X7 focus/noisy
+    // handoff and 0.5 base gain. X8 duck/restore and X9 transient pause/resume
+    // are NOT enabled. Sink-side playstate telemetry only: no acoustic
+    // audibility/speaker verification, no OS focus arbitration correctness,
+    // no transport/presentation pause, no pause/resume SLA, no route-change/
+    // dead-object recovery, no production restart policy. ───────────────────
+    final permanentFocusLossPass = await _runPermanentFocusLossSmoke();
+
     final allPass =
         pass &&
         envelopePass &&
         nonZeroGainPass &&
         focusNoisyPass &&
         duckRestorePass &&
-        focusLossPauseResumePass;
+        focusLossPauseResumePass &&
+        permanentFocusLossPass;
     if (mounted) {
       setState(() {
         _status = allPass
             ? 'PASS (X4 allNativeLanesPass=true, X5 envelope gates held, '
                   'X6 non-zero-gain gates held, X7 focus/noisy gates held, '
                   'X8 duck/restore gates held, '
-                  'X9 focus-loss pause/resume gates held)'
+                  'X9 focus-loss pause/resume gates held, '
+                  'X10 permanent focus-loss stop gates held)'
             : 'FAIL: x4Pass=$pass, envelopePass=$envelopePass, '
                   'nonZeroGainPass=$nonZeroGainPass, '
                   'focusNoisyPass=$focusNoisyPass, '
                   'duckRestorePass=$duckRestorePass, '
                   'focusLossPauseResumePass=$focusLossPauseResumePass, '
+                  'permanentFocusLossPass=$permanentFocusLossPass, '
                   'lastError=${activeReport.lastError}, error=$topLevelError';
       });
     }
@@ -1123,6 +1143,175 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
           : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_LOSS_PAUSE_RESUME_PHYSICAL_SMOKE_FAIL',
     );
     return focusLossPauseResumePass;
+  }
+
+  Future<bool> _runPermanentFocusLossSmoke() async {
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_PERMANENT_FOCUS_LOSS_SMOKE_START',
+    );
+
+    VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport? report;
+    String? topLevelError;
+    File? tempSourceFile;
+
+    try {
+      final clipBData = await rootBundle.load(
+        'assets/manual_test_clips/clip_B.mov',
+      );
+      final tempDir = Directory.systemTemp;
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+      tempSourceFile = File(
+        '${tempDir.path}/p4_async_rt_queue_perm_focus_loss_source_$timestamp.mov',
+      );
+
+      await tempSourceFile.writeAsBytes(
+        clipBData.buffer.asUint8List(
+          clipBData.offsetInBytes,
+          clipBData.lengthInBytes,
+        ),
+        flush: true,
+      );
+
+      report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: tempSourceFile.path,
+            permanentFocusLossProofEnabled: true,
+            timeout: const Duration(seconds: 45),
+          ).timeout(const Duration(seconds: 55));
+    } on TimeoutException catch (te) {
+      topLevelError = 'timeout: $te';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_PERMANENT_FOCUS_LOSS_ERROR: $topLevelError',
+      );
+    } catch (e, st) {
+      topLevelError = '$e\n$st';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_PERMANENT_FOCUS_LOSS_ERROR: $topLevelError',
+      );
+    } finally {
+      if (tempSourceFile != null) {
+        try {
+          if (await tempSourceFile.exists()) {
+            await tempSourceFile.delete();
+          }
+        } catch (_) {}
+      }
+    }
+
+    final pflReport =
+        report ??
+        VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+          <String, Object?>{
+            'pass': false,
+            'status': 'fail',
+            'marker': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .permanentFocusLossFailMarkerConstant,
+            'proofBoundary': '',
+            'nativeProofBoundary': '',
+            'failureReason': 'invocation_failed',
+            'lastError': 'invocation_failed',
+          },
+        );
+
+    // Permanent Focus-Loss Stop Response group. Sink-side AudioTrack
+    // playstate telemetry only: permanent loss (terminal EOS point) ->
+    // pause() -> PAUSED; synthetic focus-gain attempt (same owner-thread
+    // boundary) -> rejected (no play(), autoResumeAllowed=false), held until
+    // release. Applied-event sequence is a monotonic ordinal, not a
+    // drain-pass index.
+    print(
+      '  [LANE] Permanent Focus-Loss Stop Response: '
+      'permanentFocusLossProofEnabled=${pflReport.permanentFocusLossProofEnabled}, '
+      'focusDuckRestoreProofEnabled=${pflReport.focusDuckRestoreProofEnabled}, '
+      'focusLossPauseResumeProofEnabled=${pflReport.focusLossPauseResumeProofEnabled}, '
+      'permanentFocusLossPauseOk=${pflReport.permanentFocusLossPauseOk}, '
+      'focusGainAutoResumeRejectedOk=${pflReport.focusGainAutoResumeRejectedOk}, '
+      'autoResumeAllowed=${pflReport.autoResumeAllowed}, '
+      'terminalPlayStatePausedBeforeReleasePermanentOk=${pflReport.terminalPlayStatePausedBeforeReleasePermanentOk}, '
+      'syntheticPermanentLossPosted=${pflReport.syntheticPermanentLossPosted}, '
+      'syntheticFocusGainAttemptPosted=${pflReport.syntheticFocusGainAttemptPosted}, '
+      'permanentLossEventsEnqueued=${pflReport.permanentLossEventsEnqueued}, '
+      'focusGainAttemptEventsEnqueued=${pflReport.focusGainAttemptEventsEnqueued}, '
+      'permanentLossEventsDrained=${pflReport.permanentLossEventsDrained}, '
+      'focusGainAttemptEventsDrained=${pflReport.focusGainAttemptEventsDrained}, '
+      'permanentFocusLossEventsDropped=${pflReport.permanentFocusLossEventsDropped}, '
+      'permanentLossAppliedCount=${pflReport.permanentLossAppliedCount}, '
+      'focusGainAttemptRejectedCount=${pflReport.focusGainAttemptRejectedCount}, '
+      'permanentLossApplySeq=${pflReport.permanentLossApplySeq}, '
+      'focusGainAttemptApplySeq=${pflReport.focusGainAttemptApplySeq}, '
+      'audioTrackGain=${pflReport.audioTrackGain}, '
+      'permanentFocusLossGatesHeld=${pflReport.permanentFocusLossGatesHeld}, '
+      'focusNoisyEventHandoffGatesHeld=${pflReport.focusNoisyEventHandoffGatesHeld}, '
+      'hasCanonicalProofBoundary=${pflReport.hasCanonicalProofBoundary}, '
+      'allNativeLanesPass=${pflReport.allNativeLanesPass}, '
+      'marker=${pflReport.marker}, '
+      'lastError=${pflReport.lastError}',
+    );
+
+    final lastErrorOk =
+        pflReport.lastError.isEmpty ||
+        pflReport.lastError == 'none' ||
+        pflReport.lastError == 'null';
+
+    final permanentFocusLossPass =
+        (topLevelError == null) &&
+        pflReport.pass &&
+        pflReport.marker ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .permanentFocusLossPassMarkerConstant &&
+        pflReport.permanentFocusLossProofEnabled &&
+        !pflReport.focusDuckRestoreProofEnabled &&
+        !pflReport.focusLossPauseResumeProofEnabled &&
+        pflReport.permanentFocusLossGatesHeld &&
+        pflReport.permanentFocusLossPauseOk &&
+        pflReport.focusGainAutoResumeRejectedOk &&
+        !pflReport.autoResumeAllowed &&
+        pflReport.terminalPlayStatePausedBeforeReleasePermanentOk &&
+        pflReport.syntheticPermanentLossPosted == 1 &&
+        pflReport.syntheticFocusGainAttemptPosted == 1 &&
+        pflReport.permanentLossEventsEnqueued == 1 &&
+        pflReport.focusGainAttemptEventsEnqueued == 1 &&
+        pflReport.permanentLossEventsDrained == 1 &&
+        pflReport.focusGainAttemptEventsDrained == 1 &&
+        pflReport.permanentFocusLossEventsDropped == 0 &&
+        pflReport.permanentLossAppliedCount == 1 &&
+        pflReport.focusGainAttemptRejectedCount == 1 &&
+        pflReport.permanentLossApplySeq >= 0 &&
+        pflReport.focusGainAttemptApplySeq > pflReport.permanentLossApplySeq &&
+        pflReport.focusNoisyEventHandoffGatesHeld &&
+        pflReport.hasCanonicalProofBoundary &&
+        pflReport.proofBoundary ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .permanentFocusLossProofBoundaryConstant &&
+        pflReport.nativeProofBoundaryOk &&
+        pflReport.checksumsMatch &&
+        pflReport.providerCountersClean &&
+        pflReport.sinkAccountingBalanced &&
+        pflReport.realtimeGatesHeld &&
+        pflReport.allNativeLanesPass &&
+        lastErrorOk;
+
+    final summaryPayload = <String, dynamic>{
+      'unit': 'AndroidAsyncRuntimeQueuePermanentFocusLossPhysicalSmokeHarness',
+      'slice': 'P4-AUDIO-FOCUS-LOSS-PERMANENT-STOP-RESPONSE',
+      'target': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .permanentFocusLossProofBoundaryConstant,
+      'nativeTarget': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .nativeProofBoundaryConstant,
+      'pass': permanentFocusLossPass,
+      'report': pflReport.toMap(),
+      'error': topLevelError,
+    };
+
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_PERMANENT_FOCUS_LOSS_JSON:${jsonEncode(summaryPayload)}',
+    );
+    print(
+      permanentFocusLossPass
+          ? 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_PERMANENT_FOCUS_LOSS_PHYSICAL_SMOKE_PASS'
+          : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_PERMANENT_FOCUS_LOSS_PHYSICAL_SMOKE_FAIL',
+    );
+    return permanentFocusLossPass;
   }
 
   @override

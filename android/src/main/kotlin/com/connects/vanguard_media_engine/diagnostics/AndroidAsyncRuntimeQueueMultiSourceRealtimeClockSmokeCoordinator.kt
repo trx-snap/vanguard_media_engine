@@ -70,6 +70,21 @@ import java.util.concurrent.atomic.AtomicInteger
  * no auto-resume before release). Coordinator callbacks only enqueue typed
  * events and counters; the coordinator never touches the AudioTrack.
  *
+ * X10 (P4-AUDIO-FOCUS-LOSS-PERMANENT-STOP-RESPONSE) permanent focus-loss
+ * stop/no-auto-resume proof: when permanentFocusLossProofEnabled=true
+ * (implies the X7 focus/noisy handoff and the non-zero 0.5 base gain, but
+ * NOT X8 or X9), the coordinator owns a distinct bounded typed queue,
+ * ISOLATED from the X9 queue (no shared counters). It posts+awaits ONE
+ * synthetic permanent-loss event before the driver starts (fail-closed
+ * permanent_focus_loss_event_injection_timeout); the driver drains it only
+ * at its terminal EOS point, applies AudioTrack.pause() only, asserts
+ * PLAYSTATE_PAUSED, then invokes the plane callback which enqueues the ONE
+ * synthetic focus-gain-attempt DIRECTLY into the queue (no main-handler
+ * wait) so the driver rejects it at the same owner-thread boundary — no
+ * AudioTrack.play() is ever called, and no resume happens before release.
+ * Coordinator callbacks only enqueue typed events and counters; the
+ * coordinator never touches the AudioTrack.
+ *
  * Honest non-claims (Proof Boundary): diagnostic only — the worker-owned
  * steady_clock is a render/dispatch timebase, not a presentation clock; no
  * caller-supplied native time; playback head / AudioTimestamp / underrun
@@ -83,7 +98,11 @@ import java.util.concurrent.atomic.AtomicInteger
  * pause/play response to synthetic events only — no acoustic audibility or
  * speaker verification, no OS focus arbitration correctness, no
  * transport/presentation pause, no pause/resume SLA, no route-change or
- * dead-object recovery, no production restart policy.
+ * dead-object recovery, no production restart policy. X10 claims sink-side
+ * AudioTrack pause() response to ONE permanent-loss event plus rejection of
+ * a same-boundary synthetic focus-gain attempt (no play(), no auto-resume)
+ * only — the same non-claims as X9 apply, and X10 shares no counters with
+ * the X9 queue.
  *
  * The coordinator dispatches to one background [Thread] per accepted run to
  * keep the Flutter UI thread responsive; runs are serialized by an active
@@ -105,6 +124,8 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
         private const val X8_INJECTION_AWAIT_MS = 5_000L
         private const val X9_QUEUE_CAPACITY = 8
         private const val X9_INJECTION_AWAIT_MS = 5_000L
+        private const val X10_QUEUE_CAPACITY = 8
+        private const val X10_INJECTION_AWAIT_MS = 5_000L
 
         fun ownsMethod(method: String): Boolean = method == METHOD_NAME
     }
@@ -219,6 +240,51 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
         }
     }
 
+    // Bounded thread-safe TYPED queue for the X10 permanent focus-loss
+    // stop/no-auto-resume proof, ISOLATED from the X9 queue above (no
+    // shared counters), with per-tag enqueued/drained accounting. Overflow
+    // drops and increments droppedCount; never blocks callback threads. The
+    // coordinator only enqueues; the driver polls on its owner thread only,
+    // at the terminal EOS point. The coordinator never touches the
+    // AudioTrack.
+    private class PermanentFocusLossEventQueue(capacity: Int = X10_QUEUE_CAPACITY) {
+        private val queue = ArrayBlockingQueue<String>(capacity)
+        val permanentLossEnqueuedCount = AtomicInteger(0)
+        val focusGainAttemptEnqueuedCount = AtomicInteger(0)
+        val permanentLossDrainedCount = AtomicInteger(0)
+        val focusGainAttemptDrainedCount = AtomicInteger(0)
+        val droppedCount = AtomicInteger(0)
+
+        fun offer(tag: String) {
+            if (queue.offer(tag)) {
+                if (tag ==
+                    AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                        .X10_EVENT_PERMANENT_LOSS
+                ) {
+                    permanentLossEnqueuedCount.incrementAndGet()
+                } else {
+                    focusGainAttemptEnqueuedCount.incrementAndGet()
+                }
+            } else {
+                droppedCount.incrementAndGet()
+            }
+        }
+
+        // Must only be called from the driver's owner thread.
+        fun pollOne(): String? {
+            val tag = queue.poll() ?: return null
+            if (tag ==
+                AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                    .X10_EVENT_PERMANENT_LOSS
+            ) {
+                permanentLossDrainedCount.incrementAndGet()
+            } else {
+                focusGainAttemptDrainedCount.incrementAndGet()
+            }
+            return tag
+        }
+    }
+
     private val active = AtomicBoolean(false)
     private val disposed = AtomicBoolean(false)
 
@@ -243,11 +309,15 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
         // pre-seek epoch too short for the native one-second timing gate.
         // X8 implies the X7 focus/noisy handoff (and, inside the driver, the
         // non-zero 0.5 base gain). X9 likewise implies X7 and the non-zero
-        // base gain but is a distinct mode: it never sets the X8 flag.
+        // base gain but is a distinct mode: it never sets the X8 flag. X10
+        // implies the same X7/non-zero-gain setup but is its own distinct
+        // mode too: it never sets the X8 or X9 flags.
         val focusDuckRestoreRequested =
             (args?.get("focusDuckRestoreProofEnabled") as? Boolean) ?: false
         val focusLossPauseResumeRequested =
             (args?.get("focusLossPauseResumeProofEnabled") as? Boolean) ?: false
+        val permanentFocusLossRequested =
+            (args?.get("permanentFocusLossProofEnabled") as? Boolean) ?: false
         val config = AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.RunConfig(
             sourcePath = args?.get("sourcePath") as? String ?: "",
             durationSec = ((args?.get("durationSec") as? Number)?.toDouble() ?: 2.0)
@@ -276,13 +346,18 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
             focusNoisyEventHandoffProofEnabled =
                 ((args?.get("focusNoisyEventHandoffProofEnabled") as? Boolean) ?: false) ||
                     focusDuckRestoreRequested ||
-                    focusLossPauseResumeRequested,
+                    focusLossPauseResumeRequested ||
+                    permanentFocusLossRequested,
             // X8 focus-duck/restore response proof mode; absent/false
             // preserves the exact X4/X5/X6/X7 behavior and args.
             focusDuckRestoreProofEnabled = focusDuckRestoreRequested,
             // X9 focus-loss pause/resume response proof mode; absent/false
             // preserves the exact X4/X5/X6/X7/X8 behavior and args.
             focusLossPauseResumeProofEnabled = focusLossPauseResumeRequested,
+            // X10 permanent focus-loss stop/no-auto-resume proof mode;
+            // absent/false preserves the exact X4/X5/X6/X7/X8/X9 behavior
+            // and args.
+            permanentFocusLossProofEnabled = permanentFocusLossRequested,
         )
         if (!active.compareAndSet(false, true)) {
             result.error(
@@ -329,6 +404,16 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                 val x9SyntheticBecomingNoisyPosted = AtomicInteger(0)
                 val x9Queue: FocusLossPauseResumeEventQueue? =
                     if (x9Enabled) FocusLossPauseResumeEventQueue() else null
+
+                // X10 coordinator-owned permanent focus-loss stop/
+                // no-auto-resume state; null/false unless
+                // permanentFocusLossProofEnabled. ISOLATED from X9: no
+                // shared counters or queue.
+                val x10Enabled = config.permanentFocusLossProofEnabled
+                var x10SyntheticPermanentLossPosted = 0
+                val x10SyntheticFocusGainAttemptPosted = AtomicInteger(0)
+                val x10Queue: PermanentFocusLossEventQueue? =
+                    if (x10Enabled) PermanentFocusLossEventQueue() else null
 
                 try {
                     // ── X7 focus + receiver setup ──────────────────────────
@@ -524,6 +609,60 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                             }
                         } else null
 
+                    // ── X10 deterministic pre-start permanent-loss
+                    // injection ─────────────────────────────────────────────
+                    // Post the ONE synthetic permanent-loss via the main
+                    // handler and AWAIT only its enqueue before the driver
+                    // starts. Fail closed (driver not invoked) on timeout. No
+                    // AudioTrack is touched here.
+                    var x10InjectionTimedOut = false
+                    if (x10Enabled && x7FocusGranted) {
+                        val queue = x10Queue!!
+                        val posted = CountDownLatch(1)
+                        mainHandler.post {
+                            queue.offer(
+                                AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                                    .X10_EVENT_PERMANENT_LOSS,
+                            )
+                            posted.countDown()
+                        }
+                        if (posted.await(X10_INJECTION_AWAIT_MS, TimeUnit.MILLISECONDS)) {
+                            x10SyntheticPermanentLossPosted = 1
+                        } else {
+                            x10InjectionTimedOut = true
+                        }
+                    }
+
+                    // X10 event plane handed to the driver: poll-one on the
+                    // owner thread, drained only at the terminal EOS point;
+                    // the focus-gain-attempt callback enqueues DIRECTLY into
+                    // the coordinator-owned queue (no main-handler wait) so
+                    // the driver rejects it at the same owner-thread
+                    // boundary. Callbacks only enqueue typed events; they
+                    // never touch the AudioTrack.
+                    val permanentFocusLossPlane:
+                        AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                            .PermanentFocusLossEventPlane? =
+                        if (x10Enabled && x7FocusGranted && !x10InjectionTimedOut) {
+                            val queue = x10Queue!!
+                            object :
+                                AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                                    .PermanentFocusLossEventPlane {
+                                override fun pollOneEvent(): String? = queue.pollOne()
+
+                                override fun enqueueSyntheticFocusGainAttempt() {
+                                    if (x10SyntheticFocusGainAttemptPosted
+                                            .compareAndSet(0, 1)
+                                    ) {
+                                        queue.offer(
+                                            AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                                                .X10_EVENT_FOCUS_GAIN_ATTEMPT,
+                                        )
+                                    }
+                                }
+                            }
+                        } else null
+
                     // ── Driver run ─────────────────────────────────────────
                     // In X7/X8/X9 mode with focus denied (or the X8/X9
                     // injection timed out), fail-close before track create
@@ -531,7 +670,8 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                     val shouldRunDriver =
                         (!x7Enabled || x7FocusGranted) &&
                             !x8InjectionTimedOut &&
-                            !x9InjectionTimedOut
+                            !x9InjectionTimedOut &&
+                            !x10InjectionTimedOut
                     val drainFn: (() -> Int)? =
                         if (x7Enabled && x7FocusGranted) x7Queue?.let { q ->
                             { q.drain() }
@@ -539,13 +679,22 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
 
                     val runResult = if (shouldRunDriver) {
                         AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver()
-                            .run(config, drainFn, duckRestorePlane, focusLossPauseResumePlane)
+                            .run(
+                                config,
+                                drainFn,
+                                duckRestorePlane,
+                                focusLossPauseResumePlane,
+                                permanentFocusLossPlane,
+                            )
                     } else if (x8InjectionTimedOut) {
                         AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
                             .failedResult("focus_event_injection_timeout")
                     } else if (x9InjectionTimedOut) {
                         AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
                             .failedResult("focus_loss_event_injection_timeout")
+                    } else if (x10InjectionTimedOut) {
+                        AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                            .failedResult("permanent_focus_loss_event_injection_timeout")
                     } else {
                         AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
                             .failedResult("audio_focus_request_denied")
@@ -597,6 +746,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                         x9SyntheticFocusGainPosted.get(),
                         x9SyntheticBecomingNoisyPosted.get(),
                         x9Queue, runResult,
+                    ) + buildX10Lanes(
+                        x10Enabled, x10SyntheticPermanentLossPosted,
+                        x10SyntheticFocusGainAttemptPosted.get(),
+                        x10Queue, runResult,
                     )
                     val extraMetrics = buildX7Metrics(
                         x7Enabled, x7SyntheticEventsPosted, x7Queue,
@@ -609,6 +762,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                         x9SyntheticFocusGainPosted.get(),
                         x9SyntheticBecomingNoisyPosted.get(),
                         x8RealFocusChangeCallbacks.get(), x9Queue,
+                    ) + buildX10Metrics(
+                        x10Enabled, x10SyntheticPermanentLossPosted,
+                        x10SyntheticFocusGainAttemptPosted.get(),
+                        x8RealFocusChangeCallbacks.get(), x10Queue,
                     )
                     postReply(replied, result, toPayload(runResult, extraLanes, extraMetrics))
                 } catch (t: Throwable) {
@@ -651,6 +808,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                         x9SyntheticFocusGainPosted.get(),
                         x9SyntheticBecomingNoisyPosted.get(),
                         x9Queue, null,
+                    ) + buildX10Lanes(
+                        x10Enabled, x10SyntheticPermanentLossPosted,
+                        x10SyntheticFocusGainAttemptPosted.get(),
+                        x10Queue, null,
                     )
                     val extraMetrics = buildX7Metrics(
                         x7Enabled, x7SyntheticEventsPosted, x7Queue,
@@ -663,6 +824,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                         x9SyntheticFocusGainPosted.get(),
                         x9SyntheticBecomingNoisyPosted.get(),
                         x8RealFocusChangeCallbacks.get(), x9Queue,
+                    ) + buildX10Metrics(
+                        x10Enabled, x10SyntheticPermanentLossPosted,
+                        x10SyntheticFocusGainAttemptPosted.get(),
+                        x8RealFocusChangeCallbacks.get(), x10Queue,
                     )
                     postReply(
                         replied,
@@ -939,6 +1104,77 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
             "becomingNoisyEventsDrained" to (q?.becomingNoisyDrainedCount?.get() ?: 0),
             "focusLossPauseResumeEventsDropped" to (q?.droppedCount?.get() ?: 0),
             "focusLossRealFocusChangeCallbackCount" to realFocusChangeCallbacks,
+        )
+    }
+
+    // Builds the X10 coordinator-owned lane map, folding the driver's
+    // permanent focus-loss metrics into the composite gate. Returns empty
+    // map unless permanentFocusLossProofEnabled. ISOLATED from the X9 lane
+    // builder above: no shared counters. Sink-side playstate proof only (see
+    // class doc non-claims).
+    private fun buildX10Lanes(
+        x10Enabled: Boolean,
+        syntheticPermanentLossPosted: Int,
+        syntheticFocusGainAttemptPosted: Int,
+        queue: PermanentFocusLossEventQueue?,
+        runResult: AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.RunResult?,
+    ): Map<String, Any?> {
+        if (!x10Enabled) return emptyMap()
+        val q = queue
+        val dropped = q?.droppedCount?.get() ?: 0
+        val lossEnqueued = q?.permanentLossEnqueuedCount?.get() ?: 0
+        val attemptEnqueued = q?.focusGainAttemptEnqueuedCount?.get() ?: 0
+        val lossDrained = q?.permanentLossDrainedCount?.get() ?: 0
+        val attemptDrained = q?.focusGainAttemptDrainedCount?.get() ?: 0
+        val m = runResult?.metrics
+        val lossApplied = (m?.get("permanentLossAppliedCount") as? Number)?.toLong() ?: -1L
+        val attemptRejected =
+            (m?.get("focusGainAttemptRejectedCount") as? Number)?.toLong() ?: -1L
+        val pauseOk = (m?.get("permanentFocusLossPauseOk") as? Boolean) ?: false
+        val rejectedOk = (m?.get("focusGainAutoResumeRejectedOk") as? Boolean) ?: false
+        val autoResumeAllowed = (m?.get("autoResumeAllowed") as? Boolean) ?: true
+        val lossSeq = (m?.get("permanentLossApplySeq") as? Number)?.toLong() ?: -1L
+        val attemptSeq = (m?.get("focusGainAttemptApplySeq") as? Number)?.toLong() ?: -1L
+        val terminalPausedOk =
+            (m?.get("terminalPlayStatePausedBeforeReleasePermanentOk") as? Boolean) ?: false
+        val gatesHeld =
+            syntheticPermanentLossPosted == 1 &&
+                syntheticFocusGainAttemptPosted == 1 &&
+                dropped == 0 &&
+                lossEnqueued == 1 && lossDrained == 1 &&
+                attemptEnqueued == 1 && attemptDrained == 1 &&
+                lossApplied == 1L && attemptRejected == 1L &&
+                pauseOk && rejectedOk && !autoResumeAllowed &&
+                lossSeq >= 0L && attemptSeq > lossSeq &&
+                terminalPausedOk
+        return mapOf(
+            "permanentFocusLossGatesHeld" to gatesHeld,
+        )
+    }
+
+    // Builds the X10 coordinator-owned metric map (typed per-tag
+    // posted/enqueued/drained/dropped accounting plus real-callback
+    // telemetry). Returns empty map unless permanentFocusLossProofEnabled.
+    private fun buildX10Metrics(
+        x10Enabled: Boolean,
+        syntheticPermanentLossPosted: Int,
+        syntheticFocusGainAttemptPosted: Int,
+        realFocusChangeCallbacks: Int,
+        queue: PermanentFocusLossEventQueue?,
+    ): Map<String, Any?> {
+        if (!x10Enabled) return emptyMap()
+        val q = queue
+        return mapOf(
+            "syntheticPermanentLossPosted" to syntheticPermanentLossPosted,
+            "syntheticFocusGainAttemptPosted" to syntheticFocusGainAttemptPosted,
+            "permanentLossEventsEnqueued" to (q?.permanentLossEnqueuedCount?.get() ?: 0),
+            "focusGainAttemptEventsEnqueued" to
+                (q?.focusGainAttemptEnqueuedCount?.get() ?: 0),
+            "permanentLossEventsDrained" to (q?.permanentLossDrainedCount?.get() ?: 0),
+            "focusGainAttemptEventsDrained" to
+                (q?.focusGainAttemptDrainedCount?.get() ?: 0),
+            "permanentFocusLossEventsDropped" to (q?.droppedCount?.get() ?: 0),
+            "permanentFocusLossRealFocusChangeCallbackCount" to realFocusChangeCallbacks,
         )
     }
 }
