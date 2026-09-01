@@ -105,6 +105,19 @@ import java.util.concurrent.atomic.AtomicInteger
  * AudioTrack.pause() at the same owner-thread boundary, asserts
  * PLAYSTATE_PAUSED, and never recreates or restarts the sink.
  *
+ * X12 (P4-AUDIO-DEAD-OBJECT-RECOVERY-RESPONSE) dead-object recovery
+ * response proof: when deadObjectRecoveryProofEnabled=true (implies only
+ * the non-zero 0.5 base gain — NOT X7 focus/noisy, X8, X9, X10 or X11; the
+ * driver fails closed if X12 is combined with X8..X11), the coordinator
+ * only parses and passes the flag through. The whole lane is driver-owned
+ * on its owner thread: a SYNTHETIC, deterministic ERROR_DEAD_OBJECT is
+ * substituted for one non-blocking write result (no bytes consumed, no
+ * real OS dead object forced), the old AudioTrack is release()d exactly
+ * once, one new AudioTrack is built with identical parameters, asserted
+ * STATE_INITIALIZED, base gain 0.5 reapplied, play()ed, and the same
+ * unwritten slice is resumed. No coordinator queue, listener, focus, or
+ * receiver is involved.
+ *
  * Honest non-claims (Proof Boundary): diagnostic only — the worker-owned
  * steady_clock is a render/dispatch timebase, not a presentation clock; no
  * caller-supplied native time; playback head / AudioTimestamp / underrun
@@ -396,6 +409,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
             (args?.get("permanentFocusLossProofEnabled") as? Boolean) ?: false
         val routeChangeEventHandoffRequested =
             (args?.get("routeChangeEventHandoffProofEnabled") as? Boolean) ?: false
+        // X12 is isolated: it does NOT imply the X7 focus/noisy setup and is
+        // never OR-ed into any other flag; the driver rejects X12 combined
+        // with X8..X11.
+        val deadObjectRecoveryRequested =
+            (args?.get("deadObjectRecoveryProofEnabled") as? Boolean) ?: false
         val config = AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.RunConfig(
             sourcePath = args?.get("sourcePath") as? String ?: "",
             durationSec = ((args?.get("durationSec") as? Number)?.toDouble() ?: 2.0)
@@ -440,6 +458,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
             // X11 route-change event-handoff response proof mode;
             // absent/false preserves the exact X4..X10 behavior and args.
             routeChangeEventHandoffProofEnabled = routeChangeEventHandoffRequested,
+            // X12 dead-object recovery response proof mode; absent/false
+            // preserves the exact X4..X11 behavior and args (fail-closed
+            // ERROR_DEAD_OBJECT, no recovery).
+            deadObjectRecoveryProofEnabled = deadObjectRecoveryRequested,
         )
         if (!active.compareAndSet(false, true)) {
             result.error(

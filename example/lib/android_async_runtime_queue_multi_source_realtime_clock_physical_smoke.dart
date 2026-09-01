@@ -28,6 +28,7 @@
 //   - X9 (P4-AUDIO-FOCUS-LOSS-PAUSE-RESUME-RESPONSE): Transient focus-loss pause, same-boundary gain resume, and terminal becoming-noisy pause response.
 //   - X10 (P4-AUDIO-FOCUS-LOSS-PERMANENT-STOP-RESPONSE): Terminal permanent focus-loss pause and rejected same-boundary focus-gain attempt (no play, no auto-resume) response.
 //   - X11 (P4-AUDIO-ROUTE-CHANGE-EVENT-HANDOFF-RESPONSE): Real routing-listener register/remove lifecycle, synthetic route_changed handoff with routed-device telemetry, and terminal route_disconnect fail-closed pause (no recreate/restart) response.
+//   - X12 (P4-AUDIO-DEAD-OBJECT-RECOVERY-RESPONSE): SYNTHETIC ERROR_DEAD_OBJECT injected once on the owner-thread write path (no real OS dead object forced), old track released once, one same-parameter AudioTrack recreated, STATE_INITIALIZED asserted, base gain 0.5 reapplied, play() asserted, same unwritten slice resumed with lossless sink accounting.
 // Overall exit is PASS only when ALL runs pass; each phase prints its own
 // PHYSICAL_SMOKE_PASS/FAIL marker.
 
@@ -386,6 +387,22 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
     final routeChangeEventHandoffPass =
         await _runRouteChangeEventHandoffSmoke();
 
+    // ── X12 (P4-AUDIO-DEAD-OBJECT-RECOVERY-RESPONSE): ONE SYNTHETIC
+    // ERROR_DEAD_OBJECT substituted for a non-blocking write result on the
+    // driver owner thread in the post-seek epoch (no bytes consumed, no
+    // real OS dead object forced); the old AudioTrack released exactly
+    // once; ONE AudioTrack recreated with identical format/buffer/mode
+    // parameters, STATE_INITIALIZED asserted, base gain 0.5 reapplied,
+    // play() asserted PLAYSTATE_PLAYING; the same unwritten ByteBuffer
+    // slice resumed with lossless sink accounting and checksum identity.
+    // Isolated lane: X7 focus/noisy, X8 duck/restore, X9 transient
+    // pause/resume, X10 permanent stop and X11 route-change handoff are NOT
+    // enabled. Sink-side proof only: no acoustic audibility/speaker
+    // verification, no seamless hardware hot-swap, no OS route
+    // arbitration, no A/V sync, no latency/glitch/xrun/underrun freedom,
+    // no production restart policy. ───────────────────────────────────────
+    final deadObjectRecoveryPass = await _runDeadObjectRecoverySmoke();
+
     final allPass =
         pass &&
         envelopePass &&
@@ -394,7 +411,8 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
         duckRestorePass &&
         focusLossPauseResumePass &&
         permanentFocusLossPass &&
-        routeChangeEventHandoffPass;
+        routeChangeEventHandoffPass &&
+        deadObjectRecoveryPass;
     if (mounted) {
       setState(() {
         _status = allPass
@@ -403,7 +421,8 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
                   'X8 duck/restore gates held, '
                   'X9 focus-loss pause/resume gates held, '
                   'X10 permanent focus-loss stop gates held, '
-                  'X11 route-change event-handoff gates held)'
+                  'X11 route-change event-handoff gates held, '
+                  'X12 dead-object recovery gates held)'
             : 'FAIL: x4Pass=$pass, envelopePass=$envelopePass, '
                   'nonZeroGainPass=$nonZeroGainPass, '
                   'focusNoisyPass=$focusNoisyPass, '
@@ -411,6 +430,7 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
                   'focusLossPauseResumePass=$focusLossPauseResumePass, '
                   'permanentFocusLossPass=$permanentFocusLossPass, '
                   'routeChangeEventHandoffPass=$routeChangeEventHandoffPass, '
+                  'deadObjectRecoveryPass=$deadObjectRecoveryPass, '
                   'lastError=${activeReport.lastError}, error=$topLevelError';
       });
     }
@@ -1511,6 +1531,190 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
           : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_PHYSICAL_SMOKE_FAIL',
     );
     return routeChangeEventHandoffPass;
+  }
+
+  Future<bool> _runDeadObjectRecoverySmoke() async {
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_SMOKE_START',
+    );
+
+    VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport? report;
+    String? topLevelError;
+    File? tempSourceFile;
+
+    try {
+      final clipBData = await rootBundle.load(
+        'assets/manual_test_clips/clip_B.mov',
+      );
+      final tempDir = Directory.systemTemp;
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+      tempSourceFile = File(
+        '${tempDir.path}/p4_async_rt_queue_dead_object_recovery_source_$timestamp.mov',
+      );
+
+      await tempSourceFile.writeAsBytes(
+        clipBData.buffer.asUint8List(
+          clipBData.offsetInBytes,
+          clipBData.lengthInBytes,
+        ),
+        flush: true,
+      );
+
+      report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: tempSourceFile.path,
+            deadObjectRecoveryProofEnabled: true,
+            timeout: const Duration(seconds: 45),
+          ).timeout(const Duration(seconds: 55));
+    } on TimeoutException catch (te) {
+      topLevelError = 'timeout: $te';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_ERROR: $topLevelError',
+      );
+    } catch (e, st) {
+      topLevelError = '$e\n$st';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_ERROR: $topLevelError',
+      );
+    } finally {
+      if (tempSourceFile != null) {
+        try {
+          if (await tempSourceFile.exists()) {
+            await tempSourceFile.delete();
+          }
+        } catch (_) {}
+      }
+    }
+
+    final doReport =
+        report ??
+        VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+          <String, Object?>{
+            'pass': false,
+            'status': 'fail',
+            'marker': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .deadObjectRecoveryFailMarkerConstant,
+            'proofBoundary': '',
+            'nativeProofBoundary': '',
+            'failureReason': 'invocation_failed',
+            'lastError': 'invocation_failed',
+          },
+        );
+
+    // Dead-Object Recovery Response group. SYNTHETIC ERROR_DEAD_OBJECT
+    // observed exactly once on the owner-thread write path (post-seek
+    // epoch, no bytes consumed) -> old track release() exactly once -> one
+    // same-parameter AudioTrack recreated -> STATE_INITIALIZED -> setVolume
+    // 0.5 -> play() -> PLAYSTATE_PLAYING -> same unwritten slice resumed;
+    // frames written before + after the recovery sum to the sink total and
+    // the checksum identity holds. Not a real OS dead object; playstate
+    // values are sink-side telemetry only.
+    print(
+      '  [LANE] Dead-Object Recovery Response: '
+      'deadObjectRecoveryProofEnabled=${doReport.deadObjectRecoveryProofEnabled}, '
+      'focusNoisyEventHandoffProofEnabled=${doReport.focusNoisyEventHandoffProofEnabled}, '
+      'focusDuckRestoreProofEnabled=${doReport.focusDuckRestoreProofEnabled}, '
+      'focusLossPauseResumeProofEnabled=${doReport.focusLossPauseResumeProofEnabled}, '
+      'permanentFocusLossProofEnabled=${doReport.permanentFocusLossProofEnabled}, '
+      'routeChangeEventHandoffProofEnabled=${doReport.routeChangeEventHandoffProofEnabled}, '
+      'deadObjectOccurredCount=${doReport.deadObjectOccurredCount}, '
+      'syntheticDeadObjectInjectedCount=${doReport.syntheticDeadObjectInjectedCount}, '
+      'deadObjectOldTrackReleasedOk=${doReport.deadObjectOldTrackReleasedOk}, '
+      'deadObjectOldTrackReleaseCount=${doReport.deadObjectOldTrackReleaseCount}, '
+      'deadObjectTrackCreateCount=${doReport.deadObjectTrackCreateCount}, '
+      'deadObjectNewTrackStateInitializedOk=${doReport.deadObjectNewTrackStateInitializedOk}, '
+      'deadObjectNewTrackVolumeSetOk=${doReport.deadObjectNewTrackVolumeSetOk}, '
+      'deadObjectNewTrackPlayOk=${doReport.deadObjectNewTrackPlayOk}, '
+      'deadObjectSliceBytesAtRecovery=${doReport.deadObjectSliceBytesAtRecovery}, '
+      'deadObjectUnwrittenBytesAtRecovery=${doReport.deadObjectUnwrittenBytesAtRecovery}, '
+      'deadObjectSinkFramesWrittenBeforeRecovery=${doReport.deadObjectSinkFramesWrittenBeforeRecovery}, '
+      'deadObjectSinkFramesWrittenAfterRecovery=${doReport.deadObjectSinkFramesWrittenAfterRecovery}, '
+      'framesWrittenToSink=${doReport.framesWrittenToSink}, '
+      'playStateAfterDeadObjectRecreatePlay=${doReport.playStateAfterDeadObjectRecreatePlay}, '
+      'playStateAtReleaseDeadObject=${doReport.playStateAtReleaseDeadObject}, '
+      'audioTrackGain=${doReport.audioTrackGain}, '
+      'deadObjectRecoveryGatesHeld=${doReport.deadObjectRecoveryGatesHeld}, '
+      'sinkWriteAccountingOk=${doReport.sinkWriteAccountingOk}, '
+      'frameAccountingOk=${doReport.frameAccountingOk}, '
+      'checksumIdentityOk=${doReport.checksumIdentityOk}, '
+      'checksumsMatch=${doReport.checksumsMatch}, '
+      'realtimeGatesHeld=${doReport.realtimeGatesHeld}, '
+      'hasCanonicalProofBoundary=${doReport.hasCanonicalProofBoundary}, '
+      'nativeProofBoundaryOk=${doReport.nativeProofBoundaryOk}, '
+      'allNativeLanesPass=${doReport.allNativeLanesPass}, '
+      'marker=${doReport.marker}, '
+      'lastError=${doReport.lastError}',
+    );
+
+    final lastErrorOk =
+        doReport.lastError.isEmpty ||
+        doReport.lastError == 'none' ||
+        doReport.lastError == 'null';
+
+    final deadObjectRecoveryPass =
+        (topLevelError == null) &&
+        doReport.pass &&
+        doReport.marker ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .deadObjectRecoveryPassMarkerConstant &&
+        doReport.deadObjectRecoveryProofEnabled &&
+        !doReport.focusNoisyEventHandoffProofEnabled &&
+        !doReport.focusDuckRestoreProofEnabled &&
+        !doReport.focusLossPauseResumeProofEnabled &&
+        !doReport.permanentFocusLossProofEnabled &&
+        !doReport.routeChangeEventHandoffProofEnabled &&
+        doReport.deadObjectRecoveryGatesHeld &&
+        doReport.deadObjectOccurredCount == 1 &&
+        doReport.syntheticDeadObjectInjectedCount == 1 &&
+        doReport.deadObjectOldTrackReleasedOk &&
+        doReport.deadObjectOldTrackReleaseCount == 1 &&
+        doReport.deadObjectTrackCreateCount == 2 &&
+        doReport.deadObjectNewTrackStateInitializedOk &&
+        doReport.deadObjectNewTrackVolumeSetOk &&
+        doReport.deadObjectNewTrackPlayOk &&
+        doReport.deadObjectUnwrittenBytesAtRecovery > 0 &&
+        doReport.deadObjectSinkFramesWrittenBeforeRecovery > 0 &&
+        doReport.deadObjectSinkFramesWrittenAfterRecovery > 0 &&
+        doReport.deadObjectSinkFramesWrittenBeforeRecovery +
+                doReport.deadObjectSinkFramesWrittenAfterRecovery ==
+            doReport.framesWrittenToSink &&
+        doReport.audioTrackGain == 0.5 &&
+        doReport.sinkWriteAccountingOk &&
+        doReport.frameAccountingOk &&
+        doReport.checksumIdentityOk &&
+        doReport.hasCanonicalProofBoundary &&
+        doReport.proofBoundary ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .deadObjectRecoveryProofBoundaryConstant &&
+        doReport.nativeProofBoundaryOk &&
+        doReport.checksumsMatch &&
+        doReport.providerCountersClean &&
+        doReport.sinkAccountingBalanced &&
+        doReport.realtimeGatesHeld &&
+        doReport.allNativeLanesPass &&
+        lastErrorOk;
+
+    final summaryPayload = <String, dynamic>{
+      'unit': 'AndroidAsyncRuntimeQueueDeadObjectRecoveryPhysicalSmokeHarness',
+      'slice': 'P4-AUDIO-DEAD-OBJECT-RECOVERY-RESPONSE',
+      'target': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .deadObjectRecoveryProofBoundaryConstant,
+      'nativeTarget': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .nativeProofBoundaryConstant,
+      'pass': deadObjectRecoveryPass,
+      'report': doReport.toMap(),
+      'error': topLevelError,
+    };
+
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_JSON:${jsonEncode(summaryPayload)}',
+    );
+    print(
+      deadObjectRecoveryPass
+          ? 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_PASS'
+          : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_FAIL',
+    );
+    return deadObjectRecoveryPass;
   }
 
   @override

@@ -53,10 +53,19 @@ import java.nio.ByteOrder
 //     zero), not a structural claim.
 //   - Fail closed on wrong-owner, queue_full/non-enqueued commands,
 //     non-quiescent seek, per-track frame-axis divergence, every negative
-//     AudioTrack write status including ERROR_DEAD_OBJECT (no recovery),
-//     state/playState mismatch, nonmonotonic native time, deadline
-//     exceeded, timing gate fail, backlog bound fail, and residual sink
-//     frames at end.
+//     AudioTrack write status including ERROR_DEAD_OBJECT (no recovery
+//     outside the X12 lane), state/playState mismatch, nonmonotonic native
+//     time, deadline exceeded, timing gate fail, backlog bound fail, and
+//     residual sink frames at end.
+//
+// X12 (P4-AUDIO-DEAD-OBJECT-RECOVERY-RESPONSE, deadObjectRecoveryProofEnabled)
+// adds a SYNTHETIC, deterministic dead-object seam on the owner-thread sink
+// write path: exactly once, in the post-seek epoch, the write result is
+// replaced by AudioTrack.ERROR_DEAD_OBJECT with no bytes consumed; the owner
+// thread then release()s the old track once, recreates one track with the
+// same parameters, asserts STATE_INITIALIZED, reapplies the 0.5 base gain,
+// play()s it, and resumes the same unwritten slice. This exercises the
+// recovery path only — no real OS dead object is forced or claimed.
 //
 // Honest non-claims: see [PROOF_BOUNDARY]. Diagnostic foundation only — no
 // audible playback, no presentation-clock claim, no second OS decoder, no
@@ -152,6 +161,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // in X11 mode and removed exactly once before release.
         const val X11_EVENT_ROUTE_CHANGED = "route_changed"
         const val X11_EVENT_ROUTE_DISCONNECT = "route_disconnect"
+        // X12 (P4-AUDIO-DEAD-OBJECT-RECOVERY-RESPONSE) markers, emitted only
+        // for dead-object recovery proof runs; X4..X11 markers remain
+        // authoritative for their respective modes.
+        const val DEAD_OBJECT_RECOVERY_PASS_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_PASS"
+        const val DEAD_OBJECT_RECOVERY_FAIL_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_FAIL"
         const val PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_realtime_wall_clock_pacing_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_avsync_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
@@ -192,6 +208,21 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // production restart policy.
         const val ROUTE_CHANGE_EVENT_HANDOFF_PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_route_change_event_handoff_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_only_base_gain_0_5_route_changed_pre_start_synthetic_drain_route_disconnect_terminal_synthetic_pause_fail_closed_no_play_no_auto_resume_no_route_recreation_no_stream_reanchor_no_dead_object_recovery_routing_listener_registered_and_unregistered_exactly_once_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_seamless_route_recreation_no_hot_swap_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
+
+        // X12 mode-specific proof boundary: replaces the default boundary for
+        // dead-object recovery proof runs, which are not muted. The dead
+        // object is a SYNTHETIC, deterministic injection on the owner-thread
+        // non-blocking write path (the write result is replaced by
+        // AudioTrack.ERROR_DEAD_OBJECT exactly once, with no bytes consumed);
+        // no real OS dead object is forced. The response is sink-side only:
+        // release() the old track once, recreate one AudioTrack with the same
+        // format/buffer/mode parameters, assert STATE_INITIALIZED, reapply the
+        // 0.5 base gain, play(), and resume the same unwritten ByteBuffer
+        // slice. No seamless hardware hot-swap, no route re-anchor, no OS
+        // route arbitration, no audio focus policy, no A/V sync, no
+        // latency/glitch/xrun/underrun freedom, no production restart policy.
+        const val DEAD_OBJECT_RECOVERY_PROOF_BOUNDARY =
+            "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_dead_object_recovery_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_synthetic_dead_object_detection_and_recreation_only_base_gain_0_5_synthetic_dead_object_injected_once_old_track_released_new_track_initialized_and_resumed_no_real_os_dead_object_forcing_claim_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_seamless_hardware_hot_swap_claim_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
         // Frozen X3 decode dequeue timeout: the realtime loop must return
         // to ingest/drain work quickly.
@@ -240,6 +271,16 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // this at the terminal point can only mean a runaway producer.
         private const val X11_MAX_TERMINAL_ROUTE_CHANGED_DRAIN = 16
 
+        // X12 synthetic dead-object arming point: inside the POST-SEEK sink
+        // epoch, once that epoch has entered playing and this many extra mix
+        // windows beyond the pre-roll quota have been written to the sink.
+        // Injecting after the seek keeps the epoch-0 seek discard accounting
+        // and the pre-seek native timing window exactly as in X4..X11; the
+        // post-seek budget (>= 2 windows past the quota by construction, in
+        // practice ~26k frames at 48kHz) leaves ample frames for the
+        // recreated track to reach its start threshold and progress its head.
+        private const val DEAD_OBJECT_INJECT_AFTER_WINDOWS = 2L
+
         private const val MAX_CONSECUTIVE_ZERO_WRITES = 500
         private const val ZERO_WRITE_SLEEP_MS = 2L
         private const val HEAD_POLL_SLEEP_MS = 5L
@@ -284,6 +325,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // X10 permanent stop): false preserves the exact X4..X10 behavior
         // and args.
         val routeChangeEventHandoffProofEnabled: Boolean = false,
+        // X12 mode switch (implies the non-zero base gain 0.5 only; NOT X7
+        // focus/noisy, X8 duck/restore, X9 transient pause/resume, X10
+        // permanent stop, or X11 route-change handoff — combining X12 with
+        // X8..X11 fails closed): false preserves the exact X4..X11 behavior
+        // and args, including the fail-closed handling of
+        // AudioTrack.ERROR_DEAD_OBJECT with no recovery.
+        val deadObjectRecoveryProofEnabled: Boolean = false,
     )
 
     // X8 (P4-AUDIO-FOCUS-DUCK-RESTORE-RESPONSE) synthetic duck/restore event
@@ -640,6 +688,38 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
     private var routedDeviceTypeAtRouteChanged = -1
     private var playStateAfterRouteDisconnectPause = -1
     private var playStateAtReleaseRouteChange = -1
+    // X12 dead-object recovery response state. Owner thread only touches the
+    // AudioTrack (write, release, recreate, setVolume, play); terminal
+    // states: created_uninit -> base_volume_set(0.5) -> prerolled_not_playing
+    // -> playing -> [seek epoch pause/flush/re-preroll/play] -> playing ->
+    // synthetic_dead_object_observed_once (post-seek write loop, no bytes
+    // consumed) -> old_track_released_once -> new_track_created_same_params
+    // -> new_track_state_initialized -> new_track_base_volume_set(0.5) ->
+    // new_track_playing -> same_unwritten_slice_resumed -> stopped_at_eos ->
+    // released_once -> injection_disarmed. ISOLATED from X8/X9/X10/X11: no
+    // shared counters. The dead object is a SYNTHETIC injection (the write
+    // result is replaced by ERROR_DEAD_OBJECT exactly once); no real OS dead
+    // object is forced or claimed. The native worker never learns of the
+    // recreation: it only sees normal output-ring backpressure while the
+    // owner thread is busy recreating.
+    private var trackChannelMask = 0
+    private var trackRequestedBufferBytes = 0
+    private var deadObjectTrackCreateCount = 0L
+    private var syntheticDeadObjectInjectedCount = 0L
+    private var deadObjectOccurredCount = 0L
+    private var deadObjectOldTrackReleaseCount = 0L
+    private var deadObjectOldTrackReleasedOk = false
+    private var deadObjectNewTrackStateInitializedOk = false
+    private var deadObjectNewTrackVolumeSetOk = false
+    private var deadObjectNewTrackPlayOk = false
+    private var deadObjectRecoveryGatesHeld = false
+    private var deadObjectSliceBytesAtRecovery = -1L
+    private var deadObjectUnwrittenBytesAtRecovery = -1L
+    private var deadObjectSinkFramesWrittenBeforeRecovery = -1L
+    private var deadObjectEpochFramesWrittenBeforeRecovery = -1L
+    private var deadObjectSinkFramesWrittenAfterRecovery = -1L
+    private var playStateAfterDeadObjectRecreatePlay = -1
+    private var playStateAtReleaseDeadObject = -1
     private val detailParts = mutableListOf<String>()
 
     fun run(
@@ -668,6 +748,18 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
 
         try {
             if (config.sourcePath.isBlank()) throw FailClosed("source_path_required")
+            // X12 is an isolated lane: the sink recreation would invalidate
+            // the X8..X11 sink-side appliers (volume/playstate/routing
+            // listener bound to the old track instance), so combining them
+            // fails closed before any track exists.
+            if (config.deadObjectRecoveryProofEnabled &&
+                (config.focusDuckRestoreProofEnabled ||
+                    config.focusLossPauseResumeProofEnabled ||
+                    config.permanentFocusLossProofEnabled ||
+                    config.routeChangeEventHandoffProofEnabled)
+            ) {
+                throw FailClosed("dead_object_recovery_mode_not_isolated")
+            }
             val windowSec = minOf(config.durationSec, HARD_MAX_DURATION_SEC)
             if (windowSec <= 0.0) throw FailClosed("invalid_decode_duration")
             if (config.seekTargetSec <= 0.0 || config.seekTargetSec >= windowSec) {
@@ -1405,6 +1497,65 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 detailParts.add("routeChangeRoutedDeviceAndPlaystateTelemetryOnly")
             }
 
+            // X12 dead-object recovery response gate. The SYNTHETIC dead
+            // object must have been injected exactly once and observed exactly
+            // once (a real OS ERROR_DEAD_OBJECT in the same run would make the
+            // observed count 2 and fail closed — the two cannot be told apart
+            // and are not claimed apart); the old track released exactly once;
+            // exactly one recreated track (two builds total) asserted
+            // STATE_INITIALIZED, base gain 0.5 reapplied, play() asserted
+            // PLAYSTATE_PLAYING; the resumed slice was a non-empty, frame-
+            // aligned unwritten remainder; and the sink accounting, checksum
+            // identity, and frame accounting gates above still hold (no
+            // dropped or double-counted sink frames). Sink-side proof only: no
+            // real OS dead-object forcing, no acoustic audibility/speaker
+            // verification, no seamless hardware hot-swap, no OS route
+            // arbitration, no A/V sync, no latency/glitch/xrun/underrun
+            // freedom, no production restart policy.
+            if (config.deadObjectRecoveryProofEnabled) {
+                if (syntheticDeadObjectInjectedCount != 1L) {
+                    throw FailClosed(
+                        "synthetic_dead_object_injection_count_bad:" +
+                            "$syntheticDeadObjectInjectedCount"
+                    )
+                }
+                if (deadObjectOccurredCount != 1L) {
+                    throw FailClosed("dead_object_occurred_count_bad:$deadObjectOccurredCount")
+                }
+                deadObjectRecoveryGatesHeld =
+                    deadObjectOldTrackReleasedOk &&
+                        deadObjectOldTrackReleaseCount == 1L &&
+                        deadObjectTrackCreateCount == 2L &&
+                        deadObjectNewTrackStateInitializedOk &&
+                        deadObjectNewTrackVolumeSetOk &&
+                        deadObjectNewTrackPlayOk &&
+                        playStateAfterDeadObjectRecreatePlay == AudioTrack.PLAYSTATE_PLAYING &&
+                        nonZeroGainSetOk &&
+                        audioTrackGain == NONZERO_GAIN_PROOF &&
+                        deadObjectUnwrittenBytesAtRecovery > 0L &&
+                        deadObjectUnwrittenBytesAtRecovery % bytesPerFrame == 0L &&
+                        deadObjectUnwrittenBytesAtRecovery <= deadObjectSliceBytesAtRecovery &&
+                        deadObjectSinkFramesWrittenBeforeRecovery > 0L &&
+                        deadObjectSinkFramesWrittenAfterRecovery > 0L &&
+                        deadObjectSinkFramesWrittenBeforeRecovery +
+                        deadObjectSinkFramesWrittenAfterRecovery ==
+                        framesWrittenToSinkTotal &&
+                        sinkWriteAccountingOk &&
+                        checksumIdentityOk &&
+                        frameAccountingOk
+                if (!deadObjectRecoveryGatesHeld) {
+                    throw FailClosed("dead_object_recovery_gates_failed")
+                }
+                detailParts.add(
+                    "deadObjectUnwrittenBytesAtRecovery=$deadObjectUnwrittenBytesAtRecovery"
+                )
+                detailParts.add(
+                    "deadObjectSinkFramesWrittenBeforeRecovery=" +
+                        "$deadObjectSinkFramesWrittenBeforeRecovery"
+                )
+                detailParts.add("deadObjectSyntheticInjectionOnlyNoRealOsDeadObjectClaim")
+            }
+
             // ── Destroy: join-on-destroy + idempotence ──────────────────────
             val (joinOk, idempotentOk) = s.destroyAndVerifyLifecycle()
             workerJoinOnDestroyOk = joinOk
@@ -1492,6 +1643,20 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 terminalPlayStatePausedBeforeReleaseRouteChangeOk = true
             }
 
+            // X12: explicit owner-thread release of the RECREATED track before
+            // the result is sealed, so the final release count (exactly one
+            // final release, distinct from the one old-track release) is
+            // part of the sealed result. The finally release is then a
+            // guarded no-op.
+            if (config.deadObjectRecoveryProofEnabled) {
+                releaseAudioTrackOnce()
+                if (audioTrackReleaseCount != 1) {
+                    throw FailClosed(
+                        "recreated_audio_track_final_release_count_bad:$audioTrackReleaseCount"
+                    )
+                }
+            }
+
             // Every sink write and boundary callback asserted the single
             // run thread; native enforced owner-only entry points.
             ownerThreadAffinityOk = true
@@ -1542,13 +1707,24 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
 
     // Writes [bytes] bytes from offset 0 of the read buffer with
     // WRITE_NON_BLOCKING only, fail-closed on every negative status code
-    // (including ERROR_DEAD_OBJECT — no recovery claim). Partial writes
+    // (including ERROR_DEAD_OBJECT — no recovery claim — unless the X12
+    // dead-object recovery proof is enabled, see below). Partial writes
     // compact/retain the unwritten remainder in the same buffer and retry;
     // zero writes park briefly under a bounded budget. The per-epoch
     // pre-roll gate opens play() from inside this loop once the quota is
     // written.
+    //
+    // X12 only: exactly once, at the arming point, the write result is
+    // SYNTHESIZED as AudioTrack.ERROR_DEAD_OBJECT without calling write()
+    // (no bytes consumed, buffer position untouched — the documented
+    // "next write returns ERROR_DEAD_OBJECT" shape). The owner thread then
+    // releases the old track once, recreates one track with identical
+    // parameters, and resumes THIS loop on the same unwritten remainder, so
+    // no sink frame is dropped or double-counted (only wrote > 0 results
+    // are ever accounted). Any negative code on the recreated track fails
+    // closed as recreated_audio_track_write_error:<code>.
     private fun writeAllToAudioTrack(bytes: Int) {
-        val track = audioTrack ?: throw FailClosed("audio_track_missing")
+        var track = audioTrack ?: throw FailClosed("audio_track_missing")
         val buf = sinkReadBuf!!
         buf.position(0)
         buf.limit(bytes)
@@ -1556,8 +1732,16 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         while (buf.hasRemaining()) {
             checkDeadline()
             val requested = buf.remaining()
-            val wrote = track.write(buf, requested, AudioTrack.WRITE_NON_BLOCKING)
+            val wrote = if (armSyntheticDeadObject(bytes, requested)) {
+                AudioTrack.ERROR_DEAD_OBJECT
+            } else {
+                track.write(buf, requested, AudioTrack.WRITE_NON_BLOCKING)
+            }
             when {
+                wrote < 0 &&
+                    wrote != AudioTrack.ERROR_DEAD_OBJECT &&
+                    deadObjectOccurredCount > 0L ->
+                    throw FailClosed("recreated_audio_track_write_error:$wrote")
                 wrote > 0 -> {
                     consecutiveZero = 0
                     if (wrote % bytesPerFrame != 0) {
@@ -1586,10 +1770,38 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                     throw FailClosed("audio_track_invalid_operation")
                 wrote == AudioTrack.ERROR_BAD_VALUE ->
                     throw FailClosed("audio_track_bad_value")
-                wrote == AudioTrack.ERROR_DEAD_OBJECT ->
-                    throw FailClosed("audio_track_dead_object")
+                wrote == AudioTrack.ERROR_DEAD_OBJECT -> {
+                    // Default X4..X11 behavior: fail closed, no recovery.
+                    if (!config.deadObjectRecoveryProofEnabled) {
+                        throw FailClosed("audio_track_dead_object")
+                    }
+                    // X12 step 1: observe the (synthetic) dead object exactly
+                    // once. A second observation — synthetic or a real OS one
+                    // — fails closed; the two are not told apart.
+                    deadObjectOccurredCount += 1L
+                    if (deadObjectOccurredCount != 1L) {
+                        throw FailClosed(
+                            "audio_track_dead_object_repeated:$deadObjectOccurredCount"
+                        )
+                    }
+                    deadObjectSliceBytesAtRecovery = bytes.toLong()
+                    deadObjectUnwrittenBytesAtRecovery = requested.toLong()
+                    deadObjectSinkFramesWrittenBeforeRecovery = framesWrittenToSinkTotal
+                    deadObjectEpochFramesWrittenBeforeRecovery = epochFramesWritten
+                    // X12 steps 2..6 on this owner thread; the buffer
+                    // position/limit are untouched, so the loop resumes on
+                    // the same unwritten remainder (step 7).
+                    track = recreateAudioTrackAfterDeadObject(track)
+                    consecutiveZero = 0
+                }
                 else -> throw FailClosed("audio_track_write_error:$wrote")
             }
+        }
+        if (deadObjectOccurredCount > 0L) {
+            // Running total of frames written to the recreated track (the
+            // resumed remainder plus every later slice).
+            deadObjectSinkFramesWrittenAfterRecovery =
+                framesWrittenToSinkTotal - deadObjectSinkFramesWrittenBeforeRecovery
         }
         buf.clear()
         // X7 drain point: owner thread, after write loop completes.
@@ -1605,7 +1817,156 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         drainRouteChangeNonTerminal()
     }
 
+    // ── X12 synthetic dead-object seam + sink recreation (owner thread) ────
+
+    // Arms the ONE synthetic dead object: X12 mode, never injected before,
+    // inside the post-seek sink epoch (seekSinkEpochResetOk) once that epoch
+    // is playing and DEAD_OBJECT_INJECT_AFTER_WINDOWS extra windows beyond
+    // the pre-roll quota have been written. Returns true exactly once per
+    // run; the caller then substitutes ERROR_DEAD_OBJECT for the write
+    // result WITHOUT calling AudioTrack.write(). Synthetic and deterministic
+    // by construction — this is not a forced OS dead object.
+    private fun armSyntheticDeadObject(sliceBytes: Int, unwrittenBytes: Int): Boolean {
+        if (!config.deadObjectRecoveryProofEnabled) return false
+        if (syntheticDeadObjectInjectedCount != 0L) return false
+        if (!seekSinkEpochResetOk || !epochPlayed) return false
+        if (epochFramesWritten < prerollFrames + DEAD_OBJECT_INJECT_AFTER_WINDOWS * mfpm) {
+            return false
+        }
+        if (sliceBytes <= 0 || unwrittenBytes <= 0) return false
+        assertOwnerThread("x12_inject")
+        syntheticDeadObjectInjectedCount = 1L
+        return true
+    }
+
+    // X12 steps 2..6, all on the owner thread, after ERROR_DEAD_OBJECT was
+    // observed on [oldTrack]: release() the old instance exactly once (per
+    // the AudioTrack contract a dead object is no longer valid and must be
+    // recreated; release() frees its native resources), build ONE new
+    // AudioTrack with the identical format/buffer/mode parameters frozen at
+    // first creation, assert STATE_INITIALIZED, reapply the 0.5 base gain,
+    // re-align the start threshold, play() and assert PLAYSTATE_PLAYING,
+    // then re-baseline the epoch head/underrun telemetry on the new
+    // instance. Returns the new track. The native worker is never
+    // involved: it keeps rendering into the output ring and at most sees
+    // normal ring backpressure while this runs.
+    private fun recreateAudioTrackAfterDeadObject(oldTrack: AudioTrack): AudioTrack {
+        assertOwnerThread("x12_recreate")
+        if (deadObjectOldTrackReleaseCount != 0L) {
+            throw FailClosed("dead_object_old_track_already_released")
+        }
+        if (audioTrackReleaseCount > 0) {
+            throw FailClosed("dead_object_after_final_release")
+        }
+        // Step 2: release the old instance exactly once. No pause()/flush():
+        // a dead object accepts no further control calls, and this path
+        // must not depend on them.
+        audioTrack = null
+        try {
+            oldTrack.release()
+        } catch (t: Throwable) {
+            throw FailClosed(
+                "dead_object_old_track_release_failed:${t.javaClass.simpleName}"
+            )
+        }
+        deadObjectOldTrackReleaseCount = 1L
+        deadObjectOldTrackReleasedOk = true
+
+        // Step 3: recreate with the same format/buffer/mode parameters.
+        val newTrack = try {
+            buildDiagnosticAudioTrack()
+        } catch (t: Throwable) {
+            throw FailClosed(
+                "recreated_audio_track_build_failed:${t.javaClass.simpleName}"
+            )
+        }
+        audioTrack = newTrack
+
+        // Step 4: the recreated instance must be initialized.
+        if (newTrack.state != AudioTrack.STATE_INITIALIZED) {
+            throw FailClosed("recreated_audio_track_not_initialized")
+        }
+        deadObjectNewTrackStateInitializedOk = true
+
+        // Step 5: reapply the base gain 0.5 (constant output gain only; no
+        // PCM byte or checksum effect).
+        if (newTrack.setVolume(NONZERO_GAIN_PROOF) != AudioTrack.SUCCESS) {
+            throw FailClosed("recreated_audio_track_volume_set_failed")
+        }
+        deadObjectNewTrackVolumeSetOk = true
+        audioTrackGain = NONZERO_GAIN_PROOF
+
+        // Same-parameter proof: identical buffer geometry and start
+        // threshold as the frozen diagnostic sink, or fail closed.
+        val newBufferFrames = newTrack.bufferSizeInFrames.toLong()
+        if (newBufferFrames != bufferSizeInFrames) {
+            throw FailClosed(
+                "recreated_audio_track_buffer_geometry_mismatch:" +
+                    "$newBufferFrames:$bufferSizeInFrames"
+            )
+        }
+        var newThreshold = newBufferFrames
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            newThreshold = try {
+                newTrack.setStartThresholdInFrames(
+                    prerollFrames.coerceAtMost(newBufferFrames).toInt()
+                ).toLong()
+            } catch (_: Throwable) {
+                newBufferFrames
+            }
+        }
+        if (newThreshold != startThresholdFrames) {
+            throw FailClosed(
+                "recreated_audio_track_start_threshold_mismatch:" +
+                    "$newThreshold:$startThresholdFrames"
+            )
+        }
+
+        // Step 6: start the recreated track. MODE_STREAM begins consuming
+        // once the start threshold is buffered by the resumed writes.
+        newTrack.play()
+        playStateAfterDeadObjectRecreatePlay = newTrack.playState
+        if (playStateAfterDeadObjectRecreatePlay != AudioTrack.PLAYSTATE_PLAYING) {
+            throw FailClosed(
+                "recreated_audio_track_not_playing_after_play:" +
+                    "$playStateAfterDeadObjectRecreatePlay"
+            )
+        }
+        deadObjectNewTrackPlayOk = true
+
+        // Telemetry re-baseline on the new instance: its playback head
+        // starts fresh, so the epoch head/underrun baselines must follow it
+        // (telemetry lanes only; never a native anchor or timebase).
+        epochHeadBaseline = readPlaybackHeadUnsigned()
+        epochUnderrunBaseline = readUnderrunTelemetry()
+        return newTrack
+    }
+
     // ── AudioTrack lifecycle / pre-roll / seek epoch ────────────────────────
+
+    // Builds one diagnostic MODE_STREAM PCM16 AudioTrack from the frozen
+    // channel mask / sample rate / requested buffer bytes. Used for the
+    // initial sink and, in X12 only, for the same-parameter recreation.
+    private fun buildDiagnosticAudioTrack(): AudioTrack {
+        deadObjectTrackCreateCount += 1L
+        return AudioTrack.Builder()
+            .setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                    .build()
+            )
+            .setAudioFormat(
+                AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(sampleRate)
+                    .setChannelMask(trackChannelMask)
+                    .build()
+            )
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .setBufferSizeInBytes(trackRequestedBufferBytes)
+            .build()
+    }
 
     private fun createMutedAudioTrack(sampleRate: Int, channelCount: Int) {
         val channelMask = if (channelCount == 1) {
@@ -1626,23 +1987,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         val windowBytes = (mfpm * bytesPerFrame).toInt()
         val requestedBytes =
             ((maxOf(minBytes, floorBytes) + windowBytes - 1) / windowBytes) * windowBytes
-        val track = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(sampleRate)
-                    .setChannelMask(channelMask)
-                    .build()
-            )
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .setBufferSizeInBytes(requestedBytes)
-            .build()
+        // Frozen for the lifetime of the run: the X12 recreation reuses
+        // exactly these parameters (this.sampleRate was set by the caller).
+        trackChannelMask = channelMask
+        trackRequestedBufferBytes = requestedBytes
+        val track = buildDiagnosticAudioTrack()
         audioTrack = track
         if (track.state != AudioTrack.STATE_INITIALIZED) {
             throw FailClosed("audio_track_not_initialized")
@@ -1651,14 +2000,15 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             config.focusDuckRestoreProofEnabled ||
             config.focusLossPauseResumeProofEnabled ||
             config.permanentFocusLossProofEnabled ||
-            config.routeChangeEventHandoffProofEnabled
+            config.routeChangeEventHandoffProofEnabled ||
+            config.deadObjectRecoveryProofEnabled
         ) {
-            // X6 non-zero-gain proof (and X8/X9/X10/X11, which imply the
+            // X6 non-zero-gain proof (and X8/X9/X10/X11/X12, which imply the
             // non-zero base gain): constant AudioTrack output gain only.
             // Written PCM bytes and every checksum are unaffected by this.
             // Terminal state: created_uninit -> format_frozen_volume_set.
             // Deferred: no acoustic/audibility claim, no route-change
-            // handling, no dead-object recovery.
+            // handling; dead-object recovery only in the X12 synthetic lane.
             if (track.setVolume(NONZERO_GAIN_PROOF) != AudioTrack.SUCCESS) {
                 throw FailClosed("nonzero_gain_volume_set_failed")
             }
@@ -2373,6 +2723,15 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             }
         }
         x11ApplierEnabled = false
+        // X12: capture the recreated sink's playstate at final release
+        // (telemetry only) and disarm the synthetic injection permanently —
+        // any later arming attempt is impossible because the injection
+        // counter is consulted first and the final release count is
+        // asserted inside the recreate helper.
+        if (config.deadObjectRecoveryProofEnabled) {
+            playStateAtReleaseDeadObject =
+                try { track.playState } catch (_: Throwable) { -1 }
+        }
         try { track.pause() } catch (_: Throwable) {}
         try { track.flush() } catch (_: Throwable) {}
         try { track.release() } catch (_: Throwable) {}
@@ -2433,6 +2792,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "routeDisconnectFailClosedPauseOk" to routeDisconnectFailClosedPauseOk,
             "terminalPlayStatePausedBeforeReleaseRouteChangeOk" to
                 terminalPlayStatePausedBeforeReleaseRouteChangeOk,
+            "deadObjectOldTrackReleasedOk" to deadObjectOldTrackReleasedOk,
+            "deadObjectNewTrackStateInitializedOk" to deadObjectNewTrackStateInitializedOk,
+            "deadObjectNewTrackVolumeSetOk" to deadObjectNewTrackVolumeSetOk,
+            "deadObjectNewTrackPlayOk" to deadObjectNewTrackPlayOk,
+            "deadObjectRecoveryGatesHeld" to deadObjectRecoveryGatesHeld,
         )
         val metrics = mapOf<String, Any?>(
             "sampleRate" to sampleRate,
@@ -2583,8 +2947,26 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "routedDeviceTypeAtRouteChanged" to routedDeviceTypeAtRouteChanged,
             "playStateAfterRouteDisconnectPause" to playStateAfterRouteDisconnectPause,
             "playStateAtReleaseRouteChange" to playStateAtReleaseRouteChange,
+            "deadObjectRecoveryProofEnabled" to config.deadObjectRecoveryProofEnabled,
+            "deadObjectOccurredCount" to deadObjectOccurredCount,
+            "syntheticDeadObjectInjectedCount" to syntheticDeadObjectInjectedCount,
+            "deadObjectOldTrackReleaseCount" to deadObjectOldTrackReleaseCount,
+            "deadObjectTrackCreateCount" to deadObjectTrackCreateCount,
+            "deadObjectSliceBytesAtRecovery" to deadObjectSliceBytesAtRecovery,
+            "deadObjectUnwrittenBytesAtRecovery" to deadObjectUnwrittenBytesAtRecovery,
+            "deadObjectSinkFramesWrittenBeforeRecovery" to
+                deadObjectSinkFramesWrittenBeforeRecovery,
+            "deadObjectEpochFramesWrittenBeforeRecovery" to
+                deadObjectEpochFramesWrittenBeforeRecovery,
+            "deadObjectSinkFramesWrittenAfterRecovery" to
+                deadObjectSinkFramesWrittenAfterRecovery,
+            "playStateAfterDeadObjectRecreatePlay" to playStateAfterDeadObjectRecreatePlay,
+            "playStateAtReleaseDeadObject" to playStateAtReleaseDeadObject,
         )
         val marker = when {
+            config.deadObjectRecoveryProofEnabled ->
+                if (pass) DEAD_OBJECT_RECOVERY_PASS_MARKER
+                else DEAD_OBJECT_RECOVERY_FAIL_MARKER
             config.routeChangeEventHandoffProofEnabled ->
                 if (pass) ROUTE_CHANGE_EVENT_HANDOFF_PASS_MARKER
                 else ROUTE_CHANGE_EVENT_HANDOFF_FAIL_MARKER
@@ -2610,10 +2992,14 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             pass = pass,
             status = if (pass) "pass" else failureReason.substringBefore(':').ifBlank { "fail" },
             marker = marker,
-            // X8/X9/X10/X11 replace the default boundary: a focus-duck/
-            // restore, a focus-loss pause/resume, a permanent focus-loss, or
-            // a route-change event-handoff run is neither muted nor no-focus.
+            // X8/X9/X10/X11/X12 replace the default boundary: a focus-duck/
+            // restore, a focus-loss pause/resume, a permanent focus-loss, a
+            // route-change event-handoff, or a dead-object recovery run is
+            // not muted (and X8..X11 are not no-focus; X12 recreates the
+            // sink, which the default boundary disclaims).
             proofBoundary = when {
+                config.deadObjectRecoveryProofEnabled ->
+                    DEAD_OBJECT_RECOVERY_PROOF_BOUNDARY
                 config.routeChangeEventHandoffProofEnabled ->
                     ROUTE_CHANGE_EVENT_HANDOFF_PROOF_BOUNDARY
                 config.permanentFocusLossProofEnabled ->

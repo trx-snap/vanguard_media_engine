@@ -206,6 +206,16 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   static const String routeChangeEventHandoffFailMarkerConstant =
       'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_PHYSICAL_SMOKE_FAIL';
 
+  /// Canonical pass marker emitted by the native harness for X12
+  /// dead-object recovery response proof runs.
+  static const String deadObjectRecoveryPassMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_PASS';
+
+  /// Canonical fail marker emitted by the native harness for X12
+  /// dead-object recovery response proof runs.
+  static const String deadObjectRecoveryFailMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_FAIL';
+
   /// Canonical Kotlin driver proof boundary string (muted AudioTrack sink
   /// claim included) emitted by the native harness.
   static const String proofBoundaryConstant =
@@ -248,6 +258,20 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   /// production restart policy.
   static const String routeChangeEventHandoffProofBoundaryConstant =
       'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_route_change_event_handoff_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_only_base_gain_0_5_route_changed_pre_start_synthetic_drain_route_disconnect_terminal_synthetic_pause_fail_closed_no_play_no_auto_resume_no_route_recreation_no_stream_reanchor_no_dead_object_recovery_routing_listener_registered_and_unregistered_exactly_once_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_seamless_route_recreation_no_hot_swap_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
+
+  /// Canonical X12 dead-object recovery response Kotlin driver proof
+  /// boundary string. Replaces [proofBoundaryConstant] for X12 runs, which
+  /// are not muted and DO recreate the sink. The dead object is a
+  /// SYNTHETIC, deterministic injection on the owner-thread non-blocking
+  /// write path (the write result is replaced by ERROR_DEAD_OBJECT exactly
+  /// once, no bytes consumed); no real OS dead object is forced or claimed.
+  /// Sink-side release/recreate/init/setVolume/play/resume proof only: no
+  /// acoustic audibility/speaker verification, no loudness/SNR, no seamless
+  /// hardware hot-swap, no OS route arbitration correctness, no production
+  /// restart policy, no pause/resume SLA, no latency/glitch/xrun/underrun
+  /// freedom, no A/V sync.
+  static const String deadObjectRecoveryProofBoundaryConstant =
+      'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_dead_object_recovery_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_synthetic_dead_object_detection_and_recreation_only_base_gain_0_5_synthetic_dead_object_injected_once_old_track_released_new_track_initialized_and_resumed_no_real_os_dead_object_forcing_claim_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_seamless_hardware_hot_swap_claim_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
 
   /// Canonical native TU proof boundary string (NO native sink claim)
   /// observed via the snapshot and echoed by the harness.
@@ -666,19 +690,20 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       _boolFact('audioTrackNonZeroGainSetOk');
 
   /// X6 non-zero-gain sink proof gate.
-  /// In X6 mode (and X8/X9/X10/X11 modes, which imply the non-zero 0.5 base
-  /// gain): requires gain set OK, gain > 0.0 and <= 1.0.
+  /// In X6 mode (and X8/X9/X10/X11/X12 modes, which imply the non-zero 0.5
+  /// base gain): requires gain set OK, gain > 0.0 and <= 1.0.
   /// In default X4/X5/X7 mode: requires gain NOT set and gain == 0.0,
   /// proving muted behavior was preserved.
   /// Deferred: no acoustic/speaker measurement, no loudness/SNR, no
-  /// latency/glitch/xrun, no A/V sync, no route-change, no dead-object
-  /// recovery, no product/editor/export/iOS.
+  /// latency/glitch/xrun, no A/V sync, no route-change; dead-object
+  /// recovery only in the X12 synthetic lane; no product/editor/export/iOS.
   bool get nonZeroGainSinkGatesHeld {
     if (!nonZeroGainSinkProofEnabled &&
         !focusDuckRestoreProofEnabled &&
         !focusLossPauseResumeProofEnabled &&
         !permanentFocusLossProofEnabled &&
-        !routeChangeEventHandoffProofEnabled) {
+        !routeChangeEventHandoffProofEnabled &&
+        !deadObjectRecoveryProofEnabled) {
       return !audioTrackNonZeroGainSetOk && audioTrackGain == 0.0;
     }
     return audioTrackNonZeroGainSetOk &&
@@ -1239,15 +1264,132 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
         routeDisconnectApplySeq == routeChangedAppliedCount;
   }
 
+  // ── X12 dead-object recovery response proof getters ──────────────────────
+
+  /// Whether this run executed the X12 dead-object recovery response proof
+  /// mode (false for every default X4..X11 run). X12 implies only the
+  /// non-zero 0.5 base gain — NOT X7 focus/noisy, X8, X9, X10 or X11 (the
+  /// driver fails closed if X12 is combined with X8..X11). The dead object
+  /// is a SYNTHETIC injection on the owner-thread write path; no real OS
+  /// dead object is forced or claimed.
+  bool get deadObjectRecoveryProofEnabled =>
+      _boolFact('deadObjectRecoveryProofEnabled');
+
+  /// Whether the owner thread release()d the old AudioTrack instance
+  /// exactly once after observing ERROR_DEAD_OBJECT.
+  bool get deadObjectOldTrackReleasedOk =>
+      _boolFact('deadObjectOldTrackReleasedOk');
+
+  /// Whether the recreated AudioTrack (same format/buffer/mode parameters)
+  /// reported STATE_INITIALIZED.
+  bool get deadObjectNewTrackStateInitializedOk =>
+      _boolFact('deadObjectNewTrackStateInitializedOk');
+
+  /// Whether AudioTrack.setVolume(0.5) returned SUCCESS on the recreated
+  /// track (constant output gain only; no PCM byte or checksum effect).
+  bool get deadObjectNewTrackVolumeSetOk =>
+      _boolFact('deadObjectNewTrackVolumeSetOk');
+
+  /// Whether AudioTrack.play() on the recreated track was followed by
+  /// PLAYSTATE_PLAYING (sink-side playstate telemetry only).
+  bool get deadObjectNewTrackPlayOk => _boolFact('deadObjectNewTrackPlayOk');
+
+  /// Times ERROR_DEAD_OBJECT was observed on the write path in X12 mode;
+  /// must be exactly 1 (the synthetic one). A real OS dead object in the
+  /// same run would make this 2 and fail closed — the two are not told
+  /// apart. 0 in other modes.
+  int get deadObjectOccurredCount => _intFact('deadObjectOccurredCount');
+
+  /// Times the synthetic dead object was injected (must be exactly 1 in
+  /// X12 mode; 0 in other modes).
+  int get syntheticDeadObjectInjectedCount =>
+      _intFact('syntheticDeadObjectInjectedCount');
+
+  /// Times the old track was release()d for recreation (must be 1).
+  int get deadObjectOldTrackReleaseCount =>
+      _intFact('deadObjectOldTrackReleaseCount');
+
+  /// AudioTrack instances built in this run (must be 2 in X12 mode: the
+  /// original sink plus the one recreation; 1 in other modes).
+  int get deadObjectTrackCreateCount => _intFact('deadObjectTrackCreateCount');
+
+  /// Bytes of the current slice at the injection point (-1 if never).
+  int get deadObjectSliceBytesAtRecovery =>
+      _intFact('deadObjectSliceBytesAtRecovery', -1);
+
+  /// Unwritten bytes of that slice resumed on the recreated track (-1 if
+  /// never; must be > 0, frame-aligned and <= the slice bytes).
+  int get deadObjectUnwrittenBytesAtRecovery =>
+      _intFact('deadObjectUnwrittenBytesAtRecovery', -1);
+
+  /// Sink frames written (to the old track) before the injection (-1 if
+  /// never; must be > 0).
+  int get deadObjectSinkFramesWrittenBeforeRecovery =>
+      _intFact('deadObjectSinkFramesWrittenBeforeRecovery', -1);
+
+  /// Sink frames written to the recreated track after the injection (-1 if
+  /// never; must be > 0 and, with the before count, sum to
+  /// [framesWrittenToSink]).
+  int get deadObjectSinkFramesWrittenAfterRecovery =>
+      _intFact('deadObjectSinkFramesWrittenAfterRecovery', -1);
+
+  /// AudioTrack playstate observed right after play() on the recreated
+  /// track (-1 if never; 3 == PLAYSTATE_PLAYING). Telemetry only.
+  int get playStateAfterDeadObjectRecreatePlay =>
+      _intFact('playStateAfterDeadObjectRecreatePlay', -1);
+
+  /// AudioTrack playstate of the recreated track observed at final release
+  /// (-1 if never). Telemetry only.
+  int get playStateAtReleaseDeadObject =>
+      _intFact('playStateAtReleaseDeadObject', -1);
+
+  /// X12 dead-object recovery response gate.
+  /// In X12 mode: the synthetic dead object injected and observed exactly
+  /// once; the old track released exactly once; exactly two track builds;
+  /// the recreated track initialized, base gain 0.5 reapplied, and playing
+  /// after play(); a non-empty frame-aligned unwritten remainder resumed;
+  /// frames written before and after the recovery both positive and
+  /// summing to the sink total (no dropped or double-counted sink frames);
+  /// and the sink accounting / checksum identity / frame accounting lanes
+  /// held. Sink-side proof only: no real OS dead-object forcing, no
+  /// acoustic audibility/speaker verification, no seamless hardware
+  /// hot-swap, no OS route arbitration, no A/V sync, no
+  /// latency/glitch/xrun/underrun freedom, no production restart policy.
+  /// In default X4..X11 mode: vacuously true (backward compatible).
+  bool get deadObjectRecoveryGatesHeld {
+    if (!deadObjectRecoveryProofEnabled) return true;
+    return syntheticDeadObjectInjectedCount == 1 &&
+        deadObjectOccurredCount == 1 &&
+        deadObjectOldTrackReleasedOk &&
+        deadObjectOldTrackReleaseCount == 1 &&
+        deadObjectTrackCreateCount == 2 &&
+        deadObjectNewTrackStateInitializedOk &&
+        deadObjectNewTrackVolumeSetOk &&
+        deadObjectNewTrackPlayOk &&
+        deadObjectUnwrittenBytesAtRecovery > 0 &&
+        deadObjectUnwrittenBytesAtRecovery <= deadObjectSliceBytesAtRecovery &&
+        deadObjectSinkFramesWrittenBeforeRecovery > 0 &&
+        deadObjectSinkFramesWrittenAfterRecovery > 0 &&
+        deadObjectSinkFramesWrittenBeforeRecovery +
+                deadObjectSinkFramesWrittenAfterRecovery ==
+            framesWrittenToSink &&
+        sinkWriteAccountingOk &&
+        checksumIdentityOk &&
+        frameAccountingOk;
+  }
+
   /// Whether [proofBoundary] matches the canonical Kotlin driver boundary
   /// for this run's mode. X8 runs must carry the mode-specific
   /// [focusDuckRestoreProofBoundaryConstant], X9 runs the mode-specific
   /// [focusLossPauseResumeProofBoundaryConstant], X10 runs the
-  /// mode-specific [permanentFocusLossProofBoundaryConstant], and X11 runs
-  /// the mode-specific [routeChangeEventHandoffProofBoundaryConstant] —
-  /// never the default boundary, whose muted/no-focus claims would be false
-  /// for X8/X9/X10/X11.
-  bool get hasCanonicalProofBoundary => routeChangeEventHandoffProofEnabled
+  /// mode-specific [permanentFocusLossProofBoundaryConstant], X11 runs the
+  /// mode-specific [routeChangeEventHandoffProofBoundaryConstant], and X12
+  /// runs the mode-specific [deadObjectRecoveryProofBoundaryConstant] —
+  /// never the default boundary, whose muted/no-focus/no-recreation claims
+  /// would be false for X8..X12.
+  bool get hasCanonicalProofBoundary => deadObjectRecoveryProofEnabled
+      ? proofBoundary == deadObjectRecoveryProofBoundaryConstant
+      : routeChangeEventHandoffProofEnabled
       ? proofBoundary == routeChangeEventHandoffProofBoundaryConstant
       : permanentFocusLossProofEnabled
       ? proofBoundary == permanentFocusLossProofBoundaryConstant
@@ -1323,7 +1465,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       pass &&
       status.toLowerCase() == 'pass' &&
       marker ==
-          (routeChangeEventHandoffProofEnabled
+          (deadObjectRecoveryProofEnabled
+              ? deadObjectRecoveryPassMarkerConstant
+              : routeChangeEventHandoffProofEnabled
               ? routeChangeEventHandoffPassMarkerConstant
               : permanentFocusLossProofEnabled
               ? permanentFocusLossPassMarkerConstant
@@ -1357,6 +1501,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       routeChangeEventHandoffGatesHeld &&
       (!routeChangeEventHandoffProofEnabled ||
           _boolFact('routeChangeEventHandoffGatesHeld')) &&
+      deadObjectRecoveryGatesHeld &&
+      (!deadObjectRecoveryProofEnabled ||
+          _boolFact('deadObjectRecoveryGatesHeld')) &&
       hasCanonicalProofBoundary &&
       nativeProofBoundaryOk &&
       formatProbeOk &&
@@ -1379,6 +1526,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
           focusLossPauseResumeProofEnabled ||
           permanentFocusLossProofEnabled ||
           routeChangeEventHandoffProofEnabled ||
+          deadObjectRecoveryProofEnabled ||
           mutedOutputOk) &&
       playbackHeadTelemetryOk &&
       realtimeNativeElapsedOk &&
@@ -1809,6 +1957,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
     bool focusLossPauseResumeProofEnabled = false,
     bool permanentFocusLossProofEnabled = false,
     bool routeChangeEventHandoffProofEnabled = false,
+    bool deadObjectRecoveryProofEnabled = false,
     Duration? timeout,
     MethodChannel? channel,
   }) async {
@@ -1857,6 +2006,11 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       // flags.
       if (routeChangeEventHandoffProofEnabled)
         'routeChangeEventHandoffProofEnabled': true,
+      // Only sent for X12 dead-object recovery proof runs so the default
+      // X4..X11 argument shape stays frozen. X12 is isolated: the
+      // coordinator never derives X7 or any other mode flag from it.
+      if (deadObjectRecoveryProofEnabled)
+        'deadObjectRecoveryProofEnabled': true,
     };
     try {
       final future = ch.invokeMethod<Object?>(methodName, args);

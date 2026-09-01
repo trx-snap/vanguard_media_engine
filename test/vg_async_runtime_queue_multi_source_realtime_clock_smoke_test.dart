@@ -32,6 +32,11 @@ const _kPermanentFocusLossPassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_PERMANENT_FOCUS_LOSS_PHYSICAL_SMOKE_PASS';
 const _kRouteChangeEventHandoffPassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_PHYSICAL_SMOKE_PASS';
+const _kDeadObjectRecoveryPassMarker =
+    'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_PASS';
+
+const _kDeadObjectRecoveryProofBoundary =
+    'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_dead_object_recovery_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_synthetic_dead_object_detection_and_recreation_only_base_gain_0_5_synthetic_dead_object_injected_once_old_track_released_new_track_initialized_and_resumed_no_real_os_dead_object_forcing_claim_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_seamless_hardware_hot_swap_claim_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
 
 const _kFocusLossPauseResumeProofBoundary =
     'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_loss_pause_resume_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_play_only_base_gain_0_5_transient_loss_pause_focus_gain_play_becoming_noisy_terminal_pause_no_flush_no_stop_no_auto_resume_before_release_no_transport_pause_no_presentation_pause_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_sla_no_production_restart_policy_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
@@ -3219,6 +3224,539 @@ void main() {
         );
       },
     );
+  });
+
+  group('X12 dead-object recovery response proof mode', () {
+    // X12 pass sample map: X4 base with the X12 marker, the X12 mode-specific
+    // proof boundary, the implied non-zero 0.5 base gain facts, and the X12
+    // dead-object recovery lanes/metrics. X12 is isolated: X7 focus/noisy,
+    // X8 duck/restore, X9 transient pause/resume, X10 permanent-stop and X11
+    // route-change facts all stay at their defaults. The dead object is a
+    // SYNTHETIC injection; the sample geometry places it in the post-seek
+    // epoch after 62208 sink frames (57600 pre-seek + 4608 post-seek) with
+    // the remaining 21760 frames written to the recreated track.
+    Map<String, Object?> createX12SampleRawMap([
+      Map<String, Object?>? overrides,
+    ]) {
+      final result = _createSampleRawMap();
+      result['marker'] = _kDeadObjectRecoveryPassMarker;
+      result['proofBoundary'] = _kDeadObjectRecoveryProofBoundary;
+      final rawStrings = result['raw'] as Map<String, String>;
+      rawStrings['marker'] = _kDeadObjectRecoveryPassMarker;
+      rawStrings['proofBoundary'] = _kDeadObjectRecoveryProofBoundary;
+      final lanes = result['lanes'] as Map<String, Object?>;
+      // X12 implies the non-zero base gain: the muted lane is honestly false.
+      lanes['mutedOutputOk'] = false;
+      // X12 driver lanes.
+      lanes['deadObjectOldTrackReleasedOk'] = true;
+      lanes['deadObjectNewTrackStateInitializedOk'] = true;
+      lanes['deadObjectNewTrackVolumeSetOk'] = true;
+      lanes['deadObjectNewTrackPlayOk'] = true;
+      lanes['deadObjectRecoveryGatesHeld'] = true;
+      final metrics = result['metrics'] as Map<String, Object?>;
+      // Implied non-zero 0.5 base gain facts (nonZeroGainSinkProofEnabled,
+      // focusNoisyEventHandoffProofEnabled, focusDuckRestoreProofEnabled,
+      // focusLossPauseResumeProofEnabled, permanentFocusLossProofEnabled and
+      // routeChangeEventHandoffProofEnabled stay false).
+      metrics['audioTrackGain'] = 0.5;
+      metrics['audioTrackNonZeroGainSetOk'] = true;
+      metrics['focusNoisyEventHandoffProofEnabled'] = false;
+      metrics['focusDuckRestoreProofEnabled'] = false;
+      metrics['focusLossPauseResumeProofEnabled'] = false;
+      metrics['permanentFocusLossProofEnabled'] = false;
+      metrics['routeChangeEventHandoffProofEnabled'] = false;
+      // X12 driver metrics (sink-side accounting/playstate telemetry only).
+      metrics['deadObjectRecoveryProofEnabled'] = true;
+      metrics['deadObjectOccurredCount'] = 1;
+      metrics['syntheticDeadObjectInjectedCount'] = 1;
+      metrics['deadObjectOldTrackReleaseCount'] = 1;
+      metrics['deadObjectTrackCreateCount'] = 2;
+      metrics['deadObjectSliceBytesAtRecovery'] = 16384;
+      metrics['deadObjectUnwrittenBytesAtRecovery'] = 16384;
+      metrics['deadObjectSinkFramesWrittenBeforeRecovery'] = 62208;
+      metrics['deadObjectEpochFramesWrittenBeforeRecovery'] = 4608;
+      metrics['deadObjectSinkFramesWrittenAfterRecovery'] = 21760;
+      metrics['playStateAfterDeadObjectRecreatePlay'] = 3;
+      metrics['playStateAtReleaseDeadObject'] = 3;
+      if (overrides != null) {
+        for (final entry in overrides.entries) {
+          if (lanes.containsKey(entry.key)) lanes[entry.key] = entry.value;
+          if (metrics.containsKey(entry.key)) metrics[entry.key] = entry.value;
+          result[entry.key] = entry.value;
+        }
+      }
+      return result;
+    }
+
+    test('default X4 pass report has deadObjectRecoveryProofEnabled=false '
+        'and gate vacuously true', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createSampleRawMap(),
+          );
+      expect(report.deadObjectRecoveryProofEnabled, isFalse);
+      expect(report.deadObjectOldTrackReleasedOk, isFalse);
+      expect(report.deadObjectNewTrackStateInitializedOk, isFalse);
+      expect(report.deadObjectNewTrackVolumeSetOk, isFalse);
+      expect(report.deadObjectNewTrackPlayOk, isFalse);
+      expect(report.deadObjectOccurredCount, equals(0));
+      expect(report.syntheticDeadObjectInjectedCount, equals(0));
+      expect(report.deadObjectOldTrackReleaseCount, equals(0));
+      expect(report.deadObjectTrackCreateCount, equals(0));
+      expect(report.deadObjectSliceBytesAtRecovery, equals(-1));
+      expect(report.deadObjectUnwrittenBytesAtRecovery, equals(-1));
+      expect(report.deadObjectSinkFramesWrittenBeforeRecovery, equals(-1));
+      expect(report.deadObjectSinkFramesWrittenAfterRecovery, equals(-1));
+      expect(report.playStateAfterDeadObjectRecreatePlay, equals(-1));
+      expect(report.playStateAtReleaseDeadObject, equals(-1));
+      // Gate is vacuously true when X12 disabled.
+      expect(report.deadObjectRecoveryGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X11 pass report keeps X12 defaults and still passes', () {
+      final result = _createSampleRawMap();
+      result['marker'] = _kRouteChangeEventHandoffPassMarker;
+      result['proofBoundary'] = _kRouteChangeEventHandoffProofBoundary;
+      final rawStrings = result['raw'] as Map<String, String>;
+      rawStrings['marker'] = _kRouteChangeEventHandoffPassMarker;
+      rawStrings['proofBoundary'] = _kRouteChangeEventHandoffProofBoundary;
+      final lanes = result['lanes'] as Map<String, Object?>;
+      lanes['mutedOutputOk'] = false;
+      lanes['audioFocusRequestGrantedOk'] = true;
+      lanes['audioFocusAbandonedOk'] = true;
+      lanes['noisyReceiverRegisteredOk'] = true;
+      lanes['noisyReceiverUnregisteredOk'] = true;
+      lanes['focusNoisyOwnerThreadDrainOk'] = true;
+      lanes['focusNoisyEventHandoffGatesHeld'] = true;
+      lanes['routingListenerRegisteredOk'] = true;
+      lanes['routingListenerUnregisteredOk'] = true;
+      lanes['routeChangeObservationOk'] = true;
+      lanes['routeDisconnectFailClosedPauseOk'] = true;
+      lanes['terminalPlayStatePausedBeforeReleaseRouteChangeOk'] = true;
+      lanes['routeChangeEventHandoffGatesHeld'] = true;
+      final metrics = result['metrics'] as Map<String, Object?>;
+      metrics['focusNoisyEventHandoffProofEnabled'] = true;
+      metrics['focusNoisySyntheticEventsPosted'] = 2;
+      metrics['focusNoisyEventsEnqueued'] = 2;
+      metrics['focusNoisyEventsDropped'] = 0;
+      metrics['focusNoisyEventsDrained'] = 2;
+      metrics['audioTrackGain'] = 0.5;
+      metrics['audioTrackNonZeroGainSetOk'] = true;
+      metrics['routeChangeEventHandoffProofEnabled'] = true;
+      metrics['routeChangedAppliedCount'] = 1;
+      metrics['routeDisconnectAppliedCount'] = 1;
+      metrics['routeChangedApplySeq'] = 0;
+      metrics['routeDisconnectApplySeq'] = 1;
+      metrics['syntheticRouteChangedPosted'] = 1;
+      metrics['syntheticRouteDisconnectPosted'] = 1;
+      metrics['routeChangedEventsEnqueued'] = 1;
+      metrics['routeDisconnectEventsEnqueued'] = 1;
+      metrics['routeChangedEventsDrained'] = 1;
+      metrics['routeDisconnectEventsDrained'] = 1;
+      metrics['routeChangeEventsDropped'] = 0;
+      metrics['realRoutingChangedCallbackCount'] = 0;
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            result,
+          );
+      expect(report.routeChangeEventHandoffProofEnabled, isTrue);
+      expect(report.deadObjectRecoveryProofEnabled, isFalse);
+      expect(report.deadObjectRecoveryGatesHeld, isTrue);
+      expect(report.hasCanonicalProofBoundary, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X12 pass report passes all gates with one synthetic dead object, '
+        'old track released once, recreated track initialized, gain set, '
+        'playing, and the unwritten slice resumed', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX12SampleRawMap(),
+          );
+      expect(report.marker, equals(_kDeadObjectRecoveryPassMarker));
+      expect(report.proofBoundary, equals(_kDeadObjectRecoveryProofBoundary));
+      expect(report.deadObjectRecoveryProofEnabled, isTrue);
+      // X12 is isolated: X7, X8, X9, X10 and X11 stay disabled.
+      expect(report.focusNoisyEventHandoffProofEnabled, isFalse);
+      expect(report.focusNoisyEventHandoffGatesHeld, isTrue);
+      expect(report.focusDuckRestoreProofEnabled, isFalse);
+      expect(report.focusDuckRestoreGatesHeld, isTrue);
+      expect(report.focusLossPauseResumeProofEnabled, isFalse);
+      expect(report.focusLossPauseResumeGatesHeld, isTrue);
+      expect(report.permanentFocusLossProofEnabled, isFalse);
+      expect(report.permanentFocusLossGatesHeld, isTrue);
+      expect(report.routeChangeEventHandoffProofEnabled, isFalse);
+      expect(report.routeChangeEventHandoffGatesHeld, isTrue);
+      // X12 gates held.
+      expect(report.deadObjectOccurredCount, equals(1));
+      expect(report.syntheticDeadObjectInjectedCount, equals(1));
+      expect(report.deadObjectOldTrackReleasedOk, isTrue);
+      expect(report.deadObjectOldTrackReleaseCount, equals(1));
+      expect(report.deadObjectTrackCreateCount, equals(2));
+      expect(report.deadObjectNewTrackStateInitializedOk, isTrue);
+      expect(report.deadObjectNewTrackVolumeSetOk, isTrue);
+      expect(report.deadObjectNewTrackPlayOk, isTrue);
+      expect(report.deadObjectSliceBytesAtRecovery, equals(16384));
+      expect(report.deadObjectUnwrittenBytesAtRecovery, equals(16384));
+      expect(report.deadObjectSinkFramesWrittenBeforeRecovery, equals(62208));
+      expect(report.deadObjectSinkFramesWrittenAfterRecovery, equals(21760));
+      expect(
+        report.deadObjectSinkFramesWrittenBeforeRecovery +
+            report.deadObjectSinkFramesWrittenAfterRecovery,
+        equals(report.framesWrittenToSink),
+      );
+      expect(report.playStateAfterDeadObjectRecreatePlay, equals(3));
+      expect(report.playStateAtReleaseDeadObject, equals(3));
+      expect(report.deadObjectRecoveryGatesHeld, isTrue);
+      // Implied non-zero-gain gate holds; accounting/identity untouched.
+      expect(report.nonZeroGainSinkGatesHeld, isTrue);
+      expect(report.audioTrackGain, equals(0.5));
+      expect(report.sinkWriteAccountingOk, isTrue);
+      expect(report.frameAccountingOk, isTrue);
+      expect(report.checksumsMatch, isTrue);
+      expect(report.realtimeGatesHeld, isTrue);
+      expect(report.hasCanonicalProofBoundary, isTrue);
+      expect(report.nativeProofBoundaryOk, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X12 run must carry the dead-object recovery pass marker', () {
+      for (final wrongMarker in const [
+        _kPassMarker,
+        _kNonZeroGainPassMarker,
+        _kFocusNoisyPassMarker,
+        _kFocusDuckRestorePassMarker,
+        _kFocusLossPauseResumePassMarker,
+        _kPermanentFocusLossPassMarker,
+        _kRouteChangeEventHandoffPassMarker,
+      ]) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX12SampleRawMap({'marker': wrongMarker}),
+            );
+        expect(report.allNativeLanesPass, isFalse, reason: wrongMarker);
+      }
+    });
+
+    test('X12 must carry its own proof boundary, not the default, X8, X9, '
+        'X10, or X11 one', () {
+      for (final wrongBoundary in const [
+        _kCanonicalProofBoundary,
+        _kFocusDuckRestoreProofBoundary,
+        _kFocusLossPauseResumeProofBoundary,
+        _kPermanentFocusLossProofBoundary,
+        _kRouteChangeEventHandoffProofBoundary,
+      ]) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX12SampleRawMap({'proofBoundary': wrongBoundary}),
+            );
+        expect(
+          report.hasCanonicalProofBoundary,
+          isFalse,
+          reason: wrongBoundary,
+        );
+        expect(report.allNativeLanesPass, isFalse, reason: wrongBoundary);
+      }
+    });
+
+    test('X12 requires every dead-object recovery lane boolean', () {
+      for (final lane in const [
+        'deadObjectOldTrackReleasedOk',
+        'deadObjectNewTrackStateInitializedOk',
+        'deadObjectNewTrackVolumeSetOk',
+        'deadObjectNewTrackPlayOk',
+      ]) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX12SampleRawMap({lane: false}),
+            );
+        expect(report.deadObjectRecoveryGatesHeld, isFalse, reason: lane);
+        expect(report.allNativeLanesPass, isFalse, reason: lane);
+      }
+    });
+
+    test('X12 requires the deadObjectRecoveryGatesHeld native lane', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX12SampleRawMap({'deadObjectRecoveryGatesHeld': false}),
+          );
+      expect(report.deadObjectRecoveryGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X12 requires the synthetic dead object injected and observed '
+        'exactly once and the old track released exactly once', () {
+      for (final key in const [
+        'deadObjectOccurredCount',
+        'syntheticDeadObjectInjectedCount',
+        'deadObjectOldTrackReleaseCount',
+      ]) {
+        final zero =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX12SampleRawMap({key: 0}),
+            );
+        expect(zero.deadObjectRecoveryGatesHeld, isFalse, reason: key);
+        expect(zero.allNativeLanesPass, isFalse, reason: key);
+
+        // A second observation (e.g. a real OS dead object in the same run,
+        // or a duplicate injection/release) fails closed.
+        final two =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX12SampleRawMap({key: 2}),
+            );
+        expect(two.deadObjectRecoveryGatesHeld, isFalse, reason: key);
+        expect(two.allNativeLanesPass, isFalse, reason: key);
+      }
+    });
+
+    test('X12 requires exactly two track builds (original plus one '
+        'recreation)', () {
+      for (final count in const [0, 1, 3]) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX12SampleRawMap({'deadObjectTrackCreateCount': count}),
+            );
+        expect(report.deadObjectRecoveryGatesHeld, isFalse, reason: '$count');
+        expect(report.allNativeLanesPass, isFalse, reason: '$count');
+      }
+    });
+
+    test('X12 requires a non-empty unwritten remainder bounded by the slice '
+        'to have been resumed', () {
+      final empty =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX12SampleRawMap({'deadObjectUnwrittenBytesAtRecovery': 0}),
+          );
+      expect(empty.deadObjectRecoveryGatesHeld, isFalse);
+      expect(empty.allNativeLanesPass, isFalse);
+
+      final never =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX12SampleRawMap({'deadObjectUnwrittenBytesAtRecovery': -1}),
+          );
+      expect(never.deadObjectRecoveryGatesHeld, isFalse);
+      expect(never.allNativeLanesPass, isFalse);
+
+      final overSlice =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX12SampleRawMap({
+              'deadObjectUnwrittenBytesAtRecovery': 16385,
+            }),
+          );
+      expect(overSlice.deadObjectRecoveryGatesHeld, isFalse);
+      expect(overSlice.allNativeLanesPass, isFalse);
+
+      // A mid-slice remainder (partial write before the injection) is fine.
+      final midSlice =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX12SampleRawMap({'deadObjectUnwrittenBytesAtRecovery': 8192}),
+          );
+      expect(midSlice.deadObjectRecoveryGatesHeld, isTrue);
+      expect(midSlice.allNativeLanesPass, isTrue);
+    });
+
+    test('X12 requires sink frames before and after the recovery to be '
+        'positive and to sum to the sink total (no drop, no double count)', () {
+      final nothingBefore =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX12SampleRawMap({
+              'deadObjectSinkFramesWrittenBeforeRecovery': 0,
+              'deadObjectSinkFramesWrittenAfterRecovery': 83968,
+            }),
+          );
+      expect(nothingBefore.deadObjectRecoveryGatesHeld, isFalse);
+      expect(nothingBefore.allNativeLanesPass, isFalse);
+
+      final nothingAfter =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX12SampleRawMap({
+              'deadObjectSinkFramesWrittenBeforeRecovery': 83968,
+              'deadObjectSinkFramesWrittenAfterRecovery': 0,
+            }),
+          );
+      expect(nothingAfter.deadObjectRecoveryGatesHeld, isFalse);
+      expect(nothingAfter.allNativeLanesPass, isFalse);
+
+      // Dropped frames: the split no longer sums to the sink total.
+      final dropped =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX12SampleRawMap({
+              'deadObjectSinkFramesWrittenAfterRecovery': 21504,
+            }),
+          );
+      expect(dropped.deadObjectRecoveryGatesHeld, isFalse);
+      expect(dropped.allNativeLanesPass, isFalse);
+
+      // Double-counted frames: the split overshoots the sink total.
+      final doubled =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX12SampleRawMap({
+              'deadObjectSinkFramesWrittenAfterRecovery': 25856,
+            }),
+          );
+      expect(doubled.deadObjectRecoveryGatesHeld, isFalse);
+      expect(doubled.allNativeLanesPass, isFalse);
+    });
+
+    test('X12 requires the sink accounting, checksum identity, and frame '
+        'accounting lanes to survive the recovery', () {
+      for (final lane in const [
+        'sinkWriteAccountingOk',
+        'checksumIdentityOk',
+        'frameAccountingOk',
+      ]) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX12SampleRawMap({lane: false}),
+            );
+        expect(report.deadObjectRecoveryGatesHeld, isFalse, reason: lane);
+        expect(report.allNativeLanesPass, isFalse, reason: lane);
+      }
+
+      final mismatch =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX12SampleRawMap({
+              'kotlinSinkWriteChecksumHex': '00000000deadbeef',
+            }),
+          );
+      expect(mismatch.checksumsMatch, isFalse);
+      expect(mismatch.allNativeLanesPass, isFalse);
+    });
+
+    test('X12 still requires the implied non-zero base gain', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX12SampleRawMap({
+              'audioTrackGain': 0.0,
+              'audioTrackNonZeroGainSetOk': false,
+            }),
+          );
+      expect(report.nonZeroGainSinkGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X12 fail report surfaces the fail-closed recovery reason', () {
+      final report = VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+        createX12SampleRawMap({
+          'pass': false,
+          'status': 'recreated_audio_track_not_initialized',
+          'marker':
+              'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_FAIL',
+          'failureReason': 'recreated_audio_track_not_initialized',
+          'lastError': 'recreated_audio_track_not_initialized',
+          'deadObjectNewTrackStateInitializedOk': false,
+          'deadObjectNewTrackVolumeSetOk': false,
+          'deadObjectNewTrackPlayOk': false,
+          'deadObjectRecoveryGatesHeld': false,
+        }),
+      );
+      expect(report.pass, isFalse);
+      expect(
+        report.marker,
+        equals(
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+              .deadObjectRecoveryFailMarkerConstant,
+        ),
+      );
+      expect(report.deadObjectOldTrackReleasedOk, isTrue);
+      expect(report.deadObjectNewTrackStateInitializedOk, isFalse);
+      expect(report.deadObjectRecoveryGatesHeld, isFalse);
+      expect(report.lastError, equals('recreated_audio_track_not_initialized'));
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X12 mode sends deadObjectRecoveryProofEnabled=true only', () async {
+      Map<String, Object?>? capturedArgs;
+
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+        capturedArgs = (call.arguments as Map).cast<String, Object?>();
+        return createX12SampleRawMap();
+      });
+
+      final report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: '/tmp/clip_B.mov',
+            deadObjectRecoveryProofEnabled: true,
+          );
+
+      expect(capturedArgs?['deadObjectRecoveryProofEnabled'], isTrue);
+      // X12 is isolated: the Dart wrapper never sends X7, X8, X9, X10,
+      // X11, or any other mode flag for an X12 run.
+      expect(
+        capturedArgs?.containsKey('focusNoisyEventHandoffProofEnabled'),
+        isFalse,
+      );
+      expect(
+        capturedArgs?.containsKey('focusDuckRestoreProofEnabled'),
+        isFalse,
+      );
+      expect(
+        capturedArgs?.containsKey('focusLossPauseResumeProofEnabled'),
+        isFalse,
+      );
+      expect(
+        capturedArgs?.containsKey('permanentFocusLossProofEnabled'),
+        isFalse,
+      );
+      expect(
+        capturedArgs?.containsKey('routeChangeEventHandoffProofEnabled'),
+        isFalse,
+      );
+      expect(capturedArgs?.containsKey('envelopeProofEnabled'), isFalse);
+      expect(capturedArgs?.containsKey('nonZeroGainSinkProofEnabled'), isFalse);
+      expect(report.pass, isTrue);
+      expect(report.deadObjectRecoveryProofEnabled, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('default X4 run does NOT send deadObjectRecoveryProofEnabled', () async {
+      Map<String, Object?>? capturedArgs;
+
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+        capturedArgs = (call.arguments as Map).cast<String, Object?>();
+        return _createSampleRawMap();
+      });
+
+      await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+        sourcePath: '/tmp/clip_B.mov',
+      );
+
+      expect(
+        capturedArgs?.containsKey('deadObjectRecoveryProofEnabled'),
+        isFalse,
+      );
+    });
+
+    test('X6 and X11 runs do NOT send deadObjectRecoveryProofEnabled', () async {
+      Map<String, Object?>? capturedArgs;
+
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+        capturedArgs = (call.arguments as Map).cast<String, Object?>();
+        return _createSampleRawMap();
+      });
+
+      await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+        sourcePath: '/tmp/clip_B.mov',
+        nonZeroGainSinkProofEnabled: true,
+      );
+      expect(capturedArgs?['nonZeroGainSinkProofEnabled'], isTrue);
+      expect(
+        capturedArgs?.containsKey('deadObjectRecoveryProofEnabled'),
+        isFalse,
+      );
+
+      await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+        sourcePath: '/tmp/clip_B.mov',
+        routeChangeEventHandoffProofEnabled: true,
+      );
+      expect(capturedArgs?['routeChangeEventHandoffProofEnabled'], isTrue);
+      expect(
+        capturedArgs?.containsKey('deadObjectRecoveryProofEnabled'),
+        isFalse,
+      );
+    });
   });
 
   group('Equality, hashCode, and toString', () {
