@@ -123,6 +123,7 @@ if (ANDROID)
     "platform/android/src/android_phase4_audio_mix_bus_jni.cpp"
     "platform/android/src/android_phase4_audio_mixbus_timeline_jni.cpp"
     "platform/android/src/android_phase4_audio_scheduler_envelope_jni.cpp"
+    "platform/android/src/android_phase4_audio_graph_export_session_jni.cpp"
     "platform/android/src/android_phase4_audio_graph_topology_jni.cpp"
     "platform/android/src/android_phase4_audio_graph_transport_jni.cpp"
     "platform/android/src/android_phase4_audio_ring_buffer_transport_jni.cpp"

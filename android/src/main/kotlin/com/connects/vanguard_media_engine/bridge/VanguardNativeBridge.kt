@@ -1199,6 +1199,77 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
+    // ── P4-AUDIO-PASS2-GRAPH-NATIVE-SESSION: N-source True-DAG audio graph export session diagnostic ─
+    // Parameterized native graph export session: one C++ Graph with one
+    // AudioMixBusNode ("graph_export_mix") plus up to 8
+    // DecodedAudioPcmSourceNode tracks (6-arg node-owned ring/writer/provider
+    // constructor, timelineStartPtsUs=0, expectedFrameCount=totalFrames so
+    // providers run in lockstep), routed by the auto-discovery
+    // GraphAudioScheduler at prepare() with static unit gain and null
+    // envelope only. Windows render synchronously and contiguously
+    // (startFrame must equal the session cursor; no skips/retries/reorders)
+    // and any provider zero-fill underrun fails the window closed
+    // (source_underrun:<trackId>) — zero-filled audio is corruption for an
+    // export session. Diagnostic foundation only: no production route swap
+    // (AndroidAudioMixdownEngine / AndroidNativeAudioMixBusChunkMixer
+    // untouched), no runtime/realtime sink, no AudioTrack/AAudio/OpenSL/
+    // Oboe, no MediaCodec/MediaExtractor, no file IO, no native worker
+    // threads, no app/editor/product, no streaming/cache, no iOS.
+
+    // Returns status=PASS;sessionId=<id>;proofBoundary=<boundary> or
+    // status=FAIL;reason=<token>. sampleRate must be in [8000, 192000],
+    // channelCount in 1..2, maxFramesPerMix in 1..8192.
+    external fun createAndroidDagPhase4AudioGraphExportSession(
+        sampleRate: Int,
+        channelCount: Int,
+        maxFramesPerMix: Int,
+    ): String
+
+    // Rejected after prepare (session_already_prepared); a 9th track
+    // rejects with total_track_count_exceeded:<n>. totalFrames must be in
+    // [1, sampleRate * 600] (DecodedAudioPcmSourceNode kMaxExpectedSeconds).
+    external fun addAndroidDagPhase4AudioGraphExportTrack(
+        sessionId: String,
+        trackId: String,
+        totalFrames: Long,
+    ): String
+
+    // One-way prepare barrier: freezes topology and constructs the
+    // auto-discovery GraphAudioScheduler; fails closed unless every added
+    // track routed (routed_source_count_mismatch:<routed>/<requested>).
+    external fun prepareAndroidDagPhase4AudioGraphExportSession(
+        sessionId: String,
+    ): String
+
+    // Allowed only after prepare (session_not_prepared before). Pushes
+    // interleaved little-endian signed PCM16 from a direct ByteBuffer at
+    // byte offset 0 through the node-owned ring writer; only a full write
+    // is accepted (ring_write_<token> + acceptedFrames otherwise).
+    external fun ingestAndroidDagPhase4AudioGraphExportTrackPcm(
+        sessionId: String,
+        trackId: String,
+        pcmBuffer: java.nio.ByteBuffer,
+        frameCount: Int,
+    ): String
+
+    // Contiguous export windows only: startFrame must equal the session
+    // cursor (non_contiguous_window:<expected>/<got> otherwise). Scheduler
+    // kOk/kSilence are the only PASS results; provider underrun fails
+    // closed with source_underrun:<trackId>. frameCount must be in
+    // [1, maxFramesPerMix]; outPcmBuffer must be direct with capacity
+    // >= frameCount * channelCount * 2 bytes.
+    external fun renderAndroidDagPhase4AudioGraphExportWindow(
+        sessionId: String,
+        startFrame: Long,
+        frameCount: Int,
+        outPcmBuffer: java.nio.ByteBuffer,
+    ): String
+
+    // Idempotent erase-once; repeated destroy also reports status=PASS.
+    external fun destroyAndroidDagPhase4AudioGraphExportSession(
+        sessionId: String,
+    ): String
+
     // ── P4-AUDIO-GRAPH-TOPOLOGY: native AudioMixBusNode DAG topology & gated mix ─
     // diagnostic. Pure in-memory C++ graph topology + playhead evaluation gating +
     // synthetic PCM mix micro-proof. Stack-scoped, single-threaded, synchronous.

@@ -110,6 +110,12 @@ public:
     static constexpr int32_t kMaxSampleRate  = 192000;
     static constexpr int32_t kMinChannelCount = 1;
     static constexpr int32_t kMaxChannelCount = 2;
+    // Admission ceiling for expectedFrameCount: sampleRate * kMaxExpectedSeconds.
+    // Bounded pass-2 export timeline sessions must admit full export-length
+    // source timelines (not just short diagnostic clips), so the ceiling is
+    // 600 seconds. expectedFrameCount <= 0 or above this cap still throws
+    // "invalid_expected_frame_count".
+    static constexpr int64_t kMaxExpectedSeconds = 600;
 
 private:
     std::string id_;

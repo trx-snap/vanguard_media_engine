@@ -28,7 +28,7 @@ DecodedAudioPcmSourceNode::DecodedAudioPcmSourceNode(std::string id,
         throw std::invalid_argument("invalid_channel_count");
     }
     if (expectedFrameCount_ <= 0 ||
-        expectedFrameCount_ > static_cast<int64_t>(sampleRate_) * 10) {
+        expectedFrameCount_ > static_cast<int64_t>(sampleRate_) * kMaxExpectedSeconds) {
         throw std::invalid_argument("invalid_expected_frame_count");
     }
 
