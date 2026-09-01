@@ -6,20 +6,28 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-// ── AndroidNativeAudioGraphExportMixer (Export/Audio Unit B — P4-AUDIO-PASS2-GRAPH-REROUTE) ──
+// ── AndroidNativeAudioGraphExportMixer (Export/Audio Unit B — P4-AUDIO-PASS2-NATIVE-GAIN-ENVELOPE) ──
 //
 // Production offline Pass-2 PCM mixdown through ONE native True-DAG audio
 // graph export session (android_phase4_audio_graph_export_session_jni.cpp
-// via VanguardNativeBridge): create -> addTrack xN (DecodedAudioPcmSourceNode
-// node-owned ring/writer/provider, timelineStartPtsUs=0 inside native) ->
-// prepare (GraphAudioScheduler AutoDiscoverSourceProviders, static unit
-// gain, null envelope) -> per-window full ingest for EVERY track ->
-// contiguous window render -> destroy exactly once.
+// via VanguardNativeBridge): create -> addTrackWithEnvelope xN
+// (DecodedAudioPcmSourceNode node-owned ring/writer/provider,
+// timelineStartPtsUs=0 inside native, native AudioGainEnvelope built
+// atomically per track) -> prepare (GraphAudioScheduler
+// AutoDiscoverSourceProviders over the session-owned mix-params map) ->
+// per-window full ingest for EVERY track -> contiguous window render ->
+// destroy exactly once.
 //
-// Ownership split (Option B, corrected): Kotlin keeps envelope evaluation,
-// gain clamping, and source-channel conversion (mono<->stereo) BEFORE
-// ingest; the native graph owns cross-source summation and the final int16
-// clamp inside AudioMixBusNode.
+// Ownership split: the NATIVE graph owns per-frame gain/envelope evaluation
+// (AudioGainEnvelope + GraphAudioScheduler SourceMixParams + AudioMixBusNode
+// effective-gain math), cross-source summation, and the final int16 clamp.
+// Kotlin keeps decode, timeline placement, full-window zero-filled ingest,
+// and source-channel conversion (mono<->stereo) only — PCM is ingested
+// UNSCALED; there is no Kotlin envelope evaluation, gain clamping, or
+// sample scaling in this route. Raw spec params travel to native with
+// seconds already converted to integer microseconds by the caller; native
+// reports gainClamped=true on the add PASS when it had to clamp an
+// out-of-range built envelope keyframe (e.g. out-of-range static volume).
 //
 // Lockstep timeline invariant: every track is added with totalFrames equal
 // to the FULL mixdown output timeline length (not the track's own span),
@@ -49,16 +57,34 @@ object AndroidNativeAudioGraphExportMixer {
     /// One decoded track's placement on the output timeline, ready for
     /// native graph mixing. [startFrame] and [frameCount] are
     /// output-timeline frames (already resolved by the caller from
-    /// spec.startTime / decode.frameCount at outputSampleRate).
+    /// spec.startTime / decode.frameCount at outputSampleRate). The
+    /// gain/envelope params are RAW spec values with seconds already
+    /// converted to integer microseconds ([fadeInUs], [fadeOutUs],
+    /// [trackStartUs], [trackEndUs], [keyframeTimesUs]); the native
+    /// envelope builder owns normalisation, clamping, and evaluation.
+    /// [keyframeTimesUs]/[keyframeGains] must both be null or both present
+    /// with identical lengths.
     data class GraphTrackInput(
         val trackId: String,
         val startFrame: Int,
         val pcm: ShortArray,
         val srcChannelCount: Int,
         val frameCount: Int,
-        val envelope: AndroidAudioVolumeEnvelope,
+        val volume: Double,
+        val mixGain: Double,
+        val fadeInUs: Long,
+        val fadeOutUs: Long,
+        val trackStartUs: Long,
+        val trackEndUs: Long,
+        val keyframeTimesUs: LongArray?,
+        val keyframeGains: DoubleArray?,
     )
 
+    /// [gainClamped] is native evidence: true when any track's built native
+    /// envelope carried an out-of-range keyframe that native clamped. The
+    /// nativeEnvelope* fields aggregate the render-window scheduler
+    /// telemetry: applied is OR-ed, evaluations summed, min/max span the
+    /// envelope-applied windows only (0.0/0.0 when none).
     data class GraphMixResult(
         val success: Boolean,
         val reason: String,
@@ -67,6 +93,10 @@ object AndroidNativeAudioGraphExportMixer {
         val silentWindowCount: Int,
         val gainClamped: Boolean,
         val routedSourceCount: Int = 0,
+        val nativeEnvelopeApplied: Boolean = false,
+        val nativeEnvelopeEvaluations: Long = 0L,
+        val nativeMinEffectiveGain: Double = 0.0,
+        val nativeMaxEffectiveGain: Double = 0.0,
     )
 
     fun mix(
@@ -100,11 +130,16 @@ object AndroidNativeAudioGraphExportMixer {
         var silentWindowCount = 0
         var gainClamped = false
         var routedSourceCount = 0
+        var envelopeApplied = false
+        var envelopeEvaluations = 0L
+        var minEffectiveGain = 0.0
+        var maxEffectiveGain = 0.0
 
         fun fail(reason: String): GraphMixResult {
             val result = GraphMixResult(
                 false, reason, null, windowCount, silentWindowCount, gainClamped,
-                routedSourceCount,
+                routedSourceCount, envelopeApplied, envelopeEvaluations,
+                minEffectiveGain, maxEffectiveGain,
             )
             failureResult = result
             return result
@@ -124,18 +159,31 @@ object AndroidNativeAudioGraphExportMixer {
             val sid: String = createdId
 
             // Native ids src_0..src_N-1 avoid duplicate user track IDs;
-            // failure messages still carry the original trackId.
+            // failure messages still carry the original trackId. Each add
+            // atomically builds the native envelope from the raw spec
+            // params before any graph mutation.
             for ((index, track) in tracks.withIndex()) {
-                val addRaw = bridge.addAndroidDagPhase4AudioGraphExportTrack(
+                val addRaw = bridge.addAndroidDagPhase4AudioGraphExportTrackWithEnvelope(
                     sessionId = sid,
                     trackId = "src_$index",
                     totalFrames = totalFrames.toLong(),
+                    volume = track.volume,
+                    mixGain = track.mixGain,
+                    fadeInUs = track.fadeInUs,
+                    fadeOutUs = track.fadeOutUs,
+                    trackStartUs = track.trackStartUs,
+                    trackEndUs = track.trackEndUs,
+                    keyframeTimesUs = track.keyframeTimesUs,
+                    keyframeGains = track.keyframeGains,
                 )
                 if (!addRaw.startsWith("status=PASS")) {
                     return fail(
                         "add_failed:${track.trackId}:" +
                             "${extractField(addRaw, "reason") ?: addRaw}"
                     )
+                }
+                if (extractField(addRaw, "gainClamped") == "true") {
+                    gainClamped = true
                 }
             }
 
@@ -180,7 +228,10 @@ object AndroidNativeAudioGraphExportMixer {
                 val framesToRender = minOf(WINDOW_FRAMES, totalFrames - windowStart)
 
                 // Lockstep ingest: EVERY track gets a full window every
-                // window, zero-filled outside its overlap span.
+                // window, zero-filled outside its overlap span. Samples are
+                // UNSCALED — the native graph owns all gain/envelope math —
+                // so Kotlin only converts source channels to output
+                // channels here.
                 for ((index, track) in tracks.withIndex()) {
                     for (frame in 0 until framesToRender) {
                         val outFrame = windowStart + frame
@@ -192,30 +243,22 @@ object AndroidNativeAudioGraphExportMixer {
                             }
                             continue
                         }
-                        val rawGain = track.envelope.evaluate(
-                            outFrame.toDouble() / outputSampleRate
-                        )
-                        val gain = rawGain.coerceIn(0.0, 1.0)
-                        if (gain != rawGain) gainClamped = true
                         val srcBase = srcFrame * track.srcChannelCount
-                        // Frozen order: scale by gain first, then convert
-                        // source channels to output channels.
                         when {
                             track.srcChannelCount == outputChannelCount -> {
                                 for (ch in 0 until outputChannelCount) {
-                                    windowSamples[dstBase + ch] =
-                                        scaleSample(track.pcm[srcBase + ch], gain)
+                                    windowSamples[dstBase + ch] = track.pcm[srcBase + ch]
                                 }
                             }
                             track.srcChannelCount == 1 && outputChannelCount == 2 -> {
-                                val scaled = scaleSample(track.pcm[srcBase], gain)
-                                windowSamples[dstBase] = scaled
-                                windowSamples[dstBase + 1] = scaled
+                                val sample = track.pcm[srcBase]
+                                windowSamples[dstBase] = sample
+                                windowSamples[dstBase + 1] = sample
                             }
                             else -> { // stereo source -> mono output
-                                val scaledL = scaleSample(track.pcm[srcBase], gain).toInt()
-                                val scaledR = scaleSample(track.pcm[srcBase + 1], gain).toInt()
-                                windowSamples[dstBase] = ((scaledL + scaledR) / 2).toShort()
+                                val left = track.pcm[srcBase].toInt()
+                                val right = track.pcm[srcBase + 1].toInt()
+                                windowSamples[dstBase] = ((left + right) / 2).toShort()
                             }
                         }
                     }
@@ -263,12 +306,30 @@ object AndroidNativeAudioGraphExportMixer {
                 if (extractField(renderRaw, "silence") == "true") {
                     silentWindowCount++
                 }
+                if (extractField(renderRaw, "envelopeApplied") == "true") {
+                    val windowEvaluations =
+                        extractField(renderRaw, "envelopeEvaluations")?.toLongOrNull() ?: 0L
+                    val windowMin =
+                        extractField(renderRaw, "minEffectiveGain")?.toDoubleOrNull() ?: 0.0
+                    val windowMax =
+                        extractField(renderRaw, "maxEffectiveGain")?.toDoubleOrNull() ?: 0.0
+                    envelopeEvaluations += windowEvaluations
+                    if (!envelopeApplied) {
+                        minEffectiveGain = windowMin
+                        maxEffectiveGain = windowMax
+                    } else {
+                        minEffectiveGain = minOf(minEffectiveGain, windowMin)
+                        maxEffectiveGain = maxOf(maxEffectiveGain, windowMax)
+                    }
+                    envelopeApplied = true
+                }
                 windowStart += framesToRender
             }
 
             return GraphMixResult(
                 true, "success", outputPcm, windowCount, silentWindowCount, gainClamped,
-                routedSourceCount,
+                routedSourceCount, envelopeApplied, envelopeEvaluations,
+                minEffectiveGain, maxEffectiveGain,
             )
         } finally {
             // Exactly-once destroy for the session created above. A prior
@@ -281,16 +342,13 @@ object AndroidNativeAudioGraphExportMixer {
                         false,
                         "destroy_failed:${extractField(destroyRaw, "reason") ?: destroyRaw}",
                         null, windowCount, silentWindowCount, gainClamped, routedSourceCount,
+                        envelopeApplied, envelopeEvaluations,
+                        minEffectiveGain, maxEffectiveGain,
                     )
                 }
             }
         }
     }
-
-    private fun scaleSample(sample: Short, gain: Double): Short =
-        (sample * gain).toInt()
-            .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-            .toShort()
 
     private fun extractField(raw: String, field: String): String? {
         for (part in raw.split(";")) {

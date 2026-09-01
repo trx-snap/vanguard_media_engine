@@ -1,29 +1,34 @@
-// P4-AUDIO-PASS2-GRAPH-NATIVE-SESSION: parameterized N-source (up to 8)
-// True-DAG audio graph EXPORT session diagnostic seam. One session = one
-// C++ Graph holding one AudioMixBusNode ("graph_export_mix") plus up to
-// eight DecodedAudioPcmSourceNode instances built with the 6-arg
+// P4-AUDIO-PASS2-GRAPH-NATIVE-SESSION / P4-AUDIO-PASS2-NATIVE-GAIN-ENVELOPE:
+// parameterized N-source (up to 8) True-DAG audio graph EXPORT session. One
+// session = one C++ Graph holding one AudioMixBusNode ("graph_export_mix")
+// plus up to eight DecodedAudioPcmSourceNode instances built with the 6-arg
 // node-owned-transport constructor (each node owns its
 // AudioSpscAudioRingBuffer + AudioDecoderRingWriter +
 // RingBufferAudioSampleProvider triple by composition). prepare() freezes
 // the topology and constructs a GraphAudioScheduler via the tag-dispatched
-// AutoDiscoverSourceProviders constructor with a null mix-params map
-// (static unit gain, null envelope only). Windows are rendered
-// synchronously, contiguously, and export-style: startFrame must equal the
-// session's own nextRenderFrame cursor (no skips, retries, or reorders),
-// and any provider zero-fill underrun during a window fails that window
-// closed (zero-filled audio is corruption for an export session, never a
-// silent-success).
+// AutoDiscoverSourceProviders constructor with the session-owned mix-params
+// map, so the native graph owns per-frame gain/envelope evaluation
+// (AudioGainEnvelope inside AudioMixBusNode) for tracks added via the
+// add-with-envelope verb. The legacy add verb stays byte-compatible for
+// diagnostics: it registers no mix-params entry, so its tracks mix at
+// static unit gain with a null envelope, exactly as before. Windows are
+// rendered synchronously, contiguously, and export-style: startFrame must
+// equal the session's own nextRenderFrame cursor (no skips, retries, or
+// reorders), and any provider zero-fill underrun during a window fails that
+// window closed (zero-filled audio is corruption for an export session,
+// never a silent-success).
 //
 // Every graph export source node uses timelineStartPtsUs=0 and
 // expectedFrameCount=totalFrames so all providers are called in lockstep
-// (native per-node timeline gating is an explicit non-claim here).
+// (native per-node timeline gating is an explicit non-claim here). Envelope
+// times are absolute output-timeline microseconds; the scheduler stamps
+// envelopeStartPtsUs = windowPtsUs so the mix bus evaluates the same axis.
 //
-// Honest non-claims: diagnostic foundation only. No production route swap
-// (AndroidAudioMixdownEngine and AndroidNativeAudioMixBusChunkMixer are
-// untouched), no runtime/realtime sink, no AudioTrack/AAudio/OpenSL/Oboe,
-// no MediaCodec/MediaExtractor, no file IO, no native worker threads, no
-// gain/envelope production use, no app/editor/product, no streaming/cache,
-// no iOS.
+// Honest non-claims: no byte identity with the prior Kotlin pre-scaling
+// route, no performance claim, no runtime/realtime sink, no
+// AudioTrack/AAudio/OpenSL/Oboe, no MediaCodec/MediaExtractor, no file IO,
+// no native worker threads, no audible-output claim, no app/editor/product,
+// no streaming/cache, no iOS.
 //
 // This translation unit is Android-only and must NOT be included in iOS or
 // host builds; it is added via the Android-only target_sources block in
@@ -31,16 +36,18 @@
 // diagnostic session registry.
 //
 // JNI entry points (VanguardNativeBridge.kt instance declarations):
-//   createAndroidDagPhase4AudioGraphExportSession   -> jstring
-//   addAndroidDagPhase4AudioGraphExportTrack        -> jstring
-//   prepareAndroidDagPhase4AudioGraphExportSession  -> jstring
-//   ingestAndroidDagPhase4AudioGraphExportTrackPcm  -> jstring
-//   renderAndroidDagPhase4AudioGraphExportWindow    -> jstring
-//   destroyAndroidDagPhase4AudioGraphExportSession  -> jstring
+//   createAndroidDagPhase4AudioGraphExportSession              -> jstring
+//   addAndroidDagPhase4AudioGraphExportTrack                   -> jstring
+//   addAndroidDagPhase4AudioGraphExportTrackWithEnvelope       -> jstring
+//   prepareAndroidDagPhase4AudioGraphExportSession             -> jstring
+//   ingestAndroidDagPhase4AudioGraphExportTrackPcm             -> jstring
+//   renderAndroidDagPhase4AudioGraphExportWindow               -> jstring
+//   destroyAndroidDagPhase4AudioGraphExportSession             -> jstring
 
 #include <jni.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -50,6 +57,7 @@
 #include <vector>
 
 #include "vanguard/audio/audio_decoder_ring_writer.h"
+#include "vanguard/audio/audio_gain_envelope.h"
 #include "vanguard/audio/audio_mix_bus_node.h"
 #include "vanguard/audio/decoded_audio_pcm_source_node.h"
 #include "vanguard/audio/graph_audio_scheduler.h"
@@ -59,6 +67,7 @@
 namespace {
 
 using vanguard::audio::AudioDecoderRingWriter;
+using vanguard::audio::AudioGainEnvelope;
 using vanguard::audio::AudioMixBusNode;
 using vanguard::audio::AutoDiscoverSourceProviders;
 using vanguard::audio::DecodedAudioPcmSourceNode;
@@ -69,7 +78,9 @@ using WriterStatus    = AudioDecoderRingWriter::Status;
 using SchedulerResult = GraphAudioScheduler::SchedulerResult;
 
 // Must stay byte-identical to PROOF_BOUNDARY in
-// AndroidAudioGraphExportSessionDriver.kt.
+// AndroidAudioGraphExportSessionDriver.kt. It describes the legacy
+// diagnostic add-track route (unit gain, no production swap) and is frozen
+// harness data, not a claim about the add-with-envelope production verb.
 constexpr const char* kProofBoundary =
     "native_true_dag_pass2_graph_export_session_diagnostic_only_n_source_node_owned_ring_graph_"
     "scheduler_mixbus_unit_gain_no_production_route_swap_no_android_mixdown_engine_change_no_"
@@ -141,6 +152,17 @@ struct GraphExportSession {
     std::vector<std::string> trackOrder;
     std::unordered_map<std::string, std::shared_ptr<DecodedAudioPcmSourceNode>> tracks;
 
+    // P4-AUDIO-PASS2-NATIVE-GAIN-ENVELOPE: session-owned per-track gain
+    // envelopes plus the scheduler mix-params map handed to
+    // GraphAudioScheduler at prepare(). unordered_map values have stable
+    // addresses, so each mixParams entry (and the scheduler's RoutedSource)
+    // may hold a non-owning pointer into `envelopes`. Tracks added via the
+    // legacy add verb have no entry here (unit gain, null envelope). Both
+    // maps are declared BEFORE `scheduler` so the scheduler — which holds
+    // non-owning envelope pointers — is destroyed first.
+    std::unordered_map<std::string, AudioGainEnvelope> envelopes;
+    std::unordered_map<std::string, GraphAudioScheduler::SourceMixParams> mixParams;
+
     std::unique_ptr<GraphAudioScheduler> scheduler;
     bool     prepared{false};
     bool     destroyed{false};
@@ -178,6 +200,234 @@ std::shared_ptr<GraphExportSession> FindGraphExportSession(const std::string& se
 // underrun metric access, same justification as the node-owned pipeline TU).
 RingBufferAudioSampleProvider* TrackProvider(DecodedAudioPcmSourceNode& node) {
     return static_cast<RingBufferAudioSampleProvider*>(node.audioSampleProvider());
+}
+
+const char* EnvelopeBuildFailReason(AudioGainEnvelope::BuildResult r) {
+    switch (r) {
+        case AudioGainEnvelope::BuildResult::kOk:
+            return nullptr;
+        case AudioGainEnvelope::BuildResult::kTooManyKeyframes:
+            return "envelope_build_too_many_keyframes";
+        case AudioGainEnvelope::BuildResult::kNonFiniteGain:
+            return "envelope_build_non_finite_gain";
+        case AudioGainEnvelope::BuildResult::kUnsupportedInterpolation:
+            return "envelope_build_unsupported_interpolation";
+        case AudioGainEnvelope::BuildResult::kInvalidRange:
+            return "envelope_build_invalid_range";
+        case AudioGainEnvelope::BuildResult::kNullOutput:
+            return "envelope_build_null_output";
+        case AudioGainEnvelope::BuildResult::kEmptyAfterNormalize:
+            return "envelope_build_empty_after_normalize";
+    }
+    return "envelope_build_failed";
+}
+
+// Builds the native track envelope from the raw Kotlin-supplied spec params
+// (Kotlin only converts seconds to integer microseconds) via
+// AudioGainEnvelope::ForTrack. ForTrack's static path deliberately does not
+// clamp `volume` (Kotlin parity), so an out-of-range volume — negative or
+// above unity — yields out-of-range envelope keyframes that AudioMixBusNode
+// would reject per frame (kInvalidEnvelopeGain). When that happens the
+// envelope is rebuilt from clamped explicit keyframes, inserting the exact
+// 0.0/1.0 boundary-crossing keyframes per linear segment so the clamped
+// shape matches sample-level clamping of the original ramp, then
+// re-normalised with mixGain=1.0 (the original mixGain was already applied
+// by the first build). Non-finite inputs stay fail-closed inside ForTrack.
+// Returns nullptr on success (with *outGainClamped reporting whether any
+// out-of-range keyframe was clamped) or a static fail-reason token.
+const char* BuildTrackEnvelope(const AudioGainEnvelope::Keyframe* rawKeyframes,
+                               size_t             rawCount,
+                               double             volume,
+                               double             mixGain,
+                               int64_t            fadeInUs,
+                               int64_t            fadeOutUs,
+                               int64_t            trackStartUs,
+                               int64_t            trackEndUs,
+                               AudioGainEnvelope* outEnvelope,
+                               bool*              outGainClamped) {
+    *outGainClamped = false;
+    const AudioGainEnvelope::BuildResult built = AudioGainEnvelope::ForTrack(
+        rawKeyframes, rawCount, volume, mixGain,
+        fadeInUs, fadeOutUs, trackStartUs, trackEndUs, outEnvelope);
+    if (built != AudioGainEnvelope::BuildResult::kOk) {
+        return EnvelopeBuildFailReason(built);
+    }
+
+    bool outOfRange = false;
+    for (size_t i = 0; i < outEnvelope->keyframeCount(); ++i) {
+        const double g = outEnvelope->keyframeAt(i).gain;
+        if (g < 0.0 || g > 1.0) {
+            outOfRange = true;
+            break;
+        }
+    }
+    if (!outOfRange) {
+        return nullptr;
+    }
+
+    AudioGainEnvelope::Keyframe clamped[AudioGainEnvelope::kMaxRawKeyframes];
+    size_t clampedCount = 0;
+    const size_t count = outEnvelope->keyframeCount();
+    for (size_t i = 0; i < count; ++i) {
+        const AudioGainEnvelope::Keyframe& kf = outEnvelope->keyframeAt(i);
+        if (i > 0) {
+            // Insert the 0.0/1.0 crossing keyframes of the linear segment
+            // (prev -> kf), ordered by time along the segment.
+            const AudioGainEnvelope::Keyframe& prev = outEnvelope->keyframeAt(i - 1);
+            const double  g0 = prev.gain;
+            const double  g1 = kf.gain;
+            const int64_t t0 = prev.timeUs;
+            const int64_t t1 = kf.timeUs;
+            int64_t crossTimes[2];
+            double  crossGains[2];
+            size_t  crossCount = 0;
+            const double bounds[2] = {0.0, 1.0};
+            for (double bound : bounds) {
+                if ((g0 < bound && g1 > bound) || (g0 > bound && g1 < bound)) {
+                    const double fraction = (bound - g0) / (g1 - g0);
+                    crossTimes[crossCount] =
+                        t0 + static_cast<int64_t>(
+                                 std::floor(fraction * static_cast<double>(t1 - t0)));
+                    crossGains[crossCount] = bound;
+                    ++crossCount;
+                }
+            }
+            if (crossCount == 2 && crossTimes[0] > crossTimes[1]) {
+                const int64_t tSwap = crossTimes[0];
+                const double  gSwap = crossGains[0];
+                crossTimes[0] = crossTimes[1];
+                crossGains[0] = crossGains[1];
+                crossTimes[1] = tSwap;
+                crossGains[1] = gSwap;
+            }
+            for (size_t c = 0; c < crossCount; ++c) {
+                if (clampedCount >= AudioGainEnvelope::kMaxRawKeyframes) {
+                    return "envelope_clamp_keyframe_overflow";
+                }
+                clamped[clampedCount++] = AudioGainEnvelope::Keyframe{
+                    crossTimes[c], crossGains[c],
+                    AudioGainEnvelope::Interpolation::kLinear};
+            }
+        }
+        if (clampedCount >= AudioGainEnvelope::kMaxRawKeyframes) {
+            return "envelope_clamp_keyframe_overflow";
+        }
+        double g = kf.gain;
+        if (g < 0.0) {
+            g = 0.0;
+        } else if (g > 1.0) {
+            g = 1.0;
+        }
+        clamped[clampedCount++] = AudioGainEnvelope::Keyframe{
+            kf.timeUs, g, AudioGainEnvelope::Interpolation::kLinear};
+    }
+
+    const AudioGainEnvelope::BuildResult rebuilt = AudioGainEnvelope::Normalize(
+        clamped, clampedCount, trackStartUs, trackEndUs, /*mixGain=*/1.0, outEnvelope);
+    if (rebuilt != AudioGainEnvelope::BuildResult::kOk) {
+        return EnvelopeBuildFailReason(rebuilt);
+    }
+    *outGainClamped = true;
+    return nullptr;
+}
+
+// Shared add-track core for both add verbs. The caller holds session.mutex
+// and has already rejected destroyed/prepared sessions. `envelope` == nullptr
+// is the legacy diagnostic path (no envelopes/mixParams entry, so the
+// scheduler keeps static unit gain with a null envelope for that source);
+// non-null copies the envelope into session.envelopes and registers a
+// unit-static-gain mixParams entry pointing at that stored copy. Fails
+// closed: on any failure the graph, trackOrder, tracks, envelopes and
+// mixParams are all left unmutated (the connect/registration failure paths
+// roll their own mutations back).
+bool AddGraphExportTrackLocked(GraphExportSession&      session,
+                               const std::string&       trackId,
+                               int64_t                  frames,
+                               const AudioGainEnvelope* envelope,
+                               char*                    status,
+                               size_t                   statusSize,
+                               size_t*                  outTrackIndex) {
+    if (trackId.empty()) {
+        std::snprintf(status, statusSize, "status=FAIL;reason=empty_track_id");
+        return false;
+    }
+    if (session.tracks.count(trackId) != 0) {
+        std::snprintf(status, statusSize, "status=FAIL;reason=duplicate_track_id");
+        return false;
+    }
+    if (session.trackOrder.size() >= kMaxTrackCount) {
+        std::snprintf(status, statusSize,
+            "status=FAIL;reason=total_track_count_exceeded:%zu",
+            session.trackOrder.size() + 1);
+        return false;
+    }
+    if (frames <= 0 ||
+        frames > static_cast<int64_t>(session.sampleRate) *
+                     DecodedAudioPcmSourceNode::kMaxExpectedSeconds) {
+        std::snprintf(status, statusSize, "status=FAIL;reason=invalid_total_frames");
+        return false;
+    }
+
+    std::shared_ptr<DecodedAudioPcmSourceNode> node;
+    try {
+        node = std::make_shared<DecodedAudioPcmSourceNode>(
+            trackId,
+            session.sampleRate,
+            session.channelCount,
+            frames,
+            /*timelineStartPtsUs=*/0,
+            kSourceRingCapacityFrames);
+    } catch (const std::exception& e) {
+        std::snprintf(status, statusSize, "status=FAIL;reason=%s", e.what());
+        return false;
+    } catch (...) {
+        std::snprintf(status, statusSize, "status=FAIL;reason=node_construction_failed");
+        return false;
+    }
+    if (!node->ownsRing()) {
+        std::snprintf(status, statusSize, "status=FAIL;reason=node_transport_missing");
+        return false;
+    }
+
+    if (!session.graphTopology.addNode(node).ok()) {
+        std::snprintf(status, statusSize, "status=FAIL;reason=graph_add_node_failed");
+        return false;
+    }
+
+    const size_t trackIndex = session.trackOrder.size();
+    const std::string& inputPortId = session.mixBus->inputPorts()[trackIndex].id;
+    if (!session.graphTopology.connect(trackId, "audio_out", kMixNodeId, inputPortId).ok()) {
+        // Fail closed and keep the graph consistent: the orphan node must
+        // not be discoverable by a later prepare().
+        (void)session.graphTopology.removeNode(trackId);
+        std::snprintf(status, statusSize, "status=FAIL;reason=graph_connect_failed");
+        return false;
+    }
+
+    try {
+        if (envelope != nullptr) {
+            session.envelopes[trackId] = *envelope;
+            GraphAudioScheduler::SourceMixParams params;
+            params.gain     = 1.0;
+            params.envelope = &session.envelopes[trackId];
+            session.mixParams[trackId] = params;
+        }
+        session.trackOrder.push_back(trackId);
+        session.tracks[trackId] = std::move(node);
+    } catch (...) {
+        session.envelopes.erase(trackId);
+        session.mixParams.erase(trackId);
+        if (!session.trackOrder.empty() && session.trackOrder.back() == trackId) {
+            session.trackOrder.pop_back();
+        }
+        session.tracks.erase(trackId);
+        (void)session.graphTopology.removeNode(trackId);
+        std::snprintf(status, statusSize, "status=FAIL;reason=track_registration_failed");
+        return false;
+    }
+
+    *outTrackIndex = trackIndex;
+    return true;
 }
 
 } // namespace
@@ -263,10 +513,12 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_createAndr
 
 // ---------------------------------------------------------------------------
 // JNI: addAndroidDagPhase4AudioGraphExportTrack
-// Rejected after prepare() so the scheduler's generation snapshot stays
-// authoritative. Every track uses timelineStartPtsUs=0 and
-// expectedFrameCount=totalFrames (lockstep providers, no per-node timeline
-// gating claim) and the 6-arg node-owned-transport constructor.
+// Legacy diagnostic add verb, byte-compatible: unit gain, null envelope (no
+// envelopes/mixParams entry). Rejected after prepare() so the scheduler's
+// generation snapshot stays authoritative. Every track uses
+// timelineStartPtsUs=0 and expectedFrameCount=totalFrames (lockstep
+// providers, no per-node timeline gating claim) and the 6-arg
+// node-owned-transport constructor.
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_addAndroidDagPhase4AudioGraphExportTrack(
@@ -296,83 +548,151 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_addAndroid
     }
 
     const std::string trackId = JStringToStdString(env, trackIdJ);
-    if (trackId.empty()) {
-        std::snprintf(status, sizeof(status), "status=FAIL;reason=empty_track_id");
-        return env->NewStringUTF(status);
-    }
-    if (session->tracks.count(trackId) != 0) {
-        std::snprintf(status, sizeof(status), "status=FAIL;reason=duplicate_track_id");
-        return env->NewStringUTF(status);
-    }
-    if (session->trackOrder.size() >= kMaxTrackCount) {
-        std::snprintf(status, sizeof(status),
-            "status=FAIL;reason=total_track_count_exceeded:%zu",
-            session->trackOrder.size() + 1);
-        return env->NewStringUTF(status);
-    }
     const int64_t frames = static_cast<int64_t>(totalFrames);
-    if (frames <= 0 ||
-        frames > static_cast<int64_t>(session->sampleRate) *
-                     DecodedAudioPcmSourceNode::kMaxExpectedSeconds) {
-        std::snprintf(status, sizeof(status), "status=FAIL;reason=invalid_total_frames");
+    size_t trackIndex = 0;
+    if (!AddGraphExportTrackLocked(*session, trackId, frames, /*envelope=*/nullptr,
+                                   status, sizeof(status), &trackIndex)) {
         return env->NewStringUTF(status);
     }
-
-    std::shared_ptr<DecodedAudioPcmSourceNode> node;
-    try {
-        node = std::make_shared<DecodedAudioPcmSourceNode>(
-            trackId,
-            session->sampleRate,
-            session->channelCount,
-            frames,
-            /*timelineStartPtsUs=*/0,
-            kSourceRingCapacityFrames);
-    } catch (const std::exception& e) {
-        std::snprintf(status, sizeof(status), "status=FAIL;reason=%s", e.what());
-        return env->NewStringUTF(status);
-    } catch (...) {
-        std::snprintf(status, sizeof(status), "status=FAIL;reason=node_construction_failed");
-        return env->NewStringUTF(status);
-    }
-    if (!node->ownsRing()) {
-        std::snprintf(status, sizeof(status), "status=FAIL;reason=node_transport_missing");
-        return env->NewStringUTF(status);
-    }
-
-    if (!session->graphTopology.addNode(node).ok()) {
-        std::snprintf(status, sizeof(status), "status=FAIL;reason=graph_add_node_failed");
-        return env->NewStringUTF(status);
-    }
-
-    const size_t trackIndex = session->trackOrder.size();
-    const std::string& inputPortId = session->mixBus->inputPorts()[trackIndex].id;
-    if (!session->graphTopology.connect(trackId, "audio_out", kMixNodeId, inputPortId).ok()) {
-        // Fail closed and keep the graph consistent: the orphan node must
-        // not be discoverable by a later prepare().
-        (void)session->graphTopology.removeNode(trackId);
-        std::snprintf(status, sizeof(status), "status=FAIL;reason=graph_connect_failed");
-        return env->NewStringUTF(status);
-    }
-
-    session->trackOrder.push_back(trackId);
-    session->tracks[trackId] = std::move(node);
 
     std::snprintf(status, sizeof(status),
         "status=PASS;trackId=%s;trackIndex=%zu;inputPort=%s;totalFrames=%lld;trackCount=%zu",
         trackId.c_str(),
         trackIndex,
-        inputPortId.c_str(),
+        session->mixBus->inputPorts()[trackIndex].id.c_str(),
         static_cast<long long>(frames),
         session->trackOrder.size());
     return env->NewStringUTF(status);
 }
 
 // ---------------------------------------------------------------------------
+// JNI: addAndroidDagPhase4AudioGraphExportTrackWithEnvelope
+// P4-AUDIO-PASS2-NATIVE-GAIN-ENVELOPE production add verb: one atomic call
+// builds the native AudioGainEnvelope from the raw spec params (Kotlin only
+// converts seconds to integer microseconds) BEFORE any graph mutation, then
+// constructs the node, adds it, connects it, and registers
+// track/envelope/mixParams together. Any failure — including every
+// envelope_* reason — leaves graph, tracks, envelopes and mixParams
+// unmutated. Same prepare barrier and lockstep totalFrames semantics as the
+// legacy verb.
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_addAndroidDagPhase4AudioGraphExportTrackWithEnvelope(
+    JNIEnv*      env,
+    jobject /* this */,
+    jstring      sessionIdJ,
+    jstring      trackIdJ,
+    jlong        totalFrames,
+    jdouble      volume,
+    jdouble      mixGain,
+    jlong        fadeInUs,
+    jlong        fadeOutUs,
+    jlong        trackStartUs,
+    jlong        trackEndUs,
+    jlongArray   keyframeTimesUsJ,
+    jdoubleArray keyframeGainsJ) {
+
+    char status[640];
+
+    const std::string sid = JStringToStdString(env, sessionIdJ);
+    const std::shared_ptr<GraphExportSession> session = FindGraphExportSession(sid);
+    if (!session) {
+        std::snprintf(status, sizeof(status), "status=FAIL;reason=session_not_found");
+        return env->NewStringUTF(status);
+    }
+
+    std::lock_guard<std::mutex> lock(session->mutex);
+    if (session->destroyed) {
+        std::snprintf(status, sizeof(status), "status=FAIL;reason=session_destroyed");
+        return env->NewStringUTF(status);
+    }
+    if (session->prepared) {
+        std::snprintf(status, sizeof(status), "status=FAIL;reason=session_already_prepared");
+        return env->NewStringUTF(status);
+    }
+
+    // Keyframe arrays travel as a matched pair: both null (static
+    // volume/fade path) or both present with identical lengths.
+    if ((keyframeTimesUsJ == nullptr) != (keyframeGainsJ == nullptr)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=envelope_keyframe_array_mismatch");
+        return env->NewStringUTF(status);
+    }
+    size_t rawCount = 0;
+    AudioGainEnvelope::Keyframe rawKeyframes[AudioGainEnvelope::kMaxRawKeyframes];
+    if (keyframeTimesUsJ != nullptr) {
+        const jsize timesLen = env->GetArrayLength(keyframeTimesUsJ);
+        const jsize gainsLen = env->GetArrayLength(keyframeGainsJ);
+        if (timesLen != gainsLen) {
+            std::snprintf(status, sizeof(status),
+                "status=FAIL;reason=envelope_keyframe_array_mismatch");
+            return env->NewStringUTF(status);
+        }
+        if (timesLen < 0 ||
+            static_cast<size_t>(timesLen) > AudioGainEnvelope::kMaxRawKeyframes) {
+            std::snprintf(status, sizeof(status),
+                "status=FAIL;reason=envelope_keyframe_count_exceeded:%lld",
+                static_cast<long long>(timesLen));
+            return env->NewStringUTF(status);
+        }
+        if (timesLen > 0) {
+            jlong   times[AudioGainEnvelope::kMaxRawKeyframes];
+            jdouble gains[AudioGainEnvelope::kMaxRawKeyframes];
+            env->GetLongArrayRegion(keyframeTimesUsJ, 0, timesLen, times);
+            env->GetDoubleArrayRegion(keyframeGainsJ, 0, gainsLen, gains);
+            for (jsize i = 0; i < timesLen; ++i) {
+                rawKeyframes[i] = AudioGainEnvelope::Keyframe{
+                    static_cast<int64_t>(times[i]),
+                    static_cast<double>(gains[i]),
+                    AudioGainEnvelope::Interpolation::kLinear};
+            }
+            rawCount = static_cast<size_t>(timesLen);
+        }
+    }
+
+    // Envelope build happens entirely before any graph mutation.
+    AudioGainEnvelope envelope;
+    bool gainClamped = false;
+    const char* envelopeFail = BuildTrackEnvelope(
+        rawCount > 0 ? rawKeyframes : nullptr, rawCount,
+        static_cast<double>(volume), static_cast<double>(mixGain),
+        static_cast<int64_t>(fadeInUs), static_cast<int64_t>(fadeOutUs),
+        static_cast<int64_t>(trackStartUs), static_cast<int64_t>(trackEndUs),
+        &envelope, &gainClamped);
+    if (envelopeFail != nullptr) {
+        std::snprintf(status, sizeof(status), "status=FAIL;reason=%s", envelopeFail);
+        return env->NewStringUTF(status);
+    }
+
+    const std::string trackId = JStringToStdString(env, trackIdJ);
+    const int64_t frames = static_cast<int64_t>(totalFrames);
+    size_t trackIndex = 0;
+    if (!AddGraphExportTrackLocked(*session, trackId, frames, &envelope,
+                                   status, sizeof(status), &trackIndex)) {
+        return env->NewStringUTF(status);
+    }
+
+    std::snprintf(status, sizeof(status),
+        "status=PASS;trackId=%s;trackIndex=%zu;inputPort=%s;totalFrames=%lld;trackCount=%zu;"
+        "gainClamped=%s;envelopeKeyframeCount=%zu",
+        trackId.c_str(),
+        trackIndex,
+        session->mixBus->inputPorts()[trackIndex].id.c_str(),
+        static_cast<long long>(frames),
+        session->trackOrder.size(),
+        gainClamped ? "true" : "false",
+        session->envelopes[trackId].keyframeCount());
+    return env->NewStringUTF(status);
+}
+
+// ---------------------------------------------------------------------------
 // JNI: prepareAndroidDagPhase4AudioGraphExportSession
 // One-way prepare barrier: freezes the topology and constructs the
-// auto-discovery GraphAudioScheduler. Fails closed (session stays
-// unprepared, scheduler discarded) unless the target is valid and every
-// added track routed.
+// auto-discovery GraphAudioScheduler over the session-owned mixParams map
+// (per-source unit static gain + non-owning pointer into session->envelopes
+// for envelope tracks; legacy tracks have no entry and keep unit gain with
+// a null envelope). Fails closed (session stays unprepared, scheduler
+// discarded) unless the target is valid and every added track routed.
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_prepareAndroidDagPhase4AudioGraphExportSession(
@@ -406,7 +726,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_prepareAnd
     try {
         session->scheduler = std::make_unique<GraphAudioScheduler>(
             session->graphTopology, kMixNodeId, AutoDiscoverSourceProviders{},
-            /*mixParams=*/nullptr);
+            &session->mixParams);
     } catch (const std::exception& e) {
         session->scheduler.reset();
         std::snprintf(status, sizeof(status), "status=FAIL;reason=%s", e.what());
@@ -551,7 +871,10 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_ingestAndr
 // renderWindow(); any zero-fill growth fails the window closed with
 // source_underrun:<trackId> (never a PASS), because zero-filled audio is
 // corruption for an export session. kOk and kSilence are the only PASS
-// scheduler results; the cursor/metrics advance only on PASS.
+// scheduler results; the cursor/metrics advance only on PASS. Every PASS
+// also reports the scheduler's envelope telemetry (envelopeApplied /
+// envelopeEvaluations / minEffectiveGain / maxEffectiveGain) so Kotlin can
+// evidence that the native graph owned the per-frame gain math.
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidDagPhase4AudioGraphExportWindow(
@@ -562,7 +885,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     jint    frameCount,
     jobject outPcmBufferJ) {
 
-    char status[640];
+    char status[896];
 
     const std::string sid = JStringToStdString(env, sessionIdJ);
     const std::shared_ptr<GraphExportSession> session = FindGraphExportSession(sid);
@@ -661,7 +984,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 
     std::snprintf(status, sizeof(status),
         "status=PASS;framesRendered=%lld;routedTrackCount=%zu;mixCalled=%s;silence=%s;"
-        "checksum=%016llx;windowCount=%lld;silentWindowCount=%lld;nextRenderFrame=%lld",
+        "checksum=%016llx;windowCount=%lld;silentWindowCount=%lld;nextRenderFrame=%lld;"
+        "envelopeApplied=%s;envelopeEvaluations=%lld;minEffectiveGain=%.6f;"
+        "maxEffectiveGain=%.6f",
         static_cast<long long>(out.framesRendered),
         out.routedTrackCount,
         out.mixCalled ? "true" : "false",
@@ -669,7 +994,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         static_cast<unsigned long long>(out.checksum),
         static_cast<long long>(session->windowCount),
         static_cast<long long>(session->silentWindowCount),
-        static_cast<long long>(session->nextRenderFrame));
+        static_cast<long long>(session->nextRenderFrame),
+        out.envelopeApplied ? "true" : "false",
+        static_cast<long long>(out.envelopeEvaluations),
+        out.minEffectiveGain,
+        out.maxEffectiveGain);
     return env->NewStringUTF(status);
 }
 

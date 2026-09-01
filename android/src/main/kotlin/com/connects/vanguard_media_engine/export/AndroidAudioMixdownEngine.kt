@@ -9,11 +9,16 @@ import android.util.Log
 // AndroidNativeAudioGraphExportMixer — ONE native True-DAG audio graph
 // export session (Graph + AudioMixBusNode + N node-owned
 // DecodedAudioPcmSourceNode rings routed by GraphAudioScheduler) that owns
-// cross-source summation and the final int16 clamp. Kotlin still owns
-// decode, per-frame AndroidAudioVolumeEnvelope evaluation/clamping, and
-// source-channel conversion (mono<->stereo) before ingest. The legacy
-// AndroidNativeAudioMixBusChunkMixer remains available for
-// rollback/harness comparison but is no longer the production route.
+// per-frame gain/envelope evaluation (native AudioGainEnvelope, built from
+// the raw spec params), cross-source summation, and the final int16 clamp
+// (P4-AUDIO-PASS2-NATIVE-GAIN-ENVELOPE). Kotlin keeps decode, timeline
+// placement, and source-channel conversion (mono<->stereo) only; this
+// engine passes the raw volume/mixGain/fade/keyframe spec values with
+// seconds converted to integer microseconds and does no envelope
+// evaluation itself. AndroidAudioVolumeEnvelope remains untouched for
+// legacy/harness users. The legacy AndroidNativeAudioMixBusChunkMixer
+// remains available for rollback/harness comparison but is no longer the
+// production route.
 //
 // Constraints in this slice:
 //   - Output sample rate follows the FIRST successfully decoded track
@@ -29,12 +34,16 @@ import android.util.Log
 //     "native_audio_graph_export:total_track_count_exceeded:<n>".
 
 /// Structured mixdown outcome. [pcm] is 16-bit interleaved output-timeline
-/// samples on success. The native* fields are evidence of the
-/// P4-AUDIO-PASS2-GRAPH-REROUTE native graph routing and default to their
-/// "not used" values for failures that occur before native mixing is
-/// attempted. nativeChunkCount/nativeSilentChunks/nativeMixReason/
-/// nativeGainClamped are kept for caller compatibility and now carry the
-/// graph route's windowCount/silentWindowCount/reason/gainClamped.
+/// samples on success. The native* fields are evidence of the native graph
+/// routing and default to their "not used" values for failures that occur
+/// before native mixing is attempted. nativeChunkCount/nativeSilentChunks/
+/// nativeMixReason/nativeGainClamped are kept for caller compatibility and
+/// now carry the graph route's windowCount/silentWindowCount/reason/
+/// gainClamped ([nativeGainClamped] is native envelope-build evidence, not
+/// Kotlin clamping). The nativeEnvelope* fields carry the
+/// P4-AUDIO-PASS2-NATIVE-GAIN-ENVELOPE scheduler telemetry aggregated
+/// across render windows (applied OR-ed, evaluations summed, min/max over
+/// envelope-applied windows).
 data class AndroidAudioMixdownResult(
     val success: Boolean,
     val reason: String,
@@ -54,6 +63,10 @@ data class AndroidAudioMixdownResult(
     val nativeMixTotalTrackCount: Int = 0,
     val nativeGraphRoutedSourceCount: Int = 0,
     val nativeGraphWindowCount: Int = 0,
+    val nativeEnvelopeApplied: Boolean = false,
+    val nativeEnvelopeEvaluations: Long = 0L,
+    val nativeMinEffectiveGain: Double = 0.0,
+    val nativeMaxEffectiveGain: Double = 0.0,
 ) {
     override fun equals(other: Any?): Boolean = this === other
     override fun hashCode(): Int = System.identityHashCode(this)
@@ -133,14 +146,29 @@ object AndroidAudioMixdownEngine {
             val startFrame = Math.round(spec.startTime * outputSampleRate).toInt()
             val trackStartSec = spec.startTime
             val trackEndSec = spec.startTime + decode.frameCount.toDouble() / outputSampleRate
-            val envelope = AndroidAudioVolumeEnvelope.forTrack(spec, trackStartSec, trackEndSec)
+            // Raw spec params only: the native graph owns envelope build and
+            // per-frame evaluation. Kotlin converts seconds to integer
+            // microseconds here; trackStartUs is rounded independently from
+            // startFrame (frame and microsecond axes each round once from
+            // the same seconds value).
             AndroidNativeAudioGraphExportMixer.GraphTrackInput(
                 trackId = spec.trackId,
                 startFrame = startFrame,
                 pcm = decode.pcm!!,
                 srcChannelCount = decode.channelCount,
                 frameCount = decode.frameCount,
-                envelope = envelope,
+                volume = spec.volume,
+                mixGain = spec.mixGain,
+                fadeInUs = Math.round(spec.fadeInSeconds * 1_000_000.0),
+                fadeOutUs = Math.round(spec.fadeOutSeconds * 1_000_000.0),
+                trackStartUs = Math.round(trackStartSec * 1_000_000.0),
+                trackEndUs = Math.round(trackEndSec * 1_000_000.0),
+                keyframeTimesUs = spec.volumeKeyframes
+                    ?.map { Math.round(it.time * 1_000_000.0) }
+                    ?.toLongArray(),
+                keyframeGains = spec.volumeKeyframes
+                    ?.map { it.volume }
+                    ?.toDoubleArray(),
             )
         }
 
@@ -171,6 +199,10 @@ object AndroidAudioMixdownEngine {
                 nativeMixTotalTrackCount = decoded.size,
                 nativeGraphRoutedSourceCount = graphResult.routedSourceCount,
                 nativeGraphWindowCount = graphResult.windowCount,
+                nativeEnvelopeApplied = graphResult.nativeEnvelopeApplied,
+                nativeEnvelopeEvaluations = graphResult.nativeEnvelopeEvaluations,
+                nativeMinEffectiveGain = graphResult.nativeMinEffectiveGain,
+                nativeMaxEffectiveGain = graphResult.nativeMaxEffectiveGain,
             )
         }
 
@@ -201,6 +233,10 @@ object AndroidAudioMixdownEngine {
             nativeMixTotalTrackCount = decoded.size,
             nativeGraphRoutedSourceCount = graphResult.routedSourceCount,
             nativeGraphWindowCount = graphResult.windowCount,
+            nativeEnvelopeApplied = graphResult.nativeEnvelopeApplied,
+            nativeEnvelopeEvaluations = graphResult.nativeEnvelopeEvaluations,
+            nativeMinEffectiveGain = graphResult.nativeMinEffectiveGain,
+            nativeMaxEffectiveGain = graphResult.nativeMaxEffectiveGain,
         )
     }
 

@@ -1088,19 +1088,24 @@ object AndroidAudioFoundationSmokeHarness {
             )
         }
 
-        // 4. Mix tracks through AndroidAudioMixdownEngine (using native AudioMixBus).
+        // 4. Mix tracks through AndroidAudioMixdownEngine (using native AudioMixBus with native gain envelope).
         val mix = AndroidAudioMixdownEngine.mix(specs)
         if (!mix.success || mix.pcm == null) {
             return scenarioFailure("staticCurveMixdown", "mixdown_failed:${mix.reason}", outputPath)
         }
+        val expectedNativeEnvelopeEvaluations = mix.frameCount.toLong() * mix.mixedTrackCount.toLong()
         if (!mix.nativeMixBusUsed || mix.nativeChunkCount <= 0 || mix.nativeMixReason != "success" ||
-            mix.mixedTrackCount != 8 || !mix.nativeGainClamped
+            mix.mixedTrackCount != 8 || !mix.nativeGainClamped ||
+            !mix.nativeEnvelopeApplied || mix.nativeEnvelopeEvaluations != expectedNativeEnvelopeEvaluations
         ) {
             return scenarioFailure(
                 "staticCurveMixdown",
                 "native_mix_bus_evidence_missing:used=${mix.nativeMixBusUsed};" +
                     "chunks=${mix.nativeChunkCount};nativeReason=${mix.nativeMixReason};" +
-                    "mixedTracks=${mix.mixedTrackCount};nativeGainClamped=${mix.nativeGainClamped}",
+                    "mixedTracks=${mix.mixedTrackCount};nativeGainClamped=${mix.nativeGainClamped};" +
+                    "nativeEnvelopeApplied=${mix.nativeEnvelopeApplied};" +
+                    "nativeEnvelopeEvaluations=${mix.nativeEnvelopeEvaluations};" +
+                    "expectedNativeEnvelopeEvaluations=$expectedNativeEnvelopeEvaluations",
                 outputPath,
             )
         }
@@ -1140,6 +1145,10 @@ object AndroidAudioFoundationSmokeHarness {
                 "directCopyReason=${directCopyVerdict.reason},mixedTracks=${mix.mixedTrackCount}," +
                 "nativeMixBusUsed=${mix.nativeMixBusUsed},nativeChunkCount=${mix.nativeChunkCount}," +
                 "nativeSilentChunks=${mix.nativeSilentChunks},nativeGainClamped=${mix.nativeGainClamped}," +
+                "nativeEnvelopeApplied=${mix.nativeEnvelopeApplied}," +
+                "nativeEnvelopeEvaluations=${mix.nativeEnvelopeEvaluations}," +
+                "nativeMinEffectiveGain=${mix.nativeMinEffectiveGain}," +
+                "nativeMaxEffectiveGain=${mix.nativeMaxEffectiveGain}," +
                 "aacSamples=${encode.encodedSamples},video=${remux.videoSamples}," +
                 "audio=${remux.audioSamples},bytes=${remux.outputSizeBytes})"
         } else {
@@ -1171,6 +1180,11 @@ object AndroidAudioFoundationSmokeHarness {
             "nativeSilentChunks" to mix.nativeSilentChunks,
             "nativeMixReason" to mix.nativeMixReason,
             "nativeGainClamped" to mix.nativeGainClamped,
+            "nativeEnvelopeApplied" to mix.nativeEnvelopeApplied,
+            "nativeEnvelopeEvaluations" to mix.nativeEnvelopeEvaluations,
+            "expectedNativeEnvelopeEvaluations" to expectedNativeEnvelopeEvaluations,
+            "nativeMinEffectiveGain" to mix.nativeMinEffectiveGain,
+            "nativeMaxEffectiveGain" to mix.nativeMaxEffectiveGain,
             "encodedSamples" to encode.encodedSamples,
             "mixedAudioPath" to mixedAudioPath,
             "mixedAudioSize" to encode.outputSizeBytes,

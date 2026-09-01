@@ -1199,22 +1199,26 @@ class VanguardNativeBridge(
         sessionId: String,
     ): String
 
-    // ── P4-AUDIO-PASS2-GRAPH-NATIVE-SESSION: N-source True-DAG audio graph export session diagnostic ─
+    // ── P4-AUDIO-PASS2-GRAPH-NATIVE-SESSION / P4-AUDIO-PASS2-NATIVE-GAIN-ENVELOPE: N-source True-DAG audio graph export session ─
     // Parameterized native graph export session: one C++ Graph with one
     // AudioMixBusNode ("graph_export_mix") plus up to 8
     // DecodedAudioPcmSourceNode tracks (6-arg node-owned ring/writer/provider
     // constructor, timelineStartPtsUs=0, expectedFrameCount=totalFrames so
     // providers run in lockstep), routed by the auto-discovery
-    // GraphAudioScheduler at prepare() with static unit gain and null
-    // envelope only. Windows render synchronously and contiguously
-    // (startFrame must equal the session cursor; no skips/retries/reorders)
-    // and any provider zero-fill underrun fails the window closed
-    // (source_underrun:<trackId>) — zero-filled audio is corruption for an
-    // export session. Diagnostic foundation only: no production route swap
-    // (AndroidAudioMixdownEngine / AndroidNativeAudioMixBusChunkMixer
-    // untouched), no runtime/realtime sink, no AudioTrack/AAudio/OpenSL/
-    // Oboe, no MediaCodec/MediaExtractor, no file IO, no native worker
-    // threads, no app/editor/product, no streaming/cache, no iOS.
+    // GraphAudioScheduler at prepare() over the session-owned mix-params
+    // map. The native graph owns per-frame gain/envelope evaluation
+    // (AudioGainEnvelope inside AudioMixBusNode) for tracks added via
+    // addAndroidDagPhase4AudioGraphExportTrackWithEnvelope; the legacy
+    // addAndroidDagPhase4AudioGraphExportTrack verb stays byte-compatible
+    // for diagnostics (unit gain, null envelope). Windows render
+    // synchronously and contiguously (startFrame must equal the session
+    // cursor; no skips/retries/reorders) and any provider zero-fill underrun
+    // fails the window closed (source_underrun:<trackId>) — zero-filled
+    // audio is corruption for an export session. Non-claims: no byte
+    // identity with the prior Kotlin pre-scaling route, no performance
+    // claim, no runtime/realtime sink, no AudioTrack/AAudio/OpenSL/Oboe, no
+    // MediaCodec/MediaExtractor, no file IO, no native worker threads, no
+    // app/editor/product, no streaming/cache, no iOS.
 
     // Returns status=PASS;sessionId=<id>;proofBoundary=<boundary> or
     // status=FAIL;reason=<token>. sampleRate must be in [8000, 192000],
@@ -1225,13 +1229,47 @@ class VanguardNativeBridge(
         maxFramesPerMix: Int,
     ): String
 
-    // Rejected after prepare (session_already_prepared); a 9th track
-    // rejects with total_track_count_exceeded:<n>. totalFrames must be in
-    // [1, sampleRate * 600] (DecodedAudioPcmSourceNode kMaxExpectedSeconds).
+    // Legacy diagnostic add verb (byte-compatible): static unit gain, null
+    // envelope. Rejected after prepare (session_already_prepared); a 9th
+    // track rejects with total_track_count_exceeded:<n>. totalFrames must be
+    // in [1, sampleRate * 600] (DecodedAudioPcmSourceNode
+    // kMaxExpectedSeconds).
     external fun addAndroidDagPhase4AudioGraphExportTrack(
         sessionId: String,
         trackId: String,
         totalFrames: Long,
+    ): String
+
+    // P4-AUDIO-PASS2-NATIVE-GAIN-ENVELOPE production add verb: one atomic
+    // call that builds the native AudioGainEnvelope (AudioGainEnvelope::
+    // ForTrack over the raw spec params; Kotlin only converts seconds to
+    // integer microseconds) BEFORE any graph mutation, then adds/connects
+    // the node and registers track + envelope + scheduler mix params
+    // together. All times are absolute output-timeline microseconds.
+    // keyframeTimesUs/keyframeGains must both be null (static volume/fade
+    // path) or both present with identical lengths
+    // (envelope_keyframe_array_mismatch otherwise; more than 510 keyframes
+    // rejects with envelope_keyframe_count_exceeded:<n>). Envelope build
+    // failures reject with envelope_build_<token> and non-finite inputs stay
+    // fail-closed. A built keyframe gain outside [0,1] (e.g. negative or
+    // above-unity static volume) is rebuilt clamped with exact 0.0/1.0
+    // crossing keyframes (envelope_clamp_keyframe_overflow when that cannot
+    // fit) and reported via gainClamped=true. Any failure leaves the graph,
+    // tracks, envelopes and mix params unmutated. PASS reports
+    // gainClamped=<true|false>;envelopeKeyframeCount=<n> in addition to the
+    // legacy add fields.
+    external fun addAndroidDagPhase4AudioGraphExportTrackWithEnvelope(
+        sessionId: String,
+        trackId: String,
+        totalFrames: Long,
+        volume: Double,
+        mixGain: Double,
+        fadeInUs: Long,
+        fadeOutUs: Long,
+        trackStartUs: Long,
+        trackEndUs: Long,
+        keyframeTimesUs: LongArray?,
+        keyframeGains: DoubleArray?,
     ): String
 
     // One-way prepare barrier: freezes topology and constructs the
@@ -1257,7 +1295,9 @@ class VanguardNativeBridge(
     // kOk/kSilence are the only PASS results; provider underrun fails
     // closed with source_underrun:<trackId>. frameCount must be in
     // [1, maxFramesPerMix]; outPcmBuffer must be direct with capacity
-    // >= frameCount * channelCount * 2 bytes.
+    // >= frameCount * channelCount * 2 bytes. Every PASS also appends the
+    // scheduler envelope telemetry: envelopeApplied, envelopeEvaluations,
+    // minEffectiveGain, maxEffectiveGain.
     external fun renderAndroidDagPhase4AudioGraphExportWindow(
         sessionId: String,
         startFrame: Long,
