@@ -166,10 +166,26 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   static const String focusNoisyEventHandoffFailMarkerConstant =
       'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_PHYSICAL_SMOKE_FAIL';
 
+  /// Canonical pass marker emitted by the native harness for X8
+  /// focus-duck/restore response proof runs.
+  static const String focusDuckRestorePassMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_DUCK_RESTORE_PHYSICAL_SMOKE_PASS';
+
+  /// Canonical fail marker emitted by the native harness for X8
+  /// focus-duck/restore response proof runs.
+  static const String focusDuckRestoreFailMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_DUCK_RESTORE_PHYSICAL_SMOKE_FAIL';
+
   /// Canonical Kotlin driver proof boundary string (muted AudioTrack sink
   /// claim included) emitted by the native harness.
   static const String proofBoundaryConstant =
       'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_realtime_wall_clock_pacing_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_avsync_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
+
+  /// Canonical X8 focus-duck/restore Kotlin driver proof boundary string.
+  /// Replaces [proofBoundaryConstant] for X8 runs, which are neither muted
+  /// nor no-focus.
+  static const String focusDuckRestoreProofBoundaryConstant =
+      'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_duck_restore_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_focus_duck_restore_setvolume_only_base_gain_0_5_duck_gain_0_1_restore_gain_0_5_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_restart_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
 
   /// Canonical native TU proof boundary string (NO native sink claim)
   /// observed via the snapshot and echoed by the harness.
@@ -588,14 +604,15 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       _boolFact('audioTrackNonZeroGainSetOk');
 
   /// X6 non-zero-gain sink proof gate.
-  /// In X6 mode: requires gain set OK, gain > 0.0 and <= 1.0.
-  /// In default X4/X5 mode: requires gain NOT set and gain == 0.0,
+  /// In X6 mode (and X8 mode, which implies the non-zero 0.5 base gain):
+  /// requires gain set OK, gain > 0.0 and <= 1.0.
+  /// In default X4/X5/X7 mode: requires gain NOT set and gain == 0.0,
   /// proving muted behavior was preserved.
   /// Deferred: no acoustic/speaker measurement, no loudness/SNR, no
-  /// latency/glitch/xrun, no A/V sync, no audio focus/duck/noisy, no
-  /// route-change, no dead-object recovery, no product/editor/export/iOS.
+  /// latency/glitch/xrun, no A/V sync, no route-change, no dead-object
+  /// recovery, no product/editor/export/iOS.
   bool get nonZeroGainSinkGatesHeld {
-    if (!nonZeroGainSinkProofEnabled) {
+    if (!nonZeroGainSinkProofEnabled && !focusDuckRestoreProofEnabled) {
       return !audioTrackNonZeroGainSetOk && audioTrackGain == 0.0;
     }
     return audioTrackNonZeroGainSetOk &&
@@ -669,8 +686,125 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
         focusNoisyOwnerThreadDrainOk;
   }
 
-  /// Whether [proofBoundary] matches the canonical Kotlin driver boundary.
-  bool get hasCanonicalProofBoundary => proofBoundary == proofBoundaryConstant;
+  // ── X8 focus-duck/restore response proof getters ──────────────────────────
+
+  /// Whether this run executed the X8 focus-duck/restore response proof mode
+  /// (false for every default X4/X5/X6/X7 run). X8 implies the X7
+  /// focus/noisy handoff and the non-zero 0.5 base gain.
+  bool get focusDuckRestoreProofEnabled =>
+      _boolFact('focusDuckRestoreProofEnabled');
+
+  /// Whether a real AudioManager.OnAudioFocusChangeListener was attached to
+  /// the granted focus request in X8 mode. Real OS callbacks are counted
+  /// telemetry only, never a verdict gate.
+  bool get focusListenerRegisteredOk => _boolFact('focusListenerRegisteredOk');
+
+  /// Number of synthetic duck events posted (and awaited) before the driver
+  /// started in X8 mode; must be exactly 1 (0 in other modes).
+  int get syntheticDuckPosted => _intFact('syntheticDuckPosted');
+
+  /// Number of synthetic gain events posted after the driver reported the
+  /// duck drained/applied in X8 mode; must be exactly 1 (0 in other modes).
+  int get syntheticGainPosted => _intFact('syntheticGainPosted');
+
+  /// Times the owner thread applied the duck (setVolume 0.1) in X8 mode;
+  /// must be exactly 1.
+  int get duckAppliedCount => _intFact('duckAppliedCount', -1);
+
+  /// Times the owner thread applied the gain restore (setVolume 0.5) in X8
+  /// mode; must be exactly 1.
+  int get restoreAppliedCount => _intFact('restoreAppliedCount', -1);
+
+  /// Whether AudioTrack.setVolume(0.1) returned SUCCESS for the duck
+  /// (set-value telemetry only; no measured volume/dB/perceptual claim).
+  bool get duckSetVolumeOk => _boolFact('duckSetVolumeOk');
+
+  /// Whether AudioTrack.setVolume(0.5) returned SUCCESS for the restore
+  /// (set-value telemetry only; no measured volume/dB/perceptual claim).
+  bool get restoreSetVolumeOk => _boolFact('restoreSetVolumeOk');
+
+  /// Owner-thread drain pass at which the duck was applied (-1 if never).
+  int get duckDrainSeq => _intFact('duckDrainSeq', -1);
+
+  /// Owner-thread drain pass at which the restore was applied (-1 if never);
+  /// must be strictly greater than [duckDrainSeq].
+  int get restoreDrainSeq => _intFact('restoreDrainSeq', -1);
+
+  /// Base AudioTrack output gain set at create in X8 mode (0.5).
+  double get baseVolume => _doubleFact('baseVolume', -1.0);
+
+  /// Ducked AudioTrack output gain set value in X8 mode (0.1).
+  double get duckedVolume => _doubleFact('duckedVolume', -1.0);
+
+  /// Restored AudioTrack output gain set value in X8 mode (0.5).
+  double get restoredVolume => _doubleFact('restoredVolume', -1.0);
+
+  /// Final AudioTrack output gain set value at EOS in X8 mode (0.5).
+  double get finalVolume => _doubleFact('finalVolume', -1.0);
+
+  /// Synthetic duck events enqueued into the typed bounded queue (must be 1).
+  int get duckEventsEnqueued => _intFact('duckEventsEnqueued', -1);
+
+  /// Synthetic gain events enqueued into the typed bounded queue (must be 1).
+  int get gainEventsEnqueued => _intFact('gainEventsEnqueued', -1);
+
+  /// Synthetic duck events drained by the owner thread (must be 1).
+  int get duckEventsDrained => _intFact('duckEventsDrained', -1);
+
+  /// Synthetic gain events drained by the owner thread (must be 1).
+  int get gainEventsDrained => _intFact('gainEventsDrained', -1);
+
+  /// X8 duck/restore events dropped due to queue overflow; must be 0 for
+  /// proof (0 in other modes).
+  int get focusEventsDropped => _intFact('focusEventsDropped');
+
+  /// Real OS focus-change callbacks observed by the registered listener —
+  /// telemetry only, never a verdict gate.
+  int get realFocusChangeCallbackCount =>
+      _intFact('realFocusChangeCallbackCount');
+
+  static bool _volumeIs(double value, double expected) =>
+      (value - expected).abs() < 1e-6;
+
+  /// X8 focus-duck/restore response gate.
+  /// In X8 mode: the listener must be registered, exactly one synthetic
+  /// duck posted/enqueued/drained/applied (setVolume 0.1 SUCCESS), exactly
+  /// one synthetic gain posted/enqueued/drained/applied (setVolume 0.5
+  /// SUCCESS) on a strictly later drain pass, zero dropped events, and the
+  /// set-value telemetry must read base 0.5 / ducked 0.1 / restored 0.5 /
+  /// final 0.5. Set-value only: no measured volume, dB, perceptual depth,
+  /// fade, ramp, pause/resume, OS arbitration correctness, route recovery,
+  /// or dead-object recovery claim.
+  /// In default X4/X5/X6/X7 mode: vacuously true (backward compatible).
+  bool get focusDuckRestoreGatesHeld {
+    if (!focusDuckRestoreProofEnabled) return true;
+    return focusListenerRegisteredOk &&
+        syntheticDuckPosted == 1 &&
+        syntheticGainPosted == 1 &&
+        duckAppliedCount == 1 &&
+        restoreAppliedCount == 1 &&
+        duckSetVolumeOk &&
+        restoreSetVolumeOk &&
+        duckDrainSeq >= 0 &&
+        restoreDrainSeq > duckDrainSeq &&
+        _volumeIs(baseVolume, 0.5) &&
+        _volumeIs(duckedVolume, 0.1) &&
+        _volumeIs(restoredVolume, 0.5) &&
+        _volumeIs(finalVolume, 0.5) &&
+        focusEventsDropped == 0 &&
+        duckEventsEnqueued == 1 &&
+        duckEventsDrained == 1 &&
+        gainEventsEnqueued == 1 &&
+        gainEventsDrained == 1;
+  }
+
+  /// Whether [proofBoundary] matches the canonical Kotlin driver boundary
+  /// for this run's mode. X8 runs must carry the mode-specific
+  /// [focusDuckRestoreProofBoundaryConstant] — never the default boundary,
+  /// whose muted/no-focus claims would be false for X8.
+  bool get hasCanonicalProofBoundary => focusDuckRestoreProofEnabled
+      ? proofBoundary == focusDuckRestoreProofBoundaryConstant
+      : proofBoundary == proofBoundaryConstant;
 
   /// Whether [nativeProofBoundary] matches the canonical native TU
   /// boundary (no native sink claim).
@@ -738,7 +872,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       pass &&
       status.toLowerCase() == 'pass' &&
       marker ==
-          (focusNoisyEventHandoffProofEnabled
+          (focusDuckRestoreProofEnabled
+              ? focusDuckRestorePassMarkerConstant
+              : focusNoisyEventHandoffProofEnabled
               ? focusNoisyEventHandoffPassMarkerConstant
               : nonZeroGainSinkProofEnabled
               ? nonZeroGainSinkPassMarkerConstant
@@ -752,6 +888,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       focusNoisyEventHandoffGatesHeld &&
       (!focusNoisyEventHandoffProofEnabled ||
           _boolFact('focusNoisyEventHandoffGatesHeld')) &&
+      focusDuckRestoreGatesHeld &&
+      (!focusDuckRestoreProofEnabled ||
+          _boolFact('focusDuckRestoreGatesHeld')) &&
       hasCanonicalProofBoundary &&
       nativeProofBoundaryOk &&
       formatProbeOk &&
@@ -769,7 +908,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       sinkWriteAccountingOk &&
       providerPoisoningOk &&
       audioTrackInitOk &&
-      (nonZeroGainSinkProofEnabled || mutedOutputOk) &&
+      (nonZeroGainSinkProofEnabled ||
+          focusDuckRestoreProofEnabled ||
+          mutedOutputOk) &&
       playbackHeadTelemetryOk &&
       realtimeNativeElapsedOk &&
       realtimeBacklogBoundOk &&
@@ -1195,6 +1336,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
     bool envelopeProofEnabled = false,
     bool nonZeroGainSinkProofEnabled = false,
     bool focusNoisyEventHandoffProofEnabled = false,
+    bool focusDuckRestoreProofEnabled = false,
     Duration? timeout,
     MethodChannel? channel,
   }) async {
@@ -1219,6 +1361,10 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       // X4/X5/X6 argument shape stays frozen.
       if (focusNoisyEventHandoffProofEnabled)
         'focusNoisyEventHandoffProofEnabled': true,
+      // Only sent for X8 focus-duck/restore proof runs so the default
+      // X4/X5/X6/X7 argument shape stays frozen; the coordinator derives the
+      // implied X7 focus/noisy handoff from this single flag.
+      if (focusDuckRestoreProofEnabled) 'focusDuckRestoreProofEnabled': true,
     };
     try {
       final future = ch.invokeMethod<Object?>(methodName, args);

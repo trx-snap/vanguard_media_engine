@@ -331,15 +331,30 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
     // mutation; no duck/pause/resume/restart; no acoustic claim. ─────────
     final focusNoisyPass = await _runFocusNoisySmoke();
 
-    final allPass = pass && envelopePass && nonZeroGainPass && focusNoisyPass;
+    // ── X8 (P4-AUDIO-FOCUS-DUCK-RESTORE-RESPONSE): transient duck
+    // (setVolume 0.1) and gain restore (setVolume 0.5) applied by the
+    // driver owner thread from coordinator-enqueued synthetic events, over
+    // the implied X7 focus/noisy handoff and 0.5 base gain. Set-value
+    // telemetry only: no measured volume/dB/perceptual depth, no
+    // fade/ramp, no pause/resume, no OS arbitration correctness. ─────────
+    final duckRestorePass = await _runFocusDuckRestoreSmoke();
+
+    final allPass =
+        pass &&
+        envelopePass &&
+        nonZeroGainPass &&
+        focusNoisyPass &&
+        duckRestorePass;
     if (mounted) {
       setState(() {
         _status = allPass
             ? 'PASS (X4 allNativeLanesPass=true, X5 envelope gates held, '
-                  'X6 non-zero-gain gates held, X7 focus/noisy gates held)'
+                  'X6 non-zero-gain gates held, X7 focus/noisy gates held, '
+                  'X8 duck/restore gates held)'
             : 'FAIL: x4Pass=$pass, envelopePass=$envelopePass, '
                   'nonZeroGainPass=$nonZeroGainPass, '
                   'focusNoisyPass=$focusNoisyPass, '
+                  'duckRestorePass=$duckRestorePass, '
                   'lastError=${activeReport.lastError}, error=$topLevelError';
       });
     }
@@ -759,6 +774,162 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
           : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_PHYSICAL_SMOKE_FAIL',
     );
     return focusNoisyPass;
+  }
+
+  Future<bool> _runFocusDuckRestoreSmoke() async {
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_DUCK_RESTORE_SMOKE_START',
+    );
+
+    VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport? report;
+    String? topLevelError;
+    File? tempSourceFile;
+
+    try {
+      final clipBData = await rootBundle.load(
+        'assets/manual_test_clips/clip_B.mov',
+      );
+      final tempDir = Directory.systemTemp;
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+      tempSourceFile = File(
+        '${tempDir.path}/p4_async_rt_queue_focus_duck_restore_source_$timestamp.mov',
+      );
+
+      await tempSourceFile.writeAsBytes(
+        clipBData.buffer.asUint8List(
+          clipBData.offsetInBytes,
+          clipBData.lengthInBytes,
+        ),
+        flush: true,
+      );
+
+      report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: tempSourceFile.path,
+            focusDuckRestoreProofEnabled: true,
+            timeout: const Duration(seconds: 45),
+          ).timeout(const Duration(seconds: 55));
+    } on TimeoutException catch (te) {
+      topLevelError = 'timeout: $te';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_DUCK_RESTORE_ERROR: $topLevelError',
+      );
+    } catch (e, st) {
+      topLevelError = '$e\n$st';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_DUCK_RESTORE_ERROR: $topLevelError',
+      );
+    } finally {
+      if (tempSourceFile != null) {
+        try {
+          if (await tempSourceFile.exists()) {
+            await tempSourceFile.delete();
+          }
+        } catch (_) {}
+      }
+    }
+
+    final drReport =
+        report ??
+        VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+          <String, Object?>{
+            'pass': false,
+            'status': 'fail',
+            'marker': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .focusDuckRestoreFailMarkerConstant,
+            'proofBoundary': '',
+            'nativeProofBoundary': '',
+            'failureReason': 'invocation_failed',
+            'lastError': 'invocation_failed',
+          },
+        );
+
+    // Focus-Duck/Restore Response group. Set-value telemetry only: base
+    // 0.5 -> ducked 0.1 -> restored 0.5, each via one owner-thread
+    // setVolume SUCCESS on strictly ordered drain passes.
+    print(
+      '  [LANE] Focus-Duck/Restore Response: '
+      'focusDuckRestoreProofEnabled=${drReport.focusDuckRestoreProofEnabled}, '
+      'focusListenerRegisteredOk=${drReport.focusListenerRegisteredOk}, '
+      'syntheticDuckPosted=${drReport.syntheticDuckPosted}, '
+      'syntheticGainPosted=${drReport.syntheticGainPosted}, '
+      'duckAppliedCount=${drReport.duckAppliedCount}, '
+      'restoreAppliedCount=${drReport.restoreAppliedCount}, '
+      'duckSetVolumeOk=${drReport.duckSetVolumeOk}, '
+      'restoreSetVolumeOk=${drReport.restoreSetVolumeOk}, '
+      'duckDrainSeq=${drReport.duckDrainSeq}, '
+      'restoreDrainSeq=${drReport.restoreDrainSeq}, '
+      'baseVolume=${drReport.baseVolume}, '
+      'duckedVolume=${drReport.duckedVolume}, '
+      'restoredVolume=${drReport.restoredVolume}, '
+      'finalVolume=${drReport.finalVolume}, '
+      'focusEventsDropped=${drReport.focusEventsDropped}, '
+      'duckEventsEnqueued=${drReport.duckEventsEnqueued}, '
+      'duckEventsDrained=${drReport.duckEventsDrained}, '
+      'gainEventsEnqueued=${drReport.gainEventsEnqueued}, '
+      'gainEventsDrained=${drReport.gainEventsDrained}, '
+      'realFocusChangeCallbackCount=${drReport.realFocusChangeCallbackCount}, '
+      'focusDuckRestoreGatesHeld=${drReport.focusDuckRestoreGatesHeld}, '
+      'focusNoisyEventHandoffGatesHeld=${drReport.focusNoisyEventHandoffGatesHeld}, '
+      'allNativeLanesPass=${drReport.allNativeLanesPass}, '
+      'marker=${drReport.marker}, '
+      'lastError=${drReport.lastError}',
+    );
+
+    final lastErrorOk =
+        drReport.lastError.isEmpty ||
+        drReport.lastError == 'none' ||
+        drReport.lastError == 'null';
+
+    final duckRestorePass =
+        (topLevelError == null) &&
+        drReport.pass &&
+        drReport.marker ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .focusDuckRestorePassMarkerConstant &&
+        drReport.focusDuckRestoreProofEnabled &&
+        drReport.focusDuckRestoreGatesHeld &&
+        drReport.focusListenerRegisteredOk &&
+        drReport.syntheticDuckPosted == 1 &&
+        drReport.syntheticGainPosted == 1 &&
+        drReport.duckAppliedCount == 1 &&
+        drReport.restoreAppliedCount == 1 &&
+        drReport.duckSetVolumeOk &&
+        drReport.restoreSetVolumeOk &&
+        drReport.duckDrainSeq >= 0 &&
+        drReport.restoreDrainSeq > drReport.duckDrainSeq &&
+        drReport.focusEventsDropped == 0 &&
+        drReport.focusNoisyEventHandoffGatesHeld &&
+        drReport.hasCanonicalProofBoundary &&
+        drReport.nativeProofBoundaryOk &&
+        drReport.checksumsMatch &&
+        drReport.providerCountersClean &&
+        drReport.sinkAccountingBalanced &&
+        drReport.realtimeGatesHeld &&
+        drReport.allNativeLanesPass &&
+        lastErrorOk;
+
+    final summaryPayload = <String, dynamic>{
+      'unit': 'AndroidAsyncRuntimeQueueFocusDuckRestorePhysicalSmokeHarness',
+      'slice': 'P4-AUDIO-FOCUS-DUCK-RESTORE-RESPONSE',
+      'target': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .focusDuckRestoreProofBoundaryConstant,
+      'nativeTarget': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .nativeProofBoundaryConstant,
+      'pass': duckRestorePass,
+      'report': drReport.toMap(),
+      'error': topLevelError,
+    };
+
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_DUCK_RESTORE_JSON:${jsonEncode(summaryPayload)}',
+    );
+    print(
+      duckRestorePass
+          ? 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_DUCK_RESTORE_PHYSICAL_SMOKE_PASS'
+          : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_DUCK_RESTORE_PHYSICAL_SMOKE_FAIL',
+    );
+    return duckRestorePass;
   }
 
   @override

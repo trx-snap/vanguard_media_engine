@@ -12,6 +12,8 @@ import android.os.Handler
 import android.util.Log
 import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -40,6 +42,18 @@ import java.util.concurrent.atomic.AtomicInteger
  * failure, or dispose. No playback mutation, duck, pause, resume, restart,
  * gain restore, or route/device monitoring is performed.
  *
+ * X8 (P4-AUDIO-FOCUS-DUCK-RESTORE-RESPONSE) duck/restore response proof:
+ * when focusDuckRestoreProofEnabled=true (implies the X7 focus/noisy
+ * handoff and the non-zero 0.5 base gain), a real
+ * AudioManager.OnAudioFocusChangeListener is attached to the focus request
+ * (real OS callbacks are counted telemetry only, never a verdict gate). The
+ * coordinator posts+awaits ONE synthetic duck event before the driver
+ * starts (fail-closed focus_event_injection_timeout) and posts the ONE
+ * synthetic gain event only after the driver reports the duck drained and
+ * applied. Coordinator callbacks only enqueue typed bounded events and
+ * counters; the coordinator never touches the AudioTrack — the driver's
+ * owner thread alone mutates gain via setVolume (0.5 -> 0.1 -> 0.5).
+ *
  * Honest non-claims (Proof Boundary): diagnostic only — the worker-owned
  * steady_clock is a render/dispatch timebase, not a presentation clock; no
  * caller-supplied native time; playback head / AudioTimestamp / underrun
@@ -67,6 +81,8 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
         private const val METHOD_NAME = "runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke"
         private const val MAX_DURATION_SEC = 2.0
         private const val X7_QUEUE_CAPACITY = 64
+        private const val X8_QUEUE_CAPACITY = 8
+        private const val X8_INJECTION_AWAIT_MS = 5_000L
 
         fun ownsMethod(method: String): Boolean = method == METHOD_NAME
     }
@@ -93,6 +109,47 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
         }
     }
 
+    // Bounded thread-safe TYPED queue for the X8 duck/restore proof, with
+    // per-tag enqueued/drained accounting. Overflow drops and increments
+    // droppedCount; never blocks callback threads. The coordinator only
+    // enqueues; the driver polls at most one event per drain pass on its
+    // owner thread.
+    private class DuckRestoreEventQueue(capacity: Int = X8_QUEUE_CAPACITY) {
+        private val queue = ArrayBlockingQueue<String>(capacity)
+        val duckEnqueuedCount = AtomicInteger(0)
+        val gainEnqueuedCount = AtomicInteger(0)
+        val duckDrainedCount = AtomicInteger(0)
+        val gainDrainedCount = AtomicInteger(0)
+        val droppedCount = AtomicInteger(0)
+
+        fun offer(tag: String) {
+            if (queue.offer(tag)) {
+                if (tag ==
+                    AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.X8_EVENT_DUCK
+                ) {
+                    duckEnqueuedCount.incrementAndGet()
+                } else {
+                    gainEnqueuedCount.incrementAndGet()
+                }
+            } else {
+                droppedCount.incrementAndGet()
+            }
+        }
+
+        // Must only be called from the driver's owner thread.
+        fun pollOne(): String? {
+            val tag = queue.poll() ?: return null
+            if (tag ==
+                AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.X8_EVENT_DUCK
+            ) {
+                duckDrainedCount.incrementAndGet()
+            } else {
+                gainDrainedCount.incrementAndGet()
+            }
+            return tag
+        }
+    }
+
     private val active = AtomicBoolean(false)
     private val disposed = AtomicBoolean(false)
 
@@ -115,6 +172,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
         // durationSec is clamped here; the driver fail-closes on a blank
         // sourcePath, on budget/seek geometry outside the window, and on a
         // pre-seek epoch too short for the native one-second timing gate.
+        // X8 implies the X7 focus/noisy handoff (and, inside the driver, the
+        // non-zero 0.5 base gain).
+        val focusDuckRestoreRequested =
+            (args?.get("focusDuckRestoreProofEnabled") as? Boolean) ?: false
         val config = AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.RunConfig(
             sourcePath = args?.get("sourcePath") as? String ?: "",
             durationSec = ((args?.get("durationSec") as? Number)?.toDouble() ?: 2.0)
@@ -139,9 +200,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
             nonZeroGainSinkProofEnabled =
                 (args?.get("nonZeroGainSinkProofEnabled") as? Boolean) ?: false,
             // X7 focus/noisy event-plane proof mode; absent/false preserves
-            // the exact X4/X5/X6 behavior and args.
+            // the exact X4/X5/X6 behavior and args. X8 implies it.
             focusNoisyEventHandoffProofEnabled =
-                (args?.get("focusNoisyEventHandoffProofEnabled") as? Boolean) ?: false,
+                ((args?.get("focusNoisyEventHandoffProofEnabled") as? Boolean) ?: false) ||
+                    focusDuckRestoreRequested,
+            // X8 focus-duck/restore response proof mode; absent/false
+            // preserves the exact X4/X5/X6/X7 behavior and args.
+            focusDuckRestoreProofEnabled = focusDuckRestoreRequested,
         )
         if (!active.compareAndSet(false, true)) {
             result.error(
@@ -167,12 +232,33 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                 val x7Queue: FocusNoisyEventQueue? =
                     if (x7Enabled) FocusNoisyEventQueue() else null
 
+                // X8 coordinator-owned duck/restore state; null/false unless
+                // focusDuckRestoreProofEnabled. Real OS focus-change callbacks
+                // only bump a counter (telemetry, never a verdict gate).
+                val x8Enabled = config.focusDuckRestoreProofEnabled
+                var x7FocusListener: AudioManager.OnAudioFocusChangeListener? = null
+                var x8ListenerRegistered = false
+                var x8SyntheticDuckPosted = 0
+                val x8SyntheticGainPosted = AtomicInteger(0)
+                val x8RealFocusChangeCallbacks = AtomicInteger(0)
+                val x8Queue: DuckRestoreEventQueue? =
+                    if (x8Enabled) DuckRestoreEventQueue() else null
+
                 try {
                     // ── X7 focus + receiver setup ──────────────────────────
                     if (x7Enabled) {
                         val am =
                             context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
                         x7AudioManager = am
+
+                        // Real focus-change listener attached to the focus
+                        // request on both API paths. Real OS callbacks are
+                        // telemetry-only counters — no OS focus arbitration
+                        // correctness claim and never a verdict gate.
+                        val listener = AudioManager.OnAudioFocusChangeListener { _ ->
+                            x8RealFocusChangeCallbacks.incrementAndGet()
+                        }
+                        x7FocusListener = listener
 
                         // Request audio focus: AUDIOFOCUS_GAIN,
                         // USAGE_MEDIA / CONTENT_TYPE_MUSIC. Abandon exactly
@@ -186,19 +272,25 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                                     .setUsage(AudioAttributes.USAGE_MEDIA)
                                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                                     .build(),
+                            ).setOnAudioFocusChangeListener(
+                                listener, mainHandler,
                             ).build()
                             x7FocusRequestApi26 = req
                             focusResult = am.requestAudioFocus(req)
                         } else {
+                            // Pre-26: request and abandon the SAME listener.
                             @Suppress("DEPRECATION")
                             focusResult = am.requestAudioFocus(
-                                null,
+                                listener,
                                 AudioManager.STREAM_MUSIC,
                                 AudioManager.AUDIOFOCUS_GAIN,
                             )
                         }
                         x7FocusGranted =
                             (focusResult == AudioManager.AUDIOFOCUS_REQUEST_GRANTED)
+                        if (x8Enabled) {
+                            x8ListenerRegistered = x7FocusGranted
+                        }
 
                         if (x7FocusGranted) {
                             // Register ACTION_AUDIO_BECOMING_NOISY receiver.
@@ -236,10 +328,62 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                         }
                     }
 
+                    // ── X8 deterministic pre-start duck injection ──────────
+                    // Post the ONE synthetic duck via the main handler and
+                    // AWAIT its enqueue before the driver starts, so the duck
+                    // is drained/applied strictly before the gain restore can
+                    // exist. Fail closed (driver not invoked) on timeout.
+                    var x8InjectionTimedOut = false
+                    if (x8Enabled && x7FocusGranted) {
+                        val queue = x8Queue!!
+                        val posted = CountDownLatch(1)
+                        mainHandler.post {
+                            queue.offer(
+                                AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                                    .X8_EVENT_DUCK,
+                            )
+                            posted.countDown()
+                        }
+                        if (posted.await(X8_INJECTION_AWAIT_MS, TimeUnit.MILLISECONDS)) {
+                            x8SyntheticDuckPosted = 1
+                        } else {
+                            x8InjectionTimedOut = true
+                        }
+                    }
+
+                    // X8 event plane handed to the driver: poll-one on the
+                    // owner thread; the coordinator callback only enqueues
+                    // the typed gain event (never touches the AudioTrack),
+                    // and only after the driver reports the duck applied.
+                    val duckRestorePlane:
+                        AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                            .DuckRestoreEventPlane? =
+                        if (x8Enabled && x7FocusGranted && !x8InjectionTimedOut) {
+                            val queue = x8Queue!!
+                            object :
+                                AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                                    .DuckRestoreEventPlane {
+                                override fun pollOneEvent(): String? = queue.pollOne()
+
+                                override fun onDuckApplied() {
+                                    if (x8SyntheticGainPosted.compareAndSet(0, 1)) {
+                                        mainHandler.post {
+                                            queue.offer(
+                                                AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                                                    .X8_EVENT_GAIN,
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        } else null
+
                     // ── Driver run ─────────────────────────────────────────
-                    // In X7 mode with focus denied, fail-close before track
-                    // create (driver is not invoked).
-                    val shouldRunDriver = !x7Enabled || x7FocusGranted
+                    // In X7/X8 mode with focus denied (or the X8 injection
+                    // timed out), fail-close before track create (driver is
+                    // not invoked).
+                    val shouldRunDriver =
+                        (!x7Enabled || x7FocusGranted) && !x8InjectionTimedOut
                     val drainFn: (() -> Int)? =
                         if (x7Enabled && x7FocusGranted) x7Queue?.let { q ->
                             { q.drain() }
@@ -247,7 +391,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
 
                     val runResult = if (shouldRunDriver) {
                         AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver()
-                            .run(config, drainFn)
+                            .run(config, drainFn, duckRestorePlane)
+                    } else if (x8InjectionTimedOut) {
+                        AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                            .failedResult("focus_event_injection_timeout")
                     } else {
                         AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
                             .failedResult("audio_focus_request_denied")
@@ -278,7 +425,7 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                                         }
                                     } else {
                                         @Suppress("DEPRECATION")
-                                        am.abandonAudioFocus(null)
+                                        am.abandonAudioFocus(x7FocusListener)
                                     }
                                     x7FocusAbandoned = true
                                 }
@@ -290,9 +437,17 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                         x7Enabled, x7FocusGranted, x7FocusAbandoned,
                         x7ReceiverRegistered, x7ReceiverUnregistered,
                         x7Queue, runResult,
+                    ) + buildX8Lanes(
+                        x8Enabled, x8ListenerRegistered,
+                        x8SyntheticDuckPosted, x8SyntheticGainPosted.get(),
+                        x8Queue, runResult,
                     )
                     val extraMetrics = buildX7Metrics(
                         x7Enabled, x7SyntheticEventsPosted, x7Queue,
+                    ) + buildX8Metrics(
+                        x8Enabled, x8SyntheticDuckPosted,
+                        x8SyntheticGainPosted.get(),
+                        x8RealFocusChangeCallbacks.get(), x8Queue,
                     )
                     postReply(replied, result, toPayload(runResult, extraLanes, extraMetrics))
                 } catch (t: Throwable) {
@@ -315,7 +470,7 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                                         }
                                     } else {
                                         @Suppress("DEPRECATION")
-                                        am.abandonAudioFocus(null)
+                                        am.abandonAudioFocus(x7FocusListener)
                                     }
                                     x7FocusAbandoned = true
                                 }
@@ -326,9 +481,17 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                         x7Enabled, x7FocusGranted, x7FocusAbandoned,
                         x7ReceiverRegistered, x7ReceiverUnregistered,
                         x7Queue, null,
+                    ) + buildX8Lanes(
+                        x8Enabled, x8ListenerRegistered,
+                        x8SyntheticDuckPosted, x8SyntheticGainPosted.get(),
+                        x8Queue, null,
                     )
                     val extraMetrics = buildX7Metrics(
                         x7Enabled, x7SyntheticEventsPosted, x7Queue,
+                    ) + buildX8Metrics(
+                        x8Enabled, x8SyntheticDuckPosted,
+                        x8SyntheticGainPosted.get(),
+                        x8RealFocusChangeCallbacks.get(), x8Queue,
                     )
                     postReply(
                         replied,
@@ -395,7 +558,7 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
     // key shape shared by pass and failure paths. Both proof boundaries
     // travel top-level: the Kotlin driver boundary (muted AudioTrack sink
     // claim) and the observed native TU boundary (no native sink claim).
-    // extraLanes/extraMetrics carry X7 coordinator-owned fields; empty in
+    // extraLanes/extraMetrics carry X7/X8 coordinator-owned fields; empty in
     // X4/X5/X6 mode, preserving exact backward-compatible payload shape.
     private fun toPayload(
         r: AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.RunResult,
@@ -456,6 +619,75 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
             "focusNoisyEventsEnqueued" to (q?.enqueuedCount?.get() ?: 0),
             "focusNoisyEventsDropped" to (q?.droppedCount?.get() ?: 0),
             "focusNoisyEventsDrained" to (q?.drainedCount?.get() ?: 0),
+        )
+    }
+
+    // Builds the X8 coordinator-owned lane map, folding the driver's
+    // duck/restore metrics into the composite gate. Returns empty map unless
+    // focusDuckRestoreProofEnabled.
+    private fun buildX8Lanes(
+        x8Enabled: Boolean,
+        listenerRegistered: Boolean,
+        syntheticDuckPosted: Int,
+        syntheticGainPosted: Int,
+        queue: DuckRestoreEventQueue?,
+        runResult: AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.RunResult?,
+    ): Map<String, Any?> {
+        if (!x8Enabled) return emptyMap()
+        val q = queue
+        val dropped = q?.droppedCount?.get() ?: 0
+        val duckEnqueued = q?.duckEnqueuedCount?.get() ?: 0
+        val gainEnqueued = q?.gainEnqueuedCount?.get() ?: 0
+        val duckDrained = q?.duckDrainedCount?.get() ?: 0
+        val gainDrained = q?.gainDrainedCount?.get() ?: 0
+        val m = runResult?.metrics
+        val duckApplied = (m?.get("duckAppliedCount") as? Number)?.toLong() ?: -1L
+        val restoreApplied = (m?.get("restoreAppliedCount") as? Number)?.toLong() ?: -1L
+        val duckSetOk = (m?.get("duckSetVolumeOk") as? Boolean) ?: false
+        val restoreSetOk = (m?.get("restoreSetVolumeOk") as? Boolean) ?: false
+        val duckSeq = (m?.get("duckDrainSeq") as? Number)?.toLong() ?: -1L
+        val restoreSeq = (m?.get("restoreDrainSeq") as? Number)?.toLong() ?: -1L
+        val baseVolume = (m?.get("baseVolume") as? Number)?.toDouble() ?: -1.0
+        val duckedVolume = (m?.get("duckedVolume") as? Number)?.toDouble() ?: -1.0
+        val restoredVolume = (m?.get("restoredVolume") as? Number)?.toDouble() ?: -1.0
+        val finalVolume = (m?.get("finalVolume") as? Number)?.toDouble() ?: -1.0
+        val gatesHeld = listenerRegistered &&
+            syntheticDuckPosted == 1 && syntheticGainPosted == 1 &&
+            dropped == 0 &&
+            duckEnqueued == 1 && duckDrained == 1 &&
+            gainEnqueued == 1 && gainDrained == 1 &&
+            duckApplied == 1L && restoreApplied == 1L &&
+            duckSetOk && restoreSetOk &&
+            duckSeq >= 0L && restoreSeq > duckSeq &&
+            baseVolume == 0.5 && duckedVolume == 0.1 &&
+            restoredVolume == 0.5 && finalVolume == 0.5
+        return mapOf(
+            "focusListenerRegisteredOk" to listenerRegistered,
+            "focusDuckRestoreGatesHeld" to gatesHeld,
+        )
+    }
+
+    // Builds the X8 coordinator-owned metric map (typed per-tag enqueue/drain
+    // accounting plus real-callback telemetry). Returns empty map unless
+    // focusDuckRestoreProofEnabled.
+    private fun buildX8Metrics(
+        x8Enabled: Boolean,
+        syntheticDuckPosted: Int,
+        syntheticGainPosted: Int,
+        realFocusChangeCallbacks: Int,
+        queue: DuckRestoreEventQueue?,
+    ): Map<String, Any?> {
+        if (!x8Enabled) return emptyMap()
+        val q = queue
+        return mapOf(
+            "syntheticDuckPosted" to syntheticDuckPosted,
+            "syntheticGainPosted" to syntheticGainPosted,
+            "duckEventsEnqueued" to (q?.duckEnqueuedCount?.get() ?: 0),
+            "gainEventsEnqueued" to (q?.gainEnqueuedCount?.get() ?: 0),
+            "duckEventsDrained" to (q?.duckDrainedCount?.get() ?: 0),
+            "gainEventsDrained" to (q?.gainDrainedCount?.get() ?: 0),
+            "focusEventsDropped" to (q?.droppedCount?.get() ?: 0),
+            "realFocusChangeCallbackCount" to realFocusChangeCallbacks,
         )
     }
 }

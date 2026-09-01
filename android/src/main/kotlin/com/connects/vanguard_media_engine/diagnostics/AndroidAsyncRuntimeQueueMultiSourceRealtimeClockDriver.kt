@@ -88,8 +88,24 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_PHYSICAL_SMOKE_PASS"
         const val FOCUS_NOISY_FAIL_MARKER =
             "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_PHYSICAL_SMOKE_FAIL"
+        // X8 (P4-AUDIO-FOCUS-DUCK-RESTORE-RESPONSE) markers, emitted only for
+        // focus-duck/restore proof runs; X4/X5/X6/X7 markers remain
+        // authoritative for their respective modes.
+        const val FOCUS_DUCK_RESTORE_PASS_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_DUCK_RESTORE_PHYSICAL_SMOKE_PASS"
+        const val FOCUS_DUCK_RESTORE_FAIL_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_DUCK_RESTORE_PHYSICAL_SMOKE_FAIL"
+        // X8 typed synthetic duck/restore event tags (coordinator-enqueued,
+        // driver-drained on the owner thread, at most one per drain pass).
+        const val X8_EVENT_DUCK = "duck"
+        const val X8_EVENT_GAIN = "gain"
         const val PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_realtime_wall_clock_pacing_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_avsync_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
+
+        // X8 mode-specific proof boundary: replaces the default boundary for
+        // focus-duck/restore runs, which are neither muted nor no-focus.
+        const val FOCUS_DUCK_RESTORE_PROOF_BOUNDARY =
+            "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_duck_restore_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_focus_duck_restore_setvolume_only_base_gain_0_5_duck_gain_0_1_restore_gain_0_5_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_restart_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
         // Frozen X3 decode dequeue timeout: the realtime loop must return
         // to ingest/drain work quickly.
@@ -129,6 +145,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // handling, or dead-object recovery.
         private const val NONZERO_GAIN_PROOF = 0.5f
 
+        // Frozen X8 transient duck AudioTrack output gain. Set-value telemetry
+        // only: no measured volume, dB, perceptual depth, fade, or ramp claim.
+        private const val DUCK_GAIN_PROOF = 0.1f
+
         private const val MAX_CONSECUTIVE_ZERO_WRITES = 500
         private const val ZERO_WRITE_SLEEP_MS = 2L
         private const val HEAD_POLL_SLEEP_MS = 5L
@@ -157,7 +177,23 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         val nonZeroGainSinkProofEnabled: Boolean = false,
         // X7 mode switch: false preserves the exact X4/X5/X6 behavior and args.
         val focusNoisyEventHandoffProofEnabled: Boolean = false,
+        // X8 mode switch (implies X7 focus/noisy handoff and non-zero base
+        // gain 0.5): false preserves the exact X4/X5/X6/X7 behavior and args.
+        val focusDuckRestoreProofEnabled: Boolean = false,
     )
+
+    // X8 (P4-AUDIO-FOCUS-DUCK-RESTORE-RESPONSE) synthetic duck/restore event
+    // plane, supplied by the coordinator. The driver polls at most ONE typed
+    // event per drain pass on its owner thread (the only thread ever allowed
+    // to mutate AudioTrack gain) and reports the applied duck back so the
+    // coordinator can post the synthetic gain restore strictly afterwards.
+    interface DuckRestoreEventPlane {
+        /** Owner thread only: returns [X8_EVENT_DUCK]/[X8_EVENT_GAIN] or null. */
+        fun pollOneEvent(): String?
+
+        /** Driver report: the synthetic duck was drained and applied. */
+        fun onDuckApplied()
+    }
 
     // Lanes/metrics are flat maps so the coordinator payload and the
     // failure default shape stay identical by construction.
@@ -315,11 +351,34 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
     private var nonZeroGainSinkGatesHeld = false
     // X7 focus/noisy event-plane drain function (coordinator-supplied, owner-thread only).
     private var drainEventsFn: (() -> Int)? = null
+    // X8 focus-duck/restore state. Owner thread only mutates AudioTrack gain;
+    // terminal states: created_uninit -> base_volume_set(0.5) ->
+    // prerolled_not_playing -> playing_base -> ducked(0.1) ->
+    // restored_base(0.5) -> stopped_at_eos -> released_once -> applier_disabled.
+    private var duckRestorePlane: DuckRestoreEventPlane? = null
+    private var x8ApplierEnabled = false
+    private var x8BaseVolumeSet = false
+    private var x8DrainSeq = 0L
+    private var duckDrainSeq = -1L
+    private var restoreDrainSeq = -1L
+    private var duckAppliedCount = 0L
+    private var restoreAppliedCount = 0L
+    private var duckSetVolumeOk = false
+    private var restoreSetVolumeOk = false
+    private var x8BaseVolume = -1.0
+    private var x8DuckedVolume = -1.0
+    private var x8RestoredVolume = -1.0
+    private var x8FinalVolume = -1.0
     private val detailParts = mutableListOf<String>()
 
-    fun run(runConfig: RunConfig, drainEventsFn: (() -> Int)? = null): RunResult {
+    fun run(
+        runConfig: RunConfig,
+        drainEventsFn: (() -> Int)? = null,
+        duckRestorePlane: DuckRestoreEventPlane? = null,
+    ): RunResult {
         config = runConfig
         this.drainEventsFn = drainEventsFn
+        this.duckRestorePlane = duckRestorePlane
         deadline = SystemClock.elapsedRealtime() + config.deadlineMs
         mfpm = config.maxFramesPerMix.toLong()
         runThreadId = Thread.currentThread().id
@@ -927,12 +986,50 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 detailParts.add("nonZeroGainSinkGatesHeld=true")
             }
 
+            // X8 focus-duck/restore response gate. The synthetic duck must
+            // have been drained and applied exactly once (setVolume 0.1
+            // SUCCESS), the gain restore exactly once afterwards (setVolume
+            // 0.5 SUCCESS), on a strictly later drain pass, ending at the
+            // 0.5 base gain. Set-value telemetry only: no measured volume,
+            // dB, perceptual depth, fade, ramp, pause/resume, OS focus
+            // arbitration correctness, route recovery, or dead-object
+            // recovery claim.
+            if (config.focusDuckRestoreProofEnabled) {
+                if (duckAppliedCount != 1L || !duckSetVolumeOk) {
+                    throw FailClosed("duck_not_applied")
+                }
+                if (restoreAppliedCount != 1L || !restoreSetVolumeOk) {
+                    throw FailClosed("restore_not_applied")
+                }
+                if (duckDrainSeq < 0L || restoreDrainSeq <= duckDrainSeq) {
+                    throw FailClosed("duck_restore_order_violated")
+                }
+                if (x8FinalVolume != 0.5) {
+                    throw FailClosed("final_volume_not_restored")
+                }
+                detailParts.add("duckDrainSeq=$duckDrainSeq")
+                detailParts.add("restoreDrainSeq=$restoreDrainSeq")
+                detailParts.add("focusDuckRestoreSetVolumeTelemetryOnly")
+            }
+
             // ── Destroy: join-on-destroy + idempotence ──────────────────────
             val (joinOk, idempotentOk) = s.destroyAndVerifyLifecycle()
             workerJoinOnDestroyOk = joinOk
             if (!joinOk) throw FailClosed("worker_join_on_destroy_failed")
             idempotentDestroyOk = idempotentOk
             if (!idempotentOk) throw FailClosed("destroy_not_idempotent")
+
+            // X8: explicit owner-thread release before the result is sealed;
+            // releasing with an unrestored duck fails closed, and the release
+            // itself disables the volume applier (terminal: stopped_at_eos ->
+            // released_once -> applier_disabled). The finally release is then
+            // a guarded no-op.
+            if (config.focusDuckRestoreProofEnabled) {
+                if (duckAppliedCount > restoreAppliedCount) {
+                    throw FailClosed("released_while_ducked")
+                }
+                releaseAudioTrackOnce()
+            }
 
             // Every sink write and boundary callback asserted the single
             // run thread; native enforced owner-only entry points.
@@ -1036,6 +1133,8 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         buf.clear()
         // X7 drain point: owner thread, after write loop completes.
         drainEventsFn?.invoke()
+        // X8 drain point: at most one synthetic duck/restore event per pass.
+        drainOneDuckRestoreEvent()
     }
 
     // ── AudioTrack lifecycle / pre-roll / seek epoch ────────────────────────
@@ -1080,17 +1179,27 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         if (track.state != AudioTrack.STATE_INITIALIZED) {
             throw FailClosed("audio_track_not_initialized")
         }
-        if (config.nonZeroGainSinkProofEnabled) {
-            // X6 non-zero-gain proof: constant AudioTrack output gain only.
-            // Written PCM bytes and every checksum are unaffected by this.
+        if (config.nonZeroGainSinkProofEnabled || config.focusDuckRestoreProofEnabled) {
+            // X6 non-zero-gain proof (and X8, which implies the non-zero base
+            // gain): constant AudioTrack output gain only. Written PCM bytes
+            // and every checksum are unaffected by this.
             // Terminal state: created_uninit -> format_frozen_volume_set.
-            // Deferred: no acoustic/audibility claim, no audio focus, no
-            // route-change handling, no dead-object recovery.
+            // Deferred: no acoustic/audibility claim, no route-change
+            // handling, no dead-object recovery.
             if (track.setVolume(NONZERO_GAIN_PROOF) != AudioTrack.SUCCESS) {
                 throw FailClosed("nonzero_gain_volume_set_failed")
             }
             nonZeroGainSetOk = true
             audioTrackGain = NONZERO_GAIN_PROOF
+            if (config.focusDuckRestoreProofEnabled) {
+                // X8 terminal state: created_uninit -> base_volume_set(0.5);
+                // the duck/restore volume applier is live from here until
+                // release disables it.
+                x8BaseVolumeSet = true
+                x8BaseVolume = 0.5
+                x8FinalVolume = 0.5
+                x8ApplierEnabled = true
+            }
         } else {
             // Muted-only boundary: default X4/X5 path (volume 0.0).
             if (track.setVolume(0.0f) != AudioTrack.SUCCESS) {
@@ -1174,6 +1283,8 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         track.flush()
         // X7 drain point: owner thread, at seek boundary.
         drainEventsFn?.invoke()
+        // X8 drain point: at most one synthetic duck/restore event per pass.
+        drainOneDuckRestoreEvent()
     }
 
     // Post-EOS sink finalization: zero staged residual, epoch-1 head
@@ -1199,6 +1310,70 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         captureEpochUnderrunDelta("epoch1")
         // X7 drain point: owner thread, at EOS finalization.
         drainEventsFn?.invoke()
+        // X8 drain point: at most one synthetic duck/restore event per pass.
+        drainOneDuckRestoreEvent()
+    }
+
+    // ── X8 focus-duck/restore volume applier (owner thread only) ────────────
+
+    // Polls AT MOST ONE synthetic duck/restore event per drain pass, only
+    // once the current epoch has entered playing_base. Every pass advances
+    // the drain sequence so duckDrainSeq < restoreDrainSeq proves ordering.
+    private fun drainOneDuckRestoreEvent() {
+        val plane = duckRestorePlane ?: return
+        if (!config.focusDuckRestoreProofEnabled) return
+        assertOwnerThread("x8_drain")
+        if (!epochPlayed) return
+        val seq = x8DrainSeq++
+        val event = plane.pollOneEvent() ?: return
+        applyDuckRestoreEvent(event, seq)
+    }
+
+    // Applies one typed synthetic event via AudioTrack.setVolume on the owner
+    // thread. Set-value telemetry only: no measured volume, dB, perceptual
+    // depth, fade, ramp, pause/resume, OS arbitration correctness, route
+    // recovery, or dead-object recovery claim. Fail-closed state machine:
+    // duck requires the 0.5 base, restore requires the applied duck, each is
+    // applied exactly once, and nothing may run after release disables the
+    // applier.
+    private fun applyDuckRestoreEvent(event: String, seq: Long) {
+        val track = audioTrack
+        if (!x8ApplierEnabled || track == null) {
+            throw FailClosed(
+                if (event == X8_EVENT_DUCK) "duck_after_release"
+                else "restore_after_release"
+            )
+        }
+        when (event) {
+            X8_EVENT_DUCK -> {
+                if (!x8BaseVolumeSet) throw FailClosed("duck_without_base")
+                if (duckAppliedCount > 0L) throw FailClosed("duplicate_duck")
+                if (track.setVolume(DUCK_GAIN_PROOF) != AudioTrack.SUCCESS) {
+                    throw FailClosed("duck_set_volume_failed")
+                }
+                duckSetVolumeOk = true
+                duckAppliedCount = 1L
+                duckDrainSeq = seq
+                x8DuckedVolume = 0.1
+                x8FinalVolume = 0.1
+                // Report duck drained/applied so the coordinator may post the
+                // synthetic gain restore strictly afterwards.
+                duckRestorePlane?.onDuckApplied()
+            }
+            X8_EVENT_GAIN -> {
+                if (duckAppliedCount == 0L) throw FailClosed("restore_without_duck")
+                if (restoreAppliedCount > 0L) throw FailClosed("duplicate_restore")
+                if (track.setVolume(NONZERO_GAIN_PROOF) != AudioTrack.SUCCESS) {
+                    throw FailClosed("restore_set_volume_failed")
+                }
+                restoreSetVolumeOk = true
+                restoreAppliedCount = 1L
+                restoreDrainSeq = seq
+                x8RestoredVolume = 0.5
+                x8FinalVolume = 0.5
+            }
+            else -> throw FailClosed("unknown_duck_restore_event:$event")
+        }
     }
 
     // Opens a sink write epoch: zeroed counters, fresh unsigned-masked head
@@ -1254,6 +1429,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
     private fun releaseAudioTrackOnce() {
         val track = audioTrack ?: return
         if (audioTrackReleaseCount > 0) return
+        // X8: the duck/restore volume applier is disabled at release; any
+        // later duck/restore event fails closed (duck_after_release /
+        // restore_after_release).
+        x8ApplierEnabled = false
         try { track.pause() } catch (_: Throwable) {}
         try { track.flush() } catch (_: Throwable) {}
         try { track.release() } catch (_: Throwable) {}
@@ -1409,8 +1588,22 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "audioTrackNonZeroGainSetOk" to nonZeroGainSetOk,
             "nonZeroGainSinkGatesHeld" to nonZeroGainSinkGatesHeld,
             "focusNoisyEventHandoffProofEnabled" to config.focusNoisyEventHandoffProofEnabled,
+            "focusDuckRestoreProofEnabled" to config.focusDuckRestoreProofEnabled,
+            "duckAppliedCount" to duckAppliedCount,
+            "restoreAppliedCount" to restoreAppliedCount,
+            "duckSetVolumeOk" to duckSetVolumeOk,
+            "restoreSetVolumeOk" to restoreSetVolumeOk,
+            "duckDrainSeq" to duckDrainSeq,
+            "restoreDrainSeq" to restoreDrainSeq,
+            "baseVolume" to x8BaseVolume,
+            "duckedVolume" to x8DuckedVolume,
+            "restoredVolume" to x8RestoredVolume,
+            "finalVolume" to x8FinalVolume,
         )
         val marker = when {
+            config.focusDuckRestoreProofEnabled ->
+                if (pass) FOCUS_DUCK_RESTORE_PASS_MARKER
+                else FOCUS_DUCK_RESTORE_FAIL_MARKER
             config.focusNoisyEventHandoffProofEnabled ->
                 if (pass) FOCUS_NOISY_PASS_MARKER else FOCUS_NOISY_FAIL_MARKER
             config.nonZeroGainSinkProofEnabled ->
@@ -1424,7 +1617,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             pass = pass,
             status = if (pass) "pass" else failureReason.substringBefore(':').ifBlank { "fail" },
             marker = marker,
-            proofBoundary = PROOF_BOUNDARY,
+            // X8 replaces the default boundary: a focus-duck/restore run is
+            // neither muted nor no-focus.
+            proofBoundary = if (config.focusDuckRestoreProofEnabled) {
+                FOCUS_DUCK_RESTORE_PROOF_BOUNDARY
+            } else {
+                PROOF_BOUNDARY
+            },
             nativeProofBoundary = s?.snapProofBoundary ?: "",
             failureReason = failureReason,
             details = detailParts.joinToString("|"),
