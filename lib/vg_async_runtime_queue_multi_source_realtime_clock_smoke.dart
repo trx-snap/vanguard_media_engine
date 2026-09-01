@@ -146,6 +146,16 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   static const String dynamicGainEnvelopeFailMarkerConstant =
       'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_SMOKE_FAIL';
 
+  /// Canonical pass marker emitted by the native harness for X6
+  /// non-zero-gain sink proof runs.
+  static const String nonZeroGainSinkPassMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_PHYSICAL_SMOKE_PASS';
+
+  /// Canonical fail marker emitted by the native harness for X6
+  /// non-zero-gain sink proof runs.
+  static const String nonZeroGainSinkFailMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_PHYSICAL_SMOKE_FAIL';
+
   /// Canonical Kotlin driver proof boundary string (muted AudioTrack sink
   /// claim included) emitted by the native harness.
   static const String proofBoundaryConstant =
@@ -552,6 +562,37 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
         minEffectiveGain < maxEffectiveGain;
   }
 
+  /// Whether this run executed the X6 non-zero-gain AudioTrack sink proof
+  /// mode (false for every default X4/X5 run).
+  bool get nonZeroGainSinkProofEnabled =>
+      _boolFact('nonZeroGainSinkProofEnabled');
+
+  /// AudioTrack output gain applied in this run (0.0 for default X4/X5;
+  /// > 0 for X6 mode). Volume does NOT alter written PCM bytes or any
+  /// checksum — it is an AudioTrack output gain setting only.
+  double get audioTrackGain => _doubleFact('audioTrackGain');
+
+  /// Whether AudioTrack.setVolume(gain) returned SUCCESS in X6 mode
+  /// (false for every default X4/X5 run).
+  bool get audioTrackNonZeroGainSetOk =>
+      _boolFact('audioTrackNonZeroGainSetOk');
+
+  /// X6 non-zero-gain sink proof gate.
+  /// In X6 mode: requires gain set OK, gain > 0.0 and <= 1.0.
+  /// In default X4/X5 mode: requires gain NOT set and gain == 0.0,
+  /// proving muted behavior was preserved.
+  /// Deferred: no acoustic/speaker measurement, no loudness/SNR, no
+  /// latency/glitch/xrun, no A/V sync, no audio focus/duck/noisy, no
+  /// route-change, no dead-object recovery, no product/editor/export/iOS.
+  bool get nonZeroGainSinkGatesHeld {
+    if (!nonZeroGainSinkProofEnabled) {
+      return !audioTrackNonZeroGainSetOk && audioTrackGain == 0.0;
+    }
+    return audioTrackNonZeroGainSetOk &&
+        audioTrackGain > 0.0 &&
+        audioTrackGain <= 1.0;
+  }
+
   /// Whether [proofBoundary] matches the canonical Kotlin driver boundary.
   bool get hasCanonicalProofBoundary => proofBoundary == proofBoundaryConstant;
 
@@ -621,11 +662,15 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       pass &&
       status.toLowerCase() == 'pass' &&
       marker ==
-          (envelopeProofEnabled
+          (nonZeroGainSinkProofEnabled
+              ? nonZeroGainSinkPassMarkerConstant
+              : envelopeProofEnabled
               ? dynamicGainEnvelopePassMarkerConstant
               : passMarkerConstant) &&
       dynamicGainEnvelopeGatesHeld &&
       (!envelopeProofEnabled || _boolFact('dynamicGainEnvelopeOk')) &&
+      nonZeroGainSinkGatesHeld &&
+      (!nonZeroGainSinkProofEnabled || _boolFact('nonZeroGainSinkGatesHeld')) &&
       hasCanonicalProofBoundary &&
       nativeProofBoundaryOk &&
       formatProbeOk &&
@@ -643,7 +688,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       sinkWriteAccountingOk &&
       providerPoisoningOk &&
       audioTrackInitOk &&
-      mutedOutputOk &&
+      (nonZeroGainSinkProofEnabled || mutedOutputOk) &&
       playbackHeadTelemetryOk &&
       realtimeNativeElapsedOk &&
       realtimeBacklogBoundOk &&
@@ -1067,6 +1112,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
     int outputRingCapacityFrames = 4096,
     int maxFramesPerMix = 256,
     bool envelopeProofEnabled = false,
+    bool nonZeroGainSinkProofEnabled = false,
     Duration? timeout,
     MethodChannel? channel,
   }) async {
@@ -1084,6 +1130,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       // Only sent for X5 dynamic-gain-envelope runs so the default X4
       // argument shape (and its exact-args tests) stays frozen.
       if (envelopeProofEnabled) 'envelopeProofEnabled': true,
+      // Only sent for X6 non-zero-gain sink proof runs so the default X4/X5
+      // argument shape stays frozen.
+      if (nonZeroGainSinkProofEnabled) 'nonZeroGainSinkProofEnabled': true,
     };
     try {
       final future = ch.invokeMethod<Object?>(methodName, args);

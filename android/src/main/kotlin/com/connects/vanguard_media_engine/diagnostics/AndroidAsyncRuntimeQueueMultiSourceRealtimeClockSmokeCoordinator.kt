@@ -90,6 +90,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
             // exact X4 unit-gain run.
             envelopeProofEnabled =
                 (args?.get("envelopeProofEnabled") as? Boolean) ?: false,
+            // X6 non-zero-gain sink proof mode; absent/false preserves the
+            // exact X4/X5 muted-output behavior.
+            nonZeroGainSinkProofEnabled =
+                (args?.get("nonZeroGainSinkProofEnabled") as? Boolean) ?: false,
         )
         if (!active.compareAndSet(false, true)) {
             result.error(

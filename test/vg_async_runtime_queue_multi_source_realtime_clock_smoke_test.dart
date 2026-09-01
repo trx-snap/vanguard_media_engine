@@ -20,6 +20,8 @@ const _kFailMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_REALTIME_CLOCK_SMOKE_FAIL';
 const _kEnvelopePassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_SMOKE_PASS';
+const _kNonZeroGainPassMarker =
+    'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_PHYSICAL_SMOKE_PASS';
 const _kTrack0Hex = '00000000abcdef12';
 const _kTrack1Hex = '00000000abcdef34';
 const _kMixHex = '00000000abcdef56';
@@ -184,6 +186,37 @@ Map<String, Object?> _createEnvelopeSampleRawMap([
   metrics['maxEffectiveGain'] = 1.0;
   final lanes = result['lanes'] as Map<String, Object?>;
   lanes['dynamicGainEnvelopeOk'] = true;
+  if (overrides != null) {
+    for (final entry in overrides.entries) {
+      if (lanes.containsKey(entry.key)) {
+        lanes[entry.key] = entry.value;
+      }
+      if (metrics.containsKey(entry.key)) {
+        metrics[entry.key] = entry.value;
+      }
+      result[entry.key] = entry.value;
+    }
+  }
+  return result;
+}
+
+// X6 non-zero-gain sink proof pass payload: the X4 sample map with X6
+// marker, mode flag, and gain facts. The mutedOutputOk lane is omitted
+// (false in X6 mode); nonZeroGainSinkGatesHeld replaces it in the verdict.
+Map<String, Object?> _createNonZeroGainSampleRawMap([
+  Map<String, Object?>? overrides,
+]) {
+  final result = _createSampleRawMap();
+  result['marker'] = _kNonZeroGainPassMarker;
+  (result['raw'] as Map<String, String>)['marker'] = _kNonZeroGainPassMarker;
+  final lanes = result['lanes'] as Map<String, Object?>;
+  lanes['mutedOutputOk'] = false;
+  lanes['nonZeroGainSinkGatesHeld'] = true;
+  final metrics = result['metrics'] as Map<String, Object?>;
+  metrics['nonZeroGainSinkProofEnabled'] = true;
+  metrics['audioTrackGain'] = 0.5;
+  metrics['audioTrackNonZeroGainSetOk'] = true;
+  metrics['nonZeroGainSinkGatesHeld'] = true;
   if (overrides != null) {
     for (final entry in overrides.entries) {
       if (lanes.containsKey(entry.key)) {
@@ -917,6 +950,119 @@ void main() {
       expect(report.failureReason, startsWith('exception:'));
       expect(report.lastError, contains('simulated non-platform exception'));
       expect(report.allNativeLanesPass, isFalse);
+    });
+  });
+
+  group('X6 non-zero-gain sink proof mode', () {
+    test(
+      'default X4 pass report has nonZeroGainSinkProofEnabled=false, gain=0.0, gatesHeld=true',
+      () {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              _createSampleRawMap(),
+            );
+        expect(report.nonZeroGainSinkProofEnabled, isFalse);
+        expect(report.audioTrackGain, equals(0.0));
+        expect(report.audioTrackNonZeroGainSetOk, isFalse);
+        expect(report.nonZeroGainSinkGatesHeld, isTrue);
+        expect(report.mutedOutputOk, isTrue);
+        expect(report.allNativeLanesPass, isTrue);
+      },
+    );
+
+    test('X6 pass report passes all gates with non-zero gain set OK', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createNonZeroGainSampleRawMap(),
+          );
+      expect(report.marker, equals(_kNonZeroGainPassMarker));
+      expect(report.nonZeroGainSinkProofEnabled, isTrue);
+      expect(report.audioTrackGain, equals(0.5));
+      expect(report.audioTrackNonZeroGainSetOk, isTrue);
+      expect(report.nonZeroGainSinkGatesHeld, isTrue);
+      expect(report.mutedOutputOk, isFalse);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X6 run must carry the non-zero-gain pass marker', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createNonZeroGainSampleRawMap({'marker': _kPassMarker}),
+          );
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X6 rejects missing gain set OK', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createNonZeroGainSampleRawMap({
+              'audioTrackNonZeroGainSetOk': false,
+            }),
+          );
+      expect(report.nonZeroGainSinkGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X6 rejects gain == 0.0', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createNonZeroGainSampleRawMap({'audioTrackGain': 0.0}),
+          );
+      expect(report.nonZeroGainSinkGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X6 rejects gain > 1.0', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createNonZeroGainSampleRawMap({'audioTrackGain': 1.5}),
+          );
+      expect(report.nonZeroGainSinkGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X6 requires the nonZeroGainSinkGatesHeld lane', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createNonZeroGainSampleRawMap({'nonZeroGainSinkGatesHeld': false}),
+          );
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X6 mode sends nonZeroGainSinkProofEnabled=true only', () async {
+      Map<String, Object?>? capturedArgs;
+
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+        capturedArgs = (call.arguments as Map).cast<String, Object?>();
+        return _createNonZeroGainSampleRawMap();
+      });
+
+      final report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: '/tmp/clip_B.mov',
+            nonZeroGainSinkProofEnabled: true,
+          );
+
+      expect(capturedArgs?['nonZeroGainSinkProofEnabled'], isTrue);
+      expect(capturedArgs?.containsKey('envelopeProofEnabled'), isFalse);
+      expect(report.pass, isTrue);
+      expect(report.nonZeroGainSinkProofEnabled, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('default X4 run does NOT send nonZeroGainSinkProofEnabled', () async {
+      Map<String, Object?>? capturedArgs;
+
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+        capturedArgs = (call.arguments as Map).cast<String, Object?>();
+        return _createSampleRawMap();
+      });
+
+      await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+        sourcePath: '/tmp/clip_B.mov',
+      );
+
+      expect(capturedArgs?.containsKey('nonZeroGainSinkProofEnabled'), isFalse);
     });
   });
 

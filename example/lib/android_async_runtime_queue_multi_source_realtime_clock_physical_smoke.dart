@@ -318,18 +318,27 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
     // envelope-shaped reference mix identity and telemetry gates. ─────────
     final envelopePass = await _runEnvelopeSmoke();
 
-    final bothPass = pass && envelopePass;
+    // ── X6 (P4-AUDIO-REALTIME-PLAYBACK-SINK-BRIDGE): non-zero-gain
+    // AudioTrack sink proof. Same X4/X5 path with a constant gain > 0
+    // set via AudioTrack.setVolume(). PCM bytes and checksums are
+    // unchanged; this proves the gain-set path only. No acoustic/audibility
+    // claim; no audio focus, route-change, or dead-object recovery. ────────
+    final nonZeroGainPass = await _runNonZeroGainSmoke();
+
+    final allPass = pass && envelopePass && nonZeroGainPass;
     if (mounted) {
       setState(() {
-        _status = bothPass
-            ? 'PASS (X4 allNativeLanesPass=true, X5 envelope gates held)'
+        _status = allPass
+            ? 'PASS (X4 allNativeLanesPass=true, X5 envelope gates held, '
+                  'X6 non-zero-gain gates held)'
             : 'FAIL: x4Pass=$pass, envelopePass=$envelopePass, '
+                  'nonZeroGainPass=$nonZeroGainPass, '
                   'lastError=${activeReport.lastError}, error=$topLevelError';
       });
     }
 
     await Future<void>.delayed(const Duration(milliseconds: 1500));
-    exit(bothPass ? 0 : 1);
+    exit(allPass ? 0 : 1);
   }
 
   Future<bool> _runEnvelopeSmoke() async {
@@ -466,6 +475,141 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
           : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_PHYSICAL_SMOKE_FAIL',
     );
     return envelopePass;
+  }
+
+  Future<bool> _runNonZeroGainSmoke() async {
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_SMOKE_START',
+    );
+
+    VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport? report;
+    String? topLevelError;
+    File? tempSourceFile;
+
+    try {
+      final clipBData = await rootBundle.load(
+        'assets/manual_test_clips/clip_B.mov',
+      );
+      final tempDir = Directory.systemTemp;
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+      tempSourceFile = File(
+        '${tempDir.path}/p4_async_rt_queue_nonzero_gain_source_$timestamp.mov',
+      );
+
+      await tempSourceFile.writeAsBytes(
+        clipBData.buffer.asUint8List(
+          clipBData.offsetInBytes,
+          clipBData.lengthInBytes,
+        ),
+        flush: true,
+      );
+
+      report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: tempSourceFile.path,
+            nonZeroGainSinkProofEnabled: true,
+            timeout: const Duration(seconds: 45),
+          ).timeout(const Duration(seconds: 55));
+    } on TimeoutException catch (te) {
+      topLevelError = 'timeout: $te';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_ERROR: $topLevelError',
+      );
+    } catch (e, st) {
+      topLevelError = '$e\n$st';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_ERROR: $topLevelError',
+      );
+    } finally {
+      if (tempSourceFile != null) {
+        try {
+          if (await tempSourceFile.exists()) {
+            await tempSourceFile.delete();
+          }
+        } catch (_) {}
+      }
+    }
+
+    final ngReport =
+        report ??
+        VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+          <String, Object?>{
+            'pass': false,
+            'status': 'fail',
+            'marker': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .nonZeroGainSinkFailMarkerConstant,
+            'proofBoundary': '',
+            'nativeProofBoundary': '',
+            'failureReason': 'invocation_failed',
+            'lastError': 'invocation_failed',
+          },
+        );
+
+    // Non-Zero-Gain Sink group: gain-set fact plus existing identity/accounting
+    // gates. No acoustic/audibility claim; PCM bytes and checksums unchanged.
+    // Deferred: no loudness/SNR, no latency/glitch/xrun, no A/V sync, no
+    // audio focus/duck/noisy, no route-change, no dead-object recovery.
+    print(
+      '  [LANE] Non-Zero-Gain Sink: '
+      'nonZeroGainSinkProofEnabled=${ngReport.nonZeroGainSinkProofEnabled}, '
+      'audioTrackGain=${ngReport.audioTrackGain}, '
+      'audioTrackNonZeroGainSetOk=${ngReport.audioTrackNonZeroGainSetOk}, '
+      'nonZeroGainSinkGatesHeld=${ngReport.nonZeroGainSinkGatesHeld}, '
+      'checksumIdentityOk=${ngReport.checksumIdentityOk}, '
+      'sinkWriteAccountingOk=${ngReport.sinkWriteAccountingOk}, '
+      'frameAccountingOk=${ngReport.frameAccountingOk}, '
+      'realtimeGatesHeld=${ngReport.realtimeGatesHeld}, '
+      'allNativeLanesPass=${ngReport.allNativeLanesPass}, '
+      'marker=${ngReport.marker}, '
+      'lastError=${ngReport.lastError}',
+    );
+
+    final lastErrorOk =
+        ngReport.lastError.isEmpty ||
+        ngReport.lastError == 'none' ||
+        ngReport.lastError == 'null';
+
+    final nonZeroGainPass =
+        (topLevelError == null) &&
+        ngReport.pass &&
+        ngReport.marker ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .nonZeroGainSinkPassMarkerConstant &&
+        ngReport.nonZeroGainSinkProofEnabled &&
+        ngReport.nonZeroGainSinkGatesHeld &&
+        ngReport.audioTrackNonZeroGainSetOk &&
+        ngReport.audioTrackGain > 0.0 &&
+        ngReport.audioTrackGain <= 1.0 &&
+        ngReport.hasCanonicalProofBoundary &&
+        ngReport.nativeProofBoundaryOk &&
+        ngReport.checksumsMatch &&
+        ngReport.providerCountersClean &&
+        ngReport.sinkAccountingBalanced &&
+        ngReport.realtimeGatesHeld &&
+        ngReport.allNativeLanesPass &&
+        lastErrorOk;
+
+    final summaryPayload = <String, dynamic>{
+      'unit': 'AndroidAsyncRuntimeQueueNonZeroGainSinkPhysicalSmokeHarness',
+      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-SINK-BRIDGE',
+      'target': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .proofBoundaryConstant,
+      'nativeTarget': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .nativeProofBoundaryConstant,
+      'pass': nonZeroGainPass,
+      'report': ngReport.toMap(),
+      'error': topLevelError,
+    };
+
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_JSON:${jsonEncode(summaryPayload)}',
+    );
+    print(
+      nonZeroGainPass
+          ? 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_PHYSICAL_SMOKE_PASS'
+          : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_PHYSICAL_SMOKE_FAIL',
+    );
+    return nonZeroGainPass;
   }
 
   @override

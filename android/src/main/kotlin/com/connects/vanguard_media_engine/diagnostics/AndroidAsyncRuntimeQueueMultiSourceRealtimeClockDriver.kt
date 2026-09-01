@@ -74,6 +74,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_SMOKE_PASS"
         const val ENVELOPE_FAIL_MARKER =
             "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_SMOKE_FAIL"
+        // X6 (P4-AUDIO-REALTIME-PLAYBACK-SINK-BRIDGE) markers, emitted only
+        // for non-zero-gain sink proof runs; X4/X5 markers remain
+        // authoritative for their respective modes.
+        const val NONZERO_GAIN_PASS_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_PHYSICAL_SMOKE_PASS"
+        const val NONZERO_GAIN_FAIL_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_PHYSICAL_SMOKE_FAIL"
         const val PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_realtime_wall_clock_pacing_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_avsync_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
@@ -109,6 +116,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         private const val PREROLL_WINDOWS = 4L
         private const val TRACK_BUFFER_MARGIN_WINDOWS = 4L
 
+        // Frozen X6 non-zero AudioTrack output gain (> 0 and <= 1). Applied
+        // via AudioTrack.setVolume(); does NOT alter written PCM bytes or any
+        // checksum. No acoustic/audibility claim; no audio focus, route-change
+        // handling, or dead-object recovery.
+        private const val NONZERO_GAIN_PROOF = 0.5f
+
         private const val MAX_CONSECUTIVE_ZERO_WRITES = 500
         private const val ZERO_WRITE_SLEEP_MS = 2L
         private const val HEAD_POLL_SLEEP_MS = 5L
@@ -133,6 +146,8 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         val deadlineMs: Long = 30_000L,
         // X5 mode switch: false preserves the exact X4 unit-gain run.
         val envelopeProofEnabled: Boolean = false,
+        // X6 mode switch: false preserves the exact X4/X5 muted-output behavior.
+        val nonZeroGainSinkProofEnabled: Boolean = false,
     )
 
     // Lanes/metrics are flat maps so the coordinator payload and the
@@ -285,6 +300,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
     private var canonicalProofBoundaryOk = false
     private var ownerThreadAffinityOk = false
     private var dynamicGainEnvelopeOk = false
+    // X6 non-zero-gain sink proof state.
+    private var nonZeroGainSetOk = false
+    private var audioTrackGain = 0.0f
+    private var nonZeroGainSinkGatesHeld = false
     private val detailParts = mutableListOf<String>()
 
     fun run(runConfig: RunConfig): RunResult {
@@ -871,6 +890,31 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             detailParts.add("envelopeProofEnabled=${config.envelopeProofEnabled}")
             detailParts.add("envelopeEvaluations=${s.snapEnvelopeEvaluations}")
 
+            // X6 non-zero-gain sink proof gate. Only evaluated when
+            // nonZeroGainSinkProofEnabled=true; composites the gain-set
+            // fact with existing accounting/checksum/frame gates. Volume
+            // does not alter written PCM bytes; checksums are preserved.
+            // Terminal states encoded here: format_frozen_volume_set ->
+            // prerolled_not_playing -> playing -> stopped_at_eos ->
+            // released_once (see driver-level terminal-state table).
+            // Deferred: no acoustic/speaker measurement, no loudness/SNR,
+            // no latency/glitch/xrun/underrun-freedom, no A/V sync, no
+            // audio focus/duck/noisy, no route-change, no dead-object
+            // recovery, no product/editor/export/streaming/iOS.
+            if (config.nonZeroGainSinkProofEnabled) {
+                nonZeroGainSinkGatesHeld = nonZeroGainSetOk &&
+                    audioTrackGain > 0.0f &&
+                    audioTrackGain <= 1.0f &&
+                    sinkWriteAccountingOk &&
+                    checksumIdentityOk &&
+                    frameAccountingOk
+                if (!nonZeroGainSinkGatesHeld) {
+                    throw FailClosed("nonzero_gain_sink_gates_failed")
+                }
+                detailParts.add("audioTrackGain=$audioTrackGain")
+                detailParts.add("nonZeroGainSinkGatesHeld=true")
+            }
+
             // ── Destroy: join-on-destroy + idempotence ──────────────────────
             val (joinOk, idempotentOk) = s.destroyAndVerifyLifecycle()
             workerJoinOnDestroyOk = joinOk
@@ -1022,11 +1066,25 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         if (track.state != AudioTrack.STATE_INITIALIZED) {
             throw FailClosed("audio_track_not_initialized")
         }
-        // Muted-only boundary: this slice never runs with an audible gain.
-        if (track.setVolume(0.0f) != AudioTrack.SUCCESS) {
-            throw FailClosed("muted_volume_set_failed")
+        if (config.nonZeroGainSinkProofEnabled) {
+            // X6 non-zero-gain proof: constant AudioTrack output gain only.
+            // Written PCM bytes and every checksum are unaffected by this.
+            // Terminal state: created_uninit -> format_frozen_volume_set.
+            // Deferred: no acoustic/audibility claim, no audio focus, no
+            // route-change handling, no dead-object recovery.
+            if (track.setVolume(NONZERO_GAIN_PROOF) != AudioTrack.SUCCESS) {
+                throw FailClosed("nonzero_gain_volume_set_failed")
+            }
+            nonZeroGainSetOk = true
+            audioTrackGain = NONZERO_GAIN_PROOF
+        } else {
+            // Muted-only boundary: default X4/X5 path (volume 0.0).
+            if (track.setVolume(0.0f) != AudioTrack.SUCCESS) {
+                throw FailClosed("muted_volume_set_failed")
+            }
+            mutedOutputOk = true
+            audioTrackGain = 0.0f
         }
-        mutedOutputOk = true
         bufferSizeInFrames = track.bufferSizeInFrames.toLong()
         prerollFrames = PREROLL_WINDOWS * mfpm
         alignPrerollWithStartThreshold(track)
@@ -1231,6 +1289,7 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "canonicalProofBoundaryOk" to canonicalProofBoundaryOk,
             "ownerThreadAffinityOk" to ownerThreadAffinityOk,
             "dynamicGainEnvelopeOk" to dynamicGainEnvelopeOk,
+            "nonZeroGainSinkGatesHeld" to nonZeroGainSinkGatesHeld,
         )
         val metrics = mapOf<String, Any?>(
             "sampleRate" to sampleRate,
@@ -1327,11 +1386,18 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "envelopeEvaluations" to (s?.snapEnvelopeEvaluations ?: -1L),
             "minEffectiveGain" to (s?.snapMinEffectiveGain ?: 0.0),
             "maxEffectiveGain" to (s?.snapMaxEffectiveGain ?: 0.0),
+            "nonZeroGainSinkProofEnabled" to config.nonZeroGainSinkProofEnabled,
+            "audioTrackGain" to audioTrackGain.toDouble(),
+            "audioTrackNonZeroGainSetOk" to nonZeroGainSetOk,
+            "nonZeroGainSinkGatesHeld" to nonZeroGainSinkGatesHeld,
         )
-        val marker = if (config.envelopeProofEnabled) {
-            if (pass) ENVELOPE_PASS_MARKER else ENVELOPE_FAIL_MARKER
-        } else {
-            if (pass) PASS_MARKER else FAIL_MARKER
+        val marker = when {
+            config.nonZeroGainSinkProofEnabled ->
+                if (pass) NONZERO_GAIN_PASS_MARKER else NONZERO_GAIN_FAIL_MARKER
+            config.envelopeProofEnabled ->
+                if (pass) ENVELOPE_PASS_MARKER else ENVELOPE_FAIL_MARKER
+            else ->
+                if (pass) PASS_MARKER else FAIL_MARKER
         }
         return RunResult(
             pass = pass,
