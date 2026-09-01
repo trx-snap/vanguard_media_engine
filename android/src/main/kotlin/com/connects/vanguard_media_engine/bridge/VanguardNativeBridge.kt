@@ -790,6 +790,101 @@ class VanguardNativeBridge(
         external fun destroyAsyncRuntimeQueueSchedulerSession(
             handle: Long,
         ): String
+
+        // ── P4-AUDIO-ASYNC-RUNTIME-QUEUE-REALTIME-CLOCK-PACING (sub-slice
+        // X3) — android_phase4_async_runtime_queue_realtime_clock_jni.cpp.
+        // Disjoint session registry/handle space from the X1/X2 scheduler
+        // TU. The native worker thread OWNS the monotonic
+        // std::chrono::steady_clock render/dispatch timebase: NO entry
+        // point below accepts a sysTimeNs/syntheticSysTimeNs argument and
+        // Kotlin must never pass a time value into a control command. ────
+
+        // Returns a handle (>0) or 0 on any validation/allocation failure
+        // (bad sample rate / channel count, expected frames out of range
+        // or not window-aligned, non-power-of-two rings,
+        // outputRingCapacityFrames < maxFramesPerMix,
+        // sourceRingCapacityFrames <
+        // outputRingCapacityFrames + 2*maxFramesPerMix) or when the
+        // 4-live-session registry cap is reached. The worker thread starts
+        // only after the rig validated.
+        external fun createAsyncRuntimeQueueRealtimeClockSession(
+            sampleRate: Int,
+            channelCount: Int,
+            expectedFrameCount: Long,
+            sourceRingCapacityFrames: Int,
+            outputRingCapacityFrames: Int,
+            maxFramesPerMix: Int,
+        ): Long
+
+        // Enqueue-only, no time argument (status=enqueued;commandSeq=N, or
+        // already_started / queue_full / not_found / wrong_owner_thread).
+        // The worker reads steady_clock itself and executes
+        // coordinator.start(0, now); the caller must then consume the
+        // output-ring seek ack via the read entry point before the worker
+        // can render its first window.
+        external fun startAsyncRuntimeQueueRealtimeClock(
+            handle: Long,
+        ): String
+
+        // Forward-only, quiescent-only seek with no time argument (fail
+        // closed otherwise): needs every prior command processed, no EOS,
+        // an empty source ring, a drained output ring, no pending seek
+        // handshakes, and a completed native one-second timing window. The
+        // owner publishes the source writer seek request, the worker
+        // consumes the source ack + calls coordinator.seek(targetPtsUs,
+        // fresh steady_clock now), and the caller must then consume the
+        // output-ring ack via the read entry point.
+        external fun seekAsyncRuntimeQueueRealtimeClock(
+            handle: Long,
+            targetPtsUs: Long,
+        ): String
+
+        // Owner-thread source-ring producer through the NODE-OWNED writer.
+        // Accepted frames are clamped to
+        // min(frameCount, 8192, framesThatFitInBuffer); writer
+        // backpressure (ring_full/partial_write) is a reported outcome.
+        external fun ingestAsyncRuntimeQueueRealtimeClockPcm16(
+            handle: Long,
+            pcm: java.nio.ByteBuffer,
+            frameCount: Int,
+        ): String
+
+        // Writer-local EOS; the X3 driver sets it only after the exact
+        // expected timeline completed, so no zero-fill window remains.
+        external fun setAsyncRuntimeQueueRealtimeClockEos(
+            handle: Long,
+        ): String
+
+        // Owner-thread output-ring consumer: consumes a pending start/seek
+        // ack first (reporting discarded frames), then pops mixed PCM16
+        // into the direct ByteBuffer. maxFrames == 0 is a legal ack-only
+        // call.
+        external fun readAsyncRuntimeQueueRealtimeClockOutputPcm16(
+            handle: Long,
+            pcm: java.nio.ByteBuffer,
+            maxFrames: Int,
+        ): String
+
+        // Owner-thread-only. All coordinator/provider/worker/timing facts
+        // come from the worker-published mirror; includes the native
+        // one-second timing gate (nativeTimingF0/F1, elapsed,
+        // realtimeElapsedOk), the render-cursor backlog bound
+        // (maxRenderCursorBacklogUs, realtimeBacklogBoundOk),
+        // workerNoFramesDueWaits, the structural
+        // noCallerSuppliedNativeTime/workerOwnsMonotonicClock tokens,
+        // ownerDispatchCalls=0, checksums, seek-ack state, join/destroy
+        // counts, and the verbatim proof boundary.
+        external fun snapshotAsyncRuntimeQueueRealtimeClock(
+            handle: Long,
+        ): String
+
+        // Any-thread, idempotent erase-once destroy: sets the stop flag,
+        // wakes the worker, and JOINS (never detaches) before replying
+        // with the race-free final counters. Second call / unknown handle
+        // returns status=not_found.
+        external fun destroyAsyncRuntimeQueueRealtimeClockSession(
+            handle: Long,
+        ): String
     }
 
     external fun probeCapabilities(): BackendCapabilityReport
