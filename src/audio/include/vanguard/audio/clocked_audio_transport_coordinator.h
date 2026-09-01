@@ -50,6 +50,15 @@ public:
         int64_t  nextDispatchFrame{0};
         uint64_t checksum{0};
         bool     silence{false};
+        // P4-AUDIO-ASYNC-RUNTIME-QUEUE-MULTI-SOURCE-DYNAMIC-GAIN-ENVELOPE:
+        // GraphAudioScheduler::SchedulerOutput envelope metrics propagated
+        // verbatim from the dispatched window's renderWindow() call; all
+        // zero/false when no envelope-bearing track was mixed (including
+        // every unit-gain/no-envelope configuration).
+        bool     envelopeApplied{false};
+        double   minEffectiveGain{0.0};
+        double   maxEffectiveGain{0.0};
+        int64_t  envelopeEvaluations{0};
     };
 
     struct Snapshot {

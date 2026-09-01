@@ -67,6 +67,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_REALTIME_CLOCK_SMOKE_PASS"
         const val FAIL_MARKER =
             "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_REALTIME_CLOCK_SMOKE_FAIL"
+        // X5 (P4-AUDIO-ASYNC-RUNTIME-QUEUE-MULTI-SOURCE-DYNAMIC-GAIN-
+        // ENVELOPE) markers, emitted only for envelope-enabled runs; the X4
+        // markers above stay authoritative for the default unit-gain mode.
+        const val ENVELOPE_PASS_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_SMOKE_PASS"
+        const val ENVELOPE_FAIL_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_SMOKE_FAIL"
         const val PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_realtime_wall_clock_pacing_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_avsync_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
@@ -124,6 +131,8 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         val outputRingCapacityFrames: Int = 4096,
         val maxFramesPerMix: Int = 256,
         val deadlineMs: Long = 30_000L,
+        // X5 mode switch: false preserves the exact X4 unit-gain run.
+        val envelopeProofEnabled: Boolean = false,
     )
 
     // Lanes/metrics are flat maps so the coordinator payload and the
@@ -141,6 +150,51 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
     )
 
     private class FailClosed(val reason: String) : Exception(reason)
+
+    // X5 exact Kotlin replica of the native deterministic proof envelopes
+    // (three keyframes per track at {0, endUs/2, endUs}) and of the
+    // scheduler/mix-bus per-frame gain timing: every dispatch window starts
+    // at a maxFramesPerMix-aligned frame (window-aligned expected frames,
+    // full-window dispatch only, window-aligned seek re-anchor), its
+    // envelopeStartPtsUs is floor(windowStart * 1e6 / sampleRate), and the
+    // per-frame pts adds floor(frameInWindow * 1e6 / sampleRate) — all
+    // integer-us floor math. Interpolation replays AudioGainEnvelope's
+    // evaluateSegment double expression verbatim (gain0 + (gain1 - gain0) *
+    // fraction), so the resulting doubles are bit-identical to native. Any
+    // change to the native keyframe table
+    // (kEnvelopeGainsTrack0/kEnvelopeGainsTrack1 in
+    // android_phase4_async_runtime_queue_multi_source_realtime_clock_jni.cpp)
+    // must land here in the same slice.
+    private class EnvelopeReferenceModel(
+        private val sampleRate: Int,
+        private val maxFramesPerMix: Long,
+        expectedFrames: Long,
+    ) {
+        private val endUs: Long =
+            (expectedFrames * 1_000_000L + sampleRate - 1) / sampleRate
+        private val midUs: Long = endUs / 2
+        private val gains = arrayOf(
+            doubleArrayOf(0.25, 1.0, 0.5),
+            doubleArrayOf(1.0, 0.25, 0.75),
+        )
+
+        fun gainAt(track: Int, frameIndex: Long): Double {
+            val windowStart = (frameIndex / maxFramesPerMix) * maxFramesPerMix
+            val ptsUs = windowStart * 1_000_000L / sampleRate +
+                ((frameIndex - windowStart) * 1_000_000L) / sampleRate
+            val g = gains[track]
+            return when {
+                ptsUs <= 0L -> g[0]
+                ptsUs >= endUs -> g[2]
+                ptsUs < midUs ->
+                    g[0] + (g[1] - g[0]) *
+                        (ptsUs.toDouble() / midUs.toDouble())
+                else ->
+                    g[1] + (g[2] - g[1]) *
+                        ((ptsUs - midUs).toDouble() / (endUs - midUs).toDouble())
+            }
+        }
+    }
 
     private var config = RunConfig(sourcePath = "")
     private var deadline = 0L
@@ -230,6 +284,7 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
     private var idempotentDestroyOk = false
     private var canonicalProofBoundaryOk = false
     private var ownerThreadAffinityOk = false
+    private var dynamicGainEnvelopeOk = false
     private val detailParts = mutableListOf<String>()
 
     fun run(runConfig: RunConfig): RunResult {
@@ -352,13 +407,24 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                     config.outputRingCapacityFrames,
                     config.maxFramesPerMix,
                     readBuf,
+                    envelopeProofEnabledIn = config.envelopeProofEnabled,
                 )
+                // X5 only: the reference mix model applies the exact native
+                // per-frame envelope gains; null keeps the X4 unit-gain
+                // clamp16(s0 + s1) model untouched.
+                val envelopeGainModel: ((Int, Long) -> Double)? =
+                    if (config.envelopeProofEnabled) {
+                        EnvelopeReferenceModel(sr, mfpm, expectedFrames)::gainAt
+                    } else {
+                        null
+                    }
                 pump = AndroidAsyncRuntimeQueueMultiSourceRealtimeClockIngestPump(
                     session = s,
                     channelCount = ch,
                     maxFramesPerMix = config.maxFramesPerMix,
                     pollCancellation = { checkDeadline() },
                     drainOutputToSink = { s.drainAvailableOutput() },
+                    envelopeGainModel = envelopeGainModel,
                 )
                 scratch = ByteBuffer.allocateDirect(SCRATCH_FRAMES * bytesPerFrame)
                     .order(ByteOrder.LITTLE_ENDIAN)
@@ -780,6 +846,31 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                     .NATIVE_PROOF_BOUNDARY
             if (!canonicalProofBoundaryOk) throw FailClosed("native_proof_boundary_mismatch")
 
+            // X5 dynamic-gain-envelope gate. Envelope mode requires the
+            // worker-folded telemetry to prove a DYNAMIC envelope actually
+            // shaped the mix (applied, evaluated, min strictly below max,
+            // both inside [0,1]); the default X4 mode requires the exact
+            // no-envelope defaults so unit-gain behavior is proven
+            // preserved. The checksum identity above already bound the
+            // envelope math bit-exactly in envelope mode.
+            dynamicGainEnvelopeOk = if (config.envelopeProofEnabled) {
+                s.snapEnvelopeProofEnabled &&
+                    s.snapEnvelopeApplied &&
+                    s.snapEnvelopeEvaluations > 0L &&
+                    s.snapMinEffectiveGain >= 0.0 &&
+                    s.snapMaxEffectiveGain <= 1.0 &&
+                    s.snapMinEffectiveGain < s.snapMaxEffectiveGain
+            } else {
+                !s.snapEnvelopeProofEnabled &&
+                    !s.snapEnvelopeApplied &&
+                    s.snapEnvelopeEvaluations == 0L
+            }
+            if (!dynamicGainEnvelopeOk) {
+                throw FailClosed("dynamic_gain_envelope_gates_failed")
+            }
+            detailParts.add("envelopeProofEnabled=${config.envelopeProofEnabled}")
+            detailParts.add("envelopeEvaluations=${s.snapEnvelopeEvaluations}")
+
             // ── Destroy: join-on-destroy + idempotence ──────────────────────
             val (joinOk, idempotentOk) = s.destroyAndVerifyLifecycle()
             workerJoinOnDestroyOk = joinOk
@@ -1139,6 +1230,7 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "idempotentDestroyOk" to idempotentDestroyOk,
             "canonicalProofBoundaryOk" to canonicalProofBoundaryOk,
             "ownerThreadAffinityOk" to ownerThreadAffinityOk,
+            "dynamicGainEnvelopeOk" to dynamicGainEnvelopeOk,
         )
         val metrics = mapOf<String, Any?>(
             "sampleRate" to sampleRate,
@@ -1230,11 +1322,21 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "underrunFinal" to underrunFinalLast,
             "audioTrackReleaseCount" to audioTrackReleaseCount.toLong(),
             "nativeLastStatus" to (s?.lastStatus ?: ""),
+            "envelopeProofEnabled" to config.envelopeProofEnabled,
+            "envelopeApplied" to (s?.snapEnvelopeApplied ?: false),
+            "envelopeEvaluations" to (s?.snapEnvelopeEvaluations ?: -1L),
+            "minEffectiveGain" to (s?.snapMinEffectiveGain ?: 0.0),
+            "maxEffectiveGain" to (s?.snapMaxEffectiveGain ?: 0.0),
         )
+        val marker = if (config.envelopeProofEnabled) {
+            if (pass) ENVELOPE_PASS_MARKER else ENVELOPE_FAIL_MARKER
+        } else {
+            if (pass) PASS_MARKER else FAIL_MARKER
+        }
         return RunResult(
             pass = pass,
             status = if (pass) "pass" else failureReason.substringBefore(':').ifBlank { "fail" },
-            marker = if (pass) PASS_MARKER else FAIL_MARKER,
+            marker = marker,
             proofBoundary = PROOF_BOUNDARY,
             nativeProofBoundary = s?.snapProofBoundary ?: "",
             failureReason = failureReason,

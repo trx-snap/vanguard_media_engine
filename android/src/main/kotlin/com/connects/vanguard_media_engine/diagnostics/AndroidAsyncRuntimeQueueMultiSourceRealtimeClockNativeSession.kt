@@ -192,6 +192,20 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         private set
     var snapClockDriftSampleCount = -1L
         private set
+    // X5 envelope telemetry folded from the snapshot (defaults preserve the
+    // X4 shape: enabled/applied false, evaluations 0, gains 0.0).
+    var envelopeProofEnabled = false
+        private set
+    var snapEnvelopeProofEnabled = false
+        private set
+    var snapEnvelopeApplied = false
+        private set
+    var snapEnvelopeEvaluations = -1L
+        private set
+    var snapMinEffectiveGain = 0.0
+        private set
+    var snapMaxEffectiveGain = 0.0
+        private set
     var snapProofBoundary = ""
         private set
     var lastStatus = ""
@@ -217,6 +231,7 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         outputRingCapacityFrames: Int,
         maxFramesPerMix: Int,
         readBuffer: ByteBuffer,
+        envelopeProofEnabledIn: Boolean = false,
     ) {
         if (handle != 0L) throw Failure("native_session_already_created")
         if (maxFramesPerMix <= 0) throw Failure("invalid_config_max_frames_per_mix")
@@ -243,10 +258,20 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         if (readBuffer.capacity() < outputRingCapacityFrames * bytesPerFrame) {
             throw Failure("read_buffer_too_small")
         }
-        handle = VanguardNativeBridge.createAsyncRuntimeQueueMultiSourceRealtimeClockSession(
-            sampleRateIn, channelCountIn, expectedFramesIn,
-            sourceRingCapacityFrames, outputRingCapacityFrames, maxFramesPerMix,
-        )
+        envelopeProofEnabled = envelopeProofEnabledIn
+        // X5 mode selects the envelope-enabled create; every other entry
+        // point (start/seek/ingest/eos/read/snapshot/destroy) is shared.
+        handle = if (envelopeProofEnabledIn) {
+            VanguardNativeBridge.createAsyncRuntimeQueueMultiSourceRealtimeClockEnvelopeSession(
+                sampleRateIn, channelCountIn, expectedFramesIn,
+                sourceRingCapacityFrames, outputRingCapacityFrames, maxFramesPerMix,
+            )
+        } else {
+            VanguardNativeBridge.createAsyncRuntimeQueueMultiSourceRealtimeClockSession(
+                sampleRateIn, channelCountIn, expectedFramesIn,
+                sourceRingCapacityFrames, outputRingCapacityFrames, maxFramesPerMix,
+            )
+        }
         if (handle == 0L) throw Failure("native_session_create_failed")
         readBuf = readBuffer
         val snapBoot = awaitSnapshot("worker_started") { it["workerStarted"] == "true" }
@@ -586,6 +611,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         snapRealtimeBacklogBoundOk = kv["realtimeBacklogBoundOk"] == "true"
         snapBacklogSampleCount = longField(kv, "backlogSampleCount")
         snapClockDriftSampleCount = longField(kv, "clockDriftSampleCount")
+        snapEnvelopeProofEnabled = kv["envelopeProofEnabled"] == "true"
+        snapEnvelopeApplied = kv["envelopeApplied"] == "true"
+        snapEnvelopeEvaluations = longField(kv, "envelopeEvaluations")
+        snapMinEffectiveGain = doubleField(kv, "minEffectiveGain")
+        snapMaxEffectiveGain = doubleField(kv, "maxEffectiveGain")
         snapProofBoundary = kv["proofBoundary"] ?: ""
         return kv
     }
@@ -650,4 +680,7 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
 
     private fun longField(kv: Map<String, String>, key: String): Long =
         kv[key]?.toLongOrNull() ?: throw Failure("missing_status_field_$key")
+
+    private fun doubleField(kv: Map<String, String>, key: String): Double =
+        kv[key]?.toDoubleOrNull() ?: throw Failure("missing_status_field_$key")
 }

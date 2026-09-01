@@ -18,6 +18,8 @@ const _kPassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_REALTIME_CLOCK_SMOKE_PASS';
 const _kFailMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_REALTIME_CLOCK_SMOKE_FAIL';
+const _kEnvelopePassMarker =
+    'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_SMOKE_PASS';
 const _kTrack0Hex = '00000000abcdef12';
 const _kTrack1Hex = '00000000abcdef34';
 const _kMixHex = '00000000abcdef56';
@@ -117,6 +119,12 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'track0NonZeroSampleCount': 160000,
     'track1NonZeroSampleCount': 167000,
     'nativeLastStatus': 'ok',
+    // X5 telemetry at its exact X4 defaults (no envelope applied).
+    'envelopeProofEnabled': false,
+    'envelopeApplied': false,
+    'envelopeEvaluations': 0,
+    'minEffectiveGain': 0.0,
+    'maxEffectiveGain': 0.0,
   };
 
   final raw = <String, String>{
@@ -155,6 +163,38 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     }
   }
 
+  return result;
+}
+
+// X5 dynamic-gain-envelope pass payload: the X4 sample map with the
+// envelope marker, envelope-mode metrics, and the dynamicGainEnvelopeOk
+// lane. Envelope keys must live INSIDE the lanes/metrics maps because the
+// typed getters read only those maps.
+Map<String, Object?> _createEnvelopeSampleRawMap([
+  Map<String, Object?>? overrides,
+]) {
+  final result = _createSampleRawMap();
+  result['marker'] = _kEnvelopePassMarker;
+  (result['raw'] as Map<String, String>)['marker'] = _kEnvelopePassMarker;
+  final metrics = result['metrics'] as Map<String, Object?>;
+  metrics['envelopeProofEnabled'] = true;
+  metrics['envelopeApplied'] = true;
+  metrics['envelopeEvaluations'] = 167936;
+  metrics['minEffectiveGain'] = 0.25;
+  metrics['maxEffectiveGain'] = 1.0;
+  final lanes = result['lanes'] as Map<String, Object?>;
+  lanes['dynamicGainEnvelopeOk'] = true;
+  if (overrides != null) {
+    for (final entry in overrides.entries) {
+      if (lanes.containsKey(entry.key)) {
+        lanes[entry.key] = entry.value;
+      }
+      if (metrics.containsKey(entry.key)) {
+        metrics[entry.key] = entry.value;
+      }
+      result[entry.key] = entry.value;
+    }
+  }
   return result;
 }
 
@@ -612,6 +652,121 @@ void main() {
             _createSampleRawMap({'playbackHeadDeltaTelemetryOnly': 0}),
           );
       expect(report.allNativeLanesPass, isFalse);
+    });
+  });
+
+  group('X5 dynamic gain envelope mode', () {
+    test('default X4 pass report keeps the exact no-envelope defaults', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createSampleRawMap(),
+          );
+      expect(report.envelopeProofEnabled, isFalse);
+      expect(report.envelopeApplied, isFalse);
+      expect(report.envelopeEvaluations, equals(0));
+      expect(report.minEffectiveGain, equals(0.0));
+      expect(report.maxEffectiveGain, equals(0.0));
+      expect(report.dynamicGainEnvelopeGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X4 run reporting envelope application fails the default gate', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createSampleRawMap({'envelopeApplied': true}),
+          );
+      expect(report.dynamicGainEnvelopeGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('envelope pass report parses telemetry and passes all lanes', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createEnvelopeSampleRawMap(),
+          );
+      expect(report.marker, equals(_kEnvelopePassMarker));
+      expect(report.envelopeProofEnabled, isTrue);
+      expect(report.envelopeApplied, isTrue);
+      expect(report.envelopeEvaluations, equals(167936));
+      expect(report.minEffectiveGain, equals(0.25));
+      expect(report.maxEffectiveGain, equals(1.0));
+      expect(report.dynamicGainEnvelopeGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('envelope run must carry the envelope pass marker', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createEnvelopeSampleRawMap({'marker': _kPassMarker}),
+          );
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('envelope run requires envelopeApplied with evaluations > 0', () {
+      final notApplied =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createEnvelopeSampleRawMap({'envelopeApplied': false}),
+          );
+      expect(notApplied.dynamicGainEnvelopeGatesHeld, isFalse);
+      expect(notApplied.allNativeLanesPass, isFalse);
+
+      final noEvaluations =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createEnvelopeSampleRawMap({'envelopeEvaluations': 0}),
+          );
+      expect(noEvaluations.dynamicGainEnvelopeGatesHeld, isFalse);
+      expect(noEvaluations.allNativeLanesPass, isFalse);
+    });
+
+    test('envelope run requires min < max effective gain within [0,1]', () {
+      final flatGain =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createEnvelopeSampleRawMap({'minEffectiveGain': 1.0}),
+          );
+      expect(flatGain.dynamicGainEnvelopeGatesHeld, isFalse);
+      expect(flatGain.allNativeLanesPass, isFalse);
+
+      final overUnity =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createEnvelopeSampleRawMap({'maxEffectiveGain': 1.5}),
+          );
+      expect(overUnity.dynamicGainEnvelopeGatesHeld, isFalse);
+      expect(overUnity.allNativeLanesPass, isFalse);
+
+      final negativeMin =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createEnvelopeSampleRawMap({'minEffectiveGain': -0.1}),
+          );
+      expect(negativeMin.dynamicGainEnvelopeGatesHeld, isFalse);
+      expect(negativeMin.allNativeLanesPass, isFalse);
+    });
+
+    test('envelope run requires the dynamicGainEnvelopeOk lane', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createEnvelopeSampleRawMap({'dynamicGainEnvelopeOk': false}),
+          );
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('envelope mode sends envelopeProofEnabled=true only', () async {
+      Map<String, Object?>? capturedArgs;
+
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+        capturedArgs = (call.arguments as Map).cast<String, Object?>();
+        return _createEnvelopeSampleRawMap();
+      });
+
+      final report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: '/tmp/clip_B.mov',
+            envelopeProofEnabled: true,
+          );
+
+      expect(capturedArgs?['envelopeProofEnabled'], isTrue);
+      expect(report.pass, isTrue);
+      expect(report.envelopeProofEnabled, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
     });
   });
 

@@ -46,6 +46,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockIngestPump(
     maxFramesPerMix: Int,
     private val pollCancellation: () -> Unit,
     private val drainOutputToSink: () -> Long,
+    // X5 (dynamic-gain-envelope mode) only: per-(track, accepted frame)
+    // effective gain of the native scheduler/mix-bus envelope path,
+    // replicated exactly (integer-us floor pts on window-aligned full mix
+    // windows, double interpolation, single truncating quantization). Null
+    // keeps the X4 unit-gain clamp16(s0 + s1) reference model bit-exact.
+    private val envelopeGainModel: ((track: Int, frameIndex: Long) -> Double)? = null,
 ) {
     class FailClosed(val reason: String) : Exception(reason)
 
@@ -167,15 +173,28 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockIngestPump(
         slice.clear()
         val base = syntheticGeneratorNextFrame
         val sampleCount = frames * channelCount
+        val envelope = envelopeGainModel
         for (i in 0 until sampleCount) {
             val s0 = chunk0.getShort(i * 2).toInt()
-            val s1 = syntheticSample(base + (i / channelCount), i % channelCount)
+            val frame = base + (i / channelCount)
+            val s1 = syntheticSample(frame, i % channelCount)
             chunk1.putShort(i * 2, s1.toShort())
             if (s0 != 0) track0NonZeroSampleCount += 1
             if (s1 != 0) track1NonZeroSampleCount += 1
+            // Per-track RAW accepted checksums stay envelope-free in both
+            // modes: envelopes shape only the mixed output.
             kotlinTrack0Checksum = kotlinTrack0Checksum * 31L + (s0.toLong() and 0xFFFFL)
             kotlinTrack1Checksum = kotlinTrack1Checksum * 31L + (s1.toLong() and 0xFFFFL)
-            var acc = s0 + s1
+            var acc = if (envelope == null) {
+                s0 + s1
+            } else {
+                // AudioMixBusNode parity: each sample is scaled by its
+                // track's effective gain with ONE truncating double->int
+                // quantization, accumulated in integer, clamped only at
+                // the final int16 output stage below.
+                (s0.toDouble() * envelope(0, frame)).toInt() +
+                    (s1.toDouble() * envelope(1, frame)).toInt()
+            }
             if (acc > 32767) acc = 32767 else if (acc < -32768) acc = -32768
             kotlinMixedChecksum = kotlinMixedChecksum * 31L + (acc.toLong() and 0xFFFFL)
         }

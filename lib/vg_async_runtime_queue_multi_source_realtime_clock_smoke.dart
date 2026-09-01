@@ -135,6 +135,17 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   static const String failMarkerConstant =
       'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_REALTIME_CLOCK_SMOKE_FAIL';
 
+  /// Canonical pass marker emitted by the native harness for
+  /// envelope-enabled (X5 dynamic-gain-envelope) runs; default (X4
+  /// unit-gain) runs keep [passMarkerConstant].
+  static const String dynamicGainEnvelopePassMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_SMOKE_PASS';
+
+  /// Canonical fail marker emitted by the native harness for
+  /// envelope-enabled (X5 dynamic-gain-envelope) runs.
+  static const String dynamicGainEnvelopeFailMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_SMOKE_FAIL';
+
   /// Canonical Kotlin driver proof boundary string (muted AudioTrack sink
   /// claim included) emitted by the native harness.
   static const String proofBoundaryConstant =
@@ -483,6 +494,64 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
 
   // ---- Getters ------------------------------------------------------------
 
+  Object? _laneOrMetric(String key) => lanes[key] ?? metrics[key] ?? raw[key];
+
+  bool _boolFact(String key) {
+    final v = _laneOrMetric(key);
+    if (v is bool) return v;
+    if (v is String) return v.trim().toLowerCase() == 'true';
+    return false;
+  }
+
+  int _intFact(String key, [int defaultValue = 0]) {
+    final v = _laneOrMetric(key);
+    if (v is num) return v.toInt();
+    if (v is String) return int.tryParse(v.trim()) ?? defaultValue;
+    return defaultValue;
+  }
+
+  double _doubleFact(String key, [double defaultValue = 0.0]) {
+    final v = _laneOrMetric(key);
+    if (v is num) return v.toDouble();
+    if (v is String) return double.tryParse(v.trim()) ?? defaultValue;
+    return defaultValue;
+  }
+
+  /// Whether this run executed the X5 dynamic-gain-envelope mode (false for
+  /// every default X4 unit-gain run).
+  bool get envelopeProofEnabled => _boolFact('envelopeProofEnabled');
+
+  /// Whether the native mix bus actually applied an envelope-bearing track
+  /// gain (worker-folded telemetry; false in X4 mode).
+  bool get envelopeApplied => _boolFact('envelopeApplied');
+
+  /// Total native per-frame envelope evaluations folded by the worker
+  /// (0 in X4 mode).
+  int get envelopeEvaluations => _intFact('envelopeEvaluations');
+
+  /// Minimum effective per-frame gain observed by the native mix bus across
+  /// envelope-bearing tracks (0.0 in X4 mode).
+  double get minEffectiveGain => _doubleFact('minEffectiveGain');
+
+  /// Maximum effective per-frame gain observed by the native mix bus across
+  /// envelope-bearing tracks (0.0 in X4 mode).
+  double get maxEffectiveGain => _doubleFact('maxEffectiveGain');
+
+  /// X5 dynamic-gain-envelope gate: envelope-enabled runs must prove a
+  /// dynamic envelope shaped the mix (applied, evaluated, min strictly
+  /// below max within [0,1]); default X4 runs must report the exact
+  /// no-envelope defaults, proving unit-gain behavior was preserved.
+  bool get dynamicGainEnvelopeGatesHeld {
+    if (!envelopeProofEnabled) {
+      return !envelopeApplied && envelopeEvaluations == 0;
+    }
+    return envelopeApplied &&
+        envelopeEvaluations > 0 &&
+        minEffectiveGain >= 0.0 &&
+        maxEffectiveGain <= 1.0 &&
+        minEffectiveGain < maxEffectiveGain;
+  }
+
   /// Whether [proofBoundary] matches the canonical Kotlin driver boundary.
   bool get hasCanonicalProofBoundary => proofBoundary == proofBoundaryConstant;
 
@@ -551,7 +620,12 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   bool get allNativeLanesPass =>
       pass &&
       status.toLowerCase() == 'pass' &&
-      marker == passMarkerConstant &&
+      marker ==
+          (envelopeProofEnabled
+              ? dynamicGainEnvelopePassMarkerConstant
+              : passMarkerConstant) &&
+      dynamicGainEnvelopeGatesHeld &&
+      (!envelopeProofEnabled || _boolFact('dynamicGainEnvelopeOk')) &&
       hasCanonicalProofBoundary &&
       nativeProofBoundaryOk &&
       formatProbeOk &&
@@ -992,6 +1066,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
     int sourceRingCapacityFrames = 8192,
     int outputRingCapacityFrames = 4096,
     int maxFramesPerMix = 256,
+    bool envelopeProofEnabled = false,
     Duration? timeout,
     MethodChannel? channel,
   }) async {
@@ -1006,6 +1081,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       'outputRingCapacityFrames': outputRingCapacityFrames,
       'maxFramesPerMix': maxFramesPerMix,
       'deadlineMs': timeout != null ? timeout.inMilliseconds : 30000,
+      // Only sent for X5 dynamic-gain-envelope runs so the default X4
+      // argument shape (and its exact-args tests) stays frozen.
+      if (envelopeProofEnabled) 'envelopeProofEnabled': true,
     };
     try {
       final future = ch.invokeMethod<Object?>(methodName, args);

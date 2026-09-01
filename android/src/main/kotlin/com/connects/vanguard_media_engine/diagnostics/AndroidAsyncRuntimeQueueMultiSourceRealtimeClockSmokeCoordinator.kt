@@ -86,6 +86,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                 (args?.get("outputRingCapacityFrames") as? Number)?.toInt() ?: 4_096,
             maxFramesPerMix = (args?.get("maxFramesPerMix") as? Number)?.toInt() ?: 256,
             deadlineMs = (args?.get("deadlineMs") as? Number)?.toLong() ?: 30_000L,
+            // X5 dynamic-gain-envelope mode; absent/false preserves the
+            // exact X4 unit-gain run.
+            envelopeProofEnabled =
+                (args?.get("envelopeProofEnabled") as? Boolean) ?: false,
         )
         if (!active.compareAndSet(false, true)) {
             result.error(

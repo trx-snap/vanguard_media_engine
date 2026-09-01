@@ -917,6 +917,22 @@ class VanguardNativeBridge(
             maxFramesPerMix: Int,
         ): Long
 
+        // X5 (P4-AUDIO-ASYNC-RUNTIME-QUEUE-MULTI-SOURCE-DYNAMIC-GAIN-
+        // ENVELOPE) envelope-enabled create: identical rig, validation, and
+        // registry as the X4 create above, plus session-owned deterministic
+        // per-track dynamic AudioGainEnvelope mix params built atomically
+        // before the scheduler snapshot / worker start (additionally
+        // returns 0 when the proof envelopes fail to build). All other
+        // entry points are shared between both modes.
+        external fun createAsyncRuntimeQueueMultiSourceRealtimeClockEnvelopeSession(
+            sampleRate: Int,
+            channelCount: Int,
+            expectedFrameCount: Long,
+            sourceRingCapacityFrames: Int,
+            outputRingCapacityFrames: Int,
+            maxFramesPerMix: Int,
+        ): Long
+
         // Enqueue-only, no time argument (status=enqueued;commandSeq=N, or
         // already_started / queue_full / not_found / wrong_owner_thread).
         // The worker reads steady_clock itself and executes

@@ -84,8 +84,24 @@
 // from every other diagnostic session TU (including the X3 realtime-clock
 // TU and both step-driven multi-source TUs).
 //
+// P4-AUDIO-ASYNC-RUNTIME-QUEUE-MULTI-SOURCE-DYNAMIC-GAIN-ENVELOPE (X5):
+// an envelope-enabled create entry point layers deterministic per-track
+// dynamic AudioGainEnvelope mix params (built atomically BEFORE the
+// scheduler snapshots the topology, owned by the session for the full
+// scheduler lifetime) onto the otherwise-identical X4 rig. The default
+// (X4) create keeps unit gain with null envelopes and is bit-identical to
+// the pre-X5 behavior; every other entry point, constant, and timing
+// invariant is shared verbatim between both modes. The snapshot publishes
+// envelopeProofEnabled/envelopeApplied/envelopeEvaluations and the min/max
+// effective gain folded by the worker from DispatchOutput (all false/0 in
+// X4 mode). The kProofBoundary constant stays shared verbatim as the
+// TU-identity proof for both modes; its unit-gain token describes the
+// default (X4) configuration and the snapshot's envelopeProofEnabled key
+// is the authoritative per-session mode disclosure.
+//
 // JNI entry points (VanguardNativeBridge.kt companion object):
 //   createAsyncRuntimeQueueMultiSourceRealtimeClockSession   -> jlong handle (0 on failure)
+//   createAsyncRuntimeQueueMultiSourceRealtimeClockEnvelopeSession -> jlong handle (0 on failure)
 //   startAsyncRuntimeQueueMultiSourceRealtimeClock           -> jstring key=value (no time arg)
 //   seekAsyncRuntimeQueueMultiSourceRealtimeClock            -> jstring key=value (no time arg)
 //   ingestAsyncRuntimeQueueMultiSourceRealtimeClockPcm16     -> jstring key=value (per track)
@@ -113,6 +129,7 @@
 
 #include "vanguard/audio/audio_clock.h"
 #include "vanguard/audio/audio_decoder_ring_writer.h"
+#include "vanguard/audio/audio_gain_envelope.h"
 #include "vanguard/audio/audio_mix_bus_node.h"
 #include "vanguard/audio/audio_ring_buffer.h"
 #include "vanguard/audio/audio_sample_provider.h"
@@ -135,6 +152,7 @@ constexpr const char* kProofBoundary =
 
 using vanguard::audio::AudioClock;
 using vanguard::audio::AudioDecoderRingWriter;
+using vanguard::audio::AudioGainEnvelope;
 using vanguard::audio::AudioMixBusNode;
 using vanguard::audio::AudioSpscAudioRingBuffer;
 using vanguard::audio::AutoDiscoverSourceProviders;
@@ -269,6 +287,65 @@ const Graph& PrepareTopology(Graph& g,
     return g;
 }
 
+// X5 deterministic dynamic proof envelopes, one per routed track, built
+// from exactly three finite [0,1] keyframes at {0, trackEndUs/2,
+// trackEndUs} with trackEndUs = CeilPtsUsOfFrame(expectedFrames). The
+// Kotlin driver reproduces this table (and the AudioMixBusNode per-frame
+// integer-us floor pts / truncation math) verbatim for the reference mix
+// checksum, so any keyframe change must land on both sides at once.
+constexpr double kEnvelopeGainsTrack0[3] = {0.25, 1.0, 0.5};
+constexpr double kEnvelopeGainsTrack1[3] = {1.0, 0.25, 0.75};
+
+// Populates the session-owned per-track envelopes + mix-params map BEFORE
+// the scheduler member snapshots them; called from the session's member
+// initializer list only (all touched members are declared before the
+// scheduler, so their storage outlives every renderWindow() call). Returns
+// the map pointer for the scheduler constructor (nullptr keeps the exact
+// X4 unit-gain/no-envelope behavior); buildOk latches false on any
+// normalization failure and the create entry point fails closed on it.
+const std::unordered_map<std::string, GraphAudioScheduler::SourceMixParams>*
+PrepareEnvelopeMixParams(
+    bool     envelopeProofEnabled,
+    int64_t  expectedFrames,
+    int32_t  sampleRate,
+    std::array<AudioGainEnvelope, kTrackCount>& envelopes,
+    std::unordered_map<std::string, GraphAudioScheduler::SourceMixParams>& mixParams,
+    bool&    buildOk) {
+    if (!envelopeProofEnabled) {
+        buildOk = true;
+        return nullptr;
+    }
+    buildOk = false;
+    const int64_t trackEndUs = CeilPtsUsOfFrame(expectedFrames, sampleRate);
+    // The three-keyframe table must survive Normalize verbatim (no
+    // sub-millisecond merge, no synthesized head/tail), so the timeline
+    // must comfortably exceed the merge epsilon on both segments.
+    if (trackEndUs < 4 * AudioGainEnvelope::kMergeEpsilonUs) {
+        return nullptr;
+    }
+    const int64_t trackMidUs = trackEndUs / 2;
+    const double* gains[kTrackCount] = {kEnvelopeGainsTrack0, kEnvelopeGainsTrack1};
+    for (int t = 0; t < kTrackCount; ++t) {
+        const AudioGainEnvelope::Keyframe raw[3] = {
+            {0,          gains[t][0], AudioGainEnvelope::Interpolation::kLinear},
+            {trackMidUs, gains[t][1], AudioGainEnvelope::Interpolation::kLinear},
+            {trackEndUs, gains[t][2], AudioGainEnvelope::Interpolation::kLinear},
+        };
+        if (AudioGainEnvelope::Normalize(raw, 3, /*trackStartUs=*/0, trackEndUs,
+                                         /*mixGain=*/1.0, &envelopes[t]) !=
+            AudioGainEnvelope::BuildResult::kOk) {
+            return nullptr;
+        }
+        if (envelopes[t].keyframeCount() != 3) {
+            return nullptr; // synthesized/merged keyframes would break parity
+        }
+    }
+    mixParams[kSource0NodeId] = GraphAudioScheduler::SourceMixParams{1.0, &envelopes[0]};
+    mixParams[kSource1NodeId] = GraphAudioScheduler::SourceMixParams{1.0, &envelopes[1]};
+    buildOk = true;
+    return &mixParams;
+}
+
 // No control command carries a time value: the worker reads steady_clock
 // itself at execution.
 enum class CommandType : int32_t {
@@ -338,6 +415,13 @@ struct PublishedState {
     uint64_t providerFramesZeroFilled[kTrackCount]{0, 0};
     uint64_t providerForwardSkipFrames[kTrackCount]{0, 0};
     uint64_t providerRewindRejects[kTrackCount]{0, 0};
+
+    // X5 envelope telemetry folded by the worker from DispatchOutput; all
+    // false/0 for the X4 unit-gain/no-envelope mode.
+    bool     envelopeApplied{false};
+    uint64_t envelopeEvaluations{0};
+    double   minEffectiveGain{0.0};
+    double   maxEffectiveGain{0.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -355,6 +439,16 @@ struct AsyncRuntimeQueueMultiSourceRealtimeClockSession {
     std::shared_ptr<DecodedAudioPcmSourceNode> sourceNode0;
     std::shared_ptr<DecodedAudioPcmSourceNode> sourceNode1;
     AudioSpscAudioRingBuffer                   outputRing;
+    // X5 envelope owner storage, declared (and thus constructed) BEFORE the
+    // scheduler so the non-owning envelope pointers the scheduler resolves
+    // at construction stay valid for its whole lifetime and destruction
+    // order is safe. Built atomically in PrepareEnvelopeMixParams before
+    // the scheduler snapshots the graph; never mutated mid-flight.
+    bool                                       envelopeProofEnabled;
+    bool                                       envelopeBuildOk;
+    std::array<AudioGainEnvelope, kTrackCount> trackEnvelopes;
+    std::unordered_map<std::string, GraphAudioScheduler::SourceMixParams>
+                                               trackMixParams;
     GraphAudioScheduler                        scheduler;
     AudioClock                                 clock;
     ClockedAudioTransportCoordinator           coordinator;
@@ -396,7 +490,8 @@ struct AsyncRuntimeQueueMultiSourceRealtimeClockSession {
                                                      int64_t expectedFrameCountIn,
                                                      int64_t sourceRingCapacityFrames,
                                                      int64_t outputRingCapacityFrames,
-                                                     int64_t maxFramesPerMixIn)
+                                                     int64_t maxFramesPerMixIn,
+                                                     bool    envelopeProofEnabledIn)
         : graphTopology(),
           mixBus(std::make_shared<AudioMixBusNode>(
               kMixNodeId, sampleRateIn, channelCountIn, maxFramesPerMixIn)),
@@ -407,8 +502,16 @@ struct AsyncRuntimeQueueMultiSourceRealtimeClockSession {
               kSource1NodeId, sampleRateIn, channelCountIn, expectedFrameCountIn,
               /*timelineStartPtsUs=*/0, sourceRingCapacityFrames)),
           outputRing(sampleRateIn, channelCountIn, outputRingCapacityFrames),
+          envelopeProofEnabled(envelopeProofEnabledIn),
+          envelopeBuildOk(false),
+          trackEnvelopes(),
+          trackMixParams(),
           scheduler(PrepareTopology(graphTopology, mixBus, sourceNode0, sourceNode1),
-                    kMixNodeId, AutoDiscoverSourceProviders{}),
+                    kMixNodeId, AutoDiscoverSourceProviders{},
+                    PrepareEnvelopeMixParams(envelopeProofEnabledIn,
+                                             expectedFrameCountIn, sampleRateIn,
+                                             trackEnvelopes, trackMixParams,
+                                             envelopeBuildOk)),
           clock(),
           coordinator(clock, scheduler, outputRing),
           ownerThreadId(std::this_thread::get_id()),
@@ -520,6 +623,14 @@ private:
         uint64_t dispatchAnomalies = 0, nonMonotonicAnomalies = 0;
         uint64_t backlogSamples = 0;
 
+        // X5 envelope telemetry folded from every ok/silence DispatchOutput
+        // (structurally all-false/0 in X4 mode: the scheduler mixes no
+        // envelope-bearing track without mix params).
+        bool     envelopeAppliedSeen   = false;
+        uint64_t envelopeEvaluations   = 0;
+        double   minEffectiveGain      = 0.0;
+        double   maxEffectiveGain      = 0.0;
+
         // Realtime timebase state: every value below is derived from the
         // worker's own steady_clock reads, never from a caller.
         int64_t lastNowNs       = 0;
@@ -594,6 +705,10 @@ private:
             ps.maxRenderCursorBacklogUs = maxBacklogUs;
             ps.realtimeBacklogBoundOk   = maxBacklogUs < kMaxBacklogBoundUs;
             ps.clockDriftSampleCount    = ksnap.driftSampleCount;
+            ps.envelopeApplied          = envelopeAppliedSeen;
+            ps.envelopeEvaluations      = envelopeEvaluations;
+            ps.minEffectiveGain         = minEffectiveGain;
+            ps.maxEffectiveGain         = maxEffectiveGain;
             for (int t = 0; t < kTrackCount; ++t) {
                 RingBufferAudioSampleProvider& p = providerAt(t);
                 ps.providerExpectedNextFrame[t] = p.expectedNextFrame();
@@ -780,6 +895,19 @@ private:
                         if (r == DispatchResult::kOk ||
                             r == DispatchResult::kSilence) {
                             progressed = true;
+                            if (out.envelopeApplied) {
+                                if (!envelopeAppliedSeen ||
+                                    out.minEffectiveGain < minEffectiveGain) {
+                                    minEffectiveGain = out.minEffectiveGain;
+                                }
+                                if (!envelopeAppliedSeen ||
+                                    out.maxEffectiveGain > maxEffectiveGain) {
+                                    maxEffectiveGain = out.maxEffectiveGain;
+                                }
+                                envelopeAppliedSeen = true;
+                                envelopeEvaluations +=
+                                    static_cast<uint64_t>(out.envelopeEvaluations);
+                            }
                             const int64_t cursorAfter = out.nextDispatchFrame;
                             if (timingT0Ns < 0 && cursorAfter > timingF0) {
                                 timingT0Ns = nowNs;
@@ -867,25 +995,26 @@ FindMsRealtimeClockSession(jlong handle) {
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// JNI: createAsyncRuntimeQueueMultiSourceRealtimeClockSession
-// Fail-closed construction validation; the worker thread starts only after
-// the rig validated (BOTH nodes own their transport, the auto-discovered
-// route resolved to exactly the two intended tracks in edge order, and
-// every node/ring carries the session's channel/sample-rate geometry).
-// expectedFrameCount must be window-aligned because the realtime worker
-// dispatches full windows only (no joint tail flush exists).
-// ---------------------------------------------------------------------------
-extern "C" JNIEXPORT jlong JNICALL
-Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Companion_createAsyncRuntimeQueueMultiSourceRealtimeClockSession(
-    JNIEnv* /* env */,
-    jobject /* companion */,
-    jint sampleRate,
-    jint channelCount,
+namespace {
+
+// Shared fail-closed create path for both the X4 (unit-gain, no-envelope)
+// and X5 (envelope-enabled) entry points: construction validation runs
+// first and the worker thread starts only after the rig validated (BOTH
+// nodes own their transport, the auto-discovered route resolved to exactly
+// the two intended tracks in edge order, every node/ring carries the
+// session's channel/sample-rate geometry, and — in envelope mode — the
+// deterministic proof envelopes built cleanly before the scheduler
+// snapshot). expectedFrameCount must be window-aligned because the
+// realtime worker dispatches full windows only (no joint tail flush
+// exists).
+jlong CreateMsRealtimeClockSession(
+    jint  sampleRate,
+    jint  channelCount,
     jlong expectedFrameCount,
-    jint sourceRingCapacityFrames,
-    jint outputRingCapacityFrames,
-    jint maxFramesPerMix) {
+    jint  sourceRingCapacityFrames,
+    jint  outputRingCapacityFrames,
+    jint  maxFramesPerMix,
+    bool  envelopeProofEnabled) {
 
     const int64_t expFrames = static_cast<int64_t>(expectedFrameCount);
     const int64_t srcCap    = static_cast<int64_t>(sourceRingCapacityFrames);
@@ -916,11 +1045,15 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
         session = std::make_shared<AsyncRuntimeQueueMultiSourceRealtimeClockSession>(
             static_cast<int32_t>(sampleRate),
             static_cast<int32_t>(channelCount),
-            expFrames, srcCap, outCap, mfpm);
+            expFrames, srcCap, outCap, mfpm,
+            envelopeProofEnabled);
     } catch (...) {
         return 0;
     }
 
+    if (!session->envelopeBuildOk) {
+        return 0; // envelope-mode proof envelopes failed to build atomically
+    }
     if (!session->sourceNode0->ownsRing() ||
         !session->sourceNode1->ownsRing() ||
         !session->scheduler.targetValid() ||
@@ -953,6 +1086,53 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
         gMsRealtimeClockSessions[handle] = std::move(session);
         return static_cast<jlong>(handle);
     }
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// JNI: createAsyncRuntimeQueueMultiSourceRealtimeClockSession
+// X4 default mode: unit gain, no envelopes; bit-identical to the pre-X5
+// behavior of this TU.
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Companion_createAsyncRuntimeQueueMultiSourceRealtimeClockSession(
+    JNIEnv* /* env */,
+    jobject /* companion */,
+    jint sampleRate,
+    jint channelCount,
+    jlong expectedFrameCount,
+    jint sourceRingCapacityFrames,
+    jint outputRingCapacityFrames,
+    jint maxFramesPerMix) {
+    return CreateMsRealtimeClockSession(
+        sampleRate, channelCount, expectedFrameCount,
+        sourceRingCapacityFrames, outputRingCapacityFrames, maxFramesPerMix,
+        /*envelopeProofEnabled=*/false);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: createAsyncRuntimeQueueMultiSourceRealtimeClockEnvelopeSession
+// X5 envelope-enabled mode: identical rig plus the session-owned
+// deterministic per-track dynamic AudioGainEnvelope mix params resolved by
+// the scheduler at construction. Envelope configuration is atomic before
+// the worker starts and before the handle registers; no mid-flight
+// envelope mutation path exists.
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Companion_createAsyncRuntimeQueueMultiSourceRealtimeClockEnvelopeSession(
+    JNIEnv* /* env */,
+    jobject /* companion */,
+    jint sampleRate,
+    jint channelCount,
+    jlong expectedFrameCount,
+    jint sourceRingCapacityFrames,
+    jint outputRingCapacityFrames,
+    jint maxFramesPerMix) {
+    return CreateMsRealtimeClockSession(
+        sampleRate, channelCount, expectedFrameCount,
+        sourceRingCapacityFrames, outputRingCapacityFrames, maxFramesPerMix,
+        /*envelopeProofEnabled=*/true);
 }
 
 namespace {
@@ -1488,6 +1668,22 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
             track, static_cast<long long>(s.totalFramesAccepted[track]),
             track, static_cast<unsigned long long>(s.nativeAcceptedChecksum[track]));
     }
+
+    // X5 envelope telemetry: mode flag + owner-side keyframe counts read
+    // directly (immutable after create), worker-folded application facts
+    // from the published mirror. All false/0 in X4 mode.
+    out.appendf(
+        "envelopeProofEnabled=%s;envelopeApplied=%s;"
+        "envelopeEvaluations=%llu;"
+        "minEffectiveGain=%.9f;maxEffectiveGain=%.9f;"
+        "envelopeKeyframeCountTrack0=%zu;envelopeKeyframeCountTrack1=%zu;",
+        s.envelopeProofEnabled ? "true" : "false",
+        ps.envelopeApplied ? "true" : "false",
+        static_cast<unsigned long long>(ps.envelopeEvaluations),
+        ps.minEffectiveGain,
+        ps.maxEffectiveGain,
+        s.trackEnvelopes[0].keyframeCount(),
+        s.trackEnvelopes[1].keyframeCount());
 
     out.appendf(
         "outputAvailableReadFrames=%lld;"

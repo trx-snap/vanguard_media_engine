@@ -234,6 +234,10 @@ ClockedAudioTransportCoordinator::DispatchResult ClockedAudioTransportCoordinato
         outResult->nextDispatchFrame  = nextDispatchFrame_;
         outResult->checksum           = schedOut.checksum;
         outResult->silence            = silence;
+        outResult->envelopeApplied     = schedOut.envelopeApplied;
+        outResult->minEffectiveGain    = schedOut.minEffectiveGain;
+        outResult->maxEffectiveGain    = schedOut.maxEffectiveGain;
+        outResult->envelopeEvaluations = schedOut.envelopeEvaluations;
     }
 
     lastResult_ = silence ? DispatchResult::kSilence : DispatchResult::kOk;

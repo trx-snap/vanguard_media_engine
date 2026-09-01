@@ -18,6 +18,13 @@
 //   - Seek Epoch group: seekEpochReanchorOk, seekSinkEpochResetOk, syntheticGeneratorReanchorOk, generatorReanchorCount, seekTargetFrame, framesDiscardedInSinkAtSeek.
 //   - Lifecycle group: workerJoinOnDestroyOk, idempotentDestroyOk.
 //   - Proof-Boundary & Summary group: canonicalProofBoundaryOk, hasCanonicalProofBoundary, nativeProofBoundaryOk, allNativeLanesPass, lastError.
+//
+// After the X4 run, a second envelope-enabled run (sub-slice X5,
+// P4-AUDIO-ASYNC-RUNTIME-QUEUE-MULTI-SOURCE-DYNAMIC-GAIN-ENVELOPE) proves
+// the dynamic-gain-envelope reference mix identity and telemetry gates:
+//   - Dynamic Gain Envelope group: envelopeProofEnabled, envelopeApplied, envelopeEvaluations, minEffectiveGain, maxEffectiveGain, dynamicGainEnvelopeGatesHeld.
+// Overall exit is PASS only when BOTH runs pass; each phase prints its own
+// PHYSICAL_SMOKE_PASS/FAIL marker.
 
 // ignore_for_file: avoid_print
 
@@ -304,16 +311,161 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
           : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_REALTIME_CLOCK_PHYSICAL_SMOKE_FAIL',
     );
 
+    // ── X5 (P4-AUDIO-ASYNC-RUNTIME-QUEUE-MULTI-SOURCE-DYNAMIC-GAIN-
+    // ENVELOPE): the same run with the deterministic dynamic per-track
+    // envelope mix params enabled. The X4 run above stays authoritative
+    // for the unit-gain proof; this phase additionally proves the
+    // envelope-shaped reference mix identity and telemetry gates. ─────────
+    final envelopePass = await _runEnvelopeSmoke();
+
+    final bothPass = pass && envelopePass;
     if (mounted) {
       setState(() {
-        _status = pass
-            ? 'PASS (allNativeLanesPass=true, realtimeGatesHeld=true)'
-            : 'FAIL: lastError=${activeReport.lastError}, error=$topLevelError';
+        _status = bothPass
+            ? 'PASS (X4 allNativeLanesPass=true, X5 envelope gates held)'
+            : 'FAIL: x4Pass=$pass, envelopePass=$envelopePass, '
+                  'lastError=${activeReport.lastError}, error=$topLevelError';
       });
     }
 
     await Future<void>.delayed(const Duration(milliseconds: 1500));
-    exit(pass ? 0 : 1);
+    exit(bothPass ? 0 : 1);
+  }
+
+  Future<bool> _runEnvelopeSmoke() async {
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_SMOKE_START',
+    );
+
+    VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport? report;
+    String? topLevelError;
+    File? tempSourceFile;
+
+    try {
+      final clipBData = await rootBundle.load(
+        'assets/manual_test_clips/clip_B.mov',
+      );
+      final tempDir = Directory.systemTemp;
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+      tempSourceFile = File(
+        '${tempDir.path}/p4_async_rt_queue_ms_dyn_gain_env_source_$timestamp.mov',
+      );
+
+      await tempSourceFile.writeAsBytes(
+        clipBData.buffer.asUint8List(
+          clipBData.offsetInBytes,
+          clipBData.lengthInBytes,
+        ),
+        flush: true,
+      );
+
+      report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: tempSourceFile.path,
+            envelopeProofEnabled: true,
+            timeout: const Duration(seconds: 45),
+          ).timeout(const Duration(seconds: 55));
+    } on TimeoutException catch (te) {
+      topLevelError = 'timeout: $te';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_ERROR: $topLevelError',
+      );
+    } catch (e, st) {
+      topLevelError = '$e\n$st';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_ERROR: $topLevelError',
+      );
+    } finally {
+      if (tempSourceFile != null) {
+        try {
+          if (await tempSourceFile.exists()) {
+            await tempSourceFile.delete();
+          }
+        } catch (_) {}
+      }
+    }
+
+    final envReport =
+        report ??
+        VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+          <String, Object?>{
+            'pass': false,
+            'status': 'fail',
+            'marker': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .dynamicGainEnvelopeFailMarkerConstant,
+            'proofBoundary': '',
+            'nativeProofBoundary': '',
+            'failureReason': 'invocation_failed',
+            'lastError': 'invocation_failed',
+          },
+        );
+
+    // Dynamic Gain Envelope group: mode + worker-folded telemetry gates on
+    // top of the full X4 lane/identity/timing contract (allNativeLanesPass
+    // consumes the envelope marker and gates in envelope mode).
+    print(
+      '  [LANE] Dynamic Gain Envelope: '
+      'envelopeProofEnabled=${envReport.envelopeProofEnabled}, '
+      'envelopeApplied=${envReport.envelopeApplied}, '
+      'envelopeEvaluations=${envReport.envelopeEvaluations}, '
+      'minEffectiveGain=${envReport.minEffectiveGain}, '
+      'maxEffectiveGain=${envReport.maxEffectiveGain}, '
+      'dynamicGainEnvelopeGatesHeld=${envReport.dynamicGainEnvelopeGatesHeld}, '
+      'referenceMixChecksumOk=${envReport.referenceMixChecksumOk}, '
+      'checksumsMatch=${envReport.checksumsMatch}, '
+      'commandErrors=${envReport.commandErrors}, '
+      'residualFramesAtEnd=${envReport.residualFramesAtEnd}, '
+      'realtimeGatesHeld=${envReport.realtimeGatesHeld}, '
+      'allNativeLanesPass=${envReport.allNativeLanesPass}, '
+      'marker=${envReport.marker}, '
+      'lastError=${envReport.lastError}',
+    );
+
+    final lastErrorOk =
+        envReport.lastError.isEmpty ||
+        envReport.lastError == 'none' ||
+        envReport.lastError == 'null';
+
+    final envelopePass =
+        (topLevelError == null) &&
+        envReport.pass &&
+        envReport.marker ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .dynamicGainEnvelopePassMarkerConstant &&
+        envReport.envelopeProofEnabled &&
+        envReport.dynamicGainEnvelopeGatesHeld &&
+        envReport.hasCanonicalProofBoundary &&
+        envReport.nativeProofBoundaryOk &&
+        envReport.checksumsMatch &&
+        envReport.providerCountersClean &&
+        envReport.sinkAccountingBalanced &&
+        envReport.realtimeGatesHeld &&
+        envReport.allNativeLanesPass &&
+        lastErrorOk;
+
+    final summaryPayload = <String, dynamic>{
+      'unit':
+          'AndroidAsyncRuntimeQueueMultiSourceDynamicGainEnvelopePhysicalSmokeHarness',
+      'slice':
+          'P4-AUDIO-ASYNC-RUNTIME-QUEUE-MULTI-SOURCE-DYNAMIC-GAIN-ENVELOPE',
+      'target': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .proofBoundaryConstant,
+      'nativeTarget': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .nativeProofBoundaryConstant,
+      'pass': envelopePass,
+      'report': envReport.toMap(),
+      'error': topLevelError,
+    };
+
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_JSON:${jsonEncode(summaryPayload)}',
+    );
+    print(
+      envelopePass
+          ? 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_PHYSICAL_SMOKE_PASS'
+          : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_PHYSICAL_SMOKE_FAIL',
+    );
+    return envelopePass;
   }
 
   @override
