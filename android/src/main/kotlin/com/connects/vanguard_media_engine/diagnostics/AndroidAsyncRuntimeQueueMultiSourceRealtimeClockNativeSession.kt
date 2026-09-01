@@ -1,0 +1,653 @@
+package com.connects.vanguard_media_engine.diagnostics
+
+import android.os.SystemClock
+import com.connects.vanguard_media_engine.bridge.VanguardNativeBridge
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
+// ── AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession (P4
+// True-DAG sub-slice X4) ────────────────────────────────────────────────────
+//
+// Owner-thread wrapper around the multi-source realtime-clock async runtime
+// queue JNI seam
+// (android_phase4_async_runtime_queue_multi_source_realtime_clock_jni.cpp),
+// used by the muted-AudioTrack two-track realtime pacing driver
+// [AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver] together with
+// the lockstep ingest pump
+// [AndroidAsyncRuntimeQueueMultiSourceRealtimeClockIngestPump]. The NATIVE
+// WORKER thread inside the session is the sole reader of
+// std::chrono::steady_clock for media time and the sole caller of every
+// AudioClock mutator, every ClockedAudioTransportCoordinator
+// control/dispatch method, and the output ring's producer role; this class
+// only ingests PCM through the two NODE-OWNED source-ring writers (per
+// track), enqueues start/seek commands (which carry NO time values), reads
+// the output ring, and observes the worker through the mutex-published
+// snapshot mirror. No step/dispatch method exists anywhere on this
+// wrapper: in X4 only the native worker dispatches.
+//
+// X4 differences from the X3 wrapper
+// (AndroidAsyncRuntimeQueueRealtimeClockNativeSession, untouched and
+// behaviorally reproducible):
+//   - Two node-owned source tracks on the SHARED ACCEPTED FRAME AXIS:
+//     [ingestTrackOnce] takes a track index and folds per-track accepted
+//     totals + native checksums; the seek boundary asserts lockstep
+//     (accepted0 == accepted1 == target).
+//   - The joint seek publishes BOTH writer requests natively and the
+//     transient/fatal status token set is per-track suffixed.
+//   - Per-track provider poisoning counters are folded from the snapshot.
+//
+// Owner-thread affinity: every non-destroy entry point is owner-only in
+// native; this object must be created AND driven on the single Kotlin
+// worker thread that calls create().
+//
+// Honest non-claims: muted diagnostic realtime pacing proof only; the
+// native steady_clock timebase is a render/dispatch timebase, not a
+// presentation clock; no audible output, no product/editor/app wiring, no
+// streaming/cache, no iOS, no C++ primitive changes. Zero-fill is never
+// allowed into the identity checksums: the driver completes the exact
+// expected timeline before setting the joint writer-local EOS, and this
+// wrapper fails closed if any per-track provider zero-fill is observed.
+class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
+    private val deadlineElapsedRealtimeMs: Long,
+    private val outputSink: OutputSink,
+) {
+    class Failure(val reason: String) : Exception(reason)
+
+    // Invoked after every destructive output read that produced frames: the
+    // freshly read mixed PCM16 sits at byte offset 0 of the read buffer
+    // supplied to [create]. The sink must fully consume (write + account)
+    // the frames before returning, or throw; the session issues no further
+    // native call while staged frames remain unconsumed.
+    fun interface OutputSink {
+        fun onOutputFramesRead(frames: Long)
+    }
+
+    data class IngestReply(
+        val framesAccepted: Long,
+        val writerStatus: String,
+        val writerBackpressureRejects: Long,
+    )
+
+    companion object {
+        // Verbatim native TU constant; the snapshot must echo it so a
+        // physical run proves the exact multi-source realtime-clock TU
+        // executed. Deliberately carries NO AudioTrack/native-sink claim
+        // (the Kotlin driver's separate boundary does).
+        const val NATIVE_PROOF_BOUNDARY =
+            "diagnostic_async_runtime_queue_multi_source_realtime_clock_native_worker_proof_only_real_decoder_plus_synthetic_track_node_owned_source_rings_to_graph_scheduler_audio_mix_bus_to_output_ring_worker_owned_std_chrono_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_on_any_control_command_two_routed_tracks_unit_gain_lockstep_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_seek_reanchors_both_tracks_at_single_accepted_frame_cursor_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_native_audio_sink_no_audiotrack_no_aaudio_no_opensl_no_oboe_no_audible_output_no_speaker_route_no_audio_focus_no_route_change_no_dead_object_recovery_no_latency_glitch_avsync_claim_no_zero_underrun_claim_no_realtime_priority_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
+
+        // Matches the native per-call ingest clamp
+        // (AudioDecoderRingWriter kMaxWriteFrames).
+        private const val NATIVE_MAX_INGEST_FRAMES = 8_192L
+        private const val POLL_SLEEP_MS = 2L
+        private const val MAX_SEEK_TRANSIENT_RETRIES = 64
+    }
+
+    // Geometry, frozen at create().
+    private var handle = 0L
+    private var sampleRate = 0
+    private var channelCount = 0
+    private var bytesPerFrame = 0
+    private var srcCap = 0L
+    private var outCap = 0L
+    private var mfpm = 0L
+    var expectedFrames = 0L
+        private set
+
+    // Driver-supplied direct buffer for every destructive output read.
+    private var readBuf: ByteBuffer? = null
+
+    // Owner-side command sequence mirror (asserted against every enqueue
+    // reply and the processed-command snapshot).
+    private var nextCommandSeq = 0L
+
+    // Owner-side per-track accounting folded from every ingest reply
+    // (indexed, never duplicated).
+    private val totalFramesAcceptedTrack = longArrayOf(0L, 0L)
+    private val nativeAcceptedChecksumHexTrack = arrayOf("", "")
+    var totalOutputFramesRead = 0L
+        private set
+    var nativeOutputReadChecksumHex = ""
+        private set
+    var writerBackpressureRejects = 0L
+        private set
+
+    val totalFramesAcceptedTrack0: Long get() = totalFramesAcceptedTrack[0]
+    val totalFramesAcceptedTrack1: Long get() = totalFramesAcceptedTrack[1]
+    val nativeAcceptedChecksumHexTrack0: String get() = nativeAcceptedChecksumHexTrack[0]
+    val nativeAcceptedChecksumHexTrack1: String get() = nativeAcceptedChecksumHexTrack[1]
+
+    // Lane observations.
+    var workerOwnershipAtBootOk = false
+        private set
+    var nodeOwnedTopologyOk = false
+        private set
+    var seekReanchorOk = false
+        private set
+    var seekTargetFrame = -1L
+        private set
+
+    // Folded from the most recent snapshot (final metrics for the driver).
+    var snapCommandsEnqueued = -1L
+        private set
+    var snapCommandsProcessed = -1L
+        private set
+    var snapCommandErrors = -1L
+        private set
+    var snapLastCommandSeq = -1L
+        private set
+    var snapQueueDepth = -1L
+        private set
+    var snapDispatchCount = -1L
+        private set
+    var snapOkCount = -1L
+        private set
+    var snapSilenceCount = -1L
+        private set
+    var snapBackpressureCount = -1L
+        private set
+    var snapSchedulerErrorCount = -1L
+        private set
+    var snapWorkerDispatchAnomalies = -1L
+        private set
+    var snapNonMonotonicTimeAnomalies = -1L
+        private set
+    var snapWorkerNoFramesDueWaits = -1L
+        private set
+    var snapWorkerStarvedWaits = -1L
+        private set
+    val snapProviderUnderrunEventsTrack = longArrayOf(-1L, -1L)
+    val snapProviderFramesZeroFilledTrack = longArrayOf(-1L, -1L)
+    val snapProviderForwardSkipFramesTrack = longArrayOf(-1L, -1L)
+    val snapProviderRewindRejectsTrack = longArrayOf(-1L, -1L)
+    var snapTotalFramesRendered = -1L
+        private set
+    var snapTotalFramesPushed = -1L
+        private set
+    var snapOwnerDispatchCalls = -1L
+        private set
+    var snapWorkerThreadDistinct = false
+        private set
+    var snapTerminal = false
+        private set
+    var snapNoCallerSuppliedNativeTime = false
+        private set
+    var snapWorkerOwnsMonotonicClock = false
+        private set
+    var snapRoutedSourceCount = -1L
+        private set
+    var snapNativeTimingF0 = -1L
+        private set
+    var snapNativeTimingF1 = -1L
+        private set
+    var snapNativeRealtimeElapsedMs = -1L
+        private set
+    var snapRealtimeElapsedOk = false
+        private set
+    var snapMaxRenderCursorBacklogUs = -1L
+        private set
+    var snapRealtimeBacklogBoundOk = false
+        private set
+    var snapBacklogSampleCount = -1L
+        private set
+    var snapClockDriftSampleCount = -1L
+        private set
+    var snapProofBoundary = ""
+        private set
+    var lastStatus = ""
+        private set
+
+    val isCreated: Boolean get() = handle != 0L
+
+    // ── Lifecycle ───────────────────────────────────────────────────────────
+
+    // Creates the multi-source realtime-clock native session (which starts
+    // its worker thread) and proves boot-time async ownership AND the
+    // node-owned two-track topology: worker started, worker thread id
+    // distinct from this owner thread, zero owner dispatch calls, the
+    // structural no-caller-supplied-native-time token, exactly two routed
+    // sources, and both nodes owning their rings. The driver-supplied
+    // [readBuffer] must be direct, little-endian, and large enough to hold
+    // one full output-ring drain.
+    fun create(
+        sampleRateIn: Int,
+        channelCountIn: Int,
+        expectedFramesIn: Long,
+        sourceRingCapacityFrames: Int,
+        outputRingCapacityFrames: Int,
+        maxFramesPerMix: Int,
+        readBuffer: ByteBuffer,
+    ) {
+        if (handle != 0L) throw Failure("native_session_already_created")
+        if (maxFramesPerMix <= 0) throw Failure("invalid_config_max_frames_per_mix")
+        sampleRate = sampleRateIn
+        channelCount = channelCountIn
+        bytesPerFrame = 2 * channelCountIn
+        srcCap = sourceRingCapacityFrames.toLong()
+        outCap = outputRingCapacityFrames.toLong()
+        mfpm = maxFramesPerMix.toLong()
+        expectedFrames = expectedFramesIn
+        if (outCap % mfpm != 0L) throw Failure("invalid_config_output_ring_alignment")
+        if (expectedFrames <= 0L || expectedFrames % mfpm != 0L) {
+            throw Failure("invalid_config_expected_frames_alignment")
+        }
+        // Frozen X3 geometry per source ring (also validated fail-closed in
+        // native).
+        if (srcCap < outCap + 2L * mfpm) {
+            throw Failure("invalid_config_source_ring_geometry")
+        }
+        if (!readBuffer.isDirect) throw Failure("read_buffer_not_direct")
+        if (readBuffer.order() != ByteOrder.LITTLE_ENDIAN) {
+            throw Failure("read_buffer_not_little_endian")
+        }
+        if (readBuffer.capacity() < outputRingCapacityFrames * bytesPerFrame) {
+            throw Failure("read_buffer_too_small")
+        }
+        handle = VanguardNativeBridge.createAsyncRuntimeQueueMultiSourceRealtimeClockSession(
+            sampleRateIn, channelCountIn, expectedFramesIn,
+            sourceRingCapacityFrames, outputRingCapacityFrames, maxFramesPerMix,
+        )
+        if (handle == 0L) throw Failure("native_session_create_failed")
+        readBuf = readBuffer
+        val snapBoot = awaitSnapshot("worker_started") { it["workerStarted"] == "true" }
+        if (snapBoot["workerThreadDistinct"] != "true") {
+            throw Failure("worker_thread_not_distinct")
+        }
+        if (longField(snapBoot, "ownerDispatchCalls") != 0L) {
+            throw Failure("owner_dispatch_calls_nonzero_at_boot")
+        }
+        if (snapBoot["noCallerSuppliedNativeTime"] != "true") {
+            throw Failure("caller_supplied_native_time_token_missing")
+        }
+        if (longField(snapBoot, "routedSourceCount") != 2L ||
+            snapBoot["routedSourceId0"] != "async_rtclock_ms_src0" ||
+            snapBoot["routedSourceId1"] != "async_rtclock_ms_src1" ||
+            snapBoot["nodeOwnsRingTrack0"] != "true" ||
+            snapBoot["nodeOwnsRingTrack1"] != "true"
+        ) {
+            throw Failure("node_owned_two_track_topology_not_proven")
+        }
+        workerOwnershipAtBootOk = true
+        nodeOwnedTopologyOk = true
+    }
+
+    // Enqueues the start command (no time value crosses JNI: the worker
+    // reads steady_clock itself), waits for the worker to execute it, and
+    // consumes the output-ring start ack (frame 0, zero discards). The
+    // driver must have ingested the lockstep pre-start source fill quota
+    // (on min(accepted0, accepted1)) first so BOTH decodes stay ahead of
+    // the realtime clock.
+    fun startAndConsumeAck() {
+        val kv = parseNative(
+            VanguardNativeBridge.startAsyncRuntimeQueueMultiSourceRealtimeClock(handle)
+        )
+        if (kv["status"] != "enqueued") throw Failure("start_not_enqueued_${kv["status"]}")
+        val seq = ++nextCommandSeq
+        if (longField(kv, "commandSeq") != seq) throw Failure("start_command_seq_mismatch")
+        val snap = awaitCommandProcessed(seq)
+        if (snap["started"] != "true") throw Failure("start_state_mismatch")
+        val ack = ackOnlyRead()
+        if (ack["seekAckConsumed"] != "true" ||
+            longField(ack, "newStartFrame") != 0L ||
+            longField(ack, "discardedFramesOnSeek") != 0L
+        ) {
+            throw Failure("start_ack_not_consumed_cleanly")
+        }
+    }
+
+    // ── Ingest (owner is BOTH source rings' producer; lockstep pacing is
+    // owned by the pump) ─────────────────────────────────────────────────────
+
+    // One ingest of [frames] frames held at byte offset 0 of [pcm] into
+    // track [track]'s node-owned writer. The pump streams the Kotlin
+    // reference checksums BEFORE handing a chunk here, so this wrapper
+    // folds only the native-side per-track accounting.
+    fun ingestTrackOnce(track: Int, pcm: ByteBuffer, frames: Int): IngestReply {
+        checkDeadline()
+        if (track != 0 && track != 1) throw Failure("ingest_invalid_track_index")
+        if (frames <= 0) throw Failure("ingest_invalid_frame_count")
+        if (frames.toLong() > NATIVE_MAX_INGEST_FRAMES) {
+            throw Failure("ingest_chunk_exceeds_native_clamp")
+        }
+        if (frames.toLong() * bytesPerFrame > pcm.capacity()) {
+            throw Failure("ingest_chunk_exceeds_buffer")
+        }
+        val kv = parseNative(
+            VanguardNativeBridge.ingestAsyncRuntimeQueueMultiSourceRealtimeClockPcm16(
+                handle, track, pcm, frames,
+            )
+        )
+        if (kv["status"] != "ok") throw Failure("ingest_status_${kv["status"]}")
+        val accepted = longField(kv, "framesAccepted")
+        val writerStatus = kv["writerStatus"] ?: ""
+        when (writerStatus) {
+            "ok", "partial_write", "ring_full" -> {}
+            else -> throw Failure("unexpected_writer_status_$writerStatus")
+        }
+        totalFramesAcceptedTrack[0] = longField(kv, "totalFramesAcceptedTrack0")
+        totalFramesAcceptedTrack[1] = longField(kv, "totalFramesAcceptedTrack1")
+        nativeAcceptedChecksumHexTrack[track] = kv["nativeAcceptedChecksumHex"] ?: ""
+        writerBackpressureRejects = longField(kv, "writerBackpressureRejects")
+        return IngestReply(accepted, writerStatus, writerBackpressureRejects)
+    }
+
+    // ── Output reads (owner is the output-ring consumer; every destructive
+    // read hands its frames to the driver sink before any further native
+    // call) ─────────────────────────────────────────────────────────────────
+
+    private fun readOnce(maxFrames: Int): Map<String, String> {
+        checkDeadline()
+        val buf = readBuf ?: throw Failure("read_before_create")
+        val kv = parseNative(
+            VanguardNativeBridge.readAsyncRuntimeQueueMultiSourceRealtimeClockOutputPcm16(
+                handle, buf, maxFrames,
+            )
+        )
+        if (kv["status"] != "ok") throw Failure("read_status_${kv["status"]}")
+        totalOutputFramesRead = longField(kv, "totalOutputFramesRead")
+        nativeOutputReadChecksumHex = kv["nativeOutputReadChecksumHex"] ?: ""
+        val framesRead = longField(kv, "framesRead")
+        if (framesRead > 0L) {
+            outputSink.onOutputFramesRead(framesRead)
+        }
+        return kv
+    }
+
+    // Ack-only read (maxFrames == 0): consumes a pending start/seek output
+    // ack without popping frames, so the sink is never invoked.
+    fun ackOnlyRead(): Map<String, String> = readOnce(0)
+
+    fun drainAvailableOutput(): Long =
+        longField(readOnce(outCap.toInt()), "framesRead")
+
+    fun drainUntilRead(targetTotal: Long) {
+        while (true) {
+            val kv = readOnce(outCap.toInt())
+            if (longField(kv, "totalOutputFramesRead") >= targetTotal) return
+            if (longField(kv, "framesRead") == 0L) {
+                Thread.sleep(POLL_SLEEP_MS)
+            }
+            checkDeadline()
+        }
+    }
+
+    // ── Forward joint seek at the aligned accepted-frame boundary
+    // (pre-EOS, both tracks re-anchored at one accepted frame cursor) ───────
+
+    // The seek target IS the current lockstep accepted frame count, which
+    // must be window-aligned, equal across both tracks, fully dispatched,
+    // and fully read. After quiescence and the full boundary drain,
+    // [onQuiescentBeforeSeek] runs exactly once (the X4 driver
+    // pauses/flushes its AudioTrack sink there, with zero staged residual
+    // frames guaranteed by the sink callback contract); only then is the
+    // native joint seek enqueued (no time value crosses JNI) and awaited.
+    // The pending OUTPUT ack is deliberately NOT consumed here: the driver
+    // prefills both post-seek source rings first and then calls
+    // [consumeSeekAckAndReanchor]. Transient seek statuses are
+    // waited/retried under a bounded budget; every other status (including
+    // seek_track_frame_axis_divergence and both
+    // seek_target_behind_writer_trackN tokens) fails closed.
+    fun seekAtQuiescentBoundary(onQuiescentBeforeSeek: () -> Unit): Long {
+        val target = totalFramesAcceptedTrack[0]
+        if (target <= 0L || target % mfpm != 0L) throw Failure("seek_boundary_not_aligned")
+        if (totalFramesAcceptedTrack[1] != target) {
+            throw Failure("seek_boundary_lockstep_mismatch")
+        }
+        awaitSnapshotDraining("seek_quiescent") {
+            longField(it, "totalFramesPushed") == target &&
+                longField(it, "sourceAvailableReadFramesTrack0") == 0L &&
+                longField(it, "sourceAvailableReadFramesTrack1") == 0L
+        }
+        drainUntilRead(target)
+        onQuiescentBeforeSeek()
+        val seekPtsUs = ceilDiv(target * 1_000_000L, sampleRate.toLong())
+        var attempts = 0
+        while (true) {
+            checkDeadline()
+            if (++attempts > MAX_SEEK_TRANSIENT_RETRIES) {
+                throw Failure("seek_transient_retry_budget_exhausted")
+            }
+            val kv = parseNative(
+                VanguardNativeBridge.seekAsyncRuntimeQueueMultiSourceRealtimeClock(
+                    handle, seekPtsUs,
+                )
+            )
+            when (kv["status"]) {
+                "enqueued" -> {
+                    if (longField(kv, "targetFrame") != target) {
+                        throw Failure("seek_target_frame_mismatch")
+                    }
+                    val seq = ++nextCommandSeq
+                    if (longField(kv, "commandSeq") != seq) {
+                        throw Failure("seek_command_seq_mismatch")
+                    }
+                    awaitCommandProcessed(seq)
+                    seekTargetFrame = target
+                    return target
+                }
+                // The boundary drain already emptied the output ring; an
+                // undrained ring here means the quiescence claim was false.
+                "seek_output_ring_not_drained" ->
+                    throw Failure("seek_output_not_drained_after_quiescence")
+                // Bounded wait/retry transients (per-track suffixed).
+                "seek_pending_commands",
+                "seek_source_ring_not_empty_track0",
+                "seek_source_ring_not_empty_track1",
+                "seek_source_ack_pending_track0",
+                "seek_source_ack_pending_track1",
+                "seek_output_ack_pending" -> Thread.sleep(POLL_SLEEP_MS)
+                // Everything else (seek_track_frame_axis_divergence,
+                // behind_cursor, behind_writer_track0/1,
+                // writer_seek_rejected_track0/1, seek_rejected_eos,
+                // timing_window_unavailable via awaitCommandProcessed, and
+                // the per-track ack missing/mismatch tokens) fails closed.
+                else -> throw Failure("seek_status_${kv["status"]}")
+            }
+        }
+    }
+
+    // Consumes the pending output-ring seek ack (ack-only read) after the
+    // post-seek lockstep source prefill: the ack must land at exactly the
+    // seek target frame with zero discarded frames.
+    fun consumeSeekAckAndReanchor() {
+        if (seekTargetFrame < 0L) throw Failure("seek_ack_without_seek")
+        val ack = ackOnlyRead()
+        if (ack["seekAckConsumed"] != "true" ||
+            longField(ack, "newStartFrame") != seekTargetFrame ||
+            longField(ack, "discardedFramesOnSeek") != 0L
+        ) {
+            throw Failure("seek_ack_not_consumed_cleanly")
+        }
+        seekReanchorOk = true
+    }
+
+    // ── Timeline completion + joint writer-local EOS (zero-fill forbidden) ──
+
+    // Awaits the exact expected-frame timeline completion, drains the last
+    // output, then sets the JOINT writer-local EOS (one entry point, both
+    // writers). Because the timeline is already complete, the worker has no
+    // remaining window to dispatch, so provider zero-fill cannot occur on
+    // either track; any observed zero-fill fails closed to keep the
+    // identity checksums pure.
+    fun completeTimelineAndSetEos() {
+        awaitSnapshotDraining("timeline_complete") {
+            it["timelineComplete"] == "true" &&
+                longField(it, "totalFramesPushed") == expectedFrames
+        }
+        drainUntilRead(expectedFrames)
+        val kv = parseNative(
+            VanguardNativeBridge.setAsyncRuntimeQueueMultiSourceRealtimeClockEos(handle)
+        )
+        if (kv["status"] != "ok" || kv["eosTrack0"] != "true" || kv["eosTrack1"] != "true") {
+            throw Failure("eos_set_failed_${kv["status"]}")
+        }
+        val snap = awaitSnapshot("post_eos_quiescent") {
+            longField(it, "outputAvailableReadFrames") == 0L
+        }
+        if (longField(snap, "providerFramesZeroFilledTrack0") != 0L ||
+            longField(snap, "providerFramesZeroFilledTrack1") != 0L
+        ) {
+            throw Failure("zero_fill_leaked_into_identity")
+        }
+    }
+
+    // ── Snapshot / lifecycle verdicts ───────────────────────────────────────
+
+    fun finalSnapshot(): Map<String, String> = snapshot()
+
+    // Destroy joins the worker (never detaches); second destroy and
+    // post-destroy snapshot must both report not_found.
+    fun destroyAndVerifyLifecycle(): Pair<Boolean, Boolean> {
+        if (handle == 0L) throw Failure("lifecycle_no_handle")
+        val h = handle
+        val destroyKv = parseStatus(
+            VanguardNativeBridge.destroyAsyncRuntimeQueueMultiSourceRealtimeClockSession(h)
+        )
+        handle = 0L
+        val joinOk = destroyKv["status"] == "ok" &&
+            destroyKv["workerJoined"] == "true" &&
+            destroyKv["workerExited"] == "true" &&
+            longField(destroyKv, "joinCount") == 1L
+        val againKv = parseStatus(
+            VanguardNativeBridge.destroyAsyncRuntimeQueueMultiSourceRealtimeClockSession(h)
+        )
+        val snapKv = parseStatus(
+            VanguardNativeBridge.snapshotAsyncRuntimeQueueMultiSourceRealtimeClock(h)
+        )
+        val idempotentOk = againKv["status"] == "not_found" &&
+            snapKv["status"] == "not_found"
+        return joinOk to idempotentOk
+    }
+
+    // Finally-safe: destroys the native session (joining its worker) if the
+    // run failed before destroyAndVerifyLifecycle() zeroed the handle.
+    fun cleanup() {
+        if (handle != 0L) {
+            try {
+                VanguardNativeBridge.destroyAsyncRuntimeQueueMultiSourceRealtimeClockSession(handle)
+            } catch (_: Throwable) {}
+            handle = 0L
+        }
+    }
+
+    // ── Internals ───────────────────────────────────────────────────────────
+
+    private fun checkDeadline() {
+        if (SystemClock.elapsedRealtime() > deadlineElapsedRealtimeMs) {
+            throw Failure("deadline_exceeded")
+        }
+    }
+
+    private fun ceilDiv(a: Long, b: Long): Long = (a + b - 1) / b
+
+    private fun snapshot(): Map<String, String> {
+        checkDeadline()
+        val kv = parseNative(
+            VanguardNativeBridge.snapshotAsyncRuntimeQueueMultiSourceRealtimeClock(handle)
+        )
+        if (kv["status"] != "ok") throw Failure("snapshot_status_${kv["status"]}")
+        snapCommandsEnqueued = longField(kv, "commandsEnqueued")
+        snapCommandsProcessed = longField(kv, "commandsProcessed")
+        snapCommandErrors = longField(kv, "commandErrors")
+        snapLastCommandSeq = longField(kv, "lastCommandSeq")
+        snapQueueDepth = longField(kv, "queueDepth")
+        snapDispatchCount = longField(kv, "dispatchCount")
+        snapOkCount = longField(kv, "okCount")
+        snapSilenceCount = longField(kv, "silenceCount")
+        snapBackpressureCount = longField(kv, "backpressureCount")
+        snapSchedulerErrorCount = longField(kv, "schedulerErrorCount")
+        snapWorkerDispatchAnomalies = longField(kv, "workerDispatchAnomalies")
+        snapNonMonotonicTimeAnomalies = longField(kv, "nonMonotonicTimeAnomalies")
+        snapWorkerNoFramesDueWaits = longField(kv, "workerNoFramesDueWaits")
+        snapWorkerStarvedWaits = longField(kv, "workerStarvedWaits")
+        for (track in 0..1) {
+            snapProviderUnderrunEventsTrack[track] =
+                longField(kv, "providerUnderrunEventsTrack$track")
+            snapProviderFramesZeroFilledTrack[track] =
+                longField(kv, "providerFramesZeroFilledTrack$track")
+            snapProviderForwardSkipFramesTrack[track] =
+                longField(kv, "providerForwardSkipFramesTrack$track")
+            snapProviderRewindRejectsTrack[track] =
+                longField(kv, "providerRewindRejectsTrack$track")
+        }
+        snapTotalFramesRendered = longField(kv, "totalFramesRendered")
+        snapTotalFramesPushed = longField(kv, "totalFramesPushed")
+        snapOwnerDispatchCalls = longField(kv, "ownerDispatchCalls")
+        snapWorkerThreadDistinct = kv["workerThreadDistinct"] == "true"
+        snapTerminal = kv["terminal"] == "true"
+        snapNoCallerSuppliedNativeTime = kv["noCallerSuppliedNativeTime"] == "true"
+        snapWorkerOwnsMonotonicClock = kv["workerOwnsMonotonicClock"] == "true"
+        snapRoutedSourceCount = longField(kv, "routedSourceCount")
+        snapNativeTimingF0 = longField(kv, "nativeTimingF0")
+        snapNativeTimingF1 = longField(kv, "nativeTimingF1")
+        snapNativeRealtimeElapsedMs = longField(kv, "nativeRealtimeElapsedMs")
+        snapRealtimeElapsedOk = kv["realtimeElapsedOk"] == "true"
+        snapMaxRenderCursorBacklogUs = longField(kv, "maxRenderCursorBacklogUs")
+        snapRealtimeBacklogBoundOk = kv["realtimeBacklogBoundOk"] == "true"
+        snapBacklogSampleCount = longField(kv, "backlogSampleCount")
+        snapClockDriftSampleCount = longField(kv, "clockDriftSampleCount")
+        snapProofBoundary = kv["proofBoundary"] ?: ""
+        return kv
+    }
+
+    private fun awaitSnapshot(
+        what: String,
+        pred: (Map<String, String>) -> Boolean,
+    ): Map<String, String> {
+        while (true) {
+            val kv = snapshot()
+            if (pred(kv)) return kv
+            if (SystemClock.elapsedRealtime() > deadlineElapsedRealtimeMs) {
+                throw Failure("await_timeout_$what")
+            }
+            Thread.sleep(POLL_SLEEP_MS)
+        }
+    }
+
+    // Await variant that drains the output ring between polls so the
+    // realtime worker can never wedge on a full output ring while we wait
+    // for it to push a target frame count.
+    private fun awaitSnapshotDraining(
+        what: String,
+        pred: (Map<String, String>) -> Boolean,
+    ): Map<String, String> {
+        while (true) {
+            val kv = snapshot()
+            if (pred(kv)) return kv
+            if (SystemClock.elapsedRealtime() > deadlineElapsedRealtimeMs) {
+                throw Failure("await_timeout_$what")
+            }
+            if (drainAvailableOutput() == 0L) {
+                Thread.sleep(POLL_SLEEP_MS)
+            }
+        }
+    }
+
+    private fun awaitCommandProcessed(seq: Long): Map<String, String> {
+        val kv = awaitSnapshot("command_$seq") {
+            longField(it, "commandsProcessed") >= seq
+        }
+        if (longField(kv, "lastCommandSeq") != seq ||
+            kv["lastCommandResult"] != "ok" ||
+            longField(kv, "commandErrors") != 0L
+        ) {
+            throw Failure("command_${seq}_failed_${kv["lastCommandResult"]}")
+        }
+        return kv
+    }
+
+    private fun parseNative(raw: String): Map<String, String> {
+        val kv = parseStatus(raw)
+        lastStatus = kv["status"] ?: ""
+        return kv
+    }
+
+    private fun parseStatus(raw: String): Map<String, String> =
+        raw.split(';').mapNotNull { part ->
+            val idx = part.indexOf('=')
+            if (idx <= 0) null else part.substring(0, idx) to part.substring(idx + 1)
+        }.toMap()
+
+    private fun longField(kv: Map<String, String>, key: String): Long =
+        kv[key]?.toLongOrNull() ?: throw Failure("missing_status_field_$key")
+}

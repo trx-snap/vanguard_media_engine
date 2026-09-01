@@ -885,6 +885,119 @@ class VanguardNativeBridge(
         external fun destroyAsyncRuntimeQueueRealtimeClockSession(
             handle: Long,
         ): String
+
+        // ── P4-AUDIO-ASYNC-RUNTIME-QUEUE-MULTI-SOURCE-REALTIME-CLOCK
+        // (sub-slice X4) —
+        // android_phase4_async_runtime_queue_multi_source_realtime_clock_jni.cpp.
+        // X3's async worker-owned steady_clock render/dispatch timebase
+        // composed with the TWO-SOURCE node-owned topology: two
+        // DecodedAudioPcmSourceNode instances (6-arg constructor) routed
+        // src0 -> primary_audio_in and src1 -> secondary_audio_in, with
+        // the GraphAudioScheduler auto-discovering both providers from
+        // graph topology only. Disjoint session registry/handle space from
+        // every other diagnostic TU. NO entry point below accepts a
+        // sysTimeNs argument: Kotlin never passes a time value into a
+        // control command, and no step/dispatch entry point exists. ────────
+
+        // Returns a handle (>0) or 0 on any validation/allocation failure
+        // (bad sample rate / channel count, expected frames out of range
+        // or not window-aligned, non-power-of-two rings,
+        // outputRingCapacityFrames < maxFramesPerMix, either source ring
+        // below outputRingCapacityFrames + 2*maxFramesPerMix, either node
+        // not owning its transport, a route that did not resolve to
+        // exactly [src0, src1], or any channel/sample-rate divergence
+        // across the rig) or when the 4-live-session registry cap is
+        // reached. The worker thread starts only after the rig validated.
+        external fun createAsyncRuntimeQueueMultiSourceRealtimeClockSession(
+            sampleRate: Int,
+            channelCount: Int,
+            expectedFrameCount: Long,
+            sourceRingCapacityFrames: Int,
+            outputRingCapacityFrames: Int,
+            maxFramesPerMix: Int,
+        ): Long
+
+        // Enqueue-only, no time argument (status=enqueued;commandSeq=N, or
+        // already_started / queue_full / not_found / wrong_owner_thread).
+        // The worker reads steady_clock itself and executes
+        // coordinator.start(0, now); the caller must then consume the
+        // output-ring seek ack via the read entry point before the worker
+        // can render its first window.
+        external fun startAsyncRuntimeQueueMultiSourceRealtimeClock(
+            handle: Long,
+        ): String
+
+        // Forward-only, quiescent-only JOINT seek with no time argument
+        // (fail closed with distinct per-track tokens otherwise): needs
+        // every prior command processed, the shared accepted-frame axis
+        // intact (nextDispatchFrame == accepted0 == accepted1), both
+        // node-owned source rings empty with settled acks, a drained
+        // output ring with a settled ack, no EOS, a completed native
+        // one-second timing window, and targetFrame >= each writer's
+        // cursor. The owner publishes BOTH writer seek requests; the
+        // worker verifies both ring acks are pending, consumes both
+        // (requiring both ack frames == target), and calls
+        // coordinator.seek(targetPtsUs, fresh steady_clock now); the
+        // caller must then consume the output-ring ack via read.
+        external fun seekAsyncRuntimeQueueMultiSourceRealtimeClock(
+            handle: Long,
+            targetPtsUs: Long,
+        ): String
+
+        // Owner-thread source-ring producer for ONE track through that
+        // track's NODE-OWNED writer. Accepted frames are clamped to
+        // min(frameCount, 8192, framesThatFitInBuffer); writer
+        // backpressure (ring_full/partial_write) is a reported outcome.
+        // The Kotlin pump keeps the two accepted totals in lockstep.
+        external fun ingestAsyncRuntimeQueueMultiSourceRealtimeClockPcm16(
+            handle: Long,
+            trackIndex: Int,
+            pcm: java.nio.ByteBuffer,
+            frameCount: Int,
+        ): String
+
+        // JOINT writer-local EOS: sets BOTH node-owned writers together
+        // (there is deliberately no per-track EOS route). The X4 driver
+        // sets it only after the exact expected timeline completed, so no
+        // zero-fill window remains.
+        external fun setAsyncRuntimeQueueMultiSourceRealtimeClockEos(
+            handle: Long,
+        ): String
+
+        // Owner-thread output-ring consumer: consumes a pending start/seek
+        // ack first (reporting discarded frames), then pops mixed PCM16
+        // into the direct ByteBuffer. maxFrames == 0 is a legal ack-only
+        // call.
+        external fun readAsyncRuntimeQueueMultiSourceRealtimeClockOutputPcm16(
+            handle: Long,
+            pcm: java.nio.ByteBuffer,
+            maxFrames: Int,
+        ): String
+
+        // Owner-thread-only. All coordinator/provider/worker/timing facts
+        // come from the worker-published mirror; includes the native
+        // one-second timing gate, the render-cursor backlog bound, the
+        // per-track provider poisoning counters
+        // (providerFramesZeroFilledTrackN, providerUnderrunEventsTrackN,
+        // providerForwardSkipFramesTrackN, providerRewindRejectsTrackN),
+        // per-track accepted totals/checksums, the auto-discovery route
+        // evidence (routedSourceCount, routedSourceId0/1,
+        // nodeOwnsRingTrack0/1), the structural
+        // noCallerSuppliedNativeTime/workerOwnsMonotonicClock tokens,
+        // ownerDispatchCalls=0, and the verbatim proof boundary. Built via
+        // the bounded StatusAppender; overflow fails closed with
+        // status=snapshot_overflow.
+        external fun snapshotAsyncRuntimeQueueMultiSourceRealtimeClock(
+            handle: Long,
+        ): String
+
+        // Any-thread, idempotent erase-once destroy: sets the stop flag,
+        // wakes the worker, and JOINS (never detaches) before replying
+        // with the race-free final counters. Second call / unknown handle
+        // returns status=not_found.
+        external fun destroyAsyncRuntimeQueueMultiSourceRealtimeClockSession(
+            handle: Long,
+        ): String
     }
 
     external fun probeCapabilities(): BackendCapabilityReport
