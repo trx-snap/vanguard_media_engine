@@ -339,22 +339,38 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
     // fade/ramp, no pause/resume, no OS arbitration correctness. ─────────
     final duckRestorePass = await _runFocusDuckRestoreSmoke();
 
+    // ── X9 (P4-AUDIO-FOCUS-LOSS-PAUSE-RESUME-RESPONSE): transient
+    // focus-loss pause (AudioTrack.pause() only, PLAYSTATE_PAUSED), same
+    // owner-thread-boundary focus-gain resume (play(), PLAYSTATE_PLAYING),
+    // and terminal becoming-noisy pause (pause() only, no auto-resume before
+    // release), applied by the driver owner thread from coordinator-enqueued
+    // synthetic events over the implied X7 focus/noisy handoff and 0.5 base
+    // gain. X8 duck/restore is NOT enabled. Sink-side playstate telemetry
+    // only: no acoustic audibility/speaker verification, no OS focus
+    // arbitration correctness, no transport/presentation pause, no
+    // pause/resume SLA, no route-change/dead-object recovery, no production
+    // restart policy. ───────────────────────────────────────────────────────
+    final focusLossPauseResumePass = await _runFocusLossPauseResumeSmoke();
+
     final allPass =
         pass &&
         envelopePass &&
         nonZeroGainPass &&
         focusNoisyPass &&
-        duckRestorePass;
+        duckRestorePass &&
+        focusLossPauseResumePass;
     if (mounted) {
       setState(() {
         _status = allPass
             ? 'PASS (X4 allNativeLanesPass=true, X5 envelope gates held, '
                   'X6 non-zero-gain gates held, X7 focus/noisy gates held, '
-                  'X8 duck/restore gates held)'
+                  'X8 duck/restore gates held, '
+                  'X9 focus-loss pause/resume gates held)'
             : 'FAIL: x4Pass=$pass, envelopePass=$envelopePass, '
                   'nonZeroGainPass=$nonZeroGainPass, '
                   'focusNoisyPass=$focusNoisyPass, '
                   'duckRestorePass=$duckRestorePass, '
+                  'focusLossPauseResumePass=$focusLossPauseResumePass, '
                   'lastError=${activeReport.lastError}, error=$topLevelError';
       });
     }
@@ -930,6 +946,183 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
           : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_DUCK_RESTORE_PHYSICAL_SMOKE_FAIL',
     );
     return duckRestorePass;
+  }
+
+  Future<bool> _runFocusLossPauseResumeSmoke() async {
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_LOSS_PAUSE_RESUME_SMOKE_START',
+    );
+
+    VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport? report;
+    String? topLevelError;
+    File? tempSourceFile;
+
+    try {
+      final clipBData = await rootBundle.load(
+        'assets/manual_test_clips/clip_B.mov',
+      );
+      final tempDir = Directory.systemTemp;
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+      tempSourceFile = File(
+        '${tempDir.path}/p4_async_rt_queue_focus_loss_pause_resume_source_$timestamp.mov',
+      );
+
+      await tempSourceFile.writeAsBytes(
+        clipBData.buffer.asUint8List(
+          clipBData.offsetInBytes,
+          clipBData.lengthInBytes,
+        ),
+        flush: true,
+      );
+
+      report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: tempSourceFile.path,
+            focusLossPauseResumeProofEnabled: true,
+            timeout: const Duration(seconds: 45),
+          ).timeout(const Duration(seconds: 55));
+    } on TimeoutException catch (te) {
+      topLevelError = 'timeout: $te';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_LOSS_PAUSE_RESUME_ERROR: $topLevelError',
+      );
+    } catch (e, st) {
+      topLevelError = '$e\n$st';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_LOSS_PAUSE_RESUME_ERROR: $topLevelError',
+      );
+    } finally {
+      if (tempSourceFile != null) {
+        try {
+          if (await tempSourceFile.exists()) {
+            await tempSourceFile.delete();
+          }
+        } catch (_) {}
+      }
+    }
+
+    final prReport =
+        report ??
+        VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+          <String, Object?>{
+            'pass': false,
+            'status': 'fail',
+            'marker': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .focusLossPauseResumeFailMarkerConstant,
+            'proofBoundary': '',
+            'nativeProofBoundary': '',
+            'failureReason': 'invocation_failed',
+            'lastError': 'invocation_failed',
+          },
+        );
+
+    // Focus-Loss Pause/Resume Response group. Sink-side AudioTrack playstate
+    // telemetry only: transient loss -> pause() -> PAUSED; focus gain (same
+    // owner-thread boundary) -> play() -> PLAYING; becoming-noisy (terminal
+    // EOS point) -> pause() -> PAUSED, held until release. Applied-event
+    // sequence is a monotonic ordinal, not a drain-pass index.
+    print(
+      '  [LANE] Focus-Loss Pause/Resume Response: '
+      'focusLossPauseResumeProofEnabled=${prReport.focusLossPauseResumeProofEnabled}, '
+      'focusDuckRestoreProofEnabled=${prReport.focusDuckRestoreProofEnabled}, '
+      'focusLossPauseOk=${prReport.focusLossPauseOk}, '
+      'focusGainResumeOk=${prReport.focusGainResumeOk}, '
+      'becomingNoisyPauseOk=${prReport.becomingNoisyPauseOk}, '
+      'terminalPlayStatePausedBeforeReleaseOk=${prReport.terminalPlayStatePausedBeforeReleaseOk}, '
+      'syntheticTransientLossPosted=${prReport.syntheticTransientLossPosted}, '
+      'syntheticFocusGainPosted=${prReport.syntheticFocusGainPosted}, '
+      'syntheticBecomingNoisyPosted=${prReport.syntheticBecomingNoisyPosted}, '
+      'transientLossEventsEnqueued=${prReport.transientLossEventsEnqueued}, '
+      'focusGainEventsEnqueued=${prReport.focusGainEventsEnqueued}, '
+      'becomingNoisyEventsEnqueued=${prReport.becomingNoisyEventsEnqueued}, '
+      'transientLossEventsDrained=${prReport.transientLossEventsDrained}, '
+      'focusGainEventsDrained=${prReport.focusGainEventsDrained}, '
+      'becomingNoisyEventsDrained=${prReport.becomingNoisyEventsDrained}, '
+      'focusLossPauseResumeEventsDropped=${prReport.focusLossPauseResumeEventsDropped}, '
+      'transientLossAppliedCount=${prReport.transientLossAppliedCount}, '
+      'focusGainAppliedCount=${prReport.focusGainAppliedCount}, '
+      'becomingNoisyAppliedCount=${prReport.becomingNoisyAppliedCount}, '
+      'transientPauseApplySeq=${prReport.transientPauseApplySeq}, '
+      'focusGainResumeApplySeq=${prReport.focusGainResumeApplySeq}, '
+      'noisyPauseApplySeq=${prReport.noisyPauseApplySeq}, '
+      'audioTrackGain=${prReport.audioTrackGain}, '
+      'focusLossPauseResumeGatesHeld=${prReport.focusLossPauseResumeGatesHeld}, '
+      'focusNoisyEventHandoffGatesHeld=${prReport.focusNoisyEventHandoffGatesHeld}, '
+      'hasCanonicalProofBoundary=${prReport.hasCanonicalProofBoundary}, '
+      'allNativeLanesPass=${prReport.allNativeLanesPass}, '
+      'marker=${prReport.marker}, '
+      'lastError=${prReport.lastError}',
+    );
+
+    final lastErrorOk =
+        prReport.lastError.isEmpty ||
+        prReport.lastError == 'none' ||
+        prReport.lastError == 'null';
+
+    final focusLossPauseResumePass =
+        (topLevelError == null) &&
+        prReport.pass &&
+        prReport.marker ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .focusLossPauseResumePassMarkerConstant &&
+        prReport.focusLossPauseResumeProofEnabled &&
+        !prReport.focusDuckRestoreProofEnabled &&
+        prReport.focusLossPauseResumeGatesHeld &&
+        prReport.focusLossPauseOk &&
+        prReport.focusGainResumeOk &&
+        prReport.becomingNoisyPauseOk &&
+        prReport.terminalPlayStatePausedBeforeReleaseOk &&
+        prReport.syntheticTransientLossPosted == 1 &&
+        prReport.syntheticFocusGainPosted == 1 &&
+        prReport.syntheticBecomingNoisyPosted == 1 &&
+        prReport.transientLossEventsEnqueued == 1 &&
+        prReport.focusGainEventsEnqueued == 1 &&
+        prReport.becomingNoisyEventsEnqueued == 1 &&
+        prReport.transientLossEventsDrained == 1 &&
+        prReport.focusGainEventsDrained == 1 &&
+        prReport.becomingNoisyEventsDrained == 1 &&
+        prReport.focusLossPauseResumeEventsDropped == 0 &&
+        prReport.transientLossAppliedCount == 1 &&
+        prReport.focusGainAppliedCount == 1 &&
+        prReport.becomingNoisyAppliedCount == 1 &&
+        prReport.transientPauseApplySeq >= 0 &&
+        prReport.focusGainResumeApplySeq > prReport.transientPauseApplySeq &&
+        prReport.noisyPauseApplySeq > prReport.focusGainResumeApplySeq &&
+        prReport.focusNoisyEventHandoffGatesHeld &&
+        prReport.hasCanonicalProofBoundary &&
+        prReport.proofBoundary ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .focusLossPauseResumeProofBoundaryConstant &&
+        prReport.nativeProofBoundaryOk &&
+        prReport.checksumsMatch &&
+        prReport.providerCountersClean &&
+        prReport.sinkAccountingBalanced &&
+        prReport.realtimeGatesHeld &&
+        prReport.allNativeLanesPass &&
+        lastErrorOk;
+
+    final summaryPayload = <String, dynamic>{
+      'unit':
+          'AndroidAsyncRuntimeQueueFocusLossPauseResumePhysicalSmokeHarness',
+      'slice': 'P4-AUDIO-FOCUS-LOSS-PAUSE-RESUME-RESPONSE',
+      'target': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .focusLossPauseResumeProofBoundaryConstant,
+      'nativeTarget': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .nativeProofBoundaryConstant,
+      'pass': focusLossPauseResumePass,
+      'report': prReport.toMap(),
+      'error': topLevelError,
+    };
+
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_LOSS_PAUSE_RESUME_JSON:${jsonEncode(summaryPayload)}',
+    );
+    print(
+      focusLossPauseResumePass
+          ? 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_LOSS_PAUSE_RESUME_PHYSICAL_SMOKE_PASS'
+          : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_LOSS_PAUSE_RESUME_PHYSICAL_SMOKE_FAIL',
+    );
+    return focusLossPauseResumePass;
   }
 
   @override

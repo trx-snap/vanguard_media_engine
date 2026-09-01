@@ -176,6 +176,16 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   static const String focusDuckRestoreFailMarkerConstant =
       'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_DUCK_RESTORE_PHYSICAL_SMOKE_FAIL';
 
+  /// Canonical pass marker emitted by the native harness for X9
+  /// focus-loss pause/resume response proof runs.
+  static const String focusLossPauseResumePassMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_LOSS_PAUSE_RESUME_PHYSICAL_SMOKE_PASS';
+
+  /// Canonical fail marker emitted by the native harness for X9
+  /// focus-loss pause/resume response proof runs.
+  static const String focusLossPauseResumeFailMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_LOSS_PAUSE_RESUME_PHYSICAL_SMOKE_FAIL';
+
   /// Canonical Kotlin driver proof boundary string (muted AudioTrack sink
   /// claim included) emitted by the native harness.
   static const String proofBoundaryConstant =
@@ -186,6 +196,15 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   /// nor no-focus.
   static const String focusDuckRestoreProofBoundaryConstant =
       'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_duck_restore_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_focus_duck_restore_setvolume_only_base_gain_0_5_duck_gain_0_1_restore_gain_0_5_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_restart_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
+
+  /// Canonical X9 focus-loss pause/resume Kotlin driver proof boundary
+  /// string. Replaces [proofBoundaryConstant] for X9 runs, which are neither
+  /// muted nor no-focus. Sink-side AudioTrack playstate proof only: no
+  /// acoustic audibility/speaker verification, no OS focus arbitration
+  /// correctness, no transport/presentation pause, no pause/resume SLA, no
+  /// route-change or dead-object recovery, no production restart policy.
+  static const String focusLossPauseResumeProofBoundaryConstant =
+      'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_loss_pause_resume_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_play_only_base_gain_0_5_transient_loss_pause_focus_gain_play_becoming_noisy_terminal_pause_no_flush_no_stop_no_auto_resume_before_release_no_transport_pause_no_presentation_pause_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_sla_no_production_restart_policy_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
 
   /// Canonical native TU proof boundary string (NO native sink claim)
   /// observed via the snapshot and echoed by the harness.
@@ -604,7 +623,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       _boolFact('audioTrackNonZeroGainSetOk');
 
   /// X6 non-zero-gain sink proof gate.
-  /// In X6 mode (and X8 mode, which implies the non-zero 0.5 base gain):
+  /// In X6 mode (and X8/X9 modes, which imply the non-zero 0.5 base gain):
   /// requires gain set OK, gain > 0.0 and <= 1.0.
   /// In default X4/X5/X7 mode: requires gain NOT set and gain == 0.0,
   /// proving muted behavior was preserved.
@@ -612,7 +631,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   /// latency/glitch/xrun, no A/V sync, no route-change, no dead-object
   /// recovery, no product/editor/export/iOS.
   bool get nonZeroGainSinkGatesHeld {
-    if (!nonZeroGainSinkProofEnabled && !focusDuckRestoreProofEnabled) {
+    if (!nonZeroGainSinkProofEnabled &&
+        !focusDuckRestoreProofEnabled &&
+        !focusLossPauseResumeProofEnabled) {
       return !audioTrackNonZeroGainSetOk && audioTrackGain == 0.0;
     }
     return audioTrackNonZeroGainSetOk &&
@@ -798,11 +819,141 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
         gainEventsDrained == 1;
   }
 
+  // ── X9 focus-loss pause/resume response proof getters ─────────────────────
+
+  /// Whether this run executed the X9 focus-loss pause/resume response proof
+  /// mode (false for every default X4/X5/X6/X7/X8 run). X9 implies the X7
+  /// focus/noisy handoff and the non-zero 0.5 base gain, but NOT X8.
+  bool get focusLossPauseResumeProofEnabled =>
+      _boolFact('focusLossPauseResumeProofEnabled');
+
+  /// Whether the owner thread applied AudioTrack.pause() for the synthetic
+  /// transient focus loss and observed PLAYSTATE_PAUSED (sink-side playstate
+  /// telemetry only; no transport/presentation pause, no OS arbitration
+  /// correctness, no pause/resume SLA claim).
+  bool get focusLossPauseOk => _boolFact('focusLossPauseOk');
+
+  /// Whether the owner thread applied AudioTrack.play() for the synthetic
+  /// focus gain at the same owner-thread boundary and observed
+  /// PLAYSTATE_PLAYING (sink-side playstate telemetry only).
+  bool get focusGainResumeOk => _boolFact('focusGainResumeOk');
+
+  /// Whether the owner thread applied AudioTrack.pause() for the synthetic
+  /// becoming-noisy event at the terminal EOS point and observed
+  /// PLAYSTATE_PAUSED, with no auto-resume before release.
+  bool get becomingNoisyPauseOk => _boolFact('becomingNoisyPauseOk');
+
+  /// Whether the AudioTrack playstate observed at release (after the
+  /// terminal becoming-noisy pause) was PLAYSTATE_PAUSED.
+  bool get terminalPlayStatePausedBeforeReleaseOk =>
+      _boolFact('terminalPlayStatePausedBeforeReleaseOk');
+
+  /// Synthetic transient focus-loss events posted (and awaited) before the
+  /// driver started in X9 mode; must be exactly 1 (0 in other modes).
+  int get syntheticTransientLossPosted =>
+      _intFact('syntheticTransientLossPosted');
+
+  /// Synthetic focus-gain events enqueued directly by the driver-invoked
+  /// plane callback in X9 mode; must be exactly 1 (0 in other modes).
+  int get syntheticFocusGainPosted => _intFact('syntheticFocusGainPosted');
+
+  /// Synthetic becoming-noisy events enqueued after the driver reported the
+  /// transient resume applied in X9 mode; must be exactly 1.
+  int get syntheticBecomingNoisyPosted =>
+      _intFact('syntheticBecomingNoisyPosted');
+
+  /// Transient-loss events enqueued into the typed X9 queue (must be 1).
+  int get transientLossEventsEnqueued =>
+      _intFact('transientLossEventsEnqueued', -1);
+
+  /// Focus-gain events enqueued into the typed X9 queue (must be 1).
+  int get focusGainEventsEnqueued => _intFact('focusGainEventsEnqueued', -1);
+
+  /// Becoming-noisy events enqueued into the typed X9 queue (must be 1).
+  int get becomingNoisyEventsEnqueued =>
+      _intFact('becomingNoisyEventsEnqueued', -1);
+
+  /// Transient-loss events drained by the owner thread (must be 1).
+  int get transientLossEventsDrained =>
+      _intFact('transientLossEventsDrained', -1);
+
+  /// Focus-gain events drained by the owner thread (must be 1).
+  int get focusGainEventsDrained => _intFact('focusGainEventsDrained', -1);
+
+  /// Becoming-noisy events drained by the owner thread (must be 1).
+  int get becomingNoisyEventsDrained =>
+      _intFact('becomingNoisyEventsDrained', -1);
+
+  /// X9 events dropped due to queue overflow; must be 0 for proof.
+  int get focusLossPauseResumeEventsDropped =>
+      _intFact('focusLossPauseResumeEventsDropped');
+
+  /// Times the owner thread applied the transient-loss pause (must be 1).
+  int get transientLossAppliedCount =>
+      _intFact('transientLossAppliedCount', -1);
+
+  /// Times the owner thread applied the focus-gain resume (must be 1).
+  int get focusGainAppliedCount => _intFact('focusGainAppliedCount', -1);
+
+  /// Times the owner thread applied the becoming-noisy pause (must be 1).
+  int get becomingNoisyAppliedCount =>
+      _intFact('becomingNoisyAppliedCount', -1);
+
+  /// Monotonic applied-event sequence at which the transient pause was
+  /// applied (-1 if never). Applied-event ordinal, not a drain-pass index.
+  int get transientPauseApplySeq => _intFact('transientPauseApplySeq', -1);
+
+  /// Monotonic applied-event sequence at which the focus-gain resume was
+  /// applied (-1 if never); must be strictly after [transientPauseApplySeq].
+  int get focusGainResumeApplySeq => _intFact('focusGainResumeApplySeq', -1);
+
+  /// Monotonic applied-event sequence at which the becoming-noisy pause was
+  /// applied (-1 if never); must be strictly after [focusGainResumeApplySeq].
+  int get noisyPauseApplySeq => _intFact('noisyPauseApplySeq', -1);
+
+  /// X9 focus-loss pause/resume response gate.
+  /// In X9 mode: exactly one synthetic transient loss / focus gain /
+  /// becoming-noisy each posted, enqueued, drained, and applied; zero
+  /// dropped events; pause/resume/terminal-pause playstate assertions held;
+  /// applied sequence strictly ordered transient < gain < noisy; and the
+  /// terminal playstate before release was PAUSED. Sink-side playstate
+  /// telemetry only: no acoustic audibility/speaker verification, no OS
+  /// focus arbitration correctness, no transport/presentation pause, no
+  /// pause/resume SLA, no route-change/dead-object recovery, no production
+  /// restart policy.
+  /// In default X4/X5/X6/X7/X8 mode: vacuously true (backward compatible).
+  bool get focusLossPauseResumeGatesHeld {
+    if (!focusLossPauseResumeProofEnabled) return true;
+    return focusLossPauseOk &&
+        focusGainResumeOk &&
+        becomingNoisyPauseOk &&
+        syntheticTransientLossPosted == 1 &&
+        syntheticFocusGainPosted == 1 &&
+        syntheticBecomingNoisyPosted == 1 &&
+        transientLossEventsEnqueued == 1 &&
+        focusGainEventsEnqueued == 1 &&
+        becomingNoisyEventsEnqueued == 1 &&
+        transientLossEventsDrained == 1 &&
+        focusGainEventsDrained == 1 &&
+        becomingNoisyEventsDrained == 1 &&
+        focusLossPauseResumeEventsDropped == 0 &&
+        transientLossAppliedCount == 1 &&
+        focusGainAppliedCount == 1 &&
+        becomingNoisyAppliedCount == 1 &&
+        transientPauseApplySeq >= 0 &&
+        focusGainResumeApplySeq > transientPauseApplySeq &&
+        noisyPauseApplySeq > focusGainResumeApplySeq &&
+        terminalPlayStatePausedBeforeReleaseOk;
+  }
+
   /// Whether [proofBoundary] matches the canonical Kotlin driver boundary
   /// for this run's mode. X8 runs must carry the mode-specific
-  /// [focusDuckRestoreProofBoundaryConstant] — never the default boundary,
-  /// whose muted/no-focus claims would be false for X8.
-  bool get hasCanonicalProofBoundary => focusDuckRestoreProofEnabled
+  /// [focusDuckRestoreProofBoundaryConstant] and X9 runs the mode-specific
+  /// [focusLossPauseResumeProofBoundaryConstant] — never the default
+  /// boundary, whose muted/no-focus claims would be false for X8/X9.
+  bool get hasCanonicalProofBoundary => focusLossPauseResumeProofEnabled
+      ? proofBoundary == focusLossPauseResumeProofBoundaryConstant
+      : focusDuckRestoreProofEnabled
       ? proofBoundary == focusDuckRestoreProofBoundaryConstant
       : proofBoundary == proofBoundaryConstant;
 
@@ -872,7 +1023,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       pass &&
       status.toLowerCase() == 'pass' &&
       marker ==
-          (focusDuckRestoreProofEnabled
+          (focusLossPauseResumeProofEnabled
+              ? focusLossPauseResumePassMarkerConstant
+              : focusDuckRestoreProofEnabled
               ? focusDuckRestorePassMarkerConstant
               : focusNoisyEventHandoffProofEnabled
               ? focusNoisyEventHandoffPassMarkerConstant
@@ -891,6 +1044,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       focusDuckRestoreGatesHeld &&
       (!focusDuckRestoreProofEnabled ||
           _boolFact('focusDuckRestoreGatesHeld')) &&
+      focusLossPauseResumeGatesHeld &&
+      (!focusLossPauseResumeProofEnabled ||
+          _boolFact('focusLossPauseResumeGatesHeld')) &&
       hasCanonicalProofBoundary &&
       nativeProofBoundaryOk &&
       formatProbeOk &&
@@ -910,6 +1066,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       audioTrackInitOk &&
       (nonZeroGainSinkProofEnabled ||
           focusDuckRestoreProofEnabled ||
+          focusLossPauseResumeProofEnabled ||
           mutedOutputOk) &&
       playbackHeadTelemetryOk &&
       realtimeNativeElapsedOk &&
@@ -1337,6 +1494,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
     bool nonZeroGainSinkProofEnabled = false,
     bool focusNoisyEventHandoffProofEnabled = false,
     bool focusDuckRestoreProofEnabled = false,
+    bool focusLossPauseResumeProofEnabled = false,
     Duration? timeout,
     MethodChannel? channel,
   }) async {
@@ -1365,6 +1523,12 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       // X4/X5/X6/X7 argument shape stays frozen; the coordinator derives the
       // implied X7 focus/noisy handoff from this single flag.
       if (focusDuckRestoreProofEnabled) 'focusDuckRestoreProofEnabled': true,
+      // Only sent for X9 focus-loss pause/resume proof runs so the default
+      // X4..X8 argument shape stays frozen; the coordinator derives the
+      // implied X7 focus/noisy handoff from this single flag and never sets
+      // the X8 duck/restore flag.
+      if (focusLossPauseResumeProofEnabled)
+        'focusLossPauseResumeProofEnabled': true,
     };
     try {
       final future = ch.invokeMethod<Object?>(methodName, args);

@@ -99,6 +99,22 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // driver-drained on the owner thread, at most one per drain pass).
         const val X8_EVENT_DUCK = "duck"
         const val X8_EVENT_GAIN = "gain"
+        // X9 (P4-AUDIO-FOCUS-LOSS-PAUSE-RESUME-RESPONSE) markers, emitted only
+        // for focus-loss pause/resume proof runs; X4/X5/X6/X7/X8 markers
+        // remain authoritative for their respective modes.
+        const val FOCUS_LOSS_PAUSE_RESUME_PASS_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_LOSS_PAUSE_RESUME_PHYSICAL_SMOKE_PASS"
+        const val FOCUS_LOSS_PAUSE_RESUME_FAIL_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_LOSS_PAUSE_RESUME_PHYSICAL_SMOKE_FAIL"
+        // X9 typed synthetic event tags (coordinator-owned bounded queue,
+        // driver-drained on the owner thread only). The transient loss is
+        // enqueued pre-start; the focus gain is enqueued synchronously by the
+        // driver-invoked plane callback at the same owner-thread boundary; the
+        // becoming-noisy event is enqueued only after the driver reports the
+        // transient resume applied and is applied at the terminal EOS point.
+        const val X9_EVENT_TRANSIENT_LOSS = "transient_loss"
+        const val X9_EVENT_FOCUS_GAIN = "focus_gain"
+        const val X9_EVENT_BECOMING_NOISY = "becoming_noisy"
         const val PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_realtime_wall_clock_pacing_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_avsync_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
@@ -106,6 +122,16 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // focus-duck/restore runs, which are neither muted nor no-focus.
         const val FOCUS_DUCK_RESTORE_PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_duck_restore_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_focus_duck_restore_setvolume_only_base_gain_0_5_duck_gain_0_1_restore_gain_0_5_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_restart_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
+
+        // X9 mode-specific proof boundary: replaces the default boundary for
+        // focus-loss pause/resume runs, which are neither muted nor no-focus.
+        // Sink-side AudioTrack playstate proof only (pause()/play(), no
+        // flush/stop): no acoustic audibility or speaker verification, no OS
+        // focus arbitration correctness, no transport/presentation pause, no
+        // pause/resume SLA, no route-change or dead-object recovery, no
+        // production restart policy.
+        const val FOCUS_LOSS_PAUSE_RESUME_PROOF_BOUNDARY =
+            "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_loss_pause_resume_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_play_only_base_gain_0_5_transient_loss_pause_focus_gain_play_becoming_noisy_terminal_pause_no_flush_no_stop_no_auto_resume_before_release_no_transport_pause_no_presentation_pause_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_sla_no_production_restart_policy_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
         // Frozen X3 decode dequeue timeout: the realtime loop must return
         // to ingest/drain work quickly.
@@ -180,6 +206,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // X8 mode switch (implies X7 focus/noisy handoff and non-zero base
         // gain 0.5): false preserves the exact X4/X5/X6/X7 behavior and args.
         val focusDuckRestoreProofEnabled: Boolean = false,
+        // X9 mode switch (implies X7 focus/noisy handoff and non-zero base
+        // gain 0.5, but NOT X8 duck/restore): false preserves the exact
+        // X4/X5/X6/X7/X8 behavior and args.
+        val focusLossPauseResumeProofEnabled: Boolean = false,
     )
 
     // X8 (P4-AUDIO-FOCUS-DUCK-RESTORE-RESPONSE) synthetic duck/restore event
@@ -193,6 +223,34 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
 
         /** Driver report: the synthetic duck was drained and applied. */
         fun onDuckApplied()
+    }
+
+    // X9 (P4-AUDIO-FOCUS-LOSS-PAUSE-RESUME-RESPONSE) synthetic focus-loss /
+    // focus-gain / becoming-noisy event plane, supplied by the coordinator.
+    // The driver polls typed events only on its owner thread (the only thread
+    // ever allowed to touch the AudioTrack playstate). The coordinator
+    // callbacks only enqueue into the coordinator-owned bounded queue and
+    // never touch the AudioTrack; they must enqueue directly (no main-handler
+    // hop) so the driver can apply the resume at the same owner-thread
+    // boundary and never leaves a paused sink with a write backlog.
+    interface FocusLossPauseResumeEventPlane {
+        /**
+         * Owner thread only: returns [X9_EVENT_TRANSIENT_LOSS],
+         * [X9_EVENT_FOCUS_GAIN], [X9_EVENT_BECOMING_NOISY] or null.
+         */
+        fun pollOneEvent(): String?
+
+        /**
+         * Driver request (owner thread, synchronous): enqueue the ONE
+         * synthetic focus-gain event directly into the coordinator-owned queue.
+         */
+        fun enqueueSyntheticFocusGain()
+
+        /**
+         * Driver report: the transient pause/resume cycle was applied; the
+         * coordinator may now enqueue the ONE synthetic becoming-noisy event.
+         */
+        fun onTransientResumeApplied()
     }
 
     // Lanes/metrics are flat maps so the coordinator payload and the
@@ -369,16 +427,42 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
     private var x8DuckedVolume = -1.0
     private var x8RestoredVolume = -1.0
     private var x8FinalVolume = -1.0
+    // X9 focus-loss pause/resume state. Owner thread only mutates the
+    // AudioTrack playstate; terminal states: created_uninit ->
+    // base_volume_set(0.5) -> prerolled_not_playing -> playing ->
+    // paused_transient_loss -> playing_focus_gain (same boundary) -> [seek
+    // epoch pause/flush/re-preroll/play] -> playing -> paused_becoming_noisy
+    // (terminal EOS point, no auto-resume) -> released_once ->
+    // applier_disabled. Playstate values are sink-side telemetry only.
+    private var focusLossPauseResumePlane: FocusLossPauseResumeEventPlane? = null
+    private var x9ApplierEnabled = false
+    private var x9AppliedEventSeq = 0L
+    private var transientLossAppliedCount = 0L
+    private var focusGainAppliedCount = 0L
+    private var becomingNoisyAppliedCount = 0L
+    private var focusLossPauseOk = false
+    private var focusGainResumeOk = false
+    private var becomingNoisyPauseOk = false
+    private var transientPauseApplySeq = -1L
+    private var focusGainResumeApplySeq = -1L
+    private var noisyPauseApplySeq = -1L
+    private var playStateAfterTransientPause = -1
+    private var playStateAfterFocusGainResume = -1
+    private var playStateAfterNoisyPause = -1
+    private var playStateAtRelease = -1
+    private var terminalPlayStatePausedBeforeReleaseOk = false
     private val detailParts = mutableListOf<String>()
 
     fun run(
         runConfig: RunConfig,
         drainEventsFn: (() -> Int)? = null,
         duckRestorePlane: DuckRestoreEventPlane? = null,
+        focusLossPauseResumePlane: FocusLossPauseResumeEventPlane? = null,
     ): RunResult {
         config = runConfig
         this.drainEventsFn = drainEventsFn
         this.duckRestorePlane = duckRestorePlane
+        this.focusLossPauseResumePlane = focusLossPauseResumePlane
         deadline = SystemClock.elapsedRealtime() + config.deadlineMs
         mfpm = config.maxFramesPerMix.toLong()
         runThreadId = Thread.currentThread().id
@@ -1012,6 +1096,43 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 detailParts.add("focusDuckRestoreSetVolumeTelemetryOnly")
             }
 
+            // X9 focus-loss pause/resume response gate. Exactly one synthetic
+            // transient loss must have been applied (AudioTrack.pause() only,
+            // PLAYSTATE_PAUSED asserted), exactly one synthetic focus gain
+            // applied at the same owner-thread boundary (AudioTrack.play(),
+            // PLAYSTATE_PLAYING asserted), and exactly one synthetic
+            // becoming-noisy applied at the terminal EOS point (pause() only,
+            // PLAYSTATE_PAUSED asserted, no auto-resume), with a strictly
+            // monotonic applied-event sequence. Sink-side playstate proof
+            // only: no acoustic audibility/speaker verification, no OS focus
+            // arbitration correctness, no transport/presentation pause, no
+            // pause/resume SLA, no route-change or dead-object recovery, no
+            // production restart policy.
+            if (config.focusLossPauseResumeProofEnabled) {
+                if (transientLossAppliedCount != 1L || !focusLossPauseOk) {
+                    throw FailClosed("focus_loss_pause_not_applied")
+                }
+                if (focusGainAppliedCount != 1L || !focusGainResumeOk) {
+                    throw FailClosed("focus_gain_resume_not_applied")
+                }
+                if (becomingNoisyAppliedCount != 1L || !becomingNoisyPauseOk) {
+                    throw FailClosed("becoming_noisy_pause_not_applied")
+                }
+                if (transientPauseApplySeq < 0L ||
+                    focusGainResumeApplySeq <= transientPauseApplySeq ||
+                    noisyPauseApplySeq <= focusGainResumeApplySeq
+                ) {
+                    throw FailClosed("focus_loss_pause_resume_order_violated")
+                }
+                if (playStateAfterNoisyPause != AudioTrack.PLAYSTATE_PAUSED) {
+                    throw FailClosed("terminal_playstate_not_paused")
+                }
+                detailParts.add("transientPauseApplySeq=$transientPauseApplySeq")
+                detailParts.add("focusGainResumeApplySeq=$focusGainResumeApplySeq")
+                detailParts.add("noisyPauseApplySeq=$noisyPauseApplySeq")
+                detailParts.add("focusLossPauseResumePlaystateTelemetryOnly")
+            }
+
             // ── Destroy: join-on-destroy + idempotence ──────────────────────
             val (joinOk, idempotentOk) = s.destroyAndVerifyLifecycle()
             workerJoinOnDestroyOk = joinOk
@@ -1029,6 +1150,27 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                     throw FailClosed("released_while_ducked")
                 }
                 releaseAudioTrackOnce()
+            }
+
+            // X9: explicit owner-thread release before the result is sealed.
+            // The transient pause must have been resumed; the terminal
+            // becoming-noisy pause is intentionally NOT resumed, so the
+            // playstate observed at release must be PLAYSTATE_PAUSED. The
+            // release disables the X9 applier (terminal:
+            // paused_becoming_noisy -> released_once -> applier_disabled); any
+            // later X9 event fails closed. The finally release is then a
+            // guarded no-op.
+            if (config.focusLossPauseResumeProofEnabled) {
+                if (transientLossAppliedCount > focusGainAppliedCount) {
+                    throw FailClosed("released_while_focus_paused_unresumed")
+                }
+                releaseAudioTrackOnce()
+                if (playStateAtRelease != AudioTrack.PLAYSTATE_PAUSED) {
+                    throw FailClosed(
+                        "terminal_playstate_not_paused_before_release:$playStateAtRelease"
+                    )
+                }
+                terminalPlayStatePausedBeforeReleaseOk = true
             }
 
             // Every sink write and boundary callback asserted the single
@@ -1135,6 +1277,9 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         drainEventsFn?.invoke()
         // X8 drain point: at most one synthetic duck/restore event per pass.
         drainOneDuckRestoreEvent()
+        // X9 non-terminal drain point: the transient loss pause + same-boundary
+        // focus-gain resume are applied here (never at the seek boundary).
+        drainFocusLossPauseResumeNonTerminal()
     }
 
     // ── AudioTrack lifecycle / pre-roll / seek epoch ────────────────────────
@@ -1179,10 +1324,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         if (track.state != AudioTrack.STATE_INITIALIZED) {
             throw FailClosed("audio_track_not_initialized")
         }
-        if (config.nonZeroGainSinkProofEnabled || config.focusDuckRestoreProofEnabled) {
-            // X6 non-zero-gain proof (and X8, which implies the non-zero base
-            // gain): constant AudioTrack output gain only. Written PCM bytes
-            // and every checksum are unaffected by this.
+        if (config.nonZeroGainSinkProofEnabled ||
+            config.focusDuckRestoreProofEnabled ||
+            config.focusLossPauseResumeProofEnabled
+        ) {
+            // X6 non-zero-gain proof (and X8/X9, which imply the non-zero
+            // base gain): constant AudioTrack output gain only. Written PCM
+            // bytes and every checksum are unaffected by this.
             // Terminal state: created_uninit -> format_frozen_volume_set.
             // Deferred: no acoustic/audibility claim, no route-change
             // handling, no dead-object recovery.
@@ -1199,6 +1347,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 x8BaseVolume = 0.5
                 x8FinalVolume = 0.5
                 x8ApplierEnabled = true
+            }
+            if (config.focusLossPauseResumeProofEnabled) {
+                // X9 terminal state: created_uninit -> base_volume_set(0.5);
+                // the pause/resume playstate applier is live from here until
+                // release disables it. X8 duck/restore state is NOT touched.
+                x9ApplierEnabled = true
             }
         } else {
             // Muted-only boundary: default X4/X5 path (volume 0.0).
@@ -1276,6 +1430,15 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             throw FailClosed("seek_sink_discard_accounting_negative")
         }
         captureEpochUnderrunDelta("epoch0")
+        // X9 invariant: a transient focus-loss pause must have been resumed
+        // at its own owner-thread boundary before the seek epoch pause/flush
+        // may run. X9 events are never drained here (the seek pause/flush
+        // resets the epoch; applying pause/play inside it would be unsafe).
+        if (config.focusLossPauseResumeProofEnabled &&
+            transientLossAppliedCount > focusGainAppliedCount
+        ) {
+            throw FailClosed("seek_boundary_while_focus_paused_unresumed")
+        }
         track.pause()
         if (track.playState != AudioTrack.PLAYSTATE_PAUSED) {
             throw FailClosed("audio_track_not_paused_at_seek")
@@ -1312,6 +1475,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         drainEventsFn?.invoke()
         // X8 drain point: at most one synthetic duck/restore event per pass.
         drainOneDuckRestoreEvent()
+        // X9 terminal drain point: the ONE synthetic becoming-noisy event is
+        // applied here (AudioTrack.pause() only, no flush/stop, no resume
+        // before release).
+        drainFocusLossPauseResumeTerminal()
     }
 
     // ── X8 focus-duck/restore volume applier (owner thread only) ────────────
@@ -1376,6 +1543,137 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         }
     }
 
+    // ── X9 focus-loss pause/resume playstate applier (owner thread only) ────
+
+    // Non-terminal drain point (write loop only): polls AT MOST ONE typed
+    // event once the current epoch is playing, and only until the transient
+    // pause/resume cycle has completed. After that the queue is deliberately
+    // left untouched so the becoming-noisy event can only be applied at the
+    // terminal EOS point; a becoming-noisy polled here fails closed.
+    private fun drainFocusLossPauseResumeNonTerminal() {
+        val plane = focusLossPauseResumePlane ?: return
+        if (!config.focusLossPauseResumeProofEnabled) return
+        assertOwnerThread("x9_drain")
+        if (!epochPlayed) return
+        if (focusGainAppliedCount > 0L) return
+        val event = plane.pollOneEvent() ?: return
+        applyFocusLossPauseResumeEvent(event, terminal = false)
+    }
+
+    // Terminal drain point (EOS finalization only): exactly ONE
+    // becoming-noisy event must be present and nothing may follow it.
+    private fun drainFocusLossPauseResumeTerminal() {
+        val plane = focusLossPauseResumePlane ?: return
+        if (!config.focusLossPauseResumeProofEnabled) return
+        assertOwnerThread("x9_terminal_drain")
+        if (!epochPlayed) throw FailClosed("becoming_noisy_before_epoch_play")
+        val event = plane.pollOneEvent()
+            ?: throw FailClosed("becoming_noisy_event_missing")
+        if (event != X9_EVENT_BECOMING_NOISY) {
+            throw FailClosed("unexpected_terminal_focus_event:$event")
+        }
+        applyFocusLossPauseResumeEvent(event, terminal = true)
+        if (plane.pollOneEvent() != null) {
+            throw FailClosed("focus_event_after_becoming_noisy")
+        }
+    }
+
+    // Applies one typed synthetic X9 event to the AudioTrack playstate on the
+    // owner thread. pause()/play() only — never flush()/stop(); playstate
+    // assertions are sink-side telemetry, not an acoustic, transport,
+    // presentation, OS-arbitration, SLA, or recovery claim. Fail-closed state
+    // machine: transient loss requires PLAYING and is applied once; the focus
+    // gain is enqueued synchronously by the plane callback and applied at the
+    // SAME boundary (requires the applied pause, applied once, resumes to
+    // PLAYING); becoming-noisy is terminal-only, requires the applied resume,
+    // is applied once, and is never auto-resumed. Nothing may run after
+    // release disables the applier. The applied-event sequence is monotonic
+    // per applied event (not per drain pass).
+    private fun applyFocusLossPauseResumeEvent(event: String, terminal: Boolean) {
+        val track = audioTrack
+        if (!x9ApplierEnabled || track == null) {
+            throw FailClosed("focus_event_after_release:$event")
+        }
+        when (event) {
+            X9_EVENT_TRANSIENT_LOSS -> {
+                if (terminal) throw FailClosed("transient_loss_at_terminal_point")
+                if (transientLossAppliedCount > 0L) throw FailClosed("duplicate_transient_loss")
+                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                    throw FailClosed(
+                        "transient_loss_from_non_playing_state:${track.playState}"
+                    )
+                }
+                track.pause()
+                playStateAfterTransientPause = track.playState
+                if (playStateAfterTransientPause != AudioTrack.PLAYSTATE_PAUSED) {
+                    throw FailClosed(
+                        "transient_loss_pause_playstate_bad:$playStateAfterTransientPause"
+                    )
+                }
+                focusLossPauseOk = true
+                transientLossAppliedCount = 1L
+                transientPauseApplySeq = x9AppliedEventSeq++
+                // Same-boundary resume: the plane callback enqueues the ONE
+                // synthetic focus gain directly (no main-handler wait), and it
+                // is polled and applied right here so the paused sink never
+                // accumulates a write backlog.
+                val plane = focusLossPauseResumePlane
+                    ?: throw FailClosed("focus_loss_plane_missing")
+                plane.enqueueSyntheticFocusGain()
+                val next = plane.pollOneEvent()
+                    ?: throw FailClosed("focus_gain_not_enqueued_synchronously")
+                if (next != X9_EVENT_FOCUS_GAIN) {
+                    throw FailClosed("unexpected_focus_event_after_transient_loss:$next")
+                }
+                applyFocusLossPauseResumeEvent(next, terminal = false)
+            }
+            X9_EVENT_FOCUS_GAIN -> {
+                if (terminal) throw FailClosed("focus_gain_at_terminal_point")
+                if (transientLossAppliedCount == 0L) {
+                    throw FailClosed("focus_gain_without_transient_loss")
+                }
+                if (focusGainAppliedCount > 0L) throw FailClosed("duplicate_focus_gain")
+                if (track.playState != AudioTrack.PLAYSTATE_PAUSED) {
+                    throw FailClosed("focus_gain_from_non_paused_state:${track.playState}")
+                }
+                track.play()
+                playStateAfterFocusGainResume = track.playState
+                if (playStateAfterFocusGainResume != AudioTrack.PLAYSTATE_PLAYING) {
+                    throw FailClosed(
+                        "focus_gain_resume_playstate_bad:$playStateAfterFocusGainResume"
+                    )
+                }
+                focusGainResumeOk = true
+                focusGainAppliedCount = 1L
+                focusGainResumeApplySeq = x9AppliedEventSeq++
+                // Report the transient resume applied so the coordinator may
+                // enqueue the ONE synthetic becoming-noisy strictly afterwards.
+                focusLossPauseResumePlane?.onTransientResumeApplied()
+            }
+            X9_EVENT_BECOMING_NOISY -> {
+                if (!terminal) throw FailClosed("becoming_noisy_at_non_terminal_point")
+                if (focusGainAppliedCount == 0L) throw FailClosed("becoming_noisy_before_resume")
+                if (becomingNoisyAppliedCount > 0L) throw FailClosed("duplicate_becoming_noisy")
+                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                    throw FailClosed(
+                        "becoming_noisy_from_non_playing_state:${track.playState}"
+                    )
+                }
+                track.pause()
+                playStateAfterNoisyPause = track.playState
+                if (playStateAfterNoisyPause != AudioTrack.PLAYSTATE_PAUSED) {
+                    throw FailClosed(
+                        "becoming_noisy_pause_playstate_bad:$playStateAfterNoisyPause"
+                    )
+                }
+                becomingNoisyPauseOk = true
+                becomingNoisyAppliedCount = 1L
+                noisyPauseApplySeq = x9AppliedEventSeq++
+            }
+            else -> throw FailClosed("unknown_focus_loss_pause_resume_event:$event")
+        }
+    }
+
     // Opens a sink write epoch: zeroed counters, fresh unsigned-masked head
     // baseline (re-read after any flush), cleared play/underrun baselines.
     private fun openSinkEpoch() {
@@ -1433,6 +1731,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // later duck/restore event fails closed (duck_after_release /
         // restore_after_release).
         x8ApplierEnabled = false
+        // X9: capture the sink playstate observed at release (telemetry; the
+        // run path gates it to PLAYSTATE_PAUSED) and disable the pause/resume
+        // applier; any later X9 event fails closed (focus_event_after_release).
+        if (config.focusLossPauseResumeProofEnabled) {
+            playStateAtRelease = try { track.playState } catch (_: Throwable) { -1 }
+        }
+        x9ApplierEnabled = false
         try { track.pause() } catch (_: Throwable) {}
         try { track.flush() } catch (_: Throwable) {}
         try { track.release() } catch (_: Throwable) {}
@@ -1599,8 +1904,26 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "duckedVolume" to x8DuckedVolume,
             "restoredVolume" to x8RestoredVolume,
             "finalVolume" to x8FinalVolume,
+            "focusLossPauseResumeProofEnabled" to config.focusLossPauseResumeProofEnabled,
+            "transientLossAppliedCount" to transientLossAppliedCount,
+            "focusGainAppliedCount" to focusGainAppliedCount,
+            "becomingNoisyAppliedCount" to becomingNoisyAppliedCount,
+            "focusLossPauseOk" to focusLossPauseOk,
+            "focusGainResumeOk" to focusGainResumeOk,
+            "becomingNoisyPauseOk" to becomingNoisyPauseOk,
+            "transientPauseApplySeq" to transientPauseApplySeq,
+            "focusGainResumeApplySeq" to focusGainResumeApplySeq,
+            "noisyPauseApplySeq" to noisyPauseApplySeq,
+            "playStateAfterTransientPause" to playStateAfterTransientPause,
+            "playStateAfterFocusGainResume" to playStateAfterFocusGainResume,
+            "playStateAfterNoisyPause" to playStateAfterNoisyPause,
+            "playStateAtRelease" to playStateAtRelease,
+            "terminalPlayStatePausedBeforeReleaseOk" to terminalPlayStatePausedBeforeReleaseOk,
         )
         val marker = when {
+            config.focusLossPauseResumeProofEnabled ->
+                if (pass) FOCUS_LOSS_PAUSE_RESUME_PASS_MARKER
+                else FOCUS_LOSS_PAUSE_RESUME_FAIL_MARKER
             config.focusDuckRestoreProofEnabled ->
                 if (pass) FOCUS_DUCK_RESTORE_PASS_MARKER
                 else FOCUS_DUCK_RESTORE_FAIL_MARKER
@@ -1617,12 +1940,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             pass = pass,
             status = if (pass) "pass" else failureReason.substringBefore(':').ifBlank { "fail" },
             marker = marker,
-            // X8 replaces the default boundary: a focus-duck/restore run is
-            // neither muted nor no-focus.
-            proofBoundary = if (config.focusDuckRestoreProofEnabled) {
-                FOCUS_DUCK_RESTORE_PROOF_BOUNDARY
-            } else {
-                PROOF_BOUNDARY
+            // X8/X9 replace the default boundary: a focus-duck/restore or a
+            // focus-loss pause/resume run is neither muted nor no-focus.
+            proofBoundary = when {
+                config.focusLossPauseResumeProofEnabled ->
+                    FOCUS_LOSS_PAUSE_RESUME_PROOF_BOUNDARY
+                config.focusDuckRestoreProofEnabled -> FOCUS_DUCK_RESTORE_PROOF_BOUNDARY
+                else -> PROOF_BOUNDARY
             },
             nativeProofBoundary = s?.snapProofBoundary ?: "",
             failureReason = failureReason,

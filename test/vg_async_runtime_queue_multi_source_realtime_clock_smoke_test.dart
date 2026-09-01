@@ -26,6 +26,11 @@ const _kFocusNoisyPassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_PHYSICAL_SMOKE_PASS';
 const _kFocusDuckRestorePassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_DUCK_RESTORE_PHYSICAL_SMOKE_PASS';
+const _kFocusLossPauseResumePassMarker =
+    'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_LOSS_PAUSE_RESUME_PHYSICAL_SMOKE_PASS';
+
+const _kFocusLossPauseResumeProofBoundary =
+    'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_loss_pause_resume_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_play_only_base_gain_0_5_transient_loss_pause_focus_gain_play_becoming_noisy_terminal_pause_no_flush_no_stop_no_auto_resume_before_release_no_transport_pause_no_presentation_pause_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_sla_no_production_restart_policy_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
 
 const _kFocusDuckRestoreProofBoundary =
     'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_duck_restore_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_focus_duck_restore_setvolume_only_base_gain_0_5_duck_gain_0_1_restore_gain_0_5_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_restart_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
@@ -1586,6 +1591,485 @@ void main() {
 
       expect(
         capturedArgs?.containsKey('focusDuckRestoreProofEnabled'),
+        isFalse,
+      );
+    });
+  });
+
+  group('X9 focus-loss pause/resume response proof mode', () {
+    // X9 pass sample map: X4 base with the X9 marker, the X9 mode-specific
+    // proof boundary, the implied X7 focus/noisy lanes/metrics, the implied
+    // non-zero 0.5 base gain facts, and the X9 pause/resume lanes/metrics.
+    // X8 duck/restore facts stay at their defaults: X9 never enables X8.
+    Map<String, Object?> createX9SampleRawMap([
+      Map<String, Object?>? overrides,
+    ]) {
+      final result = _createSampleRawMap();
+      result['marker'] = _kFocusLossPauseResumePassMarker;
+      result['proofBoundary'] = _kFocusLossPauseResumeProofBoundary;
+      final rawStrings = result['raw'] as Map<String, String>;
+      rawStrings['marker'] = _kFocusLossPauseResumePassMarker;
+      rawStrings['proofBoundary'] = _kFocusLossPauseResumeProofBoundary;
+      final lanes = result['lanes'] as Map<String, Object?>;
+      // X9 implies the non-zero base gain: the muted lane is honestly false.
+      lanes['mutedOutputOk'] = false;
+      // Implied X7 focus/noisy lanes.
+      lanes['audioFocusRequestGrantedOk'] = true;
+      lanes['audioFocusAbandonedOk'] = true;
+      lanes['noisyReceiverRegisteredOk'] = true;
+      lanes['noisyReceiverUnregisteredOk'] = true;
+      lanes['focusNoisyOwnerThreadDrainOk'] = true;
+      lanes['focusNoisyEventHandoffGatesHeld'] = true;
+      // X9 coordinator lane.
+      lanes['focusLossPauseResumeGatesHeld'] = true;
+      final metrics = result['metrics'] as Map<String, Object?>;
+      // Implied X7 metrics.
+      metrics['focusNoisyEventHandoffProofEnabled'] = true;
+      metrics['focusNoisySyntheticEventsPosted'] = 2;
+      metrics['focusNoisyEventsEnqueued'] = 2;
+      metrics['focusNoisyEventsDropped'] = 0;
+      metrics['focusNoisyEventsDrained'] = 2;
+      // Implied non-zero 0.5 base gain facts (nonZeroGainSinkProofEnabled
+      // and focusDuckRestoreProofEnabled stay false: X9 is its own mode).
+      metrics['audioTrackGain'] = 0.5;
+      metrics['audioTrackNonZeroGainSetOk'] = true;
+      metrics['focusDuckRestoreProofEnabled'] = false;
+      // X9 driver metrics (sink-side playstate telemetry only).
+      metrics['focusLossPauseResumeProofEnabled'] = true;
+      metrics['transientLossAppliedCount'] = 1;
+      metrics['focusGainAppliedCount'] = 1;
+      metrics['becomingNoisyAppliedCount'] = 1;
+      metrics['focusLossPauseOk'] = true;
+      metrics['focusGainResumeOk'] = true;
+      metrics['becomingNoisyPauseOk'] = true;
+      metrics['transientPauseApplySeq'] = 0;
+      metrics['focusGainResumeApplySeq'] = 1;
+      metrics['noisyPauseApplySeq'] = 2;
+      metrics['playStateAfterTransientPause'] = 2;
+      metrics['playStateAfterFocusGainResume'] = 3;
+      metrics['playStateAfterNoisyPause'] = 2;
+      metrics['playStateAtRelease'] = 2;
+      metrics['terminalPlayStatePausedBeforeReleaseOk'] = true;
+      // X9 coordinator metrics.
+      metrics['syntheticTransientLossPosted'] = 1;
+      metrics['syntheticFocusGainPosted'] = 1;
+      metrics['syntheticBecomingNoisyPosted'] = 1;
+      metrics['transientLossEventsEnqueued'] = 1;
+      metrics['focusGainEventsEnqueued'] = 1;
+      metrics['becomingNoisyEventsEnqueued'] = 1;
+      metrics['transientLossEventsDrained'] = 1;
+      metrics['focusGainEventsDrained'] = 1;
+      metrics['becomingNoisyEventsDrained'] = 1;
+      metrics['focusLossPauseResumeEventsDropped'] = 0;
+      metrics['focusLossRealFocusChangeCallbackCount'] = 0;
+      if (overrides != null) {
+        for (final entry in overrides.entries) {
+          if (lanes.containsKey(entry.key)) lanes[entry.key] = entry.value;
+          if (metrics.containsKey(entry.key)) metrics[entry.key] = entry.value;
+          result[entry.key] = entry.value;
+        }
+      }
+      return result;
+    }
+
+    test('default X4 pass report has focusLossPauseResumeProofEnabled=false '
+        'and gate vacuously true', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createSampleRawMap(),
+          );
+      expect(report.focusLossPauseResumeProofEnabled, isFalse);
+      expect(report.focusLossPauseOk, isFalse);
+      expect(report.focusGainResumeOk, isFalse);
+      expect(report.becomingNoisyPauseOk, isFalse);
+      expect(report.terminalPlayStatePausedBeforeReleaseOk, isFalse);
+      expect(report.syntheticTransientLossPosted, equals(0));
+      expect(report.syntheticFocusGainPosted, equals(0));
+      expect(report.syntheticBecomingNoisyPosted, equals(0));
+      expect(report.transientLossAppliedCount, equals(-1));
+      expect(report.focusGainAppliedCount, equals(-1));
+      expect(report.becomingNoisyAppliedCount, equals(-1));
+      expect(report.transientPauseApplySeq, equals(-1));
+      expect(report.focusGainResumeApplySeq, equals(-1));
+      expect(report.noisyPauseApplySeq, equals(-1));
+      expect(report.focusLossPauseResumeEventsDropped, equals(0));
+      // Gate is vacuously true when X9 disabled.
+      expect(report.focusLossPauseResumeGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X8 pass report keeps X9 defaults and still passes', () {
+      final result = _createSampleRawMap();
+      result['marker'] = _kFocusDuckRestorePassMarker;
+      result['proofBoundary'] = _kFocusDuckRestoreProofBoundary;
+      final rawStrings = result['raw'] as Map<String, String>;
+      rawStrings['marker'] = _kFocusDuckRestorePassMarker;
+      rawStrings['proofBoundary'] = _kFocusDuckRestoreProofBoundary;
+      final lanes = result['lanes'] as Map<String, Object?>;
+      lanes['mutedOutputOk'] = false;
+      lanes['audioFocusRequestGrantedOk'] = true;
+      lanes['audioFocusAbandonedOk'] = true;
+      lanes['noisyReceiverRegisteredOk'] = true;
+      lanes['noisyReceiverUnregisteredOk'] = true;
+      lanes['focusNoisyOwnerThreadDrainOk'] = true;
+      lanes['focusNoisyEventHandoffGatesHeld'] = true;
+      lanes['focusListenerRegisteredOk'] = true;
+      lanes['focusDuckRestoreGatesHeld'] = true;
+      final metrics = result['metrics'] as Map<String, Object?>;
+      metrics['focusNoisyEventHandoffProofEnabled'] = true;
+      metrics['focusNoisySyntheticEventsPosted'] = 2;
+      metrics['focusNoisyEventsEnqueued'] = 2;
+      metrics['focusNoisyEventsDropped'] = 0;
+      metrics['focusNoisyEventsDrained'] = 2;
+      metrics['audioTrackGain'] = 0.5;
+      metrics['audioTrackNonZeroGainSetOk'] = true;
+      metrics['focusDuckRestoreProofEnabled'] = true;
+      metrics['syntheticDuckPosted'] = 1;
+      metrics['syntheticGainPosted'] = 1;
+      metrics['duckAppliedCount'] = 1;
+      metrics['restoreAppliedCount'] = 1;
+      metrics['duckSetVolumeOk'] = true;
+      metrics['restoreSetVolumeOk'] = true;
+      metrics['duckDrainSeq'] = 3;
+      metrics['restoreDrainSeq'] = 57;
+      metrics['baseVolume'] = 0.5;
+      metrics['duckedVolume'] = 0.1;
+      metrics['restoredVolume'] = 0.5;
+      metrics['finalVolume'] = 0.5;
+      metrics['duckEventsEnqueued'] = 1;
+      metrics['gainEventsEnqueued'] = 1;
+      metrics['duckEventsDrained'] = 1;
+      metrics['gainEventsDrained'] = 1;
+      metrics['focusEventsDropped'] = 0;
+      metrics['realFocusChangeCallbackCount'] = 0;
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            result,
+          );
+      expect(report.focusDuckRestoreProofEnabled, isTrue);
+      expect(report.focusLossPauseResumeProofEnabled, isFalse);
+      expect(report.focusLossPauseResumeGatesHeld, isTrue);
+      expect(report.hasCanonicalProofBoundary, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X9 pass report passes all gates with pause, resume, and terminal '
+        'noisy pause applied', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap(),
+          );
+      expect(report.marker, equals(_kFocusLossPauseResumePassMarker));
+      expect(report.proofBoundary, equals(_kFocusLossPauseResumeProofBoundary));
+      expect(report.focusLossPauseResumeProofEnabled, isTrue);
+      // X9 never enables X8.
+      expect(report.focusDuckRestoreProofEnabled, isFalse);
+      expect(report.focusDuckRestoreGatesHeld, isTrue);
+      expect(report.focusLossPauseOk, isTrue);
+      expect(report.focusGainResumeOk, isTrue);
+      expect(report.becomingNoisyPauseOk, isTrue);
+      expect(report.terminalPlayStatePausedBeforeReleaseOk, isTrue);
+      expect(report.syntheticTransientLossPosted, equals(1));
+      expect(report.syntheticFocusGainPosted, equals(1));
+      expect(report.syntheticBecomingNoisyPosted, equals(1));
+      expect(report.transientLossEventsEnqueued, equals(1));
+      expect(report.focusGainEventsEnqueued, equals(1));
+      expect(report.becomingNoisyEventsEnqueued, equals(1));
+      expect(report.transientLossEventsDrained, equals(1));
+      expect(report.focusGainEventsDrained, equals(1));
+      expect(report.becomingNoisyEventsDrained, equals(1));
+      expect(report.focusLossPauseResumeEventsDropped, equals(0));
+      expect(report.transientLossAppliedCount, equals(1));
+      expect(report.focusGainAppliedCount, equals(1));
+      expect(report.becomingNoisyAppliedCount, equals(1));
+      expect(report.transientPauseApplySeq, equals(0));
+      expect(report.focusGainResumeApplySeq, equals(1));
+      expect(report.noisyPauseApplySeq, equals(2));
+      expect(
+        report.transientPauseApplySeq,
+        lessThan(report.focusGainResumeApplySeq),
+      );
+      expect(
+        report.focusGainResumeApplySeq,
+        lessThan(report.noisyPauseApplySeq),
+      );
+      expect(report.focusLossPauseResumeGatesHeld, isTrue);
+      // Implied X7 and non-zero-gain gates hold too.
+      expect(report.focusNoisyEventHandoffGatesHeld, isTrue);
+      expect(report.nonZeroGainSinkGatesHeld, isTrue);
+      expect(report.hasCanonicalProofBoundary, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X9 run must carry the focus-loss pause/resume pass marker', () {
+      for (final wrongMarker in const [
+        _kPassMarker,
+        _kFocusNoisyPassMarker,
+        _kFocusDuckRestorePassMarker,
+      ]) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX9SampleRawMap({'marker': wrongMarker}),
+            );
+        expect(report.allNativeLanesPass, isFalse, reason: wrongMarker);
+      }
+    });
+
+    test('X9 must carry its own proof boundary, not the default or X8 one', () {
+      final defaultBoundary =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({'proofBoundary': _kCanonicalProofBoundary}),
+          );
+      expect(defaultBoundary.hasCanonicalProofBoundary, isFalse);
+      expect(defaultBoundary.allNativeLanesPass, isFalse);
+
+      final x8Boundary =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({
+              'proofBoundary': _kFocusDuckRestoreProofBoundary,
+            }),
+          );
+      expect(x8Boundary.hasCanonicalProofBoundary, isFalse);
+      expect(x8Boundary.allNativeLanesPass, isFalse);
+    });
+
+    test('X9 requires focusLossPauseOk', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({'focusLossPauseOk': false}),
+          );
+      expect(report.focusLossPauseResumeGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X9 requires focusGainResumeOk', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({'focusGainResumeOk': false}),
+          );
+      expect(report.focusLossPauseResumeGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X9 requires becomingNoisyPauseOk', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({'becomingNoisyPauseOk': false}),
+          );
+      expect(report.focusLossPauseResumeGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X9 requires the terminal playstate paused before release', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({
+              'terminalPlayStatePausedBeforeReleaseOk': false,
+            }),
+          );
+      expect(report.focusLossPauseResumeGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X9 requires the focusLossPauseResumeGatesHeld native lane', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({'focusLossPauseResumeGatesHeld': false}),
+          );
+      expect(report.focusLossPauseResumeGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X9 requires exactly one applied event per tag', () {
+      for (final key in const [
+        'transientLossAppliedCount',
+        'focusGainAppliedCount',
+        'becomingNoisyAppliedCount',
+      ]) {
+        final missing =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX9SampleRawMap({key: 0}),
+            );
+        expect(missing.focusLossPauseResumeGatesHeld, isFalse, reason: key);
+        expect(missing.allNativeLanesPass, isFalse, reason: key);
+
+        final duplicate =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX9SampleRawMap({key: 2}),
+            );
+        expect(duplicate.focusLossPauseResumeGatesHeld, isFalse, reason: key);
+        expect(duplicate.allNativeLanesPass, isFalse, reason: key);
+      }
+    });
+
+    test('X9 requires per-tag posted/enqueued/drained counts of exactly 1', () {
+      for (final key in const [
+        'syntheticTransientLossPosted',
+        'syntheticFocusGainPosted',
+        'syntheticBecomingNoisyPosted',
+        'transientLossEventsEnqueued',
+        'focusGainEventsEnqueued',
+        'becomingNoisyEventsEnqueued',
+        'transientLossEventsDrained',
+        'focusGainEventsDrained',
+        'becomingNoisyEventsDrained',
+      ]) {
+        final zero =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX9SampleRawMap({key: 0}),
+            );
+        expect(zero.focusLossPauseResumeGatesHeld, isFalse, reason: key);
+        expect(zero.allNativeLanesPass, isFalse, reason: key);
+
+        final two =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX9SampleRawMap({key: 2}),
+            );
+        expect(two.focusLossPauseResumeGatesHeld, isFalse, reason: key);
+        expect(two.allNativeLanesPass, isFalse, reason: key);
+      }
+    });
+
+    test('X9 gate fails on dropped events', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({'focusLossPauseResumeEventsDropped': 1}),
+          );
+      expect(report.focusLossPauseResumeEventsDropped, equals(1));
+      expect(report.focusLossPauseResumeGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X9 gate fails when the applied sequence is not strictly ordered '
+        'transient < gain < noisy', () {
+      final gainBeforePause =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({
+              'transientPauseApplySeq': 1,
+              'focusGainResumeApplySeq': 0,
+            }),
+          );
+      expect(gainBeforePause.focusLossPauseResumeGatesHeld, isFalse);
+      expect(gainBeforePause.allNativeLanesPass, isFalse);
+
+      final noisyBeforeGain =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({
+              'focusGainResumeApplySeq': 2,
+              'noisyPauseApplySeq': 1,
+            }),
+          );
+      expect(noisyBeforeGain.focusLossPauseResumeGatesHeld, isFalse);
+      expect(noisyBeforeGain.allNativeLanesPass, isFalse);
+
+      final equalSeq =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({
+              'transientPauseApplySeq': 1,
+              'focusGainResumeApplySeq': 1,
+            }),
+          );
+      expect(equalSeq.focusLossPauseResumeGatesHeld, isFalse);
+      expect(equalSeq.allNativeLanesPass, isFalse);
+
+      final neverPaused =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({'transientPauseApplySeq': -1}),
+          );
+      expect(neverPaused.focusLossPauseResumeGatesHeld, isFalse);
+      expect(neverPaused.allNativeLanesPass, isFalse);
+    });
+
+    test('X9 still requires the implied X7 focus/noisy gates', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({'audioFocusAbandonedOk': false}),
+          );
+      expect(report.focusNoisyEventHandoffGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X9 still requires the implied non-zero base gain', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX9SampleRawMap({
+              'audioTrackGain': 0.0,
+              'audioTrackNonZeroGainSetOk': false,
+            }),
+          );
+      expect(report.nonZeroGainSinkGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X9 mode sends focusLossPauseResumeProofEnabled=true only', () async {
+      Map<String, Object?>? capturedArgs;
+
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+        capturedArgs = (call.arguments as Map).cast<String, Object?>();
+        return createX9SampleRawMap();
+      });
+
+      final report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: '/tmp/clip_B.mov',
+            focusLossPauseResumeProofEnabled: true,
+          );
+
+      expect(capturedArgs?['focusLossPauseResumeProofEnabled'], isTrue);
+      // The implied X7 flag is derived natively; the Dart wrapper never
+      // sends it, the X8 flag, or any other mode flag for an X9 run.
+      expect(
+        capturedArgs?.containsKey('focusNoisyEventHandoffProofEnabled'),
+        isFalse,
+      );
+      expect(
+        capturedArgs?.containsKey('focusDuckRestoreProofEnabled'),
+        isFalse,
+      );
+      expect(capturedArgs?.containsKey('envelopeProofEnabled'), isFalse);
+      expect(capturedArgs?.containsKey('nonZeroGainSinkProofEnabled'), isFalse);
+      expect(report.pass, isTrue);
+      expect(report.focusLossPauseResumeProofEnabled, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test(
+      'default X4 run does NOT send focusLossPauseResumeProofEnabled',
+      () async {
+        Map<String, Object?>? capturedArgs;
+
+        binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+          capturedArgs = (call.arguments as Map).cast<String, Object?>();
+          return _createSampleRawMap();
+        });
+
+        await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+          sourcePath: '/tmp/clip_B.mov',
+        );
+
+        expect(
+          capturedArgs?.containsKey('focusLossPauseResumeProofEnabled'),
+          isFalse,
+        );
+      },
+    );
+
+    test('X8 run does NOT send focusLossPauseResumeProofEnabled', () async {
+      Map<String, Object?>? capturedArgs;
+
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+        capturedArgs = (call.arguments as Map).cast<String, Object?>();
+        return _createSampleRawMap();
+      });
+
+      await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+        sourcePath: '/tmp/clip_B.mov',
+        focusDuckRestoreProofEnabled: true,
+      );
+
+      expect(capturedArgs?['focusDuckRestoreProofEnabled'], isTrue);
+      expect(
+        capturedArgs?.containsKey('focusLossPauseResumeProofEnabled'),
         isFalse,
       );
     });
