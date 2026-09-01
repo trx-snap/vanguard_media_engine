@@ -100,6 +100,8 @@ export 'vg_audio_graph_export_session_smoke.dart';
 export 'vg_async_runtime_queue_scheduler_smoke.dart';
 // P4-AUDIO-ASYNC-RUNTIME-QUEUE-REAL-DECODER (sub-slice X1): Android True-DAG Phase 4 real MediaExtractor/MediaCodec decoder to async runtime queue scheduler smoke foundation.
 export 'vg_async_runtime_queue_real_decoder_smoke.dart';
+// P4-AUDIO-ASYNC-RUNTIME-QUEUE-AUDIOTRACK-SINK (sub-slice X2): Android True-DAG Phase 4 async runtime queue output ring to Kotlin-owned muted AudioTrack sink smoke foundation.
+export 'vg_async_runtime_queue_audiotrack_sink_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.

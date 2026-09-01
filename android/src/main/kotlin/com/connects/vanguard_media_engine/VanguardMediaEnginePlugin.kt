@@ -21,6 +21,7 @@ import com.connects.vanguard_media_engine.camera.AndroidCamera2TextureSmokeCoord
 import com.connects.vanguard_media_engine.camera.AndroidCameraGraphTransactionCoordinator
 import com.connects.vanguard_media_engine.codec.AndroidDagTexturePlaybackCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAaudioNodeOwnedSinkSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidAsyncRuntimeQueueAudioTrackSinkSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAsyncRuntimeQueueRealDecoderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAsyncRuntimeQueueSchedulerSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidAudioDecodeBridgeSmokeCoordinator
@@ -230,6 +231,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // smoke coordinator. Registration-only glue mirroring the established
     // diagnostic route wiring.
     private var asyncRuntimeQueueRealDecoderSmokeCoordinator: AndroidAsyncRuntimeQueueRealDecoderSmokeCoordinator? = null
+
+    // ── P4-AUDIO-ASYNC-RUNTIME-QUEUE-AUDIOTRACK-SINK (sub-slice X2): async ────
+    // runtime queue output ring to Kotlin-owned muted AudioTrack sink smoke
+    // coordinator. Registration-only glue mirroring the established
+    // diagnostic route wiring.
+    private var asyncRuntimeQueueAudioTrackSinkSmokeCoordinator: AndroidAsyncRuntimeQueueAudioTrackSinkSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -453,6 +460,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         asyncRuntimeQueueRealDecoderSmokeCoordinator = AndroidAsyncRuntimeQueueRealDecoderSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        asyncRuntimeQueueAudioTrackSinkSmokeCoordinator = AndroidAsyncRuntimeQueueAudioTrackSinkSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -838,6 +848,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android async runtime queue real decoder smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidAsyncRuntimeQueueAudioTrackSinkSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = asyncRuntimeQueueAudioTrackSinkSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android async runtime queue AudioTrack sink smoke coordinator unavailable", null)
             }
             return
         }
@@ -2247,6 +2267,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // in its finally block.
         asyncRuntimeQueueRealDecoderSmokeCoordinator?.disposeAll()
         asyncRuntimeQueueRealDecoderSmokeCoordinator = null
+        // P4-AUDIO-ASYNC-RUNTIME-QUEUE-AUDIOTRACK-SINK: stop replying before
+        // dropping; an in-flight sink run finishes naturally on its own
+        // thread, releases its own AudioTrack, and destroys (stop flag +
+        // join) its own native session in its finally block.
+        asyncRuntimeQueueAudioTrackSinkSmokeCoordinator?.disposeAll()
+        asyncRuntimeQueueAudioTrackSinkSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.
