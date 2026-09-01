@@ -673,6 +673,123 @@ class VanguardNativeBridge(
         external fun destroyAaudioNodeOwnedSinkSmokeSession(
             handle: Long,
         ): String
+
+        // ── P4-AUDIO-RUNTIME-QUEUE-SCHEDULER: diagnostic async runtime queue/backpressure scheduler session seam ─
+        // Session-scoped native seam whose session owns ONE native worker
+        // thread: the worker is the sole caller of every AudioClock
+        // mutator, every ClockedAudioTransportCoordinator control/dispatch
+        // method, and the output ring's producer role. Kotlin control
+        // commands (start/pause/resume/seek) only ENQUEUE into a bounded
+        // TU-local command queue drained by the worker; command results
+        // surface through the mutex-published snapshot mirror. The Kotlin
+        // owner thread stays the source-ring producer (ingest/EOS/seek
+        // request via the node-owned writer) and the output-ring consumer
+        // (read/ack). Every media-time tick is caller-derived /
+        // frame-axis synthetic; the worker never reads a wall clock as a
+        // media timebase (std::chrono is pacing-only), never touches
+        // JNIEnv, and never calls back into Kotlin. No
+        // AudioTrack/AAudio/OpenSL/Oboe, no audible output, no realtime
+        // claim, no product/editor/app wiring, no streaming/cache, no iOS,
+        // no export route changes. Forward-only seek over quiescent rings;
+        // writer-local EOS arms a bounded, honestly-reported zero-fill
+        // probe lane.
+
+        // Returns an opaque session handle, or 0 on invalid input
+        // (sampleRate not in [8000, 192000], channelCount not in {1,2},
+        // expectedFrameCount not in (0, 600*sampleRate], maxFramesPerMix
+        // not in [1, 8192], ring capacities not powers of two in
+        // [64, 65536], outputRingCapacityFrames < maxFramesPerMix,
+        // sourceRingCapacityFrames < 2*maxFramesPerMix) or when the
+        // 4-live-session registry cap is reached. The worker thread starts
+        // only after the rig validated.
+        external fun createAsyncRuntimeQueueSchedulerSession(
+            sampleRate: Int,
+            channelCount: Int,
+            expectedFrameCount: Long,
+            sourceRingCapacityFrames: Int,
+            outputRingCapacityFrames: Int,
+            maxFramesPerMix: Int,
+        ): Long
+
+        // Enqueue-only (status=enqueued;commandSeq=N, or already_started /
+        // queue_full / not_found / wrong_owner_thread / invalid_args). The
+        // worker executes coordinator.start; the caller must then consume
+        // the output-ring seek ack via the read entry point before the
+        // worker can render its first window.
+        external fun startAsyncRuntimeQueueScheduler(
+            handle: Long,
+            mediaPtsUs: Long,
+            syntheticSysTimeNs: Long,
+        ): String
+
+        // Enqueue-only; the worker clamps the synthetic tick to its own
+        // last tick (never a regression) before calling the coordinator.
+        external fun pauseAsyncRuntimeQueueScheduler(
+            handle: Long,
+            syntheticSysTimeNs: Long,
+        ): String
+
+        external fun resumeAsyncRuntimeQueueScheduler(
+            handle: Long,
+            syntheticSysTimeNs: Long,
+        ): String
+
+        // Forward-only, quiescent-only seek (fail closed otherwise): needs
+        // every prior command processed, no EOS, an empty source ring, a
+        // drained output ring, and no pending seek handshakes. The owner
+        // publishes the source writer seek request, the worker consumes
+        // the source ack + calls coordinator.seek, and the caller must
+        // then consume the output-ring ack via the read entry point.
+        external fun seekAsyncRuntimeQueueScheduler(
+            handle: Long,
+            targetPtsUs: Long,
+            syntheticSysTimeNs: Long,
+        ): String
+
+        // Owner-thread source-ring producer through the NODE-OWNED writer.
+        // Accepted frames are clamped to
+        // min(frameCount, 8192, framesThatFitInBuffer); writer
+        // backpressure (ring_full/partial_write) is a reported outcome.
+        external fun ingestAsyncRuntimeQueueSchedulerPcm16(
+            handle: Long,
+            pcm: java.nio.ByteBuffer,
+            frameCount: Int,
+        ): String
+
+        // Writer-local EOS; also arms the worker's bounded zero-fill probe
+        // lane on the deterministic frame axis (provider zero-fill is
+        // reported honestly, never hidden as recovery).
+        external fun setAsyncRuntimeQueueSchedulerEos(
+            handle: Long,
+        ): String
+
+        // Owner-thread output-ring consumer: consumes a pending start/seek
+        // ack first (reporting discarded frames), then pops mixed PCM16
+        // into the direct ByteBuffer. maxFrames == 0 is a legal ack-only
+        // call.
+        external fun readAsyncRuntimeQueueSchedulerOutputPcm16(
+            handle: Long,
+            pcm: java.nio.ByteBuffer,
+            maxFrames: Int,
+        ): String
+
+        // Owner-thread-only. All coordinator/provider/worker facts come
+        // from the worker-published mirror; includes owner/worker thread
+        // identity hashes, command enqueue/process counts,
+        // ownerDispatchCalls=0, dispatch/backpressure/zero-fill counters,
+        // checksums, seek-ack state, join/destroy counts, and the verbatim
+        // proof boundary.
+        external fun snapshotAsyncRuntimeQueueScheduler(
+            handle: Long,
+        ): String
+
+        // Any-thread, idempotent erase-once destroy: sets the stop flag,
+        // wakes the worker, and JOINS (never detaches) before replying
+        // with the race-free final counters. Second call / unknown handle
+        // returns status=not_found.
+        external fun destroyAsyncRuntimeQueueSchedulerSession(
+            handle: Long,
+        ): String
     }
 
     external fun probeCapabilities(): BackendCapabilityReport

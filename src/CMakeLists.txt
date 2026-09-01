@@ -137,6 +137,7 @@ if (ANDROID)
     "platform/android/src/android_phase4_node_owned_source_graph_pipeline_session_jni.cpp"
     "platform/android/src/android_phase4_multi_source_node_owned_pipeline_session_jni.cpp"
     "platform/android/src/android_phase4_aaudio_node_owned_sink_session_jni.cpp"
+    "platform/android/src/android_phase4_async_runtime_queue_scheduler_session_jni.cpp"
     "platform/android/src/android_phase3_multicam_compositor_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_render_jni.cpp"
   )
