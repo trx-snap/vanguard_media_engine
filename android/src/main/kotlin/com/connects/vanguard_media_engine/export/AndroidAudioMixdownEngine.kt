@@ -4,15 +4,16 @@ import android.util.Log
 
 // ── AndroidAudioMixdownEngine (Export/Audio Unit B) ───────────────────────────
 //
-// Diagnostic PCM mixdown: decodes each valid sidecar track, places it at its
-// startTime on an output-timeline, and routes the placement to
-// AndroidNativeAudioMixBusChunkMixer, which slices the timeline into
-// kChunkFrames windows and mixes each non-silent window through the native
-// vanguard::audio::AudioMixBusNode PCM16 mix bus (per-frame
-// AndroidAudioVolumeEnvelope gain is still evaluated in Kotlin; native owns
-// channel mapping, summation, and the 16-bit clamp). See
-// AndroidNativeAudioMixBusChunkMixer's header for the +/-1 LSB rounding-order
-// note versus the old all-Kotlin summation.
+// Production Pass-2 PCM mixdown: decodes each valid sidecar track, places it
+// at its startTime on an output-timeline, and routes the placement through
+// AndroidNativeAudioGraphExportMixer — ONE native True-DAG audio graph
+// export session (Graph + AudioMixBusNode + N node-owned
+// DecodedAudioPcmSourceNode rings routed by GraphAudioScheduler) that owns
+// cross-source summation and the final int16 clamp. Kotlin still owns
+// decode, per-frame AndroidAudioVolumeEnvelope evaluation/clamping, and
+// source-channel conversion (mono<->stereo) before ingest. The legacy
+// AndroidNativeAudioMixBusChunkMixer remains available for
+// rollback/harness comparison but is no longer the production route.
 //
 // Constraints in this slice:
 //   - Output sample rate follows the FIRST successfully decoded track
@@ -23,14 +24,17 @@ import android.util.Log
 //     channels; stereo → mono averages. More than 2 channels is unsupported.
 //   - Tracks that fail parsing/decoding are skipped with evidence in
 //     [AndroidAudioMixdownResult.skippedTracks]; at least one track must mix.
-//   - More than 2 simultaneously active tracks in any output chunk is an
-//     explicit non-claim left to P4-MULTITRACK-EXPORT: mixing fails closed
-//     with reason "native_audio_mix_bus:overlap_depth_exceeded:<n>".
+//   - More than 8 total decoded tracks is an explicit non-claim: the graph
+//     session admits at most 8 sources, so mixing fails closed with reason
+//     "native_audio_graph_export:total_track_count_exceeded:<n>".
 
 /// Structured mixdown outcome. [pcm] is 16-bit interleaved output-timeline
-/// samples on success. The native* fields are diagnostic evidence of the
-/// P4-AUDIO-MIXBUS chunked native routing and default to their "not used"
-/// values for failures that occur before native mixing is attempted.
+/// samples on success. The native* fields are evidence of the
+/// P4-AUDIO-PASS2-GRAPH-REROUTE native graph routing and default to their
+/// "not used" values for failures that occur before native mixing is
+/// attempted. nativeChunkCount/nativeSilentChunks/nativeMixReason/
+/// nativeGainClamped are kept for caller compatibility and now carry the
+/// graph route's windowCount/silentWindowCount/reason/gainClamped.
 data class AndroidAudioMixdownResult(
     val success: Boolean,
     val reason: String,
@@ -45,6 +49,11 @@ data class AndroidAudioMixdownResult(
     val nativeSilentChunks: Int = 0,
     val nativeMixReason: String = "",
     val nativeGainClamped: Boolean = false,
+    val nativeMixRoute: String = "",
+    val nativeMixRouteReason: String = "",
+    val nativeMixTotalTrackCount: Int = 0,
+    val nativeGraphRoutedSourceCount: Int = 0,
+    val nativeGraphWindowCount: Int = 0,
 ) {
     override fun equals(other: Any?): Boolean = this === other
     override fun hashCode(): Int = System.identityHashCode(this)
@@ -118,14 +127,14 @@ object AndroidAudioMixdownEngine {
 
         val totalFrames = Math.ceil(timelineEndSec * outputSampleRate).toInt()
 
-        val chunkTrackInputs = decoded.map { d ->
+        val graphTrackInputs = decoded.map { d ->
             val spec = d.spec
             val decode = d.decode
             val startFrame = Math.round(spec.startTime * outputSampleRate).toInt()
             val trackStartSec = spec.startTime
             val trackEndSec = spec.startTime + decode.frameCount.toDouble() / outputSampleRate
             val envelope = AndroidAudioVolumeEnvelope.forTrack(spec, trackStartSec, trackEndSec)
-            AndroidNativeAudioMixBusChunkMixer.ChunkTrackInput(
+            AndroidNativeAudioGraphExportMixer.GraphTrackInput(
                 trackId = spec.trackId,
                 startFrame = startFrame,
                 pcm = decode.pcm!!,
@@ -135,17 +144,17 @@ object AndroidAudioMixdownEngine {
             )
         }
 
-        val nativeResult = AndroidNativeAudioMixBusChunkMixer.mix(
-            tracks = chunkTrackInputs,
+        val graphResult = AndroidNativeAudioGraphExportMixer.mix(
+            tracks = graphTrackInputs,
             outputSampleRate = outputSampleRate,
             outputChannelCount = outputChannels,
             totalFrames = totalFrames,
         )
-        if (!nativeResult.success || nativeResult.pcm == null) {
-            Log.e(TAG, "native mix bus failed — reason=${nativeResult.reason}")
+        if (!graphResult.success || graphResult.pcm == null) {
+            Log.e(TAG, "native graph export mix failed — reason=${graphResult.reason}")
             return AndroidAudioMixdownResult(
                 success = false,
-                reason = "native_audio_mix_bus:${nativeResult.reason}",
+                reason = "native_audio_graph_export:${graphResult.reason}",
                 pcm = null,
                 sampleRate = 0,
                 channelCount = 0,
@@ -153,10 +162,15 @@ object AndroidAudioMixdownEngine {
                 mixedTrackCount = 0,
                 skippedTracks = skipped,
                 nativeMixBusUsed = true,
-                nativeChunkCount = nativeResult.chunkCount,
-                nativeSilentChunks = nativeResult.silentChunks,
-                nativeMixReason = nativeResult.reason,
-                nativeGainClamped = nativeResult.gainClamped,
+                nativeChunkCount = graphResult.windowCount,
+                nativeSilentChunks = graphResult.silentWindowCount,
+                nativeMixReason = graphResult.reason,
+                nativeGainClamped = graphResult.gainClamped,
+                nativeMixRoute = "graph",
+                nativeMixRouteReason = graphResult.reason,
+                nativeMixTotalTrackCount = decoded.size,
+                nativeGraphRoutedSourceCount = graphResult.routedSourceCount,
+                nativeGraphWindowCount = graphResult.windowCount,
             )
         }
 
@@ -164,22 +178,29 @@ object AndroidAudioMixdownEngine {
             TAG,
             "mix OK — tracks=${decoded.size} skipped=${skipped.size} " +
                 "frames=$totalFrames rate=$outputSampleRate ch=$outputChannels " +
-                "nativeChunks=${nativeResult.chunkCount} nativeSilentChunks=${nativeResult.silentChunks}",
+                "graphWindows=${graphResult.windowCount} " +
+                "graphSilentWindows=${graphResult.silentWindowCount} " +
+                "graphRoutedSources=${graphResult.routedSourceCount}",
         )
         return AndroidAudioMixdownResult(
             success = true,
             reason = "success",
-            pcm = nativeResult.pcm,
+            pcm = graphResult.pcm,
             sampleRate = outputSampleRate,
             channelCount = outputChannels,
             frameCount = totalFrames,
             mixedTrackCount = decoded.size,
             skippedTracks = skipped,
             nativeMixBusUsed = true,
-            nativeChunkCount = nativeResult.chunkCount,
-            nativeSilentChunks = nativeResult.silentChunks,
-            nativeMixReason = nativeResult.reason,
-            nativeGainClamped = nativeResult.gainClamped,
+            nativeChunkCount = graphResult.windowCount,
+            nativeSilentChunks = graphResult.silentWindowCount,
+            nativeMixReason = "success",
+            nativeGainClamped = graphResult.gainClamped,
+            nativeMixRoute = "graph",
+            nativeMixRouteReason = graphResult.reason,
+            nativeMixTotalTrackCount = decoded.size,
+            nativeGraphRoutedSourceCount = graphResult.routedSourceCount,
+            nativeGraphWindowCount = graphResult.windowCount,
         )
     }
 
