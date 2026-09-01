@@ -22,6 +22,8 @@ const _kEnvelopePassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_MULTI_SOURCE_DYNAMIC_GAIN_ENVELOPE_SMOKE_PASS';
 const _kNonZeroGainPassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_PHYSICAL_SMOKE_PASS';
+const _kFocusNoisyPassMarker =
+    'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_PHYSICAL_SMOKE_PASS';
 const _kTrack0Hex = '00000000abcdef12';
 const _kTrack1Hex = '00000000abcdef34';
 const _kMixHex = '00000000abcdef56';
@@ -1064,6 +1066,224 @@ void main() {
 
       expect(capturedArgs?.containsKey('nonZeroGainSinkProofEnabled'), isFalse);
     });
+  });
+
+  group('X7 focus/noisy event-plane proof mode', () {
+    // X7 pass sample map: X4 base with X7 marker, mode flag, and event-plane
+    // lane/metric additions from coordinator extraLanes/extraMetrics.
+    Map<String, Object?> createX7SampleRawMap([
+      Map<String, Object?>? overrides,
+    ]) {
+      final result = _createSampleRawMap();
+      result['marker'] = _kFocusNoisyPassMarker;
+      (result['raw'] as Map<String, String>)['marker'] = _kFocusNoisyPassMarker;
+      final lanes = result['lanes'] as Map<String, Object?>;
+      lanes['audioFocusRequestGrantedOk'] = true;
+      lanes['audioFocusAbandonedOk'] = true;
+      lanes['noisyReceiverRegisteredOk'] = true;
+      lanes['noisyReceiverUnregisteredOk'] = true;
+      lanes['focusNoisyOwnerThreadDrainOk'] = true;
+      lanes['focusNoisyEventHandoffGatesHeld'] = true;
+      final metrics = result['metrics'] as Map<String, Object?>;
+      metrics['focusNoisyEventHandoffProofEnabled'] = true;
+      metrics['focusNoisySyntheticEventsPosted'] = 2;
+      metrics['focusNoisyEventsEnqueued'] = 2;
+      metrics['focusNoisyEventsDropped'] = 0;
+      metrics['focusNoisyEventsDrained'] = 2;
+      if (overrides != null) {
+        for (final entry in overrides.entries) {
+          if (lanes.containsKey(entry.key)) lanes[entry.key] = entry.value;
+          if (metrics.containsKey(entry.key)) metrics[entry.key] = entry.value;
+          result[entry.key] = entry.value;
+        }
+      }
+      return result;
+    }
+
+    test('default X4 pass report has focusNoisyEventHandoffProofEnabled=false '
+        'and gate vacuously true', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createSampleRawMap(),
+          );
+      expect(report.focusNoisyEventHandoffProofEnabled, isFalse);
+      expect(report.audioFocusRequestGrantedOk, isFalse);
+      expect(report.audioFocusAbandonedOk, isFalse);
+      expect(report.noisyReceiverRegisteredOk, isFalse);
+      expect(report.noisyReceiverUnregisteredOk, isFalse);
+      expect(report.focusNoisySyntheticEventsPosted, equals(0));
+      expect(report.focusNoisyEventsEnqueued, equals(0));
+      expect(report.focusNoisyEventsDrained, equals(0));
+      expect(report.focusNoisyEventsDropped, equals(0));
+      expect(report.focusNoisyOwnerThreadDrainOk, isFalse);
+      // Gate is vacuously true when X7 disabled.
+      expect(report.focusNoisyEventHandoffGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X7 pass report passes all gates with focus/receiver/event OK', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX7SampleRawMap(),
+          );
+      expect(report.marker, equals(_kFocusNoisyPassMarker));
+      expect(report.focusNoisyEventHandoffProofEnabled, isTrue);
+      expect(report.audioFocusRequestGrantedOk, isTrue);
+      expect(report.audioFocusAbandonedOk, isTrue);
+      expect(report.noisyReceiverRegisteredOk, isTrue);
+      expect(report.noisyReceiverUnregisteredOk, isTrue);
+      expect(report.focusNoisySyntheticEventsPosted, equals(2));
+      expect(report.focusNoisyEventsEnqueued, equals(2));
+      expect(report.focusNoisyEventsDrained, equals(2));
+      expect(report.focusNoisyEventsDropped, equals(0));
+      expect(report.focusNoisyOwnerThreadDrainOk, isTrue);
+      expect(report.focusNoisyEventHandoffGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X7 run must carry the focus/noisy pass marker', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX7SampleRawMap({'marker': _kPassMarker}),
+          );
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X7 requires audioFocusRequestGrantedOk', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX7SampleRawMap({'audioFocusRequestGrantedOk': false}),
+          );
+      expect(report.focusNoisyEventHandoffGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X7 requires audioFocusAbandonedOk', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX7SampleRawMap({'audioFocusAbandonedOk': false}),
+          );
+      expect(report.focusNoisyEventHandoffGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X7 requires noisyReceiverRegisteredOk', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX7SampleRawMap({'noisyReceiverRegisteredOk': false}),
+          );
+      expect(report.focusNoisyEventHandoffGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X7 requires noisyReceiverUnregisteredOk', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX7SampleRawMap({'noisyReceiverUnregisteredOk': false}),
+          );
+      expect(report.focusNoisyEventHandoffGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X7 requires focusNoisyOwnerThreadDrainOk', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX7SampleRawMap({'focusNoisyOwnerThreadDrainOk': false}),
+          );
+      expect(report.focusNoisyEventHandoffGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X7 requires focusNoisyEventHandoffGatesHeld native lane', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX7SampleRawMap({'focusNoisyEventHandoffGatesHeld': false}),
+          );
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X7 dropped events cause gate failure (enqueued != drained)', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX7SampleRawMap({
+              'focusNoisyEventsDropped': 1,
+              'focusNoisyEventsEnqueued': 3,
+              'focusNoisyEventsDrained': 2,
+            }),
+          );
+      // dropped > 0 violates the gate
+      expect(report.focusNoisyEventsDropped, equals(1));
+      expect(report.focusNoisyEventHandoffGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X7 gate fails when drained != enqueued', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX7SampleRawMap({
+              'focusNoisyEventsEnqueued': 2,
+              'focusNoisyEventsDrained': 1,
+            }),
+          );
+      expect(report.focusNoisyEventHandoffGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X7 gate fails when no synthetic events posted', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX7SampleRawMap({
+              'focusNoisySyntheticEventsPosted': 0,
+              'focusNoisyEventsEnqueued': 0,
+              'focusNoisyEventsDrained': 0,
+            }),
+          );
+      expect(report.focusNoisyEventHandoffGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X7 mode sends focusNoisyEventHandoffProofEnabled=true', () async {
+      Map<String, Object?>? capturedArgs;
+
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+        capturedArgs = (call.arguments as Map).cast<String, Object?>();
+        return createX7SampleRawMap();
+      });
+
+      final report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: '/tmp/clip_B.mov',
+            focusNoisyEventHandoffProofEnabled: true,
+          );
+
+      expect(capturedArgs?['focusNoisyEventHandoffProofEnabled'], isTrue);
+      expect(capturedArgs?.containsKey('envelopeProofEnabled'), isFalse);
+      expect(capturedArgs?.containsKey('nonZeroGainSinkProofEnabled'), isFalse);
+      expect(report.pass, isTrue);
+      expect(report.focusNoisyEventHandoffProofEnabled, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test(
+      'default X4 run does NOT send focusNoisyEventHandoffProofEnabled',
+      () async {
+        Map<String, Object?>? capturedArgs;
+
+        binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+          capturedArgs = (call.arguments as Map).cast<String, Object?>();
+          return _createSampleRawMap();
+        });
+
+        await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+          sourcePath: '/tmp/clip_B.mov',
+        );
+
+        expect(
+          capturedArgs?.containsKey('focusNoisyEventHandoffProofEnabled'),
+          isFalse,
+        );
+      },
+    );
   });
 
   group('Equality, hashCode, and toString', () {

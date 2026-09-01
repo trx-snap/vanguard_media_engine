@@ -81,6 +81,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_PHYSICAL_SMOKE_PASS"
         const val NONZERO_GAIN_FAIL_MARKER =
             "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_PHYSICAL_SMOKE_FAIL"
+        // X7 (P4-AUDIO-FOCUS-NOISY-EVENT-HANDOFF) markers, emitted only for
+        // focus/noisy event-plane proof runs; X4/X5/X6 markers remain
+        // authoritative for their respective modes.
+        const val FOCUS_NOISY_PASS_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_PHYSICAL_SMOKE_PASS"
+        const val FOCUS_NOISY_FAIL_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_PHYSICAL_SMOKE_FAIL"
         const val PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_realtime_wall_clock_pacing_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_avsync_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
@@ -148,6 +155,8 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         val envelopeProofEnabled: Boolean = false,
         // X6 mode switch: false preserves the exact X4/X5 muted-output behavior.
         val nonZeroGainSinkProofEnabled: Boolean = false,
+        // X7 mode switch: false preserves the exact X4/X5/X6 behavior and args.
+        val focusNoisyEventHandoffProofEnabled: Boolean = false,
     )
 
     // Lanes/metrics are flat maps so the coordinator payload and the
@@ -304,10 +313,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
     private var nonZeroGainSetOk = false
     private var audioTrackGain = 0.0f
     private var nonZeroGainSinkGatesHeld = false
+    // X7 focus/noisy event-plane drain function (coordinator-supplied, owner-thread only).
+    private var drainEventsFn: (() -> Int)? = null
     private val detailParts = mutableListOf<String>()
 
-    fun run(runConfig: RunConfig): RunResult {
+    fun run(runConfig: RunConfig, drainEventsFn: (() -> Int)? = null): RunResult {
         config = runConfig
+        this.drainEventsFn = drainEventsFn
         deadline = SystemClock.elapsedRealtime() + config.deadlineMs
         mfpm = config.maxFramesPerMix.toLong()
         runThreadId = Thread.currentThread().id
@@ -1022,6 +1034,8 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             }
         }
         buf.clear()
+        // X7 drain point: owner thread, after write loop completes.
+        drainEventsFn?.invoke()
     }
 
     // ── AudioTrack lifecycle / pre-roll / seek epoch ────────────────────────
@@ -1158,6 +1172,8 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             throw FailClosed("audio_track_not_paused_at_seek")
         }
         track.flush()
+        // X7 drain point: owner thread, at seek boundary.
+        drainEventsFn?.invoke()
     }
 
     // Post-EOS sink finalization: zero staged residual, epoch-1 head
@@ -1181,6 +1197,8 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         playbackHeadTelemetryOk = progress > 0L && playbackHeadAtSeek >= 0L
         if (!playbackHeadTelemetryOk) throw FailClosed("playback_head_not_progressed")
         captureEpochUnderrunDelta("epoch1")
+        // X7 drain point: owner thread, at EOS finalization.
+        drainEventsFn?.invoke()
     }
 
     // Opens a sink write epoch: zeroed counters, fresh unsigned-masked head
@@ -1390,8 +1408,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "audioTrackGain" to audioTrackGain.toDouble(),
             "audioTrackNonZeroGainSetOk" to nonZeroGainSetOk,
             "nonZeroGainSinkGatesHeld" to nonZeroGainSinkGatesHeld,
+            "focusNoisyEventHandoffProofEnabled" to config.focusNoisyEventHandoffProofEnabled,
         )
         val marker = when {
+            config.focusNoisyEventHandoffProofEnabled ->
+                if (pass) FOCUS_NOISY_PASS_MARKER else FOCUS_NOISY_FAIL_MARKER
             config.nonZeroGainSinkProofEnabled ->
                 if (pass) NONZERO_GAIN_PASS_MARKER else NONZERO_GAIN_FAIL_MARKER
             config.envelopeProofEnabled ->

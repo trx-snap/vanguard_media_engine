@@ -483,6 +483,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         asyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator = AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
+            context = binding.applicationContext,
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(

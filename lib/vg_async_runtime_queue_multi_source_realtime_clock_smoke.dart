@@ -156,6 +156,16 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   static const String nonZeroGainSinkFailMarkerConstant =
       'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_PHYSICAL_SMOKE_FAIL';
 
+  /// Canonical pass marker emitted by the native harness for X7
+  /// focus/noisy event-plane proof runs.
+  static const String focusNoisyEventHandoffPassMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_PHYSICAL_SMOKE_PASS';
+
+  /// Canonical fail marker emitted by the native harness for X7
+  /// focus/noisy event-plane proof runs.
+  static const String focusNoisyEventHandoffFailMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_PHYSICAL_SMOKE_FAIL';
+
   /// Canonical Kotlin driver proof boundary string (muted AudioTrack sink
   /// claim included) emitted by the native harness.
   static const String proofBoundaryConstant =
@@ -593,6 +603,72 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
         audioTrackGain <= 1.0;
   }
 
+  // ── X7 focus/noisy event-plane proof getters ──────────────────────────────
+
+  /// Whether this run executed the X7 focus/noisy event-plane proof mode
+  /// (false for every default X4/X5/X6 run).
+  bool get focusNoisyEventHandoffProofEnabled =>
+      _boolFact('focusNoisyEventHandoffProofEnabled');
+
+  /// Whether AudioManager.requestAudioFocus returned AUDIOFOCUS_REQUEST_GRANTED
+  /// in X7 mode (false in X4/X5/X6 mode).
+  bool get audioFocusRequestGrantedOk =>
+      _boolFact('audioFocusRequestGrantedOk');
+
+  /// Whether AudioManager.abandonAudioFocus(Request) was called exactly once
+  /// in X7 mode (false in X4/X5/X6 mode).
+  bool get audioFocusAbandonedOk => _boolFact('audioFocusAbandonedOk');
+
+  /// Whether the ACTION_AUDIO_BECOMING_NOISY receiver was registered in X7
+  /// mode (false in X4/X5/X6 mode).
+  bool get noisyReceiverRegisteredOk => _boolFact('noisyReceiverRegisteredOk');
+
+  /// Whether the ACTION_AUDIO_BECOMING_NOISY receiver was unregistered
+  /// exactly once in X7 mode (false in X4/X5/X6 mode).
+  bool get noisyReceiverUnregisteredOk =>
+      _boolFact('noisyReceiverUnregisteredOk');
+
+  /// Number of synthetic focus/noisy events posted via the main handler in
+  /// X7 mode (0 in X4/X5/X6 mode).
+  int get focusNoisySyntheticEventsPosted =>
+      _intFact('focusNoisySyntheticEventsPosted');
+
+  /// Total events enqueued into the bounded event queue across all callbacks
+  /// in X7 mode (0 in X4/X5/X6 mode).
+  int get focusNoisyEventsEnqueued => _intFact('focusNoisyEventsEnqueued');
+
+  /// Total events drained on the owner thread in X7 mode (0 in X4/X5/X6
+  /// mode).
+  int get focusNoisyEventsDrained => _intFact('focusNoisyEventsDrained');
+
+  /// Total events dropped due to queue overflow in X7 mode; must be 0 for
+  /// normal proof (0 in X4/X5/X6 mode).
+  int get focusNoisyEventsDropped => _intFact('focusNoisyEventsDropped');
+
+  /// Whether at least one owner-thread drain call returned > 0 events in X7
+  /// mode (false in X4/X5/X6 mode).
+  bool get focusNoisyOwnerThreadDrainOk =>
+      _boolFact('focusNoisyOwnerThreadDrainOk');
+
+  /// X7 focus/noisy event-plane handoff gate.
+  /// In X7 mode: all focus/receiver/event sub-gates must hold and the event
+  /// accounting identity enqueued == drained (dropped == 0) must be
+  /// satisfied.
+  /// In default X4/X5/X6 mode: vacuously true (no focus or receiver was
+  /// touched; backward-compatible with all prior proof shapes).
+  bool get focusNoisyEventHandoffGatesHeld {
+    if (!focusNoisyEventHandoffProofEnabled) return true;
+    return audioFocusRequestGrantedOk &&
+        audioFocusAbandonedOk &&
+        noisyReceiverRegisteredOk &&
+        noisyReceiverUnregisteredOk &&
+        focusNoisySyntheticEventsPosted > 0 &&
+        focusNoisyEventsEnqueued > 0 &&
+        focusNoisyEventsDropped == 0 &&
+        focusNoisyEventsDrained == focusNoisyEventsEnqueued &&
+        focusNoisyOwnerThreadDrainOk;
+  }
+
   /// Whether [proofBoundary] matches the canonical Kotlin driver boundary.
   bool get hasCanonicalProofBoundary => proofBoundary == proofBoundaryConstant;
 
@@ -662,7 +738,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       pass &&
       status.toLowerCase() == 'pass' &&
       marker ==
-          (nonZeroGainSinkProofEnabled
+          (focusNoisyEventHandoffProofEnabled
+              ? focusNoisyEventHandoffPassMarkerConstant
+              : nonZeroGainSinkProofEnabled
               ? nonZeroGainSinkPassMarkerConstant
               : envelopeProofEnabled
               ? dynamicGainEnvelopePassMarkerConstant
@@ -671,6 +749,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       (!envelopeProofEnabled || _boolFact('dynamicGainEnvelopeOk')) &&
       nonZeroGainSinkGatesHeld &&
       (!nonZeroGainSinkProofEnabled || _boolFact('nonZeroGainSinkGatesHeld')) &&
+      focusNoisyEventHandoffGatesHeld &&
+      (!focusNoisyEventHandoffProofEnabled ||
+          _boolFact('focusNoisyEventHandoffGatesHeld')) &&
       hasCanonicalProofBoundary &&
       nativeProofBoundaryOk &&
       formatProbeOk &&
@@ -1113,6 +1194,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
     int maxFramesPerMix = 256,
     bool envelopeProofEnabled = false,
     bool nonZeroGainSinkProofEnabled = false,
+    bool focusNoisyEventHandoffProofEnabled = false,
     Duration? timeout,
     MethodChannel? channel,
   }) async {
@@ -1133,6 +1215,10 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       // Only sent for X6 non-zero-gain sink proof runs so the default X4/X5
       // argument shape stays frozen.
       if (nonZeroGainSinkProofEnabled) 'nonZeroGainSinkProofEnabled': true,
+      // Only sent for X7 focus/noisy event-plane proof runs so the default
+      // X4/X5/X6 argument shape stays frozen.
+      if (focusNoisyEventHandoffProofEnabled)
+        'focusNoisyEventHandoffProofEnabled': true,
     };
     try {
       final future = ch.invokeMethod<Object?>(methodName, args);

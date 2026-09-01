@@ -325,14 +325,21 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
     // claim; no audio focus, route-change, or dead-object recovery. ────────
     final nonZeroGainPass = await _runNonZeroGainSmoke();
 
-    final allPass = pass && envelopePass && nonZeroGainPass;
+    // ── X7 (P4-AUDIO-FOCUS-NOISY-EVENT-HANDOFF): focus request/abandon
+    // and ACTION_AUDIO_BECOMING_NOISY receiver register/unregister plus
+    // synthetic event enqueue-to-owner-thread-drain proof. No playback
+    // mutation; no duck/pause/resume/restart; no acoustic claim. ─────────
+    final focusNoisyPass = await _runFocusNoisySmoke();
+
+    final allPass = pass && envelopePass && nonZeroGainPass && focusNoisyPass;
     if (mounted) {
       setState(() {
         _status = allPass
             ? 'PASS (X4 allNativeLanesPass=true, X5 envelope gates held, '
-                  'X6 non-zero-gain gates held)'
+                  'X6 non-zero-gain gates held, X7 focus/noisy gates held)'
             : 'FAIL: x4Pass=$pass, envelopePass=$envelopePass, '
                   'nonZeroGainPass=$nonZeroGainPass, '
+                  'focusNoisyPass=$focusNoisyPass, '
                   'lastError=${activeReport.lastError}, error=$topLevelError';
       });
     }
@@ -610,6 +617,148 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
           : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_NONZERO_GAIN_SINK_PHYSICAL_SMOKE_FAIL',
     );
     return nonZeroGainPass;
+  }
+
+  Future<bool> _runFocusNoisySmoke() async {
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_SMOKE_START',
+    );
+
+    VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport? report;
+    String? topLevelError;
+    File? tempSourceFile;
+
+    try {
+      final clipBData = await rootBundle.load(
+        'assets/manual_test_clips/clip_B.mov',
+      );
+      final tempDir = Directory.systemTemp;
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+      tempSourceFile = File(
+        '${tempDir.path}/p4_async_rt_queue_focus_noisy_source_$timestamp.mov',
+      );
+
+      await tempSourceFile.writeAsBytes(
+        clipBData.buffer.asUint8List(
+          clipBData.offsetInBytes,
+          clipBData.lengthInBytes,
+        ),
+        flush: true,
+      );
+
+      report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: tempSourceFile.path,
+            focusNoisyEventHandoffProofEnabled: true,
+            timeout: const Duration(seconds: 45),
+          ).timeout(const Duration(seconds: 55));
+    } on TimeoutException catch (te) {
+      topLevelError = 'timeout: $te';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_ERROR: $topLevelError',
+      );
+    } catch (e, st) {
+      topLevelError = '$e\n$st';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_ERROR: $topLevelError',
+      );
+    } finally {
+      if (tempSourceFile != null) {
+        try {
+          if (await tempSourceFile.exists()) {
+            await tempSourceFile.delete();
+          }
+        } catch (_) {}
+      }
+    }
+
+    final fnReport =
+        report ??
+        VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+          <String, Object?>{
+            'pass': false,
+            'status': 'fail',
+            'marker': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .focusNoisyEventHandoffFailMarkerConstant,
+            'proofBoundary': '',
+            'nativeProofBoundary': '',
+            'failureReason': 'invocation_failed',
+            'lastError': 'invocation_failed',
+          },
+        );
+
+    // Focus / Noisy Event-Plane group.
+    print(
+      '  [LANE] Focus/Noisy Event-Plane: '
+      'focusNoisyEventHandoffProofEnabled=${fnReport.focusNoisyEventHandoffProofEnabled}, '
+      'audioFocusRequestGrantedOk=${fnReport.audioFocusRequestGrantedOk}, '
+      'audioFocusAbandonedOk=${fnReport.audioFocusAbandonedOk}, '
+      'noisyReceiverRegisteredOk=${fnReport.noisyReceiverRegisteredOk}, '
+      'noisyReceiverUnregisteredOk=${fnReport.noisyReceiverUnregisteredOk}, '
+      'focusNoisySyntheticEventsPosted=${fnReport.focusNoisySyntheticEventsPosted}, '
+      'focusNoisyEventsEnqueued=${fnReport.focusNoisyEventsEnqueued}, '
+      'focusNoisyEventsDrained=${fnReport.focusNoisyEventsDrained}, '
+      'focusNoisyEventsDropped=${fnReport.focusNoisyEventsDropped}, '
+      'focusNoisyOwnerThreadDrainOk=${fnReport.focusNoisyOwnerThreadDrainOk}, '
+      'focusNoisyEventHandoffGatesHeld=${fnReport.focusNoisyEventHandoffGatesHeld}, '
+      'allNativeLanesPass=${fnReport.allNativeLanesPass}, '
+      'marker=${fnReport.marker}, '
+      'lastError=${fnReport.lastError}',
+    );
+
+    final lastErrorOk =
+        fnReport.lastError.isEmpty ||
+        fnReport.lastError == 'none' ||
+        fnReport.lastError == 'null';
+
+    final focusNoisyPass =
+        (topLevelError == null) &&
+        fnReport.pass &&
+        fnReport.marker ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .focusNoisyEventHandoffPassMarkerConstant &&
+        fnReport.focusNoisyEventHandoffProofEnabled &&
+        fnReport.focusNoisyEventHandoffGatesHeld &&
+        fnReport.audioFocusRequestGrantedOk &&
+        fnReport.audioFocusAbandonedOk &&
+        fnReport.noisyReceiverRegisteredOk &&
+        fnReport.noisyReceiverUnregisteredOk &&
+        fnReport.focusNoisySyntheticEventsPosted > 0 &&
+        fnReport.focusNoisyEventsEnqueued > 0 &&
+        fnReport.focusNoisyEventsDropped == 0 &&
+        fnReport.focusNoisyEventsDrained == fnReport.focusNoisyEventsEnqueued &&
+        fnReport.focusNoisyOwnerThreadDrainOk &&
+        fnReport.hasCanonicalProofBoundary &&
+        fnReport.nativeProofBoundaryOk &&
+        fnReport.checksumsMatch &&
+        fnReport.providerCountersClean &&
+        fnReport.sinkAccountingBalanced &&
+        fnReport.realtimeGatesHeld &&
+        fnReport.allNativeLanesPass &&
+        lastErrorOk;
+
+    final summaryPayload = <String, dynamic>{
+      'unit':
+          'AndroidAsyncRuntimeQueueFocusNoisyEventHandoffPhysicalSmokeHarness',
+      'slice': 'P4-AUDIO-FOCUS-NOISY-EVENT-HANDOFF',
+      'target': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .proofBoundaryConstant,
+      'nativeTarget': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .nativeProofBoundaryConstant,
+      'pass': focusNoisyPass,
+      'report': fnReport.toMap(),
+      'error': topLevelError,
+    };
+
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_JSON:${jsonEncode(summaryPayload)}',
+    );
+    print(
+      focusNoisyPass
+          ? 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_PHYSICAL_SMOKE_PASS'
+          : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_NOISY_EVENT_HANDOFF_PHYSICAL_SMOKE_FAIL',
+    );
+    return focusNoisyPass;
   }
 
   @override
