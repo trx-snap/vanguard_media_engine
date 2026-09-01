@@ -30,12 +30,17 @@ const _kFocusLossPauseResumePassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_FOCUS_LOSS_PAUSE_RESUME_PHYSICAL_SMOKE_PASS';
 const _kPermanentFocusLossPassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_PERMANENT_FOCUS_LOSS_PHYSICAL_SMOKE_PASS';
+const _kRouteChangeEventHandoffPassMarker =
+    'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_PHYSICAL_SMOKE_PASS';
 
 const _kFocusLossPauseResumeProofBoundary =
     'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_loss_pause_resume_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_play_only_base_gain_0_5_transient_loss_pause_focus_gain_play_becoming_noisy_terminal_pause_no_flush_no_stop_no_auto_resume_before_release_no_transport_pause_no_presentation_pause_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_sla_no_production_restart_policy_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
 
 const _kPermanentFocusLossProofBoundary =
     'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_loss_permanent_stop_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_only_base_gain_0_5_permanent_loss_terminal_pause_synthetic_focus_gain_attempt_rejected_no_play_no_auto_resume_no_flush_no_stop_no_release_recreate_no_transport_pause_no_presentation_pause_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_sla_no_production_restart_policy_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
+
+const _kRouteChangeEventHandoffProofBoundary =
+    'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_route_change_event_handoff_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_only_base_gain_0_5_route_changed_pre_start_synthetic_drain_route_disconnect_terminal_synthetic_pause_fail_closed_no_play_no_auto_resume_no_route_recreation_no_stream_reanchor_no_dead_object_recovery_routing_listener_registered_and_unregistered_exactly_once_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_seamless_route_recreation_no_hot_swap_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
 
 const _kFocusDuckRestoreProofBoundary =
     'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_duck_restore_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_focus_duck_restore_setvolume_only_base_gain_0_5_duck_gain_0_1_restore_gain_0_5_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_restart_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
@@ -2633,6 +2638,587 @@ void main() {
         isFalse,
       );
     });
+  });
+
+  group('X11 route-change event-handoff response proof mode', () {
+    // X11 pass sample map: X4 base with the X11 marker, the X11 mode-specific
+    // proof boundary, the implied X7 focus/noisy lanes/metrics, the implied
+    // non-zero 0.5 base gain facts, and the X11 route-change lanes/metrics.
+    // X8 duck/restore, X9 transient pause/resume and X10 permanent-stop facts
+    // stay at their defaults: X11 never enables X8, X9 or X10.
+    Map<String, Object?> createX11SampleRawMap([
+      Map<String, Object?>? overrides,
+    ]) {
+      final result = _createSampleRawMap();
+      result['marker'] = _kRouteChangeEventHandoffPassMarker;
+      result['proofBoundary'] = _kRouteChangeEventHandoffProofBoundary;
+      final rawStrings = result['raw'] as Map<String, String>;
+      rawStrings['marker'] = _kRouteChangeEventHandoffPassMarker;
+      rawStrings['proofBoundary'] = _kRouteChangeEventHandoffProofBoundary;
+      final lanes = result['lanes'] as Map<String, Object?>;
+      // X11 implies the non-zero base gain: the muted lane is honestly false.
+      lanes['mutedOutputOk'] = false;
+      // Implied X7 focus/noisy lanes.
+      lanes['audioFocusRequestGrantedOk'] = true;
+      lanes['audioFocusAbandonedOk'] = true;
+      lanes['noisyReceiverRegisteredOk'] = true;
+      lanes['noisyReceiverUnregisteredOk'] = true;
+      lanes['focusNoisyOwnerThreadDrainOk'] = true;
+      lanes['focusNoisyEventHandoffGatesHeld'] = true;
+      // X11 driver lanes.
+      lanes['routingListenerRegisteredOk'] = true;
+      lanes['routingListenerUnregisteredOk'] = true;
+      lanes['routeChangeObservationOk'] = true;
+      lanes['routeDisconnectFailClosedPauseOk'] = true;
+      lanes['terminalPlayStatePausedBeforeReleaseRouteChangeOk'] = true;
+      // X11 coordinator lane.
+      lanes['routeChangeEventHandoffGatesHeld'] = true;
+      final metrics = result['metrics'] as Map<String, Object?>;
+      // Implied X7 metrics.
+      metrics['focusNoisyEventHandoffProofEnabled'] = true;
+      metrics['focusNoisySyntheticEventsPosted'] = 2;
+      metrics['focusNoisyEventsEnqueued'] = 2;
+      metrics['focusNoisyEventsDropped'] = 0;
+      metrics['focusNoisyEventsDrained'] = 2;
+      // Implied non-zero 0.5 base gain facts (nonZeroGainSinkProofEnabled,
+      // focusDuckRestoreProofEnabled, focusLossPauseResumeProofEnabled and
+      // permanentFocusLossProofEnabled stay false).
+      metrics['audioTrackGain'] = 0.5;
+      metrics['audioTrackNonZeroGainSetOk'] = true;
+      metrics['focusDuckRestoreProofEnabled'] = false;
+      metrics['focusLossPauseResumeProofEnabled'] = false;
+      metrics['permanentFocusLossProofEnabled'] = false;
+      // X11 driver metrics (sink-side routed-device/playstate telemetry only).
+      metrics['routeChangeEventHandoffProofEnabled'] = true;
+      metrics['routeChangedAppliedCount'] = 1;
+      metrics['routeDisconnectAppliedCount'] = 1;
+      metrics['routeChangedApplySeq'] = 0;
+      metrics['routeDisconnectApplySeq'] = 1;
+      metrics['routedDeviceSampleOk'] = true;
+      metrics['routedDeviceTypeAtRouteChanged'] = 2;
+      metrics['playStateAfterRouteDisconnectPause'] = 2;
+      metrics['playStateAtReleaseRouteChange'] = 2;
+      // X11 coordinator metrics.
+      metrics['syntheticRouteChangedPosted'] = 1;
+      metrics['syntheticRouteDisconnectPosted'] = 1;
+      metrics['routeChangedEventsEnqueued'] = 1;
+      metrics['routeDisconnectEventsEnqueued'] = 1;
+      metrics['routeChangedEventsDrained'] = 1;
+      metrics['routeDisconnectEventsDrained'] = 1;
+      metrics['routeChangeEventsDropped'] = 0;
+      metrics['realRoutingChangedCallbackCount'] = 0;
+      if (overrides != null) {
+        for (final entry in overrides.entries) {
+          if (lanes.containsKey(entry.key)) lanes[entry.key] = entry.value;
+          if (metrics.containsKey(entry.key)) metrics[entry.key] = entry.value;
+          result[entry.key] = entry.value;
+        }
+      }
+      return result;
+    }
+
+    test('default X4 pass report has routeChangeEventHandoffProofEnabled=false '
+        'and gate vacuously true', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createSampleRawMap(),
+          );
+      expect(report.routeChangeEventHandoffProofEnabled, isFalse);
+      expect(report.routingListenerRegisteredOk, isFalse);
+      expect(report.routingListenerUnregisteredOk, isFalse);
+      expect(report.routeChangeObservationOk, isFalse);
+      expect(report.routeDisconnectFailClosedPauseOk, isFalse);
+      expect(report.terminalPlayStatePausedBeforeReleaseRouteChangeOk, isFalse);
+      expect(report.syntheticRouteChangedPosted, equals(0));
+      expect(report.syntheticRouteDisconnectPosted, equals(0));
+      expect(report.routeChangedEventsEnqueued, equals(-1));
+      expect(report.routeDisconnectEventsEnqueued, equals(-1));
+      expect(report.routeChangedEventsDrained, equals(-1));
+      expect(report.routeDisconnectEventsDrained, equals(-1));
+      expect(report.routeChangeEventsDropped, equals(0));
+      expect(report.routeChangedAppliedCount, equals(-1));
+      expect(report.routeDisconnectAppliedCount, equals(-1));
+      expect(report.routeChangedApplySeq, equals(-1));
+      expect(report.routeDisconnectApplySeq, equals(-1));
+      expect(report.realRoutingChangedCallbackCount, equals(0));
+      expect(report.playStateAfterRouteDisconnectPause, equals(-1));
+      expect(report.playStateAtReleaseRouteChange, equals(-1));
+      // Gate is vacuously true when X11 disabled.
+      expect(report.routeChangeEventHandoffGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X10 pass report keeps X11 defaults and still passes', () {
+      final result = _createSampleRawMap();
+      result['marker'] = _kPermanentFocusLossPassMarker;
+      result['proofBoundary'] = _kPermanentFocusLossProofBoundary;
+      final rawStrings = result['raw'] as Map<String, String>;
+      rawStrings['marker'] = _kPermanentFocusLossPassMarker;
+      rawStrings['proofBoundary'] = _kPermanentFocusLossProofBoundary;
+      final lanes = result['lanes'] as Map<String, Object?>;
+      lanes['mutedOutputOk'] = false;
+      lanes['audioFocusRequestGrantedOk'] = true;
+      lanes['audioFocusAbandonedOk'] = true;
+      lanes['noisyReceiverRegisteredOk'] = true;
+      lanes['noisyReceiverUnregisteredOk'] = true;
+      lanes['focusNoisyOwnerThreadDrainOk'] = true;
+      lanes['focusNoisyEventHandoffGatesHeld'] = true;
+      lanes['permanentFocusLossGatesHeld'] = true;
+      final metrics = result['metrics'] as Map<String, Object?>;
+      metrics['focusNoisyEventHandoffProofEnabled'] = true;
+      metrics['focusNoisySyntheticEventsPosted'] = 2;
+      metrics['focusNoisyEventsEnqueued'] = 2;
+      metrics['focusNoisyEventsDropped'] = 0;
+      metrics['focusNoisyEventsDrained'] = 2;
+      metrics['audioTrackGain'] = 0.5;
+      metrics['audioTrackNonZeroGainSetOk'] = true;
+      metrics['focusDuckRestoreProofEnabled'] = false;
+      metrics['focusLossPauseResumeProofEnabled'] = false;
+      metrics['permanentFocusLossProofEnabled'] = true;
+      metrics['permanentLossAppliedCount'] = 1;
+      metrics['focusGainAttemptRejectedCount'] = 1;
+      metrics['permanentFocusLossPauseOk'] = true;
+      metrics['focusGainAutoResumeRejectedOk'] = true;
+      metrics['autoResumeAllowed'] = false;
+      metrics['permanentLossApplySeq'] = 0;
+      metrics['focusGainAttemptApplySeq'] = 1;
+      metrics['playStateAfterPermanentLossPause'] = 2;
+      metrics['playStateAfterFocusGainAttempt'] = 2;
+      metrics['playStateAtReleasePermanent'] = 2;
+      metrics['terminalPlayStatePausedBeforeReleasePermanentOk'] = true;
+      metrics['syntheticPermanentLossPosted'] = 1;
+      metrics['syntheticFocusGainAttemptPosted'] = 1;
+      metrics['permanentLossEventsEnqueued'] = 1;
+      metrics['focusGainAttemptEventsEnqueued'] = 1;
+      metrics['permanentLossEventsDrained'] = 1;
+      metrics['focusGainAttemptEventsDrained'] = 1;
+      metrics['permanentFocusLossEventsDropped'] = 0;
+      metrics['permanentFocusLossRealFocusChangeCallbackCount'] = 0;
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            result,
+          );
+      expect(report.permanentFocusLossProofEnabled, isTrue);
+      expect(report.routeChangeEventHandoffProofEnabled, isFalse);
+      expect(report.routeChangeEventHandoffGatesHeld, isTrue);
+      expect(report.hasCanonicalProofBoundary, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X11 pass report passes all gates with listener registered and '
+        'unregistered, route_changed observed, route_disconnect pause ok, '
+        'strictly ordered route_changed < route_disconnect, and terminal '
+        'playstate paused', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap(),
+          );
+      expect(report.marker, equals(_kRouteChangeEventHandoffPassMarker));
+      expect(
+        report.proofBoundary,
+        equals(_kRouteChangeEventHandoffProofBoundary),
+      );
+      expect(report.routeChangeEventHandoffProofEnabled, isTrue);
+      // X11 never enables X8, X9 or X10.
+      expect(report.focusDuckRestoreProofEnabled, isFalse);
+      expect(report.focusDuckRestoreGatesHeld, isTrue);
+      expect(report.focusLossPauseResumeProofEnabled, isFalse);
+      expect(report.focusLossPauseResumeGatesHeld, isTrue);
+      expect(report.permanentFocusLossProofEnabled, isFalse);
+      expect(report.permanentFocusLossGatesHeld, isTrue);
+      // X11 gates held.
+      expect(report.routingListenerRegisteredOk, isTrue);
+      expect(report.routingListenerUnregisteredOk, isTrue);
+      expect(report.routeChangeObservationOk, isTrue);
+      expect(report.routeDisconnectFailClosedPauseOk, isTrue);
+      expect(report.terminalPlayStatePausedBeforeReleaseRouteChangeOk, isTrue);
+      expect(report.syntheticRouteChangedPosted, equals(1));
+      expect(report.syntheticRouteDisconnectPosted, equals(1));
+      expect(report.routeChangedEventsEnqueued, equals(1));
+      expect(report.routeDisconnectEventsEnqueued, equals(1));
+      expect(report.routeChangedEventsDrained, equals(1));
+      expect(report.routeDisconnectEventsDrained, equals(1));
+      expect(report.routeChangeEventsDropped, equals(0));
+      expect(report.routeChangedAppliedCount, equals(1));
+      expect(report.routeDisconnectAppliedCount, equals(1));
+      expect(report.routeChangedApplySeq, equals(0));
+      expect(report.routeDisconnectApplySeq, equals(1));
+      expect(
+        report.routeChangedApplySeq,
+        lessThan(report.routeDisconnectApplySeq),
+      );
+      expect(report.realRoutingChangedCallbackCount, equals(0));
+      expect(report.playStateAfterRouteDisconnectPause, equals(2));
+      expect(report.playStateAtReleaseRouteChange, equals(2));
+      expect(report.routeChangeEventHandoffGatesHeld, isTrue);
+      // Implied X7 and non-zero-gain gates hold too.
+      expect(report.focusNoisyEventHandoffGatesHeld, isTrue);
+      expect(report.nonZeroGainSinkGatesHeld, isTrue);
+      expect(report.hasCanonicalProofBoundary, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X11 pass report tolerates a real routing-callback handoff that '
+        'was drained and observed before the disconnect', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({
+              'realRoutingChangedCallbackCount': 1,
+              'routeChangedEventsEnqueued': 2,
+              'routeChangedEventsDrained': 2,
+              'routeChangedAppliedCount': 2,
+              'routeDisconnectApplySeq': 2,
+            }),
+          );
+      expect(report.realRoutingChangedCallbackCount, equals(1));
+      expect(report.routeChangeEventHandoffGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X11 run must carry the route-change event-handoff pass marker', () {
+      for (final wrongMarker in const [
+        _kPassMarker,
+        _kFocusNoisyPassMarker,
+        _kFocusDuckRestorePassMarker,
+        _kFocusLossPauseResumePassMarker,
+        _kPermanentFocusLossPassMarker,
+      ]) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX11SampleRawMap({'marker': wrongMarker}),
+            );
+        expect(report.allNativeLanesPass, isFalse, reason: wrongMarker);
+      }
+    });
+
+    test('X11 must carry its own proof boundary, not the default, X8, X9, or '
+        'X10 one', () {
+      for (final wrongBoundary in const [
+        _kCanonicalProofBoundary,
+        _kFocusDuckRestoreProofBoundary,
+        _kFocusLossPauseResumeProofBoundary,
+        _kPermanentFocusLossProofBoundary,
+      ]) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX11SampleRawMap({'proofBoundary': wrongBoundary}),
+            );
+        expect(
+          report.hasCanonicalProofBoundary,
+          isFalse,
+          reason: wrongBoundary,
+        );
+        expect(report.allNativeLanesPass, isFalse, reason: wrongBoundary);
+      }
+    });
+
+    test('X11 requires every route-change lane boolean', () {
+      for (final lane in const [
+        'routingListenerRegisteredOk',
+        'routingListenerUnregisteredOk',
+        'routeChangeObservationOk',
+        'routeDisconnectFailClosedPauseOk',
+        'terminalPlayStatePausedBeforeReleaseRouteChangeOk',
+      ]) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX11SampleRawMap({lane: false}),
+            );
+        expect(report.routeChangeEventHandoffGatesHeld, isFalse, reason: lane);
+        expect(report.allNativeLanesPass, isFalse, reason: lane);
+      }
+    });
+
+    test('X11 requires the routeChangeEventHandoffGatesHeld native lane', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({'routeChangeEventHandoffGatesHeld': false}),
+          );
+      expect(report.routeChangeEventHandoffGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X11 requires exactly one applied route_disconnect', () {
+      final missing =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({'routeDisconnectAppliedCount': 0}),
+          );
+      expect(missing.routeChangeEventHandoffGatesHeld, isFalse);
+      expect(missing.allNativeLanesPass, isFalse);
+
+      final duplicate =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({'routeDisconnectAppliedCount': 2}),
+          );
+      expect(duplicate.routeChangeEventHandoffGatesHeld, isFalse);
+      expect(duplicate.allNativeLanesPass, isFalse);
+    });
+
+    test('X11 requires every drained route_changed to be observed, at least '
+        'once', () {
+      final missing =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({'routeChangedAppliedCount': 0}),
+          );
+      expect(missing.routeChangeEventHandoffGatesHeld, isFalse);
+      expect(missing.allNativeLanesPass, isFalse);
+
+      // Applied twice while only one was drained: duplicate observation.
+      final duplicate =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({'routeChangedAppliedCount': 2}),
+          );
+      expect(duplicate.routeChangeEventHandoffGatesHeld, isFalse);
+      expect(duplicate.allNativeLanesPass, isFalse);
+    });
+
+    test('X11 requires per-tag synthetic posted and route_disconnect '
+        'enqueued/drained counts of exactly 1', () {
+      for (final key in const [
+        'syntheticRouteChangedPosted',
+        'syntheticRouteDisconnectPosted',
+        'routeDisconnectEventsEnqueued',
+        'routeDisconnectEventsDrained',
+      ]) {
+        final zero =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX11SampleRawMap({key: 0}),
+            );
+        expect(zero.routeChangeEventHandoffGatesHeld, isFalse, reason: key);
+        expect(zero.allNativeLanesPass, isFalse, reason: key);
+
+        final two =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX11SampleRawMap({key: 2}),
+            );
+        expect(two.routeChangeEventHandoffGatesHeld, isFalse, reason: key);
+        expect(two.allNativeLanesPass, isFalse, reason: key);
+      }
+    });
+
+    test('X11 requires route_changed enqueued/drained accounting: at least '
+        'one, bounded by the real callback count, fully drained', () {
+      // Never enqueued: the synthetic pre-start event was lost.
+      final missing =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({
+              'routeChangedEventsEnqueued': 0,
+              'routeChangedEventsDrained': 0,
+              'routeChangedAppliedCount': 0,
+            }),
+          );
+      expect(missing.routeChangeEventHandoffGatesHeld, isFalse);
+      expect(missing.allNativeLanesPass, isFalse);
+
+      // Two enqueued with zero real callbacks: a duplicate synthetic post.
+      final duplicate =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({
+              'routeChangedEventsEnqueued': 2,
+              'routeChangedEventsDrained': 2,
+              'routeChangedAppliedCount': 2,
+              'routeDisconnectApplySeq': 2,
+            }),
+          );
+      expect(duplicate.routeChangeEventHandoffGatesHeld, isFalse);
+      expect(duplicate.allNativeLanesPass, isFalse);
+
+      // Enqueued but never drained on the owner thread.
+      final undrained =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({'routeChangedEventsDrained': 0}),
+          );
+      expect(undrained.routeChangeEventHandoffGatesHeld, isFalse);
+      expect(undrained.allNativeLanesPass, isFalse);
+
+      // Drained more than enqueued.
+      final overDrained =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({'routeChangedEventsDrained': 2}),
+          );
+      expect(overDrained.routeChangeEventHandoffGatesHeld, isFalse);
+      expect(overDrained.allNativeLanesPass, isFalse);
+    });
+
+    test('X11 gate fails on dropped events', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({'routeChangeEventsDropped': 1}),
+          );
+      expect(report.routeChangeEventsDropped, equals(1));
+      expect(report.routeChangeEventHandoffGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X11 gate fails when the applied sequence is not strictly ordered '
+        'route_changed < route_disconnect with the disconnect last', () {
+      final disconnectBeforeChanged =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({
+              'routeChangedApplySeq': 1,
+              'routeDisconnectApplySeq': 0,
+            }),
+          );
+      expect(disconnectBeforeChanged.routeChangeEventHandoffGatesHeld, isFalse);
+      expect(disconnectBeforeChanged.allNativeLanesPass, isFalse);
+
+      final equalSeq =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({
+              'routeChangedApplySeq': 1,
+              'routeDisconnectApplySeq': 1,
+            }),
+          );
+      expect(equalSeq.routeChangeEventHandoffGatesHeld, isFalse);
+      expect(equalSeq.allNativeLanesPass, isFalse);
+
+      final neverObserved =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({'routeChangedApplySeq': -1}),
+          );
+      expect(neverObserved.routeChangeEventHandoffGatesHeld, isFalse);
+      expect(neverObserved.allNativeLanesPass, isFalse);
+
+      // The disconnect ordinal must equal the observed route_changed count:
+      // anything else means an event was applied after the disconnect.
+      final notLast =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({'routeDisconnectApplySeq': 2}),
+          );
+      expect(notLast.routeChangeEventHandoffGatesHeld, isFalse);
+      expect(notLast.allNativeLanesPass, isFalse);
+    });
+
+    test('X11 still requires the implied X7 focus/noisy gates', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({'audioFocusAbandonedOk': false}),
+          );
+      expect(report.focusNoisyEventHandoffGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X11 still requires the implied non-zero base gain', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX11SampleRawMap({
+              'audioTrackGain': 0.0,
+              'audioTrackNonZeroGainSetOk': false,
+            }),
+          );
+      expect(report.nonZeroGainSinkGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test(
+      'X11 mode sends routeChangeEventHandoffProofEnabled=true only',
+      () async {
+        Map<String, Object?>? capturedArgs;
+
+        binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+          capturedArgs = (call.arguments as Map).cast<String, Object?>();
+          return createX11SampleRawMap();
+        });
+
+        final report =
+            await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+              sourcePath: '/tmp/clip_B.mov',
+              routeChangeEventHandoffProofEnabled: true,
+            );
+
+        expect(capturedArgs?['routeChangeEventHandoffProofEnabled'], isTrue);
+        // The implied X7 flag is derived natively; the Dart wrapper never
+        // sends it, the X8, X9 or X10 flags, or any other mode flag for an
+        // X11 run.
+        expect(
+          capturedArgs?.containsKey('focusNoisyEventHandoffProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('focusDuckRestoreProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('focusLossPauseResumeProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('permanentFocusLossProofEnabled'),
+          isFalse,
+        );
+        expect(capturedArgs?.containsKey('envelopeProofEnabled'), isFalse);
+        expect(
+          capturedArgs?.containsKey('nonZeroGainSinkProofEnabled'),
+          isFalse,
+        );
+        expect(report.pass, isTrue);
+        expect(report.routeChangeEventHandoffProofEnabled, isTrue);
+        expect(report.allNativeLanesPass, isTrue);
+      },
+    );
+
+    test(
+      'default X4 run does NOT send routeChangeEventHandoffProofEnabled',
+      () async {
+        Map<String, Object?>? capturedArgs;
+
+        binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+          capturedArgs = (call.arguments as Map).cast<String, Object?>();
+          return _createSampleRawMap();
+        });
+
+        await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+          sourcePath: '/tmp/clip_B.mov',
+        );
+
+        expect(
+          capturedArgs?.containsKey('routeChangeEventHandoffProofEnabled'),
+          isFalse,
+        );
+      },
+    );
+
+    test(
+      'X8, X9 and X10 runs do NOT send routeChangeEventHandoffProofEnabled',
+      () async {
+        Map<String, Object?>? capturedArgs;
+
+        binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+          capturedArgs = (call.arguments as Map).cast<String, Object?>();
+          return _createSampleRawMap();
+        });
+
+        await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+          sourcePath: '/tmp/clip_B.mov',
+          focusDuckRestoreProofEnabled: true,
+        );
+        expect(capturedArgs?['focusDuckRestoreProofEnabled'], isTrue);
+        expect(
+          capturedArgs?.containsKey('routeChangeEventHandoffProofEnabled'),
+          isFalse,
+        );
+
+        await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+          sourcePath: '/tmp/clip_B.mov',
+          focusLossPauseResumeProofEnabled: true,
+        );
+        expect(capturedArgs?['focusLossPauseResumeProofEnabled'], isTrue);
+        expect(
+          capturedArgs?.containsKey('routeChangeEventHandoffProofEnabled'),
+          isFalse,
+        );
+
+        await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+          sourcePath: '/tmp/clip_B.mov',
+          permanentFocusLossProofEnabled: true,
+        );
+        expect(capturedArgs?['permanentFocusLossProofEnabled'], isTrue);
+        expect(
+          capturedArgs?.containsKey('routeChangeEventHandoffProofEnabled'),
+          isFalse,
+        );
+      },
+    );
   });
 
   group('Equality, hashCode, and toString', () {

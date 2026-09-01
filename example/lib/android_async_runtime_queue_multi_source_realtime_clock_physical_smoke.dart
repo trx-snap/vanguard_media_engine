@@ -27,6 +27,7 @@
 //   - X8 (P4-AUDIO-FOCUS-DUCK-RESTORE-RESPONSE): Transient duck (0.1) and restore (0.5) volume response.
 //   - X9 (P4-AUDIO-FOCUS-LOSS-PAUSE-RESUME-RESPONSE): Transient focus-loss pause, same-boundary gain resume, and terminal becoming-noisy pause response.
 //   - X10 (P4-AUDIO-FOCUS-LOSS-PERMANENT-STOP-RESPONSE): Terminal permanent focus-loss pause and rejected same-boundary focus-gain attempt (no play, no auto-resume) response.
+//   - X11 (P4-AUDIO-ROUTE-CHANGE-EVENT-HANDOFF-RESPONSE): Real routing-listener register/remove lifecycle, synthetic route_changed handoff with routed-device telemetry, and terminal route_disconnect fail-closed pause (no recreate/restart) response.
 // Overall exit is PASS only when ALL runs pass; each phase prints its own
 // PHYSICAL_SMOKE_PASS/FAIL marker.
 
@@ -369,6 +370,22 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
     // dead-object recovery, no production restart policy. ───────────────────
     final permanentFocusLossPass = await _runPermanentFocusLossSmoke();
 
+    // ── X11 (P4-AUDIO-ROUTE-CHANGE-EVENT-HANDOFF-RESPONSE): real
+    // AudioRouting.OnRoutingChangedListener added to the AudioTrack by the
+    // driver owner thread and removed exactly once before release; ONE
+    // synthetic route_changed drained on the owner thread with routed-device
+    // telemetry sampled; ONE synthetic route_disconnect enqueued/drained at
+    // the terminal EOS point (AudioTrack.pause() only, PLAYSTATE_PAUSED, no
+    // recreate/restart), over the implied X7 focus/noisy handoff and 0.5
+    // base gain. X8 duck/restore, X9 transient pause/resume and X10
+    // permanent stop are NOT enabled. Sink-side telemetry only: no seamless
+    // route recreation/hot-swap, no stream re-anchor, no dead-object
+    // recovery, no OS route arbitration correctness, no acoustic
+    // audibility/speaker verification, no transport/presentation pause, no
+    // pause/resume SLA, no production restart policy. ─────────────────────
+    final routeChangeEventHandoffPass =
+        await _runRouteChangeEventHandoffSmoke();
+
     final allPass =
         pass &&
         envelopePass &&
@@ -376,7 +393,8 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
         focusNoisyPass &&
         duckRestorePass &&
         focusLossPauseResumePass &&
-        permanentFocusLossPass;
+        permanentFocusLossPass &&
+        routeChangeEventHandoffPass;
     if (mounted) {
       setState(() {
         _status = allPass
@@ -384,13 +402,15 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
                   'X6 non-zero-gain gates held, X7 focus/noisy gates held, '
                   'X8 duck/restore gates held, '
                   'X9 focus-loss pause/resume gates held, '
-                  'X10 permanent focus-loss stop gates held)'
+                  'X10 permanent focus-loss stop gates held, '
+                  'X11 route-change event-handoff gates held)'
             : 'FAIL: x4Pass=$pass, envelopePass=$envelopePass, '
                   'nonZeroGainPass=$nonZeroGainPass, '
                   'focusNoisyPass=$focusNoisyPass, '
                   'duckRestorePass=$duckRestorePass, '
                   'focusLossPauseResumePass=$focusLossPauseResumePass, '
                   'permanentFocusLossPass=$permanentFocusLossPass, '
+                  'routeChangeEventHandoffPass=$routeChangeEventHandoffPass, '
                   'lastError=${activeReport.lastError}, error=$topLevelError';
       });
     }
@@ -1312,6 +1332,185 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
           : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_PERMANENT_FOCUS_LOSS_PHYSICAL_SMOKE_FAIL',
     );
     return permanentFocusLossPass;
+  }
+
+  Future<bool> _runRouteChangeEventHandoffSmoke() async {
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_SMOKE_START',
+    );
+
+    VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport? report;
+    String? topLevelError;
+    File? tempSourceFile;
+
+    try {
+      final clipBData = await rootBundle.load(
+        'assets/manual_test_clips/clip_B.mov',
+      );
+      final tempDir = Directory.systemTemp;
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+      tempSourceFile = File(
+        '${tempDir.path}/p4_async_rt_queue_route_change_handoff_source_$timestamp.mov',
+      );
+
+      await tempSourceFile.writeAsBytes(
+        clipBData.buffer.asUint8List(
+          clipBData.offsetInBytes,
+          clipBData.lengthInBytes,
+        ),
+        flush: true,
+      );
+
+      report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: tempSourceFile.path,
+            routeChangeEventHandoffProofEnabled: true,
+            timeout: const Duration(seconds: 45),
+          ).timeout(const Duration(seconds: 55));
+    } on TimeoutException catch (te) {
+      topLevelError = 'timeout: $te';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_ERROR: $topLevelError',
+      );
+    } catch (e, st) {
+      topLevelError = '$e\n$st';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_ERROR: $topLevelError',
+      );
+    } finally {
+      if (tempSourceFile != null) {
+        try {
+          if (await tempSourceFile.exists()) {
+            await tempSourceFile.delete();
+          }
+        } catch (_) {}
+      }
+    }
+
+    final rcReport =
+        report ??
+        VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+          <String, Object?>{
+            'pass': false,
+            'status': 'fail',
+            'marker': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .routeChangeEventHandoffFailMarkerConstant,
+            'proofBoundary': '',
+            'nativeProofBoundary': '',
+            'failureReason': 'invocation_failed',
+            'lastError': 'invocation_failed',
+          },
+        );
+
+    // Route-Change Event-Handoff Response group. Real routing listener
+    // added/removed exactly once by the driver owner thread; synthetic
+    // route_changed (pre-start) -> owner-thread drain -> routed-device
+    // telemetry sampled; synthetic route_disconnect (terminal EOS point,
+    // same owner-thread boundary) -> pause() -> PAUSED, held until release
+    // (no recreate/restart). Applied-event sequence is a monotonic ordinal,
+    // not a drain-pass index; real routing callbacks are telemetry only.
+    print(
+      '  [LANE] Route-Change Event-Handoff Response: '
+      'routeChangeEventHandoffProofEnabled=${rcReport.routeChangeEventHandoffProofEnabled}, '
+      'focusDuckRestoreProofEnabled=${rcReport.focusDuckRestoreProofEnabled}, '
+      'focusLossPauseResumeProofEnabled=${rcReport.focusLossPauseResumeProofEnabled}, '
+      'permanentFocusLossProofEnabled=${rcReport.permanentFocusLossProofEnabled}, '
+      'routingListenerRegisteredOk=${rcReport.routingListenerRegisteredOk}, '
+      'routingListenerUnregisteredOk=${rcReport.routingListenerUnregisteredOk}, '
+      'routeChangeObservationOk=${rcReport.routeChangeObservationOk}, '
+      'routeDisconnectFailClosedPauseOk=${rcReport.routeDisconnectFailClosedPauseOk}, '
+      'terminalPlayStatePausedBeforeReleaseRouteChangeOk=${rcReport.terminalPlayStatePausedBeforeReleaseRouteChangeOk}, '
+      'syntheticRouteChangedPosted=${rcReport.syntheticRouteChangedPosted}, '
+      'syntheticRouteDisconnectPosted=${rcReport.syntheticRouteDisconnectPosted}, '
+      'routeChangedEventsEnqueued=${rcReport.routeChangedEventsEnqueued}, '
+      'routeDisconnectEventsEnqueued=${rcReport.routeDisconnectEventsEnqueued}, '
+      'routeChangedEventsDrained=${rcReport.routeChangedEventsDrained}, '
+      'routeDisconnectEventsDrained=${rcReport.routeDisconnectEventsDrained}, '
+      'routeChangeEventsDropped=${rcReport.routeChangeEventsDropped}, '
+      'routeChangedAppliedCount=${rcReport.routeChangedAppliedCount}, '
+      'routeDisconnectAppliedCount=${rcReport.routeDisconnectAppliedCount}, '
+      'routeChangedApplySeq=${rcReport.routeChangedApplySeq}, '
+      'routeDisconnectApplySeq=${rcReport.routeDisconnectApplySeq}, '
+      'realRoutingChangedCallbackCount=${rcReport.realRoutingChangedCallbackCount}, '
+      'playStateAfterRouteDisconnectPause=${rcReport.playStateAfterRouteDisconnectPause}, '
+      'playStateAtReleaseRouteChange=${rcReport.playStateAtReleaseRouteChange}, '
+      'audioTrackGain=${rcReport.audioTrackGain}, '
+      'routeChangeEventHandoffGatesHeld=${rcReport.routeChangeEventHandoffGatesHeld}, '
+      'focusNoisyEventHandoffGatesHeld=${rcReport.focusNoisyEventHandoffGatesHeld}, '
+      'hasCanonicalProofBoundary=${rcReport.hasCanonicalProofBoundary}, '
+      'allNativeLanesPass=${rcReport.allNativeLanesPass}, '
+      'marker=${rcReport.marker}, '
+      'lastError=${rcReport.lastError}',
+    );
+
+    final lastErrorOk =
+        rcReport.lastError.isEmpty ||
+        rcReport.lastError == 'none' ||
+        rcReport.lastError == 'null';
+
+    final routeChangeEventHandoffPass =
+        (topLevelError == null) &&
+        rcReport.pass &&
+        rcReport.marker ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .routeChangeEventHandoffPassMarkerConstant &&
+        rcReport.routeChangeEventHandoffProofEnabled &&
+        !rcReport.focusDuckRestoreProofEnabled &&
+        !rcReport.focusLossPauseResumeProofEnabled &&
+        !rcReport.permanentFocusLossProofEnabled &&
+        rcReport.routeChangeEventHandoffGatesHeld &&
+        rcReport.routingListenerRegisteredOk &&
+        rcReport.routingListenerUnregisteredOk &&
+        rcReport.routeChangeObservationOk &&
+        rcReport.routeDisconnectFailClosedPauseOk &&
+        rcReport.terminalPlayStatePausedBeforeReleaseRouteChangeOk &&
+        rcReport.syntheticRouteChangedPosted == 1 &&
+        rcReport.syntheticRouteDisconnectPosted == 1 &&
+        rcReport.routeChangedEventsEnqueued >= 1 &&
+        rcReport.routeChangedEventsDrained ==
+            rcReport.routeChangedEventsEnqueued &&
+        rcReport.routeDisconnectEventsEnqueued == 1 &&
+        rcReport.routeDisconnectEventsDrained == 1 &&
+        rcReport.routeChangeEventsDropped == 0 &&
+        rcReport.routeChangedAppliedCount >= 1 &&
+        rcReport.routeDisconnectAppliedCount == 1 &&
+        rcReport.routeChangedApplySeq >= 0 &&
+        rcReport.routeDisconnectApplySeq > rcReport.routeChangedApplySeq &&
+        rcReport.focusNoisyEventHandoffGatesHeld &&
+        rcReport.hasCanonicalProofBoundary &&
+        rcReport.proofBoundary ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .routeChangeEventHandoffProofBoundaryConstant &&
+        rcReport.nativeProofBoundaryOk &&
+        rcReport.checksumsMatch &&
+        rcReport.providerCountersClean &&
+        rcReport.sinkAccountingBalanced &&
+        rcReport.realtimeGatesHeld &&
+        rcReport.allNativeLanesPass &&
+        lastErrorOk;
+
+    final summaryPayload = <String, dynamic>{
+      'unit':
+          'AndroidAsyncRuntimeQueueRouteChangeEventHandoffPhysicalSmokeHarness',
+      'slice': 'P4-AUDIO-ROUTE-CHANGE-EVENT-HANDOFF-RESPONSE',
+      'target': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .routeChangeEventHandoffProofBoundaryConstant,
+      'nativeTarget': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .nativeProofBoundaryConstant,
+      'pass': routeChangeEventHandoffPass,
+      'report': rcReport.toMap(),
+      'error': topLevelError,
+    };
+
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_JSON:${jsonEncode(summaryPayload)}',
+    );
+    print(
+      routeChangeEventHandoffPass
+          ? 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_PHYSICAL_SMOKE_PASS'
+          : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_PHYSICAL_SMOKE_FAIL',
+    );
+    return routeChangeEventHandoffPass;
   }
 
   @override

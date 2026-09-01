@@ -196,6 +196,16 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   static const String permanentFocusLossFailMarkerConstant =
       'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_PERMANENT_FOCUS_LOSS_PHYSICAL_SMOKE_FAIL';
 
+  /// Canonical pass marker emitted by the native harness for X11
+  /// route-change event-handoff response proof runs.
+  static const String routeChangeEventHandoffPassMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_PHYSICAL_SMOKE_PASS';
+
+  /// Canonical fail marker emitted by the native harness for X11
+  /// route-change event-handoff response proof runs.
+  static const String routeChangeEventHandoffFailMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_PHYSICAL_SMOKE_FAIL';
+
   /// Canonical Kotlin driver proof boundary string (muted AudioTrack sink
   /// claim included) emitted by the native harness.
   static const String proofBoundaryConstant =
@@ -225,6 +235,19 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   /// production restart policy.
   static const String permanentFocusLossProofBoundaryConstant =
       'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_loss_permanent_stop_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_only_base_gain_0_5_permanent_loss_terminal_pause_synthetic_focus_gain_attempt_rejected_no_play_no_auto_resume_no_flush_no_stop_no_release_recreate_no_transport_pause_no_presentation_pause_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_sla_no_production_restart_policy_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
+
+  /// Canonical X11 route-change event-handoff response Kotlin driver proof
+  /// boundary string. Replaces [proofBoundaryConstant] for X11 runs, which
+  /// are neither muted nor no-focus. Real routing-listener register/remove
+  /// lifecycle, synthetic route_changed handoff with routed-device telemetry
+  /// sampling, and sink-side AudioTrack pause() response to ONE synthetic
+  /// route_disconnect (no recreate/restart) only: no seamless route
+  /// recreation or hot-swap, no stream re-anchor, no dead-object recovery,
+  /// no OS route arbitration correctness, no acoustic audibility/speaker
+  /// verification, no transport/presentation pause, no pause/resume SLA, no
+  /// production restart policy.
+  static const String routeChangeEventHandoffProofBoundaryConstant =
+      'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_route_change_event_handoff_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_only_base_gain_0_5_route_changed_pre_start_synthetic_drain_route_disconnect_terminal_synthetic_pause_fail_closed_no_play_no_auto_resume_no_route_recreation_no_stream_reanchor_no_dead_object_recovery_routing_listener_registered_and_unregistered_exactly_once_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_seamless_route_recreation_no_hot_swap_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
 
   /// Canonical native TU proof boundary string (NO native sink claim)
   /// observed via the snapshot and echoed by the harness.
@@ -643,8 +666,8 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       _boolFact('audioTrackNonZeroGainSetOk');
 
   /// X6 non-zero-gain sink proof gate.
-  /// In X6 mode (and X8/X9 modes, which imply the non-zero 0.5 base gain):
-  /// requires gain set OK, gain > 0.0 and <= 1.0.
+  /// In X6 mode (and X8/X9/X10/X11 modes, which imply the non-zero 0.5 base
+  /// gain): requires gain set OK, gain > 0.0 and <= 1.0.
   /// In default X4/X5/X7 mode: requires gain NOT set and gain == 0.0,
   /// proving muted behavior was preserved.
   /// Deferred: no acoustic/speaker measurement, no loudness/SNR, no
@@ -654,7 +677,8 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
     if (!nonZeroGainSinkProofEnabled &&
         !focusDuckRestoreProofEnabled &&
         !focusLossPauseResumeProofEnabled &&
-        !permanentFocusLossProofEnabled) {
+        !permanentFocusLossProofEnabled &&
+        !routeChangeEventHandoffProofEnabled) {
       return !audioTrackNonZeroGainSetOk && audioTrackGain == 0.0;
     }
     return audioTrackNonZeroGainSetOk &&
@@ -1074,14 +1098,158 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
         terminalPlayStatePausedBeforeReleasePermanentOk;
   }
 
+  // ── X11 route-change event-handoff response proof getters ────────────────
+
+  /// Whether this run executed the X11 route-change event-handoff response
+  /// proof mode (false for every default X4..X10 run). X11 implies the X7
+  /// focus/noisy handoff and the non-zero 0.5 base gain, but NOT X8, X9 or
+  /// X10. ISOLATED from X8/X9/X10: no shared counters.
+  bool get routeChangeEventHandoffProofEnabled =>
+      _boolFact('routeChangeEventHandoffProofEnabled');
+
+  /// Whether the driver owner thread added the real
+  /// AudioRouting.OnRoutingChangedListener to the AudioTrack in X11 mode.
+  bool get routingListenerRegisteredOk =>
+      _boolFact('routingListenerRegisteredOk');
+
+  /// Whether the driver owner thread removed that listener from the
+  /// AudioTrack exactly once, before AudioTrack.release().
+  bool get routingListenerUnregisteredOk =>
+      _boolFact('routingListenerUnregisteredOk');
+
+  /// Whether at least one route_changed event (the synthetic pre-start one)
+  /// was drained on the owner thread with routed-device telemetry sampled
+  /// (telemetry only; no route recreation, re-anchor, or recovery claim).
+  bool get routeChangeObservationOk => _boolFact('routeChangeObservationOk');
+
+  /// Whether the owner thread applied AudioTrack.pause() for the synthetic
+  /// route_disconnect at the terminal EOS point and observed
+  /// PLAYSTATE_PAUSED (sink-side playstate telemetry only; no
+  /// transport/presentation pause, no OS route arbitration claim).
+  bool get routeDisconnectFailClosedPauseOk =>
+      _boolFact('routeDisconnectFailClosedPauseOk');
+
+  /// Whether the AudioTrack playstate observed at release (after the
+  /// terminal route-disconnect pause, no recreate/restart) was
+  /// PLAYSTATE_PAUSED.
+  bool get terminalPlayStatePausedBeforeReleaseRouteChangeOk =>
+      _boolFact('terminalPlayStatePausedBeforeReleaseRouteChangeOk');
+
+  /// Synthetic route_changed events posted (and awaited) before the driver
+  /// started in X11 mode; must be exactly 1 (0 in other modes).
+  int get syntheticRouteChangedPosted =>
+      _intFact('syntheticRouteChangedPosted');
+
+  /// Synthetic route_disconnect events enqueued directly by the
+  /// driver-invoked plane callback in X11 mode; must be exactly 1.
+  int get syntheticRouteDisconnectPosted =>
+      _intFact('syntheticRouteDisconnectPosted');
+
+  /// route_changed events enqueued into the typed X11 queue (the synthetic
+  /// one plus any real-listener handoff; must be >= 1 and bounded by
+  /// 1 + [realRoutingChangedCallbackCount]).
+  int get routeChangedEventsEnqueued =>
+      _intFact('routeChangedEventsEnqueued', -1);
+
+  /// route_disconnect events enqueued into the typed X11 queue (must be 1).
+  int get routeDisconnectEventsEnqueued =>
+      _intFact('routeDisconnectEventsEnqueued', -1);
+
+  /// route_changed events drained by the owner thread (must equal
+  /// [routeChangedEventsEnqueued]).
+  int get routeChangedEventsDrained =>
+      _intFact('routeChangedEventsDrained', -1);
+
+  /// route_disconnect events drained by the owner thread (must be 1).
+  int get routeDisconnectEventsDrained =>
+      _intFact('routeDisconnectEventsDrained', -1);
+
+  /// X11 events dropped due to queue overflow; must be 0 for proof.
+  int get routeChangeEventsDropped => _intFact('routeChangeEventsDropped');
+
+  /// Times the owner thread observed a route_changed event (must be >= 1
+  /// and equal [routeChangedEventsDrained]).
+  int get routeChangedAppliedCount => _intFact('routeChangedAppliedCount', -1);
+
+  /// Times the owner thread applied the route-disconnect pause (must be 1).
+  int get routeDisconnectAppliedCount =>
+      _intFact('routeDisconnectAppliedCount', -1);
+
+  /// Monotonic applied-event sequence at which the FIRST route_changed was
+  /// observed (-1 if never). Applied-event ordinal, not a drain-pass index.
+  int get routeChangedApplySeq => _intFact('routeChangedApplySeq', -1);
+
+  /// Monotonic applied-event sequence at which the route-disconnect pause
+  /// was applied (-1 if never); must be strictly after
+  /// [routeChangedApplySeq] and equal [routeChangedAppliedCount] (the
+  /// disconnect is the last applied event).
+  int get routeDisconnectApplySeq => _intFact('routeDisconnectApplySeq', -1);
+
+  /// Real AudioRouting.OnRoutingChangedListener callbacks delivered on the
+  /// main handler in X11 mode (telemetry only, never a verdict gate on its
+  /// own).
+  int get realRoutingChangedCallbackCount =>
+      _intFact('realRoutingChangedCallbackCount');
+
+  /// AudioTrack playstate observed right after the route-disconnect pause
+  /// (-1 if never; 2 == PLAYSTATE_PAUSED). Telemetry only.
+  int get playStateAfterRouteDisconnectPause =>
+      _intFact('playStateAfterRouteDisconnectPause', -1);
+
+  /// AudioTrack playstate observed at release in X11 mode (-1 if never;
+  /// 2 == PLAYSTATE_PAUSED). Telemetry only.
+  int get playStateAtReleaseRouteChange =>
+      _intFact('playStateAtReleaseRouteChange', -1);
+
+  /// X11 route-change event-handoff response gate.
+  /// In X11 mode: the real routing listener registered and unregistered
+  /// exactly once; one synthetic route_changed posted and one synthetic
+  /// route_disconnect posted; every enqueued route_changed drained and
+  /// observed (at least one, bounded by the real callback count); the
+  /// route_disconnect enqueued, drained and applied exactly once with the
+  /// pause playstate assertion held; zero dropped events; the applied
+  /// sequence strictly ordered route_changed < route_disconnect with the
+  /// disconnect as the last applied event; and the terminal playstate
+  /// before release PAUSED. Sink-side telemetry only: no seamless route
+  /// recreation/hot-swap, no stream re-anchor, no dead-object recovery, no
+  /// OS route arbitration correctness, no acoustic audibility/speaker
+  /// verification, no transport/presentation pause, no pause/resume SLA,
+  /// no production restart policy. In default X4..X10 mode: vacuously true
+  /// (backward compatible).
+  bool get routeChangeEventHandoffGatesHeld {
+    if (!routeChangeEventHandoffProofEnabled) return true;
+    return routingListenerRegisteredOk &&
+        routingListenerUnregisteredOk &&
+        routeChangeObservationOk &&
+        routeDisconnectFailClosedPauseOk &&
+        terminalPlayStatePausedBeforeReleaseRouteChangeOk &&
+        syntheticRouteChangedPosted == 1 &&
+        syntheticRouteDisconnectPosted == 1 &&
+        routeChangeEventsDropped == 0 &&
+        routeChangedEventsEnqueued >= 1 &&
+        routeChangedEventsEnqueued <= 1 + realRoutingChangedCallbackCount &&
+        routeChangedEventsDrained == routeChangedEventsEnqueued &&
+        routeDisconnectEventsEnqueued == 1 &&
+        routeDisconnectEventsDrained == 1 &&
+        routeChangedAppliedCount >= 1 &&
+        routeChangedAppliedCount == routeChangedEventsDrained &&
+        routeDisconnectAppliedCount == 1 &&
+        routeChangedApplySeq >= 0 &&
+        routeDisconnectApplySeq > routeChangedApplySeq &&
+        routeDisconnectApplySeq == routeChangedAppliedCount;
+  }
+
   /// Whether [proofBoundary] matches the canonical Kotlin driver boundary
   /// for this run's mode. X8 runs must carry the mode-specific
   /// [focusDuckRestoreProofBoundaryConstant], X9 runs the mode-specific
-  /// [focusLossPauseResumeProofBoundaryConstant], and X10 runs the
-  /// mode-specific [permanentFocusLossProofBoundaryConstant] — never the
-  /// default boundary, whose muted/no-focus claims would be false for
-  /// X8/X9/X10.
-  bool get hasCanonicalProofBoundary => permanentFocusLossProofEnabled
+  /// [focusLossPauseResumeProofBoundaryConstant], X10 runs the
+  /// mode-specific [permanentFocusLossProofBoundaryConstant], and X11 runs
+  /// the mode-specific [routeChangeEventHandoffProofBoundaryConstant] —
+  /// never the default boundary, whose muted/no-focus claims would be false
+  /// for X8/X9/X10/X11.
+  bool get hasCanonicalProofBoundary => routeChangeEventHandoffProofEnabled
+      ? proofBoundary == routeChangeEventHandoffProofBoundaryConstant
+      : permanentFocusLossProofEnabled
       ? proofBoundary == permanentFocusLossProofBoundaryConstant
       : focusLossPauseResumeProofEnabled
       ? proofBoundary == focusLossPauseResumeProofBoundaryConstant
@@ -1155,7 +1323,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       pass &&
       status.toLowerCase() == 'pass' &&
       marker ==
-          (permanentFocusLossProofEnabled
+          (routeChangeEventHandoffProofEnabled
+              ? routeChangeEventHandoffPassMarkerConstant
+              : permanentFocusLossProofEnabled
               ? permanentFocusLossPassMarkerConstant
               : focusLossPauseResumeProofEnabled
               ? focusLossPauseResumePassMarkerConstant
@@ -1184,6 +1354,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       permanentFocusLossGatesHeld &&
       (!permanentFocusLossProofEnabled ||
           _boolFact('permanentFocusLossGatesHeld')) &&
+      routeChangeEventHandoffGatesHeld &&
+      (!routeChangeEventHandoffProofEnabled ||
+          _boolFact('routeChangeEventHandoffGatesHeld')) &&
       hasCanonicalProofBoundary &&
       nativeProofBoundaryOk &&
       formatProbeOk &&
@@ -1205,6 +1378,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
           focusDuckRestoreProofEnabled ||
           focusLossPauseResumeProofEnabled ||
           permanentFocusLossProofEnabled ||
+          routeChangeEventHandoffProofEnabled ||
           mutedOutputOk) &&
       playbackHeadTelemetryOk &&
       realtimeNativeElapsedOk &&
@@ -1634,6 +1808,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
     bool focusDuckRestoreProofEnabled = false,
     bool focusLossPauseResumeProofEnabled = false,
     bool permanentFocusLossProofEnabled = false,
+    bool routeChangeEventHandoffProofEnabled = false,
     Duration? timeout,
     MethodChannel? channel,
   }) async {
@@ -1675,6 +1850,13 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       // flags.
       if (permanentFocusLossProofEnabled)
         'permanentFocusLossProofEnabled': true,
+      // Only sent for X11 route-change event-handoff proof runs so the
+      // default X4..X10 argument shape stays frozen; the coordinator derives
+      // the implied X7 focus/noisy handoff from this single flag and never
+      // sets the X8 duck/restore, X9 pause/resume, or X10 permanent-stop
+      // flags.
+      if (routeChangeEventHandoffProofEnabled)
+        'routeChangeEventHandoffProofEnabled': true,
     };
     try {
       final future = ch.invokeMethod<Object?>(methodName, args);

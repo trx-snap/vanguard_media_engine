@@ -7,6 +7,7 @@ import android.content.IntentFilter
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.AudioRouting
 import android.os.Build
 import android.os.Handler
 import android.util.Log
@@ -85,6 +86,25 @@ import java.util.concurrent.atomic.AtomicInteger
  * Coordinator callbacks only enqueue typed events and counters; the
  * coordinator never touches the AudioTrack.
  *
+ * X11 (P4-AUDIO-ROUTE-CHANGE-EVENT-HANDOFF-RESPONSE) route-change event
+ * handoff / fail-closed response proof: when
+ * routeChangeEventHandoffProofEnabled=true (implies the X7 focus/noisy
+ * handoff and the non-zero 0.5 base gain, but NOT X8, X9 or X10), the
+ * coordinator owns a distinct bounded typed queue (capacity 8), ISOLATED
+ * from the X8/X9/X10 queues (no shared counters), plus the real
+ * android.media.AudioRouting.OnRoutingChangedListener object delivered on
+ * the main handler. The driver alone adds that listener to its AudioTrack
+ * and removes it exactly once before release; the listener is telemetry/
+ * handoff only (it counts the real callback and enqueues route_changed) and
+ * never touches the AudioTrack. The coordinator posts+awaits ONE synthetic
+ * route_changed before the driver starts (fail-closed
+ * route_change_event_injection_timeout); the driver drains it on the owner
+ * thread and samples routed-device telemetry. At the terminal EOS point the
+ * driver-invoked plane callback enqueues the ONE synthetic route_disconnect
+ * DIRECTLY into the queue (no main-handler wait) so the driver applies
+ * AudioTrack.pause() at the same owner-thread boundary, asserts
+ * PLAYSTATE_PAUSED, and never recreates or restarts the sink.
+ *
  * Honest non-claims (Proof Boundary): diagnostic only — the worker-owned
  * steady_clock is a render/dispatch timebase, not a presentation clock; no
  * caller-supplied native time; playback head / AudioTimestamp / underrun
@@ -102,7 +122,15 @@ import java.util.concurrent.atomic.AtomicInteger
  * AudioTrack pause() response to ONE permanent-loss event plus rejection of
  * a same-boundary synthetic focus-gain attempt (no play(), no auto-resume)
  * only — the same non-claims as X9 apply, and X10 shares no counters with
- * the X9 queue.
+ * the X9 queue. X11 claims real routing-listener register/remove lifecycle on
+ * the AudioTrack, synthetic route_changed handoff with routed-device
+ * telemetry sampling, and sink-side AudioTrack pause() response to ONE
+ * synthetic route_disconnect (no recreate/restart) only — no seamless route
+ * recreation or hot-swap, no stream re-anchor, no dead-object recovery, no
+ * OS route arbitration correctness, no acoustic audibility/speaker
+ * verification, no transport/presentation pause, no pause/resume SLA, no
+ * production restart policy; X11 shares no counters with the X8/X9/X10
+ * queues.
  *
  * The coordinator dispatches to one background [Thread] per accepted run to
  * keep the Flutter UI thread responsive; runs are serialized by an active
@@ -126,6 +154,8 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
         private const val X9_INJECTION_AWAIT_MS = 5_000L
         private const val X10_QUEUE_CAPACITY = 8
         private const val X10_INJECTION_AWAIT_MS = 5_000L
+        private const val X11_QUEUE_CAPACITY = 8
+        private const val X11_INJECTION_AWAIT_MS = 5_000L
 
         fun ownsMethod(method: String): Boolean = method == METHOD_NAME
     }
@@ -285,6 +315,51 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
         }
     }
 
+    // Bounded thread-safe TYPED queue for the X11 route-change event-handoff
+    // proof, ISOLATED from the X8/X9/X10 queues above (no shared counters),
+    // with per-tag enqueued/drained accounting. Overflow drops and
+    // increments droppedCount; never blocks the main-handler routing
+    // listener. The coordinator and the real routing listener only enqueue;
+    // the driver polls on its owner thread only. The coordinator never
+    // touches the AudioTrack.
+    private class RouteChangeEventQueue(capacity: Int = X11_QUEUE_CAPACITY) {
+        private val queue = ArrayBlockingQueue<String>(capacity)
+        val routeChangedEnqueuedCount = AtomicInteger(0)
+        val routeDisconnectEnqueuedCount = AtomicInteger(0)
+        val routeChangedDrainedCount = AtomicInteger(0)
+        val routeDisconnectDrainedCount = AtomicInteger(0)
+        val droppedCount = AtomicInteger(0)
+
+        fun offer(tag: String) {
+            if (queue.offer(tag)) {
+                if (tag ==
+                    AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                        .X11_EVENT_ROUTE_CHANGED
+                ) {
+                    routeChangedEnqueuedCount.incrementAndGet()
+                } else {
+                    routeDisconnectEnqueuedCount.incrementAndGet()
+                }
+            } else {
+                droppedCount.incrementAndGet()
+            }
+        }
+
+        // Must only be called from the driver's owner thread.
+        fun pollOne(): String? {
+            val tag = queue.poll() ?: return null
+            if (tag ==
+                AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                    .X11_EVENT_ROUTE_CHANGED
+            ) {
+                routeChangedDrainedCount.incrementAndGet()
+            } else {
+                routeDisconnectDrainedCount.incrementAndGet()
+            }
+            return tag
+        }
+    }
+
     private val active = AtomicBoolean(false)
     private val disposed = AtomicBoolean(false)
 
@@ -311,13 +386,16 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
         // non-zero 0.5 base gain). X9 likewise implies X7 and the non-zero
         // base gain but is a distinct mode: it never sets the X8 flag. X10
         // implies the same X7/non-zero-gain setup but is its own distinct
-        // mode too: it never sets the X8 or X9 flags.
+        // mode too: it never sets the X8 or X9 flags. X11 likewise implies
+        // the X7/non-zero-gain setup and never sets the X8, X9 or X10 flags.
         val focusDuckRestoreRequested =
             (args?.get("focusDuckRestoreProofEnabled") as? Boolean) ?: false
         val focusLossPauseResumeRequested =
             (args?.get("focusLossPauseResumeProofEnabled") as? Boolean) ?: false
         val permanentFocusLossRequested =
             (args?.get("permanentFocusLossProofEnabled") as? Boolean) ?: false
+        val routeChangeEventHandoffRequested =
+            (args?.get("routeChangeEventHandoffProofEnabled") as? Boolean) ?: false
         val config = AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.RunConfig(
             sourcePath = args?.get("sourcePath") as? String ?: "",
             durationSec = ((args?.get("durationSec") as? Number)?.toDouble() ?: 2.0)
@@ -342,12 +420,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
             nonZeroGainSinkProofEnabled =
                 (args?.get("nonZeroGainSinkProofEnabled") as? Boolean) ?: false,
             // X7 focus/noisy event-plane proof mode; absent/false preserves
-            // the exact X4/X5/X6 behavior and args. X8 and X9 imply it.
+            // the exact X4/X5/X6 behavior and args. X8/X9/X10/X11 imply it.
             focusNoisyEventHandoffProofEnabled =
                 ((args?.get("focusNoisyEventHandoffProofEnabled") as? Boolean) ?: false) ||
                     focusDuckRestoreRequested ||
                     focusLossPauseResumeRequested ||
-                    permanentFocusLossRequested,
+                    permanentFocusLossRequested ||
+                    routeChangeEventHandoffRequested,
             // X8 focus-duck/restore response proof mode; absent/false
             // preserves the exact X4/X5/X6/X7 behavior and args.
             focusDuckRestoreProofEnabled = focusDuckRestoreRequested,
@@ -358,6 +437,9 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
             // absent/false preserves the exact X4/X5/X6/X7/X8/X9 behavior
             // and args.
             permanentFocusLossProofEnabled = permanentFocusLossRequested,
+            // X11 route-change event-handoff response proof mode;
+            // absent/false preserves the exact X4..X10 behavior and args.
+            routeChangeEventHandoffProofEnabled = routeChangeEventHandoffRequested,
         )
         if (!active.compareAndSet(false, true)) {
             result.error(
@@ -414,6 +496,20 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                 val x10SyntheticFocusGainAttemptPosted = AtomicInteger(0)
                 val x10Queue: PermanentFocusLossEventQueue? =
                     if (x10Enabled) PermanentFocusLossEventQueue() else null
+
+                // X11 coordinator-owned route-change event-handoff state;
+                // null/false unless routeChangeEventHandoffProofEnabled.
+                // ISOLATED from X8/X9/X10: no shared counters or queue. The
+                // real routing listener only counts and hands off while the
+                // driver still holds it on the AudioTrack (x11ListenerLive);
+                // late deliveries after removal are counted only.
+                val x11Enabled = config.routeChangeEventHandoffProofEnabled
+                var x11SyntheticRouteChangedPosted = 0
+                val x11SyntheticRouteDisconnectPosted = AtomicInteger(0)
+                val x11RealRoutingChangedCallbacks = AtomicInteger(0)
+                val x11ListenerLive = AtomicBoolean(false)
+                val x11Queue: RouteChangeEventQueue? =
+                    if (x11Enabled) RouteChangeEventQueue() else null
 
                 try {
                     // ── X7 focus + receiver setup ──────────────────────────
@@ -663,15 +759,92 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                             }
                         } else null
 
+                    // ── X11 deterministic pre-start route-changed
+                    // injection ─────────────────────────────────────────────
+                    // Post the ONE synthetic route_changed via the main
+                    // handler and AWAIT only its enqueue before the driver
+                    // starts. Fail closed (driver not invoked) on timeout. No
+                    // AudioTrack is touched here.
+                    var x11InjectionTimedOut = false
+                    if (x11Enabled && x7FocusGranted) {
+                        val queue = x11Queue!!
+                        val posted = CountDownLatch(1)
+                        mainHandler.post {
+                            queue.offer(
+                                AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                                    .X11_EVENT_ROUTE_CHANGED,
+                            )
+                            posted.countDown()
+                        }
+                        if (posted.await(X11_INJECTION_AWAIT_MS, TimeUnit.MILLISECONDS)) {
+                            x11SyntheticRouteChangedPosted = 1
+                        } else {
+                            x11InjectionTimedOut = true
+                        }
+                    }
+
+                    // X11 event plane handed to the driver: poll-one on the
+                    // owner thread; the route-disconnect callback enqueues
+                    // DIRECTLY into the coordinator-owned queue (no
+                    // main-handler wait) so the driver pauses at the same
+                    // owner-thread boundary. The real
+                    // AudioRouting.OnRoutingChangedListener is created here
+                    // and delivered on the main handler, but the driver
+                    // alone adds/removes it on the AudioTrack. Callbacks only
+                    // count and enqueue typed events; they never touch the
+                    // AudioTrack.
+                    val routeChangeEventPlane:
+                        AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                            .RouteChangeEventPlane? =
+                        if (x11Enabled && x7FocusGranted && !x11InjectionTimedOut) {
+                            val queue = x11Queue!!
+                            x11ListenerLive.set(true)
+                            val realListener = AudioRouting.OnRoutingChangedListener { _ ->
+                                x11RealRoutingChangedCallbacks.incrementAndGet()
+                                if (x11ListenerLive.get()) {
+                                    queue.offer(
+                                        AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                                            .X11_EVENT_ROUTE_CHANGED,
+                                    )
+                                }
+                            }
+                            object :
+                                AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                                    .RouteChangeEventPlane {
+                                override fun pollOneEvent(): String? = queue.pollOne()
+
+                                override fun enqueueSyntheticRouteDisconnect() {
+                                    if (x11SyntheticRouteDisconnectPosted
+                                            .compareAndSet(0, 1)
+                                    ) {
+                                        queue.offer(
+                                            AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                                                .X11_EVENT_ROUTE_DISCONNECT,
+                                        )
+                                    }
+                                }
+
+                                override val routingChangedListener:
+                                    AudioRouting.OnRoutingChangedListener = realListener
+
+                                override val routingListenerHandler: Handler = mainHandler
+
+                                override fun onRoutingListenerRemoved() {
+                                    x11ListenerLive.set(false)
+                                }
+                            }
+                        } else null
+
                     // ── Driver run ─────────────────────────────────────────
-                    // In X7/X8/X9 mode with focus denied (or the X8/X9
-                    // injection timed out), fail-close before track create
-                    // (driver is not invoked).
+                    // In X7/X8/X9/X10/X11 mode with focus denied (or the
+                    // X8/X9/X10/X11 injection timed out), fail-close before
+                    // track create (driver is not invoked).
                     val shouldRunDriver =
                         (!x7Enabled || x7FocusGranted) &&
                             !x8InjectionTimedOut &&
                             !x9InjectionTimedOut &&
-                            !x10InjectionTimedOut
+                            !x10InjectionTimedOut &&
+                            !x11InjectionTimedOut
                     val drainFn: (() -> Int)? =
                         if (x7Enabled && x7FocusGranted) x7Queue?.let { q ->
                             { q.drain() }
@@ -685,6 +858,7 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                                 duckRestorePlane,
                                 focusLossPauseResumePlane,
                                 permanentFocusLossPlane,
+                                routeChangeEventPlane,
                             )
                     } else if (x8InjectionTimedOut) {
                         AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
@@ -695,6 +869,9 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                     } else if (x10InjectionTimedOut) {
                         AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
                             .failedResult("permanent_focus_loss_event_injection_timeout")
+                    } else if (x11InjectionTimedOut) {
+                        AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
+                            .failedResult("route_change_event_injection_timeout")
                     } else {
                         AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver
                             .failedResult("audio_focus_request_denied")
@@ -750,6 +927,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                         x10Enabled, x10SyntheticPermanentLossPosted,
                         x10SyntheticFocusGainAttemptPosted.get(),
                         x10Queue, runResult,
+                    ) + buildX11Lanes(
+                        x11Enabled, x11SyntheticRouteChangedPosted,
+                        x11SyntheticRouteDisconnectPosted.get(),
+                        x11RealRoutingChangedCallbacks.get(),
+                        x11Queue, runResult,
                     )
                     val extraMetrics = buildX7Metrics(
                         x7Enabled, x7SyntheticEventsPosted, x7Queue,
@@ -766,6 +948,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                         x10Enabled, x10SyntheticPermanentLossPosted,
                         x10SyntheticFocusGainAttemptPosted.get(),
                         x8RealFocusChangeCallbacks.get(), x10Queue,
+                    ) + buildX11Metrics(
+                        x11Enabled, x11SyntheticRouteChangedPosted,
+                        x11SyntheticRouteDisconnectPosted.get(),
+                        x11RealRoutingChangedCallbacks.get(), x11Queue,
                     )
                     postReply(replied, result, toPayload(runResult, extraLanes, extraMetrics))
                 } catch (t: Throwable) {
@@ -812,6 +998,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                         x10Enabled, x10SyntheticPermanentLossPosted,
                         x10SyntheticFocusGainAttemptPosted.get(),
                         x10Queue, null,
+                    ) + buildX11Lanes(
+                        x11Enabled, x11SyntheticRouteChangedPosted,
+                        x11SyntheticRouteDisconnectPosted.get(),
+                        x11RealRoutingChangedCallbacks.get(),
+                        x11Queue, null,
                     )
                     val extraMetrics = buildX7Metrics(
                         x7Enabled, x7SyntheticEventsPosted, x7Queue,
@@ -828,6 +1019,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                         x10Enabled, x10SyntheticPermanentLossPosted,
                         x10SyntheticFocusGainAttemptPosted.get(),
                         x8RealFocusChangeCallbacks.get(), x10Queue,
+                    ) + buildX11Metrics(
+                        x11Enabled, x11SyntheticRouteChangedPosted,
+                        x11SyntheticRouteDisconnectPosted.get(),
+                        x11RealRoutingChangedCallbacks.get(), x11Queue,
                     )
                     postReply(
                         replied,
@@ -894,8 +1089,9 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
     // key shape shared by pass and failure paths. Both proof boundaries
     // travel top-level: the Kotlin driver boundary (muted AudioTrack sink
     // claim) and the observed native TU boundary (no native sink claim).
-    // extraLanes/extraMetrics carry X7/X8/X9 coordinator-owned fields; empty
-    // in X4/X5/X6 mode, preserving exact backward-compatible payload shape.
+    // extraLanes/extraMetrics carry X7/X8/X9/X10/X11 coordinator-owned
+    // fields; empty in X4/X5/X6 mode, preserving exact backward-compatible
+    // payload shape.
     private fun toPayload(
         r: AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.RunResult,
         extraLanes: Map<String, Any?> = emptyMap(),
@@ -1175,6 +1371,86 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
                 (q?.focusGainAttemptDrainedCount?.get() ?: 0),
             "permanentFocusLossEventsDropped" to (q?.droppedCount?.get() ?: 0),
             "permanentFocusLossRealFocusChangeCallbackCount" to realFocusChangeCallbacks,
+        )
+    }
+
+    // Builds the X11 coordinator-owned lane map, folding the driver's
+    // route-change lanes/metrics into the composite gate. Returns empty map
+    // unless routeChangeEventHandoffProofEnabled. ISOLATED from the X8/X9/X10
+    // lane builders above: no shared counters. Real routing callbacks are
+    // telemetry: they may add route_changed handoffs (bounded by the real
+    // callback count) but never gate the verdict on their own. The synthetic
+    // route_disconnect must be the LAST applied event.
+    private fun buildX11Lanes(
+        x11Enabled: Boolean,
+        syntheticRouteChangedPosted: Int,
+        syntheticRouteDisconnectPosted: Int,
+        realRoutingChangedCallbacks: Int,
+        queue: RouteChangeEventQueue?,
+        runResult: AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.RunResult?,
+    ): Map<String, Any?> {
+        if (!x11Enabled) return emptyMap()
+        val q = queue
+        val dropped = q?.droppedCount?.get() ?: 0
+        val changedEnqueued = q?.routeChangedEnqueuedCount?.get() ?: 0
+        val disconnectEnqueued = q?.routeDisconnectEnqueuedCount?.get() ?: 0
+        val changedDrained = q?.routeChangedDrainedCount?.get() ?: 0
+        val disconnectDrained = q?.routeDisconnectDrainedCount?.get() ?: 0
+        val l = runResult?.lanes
+        val m = runResult?.metrics
+        val registeredOk = (l?.get("routingListenerRegisteredOk") as? Boolean) ?: false
+        val unregisteredOk = (l?.get("routingListenerUnregisteredOk") as? Boolean) ?: false
+        val observationOk = (l?.get("routeChangeObservationOk") as? Boolean) ?: false
+        val pauseOk = (l?.get("routeDisconnectFailClosedPauseOk") as? Boolean) ?: false
+        val terminalPausedOk =
+            (l?.get("terminalPlayStatePausedBeforeReleaseRouteChangeOk") as? Boolean)
+                ?: false
+        val changedApplied = (m?.get("routeChangedAppliedCount") as? Number)?.toLong() ?: -1L
+        val disconnectApplied =
+            (m?.get("routeDisconnectAppliedCount") as? Number)?.toLong() ?: -1L
+        val changedSeq = (m?.get("routeChangedApplySeq") as? Number)?.toLong() ?: -1L
+        val disconnectSeq = (m?.get("routeDisconnectApplySeq") as? Number)?.toLong() ?: -1L
+        val gatesHeld =
+            registeredOk && unregisteredOk && observationOk && pauseOk && terminalPausedOk &&
+                syntheticRouteChangedPosted == 1 &&
+                syntheticRouteDisconnectPosted == 1 &&
+                dropped == 0 &&
+                changedEnqueued >= 1 &&
+                changedEnqueued <= 1 + realRoutingChangedCallbacks &&
+                changedDrained == changedEnqueued &&
+                disconnectEnqueued == 1 && disconnectDrained == 1 &&
+                changedApplied >= 1L && changedApplied == changedDrained.toLong() &&
+                disconnectApplied == 1L &&
+                changedSeq >= 0L && disconnectSeq > changedSeq &&
+                disconnectSeq == changedApplied
+        return mapOf(
+            "routeChangeEventHandoffGatesHeld" to gatesHeld,
+        )
+    }
+
+    // Builds the X11 coordinator-owned metric map (typed per-tag
+    // posted/enqueued/drained/dropped accounting plus real routing-callback
+    // telemetry). Returns empty map unless routeChangeEventHandoffProofEnabled.
+    private fun buildX11Metrics(
+        x11Enabled: Boolean,
+        syntheticRouteChangedPosted: Int,
+        syntheticRouteDisconnectPosted: Int,
+        realRoutingChangedCallbacks: Int,
+        queue: RouteChangeEventQueue?,
+    ): Map<String, Any?> {
+        if (!x11Enabled) return emptyMap()
+        val q = queue
+        return mapOf(
+            "syntheticRouteChangedPosted" to syntheticRouteChangedPosted,
+            "syntheticRouteDisconnectPosted" to syntheticRouteDisconnectPosted,
+            "routeChangedEventsEnqueued" to (q?.routeChangedEnqueuedCount?.get() ?: 0),
+            "routeDisconnectEventsEnqueued" to
+                (q?.routeDisconnectEnqueuedCount?.get() ?: 0),
+            "routeChangedEventsDrained" to (q?.routeChangedDrainedCount?.get() ?: 0),
+            "routeDisconnectEventsDrained" to
+                (q?.routeDisconnectDrainedCount?.get() ?: 0),
+            "routeChangeEventsDropped" to (q?.droppedCount?.get() ?: 0),
+            "realRoutingChangedCallbackCount" to realRoutingChangedCallbacks,
         )
     }
 }

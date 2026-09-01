@@ -2,12 +2,14 @@ package com.connects.vanguard_media_engine.diagnostics
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioRouting
 import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.os.Build
+import android.os.Handler
 import android.os.SystemClock
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -133,6 +135,23 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // AudioTrack.play(), no auto-resume).
         const val X10_EVENT_PERMANENT_LOSS = "permanent_loss"
         const val X10_EVENT_FOCUS_GAIN_ATTEMPT = "focus_gain_attempt"
+        // X11 (P4-AUDIO-ROUTE-CHANGE-EVENT-HANDOFF-RESPONSE) markers, emitted
+        // only for route-change event-handoff proof runs; X4..X10 markers
+        // remain authoritative for their respective modes.
+        const val ROUTE_CHANGE_EVENT_HANDOFF_PASS_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_PHYSICAL_SMOKE_PASS"
+        const val ROUTE_CHANGE_EVENT_HANDOFF_FAIL_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_PHYSICAL_SMOKE_FAIL"
+        // X11 typed synthetic event tags: an ISOLATED queue/plane, distinct
+        // from X9/X10. A synthetic route_changed is posted+awaited pre-start;
+        // the driver drains it on the owner thread. At terminal EOS the driver
+        // synchronously enqueues ONE synthetic route_disconnect via the plane
+        // callback, drains it, calls track.pause(), asserts PLAYSTATE_PAUSED,
+        // and rejects any auto-recreation/restart. The real
+        // AudioRouting.OnRoutingChangedListener is attached to the AudioTrack
+        // in X11 mode and removed exactly once before release.
+        const val X11_EVENT_ROUTE_CHANGED = "route_changed"
+        const val X11_EVENT_ROUTE_DISCONNECT = "route_disconnect"
         const val PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_realtime_wall_clock_pacing_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_avsync_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
@@ -160,6 +179,19 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // or dead-object recovery, no production restart policy.
         const val PERMANENT_FOCUS_LOSS_PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_loss_permanent_stop_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_only_base_gain_0_5_permanent_loss_terminal_pause_synthetic_focus_gain_attempt_rejected_no_play_no_auto_resume_no_flush_no_stop_no_release_recreate_no_transport_pause_no_presentation_pause_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_sla_no_production_restart_policy_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
+
+        // X11 mode-specific proof boundary: replaces the default boundary for
+        // route-change event-handoff proof runs, which are neither muted nor
+        // no-focus. Diagnostic routing-listener lifecycle, event handoff and
+        // sink-side fail-closed pause response only (pause() only, no
+        // flush/stop, no release-recreate): no seamless route recreation or
+        // hot-swap, no stream re-anchor, no dead-object recovery, no OS route
+        // arbitration correctness, no acoustic audibility/speaker
+        // verification, no transport/presentation pause, no pause/resume
+        // SLA, no latency/glitch/xrun/underrun freedom, no A/V sync, no
+        // production restart policy.
+        const val ROUTE_CHANGE_EVENT_HANDOFF_PROOF_BOUNDARY =
+            "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_route_change_event_handoff_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_only_base_gain_0_5_route_changed_pre_start_synthetic_drain_route_disconnect_terminal_synthetic_pause_fail_closed_no_play_no_auto_resume_no_route_recreation_no_stream_reanchor_no_dead_object_recovery_routing_listener_registered_and_unregistered_exactly_once_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_seamless_route_recreation_no_hot_swap_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
         // Frozen X3 decode dequeue timeout: the realtime loop must return
         // to ingest/drain work quickly.
@@ -203,6 +235,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // only: no measured volume, dB, perceptual depth, fade, or ramp claim.
         private const val DUCK_GAIN_PROOF = 0.1f
 
+        // X11 terminal drain guard: the coordinator route-change queue holds
+        // at most 8 events, so more pending route_changed observations than
+        // this at the terminal point can only mean a runaway producer.
+        private const val X11_MAX_TERMINAL_ROUTE_CHANGED_DRAIN = 16
+
         private const val MAX_CONSECUTIVE_ZERO_WRITES = 500
         private const val ZERO_WRITE_SLEEP_MS = 2L
         private const val HEAD_POLL_SLEEP_MS = 5L
@@ -242,6 +279,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // gain 0.5, but NOT X8 duck/restore or X9 transient pause/resume):
         // false preserves the exact X4/X5/X6/X7/X8/X9 behavior and args.
         val permanentFocusLossProofEnabled: Boolean = false,
+        // X11 mode switch (implies X7 focus/noisy handoff and non-zero base
+        // gain 0.5, but NOT X8 duck/restore, X9 transient pause/resume, or
+        // X10 permanent stop): false preserves the exact X4..X10 behavior
+        // and args.
+        val routeChangeEventHandoffProofEnabled: Boolean = false,
     )
 
     // X8 (P4-AUDIO-FOCUS-DUCK-RESTORE-RESPONSE) synthetic duck/restore event
@@ -308,6 +350,47 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
          * coordinator-owned queue.
          */
         fun enqueueSyntheticFocusGainAttempt()
+    }
+
+    // X11 (P4-AUDIO-ROUTE-CHANGE-EVENT-HANDOFF-RESPONSE) route-change event
+    // plane, supplied by the coordinator. ISOLATED from the X8/X9/X10
+    // planes/queues: no shared counters. The driver polls typed events only
+    // on its owner thread (the only thread ever allowed to touch the
+    // AudioTrack): every route_changed drained (the ONE synthetic pre-start
+    // event plus any real-listener handoff) is observed by sampling
+    // routed-device telemetry; the ONE synthetic route_disconnect is
+    // enqueued by the driver-invoked callback at the terminal EOS point and
+    // applied at the SAME owner-thread boundary (pause() only, fail closed,
+    // no recreation/restart). The coordinator owns the real
+    // AudioRouting.OnRoutingChangedListener object and the handler it is
+    // delivered on; the driver alone adds it to and removes it from the
+    // AudioTrack, exactly once each. The listener only counts and enqueues
+    // typed events; it never touches the AudioTrack.
+    interface RouteChangeEventPlane {
+        /**
+         * Owner thread only: returns [X11_EVENT_ROUTE_CHANGED],
+         * [X11_EVENT_ROUTE_DISCONNECT] or null.
+         */
+        fun pollOneEvent(): String?
+
+        /**
+         * Driver request (owner thread, synchronous): enqueue the ONE
+         * synthetic route-disconnect event directly into the
+         * coordinator-owned queue.
+         */
+        fun enqueueSyntheticRouteDisconnect()
+
+        /** Coordinator-owned real routing listener (telemetry/handoff only). */
+        val routingChangedListener: AudioRouting.OnRoutingChangedListener
+
+        /** Handler the real routing listener callbacks are delivered on. */
+        val routingListenerHandler: Handler
+
+        /**
+         * Driver report (owner thread): the listener was removed from the
+         * AudioTrack, so the coordinator stops handing off late callbacks.
+         */
+        fun onRoutingListenerRemoved()
     }
 
     // Lanes/metrics are flat maps so the coordinator payload and the
@@ -529,6 +612,34 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
     private var playStateAfterFocusGainAttempt = -1
     private var playStateAtReleasePermanent = -1
     private var terminalPlayStatePausedBeforeReleasePermanentOk = false
+    // X11 route-change event-handoff response state. Owner thread only
+    // touches the AudioTrack (add/remove routing listener, routedDevice
+    // telemetry, pause); terminal states: created_uninit ->
+    // base_volume_set(0.5) -> routing_listener_registered ->
+    // prerolled_not_playing -> playing -> route_changed_observed (write-loop
+    // drain, routed-device telemetry sampled) -> [seek epoch, unaffected] ->
+    // playing -> paused_route_disconnect (terminal EOS point, synthetic
+    // disconnect enqueued+drained at the same boundary, no
+    // recreate/restart) -> routing_listener_removed_once -> released_once ->
+    // applier_disabled. ISOLATED from X8/X9/X10: no shared counters.
+    // Playstate and routed-device values are sink-side telemetry only.
+    private var routeChangeEventPlane: RouteChangeEventPlane? = null
+    private var x11ApplierEnabled = false
+    private var x11AppliedEventSeq = 0L
+    private var routingListenerRegisteredOk = false
+    private var routingListenerRemoveAttempted = false
+    private var routingListenerUnregisteredOk = false
+    private var routeChangeObservationOk = false
+    private var routeDisconnectFailClosedPauseOk = false
+    private var terminalPlayStatePausedBeforeReleaseRouteChangeOk = false
+    private var routeChangedAppliedCount = 0L
+    private var routeDisconnectAppliedCount = 0L
+    private var routeChangedApplySeq = -1L
+    private var routeDisconnectApplySeq = -1L
+    private var routedDeviceSampleOk = false
+    private var routedDeviceTypeAtRouteChanged = -1
+    private var playStateAfterRouteDisconnectPause = -1
+    private var playStateAtReleaseRouteChange = -1
     private val detailParts = mutableListOf<String>()
 
     fun run(
@@ -537,12 +648,14 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         duckRestorePlane: DuckRestoreEventPlane? = null,
         focusLossPauseResumePlane: FocusLossPauseResumeEventPlane? = null,
         permanentFocusLossPlane: PermanentFocusLossEventPlane? = null,
+        routeChangeEventPlane: RouteChangeEventPlane? = null,
     ): RunResult {
         config = runConfig
         this.drainEventsFn = drainEventsFn
         this.duckRestorePlane = duckRestorePlane
         this.focusLossPauseResumePlane = focusLossPauseResumePlane
         this.permanentFocusLossPlane = permanentFocusLossPlane
+        this.routeChangeEventPlane = routeChangeEventPlane
         deadline = SystemClock.elapsedRealtime() + config.deadlineMs
         mfpm = config.maxFramesPerMix.toLong()
         runThreadId = Thread.currentThread().id
@@ -1248,6 +1361,50 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 detailParts.add("permanentFocusLossPlaystateTelemetryOnly")
             }
 
+            // X11 route-change event-handoff response gate. The real routing
+            // listener must have been registered on the AudioTrack; at least
+            // one route_changed (the ONE synthetic pre-start event, plus any
+            // real-listener handoff) must have been observed with
+            // routed-device telemetry sampled; exactly one synthetic
+            // route_disconnect must have been applied at the terminal EOS
+            // point (AudioTrack.pause() only, PLAYSTATE_PAUSED asserted, no
+            // recreation/restart) as the LAST applied event of a strictly
+            // monotonic applied-event sequence. Sink-side telemetry only: no
+            // acoustic audibility/speaker verification, no OS route
+            // arbitration correctness, no seamless route recreation/hot-swap,
+            // no stream re-anchor, no dead-object recovery, no
+            // transport/presentation pause, no pause/resume SLA, no
+            // production restart policy.
+            if (config.routeChangeEventHandoffProofEnabled) {
+                if (!routingListenerRegisteredOk) {
+                    throw FailClosed("routing_listener_not_registered")
+                }
+                if (routeChangedAppliedCount < 1L || !routeChangeObservationOk ||
+                    !routedDeviceSampleOk
+                ) {
+                    throw FailClosed("route_changed_not_observed")
+                }
+                if (routeDisconnectAppliedCount != 1L || !routeDisconnectFailClosedPauseOk) {
+                    throw FailClosed("route_disconnect_pause_not_applied")
+                }
+                if (routeChangedApplySeq < 0L ||
+                    routeDisconnectApplySeq <= routeChangedApplySeq ||
+                    routeDisconnectApplySeq != routeChangedAppliedCount
+                ) {
+                    throw FailClosed("route_change_order_violated")
+                }
+                if (playStateAfterRouteDisconnectPause != AudioTrack.PLAYSTATE_PAUSED) {
+                    throw FailClosed("terminal_playstate_not_paused_after_route_disconnect")
+                }
+                detailParts.add("routeChangedAppliedCount=$routeChangedAppliedCount")
+                detailParts.add("routeChangedApplySeq=$routeChangedApplySeq")
+                detailParts.add("routeDisconnectApplySeq=$routeDisconnectApplySeq")
+                detailParts.add(
+                    "routedDeviceTypeAtRouteChanged=$routedDeviceTypeAtRouteChanged"
+                )
+                detailParts.add("routeChangeRoutedDeviceAndPlaystateTelemetryOnly")
+            }
+
             // ── Destroy: join-on-destroy + idempotence ──────────────────────
             val (joinOk, idempotentOk) = s.destroyAndVerifyLifecycle()
             workerJoinOnDestroyOk = joinOk
@@ -1306,6 +1463,33 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                     )
                 }
                 terminalPlayStatePausedBeforeReleasePermanentOk = true
+            }
+
+            // X11: explicit owner-thread release before the result is
+            // sealed. The route-disconnect pause must never have been
+            // resumed or recreated, so the playstate observed at release
+            // must be PLAYSTATE_PAUSED, and the real routing listener must
+            // have been removed exactly once inside the release, before
+            // AudioTrack.release(). The release disables the X11 applier
+            // (terminal: paused_route_disconnect ->
+            // routing_listener_removed_once -> released_once ->
+            // applier_disabled); any later X11 event fails closed. The
+            // finally release is then a guarded no-op.
+            if (config.routeChangeEventHandoffProofEnabled) {
+                if (routeDisconnectAppliedCount != 1L) {
+                    throw FailClosed("released_before_route_disconnect")
+                }
+                releaseAudioTrackOnce()
+                if (!routingListenerRegisteredOk || !routingListenerUnregisteredOk) {
+                    throw FailClosed("routing_listener_lifecycle_incomplete")
+                }
+                if (playStateAtReleaseRouteChange != AudioTrack.PLAYSTATE_PAUSED) {
+                    throw FailClosed(
+                        "terminal_playstate_not_paused_before_release_route_change:" +
+                            "$playStateAtReleaseRouteChange"
+                    )
+                }
+                terminalPlayStatePausedBeforeReleaseRouteChangeOk = true
             }
 
             // Every sink write and boundary callback asserted the single
@@ -1415,6 +1599,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // X9 non-terminal drain point: the transient loss pause + same-boundary
         // focus-gain resume are applied here (never at the seek boundary).
         drainFocusLossPauseResumeNonTerminal()
+        // X11 non-terminal drain point: route_changed observations (synthetic
+        // pre-start event plus any real-listener handoff) are applied here
+        // (never at the seek boundary). ISOLATED from the X8/X9 drains above.
+        drainRouteChangeNonTerminal()
     }
 
     // ── AudioTrack lifecycle / pre-roll / seek epoch ────────────────────────
@@ -1462,9 +1650,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         if (config.nonZeroGainSinkProofEnabled ||
             config.focusDuckRestoreProofEnabled ||
             config.focusLossPauseResumeProofEnabled ||
-            config.permanentFocusLossProofEnabled
+            config.permanentFocusLossProofEnabled ||
+            config.routeChangeEventHandoffProofEnabled
         ) {
-            // X6 non-zero-gain proof (and X8/X9/X10, which imply the
+            // X6 non-zero-gain proof (and X8/X9/X10/X11, which imply the
             // non-zero base gain): constant AudioTrack output gain only.
             // Written PCM bytes and every checksum are unaffected by this.
             // Terminal state: created_uninit -> format_frozen_volume_set.
@@ -1495,6 +1684,28 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 // the permanent-loss applier is live from here until release
                 // disables it. X8/X9 state is NOT touched.
                 x10ApplierEnabled = true
+            }
+            if (config.routeChangeEventHandoffProofEnabled) {
+                // X11 terminal state: created_uninit -> base_volume_set(0.5)
+                // -> routing_listener_registered. The coordinator-owned real
+                // AudioRouting.OnRoutingChangedListener is added to the
+                // AudioTrack here, on the owner thread, delivered on the
+                // coordinator/main handler, and removed exactly once at
+                // release. X8/X9/X10 state is NOT touched.
+                val plane = routeChangeEventPlane
+                    ?: throw FailClosed("route_change_plane_missing")
+                try {
+                    track.addOnRoutingChangedListener(
+                        plane.routingChangedListener,
+                        plane.routingListenerHandler,
+                    )
+                } catch (t: Throwable) {
+                    throw FailClosed(
+                        "routing_listener_register_failed:${t.javaClass.simpleName}"
+                    )
+                }
+                routingListenerRegisteredOk = true
+                x11ApplierEnabled = true
             }
         } else {
             // Muted-only boundary: default X4/X5 path (volume 0.0).
@@ -1626,6 +1837,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // here (AudioTrack.pause() only, no flush/stop, no play(), no resume
         // before release). ISOLATED from the X9 drain above.
         drainPermanentFocusLossTerminal()
+        // X11 terminal drain point: pending route_changed observations are
+        // applied first, then the ONE synthetic route_disconnect is requested,
+        // drained and applied here at the same owner-thread boundary
+        // (AudioTrack.pause() only, no flush/stop, no recreate/restart, no
+        // resume before release). ISOLATED from the X9/X10 drains above.
+        drainRouteChangeTerminal()
     }
 
     // ── X8 focus-duck/restore volume applier (owner thread only) ────────────
@@ -1926,6 +2143,142 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         }
     }
 
+    // ── X11 route-change event-handoff applier (owner thread only) ─────────
+
+    // Non-terminal drain point (write loop only): polls AT MOST ONE typed
+    // event per pass once the current epoch is playing. Every route_changed
+    // (the ONE synthetic pre-start event plus any real-listener handoff) is
+    // observed here; a route_disconnect polled here fails closed — it may
+    // only exist at the terminal EOS point, where the driver itself requests
+    // it.
+    private fun drainRouteChangeNonTerminal() {
+        val plane = routeChangeEventPlane ?: return
+        if (!config.routeChangeEventHandoffProofEnabled) return
+        assertOwnerThread("x11_drain")
+        if (!epochPlayed) return
+        val event = plane.pollOneEvent() ?: return
+        applyRouteChangeEvent(event, terminal = false)
+    }
+
+    // Terminal drain point (EOS finalization only): any route_changed still
+    // pending is observed first, at least one route_changed must have been
+    // observed overall, then the driver requests the ONE synthetic
+    // route_disconnect (enqueued directly by the plane callback, no
+    // main-handler wait), drains it at the SAME owner-thread boundary,
+    // applies pause() only and asserts PLAYSTATE_PAUSED. Nothing may follow
+    // it; the sink is never recreated or restarted.
+    private fun drainRouteChangeTerminal() {
+        val plane = routeChangeEventPlane ?: return
+        if (!config.routeChangeEventHandoffProofEnabled) return
+        assertOwnerThread("x11_terminal_drain")
+        if (!epochPlayed) throw FailClosed("route_disconnect_before_epoch_play")
+        var guard = 0
+        var pending = plane.pollOneEvent()
+        while (pending != null) {
+            if (pending != X11_EVENT_ROUTE_CHANGED) {
+                throw FailClosed("unexpected_route_event_before_disconnect:$pending")
+            }
+            applyRouteChangeEvent(pending, terminal = true)
+            if (++guard > X11_MAX_TERMINAL_ROUTE_CHANGED_DRAIN) {
+                throw FailClosed("route_changed_terminal_drain_unbounded")
+            }
+            pending = plane.pollOneEvent()
+        }
+        if (routeChangedAppliedCount == 0L) {
+            throw FailClosed("route_changed_never_observed")
+        }
+        plane.enqueueSyntheticRouteDisconnect()
+        var next = plane.pollOneEvent()
+        while (next == X11_EVENT_ROUTE_CHANGED) {
+            // A real-listener handoff racing the request is still observed
+            // strictly BEFORE the disconnect.
+            applyRouteChangeEvent(next, terminal = true)
+            if (++guard > X11_MAX_TERMINAL_ROUTE_CHANGED_DRAIN) {
+                throw FailClosed("route_changed_terminal_drain_unbounded")
+            }
+            next = plane.pollOneEvent()
+        }
+        if (next == null) {
+            throw FailClosed("route_disconnect_not_enqueued_synchronously")
+        }
+        if (next != X11_EVENT_ROUTE_DISCONNECT) {
+            throw FailClosed("unexpected_route_event_after_disconnect_request:$next")
+        }
+        applyRouteChangeEvent(next, terminal = true)
+        if (plane.pollOneEvent() != null) {
+            throw FailClosed("route_event_after_disconnect")
+        }
+    }
+
+    // Applies one typed X11 event on the owner thread. route_changed is a
+    // telemetry-only observation: AudioTrack.getRoutedDevice() is sampled,
+    // nothing is recreated, re-anchored or play-state mutated; every applied
+    // observation is counted and the FIRST one's ordinal is recorded.
+    // route_disconnect is the terminal-only fail-closed response: pause()
+    // only — never flush()/stop()/release-recreate/play() — requiring
+    // PLAYING, applied exactly once, PLAYSTATE_PAUSED asserted, and nothing
+    // may follow it. Playstate/routed-device values are sink-side telemetry,
+    // not an acoustic, transport, presentation, OS-route-arbitration, SLA,
+    // or recovery claim. Nothing may run after release disables the applier.
+    // The applied-event sequence is monotonic per applied event.
+    private fun applyRouteChangeEvent(event: String, terminal: Boolean) {
+        val track = audioTrack
+        if (!x11ApplierEnabled || track == null) {
+            throw FailClosed("route_event_after_release:$event")
+        }
+        when (event) {
+            X11_EVENT_ROUTE_CHANGED -> {
+                if (routeDisconnectAppliedCount > 0L) {
+                    throw FailClosed("route_changed_after_disconnect")
+                }
+                val device = try {
+                    track.routedDevice
+                } catch (t: Throwable) {
+                    throw FailClosed(
+                        "routed_device_sample_failed:${t.javaClass.simpleName}"
+                    )
+                }
+                val seq = x11AppliedEventSeq++
+                if (routeChangedAppliedCount == 0L) {
+                    routeChangedApplySeq = seq
+                    routedDeviceTypeAtRouteChanged = device?.type ?: -1
+                    routedDeviceSampleOk = true
+                    routeChangeObservationOk = true
+                }
+                routeChangedAppliedCount += 1L
+            }
+            X11_EVENT_ROUTE_DISCONNECT -> {
+                if (!terminal) throw FailClosed("route_disconnect_at_non_terminal_point")
+                if (routeChangedAppliedCount == 0L) {
+                    throw FailClosed("route_disconnect_before_route_changed")
+                }
+                if (routeDisconnectAppliedCount > 0L) {
+                    throw FailClosed("duplicate_route_disconnect")
+                }
+                if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+                    throw FailClosed(
+                        "route_disconnect_from_non_playing_state:${track.playState}"
+                    )
+                }
+                // Fail-closed response: pause() only. No flush/stop, no
+                // release-recreate, no play() — the sink stays paused until
+                // release.
+                track.pause()
+                playStateAfterRouteDisconnectPause = track.playState
+                if (playStateAfterRouteDisconnectPause != AudioTrack.PLAYSTATE_PAUSED) {
+                    throw FailClosed(
+                        "route_disconnect_pause_playstate_bad:" +
+                            "$playStateAfterRouteDisconnectPause"
+                    )
+                }
+                routeDisconnectFailClosedPauseOk = true
+                routeDisconnectAppliedCount = 1L
+                routeDisconnectApplySeq = x11AppliedEventSeq++
+            }
+            else -> throw FailClosed("unknown_route_change_event:$event")
+        }
+    }
+
     // Opens a sink write epoch: zeroed counters, fresh unsigned-masked head
     // baseline (re-read after any flush), cleared play/underrun baselines.
     private fun openSinkEpoch() {
@@ -1999,6 +2352,27 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 try { track.playState } catch (_: Throwable) { -1 }
         }
         x10ApplierEnabled = false
+        // X11: capture the sink playstate observed at release (telemetry;
+        // the run path gates it to PLAYSTATE_PAUSED), remove the real
+        // routing listener EXACTLY ONCE before AudioTrack.release(), report
+        // the removal to the plane, and disable the route-change applier;
+        // any later X11 event fails closed (route_event_after_release).
+        if (config.routeChangeEventHandoffProofEnabled) {
+            playStateAtReleaseRouteChange =
+                try { track.playState } catch (_: Throwable) { -1 }
+            if (routingListenerRegisteredOk && !routingListenerRemoveAttempted) {
+                routingListenerRemoveAttempted = true
+                val plane = routeChangeEventPlane
+                if (plane != null) {
+                    try {
+                        track.removeOnRoutingChangedListener(plane.routingChangedListener)
+                        routingListenerUnregisteredOk = true
+                    } catch (_: Throwable) {}
+                    plane.onRoutingListenerRemoved()
+                }
+            }
+        }
+        x11ApplierEnabled = false
         try { track.pause() } catch (_: Throwable) {}
         try { track.flush() } catch (_: Throwable) {}
         try { track.release() } catch (_: Throwable) {}
@@ -2053,6 +2427,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "ownerThreadAffinityOk" to ownerThreadAffinityOk,
             "dynamicGainEnvelopeOk" to dynamicGainEnvelopeOk,
             "nonZeroGainSinkGatesHeld" to nonZeroGainSinkGatesHeld,
+            "routingListenerRegisteredOk" to routingListenerRegisteredOk,
+            "routingListenerUnregisteredOk" to routingListenerUnregisteredOk,
+            "routeChangeObservationOk" to routeChangeObservationOk,
+            "routeDisconnectFailClosedPauseOk" to routeDisconnectFailClosedPauseOk,
+            "terminalPlayStatePausedBeforeReleaseRouteChangeOk" to
+                terminalPlayStatePausedBeforeReleaseRouteChangeOk,
         )
         val metrics = mapOf<String, Any?>(
             "sampleRate" to sampleRate,
@@ -2193,8 +2573,21 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "playStateAtReleasePermanent" to playStateAtReleasePermanent,
             "terminalPlayStatePausedBeforeReleasePermanentOk" to
                 terminalPlayStatePausedBeforeReleasePermanentOk,
+            "routeChangeEventHandoffProofEnabled" to
+                config.routeChangeEventHandoffProofEnabled,
+            "routeChangedAppliedCount" to routeChangedAppliedCount,
+            "routeDisconnectAppliedCount" to routeDisconnectAppliedCount,
+            "routeChangedApplySeq" to routeChangedApplySeq,
+            "routeDisconnectApplySeq" to routeDisconnectApplySeq,
+            "routedDeviceSampleOk" to routedDeviceSampleOk,
+            "routedDeviceTypeAtRouteChanged" to routedDeviceTypeAtRouteChanged,
+            "playStateAfterRouteDisconnectPause" to playStateAfterRouteDisconnectPause,
+            "playStateAtReleaseRouteChange" to playStateAtReleaseRouteChange,
         )
         val marker = when {
+            config.routeChangeEventHandoffProofEnabled ->
+                if (pass) ROUTE_CHANGE_EVENT_HANDOFF_PASS_MARKER
+                else ROUTE_CHANGE_EVENT_HANDOFF_FAIL_MARKER
             config.permanentFocusLossProofEnabled ->
                 if (pass) PERMANENT_FOCUS_LOSS_PASS_MARKER
                 else PERMANENT_FOCUS_LOSS_FAIL_MARKER
@@ -2217,10 +2610,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             pass = pass,
             status = if (pass) "pass" else failureReason.substringBefore(':').ifBlank { "fail" },
             marker = marker,
-            // X8/X9/X10 replace the default boundary: a focus-duck/restore,
-            // a focus-loss pause/resume, or a permanent focus-loss run is
-            // neither muted nor no-focus.
+            // X8/X9/X10/X11 replace the default boundary: a focus-duck/
+            // restore, a focus-loss pause/resume, a permanent focus-loss, or
+            // a route-change event-handoff run is neither muted nor no-focus.
             proofBoundary = when {
+                config.routeChangeEventHandoffProofEnabled ->
+                    ROUTE_CHANGE_EVENT_HANDOFF_PROOF_BOUNDARY
                 config.permanentFocusLossProofEnabled ->
                     PERMANENT_FOCUS_LOSS_PROOF_BOUNDARY
                 config.focusLossPauseResumeProofEnabled ->
