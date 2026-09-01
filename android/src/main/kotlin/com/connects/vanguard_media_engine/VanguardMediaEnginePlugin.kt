@@ -53,6 +53,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioSourc
 import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioSourceRealDecoderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidPassthroughRemuxSinkSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineCompositorSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
@@ -255,6 +256,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
     private var multiCamCompositorSmokeCoordinator: AndroidMultiCamCompositorSmokeCoordinator? = null
+
+    // ── P5-COMPOSITOR-TRANS (NODE-TOPOLOGY-MATH): VGTimelineCompositorNode ──
+    // native topology + transition math smoke coordinator.
+    private var timelineCompositorSmokeCoordinator: AndroidTimelineCompositorSmokeCoordinator? = null
 
     // ── P3-CAM-CONCURRENT: Camera2 dual-camera concurrent ingest smoke ────────
     private var camera2ConcurrentSmokeCoordinator: AndroidCamera2ConcurrentSmokeCoordinator? = null
@@ -487,6 +492,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        timelineCompositorSmokeCoordinator = AndroidTimelineCompositorSmokeCoordinator(
             mainHandler = mainHandler,
         )
         camera2ConcurrentSmokeCoordinator = AndroidCamera2ConcurrentSmokeCoordinator(
@@ -919,6 +927,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 coord.handleMethodCall(call.method, args, result)
             } else {
                 result.error("UNAVAILABLE", "Android multi-cam compositor smoke coordinator unavailable", null)
+            }
+            return
+        }
+
+        if (AndroidTimelineCompositorSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = timelineCompositorSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error("UNAVAILABLE", "Android timeline compositor smoke coordinator unavailable", null)
             }
             return
         }
@@ -2328,6 +2346,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         asyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator?.disposeAll()
         asyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
+        // P5-COMPOSITOR-TRANS (NODE-TOPOLOGY-MATH): release the smoke executor.
+        timelineCompositorSmokeCoordinator?.disposeAll()
+        timelineCompositorSmokeCoordinator = null
         // Export Unit C / Phase 2-Unit AD: cancel any in-flight exportTimeline
         // or exportPassthroughRemux and drop temps.
         editorExportCoordinator?.disposeAll()

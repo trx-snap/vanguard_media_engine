@@ -33,7 +33,10 @@ add_library(vanguard_audio STATIC
 target_include_directories(vanguard_audio PUBLIC "audio/include")
 target_link_libraries(vanguard_audio PRIVATE vanguard_graph vanguard_core)
 
-add_library(vanguard_compositors STATIC "compositors/src/multi_cam_compositor_node.cpp")
+add_library(vanguard_compositors STATIC
+    "compositors/src/multi_cam_compositor_node.cpp"
+    "compositors/src/vg_timeline_compositor_node.cpp"
+)
 target_include_directories(vanguard_compositors PUBLIC "compositors/include")
 target_link_libraries(vanguard_compositors PRIVATE vanguard_graph vanguard_core)
 
@@ -142,6 +145,7 @@ if (ANDROID)
     "platform/android/src/android_phase4_async_runtime_queue_multi_source_realtime_clock_jni.cpp"
     "platform/android/src/android_phase3_multicam_compositor_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_render_jni.cpp"
+    "platform/android/src/android_phase5_timeline_compositor_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
 

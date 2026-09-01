@@ -1801,6 +1801,15 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // ── P5-COMPOSITOR-TRANS (NODE-TOPOLOGY-MATH): VGTimelineCompositorNode ──
+    // native topology + timeline clip overlap / transition progress math
+    // foundation diagnostic. Pure in-memory C++ math only: builds
+    // VGTimelineCompositorNode instances with synthetic clip/transition
+    // descriptors and gates EvaluateTimelineComposition() results. Returns a
+    // JSON object string. No threads, no MediaCodec, no GLES/Vulkan, no file
+    // IO, no export/render claim.
+    external fun runAndroidDagPhase5TimelineCompositorSmoke(): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
