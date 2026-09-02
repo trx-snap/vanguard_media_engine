@@ -130,6 +130,8 @@ export 'vg_realtime_playback_pipeline_pause_resume_smoke.dart';
 export 'vg_realtime_playback_pipeline_seek_smoke.dart';
 // P4-AUDIO-REALTIME-PLAYBACK-PIPELINE-FOCUS-RESPONSE (Y6d): Android True-DAG Phase 4 realtime playback pipeline focus response diagnostic smoke foundation.
 export 'vg_realtime_playback_pipeline_focus_response_smoke.dart';
+// P4-AUDIO-REALTIME-PLAYBACK-PIPELINE-SINK-FAULT-TOLERANCE (Y6e): Android True-DAG Phase 4 realtime playback pipeline sink fault tolerance diagnostic smoke foundation.
+export 'vg_realtime_playback_pipeline_sink_fault_tolerance_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.

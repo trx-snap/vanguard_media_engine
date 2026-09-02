@@ -61,6 +61,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackInt
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineIntegrationSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelinePauseResumeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineFocusResponseSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineSeekSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackRealDecoderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackSinkFaultToleranceSmokeCoordinator
@@ -337,6 +338,17 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // BECOMING_NOISY_TERMINAL, PERMANENT_LOSS_TERMINAL). Registration-only
     // glue mirroring the established diagnostic route wiring.
     private var realtimePlaybackPipelineFocusResponseSmokeCoordinator: AndroidRealtimePlaybackPipelineFocusResponseSmokeCoordinator? = null
+
+    // ── P4-AUDIO-REALTIME-PLAYBACK-PIPELINE-SINK-FAULT-TOLERANCE (Y6e): production ──
+    // True-DAG realtime playback pipeline sink fault tolerance smoke
+    // coordinator (Y6a/Y6b pipeline shape + one Y4b routing controller per
+    // scenario: real decode -> Y5a ingest -> Y1 transport -> non-zero-gain
+    // AudioTrack; the sink thread owns every AudioTrack call, applies routing
+    // events and recovers the one synthetic dead object, the coordinator owns
+    // transport commands; EOS_WITH_DEAD_OBJECT_RECOVERY,
+    // ROUTE_DISCONNECT_TERMINAL). Registration-only glue mirroring the
+    // established diagnostic route wiring.
+    private var realtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator: AndroidRealtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -629,6 +641,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         )
         realtimePlaybackPipelineFocusResponseSmokeCoordinator = AndroidRealtimePlaybackPipelineFocusResponseSmokeCoordinator(
             context = binding.applicationContext,
+            mainHandler = mainHandler,
+        )
+        realtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator = AndroidRealtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -1211,6 +1226,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android realtime playback pipeline focus response smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidRealtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = realtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android realtime playback pipeline sink fault tolerance smoke coordinator unavailable",
                     null,
                 )
             }
@@ -2772,6 +2801,14 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // finally and the run thread disposes its state machine in finally.
         realtimePlaybackPipelineFocusResponseSmokeCoordinator?.disposeAll()
         realtimePlaybackPipelineFocusResponseSmokeCoordinator = null
+        // P4-AUDIO-REALTIME-PLAYBACK-PIPELINE-SINK-FAULT-TOLERANCE (Y6e): stop
+        // replying before dropping; an in-flight run is cancelled (a parked or
+        // gated sink thread wakes on cancel), its decoder/sink threads release
+        // MediaCodec/MediaExtractor/AudioTrack on their own threads, the sink
+        // thread releases its routing controller (listener detached) before the
+        // track and the run thread disposes its state machine in finally.
+        realtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator?.disposeAll()
+        realtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): release the smoke executor. An
         // in-flight run owns its VkDevice/images on its own thread and destroys
