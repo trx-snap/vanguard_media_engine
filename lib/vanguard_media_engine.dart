@@ -120,6 +120,8 @@ export 'vg_realtime_playback_focus_response_smoke.dart';
 export 'vg_realtime_playback_sink_fault_tolerance_smoke.dart';
 // P4-AUDIO-REALTIME-PLAYBACK-EXTERNAL-INGEST-SEAM (Y5a): Android True-DAG Phase 4 realtime playback external PCM16 ingest seam diagnostic smoke foundation.
 export 'vg_realtime_playback_ingest_seam_smoke.dart';
+// P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER (Y5b): Android True-DAG Phase 4 realtime playback real MediaExtractor/MediaCodec PCM16 decode to external ingest seam diagnostic smoke foundation.
+export 'vg_realtime_playback_real_decoder_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.

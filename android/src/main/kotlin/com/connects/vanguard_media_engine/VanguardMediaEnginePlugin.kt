@@ -58,6 +58,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackAud
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackFocusResponseSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackIngestSeamSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackInteractiveControlsSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackRealDecoderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackSinkFaultToleranceSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackTransportCoreSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineCompositorSmokeCoordinator
@@ -294,6 +295,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // synthetic producer -> owner-thread native source-ring ingest; no codec).
     // Registration-only glue mirroring the established diagnostic route wiring.
     private var realtimePlaybackIngestSeamSmokeCoordinator: AndroidRealtimePlaybackIngestSeamSmokeCoordinator? = null
+
+    // ── P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER (Y5b): production True-DAG ──
+    // realtime playback MediaExtractor/MediaCodec decoder smoke coordinator (real
+    // decoder -> owner-thread generation-pinned postIngest to Y5a seam).
+    // Registration-only glue mirroring the established diagnostic route wiring.
+    private var realtimePlaybackRealDecoderSmokeCoordinator: AndroidRealtimePlaybackRealDecoderSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -570,6 +577,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         realtimePlaybackIngestSeamSmokeCoordinator = AndroidRealtimePlaybackIngestSeamSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        realtimePlaybackRealDecoderSmokeCoordinator = AndroidRealtimePlaybackRealDecoderSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -1082,6 +1092,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android realtime playback ingest seam smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidRealtimePlaybackRealDecoderSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = realtimePlaybackRealDecoderSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android realtime playback real decoder smoke coordinator unavailable",
                     null,
                 )
             }
@@ -2610,6 +2634,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // disposes its state machine / destroys its raw session in finally.
         realtimePlaybackIngestSeamSmokeCoordinator?.disposeAll()
         realtimePlaybackIngestSeamSmokeCoordinator = null
+        // P4-AUDIO-REALTIME-PLAYBACK-REAL-DECODER (Y5b): stop replying
+        // before dropping; an in-flight run finishes on its own thread and
+        // cancels/disposes its adapter in finally.
+        realtimePlaybackRealDecoderSmokeCoordinator?.disposeAll()
+        realtimePlaybackRealDecoderSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): release the smoke executor. An
         // in-flight run owns its VkDevice/images on its own thread and destroys
