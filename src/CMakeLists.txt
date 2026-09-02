@@ -56,6 +56,7 @@ add_library(vanguard_render_vulkan STATIC
     "render/vulkan/src/vulkan_graphics_pipeline.cpp"
     "render/vulkan/src/vulkan_graphics_command_recorder.cpp"
     "render/vulkan/src/vulkan_frame_synchronization.cpp"
+    "render/vulkan/src/vulkan_timeline_transition_compositor.cpp"
 )
 target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include"
     # Phase 2K: private Vulkan src dir exposed so vulkan_surface_swapchain.cpp
@@ -148,6 +149,7 @@ if (ANDROID)
     "platform/android/src/android_phase3_multicam_spatial_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_compositor_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_gles_render_jni.cpp"
+    "platform/android/src/android_phase5_timeline_transition_vulkan_render_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private
@@ -156,6 +158,12 @@ if (ANDROID)
   # helper source dir on its include path. Diagnostic-only; the helper header
   # stays out of the public gles_backend.h.
   target_include_directories(vanguard_media_engine PRIVATE "render/gles/src")
+  # P5-COMPOSITOR-TRANS (VULKAN-RENDER): the diagnostic JNI drives the private
+  # VulkanTimelineTransitionCompositor helper directly against its own temporary
+  # VkDevice / offscreen attachment (no VulkanBackend seam yet), so it needs the
+  # private Vulkan helper source dir on its include path. Diagnostic-only; the
+  # helper header stays out of the public vulkan_backend.h.
+  target_include_directories(vanguard_media_engine PRIVATE "render/vulkan/src")
 
   # Support Android 15 16 KB page size
   target_link_options(vanguard_media_engine PRIVATE

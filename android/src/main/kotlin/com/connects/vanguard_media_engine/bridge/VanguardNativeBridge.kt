@@ -1822,6 +1822,20 @@ class VanguardNativeBridge(
     // no export session, no product UI.
     external fun runAndroidDagPhase5TimelineTransitionGlesRenderSmoke(): String
 
+    // ── P5-COMPOSITOR-TRANS (VULKAN-RENDER): VulkanTimelineTransitionCompositor ──
+    // shader/raster proof diagnostic. Native creates its own temporary
+    // VkInstance/VkDevice/VkQueue/VkCommandPool, synthetic RGBA8 sampled images,
+    // a 64x64 offscreen color attachment and a host-visible readback buffer on
+    // the calling thread, evaluates ComputeTransitionGeometry() for crossfade /
+    // slide / wipe / none families, renders each through the private Vulkan
+    // transition helper (existing AOT passthrough SPIR-V, fixed-function
+    // blending, viewport/scissor placement), reads the pixels back, and
+    // destroys everything before returning a JSON object string. Reports
+    // status "UNSUPPORTED" (never crashes) when no usable Vulkan device exists.
+    // No MediaCodec/decode, no AHardwareBuffer import, no export session, no
+    // production VulkanBackend mutation, no product UI.
+    external fun runAndroidDagPhase5TimelineTransitionVulkanRenderSmoke(): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
