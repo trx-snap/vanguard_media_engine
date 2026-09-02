@@ -54,6 +54,13 @@ public:
     RenderFrameResult renderFrame(HardwareBufferHandle handle,
                                   const VideoFrameTransform& transform) override;
 
+    // P5-COMPOSITOR-TRANS: two-source clip overlap transition frame through
+    // the same swapchain acquire/submit/present lifecycle as renderFrame.
+    RenderFrameResult renderTransitionFrame(
+        HardwareBufferHandle fromHandle,
+        HardwareBufferHandle toHandle,
+        const VideoTransitionFrameTransform& transition) override;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

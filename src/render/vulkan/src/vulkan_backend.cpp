@@ -170,6 +170,17 @@ RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle /*handle*/,
     return RenderFrameResult::kUnavailable;
 }
 
+// ---------------------------------------------------------------------------
+// P5-COMPOSITOR-TRANS: renderTransitionFrame stub - host build.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderTransitionFrame(
+    HardwareBufferHandle /*fromHandle*/,
+    HardwareBufferHandle /*toHandle*/,
+    const VideoTransitionFrameTransform& /*transition*/) {
+    return RenderFrameResult::kUnavailable;
+}
+
 #else // __ANDROID__
 
 // ---------------------------------------------------------------------------
@@ -849,6 +860,42 @@ RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle handle,
         *s.coreShaders,
         handle,
         transform);
+}
+
+// ---------------------------------------------------------------------------
+// P5-COMPOSITOR-TRANS: renderTransitionFrame - Android.
+// Validates both imports and delegates to the frame renderer's two-source
+// transition path, which preserves the swapchain acquire / frame fence /
+// semaphore / release-fence-export protocol of renderFrame.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderTransitionFrame(
+    HardwareBufferHandle fromHandle,
+    HardwareBufferHandle toHandle,
+    const VideoTransitionFrameTransform& transition) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (!s.surfaceSwapchain || !s.surfaceSwapchain->hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (!s.ahbImports || fromHandle == toHandle ||
+        !hasHardwareBuffer(fromHandle) || s.ahbImports->getImage(fromHandle) == nullptr ||
+        !hasHardwareBuffer(toHandle) || s.ahbImports->getImage(toHandle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (!s.frameRenderer || !s.coreShaders) {
+        return RenderFrameResult::kUnavailable;
+    }
+    return s.frameRenderer->renderTransitionFrame(
+        static_cast<void*>(s.queue),
+        *s.surfaceSwapchain,
+        *s.ahbImports,
+        *s.coreShaders,
+        fromHandle,
+        toHandle,
+        transition);
 }
 
 #endif // __ANDROID__

@@ -23,6 +23,16 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // before pass-2/finalization (a genuine capability/init/render failure); that
 // runtime fallback is session-owned and does not change this selector's
 // [select] decision.
+//
+// P5-COMPOSITOR-TRANS: a scope carrying non-hard-cut transitions REQUIRES
+// Vulkan. When Vulkan cannot be selected for such a scope (capability probe
+// gates it, probe failure, or the clip shape is outside the Vulkan safe
+// scope), [select] resolves to [ExportRenderBackend.UNAVAILABLE] with a
+// `transitions_require_vulkan:<underlying reason>` reason instead of GLES --
+// there is no GLES transition route, and silently degrading an overlap
+// timeline to hard cuts is wrong output. AndroidTimelineExportSession turns
+// that into UNSUPPORTED_EXPORT_FEATURE before pass-1 and also disables its
+// mid-export GLES fallback for transition timelines.
 enum class ExportRenderBackend {
     VULKAN,
     GLES,
@@ -54,7 +64,12 @@ data class ExportRenderScope(
     val clips: List<AndroidTimelineVideoEncoder.ClipInput>,
     val requestedWidth: Int,
     val requestedHeight: Int,
-)
+    /// Validated non-hard-cut transitions (AndroidTimelineTransitionDescriptor.parseList).
+    /// Non-empty means the scope requires the Vulkan backend; see the class doc.
+    val transitions: List<AndroidTimelineTransitionDescriptor> = emptyList(),
+) {
+    val requiresVulkan: Boolean get() = transitions.any { !it.isHardCut }
+}
 
 class AndroidExportRenderBackendSelector {
 
@@ -104,6 +119,7 @@ class AndroidExportRenderBackendSelector {
                 else -> ExportRenderBackend.UNAVAILABLE
             }
 
+            val requiresVulkan = scope?.requiresVulkan == true
             val actualBackend: ExportRenderBackend
             val reason: String
             when (capabilityBackend) {
@@ -112,14 +128,22 @@ class AndroidExportRenderBackendSelector {
                     if (scopeFailureReason == null) {
                         actualBackend = ExportRenderBackend.VULKAN
                         reason = "vulkan_export_scope_supported"
+                    } else if (requiresVulkan) {
+                        actualBackend = ExportRenderBackend.UNAVAILABLE
+                        reason = "$TRANSITIONS_REQUIRE_VULKAN_REASON:$scopeFailureReason"
                     } else {
                         actualBackend = ExportRenderBackend.GLES
                         reason = scopeFailureReason
                     }
                 }
                 ExportRenderBackend.GLES, ExportRenderBackend.UNAVAILABLE -> {
-                    actualBackend = ExportRenderBackend.GLES
-                    reason = report.fallbackReason
+                    if (requiresVulkan) {
+                        actualBackend = ExportRenderBackend.UNAVAILABLE
+                        reason = "$TRANSITIONS_REQUIRE_VULKAN_REASON:${report.fallbackReason}"
+                    } else {
+                        actualBackend = ExportRenderBackend.GLES
+                        reason = report.fallbackReason
+                    }
                 }
             }
 
@@ -133,10 +157,15 @@ class AndroidExportRenderBackendSelector {
             )
         } catch (t: Throwable) {
             Log.e(TAG, "capability probe failed: $t", t)
+            val requiresVulkan = scope?.requiresVulkan == true
             ExportRenderBackendDecision(
                 preferredBackend = ExportRenderBackend.UNAVAILABLE,
-                actualBackend = ExportRenderBackend.GLES,
-                reason = "capability_probe_failed:${t.javaClass.simpleName}",
+                actualBackend = if (requiresVulkan) ExportRenderBackend.UNAVAILABLE else ExportRenderBackend.GLES,
+                reason = if (requiresVulkan) {
+                    "$TRANSITIONS_REQUIRE_VULKAN_REASON:capability_probe_failed:${t.javaClass.simpleName}"
+                } else {
+                    "capability_probe_failed:${t.javaClass.simpleName}"
+                },
                 vulkanSupported = false,
                 glesSupported = false,
                 selectedCapabilityBackend = ExportRenderBackend.UNAVAILABLE,
@@ -190,5 +219,9 @@ class AndroidExportRenderBackendSelector {
 
     companion object {
         private const val TAG = "VGExportBackendSelector"
+
+        /// Reason prefix when a transition timeline cannot be routed to Vulkan
+        /// (the underlying capability/scope reason follows after ':').
+        const val TRANSITIONS_REQUIRE_VULKAN_REASON = "transitions_require_vulkan"
     }
 }

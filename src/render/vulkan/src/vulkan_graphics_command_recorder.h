@@ -122,6 +122,90 @@ struct VulkanGraphicsPassParams {
 #endif
 };
 
+// ---------------------------------------------------------------------------
+// P5-COMPOSITOR-TRANS: two-source clip overlap transition pass.
+// ---------------------------------------------------------------------------
+// One layer draw inside a transition render pass: a fullscreen-triangle draw
+// of one imported source image through its own pipeline / pipeline layout /
+// descriptor set, scoped by an explicit viewport and an explicit scissor.
+// Unlike VulkanGraphicsPassParams::destination*, the viewport here MAY extend
+// beyond (or start before) the render area -- off-canvas slide placement --
+// while the scissor MUST be a non-empty sub-rect of the render area, since
+// the application must confine all rasterization to the render area.
+struct VulkanTransitionLayerDraw {
+#if defined(__ANDROID__)
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+#else
+    void* pipeline = nullptr;
+    void* pipelineLayout = nullptr;
+    void* descriptorSet = nullptr;
+#endif
+    VideoTransformFullPushConstants pushConstants = {
+        {
+            {1.0f, 0.0f, 0.0f, 0.0f},
+            {0.0f, 1.0f, 0.0f, 0.0f},
+        },
+        {
+            {1.0f, 0.0f, 0.0f, 0.0f},
+            {0.0f, 1.0f, 0.0f, 0.0f},
+            {0.0f, 0.0f, 1.0f, 0.0f},
+            {0.0f, 0.0f, 0.0f, 1.0f},
+            {0.0f, 0.0f, 0.0f, 0.0f},
+        },
+    };
+    int32_t viewportX = 0;
+    int32_t viewportY = 0;
+    uint32_t viewportWidth = 0;
+    uint32_t viewportHeight = 0;
+    int32_t scissorX = 0;
+    int32_t scissorY = 0;
+    uint32_t scissorWidth = 0;
+    uint32_t scissorHeight = 0;
+    // When true the pipeline was created with VK_DYNAMIC_STATE_BLEND_CONSTANTS
+    // and [blendConstant] is set on all four channels before the draw.
+    bool useBlendConstants = false;
+    float blendConstant = 0.0f;
+};
+
+// Upper bound on layer draws per transition pass: "from" content, "to"
+// content, plus up to four black letterbox bands for the "to" layer.
+constexpr uint32_t kVulkanTransitionMaxLayerDraws = 8;
+
+struct VulkanTransitionPassParams {
+#if defined(__ANDROID__)
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    VkRenderPass renderPass = VK_NULL_HANDLE;
+    VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    VkClearColorValue clearColor = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    // Optional pre-pass layout transitions for the two imported sources
+    // (UNDEFINED -> SHADER_READ_ONLY_OPTIMAL on first use, same stage/access
+    // masks as the single-source pass).
+    bool transitionFromImage = false;
+    const VulkanHardwareBufferImage* fromImage = nullptr;
+    VkImageLayout fromOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    bool transitionToImage = false;
+    const VulkanHardwareBufferImage* toImage = nullptr;
+    VkImageLayout toOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+#else
+    void* commandBuffer = nullptr;
+    void* renderPass = nullptr;
+    void* framebuffer = nullptr;
+    float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    bool transitionFromImage = false;
+    const VulkanHardwareBufferImage* fromImage = nullptr;
+    uint32_t fromOldLayout = 0;
+    bool transitionToImage = false;
+    const VulkanHardwareBufferImage* toImage = nullptr;
+    uint32_t toOldLayout = 0;
+#endif
+    uint32_t extentWidth = 0;
+    uint32_t extentHeight = 0;
+    VulkanTransitionLayerDraw draws[kVulkanTransitionMaxLayerDraws];
+    uint32_t drawCount = 0;
+};
+
 class VulkanGraphicsCommandRecorder {
 public:
     VulkanGraphicsCommandRecorder() = delete;
@@ -132,6 +216,20 @@ public:
     static bool recordGraphicsPass(const VulkanGraphicsPassParams& params);
     static bool recordCompletePass(
         const VulkanGraphicsPassParams& params,
+#if defined(__ANDROID__)
+        VkCommandBufferUsageFlags flags = 0
+#else
+        uint32_t flags = 0
+#endif
+    );
+
+    // P5-COMPOSITOR-TRANS: begins the command buffer, records optional
+    // source layout transitions, one clear render pass over the full extent
+    // and every layer draw in order, then ends the command buffer. Validates
+    // every handle / extent / scissor before recording anything; returns
+    // false (recording nothing) on any invalid parameter.
+    static bool recordTransitionPass(
+        const VulkanTransitionPassParams& params,
 #if defined(__ANDROID__)
         VkCommandBufferUsageFlags flags = 0
 #else

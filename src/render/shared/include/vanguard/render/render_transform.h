@@ -79,6 +79,55 @@ struct VideoFrameTransform {
 };
 
 // ---------------------------------------------------------------------------
+// RenderNormalizedRect / VideoTransitionFrameTransform
+// ---------------------------------------------------------------------------
+// P5-COMPOSITOR-TRANS production export route: one compositor-owned clip
+// overlap transition frame consuming two imported source images ("from" =
+// outgoing clip, "to" = incoming clip). The per-layer [VideoFrameTransform]s
+// carry each clip's own rotation / decoder crop / aspect-fit destination rect
+// / color matrix exactly as a solo frame would; the transition geometry below
+// mirrors vanguard::compositors::TimelineTransitionProgress (minus the family
+// enum) so the render layer never depends on a compositors header. Viewport
+// rects are top-left-origin, Y-down normalized canvas placements that MAY lie
+// outside [0,1] on x/y (off-canvas slide motion); crop rects select the
+// visible portion of a layer's canvas and must lie inside [0,1].
+//
+// Draw model (derived purely from the weights, never from a family enum):
+//   * blendWeightTo   <= 0            -> "from" layer only, opaque.
+//   * blendWeightFrom <= 0            -> "to" layer only, opaque.
+//   * both weights    >= 1            -> opaque paint-over: "from" then "to".
+//   * otherwise                       -> crossfade: "from" opaque, then "to"
+//                                        constant-alpha blended with
+//                                        alpha = blendWeightTo; both
+//                                        viewports/crops must be identity.
+// Backends fail closed (never render a partial frame) for any other shape.
+struct RenderNormalizedRect {
+    double x      = 0.0;
+    double y      = 0.0;
+    double width  = 1.0;
+    double height = 1.0;
+
+    bool isIdentity() const {
+        const double eps = 1e-9;
+        return x > -eps && x < eps && y > -eps && y < eps &&
+               width > 1.0 - eps && width < 1.0 + eps &&
+               height > 1.0 - eps && height < 1.0 + eps;
+    }
+};
+
+struct VideoTransitionFrameTransform {
+    VideoFrameTransform from;
+    VideoFrameTransform to;
+    double progress        = 0.0;
+    double blendWeightFrom = 1.0;
+    double blendWeightTo   = 0.0;
+    RenderNormalizedRect fromViewport;
+    RenderNormalizedRect toViewport;
+    RenderNormalizedRect fromCrop;
+    RenderNormalizedRect toCrop;
+};
+
+// ---------------------------------------------------------------------------
 // VideoTransformPushConstants
 // ---------------------------------------------------------------------------
 // Packed as two float[4] rows of a 2x4 matrix that maps NDC vertex coords

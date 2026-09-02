@@ -131,6 +131,24 @@ public:
         }
         return renderFrame(handle);
     }
+
+    // ---------------------------------------------------------------------------
+    // P5-COMPOSITOR-TRANS: compositor-owned clip overlap transition frame.
+    //
+    // Renders one output frame from TWO imported AHardwareBuffers (the
+    // outgoing "from" clip and the incoming "to" clip) placed/blended per
+    // [transition] into the attached surface, preserving the same acquire /
+    // submit / present lifecycle as renderFrame. Both handles must be
+    // distinct, active imports. Backends that have not overridden this seam
+    // fail closed with kUnavailable rather than rendering either clip alone
+    // (a silent hard cut would be wrong output).
+    // ---------------------------------------------------------------------------
+    virtual RenderFrameResult renderTransitionFrame(
+        HardwareBufferHandle /*fromHandle*/,
+        HardwareBufferHandle /*toHandle*/,
+        const VideoTransitionFrameTransform& /*transition*/) {
+        return RenderFrameResult::kUnavailable;
+    }
 };
 
 } // namespace render

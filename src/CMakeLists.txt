@@ -47,6 +47,9 @@ target_link_libraries(vanguard_render_shared PRIVATE vanguard_core)
 add_library(vanguard_render_vulkan STATIC
     "render/vulkan/src/vulkan_backend.cpp"
     "render/vulkan/src/vulkan_frame_renderer.cpp"
+    # P5-COMPOSITOR-TRANS: transition-only helpers (draw model, placement,
+    # draw-list, blend pipeline) split out of vulkan_frame_renderer.cpp.
+    "render/vulkan/src/vulkan_transition_frame_renderer.cpp"
     "render/vulkan/src/vulkan_shader_module.cpp"
     "render/vulkan/src/vulkan_surface_swapchain.cpp"
     "render/vulkan/src/vulkan_swapchain_render_targets.cpp"

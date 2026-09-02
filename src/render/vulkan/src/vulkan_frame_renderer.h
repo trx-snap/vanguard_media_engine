@@ -73,6 +73,23 @@ public:
         HardwareBufferHandle handle,
         const VideoFrameTransform& transform);
 
+    // P5-COMPOSITOR-TRANS: two-source clip overlap transition frame. Same
+    // acquire / frame fence / imageAvailable + presentReady semaphore /
+    // pending AHB acquire semaphore wait / release-fence export / present
+    // protocol as renderFrame, with the "from" and "to" imports drawn into
+    // one clear render pass per [VideoTransitionFrameTransform]'s draw model.
+    // Transition pipelines are rebuilt per call (pipeline layouts are per
+    // import) after a device idle wait and retired on the next render call,
+    // failClosed, invalidatePipeline or shutdown.
+    RenderFrameResult renderTransitionFrame(
+        void* queueHandle,
+        VulkanSurfaceSwapchain& swapchain,
+        VulkanHardwareBufferImports& ahbImports,
+        VulkanCoreShaderModules& coreShaders,
+        HardwareBufferHandle fromHandle,
+        HardwareBufferHandle toHandle,
+        const VideoTransitionFrameTransform& transition);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

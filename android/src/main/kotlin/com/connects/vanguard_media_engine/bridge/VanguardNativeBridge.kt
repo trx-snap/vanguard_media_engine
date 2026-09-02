@@ -1179,6 +1179,41 @@ class VanguardNativeBridge(
         colorMatrix: FloatArray?,
     ): String
 
+    // ── P5-COMPOSITOR-TRANS: production transition frame render seam ────────
+    // Renders ONE output frame of a compositor-owned clip overlap transition
+    // from TWO decoder HardwareBuffers (outgoing "from" clip, incoming "to"
+    // clip) into the existing production Vulkan export session -- the same
+    // session/swapchain/activeRenderCount lifecycle as the solo routes above.
+    // [transitionTypeCode] is AndroidTimelineTransitionDescriptor.Type.nativeCode
+    // (hard cut / 0 is rejected: hard cuts never use this route); [progress]
+    // must be finite in [0, 1]. [fromLayerGeometry] / [toLayerGeometry] are
+    // IntArray(9): [cropLeft, cropTop, cropRight, cropBottom, rotationDegrees,
+    // destFitX, destFitY, destFitWidth, destFitHeight], validated natively
+    // exactly like the cropped solo route (crop against the imported buffer
+    // descriptor, cardinal rotation, destination rect inside [width]x[height]).
+    // [fromColorMatrix] / [toColorMatrix] follow the cropped route's optional
+    // 20-element raw colorMatrix contract. Native imports both buffers,
+    // renders, and releases BOTH imports (closing both release fence fds) on
+    // every path after import. The status string always carries a
+    // machine-readable reason plus transitionType / progress / frameIndex;
+    // "status=OK;..." additionally reports renderedFrames and both release
+    // results.
+    external fun renderAndroidTimelineVulkanExportTransitionFrame(
+        sessionId: String,
+        width: Int,
+        height: Int,
+        transitionTypeCode: Int,
+        progress: Double,
+        fromHardwareBuffer: HardwareBuffer,
+        fromLayerGeometry: IntArray,
+        fromColorMatrix: FloatArray?,
+        toHardwareBuffer: HardwareBuffer,
+        toLayerGeometry: IntArray,
+        toColorMatrix: FloatArray?,
+        timelinePtsUs: Long,
+        frameIndex: Int,
+    ): String
+
     // ── Phase 1-Unit U: Android GLES backend offscreen EGL lifecycle smoke ──
     external fun runAndroidDagPhase1UGlesBackendSmoke(): String
 

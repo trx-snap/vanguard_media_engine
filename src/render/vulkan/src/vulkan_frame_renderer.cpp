@@ -19,8 +19,10 @@
 #include "vulkan_surface_swapchain.h"
 #include "vulkan_hardware_buffer_imports.h"
 #include "vulkan_shader_module.h"
+#include "vulkan_transition_frame_renderer.h"
 #include "vanguard/render/render_transform.h"
 
+#include <algorithm>
 #include <cstring>
 #include <unistd.h>
 
@@ -80,6 +82,37 @@ struct VulkanFrameRenderer::Impl {
     // does not fail initialization.
     PFN_vkGetSemaphoreFdKHR pfnGetSemaphoreFd = nullptr;
 
+    // P5-COMPOSITOR-TRANS: per-transition-frame pipelines. Pipeline layouts
+    // are per import, so these are rebuilt for every transition frame (after
+    // a device idle wait) and retired only after the GPU is idle again: on
+    // the next render call, failClosed(), invalidatePipeline() or shutdown().
+    std::unique_ptr<VulkanGraphicsPipeline> transitionFromPipeline;
+    std::unique_ptr<VulkanGraphicsPipeline> transitionToOpaquePipeline;
+    VkPipeline transitionToBlendPipeline = VK_NULL_HANDLE;
+
+    bool hasTransitionPipelines() const {
+        return transitionFromPipeline != nullptr ||
+               transitionToOpaquePipeline != nullptr ||
+               transitionToBlendPipeline != VK_NULL_HANDLE;
+    }
+
+    void invalidateTransitionPipelines() {
+        if (transitionFromPipeline) {
+            transitionFromPipeline->destroy(device);
+            transitionFromPipeline.reset();
+        }
+        if (transitionToOpaquePipeline) {
+            transitionToOpaquePipeline->destroy(device);
+            transitionToOpaquePipeline.reset();
+        }
+        if (transitionToBlendPipeline != VK_NULL_HANDLE) {
+            if (device != VK_NULL_HANDLE) {
+                vkDestroyPipeline(device, transitionToBlendPipeline, nullptr);
+            }
+            transitionToBlendPipeline = VK_NULL_HANDLE;
+        }
+    }
+
     void invalidatePipeline() {
         if (graphicsPipeline) {
             graphicsPipeline->destroy(device);
@@ -87,6 +120,7 @@ struct VulkanFrameRenderer::Impl {
         }
         activePipelineLayout = VK_NULL_HANDLE;
         activeRenderPassHandle = 0;
+        invalidateTransitionPipelines();
     }
 
     // Phase 2P2: failClosed receives ahbImports so it can drainAllRetired()
@@ -285,7 +319,10 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     const bool pipelineMismatch =
         !hasActivePipeline || pipelineCompatibilityMismatch;
     if (pipelineMismatch) {
-        if (pipelineCompatibilityMismatch &&
+        // A previous transition frame's pipelines may still be in flight on
+        // the other frame slot; they are destroyed by invalidatePipeline()
+        // below, so the device must be idle first in that case too.
+        if ((pipelineCompatibilityMismatch || s.hasTransitionPipelines()) &&
             vkDeviceWaitIdle(s.device) != VK_SUCCESS) {
             return RenderFrameResult::kVulkanFailure;
         }
@@ -528,6 +565,379 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
 }
 
+// ---------------------------------------------------------------------------
+// P5-COMPOSITOR-TRANS: two-source clip overlap transition frame.
+// Draw-model resolution, placement math, draw-list construction and the
+// crossfade blend pipeline live in vulkan_transition_frame_renderer.{h,cpp};
+// this method owns only the per-frame swapchain / fence / semaphore protocol.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
+    void* queueHandle,
+    VulkanSurfaceSwapchain& swapchain,
+    VulkanHardwareBufferImports& ahbImports,
+    VulkanCoreShaderModules& coreShaders,
+    HardwareBufferHandle fromHandle,
+    HardwareBufferHandle toHandle,
+    const VideoTransitionFrameTransform& transition) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (queueHandle == nullptr || s.device == VK_NULL_HANDLE ||
+        s.commandPool == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    if (!swapchain.hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (fromHandle == toHandle) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    const VulkanHardwareBufferImage* fromImage = ahbImports.getImage(fromHandle);
+    const VulkanHardwareBufferImage* toImage = ahbImports.getImage(toHandle);
+    if (!ahbImports.hasBuffer(fromHandle) || fromImage == nullptr ||
+        !ahbImports.hasBuffer(toHandle) || toImage == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (fromImage->image == VK_NULL_HANDLE || toImage->image == VK_NULL_HANDLE ||
+        coreShaders.vertex.get() == VK_NULL_HANDLE ||
+        coreShaders.fragment.get() == VK_NULL_HANDLE ||
+        !s.frameSync || !s.frameSync->isInitialized()) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    // Draw model from the weights (see render_transform.h). Validated before
+    // any Vulkan state is touched so an invalid descriptor never reaches the
+    // swapchain.
+    VulkanTransitionDrawMode mode;
+    if (!ResolveVulkanTransitionDrawMode(transition, &mode)) {
+        VGLOG_VFR("renderTransitionFrame: non-finite weights/progress or non-identity "
+                  "crossfade geometry; failing closed");
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint32_t frameCount = s.frameSync->getFrameCount();
+    if (frameCount == 0 || s.currentFrameIndex >= frameCount) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VulkanFrameSyncResources* frame =
+        s.frameSync->getFrame(s.currentFrameIndex);
+    if (frame == nullptr || frame->commandBuffer == VK_NULL_HANDLE ||
+        frame->imageAvailableSemaphore == VK_NULL_HANDLE ||
+        frame->inFlightFence == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t renderPassHandle = swapchain.getRenderPassHandle();
+    const uint32_t extentWidth = swapchain.getExtentWidth();
+    const uint32_t extentHeight = swapchain.getExtentHeight();
+    const VkPipelineLayout fromLayout = fromImage->descriptorResources.pipelineLayout;
+    const VkDescriptorSet fromSet = fromImage->descriptorResources.descriptorSet;
+    const VkPipelineLayout toLayout = toImage->descriptorResources.pipelineLayout;
+    const VkDescriptorSet toSet = toImage->descriptorResources.descriptorSet;
+    if (renderPassHandle == 0 || extentWidth == 0 || extentHeight == 0 ||
+        fromLayout == VK_NULL_HANDLE || fromSet == VK_NULL_HANDLE ||
+        toLayout == VK_NULL_HANDLE || toSet == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VkRenderPass renderPass = u64ToVkHandle<VkRenderPass>(renderPassHandle);
+
+    // Placement is pure math; resolve it before creating any pipeline.
+    VulkanTransitionLayerPlacement fromPlacement;
+    VulkanTransitionLayerPlacement toPlacement;
+    if (!ResolveVulkanTransitionLayerPlacement(transition.from, transition.fromViewport,
+                                               transition.fromCrop, extentWidth, extentHeight,
+                                               &fromPlacement) ||
+        !ResolveVulkanTransitionLayerPlacement(transition.to, transition.toViewport,
+                                               transition.toCrop, extentWidth, extentHeight,
+                                               &toPlacement)) {
+        VGLOG_VFR("renderTransitionFrame: invalid layer geometry; failing closed");
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    // Pipelines are per import layout, so every transition frame rebuilds
+    // them. Any cached pipeline (solo or previous transition) may still be in
+    // flight on the other frame slot: idle the device before destroying.
+    if (vkDeviceWaitIdle(s.device) != VK_SUCCESS) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    s.invalidatePipeline();
+
+    const bool needFrom = mode != VulkanTransitionDrawMode::kToOnly;
+    const bool needToOpaque =
+        mode == VulkanTransitionDrawMode::kToOnly || mode == VulkanTransitionDrawMode::kPaintOver;
+    const bool needToBlend = mode == VulkanTransitionDrawMode::kCrossfade;
+    if (needFrom) {
+        s.transitionFromPipeline = std::make_unique<VulkanGraphicsPipeline>();
+        if (!s.transitionFromPipeline->create(s.device, fromLayout, renderPass,
+                                              coreShaders.vertex.get(),
+                                              coreShaders.fragment.get())) {
+            s.invalidatePipeline();
+            return RenderFrameResult::kVulkanFailure;
+        }
+    }
+    if (needToOpaque) {
+        s.transitionToOpaquePipeline = std::make_unique<VulkanGraphicsPipeline>();
+        if (!s.transitionToOpaquePipeline->create(s.device, toLayout, renderPass,
+                                                  coreShaders.vertex.get(),
+                                                  coreShaders.fragment.get())) {
+            s.invalidatePipeline();
+            return RenderFrameResult::kVulkanFailure;
+        }
+    }
+    if (needToBlend) {
+        if (!CreateVulkanTransitionBlendPipeline(s.device, toLayout, renderPass,
+                                                 coreShaders.vertex.get(),
+                                                 coreShaders.fragment.get(),
+                                                 &s.transitionToBlendPipeline)) {
+            s.invalidatePipeline();
+            return RenderFrameResult::kVulkanFailure;
+        }
+    }
+
+    if (!s.frameSync->waitForFrameFence(s.currentFrameIndex)) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    ahbImports.drainRetiredForFrame(s.currentFrameIndex);
+
+    uint32_t imageIndex = 0;
+    const SwapchainResult acquireResult = swapchain.acquireNextImage(
+        vkHandleToU64(frame->imageAvailableSemaphore),
+        0,
+        &imageIndex,
+        UINT64_MAX);
+    switch (acquireResult) {
+        case SwapchainResult::kSuccess:
+        case SwapchainResult::kSuboptimal:
+            break;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return RenderFrameResult::kDeviceLost;
+        case SwapchainResult::kError:
+            return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t framebufferHandle = swapchain.getFramebufferHandle(imageIndex);
+    if (framebufferHandle == 0) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    const VkFramebuffer framebuffer = u64ToVkHandle<VkFramebuffer>(framebufferHandle);
+
+    const uint64_t presentReadySemaphoreHandle =
+        swapchain.getPresentReadySemaphoreHandle(imageIndex);
+    if (presentReadySemaphoreHandle == 0) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    const VkSemaphore presentReadySemaphore =
+        u64ToVkHandle<VkSemaphore>(presentReadySemaphoreHandle);
+
+    if (!s.frameSync->resetCommandBuffer(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    VulkanTransitionPassParams passParams{};
+    passParams.commandBuffer = frame->commandBuffer;
+    passParams.renderPass = renderPass;
+    passParams.framebuffer = framebuffer;
+    passParams.extentWidth = extentWidth;
+    passParams.extentHeight = extentHeight;
+    const VkImageLayout fromLayoutState =
+        static_cast<VkImageLayout>(ahbImports.getImageLayout(fromHandle));
+    const VkImageLayout toLayoutState =
+        static_cast<VkImageLayout>(ahbImports.getImageLayout(toHandle));
+    passParams.fromImage = fromImage;
+    passParams.fromOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    passParams.transitionFromImage = (fromLayoutState == VK_IMAGE_LAYOUT_UNDEFINED);
+    passParams.toImage = toImage;
+    passParams.toOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    passParams.transitionToImage = (toLayoutState == VK_IMAGE_LAYOUT_UNDEFINED);
+
+    VulkanTransitionLayerResources fromRes;
+    fromRes.pipeline = s.transitionFromPipeline ? s.transitionFromPipeline->get() : VK_NULL_HANDLE;
+    fromRes.pipelineLayout = fromLayout;
+    fromRes.descriptorSet = fromSet;
+    fromRes.pushConstants = makeVideoTransformFullPushConstants(transition.from);
+
+    VulkanTransitionLayerResources toRes;
+    toRes.pipelineLayout = toLayout;
+    toRes.descriptorSet = toSet;
+    toRes.pushConstants = makeVideoTransformFullPushConstants(transition.to);
+    if (needToBlend) {
+        toRes.pipeline = s.transitionToBlendPipeline;
+        toRes.useBlendConstants = true;
+        toRes.blendConstant =
+            static_cast<float>(std::max(0.0, std::min(1.0, transition.blendWeightTo)));
+    } else if (s.transitionToOpaquePipeline) {
+        toRes.pipeline = s.transitionToOpaquePipeline->get();
+    }
+
+    bool planOk = true;
+    switch (mode) {
+        case VulkanTransitionDrawMode::kFromOnly:
+            planOk = AppendVulkanTransitionLayer(&passParams, fromRes, fromPlacement, false);
+            break;
+        case VulkanTransitionDrawMode::kToOnly:
+            planOk = AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, false);
+            break;
+        case VulkanTransitionDrawMode::kPaintOver:
+        case VulkanTransitionDrawMode::kCrossfade:
+            planOk = AppendVulkanTransitionLayer(&passParams, fromRes, fromPlacement, false) &&
+                     AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, true);
+            break;
+    }
+    if (!planOk) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    if (!VulkanGraphicsCommandRecorder::recordTransitionPass(passParams)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    if (!s.frameSync->resetFrameFence(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    VkSemaphore waitSemaphores[3] = {
+        frame->imageAvailableSemaphore,
+        VK_NULL_HANDLE,
+        VK_NULL_HANDLE,
+    };
+    VkPipelineStageFlags waitStages[3] = {
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+    };
+    uint32_t waitSemaphoreCount = 1;
+    const uint64_t fromPendingAcquire = ahbImports.getPendingAcquireSemaphoreHandle(fromHandle);
+    const uint64_t toPendingAcquire = ahbImports.getPendingAcquireSemaphoreHandle(toHandle);
+    if (fromPendingAcquire != 0) {
+        waitSemaphores[waitSemaphoreCount++] = u64ToVkHandle<VkSemaphore>(fromPendingAcquire);
+    }
+    if (toPendingAcquire != 0 && toPendingAcquire != fromPendingAcquire) {
+        waitSemaphores[waitSemaphoreCount++] = u64ToVkHandle<VkSemaphore>(toPendingAcquire);
+    }
+
+    const bool canExportRelease =
+        (frame->releaseFenceSemaphore != VK_NULL_HANDLE) && (s.pfnGetSemaphoreFd != nullptr);
+
+    VkSemaphore signalSemaphores[2] = {
+        presentReadySemaphore,
+        VK_NULL_HANDLE,
+    };
+    uint32_t signalSemaphoreCount = 1;
+    if (canExportRelease) {
+        signalSemaphores[signalSemaphoreCount++] = frame->releaseFenceSemaphore;
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = waitSemaphoreCount;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &frame->commandBuffer;
+    submitInfo.signalSemaphoreCount = signalSemaphoreCount;
+    submitInfo.pSignalSemaphores = signalSemaphores;
+
+    const VkQueue queue = static_cast<VkQueue>(queueHandle);
+    const VkResult submitResult =
+        vkQueueSubmit(queue, 1, &submitInfo, frame->inFlightFence);
+    if (submitResult != VK_SUCCESS) {
+        const RenderFrameResult result =
+            (submitResult == VK_ERROR_DEVICE_LOST)
+                ? RenderFrameResult::kDeviceLost
+                : RenderFrameResult::kVulkanFailure;
+        return s.failClosed(swapchain, ahbImports, result);
+    }
+
+    // Both imports were consumed by this submission: tag both records with
+    // the frame slot so their deferred retirement waits for this fence.
+    if (!ahbImports.markBufferSubmitted(fromHandle, s.currentFrameIndex) ||
+        !ahbImports.markBufferSubmitted(toHandle, s.currentFrameIndex)) {
+        VGLOG_VFR("markBufferSubmitted failed for transition handles %" PRIu64 "/%" PRIu64
+                  "; failing closed",
+                  static_cast<uint64_t>(fromHandle), static_cast<uint64_t>(toHandle));
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    // Release-fence export (see renderFrame): a sync-fd export has wait
+    // semantics on the semaphore payload, so export exactly once and hand the
+    // "to" record a dup() of the same fd (or -1 when no fd was produced).
+    {
+        if (canExportRelease) {
+            int exportedFd = -1;
+            VkSemaphoreGetFdInfoKHR semGetFdInfo{};
+            semGetFdInfo.sType      = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+            semGetFdInfo.pNext      = nullptr;
+            semGetFdInfo.semaphore  = frame->releaseFenceSemaphore;
+            semGetFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+            const VkResult exportResult =
+                s.pfnGetSemaphoreFd(s.device, &semGetFdInfo, &exportedFd);
+            if (exportResult != VK_SUCCESS) {
+                VGLOG_VFR("transition vkGetSemaphoreFdKHR failed: %d; clearing stored release fds",
+                          static_cast<int>(exportResult));
+                if (exportedFd >= 0) {
+                    ::close(exportedFd);
+                }
+                ahbImports.setLatestReleaseFenceFd(fromHandle, -1);
+                ahbImports.setLatestReleaseFenceFd(toHandle, -1);
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+            }
+            int dupFd = -1;
+            if (exportedFd >= 0) {
+                dupFd = ::dup(exportedFd);
+                if (dupFd < 0) dupFd = -1;
+            }
+            ahbImports.setLatestReleaseFenceFd(fromHandle, exportedFd);
+            ahbImports.setLatestReleaseFenceFd(toHandle, dupFd);
+        } else {
+            ahbImports.setLatestReleaseFenceFd(fromHandle, -1);
+            ahbImports.setLatestReleaseFenceFd(toHandle, -1);
+        }
+    }
+
+    if ((fromPendingAcquire != 0 && !ahbImports.markAcquireSemaphoreSubmitted(fromHandle)) ||
+        (toPendingAcquire != 0 && !ahbImports.markAcquireSemaphoreSubmitted(toHandle))) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    if (!ahbImports.setImageLayout(
+            fromHandle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)) ||
+        !ahbImports.setImageLayout(
+            toHandle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    const SwapchainResult presentResult = swapchain.presentImage(
+        queueHandle,
+        presentReadySemaphoreHandle,
+        imageIndex);
+    s.currentFrameIndex = (s.currentFrameIndex + 1) % frameCount;
+
+    switch (presentResult) {
+        case SwapchainResult::kSuccess:
+            return acquireResult == SwapchainResult::kSuboptimal
+                ? RenderFrameResult::kSuboptimal
+                : RenderFrameResult::kSuccess;
+        case SwapchainResult::kSuboptimal:
+            return RenderFrameResult::kSuboptimal;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kDeviceLost);
+        case SwapchainResult::kError:
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+}
+
 } // namespace render
 } // namespace vanguard
 
@@ -603,6 +1013,29 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
         return RenderFrameResult::kNoSurface;
     }
     if (!ahbImports.hasBuffer(handle) || ahbImports.getImage(handle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    return RenderFrameResult::kUnavailable;
+}
+
+// P5-COMPOSITOR-TRANS: host-build stub for the two-source transition frame.
+RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
+    void* /*queueHandle*/,
+    VulkanSurfaceSwapchain& swapchain,
+    VulkanHardwareBufferImports& ahbImports,
+    VulkanCoreShaderModules& /*coreShaders*/,
+    HardwareBufferHandle fromHandle,
+    HardwareBufferHandle toHandle,
+    const VideoTransitionFrameTransform& /*transition*/) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    if (!swapchain.hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (fromHandle == toHandle ||
+        !ahbImports.hasBuffer(fromHandle) || ahbImports.getImage(fromHandle) == nullptr ||
+        !ahbImports.hasBuffer(toHandle) || ahbImports.getImage(toHandle) == nullptr) {
         return RenderFrameResult::kInvalidBufferHandle;
     }
     return RenderFrameResult::kUnavailable;

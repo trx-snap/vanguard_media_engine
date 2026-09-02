@@ -223,6 +223,180 @@ bool VulkanGraphicsCommandRecorder::recordCompletePass(
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// P5-COMPOSITOR-TRANS: two-source transition pass
+// ---------------------------------------------------------------------------
+
+namespace {
+
+static bool validateTransitionPassParams(const VulkanTransitionPassParams& params) {
+    if (params.commandBuffer == VK_NULL_HANDLE) {
+        VGLOG_CR("Transition validation failed: commandBuffer is VK_NULL_HANDLE");
+        return false;
+    }
+    if (params.renderPass == VK_NULL_HANDLE || params.framebuffer == VK_NULL_HANDLE) {
+        VGLOG_CR("Transition validation failed: renderPass/framebuffer is VK_NULL_HANDLE");
+        return false;
+    }
+    if (params.extentWidth == 0 || params.extentHeight == 0) {
+        VGLOG_CR("Transition validation failed: invalid extents (%u x %u)",
+                 params.extentWidth, params.extentHeight);
+        return false;
+    }
+    // drawCount may be 0 (a clear-only frame when every layer is off-canvas).
+    if (params.drawCount > kVulkanTransitionMaxLayerDraws) {
+        VGLOG_CR("Transition validation failed: drawCount %u out of range", params.drawCount);
+        return false;
+    }
+    if (params.transitionFromImage &&
+        (params.fromImage == nullptr || params.fromImage->image == VK_NULL_HANDLE)) {
+        VGLOG_CR("Transition validation failed: transitionFromImage without a valid fromImage");
+        return false;
+    }
+    if (params.transitionToImage &&
+        (params.toImage == nullptr || params.toImage->image == VK_NULL_HANDLE)) {
+        VGLOG_CR("Transition validation failed: transitionToImage without a valid toImage");
+        return false;
+    }
+    for (uint32_t i = 0; i < params.drawCount; ++i) {
+        const VulkanTransitionLayerDraw& d = params.draws[i];
+        if (d.pipeline == VK_NULL_HANDLE || d.pipelineLayout == VK_NULL_HANDLE ||
+            d.descriptorSet == VK_NULL_HANDLE) {
+            VGLOG_CR("Transition validation failed: draw %u has a null pipeline/layout/set", i);
+            return false;
+        }
+        if (d.viewportWidth == 0 || d.viewportHeight == 0) {
+            VGLOG_CR("Transition validation failed: draw %u has an empty viewport", i);
+            return false;
+        }
+        if (d.scissorWidth == 0 || d.scissorHeight == 0 || d.scissorX < 0 || d.scissorY < 0) {
+            VGLOG_CR("Transition validation failed: draw %u has an empty/negative scissor", i);
+            return false;
+        }
+        const uint64_t right =
+            static_cast<uint64_t>(d.scissorX) + static_cast<uint64_t>(d.scissorWidth);
+        const uint64_t bottom =
+            static_cast<uint64_t>(d.scissorY) + static_cast<uint64_t>(d.scissorHeight);
+        if (right > params.extentWidth || bottom > params.extentHeight) {
+            VGLOG_CR("Transition validation failed: draw %u scissor (%d, %d, %u x %u) exceeds extent (%u x %u)",
+                     i, d.scissorX, d.scissorY, d.scissorWidth, d.scissorHeight,
+                     params.extentWidth, params.extentHeight);
+            return false;
+        }
+    }
+    return true;
+}
+
+static void recordSourceLayoutTransition(VkCommandBuffer commandBuffer,
+                                         const VulkanHardwareBufferImage* image,
+                                         VkImageLayout oldLayout) {
+    image->recordLayoutTransition(
+        commandBuffer,
+        oldLayout,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0,
+        VK_ACCESS_SHADER_READ_BIT,
+        VK_QUEUE_FAMILY_IGNORED,
+        VK_QUEUE_FAMILY_IGNORED);
+}
+
+} // anonymous namespace
+
+bool VulkanGraphicsCommandRecorder::recordTransitionPass(
+    const VulkanTransitionPassParams& params,
+    VkCommandBufferUsageFlags flags) {
+    if (!validateTransitionPassParams(params)) {
+        return false;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.pNext = nullptr;
+    beginInfo.flags = flags;
+    beginInfo.pInheritanceInfo = nullptr;
+
+    VkResult res = vkBeginCommandBuffer(params.commandBuffer, &beginInfo);
+    if (res != VK_SUCCESS) {
+        VGLOG_CR("transition vkBeginCommandBuffer failed: %d", res);
+        return false;
+    }
+
+    if (params.transitionFromImage) {
+        recordSourceLayoutTransition(params.commandBuffer, params.fromImage, params.fromOldLayout);
+    }
+    if (params.transitionToImage) {
+        recordSourceLayoutTransition(params.commandBuffer, params.toImage, params.toOldLayout);
+    }
+
+    VkClearValue clearValue{};
+    clearValue.color = params.clearColor;
+
+    VkRenderPassBeginInfo renderPassBeginInfo{};
+    renderPassBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    renderPassBeginInfo.pNext = nullptr;
+    renderPassBeginInfo.renderPass = params.renderPass;
+    renderPassBeginInfo.framebuffer = params.framebuffer;
+    renderPassBeginInfo.renderArea.offset = {0, 0};
+    renderPassBeginInfo.renderArea.extent = {params.extentWidth, params.extentHeight};
+    renderPassBeginInfo.clearValueCount = 1;
+    renderPassBeginInfo.pClearValues = &clearValue;
+
+    vkCmdBeginRenderPass(params.commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+    for (uint32_t i = 0; i < params.drawCount; ++i) {
+        const VulkanTransitionLayerDraw& d = params.draws[i];
+
+        VkViewport viewport{};
+        viewport.x = static_cast<float>(d.viewportX);
+        viewport.y = static_cast<float>(d.viewportY);
+        viewport.width = static_cast<float>(d.viewportWidth);
+        viewport.height = static_cast<float>(d.viewportHeight);
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(params.commandBuffer, 0, 1, &viewport);
+
+        VkRect2D scissor{};
+        scissor.offset = {d.scissorX, d.scissorY};
+        scissor.extent = {d.scissorWidth, d.scissorHeight};
+        vkCmdSetScissor(params.commandBuffer, 0, 1, &scissor);
+
+        vkCmdBindPipeline(params.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
+        vkCmdBindDescriptorSets(
+            params.commandBuffer,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            d.pipelineLayout,
+            0,
+            1,
+            &d.descriptorSet,
+            0,
+            nullptr);
+        if (d.useBlendConstants) {
+            const float constants[4] = {d.blendConstant, d.blendConstant,
+                                        d.blendConstant, d.blendConstant};
+            vkCmdSetBlendConstants(params.commandBuffer, constants);
+        }
+        vkCmdPushConstants(
+            params.commandBuffer,
+            d.pipelineLayout,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            0,
+            sizeof(d.pushConstants),
+            &d.pushConstants);
+        vkCmdDraw(params.commandBuffer, 3, 1, 0, 0);
+    }
+
+    vkCmdEndRenderPass(params.commandBuffer);
+
+    res = vkEndCommandBuffer(params.commandBuffer);
+    if (res != VK_SUCCESS) {
+        VGLOG_CR("transition vkEndCommandBuffer failed: %d", res);
+        return false;
+    }
+    return true;
+}
+
 } // namespace render
 } // namespace vanguard
 
@@ -238,6 +412,14 @@ bool VulkanGraphicsCommandRecorder::recordGraphicsPass(const VulkanGraphicsPassP
 
 bool VulkanGraphicsCommandRecorder::recordCompletePass(
     const VulkanGraphicsPassParams& params,
+    uint32_t flags) {
+    (void)params;
+    (void)flags;
+    return false;
+}
+
+bool VulkanGraphicsCommandRecorder::recordTransitionPass(
+    const VulkanTransitionPassParams& params,
     uint32_t flags) {
     (void)params;
     (void)flags;

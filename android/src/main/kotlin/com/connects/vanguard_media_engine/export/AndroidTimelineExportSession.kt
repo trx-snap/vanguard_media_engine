@@ -35,9 +35,20 @@ import kotlin.math.floor
 // Scope (minimal hard-cut, sequential, local-video export -- Unit C, extended
 // by Unit G with rotation metadata + canvas scaling normalization, and by
 // Phase 10 with per-clip colorMatrix parity):
-//   - video-only clips, speed == 1.0, no transitions, no overlays, no canvas
+//   - video-only clips, speed == 1.0, no overlays, no canvas
 //     contentMode other than "fit", no per-clip transform/crop/freeze/
-//     reverse/time-remap/dual-camera. Per-clip colorMatrix is accepted and
+//     reverse/time-remap/dual-camera.
+//   - P5-COMPOSITOR-TRANS: compositor-owned clip overlap transitions
+//     (AndroidTimelineTransitionDescriptor: dissolve/crossfade, slide*,
+//     wipe*) between adjacent video clips, rendered ONLY by
+//     AndroidTimelineVulkanVideoEncoder. A transition timeline requires the
+//     Vulkan backend: when the selector cannot resolve Vulkan the export
+//     fails closed with UNSUPPORTED_EXPORT_FEATURE before pass-1, and a
+//     failed Vulkan pass-1 never falls back to GLES hard cuts. `fade` and
+//     any other unsupported type fail closed at parse time. Transition
+//     timelines carrying audioSidecar tracks fail closed too: this route
+//     does not overlap-adjust serialized audio timings.
+//   - Per-clip colorMatrix is accepted and
 //     applied for both decoded video frames and still-image frames by
 //     whichever backend renders the clip (Vulkan-native color-matrix push
 //     constants for supported video clips, or the GLES program's colorMatrix
@@ -94,6 +105,7 @@ class AndroidTimelineExportSession(private val context: Context) {
     // ─────────────────────────────────────────────────────────────────────────
 
     private data class ParsedClip(
+        val id: String?,
         val sourcePath: String,
         val trimStart: Double,
         val trimEnd: Double,
@@ -141,11 +153,10 @@ class AndroidTimelineExportSession(private val context: Context) {
             return
         }
 
-        val transitions = draftMap["transitions"] as? List<*> ?: emptyList<Any?>()
-        if (transitions.isNotEmpty()) {
-            onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: transitions are not supported")
-            return
-        }
+        // P5-COMPOSITOR-TRANS: transitions are parsed/validated against the
+        // parsed clip order below (step 2b), once clip ids and trim windows
+        // are known.
+        val rawTransitions = draftMap["transitions"] as? List<*> ?: emptyList<Any?>()
 
         val overlays = draftMap["overlays"] as? List<*> ?: emptyList<Any?>()
         if (overlays.isNotEmpty()) {
@@ -270,7 +281,60 @@ class AndroidTimelineExportSession(private val context: Context) {
                 onError("FILE_UNREADABLE", "exportTimeline: cannot read clip source: $sourcePath")
                 return
             }
-            parsedClips.add(ParsedClip(sourcePath, trimStart, trimEnd, mediaKind, colorMatrix))
+            parsedClips.add(
+                ParsedClip(
+                    id = (map["id"] as? String)?.trim(),
+                    sourcePath = sourcePath,
+                    trimStart = trimStart,
+                    trimEnd = trimEnd,
+                    mediaKind = mediaKind,
+                    colorMatrix = colorMatrix,
+                ),
+            )
+        }
+
+        // ── 2b. Transitions: parse + bind to adjacent clips (P5-COMPOSITOR-TRANS) ──
+        // Clip ids are preserved from the draft so fromClipId/toClipId bind to
+        // the parsed clip order; adjacency, duplicate boundaries, durations and
+        // the closed supported type set are validated by the descriptor
+        // parser. `fade` (and any other unsupported type) fails closed there.
+        val transitions: List<AndroidTimelineTransitionDescriptor> =
+            when (
+                val parse = AndroidTimelineTransitionDescriptor.parseList(
+                    rawTransitions,
+                    parsedClips.map { clip ->
+                        AndroidTimelineTransitionDescriptor.ClipRef(
+                            id = clip.id,
+                            durationSeconds = clip.trimEnd - clip.trimStart,
+                        )
+                    },
+                )
+            ) {
+                is AndroidTimelineTransitionDescriptor.ParseResult.Failure -> {
+                    onError(parse.code, parse.message)
+                    return
+                }
+                is AndroidTimelineTransitionDescriptor.ParseResult.Success -> parse.transitions
+            }
+        if (transitions.isNotEmpty()) {
+            // Non-video clips (still images) are outside the Vulkan safe scope;
+            // AndroidExportRenderBackendSelector resolves such a transition
+            // timeline to UNAVAILABLE (transitions_require_vulkan:...) and the
+            // check after backend selection below fails closed.
+            //
+            // Serialized audioSidecar track timings are not overlap-adjusted by
+            // this route; muxing them under an overlap-shortened video would
+            // desynchronize audio. Fail closed rather than produce wrong output.
+            val sidecarTracks = ((draftMap["audioSidecar"] as? Map<*, *>)?.get("tracks") as? List<*>)
+                ?: emptyList<Any?>()
+            if (sidecarTracks.isNotEmpty()) {
+                onError(
+                    "UNSUPPORTED_EXPORT_FEATURE",
+                    "exportTimeline: transitions with audioSidecar tracks are not supported " +
+                        "(audio timings are not overlap-adjusted)",
+                )
+                return
+            }
         }
 
         // ── 3. Probe decoded geometry + rotation for every clip ─────────────
@@ -424,9 +488,23 @@ class AndroidTimelineExportSession(private val context: Context) {
                 clips = clipInputs,
                 requestedWidth = requestWidth,
                 requestedHeight = requestHeight,
+                transitions = transitions,
             ),
             nativeBridge = sessionNativeBridge,
         )
+        // P5-COMPOSITOR-TRANS: a transition timeline that cannot be routed to
+        // Vulkan fails closed here -- there is no GLES transition route and a
+        // hard-cut re-encode would be wrong output.
+        if (backendDecision.actualBackend == ExportRenderBackend.UNAVAILABLE) {
+            deleteOwnedTemps()
+            logTerminal("backend_unavailable", backendDecision.actualBackend)
+            onError(
+                "UNSUPPORTED_EXPORT_FEATURE",
+                "exportTimeline: transitions require the Vulkan export backend " +
+                    "(${backendDecision.reason})",
+            )
+            return
+        }
         // Backend that actually produced pass-1's output -- starts as the
         // selector's decision, and is updated to GLES if a Vulkan attempt
         // fails and this session falls back mid-export. Every terminal log
@@ -474,7 +552,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         fun encodeWithActiveTracking(enc: AndroidTimelineVideoPassEncoder): AndroidTimelineVideoEncoder.EncodeResult {
             activeEncoder = enc
             try {
-                return enc.encode(clipInputs) { p -> emitPass1Progress(p) }
+                return enc.encode(clipInputs, transitions) { p -> emitPass1Progress(p) }
             } finally {
                 activeEncoder = null
             }
@@ -484,7 +562,14 @@ class AndroidTimelineExportSession(private val context: Context) {
         var encodeResult = encodeWithActiveTracking(encoder)
 
         if (!encodeResult.success && effectiveBackend == ExportRenderBackend.VULKAN &&
-            !cancelRequested && encodeResult.reason != "cancelled"
+            transitions.isNotEmpty() && !cancelRequested && encodeResult.reason != "cancelled"
+        ) {
+            // Transition timelines never fall back: GLES has no overlap route
+            // and would re-encode the timeline as hard cuts.
+            Log.i(TAG, "VG_EXPORT_BACKEND_FALLBACK_BLOCKED from=vulkan reason=${encodeResult.reason} transitions=${transitions.size}")
+        }
+        if (!encodeResult.success && effectiveBackend == ExportRenderBackend.VULKAN &&
+            transitions.isEmpty() && !cancelRequested && encodeResult.reason != "cancelled"
         ) {
             Log.i(TAG, "VG_EXPORT_BACKEND_FALLBACK from=vulkan to=gles reason=${encodeResult.reason}")
             try { File(videoTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
@@ -604,6 +689,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                 "fps" to requestFps,
                 "exportRoiSidecarPath" to roiSidecarPath,
                 "renderBackend" to effectiveBackend.wireName(),
+                "transitionCount" to transitions.size,
             ),
         )
     }

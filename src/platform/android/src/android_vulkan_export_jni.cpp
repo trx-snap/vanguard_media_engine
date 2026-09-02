@@ -13,6 +13,9 @@
 //   renderAndroidTimelineVulkanExportFrame           -> jstring
 //   renderAndroidTimelineVulkanExportFrameCropped     -> jstring (crop + rotationDegrees, 0/90/180/270, dest fit rect,
 //                                                                  Phase 10: optional 20-element raw colorMatrix)
+//   renderAndroidTimelineVulkanExportTransitionFrame  -> jstring (P5-COMPOSITOR-TRANS: two imported AHardwareBuffers,
+//                                                                  per-layer 9-int geometry + optional colorMatrix,
+//                                                                  compositor-owned transition type code + progress)
 //   destroyAndroidTimelineVulkanExportSession        -> jstring
 
 #include <jni.h>
@@ -23,6 +26,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -31,6 +35,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "vanguard/compositors/vg_timeline_compositor_node.h"
 #include "vanguard/render/vulkan_backend.h"
 
 // ---------------------------------------------------------------------------
@@ -123,6 +128,154 @@ const char* RenderResultName(vanguard::render::RenderFrameResult r) {
         case R::kUnavailable:            return "unavailable";
     }
     return "unknown";
+}
+
+// ---------------------------------------------------------------------------
+// Per-layer render geometry shared by the cropped solo route and the
+// transition route: decoder crop rect, cardinal rotation, and the
+// aspect-fit destination rect inside the session's output surface.
+// ---------------------------------------------------------------------------
+
+struct LayerGeometryArgs {
+    int32_t cropLeft = 0;
+    int32_t cropTop = 0;
+    int32_t cropRight = 0;
+    int32_t cropBottom = 0;
+    int32_t rotationDegrees = 0;
+    int32_t destFitX = 0;
+    int32_t destFitY = 0;
+    int32_t destFitWidth = 0;
+    int32_t destFitHeight = 0;
+};
+
+// Wire layout of the Kotlin IntArray(9) for one transition layer.
+constexpr jsize kLayerGeometryLength = 9;
+
+bool ReadLayerGeometry(JNIEnv* env, jintArray arr, LayerGeometryArgs* out, jsize* outLen) {
+    *outLen = arr ? env->GetArrayLength(arr) : -1;
+    if (!arr || *outLen != kLayerGeometryLength) return false;
+    jint values[kLayerGeometryLength];
+    env->GetIntArrayRegion(arr, 0, kLayerGeometryLength, values);
+    out->cropLeft = values[0];
+    out->cropTop = values[1];
+    out->cropRight = values[2];
+    out->cropBottom = values[3];
+    out->rotationDegrees = values[4];
+    out->destFitX = values[5];
+    out->destFitY = values[6];
+    out->destFitWidth = values[7];
+    out->destFitHeight = values[8];
+    return true;
+}
+
+// Returns nullptr when the geometry is structurally valid for a width x
+// height output, else a machine-readable reason token.
+const char* ValidateLayerGeometry(const LayerGeometryArgs& g, int32_t width, int32_t height) {
+    if (g.cropLeft < 0 || g.cropTop < 0 || g.cropRight <= g.cropLeft || g.cropBottom <= g.cropTop) {
+        return "invalid_crop";
+    }
+    if (g.rotationDegrees != 0 && g.rotationDegrees != 90 &&
+        g.rotationDegrees != 180 && g.rotationDegrees != 270) {
+        return "vulkan_rotation_unsupported";
+    }
+    if (g.destFitWidth <= 0 || g.destFitHeight <= 0 || g.destFitX < 0 || g.destFitY < 0 ||
+        (static_cast<int64_t>(g.destFitX) + g.destFitWidth) > width ||
+        (static_cast<int64_t>(g.destFitY) + g.destFitHeight) > height) {
+        return "vulkan_dest_fit_rect_invalid";
+    }
+    return nullptr;
+}
+
+bool CropWithinDescriptor(const LayerGeometryArgs& g,
+                          const vanguard::render::HardwareBufferDescriptor& d) {
+    return d.width > 0 && d.height > 0 &&
+           static_cast<uint32_t>(g.cropRight) <= d.width &&
+           static_cast<uint32_t>(g.cropBottom) <= d.height;
+}
+
+// Builds the render transform for one layer against its *imported*
+// descriptor (the authoritative, possibly padded buffer geometry). The four
+// raw color-matrix offsets (indices 4, 9, 14, 19) are normalized by /255.0
+// exactly once here, matching the GLES backend's uColorMatrixOffset upload.
+void ApplyLayerTransform(const LayerGeometryArgs& g,
+                         const vanguard::render::HardwareBufferDescriptor& d,
+                         const float* colorMatrix /* nullable, 20 raw values */,
+                         vanguard::render::VideoFrameTransform* out) {
+    out->rotationDegrees = static_cast<uint32_t>(g.rotationDegrees);
+    out->cropScaleU = static_cast<float>(g.cropRight - g.cropLeft) / static_cast<float>(d.width);
+    out->cropScaleV = static_cast<float>(g.cropBottom - g.cropTop) / static_cast<float>(d.height);
+    out->cropBiasU = static_cast<float>(g.cropLeft) / static_cast<float>(d.width);
+    out->cropBiasV = static_cast<float>(g.cropTop) / static_cast<float>(d.height);
+    out->destinationRect.x = g.destFitX;
+    out->destinationRect.y = g.destFitY;
+    out->destinationRect.width = g.destFitWidth;
+    out->destinationRect.height = g.destFitHeight;
+    if (colorMatrix != nullptr) {
+        out->colorMatrixEnabled = true;
+        out->colorMatrixRow0[0] = colorMatrix[0];
+        out->colorMatrixRow0[1] = colorMatrix[1];
+        out->colorMatrixRow0[2] = colorMatrix[2];
+        out->colorMatrixRow0[3] = colorMatrix[3];
+        out->colorMatrixRow1[0] = colorMatrix[5];
+        out->colorMatrixRow1[1] = colorMatrix[6];
+        out->colorMatrixRow1[2] = colorMatrix[7];
+        out->colorMatrixRow1[3] = colorMatrix[8];
+        out->colorMatrixRow2[0] = colorMatrix[10];
+        out->colorMatrixRow2[1] = colorMatrix[11];
+        out->colorMatrixRow2[2] = colorMatrix[12];
+        out->colorMatrixRow2[3] = colorMatrix[13];
+        out->colorMatrixRow3[0] = colorMatrix[15];
+        out->colorMatrixRow3[1] = colorMatrix[16];
+        out->colorMatrixRow3[2] = colorMatrix[17];
+        out->colorMatrixRow3[3] = colorMatrix[18];
+        out->colorMatrixOffset[0] = colorMatrix[4] / 255.0f;
+        out->colorMatrixOffset[1] = colorMatrix[9] / 255.0f;
+        out->colorMatrixOffset[2] = colorMatrix[14] / 255.0f;
+        out->colorMatrixOffset[3] = colorMatrix[19] / 255.0f;
+    }
+}
+
+// Reads an optional 20-element raw colorMatrix. Returns false only when a
+// non-null array has the wrong length ([outLen] then carries that length).
+bool ReadOptionalColorMatrix(JNIEnv* env, jfloatArray arr, float* out20, bool* outHas, jsize* outLen) {
+    *outHas = false;
+    *outLen = 0;
+    if (arr == nullptr) return true;
+    *outLen = env->GetArrayLength(arr);
+    if (*outLen != 20) return false;
+    env->GetFloatArrayRegion(arr, 0, 20, out20);
+    *outHas = true;
+    return true;
+}
+
+// Kotlin AndroidTimelineTransitionDescriptor.Type.nativeCode wire codes.
+// 0 (hard cut) is deliberately rejected: hard cuts never reach this route.
+bool TransitionTypeFromCode(jint code,
+                            vanguard::compositors::TransitionType* outType,
+                            const char** outName) {
+    using T = vanguard::compositors::TransitionType;
+    switch (code) {
+        case 1: *outType = T::kCrossfade;  *outName = "crossfade";  return true;
+        case 2: *outType = T::kWipeLeft;   *outName = "wipeLeft";   return true;
+        case 3: *outType = T::kWipeRight;  *outName = "wipeRight";  return true;
+        case 4: *outType = T::kWipeUp;     *outName = "wipeUp";     return true;
+        case 5: *outType = T::kWipeDown;   *outName = "wipeDown";   return true;
+        case 6: *outType = T::kSlideLeft;  *outName = "slideLeft";  return true;
+        case 7: *outType = T::kSlideRight; *outName = "slideRight"; return true;
+        case 8: *outType = T::kSlideUp;    *outName = "slideUp";    return true;
+        case 9: *outType = T::kSlideDown;  *outName = "slideDown";  return true;
+        default: *outName = "unknown"; return false;
+    }
+}
+
+vanguard::render::RenderNormalizedRect ToRenderRect(
+    const vanguard::compositors::TimelineNormalizedRect& r) {
+    vanguard::render::RenderNormalizedRect out;
+    out.x = r.x;
+    out.y = r.y;
+    out.width = r.width;
+    out.height = r.height;
+    return out;
 }
 
 } // namespace
@@ -532,49 +685,23 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     if (!cropWithinBuffer) {
         // Fall through without rendering; buffer is still released below.
     } else {
-        vanguard::render::VideoFrameTransform transform{};
-        transform.rotationDegrees = static_cast<uint32_t>(rotationDegrees);
-        transform.cropScaleU =
-            static_cast<float>(cropRight - cropLeft) / static_cast<float>(descriptor.width);
-        transform.cropScaleV =
-            static_cast<float>(cropBottom - cropTop) / static_cast<float>(descriptor.height);
-        transform.cropBiasU =
-            static_cast<float>(cropLeft) / static_cast<float>(descriptor.width);
-        transform.cropBiasV =
-            static_cast<float>(cropTop) / static_cast<float>(descriptor.height);
-        transform.destinationRect.x = static_cast<int32_t>(destFitX);
-        transform.destinationRect.y = static_cast<int32_t>(destFitY);
-        transform.destinationRect.width = static_cast<int32_t>(destFitWidth);
-        transform.destinationRect.height = static_cast<int32_t>(destFitHeight);
-
         // Phase 10: colorMatrix was already validated (length == 20) before
         // the buffer was imported above; [colorMatrixValues] holds the raw
-        // (un-normalized) 4x5 row-major values. Offsets (indices 4, 9, 14,
-        // 19) are normalized by /255.0 exactly once here, matching the GLES
-        // backend's uColorMatrixOffset upload convention.
-        if (hasColorMatrix) {
-            transform.colorMatrixEnabled = true;
-            transform.colorMatrixRow0[0] = colorMatrixValues[0];
-            transform.colorMatrixRow0[1] = colorMatrixValues[1];
-            transform.colorMatrixRow0[2] = colorMatrixValues[2];
-            transform.colorMatrixRow0[3] = colorMatrixValues[3];
-            transform.colorMatrixRow1[0] = colorMatrixValues[5];
-            transform.colorMatrixRow1[1] = colorMatrixValues[6];
-            transform.colorMatrixRow1[2] = colorMatrixValues[7];
-            transform.colorMatrixRow1[3] = colorMatrixValues[8];
-            transform.colorMatrixRow2[0] = colorMatrixValues[10];
-            transform.colorMatrixRow2[1] = colorMatrixValues[11];
-            transform.colorMatrixRow2[2] = colorMatrixValues[12];
-            transform.colorMatrixRow2[3] = colorMatrixValues[13];
-            transform.colorMatrixRow3[0] = colorMatrixValues[15];
-            transform.colorMatrixRow3[1] = colorMatrixValues[16];
-            transform.colorMatrixRow3[2] = colorMatrixValues[17];
-            transform.colorMatrixRow3[3] = colorMatrixValues[18];
-            transform.colorMatrixOffset[0] = colorMatrixValues[4] / 255.0f;
-            transform.colorMatrixOffset[1] = colorMatrixValues[9] / 255.0f;
-            transform.colorMatrixOffset[2] = colorMatrixValues[14] / 255.0f;
-            transform.colorMatrixOffset[3] = colorMatrixValues[19] / 255.0f;
-        }
+        // (un-normalized) 4x5 row-major values, normalized once by
+        // ApplyLayerTransform (shared with the transition route).
+        LayerGeometryArgs geometry;
+        geometry.cropLeft = static_cast<int32_t>(cropLeft);
+        geometry.cropTop = static_cast<int32_t>(cropTop);
+        geometry.cropRight = static_cast<int32_t>(cropRight);
+        geometry.cropBottom = static_cast<int32_t>(cropBottom);
+        geometry.rotationDegrees = static_cast<int32_t>(rotationDegrees);
+        geometry.destFitX = static_cast<int32_t>(destFitX);
+        geometry.destFitY = static_cast<int32_t>(destFitY);
+        geometry.destFitWidth = static_cast<int32_t>(destFitWidth);
+        geometry.destFitHeight = static_cast<int32_t>(destFitHeight);
+        vanguard::render::VideoFrameTransform transform{};
+        ApplyLayerTransform(geometry, descriptor,
+                            hasColorMatrix ? colorMatrixValues : nullptr, &transform);
 
         renderResult = session->backend.renderFrame(handle, transform);
         renderOk =
@@ -635,6 +762,321 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         static_cast<int>(destFitX), static_cast<int>(destFitY),
         static_cast<int>(destFitWidth), static_cast<int>(destFitHeight),
         hasColorMatrix ? 1 : 0);
+    return env->NewStringUTF(status);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: renderAndroidTimelineVulkanExportTransitionFrame (P5-COMPOSITOR-TRANS)
+// ---------------------------------------------------------------------------
+// Production compositor-owned clip overlap transition frame: imports the
+// outgoing ("from") and incoming ("to") decoder HardwareBuffers into the
+// existing production Vulkan export session, evaluates the compositor-owned
+// transition geometry (vanguard::compositors::ComputeTransitionGeometry) for
+// [transitionTypeCode] at [progress], and renders one output frame through
+// VulkanBackend::renderTransitionFrame -- the same swapchain acquire /
+// submit / present lifecycle and activeRenderCount registry protocol as the
+// solo routes above. Both imports are released on every path after import,
+// and both release fence fds are closed here.
+//
+// [fromLayerGeometry] / [toLayerGeometry] are IntArray(9):
+//   [cropLeft, cropTop, cropRight, cropBottom, rotationDegrees,
+//    destFitX, destFitY, destFitWidth, destFitHeight]
+// validated exactly like the cropped solo route (crop against the imported
+// descriptor, cardinal rotation, destination rect inside width x height).
+// [fromColorMatrix] / [toColorMatrix] follow the cropped route's optional
+// 20-element raw colorMatrix contract. [transitionTypeCode] must be one of
+// the non-hard-cut codes accepted by TransitionTypeFromCode; [progress] must
+// be finite in [0, 1]. Every failure is reported with a machine-readable
+// reason plus transitionType / progress / frameIndex, and success reports
+// renderedFrames and both release results.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidTimelineVulkanExportTransitionFrame(
+    JNIEnv*     env,
+    jobject     /* this */,
+    jstring     sessionIdJ,
+    jint        width,
+    jint        height,
+    jint        transitionTypeCode,
+    jdouble     progress,
+    jobject     fromHardwareBufferJ,
+    jintArray   fromLayerGeometryJ,
+    jfloatArray fromColorMatrixJ,
+    jobject     toHardwareBufferJ,
+    jintArray   toLayerGeometryJ,
+    jfloatArray toColorMatrixJ,
+    jlong       timelinePtsUs,
+    jint        frameIndex) {
+
+    char status[768];
+    const char* typeName = "unknown";
+    vanguard::compositors::TransitionType type = vanguard::compositors::TransitionType::kNone;
+    const double progressValue = static_cast<double>(progress);
+
+    if (!TransitionTypeFromCode(transitionTypeCode, &type, &typeName)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=transition_type_unsupported:code=%d;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            static_cast<int>(transitionTypeCode), typeName, progressValue,
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (!sessionIdJ || !fromHardwareBufferJ || !toHardwareBufferJ || width <= 0 || height <= 0) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=invalid_args;transitionType=%s;progress=%.4f;frameIndex=%d",
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (!std::isfinite(progressValue) || progressValue < 0.0 || progressValue > 1.0) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=transition_progress_invalid;transitionType=%s;progress=%.4f;"
+            "frameIndex=%d",
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    LayerGeometryArgs fromGeometry;
+    LayerGeometryArgs toGeometry;
+    jsize geometryLen = 0;
+    if (!ReadLayerGeometry(env, fromLayerGeometryJ, &fromGeometry, &geometryLen)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=layer_geometry_invalid:layer=from:len=%d;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            static_cast<int>(geometryLen), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+    if (!ReadLayerGeometry(env, toLayerGeometryJ, &toGeometry, &geometryLen)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=layer_geometry_invalid:layer=to:len=%d;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            static_cast<int>(geometryLen), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+    if (const char* reason = ValidateLayerGeometry(fromGeometry, width, height)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=%s:layer=from;transitionType=%s;progress=%.4f;frameIndex=%d",
+            reason, typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+    if (const char* reason = ValidateLayerGeometry(toGeometry, width, height)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=%s:layer=to;transitionType=%s;progress=%.4f;frameIndex=%d",
+            reason, typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    float fromColorMatrix[20];
+    float toColorMatrix[20];
+    bool hasFromColorMatrix = false;
+    bool hasToColorMatrix = false;
+    jsize colorMatrixLen = 0;
+    if (!ReadOptionalColorMatrix(env, fromColorMatrixJ, fromColorMatrix, &hasFromColorMatrix, &colorMatrixLen)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=vulkan_color_matrix_invalid:layer=from:len=%d;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            static_cast<int>(colorMatrixLen), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+    if (!ReadOptionalColorMatrix(env, toColorMatrixJ, toColorMatrix, &hasToColorMatrix, &colorMatrixLen)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=vulkan_color_matrix_invalid:layer=to:len=%d;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            static_cast<int>(colorMatrixLen), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    const char* sidCStr = env->GetStringUTFChars(sessionIdJ, nullptr);
+    std::string sid(sidCStr ? sidCStr : "");
+    if (sidCStr) env->ReleaseStringUTFChars(sessionIdJ, sidCStr);
+
+    VulkanExportSession* session = nullptr;
+    {
+        // Same claim / erase-and-wait lifetime protocol as the solo routes.
+        std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+        auto it = gVulkanExportSessions.find(sid);
+        if (it != gVulkanExportSessions.end()) {
+            session = it->second;
+            session->activeRenderCount++;
+        }
+    }
+
+    if (!session) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=session_not_found;sessionId=%s;transitionType=%s;progress=%.4f;"
+            "frameIndex=%d",
+            sid.c_str(), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    struct ReleaseGuard {
+        VulkanExportSession* s;
+        ~ReleaseGuard() {
+            std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+            if (--s->activeRenderCount == 0) {
+                gVulkanExportSessionIdleCv.notify_all();
+            }
+        }
+    } releaseGuard{session};
+
+    if (!session->initialized || !session->surfaceAttached) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=session_not_ready;transitionType=%s;progress=%.4f;frameIndex=%d",
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (width != session->width || height != session->height) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=vulkan_output_geometry_mismatch:"
+            "sessionW=%d:sessionH=%d:outW=%d:outH=%d;transitionType=%s;progress=%.4f;frameIndex=%d",
+            session->width, session->height, static_cast<int>(width), static_cast<int>(height),
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    AHardwareBuffer* fromAhwb = ResolveAHardwareBufferFromJObject(env, fromHardwareBufferJ);
+    AHardwareBuffer* toAhwb = ResolveAHardwareBufferFromJObject(env, toHardwareBufferJ);
+    if (!fromAhwb || !toAhwb) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=ahardwarebuffer_resolve_failed:layer=%s;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            fromAhwb ? "to" : "from", typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    using vanguard::render::HardwareBufferImportResult;
+    vanguard::render::HardwareBufferHandle fromHandle = vanguard::render::kInvalidHardwareBufferHandle;
+    vanguard::render::HardwareBufferHandle toHandle = vanguard::render::kInvalidHardwareBufferHandle;
+    vanguard::render::HardwareBufferDescriptor fromDescriptor{};
+    vanguard::render::HardwareBufferDescriptor toDescriptor{};
+
+    const auto fromImportResult = session->backend.importHardwareBuffer(
+        fromAhwb, -1, &fromHandle, &fromDescriptor);
+    if (fromImportResult != HardwareBufferImportResult::kSuccess) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=import_failed:layer=from;importResult=%s;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            HwBufResultName(fromImportResult), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    const auto toImportResult = session->backend.importHardwareBuffer(
+        toAhwb, -1, &toHandle, &toDescriptor);
+    if (toImportResult != HardwareBufferImportResult::kSuccess) {
+        // Exactly-once release of the already imported "from" layer.
+        int fromReleaseFenceFd = -1;
+        const auto fromReleaseResult =
+            session->backend.releaseHardwareBuffer(fromHandle, &fromReleaseFenceFd);
+        if (fromReleaseFenceFd >= 0) {
+            ::close(fromReleaseFenceFd);
+        }
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=import_failed:layer=to;importResult=%s;fromReleaseResult=%s;"
+            "transitionType=%s;progress=%.4f;frameIndex=%d",
+            HwBufResultName(toImportResult), HwBufResultName(fromReleaseResult),
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    // Both imported: from here every path releases both handles below.
+    const bool fromCropOk = CropWithinDescriptor(fromGeometry, fromDescriptor);
+    const bool toCropOk = CropWithinDescriptor(toGeometry, toDescriptor);
+    vanguard::render::RenderFrameResult renderResult =
+        vanguard::render::RenderFrameResult::kInvalidBufferHandle;
+    bool renderOk = false;
+
+    if (fromCropOk && toCropOk) {
+        vanguard::render::VideoTransitionFrameTransform transition{};
+        ApplyLayerTransform(fromGeometry, fromDescriptor,
+                            hasFromColorMatrix ? fromColorMatrix : nullptr, &transition.from);
+        ApplyLayerTransform(toGeometry, toDescriptor,
+                            hasToColorMatrix ? toColorMatrix : nullptr, &transition.to);
+        const vanguard::compositors::TimelineTransitionProgress geometry =
+            vanguard::compositors::ComputeTransitionGeometry(type, progressValue);
+        transition.progress = geometry.progress;
+        transition.blendWeightFrom = geometry.blendWeightFrom;
+        transition.blendWeightTo = geometry.blendWeightTo;
+        transition.fromViewport = ToRenderRect(geometry.fromViewport);
+        transition.toViewport = ToRenderRect(geometry.toViewport);
+        transition.fromCrop = ToRenderRect(geometry.fromCrop);
+        transition.toCrop = ToRenderRect(geometry.toCrop);
+
+        renderResult = session->backend.renderTransitionFrame(fromHandle, toHandle, transition);
+        renderOk =
+            renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+            renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+    }
+
+    int fromReleaseFenceFd = -1;
+    const auto fromReleaseResult =
+        session->backend.releaseHardwareBuffer(fromHandle, &fromReleaseFenceFd);
+    if (fromReleaseFenceFd >= 0) {
+        ::close(fromReleaseFenceFd);
+        fromReleaseFenceFd = -1;
+    }
+    int toReleaseFenceFd = -1;
+    const auto toReleaseResult =
+        session->backend.releaseHardwareBuffer(toHandle, &toReleaseFenceFd);
+    if (toReleaseFenceFd >= 0) {
+        ::close(toReleaseFenceFd);
+        toReleaseFenceFd = -1;
+    }
+
+    if (!fromCropOk || !toCropOk) {
+        const LayerGeometryArgs& g = fromCropOk ? toGeometry : fromGeometry;
+        const vanguard::render::HardwareBufferDescriptor& d = fromCropOk ? toDescriptor : fromDescriptor;
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=vulkan_decoder_crop_unsupported:layer=%s:"
+            "crop=%d,%d-%d,%d:descW=%u:descH=%u;fromReleaseResult=%s;toReleaseResult=%s;"
+            "transitionType=%s;progress=%.4f;frameIndex=%d",
+            fromCropOk ? "to" : "from",
+            g.cropLeft, g.cropTop, g.cropRight, g.cropBottom, d.width, d.height,
+            HwBufResultName(fromReleaseResult), HwBufResultName(toReleaseResult),
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (!renderOk) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=render_failed;renderResult=%s;fromReleaseResult=%s;"
+            "toReleaseResult=%s;transitionType=%s;progress=%.4f;frameIndex=%d",
+            RenderResultName(renderResult),
+            HwBufResultName(fromReleaseResult), HwBufResultName(toReleaseResult),
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    if (fromReleaseResult != HardwareBufferImportResult::kSuccess ||
+        toReleaseResult != HardwareBufferImportResult::kSuccess) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=release_failed;fromReleaseResult=%s;toReleaseResult=%s;"
+            "transitionType=%s;progress=%.4f;frameIndex=%d",
+            HwBufResultName(fromReleaseResult), HwBufResultName(toReleaseResult),
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    session->renderedFrames++;
+
+    std::snprintf(status, sizeof(status),
+        "status=OK;frameIndex=%d;timelinePtsUs=%lld;renderedFrames=%d;transitionType=%s;"
+        "progress=%.4f;renderResult=%s;fromReleaseResult=%s;toReleaseResult=%s;"
+        "fromDescW=%u;fromDescH=%u;toDescW=%u;toDescH=%u;"
+        "fromDestFit=%d,%d-%dx%d;toDestFit=%d,%d-%dx%d;fromColorMatrix=%d;toColorMatrix=%d",
+        static_cast<int>(frameIndex),
+        static_cast<long long>(timelinePtsUs),
+        session->renderedFrames,
+        typeName,
+        progressValue,
+        RenderResultName(renderResult),
+        HwBufResultName(fromReleaseResult),
+        HwBufResultName(toReleaseResult),
+        fromDescriptor.width, fromDescriptor.height,
+        toDescriptor.width, toDescriptor.height,
+        fromGeometry.destFitX, fromGeometry.destFitY, fromGeometry.destFitWidth, fromGeometry.destFitHeight,
+        toGeometry.destFitX, toGeometry.destFitY, toGeometry.destFitWidth, toGeometry.destFitHeight,
+        hasFromColorMatrix ? 1 : 0, hasToColorMatrix ? 1 : 0);
     return env->NewStringUTF(status);
 }
 

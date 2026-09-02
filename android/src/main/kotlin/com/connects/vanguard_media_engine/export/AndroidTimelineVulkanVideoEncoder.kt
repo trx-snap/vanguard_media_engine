@@ -1,6 +1,7 @@
 package com.connects.vanguard_media_engine.export
 
 import android.graphics.ImageFormat
+import android.graphics.Rect
 import android.hardware.HardwareBuffer
 import android.media.Image
 import android.media.ImageReader
@@ -34,8 +35,9 @@ import kotlin.math.min
 // surface, letterboxed/pillarboxed over black where the aspect ratios
 // differ. AndroidTimelineExportSession falls back to
 // AndroidTimelineVideoEncoder (GLES) whenever this class fails before
-// pass-2/finalization and cancellation has not been requested -- this class
-// itself never falls back; it only reports a distinct machine-readable
+// pass-2/finalization and cancellation has not been requested -- for
+// hard-cut timelines only; a transition timeline never falls back -- this
+// class itself never falls back; it only reports a distinct machine-readable
 // failure reason and lets the caller decide.
 //
 // Frame path: MediaExtractor + MediaCodec decode -> ImageReader.PRIVATE
@@ -43,14 +45,28 @@ import kotlin.math.min
 // (VanguardNativeBridge.createAndroidTimelineVulkanExportSession /
 // renderAndroidTimelineVulkanExportFrame / destroyAndroidTimelineVulkanExportSession),
 // which renders the decoded HardwareBuffer directly into the MediaCodec
-// encoder's own input Surface. No native/JNI code is added or altered here.
+// encoder's own input Surface.
+//
+// P5-COMPOSITOR-TRANS: the transition-aware [encode] overload is the only
+// production route for compositor-owned clip overlap transitions. The clip
+// list plus validated transitions are planned into an ordered segment list:
+// per clip a solo segment over the clip's trim window minus the overlap
+// windows it lends to its incoming/outgoing transitions, and per transition
+// an overlap segment pairing the outgoing clip's tail window with the
+// incoming clip's head window (AndroidTimelineTransitionOverlapDecoder),
+// each pair rendered through
+// VanguardNativeBridge.renderAndroidTimelineVulkanExportTransitionFrame at
+// progress (j + 1) / (N + 1). Output is therefore overlap-shortened: the
+// muxed duration is the clip-duration sum minus the transition durations.
 //
 // PTS mechanism (must stay compatible with AndroidTimelineVideoEncoder's
 // frozen fixed frame clock, since a mid-export fallback re-runs the same
 // clips through the GLES encoder from sample 0): both the native-render
 // timelinePtsUs and the muxed sample presentationTimeUs are
 // `sampleIndex * frameDurationUs`, driven off this encoder's own
-// [renderedFrames] / [writtenVideoSamples] counters respectively.
+// [renderedFrames] / [writtenVideoSamples] counters respectively. Solo and
+// transition frames share those counters, so the success invariant
+// writtenVideoSamples == renderedFrames holds for both shapes.
 //
 // Guardrails enforced upstream by AndroidExportRenderBackendSelector /
 // AndroidTimelineExportSession (not here): video-only clips, cardinal
@@ -97,16 +113,57 @@ class AndroidTimelineVulkanVideoEncoder(
     private var totalExpectedSamples = 0
     private var onProgress: ((Double) -> Unit)? = null
 
+    // ─── Export segment plan ──────────────────────────────────────────────────
+
+    /// One ordered unit of pass-1 work. Windows are end-exclusive source pts
+    /// ranges in seconds; a source frame belongs to exactly one segment.
+    private sealed class Segment {
+        class Solo(
+            val clip: AndroidTimelineVideoEncoder.ClipInput,
+            val windowStartSeconds: Double,
+            val windowEndSeconds: Double,
+        ) : Segment()
+
+        class Overlap(
+            val transition: AndroidTimelineTransitionDescriptor,
+            val fromClip: AndroidTimelineVideoEncoder.ClipInput,
+            val fromWindowStartSeconds: Double,
+            val fromWindowEndSeconds: Double,
+            val toClip: AndroidTimelineVideoEncoder.ClipInput,
+            val toWindowStartSeconds: Double,
+            val toWindowEndSeconds: Double,
+        ) : Segment()
+    }
+
+    private class SegmentPlan(
+        val segments: List<Segment>,
+        val expectedSamples: Int,
+        val failureReason: String?,
+    )
+
     /// Encodes [clips] sequentially (hard-cut concatenation) into [outputPath]
     /// as a video-only MP4, using the native Vulkan export session for every
     /// frame. Returns a structured result; never throws.
     override fun encode(
         clips: List<AndroidTimelineVideoEncoder.ClipInput>,
         onProgress: ((Double) -> Unit)?,
+    ): AndroidTimelineVideoEncoder.EncodeResult = encode(clips, emptyList(), onProgress)
+
+    /// Encodes [clips] with the validated, index-bound [transitions]
+    /// (AndroidTimelineTransitionDescriptor.parseList output). An empty /
+    /// hard-cut-only list is the plain sequential route; otherwise the
+    /// overlap-shortened transition route described in the class doc.
+    /// Returns a structured result; never throws.
+    override fun encode(
+        clips: List<AndroidTimelineVideoEncoder.ClipInput>,
+        transitions: List<AndroidTimelineTransitionDescriptor>,
+        onProgress: ((Double) -> Unit)?,
     ): AndroidTimelineVideoEncoder.EncodeResult {
         this.onProgress = onProgress
-        totalExpectedSamples = clips.sumOf { clip ->
-            ceil((clip.trimEndSeconds - clip.trimStartSeconds) * fps).toInt().coerceAtLeast(1)
+        val plan = buildSegmentPlan(clips, transitions.filter { !it.isHardCut })
+        totalExpectedSamples = plan.expectedSamples
+        if (plan.failureReason != null) {
+            return failResult(plan.failureReason)
         }
 
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
@@ -119,9 +176,16 @@ class AndroidTimelineVulkanVideoEncoder(
         try {
             setupEncoderMuxerAndSession()
 
-            for (clip in clips) {
+            for (segment in plan.segments) {
                 if (cancelRequested) break
-                val failureReason = decodeClipIntoSession(clip)
+                val failureReason = when (segment) {
+                    is Segment.Solo -> decodeClipIntoSession(
+                        segment.clip,
+                        segment.windowStartSeconds,
+                        segment.windowEndSeconds,
+                    )
+                    is Segment.Overlap -> encodeOverlapSegment(segment)
+                }
                 if (failureReason != null) {
                     if (cancelRequested) break
                     reason = failureReason
@@ -166,7 +230,8 @@ class AndroidTimelineVulkanVideoEncoder(
             Log.i(
                 TAG,
                 "VG_VULKAN_ENCODE_RESULT status=success rendered=$renderedFrames " +
-                    "written=$writtenVideoSamples outputSize=$outSize",
+                    "written=$writtenVideoSamples outputSize=$outSize " +
+                    "transitions=${plan.segments.count { it is Segment.Overlap }}",
             )
             return AndroidTimelineVideoEncoder.EncodeResult(true, reason, writtenVideoSamples, outSize)
         } catch (t: Throwable) {
@@ -194,6 +259,89 @@ class AndroidTimelineVulkanVideoEncoder(
                 "written=$writtenVideoSamples",
         )
         return AndroidTimelineVideoEncoder.EncodeResult(false, reason, writtenVideoSamples, 0L)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Segment planning
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Plans the ordered segments for [clips] and the non-hard-cut
+    /// [transitions]. Without transitions every clip is one solo segment over
+    /// its full trim window (the frozen hard-cut route). With transitions,
+    /// each clip's solo window is shortened by the overlap it lends to its
+    /// incoming and outgoing transitions (a solo window shorter than one
+    /// output frame is skipped), and each transition becomes an overlap
+    /// segment. Fails closed (reason set, no segments) for any shape the
+    /// parser should already have rejected: non-video clips, out-of-range or
+    /// non-adjacent indices, or combined overlaps exceeding a clip.
+    private fun buildSegmentPlan(
+        clips: List<AndroidTimelineVideoEncoder.ClipInput>,
+        transitions: List<AndroidTimelineTransitionDescriptor>,
+    ): SegmentPlan {
+        if (transitions.isEmpty()) {
+            val segments = clips.map { clip ->
+                Segment.Solo(clip, clip.trimStartSeconds, clip.trimEndSeconds)
+            }
+            val expected = clips.sumOf { clip ->
+                ceil((clip.trimEndSeconds - clip.trimStartSeconds) * fps).toInt().coerceAtLeast(1)
+            }
+            return SegmentPlan(segments, expected, null)
+        }
+
+        fun fail(reason: String) = SegmentPlan(emptyList(), 0, reason)
+
+        if (clips.any { it.mediaKind != "video" || it.stillFrameCount != 0 }) {
+            return fail("transitions_require_video_clips")
+        }
+        val incomingByClip = HashMap<Int, AndroidTimelineTransitionDescriptor>()
+        val outgoingByClip = HashMap<Int, AndroidTimelineTransitionDescriptor>()
+        for (t in transitions) {
+            if (t.type == AndroidTimelineTransitionDescriptor.Type.NONE) continue
+            if (t.fromClipIndex < 0 || t.toClipIndex >= clips.size || t.toClipIndex != t.fromClipIndex + 1) {
+                return fail("transition_index_invalid:${t.transitionId}:from=${t.fromClipIndex}:to=${t.toClipIndex}")
+            }
+            if (!t.durationSeconds.isFinite() || t.durationSeconds <= 0.0) {
+                return fail("transition_duration_invalid:${t.transitionId}")
+            }
+            if (outgoingByClip.put(t.fromClipIndex, t) != null || incomingByClip.put(t.toClipIndex, t) != null) {
+                return fail("transition_boundary_duplicate:${t.transitionId}")
+            }
+        }
+
+        val minSoloWindowSeconds = 1.0 / fps.coerceAtLeast(1)
+        val segments = ArrayList<Segment>()
+        for ((index, clip) in clips.withIndex()) {
+            val incoming = incomingByClip[index]
+            val outgoing = outgoingByClip[index]
+            val soloStart = clip.trimStartSeconds + (incoming?.durationSeconds ?: 0.0)
+            val soloEnd = clip.trimEndSeconds - (outgoing?.durationSeconds ?: 0.0)
+            if (soloEnd < soloStart - OVERLAP_EPSILON_SECONDS) {
+                return fail("transition_overlap_exceeds_clip:clip=$index")
+            }
+            if (soloEnd - soloStart >= minSoloWindowSeconds) {
+                segments.add(Segment.Solo(clip, soloStart, soloEnd))
+            }
+            if (outgoing != null) {
+                val toClip = clips[outgoing.toClipIndex]
+                segments.add(
+                    Segment.Overlap(
+                        transition = outgoing,
+                        fromClip = clip,
+                        fromWindowStartSeconds = clip.trimEndSeconds - outgoing.durationSeconds,
+                        fromWindowEndSeconds = clip.trimEndSeconds,
+                        toClip = toClip,
+                        toWindowStartSeconds = toClip.trimStartSeconds,
+                        toWindowEndSeconds = toClip.trimStartSeconds + outgoing.durationSeconds,
+                    ),
+                )
+            }
+        }
+        val timelineSeconds = AndroidTimelineTransitionDescriptor.timelineDurationSeconds(
+            clips.map { it.trimEndSeconds - it.trimStartSeconds },
+            transitions,
+        )
+        val expected = ceil(timelineSeconds * fps).toInt().coerceAtLeast(1)
+        return SegmentPlan(segments, expected, null)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -233,8 +381,15 @@ class AndroidTimelineVulkanVideoEncoder(
     /// checked against the Opus P1 real-buffer geometry guard (see
     /// [renderImageIntoSession]) -- a decoder can produce a differently
     /// padded/cropped HardwareBuffer from frame to frame even within one
-    /// clip.
-    private fun decodeClipIntoSession(clip: AndroidTimelineVideoEncoder.ClipInput): String? {
+    /// clip. [windowStartSeconds] / [windowEndSeconds] is the end-exclusive
+    /// source pts window to render (the clip's full trim window for hard-cut
+    /// timelines; the overlap-shortened solo window for transition
+    /// timelines).
+    private fun decodeClipIntoSession(
+        clip: AndroidTimelineVideoEncoder.ClipInput,
+        windowStartSeconds: Double,
+        windowEndSeconds: Double,
+    ): String? {
         val extractor = MediaExtractor()
         var decoder: MediaCodec? = null
         var imageReader: ImageReader? = null
@@ -292,11 +447,19 @@ class AndroidTimelineVulkanVideoEncoder(
                 "decodedW=${clip.decodedWidth}:decodedH=${clip.decodedHeight}:" +
                 "rotation=${clip.rotationDegrees}:outW=$width:outH=$height"
 
-            val trimStartUs = (clip.trimStartSeconds * 1_000_000L).toLong()
+            val trimStartUs = (windowStartSeconds * 1_000_000L).toLong()
             if (trimStartUs > 0L) {
-                extractor.seekTo(trimStartUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                // Pre-roll from the sync sample at or before the window start.
+                // CLOSEST_SYNC may land on a sync sample after trimStartUs (e.g.
+                // the incoming post-transition solo window [0.5s, 2.0s) landing
+                // on the 1.0s keyframe), silently dropping every frame between
+                // the window start and that sync. The output loop below already
+                // drops every decoded frame with presentationTimeUs < trimStartUs,
+                // so pre-rolling from the previous sync only costs decode work,
+                // never wrong frames. Mirrors AndroidTimelineTransitionOverlapDecoder.
+                extractor.seekTo(trimStartUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
             }
-            val trimEndUs = (clip.trimEndSeconds * 1_000_000L).toLong()
+            val trimEndUs = (windowEndSeconds * 1_000_000L).toLong()
 
             thread = HandlerThread("VGVulkanExportImageReader").also { it.start() }
             val handler = Handler(thread.looper)
@@ -460,12 +623,6 @@ class AndroidTimelineVulkanVideoEncoder(
     ): String? {
         var hwBuf: HardwareBuffer? = null
         try {
-            if (rotationDegrees != 0 && rotationDegrees != 90 &&
-                rotationDegrees != 180 && rotationDegrees != 270
-            ) {
-                return "vulkan_rotation_unsupported:$rotationDegrees"
-            }
-
             hwBuf = image.hardwareBuffer
                 ?: return "vulkan_decoder_buffer_geometry_mismatch:hardware_buffer_null"
 
@@ -484,60 +641,309 @@ class AndroidTimelineVulkanVideoEncoder(
 
             // Read the crop rect before the image (and its buffer) is closed.
             val cropRect = image.cropRect
-            val bufW = hwBuf.width
-            val bufH = hwBuf.height
-
-            if (cropRect.left < 0 || cropRect.top < 0 ||
-                cropRect.right <= cropRect.left || cropRect.bottom <= cropRect.top ||
-                cropRect.right > bufW || cropRect.bottom > bufH
-            ) {
-                return "vulkan_decoder_buffer_geometry_mismatch:" +
-                    "bufW=$bufW:bufH=$bufH:crop=$cropRect"
-            }
-
-            val cropWidth = cropRect.right - cropRect.left
-            val cropHeight = cropRect.bottom - cropRect.top
-            if (cropWidth != expectedCropWidth || cropHeight != expectedCropHeight) {
-                return "vulkan_decoder_crop_unsupported:size_mismatch:" +
-                    "bufW=$bufW:bufH=$bufH:crop=$cropRect:" +
-                    "expectedW=$expectedCropWidth:expectedH=$expectedCropHeight"
-            }
-
-            if (cropRect.left % 2 != 0 || cropRect.top % 2 != 0 ||
-                cropRect.right % 2 != 0 || cropRect.bottom % 2 != 0
-            ) {
-                return "vulkan_decoder_crop_unsupported:odd_crop_bounds:crop=$cropRect"
-            }
-
-            val timelinePtsUs = renderedFrames * frameDurationUs
-            val renderStr = nativeBridge.renderAndroidTimelineVulkanExportFrameCropped(
-                sessionId = nativeSessionId!!,
-                hardwareBuffer = hwBuf,
-                width = width,
-                height = height,
-                cropLeft = cropRect.left,
-                cropTop = cropRect.top,
-                cropRight = cropRect.right,
-                cropBottom = cropRect.bottom,
-                rotationDegrees = rotationDegrees,
-                destFitX = destFitRect.x,
-                destFitY = destFitRect.y,
-                destFitWidth = destFitRect.width,
-                destFitHeight = destFitRect.height,
-                timelinePtsUs = timelinePtsUs,
-                frameIndex = renderedFrames,
-                colorMatrix = colorMatrix,
+            return renderSoloLayer(
+                hwBuf,
+                cropRect,
+                hwBuf.width,
+                hwBuf.height,
+                rotationDegrees,
+                expectedCropWidth,
+                expectedCropHeight,
+                destFitRect,
+                colorMatrix,
             )
-            if (!renderStr.startsWith("status=OK;")) {
-                return "vulkan_render_failed:${renderStr.take(120)}"
-            }
-            renderedFrames++
-            drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
-            return null
         } finally {
             try { hwBuf?.close() } catch (_: Throwable) {}
             try { image.close() } catch (_: Throwable) {}
         }
+    }
+
+    /// Validated native layer geometry (IntArray(9) wire layout of the
+    /// transition seam: crop l/t/r/b, rotation, dest fit x/y/w/h) or a
+    /// machine-readable failure reason. Exactly one of the two is non-null.
+    private class LayerGeometry(val values: IntArray?, val failure: String?)
+
+    /// The Opus P1 real-buffer geometry guard shared by the solo and
+    /// transition routes: cardinal rotation, crop inside the buffer, crop
+    /// size equal to the clip's decoded extent, even-aligned crop bounds.
+    private fun resolveLayerGeometry(
+        cropRect: Rect,
+        bufW: Int,
+        bufH: Int,
+        rotationDegrees: Int,
+        expectedCropWidth: Int,
+        expectedCropHeight: Int,
+        destFitRect: DestFitRect,
+    ): LayerGeometry {
+        if (rotationDegrees != 0 && rotationDegrees != 90 &&
+            rotationDegrees != 180 && rotationDegrees != 270
+        ) {
+            return LayerGeometry(null, "vulkan_rotation_unsupported:$rotationDegrees")
+        }
+        if (cropRect.left < 0 || cropRect.top < 0 ||
+            cropRect.right <= cropRect.left || cropRect.bottom <= cropRect.top ||
+            cropRect.right > bufW || cropRect.bottom > bufH
+        ) {
+            return LayerGeometry(
+                null,
+                "vulkan_decoder_buffer_geometry_mismatch:bufW=$bufW:bufH=$bufH:crop=$cropRect",
+            )
+        }
+        val cropWidth = cropRect.right - cropRect.left
+        val cropHeight = cropRect.bottom - cropRect.top
+        if (cropWidth != expectedCropWidth || cropHeight != expectedCropHeight) {
+            return LayerGeometry(
+                null,
+                "vulkan_decoder_crop_unsupported:size_mismatch:" +
+                    "bufW=$bufW:bufH=$bufH:crop=$cropRect:" +
+                    "expectedW=$expectedCropWidth:expectedH=$expectedCropHeight",
+            )
+        }
+        if (cropRect.left % 2 != 0 || cropRect.top % 2 != 0 ||
+            cropRect.right % 2 != 0 || cropRect.bottom % 2 != 0
+        ) {
+            return LayerGeometry(null, "vulkan_decoder_crop_unsupported:odd_crop_bounds:crop=$cropRect")
+        }
+        return LayerGeometry(
+            intArrayOf(
+                cropRect.left, cropRect.top, cropRect.right, cropRect.bottom,
+                rotationDegrees,
+                destFitRect.x, destFitRect.y, destFitRect.width, destFitRect.height,
+            ),
+            null,
+        )
+    }
+
+    /// Renders one decoded layer solo through the cropped native seam, then
+    /// drains the encoder. Does NOT close [hwBuf]; the caller owns it.
+    private fun renderSoloLayer(
+        hwBuf: HardwareBuffer,
+        cropRect: Rect,
+        bufW: Int,
+        bufH: Int,
+        rotationDegrees: Int,
+        expectedCropWidth: Int,
+        expectedCropHeight: Int,
+        destFitRect: DestFitRect,
+        colorMatrix: FloatArray?,
+    ): String? {
+        val geometry = resolveLayerGeometry(
+            cropRect, bufW, bufH, rotationDegrees, expectedCropWidth, expectedCropHeight, destFitRect,
+        )
+        val g = geometry.values ?: return geometry.failure ?: "vulkan_layer_geometry_unresolved"
+
+        val timelinePtsUs = renderedFrames * frameDurationUs
+        val renderStr = nativeBridge.renderAndroidTimelineVulkanExportFrameCropped(
+            sessionId = nativeSessionId!!,
+            hardwareBuffer = hwBuf,
+            width = width,
+            height = height,
+            cropLeft = g[0],
+            cropTop = g[1],
+            cropRight = g[2],
+            cropBottom = g[3],
+            rotationDegrees = g[4],
+            destFitX = g[5],
+            destFitY = g[6],
+            destFitWidth = g[7],
+            destFitHeight = g[8],
+            timelinePtsUs = timelinePtsUs,
+            frameIndex = renderedFrames,
+            colorMatrix = colorMatrix,
+        )
+        if (!renderStr.startsWith("status=OK;")) {
+            return "vulkan_render_failed:${renderStr.take(120)}"
+        }
+        renderedFrames++
+        drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
+        return null
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Transition overlap segment (P5-COMPOSITOR-TRANS)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Renders one transition overlap: the outgoing clip's tail window and the
+    /// incoming clip's head window are decoded in lockstep by
+    /// AndroidTimelineTransitionOverlapDecoder and every pair is rendered
+    /// through the native two-source transition seam at progress
+    /// (j + 1) / (N + 1), N = the descriptor's overlap frame count at [fps].
+    /// If one window ends a frame earlier than the other (decoder timing
+    /// jitter), the remaining unpaired frames render solo through the cropped
+    /// seam so no source frame is dropped and the muxed PTS clock stays
+    /// continuous. Returns null on success or cancellation (the caller checks
+    /// [cancelRequested]), else a machine-readable failure reason. Never
+    /// throws; the decoder is always closed.
+    private fun encodeOverlapSegment(segment: Segment.Overlap): String? {
+        val transition = segment.transition
+        val fromClip = segment.fromClip
+        val toClip = segment.toClip
+        for ((label, clip) in listOf("from" to fromClip, "to" to toClip)) {
+            if (clip.decodedWidth <= 0 || clip.decodedHeight <= 0) {
+                return "vulkan_decoded_dims_invalid:layer=$label:" +
+                    "decodedW=${clip.decodedWidth}:decodedH=${clip.decodedHeight}"
+            }
+            if (clip.rotationDegrees != 0 && clip.rotationDegrees != 90 &&
+                clip.rotationDegrees != 180 && clip.rotationDegrees != 270
+            ) {
+                return "vulkan_rotation_unsupported:layer=$label:${clip.rotationDegrees}"
+            }
+        }
+        val fromFit = computeAspectFitRect(width, height, fromClip.decodedWidth, fromClip.decodedHeight, fromClip.rotationDegrees)
+            ?: return "vulkan_dest_fit_rect_invalid:layer=from:decodedW=${fromClip.decodedWidth}:" +
+                "decodedH=${fromClip.decodedHeight}:rotation=${fromClip.rotationDegrees}:outW=$width:outH=$height"
+        val toFit = computeAspectFitRect(width, height, toClip.decodedWidth, toClip.decodedHeight, toClip.rotationDegrees)
+            ?: return "vulkan_dest_fit_rect_invalid:layer=to:decodedW=${toClip.decodedWidth}:" +
+                "decodedH=${toClip.decodedHeight}:rotation=${toClip.rotationDegrees}:outW=$width:outH=$height"
+
+        val expectedOverlapFrames = transition.overlapFrameCount(fps)
+        val decoder = AndroidTimelineTransitionOverlapDecoder(
+            fromSource = AndroidTimelineTransitionOverlapDecoder.Source(
+                label = "from",
+                sourcePath = fromClip.sourcePath,
+                windowStartSeconds = segment.fromWindowStartSeconds,
+                windowEndSeconds = segment.fromWindowEndSeconds,
+                decodedWidth = fromClip.decodedWidth,
+                decodedHeight = fromClip.decodedHeight,
+            ),
+            toSource = AndroidTimelineTransitionOverlapDecoder.Source(
+                label = "to",
+                sourcePath = toClip.sourcePath,
+                windowStartSeconds = segment.toWindowStartSeconds,
+                windowEndSeconds = segment.toWindowEndSeconds,
+                decodedWidth = toClip.decodedWidth,
+                decodedHeight = toClip.decodedHeight,
+            ),
+            isCancelled = { cancelRequested },
+        )
+
+        var pairsRendered = 0
+        var soloFromRendered = 0
+        var soloToRendered = 0
+        try {
+            val openFailure = decoder.open()
+            if (openFailure != null) {
+                return "vulkan_transition_decoder_open_failed:${transition.transitionId}:$openFailure"
+            }
+            while (true) {
+                if (cancelRequested) return null
+                when (val step = decoder.nextStep()) {
+                    is AndroidTimelineTransitionOverlapDecoder.Step.Exhausted -> break
+                    is AndroidTimelineTransitionOverlapDecoder.Step.Cancelled -> return null
+                    is AndroidTimelineTransitionOverlapDecoder.Step.Failed ->
+                        return "vulkan_transition_decode_failed:${transition.transitionId}:${step.reason}"
+                    is AndroidTimelineTransitionOverlapDecoder.Step.Frames -> {
+                        val fromFrame = step.from
+                        val toFrame = step.to
+                        try {
+                            val failure = when {
+                                fromFrame != null && toFrame != null -> {
+                                    val progress = transition.progressForOverlapFrame(pairsRendered, expectedOverlapFrames)
+                                    val result = renderTransitionPair(
+                                        fromFrame, toFrame, transition, fromClip, toClip, fromFit, toFit, progress,
+                                    )
+                                    if (result == null) pairsRendered++
+                                    result
+                                }
+                                fromFrame != null -> {
+                                    val result = renderSoloLayer(
+                                        fromFrame.hardwareBuffer, fromFrame.cropRect,
+                                        fromFrame.bufferWidth, fromFrame.bufferHeight,
+                                        fromClip.rotationDegrees, fromClip.decodedWidth, fromClip.decodedHeight,
+                                        fromFit, fromClip.colorMatrix,
+                                    )
+                                    if (result == null) soloFromRendered++
+                                    result
+                                }
+                                toFrame != null -> {
+                                    val result = renderSoloLayer(
+                                        toFrame.hardwareBuffer, toFrame.cropRect,
+                                        toFrame.bufferWidth, toFrame.bufferHeight,
+                                        toClip.rotationDegrees, toClip.decodedWidth, toClip.decodedHeight,
+                                        toFit, toClip.colorMatrix,
+                                    )
+                                    if (result == null) soloToRendered++
+                                    result
+                                }
+                                else -> "vulkan_transition_empty_step"
+                            }
+                            if (failure != null) return failure
+                        } finally {
+                            fromFrame?.close()
+                            toFrame?.close()
+                        }
+                    }
+                }
+            }
+            val framesRendered = pairsRendered + soloFromRendered + soloToRendered
+            if (framesRendered == 0 && !cancelRequested) {
+                return "no_frames_in_transition_window:${transition.transitionId}"
+            }
+            Log.i(
+                TAG,
+                "VG_VULKAN_TRANSITION_SEGMENT transition=${transition.transitionId} " +
+                    "type=${transition.type.wireName} pairs=$pairsRendered expected=$expectedOverlapFrames " +
+                    "soloFrom=$soloFromRendered soloTo=$soloToRendered " +
+                    "fromDecoded=${decoder.fromFramesProduced} toDecoded=${decoder.toFramesProduced}",
+            )
+            return null
+        } catch (t: Throwable) {
+            Log.e(TAG, "encodeOverlapSegment failed for ${transition.transitionId}: $t", t)
+            return "vulkan_transition_exception:${t.javaClass.simpleName}:${transition.transitionId}"
+        } finally {
+            decoder.close()
+        }
+    }
+
+    /// Renders one overlap pair through the native two-source transition
+    /// seam, then drains the encoder. Does NOT close either frame; the caller
+    /// owns them. Both layers pass the same per-frame geometry guard as solo
+    /// frames.
+    private fun renderTransitionPair(
+        fromFrame: AndroidTimelineTransitionOverlapDecoder.Frame,
+        toFrame: AndroidTimelineTransitionOverlapDecoder.Frame,
+        transition: AndroidTimelineTransitionDescriptor,
+        fromClip: AndroidTimelineVideoEncoder.ClipInput,
+        toClip: AndroidTimelineVideoEncoder.ClipInput,
+        fromFit: DestFitRect,
+        toFit: DestFitRect,
+        progress: Double,
+    ): String? {
+        val fromGeometry = resolveLayerGeometry(
+            fromFrame.cropRect, fromFrame.bufferWidth, fromFrame.bufferHeight,
+            fromClip.rotationDegrees, fromClip.decodedWidth, fromClip.decodedHeight, fromFit,
+        )
+        val fromValues = fromGeometry.values
+            ?: return "vulkan_transition_layer_geometry:layer=from:${fromGeometry.failure}"
+        val toGeometry = resolveLayerGeometry(
+            toFrame.cropRect, toFrame.bufferWidth, toFrame.bufferHeight,
+            toClip.rotationDegrees, toClip.decodedWidth, toClip.decodedHeight, toFit,
+        )
+        val toValues = toGeometry.values
+            ?: return "vulkan_transition_layer_geometry:layer=to:${toGeometry.failure}"
+
+        val timelinePtsUs = renderedFrames * frameDurationUs
+        val renderStr = nativeBridge.renderAndroidTimelineVulkanExportTransitionFrame(
+            sessionId = nativeSessionId!!,
+            width = width,
+            height = height,
+            transitionTypeCode = transition.type.nativeCode,
+            progress = progress,
+            fromHardwareBuffer = fromFrame.hardwareBuffer,
+            fromLayerGeometry = fromValues,
+            fromColorMatrix = fromClip.colorMatrix,
+            toHardwareBuffer = toFrame.hardwareBuffer,
+            toLayerGeometry = toValues,
+            toColorMatrix = toClip.colorMatrix,
+            timelinePtsUs = timelinePtsUs,
+            frameIndex = renderedFrames,
+        )
+        if (!renderStr.startsWith("status=OK;")) {
+            return "vulkan_transition_render_failed:${renderStr.take(120)}"
+        }
+        renderedFrames++
+        drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
+        return null
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -697,5 +1103,8 @@ class AndroidTimelineVulkanVideoEncoder(
         private const val ENCODE_DRAIN_DEADLINE_MS = 2_000L
         private const val ENCODE_EOS_DEADLINE_MS = 5_000L
         private const val IMAGE_READER_MAX_IMAGES = 3
+
+        /** Tolerance for overlap arithmetic on the parser-validated durations. */
+        private const val OVERLAP_EPSILON_SECONDS = 1e-9
     }
 }
