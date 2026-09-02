@@ -16,23 +16,44 @@ class VGROIBox {
     required this.w,
     required this.h,
   }) {
-    if (x.isNaN || x.isInfinite || y.isNaN || y.isInfinite || w.isNaN || w.isInfinite || h.isNaN || h.isInfinite) {
+    if (x.isNaN ||
+        x.isInfinite ||
+        y.isNaN ||
+        y.isInfinite ||
+        w.isNaN ||
+        w.isInfinite ||
+        h.isNaN ||
+        h.isInfinite) {
       throw ArgumentError('Coordinates must be finite and not NaN.');
     }
-    if (x < 0.0 || x > 1.0 || y < 0.0 || y > 1.0 || w < 0.0 || w > 1.0 || h < 0.0 || h > 1.0) {
-      throw ArgumentError('Coordinates must be in normalized [0.0, 1.0] range.');
+    if (x < 0.0 ||
+        x > 1.0 ||
+        y < 0.0 ||
+        y > 1.0 ||
+        w < 0.0 ||
+        w > 1.0 ||
+        h < 0.0 ||
+        h > 1.0) {
+      throw ArgumentError(
+        'Coordinates must be in normalized [0.0, 1.0] range.',
+      );
     }
     if (w < 0.0 || h < 0.0) {
       throw ArgumentError('Width and height must be non-negative.');
     }
     // Check bounds with a small tolerance to protect against IEEE 754 precision inaccuracies.
     if ((x + w) > 1.0 + 1e-9 || (y + h) > 1.0 + 1e-9) {
-      throw ArgumentError('Box overflows normalized bounds (x+w > 1.0 or y+h > 1.0).');
+      throw ArgumentError(
+        'Box overflows normalized bounds (x+w > 1.0 or y+h > 1.0).',
+      );
     }
   }
 
   factory VGROIBox.fromJson(Map<String, dynamic> json) {
-    if (!json.containsKey('x') || !json.containsKey('y') || !json.containsKey('w') || !json.containsKey('h')) {
+    if (!json.containsKey('x') ||
+        !json.containsKey('y') ||
+        !json.containsKey('w') ||
+        !json.containsKey('h')) {
       throw ArgumentError('JSON map must contain x, y, w, and h keys.');
     }
     return VGROIBox(
@@ -44,12 +65,7 @@ class VGROIBox {
   }
 
   Map<String, dynamic> toJson() {
-    return {
-      'x': x,
-      'y': y,
-      'w': w,
-      'h': h,
-    };
+    return {'x': x, 'y': y, 'w': w, 'h': h};
   }
 
   @override
@@ -101,8 +117,13 @@ class VGROISample {
       throw ArgumentError('quality must not be empty.');
     }
     if (confidence != null) {
-      if (confidence!.isNaN || confidence!.isInfinite || confidence! < 0.0 || confidence! > 1.0) {
-        throw ArgumentError('confidence must be a normalized finite value in [0.0, 1.0].');
+      if (confidence!.isNaN ||
+          confidence!.isInfinite ||
+          confidence! < 0.0 ||
+          confidence! > 1.0) {
+        throw ArgumentError(
+          'confidence must be a normalized finite value in [0.0, 1.0].',
+        );
       }
     }
   }
@@ -112,9 +133,13 @@ class VGROISample {
       timestampMs: json['timestampMs'] as int,
       framePtsMs: json['framePtsMs'] as int,
       recordingRelativeMs: json['recordingRelativeMs'] as int,
-      box: json['box'] != null ? VGROIBox.fromJson(json['box'] as Map<String, dynamic>) : null,
+      box: json['box'] != null
+          ? VGROIBox.fromJson(json['box'] as Map<String, dynamic>)
+          : null,
       quality: json['quality'] as String,
-      confidence: json['confidence'] != null ? (json['confidence'] as num).toDouble() : null,
+      confidence: json['confidence'] != null
+          ? (json['confidence'] as num).toDouble()
+          : null,
       paddingPolicy: json['paddingPolicy'] as String?,
     );
   }
@@ -127,7 +152,10 @@ class VGROISample {
       if (box != null) 'box': box!.toJson() else 'box': null,
       'quality': quality,
       if (confidence != null) 'confidence': confidence else 'confidence': null,
-      if (paddingPolicy != null) 'paddingPolicy': paddingPolicy else 'paddingPolicy': null,
+      if (paddingPolicy != null)
+        'paddingPolicy': paddingPolicy
+      else
+        'paddingPolicy': null,
     };
   }
 
@@ -214,7 +242,10 @@ class VGROIMissingInterval {
 
   @override
   int get hashCode =>
-      startMs.hashCode ^ endMs.hashCode ^ reason.hashCode ^ postProcessRequired.hashCode;
+      startMs.hashCode ^
+      endMs.hashCode ^
+      reason.hashCode ^
+      postProcessRequired.hashCode;
 
   @override
   String toString() {
@@ -231,8 +262,13 @@ class VGROICoverage {
     required this.coveragePercent,
     this.missingIntervals = const [],
   }) {
-    if (coveragePercent.isNaN || coveragePercent.isInfinite || coveragePercent < 0.0 || coveragePercent > 1.0) {
-      throw ArgumentError('coveragePercent must be a normalized finite value in [0.0, 1.0].');
+    if (coveragePercent.isNaN ||
+        coveragePercent.isInfinite ||
+        coveragePercent < 0.0 ||
+        coveragePercent > 1.0) {
+      throw ArgumentError(
+        'coveragePercent must be a normalized finite value in [0.0, 1.0].',
+      );
     }
   }
 
@@ -242,8 +278,11 @@ class VGROICoverage {
       coveragePercent: (json['coveragePercent'] as num).toDouble(),
       missingIntervals: intervalsList != null
           ? intervalsList
-              .map((i) => VGROIMissingInterval.fromJson(i as Map<String, dynamic>))
-              .toList()
+                .map(
+                  (i) =>
+                      VGROIMissingInterval.fromJson(i as Map<String, dynamic>),
+                )
+                .toList()
           : const [],
     );
   }
@@ -325,7 +364,8 @@ class VGROIIdentity {
           hash == other.hash;
 
   @override
-  int get hashCode => durationMs.hashCode ^ width.hashCode ^ height.hashCode ^ hash.hashCode;
+  int get hashCode =>
+      durationMs.hashCode ^ width.hashCode ^ height.hashCode ^ hash.hashCode;
 
   @override
   String toString() {
@@ -381,10 +421,16 @@ class VGROISidecar {
       platform: json['platform'] as String,
       coordinateSpace: json['coordinateSpace'] as String,
       recordingSessionId: json['recordingSessionId'] as String,
-      videoIdentity: VGROIIdentity.fromJson(json['videoIdentity'] as Map<String, dynamic>),
-      coverage: VGROICoverage.fromJson(json['coverage'] as Map<String, dynamic>),
+      videoIdentity: VGROIIdentity.fromJson(
+        json['videoIdentity'] as Map<String, dynamic>,
+      ),
+      coverage: VGROICoverage.fromJson(
+        json['coverage'] as Map<String, dynamic>,
+      ),
       samples: samplesList != null
-          ? samplesList.map((s) => VGROISample.fromJson(s as Map<String, dynamic>)).toList()
+          ? samplesList
+                .map((s) => VGROISample.fromJson(s as Map<String, dynamic>))
+                .toList()
           : const [],
       finalized: json['finalized'] as bool,
     );
@@ -432,5 +478,133 @@ class VGROISidecar {
   @override
   String toString() {
     return 'VGROISidecar(version: $version, sourceType: $sourceType, platform: $platform, coordinateSpace: $coordinateSpace, recordingSessionId: $recordingSessionId, videoIdentity: $videoIdentity, coverage: $coverage, samples: $samples, finalized: $finalized)';
+  }
+}
+
+/// Interpolation curve applied between consecutive ROI keyframes.
+enum VGROIKeyframeInterpolation {
+  /// Linear interpolation.
+  linear,
+
+  /// Ease-in-out cubic smoothstep interpolation: f(t) = 3t^2 - 2t^3.
+  easeInOut,
+
+  /// Cubic smoothstep interpolation (alias/equivalent for easeInOut).
+  smoothstep,
+
+  /// Step (hold) - holds the start keyframe's box until the next keyframe.
+  hold,
+}
+
+/// Represents a single ROI keyframe in export-normalized coordinate space.
+class VGROIKeyframe {
+  /// Timestamp in milliseconds from the start of the timeline.
+  final int timestampMs;
+
+  /// Bounding box in normalized [0.0, 1.0] export output coordinate system.
+  /// A null box indicates that ROI tracking is absent or unavailable at this keyframe.
+  final VGROIBox? box;
+
+  /// The interpolation curve to use when transitioning to the next keyframe.
+  final VGROIKeyframeInterpolation interpolation;
+
+  /// Optional quality descriptor (e.g. 'stable', 'keyframe', 'user_keyed').
+  final String? quality;
+
+  /// Optional confidence score in [0.0, 1.0].
+  final double? confidence;
+
+  /// Optional padding policy identifier.
+  final String? paddingPolicy;
+
+  VGROIKeyframe({
+    required this.timestampMs,
+    this.box,
+    this.interpolation = VGROIKeyframeInterpolation.linear,
+    this.quality,
+    this.confidence,
+    this.paddingPolicy,
+  }) {
+    if (timestampMs < 0) {
+      throw ArgumentError('timestampMs must be non-negative.');
+    }
+    if (quality != null && quality!.isEmpty) {
+      throw ArgumentError('quality must not be empty if specified.');
+    }
+    if (confidence != null) {
+      if (confidence!.isNaN ||
+          confidence!.isInfinite ||
+          confidence! < 0.0 ||
+          confidence! > 1.0) {
+        throw ArgumentError(
+          'confidence must be a normalized finite value in [0.0, 1.0].',
+        );
+      }
+    }
+  }
+
+  factory VGROIKeyframe.fromJson(Map<String, dynamic> json) {
+    if (!json.containsKey('timestampMs')) {
+      throw ArgumentError('JSON map must contain timestampMs key.');
+    }
+    return VGROIKeyframe(
+      timestampMs: json['timestampMs'] as int,
+      box: json['box'] != null
+          ? VGROIBox.fromJson(json['box'] as Map<String, dynamic>)
+          : null,
+      interpolation: json['interpolation'] != null
+          ? VGROIKeyframeInterpolation.values.firstWhere(
+              (e) => e.name == json['interpolation'],
+              orElse: () => throw ArgumentError(
+                'Unsupported interpolation: ${json['interpolation']}',
+              ),
+            )
+          : VGROIKeyframeInterpolation.linear,
+      quality: json['quality'] as String?,
+      confidence: json['confidence'] != null
+          ? (json['confidence'] as num).toDouble()
+          : null,
+      paddingPolicy: json['paddingPolicy'] as String?,
+    );
+  }
+
+  Map<String, dynamic> toJson() {
+    return {
+      'timestampMs': timestampMs,
+      if (box != null) 'box': box!.toJson() else 'box': null,
+      'interpolation': interpolation.name,
+      if (quality != null) 'quality': quality else 'quality': null,
+      if (confidence != null) 'confidence': confidence else 'confidence': null,
+      if (paddingPolicy != null)
+        'paddingPolicy': paddingPolicy
+      else
+        'paddingPolicy': null,
+    };
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is VGROIKeyframe &&
+          runtimeType == other.runtimeType &&
+          timestampMs == other.timestampMs &&
+          box == other.box &&
+          interpolation == other.interpolation &&
+          quality == other.quality &&
+          confidence == other.confidence &&
+          paddingPolicy == other.paddingPolicy;
+
+  @override
+  int get hashCode =>
+      timestampMs.hashCode ^
+      box.hashCode ^
+      interpolation.hashCode ^
+      quality.hashCode ^
+      confidence.hashCode ^
+      paddingPolicy.hashCode;
+
+  @override
+  String toString() {
+    return 'VGROIKeyframe(timestampMs: $timestampMs, box: $box, interpolation: $interpolation, quality: $quality, confidence: $confidence, paddingPolicy: $paddingPolicy)';
   }
 }
