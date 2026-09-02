@@ -138,6 +138,8 @@ export 'vg_realtime_playback_pipeline_timestamp_stabilization_smoke.dart';
 export 'vg_realtime_playback_pipeline_clock_sync_smoke.dart';
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a): Android True-DAG Phase 4 realtime audio playback production sink and clock diagnostic smoke foundation.
 export 'vg_realtime_audio_playback_production_smoke.dart';
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a): typed report/model/deserialization structures for the production sink/clock/dead-object smoke.
+export 'vg_realtime_audio_playback_production_types.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.

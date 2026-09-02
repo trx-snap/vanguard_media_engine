@@ -105,7 +105,7 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         val clockBeforeResume: VanguardRealtimePlaybackPresentationClock.Snapshot?,
         val clockAfterResume: VanguardRealtimePlaybackPresentationClock.Snapshot?,
         val clock: VanguardRealtimePlaybackPresentationClock.Snapshot?,
-        val sink: VanguardRealtimeAudioPlaybackSinkBridge.Telemetry?,
+        val sink: VanguardRealtimeAudioPlaybackSinkTelemetry?,
         val decoderExitReason: String,
         val decoderThreadId: Long,
         val decoderThreadIsTransportOwner: Boolean,

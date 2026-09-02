@@ -105,114 +105,6 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
 
     enum class Phase { SETUP, READY, RUNNING, PARK_REQUESTED, PARKED, EXITED }
 
-    // Immutable any-thread view of the sink-thread-published telemetry.
-    data class Telemetry(
-        val phase: Phase,
-        val exitReason: String,
-        val threadId: Long,
-        val threadIsTransportOwner: Boolean,
-        val clockWriterBoundOnSinkThread: Boolean,
-        val audioTrackInitOk: Boolean,
-        val gainSetOk: Boolean,
-        val gainValue: Float,
-        val audioTrackBufferBytes: Int,
-        val audioTracksCreated: Int,
-        val releaseCount: Int,
-        val releaseExecutedOnSinkThread: Boolean,
-        val audioTrackCallsOffSinkThread: Long,
-        val played: Boolean,
-        val initialPlayState: Int,
-        val framesReadFromTransport: Long,
-        val framesWrittenToSink: Long,
-        val partialWriteCount: Long,
-        val zeroWriteCount: Long,
-        val drainCalls: Long,
-        val drainCallsBeforeAllow: Long,
-        val drainRequestSizeChanges: Long,
-        val emptyDrainCount: Long,
-        val productiveDrainPasses: Long,
-        val eosDrainedObserved: Boolean,
-        val timestampPollAttempts: Long,
-        val timestampPollSuccesses: Long,
-        val timestampPollUnavailable: Long,
-        val timestampPollsWhileParked: Long,
-        val timestampMaxPollsInOnePass: Long,
-        val clockEpochOpenCalls: Int,
-        val clockEpochCloseCalls: Int,
-        val clockRejectedCount: Long,
-        val clockSnapshotsAtPark: Long,
-        val rebasedClampCount: Long,
-        val currentEpoch: Int,
-        val parkCount: Int,
-        val unparkCount: Int,
-        val playStateAtPark: Int,
-        val playStateAfterUnpark: Int,
-        val parkedPlayStateViolations: Long,
-        val parkExecutedOnSinkThread: Boolean,
-        val unparkExecutedOnSinkThread: Boolean,
-        val positionAtPark: Long,
-        val epochClosedAtPark: Int,
-        val epochOpenedAtUnpark: Int,
-        val parkAckLatencyMs: Long,
-        val parkedHoldMs: Long,
-        val playbackHeadAtPark: Long,
-        val playbackHeadAtUnpark: Long,
-        val playbackHeadFinal: Long,
-        val readyAtMs: Long,
-        val drainAllowedAtMs: Long,
-        val firstDrainAtMs: Long,
-        val firstWriteAtMs: Long,
-        val sinkThreadWallMs: Long,
-        val checksumHex: String,
-        val lastReply: Reply?,
-        // ── Y8b synthetic dead-object recovery ──
-        val syntheticDeadObjectInjectAfterFrames: Long,
-        val deadObjectInjectedCount: Long,
-        val deadObjectObservedCount: Long,
-        val deadObjectRecoveryCount: Int,
-        val deadObjectOldTrackReleaseCount: Int,
-        val deadObjectRecoveryExecutedOnSinkThread: Boolean,
-        val deadObjectNewTrackInitOk: Boolean,
-        val deadObjectNewTrackVolumeOk: Boolean,
-        val deadObjectNewTrackPlayOk: Boolean,
-        val deadObjectNewTrackPlayState: Int,
-        val deadObjectNewTrackSameBuffer: Boolean,
-        val audioTrackBufferFrames: Int,
-        val deadObjectNewTrackBufferFrames: Int,
-        val deadObjectRecoveryWallMs: Long,
-        val deadObjectEpochBeforeRecovery: Int,
-        val deadObjectEpochOpenedAfterRecovery: Int,
-        val deadObjectEpochCloseAccepted: Boolean,
-        val deadObjectEpochOpenAccepted: Boolean,
-        val deadObjectPositionBeforeRecovery: Long,
-        val deadObjectBaseFrameAfterRecovery: Long,
-        val deadObjectBaseStepFrames: Long,
-        // Sign-only claim: true iff deadObjectBaseStepFrames >= 0.
-        val deadObjectBaseStepBounded: Boolean,
-        // Content frame (current-epoch continuous frame) the dead instance
-        // had consumed at the dead object; -1 when its head was unreadable.
-        val deadObjectContentHeadAtDeadObject: Long,
-        // written - contentHead: frames lost with the dead instance (-1 if H < 0).
-        val deadObjectWrittenAheadOfHeadFrames: Long,
-        // contentHead - last published position (-1 if H < 0).
-        val deadObjectPublicationLagFrames: Long,
-        // H >= 0 && 0 <= written - H <= track buffer + one mix window.
-        val deadObjectBaseStepDecompositionOk: Boolean,
-        val deadObjectClockProvenanceAtRecovery: String,
-        val deadObjectClockLastAgeNsAtRecovery: Long,
-        val deadObjectSliceBytesAtRecovery: Long,
-        val deadObjectUnwrittenBytesAtRecovery: Long,
-        val deadObjectBufferPositionAtRecovery: Long,
-        val deadObjectFramesReadAtRecovery: Long,
-        val deadObjectFramesWrittenBeforeRecovery: Long,
-        val deadObjectRemainderFramesExpected: Long,
-        val deadObjectRemainderFramesWrittenOnNewTrack: Long,
-        val deadObjectRemainderAccountingOk: Boolean,
-        val deadObjectTimestampPollsDuringRecovery: Long,
-        val clockSnapshotsAtDeadObjectRecovery: Long,
-        val playbackHeadAtDeadObject: Long,
-    )
-
     companion object {
         const val DEFAULT_GAIN = 1.0f
         const val DEFAULT_MAX_PAUSE_HOLD_MS = 1_500L
@@ -460,7 +352,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
 
     fun clockSnapshot(): VanguardRealtimePlaybackPresentationClock.Snapshot = presentationClock.snapshot()
 
-    fun telemetry(): Telemetry = Telemetry(
+    fun telemetry(): VanguardRealtimeAudioPlaybackSinkTelemetry = VanguardRealtimeAudioPlaybackSinkTelemetry(
         phase = phaseRef.get(),
         exitReason = exitReason,
         threadId = threadId,
