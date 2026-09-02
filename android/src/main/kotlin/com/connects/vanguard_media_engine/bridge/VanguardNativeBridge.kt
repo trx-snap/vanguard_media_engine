@@ -1863,6 +1863,23 @@ class VanguardNativeBridge(
         height: Int,
     ): String
 
+    // ── P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): VulkanMultiCamSpatialCompositor ──
+    // two-texture spatial layout raster + readback proof diagnostic. Native
+    // creates its own temporary VkInstance/VkDevice/VkQueue/VkCommandPool,
+    // synthetic solid red (primary) and solid blue (secondary) RGBA8 sampled
+    // images, a 64x64 offscreen color attachment and a host-visible readback
+    // buffer on the calling thread, evaluates ComputeMultiCamLayout() for
+    // top/bottom split, left/right split, PiP top-left and PiP free-floating,
+    // renders each through the private Vulkan spatial helper (existing AOT
+    // passthrough SPIR-V, opaque paint-over via dynamic viewport/scissor),
+    // gates every readback pixel (blue secondary rect, red primary rect,
+    // green clear sentinel elsewhere), and destroys everything before
+    // returning a JSON object string. Reports status "UNSUPPORTED" (never
+    // crashes) when no usable Vulkan device exists. No GLES, no camera open,
+    // no OES/AHardwareBuffer import, no opacity, no corner radius, no
+    // recording/export, no production VulkanBackend mutation, no product UI.
+    external fun runAndroidDagPhase3MultiCamSpatialVulkanRenderSmoke(): String
+
     // ── P5-COMPOSITOR-TRANS (NODE-TOPOLOGY-MATH): VGTimelineCompositorNode ──
     // native topology + timeline clip overlap / transition progress math
     // foundation diagnostic. Pure in-memory C++ math only: builds

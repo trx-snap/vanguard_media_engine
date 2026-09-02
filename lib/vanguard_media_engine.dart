@@ -52,6 +52,8 @@ export 'vg_camera2_concurrent_ingest_smoke.dart';
 export 'vg_multicam_compositor_smoke.dart';
 // P3-MULTICAM-NODE: Android True-DAG Phase 3 GLES-first spatial multi-texture diagnostic render pass smoke foundation.
 export 'vg_multicam_spatial_gles_render_smoke.dart';
+// P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): Android True-DAG Phase 3 Vulkan two-texture spatial layout render smoke foundation.
+export 'vg_multicam_spatial_vulkan_render_smoke.dart';
 // P4-AUDIO-MIXBUS: Android True-DAG Phase 4 AudioMixBusNode PCM16 mix-math diagnostic smoke foundation.
 export 'vg_audio_mix_bus_smoke.dart';
 // P4-AUDIO-GRAPH-TOPOLOGY: Android True-DAG Phase 4 AudioMixBusNode DAG topology & graph-gated diagnostic mix smoke foundation.
