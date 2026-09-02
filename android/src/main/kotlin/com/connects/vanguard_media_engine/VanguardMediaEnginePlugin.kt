@@ -64,6 +64,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPip
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineTimestampStabilizationSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineClockSyncSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineSeekSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackRealDecoderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackSinkFaultToleranceSmokeCoordinator
@@ -367,6 +368,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // clock is diagnostic only and controls nothing.
     private var realtimePlaybackPipelineClockSyncSmokeCoordinator: AndroidRealtimePlaybackPipelineClockSyncSmokeCoordinator? = null
 
+    // ── P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a): production ──
+    // session + sink-thread-owned AudioTrack/presentation clock smoke
+    // coordinator (bounded pause/resume to EOS, stop/dispose mid-playback).
+    private var realtimeAudioPlaybackProductionSmokeCoordinator: AndroidRealtimeAudioPlaybackProductionSmokeCoordinator? = null
+
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
     private var multiCamCompositorSmokeCoordinator: AndroidMultiCamCompositorSmokeCoordinator? = null
@@ -667,6 +673,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         realtimePlaybackPipelineClockSyncSmokeCoordinator = AndroidRealtimePlaybackPipelineClockSyncSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        realtimeAudioPlaybackProductionSmokeCoordinator = AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -1291,6 +1300,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android realtime playback pipeline clock sync smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = realtimeAudioPlaybackProductionSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android realtime audio playback production smoke coordinator unavailable",
                     null,
                 )
             }
@@ -2871,6 +2894,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // presentation clock is plain Kotlin state with nothing to release).
         realtimePlaybackPipelineClockSyncSmokeCoordinator?.disposeAll()
         realtimePlaybackPipelineClockSyncSmokeCoordinator = null
+        // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a): cancel an
+        // in-flight production session without blocking (its own threads
+        // release MediaCodec/MediaExtractor/AudioTrack; the smoke worker
+        // disposes the session and its transport in finally).
+        realtimeAudioPlaybackProductionSmokeCoordinator?.disposeAll()
+        realtimeAudioPlaybackProductionSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): release the smoke executor. An
         // in-flight run owns its VkDevice/images on its own thread and destroys
