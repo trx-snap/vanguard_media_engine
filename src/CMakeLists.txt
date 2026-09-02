@@ -70,6 +70,7 @@ add_library(vanguard_render_gles STATIC
     "render/gles/src/gles_texture_frame_renderer.cpp"
     "render/gles/src/gles_two_texture_compositor.cpp"
     "render/gles/src/gles_multicam_spatial_compositor.cpp"
+    "render/gles/src/gles_timeline_transition_compositor.cpp"
 )
 target_include_directories(vanguard_render_gles PUBLIC "render/gles/include")
 target_link_libraries(vanguard_render_gles PRIVATE vanguard_render_shared vanguard_core)
@@ -146,8 +147,15 @@ if (ANDROID)
     "platform/android/src/android_phase3_multicam_compositor_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_compositor_jni.cpp"
+    "platform/android/src/android_phase5_timeline_transition_gles_render_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
+  # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private
+  # GlesTimelineTransitionCompositor helper directly against its own temporary
+  # pbuffer context (no GlesBackend seam yet), so it needs the private GLES
+  # helper source dir on its include path. Diagnostic-only; the helper header
+  # stays out of the public gles_backend.h.
+  target_include_directories(vanguard_media_engine PRIVATE "render/gles/src")
 
   # Support Android 15 16 KB page size
   target_link_options(vanguard_media_engine PRIVATE

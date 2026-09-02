@@ -1810,6 +1810,18 @@ class VanguardNativeBridge(
     // IO, no export/render claim.
     external fun runAndroidDagPhase5TimelineCompositorSmoke(): String
 
+    // ── P5-COMPOSITOR-TRANS (GLES-RENDER): GlesTimelineTransitionCompositor ──
+    // shader/raster proof diagnostic. Native creates its own temporary EGL
+    // pbuffer context and synthetic GL_TEXTURE_2D solid-color/quadrant
+    // textures on the calling thread, evaluates ComputeTransitionGeometry()
+    // for crossfade / slide / wipe / none families, draws each through the
+    // private GLES transition helper, reads pixels back, and tears everything
+    // down before returning a JSON object string. Must be called from a
+    // thread with no EGL context current (the smoke coordinator's executor).
+    // No Vulkan, no MediaCodec/decode, no SurfaceTexture/OES frame proof,
+    // no export session, no product UI.
+    external fun runAndroidDagPhase5TimelineTransitionGlesRenderSmoke(): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)
