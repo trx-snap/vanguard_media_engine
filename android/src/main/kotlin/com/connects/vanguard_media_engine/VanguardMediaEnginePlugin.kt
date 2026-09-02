@@ -63,6 +63,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPip
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineFocusResponseSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineTimestampStabilizationSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineClockSyncSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineSeekSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackRealDecoderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackSinkFaultToleranceSmokeCoordinator
@@ -358,6 +359,13 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // coordinator owns transport commands; FORWARD_PLAYTHROUGH_TIMESTAMP,
     // DEAD_OBJECT_EPOCH_RESET_TIMESTAMP). Timestamp telemetry is inert.
     private var realtimePlaybackPipelineTimestampStabilizationSmokeCoordinator: AndroidRealtimePlaybackPipelineTimestampStabilizationSmokeCoordinator? = null
+
+    // Registration-only glue for the Y7 clock-synchronization smoke route
+    // (Y6f pipeline + read-only downstream presentation clock written by the
+    // sink thread at the post-write poll point, snapshotted by any thread;
+    // FORWARD_PLAYTHROUGH_CLOCK_SYNC, DEAD_OBJECT_CLOCK_EPOCH_RESET). The
+    // clock is diagnostic only and controls nothing.
+    private var realtimePlaybackPipelineClockSyncSmokeCoordinator: AndroidRealtimePlaybackPipelineClockSyncSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -656,6 +664,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         realtimePlaybackPipelineTimestampStabilizationSmokeCoordinator = AndroidRealtimePlaybackPipelineTimestampStabilizationSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        realtimePlaybackPipelineClockSyncSmokeCoordinator = AndroidRealtimePlaybackPipelineClockSyncSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -1266,6 +1277,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android realtime playback pipeline timestamp stabilization smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidRealtimePlaybackPipelineClockSyncSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = realtimePlaybackPipelineClockSyncSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android realtime playback pipeline clock sync smoke coordinator unavailable",
                     null,
                 )
             }
@@ -2841,6 +2866,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // disposes its state machine in finally).
         realtimePlaybackPipelineTimestampStabilizationSmokeCoordinator?.disposeAll()
         realtimePlaybackPipelineTimestampStabilizationSmokeCoordinator = null
+        // P4-AUDIO-REALTIME-PLAYBACK-CLOCK-SYNCHRONIZATION (Y7): cancel an
+        // in-flight run (same thread-owned release shape as Y6f; the
+        // presentation clock is plain Kotlin state with nothing to release).
+        realtimePlaybackPipelineClockSyncSmokeCoordinator?.disposeAll()
+        realtimePlaybackPipelineClockSyncSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): release the smoke executor. An
         // in-flight run owns its VkDevice/images on its own thread and destroys
