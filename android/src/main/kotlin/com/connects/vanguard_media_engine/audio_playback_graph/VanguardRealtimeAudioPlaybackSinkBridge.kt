@@ -54,8 +54,30 @@ import kotlin.concurrent.withLock
 //     The sink reads the clock (snapshot) only at park, to take the base
 //     of the next epoch; that read is counted.
 // A parked hold longer than [Config.maxPauseHoldMs] (default well below the
-// decoder feed's ingest stall budget) fails closed. ERROR_DEAD_OBJECT fails
-// closed with a clear reason; there is no dead-object recovery and no seek.
+// decoder feed's ingest stall budget) fails closed. No seek.
+//
+// Dead object (Y8b, P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT):
+//   - Default off. When [Config.syntheticDeadObjectInjectAfterFrames] > 0
+//     the sink thread arms EXACTLY ONE synthetic AudioTrack.ERROR_DEAD_OBJECT
+//     once that many frames were written: the write is skipped and the
+//     error substituted, so no byte of the slice is consumed.
+//   - Only that armed synthetic dead object is recovered, on the sink
+//     thread, inside the write loop: current epoch closed (accepted), old
+//     instance released exactly once (own counter, never [releaseCounter]),
+//     one same-parameter replacement built (STATE_INITIALIZED, same buffer
+//     geometry), gain reapplied, play() -> PLAYSTATE_PLAYING, instance
+//     unwrap/rebase reset, epoch+1 opened at baseFrame = frames written so
+//     far (accepted). The unwritten remainder is then written to the new
+//     instance. No timestamp poll happens inside the recovery window.
+//   - The base step (baseFrame - last published position) fails closed on
+//     sign only (step < 0). Its magnitude is NOT a production bound: it is
+//     decomposed for the proof lane into frames lost with the dead instance
+//     (written - head consumed at the dead object) and publication lag
+//     (head consumed - last published position), from the same single clock
+//     snapshot plus the dead instance's playbackHeadPosition.
+//   - Any unarmed (real) ERROR_DEAD_OBJECT and any second ERROR_DEAD_OBJECT
+//     fail closed. The final release of the replacement instance still goes
+//     through [releaseAudioTrackOnce] exactly once.
 class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
 
     data class Config(
@@ -75,6 +97,10 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         val externallyCancelled: () -> Boolean = { false },
         // Invoked once on the sink thread after the AudioTrack was released.
         val onExited: ((String) -> Unit)? = null,
+        // Y8b diagnostic seam, default OFF (0). When > 0, exactly one
+        // synthetic ERROR_DEAD_OBJECT is armed on the sink thread once this
+        // many frames were written; see the class comment.
+        val syntheticDeadObjectInjectAfterFrames: Long = 0L,
     )
 
     enum class Phase { SETUP, READY, RUNNING, PARK_REQUESTED, PARKED, EXITED }
@@ -139,6 +165,52 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         val sinkThreadWallMs: Long,
         val checksumHex: String,
         val lastReply: Reply?,
+        // ── Y8b synthetic dead-object recovery ──
+        val syntheticDeadObjectInjectAfterFrames: Long,
+        val deadObjectInjectedCount: Long,
+        val deadObjectObservedCount: Long,
+        val deadObjectRecoveryCount: Int,
+        val deadObjectOldTrackReleaseCount: Int,
+        val deadObjectRecoveryExecutedOnSinkThread: Boolean,
+        val deadObjectNewTrackInitOk: Boolean,
+        val deadObjectNewTrackVolumeOk: Boolean,
+        val deadObjectNewTrackPlayOk: Boolean,
+        val deadObjectNewTrackPlayState: Int,
+        val deadObjectNewTrackSameBuffer: Boolean,
+        val audioTrackBufferFrames: Int,
+        val deadObjectNewTrackBufferFrames: Int,
+        val deadObjectRecoveryWallMs: Long,
+        val deadObjectEpochBeforeRecovery: Int,
+        val deadObjectEpochOpenedAfterRecovery: Int,
+        val deadObjectEpochCloseAccepted: Boolean,
+        val deadObjectEpochOpenAccepted: Boolean,
+        val deadObjectPositionBeforeRecovery: Long,
+        val deadObjectBaseFrameAfterRecovery: Long,
+        val deadObjectBaseStepFrames: Long,
+        // Sign-only claim: true iff deadObjectBaseStepFrames >= 0.
+        val deadObjectBaseStepBounded: Boolean,
+        // Content frame (current-epoch continuous frame) the dead instance
+        // had consumed at the dead object; -1 when its head was unreadable.
+        val deadObjectContentHeadAtDeadObject: Long,
+        // written - contentHead: frames lost with the dead instance (-1 if H < 0).
+        val deadObjectWrittenAheadOfHeadFrames: Long,
+        // contentHead - last published position (-1 if H < 0).
+        val deadObjectPublicationLagFrames: Long,
+        // H >= 0 && 0 <= written - H <= track buffer + one mix window.
+        val deadObjectBaseStepDecompositionOk: Boolean,
+        val deadObjectClockProvenanceAtRecovery: String,
+        val deadObjectClockLastAgeNsAtRecovery: Long,
+        val deadObjectSliceBytesAtRecovery: Long,
+        val deadObjectUnwrittenBytesAtRecovery: Long,
+        val deadObjectBufferPositionAtRecovery: Long,
+        val deadObjectFramesReadAtRecovery: Long,
+        val deadObjectFramesWrittenBeforeRecovery: Long,
+        val deadObjectRemainderFramesExpected: Long,
+        val deadObjectRemainderFramesWrittenOnNewTrack: Long,
+        val deadObjectRemainderAccountingOk: Boolean,
+        val deadObjectTimestampPollsDuringRecovery: Long,
+        val clockSnapshotsAtDeadObjectRecovery: Long,
+        val playbackHeadAtDeadObject: Long,
     )
 
     companion object {
@@ -154,6 +226,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         const val EXIT_NOT_STARTED = "not_started"
         const val EXIT_PAUSE_HOLD_EXCEEDED = "bounded_pause_hold_exceeded"
         const val EXIT_DEAD_OBJECT = "audio_track_dead_object"
+        const val EXIT_DEAD_OBJECT_REPEATED = "audio_track_dead_object_repeated"
 
         private const val TRACK_BUFFER_MARGIN_WINDOWS = 4L
         private const val MAX_CONSECUTIVE_ZERO_WRITES = 500
@@ -254,12 +327,55 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     @Volatile private var lastReply: Reply? = null
     @Volatile private var parkRequestedAtMs = -1L
 
+    // Y8b synthetic dead-object recovery telemetry (sink thread writes).
+    @Volatile private var deadObjectInjectedCount = 0L
+    @Volatile private var deadObjectObservedCount = 0L
+    @Volatile private var deadObjectRecoveryCount = 0
+    @Volatile private var deadObjectOldTrackReleaseCount = 0
+    @Volatile private var deadObjectRecoveryExecutedOnSinkThread = false
+    @Volatile private var deadObjectNewTrackInitOk = false
+    @Volatile private var deadObjectNewTrackVolumeOk = false
+    @Volatile private var deadObjectNewTrackPlayOk = false
+    @Volatile private var deadObjectNewTrackPlayState = PLAY_STATE_UNKNOWN
+    @Volatile private var deadObjectNewTrackSameBuffer = false
+    @Volatile private var audioTrackBufferFrames = 0
+    @Volatile private var deadObjectNewTrackBufferFrames = 0
+    @Volatile private var deadObjectRecoveryWallMs = -1L
+    @Volatile private var deadObjectEpochBeforeRecovery = EPOCH_NONE
+    @Volatile private var deadObjectEpochOpenedAfterRecovery = EPOCH_NONE
+    @Volatile private var deadObjectEpochCloseAccepted = false
+    @Volatile private var deadObjectEpochOpenAccepted = false
+    @Volatile private var deadObjectPositionBeforeRecovery = -1L
+    @Volatile private var deadObjectBaseFrameAfterRecovery = -1L
+    @Volatile private var deadObjectBaseStepFrames = -1L
+    @Volatile private var deadObjectBaseStepBounded = false
+    @Volatile private var deadObjectContentHeadAtDeadObject = -1L
+    @Volatile private var deadObjectWrittenAheadOfHeadFrames = -1L
+    @Volatile private var deadObjectPublicationLagFrames = -1L
+    @Volatile private var deadObjectBaseStepDecompositionOk = false
+    @Volatile private var deadObjectClockProvenanceAtRecovery = ""
+    @Volatile private var deadObjectClockLastAgeNsAtRecovery = -1L
+    @Volatile private var deadObjectSliceBytesAtRecovery = -1L
+    @Volatile private var deadObjectUnwrittenBytesAtRecovery = -1L
+    @Volatile private var deadObjectBufferPositionAtRecovery = -1L
+    @Volatile private var deadObjectFramesReadAtRecovery = -1L
+    @Volatile private var deadObjectFramesWrittenBeforeRecovery = -1L
+    @Volatile private var deadObjectRemainderFramesExpected = -1L
+    @Volatile private var deadObjectRemainderFramesWrittenOnNewTrack = -1L
+    @Volatile private var deadObjectRemainderAccountingOk = false
+    @Volatile private var deadObjectTimestampPollsDuringRecovery = -1L
+    @Volatile private var clockSnapshotsAtDeadObjectRecovery = 0L
+    @Volatile private var playbackHeadAtDeadObject = -1L
+
     // ── Sink-thread-confined state ─────────────────────────────────────────
 
     private var audioTrack: AudioTrack? = null
     private val audioTimestamp = AudioTimestamp()
     private var lastProgressMs = 0L
     private var pollsThisPass = 0L
+    // Set by the write loop between the armed dead object and the end of
+    // the slice whose remainder the replacement instance must absorb.
+    private var deadObjectResumePending = false
     // Instance-frame unwrap of AudioTimestamp.framePosition (one forward
     // wrap tolerated) and the per-epoch rebase origin in instance frames.
     private var lastRaw32 = -1L
@@ -403,6 +519,45 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         sinkThreadWallMs = sinkThreadWallMs,
         checksumHex = hex16(checksum),
         lastReply = lastReply,
+        syntheticDeadObjectInjectAfterFrames = config.syntheticDeadObjectInjectAfterFrames,
+        deadObjectInjectedCount = deadObjectInjectedCount,
+        deadObjectObservedCount = deadObjectObservedCount,
+        deadObjectRecoveryCount = deadObjectRecoveryCount,
+        deadObjectOldTrackReleaseCount = deadObjectOldTrackReleaseCount,
+        deadObjectRecoveryExecutedOnSinkThread = deadObjectRecoveryExecutedOnSinkThread,
+        deadObjectNewTrackInitOk = deadObjectNewTrackInitOk,
+        deadObjectNewTrackVolumeOk = deadObjectNewTrackVolumeOk,
+        deadObjectNewTrackPlayOk = deadObjectNewTrackPlayOk,
+        deadObjectNewTrackPlayState = deadObjectNewTrackPlayState,
+        deadObjectNewTrackSameBuffer = deadObjectNewTrackSameBuffer,
+        audioTrackBufferFrames = audioTrackBufferFrames,
+        deadObjectNewTrackBufferFrames = deadObjectNewTrackBufferFrames,
+        deadObjectRecoveryWallMs = deadObjectRecoveryWallMs,
+        deadObjectEpochBeforeRecovery = deadObjectEpochBeforeRecovery,
+        deadObjectEpochOpenedAfterRecovery = deadObjectEpochOpenedAfterRecovery,
+        deadObjectEpochCloseAccepted = deadObjectEpochCloseAccepted,
+        deadObjectEpochOpenAccepted = deadObjectEpochOpenAccepted,
+        deadObjectPositionBeforeRecovery = deadObjectPositionBeforeRecovery,
+        deadObjectBaseFrameAfterRecovery = deadObjectBaseFrameAfterRecovery,
+        deadObjectBaseStepFrames = deadObjectBaseStepFrames,
+        deadObjectBaseStepBounded = deadObjectBaseStepBounded,
+        deadObjectContentHeadAtDeadObject = deadObjectContentHeadAtDeadObject,
+        deadObjectWrittenAheadOfHeadFrames = deadObjectWrittenAheadOfHeadFrames,
+        deadObjectPublicationLagFrames = deadObjectPublicationLagFrames,
+        deadObjectBaseStepDecompositionOk = deadObjectBaseStepDecompositionOk,
+        deadObjectClockProvenanceAtRecovery = deadObjectClockProvenanceAtRecovery,
+        deadObjectClockLastAgeNsAtRecovery = deadObjectClockLastAgeNsAtRecovery,
+        deadObjectSliceBytesAtRecovery = deadObjectSliceBytesAtRecovery,
+        deadObjectUnwrittenBytesAtRecovery = deadObjectUnwrittenBytesAtRecovery,
+        deadObjectBufferPositionAtRecovery = deadObjectBufferPositionAtRecovery,
+        deadObjectFramesReadAtRecovery = deadObjectFramesReadAtRecovery,
+        deadObjectFramesWrittenBeforeRecovery = deadObjectFramesWrittenBeforeRecovery,
+        deadObjectRemainderFramesExpected = deadObjectRemainderFramesExpected,
+        deadObjectRemainderFramesWrittenOnNewTrack = deadObjectRemainderFramesWrittenOnNewTrack,
+        deadObjectRemainderAccountingOk = deadObjectRemainderAccountingOk,
+        deadObjectTimestampPollsDuringRecovery = deadObjectTimestampPollsDuringRecovery,
+        clockSnapshotsAtDeadObjectRecovery = clockSnapshotsAtDeadObjectRecovery,
+        playbackHeadAtDeadObject = playbackHeadAtDeadObject,
     )
 
     // ── Sink thread body ───────────────────────────────────────────────────
@@ -461,6 +616,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         if (config.declaredFrameCount <= 0L) throw FailClosed("invalid_declared_frame_count")
         if (!(config.gain > 0f) || config.gain > 1f) throw FailClosed("invalid_gain")
         if (config.maxPauseHoldMs <= 0L) throw FailClosed("invalid_max_pause_hold")
+        if (config.syntheticDeadObjectInjectAfterFrames < 0L) throw FailClosed("invalid_dead_object_inject_after_frames")
     }
 
     private fun isCancelled(): Boolean = cancelled.get() || config.externallyCancelled()
@@ -479,7 +635,10 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         return audioTrack ?: throw FailClosed("audio_track_missing")
     }
 
-    private fun createAudioTrack() {
+    // Builds one AudioTrack from the frozen config parameters; the buffer
+    // request is returned so a replacement can be checked against the
+    // original geometry. Shared by the initial create and the Y8b recreate.
+    private fun buildAudioTrack(): Pair<AudioTrack, Int> {
         val bytesPerFrame = 2 * config.channelCount
         val channelMask = if (config.channelCount == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
         val minBytes = AudioTrack.getMinBufferSize(config.sampleRate, channelMask, AudioFormat.ENCODING_PCM_16BIT)
@@ -504,11 +663,17 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             .setTransferMode(AudioTrack.MODE_STREAM)
             .setBufferSizeInBytes(bufferBytes)
             .build()
-        audioTrack = track
         audioTracksCreated++
+        return Pair(track, bufferBytes)
+    }
+
+    private fun createAudioTrack() {
+        val (track, bufferBytes) = buildAudioTrack()
+        audioTrack = track
         audioTrackBufferBytes = bufferBytes
         if (track.state != AudioTrack.STATE_INITIALIZED) throw FailClosed("audio_track_not_initialized")
         audioTrackInitOk = true
+        audioTrackBufferFrames = track.bufferSizeInFrames
         if (track.setVolume(config.gain) != AudioTrack.SUCCESS) throw FailClosed("audio_track_set_volume_failed")
         gainValue = config.gain
         gainSetOk = config.gain > 0f
@@ -536,20 +701,47 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
 
     // ── Write path (WRITE_NON_BLOCKING, in-place bounded retries) ──────────
 
+    // Arms the ONE synthetic dead object: config seam > 0, never injected
+    // before, sink playing with an open epoch, and at least
+    // syntheticDeadObjectInjectAfterFrames written. Returns true exactly once
+    // per run; the caller then substitutes ERROR_DEAD_OBJECT for the write
+    // result WITHOUT calling AudioTrack.write(). Deterministic by
+    // construction; timestamp/clock outcomes play no part in the decision.
+    private fun armSyntheticDeadObject(unwrittenBytes: Int): Boolean {
+        val after = config.syntheticDeadObjectInjectAfterFrames
+        if (after <= 0L) return false
+        if (deadObjectInjectedCount != 0L) return false
+        if (!played || currentEpoch == EPOCH_NONE) return false
+        if (phaseRef.get() != Phase.RUNNING) return false
+        if (framesWrittenToSink < after) return false
+        if (unwrittenBytes <= 0) return false
+        deadObjectInjectedCount = 1L
+        return true
+    }
+
     private fun writeAllToAudioTrack(buf: ByteBuffer, bytes: Int, bytesPerFrame: Int) {
-        val track = requireTrack()
+        var track = requireTrack()
+        var framesThisCall = 0L
         buf.position(0)
         buf.limit(bytes)
         var consecutiveZero = 0
         while (buf.hasRemaining()) {
             checkDeadlineAndCancel()
             val requested = buf.remaining()
-            val wrote = track.write(buf, requested, AudioTrack.WRITE_NON_BLOCKING)
+            val positionBefore = buf.position()
+            val wrote = if (armSyntheticDeadObject(requested)) {
+                AudioTrack.ERROR_DEAD_OBJECT
+            } else {
+                track.write(buf, requested, AudioTrack.WRITE_NON_BLOCKING)
+            }
+            val errorPrefix = if (deadObjectRecoveryCount > 0) "recreated_audio_track" else "audio_track"
             when {
                 wrote > 0 -> {
                     consecutiveZero = 0
-                    if (wrote % bytesPerFrame != 0) throw FailClosed("audio_track_write_frame_misaligned:$wrote")
-                    framesWrittenToSink += (wrote / bytesPerFrame).toLong()
+                    if (wrote % bytesPerFrame != 0) throw FailClosed("${errorPrefix}_write_frame_misaligned:$wrote")
+                    val frames = (wrote / bytesPerFrame).toLong()
+                    framesThisCall += frames
+                    framesWrittenToSink += frames
                     if (firstWriteAtMs < 0L) firstWriteAtMs = SystemClock.elapsedRealtime()
                     if (wrote < requested) {
                         partialWriteCount++
@@ -559,16 +751,194 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
                 }
                 wrote == 0 -> {
                     zeroWriteCount++
-                    if (++consecutiveZero > MAX_CONSECUTIVE_ZERO_WRITES) throw FailClosed("audio_track_write_stalled")
+                    if (++consecutiveZero > MAX_CONSECUTIVE_ZERO_WRITES) throw FailClosed("${errorPrefix}_write_stalled")
                     SystemClock.sleep(ZERO_WRITE_SLEEP_MS)
                 }
-                wrote == AudioTrack.ERROR_INVALID_OPERATION -> throw FailClosed("audio_track_invalid_operation")
-                wrote == AudioTrack.ERROR_BAD_VALUE -> throw FailClosed("audio_track_bad_value")
-                wrote == AudioTrack.ERROR_DEAD_OBJECT -> throw FailClosed(EXIT_DEAD_OBJECT)
-                else -> throw FailClosed("audio_track_generic_error:$wrote")
+                wrote == AudioTrack.ERROR_INVALID_OPERATION -> throw FailClosed("${errorPrefix}_invalid_operation")
+                wrote == AudioTrack.ERROR_BAD_VALUE -> throw FailClosed("${errorPrefix}_bad_value")
+                wrote == AudioTrack.ERROR_DEAD_OBJECT -> {
+                    deadObjectObservedCount++
+                    if (deadObjectObservedCount != 1L) {
+                        throw FailClosed("$EXIT_DEAD_OBJECT_REPEATED:$deadObjectObservedCount")
+                    }
+                    // Only the armed synthetic dead object is recovered; an
+                    // unarmed (real) dead object fails closed as before.
+                    if (deadObjectInjectedCount != 1L) throw FailClosed(EXIT_DEAD_OBJECT)
+                    if (buf.position() != positionBefore || buf.remaining() != requested) {
+                        throw FailClosed("dead_object_consumed_bytes")
+                    }
+                    deadObjectSliceBytesAtRecovery = bytes.toLong()
+                    deadObjectUnwrittenBytesAtRecovery = requested.toLong()
+                    deadObjectBufferPositionAtRecovery = positionBefore.toLong()
+                    deadObjectFramesReadAtRecovery = framesReadFromTransport
+                    deadObjectFramesWrittenBeforeRecovery = framesWrittenToSink
+                    deadObjectRemainderFramesExpected = (requested / bytesPerFrame).toLong()
+                    // Recovery on this thread; buffer position/limit are
+                    // untouched so the loop resumes on the same remainder.
+                    track = recoverFromSyntheticDeadObject(track)
+                    deadObjectResumePending = true
+                    consecutiveZero = 0
+                }
+                else -> throw FailClosed("${errorPrefix}_generic_error:$wrote")
+            }
+        }
+        if (deadObjectResumePending) {
+            // Exactly the remainder present at injection landed on the new
+            // instance and the slice total is intact.
+            deadObjectResumePending = false
+            deadObjectRemainderFramesWrittenOnNewTrack = framesWrittenToSink - deadObjectFramesWrittenBeforeRecovery
+            deadObjectRemainderAccountingOk =
+                deadObjectRemainderFramesWrittenOnNewTrack == deadObjectRemainderFramesExpected &&
+                    framesThisCall == (bytes / bytesPerFrame).toLong()
+            if (!deadObjectRemainderAccountingOk) {
+                throw FailClosed(
+                    "dead_object_remainder_accounting:$deadObjectRemainderFramesWrittenOnNewTrack:$deadObjectRemainderFramesExpected",
+                )
             }
         }
         buf.clear()
+    }
+
+    // ── Y8b: synthetic dead-object recovery (sink thread only) ─────────────
+
+    // Recovery after the armed ERROR_DEAD_OBJECT on [oldTrack]. Everything
+    // runs on this sink thread, inside the write loop, with the drain buffer
+    // untouched. Order: capture epoch/position, close the epoch (accepted),
+    // release the old instance exactly once (own counter), build ONE
+    // same-parameter replacement (STATE_INITIALIZED, same buffer geometry),
+    // reapply gain, play() -> PLAYSTATE_PLAYING, reset the instance
+    // unwrap/rebase state, open epoch+1 at baseFrame = frames written so far
+    // (accepted). No timestamp poll and no transport command happen here.
+    private fun recoverFromSyntheticDeadObject(oldTrack: AudioTrack): AudioTrack {
+        val recoveryStart = SystemClock.elapsedRealtime()
+        deadObjectRecoveryExecutedOnSinkThread = Thread.currentThread().id == threadId
+        if (!deadObjectRecoveryExecutedOnSinkThread) throw FailClosed("dead_object_recovery_off_sink_thread")
+        if (deadObjectRecoveryCount != 0 || deadObjectOldTrackReleaseCount != 0) {
+            throw FailClosed("dead_object_recovery_repeated")
+        }
+        if (releaseCounter.get() > 0) throw FailClosed("dead_object_after_final_release")
+        if (phaseRef.get() != Phase.RUNNING) throw FailClosed("dead_object_outside_running:${phaseRef.get().name.lowercase()}")
+        val epochBeforeRecovery = currentEpoch
+        if (epochBeforeRecovery == EPOCH_NONE) throw FailClosed("dead_object_without_open_epoch")
+        deadObjectEpochBeforeRecovery = epochBeforeRecovery
+        val pollAttemptsAtStart = timestampPollAttempts
+
+        // Step 1: freeze. The last published position, provenance, anchor
+        // age and epoch base are read from ONE (counted) snapshot for
+        // telemetry only; the epoch closes with the dead instance.
+        val snap = presentationClock.snapshot()
+        clockSnapshotsAtDeadObjectRecovery++
+        val positionBeforeRecovery = snap.positionFrames
+        deadObjectPositionBeforeRecovery = positionBeforeRecovery
+        deadObjectClockProvenanceAtRecovery = snap.provenance.name
+        deadObjectClockLastAgeNsAtRecovery = snap.lastAgeNs
+        val framesWrittenAtDeadObject = framesWrittenToSink
+        // Head consumed by the dead instance, converted to a content frame of
+        // the closing epoch with the poll path's unwrap/rebase assumptions
+        // (instance frames minus the epoch origin, on the epoch base). -1 when
+        // the dead instance no longer answers or the conversion is negative.
+        var contentHead = -1L
+        try {
+            val rawHeadAtDeadObject = oldTrack.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+            playbackHeadAtDeadObject = rawHeadAtDeadObject
+            val rebasedHead = peekUnwrappedInstanceFrame(rawHeadAtDeadObject, snap.lastHead) - epochRawOrigin
+            if (rebasedHead >= 0L && rebasedHead < FRAME_WRAP_MODULUS) contentHead = snap.epochBaseOffsetFrames + rebasedHead
+        } catch (_: Throwable) {}
+        deadObjectContentHeadAtDeadObject = contentHead
+        currentEpoch = EPOCH_NONE
+        clockEpochCloseCalls++
+        val closeOutcome = presentationClock.epochClosed(epochBeforeRecovery, System.nanoTime())
+        countClockOutcome(closeOutcome)
+        deadObjectEpochCloseAccepted = closeOutcome.accepted
+        if (!closeOutcome.accepted) throw FailClosed("dead_object_epoch_close_rejected:${closeOutcome.name.lowercase()}")
+
+        // Step 2: release the old instance exactly once (never the final
+        // releaseCounter). A dead object accepts no control calls, so no
+        // stop/flush precedes release.
+        audioTrack = null
+        noteTrackCall()
+        try {
+            oldTrack.release()
+        } catch (t: Throwable) {
+            throw FailClosed("dead_object_old_track_release_failed:${t.javaClass.simpleName}")
+        }
+        deadObjectOldTrackReleaseCount = 1
+
+        // Step 3: same-parameter replacement.
+        val (newTrack, bufferBytes) = try {
+            buildAudioTrack()
+        } catch (f: FailClosed) {
+            throw FailClosed("recreated_${f.reason}")
+        } catch (t: Throwable) {
+            throw FailClosed("recreated_audio_track_build_failed:${t.javaClass.simpleName}")
+        }
+        audioTrack = newTrack
+        if (newTrack.state != AudioTrack.STATE_INITIALIZED) throw FailClosed("recreated_audio_track_not_initialized")
+        deadObjectNewTrackInitOk = true
+        deadObjectNewTrackBufferFrames = newTrack.bufferSizeInFrames
+        deadObjectNewTrackSameBuffer = bufferBytes == audioTrackBufferBytes &&
+            deadObjectNewTrackBufferFrames == audioTrackBufferFrames
+        if (!deadObjectNewTrackSameBuffer) {
+            throw FailClosed(
+                "recreated_audio_track_buffer_geometry_mismatch:$bufferBytes:$audioTrackBufferBytes:" +
+                    "$deadObjectNewTrackBufferFrames:$audioTrackBufferFrames",
+            )
+        }
+
+        // Step 4: reapply the configured gain.
+        if (newTrack.setVolume(config.gain) != AudioTrack.SUCCESS) throw FailClosed("recreated_audio_track_set_volume_failed")
+        deadObjectNewTrackVolumeOk = true
+        gainValue = config.gain
+
+        // Step 5: play; MODE_STREAM consumes once the remainder lands.
+        newTrack.play()
+        val playState = newTrack.playState
+        deadObjectNewTrackPlayState = playState
+        if (playState != AudioTrack.PLAYSTATE_PLAYING) throw FailClosed("recreated_audio_track_play_failed:$playState")
+        deadObjectNewTrackPlayOk = true
+
+        // Step 6: the new instance's framePosition starts from 0: reset the
+        // unwrap/rebase state, then open epoch+1 based at the frames
+        // written so far (>= last published position, so no clamp).
+        lastRaw32 = -1L
+        wrapOffset = 0L
+        epochRawOrigin = 0L
+        val baseFrame = framesWrittenToSink
+        val nextEpoch = epochBeforeRecovery + 1
+        val openOutcome = openClockEpoch(nextEpoch, baseFrame)
+        deadObjectEpochOpenAccepted = openOutcome.accepted
+        if (!openOutcome.accepted) throw FailClosed("dead_object_epoch_open_rejected:${openOutcome.name.lowercase()}")
+        deadObjectEpochOpenedAfterRecovery = nextEpoch
+        deadObjectBaseFrameAfterRecovery = baseFrame
+        val step = baseFrame - positionBeforeRecovery
+        deadObjectBaseStepFrames = step
+        // Production fails closed on sign only: the new base may never fall
+        // below the last published position. The step magnitude is publication
+        // lag plus frames lost with the dead instance; neither is a sink fault.
+        deadObjectBaseStepBounded = step >= 0L
+        if (!deadObjectBaseStepBounded) throw FailClosed("dead_object_base_below_published:$baseFrame:$positionBeforeRecovery")
+        // Proof decomposition (telemetry only): step = (W - H) + (H - P).
+        // W - H is bounded by one track buffer plus one mix window; H - P is
+        // reported for the proof lane's provenance-dependent budget.
+        if (contentHead >= 0L) {
+            val writtenAhead = framesWrittenAtDeadObject - contentHead
+            deadObjectWrittenAheadOfHeadFrames = writtenAhead
+            deadObjectPublicationLagFrames = contentHead - positionBeforeRecovery
+            val lossBound = audioTrackBufferFrames.toLong() + config.maxFramesPerMix.toLong()
+            deadObjectBaseStepDecompositionOk = writtenAhead in 0L..lossBound
+        } else {
+            deadObjectWrittenAheadOfHeadFrames = -1L
+            deadObjectPublicationLagFrames = -1L
+            deadObjectBaseStepDecompositionOk = false
+        }
+
+        deadObjectTimestampPollsDuringRecovery = timestampPollAttempts - pollAttemptsAtStart
+        if (deadObjectTimestampPollsDuringRecovery != 0L) throw FailClosed("dead_object_timestamp_polled_in_recovery")
+        deadObjectRecoveryCount = 1
+        val now = SystemClock.elapsedRealtime()
+        deadObjectRecoveryWallMs = now - recoveryStart
+        lastProgressMs = now
+        return newTrack
     }
 
     // ── Presentation clock writes (sink thread only; never fed back) ───────
@@ -577,10 +947,12 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         if (!outcome.accepted) clockRejectedCount++
     }
 
-    private fun openClockEpoch(epoch: Int, baseFrame: Long) {
+    private fun openClockEpoch(epoch: Int, baseFrame: Long): VanguardRealtimePlaybackPresentationClock.Outcome {
         currentEpoch = epoch
         clockEpochOpenCalls++
-        countClockOutcome(presentationClock.epochOpened(epoch, baseFrame, System.nanoTime()))
+        val outcome = presentationClock.epochOpened(epoch, baseFrame, System.nanoTime())
+        countClockOutcome(outcome)
+        return outcome
     }
 
     private fun closeEpochIfOpen() {
@@ -589,6 +961,20 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         currentEpoch = EPOCH_NONE
         clockEpochCloseCalls++
         countClockOutcome(presentationClock.epochClosed(epoch, System.nanoTime()))
+    }
+
+    // Non-mutating variant for the dead instance's head: applies the wrap
+    // offset already accumulated by the timestamp path and tolerates the
+    // same single forward wrap relative to the last raw frame seen (the last
+    // timestamp raw frame, else [fallbackLastRaw32]). Unwrap state is untouched.
+    private fun peekUnwrappedInstanceFrame(raw32: Long, fallbackLastRaw32: Long): Long {
+        val last = if (lastRaw32 >= 0L) lastRaw32 else fallbackLastRaw32
+        var offset = wrapOffset
+        if (last >= 0L && raw32 < last) {
+            val forward = raw32 + FRAME_WRAP_MODULUS - last
+            if (forward > 0L && forward < FRAME_WRAP_FORWARD_MAX) offset += FRAME_WRAP_MODULUS
+        }
+        return raw32 + offset
     }
 
     private fun unwrapInstanceFrame(raw32: Long): Long {

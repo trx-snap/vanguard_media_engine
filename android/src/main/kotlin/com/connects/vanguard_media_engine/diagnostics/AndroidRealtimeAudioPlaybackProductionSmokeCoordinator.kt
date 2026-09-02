@@ -13,17 +13,24 @@ import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Android True-DAG P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a):
+ * Android True-DAG P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a) +
+ * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b):
  * production-component diagnostic smoke coordinator.
  *
  * Owns the [METHOD_NAME] MethodChannel route only. It drives the PRODUCTION
  * [VanguardRealtimeAudioPlaybackSession] (real MediaExtractor/MediaCodec ->
  * Y5a external ingest -> Y1 transport -> sink-thread-owned non-zero-gain
- * AudioTrack + presentation clock) through two scenarios on a worker
+ * AudioTrack + presentation clock) through three scenarios on a worker
  * thread, evaluates proof lanes from the session's snapshots, posts the
  * payload on the main handler and logs the START / JSON / PASS / FAIL
  * markers. Every lifecycle decision lives in the session; this class only
  * maps arguments, sequences scenarios, evaluates lanes and reports.
+ *
+ * Scenario 3 (Y8b) arms the session's ONE synthetic ERROR_DEAD_OBJECT after
+ * [SmokeConfig.deadObjectInjectAfterFrames] written frames; the two Y8a
+ * baseline scenarios run with the seam off. The synthetic injection proves
+ * the recovery sequence only; a real OS dead object is not forced here and
+ * fails closed in the sink by construction.
  */
 class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
     private val mainHandler: Handler,
@@ -41,14 +48,26 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_" +
                 "to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_" +
                 "bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_" +
-                "stop_dispose_release_once_no_seek_no_dead_object_recovery_" +
+                "synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_" +
+                "real_or_repeated_dead_object_fails_closed_" +
+                "stop_dispose_release_once_no_seek_" +
                 "no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni"
 
         const val SCENARIO_PLAYTHROUGH = "PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS"
         const val SCENARIO_STOP_DISPOSE = "STOP_DISPOSE_MID_PLAYBACK"
+        const val SCENARIO_DEAD_OBJECT_RECOVERY = "SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS"
 
         const val DEFAULT_PAUSE_HOLD_MS = 400L
         const val DEFAULT_STOP_AFTER_MS = 300L
+        // Frames written before the ONE synthetic dead object is armed
+        // (~186 ms at 44.1 kHz); must stay below the clip's declared frames.
+        const val DEFAULT_DEAD_OBJECT_INJECT_AFTER_FRAMES = 8_192L
+        // Device observability budget for the dead-object publication lag
+        // (head consumed by the dead instance minus the last published clock
+        // position) when the clock was ANCHORED or EXTRAPOLATED at recovery.
+        // It bounds how far the clock's view may trail the hardware on the
+        // proof device; it is NOT a playback latency target or an SLA.
+        const val DEAD_OBJECT_PUBLICATION_LAG_BUDGET_MS = 300L
 
         const val LANE_FORMAT_PROBE = "formatProbeOk"
         const val LANE_PRE_ROLL = "preRollOk"
@@ -68,6 +87,10 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_THREAD_OWNERSHIP = "threadOwnershipOk"
         const val LANE_NO_FEEDBACK = "noFeedbackOk"
         const val LANE_PROOF_BOUNDARY = "proofBoundaryOk"
+        // Y8b lanes, evaluated by the dead-object scenario only.
+        const val LANE_DEAD_OBJECT_RECOVERY = "syntheticDeadObjectRecoveryOk"
+        const val LANE_DEAD_OBJECT_CLOCK_EPOCH = "deadObjectClockEpochRebaseOk"
+        const val LANE_DEAD_OBJECT_REMAINDER = "deadObjectRemainderAccountingOk"
         const val LANE_CANONICAL = "canonical"
 
         val REQUIRED_LANES: List<String> = listOf(
@@ -77,13 +100,16 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_BOUNDED_PAUSE_RESUME, LANE_STOP_DISPOSE, LANE_DECODER_CANCELLED_ON_STOP,
             LANE_TRANSPORT_DISPOSED, LANE_AUDIO_TRACK_RELEASED_ONCE, LANE_THREAD_OWNERSHIP,
             LANE_NO_FEEDBACK, LANE_PROOF_BOUNDARY,
+            LANE_DEAD_OBJECT_RECOVERY, LANE_DEAD_OBJECT_CLOCK_EPOCH, LANE_DEAD_OBJECT_REMAINDER,
         )
 
         private val PROOF_BOUNDARY_TOKENS = listOf(
             "production_engine_component_diagnostic_route", "real_mediaextractor_mediacodec", "y5a_external_ingest",
             "y1_transport", "nonzero_gain_audiotrack", "sink_thread_owned_audiotrack_and_presentation_clock",
-            "bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position", "stop_dispose_release_once",
-            "no_seek", "no_dead_object_recovery", "no_product", "no_editor", "no_app", "no_connectsapp", "no_ios",
+            "bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position",
+            "synthetic_armed_dead_object_recovered_once_on_sink_thread", "same_parameter_audiotrack", "epoch_rebase",
+            "real_or_repeated_dead_object_fails_closed", "stop_dispose_release_once",
+            "no_seek", "no_product", "no_editor", "no_app", "no_connectsapp", "no_ios",
             "no_streaming", "no_cache", "no_cpp", "no_jni",
         )
 
@@ -105,7 +131,19 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         val pauseHoldMs: Long,
         val maxPauseHoldMs: Long,
         val stopAfterMs: Long,
+        val deadObjectInjectAfterFrames: Long,
     )
+
+    // Per-scenario expected AudioTrack instance/dead-object accounting.
+    private data class SinkExpectation(
+        val audioTracksCreated: Int,
+        val oldTrackReleases: Int,
+        val deadObjectsInjected: Long,
+        val deadObjectsObserved: Long,
+    )
+
+    private val baselineExpectation = SinkExpectation(audioTracksCreated = 1, oldTrackReleases = 0, deadObjectsInjected = 0L, deadObjectsObserved = 0L)
+    private val deadObjectExpectation = SinkExpectation(audioTracksCreated = 2, oldTrackReleases = 1, deadObjectsInjected = 1L, deadObjectsObserved = 1L)
 
     private class ScenarioOutcome(val name: String) {
         val lanes = linkedMapOf<String, Boolean>()
@@ -153,6 +191,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             maxPauseHoldMs = (args["maxPauseHoldMs"] as? Number)?.toLong()
                 ?: VanguardRealtimeAudioPlaybackSession.DEFAULT_MAX_PAUSE_HOLD_MS,
             stopAfterMs = (args["stopAfterMs"] as? Number)?.toLong() ?: DEFAULT_STOP_AFTER_MS,
+            deadObjectInjectAfterFrames = (args["deadObjectInjectAfterFrames"] as? Number)?.toLong()
+                ?: DEFAULT_DEAD_OBJECT_INJECT_AFTER_FRAMES,
         )
         runSmoke(config, result)
         return true
@@ -197,15 +237,29 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "pauseHoldMs" to config.pauseHoldMs,
             "maxPauseHoldMs" to config.maxPauseHoldMs,
             "stopAfterMs" to config.stopAfterMs,
+            "deadObjectInjectAfterFrames" to config.deadObjectInjectAfterFrames,
             "coordinatorThreadId" to Thread.currentThread().id,
         )
-        val outcomes = ArrayList<ScenarioOutcome>(2)
+        val outcomes = ArrayList<ScenarioOutcome>(3)
         if (config.pauseHoldMs <= 0L || config.pauseHoldMs >= config.maxPauseHoldMs) {
             return buildPayload(false, "invalid_pause_hold:${config.pauseHoldMs}:${config.maxPauseHoldMs}", emptyList(), metrics)
         }
-        outcomes += runScenario(SCENARIO_PLAYTHROUGH, config) { session, outcome -> playthroughScenario(session, config, outcome) }
+        if (config.deadObjectInjectAfterFrames <= 0L) {
+            return buildPayload(false, "invalid_dead_object_inject_after_frames:${config.deadObjectInjectAfterFrames}", emptyList(), metrics)
+        }
+        // Y8a baseline scenarios run with the dead-object seam OFF.
+        outcomes += runScenario(SCENARIO_PLAYTHROUGH, config, injectAfterFrames = 0L) { session, outcome ->
+            playthroughScenario(session, config, outcome)
+        }
         if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
-        outcomes += runScenario(SCENARIO_STOP_DISPOSE, config) { session, outcome -> stopDisposeScenario(session, config, outcome) }
+        outcomes += runScenario(SCENARIO_STOP_DISPOSE, config, injectAfterFrames = 0L) { session, outcome ->
+            stopDisposeScenario(session, config, outcome)
+        }
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y8b: the ONE synthetic dead object is armed for this scenario only.
+        outcomes += runScenario(SCENARIO_DEAD_OBJECT_RECOVERY, config, injectAfterFrames = config.deadObjectInjectAfterFrames) { session, outcome ->
+            deadObjectRecoveryScenario(session, config, outcome)
+        }
 
         val lanes = aggregateLanes(outcomes)
         val firstFailure = outcomes.firstOrNull { it.failureReason.isNotBlank() }?.let { "${it.name}:${it.failureReason}" } ?: ""
@@ -217,6 +271,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
     private fun runScenario(
         name: String,
         config: SmokeConfig,
+        injectAfterFrames: Long,
         body: (VanguardRealtimeAudioPlaybackSession, ScenarioOutcome) -> Unit,
     ): ScenarioOutcome {
         val outcome = ScenarioOutcome(name)
@@ -229,8 +284,10 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 deadlineMs = config.deadlineMs,
                 maxPauseHoldMs = config.maxPauseHoldMs,
                 threadNamePrefix = "Y8a$name",
+                syntheticDeadObjectInjectAfterFrames = injectAfterFrames,
             ),
         )
+        outcome.metrics["deadObjectInjectAfterFrames"] = injectAfterFrames
         activeSession = session
         val wallStart = SystemClock.elapsedRealtime()
         try {
@@ -286,8 +343,38 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         session.dispose()
         session.dispose()
         val final = session.snapshot()
-        evaluateCommon(final, out)
+        evaluateCommon(final, baselineExpectation, out)
         evaluatePlaythrough(final, holdStart, holdEnd, stateAtCompletion, config, out)
+    }
+
+    // ── Scenario 3 (Y8b): load/start -> armed synthetic dead object ->
+    //    sink-thread recovery -> EOS ───────────────────────────────────────
+
+    private fun deadObjectRecoveryScenario(session: VanguardRealtimeAudioPlaybackSession, config: SmokeConfig, out: ScenarioOutcome) {
+        startAndAwaitAudio(session)
+        val waitStart = SystemClock.elapsedRealtime()
+        var afterRecovery: VanguardRealtimeAudioPlaybackSession.Snapshot
+        while (true) {
+            val snap = session.snapshot()
+            require(snap.failureReason.isBlank(), "failure_before_recovery:${snap.failureReason}")
+            val k = snap.sink ?: throw FailClosed("sink_missing_before_recovery")
+            if (k.deadObjectRecoveryCount == 1) {
+                afterRecovery = snap
+                break
+            }
+            require(k.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_RUNNING, "sink_exited_before_recovery:${k.exitReason}")
+            require(SystemClock.elapsedRealtime() - waitStart < config.deadlineMs, "recovery_not_observed:${k.framesWrittenToSink}")
+            SystemClock.sleep(WAIT_SLICE_MS)
+        }
+        require(session.awaitCompletion(config.deadlineMs), "completion_not_reached:${session.failureReason}")
+        val stateAtCompletion = session.currentState
+        val stopRes = session.stop()
+        require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
+        session.dispose()
+        session.dispose()
+        val final = session.snapshot()
+        evaluateCommon(final, deadObjectExpectation, out)
+        evaluateDeadObjectRecovery(final, afterRecovery, stateAtCompletion, config, out)
     }
 
     // ── Scenario 2: load/start -> stop/dispose before EOS ──────────────────
@@ -319,7 +406,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         out.metrics["stateAfterDispose"] = stateAfterDispose.name
         out.metrics["stateAfterSecondDispose"] = stateAfterSecondDispose.name
         out.metrics["framesWrittenBeforeStop"] = sinkBefore.framesWrittenToSink
-        evaluateCommon(final, out)
+        evaluateCommon(final, baselineExpectation, out)
         out.lanes[LANE_STOP_DISPOSE] = stopRes.accepted && stopRes.state == VanguardRealtimeAudioPlaybackSession.State.STOPPED &&
             stateAfterStop == VanguardRealtimeAudioPlaybackSession.State.STOPPED &&
             stateAfterDispose == VanguardRealtimeAudioPlaybackSession.State.DISPOSED &&
@@ -338,7 +425,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
 
     // ── Lane evaluation ────────────────────────────────────────────────────
 
-    private fun evaluateCommon(final: VanguardRealtimeAudioPlaybackSession.Snapshot, out: ScenarioOutcome) {
+    private fun evaluateCommon(
+        final: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        expect: SinkExpectation,
+        out: ScenarioOutcome,
+    ) {
         val fmt = final.format ?: throw FailClosed("format_missing")
         val sink = final.sink ?: throw FailClosed("sink_missing")
         val clock = final.clock ?: throw FailClosed("clock_missing")
@@ -352,7 +443,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             final.sinkReadyBeforeTransportStart && final.drainAllowedAfterTransportStart &&
             sink.drainCallsBeforeAllow == 0L && sink.firstDrainAtMs >= final.drainAllowedAtMs && sink.drainCalls > 0L
         out.lanes[LANE_NONZERO_GAIN] = sink.audioTrackInitOk && sink.gainSetOk && sink.gainValue > 0f && sink.played &&
-            sink.initialPlayState == AudioTrack.PLAYSTATE_PLAYING && sink.audioTracksCreated == 1 && sink.framesWrittenToSink > 0L
+            sink.initialPlayState == AudioTrack.PLAYSTATE_PLAYING && sink.audioTracksCreated == expect.audioTracksCreated &&
+            sink.framesWrittenToSink > 0L
         out.lanes[LANE_CLOCK_ANCHORED] = clock.anchoredCount > 0L && clock.timestampSuccessCount > 0L &&
             sink.timestampPollSuccesses == clock.timestampSuccessCount && sink.clockWriterBoundOnSinkThread &&
             clock.writerThreadId == sink.threadId && clock.consistent
@@ -361,8 +453,15 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         out.lanes[LANE_CLOCK_EPOCH_BALANCED] = clock.epochOpenCount == clock.epochCloseCount && clock.epochOpenCount > 0 && !clock.epochOpen &&
             sink.clockEpochOpenCalls == clock.epochOpenCount && sink.clockEpochCloseCalls == clock.epochCloseCount &&
             sink.currentEpoch == VanguardRealtimeAudioPlaybackSinkBridge.EPOCH_NONE
+        // Final release exactly once on every scenario; the dead-object
+        // scenario additionally released the old instance exactly once
+        // through its own counter, so created == final + old releases.
         out.lanes[LANE_AUDIO_TRACK_RELEASED_ONCE] = sink.releaseCount == 1 && sink.releaseExecutedOnSinkThread && final.sinkJoined &&
-            sink.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.EXITED
+            sink.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.EXITED &&
+            sink.deadObjectOldTrackReleaseCount == expect.oldTrackReleases &&
+            sink.audioTracksCreated == sink.releaseCount + sink.deadObjectOldTrackReleaseCount &&
+            sink.deadObjectInjectedCount == expect.deadObjectsInjected && sink.deadObjectObservedCount == expect.deadObjectsObserved &&
+            (sink.syntheticDeadObjectInjectAfterFrames > 0L) == (expect.deadObjectsInjected > 0L)
         out.lanes[LANE_TRANSPORT_DISPOSED] = final.transportDisposeCalls == 1 &&
             final.transportStateAfterDispose == VanguardRealtimePlaybackTransportStateMachine.State.DISPOSED &&
             final.transportState == VanguardRealtimePlaybackTransportStateMachine.State.DISPOSED &&
@@ -377,7 +476,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         out.lanes[LANE_NO_FEEDBACK] = sink.drainRequestSizeChanges == 0L && sink.timestampMaxPollsInOnePass <= 1L &&
             sink.timestampPollAttempts <= sink.productiveDrainPasses &&
             sink.timestampPollAttempts == clock.timestampSuccessCount + clock.timestampUnavailableCount &&
-            clock.snapshotCallsFromWriterThread == sink.clockSnapshotsAtPark && sink.timestampPollsWhileParked == 0L
+            clock.snapshotCallsFromWriterThread == sink.clockSnapshotsAtPark + sink.clockSnapshotsAtDeadObjectRecovery &&
+            sink.timestampPollsWhileParked == 0L
         out.lanes[LANE_PROOF_BOUNDARY] = PROOF_BOUNDARY_TOKENS.all { PROOF_BOUNDARY.contains(it) }
     }
 
@@ -389,11 +489,9 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         config: SmokeConfig,
         out: ScenarioOutcome,
     ) {
-        val fmt = final.format ?: return
+        if (final.format == null) return
         val sink = final.sink ?: return
         val clock = final.clock ?: return
-        val declared = fmt.declaredFrameCount
-        val reply = final.terminalReply
         val atPause = final.clockAtPauseAck
         val beforeResume = final.clockBeforeResume
         val afterResume = final.clockAfterResume
@@ -410,16 +508,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         out.metrics["holdStartClockUpdateCount"] = hsClock?.updateCount ?: -1L
         out.metrics["holdEndClockUpdateCount"] = heClock?.updateCount ?: -1L
 
-        out.lanes[LANE_PLAYTHROUGH_ACCOUNTING] = stateAtCompletion == VanguardRealtimeAudioPlaybackSession.State.COMPLETED &&
-            sink.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_EOS && sink.eosDrainedObserved &&
-            sink.framesReadFromTransport == declared && sink.framesWrittenToSink == declared &&
-            final.decoderExitReason == VanguardRealtimePlaybackDecoderFeed.EXIT_EOS && final.decoderAcceptedFrames == declared &&
-            reply != null && reply.pushedFrames == declared && reply.drainedFrames == declared && reply.discardedFrames == 0L &&
-            final.transportCompletedCallbacks == 1 && final.transportFailedCallbacks == 0 && final.failureReason.isBlank()
-        out.lanes[LANE_CHECKSUM_IDENTITY] = final.decoderChecksumHex.isNotBlank() && reply != null &&
-            final.decoderChecksumHex.equals(reply.pushedChecksumHex, ignoreCase = true) &&
-            final.decoderChecksumHex.equals(reply.drainedChecksumHex, ignoreCase = true) &&
-            final.decoderChecksumHex.equals(sink.checksumHex, ignoreCase = true)
+        out.lanes[LANE_PLAYTHROUGH_ACCOUNTING] = playthroughAccountingOk(final, stateAtCompletion)
+        out.lanes[LANE_CHECKSUM_IDENTITY] = checksumIdentityOk(final)
         out.lanes[LANE_CLOCK_PAUSE_FROZEN] = atPause != null && beforeResume != null && afterResume != null &&
             hs != null && he != null && hsClock != null && heClock != null &&
             !atPause.epochOpen && atPause.epochId == 0 && atPause.provenance == VanguardRealtimePlaybackPresentationClock.Provenance.RESET &&
@@ -441,6 +531,145 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             holdStart.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED && holdEnd.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
             holdStart.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED &&
             holdEnd.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED
+    }
+
+    // Shared by the two EOS scenarios (Y8a playthrough, Y8b dead object).
+    private fun playthroughAccountingOk(
+        final: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        stateAtCompletion: VanguardRealtimeAudioPlaybackSession.State,
+    ): Boolean {
+        val declared = final.format?.declaredFrameCount ?: return false
+        val sink = final.sink ?: return false
+        val reply = final.terminalReply
+        return stateAtCompletion == VanguardRealtimeAudioPlaybackSession.State.COMPLETED &&
+            sink.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_EOS && sink.eosDrainedObserved &&
+            sink.framesReadFromTransport == declared && sink.framesWrittenToSink == declared &&
+            final.decoderExitReason == VanguardRealtimePlaybackDecoderFeed.EXIT_EOS && final.decoderAcceptedFrames == declared &&
+            reply != null && reply.pushedFrames == declared && reply.drainedFrames == declared && reply.discardedFrames == 0L &&
+            final.transportCompletedCallbacks == 1 && final.transportFailedCallbacks == 0 && final.failureReason.isBlank()
+    }
+
+    private fun checksumIdentityOk(final: VanguardRealtimeAudioPlaybackSession.Snapshot): Boolean {
+        val sink = final.sink ?: return false
+        val reply = final.terminalReply ?: return false
+        return final.decoderChecksumHex.isNotBlank() &&
+            final.decoderChecksumHex.equals(reply.pushedChecksumHex, ignoreCase = true) &&
+            final.decoderChecksumHex.equals(reply.drainedChecksumHex, ignoreCase = true) &&
+            final.decoderChecksumHex.equals(sink.checksumHex, ignoreCase = true)
+    }
+
+    // Y8b lanes: the ONE armed synthetic dead object was recovered on the
+    // sink thread with a same-parameter instance, the clock epoch was
+    // closed/reopened at baseFrame = frames written with a non-negative base
+    // step whose decomposition (frames lost with the dead instance + clock
+    // publication lag) holds, and exactly the unwritten
+    // remainder landed on the replacement; the run then reached EOS with
+    // full accounting and checksum identity, and the final release still
+    // happened exactly once.
+    private fun evaluateDeadObjectRecovery(
+        final: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterRecovery: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        stateAtCompletion: VanguardRealtimeAudioPlaybackSession.State,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+    ) {
+        val fmt = final.format ?: return
+        val sink = final.sink ?: return
+        val clock = final.clock ?: return
+        val arSink = afterRecovery.sink
+        val arClock = afterRecovery.clock
+        val declared = fmt.declaredFrameCount
+
+        out.metrics["stateAtCompletion"] = stateAtCompletion.name
+        out.metrics["afterRecoverySinkExitReason"] = arSink?.exitReason ?: "none"
+        out.metrics["afterRecoveryFramesWritten"] = arSink?.framesWrittenToSink ?: -1L
+        out.metrics["afterRecoveryClockEpochId"] = arClock?.epochId ?: -1
+        out.metrics["afterRecoveryClockEpochOpen"] = arClock?.epochOpen ?: false
+        out.metrics["afterRecoveryClockEpochBase"] = arClock?.epochBaseOffsetFrames ?: -1L
+        out.metrics["afterRecoveryClockPosition"] = arClock?.positionFrames ?: -1L
+        out.metrics["afterRecoveryClockTimestampSuccessCount"] = arClock?.timestampSuccessCount ?: -1L
+
+        out.lanes[LANE_PLAYTHROUGH_ACCOUNTING] = playthroughAccountingOk(final, stateAtCompletion)
+        out.lanes[LANE_CHECKSUM_IDENTITY] = checksumIdentityOk(final)
+        out.lanes[LANE_DEAD_OBJECT_RECOVERY] = sink.syntheticDeadObjectInjectAfterFrames == config.deadObjectInjectAfterFrames &&
+            sink.deadObjectInjectedCount == 1L && sink.deadObjectObservedCount == 1L && sink.deadObjectRecoveryCount == 1 &&
+            sink.deadObjectOldTrackReleaseCount == 1 && sink.deadObjectRecoveryExecutedOnSinkThread &&
+            sink.deadObjectNewTrackInitOk && sink.deadObjectNewTrackVolumeOk && sink.deadObjectNewTrackPlayOk &&
+            sink.deadObjectNewTrackPlayState == AudioTrack.PLAYSTATE_PLAYING && sink.deadObjectNewTrackSameBuffer &&
+            sink.deadObjectNewTrackBufferFrames == sink.audioTrackBufferFrames && sink.audioTrackBufferFrames > 0 &&
+            sink.audioTracksCreated == 2 && sink.releaseCount == 1 && sink.gainValue == config.gain &&
+            sink.deadObjectRecoveryWallMs >= 0L && sink.deadObjectTimestampPollsDuringRecovery == 0L &&
+            sink.parkCount == 0 && sink.unparkCount == 0 && sink.audioTrackCallsOffSinkThread == 0L &&
+            arSink != null && arSink.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_RUNNING &&
+            arSink.deadObjectRecoveryCount == 1 && arSink.audioTracksCreated == 2 && arSink.releaseCount == 0 &&
+            sink.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_EOS && final.failureReason.isBlank()
+        out.lanes[LANE_DEAD_OBJECT_CLOCK_EPOCH] = arClock != null &&
+            sink.deadObjectEpochBeforeRecovery == 0 && sink.deadObjectEpochOpenedAfterRecovery == 1 &&
+            sink.deadObjectEpochCloseAccepted && sink.deadObjectEpochOpenAccepted &&
+            sink.clockSnapshotsAtDeadObjectRecovery == 1L && sink.clockSnapshotsAtPark == 0L &&
+            sink.deadObjectPositionBeforeRecovery >= 0L &&
+            sink.deadObjectBaseFrameAfterRecovery == sink.deadObjectFramesWrittenBeforeRecovery &&
+            sink.deadObjectBaseStepFrames == sink.deadObjectBaseFrameAfterRecovery - sink.deadObjectPositionBeforeRecovery &&
+            sink.deadObjectBaseStepFrames >= 0L && sink.deadObjectBaseStepBounded &&
+            deadObjectBaseStepDecompositionOk(sink, config, fmt.sampleRate) &&
+            arClock.epochId == 1 && arClock.epochBaseOffsetFrames == sink.deadObjectBaseFrameAfterRecovery &&
+            arClock.positionFrames >= sink.deadObjectPositionBeforeRecovery &&
+            clock.epochOpenCount == 2 && clock.epochCloseCount == 2 && clock.baseClampCount == 0L &&
+            clock.timestampSuccessCount > arClock.timestampSuccessCount && clock.anchoredCount > arClock.anchoredCount &&
+            clock.positionFrames >= sink.deadObjectBaseFrameAfterRecovery && !clock.epochOpen && clock.epochId == 1 &&
+            sink.rebasedClampCount == 0L
+        out.lanes[LANE_DEAD_OBJECT_REMAINDER] = sink.deadObjectRemainderAccountingOk &&
+            sink.deadObjectSliceBytesAtRecovery > 0L &&
+            sink.deadObjectUnwrittenBytesAtRecovery in 1L..sink.deadObjectSliceBytesAtRecovery &&
+            sink.deadObjectBufferPositionAtRecovery >= 0L &&
+            sink.deadObjectRemainderFramesExpected > 0L &&
+            sink.deadObjectRemainderFramesExpected * 2L * fmt.channelCount == sink.deadObjectUnwrittenBytesAtRecovery &&
+            sink.deadObjectRemainderFramesWrittenOnNewTrack == sink.deadObjectRemainderFramesExpected &&
+            sink.deadObjectFramesWrittenBeforeRecovery >= config.deadObjectInjectAfterFrames &&
+            sink.deadObjectFramesWrittenBeforeRecovery < declared &&
+            sink.deadObjectFramesReadAtRecovery >= sink.deadObjectFramesWrittenBeforeRecovery &&
+            sink.deadObjectFramesReadAtRecovery <= declared &&
+            sink.framesWrittenToSink == declared && sink.framesReadFromTransport == declared
+    }
+
+    // Base-step decomposition (A-prime). With W = frames written before
+    // recovery, H = content head consumed at the dead object, P = last
+    // published position, B = track buffer frames, M = one mix window:
+    //   step = W - P = (W - H) + (H - P).
+    //   Loss bound: when H was readable, 0 <= W - H <= B + M (frames lost
+    //     with the dead instance never exceed what could sit in its buffer
+    //     plus one mix window) and the sink's own decomposition flag holds.
+    //   Publication lag: if the clock was ANCHORED or EXTRAPOLATED at
+    //     recovery, step <= B + M + framesFor(DEAD_OBJECT_PUBLICATION_LAG_BUDGET_MS);
+    //     if RESET or STALE only the sign claim (step >= 0) is asserted and
+    //     the values are reported.
+    private fun deadObjectBaseStepDecompositionOk(
+        sink: VanguardRealtimeAudioPlaybackSinkBridge.Telemetry,
+        config: SmokeConfig,
+        sampleRate: Int,
+    ): Boolean {
+        val w = sink.deadObjectFramesWrittenBeforeRecovery
+        val h = sink.deadObjectContentHeadAtDeadObject
+        val p = sink.deadObjectPositionBeforeRecovery
+        val step = sink.deadObjectBaseStepFrames
+        val lossBound = sink.audioTrackBufferFrames.toLong() + config.maxFramesPerMix.toLong()
+        if (step < 0L || w < 0L || p < 0L) return false
+        if (h >= 0L) {
+            val lost = w - h
+            if (lost !in 0L..lossBound) return false
+            if (sink.deadObjectWrittenAheadOfHeadFrames != lost) return false
+            if (sink.deadObjectPublicationLagFrames != h - p) return false
+            if (!sink.deadObjectBaseStepDecompositionOk) return false
+        }
+        return when (sink.deadObjectClockProvenanceAtRecovery) {
+            VanguardRealtimePlaybackPresentationClock.Provenance.ANCHORED.name,
+            VanguardRealtimePlaybackPresentationClock.Provenance.EXTRAPOLATED.name,
+            -> step <= lossBound + sampleRate.toLong() * DEAD_OBJECT_PUBLICATION_LAG_BUDGET_MS / 1_000L
+            VanguardRealtimePlaybackPresentationClock.Provenance.RESET.name,
+            VanguardRealtimePlaybackPresentationClock.Provenance.STALE.name,
+            -> true
+            else -> false
+        }
     }
 
     // A lane holds only when every scenario that evaluated it passed and at
@@ -566,6 +795,45 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             m["playbackHeadFinal"] = k.playbackHeadFinal
             m["sinkThreadWallMs"] = k.sinkThreadWallMs
             m["sinkChecksumHex"] = k.checksumHex
+            m["audioTrackBufferFrames"] = k.audioTrackBufferFrames
+            m["syntheticDeadObjectInjectAfterFrames"] = k.syntheticDeadObjectInjectAfterFrames
+            m["deadObjectInjectedCount"] = k.deadObjectInjectedCount
+            m["deadObjectObservedCount"] = k.deadObjectObservedCount
+            m["deadObjectRecoveryCount"] = k.deadObjectRecoveryCount
+            m["deadObjectOldTrackReleaseCount"] = k.deadObjectOldTrackReleaseCount
+            m["deadObjectRecoveryExecutedOnSinkThread"] = k.deadObjectRecoveryExecutedOnSinkThread
+            m["deadObjectNewTrackInitOk"] = k.deadObjectNewTrackInitOk
+            m["deadObjectNewTrackVolumeOk"] = k.deadObjectNewTrackVolumeOk
+            m["deadObjectNewTrackPlayOk"] = k.deadObjectNewTrackPlayOk
+            m["deadObjectNewTrackPlayState"] = k.deadObjectNewTrackPlayState
+            m["deadObjectNewTrackSameBuffer"] = k.deadObjectNewTrackSameBuffer
+            m["deadObjectNewTrackBufferFrames"] = k.deadObjectNewTrackBufferFrames
+            m["deadObjectRecoveryWallMs"] = k.deadObjectRecoveryWallMs
+            m["deadObjectEpochBeforeRecovery"] = k.deadObjectEpochBeforeRecovery
+            m["deadObjectEpochOpenedAfterRecovery"] = k.deadObjectEpochOpenedAfterRecovery
+            m["deadObjectEpochCloseAccepted"] = k.deadObjectEpochCloseAccepted
+            m["deadObjectEpochOpenAccepted"] = k.deadObjectEpochOpenAccepted
+            m["deadObjectPositionBeforeRecovery"] = k.deadObjectPositionBeforeRecovery
+            m["deadObjectBaseFrameAfterRecovery"] = k.deadObjectBaseFrameAfterRecovery
+            m["deadObjectBaseStepFrames"] = k.deadObjectBaseStepFrames
+            m["deadObjectBaseStepBounded"] = k.deadObjectBaseStepBounded
+            m["deadObjectContentHeadAtDeadObject"] = k.deadObjectContentHeadAtDeadObject
+            m["deadObjectWrittenAheadOfHeadFrames"] = k.deadObjectWrittenAheadOfHeadFrames
+            m["deadObjectPublicationLagFrames"] = k.deadObjectPublicationLagFrames
+            m["deadObjectBaseStepDecompositionOk"] = k.deadObjectBaseStepDecompositionOk
+            m["deadObjectClockProvenanceAtRecovery"] = k.deadObjectClockProvenanceAtRecovery
+            m["deadObjectClockLastAgeNsAtRecovery"] = k.deadObjectClockLastAgeNsAtRecovery
+            m["deadObjectSliceBytesAtRecovery"] = k.deadObjectSliceBytesAtRecovery
+            m["deadObjectUnwrittenBytesAtRecovery"] = k.deadObjectUnwrittenBytesAtRecovery
+            m["deadObjectBufferPositionAtRecovery"] = k.deadObjectBufferPositionAtRecovery
+            m["deadObjectFramesReadAtRecovery"] = k.deadObjectFramesReadAtRecovery
+            m["deadObjectFramesWrittenBeforeRecovery"] = k.deadObjectFramesWrittenBeforeRecovery
+            m["deadObjectRemainderFramesExpected"] = k.deadObjectRemainderFramesExpected
+            m["deadObjectRemainderFramesWrittenOnNewTrack"] = k.deadObjectRemainderFramesWrittenOnNewTrack
+            m["deadObjectRemainderAccountingOk"] = k.deadObjectRemainderAccountingOk
+            m["deadObjectTimestampPollsDuringRecovery"] = k.deadObjectTimestampPollsDuringRecovery
+            m["sinkClockSnapshotsAtDeadObjectRecovery"] = k.clockSnapshotsAtDeadObjectRecovery
+            m["playbackHeadAtDeadObject"] = k.playbackHeadAtDeadObject
         }
         if (c != null) {
             m["clockConsistent"] = c.consistent
@@ -631,7 +899,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "proofBoundary" to PROOF_BOUNDARY,
             "nativeProofBoundary" to PROOF_BOUNDARY,
             "failureReason" to reason,
-            "details" to "Y8a realtime audio playback production sink/clock smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
+            "details" to "Y8a/Y8b realtime audio playback production sink/clock/dead-object smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
             "lanes" to lanes,
             "metrics" to metricMap,
             "lastError" to if (pass) null else reason,

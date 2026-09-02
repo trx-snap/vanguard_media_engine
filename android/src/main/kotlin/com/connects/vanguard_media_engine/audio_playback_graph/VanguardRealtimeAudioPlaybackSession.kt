@@ -39,7 +39,11 @@ import kotlin.concurrent.withLock
 // the decoder feed's own ingest stall budget is therefore never reached.
 // Stop/dispose: sink cancel, decoder cancel, bounded joins, transport stop
 // (only after both threads exited), terminal snapshot, transport dispose
-// exactly once. No seek, no dead-object recovery.
+// exactly once. No seek. Dead object (Y8b): only the sink's ONE armed
+// synthetic ERROR_DEAD_OBJECT ([Config.syntheticDeadObjectInjectAfterFrames]
+// > 0, default off) is recovered, entirely inside the sink thread's write
+// loop; the session sees a sink that continues to EOS. A real dead object
+// or a second one still exits the sink non-EOS and fails closed here.
 class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
 
     data class Config(
@@ -50,6 +54,9 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         val deadlineMs: Long = 30_000L,
         val maxPauseHoldMs: Long = DEFAULT_MAX_PAUSE_HOLD_MS,
         val threadNamePrefix: String = "VanguardRealtimeAudio",
+        // Y8b diagnostic seam, default OFF (0): forwarded to the sink; see
+        // [VanguardRealtimeAudioPlaybackSinkBridge.Config].
+        val syntheticDeadObjectInjectAfterFrames: Long = 0L,
     )
 
     enum class State { IDLE, STARTING, PLAYING, PAUSED, COMPLETED, STOPPED, FAILED, DISPOSED }
@@ -230,6 +237,7 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         if (!(config.gain > 0f) || config.gain > 1f) return failClosed("invalid_gain")
         if (config.deadlineMs <= 0L) return failClosed("invalid_deadline")
         if (config.maxPauseHoldMs <= 0L) return failClosed("invalid_max_pause_hold")
+        if (config.syntheticDeadObjectInjectAfterFrames < 0L) return failClosed("invalid_dead_object_inject_after_frames")
         state = State.STARTING
         generation++
         sessionStartedAtMs = SystemClock.elapsedRealtime()
@@ -314,6 +322,7 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
                 threadName = "${config.threadNamePrefix}Sink",
                 externallyCancelled = { cancelled.get() },
                 onExited = { reason -> onSinkExited(reason) },
+                syntheticDeadObjectInjectAfterFrames = config.syntheticDeadObjectInjectAfterFrames,
             ),
         )
         sink = s

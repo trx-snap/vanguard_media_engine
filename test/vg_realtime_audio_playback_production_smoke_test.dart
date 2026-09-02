@@ -1,6 +1,7 @@
 // vg_realtime_audio_playback_production_smoke_test.dart
-// vanguard_media_engine - P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a): Android True-DAG Phase 4
-// realtime audio playback production sink and clock diagnostic smoke foundation
+// vanguard_media_engine - P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a) +
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, and dead-object diagnostic smoke foundation
 // Dart model and MethodChannel unit tests.
 
 import 'package:flutter/services.dart';
@@ -8,7 +9,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
 const _kCanonicalProofBoundary =
-    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_stop_dispose_release_once_no_seek_no_dead_object_recovery_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
+    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_stop_dispose_release_once_no_seek_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
 
 const _kPassMarker =
     'ANDROID_DAG_PHASE4_REALTIME_AUDIO_PLAYBACK_PRODUCTION_PHYSICAL_SMOKE_PASS';
@@ -39,6 +40,9 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'threadOwnershipOk': true,
     'noFeedbackOk': true,
     'proofBoundaryOk': true,
+    'syntheticDeadObjectRecoveryOk': true,
+    'deadObjectClockEpochRebaseOk': true,
+    'deadObjectRemainderAccountingOk': true,
     'canonical': true,
   };
 
@@ -54,6 +58,46 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'pauseHoldMs': 400,
     'maxPauseHoldMs': 3000,
     'stopAfterMs': 300,
+    'deadObjectInjectAfterFrames': 8192,
+    'syntheticDeadObjectInjectAfterFrames': 8192,
+    'audioTrackBufferFrames': 3840,
+    'deadObjectInjectedCount': 1,
+    'deadObjectObservedCount': 1,
+    'deadObjectRecoveryCount': 1,
+    'deadObjectOldTrackReleaseCount': 1,
+    'deadObjectRecoveryExecutedOnSinkThread': true,
+    'deadObjectNewTrackInitOk': true,
+    'deadObjectNewTrackVolumeOk': true,
+    'deadObjectNewTrackPlayOk': true,
+    'deadObjectNewTrackPlayState': 3,
+    'deadObjectNewTrackSameBuffer': true,
+    'deadObjectNewTrackBufferFrames': 3840,
+    'deadObjectRecoveryWallMs': 5,
+    'deadObjectEpochBeforeRecovery': 0,
+    'deadObjectEpochOpenedAfterRecovery': 1,
+    'deadObjectEpochCloseAccepted': true,
+    'deadObjectEpochOpenAccepted': true,
+    'deadObjectPositionBeforeRecovery': 1920,
+    'deadObjectBaseFrameAfterRecovery': 8192,
+    'deadObjectBaseStepFrames': 6272,
+    'deadObjectBaseStepBounded': true,
+    'deadObjectContentHeadAtDeadObject': 6400,
+    'deadObjectWrittenAheadOfHeadFrames': 1792,
+    'deadObjectPublicationLagFrames': 4480,
+    'deadObjectBaseStepDecompositionOk': true,
+    'deadObjectClockProvenanceAtRecovery': 'ANCHORED',
+    'deadObjectClockLastAgeNsAtRecovery': 15000000,
+    'deadObjectSliceBytesAtRecovery': 1024,
+    'deadObjectUnwrittenBytesAtRecovery': 512,
+    'deadObjectBufferPositionAtRecovery': 512,
+    'deadObjectFramesReadAtRecovery': 8192,
+    'deadObjectFramesWrittenBeforeRecovery': 8192,
+    'deadObjectRemainderFramesExpected': 128,
+    'deadObjectRemainderFramesWrittenOnNewTrack': 128,
+    'deadObjectRemainderAccountingOk': true,
+    'deadObjectTimestampPollsDuringRecovery': 0,
+    'sinkClockSnapshotsAtDeadObjectRecovery': 1,
+    'playbackHeadAtDeadObject': 6400,
     'coordinatorThreadId': 100,
     'preRollFrames': 4096,
     'pauseHoldObservedMs': 402,
@@ -82,7 +126,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'nativeProofBoundary': _kCanonicalProofBoundary,
     'failureReason': '',
     'details':
-        'Y8a realtime audio playback production sink/clock smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK',
+        'Y8a/Y8b realtime audio playback production sink/clock/dead-object smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS',
     'lanes': lanes,
     'metrics': metrics,
     'lastError': null,
@@ -151,11 +195,11 @@ void main() {
         VGRealtimeAudioPlaybackProductionSmokeReport
             .requiredNonCanonicalLanes
             .length,
-        equals(18),
+        equals(21),
       );
       expect(
         VGRealtimeAudioPlaybackProductionSmokeReport.requiredLanes.length,
-        equals(19),
+        equals(22),
       );
 
       final expectedLanes = <String>[
@@ -177,6 +221,9 @@ void main() {
         'threadOwnershipOk',
         'noFeedbackOk',
         'proofBoundaryOk',
+        'syntheticDeadObjectRecoveryOk',
+        'deadObjectClockEpochRebaseOk',
+        'deadObjectRemainderAccountingOk',
         'canonical',
       ];
 
@@ -221,11 +268,135 @@ void main() {
       expect(report.threadOwnershipOk, isTrue);
       expect(report.noFeedbackOk, isTrue);
       expect(report.proofBoundaryOk, isTrue);
+      expect(report.syntheticDeadObjectRecoveryOk, isTrue);
+      expect(report.deadObjectClockEpochRebaseOk, isTrue);
+      expect(report.deadObjectRemainderAccountingOk, isTrue);
       expect(report.canonical, isTrue);
       expect(report.allRequiredNonCanonicalLanesPass, isTrue);
 
       expect(report.metrics['sampleRate'], equals(48000));
       expect(report.metrics['gain'], equals(0.5));
+      expect(report.metrics['deadObjectInjectAfterFrames'], equals(8192));
+      expect(report.metrics['deadObjectRecoveryCount'], equals(1));
+      expect(report.metrics['deadObjectRemainderAccountingOk'], isTrue);
+      expect(report.metrics['audioTrackBufferFrames'], equals(3840));
+      expect(report.metrics['deadObjectPositionBeforeRecovery'], equals(1920));
+      expect(report.metrics['deadObjectBaseStepFrames'], equals(6272));
+      expect(report.metrics['deadObjectBaseStepBounded'], isTrue);
+      expect(report.metrics['deadObjectContentHeadAtDeadObject'], equals(6400));
+      expect(
+        report.metrics['deadObjectWrittenAheadOfHeadFrames'],
+        equals(1792),
+      );
+      expect(report.metrics['deadObjectPublicationLagFrames'], equals(4480));
+      expect(report.metrics['deadObjectBaseStepDecompositionOk'], isTrue);
+      expect(
+        report.metrics['deadObjectClockProvenanceAtRecovery'],
+        equals('ANCHORED'),
+      );
+      expect(
+        report.metrics['deadObjectClockLastAgeNsAtRecovery'],
+        equals(15000000),
+      );
+      expect(report.metrics['playbackHeadAtDeadObject'], equals(6400));
+    });
+
+    test(
+      'new Y8b dead-object metric keys parse and are present in metrics map',
+      () {
+        final report = _createSampleReport();
+        expect(
+          report.metrics.containsKey('deadObjectContentHeadAtDeadObject'),
+          isTrue,
+        );
+        expect(
+          report.metrics['deadObjectContentHeadAtDeadObject'],
+          equals(6400),
+        );
+        expect(
+          report.metrics.containsKey('deadObjectWrittenAheadOfHeadFrames'),
+          isTrue,
+        );
+        expect(
+          report.metrics['deadObjectWrittenAheadOfHeadFrames'],
+          equals(1792),
+        );
+        expect(
+          report.metrics.containsKey('deadObjectPublicationLagFrames'),
+          isTrue,
+        );
+        expect(report.metrics['deadObjectPublicationLagFrames'], equals(4480));
+        expect(
+          report.metrics.containsKey('deadObjectBaseStepDecompositionOk'),
+          isTrue,
+        );
+        expect(report.metrics['deadObjectBaseStepDecompositionOk'], isTrue);
+        expect(
+          report.metrics.containsKey('deadObjectClockProvenanceAtRecovery'),
+          isTrue,
+        );
+        expect(
+          report.metrics['deadObjectClockProvenanceAtRecovery'],
+          equals('ANCHORED'),
+        );
+        expect(
+          report.metrics.containsKey('deadObjectClockLastAgeNsAtRecovery'),
+          isTrue,
+        );
+        expect(
+          report.metrics['deadObjectClockLastAgeNsAtRecovery'],
+          equals(15000000),
+        );
+      },
+    );
+
+    test('missing one new required Y8b lane fails isVerifiedPass', () {
+      for (final lane in <String>[
+        'syntheticDeadObjectRecoveryOk',
+        'deadObjectClockEpochRebaseOk',
+        'deadObjectRemainderAccountingOk',
+      ]) {
+        final raw = _createSampleRawMap();
+        final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
+        lanes.remove(lane);
+        raw['lanes'] = lanes;
+        if (raw['metrics'] is Map) {
+          final metrics = Map<String, Object?>.from(raw['metrics'] as Map);
+          metrics.remove(lane);
+          raw['metrics'] = metrics;
+        }
+        raw.remove(lane);
+
+        final report = VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(
+          raw,
+        );
+        expect(report.pass, isFalse);
+        expect(report.isVerifiedPass, isFalse);
+        expect(report.marker, equals(_kFailMarker));
+        expect(report.status, equals('missing_lane'));
+        expect(report.lastError, equals('missing_lane_$lane'));
+      }
+    });
+
+    test('fail map with deadObjectBaseStepBounded=false fails validation', () {
+      final report = _createSampleReport(<String, Object?>{
+        'pass': false,
+        'status': 'fail',
+        'marker': _kFailMarker,
+        'failureReason': 'dead_object_base_step_negative',
+        'deadObjectClockEpochRebaseOk': false,
+        'deadObjectBaseStepBounded': false,
+        'canonical': false,
+      });
+
+      expect(report.pass, isFalse);
+      expect(report.isVerifiedPass, isFalse);
+      expect(report.hasPassMarker, isFalse);
+      expect(report.hasFailMarker, isTrue);
+      expect(report.status, equals('fail'));
+      expect(report.failureReason, equals('dead_object_base_step_negative'));
+      expect(report.lastError, equals('dead_object_base_step_negative'));
+      expect(report.metrics['deadObjectBaseStepBounded'], isFalse);
     });
 
     test('missing required lane fails validation', () {
@@ -368,6 +539,7 @@ void main() {
               pauseHoldMs: 400,
               maxPauseHoldMs: 3000,
               stopAfterMs: 300,
+              deadObjectInjectAfterFrames: 8192,
             );
 
         expect(
@@ -382,11 +554,32 @@ void main() {
         expect(invokedArguments?['pauseHoldMs'], equals(400));
         expect(invokedArguments?['maxPauseHoldMs'], equals(3000));
         expect(invokedArguments?['stopAfterMs'], equals(300));
+        expect(invokedArguments?['deadObjectInjectAfterFrames'], equals(8192));
         expect(report.pass, isTrue);
         expect(report.isVerifiedPass, isTrue);
         expect(report.hasPassMarker, isTrue);
       },
     );
+
+    test('method route passes custom deadObjectInjectAfterFrames', () async {
+      Map<Object?, Object?>? invokedArguments;
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (
+        MethodCall call,
+      ) async {
+        invokedArguments = call.arguments as Map<Object?, Object?>?;
+        if (call.method == 'runRealtimeAudioPlaybackProductionSmoke') {
+          return _createSampleRawMap();
+        }
+        return null;
+      });
+
+      await VGRealtimeAudioPlaybackProductionSmokeReport.runRealtimeAudioPlaybackProductionSmoke(
+        sourcePath: '/tmp/test_clip.mov',
+        deadObjectInjectAfterFrames: 16384,
+      );
+
+      expect(invokedArguments?['deadObjectInjectAfterFrames'], equals(16384));
+    });
 
     test(
       'PlatformException produces failed report instead of uncaught exception',

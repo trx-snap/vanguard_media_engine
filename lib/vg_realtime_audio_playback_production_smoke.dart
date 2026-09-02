@@ -1,17 +1,19 @@
 // vg_realtime_audio_playback_production_smoke.dart
-// vanguard_media_engine - P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a): Android True-DAG Phase 4
-// realtime audio playback production sink and clock diagnostic smoke foundation.
+// vanguard_media_engine - P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a) +
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, and dead-object diagnostic smoke foundation.
 //
 // Pure Dart typed model + invocation wrapper over the native
 // `runRealtimeAudioPlaybackProductionSmoke` MethodChannel route.
 // Diagnostic-only - drives the production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
-// sink-thread-owned non-zero-gain AudioTrack + presentation clock) through two
+// sink-thread-owned non-zero-gain AudioTrack + presentation clock) through three
 // scenarios:
 //   1. Playthrough + bounded pause/resume to EOS.
 //   2. Mid-playback stop/dispose verifying clean release.
+//   3. Synthetic dead-object recovery to EOS.
 //
-// Required proof lanes (18 native lanes + canonical = 19 total):
+// Required proof lanes (21 native lanes + canonical = 22 total):
 //   1. formatProbeOk: format, duration, channel count, sample rate, and MIME probed successfully
 //   2. preRollOk: pre-roll while PREPARED until ring_full or declared end fits
 //   3. startOk: session and transport transition to PLAYING accepted cleanly
@@ -30,10 +32,20 @@
 //  16. threadOwnershipOk: strict thread ownership across decode, transport, and sink
 //  17. noFeedbackOk: no audio feedback loop or invalid gain ramp detected
 //  18. proofBoundaryOk: proof boundary string matches canonical contract exactly
-//  19. canonical: aggregate pass evaluation holding across all required lanes
+//  19. syntheticDeadObjectRecoveryOk: armed synthetic dead object recovered cleanly on sink thread
+//  20. deadObjectClockEpochRebaseOk: presentation clock epoch rebase bounded and monotonic
+//  21. deadObjectRemainderAccountingOk: unwritten remainder frames accounted and played on replacement track
+//  22. canonical: aggregate pass evaluation holding across all required lanes
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_stop_dispose_release_once_no_seek_no_dead_object_recovery_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_stop_dispose_release_once_no_seek_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
+//
+// Honest operational non-claims:
+//   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
+//     one mix window of already-written content may be discarded with the dead
+//     instance.
+//   - 300 ms publication lag is device observability budget, not latency/SLA.
+//   - Checksum identity is over frames handed to write, not frames audibly presented.
 
 import 'dart:async';
 
@@ -43,6 +55,13 @@ import 'package:flutter/services.dart';
 /// Typed report returned by
 /// [VGRealtimeAudioPlaybackProductionSmokeReport.runRealtimeAudioPlaybackProductionSmoke],
 /// mirroring the native Kotlin smoke coordinator's payload map.
+///
+/// Honest operational non-claims:
+///   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
+///     one mix window of already-written content may be discarded with the dead
+///     instance.
+///   - 300 ms publication lag is device observability budget, not latency/SLA.
+///   - Checksum identity is over frames handed to write, not frames audibly presented.
 @immutable
 class VGRealtimeAudioPlaybackProductionSmokeReport {
   const VGRealtimeAudioPlaybackProductionSmokeReport({
@@ -71,6 +90,9 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     required this.threadOwnershipOk,
     required this.noFeedbackOk,
     required this.proofBoundaryOk,
+    required this.syntheticDeadObjectRecoveryOk,
+    required this.deadObjectClockEpochRebaseOk,
+    required this.deadObjectRemainderAccountingOk,
     required this.canonical,
     required this.lanes,
     required this.metrics,
@@ -99,7 +121,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
 
   /// Canonical proof boundary string emitted by the native harness.
   static const String proofBoundaryConstant =
-      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_stop_dispose_release_once_no_seek_no_dead_object_recovery_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
+      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_stop_dispose_release_once_no_seek_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
 
   /// All required non-canonical native lane keys that must be evaluated and true.
   static const List<String> requiredNonCanonicalLanes = <String>[
@@ -121,6 +143,9 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     'threadOwnershipOk',
     'noFeedbackOk',
     'proofBoundaryOk',
+    'syntheticDeadObjectRecoveryOk',
+    'deadObjectClockEpochRebaseOk',
+    'deadObjectRemainderAccountingOk',
   ];
 
   /// All required native lane keys including canonical.
@@ -206,6 +231,15 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Whether proof boundary string matches canonical contract exactly.
   final bool proofBoundaryOk;
 
+  /// Whether the armed synthetic dead object was recovered cleanly on sink thread.
+  final bool syntheticDeadObjectRecoveryOk;
+
+  /// Whether the presentation clock epoch rebase was bounded and monotonic across dead-object recovery.
+  final bool deadObjectClockEpochRebaseOk;
+
+  /// Whether unwritten remainder frames were accounted for and played on replacement AudioTrack.
+  final bool deadObjectRemainderAccountingOk;
+
   /// Canonical pass indicator.
   final bool canonical;
 
@@ -254,7 +288,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       audioTrackReleasedOnceOk &&
       threadOwnershipOk &&
       noFeedbackOk &&
-      proofBoundaryOk;
+      proofBoundaryOk &&
+      syntheticDeadObjectRecoveryOk &&
+      deadObjectClockEpochRebaseOk &&
+      deadObjectRemainderAccountingOk;
 
   /// Whether this report meets all verification criteria for a passing smoke run.
   bool get isVerifiedPass =>
@@ -297,6 +334,9 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         threadOwnershipOk: false,
         noFeedbackOk: false,
         proofBoundaryOk: false,
+        syntheticDeadObjectRecoveryOk: false,
+        deadObjectClockEpochRebaseOk: false,
+        deadObjectRemainderAccountingOk: false,
         canonical: false,
         lanes: <String, Object?>{
           'status': 'FAIL',
@@ -404,6 +444,15 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     final threadOwnershipOk = parseBool('threadOwnershipOk');
     final noFeedbackOk = parseBool('noFeedbackOk');
     final proofBoundaryOk = parseBool('proofBoundaryOk');
+    final syntheticDeadObjectRecoveryOk = parseBool(
+      'syntheticDeadObjectRecoveryOk',
+    );
+    final deadObjectClockEpochRebaseOk = parseBool(
+      'deadObjectClockEpochRebaseOk',
+    );
+    final deadObjectRemainderAccountingOk = parseBool(
+      'deadObjectRemainderAccountingOk',
+    );
     final canonical = parseBool('canonical', rawPass && missingLanes.isEmpty);
 
     final hasValidProofBoundary =
@@ -430,7 +479,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         audioTrackReleasedOnceOk &&
         threadOwnershipOk &&
         noFeedbackOk &&
-        proofBoundaryOk;
+        proofBoundaryOk &&
+        syntheticDeadObjectRecoveryOk &&
+        deadObjectClockEpochRebaseOk &&
+        deadObjectRemainderAccountingOk;
 
     final allRequiredLanesPresent = missingLanes.isEmpty;
     final explicitLastError = parseString('lastError');
@@ -509,6 +561,9 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'threadOwnershipOk': threadOwnershipOk,
       'noFeedbackOk': noFeedbackOk,
       'proofBoundaryOk': proofBoundaryOk,
+      'syntheticDeadObjectRecoveryOk': syntheticDeadObjectRecoveryOk,
+      'deadObjectClockEpochRebaseOk': deadObjectClockEpochRebaseOk,
+      'deadObjectRemainderAccountingOk': deadObjectRemainderAccountingOk,
       'canonical': canonical,
       ...parsedLanes,
     };
@@ -539,6 +594,9 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       threadOwnershipOk: threadOwnershipOk,
       noFeedbackOk: noFeedbackOk,
       proofBoundaryOk: proofBoundaryOk,
+      syntheticDeadObjectRecoveryOk: syntheticDeadObjectRecoveryOk,
+      deadObjectClockEpochRebaseOk: deadObjectClockEpochRebaseOk,
+      deadObjectRemainderAccountingOk: deadObjectRemainderAccountingOk,
       canonical: canonical,
       lanes: Map<String, Object?>.unmodifiable(finalLanes),
       metrics: Map<String, Object?>.unmodifiable(parsedMetrics),
@@ -607,6 +665,9 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       threadOwnershipOk: false,
       noFeedbackOk: false,
       proofBoundaryOk: false,
+      syntheticDeadObjectRecoveryOk: false,
+      deadObjectClockEpochRebaseOk: false,
+      deadObjectRemainderAccountingOk: false,
       canonical: false,
       lanes: Map<String, Object?>.unmodifiable(lanes),
       metrics: Map<String, Object?>.unmodifiable(metrics),
@@ -626,6 +687,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// [pauseHoldMs] duration of pause hold in milliseconds (default 400).
   /// [maxPauseHoldMs] maximum allowed pause hold in milliseconds.
   /// [stopAfterMs] duration to play before mid-playback stop in milliseconds (default 300).
+  /// [deadObjectInjectAfterFrames] frames written before synthetic dead object is armed (default 8192).
   /// [timeout] optionally bounds the invocation (defaults to 40 seconds).
   /// [channel] may be injected for testing; defaults to the shared
   /// `vanguard_media_engine` MethodChannel.
@@ -639,6 +701,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     int pauseHoldMs = 400,
     int? maxPauseHoldMs,
     int stopAfterMs = 300,
+    int deadObjectInjectAfterFrames = 8192,
     Duration timeout = const Duration(seconds: 40),
     MethodChannel? channel,
   }) async {
@@ -653,6 +716,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         'pauseHoldMs': pauseHoldMs,
         'maxPauseHoldMs': ?maxPauseHoldMs,
         'stopAfterMs': stopAfterMs,
+        'deadObjectInjectAfterFrames': deadObjectInjectAfterFrames,
       });
       final raw = await future.timeout(timeout);
       return VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(raw);
@@ -706,6 +770,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         other.threadOwnershipOk == threadOwnershipOk &&
         other.noFeedbackOk == noFeedbackOk &&
         other.proofBoundaryOk == proofBoundaryOk &&
+        other.syntheticDeadObjectRecoveryOk == syntheticDeadObjectRecoveryOk &&
+        other.deadObjectClockEpochRebaseOk == deadObjectClockEpochRebaseOk &&
+        other.deadObjectRemainderAccountingOk ==
+            deadObjectRemainderAccountingOk &&
         other.canonical == canonical &&
         other.lastError == lastError;
   }
@@ -732,6 +800,15 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     boundedPauseResumeOk,
     stopDisposeOk,
     decoderCancelledOnStopOk,
+    transportDisposedOk,
+    audioTrackReleasedOnceOk,
+    threadOwnershipOk,
+    noFeedbackOk,
+    proofBoundaryOk,
+    syntheticDeadObjectRecoveryOk,
+    deadObjectClockEpochRebaseOk,
+    deadObjectRemainderAccountingOk,
+    canonical,
   ]);
 
   @override
@@ -747,5 +824,8 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'decoderCancelledOnStopOk: $decoderCancelledOnStopOk, transportDisposedOk: $transportDisposedOk, '
       'audioTrackReleasedOnceOk: $audioTrackReleasedOnceOk, threadOwnershipOk: $threadOwnershipOk, '
       'noFeedbackOk: $noFeedbackOk, proofBoundaryOk: $proofBoundaryOk, '
+      'syntheticDeadObjectRecoveryOk: $syntheticDeadObjectRecoveryOk, '
+      'deadObjectClockEpochRebaseOk: $deadObjectClockEpochRebaseOk, '
+      'deadObjectRemainderAccountingOk: $deadObjectRemainderAccountingOk, '
       'canonical: $canonical, failureReason: $failureReason, lastError: $lastError)';
 }

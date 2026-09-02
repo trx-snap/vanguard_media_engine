@@ -1,13 +1,21 @@
 // android_realtime_audio_playback_production_physical_smoke.dart
-// vanguard_media_engine - P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a): Android True-DAG Phase 4
-// realtime audio playback production sink and clock diagnostic physical smoke target.
+// vanguard_media_engine - P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a) +
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, and dead-object diagnostic physical smoke target.
 //
 // Component diagnostic smoke: drives production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
 // sink-thread-owned non-zero-gain AudioTrack + presentation clock).
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_stop_dispose_release_once_no_seek_no_dead_object_recovery_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_stop_dispose_release_once_no_seek_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
+//
+// Honest operational non-claims:
+//   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
+//     one mix window of already-written content may be discarded with the dead
+//     instance.
+//   - 300 ms publication lag is device observability budget, not latency/SLA.
+//   - Checksum identity is over frames handed to write, not frames audibly presented.
 //
 // This is a component diagnostic smoke. It must not claim
 // product/editor/UI/ConnectsApp/iOS/streaming/cache/CPP/JNI proof.
@@ -46,7 +54,7 @@ class AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp
 class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     extends State<AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp> {
   String _status =
-      'Running Android DAG Phase 4 Realtime Audio Playback Production Sink & Clock smoke...';
+      'Running Android DAG Phase 4 Realtime Audio Playback Production Sink, Clock & Dead-Object smoke...';
 
   @override
   void initState() {
@@ -132,6 +140,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
             deadlineMs: 30000,
             pauseHoldMs: 400,
             stopAfterMs: 300,
+            deadObjectInjectAfterFrames: 8192,
             timeout: const Duration(seconds: 40),
           );
     } on TimeoutException catch (te) {
@@ -203,6 +212,15 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print('  [LANE] threadOwnershipOk: ${activeReport.threadOwnershipOk}');
     print('  [LANE] noFeedbackOk: ${activeReport.noFeedbackOk}');
     print('  [LANE] proofBoundaryOk: ${activeReport.proofBoundaryOk}');
+    print(
+      '  [LANE] syntheticDeadObjectRecoveryOk: ${activeReport.syntheticDeadObjectRecoveryOk}',
+    );
+    print(
+      '  [LANE] deadObjectClockEpochRebaseOk: ${activeReport.deadObjectClockEpochRebaseOk}',
+    );
+    print(
+      '  [LANE] deadObjectRemainderAccountingOk: ${activeReport.deadObjectRemainderAccountingOk}',
+    );
     print('  [LANE] canonical: ${activeReport.canonical}');
 
     // 4. Print key metrics needed for human/Codex review.
@@ -215,6 +233,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
 
     const playthroughScenarioKey = 'PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS';
     const stopDisposeScenarioKey = 'STOP_DISPOSE_MID_PLAYBACK';
+    const deadObjectScenarioKey = 'SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS';
 
     final topMetrics = activeReport.metrics;
     final playthroughMetrics = asStringKeyedMap(
@@ -223,11 +242,67 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     final stopDisposeMetrics = asStringKeyedMap(
       topMetrics[stopDisposeScenarioKey],
     );
+    final deadObjectMetrics = asStringKeyedMap(
+      topMetrics[deadObjectScenarioKey],
+    );
+
+    const deadObjectScenarioOwnedKeys = <String>{
+      'syntheticDeadObjectInjectAfterFrames',
+      'deadObjectInjectedCount',
+      'deadObjectObservedCount',
+      'deadObjectRecoveryCount',
+      'deadObjectOldTrackReleaseCount',
+      'deadObjectRecoveryExecutedOnSinkThread',
+      'deadObjectNewTrackInitOk',
+      'deadObjectNewTrackVolumeOk',
+      'deadObjectNewTrackPlayOk',
+      'deadObjectNewTrackPlayState',
+      'deadObjectNewTrackSameBuffer',
+      'deadObjectNewTrackBufferFrames',
+      'deadObjectRecoveryWallMs',
+      'deadObjectEpochBeforeRecovery',
+      'deadObjectEpochOpenedAfterRecovery',
+      'deadObjectEpochCloseAccepted',
+      'deadObjectEpochOpenAccepted',
+      'deadObjectPositionBeforeRecovery',
+      'deadObjectBaseFrameAfterRecovery',
+      'deadObjectBaseStepFrames',
+      'deadObjectBaseStepBounded',
+      'deadObjectContentHeadAtDeadObject',
+      'deadObjectWrittenAheadOfHeadFrames',
+      'deadObjectPublicationLagFrames',
+      'deadObjectBaseStepDecompositionOk',
+      'deadObjectClockProvenanceAtRecovery',
+      'deadObjectClockLastAgeNsAtRecovery',
+      'deadObjectSliceBytesAtRecovery',
+      'deadObjectUnwrittenBytesAtRecovery',
+      'deadObjectBufferPositionAtRecovery',
+      'deadObjectFramesReadAtRecovery',
+      'deadObjectFramesWrittenBeforeRecovery',
+      'deadObjectRemainderFramesExpected',
+      'deadObjectRemainderFramesWrittenOnNewTrack',
+      'deadObjectRemainderAccountingOk',
+      'deadObjectTimestampPollsDuringRecovery',
+      'sinkClockSnapshotsAtDeadObjectRecovery',
+      'playbackHeadAtDeadObject',
+    };
+
+    bool isDeadObjectOwnedMetric(String key) {
+      return key.startsWith('deadObject') ||
+          deadObjectScenarioOwnedKeys.contains(key);
+    }
 
     Object? lookupMetric(String key) {
+      if (isDeadObjectOwnedMetric(key)) {
+        return deadObjectMetrics[key] ??
+            playthroughMetrics[key] ??
+            stopDisposeMetrics[key] ??
+            topMetrics[key];
+      }
       return topMetrics[key] ??
           playthroughMetrics[key] ??
-          stopDisposeMetrics[key];
+          stopDisposeMetrics[key] ??
+          deadObjectMetrics[key];
     }
 
     Map<String, Object?> extractCompactScenario(
@@ -292,6 +367,52 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
           'failureReason',
         ]);
 
+    final compactDeadObject =
+        extractCompactScenario(deadObjectMetrics, const <String>[
+          'audioTrackBufferFrames',
+          'syntheticDeadObjectInjectAfterFrames',
+          'deadObjectInjectedCount',
+          'deadObjectObservedCount',
+          'deadObjectRecoveryCount',
+          'deadObjectOldTrackReleaseCount',
+          'deadObjectRecoveryExecutedOnSinkThread',
+          'deadObjectNewTrackInitOk',
+          'deadObjectNewTrackVolumeOk',
+          'deadObjectNewTrackPlayOk',
+          'deadObjectNewTrackPlayState',
+          'deadObjectNewTrackSameBuffer',
+          'deadObjectNewTrackBufferFrames',
+          'deadObjectRecoveryWallMs',
+          'deadObjectEpochBeforeRecovery',
+          'deadObjectEpochOpenedAfterRecovery',
+          'deadObjectEpochCloseAccepted',
+          'deadObjectEpochOpenAccepted',
+          'deadObjectPositionBeforeRecovery',
+          'deadObjectBaseFrameAfterRecovery',
+          'deadObjectBaseStepFrames',
+          'deadObjectBaseStepBounded',
+          'deadObjectContentHeadAtDeadObject',
+          'deadObjectWrittenAheadOfHeadFrames',
+          'deadObjectPublicationLagFrames',
+          'deadObjectBaseStepDecompositionOk',
+          'deadObjectClockProvenanceAtRecovery',
+          'deadObjectClockLastAgeNsAtRecovery',
+          'deadObjectSliceBytesAtRecovery',
+          'deadObjectUnwrittenBytesAtRecovery',
+          'deadObjectBufferPositionAtRecovery',
+          'deadObjectFramesReadAtRecovery',
+          'deadObjectFramesWrittenBeforeRecovery',
+          'deadObjectRemainderFramesExpected',
+          'deadObjectRemainderFramesWrittenOnNewTrack',
+          'deadObjectRemainderAccountingOk',
+          'deadObjectTimestampPollsDuringRecovery',
+          'sinkClockSnapshotsAtDeadObjectRecovery',
+          'playbackHeadAtDeadObject',
+          'stateAtCompletion',
+          'scenarioWallMs',
+          'failureReason',
+        ]);
+
     print('--- METRICS ---');
     print('  [METRIC] sourceMime: ${lookupMetric('sourceMime')}');
     print('  [METRIC] sampleRate: ${lookupMetric('sampleRate')}');
@@ -308,6 +429,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       '  [METRIC] pauseHoldObservedMs: ${lookupMetric('pauseHoldObservedMs')}',
     );
     print('  [METRIC] stopAfterMs: ${lookupMetric('stopAfterMs')}');
+    print(
+      '  [METRIC] deadObjectInjectAfterFrames: ${lookupMetric('deadObjectInjectAfterFrames')}',
+    );
     print('  [METRIC] preRollFrames: ${lookupMetric('preRollFrames')}');
     print(
       '  [METRIC] decoderAcceptedFrames: ${lookupMetric('decoderAcceptedFrames')}',
@@ -328,11 +452,39 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print('  [METRIC] stopAccepted: ${lookupMetric('stopAccepted')}');
     print('  [METRIC] stateAfterStop: ${lookupMetric('stateAfterStop')}');
     print('  [METRIC] stateAfterDispose: ${lookupMetric('stateAfterDispose')}');
+    print(
+      '  [METRIC] deadObjectRecoveryCount: ${lookupMetric('deadObjectRecoveryCount')}',
+    );
+    print(
+      '  [METRIC] deadObjectRecoveryExecutedOnSinkThread: ${lookupMetric('deadObjectRecoveryExecutedOnSinkThread')}',
+    );
+    print(
+      '  [METRIC] deadObjectRemainderAccountingOk: ${lookupMetric('deadObjectRemainderAccountingOk')}',
+    );
+    print(
+      '  [METRIC] deadObjectBaseStepFrames: ${lookupMetric('deadObjectBaseStepFrames')}',
+    );
+    print(
+      '  [METRIC] deadObjectContentHeadAtDeadObject: ${lookupMetric('deadObjectContentHeadAtDeadObject')}',
+    );
+    print(
+      '  [METRIC] deadObjectWrittenAheadOfHeadFrames: ${lookupMetric('deadObjectWrittenAheadOfHeadFrames')}',
+    );
+    print(
+      '  [METRIC] deadObjectPublicationLagFrames: ${lookupMetric('deadObjectPublicationLagFrames')}',
+    );
+    print(
+      '  [METRIC] deadObjectBaseStepDecompositionOk: ${lookupMetric('deadObjectBaseStepDecompositionOk')}',
+    );
+    print(
+      '  [METRIC] deadObjectClockProvenanceAtRecovery: ${lookupMetric('deadObjectClockProvenanceAtRecovery')}',
+    );
     print('  [METRIC] failureReason: ${activeReport.failureReason}');
     print('  [METRIC] lastError: ${activeReport.lastError}');
     print('--- SCENARIO METRICS ---');
     print('  [SCENARIO] $playthroughScenarioKey: $compactPlaythrough');
     print('  [SCENARIO] $stopDisposeScenarioKey: $compactStopDispose');
+    print('  [SCENARIO] $deadObjectScenarioKey: $compactDeadObject');
 
     // 5. Verification evaluation.
     final pass =
@@ -345,13 +497,14 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     final compactScenarioMetrics = <String, dynamic>{
       playthroughScenarioKey: compactPlaythrough,
       stopDisposeScenarioKey: compactStopDispose,
+      deadObjectScenarioKey: compactDeadObject,
     };
 
     // 6. Print JSON marker with compact JSON payload.
     final summaryPayload = <String, dynamic>{
       'unit': 'AndroidRealtimeAudioPlaybackProductionPhysicalSmokeHarness',
-      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK',
-      'subSlice': 'Y8a',
+      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT',
+      'subSlice': 'Y8b',
       'target':
           VGRealtimeAudioPlaybackProductionSmokeReport.proofBoundaryConstant,
       'selectedFixture': selectedFixturePath,
@@ -373,6 +526,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
         'pauseHoldMs': lookupMetric('pauseHoldMs'),
         'pauseHoldObservedMs': lookupMetric('pauseHoldObservedMs'),
         'stopAfterMs': lookupMetric('stopAfterMs'),
+        'deadObjectInjectAfterFrames': lookupMetric(
+          'deadObjectInjectAfterFrames',
+        ),
         'preRollFrames': lookupMetric('preRollFrames'),
         'decoderAcceptedFrames': lookupMetric('decoderAcceptedFrames'),
         'decoderChecksumHex': lookupMetric('decoderChecksumHex'),
@@ -383,6 +539,29 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
         'stopAccepted': lookupMetric('stopAccepted'),
         'stateAfterStop': lookupMetric('stateAfterStop'),
         'stateAfterDispose': lookupMetric('stateAfterDispose'),
+        'deadObjectRecoveryCount': lookupMetric('deadObjectRecoveryCount'),
+        'deadObjectRecoveryExecutedOnSinkThread': lookupMetric(
+          'deadObjectRecoveryExecutedOnSinkThread',
+        ),
+        'deadObjectRemainderAccountingOk': lookupMetric(
+          'deadObjectRemainderAccountingOk',
+        ),
+        'deadObjectBaseStepFrames': lookupMetric('deadObjectBaseStepFrames'),
+        'deadObjectContentHeadAtDeadObject': lookupMetric(
+          'deadObjectContentHeadAtDeadObject',
+        ),
+        'deadObjectWrittenAheadOfHeadFrames': lookupMetric(
+          'deadObjectWrittenAheadOfHeadFrames',
+        ),
+        'deadObjectPublicationLagFrames': lookupMetric(
+          'deadObjectPublicationLagFrames',
+        ),
+        'deadObjectBaseStepDecompositionOk': lookupMetric(
+          'deadObjectBaseStepDecompositionOk',
+        ),
+        'deadObjectClockProvenanceAtRecovery': lookupMetric(
+          'deadObjectClockProvenanceAtRecovery',
+        ),
       },
       'error': topLevelError,
     };
