@@ -148,6 +148,9 @@ if (ANDROID)
     "platform/android/src/android_phase4_async_runtime_queue_scheduler_session_jni.cpp"
     "platform/android/src/android_phase4_async_runtime_queue_realtime_clock_jni.cpp"
     "platform/android/src/android_phase4_async_runtime_queue_multi_source_realtime_clock_jni.cpp"
+    # P4-AUDIO-REALTIME-PLAYBACK-TRANSPORT-CORE (Y1): production realtime
+    # playback graph transport session (own handle registry, non-diagnostic).
+    "platform/android/src/android_phase4_realtime_playback_graph_session_jni.cpp"
     "platform/android/src/android_phase3_multicam_compositor_jni.cpp"
     "platform/android/src/android_phase3_multicam_spatial_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_compositor_jni.cpp"
