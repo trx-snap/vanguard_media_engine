@@ -108,6 +108,8 @@ export 'vg_async_runtime_queue_realtime_clock_smoke.dart';
 export 'vg_async_runtime_queue_multi_source_realtime_clock_smoke.dart';
 // P4-AUDIO-REALTIME-PLAYBACK-TRANSPORT-CORE (Y1): Android True-DAG Phase 4 realtime playback transport core diagnostic smoke foundation.
 export 'vg_realtime_playback_transport_core_smoke.dart';
+// P4-AUDIO-REALTIME-PLAYBACK-AUDIOTRACK-SINK (Y2): Android True-DAG Phase 4 realtime playback AudioTrack sink diagnostic smoke foundation.
+export 'vg_realtime_playback_audiotrack_sink_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.

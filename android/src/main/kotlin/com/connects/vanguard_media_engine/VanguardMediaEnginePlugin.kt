@@ -53,6 +53,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioSourc
 import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioSourceRealDecoderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidPassthroughRemuxSinkSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackAudioTrackSinkSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackTransportCoreSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineCompositorSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineTransitionGlesRenderSmokeCoordinator
@@ -261,6 +262,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // realtime playback transport core smoke coordinator. Registration-only
     // glue mirroring the established diagnostic route wiring.
     private var realtimePlaybackTransportCoreSmokeCoordinator: AndroidRealtimePlaybackTransportCoreSmokeCoordinator? = null
+
+    // ── P4-AUDIO-REALTIME-PLAYBACK-AUDIOTRACK-SINK (Y2): production True-DAG ──
+    // realtime playback AudioTrack sink smoke coordinator. Registration-only
+    // glue mirroring the established diagnostic route wiring.
+    private var realtimePlaybackAudioTrackSinkSmokeCoordinator: AndroidRealtimePlaybackAudioTrackSinkSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -516,6 +522,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         realtimePlaybackTransportCoreSmokeCoordinator = AndroidRealtimePlaybackTransportCoreSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        realtimePlaybackAudioTrackSinkSmokeCoordinator = AndroidRealtimePlaybackAudioTrackSinkSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -955,6 +964,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android realtime playback transport core smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidRealtimePlaybackAudioTrackSinkSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = realtimePlaybackAudioTrackSinkSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android realtime playback AudioTrack sink smoke coordinator unavailable",
                     null,
                 )
             }
@@ -2442,6 +2465,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // disposes its state machine in its finally block.
         realtimePlaybackTransportCoreSmokeCoordinator?.disposeAll()
         realtimePlaybackTransportCoreSmokeCoordinator = null
+        // P4-AUDIO-REALTIME-PLAYBACK-AUDIOTRACK-SINK (Y2): stop replying before
+        // dropping; an in-flight run finishes naturally on its own thread,
+        // releases its AudioTrack, and disposes its state machine in its finally block.
+        realtimePlaybackAudioTrackSinkSmokeCoordinator?.disposeAll()
+        realtimePlaybackAudioTrackSinkSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // P5-COMPOSITOR-TRANS (NODE-TOPOLOGY-MATH): release the smoke executor.
         timelineCompositorSmokeCoordinator?.disposeAll()
