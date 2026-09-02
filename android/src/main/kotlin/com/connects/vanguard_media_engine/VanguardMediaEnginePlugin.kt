@@ -60,6 +60,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackIng
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackInteractiveControlsSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineIntegrationSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelinePauseResumeSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineFocusResponseSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineSeekSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackRealDecoderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackSinkFaultToleranceSmokeCoordinator
@@ -326,6 +327,16 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // pre-roll -> sink unpark -> transport resume -> EOS). Registration-only
     // glue mirroring the established diagnostic route wiring.
     private var realtimePlaybackPipelineSeekSmokeCoordinator: AndroidRealtimePlaybackPipelineSeekSmokeCoordinator? = null
+
+    // ── P4-AUDIO-REALTIME-PLAYBACK-PIPELINE-FOCUS-RESPONSE (Y6d): production ──
+    // True-DAG realtime playback pipeline focus / becoming-noisy response smoke
+    // coordinator (Y6a/Y6b pipeline shape + one Y4a focus controller per
+    // scenario: real decode -> Y5a ingest -> Y1 transport -> non-zero-gain
+    // AudioTrack; the sink thread applies synthetic focus / noisy events, the
+    // coordinator owns transport commands; EOS_COMPLETION,
+    // BECOMING_NOISY_TERMINAL, PERMANENT_LOSS_TERMINAL). Registration-only
+    // glue mirroring the established diagnostic route wiring.
+    private var realtimePlaybackPipelineFocusResponseSmokeCoordinator: AndroidRealtimePlaybackPipelineFocusResponseSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -614,6 +625,10 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         realtimePlaybackPipelineSeekSmokeCoordinator = AndroidRealtimePlaybackPipelineSeekSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        realtimePlaybackPipelineFocusResponseSmokeCoordinator = AndroidRealtimePlaybackPipelineFocusResponseSmokeCoordinator(
+            context = binding.applicationContext,
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -1182,6 +1197,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android realtime playback pipeline seek smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidRealtimePlaybackPipelineFocusResponseSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = realtimePlaybackPipelineFocusResponseSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android realtime playback pipeline focus response smoke coordinator unavailable",
                     null,
                 )
             }
@@ -2735,6 +2764,14 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // disposes its state machine in finally.
         realtimePlaybackPipelineSeekSmokeCoordinator?.disposeAll()
         realtimePlaybackPipelineSeekSmokeCoordinator = null
+        // P4-AUDIO-REALTIME-PLAYBACK-PIPELINE-FOCUS-RESPONSE (Y6d): stop replying
+        // before dropping; an in-flight run is cancelled (a parked sink thread
+        // wakes on cancel), its decoder/sink threads release MediaCodec/
+        // MediaExtractor/AudioTrack on their own threads, each scenario releases
+        // its focus controller (receiver unregistered, focus abandoned) in
+        // finally and the run thread disposes its state machine in finally.
+        realtimePlaybackPipelineFocusResponseSmokeCoordinator?.disposeAll()
+        realtimePlaybackPipelineFocusResponseSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): release the smoke executor. An
         // in-flight run owns its VkDevice/images on its own thread and destroys
