@@ -145,6 +145,12 @@ class VanguardRealtimePlaybackTransportStateMachine(
     // Enqueues `op` on the owner thread. When `expectedGeneration` is set
     // and no longer current at execution time, the op is rejected as stale
     // without touching native. `callback` runs on the owner thread.
+    //
+    // Once [dispose] is visible the op is rejected quietly on the caller's
+    // thread (callback invoked inline, returns false) WITHOUT touching the
+    // Handler: posting to a quit Looper logs an Android MessageQueue
+    // "dead thread" warning, and post-dispose rejection is a normal,
+    // expected path for late producers, not a defect worth a warning.
     fun post(
         op: Op,
         arg: Long = 0L,
@@ -153,6 +159,10 @@ class VanguardRealtimePlaybackTransportStateMachine(
         ingestRequest: IngestRequest? = null,
         callback: ((Result) -> Unit)? = null,
     ): Boolean {
+        if (disposed.get()) {
+            callback?.invoke(disposedResult())
+            return false
+        }
         val posted = handler.post {
             val result = if (expectedGeneration != null && expectedGeneration != generation) {
                 Result(false, state, generation, REASON_STALE_GENERATION, null)
@@ -173,9 +183,14 @@ class VanguardRealtimePlaybackTransportStateMachine(
             }
             callback?.invoke(result)
         }
-        if (!posted) callback?.invoke(Result(false, State.DISPOSED, publishedGeneration, REASON_DISPOSED, null))
+        // Narrow race: dispose became visible between the gate above and
+        // the enqueue. Same rejection shape either way.
+        if (!posted) callback?.invoke(disposedResult())
         return posted
     }
+
+    private fun disposedResult(): Result =
+        Result(false, State.DISPOSED, publishedGeneration, REASON_DISPOSED, null)
 
     // ── Dispose ────────────────────────────────────────────────────────────
 
@@ -221,8 +236,12 @@ class VanguardRealtimePlaybackTransportStateMachine(
 
     // ── Owner-thread execution ─────────────────────────────────────────────
 
+    // Off-owner callers after [dispose] is visible get null without touching
+    // the Handler (see [post] for why); the owner thread still runs inline so
+    // listener callbacks issued during dispose observe the same rejections.
     private fun <T> runOnOwnerOrNull(block: () -> T): T? {
         if (isOwnerThread) return block()
+        if (disposed.get()) return null
         val latch = CountDownLatch(1)
         var result: T? = null
         val posted = handler.post {
@@ -239,13 +258,11 @@ class VanguardRealtimePlaybackTransportStateMachine(
 
     private fun runOnOwner(block: () -> Result): Result =
         runOnOwnerOrNull(block)
-            ?: Result(
-                false,
-                publishedState,
-                publishedGeneration,
-                if (disposed.get()) REASON_DISPOSED else REASON_OWNER_THREAD_TIMEOUT,
-                null,
-            )
+            ?: if (disposed.get()) {
+                disposedResult()
+            } else {
+                Result(false, publishedState, publishedGeneration, REASON_OWNER_THREAD_TIMEOUT, null)
+            }
 
     private fun reject(reason: String, reply: Reply? = null): Result =
         Result(false, state, generation, reason, reply)

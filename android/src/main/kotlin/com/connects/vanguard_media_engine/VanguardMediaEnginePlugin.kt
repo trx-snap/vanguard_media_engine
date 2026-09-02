@@ -62,6 +62,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPip
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelinePauseResumeSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineFocusResponseSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineTimestampStabilizationSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineSeekSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackRealDecoderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackSinkFaultToleranceSmokeCoordinator
@@ -349,6 +350,14 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // ROUTE_DISCONNECT_TERMINAL). Registration-only glue mirroring the
     // established diagnostic route wiring.
     private var realtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator: AndroidRealtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator? = null
+
+    // ── P4-AUDIO-REALTIME-PLAYBACK-PIPELINE-TIMESTAMP-STABILIZATION (Y6f) ──
+    // Registration-only glue for the Y6f timestamp-stabilization smoke route
+    // (X13 getTimestamp poll-cadence / per-epoch frame-monotonicity lifted
+    // into the Y6 pipeline; sink thread owns AudioTrack + getTimestamp,
+    // coordinator owns transport commands; FORWARD_PLAYTHROUGH_TIMESTAMP,
+    // DEAD_OBJECT_EPOCH_RESET_TIMESTAMP). Timestamp telemetry is inert.
+    private var realtimePlaybackPipelineTimestampStabilizationSmokeCoordinator: AndroidRealtimePlaybackPipelineTimestampStabilizationSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -644,6 +653,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         realtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator = AndroidRealtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        realtimePlaybackPipelineTimestampStabilizationSmokeCoordinator = AndroidRealtimePlaybackPipelineTimestampStabilizationSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -1240,6 +1252,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android realtime playback pipeline sink fault tolerance smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidRealtimePlaybackPipelineTimestampStabilizationSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = realtimePlaybackPipelineTimestampStabilizationSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android realtime playback pipeline timestamp stabilization smoke coordinator unavailable",
                     null,
                 )
             }
@@ -2809,6 +2835,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // track and the run thread disposes its state machine in finally.
         realtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator?.disposeAll()
         realtimePlaybackPipelineSinkFaultToleranceSmokeCoordinator = null
+        // P4-AUDIO-REALTIME-PLAYBACK-PIPELINE-TIMESTAMP-STABILIZATION (Y6f): cancel
+        // an in-flight run (its decoder/sink threads release MediaCodec/
+        // MediaExtractor/AudioTrack on their own threads; the run thread
+        // disposes its state machine in finally).
+        realtimePlaybackPipelineTimestampStabilizationSmokeCoordinator?.disposeAll()
+        realtimePlaybackPipelineTimestampStabilizationSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): release the smoke executor. An
         // in-flight run owns its VkDevice/images on its own thread and destroys
