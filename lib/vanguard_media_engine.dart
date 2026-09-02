@@ -114,6 +114,8 @@ export 'vg_realtime_playback_transport_core_smoke.dart';
 export 'vg_realtime_playback_audiotrack_sink_smoke.dart';
 // P4-AUDIO-REALTIME-PLAYBACK-INTERACTIVE-CONTROLS (Y3): Android True-DAG Phase 4 realtime playback interactive transport controls diagnostic smoke foundation.
 export 'vg_realtime_playback_interactive_controls_smoke.dart';
+// P4-AUDIO-REALTIME-PLAYBACK-FOCUS-RESPONSE (Y4a): Android True-DAG Phase 4 realtime playback audio focus and becoming noisy response diagnostic smoke foundation.
+export 'vg_realtime_playback_focus_response_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.
