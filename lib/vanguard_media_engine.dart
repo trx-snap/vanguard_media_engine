@@ -126,6 +126,8 @@ export 'vg_realtime_playback_real_decoder_smoke.dart';
 export 'vg_realtime_playback_pipeline_integration_smoke.dart';
 // P4-AUDIO-REALTIME-PLAYBACK-PIPELINE-PAUSE-RESUME (Y6b): Android True-DAG Phase 4 realtime playback pipeline pause/resume diagnostic smoke foundation.
 export 'vg_realtime_playback_pipeline_pause_resume_smoke.dart';
+// P4-AUDIO-REALTIME-PLAYBACK-PIPELINE-SEEK (Y6c): Android True-DAG Phase 4 realtime playback pipeline seek diagnostic smoke foundation.
+export 'vg_realtime_playback_pipeline_seek_smoke.dart';
 // Phase 3-Unit U: Android Camera2 Mid-Recording Thermal Load-Shedding Policy & Mitigation Planner.
 export 'vg_camera2_thermal_load_shedding_policy.dart';
 // Phase 3-Unit V: Android Camera2 Thermal Load-Shedding Monitor & Telemetry Coordinator Foundation.
