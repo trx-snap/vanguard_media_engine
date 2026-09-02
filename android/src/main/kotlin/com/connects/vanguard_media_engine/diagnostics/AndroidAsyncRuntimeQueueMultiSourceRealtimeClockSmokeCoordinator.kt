@@ -136,6 +136,18 @@ import java.util.concurrent.atomic.AtomicInteger
  * other combination. No coordinator queue, listener, focus, or receiver is
  * involved.
  *
+ * X14 (P4-AUDIO-AUDIBLE-SPEAKER-PLAYBACK) audible built-in-speaker route
+ * diagnostic proof: when audibleSpeakerPlaybackProofEnabled=true the
+ * coordinator only parses and passes the flag through (never OR-ed into any
+ * other flag; no focus request, noisy receiver, routing listener, event
+ * queue, or AudioManager setup). The whole lane is driver-owned on its owner
+ * thread: the non-zero 0.5 base gain is implied, AudioTrack.getRoutedDevice()
+ * is sampled after each epoch's play() and must report TYPE_BUILTIN_SPEAKER,
+ * and the driver fails closed (audible_speaker_playback_mode_not_isolated)
+ * for X14 combined with X5 or X7..X13. SM-A566B manual acoustic-observation
+ * lane only: the routed-device type is an OS routing report, never an
+ * automatic acoustic-audibility, loudness, or SNR claim.
+ *
  * Honest non-claims (Proof Boundary): diagnostic only — the worker-owned
  * steady_clock is a render/dispatch timebase, not a presentation clock; no
  * caller-supplied native time; playback head / AudioTimestamp / underrun
@@ -438,6 +450,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
         // every other combination.
         val timestampStabilizationRequested =
             (args?.get("timestampStabilizationProofEnabled") as? Boolean) ?: false
+        // X14 is driver-owned and isolated: it does NOT imply the X7
+        // focus/noisy setup (no focus request, noisy receiver, routing
+        // listener, event queue, or AudioManager work here) and is never
+        // OR-ed into any other flag; the driver implies the non-zero 0.5 base
+        // gain itself and rejects X14 combined with X5 or X7..X13.
+        val audibleSpeakerPlaybackRequested =
+            (args?.get("audibleSpeakerPlaybackProofEnabled") as? Boolean) ?: false
         val config = AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.RunConfig(
             sourcePath = args?.get("sourcePath") as? String ?: "",
             durationSec = ((args?.get("durationSec") as? Number)?.toDouble() ?: 2.0)
@@ -490,6 +509,9 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
             // absent/false preserves the exact X4..X12 behavior and args
             // (AudioTimestamp stays telemetry-only, no per-pass polls).
             timestampStabilizationProofEnabled = timestampStabilizationRequested,
+            // X14 audible built-in-speaker route diagnostic proof mode;
+            // absent/false preserves the exact X4..X13 behavior and args.
+            audibleSpeakerPlaybackProofEnabled = audibleSpeakerPlaybackRequested,
         )
         if (!active.compareAndSet(false, true)) {
             result.error(

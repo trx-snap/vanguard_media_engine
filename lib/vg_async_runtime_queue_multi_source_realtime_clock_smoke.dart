@@ -227,6 +227,16 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   static const String timestampStabilizationFailMarkerConstant =
       'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_SMOKE_FAIL';
 
+  /// Canonical pass marker emitted by the native harness for X14
+  /// audible built-in-speaker route proof runs.
+  static const String audibleSpeakerPlaybackPassMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_PHYSICAL_SMOKE_PASS';
+
+  /// Canonical fail marker emitted by the native harness for X14
+  /// audible built-in-speaker route proof runs.
+  static const String audibleSpeakerPlaybackFailMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_PHYSICAL_SMOKE_FAIL';
+
   /// Canonical Kotlin driver proof boundary string (muted AudioTrack sink
   /// claim included) emitted by the native harness.
   static const String proofBoundaryConstant =
@@ -299,6 +309,16 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   static const String
   timestampStabilizationDeadObjectRecoveryProofBoundaryConstant =
       'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audiotrack_timestamp_stabilization_with_dead_object_recovery_response_diagnostic_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_synthetic_dead_object_detection_and_recreation_only_base_gain_0_5_synthetic_dead_object_injected_once_old_track_released_new_track_initialized_and_resumed_no_real_os_dead_object_forcing_claim_playback_head_telemetry_only_audio_timestamp_poll_cadence_and_per_epoch_frame_monotonicity_diagnostic_gate_only_one_poll_per_output_pass_after_write_returns_no_poll_inside_write_retry_loop_warmup_after_epoch_play_only_bounded_by_existing_deadline_per_epoch_baseline_reset_on_seek_flush_and_after_synthetic_dead_object_recreation_no_cross_epoch_comparison_unsigned_32bit_frame_position_one_positive_wrap_tolerated_equal_frame_position_allowed_strict_backward_only_fails_nanotime_monotonicity_telemetry_only_no_pacing_feedback_no_dispatch_feedback_no_write_size_feedback_no_checksum_effect_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_seamless_hardware_hot_swap_claim_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_presentation_clock_claim_no_latency_claim_no_avsync_claim_no_drift_claim_no_hal_timestamp_accuracy_claim_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
+
+  /// Canonical X14 audible built-in-speaker route Kotlin driver proof
+  /// boundary string. Replaces [proofBoundaryConstant] for X14 runs, which
+  /// are not muted (base gain 0.5) and gate on the built-in-speaker route.
+  static const String audibleSpeakerPlaybackProofBoundaryConstant =
+      'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audible_speaker_playback_diagnostic_proof_only_sm_a566b_manual_acoustic_observation_lane_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_base_gain_0_5_owner_thread_routed_device_sampled_after_each_epoch_play_type_builtin_speaker_required_os_routing_report_only_no_automatic_acoustic_audibility_claim_no_loudness_snr_claim_no_speaker_verification_beyond_routed_device_type_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_timestamp_stabilization_gate_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_drift_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
+
+  /// Android AudioDeviceInfo.TYPE_BUILTIN_SPEAKER constant value (2).
+  /// Mirrors AudioDeviceInfo.TYPE_BUILTIN_SPEAKER from the Android SDK.
+  static const int builtInSpeakerTypeConstant = 2;
 
   /// Canonical native TU proof boundary string (NO native sink claim)
   /// observed via the snapshot and echoed by the harness.
@@ -717,10 +737,10 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       _boolFact('audioTrackNonZeroGainSetOk');
 
   /// X6 non-zero-gain sink proof gate.
-  /// In X6 mode (and X8/X9/X10/X11/X12 modes, which imply the non-zero 0.5
+  /// In X6 mode (and X8/X9/X10/X11/X12/X14 modes, which imply the non-zero 0.5
   /// base gain): requires gain set OK, gain > 0.0 and <= 1.0.
-  /// In default X4/X5/X7 mode: requires gain NOT set and gain == 0.0,
-  /// proving muted behavior was preserved.
+  /// In default X4/X5/X7/X13-standalone mode: requires gain NOT set and
+  /// gain == 0.0, proving muted behavior was preserved.
   /// Deferred: no acoustic/speaker measurement, no loudness/SNR, no
   /// latency/glitch/xrun, no A/V sync, no route-change; dead-object
   /// recovery only in the X12 synthetic lane; no product/editor/export/iOS.
@@ -730,7 +750,8 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
         !focusLossPauseResumeProofEnabled &&
         !permanentFocusLossProofEnabled &&
         !routeChangeEventHandoffProofEnabled &&
-        !deadObjectRecoveryProofEnabled) {
+        !deadObjectRecoveryProofEnabled &&
+        !audibleSpeakerPlaybackProofEnabled) {
       return !audioTrackNonZeroGainSetOk && audioTrackGain == 0.0;
     }
     return audioTrackNonZeroGainSetOk &&
@@ -1619,6 +1640,54 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
         (!deadObjectRecoveryProofEnabled || deadObjectRecoveryGatesHeld);
   }
 
+  // ── X14 audible speaker playback proof getters ───────────────────────────
+
+  /// Whether this run executed the X14 audible built-in-speaker route proof
+  /// mode (false for every default X4..X13 run). X14 implies the non-zero 0.5
+  /// base gain only — NOT X5 envelope, X7 focus/noisy, X8..X11 event planes,
+  /// X12 recreation, or the X13 timestamp gate.
+  bool get audibleSpeakerPlaybackProofEnabled =>
+      _boolFact('audibleSpeakerPlaybackProofEnabled');
+
+  /// Count of routed-device samples taken on the owner thread across all
+  /// epochs (must be >= 1; taken after each epoch's play()).
+  int get audibleSpeakerRouteSampleCount =>
+      _intFact('audibleSpeakerRouteSampleCount');
+
+  /// Whether every routed-device sample succeeded without throwing or
+  /// returning null.
+  bool get audibleSpeakerRouteSampleOk =>
+      _boolFact('audibleSpeakerRouteSampleOk');
+
+  /// Routed-device type sampled on the owner thread (-1 if never; 2 ==
+  /// TYPE_BUILTIN_SPEAKER). Mirrors AudioDeviceInfo.TYPE_BUILTIN_SPEAKER.
+  int get audibleSpeakerRouteType => _intFact('audibleSpeakerRouteType', -1);
+
+  /// Whether every routed-device sample reported
+  /// [builtInSpeakerTypeConstant] (TYPE_BUILTIN_SPEAKER).
+  bool get audibleSpeakerBuiltInSpeakerRouteOk =>
+      _boolFact('audibleSpeakerBuiltInSpeakerRouteOk');
+
+  /// X14 audible built-in-speaker route diagnostic gate.
+  /// In X14 mode: requires base gain 0.5 set OK, route sample ok, route type
+  /// == [builtInSpeakerTypeConstant] (2), built-in speaker route ok, route
+  /// sample count >= 1, and lossless sink accounting / checksum identity /
+  /// frame accounting held. OS routing report only: no automatic acoustic
+  /// audibility, loudness, SNR, or A/V sync claim.
+  /// In default X4..X13 modes: vacuously true (backward compatible).
+  bool get audibleSpeakerPlaybackGatesHeld {
+    if (!audibleSpeakerPlaybackProofEnabled) return true;
+    return audioTrackNonZeroGainSetOk &&
+        _volumeIs(audioTrackGain, 0.5) &&
+        audibleSpeakerRouteSampleCount >= 1 &&
+        audibleSpeakerRouteSampleOk &&
+        audibleSpeakerRouteType == builtInSpeakerTypeConstant &&
+        audibleSpeakerBuiltInSpeakerRouteOk &&
+        sinkWriteAccountingOk &&
+        checksumIdentityOk &&
+        frameAccountingOk;
+  }
+
   /// Whether [proofBoundary] matches the canonical Kotlin driver boundary
   /// for this run's mode. X8 runs must carry the mode-specific
   /// [focusDuckRestoreProofBoundaryConstant], X9 runs the mode-specific
@@ -1627,11 +1696,13 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   /// mode-specific [routeChangeEventHandoffProofBoundaryConstant], X12 runs
   /// the mode-specific [deadObjectRecoveryProofBoundaryConstant], X13
   /// standalone runs the mode-specific
-  /// [timestampStabilizationProofBoundaryConstant], and X13+X12 composed
+  /// [timestampStabilizationProofBoundaryConstant], X13+X12 composed
   /// runs the mode-specific
-  /// [timestampStabilizationDeadObjectRecoveryProofBoundaryConstant] — never
-  /// the default boundary, whose muted/no-focus/no-recreation/no-timestamp-gate
-  /// claims would be false for X8..X13.
+  /// [timestampStabilizationDeadObjectRecoveryProofBoundaryConstant], and
+  /// X14 runs the mode-specific
+  /// [audibleSpeakerPlaybackProofBoundaryConstant] — never the default
+  /// boundary, whose muted/no-focus/no-recreation/no-timestamp-gate/no-speaker-route
+  /// claims would be false for X8..X14.
   bool get hasCanonicalProofBoundary =>
       timestampStabilizationProofEnabled && deadObjectRecoveryProofEnabled
       ? proofBoundary ==
@@ -1648,6 +1719,8 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       ? proofBoundary == focusLossPauseResumeProofBoundaryConstant
       : focusDuckRestoreProofEnabled
       ? proofBoundary == focusDuckRestoreProofBoundaryConstant
+      : audibleSpeakerPlaybackProofEnabled
+      ? proofBoundary == audibleSpeakerPlaybackProofBoundaryConstant
       : proofBoundary == proofBoundaryConstant;
 
   /// Whether [nativeProofBoundary] matches the canonical native TU
@@ -1730,6 +1803,8 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
               ? focusDuckRestorePassMarkerConstant
               : focusNoisyEventHandoffProofEnabled
               ? focusNoisyEventHandoffPassMarkerConstant
+              : audibleSpeakerPlaybackProofEnabled
+              ? audibleSpeakerPlaybackPassMarkerConstant
               : nonZeroGainSinkProofEnabled
               ? nonZeroGainSinkPassMarkerConstant
               : envelopeProofEnabled
@@ -1760,6 +1835,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       timestampStabilizationGatesHeld &&
       (!timestampStabilizationProofEnabled ||
           _boolFact('timestampStabilizationGatesHeld')) &&
+      audibleSpeakerPlaybackGatesHeld &&
+      (!audibleSpeakerPlaybackProofEnabled ||
+          _boolFact('audibleSpeakerPlaybackGatesHeld')) &&
       hasCanonicalProofBoundary &&
       nativeProofBoundaryOk &&
       formatProbeOk &&
@@ -1783,6 +1861,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
           permanentFocusLossProofEnabled ||
           routeChangeEventHandoffProofEnabled ||
           deadObjectRecoveryProofEnabled ||
+          audibleSpeakerPlaybackProofEnabled ||
           mutedOutputOk) &&
       playbackHeadTelemetryOk &&
       realtimeNativeElapsedOk &&
@@ -2215,6 +2294,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
     bool routeChangeEventHandoffProofEnabled = false,
     bool deadObjectRecoveryProofEnabled = false,
     bool timestampStabilizationProofEnabled = false,
+    bool audibleSpeakerPlaybackProofEnabled = false,
     Duration? timeout,
     MethodChannel? channel,
   }) async {
@@ -2273,6 +2353,11 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       // keeps the muted default sink, composes only with X12.
       if (timestampStabilizationProofEnabled)
         'timestampStabilizationProofEnabled': true,
+      // Only sent for X14 audible-speaker playback proof runs so the
+      // default X4..X13 argument shape stays frozen. X14 is isolated: the
+      // coordinator never derives X7 or any other mode flag from it.
+      if (audibleSpeakerPlaybackProofEnabled)
+        'audibleSpeakerPlaybackProofEnabled': true,
     };
     try {
       final future = ch.invokeMethod<Object?>(methodName, args);

@@ -1,6 +1,7 @@
 package com.connects.vanguard_media_engine.diagnostics
 
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioRouting
 import android.media.AudioTimestamp
@@ -263,6 +264,29 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         const val TIMESTAMP_STABILIZATION_DEAD_OBJECT_RECOVERY_PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audiotrack_timestamp_stabilization_with_dead_object_recovery_response_diagnostic_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_synthetic_dead_object_detection_and_recreation_only_base_gain_0_5_synthetic_dead_object_injected_once_old_track_released_new_track_initialized_and_resumed_no_real_os_dead_object_forcing_claim_playback_head_telemetry_only_audio_timestamp_poll_cadence_and_per_epoch_frame_monotonicity_diagnostic_gate_only_one_poll_per_output_pass_after_write_returns_no_poll_inside_write_retry_loop_warmup_after_epoch_play_only_bounded_by_existing_deadline_per_epoch_baseline_reset_on_seek_flush_and_after_synthetic_dead_object_recreation_no_cross_epoch_comparison_unsigned_32bit_frame_position_one_positive_wrap_tolerated_equal_frame_position_allowed_strict_backward_only_fails_nanotime_monotonicity_telemetry_only_no_pacing_feedback_no_dispatch_feedback_no_write_size_feedback_no_checksum_effect_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_seamless_hardware_hot_swap_claim_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_presentation_clock_claim_no_latency_claim_no_avsync_claim_no_drift_claim_no_hal_timestamp_accuracy_claim_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
+        // X14 (P4-AUDIO-AUDIBLE-SPEAKER-PLAYBACK) markers, emitted only for
+        // audible-speaker route proof runs; X4..X13 markers remain
+        // authoritative for their respective modes.
+        const val AUDIBLE_SPEAKER_PLAYBACK_PASS_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_PHYSICAL_SMOKE_PASS"
+        const val AUDIBLE_SPEAKER_PLAYBACK_FAIL_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_PHYSICAL_SMOKE_FAIL"
+
+        // X14 mode-specific proof boundary: replaces the default boundary for
+        // audible-speaker playback runs, which are not muted (base gain 0.5)
+        // and are gated on the sink-side AudioTrack.getRoutedDevice() sample
+        // taken on the owner thread after each epoch's play() reporting
+        // TYPE_BUILTIN_SPEAKER. DIAGNOSTIC lane only, for the SM-A566B
+        // device under manual acoustic observation: the routed-device sample
+        // is an OS routing report, never an automatic acoustic-audibility
+        // measurement; any audibility verdict is the human observer's,
+        // recorded outside this driver. Not a production presentation clock;
+        // no A/V sync, drift, latency, glitch/xrun/underrun freedom,
+        // loudness, SNR, or fleet claim; no product/editor/app wiring, export
+        // route, streaming/cache, or iOS; zero C++ primitive changes.
+        const val AUDIBLE_SPEAKER_PLAYBACK_PROOF_BOUNDARY =
+            "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audible_speaker_playback_diagnostic_proof_only_sm_a566b_manual_acoustic_observation_lane_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_base_gain_0_5_owner_thread_routed_device_sampled_after_each_epoch_play_type_builtin_speaker_required_os_routing_report_only_no_automatic_acoustic_audibility_claim_no_loudness_snr_claim_no_speaker_verification_beyond_routed_device_type_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_timestamp_stabilization_gate_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_drift_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
+
         // Frozen X3 decode dequeue timeout: the realtime loop must return
         // to ingest/drain work quickly.
         private const val DEQUEUE_TIMEOUT_US = 2_000L
@@ -400,6 +424,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // closed): false preserves the exact X4..X12 behavior and args,
         // including the telemetry-only AudioTimestamp sampling.
         val timestampStabilizationProofEnabled: Boolean = false,
+        // X14 mode switch (audible built-in-speaker route diagnostic; implies
+        // the non-zero base gain 0.5 only — NOT X5 envelope, X7 focus/noisy,
+        // X8..X11 event planes, X12 recreation, or the X13 timestamp gate;
+        // combining X14 with X5 or X7..X13 fails closed): false preserves
+        // the exact X4..X13 behavior and args.
+        val audibleSpeakerPlaybackProofEnabled: Boolean = false,
     )
 
     // X8 (P4-AUDIO-FOCUS-DUCK-RESTORE-RESPONSE) synthetic duck/restore event
@@ -663,6 +693,14 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
     private var nonZeroGainSetOk = false
     private var audioTrackGain = 0.0f
     private var nonZeroGainSinkGatesHeld = false
+    // X14 audible-speaker route proof state. Owner thread only samples
+    // AudioTrack.getRoutedDevice() after each epoch's play(); the sample is
+    // an OS routing report, never an automatic acoustic-audibility claim.
+    private var audibleSpeakerRouteSampleCount = 0L
+    private var audibleSpeakerRouteSampleOk = false
+    private var audibleSpeakerRouteType = -1
+    private var audibleSpeakerBuiltInSpeakerRouteOk = false
+    private var audibleSpeakerPlaybackGatesHeld = false
     // X7 focus/noisy event-plane drain function (coordinator-supplied, owner-thread only).
     private var drainEventsFn: (() -> Int)? = null
     // X8 focus-duck/restore state. Owner thread only mutates AudioTrack gain;
@@ -891,6 +929,26 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                     config.routeChangeEventHandoffProofEnabled)
             ) {
                 throw FailClosed("timestamp_stabilization_mode_not_isolated")
+            }
+            // X14 is an isolated audible lane: the X5 envelope changes the
+            // mixed PCM, the X7 focus/noisy plane requests audio focus and
+            // registers the noisy receiver (the X14 boundary claims no audio
+            // focus), the X8..X11 event planes mutate gain/playstate/routing
+            // on the same track, X12 recreates the sink, and the X13 gate is
+            // muted-or-X12 only; every such combination is undefined for the
+            // manual acoustic-observation lane and fails closed before any
+            // track exists.
+            if (config.audibleSpeakerPlaybackProofEnabled &&
+                (config.envelopeProofEnabled ||
+                    config.focusNoisyEventHandoffProofEnabled ||
+                    config.focusDuckRestoreProofEnabled ||
+                    config.focusLossPauseResumeProofEnabled ||
+                    config.permanentFocusLossProofEnabled ||
+                    config.routeChangeEventHandoffProofEnabled ||
+                    config.deadObjectRecoveryProofEnabled ||
+                    config.timestampStabilizationProofEnabled)
+            ) {
+                throw FailClosed("audible_speaker_playback_mode_not_isolated")
             }
             val windowSec = minOf(config.durationSec, HARD_MAX_DURATION_SEC)
             if (windowSec <= 0.0) throw FailClosed("invalid_decode_duration")
@@ -1485,6 +1543,34 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 }
                 detailParts.add("audioTrackGain=$audioTrackGain")
                 detailParts.add("nonZeroGainSinkGatesHeld=true")
+            }
+
+            // X14 audible built-in-speaker route proof gate. Only evaluated
+            // when audibleSpeakerPlaybackProofEnabled=true; composites the
+            // non-zero 0.5 base-gain fact with the existing accounting/
+            // checksum/frame gates and the owner-thread routed-device
+            // samples (every epoch play() reported a non-null device of
+            // TYPE_BUILTIN_SPEAKER). Diagnostic SM-A566B / manual
+            // acoustic-observation lane only: the routed-device type is an
+            // OS routing report, NOT an automatic acoustic-audibility,
+            // loudness, or SNR measurement. Deferred: no A/V sync, drift,
+            // latency/glitch/xrun/underrun freedom, focus, route-change or
+            // dead-object handling, no product/editor/export/streaming/iOS.
+            if (config.audibleSpeakerPlaybackProofEnabled) {
+                audibleSpeakerPlaybackGatesHeld = nonZeroGainSetOk &&
+                    audioTrackGain == NONZERO_GAIN_PROOF &&
+                    sinkWriteAccountingOk &&
+                    checksumIdentityOk &&
+                    frameAccountingOk &&
+                    audibleSpeakerRouteSampleOk &&
+                    audibleSpeakerBuiltInSpeakerRouteOk
+                if (!audibleSpeakerPlaybackGatesHeld) {
+                    throw FailClosed("audible_speaker_playback_gates_failed")
+                }
+                detailParts.add("audibleSpeakerRouteType=$audibleSpeakerRouteType")
+                detailParts.add("audibleSpeakerRouteSampleCount=$audibleSpeakerRouteSampleCount")
+                detailParts.add("audibleSpeakerPlaybackGatesHeld=true")
+                detailParts.add("audibleSpeakerRoutedDeviceReportOnlyNoAutomaticAudibilityClaim")
             }
 
             // X8 focus-duck/restore response gate. The synthetic duck must
@@ -2206,10 +2292,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             config.focusLossPauseResumeProofEnabled ||
             config.permanentFocusLossProofEnabled ||
             config.routeChangeEventHandoffProofEnabled ||
-            config.deadObjectRecoveryProofEnabled
+            config.deadObjectRecoveryProofEnabled ||
+            config.audibleSpeakerPlaybackProofEnabled
         ) {
-            // X6 non-zero-gain proof (and X8/X9/X10/X11/X12, which imply the
-            // non-zero base gain): constant AudioTrack output gain only.
+            // X6 non-zero-gain proof (and X8/X9/X10/X11/X12/X14, which imply
+            // the non-zero base gain): constant AudioTrack output gain only.
             // Written PCM bytes and every checksum are unaffected by this.
             // Terminal state: created_uninit -> format_frozen_volume_set.
             // Deferred: no acoustic/audibility claim, no route-change
@@ -2321,6 +2408,47 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // X13: warmup starts only now (epoch entered playing).
         if (config.timestampStabilizationProofEnabled) {
             timestampGenPlayStartMs = SystemClock.elapsedRealtime()
+        }
+        // X14: owner-thread routed-device sample once the epoch is PLAYING.
+        if (config.audibleSpeakerPlaybackProofEnabled) {
+            sampleAudibleSpeakerRoute(track)
+        }
+    }
+
+    // X14 owner-thread routed-device sample, taken after each epoch's play()
+    // asserted PLAYSTATE_PLAYING. The lane holds only while EVERY sample is
+    // a non-null device of TYPE_BUILTIN_SPEAKER; a null device or any other
+    // type fails closed immediately (the metrics below are recorded first).
+    // AudioTrack.getRoutedDevice() is an OS routing report: it is never an
+    // automatic acoustic-audibility measurement, and the manual acoustic
+    // observation for this diagnostic lane lives outside the driver.
+    private fun sampleAudibleSpeakerRoute(track: AudioTrack) {
+        val device = try {
+            track.routedDevice
+        } catch (t: Throwable) {
+            audibleSpeakerRouteSampleOk = false
+            audibleSpeakerBuiltInSpeakerRouteOk = false
+            throw FailClosed(
+                "audible_speaker_routed_device_sample_failed:${t.javaClass.simpleName}"
+            )
+        }
+        audibleSpeakerRouteSampleCount += 1L
+        if (device == null) {
+            audibleSpeakerRouteSampleOk = false
+            audibleSpeakerBuiltInSpeakerRouteOk = false
+            audibleSpeakerRouteType = -1
+            throw FailClosed("audible_speaker_routed_device_null")
+        }
+        audibleSpeakerRouteType = device.type
+        // First sample establishes the fact; later samples may only keep it.
+        audibleSpeakerRouteSampleOk = audibleSpeakerRouteSampleCount == 1L ||
+            audibleSpeakerRouteSampleOk
+        val builtInSpeaker = device.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        audibleSpeakerBuiltInSpeakerRouteOk =
+            builtInSpeaker &&
+                (audibleSpeakerRouteSampleCount == 1L || audibleSpeakerBuiltInSpeakerRouteOk)
+        if (!builtInSpeaker) {
+            throw FailClosed("audible_speaker_route_not_builtin_speaker:${device.type}")
         }
     }
 
@@ -3168,6 +3296,7 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "ownerThreadAffinityOk" to ownerThreadAffinityOk,
             "dynamicGainEnvelopeOk" to dynamicGainEnvelopeOk,
             "nonZeroGainSinkGatesHeld" to nonZeroGainSinkGatesHeld,
+            "audibleSpeakerPlaybackGatesHeld" to audibleSpeakerPlaybackGatesHeld,
             "routingListenerRegisteredOk" to routingListenerRegisteredOk,
             "routingListenerUnregisteredOk" to routingListenerUnregisteredOk,
             "routeChangeObservationOk" to routeChangeObservationOk,
@@ -3399,6 +3528,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "timestampLastFramePosition" to timestampLastFramePosition,
             "timestampWarmupBudgetMs" to TIMESTAMP_WARMUP_BUDGET_MS,
             "timestampWarmupMaxPolls" to TIMESTAMP_WARMUP_MAX_POLLS,
+            "audibleSpeakerPlaybackProofEnabled" to config.audibleSpeakerPlaybackProofEnabled,
+            "audibleSpeakerRouteSampleCount" to audibleSpeakerRouteSampleCount,
+            "audibleSpeakerRouteSampleOk" to audibleSpeakerRouteSampleOk,
+            "audibleSpeakerRouteType" to audibleSpeakerRouteType,
+            "audibleSpeakerBuiltInSpeakerRouteOk" to audibleSpeakerBuiltInSpeakerRouteOk,
+            "audibleSpeakerPlaybackGatesHeld" to audibleSpeakerPlaybackGatesHeld,
         )
         val marker = when {
             // X13 (standalone or composed with X12) owns the marker; the
@@ -3423,6 +3558,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 else FOCUS_DUCK_RESTORE_FAIL_MARKER
             config.focusNoisyEventHandoffProofEnabled ->
                 if (pass) FOCUS_NOISY_PASS_MARKER else FOCUS_NOISY_FAIL_MARKER
+            // X14 (isolated from X5 and X7..X13) owns the marker ahead of the
+            // X6 non-zero-gain and default markers.
+            config.audibleSpeakerPlaybackProofEnabled ->
+                if (pass) AUDIBLE_SPEAKER_PLAYBACK_PASS_MARKER
+                else AUDIBLE_SPEAKER_PLAYBACK_FAIL_MARKER
             config.nonZeroGainSinkProofEnabled ->
                 if (pass) NONZERO_GAIN_PASS_MARKER else NONZERO_GAIN_FAIL_MARKER
             config.envelopeProofEnabled ->
@@ -3457,6 +3597,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 config.focusLossPauseResumeProofEnabled ->
                     FOCUS_LOSS_PAUSE_RESUME_PROOF_BOUNDARY
                 config.focusDuckRestoreProofEnabled -> FOCUS_DUCK_RESTORE_PROOF_BOUNDARY
+                // X14 is not muted and gates on the built-in-speaker route,
+                // which the default boundary disclaims.
+                config.audibleSpeakerPlaybackProofEnabled ->
+                    AUDIBLE_SPEAKER_PLAYBACK_PROOF_BOUNDARY
                 else -> PROOF_BOUNDARY
             },
             nativeProofBoundary = s?.snapProofBoundary ?: "",

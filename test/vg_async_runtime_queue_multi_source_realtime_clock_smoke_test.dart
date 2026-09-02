@@ -38,6 +38,13 @@ const _kTimestampStabilizationPassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_SMOKE_PASS';
 const _kTimestampStabilizationFailMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_SMOKE_FAIL';
+const _kAudibleSpeakerPlaybackPassMarker =
+    'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_PHYSICAL_SMOKE_PASS';
+const _kAudibleSpeakerPlaybackFailMarker =
+    'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_PHYSICAL_SMOKE_FAIL';
+
+const _kAudibleSpeakerPlaybackProofBoundary =
+    'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audible_speaker_playback_diagnostic_proof_only_sm_a566b_manual_acoustic_observation_lane_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_base_gain_0_5_owner_thread_routed_device_sampled_after_each_epoch_play_type_builtin_speaker_required_os_routing_report_only_no_automatic_acoustic_audibility_claim_no_loudness_snr_claim_no_speaker_verification_beyond_routed_device_type_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_timestamp_stabilization_gate_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_drift_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
 
 const _kDeadObjectRecoveryProofBoundary =
     'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_dead_object_recovery_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_synthetic_dead_object_detection_and_recreation_only_base_gain_0_5_synthetic_dead_object_injected_once_old_track_released_new_track_initialized_and_resumed_no_real_os_dead_object_forcing_claim_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_seamless_hardware_hot_swap_claim_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
@@ -254,6 +261,48 @@ Map<String, Object?> _createNonZeroGainSampleRawMap([
   metrics['audioTrackGain'] = 0.5;
   metrics['audioTrackNonZeroGainSetOk'] = true;
   metrics['nonZeroGainSinkGatesHeld'] = true;
+  if (overrides != null) {
+    for (final entry in overrides.entries) {
+      if (lanes.containsKey(entry.key)) {
+        lanes[entry.key] = entry.value;
+      }
+      if (metrics.containsKey(entry.key)) {
+        metrics[entry.key] = entry.value;
+      }
+      result[entry.key] = entry.value;
+    }
+  }
+  return result;
+}
+
+// X14 audible speaker playback proof pass payload: the X4 sample map with
+// X14 marker, X14 proof boundary, mode flag, 0.5 gain, and routed-device
+// facts (TYPE_BUILTIN_SPEAKER = 2). The mutedOutputOk lane is omitted
+// (false in X14 mode); audibleSpeakerPlaybackGatesHeld and nonZeroGainSinkGatesHeld
+// replace it in the verdict.
+Map<String, Object?> _createAudibleSpeakerSampleRawMap([
+  Map<String, Object?>? overrides,
+]) {
+  final result = _createSampleRawMap();
+  result['marker'] = _kAudibleSpeakerPlaybackPassMarker;
+  result['proofBoundary'] = _kAudibleSpeakerPlaybackProofBoundary;
+  final rawStrings = result['raw'] as Map<String, String>;
+  rawStrings['marker'] = _kAudibleSpeakerPlaybackPassMarker;
+  rawStrings['proofBoundary'] = _kAudibleSpeakerPlaybackProofBoundary;
+  final lanes = result['lanes'] as Map<String, Object?>;
+  lanes['mutedOutputOk'] = false;
+  lanes['nonZeroGainSinkGatesHeld'] = true;
+  lanes['audibleSpeakerPlaybackGatesHeld'] = true;
+  final metrics = result['metrics'] as Map<String, Object?>;
+  metrics['audioTrackGain'] = 0.5;
+  metrics['audioTrackNonZeroGainSetOk'] = true;
+  metrics['nonZeroGainSinkGatesHeld'] = true;
+  metrics['audibleSpeakerPlaybackProofEnabled'] = true;
+  metrics['audibleSpeakerRouteSampleCount'] = 2;
+  metrics['audibleSpeakerRouteSampleOk'] = true;
+  metrics['audibleSpeakerRouteType'] = 2;
+  metrics['audibleSpeakerBuiltInSpeakerRouteOk'] = true;
+  metrics['audibleSpeakerPlaybackGatesHeld'] = true;
   if (overrides != null) {
     for (final entry in overrides.entries) {
       if (lanes.containsKey(entry.key)) {
@@ -4524,6 +4573,318 @@ void main() {
         expect(capturedArgs?['deadObjectRecoveryProofEnabled'], isTrue);
         expect(
           capturedArgs?.containsKey('timestampStabilizationProofEnabled'),
+          isFalse,
+        );
+      },
+    );
+  });
+
+  group('X14 audible speaker playback mode', () {
+    test('default X4 pass report has audibleSpeakerPlaybackProofEnabled=false '
+        'and gate vacuously true', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createSampleRawMap(),
+          );
+      expect(report.audibleSpeakerPlaybackProofEnabled, isFalse);
+      expect(report.audibleSpeakerRouteSampleCount, equals(0));
+      expect(report.audibleSpeakerRouteSampleOk, isFalse);
+      expect(report.audibleSpeakerRouteType, equals(-1));
+      expect(report.audibleSpeakerBuiltInSpeakerRouteOk, isFalse);
+      expect(report.audibleSpeakerPlaybackGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test(
+      'X14 pass sample accepts marker, boundary, and metrics, and passes all gates',
+      () {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              _createAudibleSpeakerSampleRawMap(),
+            );
+        expect(report.marker, equals(_kAudibleSpeakerPlaybackPassMarker));
+        expect(
+          report.proofBoundary,
+          equals(_kAudibleSpeakerPlaybackProofBoundary),
+        );
+        expect(report.hasCanonicalProofBoundary, isTrue);
+        expect(report.nativeProofBoundaryOk, isTrue);
+        expect(report.audibleSpeakerPlaybackProofEnabled, isTrue);
+        expect(report.audioTrackGain, equals(0.5));
+        expect(report.audioTrackNonZeroGainSetOk, isTrue);
+        expect(report.audibleSpeakerRouteSampleCount, equals(2));
+        expect(report.audibleSpeakerRouteSampleOk, isTrue);
+        expect(
+          report.audibleSpeakerRouteType,
+          equals(
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .builtInSpeakerTypeConstant,
+          ),
+        );
+        expect(report.audibleSpeakerBuiltInSpeakerRouteOk, isTrue);
+        expect(report.audibleSpeakerPlaybackGatesHeld, isTrue);
+        expect(report.nonZeroGainSinkGatesHeld, isTrue);
+        expect(report.sinkWriteAccountingOk, isTrue);
+        expect(report.frameAccountingOk, isTrue);
+        expect(report.checksumIdentityOk, isTrue);
+        expect(report.checksumsMatch, isTrue);
+        expect(report.realtimeGatesHeld, isTrue);
+        expect(report.allNativeLanesPass, isTrue);
+      },
+    );
+
+    test('X14 must carry its own pass marker, not other markers', () {
+      for (final wrongMarker in const [
+        _kPassMarker,
+        _kEnvelopePassMarker,
+        _kNonZeroGainPassMarker,
+        _kFocusNoisyPassMarker,
+        _kFocusDuckRestorePassMarker,
+        _kFocusLossPauseResumePassMarker,
+        _kPermanentFocusLossPassMarker,
+        _kRouteChangeEventHandoffPassMarker,
+        _kDeadObjectRecoveryPassMarker,
+        _kTimestampStabilizationPassMarker,
+      ]) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              _createAudibleSpeakerSampleRawMap({'marker': wrongMarker}),
+            );
+        expect(report.allNativeLanesPass, isFalse, reason: wrongMarker);
+      }
+    });
+
+    test(
+      'X14 must carry its own proof boundary, not X4 or X8..X13 boundaries',
+      () {
+        for (final wrongBoundary in const [
+          _kCanonicalProofBoundary,
+          _kFocusDuckRestoreProofBoundary,
+          _kFocusLossPauseResumeProofBoundary,
+          _kPermanentFocusLossProofBoundary,
+          _kRouteChangeEventHandoffProofBoundary,
+          _kDeadObjectRecoveryProofBoundary,
+          _kTimestampStabilizationProofBoundary,
+          _kTimestampStabilizationDeadObjectRecoveryProofBoundary,
+        ]) {
+          final report =
+              VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+                _createAudibleSpeakerSampleRawMap({
+                  'proofBoundary': wrongBoundary,
+                }),
+              );
+          expect(
+            report.hasCanonicalProofBoundary,
+            isFalse,
+            reason: wrongBoundary,
+          );
+          expect(report.allNativeLanesPass, isFalse, reason: wrongBoundary);
+        }
+      },
+    );
+
+    test('X14 fails gates when audibleSpeakerRouteSampleCount is 0', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createAudibleSpeakerSampleRawMap({
+              'audibleSpeakerRouteSampleCount': 0,
+            }),
+          );
+      expect(report.audibleSpeakerPlaybackGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test('X14 fails gates when audibleSpeakerRouteSampleOk is false', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createAudibleSpeakerSampleRawMap({
+              'audibleSpeakerRouteSampleOk': false,
+            }),
+          );
+      expect(report.audibleSpeakerPlaybackGatesHeld, isFalse);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test(
+      'X14 fails gates when audibleSpeakerRouteType is not built-in speaker (2)',
+      () {
+        for (final wrongType in [-1, 0, 1, 3, 4, 7, 8]) {
+          final report =
+              VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+                _createAudibleSpeakerSampleRawMap({
+                  'audibleSpeakerRouteType': wrongType,
+                }),
+              );
+          expect(
+            report.audibleSpeakerPlaybackGatesHeld,
+            isFalse,
+            reason: 'type $wrongType must fail',
+          );
+          expect(report.allNativeLanesPass, isFalse);
+        }
+      },
+    );
+
+    test(
+      'X14 fails gates when audibleSpeakerBuiltInSpeakerRouteOk is false',
+      () {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              _createAudibleSpeakerSampleRawMap({
+                'audibleSpeakerBuiltInSpeakerRouteOk': false,
+              }),
+            );
+        expect(report.audibleSpeakerPlaybackGatesHeld, isFalse);
+        expect(report.allNativeLanesPass, isFalse);
+      },
+    );
+
+    test(
+      'X14 fails gates when audioTrackNonZeroGainSetOk is false or gain != 0.5',
+      () {
+        final noGainSet =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              _createAudibleSpeakerSampleRawMap({
+                'audioTrackNonZeroGainSetOk': false,
+              }),
+            );
+        expect(noGainSet.audibleSpeakerPlaybackGatesHeld, isFalse);
+        expect(noGainSet.allNativeLanesPass, isFalse);
+
+        final wrongGain =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              _createAudibleSpeakerSampleRawMap({'audioTrackGain': 0.1}),
+            );
+        expect(wrongGain.audibleSpeakerPlaybackGatesHeld, isFalse);
+        expect(wrongGain.allNativeLanesPass, isFalse);
+      },
+    );
+
+    test(
+      'X14 fails gates when native audibleSpeakerPlaybackGatesHeld lane is false',
+      () {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              _createAudibleSpeakerSampleRawMap({
+                'audibleSpeakerPlaybackGatesHeld': false,
+              }),
+            );
+        expect(report.allNativeLanesPass, isFalse);
+      },
+    );
+
+    test('X14 fail report surfaces failure flags and fail marker', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createAudibleSpeakerSampleRawMap({
+              'pass': false,
+              'status': 'audible_speaker_route_not_builtin_speaker:3',
+              'marker': _kAudibleSpeakerPlaybackFailMarker,
+              'failureReason': 'audible_speaker_route_not_builtin_speaker:3',
+              'lastError': 'audible_speaker_route_not_builtin_speaker:3',
+              'audibleSpeakerBuiltInSpeakerRouteOk': false,
+              'audibleSpeakerPlaybackGatesHeld': false,
+            }),
+          );
+      expect(report.pass, isFalse);
+      expect(
+        report.marker,
+        equals(
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+              .audibleSpeakerPlaybackFailMarkerConstant,
+        ),
+      );
+      expect(report.audibleSpeakerBuiltInSpeakerRouteOk, isFalse);
+      expect(report.audibleSpeakerPlaybackGatesHeld, isFalse);
+      expect(
+        report.lastError,
+        equals('audible_speaker_route_not_builtin_speaker:3'),
+      );
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test(
+      'X14 mode sends only audibleSpeakerPlaybackProofEnabled plus common args, '
+      'not focus/duck/pause/timestamp/dead-object flags',
+      () async {
+        Map<String, Object?>? capturedArgs;
+
+        binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+          capturedArgs = (call.arguments as Map).cast<String, Object?>();
+          return _createAudibleSpeakerSampleRawMap();
+        });
+
+        final report =
+            await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+              sourcePath: '/tmp/clip_B.mov',
+              audibleSpeakerPlaybackProofEnabled: true,
+            );
+
+        expect(capturedArgs?['audibleSpeakerPlaybackProofEnabled'], isTrue);
+        expect(capturedArgs?['sourcePath'], equals('/tmp/clip_B.mov'));
+        expect(capturedArgs?['durationSec'], equals(2.0));
+        expect(capturedArgs?['seekTargetSec'], equals(1.30));
+        expect(capturedArgs?['preSeekBudgetSec'], equals(1.20));
+        expect(capturedArgs?['postSeekBudgetSec'], equals(0.55));
+        expect(capturedArgs?['sourceRingCapacityFrames'], equals(8192));
+        expect(capturedArgs?['outputRingCapacityFrames'], equals(4096));
+        expect(capturedArgs?['maxFramesPerMix'], equals(256));
+        expect(capturedArgs?['deadlineMs'], equals(30000));
+        expect(capturedArgs?.containsKey('envelopeProofEnabled'), isFalse);
+        expect(
+          capturedArgs?.containsKey('nonZeroGainSinkProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('focusNoisyEventHandoffProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('focusDuckRestoreProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('focusLossPauseResumeProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('permanentFocusLossProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('routeChangeEventHandoffProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('deadObjectRecoveryProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('timestampStabilizationProofEnabled'),
+          isFalse,
+        );
+        expect(report.pass, isTrue);
+        expect(report.audibleSpeakerPlaybackProofEnabled, isTrue);
+        expect(report.allNativeLanesPass, isTrue);
+      },
+    );
+
+    test(
+      'default X4 run does NOT send audibleSpeakerPlaybackProofEnabled',
+      () async {
+        Map<String, Object?>? capturedArgs;
+
+        binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+          capturedArgs = (call.arguments as Map).cast<String, Object?>();
+          return _createSampleRawMap();
+        });
+
+        await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+          sourcePath: '/tmp/clip_B.mov',
+        );
+
+        expect(
+          capturedArgs?.containsKey('audibleSpeakerPlaybackProofEnabled'),
           isFalse,
         );
       },

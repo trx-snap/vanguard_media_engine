@@ -32,6 +32,11 @@
 //   - X13 (P4-AUDIO-AUDIOTRACK-TIMESTAMP-STABILIZATION): AudioTrack timestamp stabilization diagnostic proof executed twice:
 //     1) Standalone (muted default sink): proves pre-seek + post-seek timestamp stabilization (2 generations, 0 recreate resets), monotonic frame advancement with 0 strict regressions, no poll inside write loop, and zero feedback into native pacing.
 //     2) Composed with X12 (dead-object recovery, base gain 0.5): proves timestamp stabilization across all 3 generations (pre-seek, post-seek, post-recreate), with baseline reset on recreation and X12 dead-object recovery gates intact.
+//   - X14 (P4-AUDIO-AUDIBLE-SPEAKER-PLAYBACK): Audible built-in-speaker playback proof:
+//     base gain 0.5, owner-thread routed-device sample after each epoch's play() asserting
+//     TYPE_BUILTIN_SPEAKER (2), lossless sink accounting and reference mix checksum identity.
+//     Automated pass validates OS routing report and telemetry only; manual acoustic observation
+//     required for human hearing confirmation.
 // Overall exit is PASS only when ALL runs pass; each phase prints its own
 // PHYSICAL_SMOKE_PASS/FAIL marker.
 
@@ -426,6 +431,14 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
     final timestampDeadObjectPass =
         await _runTimestampStabilizationDeadObjectRecoverySmoke();
 
+    // ── X14 (P4-AUDIO-AUDIBLE-SPEAKER-PLAYBACK): audible built-in-speaker
+    // route diagnostic proof (0.5 base gain). Proves owner-thread
+    // routed-device sample after each epoch's play() reports
+    // TYPE_BUILTIN_SPEAKER (2), base gain 0.5, and lossless sink accounting
+    // / checksum identity. Preceded by an acoustic warning / countdown for
+    // manual listening observation. ─────────────────────────────────────────
+    final audibleSpeakerPlaybackPass = await _runAudibleSpeakerPlaybackSmoke();
+
     final allPass =
         pass &&
         envelopePass &&
@@ -437,7 +450,8 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
         routeChangeEventHandoffPass &&
         deadObjectRecoveryPass &&
         timestampStabilizationPass &&
-        timestampDeadObjectPass;
+        timestampDeadObjectPass &&
+        audibleSpeakerPlaybackPass;
     if (mounted) {
       setState(() {
         _status = allPass
@@ -449,7 +463,8 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
                   'X11 route-change event-handoff gates held, '
                   'X12 dead-object recovery gates held, '
                   'X13 timestamp stabilization gates held, '
-                  'X13+X12 timestamp dead-object recovery gates held)'
+                  'X13+X12 timestamp dead-object recovery gates held, '
+                  'X14 audible speaker playback gates held)'
             : 'FAIL: x4Pass=$pass, envelopePass=$envelopePass, '
                   'nonZeroGainPass=$nonZeroGainPass, '
                   'focusNoisyPass=$focusNoisyPass, '
@@ -460,6 +475,7 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
                   'deadObjectRecoveryPass=$deadObjectRecoveryPass, '
                   'timestampStabilizationPass=$timestampStabilizationPass, '
                   'timestampDeadObjectPass=$timestampDeadObjectPass, '
+                  'audibleSpeakerPlaybackPass=$audibleSpeakerPlaybackPass, '
                   'lastError=${activeReport.lastError}, error=$topLevelError';
       });
     }
@@ -2169,6 +2185,190 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
           : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_FAIL',
     );
     return timestampDeadObjectPass;
+  }
+
+  Future<bool> _runAudibleSpeakerPlaybackSmoke() async {
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_SMOKE_START',
+    );
+
+    if (mounted) {
+      setState(() {
+        _status =
+            'X14 Audible Speaker Playback Test Starting...\n'
+            'MANUAL OBSERVATION REQUIRED: Please listen for audio playback through the device speaker.';
+      });
+    }
+
+    print('================================================================');
+    print('X14 AUDIBLE SPEAKER PLAYBACK TEST: MANUAL ACOUSTIC OBSERVATION');
+    print(
+      'MANUAL OBSERVATION REQUIRED: Please listen to the device built-in speaker.',
+    );
+    print(
+      'Audio will play at gain 0.5 for ~2 seconds with a joint seek at 1.30s.',
+    );
+    print('Countdown: 3...');
+    await Future<void>.delayed(const Duration(seconds: 1));
+    print('Countdown: 2...');
+    await Future<void>.delayed(const Duration(seconds: 1));
+    print('Countdown: 1... PLAYING NOW');
+    print('================================================================');
+
+    VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport? report;
+    String? topLevelError;
+    File? tempSourceFile;
+
+    try {
+      final clipBData = await rootBundle.load(
+        'assets/manual_test_clips/clip_B.mov',
+      );
+      final tempDir = Directory.systemTemp;
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+      tempSourceFile = File(
+        '${tempDir.path}/p4_async_rt_queue_audible_speaker_source_$timestamp.mov',
+      );
+
+      await tempSourceFile.writeAsBytes(
+        clipBData.buffer.asUint8List(
+          clipBData.offsetInBytes,
+          clipBData.lengthInBytes,
+        ),
+        flush: true,
+      );
+
+      report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: tempSourceFile.path,
+            audibleSpeakerPlaybackProofEnabled: true,
+            timeout: const Duration(seconds: 45),
+          ).timeout(const Duration(seconds: 55));
+    } on TimeoutException catch (te) {
+      topLevelError = 'timeout: $te';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_ERROR: $topLevelError',
+      );
+    } catch (e, st) {
+      topLevelError = '$e\n$st';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_ERROR: $topLevelError',
+      );
+    } finally {
+      if (tempSourceFile != null) {
+        try {
+          if (await tempSourceFile.exists()) {
+            await tempSourceFile.delete();
+          }
+        } catch (_) {}
+      }
+    }
+
+    final audibleReport =
+        report ??
+        VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+          <String, Object?>{
+            'pass': false,
+            'status': 'fail',
+            'marker': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .audibleSpeakerPlaybackFailMarkerConstant,
+            'proofBoundary': '',
+            'nativeProofBoundary': '',
+            'failureReason': 'invocation_failed',
+            'lastError': 'invocation_failed',
+          },
+        );
+
+    // Audible Speaker Playback group (diagnostic SM-A566B lane).
+    // Owner-thread routed-device sample after each epoch's play() asserted
+    // TYPE_BUILTIN_SPEAKER (2); base gain 0.5; lossless sink write accounting
+    // and reference mix checksum identity held. Diagnostic lane under manual
+    // acoustic observation: OS routing report only, not automatic acoustic
+    // audibility measurement; any audibility verdict is recorded manually.
+    print(
+      '  [LANE] Audible Speaker Playback: '
+      'audibleSpeakerPlaybackProofEnabled=${audibleReport.audibleSpeakerPlaybackProofEnabled}, '
+      'audioTrackGain=${audibleReport.audioTrackGain}, '
+      'audioTrackNonZeroGainSetOk=${audibleReport.audioTrackNonZeroGainSetOk}, '
+      'audibleSpeakerRouteSampleCount=${audibleReport.audibleSpeakerRouteSampleCount}, '
+      'audibleSpeakerRouteSampleOk=${audibleReport.audibleSpeakerRouteSampleOk}, '
+      'audibleSpeakerRouteType=${audibleReport.audibleSpeakerRouteType}, '
+      'audibleSpeakerBuiltInSpeakerRouteOk=${audibleReport.audibleSpeakerBuiltInSpeakerRouteOk}, '
+      'audibleSpeakerPlaybackGatesHeld=${audibleReport.audibleSpeakerPlaybackGatesHeld}, '
+      'sinkWriteAccountingOk=${audibleReport.sinkWriteAccountingOk}, '
+      'frameAccountingOk=${audibleReport.frameAccountingOk}, '
+      'checksumIdentityOk=${audibleReport.checksumIdentityOk}, '
+      'checksumsMatch=${audibleReport.checksumsMatch}, '
+      'realtimeGatesHeld=${audibleReport.realtimeGatesHeld}, '
+      'hasCanonicalProofBoundary=${audibleReport.hasCanonicalProofBoundary}, '
+      'nativeProofBoundaryOk=${audibleReport.nativeProofBoundaryOk}, '
+      'allNativeLanesPass=${audibleReport.allNativeLanesPass}, '
+      'marker=${audibleReport.marker}, '
+      'lastError=${audibleReport.lastError}',
+    );
+
+    final lastErrorOk =
+        audibleReport.lastError.isEmpty ||
+        audibleReport.lastError == 'none' ||
+        audibleReport.lastError == 'null';
+
+    final audibleSpeakerPlaybackPass =
+        (topLevelError == null) &&
+        audibleReport.pass &&
+        audibleReport.marker ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .audibleSpeakerPlaybackPassMarkerConstant &&
+        audibleReport.audibleSpeakerPlaybackProofEnabled &&
+        audibleReport.audioTrackGain == 0.5 &&
+        audibleReport.audioTrackNonZeroGainSetOk &&
+        audibleReport.audibleSpeakerRouteSampleCount >= 1 &&
+        audibleReport.audibleSpeakerRouteSampleOk &&
+        audibleReport.audibleSpeakerRouteType ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .builtInSpeakerTypeConstant &&
+        audibleReport.audibleSpeakerBuiltInSpeakerRouteOk &&
+        audibleReport.audibleSpeakerPlaybackGatesHeld &&
+        audibleReport.sinkWriteAccountingOk &&
+        audibleReport.frameAccountingOk &&
+        audibleReport.checksumIdentityOk &&
+        audibleReport.hasCanonicalProofBoundary &&
+        audibleReport.proofBoundary ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .audibleSpeakerPlaybackProofBoundaryConstant &&
+        audibleReport.nativeProofBoundaryOk &&
+        audibleReport.checksumsMatch &&
+        audibleReport.providerCountersClean &&
+        audibleReport.sinkAccountingBalanced &&
+        audibleReport.realtimeGatesHeld &&
+        audibleReport.allNativeLanesPass &&
+        lastErrorOk;
+
+    final summaryPayload = <String, dynamic>{
+      'unit':
+          'AndroidAsyncRuntimeQueueAudibleSpeakerPlaybackPhysicalSmokeHarness',
+      'slice': 'P4-AUDIO-AUDIBLE-SPEAKER-PLAYBACK',
+      'target': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .audibleSpeakerPlaybackProofBoundaryConstant,
+      'nativeTarget': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .nativeProofBoundaryConstant,
+      'pass': audibleSpeakerPlaybackPass,
+      'report': audibleReport.toMap(),
+      'error': topLevelError,
+    };
+
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_JSON:${jsonEncode(summaryPayload)}',
+    );
+    print(
+      audibleSpeakerPlaybackPass
+          ? 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_PHYSICAL_SMOKE_PASS'
+          : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_PHYSICAL_SMOKE_FAIL',
+    );
+    print(
+      'MANUAL OBSERVATION REQUIRED: Automated pass confirms OS routed-device '
+      'report TYPE_BUILTIN_SPEAKER (2) and telemetry only; human hearing confirmation '
+      'of audible playback is required and is not encoded in the automated PASS.',
+    );
+    return audibleSpeakerPlaybackPass;
   }
 
   @override
