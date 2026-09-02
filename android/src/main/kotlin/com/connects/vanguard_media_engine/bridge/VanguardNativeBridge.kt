@@ -1836,6 +1836,37 @@ class VanguardNativeBridge(
     // production VulkanBackend mutation, no product UI.
     external fun runAndroidDagPhase5TimelineTransitionVulkanRenderSmoke(): String
 
+    // ── P5-COMPOSITOR-TRANS (DUAL-DECODER-SYNC): dual MediaCodec -> AHB -> Vulkan ──
+    // crossfade proof. Kotlin (AndroidTimelineDualDecoderSyncDriver) owns both
+    // decoder pipelines and calls this once per overlap frame with one
+    // ImageReader.PRIVATE HardwareBuffer from each decoder. Native resolves both
+    // to AHardwareBuffer via libandroid, creates a temporary VkDevice with the
+    // AHardwareBuffer import extension + samplerYcbcrConversion feature,
+    // imports both buffers as sampled images, resolves them to RGBA8 with the
+    // existing AOT passthrough SPIR-V, evaluates
+    // ComputeTransitionGeometry(kCrossfade, progress), renders through
+    // VulkanTimelineTransitionCompositor offscreen (from-only / to-only /
+    // blended), reads pixels back, gates the blend arithmetic, and destroys
+    // every import/scratch object before returning a JSON object string.
+    // Reports status "UNSUPPORTED" (never crashes) when Vulkan or the
+    // AHardwareBuffer import path is unavailable. The caller must keep both
+    // HardwareBuffers and their Images open until this call returns.
+    // Diagnostic only: no export session, no production VulkanBackend
+    // mutation, no product UI.
+    external fun renderAndroidDagPhase5TimelineDualDecoderSyncCrossfade(
+        fromHardwareBuffer: HardwareBuffer,
+        fromWidth: Int,
+        fromHeight: Int,
+        fromFrameIndex: Int,
+        fromPtsUs: Long,
+        toHardwareBuffer: HardwareBuffer,
+        toWidth: Int,
+        toHeight: Int,
+        toFrameIndex: Int,
+        toPtsUs: Long,
+        progress: Double,
+    ): String
+
     fun initialize() {
         val report = probeCapabilities()
         diagnostics.logCapabilities(report)

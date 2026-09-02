@@ -150,6 +150,8 @@ if (ANDROID)
     "platform/android/src/android_phase5_timeline_compositor_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_gles_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_vulkan_render_jni.cpp"
+    "platform/android/src/android_phase5_timeline_dual_decoder_sync_jni.cpp"
+    "platform/android/src/android_phase5_timeline_dual_decoder_sync_vulkan_support.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private
@@ -164,6 +166,13 @@ if (ANDROID)
   # private Vulkan helper source dir on its include path. Diagnostic-only; the
   # helper header stays out of the public vulkan_backend.h.
   target_include_directories(vanguard_media_engine PRIVATE "render/vulkan/src")
+  # P5-COMPOSITOR-TRANS (DUAL-DECODER-SYNC): the dual MediaCodec -> AHardwareBuffer
+  # -> Vulkan crossfade diagnostic JNI and its private support translation unit
+  # (android_phase5_timeline_dual_decoder_sync_vulkan_support.cpp) reuse the
+  # private VulkanHardwareBufferImage / VulkanGraphicsPipeline /
+  # VulkanShaderModule helpers and the AOT passthrough SPIR-V headers from the
+  # same private Vulkan source dir already added above. Diagnostic-only; no
+  # production route or public header change.
 
   # Support Android 15 16 KB page size
   target_link_options(vanguard_media_engine PRIVATE
