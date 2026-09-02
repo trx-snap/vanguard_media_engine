@@ -58,6 +58,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackAud
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackFocusResponseSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackIngestSeamSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackInteractiveControlsSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackPipelineIntegrationSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackRealDecoderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackSinkFaultToleranceSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackTransportCoreSmokeCoordinator
@@ -301,6 +302,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // decoder -> owner-thread generation-pinned postIngest to Y5a seam).
     // Registration-only glue mirroring the established diagnostic route wiring.
     private var realtimePlaybackRealDecoderSmokeCoordinator: AndroidRealtimePlaybackRealDecoderSmokeCoordinator? = null
+
+    // ── P4-AUDIO-REALTIME-PLAYBACK-PIPELINE-INTEGRATION-A (Y6a): production True-DAG ──
+    // realtime playback pipeline integration smoke coordinator (real decoder
+    // thread -> Y5a ingest seam -> Y1 transport -> non-zero-gain AudioTrack sink
+    // thread). Registration-only glue mirroring the established diagnostic route wiring.
+    private var realtimePlaybackPipelineIntegrationSmokeCoordinator: AndroidRealtimePlaybackPipelineIntegrationSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -580,6 +587,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         realtimePlaybackRealDecoderSmokeCoordinator = AndroidRealtimePlaybackRealDecoderSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        realtimePlaybackPipelineIntegrationSmokeCoordinator = AndroidRealtimePlaybackPipelineIntegrationSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -1106,6 +1116,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android realtime playback real decoder smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidRealtimePlaybackPipelineIntegrationSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = realtimePlaybackPipelineIntegrationSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android realtime playback pipeline integration smoke coordinator unavailable",
                     null,
                 )
             }
@@ -2639,6 +2663,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // cancels/disposes its adapter in finally.
         realtimePlaybackRealDecoderSmokeCoordinator?.disposeAll()
         realtimePlaybackRealDecoderSmokeCoordinator = null
+        // P4-AUDIO-REALTIME-PLAYBACK-PIPELINE-INTEGRATION-A (Y6a): stop replying
+        // before dropping; an in-flight run is cancelled, its decoder/sink
+        // threads release MediaCodec/MediaExtractor/AudioTrack on their own
+        // threads and the run thread disposes its state machine in finally.
+        realtimePlaybackPipelineIntegrationSmokeCoordinator?.disposeAll()
+        realtimePlaybackPipelineIntegrationSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): release the smoke executor. An
         // in-flight run owns its VkDevice/images on its own thread and destroys
