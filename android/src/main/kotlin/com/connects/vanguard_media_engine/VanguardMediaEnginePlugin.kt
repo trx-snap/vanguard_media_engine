@@ -54,6 +54,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioSourc
 import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioTrackSinkClockedTransportSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidPassthroughRemuxSinkSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackAudioTrackSinkSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackInteractiveControlsSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackTransportCoreSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineCompositorSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineTransitionGlesRenderSmokeCoordinator
@@ -267,6 +268,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // realtime playback AudioTrack sink smoke coordinator. Registration-only
     // glue mirroring the established diagnostic route wiring.
     private var realtimePlaybackAudioTrackSinkSmokeCoordinator: AndroidRealtimePlaybackAudioTrackSinkSmokeCoordinator? = null
+
+    // ── P4-AUDIO-REALTIME-PLAYBACK-INTERACTIVE-CONTROLS (Y3): production True-DAG ──
+    // realtime playback interactive transport controls smoke coordinator. Registration-only
+    // glue mirroring the established diagnostic route wiring.
+    private var realtimePlaybackInteractiveControlsSmokeCoordinator: AndroidRealtimePlaybackInteractiveControlsSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -525,6 +531,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         realtimePlaybackAudioTrackSinkSmokeCoordinator = AndroidRealtimePlaybackAudioTrackSinkSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        realtimePlaybackInteractiveControlsSmokeCoordinator = AndroidRealtimePlaybackInteractiveControlsSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -978,6 +987,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android realtime playback AudioTrack sink smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidRealtimePlaybackInteractiveControlsSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = realtimePlaybackInteractiveControlsSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android realtime playback interactive controls smoke coordinator unavailable",
                     null,
                 )
             }
@@ -2470,6 +2493,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // releases its AudioTrack, and disposes its state machine in its finally block.
         realtimePlaybackAudioTrackSinkSmokeCoordinator?.disposeAll()
         realtimePlaybackAudioTrackSinkSmokeCoordinator = null
+        // P4-AUDIO-REALTIME-PLAYBACK-INTERACTIVE-CONTROLS (Y3): stop replying before
+        // dropping; an in-flight run finishes naturally on its own thread,
+        // releases its AudioTrack, and disposes its state machine in its finally block.
+        realtimePlaybackInteractiveControlsSmokeCoordinator?.disposeAll()
+        realtimePlaybackInteractiveControlsSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // P5-COMPOSITOR-TRANS (NODE-TOPOLOGY-MATH): release the smoke executor.
         timelineCompositorSmokeCoordinator?.disposeAll()
