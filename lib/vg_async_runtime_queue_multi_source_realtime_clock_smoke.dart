@@ -237,6 +237,16 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   static const String audibleSpeakerPlaybackFailMarkerConstant =
       'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_PHYSICAL_SMOKE_FAIL';
 
+  /// Canonical pass marker emitted by the native harness for X15
+  /// transport pause/resume proof runs.
+  static const String pauseResumePassMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_TRANSPORT_PAUSE_RESUME_SMOKE_PASS';
+
+  /// Canonical fail marker emitted by the native harness for X15
+  /// transport pause/resume proof runs.
+  static const String pauseResumeFailMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_TRANSPORT_PAUSE_RESUME_SMOKE_FAIL';
+
   /// Canonical Kotlin driver proof boundary string (muted AudioTrack sink
   /// claim included) emitted by the native harness.
   static const String proofBoundaryConstant =
@@ -315,6 +325,16 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   /// are not muted (base gain 0.5) and gate on the built-in-speaker route.
   static const String audibleSpeakerPlaybackProofBoundaryConstant =
       'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audible_speaker_playback_diagnostic_proof_only_sm_a566b_manual_acoustic_observation_lane_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_base_gain_0_5_owner_thread_routed_device_sampled_after_each_epoch_play_type_builtin_speaker_required_os_routing_report_only_no_automatic_acoustic_audibility_claim_no_loudness_snr_claim_no_speaker_verification_beyond_routed_device_type_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_timestamp_stabilization_gate_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_drift_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
+
+  /// Canonical X15 transport pause/resume Kotlin driver proof boundary string.
+  /// Replaces [proofBoundaryConstant] for X15 runs. Muted default sink kept;
+  /// proves worker-owned steady_clock pause/resume commands (no caller time),
+  /// sink AudioTrack playstate pause (2) and resume (3), ~150ms hold with
+  /// frozen dispatch/pushed counts, worker paused waits > 0, paused interval
+  /// excluded from native timing gate, 4 commands processed, and lossless
+  /// sink accounting / checksum identity.
+  static const String pauseResumeProofBoundaryConstant =
+      'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_transport_pause_resume_diagnostic_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_pause_resume_commands_no_caller_supplied_native_time_worker_samples_steady_clock_at_execution_coordinator_pause_resume_delegates_to_audio_clock_media_position_preserved_no_dispatch_while_paused_once_in_pre_seek_epoch_after_sink_playing_command_order_start_pause_resume_seek_sink_side_audiotrack_playstate_pause_play_only_no_flush_no_stop_bounded_150ms_hold_no_output_read_dispatch_count_and_total_frames_pushed_unchanged_across_hold_paused_interval_excluded_from_native_one_second_timing_gate_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_not_production_presentation_pause_no_pause_resume_sla_no_avsync_claim_no_drift_correction_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
 
   /// Android AudioDeviceInfo.TYPE_BUILTIN_SPEAKER constant value (2).
   /// Mirrors AudioDeviceInfo.TYPE_BUILTIN_SPEAKER from the Android SDK.
@@ -1688,6 +1708,158 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
         frameAccountingOk;
   }
 
+  // ── X15 native transport pause/resume proof getters ───────────────────────
+
+  /// Whether this run executed the X15 native transport pause/resume proof
+  /// mode (false for every default X4..X14 run). X15 keeps the muted default
+  /// sink and is isolated from X5..X14.
+  bool get pauseResumeProofEnabled => _boolFact('pauseResumeProofEnabled');
+
+  /// Whether native transport pause/resume was exercised in the pre-seek
+  /// epoch.
+  bool get pauseResumeExercised => _boolFact('pauseResumeExercised');
+
+  /// Whether the native Pause command was enqueued, processed, and
+  /// confirmed with steady_clock sampled at execution.
+  bool get pauseResumeNativePauseOk => _boolFact('pauseResumeNativePauseOk');
+
+  /// Whether AudioTrack.pause() was called after the native pause command
+  /// and confirmed PLAYSTATE_PAUSED.
+  bool get pauseResumeSinkPausedOk => _boolFact('pauseResumeSinkPausedOk');
+
+  /// Whether dispatch and pushed frame totals remained frozen across the
+  /// bounded ~150ms hold with at least one worker paused wait observed.
+  bool get pauseResumeHoldFrozenOk => _boolFact('pauseResumeHoldFrozenOk');
+
+  /// Whether AudioTrack.play() was called to resume the sink and confirmed
+  /// PLAYSTATE_PLAYING.
+  bool get pauseResumeSinkResumedOk => _boolFact('pauseResumeSinkResumedOk');
+
+  /// Whether the native Resume command was enqueued, processed, and
+  /// confirmed with steady_clock sampled at execution.
+  bool get pauseResumeNativeResumeOk => _boolFact('pauseResumeNativeResumeOk');
+
+  /// Elapsed wall-clock time of the paused hold in milliseconds (-1 if never).
+  int get pauseResumeHoldMs => _intFact('pauseResumeHoldMs', -1);
+
+  /// Unrendered frames pending in the source rings at the moment of pause
+  /// (-1 if never; must be > 0).
+  int get pauseResumeFramesPendingAtPause =>
+      _intFact('pauseResumeFramesPendingAtPause', -1);
+
+  /// AudioTrack playstate observed right after the native pause command and
+  /// sink pause (-1 if never; 2 == PLAYSTATE_PAUSED).
+  int get playStateAfterNativePause =>
+      _intFact('playStateAfterNativePause', -1);
+
+  /// AudioTrack playstate observed right after sink resume and native resume
+  /// command (-1 if never; 3 == PLAYSTATE_PLAYING).
+  int get playStateAfterNativeResume =>
+      _intFact('playStateAfterNativeResume', -1);
+
+  /// Command sequence number of the native Pause command (-1 if never).
+  int get pauseProofCommandSeq => _intFact('pauseProofCommandSeq', -1);
+
+  /// Command sequence number of the native Resume command (-1 if never).
+  int get resumeProofCommandSeq => _intFact('resumeProofCommandSeq', -1);
+
+  /// Worker dispatch count captured at the moment of pause (-1 if never).
+  int get pauseProofDispatchCountAtPause =>
+      _intFact('pauseProofDispatchCountAtPause', -1);
+
+  /// Total frames pushed captured at the moment of pause (-1 if never).
+  int get pauseProofTotalFramesPushedAtPause =>
+      _intFact('pauseProofTotalFramesPushedAtPause', -1);
+
+  /// Worker dispatch count captured after the bounded hold (-1 if never).
+  int get pauseProofDispatchCountAfterHold =>
+      _intFact('pauseProofDispatchCountAfterHold', -1);
+
+  /// Total frames pushed captured after the bounded hold (-1 if never).
+  int get pauseProofTotalFramesPushedAfterHold =>
+      _intFact('pauseProofTotalFramesPushedAfterHold', -1);
+
+  /// Worker paused waits counter captured at the moment of pause (-1 if never).
+  int get pauseProofPausedWaitsAtPause =>
+      _intFact('pauseProofPausedWaitsAtPause', -1);
+
+  /// Worker paused waits counter captured after the bounded hold (-1 if never).
+  int get pauseProofPausedWaitsAfterHold =>
+      _intFact('pauseProofPausedWaitsAfterHold', -1);
+
+  /// Whether the native worker thread is currently in the paused state (must
+  /// be false at session end).
+  bool get nativePaused => _boolFact('nativePaused');
+
+  /// Total Pause commands processed by the native worker (must be 1).
+  int get nativePauseCommandsProcessed =>
+      _intFact('nativePauseCommandsProcessed', -1);
+
+  /// Total Resume commands processed by the native worker (must be 1).
+  int get nativeResumeCommandsProcessed =>
+      _intFact('nativeResumeCommandsProcessed', -1);
+
+  /// Total worker loop waits while in the paused state (must be > 0).
+  int get nativeWorkerPausedWaits => _intFact('nativeWorkerPausedWaits', -1);
+
+  /// Duration of the last paused interval in nanoseconds (must be > 0).
+  int get nativeLastPausedIntervalNs =>
+      _intFact('nativeLastPausedIntervalNs', -1);
+
+  /// Cumulative paused duration in nanoseconds (must be > 0).
+  int get nativeTotalPausedNs => _intFact('nativeTotalPausedNs', -1);
+
+  /// Paused duration excluded from the native 1-second timing gate in
+  /// nanoseconds (must be > 0).
+  int get nativeTimingPausedExcludedNs =>
+      _intFact('nativeTimingPausedExcludedNs', -1);
+
+  /// Whether the native session confirmed dispatch was frozen while paused.
+  bool get nativePausedDispatchFrozenOk =>
+      _boolFact('nativePausedDispatchFrozenOk');
+
+  /// X15 native transport pause/resume response gate.
+  /// In X15 mode: validates that native pause and resume commands were
+  /// processed in order (pause seq >= 0, resume seq > pause seq, 1 pause cmd,
+  /// 1 resume cmd), the sink was paused (PLAYSTATE_PAUSED = 2) and resumed
+  /// (PLAYSTATE_PLAYING = 3), the worker dispatch and push counts remained
+  /// frozen across the bounded hold with paused wait observed, worker is not
+  /// left paused, last paused interval > 0, worker paused waits > 0, frames
+  /// pending at pause > 0, four commands processed, and lossless muted sink
+  /// accounting / checksum identity / frame accounting held.
+  /// In default X4..X14 modes: vacuously true (backward compatible).
+  bool get pauseResumeGatesHeld {
+    if (!pauseResumeProofEnabled) return true;
+    return pauseResumeExercised &&
+        pauseResumeNativePauseOk &&
+        pauseResumeSinkPausedOk &&
+        pauseResumeHoldFrozenOk &&
+        pauseResumeSinkResumedOk &&
+        pauseResumeNativeResumeOk &&
+        nativePauseCommandsProcessed == 1 &&
+        nativeResumeCommandsProcessed == 1 &&
+        nativePausedDispatchFrozenOk &&
+        !nativePaused &&
+        nativeLastPausedIntervalNs > 0 &&
+        nativeWorkerPausedWaits > 0 &&
+        pauseResumeFramesPendingAtPause > 0 &&
+        playStateAfterNativePause == 2 &&
+        playStateAfterNativeResume == 3 &&
+        pauseProofCommandSeq >= 0 &&
+        resumeProofCommandSeq > pauseProofCommandSeq &&
+        pauseProofDispatchCountAtPause >= 0 &&
+        pauseProofDispatchCountAfterHold == pauseProofDispatchCountAtPause &&
+        pauseProofTotalFramesPushedAtPause >= 0 &&
+        pauseProofTotalFramesPushedAfterHold ==
+            pauseProofTotalFramesPushedAtPause &&
+        pauseProofPausedWaitsAfterHold > pauseProofPausedWaitsAtPause &&
+        controlCommandSerializationOk &&
+        mutedOutputOk &&
+        sinkWriteAccountingOk &&
+        checksumIdentityOk &&
+        frameAccountingOk;
+  }
+
   /// Whether [proofBoundary] matches the canonical Kotlin driver boundary
   /// for this run's mode. X8 runs must carry the mode-specific
   /// [focusDuckRestoreProofBoundaryConstant], X9 runs the mode-specific
@@ -1698,13 +1870,14 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   /// standalone runs the mode-specific
   /// [timestampStabilizationProofBoundaryConstant], X13+X12 composed
   /// runs the mode-specific
-  /// [timestampStabilizationDeadObjectRecoveryProofBoundaryConstant], and
+  /// [timestampStabilizationDeadObjectRecoveryProofBoundaryConstant],
   /// X14 runs the mode-specific
-  /// [audibleSpeakerPlaybackProofBoundaryConstant] — never the default
-  /// boundary, whose muted/no-focus/no-recreation/no-timestamp-gate/no-speaker-route
-  /// claims would be false for X8..X14.
-  bool get hasCanonicalProofBoundary =>
-      timestampStabilizationProofEnabled && deadObjectRecoveryProofEnabled
+  /// [audibleSpeakerPlaybackProofBoundaryConstant], and X15 runs the
+  /// mode-specific [pauseResumeProofBoundaryConstant] — never the default
+  /// boundary, whose non-claims/properties would not match X8..X15 modes.
+  bool get hasCanonicalProofBoundary => pauseResumeProofEnabled
+      ? proofBoundary == pauseResumeProofBoundaryConstant
+      : timestampStabilizationProofEnabled && deadObjectRecoveryProofEnabled
       ? proofBoundary ==
             timestampStabilizationDeadObjectRecoveryProofBoundaryConstant
       : timestampStabilizationProofEnabled
@@ -1789,7 +1962,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       pass &&
       status.toLowerCase() == 'pass' &&
       marker ==
-          (timestampStabilizationProofEnabled
+          (pauseResumeProofEnabled
+              ? pauseResumePassMarkerConstant
+              : timestampStabilizationProofEnabled
               ? timestampStabilizationPassMarkerConstant
               : deadObjectRecoveryProofEnabled
               ? deadObjectRecoveryPassMarkerConstant
@@ -1838,6 +2013,8 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       audibleSpeakerPlaybackGatesHeld &&
       (!audibleSpeakerPlaybackProofEnabled ||
           _boolFact('audibleSpeakerPlaybackGatesHeld')) &&
+      pauseResumeGatesHeld &&
+      (!pauseResumeProofEnabled || _boolFact('pauseResumeGatesHeld')) &&
       hasCanonicalProofBoundary &&
       nativeProofBoundaryOk &&
       formatProbeOk &&
@@ -1875,8 +2052,8 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       ownerThreadAffinityOk &&
       workerThreadDistinct &&
       ownerDispatchCalls == 0 &&
-      commandsEnqueued == 2 &&
-      commandsProcessed == 2 &&
+      commandsEnqueued == (pauseResumeProofEnabled ? 4 : 2) &&
+      commandsProcessed == (pauseResumeProofEnabled ? 4 : 2) &&
       commandErrors == 0 &&
       checksumsMatch &&
       providerCountersClean &&
@@ -2295,6 +2472,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
     bool deadObjectRecoveryProofEnabled = false,
     bool timestampStabilizationProofEnabled = false,
     bool audibleSpeakerPlaybackProofEnabled = false,
+    bool pauseResumeProofEnabled = false,
     Duration? timeout,
     MethodChannel? channel,
   }) async {
@@ -2358,6 +2536,10 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       // coordinator never derives X7 or any other mode flag from it.
       if (audibleSpeakerPlaybackProofEnabled)
         'audibleSpeakerPlaybackProofEnabled': true,
+      // Only sent for X15 transport pause/resume proof runs so the default
+      // X4..X14 argument shape stays frozen. X15 is isolated: the coordinator
+      // never derives X5..X14 flags from it.
+      if (pauseResumeProofEnabled) 'pauseResumeProofEnabled': true,
     };
     try {
       final future = ch.invokeMethod<Object?>(methodName, args);

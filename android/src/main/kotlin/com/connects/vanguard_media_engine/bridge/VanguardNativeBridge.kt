@@ -960,6 +960,33 @@ class VanguardNativeBridge(
             targetPtsUs: Long,
         ): String
 
+        // X15 (P4-AUDIO-ASYNC-RUNTIME-QUEUE-PAUSE-RESUME) diagnostic
+        // transport pause: enqueue-only, no time argument
+        // (status=enqueued;commandSeq=N, or not_found / wrong_owner_thread /
+        // not_started / pause_already_pending_or_paused / queue_full). The
+        // worker samples steady_clock itself and executes
+        // coordinator.pause(now); while paused it dispatches no frames and
+        // publishes paused=true, dispatchCountAtPause /
+        // totalFramesPushedAtPause and workerPausedWaits. Not a production
+        // presentation pause; no pause/resume SLA, A/V sync, or drift
+        // correction claim.
+        external fun pauseAsyncRuntimeQueueMultiSourceRealtimeClock(
+            handle: Long,
+        ): String
+
+        // X15 diagnostic transport resume: enqueue-only, no time argument
+        // (status=enqueued;commandSeq=N, or not_found / wrong_owner_thread /
+        // not_started / resume_not_paused / queue_full). The worker samples
+        // steady_clock itself and executes coordinator.resume(now); the
+        // clock continues from the frozen media position and the worker
+        // publishes resumeCommandsProcessed, dispatchCountAtResume /
+        // totalFramesPushedAtResume, lastPausedIntervalNs and
+        // pausedDispatchFrozenOk. A seek while a pause is pending or in
+        // effect is rejected (seek_rejected_paused).
+        external fun resumeAsyncRuntimeQueueMultiSourceRealtimeClock(
+            handle: Long,
+        ): String
+
         // Owner-thread source-ring producer for ONE track through that
         // track's NODE-OWNED writer. Accepted frames are clamped to
         // min(frameCount, 8192, framesThatFitInBuffer); writer

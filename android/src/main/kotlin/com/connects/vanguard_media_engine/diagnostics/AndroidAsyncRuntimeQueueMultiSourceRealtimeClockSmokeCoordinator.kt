@@ -148,6 +148,21 @@ import java.util.concurrent.atomic.AtomicInteger
  * lane only: the routed-device type is an OS routing report, never an
  * automatic acoustic-audibility, loudness, or SNR claim.
  *
+ * X15 (P4-AUDIO-ASYNC-RUNTIME-QUEUE-PAUSE-RESUME) diagnostic native
+ * transport pause/resume proof: when pauseResumeProofEnabled=true the
+ * coordinator only parses and passes the flag through (never OR-ed into any
+ * other flag; no focus request, noisy receiver, routing listener, event
+ * queue, or AudioManager setup). The whole lane is driver-owned on its
+ * owner thread: once, inside the pre-seek epoch after the sink is PLAYING,
+ * the driver enqueues the native Pause (worker-sampled steady_clock),
+ * pauses the muted AudioTrack, holds ~150ms without reading output, proves
+ * dispatchCount/totalFramesPushed unchanged, plays the AudioTrack and
+ * enqueues the native Resume, so the command order is start, pause, resume,
+ * seek. The driver keeps the muted default sink and fails closed
+ * (pause_resume_mode_not_isolated) for X15 combined with X5..X14.
+ * Diagnostic only: not a production presentation pause, no pause/resume
+ * SLA, no A/V sync, no drift correction.
+ *
  * Honest non-claims (Proof Boundary): diagnostic only — the worker-owned
  * steady_clock is a render/dispatch timebase, not a presentation clock; no
  * caller-supplied native time; playback head / AudioTimestamp / underrun
@@ -457,6 +472,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
         // gain itself and rejects X14 combined with X5 or X7..X13.
         val audibleSpeakerPlaybackRequested =
             (args?.get("audibleSpeakerPlaybackProofEnabled") as? Boolean) ?: false
+        // X15 is driver-owned and isolated: it does NOT imply the X5
+        // envelope, X6 gain, X7 focus/noisy setup, X8..X11 event planes, X12
+        // recreation, X13 timestamp gate, or X14 audible route and is never
+        // OR-ed into any other flag; the driver rejects X15 combined with
+        // X5..X14 and keeps the muted default sink.
+        val pauseResumeRequested =
+            (args?.get("pauseResumeProofEnabled") as? Boolean) ?: false
         val config = AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.RunConfig(
             sourcePath = args?.get("sourcePath") as? String ?: "",
             durationSec = ((args?.get("durationSec") as? Number)?.toDouble() ?: 2.0)
@@ -512,6 +534,9 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
             // X14 audible built-in-speaker route diagnostic proof mode;
             // absent/false preserves the exact X4..X13 behavior and args.
             audibleSpeakerPlaybackProofEnabled = audibleSpeakerPlaybackRequested,
+            // X15 native transport pause/resume diagnostic proof mode;
+            // absent/false preserves the exact X4..X14 behavior and args.
+            pauseResumeProofEnabled = pauseResumeRequested,
         )
         if (!active.compareAndSet(false, true)) {
             result.error(

@@ -208,6 +208,52 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         private set
     var snapProofBoundary = ""
         private set
+    // X15 pause/resume telemetry folded from the snapshot (defaults keep the
+    // X4..X14 shape: never paused, zero pause/resume commands).
+    var snapPaused = false
+        private set
+    var snapPauseCommandsProcessed = -1L
+        private set
+    var snapResumeCommandsProcessed = -1L
+        private set
+    var snapWorkerPausedWaits = -1L
+        private set
+    var snapLastPausedIntervalNs = -1L
+        private set
+    var snapTotalPausedNs = -1L
+        private set
+    var snapTimingPausedExcludedNs = -1L
+        private set
+    var snapPausedDispatchFrozenOk = false
+        private set
+    // X15 owner-side pause/resume proof facts, recorded by
+    // [pauseAndAwaitProof] / [assertPausedHoldFrozen] / [resumeAndAwaitProof].
+    var pauseProofCommandSeq = -1L
+        private set
+    var resumeProofCommandSeq = -1L
+        private set
+    var pauseProofDispatchCountAtPause = -1L
+        private set
+    var pauseProofTotalFramesPushedAtPause = -1L
+        private set
+    var pauseProofNextDispatchFrameAtPause = -1L
+        private set
+    var pauseProofFramesPendingAtPause = -1L
+        private set
+    var pauseProofPausedWaitsAtPause = -1L
+        private set
+    var pauseProofDispatchCountAfterHold = -1L
+        private set
+    var pauseProofTotalFramesPushedAfterHold = -1L
+        private set
+    var pauseProofPausedWaitsAfterHold = -1L
+        private set
+    var pauseProofNativePauseOk = false
+        private set
+    var pauseProofHoldFrozenOk = false
+        private set
+    var pauseProofNativeResumeOk = false
+        private set
     var lastStatus = ""
         private set
 
@@ -471,6 +517,99 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         }
     }
 
+    // ── X15 diagnostic transport pause/resume (owner thread; no time value
+    // crosses JNI; the worker samples steady_clock itself) ─────────────────
+
+    // Enqueues the native Pause command, awaits the worker's execution
+    // (command seq strictly next, lastCommandResult=ok, zero command
+    // errors) and records the frozen dispatch/push totals from the very
+    // snapshot that reported the command processed (the worker publishes
+    // that snapshot after skipping dispatch for the paused loop pass).
+    fun pauseAndAwaitProof(): Map<String, String> {
+        if (pauseProofCommandSeq >= 0L) throw Failure("pause_proof_already_exercised")
+        val kv = parseNative(
+            VanguardNativeBridge.pauseAsyncRuntimeQueueMultiSourceRealtimeClock(handle)
+        )
+        if (kv["status"] != "enqueued") throw Failure("pause_not_enqueued_${kv["status"]}")
+        val seq = ++nextCommandSeq
+        if (longField(kv, "commandSeq") != seq) throw Failure("pause_command_seq_mismatch")
+        val snap = awaitCommandProcessed(seq)
+        if (snap["paused"] != "true" ||
+            longField(snap, "pauseCommandsProcessed") != 1L ||
+            longField(snap, "resumeCommandsProcessed") != 0L
+        ) {
+            throw Failure("pause_state_mismatch")
+        }
+        pauseProofCommandSeq = seq
+        pauseProofDispatchCountAtPause = longField(snap, "dispatchCount")
+        pauseProofTotalFramesPushedAtPause = longField(snap, "totalFramesPushed")
+        pauseProofNextDispatchFrameAtPause = longField(snap, "nextDispatchFrame")
+        pauseProofFramesPendingAtPause =
+            totalFramesAcceptedTrack[0] - pauseProofNextDispatchFrameAtPause
+        pauseProofPausedWaitsAtPause = longField(snap, "workerPausedWaits")
+        if (longField(snap, "dispatchCountAtPause") != pauseProofDispatchCountAtPause ||
+            longField(snap, "totalFramesPushedAtPause") != pauseProofTotalFramesPushedAtPause
+        ) {
+            throw Failure("pause_worker_totals_mismatch")
+        }
+        pauseProofNativePauseOk = true
+        return snap
+    }
+
+    // Snapshot-only (no output read, no command) proof taken after the
+    // driver's bounded paused hold: still paused, dispatchCount and
+    // totalFramesPushed exactly as at the pause, at least one worker paused
+    // wait observed since the pause, and zero command errors.
+    fun assertPausedHoldFrozen(): Map<String, String> {
+        if (!pauseProofNativePauseOk) throw Failure("pause_hold_without_pause")
+        val snap = snapshot()
+        pauseProofDispatchCountAfterHold = snapDispatchCount
+        pauseProofTotalFramesPushedAfterHold = snapTotalFramesPushed
+        pauseProofPausedWaitsAfterHold = snapWorkerPausedWaits
+        if (!snapPaused) throw Failure("pause_hold_not_paused")
+        if (snapCommandErrors != 0L) throw Failure("pause_hold_command_errors")
+        if (pauseProofDispatchCountAfterHold != pauseProofDispatchCountAtPause ||
+            pauseProofTotalFramesPushedAfterHold != pauseProofTotalFramesPushedAtPause ||
+            longField(snap, "nextDispatchFrame") != pauseProofNextDispatchFrameAtPause
+        ) {
+            throw Failure("pause_hold_dispatch_not_frozen")
+        }
+        if (pauseProofPausedWaitsAfterHold <= pauseProofPausedWaitsAtPause) {
+            throw Failure("pause_hold_wait_not_observed")
+        }
+        pauseProofHoldFrozenOk = true
+        return snap
+    }
+
+    // Enqueues the native Resume command and awaits its execution: the
+    // worker must report not paused, exactly one resume processed, and its
+    // own pause->resume frozen-dispatch verdict true with the resume-time
+    // totals equal to the pause-time totals.
+    fun resumeAndAwaitProof(): Map<String, String> {
+        if (!pauseProofHoldFrozenOk) throw Failure("resume_before_hold_proof")
+        if (resumeProofCommandSeq >= 0L) throw Failure("resume_proof_already_exercised")
+        val kv = parseNative(
+            VanguardNativeBridge.resumeAsyncRuntimeQueueMultiSourceRealtimeClock(handle)
+        )
+        if (kv["status"] != "enqueued") throw Failure("resume_not_enqueued_${kv["status"]}")
+        val seq = ++nextCommandSeq
+        if (longField(kv, "commandSeq") != seq) throw Failure("resume_command_seq_mismatch")
+        val snap = awaitCommandProcessed(seq)
+        if (snap["paused"] != "false" ||
+            longField(snap, "pauseCommandsProcessed") != 1L ||
+            longField(snap, "resumeCommandsProcessed") != 1L ||
+            snap["pausedDispatchFrozenOk"] != "true" ||
+            longField(snap, "dispatchCountAtResume") != pauseProofDispatchCountAtPause ||
+            longField(snap, "totalFramesPushedAtResume") != pauseProofTotalFramesPushedAtPause ||
+            longField(snap, "lastPausedIntervalNs") <= 0L
+        ) {
+            throw Failure("resume_state_mismatch")
+        }
+        resumeProofCommandSeq = seq
+        pauseProofNativeResumeOk = true
+        return snap
+    }
+
     // Consumes the pending output-ring seek ack (ack-only read) after the
     // post-seek lockstep source prefill: the ack must land at exactly the
     // seek target frame with zero discarded frames.
@@ -616,6 +755,14 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession(
         snapEnvelopeEvaluations = longField(kv, "envelopeEvaluations")
         snapMinEffectiveGain = doubleField(kv, "minEffectiveGain")
         snapMaxEffectiveGain = doubleField(kv, "maxEffectiveGain")
+        snapPaused = kv["paused"] == "true"
+        snapPauseCommandsProcessed = longField(kv, "pauseCommandsProcessed")
+        snapResumeCommandsProcessed = longField(kv, "resumeCommandsProcessed")
+        snapWorkerPausedWaits = longField(kv, "workerPausedWaits")
+        snapLastPausedIntervalNs = longField(kv, "lastPausedIntervalNs")
+        snapTotalPausedNs = longField(kv, "totalPausedNs")
+        snapTimingPausedExcludedNs = longField(kv, "timingPausedExcludedNs")
+        snapPausedDispatchFrozenOk = kv["pausedDispatchFrozenOk"] == "true"
         snapProofBoundary = kv["proofBoundary"] ?: ""
         return kv
     }

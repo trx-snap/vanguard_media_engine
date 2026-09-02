@@ -287,6 +287,34 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         const val AUDIBLE_SPEAKER_PLAYBACK_PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audible_speaker_playback_diagnostic_proof_only_sm_a566b_manual_acoustic_observation_lane_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_base_gain_0_5_owner_thread_routed_device_sampled_after_each_epoch_play_type_builtin_speaker_required_os_routing_report_only_no_automatic_acoustic_audibility_claim_no_loudness_snr_claim_no_speaker_verification_beyond_routed_device_type_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_timestamp_stabilization_gate_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_drift_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
+        // X15 (P4-AUDIO-ASYNC-RUNTIME-QUEUE-PAUSE-RESUME) markers, emitted
+        // only for native transport pause/resume proof runs; X4..X14 markers
+        // remain authoritative for their respective modes.
+        const val PAUSE_RESUME_PASS_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_TRANSPORT_PAUSE_RESUME_SMOKE_PASS"
+        const val PAUSE_RESUME_FAIL_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_TRANSPORT_PAUSE_RESUME_SMOKE_FAIL"
+
+        // X15 mode-specific proof boundary: replaces the default boundary for
+        // native transport pause/resume runs. Muted default sink kept; once,
+        // inside the pre-seek epoch after the sink asserted PLAYSTATE_PLAYING
+        // and strictly before the joint seek (command order start, pause,
+        // resume, seek), the worker-owned steady_clock Pause/Resume commands
+        // (no caller-supplied time) are coordinated with AudioTrack.pause()/
+        // play() playstate only, a bounded ~150ms hold with no output read
+        // proves dispatchCount/totalFramesPushed unchanged, and the worker
+        // excludes its own observed paused interval from the one-second
+        // timing gate. DIAGNOSTIC only: not a production presentation pause;
+        // no pause/resume SLA, A/V sync, drift correction, latency, glitch,
+        // xrun or underrun-freedom claim; no product/editor/app wiring,
+        // export route, streaming/cache, or iOS; zero C++ primitive changes.
+        const val PAUSE_RESUME_PROOF_BOUNDARY =
+            "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_transport_pause_resume_diagnostic_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_pause_resume_commands_no_caller_supplied_native_time_worker_samples_steady_clock_at_execution_coordinator_pause_resume_delegates_to_audio_clock_media_position_preserved_no_dispatch_while_paused_once_in_pre_seek_epoch_after_sink_playing_command_order_start_pause_resume_seek_sink_side_audiotrack_playstate_pause_play_only_no_flush_no_stop_bounded_150ms_hold_no_output_read_dispatch_count_and_total_frames_pushed_unchanged_across_hold_paused_interval_excluded_from_native_one_second_timing_gate_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_not_production_presentation_pause_no_pause_resume_sla_no_avsync_claim_no_drift_correction_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
+
+        // X15 bounded diagnostic paused hold (no output read, no native
+        // call) between the sink pause and the frozen-dispatch snapshot.
+        private const val PAUSE_RESUME_HOLD_MS = 150L
+
         // Frozen X3 decode dequeue timeout: the realtime loop must return
         // to ingest/drain work quickly.
         private const val DEQUEUE_TIMEOUT_US = 2_000L
@@ -430,6 +458,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // combining X14 with X5 or X7..X13 fails closed): false preserves
         // the exact X4..X13 behavior and args.
         val audibleSpeakerPlaybackProofEnabled: Boolean = false,
+        // X15 mode switch (native transport pause/resume diagnostic; keeps
+        // the muted default sink and implies NOTHING else — NOT X5 envelope,
+        // X6 gain, X7 focus/noisy, X8..X11 event planes, X12 recreation, X13
+        // timestamp gate, or X14 audible route; combining X15 with X5..X14
+        // fails closed): false preserves the exact X4..X14 behavior and
+        // args (no Pause/Resume command is ever enqueued).
+        val pauseResumeProofEnabled: Boolean = false,
     )
 
     // X8 (P4-AUDIO-FOCUS-DUCK-RESTORE-RESPONSE) synthetic duck/restore event
@@ -701,6 +736,20 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
     private var audibleSpeakerRouteType = -1
     private var audibleSpeakerBuiltInSpeakerRouteOk = false
     private var audibleSpeakerPlaybackGatesHeld = false
+    // X15 native transport pause/resume proof state (owner thread only;
+    // exercised exactly once inside the pre-seek epoch). Playstate values
+    // are sink-side telemetry only.
+    private var pauseResumeExercised = false
+    private var pauseResumeNativePauseOk = false
+    private var pauseResumeSinkPausedOk = false
+    private var pauseResumeHoldFrozenOk = false
+    private var pauseResumeSinkResumedOk = false
+    private var pauseResumeNativeResumeOk = false
+    private var pauseResumeGatesHeld = false
+    private var pauseResumeHoldMs = -1L
+    private var pauseResumeFramesPendingAtPause = -1L
+    private var playStateAfterNativePause = -1
+    private var playStateAfterNativeResume = -1
     // X7 focus/noisy event-plane drain function (coordinator-supplied, owner-thread only).
     private var drainEventsFn: (() -> Int)? = null
     // X8 focus-duck/restore state. Owner thread only mutates AudioTrack gain;
@@ -949,6 +998,27 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                     config.timestampStabilizationProofEnabled)
             ) {
                 throw FailClosed("audible_speaker_playback_mode_not_isolated")
+            }
+            // X15 is an isolated muted lane: the X5 envelope changes the
+            // mixed PCM, X6/X14 un-mute the sink (the X15 boundary claims a
+            // muted sink), the X7..X11 event planes mutate playstate/gain/
+            // routing on the same track (X9/X10/X11 pause it), X12 recreates
+            // the sink, and the X13 gate keys off per-epoch play(); every
+            // such combination is undefined for the pause/resume proof and
+            // fails closed before any track exists.
+            if (config.pauseResumeProofEnabled &&
+                (config.envelopeProofEnabled ||
+                    config.nonZeroGainSinkProofEnabled ||
+                    config.focusNoisyEventHandoffProofEnabled ||
+                    config.focusDuckRestoreProofEnabled ||
+                    config.focusLossPauseResumeProofEnabled ||
+                    config.permanentFocusLossProofEnabled ||
+                    config.routeChangeEventHandoffProofEnabled ||
+                    config.deadObjectRecoveryProofEnabled ||
+                    config.timestampStabilizationProofEnabled ||
+                    config.audibleSpeakerPlaybackProofEnabled)
+            ) {
+                throw FailClosed("pause_resume_mode_not_isolated")
             }
             val windowSec = minOf(config.durationSec, HARD_MAX_DURATION_SEC)
             if (windowSec <= 0.0) throw FailClosed("invalid_decode_duration")
@@ -1312,6 +1382,14 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             if (!nativeStarted) throw FailClosed("prestart_fill_never_completed")
             detailParts.add("preStartFillFrames=$preStartFillFrames")
 
+            // ── X15: the one diagnostic native transport pause/resume,
+            // inside the still-active pre-seek epoch (the worker has
+            // ring-buffered windows left to dispatch in real time) and
+            // strictly before the joint seek ────────────────────────────────
+            if (config.pauseResumeProofEnabled) {
+                exercisePauseResumeProof(s)
+            }
+
             // ── The one pre-EOS JOINT native seek at the aligned lockstep
             // budget boundary, with the AudioTrack sink paused + flushed at
             // quiescence and NO caller-supplied time. Both tracks re-anchor
@@ -1389,10 +1467,14 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 throw FailClosed("caller_supplied_native_time_detected")
             }
 
-            controlCommandSerializationOk = s.snapCommandsEnqueued == 2L &&
-                s.snapCommandsProcessed == 2L &&
+            // X15 adds exactly one Pause and one Resume between start and
+            // seek (start, pause, resume, seek); every other lane keeps the
+            // frozen two-command shape (start, seek).
+            val expectedCommandCount = if (config.pauseResumeProofEnabled) 4L else 2L
+            controlCommandSerializationOk = s.snapCommandsEnqueued == expectedCommandCount &&
+                s.snapCommandsProcessed == expectedCommandCount &&
                 s.snapCommandErrors == 0L &&
-                s.snapLastCommandSeq == 2L &&
+                s.snapLastCommandSeq == expectedCommandCount &&
                 s.snapQueueDepth == 0L
             if (!controlCommandSerializationOk) {
                 throw FailClosed("command_serialization_mismatch")
@@ -1571,6 +1653,49 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 detailParts.add("audibleSpeakerRouteSampleCount=$audibleSpeakerRouteSampleCount")
                 detailParts.add("audibleSpeakerPlaybackGatesHeld=true")
                 detailParts.add("audibleSpeakerRoutedDeviceReportOnlyNoAutomaticAudibilityClaim")
+            }
+
+            // X15 native transport pause/resume proof gate. Only evaluated
+            // when pauseResumeProofEnabled=true; composites the owner-thread
+            // sequence facts (native pause processed, sink PLAYSTATE_PAUSED,
+            // frozen dispatch/push totals across the bounded hold with a
+            // paused wait observed, sink PLAYSTATE_PLAYING, native resume
+            // processed) with the worker's own pause->resume frozen verdict,
+            // the four-command serialization, the muted sink and the
+            // existing accounting/checksum/frame gates. Diagnostic only: not
+            // a production presentation pause; no pause/resume SLA, A/V
+            // sync, drift, latency/glitch/xrun/underrun-freedom claim.
+            if (config.pauseResumeProofEnabled) {
+                pauseResumeGatesHeld = pauseResumeExercised &&
+                    pauseResumeNativePauseOk &&
+                    pauseResumeSinkPausedOk &&
+                    pauseResumeHoldFrozenOk &&
+                    pauseResumeSinkResumedOk &&
+                    pauseResumeNativeResumeOk &&
+                    s.pauseProofNativePauseOk &&
+                    s.pauseProofHoldFrozenOk &&
+                    s.pauseProofNativeResumeOk &&
+                    s.snapPauseCommandsProcessed == 1L &&
+                    s.snapResumeCommandsProcessed == 1L &&
+                    s.snapPausedDispatchFrozenOk &&
+                    !s.snapPaused &&
+                    s.snapLastPausedIntervalNs > 0L &&
+                    s.snapWorkerPausedWaits > 0L &&
+                    pauseResumeFramesPendingAtPause > 0L &&
+                    controlCommandSerializationOk &&
+                    mutedOutputOk &&
+                    sinkWriteAccountingOk &&
+                    checksumIdentityOk &&
+                    frameAccountingOk
+                if (!pauseResumeGatesHeld) {
+                    throw FailClosed("pause_resume_gates_failed")
+                }
+                detailParts.add("pauseResumeHoldMs=$pauseResumeHoldMs")
+                detailParts.add("pauseResumeFramesPendingAtPause=$pauseResumeFramesPendingAtPause")
+                detailParts.add("nativeLastPausedIntervalNs=${s.snapLastPausedIntervalNs}")
+                detailParts.add("nativeTimingPausedExcludedNs=${s.snapTimingPausedExcludedNs}")
+                detailParts.add("pauseResumeGatesHeld=true")
+                detailParts.add("pauseResumeDiagnosticOnlyNotProductionPresentationPause")
             }
 
             // X8 focus-duck/restore response gate. The synthetic duck must
@@ -2452,6 +2577,77 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         }
     }
 
+    // X15 (P4-AUDIO-ASYNC-RUNTIME-QUEUE-PAUSE-RESUME) diagnostic native
+    // transport pause/resume proof, exercised exactly once on the owner
+    // thread inside the pre-seek epoch: after the phase-1 decode committed
+    // the whole pre-seek budget (the worker still has ring-buffered windows
+    // to dispatch in real time), after the sink epoch's play() asserted
+    // PLAYSTATE_PLAYING, and strictly before the joint seek, so the command
+    // order is start, pause, resume, seek. Sequence: native Pause enqueued +
+    // awaited (worker-sampled steady_clock, no time value crosses JNI),
+    // AudioTrack.pause() + PLAYSTATE_PAUSED asserted, a bounded hold with
+    // NO output read and no native call, a snapshot proving
+    // dispatchCount/totalFramesPushed/nextDispatchFrame unchanged and a
+    // paused worker wait observed, AudioTrack.play() + PLAYSTATE_PLAYING
+    // asserted, then native Resume enqueued + awaited. Muted diagnostic
+    // sink, playstate only (no flush/stop): not a production presentation
+    // pause; no pause/resume SLA, A/V sync, drift correction, or
+    // latency/glitch/xrun/underrun-freedom claim.
+    private fun exercisePauseResumeProof(
+        s: AndroidAsyncRuntimeQueueMultiSourceRealtimeClockNativeSession,
+    ) {
+        assertOwnerThread("pause_resume_proof")
+        if (pauseResumeExercised) throw FailClosed("pause_resume_already_exercised")
+        pauseResumeExercised = true
+        val track = audioTrack ?: throw FailClosed("audio_track_missing")
+        // 1. Confirm active playback: keep draining output to the sink until
+        // the per-epoch pre-roll gate opened play() (normally already true
+        // after the >1s pre-seek stream).
+        while (!epochPlayed) {
+            checkDeadline()
+            if (s.drainAvailableOutput() == 0L) Thread.sleep(ZERO_WRITE_SLEEP_MS)
+        }
+        if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+            throw FailClosed("pause_resume_track_not_playing_before_pause")
+        }
+        // 2. Native transport pause, awaited; the worker must still have
+        // pre-seek windows pending so the frozen-dispatch claim is not
+        // vacuous.
+        s.pauseAndAwaitProof()
+        pauseResumeFramesPendingAtPause = s.pauseProofFramesPendingAtPause
+        if (pauseResumeFramesPendingAtPause <= 0L) {
+            throw FailClosed("pause_resume_no_frames_pending_at_pause")
+        }
+        pauseResumeNativePauseOk = true
+        // 3. Sink pause: playstate only (no flush/stop).
+        track.pause()
+        playStateAfterNativePause = track.playState
+        if (playStateAfterNativePause != AudioTrack.PLAYSTATE_PAUSED) {
+            throw FailClosed("pause_resume_track_not_paused")
+        }
+        pauseResumeSinkPausedOk = true
+        // 4. Bounded diagnostic hold: no output read, no native call.
+        val holdStartMs = SystemClock.elapsedRealtime()
+        Thread.sleep(PAUSE_RESUME_HOLD_MS)
+        pauseResumeHoldMs = SystemClock.elapsedRealtime() - holdStartMs
+        checkDeadline()
+        // 5. Frozen-dispatch proof from a snapshot only.
+        s.assertPausedHoldFrozen()
+        pauseResumeHoldFrozenOk = true
+        // 6. Sink resume: playstate only.
+        track.play()
+        playStateAfterNativeResume = track.playState
+        if (playStateAfterNativeResume != AudioTrack.PLAYSTATE_PLAYING) {
+            throw FailClosed("pause_resume_track_not_playing_after_play")
+        }
+        pauseResumeSinkResumedOk = true
+        // 7. Native transport resume, awaited; the existing seek/EOS path
+        // continues from here.
+        s.resumeAndAwaitProof()
+        pauseResumeNativeResumeOk = true
+        detailParts.add("pauseResumeExercisedInPreSeekEpoch")
+    }
+
     // Runs at the seek quiescent boundary (inside the session's seek, after
     // the full boundary drain, before the native joint seek is enqueued):
     // zero staged residual asserted, epoch-0 sink discard accounting
@@ -3297,6 +3493,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "dynamicGainEnvelopeOk" to dynamicGainEnvelopeOk,
             "nonZeroGainSinkGatesHeld" to nonZeroGainSinkGatesHeld,
             "audibleSpeakerPlaybackGatesHeld" to audibleSpeakerPlaybackGatesHeld,
+            "pauseResumeNativePauseOk" to pauseResumeNativePauseOk,
+            "pauseResumeSinkPausedOk" to pauseResumeSinkPausedOk,
+            "pauseResumeHoldFrozenOk" to pauseResumeHoldFrozenOk,
+            "pauseResumeSinkResumedOk" to pauseResumeSinkResumedOk,
+            "pauseResumeNativeResumeOk" to pauseResumeNativeResumeOk,
+            "pauseResumeGatesHeld" to pauseResumeGatesHeld,
             "routingListenerRegisteredOk" to routingListenerRegisteredOk,
             "routingListenerUnregisteredOk" to routingListenerUnregisteredOk,
             "routeChangeObservationOk" to routeChangeObservationOk,
@@ -3534,8 +3736,37 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "audibleSpeakerRouteType" to audibleSpeakerRouteType,
             "audibleSpeakerBuiltInSpeakerRouteOk" to audibleSpeakerBuiltInSpeakerRouteOk,
             "audibleSpeakerPlaybackGatesHeld" to audibleSpeakerPlaybackGatesHeld,
+            "pauseResumeProofEnabled" to config.pauseResumeProofEnabled,
+            "pauseResumeExercised" to pauseResumeExercised,
+            "pauseResumeHoldMs" to pauseResumeHoldMs,
+            "pauseResumeFramesPendingAtPause" to pauseResumeFramesPendingAtPause,
+            "playStateAfterNativePause" to playStateAfterNativePause,
+            "playStateAfterNativeResume" to playStateAfterNativeResume,
+            "pauseProofCommandSeq" to (s?.pauseProofCommandSeq ?: -1L),
+            "resumeProofCommandSeq" to (s?.resumeProofCommandSeq ?: -1L),
+            "pauseProofDispatchCountAtPause" to (s?.pauseProofDispatchCountAtPause ?: -1L),
+            "pauseProofTotalFramesPushedAtPause" to
+                (s?.pauseProofTotalFramesPushedAtPause ?: -1L),
+            "pauseProofDispatchCountAfterHold" to (s?.pauseProofDispatchCountAfterHold ?: -1L),
+            "pauseProofTotalFramesPushedAfterHold" to
+                (s?.pauseProofTotalFramesPushedAfterHold ?: -1L),
+            "pauseProofPausedWaitsAtPause" to (s?.pauseProofPausedWaitsAtPause ?: -1L),
+            "pauseProofPausedWaitsAfterHold" to (s?.pauseProofPausedWaitsAfterHold ?: -1L),
+            "nativePaused" to (s?.snapPaused ?: false),
+            "nativePauseCommandsProcessed" to (s?.snapPauseCommandsProcessed ?: -1L),
+            "nativeResumeCommandsProcessed" to (s?.snapResumeCommandsProcessed ?: -1L),
+            "nativeWorkerPausedWaits" to (s?.snapWorkerPausedWaits ?: -1L),
+            "nativeLastPausedIntervalNs" to (s?.snapLastPausedIntervalNs ?: -1L),
+            "nativeTotalPausedNs" to (s?.snapTotalPausedNs ?: -1L),
+            "nativeTimingPausedExcludedNs" to (s?.snapTimingPausedExcludedNs ?: -1L),
+            "nativePausedDispatchFrozenOk" to (s?.snapPausedDispatchFrozenOk ?: false),
+            "pauseResumeGatesHeld" to pauseResumeGatesHeld,
         )
         val marker = when {
+            // X15 (isolated from X5..X14) owns the marker for pause/resume
+            // proof runs.
+            config.pauseResumeProofEnabled ->
+                if (pass) PAUSE_RESUME_PASS_MARKER else PAUSE_RESUME_FAIL_MARKER
             // X13 (standalone or composed with X12) owns the marker; the
             // deadObjectRecoveryProofEnabled metric distinguishes the two.
             config.timestampStabilizationProofEnabled ->
@@ -3580,6 +3811,9 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             // not muted (and X8..X11 are not no-focus; X12 recreates the
             // sink, which the default boundary disclaims).
             proofBoundary = when {
+                // X15 exercises a native transport pause/resume the default
+                // boundary never claims, so it owns its own (muted) boundary.
+                config.pauseResumeProofEnabled -> PAUSE_RESUME_PROOF_BOUNDARY
                 // X13 promotes AudioTimestamp from telemetry-only to a
                 // diagnostic gate, so it owns its own boundary (muted
                 // standalone, or the X12 composition).

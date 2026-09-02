@@ -37,6 +37,11 @@
 //     TYPE_BUILTIN_SPEAKER (2), lossless sink accounting and reference mix checksum identity.
 //     Automated pass validates OS routing report and telemetry only; manual acoustic observation
 //     required for human hearing confirmation.
+//   - X15 (P4-AUDIO-ASYNC-RUNTIME-QUEUE-PAUSE-RESUME): Native transport pause/resume proof:
+//     worker steady_clock pause/resume commands (no caller time), AudioTrack playstate pause (2) and resume (3),
+//     ~150ms hold with frozen dispatch and pushed counts, worker paused waits > 0, paused interval
+//     excluded from native timing gate, 4 commands processed, muted sink, lossless sink accounting
+//     and reference mix checksum identity. Muted diagnostic only: no acoustic observation needed.
 // Overall exit is PASS only when ALL runs pass; each phase prints its own
 // PHYSICAL_SMOKE_PASS/FAIL marker.
 
@@ -439,6 +444,17 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
     // manual listening observation. ─────────────────────────────────────────
     final audibleSpeakerPlaybackPass = await _runAudibleSpeakerPlaybackSmoke();
 
+    // ── X15 (P4-AUDIO-ASYNC-RUNTIME-QUEUE-PAUSE-RESUME): native transport
+    // pause/resume diagnostic proof (muted default sink). Proves worker
+    // steady_clock pause/resume commands without caller-supplied time, sink
+    // AudioTrack playstate pause (2) and resume (3), ~150ms bounded hold with
+    // frozen dispatch/pushed counts, worker paused waits > 0, paused interval
+    // excluded from native timing gate, 4 commands processed, and lossless
+    // sink accounting / checksum identity. Muted diagnostic only: no audible
+    // output, no speaker route, no production presentation pause, no
+    // pause/resume SLA, no A/V sync. ───────────────────────────────────────
+    final pauseResumePass = await _runPauseResumeSmoke();
+
     final allPass =
         pass &&
         envelopePass &&
@@ -451,7 +467,8 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
         deadObjectRecoveryPass &&
         timestampStabilizationPass &&
         timestampDeadObjectPass &&
-        audibleSpeakerPlaybackPass;
+        audibleSpeakerPlaybackPass &&
+        pauseResumePass;
     if (mounted) {
       setState(() {
         _status = allPass
@@ -464,7 +481,8 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
                   'X12 dead-object recovery gates held, '
                   'X13 timestamp stabilization gates held, '
                   'X13+X12 timestamp dead-object recovery gates held, '
-                  'X14 audible speaker playback gates held)'
+                  'X14 audible speaker playback gates held, '
+                  'X15 pause/resume gates held)'
             : 'FAIL: x4Pass=$pass, envelopePass=$envelopePass, '
                   'nonZeroGainPass=$nonZeroGainPass, '
                   'focusNoisyPass=$focusNoisyPass, '
@@ -476,6 +494,7 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
                   'timestampStabilizationPass=$timestampStabilizationPass, '
                   'timestampDeadObjectPass=$timestampDeadObjectPass, '
                   'audibleSpeakerPlaybackPass=$audibleSpeakerPlaybackPass, '
+                  'pauseResumePass=$pauseResumePass, '
                   'lastError=${activeReport.lastError}, error=$topLevelError';
       });
     }
@@ -2369,6 +2388,198 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
       'of audible playback is required and is not encoded in the automated PASS.',
     );
     return audibleSpeakerPlaybackPass;
+  }
+
+  Future<bool> _runPauseResumeSmoke() async {
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_TRANSPORT_PAUSE_RESUME_SMOKE_START',
+    );
+
+    VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport? report;
+    String? topLevelError;
+    File? tempSourceFile;
+
+    try {
+      final clipBData = await rootBundle.load(
+        'assets/manual_test_clips/clip_B.mov',
+      );
+      final tempDir = Directory.systemTemp;
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+      tempSourceFile = File(
+        '${tempDir.path}/p4_async_rt_queue_pause_resume_source_$timestamp.mov',
+      );
+
+      await tempSourceFile.writeAsBytes(
+        clipBData.buffer.asUint8List(
+          clipBData.offsetInBytes,
+          clipBData.lengthInBytes,
+        ),
+        flush: true,
+      );
+
+      report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: tempSourceFile.path,
+            pauseResumeProofEnabled: true,
+            timeout: const Duration(seconds: 45),
+          ).timeout(const Duration(seconds: 55));
+    } on TimeoutException catch (te) {
+      topLevelError = 'timeout: $te';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_TRANSPORT_PAUSE_RESUME_ERROR: $topLevelError',
+      );
+    } catch (e, st) {
+      topLevelError = '$e\n$st';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_TRANSPORT_PAUSE_RESUME_ERROR: $topLevelError',
+      );
+    } finally {
+      if (tempSourceFile != null) {
+        try {
+          if (await tempSourceFile.exists()) {
+            await tempSourceFile.delete();
+          }
+        } catch (_) {}
+      }
+    }
+
+    final prReport =
+        report ??
+        VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+          <String, Object?>{
+            'pass': false,
+            'status': 'fail',
+            'marker': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .pauseResumeFailMarkerConstant,
+            'proofBoundary': '',
+            'nativeProofBoundary': '',
+            'failureReason': 'invocation_failed',
+            'lastError': 'invocation_failed',
+          },
+        );
+
+    // Native Transport Pause/Resume group:
+    // Worker steady_clock pause/resume commands (order start, pause, resume, seek),
+    // AudioTrack playstate pause (2) and resume (3), ~150ms hold with frozen dispatch
+    // and pushed counts, worker paused waits > 0, paused interval excluded from native
+    // timing gate, 4 commands processed, muted sink, lossless sink accounting and checksum identity.
+    print(
+      '  [LANE] Native Transport Pause/Resume: '
+      'pauseResumeProofEnabled=${prReport.pauseResumeProofEnabled}, '
+      'pauseResumeExercised=${prReport.pauseResumeExercised}, '
+      'pauseResumeNativePauseOk=${prReport.pauseResumeNativePauseOk}, '
+      'pauseResumeSinkPausedOk=${prReport.pauseResumeSinkPausedOk}, '
+      'pauseResumeHoldFrozenOk=${prReport.pauseResumeHoldFrozenOk}, '
+      'pauseResumeSinkResumedOk=${prReport.pauseResumeSinkResumedOk}, '
+      'pauseResumeNativeResumeOk=${prReport.pauseResumeNativeResumeOk}, '
+      'pauseResumeHoldMs=${prReport.pauseResumeHoldMs}, '
+      'pauseResumeFramesPendingAtPause=${prReport.pauseResumeFramesPendingAtPause}, '
+      'playStateAfterNativePause=${prReport.playStateAfterNativePause}, '
+      'playStateAfterNativeResume=${prReport.playStateAfterNativeResume}, '
+      'pauseProofCommandSeq=${prReport.pauseProofCommandSeq}, '
+      'resumeProofCommandSeq=${prReport.resumeProofCommandSeq}, '
+      'pauseProofDispatchCountAtPause=${prReport.pauseProofDispatchCountAtPause}, '
+      'pauseProofTotalFramesPushedAtPause=${prReport.pauseProofTotalFramesPushedAtPause}, '
+      'pauseProofDispatchCountAfterHold=${prReport.pauseProofDispatchCountAfterHold}, '
+      'pauseProofTotalFramesPushedAfterHold=${prReport.pauseProofTotalFramesPushedAfterHold}, '
+      'nativePaused=${prReport.nativePaused}, '
+      'nativePauseCommandsProcessed=${prReport.nativePauseCommandsProcessed}, '
+      'nativeResumeCommandsProcessed=${prReport.nativeResumeCommandsProcessed}, '
+      'nativeWorkerPausedWaits=${prReport.nativeWorkerPausedWaits}, '
+      'nativeLastPausedIntervalNs=${prReport.nativeLastPausedIntervalNs}, '
+      'nativeTimingPausedExcludedNs=${prReport.nativeTimingPausedExcludedNs}, '
+      'nativePausedDispatchFrozenOk=${prReport.nativePausedDispatchFrozenOk}, '
+      'commandsEnqueued=${prReport.commandsEnqueued}, '
+      'commandsProcessed=${prReport.commandsProcessed}, '
+      'mutedOutputOk=${prReport.mutedOutputOk}, '
+      'pauseResumeGatesHeld=${prReport.pauseResumeGatesHeld}, '
+      'sinkWriteAccountingOk=${prReport.sinkWriteAccountingOk}, '
+      'frameAccountingOk=${prReport.frameAccountingOk}, '
+      'checksumIdentityOk=${prReport.checksumIdentityOk}, '
+      'checksumsMatch=${prReport.checksumsMatch}, '
+      'realtimeGatesHeld=${prReport.realtimeGatesHeld}, '
+      'hasCanonicalProofBoundary=${prReport.hasCanonicalProofBoundary}, '
+      'nativeProofBoundaryOk=${prReport.nativeProofBoundaryOk}, '
+      'allNativeLanesPass=${prReport.allNativeLanesPass}, '
+      'marker=${prReport.marker}, '
+      'lastError=${prReport.lastError}',
+    );
+
+    final lastErrorOk =
+        prReport.lastError.isEmpty ||
+        prReport.lastError == 'none' ||
+        prReport.lastError == 'null';
+
+    final pauseResumePass =
+        (topLevelError == null) &&
+        prReport.pass &&
+        prReport.marker ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .pauseResumePassMarkerConstant &&
+        prReport.pauseResumeProofEnabled &&
+        prReport.pauseResumeExercised &&
+        prReport.pauseResumeNativePauseOk &&
+        prReport.pauseResumeSinkPausedOk &&
+        prReport.pauseResumeHoldFrozenOk &&
+        prReport.pauseResumeSinkResumedOk &&
+        prReport.pauseResumeNativeResumeOk &&
+        prReport.nativePauseCommandsProcessed == 1 &&
+        prReport.nativeResumeCommandsProcessed == 1 &&
+        prReport.nativePausedDispatchFrozenOk &&
+        !prReport.nativePaused &&
+        prReport.nativeLastPausedIntervalNs > 0 &&
+        prReport.nativeWorkerPausedWaits > 0 &&
+        prReport.pauseResumeFramesPendingAtPause > 0 &&
+        prReport.playStateAfterNativePause == 2 &&
+        prReport.playStateAfterNativeResume == 3 &&
+        prReport.pauseProofCommandSeq >= 0 &&
+        prReport.resumeProofCommandSeq > prReport.pauseProofCommandSeq &&
+        prReport.pauseProofDispatchCountAfterHold ==
+            prReport.pauseProofDispatchCountAtPause &&
+        prReport.pauseProofTotalFramesPushedAfterHold ==
+            prReport.pauseProofTotalFramesPushedAtPause &&
+        prReport.commandsEnqueued == 4 &&
+        prReport.commandsProcessed == 4 &&
+        prReport.commandErrors == 0 &&
+        prReport.mutedOutputOk &&
+        prReport.pauseResumeGatesHeld &&
+        prReport.sinkWriteAccountingOk &&
+        prReport.frameAccountingOk &&
+        prReport.checksumIdentityOk &&
+        prReport.hasCanonicalProofBoundary &&
+        prReport.proofBoundary ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .pauseResumeProofBoundaryConstant &&
+        prReport.nativeProofBoundaryOk &&
+        prReport.checksumsMatch &&
+        prReport.providerCountersClean &&
+        prReport.sinkAccountingBalanced &&
+        prReport.realtimeGatesHeld &&
+        prReport.allNativeLanesPass &&
+        lastErrorOk;
+
+    final summaryPayload = <String, dynamic>{
+      'unit':
+          'AndroidAsyncRuntimeQueueTransportPauseResumePhysicalSmokeHarness',
+      'slice': 'P4-AUDIO-ASYNC-RUNTIME-QUEUE-PAUSE-RESUME',
+      'target': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .pauseResumeProofBoundaryConstant,
+      'nativeTarget': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .nativeProofBoundaryConstant,
+      'pass': pauseResumePass,
+      'report': prReport.toMap(),
+      'error': topLevelError,
+    };
+
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_TRANSPORT_PAUSE_RESUME_JSON:${jsonEncode(summaryPayload)}',
+    );
+    print(
+      pauseResumePass
+          ? 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_TRANSPORT_PAUSE_RESUME_PHYSICAL_SMOKE_PASS'
+          : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_TRANSPORT_PAUSE_RESUME_PHYSICAL_SMOKE_FAIL',
+    );
+    return pauseResumePass;
   }
 
   @override

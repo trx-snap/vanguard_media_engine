@@ -349,8 +349,16 @@ PrepareEnvelopeMixParams(
 // No control command carries a time value: the worker reads steady_clock
 // itself at execution.
 enum class CommandType : int32_t {
-    kStart = 1, // no payload (media pts 0)
-    kSeek  = 2, // a = targetPtsUs
+    kStart  = 1, // no payload (media pts 0)
+    kSeek   = 2, // a = targetPtsUs
+    // X15 (P4-AUDIO-ASYNC-RUNTIME-QUEUE-PAUSE-RESUME) diagnostic transport
+    // pause/resume: no payload; the worker samples steady_clock itself and
+    // calls coordinator.pause(now) / coordinator.resume(now). Frames are
+    // never dispatched while paused. Diagnostic-only: NOT a production
+    // presentation pause, no pause/resume SLA, no A/V sync, no drift
+    // correction.
+    kPause  = 3,
+    kResume = 4,
 };
 
 struct Command {
@@ -422,6 +430,27 @@ struct PublishedState {
     uint64_t envelopeEvaluations{0};
     double   minEffectiveGain{0.0};
     double   maxEffectiveGain{0.0};
+
+    // X15 pause/resume telemetry, all worker-observed from its own
+    // steady_clock reads. Structurally false/0/-1 for every run that never
+    // enqueues a Pause command (X4..X14 shape preserved).
+    bool     paused{false};
+    uint64_t pauseCommandsProcessed{0};
+    uint64_t resumeCommandsProcessed{0};
+    uint64_t workerPausedWaits{0};
+    uint64_t dispatchCountAtPause{0};
+    int64_t  totalFramesPushedAtPause{0};
+    uint64_t dispatchCountAtResume{0};
+    int64_t  totalFramesPushedAtResume{0};
+    int64_t  lastPausedIntervalNs{-1};
+    int64_t  totalPausedNs{0};
+    // Paused time that fell inside the open one-second timing window
+    // [T0, T1) and is therefore excluded from realtimeElapsedNs (0 unless
+    // a pause/resume pair executed between T0 and T1).
+    int64_t  timingPausedExcludedNs{0};
+    // True when every completed paused interval saw dispatchCount and
+    // totalFramesPushed unchanged between its pause and resume.
+    bool     pausedDispatchFrozenOk{true};
 };
 
 // ---------------------------------------------------------------------------
@@ -466,6 +495,11 @@ struct AsyncRuntimeQueueMultiSourceRealtimeClockSession {
     uint64_t nativeOutputReadChecksum{0};
     int64_t  totalOutputFramesRead{0};
     bool     startEnqueued{false};
+    // X15 owner-side pause bookkeeping: true from a successfully enqueued
+    // Pause until the matching Resume is enqueued (pause_already_pending_
+    // or_paused / resume_not_paused fail closed on the owner thread before
+    // any queue slot is consumed).
+    bool     pauseRequested{false};
 
     // Cross-thread flags (lock-free reads on the worker's hot path).
     std::atomic<bool>     eosPublished{false};
@@ -611,6 +645,20 @@ private:
     // logs, never elevates priority.
     void workerMain() {
         bool startedLocal = false;
+        // X15 transport pause state (worker-private; mirrored via publish).
+        bool     pausedLocal            = false;
+        int64_t  pausedAtNs             = -1;
+        uint64_t pauseCommandsProcessed = 0;
+        uint64_t resumeCommandsProcessed = 0;
+        uint64_t pausedWaits            = 0;
+        uint64_t dispatchCountAtPause   = 0;
+        int64_t  framesPushedAtPause    = 0;
+        uint64_t dispatchCountAtResume  = 0;
+        int64_t  framesPushedAtResume   = 0;
+        int64_t  lastPausedIntervalNs   = -1;
+        int64_t  totalPausedNs          = 0;
+        int64_t  timingPausedExcludedNs = 0;
+        bool     pausedDispatchFrozenOk = true;
 
         uint64_t commandsProcessed = 0;
         uint64_t commandErrors     = 0;
@@ -659,9 +707,13 @@ private:
         auto publish = [&](bool exited) {
             const auto csnap = coordinator.snapshot();
             const auto ksnap = clock.snapshot();
+            // The one-second gate measures PLAYING wall time: any X15
+            // paused interval the worker itself observed inside [T0, T1)
+            // is excluded (timingPausedExcludedNs is 0 when never paused).
             const int64_t elapsedNs =
-                (timingT0Ns >= 0 && timingT1Ns >= 0) ? timingT1Ns - timingT0Ns
-                                                     : -1;
+                (timingT0Ns >= 0 && timingT1Ns >= 0)
+                    ? timingT1Ns - timingT0Ns - timingPausedExcludedNs
+                    : -1;
             std::lock_guard<std::mutex> lock(mutex_);
             PublishedState& ps = published_;
             ps.workerStarted        = true;
@@ -709,6 +761,18 @@ private:
             ps.envelopeEvaluations      = envelopeEvaluations;
             ps.minEffectiveGain         = minEffectiveGain;
             ps.maxEffectiveGain         = maxEffectiveGain;
+            ps.paused                   = pausedLocal;
+            ps.pauseCommandsProcessed   = pauseCommandsProcessed;
+            ps.resumeCommandsProcessed  = resumeCommandsProcessed;
+            ps.workerPausedWaits        = pausedWaits;
+            ps.dispatchCountAtPause     = dispatchCountAtPause;
+            ps.totalFramesPushedAtPause = framesPushedAtPause;
+            ps.dispatchCountAtResume    = dispatchCountAtResume;
+            ps.totalFramesPushedAtResume = framesPushedAtResume;
+            ps.lastPausedIntervalNs     = lastPausedIntervalNs;
+            ps.totalPausedNs            = totalPausedNs;
+            ps.timingPausedExcludedNs   = timingPausedExcludedNs;
+            ps.pausedDispatchFrozenOk   = pausedDispatchFrozenOk;
             for (int t = 0; t < kTrackCount; ++t) {
                 RingBufferAudioSampleProvider& p = providerAt(t);
                 ps.providerExpectedNextFrame[t] = p.expectedNextFrame();
@@ -804,6 +868,87 @@ private:
                     }
                     break;
                 }
+                case CommandType::kPause: {
+                    // X15: freeze the transport at the worker's own
+                    // steady_clock now. The coordinator delegates to
+                    // AudioClock::pause, which preserves the media position
+                    // and rejects a regressed sysTimeNs; the worker's
+                    // lastNowNs guard makes that regression impossible.
+                    if (!startedLocal) {
+                        lastCommandResult = "not_started";
+                        ++commandErrors;
+                        break;
+                    }
+                    if (pausedLocal) {
+                        lastCommandResult = "already_paused";
+                        ++commandErrors;
+                        break;
+                    }
+                    const int64_t now = steadyNowNs();
+                    if (now < lastNowNs) {
+                        lastCommandResult = "non_monotonic_time";
+                        ++nonMonotonicAnomalies;
+                        ++commandErrors;
+                        break;
+                    }
+                    const Status st = coordinator.pause(now);
+                    if (st.ok()) {
+                        const auto csnap     = coordinator.snapshot();
+                        pausedLocal          = true;
+                        pausedAtNs           = now;
+                        lastNowNs            = now;
+                        dispatchCountAtPause = csnap.dispatchCount;
+                        framesPushedAtPause  = csnap.totalFramesPushed;
+                        ++pauseCommandsProcessed;
+                        lastCommandResult = "ok";
+                    } else {
+                        lastCommandResult = "clock_error";
+                        ++commandErrors;
+                    }
+                    break;
+                }
+                case CommandType::kResume: {
+                    // X15: resume at the worker's own steady_clock now; the
+                    // clock continues from the frozen media position, so
+                    // no dispatch backlog is created by the paused interval.
+                    if (!pausedLocal) {
+                        lastCommandResult = "not_paused";
+                        ++commandErrors;
+                        break;
+                    }
+                    const int64_t now = steadyNowNs();
+                    if (now < lastNowNs) {
+                        lastCommandResult = "non_monotonic_time";
+                        ++nonMonotonicAnomalies;
+                        ++commandErrors;
+                        break;
+                    }
+                    const Status st = coordinator.resume(now);
+                    if (st.ok()) {
+                        const auto csnap      = coordinator.snapshot();
+                        const int64_t interval = now - pausedAtNs;
+                        pausedLocal           = false;
+                        lastNowNs             = now;
+                        dispatchCountAtResume = csnap.dispatchCount;
+                        framesPushedAtResume  = csnap.totalFramesPushed;
+                        lastPausedIntervalNs  = interval;
+                        totalPausedNs        += interval;
+                        if (timingT0Ns >= 0 && timingT1Ns < 0) {
+                            timingPausedExcludedNs += interval;
+                        }
+                        if (dispatchCountAtResume != dispatchCountAtPause ||
+                            framesPushedAtResume != framesPushedAtPause) {
+                            pausedDispatchFrozenOk = false;
+                        }
+                        pausedAtNs = -1;
+                        ++resumeCommandsProcessed;
+                        lastCommandResult = "ok";
+                    } else {
+                        lastCommandResult = "clock_error";
+                        ++commandErrors;
+                    }
+                    break;
+                }
             }
             ++commandsProcessed;
         };
@@ -833,7 +978,13 @@ private:
             // terminal, or the per-wake cap.
             bool progressed = localCount > 0;
             int64_t waitNs = kMaxWaitNs;
-            if (startedLocal) {
+            if (startedLocal && pausedLocal) {
+                // X15 paused hold: no dispatch, no clock read, no ring
+                // touch; the loop falls through to the bounded cv wait and
+                // wakes on Resume/stop (or the 5ms clamp) only.
+                ++pausedWaits;
+                lastDispatchToken = "paused";
+            } else if (startedLocal) {
                 auto csnap = coordinator.snapshot();
                 if (!csnap.terminal &&
                     outputRing.seekRequest() != outputRing.seekAck()) {
@@ -1224,6 +1375,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
     if (session->eosPublished.load(std::memory_order_acquire)) {
         return reply("seek_rejected_eos", 0, -1);
     }
+    // X15: a seek is only defined on a running transport; the owner must
+    // enqueue (and await) Resume first.
+    if (session->pauseRequested) {
+        return reply("seek_rejected_paused", 0, -1);
+    }
 
     AsyncRuntimeQueueMultiSourceRealtimeClockSession& s = *session;
     const int64_t targetFrame = ClockedAudioTransportCoordinator::frameOfPositionUs(
@@ -1292,6 +1448,70 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
         return reply("queue_full", 0, targetFrame);
     }
     return reply("enqueued", seq, targetFrame);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: pauseAsyncRuntimeQueueMultiSourceRealtimeClock /
+//      resumeAsyncRuntimeQueueMultiSourceRealtimeClock (X15)
+// Owner-thread-only, enqueue-only, NO time argument: the WORKER reads
+// steady_clock itself and executes coordinator.pause(now) /
+// coordinator.resume(now). Owner-side pairing is enforced fail-closed
+// before any bounded-queue slot is consumed (pause while a pause is
+// pending or in effect -> pause_already_pending_or_paused; resume while no
+// pause is pending or in effect -> resume_not_paused). Diagnostic transport
+// pause only: not a production presentation pause.
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Companion_pauseAsyncRuntimeQueueMultiSourceRealtimeClock(
+    JNIEnv* env,
+    jobject /* companion */,
+    jlong handle) {
+
+    char status[192];
+    const auto session = FindMsRealtimeClockSession(handle);
+    if (!session) return ReplyCommand(env, status, sizeof(status), "not_found", 0);
+    if (std::this_thread::get_id() != session->ownerThreadId) {
+        return ReplyCommand(env, status, sizeof(status), "wrong_owner_thread", 0);
+    }
+    if (!session->startEnqueued) {
+        return ReplyCommand(env, status, sizeof(status), "not_started", 0);
+    }
+    if (session->pauseRequested) {
+        return ReplyCommand(env, status, sizeof(status),
+                            "pause_already_pending_or_paused", 0);
+    }
+    const uint64_t seq = session->enqueueCommand(CommandType::kPause, 0);
+    if (seq == 0) {
+        return ReplyCommand(env, status, sizeof(status), "queue_full", 0);
+    }
+    session->pauseRequested = true;
+    return ReplyCommand(env, status, sizeof(status), "enqueued", seq);
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Companion_resumeAsyncRuntimeQueueMultiSourceRealtimeClock(
+    JNIEnv* env,
+    jobject /* companion */,
+    jlong handle) {
+
+    char status[192];
+    const auto session = FindMsRealtimeClockSession(handle);
+    if (!session) return ReplyCommand(env, status, sizeof(status), "not_found", 0);
+    if (std::this_thread::get_id() != session->ownerThreadId) {
+        return ReplyCommand(env, status, sizeof(status), "wrong_owner_thread", 0);
+    }
+    if (!session->startEnqueued) {
+        return ReplyCommand(env, status, sizeof(status), "not_started", 0);
+    }
+    if (!session->pauseRequested) {
+        return ReplyCommand(env, status, sizeof(status), "resume_not_paused", 0);
+    }
+    const uint64_t seq = session->enqueueCommand(CommandType::kResume, 0);
+    if (seq == 0) {
+        return ReplyCommand(env, status, sizeof(status), "queue_full", 0);
+    }
+    session->pauseRequested = false;
+    return ReplyCommand(env, status, sizeof(status), "enqueued", seq);
 }
 
 // ---------------------------------------------------------------------------
@@ -1684,6 +1904,31 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_00024Compa
         ps.maxEffectiveGain,
         s.trackEnvelopes[0].keyframeCount(),
         s.trackEnvelopes[1].keyframeCount());
+
+    // X15 pause/resume telemetry: owner-side pairing flag read directly,
+    // every other fact worker-published. All false/0/-1 when no Pause was
+    // ever enqueued.
+    out.appendf(
+        "ownerPauseRequested=%s;paused=%s;"
+        "pauseCommandsProcessed=%llu;resumeCommandsProcessed=%llu;"
+        "workerPausedWaits=%llu;"
+        "dispatchCountAtPause=%llu;totalFramesPushedAtPause=%lld;"
+        "dispatchCountAtResume=%llu;totalFramesPushedAtResume=%lld;"
+        "lastPausedIntervalNs=%lld;totalPausedNs=%lld;"
+        "timingPausedExcludedNs=%lld;pausedDispatchFrozenOk=%s;",
+        s.pauseRequested ? "true" : "false",
+        ps.paused ? "true" : "false",
+        static_cast<unsigned long long>(ps.pauseCommandsProcessed),
+        static_cast<unsigned long long>(ps.resumeCommandsProcessed),
+        static_cast<unsigned long long>(ps.workerPausedWaits),
+        static_cast<unsigned long long>(ps.dispatchCountAtPause),
+        static_cast<long long>(ps.totalFramesPushedAtPause),
+        static_cast<unsigned long long>(ps.dispatchCountAtResume),
+        static_cast<long long>(ps.totalFramesPushedAtResume),
+        static_cast<long long>(ps.lastPausedIntervalNs),
+        static_cast<long long>(ps.totalPausedNs),
+        static_cast<long long>(ps.timingPausedExcludedNs),
+        ps.pausedDispatchFrozenOk ? "true" : "false");
 
     out.appendf(
         "outputAvailableReadFrames=%lld;"

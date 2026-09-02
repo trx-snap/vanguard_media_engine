@@ -42,6 +42,13 @@ const _kAudibleSpeakerPlaybackPassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_PHYSICAL_SMOKE_PASS';
 const _kAudibleSpeakerPlaybackFailMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIBLE_SPEAKER_PLAYBACK_PHYSICAL_SMOKE_FAIL';
+const _kPauseResumePassMarker =
+    'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_TRANSPORT_PAUSE_RESUME_SMOKE_PASS';
+const _kPauseResumeFailMarker =
+    'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_TRANSPORT_PAUSE_RESUME_SMOKE_FAIL';
+
+const _kPauseResumeProofBoundary =
+    'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_transport_pause_resume_diagnostic_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_pause_resume_commands_no_caller_supplied_native_time_worker_samples_steady_clock_at_execution_coordinator_pause_resume_delegates_to_audio_clock_media_position_preserved_no_dispatch_while_paused_once_in_pre_seek_epoch_after_sink_playing_command_order_start_pause_resume_seek_sink_side_audiotrack_playstate_pause_play_only_no_flush_no_stop_bounded_150ms_hold_no_output_read_dispatch_count_and_total_frames_pushed_unchanged_across_hold_paused_interval_excluded_from_native_one_second_timing_gate_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_not_production_presentation_pause_no_pause_resume_sla_no_avsync_claim_no_drift_correction_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
 
 const _kAudibleSpeakerPlaybackProofBoundary =
     'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audible_speaker_playback_diagnostic_proof_only_sm_a566b_manual_acoustic_observation_lane_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_base_gain_0_5_owner_thread_routed_device_sampled_after_each_epoch_play_type_builtin_speaker_required_os_routing_report_only_no_automatic_acoustic_audibility_claim_no_loudness_snr_claim_no_speaker_verification_beyond_routed_device_type_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_timestamp_stabilization_gate_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_drift_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
@@ -303,6 +310,68 @@ Map<String, Object?> _createAudibleSpeakerSampleRawMap([
   metrics['audibleSpeakerRouteType'] = 2;
   metrics['audibleSpeakerBuiltInSpeakerRouteOk'] = true;
   metrics['audibleSpeakerPlaybackGatesHeld'] = true;
+  if (overrides != null) {
+    for (final entry in overrides.entries) {
+      if (lanes.containsKey(entry.key)) {
+        lanes[entry.key] = entry.value;
+      }
+      if (metrics.containsKey(entry.key)) {
+        metrics[entry.key] = entry.value;
+      }
+      result[entry.key] = entry.value;
+    }
+  }
+  return result;
+}
+
+// X15 native transport pause/resume proof pass payload: the X4 sample map with
+// X15 marker, X15 proof boundary, mode flag, 4 commands, muted sink,
+// playstate 2 at pause and 3 at resume, frozen dispatch/pushed across hold,
+// worker paused waits > 0, excluded paused interval, and pauseResumeGatesHeld=true.
+Map<String, Object?> _createPauseResumeSampleRawMap([
+  Map<String, Object?>? overrides,
+]) {
+  final result = _createSampleRawMap();
+  result['marker'] = _kPauseResumePassMarker;
+  result['proofBoundary'] = _kPauseResumeProofBoundary;
+  final rawStrings = result['raw'] as Map<String, String>;
+  rawStrings['marker'] = _kPauseResumePassMarker;
+  rawStrings['proofBoundary'] = _kPauseResumeProofBoundary;
+  final lanes = result['lanes'] as Map<String, Object?>;
+  lanes['mutedOutputOk'] = true;
+  lanes['pauseResumeNativePauseOk'] = true;
+  lanes['pauseResumeSinkPausedOk'] = true;
+  lanes['pauseResumeHoldFrozenOk'] = true;
+  lanes['pauseResumeSinkResumedOk'] = true;
+  lanes['pauseResumeNativeResumeOk'] = true;
+  lanes['pauseResumeGatesHeld'] = true;
+  final metrics = result['metrics'] as Map<String, Object?>;
+  metrics['commandsEnqueued'] = 4;
+  metrics['commandsProcessed'] = 4;
+  metrics['commandErrors'] = 0;
+  metrics['pauseResumeProofEnabled'] = true;
+  metrics['pauseResumeExercised'] = true;
+  metrics['pauseResumeHoldMs'] = 152;
+  metrics['pauseResumeFramesPendingAtPause'] = 1280;
+  metrics['playStateAfterNativePause'] = 2;
+  metrics['playStateAfterNativeResume'] = 3;
+  metrics['pauseProofCommandSeq'] = 2;
+  metrics['resumeProofCommandSeq'] = 3;
+  metrics['pauseProofDispatchCountAtPause'] = 120;
+  metrics['pauseProofTotalFramesPushedAtPause'] = 30720;
+  metrics['pauseProofDispatchCountAfterHold'] = 120;
+  metrics['pauseProofTotalFramesPushedAfterHold'] = 30720;
+  metrics['pauseProofPausedWaitsAtPause'] = 0;
+  metrics['pauseProofPausedWaitsAfterHold'] = 30;
+  metrics['nativePaused'] = false;
+  metrics['nativePauseCommandsProcessed'] = 1;
+  metrics['nativeResumeCommandsProcessed'] = 1;
+  metrics['nativeWorkerPausedWaits'] = 30;
+  metrics['nativeLastPausedIntervalNs'] = 152000000;
+  metrics['nativeTotalPausedNs'] = 152000000;
+  metrics['nativeTimingPausedExcludedNs'] = 152000000;
+  metrics['nativePausedDispatchFrozenOk'] = true;
+  metrics['pauseResumeGatesHeld'] = true;
   if (overrides != null) {
     for (final entry in overrides.entries) {
       if (lanes.containsKey(entry.key)) {
@@ -4889,6 +4958,324 @@ void main() {
         );
       },
     );
+  });
+
+  group('X15 transport pause/resume mode', () {
+    test(
+      'default X4 pass report has pauseResumeProofEnabled=false, pause metrics default, '
+      'pauseResumeGatesHeld vacuously true, and allNativeLanesPass true',
+      () {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              _createSampleRawMap(),
+            );
+        expect(report.pauseResumeProofEnabled, isFalse);
+        expect(report.pauseResumeExercised, isFalse);
+        expect(report.pauseResumeNativePauseOk, isFalse);
+        expect(report.pauseResumeSinkPausedOk, isFalse);
+        expect(report.pauseResumeHoldFrozenOk, isFalse);
+        expect(report.pauseResumeSinkResumedOk, isFalse);
+        expect(report.pauseResumeNativeResumeOk, isFalse);
+        expect(report.pauseResumeHoldMs, equals(-1));
+        expect(report.pauseResumeFramesPendingAtPause, equals(-1));
+        expect(report.playStateAfterNativePause, equals(-1));
+        expect(report.playStateAfterNativeResume, equals(-1));
+        expect(report.pauseProofCommandSeq, equals(-1));
+        expect(report.resumeProofCommandSeq, equals(-1));
+        expect(report.pauseProofDispatchCountAtPause, equals(-1));
+        expect(report.pauseProofTotalFramesPushedAtPause, equals(-1));
+        expect(report.pauseProofDispatchCountAfterHold, equals(-1));
+        expect(report.pauseProofTotalFramesPushedAfterHold, equals(-1));
+        expect(report.pauseProofPausedWaitsAtPause, equals(-1));
+        expect(report.pauseProofPausedWaitsAfterHold, equals(-1));
+        expect(report.nativePaused, isFalse);
+        expect(report.nativePauseCommandsProcessed, equals(-1));
+        expect(report.nativeResumeCommandsProcessed, equals(-1));
+        expect(report.nativeWorkerPausedWaits, equals(-1));
+        expect(report.nativeLastPausedIntervalNs, equals(-1));
+        expect(report.nativeTotalPausedNs, equals(-1));
+        expect(report.nativeTimingPausedExcludedNs, equals(-1));
+        expect(report.nativePausedDispatchFrozenOk, isFalse);
+        expect(report.pauseResumeGatesHeld, isTrue);
+        expect(report.allNativeLanesPass, isTrue);
+      },
+    );
+
+    test(
+      'X15 pass sample accepts marker, boundary, 4 commands, muted sink, and metrics, and passes all gates',
+      () {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              _createPauseResumeSampleRawMap(),
+            );
+        expect(report.pass, isTrue);
+        expect(report.marker, equals(_kPauseResumePassMarker));
+        expect(report.proofBoundary, equals(_kPauseResumeProofBoundary));
+        expect(report.hasCanonicalProofBoundary, isTrue);
+        expect(report.nativeProofBoundaryOk, isTrue);
+        expect(report.pauseResumeProofEnabled, isTrue);
+        expect(report.pauseResumeExercised, isTrue);
+        expect(report.pauseResumeNativePauseOk, isTrue);
+        expect(report.pauseResumeSinkPausedOk, isTrue);
+        expect(report.pauseResumeHoldFrozenOk, isTrue);
+        expect(report.pauseResumeSinkResumedOk, isTrue);
+        expect(report.pauseResumeNativeResumeOk, isTrue);
+        expect(report.pauseResumeHoldMs, equals(152));
+        expect(report.pauseResumeFramesPendingAtPause, equals(1280));
+        expect(report.playStateAfterNativePause, equals(2));
+        expect(report.playStateAfterNativeResume, equals(3));
+        expect(report.pauseProofCommandSeq, equals(2));
+        expect(report.resumeProofCommandSeq, equals(3));
+        expect(report.pauseProofDispatchCountAtPause, equals(120));
+        expect(report.pauseProofTotalFramesPushedAtPause, equals(30720));
+        expect(report.pauseProofDispatchCountAfterHold, equals(120));
+        expect(report.pauseProofTotalFramesPushedAfterHold, equals(30720));
+        expect(report.pauseProofPausedWaitsAtPause, equals(0));
+        expect(report.pauseProofPausedWaitsAfterHold, equals(30));
+        expect(report.nativePaused, isFalse);
+        expect(report.nativePauseCommandsProcessed, equals(1));
+        expect(report.nativeResumeCommandsProcessed, equals(1));
+        expect(report.nativeWorkerPausedWaits, equals(30));
+        expect(report.nativeLastPausedIntervalNs, equals(152000000));
+        expect(report.nativeTotalPausedNs, equals(152000000));
+        expect(report.nativeTimingPausedExcludedNs, equals(152000000));
+        expect(report.nativePausedDispatchFrozenOk, isTrue);
+        expect(report.commandsEnqueued, equals(4));
+        expect(report.commandsProcessed, equals(4));
+        expect(report.commandErrors, equals(0));
+        expect(report.mutedOutputOk, isTrue);
+        expect(report.pauseResumeGatesHeld, isTrue);
+        expect(report.sinkWriteAccountingOk, isTrue);
+        expect(report.frameAccountingOk, isTrue);
+        expect(report.checksumIdentityOk, isTrue);
+        expect(report.checksumsMatch, isTrue);
+        expect(report.realtimeGatesHeld, isTrue);
+        expect(report.allNativeLanesPass, isTrue);
+      },
+    );
+
+    test('X15 must carry its own pass marker, not other markers', () {
+      for (final wrongMarker in const [
+        _kPassMarker,
+        _kEnvelopePassMarker,
+        _kNonZeroGainPassMarker,
+        _kFocusNoisyPassMarker,
+        _kFocusDuckRestorePassMarker,
+        _kFocusLossPauseResumePassMarker,
+        _kPermanentFocusLossPassMarker,
+        _kRouteChangeEventHandoffPassMarker,
+        _kDeadObjectRecoveryPassMarker,
+        _kTimestampStabilizationPassMarker,
+        _kAudibleSpeakerPlaybackPassMarker,
+      ]) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              _createPauseResumeSampleRawMap({'marker': wrongMarker}),
+            );
+        expect(report.allNativeLanesPass, isFalse, reason: wrongMarker);
+      }
+    });
+
+    test(
+      'X15 must carry its own proof boundary, not X4 or X8..X14 boundaries',
+      () {
+        for (final wrongBoundary in const [
+          _kCanonicalProofBoundary,
+          _kFocusDuckRestoreProofBoundary,
+          _kFocusLossPauseResumeProofBoundary,
+          _kPermanentFocusLossProofBoundary,
+          _kRouteChangeEventHandoffProofBoundary,
+          _kDeadObjectRecoveryProofBoundary,
+          _kTimestampStabilizationProofBoundary,
+          _kTimestampStabilizationDeadObjectRecoveryProofBoundary,
+          _kAudibleSpeakerPlaybackProofBoundary,
+        ]) {
+          final report =
+              VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+                _createPauseResumeSampleRawMap({
+                  'proofBoundary': wrongBoundary,
+                }),
+              );
+          expect(
+            report.hasCanonicalProofBoundary,
+            isFalse,
+            reason: wrongBoundary,
+          );
+          expect(report.allNativeLanesPass, isFalse, reason: wrongBoundary);
+        }
+      },
+    );
+
+    test('Each critical X15 gate failure fails allNativeLanesPass', () {
+      final failures = <String, Map<String, Object?>>{
+        'pauseResumeExercised=false': {'pauseResumeExercised': false},
+        'pauseResumeNativePauseOk=false': {'pauseResumeNativePauseOk': false},
+        'pauseResumeSinkPausedOk=false': {'pauseResumeSinkPausedOk': false},
+        'pauseResumeHoldFrozenOk=false': {'pauseResumeHoldFrozenOk': false},
+        'pauseResumeSinkResumedOk=false': {'pauseResumeSinkResumedOk': false},
+        'pauseResumeNativeResumeOk=false': {'pauseResumeNativeResumeOk': false},
+        'nativePauseCommandsProcessed=0': {'nativePauseCommandsProcessed': 0},
+        'nativePauseCommandsProcessed=2': {'nativePauseCommandsProcessed': 2},
+        'nativeResumeCommandsProcessed=0': {'nativeResumeCommandsProcessed': 0},
+        'nativeResumeCommandsProcessed=2': {'nativeResumeCommandsProcessed': 2},
+        'nativePausedDispatchFrozenOk=false': {
+          'nativePausedDispatchFrozenOk': false,
+        },
+        'nativePaused=true': {'nativePaused': true},
+        'nativeLastPausedIntervalNs=0': {'nativeLastPausedIntervalNs': 0},
+        'nativeWorkerPausedWaits=0': {'nativeWorkerPausedWaits': 0},
+        'pauseResumeFramesPendingAtPause=0': {
+          'pauseResumeFramesPendingAtPause': 0,
+        },
+        'playStateAfterNativePause=1': {'playStateAfterNativePause': 1},
+        'playStateAfterNativePause=3': {'playStateAfterNativePause': 3},
+        'playStateAfterNativeResume=1': {'playStateAfterNativeResume': 1},
+        'playStateAfterNativeResume=2': {'playStateAfterNativeResume': 2},
+        'pauseProofCommandSeq=-1': {'pauseProofCommandSeq': -1},
+        'resumeProofCommandSeq<=pauseProofCommandSeq': {
+          'resumeProofCommandSeq': 2,
+        },
+        'pauseProofDispatchCountAfterHold changed': {
+          'pauseProofDispatchCountAfterHold': 121,
+        },
+        'pauseProofTotalFramesPushedAfterHold changed': {
+          'pauseProofTotalFramesPushedAfterHold': 30721,
+        },
+        'pauseProofPausedWaitsAfterHold not advancing': {
+          'pauseProofPausedWaitsAfterHold': 0,
+        },
+        'commandsEnqueued=2': {'commandsEnqueued': 2},
+        'commandsProcessed=2': {'commandsProcessed': 2},
+        'commandsEnqueued=3': {'commandsEnqueued': 3},
+        'commandsProcessed=3': {'commandsProcessed': 3},
+        'mutedOutputOk=false': {'mutedOutputOk': false},
+        'pauseResumeGatesHeld=false': {'pauseResumeGatesHeld': false},
+      };
+
+      for (final entry in failures.entries) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              _createPauseResumeSampleRawMap(entry.value),
+            );
+        expect(
+          report.allNativeLanesPass,
+          isFalse,
+          reason: '${entry.key} must fail allNativeLanesPass',
+        );
+      }
+    });
+
+    test('X15 fail report surfaces failure flags and fail marker', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createPauseResumeSampleRawMap({
+              'pass': false,
+              'status': 'pause_resume_gates_failed',
+              'marker': _kPauseResumeFailMarker,
+              'failureReason': 'pause_resume_gates_failed',
+              'lastError': 'pause_resume_gates_failed',
+              'pauseResumeHoldFrozenOk': false,
+              'pauseResumeGatesHeld': false,
+            }),
+          );
+      expect(report.pass, isFalse);
+      expect(
+        report.marker,
+        equals(
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+              .pauseResumeFailMarkerConstant,
+        ),
+      );
+      expect(report.pauseResumeHoldFrozenOk, isFalse);
+      expect(report.pauseResumeGatesHeld, isFalse);
+      expect(report.lastError, equals('pause_resume_gates_failed'));
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test(
+      'X15 mode sends only pauseResumeProofEnabled plus common args, '
+      'not envelope/nonzero/focus/duck/pause/permanent/route/dead/timestamp/audible flags',
+      () async {
+        Map<String, Object?>? capturedArgs;
+
+        binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+          capturedArgs = (call.arguments as Map).cast<String, Object?>();
+          return _createPauseResumeSampleRawMap();
+        });
+
+        final report =
+            await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+              sourcePath: '/tmp/clip_B.mov',
+              pauseResumeProofEnabled: true,
+            );
+
+        expect(capturedArgs?['pauseResumeProofEnabled'], isTrue);
+        expect(capturedArgs?['sourcePath'], equals('/tmp/clip_B.mov'));
+        expect(capturedArgs?['durationSec'], equals(2.0));
+        expect(capturedArgs?['seekTargetSec'], equals(1.30));
+        expect(capturedArgs?['preSeekBudgetSec'], equals(1.20));
+        expect(capturedArgs?['postSeekBudgetSec'], equals(0.55));
+        expect(capturedArgs?['sourceRingCapacityFrames'], equals(8192));
+        expect(capturedArgs?['outputRingCapacityFrames'], equals(4096));
+        expect(capturedArgs?['maxFramesPerMix'], equals(256));
+        expect(capturedArgs?['deadlineMs'], equals(30000));
+        expect(capturedArgs?.containsKey('envelopeProofEnabled'), isFalse);
+        expect(
+          capturedArgs?.containsKey('nonZeroGainSinkProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('focusNoisyEventHandoffProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('focusDuckRestoreProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('focusLossPauseResumeProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('permanentFocusLossProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('routeChangeEventHandoffProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('deadObjectRecoveryProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('timestampStabilizationProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('audibleSpeakerPlaybackProofEnabled'),
+          isFalse,
+        );
+        expect(report.pass, isTrue);
+        expect(report.pauseResumeProofEnabled, isTrue);
+        expect(report.allNativeLanesPass, isTrue);
+      },
+    );
+
+    test('default X4 run does NOT send pauseResumeProofEnabled', () async {
+      Map<String, Object?>? capturedArgs;
+
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+        capturedArgs = (call.arguments as Map).cast<String, Object?>();
+        return _createSampleRawMap();
+      });
+
+      await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+        sourcePath: '/tmp/clip_B.mov',
+      );
+
+      expect(capturedArgs?.containsKey('pauseResumeProofEnabled'), isFalse);
+    });
   });
 
   group('Equality, hashCode, and toString', () {
