@@ -32,6 +32,16 @@ import java.util.concurrent.atomic.AtomicBoolean
 // No OS media APIs live here: no AudioTrack, MediaCodec, MediaExtractor,
 // AudioManager, BroadcastReceiver, or route listeners. Draining the mixed
 // PCM16 into a sink is a later coordinator's job through [drain].
+//
+// Y5a (EXTERNAL-INGEST-SEAM): [ingest] / [postIngest] are the ONLY sanctioned
+// way to feed an external-ingest track. Both execute on the owner
+// HandlerThread (the native owner thread), so a decoder or background
+// producer never touches JNI directly; [postIngest] additionally pins an
+// expected generation and is rejected as stale, before any native call,
+// once start/seek/stop advanced the epoch. Ingest statuses that mean
+// "producer must re-anchor / retry" ([IngestRequest] anchor mismatch,
+// ring full, command in flight, format/argument errors) are rejected
+// results that do NOT fail the machine; only native session faults do.
 class VanguardRealtimePlaybackTransportStateMachine(
     private val config: VanguardRealtimePlaybackNativeSession.Config,
     private val listener: Listener? = null,
@@ -39,7 +49,17 @@ class VanguardRealtimePlaybackTransportStateMachine(
 ) {
     enum class State { IDLE, PREPARED, PLAYING, PAUSED, STOPPED, COMPLETED, FAILED, DISPOSED }
 
-    enum class Op { LOAD, PREPARE, START, PAUSE, RESUME, SEEK, STOP, SNAPSHOT, DRAIN }
+    enum class Op { LOAD, PREPARE, START, PAUSE, RESUME, SEEK, STOP, SNAPSHOT, DRAIN, INGEST }
+
+    // Y5a typed ingest request. `src` is a direct buffer holding frameCount
+    // interleaved PCM16 frames at byte offset 0 in the session format;
+    // expectedStartFrame must equal the track's native writer cursor.
+    data class IngestRequest(
+        val trackIndex: Int,
+        val src: ByteBuffer,
+        val frameCount: Int,
+        val expectedStartFrame: Long,
+    )
 
     // All callbacks run on the owner thread.
     interface Listener {
@@ -61,6 +81,7 @@ class VanguardRealtimePlaybackTransportStateMachine(
         const val REASON_STALE_GENERATION = "stale_generation"
         const val REASON_DISPOSED = "disposed"
         const val REASON_OWNER_THREAD_TIMEOUT = "owner_thread_timeout"
+        const val REASON_INGEST_PREFIX = "ingest_"
         private const val OWNER_WAIT_TIMEOUT_MS = 10_000L
         private const val DISPOSE_JOIN_TIMEOUT_MS = 5_000L
     }
@@ -104,6 +125,21 @@ class VanguardRealtimePlaybackTransportStateMachine(
     fun drain(dst: ByteBuffer, maxFrames: Int): Result =
         runOnOwner { executeDrain(dst, maxFrames) }
 
+    // Y5a: synchronous owner-thread ingest. On success the reply carries
+    // acceptedFrames (may be 0 on ring_full/eos_reached) and the post-call
+    // nextWriteFrame anchor. Re-anchor/retry conditions come back as
+    // rejected results whose reason starts with [REASON_INGEST_PREFIX] and
+    // whose reply (when present) holds the real nextWriteFrame.
+    fun ingest(request: IngestRequest): Result = runOnOwner { executeIngest(request) }
+
+    // Y5a: callback-friendly ingest through the same generation-pinned
+    // [post] path; the producer thread never reaches JNI itself.
+    fun postIngest(
+        request: IngestRequest,
+        expectedGeneration: Long? = null,
+        callback: ((Result) -> Unit)? = null,
+    ): Boolean = post(Op.INGEST, 0L, expectedGeneration, null, request, callback)
+
     // ── Callback-friendly API ──────────────────────────────────────────────
 
     // Enqueues `op` on the owner thread. When `expectedGeneration` is set
@@ -114,6 +150,7 @@ class VanguardRealtimePlaybackTransportStateMachine(
         arg: Long = 0L,
         expectedGeneration: Long? = null,
         drainBuffer: ByteBuffer? = null,
+        ingestRequest: IngestRequest? = null,
         callback: ((Result) -> Unit)? = null,
     ): Boolean {
         val posted = handler.post {
@@ -124,6 +161,12 @@ class VanguardRealtimePlaybackTransportStateMachine(
                     Result(false, state, generation, "null_drain_buffer", null)
                 } else {
                     executeDrain(drainBuffer, arg.toInt())
+                }
+            } else if (op == Op.INGEST) {
+                if (ingestRequest == null) {
+                    Result(false, state, generation, "null_ingest_request", null)
+                } else {
+                    executeIngest(ingestRequest)
                 }
             } else {
                 execute(op, arg)
@@ -233,7 +276,7 @@ class VanguardRealtimePlaybackTransportStateMachine(
             Op.SEEK -> s.seek(arg)
             Op.STOP -> s.stop()
             Op.SNAPSHOT -> s.snapshot()
-            Op.LOAD, Op.DRAIN -> return reject("unreachable")
+            Op.LOAD, Op.DRAIN, Op.INGEST -> return reject("unreachable")
         }
         if (!reply.ok) return failClosedOnReply(op, reply)
 
@@ -245,7 +288,7 @@ class VanguardRealtimePlaybackTransportStateMachine(
             Op.SEEK -> generation++ // paused stays PAUSED, playing stays PLAYING
             Op.STOP -> { generation++; transition(State.STOPPED) }
             Op.SNAPSHOT -> Unit
-            Op.LOAD, Op.DRAIN -> Unit
+            Op.LOAD, Op.DRAIN, Op.INGEST -> Unit
         }
         publishedGeneration = generation
         return verifyAndObserve(reply)
@@ -276,6 +319,48 @@ class VanguardRealtimePlaybackTransportStateMachine(
         val reply = s.drain(dst, maxFrames)
         if (!reply.ok) return failClosedOnReply(Op.DRAIN, reply)
         return verifyAndObserve(reply)
+    }
+
+    // Y5a owner-thread ingest. Argument/mode errors are caught here before
+    // JNI; native re-validates everything and the writer is only touched
+    // when its command gate is quiescent.
+    private fun executeIngest(request: IngestRequest): Result {
+        if (state == State.DISPOSED) return reject(REASON_DISPOSED)
+        val s = session ?: return reject("not_loaded")
+        if (state == State.FAILED) return reject("failed:${failureReason ?: "unknown"}")
+        if (!commandAllowed(Op.INGEST, state)) return reject("invalid_state_${state.name.lowercase()}")
+        if (request.trackIndex < 0 || request.trackIndex >= config.trackCount) {
+            return reject("${REASON_INGEST_PREFIX}invalid_track")
+        }
+        if (!config.isExternalTrack(request.trackIndex)) {
+            return reject("${REASON_INGEST_PREFIX}track_not_external")
+        }
+        if (request.frameCount <= 0 || request.expectedStartFrame < 0L) {
+            return reject("${REASON_INGEST_PREFIX}invalid_args")
+        }
+        if (!request.src.isDirect) return reject("${REASON_INGEST_PREFIX}non_direct_buffer")
+        if (request.src.capacity() < request.frameCount.toLong() * config.bytesPerFrame) {
+            return reject("${REASON_INGEST_PREFIX}insufficient_buffer_capacity")
+        }
+        val reply = s.ingest(
+            request.trackIndex, request.src, request.frameCount, request.expectedStartFrame,
+        )
+        if (reply.ingestNonterminal) return verifyAndObserve(reply)
+        return when (reply.status) {
+            // Producer must re-anchor (reply.nextWriteFrame) or retry later;
+            // the session itself is intact and nothing was written.
+            VanguardRealtimePlaybackNativeSession.STATUS_EXPECTED_START_MISMATCH,
+            VanguardRealtimePlaybackNativeSession.STATUS_AWAITING_SEEK_ACK,
+            VanguardRealtimePlaybackNativeSession.STATUS_COMMAND_IN_FLIGHT,
+            VanguardRealtimePlaybackNativeSession.STATUS_FORMAT_MISMATCH,
+            VanguardRealtimePlaybackNativeSession.STATUS_INVALID_TRACK,
+            VanguardRealtimePlaybackNativeSession.STATUS_TRACK_NOT_EXTERNAL,
+            VanguardRealtimePlaybackNativeSession.STATUS_INVALID_ARGS,
+            "null_pcm_buffer", "non_direct_buffer", "direct_buffer_address_unavailable",
+            "insufficient_buffer_capacity",
+            -> reject("$REASON_INGEST_PREFIX${reply.status}", reply)
+            else -> failClosedOnReply(Op.INGEST, reply)
+        }
     }
 
     // Native rejected the call. Kotlin is authoritative, so a native
@@ -353,5 +438,8 @@ class VanguardRealtimePlaybackTransportStateMachine(
             current == State.PAUSED || current == State.STOPPED || current == State.COMPLETED
         Op.SNAPSHOT -> current != State.DISPOSED
         Op.DRAIN -> current != State.IDLE && current != State.FAILED && current != State.DISPOSED
+        // Pre-roll while PREPARED/STOPPED, steady-state while PLAYING/PAUSED;
+        // COMPLETED answers eos_reached natively (harmless, no mutation).
+        Op.INGEST -> current != State.IDLE && current != State.FAILED && current != State.DISPOSED
     }
 }

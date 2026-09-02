@@ -20,11 +20,26 @@
 //   the drain entry point); reads the worker-published mirror.
 // - Worker thread: sole reader of steady_clock for media time, sole caller
 //   of every AudioClock / ClockedAudioTransportCoordinator mutator, and
-//   BOTH roles of every node-owned source ring (synthetic generator ->
-//   AudioDecoderRingWriter as producer; GraphAudioScheduler ->
+//   BOTH roles of every SYNTHETIC node-owned source ring (synthetic
+//   generator -> AudioDecoderRingWriter as producer; GraphAudioScheduler ->
 //   RingBufferAudioSampleProvider as consumer), plus the output ring's
 //   PRODUCER role. A single thread holding both SPSC roles of one ring is
 //   trivially race-free. The worker never touches JNIEnv and never logs.
+// - Y5a EXTERNAL-INGEST tracks (opted in per track by externalIngestTrackMask
+//   at create; default none): the worker keeps only the CONSUMER role of
+//   that source ring. The PRODUCER role (AudioDecoderRingWriter::write)
+//   belongs to the owner thread through the ingest entry point, EXCEPT
+//   inside command execution, where the worker re-anchors every ring
+//   (writer.requestSeek + provider ack probe) exactly as before. The two
+//   producers never overlap: the owner enqueues/acks commands under mutex_
+//   and the ingest entry point refuses (command_in_flight) unless the
+//   command slot is empty and every enqueued command has been acked, so
+//   every owner write happens-after the worker's last re-anchor and
+//   happens-before the next enqueue. The worker never generates PCM for,
+//   never reads writer.nextWriteFrame() of, an external track outside
+//   command execution; its readiness probe is the ring's atomic
+//   availableReadFrames(), and a short external ring is a nonterminal
+//   underrun (counter + skipped dispatch iteration), not source_starved.
 //
 // Y1 contract highlights:
 // - Synthetic PCM only, generated on the worker by a deterministic integer
@@ -47,6 +62,27 @@
 // - No AudioTrack/AAudio/OpenSL/Oboe/MediaCodec, no audible output, no
 //   file IO, no product/editor wiring. C++ audio primitives are unchanged.
 //
+// Y5a EXTERNAL-INGEST-SEAM (this is NOT the decoder slice):
+// - Kotlin owns every Android codec/media API (V4.3 strict boundary); this
+//   TU only accepts already-decoded interleaved PCM16 from a direct
+//   ByteBuffer on the owner thread and hands it to the track's own
+//   AudioDecoderRingWriter. No MediaCodec/MediaExtractor, no presentation
+//   clock, no A/V sync, no decoder lifecycle live here.
+// - Ingest contract (ingest entry point): owner thread only; direct buffer
+//   with capacity >= frameCount * 2 * channelCount; trackIndex must be an
+//   external track; sampleRate/channelCount must equal the session's
+//   (format_mismatch); expectedStartFrame must equal the writer's
+//   nextWriteFrame() (expected_start_mismatch; the reply carries the real
+//   nextWriteFrame so the producer re-anchors after seek/prepare/stop);
+//   a ring whose seek epoch is not yet acked answers awaiting_seek_ack
+//   (never expected after a command ack, guarded anyway). Accepted frames
+//   are clamped to min(frameCount, freeFrames, 8192, declared -
+//   nextWriteFrame): full accept = ok, shorter = partial_write, zero free
+//   = ring_full, cursor at declared end = eos_reached. All rejections
+//   mutate nothing.
+// - Command gate: command_in_flight is returned (no mutation) while the
+//   command slot is occupied or any enqueued command is unacked.
+//
 // Android-only TU, added through the Android target_sources block in
 // src/CMakeLists.txt. Its handle registry is disjoint from every
 // diagnostic session TU.
@@ -55,17 +91,16 @@
 //   createRealtimePlaybackGraphSession            -> jlong handle (0 on failure)
 //   prepare/start/pause/resume/seek/stop...Session -> jstring key=value
 //   drainRealtimePlaybackGraphSessionOutputPcm16  -> jstring key=value
+//   ingestRealtimePlaybackGraphSessionExternalPcm16 -> jstring key=value (Y5a)
 //   snapshotRealtimePlaybackGraphSession          -> jstring key=value
 //   destroyRealtimePlaybackGraphSession           -> jstring key=value
 
 #include <jni.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -76,6 +111,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "android_phase4_realtime_playback_graph_session_helpers.h"
 #include "vanguard/audio/audio_clock.h"
 #include "vanguard/audio/audio_decoder_ring_writer.h"
 #include "vanguard/audio/audio_mix_bus_node.h"
@@ -103,6 +139,8 @@ using vanguard::audio::RingBufferAudioSampleProvider;
 using vanguard::core::Status;
 using vanguard::graph::Graph;
 using WriterStatus   = AudioDecoderRingWriter::Status;
+// Header-only helpers extracted in Y5a (pure functions / plain records).
+using namespace vanguard::platform::android::realtime_playback_detail;
 
 constexpr size_t  kMaxLiveSessions       = 4;
 constexpr int32_t kMinTrackCount         = 1;
@@ -110,207 +148,11 @@ constexpr int32_t kMaxTrackCount         = static_cast<int32_t>(AudioMixBusNode:
 constexpr int64_t kMaxFramesPerMixCap    = AudioMixBusNode::kMaxMaxFramesPerMix;                // 8192
 constexpr int64_t kMaxWriteFrames        = AudioDecoderRingWriter::kMaxWriteFrames;             // 8192
 constexpr int64_t kMaxRingCapacityFrames = AudioSpscAudioRingBuffer::kMaxCapacityFrames;        // 65536
-constexpr int64_t kMicrosPerSecond       = 1'000'000LL;
 constexpr int     kMaxDispatchesPerWake  = 8;
 constexpr int64_t kMaxWaitNs             = 5'000'000LL;      // 5ms cv clamp
 constexpr int64_t kCommandAckTimeoutMs   = 1'000LL;          // owner-side bounded ack wait
-constexpr size_t  kReplyCapacity         = 1024;
-
-constexpr const char* kMixNodeId        = "rt_playback_mix";
-constexpr const char* kSourceNodePrefix = "rt_playback_src";
-
-// AudioMixBusNode input port ids in track order (see audio_mix_bus_node.cpp).
-const std::array<std::string, 8> kMixInputPorts = {
-    "primary_audio_in", "secondary_audio_in", "audio_in_2", "audio_in_3",
-    "audio_in_4", "audio_in_5", "audio_in_6", "audio_in_7"};
-
-std::string SourceNodeId(int track) {
-    return std::string(kSourceNodePrefix) + std::to_string(track);
-}
-
-enum class NativeState : int32_t {
-    kIdle = 0,
-    kPrepared,
-    kPlaying,
-    kPaused,
-    kStopped,
-    kFailed,
-};
-
-const char* NativeStateToken(NativeState s) {
-    switch (s) {
-        case NativeState::kIdle:     return "idle";
-        case NativeState::kPrepared: return "prepared";
-        case NativeState::kPlaying:  return "playing";
-        case NativeState::kPaused:   return "paused";
-        case NativeState::kStopped:  return "stopped";
-        case NativeState::kFailed:   return "failed";
-    }
-    return "unknown";
-}
-
-enum class CommandType : int32_t {
-    kPrepare = 1,
-    kStart   = 2,
-    kPause   = 3,
-    kResume  = 4,
-    kSeek    = 5, // arg = targetFrame
-    kStop    = 6,
-};
-
-// Shared owner-precheck / worker-revalidation predicate. Kotlin mirrors
-// the same table authoritatively; a mismatch surfaces as invalid_state.
-bool CommandAllowed(CommandType type, NativeState state) {
-    switch (type) {
-        case CommandType::kPrepare:
-            return state == NativeState::kIdle || state == NativeState::kPrepared ||
-                   state == NativeState::kStopped;
-        case CommandType::kStart:
-            return state == NativeState::kPrepared || state == NativeState::kStopped;
-        case CommandType::kPause:
-            return state == NativeState::kPlaying;
-        case CommandType::kResume:
-            return state == NativeState::kPaused;
-        case CommandType::kSeek:
-            return state == NativeState::kPrepared || state == NativeState::kPlaying ||
-                   state == NativeState::kPaused || state == NativeState::kStopped;
-        case CommandType::kStop:
-            return state != NativeState::kIdle;
-    }
-    return false;
-}
-
-// checksum = checksum * 31 + uint16(sample), the shape shared by the sibling
-// audio seams so a harness can reproduce it in Kotlin.
-uint64_t AccumulateChecksum(uint64_t checksum, const int16_t* samples, int64_t count) {
-    for (int64_t i = 0; i < count; ++i) {
-        checksum = checksum * 31u + static_cast<uint64_t>(static_cast<uint16_t>(samples[i]));
-    }
-    return checksum;
-}
-
-// Deterministic synthetic reference identity. Pure integer math so the
-// Kotlin wrapper reproduces it bit-exactly:
-//   sample(track, frame, channel) =
-//       (((frame * (2*track + 3) + channel * 97) mod 2001) - 1000) * 4
-// Per-track amplitude <= 4000, so eight unit-gain tracks sum to <= 32000
-// and the mix bus never clips.
-int16_t SyntheticSample(int track, int64_t frame, int channel) {
-    const int64_t phase = frame * static_cast<int64_t>(2 * track + 3) +
-                          static_cast<int64_t>(channel) * 97;
-    return static_cast<int16_t>(((phase % 2001) - 1000) * 4);
-}
-
-void GenerateSyntheticPcm(int track, int64_t startFrame, int64_t frames,
-                          int32_t channelCount, int16_t* out) {
-    int64_t i = 0;
-    for (int64_t f = 0; f < frames; ++f) {
-        for (int32_t c = 0; c < channelCount; ++c) {
-            out[i++] = SyntheticSample(track, startFrame + f, c);
-        }
-    }
-}
-
-// Smallest ptsUs whose frameOfPositionUs floor lands exactly on `frame`
-// (valid because sampleRate <= 192000 < 1e6).
-int64_t CeilPtsUsOfFrame(int64_t frame, int32_t sampleRate) {
-    if (frame <= 0) return 0;
-    return (frame * kMicrosPerSecond + sampleRate - 1) / sampleRate;
-}
-
-int64_t PowerOfTwoCeil(int64_t v) {
-    int64_t p = 1;
-    while (p < v) p <<= 1;
-    return p;
-}
-
-int64_t SteadyNowNs() {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-// Bounded stack-buffer appender; overflow latches and the reply fails
-// closed with status=reply_overflow instead of silently truncating.
-class ReplyBuilder {
-public:
-    ReplyBuilder(char* buf, size_t cap) : buf_(buf), cap_(cap) {
-        if (cap_ > 0) buf_[0] = '\0';
-    }
-    void appendf(const char* fmt, ...) {
-        if (overflow_ || len_ >= cap_) { overflow_ = true; return; }
-        va_list args;
-        va_start(args, fmt);
-        const int written = std::vsnprintf(buf_ + len_, cap_ - len_, fmt, args);
-        va_end(args);
-        if (written < 0 || static_cast<size_t>(written) >= cap_ - len_) {
-            overflow_ = true;
-            return;
-        }
-        len_ += static_cast<size_t>(written);
-    }
-    bool overflowed() const { return overflow_; }
-
-private:
-    char*  buf_;
-    size_t cap_;
-    size_t len_{0};
-    bool   overflow_{false};
-};
-
-struct Command {
-    CommandType type{CommandType::kPrepare};
-    int64_t     arg{0};
-    uint64_t    seq{0};
-};
-
-// Worker-published mirror (guarded by Session::mutex_). All tokens are
-// string literals so publishing never allocates.
-struct PublishedState {
-    NativeState state{NativeState::kIdle};
-    bool        workerStarted{false};
-    bool        workerExited{false};
-    bool        eosPushed{false};
-    int64_t     renderedFrames{0};
-    int64_t     pushedFrames{0};
-    int64_t     positionFrame{0};
-    uint64_t    dispatchCount{0};
-    uint64_t    backpressureCount{0};
-    uint64_t    commandsProcessed{0};
-    uint64_t    commandErrors{0};
-    uint64_t    ackedSeq{0};
-    const char* lastCommandResult{"none"};
-    const char* lastError{"none"};
-    uint64_t    pushedChecksum{0};
-};
-
-std::vector<std::shared_ptr<DecodedAudioPcmSourceNode>> MakeSources(
-    int32_t trackCount, int32_t sampleRate, int32_t channelCount,
-    int64_t declaredFrames, int64_t sourceRingCapacityFrames) {
-    std::vector<std::shared_ptr<DecodedAudioPcmSourceNode>> sources;
-    sources.reserve(static_cast<size_t>(trackCount));
-    for (int32_t t = 0; t < trackCount; ++t) {
-        sources.push_back(std::make_shared<DecodedAudioPcmSourceNode>(
-            SourceNodeId(t), sampleRate, channelCount, declaredFrames,
-            /*timelineStartPtsUs=*/0, sourceRingCapacityFrames));
-    }
-    return sources;
-}
-
-// Populates the mix topology before the scheduler member snapshots it;
-// called from the member initializer list only. Edge-insertion order is
-// the auto-discovery routed order (track 0 first).
-const Graph& PrepareTopology(
-    Graph& g,
-    const std::shared_ptr<AudioMixBusNode>& mixBus,
-    const std::vector<std::shared_ptr<DecodedAudioPcmSourceNode>>& sources) {
-    (void)g.addNode(mixBus);
-    for (size_t t = 0; t < sources.size(); ++t) {
-        (void)g.addNode(sources[t]);
-        (void)g.connect(sources[t]->id(), "audio_out", kMixNodeId, kMixInputPorts[t]);
-    }
-    return g;
-}
+constexpr size_t  kReplyCapacity         = 1536;
+constexpr int64_t kMaxIngestFrames       = kMaxWriteFrames;                                    // 8192
 
 // ---------------------------------------------------------------------------
 // Session. Member declaration order is construction order: the graph is
@@ -325,6 +167,8 @@ struct RealtimePlaybackGraphSession {
     const int64_t maxFramesPerMix;
     const int32_t trackCount;
     const int64_t declaredFrames;
+    // Y5a: bit t set => track t is EXTERNAL-INGEST (owner-thread producer).
+    const uint32_t externalIngestMask;
     int64_t       handle{0}; // assigned under the registry mutex before publication
 
     Graph                                                   graphTopology;
@@ -371,6 +215,7 @@ struct RealtimePlaybackGraphSession {
     RealtimePlaybackGraphSession(int32_t sampleRateIn, int32_t channelCountIn,
                                  int64_t maxFramesPerMixIn, int32_t trackCountIn,
                                  int64_t declaredFramesIn,
+                                 uint32_t externalIngestMaskIn,
                                  int64_t sourceRingCapacityFrames,
                                  int64_t outputRingCapacityFrames)
         : sampleRate(sampleRateIn),
@@ -378,6 +223,7 @@ struct RealtimePlaybackGraphSession {
           maxFramesPerMix(maxFramesPerMixIn),
           trackCount(trackCountIn),
           declaredFrames(declaredFramesIn),
+          externalIngestMask(externalIngestMaskIn),
           graphTopology(),
           mixBus(std::make_shared<AudioMixBusNode>(kMixNodeId, sampleRateIn, channelCountIn,
                                                    maxFramesPerMixIn)),
@@ -392,6 +238,7 @@ struct RealtimePlaybackGraphSession {
 
     ~RealtimePlaybackGraphSession() { shutdownWorker(); }
 
+    bool isExternalTrack(int t) const { return ((externalIngestMask >> t) & 1u) != 0u; }
     AudioSpscAudioRingBuffer& sourceRingAt(int t) { return *sources[static_cast<size_t>(t)]->ring(); }
     AudioDecoderRingWriter&   writerAt(int t)     { return *sources[static_cast<size_t>(t)]->ringWriter(); }
     // The 6-arg node constructor always owns a RingBufferAudioSampleProvider,
@@ -451,6 +298,16 @@ struct RealtimePlaybackGraphSession {
         return published_;
     }
 
+    // Owner-thread (Y5a ingest gate): true only when the command slot is
+    // empty AND every enqueued command has been acked, i.e. the worker
+    // cannot be inside executeCommand() (the only place it touches an
+    // external track's writer). Copies the mirror under the same lock.
+    bool ownerQuiescentForIngest(PublishedState* out) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        *out = published_;
+        return !commandPending && published_.ackedSeq == commandsEnqueued;
+    }
+
     // Owner-thread (output ring CONSUMER role): consumes a pending
     // start/seek epoch and/or discards every unread frame, folding the
     // count into discardedFrames.
@@ -483,6 +340,7 @@ private:
         uint64_t    commandsDone   = 0;
         uint64_t    commandErrors  = 0;
         uint64_t    ackedSeq       = 0;
+        uint64_t    underruns      = 0; // Y5a external-ingest underruns (nonterminal)
         uint64_t    pushedChecksum = 0;
         const char* lastResult     = "none";
         const char* lastError      = "none";
@@ -506,6 +364,7 @@ private:
             ps.commandsProcessed = commandsDone;
             ps.commandErrors     = commandErrors;
             ps.ackedSeq          = ackedSeq;
+            ps.underrunCount     = underruns;
             ps.lastCommandResult = lastResult;
             ps.lastError         = lastError;
             ps.pushedChecksum    = pushedChecksum;
@@ -565,10 +424,13 @@ private:
             return nullptr;
         };
 
-        // Producer role: fills every source ring with synthetic PCM from the
-        // writer's own cursor up to the declared end / free space.
+        // Producer role (SYNTHETIC tracks only): fills every synthetic source
+        // ring with synthetic PCM from the writer's own cursor up to the
+        // declared end / free space. External tracks are never touched here;
+        // their producer is the owner-thread ingest entry point.
         auto topUpSources = [&]() -> const char* {
             for (int t = 0; t < trackCount; ++t) {
+                if (isExternalTrack(t)) continue;
                 AudioDecoderRingWriter&   w    = writerAt(t);
                 AudioSpscAudioRingBuffer& ring = sourceRingAt(t);
                 while (w.nextWriteFrame() < declaredFrames) {
@@ -732,13 +594,26 @@ private:
                     break;
                 }
                 if (const char* e = topUpSources()) { fail(e); break; }
+                // Readiness: synthetic tracks keep the fail-closed writer-cursor
+                // probe (the worker is their producer, so a shortfall is a
+                // bug). External tracks use only the ring's atomic
+                // availableReadFrames() (never the owner-private writer
+                // cursor); a shortfall is a nonterminal underrun that skips
+                // this iteration and lets the clock catch up later.
+                bool externalShort = false;
                 for (int t = 0; t < trackCount; ++t) {
-                    if (writerAt(t).nextWriteFrame() - cursorFrame < window) {
+                    if (isExternalTrack(t)) {
+                        if (sourceRingAt(t).availableReadFrames() < window) {
+                            externalShort = true;
+                            break;
+                        }
+                    } else if (writerAt(t).nextWriteFrame() - cursorFrame < window) {
                         fail("source_starved");
                         break;
                     }
                 }
                 if (state == NativeState::kFailed) break;
+                if (externalShort) { ++underruns; break; }
                 if (outputRing.availableWriteFrames() < window) { ++backpressure; break; }
 
                 GraphAudioScheduler::SchedulerOutput so{};
@@ -860,9 +735,19 @@ jstring ReplyWrongOwner(JNIEnv* env, RealtimePlaybackGraphSession& s) {
                         NativeStateToken(s.copyPublished().state));
 }
 
+// Y5a ingest-only reply fields; every non-ingest reply carries the
+// defaults (ingestTrack=-1, counts 0) so the reply shape stays stable.
+struct IngestExtras {
+    int32_t track{-1};
+    int64_t acceptedFrames{0};
+    int64_t nextWriteFrame{0};
+    int64_t freeFrames{0};
+};
+
 // Full stable reply shape shared by every owner-thread entry point.
 jstring ReplyFull(JNIEnv* env, RealtimePlaybackGraphSession& s, const char* status,
-                  const PublishedState& ps, uint64_t seq, int64_t framesRead) {
+                  const PublishedState& ps, uint64_t seq, int64_t framesRead,
+                  const IngestExtras& ingest = IngestExtras{}) {
     char buf[kReplyCapacity];
     ReplyBuilder out(buf, sizeof(buf));
     out.appendf(
@@ -874,7 +759,9 @@ jstring ReplyFull(JNIEnv* env, RealtimePlaybackGraphSession& s, const char* stat
         "wrongOwnerThread=%s;workerJoined=%s;workerExited=%s;"
         "dispatchCount=%llu;backpressureCount=%llu;commandsProcessed=%llu;commandErrors=%llu;"
         "outputAvailableReadFrames=%lld;pushedChecksumHex=%016llx;drainedChecksumHex=%016llx;"
-        "framesRead=%lld;bytesRead=%lld",
+        "framesRead=%lld;bytesRead=%lld;"
+        "externalIngestTrackMask=%u;underrunCount=%llu;ingestTrack=%d;"
+        "acceptedFrames=%lld;nextWriteFrame=%lld;freeFrames=%lld",
         status, DerivedStateToken(ps, s.eosDrained),
         static_cast<long long>(s.handle), static_cast<int>(s.trackCount),
         static_cast<long long>(s.declaredFrames), static_cast<long long>(s.maxFramesPerMix),
@@ -895,7 +782,13 @@ jstring ReplyFull(JNIEnv* env, RealtimePlaybackGraphSession& s, const char* stat
         static_cast<unsigned long long>(ps.pushedChecksum),
         static_cast<unsigned long long>(s.drainedChecksum),
         static_cast<long long>(framesRead),
-        static_cast<long long>(framesRead * 2 * s.channelCount));
+        static_cast<long long>(framesRead * 2 * s.channelCount),
+        static_cast<unsigned>(s.externalIngestMask),
+        static_cast<unsigned long long>(ps.underrunCount),
+        static_cast<int>(ingest.track),
+        static_cast<long long>(ingest.acceptedFrames),
+        static_cast<long long>(ingest.nextWriteFrame),
+        static_cast<long long>(ingest.freeFrames));
     if (out.overflowed()) {
         std::snprintf(buf, sizeof(buf), "status=reply_overflow;state=unknown;handle=%lld",
                       static_cast<long long>(s.handle));
@@ -958,6 +851,9 @@ jstring RunCommand(JNIEnv* env, jlong handle, CommandType type, int64_t arg) {
 // JNI: createRealtimePlaybackGraphSession
 // Returns handle > 0, or 0 on invalid arguments, rig validation failure,
 // worker start failure, or when kMaxLiveSessions live sessions exist.
+// externalIngestTrackMask (Y5a): bit t marks track t external-ingest; 0 =
+// every track synthetic (Y1 behaviour). Bits at or above trackCount, or a
+// negative mask, are invalid arguments.
 // ---------------------------------------------------------------------------
 extern "C" JNIEXPORT jlong JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardRealtimePlaybackNativeBridge_createRealtimePlaybackGraphSession(
@@ -967,7 +863,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardRealtimePlaybackNativeB
     jint  channelCount,
     jint  maxFramesPerMix,
     jint  trackCount,
-    jlong declaredFrameCount) {
+    jlong declaredFrameCount,
+    jint  externalIngestTrackMask) {
 
     const int64_t mfpm     = static_cast<int64_t>(maxFramesPerMix);
     const int64_t declared = static_cast<int64_t>(declaredFrameCount);
@@ -983,6 +880,10 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardRealtimePlaybackNativeB
         declared > DecodedAudioPcmSourceNode::kMaxExpectedSeconds * static_cast<int64_t>(sampleRate)) {
         return 0;
     }
+    if (externalIngestTrackMask < 0) return 0;
+    const uint32_t allowedMaskBits = (1u << static_cast<uint32_t>(trackCount)) - 1u;
+    const uint32_t externalMask    = static_cast<uint32_t>(externalIngestTrackMask);
+    if ((externalMask & ~allowedMaskBits) != 0u) return 0;
 
     const int64_t sourceCap = std::min<int64_t>(
         kMaxRingCapacityFrames, PowerOfTwoCeil(std::max<int64_t>(4 * mfpm, 4096)));
@@ -993,7 +894,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardRealtimePlaybackNativeB
     try {
         session = std::make_shared<RealtimePlaybackGraphSession>(
             static_cast<int32_t>(sampleRate), static_cast<int32_t>(channelCount), mfpm,
-            static_cast<int32_t>(trackCount), declared, sourceCap, outputCap);
+            static_cast<int32_t>(trackCount), declared, externalMask, sourceCap, outputCap);
     } catch (...) {
         return 0;
     }
@@ -1106,6 +1007,111 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardRealtimePlaybackNativeB
     ps = s.copyPublished();
     OwnerRefreshEosDrained(s, ps);
     return ReplyFull(env, s, "ok", ps, ps.ackedSeq, framesRead);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: ingestRealtimePlaybackGraphSessionExternalPcm16 (Y5a)
+// Owner-thread PRODUCER of one EXTERNAL track's source ring. Reads
+// frameCount interleaved PCM16 frames from byte offset 0 of the direct
+// buffer. Status tokens (all rejections mutate nothing):
+//   not_found / wrong_owner_thread / worker_exited   registry / affinity
+//   invalid_state          session already failed
+//   invalid_track          trackIndex outside [0, trackCount)
+//   track_not_external     trackIndex is a synthetic track
+//   invalid_args           frameCount <= 0 or expectedStartFrame < 0
+//   null_pcm_buffer / non_direct_buffer / direct_buffer_address_unavailable
+//   insufficient_buffer_capacity   capacity < frameCount * 2 * channelCount
+//   format_mismatch        sampleRate/channelCount != session format
+//   command_in_flight      command slot busy or an enqueued command unacked
+//   awaiting_seek_ack      ring seek epoch not yet acked by the worker
+//   expected_start_mismatch expectedStartFrame != writer.nextWriteFrame()
+//   eos_reached            writer cursor already at declaredFrameCount
+//   ring_full              zero free frames (backpressure, retry later)
+//   partial_write          0 < acceptedFrames < frameCount
+//   ok                     acceptedFrames == frameCount
+// Reply adds ingestTrack/acceptedFrames/nextWriteFrame/freeFrames to the
+// common shape; nextWriteFrame/freeFrames are post-write values.
+// ---------------------------------------------------------------------------
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardRealtimePlaybackNativeBridge_ingestRealtimePlaybackGraphSessionExternalPcm16(
+    JNIEnv* env, jobject /* bridge */, jlong handle, jint trackIndex, jobject srcBuffer,
+    jint frameCount, jint sampleRate, jint channelCount, jlong expectedStartFrame) {
+
+    const auto session = FindRtPlaybackSession(handle);
+    if (!session) return ReplyMinimal(env, "not_found", handle, "unknown");
+    RealtimePlaybackGraphSession& s = *session;
+    if (std::this_thread::get_id() != s.ownerThreadId) return ReplyWrongOwner(env, s);
+
+    PublishedState ps = s.copyPublished();
+    OwnerRefreshEosDrained(s, ps);
+    IngestExtras x{};
+    x.track = static_cast<int32_t>(trackIndex);
+    if (ps.workerExited) return ReplyFull(env, s, "worker_exited", ps, ps.ackedSeq, 0, x);
+    if (ps.state == NativeState::kFailed) return ReplyFull(env, s, "invalid_state", ps, ps.ackedSeq, 0, x);
+    if (trackIndex < 0 || trackIndex >= s.trackCount) {
+        return ReplyFull(env, s, "invalid_track", ps, ps.ackedSeq, 0, x);
+    }
+    const int t = static_cast<int>(trackIndex);
+    if (!s.isExternalTrack(t)) return ReplyFull(env, s, "track_not_external", ps, ps.ackedSeq, 0, x);
+    if (frameCount <= 0 || expectedStartFrame < 0) {
+        return ReplyFull(env, s, "invalid_args", ps, ps.ackedSeq, 0, x);
+    }
+    if (!srcBuffer) return ReplyFull(env, s, "null_pcm_buffer", ps, ps.ackedSeq, 0, x);
+    const jlong capacityBytes = env->GetDirectBufferCapacity(srcBuffer);
+    if (capacityBytes < 0) return ReplyFull(env, s, "non_direct_buffer", ps, ps.ackedSeq, 0, x);
+    const void* rawAddr = env->GetDirectBufferAddress(srcBuffer);
+    if (!rawAddr) return ReplyFull(env, s, "direct_buffer_address_unavailable", ps, ps.ackedSeq, 0, x);
+    const int64_t bytesPerFrame = 2LL * s.channelCount;
+    if (static_cast<int64_t>(capacityBytes) < static_cast<int64_t>(frameCount) * bytesPerFrame) {
+        return ReplyFull(env, s, "insufficient_buffer_capacity", ps, ps.ackedSeq, 0, x);
+    }
+    if (sampleRate != s.sampleRate || channelCount != s.channelCount) {
+        return ReplyFull(env, s, "format_mismatch", ps, ps.ackedSeq, 0, x);
+    }
+
+    // Command gate: only past this point may the owner touch the writer
+    // (producer-private plain counters) without racing the worker's
+    // command-time re-anchor. The gate cannot flip underneath us: this
+    // owner thread is the only command enqueuer.
+    if (!s.ownerQuiescentForIngest(&ps)) {
+        return ReplyFull(env, s, "command_in_flight", ps, ps.ackedSeq, 0, x);
+    }
+    AudioDecoderRingWriter&   w    = s.writerAt(t);
+    AudioSpscAudioRingBuffer& ring = s.sourceRingAt(t);
+    x.nextWriteFrame = w.nextWriteFrame();
+    x.freeFrames     = ring.availableWriteFrames();
+    if (ring.seekRequest() != ring.seekAck()) {
+        return ReplyFull(env, s, "awaiting_seek_ack", ps, ps.ackedSeq, 0, x);
+    }
+    if (static_cast<int64_t>(expectedStartFrame) != x.nextWriteFrame) {
+        return ReplyFull(env, s, "expected_start_mismatch", ps, ps.ackedSeq, 0, x);
+    }
+    const int64_t remainingDeclared = s.declaredFrames - x.nextWriteFrame;
+    if (remainingDeclared <= 0) return ReplyFull(env, s, "eos_reached", ps, ps.ackedSeq, 0, x);
+    if (x.freeFrames <= 0) return ReplyFull(env, s, "ring_full", ps, ps.ackedSeq, 0, x);
+
+    const int64_t toWrite = std::min<int64_t>(
+        {static_cast<int64_t>(frameCount), x.freeFrames, kMaxIngestFrames, remainingDeclared});
+    int64_t written = 0;
+    const WriterStatus ws = w.write(static_cast<const int16_t*>(rawAddr), toWrite,
+                                    s.sampleRate, s.channelCount, &written);
+    x.acceptedFrames = written;
+    x.nextWriteFrame = w.nextWriteFrame();
+    x.freeFrames     = ring.availableWriteFrames();
+    const char* status = "ok";
+    switch (ws) {
+        case WriterStatus::kOk:
+            status = written == static_cast<int64_t>(frameCount) ? "ok" : "partial_write";
+            break;
+        case WriterStatus::kPartialWrite:   status = "partial_write";     break;
+        case WriterStatus::kRingFull:       status = "ring_full";         break;
+        case WriterStatus::kFormatMismatch: status = "format_mismatch";   break;
+        case WriterStatus::kInvalidArgument:status = "invalid_args";      break;
+        case WriterStatus::kAlreadyEos:     status = "eos_reached";       break;
+        case WriterStatus::kAwaitingSeekAck:status = "awaiting_seek_ack"; break;
+    }
+    if (written > 0) s.cv_.notify_all(); // an underrun-paused worker may dispatch now
+    return ReplyFull(env, s, status, ps, ps.ackedSeq, 0, x);
 }
 
 extern "C" JNIEXPORT jstring JNICALL

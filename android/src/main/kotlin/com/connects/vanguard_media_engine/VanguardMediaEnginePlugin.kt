@@ -56,6 +56,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidNodeOwnedAudioTrack
 import com.connects.vanguard_media_engine.diagnostics.AndroidPassthroughRemuxSinkSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackAudioTrackSinkSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackFocusResponseSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackIngestSeamSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackInteractiveControlsSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackSinkFaultToleranceSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackTransportCoreSmokeCoordinator
@@ -287,6 +288,12 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     // recovery + route-change listener handoff) smoke coordinator.
     // Registration-only glue mirroring the established diagnostic route wiring.
     private var realtimePlaybackSinkFaultToleranceSmokeCoordinator: AndroidRealtimePlaybackSinkFaultToleranceSmokeCoordinator? = null
+
+    // ── P4-AUDIO-REALTIME-PLAYBACK-EXTERNAL-INGEST-SEAM (Y5a): production True-DAG ──
+    // realtime playback external PCM16 ingest seam smoke coordinator (Kotlin
+    // synthetic producer -> owner-thread native source-ring ingest; no codec).
+    // Registration-only glue mirroring the established diagnostic route wiring.
+    private var realtimePlaybackIngestSeamSmokeCoordinator: AndroidRealtimePlaybackIngestSeamSmokeCoordinator? = null
 
     // ── P3-MULTICAM-NODE: MultiCamCompositorNode native topology + layout ────
     // math smoke coordinator.
@@ -560,6 +567,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         realtimePlaybackSinkFaultToleranceSmokeCoordinator = AndroidRealtimePlaybackSinkFaultToleranceSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        realtimePlaybackIngestSeamSmokeCoordinator = AndroidRealtimePlaybackIngestSeamSmokeCoordinator(
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(
@@ -1058,6 +1068,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android realtime playback sink fault tolerance smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidRealtimePlaybackIngestSeamSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = realtimePlaybackIngestSeamSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android realtime playback ingest seam smoke coordinator unavailable",
                     null,
                 )
             }
@@ -2581,6 +2605,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // releases every AudioTrack instance it created.
         realtimePlaybackSinkFaultToleranceSmokeCoordinator?.disposeAll()
         realtimePlaybackSinkFaultToleranceSmokeCoordinator = null
+        // P4-AUDIO-REALTIME-PLAYBACK-EXTERNAL-INGEST-SEAM (Y5a): stop replying
+        // before dropping; an in-flight run finishes on its own thread and
+        // disposes its state machine / destroys its raw session in finally.
+        realtimePlaybackIngestSeamSmokeCoordinator?.disposeAll()
+        realtimePlaybackIngestSeamSmokeCoordinator = null
         camera2ConcurrentSmokeCoordinator = null
         // P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): release the smoke executor. An
         // in-flight run owns its VkDevice/images on its own thread and destroys

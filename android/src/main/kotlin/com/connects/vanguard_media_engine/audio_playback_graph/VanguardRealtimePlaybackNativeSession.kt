@@ -14,6 +14,12 @@ import java.nio.ByteBuffer
 //
 // Owner-thread affinity: native pins the creating thread; construct and
 // drive this object on that single thread (only [destroy] is any-thread).
+//
+// Y5a (EXTERNAL-INGEST-SEAM): [Config.externalIngestTrackMask] opts
+// individual tracks into owner-thread PCM16 ingest through [ingest]; the
+// default (0) keeps every track native-synthetic, so existing callers are
+// unchanged. This wrapper still carries no policy: which ingest statuses
+// are terminal is decided by the transport state machine.
 class VanguardRealtimePlaybackNativeSession private constructor(
     val handle: Long,
     val config: Config,
@@ -24,8 +30,14 @@ class VanguardRealtimePlaybackNativeSession private constructor(
         val maxFramesPerMix: Int,
         val trackCount: Int,
         val declaredFrameCount: Long,
+        // Bit t set => track t is external-ingest (Kotlin producer). Must be
+        // >= 0 with no bits at or above trackCount.
+        val externalIngestTrackMask: Int = 0,
     ) {
         val bytesPerFrame: Int get() = 2 * channelCount
+
+        fun isExternalTrack(trackIndex: Int): Boolean =
+            trackIndex in 0 until trackCount && ((externalIngestTrackMask ushr trackIndex) and 1) != 0
     }
 
     enum class CreateFailure {
@@ -34,6 +46,7 @@ class VanguardRealtimePlaybackNativeSession private constructor(
         INVALID_MAX_FRAMES_PER_MIX,
         INVALID_TRACK_COUNT,
         INVALID_DECLARED_FRAME_COUNT,
+        INVALID_EXTERNAL_INGEST_TRACK_MASK,
         // Native returned 0 for arguments that passed the mirrored
         // admission table above. The only remaining native causes are the
         // four-live-session cap and native resource exhaustion (thread or
@@ -95,9 +108,25 @@ class VanguardRealtimePlaybackNativeSession private constructor(
         val drainedChecksumHex: String,
         val framesRead: Long,
         val bytesRead: Long,
+        // Y5a fields. externalIngestTrackMask/underrunCount are on every
+        // full reply; ingestTrack/acceptedFrames/nextWriteFrame/freeFrames
+        // are meaningful only on [ingest] replies (ingestTrack == -1 else).
+        val externalIngestTrackMask: Int,
+        val underrunCount: Long,
+        val ingestTrack: Int,
+        val acceptedFrames: Long,
+        val nextWriteFrame: Long,
+        val freeFrames: Long,
         val raw: String,
     ) {
         val ok: Boolean get() = status == STATUS_OK
+
+        // Y5a: an ingest call that native fully processed without failing
+        // the session; acceptedFrames may still be 0 (ring_full /
+        // eos_reached) and nextWriteFrame is the post-call anchor.
+        val ingestNonterminal: Boolean
+            get() = status == STATUS_OK || status == STATUS_PARTIAL_WRITE ||
+                status == STATUS_RING_FULL || status == STATUS_EOS_REACHED
     }
 
     companion object {
@@ -108,6 +137,19 @@ class VanguardRealtimePlaybackNativeSession private constructor(
         const val STATUS_INVALID_ARGS = "invalid_args"
         const val STATUS_COMMAND_TIMEOUT = "command_timeout"
         const val STATUS_SESSION_CLOSED = "session_closed"
+
+        // Y5a ingest statuses (native tokens, see the ingest JNI comment).
+        const val STATUS_PARTIAL_WRITE = "partial_write"
+        const val STATUS_RING_FULL = "ring_full"
+        const val STATUS_EOS_REACHED = "eos_reached"
+        const val STATUS_EXPECTED_START_MISMATCH = "expected_start_mismatch"
+        const val STATUS_AWAITING_SEEK_ACK = "awaiting_seek_ack"
+        const val STATUS_COMMAND_IN_FLIGHT = "command_in_flight"
+        const val STATUS_FORMAT_MISMATCH = "format_mismatch"
+        const val STATUS_INVALID_TRACK = "invalid_track"
+        const val STATUS_TRACK_NOT_EXTERNAL = "track_not_external"
+        const val STATUS_WORKER_EXITED = "worker_exited"
+        const val MAX_INGEST_FRAMES = 8_192
 
         // Mirrors the native admission table exactly (AudioMixBusNode /
         // DecodedAudioPcmSourceNode / AudioDecoderRingWriter bounds).
@@ -130,6 +172,9 @@ class VanguardRealtimePlaybackNativeSession private constructor(
             config.declaredFrameCount <= 0L ||
                 config.declaredFrameCount > MAX_DECLARED_SECONDS * config.sampleRate ->
                 CreateFailure.INVALID_DECLARED_FRAME_COUNT
+            config.externalIngestTrackMask < 0 ||
+                (config.externalIngestTrackMask and ((1 shl config.trackCount) - 1).inv()) != 0 ->
+                CreateFailure.INVALID_EXTERNAL_INGEST_TRACK_MASK
             else -> null
         }
 
@@ -142,6 +187,7 @@ class VanguardRealtimePlaybackNativeSession private constructor(
                 config.maxFramesPerMix,
                 config.trackCount,
                 config.declaredFrameCount,
+                config.externalIngestTrackMask,
             )
             if (handle <= 0L) return CreateResult.Failure(CreateFailure.NATIVE_CAPACITY_EXHAUSTED)
             return CreateResult.Success(VanguardRealtimePlaybackNativeSession(handle, config))
@@ -205,6 +251,12 @@ class VanguardRealtimePlaybackNativeSession private constructor(
                 drainedChecksumHex = str("drainedChecksumHex"),
                 framesRead = long("framesRead"),
                 bytesRead = long("bytesRead"),
+                externalIngestTrackMask = int("externalIngestTrackMask"),
+                underrunCount = long("underrunCount"),
+                ingestTrack = kv["ingestTrack"]?.toIntOrNull() ?: -1,
+                acceptedFrames = long("acceptedFrames"),
+                nextWriteFrame = long("nextWriteFrame"),
+                freeFrames = long("freeFrames"),
                 raw = raw,
             )
         }
@@ -247,6 +299,16 @@ class VanguardRealtimePlaybackNativeSession private constructor(
     fun drain(dst: ByteBuffer, maxFrames: Int): Reply = guarded {
         VanguardRealtimePlaybackNativeBridge.drainRealtimePlaybackGraphSessionOutputPcm16(
             handle, dst, maxFrames,
+        )
+    }
+
+    // Y5a: owner-thread producer write into external track `trackIndex`.
+    // `src` must be direct with capacity >= frameCount * bytesPerFrame; PCM16
+    // is read from byte offset 0 (position/limit are not touched). The
+    // session format is passed through so native can reject a mismatch.
+    fun ingest(trackIndex: Int, src: ByteBuffer, frameCount: Int, expectedStartFrame: Long): Reply = guarded {
+        VanguardRealtimePlaybackNativeBridge.ingestRealtimePlaybackGraphSessionExternalPcm16(
+            handle, trackIndex, src, frameCount, config.sampleRate, config.channelCount, expectedStartFrame,
         )
     }
 
