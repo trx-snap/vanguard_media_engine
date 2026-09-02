@@ -216,6 +216,17 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   static const String deadObjectRecoveryFailMarkerConstant =
       'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_FAIL';
 
+  /// Canonical pass marker emitted by the native harness for X13
+  /// AudioTrack timestamp stabilization diagnostic proof runs (standalone
+  /// muted, or composed with X12).
+  static const String timestampStabilizationPassMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_SMOKE_PASS';
+
+  /// Canonical fail marker emitted by the native harness for X13
+  /// AudioTrack timestamp stabilization diagnostic proof runs.
+  static const String timestampStabilizationFailMarkerConstant =
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_SMOKE_FAIL';
+
   /// Canonical Kotlin driver proof boundary string (muted AudioTrack sink
   /// claim included) emitted by the native harness.
   static const String proofBoundaryConstant =
@@ -272,6 +283,22 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
   /// freedom, no A/V sync.
   static const String deadObjectRecoveryProofBoundaryConstant =
       'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_dead_object_recovery_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_synthetic_dead_object_detection_and_recreation_only_base_gain_0_5_synthetic_dead_object_injected_once_old_track_released_new_track_initialized_and_resumed_no_real_os_dead_object_forcing_claim_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_seamless_hardware_hot_swap_claim_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
+
+  /// Canonical X13 timestamp stabilization (standalone muted) Kotlin driver
+  /// proof boundary string. Promotes AudioTimestamp from telemetry-only to a
+  /// poll-cadence / per-epoch frame-monotonicity DIAGNOSTIC gate. No
+  /// presentation clock, latency, A/V sync, drift, or HAL timestamp accuracy
+  /// claim; the timestamp never feeds back into pacing.
+  static const String timestampStabilizationProofBoundaryConstant =
+      'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audiotrack_timestamp_stabilization_diagnostic_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_telemetry_only_audio_timestamp_poll_cadence_and_per_epoch_frame_monotonicity_diagnostic_gate_only_one_poll_per_output_pass_after_write_returns_no_poll_inside_write_retry_loop_warmup_after_epoch_play_only_bounded_by_existing_deadline_per_epoch_baseline_reset_on_seek_flush_no_cross_epoch_comparison_unsigned_32bit_frame_position_one_positive_wrap_tolerated_equal_frame_position_allowed_strict_backward_only_fails_nanotime_monotonicity_telemetry_only_no_pacing_feedback_no_dispatch_feedback_no_write_size_feedback_no_checksum_effect_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_presentation_clock_claim_no_latency_claim_no_avsync_claim_no_drift_claim_no_hal_timestamp_accuracy_claim_no_aaudio_no_opensl_no_oboe_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
+
+  /// Canonical X13 + X12 composed Kotlin driver proof boundary string: the
+  /// X12 synthetic dead-object recovery sink (not muted, base gain 0.5) with
+  /// the X13 timestamp diagnostic gate, whose baseline is additionally reset
+  /// after the synthetic recreation. All X12 and X13 non-claims apply.
+  static const String
+  timestampStabilizationDeadObjectRecoveryProofBoundaryConstant =
+      'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audiotrack_timestamp_stabilization_with_dead_object_recovery_response_diagnostic_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_synthetic_dead_object_detection_and_recreation_only_base_gain_0_5_synthetic_dead_object_injected_once_old_track_released_new_track_initialized_and_resumed_no_real_os_dead_object_forcing_claim_playback_head_telemetry_only_audio_timestamp_poll_cadence_and_per_epoch_frame_monotonicity_diagnostic_gate_only_one_poll_per_output_pass_after_write_returns_no_poll_inside_write_retry_loop_warmup_after_epoch_play_only_bounded_by_existing_deadline_per_epoch_baseline_reset_on_seek_flush_and_after_synthetic_dead_object_recreation_no_cross_epoch_comparison_unsigned_32bit_frame_position_one_positive_wrap_tolerated_equal_frame_position_allowed_strict_backward_only_fails_nanotime_monotonicity_telemetry_only_no_pacing_feedback_no_dispatch_feedback_no_write_size_feedback_no_checksum_effect_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_seamless_hardware_hot_swap_claim_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_presentation_clock_claim_no_latency_claim_no_avsync_claim_no_drift_claim_no_hal_timestamp_accuracy_claim_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
 
   /// Canonical native TU proof boundary string (NO native sink claim)
   /// observed via the snapshot and echoed by the harness.
@@ -1378,16 +1405,240 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
         frameAccountingOk;
   }
 
+  // ── X13 AudioTrack timestamp stabilization proof getters ──────────────────
+
+  /// Whether this run executed the X13 AudioTrack timestamp stabilization
+  /// diagnostic proof mode (false for every default X4..X12 run). Standalone
+  /// keeps the muted default sink; composes ONLY with X12 (which adds the
+  /// post-recreate baseline reset).
+  bool get timestampStabilizationProofEnabled =>
+      _boolFact('timestampStabilizationProofEnabled');
+
+  /// Whether the AudioTrack timestamp stabilized in the pre-seek generation
+  /// and the final generation (post-seek, or post-recreate under X12) with
+  /// at least one stable poll and zero strict regressions.
+  bool get timestampStabilizedOk => _boolFact('timestampStabilizedOk');
+
+  /// Whether the AudioTrack timestamp framePosition advanced monotonically
+  /// (advances >= 1, wrap count bounded by generation count, zero
+  /// regressions).
+  bool get timestampAdvancingMonotonicOk =>
+      _boolFact('timestampAdvancingMonotonicOk');
+
+  /// Whether the AudioTrack timestamp stabilized in the final generation
+  /// after seek flush (and after X12 recreation if enabled) with the expected
+  /// epoch open and recreate reset counts.
+  bool get timestampPostSeekRestabilizedOk =>
+      _boolFact('timestampPostSeekRestabilizedOk');
+
+  /// Whether the timestamp never fed back into native pacing or write
+  /// accounting: at most one poll per pass, no poll inside write loop,
+  /// maxFramesPerMix unchanged, and native timing/checksum/sink accounting
+  /// gates held.
+  bool get timestampNoPacingFeedbackOk =>
+      _boolFact('timestampNoPacingFeedbackOk');
+
+  /// Total warmup polls across all generations before first available
+  /// timestamp.
+  int get timestampWarmupPollCount => _intFact('timestampWarmupPollCount');
+
+  /// Total stable polls across all generations with an available timestamp.
+  int get timestampStablePollCount => _intFact('timestampStablePollCount');
+
+  /// Transient timestamp unavailabilities observed after stabilization
+  /// (telemetry only; baseline is preserved).
+  int get timestampUnavailableAfterStableCount =>
+      _intFact('timestampUnavailableAfterStableCount');
+
+  /// Output passes executed by the sink on the owner thread.
+  int get timestampPassCount => _intFact('timestampPassCount');
+
+  /// Timestamp polls taken at output pass boundaries (must be <=
+  /// [timestampPassCount]).
+  int get timestampPassPollCount => _intFact('timestampPassPollCount');
+
+  /// Timestamp polls attempted inside the write loop (must be 0).
+  int get timestampPollInsideWriteLoopCount =>
+      _intFact('timestampPollInsideWriteLoopCount');
+
+  /// Monotonic strictly-forward framePosition steps observed across stable
+  /// polls.
+  int get timestampFrameAdvanceCount => _intFact('timestampFrameAdvanceCount');
+
+  /// Equal framePosition readings observed across consecutive stable polls.
+  int get timestampFrameEqualCount => _intFact('timestampFrameEqualCount');
+
+  /// Backward framePosition regressions observed (must be 0 for pass).
+  int get timestampFrameRegressionCount =>
+      _intFact('timestampFrameRegressionCount');
+
+  /// Positive-direction unsigned 32-bit framePosition wrap count (at most 1
+  /// per generation).
+  int get timestampWrapCount => _intFact('timestampWrapCount');
+
+  /// Strictly-forward nanoTime steps observed across stable polls (telemetry
+  /// only).
+  int get timestampNanoTimeAdvanceCountTelemetryOnly =>
+      _intFact('timestampNanoTimeAdvanceCountTelemetryOnly');
+
+  /// Equal nanoTime readings observed across stable polls (telemetry only).
+  int get timestampNanoTimeEqualCountTelemetryOnly =>
+      _intFact('timestampNanoTimeEqualCountTelemetryOnly');
+
+  /// Non-monotonic nanoTime readings observed across stable polls (telemetry
+  /// only).
+  int get timestampNanoTimeNonMonotonicCountTelemetryOnly =>
+      _intFact('timestampNanoTimeNonMonotonicCountTelemetryOnly');
+
+  /// Sink epoch open count (must be 2: initial open + post-seek open).
+  int get timestampEpochOpenCount => _intFact('timestampEpochOpenCount');
+
+  /// Timestamp baseline resets triggered by X12 track recreation (1 under
+  /// X13+X12, 0 under standalone X13).
+  int get timestampRecreateResetCount =>
+      _intFact('timestampRecreateResetCount');
+
+  /// Number of timestamp generations (baselines) tracked: 2 for standalone
+  /// X13 (pre-seek + post-seek), 3 for X13+X12 (pre-seek + post-seek +
+  /// post-recreate).
+  int get timestampGenerationCount => _intFact('timestampGenerationCount');
+
+  /// Number of generations that successfully stabilized.
+  int get timestampGenerationsStabilized =>
+      _intFact('timestampGenerationsStabilized');
+
+  /// Whether generation 0 (pre-seek) stabilized.
+  bool get timestampPreSeekStabilized =>
+      _boolFact('timestampPreSeekStabilized');
+
+  /// Whether generation 1 (post-seek) stabilized.
+  bool get timestampPostSeekStabilized =>
+      _boolFact('timestampPostSeekStabilized');
+
+  /// Whether generation 2 (post-recreate, X13+X12 only) stabilized.
+  bool get timestampPostRecreateStabilized =>
+      _boolFact('timestampPostRecreateStabilized');
+
+  /// Warmup polls spent in generation 0 before stabilization.
+  int get timestampPreSeekWarmupPolls =>
+      _intFact('timestampPreSeekWarmupPolls');
+
+  /// Warmup polls spent in generation 1 before stabilization.
+  int get timestampPostSeekWarmupPolls =>
+      _intFact('timestampPostSeekWarmupPolls');
+
+  /// Warmup polls spent in generation 2 before stabilization (X13+X12 only).
+  int get timestampPostRecreateWarmupPolls =>
+      _intFact('timestampPostRecreateWarmupPolls');
+
+  /// Stable polls observed in generation 0.
+  int get timestampPreSeekStablePolls =>
+      _intFact('timestampPreSeekStablePolls');
+
+  /// Stable polls observed in generation 1.
+  int get timestampPostSeekStablePolls =>
+      _intFact('timestampPostSeekStablePolls');
+
+  /// Stable polls observed in generation 2 (X13+X12 only).
+  int get timestampPostRecreateStablePolls =>
+      _intFact('timestampPostRecreateStablePolls');
+
+  /// Strictly-forward framePosition advances in generation 0.
+  int get timestampPreSeekAdvanceCount =>
+      _intFact('timestampPreSeekAdvanceCount');
+
+  /// Strictly-forward framePosition advances in generation 1.
+  int get timestampPostSeekAdvanceCount =>
+      _intFact('timestampPostSeekAdvanceCount');
+
+  /// Strictly-forward framePosition advances in generation 2 (X13+X12 only).
+  int get timestampPostRecreateAdvanceCount =>
+      _intFact('timestampPostRecreateAdvanceCount');
+
+  /// First stable framePosition captured in generation 0 (-1 if never).
+  int get timestampPreSeekFirstStableFramePosition =>
+      _intFact('timestampPreSeekFirstStableFramePosition', -1);
+
+  /// First stable framePosition captured in generation 1 (-1 if never).
+  int get timestampPostSeekFirstStableFramePosition =>
+      _intFact('timestampPostSeekFirstStableFramePosition', -1);
+
+  /// First stable framePosition captured in generation 2 (-1 if never).
+  int get timestampPostRecreateFirstStableFramePosition =>
+      _intFact('timestampPostRecreateFirstStableFramePosition', -1);
+
+  /// Last sampled framePosition across all polls (-1 if never).
+  int get timestampLastFramePosition =>
+      _intFact('timestampLastFramePosition', -1);
+
+  /// Timestamp warmup time budget per generation in milliseconds (1000).
+  int get timestampWarmupBudgetMs => _intFact('timestampWarmupBudgetMs');
+
+  /// Timestamp warmup max poll count per generation (4096).
+  int get timestampWarmupMaxPolls => _intFact('timestampWarmupMaxPolls');
+
+  /// X13 AudioTrack timestamp stabilization diagnostic gate.
+  /// In X13 mode: requires pre-seek and final generations stabilized,
+  /// monotonic framePosition advancement with zero regressions, bounded wrap
+  /// count, per-epoch baseline resets observed (2 epoch opens, and 1 recreate
+  /// reset if composed with X12), and the no-feedback invariant held (no
+  /// poll in write loop, poll count <= pass count, native pacing / sink
+  /// accounting / checksum identity gates intact). Diagnostic only: no
+  /// presentation clock, latency, A/V sync, drift, or HAL timestamp
+  /// accuracy claim.
+  /// In default X4..X12 mode: vacuously true (backward compatible).
+  bool get timestampStabilizationGatesHeld {
+    if (!timestampStabilizationProofEnabled) return true;
+    final expectedGenerations = deadObjectRecoveryProofEnabled ? 3 : 2;
+    final finalGenerationStabilized = deadObjectRecoveryProofEnabled
+        ? timestampPostRecreateStabilized
+        : timestampPostSeekStabilized;
+    final finalStablePolls = deadObjectRecoveryProofEnabled
+        ? timestampPostRecreateStablePolls
+        : timestampPostSeekStablePolls;
+    final expectedRecreateResets = deadObjectRecoveryProofEnabled ? 1 : 0;
+    return timestampStabilizedOk &&
+        timestampAdvancingMonotonicOk &&
+        timestampPostSeekRestabilizedOk &&
+        timestampNoPacingFeedbackOk &&
+        timestampPreSeekStabilized &&
+        finalGenerationStabilized &&
+        timestampGenerationCount == expectedGenerations &&
+        timestampEpochOpenCount == 2 &&
+        timestampRecreateResetCount == expectedRecreateResets &&
+        finalStablePolls > 0 &&
+        timestampStablePollCount > 0 &&
+        timestampFrameAdvanceCount >= 1 &&
+        timestampFrameRegressionCount == 0 &&
+        timestampPollInsideWriteLoopCount == 0 &&
+        timestampPassPollCount <= timestampPassCount &&
+        timestampWrapCount <= expectedGenerations &&
+        sinkWriteAccountingOk &&
+        checksumIdentityOk &&
+        frameAccountingOk &&
+        (!deadObjectRecoveryProofEnabled || deadObjectRecoveryGatesHeld);
+  }
+
   /// Whether [proofBoundary] matches the canonical Kotlin driver boundary
   /// for this run's mode. X8 runs must carry the mode-specific
   /// [focusDuckRestoreProofBoundaryConstant], X9 runs the mode-specific
   /// [focusLossPauseResumeProofBoundaryConstant], X10 runs the
   /// mode-specific [permanentFocusLossProofBoundaryConstant], X11 runs the
-  /// mode-specific [routeChangeEventHandoffProofBoundaryConstant], and X12
-  /// runs the mode-specific [deadObjectRecoveryProofBoundaryConstant] —
-  /// never the default boundary, whose muted/no-focus/no-recreation claims
-  /// would be false for X8..X12.
-  bool get hasCanonicalProofBoundary => deadObjectRecoveryProofEnabled
+  /// mode-specific [routeChangeEventHandoffProofBoundaryConstant], X12 runs
+  /// the mode-specific [deadObjectRecoveryProofBoundaryConstant], X13
+  /// standalone runs the mode-specific
+  /// [timestampStabilizationProofBoundaryConstant], and X13+X12 composed
+  /// runs the mode-specific
+  /// [timestampStabilizationDeadObjectRecoveryProofBoundaryConstant] — never
+  /// the default boundary, whose muted/no-focus/no-recreation/no-timestamp-gate
+  /// claims would be false for X8..X13.
+  bool get hasCanonicalProofBoundary =>
+      timestampStabilizationProofEnabled && deadObjectRecoveryProofEnabled
+      ? proofBoundary ==
+            timestampStabilizationDeadObjectRecoveryProofBoundaryConstant
+      : timestampStabilizationProofEnabled
+      ? proofBoundary == timestampStabilizationProofBoundaryConstant
+      : deadObjectRecoveryProofEnabled
       ? proofBoundary == deadObjectRecoveryProofBoundaryConstant
       : routeChangeEventHandoffProofEnabled
       ? proofBoundary == routeChangeEventHandoffProofBoundaryConstant
@@ -1465,7 +1716,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       pass &&
       status.toLowerCase() == 'pass' &&
       marker ==
-          (deadObjectRecoveryProofEnabled
+          (timestampStabilizationProofEnabled
+              ? timestampStabilizationPassMarkerConstant
+              : deadObjectRecoveryProofEnabled
               ? deadObjectRecoveryPassMarkerConstant
               : routeChangeEventHandoffProofEnabled
               ? routeChangeEventHandoffPassMarkerConstant
@@ -1504,6 +1757,9 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       deadObjectRecoveryGatesHeld &&
       (!deadObjectRecoveryProofEnabled ||
           _boolFact('deadObjectRecoveryGatesHeld')) &&
+      timestampStabilizationGatesHeld &&
+      (!timestampStabilizationProofEnabled ||
+          _boolFact('timestampStabilizationGatesHeld')) &&
       hasCanonicalProofBoundary &&
       nativeProofBoundaryOk &&
       formatProbeOk &&
@@ -1958,6 +2214,7 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
     bool permanentFocusLossProofEnabled = false,
     bool routeChangeEventHandoffProofEnabled = false,
     bool deadObjectRecoveryProofEnabled = false,
+    bool timestampStabilizationProofEnabled = false,
     Duration? timeout,
     MethodChannel? channel,
   }) async {
@@ -2011,6 +2268,11 @@ class VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport {
       // coordinator never derives X7 or any other mode flag from it.
       if (deadObjectRecoveryProofEnabled)
         'deadObjectRecoveryProofEnabled': true,
+      // Only sent for X13 timestamp-stabilization proof runs so the default
+      // X4..X12 argument shape stays frozen. X13 is isolated: standalone
+      // keeps the muted default sink, composes only with X12.
+      if (timestampStabilizationProofEnabled)
+        'timestampStabilizationProofEnabled': true,
     };
     try {
       final future = ch.invokeMethod<Object?>(methodName, args);

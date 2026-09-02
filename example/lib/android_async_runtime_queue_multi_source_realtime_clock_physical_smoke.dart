@@ -29,6 +29,9 @@
 //   - X10 (P4-AUDIO-FOCUS-LOSS-PERMANENT-STOP-RESPONSE): Terminal permanent focus-loss pause and rejected same-boundary focus-gain attempt (no play, no auto-resume) response.
 //   - X11 (P4-AUDIO-ROUTE-CHANGE-EVENT-HANDOFF-RESPONSE): Real routing-listener register/remove lifecycle, synthetic route_changed handoff with routed-device telemetry, and terminal route_disconnect fail-closed pause (no recreate/restart) response.
 //   - X12 (P4-AUDIO-DEAD-OBJECT-RECOVERY-RESPONSE): SYNTHETIC ERROR_DEAD_OBJECT injected once on the owner-thread write path (no real OS dead object forced), old track released once, one same-parameter AudioTrack recreated, STATE_INITIALIZED asserted, base gain 0.5 reapplied, play() asserted, same unwritten slice resumed with lossless sink accounting.
+//   - X13 (P4-AUDIO-AUDIOTRACK-TIMESTAMP-STABILIZATION): AudioTrack timestamp stabilization diagnostic proof executed twice:
+//     1) Standalone (muted default sink): proves pre-seek + post-seek timestamp stabilization (2 generations, 0 recreate resets), monotonic frame advancement with 0 strict regressions, no poll inside write loop, and zero feedback into native pacing.
+//     2) Composed with X12 (dead-object recovery, base gain 0.5): proves timestamp stabilization across all 3 generations (pre-seek, post-seek, post-recreate), with baseline reset on recreation and X12 dead-object recovery gates intact.
 // Overall exit is PASS only when ALL runs pass; each phase prints its own
 // PHYSICAL_SMOKE_PASS/FAIL marker.
 
@@ -403,6 +406,26 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
     // no production restart policy. ───────────────────────────────────────
     final deadObjectRecoveryPass = await _runDeadObjectRecoverySmoke();
 
+    // ── X13 (P4-AUDIO-AUDIOTRACK-TIMESTAMP-STABILIZATION - standalone):
+    // AudioTrack timestamp poll cadence and per-epoch frame monotonicity
+    // diagnostic gate over the muted default sink. Pre-seek and post-seek
+    // generations stabilize within warmup budget; framePosition advances
+    // monotonically with zero strict regressions; no poll inside write loop;
+    // timestamp never feeds back into native pacing or write accounting.
+    // Diagnostic only: no presentation clock, latency, A/V sync, drift, or
+    // HAL accuracy claims. ───────────────────────────────────────────────────
+    final timestampStabilizationPass = await _runTimestampStabilizationSmoke();
+
+    // ── X13 + X12 (P4-AUDIO-AUDIOTRACK-TIMESTAMP-STABILIZATION composed
+    // with DEAD-OBJECT-RECOVERY): AudioTrack timestamp stabilization over the
+    // X12 synthetic dead-object recovery response path (0.5 base gain).
+    // Baseline resets on seek and after synthetic dead-object recreation;
+    // all 3 generations (pre-seek, post-seek, post-recreate) stabilize with
+    // positive advances, zero regressions, lossless sink accounting, and
+    // X12 dead-object recovery held. ─────────────────────────────────────────
+    final timestampDeadObjectPass =
+        await _runTimestampStabilizationDeadObjectRecoverySmoke();
+
     final allPass =
         pass &&
         envelopePass &&
@@ -412,7 +435,9 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
         focusLossPauseResumePass &&
         permanentFocusLossPass &&
         routeChangeEventHandoffPass &&
-        deadObjectRecoveryPass;
+        deadObjectRecoveryPass &&
+        timestampStabilizationPass &&
+        timestampDeadObjectPass;
     if (mounted) {
       setState(() {
         _status = allPass
@@ -422,7 +447,9 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
                   'X9 focus-loss pause/resume gates held, '
                   'X10 permanent focus-loss stop gates held, '
                   'X11 route-change event-handoff gates held, '
-                  'X12 dead-object recovery gates held)'
+                  'X12 dead-object recovery gates held, '
+                  'X13 timestamp stabilization gates held, '
+                  'X13+X12 timestamp dead-object recovery gates held)'
             : 'FAIL: x4Pass=$pass, envelopePass=$envelopePass, '
                   'nonZeroGainPass=$nonZeroGainPass, '
                   'focusNoisyPass=$focusNoisyPass, '
@@ -431,6 +458,8 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
                   'permanentFocusLossPass=$permanentFocusLossPass, '
                   'routeChangeEventHandoffPass=$routeChangeEventHandoffPass, '
                   'deadObjectRecoveryPass=$deadObjectRecoveryPass, '
+                  'timestampStabilizationPass=$timestampStabilizationPass, '
+                  'timestampDeadObjectPass=$timestampDeadObjectPass, '
                   'lastError=${activeReport.lastError}, error=$topLevelError';
       });
     }
@@ -1715,6 +1744,431 @@ class _AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeAppState
           : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_FAIL',
     );
     return deadObjectRecoveryPass;
+  }
+
+  Future<bool> _runTimestampStabilizationSmoke() async {
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_SMOKE_START',
+    );
+
+    VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport? report;
+    String? topLevelError;
+    File? tempSourceFile;
+
+    try {
+      final clipBData = await rootBundle.load(
+        'assets/manual_test_clips/clip_B.mov',
+      );
+      final tempDir = Directory.systemTemp;
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+      tempSourceFile = File(
+        '${tempDir.path}/p4_async_rt_queue_timestamp_stab_source_$timestamp.mov',
+      );
+
+      await tempSourceFile.writeAsBytes(
+        clipBData.buffer.asUint8List(
+          clipBData.offsetInBytes,
+          clipBData.lengthInBytes,
+        ),
+        flush: true,
+      );
+
+      report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: tempSourceFile.path,
+            timestampStabilizationProofEnabled: true,
+            timeout: const Duration(seconds: 45),
+          ).timeout(const Duration(seconds: 55));
+    } on TimeoutException catch (te) {
+      topLevelError = 'timeout: $te';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_ERROR: $topLevelError',
+      );
+    } catch (e, st) {
+      topLevelError = '$e\n$st';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_ERROR: $topLevelError',
+      );
+    } finally {
+      if (tempSourceFile != null) {
+        try {
+          if (await tempSourceFile.exists()) {
+            await tempSourceFile.delete();
+          }
+        } catch (_) {}
+      }
+    }
+
+    final tsReport =
+        report ??
+        VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+          <String, Object?>{
+            'pass': false,
+            'status': 'fail',
+            'marker': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .timestampStabilizationFailMarkerConstant,
+            'proofBoundary': '',
+            'nativeProofBoundary': '',
+            'failureReason': 'invocation_failed',
+            'lastError': 'invocation_failed',
+          },
+        );
+
+    // AudioTrack Timestamp Stabilization group (standalone muted sink).
+    // Pre-seek and post-seek generations stabilize within 1000ms / 4096 polls;
+    // framePosition advances monotonically with 0 strict regressions; at most
+    // one poll per output pass; zero polls inside write retry loop; wrap count
+    // bounded; nanoTime telemetry recorded; zero feedback into native pacing.
+    print(
+      '  [LANE] AudioTrack Timestamp Stabilization: '
+      'timestampStabilizationProofEnabled=${tsReport.timestampStabilizationProofEnabled}, '
+      'timestampStabilizedOk=${tsReport.timestampStabilizedOk}, '
+      'timestampAdvancingMonotonicOk=${tsReport.timestampAdvancingMonotonicOk}, '
+      'timestampPostSeekRestabilizedOk=${tsReport.timestampPostSeekRestabilizedOk}, '
+      'timestampNoPacingFeedbackOk=${tsReport.timestampNoPacingFeedbackOk}, '
+      'timestampWarmupPollCount=${tsReport.timestampWarmupPollCount}, '
+      'timestampStablePollCount=${tsReport.timestampStablePollCount}, '
+      'timestampUnavailableAfterStableCount=${tsReport.timestampUnavailableAfterStableCount}, '
+      'timestampPassCount=${tsReport.timestampPassCount}, '
+      'timestampPassPollCount=${tsReport.timestampPassPollCount}, '
+      'timestampPollInsideWriteLoopCount=${tsReport.timestampPollInsideWriteLoopCount}, '
+      'timestampFrameAdvanceCount=${tsReport.timestampFrameAdvanceCount}, '
+      'timestampFrameEqualCount=${tsReport.timestampFrameEqualCount}, '
+      'timestampFrameRegressionCount=${tsReport.timestampFrameRegressionCount}, '
+      'timestampWrapCount=${tsReport.timestampWrapCount}, '
+      'timestampNanoTimeAdvanceCountTelemetryOnly=${tsReport.timestampNanoTimeAdvanceCountTelemetryOnly}, '
+      'timestampNanoTimeEqualCountTelemetryOnly=${tsReport.timestampNanoTimeEqualCountTelemetryOnly}, '
+      'timestampNanoTimeNonMonotonicCountTelemetryOnly=${tsReport.timestampNanoTimeNonMonotonicCountTelemetryOnly}, '
+      'timestampEpochOpenCount=${tsReport.timestampEpochOpenCount}, '
+      'timestampRecreateResetCount=${tsReport.timestampRecreateResetCount}, '
+      'timestampGenerationCount=${tsReport.timestampGenerationCount}, '
+      'timestampGenerationsStabilized=${tsReport.timestampGenerationsStabilized}, '
+      'timestampPreSeekStabilized=${tsReport.timestampPreSeekStabilized}, '
+      'timestampPostSeekStabilized=${tsReport.timestampPostSeekStabilized}, '
+      'timestampPostRecreateStabilized=${tsReport.timestampPostRecreateStabilized}, '
+      'timestampPreSeekWarmupPolls=${tsReport.timestampPreSeekWarmupPolls}, '
+      'timestampPostSeekWarmupPolls=${tsReport.timestampPostSeekWarmupPolls}, '
+      'timestampPreSeekStablePolls=${tsReport.timestampPreSeekStablePolls}, '
+      'timestampPostSeekStablePolls=${tsReport.timestampPostSeekStablePolls}, '
+      'timestampPreSeekAdvanceCount=${tsReport.timestampPreSeekAdvanceCount}, '
+      'timestampPostSeekAdvanceCount=${tsReport.timestampPostSeekAdvanceCount}, '
+      'timestampPreSeekFirstStableFramePosition=${tsReport.timestampPreSeekFirstStableFramePosition}, '
+      'timestampPostSeekFirstStableFramePosition=${tsReport.timestampPostSeekFirstStableFramePosition}, '
+      'timestampLastFramePosition=${tsReport.timestampLastFramePosition}, '
+      'timestampStabilizationGatesHeld=${tsReport.timestampStabilizationGatesHeld}, '
+      'mutedOutputOk=${tsReport.mutedOutputOk}, '
+      'sinkWriteAccountingOk=${tsReport.sinkWriteAccountingOk}, '
+      'frameAccountingOk=${tsReport.frameAccountingOk}, '
+      'checksumIdentityOk=${tsReport.checksumIdentityOk}, '
+      'checksumsMatch=${tsReport.checksumsMatch}, '
+      'realtimeGatesHeld=${tsReport.realtimeGatesHeld}, '
+      'hasCanonicalProofBoundary=${tsReport.hasCanonicalProofBoundary}, '
+      'nativeProofBoundaryOk=${tsReport.nativeProofBoundaryOk}, '
+      'allNativeLanesPass=${tsReport.allNativeLanesPass}, '
+      'marker=${tsReport.marker}, '
+      'lastError=${tsReport.lastError}',
+    );
+
+    final lastErrorOk =
+        tsReport.lastError.isEmpty ||
+        tsReport.lastError == 'none' ||
+        tsReport.lastError == 'null';
+
+    final timestampStabilizationPass =
+        (topLevelError == null) &&
+        tsReport.pass &&
+        tsReport.marker ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .timestampStabilizationPassMarkerConstant &&
+        tsReport.timestampStabilizationProofEnabled &&
+        !tsReport.deadObjectRecoveryProofEnabled &&
+        tsReport.timestampStabilizationGatesHeld &&
+        tsReport.timestampStabilizedOk &&
+        tsReport.timestampAdvancingMonotonicOk &&
+        tsReport.timestampPostSeekRestabilizedOk &&
+        tsReport.timestampNoPacingFeedbackOk &&
+        tsReport.timestampPreSeekStabilized &&
+        tsReport.timestampPostSeekStabilized &&
+        tsReport.timestampGenerationCount == 2 &&
+        tsReport.timestampEpochOpenCount == 2 &&
+        tsReport.timestampRecreateResetCount == 0 &&
+        tsReport.timestampPreSeekStablePolls > 0 &&
+        tsReport.timestampPostSeekStablePolls > 0 &&
+        tsReport.timestampStablePollCount > 0 &&
+        tsReport.timestampFrameAdvanceCount >= 1 &&
+        tsReport.timestampFrameRegressionCount == 0 &&
+        tsReport.timestampPollInsideWriteLoopCount == 0 &&
+        tsReport.timestampPassPollCount <= tsReport.timestampPassCount &&
+        tsReport.mutedOutputOk &&
+        tsReport.sinkWriteAccountingOk &&
+        tsReport.frameAccountingOk &&
+        tsReport.checksumIdentityOk &&
+        tsReport.hasCanonicalProofBoundary &&
+        tsReport.proofBoundary ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .timestampStabilizationProofBoundaryConstant &&
+        tsReport.nativeProofBoundaryOk &&
+        tsReport.checksumsMatch &&
+        tsReport.providerCountersClean &&
+        tsReport.sinkAccountingBalanced &&
+        tsReport.realtimeGatesHeld &&
+        tsReport.allNativeLanesPass &&
+        lastErrorOk;
+
+    final summaryPayload = <String, dynamic>{
+      'unit':
+          'AndroidAsyncRuntimeQueueTimestampStabilizationPhysicalSmokeHarness',
+      'slice': 'P4-AUDIO-AUDIOTRACK-TIMESTAMP-STABILIZATION',
+      'target': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .timestampStabilizationProofBoundaryConstant,
+      'nativeTarget': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .nativeProofBoundaryConstant,
+      'pass': timestampStabilizationPass,
+      'report': tsReport.toMap(),
+      'error': topLevelError,
+    };
+
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_JSON:${jsonEncode(summaryPayload)}',
+    );
+    print(
+      timestampStabilizationPass
+          ? 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_PHYSICAL_SMOKE_PASS'
+          : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_PHYSICAL_SMOKE_FAIL',
+    );
+    return timestampStabilizationPass;
+  }
+
+  Future<bool> _runTimestampStabilizationDeadObjectRecoverySmoke() async {
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_DEAD_OBJECT_RECOVERY_SMOKE_START',
+    );
+
+    VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport? report;
+    String? topLevelError;
+    File? tempSourceFile;
+
+    try {
+      final clipBData = await rootBundle.load(
+        'assets/manual_test_clips/clip_B.mov',
+      );
+      final tempDir = Directory.systemTemp;
+      final timestamp = DateTime.now().microsecondsSinceEpoch;
+      tempSourceFile = File(
+        '${tempDir.path}/p4_async_rt_queue_timestamp_dead_object_source_$timestamp.mov',
+      );
+
+      await tempSourceFile.writeAsBytes(
+        clipBData.buffer.asUint8List(
+          clipBData.offsetInBytes,
+          clipBData.lengthInBytes,
+        ),
+        flush: true,
+      );
+
+      report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: tempSourceFile.path,
+            timestampStabilizationProofEnabled: true,
+            deadObjectRecoveryProofEnabled: true,
+            timeout: const Duration(seconds: 45),
+          ).timeout(const Duration(seconds: 55));
+    } on TimeoutException catch (te) {
+      topLevelError = 'timeout: $te';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_DEAD_OBJECT_RECOVERY_ERROR: $topLevelError',
+      );
+    } catch (e, st) {
+      topLevelError = '$e\n$st';
+      print(
+        'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_DEAD_OBJECT_RECOVERY_ERROR: $topLevelError',
+      );
+    } finally {
+      if (tempSourceFile != null) {
+        try {
+          if (await tempSourceFile.exists()) {
+            await tempSourceFile.delete();
+          }
+        } catch (_) {}
+      }
+    }
+
+    final tsDoReport =
+        report ??
+        VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+          <String, Object?>{
+            'pass': false,
+            'status': 'fail',
+            'marker': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .timestampStabilizationFailMarkerConstant,
+            'proofBoundary': '',
+            'nativeProofBoundary': '',
+            'failureReason': 'invocation_failed',
+            'lastError': 'invocation_failed',
+          },
+        );
+
+    // AudioTrack Timestamp Stabilization with Dead-Object Recovery group.
+    // Proves timestamp stabilization across all 3 generations (pre-seek,
+    // post-seek, and post-recreate) with baseline reset on seek and after
+    // synthetic dead-object track recreation; base gain 0.5; old track
+    // released once; recreated track playing; unwritten slice resumed;
+    // framePosition advancing monotonically with zero regressions; zero
+    // polls inside write loop; and X12 recovery gates intact.
+    print(
+      '  [LANE] AudioTrack Timestamp Stabilization with Dead-Object Recovery: '
+      'timestampStabilizationProofEnabled=${tsDoReport.timestampStabilizationProofEnabled}, '
+      'deadObjectRecoveryProofEnabled=${tsDoReport.deadObjectRecoveryProofEnabled}, '
+      'timestampStabilizedOk=${tsDoReport.timestampStabilizedOk}, '
+      'timestampAdvancingMonotonicOk=${tsDoReport.timestampAdvancingMonotonicOk}, '
+      'timestampPostSeekRestabilizedOk=${tsDoReport.timestampPostSeekRestabilizedOk}, '
+      'timestampNoPacingFeedbackOk=${tsDoReport.timestampNoPacingFeedbackOk}, '
+      'timestampWarmupPollCount=${tsDoReport.timestampWarmupPollCount}, '
+      'timestampStablePollCount=${tsDoReport.timestampStablePollCount}, '
+      'timestampUnavailableAfterStableCount=${tsDoReport.timestampUnavailableAfterStableCount}, '
+      'timestampPassCount=${tsDoReport.timestampPassCount}, '
+      'timestampPassPollCount=${tsDoReport.timestampPassPollCount}, '
+      'timestampPollInsideWriteLoopCount=${tsDoReport.timestampPollInsideWriteLoopCount}, '
+      'timestampFrameAdvanceCount=${tsDoReport.timestampFrameAdvanceCount}, '
+      'timestampFrameEqualCount=${tsDoReport.timestampFrameEqualCount}, '
+      'timestampFrameRegressionCount=${tsDoReport.timestampFrameRegressionCount}, '
+      'timestampWrapCount=${tsDoReport.timestampWrapCount}, '
+      'timestampNanoTimeAdvanceCountTelemetryOnly=${tsDoReport.timestampNanoTimeAdvanceCountTelemetryOnly}, '
+      'timestampNanoTimeEqualCountTelemetryOnly=${tsDoReport.timestampNanoTimeEqualCountTelemetryOnly}, '
+      'timestampNanoTimeNonMonotonicCountTelemetryOnly=${tsDoReport.timestampNanoTimeNonMonotonicCountTelemetryOnly}, '
+      'timestampEpochOpenCount=${tsDoReport.timestampEpochOpenCount}, '
+      'timestampRecreateResetCount=${tsDoReport.timestampRecreateResetCount}, '
+      'timestampGenerationCount=${tsDoReport.timestampGenerationCount}, '
+      'timestampGenerationsStabilized=${tsDoReport.timestampGenerationsStabilized}, '
+      'timestampPreSeekStabilized=${tsDoReport.timestampPreSeekStabilized}, '
+      'timestampPostSeekStabilized=${tsDoReport.timestampPostSeekStabilized}, '
+      'timestampPostRecreateStabilized=${tsDoReport.timestampPostRecreateStabilized}, '
+      'timestampPreSeekWarmupPolls=${tsDoReport.timestampPreSeekWarmupPolls}, '
+      'timestampPostSeekWarmupPolls=${tsDoReport.timestampPostSeekWarmupPolls}, '
+      'timestampPostRecreateWarmupPolls=${tsDoReport.timestampPostRecreateWarmupPolls}, '
+      'timestampPreSeekStablePolls=${tsDoReport.timestampPreSeekStablePolls}, '
+      'timestampPostSeekStablePolls=${tsDoReport.timestampPostSeekStablePolls}, '
+      'timestampPostRecreateStablePolls=${tsDoReport.timestampPostRecreateStablePolls}, '
+      'timestampPreSeekAdvanceCount=${tsDoReport.timestampPreSeekAdvanceCount}, '
+      'timestampPostSeekAdvanceCount=${tsDoReport.timestampPostSeekAdvanceCount}, '
+      'timestampPostRecreateAdvanceCount=${tsDoReport.timestampPostRecreateAdvanceCount}, '
+      'timestampPreSeekFirstStableFramePosition=${tsDoReport.timestampPreSeekFirstStableFramePosition}, '
+      'timestampPostSeekFirstStableFramePosition=${tsDoReport.timestampPostSeekFirstStableFramePosition}, '
+      'timestampPostRecreateFirstStableFramePosition=${tsDoReport.timestampPostRecreateFirstStableFramePosition}, '
+      'timestampLastFramePosition=${tsDoReport.timestampLastFramePosition}, '
+      'deadObjectOccurredCount=${tsDoReport.deadObjectOccurredCount}, '
+      'syntheticDeadObjectInjectedCount=${tsDoReport.syntheticDeadObjectInjectedCount}, '
+      'deadObjectOldTrackReleasedOk=${tsDoReport.deadObjectOldTrackReleasedOk}, '
+      'deadObjectOldTrackReleaseCount=${tsDoReport.deadObjectOldTrackReleaseCount}, '
+      'deadObjectTrackCreateCount=${tsDoReport.deadObjectTrackCreateCount}, '
+      'deadObjectNewTrackStateInitializedOk=${tsDoReport.deadObjectNewTrackStateInitializedOk}, '
+      'deadObjectNewTrackVolumeSetOk=${tsDoReport.deadObjectNewTrackVolumeSetOk}, '
+      'deadObjectNewTrackPlayOk=${tsDoReport.deadObjectNewTrackPlayOk}, '
+      'deadObjectSliceBytesAtRecovery=${tsDoReport.deadObjectSliceBytesAtRecovery}, '
+      'deadObjectUnwrittenBytesAtRecovery=${tsDoReport.deadObjectUnwrittenBytesAtRecovery}, '
+      'deadObjectSinkFramesWrittenBeforeRecovery=${tsDoReport.deadObjectSinkFramesWrittenBeforeRecovery}, '
+      'deadObjectSinkFramesWrittenAfterRecovery=${tsDoReport.deadObjectSinkFramesWrittenAfterRecovery}, '
+      'framesWrittenToSink=${tsDoReport.framesWrittenToSink}, '
+      'audioTrackGain=${tsDoReport.audioTrackGain}, '
+      'deadObjectRecoveryGatesHeld=${tsDoReport.deadObjectRecoveryGatesHeld}, '
+      'timestampStabilizationGatesHeld=${tsDoReport.timestampStabilizationGatesHeld}, '
+      'sinkWriteAccountingOk=${tsDoReport.sinkWriteAccountingOk}, '
+      'frameAccountingOk=${tsDoReport.frameAccountingOk}, '
+      'checksumIdentityOk=${tsDoReport.checksumIdentityOk}, '
+      'checksumsMatch=${tsDoReport.checksumsMatch}, '
+      'realtimeGatesHeld=${tsDoReport.realtimeGatesHeld}, '
+      'hasCanonicalProofBoundary=${tsDoReport.hasCanonicalProofBoundary}, '
+      'nativeProofBoundaryOk=${tsDoReport.nativeProofBoundaryOk}, '
+      'allNativeLanesPass=${tsDoReport.allNativeLanesPass}, '
+      'marker=${tsDoReport.marker}, '
+      'lastError=${tsDoReport.lastError}',
+    );
+
+    final lastErrorOk =
+        tsDoReport.lastError.isEmpty ||
+        tsDoReport.lastError == 'none' ||
+        tsDoReport.lastError == 'null';
+
+    final timestampDeadObjectPass =
+        (topLevelError == null) &&
+        tsDoReport.pass &&
+        tsDoReport.marker ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .timestampStabilizationPassMarkerConstant &&
+        tsDoReport.timestampStabilizationProofEnabled &&
+        tsDoReport.deadObjectRecoveryProofEnabled &&
+        tsDoReport.timestampStabilizationGatesHeld &&
+        tsDoReport.deadObjectRecoveryGatesHeld &&
+        tsDoReport.timestampStabilizedOk &&
+        tsDoReport.timestampAdvancingMonotonicOk &&
+        tsDoReport.timestampPostSeekRestabilizedOk &&
+        tsDoReport.timestampNoPacingFeedbackOk &&
+        tsDoReport.timestampPreSeekStabilized &&
+        tsDoReport.timestampPostSeekStabilized &&
+        tsDoReport.timestampPostRecreateStabilized &&
+        tsDoReport.timestampGenerationCount == 3 &&
+        tsDoReport.timestampEpochOpenCount == 2 &&
+        tsDoReport.timestampRecreateResetCount == 1 &&
+        tsDoReport.timestampPreSeekStablePolls > 0 &&
+        tsDoReport.timestampPostSeekStablePolls > 0 &&
+        tsDoReport.timestampPostRecreateStablePolls > 0 &&
+        tsDoReport.timestampStablePollCount > 0 &&
+        tsDoReport.timestampFrameAdvanceCount >= 1 &&
+        tsDoReport.timestampFrameRegressionCount == 0 &&
+        tsDoReport.timestampPollInsideWriteLoopCount == 0 &&
+        tsDoReport.timestampPassPollCount <= tsDoReport.timestampPassCount &&
+        tsDoReport.deadObjectOccurredCount == 1 &&
+        tsDoReport.syntheticDeadObjectInjectedCount == 1 &&
+        tsDoReport.deadObjectOldTrackReleasedOk &&
+        tsDoReport.deadObjectOldTrackReleaseCount == 1 &&
+        tsDoReport.deadObjectTrackCreateCount == 2 &&
+        tsDoReport.deadObjectNewTrackStateInitializedOk &&
+        tsDoReport.deadObjectNewTrackVolumeSetOk &&
+        tsDoReport.deadObjectNewTrackPlayOk &&
+        tsDoReport.deadObjectUnwrittenBytesAtRecovery > 0 &&
+        tsDoReport.deadObjectSinkFramesWrittenBeforeRecovery > 0 &&
+        tsDoReport.deadObjectSinkFramesWrittenAfterRecovery > 0 &&
+        tsDoReport.deadObjectSinkFramesWrittenBeforeRecovery +
+                tsDoReport.deadObjectSinkFramesWrittenAfterRecovery ==
+            tsDoReport.framesWrittenToSink &&
+        tsDoReport.audioTrackGain == 0.5 &&
+        tsDoReport.sinkWriteAccountingOk &&
+        tsDoReport.frameAccountingOk &&
+        tsDoReport.checksumIdentityOk &&
+        tsDoReport.hasCanonicalProofBoundary &&
+        tsDoReport.proofBoundary ==
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+                .timestampStabilizationDeadObjectRecoveryProofBoundaryConstant &&
+        tsDoReport.nativeProofBoundaryOk &&
+        tsDoReport.checksumsMatch &&
+        tsDoReport.providerCountersClean &&
+        tsDoReport.sinkAccountingBalanced &&
+        tsDoReport.realtimeGatesHeld &&
+        tsDoReport.allNativeLanesPass &&
+        lastErrorOk;
+
+    final summaryPayload = <String, dynamic>{
+      'unit':
+          'AndroidAsyncRuntimeQueueTimestampStabilizationDeadObjectRecoveryPhysicalSmokeHarness',
+      'slice': 'P4-AUDIO-AUDIOTRACK-TIMESTAMP-STABILIZATION',
+      'target': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .timestampStabilizationDeadObjectRecoveryProofBoundaryConstant,
+      'nativeTarget': VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+          .nativeProofBoundaryConstant,
+      'pass': timestampDeadObjectPass,
+      'report': tsDoReport.toMap(),
+      'error': topLevelError,
+    };
+
+    print(
+      'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_DEAD_OBJECT_RECOVERY_JSON:${jsonEncode(summaryPayload)}',
+    );
+    print(
+      timestampDeadObjectPass
+          ? 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_PASS'
+          : 'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_FAIL',
+    );
+    return timestampDeadObjectPass;
   }
 
   @override

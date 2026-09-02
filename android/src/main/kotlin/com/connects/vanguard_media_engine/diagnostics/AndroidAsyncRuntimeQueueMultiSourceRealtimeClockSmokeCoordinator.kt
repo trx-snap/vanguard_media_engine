@@ -118,6 +118,24 @@ import java.util.concurrent.atomic.AtomicInteger
  * unwritten slice is resumed. No coordinator queue, listener, focus, or
  * receiver is involved.
  *
+ * X13 (P4-AUDIO-AUDIOTRACK-TIMESTAMP-STABILIZATION) AudioTrack timestamp
+ * poll-cadence / per-epoch frame-monotonicity diagnostic proof: when
+ * timestampStabilizationProofEnabled=true the coordinator only parses and
+ * passes the flag through (never OR-ed into any other flag; it does NOT
+ * imply X6 gain or the X7 focus/noisy setup). The whole lane is
+ * driver-owned on its owner thread: at most one AudioTrack.getTimestamp()
+ * poll per output pass after the sink write returns, warmup only after the
+ * epoch's play(), per-epoch baseline reset on the seek flush and after the
+ * X12 recreation, unsigned-32 framePosition with one tolerated positive
+ * wrap, equal positions allowed, strict backward movement fails closed
+ * (timestamp_frame_regression), bounded warmup (timestamp_warmup_timeout)
+ * inside the existing deadline, nanoTime order telemetry only, and no
+ * feedback into native pacing or write accounting. Standalone X13 keeps
+ * the muted default sink; the driver permits X13 only alone or with X12
+ * and fails closed (timestamp_stabilization_mode_not_isolated) for any
+ * other combination. No coordinator queue, listener, focus, or receiver is
+ * involved.
+ *
  * Honest non-claims (Proof Boundary): diagnostic only — the worker-owned
  * steady_clock is a render/dispatch timebase, not a presentation clock; no
  * caller-supplied native time; playback head / AudioTimestamp / underrun
@@ -414,6 +432,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
         // with X8..X11.
         val deadObjectRecoveryRequested =
             (args?.get("deadObjectRecoveryProofEnabled") as? Boolean) ?: false
+        // X13 is driver-owned and isolated: it does NOT imply the X6 gain or
+        // X7 focus/noisy setup and is never OR-ed into any other flag; the
+        // driver permits X13 only standalone or combined with X12 and rejects
+        // every other combination.
+        val timestampStabilizationRequested =
+            (args?.get("timestampStabilizationProofEnabled") as? Boolean) ?: false
         val config = AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver.RunConfig(
             sourcePath = args?.get("sourcePath") as? String ?: "",
             durationSec = ((args?.get("durationSec") as? Number)?.toDouble() ?: 2.0)
@@ -462,6 +486,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockSmokeCoordinator(
             // preserves the exact X4..X11 behavior and args (fail-closed
             // ERROR_DEAD_OBJECT, no recovery).
             deadObjectRecoveryProofEnabled = deadObjectRecoveryRequested,
+            // X13 AudioTrack timestamp stabilization diagnostic proof mode;
+            // absent/false preserves the exact X4..X12 behavior and args
+            // (AudioTimestamp stays telemetry-only, no per-pass polls).
+            timestampStabilizationProofEnabled = timestampStabilizationRequested,
         )
         if (!active.compareAndSet(false, true)) {
             result.error(

@@ -34,9 +34,19 @@ const _kRouteChangeEventHandoffPassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_ROUTE_CHANGE_EVENT_HANDOFF_PHYSICAL_SMOKE_PASS';
 const _kDeadObjectRecoveryPassMarker =
     'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_PASS';
+const _kTimestampStabilizationPassMarker =
+    'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_SMOKE_PASS';
+const _kTimestampStabilizationFailMarker =
+    'ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_SMOKE_FAIL';
 
 const _kDeadObjectRecoveryProofBoundary =
     'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_dead_object_recovery_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_synthetic_dead_object_detection_and_recreation_only_base_gain_0_5_synthetic_dead_object_injected_once_old_track_released_new_track_initialized_and_resumed_no_real_os_dead_object_forcing_claim_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_seamless_hardware_hot_swap_claim_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
+
+const _kTimestampStabilizationProofBoundary =
+    'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audiotrack_timestamp_stabilization_diagnostic_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_telemetry_only_audio_timestamp_poll_cadence_and_per_epoch_frame_monotonicity_diagnostic_gate_only_one_poll_per_output_pass_after_write_returns_no_poll_inside_write_retry_loop_warmup_after_epoch_play_only_bounded_by_existing_deadline_per_epoch_baseline_reset_on_seek_flush_no_cross_epoch_comparison_unsigned_32bit_frame_position_one_positive_wrap_tolerated_equal_frame_position_allowed_strict_backward_only_fails_nanotime_monotonicity_telemetry_only_no_pacing_feedback_no_dispatch_feedback_no_write_size_feedback_no_checksum_effect_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_presentation_clock_claim_no_latency_claim_no_avsync_claim_no_drift_claim_no_hal_timestamp_accuracy_claim_no_aaudio_no_opensl_no_oboe_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
+
+const _kTimestampStabilizationDeadObjectRecoveryProofBoundary =
+    'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audiotrack_timestamp_stabilization_with_dead_object_recovery_response_diagnostic_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_synthetic_dead_object_detection_and_recreation_only_base_gain_0_5_synthetic_dead_object_injected_once_old_track_released_new_track_initialized_and_resumed_no_real_os_dead_object_forcing_claim_playback_head_telemetry_only_audio_timestamp_poll_cadence_and_per_epoch_frame_monotonicity_diagnostic_gate_only_one_poll_per_output_pass_after_write_returns_no_poll_inside_write_retry_loop_warmup_after_epoch_play_only_bounded_by_existing_deadline_per_epoch_baseline_reset_on_seek_flush_and_after_synthetic_dead_object_recreation_no_cross_epoch_comparison_unsigned_32bit_frame_position_one_positive_wrap_tolerated_equal_frame_position_allowed_strict_backward_only_fails_nanotime_monotonicity_telemetry_only_no_pacing_feedback_no_dispatch_feedback_no_write_size_feedback_no_checksum_effect_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_seamless_hardware_hot_swap_claim_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_presentation_clock_claim_no_latency_claim_no_avsync_claim_no_drift_claim_no_hal_timestamp_accuracy_claim_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
 
 const _kFocusLossPauseResumeProofBoundary =
     'kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_focus_loss_pause_resume_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_audiotrack_playstate_pause_play_only_base_gain_0_5_transient_loss_pause_focus_gain_play_becoming_noisy_terminal_pause_no_flush_no_stop_no_auto_resume_before_release_no_transport_pause_no_presentation_pause_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_pause_resume_sla_no_production_restart_policy_no_os_focus_arbitration_correctness_no_route_change_recovery_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes';
@@ -3757,6 +3767,767 @@ void main() {
         isFalse,
       );
     });
+  });
+
+  group('X13 AudioTrack timestamp stabilization proof mode', () {
+    // X13 standalone pass sample map: X4 base with X13 marker, X13 standalone
+    // proof boundary (muted sink), X13 lanes, and X13 metrics (2 generations:
+    // pre-seek and post-seek).
+    Map<String, Object?> createX13SampleRawMap([
+      Map<String, Object?>? overrides,
+    ]) {
+      final result = _createSampleRawMap();
+      result['marker'] = _kTimestampStabilizationPassMarker;
+      result['proofBoundary'] = _kTimestampStabilizationProofBoundary;
+      final rawStrings = result['raw'] as Map<String, String>;
+      rawStrings['marker'] = _kTimestampStabilizationPassMarker;
+      rawStrings['proofBoundary'] = _kTimestampStabilizationProofBoundary;
+      final lanes = result['lanes'] as Map<String, Object?>;
+      lanes['timestampStabilizedOk'] = true;
+      lanes['timestampAdvancingMonotonicOk'] = true;
+      lanes['timestampPostSeekRestabilizedOk'] = true;
+      lanes['timestampNoPacingFeedbackOk'] = true;
+      lanes['timestampStabilizationGatesHeld'] = true;
+      final metrics = result['metrics'] as Map<String, Object?>;
+      metrics['timestampStabilizationProofEnabled'] = true;
+      metrics['timestampWarmupPollCount'] = 8;
+      metrics['timestampStablePollCount'] = 320;
+      metrics['timestampUnavailableAfterStableCount'] = 0;
+      metrics['timestampPassCount'] = 328;
+      metrics['timestampPassPollCount'] = 328;
+      metrics['timestampPollInsideWriteLoopCount'] = 0;
+      metrics['timestampFrameAdvanceCount'] = 310;
+      metrics['timestampFrameEqualCount'] = 10;
+      metrics['timestampFrameRegressionCount'] = 0;
+      metrics['timestampWrapCount'] = 0;
+      metrics['timestampNanoTimeAdvanceCountTelemetryOnly'] = 320;
+      metrics['timestampNanoTimeEqualCountTelemetryOnly'] = 0;
+      metrics['timestampNanoTimeNonMonotonicCountTelemetryOnly'] = 0;
+      metrics['timestampEpochOpenCount'] = 2;
+      metrics['timestampRecreateResetCount'] = 0;
+      metrics['timestampGenerationCount'] = 2;
+      metrics['timestampGenerationsStabilized'] = 2;
+      metrics['timestampPreSeekStabilized'] = true;
+      metrics['timestampPostSeekStabilized'] = true;
+      metrics['timestampPostRecreateStabilized'] = false;
+      metrics['timestampPreSeekWarmupPolls'] = 4;
+      metrics['timestampPostSeekWarmupPolls'] = 4;
+      metrics['timestampPostRecreateWarmupPolls'] = 0;
+      metrics['timestampPreSeekStablePolls'] = 220;
+      metrics['timestampPostSeekStablePolls'] = 100;
+      metrics['timestampPostRecreateStablePolls'] = 0;
+      metrics['timestampPreSeekAdvanceCount'] = 215;
+      metrics['timestampPostSeekAdvanceCount'] = 95;
+      metrics['timestampPostRecreateAdvanceCount'] = 0;
+      metrics['timestampPreSeekFirstStableFramePosition'] = 1024;
+      metrics['timestampPostSeekFirstStableFramePosition'] = 2048;
+      metrics['timestampPostRecreateFirstStableFramePosition'] = -1;
+      metrics['timestampLastFramePosition'] = 83968;
+      metrics['timestampWarmupBudgetMs'] = 1000;
+      metrics['timestampWarmupMaxPolls'] = 4096;
+      if (overrides != null) {
+        for (final entry in overrides.entries) {
+          if (lanes.containsKey(entry.key)) lanes[entry.key] = entry.value;
+          if (metrics.containsKey(entry.key)) metrics[entry.key] = entry.value;
+          result[entry.key] = entry.value;
+        }
+      }
+      return result;
+    }
+
+    // X13 + X12 composed pass sample map: X12 base (deadObjectRecoveryProofEnabled,
+    // audioTrackGain 0.5, synthetic dead object injected once, recreated track)
+    // with X13 marker, X13+X12 composed proof boundary, X13 lanes, and X13 metrics
+    // across all 3 generations (pre-seek, post-seek, post-recreate).
+    Map<String, Object?> createX13DeadObjectSampleRawMap([
+      Map<String, Object?>? overrides,
+    ]) {
+      final result = _createSampleRawMap();
+      result['marker'] = _kTimestampStabilizationPassMarker;
+      result['proofBoundary'] =
+          _kTimestampStabilizationDeadObjectRecoveryProofBoundary;
+      final rawStrings = result['raw'] as Map<String, String>;
+      rawStrings['marker'] = _kTimestampStabilizationPassMarker;
+      rawStrings['proofBoundary'] =
+          _kTimestampStabilizationDeadObjectRecoveryProofBoundary;
+      final lanes = result['lanes'] as Map<String, Object?>;
+      lanes['mutedOutputOk'] = false;
+      // X12 driver lanes.
+      lanes['deadObjectOldTrackReleasedOk'] = true;
+      lanes['deadObjectNewTrackStateInitializedOk'] = true;
+      lanes['deadObjectNewTrackVolumeSetOk'] = true;
+      lanes['deadObjectNewTrackPlayOk'] = true;
+      lanes['deadObjectRecoveryGatesHeld'] = true;
+      // X13 driver lanes.
+      lanes['timestampStabilizedOk'] = true;
+      lanes['timestampAdvancingMonotonicOk'] = true;
+      lanes['timestampPostSeekRestabilizedOk'] = true;
+      lanes['timestampNoPacingFeedbackOk'] = true;
+      lanes['timestampStabilizationGatesHeld'] = true;
+      final metrics = result['metrics'] as Map<String, Object?>;
+      metrics['audioTrackGain'] = 0.5;
+      metrics['audioTrackNonZeroGainSetOk'] = true;
+      metrics['deadObjectRecoveryProofEnabled'] = true;
+      metrics['deadObjectOccurredCount'] = 1;
+      metrics['syntheticDeadObjectInjectedCount'] = 1;
+      metrics['deadObjectOldTrackReleaseCount'] = 1;
+      metrics['deadObjectTrackCreateCount'] = 2;
+      metrics['deadObjectSliceBytesAtRecovery'] = 16384;
+      metrics['deadObjectUnwrittenBytesAtRecovery'] = 16384;
+      metrics['deadObjectSinkFramesWrittenBeforeRecovery'] = 62208;
+      metrics['deadObjectEpochFramesWrittenBeforeRecovery'] = 4608;
+      metrics['deadObjectSinkFramesWrittenAfterRecovery'] = 21760;
+      metrics['playStateAfterDeadObjectRecreatePlay'] = 3;
+      metrics['playStateAtReleaseDeadObject'] = 3;
+      // X13 metrics for 3 generations.
+      metrics['timestampStabilizationProofEnabled'] = true;
+      metrics['timestampWarmupPollCount'] = 12;
+      metrics['timestampStablePollCount'] = 316;
+      metrics['timestampUnavailableAfterStableCount'] = 0;
+      metrics['timestampPassCount'] = 328;
+      metrics['timestampPassPollCount'] = 328;
+      metrics['timestampPollInsideWriteLoopCount'] = 0;
+      metrics['timestampFrameAdvanceCount'] = 306;
+      metrics['timestampFrameEqualCount'] = 10;
+      metrics['timestampFrameRegressionCount'] = 0;
+      metrics['timestampWrapCount'] = 0;
+      metrics['timestampNanoTimeAdvanceCountTelemetryOnly'] = 316;
+      metrics['timestampNanoTimeEqualCountTelemetryOnly'] = 0;
+      metrics['timestampNanoTimeNonMonotonicCountTelemetryOnly'] = 0;
+      metrics['timestampEpochOpenCount'] = 2;
+      metrics['timestampRecreateResetCount'] = 1;
+      metrics['timestampGenerationCount'] = 3;
+      metrics['timestampGenerationsStabilized'] = 3;
+      metrics['timestampPreSeekStabilized'] = true;
+      metrics['timestampPostSeekStabilized'] = true;
+      metrics['timestampPostRecreateStabilized'] = true;
+      metrics['timestampPreSeekWarmupPolls'] = 4;
+      metrics['timestampPostSeekWarmupPolls'] = 4;
+      metrics['timestampPostRecreateWarmupPolls'] = 4;
+      metrics['timestampPreSeekStablePolls'] = 220;
+      metrics['timestampPostSeekStablePolls'] = 16;
+      metrics['timestampPostRecreateStablePolls'] = 80;
+      metrics['timestampPreSeekAdvanceCount'] = 215;
+      metrics['timestampPostSeekAdvanceCount'] = 15;
+      metrics['timestampPostRecreateAdvanceCount'] = 76;
+      metrics['timestampPreSeekFirstStableFramePosition'] = 1024;
+      metrics['timestampPostSeekFirstStableFramePosition'] = 2048;
+      metrics['timestampPostRecreateFirstStableFramePosition'] = 512;
+      metrics['timestampLastFramePosition'] = 83968;
+      metrics['timestampWarmupBudgetMs'] = 1000;
+      metrics['timestampWarmupMaxPolls'] = 4096;
+      if (overrides != null) {
+        for (final entry in overrides.entries) {
+          if (lanes.containsKey(entry.key)) lanes[entry.key] = entry.value;
+          if (metrics.containsKey(entry.key)) metrics[entry.key] = entry.value;
+          result[entry.key] = entry.value;
+        }
+      }
+      return result;
+    }
+
+    test('default X4 pass report has timestampStabilizationProofEnabled=false '
+        'and gate vacuously true', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            _createSampleRawMap(),
+          );
+      expect(report.timestampStabilizationProofEnabled, isFalse);
+      expect(report.timestampStabilizedOk, isFalse);
+      expect(report.timestampAdvancingMonotonicOk, isFalse);
+      expect(report.timestampPostSeekRestabilizedOk, isFalse);
+      expect(report.timestampNoPacingFeedbackOk, isFalse);
+      expect(report.timestampWarmupPollCount, equals(0));
+      expect(report.timestampStablePollCount, equals(0));
+      expect(report.timestampUnavailableAfterStableCount, equals(0));
+      expect(report.timestampPassCount, equals(0));
+      expect(report.timestampPassPollCount, equals(0));
+      expect(report.timestampPollInsideWriteLoopCount, equals(0));
+      expect(report.timestampFrameAdvanceCount, equals(0));
+      expect(report.timestampFrameEqualCount, equals(0));
+      expect(report.timestampFrameRegressionCount, equals(0));
+      expect(report.timestampWrapCount, equals(0));
+      expect(report.timestampNanoTimeAdvanceCountTelemetryOnly, equals(0));
+      expect(report.timestampNanoTimeEqualCountTelemetryOnly, equals(0));
+      expect(report.timestampNanoTimeNonMonotonicCountTelemetryOnly, equals(0));
+      expect(report.timestampEpochOpenCount, equals(0));
+      expect(report.timestampRecreateResetCount, equals(0));
+      expect(report.timestampGenerationCount, equals(0));
+      expect(report.timestampGenerationsStabilized, equals(0));
+      expect(report.timestampPreSeekStabilized, isFalse);
+      expect(report.timestampPostSeekStabilized, isFalse);
+      expect(report.timestampPostRecreateStabilized, isFalse);
+      expect(report.timestampPreSeekWarmupPolls, equals(0));
+      expect(report.timestampPostSeekWarmupPolls, equals(0));
+      expect(report.timestampPostRecreateWarmupPolls, equals(0));
+      expect(report.timestampPreSeekStablePolls, equals(0));
+      expect(report.timestampPostSeekStablePolls, equals(0));
+      expect(report.timestampPostRecreateStablePolls, equals(0));
+      expect(report.timestampPreSeekAdvanceCount, equals(0));
+      expect(report.timestampPostSeekAdvanceCount, equals(0));
+      expect(report.timestampPostRecreateAdvanceCount, equals(0));
+      expect(report.timestampPreSeekFirstStableFramePosition, equals(-1));
+      expect(report.timestampPostSeekFirstStableFramePosition, equals(-1));
+      expect(report.timestampPostRecreateFirstStableFramePosition, equals(-1));
+      expect(report.timestampLastFramePosition, equals(-1));
+      expect(report.timestampWarmupBudgetMs, equals(0));
+      expect(report.timestampWarmupMaxPolls, equals(0));
+      expect(report.timestampStabilizationGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X12 pass report keeps X13 defaults and still passes', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX13DeadObjectSampleRawMap({
+              'marker': _kDeadObjectRecoveryPassMarker,
+              'proofBoundary': _kDeadObjectRecoveryProofBoundary,
+              'timestampStabilizationProofEnabled': false,
+            }),
+          );
+      expect(report.deadObjectRecoveryProofEnabled, isTrue);
+      expect(report.timestampStabilizationProofEnabled, isFalse);
+      expect(report.timestampStabilizationGatesHeld, isTrue);
+      expect(report.hasCanonicalProofBoundary, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X13 standalone pass report passes all gates with 2 generations, '
+        'muted sink, monotonic framePosition, and zero feedback', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX13SampleRawMap(),
+          );
+      expect(report.marker, equals(_kTimestampStabilizationPassMarker));
+      expect(
+        report.proofBoundary,
+        equals(_kTimestampStabilizationProofBoundary),
+      );
+      expect(report.timestampStabilizationProofEnabled, isTrue);
+      expect(report.deadObjectRecoveryProofEnabled, isFalse);
+      // X13 driver lanes.
+      expect(report.timestampStabilizedOk, isTrue);
+      expect(report.timestampAdvancingMonotonicOk, isTrue);
+      expect(report.timestampPostSeekRestabilizedOk, isTrue);
+      expect(report.timestampNoPacingFeedbackOk, isTrue);
+      // Generation stabilization facts.
+      expect(report.timestampPreSeekStabilized, isTrue);
+      expect(report.timestampPostSeekStabilized, isTrue);
+      expect(report.timestampPostRecreateStabilized, isFalse);
+      expect(report.timestampGenerationCount, equals(2));
+      expect(report.timestampGenerationsStabilized, equals(2));
+      expect(report.timestampEpochOpenCount, equals(2));
+      expect(report.timestampRecreateResetCount, equals(0));
+      // Polls & advances.
+      expect(report.timestampWarmupPollCount, equals(8));
+      expect(report.timestampStablePollCount, equals(320));
+      expect(report.timestampPreSeekWarmupPolls, equals(4));
+      expect(report.timestampPostSeekWarmupPolls, equals(4));
+      expect(report.timestampPreSeekStablePolls, equals(220));
+      expect(report.timestampPostSeekStablePolls, equals(100));
+      expect(report.timestampPreSeekAdvanceCount, equals(215));
+      expect(report.timestampPostSeekAdvanceCount, equals(95));
+      expect(report.timestampPreSeekFirstStableFramePosition, equals(1024));
+      expect(report.timestampPostSeekFirstStableFramePosition, equals(2048));
+      expect(report.timestampPostRecreateFirstStableFramePosition, equals(-1));
+      expect(report.timestampLastFramePosition, equals(83968));
+      expect(report.timestampFrameRegressionCount, equals(0));
+      expect(report.timestampPollInsideWriteLoopCount, equals(0));
+      expect(report.timestampPassPollCount, equals(report.timestampPassCount));
+      // Muted sink preserved in standalone mode.
+      expect(report.mutedOutputOk, isTrue);
+      expect(report.sinkWriteAccountingOk, isTrue);
+      expect(report.frameAccountingOk, isTrue);
+      expect(report.checksumsMatch, isTrue);
+      expect(report.realtimeGatesHeld, isTrue);
+      expect(report.timestampStabilizationGatesHeld, isTrue);
+      expect(report.hasCanonicalProofBoundary, isTrue);
+      expect(report.nativeProofBoundaryOk, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X13 + X12 composed pass report passes all gates with 3 generations, '
+        'post-recreate reset, 0.5 gain, and X12 dead-object recovery held', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX13DeadObjectSampleRawMap(),
+          );
+      expect(report.marker, equals(_kTimestampStabilizationPassMarker));
+      expect(
+        report.proofBoundary,
+        equals(_kTimestampStabilizationDeadObjectRecoveryProofBoundary),
+      );
+      expect(report.timestampStabilizationProofEnabled, isTrue);
+      expect(report.deadObjectRecoveryProofEnabled, isTrue);
+      // X12 dead-object recovery lanes held.
+      expect(report.deadObjectOldTrackReleasedOk, isTrue);
+      expect(report.deadObjectNewTrackStateInitializedOk, isTrue);
+      expect(report.deadObjectNewTrackVolumeSetOk, isTrue);
+      expect(report.deadObjectNewTrackPlayOk, isTrue);
+      expect(report.deadObjectRecoveryGatesHeld, isTrue);
+      expect(report.audioTrackGain, equals(0.5));
+      // X13 driver lanes held across 3 generations.
+      expect(report.timestampStabilizedOk, isTrue);
+      expect(report.timestampAdvancingMonotonicOk, isTrue);
+      expect(report.timestampPostSeekRestabilizedOk, isTrue);
+      expect(report.timestampNoPacingFeedbackOk, isTrue);
+      expect(report.timestampPreSeekStabilized, isTrue);
+      expect(report.timestampPostSeekStabilized, isTrue);
+      expect(report.timestampPostRecreateStabilized, isTrue);
+      expect(report.timestampGenerationCount, equals(3));
+      expect(report.timestampGenerationsStabilized, equals(3));
+      expect(report.timestampEpochOpenCount, equals(2));
+      expect(report.timestampRecreateResetCount, equals(1));
+      expect(report.timestampPreSeekWarmupPolls, equals(4));
+      expect(report.timestampPostSeekWarmupPolls, equals(4));
+      expect(report.timestampPostRecreateWarmupPolls, equals(4));
+      expect(report.timestampPreSeekStablePolls, equals(220));
+      expect(report.timestampPostSeekStablePolls, equals(16));
+      expect(report.timestampPostRecreateStablePolls, equals(80));
+      expect(report.timestampPreSeekAdvanceCount, equals(215));
+      expect(report.timestampPostSeekAdvanceCount, equals(15));
+      expect(report.timestampPostRecreateAdvanceCount, equals(76));
+      expect(report.timestampPreSeekFirstStableFramePosition, equals(1024));
+      expect(report.timestampPostSeekFirstStableFramePosition, equals(2048));
+      expect(report.timestampPostRecreateFirstStableFramePosition, equals(512));
+      expect(report.timestampLastFramePosition, equals(83968));
+      expect(report.timestampFrameRegressionCount, equals(0));
+      expect(report.timestampPollInsideWriteLoopCount, equals(0));
+      expect(report.timestampPassPollCount, equals(report.timestampPassCount));
+      expect(report.timestampStabilizationGatesHeld, isTrue);
+      expect(report.sinkWriteAccountingOk, isTrue);
+      expect(report.frameAccountingOk, isTrue);
+      expect(report.checksumsMatch, isTrue);
+      expect(report.realtimeGatesHeld, isTrue);
+      expect(report.hasCanonicalProofBoundary, isTrue);
+      expect(report.nativeProofBoundaryOk, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test('X13 standalone and X13+X12 runs must carry the timestamp '
+        'stabilization pass marker', () {
+      for (final wrongMarker in const [
+        _kPassMarker,
+        _kNonZeroGainPassMarker,
+        _kFocusNoisyPassMarker,
+        _kFocusDuckRestorePassMarker,
+        _kFocusLossPauseResumePassMarker,
+        _kPermanentFocusLossPassMarker,
+        _kRouteChangeEventHandoffPassMarker,
+        _kDeadObjectRecoveryPassMarker,
+      ]) {
+        final standaloneReport =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13SampleRawMap({'marker': wrongMarker}),
+            );
+        expect(
+          standaloneReport.allNativeLanesPass,
+          isFalse,
+          reason: wrongMarker,
+        );
+
+        final composedReport =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13DeadObjectSampleRawMap({'marker': wrongMarker}),
+            );
+        expect(composedReport.allNativeLanesPass, isFalse, reason: wrongMarker);
+      }
+    });
+
+    test('X13 standalone must carry its own proof boundary, not X4, X8..X12, '
+        'or X13+X12 boundary', () {
+      for (final wrongBoundary in const [
+        _kCanonicalProofBoundary,
+        _kFocusDuckRestoreProofBoundary,
+        _kFocusLossPauseResumeProofBoundary,
+        _kPermanentFocusLossProofBoundary,
+        _kRouteChangeEventHandoffProofBoundary,
+        _kDeadObjectRecoveryProofBoundary,
+        _kTimestampStabilizationDeadObjectRecoveryProofBoundary,
+      ]) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13SampleRawMap({'proofBoundary': wrongBoundary}),
+            );
+        expect(
+          report.hasCanonicalProofBoundary,
+          isFalse,
+          reason: wrongBoundary,
+        );
+        expect(report.allNativeLanesPass, isFalse, reason: wrongBoundary);
+      }
+    });
+
+    test('X13 + X12 must carry the composite proof boundary, not X4, X12, '
+        'or X13 standalone boundary', () {
+      for (final wrongBoundary in const [
+        _kCanonicalProofBoundary,
+        _kDeadObjectRecoveryProofBoundary,
+        _kTimestampStabilizationProofBoundary,
+        _kRouteChangeEventHandoffProofBoundary,
+      ]) {
+        final report =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13DeadObjectSampleRawMap({'proofBoundary': wrongBoundary}),
+            );
+        expect(
+          report.hasCanonicalProofBoundary,
+          isFalse,
+          reason: wrongBoundary,
+        );
+        expect(report.allNativeLanesPass, isFalse, reason: wrongBoundary);
+      }
+    });
+
+    test('X13 requires every timestamp stabilization lane boolean', () {
+      for (final lane in const [
+        'timestampStabilizedOk',
+        'timestampAdvancingMonotonicOk',
+        'timestampPostSeekRestabilizedOk',
+        'timestampNoPacingFeedbackOk',
+      ]) {
+        final standaloneReport =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13SampleRawMap({lane: false}),
+            );
+        expect(
+          standaloneReport.timestampStabilizationGatesHeld,
+          isFalse,
+          reason: lane,
+        );
+        expect(standaloneReport.allNativeLanesPass, isFalse, reason: lane);
+
+        final composedReport =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13DeadObjectSampleRawMap({lane: false}),
+            );
+        expect(
+          composedReport.timestampStabilizationGatesHeld,
+          isFalse,
+          reason: lane,
+        );
+        expect(composedReport.allNativeLanesPass, isFalse, reason: lane);
+      }
+    });
+
+    test('X13 requires timestampStabilizationGatesHeld native lane', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX13SampleRawMap({'timestampStabilizationGatesHeld': false}),
+          );
+      expect(report.timestampStabilizationGatesHeld, isTrue);
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test(
+      'X13 standalone requires pre-seek and post-seek generations stabilized, '
+      'exactly 2 generations and 0 recreate resets',
+      () {
+        final noPreSeek =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13SampleRawMap({'timestampPreSeekStabilized': false}),
+            );
+        expect(noPreSeek.timestampStabilizationGatesHeld, isFalse);
+        expect(noPreSeek.allNativeLanesPass, isFalse);
+
+        final noPostSeek =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13SampleRawMap({'timestampPostSeekStabilized': false}),
+            );
+        expect(noPostSeek.timestampStabilizationGatesHeld, isFalse);
+        expect(noPostSeek.allNativeLanesPass, isFalse);
+
+        final wrongGenCount =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13SampleRawMap({'timestampGenerationCount': 3}),
+            );
+        expect(wrongGenCount.timestampStabilizationGatesHeld, isFalse);
+        expect(wrongGenCount.allNativeLanesPass, isFalse);
+
+        final unexpectedRecreateReset =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13SampleRawMap({'timestampRecreateResetCount': 1}),
+            );
+        expect(
+          unexpectedRecreateReset.timestampStabilizationGatesHeld,
+          isFalse,
+        );
+        expect(unexpectedRecreateReset.allNativeLanesPass, isFalse);
+
+        final wrongEpochOpen =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13SampleRawMap({'timestampEpochOpenCount': 1}),
+            );
+        expect(wrongEpochOpen.timestampStabilizationGatesHeld, isFalse);
+        expect(wrongEpochOpen.allNativeLanesPass, isFalse);
+      },
+    );
+
+    test(
+      'X13 + X12 requires all 3 generations stabilized, exactly 3 generations '
+      'and 1 recreate reset',
+      () {
+        final noPostRecreate =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13DeadObjectSampleRawMap({
+                'timestampPostRecreateStabilized': false,
+              }),
+            );
+        expect(noPostRecreate.timestampStabilizationGatesHeld, isFalse);
+        expect(noPostRecreate.allNativeLanesPass, isFalse);
+
+        final wrongGenCount =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13DeadObjectSampleRawMap({'timestampGenerationCount': 2}),
+            );
+        expect(wrongGenCount.timestampStabilizationGatesHeld, isFalse);
+        expect(wrongGenCount.allNativeLanesPass, isFalse);
+
+        final missingRecreateReset =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13DeadObjectSampleRawMap({
+                'timestampRecreateResetCount': 0,
+              }),
+            );
+        expect(missingRecreateReset.timestampStabilizationGatesHeld, isFalse);
+        expect(missingRecreateReset.allNativeLanesPass, isFalse);
+
+        final noPostRecreateStablePolls =
+            VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+              createX13DeadObjectSampleRawMap({
+                'timestampPostRecreateStablePolls': 0,
+              }),
+            );
+        expect(
+          noPostRecreateStablePolls.timestampStabilizationGatesHeld,
+          isFalse,
+        );
+        expect(noPostRecreateStablePolls.allNativeLanesPass, isFalse);
+      },
+    );
+
+    test('X13 requires zero frame regressions and zero in-loop polls', () {
+      final regression =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX13SampleRawMap({'timestampFrameRegressionCount': 1}),
+          );
+      expect(regression.timestampStabilizationGatesHeld, isFalse);
+      expect(regression.allNativeLanesPass, isFalse);
+
+      final pollInsideLoop =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX13SampleRawMap({'timestampPollInsideWriteLoopCount': 1}),
+          );
+      expect(pollInsideLoop.timestampStabilizationGatesHeld, isFalse);
+      expect(pollInsideLoop.allNativeLanesPass, isFalse);
+
+      final tooManyPolls =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX13SampleRawMap({
+              'timestampPassPollCount': 329,
+              'timestampPassCount': 328,
+            }),
+          );
+      expect(tooManyPolls.timestampStabilizationGatesHeld, isFalse);
+      expect(tooManyPolls.allNativeLanesPass, isFalse);
+    });
+
+    test('X13 requires positive stable polls and at least 1 frame advance', () {
+      final noStablePolls =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX13SampleRawMap({'timestampStablePollCount': 0}),
+          );
+      expect(noStablePolls.timestampStabilizationGatesHeld, isFalse);
+      expect(noStablePolls.allNativeLanesPass, isFalse);
+
+      final noAdvances =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX13SampleRawMap({'timestampFrameAdvanceCount': 0}),
+          );
+      expect(noAdvances.timestampStabilizationGatesHeld, isFalse);
+      expect(noAdvances.allNativeLanesPass, isFalse);
+    });
+
+    test('X13 fail report surfaces failure flags and fail marker', () {
+      final report =
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.fromMap(
+            createX13SampleRawMap({
+              'pass': false,
+              'status': 'audio_timestamp_warmup_budget_exceeded',
+              'marker': _kTimestampStabilizationFailMarker,
+              'failureReason': 'audio_timestamp_warmup_budget_exceeded',
+              'lastError': 'audio_timestamp_warmup_budget_exceeded',
+              'timestampStabilizedOk': false,
+              'timestampStabilizationGatesHeld': false,
+            }),
+          );
+      expect(report.pass, isFalse);
+      expect(
+        report.marker,
+        equals(
+          VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport
+              .timestampStabilizationFailMarkerConstant,
+        ),
+      );
+      expect(report.timestampStabilizedOk, isFalse);
+      expect(report.timestampStabilizationGatesHeld, isFalse);
+      expect(
+        report.lastError,
+        equals('audio_timestamp_warmup_budget_exceeded'),
+      );
+      expect(report.allNativeLanesPass, isFalse);
+    });
+
+    test(
+      'X13 standalone mode sends timestampStabilizationProofEnabled=true only',
+      () async {
+        Map<String, Object?>? capturedArgs;
+
+        binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+          capturedArgs = (call.arguments as Map).cast<String, Object?>();
+          return createX13SampleRawMap();
+        });
+
+        final report =
+            await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+              sourcePath: '/tmp/clip_B.mov',
+              timestampStabilizationProofEnabled: true,
+            );
+
+        expect(capturedArgs?['timestampStabilizationProofEnabled'], isTrue);
+        expect(
+          capturedArgs?.containsKey('deadObjectRecoveryProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('focusNoisyEventHandoffProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('focusDuckRestoreProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('focusLossPauseResumeProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('permanentFocusLossProofEnabled'),
+          isFalse,
+        );
+        expect(
+          capturedArgs?.containsKey('routeChangeEventHandoffProofEnabled'),
+          isFalse,
+        );
+        expect(capturedArgs?.containsKey('envelopeProofEnabled'), isFalse);
+        expect(
+          capturedArgs?.containsKey('nonZeroGainSinkProofEnabled'),
+          isFalse,
+        );
+        expect(report.pass, isTrue);
+        expect(report.timestampStabilizationProofEnabled, isTrue);
+        expect(report.allNativeLanesPass, isTrue);
+      },
+    );
+
+    test('X13 + X12 mode sends both timestampStabilizationProofEnabled and '
+        'deadObjectRecoveryProofEnabled', () async {
+      Map<String, Object?>? capturedArgs;
+
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+        capturedArgs = (call.arguments as Map).cast<String, Object?>();
+        return createX13DeadObjectSampleRawMap();
+      });
+
+      final report =
+          await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+            sourcePath: '/tmp/clip_B.mov',
+            timestampStabilizationProofEnabled: true,
+            deadObjectRecoveryProofEnabled: true,
+          );
+
+      expect(capturedArgs?['timestampStabilizationProofEnabled'], isTrue);
+      expect(capturedArgs?['deadObjectRecoveryProofEnabled'], isTrue);
+      expect(
+        capturedArgs?.containsKey('focusNoisyEventHandoffProofEnabled'),
+        isFalse,
+      );
+      expect(
+        capturedArgs?.containsKey('focusDuckRestoreProofEnabled'),
+        isFalse,
+      );
+      expect(
+        capturedArgs?.containsKey('focusLossPauseResumeProofEnabled'),
+        isFalse,
+      );
+      expect(
+        capturedArgs?.containsKey('permanentFocusLossProofEnabled'),
+        isFalse,
+      );
+      expect(
+        capturedArgs?.containsKey('routeChangeEventHandoffProofEnabled'),
+        isFalse,
+      );
+      expect(capturedArgs?.containsKey('envelopeProofEnabled'), isFalse);
+      expect(capturedArgs?.containsKey('nonZeroGainSinkProofEnabled'), isFalse);
+      expect(report.pass, isTrue);
+      expect(report.timestampStabilizationProofEnabled, isTrue);
+      expect(report.deadObjectRecoveryProofEnabled, isTrue);
+      expect(report.allNativeLanesPass, isTrue);
+    });
+
+    test(
+      'default X4 run does NOT send timestampStabilizationProofEnabled',
+      () async {
+        Map<String, Object?>? capturedArgs;
+
+        binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+          capturedArgs = (call.arguments as Map).cast<String, Object?>();
+          return _createSampleRawMap();
+        });
+
+        await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+          sourcePath: '/tmp/clip_B.mov',
+        );
+
+        expect(
+          capturedArgs?.containsKey('timestampStabilizationProofEnabled'),
+          isFalse,
+        );
+      },
+    );
+
+    test(
+      'X6 and X12 runs do NOT send timestampStabilizationProofEnabled',
+      () async {
+        Map<String, Object?>? capturedArgs;
+
+        binaryMessenger.setMockMethodCallHandler(defaultChannel, (call) async {
+          capturedArgs = (call.arguments as Map).cast<String, Object?>();
+          return _createSampleRawMap();
+        });
+
+        await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+          sourcePath: '/tmp/clip_B.mov',
+          nonZeroGainSinkProofEnabled: true,
+        );
+        expect(capturedArgs?['nonZeroGainSinkProofEnabled'], isTrue);
+        expect(
+          capturedArgs?.containsKey('timestampStabilizationProofEnabled'),
+          isFalse,
+        );
+
+        await VGAsyncRuntimeQueueMultiSourceRealtimeClockSmokeReport.runAsyncRuntimeQueueMultiSourceRealtimeClockSmoke(
+          sourcePath: '/tmp/clip_B.mov',
+          deadObjectRecoveryProofEnabled: true,
+        );
+        expect(capturedArgs?['deadObjectRecoveryProofEnabled'], isTrue);
+        expect(
+          capturedArgs?.containsKey('timestampStabilizationProofEnabled'),
+          isFalse,
+        );
+      },
+    );
   });
 
   group('Equality, hashCode, and toString', () {

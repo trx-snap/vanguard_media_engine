@@ -67,6 +67,22 @@ import java.nio.ByteOrder
 // play()s it, and resumes the same unwritten slice. This exercises the
 // recovery path only — no real OS dead object is forced or claimed.
 //
+// X13 (P4-AUDIO-AUDIOTRACK-TIMESTAMP-STABILIZATION,
+// timestampStabilizationProofEnabled) adds a driver-owned, owner-thread-only
+// AudioTrack.getTimestamp() poll-cadence and per-epoch frame-monotonicity
+// state machine: at most ONE poll per onOutputFramesRead pass, taken only
+// AFTER writeAllToAudioTrack returns (never inside its retry loop), plus the
+// existing seek/EOS boundary samples. Warmup starts only once the epoch has
+// entered playing; the warmup/regression baseline is reset per sink epoch
+// (seek flush) and after the X12 recreation, and framePosition is never
+// compared across epochs. framePosition is normalized unsigned 32-bit like
+// the playback head, one positive-direction wrap is tolerated, equal
+// positions are allowed and only strict backward movement fails closed.
+// nanoTime monotonicity is telemetry only. The timestamp never feeds back
+// into native pacing, dispatch, write size, sleeps, checksums or write
+// accounting. Standalone X13 keeps the muted default sink; X13 composes
+// only with X12 and fails closed with X5..X11.
+//
 // Honest non-claims: see [PROOF_BOUNDARY]. Diagnostic foundation only — no
 // audible playback, no presentation-clock claim, no second OS decoder, no
 // product/editor/app wiring, no export route, no streaming/cache, no iOS,
@@ -168,6 +184,14 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_PASS"
         const val DEAD_OBJECT_RECOVERY_FAIL_MARKER =
             "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_DEAD_OBJECT_RECOVERY_PHYSICAL_SMOKE_FAIL"
+        // X13 (P4-AUDIO-AUDIOTRACK-TIMESTAMP-STABILIZATION) markers, emitted
+        // only for timestamp-stabilization proof runs (standalone muted, or
+        // composed with X12); X4..X12 markers remain authoritative for their
+        // respective modes.
+        const val TIMESTAMP_STABILIZATION_PASS_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_SMOKE_PASS"
+        const val TIMESTAMP_STABILIZATION_FAIL_MARKER =
+            "ANDROID_DAG_PHASE4_ASYNC_RUNTIME_QUEUE_AUDIOTRACK_TIMESTAMP_STABILIZATION_SMOKE_FAIL"
         const val PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_realtime_wall_clock_pacing_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_and_audio_timestamp_telemetry_only_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_aaudio_no_opensl_no_oboe_no_latency_glitch_avsync_claim_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
@@ -223,6 +247,21 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // latency/glitch/xrun/underrun freedom, no production restart policy.
         const val DEAD_OBJECT_RECOVERY_PROOF_BOUNDARY =
             "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_dead_object_recovery_response_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_synthetic_dead_object_detection_and_recreation_only_base_gain_0_5_synthetic_dead_object_injected_once_old_track_released_new_track_initialized_and_resumed_no_real_os_dead_object_forcing_claim_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_seamless_hardware_hot_swap_claim_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_avsync_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
+
+        // X13 mode-specific proof boundary (standalone): the default muted
+        // sink, with AudioTimestamp promoted from telemetry-only to a
+        // poll-cadence / per-epoch frame-monotonicity DIAGNOSTIC gate. No
+        // presentation clock, latency, A/V sync, drift, or HAL timestamp
+        // accuracy claim; the timestamp never feeds back into pacing.
+        const val TIMESTAMP_STABILIZATION_PROOF_BOUNDARY =
+            "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audiotrack_timestamp_stabilization_diagnostic_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_muted_audiotrack_mode_stream_sink_write_accounting_native_worker_owned_steady_clock_render_dispatch_timebase_not_presentation_clock_no_caller_supplied_native_time_kotlin_owned_mediacodec_mediaextractor_and_audiotrack_lifecycle_synthetic_pcm_track_kotlin_owned_write_non_blocking_only_playback_head_telemetry_only_audio_timestamp_poll_cadence_and_per_epoch_frame_monotonicity_diagnostic_gate_only_one_poll_per_output_pass_after_write_returns_no_poll_inside_write_retry_loop_warmup_after_epoch_play_only_bounded_by_existing_deadline_per_epoch_baseline_reset_on_seek_flush_no_cross_epoch_comparison_unsigned_32bit_frame_position_one_positive_wrap_tolerated_equal_frame_position_allowed_strict_backward_only_fails_nanotime_monotonicity_telemetry_only_no_pacing_feedback_no_dispatch_feedback_no_write_size_feedback_no_checksum_effect_two_routed_tracks_unit_gain_lockstep_ingest_source_rings_spsc_output_ring_spsc_full_window_dispatch_only_window_aligned_expected_frame_count_no_joint_tail_flush_no_partial_window_dispatch_bounded_catch_up_max_eight_per_wake_condition_variable_wait_clamped_5ms_scheduler_auto_discovers_providers_from_graph_topology_tag_dispatched_ctor_only_no_external_provider_map_native_frame_axis_is_shared_accepted_frame_count_not_media_pts_extractor_seek_is_media_local_post_seek_media_content_overlap_permitted_lossless_within_common_budget_l_truncation_beyond_budget_non_claim_synthetic_generator_reanchored_at_accepted_frame_axis_no_second_os_decoder_no_cpp_os_decoder_no_cpp_file_io_no_independent_eos_no_ragged_tail_no_resample_no_downmix_channels_1_or_2_only_no_audible_output_no_speaker_route_no_audio_focus_no_becoming_noisy_no_route_change_handling_no_dead_object_recovery_no_presentation_clock_claim_no_latency_claim_no_avsync_claim_no_drift_claim_no_hal_timestamp_accuracy_claim_no_aaudio_no_opensl_no_oboe_no_zero_underrun_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
+
+        // X13 + X12 composed proof boundary: the X12 synthetic dead-object
+        // recovery sink (not muted, base gain 0.5) with the X13 timestamp
+        // diagnostic gate, whose baseline is additionally reset after the
+        // synthetic recreation. All X12 and X13 non-claims apply.
+        const val TIMESTAMP_STABILIZATION_DEAD_OBJECT_RECOVERY_PROOF_BOUNDARY =
+            "kotlin_owned_audiotrack_sink_on_async_runtime_queue_multi_source_audiotrack_timestamp_stabilization_with_dead_object_recovery_response_diagnostic_proof_only_real_decoder_plus_synthetic_track_to_async_runtime_queue_scheduler_output_ring_to_nonzero_gain_audiotrack_mode_stream_sink_write_accounting_sink_side_synthetic_dead_object_detection_and_recreation_only_base_gain_0_5_synthetic_dead_object_injected_once_old_track_released_new_track_initialized_and_resumed_no_real_os_dead_object_forcing_claim_playback_head_telemetry_only_audio_timestamp_poll_cadence_and_per_epoch_frame_monotonicity_diagnostic_gate_only_one_poll_per_output_pass_after_write_returns_no_poll_inside_write_retry_loop_warmup_after_epoch_play_only_bounded_by_existing_deadline_per_epoch_baseline_reset_on_seek_flush_and_after_synthetic_dead_object_recreation_no_cross_epoch_comparison_unsigned_32bit_frame_position_one_positive_wrap_tolerated_equal_frame_position_allowed_strict_backward_only_fails_nanotime_monotonicity_telemetry_only_no_pacing_feedback_no_dispatch_feedback_no_write_size_feedback_no_checksum_effect_no_acoustic_audibility_claim_no_speaker_verification_no_loudness_snr_claim_no_seamless_hardware_hot_swap_claim_no_os_route_arbitration_correctness_no_production_restart_policy_no_pause_resume_sla_no_presentation_clock_claim_no_latency_claim_no_avsync_claim_no_drift_claim_no_hal_timestamp_accuracy_claim_no_aaudio_no_opensl_no_oboe_no_latency_glitch_xrun_underrun_freedom_claim_no_realtime_priority_claim_no_sched_fifo_no_affinity_no_fleet_claim_no_product_editor_app_wiring_no_streaming_cache_no_export_route_no_ios_no_cpp_primitive_changes"
 
         // Frozen X3 decode dequeue timeout: the realtime loop must return
         // to ingest/drain work quickly.
@@ -281,6 +320,29 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // recreated track to reach its start threshold and progress its head.
         private const val DEAD_OBJECT_INJECT_AFTER_WINDOWS = 2L
 
+        // X13 timestamp warmup bounds, evaluated ONLY at existing poll points
+        // (no sleep, no wait, no wall-time extension beyond deadlineMs): an
+        // epoch that has entered playing must yield its first available
+        // AudioTimestamp within this many ms of its play() call AND within
+        // this many polls, and in any case before the epoch closes (seek
+        // boundary / EOS finalization). The pass cadence is the native
+        // worker's realtime output pace (2ms poll granularity), so the poll
+        // bound is a defensive runaway cap, the ms budget the real limit.
+        private const val TIMESTAMP_WARMUP_BUDGET_MS = 1_000L
+        private const val TIMESTAMP_WARMUP_MAX_POLLS = 4_096L
+        // X13 framePosition normalization: unsigned 32-bit like the playback
+        // head (and 0xFFFF_FFFFL); a backward step that unwraps to a forward
+        // move below half the modulus is ONE tolerated positive-direction
+        // wrap per epoch, anything else is a strict regression.
+        private const val TIMESTAMP_FRAME_WRAP_MODULUS = 0x1_0000_0000L
+        private const val TIMESTAMP_FRAME_WRAP_FORWARD_MAX = 0x8000_0000L
+        // X13 timestamp generations (per-epoch baselines): 0 = pre-seek
+        // epoch, 1 = post-seek epoch, 2 = post-X12-recreation (X13+X12 only).
+        private const val TIMESTAMP_GEN_PRE_SEEK = 0
+        private const val TIMESTAMP_GEN_POST_SEEK = 1
+        private const val TIMESTAMP_GEN_POST_RECREATE = 2
+        private const val TIMESTAMP_GEN_COUNT = 3
+
         private const val MAX_CONSECUTIVE_ZERO_WRITES = 500
         private const val ZERO_WRITE_SLEEP_MS = 2L
         private const val HEAD_POLL_SLEEP_MS = 5L
@@ -332,6 +394,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // and args, including the fail-closed handling of
         // AudioTrack.ERROR_DEAD_OBJECT with no recovery.
         val deadObjectRecoveryProofEnabled: Boolean = false,
+        // X13 mode switch (AudioTrack timestamp poll-cadence / per-epoch
+        // frame-monotonicity diagnostic; standalone keeps the muted default
+        // sink, composes ONLY with X12 — combining X13 with X5..X11 fails
+        // closed): false preserves the exact X4..X12 behavior and args,
+        // including the telemetry-only AudioTimestamp sampling.
+        val timestampStabilizationProofEnabled: Boolean = false,
     )
 
     // X8 (P4-AUDIO-FOCUS-DUCK-RESTORE-RESPONSE) synthetic duck/restore event
@@ -720,6 +788,54 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
     private var deadObjectSinkFramesWrittenAfterRecovery = -1L
     private var playStateAfterDeadObjectRecreatePlay = -1
     private var playStateAtReleaseDeadObject = -1
+    // X13 AudioTrack timestamp stabilization state. Owner thread only; pure
+    // observer (reads AudioTrack.getTimestamp, mutates nothing the native
+    // worker, the pacing, the write loop, the checksums or the write
+    // accounting ever consult). One generation per per-epoch baseline:
+    // generation 0 opens with the first sink epoch, generation 1 with the
+    // post-seek epoch (after the seek pause/flush), generation 2 after the
+    // X12 synthetic dead-object recreation. Positions are never compared
+    // across generations. Terminal states per generation: opened ->
+    // play_pending -> warming_up (polls after play returning unavailable,
+    // bounded) -> stabilized (first available poll, baseline captured) ->
+    // advancing/equal (monotonic) -> closed (seek boundary / EOS) or
+    // superseded (X12 recreation). Strict backward framePosition movement
+    // inside one generation is the only regression; nanoTime order is
+    // telemetry only.
+    private var timestampGenerationIndex = -1
+    private var timestampEpochOpenCount = 0L
+    private var timestampRecreateResetCount = 0L
+    private var timestampGenPlayStartMs = -1L
+    private var timestampGenStabilizedNow = false
+    private var timestampGenWarmupPolls = 0L
+    private var timestampGenWrapSeen = false
+    private var timestampLastFramePosition = -1L
+    private var timestampLastNanoTime = -1L
+    private val timestampGenStabilized = BooleanArray(TIMESTAMP_GEN_COUNT)
+    private val timestampGenWarmupPollCounts = LongArray(TIMESTAMP_GEN_COUNT)
+    private val timestampGenStablePollCounts = LongArray(TIMESTAMP_GEN_COUNT)
+    private val timestampGenAdvanceCounts = LongArray(TIMESTAMP_GEN_COUNT)
+    private val timestampGenFirstStableFramePositions = LongArray(TIMESTAMP_GEN_COUNT) { -1L }
+    private var timestampPassCount = 0L
+    private var timestampPassPollCount = 0L
+    private var timestampPollInsideWriteLoopCount = 0L
+    private var sinkWriteLoopActive = false
+    private var timestampWarmupPollCount = 0L
+    private var timestampStablePollCount = 0L
+    private var timestampUnavailableAfterStableCount = 0L
+    private var timestampFrameAdvanceCount = 0L
+    private var timestampFrameEqualCount = 0L
+    private var timestampFrameRegressionCount = 0L
+    private var timestampWrapCount = 0L
+    private var timestampNanoTimeAdvanceCount = 0L
+    private var timestampNanoTimeEqualCount = 0L
+    private var timestampNanoTimeNonMonotonicCount = 0L
+    private var timestampGenerationsStabilized = 0L
+    private var timestampStabilizedOk = false
+    private var timestampAdvancingMonotonicOk = false
+    private var timestampPostSeekRestabilizedOk = false
+    private var timestampNoPacingFeedbackOk = false
+    private var timestampStabilizationGatesHeld = false
     private val detailParts = mutableListOf<String>()
 
     fun run(
@@ -759,6 +875,22 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                     config.routeChangeEventHandoffProofEnabled)
             ) {
                 throw FailClosed("dead_object_recovery_mode_not_isolated")
+            }
+            // X13 composes ONLY with the default muted sink or with X12 (whose
+            // recreation exercises the post-recreate baseline reset). X5/X6
+            // (gain paths) and X7..X11 (event planes that mutate playstate,
+            // gain or routing on the same track) are undefined with X13 and
+            // fail closed before any track exists.
+            if (config.timestampStabilizationProofEnabled &&
+                (config.envelopeProofEnabled ||
+                    config.nonZeroGainSinkProofEnabled ||
+                    config.focusNoisyEventHandoffProofEnabled ||
+                    config.focusDuckRestoreProofEnabled ||
+                    config.focusLossPauseResumeProofEnabled ||
+                    config.permanentFocusLossProofEnabled ||
+                    config.routeChangeEventHandoffProofEnabled)
+            ) {
+                throw FailClosed("timestamp_stabilization_mode_not_isolated")
             }
             val windowSec = minOf(config.durationSec, HARD_MAX_DURATION_SEC)
             if (windowSec <= 0.0) throw FailClosed("invalid_decode_duration")
@@ -1556,6 +1688,66 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 detailParts.add("deadObjectSyntheticInjectionOnlyNoRealOsDeadObjectClaim")
             }
 
+            // X13 AudioTrack timestamp stabilization gate. Every warmup
+            // timeout and every strict regression already failed closed at
+            // its poll point with its own reason; this composite asserts the
+            // pre-seek generation and the FINAL generation (post-seek, or
+            // post-recreate under X12) stabilized, at least one strict
+            // framePosition advance was observed with zero regressions, the
+            // expected per-epoch baseline resets happened (2 epoch opens, plus
+            // exactly one recreate reset under X12), and the no-feedback
+            // invariant held: at most one poll per pass, no poll inside the
+            // write loop, maxFramesPerMix untouched, and the native pacing /
+            // sink accounting / checksum / frame gates above unchanged.
+            // Diagnostic only: no presentation clock, latency, A/V sync,
+            // drift, or HAL timestamp accuracy claim.
+            if (config.timestampStabilizationProofEnabled) {
+                val expectedGenerations =
+                    if (config.deadObjectRecoveryProofEnabled) TIMESTAMP_GEN_COUNT
+                    else TIMESTAMP_GEN_POST_SEEK + 1
+                val finalGeneration = expectedGenerations - 1
+                val finalGenerationStabilized = timestampGenStabilized[finalGeneration]
+                timestampStabilizedOk =
+                    timestampGenStabilized[TIMESTAMP_GEN_PRE_SEEK] &&
+                        finalGenerationStabilized &&
+                        timestampStablePollCount > 0L &&
+                        timestampFrameRegressionCount == 0L
+                timestampAdvancingMonotonicOk =
+                    timestampStabilizedOk &&
+                        timestampFrameAdvanceCount >= 1L &&
+                        timestampWrapCount <= expectedGenerations.toLong()
+                timestampPostSeekRestabilizedOk =
+                    finalGenerationStabilized &&
+                        timestampGenerationIndex == finalGeneration &&
+                        timestampEpochOpenCount == 2L &&
+                        timestampRecreateResetCount ==
+                        (if (config.deadObjectRecoveryProofEnabled) 1L else 0L) &&
+                        timestampGenStablePollCounts[finalGeneration] > 0L
+                timestampNoPacingFeedbackOk =
+                    timestampPassPollCount <= timestampPassCount &&
+                        timestampPollInsideWriteLoopCount == 0L &&
+                        !sinkWriteLoopActive &&
+                        mfpm == config.maxFramesPerMix.toLong() &&
+                        realtimeNativeElapsedOk &&
+                        realtimeBacklogBoundOk &&
+                        sinkWriteAccountingOk &&
+                        checksumIdentityOk &&
+                        frameAccountingOk &&
+                        (!config.deadObjectRecoveryProofEnabled || deadObjectRecoveryGatesHeld)
+                timestampStabilizationGatesHeld =
+                    timestampStabilizedOk &&
+                        timestampAdvancingMonotonicOk &&
+                        timestampPostSeekRestabilizedOk &&
+                        timestampNoPacingFeedbackOk
+                if (!timestampStabilizationGatesHeld) {
+                    throw FailClosed("timestamp_stabilization_gates_failed")
+                }
+                detailParts.add("timestampGenerations=$expectedGenerations")
+                detailParts.add("timestampWarmupPollCount=$timestampWarmupPollCount")
+                detailParts.add("timestampStablePollCount=$timestampStablePollCount")
+                detailParts.add("timestampPollCadenceAndPerEpochMonotonicityDiagnosticOnly")
+            }
+
             // ── Destroy: join-on-destroy + idempotence ──────────────────────
             val (joinOk, idempotentOk) = s.destroyAndVerifyLifecycle()
             workerJoinOnDestroyOk = joinOk
@@ -1703,6 +1895,9 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         stagedResidualFrames = frames
         writeAllToAudioTrack((frames * bytesPerFrame).toInt())
         if (stagedResidualFrames != 0L) throw FailClosed("sink_residual_after_write")
+        // X13 poll point: at most ONE timestamp poll per pass, strictly after
+        // the write loop returned with zero residual (never inside it).
+        pollTimestampStabilizationAfterPass()
     }
 
     // Writes [bytes] bytes from offset 0 of the read buffer with
@@ -1728,6 +1923,9 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         val buf = sinkReadBuf!!
         buf.position(0)
         buf.limit(bytes)
+        // X13 guard only: a timestamp poll attempted while this loop is
+        // active fails closed (timestamp_poll_inside_write_loop).
+        sinkWriteLoopActive = true
         var consecutiveZero = 0
         while (buf.hasRemaining()) {
             checkDeadline()
@@ -1804,6 +2002,7 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 framesWrittenToSinkTotal - deadObjectSinkFramesWrittenBeforeRecovery
         }
         buf.clear()
+        sinkWriteLoopActive = false
         // X7 drain point: owner thread, after write loop completes.
         drainEventsFn?.invoke()
         // X8 drain point: at most one synthetic duck/restore event per pass.
@@ -1939,6 +2138,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         // (telemetry lanes only; never a native anchor or timebase).
         epochHeadBaseline = readPlaybackHeadUnsigned()
         epochUnderrunBaseline = readUnderrunTelemetry()
+        // X13: the recreated instance is a fresh timestamp stream; open the
+        // post-recreate generation with its warmup clock at this play().
+        if (config.timestampStabilizationProofEnabled) {
+            timestampRecreateResetCount += 1L
+            resetTimestampBaseline(playStartMs = SystemClock.elapsedRealtime())
+        }
         return newTrack
     }
 
@@ -2113,6 +2318,10 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         epochPlayed = true
         epochUnderrunBaseline = readUnderrunTelemetry()
         if (underrunBaselineFirst < 0L) underrunBaselineFirst = epochUnderrunBaseline
+        // X13: warmup starts only now (epoch entered playing).
+        if (config.timestampStabilizationProofEnabled) {
+            timestampGenPlayStartMs = SystemClock.elapsedRealtime()
+        }
     }
 
     // Runs at the seek quiescent boundary (inside the session's seek, after
@@ -2126,6 +2335,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         if (!epochPlayed) throw FailClosed("seek_before_epoch_play")
         val track = audioTrack ?: throw FailClosed("audio_track_missing")
         sampleTimestampTelemetry()
+        // X13: the pre-seek generation closes here; an epoch that played but
+        // never yielded an available timestamp is a warmup timeout. The
+        // post-seek baseline reset happens in openSinkEpoch() (no output
+        // pass can occur between this flush and that open).
+        closeTimestampGenerationOrFail("seek")
         framesWrittenBeforeSeek = epochFramesWritten
         playbackHeadAtSeek = epochHeadProgress()
         framesDiscardedInSinkAtSeek = framesWrittenBeforeSeek - playbackHeadAtSeek
@@ -2174,6 +2388,12 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         playbackHeadTelemetryOk = progress > 0L && playbackHeadAtSeek >= 0L
         if (!playbackHeadTelemetryOk) throw FailClosed("playback_head_not_progressed")
         captureEpochUnderrunDelta("epoch1")
+        // X13 only: one more boundary sample after the existing bounded head
+        // wait (no extra wait is added), then the final generation closes.
+        if (config.timestampStabilizationProofEnabled) {
+            sampleTimestampTelemetry()
+            closeTimestampGenerationOrFail("eos")
+        }
         // X7 drain point: owner thread, at EOS finalization.
         drainEventsFn?.invoke()
         // X8 drain point: at most one synthetic duck/restore event per pass.
@@ -2636,6 +2856,13 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         epochPlayed = false
         epochUnderrunBaseline = -1L
         epochHeadBaseline = readPlaybackHeadUnsigned()
+        // X13: every sink epoch (initial, and the post-seek one opened after
+        // the seek pause/flush) starts a fresh timestamp generation whose
+        // warmup clock is stamped by that epoch's play().
+        if (config.timestampStabilizationProofEnabled) {
+            timestampEpochOpenCount += 1L
+            resetTimestampBaseline(playStartMs = -1L)
+        }
     }
 
     private fun readPlaybackHeadUnsigned(): Long =
@@ -2669,14 +2896,169 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
         detailParts.add("${label}UnderrunDelta=$delta")
     }
 
-    // AudioTimestamp TELEMETRY only: attempt/success counters, never a
-    // verdict gate.
+    // AudioTimestamp TELEMETRY only in X4..X12: attempt/success counters,
+    // never a verdict gate. In X13 mode every sample (the same seek/EOS
+    // boundary samples plus the per-pass polls) is additionally fed to the
+    // owner-thread stabilization observer.
     private fun sampleTimestampTelemetry() {
         val track = audioTrack ?: return
         audioTimestampAttemptCount++
-        try {
-            if (track.getTimestamp(audioTimestamp)) audioTimestampSuccessCount++
-        } catch (_: Throwable) {}
+        val available = try {
+            track.getTimestamp(audioTimestamp)
+        } catch (_: Throwable) {
+            false
+        }
+        if (available) audioTimestampSuccessCount++
+        if (config.timestampStabilizationProofEnabled) observeTimestampSample(available)
+    }
+
+    // ── X13 AudioTrack timestamp stabilization observer (owner thread only)
+
+    // Per-pass poll point: counts the pass, and only once the current epoch
+    // has entered playing (warmup start) takes ONE sample. Before play no
+    // attempt is made or counted — exactly like the existing boundary
+    // telemetry, which never samples before play. Never called from inside
+    // the write loop; the guard fails closed if it ever is.
+    private fun pollTimestampStabilizationAfterPass() {
+        if (!config.timestampStabilizationProofEnabled) return
+        assertOwnerThread("x13_poll")
+        checkDeadline()
+        timestampPassCount += 1L
+        if (sinkWriteLoopActive) {
+            timestampPollInsideWriteLoopCount += 1L
+            throw FailClosed("timestamp_poll_inside_write_loop")
+        }
+        if (!epochPlayed) return
+        timestampPassPollCount += 1L
+        sampleTimestampTelemetry()
+    }
+
+    // Opens a timestamp generation: fresh warmup/regression baseline, no
+    // carried-over position (never compared across generations).
+    // [playStartMs] < 0 means play() is still pending for this epoch and
+    // playIfPrerolled() stamps the warmup clock; the X12 recreation passes
+    // its own play() instant.
+    private fun resetTimestampBaseline(playStartMs: Long) {
+        assertOwnerThread("x13_reset")
+        val next = timestampGenerationIndex + 1
+        if (next >= TIMESTAMP_GEN_COUNT) {
+            throw FailClosed("timestamp_generation_overflow:$next")
+        }
+        timestampGenerationIndex = next
+        timestampGenPlayStartMs = playStartMs
+        timestampGenStabilizedNow = false
+        timestampGenWarmupPolls = 0L
+        timestampGenWrapSeen = false
+        timestampLastFramePosition = -1L
+        timestampLastNanoTime = -1L
+    }
+
+    // Generation close (seek boundary / EOS finalization): an epoch that
+    // entered playing but never yielded an available timestamp is the
+    // bounded warmup timeout. The X12 recreation does NOT close a
+    // generation (the dying post-seek generation is superseded ~2 windows
+    // after its play(), which is not a timeout claim).
+    private fun closeTimestampGenerationOrFail(where: String) {
+        if (!config.timestampStabilizationProofEnabled) return
+        assertOwnerThread("x13_close")
+        if (timestampGenerationIndex < 0) throw FailClosed("timestamp_generation_not_open")
+        if (epochPlayed && !timestampGenStabilizedNow) {
+            detailParts.add(
+                "timestampWarmupTimeoutAt=$where:gen$timestampGenerationIndex:" +
+                    "polls=$timestampGenWarmupPolls"
+            )
+            throw FailClosed("timestamp_warmup_timeout")
+        }
+    }
+
+    // Feeds one sample into the per-generation state machine. Unavailable
+    // during warmup: bounded by the ms budget since play() and the poll cap
+    // (evaluated here only — no sleep or wait is ever added). First
+    // available: baseline. Later available: unsigned-32 framePosition must
+    // not move strictly backward (equal allowed, one positive wrap
+    // tolerated); nanoTime order is counted only.
+    private fun observeTimestampSample(available: Boolean) {
+        assertOwnerThread("x13_observe")
+        if (!epochPlayed) return
+        val gen = timestampGenerationIndex
+        if (gen < 0 || gen >= TIMESTAMP_GEN_COUNT) {
+            throw FailClosed("timestamp_generation_not_open")
+        }
+        if (!timestampGenStabilizedNow) {
+            if (!available) {
+                timestampGenWarmupPolls += 1L
+                timestampWarmupPollCount += 1L
+                timestampGenWarmupPollCounts[gen] += 1L
+                if (timestampGenPlayStartMs < 0L) {
+                    // Defensive: play() stamps the clock before any poll.
+                    timestampGenPlayStartMs = SystemClock.elapsedRealtime()
+                }
+                val sincePlayMs = SystemClock.elapsedRealtime() - timestampGenPlayStartMs
+                if (sincePlayMs > TIMESTAMP_WARMUP_BUDGET_MS ||
+                    timestampGenWarmupPolls > TIMESTAMP_WARMUP_MAX_POLLS
+                ) {
+                    detailParts.add(
+                        "timestampWarmupTimeoutAt=poll:gen$gen:" +
+                            "polls=$timestampGenWarmupPolls:sincePlayMs=$sincePlayMs"
+                    )
+                    throw FailClosed("timestamp_warmup_timeout")
+                }
+                return
+            }
+            val pos = audioTimestamp.framePosition and 0xFFFF_FFFFL
+            timestampGenStabilizedNow = true
+            timestampGenStabilized[gen] = true
+            timestampGenerationsStabilized += 1L
+            timestampGenFirstStableFramePositions[gen] = pos
+            timestampGenStablePollCounts[gen] += 1L
+            timestampStablePollCount += 1L
+            timestampLastFramePosition = pos
+            timestampLastNanoTime = audioTimestamp.nanoTime
+            return
+        }
+        if (!available) {
+            // Transient unavailability after stabilization: telemetry only,
+            // the baseline is kept (no regression can be inferred from it).
+            timestampUnavailableAfterStableCount += 1L
+            return
+        }
+        val pos = audioTimestamp.framePosition and 0xFFFF_FFFFL
+        val nano = audioTimestamp.nanoTime
+        val delta = pos - timestampLastFramePosition
+        when {
+            delta > 0L -> {
+                timestampFrameAdvanceCount += 1L
+                timestampGenAdvanceCounts[gen] += 1L
+            }
+            delta == 0L -> timestampFrameEqualCount += 1L
+            else -> {
+                val forward = pos + TIMESTAMP_FRAME_WRAP_MODULUS - timestampLastFramePosition
+                if (!timestampGenWrapSeen &&
+                    forward > 0L && forward < TIMESTAMP_FRAME_WRAP_FORWARD_MAX
+                ) {
+                    timestampGenWrapSeen = true
+                    timestampWrapCount += 1L
+                    timestampFrameAdvanceCount += 1L
+                    timestampGenAdvanceCounts[gen] += 1L
+                } else {
+                    timestampFrameRegressionCount += 1L
+                    detailParts.add(
+                        "timestampFrameRegression=gen$gen:" +
+                            "$timestampLastFramePosition->$pos"
+                    )
+                    throw FailClosed("timestamp_frame_regression")
+                }
+            }
+        }
+        when {
+            nano > timestampLastNanoTime -> timestampNanoTimeAdvanceCount += 1L
+            nano == timestampLastNanoTime -> timestampNanoTimeEqualCount += 1L
+            else -> timestampNanoTimeNonMonotonicCount += 1L
+        }
+        timestampGenStablePollCounts[gen] += 1L
+        timestampStablePollCount += 1L
+        timestampLastFramePosition = pos
+        timestampLastNanoTime = nano
     }
 
     private fun releaseAudioTrackOnce() {
@@ -2797,6 +3179,11 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             "deadObjectNewTrackVolumeSetOk" to deadObjectNewTrackVolumeSetOk,
             "deadObjectNewTrackPlayOk" to deadObjectNewTrackPlayOk,
             "deadObjectRecoveryGatesHeld" to deadObjectRecoveryGatesHeld,
+            "timestampStabilizedOk" to timestampStabilizedOk,
+            "timestampAdvancingMonotonicOk" to timestampAdvancingMonotonicOk,
+            "timestampPostSeekRestabilizedOk" to timestampPostSeekRestabilizedOk,
+            "timestampNoPacingFeedbackOk" to timestampNoPacingFeedbackOk,
+            "timestampStabilizationGatesHeld" to timestampStabilizationGatesHeld,
         )
         val metrics = mapOf<String, Any?>(
             "sampleRate" to sampleRate,
@@ -2962,8 +3349,63 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
                 deadObjectSinkFramesWrittenAfterRecovery,
             "playStateAfterDeadObjectRecreatePlay" to playStateAfterDeadObjectRecreatePlay,
             "playStateAtReleaseDeadObject" to playStateAtReleaseDeadObject,
+            "timestampStabilizationProofEnabled" to config.timestampStabilizationProofEnabled,
+            "timestampWarmupPollCount" to timestampWarmupPollCount,
+            "timestampStablePollCount" to timestampStablePollCount,
+            "timestampUnavailableAfterStableCount" to timestampUnavailableAfterStableCount,
+            "timestampPassCount" to timestampPassCount,
+            "timestampPassPollCount" to timestampPassPollCount,
+            "timestampPollInsideWriteLoopCount" to timestampPollInsideWriteLoopCount,
+            "timestampFrameAdvanceCount" to timestampFrameAdvanceCount,
+            "timestampFrameEqualCount" to timestampFrameEqualCount,
+            "timestampFrameRegressionCount" to timestampFrameRegressionCount,
+            "timestampWrapCount" to timestampWrapCount,
+            "timestampNanoTimeAdvanceCountTelemetryOnly" to timestampNanoTimeAdvanceCount,
+            "timestampNanoTimeEqualCountTelemetryOnly" to timestampNanoTimeEqualCount,
+            "timestampNanoTimeNonMonotonicCountTelemetryOnly" to
+                timestampNanoTimeNonMonotonicCount,
+            "timestampEpochOpenCount" to timestampEpochOpenCount,
+            "timestampRecreateResetCount" to timestampRecreateResetCount,
+            "timestampGenerationCount" to (timestampGenerationIndex + 1).toLong(),
+            "timestampGenerationsStabilized" to timestampGenerationsStabilized,
+            "timestampPreSeekStabilized" to timestampGenStabilized[TIMESTAMP_GEN_PRE_SEEK],
+            "timestampPostSeekStabilized" to timestampGenStabilized[TIMESTAMP_GEN_POST_SEEK],
+            "timestampPostRecreateStabilized" to
+                timestampGenStabilized[TIMESTAMP_GEN_POST_RECREATE],
+            "timestampPreSeekWarmupPolls" to
+                timestampGenWarmupPollCounts[TIMESTAMP_GEN_PRE_SEEK],
+            "timestampPostSeekWarmupPolls" to
+                timestampGenWarmupPollCounts[TIMESTAMP_GEN_POST_SEEK],
+            "timestampPostRecreateWarmupPolls" to
+                timestampGenWarmupPollCounts[TIMESTAMP_GEN_POST_RECREATE],
+            "timestampPreSeekStablePolls" to
+                timestampGenStablePollCounts[TIMESTAMP_GEN_PRE_SEEK],
+            "timestampPostSeekStablePolls" to
+                timestampGenStablePollCounts[TIMESTAMP_GEN_POST_SEEK],
+            "timestampPostRecreateStablePolls" to
+                timestampGenStablePollCounts[TIMESTAMP_GEN_POST_RECREATE],
+            "timestampPreSeekAdvanceCount" to
+                timestampGenAdvanceCounts[TIMESTAMP_GEN_PRE_SEEK],
+            "timestampPostSeekAdvanceCount" to
+                timestampGenAdvanceCounts[TIMESTAMP_GEN_POST_SEEK],
+            "timestampPostRecreateAdvanceCount" to
+                timestampGenAdvanceCounts[TIMESTAMP_GEN_POST_RECREATE],
+            "timestampPreSeekFirstStableFramePosition" to
+                timestampGenFirstStableFramePositions[TIMESTAMP_GEN_PRE_SEEK],
+            "timestampPostSeekFirstStableFramePosition" to
+                timestampGenFirstStableFramePositions[TIMESTAMP_GEN_POST_SEEK],
+            "timestampPostRecreateFirstStableFramePosition" to
+                timestampGenFirstStableFramePositions[TIMESTAMP_GEN_POST_RECREATE],
+            "timestampLastFramePosition" to timestampLastFramePosition,
+            "timestampWarmupBudgetMs" to TIMESTAMP_WARMUP_BUDGET_MS,
+            "timestampWarmupMaxPolls" to TIMESTAMP_WARMUP_MAX_POLLS,
         )
         val marker = when {
+            // X13 (standalone or composed with X12) owns the marker; the
+            // deadObjectRecoveryProofEnabled metric distinguishes the two.
+            config.timestampStabilizationProofEnabled ->
+                if (pass) TIMESTAMP_STABILIZATION_PASS_MARKER
+                else TIMESTAMP_STABILIZATION_FAIL_MARKER
             config.deadObjectRecoveryProofEnabled ->
                 if (pass) DEAD_OBJECT_RECOVERY_PASS_MARKER
                 else DEAD_OBJECT_RECOVERY_FAIL_MARKER
@@ -2998,6 +3440,14 @@ class AndroidAsyncRuntimeQueueMultiSourceRealtimeClockDriver {
             // not muted (and X8..X11 are not no-focus; X12 recreates the
             // sink, which the default boundary disclaims).
             proofBoundary = when {
+                // X13 promotes AudioTimestamp from telemetry-only to a
+                // diagnostic gate, so it owns its own boundary (muted
+                // standalone, or the X12 composition).
+                config.timestampStabilizationProofEnabled &&
+                    config.deadObjectRecoveryProofEnabled ->
+                    TIMESTAMP_STABILIZATION_DEAD_OBJECT_RECOVERY_PROOF_BOUNDARY
+                config.timestampStabilizationProofEnabled ->
+                    TIMESTAMP_STABILIZATION_PROOF_BOUNDARY
                 config.deadObjectRecoveryProofEnabled ->
                     DEAD_OBJECT_RECOVERY_PROOF_BOUNDARY
                 config.routeChangeEventHandoffProofEnabled ->
