@@ -295,6 +295,8 @@ export 'vg_streaming_manifest_rendition_client.dart';
 export 'vg_streaming_compatibility_decision_client.dart';
 // Phase 4C5P: public streaming preflight composite evaluator.
 export 'vg_streaming_preflight_composite_evaluator.dart';
+// P1-GPU-BLACKLIST: GPU driver blacklist rule evaluator.
+export 'src/diagnostics/vg_gpu_driver_blacklist.dart';
 
 const String _libName = 'vanguard_media_engine';
 
