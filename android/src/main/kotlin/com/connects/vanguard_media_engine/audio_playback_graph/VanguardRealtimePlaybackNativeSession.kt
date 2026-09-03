@@ -117,6 +117,20 @@ class VanguardRealtimePlaybackNativeSession private constructor(
         val acceptedFrames: Long,
         val nextWriteFrame: Long,
         val freeFrames: Long,
+        // Y15a (P4-AUDIO-REALTIME-PLAYBACK-CLOCK-CORRELATION-OBSERVATION):
+        // read-only mirror of the native worker-owned AudioClock, refreshed
+        // on every full reply. "none" state / 0 positions when no AudioClock
+        // instance currently exists (parse-compatible default: an older
+        // native build that predates these keys parses the same way).
+        val nativeClockState: String,
+        val nativeClockPositionUs: Long,
+        val nativeClockPositionFrame: Long,
+        val nativeClockAnchorMediaPtsUs: Long,
+        val nativeClockAnchorSystemTimeNs: Long,
+        val nativeClockSpeedNumerator: Int,
+        val nativeClockSpeedDenominator: Int,
+        val nativeClockDriftSampleCount: Long,
+        val nativeClockLastDriftDeltaUs: Long,
         val raw: String,
     ) {
         val ok: Boolean get() = status == STATUS_OK
@@ -257,6 +271,15 @@ class VanguardRealtimePlaybackNativeSession private constructor(
                 acceptedFrames = long("acceptedFrames"),
                 nextWriteFrame = long("nextWriteFrame"),
                 freeFrames = long("freeFrames"),
+                nativeClockState = str("nativeClockState", "none"),
+                nativeClockPositionUs = long("nativeClockPositionUs"),
+                nativeClockPositionFrame = long("nativeClockPositionFrame"),
+                nativeClockAnchorMediaPtsUs = long("nativeClockAnchorMediaPtsUs"),
+                nativeClockAnchorSystemTimeNs = long("nativeClockAnchorSystemTimeNs"),
+                nativeClockSpeedNumerator = kv["nativeClockSpeedNumerator"]?.toIntOrNull() ?: 1,
+                nativeClockSpeedDenominator = kv["nativeClockSpeedDenominator"]?.toIntOrNull() ?: 1,
+                nativeClockDriftSampleCount = long("nativeClockDriftSampleCount"),
+                nativeClockLastDriftDeltaUs = long("nativeClockLastDriftDeltaUs"),
                 raw = raw,
             )
         }

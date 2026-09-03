@@ -7,6 +7,7 @@ import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeA
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackDecoderFeed
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackNativeSession
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackPresentationClock
+import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackClockCorrelation
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackTransportStateMachine
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.DEAD_OBJECT_PUBLICATION_LAG_BUDGET_MS
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.DEFAULT_DUCK_GAIN
@@ -14,8 +15,10 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_BOUNDED_PAUSE_RESUME
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CHECKSUM_IDENTITY
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_ANCHORED
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_CORRELATION_TELEMETRY
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_EPOCH_BALANCED
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_MONOTONIC
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_OBSERVATION_NO_FEEDBACK
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_PAUSE_FROZEN
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CURRENT_POSITION_POLLER_MONOTONIC
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CURRENT_POSITION_QUERY_SURFACE
@@ -31,6 +34,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_FOCUS_SETUP
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_FOCUS_TRANSIENT_PAUSE_RESUME
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_FORMAT_PROBE
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_NATIVE_AUDIO_CLOCK_SNAPSHOT_PUBLISHED
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_NONZERO_GAIN
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_NO_FEEDBACK
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_PLAYTHROUGH_ACCOUNTING
@@ -1219,6 +1223,9 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         out: ScenarioOutcome,
         postTeardownFrames: Long = -1L,
         postTeardownUs: Long = -1L,
+        correlation: VanguardRealtimeAudioPlaybackClockCorrelation? = null,
+        commandsBefore: Int = -1,
+        commandsAfter: Int = -1,
     ) {
         val fmt = final.format ?: return
         val sink = final.sink ?: return
@@ -1256,6 +1263,16 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         out.metrics["positionAtEosUs"] = sink.positionAtEosUs
         out.metrics["currentPositionReadsFromWriterThread"] = sink.currentPositionReadsFromWriterThread
         out.metrics["currentPositionReadsFromOtherThreads"] = sink.currentPositionReadsFromOtherThreads
+        out.metrics["nativeClockState"] = correlation?.nativeClockState ?: ""
+        out.metrics["nativeClockPositionUs"] = correlation?.nativePositionUs ?: -1L
+        out.metrics["nativeClockPositionFrame"] = correlation?.nativePositionFrame ?: -1L
+        out.metrics["nativeClockDriftSampleCount"] = correlation?.nativeDriftSampleCount ?: -1L
+        out.metrics["presentationClockPositionUsAtCorrelation"] = correlation?.presentationPositionUs ?: -1L
+        out.metrics["presentationClockPositionFramesAtCorrelation"] = correlation?.presentationPositionFrames ?: -1L
+        out.metrics["clockCorrelationOffsetUs"] = correlation?.offsetUs ?: -1L
+        out.metrics["clockCorrelationOffsetFrames"] = correlation?.offsetFrames ?: -1L
+        out.metrics["clockCorrelationCommandsBefore"] = commandsBefore
+        out.metrics["clockCorrelationCommandsAfter"] = commandsAfter
 
         out.lanes[LANE_PLAYTHROUGH_ACCOUNTING] = playthroughAccountingOk(final, stateAtCompletion)
         out.lanes[LANE_CHECKSUM_IDENTITY] = checksumIdentityOk(final)
@@ -1305,6 +1322,24 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             clock.positionUs >= 0L &&
             postTeardownFrames >= clock.positionFrames &&
             postTeardownUs >= clock.positionUs
+
+        val nativeClockStateValid = correlation != null &&
+            correlation.nativeClockState.isNotBlank() &&
+            !correlation.nativeClockState.equals("none", ignoreCase = true) &&
+            !correlation.nativeClockState.equals("unknown", ignoreCase = true)
+        out.lanes[LANE_NATIVE_AUDIO_CLOCK_SNAPSHOT_PUBLISHED] = correlation != null &&
+            nativeClockStateValid &&
+            correlation.nativePositionUs >= 0L &&
+            correlation.nativePositionFrame >= 0L
+
+        out.lanes[LANE_CLOCK_CORRELATION_TELEMETRY] = correlation != null &&
+            correlation.presentationConsistent &&
+            correlation.presentationPositionUs >= 0L &&
+            correlation.presentationPositionFrames >= 0L
+
+        out.lanes[LANE_CLOCK_OBSERVATION_NO_FEEDBACK] = correlation != null &&
+            commandsBefore >= 0 &&
+            commandsBefore == commandsAfter
     }
 
     // A lane holds only when every scenario that evaluated it passed and at

@@ -455,6 +455,25 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     fun currentPositionFrames(): Long = sink?.currentPositionFrames() ?: -1L
     fun currentPositionUs(): Long = sink?.currentPositionUs() ?: -1L
 
+    // Y15a (P4-AUDIO-REALTIME-PLAYBACK-CLOCK-CORRELATION-OBSERVATION): any-
+    // thread, read-only pairing of a live native transport snapshot (the
+    // worker-published AudioClock mirror) with the sink's presentation
+    // clock snapshot. An OBSERVATION seam only -- it never touches
+    // [currentPositionFrames]/[currentPositionUs] above (still the sole
+    // downstream presentation-clock authority), never acquires
+    // [commandLock], and issues no transport command beyond the existing
+    // read-only [VanguardRealtimePlaybackTransportStateMachine.snapshot]
+    // (Op.SNAPSHOT), so it never touches start/pause/resume/seek/drain
+    // decisions. Null before a transport/sink exist, or once the transport
+    // is disposed (a disposed machine's snapshot rejects with a null reply,
+    // which this method also treats as terminal-safe null).
+    fun observeClockCorrelation(): VanguardRealtimeAudioPlaybackClockCorrelation? {
+        val machine = transport ?: return null
+        val s = sink ?: return null
+        val reply = machine.snapshot().reply ?: return null
+        return VanguardRealtimeAudioPlaybackClockCorrelation.from(reply, s.clockSnapshot())
+    }
+
     private val listener = object : VanguardRealtimePlaybackTransportStateMachine.Listener {
         override fun onStateChanged(previous: TransportState, current: TransportState, generation: Long) {
             countListener()

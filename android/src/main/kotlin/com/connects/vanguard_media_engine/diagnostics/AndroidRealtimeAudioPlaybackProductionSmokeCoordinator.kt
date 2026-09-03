@@ -6,6 +6,7 @@ import android.media.AudioTrack
 import android.os.Handler
 import android.os.SystemClock
 import android.util.Log
+import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackClockCorrelation
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackSession
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackSinkBridge
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackDecoderFeed
@@ -121,8 +122,10 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 "presentation_clock_query_surface_off_thread_current_position_poller_monotonic_" +
                 "current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_" +
                 "position_query_lifecycle_pause_seek_dead_object_teardown_" +
+                "native_clock_correlation_observation_no_feedback_" +
                 "stop_dispose_release_once_" +
-                "no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni"
+                "no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_" +
+                "no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback"
 
         const val SCENARIO_PLAYTHROUGH = "PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS"
         const val SCENARIO_STOP_DISPOSE = "STOP_DISPOSE_MID_PLAYBACK"
@@ -215,6 +218,10 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_POSITION_QUERY_SEEK_BASE_ADVANCE = "positionQuerySeekBaseAdvanceOk"
         const val LANE_POSITION_QUERY_REPEATED_SEEK_BASE_ADVANCE = "positionQueryRepeatedSeekBaseAdvanceOk"
         const val LANE_POSITION_QUERY_POST_TEARDOWN_LATCHED = "positionQueryPostTeardownLatchedOk"
+        // Y15 lanes, evaluated by the clock correlation observation.
+        const val LANE_NATIVE_AUDIO_CLOCK_SNAPSHOT_PUBLISHED = "nativeAudioClockSnapshotPublishedOk"
+        const val LANE_CLOCK_CORRELATION_TELEMETRY = "clockCorrelationTelemetryOk"
+        const val LANE_CLOCK_OBSERVATION_NO_FEEDBACK = "clockObservationNoFeedbackOk"
         const val LANE_CANONICAL = "canonical"
 
         val REQUIRED_LANES: List<String> = listOf(
@@ -239,6 +246,9 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_POSITION_QUERY_PAUSE_HOLD_FROZEN, LANE_POSITION_QUERY_DEAD_OBJECT_REBASE,
             LANE_POSITION_QUERY_SEEK_BASE_ADVANCE, LANE_POSITION_QUERY_REPEATED_SEEK_BASE_ADVANCE,
             LANE_POSITION_QUERY_POST_TEARDOWN_LATCHED,
+            LANE_NATIVE_AUDIO_CLOCK_SNAPSHOT_PUBLISHED,
+            LANE_CLOCK_CORRELATION_TELEMETRY,
+            LANE_CLOCK_OBSERVATION_NO_FEEDBACK,
         )
 
         val PROOF_BOUNDARY_TOKENS = listOf(
@@ -264,9 +274,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "current_position_read_counter_isolation", "epoch_relative_presentation_lag_bounded",
             "position_at_eos_no_runaway",
             "position_query_lifecycle_pause_seek_dead_object_teardown",
+            "native_clock_correlation_observation_no_feedback",
             "stop_dispose_release_once",
             "no_product", "no_editor", "no_app", "no_connectsapp", "no_ios",
-            "no_streaming", "no_cache", "no_cpp", "no_jni",
+            "no_streaming", "no_cache", "no_audio_clock_mutator_changes",
+            "no_clock_feedback_no_pacing_feedback",
         )
 
         private const val FAILURE_SOURCE_PATH_REQUIRED = "source_path_required"
@@ -1341,6 +1353,10 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         }
         require(completionReached, "completion_not_reached:${session.failureReason}")
 
+        val commandsBefore = session.snapshot().commandsIssued
+        val correlation = session.observeClockCorrelation()
+        val commandsAfter = session.snapshot().commandsIssued
+
         val stateAtCompletion = session.currentState
         val stopRes = session.stop()
         require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
@@ -1354,6 +1370,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluatePresentationClockQuerySurface(
             final, pollerMetrics, stateAtCompletion, config, out,
             postTeardownFrames, postTeardownUs,
+            correlation, commandsBefore, commandsAfter,
         )
     }
 
@@ -1660,7 +1677,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "proofBoundary" to PROOF_BOUNDARY,
             "nativeProofBoundary" to PROOF_BOUNDARY,
             "failureReason" to reason,
-            "details" to "Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock/position-query-lifecycle smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
+            "details" to "Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14/Y15 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
             "lanes" to lanes,
             "metrics" to metricMap,
             "lastError" to if (pass) null else reason,

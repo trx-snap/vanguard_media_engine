@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "vanguard/audio/audio_clock.h"
 #include "vanguard/audio/audio_mix_bus_node.h"
 #include "vanguard/audio/decoded_audio_pcm_source_node.h"
 #include "vanguard/graph/graph.h"
@@ -62,6 +63,19 @@ inline const char* NativeStateToken(NativeState s) {
         case NativeState::kPaused:   return "paused";
         case NativeState::kStopped:  return "stopped";
         case NativeState::kFailed:   return "failed";
+    }
+    return "unknown";
+}
+
+// Y15a (P4-AUDIO-REALTIME-PLAYBACK-CLOCK-CORRELATION-OBSERVATION): token
+// for the worker-owned AudioClock's own State, distinct from NativeState
+// above. "none" (not a member of AudioClock::State) is reserved by the
+// caller for "no AudioClock instance exists yet/anymore".
+inline const char* AudioClockStateToken(vanguard::audio::AudioClock::State s) {
+    switch (s) {
+        case vanguard::audio::AudioClock::State::kStopped: return "stopped";
+        case vanguard::audio::AudioClock::State::kPlaying: return "playing";
+        case vanguard::audio::AudioClock::State::kPaused:  return "paused";
     }
     return "unknown";
 }
@@ -202,6 +216,21 @@ struct PublishedState {
     const char* lastCommandResult{"none"};
     const char* lastError{"none"};
     uint64_t    pushedChecksum{0};
+    // Y15a: read-only mirror of the worker-owned AudioClock, refreshed by
+    // the worker alongside the rest of this struct. Publication only: never
+    // consulted by dispatch/pacing (see dispatchPlaying's own posUs read),
+    // never mutated from Kotlin. "none"/0 defaults apply whenever no
+    // AudioClock instance currently exists (idle/stopped/failed-before-
+    // prepare).
+    const char* nativeClockState{"none"};
+    int64_t     nativeClockPositionUs{0};
+    int64_t     nativeClockPositionFrame{0};
+    int64_t     nativeClockAnchorMediaPtsUs{0};
+    int64_t     nativeClockAnchorSystemTimeNs{0};
+    int32_t     nativeClockSpeedNumerator{1};
+    int32_t     nativeClockSpeedDenominator{1};
+    uint64_t    nativeClockDriftSampleCount{0};
+    int64_t     nativeClockLastDriftDeltaUs{0};
 };
 
 inline std::vector<std::shared_ptr<vanguard::audio::DecodedAudioPcmSourceNode>> MakeSources(

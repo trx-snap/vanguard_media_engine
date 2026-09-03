@@ -12,7 +12,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
 const _kCanonicalProofBoundary =
-    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
+    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback';
 
 const _kPassMarker =
     'ANDROID_DAG_PHASE4_REALTIME_AUDIO_PLAYBACK_PRODUCTION_PHYSICAL_SMOKE_PASS';
@@ -78,6 +78,9 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'positionQuerySeekBaseAdvanceOk': true,
     'positionQueryRepeatedSeekBaseAdvanceOk': true,
     'positionQueryPostTeardownLatchedOk': true,
+    'nativeAudioClockSnapshotPublishedOk': true,
+    'clockCorrelationTelemetryOk': true,
+    'clockObservationNoFeedbackOk': true,
     'canonical': true,
   };
 
@@ -241,6 +244,17 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'afterSeek3QueryUs': 2000000,
     'postTeardownCurrentPositionFrames': 144000,
     'postTeardownCurrentPositionUs': 3000000,
+    'nativeClockState': 'running',
+    'nativeClockPositionUs': 2916666,
+    'nativeClockPositionFrame': 140000,
+    'nativeDriftSampleCount': 10,
+    'nativeClockDriftSampleCount': 10,
+    'presentationClockPositionUsAtCorrelation': 2916666,
+    'presentationClockPositionFramesAtCorrelation': 140000,
+    'clockCorrelationOffsetUs': 0,
+    'clockCorrelationOffsetFrames': 0,
+    'clockCorrelationCommandsBefore': 3,
+    'clockCorrelationCommandsAfter': 3,
     'failureReason': '',
     'lastError': 'none',
   };
@@ -253,7 +267,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'nativeProofBoundary': _kCanonicalProofBoundary,
     'failureReason': '',
     'details':
-        'Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock/position-query-lifecycle smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS,SCENARIO_FORWARD_SEEK_TO_EOS,SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS,SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY,SCENARIO_FOCUS_PERMANENT_LOSS,SCENARIO_ROUTE_CHANGE_OBSERVATION,SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE,SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED,SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE',
+        'Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14/Y15 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock/position-query-lifecycle/native-clock-correlation smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS,SCENARIO_FORWARD_SEEK_TO_EOS,SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS,SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY,SCENARIO_FOCUS_PERMANENT_LOSS,SCENARIO_ROUTE_CHANGE_OBSERVATION,SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE,SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED,SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE',
     'lanes': lanes,
     'metrics': metrics,
     'lastError': null,
@@ -322,11 +336,11 @@ void main() {
         VGRealtimeAudioPlaybackProductionSmokeReport
             .requiredNonCanonicalLanes
             .length,
-        equals(53),
+        equals(56),
       );
       expect(
         VGRealtimeAudioPlaybackProductionSmokeReport.requiredLanes.length,
-        equals(54),
+        equals(57),
       );
 
       final expectedLanes = <String>[
@@ -383,6 +397,9 @@ void main() {
         'positionQuerySeekBaseAdvanceOk',
         'positionQueryRepeatedSeekBaseAdvanceOk',
         'positionQueryPostTeardownLatchedOk',
+        'nativeAudioClockSnapshotPublishedOk',
+        'clockCorrelationTelemetryOk',
+        'clockObservationNoFeedbackOk',
         'canonical',
       ];
 
@@ -462,6 +479,22 @@ void main() {
       expect(report.positionQuerySeekBaseAdvanceOk, isTrue);
       expect(report.positionQueryRepeatedSeekBaseAdvanceOk, isTrue);
       expect(report.positionQueryPostTeardownLatchedOk, isTrue);
+      expect(report.nativeAudioClockSnapshotPublishedOk, isTrue);
+      expect(report.clockCorrelationTelemetryOk, isTrue);
+      expect(report.clockObservationNoFeedbackOk, isTrue);
+      expect(report.nativeClockState, equals('running'));
+      expect(report.nativeClockPositionUs, equals(2916666));
+      expect(report.nativeClockPositionFrame, equals(140000));
+      expect(report.nativeClockDriftSampleCount, equals(10));
+      expect(report.presentationClockPositionUsAtCorrelation, equals(2916666));
+      expect(
+        report.presentationClockPositionFramesAtCorrelation,
+        equals(140000),
+      );
+      expect(report.clockCorrelationOffsetUs, equals(0));
+      expect(report.clockCorrelationOffsetFrames, equals(0));
+      expect(report.clockCorrelationCommandsBefore, equals(3));
+      expect(report.clockCorrelationCommandsAfter, equals(3));
       expect(report.pauseStartQueryFrames, equals(19200));
       expect(report.pauseStartQueryUs, equals(400000));
       expect(report.pauseEndQueryFrames, equals(19200));
@@ -1196,6 +1229,139 @@ void main() {
       final report = _createSampleReport();
       expect(report.details.contains('position-query-lifecycle'), isTrue);
     });
+
+    test('report details contains Y15 native-clock-correlation metadata', () {
+      final report = _createSampleReport();
+      expect(report.details.contains('native-clock-correlation'), isTrue);
+      expect(report.details.contains('Y15'), isTrue);
+    });
+
+    test('missing one new required Y15 lane fails isVerifiedPass', () {
+      for (final lane in <String>[
+        'nativeAudioClockSnapshotPublishedOk',
+        'clockCorrelationTelemetryOk',
+        'clockObservationNoFeedbackOk',
+      ]) {
+        final raw = _createSampleRawMap();
+        final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
+        lanes.remove(lane);
+        raw['lanes'] = lanes;
+        if (raw['metrics'] is Map) {
+          final metrics = Map<String, Object?>.from(raw['metrics'] as Map);
+          metrics.remove(lane);
+          raw['metrics'] = metrics;
+        }
+        raw.remove(lane);
+
+        final report = VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(
+          raw,
+        );
+        expect(report.pass, isFalse);
+        expect(report.isVerifiedPass, isFalse);
+        expect(report.marker, equals(_kFailMarker));
+        expect(report.status, equals('missing_lane'));
+        expect(report.lastError, equals('missing_lane_$lane'));
+      }
+    });
+
+    test(
+      'new Y15 clock correlation metric keys parse and are present in metrics map',
+      () {
+        final report = _createSampleReport();
+        expect(report.metrics.containsKey('nativeClockState'), isTrue);
+        expect(report.metrics['nativeClockState'], equals('running'));
+        expect(report.metrics.containsKey('nativeClockPositionUs'), isTrue);
+        expect(report.metrics['nativeClockPositionUs'], equals(2916666));
+        expect(report.metrics.containsKey('nativeClockPositionFrame'), isTrue);
+        expect(report.metrics['nativeClockPositionFrame'], equals(140000));
+        expect(
+          report.metrics.containsKey('nativeClockDriftSampleCount'),
+          isTrue,
+        );
+        expect(report.metrics['nativeClockDriftSampleCount'], equals(10));
+        expect(
+          report.metrics.containsKey(
+            'presentationClockPositionUsAtCorrelation',
+          ),
+          isTrue,
+        );
+        expect(
+          report.metrics['presentationClockPositionUsAtCorrelation'],
+          equals(2916666),
+        );
+        expect(
+          report.metrics.containsKey(
+            'presentationClockPositionFramesAtCorrelation',
+          ),
+          isTrue,
+        );
+        expect(
+          report.metrics['presentationClockPositionFramesAtCorrelation'],
+          equals(140000),
+        );
+        expect(report.metrics.containsKey('clockCorrelationOffsetUs'), isTrue);
+        expect(report.metrics['clockCorrelationOffsetUs'], equals(0));
+        expect(
+          report.metrics.containsKey('clockCorrelationOffsetFrames'),
+          isTrue,
+        );
+        expect(report.metrics['clockCorrelationOffsetFrames'], equals(0));
+        expect(
+          report.metrics.containsKey('clockCorrelationCommandsBefore'),
+          isTrue,
+        );
+        expect(report.metrics['clockCorrelationCommandsBefore'], equals(3));
+        expect(
+          report.metrics.containsKey('clockCorrelationCommandsAfter'),
+          isTrue,
+        );
+        expect(report.metrics['clockCorrelationCommandsAfter'], equals(3));
+      },
+    );
+
+    test('new Y15 clock correlation getters return expected values', () {
+      final report = _createSampleReport();
+      expect(report.nativeAudioClockSnapshotPublishedOk, isTrue);
+      expect(report.clockCorrelationTelemetryOk, isTrue);
+      expect(report.clockObservationNoFeedbackOk, isTrue);
+
+      expect(report.nativeClockState, equals('running'));
+      expect(report.nativeClockPositionUs, equals(2916666));
+      expect(report.nativeClockPositionFrame, equals(140000));
+      expect(report.nativeClockDriftSampleCount, equals(10));
+      expect(report.presentationClockPositionUsAtCorrelation, equals(2916666));
+      expect(
+        report.presentationClockPositionFramesAtCorrelation,
+        equals(140000),
+      );
+      expect(report.clockCorrelationOffsetUs, equals(0));
+      expect(report.clockCorrelationOffsetFrames, equals(0));
+      expect(report.clockCorrelationCommandsBefore, equals(3));
+      expect(report.clockCorrelationCommandsAfter, equals(3));
+    });
+
+    test(
+      'new Y15 clock correlation getters default fail-closed on empty metrics',
+      () {
+        final report = VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(
+          <String, Object?>{},
+        );
+        expect(report.nativeAudioClockSnapshotPublishedOk, isFalse);
+        expect(report.clockCorrelationTelemetryOk, isFalse);
+        expect(report.clockObservationNoFeedbackOk, isFalse);
+
+        expect(report.nativeClockState, equals(''));
+        expect(report.nativeClockPositionUs, equals(-1));
+        expect(report.nativeClockPositionFrame, equals(-1));
+        expect(report.nativeClockDriftSampleCount, equals(-1));
+        expect(report.presentationClockPositionUsAtCorrelation, equals(-1));
+        expect(report.presentationClockPositionFramesAtCorrelation, equals(-1));
+        expect(report.clockCorrelationOffsetUs, equals(-1));
+        expect(report.clockCorrelationOffsetFrames, equals(-1));
+        expect(report.clockCorrelationCommandsBefore, equals(-1));
+        expect(report.clockCorrelationCommandsAfter, equals(-1));
+      },
+    );
 
     test('fail map with deadObjectBaseStepBounded=false fails validation', () {
       final report = _createSampleReport(<String, Object?>{

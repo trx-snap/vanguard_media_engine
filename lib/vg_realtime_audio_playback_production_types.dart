@@ -4,14 +4,17 @@
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK (Y9) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b) +
-// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE (Y12): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, and route-change diagnostic smoke foundation.
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE (Y12) +
+// P4-AUDIO-REALTIME-PLAYBACK-PRESENTATION-CLOCK-QUERY-SURFACE (Y13) +
+// P4-AUDIO-REALTIME-PLAYBACK-POSITION-QUERY-LIFECYCLE-CONTRACT (Y14) +
+// P4-AUDIO-REALTIME-PLAYBACK-CLOCK-CORRELATION-OBSERVATION (Y15): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, and clock correlation diagnostic smoke foundation.
 //
 // Pure Dart typed model + invocation wrapper over the native
 // `runRealtimeAudioPlaybackProductionSmoke` MethodChannel route.
 // Diagnostic-only - drives the production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
-// sink-thread-owned non-zero-gain AudioTrack + presentation clock) through ten
+// sink-thread-owned non-zero-gain AudioTrack + presentation clock) through eleven
 // scenarios:
 //   1. Playthrough + bounded pause/resume to EOS.
 //   2. Mid-playback stop/dispose verifying clean release.
@@ -23,8 +26,9 @@
 //   8. Route change observation without transport mutation (independently bounded; no disconnect posted).
 //   9. Route disconnect terminal pause, public resume blocked, and routing teardown (independently bounded, fresh PLAYING session).
 //  10. Route disconnect while paused by focus policy: public resume blocked and focus auto-resume blocked.
+//  11. Presentation clock query surface with off-thread poller to EOS, clock correlation observation, and post-teardown latched read.
 //
-// Required proof lanes (42 native lanes plus canonical equals 43 total lanes):
+// Required proof lanes (56 native lanes plus canonical equals 57 total lanes):
 //   1. formatProbeOk: format, duration, channel count, sample rate, and MIME probed successfully
 //   2. preRollOk: pre-roll while PREPARED until ring_full or declared end fits
 //   3. startOk: session and transport transition to PLAYING accepted cleanly
@@ -67,10 +71,24 @@
 //  40. routeDisconnectTerminalPauseOk: route disconnect triggers terminal pause with AudioTrack paused at park
 //  41. routeDisconnectResumeBlockedOk: public resume rejected and subsequent focus gain does not auto-resume
 //  42. routingMonitorTeardownOk: routing controller released, monitor thread exited and joined cleanly
+//  43. currentPositionQuerySurfaceOk: currentPosition queried across thread boundaries without mutation
+//  44. currentPositionPollerMonotonicOk: off-thread poller position reads monotonic without regression
+//  45. currentPositionReadCounterIsolationOk: currentPosition read counters isolated between writer and other threads
+//  46. presentationLagTelemetryOk: presentation lag telemetry captured with valid bounds and samples
+//  47. presentationLagBoundedOk: presentation lag samples remain strictly within analytical bounds
+//  48. positionAtEosNoRunawayOk: position at EOS non-negative and bounded without runaway
+//  49. positionQueryPauseHoldFrozenOk: position query frozen and non-regressing during bounded pause hold
+//  50. positionQueryDeadObjectRebaseOk: position query rebased monotonically across dead-object recovery
+//  51. positionQuerySeekBaseAdvanceOk: position query advanced at or beyond target after forward seek
+//  52. positionQueryRepeatedSeekBaseAdvanceOk: position query advanced across repeated seeks without regression
+//  53. positionQueryPostTeardownLatchedOk: position query read post-stop/dispose latched cleanly
+//  54. nativeAudioClockSnapshotPublishedOk: native audio clock snapshot published with non-blank state and non-negative positions
+//  55. clockCorrelationTelemetryOk: presentation clock snapshot consistent and correlation offset telemetry present
+//  56. clockObservationNoFeedbackOk: clock correlation observation executed without feedback or transport mutation
 //  (canonical: aggregate pass evaluation holding across all required lanes)
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback
 //
 // Honest operational non-claims:
 //   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
@@ -163,6 +181,9 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     required this.positionQuerySeekBaseAdvanceOk,
     required this.positionQueryRepeatedSeekBaseAdvanceOk,
     required this.positionQueryPostTeardownLatchedOk,
+    required this.nativeAudioClockSnapshotPublishedOk,
+    required this.clockCorrelationTelemetryOk,
+    required this.clockObservationNoFeedbackOk,
     required this.canonical,
     required this.lanes,
     required this.metrics,
@@ -191,7 +212,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
 
   /// Canonical proof boundary string emitted by the native harness.
   static const String proofBoundaryConstant =
-      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
+      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback';
 
   /// All required non-canonical native lane keys that must be evaluated and true.
   static const List<String> requiredNonCanonicalLanes = <String>[
@@ -248,6 +269,9 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     'positionQuerySeekBaseAdvanceOk',
     'positionQueryRepeatedSeekBaseAdvanceOk',
     'positionQueryPostTeardownLatchedOk',
+    'nativeAudioClockSnapshotPublishedOk',
+    'clockCorrelationTelemetryOk',
+    'clockObservationNoFeedbackOk',
   ];
 
   /// All required native lane keys including canonical.
@@ -438,6 +462,15 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Whether position query read post-stop/dispose latched cleanly and remained >= final clock envelope.
   final bool positionQueryPostTeardownLatchedOk;
 
+  /// Whether native audio clock snapshot was published with valid state and non-negative positions.
+  final bool nativeAudioClockSnapshotPublishedOk;
+
+  /// Whether clock correlation telemetry was captured with consistent presentation clock and offset telemetry.
+  final bool clockCorrelationTelemetryOk;
+
+  /// Whether clock correlation observation executed without feedback or transport command mutation.
+  final bool clockObservationNoFeedbackOk;
+
   /// Canonical pass indicator.
   final bool canonical;
 
@@ -521,7 +554,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       positionQueryDeadObjectRebaseOk &&
       positionQuerySeekBaseAdvanceOk &&
       positionQueryRepeatedSeekBaseAdvanceOk &&
-      positionQueryPostTeardownLatchedOk;
+      positionQueryPostTeardownLatchedOk &&
+      nativeAudioClockSnapshotPublishedOk &&
+      clockCorrelationTelemetryOk &&
+      clockObservationNoFeedbackOk;
 
   /// Whether this report meets all verification criteria for a passing smoke run.
   bool get isVerifiedPass =>
@@ -599,6 +635,9 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         positionQuerySeekBaseAdvanceOk: false,
         positionQueryRepeatedSeekBaseAdvanceOk: false,
         positionQueryPostTeardownLatchedOk: false,
+        nativeAudioClockSnapshotPublishedOk: false,
+        clockCorrelationTelemetryOk: false,
+        clockObservationNoFeedbackOk: false,
         canonical: false,
         lanes: <String, Object?>{
           'status': 'FAIL',
@@ -771,6 +810,15 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     final positionQueryPostTeardownLatchedOk = parseBool(
       'positionQueryPostTeardownLatchedOk',
     );
+    final nativeAudioClockSnapshotPublishedOk = parseBool(
+      'nativeAudioClockSnapshotPublishedOk',
+    );
+    final clockCorrelationTelemetryOk = parseBool(
+      'clockCorrelationTelemetryOk',
+    );
+    final clockObservationNoFeedbackOk = parseBool(
+      'clockObservationNoFeedbackOk',
+    );
     final canonical = parseBool('canonical', rawPass && missingLanes.isEmpty);
 
     final hasValidProofBoundary =
@@ -832,7 +880,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         positionQueryDeadObjectRebaseOk &&
         positionQuerySeekBaseAdvanceOk &&
         positionQueryRepeatedSeekBaseAdvanceOk &&
-        positionQueryPostTeardownLatchedOk;
+        positionQueryPostTeardownLatchedOk &&
+        nativeAudioClockSnapshotPublishedOk &&
+        clockCorrelationTelemetryOk &&
+        clockObservationNoFeedbackOk;
 
     final allRequiredLanesPresent = missingLanes.isEmpty;
     final explicitLastError = parseString('lastError');
@@ -948,6 +999,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'positionQueryRepeatedSeekBaseAdvanceOk':
           positionQueryRepeatedSeekBaseAdvanceOk,
       'positionQueryPostTeardownLatchedOk': positionQueryPostTeardownLatchedOk,
+      'nativeAudioClockSnapshotPublishedOk':
+          nativeAudioClockSnapshotPublishedOk,
+      'clockCorrelationTelemetryOk': clockCorrelationTelemetryOk,
+      'clockObservationNoFeedbackOk': clockObservationNoFeedbackOk,
       'canonical': canonical,
       ...parsedLanes,
     };
@@ -1015,6 +1070,9 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       positionQueryRepeatedSeekBaseAdvanceOk:
           positionQueryRepeatedSeekBaseAdvanceOk,
       positionQueryPostTeardownLatchedOk: positionQueryPostTeardownLatchedOk,
+      nativeAudioClockSnapshotPublishedOk: nativeAudioClockSnapshotPublishedOk,
+      clockCorrelationTelemetryOk: clockCorrelationTelemetryOk,
+      clockObservationNoFeedbackOk: clockObservationNoFeedbackOk,
       canonical: canonical,
       lanes: Map<String, Object?>.unmodifiable(finalLanes),
       metrics: Map<String, Object?>.unmodifiable(parsedMetrics),
@@ -1118,6 +1176,9 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       positionQuerySeekBaseAdvanceOk: false,
       positionQueryRepeatedSeekBaseAdvanceOk: false,
       positionQueryPostTeardownLatchedOk: false,
+      nativeAudioClockSnapshotPublishedOk: false,
+      clockCorrelationTelemetryOk: false,
+      clockObservationNoFeedbackOk: false,
       canonical: false,
       lanes: Map<String, Object?>.unmodifiable(lanes),
       metrics: Map<String, Object?>.unmodifiable(metrics),
@@ -1281,6 +1342,10 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
             positionQueryRepeatedSeekBaseAdvanceOk &&
         other.positionQueryPostTeardownLatchedOk ==
             positionQueryPostTeardownLatchedOk &&
+        other.nativeAudioClockSnapshotPublishedOk ==
+            nativeAudioClockSnapshotPublishedOk &&
+        other.clockCorrelationTelemetryOk == clockCorrelationTelemetryOk &&
+        other.clockObservationNoFeedbackOk == clockObservationNoFeedbackOk &&
         other.canonical == canonical &&
         other.lastError == lastError;
   }
@@ -1347,6 +1412,9 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     positionQuerySeekBaseAdvanceOk,
     positionQueryRepeatedSeekBaseAdvanceOk,
     positionQueryPostTeardownLatchedOk,
+    nativeAudioClockSnapshotPublishedOk,
+    clockCorrelationTelemetryOk,
+    clockObservationNoFeedbackOk,
     canonical,
   ]);
 
@@ -1394,6 +1462,9 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'positionQuerySeekBaseAdvanceOk: $positionQuerySeekBaseAdvanceOk, '
       'positionQueryRepeatedSeekBaseAdvanceOk: $positionQueryRepeatedSeekBaseAdvanceOk, '
       'positionQueryPostTeardownLatchedOk: $positionQueryPostTeardownLatchedOk, '
+      'nativeAudioClockSnapshotPublishedOk: $nativeAudioClockSnapshotPublishedOk, '
+      'clockCorrelationTelemetryOk: $clockCorrelationTelemetryOk, '
+      'clockObservationNoFeedbackOk: $clockObservationNoFeedbackOk, '
       'canonical: $canonical, '
       'failureReason: $failureReason, lastError: $lastError)';
 
@@ -1679,4 +1750,96 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Post-teardown latched currentPositionUs read.
   int get postTeardownCurrentPositionUs =>
       (metrics['postTeardownCurrentPositionUs'] as num?)?.toInt() ?? -1;
+
+  // ---- Native Clock Correlation Observation Getters (Y15) ------------------
+
+  /// Native audio clock state token from correlation observation.
+  String get nativeClockState =>
+      metrics['nativeClockState']?.toString() ??
+      (metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+              as Map?)?['nativeClockState']
+          ?.toString() ??
+      '';
+
+  /// Native audio clock position in microseconds at correlation observation.
+  int get nativeClockPositionUs =>
+      (metrics['nativeClockPositionUs'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['nativeClockPositionUs']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Native audio clock position in frames at correlation observation.
+  int get nativeClockPositionFrame =>
+      (metrics['nativeClockPositionFrame'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['nativeClockPositionFrame']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Native clock drift sample count at correlation observation.
+  int get nativeClockDriftSampleCount =>
+      (metrics['nativeClockDriftSampleCount'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['nativeClockDriftSampleCount']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Presentation clock position in microseconds at correlation observation.
+  int get presentationClockPositionUsAtCorrelation =>
+      (metrics['presentationClockPositionUsAtCorrelation'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['presentationClockPositionUsAtCorrelation']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Presentation clock position in frames at correlation observation.
+  int get presentationClockPositionFramesAtCorrelation =>
+      (metrics['presentationClockPositionFramesAtCorrelation'] as num?)
+          ?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['presentationClockPositionFramesAtCorrelation']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Clock correlation offset in microseconds (presentationUs - nativeUs).
+  int get clockCorrelationOffsetUs =>
+      (metrics['clockCorrelationOffsetUs'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['clockCorrelationOffsetUs']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Clock correlation offset in frames (presentationFrames - nativeFrames).
+  int get clockCorrelationOffsetFrames =>
+      (metrics['clockCorrelationOffsetFrames'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['clockCorrelationOffsetFrames']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Session commandsIssued count immediately before observeClockCorrelation.
+  int get clockCorrelationCommandsBefore =>
+      (metrics['clockCorrelationCommandsBefore'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['clockCorrelationCommandsBefore']
+              as num?)
+          ?.toInt() ??
+      -1;
+
+  /// Session commandsIssued count immediately after observeClockCorrelation.
+  int get clockCorrelationCommandsAfter =>
+      (metrics['clockCorrelationCommandsAfter'] as num?)?.toInt() ??
+      ((metrics['SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE']
+                  as Map?)?['clockCorrelationCommandsAfter']
+              as num?)
+          ?.toInt() ??
+      -1;
 }

@@ -151,7 +151,7 @@ constexpr int64_t kMaxRingCapacityFrames = AudioSpscAudioRingBuffer::kMaxCapacit
 constexpr int     kMaxDispatchesPerWake  = 8;
 constexpr int64_t kMaxWaitNs             = 5'000'000LL;      // 5ms cv clamp
 constexpr int64_t kCommandAckTimeoutMs   = 1'000LL;          // owner-side bounded ack wait
-constexpr size_t  kReplyCapacity         = 1536;
+constexpr size_t  kReplyCapacity         = 2048; // Y15a: widened for nativeClock* telemetry
 constexpr int64_t kMaxIngestFrames       = kMaxWriteFrames;                                    // 8192
 
 // ---------------------------------------------------------------------------
@@ -368,6 +368,36 @@ private:
             ps.lastCommandResult = lastResult;
             ps.lastError         = lastError;
             ps.pushedChecksum    = pushedChecksum;
+            // Y15a: read-only native AudioClock telemetry refresh. Worker
+            // thread only (sole AudioClock mutator/steady-clock reader);
+            // this is an EXTRA, independent currentPositionUs() read purely
+            // for publication and never feeds dispatchPlaying's own posUs
+            // (computed separately there for pacing). Safe defaults when no
+            // clock instance currently exists.
+            if (clock) {
+                const AudioClock::Snapshot cs = clock->snapshot();
+                const int64_t clockPosUs = clock->currentPositionUs(SteadyNowNs());
+                ps.nativeClockState              = AudioClockStateToken(cs.state);
+                ps.nativeClockPositionUs         = clockPosUs;
+                ps.nativeClockPositionFrame      =
+                    ClockedAudioTransportCoordinator::frameOfPositionUs(clockPosUs, sampleRate);
+                ps.nativeClockAnchorMediaPtsUs   = cs.anchorMediaPtsUs;
+                ps.nativeClockAnchorSystemTimeNs = cs.anchorSystemTimeNs;
+                ps.nativeClockSpeedNumerator     = cs.speedNumerator;
+                ps.nativeClockSpeedDenominator   = cs.speedDenominator;
+                ps.nativeClockDriftSampleCount   = cs.driftSampleCount;
+                ps.nativeClockLastDriftDeltaUs   = cs.lastDriftDeltaUs;
+            } else {
+                ps.nativeClockState              = "none";
+                ps.nativeClockPositionUs         = 0;
+                ps.nativeClockPositionFrame      = 0;
+                ps.nativeClockAnchorMediaPtsUs   = 0;
+                ps.nativeClockAnchorSystemTimeNs = 0;
+                ps.nativeClockSpeedNumerator     = 1;
+                ps.nativeClockSpeedDenominator   = 1;
+                ps.nativeClockDriftSampleCount   = 0;
+                ps.nativeClockLastDriftDeltaUs   = 0;
+            }
         };
 
         auto fail = [&](const char* token) {
@@ -789,6 +819,22 @@ jstring ReplyFull(JNIEnv* env, RealtimePlaybackGraphSession& s, const char* stat
         static_cast<long long>(ingest.acceptedFrames),
         static_cast<long long>(ingest.nextWriteFrame),
         static_cast<long long>(ingest.freeFrames));
+    // Y15a: read-only native AudioClock telemetry, appended as its own
+    // segment so the primary reply shape above stays untouched.
+    out.appendf(
+        ";nativeClockState=%s;nativeClockPositionUs=%lld;nativeClockPositionFrame=%lld;"
+        "nativeClockAnchorMediaPtsUs=%lld;nativeClockAnchorSystemTimeNs=%lld;"
+        "nativeClockSpeedNumerator=%d;nativeClockSpeedDenominator=%d;"
+        "nativeClockDriftSampleCount=%llu;nativeClockLastDriftDeltaUs=%lld",
+        ps.nativeClockState,
+        static_cast<long long>(ps.nativeClockPositionUs),
+        static_cast<long long>(ps.nativeClockPositionFrame),
+        static_cast<long long>(ps.nativeClockAnchorMediaPtsUs),
+        static_cast<long long>(ps.nativeClockAnchorSystemTimeNs),
+        static_cast<int>(ps.nativeClockSpeedNumerator),
+        static_cast<int>(ps.nativeClockSpeedDenominator),
+        static_cast<unsigned long long>(ps.nativeClockDriftSampleCount),
+        static_cast<long long>(ps.nativeClockLastDriftDeltaUs));
     if (out.overflowed()) {
         std::snprintf(buf, sizeof(buf), "status=reply_overflow;state=unknown;handle=%lld",
                       static_cast<long long>(s.handle));

@@ -6,15 +6,16 @@
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE (Y12) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRESENTATION-CLOCK-QUERY-SURFACE (Y13) +
-// P4-AUDIO-REALTIME-PLAYBACK-POSITION-QUERY-LIFECYCLE-CONTRACT (Y14): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, and position query lifecycle diagnostic physical smoke target.
+// P4-AUDIO-REALTIME-PLAYBACK-POSITION-QUERY-LIFECYCLE-CONTRACT (Y14) +
+// P4-AUDIO-REALTIME-PLAYBACK-CLOCK-CORRELATION-OBSERVATION (Y15): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, position query lifecycle, and clock correlation diagnostic physical smoke target.
 //
 // Component diagnostic smoke: drives production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
 // sink-thread-owned non-zero-gain AudioTrack + presentation clock).
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_native_clock_correlation_observation_no_feedback_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_audio_clock_mutator_changes_no_clock_feedback_no_pacing_feedback
 //
 // Honest operational non-claims:
 //   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
@@ -30,7 +31,7 @@
 //     requiring real OS bluetooth or headphone events during headless diagnostic runs.
 //
 // This is a component diagnostic smoke. It must not claim
-// product/editor/UI/ConnectsApp/iOS/streaming/cache/CPP/JNI proof.
+// product/editor/UI/ConnectsApp/iOS/streaming/cache/audio clock mutator changes/clock feedback proof.
 
 // ignore_for_file: avoid_print
 
@@ -320,6 +321,15 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     );
     print(
       '  [LANE] positionQueryPostTeardownLatchedOk: ${activeReport.positionQueryPostTeardownLatchedOk}',
+    );
+    print(
+      '  [LANE] nativeAudioClockSnapshotPublishedOk: ${activeReport.nativeAudioClockSnapshotPublishedOk}',
+    );
+    print(
+      '  [LANE] clockCorrelationTelemetryOk: ${activeReport.clockCorrelationTelemetryOk}',
+    );
+    print(
+      '  [LANE] clockObservationNoFeedbackOk: ${activeReport.clockObservationNoFeedbackOk}',
     );
     print('  [LANE] canonical: ${activeReport.canonical}');
 
@@ -612,6 +622,16 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       'positionAtEosUs',
       'currentPositionReadsFromWriterThread',
       'currentPositionReadsFromOtherThreads',
+      'nativeClockState',
+      'nativeClockPositionUs',
+      'nativeClockPositionFrame',
+      'nativeClockDriftSampleCount',
+      'presentationClockPositionUsAtCorrelation',
+      'presentationClockPositionFramesAtCorrelation',
+      'clockCorrelationOffsetUs',
+      'clockCorrelationOffsetFrames',
+      'clockCorrelationCommandsBefore',
+      'clockCorrelationCommandsAfter',
     };
 
     bool isPresentationClockOwnedMetric(String key) {
@@ -1043,6 +1063,16 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       'currentPositionReadsFromOtherThreads',
       'postTeardownCurrentPositionFrames',
       'postTeardownCurrentPositionUs',
+      'nativeClockState',
+      'nativeClockPositionUs',
+      'nativeClockPositionFrame',
+      'nativeClockDriftSampleCount',
+      'presentationClockPositionUsAtCorrelation',
+      'presentationClockPositionFramesAtCorrelation',
+      'clockCorrelationOffsetUs',
+      'clockCorrelationOffsetFrames',
+      'clockCorrelationCommandsBefore',
+      'clockCorrelationCommandsAfter',
       'scenarioWallMs',
       'failureReason',
     ];
@@ -1247,6 +1277,34 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print(
       '  [METRIC] routingTerminalDisconnectAfterGain: ${lookupMetric('routingTerminalDisconnectAfterGain')}',
     );
+    print('  [METRIC] nativeClockState: ${lookupMetric('nativeClockState')}');
+    print(
+      '  [METRIC] nativeClockPositionUs: ${lookupMetric('nativeClockPositionUs')}',
+    );
+    print(
+      '  [METRIC] nativeClockPositionFrame: ${lookupMetric('nativeClockPositionFrame')}',
+    );
+    print(
+      '  [METRIC] nativeClockDriftSampleCount: ${lookupMetric('nativeClockDriftSampleCount')}',
+    );
+    print(
+      '  [METRIC] presentationClockPositionUsAtCorrelation: ${lookupMetric('presentationClockPositionUsAtCorrelation')}',
+    );
+    print(
+      '  [METRIC] presentationClockPositionFramesAtCorrelation: ${lookupMetric('presentationClockPositionFramesAtCorrelation')}',
+    );
+    print(
+      '  [METRIC] clockCorrelationOffsetUs: ${lookupMetric('clockCorrelationOffsetUs')}',
+    );
+    print(
+      '  [METRIC] clockCorrelationOffsetFrames: ${lookupMetric('clockCorrelationOffsetFrames')}',
+    );
+    print(
+      '  [METRIC] clockCorrelationCommandsBefore: ${lookupMetric('clockCorrelationCommandsBefore')}',
+    );
+    print(
+      '  [METRIC] clockCorrelationCommandsAfter: ${lookupMetric('clockCorrelationCommandsAfter')}',
+    );
     print('  [METRIC] failureReason: ${activeReport.failureReason}');
     print('  [METRIC] lastError: ${activeReport.lastError}');
     print('--- SCENARIO METRICS ---');
@@ -1301,8 +1359,8 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     // 6. Print JSON marker with compact JSON payload.
     final summaryPayload = <String, dynamic>{
       'unit': 'AndroidRealtimeAudioPlaybackProductionPhysicalSmokeHarness',
-      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-POSITION-QUERY-LIFECYCLE-CONTRACT',
-      'subSlice': 'Y14',
+      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-CLOCK-CORRELATION-OBSERVATION',
+      'subSlice': 'Y15',
       'target':
           VGRealtimeAudioPlaybackProductionSmokeReport.proofBoundaryConstant,
       'selectedFixture': selectedFixturePath,
@@ -1501,6 +1559,28 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
         ),
         'postTeardownCurrentPositionUs': lookupMetric(
           'postTeardownCurrentPositionUs',
+        ),
+        'nativeClockState': lookupMetric('nativeClockState'),
+        'nativeClockPositionUs': lookupMetric('nativeClockPositionUs'),
+        'nativeClockPositionFrame': lookupMetric('nativeClockPositionFrame'),
+        'nativeClockDriftSampleCount': lookupMetric(
+          'nativeClockDriftSampleCount',
+        ),
+        'presentationClockPositionUsAtCorrelation': lookupMetric(
+          'presentationClockPositionUsAtCorrelation',
+        ),
+        'presentationClockPositionFramesAtCorrelation': lookupMetric(
+          'presentationClockPositionFramesAtCorrelation',
+        ),
+        'clockCorrelationOffsetUs': lookupMetric('clockCorrelationOffsetUs'),
+        'clockCorrelationOffsetFrames': lookupMetric(
+          'clockCorrelationOffsetFrames',
+        ),
+        'clockCorrelationCommandsBefore': lookupMetric(
+          'clockCorrelationCommandsBefore',
+        ),
+        'clockCorrelationCommandsAfter': lookupMetric(
+          'clockCorrelationCommandsAfter',
         ),
       },
       'error': topLevelError,
