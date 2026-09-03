@@ -84,6 +84,13 @@ add_library(vanguard_render_vulkan STATIC
     # buffer/submit/present per frame; per-geometry, per-frame-in-flight-slot
     # cached intermediates/pipelines/descriptor resources.
     "render/vulkan/src/vulkan_beauty_frame_renderer.cpp"
+    # P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A (native helper
+    # sub-slice N4): backend-owned VulkanOverlayTextureStore helper (store-
+    # owned transient command pool + per-upload fence, shared LINEAR /
+    # CLAMP_TO_BORDER sampler, persistent RGBA8 sampled images) for static
+    # sticker overlay pixels. Not yet wired into VulkanFrameRenderer / JNI /
+    # Kotlin.
+    "render/vulkan/src/vulkan_overlay_texture_store.cpp"
 )
 target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include"
     # Phase 2K: private Vulkan src dir exposed so vulkan_surface_swapchain.cpp

@@ -21,6 +21,7 @@
 #include "vulkan_hardware_buffer_imports.h"
 #include "vulkan_shader_module.h"
 #include "vulkan_frame_renderer.h"
+#include "vulkan_overlay_texture_store.h"
 
 #if defined(__ANDROID__)
 
@@ -57,6 +58,12 @@ struct VulkanBackend::Impl {
 
     // Phase 2J: AOT-embedded core shader modules.
     std::unique_ptr<VulkanCoreShaderModules> coreShaders;
+
+    // P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
+    // sub-slice N4: backend-owned Vulkan overlay texture store for static
+    // sticker RGBA pixels. Lazily instantiated/initialized on first
+    // createOverlayTextureRgba8888() call.
+    std::unique_ptr<VulkanOverlayTextureStore> overlayTextureStore;
 #endif
 
     // Phase 2O2B1: modular frame renderer helper.
@@ -203,6 +210,37 @@ RenderFrameResult VulkanBackend::renderTransitionFrame(
     const VideoBeautyV2RenderParams& /*fromBeauty*/,
     const VideoBeautyV2RenderParams& /*toBeauty*/) {
     return RenderFrameResult::kUnavailable;
+}
+
+// ---------------------------------------------------------------------------
+// P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
+// sub-slice N4: overlay texture store stubs - host build.
+// ---------------------------------------------------------------------------
+
+bool VulkanBackend::createOverlayTextureRgba8888(const uint8_t* /*rgba*/,
+                                                 size_t /*rgbaByteCount*/,
+                                                 uint32_t /*width*/,
+                                                 uint32_t /*height*/,
+                                                 uint32_t /*rowStrideBytes*/,
+                                                 VulkanOverlayTextureHandle* outHandle,
+                                                 VulkanOverlayTextureInfo* outInfo) {
+    if (outHandle) *outHandle = kInvalidOverlayTextureHandle;
+    if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+    return false;
+}
+
+bool VulkanBackend::releaseOverlayTexture(VulkanOverlayTextureHandle /*handle*/) {
+    return false;
+}
+
+bool VulkanBackend::getOverlayTextureInfo(VulkanOverlayTextureHandle /*handle*/,
+                                          VulkanOverlayTextureInfo* outInfo) const {
+    if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+    return false;
+}
+
+void VulkanBackend::clearOverlayTextures() {
+    // no-op on host builds
 }
 
 #else // __ANDROID__
@@ -654,6 +692,14 @@ void VulkanBackend::shutdown() {
         s.frameRenderer.reset();
     }
 
+    // P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
+    // sub-slice N4: destroy overlay texture store resources (images, views,
+    // shared sampler, transient command pool) before command pool / device.
+    if (s.overlayTextureStore) {
+        s.overlayTextureStore->clear();
+        s.overlayTextureStore.reset();
+    }
+
     // Phase 2J: Destroy AOT core shader modules before command pool/device.
     if (s.coreShaders) {
         s.coreShaders->shutdown(s.device);
@@ -995,6 +1041,67 @@ RenderFrameResult VulkanBackend::renderTransitionFrame(
         transition,
         fromBeauty,
         toBeauty);
+}
+
+// ---------------------------------------------------------------------------
+// P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
+// sub-slice N4: overlay texture store - Android.
+// The store is lazily instantiated/initialized on the first successful call
+// here rather than eagerly during VulkanBackend::initialize().
+// ---------------------------------------------------------------------------
+
+bool VulkanBackend::createOverlayTextureRgba8888(const uint8_t* rgba,
+                                                 size_t rgbaByteCount,
+                                                 uint32_t width,
+                                                 uint32_t height,
+                                                 uint32_t rowStrideBytes,
+                                                 VulkanOverlayTextureHandle* outHandle,
+                                                 VulkanOverlayTextureInfo* outInfo) {
+    if (!impl_ || !impl_->initialized) {
+        if (outHandle) *outHandle = kInvalidOverlayTextureHandle;
+        if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+        return false;
+    }
+    Impl& s = *impl_;
+    if (!s.overlayTextureStore) {
+        s.overlayTextureStore = std::make_unique<VulkanOverlayTextureStore>();
+        if (!s.overlayTextureStore->initialize(static_cast<void*>(s.device),
+                                               static_cast<void*>(s.physDev),
+                                               static_cast<void*>(s.queue),
+                                               s.queueFamilyIndex)) {
+            s.overlayTextureStore.reset();
+        }
+    }
+    if (!s.overlayTextureStore) {
+        if (outHandle) *outHandle = kInvalidOverlayTextureHandle;
+        if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+        return false;
+    }
+    return s.overlayTextureStore->createTextureRgba8888(
+        rgba, rgbaByteCount, width, height, rowStrideBytes, outHandle, outInfo);
+}
+
+bool VulkanBackend::releaseOverlayTexture(VulkanOverlayTextureHandle handle) {
+    if (!impl_ || !impl_->initialized || !impl_->overlayTextureStore) {
+        return false;
+    }
+    return impl_->overlayTextureStore->releaseTexture(handle);
+}
+
+bool VulkanBackend::getOverlayTextureInfo(VulkanOverlayTextureHandle handle,
+                                          VulkanOverlayTextureInfo* outInfo) const {
+    if (!impl_ || !impl_->initialized || !impl_->overlayTextureStore) {
+        if (outInfo) *outInfo = VulkanOverlayTextureInfo{};
+        return false;
+    }
+    return impl_->overlayTextureStore->getTextureInfo(handle, outInfo);
+}
+
+void VulkanBackend::clearOverlayTextures() {
+    if (!impl_ || !impl_->overlayTextureStore) {
+        return;
+    }
+    impl_->overlayTextureStore->clear();
 }
 
 #endif // __ANDROID__

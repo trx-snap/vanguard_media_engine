@@ -7,6 +7,7 @@
 
 #include "vanguard/render/render_backend.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 
@@ -18,6 +19,23 @@ namespace render {
 // vulkan_overlay_frame_renderer.h) never exposed by this public header; only
 // a pointer to it crosses this seam.
 struct VulkanOverlayFrameDraw;
+
+// P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
+// sub-slice N4: opaque handle + descriptor for a backend-owned Vulkan
+// overlay texture (see VulkanBackend::createOverlayTextureRgba8888 below and
+// the private VulkanOverlayTextureStore helper). imageViewHandle /
+// samplerHandle are VkImageView / VkSampler non-dispatchable handles widened
+// to uint64_t, matching VulkanOverlayFrameDraw::imageViewHandle /
+// samplerHandle so a caller can populate a draw directly from this info.
+using VulkanOverlayTextureHandle = uint64_t;
+constexpr VulkanOverlayTextureHandle kInvalidOverlayTextureHandle = 0;
+
+struct VulkanOverlayTextureInfo {
+    uint64_t imageViewHandle = 0;
+    uint64_t samplerHandle = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
 
 class VulkanBackend : public RenderBackend {
 public:
@@ -89,6 +107,51 @@ public:
         const VideoTransitionFrameTransform& transition,
         const VideoBeautyV2RenderParams& fromBeauty = VideoBeautyV2RenderParams{},
         const VideoBeautyV2RenderParams& toBeauty = VideoBeautyV2RenderParams{}) override;
+
+    // P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
+    // sub-slice N4: backend-owned Vulkan overlay texture store for static
+    // sticker RGBA pixels (see the private VulkanOverlayTextureStore
+    // helper). Not part of the shared RenderBackend interface, so these are
+    // concrete VulkanBackend-only additions (no `override`); host builds
+    // stub every method to false/no-op.
+    //
+    // Threading contract (Opus validation): this store performs no internal
+    // synchronization. Every call below must be made from the same
+    // thread/serialized lane that owns this VulkanBackend's render
+    // loop/session, and must never run concurrently with renderFrame() (any
+    // overload) or with each other on this backend -- the caller is
+    // responsible for serializing all overlay texture-store calls against
+    // renderFrame()/releaseOverlayTexture()/clearOverlayTextures().
+
+    // Uploads `rgba` into a brand-new persistent, sampled RGBA8 texture and
+    // returns a stable handle plus (optionally) its VkImageView/VkSampler/
+    // extent via outInfo. rgbaByteCount is the caller-declared size of
+    // `rgba` in bytes; rowStrideBytes is the caller's source row stride in
+    // bytes, or 0 for tightly packed rows (stride == width * 4). Fails
+    // closed (returns false, *outHandle == kInvalidOverlayTextureHandle,
+    // *outInfo zeroed when non-null) on any invalid input or Vulkan
+    // failure; outInfo may be null.
+    bool createOverlayTextureRgba8888(const uint8_t* rgba,
+                                      size_t rgbaByteCount,
+                                      uint32_t width,
+                                      uint32_t height,
+                                      uint32_t rowStrideBytes,
+                                      VulkanOverlayTextureHandle* outHandle,
+                                      VulkanOverlayTextureInfo* outInfo = nullptr);
+
+    // Destroys handle's texture. Returns false (no-op) for an unknown or
+    // already-released handle.
+    bool releaseOverlayTexture(VulkanOverlayTextureHandle handle);
+
+    // Returns true and fills *outInfo iff handle is an active texture;
+    // returns false (zeroing *outInfo when non-null) otherwise.
+    bool getOverlayTextureInfo(VulkanOverlayTextureHandle handle,
+                               VulkanOverlayTextureInfo* outInfo) const;
+
+    // Destroys every active overlay texture and the shared sampler/command
+    // pool backing them. Idempotent. Must be called before this backend's
+    // VkDevice is destroyed (VulkanBackend::shutdown() already does this).
+    void clearOverlayTextures();
 
 private:
     struct Impl;
