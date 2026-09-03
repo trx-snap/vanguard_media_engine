@@ -82,6 +82,16 @@ import java.util.concurrent.atomic.AtomicReference
 // so it matches the native and sink checksums across the seek; whole-run
 // frame accounting is H + (declared - T). Seek value types live in
 // VanguardRealtimePlaybackDecoderSeekTypes.kt.
+//
+// Y10b-1a, additive: [requestSeekReanchor]'s `index`/`nextHoldFrame` let the
+// coordinator chain a second serial re-anchor once the first completes
+// (`index` must equal the count of reanchors already done); `nextHoldFrame`
+// re-pins the hold the feed idles at next (or leaves it at the declared end
+// for the run's final seek). [awaitReanchor]/[awaitPostSeekPreRoll] each take
+// an optional `expectedCount` (1-based) to await a specific serial reanchor's
+// completion or its OWN post-seek pre-roll; the post-seek pre-roll counter
+// resets to zero at every re-anchor so a second seek proves its own paused
+// pre-roll instead of inheriting the first seek's already-accumulated frames.
 class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
 
     data class Config(
@@ -150,8 +160,13 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
     private val preRollLatch = CountDownLatch(1)
     private val exitLatch = CountDownLatch(1)
     // Y9 seek control (unused unless a hold frame is pinned).
-    private val reanchorLatch = CountDownLatch(1)
-    private val postSeekPreRollLatch = CountDownLatch(1)
+    // Y10b-1a: one latch per serial reanchor slot (up to two); latch[i]
+    // releases when the (i+1)-th reanchor completes (ok or fail-closed exit).
+    private val reanchorLatches = Array(2) { CountDownLatch(1) }
+    // Y10b-1a: one latch per serial reanchor slot, mirroring [reanchorLatches];
+    // latch[i] releases when the (i+1)-th reanchor's OWN post-seek pre-roll
+    // (never the previous seek's already-accumulated frames) reaches the window.
+    private val postSeekPreRollLatches = Array(2) { CountDownLatch(1) }
     private val seekRequest = AtomicReference<VanguardRealtimePlaybackDecoderSeekRequest?>(null)
 
     @Volatile
@@ -426,20 +441,47 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
     }
 
     // Y9 coordinator-only, after transport.seek(T) was accepted while PAUSED.
-    // Single use, executed by the decode thread while held at H; false when a
-    // request already exists or no hold frame was pinned.
+    // Executed by the decode thread while held at the hold frame the request's
+    // `index` expects; false when a request is already pending, no hold frame
+    // was pinned, or `request.index` is not the count of reanchors already
+    // completed (Y10b-1a: accepts a second serial request once the first has
+    // completed, in order, up to the fixed two-slot capacity below; an index
+    // at or past that capacity is rejected before it could ever be latched).
     fun requestSeekReanchor(request: VanguardRealtimePlaybackDecoderSeekRequest): Boolean {
         if (holdFrame <= 0L) return false
+        if (request.index !in reanchorLatches.indices) return false
+        if (request.index != seekReanchorCount) return false
         return seekRequest.compareAndSet(null, request)
     }
 
-    // Y9: blocks until the re-anchor finished (or the thread exited); true only when clean.
-    fun awaitReanchor(timeoutMs: Long): Boolean =
-        reanchorLatch.await(timeoutMs, TimeUnit.MILLISECONDS) && reanchorOk
+    // Y9 compatibility: blocks until the first re-anchor finished (or the
+    // thread exited); true only when clean. Equivalent to
+    // awaitReanchor(timeoutMs, expectedCount = 1).
+    fun awaitReanchor(timeoutMs: Long): Boolean = awaitReanchor(timeoutMs, expectedCount = 1)
 
-    // Y9: blocks until >= maxFramesPerMix post-seek frames were accepted, the declared end was reached or the thread exited.
-    fun awaitPostSeekPreRoll(timeoutMs: Long): Boolean =
-        postSeekPreRollLatch.await(timeoutMs, TimeUnit.MILLISECONDS) && postSeekPreRollFrames > 0L
+    // Y10b-1a: blocks until the `expectedCount`-th serial re-anchor finished
+    // (or the thread exited); true only when that many reanchors completed and
+    // the last one was clean. `expectedCount` is 1-based, up to two.
+    fun awaitReanchor(timeoutMs: Long, expectedCount: Int): Boolean {
+        if (expectedCount < 1 || expectedCount > reanchorLatches.size) return false
+        val released = reanchorLatches[expectedCount - 1].await(timeoutMs, TimeUnit.MILLISECONDS)
+        return released && reanchorOk && seekReanchorCount >= expectedCount
+    }
+
+    // Y9 compatibility: blocks until the first post-seek pre-roll finished (or
+    // the thread exited); true only when clean. Equivalent to
+    // awaitPostSeekPreRoll(timeoutMs, expectedCount = 1).
+    fun awaitPostSeekPreRoll(timeoutMs: Long): Boolean = awaitPostSeekPreRoll(timeoutMs, expectedCount = 1)
+
+    // Y10b-1a: blocks until the `expectedCount`-th serial reanchor's OWN
+    // post-seek pre-roll (>= maxFramesPerMix frames accepted since THAT
+    // reanchor, the declared end reached, or the thread exited) finished.
+    // `expectedCount` is 1-based, up to two, and mirrors [awaitReanchor].
+    fun awaitPostSeekPreRoll(timeoutMs: Long, expectedCount: Int): Boolean {
+        if (expectedCount < 1 || expectedCount > postSeekPreRollLatches.size) return false
+        val released = postSeekPreRollLatches[expectedCount - 1].await(timeoutMs, TimeUnit.MILLISECONDS)
+        return released && postSeekPreRollFrames > 0L && seekReanchorCount >= expectedCount
+    }
 
     // Any thread. The decode thread observes the flag at its next bounded
     // wait and tears down on its own thread.
@@ -528,8 +570,8 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
             decodeThreadWallMs = SystemClock.elapsedRealtime() - wallStart
             formatLatch.countDown()
             preRollLatch.countDown()
-            reanchorLatch.countDown()
-            postSeekPreRollLatch.countDown()
+            reanchorLatches.forEach { it.countDown() }
+            postSeekPreRollLatches.forEach { it.countDown() }
             exitLatch.countDown()
         }
     }
@@ -864,12 +906,20 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
             throw FailClosed("reanchor_target_invalid:${req.targetFrame}:$anchor:$declaredFrameCount")
         }
         if (req.newGeneration == req.staleGeneration) throw FailClosed("reanchor_generation_not_advanced")
+        if (req.nextHoldFrame != Long.MAX_VALUE &&
+            (req.nextHoldFrame <= req.targetFrame ||
+                (req.nextHoldFrame - req.targetFrame) % config.maxFramesPerMix != 0L)
+        ) {
+            throw FailClosed("reanchor_next_hold_invalid:${req.nextHoldFrame}:${req.targetFrame}")
+        }
 
         preSeekAcceptedFrames = acceptedFrames
         stagedFramesClearedAtSeek = stagedFrames.toLong()
         codecChunksAtSeek = codecChunks
         clearStaged()
-        holdLimitFrame = Long.MAX_VALUE
+        // Y10b-1a: the next hold frame (H2) for a second serial seek, or
+        // Long.MAX_VALUE (no further hold) when `req` is the run's final seek.
+        holdLimitFrame = req.nextHoldFrame
         heldAtHoldFrame = false
         seekTargetFrame = req.targetFrame
         seekTargetUs = (req.targetFrame * 1_000_000L + sampleRate - 1) / sampleRate
@@ -882,6 +932,19 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
         consecutiveNoProgress = 0
         lastProgressMs = SystemClock.elapsedRealtime()
         reanchored = true
+        // Y10b-1a: this reanchor's own post-seek/landing telemetry must be
+        // proven fresh from zero, never satisfied by a previous seek's
+        // already-accumulated post-seek frames. Cumulative whole-run counters
+        // (acceptedFrames, checksum, paddedFrames, discardedFrames, etc.) are
+        // untouched.
+        postSeekAcceptedFrames = 0L
+        postSeekPreRollFrames = 0L
+        postSeekPreRollStatePaused = false
+        postSeekPaddedFrames = 0L
+        gapObservedFrames = 0L
+        gapPaddedFrames = 0L
+        discardedPreTargetFrames = 0L
+        postSeekPreRollSignalled = false
 
         // Stale probe pinned to the PRE-seek generation: the owner thread must
         // reject it before any native call (reply == null), anchor untouched.
@@ -898,7 +961,11 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
         seekReanchorCount++
         seekReanchorWallMs = SystemClock.elapsedRealtime() - startMs
         reanchorOk = true
-        reanchorLatch.countDown()
+        // Free the slot before releasing the waiter so a second serial
+        // request (index == seekReanchorCount) can be accepted as soon as
+        // the coordinator observes this reanchor's completion.
+        seekRequest.set(null)
+        reanchorLatches[seekReanchorCount - 1].countDown()
     }
 
     // ── Transport handoff (owner-thread post only) ─────────────────────────
@@ -1067,7 +1134,10 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
             postSeekPreRollSignalled = true
             postSeekPreRollFrames = postSeekAcceptedFrames
             postSeekPreRollStatePaused = transport?.currentState == State.PAUSED
-            postSeekPreRollLatch.countDown()
+            // seekReanchorCount was already incremented by the just-completed
+            // reanchor (performReanchor returns before the feed loop reaches
+            // this call), so it is this signal's own 1-based slot.
+            postSeekPreRollLatches[seekReanchorCount - 1].countDown()
         }
     }
 
@@ -1091,8 +1161,12 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
             if (anchor == limit) {
                 // Held at H: no ingest until the re-anchor; never a stall.
                 signalPreRollIfDue()
+                // Y10b-1a: seekRequest is cleared inside performReanchor once a
+                // reanchor completes, so this also picks up a second serial
+                // request once it is accepted (index == seekReanchorCount) and
+                // the decode thread is held at that request's hold frame.
                 val req = seekRequest.get()
-                if (req != null && !reanchored) {
+                if (req != null) {
                     performReanchor(req, sm)
                     continue
                 }

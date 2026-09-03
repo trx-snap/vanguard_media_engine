@@ -4,8 +4,8 @@ import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeA
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackSinkTelemetry
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackNativeSession
 
-// Y9 (P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK) metric mapping of the
-// production smoke: flattens the session's seek observation (with the decoder
+// Y9 (P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK) + Y10b repeated-seek metric mapping
+// of the production smoke: flattens the session's seek observation (with the decoder
 // seek telemetry it carries) and the sink's seek park / flush / seek-epoch
 // telemetry into a scenario metric map. Pure key mapping: lane logic lives in
 // [AndroidRealtimeAudioPlaybackProductionLaneEvaluator], sequencing in
@@ -74,6 +74,10 @@ object AndroidRealtimeAudioPlaybackProductionSeekMetrics {
         m["seekTransportStateAtUnpark"] = q.transportStateAtUnpark?.name ?: "none"
         m["seekHoldObservedMs"] = q.holdObservedMs
         m["seekWallMs"] = q.seekWallMs
+        m["seekParkRequestedAtMs"] = q.parkRequestedAtMs
+        m["seekParkAckedAtMs"] = q.parkAckedAtMs
+        m["seekUnparkedAtMs"] = q.unparkedAtMs
+        m["seekResumedAtMs"] = q.resumedAtMs
         putReplyMetrics(m, "seekPreSeek", q.preSeekReply)
         putReplyMetrics(m, "seekPostPause", q.postPauseReply)
         putReplyMetrics(m, "seekPostSeek", q.postSeekReply)

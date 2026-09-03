@@ -110,6 +110,9 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         const val DEFAULT_GAIN = 1.0f
         const val DEFAULT_MAX_PAUSE_HOLD_MS = 1_500L
         const val DEFAULT_MAX_SEEK_HOLD_MS = 15_000L
+        // Y10b-1a: two serial seek parks are supported (each with its own flush); a
+        // third requestSeekPark() is rejected the same way a second one was in Y9.
+        const val MAX_SEEK_PARKS = 2
         const val EPOCH_NONE = VanguardRealtimePlaybackPresentationClock.EPOCH_NONE
         const val PLAY_STATE_UNKNOWN = -1
 
@@ -150,7 +153,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     private val phaseRef = AtomicReference(Phase.SETUP)
     private val parkLock = ReentrantLock()
     private val parkCondition = parkLock.newCondition()
-    private val flushAckLatch = CountDownLatch(1)
+    // Y10b-1a: reset per requestFlush() so a second serial seek's flush ack can be awaited independently.
+    @Volatile private var flushAckLatch = CountDownLatch(1)
 
     // Guarded by parkLock.
     private var unparkRequested = false
@@ -301,12 +305,15 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     fun awaitParked(timeoutMs: Long): Boolean =
         parkAckLatch.await(timeoutMs, TimeUnit.MILLISECONDS) && phaseRef.get() == Phase.PARKED
 
-    // Y9: [requestPark] as a seek park: capped by [Config.maxSeekHoldMs], takes
-    // exactly one [requestFlush], unparks only after its ack. Single use.
+    // Y9 / Y10b-1a: [requestPark] as a seek park: capped by [Config.maxSeekHoldMs],
+    // takes exactly one [requestFlush] per use, unparks only after its ack.
+    // Allowed up to [MAX_SEEK_PARKS] times, serially: the previous seek park's
+    // flush must already be acked (seekParkCount == flushCount) before the next.
     fun requestSeekPark(): Boolean {
         if (!started.get() || phaseRef.get() != Phase.RUNNING) return false
         parkLock.withLock {
-            if (seekParkRequested || seekParkCount > 0 || flushRequested || flushCount > 0) return false
+            if (seekParkRequested || flushRequested) return false
+            if (seekParkCount >= MAX_SEEK_PARKS || seekParkCount != flushCount) return false
             seekParkRequested = true
         }
         if (!requestPark()) {
@@ -316,15 +323,18 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         return true
     }
 
-    // Y9, any thread: the PARKED seek-park sink thread flushes exactly once,
-    // bounds further reads to `postSeekFrames` (C6) and opens the next epoch
-    // at `targetFrame` on unpark. False unless PARKED on a seek park, once.
+    // Y9 / Y10b-1a, any thread: the PARKED seek-park sink thread flushes exactly
+    // once per use, bounds further reads to `postSeekFrames` (C6) and opens the
+    // next epoch at `targetFrame` on unpark. False unless PARKED on a seek park
+    // whose flush for this use has not run yet.
     fun requestFlush(postSeekFrames: Long, targetFrame: Long): Boolean {
         if (postSeekFrames <= 0L || targetFrame < 0L) return false
         parkLock.withLock {
             if (phaseRef.get() != Phase.PARKED) return false
             if (!seekParkRequested) return false
-            if (flushRequested || flushCount > 0) return false
+            if (flushRequested) return false
+            if (flushCount != seekParkCount - 1) return false
+            flushAckLatch = CountDownLatch(1)
             flushRequested = true
             flushRequestedAtMs = SystemClock.elapsedRealtime()
             postSeekExpectedFrames = postSeekFrames
@@ -335,17 +345,21 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         return true
     }
 
-    // Y9: bounded wait for the flush ack; true only when it executed exactly once (latch also released on exit).
-    fun awaitFlushed(timeoutMs: Long): Boolean =
-        flushAckLatch.await(timeoutMs, TimeUnit.MILLISECONDS) && flushCount == 1
+    // Y9 compatibility: bounded wait for the ONE flush ack (expectedCount=1).
+    fun awaitFlushed(timeoutMs: Long): Boolean = awaitFlushed(timeoutMs, 1)
+
+    // Y10b-1a: bounded wait for the flush ack of a specific serial seek park,
+    // keyed by the cumulative flush count it should reach (latch reset per requestFlush()).
+    fun awaitFlushed(timeoutMs: Long, expectedCount: Int): Boolean =
+        flushAckLatch.await(timeoutMs, TimeUnit.MILLISECONDS) && flushCount == expectedCount
 
     // Wakes a PARKED sink thread (AudioTrack.play there, then RUNNING). False
-    // when not PARKED or (Y9) a seek park's flush is not yet requested/acked.
+    // when not PARKED, a flush is still pending, or (seek park) its flush has not yet acked.
     fun unpark(): Boolean {
         parkLock.withLock {
             if (phaseRef.get() != Phase.PARKED) return false
-            if (flushRequested && flushCount == 0) return false
-            if (seekParkRequested && flushCount == 0) return false
+            if (flushRequested) return false
+            if (seekParkRequested && flushCount != seekParkCount) return false
             unparkRequested = true
             parkCondition.signalAll()
         }
@@ -870,9 +884,10 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     // Runs inside the parked wait under parkLock (request-side fields read
     // consistently). AudioTrack PAUSED before and after (flush is a no-op
     // otherwise); unwrap/rebase reset here (C4), read budget rebased (C6).
-    // No timestamp poll and no clock write happen here.
+    // No timestamp poll and no clock write happen here. Y10b-1a: runs once per
+    // serial seek park use (flushCount must trail seekParkCount by exactly one).
     private fun flushOnSinkThread(track: AudioTrack) {
-        if (flushCount != 0) throw FailClosed("audio_track_flush_repeated")
+        if (!flushRequested || flushCount != seekParkCount - 1) throw FailClosed("audio_track_flush_repeated")
         if (phaseRef.get() != Phase.PARKED) throw FailClosed("audio_track_flush_outside_parked:${phaseRef.get().name.lowercase()}")
         if (clockWriter.currentEpoch != EPOCH_NONE) throw FailClosed("audio_track_flush_with_open_epoch")
         val pollAttemptsAtStart = clockWriter.timestampPollAttempts
@@ -898,6 +913,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         val requestedAt = flushRequestedAtMs
         flushAckLatencyMs = if (requestedAt >= 0L) SystemClock.elapsedRealtime() - requestedAt else -1L
         flushCount++
+        // Reset so a second serial seek park's requestFlush() is accepted (still under parkLock, called from parkOnSinkThread's loop).
+        flushRequested = false
         flushAckLatch.countDown()
     }
 
@@ -905,16 +922,17 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
 
     // Bounded pause park: AudioTrack.pause, ack, wait (maxPauseHoldMs) for
     // unpark, AudioTrack.play, epoch+1 at the frozen position (instance origin
-    // there). Seek park (Y9): same to the ack; wait capped by maxSeekHoldMs,
-    // the ONE flush runs inside it, unpark opens epoch+1 at T (origin 0).
+    // there). Seek park (Y9 / Y10b-1a): same to the ack; wait capped by
+    // maxSeekHoldMs, one flush runs inside it (up to [MAX_SEEK_PARKS] serial
+    // uses), unpark opens epoch+1 at T (origin 0).
     private fun parkOnSinkThread() {
         val track = requireTrack()
         if (!played) throw FailClosed("park_before_first_play")
         parkExecutedOnSinkThread = Thread.currentThread().id == threadId
         val seekPark = seekParkRequested
         if (seekPark) {
-            if (seekParkCount != 0 || flushCount != 0) throw FailClosed("seek_park_repeated")
-            seekParkCount = 1
+            if (seekParkCount != flushCount || seekParkCount >= MAX_SEEK_PARKS) throw FailClosed("seek_park_repeated")
+            seekParkCount++
         }
 
         track.pause()
@@ -943,7 +961,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         parkLock.withLock {
             while (true) {
                 // A requested flush always executes before an unpark is honoured.
-                if (flushRequested && flushCount == 0) flushOnSinkThread(track)
+                if (flushRequested && flushCount == seekParkCount - 1) flushOnSinkThread(track)
                 if (unparkRequested) break
                 if (isCancelled()) throw FailClosed(EXIT_CANCELLED)
                 val now = SystemClock.elapsedRealtime()
@@ -958,6 +976,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
                 if (track.playState != AudioTrack.PLAYSTATE_PAUSED) parkedPlayStateViolations++
             }
             unparkRequested = false
+            // This use's flush already acked (unpark() guard); free the flag for a possible next serial seek park.
+            if (seekPark) seekParkRequested = false
         }
 
         playbackHeadAtUnpark = rawHead()
@@ -970,7 +990,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         if (seekPark) {
             // Same instance, flushed: epoch+1 opens at T, a deliberate
             // discontinuity from the frozen position, over instance origin 0.
-            if (flushCount != 1) throw FailClosed("seek_unpark_without_flush:$flushCount")
+            if (flushCount != seekParkCount) throw FailClosed("seek_unpark_without_flush:$flushCount:$seekParkCount")
             val target = seekTargetFrame
             if (target < 0L) throw FailClosed("seek_unpark_without_target")
             if (target < positionAtPark) throw FailClosed("seek_target_below_position_at_park:$target:$positionAtPark")

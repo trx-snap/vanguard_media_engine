@@ -61,6 +61,29 @@ import kotlin.concurrent.withLock
 // closed through the common teardown; cancel/dispose mid-seek use the
 // existing bounded-wait wake-ups; a second seek is rejected without teardown.
 // The seek bookkeeping is published as [VanguardRealtimeAudioPlaybackSeekObservation].
+//
+// Repeated seek (Y10b-1a, P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-
+// SEEK), default OFF, additive: with [Config.secondSeekTargetSec] also > 0,
+// start admits a SECOND ordered forward seek T2 alongside T1 (H1 < T1 < H2 <
+// T2 < declared - 2 windows, H2 = a post-seek epoch window boundary: T1 +
+// preSeekHoldWindows windows, relative to T1 rather than the absolute frame
+// grid). [seek] then accepts exactly the
+// current ordered target: T1 first (index 0), T2 second (index 1); a third
+// call is rejected the same way a second one is in the Y9-only case, without
+// teardown or mutation. Each seek runs the identical fixed order above, once
+// per call, distinguishing two frame domains that coincide for the first
+// seek and diverge for the second: content hold frames (H1/H2) are the
+// decoder/native POSITION domain (jump to each seek's target); sink hold
+// frames are the CUMULATIVE sink domain (keep counting forward through a
+// seek's position jump instead of resetting to it) -- for the second seek,
+// sinkHold = H1 + (H2 - T1), so the expected final sink frame count after
+// both seeks is H1 + (H2 - T1) + (declared - T2). Every per-seek sink/feed
+// command (park, flush, transport.seek, reanchor, unpark, post-seek
+// pre-roll) is counted cumulatively across the whole session and awaited by
+// its 1-based serial ordinal, so the second seek proves its OWN paused
+// pre-roll rather than inheriting the first seek's already-accumulated
+// frames. See [VanguardRealtimeAudioPlaybackSeekSequencer] for the per-step
+// domain bookkeeping.
 class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
 
     data class Config(
@@ -78,6 +101,12 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         // seconds; must stay below maxDurationSec. Admitted against the
         // probed format at start.
         val seekTargetSec: Double = 0.0,
+        // Y10b-1a second seek target in seconds, default OFF (0.0): when
+        // > 0.0 (and seekTargetSec is also armed and this is strictly past
+        // it), admits a second ordered forward seek T2 alongside T1. Must
+        // stay below maxDurationSec; admitted against the probed format at
+        // start together with T1 (class comment).
+        val secondSeekTargetSec: Double = 0.0,
         // Y9: windows fed after the pre-roll before the feed holds at H.
         val preSeekHoldWindows: Int = DEFAULT_PRE_SEEK_HOLD_WINDOWS,
         // Y9: hard cap on the sink's seek park (distinct from the pause cap).
@@ -220,13 +249,19 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     @Volatile private var sessionWallMs = 0L
 
     // Y9 seek admission bookkeeping (command-lock holder writes); the step
-    // sequence and its own bookkeeping live in [seekSequencer].
+    // sequence and its own bookkeeping live in [seekSequencer]. Y10b-1a: when
+    // [repeatedSeekArmed], a second ordered forward seek (T2, content hold
+    // H2) is admitted alongside the first (T1, content hold H1 = the pinned
+    // [preSeekHoldFrame]); [seekCount] then runs 0..2 instead of 0..1.
     @Volatile private var seekArmed = false
     @Volatile private var seekTargetFrame = -1L
     @Volatile private var preSeekHoldFrame = -1L
     @Volatile private var seekAdmissionOk = false
     @Volatile private var seekHoldPinned = false
     @Volatile private var seekCount = 0
+    @Volatile private var repeatedSeekArmed = false
+    @Volatile private var secondSeekTargetFrame = -1L
+    @Volatile private var secondPreSeekHoldFrame = -1L
 
     // Y10a: extracted Y9 seek step sequence; runs synchronously under this
     // session's command lock, on the caller's thread (see [seek]).
@@ -242,8 +277,6 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             override fun noteCommandIssued() {
                 commandsIssued++
             }
-
-            override val startGeneration: Long get() = this@VanguardRealtimeAudioPlaybackSession.startGeneration
         },
     )
 
@@ -301,6 +334,16 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         if (config.syntheticDeadObjectInjectAfterFrames < 0L) return failClosed("invalid_dead_object_inject_after_frames")
         if (config.seekTargetSec < 0.0 || config.seekTargetSec.isNaN() || config.seekTargetSec >= config.maxDurationSec) {
             return failClosed("invalid_seek_target")
+        }
+        if (config.secondSeekTargetSec < 0.0 || config.secondSeekTargetSec.isNaN() ||
+            config.secondSeekTargetSec >= config.maxDurationSec
+        ) {
+            return failClosed("invalid_second_seek_target")
+        }
+        if (config.secondSeekTargetSec > 0.0 &&
+            (config.seekTargetSec <= 0.0 || config.secondSeekTargetSec <= config.seekTargetSec)
+        ) {
+            return failClosed("invalid_second_seek_target")
         }
         if (config.preSeekHoldWindows <= 0 || config.preSeekHoldWindows > MAX_PRE_SEEK_HOLD_WINDOWS) {
             return failClosed("invalid_pre_seek_hold_windows")
@@ -374,8 +417,12 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         preRollStatePrepared = machine.currentState == TransportState.PREPARED
         if (preRollFrames <= 0L) throw FailClosed("preroll_empty:${f.exitReason}")
 
-        // Y9 seek admission (C10) and hold pin before the transport starts:
-        // H = first window-aligned frame >= preRoll + preSeekHoldWindows windows.
+        // Y9/Y10b-1a seek admission (C10) and hold pin before the transport
+        // starts: H1 = first window-aligned frame >= preRoll +
+        // preSeekHoldWindows windows. When secondSeekTargetSec > 0.0 a second
+        // ordered forward seek is admitted too: H2 = T1 + preSeekHoldWindows
+        // windows, a post-seek epoch window boundary relative to T1 (not the
+        // absolute frame grid), with H1 < T1 < H2 < T2 < declared - 2 windows.
         if (config.seekTargetSec > 0.0) {
             val window = config.maxFramesPerMix.toLong()
             val declared = fmt.declaredFrameCount
@@ -384,10 +431,23 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             seekArmed = true
             seekTargetFrame = target
             preSeekHoldFrame = hold
-            seekAdmissionOk = hold % window == 0L && hold > preRollFrames && hold < target &&
+            var admissionOk = hold % window == 0L && hold > preRollFrames && hold < target &&
                 target < declared - 2L * window
+            if (config.secondSeekTargetSec > 0.0) {
+                repeatedSeekArmed = true
+                val target2 = (config.secondSeekTargetSec * fmt.sampleRate).toLong()
+                val hold2 = target + config.preSeekHoldWindows.toLong() * window
+                secondSeekTargetFrame = target2
+                secondPreSeekHoldFrame = hold2
+                admissionOk = admissionOk && (hold2 - target) % window == 0L && hold2 > target && hold2 < target2 &&
+                    target2 < declared - 2L * window
+            }
+            seekAdmissionOk = admissionOk
             if (!seekAdmissionOk) {
-                throw FailClosed("seek_admission:preroll=$preRollFrames:hold=$hold:target=$target:declared=$declared")
+                throw FailClosed(
+                    "seek_admission:preroll=$preRollFrames:hold=$hold:target=$target:" +
+                        "hold2=$secondPreSeekHoldFrame:target2=$secondSeekTargetFrame:declared=$declared",
+                )
             }
             seekHoldPinned = f.setPreSeekHoldFrame(hold)
             if (!seekHoldPinned) throw FailClosed("seek_hold_pin_rejected:$hold")
@@ -502,22 +562,37 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         }
     }
 
-    // Y9: the ONE armed forward seek (targetFrame must equal the armed target),
-    // PLAYING -> SEEKING -> PLAYING in the class-comment order. Not PLAYING, not
-    // armed, repeated or foreign target: rejected without teardown.
+    // Y9 (default): the ONE armed forward seek (targetFrame must equal the
+    // armed target), PLAYING -> SEEKING -> PLAYING in the class-comment
+    // order. Y10b-1a, when [repeatedSeekArmed]: two ordered forward seeks are
+    // admitted; each call accepts only the CURRENT ordered target (T1 first,
+    // then T2), by index (0, then 1). Not PLAYING, not armed, a target past
+    // the armed count (repeated) or a foreign target: rejected without
+    // teardown or mutation.
     fun seek(targetFrame: Long): CommandResult = commandLock.withLock {
         if (state != State.PLAYING) return reject("invalid_state_${state.name.lowercase()}")
         if (!seekArmed || !seekHoldPinned) return reject("seek_not_armed")
-        if (seekCount != 0) return reject("seek_repeated")
-        if (targetFrame != seekTargetFrame) return reject("seek_target_mismatch:$targetFrame:$seekTargetFrame")
+        val maxSeeks = if (repeatedSeekArmed) 2 else 1
+        if (seekCount >= maxSeeks) return reject("seek_repeated")
+        val index = seekCount
+        val expectedTarget = if (index == 0) seekTargetFrame else secondSeekTargetFrame
+        if (targetFrame != expectedTarget) return reject("seek_target_mismatch:$targetFrame:$expectedTarget")
         failure.get()?.let { return failClosed(it) }
         val s = sink ?: return failClosed("sink_missing")
         val f = feed ?: return failClosed("feed_missing")
         val machine = transport ?: return failClosed("transport_missing")
         val fmt = format ?: return failClosed("format_missing")
-        seekCount = 1
+        // Content hold frames (H1/H2) are decoder/native position domain;
+        // sink hold frames are cumulative sink domain (class comment). The
+        // two coincide for the first seek and diverge for the second.
+        val contentHold = if (index == 0) preSeekHoldFrame else secondPreSeekHoldFrame
+        val sinkHold = if (index == 0) preSeekHoldFrame else preSeekHoldFrame + (secondPreSeekHoldFrame - seekTargetFrame)
+        val nextContentHold = if (index == 0 && repeatedSeekArmed) secondPreSeekHoldFrame else Long.MAX_VALUE
+        seekCount = index + 1
         state = State.SEEKING
-        val reason = seekSequencer.run(s, f, machine, fmt.declaredFrameCount, preSeekHoldFrame, seekTargetFrame)
+        val reason = seekSequencer.run(
+            s, f, machine, fmt.declaredFrameCount, index, contentHold, sinkHold, targetFrame, nextContentHold,
+        )
         if (reason == null) {
             state = State.PLAYING
             accept()

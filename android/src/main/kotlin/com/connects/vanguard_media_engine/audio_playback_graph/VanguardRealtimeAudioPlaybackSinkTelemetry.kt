@@ -112,7 +112,7 @@ data class VanguardRealtimeAudioPlaybackSinkTelemetry(
     val playbackHeadAtDeadObject: Long,
     // ── Y9 seek park / flush / seek epoch ──
     val maxSeekHoldMs: Long,
-    // 1 once the sink thread executed a park requested through requestSeekPark().
+    // Count of seek parks the sink thread executed via requestSeekPark() (0..MAX_SEEK_PARKS, Y10b-1a).
     val seekParkCount: Int,
     // Hold cap applied to the last park: maxPauseHoldMs or maxSeekHoldMs.
     val parkHoldCapMs: Long,

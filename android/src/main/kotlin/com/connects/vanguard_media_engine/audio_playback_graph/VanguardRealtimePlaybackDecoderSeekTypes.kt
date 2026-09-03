@@ -5,14 +5,22 @@ package com.connects.vanguard_media_engine.audio_playback_graph
 // Value types of [VanguardRealtimePlaybackDecoderFeed]'s single forward seek.
 // Pure data: the feed's decode thread owns every state transition behind them.
 
-// Coordinator-issued seek re-anchor request (single use): the feed moves its
-// anchor from `preSeekAnchorFrame` (the hold frame H) to `targetFrame` and its
-// pinned generation from `staleGeneration` to `newGeneration`.
+// Coordinator-issued seek re-anchor request: the feed moves its anchor from
+// `preSeekAnchorFrame` (the hold frame it is currently held at) to
+// `targetFrame` and its pinned generation from `staleGeneration` to
+// `newGeneration`. `index` is the zero-based serial position of this request
+// among the up-to-two reanchors a single feed run accepts (0 = first, 1 =
+// second); the feed only accepts a request whose `index` matches the count of
+// reanchors already completed. `nextHoldFrame` is the next hold frame the
+// feed idles at after this reanchor (Y10b-1a, default = no further hold, i.e.
+// this is the final seek of the run).
 data class VanguardRealtimePlaybackDecoderSeekRequest(
     val targetFrame: Long,
     val preSeekAnchorFrame: Long,
     val newGeneration: Long,
     val staleGeneration: Long,
+    val index: Int = 0,
+    val nextHoldFrame: Long = Long.MAX_VALUE,
 )
 
 // Any-thread immutable view of the feed's seek telemetry (decode thread
