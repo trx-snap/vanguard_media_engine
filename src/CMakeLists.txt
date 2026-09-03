@@ -78,6 +78,9 @@ add_library(vanguard_render_gles STATIC
     "render/gles/src/gles_two_texture_compositor.cpp"
     "render/gles/src/gles_multicam_spatial_compositor.cpp"
     "render/gles/src/gles_timeline_transition_compositor.cpp"
+    # P5-OVERLAYS-TRANS (GLES-RENDER): private multi-layer overlay helper
+    # (mat3 transform, per-layer opacity, source-over blend, state restore).
+    "render/gles/src/gles_overlay_compositor.cpp"
 )
 target_include_directories(vanguard_render_gles PUBLIC "render/gles/include")
 target_link_libraries(vanguard_render_gles PRIVATE vanguard_render_shared vanguard_core)
@@ -159,6 +162,7 @@ if (ANDROID)
     "platform/android/src/android_phase3_multicam_spatial_vulkan_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_compositor_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_gles_render_jni.cpp"
+    "platform/android/src/android_phase5_timeline_overlay_gles_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_vulkan_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_dual_decoder_sync_jni.cpp"
     "platform/android/src/android_phase5_timeline_dual_decoder_sync_vulkan_support.cpp"

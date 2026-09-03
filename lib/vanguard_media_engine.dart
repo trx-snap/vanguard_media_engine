@@ -201,6 +201,8 @@ export 'vg_overlay_descriptor.dart';
 // P5-OVERLAYS-KEYFRAME-INTERP: Dynamic overlay keyframe/spatial transform interpolation
 export 'src/overlay/vg_overlay_keyframe.dart';
 export 'src/overlay/vg_overlay_transform_evaluator.dart';
+// P5-OVERLAYS-GLES-RENDER: Android True-DAG GlesOverlayCompositor multi-layer shader/raster smoke foundation.
+export 'vg_timeline_overlay_gles_render_smoke.dart';
 // Phase 8.14A: audio sidecar export muxer descriptor.
 export 'vg_audio_sidecar_plan.dart';
 // Phase 8.15B: offline audio ducking engine.

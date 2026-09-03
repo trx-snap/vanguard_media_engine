@@ -1901,6 +1901,21 @@ class VanguardNativeBridge(
     // no export session, no product UI.
     external fun runAndroidDagPhase5TimelineTransitionGlesRenderSmoke(): String
 
+    // ── P5-OVERLAYS-TRANS (GLES-RENDER): GlesOverlayCompositor multi-layer ──
+    // overlay shader/raster proof diagnostic. Native creates its own temporary
+    // 64x64 EGL pbuffer context and synthetic GL_TEXTURE_2D solid/quadrant/
+    // half-alpha textures on the calling thread, hand-builds already-resolved
+    // GlesOverlayLayerDescriptor lists (mirroring Dart
+    // VGOverlayEvaluatedTransform raster fields), draws each lane through the
+    // private GLES overlay helper (mat3 uTransform, float uOpacity,
+    // Porter-Duff source-over), reads pixels back, verifies GL_BLEND /
+    // viewport / binding restoration, and tears everything down before
+    // returning a JSON object string. Must be called from a thread with no
+    // EGL context current (the smoke coordinator's executor). No Vulkan, no
+    // MediaCodec/decode, no SurfaceTexture/OES frame proof, no keyframe math,
+    // no export session, no product UI.
+    external fun runAndroidDagPhase5TimelineOverlayGlesRenderSmoke(): String
+
     // ── P5-COMPOSITOR-TRANS (VULKAN-RENDER): VulkanTimelineTransitionCompositor ──
     // shader/raster proof diagnostic. Native creates its own temporary
     // VkInstance/VkDevice/VkQueue/VkCommandPool, synthetic RGBA8 sampled images,

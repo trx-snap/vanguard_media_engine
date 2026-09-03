@@ -71,6 +71,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackSin
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimePlaybackTransportCoreSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineCompositorSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineTransitionGlesRenderSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineOverlayGlesRenderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineDualDecoderSyncSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineTransitionVulkanRenderSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
@@ -391,6 +392,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     private var timelineTransitionGlesRenderSmokeCoordinator:
         AndroidTimelineTransitionGlesRenderSmokeCoordinator? = null
 
+    // ── P5-OVERLAYS-TRANS (GLES-RENDER): GlesOverlayCompositor multi-layer ──
+    // overlay shader/raster proof smoke coordinator.
+    private var timelineOverlayGlesRenderSmokeCoordinator:
+        AndroidTimelineOverlayGlesRenderSmokeCoordinator? = null
+
     // ── P5-COMPOSITOR-TRANS (VULKAN-RENDER): VulkanTimelineTransitionCompositor ──
     // shader/raster proof smoke coordinator.
     private var timelineTransitionVulkanRenderSmokeCoordinator:
@@ -688,6 +694,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         timelineTransitionGlesRenderSmokeCoordinator = AndroidTimelineTransitionGlesRenderSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        timelineOverlayGlesRenderSmokeCoordinator = AndroidTimelineOverlayGlesRenderSmokeCoordinator(
             mainHandler = mainHandler,
         )
         timelineTransitionVulkanRenderSmokeCoordinator = AndroidTimelineTransitionVulkanRenderSmokeCoordinator(
@@ -1372,6 +1381,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android timeline transition GLES render smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidTimelineOverlayGlesRenderSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = timelineOverlayGlesRenderSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android timeline overlay GLES render smoke coordinator unavailable",
                     null,
                 )
             }
@@ -2914,6 +2937,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // tears them down in the native call before returning.
         timelineTransitionGlesRenderSmokeCoordinator?.disposeAll()
         timelineTransitionGlesRenderSmokeCoordinator = null
+        // P5-OVERLAYS-TRANS (GLES-RENDER): release the smoke executor. An
+        // in-flight run owns its EGL context/textures on its own thread and
+        // tears them down in the native call before returning.
+        timelineOverlayGlesRenderSmokeCoordinator?.disposeAll()
+        timelineOverlayGlesRenderSmokeCoordinator = null
         // P5-COMPOSITOR-TRANS (VULKAN-RENDER): release the smoke executor. An
         // in-flight run owns its VkDevice/images on its own thread and destroys
         // them in the native call before returning.
