@@ -156,4 +156,27 @@ data class VanguardRealtimeAudioPlaybackSinkTelemetry(
     val playbackHeadAtSeekUnpark: Long,
     // framesWrittenToSink - framesWrittenAtFlush once flushed, else 0.
     val postSeekFramesWritten: Long,
+    // ── Y13 diagnostic production-clock query / epoch-relative lag ──
+    // Bounded diagnostic only (see file header): never influences drain
+    // size, sleeps, gating, checksum, park/unpark, epoch decisions or
+    // transport commands, and does not by itself claim P4-AUDIO-MIXBUS or
+    // P4-AUDIO-GRAPH-TRANSPORT-CLOCK are complete.
+    val epochBaseFrame: Long,
+    val framesWrittenAtEpochOpen: Long,
+    val framesReadAtEpochOpen: Long,
+    val presentationLagSampleCount: Long,
+    val presentationLagBoundedSampleCount: Long,
+    val presentationLagExcludedSampleCount: Long,
+    val lastPresentationLagFrames: Long,
+    val minPresentationLagFrames: Long,
+    val maxPresentationLagFrames: Long,
+    val presentationLagLowerBoundFrames: Long,
+    val presentationLagUpperBoundFrames: Long,
+    val lastPositionFramesAtPoll: Long,
+    val lastPositionUsAtPoll: Long,
+    val positionAtEosFrames: Long,
+    val positionAtEosUs: Long,
+    // Y13: isolated currentPosition() read counters (own counters, distinct from the snapshot-call counters).
+    val currentPositionReadsFromWriterThread: Long,
+    val currentPositionReadsFromOtherThreads: Long,
 )

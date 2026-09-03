@@ -118,6 +118,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 "production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_" +
                 "route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_" +
                 "focus_gain_after_route_disconnect_no_auto_resume_" +
+                "presentation_clock_query_surface_off_thread_current_position_poller_monotonic_" +
+                "current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_" +
                 "stop_dispose_release_once_" +
                 "no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni"
 
@@ -131,6 +133,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val SCENARIO_ROUTE_CHANGE_OBSERVATION = "SCENARIO_ROUTE_CHANGE_OBSERVATION"
         const val SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE = "SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE"
         const val SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED = "SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED"
+        const val SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE = "SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE"
 
         const val DEFAULT_PAUSE_HOLD_MS = 400L
         const val DEFAULT_STOP_AFTER_MS = 300L
@@ -198,6 +201,13 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_ROUTE_DISCONNECT_TERMINAL_PAUSE = "routeDisconnectTerminalPauseOk"
         const val LANE_ROUTE_DISCONNECT_RESUME_BLOCKED = "routeDisconnectResumeBlockedOk"
         const val LANE_ROUTING_MONITOR_TEARDOWN = "routingMonitorTeardownOk"
+        // Y13 lanes, evaluated by the presentation-clock query surface scenario.
+        const val LANE_CURRENT_POSITION_QUERY_SURFACE = "currentPositionQuerySurfaceOk"
+        const val LANE_CURRENT_POSITION_POLLER_MONOTONIC = "currentPositionPollerMonotonicOk"
+        const val LANE_CURRENT_POSITION_READ_COUNTER_ISOLATION = "currentPositionReadCounterIsolationOk"
+        const val LANE_PRESENTATION_LAG_TELEMETRY = "presentationLagTelemetryOk"
+        const val LANE_PRESENTATION_LAG_BOUNDED = "presentationLagBoundedOk"
+        const val LANE_POSITION_AT_EOS_NO_RUNAWAY = "positionAtEosNoRunawayOk"
         const val LANE_CANONICAL = "canonical"
 
         val REQUIRED_LANES: List<String> = listOf(
@@ -216,6 +226,9 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_FOCUS_NOISY_TERMINAL_PAUSE, LANE_FOCUS_PERMANENT_LOSS_PAUSE, LANE_FOCUS_MONITOR_TEARDOWN,
             LANE_ROUTING_SETUP, LANE_ROUTE_CHANGE_OBSERVATION, LANE_ROUTE_DISCONNECT_TERMINAL_PAUSE,
             LANE_ROUTE_DISCONNECT_RESUME_BLOCKED, LANE_ROUTING_MONITOR_TEARDOWN,
+            LANE_CURRENT_POSITION_QUERY_SURFACE, LANE_CURRENT_POSITION_POLLER_MONOTONIC,
+            LANE_CURRENT_POSITION_READ_COUNTER_ISOLATION, LANE_PRESENTATION_LAG_TELEMETRY,
+            LANE_PRESENTATION_LAG_BOUNDED, LANE_POSITION_AT_EOS_NO_RUNAWAY,
         )
 
         val PROOF_BOUNDARY_TOKENS = listOf(
@@ -237,6 +250,9 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "route_change_observed_no_transport_mutation",
             "route_disconnect_terminal_pause_no_resume",
             "focus_gain_after_route_disconnect_no_auto_resume",
+            "presentation_clock_query_surface", "off_thread_current_position_poller_monotonic",
+            "current_position_read_counter_isolation", "epoch_relative_presentation_lag_bounded",
+            "position_at_eos_no_runaway",
             "stop_dispose_release_once",
             "no_product", "no_editor", "no_app", "no_connectsapp", "no_ios",
             "no_streaming", "no_cache", "no_cpp", "no_jni",
@@ -354,7 +370,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "maxSeekHoldMs" to config.maxSeekHoldMs,
             "coordinatorThreadId" to Thread.currentThread().id,
         )
-        val outcomes = ArrayList<ScenarioOutcome>(10)
+        val outcomes = ArrayList<ScenarioOutcome>(11)
         if (config.pauseHoldMs <= 0L || config.pauseHoldMs >= config.maxPauseHoldMs) {
             return buildPayload(false, "invalid_pause_hold:${config.pauseHoldMs}:${config.maxPauseHoldMs}", emptyList(), metrics)
         }
@@ -469,6 +485,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             enableAudioRoutingResponse = true,
         ) { session, outcome ->
             routeDisconnectFocusGainBlockedScenario(session, config, outcome)
+        }
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y13: presentation clock query surface during active playback -> EOS.
+        outcomes += runScenario(SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE, config, injectAfterFrames = 0L) { session, outcome ->
+            presentationClockQuerySurfaceScenario(session, config, outcome)
         }
 
         val lanes = AndroidRealtimeAudioPlaybackProductionLaneEvaluator.aggregateLanes(outcomes)
@@ -1126,6 +1147,126 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             final.decoderAcceptedFrames < declared
     }
 
+    // ── Scenario 11 (Y13): load/start -> active playback with off-thread
+    //    presentation clock poller -> EOS ──────────────────────────────────
+
+    private fun presentationClockQuerySurfaceScenario(
+        session: VanguardRealtimeAudioPlaybackSession,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+    ) {
+        startAndAwaitAudio(session)
+        val coordinatorThreadId = Thread.currentThread().id
+        val running = AtomicBoolean(true)
+        var pollerThreadId = -1L
+        var pollCount = 0L
+        var validCount = 0L
+        var regressionCount = 0L
+        var frameReadCount = 0L
+        var usReadCount = 0L
+        var lastFrame = -1L
+        var lastUs = -1L
+        var minFrame = Long.MAX_VALUE
+        var maxFrame = -1L
+        var minUs = Long.MAX_VALUE
+        var maxUs = -1L
+        var pollerError = ""
+
+        val poller = Thread({
+            pollerThreadId = Thread.currentThread().id
+            while (running.get()) {
+                try {
+                    val f = session.currentPositionFrames()
+                    frameReadCount++
+                    val u = session.currentPositionUs()
+                    usReadCount++
+                    pollCount++
+                    if (f >= 0L) {
+                        validCount++
+                        if (lastFrame >= 0L && f < lastFrame) {
+                            regressionCount++
+                        }
+                        if (f < minFrame) minFrame = f
+                        if (f > maxFrame) maxFrame = f
+                        lastFrame = f
+                    }
+                    if (u >= 0L) {
+                        if (lastUs >= 0L && u < lastUs) {
+                            regressionCount++
+                        }
+                        if (u < minUs) minUs = u
+                        if (u > maxUs) maxUs = u
+                        lastUs = u
+                    }
+                    Thread.sleep(WAIT_SLICE_MS)
+                } catch (_: InterruptedException) {
+                    break
+                } catch (t: Throwable) {
+                    pollerError = "exception:${t.javaClass.simpleName}:${t.message}"
+                    break
+                }
+            }
+        }, "Y13PositionPoller")
+
+        var completionReached = false
+        try {
+            poller.start()
+            completionReached = session.awaitCompletion(config.deadlineMs)
+        } finally {
+            running.set(false)
+            poller.interrupt()
+            try {
+                poller.join(3_000L)
+            } catch (_: InterruptedException) {}
+        }
+        val joined = !poller.isAlive
+        require(joined, "poller_not_joined")
+        require(completionReached, "completion_not_reached:${session.failureReason}")
+
+        val stateAtCompletion = session.currentState
+        val stopRes = session.stop()
+        require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
+        session.dispose()
+        session.dispose()
+        val final = session.snapshot()
+
+        val pollerMetrics = PresentationClockPollerMetrics(
+            pollCount = pollCount,
+            validCount = validCount,
+            regressionCount = regressionCount,
+            frameReadCount = frameReadCount,
+            usReadCount = usReadCount,
+            lastFrame = lastFrame,
+            lastUs = lastUs,
+            minFrame = if (minFrame == Long.MAX_VALUE) -1L else minFrame,
+            maxFrame = maxFrame,
+            minUs = if (minUs == Long.MAX_VALUE) -1L else minUs,
+            maxUs = maxUs,
+            threadId = pollerThreadId,
+            joined = joined,
+            error = pollerError,
+            coordinatorThreadId = coordinatorThreadId,
+        )
+
+        out.metrics["pollerPollCount"] = pollerMetrics.pollCount
+        out.metrics["pollerValidCount"] = pollerMetrics.validCount
+        out.metrics["pollerRegressionCount"] = pollerMetrics.regressionCount
+        out.metrics["pollerFrameReadCount"] = pollerMetrics.frameReadCount
+        out.metrics["pollerUsReadCount"] = pollerMetrics.usReadCount
+        out.metrics["pollerLastFrame"] = pollerMetrics.lastFrame
+        out.metrics["pollerLastUs"] = pollerMetrics.lastUs
+        out.metrics["pollerMinFrame"] = pollerMetrics.minFrame
+        out.metrics["pollerMaxFrame"] = pollerMetrics.maxFrame
+        out.metrics["pollerMinUs"] = pollerMetrics.minUs
+        out.metrics["pollerMaxUs"] = pollerMetrics.maxUs
+        out.metrics["pollerThreadId"] = pollerMetrics.threadId
+        out.metrics["pollerJoined"] = pollerMetrics.joined
+        out.metrics["pollerError"] = pollerMetrics.error
+
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateCommon(final, baselineExpectation, out, coordinatorThreadId)
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluatePresentationClockQuerySurface(final, pollerMetrics, stateAtCompletion, config, out)
+    }
+
     // ── Metrics ────────────────────────────────────────────────────────────
 
     private fun snapshotMetrics(s: VanguardRealtimeAudioPlaybackSession.Snapshot): LinkedHashMap<String, Any?> {
@@ -1286,6 +1427,23 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             m["sinkLastGainAppliedSeq"] = k.lastGainAppliedSeq
             m["sinkGainAppliedOnSinkThread"] = k.gainAppliedOnSinkThread
             m["sinkEffectiveGain"] = k.effectiveGain.toDouble()
+            m["epochBaseFrame"] = k.epochBaseFrame
+            m["framesWrittenAtEpochOpen"] = k.framesWrittenAtEpochOpen
+            m["framesReadAtEpochOpen"] = k.framesReadAtEpochOpen
+            m["presentationLagSampleCount"] = k.presentationLagSampleCount
+            m["presentationLagBoundedSampleCount"] = k.presentationLagBoundedSampleCount
+            m["presentationLagExcludedSampleCount"] = k.presentationLagExcludedSampleCount
+            m["lastPresentationLagFrames"] = k.lastPresentationLagFrames
+            m["minPresentationLagFrames"] = k.minPresentationLagFrames
+            m["maxPresentationLagFrames"] = k.maxPresentationLagFrames
+            m["presentationLagLowerBoundFrames"] = k.presentationLagLowerBoundFrames
+            m["presentationLagUpperBoundFrames"] = k.presentationLagUpperBoundFrames
+            m["lastPositionFramesAtPoll"] = k.lastPositionFramesAtPoll
+            m["lastPositionUsAtPoll"] = k.lastPositionUsAtPoll
+            m["positionAtEosFrames"] = k.positionAtEosFrames
+            m["positionAtEosUs"] = k.positionAtEosUs
+            m["currentPositionReadsFromWriterThread"] = k.currentPositionReadsFromWriterThread
+            m["currentPositionReadsFromOtherThreads"] = k.currentPositionReadsFromOtherThreads
         }
         if (c != null) {
             m["clockConsistent"] = c.consistent
@@ -1412,7 +1570,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "proofBoundary" to PROOF_BOUNDARY,
             "nativeProofBoundary" to PROOF_BOUNDARY,
             "failureReason" to reason,
-            "details" to "Y8a/Y8b/Y9/Y10b/Y11b/Y12 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
+            "details" to "Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
             "lanes" to lanes,
             "metrics" to metricMap,
             "lastError" to if (pass) null else reason,

@@ -51,7 +51,12 @@ import kotlin.concurrent.withLock
 //   - the clock NEVER feeds back: drain size, sleeps, gating, checksum and
 //     (absent) transport commands never depend on a timestamp or clock
 //     outcome; a rejected clock write is counted, never acted on. The sink
-//     reads the clock only at park (next epoch base); that read is counted.
+//     reads the clock at park (next epoch base; that read is counted) AND,
+//     as of Y13 (P4-AUDIO-REALTIME-PLAYBACK-PRESENTATION-CLOCK-QUERY-
+//     SURFACE), at the existing post-write timestamp poll point, where a
+//     bounded, epoch-relative production-clock lag sample is recorded as
+//     diagnostic telemetry only -- a bounded query surface, not a claim
+//     that P4-AUDIO-MIXBUS or P4-AUDIO-GRAPH-TRANSPORT-CLOCK are complete.
 //
 // Seek (Y9, P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK): one forward seek
 // reuses the park protocol as a seek park capped by [Config.maxSeekHoldMs]
@@ -470,6 +475,10 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
 
     fun clockSnapshot(): VanguardRealtimePlaybackPresentationClock.Snapshot = clockWriter.snapshot()
 
+    // Y13: any-thread, non-allocating forwarders onto the owned clock (class comment).
+    fun currentPositionFrames(): Long = clockWriter.currentPositionFrames()
+    fun currentPositionUs(): Long = clockWriter.currentPositionUs()
+
     fun telemetry(): VanguardRealtimeAudioPlaybackSinkTelemetry = VanguardRealtimeAudioPlaybackSinkTelemetry(
         phase = phaseRef.get(),
         exitReason = exitReason,
@@ -602,6 +611,23 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         epochRawOriginAtUnpark = epochRawOriginAtUnpark,
         playbackHeadAtSeekUnpark = playbackHeadAtSeekUnpark,
         postSeekFramesWritten = if (flushCount > 0) framesWrittenToSink - framesWrittenAtFlush else 0L,
+        epochBaseFrame = clockWriter.epochBaseFrame,
+        framesWrittenAtEpochOpen = clockWriter.framesWrittenAtEpochOpen,
+        framesReadAtEpochOpen = clockWriter.framesReadAtEpochOpen,
+        presentationLagSampleCount = clockWriter.presentationLagSampleCount,
+        presentationLagBoundedSampleCount = clockWriter.presentationLagBoundedSampleCount,
+        presentationLagExcludedSampleCount = clockWriter.presentationLagExcludedSampleCount,
+        lastPresentationLagFrames = clockWriter.lastPresentationLagFrames,
+        minPresentationLagFrames = clockWriter.minPresentationLagFrames,
+        maxPresentationLagFrames = clockWriter.maxPresentationLagFrames,
+        presentationLagLowerBoundFrames = clockWriter.presentationLagLowerBoundFrames,
+        presentationLagUpperBoundFrames = clockWriter.presentationLagUpperBoundFrames,
+        lastPositionFramesAtPoll = clockWriter.lastPositionFramesAtPoll,
+        lastPositionUsAtPoll = clockWriter.lastPositionUsAtPoll,
+        positionAtEosFrames = clockWriter.positionAtEosFrames,
+        positionAtEosUs = clockWriter.positionAtEosUs,
+        currentPositionReadsFromWriterThread = clockWriter.currentPositionReadsFromWriterThread,
+        currentPositionReadsFromOtherThreads = clockWriter.currentPositionReadsFromOtherThreads,
     )
 
     // ── Sink thread body ───────────────────────────────────────────────────
@@ -938,7 +964,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         clockWriter.resetUnwrap(0L)
         val baseFrame = framesWrittenToSink
         val nextEpoch = epochBeforeRecovery + 1
-        val openOutcome = clockWriter.openEpoch(nextEpoch, baseFrame)
+        val openOutcome = clockWriter.openEpoch(nextEpoch, baseFrame, framesWrittenToSink, framesReadFromTransport)
         clockWriter.deadObjectEpochOpenAccepted = openOutcome.accepted
         if (!openOutcome.accepted) throw FailClosed("dead_object_epoch_open_rejected:${openOutcome.name.lowercase()}")
         clockWriter.deadObjectEpochOpenedAfterRecovery = nextEpoch
@@ -990,7 +1016,16 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             false
         }
         val head = rawHead()
-        clockWriter.recordTimestampPoll(available, audioTimestamp.framePosition and 0xFFFF_FFFFL, audioTimestamp.nanoTime, head)
+        clockWriter.recordTimestampPoll(
+            available,
+            audioTimestamp.framePosition and 0xFFFF_FFFFL,
+            audioTimestamp.nanoTime,
+            head,
+            framesWrittenToSink,
+            framesReadFromTransport,
+            audioTrackBufferFrames,
+            config.maxFramesPerMix,
+        )
     }
 
     // ── Y9 flush (sink thread only, while PARKED on a seek park, once) ─────
@@ -1134,7 +1169,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             if (target < positionAtPark) throw FailClosed("seek_target_below_position_at_park:$target:$positionAtPark")
             playbackHeadAtSeekUnpark = playbackHeadAtUnpark
             clockWriter.setOrigin(0L)
-            val outcome = clockWriter.openEpoch(nextEpoch, target)
+            val outcome = clockWriter.openEpoch(nextEpoch, target, framesWrittenToSink, framesReadFromTransport)
             seekEpochOpenAccepted = outcome.accepted
             seekEpochOpenedAtUnpark = nextEpoch
             seekEpochBaseFrame = target
@@ -1142,7 +1177,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         } else {
             // Same AudioTrack instance, new clock epoch based at the frozen position.
             clockWriter.setOrigin(positionAtPark)
-            clockWriter.openEpoch(nextEpoch, positionAtPark)
+            clockWriter.openEpoch(nextEpoch, positionAtPark, framesWrittenToSink, framesReadFromTransport)
         }
         epochRawOriginAtUnpark = if (seekPark) 0L else positionAtPark
         epochOpenedAtUnpark = nextEpoch
@@ -1198,13 +1233,14 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
                     played = true
                     // Epoch 0 opens only now: play succeeded on the first productive write.
                     clockWriter.setOrigin(0L)
-                    clockWriter.openEpoch(0, 0L)
+                    clockWriter.openEpoch(0, 0L, framesWrittenToSink, framesReadFromTransport)
                 }
                 pollTimestampOnce()
                 lastProgressMs = SystemClock.elapsedRealtime()
             } else {
                 if (reply.eosDrained) {
                     eosDrainedObserved = true
+                    clockWriter.recordPositionAtEos()
                     break
                 }
                 emptyDrainCount++
@@ -1216,6 +1252,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             }
             if (reply.eosDrained) {
                 eosDrainedObserved = true
+                clockWriter.recordPositionAtEos()
                 break
             }
         }

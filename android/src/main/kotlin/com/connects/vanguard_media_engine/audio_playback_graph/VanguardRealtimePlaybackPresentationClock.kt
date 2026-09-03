@@ -210,6 +210,12 @@ class VanguardRealtimePlaybackPresentationClock(
     private val snapshotCallsFromWriterThread = AtomicLong(0L)
     private val snapshotCallsFromOtherThreads = AtomicLong(0L)
 
+    // Y13: single-field, non-allocating current-position reads. Isolated
+    // from the snapshot counters above (a diagnostic lag poll must never be
+    // conflated with a full [Snapshot] read).
+    private val currentPositionReadsFromWriterThread = AtomicLong(0L)
+    private val currentPositionReadsFromOtherThreads = AtomicLong(0L)
+
     // ── Writer API (single writer: the sink thread) ────────────────────────
 
     // Binds the calling thread as the only writer. Idempotent for the same
@@ -422,6 +428,26 @@ class VanguardRealtimePlaybackPresentationClock(
     }
 
     // ── Reader API (any thread; allocates one Snapshot) ────────────────────
+
+    // Y13: any-thread, non-allocating current position. Reads only the one
+    // @Volatile [positionFrames] field (no seqlock retry, no other field) so
+    // it can be called from a diagnostic lag poll without a Snapshot
+    // allocation; isolated from [snapshotCallsFromWriterThread] /
+    // [snapshotCallsFromOtherThreads] by its own counters.
+    fun currentPositionFrames(): Long {
+        val me = Thread.currentThread().id
+        if (me == writerThreadId) currentPositionReadsFromWriterThread.incrementAndGet() else currentPositionReadsFromOtherThreads.incrementAndGet()
+        return positionFrames
+    }
+
+    // Derives solely from the one [currentPositionFrames] read above.
+    fun currentPositionUs(): Long {
+        val frames = currentPositionFrames()
+        return framesToUs(frames, sampleRate)
+    }
+
+    val currentPositionReadsFromWriterThreadCount: Long get() = currentPositionReadsFromWriterThread.get()
+    val currentPositionReadsFromOtherThreadsCount: Long get() = currentPositionReadsFromOtherThreads.get()
 
     fun snapshot(): Snapshot {
         val me = Thread.currentThread().id

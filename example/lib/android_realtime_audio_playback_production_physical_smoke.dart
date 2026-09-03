@@ -4,15 +4,16 @@
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK (Y9) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b) +
-// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE (Y12): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, and route-change diagnostic physical smoke target.
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE (Y12) +
+// P4-AUDIO-REALTIME-PLAYBACK-PRESENTATION-CLOCK-QUERY-SURFACE (Y13): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, and presentation-clock diagnostic physical smoke target.
 //
 // Component diagnostic smoke: drives production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
 // sink-thread-owned non-zero-gain AudioTrack + presentation clock).
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
 //
 // Honest operational non-claims:
 //   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
@@ -64,7 +65,7 @@ class AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp
 class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     extends State<AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp> {
   String _status =
-      'Running Android DAG Phase 4 (Y8a/Y8b/Y9/Y10b/Y11b/Y12) Realtime Audio Playback Production Sink, Clock, Dead-Object, Seek, Repeated-Seek, Focus Response & Route-Change smoke...';
+      'Running Android DAG Phase 4 (Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13) Realtime Audio Playback Production Sink, Clock, Dead-Object, Seek, Repeated-Seek, Focus Response, Route-Change & Presentation-Clock smoke...';
 
   @override
   void initState() {
@@ -286,6 +287,24 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print(
       '  [LANE] routingMonitorTeardownOk: ${activeReport.routingMonitorTeardownOk}',
     );
+    print(
+      '  [LANE] currentPositionQuerySurfaceOk: ${activeReport.currentPositionQuerySurfaceOk}',
+    );
+    print(
+      '  [LANE] currentPositionPollerMonotonicOk: ${activeReport.currentPositionPollerMonotonicOk}',
+    );
+    print(
+      '  [LANE] currentPositionReadCounterIsolationOk: ${activeReport.currentPositionReadCounterIsolationOk}',
+    );
+    print(
+      '  [LANE] presentationLagTelemetryOk: ${activeReport.presentationLagTelemetryOk}',
+    );
+    print(
+      '  [LANE] presentationLagBoundedOk: ${activeReport.presentationLagBoundedOk}',
+    );
+    print(
+      '  [LANE] positionAtEosNoRunawayOk: ${activeReport.positionAtEosNoRunawayOk}',
+    );
     print('  [LANE] canonical: ${activeReport.canonical}');
 
     // 4. Print key metrics needed for human/Codex review.
@@ -310,6 +329,8 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
         'SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE';
     const routeDisconnectFocusGainBlockedScenarioKey =
         'SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED';
+    const presentationClockQuerySurfaceScenarioKey =
+        'SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE';
 
     final topMetrics = activeReport.metrics;
     final playthroughMetrics = asStringKeyedMap(
@@ -341,6 +362,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     );
     final routeDisconnectFocusGainBlockedMetrics = asStringKeyedMap(
       topMetrics[routeDisconnectFocusGainBlockedScenarioKey],
+    );
+    final presentationClockQuerySurfaceMetrics = asStringKeyedMap(
+      topMetrics[presentationClockQuerySurfaceScenarioKey],
     );
 
     const deadObjectScenarioOwnedKeys = <String>{
@@ -543,7 +567,60 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
           repeatedSeekScenarioOwnedKeys.contains(key);
     }
 
+    const presentationClockScenarioOwnedKeys = <String>{
+      'pollerPollCount',
+      'pollerValidCount',
+      'pollerRegressionCount',
+      'pollerFrameReadCount',
+      'pollerUsReadCount',
+      'pollerLastFrame',
+      'pollerLastUs',
+      'pollerMinFrame',
+      'pollerMaxFrame',
+      'pollerMinUs',
+      'pollerMaxUs',
+      'pollerThreadId',
+      'pollerJoined',
+      'pollerError',
+      'presentationLagSampleCount',
+      'presentationLagBoundedSampleCount',
+      'presentationLagExcludedSampleCount',
+      'lastPresentationLagFrames',
+      'minPresentationLagFrames',
+      'maxPresentationLagFrames',
+      'presentationLagLowerBoundFrames',
+      'presentationLagUpperBoundFrames',
+      'lastPositionFramesAtPoll',
+      'lastPositionUsAtPoll',
+      'positionAtEosFrames',
+      'positionAtEosUs',
+      'currentPositionReadsFromWriterThread',
+      'currentPositionReadsFromOtherThreads',
+    };
+
+    bool isPresentationClockOwnedMetric(String key) {
+      return key.startsWith('poller') ||
+          key.startsWith('presentationLag') ||
+          key.startsWith('currentPosition') ||
+          key.startsWith('positionAtEos') ||
+          presentationClockScenarioOwnedKeys.contains(key);
+    }
+
     Object? lookupMetric(String key) {
+      if (isPresentationClockOwnedMetric(key)) {
+        return topMetrics[key] ??
+            presentationClockQuerySurfaceMetrics[key] ??
+            playthroughMetrics[key] ??
+            stopDisposeMetrics[key] ??
+            deadObjectMetrics[key] ??
+            forwardSeekMetrics[key] ??
+            repeatedSeekMetrics[key] ??
+            focusDuckTransientNoisyMetrics[key] ??
+            focusPermanentLossMetrics[key] ??
+            routeChangeObservationMetrics[key] ??
+            routeDisconnectTerminalPauseMetrics[key] ??
+            routeDisconnectFocusGainBlockedMetrics[key];
+      }
       if (isRoutingOwnedMetric(key)) {
         return topMetrics[key] ??
             routeChangeObservationMetrics[key] ??
@@ -919,6 +996,44 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       routeFocusBlockedCompactKeys,
     );
 
+    const presentationClockCompactKeys = <String>[
+      'pollerPollCount',
+      'pollerValidCount',
+      'pollerRegressionCount',
+      'pollerFrameReadCount',
+      'pollerUsReadCount',
+      'pollerLastFrame',
+      'pollerLastUs',
+      'pollerMinFrame',
+      'pollerMaxFrame',
+      'pollerMinUs',
+      'pollerMaxUs',
+      'pollerThreadId',
+      'pollerJoined',
+      'pollerError',
+      'presentationLagSampleCount',
+      'presentationLagBoundedSampleCount',
+      'presentationLagExcludedSampleCount',
+      'lastPresentationLagFrames',
+      'minPresentationLagFrames',
+      'maxPresentationLagFrames',
+      'presentationLagLowerBoundFrames',
+      'presentationLagUpperBoundFrames',
+      'lastPositionFramesAtPoll',
+      'lastPositionUsAtPoll',
+      'positionAtEosFrames',
+      'positionAtEosUs',
+      'currentPositionReadsFromWriterThread',
+      'currentPositionReadsFromOtherThreads',
+      'scenarioWallMs',
+      'failureReason',
+    ];
+
+    final compactPresentationClock = extractCompactScenario(
+      presentationClockQuerySurfaceMetrics,
+      presentationClockCompactKeys,
+    );
+
     print('--- METRICS ---');
     print('  [METRIC] sourceMime: ${lookupMetric('sourceMime')}');
     print('  [METRIC] sampleRate: ${lookupMetric('sampleRate')}');
@@ -1137,6 +1252,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print(
       '  [SCENARIO] $routeDisconnectFocusGainBlockedScenarioKey: $compactRouteDisconnectFocusGainBlocked',
     );
+    print(
+      '  [SCENARIO] $presentationClockQuerySurfaceScenarioKey: $compactPresentationClock',
+    );
 
     // 5. Verification evaluation.
     final pass =
@@ -1159,13 +1277,14 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
           compactRouteDisconnectTerminalPause,
       routeDisconnectFocusGainBlockedScenarioKey:
           compactRouteDisconnectFocusGainBlocked,
+      presentationClockQuerySurfaceScenarioKey: compactPresentationClock,
     };
 
     // 6. Print JSON marker with compact JSON payload.
     final summaryPayload = <String, dynamic>{
       'unit': 'AndroidRealtimeAudioPlaybackProductionPhysicalSmokeHarness',
-      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE',
-      'subSlice': 'Y12',
+      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-PRESENTATION-CLOCK-QUERY-SURFACE',
+      'subSlice': 'Y13',
       'target':
           VGRealtimeAudioPlaybackProductionSmokeReport.proofBoundaryConstant,
       'selectedFixture': selectedFixturePath,
@@ -1300,6 +1419,51 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
         'routingTerminalDisconnectAfterGain': lookupMetric(
           'routingTerminalDisconnectAfterGain',
         ),
+        'epochBaseFrame': lookupMetric('epochBaseFrame'),
+        'framesWrittenAtEpochOpen': lookupMetric('framesWrittenAtEpochOpen'),
+        'framesReadAtEpochOpen': lookupMetric('framesReadAtEpochOpen'),
+        'presentationLagSampleCount': lookupMetric(
+          'presentationLagSampleCount',
+        ),
+        'presentationLagBoundedSampleCount': lookupMetric(
+          'presentationLagBoundedSampleCount',
+        ),
+        'presentationLagExcludedSampleCount': lookupMetric(
+          'presentationLagExcludedSampleCount',
+        ),
+        'lastPresentationLagFrames': lookupMetric('lastPresentationLagFrames'),
+        'minPresentationLagFrames': lookupMetric('minPresentationLagFrames'),
+        'maxPresentationLagFrames': lookupMetric('maxPresentationLagFrames'),
+        'presentationLagLowerBoundFrames': lookupMetric(
+          'presentationLagLowerBoundFrames',
+        ),
+        'presentationLagUpperBoundFrames': lookupMetric(
+          'presentationLagUpperBoundFrames',
+        ),
+        'lastPositionFramesAtPoll': lookupMetric('lastPositionFramesAtPoll'),
+        'lastPositionUsAtPoll': lookupMetric('lastPositionUsAtPoll'),
+        'positionAtEosFrames': lookupMetric('positionAtEosFrames'),
+        'positionAtEosUs': lookupMetric('positionAtEosUs'),
+        'currentPositionReadsFromWriterThread': lookupMetric(
+          'currentPositionReadsFromWriterThread',
+        ),
+        'currentPositionReadsFromOtherThreads': lookupMetric(
+          'currentPositionReadsFromOtherThreads',
+        ),
+        'pollerPollCount': lookupMetric('pollerPollCount'),
+        'pollerValidCount': lookupMetric('pollerValidCount'),
+        'pollerRegressionCount': lookupMetric('pollerRegressionCount'),
+        'pollerFrameReadCount': lookupMetric('pollerFrameReadCount'),
+        'pollerUsReadCount': lookupMetric('pollerUsReadCount'),
+        'pollerLastFrame': lookupMetric('pollerLastFrame'),
+        'pollerLastUs': lookupMetric('pollerLastUs'),
+        'pollerMinFrame': lookupMetric('pollerMinFrame'),
+        'pollerMaxFrame': lookupMetric('pollerMaxFrame'),
+        'pollerMinUs': lookupMetric('pollerMinUs'),
+        'pollerMaxUs': lookupMetric('pollerMaxUs'),
+        'pollerThreadId': lookupMetric('pollerThreadId'),
+        'pollerJoined': lookupMetric('pollerJoined'),
+        'pollerError': lookupMetric('pollerError'),
       },
       'error': topLevelError,
     };

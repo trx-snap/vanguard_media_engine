@@ -17,6 +17,9 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_EPOCH_BALANCED
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_MONOTONIC
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CLOCK_PAUSE_FROZEN
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CURRENT_POSITION_POLLER_MONOTONIC
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CURRENT_POSITION_QUERY_SURFACE
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CURRENT_POSITION_READ_COUNTER_ISOLATION
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DEAD_OBJECT_CLOCK_EPOCH
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DEAD_OBJECT_RECOVERY
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DEAD_OBJECT_REMAINDER
@@ -31,8 +34,11 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_NONZERO_GAIN
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_NO_FEEDBACK
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_PLAYTHROUGH_ACCOUNTING
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_POSITION_AT_EOS_NO_RUNAWAY
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_POST_SEEK_DRAIN
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_PRE_ROLL
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_PRESENTATION_LAG_BOUNDED
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_PRESENTATION_LAG_TELEMETRY
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_PROOF_BOUNDARY
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_REPEATED_SEEK_COMMAND
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_REPEATED_SEEK_CUMULATIVE_ACCOUNTING
@@ -54,7 +60,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.PROOF_BOUNDARY_TOKENS
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.REQUIRED_LANES
 
-// Per-invocation Y8a/Y8b/Y9/Y10b/Y11b/Y12 smoke arguments, shared by scenario sequencing
+// Per-invocation Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13 smoke arguments, shared by scenario sequencing
 // (coordinator) and lane evaluation (this file).
 data class SmokeConfig(
     val sourcePath: String,
@@ -92,8 +98,27 @@ class ScenarioOutcome(val name: String) {
     var failureReason = ""
 }
 
+// Y13 off-thread poller metrics for the presentation-clock query surface scenario.
+data class PresentationClockPollerMetrics(
+    val pollCount: Long,
+    val validCount: Long,
+    val regressionCount: Long,
+    val frameReadCount: Long,
+    val usReadCount: Long,
+    val lastFrame: Long,
+    val lastUs: Long,
+    val minFrame: Long,
+    val maxFrame: Long,
+    val minUs: Long,
+    val maxUs: Long,
+    val threadId: Long,
+    val joined: Boolean,
+    val error: String,
+    val coordinatorThreadId: Long = 0L,
+)
+
 // Pure lane evaluation, A-prime dead-object base-step decomposition, and lane
-// aggregation for the Y8a/Y8b production smoke coordinator. Every function
+// aggregation for the Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13 production smoke coordinator. Every function
 // here reads already-captured session/sink/clock snapshots; none owns a
 // thread, session, handler, AudioTrack instance, or lifecycle decision.
 object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
@@ -1085,6 +1110,97 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             final.transportStateAfterDispose == VanguardRealtimePlaybackTransportStateMachine.State.DISPOSED &&
             final.state == VanguardRealtimeAudioPlaybackSession.State.DISPOSED &&
             final.failureReason.isBlank()
+    }
+
+    // Y13 lanes: the off-thread poller repeatedly queried the public query
+    // surface (currentPositionFrames / currentPositionUs) on an independent
+    // thread without regressing, currentPosition read counters recorded
+    // writer vs other thread reads cleanly isolated from snapshot counters,
+    // epoch-relative presentation lag telemetry was captured and bounded
+    // analytically, and the final EOS position exhibited no runaway.
+    fun evaluatePresentationClockQuerySurface(
+        final: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        poller: PresentationClockPollerMetrics,
+        stateAtCompletion: VanguardRealtimeAudioPlaybackSession.State,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+    ) {
+        val fmt = final.format ?: return
+        val sink = final.sink ?: return
+        val clock = final.clock ?: return
+        val declared = fmt.declaredFrameCount
+
+        out.metrics["stateAtCompletion"] = stateAtCompletion.name
+        out.metrics["pollerPollCount"] = poller.pollCount
+        out.metrics["pollerValidCount"] = poller.validCount
+        out.metrics["pollerRegressionCount"] = poller.regressionCount
+        out.metrics["pollerFrameReadCount"] = poller.frameReadCount
+        out.metrics["pollerUsReadCount"] = poller.usReadCount
+        out.metrics["pollerLastFrame"] = poller.lastFrame
+        out.metrics["pollerLastUs"] = poller.lastUs
+        out.metrics["pollerMinFrame"] = poller.minFrame
+        out.metrics["pollerMaxFrame"] = poller.maxFrame
+        out.metrics["pollerMinUs"] = poller.minUs
+        out.metrics["pollerMaxUs"] = poller.maxUs
+        out.metrics["pollerThreadId"] = poller.threadId
+        out.metrics["pollerJoined"] = poller.joined
+        out.metrics["pollerError"] = poller.error
+        out.metrics["presentationLagSampleCount"] = sink.presentationLagSampleCount
+        out.metrics["presentationLagBoundedSampleCount"] = sink.presentationLagBoundedSampleCount
+        out.metrics["presentationLagExcludedSampleCount"] = sink.presentationLagExcludedSampleCount
+        out.metrics["lastPresentationLagFrames"] = sink.lastPresentationLagFrames
+        out.metrics["minPresentationLagFrames"] = sink.minPresentationLagFrames
+        out.metrics["maxPresentationLagFrames"] = sink.maxPresentationLagFrames
+        out.metrics["presentationLagLowerBoundFrames"] = sink.presentationLagLowerBoundFrames
+        out.metrics["presentationLagUpperBoundFrames"] = sink.presentationLagUpperBoundFrames
+        out.metrics["lastPositionFramesAtPoll"] = sink.lastPositionFramesAtPoll
+        out.metrics["lastPositionUsAtPoll"] = sink.lastPositionUsAtPoll
+        out.metrics["positionAtEosFrames"] = sink.positionAtEosFrames
+        out.metrics["positionAtEosUs"] = sink.positionAtEosUs
+        out.metrics["currentPositionReadsFromWriterThread"] = sink.currentPositionReadsFromWriterThread
+        out.metrics["currentPositionReadsFromOtherThreads"] = sink.currentPositionReadsFromOtherThreads
+
+        out.lanes[LANE_PLAYTHROUGH_ACCOUNTING] = playthroughAccountingOk(final, stateAtCompletion)
+        out.lanes[LANE_CHECKSUM_IDENTITY] = checksumIdentityOk(final)
+
+        out.lanes[LANE_CURRENT_POSITION_QUERY_SURFACE] = poller.joined &&
+            poller.error.isBlank() &&
+            poller.validCount > 0L &&
+            poller.pollCount > 0L &&
+            sink.currentPositionReadsFromOtherThreads >= poller.frameReadCount + poller.usReadCount &&
+            sink.currentPositionReadsFromOtherThreads > 0L &&
+            final.failureReason.isBlank()
+
+        val threadDistinct = poller.threadId > 0L &&
+            poller.threadId != poller.coordinatorThreadId &&
+            poller.threadId != sink.threadId &&
+            (final.decoderThreadId <= 0L || poller.threadId != final.decoderThreadId)
+        out.lanes[LANE_CURRENT_POSITION_POLLER_MONOTONIC] = poller.regressionCount == 0L &&
+            poller.validCount >= 3L &&
+            poller.frameReadCount >= 3L &&
+            poller.usReadCount >= 3L &&
+            threadDistinct
+
+        out.lanes[LANE_CURRENT_POSITION_READ_COUNTER_ISOLATION] = sink.currentPositionReadsFromOtherThreads >= poller.frameReadCount + poller.usReadCount &&
+            sink.currentPositionReadsFromOtherThreads > 0L &&
+            sink.currentPositionReadsFromWriterThread >= 1L &&
+            clock.offWriterThreadCalls == 0L
+
+        out.lanes[LANE_PRESENTATION_LAG_TELEMETRY] = sink.presentationLagSampleCount > 0L &&
+            sink.lastPositionFramesAtPoll >= 0L &&
+            sink.presentationLagLowerBoundFrames <= sink.presentationLagUpperBoundFrames &&
+            sink.presentationLagExcludedSampleCount >= 0L
+
+        out.lanes[LANE_PRESENTATION_LAG_BOUNDED] = sink.presentationLagBoundedSampleCount == sink.presentationLagSampleCount &&
+            sink.presentationLagSampleCount > 0L &&
+            sink.lastPresentationLagFrames in sink.presentationLagLowerBoundFrames..sink.presentationLagUpperBoundFrames &&
+            sink.minPresentationLagFrames in sink.presentationLagLowerBoundFrames..sink.presentationLagUpperBoundFrames &&
+            sink.maxPresentationLagFrames in sink.presentationLagLowerBoundFrames..sink.presentationLagUpperBoundFrames
+
+        val maxAllowedEosFrames = declared + sink.audioTrackBufferFrames.toLong() + config.maxFramesPerMix.toLong()
+        out.lanes[LANE_POSITION_AT_EOS_NO_RUNAWAY] = sink.positionAtEosFrames >= 0L &&
+            sink.positionAtEosUs >= 0L &&
+            sink.positionAtEosFrames <= maxAllowedEosFrames
     }
 
     // A lane holds only when every scenario that evaluated it passed and at

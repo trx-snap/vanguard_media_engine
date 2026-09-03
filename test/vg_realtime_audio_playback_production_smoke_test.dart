@@ -12,7 +12,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
 const _kCanonicalProofBoundary =
-    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
+    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
 
 const _kPassMarker =
     'ANDROID_DAG_PHASE4_REALTIME_AUDIO_PLAYBACK_PRODUCTION_PHYSICAL_SMOKE_PASS';
@@ -67,6 +67,12 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'routeDisconnectTerminalPauseOk': true,
     'routeDisconnectResumeBlockedOk': true,
     'routingMonitorTeardownOk': true,
+    'currentPositionQuerySurfaceOk': true,
+    'currentPositionPollerMonotonicOk': true,
+    'currentPositionReadCounterIsolationOk': true,
+    'presentationLagTelemetryOk': true,
+    'presentationLagBoundedOk': true,
+    'positionAtEosNoRunawayOk': true,
     'canonical': true,
   };
 
@@ -183,6 +189,37 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'routingLastReason': 'route_disconnect',
     'publicResumeAccepted': false,
     'publicResumeReason': 'routing_terminal_disconnect',
+    'epochBaseFrame': 0,
+    'framesWrittenAtEpochOpen': 0,
+    'framesReadAtEpochOpen': 0,
+    'presentationLagSampleCount': 120,
+    'presentationLagBoundedSampleCount': 120,
+    'presentationLagExcludedSampleCount': 2,
+    'lastPresentationLagFrames': 512,
+    'minPresentationLagFrames': -64,
+    'maxPresentationLagFrames': 1024,
+    'presentationLagLowerBoundFrames': -2560,
+    'presentationLagUpperBoundFrames': 4096,
+    'lastPositionFramesAtPoll': 140000,
+    'lastPositionUsAtPoll': 2916666,
+    'positionAtEosFrames': 144000,
+    'positionAtEosUs': 3000000,
+    'currentPositionReadsFromWriterThread': 122,
+    'currentPositionReadsFromOtherThreads': 240,
+    'pollerPollCount': 120,
+    'pollerValidCount': 120,
+    'pollerRegressionCount': 0,
+    'pollerFrameReadCount': 120,
+    'pollerUsReadCount': 120,
+    'pollerLastFrame': 144000,
+    'pollerLastUs': 3000000,
+    'pollerMinFrame': 0,
+    'pollerMaxFrame': 144000,
+    'pollerMinUs': 0,
+    'pollerMaxUs': 3000000,
+    'pollerThreadId': 105,
+    'pollerJoined': true,
+    'pollerError': '',
     'failureReason': '',
     'lastError': 'none',
   };
@@ -195,7 +232,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'nativeProofBoundary': _kCanonicalProofBoundary,
     'failureReason': '',
     'details':
-        'Y8a/Y8b/Y9/Y10b/Y11b/Y12 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS,SCENARIO_FORWARD_SEEK_TO_EOS,SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS,SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY,SCENARIO_FOCUS_PERMANENT_LOSS,SCENARIO_ROUTE_CHANGE_OBSERVATION,SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE,SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED',
+        'Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS,SCENARIO_FORWARD_SEEK_TO_EOS,SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS,SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY,SCENARIO_FOCUS_PERMANENT_LOSS,SCENARIO_ROUTE_CHANGE_OBSERVATION,SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE,SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED,SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE',
     'lanes': lanes,
     'metrics': metrics,
     'lastError': null,
@@ -264,11 +301,11 @@ void main() {
         VGRealtimeAudioPlaybackProductionSmokeReport
             .requiredNonCanonicalLanes
             .length,
-        equals(42),
+        equals(48),
       );
       expect(
         VGRealtimeAudioPlaybackProductionSmokeReport.requiredLanes.length,
-        equals(43),
+        equals(49),
       );
 
       final expectedLanes = <String>[
@@ -314,6 +351,12 @@ void main() {
         'routeDisconnectTerminalPauseOk',
         'routeDisconnectResumeBlockedOk',
         'routingMonitorTeardownOk',
+        'currentPositionQuerySurfaceOk',
+        'currentPositionPollerMonotonicOk',
+        'currentPositionReadCounterIsolationOk',
+        'presentationLagTelemetryOk',
+        'presentationLagBoundedOk',
+        'positionAtEosNoRunawayOk',
         'canonical',
       ];
 
@@ -798,6 +841,193 @@ void main() {
       );
       expect(
         report.details.contains('SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED'),
+        isTrue,
+      );
+    });
+
+    test('missing one new required Y13 lane fails isVerifiedPass', () {
+      for (final lane in <String>[
+        'currentPositionQuerySurfaceOk',
+        'currentPositionPollerMonotonicOk',
+        'currentPositionReadCounterIsolationOk',
+        'presentationLagTelemetryOk',
+        'presentationLagBoundedOk',
+        'positionAtEosNoRunawayOk',
+      ]) {
+        final raw = _createSampleRawMap();
+        final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
+        lanes.remove(lane);
+        raw['lanes'] = lanes;
+        if (raw['metrics'] is Map) {
+          final metrics = Map<String, Object?>.from(raw['metrics'] as Map);
+          metrics.remove(lane);
+          raw['metrics'] = metrics;
+        }
+        raw.remove(lane);
+
+        final report = VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(
+          raw,
+        );
+        expect(report.pass, isFalse);
+        expect(report.isVerifiedPass, isFalse);
+        expect(report.marker, equals(_kFailMarker));
+        expect(report.status, equals('missing_lane'));
+        expect(report.lastError, equals('missing_lane_$lane'));
+      }
+    });
+
+    test(
+      'new Y13 presentation clock and poller metric keys parse and are present in metrics map',
+      () {
+        final report = _createSampleReport();
+        expect(report.metrics.containsKey('epochBaseFrame'), isTrue);
+        expect(report.metrics['epochBaseFrame'], equals(0));
+        expect(report.metrics.containsKey('framesWrittenAtEpochOpen'), isTrue);
+        expect(report.metrics['framesWrittenAtEpochOpen'], equals(0));
+        expect(report.metrics.containsKey('framesReadAtEpochOpen'), isTrue);
+        expect(report.metrics['framesReadAtEpochOpen'], equals(0));
+        expect(
+          report.metrics.containsKey('presentationLagSampleCount'),
+          isTrue,
+        );
+        expect(report.metrics['presentationLagSampleCount'], equals(120));
+        expect(
+          report.metrics.containsKey('presentationLagBoundedSampleCount'),
+          isTrue,
+        );
+        expect(
+          report.metrics['presentationLagBoundedSampleCount'],
+          equals(120),
+        );
+        expect(
+          report.metrics.containsKey('presentationLagExcludedSampleCount'),
+          isTrue,
+        );
+        expect(report.metrics['presentationLagExcludedSampleCount'], equals(2));
+        expect(report.metrics.containsKey('lastPresentationLagFrames'), isTrue);
+        expect(report.metrics['lastPresentationLagFrames'], equals(512));
+        expect(report.metrics.containsKey('minPresentationLagFrames'), isTrue);
+        expect(report.metrics['minPresentationLagFrames'], equals(-64));
+        expect(report.metrics.containsKey('maxPresentationLagFrames'), isTrue);
+        expect(report.metrics['maxPresentationLagFrames'], equals(1024));
+        expect(
+          report.metrics.containsKey('presentationLagLowerBoundFrames'),
+          isTrue,
+        );
+        expect(
+          report.metrics['presentationLagLowerBoundFrames'],
+          equals(-2560),
+        );
+        expect(
+          report.metrics.containsKey('presentationLagUpperBoundFrames'),
+          isTrue,
+        );
+        expect(report.metrics['presentationLagUpperBoundFrames'], equals(4096));
+        expect(report.metrics.containsKey('lastPositionFramesAtPoll'), isTrue);
+        expect(report.metrics['lastPositionFramesAtPoll'], equals(140000));
+        expect(report.metrics.containsKey('lastPositionUsAtPoll'), isTrue);
+        expect(report.metrics['lastPositionUsAtPoll'], equals(2916666));
+        expect(report.metrics.containsKey('positionAtEosFrames'), isTrue);
+        expect(report.metrics['positionAtEosFrames'], equals(144000));
+        expect(report.metrics.containsKey('positionAtEosUs'), isTrue);
+        expect(report.metrics['positionAtEosUs'], equals(3000000));
+        expect(
+          report.metrics.containsKey('currentPositionReadsFromWriterThread'),
+          isTrue,
+        );
+        expect(
+          report.metrics['currentPositionReadsFromWriterThread'],
+          equals(122),
+        );
+        expect(
+          report.metrics.containsKey('currentPositionReadsFromOtherThreads'),
+          isTrue,
+        );
+        expect(
+          report.metrics['currentPositionReadsFromOtherThreads'],
+          equals(240),
+        );
+        expect(report.metrics.containsKey('pollerPollCount'), isTrue);
+        expect(report.metrics['pollerPollCount'], equals(120));
+        expect(report.metrics.containsKey('pollerValidCount'), isTrue);
+        expect(report.metrics['pollerValidCount'], equals(120));
+        expect(report.metrics.containsKey('pollerRegressionCount'), isTrue);
+        expect(report.metrics['pollerRegressionCount'], equals(0));
+        expect(report.metrics.containsKey('pollerFrameReadCount'), isTrue);
+        expect(report.metrics['pollerFrameReadCount'], equals(120));
+        expect(report.metrics.containsKey('pollerUsReadCount'), isTrue);
+        expect(report.metrics['pollerUsReadCount'], equals(120));
+        expect(report.metrics.containsKey('pollerLastFrame'), isTrue);
+        expect(report.metrics['pollerLastFrame'], equals(144000));
+        expect(report.metrics.containsKey('pollerLastUs'), isTrue);
+        expect(report.metrics['pollerLastUs'], equals(3000000));
+        expect(report.metrics.containsKey('pollerMinFrame'), isTrue);
+        expect(report.metrics['pollerMinFrame'], equals(0));
+        expect(report.metrics.containsKey('pollerMaxFrame'), isTrue);
+        expect(report.metrics['pollerMaxFrame'], equals(144000));
+        expect(report.metrics.containsKey('pollerMinUs'), isTrue);
+        expect(report.metrics['pollerMinUs'], equals(0));
+        expect(report.metrics.containsKey('pollerMaxUs'), isTrue);
+        expect(report.metrics['pollerMaxUs'], equals(3000000));
+        expect(report.metrics.containsKey('pollerThreadId'), isTrue);
+        expect(report.metrics['pollerThreadId'], equals(105));
+        expect(report.metrics.containsKey('pollerJoined'), isTrue);
+        expect(report.metrics['pollerJoined'], isTrue);
+        expect(report.metrics.containsKey('pollerError'), isTrue);
+        expect(report.metrics['pollerError'], equals(''));
+      },
+    );
+
+    test(
+      'new Y13 presentation clock and poller getters return expected values',
+      () {
+        final report = _createSampleReport();
+        expect(report.currentPositionQuerySurfaceOk, isTrue);
+        expect(report.currentPositionPollerMonotonicOk, isTrue);
+        expect(report.currentPositionReadCounterIsolationOk, isTrue);
+        expect(report.presentationLagTelemetryOk, isTrue);
+        expect(report.presentationLagBoundedOk, isTrue);
+        expect(report.positionAtEosNoRunawayOk, isTrue);
+
+        expect(report.epochBaseFrame, equals(0));
+        expect(report.framesWrittenAtEpochOpen, equals(0));
+        expect(report.framesReadAtEpochOpen, equals(0));
+        expect(report.presentationLagSampleCount, equals(120));
+        expect(report.presentationLagBoundedSampleCount, equals(120));
+        expect(report.presentationLagExcludedSampleCount, equals(2));
+        expect(report.lastPresentationLagFrames, equals(512));
+        expect(report.minPresentationLagFrames, equals(-64));
+        expect(report.maxPresentationLagFrames, equals(1024));
+        expect(report.presentationLagLowerBoundFrames, equals(-2560));
+        expect(report.presentationLagUpperBoundFrames, equals(4096));
+        expect(report.lastPositionFramesAtPoll, equals(140000));
+        expect(report.lastPositionUsAtPoll, equals(2916666));
+        expect(report.positionAtEosFrames, equals(144000));
+        expect(report.positionAtEosUs, equals(3000000));
+        expect(report.currentPositionReadsFromWriterThread, equals(122));
+        expect(report.currentPositionReadsFromOtherThreads, equals(240));
+
+        expect(report.pollerPollCount, equals(120));
+        expect(report.pollerValidCount, equals(120));
+        expect(report.pollerRegressionCount, equals(0));
+        expect(report.pollerFrameReadCount, equals(120));
+        expect(report.pollerUsReadCount, equals(120));
+        expect(report.pollerLastFrame, equals(144000));
+        expect(report.pollerLastUs, equals(3000000));
+        expect(report.pollerMinFrame, equals(0));
+        expect(report.pollerMaxFrame, equals(144000));
+        expect(report.pollerMinUs, equals(0));
+        expect(report.pollerMaxUs, equals(3000000));
+        expect(report.pollerThreadId, equals(105));
+        expect(report.pollerJoined, isTrue);
+        expect(report.pollerError, equals(''));
+      },
+    );
+
+    test('report details contains Y13 presentation clock scenario', () {
+      final report = _createSampleReport();
+      expect(
+        report.details.contains('SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE'),
         isTrue,
       );
     });

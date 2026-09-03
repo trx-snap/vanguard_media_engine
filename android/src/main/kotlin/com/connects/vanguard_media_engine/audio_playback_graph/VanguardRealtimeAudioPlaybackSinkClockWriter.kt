@@ -99,6 +99,53 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
     @Volatile var deadObjectTimestampPollsDuringRecovery = -1L
     @Volatile var playbackHeadAtDeadObject = -1L
 
+    // ── Y13 diagnostic production-clock query / epoch-relative lag telemetry ─
+    //
+    // P4-AUDIO-REALTIME-PLAYBACK-PRESENTATION-CLOCK-QUERY-SURFACE: a bounded
+    // diagnostic surface only. It never influences drain size, sleeps,
+    // gating, checksum, park/unpark, epoch decisions or transport commands
+    // (record telemetry only); it does not by itself claim P4-AUDIO-MIXBUS
+    // or P4-AUDIO-GRAPH-TRANSPORT-CLOCK are complete. Lag is computed only
+    // at the existing post-write timestamp poll path in [recordTimestampPoll]
+    // (no new/second poll point, no extra AudioTrack call), epoch-relative
+    // via the anchors captured once per [openEpoch] call so a seek's base
+    // discontinuity never leaks into the metric as cumulative drift.
+    @Volatile var epochBaseFrame = -1L
+        private set
+    @Volatile var framesWrittenAtEpochOpen = -1L
+        private set
+    @Volatile var framesReadAtEpochOpen = -1L
+        private set
+    @Volatile var presentationLagSampleCount = 0L
+        private set
+    // Of [presentationLagSampleCount], how many fell within the honest bounds below.
+    @Volatile var presentationLagBoundedSampleCount = 0L
+        private set
+    // RESET / STALE / no-anchor (or off-epoch) samples: never fed into the lag formula.
+    @Volatile var presentationLagExcludedSampleCount = 0L
+        private set
+    @Volatile var lastPresentationLagFrames = 0L
+        private set
+    @Volatile var minPresentationLagFrames = 0L
+        private set
+    @Volatile var maxPresentationLagFrames = 0L
+        private set
+    // -(extrapolation horizon in frames + one mix window); no nonnegative-lag claim.
+    @Volatile var presentationLagLowerBoundFrames = 0L
+        private set
+    // AudioTrack client buffer + one mix window + the same extrapolation horizon
+    // used on the negative side (timestamp freshness / output-path uncertainty).
+    @Volatile var presentationLagUpperBoundFrames = 0L
+        private set
+    @Volatile var lastPositionFramesAtPoll = -1L
+        private set
+    @Volatile var lastPositionUsAtPoll = -1L
+        private set
+    @Volatile var positionAtEosFrames = -1L
+        private set
+    @Volatile var positionAtEosUs = -1L
+        private set
+
     // Pure arithmetic (Y8b proof decomposition): step = baseFrame -
     // positionBeforeRecovery must be >= 0 (sign-only fail-closed claim; the
     // caller throws when this returns false, before any decomposition is
@@ -144,6 +191,20 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
 
     fun snapshot(): VanguardRealtimePlaybackPresentationClock.Snapshot = presentationClock.snapshot()
 
+    // Y13: any-thread, non-allocating forwarders onto the owned clock (class
+    // comment); isolated from the snapshot-call counters above (own counters).
+    fun currentPositionFrames(): Long = presentationClock.currentPositionFrames()
+    fun currentPositionUs(): Long = presentationClock.currentPositionUs()
+    val currentPositionReadsFromWriterThread: Long get() = presentationClock.currentPositionReadsFromWriterThreadCount
+    val currentPositionReadsFromOtherThreads: Long get() = presentationClock.currentPositionReadsFromOtherThreadsCount
+
+    // Sink thread only, once at EOS: no new timestamp poll (class comment).
+    fun recordPositionAtEos() {
+        val frames = presentationClock.currentPositionFrames()
+        positionAtEosFrames = frames
+        positionAtEosUs = VanguardRealtimePlaybackPresentationClock.framesToUs(frames, presentationClock.sampleRate)
+    }
+
     fun snapshotAtPark(): VanguardRealtimePlaybackPresentationClock.Snapshot {
         clockSnapshotsAtPark++
         return presentationClock.snapshot()
@@ -158,11 +219,25 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
         if (!outcome.accepted) clockRejectedCount++
     }
 
-    fun openEpoch(epoch: Int, baseFrame: Long): VanguardRealtimePlaybackPresentationClock.Outcome {
+    // Y13: also anchors the epoch-relative lag inputs (class comment) --
+    // baseFrame doubles as [epochBaseFrame], and the caller-supplied stream
+    // counters at this same open become [framesWrittenAtEpochOpen] /
+    // [framesReadAtEpochOpen]. Set unconditionally (matching [currentEpoch]
+    // above): every existing call site throws on a rejected outcome, so a
+    // stale anchor never survives to a later poll.
+    fun openEpoch(
+        epoch: Int,
+        baseFrame: Long,
+        framesWrittenAtEpochOpen: Long,
+        framesReadAtEpochOpen: Long,
+    ): VanguardRealtimePlaybackPresentationClock.Outcome {
         currentEpoch = epoch
         clockEpochOpenCalls++
         val outcome = presentationClock.epochOpened(epoch, baseFrame, System.nanoTime())
         countClockOutcome(outcome)
+        epochBaseFrame = baseFrame
+        this.framesWrittenAtEpochOpen = framesWrittenAtEpochOpen
+        this.framesReadAtEpochOpen = framesReadAtEpochOpen
         return outcome
     }
 
@@ -237,9 +312,23 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
 
     // The accounting half of one timestamp poll, given the raw AudioTrack
     // read the bridge already performed. Telemetry and clock writes only;
-    // nothing downstream depends on the result.
-    fun recordTimestampPoll(available: Boolean, framePositionRaw: Long, frameNanoTime: Long, head: Long) {
+    // nothing downstream depends on the result. Y13: the SAME observation
+    // also feeds the epoch-relative lag bound below (no second poll point,
+    // no extra AudioTrack call); framesReadFromTransport is accepted for
+    // anchor-input symmetry with [openEpoch] but the lag formula itself
+    // (class comment) does not use it.
+    fun recordTimestampPoll(
+        available: Boolean,
+        framePositionRaw: Long,
+        frameNanoTime: Long,
+        head: Long,
+        framesWrittenToSink: Long,
+        framesReadFromTransport: Long,
+        audioTrackBufferFrames: Int,
+        maxFramesPerMix: Int,
+    ) {
         val epoch = currentEpoch
+        val outcome: VanguardRealtimePlaybackPresentationClock.Outcome
         if (available) {
             timestampPollSuccesses++
             val instance = unwrapInstanceFrame(framePositionRaw)
@@ -252,10 +341,55 @@ class VanguardRealtimeAudioPlaybackSinkClockWriter(sampleRate: Int) {
                 clockRejectedCount++
                 return
             }
-            countClockOutcome(presentationClock.observeTimestamp(epoch, rebased, frameNanoTime))
+            outcome = presentationClock.observeTimestamp(epoch, rebased, frameNanoTime)
+            countClockOutcome(outcome)
         } else {
             timestampPollUnavailable++
-            countClockOutcome(presentationClock.observeTimestampUnavailable(epoch, head, System.nanoTime()))
+            outcome = presentationClock.observeTimestampUnavailable(epoch, head, System.nanoTime())
+            countClockOutcome(outcome)
         }
+        recordPresentationLag(outcome, framesWrittenToSink, audioTrackBufferFrames, maxFramesPerMix)
+    }
+
+    // Y13 bounded diagnostic only (class comment): never fails closed, never
+    // read by any drain/gating/epoch/transport decision. Lag is computed
+    // only for an accepted ANCHORED/EXTRAPOLATED outcome with an epoch-open
+    // anchor on record; every other outcome (RESET/STALE/no-anchor/rejected)
+    // is excluded and counted separately, honestly, with no nonnegative-lag
+    // claim.
+    private fun recordPresentationLag(
+        outcome: VanguardRealtimePlaybackPresentationClock.Outcome,
+        framesWrittenToSink: Long,
+        audioTrackBufferFrames: Int,
+        maxFramesPerMix: Int,
+    ) {
+        val positionFrames = presentationClock.currentPositionFrames()
+        lastPositionFramesAtPoll = positionFrames
+        lastPositionUsAtPoll = VanguardRealtimePlaybackPresentationClock.framesToUs(positionFrames, presentationClock.sampleRate)
+        val eligible = outcome == VanguardRealtimePlaybackPresentationClock.Outcome.ACCEPTED_ANCHORED ||
+            outcome == VanguardRealtimePlaybackPresentationClock.Outcome.ACCEPTED_EXTRAPOLATED
+        if (!eligible || epochBaseFrame < 0L) {
+            presentationLagExcludedSampleCount++
+            return
+        }
+        val lag = (framesWrittenToSink - framesWrittenAtEpochOpen) - (positionFrames - epochBaseFrame)
+        presentationLagSampleCount++
+        lastPresentationLagFrames = lag
+        if (presentationLagSampleCount == 1L) {
+            minPresentationLagFrames = lag
+            maxPresentationLagFrames = lag
+        } else {
+            if (lag < minPresentationLagFrames) minPresentationLagFrames = lag
+            if (lag > maxPresentationLagFrames) maxPresentationLagFrames = lag
+        }
+        val horizonFrames = presentationClock.extrapolationHorizonNs * presentationClock.sampleRate / 1_000_000_000L
+        val lower = -(horizonFrames + maxFramesPerMix)
+        // Upper side: client buffer + one mix window + the same timestamp
+        // freshness horizon / output-path uncertainty as the negative side.
+        // Diagnostic envelope only, not a latency SLA or device latency measurement.
+        val upper = audioTrackBufferFrames.toLong() + maxFramesPerMix + horizonFrames
+        presentationLagLowerBoundFrames = lower
+        presentationLagUpperBoundFrames = upper
+        if (lag in lower..upper) presentationLagBoundedSampleCount++
     }
 }

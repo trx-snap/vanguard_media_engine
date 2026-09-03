@@ -152,6 +152,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     required this.routeDisconnectTerminalPauseOk,
     required this.routeDisconnectResumeBlockedOk,
     required this.routingMonitorTeardownOk,
+    required this.currentPositionQuerySurfaceOk,
+    required this.currentPositionPollerMonotonicOk,
+    required this.currentPositionReadCounterIsolationOk,
+    required this.presentationLagTelemetryOk,
+    required this.presentationLagBoundedOk,
+    required this.positionAtEosNoRunawayOk,
     required this.canonical,
     required this.lanes,
     required this.metrics,
@@ -180,7 +186,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
 
   /// Canonical proof boundary string emitted by the native harness.
   static const String proofBoundaryConstant =
-      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
+      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
 
   /// All required non-canonical native lane keys that must be evaluated and true.
   static const List<String> requiredNonCanonicalLanes = <String>[
@@ -226,6 +232,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     'routeDisconnectTerminalPauseOk',
     'routeDisconnectResumeBlockedOk',
     'routingMonitorTeardownOk',
+    'currentPositionQuerySurfaceOk',
+    'currentPositionPollerMonotonicOk',
+    'currentPositionReadCounterIsolationOk',
+    'presentationLagTelemetryOk',
+    'presentationLagBoundedOk',
+    'positionAtEosNoRunawayOk',
   ];
 
   /// All required native lane keys including canonical.
@@ -383,6 +395,24 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Whether routing controller was released and monitor thread exited and joined cleanly.
   final bool routingMonitorTeardownOk;
 
+  /// Whether public current-position query surface returned valid values on any thread.
+  final bool currentPositionQuerySurfaceOk;
+
+  /// Whether off-thread poller observed monotonic position reads without regression.
+  final bool currentPositionPollerMonotonicOk;
+
+  /// Whether currentPosition read counters are isolated between writer and other threads.
+  final bool currentPositionReadCounterIsolationOk;
+
+  /// Whether presentation lag telemetry was captured with valid bounds and samples.
+  final bool presentationLagTelemetryOk;
+
+  /// Whether presentation lag samples remained strictly within analytical bounds.
+  final bool presentationLagBoundedOk;
+
+  /// Whether position reported at EOS was non-negative and bounded without runaway.
+  final bool positionAtEosNoRunawayOk;
+
   /// Canonical pass indicator.
   final bool canonical;
 
@@ -522,6 +552,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         routeDisconnectTerminalPauseOk: false,
         routeDisconnectResumeBlockedOk: false,
         routingMonitorTeardownOk: false,
+        currentPositionQuerySurfaceOk: false,
+        currentPositionPollerMonotonicOk: false,
+        currentPositionReadCounterIsolationOk: false,
+        presentationLagTelemetryOk: false,
+        presentationLagBoundedOk: false,
+        positionAtEosNoRunawayOk: false,
         canonical: false,
         lanes: <String, Object?>{
           'status': 'FAIL',
@@ -667,6 +703,18 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'routeDisconnectResumeBlockedOk',
     );
     final routingMonitorTeardownOk = parseBool('routingMonitorTeardownOk');
+    final currentPositionQuerySurfaceOk = parseBool(
+      'currentPositionQuerySurfaceOk',
+    );
+    final currentPositionPollerMonotonicOk = parseBool(
+      'currentPositionPollerMonotonicOk',
+    );
+    final currentPositionReadCounterIsolationOk = parseBool(
+      'currentPositionReadCounterIsolationOk',
+    );
+    final presentationLagTelemetryOk = parseBool('presentationLagTelemetryOk');
+    final presentationLagBoundedOk = parseBool('presentationLagBoundedOk');
+    final positionAtEosNoRunawayOk = parseBool('positionAtEosNoRunawayOk');
     final canonical = parseBool('canonical', rawPass && missingLanes.isEmpty);
 
     final hasValidProofBoundary =
@@ -717,7 +765,13 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         routeChangeObservationOk &&
         routeDisconnectTerminalPauseOk &&
         routeDisconnectResumeBlockedOk &&
-        routingMonitorTeardownOk;
+        routingMonitorTeardownOk &&
+        currentPositionQuerySurfaceOk &&
+        currentPositionPollerMonotonicOk &&
+        currentPositionReadCounterIsolationOk &&
+        presentationLagTelemetryOk &&
+        presentationLagBoundedOk &&
+        positionAtEosNoRunawayOk;
 
     final allRequiredLanesPresent = missingLanes.isEmpty;
     final explicitLastError = parseString('lastError');
@@ -820,6 +874,13 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'routeDisconnectTerminalPauseOk': routeDisconnectTerminalPauseOk,
       'routeDisconnectResumeBlockedOk': routeDisconnectResumeBlockedOk,
       'routingMonitorTeardownOk': routingMonitorTeardownOk,
+      'currentPositionQuerySurfaceOk': currentPositionQuerySurfaceOk,
+      'currentPositionPollerMonotonicOk': currentPositionPollerMonotonicOk,
+      'currentPositionReadCounterIsolationOk':
+          currentPositionReadCounterIsolationOk,
+      'presentationLagTelemetryOk': presentationLagTelemetryOk,
+      'presentationLagBoundedOk': presentationLagBoundedOk,
+      'positionAtEosNoRunawayOk': positionAtEosNoRunawayOk,
       'canonical': canonical,
       ...parsedLanes,
     };
@@ -874,6 +935,13 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       routeDisconnectTerminalPauseOk: routeDisconnectTerminalPauseOk,
       routeDisconnectResumeBlockedOk: routeDisconnectResumeBlockedOk,
       routingMonitorTeardownOk: routingMonitorTeardownOk,
+      currentPositionQuerySurfaceOk: currentPositionQuerySurfaceOk,
+      currentPositionPollerMonotonicOk: currentPositionPollerMonotonicOk,
+      currentPositionReadCounterIsolationOk:
+          currentPositionReadCounterIsolationOk,
+      presentationLagTelemetryOk: presentationLagTelemetryOk,
+      presentationLagBoundedOk: presentationLagBoundedOk,
+      positionAtEosNoRunawayOk: positionAtEosNoRunawayOk,
       canonical: canonical,
       lanes: Map<String, Object?>.unmodifiable(finalLanes),
       metrics: Map<String, Object?>.unmodifiable(parsedMetrics),
@@ -966,6 +1034,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       routeDisconnectTerminalPauseOk: false,
       routeDisconnectResumeBlockedOk: false,
       routingMonitorTeardownOk: false,
+      currentPositionQuerySurfaceOk: false,
+      currentPositionPollerMonotonicOk: false,
+      currentPositionReadCounterIsolationOk: false,
+      presentationLagTelemetryOk: false,
+      presentationLagBoundedOk: false,
+      positionAtEosNoRunawayOk: false,
       canonical: false,
       lanes: Map<String, Object?>.unmodifiable(lanes),
       metrics: Map<String, Object?>.unmodifiable(metrics),
@@ -1202,6 +1276,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'routeDisconnectTerminalPauseOk: $routeDisconnectTerminalPauseOk, '
       'routeDisconnectResumeBlockedOk: $routeDisconnectResumeBlockedOk, '
       'routingMonitorTeardownOk: $routingMonitorTeardownOk, '
+      'currentPositionQuerySurfaceOk: $currentPositionQuerySurfaceOk, '
+      'currentPositionPollerMonotonicOk: $currentPositionPollerMonotonicOk, '
+      'currentPositionReadCounterIsolationOk: $currentPositionReadCounterIsolationOk, '
+      'presentationLagTelemetryOk: $presentationLagTelemetryOk, '
+      'presentationLagBoundedOk: $presentationLagBoundedOk, '
+      'positionAtEosNoRunawayOk: $positionAtEosNoRunawayOk, '
       'canonical: $canonical, '
       'failureReason: $failureReason, lastError: $lastError)';
 
@@ -1303,4 +1383,122 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Public resume rejection reason during routing disconnect proof.
   String get publicResumeReason =>
       metrics['publicResumeReason']?.toString() ?? '';
+
+  // ---- Presentation Clock and Lag Telemetry Getters -----------------------
+
+  /// Epoch base frame at epoch open.
+  int get epochBaseFrame => (metrics['epochBaseFrame'] as num?)?.toInt() ?? -1;
+
+  /// Frames written to sink at epoch open.
+  int get framesWrittenAtEpochOpen =>
+      (metrics['framesWrittenAtEpochOpen'] as num?)?.toInt() ?? -1;
+
+  /// Frames read from transport at epoch open.
+  int get framesReadAtEpochOpen =>
+      (metrics['framesReadAtEpochOpen'] as num?)?.toInt() ?? -1;
+
+  /// Number of eligible presentation lag samples recorded.
+  int get presentationLagSampleCount =>
+      (metrics['presentationLagSampleCount'] as num?)?.toInt() ?? 0;
+
+  /// Number of presentation lag samples within analytical bounds.
+  int get presentationLagBoundedSampleCount =>
+      (metrics['presentationLagBoundedSampleCount'] as num?)?.toInt() ?? 0;
+
+  /// Number of presentation lag samples excluded (e.g. RESET/STALE/no-anchor).
+  int get presentationLagExcludedSampleCount =>
+      (metrics['presentationLagExcludedSampleCount'] as num?)?.toInt() ?? 0;
+
+  /// Last observed presentation lag in frames.
+  int get lastPresentationLagFrames =>
+      (metrics['lastPresentationLagFrames'] as num?)?.toInt() ?? 0;
+
+  /// Minimum observed presentation lag in frames.
+  int get minPresentationLagFrames =>
+      (metrics['minPresentationLagFrames'] as num?)?.toInt() ?? 0;
+
+  /// Maximum observed presentation lag in frames.
+  int get maxPresentationLagFrames =>
+      (metrics['maxPresentationLagFrames'] as num?)?.toInt() ?? 0;
+
+  /// Presentation lag lower bound in frames.
+  int get presentationLagLowerBoundFrames =>
+      (metrics['presentationLagLowerBoundFrames'] as num?)?.toInt() ?? 0;
+
+  /// Presentation lag upper bound in frames.
+  int get presentationLagUpperBoundFrames =>
+      (metrics['presentationLagUpperBoundFrames'] as num?)?.toInt() ?? 0;
+
+  /// Last published presentation clock position in frames at poll time.
+  int get lastPositionFramesAtPoll =>
+      (metrics['lastPositionFramesAtPoll'] as num?)?.toInt() ?? -1;
+
+  /// Last published presentation clock position in microseconds at poll time.
+  int get lastPositionUsAtPoll =>
+      (metrics['lastPositionUsAtPoll'] as num?)?.toInt() ?? -1;
+
+  /// Presentation clock position in frames recorded at EOS.
+  int get positionAtEosFrames =>
+      (metrics['positionAtEosFrames'] as num?)?.toInt() ?? -1;
+
+  /// Presentation clock position in microseconds recorded at EOS.
+  int get positionAtEosUs =>
+      (metrics['positionAtEosUs'] as num?)?.toInt() ?? -1;
+
+  /// Count of currentPosition reads executed from writer/sink thread.
+  int get currentPositionReadsFromWriterThread =>
+      (metrics['currentPositionReadsFromWriterThread'] as num?)?.toInt() ?? 0;
+
+  /// Count of currentPosition reads executed from other (non-writer) threads.
+  int get currentPositionReadsFromOtherThreads =>
+      (metrics['currentPositionReadsFromOtherThreads'] as num?)?.toInt() ?? 0;
+
+  // ---- Presentation Clock Poller Getters ----------------------------------
+
+  /// Total polls executed by the off-thread poller.
+  int get pollerPollCount => (metrics['pollerPollCount'] as num?)?.toInt() ?? 0;
+
+  /// Valid non-negative position reads recorded by the off-thread poller.
+  int get pollerValidCount =>
+      (metrics['pollerValidCount'] as num?)?.toInt() ?? 0;
+
+  /// Regressions observed by the off-thread poller.
+  int get pollerRegressionCount =>
+      (metrics['pollerRegressionCount'] as num?)?.toInt() ?? 0;
+
+  /// Total frame reads executed by the off-thread poller.
+  int get pollerFrameReadCount =>
+      (metrics['pollerFrameReadCount'] as num?)?.toInt() ?? 0;
+
+  /// Total microseconds reads executed by the off-thread poller.
+  int get pollerUsReadCount =>
+      (metrics['pollerUsReadCount'] as num?)?.toInt() ?? 0;
+
+  /// Last frame value read by the off-thread poller.
+  int get pollerLastFrame =>
+      (metrics['pollerLastFrame'] as num?)?.toInt() ?? -1;
+
+  /// Last microseconds value read by the off-thread poller.
+  int get pollerLastUs => (metrics['pollerLastUs'] as num?)?.toInt() ?? -1;
+
+  /// Minimum frame value read by the off-thread poller.
+  int get pollerMinFrame => (metrics['pollerMinFrame'] as num?)?.toInt() ?? -1;
+
+  /// Maximum frame value read by the off-thread poller.
+  int get pollerMaxFrame => (metrics['pollerMaxFrame'] as num?)?.toInt() ?? -1;
+
+  /// Minimum microseconds value read by the off-thread poller.
+  int get pollerMinUs => (metrics['pollerMinUs'] as num?)?.toInt() ?? -1;
+
+  /// Maximum microseconds value read by the off-thread poller.
+  int get pollerMaxUs => (metrics['pollerMaxUs'] as num?)?.toInt() ?? -1;
+
+  /// Thread ID of the off-thread poller.
+  int get pollerThreadId => (metrics['pollerThreadId'] as num?)?.toInt() ?? 0;
+
+  /// Off-thread poller joined flag.
+  bool get pollerJoined => metrics['pollerJoined'] == true;
+
+  /// Error string reported by the off-thread poller, if any.
+  String get pollerError => metrics['pollerError']?.toString() ?? '';
 }
