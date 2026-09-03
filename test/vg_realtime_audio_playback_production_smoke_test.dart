@@ -2,8 +2,9 @@
 // vanguard_media_engine - P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK (Y9) +
-// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, and repeated-seek diagnostic smoke foundation
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b) +
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, and focus response diagnostic smoke foundation
 // Dart model and MethodChannel unit tests.
 
 import 'package:flutter/services.dart';
@@ -11,7 +12,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
 const _kCanonicalProofBoundary =
-    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
+    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
 
 const _kPassMarker =
     'ANDROID_DAG_PHASE4_REALTIME_AUDIO_PLAYBACK_PRODUCTION_PHYSICAL_SMOKE_PASS';
@@ -55,6 +56,12 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'repeatedSeekCommandOk': true,
     'repeatedSeekCumulativeAccountingOk': true,
     'repeatedSeekThirdRejectOk': true,
+    'focusSetupOk': true,
+    'focusDuckRestoreOk': true,
+    'focusTransientPauseResumeOk': true,
+    'focusNoisyTerminalPauseOk': true,
+    'focusPermanentLossPauseOk': true,
+    'focusMonitorTeardownOk': true,
     'canonical': true,
   };
 
@@ -145,7 +152,19 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'stopReason': 'user_stop',
     'stateAfterStop': 'STOPPED',
     'stateAfterDispose': 'DISPOSED',
-    'stateAfterSecondDispose': 'DISPOSED',
+    'focusEnabled': true,
+    'focusDuckAppliedCount': 1,
+    'focusGainRestoreAppliedCount': 1,
+    'focusPauseTransientAppliedCount': 1,
+    'focusPauseNoisyAppliedCount': 1,
+    'focusPausePermanentAppliedCount': 1,
+    'focusAutoResumeAppliedCount': 1,
+    'ignoredGainEventsDrained': 6,
+    'ignoredGainRestoreAppliedCount': 2,
+    'ignoredGainAutoResumeCount': 1,
+    'focusState': 'held',
+    'sinkEffectiveGain': 0.5,
+    'duckGain': 0.1,
     'failureReason': '',
     'lastError': 'none',
   };
@@ -158,7 +177,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'nativeProofBoundary': _kCanonicalProofBoundary,
     'failureReason': '',
     'details':
-        'Y8a/Y8b/Y9/Y10b realtime audio playback production sink/clock/dead-object/seek/repeated-seek smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS,SCENARIO_FORWARD_SEEK_TO_EOS,SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS',
+        'Y8a/Y8b/Y9/Y10b/Y11b realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS,SCENARIO_FORWARD_SEEK_TO_EOS,SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS,SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY,SCENARIO_FOCUS_PERMANENT_LOSS',
     'lanes': lanes,
     'metrics': metrics,
     'lastError': null,
@@ -227,11 +246,11 @@ void main() {
         VGRealtimeAudioPlaybackProductionSmokeReport
             .requiredNonCanonicalLanes
             .length,
-        equals(31),
+        equals(37),
       );
       expect(
         VGRealtimeAudioPlaybackProductionSmokeReport.requiredLanes.length,
-        equals(32),
+        equals(38),
       );
 
       final expectedLanes = <String>[
@@ -266,6 +285,12 @@ void main() {
         'repeatedSeekCommandOk',
         'repeatedSeekCumulativeAccountingOk',
         'repeatedSeekThirdRejectOk',
+        'focusSetupOk',
+        'focusDuckRestoreOk',
+        'focusTransientPauseResumeOk',
+        'focusNoisyTerminalPauseOk',
+        'focusPermanentLossPauseOk',
+        'focusMonitorTeardownOk',
         'canonical',
       ];
 
@@ -323,6 +348,24 @@ void main() {
       expect(report.repeatedSeekCommandOk, isTrue);
       expect(report.repeatedSeekCumulativeAccountingOk, isTrue);
       expect(report.repeatedSeekThirdRejectOk, isTrue);
+      expect(report.focusSetupOk, isTrue);
+      expect(report.focusDuckRestoreOk, isTrue);
+      expect(report.focusTransientPauseResumeOk, isTrue);
+      expect(report.focusNoisyTerminalPauseOk, isTrue);
+      expect(report.focusPermanentLossPauseOk, isTrue);
+      expect(report.focusMonitorTeardownOk, isTrue);
+      expect(report.focusEnabled, isTrue);
+      expect(report.focusDuckAppliedCount, equals(1));
+      expect(report.focusGainRestoreAppliedCount, equals(1));
+      expect(report.focusPauseTransientAppliedCount, equals(1));
+      expect(report.focusPauseNoisyAppliedCount, equals(1));
+      expect(report.focusPausePermanentAppliedCount, equals(1));
+      expect(report.focusAutoResumeAppliedCount, equals(1));
+      expect(report.ignoredGainEventsDrained, equals(6));
+      expect(report.ignoredGainRestoreAppliedCount, equals(2));
+      expect(report.ignoredGainAutoResumeCount, equals(1));
+      expect(report.focusState, equals('held'));
+      expect(report.sinkEffectiveGain, equals(0.5));
       expect(report.canonical, isTrue);
       expect(report.allRequiredNonCanonicalLanesPass, isTrue);
 
@@ -468,6 +511,48 @@ void main() {
         expect(report.metrics['expectedTotalFrames'], equals(84864));
       },
     );
+
+    test('new Y11b focus metric keys parse and are present in metrics map', () {
+      final report = _createSampleReport();
+      expect(report.metrics.containsKey('focusEnabled'), isTrue);
+      expect(report.metrics['focusEnabled'], isTrue);
+      expect(report.metrics.containsKey('focusDuckAppliedCount'), isTrue);
+      expect(report.metrics['focusDuckAppliedCount'], equals(1));
+      expect(
+        report.metrics.containsKey('focusGainRestoreAppliedCount'),
+        isTrue,
+      );
+      expect(report.metrics['focusGainRestoreAppliedCount'], equals(1));
+      expect(
+        report.metrics.containsKey('focusPauseTransientAppliedCount'),
+        isTrue,
+      );
+      expect(report.metrics['focusPauseTransientAppliedCount'], equals(1));
+      expect(report.metrics.containsKey('focusPauseNoisyAppliedCount'), isTrue);
+      expect(report.metrics['focusPauseNoisyAppliedCount'], equals(1));
+      expect(
+        report.metrics.containsKey('focusPausePermanentAppliedCount'),
+        isTrue,
+      );
+      expect(report.metrics['focusPausePermanentAppliedCount'], equals(1));
+      expect(report.metrics.containsKey('focusAutoResumeAppliedCount'), isTrue);
+      expect(report.metrics['focusAutoResumeAppliedCount'], equals(1));
+      expect(report.metrics.containsKey('ignoredGainEventsDrained'), isTrue);
+      expect(report.metrics['ignoredGainEventsDrained'], equals(6));
+      expect(
+        report.metrics.containsKey('ignoredGainRestoreAppliedCount'),
+        isTrue,
+      );
+      expect(report.metrics['ignoredGainRestoreAppliedCount'], equals(2));
+      expect(report.metrics.containsKey('ignoredGainAutoResumeCount'), isTrue);
+      expect(report.metrics['ignoredGainAutoResumeCount'], equals(1));
+      expect(report.metrics.containsKey('focusState'), isTrue);
+      expect(report.metrics['focusState'], equals('held'));
+      expect(report.metrics.containsKey('sinkEffectiveGain'), isTrue);
+      expect(report.metrics['sinkEffectiveGain'], equals(0.5));
+      expect(report.metrics.containsKey('duckGain'), isTrue);
+      expect(report.metrics['duckGain'], equals(0.1));
+    });
 
     test('missing one new required Y8b lane fails isVerifiedPass', () {
       for (final lane in <String>[
@@ -770,27 +855,31 @@ void main() {
       expect(invokedArguments?['secondSeekTargetSec'], equals(2.0));
     });
 
-    test('method route passes default seek parameters when omitted', () async {
-      Map<Object?, Object?>? invokedArguments;
-      binaryMessenger.setMockMethodCallHandler(defaultChannel, (
-        MethodCall call,
-      ) async {
-        invokedArguments = call.arguments as Map<Object?, Object?>?;
-        if (call.method == 'runRealtimeAudioPlaybackProductionSmoke') {
-          return _createSampleRawMap();
-        }
-        return null;
-      });
+    test(
+      'method route passes default seek and focus parameters when omitted',
+      () async {
+        Map<Object?, Object?>? invokedArguments;
+        binaryMessenger.setMockMethodCallHandler(defaultChannel, (
+          MethodCall call,
+        ) async {
+          invokedArguments = call.arguments as Map<Object?, Object?>?;
+          if (call.method == 'runRealtimeAudioPlaybackProductionSmoke') {
+            return _createSampleRawMap();
+          }
+          return null;
+        });
 
-      await VGRealtimeAudioPlaybackProductionSmokeReport.runRealtimeAudioPlaybackProductionSmoke(
-        sourcePath: '/tmp/test_clip.mov',
-      );
+        await VGRealtimeAudioPlaybackProductionSmokeReport.runRealtimeAudioPlaybackProductionSmoke(
+          sourcePath: '/tmp/test_clip.mov',
+        );
 
-      expect(invokedArguments?['seekTargetSec'], equals(1.0));
-      expect(invokedArguments?['secondSeekTargetSec'], equals(2.0));
-    });
+        expect(invokedArguments?['seekTargetSec'], equals(1.0));
+        expect(invokedArguments?['secondSeekTargetSec'], equals(2.0));
+        expect(invokedArguments?['duckGain'], equals(0.1));
+      },
+    );
 
-    test('method route passes custom seek parameters', () async {
+    test('method route passes custom seek and focus parameters', () async {
       Map<Object?, Object?>? invokedArguments;
       binaryMessenger.setMockMethodCallHandler(defaultChannel, (
         MethodCall call,
@@ -808,12 +897,33 @@ void main() {
         secondSeekTargetSec: 2.4,
         preSeekHoldWindows: 32,
         maxSeekHoldMs: 10000,
+        duckGain: 0.15,
       );
 
       expect(invokedArguments?['seekTargetSec'], equals(1.2));
       expect(invokedArguments?['secondSeekTargetSec'], equals(2.4));
       expect(invokedArguments?['preSeekHoldWindows'], equals(32));
       expect(invokedArguments?['maxSeekHoldMs'], equals(10000));
+      expect(invokedArguments?['duckGain'], equals(0.15));
+    });
+
+    test('missing any Y11b focus lane fails isVerifiedPass', () {
+      const focusLanes = <String>[
+        'focusSetupOk',
+        'focusDuckRestoreOk',
+        'focusTransientPauseResumeOk',
+        'focusNoisyTerminalPauseOk',
+        'focusPermanentLossPauseOk',
+        'focusMonitorTeardownOk',
+      ];
+      for (final lane in focusLanes) {
+        final report = _createSampleReport(<String, Object?>{lane: false});
+        expect(
+          report.isVerifiedPass,
+          isFalse,
+          reason: 'Expected failure when $lane is false',
+        );
+      }
     });
 
     test(

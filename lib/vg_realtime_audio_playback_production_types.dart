@@ -2,22 +2,25 @@
 // vanguard_media_engine - P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK (Y9) +
-// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, and repeated-seek diagnostic smoke foundation.
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b) +
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, and focus response diagnostic smoke foundation.
 //
 // Pure Dart typed model + invocation wrapper over the native
 // `runRealtimeAudioPlaybackProductionSmoke` MethodChannel route.
 // Diagnostic-only - drives the production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
-// sink-thread-owned non-zero-gain AudioTrack + presentation clock) through five
+// sink-thread-owned non-zero-gain AudioTrack + presentation clock) through seven
 // scenarios:
 //   1. Playthrough + bounded pause/resume to EOS.
 //   2. Mid-playback stop/dispose verifying clean release.
 //   3. Synthetic dead-object recovery to EOS.
 //   4. Forward mid-stream seek while paused to EOS.
 //   5. Repeated forward seek while paused (T1 then T2, third seek rejected) to EOS.
+//   6. Focus duck, restore, transient pause, auto-resume, and noisy terminal pause.
+//   7. Focus permanent loss terminal pause without auto-resume.
 //
-// Required proof lanes (31 native lanes plus canonical equals 32 total lanes):
+// Required proof lanes (37 native lanes plus canonical equals 38 total lanes):
 //   1. formatProbeOk: format, duration, channel count, sample rate, and MIME probed successfully
 //   2. preRollOk: pre-roll while PREPARED until ring_full or declared end fits
 //   3. startOk: session and transport transition to PLAYING accepted cleanly
@@ -49,10 +52,16 @@
 //  29. repeatedSeekCommandOk: repeated forward seek commands (T1 then T2) issued and accepted cleanly
 //  30. repeatedSeekCumulativeAccountingOk: cumulative frame accounting across repeated seeks equals expected total
 //  31. repeatedSeekThirdRejectOk: third repeated seek call rejected without teardown or state mutation
+//  32. focusSetupOk: focus request and noisy receiver registered, monitor started
+//  33. focusDuckRestoreOk: transient duck gain and full restore applied on sink thread
+//  34. focusTransientPauseResumeOk: transient loss pauses transport, subsequent gain auto-resumes
+//  35. focusNoisyTerminalPauseOk: noisy event triggers terminal pause, subsequent gain ignored
+//  36. focusPermanentLossPauseOk: permanent loss triggers terminal pause, subsequent gain ignored
+//  37. focusMonitorTeardownOk: focus monitor thread exited/joined and controller released cleanly
 //  (canonical: aggregate pass evaluation holding across all required lanes)
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
 //
 // Honest operational non-claims:
 //   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
@@ -62,6 +71,8 @@
 //   - Checksum identity is over frames handed to write, not frames audibly presented.
 //   - Forward seek exercises ONE forward seek while paused; repeated seek exercises
 //     two ordered forward seeks while paused and verifies third rejected without teardown.
+//   - Audio focus proof operates on synthetic focus change / becoming noisy seams without
+//     requiring real OS phone calls or bluetooth events during headless diagnostic runs.
 
 import 'dart:async';
 
@@ -119,6 +130,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     required this.repeatedSeekCommandOk,
     required this.repeatedSeekCumulativeAccountingOk,
     required this.repeatedSeekThirdRejectOk,
+    required this.focusSetupOk,
+    required this.focusDuckRestoreOk,
+    required this.focusTransientPauseResumeOk,
+    required this.focusNoisyTerminalPauseOk,
+    required this.focusPermanentLossPauseOk,
+    required this.focusMonitorTeardownOk,
     required this.canonical,
     required this.lanes,
     required this.metrics,
@@ -147,7 +164,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
 
   /// Canonical proof boundary string emitted by the native harness.
   static const String proofBoundaryConstant =
-      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
+      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
 
   /// All required non-canonical native lane keys that must be evaluated and true.
   static const List<String> requiredNonCanonicalLanes = <String>[
@@ -182,6 +199,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     'repeatedSeekCommandOk',
     'repeatedSeekCumulativeAccountingOk',
     'repeatedSeekThirdRejectOk',
+    'focusSetupOk',
+    'focusDuckRestoreOk',
+    'focusTransientPauseResumeOk',
+    'focusNoisyTerminalPauseOk',
+    'focusPermanentLossPauseOk',
+    'focusMonitorTeardownOk',
   ];
 
   /// All required native lane keys including canonical.
@@ -306,6 +329,24 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Whether third repeated seek was rejected without teardown or mutation.
   final bool repeatedSeekThirdRejectOk;
 
+  /// Whether audio focus and noisy monitor setup succeeded.
+  final bool focusSetupOk;
+
+  /// Whether transient duck gain change and full gain restore succeeded on sink thread.
+  final bool focusDuckRestoreOk;
+
+  /// Whether transient focus loss pause and auto-resume succeeded with user intent gating.
+  final bool focusTransientPauseResumeOk;
+
+  /// Whether becoming-noisy triggered terminal pause and rejected subsequent auto-resume.
+  final bool focusNoisyTerminalPauseOk;
+
+  /// Whether permanent focus loss triggered terminal pause and rejected subsequent auto-resume.
+  final bool focusPermanentLossPauseOk;
+
+  /// Whether audio focus controller released, monitor thread exited and joined cleanly.
+  final bool focusMonitorTeardownOk;
+
   /// Canonical pass indicator.
   final bool canonical;
 
@@ -367,7 +408,13 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       postSeekDrainOk &&
       repeatedSeekCommandOk &&
       repeatedSeekCumulativeAccountingOk &&
-      repeatedSeekThirdRejectOk;
+      repeatedSeekThirdRejectOk &&
+      focusSetupOk &&
+      focusDuckRestoreOk &&
+      focusTransientPauseResumeOk &&
+      focusNoisyTerminalPauseOk &&
+      focusPermanentLossPauseOk &&
+      focusMonitorTeardownOk;
 
   /// Whether this report meets all verification criteria for a passing smoke run.
   bool get isVerifiedPass =>
@@ -423,6 +470,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         repeatedSeekCommandOk: false,
         repeatedSeekCumulativeAccountingOk: false,
         repeatedSeekThirdRejectOk: false,
+        focusSetupOk: false,
+        focusDuckRestoreOk: false,
+        focusTransientPauseResumeOk: false,
+        focusNoisyTerminalPauseOk: false,
+        focusPermanentLossPauseOk: false,
+        focusMonitorTeardownOk: false,
         canonical: false,
         lanes: <String, Object?>{
           'status': 'FAIL',
@@ -551,6 +604,14 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'repeatedSeekCumulativeAccountingOk',
     );
     final repeatedSeekThirdRejectOk = parseBool('repeatedSeekThirdRejectOk');
+    final focusSetupOk = parseBool('focusSetupOk');
+    final focusDuckRestoreOk = parseBool('focusDuckRestoreOk');
+    final focusTransientPauseResumeOk = parseBool(
+      'focusTransientPauseResumeOk',
+    );
+    final focusNoisyTerminalPauseOk = parseBool('focusNoisyTerminalPauseOk');
+    final focusPermanentLossPauseOk = parseBool('focusPermanentLossPauseOk');
+    final focusMonitorTeardownOk = parseBool('focusMonitorTeardownOk');
     final canonical = parseBool('canonical', rawPass && missingLanes.isEmpty);
 
     final hasValidProofBoundary =
@@ -590,7 +651,13 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         postSeekDrainOk &&
         repeatedSeekCommandOk &&
         repeatedSeekCumulativeAccountingOk &&
-        repeatedSeekThirdRejectOk;
+        repeatedSeekThirdRejectOk &&
+        focusSetupOk &&
+        focusDuckRestoreOk &&
+        focusTransientPauseResumeOk &&
+        focusNoisyTerminalPauseOk &&
+        focusPermanentLossPauseOk &&
+        focusMonitorTeardownOk;
 
     final allRequiredLanesPresent = missingLanes.isEmpty;
     final explicitLastError = parseString('lastError');
@@ -682,6 +749,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'repeatedSeekCommandOk': repeatedSeekCommandOk,
       'repeatedSeekCumulativeAccountingOk': repeatedSeekCumulativeAccountingOk,
       'repeatedSeekThirdRejectOk': repeatedSeekThirdRejectOk,
+      'focusSetupOk': focusSetupOk,
+      'focusDuckRestoreOk': focusDuckRestoreOk,
+      'focusTransientPauseResumeOk': focusTransientPauseResumeOk,
+      'focusNoisyTerminalPauseOk': focusNoisyTerminalPauseOk,
+      'focusPermanentLossPauseOk': focusPermanentLossPauseOk,
+      'focusMonitorTeardownOk': focusMonitorTeardownOk,
       'canonical': canonical,
       ...parsedLanes,
     };
@@ -725,6 +798,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       repeatedSeekCommandOk: repeatedSeekCommandOk,
       repeatedSeekCumulativeAccountingOk: repeatedSeekCumulativeAccountingOk,
       repeatedSeekThirdRejectOk: repeatedSeekThirdRejectOk,
+      focusSetupOk: focusSetupOk,
+      focusDuckRestoreOk: focusDuckRestoreOk,
+      focusTransientPauseResumeOk: focusTransientPauseResumeOk,
+      focusNoisyTerminalPauseOk: focusNoisyTerminalPauseOk,
+      focusPermanentLossPauseOk: focusPermanentLossPauseOk,
+      focusMonitorTeardownOk: focusMonitorTeardownOk,
       canonical: canonical,
       lanes: Map<String, Object?>.unmodifiable(finalLanes),
       metrics: Map<String, Object?>.unmodifiable(parsedMetrics),
@@ -806,6 +885,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       repeatedSeekCommandOk: false,
       repeatedSeekCumulativeAccountingOk: false,
       repeatedSeekThirdRejectOk: false,
+      focusSetupOk: false,
+      focusDuckRestoreOk: false,
+      focusTransientPauseResumeOk: false,
+      focusNoisyTerminalPauseOk: false,
+      focusPermanentLossPauseOk: false,
+      focusMonitorTeardownOk: false,
       canonical: false,
       lanes: Map<String, Object?>.unmodifiable(lanes),
       metrics: Map<String, Object?>.unmodifiable(metrics),
@@ -815,7 +900,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   }
 
   /// Invokes the Android True-DAG Phase 4 Realtime Audio Playback Production Sink, Clock,
-  /// Dead-Object, Forward-Seek, and Repeated-Seek diagnostic smoke harness.
+  /// Dead-Object, Forward-Seek, Repeated-Seek, and Focus-Response diagnostic smoke harness.
   ///
   /// [sourcePath] path to a media file with an audio track.
   /// [maxDurationSec] window duration in seconds (default 3.0).
@@ -830,6 +915,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// [secondSeekTargetSec] second forward seek target in seconds (default 2.0).
   /// [preSeekHoldWindows] mix windows to hold feed past pre-roll before seek (default 64).
   /// [maxSeekHoldMs] maximum allowed seek hold in milliseconds (default 15000).
+  /// [duckGain] target duck gain during transient ducking (default 0.1).
   /// [timeout] optionally bounds the invocation (defaults to 40 seconds).
   /// [channel] may be injected for testing; defaults to the shared
   /// `vanguard_media_engine` MethodChannel.
@@ -848,6 +934,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     double secondSeekTargetSec = 2.0,
     int preSeekHoldWindows = 64,
     int? maxSeekHoldMs,
+    double duckGain = 0.1,
     Duration timeout = const Duration(seconds: 40),
     MethodChannel? channel,
   }) async {
@@ -867,6 +954,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         'secondSeekTargetSec': secondSeekTargetSec,
         'preSeekHoldWindows': preSeekHoldWindows,
         'maxSeekHoldMs': ?maxSeekHoldMs,
+        'duckGain': duckGain,
       });
       final raw = await future.timeout(timeout);
       return VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(raw);
@@ -935,6 +1023,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         other.repeatedSeekCumulativeAccountingOk ==
             repeatedSeekCumulativeAccountingOk &&
         other.repeatedSeekThirdRejectOk == repeatedSeekThirdRejectOk &&
+        other.focusSetupOk == focusSetupOk &&
+        other.focusDuckRestoreOk == focusDuckRestoreOk &&
+        other.focusTransientPauseResumeOk == focusTransientPauseResumeOk &&
+        other.focusNoisyTerminalPauseOk == focusNoisyTerminalPauseOk &&
+        other.focusPermanentLossPauseOk == focusPermanentLossPauseOk &&
+        other.focusMonitorTeardownOk == focusMonitorTeardownOk &&
         other.canonical == canonical &&
         other.lastError == lastError;
   }
@@ -979,6 +1073,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     repeatedSeekCommandOk,
     repeatedSeekCumulativeAccountingOk,
     repeatedSeekThirdRejectOk,
+    focusSetupOk,
+    focusDuckRestoreOk,
+    focusTransientPauseResumeOk,
+    focusNoisyTerminalPauseOk,
+    focusPermanentLossPauseOk,
+    focusMonitorTeardownOk,
     canonical,
   ]);
 
@@ -1005,6 +1105,59 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'repeatedSeekCommandOk: $repeatedSeekCommandOk, '
       'repeatedSeekCumulativeAccountingOk: $repeatedSeekCumulativeAccountingOk, '
       'repeatedSeekThirdRejectOk: $repeatedSeekThirdRejectOk, '
+      'focusSetupOk: $focusSetupOk, focusDuckRestoreOk: $focusDuckRestoreOk, '
+      'focusTransientPauseResumeOk: $focusTransientPauseResumeOk, '
+      'focusNoisyTerminalPauseOk: $focusNoisyTerminalPauseOk, '
+      'focusPermanentLossPauseOk: $focusPermanentLossPauseOk, '
+      'focusMonitorTeardownOk: $focusMonitorTeardownOk, '
       'canonical: $canonical, '
       'failureReason: $failureReason, lastError: $lastError)';
+
+  // ---- Focus and Sink Telemetry Getters ----------------------------------
+
+  /// Whether audio focus response was enabled.
+  bool get focusEnabled => metrics['focusEnabled'] == true;
+
+  /// Number of focus duck transitions applied.
+  int get focusDuckAppliedCount =>
+      (metrics['focusDuckAppliedCount'] as num?)?.toInt() ?? 0;
+
+  /// Number of focus gain restore transitions applied.
+  int get focusGainRestoreAppliedCount =>
+      (metrics['focusGainRestoreAppliedCount'] as num?)?.toInt() ?? 0;
+
+  /// Number of transient pause transitions applied by policy.
+  int get focusPauseTransientAppliedCount =>
+      (metrics['focusPauseTransientAppliedCount'] as num?)?.toInt() ?? 0;
+
+  /// Number of noisy pause transitions applied.
+  int get focusPauseNoisyAppliedCount =>
+      (metrics['focusPauseNoisyAppliedCount'] as num?)?.toInt() ?? 0;
+
+  /// Number of permanent loss pause transitions applied.
+  int get focusPausePermanentAppliedCount =>
+      (metrics['focusPausePermanentAppliedCount'] as num?)?.toInt() ?? 0;
+
+  /// Number of auto-resume transitions applied by policy.
+  int get focusAutoResumeAppliedCount =>
+      (metrics['focusAutoResumeAppliedCount'] as num?)?.toInt() ?? 0;
+
+  /// Focus state string if available (e.g. "held", "ducked", "lost_transient", "noisy", "lost_permanent").
+  String get focusState => metrics['focusState']?.toString() ?? '';
+
+  /// Sink effective linear gain if available.
+  double get sinkEffectiveGain =>
+      (metrics['sinkEffectiveGain'] as num?)?.toDouble() ?? 0.0;
+
+  /// Number of focus events drained after ignored gain event.
+  int get ignoredGainEventsDrained =>
+      (metrics['ignoredGainEventsDrained'] as num?)?.toInt() ?? 0;
+
+  /// Number of focus gain restore transitions applied after ignored gain event.
+  int get ignoredGainRestoreAppliedCount =>
+      (metrics['ignoredGainRestoreAppliedCount'] as num?)?.toInt() ?? 0;
+
+  /// Number of auto-resume transitions applied after ignored gain event.
+  int get ignoredGainAutoResumeCount =>
+      (metrics['ignoredGainAutoResumeCount'] as num?)?.toInt() ?? 0;
 }

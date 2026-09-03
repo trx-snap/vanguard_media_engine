@@ -9,6 +9,7 @@ import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeP
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackPresentationClock
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackTransportStateMachine
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.DEAD_OBJECT_PUBLICATION_LAG_BUDGET_MS
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.DEFAULT_DUCK_GAIN
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_AUDIO_TRACK_RELEASED_ONCE
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_BOUNDED_PAUSE_RESUME
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_CHECKSUM_IDENTITY
@@ -20,6 +21,12 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DEAD_OBJECT_RECOVERY
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DEAD_OBJECT_REMAINDER
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DECODER_SEEK_REANCHOR
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_FOCUS_DUCK_RESTORE
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_FOCUS_MONITOR_TEARDOWN
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_FOCUS_NOISY_TERMINAL_PAUSE
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_FOCUS_PERMANENT_LOSS_PAUSE
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_FOCUS_SETUP
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_FOCUS_TRANSIENT_PAUSE_RESUME
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_FORMAT_PROBE
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_NONZERO_GAIN
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_NO_FEEDBACK
@@ -42,7 +49,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.PROOF_BOUNDARY_TOKENS
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.REQUIRED_LANES
 
-// Per-invocation Y8a/Y8b/Y9/Y10b smoke arguments, shared by scenario sequencing
+// Per-invocation Y8a/Y8b/Y9/Y10b/Y11b smoke arguments, shared by scenario sequencing
 // (coordinator) and lane evaluation (this file).
 data class SmokeConfig(
     val sourcePath: String,
@@ -60,6 +67,8 @@ data class SmokeConfig(
     val maxSeekHoldMs: Long,
     // Y10b repeated forward-seek scenario arguments.
     val secondSeekTargetSec: Double,
+    // Y11b focus response arguments.
+    val duckGain: Float = DEFAULT_DUCK_GAIN,
 )
 
 // Per-scenario expected AudioTrack instance/dead-object accounting.
@@ -126,12 +135,20 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             final.transportState == VanguardRealtimePlaybackTransportStateMachine.State.DISPOSED &&
             final.state == VanguardRealtimeAudioPlaybackSession.State.DISPOSED && final.transportStopAccepted &&
             final.transportFailedCallbacks == 0
+        val monitorThreadOk = if (final.focus.monitorThreadId > 0L) {
+            final.focus.monitorThreadId != coordinatorThreadId &&
+                final.focus.monitorThreadId != sink.threadId &&
+                final.focus.monitorThreadId != final.decoderThreadId
+        } else {
+            true
+        }
         out.lanes[LANE_THREAD_OWNERSHIP] = final.decoderThreadId > 0L && sink.threadId > 0L && final.decoderThreadId != sink.threadId &&
             final.decoderThreadId != coordinatorThreadId && sink.threadId != coordinatorThreadId &&
             !final.decoderThreadIsTransportOwner && !sink.threadIsTransportOwner &&
             final.decoderIngestCallbacksOnOwner > 0L && final.decoderIngestCallbacksOffOwner == 0L &&
             final.listenerCallbacksOnOwner > 0L && final.listenerCallbacksOffOwner == 0L &&
-            sink.audioTrackCallsOffSinkThread == 0L && clock.offWriterThreadCalls == 0L && clock.writerThreadId == sink.threadId
+            sink.audioTrackCallsOffSinkThread == 0L && clock.offWriterThreadCalls == 0L && clock.writerThreadId == sink.threadId &&
+            monitorThreadOk
         out.lanes[LANE_NO_FEEDBACK] = sink.drainRequestSizeChanges == 0L && sink.timestampMaxPollsInOnePass <= 1L &&
             sink.timestampPollAttempts <= sink.productiveDrainPasses &&
             sink.timestampPollAttempts == clock.timestampSuccessCount + clock.timestampUnavailableCount &&
@@ -603,6 +620,169 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             atSink.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.RUNNING &&
             atSink.seekParkCount == 2 && atSink.flushCount == 2 && atSink.unparkCount == 2 &&
             !afterThirdSeek.cancelled
+    }
+
+    // Y11b lanes: focus duck -> gain restore -> transient pause ->
+    // auto-resume -> noisy terminal pause -> ignored gain.
+    fun evaluateFocusDuckTransientNoisy(
+        final: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterStart: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterDuck: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterRestore: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterTransientPause: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterAutoResume: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterNoisy: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterIgnoredGain: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+        coordinatorThreadId: Long,
+    ) {
+        val sink = final.sink ?: return
+        val duckSink = afterDuck.sink ?: return
+        val restoreSink = afterRestore.sink ?: return
+        val playing = VanguardRealtimePlaybackTransportStateMachine.State.PLAYING
+        val paused = VanguardRealtimePlaybackTransportStateMachine.State.PAUSED
+
+        out.metrics["afterDuckGain"] = duckSink.effectiveGain.toDouble()
+        out.metrics["afterRestoreGain"] = restoreSink.effectiveGain.toDouble()
+        out.metrics["duckAppliedCount"] = afterDuck.focus.duckAppliedCount
+        out.metrics["gainRestoreAppliedCount"] = afterRestore.focus.gainRestoreAppliedCount
+        out.metrics["pauseTransientAppliedCount"] = afterTransientPause.focus.pauseTransientAppliedCount
+        out.metrics["autoResumeAppliedCount"] = afterAutoResume.focus.autoResumeAppliedCount
+        out.metrics["pauseNoisyAppliedCount"] = afterNoisy.focus.pauseNoisyAppliedCount
+        out.metrics["ignoredGainEventsDrained"] = afterIgnoredGain.focus.eventsDrained
+        out.metrics["ignoredGainRestoreAppliedCount"] = afterIgnoredGain.focus.gainRestoreAppliedCount
+        out.metrics["ignoredGainAutoResumeCount"] = afterIgnoredGain.focus.autoResumeAppliedCount
+
+        val monitorThreadOk = final.focus.monitorThreadId > 0L &&
+            final.focus.monitorThreadId != coordinatorThreadId &&
+            final.focus.monitorThreadId != sink.threadId &&
+            final.focus.monitorThreadId != final.decoderThreadId
+
+        out.lanes[LANE_THREAD_OWNERSHIP] = final.decoderThreadId > 0L && sink.threadId > 0L &&
+            final.decoderThreadId != sink.threadId &&
+            final.decoderThreadId != coordinatorThreadId && sink.threadId != coordinatorThreadId &&
+            !final.decoderThreadIsTransportOwner && !sink.threadIsTransportOwner &&
+            final.decoderIngestCallbacksOnOwner > 0L && final.decoderIngestCallbacksOffOwner == 0L &&
+            final.listenerCallbacksOnOwner > 0L && final.listenerCallbacksOffOwner == 0L &&
+            sink.audioTrackCallsOffSinkThread == 0L &&
+            monitorThreadOk
+
+        out.lanes[LANE_PROOF_BOUNDARY] = PROOF_BOUNDARY_TOKENS.all { PROOF_BOUNDARY.contains(it) }
+
+        out.lanes[LANE_FOCUS_SETUP] = afterStart.focus.enabled &&
+            afterStart.focus.controllerRequested &&
+            afterStart.focus.controllerGranted &&
+            afterStart.focus.controllerNoisyRegistered &&
+            afterStart.focus.monitorStarted &&
+            afterStart.focus.monitorThreadId > 0L
+
+        out.lanes[LANE_FOCUS_DUCK_RESTORE] = afterDuck.focus.duckAppliedCount == 1L &&
+            afterDuck.focus.focusState == "ducked" &&
+            kotlin.math.abs(duckSink.effectiveGain - config.duckGain) <= 0.001f &&
+            afterRestore.focus.gainRestoreAppliedCount == 1L &&
+            afterRestore.focus.focusState == "held" &&
+            kotlin.math.abs(restoreSink.effectiveGain - config.gain) <= 0.001f &&
+            duckSink.gainAppliedOnSinkThread &&
+            restoreSink.gainAppliedOnSinkThread
+
+        out.lanes[LANE_FOCUS_TRANSIENT_PAUSE_RESUME] = afterTransientPause.focus.pauseTransientAppliedCount == 1L &&
+            afterTransientPause.focus.focusPausedByPolicy &&
+            afterTransientPause.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            afterTransientPause.transportState == paused &&
+            afterAutoResume.focus.autoResumeAppliedCount == 1L &&
+            !afterAutoResume.focus.focusPausedByPolicy &&
+            afterAutoResume.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING &&
+            afterAutoResume.transportState == playing
+
+        out.lanes[LANE_FOCUS_NOISY_TERMINAL_PAUSE] = afterNoisy.focus.pauseNoisyAppliedCount == 1L &&
+            afterNoisy.focus.terminalNoisyLoss &&
+            afterNoisy.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            afterNoisy.transportState == paused &&
+            afterIgnoredGain.focus.eventsDrained >= afterNoisy.focus.eventsDrained + 1L &&
+            afterIgnoredGain.focus.gainRestoreAppliedCount >= afterRestore.focus.gainRestoreAppliedCount + 1L &&
+            afterIgnoredGain.focus.autoResumeAppliedCount == 1L &&
+            afterIgnoredGain.focus.terminalNoisyLoss &&
+            afterIgnoredGain.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            afterIgnoredGain.transportState == paused
+
+        out.lanes[LANE_FOCUS_MONITOR_TEARDOWN] = final.focus.controllerReleased &&
+            final.focus.monitorExited &&
+            final.focus.monitorJoined &&
+            sink.releaseCount == 1 &&
+            sink.releaseExecutedOnSinkThread &&
+            final.sinkJoined &&
+            sink.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.EXITED &&
+            final.transportDisposeCalls == 1 &&
+            final.transportStateAfterDispose == VanguardRealtimePlaybackTransportStateMachine.State.DISPOSED &&
+            final.state == VanguardRealtimeAudioPlaybackSession.State.DISPOSED &&
+            final.failureReason.isBlank()
+    }
+
+    // Y11b lanes: permanent focus loss -> no auto-resume on gain.
+    fun evaluateFocusPermanentLoss(
+        final: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterStart: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterPermanent: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterIgnoredGain: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+        coordinatorThreadId: Long,
+    ) {
+        val sink = final.sink ?: return
+        val paused = VanguardRealtimePlaybackTransportStateMachine.State.PAUSED
+
+        out.metrics["pausePermanentAppliedCount"] = afterPermanent.focus.pausePermanentAppliedCount
+        out.metrics["ignoredGainEventsDrained"] = afterIgnoredGain.focus.eventsDrained
+        out.metrics["ignoredGainRestoreAppliedCount"] = afterIgnoredGain.focus.gainRestoreAppliedCount
+        out.metrics["ignoredGainAutoResumeCount"] = afterIgnoredGain.focus.autoResumeAppliedCount
+        out.metrics["ignoredGainAutoResumeCountPermanent"] = afterIgnoredGain.focus.autoResumeAppliedCount
+
+        val monitorThreadOk = final.focus.monitorThreadId > 0L &&
+            final.focus.monitorThreadId != coordinatorThreadId &&
+            final.focus.monitorThreadId != sink.threadId &&
+            final.focus.monitorThreadId != final.decoderThreadId
+
+        out.lanes[LANE_THREAD_OWNERSHIP] = final.decoderThreadId > 0L && sink.threadId > 0L &&
+            final.decoderThreadId != sink.threadId &&
+            final.decoderThreadId != coordinatorThreadId && sink.threadId != coordinatorThreadId &&
+            !final.decoderThreadIsTransportOwner && !sink.threadIsTransportOwner &&
+            final.decoderIngestCallbacksOnOwner > 0L && final.decoderIngestCallbacksOffOwner == 0L &&
+            final.listenerCallbacksOnOwner > 0L && final.listenerCallbacksOffOwner == 0L &&
+            sink.audioTrackCallsOffSinkThread == 0L &&
+            monitorThreadOk
+
+        out.lanes[LANE_PROOF_BOUNDARY] = PROOF_BOUNDARY_TOKENS.all { PROOF_BOUNDARY.contains(it) }
+
+        out.lanes[LANE_FOCUS_SETUP] = afterStart.focus.enabled &&
+            afterStart.focus.controllerRequested &&
+            afterStart.focus.controllerGranted &&
+            afterStart.focus.controllerNoisyRegistered &&
+            afterStart.focus.monitorStarted &&
+            afterStart.focus.monitorThreadId > 0L
+
+        out.lanes[LANE_FOCUS_PERMANENT_LOSS_PAUSE] = afterPermanent.focus.pausePermanentAppliedCount == 1L &&
+            afterPermanent.focus.terminalPermanentLoss &&
+            afterPermanent.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            afterPermanent.transportState == paused &&
+            afterIgnoredGain.focus.eventsDrained >= afterPermanent.focus.eventsDrained + 1L &&
+            afterIgnoredGain.focus.gainRestoreAppliedCount >= 1L &&
+            afterIgnoredGain.focus.autoResumeAppliedCount == 0L &&
+            afterIgnoredGain.focus.terminalPermanentLoss &&
+            afterIgnoredGain.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+            afterIgnoredGain.transportState == paused
+
+        out.lanes[LANE_FOCUS_MONITOR_TEARDOWN] = final.focus.controllerReleased &&
+            final.focus.monitorExited &&
+            final.focus.monitorJoined &&
+            sink.releaseCount == 1 &&
+            sink.releaseExecutedOnSinkThread &&
+            final.sinkJoined &&
+            sink.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.EXITED &&
+            final.transportDisposeCalls == 1 &&
+            final.transportStateAfterDispose == VanguardRealtimePlaybackTransportStateMachine.State.DISPOSED &&
+            final.state == VanguardRealtimeAudioPlaybackSession.State.DISPOSED &&
+            final.failureReason.isBlank()
     }
 
     // A lane holds only when every scenario that evaluated it passed and at

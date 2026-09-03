@@ -702,6 +702,7 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         realtimeAudioPlaybackProductionSmokeCoordinator = AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
+            context = binding.applicationContext,
             mainHandler = mainHandler,
         )
         multiCamCompositorSmokeCoordinator = AndroidMultiCamCompositorSmokeCoordinator(

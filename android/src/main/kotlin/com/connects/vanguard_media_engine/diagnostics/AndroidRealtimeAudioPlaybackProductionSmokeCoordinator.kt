@@ -1,5 +1,7 @@
 package com.connects.vanguard_media_engine.diagnostics
 
+import android.content.Context
+import android.media.AudioManager
 import android.os.Handler
 import android.os.SystemClock
 import android.util.Log
@@ -14,13 +16,14 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Android True-DAG P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a) +
  * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b) +
  * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK (Y9) +
- * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b):
+ * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b) +
+ * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b):
  * production-component diagnostic smoke coordinator.
  *
  * Owns the [METHOD_NAME] MethodChannel route only. It drives the PRODUCTION
  * [VanguardRealtimeAudioPlaybackSession] (real MediaExtractor/MediaCodec ->
  * Y5a external ingest -> Y1 transport -> sink-thread-owned non-zero-gain
- * AudioTrack + presentation clock) through five scenarios on a worker
+ * AudioTrack + presentation clock) through seven scenarios on a worker
  * thread, evaluates proof lanes from the session's snapshots, posts the
  * payload on the main handler and logs the START / JSON / PASS / FAIL
  * markers. Every lifecycle decision lives in the session; this class only
@@ -49,8 +52,17 @@ import java.util.concurrent.atomic.AtomicBoolean
  * reason seek_repeated with state still PLAYING/no failure. Then awaits EOS,
  * stop/dispose, and evaluates lanes.
  * Seek metric flattening lives in [AndroidRealtimeAudioPlaybackProductionSeekMetrics].
+ *
+ * Scenario 6 (Y11b) starts a focus-enabled session (duckGain default 0.1f):
+ * proves transient duck gain change, full gain restore, transient loss pause,
+ * user-intent-gated auto-resume on gain, becoming-noisy terminal pause, and
+ * verified rejection of auto-resume after noisy loss.
+ *
+ * Scenario 7 (Y11b) starts a focus-enabled session: proves permanent loss pause
+ * and verified rejection of auto-resume on subsequent gain.
  */
 class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
+    private val context: Context,
     private val mainHandler: Handler,
 ) {
     companion object {
@@ -72,6 +84,9 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 "audiotrack_flush_once_on_sink_thread_before_transport_seek_" +
                 "seek_clock_epoch_based_at_target_deliberate_discontinuity_" +
                 "stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_" +
+                "production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_" +
+                "sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_" +
+                "noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_" +
                 "stop_dispose_release_once_" +
                 "no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni"
 
@@ -80,6 +95,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val SCENARIO_DEAD_OBJECT_RECOVERY = "SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS"
         const val SCENARIO_FORWARD_SEEK = "SCENARIO_FORWARD_SEEK_TO_EOS"
         const val SCENARIO_REPEATED_FORWARD_SEEK = "SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS"
+        const val SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY = "SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY"
+        const val SCENARIO_FOCUS_PERMANENT_LOSS = "SCENARIO_FOCUS_PERMANENT_LOSS"
 
         const val DEFAULT_PAUSE_HOLD_MS = 400L
         const val DEFAULT_STOP_AFTER_MS = 300L
@@ -97,6 +114,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         // It bounds how far the clock's view may trail the hardware on the
         // proof device; it is NOT a playback latency target or an SLA.
         const val DEAD_OBJECT_PUBLICATION_LAG_BUDGET_MS = 300L
+        const val DEFAULT_DUCK_GAIN = 0.1f
+        const val DEFAULT_FOCUS_SETTLE_MS = 100L
 
         const val LANE_FORMAT_PROBE = "formatProbeOk"
         const val LANE_PRE_ROLL = "preRollOk"
@@ -132,6 +151,13 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_REPEATED_SEEK_COMMAND = "repeatedSeekCommandOk"
         const val LANE_REPEATED_SEEK_CUMULATIVE_ACCOUNTING = "repeatedSeekCumulativeAccountingOk"
         const val LANE_REPEATED_SEEK_THIRD_REJECT = "repeatedSeekThirdRejectOk"
+        // Y11b lanes, evaluated by the focus-response scenarios.
+        const val LANE_FOCUS_SETUP = "focusSetupOk"
+        const val LANE_FOCUS_DUCK_RESTORE = "focusDuckRestoreOk"
+        const val LANE_FOCUS_TRANSIENT_PAUSE_RESUME = "focusTransientPauseResumeOk"
+        const val LANE_FOCUS_NOISY_TERMINAL_PAUSE = "focusNoisyTerminalPauseOk"
+        const val LANE_FOCUS_PERMANENT_LOSS_PAUSE = "focusPermanentLossPauseOk"
+        const val LANE_FOCUS_MONITOR_TEARDOWN = "focusMonitorTeardownOk"
         const val LANE_CANONICAL = "canonical"
 
         val REQUIRED_LANES: List<String> = listOf(
@@ -146,6 +172,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_DECODER_SEEK_REANCHOR, LANE_STALE_GENERATION_REJECTED, LANE_SEEK_CLOCK_EPOCH,
             LANE_POST_SEEK_DRAIN,
             LANE_REPEATED_SEEK_COMMAND, LANE_REPEATED_SEEK_CUMULATIVE_ACCOUNTING, LANE_REPEATED_SEEK_THIRD_REJECT,
+            LANE_FOCUS_SETUP, LANE_FOCUS_DUCK_RESTORE, LANE_FOCUS_TRANSIENT_PAUSE_RESUME,
+            LANE_FOCUS_NOISY_TERMINAL_PAUSE, LANE_FOCUS_PERMANENT_LOSS_PAUSE, LANE_FOCUS_MONITOR_TEARDOWN,
         )
 
         val PROOF_BOUNDARY_TOKENS = listOf(
@@ -158,6 +186,10 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "audiotrack_flush_once_on_sink_thread_before_transport_seek",
             "seek_clock_epoch_based_at_target_deliberate_discontinuity",
             "stale_generation_rejected_before_jni", "two_ordered_forward_seeks_and_third_rejected_without_teardown",
+            "production_focus_response", "focus_monitor_single_consumer", "audiomanager_focus_request",
+            "becoming_noisy_receiver", "sink_thread_gain_duck_restore_request_ack",
+            "transient_pause_auto_resume_user_intent_gated", "noisy_terminal_pause_no_auto_resume",
+            "permanent_loss_pause_no_auto_resume",
             "stop_dispose_release_once",
             "no_product", "no_editor", "no_app", "no_connectsapp", "no_ios",
             "no_streaming", "no_cache", "no_cpp", "no_jni",
@@ -222,6 +254,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             preSeekHoldWindows = (args["preSeekHoldWindows"] as? Number)?.toInt() ?: DEFAULT_PRE_SEEK_HOLD_WINDOWS,
             maxSeekHoldMs = (args["maxSeekHoldMs"] as? Number)?.toLong()
                 ?: VanguardRealtimeAudioPlaybackSession.DEFAULT_MAX_SEEK_HOLD_MS,
+            duckGain = (args["duckGain"] as? Number)?.toFloat() ?: DEFAULT_DUCK_GAIN,
         )
         runSmoke(config, result)
         return true
@@ -262,6 +295,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "maxDurationSec" to config.maxDurationSec,
             "maxFramesPerMix" to config.maxFramesPerMix,
             "gain" to config.gain.toDouble(),
+            "duckGain" to config.duckGain.toDouble(),
             "deadlineMs" to config.deadlineMs,
             "pauseHoldMs" to config.pauseHoldMs,
             "maxPauseHoldMs" to config.maxPauseHoldMs,
@@ -273,7 +307,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "maxSeekHoldMs" to config.maxSeekHoldMs,
             "coordinatorThreadId" to Thread.currentThread().id,
         )
-        val outcomes = ArrayList<ScenarioOutcome>(5)
+        val outcomes = ArrayList<ScenarioOutcome>(7)
         if (config.pauseHoldMs <= 0L || config.pauseHoldMs >= config.maxPauseHoldMs) {
             return buildPayload(false, "invalid_pause_hold:${config.pauseHoldMs}:${config.maxPauseHoldMs}", emptyList(), metrics)
         }
@@ -296,6 +330,9 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         }
         if (config.maxSeekHoldMs <= 0L || config.maxSeekHoldMs >= config.deadlineMs) {
             return buildPayload(false, "invalid_max_seek_hold:${config.maxSeekHoldMs}:${config.deadlineMs}", emptyList(), metrics)
+        }
+        if (!config.duckGain.isFinite() || config.duckGain < 0f || config.duckGain > config.gain) {
+            return buildPayload(false, "invalid_duck_gain:${config.duckGain}:${config.gain}", emptyList(), metrics)
         }
         // Y8a baseline scenarios run with the dead-object seam OFF.
         outcomes += runScenario(SCENARIO_PLAYTHROUGH, config, injectAfterFrames = 0L) { session, outcome ->
@@ -326,6 +363,28 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         ) { session, outcome ->
             repeatedForwardSeekScenario(session, config, outcome)
         }
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y11b: focus duck / transient pause / auto-resume / noisy terminal pause (seams off).
+        outcomes += runScenario(
+            SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY,
+            config,
+            injectAfterFrames = 0L,
+            enableAudioFocusResponse = true,
+            duckGain = config.duckGain,
+        ) { session, outcome ->
+            focusDuckTransientNoisyScenario(session, config, outcome)
+        }
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y11b: focus permanent loss terminal pause (seams off).
+        outcomes += runScenario(
+            SCENARIO_FOCUS_PERMANENT_LOSS,
+            config,
+            injectAfterFrames = 0L,
+            enableAudioFocusResponse = true,
+            duckGain = config.duckGain,
+        ) { session, outcome ->
+            focusPermanentLossScenario(session, config, outcome)
+        }
 
         val lanes = AndroidRealtimeAudioPlaybackProductionLaneEvaluator.aggregateLanes(outcomes)
         val firstFailure = outcomes.firstOrNull { it.failureReason.isNotBlank() }?.let { "${it.name}:${it.failureReason}" } ?: ""
@@ -340,6 +399,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         injectAfterFrames: Long,
         seekTargetSec: Double = 0.0,
         secondSeekTargetSec: Double = 0.0,
+        enableAudioFocusResponse: Boolean = false,
+        duckGain: Float = DEFAULT_DUCK_GAIN,
         body: (VanguardRealtimeAudioPlaybackSession, ScenarioOutcome) -> Unit,
     ): ScenarioOutcome {
         val outcome = ScenarioOutcome(name)
@@ -357,11 +418,17 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 secondSeekTargetSec = secondSeekTargetSec,
                 preSeekHoldWindows = config.preSeekHoldWindows,
                 maxSeekHoldMs = config.maxSeekHoldMs,
+                context = if (enableAudioFocusResponse) context else null,
+                mainHandler = if (enableAudioFocusResponse) mainHandler else null,
+                enableAudioFocusResponse = enableAudioFocusResponse,
+                duckGain = duckGain,
             ),
         )
         outcome.metrics["deadObjectInjectAfterFrames"] = injectAfterFrames
         outcome.metrics["seekTargetSecArmed"] = seekTargetSec
         outcome.metrics["secondSeekTargetSecArmed"] = secondSeekTargetSec
+        outcome.metrics["enableAudioFocusResponse"] = enableAudioFocusResponse
+        outcome.metrics["duckGainArmed"] = duckGain.toDouble()
         activeSession = session
         val wallStart = SystemClock.elapsedRealtime()
         try {
@@ -526,6 +593,170 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateRepeatedForwardSeek(
             final, armed, afterFirstSeek, afterSecondSeek, afterThirdSeek, stateAtCompletion, config, out,
         )
+    }
+
+    // ── Scenario 6 (Y11b): focus duck -> gain restore -> transient pause ->
+    //    auto-resume -> noisy terminal pause -> ignored gain ─────────────
+
+    private fun focusDuckTransientNoisyScenario(
+        session: VanguardRealtimeAudioPlaybackSession,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+    ) {
+        startAndAwaitAudio(session)
+        val afterStart = session.snapshot()
+
+        // a. post AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK, wait until snapshot.focus.duckAppliedCount == 1,
+        //    snapshot.sink.effectiveGain ~= duckGain, focusState ducked, no failure.
+        require(session.postSyntheticFocusChange(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK), "post_focus_duck_failed")
+        val afterDuck = awaitFocusSnapshot(session, config.deadlineMs, "focus_duck_not_applied") { snap ->
+            val sink = snap.sink ?: return@awaitFocusSnapshot false
+            snap.focus.duckAppliedCount == 1L &&
+                kotlin.math.abs(sink.effectiveGain - config.duckGain) <= 0.001f &&
+                snap.focus.focusState == "ducked"
+        }
+
+        // b. post AUDIOFOCUS_GAIN, wait until focus.gainRestoreAppliedCount == 1, sink.effectiveGain ~= gain.
+        require(session.postSyntheticFocusChange(AudioManager.AUDIOFOCUS_GAIN), "post_focus_gain_restore_failed")
+        val afterRestore = awaitFocusSnapshot(session, config.deadlineMs, "focus_restore_not_applied") { snap ->
+            val sink = snap.sink ?: return@awaitFocusSnapshot false
+            snap.focus.gainRestoreAppliedCount == 1L &&
+                kotlin.math.abs(sink.effectiveGain - config.gain) <= 0.001f
+        }
+
+        // c. post AUDIOFOCUS_LOSS_TRANSIENT, wait until focus.pauseTransientAppliedCount == 1,
+        //    focusPausedByPolicy true, state PAUSED, transportState PAUSED.
+        require(session.postSyntheticFocusChange(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT), "post_focus_transient_failed")
+        val afterTransientPause = awaitFocusSnapshot(session, config.deadlineMs, "focus_transient_pause_not_applied") { snap ->
+            snap.focus.pauseTransientAppliedCount == 1L &&
+                snap.focus.focusPausedByPolicy &&
+                snap.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+                snap.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED
+        }
+
+        // d. post AUDIOFOCUS_GAIN, wait until focus.autoResumeAppliedCount == 1, state PLAYING, transportState PLAYING.
+        require(session.postSyntheticFocusChange(AudioManager.AUDIOFOCUS_GAIN), "post_focus_gain_auto_resume_failed")
+        val afterAutoResume = awaitFocusSnapshot(session, config.deadlineMs, "focus_transient_resume_not_applied") { snap ->
+            snap.focus.autoResumeAppliedCount == 1L &&
+                snap.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING &&
+                snap.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PLAYING
+        }
+
+        // e. postSyntheticBecomingNoisy, wait until focus.pauseNoisyAppliedCount == 1,
+        //    terminalNoisyLoss true, state PAUSED, transportState PAUSED.
+        require(session.postSyntheticBecomingNoisy(), "post_becoming_noisy_failed")
+        val afterNoisy = awaitFocusSnapshot(session, config.deadlineMs, "focus_noisy_pause_not_applied") { snap ->
+            snap.focus.pauseNoisyAppliedCount == 1L &&
+                snap.focus.terminalNoisyLoss &&
+                snap.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+                snap.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED
+        }
+
+        // f. post AUDIOFOCUS_GAIN again; wait until the gain event is actually consumed without auto-resuming.
+        require(session.postSyntheticFocusChange(AudioManager.AUDIOFOCUS_GAIN), "post_focus_gain_after_noisy_failed")
+        val afterIgnoredGain = awaitFocusSnapshot(
+            session,
+            config.deadlineMs,
+            "focus_noisy_gain_not_consumed_or_auto_resumed",
+        ) { snap ->
+            snap.focus.eventsDrained >= afterNoisy.focus.eventsDrained + 1L &&
+                snap.focus.gainRestoreAppliedCount >= afterRestore.focus.gainRestoreAppliedCount + 1L &&
+                snap.focus.autoResumeAppliedCount == 1L &&
+                snap.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+                snap.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED &&
+                snap.focus.terminalNoisyLoss
+        }
+
+        // Then stop/dispose cleanly.
+        val stopRes = session.stop()
+        require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
+        session.dispose()
+        session.dispose()
+        val final = session.snapshot()
+
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateFocusDuckTransientNoisy(
+            final = final,
+            afterStart = afterStart,
+            afterDuck = afterDuck,
+            afterRestore = afterRestore,
+            afterTransientPause = afterTransientPause,
+            afterAutoResume = afterAutoResume,
+            afterNoisy = afterNoisy,
+            afterIgnoredGain = afterIgnoredGain,
+            config = config,
+            out = out,
+            coordinatorThreadId = Thread.currentThread().id,
+        )
+    }
+
+    // ── Scenario 7 (Y11b): permanent focus loss -> no auto-resume on gain ───
+
+    private fun focusPermanentLossScenario(
+        session: VanguardRealtimeAudioPlaybackSession,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+    ) {
+        startAndAwaitAudio(session)
+        val afterStart = session.snapshot()
+
+        // post AUDIOFOCUS_LOSS, wait until pausePermanentAppliedCount == 1, terminalPermanentLoss true, state PAUSED, transportState PAUSED;
+        require(session.postSyntheticFocusChange(AudioManager.AUDIOFOCUS_LOSS), "post_focus_permanent_loss_failed")
+        val afterPermanent = awaitFocusSnapshot(session, config.deadlineMs, "focus_permanent_pause_not_applied") { snap ->
+            snap.focus.pausePermanentAppliedCount == 1L &&
+                snap.focus.terminalPermanentLoss &&
+                snap.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+                snap.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED
+        }
+
+        // post AUDIOFOCUS_GAIN; wait until the gain event is actually consumed without auto-resuming.
+        require(session.postSyntheticFocusChange(AudioManager.AUDIOFOCUS_GAIN), "post_focus_gain_after_loss_failed")
+        val afterIgnoredGain = awaitFocusSnapshot(
+            session,
+            config.deadlineMs,
+            "focus_permanent_gain_not_consumed_or_auto_resumed",
+        ) { snap ->
+            snap.focus.eventsDrained >= afterPermanent.focus.eventsDrained + 1L &&
+                snap.focus.gainRestoreAppliedCount >= 1L &&
+                snap.focus.autoResumeAppliedCount == 0L &&
+                snap.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
+                snap.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED &&
+                snap.focus.terminalPermanentLoss
+        }
+
+        // Then stop/dispose cleanly.
+        val stopRes = session.stop()
+        require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
+        session.dispose()
+        session.dispose()
+        val final = session.snapshot()
+
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateFocusPermanentLoss(
+            final = final,
+            afterStart = afterStart,
+            afterPermanent = afterPermanent,
+            afterIgnoredGain = afterIgnoredGain,
+            config = config,
+            out = out,
+            coordinatorThreadId = Thread.currentThread().id,
+        )
+    }
+
+    private fun awaitFocusSnapshot(
+        session: VanguardRealtimeAudioPlaybackSession,
+        timeoutMs: Long,
+        timeoutReason: String,
+        condition: (VanguardRealtimeAudioPlaybackSession.Snapshot) -> Boolean,
+    ): VanguardRealtimeAudioPlaybackSession.Snapshot {
+        val start = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - start < timeoutMs) {
+            val snap = session.snapshot()
+            require(snap.failureReason.isBlank(), "failure_before_focus_event:${snap.failureReason}")
+            if (condition(snap)) {
+                return snap
+            }
+            SystemClock.sleep(WAIT_SLICE_MS)
+        }
+        throw FailClosed(timeoutReason)
     }
 
     // ── Scenario 2: load/start -> stop/dispose before EOS ──────────────────
@@ -726,6 +957,14 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             m["sinkClockSnapshotsAtDeadObjectRecovery"] = k.clockSnapshotsAtDeadObjectRecovery
             m["playbackHeadAtDeadObject"] = k.playbackHeadAtDeadObject
             AndroidRealtimeAudioPlaybackProductionSeekMetrics.putSinkSeekMetrics(m, k)
+            m["sinkGainRequestCount"] = k.gainRequestCount
+            m["sinkGainAppliedCount"] = k.gainAppliedCount
+            m["sinkGainRejectedCount"] = k.gainRejectedCount
+            m["sinkGainQueueFullCount"] = k.gainQueueFullCount
+            m["sinkLastGainRequestSeq"] = k.lastGainRequestSeq
+            m["sinkLastGainAppliedSeq"] = k.lastGainAppliedSeq
+            m["sinkGainAppliedOnSinkThread"] = k.gainAppliedOnSinkThread
+            m["sinkEffectiveGain"] = k.effectiveGain.toDouble()
         }
         if (c != null) {
             m["clockConsistent"] = c.consistent
@@ -764,6 +1003,41 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             m["clockPositionAfterResume"] = it.positionFrames
         }
         AndroidRealtimeAudioPlaybackProductionSeekMetrics.putSessionSeekMetrics(m, s.seek)
+        val f = s.focus
+        m["focusEnabled"] = f.enabled
+        m["focusControllerRequested"] = f.controllerRequested
+        m["focusControllerGranted"] = f.controllerGranted
+        m["focusControllerNoisyRegistered"] = f.controllerNoisyRegistered
+        m["focusControllerReleased"] = f.controllerReleased
+        m["focusMonitorStarted"] = f.monitorStarted
+        m["focusMonitorExited"] = f.monitorExited
+        m["focusMonitorJoined"] = f.monitorJoined
+        m["focusMonitorThreadId"] = f.monitorThreadId
+        m["focusEventsEnqueued"] = f.eventsEnqueued
+        m["focusEventsDrained"] = f.eventsDrained
+        m["focusEventsDropped"] = f.eventsDropped
+        m["focusEventsPending"] = f.eventsPending
+        m["focusDuckAppliedCount"] = f.duckAppliedCount
+        m["focusGainRestoreAppliedCount"] = f.gainRestoreAppliedCount
+        m["focusPauseTransientAppliedCount"] = f.pauseTransientAppliedCount
+        m["focusPausePermanentAppliedCount"] = f.pausePermanentAppliedCount
+        m["focusPauseNoisyAppliedCount"] = f.pauseNoisyAppliedCount
+        m["focusPauseDroppedParkAppliedCount"] = f.pauseDroppedParkAppliedCount
+        m["focusAutoResumeAppliedCount"] = f.autoResumeAppliedCount
+        m["focusUnknownEventCount"] = f.unknownEventCount
+        m["focusGainRequestCount"] = f.gainRequestCount
+        m["focusGainAppliedCount"] = f.gainAppliedCount
+        m["focusGainFailCount"] = f.gainFailCount
+        m["focusState"] = f.focusState
+        m["focusUserIntentPlaying"] = f.userIntentPlaying
+        m["focusPausedByPolicy"] = f.focusPausedByPolicy
+        m["focusTerminalPermanentLoss"] = f.terminalPermanentLoss
+        m["focusTerminalNoisyLoss"] = f.terminalNoisyLoss
+        m["focusLastEventTag"] = f.lastEventTag
+        m["focusLastEventSeq"] = f.lastEventSeq
+        m["focusLastEventSource"] = f.lastEventSource
+        m["focusLastAction"] = f.lastAction
+        m["focusLastReason"] = f.lastReason
         return m
     }
 
@@ -792,7 +1066,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "proofBoundary" to PROOF_BOUNDARY,
             "nativeProofBoundary" to PROOF_BOUNDARY,
             "failureReason" to reason,
-            "details" to "Y8a/Y8b/Y9/Y10b realtime audio playback production sink/clock/dead-object/seek/repeated-seek smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
+            "details" to "Y8a/Y8b/Y9/Y10b/Y11b realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
             "lanes" to lanes,
             "metrics" to metricMap,
             "lastError" to if (pass) null else reason,

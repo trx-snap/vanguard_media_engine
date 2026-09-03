@@ -1,6 +1,9 @@
 package com.connects.vanguard_media_engine.audio_playback_graph
 
+import android.content.Context
+import android.os.Handler
 import android.os.SystemClock
+import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackAudioFocusController.Tag as FocusTag
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackNativeSession.Reply
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackTransportStateMachine.State as TransportState
 import java.util.concurrent.atomic.AtomicBoolean
@@ -84,6 +87,39 @@ import kotlin.concurrent.withLock
 // pre-roll rather than inheriting the first seek's already-accumulated
 // frames. See [VanguardRealtimeAudioPlaybackSeekSequencer] for the per-step
 // domain bookkeeping.
+//
+// Production focus/noisy response (Y11b, P4-AUDIO-REALTIME-PLAYBACK-
+// PRODUCTION-FOCUS-RESPONSE), default OFF ([Config.enableAudioFocusResponse]):
+// this session owns exactly one [VanguardRealtimePlaybackAudioFocusController]
+// and exactly one focus monitor thread that is its only event consumer
+// (Opus Option B). Start requests AUDIOFOCUS_GAIN and registers the
+// becoming-noisy receiver before the sink exists; the monitor itself only
+// starts once the sink is READY, before the transport starts (class comment
+// order), so it can never observe a gain/duck event with no sink yet to
+// apply it to; any setup failure fails closed pre-audible and releases the
+// controller. The monitor never holds commandLock while blocked on the
+// controller's queue; it acquires commandLock only to run a transport
+// command through the SAME bounded pause/resume sequence as the public API
+// (the [pauseBoundedLocked] / [resumeLocked] helpers), so there is exactly
+// one transport-command path.
+// User intent ([userIntentPlaying], set by [start]/[resume]/[pauseBounded])
+// and focus-induced pause ([focusPausedByPolicy]) are tracked separately: a
+// duck (FOCUS_LOSS_TRANSIENT_CAN_DUCK) only requests/awaits a bounded sink
+// gain change; a transient loss/drop pauses and marks focusPausedByPolicy;
+// a focus gain restores volume and, only when userIntentPlaying and
+// focusPausedByPolicy are both true, the state is PAUSED and neither
+// terminal-loss flag is set, resumes through the bounded resume order.
+// Permanent loss and becoming-noisy pause once (when PLAYING) and set a
+// terminal flag that blocks any later auto-resume; a user pause always
+// clears userIntentPlaying regardless of focus state. Teardown signals the
+// monitor to stop, releases commandLock while joining it bounded (never
+// while holding it, and never self-joins when torn down from the monitor's
+// own thread), then releases the controller, before the existing sink/
+// decoder/transport teardown. [postSyntheticFocusChange] /
+// [postSyntheticBecomingNoisy] are a diagnostic seam onto the same
+// controller queue; both are false when focus response is disabled. All of
+// this is published through [Snapshot.focus] as
+// [VanguardRealtimeAudioPlaybackFocusTelemetry].
 class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
 
     data class Config(
@@ -111,6 +147,19 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         val preSeekHoldWindows: Int = DEFAULT_PRE_SEEK_HOLD_WINDOWS,
         // Y9: hard cap on the sink's seek park (distinct from the pause cap).
         val maxSeekHoldMs: Long = DEFAULT_MAX_SEEK_HOLD_MS,
+        // Y11b production focus/noisy response, default OFF (false): every
+        // field below is validated only when this is true (class comment).
+        val context: Context? = null,
+        val mainHandler: Handler? = null,
+        val enableAudioFocusResponse: Boolean = false,
+        // Linear gain applied on FOCUS_LOSS_TRANSIENT_CAN_DUCK; must stay in [0.0, gain].
+        val duckGain: Float = 0.1f,
+        // Bounded slice the focus monitor blocks on the controller's queue per iteration.
+        val focusEventPollMs: Long = 10L,
+        // Bounded wait for the sink to ack a requestGain seq (duck or restore).
+        val focusGainApplyTimeoutMs: Long = 500L,
+        // Bounded join of the focus monitor thread at teardown.
+        val focusMonitorJoinMs: Long = 1000L,
     )
 
     enum class State { IDLE, STARTING, PLAYING, PAUSED, SEEKING, COMPLETED, STOPPED, FAILED, DISPOSED }
@@ -177,6 +226,7 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         val terminalReply: Reply?,
         val sessionWallMs: Long,
         val seek: VanguardRealtimeAudioPlaybackSeekObservation,
+        val focus: VanguardRealtimeAudioPlaybackFocusTelemetry,
     )
 
     companion object {
@@ -280,6 +330,39 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         },
     )
 
+    // Y11b production focus/noisy response (command-lock-confined mutation
+    // of the transport-facing flags; the monitor thread otherwise
+    // single-writes its own bookkeeping below, published through
+    // [buildFocusTelemetry] / [Snapshot.focus]).
+    @Volatile private var focusController: VanguardRealtimePlaybackAudioFocusController? = null
+    @Volatile private var focusMonitorThread: Thread? = null
+    private val focusMonitorShutdown = AtomicBoolean(false)
+    @Volatile private var focusMonitorStarted = false
+    @Volatile private var focusMonitorExited = false
+    @Volatile private var focusMonitorJoined = false
+    @Volatile private var focusMonitorThreadId = -1L
+    @Volatile private var userIntentPlaying = false
+    @Volatile private var focusPausedByPolicy = false
+    @Volatile private var focusTerminalPermanentLoss = false
+    @Volatile private var focusTerminalNoisyLoss = false
+    @Volatile private var focusState = ""
+    @Volatile private var focusDuckAppliedCount = 0L
+    @Volatile private var focusGainRestoreAppliedCount = 0L
+    @Volatile private var focusPauseTransientAppliedCount = 0L
+    @Volatile private var focusPausePermanentAppliedCount = 0L
+    @Volatile private var focusPauseNoisyAppliedCount = 0L
+    @Volatile private var focusPauseDroppedParkAppliedCount = 0L
+    @Volatile private var focusAutoResumeAppliedCount = 0L
+    @Volatile private var focusUnknownEventCount = 0L
+    @Volatile private var focusGainRequestCount = 0L
+    @Volatile private var focusGainAppliedCount = 0L
+    @Volatile private var focusGainFailCount = 0L
+    @Volatile private var lastFocusEventTag = ""
+    @Volatile private var lastFocusEventSeq = -1L
+    @Volatile private var lastFocusEventSource = ""
+    @Volatile private var lastFocusAction = ""
+    @Volatile private var lastFocusReason = ""
+
     val currentState: State get() = state
     val failureReason: String get() = failure.get() ?: ""
 
@@ -348,7 +431,23 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         if (config.preSeekHoldWindows <= 0 || config.preSeekHoldWindows > MAX_PRE_SEEK_HOLD_WINDOWS) {
             return failClosed("invalid_pre_seek_hold_windows")
         }
+        // Y11b: validated only when enabled (class comment); the disabled
+        // default leaves every other config field unchecked and unused.
+        if (config.enableAudioFocusResponse) {
+            if (config.context == null) return failClosed("focus_context_required")
+            if (config.mainHandler == null) return failClosed("focus_main_handler_required")
+            if (!config.duckGain.isFinite() || config.duckGain < 0f || config.duckGain > config.gain) {
+                return failClosed("invalid_duck_gain")
+            }
+            if (config.focusEventPollMs <= 0L) return failClosed("invalid_focus_event_poll_ms")
+            if (config.focusGainApplyTimeoutMs <= 0L) return failClosed("invalid_focus_gain_apply_timeout_ms")
+            if (config.focusMonitorJoinMs <= 0L) return failClosed("invalid_focus_monitor_join_ms")
+        }
         state = State.STARTING
+        // Only an accepted start attempt (validation above already passed)
+        // begins the session and sets user intent; a rejected invalid-
+        // state/config start must never mutate it.
+        userIntentPlaying = true
         generation++
         sessionStartedAtMs = SystemClock.elapsedRealtime()
         deadlineAtMs = sessionStartedAtMs + config.deadlineMs
@@ -453,6 +552,29 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             if (!seekHoldPinned) throw FailClosed("seek_hold_pin_rejected:$hold")
         }
 
+        // Y11b production focus/noisy response, default OFF: request
+        // AUDIOFOCUS_GAIN and register the ACTION_AUDIO_BECOMING_NOISY
+        // receiver before the sink exists or the transport starts (class
+        // comment). Any setup failure here fails closed before audible
+        // output and releases the controller through the common teardown.
+        // The monitor thread itself is NOT started here: it is only started
+        // once the sink exists and is READY (below), so an early OS
+        // FOCUS_GAIN/CAN_DUCK callback can never reach [applyFocusGain]
+        // while [sink] is still null.
+        if (config.enableAudioFocusResponse) {
+            val focusContext = config.context ?: throw FailClosed("focus_context_required")
+            val focusHandler = config.mainHandler ?: throw FailClosed("focus_main_handler_required")
+            val controller = VanguardRealtimePlaybackAudioFocusController(focusContext, focusHandler)
+            focusController = controller
+            if (!controller.requestFocus()) {
+                throw FailClosed("focus_request_denied:${controller.telemetry()["focusRequestError"]}")
+            }
+            if (!controller.registerNoisyReceiver()) {
+                throw FailClosed("focus_noisy_register_failed:${controller.telemetry()["receiverRegisterError"]}")
+            }
+            focusState = "held"
+        }
+
         // Sink exists and is READY (AudioTrack created, gain set) before the
         // transport starts; it only drains after allowDrain().
         val s = VanguardRealtimeAudioPlaybackSinkBridge(
@@ -483,6 +605,18 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         }
         sinkReadyAtMs = SystemClock.elapsedRealtime()
 
+        // Y11b: the ONE session-owned focus monitor thread starts only now
+        // that the sink exists and is READY, and strictly before
+        // transport.start/allowDrain below, so the request/register-before-
+        // audible-output contract (class comment) still holds while a gain
+        // event can always find a live sink to apply against.
+        if (config.enableAudioFocusResponse) {
+            val monitor = Thread({ runFocusMonitor() }, "${config.threadNamePrefix}FocusMonitor")
+            focusMonitorThread = monitor
+            monitor.start()
+            focusMonitorStarted = true
+        }
+
         val startRes = machine.start()
         commandsIssued++
         transportStartAtMs = SystemClock.elapsedRealtime()
@@ -496,12 +630,22 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     }
 
     // Sink park -> ack -> transport.pause. The hold is bounded by the sink.
+    // A user pause always clears user intent (Y11b); a focus-induced pause
+    // goes through [pauseBoundedLocked] directly and never touches it.
     fun pauseBounded(): CommandResult = commandLock.withLock {
+        userIntentPlaying = false
+        pauseBoundedLocked()
+    }
+
+    // Command-lock holder only (already held by [pauseBounded] or by the
+    // Y11b focus monitor's own commandLock.withLock around a focus event);
+    // never mutates [userIntentPlaying].
+    private fun pauseBoundedLocked(): CommandResult {
         if (state != State.PLAYING) return reject("invalid_state_${state.name.lowercase()}")
         failure.get()?.let { return failClosed(it) }
         val s = sink ?: return failClosed("sink_missing")
         val machine = transport ?: return failClosed("transport_missing")
-        try {
+        return try {
             pauseRequestedAtMs = SystemClock.elapsedRealtime()
             if (!s.requestPark()) throw FailClosed("sink_park_rejected:${s.phase.name.lowercase()}")
             val ackDeadline = pauseRequestedAtMs + PARK_ACK_TIMEOUT_MS
@@ -528,12 +672,22 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     }
 
     // transport.resume -> sink unpark -> ack (AudioTrack.play, new epoch).
+    // A user resume always sets user intent (Y11b); the focus monitor's own
+    // auto-resume goes through [resumeLocked] directly and never touches it.
     fun resume(): CommandResult = commandLock.withLock {
+        userIntentPlaying = true
+        resumeLocked()
+    }
+
+    // Command-lock holder only (already held by [resume] or by the Y11b
+    // focus monitor's own commandLock.withLock around a FOCUS_GAIN auto-
+    // resume); never mutates [userIntentPlaying].
+    private fun resumeLocked(): CommandResult {
         if (state != State.PAUSED) return reject("invalid_state_${state.name.lowercase()}")
         failure.get()?.let { return failClosed(it) }
         val s = sink ?: return failClosed("sink_missing")
         val machine = transport ?: return failClosed("transport_missing")
-        try {
+        return try {
             if (!s.isAlive) throw FailClosed("sink_exited_during_pause:${s.currentExitReason}")
             clockBeforeResume = s.clockSnapshot()
             val res = machine.resume()
@@ -554,6 +708,7 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             pauseHoldObservedMs = resumedAtMs - pauseAckedAtMs
             clockAfterResume = s.clockSnapshot()
             state = State.PLAYING
+            focusPausedByPolicy = false
             accept()
         } catch (f: FailClosed) {
             failClosed(f.reason)
@@ -629,6 +784,26 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         cancelled.set(true)
         sink?.cancel()
         feed?.cancel()
+        // Y11b: non-blocking wake so the focus monitor (if any) notices
+        // cancellation without waiting for its next poll slice; the bounded
+        // join itself only happens at teardown.
+        focusMonitorShutdown.set(true)
+        focusMonitorThread?.takeIf { it.isAlive && Thread.currentThread() !== it }?.interrupt()
+    }
+
+    // Y11b diagnostic seam (any thread): posts one synthetic focus-change /
+    // becoming-noisy event onto the SAME controller queue the focus monitor
+    // drains, so it is indistinguishable from a real OS callback. False
+    // whenever focus response is disabled or the controller is absent or
+    // already released (never throws).
+    fun postSyntheticFocusChange(focusChange: Int): Boolean {
+        if (!config.enableAudioFocusResponse) return false
+        return focusController?.postSyntheticFocusChange(focusChange) ?: false
+    }
+
+    fun postSyntheticBecomingNoisy(): Boolean {
+        if (!config.enableAudioFocusResponse) return false
+        return focusController?.postSyntheticBecomingNoisy() ?: false
     }
 
     // ── Waits (any thread; lock-free) ──────────────────────────────────────
@@ -780,6 +955,7 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
                 clockAfterUnpark = seekSequencer.seekClockAfterUnpark,
                 decoder = f?.seekTelemetry(),
             ),
+            focus = buildFocusTelemetry(),
         )
     }
 
@@ -859,6 +1035,7 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     private fun teardownLocked() {
         if (!teardownDone.compareAndSet(false, true)) return
         cancelled.set(true)
+        shutdownAndJoinFocusMonitorUnlocked()
         val s = sink
         val f = feed
         s?.cancel()
@@ -894,6 +1071,232 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
             transportStateAfterDispose = machine.currentState
         }
         if (sessionStartedAtMs >= 0L) sessionWallMs = SystemClock.elapsedRealtime() - sessionStartedAtMs
+    }
+
+    // ── Y11b production focus/noisy response internals ─────────────────────
+
+    // Command-lock holder only, called from [teardownLocked]. Releases
+    // commandLock while joining so the monitor thread (whose only lock use
+    // is a short, bounded commandLock.withLock around one focus event) can
+    // finish its current transition and observe the shutdown flag, then
+    // reacquires the lock before returning (matched unlock/lock pair; every
+    // teardownLocked() caller already holds commandLock exactly once here).
+    // Never joins the monitor from its own thread (its own fail-closed path
+    // re-enters teardownLocked on that same thread).
+    private fun shutdownAndJoinFocusMonitorUnlocked() {
+        val controller = focusController ?: return
+        focusMonitorShutdown.set(true)
+        val t = focusMonitorThread
+        if (t != null && t.isAlive && Thread.currentThread() !== t) {
+            t.interrupt()
+            commandLock.unlock()
+            try {
+                t.join(config.focusMonitorJoinMs)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } finally {
+                commandLock.lock()
+            }
+        }
+        focusMonitorJoined = t == null || !t.isAlive
+        controller.release()
+    }
+
+    // The session's ONE focus monitor thread and the controller's ONE event
+    // consumer (Opus Option B). Bounded-slices on the controller's queue so
+    // [focusMonitorShutdown] / [cancelled] are re-checked regularly; never
+    // holds commandLock across that wait, only around one event's
+    // transport-command reaction.
+    private fun runFocusMonitor() {
+        focusMonitorThreadId = Thread.currentThread().id
+        val controller = focusController
+        if (controller == null) {
+            focusMonitorExited = true
+            return
+        }
+        var lastDropped = controller.droppedCount
+        try {
+            while (!focusMonitorShutdown.get() && !cancelled.get()) {
+                val event = try {
+                    controller.awaitEvent(config.focusEventPollMs) { !focusMonitorShutdown.get() && !cancelled.get() }
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    null
+                }
+                if (focusMonitorShutdown.get() || cancelled.get()) break
+                if (event != null) handleFocusEvent(event)
+                val dropped = controller.droppedCount
+                if (dropped > lastDropped) {
+                    lastDropped = dropped
+                    handleDroppedEventPark()
+                }
+            }
+        } catch (t: Throwable) {
+            commandLock.withLock { failClosed("focus_monitor_exception:${t.javaClass.simpleName}:${t.message}") }
+        } finally {
+            focusMonitorExited = true
+        }
+    }
+
+    // Focus monitor thread only. One event, one reaction (class comment /
+    // functional requirement 5): duck and gain-restore only round-trip the
+    // sink's gain queue; every pause reaction runs the SAME bounded pause
+    // order as the public API via [pauseBoundedLocked], gated by whether the
+    // transport is actually PLAYING (a no-op reject when it is not).
+    private fun handleFocusEvent(event: VanguardRealtimePlaybackAudioFocusController.Event) {
+        lastFocusEventTag = event.tag.name
+        lastFocusEventSeq = event.seq
+        lastFocusEventSource = event.source.name
+        lastFocusReason = event.tag.name.lowercase()
+        when (event.tag) {
+            FocusTag.FOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+                focusState = "ducked"
+                lastFocusAction = "duck"
+                if (applyFocusGain(config.duckGain, "focus_duck_gain")) focusDuckAppliedCount++
+            }
+            FocusTag.FOCUS_GAIN -> {
+                focusState = "held"
+                lastFocusAction = "gain_restore"
+                if (applyFocusGain(config.gain, "focus_gain_restore")) {
+                    focusGainRestoreAppliedCount++
+                    // Auto-resume only when the user still wants to play, the
+                    // pause was ours, we are actually PAUSED and neither
+                    // terminal-loss flag is set (functional requirement 4).
+                    commandLock.withLock {
+                        if (userIntentPlaying && focusPausedByPolicy && state == State.PAUSED &&
+                            !focusTerminalPermanentLoss && !focusTerminalNoisyLoss
+                        ) {
+                            if (resumeLocked().accepted) {
+                                lastFocusAction = "auto_resume"
+                                lastFocusReason = "focus_gain_auto_resume"
+                                focusAutoResumeAppliedCount++
+                            }
+                        }
+                    }
+                }
+            }
+            FocusTag.FOCUS_LOSS_TRANSIENT -> {
+                focusState = "lost_transient"
+                lastFocusAction = "pause_transient"
+                commandLock.withLock {
+                    if (pauseBoundedLocked().accepted) {
+                        focusPausedByPolicy = true
+                        focusPauseTransientAppliedCount++
+                    }
+                }
+            }
+            FocusTag.FOCUS_LOSS_PERMANENT -> {
+                focusState = "lost_permanent"
+                focusTerminalPermanentLoss = true
+                lastFocusAction = "pause_permanent"
+                commandLock.withLock {
+                    if (pauseBoundedLocked().accepted) focusPausePermanentAppliedCount++
+                }
+            }
+            FocusTag.BECOMING_NOISY -> {
+                focusState = "noisy"
+                focusTerminalNoisyLoss = true
+                lastFocusAction = "pause_noisy"
+                commandLock.withLock {
+                    if (pauseBoundedLocked().accepted) focusPauseNoisyAppliedCount++
+                }
+            }
+            FocusTag.FOCUS_UNKNOWN -> {
+                focusUnknownEventCount++
+                lastFocusAction = "unknown_ignored"
+            }
+        }
+    }
+
+    // Focus monitor thread only: the controller's queue was full at offer()
+    // time, so the dropped event itself is unrecoverable; treated as a
+    // transient loss/park (functional requirement 5).
+    private fun handleDroppedEventPark() {
+        lastFocusAction = "dropped_park"
+        lastFocusReason = "queue_dropped_event"
+        commandLock.withLock {
+            if (pauseBoundedLocked().accepted) {
+                focusPausedByPolicy = true
+                focusPauseDroppedParkAppliedCount++
+            }
+        }
+    }
+
+    // Focus monitor thread only: any-thread gain round-trip through the
+    // sink bridge's queued volume request (never an AudioTrack call here,
+    // Opus Option B). A rejected request or a timed-out ack fails the whole
+    // session closed with a focus-tagged reason, same as every other
+    // unrecoverable condition in this class.
+    private fun applyFocusGain(target: Float, reasonPrefix: String): Boolean {
+        focusGainRequestCount++
+        val s = sink
+        if (s == null) {
+            focusGainFailCount++
+            commandLock.withLock { failClosed("${reasonPrefix}_sink_missing") }
+            return false
+        }
+        val seq = s.requestGain(target)
+        if (seq < 0L) {
+            focusGainFailCount++
+            commandLock.withLock { failClosed("${reasonPrefix}_request_rejected") }
+            return false
+        }
+        if (!s.awaitGainApplied(seq, config.focusGainApplyTimeoutMs)) {
+            focusGainFailCount++
+            commandLock.withLock { failClosed("${reasonPrefix}_apply_timeout") }
+            return false
+        }
+        focusGainAppliedCount++
+        return true
+    }
+
+    // Any thread, lock-free: mirrors the controller's own counters live
+    // (its accessors stay valid after release()) plus this session's
+    // single-writer bookkeeping. Disabled / not-yet-set-up sessions report
+    // enabled=false / empty defaults without needing a separate branch.
+    private fun buildFocusTelemetry(): VanguardRealtimeAudioPlaybackFocusTelemetry {
+        val controller = focusController
+        val tel = controller?.telemetry()
+        return VanguardRealtimeAudioPlaybackFocusTelemetry(
+            enabled = config.enableAudioFocusResponse,
+            controllerRequested = controller?.isFocusRequested ?: false,
+            controllerGranted = controller?.isFocusGranted ?: false,
+            controllerRequestResult = (tel?.get("focusRequestResult") as? Int)
+                ?: VanguardRealtimePlaybackAudioFocusController.RESULT_NOT_ATTEMPTED,
+            controllerRequestError = (tel?.get("focusRequestError") as? String) ?: "",
+            controllerNoisyRegistered = controller?.isReceiverRegistered ?: false,
+            controllerRegisterError = (tel?.get("receiverRegisterError") as? String) ?: "",
+            controllerReleased = controller?.isReleased ?: false,
+            monitorStarted = focusMonitorStarted,
+            monitorExited = focusMonitorExited,
+            monitorJoined = focusMonitorJoined,
+            monitorThreadId = focusMonitorThreadId,
+            eventsEnqueued = controller?.enqueuedCount ?: 0L,
+            eventsDrained = controller?.drainedCount ?: 0L,
+            eventsDropped = controller?.droppedCount ?: 0L,
+            eventsPending = controller?.pendingCount ?: 0,
+            duckAppliedCount = focusDuckAppliedCount,
+            gainRestoreAppliedCount = focusGainRestoreAppliedCount,
+            pauseTransientAppliedCount = focusPauseTransientAppliedCount,
+            pausePermanentAppliedCount = focusPausePermanentAppliedCount,
+            pauseNoisyAppliedCount = focusPauseNoisyAppliedCount,
+            pauseDroppedParkAppliedCount = focusPauseDroppedParkAppliedCount,
+            autoResumeAppliedCount = focusAutoResumeAppliedCount,
+            unknownEventCount = focusUnknownEventCount,
+            gainRequestCount = focusGainRequestCount,
+            gainAppliedCount = focusGainAppliedCount,
+            gainFailCount = focusGainFailCount,
+            focusState = focusState,
+            userIntentPlaying = userIntentPlaying,
+            focusPausedByPolicy = focusPausedByPolicy,
+            terminalPermanentLoss = focusTerminalPermanentLoss,
+            terminalNoisyLoss = focusTerminalNoisyLoss,
+            lastEventTag = lastFocusEventTag,
+            lastEventSeq = lastFocusEventSeq,
+            lastEventSource = lastFocusEventSource,
+            lastAction = lastFocusAction,
+            lastReason = lastFocusReason,
+        )
     }
 
     private fun remainingMs(): Long = maxOf(1L, deadlineAtMs - SystemClock.elapsedRealtime())
