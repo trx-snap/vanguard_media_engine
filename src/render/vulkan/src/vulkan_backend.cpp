@@ -171,6 +171,18 @@ RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle /*handle*/,
 }
 
 // ---------------------------------------------------------------------------
+// P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
+// sub-slice N3: renderFrame with overlay draws stub - host build.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle /*handle*/,
+                                             const VideoFrameTransform& /*transform*/,
+                                             const VulkanOverlayFrameDraw* /*overlayDraws*/,
+                                             uint32_t /*overlayCount*/) {
+    return RenderFrameResult::kUnavailable;
+}
+
+// ---------------------------------------------------------------------------
 // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: renderFrame with beauty stub - host build.
 // ---------------------------------------------------------------------------
 
@@ -872,6 +884,42 @@ RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle handle,
         *s.coreShaders,
         handle,
         transform);
+}
+
+// ---------------------------------------------------------------------------
+// P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A backend seam
+// sub-slice N3: renderFrame with overlay draws - Android.
+// Delegates to the frame renderer's overlay-aware overload, which itself
+// delegates straight back to the plain transform overload whenever
+// overlayCount == 0 -- so this seam never changes non-overlay behavior.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle handle,
+                                             const VideoFrameTransform& transform,
+                                             const VulkanOverlayFrameDraw* overlayDraws,
+                                             uint32_t overlayCount) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (!s.surfaceSwapchain || !s.surfaceSwapchain->hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (!s.ahbImports || !hasHardwareBuffer(handle) || s.ahbImports->getImage(handle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (!s.frameRenderer || !s.coreShaders) {
+        return RenderFrameResult::kUnavailable;
+    }
+    return s.frameRenderer->renderFrame(
+        static_cast<void*>(s.queue),
+        *s.surfaceSwapchain,
+        *s.ahbImports,
+        *s.coreShaders,
+        handle,
+        transform,
+        overlayDraws,
+        overlayCount);
 }
 
 // ---------------------------------------------------------------------------
