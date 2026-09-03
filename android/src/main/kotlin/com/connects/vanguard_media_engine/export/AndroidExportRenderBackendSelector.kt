@@ -43,6 +43,14 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // `transitions_require_vulkan` prefix takes priority when the scope ALSO
 // carries a non-hard-cut transition, since that failure mode is
 // pre-existing/tested and independently sufficient to require Vulkan).
+//
+// P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A: a scope carrying non-empty overlays
+// ALSO REQUIRES Vulkan -- overlay compositing is a Vulkan-only production route
+// with no GLES fallback. When Vulkan cannot be selected for such a scope,
+// [select] resolves to [ExportRenderBackend.UNAVAILABLE] with an
+// `overlays_require_vulkan:<underlying reason>` reason (the
+// `transitions_require_vulkan` and `beauty_v2_requires_vulkan` prefixes take
+// priority in that order when also present).
 enum class ExportRenderBackend {
     VULKAN,
     GLES,
@@ -77,6 +85,9 @@ data class ExportRenderScope(
     /// Validated non-hard-cut transitions (AndroidTimelineTransitionDescriptor.parseList).
     /// Non-empty means the scope requires the Vulkan backend; see the class doc.
     val transitions: List<AndroidTimelineTransitionDescriptor> = emptyList(),
+    /// Validated timeline overlays (AndroidTimelineOverlayDescriptor).
+    /// Non-empty means the scope requires the Vulkan backend; see the class doc.
+    val overlays: List<AndroidTimelineOverlayDescriptor> = emptyList(),
 ) {
     val hasNonHardCutTransition: Boolean get() = transitions.any { !it.isHardCut }
 
@@ -85,7 +96,12 @@ data class ExportRenderScope(
     /// GLES fallback, so this alone also forces [requiresVulkan].
     val hasBeautyClip: Boolean get() = clips.any { it.beautyIntensity != null }
 
-    val requiresVulkan: Boolean get() = hasNonHardCutTransition || hasBeautyClip
+    /// P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A: true when the scope carries any
+    /// overlays. Overlay compositing is Vulkan-only with no GLES fallback,
+    /// so this also forces [requiresVulkan].
+    val hasOverlays: Boolean get() = overlays.isNotEmpty()
+
+    val requiresVulkan: Boolean get() = hasNonHardCutTransition || hasBeautyClip || hasOverlays
 }
 
 class AndroidExportRenderBackendSelector {
@@ -239,15 +255,17 @@ class AndroidExportRenderBackendSelector {
     /// routed to Vulkan. Transition prefix priority is preserved: a scope
     /// carrying a non-hard-cut transition always reports
     /// [TRANSITIONS_REQUIRE_VULKAN_REASON], even when it also carries a
-    /// beauty clip -- that failure mode is pre-existing/tested and
-    /// independently sufficient to require Vulkan (see class doc). Only a
+    /// beauty clip or overlays -- that failure mode is pre-existing/tested and
+    /// independently sufficient to require Vulkan (see class doc). A
     /// scope with a beauty clip and no non-hard-cut transition reports
-    /// [BEAUTY_REQUIRE_VULKAN_REASON].
+    /// [BEAUTY_REQUIRE_VULKAN_REASON]. If only overlays require Vulkan, returns
+    /// [OVERLAYS_REQUIRE_VULKAN_REASON].
     private fun requiresVulkanReasonPrefix(scope: ExportRenderScope?): String =
-        if (scope?.hasNonHardCutTransition == true) {
-            TRANSITIONS_REQUIRE_VULKAN_REASON
-        } else {
-            BEAUTY_REQUIRE_VULKAN_REASON
+        when {
+            scope?.hasNonHardCutTransition == true -> TRANSITIONS_REQUIRE_VULKAN_REASON
+            scope?.hasBeautyClip == true -> BEAUTY_REQUIRE_VULKAN_REASON
+            scope?.hasOverlays == true -> OVERLAYS_REQUIRE_VULKAN_REASON
+            else -> OVERLAYS_REQUIRE_VULKAN_REASON
         }
 
     companion object {
@@ -261,5 +279,10 @@ class AndroidExportRenderBackendSelector {
         /// (and no non-hard-cut transition) cannot be routed to Vulkan (the
         /// underlying capability/scope reason follows after ':').
         const val BEAUTY_REQUIRE_VULKAN_REASON = "beauty_v2_requires_vulkan"
+
+        /// Reason prefix when a scope carrying overlays (and no non-hard-cut
+        /// transition or beauty clip) cannot be routed to Vulkan (the
+        /// underlying capability/scope reason follows after ':').
+        const val OVERLAYS_REQUIRE_VULKAN_REASON = "overlays_require_vulkan"
     }
 }

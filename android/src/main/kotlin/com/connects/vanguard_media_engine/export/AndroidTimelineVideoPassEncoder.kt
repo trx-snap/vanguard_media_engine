@@ -13,6 +13,12 @@ package com.connects.vanguard_media_engine.export
 // owned overlap rendering (the GLES encoder) must never re-encode a
 // transition timeline as hard cuts. Only AndroidTimelineVulkanVideoEncoder
 // overrides it with the positive route.
+//
+// P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A: the overlay-aware [encode] overload
+// extends the backend-pass seam for timeline overlays. Its default body fails
+// closed for any non-empty overlay list -- backends that do not implement
+// native overlay compositing (e.g. GLES) fail closed with
+// [OVERLAYS_UNSUPPORTED_BY_BACKEND_REASON].
 interface AndroidTimelineVideoPassEncoder {
     /** Signals the encode loop to stop feeding new frames. Thread-safe. */
     fun cancel()
@@ -46,8 +52,36 @@ interface AndroidTimelineVideoPassEncoder {
         return encode(clips, onProgress)
     }
 
+    /**
+     * Encodes [clips] with validated [transitions] and [overlays]
+     * (see AndroidTimelineOverlayDescriptor.parseList).
+     * Backends without an overlay route inherit this fail-closed default:
+     * non-empty overlays return [OVERLAYS_UNSUPPORTED_BY_BACKEND_REASON]
+     * without producing output, and an empty list delegates to the
+     * transition-aware [encode].
+     */
+    fun encode(
+        clips: List<AndroidTimelineVideoEncoder.ClipInput>,
+        transitions: List<AndroidTimelineTransitionDescriptor>,
+        overlays: List<AndroidTimelineOverlayDescriptor>,
+        onProgress: ((Double) -> Unit)? = null,
+    ): AndroidTimelineVideoEncoder.EncodeResult {
+        if (overlays.isNotEmpty()) {
+            return AndroidTimelineVideoEncoder.EncodeResult(
+                false,
+                OVERLAYS_UNSUPPORTED_BY_BACKEND_REASON,
+                0,
+                0L,
+            )
+        }
+        return encode(clips, transitions, onProgress)
+    }
+
     companion object {
         /** Machine-readable reason for a backend that cannot render overlap transitions. */
         const val TRANSITIONS_UNSUPPORTED_BY_BACKEND_REASON = "transitions_unsupported_by_backend"
+
+        /** Machine-readable reason for a backend that cannot render timeline overlays. */
+        const val OVERLAYS_UNSUPPORTED_BY_BACKEND_REASON = "overlays_unsupported_by_backend"
     }
 }
