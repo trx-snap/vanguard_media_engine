@@ -14,6 +14,16 @@ data class VanguardRealtimeAudioPlaybackSinkTelemetry(
     val audioTrackInitOk: Boolean,
     val gainSetOk: Boolean,
     val gainValue: Float,
+    // ── Y11a-prep volume request queue (any thread request / sink thread apply) ──
+    val gainRequestCount: Long,
+    val gainAppliedCount: Long,
+    val gainRejectedCount: Long,
+    val gainQueueFullCount: Long,
+    val lastGainRequestSeq: Long,
+    val lastGainAppliedSeq: Long,
+    val gainAppliedOnSinkThread: Boolean,
+    // Current sink-thread-applied linear gain; gainValue mirrored under its new name.
+    val effectiveGain: Float,
     val audioTrackBufferBytes: Int,
     val audioTracksCreated: Int,
     val releaseCount: Int,

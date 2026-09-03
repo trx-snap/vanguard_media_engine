@@ -135,12 +135,18 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         private const val DRAIN_ITERATION_SLACK = 4L
         private const val GATE_POLL_MS = 5L
         private const val PARK_POLL_MS = 5L
+        // Y11a-prep: any-thread volume request queue (requestGain / awaitGainApplied).
+        private const val GAIN_AWAIT_POLL_MS = 5L
+        private const val GAIN_REQUEST_QUEUE_CAPACITY = 8
         private const val FRAME_WRAP_MODULUS = VanguardRealtimePlaybackPresentationClock.FRAME_WRAP_MODULUS
 
         fun hex16(value: Long): String = String.format("%016x", value)
     }
 
     private class FailClosed(val reason: String) : Exception(reason)
+
+    // Y11a-prep: one queued any-thread volume target, applied on the sink thread in FIFO order.
+    private data class GainRequest(val seq: Long, val gain: Float)
 
     // ── Cross-thread control ───────────────────────────────────────────────
 
@@ -168,6 +174,11 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     @Volatile private var unparkAckLatch = CountDownLatch(1)
     @Volatile private var thread: Thread? = null
 
+    // Y11a-prep: bounded any-thread volume request queue; request-side state guarded by this lock, drained only on the sink thread.
+    private val gainRequestLock = ReentrantLock()
+    private var gainRequestSeqCounter = 0L
+    private val pendingGainRequests = ArrayDeque<GainRequest>()
+
     // The owned clock's writer (Y10a extraction). Written by the sink thread
     // only; any thread snapshots.
     private val clockWriter = VanguardRealtimeAudioPlaybackSinkClockWriter(config.sampleRate)
@@ -181,6 +192,15 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     @Volatile private var audioTrackInitOk = false
     @Volatile private var gainSetOk = false
     @Volatile private var gainValue = 0f
+    // Y11a-prep: volume request queue telemetry (sink thread writes the applied-side counters;
+    // requestGain writes the request-side counters under [gainRequestLock]).
+    @Volatile private var gainRequestCount = 0L
+    @Volatile private var gainAppliedCount = 0L
+    @Volatile private var gainRejectedCount = 0L
+    @Volatile private var gainQueueFullCount = 0L
+    @Volatile private var lastGainRequestSeq = 0L
+    @Volatile private var lastGainAppliedSeq = 0L
+    @Volatile private var gainAppliedOnSinkThread = false
     @Volatile private var audioTrackBufferBytes = 0
     @Volatile private var audioTracksCreated = 0
     @Volatile private var releaseExecutedOnSinkThread = false
@@ -370,6 +390,48 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         unparkAckLatch.await(timeoutMs, TimeUnit.MILLISECONDS) &&
             phaseRef.get() == Phase.RUNNING && unparkCount > 0
 
+    // Y11a-prep: any-thread request for a target linear gain in [0, config.gain]; queued and
+    // applied only on the sink thread (top of each drain-loop iteration and inside a parked
+    // wait), never by an AudioTrack call off that thread. Returns a positive sequence number to
+    // pass to [awaitGainApplied], or -1 when the gain is non-finite/out of range, the queue is
+    // full, or the sink already exited; a rejection is never thrown back to the caller, only
+    // counted in telemetry.
+    fun requestGain(gain: Float): Long {
+        gainRequestLock.withLock {
+            if (!gain.isFinite() || gain < 0f || gain > config.gain) {
+                gainRejectedCount++
+                return -1L
+            }
+            if (phaseRef.get() == Phase.EXITED) {
+                gainRejectedCount++
+                return -1L
+            }
+            if (pendingGainRequests.size >= GAIN_REQUEST_QUEUE_CAPACITY) {
+                gainQueueFullCount++
+                gainRejectedCount++
+                return -1L
+            }
+            val seq = ++gainRequestSeqCounter
+            pendingGainRequests.addLast(GainRequest(seq, gain))
+            gainRequestCount++
+            lastGainRequestSeq = seq
+            return seq
+        }
+    }
+
+    // Y11a-prep: bounded, any-thread wait for [requestGain]'s seq to be applied on the sink
+    // thread. False on timeout, or if the sink exits before reaching it (never throws).
+    fun awaitGainApplied(seq: Long, timeoutMs: Long): Boolean {
+        if (seq <= 0L) return false
+        val deadlineAtMs = SystemClock.elapsedRealtime() + timeoutMs
+        while (lastGainAppliedSeq < seq) {
+            if (phaseRef.get() == Phase.EXITED) return lastGainAppliedSeq >= seq
+            if (SystemClock.elapsedRealtime() >= deadlineAtMs) return false
+            SystemClock.sleep(GAIN_AWAIT_POLL_MS)
+        }
+        return true
+    }
+
     // Observed by every bounded wait (gate, park, write retries, stalls).
     fun cancel() {
         cancelled.set(true)
@@ -400,6 +462,14 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         audioTrackInitOk = audioTrackInitOk,
         gainSetOk = gainSetOk,
         gainValue = gainValue,
+        gainRequestCount = gainRequestCount,
+        gainAppliedCount = gainAppliedCount,
+        gainRejectedCount = gainRejectedCount,
+        gainQueueFullCount = gainQueueFullCount,
+        lastGainRequestSeq = lastGainRequestSeq,
+        lastGainAppliedSeq = lastGainAppliedSeq,
+        gainAppliedOnSinkThread = gainAppliedOnSinkThread,
+        effectiveGain = gainValue,
         audioTrackBufferBytes = audioTrackBufferBytes,
         audioTracksCreated = audioTracksCreated,
         releaseCount = releaseCounter.get(),
@@ -807,10 +877,12 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             )
         }
 
-        // Step 4: reapply the configured gain.
-        if (newTrack.setVolume(config.gain) != AudioTrack.SUCCESS) throw FailClosed("recreated_audio_track_set_volume_failed")
+        // Step 4 (Y11a-prep): reapply the CURRENT EFFECTIVE gain, not config.gain — recovering
+        // while ducked/silenced by a queued [requestGain] must not restore full volume.
+        val recoveryGain = gainValue
+        if (newTrack.setVolume(recoveryGain) != AudioTrack.SUCCESS) throw FailClosed("recreated_audio_track_set_volume_failed")
         clockWriter.deadObjectNewTrackVolumeOk = true
-        gainValue = config.gain
+        gainValue = recoveryGain
 
         // Step 5: play; MODE_STREAM consumes once the remainder lands.
         newTrack.play()
@@ -918,6 +990,28 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         flushAckLatch.countDown()
     }
 
+    // ── Volume request queue application (Y11a-prep, sink thread only) ─────
+
+    // Drains every queued [requestGain] in FIFO order, applying each with AudioTrack.setVolume
+    // on this thread only: top of every drain-loop iteration and inside the parked wait, so a
+    // future focus monitor can duck/restore without this bridge ever touching AudioTrack
+    // off-thread. A setVolume failure fails the sink closed with a typed reason; it is never
+    // thrown back to a requesting caller thread.
+    private fun applyPendingGainRequests(track: AudioTrack) {
+        while (true) {
+            val request = gainRequestLock.withLock {
+                if (pendingGainRequests.isEmpty()) null else pendingGainRequests.removeFirst()
+            } ?: return
+            if (track.setVolume(request.gain) != AudioTrack.SUCCESS) {
+                throw FailClosed("audio_track_set_volume_request_failed:${request.seq}")
+            }
+            gainValue = request.gain
+            gainAppliedOnSinkThread = Thread.currentThread().id == threadId
+            gainAppliedCount++
+            lastGainAppliedSeq = request.seq
+        }
+    }
+
     // ── Park / unpark (sink thread only) ───────────────────────────────────
 
     // Bounded pause park: AudioTrack.pause, ack, wait (maxPauseHoldMs) for
@@ -960,6 +1054,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         val holdExceededReason = if (seekPark) EXIT_SEEK_HOLD_EXCEEDED else EXIT_PAUSE_HOLD_EXCEEDED
         parkLock.withLock {
             while (true) {
+                // Y11a-prep: queued volume targets apply even while parked.
+                applyPendingGainRequests(track)
                 // A requested flush always executes before an unpark is honoured.
                 if (flushRequested && flushCount == seekParkCount - 1) flushOnSinkThread(track)
                 if (unparkRequested) break
@@ -1029,6 +1125,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         lastProgressMs = SystemClock.elapsedRealtime()
         while (true) {
             checkDeadlineAndCancel()
+            // Y11a-prep: apply any queued volume targets before this pass drains/writes.
+            applyPendingGainRequests(requireTrack())
             if (phaseRef.get() == Phase.PARK_REQUESTED) parkOnSinkThread()
             clockWriter.resetPassCounter()
             if (drainFrames != config.maxFramesPerMix) drainRequestSizeChanges++
