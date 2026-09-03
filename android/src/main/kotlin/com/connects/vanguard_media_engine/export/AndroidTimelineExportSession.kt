@@ -160,9 +160,24 @@ class AndroidTimelineExportSession(private val context: Context) {
         // are known.
         val rawTransitions = draftMap["transitions"] as? List<*> ?: emptyList<Any?>()
 
-        val overlays = draftMap["overlays"] as? List<*> ?: emptyList<Any?>()
+        // P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A: overlay preflight parser and
+        // admission gate. Static sticker overlays are validated; non-empty
+        // parsed overlays fail closed here until Route-A native rendering lands.
+        val rawOverlays = draftMap["overlays"] as? List<*> ?: emptyList<Any?>()
+        val overlays: List<AndroidTimelineOverlayDescriptor> =
+            when (val parse = AndroidTimelineOverlayDescriptor.parseList(rawOverlays)) {
+                is AndroidTimelineOverlayDescriptor.ParseResult.Failure -> {
+                    onError(parse.code, parse.message)
+                    return
+                }
+                is AndroidTimelineOverlayDescriptor.ParseResult.Success -> parse.overlays
+            }
         if (overlays.isNotEmpty()) {
-            onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: overlays are not supported")
+            onError(
+                "UNSUPPORTED_EXPORT_FEATURE",
+                "exportTimeline: overlays_require_vulkan:native_overlay_route_not_implemented " +
+                    "(static sticker overlay Route-A native renderer is not implemented yet)",
+            )
             return
         }
 
