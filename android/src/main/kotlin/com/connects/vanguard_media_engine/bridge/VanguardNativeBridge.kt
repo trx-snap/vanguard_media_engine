@@ -1930,6 +1930,25 @@ class VanguardNativeBridge(
     // production VulkanBackend mutation, no product UI.
     external fun runAndroidDagPhase5TimelineTransitionVulkanRenderSmoke(): String
 
+    // ── P5-OVERLAYS-TRANS (VULKAN-RENDER): VulkanOverlayCompositor multi-layer ──
+    // overlay shader/raster proof diagnostic. Native creates its own temporary
+    // VkInstance/VkDevice/VkQueue/VkCommandPool, synthetic RGBA8 solid/quadrant/
+    // half-alpha sampled images with clamp-to-border transparent-black
+    // samplers, a 64x64 offscreen color attachment and a host-visible readback
+    // buffer on the calling thread, hand-builds already-resolved
+    // VulkanOverlayLayerDescriptor lists (mirroring Dart
+    // VGOverlayEvaluatedTransform raster fields), renders each lane through the
+    // private Vulkan overlay helper (existing AOT passthrough SPIR-V,
+    // inverse-UV push-constant placement, per-layer opacity in colour-matrix
+    // row 3, fixed-function straight-alpha source-over blending, clear or
+    // load-existing render pass), reads the pixels back, proves temporary
+    // object created == released, and destroys everything before returning a
+    // JSON object string. Reports status "UNSUPPORTED" (never crashes) when no
+    // usable Vulkan device exists. No MediaCodec/decode, no AHardwareBuffer
+    // import, no keyframe math, no export session, no production VulkanBackend
+    // mutation, no product UI.
+    external fun runAndroidDagPhase5TimelineOverlayVulkanRenderSmoke(): String
+
     // ── P5-COMPOSITOR-TRANS (DUAL-DECODER-SYNC): dual MediaCodec -> AHB -> Vulkan ──
     // crossfade proof. Kotlin (AndroidTimelineDualDecoderSyncDriver) owns both
     // decoder pipelines and calls this once per overlap frame with one

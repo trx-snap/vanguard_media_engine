@@ -63,6 +63,10 @@ add_library(vanguard_render_vulkan STATIC
     # P3-MULTICAM-NODE (SPATIAL-VULKAN-RENDER): private two-texture spatial
     # layout helper (opaque primary rect + opaque secondary rect, readback).
     "render/vulkan/src/vulkan_multicam_spatial_compositor.cpp"
+    # P5-OVERLAYS-TRANS (VULKAN-RENDER): private multi-layer overlay helper
+    # (inverse-UV push-constant placement, per-layer opacity in colour-matrix
+    # row 3, fixed-function straight-alpha source-over blend, readback).
+    "render/vulkan/src/vulkan_overlay_compositor.cpp"
 )
 target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include"
     # Phase 2K: private Vulkan src dir exposed so vulkan_surface_swapchain.cpp
@@ -164,6 +168,7 @@ if (ANDROID)
     "platform/android/src/android_phase5_timeline_transition_gles_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_overlay_gles_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_transition_vulkan_render_jni.cpp"
+    "platform/android/src/android_phase5_timeline_overlay_vulkan_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_dual_decoder_sync_jni.cpp"
     "platform/android/src/android_phase5_timeline_dual_decoder_sync_vulkan_support.cpp"
   )

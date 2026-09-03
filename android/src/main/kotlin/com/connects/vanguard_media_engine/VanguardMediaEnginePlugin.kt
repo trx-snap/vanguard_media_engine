@@ -74,6 +74,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineTransitionG
 import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineOverlayGlesRenderSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineDualDecoderSyncSmokeCoordinator
 import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineTransitionVulkanRenderSmokeCoordinator
+import com.connects.vanguard_media_engine.diagnostics.AndroidTimelineOverlayVulkanRenderSmokeCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidEditorPlaybackCoordinator
 import com.connects.vanguard_media_engine.editor.AndroidTimelineLiveControlCoordinator
 import com.connects.vanguard_media_engine.export.AndroidEditorExportCoordinator
@@ -402,6 +403,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
     private var timelineTransitionVulkanRenderSmokeCoordinator:
         AndroidTimelineTransitionVulkanRenderSmokeCoordinator? = null
 
+    // ── P5-OVERLAYS-TRANS (VULKAN-RENDER): VulkanOverlayCompositor multi-layer ──
+    // overlay shader/raster proof smoke coordinator.
+    private var timelineOverlayVulkanRenderSmokeCoordinator:
+        AndroidTimelineOverlayVulkanRenderSmokeCoordinator? = null
+
     // ── P5-COMPOSITOR-TRANS (DUAL-DECODER-SYNC): dual MediaCodec synchronized ──
     // ingest -> AHardwareBuffer -> Vulkan crossfade proof smoke coordinator.
     private var timelineDualDecoderSyncSmokeCoordinator:
@@ -700,6 +706,9 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
             mainHandler = mainHandler,
         )
         timelineTransitionVulkanRenderSmokeCoordinator = AndroidTimelineTransitionVulkanRenderSmokeCoordinator(
+            mainHandler = mainHandler,
+        )
+        timelineOverlayVulkanRenderSmokeCoordinator = AndroidTimelineOverlayVulkanRenderSmokeCoordinator(
             mainHandler = mainHandler,
         )
         timelineDualDecoderSyncSmokeCoordinator = AndroidTimelineDualDecoderSyncSmokeCoordinator(
@@ -1409,6 +1418,20 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
                 result.error(
                     "UNAVAILABLE",
                     "Android timeline transition Vulkan render smoke coordinator unavailable",
+                    null,
+                )
+            }
+            return
+        }
+
+        if (AndroidTimelineOverlayVulkanRenderSmokeCoordinator.ownsMethod(call.method)) {
+            val coord = timelineOverlayVulkanRenderSmokeCoordinator
+            if (coord != null) {
+                coord.handleMethodCall(call.method, args, result)
+            } else {
+                result.error(
+                    "UNAVAILABLE",
+                    "Android timeline overlay Vulkan render smoke coordinator unavailable",
                     null,
                 )
             }
@@ -2947,6 +2970,11 @@ class VanguardMediaEnginePlugin : FlutterPlugin, MethodCallHandler, ActivityAwar
         // them in the native call before returning.
         timelineTransitionVulkanRenderSmokeCoordinator?.disposeAll()
         timelineTransitionVulkanRenderSmokeCoordinator = null
+        // P5-OVERLAYS-TRANS (VULKAN-RENDER): release the smoke executor. An
+        // in-flight run owns its VkDevice/images on its own thread and destroys
+        // them in the native call before returning.
+        timelineOverlayVulkanRenderSmokeCoordinator?.disposeAll()
+        timelineOverlayVulkanRenderSmokeCoordinator = null
         // P5-COMPOSITOR-TRANS (DUAL-DECODER-SYNC): release the smoke executor.
         // An in-flight run owns both MediaCodec/ImageReader pipelines and its
         // native VkDevice on its own thread and releases them in the driver's
