@@ -14,6 +14,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 // ── VanguardRealtimePlaybackDecoderFeed (P4-AUDIO-REALTIME-PLAYBACK-PIPELINE-INTEGRATION-A, Y6a) ─
 //
@@ -55,6 +56,32 @@ import java.util.concurrent.atomic.AtomicLong
 // state machines and drains. The Kotlin decoder checksum accumulates over
 // exactly the interleaved samples native reported as accepted
 // (checksum = checksum * 31 + uint16(sample)).
+//
+// Y9 (P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK), default OFF: one optional
+// coordinator-driven forward mid-stream seek, additive to the above (a feed
+// without [setPreSeekHoldFrame] is byte-identical to Y6a).
+// - Pre-seek hold: a window-aligned hold frame H is pinned before transport
+//   start ([setPreSeekHoldFrame]); the feed ingests exactly up to H, then
+//   idles (heldAtHoldFrame) until the re-anchor. The held interval refreshes
+//   the progress clock and resets the no-progress counter (no mid-seek stall, C3).
+// - Re-anchor ([requestSeekReanchor], after transport.seek(T) was accepted
+//   while PAUSED) runs on the decode thread while held: pinned generation ->
+//   post-seek generation, anchor -> T, then the Y5b seek discipline
+//   (extractor SEEK_TO_PREVIOUS_SYNC, codec flush, EOS flags reset,
+//   decoded-timeline origin = first post-seek PTS, ONE extractor/codec
+//   reopen when the seat lands at -1). Pre-target PCM is discarded; a
+//   decoded-start gap <= MAX_SEEK_GAP_SEC is silence-padded through the same
+//   ingest path, a larger gap fails closed.
+// - Stale probe: right after the re-anchor one postIngest pinned to the
+//   PRE-seek generation must be rejected before JNI (stale_generation, reply
+//   == null) or the feed fails closed.
+// - Post-seek pre-roll: [awaitPostSeekPreRoll] releases once >= maxFramesPerMix
+//   post-seek frames were accepted (or the declared end was reached) while
+//   the transport is still PAUSED; that PAUSED wait is never a stall (C3).
+// The checksum covers exactly the accepted samples, pre-seek then post-seek,
+// so it matches the native and sink checksums across the seek; whole-run
+// frame accounting is H + (declared - T). Seek value types live in
+// VanguardRealtimePlaybackDecoderSeekTypes.kt.
 class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
 
     data class Config(
@@ -91,9 +118,11 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
         const val EXIT_NOT_STARTED = "not_started"
 
         const val HARD_MAX_DURATION_SEC = 20.0
+        // Y9: max post-seek decoded-start gap that is silence-padded, not failed (Y5b).
+        const val MAX_SEEK_GAP_SEC = 0.25
+        const val MAX_EOS_DRIFT_SEC = 1.0
         private const val MAX_INGEST_FRAMES = VanguardRealtimePlaybackNativeSession.MAX_INGEST_FRAMES
         private const val DEQUEUE_TIMEOUT_US = 10_000L
-        private const val MAX_EOS_DRIFT_SEC = 1.0
         private const val END_INPUT_MARGIN_US = 250_000L
         private const val POLL_SLEEP_MS = 2L
         private const val ATTACH_POLL_MS = 5L
@@ -120,6 +149,10 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
     private val attachLatch = CountDownLatch(1)
     private val preRollLatch = CountDownLatch(1)
     private val exitLatch = CountDownLatch(1)
+    // Y9 seek control (unused unless a hold frame is pinned).
+    private val reanchorLatch = CountDownLatch(1)
+    private val postSeekPreRollLatch = CountDownLatch(1)
+    private val seekRequest = AtomicReference<VanguardRealtimePlaybackDecoderSeekRequest?>(null)
 
     @Volatile
     private var thread: Thread? = null
@@ -132,6 +165,10 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
 
     @Volatile
     private var transportStarted = false
+
+    // Y9: exclusive upper bound of pre-seek ingest; Long.MAX_VALUE = no hold.
+    @Volatile
+    private var holdLimitFrame = Long.MAX_VALUE
 
     // ── Published telemetry (volatile: written by the decode thread) ───────
 
@@ -175,6 +212,7 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
     var truncatedFrames: Long = 0L
         private set
 
+    // Pre-seek (stream-start origin) drops, Y6a semantics.
     @Volatile
     var discardedFrames: Long = 0L
         private set
@@ -219,6 +257,75 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
     var lastIngestStatus: String = ""
         private set
 
+    // ── Y9 seek telemetry (decode thread writes; defaults = no seek) ───────
+
+    // Mirror of the decode-thread anchor for any-thread readers.
+    @Volatile var anchorFrame: Long = 0L
+        private set
+    @Volatile var heldAtHoldFrame: Boolean = false
+        private set
+    @Volatile var holdFrame: Long = -1L
+        private set
+    @Volatile var seekReanchorCount: Int = 0
+        private set
+    @Volatile var reanchorOk: Boolean = false
+        private set
+    @Volatile var reanchorExecutedOnDecodeThread: Boolean = false
+        private set
+    @Volatile var reanchorTransportStatePaused: Boolean = false
+        private set
+    @Volatile var preSeekAcceptedFrames: Long = -1L
+        private set
+    @Volatile var stagedFramesClearedAtSeek: Long = -1L
+        private set
+    @Volatile var codecChunksAtSeek: Long = -1L
+        private set
+    @Volatile var seekTargetFrame: Long = -1L
+        private set
+    @Volatile var seekTargetUs: Long = -1L
+        private set
+    @Volatile var seekLandedUs: Long = -1L
+        private set
+    @Volatile var seekReanchorWallMs: Long = -1L
+        private set
+    @Volatile var mediaReopens: Int = 0
+        private set
+    @Volatile var staleProbeCalls: Int = 0
+        private set
+    @Volatile var staleProbeReason: String = ""
+        private set
+    @Volatile var staleProbeReplyNull: Boolean = false
+        private set
+    @Volatile var staleProbeRejected: Boolean = false
+        private set
+    @Volatile var staleProbeAnchorUntouched: Boolean = false
+        private set
+    // Post-seek (PTS origin) accounting, Y5b semantics.
+    @Volatile var firstPostSeekPtsUs: Long = -1L
+        private set
+    @Volatile var firstPostSeekFrame: Long = -1L
+        private set
+    @Volatile var postSeekAcceptedFrames: Long = 0L
+        private set
+    @Volatile var postSeekPreRollFrames: Long = 0L
+        private set
+    @Volatile var postSeekPreRollStatePaused: Boolean = false
+        private set
+    @Volatile var postSeekPaddedFrames: Long = 0L
+        private set
+    @Volatile var gapObservedFrames: Long = 0L
+        private set
+    @Volatile var gapPaddedFrames: Long = 0L
+        private set
+    @Volatile var discardedPreTargetFrames: Long = 0L
+        private set
+
+    val maxSeekGapFrames: Long get() = (MAX_SEEK_GAP_SEC * (format?.sampleRate ?: 0)).toLong()
+
+    // Real (non-padded) post-seek decoded frames accepted by native.
+    val postSeekDecodedAcceptedFrames: Long
+        get() = postSeekAcceptedFrames - gapPaddedFrames - postSeekPaddedFrames
+
     val mediaReleaseCount = AtomicLong(0L)
     val ingestCallbacksOnOwner = AtomicLong(0L)
     val ingestCallbacksOffOwner = AtomicLong(0L)
@@ -250,6 +357,13 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
     private var consecutiveNoProgress = 0
     private var lastProgressMs = 0L
     private var preRollSignalled = false
+    // Y9 decode-thread seek state.
+    private var originIsStreamStart = true
+    private var reanchored = false
+    private var postSeekPreRollSignalled = false
+    private var verifyOutputFormatOnNextChunk = false
+    private var intermediateReleasesClean = true
+    private var trackFormat: MediaFormat? = null
 
     // ── Public API ─────────────────────────────────────────────────────────
 
@@ -291,10 +405,37 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
         transportStarted = true
     }
 
-    // Blocks until the pre-roll condition (ring_full observed or declared
-    // end reached) is signalled or the decode thread exited.
+    // Blocks until the pre-roll condition (ring_full observed, hold frame
+    // reached or declared end reached) is signalled or the decode thread exited.
     fun awaitPreRoll(timeoutMs: Long): Boolean =
         preRollLatch.await(timeoutMs, TimeUnit.MILLISECONDS) && preRollFrames > 0L
+
+    // Y9 coordinator-only, before transport start: ingest exactly up to `frame`
+    // (window-aligned, > 0) then idle until the re-anchor. False when misaligned,
+    // not positive, transport already started or a seek already happened.
+    fun setPreSeekHoldFrame(frame: Long): Boolean {
+        if (frame <= 0L || frame % config.maxFramesPerMix != 0L) return false
+        if (transportStarted || seekRequest.get() != null || seekReanchorCount > 0) return false
+        holdFrame = frame
+        holdLimitFrame = frame
+        return true
+    }
+
+    // Y9 coordinator-only, after transport.seek(T) was accepted while PAUSED.
+    // Single use, executed by the decode thread while held at H; false when a
+    // request already exists or no hold frame was pinned.
+    fun requestSeekReanchor(request: VanguardRealtimePlaybackDecoderSeekRequest): Boolean {
+        if (holdFrame <= 0L) return false
+        return seekRequest.compareAndSet(null, request)
+    }
+
+    // Y9: blocks until the re-anchor finished (or the thread exited); true only when clean.
+    fun awaitReanchor(timeoutMs: Long): Boolean =
+        reanchorLatch.await(timeoutMs, TimeUnit.MILLISECONDS) && reanchorOk
+
+    // Y9: blocks until >= maxFramesPerMix post-seek frames were accepted, the declared end was reached or the thread exited.
+    fun awaitPostSeekPreRoll(timeoutMs: Long): Boolean =
+        postSeekPreRollLatch.await(timeoutMs, TimeUnit.MILLISECONDS) && postSeekPreRollFrames > 0L
 
     // Any thread. The decode thread observes the flag at its next bounded
     // wait and tears down on its own thread.
@@ -316,6 +457,47 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
 
     // True once the decode thread finished (any exit reason).
     fun awaitExit(timeoutMs: Long): Boolean = exitLatch.await(timeoutMs, TimeUnit.MILLISECONDS)
+
+    fun seekTelemetry(): VanguardRealtimePlaybackDecoderSeekTelemetry = VanguardRealtimePlaybackDecoderSeekTelemetry(
+        holdFrame = holdFrame,
+        heldAtHoldFrame = heldAtHoldFrame,
+        anchorFrame = anchorFrame,
+        seekReanchorCount = seekReanchorCount,
+        reanchorOk = reanchorOk,
+        reanchorExecutedOnDecodeThread = reanchorExecutedOnDecodeThread,
+        reanchorTransportStatePaused = reanchorTransportStatePaused,
+        preSeekAcceptedFrames = preSeekAcceptedFrames,
+        stagedFramesClearedAtSeek = stagedFramesClearedAtSeek,
+        codecChunksAtSeek = codecChunksAtSeek,
+        codecChunks = codecChunks,
+        seekTargetFrame = seekTargetFrame,
+        seekTargetUs = seekTargetUs,
+        seekLandedUs = seekLandedUs,
+        seekReanchorWallMs = seekReanchorWallMs,
+        mediaReopens = mediaReopens,
+        staleProbeCalls = staleProbeCalls,
+        staleProbeReason = staleProbeReason,
+        staleProbeReplyNull = staleProbeReplyNull,
+        staleProbeRejected = staleProbeRejected,
+        staleProbeAnchorUntouched = staleProbeAnchorUntouched,
+        firstPostSeekPtsUs = firstPostSeekPtsUs,
+        firstPostSeekFrame = firstPostSeekFrame,
+        postSeekAcceptedFrames = postSeekAcceptedFrames,
+        postSeekDecodedAcceptedFrames = postSeekDecodedAcceptedFrames,
+        postSeekPreRollFrames = postSeekPreRollFrames,
+        postSeekPreRollStatePaused = postSeekPreRollStatePaused,
+        postSeekPaddedFrames = postSeekPaddedFrames,
+        gapObservedFrames = gapObservedFrames,
+        gapPaddedFrames = gapPaddedFrames,
+        maxSeekGapFrames = maxSeekGapFrames,
+        discardedPreTargetFrames = discardedPreTargetFrames,
+        discardedFrames = discardedFrames,
+        truncatedFrames = truncatedFrames,
+        acceptedFrames = acceptedFrames,
+        paddedFrames = paddedFrames,
+        staleGenerationRetries = staleGenerationRetries,
+        transientRejects = transientRejects,
+    )
 
     // ── Decode thread body ─────────────────────────────────────────────────
 
@@ -342,6 +524,8 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
             decodeThreadWallMs = SystemClock.elapsedRealtime() - wallStart
             formatLatch.countDown()
             preRollLatch.countDown()
+            reanchorLatch.countDown()
+            postSeekPreRollLatch.countDown()
             exitLatch.countDown()
         }
     }
@@ -397,34 +581,61 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
         extractor = ex
         ex.setDataSource(config.sourcePath)
         var trackIndex = -1
-        var trackFormat: MediaFormat? = null
+        var tf: MediaFormat? = null
         for (i in 0 until ex.trackCount) {
             val f = ex.getTrackFormat(i)
             if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
                 trackIndex = i
-                trackFormat = f
+                tf = f
                 break
             }
         }
-        if (trackIndex < 0 || trackFormat == null) throw FailClosed("no_audio_track")
+        if (trackIndex < 0 || tf == null) throw FailClosed("no_audio_track")
         ex.selectTrack(trackIndex)
-        val mime = trackFormat.getString(MediaFormat.KEY_MIME) ?: throw FailClosed("audio_track_mime_missing")
-        if (!trackFormat.containsKey(MediaFormat.KEY_DURATION)) throw FailClosed("format_duration_missing")
-        val durationUs = trackFormat.getLong(MediaFormat.KEY_DURATION)
+        val mime = tf.getString(MediaFormat.KEY_MIME) ?: throw FailClosed("audio_track_mime_missing")
+        if (!tf.containsKey(MediaFormat.KEY_DURATION)) throw FailClosed("format_duration_missing")
+        val durationUs = tf.getLong(MediaFormat.KEY_DURATION)
         if (durationUs <= 0L) throw FailClosed("format_duration_invalid:$durationUs")
         sourceMime = mime
         sourceTrackIndex = trackIndex
         sourceDurationUs = durationUs
+        trackFormat = tf
         declaredWindowUs = minOf(durationUs, (config.maxDurationSec * 1_000_000.0).toLong())
         inputEndUs = declaredWindowUs + END_INPUT_MARGIN_US
+        startCodec(tf, mime)
+    }
 
+    private fun startCodec(tf: MediaFormat, mime: String) {
         val dec = MediaCodec.createDecoderByType(mime)
         codec = dec
-        dec.configure(trackFormat, null, null, 0)
+        dec.configure(tf, null, null, 0)
         dec.start()
         inputEos = false
         outputEos = false
         decodeCursorFrame = -1L
+    }
+
+    // Y9, decode thread only: release the current extractor/codec pair, open a
+    // fresh one on the same source/track (Y5b reopen-on-EOS landing). The
+    // intermediate release folds into mediaReleaseClean, not mediaReleaseCount.
+    private fun reopenMedia() {
+        checkDeadlineAndCancel()
+        if (mediaReleased.get()) throw FailClosed("media_reopen_after_release")
+        if (mediaReopens > 0) throw FailClosed("media_reopen_repeated")
+        val tf = trackFormat ?: throw FailClosed("media_reopen_format_missing")
+        if (sourceTrackIndex < 0) throw FailClosed("media_reopen_source_missing")
+        if (!releaseMediaObjects()) intermediateReleasesClean = false
+        clearStaged()
+        val ex = MediaExtractor()
+        extractor = ex
+        ex.setDataSource(config.sourcePath)
+        if (sourceTrackIndex >= ex.trackCount) throw FailClosed("media_reopen_track_missing:$sourceTrackIndex")
+        val reopenedMime = ex.getTrackFormat(sourceTrackIndex).getString(MediaFormat.KEY_MIME)
+        if (reopenedMime != sourceMime) throw FailClosed("media_reopen_mime_changed:$reopenedMime")
+        ex.selectTrack(sourceTrackIndex)
+        startCodec(tf, sourceMime)
+        verifyOutputFormatOnNextChunk = true
+        mediaReopens++
     }
 
     // Pulls decoder output until the PCM output format is known; the first
@@ -483,6 +694,11 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
 
     // ── Codec pump (synchronous mode, decode thread only) ──────────────────
 
+    // Y9 floor mapping: a PREVIOUS_SYNC landing at or before the target never
+    // resolves past the target, so alignment discards instead of gapping.
+    private fun framesOfUs(us: Long): Long =
+        if (us <= 0L) 0L else us * sampleRate / 1_000_000L
+
     // Feeds at most one input buffer and pulls at most one output chunk into
     // the staging buffer. The codec output buffer is released before this
     // returns, so no codec-owned memory is ever visible to the transport.
@@ -516,7 +732,11 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
                 val isEos = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
                 try {
                     if (bufferInfo.size > 0) {
-                        if (!formatResolved) resolveOutputFormat(dec.outputFormat)
+                        if (!formatResolved || verifyOutputFormatOnNextChunk) {
+                            // Fresh codec after a Y9 reopen must match the resolved format.
+                            resolveOutputFormat(dec.outputFormat)
+                            verifyOutputFormatOnNextChunk = false
+                        }
                         if (bufferInfo.size % bytesPerFrame != 0) {
                             throw FailClosed("codec_chunk_shape_invalid:${bufferInfo.size}")
                         }
@@ -527,9 +747,18 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
                         outBuf.limit(bufferInfo.offset + bufferInfo.size)
                         dst.clear()
                         dst.put(outBuf)
-                        // Forward playthrough from the stream start: the decoded
-                        // timeline is contiguous from frame 0 by construction.
-                        if (decodeCursorFrame < 0L) decodeCursorFrame = 0L
+                        if (decodeCursorFrame < 0L) {
+                            if (originIsStreamStart) {
+                                // Stream-start origin: contiguous from frame 0.
+                                decodeCursorFrame = 0L
+                            } else {
+                                // Y9: the first post-seek chunk's PTS anchors the
+                                // decoded timeline (recorded, never clock-verified).
+                                firstPostSeekPtsUs = bufferInfo.presentationTimeUs
+                                firstPostSeekFrame = framesOfUs(bufferInfo.presentationTimeUs)
+                                decodeCursorFrame = firstPostSeekFrame
+                            }
+                        }
                         stagedStartFrame = decodeCursorFrame
                         stagedFrames = frames
                         decodeCursorFrame += frames
@@ -587,6 +816,88 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
     private fun clearStaged() {
         stagedFrames = 0
         stagedStartFrame = -1L
+    }
+
+    // ── Y9 decoder seek (Y5b discipline, decode thread only) ───────────────
+
+    // Re-seats the extractor at `targetUs` (PREVIOUS_SYNC); landed sample time or -1.
+    private fun seatExtractor(targetUs: Long): Long {
+        val ex = extractor ?: throw FailClosed("extractor_missing")
+        ex.seekTo(targetUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
+        return ex.sampleTime
+    }
+
+    // Clears staging, re-seats the extractor, flushes the codec, resets the EOS
+    // flags; the first post-seek PTS anchors the timeline. A -1 landing is
+    // retried once on a reopened pair; a second -1 fails closed.
+    private fun reseekDecoder(targetUs: Long): Long {
+        if (codec == null) throw FailClosed("codec_missing")
+        clearStaged()
+        var landedUs = seatExtractor(targetUs)
+        if (landedUs >= 0L) {
+            (codec ?: throw FailClosed("codec_missing")).flush()
+        } else {
+            reopenMedia()
+            landedUs = seatExtractor(targetUs)
+            if (landedUs < 0L) throw FailClosed("seek_landed_eos_after_reopen:$targetUs")
+        }
+        inputEos = false
+        outputEos = false
+        originIsStreamStart = false
+        decodeCursorFrame = -1L
+        firstPostSeekPtsUs = -1L
+        firstPostSeekFrame = -1L
+        return landedUs
+    }
+
+    // Executes the seek request while held at H: anchor and pinned generation
+    // move to the post-seek values, the decoder re-seeks, then one deliberately
+    // stale post is proven rejected before JNI. Never touches JNI itself.
+    private fun performReanchor(req: VanguardRealtimePlaybackDecoderSeekRequest, sm: VanguardRealtimePlaybackTransportStateMachine) {
+        val startMs = SystemClock.elapsedRealtime()
+        reanchorExecutedOnDecodeThread = Thread.currentThread().id == threadId
+        reanchorTransportStatePaused = sm.currentState == State.PAUSED
+        if (!reanchorTransportStatePaused) throw FailClosed("reanchor_transport_not_paused:${sm.currentState.name.lowercase()}")
+        if (anchor != req.preSeekAnchorFrame) throw FailClosed("reanchor_anchor_mismatch:$anchor:${req.preSeekAnchorFrame}")
+        if (req.targetFrame <= anchor || req.targetFrame >= declaredFrameCount) {
+            throw FailClosed("reanchor_target_invalid:${req.targetFrame}:$anchor:$declaredFrameCount")
+        }
+        if (req.newGeneration == req.staleGeneration) throw FailClosed("reanchor_generation_not_advanced")
+
+        preSeekAcceptedFrames = acceptedFrames
+        stagedFramesClearedAtSeek = stagedFrames.toLong()
+        codecChunksAtSeek = codecChunks
+        clearStaged()
+        holdLimitFrame = Long.MAX_VALUE
+        heldAtHoldFrame = false
+        seekTargetFrame = req.targetFrame
+        seekTargetUs = (req.targetFrame * 1_000_000L + sampleRate - 1) / sampleRate
+        seekLandedUs = reseekDecoder(seekTargetUs)
+
+        anchor = req.targetFrame
+        anchorFrame = anchor
+        pinnedGeneration = req.newGeneration
+        lastIngestStatus = ""
+        consecutiveNoProgress = 0
+        lastProgressMs = SystemClock.elapsedRealtime()
+        reanchored = true
+
+        // Stale probe pinned to the PRE-seek generation: the owner thread must
+        // reject it before any native call (reply == null), anchor untouched.
+        val stale = pinnedIngest(sm, silenceBuffer(), config.maxFramesPerMix, req.staleGeneration)
+        staleProbeCalls++
+        staleProbeReason = stale.reason
+        staleProbeReplyNull = stale.reply == null
+        staleProbeRejected = !stale.accepted &&
+            stale.reason == VanguardRealtimePlaybackTransportStateMachine.REASON_STALE_GENERATION &&
+            stale.reply == null
+        staleProbeAnchorUntouched = anchor == req.targetFrame
+        if (!staleProbeRejected) throw FailClosed("stale_probe_not_rejected:${stale.reason}")
+
+        seekReanchorCount++
+        seekReanchorWallMs = SystemClock.elapsedRealtime() - startMs
+        reanchorOk = true
+        reanchorLatch.countDown()
     }
 
     // ── Transport handoff (owner-thread post only) ─────────────────────────
@@ -656,7 +967,9 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
             for (i in 0 until samples) c = c * 31L + (src.getShort(i * 2).toLong() and 0xFFFFL)
             checksum = c
             anchor += n
+            anchorFrame = anchor
             acceptedFrames += n
+            if (reanchored) postSeekAcceptedFrames += n
             lastProgressMs = SystemClock.elapsedRealtime()
             consecutiveNoProgress = 0
         }
@@ -673,84 +986,143 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
         return reply.status
     }
 
-    // Aligns the staged chunk with the anchor. From a stream-start origin
-    // decoded frames are contiguous, so a chunk starting after the anchor
-    // is a timeline gap (fails closed); one starting before it is dropped.
+    // Aligns the staged chunk with the anchor. Stream-start origin: a gap fails
+    // closed, an early start is dropped. Y9 PTS origin: a gap <= MAX_SEEK_GAP_SEC
+    // stays staged for [feedStep] to pad, a larger one fails closed; pre-target
+    // PCM is discarded.
     private fun alignStagedToAnchor() {
         if (stagedFrames <= 0) return
         val start = stagedStartFrame
         if (start < 0L) throw FailClosed("staged_timeline_unknown")
-        if (start > anchor) throw FailClosed("decoded_timeline_gap:$start:$anchor")
+        if (start > anchor) {
+            val gap = start - anchor
+            if (originIsStreamStart) throw FailClosed("decoded_timeline_gap:$start:$anchor")
+            val maxGap = (MAX_SEEK_GAP_SEC * sampleRate).toLong()
+            if (gap > maxGap) throw FailClosed("decoded_timeline_gap_exceeded:$start:$anchor:$maxGap")
+            gapObservedFrames += gap
+            return
+        }
         if (start < anchor) {
             val drop = minOf(anchor - start, stagedFrames.toLong()).toInt()
-            discardedFrames += drop
+            if (originIsStreamStart) discardedFrames += drop else discardedPreTargetFrames += drop
             consumeStaged(drop)
         }
     }
 
-    // One feed attempt toward the declared end: stage decoder output, ingest
-    // at most one bounded slice, or pad silence once the decoder is
-    // exhausted. Returns true when native accepted frames.
-    private fun feedStep(): Boolean {
-        if (anchor >= declaredFrameCount) return false
+    // One feed attempt toward `limitFrame` (declared end, or the pinned Y9 hold
+    // frame): stage decoder output, pad a bounded post-seek decoded-start gap,
+    // ingest at most one slice, or pad EOS silence. True when native accepted.
+    private fun feedStep(limitFrame: Long): Boolean {
+        if (anchor >= limitFrame) return false
         while (stagedFrames == 0 && !outputEos) {
             checkDeadlineAndCancel()
             if (decodeStep() == STEP_STAGED) alignStagedToAnchor() else break
         }
         val before = acceptedFrames
-        val room = declaredFrameCount - anchor
-        if (stagedFrames > 0) {
+        val room = limitFrame - anchor
+        if (stagedFrames > 0 && stagedStartFrame > anchor) {
+            // Y9 bounded decoded-start gap (validated by alignStagedToAnchor):
+            // silence-fill anchor..stagedStartFrame through the same ingest path.
+            val gap = stagedStartFrame - anchor
+            val frames = minOf(gap, MAX_INGEST_FRAMES.toLong(), room).toInt()
+            ingestOnce(silenceBuffer(), frames)
+            gapPaddedFrames += acceptedFrames - before
+        } else if (stagedFrames > 0) {
             val frames = minOf(stagedFrames.toLong(), MAX_INGEST_FRAMES.toLong(), room).toInt()
             val s = staging ?: throw FailClosed("staging_missing")
             ingestOnce(s, frames)
             val accepted = (acceptedFrames - before).toInt()
             if (accepted > 0) consumeStaged(accepted)
         } else if (outputEos) {
+            // EOS padding applies toward the declared end only, never toward H.
+            if (limitFrame < declaredFrameCount) throw FailClosed("decoder_eos_before_hold:$anchor:$limitFrame")
             val shortfall = room
             if (shortfall > (MAX_EOS_DRIFT_SEC * sampleRate).toLong()) {
                 throw FailClosed("eos_drift_exceeded:$shortfall")
             }
             val frames = minOf(shortfall, MAX_INGEST_FRAMES.toLong()).toInt()
             ingestOnce(silenceBuffer(), frames)
-            paddedFrames += acceptedFrames - before
+            val padded = acceptedFrames - before
+            paddedFrames += padded
+            if (reanchored) postSeekPaddedFrames += padded
         }
         return acceptedFrames > before
     }
 
+    private fun currentLimit(): Long = minOf(declaredFrameCount, holdLimitFrame)
+
     private fun signalPreRollIfDue() {
         if (preRollSignalled) return
-        if (preRollRingFullObserved || anchor >= declaredFrameCount) {
+        if (preRollRingFullObserved || anchor >= currentLimit()) {
             preRollSignalled = true
             preRollFrames = anchor
             preRollLatch.countDown()
         }
     }
 
-    // Feeds until the anchor reaches the declared end. Backpressure
-    // (ring_full / partial_write remainder), transient command gates and a
-    // stale generation are retried in place; bounded by the deadline, the
-    // cancel flag, a consecutive no-progress cap and (once the transport is
-    // started) a progress stall timeout.
+    private fun signalPostSeekPreRollIfDue() {
+        if (postSeekPreRollSignalled || !reanchored) return
+        if (postSeekAcceptedFrames >= config.maxFramesPerMix || anchor >= declaredFrameCount) {
+            postSeekPreRollSignalled = true
+            postSeekPreRollFrames = postSeekAcceptedFrames
+            postSeekPreRollStatePaused = transport?.currentState == State.PAUSED
+            postSeekPreRollLatch.countDown()
+        }
+    }
+
+    // Feeds until the anchor reaches the declared end, holding at the pinned
+    // Y9 hold frame until the re-anchor. Backpressure, transient command gates
+    // and a stale generation retry in place, bounded by the deadline, cancel,
+    // a no-progress cap and (transport started) a stall timeout. The held
+    // interval and a PAUSED transport after the re-anchor refresh the progress
+    // clock and reset the no-progress counter (C3); without a seek = Y6a loop.
     private fun feedLoop() {
-        while (anchor < declaredFrameCount) {
+        while (true) {
             checkDeadlineAndCancel()
-            val progressed = feedStep()
-            signalPreRollIfDue()
             val sm = transport ?: throw FailClosed("transport_missing")
             val state = sm.currentState
             if (state == State.FAILED || state == State.DISPOSED) {
                 throw FailClosed("transport_${state.name.lowercase()}")
             }
+            val limit = currentLimit()
+            if (anchor > limit) throw FailClosed("hold_limit_overrun:$anchor:$limit")
+            if (anchor >= declaredFrameCount) break
+            if (anchor == limit) {
+                // Held at H: no ingest until the re-anchor; never a stall.
+                signalPreRollIfDue()
+                val req = seekRequest.get()
+                if (req != null && !reanchored) {
+                    performReanchor(req, sm)
+                    continue
+                }
+                heldAtHoldFrame = true
+                lastProgressMs = SystemClock.elapsedRealtime()
+                consecutiveNoProgress = 0
+                sleepPoll()
+                continue
+            }
+            heldAtHoldFrame = false
+            val progressed = feedStep(limit)
+            signalPreRollIfDue()
+            signalPostSeekPreRollIfDue()
             if (!progressed) {
+                val pausedAfterSeek = reanchored && sm.currentState == State.PAUSED
                 if (stagedFrames > 0 || outputEos) {
-                    consecutiveNoProgress++
+                    if (pausedAfterSeek) {
+                        consecutiveNoProgress = 0
+                    } else {
+                        consecutiveNoProgress++
+                    }
                     if (consecutiveNoProgress > MAX_CONSECUTIVE_NO_PROGRESS) {
                         throw FailClosed("retry_budget_exhausted:$lastIngestStatus")
                     }
-                    if (transportStarted && SystemClock.elapsedRealtime() - lastProgressMs > INGEST_STALL_TIMEOUT_MS) {
-                        throw FailClosed("ingest_stall:$lastIngestStatus:${state.name.lowercase()}")
+                    if (transportStarted && !pausedAfterSeek &&
+                        SystemClock.elapsedRealtime() - lastProgressMs > INGEST_STALL_TIMEOUT_MS
+                    ) {
+                        throw FailClosed("ingest_stall:$lastIngestStatus:${sm.currentState.name.lowercase()}")
                     }
-                    if (!transportStarted) lastProgressMs = SystemClock.elapsedRealtime()
+                    // Pre-roll ring_full and PAUSED-after-seek legitimately wait.
+                    if (!transportStarted || pausedAfterSeek) lastProgressMs = SystemClock.elapsedRealtime()
                     sleepPoll()
                 } else if (transportStarted && SystemClock.elapsedRealtime() - lastProgressMs > INGEST_STALL_TIMEOUT_MS) {
                     throw FailClosed("decoder_output_stall")
@@ -758,12 +1130,14 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
             }
         }
         signalPreRollIfDue()
+        signalPostSeekPreRollIfDue()
     }
 
     // ── Teardown (decode thread; exactly once) ─────────────────────────────
 
-    private fun releaseMedia() {
-        if (!mediaReleased.compareAndSet(false, true)) return
+    // Releases whatever codec/extractor pair currently exists; true when
+    // every release call succeeded.
+    private fun releaseMediaObjects(): Boolean {
         var clean = true
         val dec = codec
         val ex = extractor
@@ -788,8 +1162,14 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
                 clean = false
             }
         }
+        return clean
+    }
+
+    private fun releaseMedia() {
+        if (!mediaReleased.compareAndSet(false, true)) return
+        val clean = releaseMediaObjects()
         clearStaged()
         mediaReleaseCount.incrementAndGet()
-        mediaReleaseClean = clean
+        mediaReleaseClean = clean && intermediateReleasesClean
     }
 }

@@ -110,4 +110,40 @@ data class VanguardRealtimeAudioPlaybackSinkTelemetry(
     val deadObjectTimestampPollsDuringRecovery: Long,
     val clockSnapshotsAtDeadObjectRecovery: Long,
     val playbackHeadAtDeadObject: Long,
+    // ── Y9 seek park / flush / seek epoch ──
+    val maxSeekHoldMs: Long,
+    // 1 once the sink thread executed a park requested through requestSeekPark().
+    val seekParkCount: Int,
+    // Hold cap applied to the last park: maxPauseHoldMs or maxSeekHoldMs.
+    val parkHoldCapMs: Long,
+    val flushRequestCount: Int,
+    val flushCount: Int,
+    val flushExecutedOnSinkThread: Boolean,
+    val flushAckLatencyMs: Long,
+    val playStateBeforeFlush: Int,
+    val playStateAfterFlush: Int,
+    val playbackHeadBeforeFlush: Long,
+    val playbackHeadAfterFlush: Long,
+    val framesWrittenAtFlush: Long,
+    val framesReadAtFlush: Long,
+    val drainCallsAtFlush: Long,
+    val timestampPollsDuringFlush: Long,
+    val postSeekExpectedFrames: Long,
+    // declaredFrameCount before a flush; framesReadAtFlush + postSeekExpectedFrames after it.
+    val readBudgetFrames: Long,
+    // Pending seek target handed over by requestFlush; the seek epoch base.
+    val seekTargetFrame: Long,
+    val seekEpochOpenedAtUnpark: Int,
+    val seekEpochBaseFrame: Long,
+    // Deliberate discontinuity: seekEpochBaseFrame - positionAtPark (>= 0).
+    val seekDiscontinuityFrames: Long,
+    val seekEpochOpenAccepted: Boolean,
+    // True once the flush reset lastRaw32 / wrapOffset / epochRawOrigin.
+    val seekUnwrapResetAtFlush: Boolean,
+    // Instance-frame origin used by the epoch opened at the last unpark:
+    // positionAtPark for a bounded pause, 0 for a seek (flushed instance).
+    val epochRawOriginAtUnpark: Long,
+    val playbackHeadAtSeekUnpark: Long,
+    // framesWrittenToSink - framesWrittenAtFlush once flushed, else 0.
+    val postSeekFramesWritten: Long,
 )

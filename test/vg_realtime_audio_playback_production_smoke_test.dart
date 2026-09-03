@@ -1,7 +1,8 @@
 // vg_realtime_audio_playback_production_smoke_test.dart
 // vanguard_media_engine - P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a) +
-// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, and dead-object diagnostic smoke foundation
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b) +
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK (Y9): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, and forward-seek diagnostic smoke foundation
 // Dart model and MethodChannel unit tests.
 
 import 'package:flutter/services.dart';
@@ -9,7 +10,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
 const _kCanonicalProofBoundary =
-    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_stop_dispose_release_once_no_seek_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
+    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_no_repeated_seek_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
 
 const _kPassMarker =
     'ANDROID_DAG_PHASE4_REALTIME_AUDIO_PLAYBACK_PRODUCTION_PHYSICAL_SMOKE_PASS';
@@ -43,6 +44,13 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'syntheticDeadObjectRecoveryOk': true,
     'deadObjectClockEpochRebaseOk': true,
     'deadObjectRemainderAccountingOk': true,
+    'seekQuiesceAccountingOk': true,
+    'seekCommandOk': true,
+    'sinkFlushAtSeekOk': true,
+    'decoderSeekReanchorOk': true,
+    'staleGenerationRejectedOk': true,
+    'seekClockEpochOk': true,
+    'postSeekDrainOk': true,
     'canonical': true,
   };
 
@@ -98,6 +106,18 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'deadObjectTimestampPollsDuringRecovery': 0,
     'sinkClockSnapshotsAtDeadObjectRecovery': 1,
     'playbackHeadAtDeadObject': 6400,
+    'seekTargetSec': 1.5,
+    'preSeekHoldWindows': 64,
+    'maxSeekHoldMs': 15000,
+    'seekTargetFrame': 72000,
+    'preSeekHoldFrame': 16384,
+    'seekCount': 1,
+    'seekAccepted': true,
+    'sinkFlushCount': 1,
+    'decoderReanchorOk': true,
+    'decoderStaleProbeRejected': true,
+    'expectedTotalFrames': 88384,
+    'postSeekExpectedFrames': 72000,
     'coordinatorThreadId': 100,
     'preRollFrames': 4096,
     'pauseHoldObservedMs': 402,
@@ -126,7 +146,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'nativeProofBoundary': _kCanonicalProofBoundary,
     'failureReason': '',
     'details':
-        'Y8a/Y8b realtime audio playback production sink/clock/dead-object smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS',
+        'Y8a/Y8b/Y9 realtime audio playback production sink/clock/dead-object/seek smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS,SCENARIO_FORWARD_SEEK_TO_EOS',
     'lanes': lanes,
     'metrics': metrics,
     'lastError': null,
@@ -195,11 +215,11 @@ void main() {
         VGRealtimeAudioPlaybackProductionSmokeReport
             .requiredNonCanonicalLanes
             .length,
-        equals(21),
+        equals(28),
       );
       expect(
         VGRealtimeAudioPlaybackProductionSmokeReport.requiredLanes.length,
-        equals(22),
+        equals(29),
       );
 
       final expectedLanes = <String>[
@@ -224,6 +244,13 @@ void main() {
         'syntheticDeadObjectRecoveryOk',
         'deadObjectClockEpochRebaseOk',
         'deadObjectRemainderAccountingOk',
+        'seekQuiesceAccountingOk',
+        'seekCommandOk',
+        'sinkFlushAtSeekOk',
+        'decoderSeekReanchorOk',
+        'staleGenerationRejectedOk',
+        'seekClockEpochOk',
+        'postSeekDrainOk',
         'canonical',
       ];
 
@@ -271,6 +298,13 @@ void main() {
       expect(report.syntheticDeadObjectRecoveryOk, isTrue);
       expect(report.deadObjectClockEpochRebaseOk, isTrue);
       expect(report.deadObjectRemainderAccountingOk, isTrue);
+      expect(report.seekQuiesceAccountingOk, isTrue);
+      expect(report.seekCommandOk, isTrue);
+      expect(report.sinkFlushAtSeekOk, isTrue);
+      expect(report.decoderSeekReanchorOk, isTrue);
+      expect(report.staleGenerationRejectedOk, isTrue);
+      expect(report.seekClockEpochOk, isTrue);
+      expect(report.postSeekDrainOk, isTrue);
       expect(report.canonical, isTrue);
       expect(report.allRequiredNonCanonicalLanesPass, isTrue);
 
@@ -299,6 +333,18 @@ void main() {
         equals(15000000),
       );
       expect(report.metrics['playbackHeadAtDeadObject'], equals(6400));
+      expect(report.metrics['seekTargetSec'], equals(1.5));
+      expect(report.metrics['preSeekHoldWindows'], equals(64));
+      expect(report.metrics['maxSeekHoldMs'], equals(15000));
+      expect(report.metrics['seekTargetFrame'], equals(72000));
+      expect(report.metrics['preSeekHoldFrame'], equals(16384));
+      expect(report.metrics['seekCount'], equals(1));
+      expect(report.metrics['seekAccepted'], isTrue);
+      expect(report.metrics['sinkFlushCount'], equals(1));
+      expect(report.metrics['decoderReanchorOk'], isTrue);
+      expect(report.metrics['decoderStaleProbeRejected'], isTrue);
+      expect(report.metrics['expectedTotalFrames'], equals(88384));
+      expect(report.metrics['postSeekExpectedFrames'], equals(72000));
     });
 
     test(
@@ -350,11 +396,71 @@ void main() {
       },
     );
 
+    test('new Y9 seek metric keys parse and are present in metrics map', () {
+      final report = _createSampleReport();
+      expect(report.metrics.containsKey('seekTargetSec'), isTrue);
+      expect(report.metrics['seekTargetSec'], equals(1.5));
+      expect(report.metrics.containsKey('preSeekHoldWindows'), isTrue);
+      expect(report.metrics['preSeekHoldWindows'], equals(64));
+      expect(report.metrics.containsKey('maxSeekHoldMs'), isTrue);
+      expect(report.metrics['maxSeekHoldMs'], equals(15000));
+      expect(report.metrics.containsKey('seekTargetFrame'), isTrue);
+      expect(report.metrics['seekTargetFrame'], equals(72000));
+      expect(report.metrics.containsKey('preSeekHoldFrame'), isTrue);
+      expect(report.metrics['preSeekHoldFrame'], equals(16384));
+      expect(report.metrics.containsKey('seekCount'), isTrue);
+      expect(report.metrics['seekCount'], equals(1));
+      expect(report.metrics.containsKey('seekAccepted'), isTrue);
+      expect(report.metrics['seekAccepted'], isTrue);
+      expect(report.metrics.containsKey('sinkFlushCount'), isTrue);
+      expect(report.metrics['sinkFlushCount'], equals(1));
+      expect(report.metrics.containsKey('decoderReanchorOk'), isTrue);
+      expect(report.metrics['decoderReanchorOk'], isTrue);
+      expect(report.metrics.containsKey('decoderStaleProbeRejected'), isTrue);
+      expect(report.metrics['decoderStaleProbeRejected'], isTrue);
+      expect(report.metrics.containsKey('expectedTotalFrames'), isTrue);
+      expect(report.metrics['expectedTotalFrames'], equals(88384));
+      expect(report.metrics.containsKey('postSeekExpectedFrames'), isTrue);
+      expect(report.metrics['postSeekExpectedFrames'], equals(72000));
+    });
+
     test('missing one new required Y8b lane fails isVerifiedPass', () {
       for (final lane in <String>[
         'syntheticDeadObjectRecoveryOk',
         'deadObjectClockEpochRebaseOk',
         'deadObjectRemainderAccountingOk',
+      ]) {
+        final raw = _createSampleRawMap();
+        final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
+        lanes.remove(lane);
+        raw['lanes'] = lanes;
+        if (raw['metrics'] is Map) {
+          final metrics = Map<String, Object?>.from(raw['metrics'] as Map);
+          metrics.remove(lane);
+          raw['metrics'] = metrics;
+        }
+        raw.remove(lane);
+
+        final report = VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(
+          raw,
+        );
+        expect(report.pass, isFalse);
+        expect(report.isVerifiedPass, isFalse);
+        expect(report.marker, equals(_kFailMarker));
+        expect(report.status, equals('missing_lane'));
+        expect(report.lastError, equals('missing_lane_$lane'));
+      }
+    });
+
+    test('missing one new required Y9 lane fails isVerifiedPass', () {
+      for (final lane in <String>[
+        'seekQuiesceAccountingOk',
+        'seekCommandOk',
+        'sinkFlushAtSeekOk',
+        'decoderSeekReanchorOk',
+        'staleGenerationRejectedOk',
+        'seekClockEpochOk',
+        'postSeekDrainOk',
       ]) {
         final raw = _createSampleRawMap();
         final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
@@ -540,6 +646,9 @@ void main() {
               maxPauseHoldMs: 3000,
               stopAfterMs: 300,
               deadObjectInjectAfterFrames: 8192,
+              seekTargetSec: 1.5,
+              preSeekHoldWindows: 64,
+              maxSeekHoldMs: 15000,
             );
 
         expect(
@@ -555,6 +664,9 @@ void main() {
         expect(invokedArguments?['maxPauseHoldMs'], equals(3000));
         expect(invokedArguments?['stopAfterMs'], equals(300));
         expect(invokedArguments?['deadObjectInjectAfterFrames'], equals(8192));
+        expect(invokedArguments?['seekTargetSec'], equals(1.5));
+        expect(invokedArguments?['preSeekHoldWindows'], equals(64));
+        expect(invokedArguments?['maxSeekHoldMs'], equals(15000));
         expect(report.pass, isTrue);
         expect(report.isVerifiedPass, isTrue);
         expect(report.hasPassMarker, isTrue);
@@ -579,6 +691,30 @@ void main() {
       );
 
       expect(invokedArguments?['deadObjectInjectAfterFrames'], equals(16384));
+    });
+
+    test('method route passes custom seek parameters', () async {
+      Map<Object?, Object?>? invokedArguments;
+      binaryMessenger.setMockMethodCallHandler(defaultChannel, (
+        MethodCall call,
+      ) async {
+        invokedArguments = call.arguments as Map<Object?, Object?>?;
+        if (call.method == 'runRealtimeAudioPlaybackProductionSmoke') {
+          return _createSampleRawMap();
+        }
+        return null;
+      });
+
+      await VGRealtimeAudioPlaybackProductionSmokeReport.runRealtimeAudioPlaybackProductionSmoke(
+        sourcePath: '/tmp/test_clip.mov',
+        seekTargetSec: 2.0,
+        preSeekHoldWindows: 32,
+        maxSeekHoldMs: 10000,
+      );
+
+      expect(invokedArguments?['seekTargetSec'], equals(2.0));
+      expect(invokedArguments?['preSeekHoldWindows'], equals(32));
+      expect(invokedArguments?['maxSeekHoldMs'], equals(10000));
     });
 
     test(

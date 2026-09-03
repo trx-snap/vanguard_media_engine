@@ -5,6 +5,7 @@ import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeA
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackSinkBridge
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimeAudioPlaybackSinkTelemetry
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackDecoderFeed
+import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackNativeSession
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackPresentationClock
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackTransportStateMachine
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.DEAD_OBJECT_PUBLICATION_LAG_BUDGET_MS
@@ -18,12 +19,19 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DEAD_OBJECT_CLOCK_EPOCH
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DEAD_OBJECT_RECOVERY
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DEAD_OBJECT_REMAINDER
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_DECODER_SEEK_REANCHOR
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_FORMAT_PROBE
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_NONZERO_GAIN
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_NO_FEEDBACK
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_PLAYTHROUGH_ACCOUNTING
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_POST_SEEK_DRAIN
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_PRE_ROLL
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_PROOF_BOUNDARY
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_SEEK_CLOCK_EPOCH
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_SEEK_COMMAND
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_SEEK_QUIESCE_ACCOUNTING
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_SINK_FLUSH_AT_SEEK
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_STALE_GENERATION_REJECTED
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_START
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_THREAD_OWNERSHIP
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_TRANSPORT_DISPOSED
@@ -31,7 +39,7 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.PROOF_BOUNDARY_TOKENS
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.REQUIRED_LANES
 
-// Per-invocation Y8a/Y8b smoke arguments, shared by scenario sequencing
+// Per-invocation Y8a/Y8b/Y9 smoke arguments, shared by scenario sequencing
 // (coordinator) and lane evaluation (this file).
 data class SmokeConfig(
     val sourcePath: String,
@@ -43,6 +51,10 @@ data class SmokeConfig(
     val maxPauseHoldMs: Long,
     val stopAfterMs: Long,
     val deadObjectInjectAfterFrames: Long,
+    // Y9 forward-seek scenario arguments.
+    val seekTargetSec: Double,
+    val preSeekHoldWindows: Int,
+    val maxSeekHoldMs: Long,
 )
 
 // Per-scenario expected AudioTrack instance/dead-object accounting.
@@ -175,19 +187,22 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             holdEnd.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED
     }
 
-    // Shared by the two EOS scenarios (Y8a playthrough, Y8b dead object).
+    // Shared by the EOS scenarios (Y8a playthrough, Y8b dead object, Y9
+    // forward seek). `expectedTotal` is the declared count for a straight
+    // playthrough and H + (declared - T) across the one forward seek (C7).
     fun playthroughAccountingOk(
         final: VanguardRealtimeAudioPlaybackSession.Snapshot,
         stateAtCompletion: VanguardRealtimeAudioPlaybackSession.State,
+        expectedTotal: Long = final.format?.declaredFrameCount ?: -1L,
     ): Boolean {
-        val declared = final.format?.declaredFrameCount ?: return false
+        if (final.format == null || expectedTotal <= 0L) return false
         val sink = final.sink ?: return false
         val reply = final.terminalReply
         return stateAtCompletion == VanguardRealtimeAudioPlaybackSession.State.COMPLETED &&
             sink.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_EOS && sink.eosDrainedObserved &&
-            sink.framesReadFromTransport == declared && sink.framesWrittenToSink == declared &&
-            final.decoderExitReason == VanguardRealtimePlaybackDecoderFeed.EXIT_EOS && final.decoderAcceptedFrames == declared &&
-            reply != null && reply.pushedFrames == declared && reply.drainedFrames == declared && reply.discardedFrames == 0L &&
+            sink.framesReadFromTransport == expectedTotal && sink.framesWrittenToSink == expectedTotal &&
+            final.decoderExitReason == VanguardRealtimePlaybackDecoderFeed.EXIT_EOS && final.decoderAcceptedFrames == expectedTotal &&
+            reply != null && reply.pushedFrames == expectedTotal && reply.drainedFrames == expectedTotal && reply.discardedFrames == 0L &&
             final.transportCompletedCallbacks == 1 && final.transportFailedCallbacks == 0 && final.failureReason.isBlank()
     }
 
@@ -312,6 +327,172 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             -> true
             else -> false
         }
+    }
+
+    // Y9 lanes: the ONE forward seek ran in the frozen order with quiescent
+    // pre-seek accounting at the window-aligned hold frame H, the transport
+    // seek left PAUSED with generation + 1 into an empty output ring, the
+    // AudioTrack was flushed exactly once on the sink thread while PAUSED
+    // before/after, the decoder re-anchored on its own thread with the
+    // deliberate stale probe rejected before JNI and the post-seek pre-roll
+    // landing while still PAUSED, the seek clock epoch opened at T as a
+    // deliberate discontinuity (base never clamped, clock never faulted),
+    // and the run reached EOS with H + (declared - T) accounting and
+    // checksum identity paired with the decoder landing assertions.
+    fun evaluateForwardSeek(
+        final: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        afterSeek: VanguardRealtimeAudioPlaybackSession.Snapshot,
+        stateAtCompletion: VanguardRealtimeAudioPlaybackSession.State,
+        config: SmokeConfig,
+        out: ScenarioOutcome,
+    ) {
+        val fmt = final.format ?: return
+        val sink = final.sink ?: return
+        val clock = final.clock ?: return
+        val q = final.seek
+        val d = q.decoder
+        val declared = fmt.declaredFrameCount
+        val window = config.maxFramesPerMix.toLong()
+        val hold = q.holdFrame
+        val target = q.targetFrame
+        val postSeekExpected = declared - target
+        val expectedTotal = hold + postSeekExpected
+        val reply = final.terminalReply
+        val pre = q.preSeekReply
+        val postPause = q.postPauseReply
+        val post = q.postSeekReply
+        val postPreRoll = q.postSeekPreRollReply
+        val asSink = afterSeek.sink
+        val asClock = afterSeek.clock
+        val clockAtPark = q.clockAtPark
+        val clockBeforeUnpark = q.clockBeforeUnpark
+        val clockAfterUnpark = q.clockAfterUnpark
+        val paused = VanguardRealtimePlaybackTransportStateMachine.State.PAUSED
+        val playing = VanguardRealtimePlaybackTransportStateMachine.State.PLAYING
+
+        out.metrics["stateAtCompletion"] = stateAtCompletion.name
+        out.metrics["postSeekExpectedFrames"] = postSeekExpected
+        out.metrics["expectedTotalFrames"] = expectedTotal
+        out.metrics["afterSeekState"] = afterSeek.state.name
+        out.metrics["afterSeekTransportState"] = afterSeek.transportState?.name ?: "none"
+        out.metrics["afterSeekSinkPhase"] = asSink?.phase?.name ?: "none"
+        out.metrics["afterSeekFramesWritten"] = asSink?.framesWrittenToSink ?: -1L
+        out.metrics["afterSeekClockEpochId"] = asClock?.epochId ?: -1
+        out.metrics["afterSeekClockEpochOpen"] = asClock?.epochOpen ?: false
+        out.metrics["afterSeekClockEpochBase"] = asClock?.epochBaseOffsetFrames ?: -1L
+        out.metrics["afterSeekClockPosition"] = asClock?.positionFrames ?: -1L
+        out.metrics["afterSeekClockBaseClampCount"] = asClock?.baseClampCount ?: -1L
+        out.metrics["afterSeekClockBaseAdvanceCount"] = asClock?.baseAdvanceCount ?: -1L
+        out.metrics["afterSeekClockLastBaseAdvanceFrames"] = asClock?.lastBaseAdvanceFrames ?: -1L
+        out.metrics["afterSeekTransportGeneration"] = afterSeek.transportGeneration
+        out.metrics["finalTransportGeneration"] = final.transportGeneration
+
+        // Decoder landing assertions (paired with checksum identity): the
+        // previous-sync seat landed at or before the target, the first
+        // post-seek chunk is PTS-anchored, every pre-target frame was
+        // discarded and a padded gap (Y5b policy) ends exactly at the first
+        // decoded post-seek frame.
+        val gapPolicyOk = d != null && d.gapPaddedFrames == d.gapObservedFrames &&
+            d.gapPaddedFrames <= d.maxSeekGapFrames &&
+            (d.gapPaddedFrames == 0L || d.firstPostSeekFrame == target + d.gapPaddedFrames)
+        val landingOk = d != null && d.seekTargetUs > 0L && d.seekLandedUs in 0L..d.seekTargetUs &&
+            d.firstPostSeekPtsUs >= 0L && d.firstPostSeekFrame >= 0L &&
+            (if (d.firstPostSeekFrame <= target) d.discardedPreTargetFrames == target - d.firstPostSeekFrame else d.discardedPreTargetFrames == 0L) &&
+            gapPolicyOk
+        out.metrics["decoderLandingOk"] = landingOk
+        out.metrics["decoderGapPolicyOk"] = gapPolicyOk
+
+        out.lanes[LANE_PLAYTHROUGH_ACCOUNTING] = q.armed && hold > 0L && target > hold && playthroughAccountingOk(final, stateAtCompletion, expectedTotal)
+        out.lanes[LANE_CHECKSUM_IDENTITY] = checksumIdentityOk(final) && landingOk
+        out.lanes[LANE_SEEK_QUIESCE_ACCOUNTING] = d != null && pre != null &&
+            q.armed && q.admissionOk && q.holdPinned && hold % window == 0L &&
+            final.preRollFrames < hold && hold < target && target < declared - 2L * window &&
+            q.quiesceFeedHeld && q.quiesceSinkReadFrames == hold && q.quiesceSinkWrittenFrames == hold && q.quiesceAccountingOk &&
+            pre.state == VanguardRealtimePlaybackNativeSession.NativeState.PLAYING && pre.positionFrame == hold &&
+            pre.pushedFrames == hold && pre.drainedFrames == hold && pre.discardedFrames == 0L && pre.outputAvailableReadFrames == 0L &&
+            !pre.eosPushed && !pre.eosDrained && q.preSeekTransportState == playing &&
+            d.holdFrame == hold && d.preSeekAcceptedFrames == hold &&
+            sink.framesWrittenAtFlush == hold && sink.framesReadAtFlush == hold &&
+            q.initialWriteWaitMs >= 0L && q.quiesceWaitMs >= 0L && q.preSeekSettleMs >= 0L
+        out.lanes[LANE_SEEK_COMMAND] = postPause != null && post != null && postPreRoll != null &&
+            q.seekCount == 1 && q.seekAccepted && q.staleGeneration == final.startGeneration &&
+            q.seekGeneration == q.staleGeneration + 1L && q.pauseAccepted && q.pauseGeneration == final.startGeneration &&
+            q.resumeAccepted && q.resumeGeneration == q.seekGeneration &&
+            // The seek command is judged on the immediate after-seek snapshot:
+            // `final` is taken after stop(), which bumps the transport
+            // generation once more by design (exported as a metric only).
+            afterSeek.transportGeneration == q.seekGeneration &&
+            postPause.state == VanguardRealtimePlaybackNativeSession.NativeState.PAUSED && postPause.pushedFrames == hold &&
+            postPause.drainedFrames == hold && postPause.discardedFrames == 0L &&
+            post.state == VanguardRealtimePlaybackNativeSession.NativeState.PAUSED && post.positionFrame == target &&
+            post.pushedFrames == hold && post.drainedFrames == hold && post.discardedFrames == 0L && !post.eosPushed && !post.eosDrained &&
+            q.postSeekTransportState == paused && q.sinkPhaseAtSeek == VanguardRealtimeAudioPlaybackSinkBridge.Phase.PARKED.name &&
+            q.flushRequestedWhilePaused && q.flushAckedBeforeSeek &&
+            postPreRoll.state == VanguardRealtimePlaybackNativeSession.NativeState.PAUSED && postPreRoll.pushedFrames == hold &&
+            postPreRoll.positionFrame == target && postPreRoll.discardedFrames == 0L &&
+            q.postSeekPreRollTransportState == paused && q.transportStateAtUnpark == paused &&
+            afterSeek.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING && afterSeek.transportState == playing &&
+            afterSeek.failureReason.isBlank() && q.seekWallMs >= 0L &&
+            q.parkAckedAtMs >= q.parkRequestedAtMs && q.unparkedAtMs >= q.parkAckedAtMs && q.resumedAtMs >= q.unparkedAtMs
+        out.lanes[LANE_SINK_FLUSH_AT_SEEK] = sink.seekParkCount == 1 && sink.parkCount == 1 && sink.unparkCount == 1 &&
+            sink.flushRequestCount == 1 && sink.flushCount == 1 && sink.flushExecutedOnSinkThread &&
+            sink.parkExecutedOnSinkThread && sink.unparkExecutedOnSinkThread &&
+            sink.playStateAtPark == AudioTrack.PLAYSTATE_PAUSED && sink.playStateBeforeFlush == AudioTrack.PLAYSTATE_PAUSED &&
+            sink.playStateAfterFlush == AudioTrack.PLAYSTATE_PAUSED && sink.playStateAfterUnpark == AudioTrack.PLAYSTATE_PLAYING &&
+            sink.parkedPlayStateViolations == 0L && sink.timestampPollsWhileParked == 0L && sink.timestampPollsDuringFlush == 0L &&
+            sink.framesWrittenAtFlush == hold && sink.framesReadAtFlush == hold && sink.drainCallsAtFlush > 0L &&
+            sink.postSeekExpectedFrames == postSeekExpected && sink.readBudgetFrames == expectedTotal && sink.seekTargetFrame == target &&
+            sink.flushAckLatencyMs >= 0L && q.flushAckWaitMs >= 0L &&
+            sink.maxSeekHoldMs == config.maxSeekHoldMs && sink.parkHoldCapMs == config.maxSeekHoldMs &&
+            sink.parkedHoldMs >= 0L && sink.parkedHoldMs <= config.maxSeekHoldMs &&
+            q.holdObservedMs >= 0L && q.holdObservedMs <= config.maxSeekHoldMs &&
+            sink.audioTracksCreated == 1 && sink.releaseCount == 1 && sink.deadObjectRecoveryCount == 0 &&
+            sink.audioTrackCallsOffSinkThread == 0L
+        out.lanes[LANE_DECODER_SEEK_REANCHOR] = d != null &&
+            d.seekReanchorCount == 1 && d.reanchorOk && d.reanchorExecutedOnDecodeThread && d.reanchorTransportStatePaused &&
+            d.seekTargetFrame == target && d.holdFrame == hold && d.preSeekAcceptedFrames == hold && d.codecChunks > d.codecChunksAtSeek &&
+            d.postSeekAcceptedFrames == postSeekExpected && d.postSeekDecodedAcceptedFrames > 0L &&
+            d.anchorFrame == declared && d.acceptedFrames == expectedTotal && !d.heldAtHoldFrame &&
+            d.postSeekPreRollFrames >= window && d.postSeekPreRollStatePaused && landingOk && d.mediaReopens <= 1 &&
+            d.paddedFrames <= (VanguardRealtimePlaybackDecoderFeed.MAX_EOS_DRIFT_SEC * fmt.sampleRate).toLong() &&
+            d.seekReanchorWallMs >= 0L && q.reanchorWaitMs >= 0L && q.postSeekPreRollWaitMs >= 0L &&
+            final.decoderExitReason == VanguardRealtimePlaybackDecoderFeed.EXIT_EOS && final.decoderAcceptedFrames == expectedTotal &&
+            final.decoderMediaReleaseCount == 1L && final.decoderMediaReleaseClean
+        out.lanes[LANE_STALE_GENERATION_REJECTED] = d != null &&
+            d.staleProbeCalls == 1 && d.staleProbeRejected && d.staleProbeReplyNull && d.staleProbeAnchorUntouched &&
+            d.staleProbeReason == VanguardRealtimePlaybackTransportStateMachine.REASON_STALE_GENERATION &&
+            final.decoderIngestCallbacksOffOwner == 0L && q.seekGeneration == q.staleGeneration + 1L
+        out.lanes[LANE_SEEK_CLOCK_EPOCH] = clockAtPark != null && clockBeforeUnpark != null && clockAfterUnpark != null && asClock != null &&
+            !clockAtPark.epochOpen && clockAtPark.epochId == 0 && clockAtPark.positionFrames == sink.positionAtPark &&
+            clockAtPark.provenance == VanguardRealtimePlaybackPresentationClock.Provenance.RESET &&
+            clockBeforeUnpark.positionFrames == clockAtPark.positionFrames && clockBeforeUnpark.updateCount == clockAtPark.updateCount &&
+            !clockBeforeUnpark.epochOpen &&
+            sink.positionAtPark >= 0L && sink.positionAtPark <= hold && sink.epochClosedAtPark == 0 && sink.epochOpenedAtUnpark == 1 &&
+            sink.seekEpochOpenedAtUnpark == 1 && sink.seekEpochBaseFrame == target &&
+            sink.seekDiscontinuityFrames == target - sink.positionAtPark && sink.seekDiscontinuityFrames > 0L &&
+            sink.seekEpochOpenAccepted && sink.seekUnwrapResetAtFlush && sink.epochRawOriginAtUnpark == 0L &&
+            sink.rebasedClampCount == 0L && sink.clockSnapshotsAtPark == 1L && sink.clockSnapshotsAtDeadObjectRecovery == 0L &&
+            clockAfterUnpark.epochOpen && clockAfterUnpark.epochId == 1 && clockAfterUnpark.epochBaseOffsetFrames == target &&
+            clockAfterUnpark.positionFrames >= target && clockAfterUnpark.baseClampCount == 0L && !clockAfterUnpark.faulted &&
+            clockAfterUnpark.baseAdvanceCount == 1L && clockAfterUnpark.lastBaseAdvanceFrames == sink.seekDiscontinuityFrames &&
+            asClock.epochId == 1 && asClock.epochBaseOffsetFrames == target && asClock.positionFrames >= target &&
+            asClock.baseClampCount == 0L && !asClock.faulted &&
+            clock.epochOpenCount == 2 && clock.epochCloseCount == 2 && clock.baseClampCount == 0L && !clock.faulted &&
+            clock.regressionCount == 0L && clock.positionFrames >= target && clock.positionFrames <= declared &&
+            !clock.epochOpen && clock.epochId == 1 &&
+            clock.timestampSuccessCount > clockAfterUnpark.timestampSuccessCount && clock.anchoredCount > clockAfterUnpark.anchoredCount
+        out.lanes[LANE_POST_SEEK_DRAIN] = asSink != null && reply != null &&
+            sink.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_EOS && sink.eosDrainedObserved &&
+            sink.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.EXITED && q.resumeAccepted &&
+            asSink.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_RUNNING &&
+            asSink.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.RUNNING && asSink.unparkCount == 1 && asSink.flushCount == 1 &&
+            asSink.framesWrittenToSink >= hold && asSink.framesWrittenToSink <= expectedTotal &&
+            sink.framesReadFromTransport == expectedTotal && sink.framesWrittenToSink == expectedTotal &&
+            sink.postSeekFramesWritten == postSeekExpected && sink.drainCalls > sink.drainCallsAtFlush && sink.productiveDrainPasses > 0L &&
+            reply.pushedFrames == expectedTotal && reply.drainedFrames == expectedTotal && reply.discardedFrames == 0L &&
+            reply.positionFrame == declared && reply.eosDrained &&
+            final.transportCompletedCallbacks == 1 && final.transportFailedCallbacks == 0 && final.failureReason.isBlank() &&
+            stateAtCompletion == VanguardRealtimeAudioPlaybackSession.State.COMPLETED
     }
 
     // A lane holds only when every scenario that evaluated it passed and at

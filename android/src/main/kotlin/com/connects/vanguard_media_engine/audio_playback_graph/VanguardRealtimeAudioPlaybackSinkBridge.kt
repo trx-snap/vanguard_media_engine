@@ -21,63 +21,63 @@ import kotlin.concurrent.withLock
 // Production-owned AudioTrack sink of the realtime audio playback engine.
 // One NON-ZERO-GAIN android.media.AudioTrack (MODE_STREAM, PCM16) lives on
 // ITS OWN sink thread, which owns EVERY AudioTrack call (create, setVolume,
-// play, pause, write, getTimestamp, playbackHeadPosition, playState, stop,
-// release) and EVERY write into the owned
+// play, pause, flush, write, getTimestamp, playbackHeadPosition, playState,
+// stop, release) and EVERY write into the owned
 // [VanguardRealtimePlaybackPresentationClock]. PCM16 is pulled from the
 // caller-owned [VanguardRealtimePlaybackTransportStateMachine] through
 // `drain()` ONLY; this bridge never issues a transport command.
 //
 // Phase protocol (sink thread executes, any thread requests):
 //   SETUP -> READY (AudioTrack created, gain set) --allowDrain()--> RUNNING
-//   RUNNING --requestPark()--> PARK_REQUESTED --(sink thread)--> PARKED
-//   PARKED  --unpark()-------> (sink thread: AudioTrack.play) --> RUNNING
-//   any     --exit-----------> EXITED (AudioTrack released exactly once)
+//   RUNNING --requestPark() / requestSeekPark()--> PARK_REQUESTED --> PARKED
+//   PARKED  --[seek park only: requestFlush(n, T) -> flush acked]--
+//           --unpark()--> (sink thread: AudioTrack.play) --> RUNNING
+//   any     --exit--> EXITED (AudioTrack released exactly once)
 //
 // Presentation clock rules:
 //   - epoch 0 opens only after the first productive post-start drain was
 //     written and AudioTrack.play() returned PLAYSTATE_PLAYING.
-//   - getTimestamp() is polled at most once per productive drain pass,
-//     after the write returned; observeTimestamp / observeTimestampUnavailable
-//     are called at that point and playbackHeadPosition is sampled there.
-//   - bounded pause: AudioTrack.pause() on the sink thread, the last
-//     published clock position is snapshotted, epochClosed(current) freezes
-//     it. While PARKED nothing is drained, written or polled. On unpark
-//     AudioTrack.play() runs on the same instance and epochOpened(epoch+1,
-//     baseFrame = last published position) opens a new epoch. Because the
-//     AudioTrack instance (and its framePosition) survive the pause, the
-//     raw frame handed to the clock is rebased per epoch (instance frames
-//     minus the published position at park, clamped at 0) so continuity
-//     comes from the base offset only and no advancement is fabricated.
-//   - the clock NEVER feeds back: drain size, sleeps, drain gating,
-//     checksum and (absent) transport commands never depend on a timestamp
-//     or clock outcome. A rejected clock write is counted, never acted on.
-//     The sink reads the clock (snapshot) only at park, to take the base
-//     of the next epoch; that read is counted.
-// A parked hold longer than [Config.maxPauseHoldMs] (default well below the
-// decoder feed's ingest stall budget) fails closed. No seek.
+//   - getTimestamp() is polled at most once per productive drain pass, after
+//     the write returned; observeTimestamp / observeTimestampUnavailable and
+//     the playbackHeadPosition sample happen there.
+//   - bounded pause: AudioTrack.pause() on the sink thread; the last
+//     published position is snapshotted and epochClosed(current) freezes it.
+//     While PARKED nothing is drained, written or polled. Unpark: play() on
+//     the same instance, epochOpened(epoch+1, baseFrame = that position);
+//     the instance frame is rebased per epoch (minus the published position
+//     at park, clamped at 0) so continuity comes from the base offset only
+//     and no advancement is fabricated. A hold longer than
+//     [Config.maxPauseHoldMs] (below the feed's ingest stall budget) fails closed.
+//   - the clock NEVER feeds back: drain size, sleeps, gating, checksum and
+//     (absent) transport commands never depend on a timestamp or clock
+//     outcome; a rejected clock write is counted, never acted on. The sink
+//     reads the clock only at park (next epoch base); that read is counted.
 //
-// Dead object (Y8b, P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT):
-//   - Default off. When [Config.syntheticDeadObjectInjectAfterFrames] > 0
-//     the sink thread arms EXACTLY ONE synthetic AudioTrack.ERROR_DEAD_OBJECT
-//     once that many frames were written: the write is skipped and the
-//     error substituted, so no byte of the slice is consumed.
-//   - Only that armed synthetic dead object is recovered, on the sink
-//     thread, inside the write loop: current epoch closed (accepted), old
-//     instance released exactly once (own counter, never [releaseCounter]),
-//     one same-parameter replacement built (STATE_INITIALIZED, same buffer
-//     geometry), gain reapplied, play() -> PLAYSTATE_PLAYING, instance
-//     unwrap/rebase reset, epoch+1 opened at baseFrame = frames written so
-//     far (accepted). The unwritten remainder is then written to the new
-//     instance. No timestamp poll happens inside the recovery window.
-//   - The base step (baseFrame - last published position) fails closed on
-//     sign only (step < 0). Its magnitude is NOT a production bound: it is
-//     decomposed for the proof lane into frames lost with the dead instance
-//     (written - head consumed at the dead object) and publication lag
-//     (head consumed - last published position), from the same single clock
-//     snapshot plus the dead instance's playbackHeadPosition.
-//   - Any unarmed (real) ERROR_DEAD_OBJECT and any second ERROR_DEAD_OBJECT
-//     fail closed. The final release of the replacement instance still goes
-//     through [releaseAudioTrackOnce] exactly once.
+// Seek (Y9, P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK): one forward seek
+// reuses the park protocol as a seek park capped by [Config.maxSeekHoldMs]
+// (covers the session's whole seek sequence; the pause cap is untouched).
+// While PARKED the ONE requestFlush(n, T) runs AudioTrack.flush on the sink
+// thread with PLAYSTATE_PAUSED before and after: read budget = read-at-flush
+// + n (C6), instance unwrap/rebase origin reset because flush restarts the
+// instance frame position (C4). Unpark of a seek park is rejected until the
+// flush was acked, so epoch+1 opens on a flushed instance at baseFrame = T:
+// a deliberate discontinuity of T - positionAtPark frames, published as
+// telemetry. T >= positionAtPark always holds (positionAtPark <= written ==
+// H < T), so the clock never clamps the base.
+//
+// Dead object (Y8b, P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT),
+// default off: with [Config.syntheticDeadObjectInjectAfterFrames] > 0 the
+// sink thread arms EXACTLY ONE synthetic AudioTrack.ERROR_DEAD_OBJECT once
+// that many frames were written (write skipped, error substituted, no byte
+// consumed). Only that armed dead object is recovered, on the sink thread
+// inside the write loop ([recoverFromSyntheticDeadObject], steps 1-6: close
+// epoch, release old once, ONE same-parameter replacement, gain, play,
+// unwrap reset, epoch+1 at frames written) and the unwritten remainder
+// lands on the new instance; no timestamp poll happens inside the recovery
+// window. The base step fails closed on sign only; its magnitude is
+// decomposed into lost frames + publication lag for the proof lane only.
+// Any unarmed (real) or second ERROR_DEAD_OBJECT fails closed; the
+// replacement's final release still goes through [releaseAudioTrackOnce].
 class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
 
     data class Config(
@@ -88,18 +88,19 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         val declaredFrameCount: Long,
         // Non-zero linear gain applied with AudioTrack.setVolume; (0, 1].
         val gain: Float = DEFAULT_GAIN,
-        // Hard cap on one parked hold; must stay below the decoder feed's
-        // ingest stall budget, which keeps running while the transport pauses.
+        // Cap on one bounded-pause hold; below the decoder feed's ingest stall budget.
         val maxPauseHoldMs: Long = DEFAULT_MAX_PAUSE_HOLD_MS,
+        // Y9: cap on one seek park (requestSeekPark), distinct from the pause cap;
+        // the feed never stalls while held / PAUSED after its re-anchor.
+        val maxSeekHoldMs: Long = DEFAULT_MAX_SEEK_HOLD_MS,
         // Absolute SystemClock.elapsedRealtime() deadline shared by the session.
         val deadlineAtMs: Long,
         val threadName: String = "VanguardRealtimeAudioSink",
         val externallyCancelled: () -> Boolean = { false },
         // Invoked once on the sink thread after the AudioTrack was released.
         val onExited: ((String) -> Unit)? = null,
-        // Y8b diagnostic seam, default OFF (0). When > 0, exactly one
-        // synthetic ERROR_DEAD_OBJECT is armed on the sink thread once this
-        // many frames were written; see the class comment.
+        // Y8b diagnostic seam, default OFF (0): arms exactly one synthetic
+        // ERROR_DEAD_OBJECT once this many frames were written (class comment).
         val syntheticDeadObjectInjectAfterFrames: Long = 0L,
     )
 
@@ -108,6 +109,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     companion object {
         const val DEFAULT_GAIN = 1.0f
         const val DEFAULT_MAX_PAUSE_HOLD_MS = 1_500L
+        const val DEFAULT_MAX_SEEK_HOLD_MS = 15_000L
         const val EPOCH_NONE = VanguardRealtimePlaybackPresentationClock.EPOCH_NONE
         const val PLAY_STATE_UNKNOWN = -1
 
@@ -117,6 +119,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         const val EXIT_DEADLINE = "deadline_exceeded"
         const val EXIT_NOT_STARTED = "not_started"
         const val EXIT_PAUSE_HOLD_EXCEEDED = "bounded_pause_hold_exceeded"
+        const val EXIT_SEEK_HOLD_EXCEEDED = "bounded_seek_hold_exceeded"
         const val EXIT_DEAD_OBJECT = "audio_track_dead_object"
         const val EXIT_DEAD_OBJECT_REPEATED = "audio_track_dead_object_repeated"
 
@@ -148,9 +151,15 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     private val phaseRef = AtomicReference(Phase.SETUP)
     private val parkLock = ReentrantLock()
     private val parkCondition = parkLock.newCondition()
+    private val flushAckLatch = CountDownLatch(1)
 
     // Guarded by parkLock.
     private var unparkRequested = false
+    private var flushRequested = false
+    private var flushRequestedAtMs = -1L
+
+    // Y9: set by requestSeekPark() before the phase flip; read by the sink thread at PARK_REQUESTED.
+    @Volatile private var seekParkRequested = false
 
     @Volatile private var parkAckLatch = CountDownLatch(1)
     @Volatile private var unparkAckLatch = CountDownLatch(1)
@@ -259,17 +268,42 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     @Volatile private var clockSnapshotsAtDeadObjectRecovery = 0L
     @Volatile private var playbackHeadAtDeadObject = -1L
 
+    // Y9 seek park / flush / seek epoch telemetry (sink thread writes; request-side counters under parkLock).
+    @Volatile private var seekParkCount = 0
+    @Volatile private var parkHoldCapMs = -1L
+    @Volatile private var flushRequestCount = 0
+    @Volatile private var flushCount = 0
+    @Volatile private var flushExecutedOnSinkThread = false
+    @Volatile private var flushAckLatencyMs = -1L
+    @Volatile private var playStateBeforeFlush = PLAY_STATE_UNKNOWN
+    @Volatile private var playStateAfterFlush = PLAY_STATE_UNKNOWN
+    @Volatile private var playbackHeadBeforeFlush = -1L
+    @Volatile private var playbackHeadAfterFlush = -1L
+    @Volatile private var framesWrittenAtFlush = -1L
+    @Volatile private var framesReadAtFlush = -1L
+    @Volatile private var drainCallsAtFlush = -1L
+    @Volatile private var timestampPollsDuringFlush = -1L
+    @Volatile private var postSeekExpectedFrames = -1L
+    // Read budget (C6): declared before a flush, framesReadAtFlush + postSeekExpectedFrames after.
+    @Volatile private var readBudgetFrames = 0L
+    @Volatile private var seekTargetFrame = -1L
+    @Volatile private var seekEpochOpenedAtUnpark = EPOCH_NONE
+    @Volatile private var seekEpochBaseFrame = -1L
+    @Volatile private var seekDiscontinuityFrames = -1L
+    @Volatile private var seekEpochOpenAccepted = false
+    @Volatile private var seekUnwrapResetAtFlush = false
+    @Volatile private var epochRawOriginAtUnpark = -1L
+    @Volatile private var playbackHeadAtSeekUnpark = -1L
+
     // ── Sink-thread-confined state ─────────────────────────────────────────
 
     private var audioTrack: AudioTrack? = null
     private val audioTimestamp = AudioTimestamp()
     private var lastProgressMs = 0L
     private var pollsThisPass = 0L
-    // Set by the write loop between the armed dead object and the end of
-    // the slice whose remainder the replacement instance must absorb.
+    // Set by the write loop from the armed dead object to the end of the slice the new instance absorbs.
     private var deadObjectResumePending = false
-    // Instance-frame unwrap of AudioTimestamp.framePosition (one forward
-    // wrap tolerated) and the per-epoch rebase origin in instance frames.
+    // Instance-frame unwrap of framePosition (one forward wrap) and the per-epoch rebase origin.
     private var lastRaw32 = -1L
     private var wrapOffset = 0L
     private var epochRawOrigin = 0L
@@ -278,8 +312,10 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     val isAlive: Boolean get() = thread?.isAlive == true
     val currentExitReason: String get() = exitReason
     val framesWritten: Long get() = framesWrittenToSink
+    val framesRead: Long get() = framesReadFromTransport
     val hasPlayed: Boolean get() = played
     val sinkThreadId: Long get() = threadId
+    val currentFlushCount: Int get() = flushCount
 
     // ── Public API (any thread) ────────────────────────────────────────────
 
@@ -302,8 +338,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         drainGate.countDown()
     }
 
-    // Flips RUNNING -> PARK_REQUESTED; the sink parks at the top of its
-    // next drain iteration. False when not RUNNING.
+    // Flips RUNNING -> PARK_REQUESTED; the sink parks at its next drain iteration. False when not RUNNING.
     fun requestPark(): Boolean {
         if (!started.get()) return false
         parkAckLatch = CountDownLatch(1)
@@ -316,11 +351,51 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
     fun awaitParked(timeoutMs: Long): Boolean =
         parkAckLatch.await(timeoutMs, TimeUnit.MILLISECONDS) && phaseRef.get() == Phase.PARKED
 
-    // Wakes a PARKED sink thread; it plays the AudioTrack on its own thread
-    // and publishes RUNNING. False when not PARKED.
+    // Y9: [requestPark] as a seek park: capped by [Config.maxSeekHoldMs], takes
+    // exactly one [requestFlush], unparks only after its ack. Single use.
+    fun requestSeekPark(): Boolean {
+        if (!started.get() || phaseRef.get() != Phase.RUNNING) return false
+        parkLock.withLock {
+            if (seekParkRequested || seekParkCount > 0 || flushRequested || flushCount > 0) return false
+            seekParkRequested = true
+        }
+        if (!requestPark()) {
+            parkLock.withLock { seekParkRequested = false }
+            return false
+        }
+        return true
+    }
+
+    // Y9, any thread: the PARKED seek-park sink thread flushes exactly once,
+    // bounds further reads to `postSeekFrames` (C6) and opens the next epoch
+    // at `targetFrame` on unpark. False unless PARKED on a seek park, once.
+    fun requestFlush(postSeekFrames: Long, targetFrame: Long): Boolean {
+        if (postSeekFrames <= 0L || targetFrame < 0L) return false
+        parkLock.withLock {
+            if (phaseRef.get() != Phase.PARKED) return false
+            if (!seekParkRequested) return false
+            if (flushRequested || flushCount > 0) return false
+            flushRequested = true
+            flushRequestedAtMs = SystemClock.elapsedRealtime()
+            postSeekExpectedFrames = postSeekFrames
+            seekTargetFrame = targetFrame
+            flushRequestCount++
+            parkCondition.signalAll()
+        }
+        return true
+    }
+
+    // Y9: bounded wait for the flush ack; true only when it executed exactly once (latch also released on exit).
+    fun awaitFlushed(timeoutMs: Long): Boolean =
+        flushAckLatch.await(timeoutMs, TimeUnit.MILLISECONDS) && flushCount == 1
+
+    // Wakes a PARKED sink thread (AudioTrack.play there, then RUNNING). False
+    // when not PARKED or (Y9) a seek park's flush is not yet requested/acked.
     fun unpark(): Boolean {
         parkLock.withLock {
             if (phaseRef.get() != Phase.PARKED) return false
+            if (flushRequested && flushCount == 0) return false
+            if (seekParkRequested && flushCount == 0) return false
             unparkRequested = true
             parkCondition.signalAll()
         }
@@ -450,6 +525,32 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         deadObjectTimestampPollsDuringRecovery = deadObjectTimestampPollsDuringRecovery,
         clockSnapshotsAtDeadObjectRecovery = clockSnapshotsAtDeadObjectRecovery,
         playbackHeadAtDeadObject = playbackHeadAtDeadObject,
+        maxSeekHoldMs = config.maxSeekHoldMs,
+        seekParkCount = seekParkCount,
+        parkHoldCapMs = parkHoldCapMs,
+        flushRequestCount = flushRequestCount,
+        flushCount = flushCount,
+        flushExecutedOnSinkThread = flushExecutedOnSinkThread,
+        flushAckLatencyMs = flushAckLatencyMs,
+        playStateBeforeFlush = playStateBeforeFlush,
+        playStateAfterFlush = playStateAfterFlush,
+        playbackHeadBeforeFlush = playbackHeadBeforeFlush,
+        playbackHeadAfterFlush = playbackHeadAfterFlush,
+        framesWrittenAtFlush = framesWrittenAtFlush,
+        framesReadAtFlush = framesReadAtFlush,
+        drainCallsAtFlush = drainCallsAtFlush,
+        timestampPollsDuringFlush = timestampPollsDuringFlush,
+        postSeekExpectedFrames = postSeekExpectedFrames,
+        readBudgetFrames = readBudgetFrames,
+        seekTargetFrame = seekTargetFrame,
+        seekEpochOpenedAtUnpark = seekEpochOpenedAtUnpark,
+        seekEpochBaseFrame = seekEpochBaseFrame,
+        seekDiscontinuityFrames = seekDiscontinuityFrames,
+        seekEpochOpenAccepted = seekEpochOpenAccepted,
+        seekUnwrapResetAtFlush = seekUnwrapResetAtFlush,
+        epochRawOriginAtUnpark = epochRawOriginAtUnpark,
+        playbackHeadAtSeekUnpark = playbackHeadAtSeekUnpark,
+        postSeekFramesWritten = if (flushCount > 0) framesWrittenToSink - framesWrittenAtFlush else 0L,
     )
 
     // ── Sink thread body ───────────────────────────────────────────────────
@@ -486,6 +587,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             readyLatch.countDown()
             parkAckLatch.countDown()
             unparkAckLatch.countDown()
+            flushAckLatch.countDown()
             exitLatch.countDown()
             try {
                 config.onExited?.invoke(exitReason)
@@ -495,19 +597,16 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
 
     private fun validateConfig() {
         if (config.channelCount != 1 && config.channelCount != 2) throw FailClosed("invalid_channel_count")
-        if (config.maxFramesPerMix <= 0 ||
-            config.maxFramesPerMix > VanguardRealtimePlaybackNativeSession.MAX_FRAMES_PER_MIX_CAP
-        ) {
+        if (config.maxFramesPerMix <= 0 || config.maxFramesPerMix > VanguardRealtimePlaybackNativeSession.MAX_FRAMES_PER_MIX_CAP) {
             throw FailClosed("invalid_max_frames_per_mix")
         }
-        if (config.sampleRate < VanguardRealtimePlaybackNativeSession.MIN_SAMPLE_RATE ||
-            config.sampleRate > VanguardRealtimePlaybackNativeSession.MAX_SAMPLE_RATE
-        ) {
+        if (config.sampleRate < VanguardRealtimePlaybackNativeSession.MIN_SAMPLE_RATE || config.sampleRate > VanguardRealtimePlaybackNativeSession.MAX_SAMPLE_RATE) {
             throw FailClosed("invalid_sample_rate")
         }
         if (config.declaredFrameCount <= 0L) throw FailClosed("invalid_declared_frame_count")
         if (!(config.gain > 0f) || config.gain > 1f) throw FailClosed("invalid_gain")
         if (config.maxPauseHoldMs <= 0L) throw FailClosed("invalid_max_pause_hold")
+        if (config.maxSeekHoldMs <= 0L) throw FailClosed("invalid_max_seek_hold")
         if (config.syntheticDeadObjectInjectAfterFrames < 0L) throw FailClosed("invalid_dead_object_inject_after_frames")
     }
 
@@ -527,9 +626,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         return audioTrack ?: throw FailClosed("audio_track_missing")
     }
 
-    // Builds one AudioTrack from the frozen config parameters; the buffer
-    // request is returned so a replacement can be checked against the
-    // original geometry. Shared by the initial create and the Y8b recreate.
+    // Builds one AudioTrack from the frozen config; returns the buffer request
+    // so a Y8b replacement can be checked against the original geometry.
     private fun buildAudioTrack(): Pair<AudioTrack, Int> {
         val bytesPerFrame = 2 * config.channelCount
         val channelMask = if (config.channelCount == 1) AudioFormat.CHANNEL_OUT_MONO else AudioFormat.CHANNEL_OUT_STEREO
@@ -538,23 +636,12 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         val floorBytes = (TRACK_BUFFER_MARGIN_WINDOWS * config.maxFramesPerMix * bytesPerFrame).toInt()
         val bufferBytes = maxOf(minBytes, floorBytes)
         noteTrackCall()
-        val track = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                    .build()
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .setSampleRate(config.sampleRate)
-                    .setChannelMask(channelMask)
-                    .build()
-            )
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .setBufferSizeInBytes(bufferBytes)
-            .build()
+        val attributes = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build()
+        val format = AudioFormat.Builder()
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(config.sampleRate).setChannelMask(channelMask).build()
+        val track = AudioTrack.Builder().setAudioAttributes(attributes).setAudioFormat(format)
+            .setTransferMode(AudioTrack.MODE_STREAM).setBufferSizeInBytes(bufferBytes).build()
         audioTracksCreated++
         return Pair(track, bufferBytes)
     }
@@ -582,8 +669,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
 
     private fun rawHead(): Long = requireTrack().playbackHeadPosition.toLong() and 0xFFFFFFFFL
 
-    // Mirrors the native drain checksum over exactly the frames handed to
-    // AudioTrack.write; a failed write aborts the run.
+    // Mirrors the native drain checksum over exactly the frames handed to AudioTrack.write.
     private fun accumulateChecksum(buf: ByteBuffer, frames: Int) {
         var c = checksum
         val sampleCount = frames * config.channelCount
@@ -593,12 +679,10 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
 
     // ── Write path (WRITE_NON_BLOCKING, in-place bounded retries) ──────────
 
-    // Arms the ONE synthetic dead object: config seam > 0, never injected
-    // before, sink playing with an open epoch, and at least
-    // syntheticDeadObjectInjectAfterFrames written. Returns true exactly once
-    // per run; the caller then substitutes ERROR_DEAD_OBJECT for the write
-    // result WITHOUT calling AudioTrack.write(). Deterministic by
-    // construction; timestamp/clock outcomes play no part in the decision.
+    // Arms the ONE synthetic dead object (seam > 0, never injected, playing
+    // with an open epoch, >= injectAfterFrames written): true exactly once per
+    // run; the caller substitutes ERROR_DEAD_OBJECT WITHOUT calling write().
+    // Deterministic; timestamp/clock outcomes play no part.
     private fun armSyntheticDeadObject(unwrittenBytes: Int): Boolean {
         val after = config.syntheticDeadObjectInjectAfterFrames
         if (after <= 0L) return false
@@ -621,11 +705,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             checkDeadlineAndCancel()
             val requested = buf.remaining()
             val positionBefore = buf.position()
-            val wrote = if (armSyntheticDeadObject(requested)) {
-                AudioTrack.ERROR_DEAD_OBJECT
-            } else {
-                track.write(buf, requested, AudioTrack.WRITE_NON_BLOCKING)
-            }
+            val wrote =
+                if (armSyntheticDeadObject(requested)) AudioTrack.ERROR_DEAD_OBJECT else track.write(buf, requested, AudioTrack.WRITE_NON_BLOCKING)
             val errorPrefix = if (deadObjectRecoveryCount > 0) "recreated_audio_track" else "audio_track"
             when {
                 wrote > 0 -> {
@@ -653,8 +734,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
                     if (deadObjectObservedCount != 1L) {
                         throw FailClosed("$EXIT_DEAD_OBJECT_REPEATED:$deadObjectObservedCount")
                     }
-                    // Only the armed synthetic dead object is recovered; an
-                    // unarmed (real) dead object fails closed as before.
+                    // Only the armed synthetic dead object is recovered; a real one fails closed.
                     if (deadObjectInjectedCount != 1L) throw FailClosed(EXIT_DEAD_OBJECT)
                     if (buf.position() != positionBefore || buf.remaining() != requested) {
                         throw FailClosed("dead_object_consumed_bytes")
@@ -665,8 +745,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
                     deadObjectFramesReadAtRecovery = framesReadFromTransport
                     deadObjectFramesWrittenBeforeRecovery = framesWrittenToSink
                     deadObjectRemainderFramesExpected = (requested / bytesPerFrame).toLong()
-                    // Recovery on this thread; buffer position/limit are
-                    // untouched so the loop resumes on the same remainder.
+                    // Recovery on this thread; buffer position/limit untouched, same remainder resumes.
                     track = recoverFromSyntheticDeadObject(track)
                     deadObjectResumePending = true
                     consecutiveZero = 0
@@ -675,8 +754,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
             }
         }
         if (deadObjectResumePending) {
-            // Exactly the remainder present at injection landed on the new
-            // instance and the slice total is intact.
+            // Exactly the remainder at injection landed on the new instance; slice total intact.
             deadObjectResumePending = false
             deadObjectRemainderFramesWrittenOnNewTrack = framesWrittenToSink - deadObjectFramesWrittenBeforeRecovery
             deadObjectRemainderAccountingOk =
@@ -693,14 +771,10 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
 
     // ── Y8b: synthetic dead-object recovery (sink thread only) ─────────────
 
-    // Recovery after the armed ERROR_DEAD_OBJECT on [oldTrack]. Everything
-    // runs on this sink thread, inside the write loop, with the drain buffer
-    // untouched. Order: capture epoch/position, close the epoch (accepted),
-    // release the old instance exactly once (own counter), build ONE
-    // same-parameter replacement (STATE_INITIALIZED, same buffer geometry),
-    // reapply gain, play() -> PLAYSTATE_PLAYING, reset the instance
-    // unwrap/rebase state, open epoch+1 at baseFrame = frames written so far
-    // (accepted). No timestamp poll and no transport command happen here.
+    // Recovery after the armed ERROR_DEAD_OBJECT on [oldTrack], entirely on
+    // this sink thread inside the write loop with the drain buffer untouched;
+    // the step order is in the class comment. No timestamp poll and no
+    // transport command happen here.
     private fun recoverFromSyntheticDeadObject(oldTrack: AudioTrack): AudioTrack {
         val recoveryStart = SystemClock.elapsedRealtime()
         deadObjectRecoveryExecutedOnSinkThread = Thread.currentThread().id == threadId
@@ -715,9 +789,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         deadObjectEpochBeforeRecovery = epochBeforeRecovery
         val pollAttemptsAtStart = timestampPollAttempts
 
-        // Step 1: freeze. The last published position, provenance, anchor
-        // age and epoch base are read from ONE (counted) snapshot for
-        // telemetry only; the epoch closes with the dead instance.
+        // Step 1: freeze from ONE (counted) snapshot, telemetry only; the
+        // epoch closes with the dead instance.
         val snap = presentationClock.snapshot()
         clockSnapshotsAtDeadObjectRecovery++
         val positionBeforeRecovery = snap.positionFrames
@@ -725,10 +798,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         deadObjectClockProvenanceAtRecovery = snap.provenance.name
         deadObjectClockLastAgeNsAtRecovery = snap.lastAgeNs
         val framesWrittenAtDeadObject = framesWrittenToSink
-        // Head consumed by the dead instance, converted to a content frame of
-        // the closing epoch with the poll path's unwrap/rebase assumptions
-        // (instance frames minus the epoch origin, on the epoch base). -1 when
-        // the dead instance no longer answers or the conversion is negative.
+        // Head consumed by the dead instance as a content frame of the closing
+        // epoch (poll-path unwrap/rebase); -1 if unanswered or negative.
         var contentHead = -1L
         try {
             val rawHeadAtDeadObject = oldTrack.playbackHeadPosition.toLong() and 0xFFFFFFFFL
@@ -744,9 +815,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         deadObjectEpochCloseAccepted = closeOutcome.accepted
         if (!closeOutcome.accepted) throw FailClosed("dead_object_epoch_close_rejected:${closeOutcome.name.lowercase()}")
 
-        // Step 2: release the old instance exactly once (never the final
-        // releaseCounter). A dead object accepts no control calls, so no
-        // stop/flush precedes release.
+        // Step 2: release the old instance once (never the final releaseCounter);
+        // a dead object accepts no control calls, so no stop/flush precedes it.
         audioTrack = null
         noteTrackCall()
         try {
@@ -789,9 +859,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         if (playState != AudioTrack.PLAYSTATE_PLAYING) throw FailClosed("recreated_audio_track_play_failed:$playState")
         deadObjectNewTrackPlayOk = true
 
-        // Step 6: the new instance's framePosition starts from 0: reset the
-        // unwrap/rebase state, then open epoch+1 based at the frames
-        // written so far (>= last published position, so no clamp).
+        // Step 6: the new instance's framePosition starts from 0: reset unwrap/
+        // rebase, open epoch+1 at frames written so far (>= published, no clamp).
         lastRaw32 = -1L
         wrapOffset = 0L
         epochRawOrigin = 0L
@@ -804,14 +873,12 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         deadObjectBaseFrameAfterRecovery = baseFrame
         val step = baseFrame - positionBeforeRecovery
         deadObjectBaseStepFrames = step
-        // Production fails closed on sign only: the new base may never fall
-        // below the last published position. The step magnitude is publication
-        // lag plus frames lost with the dead instance; neither is a sink fault.
+        // Fails closed on sign only: the new base never falls below the last
+        // published position; the magnitude (lag + lost frames) is no sink fault.
         deadObjectBaseStepBounded = step >= 0L
         if (!deadObjectBaseStepBounded) throw FailClosed("dead_object_base_below_published:$baseFrame:$positionBeforeRecovery")
-        // Proof decomposition (telemetry only): step = (W - H) + (H - P).
-        // W - H is bounded by one track buffer plus one mix window; H - P is
-        // reported for the proof lane's provenance-dependent budget.
+        // Proof decomposition (telemetry only): step = (W - H) + (H - P); W - H
+        // <= one track buffer + one mix window, H - P is the lane's lag budget.
         if (contentHead >= 0L) {
             val writtenAhead = framesWrittenAtDeadObject - contentHead
             deadObjectWrittenAheadOfHeadFrames = writtenAhead
@@ -855,10 +922,9 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         countClockOutcome(presentationClock.epochClosed(epoch, System.nanoTime()))
     }
 
-    // Non-mutating variant for the dead instance's head: applies the wrap
-    // offset already accumulated by the timestamp path and tolerates the
-    // same single forward wrap relative to the last raw frame seen (the last
-    // timestamp raw frame, else [fallbackLastRaw32]). Unwrap state is untouched.
+    // Non-mutating unwrap for the dead instance's head: same accumulated wrap
+    // offset and single-forward-wrap tolerance vs. the last raw frame seen
+    // (else [fallbackLastRaw32]); unwrap state untouched.
     private fun peekUnwrappedInstanceFrame(raw32: Long, fallbackLastRaw32: Long): Long {
         val last = if (lastRaw32 >= 0L) lastRaw32 else fallbackLastRaw32
         var offset = wrapOffset
@@ -879,9 +945,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         return raw32 + wrapOffset
     }
 
-    // The ONE poll point of a productive drain pass, after the write
-    // returned. Telemetry and clock writes only; nothing downstream of this
-    // sink changes because of the result.
+    // The ONE poll point of a productive drain pass, after the write returned.
+    // Telemetry and clock writes only; nothing downstream depends on the result.
     private fun pollTimestampOnce() {
         val epoch = currentEpoch
         if (phaseRef.get() == Phase.PARKED) timestampPollsWhileParked++
@@ -915,12 +980,59 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         }
     }
 
+    // ── Y9 flush (sink thread only, while PARKED on a seek park, once) ─────
+
+    // Runs inside the parked wait under parkLock (request-side fields read
+    // consistently). AudioTrack PAUSED before and after (flush is a no-op
+    // otherwise); unwrap/rebase reset here (C4), read budget rebased (C6).
+    // No timestamp poll and no clock write happen here.
+    private fun flushOnSinkThread(track: AudioTrack) {
+        if (flushCount != 0) throw FailClosed("audio_track_flush_repeated")
+        if (phaseRef.get() != Phase.PARKED) throw FailClosed("audio_track_flush_outside_parked:${phaseRef.get().name.lowercase()}")
+        if (currentEpoch != EPOCH_NONE) throw FailClosed("audio_track_flush_with_open_epoch")
+        val pollAttemptsAtStart = timestampPollAttempts
+        val before = track.playState
+        playStateBeforeFlush = before
+        if (before != AudioTrack.PLAYSTATE_PAUSED) throw FailClosed("audio_track_flush_not_paused:$before")
+        playbackHeadBeforeFlush = rawHead()
+        noteTrackCall()
+        track.flush()
+        playbackHeadAfterFlush = rawHead()
+        val after = track.playState
+        playStateAfterFlush = after
+        if (after != AudioTrack.PLAYSTATE_PAUSED) throw FailClosed("audio_track_flush_changed_play_state:$after")
+        framesWrittenAtFlush = framesWrittenToSink
+        framesReadAtFlush = framesReadFromTransport
+        drainCallsAtFlush = drainCalls
+        readBudgetFrames = framesReadAtFlush + postSeekExpectedFrames
+        // The flushed instance restarts its frame position from 0.
+        lastRaw32 = -1L
+        wrapOffset = 0L
+        epochRawOrigin = 0L
+        seekUnwrapResetAtFlush = true
+        flushExecutedOnSinkThread = Thread.currentThread().id == threadId
+        timestampPollsDuringFlush = timestampPollAttempts - pollAttemptsAtStart
+        val requestedAt = flushRequestedAtMs
+        flushAckLatencyMs = if (requestedAt >= 0L) SystemClock.elapsedRealtime() - requestedAt else -1L
+        flushCount++
+        flushAckLatch.countDown()
+    }
+
     // ── Park / unpark (sink thread only) ───────────────────────────────────
 
+    // Bounded pause park: AudioTrack.pause, ack, wait (maxPauseHoldMs) for
+    // unpark, AudioTrack.play, epoch+1 at the frozen position (instance origin
+    // there). Seek park (Y9): same to the ack; wait capped by maxSeekHoldMs,
+    // the ONE flush runs inside it, unpark opens epoch+1 at T (origin 0).
     private fun parkOnSinkThread() {
         val track = requireTrack()
         if (!played) throw FailClosed("park_before_first_play")
         parkExecutedOnSinkThread = Thread.currentThread().id == threadId
+        val seekPark = seekParkRequested
+        if (seekPark) {
+            if (seekParkCount != 0 || flushCount != 0) throw FailClosed("seek_park_repeated")
+            seekParkCount = 1
+        }
 
         track.pause()
         val pausedState = track.playState
@@ -928,8 +1040,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         if (pausedState != AudioTrack.PLAYSTATE_PAUSED) throw FailClosed("audio_track_pause_failed:$pausedState")
         playbackHeadAtPark = rawHead()
 
-        // Freeze: the last published position becomes the next epoch's base
-        // and its instance-frame origin; the current epoch closes.
+        // Freeze: the published position is the next epoch's base/origin; the epoch closes.
         val snap = presentationClock.snapshot()
         clockSnapshotsAtPark++
         positionAtPark = snap.positionFrames
@@ -943,13 +1054,19 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         phaseRef.set(Phase.PARKED)
         parkAckLatch.countDown()
 
-        val holdCapAtMs = parkedAtMs + config.maxPauseHoldMs
+        val holdCapMs = if (seekPark) config.maxSeekHoldMs else config.maxPauseHoldMs
+        parkHoldCapMs = holdCapMs
+        val holdCapAtMs = parkedAtMs + holdCapMs
+        val holdExceededReason = if (seekPark) EXIT_SEEK_HOLD_EXCEEDED else EXIT_PAUSE_HOLD_EXCEEDED
         parkLock.withLock {
-            while (!unparkRequested) {
+            while (true) {
+                // A requested flush always executes before an unpark is honoured.
+                if (flushRequested && flushCount == 0) flushOnSinkThread(track)
+                if (unparkRequested) break
                 if (isCancelled()) throw FailClosed(EXIT_CANCELLED)
                 val now = SystemClock.elapsedRealtime()
                 if (now > config.deadlineAtMs) throw FailClosed(EXIT_DEADLINE)
-                if (now > holdCapAtMs) throw FailClosed("$EXIT_PAUSE_HOLD_EXCEEDED:${now - parkedAtMs}")
+                if (now > holdCapAtMs) throw FailClosed("$holdExceededReason:${now - parkedAtMs}")
                 try {
                     parkCondition.await(PARK_POLL_MS, TimeUnit.MILLISECONDS)
                 } catch (_: InterruptedException) {
@@ -967,10 +1084,27 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         playStateAfterUnpark = playingState
         unparkExecutedOnSinkThread = Thread.currentThread().id == threadId
         if (playingState != AudioTrack.PLAYSTATE_PLAYING) throw FailClosed("audio_track_resume_play_failed:$playingState")
-        // Same AudioTrack instance, new clock epoch based at the frozen position.
         val nextEpoch = epochClosedAtPark + 1
-        epochRawOrigin = positionAtPark
-        openClockEpoch(nextEpoch, positionAtPark)
+        if (seekPark) {
+            // Same instance, flushed: epoch+1 opens at T, a deliberate
+            // discontinuity from the frozen position, over instance origin 0.
+            if (flushCount != 1) throw FailClosed("seek_unpark_without_flush:$flushCount")
+            val target = seekTargetFrame
+            if (target < 0L) throw FailClosed("seek_unpark_without_target")
+            if (target < positionAtPark) throw FailClosed("seek_target_below_position_at_park:$target:$positionAtPark")
+            playbackHeadAtSeekUnpark = playbackHeadAtUnpark
+            epochRawOrigin = 0L
+            val outcome = openClockEpoch(nextEpoch, target)
+            seekEpochOpenAccepted = outcome.accepted
+            seekEpochOpenedAtUnpark = nextEpoch
+            seekEpochBaseFrame = target
+            seekDiscontinuityFrames = target - positionAtPark
+        } else {
+            // Same AudioTrack instance, new clock epoch based at the frozen position.
+            epochRawOrigin = positionAtPark
+            openClockEpoch(nextEpoch, positionAtPark)
+        }
+        epochRawOriginAtUnpark = epochRawOrigin
         epochOpenedAtUnpark = nextEpoch
         val now = SystemClock.elapsedRealtime()
         parkedHoldMs = now - parkedAtMs
@@ -988,6 +1122,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         val drainBuffer = ByteBuffer.allocateDirect(drainFrames * bytesPerFrame).order(ByteOrder.nativeOrder())
         val maxProductiveDrains = (config.declaredFrameCount / drainFrames + 1L) * DRAIN_ITERATION_SLACK +
             DRAIN_ITERATION_MARGIN
+        // C6: read budget = declared until a seek flush rebases it.
+        readBudgetFrames = config.declaredFrameCount
         lastProgressMs = SystemClock.elapsedRealtime()
         while (true) {
             checkDeadlineAndCancel()
@@ -1005,8 +1141,8 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
                 if (framesRead > drainFrames) throw FailClosed("drain_overflow:$framesRead")
                 if (reply.bytesRead != framesRead.toLong() * bytesPerFrame) throw FailClosed("drain_bytes_read_mismatch:${reply.bytesRead}")
                 if (++productiveDrainPasses > maxProductiveDrains) throw FailClosed("drain_iteration_budget_exhausted")
-                if (framesReadFromTransport + framesRead > config.declaredFrameCount) {
-                    throw FailClosed("drain_exceeds_declared:${framesReadFromTransport + framesRead}")
+                if (framesReadFromTransport + framesRead > readBudgetFrames) {
+                    throw FailClosed("drain_exceeds_read_budget:${framesReadFromTransport + framesRead}:$readBudgetFrames")
                 }
                 accumulateChecksum(drainBuffer, framesRead)
                 framesReadFromTransport += framesRead
@@ -1018,8 +1154,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
                     initialPlayState = state
                     if (state != AudioTrack.PLAYSTATE_PLAYING) throw FailClosed("audio_track_initial_play_failed:$state")
                     played = true
-                    // Epoch 0 opens only now: play succeeded on the first
-                    // productive post-start write.
+                    // Epoch 0 opens only now: play succeeded on the first productive write.
                     epochRawOrigin = 0L
                     openClockEpoch(0, 0L)
                 }
@@ -1045,8 +1180,7 @@ class VanguardRealtimeAudioPlaybackSinkBridge(private val config: Config) {
         if (!played) throw FailClosed("no_frames_written_to_sink")
     }
 
-    // Sink thread; exactly once on every exit path. The field is nulled
-    // first so a throwing release is never retried.
+    // Sink thread; exactly once on every exit path. Nulled first so a throwing release is never retried.
     private fun releaseAudioTrackOnce() {
         val track = audioTrack ?: return
         audioTrack = null

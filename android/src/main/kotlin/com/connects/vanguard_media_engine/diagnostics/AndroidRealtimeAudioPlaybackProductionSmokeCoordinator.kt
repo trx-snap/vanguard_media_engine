@@ -12,13 +12,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Android True-DAG P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a) +
- * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b):
+ * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b) +
+ * P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK (Y9):
  * production-component diagnostic smoke coordinator.
  *
  * Owns the [METHOD_NAME] MethodChannel route only. It drives the PRODUCTION
  * [VanguardRealtimeAudioPlaybackSession] (real MediaExtractor/MediaCodec ->
  * Y5a external ingest -> Y1 transport -> sink-thread-owned non-zero-gain
- * AudioTrack + presentation clock) through three scenarios on a worker
+ * AudioTrack + presentation clock) through four scenarios on a worker
  * thread, evaluates proof lanes from the session's snapshots, posts the
  * payload on the main handler and logs the START / JSON / PASS / FAIL
  * markers. Every lifecycle decision lives in the session; this class only
@@ -29,6 +30,20 @@ import java.util.concurrent.atomic.AtomicBoolean
  * baseline scenarios run with the seam off. The synthetic injection proves
  * the recovery sequence only; a real OS dead object is not forced here and
  * fails closed in the sink by construction.
+ *
+ * Scenario 4 (Y9) arms the session's ONE forward mid-stream seek to
+ * [SmokeConfig.seekTargetSec] (dead-object seam off): the session executes
+ * the whole seek order on its own (feed held at the window-aligned hold
+ * frame H, quiescence, sink seek park, transport pause, AudioTrack.flush
+ * once on the sink thread, transport seek, decoder re-anchor with the
+ * deliberate stale-generation probe, post-seek pre-roll while PAUSED, sink
+ * unpark opening the seek clock epoch at T, transport resume) and plays to
+ * EOS; the lanes assert H + (declared - T) accounting, checksum identity
+ * over the accepted sequence, and the seek clock epoch discontinuity.
+ * Cancel/dispose during a seek is served by the existing fail-closed cancel
+ * wake-ups and is not a proof lane here; neither is the session's
+ * repeated-seek rejection guard, which the smoke never exercises. Seek
+ * metric flattening lives in [AndroidRealtimeAudioPlaybackProductionSeekMetrics].
  */
 class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
     private val mainHandler: Handler,
@@ -48,15 +63,24 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 "bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_" +
                 "synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_" +
                 "real_or_repeated_dead_object_fails_closed_" +
-                "stop_dispose_release_once_no_seek_" +
+                "one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_" +
+                "audiotrack_flush_once_on_sink_thread_before_transport_seek_" +
+                "seek_clock_epoch_based_at_target_deliberate_discontinuity_" +
+                "stale_generation_rejected_before_jni_no_repeated_seek_" +
+                "stop_dispose_release_once_" +
                 "no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni"
 
         const val SCENARIO_PLAYTHROUGH = "PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS"
         const val SCENARIO_STOP_DISPOSE = "STOP_DISPOSE_MID_PLAYBACK"
         const val SCENARIO_DEAD_OBJECT_RECOVERY = "SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS"
+        const val SCENARIO_FORWARD_SEEK = "SCENARIO_FORWARD_SEEK_TO_EOS"
 
         const val DEFAULT_PAUSE_HOLD_MS = 400L
         const val DEFAULT_STOP_AFTER_MS = 300L
+        // Y9 seek defaults: target inside the 3 s default clip window; the
+        // hold frame is preSeekHoldWindows windows past the pre-roll.
+        const val DEFAULT_SEEK_TARGET_SEC = 1.5
+        const val DEFAULT_PRE_SEEK_HOLD_WINDOWS = VanguardRealtimeAudioPlaybackSession.DEFAULT_PRE_SEEK_HOLD_WINDOWS
         // Frames written before the ONE synthetic dead object is armed
         // (~186 ms at 44.1 kHz); must stay below the clip's declared frames.
         const val DEFAULT_DEAD_OBJECT_INJECT_AFTER_FRAMES = 8_192L
@@ -89,6 +113,14 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_DEAD_OBJECT_RECOVERY = "syntheticDeadObjectRecoveryOk"
         const val LANE_DEAD_OBJECT_CLOCK_EPOCH = "deadObjectClockEpochRebaseOk"
         const val LANE_DEAD_OBJECT_REMAINDER = "deadObjectRemainderAccountingOk"
+        // Y9 lanes, evaluated by the forward-seek scenario only.
+        const val LANE_SEEK_QUIESCE_ACCOUNTING = "seekQuiesceAccountingOk"
+        const val LANE_SEEK_COMMAND = "seekCommandOk"
+        const val LANE_SINK_FLUSH_AT_SEEK = "sinkFlushAtSeekOk"
+        const val LANE_DECODER_SEEK_REANCHOR = "decoderSeekReanchorOk"
+        const val LANE_STALE_GENERATION_REJECTED = "staleGenerationRejectedOk"
+        const val LANE_SEEK_CLOCK_EPOCH = "seekClockEpochOk"
+        const val LANE_POST_SEEK_DRAIN = "postSeekDrainOk"
         const val LANE_CANONICAL = "canonical"
 
         val REQUIRED_LANES: List<String> = listOf(
@@ -99,6 +131,9 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_TRANSPORT_DISPOSED, LANE_AUDIO_TRACK_RELEASED_ONCE, LANE_THREAD_OWNERSHIP,
             LANE_NO_FEEDBACK, LANE_PROOF_BOUNDARY,
             LANE_DEAD_OBJECT_RECOVERY, LANE_DEAD_OBJECT_CLOCK_EPOCH, LANE_DEAD_OBJECT_REMAINDER,
+            LANE_SEEK_QUIESCE_ACCOUNTING, LANE_SEEK_COMMAND, LANE_SINK_FLUSH_AT_SEEK,
+            LANE_DECODER_SEEK_REANCHOR, LANE_STALE_GENERATION_REJECTED, LANE_SEEK_CLOCK_EPOCH,
+            LANE_POST_SEEK_DRAIN,
         )
 
         val PROOF_BOUNDARY_TOKENS = listOf(
@@ -106,8 +141,13 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "y1_transport", "nonzero_gain_audiotrack", "sink_thread_owned_audiotrack_and_presentation_clock",
             "bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position",
             "synthetic_armed_dead_object_recovered_once_on_sink_thread", "same_parameter_audiotrack", "epoch_rebase",
-            "real_or_repeated_dead_object_fails_closed", "stop_dispose_release_once",
-            "no_seek", "no_product", "no_editor", "no_app", "no_connectsapp", "no_ios",
+            "real_or_repeated_dead_object_fails_closed",
+            "one_forward_mid_stream_seek_while_paused", "feed_held_at_window_aligned_anchor_quiescent",
+            "audiotrack_flush_once_on_sink_thread_before_transport_seek",
+            "seek_clock_epoch_based_at_target_deliberate_discontinuity",
+            "stale_generation_rejected_before_jni", "no_repeated_seek",
+            "stop_dispose_release_once",
+            "no_product", "no_editor", "no_app", "no_connectsapp", "no_ios",
             "no_streaming", "no_cache", "no_cpp", "no_jni",
         )
 
@@ -165,6 +205,10 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             stopAfterMs = (args["stopAfterMs"] as? Number)?.toLong() ?: DEFAULT_STOP_AFTER_MS,
             deadObjectInjectAfterFrames = (args["deadObjectInjectAfterFrames"] as? Number)?.toLong()
                 ?: DEFAULT_DEAD_OBJECT_INJECT_AFTER_FRAMES,
+            seekTargetSec = (args["seekTargetSec"] as? Number)?.toDouble() ?: DEFAULT_SEEK_TARGET_SEC,
+            preSeekHoldWindows = (args["preSeekHoldWindows"] as? Number)?.toInt() ?: DEFAULT_PRE_SEEK_HOLD_WINDOWS,
+            maxSeekHoldMs = (args["maxSeekHoldMs"] as? Number)?.toLong()
+                ?: VanguardRealtimeAudioPlaybackSession.DEFAULT_MAX_SEEK_HOLD_MS,
         )
         runSmoke(config, result)
         return true
@@ -210,14 +254,26 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "maxPauseHoldMs" to config.maxPauseHoldMs,
             "stopAfterMs" to config.stopAfterMs,
             "deadObjectInjectAfterFrames" to config.deadObjectInjectAfterFrames,
+            "seekTargetSec" to config.seekTargetSec,
+            "preSeekHoldWindows" to config.preSeekHoldWindows,
+            "maxSeekHoldMs" to config.maxSeekHoldMs,
             "coordinatorThreadId" to Thread.currentThread().id,
         )
-        val outcomes = ArrayList<ScenarioOutcome>(3)
+        val outcomes = ArrayList<ScenarioOutcome>(4)
         if (config.pauseHoldMs <= 0L || config.pauseHoldMs >= config.maxPauseHoldMs) {
             return buildPayload(false, "invalid_pause_hold:${config.pauseHoldMs}:${config.maxPauseHoldMs}", emptyList(), metrics)
         }
         if (config.deadObjectInjectAfterFrames <= 0L) {
             return buildPayload(false, "invalid_dead_object_inject_after_frames:${config.deadObjectInjectAfterFrames}", emptyList(), metrics)
+        }
+        if (!(config.seekTargetSec > 0.0) || config.seekTargetSec >= config.maxDurationSec) {
+            return buildPayload(false, "invalid_seek_target:${config.seekTargetSec}:${config.maxDurationSec}", emptyList(), metrics)
+        }
+        if (config.preSeekHoldWindows <= 0 || config.preSeekHoldWindows > VanguardRealtimeAudioPlaybackSession.MAX_PRE_SEEK_HOLD_WINDOWS) {
+            return buildPayload(false, "invalid_pre_seek_hold_windows:${config.preSeekHoldWindows}", emptyList(), metrics)
+        }
+        if (config.maxSeekHoldMs <= 0L || config.maxSeekHoldMs >= config.deadlineMs) {
+            return buildPayload(false, "invalid_max_seek_hold:${config.maxSeekHoldMs}:${config.deadlineMs}", emptyList(), metrics)
         }
         // Y8a baseline scenarios run with the dead-object seam OFF.
         outcomes += runScenario(SCENARIO_PLAYTHROUGH, config, injectAfterFrames = 0L) { session, outcome ->
@@ -232,6 +288,11 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         outcomes += runScenario(SCENARIO_DEAD_OBJECT_RECOVERY, config, injectAfterFrames = config.deadObjectInjectAfterFrames) { session, outcome ->
             deadObjectRecoveryScenario(session, config, outcome)
         }
+        if (disposed.get()) return buildPayload(false, "coordinator_disposed", outcomes, metrics)
+        // Y9: the ONE forward seek is armed for this scenario only (seam off).
+        outcomes += runScenario(SCENARIO_FORWARD_SEEK, config, injectAfterFrames = 0L, seekTargetSec = config.seekTargetSec) { session, outcome ->
+            forwardSeekScenario(session, config, outcome)
+        }
 
         val lanes = AndroidRealtimeAudioPlaybackProductionLaneEvaluator.aggregateLanes(outcomes)
         val firstFailure = outcomes.firstOrNull { it.failureReason.isNotBlank() }?.let { "${it.name}:${it.failureReason}" } ?: ""
@@ -244,6 +305,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         name: String,
         config: SmokeConfig,
         injectAfterFrames: Long,
+        seekTargetSec: Double = 0.0,
         body: (VanguardRealtimeAudioPlaybackSession, ScenarioOutcome) -> Unit,
     ): ScenarioOutcome {
         val outcome = ScenarioOutcome(name)
@@ -257,9 +319,13 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 maxPauseHoldMs = config.maxPauseHoldMs,
                 threadNamePrefix = "Y8a$name",
                 syntheticDeadObjectInjectAfterFrames = injectAfterFrames,
+                seekTargetSec = seekTargetSec,
+                preSeekHoldWindows = config.preSeekHoldWindows,
+                maxSeekHoldMs = config.maxSeekHoldMs,
             ),
         )
         outcome.metrics["deadObjectInjectAfterFrames"] = injectAfterFrames
+        outcome.metrics["seekTargetSecArmed"] = seekTargetSec
         activeSession = session
         val wallStart = SystemClock.elapsedRealtime()
         try {
@@ -347,6 +413,32 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         val final = session.snapshot()
         AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateCommon(final, deadObjectExpectation, out, Thread.currentThread().id)
         AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateDeadObjectRecovery(final, afterRecovery, stateAtCompletion, config, out)
+    }
+
+    // ── Scenario 4 (Y9): load/start (seek armed) -> ONE forward seek to T
+    //    executed by the session -> EOS ───────────────────────────────────
+
+    private fun forwardSeekScenario(session: VanguardRealtimeAudioPlaybackSession, config: SmokeConfig, out: ScenarioOutcome) {
+        startAndAwaitAudio(session)
+        val armed = session.snapshot()
+        val arm = armed.seek
+        require(arm.armed && arm.admissionOk && arm.holdPinned && arm.targetFrame > 0L && arm.holdFrame > 0L,
+            "seek_not_armed:${arm.armed}:${arm.admissionOk}:${arm.holdPinned}:${arm.targetFrame}:${arm.holdFrame}")
+        val seekRes = session.seek(arm.targetFrame)
+        require(seekRes.accepted && seekRes.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING, "seek_rejected:${seekRes.reason}")
+        val afterSeek = session.snapshot()
+        require(afterSeek.failureReason.isBlank(), "failure_after_seek:${afterSeek.failureReason}")
+        // ONE forward seek is the proof lane; the session's repeated-seek
+        // rejection guard is a non-claim here and is deliberately not exercised.
+        require(session.awaitCompletion(config.deadlineMs), "completion_not_reached:${session.failureReason}")
+        val stateAtCompletion = session.currentState
+        val stopRes = session.stop()
+        require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
+        session.dispose()
+        session.dispose()
+        val final = session.snapshot()
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateCommon(final, baselineExpectation, out, Thread.currentThread().id)
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateForwardSeek(final, afterSeek, stateAtCompletion, config, out)
     }
 
     // ── Scenario 2: load/start -> stop/dispose before EOS ──────────────────
@@ -546,6 +638,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             m["deadObjectTimestampPollsDuringRecovery"] = k.deadObjectTimestampPollsDuringRecovery
             m["sinkClockSnapshotsAtDeadObjectRecovery"] = k.clockSnapshotsAtDeadObjectRecovery
             m["playbackHeadAtDeadObject"] = k.playbackHeadAtDeadObject
+            AndroidRealtimeAudioPlaybackProductionSeekMetrics.putSinkSeekMetrics(m, k)
         }
         if (c != null) {
             m["clockConsistent"] = c.consistent
@@ -583,6 +676,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             m["clockEpochBaseAfterResume"] = it.epochBaseOffsetFrames
             m["clockPositionAfterResume"] = it.positionFrames
         }
+        AndroidRealtimeAudioPlaybackProductionSeekMetrics.putSessionSeekMetrics(m, s.seek)
         return m
     }
 
@@ -611,7 +705,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "proofBoundary" to PROOF_BOUNDARY,
             "nativeProofBoundary" to PROOF_BOUNDARY,
             "failureReason" to reason,
-            "details" to "Y8a/Y8b realtime audio playback production sink/clock/dead-object smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
+            "details" to "Y8a/Y8b/Y9 realtime audio playback production sink/clock/dead-object/seek smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
             "lanes" to lanes,
             "metrics" to metricMap,
             "lastError" to if (pass) null else reason,

@@ -1,14 +1,15 @@
 // android_realtime_audio_playback_production_physical_smoke.dart
 // vanguard_media_engine - P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SINK-CLOCK (Y8a) +
-// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, and dead-object diagnostic physical smoke target.
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT (Y8b) +
+// P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK (Y9): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, and forward-seek diagnostic physical smoke target.
 //
 // Component diagnostic smoke: drives production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
 // sink-thread-owned non-zero-gain AudioTrack + presentation clock).
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_stop_dispose_release_once_no_seek_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_no_repeated_seek_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
 //
 // Honest operational non-claims:
 //   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
@@ -16,6 +17,8 @@
 //     instance.
 //   - 300 ms publication lag is device observability budget, not latency/SLA.
 //   - Checksum identity is over frames handed to write, not frames audibly presented.
+//   - Forward seek exercises ONE forward seek while paused; repeated seek rejection
+//     is guarded in production session and fail-closed but not claimed in this smoke.
 //
 // This is a component diagnostic smoke. It must not claim
 // product/editor/UI/ConnectsApp/iOS/streaming/cache/CPP/JNI proof.
@@ -54,7 +57,7 @@ class AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp
 class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     extends State<AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp> {
   String _status =
-      'Running Android DAG Phase 4 Realtime Audio Playback Production Sink, Clock & Dead-Object smoke...';
+      'Running Android DAG Phase 4 Realtime Audio Playback Production Sink, Clock, Dead-Object & Forward-Seek smoke...';
 
   @override
   void initState() {
@@ -141,6 +144,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
             pauseHoldMs: 400,
             stopAfterMs: 300,
             deadObjectInjectAfterFrames: 8192,
+            seekTargetSec: 1.5,
+            preSeekHoldWindows: 64,
+            maxSeekHoldMs: 15000,
             timeout: const Duration(seconds: 40),
           );
     } on TimeoutException catch (te) {
@@ -221,6 +227,19 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print(
       '  [LANE] deadObjectRemainderAccountingOk: ${activeReport.deadObjectRemainderAccountingOk}',
     );
+    print(
+      '  [LANE] seekQuiesceAccountingOk: ${activeReport.seekQuiesceAccountingOk}',
+    );
+    print('  [LANE] seekCommandOk: ${activeReport.seekCommandOk}');
+    print('  [LANE] sinkFlushAtSeekOk: ${activeReport.sinkFlushAtSeekOk}');
+    print(
+      '  [LANE] decoderSeekReanchorOk: ${activeReport.decoderSeekReanchorOk}',
+    );
+    print(
+      '  [LANE] staleGenerationRejectedOk: ${activeReport.staleGenerationRejectedOk}',
+    );
+    print('  [LANE] seekClockEpochOk: ${activeReport.seekClockEpochOk}');
+    print('  [LANE] postSeekDrainOk: ${activeReport.postSeekDrainOk}');
     print('  [LANE] canonical: ${activeReport.canonical}');
 
     // 4. Print key metrics needed for human/Codex review.
@@ -234,6 +253,7 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     const playthroughScenarioKey = 'PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS';
     const stopDisposeScenarioKey = 'STOP_DISPOSE_MID_PLAYBACK';
     const deadObjectScenarioKey = 'SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS';
+    const forwardSeekScenarioKey = 'SCENARIO_FORWARD_SEEK_TO_EOS';
 
     final topMetrics = activeReport.metrics;
     final playthroughMetrics = asStringKeyedMap(
@@ -244,6 +264,9 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     );
     final deadObjectMetrics = asStringKeyedMap(
       topMetrics[deadObjectScenarioKey],
+    );
+    final forwardSeekMetrics = asStringKeyedMap(
+      topMetrics[forwardSeekScenarioKey],
     );
 
     const deadObjectScenarioOwnedKeys = <String>{
@@ -287,22 +310,86 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       'playbackHeadAtDeadObject',
     };
 
+    const forwardSeekScenarioOwnedKeys = <String>{
+      'seekTargetSecArmed',
+      'seekTargetFrame',
+      'preSeekHoldFrame',
+      'seekAdmissionOk',
+      'seekHoldPinned',
+      'seekCount',
+      'seekAccepted',
+      'seekStaleGeneration',
+      'seekGeneration',
+      'seekPauseAccepted',
+      'seekPauseGeneration',
+      'seekResumeAccepted',
+      'seekResumeGeneration',
+      'seekQuiesceFeedHeld',
+      'seekQuiesceSinkReadFrames',
+      'seekQuiesceSinkWrittenFrames',
+      'seekQuiesceAccountingOk',
+      'seekFlushRequestedWhilePaused',
+      'seekFlushAckedBeforeSeek',
+      'sinkFlushRequestCount',
+      'sinkFlushCount',
+      'sinkFlushExecutedOnSinkThread',
+      'sinkSeekParkCount',
+      'sinkSeekTargetFrame',
+      'sinkSeekEpochOpenedAtUnpark',
+      'sinkSeekEpochBaseFrame',
+      'sinkSeekDiscontinuityFrames',
+      'sinkSeekEpochOpenAccepted',
+      'decoderHoldFrame',
+      'decoderHeldAtHoldFrame',
+      'decoderAnchorFrame',
+      'decoderSeekReanchorCount',
+      'decoderReanchorOk',
+      'decoderReanchorExecutedOnDecodeThread',
+      'decoderPreSeekAcceptedFrames',
+      'decoderSeekTargetFrame',
+      'decoderStaleProbeCalls',
+      'decoderStaleProbeRejected',
+      'decoderStaleProbeReplyNull',
+      'decoderStaleProbeAnchorUntouched',
+      'decoderPostSeekAcceptedFrames',
+      'expectedTotalFrames',
+      'postSeekExpectedFrames',
+      'decoderLandingOk',
+      'decoderGapPolicyOk',
+    };
+
     bool isDeadObjectOwnedMetric(String key) {
       return key.startsWith('deadObject') ||
           deadObjectScenarioOwnedKeys.contains(key);
     }
 
+    bool isForwardSeekOwnedMetric(String key) {
+      return key.startsWith('seek') ||
+          key.startsWith('decoderSeek') ||
+          key.startsWith('sinkSeek') ||
+          forwardSeekScenarioOwnedKeys.contains(key);
+    }
+
     Object? lookupMetric(String key) {
+      if (isForwardSeekOwnedMetric(key)) {
+        return forwardSeekMetrics[key] ??
+            topMetrics[key] ??
+            playthroughMetrics[key] ??
+            stopDisposeMetrics[key] ??
+            deadObjectMetrics[key];
+      }
       if (isDeadObjectOwnedMetric(key)) {
         return deadObjectMetrics[key] ??
             playthroughMetrics[key] ??
             stopDisposeMetrics[key] ??
+            forwardSeekMetrics[key] ??
             topMetrics[key];
       }
       return topMetrics[key] ??
           playthroughMetrics[key] ??
           stopDisposeMetrics[key] ??
-          deadObjectMetrics[key];
+          deadObjectMetrics[key] ??
+          forwardSeekMetrics[key];
     }
 
     Map<String, Object?> extractCompactScenario(
@@ -413,6 +500,34 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
           'failureReason',
         ]);
 
+    final compactForwardSeek =
+        extractCompactScenario(forwardSeekMetrics, const <String>[
+          'seekTargetSecArmed',
+          'seekTargetFrame',
+          'preSeekHoldFrame',
+          'seekAdmissionOk',
+          'seekHoldPinned',
+          'seekCount',
+          'seekAccepted',
+          'seekGeneration',
+          'seekQuiesceAccountingOk',
+          'seekFlushAckedBeforeSeek',
+          'sinkFlushCount',
+          'sinkFlushExecutedOnSinkThread',
+          'sinkSeekParkCount',
+          'sinkSeekEpochOpenedAtUnpark',
+          'sinkSeekDiscontinuityFrames',
+          'decoderReanchorOk',
+          'decoderStaleProbeRejected',
+          'expectedTotalFrames',
+          'postSeekExpectedFrames',
+          'decoderLandingOk',
+          'decoderGapPolicyOk',
+          'stateAtCompletion',
+          'scenarioWallMs',
+          'failureReason',
+        ]);
+
     print('--- METRICS ---');
     print('  [METRIC] sourceMime: ${lookupMetric('sourceMime')}');
     print('  [METRIC] sampleRate: ${lookupMetric('sampleRate')}');
@@ -479,12 +594,33 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     print(
       '  [METRIC] deadObjectClockProvenanceAtRecovery: ${lookupMetric('deadObjectClockProvenanceAtRecovery')}',
     );
+    print('  [METRIC] seekTargetSec: ${lookupMetric('seekTargetSec')}');
+    print(
+      '  [METRIC] preSeekHoldWindows: ${lookupMetric('preSeekHoldWindows')}',
+    );
+    print('  [METRIC] maxSeekHoldMs: ${lookupMetric('maxSeekHoldMs')}');
+    print('  [METRIC] seekTargetFrame: ${lookupMetric('seekTargetFrame')}');
+    print('  [METRIC] preSeekHoldFrame: ${lookupMetric('preSeekHoldFrame')}');
+    print('  [METRIC] seekCount: ${lookupMetric('seekCount')}');
+    print('  [METRIC] seekAccepted: ${lookupMetric('seekAccepted')}');
+    print('  [METRIC] sinkFlushCount: ${lookupMetric('sinkFlushCount')}');
+    print('  [METRIC] decoderReanchorOk: ${lookupMetric('decoderReanchorOk')}');
+    print(
+      '  [METRIC] decoderStaleProbeRejected: ${lookupMetric('decoderStaleProbeRejected')}',
+    );
+    print(
+      '  [METRIC] expectedTotalFrames: ${lookupMetric('expectedTotalFrames')}',
+    );
+    print(
+      '  [METRIC] postSeekExpectedFrames: ${lookupMetric('postSeekExpectedFrames')}',
+    );
     print('  [METRIC] failureReason: ${activeReport.failureReason}');
     print('  [METRIC] lastError: ${activeReport.lastError}');
     print('--- SCENARIO METRICS ---');
     print('  [SCENARIO] $playthroughScenarioKey: $compactPlaythrough');
     print('  [SCENARIO] $stopDisposeScenarioKey: $compactStopDispose');
     print('  [SCENARIO] $deadObjectScenarioKey: $compactDeadObject');
+    print('  [SCENARIO] $forwardSeekScenarioKey: $compactForwardSeek');
 
     // 5. Verification evaluation.
     final pass =
@@ -498,13 +634,14 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       playthroughScenarioKey: compactPlaythrough,
       stopDisposeScenarioKey: compactStopDispose,
       deadObjectScenarioKey: compactDeadObject,
+      forwardSeekScenarioKey: compactForwardSeek,
     };
 
     // 6. Print JSON marker with compact JSON payload.
     final summaryPayload = <String, dynamic>{
       'unit': 'AndroidRealtimeAudioPlaybackProductionPhysicalSmokeHarness',
-      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-DEAD-OBJECT',
-      'subSlice': 'Y8b',
+      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-SEEK',
+      'subSlice': 'Y9',
       'target':
           VGRealtimeAudioPlaybackProductionSmokeReport.proofBoundaryConstant,
       'selectedFixture': selectedFixturePath,
@@ -562,6 +699,18 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
         'deadObjectClockProvenanceAtRecovery': lookupMetric(
           'deadObjectClockProvenanceAtRecovery',
         ),
+        'seekTargetSec': lookupMetric('seekTargetSec'),
+        'preSeekHoldWindows': lookupMetric('preSeekHoldWindows'),
+        'maxSeekHoldMs': lookupMetric('maxSeekHoldMs'),
+        'seekTargetFrame': lookupMetric('seekTargetFrame'),
+        'preSeekHoldFrame': lookupMetric('preSeekHoldFrame'),
+        'seekCount': lookupMetric('seekCount'),
+        'seekAccepted': lookupMetric('seekAccepted'),
+        'sinkFlushCount': lookupMetric('sinkFlushCount'),
+        'decoderReanchorOk': lookupMetric('decoderReanchorOk'),
+        'decoderStaleProbeRejected': lookupMetric('decoderStaleProbeRejected'),
+        'expectedTotalFrames': lookupMetric('expectedTotalFrames'),
+        'postSeekExpectedFrames': lookupMetric('postSeekExpectedFrames'),
       },
       'error': topLevelError,
     };

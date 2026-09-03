@@ -17,8 +17,21 @@ import java.util.concurrent.atomic.AtomicLong
 //     seqlock-style sequence counter (odd = write in flight). The writer
 //     allocates nothing in steady state (enum tokens are preallocated, all
 //     state is primitive); the reader allocates its own Snapshot.
-//   - epoch model = AudioTrack instance (Y7: epoch 0 = initial play, epoch 1
-//     = synthetic dead-object recreation). No seek / flush reanchor exists.
+//   - epoch model = one writer-declared segment of AudioTrack instance
+//     frames with its own base offset (Y7: epoch 0 = initial play, epoch 1
+//     = synthetic dead-object recreation; Y8a: a bounded pause closes the
+//     epoch and reopens epoch+1 based at the last published position; Y9:
+//     one forward seek closes the epoch at the park, the writer flushes the
+//     instance and reopens epoch+1 based at the seek target, a deliberate
+//     base-offset discontinuity the writer publishes as telemetry). The
+//     clock itself has no seek/flush/reanchor API: every base comes from
+//     the writer through [epochOpened], and a base below the published
+//     position is still clamped and counted, never trusted. A base AHEAD
+//     of the published position is published immediately as the epoch's
+//     opening position (a deliberate, counted forward discontinuity: the
+//     writer declared that instance frame 0 of the new epoch maps to
+//     `base`, so the position can never be below it); a base equal to the
+//     published position (Y8a pause reopen) changes nothing.
 //   - per epoch the unsigned-32 framePosition is unwrapped (one positive
 //     wrap tolerated, strict regression fails closed via
 //     [Outcome.REJECTED_FRAME_REGRESSION] and latches the FAULTED state).
@@ -113,6 +126,8 @@ class VanguardRealtimePlaybackPresentationClock(
         val rejectedCount: Long,
         val anchorClampCount: Long,
         val baseClampCount: Long,
+        val baseAdvanceCount: Long,
+        val lastBaseAdvanceFrames: Long,
         val negativeAgeCount: Long,
         val nanoTimeNonMonotonicCount: Long,
         val maxExtrapolatedAgeNs: Long,
@@ -173,6 +188,9 @@ class VanguardRealtimePlaybackPresentationClock(
     @Volatile private var rejectedCount = 0L
     @Volatile private var anchorClampCount = 0L
     @Volatile private var baseClampCount = 0L
+    // Epoch opens whose base was ahead of the published position (Y9 seek).
+    @Volatile private var baseAdvanceCount = 0L
+    @Volatile private var lastBaseAdvanceFrames = 0L
     @Volatile private var negativeAgeCount = 0L
     @Volatile private var nanoTimeNonMonotonicCount = 0L
     @Volatile private var maxExtrapolatedAgeNs = -1L
@@ -238,7 +256,12 @@ class VanguardRealtimePlaybackPresentationClock(
     // Opens [epoch] with the continuous-frame base offset [baseFrame] (the
     // caller's stream position at the open, e.g. frames written to the sink
     // so far). Epochs must be strictly increasing; a base below the last
-    // published position is clamped up (monotonic guarantee) and counted.
+    // published position is clamped up (monotonic guarantee) and counted; a
+    // base ahead of it is published at once as the epoch's opening position
+    // (forward discontinuity, counted in baseAdvanceCount) so a reader sees
+    // the writer-declared position (e.g. the Y9 seek target) before the
+    // first anchor of the epoch lands. Provenance is RESET either way: the
+    // opening position is declared by the writer, not measured.
     fun epochOpened(epoch: Int, baseFrame: Long, nowNs: Long): Outcome {
         if (!onWriterThread()) return Outcome.REJECTED_OFF_WRITER_THREAD
         val s = beginPublish()
@@ -248,9 +271,14 @@ class VanguardRealtimePlaybackPresentationClock(
         if (epoch <= epochId) return endPublish(s, Outcome.REJECTED_EPOCH_ORDER)
         if (baseFrame < 0L) return endPublish(s, Outcome.REJECTED_BASE_INVALID)
         var base = baseFrame
-        if (base < positionFrames) {
-            base = positionFrames
+        val current = positionFrames
+        if (base < current) {
+            base = current
             baseClampCount++
+        } else if (base > current) {
+            baseAdvanceCount++
+            lastBaseAdvanceFrames = base - current
+            publishPosition(base, isAnchor = false)
         }
         epochId = epoch
         epochOpen = true
@@ -449,6 +477,8 @@ class VanguardRealtimePlaybackPresentationClock(
             rejectedCount = rejectedCount,
             anchorClampCount = anchorClampCount,
             baseClampCount = baseClampCount,
+            baseAdvanceCount = baseAdvanceCount,
+            lastBaseAdvanceFrames = lastBaseAdvanceFrames,
             negativeAgeCount = negativeAgeCount,
             nanoTimeNonMonotonicCount = nanoTimeNonMonotonicCount,
             maxExtrapolatedAgeNs = maxExtrapolatedAgeNs,
