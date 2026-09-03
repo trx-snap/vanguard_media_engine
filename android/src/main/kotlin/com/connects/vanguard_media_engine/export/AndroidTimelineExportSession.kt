@@ -111,6 +111,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         val trimEnd: Double,
         val mediaKind: String,
         val colorMatrix: FloatArray? = null,
+        val beautyIntensity: Double? = null,
     )
 
     private data class ClipContext(
@@ -123,6 +124,7 @@ class AndroidTimelineExportSession(private val context: Context) {
         val mediaKind: String,
         val exifOrientation: Int = ExifInterface.ORIENTATION_NORMAL,
         val colorMatrix: FloatArray? = null,
+        val beautyIntensity: Double? = null,
     )
 
     private fun run(
@@ -268,6 +270,32 @@ class AndroidTimelineExportSession(private val context: Context) {
                 }
                 colorMatrix = parsedMatrix
             }
+            // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: parse optional per-clip
+            // beautyIntensity. A missing/null key means no beauty (null).
+            // When present it must be a finite number in [0.0, 1.0] --
+            // anything else is a precise INVALID_ARG rather than a
+            // silently-ignored/clamped value.
+            val rawBeautyIntensity = map["beautyIntensity"]
+            var beautyIntensity: Double? = null
+            if (rawBeautyIntensity != null) {
+                val beautyNumber = rawBeautyIntensity as? Number
+                if (beautyNumber == null) {
+                    onError(
+                        "INVALID_ARG",
+                        "exportTimeline: clip.beautyIntensity must be a number",
+                    )
+                    return
+                }
+                val beautyValue = beautyNumber.toDouble()
+                if (!beautyValue.isFinite() || beautyValue < 0.0 || beautyValue > 1.0) {
+                    onError(
+                        "INVALID_ARG",
+                        "exportTimeline: clip.beautyIntensity must be finite and in [0.0, 1.0]",
+                    )
+                    return
+                }
+                beautyIntensity = beautyValue
+            }
             if (sourcePath.startsWith("http://") || sourcePath.startsWith("https://")) {
                 onError("UNSUPPORTED_EXPORT_FEATURE", "exportTimeline: remote clip sources are not supported")
                 return
@@ -289,6 +317,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     trimEnd = trimEnd,
                     mediaKind = mediaKind,
                     colorMatrix = colorMatrix,
+                    beautyIntensity = beautyIntensity,
                 ),
             )
         }
@@ -357,6 +386,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                         mediaKind = clip.mediaKind,
                         exifOrientation = imageProbe.exifOrientation,
                         colorMatrix = clip.colorMatrix,
+                        beautyIntensity = clip.beautyIntensity,
                     ),
                 )
                 continue
@@ -387,6 +417,7 @@ class AndroidTimelineExportSession(private val context: Context) {
                     rotationDegrees = normalizedRotation,
                     mediaKind = clip.mediaKind,
                     colorMatrix = clip.colorMatrix,
+                    beautyIntensity = clip.beautyIntensity,
                 ),
             )
         }
@@ -471,8 +502,26 @@ class AndroidTimelineExportSession(private val context: Context) {
                     stillFrameCount = stillFrameCount,
                     exifOrientation = ctx.exifOrientation,
                     colorMatrix = ctx.colorMatrix,
+                    beautyIntensity = ctx.beautyIntensity,
                 ),
             )
+        }
+
+        // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: a clip-level Beauty V2
+        // request alongside any compositor transition is unsupported -- fail
+        // closed before backend selection rather than let the selector's
+        // `transitions_require_vulkan` reason mask the distinct beauty/
+        // transition incompatibility.
+        val hasBeautyClip = clipInputs.any { it.beautyIntensity != null }
+        if (hasBeautyClip && transitions.isNotEmpty()) {
+            deleteOwnedTemps()
+            logTerminal("beauty_v2_unsupported_with_transition", backend = null)
+            onError(
+                "UNSUPPORTED_EXPORT_FEATURE",
+                "exportTimeline: clip-level Beauty V2 is not supported alongside " +
+                    "transitions (beauty_v2_unsupported_with_transition)",
+            )
+            return
         }
 
         // Session-owned diagnostics/lifecycle/native-bridge triple for this
@@ -498,10 +547,16 @@ class AndroidTimelineExportSession(private val context: Context) {
         if (backendDecision.actualBackend == ExportRenderBackend.UNAVAILABLE) {
             deleteOwnedTemps()
             logTerminal("backend_unavailable", backendDecision.actualBackend)
+            val errorMessage = if (hasBeautyClip && transitions.isEmpty()) {
+                "exportTimeline: Beauty V2 requires the Vulkan export backend " +
+                    "(${backendDecision.reason})"
+            } else {
+                "exportTimeline: transitions require the Vulkan export backend " +
+                    "(${backendDecision.reason})"
+            }
             onError(
                 "UNSUPPORTED_EXPORT_FEATURE",
-                "exportTimeline: transitions require the Vulkan export backend " +
-                    "(${backendDecision.reason})",
+                errorMessage,
             )
             return
         }
@@ -569,7 +624,26 @@ class AndroidTimelineExportSession(private val context: Context) {
             Log.i(TAG, "VG_EXPORT_BACKEND_FALLBACK_BLOCKED from=vulkan reason=${encodeResult.reason} transitions=${transitions.size}")
         }
         if (!encodeResult.success && effectiveBackend == ExportRenderBackend.VULKAN &&
-            transitions.isEmpty() && !cancelRequested && encodeResult.reason != "cancelled"
+            hasBeautyClip && !cancelRequested && encodeResult.reason != "cancelled"
+        ) {
+            // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: clip-level Beauty V2 is
+            // a Vulkan-only production route with no GLES fallback (see
+            // AndroidExportRenderBackendSelector) -- a failed Vulkan attempt
+            // never falls back to GLES here either. The surfaced reason is
+            // prefixed with BEAUTY_REQUIRE_VULKAN_REASON unless the
+            // underlying reason is already a precise beauty_v2_* reason from
+            // the native render path.
+            val underlyingReason = encodeResult.reason
+            val beautyReason = if (underlyingReason.startsWith("beauty_v2_")) {
+                underlyingReason
+            } else {
+                "${AndroidExportRenderBackendSelector.BEAUTY_REQUIRE_VULKAN_REASON}:$underlyingReason"
+            }
+            Log.i(TAG, "VG_EXPORT_BACKEND_FALLBACK_BLOCKED from=vulkan reason=$beautyReason beauty_v2=true")
+            encodeResult = encodeResult.copy(reason = beautyReason)
+        }
+        if (!encodeResult.success && effectiveBackend == ExportRenderBackend.VULKAN &&
+            transitions.isEmpty() && !hasBeautyClip && !cancelRequested && encodeResult.reason != "cancelled"
         ) {
             Log.i(TAG, "VG_EXPORT_BACKEND_FALLBACK from=vulkan to=gles reason=${encodeResult.reason}")
             try { File(videoTempPath).takeIf { it.exists() }?.delete() } catch (_: Throwable) {}
@@ -690,6 +764,8 @@ class AndroidTimelineExportSession(private val context: Context) {
                 "exportRoiSidecarPath" to roiSidecarPath,
                 "renderBackend" to effectiveBackend.wireName(),
                 "transitionCount" to transitions.size,
+                "beautyClipCount" to clipInputs.count { it.beautyIntensity != null },
+                "beautyFrameCount" to encodeResult.beautyFrameCount,
             ),
         )
     }

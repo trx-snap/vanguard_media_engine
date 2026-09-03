@@ -54,6 +54,13 @@ public:
     RenderFrameResult renderFrame(HardwareBufferHandle handle,
                                   const VideoFrameTransform& transform) override;
 
+    // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: renderFrame with an optional
+    // Vulkan-only Beauty V2 pre-composite. When beauty.enabled is false this
+    // is byte-identical to the transform-only overload above.
+    RenderFrameResult renderFrame(HardwareBufferHandle handle,
+                                  const VideoFrameTransform& transform,
+                                  const VideoBeautyV2RenderParams& beauty) override;
+
     // P5-COMPOSITOR-TRANS: two-source clip overlap transition frame through
     // the same swapchain acquire/submit/present lifecycle as renderFrame.
     RenderFrameResult renderTransitionFrame(

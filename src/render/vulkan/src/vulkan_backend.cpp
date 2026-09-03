@@ -171,6 +171,16 @@ RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle /*handle*/,
 }
 
 // ---------------------------------------------------------------------------
+// P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: renderFrame with beauty stub - host build.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle /*handle*/,
+                                             const VideoFrameTransform& /*transform*/,
+                                             const VideoBeautyV2RenderParams& /*beauty*/) {
+    return RenderFrameResult::kUnavailable;
+}
+
+// ---------------------------------------------------------------------------
 // P5-COMPOSITOR-TRANS: renderTransitionFrame stub - host build.
 // ---------------------------------------------------------------------------
 
@@ -860,6 +870,40 @@ RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle handle,
         *s.coreShaders,
         handle,
         transform);
+}
+
+// ---------------------------------------------------------------------------
+// P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: renderFrame with beauty - Android.
+// Delegates to the frame renderer's beauty-aware overload, which itself
+// delegates straight back to the plain transform overload whenever
+// beauty.enabled is false -- so this seam never changes non-beauty behavior.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle handle,
+                                             const VideoFrameTransform& transform,
+                                             const VideoBeautyV2RenderParams& beauty) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (!s.surfaceSwapchain || !s.surfaceSwapchain->hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (!s.ahbImports || !hasHardwareBuffer(handle) || s.ahbImports->getImage(handle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (!s.frameRenderer || !s.coreShaders) {
+        return RenderFrameResult::kUnavailable;
+    }
+    return s.frameRenderer->renderFrame(
+        static_cast<void*>(s.queue),
+        static_cast<void*>(s.physDev),
+        *s.surfaceSwapchain,
+        *s.ahbImports,
+        *s.coreShaders,
+        handle,
+        transform,
+        beauty);
 }
 
 // ---------------------------------------------------------------------------

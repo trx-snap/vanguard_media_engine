@@ -73,6 +73,24 @@ public:
         HardwareBufferHandle handle,
         const VideoFrameTransform& transform);
 
+    // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: renderFrame with an optional
+    // Vulkan-only Beauty V2 pre-composite recorded via VulkanBeautyFrameRenderer
+    // ahead of the existing placement draw. When beauty.enabled is false this
+    // delegates directly to the transform-only overload above with zero
+    // additional Vulkan calls -- byte-identical to existing non-beauty
+    // behavior. physicalDeviceHandle is a VkPhysicalDevice cast to void*,
+    // needed only for the beauty intermediates' device-local memory
+    // allocation when beauty.enabled is true.
+    RenderFrameResult renderFrame(
+        void* queueHandle,
+        void* physicalDeviceHandle,
+        VulkanSurfaceSwapchain& swapchain,
+        VulkanHardwareBufferImports& ahbImports,
+        VulkanCoreShaderModules& coreShaders,
+        HardwareBufferHandle handle,
+        const VideoFrameTransform& transform,
+        const VideoBeautyV2RenderParams& beauty);
+
     // P5-COMPOSITOR-TRANS: two-source clip overlap transition frame. Same
     // acquire / frame fence / imageAvailable + presentReady semaphore /
     // pending AHB acquire semaphore wait / release-fence export / present

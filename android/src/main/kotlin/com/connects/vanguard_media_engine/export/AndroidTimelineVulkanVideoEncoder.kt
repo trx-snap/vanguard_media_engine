@@ -107,6 +107,7 @@ class AndroidTimelineVulkanVideoEncoder(
     private var videoTrackIndex = -1
     private var writtenVideoSamples = 0
     private var renderedFrames = 0
+    private var beautyFramesRendered = 0
     private var nativeSessionId: String? = null
 
     // ─── Pass-1 sample-ratio progress ─────────────────────────────────────────
@@ -231,9 +232,16 @@ class AndroidTimelineVulkanVideoEncoder(
                 TAG,
                 "VG_VULKAN_ENCODE_RESULT status=success rendered=$renderedFrames " +
                     "written=$writtenVideoSamples outputSize=$outSize " +
-                    "transitions=${plan.segments.count { it is Segment.Overlap }}",
+                    "transitions=${plan.segments.count { it is Segment.Overlap }} " +
+                    "beautyFrames=$beautyFramesRendered",
             )
-            return AndroidTimelineVideoEncoder.EncodeResult(true, reason, writtenVideoSamples, outSize)
+            return AndroidTimelineVideoEncoder.EncodeResult(
+                true,
+                reason,
+                writtenVideoSamples,
+                outSize,
+                beautyFrameCount = beautyFramesRendered,
+            )
         } catch (t: Throwable) {
             reason = "exception:${t.javaClass.simpleName}"
             Log.e(TAG, "vulkan encode failed: $t", t)
@@ -256,9 +264,15 @@ class AndroidTimelineVulkanVideoEncoder(
         Log.w(
             TAG,
             "VG_VULKAN_ENCODE_RESULT status=fail reason=$reason rendered=$renderedFrames " +
-                "written=$writtenVideoSamples",
+                "written=$writtenVideoSamples beautyFrames=$beautyFramesRendered",
         )
-        return AndroidTimelineVideoEncoder.EncodeResult(false, reason, writtenVideoSamples, 0L)
+        return AndroidTimelineVideoEncoder.EncodeResult(
+            false,
+            reason,
+            writtenVideoSamples,
+            0L,
+            beautyFrameCount = beautyFramesRendered,
+        )
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -544,6 +558,7 @@ class AndroidTimelineVulkanVideoEncoder(
                                 sourceHeight,
                                 destFitRect,
                                 clip.colorMatrix,
+                                clip.beautyIntensity,
                             )
                             if (frameFailure != null) return frameFailure
                             renderedFramesInClip++
@@ -604,6 +619,10 @@ class AndroidTimelineVulkanVideoEncoder(
     /// (un-normalized) 20-element colorMatrix, passed through unchanged to
     /// the native Vulkan render seam -- null means identity (no filter); see
     /// [VanguardNativeBridge.renderAndroidTimelineVulkanExportFrameCropped].
+    /// [beautyIntensity] (P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A) is the
+    /// active clip's optional Beauty V2 intensity in [0.0, 1.0]; null means
+    /// no beauty. Passed through unchanged to the native seam, which expands
+    /// it into the full ramp using the cropped source extent.
     ///
     /// Enforces the Opus P1 real-buffer geometry guard on every frame (not
     /// just a clip's first frame): real decoder HardwareBuffers can be
@@ -620,6 +639,7 @@ class AndroidTimelineVulkanVideoEncoder(
         expectedCropHeight: Int,
         destFitRect: DestFitRect,
         colorMatrix: FloatArray?,
+        beautyIntensity: Double?,
     ): String? {
         var hwBuf: HardwareBuffer? = null
         try {
@@ -651,6 +671,7 @@ class AndroidTimelineVulkanVideoEncoder(
                 expectedCropHeight,
                 destFitRect,
                 colorMatrix,
+                beautyIntensity,
             )
         } finally {
             try { hwBuf?.close() } catch (_: Throwable) {}
@@ -726,6 +747,7 @@ class AndroidTimelineVulkanVideoEncoder(
         expectedCropHeight: Int,
         destFitRect: DestFitRect,
         colorMatrix: FloatArray?,
+        beautyIntensity: Double?,
     ): String? {
         val geometry = resolveLayerGeometry(
             cropRect, bufW, bufH, rotationDegrees, expectedCropWidth, expectedCropHeight, destFitRect,
@@ -750,11 +772,16 @@ class AndroidTimelineVulkanVideoEncoder(
             timelinePtsUs = timelinePtsUs,
             frameIndex = renderedFrames,
             colorMatrix = colorMatrix,
+            beautyEnabled = beautyIntensity != null,
+            beautyIntensity = (beautyIntensity ?: 0.0).toFloat(),
         )
         if (!renderStr.startsWith("status=OK;")) {
             return "vulkan_render_failed:${renderStr.take(120)}"
         }
         renderedFrames++
+        if (beautyIntensity != null) {
+            beautyFramesRendered++
+        }
         drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
         return null
     }
@@ -846,11 +873,16 @@ class AndroidTimelineVulkanVideoEncoder(
                                     result
                                 }
                                 fromFrame != null -> {
+                                    // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: beauty is
+                                    // always null here -- AndroidTimelineExportSession
+                                    // fails closed before pass-1 when a beauty clip is
+                                    // combined with any transition, so a transition
+                                    // overlap segment's clips never carry beauty.
                                     val result = renderSoloLayer(
                                         fromFrame.hardwareBuffer, fromFrame.cropRect,
                                         fromFrame.bufferWidth, fromFrame.bufferHeight,
                                         fromClip.rotationDegrees, fromClip.decodedWidth, fromClip.decodedHeight,
-                                        fromFit, fromClip.colorMatrix,
+                                        fromFit, fromClip.colorMatrix, beautyIntensity = null,
                                     )
                                     if (result == null) soloFromRendered++
                                     result
@@ -860,7 +892,7 @@ class AndroidTimelineVulkanVideoEncoder(
                                         toFrame.hardwareBuffer, toFrame.cropRect,
                                         toFrame.bufferWidth, toFrame.bufferHeight,
                                         toClip.rotationDegrees, toClip.decodedWidth, toClip.decodedHeight,
-                                        toFit, toClip.colorMatrix,
+                                        toFit, toClip.colorMatrix, beautyIntensity = null,
                                     )
                                     if (result == null) soloToRendered++
                                     result

@@ -72,6 +72,12 @@ add_library(vanguard_render_vulkan STATIC
     # fragment shaders reusing the existing AOT passthrough vertex shader;
     # helper-owned intermediates, caller-owned source/target/readback).
     "render/vulkan/src/vulkan_beauty_v2_compositor.cpp"
+    # P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: production (non-diagnostic)
+    # Vulkan-only Beauty V2 render chain for the timeline video export route,
+    # recording into VulkanFrameRenderer's existing single command
+    # buffer/submit/present per frame; per-geometry, per-frame-in-flight-slot
+    # cached intermediates/pipelines/descriptor resources.
+    "render/vulkan/src/vulkan_beauty_frame_renderer.cpp"
 )
 target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include"
     # Phase 2K: private Vulkan src dir exposed so vulkan_surface_swapchain.cpp

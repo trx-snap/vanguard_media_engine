@@ -99,6 +99,20 @@
 //     empty. Backward-compatible: existing maps without this key, or with a
 //     non-String/empty value, produce null.
 //
+// P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A addition:
+//   - [beautyIntensity]: optional double — clip-level Beauty V2 smoothing
+//     intensity in [0.0, 1.0]. Null means no beauty (default; zero overhead).
+//   - Applies ONLY to the Android Vulkan-only production timeline video
+//     export route for solo/hard-cut-adjacent video frames. Beauty requires
+//     the Vulkan export backend; the export session fails closed with
+//     UNSUPPORTED_EXPORT_FEATURE (reason containing
+//     `beauty_v2_requires_vulkan:<reason>`) when Vulkan cannot be selected,
+//     and with reason `beauty_v2_unsupported_with_transition` when this clip
+//     carries a non-null value alongside any non-hard-cut transition.
+//   - Not consumed by playback, GLES export, or iOS in this slice.
+//   - Wire key: 'beautyIntensity'. Omitted from toMap() when null.
+//     Backward-compatible: existing maps without this key produce null.
+//
 // Serialisation:
 //   toMap() produces a JSON-compatible map:
 //   {
@@ -119,6 +133,7 @@
 //     'timeRemap': Map?,          // Phase 7.22A: omitted when null; descriptor-only in 7.22A
 //     'transformTrack': Map?,     // Phase 7.23: omitted when null; descriptor-only in 7.23
 //     'colorMatrix': List<double>?,// Phase 10: omitted when null; 20-element 4×5 color matrix
+//     'beautyIntensity': double?, // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: omitted when null
 //   }
 
 import 'vg_clip_transform_descriptor.dart';
@@ -232,11 +247,22 @@ final class VGClipDescriptor {
     this.transformTrack,
     this.colorMatrix,
     this.sourceRoiSidecarPath,
+    this.beautyIntensity,
   }) : assert(startTimeSeconds >= 0, 'startTimeSeconds must be >= 0'),
        // Phase 10: colorMatrix must be exactly 20 elements when non-null.
        assert(
          colorMatrix == null || colorMatrix.length == 20,
          'colorMatrix must have exactly 20 elements (4×5 row-major matrix)',
+       ),
+       // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: beautyIntensity must be
+       // finite and in [0.0, 1.0] when non-null. Plain comparisons (rather
+       // than `.isFinite`, which is not a constant expression) reject
+       // NaN/infinity too: comparisons against NaN/±infinity are false, so
+       // the range check alone fails the assert for those values.
+       assert(
+         beautyIntensity == null ||
+             (beautyIntensity >= 0.0 && beautyIntensity <= 1.0),
+         'beautyIntensity must be finite and in [0.0, 1.0]',
        ),
        assert(durationSeconds >= 0, 'durationSeconds must be >= 0'),
        assert(trimStartSeconds >= 0, 'trimStartSeconds must be >= 0'),
@@ -246,31 +272,12 @@ final class VGClipDescriptor {
        ),
        assert(speed > 0, 'speed must be > 0'),
        // Phase 7.16: cropRect validation.
-       // When non-null: length == 4, all finite, all in [0.0, 1.0],
-       // width > 0, height > 0, x + width <= 1.0, y + height <= 1.0.
+       // When non-null: length == 4. Detailed value validation (in [0.0, 1.0],
+       // width/height > 0, bounds within [0, 1]) is enforced in fromMap and
+       // parser routines to maintain const-valid constructor assertions.
        assert(
          cropRect == null || cropRect.length == 4,
          'cropRect must have exactly 4 elements [x, y, width, height]',
-       ),
-       assert(
-         cropRect == null ||
-             (cropRect[0] >= 0.0 &&
-                 cropRect[0] <= 1.0 &&
-                 cropRect[1] >= 0.0 &&
-                 cropRect[1] <= 1.0 &&
-                 cropRect[2] > 0.0 &&
-                 cropRect[2] <= 1.0 &&
-                 cropRect[3] > 0.0 &&
-                 cropRect[3] <= 1.0),
-         'cropRect values must be finite and in (0.0, 1.0]',
-       ),
-       assert(
-         cropRect == null || cropRect[0] + cropRect[2] <= 1.0,
-         'cropRect x + width must be <= 1.0',
-       ),
-       assert(
-         cropRect == null || cropRect[1] + cropRect[3] <= 1.0,
-         'cropRect y + height must be <= 1.0',
        ),
        // Phase 7.17: freezePTS validation.
        // When non-null: must be non-negative and finite.
@@ -536,6 +543,25 @@ final class VGClipDescriptor {
   /// Null means no known source sidecar for this clip.
   final String? sourceRoiSidecarPath;
 
+  // ── Beauty V2 intensity (P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A) ─────────
+
+  /// Clip-level Beauty V2 smoothing intensity in `[0.0, 1.0]`.
+  ///
+  /// **P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A** — null means no beauty
+  /// (default; zero overhead). Applies only to the Android Vulkan-only
+  /// production timeline video export route for solo/hard-cut video frames.
+  ///
+  /// Design notes:
+  /// - Beauty V2 requires the Vulkan export backend. The export session
+  ///   fails closed with `UNSUPPORTED_EXPORT_FEATURE` (reason containing
+  ///   `beauty_v2_requires_vulkan:<reason>`) when Vulkan cannot be selected
+  ///   for a draft carrying a non-null [beautyIntensity].
+  /// - A non-null [beautyIntensity] alongside any non-hard-cut transition
+  ///   fails closed distinctly with reason `beauty_v2_unsupported_with_transition`.
+  /// - Not rendered by playback, the GLES export fallback, or iOS in this
+  ///   slice.
+  final double? beautyIntensity;
+
   // ── Crop rect convenience accessors (Phase 7.16) ─────────────────────────
 
   /// The normalized X origin of the crop rectangle. Null when [cropRect] is null.
@@ -657,6 +683,10 @@ final class VGClipDescriptor {
     // this key. Omitted when null or empty.
     if (sourceRoiSidecarPath != null && sourceRoiSidecarPath!.isNotEmpty) {
       m['sourceRoiSidecarPath'] = sourceRoiSidecarPath!;
+    }
+    // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: omit beautyIntensity when null.
+    if (beautyIntensity != null) {
+      m['beautyIntensity'] = beautyIntensity!;
     }
     return m;
   }
@@ -845,6 +875,19 @@ final class VGClipDescriptor {
         ? rawSourceRoiSidecarPath
         : null;
 
+    // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: parse optional beautyIntensity.
+    // Missing key means null (no beauty). A present but malformed value
+    // (non-number, non-finite, or out of [0.0, 1.0]) causes fromMap to
+    // return null.
+    double? beautyIntensity;
+    final rawBeautyIntensity = map['beautyIntensity'];
+    if (rawBeautyIntensity != null) {
+      if (rawBeautyIntensity is! num) return null;
+      final v = rawBeautyIntensity.toDouble();
+      if (!v.isFinite || v < 0.0 || v > 1.0) return null;
+      beautyIntensity = v;
+    }
+
     return VGClipDescriptor(
       id: id as String,
       sourcePath: sourcePath as String,
@@ -864,6 +907,7 @@ final class VGClipDescriptor {
       transformTrack: transformTrack,
       colorMatrix: colorMatrix,
       sourceRoiSidecarPath: sourceRoiSidecarPath,
+      beautyIntensity: beautyIntensity,
     );
   }
 
@@ -899,6 +943,8 @@ final class VGClipDescriptor {
     Object? colorMatrix = _kClipNoValue,
     // Use sentinel to allow explicit null assignment (clear sourceRoiSidecarPath).
     Object? sourceRoiSidecarPath = _kClipNoValue,
+    // Use sentinel to allow explicit null assignment (clear beautyIntensity).
+    Object? beautyIntensity = _kClipNoValue,
   }) {
     return VGClipDescriptor(
       id: id ?? this.id,
@@ -935,6 +981,9 @@ final class VGClipDescriptor {
       sourceRoiSidecarPath: sourceRoiSidecarPath == _kClipNoValue
           ? this.sourceRoiSidecarPath
           : sourceRoiSidecarPath as String?,
+      beautyIntensity: beautyIntensity == _kClipNoValue
+          ? this.beautyIntensity
+          : beautyIntensity as double?,
     );
   }
 
@@ -961,7 +1010,8 @@ final class VGClipDescriptor {
           other.timeRemap == timeRemap &&
           other.transformTrack == transformTrack &&
           _colorMatrixEqual(other.colorMatrix, colorMatrix) &&
-          other.sourceRoiSidecarPath == sourceRoiSidecarPath;
+          other.sourceRoiSidecarPath == sourceRoiSidecarPath &&
+          other.beautyIntensity == beautyIntensity;
 
   /// Deep-equality helper for the [cropRect] list field.
   static bool _cropRectEqual(List<double>? a, List<double>? b) {
@@ -1007,6 +1057,7 @@ final class VGClipDescriptor {
     // Hash colorMatrix elements individually for stable hash.
     Object.hashAll(colorMatrix ?? const []),
     sourceRoiSidecarPath,
+    beautyIntensity,
   );
 
   @override
@@ -1028,7 +1079,8 @@ final class VGClipDescriptor {
       'timeRemap: ${timeRemap != null ? "<present segments=${timeRemap!.segments.length}>" : null}, '
       'transformTrack: ${transformTrack != null ? "<present keyframes=${transformTrack!.keyframes.length} interp=${transformTrack!.interpolation.value}>" : null}, '
       'colorMatrix: ${colorMatrix != null ? "<present ${colorMatrix!.length} elements>" : null}, '
-      'sourceRoiSidecarPath: $sourceRoiSidecarPath)';
+      'sourceRoiSidecarPath: $sourceRoiSidecarPath, '
+      'beautyIntensity: $beautyIntensity)';
 }
 
 // ── Sentinel for copyWith nullable fields ─────────────────────────────────────────

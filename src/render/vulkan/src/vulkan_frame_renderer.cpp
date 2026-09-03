@@ -13,6 +13,7 @@
 //   - initialize() returns false; renderFrame returns kUnavailable.
 
 #include "vulkan_frame_renderer.h"
+#include "vulkan_beauty_frame_renderer.h"
 #include "vulkan_frame_synchronization.h"
 #include "vulkan_graphics_command_recorder.h"
 #include "vulkan_graphics_pipeline.h"
@@ -90,6 +91,23 @@ struct VulkanFrameRenderer::Impl {
     std::unique_ptr<VulkanGraphicsPipeline> transitionToOpaquePipeline;
     VkPipeline transitionToBlendPipeline = VK_NULL_HANDLE;
 
+    // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: lazily constructed on the first
+    // beauty-enabled renderFrame() call. Owns its own crop/placement pipeline
+    // cache entirely independent of graphicsPipeline/transition* above, so
+    // routine solo/transition pipeline invalidation (invalidatePipeline())
+    // never touches it and beauty frames never churn the solo pipeline cache.
+    std::unique_ptr<VulkanBeautyFrameRenderer> beautyRenderer;
+
+    // Torn down only on shutdown()/failClosed() (never from the routine
+    // invalidatePipeline() hot path) so beauty's cached geometry/pipelines
+    // survive ordinary per-frame pipeline-layout churn.
+    void shutdownBeauty() {
+        if (beautyRenderer) {
+            beautyRenderer->shutdown(device);
+            beautyRenderer.reset();
+        }
+    }
+
     bool hasTransitionPipelines() const {
         return transitionFromPipeline != nullptr ||
                transitionToOpaquePipeline != nullptr ||
@@ -139,6 +157,10 @@ struct VulkanFrameRenderer::Impl {
         }
         swapchain.detach();
         invalidatePipeline();
+        // The swapchain's render pass (destroyed by swapchain.detach() above)
+        // may be referenced by beauty's cached placement pipeline; tear the
+        // whole beauty cache down rather than leave it dangling.
+        shutdownBeauty();
         pfnGetSemaphoreFd = nullptr; // fail-closed: clear export capability
         initialized = false;
         currentFrameIndex = 0;
@@ -209,6 +231,10 @@ void VulkanFrameRenderer::shutdown() {
     }
 
     s.invalidatePipeline();
+    // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: release cached beauty resources
+    // while s.device is still valid, before the device itself is torn down
+    // by the owning VulkanBackend.
+    s.shutdownBeauty();
 
     if (s.frameSync) {
         s.frameSync->shutdown(s.device, s.commandPool);
@@ -535,6 +561,277 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     }
 
     // Phase 2O2B4: Mark layout as SHADER_READ_ONLY_OPTIMAL only after vkQueueSubmit returns VK_SUCCESS.
+    if (!ahbImports.setImageLayout(handle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    const SwapchainResult presentResult = swapchain.presentImage(
+        queueHandle,
+        presentReadySemaphoreHandle,
+        imageIndex);
+    s.currentFrameIndex = (s.currentFrameIndex + 1) % frameCount;
+
+    switch (presentResult) {
+        case SwapchainResult::kSuccess:
+            return acquireResult == SwapchainResult::kSuboptimal
+                ? RenderFrameResult::kSuboptimal
+                : RenderFrameResult::kSuccess;
+        case SwapchainResult::kSuboptimal:
+            return RenderFrameResult::kSuboptimal;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kDeviceLost);
+        case SwapchainResult::kError:
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+}
+
+// ---------------------------------------------------------------------------
+// P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: renderFrame with optional Vulkan-only
+// Beauty V2 pre-composite. Mirrors the transform-only overload above's entire
+// acquire / frame-fence / pending-AHB-semaphore / release-fence-export /
+// present protocol; the only difference is what gets recorded into the
+// frame's command buffer. When beauty.enabled is false this delegates
+// directly to the transform-only overload with zero additional Vulkan calls,
+// so non-beauty behavior (including the solo pipeline cache in
+// s.graphicsPipeline) is completely unaffected by this overload's existence.
+// The beauty-enabled path never touches s.graphicsPipeline / transition*
+// pipelines: VulkanBeautyFrameRenderer owns an entirely separate crop/
+// placement pipeline cache.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanFrameRenderer::renderFrame(
+    void* queueHandle,
+    void* physicalDeviceHandle,
+    VulkanSurfaceSwapchain& swapchain,
+    VulkanHardwareBufferImports& ahbImports,
+    VulkanCoreShaderModules& coreShaders,
+    HardwareBufferHandle handle,
+    const VideoFrameTransform& transform,
+    const VideoBeautyV2RenderParams& beauty) {
+    if (!beauty.enabled) {
+        return renderFrame(queueHandle, swapchain, ahbImports, coreShaders, handle, transform);
+    }
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (queueHandle == nullptr || physicalDeviceHandle == nullptr ||
+        s.device == VK_NULL_HANDLE || s.commandPool == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    if (!swapchain.hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    const VulkanHardwareBufferImage* srcImage = ahbImports.getImage(handle);
+    if (!ahbImports.hasBuffer(handle) || srcImage == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (srcImage->image == VK_NULL_HANDLE ||
+        coreShaders.vertex.get() == VK_NULL_HANDLE ||
+        coreShaders.fragment.get() == VK_NULL_HANDLE ||
+        !s.frameSync || !s.frameSync->isInitialized()) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint32_t frameCount = s.frameSync->getFrameCount();
+    if (frameCount == 0 || s.currentFrameIndex >= frameCount) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VulkanFrameSyncResources* frame =
+        s.frameSync->getFrame(s.currentFrameIndex);
+    if (frame == nullptr || frame->commandBuffer == VK_NULL_HANDLE ||
+        frame->imageAvailableSemaphore == VK_NULL_HANDLE ||
+        frame->inFlightFence == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t renderPassHandle = swapchain.getRenderPassHandle();
+    const uint32_t extentWidth = swapchain.getExtentWidth();
+    const uint32_t extentHeight = swapchain.getExtentHeight();
+    if (renderPassHandle == 0 || extentWidth == 0 || extentHeight == 0) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VkRenderPass renderPass = u64ToVkHandle<VkRenderPass>(renderPassHandle);
+
+    if (!s.beautyRenderer) {
+        s.beautyRenderer = std::make_unique<VulkanBeautyFrameRenderer>();
+    }
+
+    if (!s.frameSync->waitForFrameFence(s.currentFrameIndex)) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    ahbImports.drainRetiredForFrame(s.currentFrameIndex);
+
+    uint32_t imageIndex = 0;
+    const SwapchainResult acquireResult = swapchain.acquireNextImage(
+        vkHandleToU64(frame->imageAvailableSemaphore),
+        0,
+        &imageIndex,
+        UINT64_MAX);
+    switch (acquireResult) {
+        case SwapchainResult::kSuccess:
+        case SwapchainResult::kSuboptimal:
+            break;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return RenderFrameResult::kDeviceLost;
+        case SwapchainResult::kError:
+            return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t framebufferHandle =
+        swapchain.getFramebufferHandle(imageIndex);
+    if (framebufferHandle == 0) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    const VkFramebuffer framebuffer =
+        u64ToVkHandle<VkFramebuffer>(framebufferHandle);
+
+    const uint64_t presentReadySemaphoreHandle =
+        swapchain.getPresentReadySemaphoreHandle(imageIndex);
+    if (presentReadySemaphoreHandle == 0) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    const VkSemaphore presentReadySemaphore =
+        u64ToVkHandle<VkSemaphore>(presentReadySemaphoreHandle);
+
+    if (!s.frameSync->resetCommandBuffer(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    const VkImageLayout currentLayout =
+        static_cast<VkImageLayout>(ahbImports.getImageLayout(handle));
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(frame->commandBuffer, &beginInfo) != VK_SUCCESS) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    std::string beautyFailureReason;
+    const bool beautyOk = s.beautyRenderer->recordBeauty(
+        s.device,
+        static_cast<VkPhysicalDevice>(physicalDeviceHandle),
+        frame->commandBuffer,
+        s.currentFrameIndex,
+        frameCount,
+        *srcImage,
+        currentLayout,
+        coreShaders.vertex.get(),
+        coreShaders.fragment.get(),
+        transform,
+        beauty,
+        renderPass,
+        framebuffer,
+        extentWidth,
+        extentHeight,
+        &beautyFailureReason);
+    if (!beautyOk) {
+        VGLOG_VFR("beauty recordBeauty failed: %s", beautyFailureReason.c_str());
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    if (vkEndCommandBuffer(frame->commandBuffer) != VK_SUCCESS) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    if (!s.frameSync->resetFrameFence(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    VkSemaphore waitSemaphores[2] = {
+        frame->imageAvailableSemaphore,
+        VK_NULL_HANDLE,
+    };
+    VkPipelineStageFlags waitStages[2] = {
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+    };
+    uint32_t waitSemaphoreCount = 1;
+    const uint64_t pendingAcquireSemaphoreHandle =
+        ahbImports.getPendingAcquireSemaphoreHandle(handle);
+    if (pendingAcquireSemaphoreHandle != 0) {
+        waitSemaphores[waitSemaphoreCount++] =
+            u64ToVkHandle<VkSemaphore>(pendingAcquireSemaphoreHandle);
+    }
+
+    const bool canExportRelease =
+        (frame->releaseFenceSemaphore != VK_NULL_HANDLE) && (s.pfnGetSemaphoreFd != nullptr);
+
+    VkSemaphore signalSemaphores[2] = {
+        presentReadySemaphore,
+        VK_NULL_HANDLE,
+    };
+    uint32_t signalSemaphoreCount = 1;
+    if (canExportRelease) {
+        signalSemaphores[signalSemaphoreCount++] = frame->releaseFenceSemaphore;
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = waitSemaphoreCount;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &frame->commandBuffer;
+    submitInfo.signalSemaphoreCount = signalSemaphoreCount;
+    submitInfo.pSignalSemaphores = signalSemaphores;
+
+    const VkQueue queue = static_cast<VkQueue>(queueHandle);
+    const VkResult submitResult =
+        vkQueueSubmit(queue, 1, &submitInfo, frame->inFlightFence);
+    if (submitResult != VK_SUCCESS) {
+        const RenderFrameResult result =
+            (submitResult == VK_ERROR_DEVICE_LOST)
+                ? RenderFrameResult::kDeviceLost
+                : RenderFrameResult::kVulkanFailure;
+        return s.failClosed(swapchain, ahbImports, result);
+    }
+
+    if (!ahbImports.markBufferSubmitted(handle, s.currentFrameIndex)) {
+        VGLOG_VFR("beauty markBufferSubmitted failed for handle=%" PRIu64 "; failing closed",
+                  static_cast<uint64_t>(handle));
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    {
+        if (canExportRelease) {
+            int exportedFd = -1;
+            VkSemaphoreGetFdInfoKHR semGetFdInfo{};
+            semGetFdInfo.sType      = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+            semGetFdInfo.pNext      = nullptr;
+            semGetFdInfo.semaphore  = frame->releaseFenceSemaphore;
+            semGetFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+            const VkResult exportResult =
+                s.pfnGetSemaphoreFd(s.device, &semGetFdInfo, &exportedFd);
+            if (exportResult != VK_SUCCESS) {
+                VGLOG_VFR("beauty vkGetSemaphoreFdKHR failed: %d; clearing stored release fd",
+                          static_cast<int>(exportResult));
+                if (exportedFd >= 0) {
+                    ::close(exportedFd);
+                }
+                ahbImports.setLatestReleaseFenceFd(handle, -1);
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+            }
+            ahbImports.setLatestReleaseFenceFd(handle, exportedFd);
+        } else {
+            ahbImports.setLatestReleaseFenceFd(handle, -1);
+        }
+    }
+
+    if (pendingAcquireSemaphoreHandle != 0 &&
+        !ahbImports.markAcquireSemaphoreSubmitted(handle)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
     if (!ahbImports.setImageLayout(handle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))) {
         return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
@@ -1006,6 +1303,31 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     VulkanCoreShaderModules& /*coreShaders*/,
     HardwareBufferHandle handle,
     const VideoFrameTransform& /*transform*/) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    if (!swapchain.hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (!ahbImports.hasBuffer(handle) || ahbImports.getImage(handle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    return RenderFrameResult::kUnavailable;
+}
+
+// P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: host-build stub for renderFrame
+// with an optional Beauty V2 pre-composite. Beauty is a Vulkan-only,
+// Android-only production route; host builds report unavailable exactly
+// like every other Vulkan render seam.
+RenderFrameResult VulkanFrameRenderer::renderFrame(
+    void* /*queueHandle*/,
+    void* /*physicalDeviceHandle*/,
+    VulkanSurfaceSwapchain& swapchain,
+    VulkanHardwareBufferImports& ahbImports,
+    VulkanCoreShaderModules& /*coreShaders*/,
+    HardwareBufferHandle handle,
+    const VideoFrameTransform& /*transform*/,
+    const VideoBeautyV2RenderParams& /*beauty*/) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }

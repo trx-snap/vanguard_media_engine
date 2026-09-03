@@ -196,6 +196,43 @@ static_assert(sizeof(VideoTransformFullPushConstants) <= 128,
               "Vulkan push constant budget (128 bytes)");
 
 // ---------------------------------------------------------------------------
+// VideoBeautyV2RenderParams
+// ---------------------------------------------------------------------------
+// P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: optional per-frame Beauty V2
+// pre-composite request for the Vulkan production export solo-frame render
+// chain. Field-for-field mirror of VulkanBeautyV2Parameters
+// (vulkan_beauty_v2_compositor.h, same names/types/defaults) so a caller can
+// populate this struct directly from ComputeVulkanBeautyV2ParametersFromIntensity's
+// output without this shared, platform-neutral header depending on that
+// private Vulkan render-backend header. When [enabled] is false, rendering
+// through VulkanFrameRenderer::renderFrame is byte-identical to the existing
+// non-beauty renderFrame(handle, transform) path -- no Beauty resources are
+// created or touched.
+struct VideoBeautyV2RenderParams {
+    bool enabled = false;
+    int32_t radius = 10;
+    float sigma = 5.5f;
+    float rangeSigma = 0.10f;
+    float smoothStrength = 0.90f;
+    float sharpenStrength = 0.25f;
+    float theta = 0.06f;
+    float detailDamping = 0.55f;
+    float toneStrength = 0.25f;
+    float midtoneLift = 0.045f;
+
+    // Cropped source extent (post-crop, pre-rotation, buffer-native
+    // orientation) that Beauty intermediates are sized to -- must equal the
+    // accompanying VideoFrameTransform's crop window
+    // (cropRight-cropLeft) x (cropBottom-cropTop) on the imported source
+    // buffer, NOT the rotation-swapped display size and NOT the output
+    // extent, so Beauty operates purely on content pixels without letterbox
+    // bleed (see the file header of vulkan_beauty_frame_renderer.h). Must be
+    // > 0 on both axes when [enabled] is true.
+    uint32_t cropWidth = 0;
+    uint32_t cropHeight = 0;
+};
+
+// ---------------------------------------------------------------------------
 // normalizeRotation
 // Maps any integer degrees to a cardinal 0/90/180/270 value.
 // Non-cardinal input returns 0 (identity).

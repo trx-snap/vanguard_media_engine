@@ -133,6 +133,27 @@ public:
     }
 
     // ---------------------------------------------------------------------------
+    // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: renderFrame with an optional
+    // Vulkan-only Beauty V2 pre-composite for clip-level Beauty V2 on
+    // solo/hard-cut export frames.
+    //
+    // Default implementation: when beauty.enabled is false this delegates to
+    // the transform-only overload above (byte-identical to pre-existing
+    // behavior for every backend that has not overridden this seam). When
+    // beauty.enabled is true this fails closed with kUnavailable -- GLES and
+    // any other backend that has not overridden this seam never renders
+    // beauty; only VulkanBackend overrides it.
+    // ---------------------------------------------------------------------------
+    virtual RenderFrameResult renderFrame(HardwareBufferHandle handle,
+                                          const VideoFrameTransform& transform,
+                                          const VideoBeautyV2RenderParams& beauty) {
+        if (beauty.enabled) {
+            return RenderFrameResult::kUnavailable;
+        }
+        return renderFrame(handle, transform);
+    }
+
+    // ---------------------------------------------------------------------------
     // P5-COMPOSITOR-TRANS: compositor-owned clip overlap transition frame.
     //
     // Renders one output frame from TWO imported AHardwareBuffers (the

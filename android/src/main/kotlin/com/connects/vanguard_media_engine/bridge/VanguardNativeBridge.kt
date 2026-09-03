@@ -1187,6 +1187,16 @@ class VanguardNativeBridge(
     // buffer and fails closed with "vulkan_color_matrix_invalid:len=N" on
     // mismatch; native normalizes the four additive offset entries (indices
     // 4, 9, 14, 19) by /255.0 exactly once. Null means identity (no filter).
+    // [beautyEnabled]/[beautyIntensity] (P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A):
+    // when [beautyEnabled] is true, [beautyIntensity] must be finite and in
+    // [0.0, 1.0] -- native fails closed with "beauty_v2_invalid_intensity" on
+    // any other value (the caller is expected to have already validated this
+    // at the Kotlin layer). Native expands the intensity into the full Beauty
+    // V2 ramp from the CROPPED SOURCE extent and renders through the
+    // Vulkan-only production Beauty V2 chain; a render failure while
+    // [beautyEnabled] is reported with reason
+    // "beauty_v2_requires_vulkan:vulkan_render_failed" instead of the generic
+    // "render_failed".
     external fun renderAndroidTimelineVulkanExportFrameCropped(
         sessionId: String,
         hardwareBuffer: HardwareBuffer,
@@ -1204,6 +1214,8 @@ class VanguardNativeBridge(
         timelinePtsUs: Long,
         frameIndex: Int,
         colorMatrix: FloatArray?,
+        beautyEnabled: Boolean,
+        beautyIntensity: Float,
     ): String
 
     // ── P5-COMPOSITOR-TRANS: production transition frame render seam ────────

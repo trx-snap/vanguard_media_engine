@@ -33,6 +33,16 @@ import com.connects.vanguard_media_engine.lifecycle.VanguardLifecycleObserver
 // timeline to hard cuts is wrong output. AndroidTimelineExportSession turns
 // that into UNSUPPORTED_EXPORT_FEATURE before pass-1 and also disables its
 // mid-export GLES fallback for transition timelines.
+//
+// P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: a scope carrying any clip with a
+// non-null [AndroidTimelineVideoEncoder.ClipInput.beautyIntensity] ALSO
+// REQUIRES Vulkan -- clip-level Beauty V2 is a Vulkan-only production route
+// with no GLES fallback. When Vulkan cannot be selected for such a scope,
+// [select] resolves to [ExportRenderBackend.UNAVAILABLE] with a
+// `beauty_v2_requires_vulkan:<underlying reason>` reason (the
+// `transitions_require_vulkan` prefix takes priority when the scope ALSO
+// carries a non-hard-cut transition, since that failure mode is
+// pre-existing/tested and independently sufficient to require Vulkan).
 enum class ExportRenderBackend {
     VULKAN,
     GLES,
@@ -68,7 +78,14 @@ data class ExportRenderScope(
     /// Non-empty means the scope requires the Vulkan backend; see the class doc.
     val transitions: List<AndroidTimelineTransitionDescriptor> = emptyList(),
 ) {
-    val requiresVulkan: Boolean get() = transitions.any { !it.isHardCut }
+    val hasNonHardCutTransition: Boolean get() = transitions.any { !it.isHardCut }
+
+    /// P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: true when any clip carries a
+    /// non-null beautyIntensity. Clip-level Beauty V2 is Vulkan-only with no
+    /// GLES fallback, so this alone also forces [requiresVulkan].
+    val hasBeautyClip: Boolean get() = clips.any { it.beautyIntensity != null }
+
+    val requiresVulkan: Boolean get() = hasNonHardCutTransition || hasBeautyClip
 }
 
 class AndroidExportRenderBackendSelector {
@@ -120,6 +137,7 @@ class AndroidExportRenderBackendSelector {
             }
 
             val requiresVulkan = scope?.requiresVulkan == true
+            val requiresVulkanReasonPrefix = requiresVulkanReasonPrefix(scope)
             val actualBackend: ExportRenderBackend
             val reason: String
             when (capabilityBackend) {
@@ -130,7 +148,7 @@ class AndroidExportRenderBackendSelector {
                         reason = "vulkan_export_scope_supported"
                     } else if (requiresVulkan) {
                         actualBackend = ExportRenderBackend.UNAVAILABLE
-                        reason = "$TRANSITIONS_REQUIRE_VULKAN_REASON:$scopeFailureReason"
+                        reason = "$requiresVulkanReasonPrefix:$scopeFailureReason"
                     } else {
                         actualBackend = ExportRenderBackend.GLES
                         reason = scopeFailureReason
@@ -139,7 +157,7 @@ class AndroidExportRenderBackendSelector {
                 ExportRenderBackend.GLES, ExportRenderBackend.UNAVAILABLE -> {
                     if (requiresVulkan) {
                         actualBackend = ExportRenderBackend.UNAVAILABLE
-                        reason = "$TRANSITIONS_REQUIRE_VULKAN_REASON:${report.fallbackReason}"
+                        reason = "$requiresVulkanReasonPrefix:${report.fallbackReason}"
                     } else {
                         actualBackend = ExportRenderBackend.GLES
                         reason = report.fallbackReason
@@ -162,7 +180,7 @@ class AndroidExportRenderBackendSelector {
                 preferredBackend = ExportRenderBackend.UNAVAILABLE,
                 actualBackend = if (requiresVulkan) ExportRenderBackend.UNAVAILABLE else ExportRenderBackend.GLES,
                 reason = if (requiresVulkan) {
-                    "$TRANSITIONS_REQUIRE_VULKAN_REASON:capability_probe_failed:${t.javaClass.simpleName}"
+                    "${requiresVulkanReasonPrefix(scope)}:capability_probe_failed:${t.javaClass.simpleName}"
                 } else {
                     "capability_probe_failed:${t.javaClass.simpleName}"
                 },
@@ -217,11 +235,31 @@ class AndroidExportRenderBackendSelector {
         return if (allSafe) null else "vulkan_scope_not_supported"
     }
 
+    /// Picks the `requires_vulkan` reason prefix for a scope that could not be
+    /// routed to Vulkan. Transition prefix priority is preserved: a scope
+    /// carrying a non-hard-cut transition always reports
+    /// [TRANSITIONS_REQUIRE_VULKAN_REASON], even when it also carries a
+    /// beauty clip -- that failure mode is pre-existing/tested and
+    /// independently sufficient to require Vulkan (see class doc). Only a
+    /// scope with a beauty clip and no non-hard-cut transition reports
+    /// [BEAUTY_REQUIRE_VULKAN_REASON].
+    private fun requiresVulkanReasonPrefix(scope: ExportRenderScope?): String =
+        if (scope?.hasNonHardCutTransition == true) {
+            TRANSITIONS_REQUIRE_VULKAN_REASON
+        } else {
+            BEAUTY_REQUIRE_VULKAN_REASON
+        }
+
     companion object {
         private const val TAG = "VGExportBackendSelector"
 
         /// Reason prefix when a transition timeline cannot be routed to Vulkan
         /// (the underlying capability/scope reason follows after ':').
         const val TRANSITIONS_REQUIRE_VULKAN_REASON = "transitions_require_vulkan"
+
+        /// Reason prefix when a scope carrying a clip-level Beauty V2 request
+        /// (and no non-hard-cut transition) cannot be routed to Vulkan (the
+        /// underlying capability/scope reason follows after ':').
+        const val BEAUTY_REQUIRE_VULKAN_REASON = "beauty_v2_requires_vulkan"
     }
 }

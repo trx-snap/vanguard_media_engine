@@ -86,6 +86,12 @@ class AndroidTimelineVideoEncoder(
         val stillFrameCount: Int = 0,
         val exifOrientation: Int = ExifInterface.ORIENTATION_NORMAL,
         val colorMatrix: FloatArray? = null,
+        // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: optional clip-level Beauty
+        // V2 smoothing intensity in [0.0, 1.0]; null means no beauty.
+        // Consumed ONLY by the Vulkan-only production export route
+        // (AndroidTimelineVulkanVideoEncoder) for solo/hard-cut-adjacent
+        // video frames -- this GLES encoder never reads this field.
+        val beautyIntensity: Double? = null,
     )
 
     data class EncodeResult(
@@ -93,6 +99,7 @@ class AndroidTimelineVideoEncoder(
         val reason: String,
         val writtenVideoSamples: Int,
         val outputSizeBytes: Long,
+        val beautyFrameCount: Int = 0,
     )
 
     @Volatile private var cancelRequested = false

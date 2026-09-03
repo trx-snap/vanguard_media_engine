@@ -12,7 +12,9 @@
 //   createAndroidTimelineVulkanExportSession         -> jstring
 //   renderAndroidTimelineVulkanExportFrame           -> jstring
 //   renderAndroidTimelineVulkanExportFrameCropped     -> jstring (crop + rotationDegrees, 0/90/180/270, dest fit rect,
-//                                                                  Phase 10: optional 20-element raw colorMatrix)
+//                                                                  Phase 10: optional 20-element raw colorMatrix;
+//                                                                  P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: optional
+//                                                                  clip-level Beauty V2 intensity, Vulkan-only)
 //   renderAndroidTimelineVulkanExportTransitionFrame  -> jstring (P5-COMPOSITOR-TRANS: two imported AHardwareBuffers,
 //                                                                  per-layer 9-int geometry + optional colorMatrix,
 //                                                                  compositor-owned transition type code + progress)
@@ -37,6 +39,14 @@
 
 #include "vanguard/compositors/vg_timeline_compositor_node.h"
 #include "vanguard/render/vulkan_backend.h"
+// P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: ComputeVulkanBeautyV2ParametersFromIntensity
+// expands a clip's beautyIntensity into the full Beauty V2 ramp using the
+// CROPPED SOURCE extent (never the output extent), matching the private
+// Vulkan render backend's own beauty ramp math exactly (this JNI is already
+// Android/Vulkan-specific and already sits on the private Vulkan src include
+// path, see target_include_directories(vanguard_media_engine PRIVATE
+// "render/vulkan/src") in src/CMakeLists.txt).
+#include "vulkan_beauty_v2_compositor.h"
 
 // ---------------------------------------------------------------------------
 // AHardwareBuffer_fromHardwareBuffer dynamic lookup
@@ -516,6 +526,19 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 // are raw (un-normalized) on the wire; native normalizes them by /255.0
 // exactly once when building the render transform, matching the GLES
 // backend's uColorMatrixOffset upload.
+// [beautyEnabled]/[beautyIntensity] (P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A):
+// when [beautyEnabled], [beautyIntensity] must be finite and in [0.0, 1.0]
+// -- native fails closed with "beauty_v2_invalid_intensity" before the
+// HardwareBuffer is even resolved on any other value (Kotlin already
+// validates this before the call; this is defense-in-depth). When enabled,
+// native expands the intensity into the full Beauty V2 ramp via
+// ComputeVulkanBeautyV2ParametersFromIntensity using the CROPPED SOURCE
+// extent (cropRight-cropLeft) x (cropBottom-cropTop), never the output
+// extent, and renders through VulkanBackend::renderFrame's beauty-aware
+// overload (VulkanBeautyFrameRenderer). A render failure while
+// [beautyEnabled] is reported with reason
+// "beauty_v2_requires_vulkan:vulkan_render_failed" instead of the generic
+// "render_failed" so callers can distinguish a beauty-specific failure.
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidTimelineVulkanExportFrameCropped(
     JNIEnv*  env,
@@ -535,7 +558,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     jint     destFitHeight,
     jlong    timelinePtsUs,
     jint     frameIndex,
-    jfloatArray colorMatrix) {
+    jfloatArray colorMatrix,
+    jboolean beautyEnabled,
+    jfloat   beautyIntensity) {
 
     char status[512];
 
@@ -543,6 +568,20 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         cropLeft < 0 || cropTop < 0 || cropRight <= cropLeft || cropBottom <= cropTop) {
         std::snprintf(status, sizeof(status),
             "status=FAIL;frameIndex=%d;reason=invalid_crop:invalid_args",
+            static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: beautyIntensity, when present,
+    // must be finite and in [0.0, 1.0]. The Kotlin parser already fails
+    // closed (INVALID_ARG) on malformed values before this native call is
+    // ever made; this is defense-in-depth, matching the colorMatrix length
+    // check below.
+    const bool hasBeauty = beautyEnabled == JNI_TRUE;
+    if (hasBeauty &&
+        (!std::isfinite(beautyIntensity) || beautyIntensity < 0.0f || beautyIntensity > 1.0f)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=beauty_v2_invalid_intensity",
             static_cast<int>(frameIndex));
         return env->NewStringUTF(status);
     }
@@ -681,6 +720,10 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     vanguard::render::RenderFrameResult renderResult =
         vanguard::render::RenderFrameResult::kInvalidBufferHandle;
     bool renderOk = false;
+    // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: overrides the generic
+    // "render_failed" reason below with a machine-readable beauty_v2_*
+    // token when the failure occurred for a beauty-enabled render.
+    const char* renderFailureReason = "render_failed";
 
     if (!cropWithinBuffer) {
         // Fall through without rendering; buffer is still released below.
@@ -703,10 +746,55 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         ApplyLayerTransform(geometry, descriptor,
                             hasColorMatrix ? colorMatrixValues : nullptr, &transform);
 
-        renderResult = session->backend.renderFrame(handle, transform);
-        renderOk =
-            renderResult == vanguard::render::RenderFrameResult::kSuccess ||
-            renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+        // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: expand beautyIntensity into
+        // the full Beauty V2 ramp using the CROPPED SOURCE extent (never the
+        // output extent), matching VideoBeautyV2RenderParams's documented
+        // contract. A disabled/absent beautyIntensity leaves beautyParams at
+        // its all-default (enabled=false) state, which VulkanBackend treats
+        // as byte-identical to the pre-existing non-beauty renderFrame path.
+        vanguard::render::VideoBeautyV2RenderParams beautyParams{};
+        bool beautyRampOk = true;
+        if (hasBeauty) {
+            const uint32_t beautyCropWidth = static_cast<uint32_t>(cropRight - cropLeft);
+            const uint32_t beautyCropHeight = static_cast<uint32_t>(cropBottom - cropTop);
+            vanguard::render::VulkanBeautyV2Parameters vkBeautyParams{};
+            std::string beautyRampErr;
+            beautyRampOk = vanguard::render::ComputeVulkanBeautyV2ParametersFromIntensity(
+                beautyIntensity, beautyCropWidth, beautyCropHeight, &vkBeautyParams, &beautyRampErr);
+            if (beautyRampOk) {
+                beautyParams.enabled = true;
+                beautyParams.radius = vkBeautyParams.radius;
+                beautyParams.sigma = vkBeautyParams.sigma;
+                beautyParams.rangeSigma = vkBeautyParams.rangeSigma;
+                beautyParams.smoothStrength = vkBeautyParams.smoothStrength;
+                beautyParams.sharpenStrength = vkBeautyParams.sharpenStrength;
+                beautyParams.theta = vkBeautyParams.theta;
+                beautyParams.detailDamping = vkBeautyParams.detailDamping;
+                beautyParams.toneStrength = vkBeautyParams.toneStrength;
+                beautyParams.midtoneLift = vkBeautyParams.midtoneLift;
+                beautyParams.cropWidth = beautyCropWidth;
+                beautyParams.cropHeight = beautyCropHeight;
+            }
+        }
+
+        if (!beautyRampOk) {
+            // Defensive-only: Kotlin already validated beautyIntensity in
+            // [0,1] and cropWidth/cropHeight are already guaranteed > 0 by
+            // the crop validation above, so ComputeVulkanBeautyV2ParametersFromIntensity
+            // should never actually fail here. Still fails closed: the
+            // buffer is released below exactly like every other failure path.
+            renderResult = vanguard::render::RenderFrameResult::kVulkanFailure;
+            renderOk = false;
+            renderFailureReason = "beauty_v2_requires_vulkan:ramp_failed";
+        } else {
+            renderResult = session->backend.renderFrame(handle, transform, beautyParams);
+            renderOk =
+                renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+                renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+            if (!renderOk && hasBeauty) {
+                renderFailureReason = "beauty_v2_requires_vulkan:vulkan_render_failed";
+            }
+        }
     }
 
     int releaseFenceFd = -1;
@@ -730,8 +818,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 
     if (!renderOk) {
         std::snprintf(status, sizeof(status),
-            "status=FAIL;frameIndex=%d;reason=render_failed;renderResult=%s",
+            "status=FAIL;frameIndex=%d;reason=%s;renderResult=%s",
             static_cast<int>(frameIndex),
+            renderFailureReason,
             RenderResultName(renderResult));
         return env->NewStringUTF(status);
     }
@@ -752,7 +841,7 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     std::snprintf(status, sizeof(status),
         "status=OK;frameIndex=%d;timelinePtsUs=%lld;renderedFrames=%d;"
         "renderResult=%s;releaseResult=%s;descW=%u;descH=%u;"
-        "destFit=%d,%d-%dx%d;colorMatrix=%d",
+        "destFit=%d,%d-%dx%d;colorMatrix=%d;beauty=%d",
         static_cast<int>(frameIndex),
         static_cast<long long>(timelinePtsUs),
         session->renderedFrames,
@@ -761,7 +850,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         descriptor.width, descriptor.height,
         static_cast<int>(destFitX), static_cast<int>(destFitY),
         static_cast<int>(destFitWidth), static_cast<int>(destFitHeight),
-        hasColorMatrix ? 1 : 0);
+        hasColorMatrix ? 1 : 0,
+        hasBeauty ? 1 : 0);
     return env->NewStringUTF(status);
 }
 
