@@ -554,6 +554,75 @@ struct VulkanBeautyFrameRenderer::Impl {
         return true;
     }
 
+    // ── P5-BEAUTY-V2-TRANSITION-COMP: shared setup for recordBeauty and
+    // prepareTransitionLayer. Validates beauty params, ensures shared
+    // resources plus this (cropWidth,cropHeight) geometry and this frame
+    // slot's crop/placement pipelines exist. Returns the geometry on success
+    // (its slots[frameSlotIndex] is the caller's SlotResources) and fills
+    // *outParams with the validated Beauty V2 ramp.
+    GeometryResources* prepareCommon(VkDevice device, VkPhysicalDevice physicalDevice,
+                                     VkShaderModule vertexModule, VkShaderModule fragmentModule,
+                                     const VideoBeautyV2RenderParams& beauty,
+                                     uint32_t frameSlotIndex, uint32_t frameCount,
+                                     VkPipelineLayout srcPipelineLayout,
+                                     VkRenderPass swapchainRenderPass,
+                                     VulkanBeautyV2Parameters* outParams,
+                                     std::string* outFailureReason) {
+        if (!beauty.enabled || beauty.cropWidth == 0 || beauty.cropHeight == 0 ||
+            frameCount == 0 || frameSlotIndex >= frameCount) {
+            SetErr(outFailureReason, kErrInvalidDimensions);
+            return nullptr;
+        }
+
+        VulkanBeautyV2Parameters params{};
+        params.radius = beauty.radius;
+        params.sigma = beauty.sigma;
+        params.rangeSigma = beauty.rangeSigma;
+        params.smoothStrength = beauty.smoothStrength;
+        params.sharpenStrength = beauty.sharpenStrength;
+        params.theta = beauty.theta;
+        params.detailDamping = beauty.detailDamping;
+        params.toneStrength = beauty.toneStrength;
+        params.midtoneLift = beauty.midtoneLift;
+        {
+            std::string ignored;
+            if (!ValidateVulkanBeautyV2Parameters(params, beauty.cropWidth, beauty.cropHeight, &ignored)) {
+                SetErr(outFailureReason, kErrInvalidParameters);
+                return nullptr;
+            }
+        }
+
+        if (!ensureSharedResources(device, vertexModule, fragmentModule, outFailureReason)) {
+            return nullptr;
+        }
+        GeometryResources* geom = findOrCreateGeometry(
+            device, physicalDevice, beauty.cropWidth, beauty.cropHeight, frameCount, outFailureReason);
+        if (geom == nullptr) {
+            return nullptr;
+        }
+        if (!ensureCropPipeline(device, frameSlotIndex, frameCount, srcPipelineLayout, outFailureReason)) {
+            return nullptr;
+        }
+        if (!ensurePlacementPipeline(device, frameSlotIndex, frameCount, swapchainRenderPass, outFailureReason)) {
+            return nullptr;
+        }
+        *outParams = params;
+        return geom;
+    }
+
+    // P5-BEAUTY-V2-TRANSITION-COMP: records passes 1-4 (crop -> blurH ->
+    // blurV -> composite, see the file header) into commandBuffer for slot,
+    // using the already-validated params. Never begins/ends the command
+    // buffer. Defined out-of-line (after RecordFullExtentPass) below.
+    void recordPasses1To4(VkCommandBuffer commandBuffer,
+                          const VulkanHardwareBufferImage& srcImage,
+                          VkImageLayout srcCurrentLayout,
+                          const VideoFrameTransform& layerTransform,
+                          const VideoBeautyV2RenderParams& beauty,
+                          const VulkanBeautyV2Parameters& params,
+                          uint32_t frameSlotIndex,
+                          SlotResources& slot);
+
     // ── Per-geometry resource cache. ─────────────────────────────────────
     bool createRgbaImage(VkDevice device, VkPhysicalDevice physicalDevice,
                          uint32_t width, uint32_t height, RgbaImage* out, std::string* outError) {
@@ -949,6 +1018,130 @@ void RecordFullExtentPass(VkCommandBuffer cb, VkRenderPass renderPass, VkFramebu
 
 } // namespace
 
+// P5-BEAUTY-V2-TRANSITION-COMP: out-of-line so it can call RecordFullExtentPass
+// (anonymous-namespace helper defined immediately above).
+void VulkanBeautyFrameRenderer::Impl::recordPasses1To4(
+    VkCommandBuffer commandBuffer,
+    const VulkanHardwareBufferImage& srcImage,
+    VkImageLayout srcCurrentLayout,
+    const VideoFrameTransform& layerTransform,
+    const VideoBeautyV2RenderParams& beauty,
+    const VulkanBeautyV2Parameters& params,
+    uint32_t frameSlotIndex,
+    SlotResources& slot) {
+    // ── Pass 1: crop — srcImage -> slot.orig (identity rotation, caller's crop scale/bias). ──
+    if (srcCurrentLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        srcImage.recordLayoutTransition(
+            commandBuffer,
+            VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0,
+            VK_ACCESS_SHADER_READ_BIT);
+    }
+    {
+        VideoFrameTransform cropOnly{};
+        cropOnly.rotationDegrees = 0;
+        cropOnly.mirrorHorizontal = false;
+        cropOnly.cropScaleU = layerTransform.cropScaleU;
+        cropOnly.cropScaleV = layerTransform.cropScaleV;
+        cropOnly.cropBiasU = layerTransform.cropBiasU;
+        cropOnly.cropBiasV = layerTransform.cropBiasV;
+        const VideoTransformFullPushConstants pc = makeVideoTransformFullPushConstants(cropOnly);
+
+        VkClearValue clearValue{};
+        clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+        VkRenderPassBeginInfo rpBegin{};
+        rpBegin.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rpBegin.renderPass        = intermediateRenderPass;
+        rpBegin.framebuffer       = slot.fboOrig;
+        rpBegin.renderArea.offset = {0, 0};
+        rpBegin.renderArea.extent = {beauty.cropWidth, beauty.cropHeight};
+        rpBegin.clearValueCount   = 1;
+        rpBegin.pClearValues      = &clearValue;
+        vkCmdBeginRenderPass(commandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+
+        VkViewport viewport{};
+        viewport.width = static_cast<float>(beauty.cropWidth);
+        viewport.height = static_cast<float>(beauty.cropHeight);
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+        VkRect2D scissor{};
+        scissor.extent = {beauty.cropWidth, beauty.cropHeight};
+        vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          cropPipelineSlots[frameSlotIndex].pipeline.get());
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                srcImage.descriptorResources.pipelineLayout, 0, 1,
+                                &srcImage.descriptorResources.descriptorSet, 0, nullptr);
+        // Crop pipeline layout uses ONE combined VERTEX|FRAGMENT push range at
+        // offset 0 (matching VulkanDescriptorResources / the non-beauty solo
+        // path), unlike the split vertex/fragment ranges used by the
+        // blur/composite passes below.
+        vkCmdPushConstants(commandBuffer, srcImage.descriptorResources.pipelineLayout,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                           0, sizeof(pc), &pc);
+        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        vkCmdEndRenderPass(commandBuffer);
+    }
+
+    // ── Pass 2: blur H — slot.orig -> slot.blurH. ──
+    {
+        const VertexUvPushConstants identityUv = IdentityUvPushConstants();
+        BlurPushConstants pc{};
+        pc.width = static_cast<int32_t>(beauty.cropWidth);
+        pc.height = static_cast<int32_t>(beauty.cropHeight);
+        pc.radius = params.radius;
+        pc.axis = 0;
+        pc.sigma = params.sigma;
+        pc.rangeSigma = params.rangeSigma;
+        RecordFullExtentPass(commandBuffer, intermediateRenderPass, slot.fboBlurH,
+                             beauty.cropWidth, beauty.cropHeight, blurPipeline.get(),
+                             blurPipelineLayout, slot.blurSetH,
+                             &identityUv, sizeof(identityUv),
+                             &pc, static_cast<uint32_t>(sizeof(VertexUvPushConstants)), sizeof(pc));
+    }
+
+    // ── Pass 3: blur V — slot.blurH -> slot.mean. ──
+    {
+        const VertexUvPushConstants identityUv = IdentityUvPushConstants();
+        BlurPushConstants pc{};
+        pc.width = static_cast<int32_t>(beauty.cropWidth);
+        pc.height = static_cast<int32_t>(beauty.cropHeight);
+        pc.radius = params.radius;
+        pc.axis = 1;
+        pc.sigma = params.sigma;
+        pc.rangeSigma = params.rangeSigma;
+        RecordFullExtentPass(commandBuffer, intermediateRenderPass, slot.fboMean,
+                             beauty.cropWidth, beauty.cropHeight, blurPipeline.get(),
+                             blurPipelineLayout, slot.blurSetV,
+                             &identityUv, sizeof(identityUv),
+                             &pc, static_cast<uint32_t>(sizeof(VertexUvPushConstants)), sizeof(pc));
+    }
+
+    // ── Pass 4: composite — slot.orig + slot.mean -> slot.beautified. ──
+    {
+        const VertexUvPushConstants identityUv = IdentityUvPushConstants();
+        CompositePushConstants pc{};
+        pc.width = static_cast<int32_t>(beauty.cropWidth);
+        pc.height = static_cast<int32_t>(beauty.cropHeight);
+        pc.smoothStrength = params.smoothStrength;
+        pc.sharpenStrength = params.sharpenStrength;
+        pc.theta = params.theta;
+        pc.detailDamping = params.detailDamping;
+        pc.toneStrength = params.toneStrength;
+        pc.midtoneLift = params.midtoneLift;
+        RecordFullExtentPass(commandBuffer, intermediateRenderPass, slot.fboBeautified,
+                             beauty.cropWidth, beauty.cropHeight, compositePipeline.get(),
+                             compositePipelineLayout, slot.compositeSet,
+                             &identityUv, sizeof(identityUv),
+                             &pc, static_cast<uint32_t>(sizeof(VertexUvPushConstants)), sizeof(pc));
+    }
+}
+
 bool VulkanBeautyFrameRenderer::recordBeauty(
     VkDevice device,
     VkPhysicalDevice physicalDevice,
@@ -978,160 +1171,18 @@ bool VulkanBeautyFrameRenderer::recordBeauty(
         SetErr(outFailureReason, kErrInvalidArguments);
         return false;
     }
-    if (!beauty.enabled || beauty.cropWidth == 0 || beauty.cropHeight == 0 ||
-        frameCount == 0 || frameSlotIndex >= frameCount) {
-        SetErr(outFailureReason, kErrInvalidDimensions);
-        return false;
-    }
-
     VulkanBeautyV2Parameters params{};
-    params.radius = beauty.radius;
-    params.sigma = beauty.sigma;
-    params.rangeSigma = beauty.rangeSigma;
-    params.smoothStrength = beauty.smoothStrength;
-    params.sharpenStrength = beauty.sharpenStrength;
-    params.theta = beauty.theta;
-    params.detailDamping = beauty.detailDamping;
-    params.toneStrength = beauty.toneStrength;
-    params.midtoneLift = beauty.midtoneLift;
-    {
-        std::string ignored;
-        if (!ValidateVulkanBeautyV2Parameters(params, beauty.cropWidth, beauty.cropHeight, &ignored)) {
-            SetErr(outFailureReason, kErrInvalidParameters);
-            return false;
-        }
-    }
-
-    if (!impl_->ensureSharedResources(device, vertexModule, fragmentModule, outFailureReason)) {
-        return false;
-    }
-    Impl::GeometryResources* geom = impl_->findOrCreateGeometry(
-        device, physicalDevice, beauty.cropWidth, beauty.cropHeight, frameCount, outFailureReason);
+    Impl::GeometryResources* geom = impl_->prepareCommon(
+        device, physicalDevice, vertexModule, fragmentModule, beauty,
+        frameSlotIndex, frameCount, srcImage.descriptorResources.pipelineLayout,
+        finalRenderPass, &params, outFailureReason);
     if (geom == nullptr) {
         return false;
     }
     Impl::SlotResources& slot = geom->slots[frameSlotIndex];
 
-    if (!impl_->ensureCropPipeline(device, frameSlotIndex, frameCount,
-                                   srcImage.descriptorResources.pipelineLayout, outFailureReason)) {
-        return false;
-    }
-    if (!impl_->ensurePlacementPipeline(device, frameSlotIndex, frameCount,
-                                        finalRenderPass, outFailureReason)) {
-        return false;
-    }
-
-    // ── Pass 1: crop — srcImage -> slot.orig (identity rotation, caller's crop scale/bias). ──
-    if (srcCurrentLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
-        srcImage.recordLayoutTransition(
-            commandBuffer,
-            VK_IMAGE_LAYOUT_UNDEFINED,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-            0,
-            VK_ACCESS_SHADER_READ_BIT);
-    }
-    {
-        VideoFrameTransform cropOnly{};
-        cropOnly.rotationDegrees = 0;
-        cropOnly.mirrorHorizontal = false;
-        cropOnly.cropScaleU = placementTransform.cropScaleU;
-        cropOnly.cropScaleV = placementTransform.cropScaleV;
-        cropOnly.cropBiasU = placementTransform.cropBiasU;
-        cropOnly.cropBiasV = placementTransform.cropBiasV;
-        const VideoTransformFullPushConstants pc = makeVideoTransformFullPushConstants(cropOnly);
-
-        VkClearValue clearValue{};
-        clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
-        VkRenderPassBeginInfo rpBegin{};
-        rpBegin.sType             = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        rpBegin.renderPass        = impl_->intermediateRenderPass;
-        rpBegin.framebuffer       = slot.fboOrig;
-        rpBegin.renderArea.offset = {0, 0};
-        rpBegin.renderArea.extent = {beauty.cropWidth, beauty.cropHeight};
-        rpBegin.clearValueCount   = 1;
-        rpBegin.pClearValues      = &clearValue;
-        vkCmdBeginRenderPass(commandBuffer, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
-
-        VkViewport viewport{};
-        viewport.width = static_cast<float>(beauty.cropWidth);
-        viewport.height = static_cast<float>(beauty.cropHeight);
-        viewport.minDepth = 0.0f;
-        viewport.maxDepth = 1.0f;
-        vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
-        VkRect2D scissor{};
-        scissor.extent = {beauty.cropWidth, beauty.cropHeight};
-        vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
-
-        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                          impl_->cropPipelineSlots[frameSlotIndex].pipeline.get());
-        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                srcImage.descriptorResources.pipelineLayout, 0, 1,
-                                &srcImage.descriptorResources.descriptorSet, 0, nullptr);
-        // Crop pipeline layout uses ONE combined VERTEX|FRAGMENT push range at
-        // offset 0 (matching VulkanDescriptorResources / the non-beauty solo
-        // path), unlike the split vertex/fragment ranges used by the
-        // blur/composite passes below.
-        vkCmdPushConstants(commandBuffer, srcImage.descriptorResources.pipelineLayout,
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                           0, sizeof(pc), &pc);
-        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
-        vkCmdEndRenderPass(commandBuffer);
-    }
-
-    // ── Pass 2: blur H — slot.orig -> slot.blurH. ──
-    {
-        const VertexUvPushConstants identityUv = IdentityUvPushConstants();
-        BlurPushConstants pc{};
-        pc.width = static_cast<int32_t>(beauty.cropWidth);
-        pc.height = static_cast<int32_t>(beauty.cropHeight);
-        pc.radius = params.radius;
-        pc.axis = 0;
-        pc.sigma = params.sigma;
-        pc.rangeSigma = params.rangeSigma;
-        RecordFullExtentPass(commandBuffer, impl_->intermediateRenderPass, slot.fboBlurH,
-                             beauty.cropWidth, beauty.cropHeight, impl_->blurPipeline.get(),
-                             impl_->blurPipelineLayout, slot.blurSetH,
-                             &identityUv, sizeof(identityUv),
-                             &pc, static_cast<uint32_t>(sizeof(VertexUvPushConstants)), sizeof(pc));
-    }
-
-    // ── Pass 3: blur V — slot.blurH -> slot.mean. ──
-    {
-        const VertexUvPushConstants identityUv = IdentityUvPushConstants();
-        BlurPushConstants pc{};
-        pc.width = static_cast<int32_t>(beauty.cropWidth);
-        pc.height = static_cast<int32_t>(beauty.cropHeight);
-        pc.radius = params.radius;
-        pc.axis = 1;
-        pc.sigma = params.sigma;
-        pc.rangeSigma = params.rangeSigma;
-        RecordFullExtentPass(commandBuffer, impl_->intermediateRenderPass, slot.fboMean,
-                             beauty.cropWidth, beauty.cropHeight, impl_->blurPipeline.get(),
-                             impl_->blurPipelineLayout, slot.blurSetV,
-                             &identityUv, sizeof(identityUv),
-                             &pc, static_cast<uint32_t>(sizeof(VertexUvPushConstants)), sizeof(pc));
-    }
-
-    // ── Pass 4: composite — slot.orig + slot.mean -> slot.beautified. ──
-    {
-        const VertexUvPushConstants identityUv = IdentityUvPushConstants();
-        CompositePushConstants pc{};
-        pc.width = static_cast<int32_t>(beauty.cropWidth);
-        pc.height = static_cast<int32_t>(beauty.cropHeight);
-        pc.smoothStrength = params.smoothStrength;
-        pc.sharpenStrength = params.sharpenStrength;
-        pc.theta = params.theta;
-        pc.detailDamping = params.detailDamping;
-        pc.toneStrength = params.toneStrength;
-        pc.midtoneLift = params.midtoneLift;
-        RecordFullExtentPass(commandBuffer, impl_->intermediateRenderPass, slot.fboBeautified,
-                             beauty.cropWidth, beauty.cropHeight, impl_->compositePipeline.get(),
-                             impl_->compositePipelineLayout, slot.compositeSet,
-                             &identityUv, sizeof(identityUv),
-                             &pc, static_cast<uint32_t>(sizeof(VertexUvPushConstants)), sizeof(pc));
-    }
+    impl_->recordPasses1To4(commandBuffer, srcImage, srcCurrentLayout, placementTransform,
+                            beauty, params, frameSlotIndex, slot);
 
     // ── Pass 5: placement — slot.beautified -> caller's swapchain framebuffer. ──
     {
@@ -1197,6 +1248,62 @@ bool VulkanBeautyFrameRenderer::recordBeauty(
     return true;
 }
 
+bool VulkanBeautyFrameRenderer::prepareTransitionLayer(
+    VkDevice device,
+    VkPhysicalDevice physicalDevice,
+    VkCommandBuffer commandBuffer,
+    uint32_t frameSlotIndex,
+    uint32_t frameCount,
+    const VulkanHardwareBufferImage& srcImage,
+    VkImageLayout srcCurrentLayout,
+    VkShaderModule vertexModule,
+    VkShaderModule fragmentModule,
+    const VideoFrameTransform& layerTransform,
+    const VideoBeautyV2RenderParams& beauty,
+    VkRenderPass swapchainRenderPass,
+    VulkanBeautyTransitionLayerResources* outResources,
+    std::string* outFailureReason) {
+    if (outFailureReason) outFailureReason->clear();
+    if (outResources == nullptr) {
+        SetErr(outFailureReason, kErrInvalidArguments);
+        return false;
+    }
+    *outResources = VulkanBeautyTransitionLayerResources{};
+
+    if (device == VK_NULL_HANDLE || physicalDevice == VK_NULL_HANDLE ||
+        commandBuffer == VK_NULL_HANDLE || vertexModule == VK_NULL_HANDLE ||
+        fragmentModule == VK_NULL_HANDLE || swapchainRenderPass == VK_NULL_HANDLE ||
+        srcImage.image == VK_NULL_HANDLE ||
+        srcImage.descriptorResources.pipelineLayout == VK_NULL_HANDLE ||
+        srcImage.descriptorResources.descriptorSet == VK_NULL_HANDLE) {
+        SetErr(outFailureReason, kErrInvalidArguments);
+        return false;
+    }
+
+    VulkanBeautyV2Parameters params{};
+    Impl::GeometryResources* geom = impl_->prepareCommon(
+        device, physicalDevice, vertexModule, fragmentModule, beauty,
+        frameSlotIndex, frameCount, srcImage.descriptorResources.pipelineLayout,
+        swapchainRenderPass, &params, outFailureReason);
+    if (geom == nullptr) {
+        return false;
+    }
+    Impl::SlotResources& slot = geom->slots[frameSlotIndex];
+
+    impl_->recordPasses1To4(commandBuffer, srcImage, srcCurrentLayout, layerTransform,
+                            beauty, params, frameSlotIndex, slot);
+
+    outResources->pipeline = impl_->placementPipelineSlots[frameSlotIndex].pipeline.get();
+    outResources->pipelineLayout = impl_->placementPipelineLayout;
+    outResources->descriptorSet = slot.placementSet;
+    outResources->placementTransform = layerTransform;
+    outResources->placementTransform.cropScaleU = 1.0f;
+    outResources->placementTransform.cropScaleV = 1.0f;
+    outResources->placementTransform.cropBiasU = 0.0f;
+    outResources->placementTransform.cropBiasV = 0.0f;
+    return true;
+}
+
 void VulkanBeautyFrameRenderer::shutdown(VkDevice device) {
     if (impl_) {
         impl_->shutdownAll(device);
@@ -1241,6 +1348,26 @@ bool VulkanBeautyFrameRenderer::recordBeauty(
     uint32_t /*finalExtentWidth*/,
     uint32_t /*finalExtentHeight*/,
     std::string* outFailureReason) {
+    if (outFailureReason) *outFailureReason = "beauty_v2_unavailable_on_host";
+    return false;
+}
+
+bool VulkanBeautyFrameRenderer::prepareTransitionLayer(
+    void* /*device*/,
+    void* /*physicalDevice*/,
+    void* /*commandBuffer*/,
+    uint32_t /*frameSlotIndex*/,
+    uint32_t /*frameCount*/,
+    const VulkanHardwareBufferImage& /*srcImage*/,
+    uint32_t /*srcCurrentLayout*/,
+    void* /*vertexModule*/,
+    void* /*fragmentModule*/,
+    const VideoFrameTransform& /*layerTransform*/,
+    const VideoBeautyV2RenderParams& /*beauty*/,
+    void* /*swapchainRenderPass*/,
+    VulkanBeautyTransitionLayerResources* outResources,
+    std::string* outFailureReason) {
+    if (outResources) *outResources = VulkanBeautyTransitionLayerResources{};
     if (outFailureReason) *outFailureReason = "beauty_v2_unavailable_on_host";
     return false;
 }

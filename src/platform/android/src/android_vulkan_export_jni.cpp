@@ -879,6 +879,21 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 // be finite in [0, 1]. Every failure is reported with a machine-readable
 // reason plus transitionType / progress / frameIndex, and success reports
 // renderedFrames and both release results.
+//
+// P5-BEAUTY-V2-TRANSITION-COMP: [fromBeautyEnabled]/[fromBeautyIntensity] and
+// [toBeautyEnabled]/[toBeautyIntensity] are optional per-layer Beauty V2
+// requests, following the cropped solo route's contract: when enabled, the
+// intensity must be finite and in [0.0, 1.0] (fails closed with
+// "beauty_v2_invalid_intensity:layer=<from|to>" otherwise, before either
+// HardwareBuffer is even resolved). When enabled, native expands the
+// intensity into the full Beauty V2 ramp via
+// ComputeVulkanBeautyV2ParametersFromIntensity using THAT layer's CROPPED
+// SOURCE extent (cropRight-cropLeft) x (cropBottom-cropTop) from the
+// validated layer geometry, never the output extent, and renders through
+// VulkanBackend::renderTransitionFrame's beauty-aware overload. A render
+// failure while either layer is beauty-enabled is reported with reason
+// "beauty_v2_requires_vulkan:vulkan_render_failed" instead of the generic
+// "render_failed" so callers can distinguish a beauty-specific failure.
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndroidTimelineVulkanExportTransitionFrame(
     JNIEnv*     env,
@@ -891,9 +906,13 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     jobject     fromHardwareBufferJ,
     jintArray   fromLayerGeometryJ,
     jfloatArray fromColorMatrixJ,
+    jboolean    fromBeautyEnabled,
+    jfloat      fromBeautyIntensity,
     jobject     toHardwareBufferJ,
     jintArray   toLayerGeometryJ,
     jfloatArray toColorMatrixJ,
+    jboolean    toBeautyEnabled,
+    jfloat      toBeautyIntensity,
     jlong       timelinePtsUs,
     jint        frameIndex) {
 
@@ -922,6 +941,29 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         std::snprintf(status, sizeof(status),
             "status=FAIL;reason=transition_progress_invalid;transitionType=%s;progress=%.4f;"
             "frameIndex=%d",
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+
+    // P5-BEAUTY-V2-TRANSITION-COMP: fromBeautyIntensity/toBeautyIntensity,
+    // when enabled, must each be finite and in [0.0, 1.0]. Kotlin already
+    // validates this before the call; this is defense-in-depth, matching the
+    // cropped solo route's identical check.
+    const bool hasFromBeauty = fromBeautyEnabled == JNI_TRUE;
+    const bool hasToBeauty = toBeautyEnabled == JNI_TRUE;
+    if (hasFromBeauty &&
+        (!std::isfinite(fromBeautyIntensity) || fromBeautyIntensity < 0.0f || fromBeautyIntensity > 1.0f)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=beauty_v2_invalid_intensity:layer=from;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
+    }
+    if (hasToBeauty &&
+        (!std::isfinite(toBeautyIntensity) || toBeautyIntensity < 0.0f || toBeautyIntensity > 1.0f)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=beauty_v2_invalid_intensity:layer=to;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
             typeName, progressValue, static_cast<int>(frameIndex));
         return env->NewStringUTF(status);
     }
@@ -1075,6 +1117,11 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     vanguard::render::RenderFrameResult renderResult =
         vanguard::render::RenderFrameResult::kInvalidBufferHandle;
     bool renderOk = false;
+    // P5-BEAUTY-V2-TRANSITION-COMP: overrides the generic "render_failed"
+    // reason below with a machine-readable beauty_v2_* token when the
+    // failure occurred for a beauty-enabled layer.
+    const char* renderFailureReason = "render_failed";
+    char beautyFailureReasonBuf[96];
 
     if (fromCropOk && toCropOk) {
         vanguard::render::VideoTransitionFrameTransform transition{};
@@ -1092,10 +1139,86 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         transition.fromCrop = ToRenderRect(geometry.fromCrop);
         transition.toCrop = ToRenderRect(geometry.toCrop);
 
-        renderResult = session->backend.renderTransitionFrame(fromHandle, toHandle, transition);
-        renderOk =
-            renderResult == vanguard::render::RenderFrameResult::kSuccess ||
-            renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+        // P5-BEAUTY-V2-TRANSITION-COMP: expand each enabled layer's
+        // beautyIntensity into the full Beauty V2 ramp using that layer's
+        // CROPPED SOURCE extent from the validated layer geometry (never the
+        // output extent), matching the cropped solo route's contract. A
+        // disabled layer leaves its VideoBeautyV2RenderParams at its
+        // all-default (enabled=false) state.
+        vanguard::render::VideoBeautyV2RenderParams fromBeautyParams{};
+        vanguard::render::VideoBeautyV2RenderParams toBeautyParams{};
+        bool beautyRampOk = true;
+        const char* beautyRampFailLayer = nullptr;
+        if (hasFromBeauty) {
+            const uint32_t cropWidth = static_cast<uint32_t>(fromGeometry.cropRight - fromGeometry.cropLeft);
+            const uint32_t cropHeight = static_cast<uint32_t>(fromGeometry.cropBottom - fromGeometry.cropTop);
+            vanguard::render::VulkanBeautyV2Parameters vkBeautyParams{};
+            std::string beautyRampErr;
+            if (!vanguard::render::ComputeVulkanBeautyV2ParametersFromIntensity(
+                    fromBeautyIntensity, cropWidth, cropHeight, &vkBeautyParams, &beautyRampErr)) {
+                beautyRampOk = false;
+                beautyRampFailLayer = "from";
+            } else {
+                fromBeautyParams.enabled = true;
+                fromBeautyParams.radius = vkBeautyParams.radius;
+                fromBeautyParams.sigma = vkBeautyParams.sigma;
+                fromBeautyParams.rangeSigma = vkBeautyParams.rangeSigma;
+                fromBeautyParams.smoothStrength = vkBeautyParams.smoothStrength;
+                fromBeautyParams.sharpenStrength = vkBeautyParams.sharpenStrength;
+                fromBeautyParams.theta = vkBeautyParams.theta;
+                fromBeautyParams.detailDamping = vkBeautyParams.detailDamping;
+                fromBeautyParams.toneStrength = vkBeautyParams.toneStrength;
+                fromBeautyParams.midtoneLift = vkBeautyParams.midtoneLift;
+                fromBeautyParams.cropWidth = cropWidth;
+                fromBeautyParams.cropHeight = cropHeight;
+            }
+        }
+        if (beautyRampOk && hasToBeauty) {
+            const uint32_t cropWidth = static_cast<uint32_t>(toGeometry.cropRight - toGeometry.cropLeft);
+            const uint32_t cropHeight = static_cast<uint32_t>(toGeometry.cropBottom - toGeometry.cropTop);
+            vanguard::render::VulkanBeautyV2Parameters vkBeautyParams{};
+            std::string beautyRampErr;
+            if (!vanguard::render::ComputeVulkanBeautyV2ParametersFromIntensity(
+                    toBeautyIntensity, cropWidth, cropHeight, &vkBeautyParams, &beautyRampErr)) {
+                beautyRampOk = false;
+                beautyRampFailLayer = "to";
+            } else {
+                toBeautyParams.enabled = true;
+                toBeautyParams.radius = vkBeautyParams.radius;
+                toBeautyParams.sigma = vkBeautyParams.sigma;
+                toBeautyParams.rangeSigma = vkBeautyParams.rangeSigma;
+                toBeautyParams.smoothStrength = vkBeautyParams.smoothStrength;
+                toBeautyParams.sharpenStrength = vkBeautyParams.sharpenStrength;
+                toBeautyParams.theta = vkBeautyParams.theta;
+                toBeautyParams.detailDamping = vkBeautyParams.detailDamping;
+                toBeautyParams.toneStrength = vkBeautyParams.toneStrength;
+                toBeautyParams.midtoneLift = vkBeautyParams.midtoneLift;
+                toBeautyParams.cropWidth = cropWidth;
+                toBeautyParams.cropHeight = cropHeight;
+            }
+        }
+
+        if (!beautyRampOk) {
+            // Defensive-only: Kotlin already validated beautyIntensity in
+            // [0,1] and cropWidth/cropHeight are already guaranteed > 0 by
+            // the crop validation above, so ComputeVulkanBeautyV2ParametersFromIntensity
+            // should never actually fail here. Still fails closed: both
+            // buffers are released below exactly like every other failure path.
+            renderResult = vanguard::render::RenderFrameResult::kVulkanFailure;
+            renderOk = false;
+            std::snprintf(beautyFailureReasonBuf, sizeof(beautyFailureReasonBuf),
+                "beauty_v2_requires_vulkan:ramp_failed:layer=%s", beautyRampFailLayer);
+            renderFailureReason = beautyFailureReasonBuf;
+        } else {
+            renderResult = session->backend.renderTransitionFrame(
+                fromHandle, toHandle, transition, fromBeautyParams, toBeautyParams);
+            renderOk =
+                renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+                renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+            if (!renderOk && (hasFromBeauty || hasToBeauty)) {
+                renderFailureReason = "beauty_v2_requires_vulkan:vulkan_render_failed";
+            }
+        }
     }
 
     int fromReleaseFenceFd = -1;
@@ -1129,8 +1252,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
 
     if (!renderOk) {
         std::snprintf(status, sizeof(status),
-            "status=FAIL;reason=render_failed;renderResult=%s;fromReleaseResult=%s;"
+            "status=FAIL;reason=%s;renderResult=%s;fromReleaseResult=%s;"
             "toReleaseResult=%s;transitionType=%s;progress=%.4f;frameIndex=%d",
+            renderFailureReason,
             RenderResultName(renderResult),
             HwBufResultName(fromReleaseResult), HwBufResultName(toReleaseResult),
             typeName, progressValue, static_cast<int>(frameIndex));
@@ -1153,7 +1277,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         "status=OK;frameIndex=%d;timelinePtsUs=%lld;renderedFrames=%d;transitionType=%s;"
         "progress=%.4f;renderResult=%s;fromReleaseResult=%s;toReleaseResult=%s;"
         "fromDescW=%u;fromDescH=%u;toDescW=%u;toDescH=%u;"
-        "fromDestFit=%d,%d-%dx%d;toDestFit=%d,%d-%dx%d;fromColorMatrix=%d;toColorMatrix=%d",
+        "fromDestFit=%d,%d-%dx%d;toDestFit=%d,%d-%dx%d;fromColorMatrix=%d;toColorMatrix=%d;"
+        "fromBeauty=%d;toBeauty=%d",
         static_cast<int>(frameIndex),
         static_cast<long long>(timelinePtsUs),
         session->renderedFrames,
@@ -1166,7 +1291,8 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         toDescriptor.width, toDescriptor.height,
         fromGeometry.destFitX, fromGeometry.destFitY, fromGeometry.destFitWidth, fromGeometry.destFitHeight,
         toGeometry.destFitX, toGeometry.destFitY, toGeometry.destFitWidth, toGeometry.destFitHeight,
-        hasFromColorMatrix ? 1 : 0, hasToColorMatrix ? 1 : 0);
+        hasFromColorMatrix ? 1 : 0, hasToColorMatrix ? 1 : 0,
+        hasFromBeauty ? 1 : 0, hasToBeauty ? 1 : 0);
     return env->NewStringUTF(status);
 }
 

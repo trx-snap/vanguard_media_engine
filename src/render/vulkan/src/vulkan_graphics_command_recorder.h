@@ -236,6 +236,16 @@ public:
         uint32_t flags = 0
 #endif
     );
+
+    // P5-BEAUTY-V2-TRANSITION-COMP: validated body-only seam for use after
+    // the caller has already called vkBeginCommandBuffer itself (the beauty
+    // transition path, which must interleave beauty pre-passes between begin
+    // and this body). Validates every handle / extent / scissor exactly like
+    // [recordTransitionPass] above, then records the optional source layout
+    // transitions, one clear render pass over the full extent, and every
+    // layer draw in order -- WITHOUT beginning or ending the command buffer.
+    // Returns false (recording nothing) on any invalid parameter.
+    static bool recordTransitionPassBody(const VulkanTransitionPassParams& params);
 };
 
 } // namespace render

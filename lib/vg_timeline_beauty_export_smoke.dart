@@ -1,5 +1,5 @@
 // vg_timeline_beauty_export_smoke.dart
-// vanguard_media_engine — P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A:
+// vanguard_media_engine — P5-BEAUTY-V2-TRANSITION-COMP:
 // Android production `exportTimeline` Beauty V2 smoke proof model.
 //
 // Pure Dart typed model + lane runner over the REAL production
@@ -12,8 +12,9 @@
 // Contract mirrored from AndroidTimelineExportSession /
 // AndroidExportRenderBackendSelector / AndroidTimelineVulkanVideoEncoder:
 //   - Proof boundary: `production_exportTimeline_vulkan_beauty_v2_route`;
-//   - Claims only production routing/fail-closed behavior on Android, not pixel
-//     quality, fleet, playback, GLES beauty, transitions+beauty, app/editor UI,
+//   - Claims production routing/fail-closed behavior on Android including
+//     Beauty V2 + Vulkan transition composition, but still does not claim
+//     pixel quality, fleet coverage, playback, GLES beauty, app/editor UI,
 //     iOS, or streaming/cache;
 //   - Pass marker: `ANDROID_TIMELINE_BEAUTY_EXPORT_PHYSICAL_SMOKE_PASS`;
 //   - Fail marker: `ANDROID_TIMELINE_BEAUTY_EXPORT_PHYSICAL_SMOKE_FAIL`;
@@ -21,8 +22,8 @@
 //   - Lane prefix: `ANDROID_TIMELINE_BEAUTY_EXPORT_LANE:`;
 //   - Validates success lanes: `success == true`, output file exists,
 //     `renderBackend == 'vulkan'`, duration within 0.25s, `beautyClipCount`
-//     equals expected, and `beautyFrameCount` is >0 when
-//     `expectedBeautyFrameCountPositive` is true;
+//     equals expected, and `beautyFrameCount` matches exact or min/max constraints,
+//     or is >0 when `expectedBeautyFrameCountPositive` is true;
 //   - Fail-closed lanes validate PlatformException code and message token;
 //   - Whole report requires at least one positive lane and all lanes pass.
 
@@ -58,10 +59,6 @@ const String invalidArgCode = 'INVALID_ARG';
 
 /// Token carried by fail-closed message when Beauty V2 requires Vulkan.
 const String beautyV2RequiresVulkanToken = 'beauty_v2_requires_vulkan';
-
-/// Token carried by fail-closed message when Beauty V2 is used alongside transitions.
-const String beautyV2UnsupportedWithTransitionToken =
-    'beauty_v2_unsupported_with_transition';
 
 /// Token carried by fail-closed message when beautyIntensity argument is invalid.
 const String beautyIntensityToken = 'beautyIntensity';
@@ -146,6 +143,9 @@ class VGTimelineBeautyExportSmokeExpectation {
   const VGTimelineBeautyExportSmokeExpectation.success({
     this.expectedBeautyClipCount,
     this.expectedBeautyFrameCountPositive = true,
+    this.expectedBeautyFrameCount,
+    this.expectedBeautyFrameCountMin,
+    this.expectedBeautyFrameCountMax,
   }) : expectsSuccess = true,
        errorCode = null,
        messageContains = null;
@@ -155,7 +155,10 @@ class VGTimelineBeautyExportSmokeExpectation {
     this.messageContains,
   }) : expectsSuccess = false,
        expectedBeautyClipCount = 0,
-       expectedBeautyFrameCountPositive = false;
+       expectedBeautyFrameCountPositive = false,
+       expectedBeautyFrameCount = null,
+       expectedBeautyFrameCountMin = null,
+       expectedBeautyFrameCountMax = null;
 
   /// True when the lane must produce an output file.
   final bool expectsSuccess;
@@ -166,6 +169,15 @@ class VGTimelineBeautyExportSmokeExpectation {
 
   /// True when beautyFrameCount must be > 0 on success.
   final bool expectedBeautyFrameCountPositive;
+
+  /// Optional exact expected beautyFrameCount on success.
+  final int? expectedBeautyFrameCount;
+
+  /// Optional minimum expected beautyFrameCount (inclusive) on success.
+  final int? expectedBeautyFrameCountMin;
+
+  /// Optional maximum expected beautyFrameCount (inclusive) on success.
+  final int? expectedBeautyFrameCountMax;
 
   /// Required PlatformException code for a fail-closed lane.
   final String? errorCode;
@@ -221,6 +233,17 @@ class VGTimelineBeautyExportSmokeRequest {
   bool get expectedBeautyFrameCountPositive =>
       expectation.expectedBeautyFrameCountPositive;
 
+  /// Optional exact expected beautyFrameCount on success.
+  int? get expectedBeautyFrameCount => expectation.expectedBeautyFrameCount;
+
+  /// Optional minimum expected beautyFrameCount on success.
+  int? get expectedBeautyFrameCountMin =>
+      expectation.expectedBeautyFrameCountMin;
+
+  /// Optional maximum expected beautyFrameCount on success.
+  int? get expectedBeautyFrameCountMax =>
+      expectation.expectedBeautyFrameCountMax;
+
   /// The exact `exportTimeline` argument map matching the production shape.
   Map<String, Object?> toExportTimelineArguments() => <String, Object?>{
     'draft': <String, Object?>{
@@ -258,6 +281,9 @@ class VGTimelineBeautyExportSmokeLaneReport {
     this.beautyFrameCount,
     this.expectedBeautyClipCount,
     this.expectedBeautyFrameCountPositive,
+    this.expectedBeautyFrameCount,
+    this.expectedBeautyFrameCountMin,
+    this.expectedBeautyFrameCountMax,
     this.errorCode,
     this.errorMessage,
   });
@@ -278,6 +304,9 @@ class VGTimelineBeautyExportSmokeLaneReport {
   final int? beautyFrameCount;
   final int? expectedBeautyClipCount;
   final bool? expectedBeautyFrameCountPositive;
+  final int? expectedBeautyFrameCount;
+  final int? expectedBeautyFrameCountMin;
+  final int? expectedBeautyFrameCountMax;
   final String? errorCode;
   final String? errorMessage;
 
@@ -298,6 +327,9 @@ class VGTimelineBeautyExportSmokeLaneReport {
     final expectedDuration = request.expectedDurationSeconds;
     final expectedClips = request.expectedBeautyClipCount;
     final expectPositiveFrames = request.expectedBeautyFrameCountPositive;
+    final expectedExactFrames = request.expectedBeautyFrameCount;
+    final expectedMinFrames = request.expectedBeautyFrameCountMin;
+    final expectedMaxFrames = request.expectedBeautyFrameCountMax;
 
     if (result == null) {
       return VGTimelineBeautyExportSmokeLaneReport(
@@ -309,6 +341,9 @@ class VGTimelineBeautyExportSmokeLaneReport {
         expectedDurationSeconds: expectedDuration,
         expectedBeautyClipCount: expectedClips,
         expectedBeautyFrameCountPositive: expectPositiveFrames,
+        expectedBeautyFrameCount: expectedExactFrames,
+        expectedBeautyFrameCountMin: expectedMinFrames,
+        expectedBeautyFrameCountMax: expectedMaxFrames,
       );
     }
     final success = result['success'] == true;
@@ -339,6 +374,23 @@ class VGTimelineBeautyExportSmokeLaneReport {
     } else if (beautyClipCount == null || beautyClipCount != expectedClips) {
       failure =
           'beauty_clip_count_mismatch:reported=$beautyClipCount:expected=$expectedClips';
+    } else if (expectedExactFrames != null) {
+      if (beautyFrameCount == null || beautyFrameCount != expectedExactFrames) {
+        failure =
+            'beauty_frame_count_mismatch:reported=$beautyFrameCount:expected=$expectedExactFrames';
+      }
+    } else if (expectedMinFrames != null || expectedMaxFrames != null) {
+      if (beautyFrameCount == null) {
+        failure = 'beauty_frame_count_missing';
+      } else if (expectedMinFrames != null &&
+          beautyFrameCount < expectedMinFrames) {
+        failure =
+            'beauty_frame_count_below_min:reported=$beautyFrameCount:min=$expectedMinFrames';
+      } else if (expectedMaxFrames != null &&
+          beautyFrameCount > expectedMaxFrames) {
+        failure =
+            'beauty_frame_count_above_max:reported=$beautyFrameCount:max=$expectedMaxFrames';
+      }
     } else if (expectPositiveFrames &&
         (beautyFrameCount == null || beautyFrameCount <= 0)) {
       failure = 'beauty_frame_count_not_positive:reported=$beautyFrameCount';
@@ -360,6 +412,9 @@ class VGTimelineBeautyExportSmokeLaneReport {
       beautyFrameCount: beautyFrameCount,
       expectedBeautyClipCount: expectedClips,
       expectedBeautyFrameCountPositive: expectPositiveFrames,
+      expectedBeautyFrameCount: expectedExactFrames,
+      expectedBeautyFrameCountMin: expectedMinFrames,
+      expectedBeautyFrameCountMax: expectedMaxFrames,
     );
   }
 
@@ -393,6 +448,9 @@ class VGTimelineBeautyExportSmokeLaneReport {
       expectedBeautyClipCount: request.expectedBeautyClipCount,
       expectedBeautyFrameCountPositive:
           request.expectedBeautyFrameCountPositive,
+      expectedBeautyFrameCount: request.expectedBeautyFrameCount,
+      expectedBeautyFrameCountMin: request.expectedBeautyFrameCountMin,
+      expectedBeautyFrameCountMax: request.expectedBeautyFrameCountMax,
       errorCode: exception.code,
       errorMessage: exception.message,
     );
@@ -411,6 +469,9 @@ class VGTimelineBeautyExportSmokeLaneReport {
     expectedDurationSeconds: request.expectedDurationSeconds,
     expectedBeautyClipCount: request.expectedBeautyClipCount,
     expectedBeautyFrameCountPositive: request.expectedBeautyFrameCountPositive,
+    expectedBeautyFrameCount: request.expectedBeautyFrameCount,
+    expectedBeautyFrameCountMin: request.expectedBeautyFrameCountMin,
+    expectedBeautyFrameCountMax: request.expectedBeautyFrameCountMax,
   );
 
   Map<String, Object?> toMap() => <String, Object?>{
@@ -429,6 +490,9 @@ class VGTimelineBeautyExportSmokeLaneReport {
     'beautyFrameCount': beautyFrameCount,
     'expectedBeautyClipCount': expectedBeautyClipCount,
     'expectedBeautyFrameCountPositive': expectedBeautyFrameCountPositive,
+    'expectedBeautyFrameCount': expectedBeautyFrameCount,
+    'expectedBeautyFrameCountMin': expectedBeautyFrameCountMin,
+    'expectedBeautyFrameCountMax': expectedBeautyFrameCountMax,
     'errorCode': errorCode,
     'errorMessage': errorMessage,
   };
@@ -455,6 +519,12 @@ class VGTimelineBeautyExportSmokeLaneReport {
           ?.toInt(),
       expectedBeautyFrameCountPositive:
           map['expectedBeautyFrameCountPositive'] as bool?,
+      expectedBeautyFrameCount: (map['expectedBeautyFrameCount'] as num?)
+          ?.toInt(),
+      expectedBeautyFrameCountMin: (map['expectedBeautyFrameCountMin'] as num?)
+          ?.toInt(),
+      expectedBeautyFrameCountMax: (map['expectedBeautyFrameCountMax'] as num?)
+          ?.toInt(),
       errorCode: map['errorCode'] as String?,
       errorMessage: map['errorMessage'] as String?,
     );

@@ -99,14 +99,26 @@ public:
     // Transition pipelines are rebuilt per call (pipeline layouts are per
     // import) after a device idle wait and retired on the next render call,
     // failClosed, invalidatePipeline or shutdown.
+    //
+    // P5-BEAUTY-V2-TRANSITION-COMP: [fromBeauty]/[toBeauty] are optional
+    // per-layer Vulkan-only Beauty V2 pre-composite requests, mirroring the
+    // solo-frame beauty renderFrame overload. When both are disabled this is
+    // byte-identical to the pre-existing non-beauty transition path.
+    // [physicalDeviceHandle] is a VkPhysicalDevice cast to void*, needed only
+    // for a beauty-enabled layer's intermediates; failing closed on a null
+    // handle happens only when a beauty layer is actually enabled, exactly
+    // like the solo beauty overload.
     RenderFrameResult renderTransitionFrame(
         void* queueHandle,
+        void* physicalDeviceHandle,
         VulkanSurfaceSwapchain& swapchain,
         VulkanHardwareBufferImports& ahbImports,
         VulkanCoreShaderModules& coreShaders,
         HardwareBufferHandle fromHandle,
         HardwareBufferHandle toHandle,
-        const VideoTransitionFrameTransform& transition);
+        const VideoTransitionFrameTransform& transition,
+        const VideoBeautyV2RenderParams& fromBeauty = VideoBeautyV2RenderParams{},
+        const VideoBeautyV2RenderParams& toBeauty = VideoBeautyV2RenderParams{});
 
 private:
     struct Impl;

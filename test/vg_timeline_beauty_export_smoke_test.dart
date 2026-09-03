@@ -1,5 +1,5 @@
 // vg_timeline_beauty_export_smoke_test.dart
-// vanguard_media_engine — P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A:
+// vanguard_media_engine — P5-BEAUTY-V2-TRANSITION-COMP:
 // production `exportTimeline` Beauty V2 smoke Dart model, serialization, report
 // and fail-closed contract unit tests.
 
@@ -135,6 +135,44 @@ void main() {
       expect(request.expectedBeautyClipCount, 1);
       expect(request.expectedBeautyFrameCountPositive, isTrue);
     });
+
+    test('transition serialization and expected duration subtraction', () {
+      const transition = VGTimelineBeautyExportSmokeTransition(
+        id: 'tr-dissolve',
+        type: 'dissolve',
+        durationSeconds: 0.5,
+        fromClipId: 'clip-1',
+        toClipId: 'clip-2',
+      );
+      final transitionMap = transition.toMap();
+      expect(transitionMap['id'], 'tr-dissolve');
+      expect(transitionMap['type'], 'dissolve');
+      expect(transitionMap['durationSeconds'], 0.5);
+      expect(transitionMap['fromClipId'], 'clip-1');
+      expect(transitionMap['toClipId'], 'clip-2');
+      expect(transitionMap['curve'], 'linear');
+
+      final request = _request(
+        laneId: 'beauty_transition_both_crossfade',
+        clips: <VGTimelineBeautyExportSmokeClip>[
+          _clip('clip-1', end: 2.0, beautyIntensity: 0.5),
+          _clip('clip-2', end: 2.0, beautyIntensity: 0.5),
+        ],
+        transitions: const <VGTimelineBeautyExportSmokeTransition>[transition],
+        expectation: const VGTimelineBeautyExportSmokeExpectation.success(
+          expectedBeautyClipCount: 2,
+          expectedBeautyFrameCount: 105,
+        ),
+      );
+      final args = request.toExportTimelineArguments();
+      final draft = args['draft'] as Map<String, Object?>;
+      final transitions = draft['transitions'] as List<Object?>;
+      expect(transitions, hasLength(1));
+      expect((transitions.first as Map)['type'], 'dissolve');
+      expect(request.expectedDurationSeconds, 3.5);
+      expect(request.expectedBeautyClipCount, 2);
+      expect(request.expectedBeautyFrameCount, 105);
+    });
   });
 
   group('lane report from export result (success contract)', () {
@@ -160,6 +198,113 @@ void main() {
         expect(report.failureReason, isEmpty);
       },
     );
+
+    test('passes when exact beautyFrameCount matches expected', () {
+      final report = VGTimelineBeautyExportSmokeLaneReport.fromExportResult(
+        _request(
+          expectation: const VGTimelineBeautyExportSmokeExpectation.success(
+            expectedBeautyClipCount: 1,
+            expectedBeautyFrameCount: 60,
+          ),
+        ),
+        _successResult(beautyFrameCount: 60),
+        outputExists: true,
+      );
+      expect(report.pass, isTrue);
+      expect(report.status, 'PASS');
+      expect(report.beautyFrameCount, 60);
+      expect(report.expectedBeautyFrameCount, 60);
+    });
+
+    test('fails when exact beautyFrameCount does not match expected', () {
+      final report = VGTimelineBeautyExportSmokeLaneReport.fromExportResult(
+        _request(
+          expectation: const VGTimelineBeautyExportSmokeExpectation.success(
+            expectedBeautyClipCount: 1,
+            expectedBeautyFrameCount: 60,
+          ),
+        ),
+        _successResult(beautyFrameCount: 59),
+        outputExists: true,
+      );
+      expect(report.pass, isFalse);
+      expect(report.status, 'FAIL');
+      expect(
+        report.failureReason,
+        'beauty_frame_count_mismatch:reported=59:expected=60',
+      );
+    });
+
+    test('passes when beautyFrameCount is within min and max range', () {
+      final request = _request(
+        expectation: const VGTimelineBeautyExportSmokeExpectation.success(
+          expectedBeautyClipCount: 1,
+          expectedBeautyFrameCountMin: 45,
+          expectedBeautyFrameCountMax: 60,
+        ),
+      );
+      final reportMin = VGTimelineBeautyExportSmokeLaneReport.fromExportResult(
+        request,
+        _successResult(beautyFrameCount: 45),
+        outputExists: true,
+      );
+      expect(reportMin.pass, isTrue);
+      expect(reportMin.beautyFrameCount, 45);
+
+      final reportMid = VGTimelineBeautyExportSmokeLaneReport.fromExportResult(
+        request,
+        _successResult(beautyFrameCount: 50),
+        outputExists: true,
+      );
+      expect(reportMid.pass, isTrue);
+      expect(reportMid.beautyFrameCount, 50);
+
+      final reportMax = VGTimelineBeautyExportSmokeLaneReport.fromExportResult(
+        request,
+        _successResult(beautyFrameCount: 60),
+        outputExists: true,
+      );
+      expect(reportMax.pass, isTrue);
+      expect(reportMax.beautyFrameCount, 60);
+    });
+
+    test('fails when beautyFrameCount is below min', () {
+      final report = VGTimelineBeautyExportSmokeLaneReport.fromExportResult(
+        _request(
+          expectation: const VGTimelineBeautyExportSmokeExpectation.success(
+            expectedBeautyClipCount: 1,
+            expectedBeautyFrameCountMin: 45,
+            expectedBeautyFrameCountMax: 60,
+          ),
+        ),
+        _successResult(beautyFrameCount: 44),
+        outputExists: true,
+      );
+      expect(report.pass, isFalse);
+      expect(
+        report.failureReason,
+        'beauty_frame_count_below_min:reported=44:min=45',
+      );
+    });
+
+    test('fails when beautyFrameCount is above max', () {
+      final report = VGTimelineBeautyExportSmokeLaneReport.fromExportResult(
+        _request(
+          expectation: const VGTimelineBeautyExportSmokeExpectation.success(
+            expectedBeautyClipCount: 1,
+            expectedBeautyFrameCountMin: 45,
+            expectedBeautyFrameCountMax: 60,
+          ),
+        ),
+        _successResult(beautyFrameCount: 61),
+        outputExists: true,
+      );
+      expect(report.pass, isFalse);
+      expect(
+        report.failureReason,
+        'beauty_frame_count_above_max:reported=61:max=60',
+      );
+    });
 
     test('fails when renderBackend is not vulkan', () {
       final report = VGTimelineBeautyExportSmokeLaneReport.fromExportResult(
@@ -288,31 +433,6 @@ void main() {
   });
 
   group('lane report from PlatformException (fail-closed contract)', () {
-    test(
-      'beauty_transition_fail_closed passes with UNSUPPORTED_EXPORT_FEATURE and token',
-      () {
-        final request = _request(
-          laneId: 'beauty_transition_fail_closed',
-          expectation: const VGTimelineBeautyExportSmokeExpectation.failClosed(
-            errorCode: unsupportedExportFeatureCode,
-            messageContains: beautyV2UnsupportedWithTransitionToken,
-          ),
-        );
-        final report = VGTimelineBeautyExportSmokeLaneReport.fromPlatformException(
-          request,
-          PlatformException(
-            code: unsupportedExportFeatureCode,
-            message:
-                'exportTimeline: clip-level Beauty V2 is not supported alongside '
-                'transitions (beauty_v2_unsupported_with_transition)',
-          ),
-        );
-        expect(report.pass, isTrue);
-        expect(report.status, 'PASS');
-        expect(report.errorCode, unsupportedExportFeatureCode);
-      },
-    );
-
     test('beauty_invalid_negative passes with INVALID_ARG and token', () {
       final request = _request(
         laneId: 'beauty_invalid_negative',
@@ -472,8 +592,15 @@ void main() {
       'toMap and fromMap round-trip preserves proof boundary and fields',
       () {
         final positive = VGTimelineBeautyExportSmokeLaneReport.fromExportResult(
-          _request(),
-          _successResult(),
+          _request(
+            expectation: const VGTimelineBeautyExportSmokeExpectation.success(
+              expectedBeautyClipCount: 1,
+              expectedBeautyFrameCount: 60,
+              expectedBeautyFrameCountMin: 45,
+              expectedBeautyFrameCountMax: 60,
+            ),
+          ),
+          _successResult(beautyFrameCount: 60),
           outputExists: true,
         );
         final report = VGTimelineBeautyExportSmokeReport(
@@ -493,6 +620,9 @@ void main() {
         expect(parsed.lanes.single.renderBackend, 'vulkan');
         expect(parsed.lanes.single.beautyClipCount, 1);
         expect(parsed.lanes.single.beautyFrameCount, 60);
+        expect(parsed.lanes.single.expectedBeautyFrameCount, 60);
+        expect(parsed.lanes.single.expectedBeautyFrameCountMin, 45);
+        expect(parsed.lanes.single.expectedBeautyFrameCountMax, 60);
       },
     );
 
@@ -536,6 +666,65 @@ void main() {
       expect(report.lanes.single.beautyClipCount, 1);
       expect(report.lanes.single.beautyFrameCount, 60);
     });
+
+    test(
+      'invokes exportTimeline with transition and parses positive transition result',
+      () async {
+        String? seenMethod;
+        Map<Object?, Object?>? seenArgs;
+        _setMockHandler((method, args) async {
+          seenMethod = method;
+          seenArgs = args as Map<Object?, Object?>;
+          return _successResult(
+            duration: 3.5,
+            beautyClipCount: 2,
+            beautyFrameCount: 105,
+            path: '/data/local/tmp/out_beauty_transition_both_crossfade.mp4',
+          );
+        });
+
+        final runner = VGTimelineBeautyExportSmokeRunner(
+          channel: _channel,
+          fileExists: (path) =>
+              path ==
+              '/data/local/tmp/out_beauty_transition_both_crossfade.mp4',
+        );
+        final request = _request(
+          laneId: 'beauty_transition_both_crossfade',
+          clips: <VGTimelineBeautyExportSmokeClip>[
+            _clip('c1', end: 2.0, beautyIntensity: 0.5),
+            _clip('c2', end: 2.0, beautyIntensity: 0.5),
+          ],
+          transitions: const <VGTimelineBeautyExportSmokeTransition>[
+            VGTimelineBeautyExportSmokeTransition(
+              id: 'tr-dissolve',
+              type: 'dissolve',
+              durationSeconds: 0.5,
+              fromClipId: 'c1',
+              toClipId: 'c2',
+            ),
+          ],
+          expectation: const VGTimelineBeautyExportSmokeExpectation.success(
+            expectedBeautyClipCount: 2,
+            expectedBeautyFrameCount: 105,
+          ),
+        );
+        final report = await runner.runLane(request);
+        expect(seenMethod, 'exportTimeline');
+        final draft = seenArgs!['draft'] as Map<Object?, Object?>;
+        final transitions = draft['transitions'] as List<Object?>;
+        expect(transitions, hasLength(1));
+        expect((transitions.first as Map)['type'], 'dissolve');
+
+        expect(report.pass, isTrue);
+        expect(report.status, 'PASS');
+        expect(report.renderBackend, 'vulkan');
+        expect(report.durationSeconds, 3.5);
+        expect(report.beautyClipCount, 2);
+        expect(report.beautyFrameCount, 105);
+        expect(report.expectedBeautyFrameCount, 105);
+      },
+    );
 
     test(
       'fail-closed PlatformException becomes passing fail-closed lane',

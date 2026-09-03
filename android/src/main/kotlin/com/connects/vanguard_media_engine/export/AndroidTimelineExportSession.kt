@@ -507,22 +507,12 @@ class AndroidTimelineExportSession(private val context: Context) {
             )
         }
 
-        // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: a clip-level Beauty V2
-        // request alongside any compositor transition is unsupported -- fail
-        // closed before backend selection rather than let the selector's
-        // `transitions_require_vulkan` reason mask the distinct beauty/
-        // transition incompatibility.
+        // P5-BEAUTY-V2-TRANSITION-COMP: clip-level Beauty V2 alongside a
+        // compositor transition is supported -- both features independently
+        // require the Vulkan backend (see AndroidExportRenderBackendSelector's
+        // `requiresVulkan`), and AndroidTimelineVulkanVideoEncoder renders
+        // per-layer Beauty V2 on both solo and transition-overlap frames.
         val hasBeautyClip = clipInputs.any { it.beautyIntensity != null }
-        if (hasBeautyClip && transitions.isNotEmpty()) {
-            deleteOwnedTemps()
-            logTerminal("beauty_v2_unsupported_with_transition", backend = null)
-            onError(
-                "UNSUPPORTED_EXPORT_FEATURE",
-                "exportTimeline: clip-level Beauty V2 is not supported alongside " +
-                    "transitions (beauty_v2_unsupported_with_transition)",
-            )
-            return
-        }
 
         // Session-owned diagnostics/lifecycle/native-bridge triple for this
         // export run -- reused for backend selection and, when Vulkan is

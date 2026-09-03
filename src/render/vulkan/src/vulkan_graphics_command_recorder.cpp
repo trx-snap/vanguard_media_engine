@@ -302,27 +302,11 @@ static void recordSourceLayoutTransition(VkCommandBuffer commandBuffer,
         VK_QUEUE_FAMILY_IGNORED);
 }
 
-} // anonymous namespace
-
-bool VulkanGraphicsCommandRecorder::recordTransitionPass(
-    const VulkanTransitionPassParams& params,
-    VkCommandBufferUsageFlags flags) {
-    if (!validateTransitionPassParams(params)) {
-        return false;
-    }
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.pNext = nullptr;
-    beginInfo.flags = flags;
-    beginInfo.pInheritanceInfo = nullptr;
-
-    VkResult res = vkBeginCommandBuffer(params.commandBuffer, &beginInfo);
-    if (res != VK_SUCCESS) {
-        VGLOG_CR("transition vkBeginCommandBuffer failed: %d", res);
-        return false;
-    }
-
+// Records the optional source layout transitions, one clear render pass over
+// the full extent, and every layer draw in order. Assumes [params] has
+// already been validated by the caller and that commandBuffer is already in
+// the recording state; never begins/ends the command buffer itself.
+static void recordTransitionPassBodyUnchecked(const VulkanTransitionPassParams& params) {
     if (params.transitionFromImage) {
         recordSourceLayoutTransition(params.commandBuffer, params.fromImage, params.fromOldLayout);
     }
@@ -388,12 +372,45 @@ bool VulkanGraphicsCommandRecorder::recordTransitionPass(
     }
 
     vkCmdEndRenderPass(params.commandBuffer);
+}
+
+} // anonymous namespace
+
+bool VulkanGraphicsCommandRecorder::recordTransitionPass(
+    const VulkanTransitionPassParams& params,
+    VkCommandBufferUsageFlags flags) {
+    if (!validateTransitionPassParams(params)) {
+        return false;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.pNext = nullptr;
+    beginInfo.flags = flags;
+    beginInfo.pInheritanceInfo = nullptr;
+
+    VkResult res = vkBeginCommandBuffer(params.commandBuffer, &beginInfo);
+    if (res != VK_SUCCESS) {
+        VGLOG_CR("transition vkBeginCommandBuffer failed: %d", res);
+        return false;
+    }
+
+    recordTransitionPassBodyUnchecked(params);
 
     res = vkEndCommandBuffer(params.commandBuffer);
     if (res != VK_SUCCESS) {
         VGLOG_CR("transition vkEndCommandBuffer failed: %d", res);
         return false;
     }
+    return true;
+}
+
+bool VulkanGraphicsCommandRecorder::recordTransitionPassBody(
+    const VulkanTransitionPassParams& params) {
+    if (!validateTransitionPassParams(params)) {
+        return false;
+    }
+    recordTransitionPassBodyUnchecked(params);
     return true;
 }
 
@@ -423,6 +440,12 @@ bool VulkanGraphicsCommandRecorder::recordTransitionPass(
     uint32_t flags) {
     (void)params;
     (void)flags;
+    return false;
+}
+
+bool VulkanGraphicsCommandRecorder::recordTransitionPassBody(
+    const VulkanTransitionPassParams& params) {
+    (void)params;
     return false;
 }
 

@@ -1231,7 +1231,18 @@ class VanguardNativeBridge(
     // exactly like the cropped solo route (crop against the imported buffer
     // descriptor, cardinal rotation, destination rect inside [width]x[height]).
     // [fromColorMatrix] / [toColorMatrix] follow the cropped route's optional
-    // 20-element raw colorMatrix contract. Native imports both buffers,
+    // 20-element raw colorMatrix contract.
+    // [fromBeautyEnabled]/[fromBeautyIntensity] and
+    // [toBeautyEnabled]/[toBeautyIntensity] (P5-BEAUTY-V2-TRANSITION-COMP):
+    // per-layer optional Beauty V2, following the cropped solo route's
+    // beautyEnabled/beautyIntensity contract independently for each layer --
+    // when a layer's beautyEnabled is true its beautyIntensity must be finite
+    // and in [0.0, 1.0], native fails closed with "beauty_v2_invalid_intensity"
+    // before either buffer is imported on any other value, and native expands
+    // the intensity into the full Beauty V2 ramp using THAT layer's own
+    // cropped source extent (never the output extent), independently of the
+    // other layer's beauty state.
+    // Native imports both buffers,
     // renders, and releases BOTH imports (closing both release fence fds) on
     // every path after import. The status string always carries a
     // machine-readable reason plus transitionType / progress / frameIndex;
@@ -1246,9 +1257,13 @@ class VanguardNativeBridge(
         fromHardwareBuffer: HardwareBuffer,
         fromLayerGeometry: IntArray,
         fromColorMatrix: FloatArray?,
+        fromBeautyEnabled: Boolean,
+        fromBeautyIntensity: Float,
         toHardwareBuffer: HardwareBuffer,
         toLayerGeometry: IntArray,
         toColorMatrix: FloatArray?,
+        toBeautyEnabled: Boolean,
+        toBeautyIntensity: Float,
         timelinePtsUs: Long,
         frameIndex: Int,
     ): String

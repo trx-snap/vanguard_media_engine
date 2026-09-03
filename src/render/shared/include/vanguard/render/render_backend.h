@@ -163,11 +163,20 @@ public:
     // distinct, active imports. Backends that have not overridden this seam
     // fail closed with kUnavailable rather than rendering either clip alone
     // (a silent hard cut would be wrong output).
+    //
+    // P5-BEAUTY-V2-TRANSITION-COMP: [fromBeauty]/[toBeauty] are optional
+    // per-layer Vulkan-only Beauty V2 pre-composite requests, field-for-field
+    // mirroring the solo-frame renderFrame beauty overload above. When both
+    // are disabled (the default) this must be byte-identical to the
+    // pre-existing non-beauty transition path for every backend that has not
+    // overridden this seam for beauty.
     // ---------------------------------------------------------------------------
     virtual RenderFrameResult renderTransitionFrame(
         HardwareBufferHandle /*fromHandle*/,
         HardwareBufferHandle /*toHandle*/,
-        const VideoTransitionFrameTransform& /*transition*/) {
+        const VideoTransitionFrameTransform& /*transition*/,
+        const VideoBeautyV2RenderParams& /*fromBeauty*/ = VideoBeautyV2RenderParams{},
+        const VideoBeautyV2RenderParams& /*toBeauty*/ = VideoBeautyV2RenderParams{}) {
         return RenderFrameResult::kUnavailable;
     }
 };

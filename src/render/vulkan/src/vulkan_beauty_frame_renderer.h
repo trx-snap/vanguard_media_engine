@@ -100,6 +100,34 @@ struct VulkanHardwareBufferImage;
 namespace vanguard {
 namespace render {
 
+// ---------------------------------------------------------------------------
+// P5-BEAUTY-V2-TRANSITION-COMP: VulkanBeautyTransitionLayerResources
+// ---------------------------------------------------------------------------
+// Draw resources for one beautified transition layer, returned by
+// [VulkanBeautyFrameRenderer::prepareTransitionLayer]. [pipeline] is the
+// placement pipeline for the caller's swapchain render pass (already built
+// via ensurePlacementPipeline for the given frame slot); [pipelineLayout] /
+// [descriptorSet] bind the beautified RGBA intermediate exactly like the
+// solo path's own placement pass. [placementTransform] is the caller's
+// original per-layer transform with cropScaleU/V forced to 1.0 and
+// cropBiasU/V forced to 0.0 (the beautified intermediate is already the
+// cropped, unrotated content) -- rotation, destination rect, and colorMatrix
+// are carried through unchanged. Feed it to makeVideoTransformFullPushConstants
+// to build the draw's push constants, matching the solo placement pass's
+// policy exactly.
+struct VulkanBeautyTransitionLayerResources {
+#if defined(__ANDROID__)
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+#else
+    void* pipeline = nullptr;
+    void* pipelineLayout = nullptr;
+    void* descriptorSet = nullptr;
+#endif
+    VideoFrameTransform placementTransform;
+};
+
 class VulkanBeautyFrameRenderer {
 public:
     VulkanBeautyFrameRenderer();
@@ -166,6 +194,65 @@ public:
         void* finalFramebuffer,
         uint32_t finalExtentWidth,
         uint32_t finalExtentHeight,
+        std::string* outFailureReason);
+#endif
+
+    // P5-BEAUTY-V2-TRANSITION-COMP: reusable seam for the transition-frame
+    // draw path. Records ONLY passes 1-4 (crop -> blurH -> blurV -> composite,
+    // see the file header) into `commandBuffer` -- which must already be in
+    // the recording state -- producing the beautified RGBA intermediate for
+    // ONE transition layer. Unlike [recordBeauty] this method never begins or
+    // ends the command buffer, never submits, never waits, never presents,
+    // never releases an AHardwareBuffer, and never records the placement
+    // pass itself: the caller (VulkanFrameRenderer's transition path) draws
+    // the returned resources into its own transition render pass alongside
+    // any non-beautified layer.
+    //
+    // Calls ensurePlacementPipeline(device, frameSlotIndex, frameCount,
+    // swapchainRenderPass) so the pipeline handed back in `*outResources` is
+    // guaranteed compatible with `swapchainRenderPass` -- the same render
+    // pass the caller's transition draw targets. `layerTransform` is this
+    // layer's own per-frame transform (rotation / decoder crop / destination
+    // rect / colorMatrix), identical in shape to the solo path's `transform`
+    // argument to [recordBeauty].
+    //
+    // Returns true on success with `*outResources` populated. Returns false
+    // (recording nothing further; any commands already recorded into
+    // `commandBuffer` for THIS call are safe no-ops on a discarded submit)
+    // with `*outFailureReason` set to a "beauty_v2_*" token on any validation
+    // or Vulkan object-creation failure. The caller must fail the whole frame
+    // on false -- no partial present.
+#if defined(__ANDROID__)
+    bool prepareTransitionLayer(
+        VkDevice device,
+        VkPhysicalDevice physicalDevice,
+        VkCommandBuffer commandBuffer,
+        uint32_t frameSlotIndex,
+        uint32_t frameCount,
+        const VulkanHardwareBufferImage& srcImage,
+        VkImageLayout srcCurrentLayout,
+        VkShaderModule vertexModule,
+        VkShaderModule fragmentModule,
+        const VideoFrameTransform& layerTransform,
+        const VideoBeautyV2RenderParams& beauty,
+        VkRenderPass swapchainRenderPass,
+        VulkanBeautyTransitionLayerResources* outResources,
+        std::string* outFailureReason);
+#else
+    bool prepareTransitionLayer(
+        void* device,
+        void* physicalDevice,
+        void* commandBuffer,
+        uint32_t frameSlotIndex,
+        uint32_t frameCount,
+        const VulkanHardwareBufferImage& srcImage,
+        uint32_t srcCurrentLayout,
+        void* vertexModule,
+        void* fragmentModule,
+        const VideoFrameTransform& layerTransform,
+        const VideoBeautyV2RenderParams& beauty,
+        void* swapchainRenderPass,
+        VulkanBeautyTransitionLayerResources* outResources,
         std::string* outFailureReason);
 #endif
 

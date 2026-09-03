@@ -1,29 +1,33 @@
 // android_timeline_beauty_export_physical_smoke.dart
-// Vanguard Media Engine — P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A:
+// Vanguard Media Engine — P5-BEAUTY-V2-TRANSITION-COMP:
 // Android production `exportTimeline` Beauty V2 smoke physical proof.
 //
 // Proof boundary: production_exportTimeline_vulkan_beauty_v2_route
 //
 // Drives the REAL production `exportTimeline` MethodChannel route (no
 // diagnostic native path) with temp copies of registered assets:
-//   Lane 1: beauty_soft_single               -> 1 video clip, trim 0..2s, beauty 0.5
-//                                              success, backend vulkan, duration ~2.0,
-//                                              beautyClipCount 1, beautyFrameCount >0
-//   Lane 2: beauty_hard_cut_mixed            -> 2 video clips, no transitions, first beauty 0.75,
-//                                              second null, success, duration ~4.0,
-//                                              beautyClipCount 1, beautyFrameCount >0
-//   Lane 3: beauty_transition_fail_closed    -> 2 video clips, beauty 0.5 on clip 1, dissolve 0.5s,
-//                                              expect UNSUPPORTED_EXPORT_FEATURE,
-//                                              token `beauty_v2_unsupported_with_transition`
-//   Lane 4: beauty_invalid_negative          -> raw beauty -0.1, expect INVALID_ARG,
-//                                              token `beautyIntensity`
-//   Lane 5: beauty_non_vulkan_scope_fail_closed -> still image clip, beauty 0.5, no transition,
-//                                              expect UNSUPPORTED_EXPORT_FEATURE,
-//                                              token `beauty_v2_requires_vulkan`
+//   Lane 1: beauty_soft_single                  -> 1 video clip, trim 0..2s, beauty 0.5
+//                                                  success, backend vulkan, duration ~2.0,
+//                                                  beautyClipCount 1, exact beautyFrameCount 60
+//   Lane 2: beauty_hard_cut_mixed               -> 2 video clips, no transitions, first beauty 0.75,
+//                                                  second null, success, duration ~4.0,
+//                                                  beautyClipCount 1, exact beautyFrameCount 60
+//   Lane 3: beauty_transition_both_crossfade    -> 2 video clips, both beauty 0.5, dissolve 0.5s,
+//                                                  success, backend vulkan, duration ~3.5,
+//                                                  beautyClipCount 2, exact beautyFrameCount 105
+//   Lane 4: beauty_transition_mixed_crossfade   -> 2 video clips, first beauty 0.75, second null,
+//                                                  dissolve 0.5s, success, backend vulkan, duration ~3.5,
+//                                                  beautyClipCount 1, beautyFrameCount min 45 max 60
+//   Lane 5: beauty_invalid_negative             -> raw beauty -0.1, expect INVALID_ARG,
+//                                                  token `beautyIntensity`
+//   Lane 6: beauty_non_vulkan_scope_fail_closed -> still image clip, beauty 0.5, no transition,
+//                                                  expect UNSUPPORTED_EXPORT_FEATURE,
+//                                                  token `beauty_v2_requires_vulkan`
 //
 // Boundary: real production MethodChannel `exportTimeline`; no diagnostic native method.
-// Claims only production routing/fail-closed behavior on Android, not pixel quality, fleet,
-// playback, GLES beauty, transitions+beauty, app/editor UI, iOS, or streaming/cache.
+// Claims production routing/fail-closed behavior on Android including Beauty V2 +
+// Vulkan transition composition, but still does not claim pixel quality, fleet coverage,
+// playback, GLES beauty, app/editor UI, iOS, or streaming/cache.
 //
 // Emits ANDROID_TIMELINE_BEAUTY_EXPORT_JSON:<json> and the PASS/FAIL marker, then exits 0/1.
 
@@ -123,7 +127,7 @@ class _AndroidTimelineBeautyExportSmokeAppState
           outputPath: laneOutputPath('beauty_soft_single'),
           expectation: const VGTimelineBeautyExportSmokeExpectation.success(
             expectedBeautyClipCount: 1,
-            expectedBeautyFrameCountPositive: true,
+            expectedBeautyFrameCount: 60,
           ),
         ),
 
@@ -137,16 +141,16 @@ class _AndroidTimelineBeautyExportSmokeAppState
           outputPath: laneOutputPath('beauty_hard_cut_mixed'),
           expectation: const VGTimelineBeautyExportSmokeExpectation.success(
             expectedBeautyClipCount: 1,
-            expectedBeautyFrameCountPositive: true,
+            expectedBeautyFrameCount: 60,
           ),
         ),
 
-        // Lane 3: beauty_transition_fail_closed
+        // Lane 3: beauty_transition_both_crossfade
         VGTimelineBeautyExportSmokeRequest(
-          laneId: 'beauty_transition_fail_closed',
+          laneId: 'beauty_transition_both_crossfade',
           clips: <VGTimelineBeautyExportSmokeClip>[
             videoClip('clip-1', clipA.path, beautyIntensity: 0.5),
-            videoClip('clip-2', clipB.path, beautyIntensity: null),
+            videoClip('clip-2', clipB.path, beautyIntensity: 0.5),
           ],
           transitions: const <VGTimelineBeautyExportSmokeTransition>[
             VGTimelineBeautyExportSmokeTransition(
@@ -157,14 +161,38 @@ class _AndroidTimelineBeautyExportSmokeAppState
               toClipId: 'clip-2',
             ),
           ],
-          outputPath: laneOutputPath('beauty_transition_fail_closed'),
-          expectation: const VGTimelineBeautyExportSmokeExpectation.failClosed(
-            errorCode: unsupportedExportFeatureCode,
-            messageContains: beautyV2UnsupportedWithTransitionToken,
+          outputPath: laneOutputPath('beauty_transition_both_crossfade'),
+          expectation: const VGTimelineBeautyExportSmokeExpectation.success(
+            expectedBeautyClipCount: 2,
+            expectedBeautyFrameCount: 105,
           ),
         ),
 
-        // Lane 4: beauty_invalid_negative
+        // Lane 4: beauty_transition_mixed_crossfade
+        VGTimelineBeautyExportSmokeRequest(
+          laneId: 'beauty_transition_mixed_crossfade',
+          clips: <VGTimelineBeautyExportSmokeClip>[
+            videoClip('clip-1', clipA.path, beautyIntensity: 0.75),
+            videoClip('clip-2', clipB.path, beautyIntensity: null),
+          ],
+          transitions: const <VGTimelineBeautyExportSmokeTransition>[
+            VGTimelineBeautyExportSmokeTransition(
+              id: 'tr-dissolve-mixed',
+              type: 'dissolve',
+              durationSeconds: 0.5,
+              fromClipId: 'clip-1',
+              toClipId: 'clip-2',
+            ),
+          ],
+          outputPath: laneOutputPath('beauty_transition_mixed_crossfade'),
+          expectation: const VGTimelineBeautyExportSmokeExpectation.success(
+            expectedBeautyClipCount: 1,
+            expectedBeautyFrameCountMin: 45,
+            expectedBeautyFrameCountMax: 60,
+          ),
+        ),
+
+        // Lane 5: beauty_invalid_negative
         VGTimelineBeautyExportSmokeRequest(
           laneId: 'beauty_invalid_negative',
           clips: <VGTimelineBeautyExportSmokeClip>[
@@ -177,7 +205,7 @@ class _AndroidTimelineBeautyExportSmokeAppState
           ),
         ),
 
-        // Lane 5: beauty_non_vulkan_scope_fail_closed
+        // Lane 6: beauty_non_vulkan_scope_fail_closed
         VGTimelineBeautyExportSmokeRequest(
           laneId: 'beauty_non_vulkan_scope_fail_closed',
           clips: <VGTimelineBeautyExportSmokeClip>[

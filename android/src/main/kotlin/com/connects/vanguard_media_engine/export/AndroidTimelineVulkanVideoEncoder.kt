@@ -873,16 +873,15 @@ class AndroidTimelineVulkanVideoEncoder(
                                     result
                                 }
                                 fromFrame != null -> {
-                                    // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: beauty is
-                                    // always null here -- AndroidTimelineExportSession
-                                    // fails closed before pass-1 when a beauty clip is
-                                    // combined with any transition, so a transition
-                                    // overlap segment's clips never carry beauty.
+                                    // P5-BEAUTY-V2-TRANSITION-COMP: an unpaired edge
+                                    // frame from the outgoing clip's own decode still
+                                    // renders that clip's own beautyIntensity, exactly
+                                    // like a solo hard-cut frame.
                                     val result = renderSoloLayer(
                                         fromFrame.hardwareBuffer, fromFrame.cropRect,
                                         fromFrame.bufferWidth, fromFrame.bufferHeight,
                                         fromClip.rotationDegrees, fromClip.decodedWidth, fromClip.decodedHeight,
-                                        fromFit, fromClip.colorMatrix, beautyIntensity = null,
+                                        fromFit, fromClip.colorMatrix, beautyIntensity = fromClip.beautyIntensity,
                                     )
                                     if (result == null) soloFromRendered++
                                     result
@@ -892,7 +891,7 @@ class AndroidTimelineVulkanVideoEncoder(
                                         toFrame.hardwareBuffer, toFrame.cropRect,
                                         toFrame.bufferWidth, toFrame.bufferHeight,
                                         toClip.rotationDegrees, toClip.decodedWidth, toClip.decodedHeight,
-                                        toFit, toClip.colorMatrix, beautyIntensity = null,
+                                        toFit, toClip.colorMatrix, beautyIntensity = toClip.beautyIntensity,
                                     )
                                     if (result == null) soloToRendered++
                                     result
@@ -964,9 +963,13 @@ class AndroidTimelineVulkanVideoEncoder(
             fromHardwareBuffer = fromFrame.hardwareBuffer,
             fromLayerGeometry = fromValues,
             fromColorMatrix = fromClip.colorMatrix,
+            fromBeautyEnabled = fromClip.beautyIntensity != null,
+            fromBeautyIntensity = (fromClip.beautyIntensity ?: 0.0).toFloat(),
             toHardwareBuffer = toFrame.hardwareBuffer,
             toLayerGeometry = toValues,
             toColorMatrix = toClip.colorMatrix,
+            toBeautyEnabled = toClip.beautyIntensity != null,
+            toBeautyIntensity = (toClip.beautyIntensity ?: 0.0).toFloat(),
             timelinePtsUs = timelinePtsUs,
             frameIndex = renderedFrames,
         )
@@ -974,6 +977,12 @@ class AndroidTimelineVulkanVideoEncoder(
             return "vulkan_transition_render_failed:${renderStr.take(120)}"
         }
         renderedFrames++
+        // P5-BEAUTY-V2-TRANSITION-COMP: counted once per rendered transition
+        // frame when either layer carries beauty, mirroring the solo path's
+        // per-frame beautyFramesRendered accounting.
+        if (fromClip.beautyIntensity != null || toClip.beautyIntensity != null) {
+            beautyFramesRendered++
+        }
         drainEncoder(endOfStream = false, deadlineMs = ENCODE_DRAIN_DEADLINE_MS)
         return null
     }

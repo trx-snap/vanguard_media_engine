@@ -63,10 +63,14 @@ public:
 
     // P5-COMPOSITOR-TRANS: two-source clip overlap transition frame through
     // the same swapchain acquire/submit/present lifecycle as renderFrame.
+    // P5-BEAUTY-V2-TRANSITION-COMP: optional per-layer Beauty V2 params;
+    // byte-identical to the pre-existing behavior when both are disabled.
     RenderFrameResult renderTransitionFrame(
         HardwareBufferHandle fromHandle,
         HardwareBufferHandle toHandle,
-        const VideoTransitionFrameTransform& transition) override;
+        const VideoTransitionFrameTransform& transition,
+        const VideoBeautyV2RenderParams& fromBeauty = VideoBeautyV2RenderParams{},
+        const VideoBeautyV2RenderParams& toBeauty = VideoBeautyV2RenderParams{}) override;
 
 private:
     struct Impl;

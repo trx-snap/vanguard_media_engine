@@ -98,6 +98,19 @@ struct VulkanFrameRenderer::Impl {
     // never touches it and beauty frames never churn the solo pipeline cache.
     std::unique_ptr<VulkanBeautyFrameRenderer> beautyRenderer;
 
+    // P5-BEAUTY-V2-TRANSITION-COMP: two DISTINCT transition-path beauty
+    // renderer instances (one for the "from" layer, one for "to"), lazily
+    // constructed on the first beauty-enabled renderTransitionFrame() call.
+    // A single shared instance would alias slot.beautified between the two
+    // layers whenever both share the same (cropWidth, cropHeight) geometry
+    // (findOrCreateGeometry keys purely on crop size, not layer identity),
+    // since each layer's crop -> ... -> composite sequence writes into the
+    // SAME per-geometry beautified image for that frame slot. Entirely
+    // independent of [beautyRenderer] above (the solo path) and of each
+    // other's caches.
+    std::unique_ptr<VulkanBeautyFrameRenderer> beautyRendererFrom;
+    std::unique_ptr<VulkanBeautyFrameRenderer> beautyRendererTo;
+
     // Torn down only on shutdown()/failClosed() (never from the routine
     // invalidatePipeline() hot path) so beauty's cached geometry/pipelines
     // survive ordinary per-frame pipeline-layout churn.
@@ -105,6 +118,14 @@ struct VulkanFrameRenderer::Impl {
         if (beautyRenderer) {
             beautyRenderer->shutdown(device);
             beautyRenderer.reset();
+        }
+        if (beautyRendererFrom) {
+            beautyRendererFrom->shutdown(device);
+            beautyRendererFrom.reset();
+        }
+        if (beautyRendererTo) {
+            beautyRendererTo->shutdown(device);
+            beautyRendererTo.reset();
         }
     }
 
@@ -871,18 +892,25 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
 
 RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
     void* queueHandle,
+    void* physicalDeviceHandle,
     VulkanSurfaceSwapchain& swapchain,
     VulkanHardwareBufferImports& ahbImports,
     VulkanCoreShaderModules& coreShaders,
     HardwareBufferHandle fromHandle,
     HardwareBufferHandle toHandle,
-    const VideoTransitionFrameTransform& transition) {
+    const VideoTransitionFrameTransform& transition,
+    const VideoBeautyV2RenderParams& fromBeauty,
+    const VideoBeautyV2RenderParams& toBeauty) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }
     Impl& s = *impl_;
     if (queueHandle == nullptr || s.device == VK_NULL_HANDLE ||
         s.commandPool == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const bool anyBeauty = fromBeauty.enabled || toBeauty.enabled;
+    if (anyBeauty && physicalDeviceHandle == nullptr) {
         return RenderFrameResult::kVulkanFailure;
     }
     if (!swapchain.hasSurface()) {
@@ -965,7 +993,11 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
     const bool needToOpaque =
         mode == VulkanTransitionDrawMode::kToOnly || mode == VulkanTransitionDrawMode::kPaintOver;
     const bool needToBlend = mode == VulkanTransitionDrawMode::kCrossfade;
-    if (needFrom) {
+    // P5-BEAUTY-V2-TRANSITION-COMP: a beautified layer is drawn through its
+    // own VulkanBeautyFrameRenderer placement pipeline (built later, after
+    // prepareTransitionLayer runs), never through an AHB-import-layout
+    // pipeline built here.
+    if (needFrom && !fromBeauty.enabled) {
         s.transitionFromPipeline = std::make_unique<VulkanGraphicsPipeline>();
         if (!s.transitionFromPipeline->create(s.device, fromLayout, renderPass,
                                               coreShaders.vertex.get(),
@@ -974,7 +1006,7 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
             return RenderFrameResult::kVulkanFailure;
         }
     }
-    if (needToOpaque) {
+    if (needToOpaque && !toBeauty.enabled) {
         s.transitionToOpaquePipeline = std::make_unique<VulkanGraphicsPipeline>();
         if (!s.transitionToOpaquePipeline->create(s.device, toLayout, renderPass,
                                                   coreShaders.vertex.get(),
@@ -983,7 +1015,7 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
             return RenderFrameResult::kVulkanFailure;
         }
     }
-    if (needToBlend) {
+    if (needToBlend && !toBeauty.enabled) {
         if (!CreateVulkanTransitionBlendPipeline(s.device, toLayout, renderPass,
                                                  coreShaders.vertex.get(),
                                                  coreShaders.fragment.get(),
@@ -1048,50 +1080,172 @@ RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
         static_cast<VkImageLayout>(ahbImports.getImageLayout(toHandle));
     passParams.fromImage = fromImage;
     passParams.fromOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    passParams.transitionFromImage = (fromLayoutState == VK_IMAGE_LAYOUT_UNDEFINED);
+    // P5-BEAUTY-V2-TRANSITION-COMP: a beautified layer's own crop pass (run
+    // by prepareTransitionLayer below) already performs the AHB layout
+    // transition when its current layout is undefined, so this pass must not
+    // transition it again.
+    passParams.transitionFromImage =
+        fromBeauty.enabled ? false : (fromLayoutState == VK_IMAGE_LAYOUT_UNDEFINED);
     passParams.toImage = toImage;
     passParams.toOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    passParams.transitionToImage = (toLayoutState == VK_IMAGE_LAYOUT_UNDEFINED);
+    passParams.transitionToImage =
+        toBeauty.enabled ? false : (toLayoutState == VK_IMAGE_LAYOUT_UNDEFINED);
 
     VulkanTransitionLayerResources fromRes;
-    fromRes.pipeline = s.transitionFromPipeline ? s.transitionFromPipeline->get() : VK_NULL_HANDLE;
-    fromRes.pipelineLayout = fromLayout;
-    fromRes.descriptorSet = fromSet;
-    fromRes.pushConstants = makeVideoTransformFullPushConstants(transition.from);
-
     VulkanTransitionLayerResources toRes;
-    toRes.pipelineLayout = toLayout;
-    toRes.descriptorSet = toSet;
-    toRes.pushConstants = makeVideoTransformFullPushConstants(transition.to);
-    if (needToBlend) {
-        toRes.pipeline = s.transitionToBlendPipeline;
-        toRes.useBlendConstants = true;
-        toRes.blendConstant =
-            static_cast<float>(std::max(0.0, std::min(1.0, transition.blendWeightTo)));
-    } else if (s.transitionToOpaquePipeline) {
-        toRes.pipeline = s.transitionToOpaquePipeline->get();
-    }
 
-    bool planOk = true;
-    switch (mode) {
-        case VulkanTransitionDrawMode::kFromOnly:
-            planOk = AppendVulkanTransitionLayer(&passParams, fromRes, fromPlacement, false);
-            break;
-        case VulkanTransitionDrawMode::kToOnly:
-            planOk = AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, false);
-            break;
-        case VulkanTransitionDrawMode::kPaintOver:
-        case VulkanTransitionDrawMode::kCrossfade:
-            planOk = AppendVulkanTransitionLayer(&passParams, fromRes, fromPlacement, false) &&
-                     AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, true);
-            break;
-    }
-    if (!planOk) {
-        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
-    }
+    if (!anyBeauty) {
+        // Byte-identical to the pre-existing non-beauty transition path.
+        fromRes.pipeline = s.transitionFromPipeline ? s.transitionFromPipeline->get() : VK_NULL_HANDLE;
+        fromRes.pipelineLayout = fromLayout;
+        fromRes.descriptorSet = fromSet;
+        fromRes.pushConstants = makeVideoTransformFullPushConstants(transition.from);
 
-    if (!VulkanGraphicsCommandRecorder::recordTransitionPass(passParams)) {
-        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+        toRes.pipelineLayout = toLayout;
+        toRes.descriptorSet = toSet;
+        toRes.pushConstants = makeVideoTransformFullPushConstants(transition.to);
+        if (needToBlend) {
+            toRes.pipeline = s.transitionToBlendPipeline;
+            toRes.useBlendConstants = true;
+            toRes.blendConstant =
+                static_cast<float>(std::max(0.0, std::min(1.0, transition.blendWeightTo)));
+        } else if (s.transitionToOpaquePipeline) {
+            toRes.pipeline = s.transitionToOpaquePipeline->get();
+        }
+
+        bool planOk = true;
+        switch (mode) {
+            case VulkanTransitionDrawMode::kFromOnly:
+                planOk = AppendVulkanTransitionLayer(&passParams, fromRes, fromPlacement, false);
+                break;
+            case VulkanTransitionDrawMode::kToOnly:
+                planOk = AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, false);
+                break;
+            case VulkanTransitionDrawMode::kPaintOver:
+            case VulkanTransitionDrawMode::kCrossfade:
+                planOk = AppendVulkanTransitionLayer(&passParams, fromRes, fromPlacement, false) &&
+                         AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, true);
+                break;
+        }
+        if (!planOk) {
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+        }
+
+        if (!VulkanGraphicsCommandRecorder::recordTransitionPass(passParams)) {
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+        }
+    } else {
+        // P5-BEAUTY-V2-TRANSITION-COMP: beauty transition path. Validation
+        // (mode, placement) already happened above, before any recording;
+        // now: vkBeginCommandBuffer -> optional beauty prepasses -> the
+        // (separately validated) transition pass body -> vkEndCommandBuffer.
+        if (!s.beautyRendererFrom) {
+            s.beautyRendererFrom = std::make_unique<VulkanBeautyFrameRenderer>();
+        }
+        if (!s.beautyRendererTo) {
+            s.beautyRendererTo = std::make_unique<VulkanBeautyFrameRenderer>();
+        }
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        if (vkBeginCommandBuffer(frame->commandBuffer, &beginInfo) != VK_SUCCESS) {
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+        }
+
+        VulkanBeautyTransitionLayerResources fromBeautyRes;
+        VulkanBeautyTransitionLayerResources toBeautyRes;
+        std::string beautyFailureReason;
+        const auto physDev = static_cast<VkPhysicalDevice>(physicalDeviceHandle);
+
+        if (fromBeauty.enabled) {
+            if (!s.beautyRendererFrom->prepareTransitionLayer(
+                    s.device, physDev, frame->commandBuffer, s.currentFrameIndex, frameCount,
+                    *fromImage, fromLayoutState, coreShaders.vertex.get(), coreShaders.fragment.get(),
+                    transition.from, fromBeauty, renderPass, &fromBeautyRes, &beautyFailureReason)) {
+                VGLOG_VFR("transition beauty prepareTransitionLayer(from) failed: %s",
+                          beautyFailureReason.c_str());
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+            }
+        }
+        if (toBeauty.enabled) {
+            if (!s.beautyRendererTo->prepareTransitionLayer(
+                    s.device, physDev, frame->commandBuffer, s.currentFrameIndex, frameCount,
+                    *toImage, toLayoutState, coreShaders.vertex.get(), coreShaders.fragment.get(),
+                    transition.to, toBeauty, renderPass, &toBeautyRes, &beautyFailureReason)) {
+                VGLOG_VFR("transition beauty prepareTransitionLayer(to) failed: %s",
+                          beautyFailureReason.c_str());
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+            }
+        }
+
+        // Pipeline-layout correctness: a beautified "to" layer blended for
+        // crossfade needs a blend pipeline built with Beauty's placement
+        // pipeline layout, never the AHB import layout.
+        if (needToBlend && toBeauty.enabled) {
+            if (!CreateVulkanTransitionBlendPipeline(s.device, toBeautyRes.pipelineLayout, renderPass,
+                                                     coreShaders.vertex.get(), coreShaders.fragment.get(),
+                                                     &s.transitionToBlendPipeline)) {
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+            }
+        }
+
+        if (fromBeauty.enabled) {
+            fromRes.pipeline = fromBeautyRes.pipeline;
+            fromRes.pipelineLayout = fromBeautyRes.pipelineLayout;
+            fromRes.descriptorSet = fromBeautyRes.descriptorSet;
+            fromRes.pushConstants = makeVideoTransformFullPushConstants(fromBeautyRes.placementTransform);
+        } else {
+            fromRes.pipeline = s.transitionFromPipeline ? s.transitionFromPipeline->get() : VK_NULL_HANDLE;
+            fromRes.pipelineLayout = fromLayout;
+            fromRes.descriptorSet = fromSet;
+            fromRes.pushConstants = makeVideoTransformFullPushConstants(transition.from);
+        }
+
+        if (toBeauty.enabled) {
+            toRes.pipelineLayout = toBeautyRes.pipelineLayout;
+            toRes.descriptorSet = toBeautyRes.descriptorSet;
+            toRes.pushConstants = makeVideoTransformFullPushConstants(toBeautyRes.placementTransform);
+        } else {
+            toRes.pipelineLayout = toLayout;
+            toRes.descriptorSet = toSet;
+            toRes.pushConstants = makeVideoTransformFullPushConstants(transition.to);
+        }
+        if (needToBlend) {
+            toRes.pipeline = s.transitionToBlendPipeline;
+            toRes.useBlendConstants = true;
+            toRes.blendConstant =
+                static_cast<float>(std::max(0.0, std::min(1.0, transition.blendWeightTo)));
+        } else if (toBeauty.enabled) {
+            toRes.pipeline = toBeautyRes.pipeline;
+        } else if (s.transitionToOpaquePipeline) {
+            toRes.pipeline = s.transitionToOpaquePipeline->get();
+        }
+
+        bool planOk = true;
+        switch (mode) {
+            case VulkanTransitionDrawMode::kFromOnly:
+                planOk = AppendVulkanTransitionLayer(&passParams, fromRes, fromPlacement, false);
+                break;
+            case VulkanTransitionDrawMode::kToOnly:
+                planOk = AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, false);
+                break;
+            case VulkanTransitionDrawMode::kPaintOver:
+            case VulkanTransitionDrawMode::kCrossfade:
+                planOk = AppendVulkanTransitionLayer(&passParams, fromRes, fromPlacement, false) &&
+                         AppendVulkanTransitionLayer(&passParams, toRes, toPlacement, true);
+                break;
+        }
+        if (!planOk) {
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+        }
+
+        if (!VulkanGraphicsCommandRecorder::recordTransitionPassBody(passParams)) {
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+        }
+
+        if (vkEndCommandBuffer(frame->commandBuffer) != VK_SUCCESS) {
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+        }
     }
 
     if (!s.frameSync->resetFrameFence(s.currentFrameIndex)) {
@@ -1343,12 +1497,15 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
 // P5-COMPOSITOR-TRANS: host-build stub for the two-source transition frame.
 RenderFrameResult VulkanFrameRenderer::renderTransitionFrame(
     void* /*queueHandle*/,
+    void* /*physicalDeviceHandle*/,
     VulkanSurfaceSwapchain& swapchain,
     VulkanHardwareBufferImports& ahbImports,
     VulkanCoreShaderModules& /*coreShaders*/,
     HardwareBufferHandle fromHandle,
     HardwareBufferHandle toHandle,
-    const VideoTransitionFrameTransform& /*transition*/) {
+    const VideoTransitionFrameTransform& /*transition*/,
+    const VideoBeautyV2RenderParams& /*fromBeauty*/,
+    const VideoBeautyV2RenderParams& /*toBeauty*/) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }

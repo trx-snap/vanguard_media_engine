@@ -187,7 +187,9 @@ RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle /*handle*/,
 RenderFrameResult VulkanBackend::renderTransitionFrame(
     HardwareBufferHandle /*fromHandle*/,
     HardwareBufferHandle /*toHandle*/,
-    const VideoTransitionFrameTransform& /*transition*/) {
+    const VideoTransitionFrameTransform& /*transition*/,
+    const VideoBeautyV2RenderParams& /*fromBeauty*/,
+    const VideoBeautyV2RenderParams& /*toBeauty*/) {
     return RenderFrameResult::kUnavailable;
 }
 
@@ -916,7 +918,9 @@ RenderFrameResult VulkanBackend::renderFrame(HardwareBufferHandle handle,
 RenderFrameResult VulkanBackend::renderTransitionFrame(
     HardwareBufferHandle fromHandle,
     HardwareBufferHandle toHandle,
-    const VideoTransitionFrameTransform& transition) {
+    const VideoTransitionFrameTransform& transition,
+    const VideoBeautyV2RenderParams& fromBeauty,
+    const VideoBeautyV2RenderParams& toBeauty) {
     if (!impl_ || !impl_->initialized) {
         return RenderFrameResult::kBackendNotInitialized;
     }
@@ -934,12 +938,15 @@ RenderFrameResult VulkanBackend::renderTransitionFrame(
     }
     return s.frameRenderer->renderTransitionFrame(
         static_cast<void*>(s.queue),
+        static_cast<void*>(s.physDev),
         *s.surfaceSwapchain,
         *s.ahbImports,
         *s.coreShaders,
         fromHandle,
         toHandle,
-        transition);
+        transition,
+        fromBeauty,
+        toBeauty);
 }
 
 #endif // __ANDROID__
