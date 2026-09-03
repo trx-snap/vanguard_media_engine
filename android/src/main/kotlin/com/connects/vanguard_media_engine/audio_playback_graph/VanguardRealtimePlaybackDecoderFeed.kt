@@ -333,6 +333,10 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
     val isAlive: Boolean get() = thread?.isAlive == true
     val checksumHex: String get() = hex16(checksum)
 
+    // Y10a: previous-sync seat / reopen-on-EOS-landing MediaExtractor
+    // mechanics; stateless, called only from the decode thread below.
+    private val mediaSeek = VanguardRealtimePlaybackDecoderMediaSeek(config.sourcePath)
+
     // ── Decode-thread-confined state ───────────────────────────────────────
 
     private var extractor: MediaExtractor? = null
@@ -626,13 +630,11 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
         if (sourceTrackIndex < 0) throw FailClosed("media_reopen_source_missing")
         if (!releaseMediaObjects()) intermediateReleasesClean = false
         clearStaged()
-        val ex = MediaExtractor()
-        extractor = ex
-        ex.setDataSource(config.sourcePath)
-        if (sourceTrackIndex >= ex.trackCount) throw FailClosed("media_reopen_track_missing:$sourceTrackIndex")
-        val reopenedMime = ex.getTrackFormat(sourceTrackIndex).getString(MediaFormat.KEY_MIME)
-        if (reopenedMime != sourceMime) throw FailClosed("media_reopen_mime_changed:$reopenedMime")
-        ex.selectTrack(sourceTrackIndex)
+        extractor = try {
+            mediaSeek.openExtractorForReopen(sourceTrackIndex, sourceMime)
+        } catch (f: VanguardRealtimePlaybackDecoderMediaSeek.FailClosed) {
+            throw FailClosed(f.reason)
+        }
         startCodec(tf, sourceMime)
         verifyOutputFormatOnNextChunk = true
         mediaReopens++
@@ -823,8 +825,7 @@ class VanguardRealtimePlaybackDecoderFeed(private val config: Config) {
     // Re-seats the extractor at `targetUs` (PREVIOUS_SYNC); landed sample time or -1.
     private fun seatExtractor(targetUs: Long): Long {
         val ex = extractor ?: throw FailClosed("extractor_missing")
-        ex.seekTo(targetUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
-        return ex.sampleTime
+        return mediaSeek.seatExtractor(ex, targetUs)
     }
 
     // Clears staging, re-seats the extractor, flushes the codec, resets the EOS

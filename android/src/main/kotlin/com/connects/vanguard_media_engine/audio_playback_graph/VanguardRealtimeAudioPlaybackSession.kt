@@ -1,8 +1,6 @@
 package com.connects.vanguard_media_engine.audio_playback_graph
 
-import android.media.AudioTrack
 import android.os.SystemClock
-import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackNativeSession.NativeState
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackNativeSession.Reply
 import com.connects.vanguard_media_engine.audio_playback_graph.VanguardRealtimePlaybackTransportStateMachine.State as TransportState
 import java.util.concurrent.atomic.AtomicBoolean
@@ -163,13 +161,6 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         private const val SINK_READY_TIMEOUT_MS = 5_000L
         private const val PARK_ACK_TIMEOUT_MS = 2_000L
         private const val UNPARK_ACK_TIMEOUT_MS = 2_000L
-        // Y9 seek waits, each bounded; the sink seek hold cap and the session deadline bound the whole sequence.
-        private const val INITIAL_WRITE_WAIT_MS = 2_000L
-        private const val QUIESCE_WAIT_MS = 10_000L
-        private const val SNAPSHOT_SETTLE_WAIT_MS = 2_000L
-        private const val FLUSH_ACK_TIMEOUT_MS = 2_000L
-        private const val REANCHOR_WAIT_MS = 5_000L
-        private const val POST_SEEK_PREROLL_WAIT_MS = 5_000L
 
         private fun alignUp(frame: Long, window: Long): Long = ((frame + window - 1L) / window) * window
     }
@@ -228,50 +219,33 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     @Volatile private var sessionStartedAtMs = -1L
     @Volatile private var sessionWallMs = 0L
 
-    // Y9 seek bookkeeping (command-lock holder writes).
+    // Y9 seek admission bookkeeping (command-lock holder writes); the step
+    // sequence and its own bookkeeping live in [seekSequencer].
     @Volatile private var seekArmed = false
     @Volatile private var seekTargetFrame = -1L
     @Volatile private var preSeekHoldFrame = -1L
     @Volatile private var seekAdmissionOk = false
     @Volatile private var seekHoldPinned = false
     @Volatile private var seekCount = 0
-    @Volatile private var seekAccepted = false
-    @Volatile private var seekStaleGeneration = -1L
-    @Volatile private var seekGeneration = -1L
-    @Volatile private var seekPauseAccepted = false
-    @Volatile private var seekPauseGeneration = -1L
-    @Volatile private var seekResumeAccepted = false
-    @Volatile private var seekResumeGeneration = -1L
-    @Volatile private var seekInitialWriteWaitMs = -1L
-    @Volatile private var seekQuiesceWaitMs = -1L
-    @Volatile private var seekQuiesceFeedHeld = false
-    @Volatile private var seekQuiesceSinkReadFrames = -1L
-    @Volatile private var seekQuiesceSinkWrittenFrames = -1L
-    @Volatile private var seekQuiesceAccountingOk = false
-    @Volatile private var seekPreSeekSettleMs = -1L
-    @Volatile private var seekPreSeekReply: Reply? = null
-    @Volatile private var seekPreSeekTransportState: TransportState? = null
-    @Volatile private var seekPostPauseReply: Reply? = null
-    @Volatile private var seekFlushRequestedWhilePaused = false
-    @Volatile private var seekFlushAckWaitMs = -1L
-    @Volatile private var seekFlushAckedBeforeSeek = false
-    @Volatile private var seekSinkPhaseAtSeek = ""
-    @Volatile private var seekPostSeekReply: Reply? = null
-    @Volatile private var seekPostSeekTransportState: TransportState? = null
-    @Volatile private var seekReanchorWaitMs = -1L
-    @Volatile private var seekPostSeekPreRollWaitMs = -1L
-    @Volatile private var seekPostSeekPreRollReply: Reply? = null
-    @Volatile private var seekPostSeekPreRollTransportState: TransportState? = null
-    @Volatile private var seekTransportStateAtUnpark: TransportState? = null
-    @Volatile private var seekParkRequestedAtMs = -1L
-    @Volatile private var seekParkAckedAtMs = -1L
-    @Volatile private var seekUnparkedAtMs = -1L
-    @Volatile private var seekResumedAtMs = -1L
-    @Volatile private var seekHoldObservedMs = -1L
-    @Volatile private var seekWallMs = -1L
-    @Volatile private var seekClockAtPark: VanguardRealtimePlaybackPresentationClock.Snapshot? = null
-    @Volatile private var seekClockBeforeUnpark: VanguardRealtimePlaybackPresentationClock.Snapshot? = null
-    @Volatile private var seekClockAfterUnpark: VanguardRealtimePlaybackPresentationClock.Snapshot? = null
+
+    // Y10a: extracted Y9 seek step sequence; runs synchronously under this
+    // session's command lock, on the caller's thread (see [seek]).
+    private val seekSequencer = VanguardRealtimeAudioPlaybackSeekSequencer(
+        VanguardRealtimeAudioPlaybackSeekSequencer.Config(maxFramesPerMix = config.maxFramesPerMix),
+        object : VanguardRealtimeAudioPlaybackSeekSequencer.Host {
+            override fun pollSeekWaitReason(): String? {
+                if (cancelled.get()) return "cancelled"
+                if (SystemClock.elapsedRealtime() > deadlineAtMs) return "deadline_exceeded"
+                return failure.get()
+            }
+
+            override fun noteCommandIssued() {
+                commandsIssued++
+            }
+
+            override val startGeneration: Long get() = this@VanguardRealtimeAudioPlaybackSession.startGeneration
+        },
+    )
 
     val currentState: State get() = state
     val failureReason: String get() = failure.get() ?: ""
@@ -543,25 +517,12 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
         val fmt = format ?: return failClosed("format_missing")
         seekCount = 1
         state = State.SEEKING
-        try {
-            val seekStartedAt = SystemClock.elapsedRealtime()
-            awaitInitialWritesLocked(s, machine)
-            awaitQuiescenceLocked(f, s, machine)
-            parkForSeekLocked(s)
-            verifyPreSeekQuiescenceLocked(f, s, machine)
-            pauseForSeekLocked(machine)
-            flushSinkLocked(s, machine, fmt.declaredFrameCount)
-            seekTransportLocked(s, machine)
-            reanchorFeedLocked(f, machine)
-            unparkSinkLocked(s, machine)
-            resumeAfterSeekLocked(s, machine)
-            seekWallMs = SystemClock.elapsedRealtime() - seekStartedAt
+        val reason = seekSequencer.run(s, f, machine, fmt.declaredFrameCount, preSeekHoldFrame, seekTargetFrame)
+        if (reason == null) {
             state = State.PLAYING
             accept()
-        } catch (fc: FailClosed) {
-            failClosed(fc.reason)
-        } catch (t: Throwable) {
-            failClosed("exception:${t.javaClass.simpleName}:${t.message}")
+        } else {
+            failClosed(reason)
         }
     }
 
@@ -705,354 +666,46 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
                 admissionOk = seekAdmissionOk,
                 holdPinned = seekHoldPinned,
                 seekCount = seekCount,
-                seekAccepted = seekAccepted,
-                staleGeneration = seekStaleGeneration,
-                seekGeneration = seekGeneration,
-                pauseAccepted = seekPauseAccepted,
-                pauseGeneration = seekPauseGeneration,
-                resumeAccepted = seekResumeAccepted,
-                resumeGeneration = seekResumeGeneration,
-                initialWriteWaitMs = seekInitialWriteWaitMs,
-                quiesceWaitMs = seekQuiesceWaitMs,
-                quiesceFeedHeld = seekQuiesceFeedHeld,
-                quiesceSinkReadFrames = seekQuiesceSinkReadFrames,
-                quiesceSinkWrittenFrames = seekQuiesceSinkWrittenFrames,
-                quiesceAccountingOk = seekQuiesceAccountingOk,
-                preSeekSettleMs = seekPreSeekSettleMs,
-                preSeekReply = seekPreSeekReply,
-                preSeekTransportState = seekPreSeekTransportState,
-                postPauseReply = seekPostPauseReply,
-                flushRequestedWhilePaused = seekFlushRequestedWhilePaused,
-                flushAckWaitMs = seekFlushAckWaitMs,
-                flushAckedBeforeSeek = seekFlushAckedBeforeSeek,
-                sinkPhaseAtSeek = seekSinkPhaseAtSeek,
-                postSeekReply = seekPostSeekReply,
-                postSeekTransportState = seekPostSeekTransportState,
-                reanchorWaitMs = seekReanchorWaitMs,
-                postSeekPreRollWaitMs = seekPostSeekPreRollWaitMs,
-                postSeekPreRollReply = seekPostSeekPreRollReply,
-                postSeekPreRollTransportState = seekPostSeekPreRollTransportState,
-                transportStateAtUnpark = seekTransportStateAtUnpark,
-                parkRequestedAtMs = seekParkRequestedAtMs,
-                parkAckedAtMs = seekParkAckedAtMs,
-                unparkedAtMs = seekUnparkedAtMs,
-                resumedAtMs = seekResumedAtMs,
-                holdObservedMs = seekHoldObservedMs,
-                seekWallMs = seekWallMs,
-                clockAtPark = seekClockAtPark,
-                clockBeforeUnpark = seekClockBeforeUnpark,
-                clockAfterUnpark = seekClockAfterUnpark,
+                seekAccepted = seekSequencer.seekAccepted,
+                staleGeneration = seekSequencer.seekStaleGeneration,
+                seekGeneration = seekSequencer.seekGeneration,
+                pauseAccepted = seekSequencer.seekPauseAccepted,
+                pauseGeneration = seekSequencer.seekPauseGeneration,
+                resumeAccepted = seekSequencer.seekResumeAccepted,
+                resumeGeneration = seekSequencer.seekResumeGeneration,
+                initialWriteWaitMs = seekSequencer.seekInitialWriteWaitMs,
+                quiesceWaitMs = seekSequencer.seekQuiesceWaitMs,
+                quiesceFeedHeld = seekSequencer.seekQuiesceFeedHeld,
+                quiesceSinkReadFrames = seekSequencer.seekQuiesceSinkReadFrames,
+                quiesceSinkWrittenFrames = seekSequencer.seekQuiesceSinkWrittenFrames,
+                quiesceAccountingOk = seekSequencer.seekQuiesceAccountingOk,
+                preSeekSettleMs = seekSequencer.seekPreSeekSettleMs,
+                preSeekReply = seekSequencer.seekPreSeekReply,
+                preSeekTransportState = seekSequencer.seekPreSeekTransportState,
+                postPauseReply = seekSequencer.seekPostPauseReply,
+                flushRequestedWhilePaused = seekSequencer.seekFlushRequestedWhilePaused,
+                flushAckWaitMs = seekSequencer.seekFlushAckWaitMs,
+                flushAckedBeforeSeek = seekSequencer.seekFlushAckedBeforeSeek,
+                sinkPhaseAtSeek = seekSequencer.seekSinkPhaseAtSeek,
+                postSeekReply = seekSequencer.seekPostSeekReply,
+                postSeekTransportState = seekSequencer.seekPostSeekTransportState,
+                reanchorWaitMs = seekSequencer.seekReanchorWaitMs,
+                postSeekPreRollWaitMs = seekSequencer.seekPostSeekPreRollWaitMs,
+                postSeekPreRollReply = seekSequencer.seekPostSeekPreRollReply,
+                postSeekPreRollTransportState = seekSequencer.seekPostSeekPreRollTransportState,
+                transportStateAtUnpark = seekSequencer.seekTransportStateAtUnpark,
+                parkRequestedAtMs = seekSequencer.seekParkRequestedAtMs,
+                parkAckedAtMs = seekSequencer.seekParkAckedAtMs,
+                unparkedAtMs = seekSequencer.seekUnparkedAtMs,
+                resumedAtMs = seekSequencer.seekResumedAtMs,
+                holdObservedMs = seekSequencer.seekHoldObservedMs,
+                seekWallMs = seekSequencer.seekWallMs,
+                clockAtPark = seekSequencer.seekClockAtPark,
+                clockBeforeUnpark = seekSequencer.seekClockBeforeUnpark,
+                clockAfterUnpark = seekSequencer.seekClockAfterUnpark,
                 decoder = f?.seekTelemetry(),
             ),
         )
-    }
-
-    // ── Y9 seek steps (command-lock holder, state SEEKING) ─────────────────
-
-    private fun snapshotReplyLocked(phase: String, machine: VanguardRealtimePlaybackTransportStateMachine): Reply {
-        val res = machine.snapshot()
-        if (!res.accepted) throw FailClosed("snapshot_rejected_$phase:${res.reason}")
-        return res.reply ?: throw FailClosed("snapshot_null_reply_$phase")
-    }
-
-    private fun pollSeekWait() {
-        checkDeadlineAndCancel()
-        failure.get()?.let { throw FailClosed(it) }
-    }
-
-    // The seek must land on a really playing sink.
-    private fun awaitInitialWritesLocked(
-        s: VanguardRealtimeAudioPlaybackSinkBridge,
-        machine: VanguardRealtimePlaybackTransportStateMachine,
-    ) {
-        val waitStart = SystemClock.elapsedRealtime()
-        val waitDeadline = waitStart + INITIAL_WRITE_WAIT_MS
-        while (!s.hasPlayed || s.framesWritten <= 0L) {
-            pollSeekWait()
-            if (!s.isAlive) throw FailClosed("sink_exited_before_first_write:${s.currentExitReason}")
-            if (SystemClock.elapsedRealtime() > waitDeadline) throw FailClosed("no_initial_sink_write")
-            sleepSlice()
-        }
-        seekInitialWriteWaitMs = SystemClock.elapsedRealtime() - waitStart
-        val transportState = machine.currentState
-        if (transportState != TransportState.PLAYING) throw FailClosed("seek_precondition_state:${transportState.name.lowercase()}")
-    }
-
-    // Feed held at H and sink read (hence written: a park follows a fully
-    // written window) all H frames, transport PLAYING, sink RUNNING.
-    private fun awaitQuiescenceLocked(
-        f: VanguardRealtimePlaybackDecoderFeed,
-        s: VanguardRealtimeAudioPlaybackSinkBridge,
-        machine: VanguardRealtimePlaybackTransportStateMachine,
-    ) {
-        val hold = preSeekHoldFrame
-        val waitStart = SystemClock.elapsedRealtime()
-        val waitDeadline = waitStart + QUIESCE_WAIT_MS
-        while (!(f.heldAtHoldFrame && f.anchorFrame == hold && s.framesRead == hold)) {
-            pollSeekWait()
-            if (!s.isAlive) throw FailClosed("sink_exited_before_quiesce:${s.currentExitReason}")
-            if (!f.isAlive) throw FailClosed("feed_exited_before_quiesce:${f.exitReason}")
-            if (s.framesRead > hold) throw FailClosed("sink_read_past_hold:${s.framesRead}:$hold")
-            if (machine.currentState != TransportState.PLAYING) throw FailClosed("quiesce_state:${machine.currentState.name.lowercase()}")
-            if (s.phase != VanguardRealtimeAudioPlaybackSinkBridge.Phase.RUNNING) throw FailClosed("quiesce_sink_phase:${s.phase.name.lowercase()}")
-            if (SystemClock.elapsedRealtime() > waitDeadline) {
-                throw FailClosed("quiesce_timeout:anchor=${f.anchorFrame}:held=${f.heldAtHoldFrame}:read=${s.framesRead}:hold=$hold")
-            }
-            sleepSlice()
-        }
-        seekQuiesceWaitMs = SystemClock.elapsedRealtime() - waitStart
-        seekQuiesceFeedHeld = f.heldAtHoldFrame
-        seekQuiesceSinkReadFrames = s.framesRead
-    }
-
-    // Seek park: AudioTrack paused on the sink thread, epoch closed at the
-    // last published position, hold capped by maxSeekHoldMs.
-    private fun parkForSeekLocked(s: VanguardRealtimeAudioPlaybackSinkBridge) {
-        seekParkRequestedAtMs = SystemClock.elapsedRealtime()
-        if (!s.requestSeekPark()) throw FailClosed("sink_seek_park_rejected:${s.phase.name.lowercase()}")
-        val ackDeadline = seekParkRequestedAtMs + PARK_ACK_TIMEOUT_MS
-        while (!s.awaitParked(WAIT_SLICE_MS)) {
-            pollSeekWait()
-            if (!s.isAlive) throw FailClosed("sink_exited_before_seek_park_ack:${s.currentExitReason}")
-            if (SystemClock.elapsedRealtime() > ackDeadline) throw FailClosed("sink_seek_park_ack_timeout")
-        }
-        seekParkAckedAtMs = SystemClock.elapsedRealtime()
-        seekClockAtPark = s.clockSnapshot()
-        val k = s.telemetry()
-        if (k.playStateAtPark != AudioTrack.PLAYSTATE_PAUSED) throw FailClosed("sink_not_paused_at_seek_park:${k.playStateAtPark}")
-        if (k.parkCount != 1 || k.seekParkCount != 1) throw FailClosed("sink_seek_park_count:${k.parkCount}:${k.seekParkCount}")
-        seekQuiesceSinkWrittenFrames = s.framesWritten
-    }
-
-    // Pre-seek native snapshot: position == pushed == drained == H, discarded
-    // 0, output ring empty, native PLAYING, sink PARKED, transport PLAYING.
-    private fun verifyPreSeekQuiescenceLocked(
-        f: VanguardRealtimePlaybackDecoderFeed,
-        s: VanguardRealtimeAudioPlaybackSinkBridge,
-        machine: VanguardRealtimePlaybackTransportStateMachine,
-    ) {
-        val hold = preSeekHoldFrame
-        val window = config.maxFramesPerMix.toLong()
-        val settleStart = SystemClock.elapsedRealtime()
-        val settleDeadline = settleStart + SNAPSHOT_SETTLE_WAIT_MS
-        var snap: Reply
-        while (true) {
-            snap = snapshotReplyLocked("pre_seek", machine)
-            if (snap.pushedFrames == hold && snap.drainedFrames == hold && snap.positionFrame == hold) break
-            pollSeekWait()
-            if (SystemClock.elapsedRealtime() > settleDeadline) {
-                throw FailClosed("pre_seek_snapshot_unsettled:pos=${snap.positionFrame}:pushed=${snap.pushedFrames}:drained=${snap.drainedFrames}:hold=$hold")
-            }
-            sleepSlice()
-        }
-        seekPreSeekSettleMs = SystemClock.elapsedRealtime() - settleStart
-        seekPreSeekReply = snap
-        val transportState = machine.currentState
-        seekPreSeekTransportState = transportState
-        val d = f.seekTelemetry()
-        seekQuiesceAccountingOk = hold % window == 0L &&
-            d.anchorFrame == hold && d.heldAtHoldFrame && d.acceptedFrames == hold &&
-            snap.state == NativeState.PLAYING && transportState == TransportState.PLAYING &&
-            snap.positionFrame == hold && snap.pushedFrames == hold && snap.drainedFrames == hold &&
-            snap.discardedFrames == 0L && snap.outputAvailableReadFrames == 0L &&
-            !snap.eosPushed && !snap.eosDrained &&
-            s.framesRead == hold && s.framesWritten == hold &&
-            s.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.PARKED
-        if (!seekQuiesceAccountingOk) {
-            throw FailClosed(
-                "seek_quiesce_accounting:hold=$hold:anchor=${d.anchorFrame}:held=${d.heldAtHoldFrame}:accepted=${d.acceptedFrames}:" +
-                    "native=${snap.stateToken}:transport=${transportState.name.lowercase()}:pos=${snap.positionFrame}:" +
-                    "pushed=${snap.pushedFrames}:drained=${snap.drainedFrames}:discarded=${snap.discardedFrames}:" +
-                    "avail=${snap.outputAvailableReadFrames}:read=${s.framesRead}:written=${s.framesWritten}:sink=${s.phase.name.lowercase()}",
-            )
-        }
-    }
-
-    // transport.pause after the sink park; PAUSED recheck with H accounting unchanged.
-    private fun pauseForSeekLocked(machine: VanguardRealtimePlaybackTransportStateMachine) {
-        val hold = preSeekHoldFrame
-        val res = machine.pause()
-        commandsIssued++
-        seekPauseAccepted = res.accepted && res.state == TransportState.PAUSED
-        seekPauseGeneration = machine.currentGeneration
-        if (!seekPauseAccepted) throw FailClosed("seek_pause_rejected:${res.reason}")
-        if (seekPauseGeneration != startGeneration) throw FailClosed("seek_pause_generation_moved:$startGeneration:$seekPauseGeneration")
-        val snap = snapshotReplyLocked("post_pause", machine)
-        seekPostPauseReply = snap
-        if (snap.state != NativeState.PAUSED || snap.pushedFrames != hold ||
-            snap.drainedFrames != hold || snap.discardedFrames != 0L
-        ) {
-            throw FailClosed("post_pause_accounting:${snap.stateToken}:${snap.pushedFrames}:${snap.drainedFrames}:${snap.discardedFrames}")
-        }
-    }
-
-    // AudioTrack.flush() once on the sink thread while sink PARKED/PAUSED and
-    // transport PAUSED; read budget becomes H + (declared - T).
-    private fun flushSinkLocked(
-        s: VanguardRealtimeAudioPlaybackSinkBridge,
-        machine: VanguardRealtimePlaybackTransportStateMachine,
-        declared: Long,
-    ) {
-        val hold = preSeekHoldFrame
-        val target = seekTargetFrame
-        if (machine.currentState != TransportState.PAUSED) throw FailClosed("flush_before_transport_pause:${machine.currentState.name.lowercase()}")
-        if (s.phase != VanguardRealtimeAudioPlaybackSinkBridge.Phase.PARKED) throw FailClosed("flush_before_sink_park:${s.phase.name.lowercase()}")
-        seekFlushRequestedWhilePaused = true
-        val flushAt = SystemClock.elapsedRealtime()
-        if (!s.requestFlush(declared - target, target)) throw FailClosed("sink_flush_request_rejected:${s.phase.name.lowercase()}")
-        val ackDeadline = flushAt + FLUSH_ACK_TIMEOUT_MS
-        while (!s.awaitFlushed(WAIT_SLICE_MS)) {
-            pollSeekWait()
-            if (!s.isAlive) throw FailClosed("sink_exited_before_flush_ack:${s.currentExitReason}")
-            if (SystemClock.elapsedRealtime() > ackDeadline) throw FailClosed("sink_flush_ack_timeout:${s.currentFlushCount}")
-        }
-        seekFlushAckWaitMs = SystemClock.elapsedRealtime() - flushAt
-        val k = s.telemetry()
-        val ok = k.flushCount == 1 && k.flushRequestCount == 1 && k.flushExecutedOnSinkThread &&
-            k.playStateBeforeFlush == AudioTrack.PLAYSTATE_PAUSED && k.playStateAfterFlush == AudioTrack.PLAYSTATE_PAUSED &&
-            k.framesWrittenAtFlush == hold && k.framesReadAtFlush == hold &&
-            k.postSeekExpectedFrames == declared - target && k.readBudgetFrames == hold + (declared - target) &&
-            k.seekTargetFrame == target && k.timestampPollsDuringFlush == 0L &&
-            s.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.PARKED && machine.currentState == TransportState.PAUSED
-        if (!ok) {
-            throw FailClosed(
-                "sink_flush_verification:count=${k.flushCount}:requests=${k.flushRequestCount}:before=${k.playStateBeforeFlush}:" +
-                    "after=${k.playStateAfterFlush}:written=${k.framesWrittenAtFlush}:read=${k.framesReadAtFlush}:" +
-                    "expected=${k.postSeekExpectedFrames}:budget=${k.readBudgetFrames}:sink=${s.phase.name.lowercase()}",
-            )
-        }
-    }
-
-    // transport.seek(T) while PAUSED into an empty output ring: stays PAUSED,
-    // generation + 1, native cursor T, nothing discarded.
-    private fun seekTransportLocked(
-        s: VanguardRealtimeAudioPlaybackSinkBridge,
-        machine: VanguardRealtimePlaybackTransportStateMachine,
-    ) {
-        val hold = preSeekHoldFrame
-        val target = seekTargetFrame
-        if (machine.currentState != TransportState.PAUSED) throw FailClosed("seek_before_pause:${machine.currentState.name.lowercase()}")
-        seekFlushAckedBeforeSeek = s.currentFlushCount == 1
-        if (!seekFlushAckedBeforeSeek) throw FailClosed("seek_before_flush:${s.currentFlushCount}")
-        seekSinkPhaseAtSeek = s.phase.name
-        seekStaleGeneration = machine.currentGeneration
-        val res = machine.seek(target)
-        commandsIssued++
-        seekAccepted = res.accepted && res.state == TransportState.PAUSED
-        seekGeneration = machine.currentGeneration
-        if (!seekAccepted) throw FailClosed("seek_rejected:${res.reason}:${res.state.name.lowercase()}")
-        if (seekGeneration != seekStaleGeneration + 1L) throw FailClosed("seek_generation_not_advanced:$seekStaleGeneration:$seekGeneration")
-        val snap = snapshotReplyLocked("post_seek", machine)
-        seekPostSeekReply = snap
-        val transportState = machine.currentState
-        seekPostSeekTransportState = transportState
-        val ok = transportState == TransportState.PAUSED && snap.state == NativeState.PAUSED &&
-            snap.positionFrame == target && snap.pushedFrames == hold && snap.drainedFrames == hold &&
-            snap.discardedFrames == 0L && !snap.eosPushed && !snap.eosDrained
-        if (!ok) {
-            throw FailClosed(
-                "seek_command_accounting:transport=${transportState.name.lowercase()}:native=${snap.stateToken}:pos=${snap.positionFrame}:" +
-                    "pushed=${snap.pushedFrames}:drained=${snap.drainedFrames}:discarded=${snap.discardedFrames}",
-            )
-        }
-    }
-
-    // Feed re-anchor on the decode thread (post-seek generation, stale probe
-    // rejected before JNI), then >= one window post-seek pre-roll while PAUSED.
-    private fun reanchorFeedLocked(
-        f: VanguardRealtimePlaybackDecoderFeed,
-        machine: VanguardRealtimePlaybackTransportStateMachine,
-    ) {
-        val hold = preSeekHoldFrame
-        val target = seekTargetFrame
-        val reanchorAt = SystemClock.elapsedRealtime()
-        val requested = f.requestSeekReanchor(
-            VanguardRealtimePlaybackDecoderSeekRequest(
-                targetFrame = target,
-                preSeekAnchorFrame = hold,
-                newGeneration = seekGeneration,
-                staleGeneration = seekStaleGeneration,
-            ),
-        )
-        if (!requested) throw FailClosed("feed_reanchor_request_rejected")
-        val reanchorDeadline = reanchorAt + REANCHOR_WAIT_MS
-        while (!f.awaitReanchor(WAIT_SLICE_MS)) {
-            pollSeekWait()
-            if (!f.isAlive) throw FailClosed("feed_exited_before_reanchor:${f.exitReason}")
-            if (SystemClock.elapsedRealtime() > reanchorDeadline) throw FailClosed("feed_reanchor_timeout")
-        }
-        seekReanchorWaitMs = SystemClock.elapsedRealtime() - reanchorAt
-        if (!(f.reanchorOk && f.seekReanchorCount == 1)) throw FailClosed("feed_reanchor_failed:${f.exitReason}")
-        if (machine.currentState != TransportState.PAUSED) throw FailClosed("reanchor_state_moved:${machine.currentState.name.lowercase()}")
-
-        val prerollAt = SystemClock.elapsedRealtime()
-        val prerollDeadline = prerollAt + POST_SEEK_PREROLL_WAIT_MS
-        while (!f.awaitPostSeekPreRoll(WAIT_SLICE_MS)) {
-            pollSeekWait()
-            if (!f.isAlive) throw FailClosed("feed_exited_before_post_seek_preroll:${f.exitReason}")
-            if (SystemClock.elapsedRealtime() > prerollDeadline) throw FailClosed("post_seek_preroll_timeout:${f.postSeekAcceptedFrames}")
-        }
-        seekPostSeekPreRollWaitMs = SystemClock.elapsedRealtime() - prerollAt
-        val transportState = machine.currentState
-        seekPostSeekPreRollTransportState = transportState
-        val preRollOk = f.postSeekPreRollFrames >= config.maxFramesPerMix.toLong() && f.postSeekPreRollStatePaused &&
-            transportState == TransportState.PAUSED
-        if (!preRollOk) {
-            throw FailClosed("post_seek_preroll_short:${f.postSeekPreRollFrames}:${f.postSeekPreRollStatePaused}:${transportState.name.lowercase()}")
-        }
-        // Still PAUSED: the worker rendered nothing since the seek.
-        val snap = snapshotReplyLocked("post_seek_preroll", machine)
-        seekPostSeekPreRollReply = snap
-        if (snap.state != NativeState.PAUSED || snap.pushedFrames != hold || snap.positionFrame != target || snap.discardedFrames != 0L) {
-            throw FailClosed("post_seek_preroll_accounting:${snap.stateToken}:${snap.pushedFrames}:${snap.positionFrame}:${snap.discardedFrames}")
-        }
-    }
-
-    // Transport still PAUSED: the sink thread plays the flushed instance,
-    // opens the seek epoch at T and publishes RUNNING before this returns.
-    private fun unparkSinkLocked(
-        s: VanguardRealtimeAudioPlaybackSinkBridge,
-        machine: VanguardRealtimePlaybackTransportStateMachine,
-    ) {
-        val target = seekTargetFrame
-        val transportState = machine.currentState
-        seekTransportStateAtUnpark = transportState
-        if (transportState != TransportState.PAUSED) throw FailClosed("unpark_transport_not_paused:${transportState.name.lowercase()}")
-        if (!s.isAlive) throw FailClosed("sink_exited_during_seek:${s.currentExitReason}")
-        seekClockBeforeUnpark = s.clockSnapshot()
-        val unparkAt = SystemClock.elapsedRealtime()
-        if (!s.unpark()) throw FailClosed("sink_seek_unpark_rejected:${s.phase.name.lowercase()}:${s.currentFlushCount}")
-        val ackDeadline = unparkAt + UNPARK_ACK_TIMEOUT_MS
-        while (!s.awaitRunning(WAIT_SLICE_MS)) {
-            pollSeekWait()
-            if (!s.isAlive) throw FailClosed("sink_exited_before_seek_unpark_ack:${s.currentExitReason}")
-            if (SystemClock.elapsedRealtime() > ackDeadline) throw FailClosed("sink_seek_unpark_ack_timeout")
-        }
-        seekUnparkedAtMs = SystemClock.elapsedRealtime()
-        seekHoldObservedMs = seekUnparkedAtMs - seekParkAckedAtMs
-        seekClockAfterUnpark = s.clockSnapshot()
-        val k = s.telemetry()
-        if (k.playStateAfterUnpark != AudioTrack.PLAYSTATE_PLAYING) throw FailClosed("sink_not_playing_after_seek_unpark:${k.playStateAfterUnpark}")
-        if (k.unparkCount != 1 || k.seekEpochOpenedAtUnpark == VanguardRealtimeAudioPlaybackSinkBridge.EPOCH_NONE ||
-            k.seekEpochBaseFrame != target
-        ) {
-            throw FailClosed("seek_epoch_not_opened:${k.unparkCount}:${k.seekEpochOpenedAtUnpark}:${k.seekEpochBaseFrame}:$target")
-        }
-    }
-
-    // Only after the sink is RUNNING again; generation stays at the post-seek value.
-    private fun resumeAfterSeekLocked(
-        s: VanguardRealtimeAudioPlaybackSinkBridge,
-        machine: VanguardRealtimePlaybackTransportStateMachine,
-    ) {
-        if (s.phase != VanguardRealtimeAudioPlaybackSinkBridge.Phase.RUNNING) throw FailClosed("resume_before_sink_unpark:${s.phase.name.lowercase()}")
-        val res = machine.resume()
-        commandsIssued++
-        seekResumeAccepted = res.accepted && res.state == TransportState.PLAYING
-        seekResumeGeneration = machine.currentGeneration
-        if (!seekResumeAccepted) throw FailClosed("seek_resume_rejected:${res.reason}")
-        if (seekResumeGeneration != seekGeneration) throw FailClosed("seek_resume_generation_moved:$seekGeneration:$seekResumeGeneration")
-        seekResumedAtMs = SystemClock.elapsedRealtime()
     }
 
     // ── Internals ──────────────────────────────────────────────────────────
