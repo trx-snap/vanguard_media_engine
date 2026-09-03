@@ -18,6 +18,11 @@
 //   renderAndroidTimelineVulkanExportTransitionFrame  -> jstring (P5-COMPOSITOR-TRANS: two imported AHardwareBuffers,
 //                                                                  per-layer 9-int geometry + optional colorMatrix,
 //                                                                  compositor-owned transition type code + progress)
+//   uploadAndroidTimelineVulkanExportOverlayTexture   -> jstring (P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A sub-slice N5:
+//                                                                  direct RGBA8888 ByteBuffer upload into the
+//                                                                  backend-owned overlay texture store)
+//   releaseAndroidTimelineVulkanExportOverlayTexture  -> jstring (sub-slice N5: release one overlay texture)
+//   clearAndroidTimelineVulkanExportOverlayTextures   -> jstring (sub-slice N5: release every overlay texture)
 //   destroyAndroidTimelineVulkanExportSession        -> jstring
 
 #include <jni.h>
@@ -82,24 +87,36 @@ struct VulkanExportSession {
     int32_t                         height{0};
     int                             renderedFrames{0};
     std::string                     sessionId;
-    // Number of in-flight render calls currently using this session's
-    // backend. Guarded by gVulkanExportSessionMutex. destroy() waits for
-    // this to reach zero (after removing the session from the registry)
-    // before touching the backend or freeing the session.
+    // Number of in-flight backend operations currently using this
+    // session's backend: render/transition frame calls and overlay
+    // texture upload/release/clear calls. Guarded by
+    // gVulkanExportSessionMutex. destroy() waits for this to reach zero
+    // (after removing the session from the registry) before touching the
+    // backend or freeing the session.
     int                             activeRenderCount{0};
+    // Serializes every call into `backend` (the render/transition routes
+    // and the overlay texture upload/release/clear routes below), since
+    // VulkanBackend performs no internal synchronization of its own and
+    // requires callers to serialize all backend use against each other.
+    // Disjoint from gVulkanExportSessionMutex, which only guards registry
+    // lookup/erase and activeRenderCount bookkeeping: the two are never
+    // held at the same time.
+    std::mutex                      backendLaneMutex;
 };
 
 // ---------------------------------------------------------------------------
 // Session registry (guarded by mutex)
 // ---------------------------------------------------------------------------
 //
-// Lifetime safety: renderAndroidTimelineVulkanExportFrame and
-// destroyAndroidTimelineVulkanExportSession both serialize their registry
-// lookup/erase and activeRenderCount bookkeeping on gVulkanExportSessionMutex.
-// destroy() erases the session from the map before waiting for
-// activeRenderCount to drain, so no new render can observe a closing
-// session, and no render can still be touching the backend once destroy
-// proceeds to detach/shutdown/release/delete. Neither side ever calls into
+// Lifetime safety: every backend-operation entry point (the render and
+// transition frame routes, and the overlay texture upload/release/clear
+// routes) and destroyAndroidTimelineVulkanExportSession all serialize
+// their registry lookup/erase and activeRenderCount bookkeeping on
+// gVulkanExportSessionMutex. destroy() erases the session from the map
+// before waiting for activeRenderCount to drain, so no new backend
+// operation can observe a closing session, and no in-flight backend
+// operation can still be touching the backend once destroy proceeds to
+// detach/shutdown/release/delete. Neither side ever calls into
 // VulkanBackend while holding gVulkanExportSessionMutex.
 
 std::mutex                                            gVulkanExportSessionMutex;
@@ -440,8 +457,35 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     vanguard::render::HardwareBufferHandle handle =
         vanguard::render::kInvalidHardwareBufferHandle;
     vanguard::render::HardwareBufferDescriptor descriptor{};
-    const auto importResult = session->backend.importHardwareBuffer(
-        ahwb, -1, &handle, &descriptor);
+    vanguard::render::HardwareBufferImportResult importResult =
+        vanguard::render::HardwareBufferImportResult::kUnknownHandle;
+    vanguard::render::RenderFrameResult renderResult =
+        vanguard::render::RenderFrameResult::kInvalidBufferHandle;
+    bool renderOk = false;
+    vanguard::render::HardwareBufferImportResult releaseResult =
+        vanguard::render::HardwareBufferImportResult::kUnknownHandle;
+    {
+        // One uninterrupted critical section: import, render, and release
+        // all happen while holding backendLaneMutex so no other call can
+        // interleave its own backend use with this frame's.
+        std::lock_guard<std::mutex> lane(session->backendLaneMutex);
+        importResult = session->backend.importHardwareBuffer(
+            ahwb, -1, &handle, &descriptor);
+        if (importResult == vanguard::render::HardwareBufferImportResult::kSuccess) {
+            renderResult = session->backend.renderFrame(handle);
+            renderOk =
+                renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+                renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+
+            int releaseFenceFd = -1;
+            releaseResult =
+                session->backend.releaseHardwareBuffer(handle, &releaseFenceFd);
+            if (releaseFenceFd >= 0) {
+                ::close(releaseFenceFd);
+                releaseFenceFd = -1;
+            }
+        }
+    }
 
     if (importResult != vanguard::render::HardwareBufferImportResult::kSuccess) {
         std::snprintf(status, sizeof(status),
@@ -449,19 +493,6 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
             static_cast<int>(frameIndex),
             HwBufResultName(importResult));
         return env->NewStringUTF(status);
-    }
-
-    const auto renderResult = session->backend.renderFrame(handle);
-    const bool renderOk =
-        renderResult == vanguard::render::RenderFrameResult::kSuccess ||
-        renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
-
-    int releaseFenceFd = -1;
-    const auto releaseResult =
-        session->backend.releaseHardwareBuffer(handle, &releaseFenceFd);
-    if (releaseFenceFd >= 0) {
-        ::close(releaseFenceFd);
-        releaseFenceFd = -1;
     }
 
     if (!renderOk) {
@@ -697,26 +728,9 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     vanguard::render::HardwareBufferHandle handle =
         vanguard::render::kInvalidHardwareBufferHandle;
     vanguard::render::HardwareBufferDescriptor descriptor{};
-    const auto importResult = session->backend.importHardwareBuffer(
-        ahwb, -1, &handle, &descriptor);
-
-    if (importResult != vanguard::render::HardwareBufferImportResult::kSuccess) {
-        std::snprintf(status, sizeof(status),
-            "status=FAIL;frameIndex=%d;reason=import_failed;importResult=%s",
-            static_cast<int>(frameIndex),
-            HwBufResultName(importResult));
-        return env->NewStringUTF(status);
-    }
-
-    // Normalize the crop against the *imported* descriptor -- the
-    // authoritative source of truth for the real (possibly padded) buffer
-    // geometry, per Opus P0. Any failure past this point still releases the
-    // successfully imported buffer before returning.
-    const bool cropWithinBuffer =
-        descriptor.width > 0 && descriptor.height > 0 &&
-        static_cast<uint32_t>(cropRight) <= descriptor.width &&
-        static_cast<uint32_t>(cropBottom) <= descriptor.height;
-
+    vanguard::render::HardwareBufferImportResult importResult =
+        vanguard::render::HardwareBufferImportResult::kUnknownHandle;
+    bool cropWithinBuffer = false;
     vanguard::render::RenderFrameResult renderResult =
         vanguard::render::RenderFrameResult::kInvalidBufferHandle;
     bool renderOk = false;
@@ -724,85 +738,119 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     // "render_failed" reason below with a machine-readable beauty_v2_*
     // token when the failure occurred for a beauty-enabled render.
     const char* renderFailureReason = "render_failed";
+    vanguard::render::HardwareBufferImportResult releaseResult =
+        vanguard::render::HardwareBufferImportResult::kUnknownHandle;
 
-    if (!cropWithinBuffer) {
-        // Fall through without rendering; buffer is still released below.
-    } else {
-        // Phase 10: colorMatrix was already validated (length == 20) before
-        // the buffer was imported above; [colorMatrixValues] holds the raw
-        // (un-normalized) 4x5 row-major values, normalized once by
-        // ApplyLayerTransform (shared with the transition route).
-        LayerGeometryArgs geometry;
-        geometry.cropLeft = static_cast<int32_t>(cropLeft);
-        geometry.cropTop = static_cast<int32_t>(cropTop);
-        geometry.cropRight = static_cast<int32_t>(cropRight);
-        geometry.cropBottom = static_cast<int32_t>(cropBottom);
-        geometry.rotationDegrees = static_cast<int32_t>(rotationDegrees);
-        geometry.destFitX = static_cast<int32_t>(destFitX);
-        geometry.destFitY = static_cast<int32_t>(destFitY);
-        geometry.destFitWidth = static_cast<int32_t>(destFitWidth);
-        geometry.destFitHeight = static_cast<int32_t>(destFitHeight);
-        vanguard::render::VideoFrameTransform transform{};
-        ApplyLayerTransform(geometry, descriptor,
-                            hasColorMatrix ? colorMatrixValues : nullptr, &transform);
+    {
+        // One uninterrupted critical section: import, the conditional
+        // render, and the (always-attempted-on-import-success) release all
+        // happen while holding backendLaneMutex so no other call can
+        // interleave its own backend use with this frame's.
+        std::lock_guard<std::mutex> lane(session->backendLaneMutex);
+        importResult = session->backend.importHardwareBuffer(
+            ahwb, -1, &handle, &descriptor);
 
-        // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: expand beautyIntensity into
-        // the full Beauty V2 ramp using the CROPPED SOURCE extent (never the
-        // output extent), matching VideoBeautyV2RenderParams's documented
-        // contract. A disabled/absent beautyIntensity leaves beautyParams at
-        // its all-default (enabled=false) state, which VulkanBackend treats
-        // as byte-identical to the pre-existing non-beauty renderFrame path.
-        vanguard::render::VideoBeautyV2RenderParams beautyParams{};
-        bool beautyRampOk = true;
-        if (hasBeauty) {
-            const uint32_t beautyCropWidth = static_cast<uint32_t>(cropRight - cropLeft);
-            const uint32_t beautyCropHeight = static_cast<uint32_t>(cropBottom - cropTop);
-            vanguard::render::VulkanBeautyV2Parameters vkBeautyParams{};
-            std::string beautyRampErr;
-            beautyRampOk = vanguard::render::ComputeVulkanBeautyV2ParametersFromIntensity(
-                beautyIntensity, beautyCropWidth, beautyCropHeight, &vkBeautyParams, &beautyRampErr);
-            if (beautyRampOk) {
-                beautyParams.enabled = true;
-                beautyParams.radius = vkBeautyParams.radius;
-                beautyParams.sigma = vkBeautyParams.sigma;
-                beautyParams.rangeSigma = vkBeautyParams.rangeSigma;
-                beautyParams.smoothStrength = vkBeautyParams.smoothStrength;
-                beautyParams.sharpenStrength = vkBeautyParams.sharpenStrength;
-                beautyParams.theta = vkBeautyParams.theta;
-                beautyParams.detailDamping = vkBeautyParams.detailDamping;
-                beautyParams.toneStrength = vkBeautyParams.toneStrength;
-                beautyParams.midtoneLift = vkBeautyParams.midtoneLift;
-                beautyParams.cropWidth = beautyCropWidth;
-                beautyParams.cropHeight = beautyCropHeight;
+        if (importResult == vanguard::render::HardwareBufferImportResult::kSuccess) {
+            // Normalize the crop against the *imported* descriptor -- the
+            // authoritative source of truth for the real (possibly padded)
+            // buffer geometry, per Opus P0. Any failure past this point
+            // still releases the successfully imported buffer below.
+            cropWithinBuffer =
+                descriptor.width > 0 && descriptor.height > 0 &&
+                static_cast<uint32_t>(cropRight) <= descriptor.width &&
+                static_cast<uint32_t>(cropBottom) <= descriptor.height;
+
+            if (cropWithinBuffer) {
+                // Phase 10: colorMatrix was already validated (length == 20)
+                // before the buffer was imported above; [colorMatrixValues]
+                // holds the raw (un-normalized) 4x5 row-major values,
+                // normalized once by ApplyLayerTransform (shared with the
+                // transition route).
+                LayerGeometryArgs geometry;
+                geometry.cropLeft = static_cast<int32_t>(cropLeft);
+                geometry.cropTop = static_cast<int32_t>(cropTop);
+                geometry.cropRight = static_cast<int32_t>(cropRight);
+                geometry.cropBottom = static_cast<int32_t>(cropBottom);
+                geometry.rotationDegrees = static_cast<int32_t>(rotationDegrees);
+                geometry.destFitX = static_cast<int32_t>(destFitX);
+                geometry.destFitY = static_cast<int32_t>(destFitY);
+                geometry.destFitWidth = static_cast<int32_t>(destFitWidth);
+                geometry.destFitHeight = static_cast<int32_t>(destFitHeight);
+                vanguard::render::VideoFrameTransform transform{};
+                ApplyLayerTransform(geometry, descriptor,
+                                    hasColorMatrix ? colorMatrixValues : nullptr, &transform);
+
+                // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: expand
+                // beautyIntensity into the full Beauty V2 ramp using the
+                // CROPPED SOURCE extent (never the output extent), matching
+                // VideoBeautyV2RenderParams's documented contract. A
+                // disabled/absent beautyIntensity leaves beautyParams at its
+                // all-default (enabled=false) state, which VulkanBackend
+                // treats as byte-identical to the pre-existing non-beauty
+                // renderFrame path.
+                vanguard::render::VideoBeautyV2RenderParams beautyParams{};
+                bool beautyRampOk = true;
+                if (hasBeauty) {
+                    const uint32_t beautyCropWidth = static_cast<uint32_t>(cropRight - cropLeft);
+                    const uint32_t beautyCropHeight = static_cast<uint32_t>(cropBottom - cropTop);
+                    vanguard::render::VulkanBeautyV2Parameters vkBeautyParams{};
+                    std::string beautyRampErr;
+                    beautyRampOk = vanguard::render::ComputeVulkanBeautyV2ParametersFromIntensity(
+                        beautyIntensity, beautyCropWidth, beautyCropHeight, &vkBeautyParams, &beautyRampErr);
+                    if (beautyRampOk) {
+                        beautyParams.enabled = true;
+                        beautyParams.radius = vkBeautyParams.radius;
+                        beautyParams.sigma = vkBeautyParams.sigma;
+                        beautyParams.rangeSigma = vkBeautyParams.rangeSigma;
+                        beautyParams.smoothStrength = vkBeautyParams.smoothStrength;
+                        beautyParams.sharpenStrength = vkBeautyParams.sharpenStrength;
+                        beautyParams.theta = vkBeautyParams.theta;
+                        beautyParams.detailDamping = vkBeautyParams.detailDamping;
+                        beautyParams.toneStrength = vkBeautyParams.toneStrength;
+                        beautyParams.midtoneLift = vkBeautyParams.midtoneLift;
+                        beautyParams.cropWidth = beautyCropWidth;
+                        beautyParams.cropHeight = beautyCropHeight;
+                    }
+                }
+
+                if (!beautyRampOk) {
+                    // Defensive-only: Kotlin already validated beautyIntensity
+                    // in [0,1] and cropWidth/cropHeight are already guaranteed
+                    // > 0 by the crop validation above, so
+                    // ComputeVulkanBeautyV2ParametersFromIntensity should
+                    // never actually fail here. Still fails closed: the
+                    // buffer is released below exactly like every other
+                    // failure path.
+                    renderResult = vanguard::render::RenderFrameResult::kVulkanFailure;
+                    renderOk = false;
+                    renderFailureReason = "beauty_v2_requires_vulkan:ramp_failed";
+                } else {
+                    renderResult = session->backend.renderFrame(handle, transform, beautyParams);
+                    renderOk =
+                        renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+                        renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+                    if (!renderOk && hasBeauty) {
+                        renderFailureReason = "beauty_v2_requires_vulkan:vulkan_render_failed";
+                    }
+                }
             }
-        }
 
-        if (!beautyRampOk) {
-            // Defensive-only: Kotlin already validated beautyIntensity in
-            // [0,1] and cropWidth/cropHeight are already guaranteed > 0 by
-            // the crop validation above, so ComputeVulkanBeautyV2ParametersFromIntensity
-            // should never actually fail here. Still fails closed: the
-            // buffer is released below exactly like every other failure path.
-            renderResult = vanguard::render::RenderFrameResult::kVulkanFailure;
-            renderOk = false;
-            renderFailureReason = "beauty_v2_requires_vulkan:ramp_failed";
-        } else {
-            renderResult = session->backend.renderFrame(handle, transform, beautyParams);
-            renderOk =
-                renderResult == vanguard::render::RenderFrameResult::kSuccess ||
-                renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
-            if (!renderOk && hasBeauty) {
-                renderFailureReason = "beauty_v2_requires_vulkan:vulkan_render_failed";
+            int releaseFenceFd = -1;
+            releaseResult =
+                session->backend.releaseHardwareBuffer(handle, &releaseFenceFd);
+            if (releaseFenceFd >= 0) {
+                ::close(releaseFenceFd);
+                releaseFenceFd = -1;
             }
         }
     }
 
-    int releaseFenceFd = -1;
-    const auto releaseResult =
-        session->backend.releaseHardwareBuffer(handle, &releaseFenceFd);
-    if (releaseFenceFd >= 0) {
-        ::close(releaseFenceFd);
-        releaseFenceFd = -1;
+    if (importResult != vanguard::render::HardwareBufferImportResult::kSuccess) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;frameIndex=%d;reason=import_failed;importResult=%s",
+            static_cast<int>(frameIndex),
+            HwBufResultName(importResult));
+        return env->NewStringUTF(status);
     }
 
     if (!cropWithinBuffer) {
@@ -1082,38 +1130,10 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     vanguard::render::HardwareBufferHandle toHandle = vanguard::render::kInvalidHardwareBufferHandle;
     vanguard::render::HardwareBufferDescriptor fromDescriptor{};
     vanguard::render::HardwareBufferDescriptor toDescriptor{};
-
-    const auto fromImportResult = session->backend.importHardwareBuffer(
-        fromAhwb, -1, &fromHandle, &fromDescriptor);
-    if (fromImportResult != HardwareBufferImportResult::kSuccess) {
-        std::snprintf(status, sizeof(status),
-            "status=FAIL;reason=import_failed:layer=from;importResult=%s;transitionType=%s;"
-            "progress=%.4f;frameIndex=%d",
-            HwBufResultName(fromImportResult), typeName, progressValue, static_cast<int>(frameIndex));
-        return env->NewStringUTF(status);
-    }
-
-    const auto toImportResult = session->backend.importHardwareBuffer(
-        toAhwb, -1, &toHandle, &toDescriptor);
-    if (toImportResult != HardwareBufferImportResult::kSuccess) {
-        // Exactly-once release of the already imported "from" layer.
-        int fromReleaseFenceFd = -1;
-        const auto fromReleaseResult =
-            session->backend.releaseHardwareBuffer(fromHandle, &fromReleaseFenceFd);
-        if (fromReleaseFenceFd >= 0) {
-            ::close(fromReleaseFenceFd);
-        }
-        std::snprintf(status, sizeof(status),
-            "status=FAIL;reason=import_failed:layer=to;importResult=%s;fromReleaseResult=%s;"
-            "transitionType=%s;progress=%.4f;frameIndex=%d",
-            HwBufResultName(toImportResult), HwBufResultName(fromReleaseResult),
-            typeName, progressValue, static_cast<int>(frameIndex));
-        return env->NewStringUTF(status);
-    }
-
-    // Both imported: from here every path releases both handles below.
-    const bool fromCropOk = CropWithinDescriptor(fromGeometry, fromDescriptor);
-    const bool toCropOk = CropWithinDescriptor(toGeometry, toDescriptor);
+    HardwareBufferImportResult fromImportResult = HardwareBufferImportResult::kUnknownHandle;
+    HardwareBufferImportResult toImportResult = HardwareBufferImportResult::kUnknownHandle;
+    bool fromCropOk = false;
+    bool toCropOk = false;
     vanguard::render::RenderFrameResult renderResult =
         vanguard::render::RenderFrameResult::kInvalidBufferHandle;
     bool renderOk = false;
@@ -1122,118 +1142,171 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
     // failure occurred for a beauty-enabled layer.
     const char* renderFailureReason = "render_failed";
     char beautyFailureReasonBuf[96];
+    HardwareBufferImportResult fromReleaseResult = HardwareBufferImportResult::kUnknownHandle;
+    HardwareBufferImportResult toReleaseResult = HardwareBufferImportResult::kUnknownHandle;
 
-    if (fromCropOk && toCropOk) {
-        vanguard::render::VideoTransitionFrameTransform transition{};
-        ApplyLayerTransform(fromGeometry, fromDescriptor,
-                            hasFromColorMatrix ? fromColorMatrix : nullptr, &transition.from);
-        ApplyLayerTransform(toGeometry, toDescriptor,
-                            hasToColorMatrix ? toColorMatrix : nullptr, &transition.to);
-        const vanguard::compositors::TimelineTransitionProgress geometry =
-            vanguard::compositors::ComputeTransitionGeometry(type, progressValue);
-        transition.progress = geometry.progress;
-        transition.blendWeightFrom = geometry.blendWeightFrom;
-        transition.blendWeightTo = geometry.blendWeightTo;
-        transition.fromViewport = ToRenderRect(geometry.fromViewport);
-        transition.toViewport = ToRenderRect(geometry.toViewport);
-        transition.fromCrop = ToRenderRect(geometry.fromCrop);
-        transition.toCrop = ToRenderRect(geometry.toCrop);
+    {
+        // One uninterrupted critical section: both imports, the conditional
+        // render, and both releases all happen while holding
+        // backendLaneMutex so no other call can interleave its own backend
+        // use with this transition frame's.
+        std::lock_guard<std::mutex> lane(session->backendLaneMutex);
 
-        // P5-BEAUTY-V2-TRANSITION-COMP: expand each enabled layer's
-        // beautyIntensity into the full Beauty V2 ramp using that layer's
-        // CROPPED SOURCE extent from the validated layer geometry (never the
-        // output extent), matching the cropped solo route's contract. A
-        // disabled layer leaves its VideoBeautyV2RenderParams at its
-        // all-default (enabled=false) state.
-        vanguard::render::VideoBeautyV2RenderParams fromBeautyParams{};
-        vanguard::render::VideoBeautyV2RenderParams toBeautyParams{};
-        bool beautyRampOk = true;
-        const char* beautyRampFailLayer = nullptr;
-        if (hasFromBeauty) {
-            const uint32_t cropWidth = static_cast<uint32_t>(fromGeometry.cropRight - fromGeometry.cropLeft);
-            const uint32_t cropHeight = static_cast<uint32_t>(fromGeometry.cropBottom - fromGeometry.cropTop);
-            vanguard::render::VulkanBeautyV2Parameters vkBeautyParams{};
-            std::string beautyRampErr;
-            if (!vanguard::render::ComputeVulkanBeautyV2ParametersFromIntensity(
-                    fromBeautyIntensity, cropWidth, cropHeight, &vkBeautyParams, &beautyRampErr)) {
-                beautyRampOk = false;
-                beautyRampFailLayer = "from";
+        fromImportResult = session->backend.importHardwareBuffer(
+            fromAhwb, -1, &fromHandle, &fromDescriptor);
+
+        if (fromImportResult == HardwareBufferImportResult::kSuccess) {
+            toImportResult = session->backend.importHardwareBuffer(
+                toAhwb, -1, &toHandle, &toDescriptor);
+
+            if (toImportResult != HardwareBufferImportResult::kSuccess) {
+                // Exactly-once release of the already imported "from" layer.
+                int fromReleaseFenceFd = -1;
+                fromReleaseResult =
+                    session->backend.releaseHardwareBuffer(fromHandle, &fromReleaseFenceFd);
+                if (fromReleaseFenceFd >= 0) {
+                    ::close(fromReleaseFenceFd);
+                }
             } else {
-                fromBeautyParams.enabled = true;
-                fromBeautyParams.radius = vkBeautyParams.radius;
-                fromBeautyParams.sigma = vkBeautyParams.sigma;
-                fromBeautyParams.rangeSigma = vkBeautyParams.rangeSigma;
-                fromBeautyParams.smoothStrength = vkBeautyParams.smoothStrength;
-                fromBeautyParams.sharpenStrength = vkBeautyParams.sharpenStrength;
-                fromBeautyParams.theta = vkBeautyParams.theta;
-                fromBeautyParams.detailDamping = vkBeautyParams.detailDamping;
-                fromBeautyParams.toneStrength = vkBeautyParams.toneStrength;
-                fromBeautyParams.midtoneLift = vkBeautyParams.midtoneLift;
-                fromBeautyParams.cropWidth = cropWidth;
-                fromBeautyParams.cropHeight = cropHeight;
-            }
-        }
-        if (beautyRampOk && hasToBeauty) {
-            const uint32_t cropWidth = static_cast<uint32_t>(toGeometry.cropRight - toGeometry.cropLeft);
-            const uint32_t cropHeight = static_cast<uint32_t>(toGeometry.cropBottom - toGeometry.cropTop);
-            vanguard::render::VulkanBeautyV2Parameters vkBeautyParams{};
-            std::string beautyRampErr;
-            if (!vanguard::render::ComputeVulkanBeautyV2ParametersFromIntensity(
-                    toBeautyIntensity, cropWidth, cropHeight, &vkBeautyParams, &beautyRampErr)) {
-                beautyRampOk = false;
-                beautyRampFailLayer = "to";
-            } else {
-                toBeautyParams.enabled = true;
-                toBeautyParams.radius = vkBeautyParams.radius;
-                toBeautyParams.sigma = vkBeautyParams.sigma;
-                toBeautyParams.rangeSigma = vkBeautyParams.rangeSigma;
-                toBeautyParams.smoothStrength = vkBeautyParams.smoothStrength;
-                toBeautyParams.sharpenStrength = vkBeautyParams.sharpenStrength;
-                toBeautyParams.theta = vkBeautyParams.theta;
-                toBeautyParams.detailDamping = vkBeautyParams.detailDamping;
-                toBeautyParams.toneStrength = vkBeautyParams.toneStrength;
-                toBeautyParams.midtoneLift = vkBeautyParams.midtoneLift;
-                toBeautyParams.cropWidth = cropWidth;
-                toBeautyParams.cropHeight = cropHeight;
-            }
-        }
+                // Both imported: from here every path releases both handles
+                // below.
+                fromCropOk = CropWithinDescriptor(fromGeometry, fromDescriptor);
+                toCropOk = CropWithinDescriptor(toGeometry, toDescriptor);
 
-        if (!beautyRampOk) {
-            // Defensive-only: Kotlin already validated beautyIntensity in
-            // [0,1] and cropWidth/cropHeight are already guaranteed > 0 by
-            // the crop validation above, so ComputeVulkanBeautyV2ParametersFromIntensity
-            // should never actually fail here. Still fails closed: both
-            // buffers are released below exactly like every other failure path.
-            renderResult = vanguard::render::RenderFrameResult::kVulkanFailure;
-            renderOk = false;
-            std::snprintf(beautyFailureReasonBuf, sizeof(beautyFailureReasonBuf),
-                "beauty_v2_requires_vulkan:ramp_failed:layer=%s", beautyRampFailLayer);
-            renderFailureReason = beautyFailureReasonBuf;
-        } else {
-            renderResult = session->backend.renderTransitionFrame(
-                fromHandle, toHandle, transition, fromBeautyParams, toBeautyParams);
-            renderOk =
-                renderResult == vanguard::render::RenderFrameResult::kSuccess ||
-                renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
-            if (!renderOk && (hasFromBeauty || hasToBeauty)) {
-                renderFailureReason = "beauty_v2_requires_vulkan:vulkan_render_failed";
+                if (fromCropOk && toCropOk) {
+                    vanguard::render::VideoTransitionFrameTransform transition{};
+                    ApplyLayerTransform(fromGeometry, fromDescriptor,
+                                        hasFromColorMatrix ? fromColorMatrix : nullptr, &transition.from);
+                    ApplyLayerTransform(toGeometry, toDescriptor,
+                                        hasToColorMatrix ? toColorMatrix : nullptr, &transition.to);
+                    const vanguard::compositors::TimelineTransitionProgress geometry =
+                        vanguard::compositors::ComputeTransitionGeometry(type, progressValue);
+                    transition.progress = geometry.progress;
+                    transition.blendWeightFrom = geometry.blendWeightFrom;
+                    transition.blendWeightTo = geometry.blendWeightTo;
+                    transition.fromViewport = ToRenderRect(geometry.fromViewport);
+                    transition.toViewport = ToRenderRect(geometry.toViewport);
+                    transition.fromCrop = ToRenderRect(geometry.fromCrop);
+                    transition.toCrop = ToRenderRect(geometry.toCrop);
+
+                    // P5-BEAUTY-V2-TRANSITION-COMP: expand each enabled
+                    // layer's beautyIntensity into the full Beauty V2 ramp
+                    // using that layer's CROPPED SOURCE extent from the
+                    // validated layer geometry (never the output extent),
+                    // matching the cropped solo route's contract. A disabled
+                    // layer leaves its VideoBeautyV2RenderParams at its
+                    // all-default (enabled=false) state.
+                    vanguard::render::VideoBeautyV2RenderParams fromBeautyParams{};
+                    vanguard::render::VideoBeautyV2RenderParams toBeautyParams{};
+                    bool beautyRampOk = true;
+                    const char* beautyRampFailLayer = nullptr;
+                    if (hasFromBeauty) {
+                        const uint32_t cropWidth = static_cast<uint32_t>(fromGeometry.cropRight - fromGeometry.cropLeft);
+                        const uint32_t cropHeight = static_cast<uint32_t>(fromGeometry.cropBottom - fromGeometry.cropTop);
+                        vanguard::render::VulkanBeautyV2Parameters vkBeautyParams{};
+                        std::string beautyRampErr;
+                        if (!vanguard::render::ComputeVulkanBeautyV2ParametersFromIntensity(
+                                fromBeautyIntensity, cropWidth, cropHeight, &vkBeautyParams, &beautyRampErr)) {
+                            beautyRampOk = false;
+                            beautyRampFailLayer = "from";
+                        } else {
+                            fromBeautyParams.enabled = true;
+                            fromBeautyParams.radius = vkBeautyParams.radius;
+                            fromBeautyParams.sigma = vkBeautyParams.sigma;
+                            fromBeautyParams.rangeSigma = vkBeautyParams.rangeSigma;
+                            fromBeautyParams.smoothStrength = vkBeautyParams.smoothStrength;
+                            fromBeautyParams.sharpenStrength = vkBeautyParams.sharpenStrength;
+                            fromBeautyParams.theta = vkBeautyParams.theta;
+                            fromBeautyParams.detailDamping = vkBeautyParams.detailDamping;
+                            fromBeautyParams.toneStrength = vkBeautyParams.toneStrength;
+                            fromBeautyParams.midtoneLift = vkBeautyParams.midtoneLift;
+                            fromBeautyParams.cropWidth = cropWidth;
+                            fromBeautyParams.cropHeight = cropHeight;
+                        }
+                    }
+                    if (beautyRampOk && hasToBeauty) {
+                        const uint32_t cropWidth = static_cast<uint32_t>(toGeometry.cropRight - toGeometry.cropLeft);
+                        const uint32_t cropHeight = static_cast<uint32_t>(toGeometry.cropBottom - toGeometry.cropTop);
+                        vanguard::render::VulkanBeautyV2Parameters vkBeautyParams{};
+                        std::string beautyRampErr;
+                        if (!vanguard::render::ComputeVulkanBeautyV2ParametersFromIntensity(
+                                toBeautyIntensity, cropWidth, cropHeight, &vkBeautyParams, &beautyRampErr)) {
+                            beautyRampOk = false;
+                            beautyRampFailLayer = "to";
+                        } else {
+                            toBeautyParams.enabled = true;
+                            toBeautyParams.radius = vkBeautyParams.radius;
+                            toBeautyParams.sigma = vkBeautyParams.sigma;
+                            toBeautyParams.rangeSigma = vkBeautyParams.rangeSigma;
+                            toBeautyParams.smoothStrength = vkBeautyParams.smoothStrength;
+                            toBeautyParams.sharpenStrength = vkBeautyParams.sharpenStrength;
+                            toBeautyParams.theta = vkBeautyParams.theta;
+                            toBeautyParams.detailDamping = vkBeautyParams.detailDamping;
+                            toBeautyParams.toneStrength = vkBeautyParams.toneStrength;
+                            toBeautyParams.midtoneLift = vkBeautyParams.midtoneLift;
+                            toBeautyParams.cropWidth = cropWidth;
+                            toBeautyParams.cropHeight = cropHeight;
+                        }
+                    }
+
+                    if (!beautyRampOk) {
+                        // Defensive-only: Kotlin already validated
+                        // beautyIntensity in [0,1] and cropWidth/cropHeight
+                        // are already guaranteed > 0 by the crop validation
+                        // above, so ComputeVulkanBeautyV2ParametersFromIntensity
+                        // should never actually fail here. Still fails
+                        // closed: both buffers are released below exactly
+                        // like every other failure path.
+                        renderResult = vanguard::render::RenderFrameResult::kVulkanFailure;
+                        renderOk = false;
+                        std::snprintf(beautyFailureReasonBuf, sizeof(beautyFailureReasonBuf),
+                            "beauty_v2_requires_vulkan:ramp_failed:layer=%s", beautyRampFailLayer);
+                        renderFailureReason = beautyFailureReasonBuf;
+                    } else {
+                        renderResult = session->backend.renderTransitionFrame(
+                            fromHandle, toHandle, transition, fromBeautyParams, toBeautyParams);
+                        renderOk =
+                            renderResult == vanguard::render::RenderFrameResult::kSuccess ||
+                            renderResult == vanguard::render::RenderFrameResult::kSuboptimal;
+                        if (!renderOk && (hasFromBeauty || hasToBeauty)) {
+                            renderFailureReason = "beauty_v2_requires_vulkan:vulkan_render_failed";
+                        }
+                    }
+                }
+
+                int fromReleaseFenceFd = -1;
+                fromReleaseResult =
+                    session->backend.releaseHardwareBuffer(fromHandle, &fromReleaseFenceFd);
+                if (fromReleaseFenceFd >= 0) {
+                    ::close(fromReleaseFenceFd);
+                    fromReleaseFenceFd = -1;
+                }
+                int toReleaseFenceFd = -1;
+                toReleaseResult =
+                    session->backend.releaseHardwareBuffer(toHandle, &toReleaseFenceFd);
+                if (toReleaseFenceFd >= 0) {
+                    ::close(toReleaseFenceFd);
+                    toReleaseFenceFd = -1;
+                }
             }
         }
     }
 
-    int fromReleaseFenceFd = -1;
-    const auto fromReleaseResult =
-        session->backend.releaseHardwareBuffer(fromHandle, &fromReleaseFenceFd);
-    if (fromReleaseFenceFd >= 0) {
-        ::close(fromReleaseFenceFd);
-        fromReleaseFenceFd = -1;
+    if (fromImportResult != HardwareBufferImportResult::kSuccess) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=import_failed:layer=from;importResult=%s;transitionType=%s;"
+            "progress=%.4f;frameIndex=%d",
+            HwBufResultName(fromImportResult), typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
     }
-    int toReleaseFenceFd = -1;
-    const auto toReleaseResult =
-        session->backend.releaseHardwareBuffer(toHandle, &toReleaseFenceFd);
-    if (toReleaseFenceFd >= 0) {
-        ::close(toReleaseFenceFd);
-        toReleaseFenceFd = -1;
+
+    if (toImportResult != HardwareBufferImportResult::kSuccess) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;reason=import_failed:layer=to;importResult=%s;fromReleaseResult=%s;"
+            "transitionType=%s;progress=%.4f;frameIndex=%d",
+            HwBufResultName(toImportResult), HwBufResultName(fromReleaseResult),
+            typeName, progressValue, static_cast<int>(frameIndex));
+        return env->NewStringUTF(status);
     }
 
     if (!fromCropOk || !toCropOk) {
@@ -1293,6 +1366,284 @@ Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_renderAndr
         toGeometry.destFitX, toGeometry.destFitY, toGeometry.destFitWidth, toGeometry.destFitHeight,
         hasFromColorMatrix ? 1 : 0, hasToColorMatrix ? 1 : 0,
         hasFromBeauty ? 1 : 0, hasToBeauty ? 1 : 0);
+    return env->NewStringUTF(status);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: uploadAndroidTimelineVulkanExportOverlayTexture
+// ---------------------------------------------------------------------------
+// P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A sub-slice N5: uploads one direct
+// RGBA8888 ByteBuffer into the session's backend-owned overlay texture store
+// (VulkanBackend::createOverlayTextureRgba8888). [rgbaBuffer] is read from
+// byte index 0 for its own direct-buffer capacity -- position/limit are
+// ignored; a caller needing an offset must pass a sliced direct buffer.
+// [rowStrideBytes] of 0 means tightly packed (width * 4 bytes/row); any
+// non-zero value less than width * 4 fails closed with reason=invalid_stride,
+// and a buffer too small for rowStrideBytes * height bytes fails closed with
+// reason=buffer_too_small. Upload is intended for session setup before frame
+// encoding; this route does not draw the uploaded texture into any frame.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_uploadAndroidTimelineVulkanExportOverlayTexture(
+    JNIEnv*  env,
+    jobject  /* this */,
+    jstring  sessionIdJ,
+    jobject  rgbaBufferJ,
+    jint     width,
+    jint     height,
+    jint     rowStrideBytes) {
+
+    char status[384];
+
+    if (!sessionIdJ) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=none;reason=invalid_args");
+        return env->NewStringUTF(status);
+    }
+
+    const char* sidCStr = env->GetStringUTFChars(sessionIdJ, nullptr);
+    std::string sid(sidCStr ? sidCStr : "");
+    if (sidCStr) env->ReleaseStringUTFChars(sessionIdJ, sidCStr);
+
+    if (!rgbaBufferJ || width <= 0 || height <= 0 || rowStrideBytes < 0) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=invalid_args", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    void* rawAddress = env->GetDirectBufferAddress(rgbaBufferJ);
+    const jlong capacity = env->GetDirectBufferCapacity(rgbaBufferJ);
+    if (rawAddress == nullptr || capacity <= 0) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=not_direct_buffer", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    const uint64_t minStride = static_cast<uint64_t>(width) * 4u;
+    const uint64_t effectiveStride =
+        rowStrideBytes == 0 ? minStride : static_cast<uint64_t>(rowStrideBytes);
+    if (effectiveStride < minStride) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=invalid_stride", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+    if (effectiveStride * static_cast<uint64_t>(height) > static_cast<uint64_t>(capacity)) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=buffer_too_small", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    VulkanExportSession* session = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+        auto it = gVulkanExportSessions.find(sid);
+        if (it != gVulkanExportSessions.end()) {
+            session = it->second;
+            session->activeRenderCount++;
+        }
+    }
+
+    if (!session) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=session_not_found", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    struct ReleaseGuard {
+        VulkanExportSession* s;
+        ~ReleaseGuard() {
+            std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+            if (--s->activeRenderCount == 0) {
+                gVulkanExportSessionIdleCv.notify_all();
+            }
+        }
+    } releaseGuard{session};
+
+    if (!session->initialized || !session->surfaceAttached) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=session_not_ready", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    vanguard::render::VulkanOverlayTextureHandle handle =
+        vanguard::render::kInvalidOverlayTextureHandle;
+    vanguard::render::VulkanOverlayTextureInfo info{};
+    bool created = false;
+    {
+        std::lock_guard<std::mutex> lane(session->backendLaneMutex);
+        created = session->backend.createOverlayTextureRgba8888(
+            static_cast<const uint8_t*>(rawAddress),
+            static_cast<size_t>(capacity),
+            static_cast<uint32_t>(width),
+            static_cast<uint32_t>(height),
+            static_cast<uint32_t>(rowStrideBytes),
+            &handle,
+            &info);
+    }
+
+    if (!created) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=texture_create_failed", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    std::snprintf(status, sizeof(status),
+        "status=OK;sessionId=%s;textureHandle=%llu;imageViewHandle=%llu;samplerHandle=%llu;"
+        "width=%u;height=%u",
+        sid.c_str(),
+        static_cast<unsigned long long>(handle),
+        static_cast<unsigned long long>(info.imageViewHandle),
+        static_cast<unsigned long long>(info.samplerHandle),
+        info.width, info.height);
+    return env->NewStringUTF(status);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: releaseAndroidTimelineVulkanExportOverlayTexture
+// ---------------------------------------------------------------------------
+// P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A sub-slice N5: releases one overlay
+// texture previously returned by uploadAndroidTimelineVulkanExportOverlayTexture.
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_releaseAndroidTimelineVulkanExportOverlayTexture(
+    JNIEnv*  env,
+    jobject  /* this */,
+    jstring  sessionIdJ,
+    jlong    textureHandleJ) {
+
+    char status[256];
+    const unsigned long long textureHandleU = static_cast<unsigned long long>(textureHandleJ);
+
+    if (!sessionIdJ) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=none;textureHandle=%llu;reason=invalid_args", textureHandleU);
+        return env->NewStringUTF(status);
+    }
+
+    const char* sidCStr = env->GetStringUTFChars(sessionIdJ, nullptr);
+    std::string sid(sidCStr ? sidCStr : "");
+    if (sidCStr) env->ReleaseStringUTFChars(sessionIdJ, sidCStr);
+
+    if (textureHandleJ <= 0) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;textureHandle=%llu;reason=invalid_args",
+            sid.c_str(), textureHandleU);
+        return env->NewStringUTF(status);
+    }
+
+    VulkanExportSession* session = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+        auto it = gVulkanExportSessions.find(sid);
+        if (it != gVulkanExportSessions.end()) {
+            session = it->second;
+            session->activeRenderCount++;
+        }
+    }
+
+    if (!session) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;textureHandle=%llu;reason=session_not_found",
+            sid.c_str(), textureHandleU);
+        return env->NewStringUTF(status);
+    }
+
+    struct ReleaseGuard {
+        VulkanExportSession* s;
+        ~ReleaseGuard() {
+            std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+            if (--s->activeRenderCount == 0) {
+                gVulkanExportSessionIdleCv.notify_all();
+            }
+        }
+    } releaseGuard{session};
+
+    if (!session->initialized || !session->surfaceAttached) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;textureHandle=%llu;reason=session_not_ready",
+            sid.c_str(), textureHandleU);
+        return env->NewStringUTF(status);
+    }
+
+    bool released = false;
+    {
+        std::lock_guard<std::mutex> lane(session->backendLaneMutex);
+        released = session->backend.releaseOverlayTexture(
+            static_cast<vanguard::render::VulkanOverlayTextureHandle>(textureHandleJ));
+    }
+
+    if (!released) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;textureHandle=%llu;reason=release_failed",
+            sid.c_str(), textureHandleU);
+        return env->NewStringUTF(status);
+    }
+
+    std::snprintf(status, sizeof(status),
+        "status=OK;sessionId=%s;textureHandle=%llu", sid.c_str(), textureHandleU);
+    return env->NewStringUTF(status);
+}
+
+// ---------------------------------------------------------------------------
+// JNI: clearAndroidTimelineVulkanExportOverlayTextures
+// ---------------------------------------------------------------------------
+// P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A sub-slice N5: releases every overlay
+// texture currently held by the session's overlay texture store. An empty
+// store is a legal no-op (still reports status=OK).
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_connects_vanguard_1media_1engine_bridge_VanguardNativeBridge_clearAndroidTimelineVulkanExportOverlayTextures(
+    JNIEnv*  env,
+    jobject  /* this */,
+    jstring  sessionIdJ) {
+
+    char status[256];
+
+    if (!sessionIdJ) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=none;reason=invalid_args");
+        return env->NewStringUTF(status);
+    }
+
+    const char* sidCStr = env->GetStringUTFChars(sessionIdJ, nullptr);
+    std::string sid(sidCStr ? sidCStr : "");
+    if (sidCStr) env->ReleaseStringUTFChars(sessionIdJ, sidCStr);
+
+    VulkanExportSession* session = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+        auto it = gVulkanExportSessions.find(sid);
+        if (it != gVulkanExportSessions.end()) {
+            session = it->second;
+            session->activeRenderCount++;
+        }
+    }
+
+    if (!session) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=session_not_found", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    struct ReleaseGuard {
+        VulkanExportSession* s;
+        ~ReleaseGuard() {
+            std::lock_guard<std::mutex> lock(gVulkanExportSessionMutex);
+            if (--s->activeRenderCount == 0) {
+                gVulkanExportSessionIdleCv.notify_all();
+            }
+        }
+    } releaseGuard{session};
+
+    if (!session->initialized || !session->surfaceAttached) {
+        std::snprintf(status, sizeof(status),
+            "status=FAIL;sessionId=%s;reason=session_not_ready", sid.c_str());
+        return env->NewStringUTF(status);
+    }
+
+    {
+        std::lock_guard<std::mutex> lane(session->backendLaneMutex);
+        session->backend.clearOverlayTextures();
+    }
+
+    std::snprintf(status, sizeof(status), "status=OK;sessionId=%s", sid.c_str());
     return env->NewStringUTF(status);
 }
 

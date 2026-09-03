@@ -1268,6 +1268,38 @@ class VanguardNativeBridge(
         frameIndex: Int,
     ): String
 
+    // ── P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A sub-slice N5: backend-owned overlay ──
+    // texture store JNI bridge. Direct RGBA8888 ByteBuffer upload/release/clear
+    // only -- no asset file/Bitmap decode. Upload is intended for session setup
+    // before frame encoding; this sub-slice does not wire overlay draw routing
+    // into any render route above.
+    // [rgbaBuffer] must be a direct java.nio.ByteBuffer; native reads it from
+    // byte index 0 for the buffer's own direct-buffer capacity -- position and
+    // limit are ignored. Callers needing an offset must pass a sliced direct
+    // buffer (e.g. rgbaBuffer.slice()) so byte index 0 of the slice is the
+    // intended start. [rowStrideBytes] of 0 means tightly packed (width * 4);
+    // a non-zero value less than width * 4 fails closed with
+    // reason=invalid_stride, and a buffer too small to hold
+    // [rowStrideBytes] * [height] bytes fails closed with
+    // reason=buffer_too_small.
+    external fun uploadAndroidTimelineVulkanExportOverlayTexture(
+        sessionId: String,
+        rgbaBuffer: java.nio.ByteBuffer,
+        width: Int,
+        height: Int,
+        rowStrideBytes: Int,
+    ): String
+
+    external fun releaseAndroidTimelineVulkanExportOverlayTexture(
+        sessionId: String,
+        textureHandle: Long,
+    ): String
+
+    // Clearing an already-empty store is a legal no-op (still status=OK).
+    external fun clearAndroidTimelineVulkanExportOverlayTextures(
+        sessionId: String,
+    ): String
+
     // ── Phase 1-Unit U: Android GLES backend offscreen EGL lifecycle smoke ──
     external fun runAndroidDagPhase1UGlesBackendSmoke(): String
 
