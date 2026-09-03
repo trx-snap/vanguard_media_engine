@@ -1966,6 +1966,27 @@ class VanguardNativeBridge(
     // mutation, no product UI.
     external fun runAndroidDagPhase5TimelineOverlayVulkanRenderSmoke(): String
 
+    // ── P5-BEAUTY-V2-VULKAN-RENDER: VulkanBeautyV2Compositor 3-pass bilateral ──
+    // beauty smoothing shader/raster + CPU-reference-parity proof diagnostic.
+    // Native creates its own temporary VkInstance/VkDevice/VkQueue/
+    // VkCommandPool, synthetic RGBA8 sampled source images with
+    // clamp-to-edge samplers, a 64x64 offscreen color attachment, and a
+    // host-visible readback buffer on the calling thread, runs the
+    // None/Soft/Strong/Max intensity presets through the private Vulkan
+    // beauty helper (new beauty_v2_blur / beauty_v2_composite fragment
+    // shaders reusing the existing AOT passthrough vertex shader: blur_h,
+    // blur_v, composite -- fused highpass, adaptive smoothing gate, tone
+    // compression, midtone lift, detail add-back, alpha preservation), reads
+    // the pixels back, compares against a pure CPU reference that quantizes
+    // Pass 1/2 intermediates to 8-bit UNORM (mirroring the
+    // VK_FORMAT_R8G8B8A8_UNORM intermediate images), verifies helper
+    // temporary object created == released and full diagnostic teardown, and
+    // destroys everything before returning a JSON object string. Reports
+    // status "UNSUPPORTED" (never crashes) when no usable Vulkan device
+    // exists. No MediaCodec/decode, no AHardwareBuffer import, no export
+    // session, no production VulkanBackend mutation, no product UI.
+    external fun runAndroidDagPhase5BeautyV2VulkanRenderSmoke(): String
+
     // ── P5-COMPOSITOR-TRANS (DUAL-DECODER-SYNC): dual MediaCodec -> AHB -> Vulkan ──
     // crossfade proof. Kotlin (AndroidTimelineDualDecoderSyncDriver) owns both
     // decoder pipelines and calls this once per overlap frame with one

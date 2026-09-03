@@ -67,6 +67,11 @@ add_library(vanguard_render_vulkan STATIC
     # (inverse-UV push-constant placement, per-layer opacity in colour-matrix
     # row 3, fixed-function straight-alpha source-over blend, readback).
     "render/vulkan/src/vulkan_overlay_compositor.cpp"
+    # P5-BEAUTY-V2-VULKAN-RENDER: private 3-pass bilateral beauty smoothing
+    # helper (blur_h, blur_v, composite; new beauty_v2_blur/composite
+    # fragment shaders reusing the existing AOT passthrough vertex shader;
+    # helper-owned intermediates, caller-owned source/target/readback).
+    "render/vulkan/src/vulkan_beauty_v2_compositor.cpp"
 )
 target_include_directories(vanguard_render_vulkan PUBLIC "render/vulkan/include"
     # Phase 2K: private Vulkan src dir exposed so vulkan_surface_swapchain.cpp
@@ -180,6 +185,12 @@ if (ANDROID)
     # probe translation unit per Constitution modularity pre-authorization).
     "platform/android/src/android_phase5_beauty_v2_gles_render_probe.cpp"
     "platform/android/src/android_phase5_beauty_v2_gles_render_jni.cpp"
+    # P5-BEAUTY-V2-VULKAN-RENDER: VulkanBeautyV2Compositor shader/raster +
+    # CPU reference parity diagnostic proof (lane execution extracted into
+    # the probe translation unit, mirroring the GLES twin's modularity
+    # precedent).
+    "platform/android/src/android_phase5_beauty_v2_vulkan_render_probe.cpp"
+    "platform/android/src/android_phase5_beauty_v2_vulkan_render_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private
