@@ -67,6 +67,12 @@ add_library(vanguard_render_vulkan STATIC
     # (inverse-UV push-constant placement, per-layer opacity in colour-matrix
     # row 3, fixed-function straight-alpha source-over blend, readback).
     "render/vulkan/src/vulkan_overlay_compositor.cpp"
+    # P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A (native helper
+    # sub-slice N1): isolated, record-only VulkanOverlayFrameRenderer helper
+    # (lazily cached descriptor set layout / pipeline layout / straight-alpha
+    # blend pipeline / grow-only descriptor pool). Not yet wired into
+    # VulkanFrameRenderer / VulkanBackend / JNI / Kotlin.
+    "render/vulkan/src/vulkan_overlay_frame_renderer.cpp"
     # P5-BEAUTY-V2-VULKAN-RENDER: private 3-pass bilateral beauty smoothing
     # helper (blur_h, blur_v, composite; new beauty_v2_blur/composite
     # fragment shaders reusing the existing AOT passthrough vertex shader;
