@@ -12,7 +12,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:vanguard_media_engine/vanguard_media_engine.dart';
 
 const _kCanonicalProofBoundary =
-    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
+    'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
 
 const _kPassMarker =
     'ANDROID_DAG_PHASE4_REALTIME_AUDIO_PLAYBACK_PRODUCTION_PHYSICAL_SMOKE_PASS';
@@ -73,6 +73,11 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'presentationLagTelemetryOk': true,
     'presentationLagBoundedOk': true,
     'positionAtEosNoRunawayOk': true,
+    'positionQueryPauseHoldFrozenOk': true,
+    'positionQueryDeadObjectRebaseOk': true,
+    'positionQuerySeekBaseAdvanceOk': true,
+    'positionQueryRepeatedSeekBaseAdvanceOk': true,
+    'positionQueryPostTeardownLatchedOk': true,
     'canonical': true,
   };
 
@@ -220,6 +225,22 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'pollerThreadId': 105,
     'pollerJoined': true,
     'pollerError': '',
+    'pauseStartQueryFrames': 19200,
+    'pauseStartQueryUs': 400000,
+    'pauseEndQueryFrames': 19200,
+    'pauseEndQueryUs': 400000,
+    'afterRecoveryQueryFrames': 10112,
+    'afterRecoveryQueryUs': 210666,
+    'afterSeekQueryFrames': 48000,
+    'afterSeekQueryUs': 1000000,
+    'afterSeek1QueryFrames': 48000,
+    'afterSeek1QueryUs': 1000000,
+    'afterSeek2QueryFrames': 96000,
+    'afterSeek2QueryUs': 2000000,
+    'afterSeek3QueryFrames': 96000,
+    'afterSeek3QueryUs': 2000000,
+    'postTeardownCurrentPositionFrames': 144000,
+    'postTeardownCurrentPositionUs': 3000000,
     'failureReason': '',
     'lastError': 'none',
   };
@@ -232,7 +253,7 @@ Map<String, Object?> _createSampleRawMap([Map<String, Object?>? overrides]) {
     'nativeProofBoundary': _kCanonicalProofBoundary,
     'failureReason': '',
     'details':
-        'Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS,SCENARIO_FORWARD_SEEK_TO_EOS,SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS,SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY,SCENARIO_FOCUS_PERMANENT_LOSS,SCENARIO_ROUTE_CHANGE_OBSERVATION,SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE,SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED,SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE',
+        'Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock/position-query-lifecycle smoke pass=true scenarios=PLAYTHROUGH_BOUNDED_PAUSE_RESUME_TO_EOS,STOP_DISPOSE_MID_PLAYBACK,SYNTHETIC_DEAD_OBJECT_RECOVERY_TO_EOS,SCENARIO_FORWARD_SEEK_TO_EOS,SCENARIO_REPEATED_FORWARD_SEEK_TO_EOS,SCENARIO_FOCUS_DUCK_TRANSIENT_NOISY,SCENARIO_FOCUS_PERMANENT_LOSS,SCENARIO_ROUTE_CHANGE_OBSERVATION,SCENARIO_ROUTE_DISCONNECT_TERMINAL_PAUSE,SCENARIO_ROUTE_DISCONNECT_FOCUS_GAIN_BLOCKED,SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE',
     'lanes': lanes,
     'metrics': metrics,
     'lastError': null,
@@ -301,11 +322,11 @@ void main() {
         VGRealtimeAudioPlaybackProductionSmokeReport
             .requiredNonCanonicalLanes
             .length,
-        equals(48),
+        equals(53),
       );
       expect(
         VGRealtimeAudioPlaybackProductionSmokeReport.requiredLanes.length,
-        equals(49),
+        equals(54),
       );
 
       final expectedLanes = <String>[
@@ -357,6 +378,11 @@ void main() {
         'presentationLagTelemetryOk',
         'presentationLagBoundedOk',
         'positionAtEosNoRunawayOk',
+        'positionQueryPauseHoldFrozenOk',
+        'positionQueryDeadObjectRebaseOk',
+        'positionQuerySeekBaseAdvanceOk',
+        'positionQueryRepeatedSeekBaseAdvanceOk',
+        'positionQueryPostTeardownLatchedOk',
         'canonical',
       ];
 
@@ -425,6 +451,33 @@ void main() {
       expect(report.routeDisconnectTerminalPauseOk, isTrue);
       expect(report.routeDisconnectResumeBlockedOk, isTrue);
       expect(report.routingMonitorTeardownOk, isTrue);
+      expect(report.currentPositionQuerySurfaceOk, isTrue);
+      expect(report.currentPositionPollerMonotonicOk, isTrue);
+      expect(report.currentPositionReadCounterIsolationOk, isTrue);
+      expect(report.presentationLagTelemetryOk, isTrue);
+      expect(report.presentationLagBoundedOk, isTrue);
+      expect(report.positionAtEosNoRunawayOk, isTrue);
+      expect(report.positionQueryPauseHoldFrozenOk, isTrue);
+      expect(report.positionQueryDeadObjectRebaseOk, isTrue);
+      expect(report.positionQuerySeekBaseAdvanceOk, isTrue);
+      expect(report.positionQueryRepeatedSeekBaseAdvanceOk, isTrue);
+      expect(report.positionQueryPostTeardownLatchedOk, isTrue);
+      expect(report.pauseStartQueryFrames, equals(19200));
+      expect(report.pauseStartQueryUs, equals(400000));
+      expect(report.pauseEndQueryFrames, equals(19200));
+      expect(report.pauseEndQueryUs, equals(400000));
+      expect(report.afterRecoveryQueryFrames, equals(10112));
+      expect(report.afterRecoveryQueryUs, equals(210666));
+      expect(report.afterSeekQueryFrames, equals(48000));
+      expect(report.afterSeekQueryUs, equals(1000000));
+      expect(report.afterSeek1QueryFrames, equals(48000));
+      expect(report.afterSeek1QueryUs, equals(1000000));
+      expect(report.afterSeek2QueryFrames, equals(96000));
+      expect(report.afterSeek2QueryUs, equals(2000000));
+      expect(report.afterSeek3QueryFrames, equals(96000));
+      expect(report.afterSeek3QueryUs, equals(2000000));
+      expect(report.postTeardownCurrentPositionFrames, equals(144000));
+      expect(report.postTeardownCurrentPositionUs, equals(3000000));
       expect(report.focusEnabled, isTrue);
       expect(report.focusDuckAppliedCount, equals(1));
       expect(report.focusGainRestoreAppliedCount, equals(1));
@@ -1024,12 +1077,124 @@ void main() {
       },
     );
 
+    test('missing one new required Y14 lane fails isVerifiedPass', () {
+      for (final lane in <String>[
+        'positionQueryPauseHoldFrozenOk',
+        'positionQueryDeadObjectRebaseOk',
+        'positionQuerySeekBaseAdvanceOk',
+        'positionQueryRepeatedSeekBaseAdvanceOk',
+        'positionQueryPostTeardownLatchedOk',
+      ]) {
+        final raw = _createSampleRawMap();
+        final lanes = Map<String, Object?>.from(raw['lanes'] as Map);
+        lanes.remove(lane);
+        raw['lanes'] = lanes;
+        if (raw['metrics'] is Map) {
+          final metrics = Map<String, Object?>.from(raw['metrics'] as Map);
+          metrics.remove(lane);
+          raw['metrics'] = metrics;
+        }
+        raw.remove(lane);
+
+        final report = VGRealtimeAudioPlaybackProductionSmokeReport.fromMap(
+          raw,
+        );
+        expect(report.pass, isFalse);
+        expect(report.isVerifiedPass, isFalse);
+        expect(report.marker, equals(_kFailMarker));
+        expect(report.status, equals('missing_lane'));
+        expect(report.lastError, equals('missing_lane_$lane'));
+      }
+    });
+
+    test(
+      'new Y14 lifecycle query metric keys parse and are present in metrics map',
+      () {
+        final report = _createSampleReport();
+        expect(report.metrics.containsKey('pauseStartQueryFrames'), isTrue);
+        expect(report.metrics['pauseStartQueryFrames'], equals(19200));
+        expect(report.metrics.containsKey('pauseStartQueryUs'), isTrue);
+        expect(report.metrics['pauseStartQueryUs'], equals(400000));
+        expect(report.metrics.containsKey('pauseEndQueryFrames'), isTrue);
+        expect(report.metrics['pauseEndQueryFrames'], equals(19200));
+        expect(report.metrics.containsKey('pauseEndQueryUs'), isTrue);
+        expect(report.metrics['pauseEndQueryUs'], equals(400000));
+        expect(report.metrics.containsKey('afterRecoveryQueryFrames'), isTrue);
+        expect(report.metrics['afterRecoveryQueryFrames'], equals(10112));
+        expect(report.metrics.containsKey('afterRecoveryQueryUs'), isTrue);
+        expect(report.metrics['afterRecoveryQueryUs'], equals(210666));
+        expect(report.metrics.containsKey('afterSeekQueryFrames'), isTrue);
+        expect(report.metrics['afterSeekQueryFrames'], equals(48000));
+        expect(report.metrics.containsKey('afterSeekQueryUs'), isTrue);
+        expect(report.metrics['afterSeekQueryUs'], equals(1000000));
+        expect(report.metrics.containsKey('afterSeek1QueryFrames'), isTrue);
+        expect(report.metrics['afterSeek1QueryFrames'], equals(48000));
+        expect(report.metrics.containsKey('afterSeek1QueryUs'), isTrue);
+        expect(report.metrics['afterSeek1QueryUs'], equals(1000000));
+        expect(report.metrics.containsKey('afterSeek2QueryFrames'), isTrue);
+        expect(report.metrics['afterSeek2QueryFrames'], equals(96000));
+        expect(report.metrics.containsKey('afterSeek2QueryUs'), isTrue);
+        expect(report.metrics['afterSeek2QueryUs'], equals(2000000));
+        expect(report.metrics.containsKey('afterSeek3QueryFrames'), isTrue);
+        expect(report.metrics['afterSeek3QueryFrames'], equals(96000));
+        expect(report.metrics.containsKey('afterSeek3QueryUs'), isTrue);
+        expect(report.metrics['afterSeek3QueryUs'], equals(2000000));
+        expect(
+          report.metrics.containsKey('postTeardownCurrentPositionFrames'),
+          isTrue,
+        );
+        expect(
+          report.metrics['postTeardownCurrentPositionFrames'],
+          equals(144000),
+        );
+        expect(
+          report.metrics.containsKey('postTeardownCurrentPositionUs'),
+          isTrue,
+        );
+        expect(
+          report.metrics['postTeardownCurrentPositionUs'],
+          equals(3000000),
+        );
+      },
+    );
+
+    test('new Y14 lifecycle query getters return expected values', () {
+      final report = _createSampleReport();
+      expect(report.positionQueryPauseHoldFrozenOk, isTrue);
+      expect(report.positionQueryDeadObjectRebaseOk, isTrue);
+      expect(report.positionQuerySeekBaseAdvanceOk, isTrue);
+      expect(report.positionQueryRepeatedSeekBaseAdvanceOk, isTrue);
+      expect(report.positionQueryPostTeardownLatchedOk, isTrue);
+
+      expect(report.pauseStartQueryFrames, equals(19200));
+      expect(report.pauseStartQueryUs, equals(400000));
+      expect(report.pauseEndQueryFrames, equals(19200));
+      expect(report.pauseEndQueryUs, equals(400000));
+      expect(report.afterRecoveryQueryFrames, equals(10112));
+      expect(report.afterRecoveryQueryUs, equals(210666));
+      expect(report.afterSeekQueryFrames, equals(48000));
+      expect(report.afterSeekQueryUs, equals(1000000));
+      expect(report.afterSeek1QueryFrames, equals(48000));
+      expect(report.afterSeek1QueryUs, equals(1000000));
+      expect(report.afterSeek2QueryFrames, equals(96000));
+      expect(report.afterSeek2QueryUs, equals(2000000));
+      expect(report.afterSeek3QueryFrames, equals(96000));
+      expect(report.afterSeek3QueryUs, equals(2000000));
+      expect(report.postTeardownCurrentPositionFrames, equals(144000));
+      expect(report.postTeardownCurrentPositionUs, equals(3000000));
+    });
+
     test('report details contains Y13 presentation clock scenario', () {
       final report = _createSampleReport();
       expect(
         report.details.contains('SCENARIO_PRESENTATION_CLOCK_QUERY_SURFACE'),
         isTrue,
       );
+    });
+
+    test('report details contains Y14 position-query-lifecycle metadata', () {
+      final report = _createSampleReport();
+      expect(report.details.contains('position-query-lifecycle'), isTrue);
     });
 
     test('fail map with deadObjectBaseStepBounded=false fails validation', () {

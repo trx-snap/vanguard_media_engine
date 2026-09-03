@@ -5,15 +5,16 @@
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-REPEATED-SEEK (Y10b) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-FOCUS-RESPONSE (Y11b) +
 // P4-AUDIO-REALTIME-PLAYBACK-PRODUCTION-ROUTE-CHANGE (Y12) +
-// P4-AUDIO-REALTIME-PLAYBACK-PRESENTATION-CLOCK-QUERY-SURFACE (Y13): Android True-DAG Phase 4
-// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, and presentation-clock diagnostic physical smoke target.
+// P4-AUDIO-REALTIME-PLAYBACK-PRESENTATION-CLOCK-QUERY-SURFACE (Y13) +
+// P4-AUDIO-REALTIME-PLAYBACK-POSITION-QUERY-LIFECYCLE-CONTRACT (Y14): Android True-DAG Phase 4
+// realtime audio playback production sink, clock, dead-object, forward-seek, repeated-seek, focus response, route-change, presentation-clock, and position query lifecycle diagnostic physical smoke target.
 //
 // Component diagnostic smoke: drives production VanguardRealtimeAudioPlaybackSession
 // (real MediaExtractor / MediaCodec -> Y5a external ingest -> Y1 transport ->
 // sink-thread-owned non-zero-gain AudioTrack + presentation clock).
 //
 // Honest non-claims (Proof Boundary):
-// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
+// production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni
 //
 // Honest operational non-claims:
 //   - Synthetic recovery is not gapless; up to one AudioTrack client buffer plus
@@ -65,7 +66,7 @@ class AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp
 class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     extends State<AndroidRealtimeAudioPlaybackProductionPhysicalSmokeApp> {
   String _status =
-      'Running Android DAG Phase 4 (Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13) Realtime Audio Playback Production Sink, Clock, Dead-Object, Seek, Repeated-Seek, Focus Response, Route-Change & Presentation-Clock smoke...';
+      'Running Android DAG Phase 4 (Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14) Realtime Audio Playback Production Sink, Clock, Dead-Object, Seek, Repeated-Seek, Focus Response, Route-Change, Presentation-Clock & Position-Query smoke...';
 
   @override
   void initState() {
@@ -304,6 +305,21 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     );
     print(
       '  [LANE] positionAtEosNoRunawayOk: ${activeReport.positionAtEosNoRunawayOk}',
+    );
+    print(
+      '  [LANE] positionQueryPauseHoldFrozenOk: ${activeReport.positionQueryPauseHoldFrozenOk}',
+    );
+    print(
+      '  [LANE] positionQueryDeadObjectRebaseOk: ${activeReport.positionQueryDeadObjectRebaseOk}',
+    );
+    print(
+      '  [LANE] positionQuerySeekBaseAdvanceOk: ${activeReport.positionQuerySeekBaseAdvanceOk}',
+    );
+    print(
+      '  [LANE] positionQueryRepeatedSeekBaseAdvanceOk: ${activeReport.positionQueryRepeatedSeekBaseAdvanceOk}',
+    );
+    print(
+      '  [LANE] positionQueryPostTeardownLatchedOk: ${activeReport.positionQueryPostTeardownLatchedOk}',
     );
     print('  [LANE] canonical: ${activeReport.canonical}');
 
@@ -1025,6 +1041,8 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
       'positionAtEosUs',
       'currentPositionReadsFromWriterThread',
       'currentPositionReadsFromOtherThreads',
+      'postTeardownCurrentPositionFrames',
+      'postTeardownCurrentPositionUs',
       'scenarioWallMs',
       'failureReason',
     ];
@@ -1283,8 +1301,8 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
     // 6. Print JSON marker with compact JSON payload.
     final summaryPayload = <String, dynamic>{
       'unit': 'AndroidRealtimeAudioPlaybackProductionPhysicalSmokeHarness',
-      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-PRESENTATION-CLOCK-QUERY-SURFACE',
-      'subSlice': 'Y13',
+      'slice': 'P4-AUDIO-REALTIME-PLAYBACK-POSITION-QUERY-LIFECYCLE-CONTRACT',
+      'subSlice': 'Y14',
       'target':
           VGRealtimeAudioPlaybackProductionSmokeReport.proofBoundaryConstant,
       'selectedFixture': selectedFixturePath,
@@ -1464,6 +1482,26 @@ class _AndroidRealtimeAudioPlaybackProductionPhysicalSmokeAppState
         'pollerThreadId': lookupMetric('pollerThreadId'),
         'pollerJoined': lookupMetric('pollerJoined'),
         'pollerError': lookupMetric('pollerError'),
+        'pauseStartQueryFrames': lookupMetric('pauseStartQueryFrames'),
+        'pauseStartQueryUs': lookupMetric('pauseStartQueryUs'),
+        'pauseEndQueryFrames': lookupMetric('pauseEndQueryFrames'),
+        'pauseEndQueryUs': lookupMetric('pauseEndQueryUs'),
+        'afterRecoveryQueryFrames': lookupMetric('afterRecoveryQueryFrames'),
+        'afterRecoveryQueryUs': lookupMetric('afterRecoveryQueryUs'),
+        'afterSeekQueryFrames': lookupMetric('afterSeekQueryFrames'),
+        'afterSeekQueryUs': lookupMetric('afterSeekQueryUs'),
+        'afterSeek1QueryFrames': lookupMetric('afterSeek1QueryFrames'),
+        'afterSeek1QueryUs': lookupMetric('afterSeek1QueryUs'),
+        'afterSeek2QueryFrames': lookupMetric('afterSeek2QueryFrames'),
+        'afterSeek2QueryUs': lookupMetric('afterSeek2QueryUs'),
+        'afterSeek3QueryFrames': lookupMetric('afterSeek3QueryFrames'),
+        'afterSeek3QueryUs': lookupMetric('afterSeek3QueryUs'),
+        'postTeardownCurrentPositionFrames': lookupMetric(
+          'postTeardownCurrentPositionFrames',
+        ),
+        'postTeardownCurrentPositionUs': lookupMetric(
+          'postTeardownCurrentPositionUs',
+        ),
       },
       'error': topLevelError,
     };

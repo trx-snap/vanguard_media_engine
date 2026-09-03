@@ -442,12 +442,16 @@ class VanguardRealtimeAudioPlaybackSession(private val config: Config) {
     val currentState: State get() = state
     val failureReason: String get() = failure.get() ?: ""
 
-    // Y13 (P4-AUDIO-REALTIME-PLAYBACK-PRESENTATION-CLOCK-QUERY-SURFACE): any-
+    // Y13/Y14 (P4-AUDIO-REALTIME-PLAYBACK-PRESENTATION-CLOCK-QUERY-SURFACE /
+    // P4-AUDIO-REALTIME-PLAYBACK-POSITION-QUERY-LIFECYCLE-CONTRACT): any-
     // thread, non-allocating, lock-free forwarders onto the sink's owned
-    // presentation clock; -1 when no sink exists yet (or any more). Never
+    // presentation clock; -1 before a sink exists; after stop/dispose the
+    // retained joined sink may return its final latched position. Never
     // acquires [commandLock] and never mutates session state -- a bounded
     // diagnostic query only (class comment), not a claim that P4-AUDIO-
     // MIXBUS or P4-AUDIO-GRAPH-TRANSPORT-CLOCK are complete.
+    // Forbidden change: do not null/latch the sink before sink join because
+    // that can create regression.
     fun currentPositionFrames(): Long = sink?.currentPositionFrames() ?: -1L
     fun currentPositionUs(): Long = sink?.currentPositionUs() ?: -1L
 

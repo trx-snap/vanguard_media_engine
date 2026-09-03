@@ -120,6 +120,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
                 "focus_gain_after_route_disconnect_no_auto_resume_" +
                 "presentation_clock_query_surface_off_thread_current_position_poller_monotonic_" +
                 "current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_" +
+                "position_query_lifecycle_pause_seek_dead_object_teardown_" +
                 "stop_dispose_release_once_" +
                 "no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni"
 
@@ -208,6 +209,12 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         const val LANE_PRESENTATION_LAG_TELEMETRY = "presentationLagTelemetryOk"
         const val LANE_PRESENTATION_LAG_BOUNDED = "presentationLagBoundedOk"
         const val LANE_POSITION_AT_EOS_NO_RUNAWAY = "positionAtEosNoRunawayOk"
+        // Y14 lanes, evaluated across lifecycle discontinuities.
+        const val LANE_POSITION_QUERY_PAUSE_HOLD_FROZEN = "positionQueryPauseHoldFrozenOk"
+        const val LANE_POSITION_QUERY_DEAD_OBJECT_REBASE = "positionQueryDeadObjectRebaseOk"
+        const val LANE_POSITION_QUERY_SEEK_BASE_ADVANCE = "positionQuerySeekBaseAdvanceOk"
+        const val LANE_POSITION_QUERY_REPEATED_SEEK_BASE_ADVANCE = "positionQueryRepeatedSeekBaseAdvanceOk"
+        const val LANE_POSITION_QUERY_POST_TEARDOWN_LATCHED = "positionQueryPostTeardownLatchedOk"
         const val LANE_CANONICAL = "canonical"
 
         val REQUIRED_LANES: List<String> = listOf(
@@ -229,6 +236,9 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             LANE_CURRENT_POSITION_QUERY_SURFACE, LANE_CURRENT_POSITION_POLLER_MONOTONIC,
             LANE_CURRENT_POSITION_READ_COUNTER_ISOLATION, LANE_PRESENTATION_LAG_TELEMETRY,
             LANE_PRESENTATION_LAG_BOUNDED, LANE_POSITION_AT_EOS_NO_RUNAWAY,
+            LANE_POSITION_QUERY_PAUSE_HOLD_FROZEN, LANE_POSITION_QUERY_DEAD_OBJECT_REBASE,
+            LANE_POSITION_QUERY_SEEK_BASE_ADVANCE, LANE_POSITION_QUERY_REPEATED_SEEK_BASE_ADVANCE,
+            LANE_POSITION_QUERY_POST_TEARDOWN_LATCHED,
         )
 
         val PROOF_BOUNDARY_TOKENS = listOf(
@@ -253,6 +263,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "presentation_clock_query_surface", "off_thread_current_position_poller_monotonic",
             "current_position_read_counter_isolation", "epoch_relative_presentation_lag_bounded",
             "position_at_eos_no_runaway",
+            "position_query_lifecycle_pause_seek_dead_object_teardown",
             "stop_dispose_release_once",
             "no_product", "no_editor", "no_app", "no_connectsapp", "no_ios",
             "no_streaming", "no_cache", "no_cpp", "no_jni",
@@ -571,22 +582,128 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         require(session.awaitFirstAudio(FIRST_AUDIO_TIMEOUT_MS), "no_first_audio:${session.failureReason}")
     }
 
+    // ── Off-thread position poller helper (Y13/Y14) ────────────────────────
+    private fun runWithPositionPoller(
+        session: VanguardRealtimeAudioPlaybackSession,
+        threadName: String,
+        block: () -> Unit,
+    ): PresentationClockPollerMetrics {
+        val coordinatorThreadId = Thread.currentThread().id
+        val running = AtomicBoolean(true)
+        var pollerThreadId = -1L
+        var pollCount = 0L
+        var validCount = 0L
+        var regressionCount = 0L
+        var frameReadCount = 0L
+        var usReadCount = 0L
+        var lastFrame = -1L
+        var lastUs = -1L
+        var minFrame = Long.MAX_VALUE
+        var maxFrame = -1L
+        var minUs = Long.MAX_VALUE
+        var maxUs = -1L
+        var pollerError = ""
+
+        val poller = Thread({
+            pollerThreadId = Thread.currentThread().id
+            while (running.get()) {
+                try {
+                    val f = session.currentPositionFrames()
+                    frameReadCount++
+                    val u = session.currentPositionUs()
+                    usReadCount++
+                    pollCount++
+                    if (f >= 0L) {
+                        validCount++
+                        if (lastFrame >= 0L && f < lastFrame) {
+                            regressionCount++
+                        }
+                        if (f < minFrame) minFrame = f
+                        if (f > maxFrame) maxFrame = f
+                        lastFrame = f
+                    }
+                    if (u >= 0L) {
+                        if (lastUs >= 0L && u < lastUs) {
+                            regressionCount++
+                        }
+                        if (u < minUs) minUs = u
+                        if (u > maxUs) maxUs = u
+                        lastUs = u
+                    }
+                    Thread.sleep(WAIT_SLICE_MS)
+                } catch (_: InterruptedException) {
+                    break
+                } catch (t: Throwable) {
+                    pollerError = "exception:${t.javaClass.simpleName}:${t.message}"
+                    break
+                }
+            }
+        }, threadName)
+
+        try {
+            poller.start()
+            block()
+        } finally {
+            running.set(false)
+            poller.interrupt()
+            try {
+                poller.join(3_000L)
+            } catch (_: InterruptedException) {}
+        }
+        val joined = !poller.isAlive
+        require(joined, "poller_not_joined")
+        return PresentationClockPollerMetrics(
+            pollCount = pollCount,
+            validCount = validCount,
+            regressionCount = regressionCount,
+            frameReadCount = frameReadCount,
+            usReadCount = usReadCount,
+            lastFrame = lastFrame,
+            lastUs = lastUs,
+            minFrame = if (minFrame == Long.MAX_VALUE) -1L else minFrame,
+            maxFrame = maxFrame,
+            minUs = if (minUs == Long.MAX_VALUE) -1L else minUs,
+            maxUs = maxUs,
+            threadId = pollerThreadId,
+            joined = joined,
+            error = pollerError,
+            coordinatorThreadId = coordinatorThreadId,
+        )
+    }
+
     // ── Scenario 1: load/start -> bounded pause -> resume -> EOS ───────────
 
     private fun playthroughScenario(session: VanguardRealtimeAudioPlaybackSession, config: SmokeConfig, out: ScenarioOutcome) {
         startAndAwaitAudio(session)
-        val pauseRes = session.pauseBounded()
-        require(pauseRes.accepted && pauseRes.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED, "pause_rejected:${pauseRes.reason}")
-        val holdStart = session.snapshot()
-        val holdStartedAt = SystemClock.elapsedRealtime()
-        while (SystemClock.elapsedRealtime() - holdStartedAt < config.pauseHoldMs) {
-            require(session.failureReason.isBlank(), "failure_during_hold:${session.failureReason}")
-            SystemClock.sleep(WAIT_SLICE_MS)
+        var pauseStartFrames = -1L
+        var pauseStartUs = -1L
+        var pauseEndFrames = -1L
+        var pauseEndUs = -1L
+        var holdStartSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var holdEndSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var completionReached = false
+
+        val pollerMetrics = runWithPositionPoller(session, "Y14PlaythroughPositionPoller") {
+            val pauseRes = session.pauseBounded()
+            require(pauseRes.accepted && pauseRes.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED, "pause_rejected:${pauseRes.reason}")
+            pauseStartFrames = session.currentPositionFrames()
+            pauseStartUs = session.currentPositionUs()
+            holdStartSnap = session.snapshot()
+            val holdStartedAt = SystemClock.elapsedRealtime()
+            while (SystemClock.elapsedRealtime() - holdStartedAt < config.pauseHoldMs) {
+                require(session.failureReason.isBlank(), "failure_during_hold:${session.failureReason}")
+                SystemClock.sleep(WAIT_SLICE_MS)
+            }
+            pauseEndFrames = session.currentPositionFrames()
+            pauseEndUs = session.currentPositionUs()
+            holdEndSnap = session.snapshot()
+            val resumeRes = session.resume()
+            require(resumeRes.accepted && resumeRes.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING, "resume_rejected:${resumeRes.reason}")
+            completionReached = session.awaitCompletion(config.deadlineMs)
         }
-        val holdEnd = session.snapshot()
-        val resumeRes = session.resume()
-        require(resumeRes.accepted && resumeRes.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING, "resume_rejected:${resumeRes.reason}")
-        require(session.awaitCompletion(config.deadlineMs), "completion_not_reached:${session.failureReason}")
+        require(completionReached, "completion_not_reached:${session.failureReason}")
+        val holdStart = holdStartSnap ?: throw FailClosed("hold_start_missing")
+        val holdEnd = holdEndSnap ?: throw FailClosed("hold_end_missing")
         val stateAtCompletion = session.currentState
         val stopRes = session.stop()
         require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
@@ -594,7 +711,10 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         session.dispose()
         val final = session.snapshot()
         AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateCommon(final, baselineExpectation, out, Thread.currentThread().id)
-        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluatePlaythrough(final, holdStart, holdEnd, stateAtCompletion, config, out)
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluatePlaythrough(
+            final, holdStart, holdEnd, stateAtCompletion, config, out,
+            pauseStartFrames, pauseStartUs, pauseEndFrames, pauseEndUs, pollerMetrics,
+        )
     }
 
     // ── Scenario 3 (Y8b): load/start -> armed synthetic dead object ->
@@ -603,28 +723,43 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
     private fun deadObjectRecoveryScenario(session: VanguardRealtimeAudioPlaybackSession, config: SmokeConfig, out: ScenarioOutcome) {
         startAndAwaitAudio(session)
         val waitStart = SystemClock.elapsedRealtime()
-        var afterRecovery: VanguardRealtimeAudioPlaybackSession.Snapshot
-        while (true) {
-            val snap = session.snapshot()
-            require(snap.failureReason.isBlank(), "failure_before_recovery:${snap.failureReason}")
-            val k = snap.sink ?: throw FailClosed("sink_missing_before_recovery")
-            if (k.deadObjectRecoveryCount == 1) {
-                afterRecovery = snap
-                break
+        var afterRecoverySnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var afterRecoveryFrames = -1L
+        var afterRecoveryUs = -1L
+        var completionReached = false
+
+        val pollerMetrics = runWithPositionPoller(session, "Y14DeadObjectPositionPoller") {
+            while (true) {
+                val snap = session.snapshot()
+                require(snap.failureReason.isBlank(), "failure_before_recovery:${snap.failureReason}")
+                val k = snap.sink ?: throw FailClosed("sink_missing_before_recovery")
+                if (k.deadObjectRecoveryCount == 1) {
+                    afterRecoverySnap = snap
+                    afterRecoveryFrames = session.currentPositionFrames()
+                    afterRecoveryUs = session.currentPositionUs()
+                    break
+                }
+                require(k.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_RUNNING, "sink_exited_before_recovery:${k.exitReason}")
+                require(SystemClock.elapsedRealtime() - waitStart < config.deadlineMs, "recovery_not_observed:${k.framesWrittenToSink}")
+                SystemClock.sleep(WAIT_SLICE_MS)
             }
-            require(k.exitReason == VanguardRealtimeAudioPlaybackSinkBridge.EXIT_RUNNING, "sink_exited_before_recovery:${k.exitReason}")
-            require(SystemClock.elapsedRealtime() - waitStart < config.deadlineMs, "recovery_not_observed:${k.framesWrittenToSink}")
-            SystemClock.sleep(WAIT_SLICE_MS)
+            completionReached = session.awaitCompletion(config.deadlineMs)
         }
-        require(session.awaitCompletion(config.deadlineMs), "completion_not_reached:${session.failureReason}")
+        require(completionReached, "completion_not_reached:${session.failureReason}")
+        val afterRecovery = afterRecoverySnap ?: throw FailClosed("after_recovery_missing")
         val stateAtCompletion = session.currentState
         val stopRes = session.stop()
         require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
         session.dispose()
         session.dispose()
         val final = session.snapshot()
+        val postTeardownFrames = session.currentPositionFrames()
+        val postTeardownUs = session.currentPositionUs()
         AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateCommon(final, deadObjectExpectation, out, Thread.currentThread().id)
-        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateDeadObjectRecovery(final, afterRecovery, stateAtCompletion, config, out)
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateDeadObjectRecovery(
+            final, afterRecovery, stateAtCompletion, config, out,
+            afterRecoveryFrames, afterRecoveryUs, postTeardownFrames, postTeardownUs, pollerMetrics,
+        )
     }
 
     // ── Scenario 4 (Y9): load/start (seek armed) -> ONE forward seek to T
@@ -632,17 +767,28 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
 
     private fun forwardSeekScenario(session: VanguardRealtimeAudioPlaybackSession, config: SmokeConfig, out: ScenarioOutcome) {
         startAndAwaitAudio(session)
-        val armed = session.snapshot()
-        val arm = armed.seek
-        require(arm.armed && arm.admissionOk && arm.holdPinned && arm.targetFrame > 0L && arm.holdFrame > 0L,
-            "seek_not_armed:${arm.armed}:${arm.admissionOk}:${arm.holdPinned}:${arm.targetFrame}:${arm.holdFrame}")
-        val seekRes = session.seek(arm.targetFrame)
-        require(seekRes.accepted && seekRes.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING, "seek_rejected:${seekRes.reason}")
-        val afterSeek = session.snapshot()
-        require(afterSeek.failureReason.isBlank(), "failure_after_seek:${afterSeek.failureReason}")
-        // ONE forward seek is the proof lane; the session's repeated-seek
-        // rejection guard is a non-claim here and is deliberately not exercised.
-        require(session.awaitCompletion(config.deadlineMs), "completion_not_reached:${session.failureReason}")
+        var afterSeekSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var afterSeekFrames = -1L
+        var afterSeekUs = -1L
+        var completionReached = false
+
+        val pollerMetrics = runWithPositionPoller(session, "Y14ForwardSeekPositionPoller") {
+            val armed = session.snapshot()
+            val arm = armed.seek
+            require(arm.armed && arm.admissionOk && arm.holdPinned && arm.targetFrame > 0L && arm.holdFrame > 0L,
+                "seek_not_armed:${arm.armed}:${arm.admissionOk}:${arm.holdPinned}:${arm.targetFrame}:${arm.holdFrame}")
+            val seekRes = session.seek(arm.targetFrame)
+            require(seekRes.accepted && seekRes.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING, "seek_rejected:${seekRes.reason}")
+            afterSeekFrames = session.currentPositionFrames()
+            afterSeekUs = session.currentPositionUs()
+            afterSeekSnap = session.snapshot()
+            require(afterSeekSnap!!.failureReason.isBlank(), "failure_after_seek:${afterSeekSnap!!.failureReason}")
+            // ONE forward seek is the proof lane; the session's repeated-seek
+            // rejection guard is a non-claim here and is deliberately not exercised.
+            completionReached = session.awaitCompletion(config.deadlineMs)
+        }
+        require(completionReached, "completion_not_reached:${session.failureReason}")
+        val afterSeek = afterSeekSnap ?: throw FailClosed("after_seek_missing")
         val stateAtCompletion = session.currentState
         val stopRes = session.stop()
         require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
@@ -650,7 +796,10 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         session.dispose()
         val final = session.snapshot()
         AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateCommon(final, baselineExpectation, out, Thread.currentThread().id)
-        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateForwardSeek(final, afterSeek, stateAtCompletion, config, out)
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateForwardSeek(
+            final, afterSeek, stateAtCompletion, config, out,
+            afterSeekFrames, afterSeekUs, pollerMetrics,
+        )
     }
 
     // ── Scenario 5 (Y10b): load/start (repeated seek armed) -> seek(T1) ->
@@ -662,36 +811,65 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         out: ScenarioOutcome,
     ) {
         startAndAwaitAudio(session)
-        val armed = session.snapshot()
-        val arm = armed.seek
-        val fmt = armed.format ?: throw FailClosed("format_missing")
-        require(
-            arm.armed && arm.admissionOk && arm.holdPinned && arm.targetFrame > 0L && arm.holdFrame > 0L,
-            "repeated_seek_not_armed:${arm.armed}:${arm.admissionOk}:${arm.holdPinned}:${arm.targetFrame}:${arm.holdFrame}",
-        )
-        val target1 = arm.targetFrame
-        val target2 = (config.secondSeekTargetSec * fmt.sampleRate).toLong()
+        var armedSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var afterFirstSeekSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var afterSecondSeekSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var afterThirdSeekSnap: VanguardRealtimeAudioPlaybackSession.Snapshot? = null
+        var afterSeek1Frames = -1L
+        var afterSeek1Us = -1L
+        var afterSeek2Frames = -1L
+        var afterSeek2Us = -1L
+        var afterSeek3Frames = -1L
+        var afterSeek3Us = -1L
+        var completionReached = false
 
-        val seekRes1 = session.seek(target1)
-        require(seekRes1.accepted && seekRes1.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING, "first_seek_rejected:${seekRes1.reason}")
-        val afterFirstSeek = session.snapshot()
-        require(afterFirstSeek.failureReason.isBlank(), "failure_after_first_seek:${afterFirstSeek.failureReason}")
+        val pollerMetrics = runWithPositionPoller(session, "Y14RepeatedSeekPositionPoller") {
+            val armed = session.snapshot()
+            armedSnap = armed
+            val arm = armed.seek
+            val fmt = armed.format ?: throw FailClosed("format_missing")
+            require(
+                arm.armed && arm.admissionOk && arm.holdPinned && arm.targetFrame > 0L && arm.holdFrame > 0L,
+                "repeated_seek_not_armed:${arm.armed}:${arm.admissionOk}:${arm.holdPinned}:${arm.targetFrame}:${arm.holdFrame}",
+            )
+            val target1 = arm.targetFrame
+            val target2 = (config.secondSeekTargetSec * fmt.sampleRate).toLong()
 
-        val seekRes2 = session.seek(target2)
-        require(seekRes2.accepted && seekRes2.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING, "second_seek_rejected:${seekRes2.reason}")
-        val afterSecondSeek = session.snapshot()
-        require(afterSecondSeek.failureReason.isBlank(), "failure_after_second_seek:${afterSecondSeek.failureReason}")
+            val seekRes1 = session.seek(target1)
+            require(seekRes1.accepted && seekRes1.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING, "first_seek_rejected:${seekRes1.reason}")
+            afterSeek1Frames = session.currentPositionFrames()
+            afterSeek1Us = session.currentPositionUs()
+            val afterFirstSeek = session.snapshot()
+            afterFirstSeekSnap = afterFirstSeek
+            require(afterFirstSeek.failureReason.isBlank(), "failure_after_first_seek:${afterFirstSeek.failureReason}")
 
-        val seekRes3 = session.seek(target2)
-        require(
-            !seekRes3.accepted && seekRes3.reason == "seek_repeated" && seekRes3.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING,
-            "third_seek_not_rejected:${seekRes3.accepted}:${seekRes3.reason}:${seekRes3.state}",
-        )
-        val afterThirdSeek = session.snapshot()
-        require(afterThirdSeek.failureReason.isBlank(), "failure_after_third_seek:${afterThirdSeek.failureReason}")
-        require(afterThirdSeek.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING, "state_mutated_after_third_seek:${afterThirdSeek.state}")
+            val seekRes2 = session.seek(target2)
+            require(seekRes2.accepted && seekRes2.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING, "second_seek_rejected:${seekRes2.reason}")
+            afterSeek2Frames = session.currentPositionFrames()
+            afterSeek2Us = session.currentPositionUs()
+            val afterSecondSeek = session.snapshot()
+            afterSecondSeekSnap = afterSecondSeek
+            require(afterSecondSeek.failureReason.isBlank(), "failure_after_second_seek:${afterSecondSeek.failureReason}")
 
-        require(session.awaitCompletion(config.deadlineMs), "completion_not_reached:${session.failureReason}")
+            val seekRes3 = session.seek(target2)
+            require(
+                !seekRes3.accepted && seekRes3.reason == "seek_repeated" && seekRes3.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING,
+                "third_seek_not_rejected:${seekRes3.accepted}:${seekRes3.reason}:${seekRes3.state}",
+            )
+            afterSeek3Frames = session.currentPositionFrames()
+            afterSeek3Us = session.currentPositionUs()
+            val afterThirdSeek = session.snapshot()
+            afterThirdSeekSnap = afterThirdSeek
+            require(afterThirdSeek.failureReason.isBlank(), "failure_after_third_seek:${afterThirdSeek.failureReason}")
+            require(afterThirdSeek.state == VanguardRealtimeAudioPlaybackSession.State.PLAYING, "state_mutated_after_third_seek:${afterThirdSeek.state}")
+
+            completionReached = session.awaitCompletion(config.deadlineMs)
+        }
+        require(completionReached, "completion_not_reached:${session.failureReason}")
+        val armed = armedSnap ?: throw FailClosed("armed_missing")
+        val afterFirstSeek = afterFirstSeekSnap ?: throw FailClosed("after_first_seek_missing")
+        val afterSecondSeek = afterSecondSeekSnap ?: throw FailClosed("after_second_seek_missing")
+        val afterThirdSeek = afterThirdSeekSnap ?: throw FailClosed("after_third_seek_missing")
         val stateAtCompletion = session.currentState
         val stopRes = session.stop()
         require(stopRes.accepted, "stop_rejected:${stopRes.reason}")
@@ -701,6 +879,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateCommon(final, baselineExpectation, out, Thread.currentThread().id)
         AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateRepeatedForwardSeek(
             final, armed, afterFirstSeek, afterSecondSeek, afterThirdSeek, stateAtCompletion, config, out,
+            afterSeek1Frames, afterSeek1Us, afterSeek2Frames, afterSeek2Us, afterSeek3Frames, afterSeek3Us, pollerMetrics,
         )
     }
 
@@ -1147,8 +1326,8 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             final.decoderAcceptedFrames < declared
     }
 
-    // ── Scenario 11 (Y13): load/start -> active playback with off-thread
-    //    presentation clock poller -> EOS ──────────────────────────────────
+    // ── Scenario 11 (Y13/Y14): load/start -> active playback with off-thread
+    //    presentation clock poller -> EOS -> post-teardown latched read ────
 
     private fun presentationClockQuerySurfaceScenario(
         session: VanguardRealtimeAudioPlaybackSession,
@@ -1156,71 +1335,10 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         out: ScenarioOutcome,
     ) {
         startAndAwaitAudio(session)
-        val coordinatorThreadId = Thread.currentThread().id
-        val running = AtomicBoolean(true)
-        var pollerThreadId = -1L
-        var pollCount = 0L
-        var validCount = 0L
-        var regressionCount = 0L
-        var frameReadCount = 0L
-        var usReadCount = 0L
-        var lastFrame = -1L
-        var lastUs = -1L
-        var minFrame = Long.MAX_VALUE
-        var maxFrame = -1L
-        var minUs = Long.MAX_VALUE
-        var maxUs = -1L
-        var pollerError = ""
-
-        val poller = Thread({
-            pollerThreadId = Thread.currentThread().id
-            while (running.get()) {
-                try {
-                    val f = session.currentPositionFrames()
-                    frameReadCount++
-                    val u = session.currentPositionUs()
-                    usReadCount++
-                    pollCount++
-                    if (f >= 0L) {
-                        validCount++
-                        if (lastFrame >= 0L && f < lastFrame) {
-                            regressionCount++
-                        }
-                        if (f < minFrame) minFrame = f
-                        if (f > maxFrame) maxFrame = f
-                        lastFrame = f
-                    }
-                    if (u >= 0L) {
-                        if (lastUs >= 0L && u < lastUs) {
-                            regressionCount++
-                        }
-                        if (u < minUs) minUs = u
-                        if (u > maxUs) maxUs = u
-                        lastUs = u
-                    }
-                    Thread.sleep(WAIT_SLICE_MS)
-                } catch (_: InterruptedException) {
-                    break
-                } catch (t: Throwable) {
-                    pollerError = "exception:${t.javaClass.simpleName}:${t.message}"
-                    break
-                }
-            }
-        }, "Y13PositionPoller")
-
         var completionReached = false
-        try {
-            poller.start()
+        val pollerMetrics = runWithPositionPoller(session, "Y13PositionPoller") {
             completionReached = session.awaitCompletion(config.deadlineMs)
-        } finally {
-            running.set(false)
-            poller.interrupt()
-            try {
-                poller.join(3_000L)
-            } catch (_: InterruptedException) {}
         }
-        val joined = !poller.isAlive
-        require(joined, "poller_not_joined")
         require(completionReached, "completion_not_reached:${session.failureReason}")
 
         val stateAtCompletion = session.currentState
@@ -1229,42 +1347,14 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
         session.dispose()
         session.dispose()
         val final = session.snapshot()
+        val postTeardownFrames = session.currentPositionFrames()
+        val postTeardownUs = session.currentPositionUs()
 
-        val pollerMetrics = PresentationClockPollerMetrics(
-            pollCount = pollCount,
-            validCount = validCount,
-            regressionCount = regressionCount,
-            frameReadCount = frameReadCount,
-            usReadCount = usReadCount,
-            lastFrame = lastFrame,
-            lastUs = lastUs,
-            minFrame = if (minFrame == Long.MAX_VALUE) -1L else minFrame,
-            maxFrame = maxFrame,
-            minUs = if (minUs == Long.MAX_VALUE) -1L else minUs,
-            maxUs = maxUs,
-            threadId = pollerThreadId,
-            joined = joined,
-            error = pollerError,
-            coordinatorThreadId = coordinatorThreadId,
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateCommon(final, baselineExpectation, out, pollerMetrics.coordinatorThreadId)
+        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluatePresentationClockQuerySurface(
+            final, pollerMetrics, stateAtCompletion, config, out,
+            postTeardownFrames, postTeardownUs,
         )
-
-        out.metrics["pollerPollCount"] = pollerMetrics.pollCount
-        out.metrics["pollerValidCount"] = pollerMetrics.validCount
-        out.metrics["pollerRegressionCount"] = pollerMetrics.regressionCount
-        out.metrics["pollerFrameReadCount"] = pollerMetrics.frameReadCount
-        out.metrics["pollerUsReadCount"] = pollerMetrics.usReadCount
-        out.metrics["pollerLastFrame"] = pollerMetrics.lastFrame
-        out.metrics["pollerLastUs"] = pollerMetrics.lastUs
-        out.metrics["pollerMinFrame"] = pollerMetrics.minFrame
-        out.metrics["pollerMaxFrame"] = pollerMetrics.maxFrame
-        out.metrics["pollerMinUs"] = pollerMetrics.minUs
-        out.metrics["pollerMaxUs"] = pollerMetrics.maxUs
-        out.metrics["pollerThreadId"] = pollerMetrics.threadId
-        out.metrics["pollerJoined"] = pollerMetrics.joined
-        out.metrics["pollerError"] = pollerMetrics.error
-
-        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluateCommon(final, baselineExpectation, out, coordinatorThreadId)
-        AndroidRealtimeAudioPlaybackProductionLaneEvaluator.evaluatePresentationClockQuerySurface(final, pollerMetrics, stateAtCompletion, config, out)
     }
 
     // ── Metrics ────────────────────────────────────────────────────────────
@@ -1570,7 +1660,7 @@ class AndroidRealtimeAudioPlaybackProductionSmokeCoordinator(
             "proofBoundary" to PROOF_BOUNDARY,
             "nativeProofBoundary" to PROOF_BOUNDARY,
             "failureReason" to reason,
-            "details" to "Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
+            "details" to "Y8a/Y8b/Y9/Y10b/Y11b/Y12/Y13/Y14 realtime audio playback production sink/clock/dead-object/seek/repeated-seek/focus/routing/presentation-clock/position-query-lifecycle smoke pass=$pass scenarios=${outcomes.joinToString(",") { it.name }}",
             "lanes" to lanes,
             "metrics" to metricMap,
             "lastError" to if (pass) null else reason,

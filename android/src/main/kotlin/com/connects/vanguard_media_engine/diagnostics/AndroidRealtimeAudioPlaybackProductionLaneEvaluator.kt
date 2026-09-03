@@ -35,6 +35,11 @@ import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlayba
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_NO_FEEDBACK
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_PLAYTHROUGH_ACCOUNTING
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_POSITION_AT_EOS_NO_RUNAWAY
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_POSITION_QUERY_DEAD_OBJECT_REBASE
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_POSITION_QUERY_PAUSE_HOLD_FROZEN
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_POSITION_QUERY_POST_TEARDOWN_LATCHED
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_POSITION_QUERY_REPEATED_SEEK_BASE_ADVANCE
+import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_POSITION_QUERY_SEEK_BASE_ADVANCE
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_POST_SEEK_DRAIN
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_PRE_ROLL
 import com.connects.vanguard_media_engine.diagnostics.AndroidRealtimeAudioPlaybackProductionSmokeCoordinator.Companion.LANE_PRESENTATION_LAG_BOUNDED
@@ -202,6 +207,11 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         stateAtCompletion: VanguardRealtimeAudioPlaybackSession.State,
         config: SmokeConfig,
         out: ScenarioOutcome,
+        pauseStartQueryFrames: Long = -1L,
+        pauseStartQueryUs: Long = -1L,
+        pauseEndQueryFrames: Long = -1L,
+        pauseEndQueryUs: Long = -1L,
+        poller: PresentationClockPollerMetrics? = null,
     ) {
         if (final.format == null) return
         val sink = final.sink ?: return
@@ -221,6 +231,14 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         out.metrics["holdEndClockPosition"] = heClock?.positionFrames ?: -1L
         out.metrics["holdStartClockUpdateCount"] = hsClock?.updateCount ?: -1L
         out.metrics["holdEndClockUpdateCount"] = heClock?.updateCount ?: -1L
+        out.metrics["pauseStartQueryFrames"] = pauseStartQueryFrames
+        out.metrics["pauseStartQueryUs"] = pauseStartQueryUs
+        out.metrics["pauseEndQueryFrames"] = pauseEndQueryFrames
+        out.metrics["pauseEndQueryUs"] = pauseEndQueryUs
+        if (poller != null) {
+            out.metrics["pollerRegressionCount"] = poller.regressionCount
+            out.metrics["pollerValidCount"] = poller.validCount
+        }
 
         out.lanes[LANE_PLAYTHROUGH_ACCOUNTING] = playthroughAccountingOk(final, stateAtCompletion)
         out.lanes[LANE_CHECKSUM_IDENTITY] = checksumIdentityOk(final)
@@ -245,6 +263,14 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             holdStart.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED && holdEnd.state == VanguardRealtimeAudioPlaybackSession.State.PAUSED &&
             holdStart.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED &&
             holdEnd.transportState == VanguardRealtimePlaybackTransportStateMachine.State.PAUSED
+        out.lanes[LANE_POSITION_QUERY_PAUSE_HOLD_FROZEN] = pauseStartQueryFrames >= 0L &&
+            pauseStartQueryUs >= 0L &&
+            pauseEndQueryFrames >= pauseStartQueryFrames &&
+            pauseEndQueryUs >= pauseStartQueryUs &&
+            pauseEndQueryFrames == pauseStartQueryFrames &&
+            pauseEndQueryUs == pauseStartQueryUs &&
+            (atPause == null || pauseStartQueryFrames == atPause.positionFrames) &&
+            (poller == null || poller.regressionCount == 0L)
     }
 
     // Shared by the EOS scenarios (Y8a playthrough, Y8b dead object, Y9
@@ -289,6 +315,11 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         stateAtCompletion: VanguardRealtimeAudioPlaybackSession.State,
         config: SmokeConfig,
         out: ScenarioOutcome,
+        afterRecoveryQueryFrames: Long = -1L,
+        afterRecoveryQueryUs: Long = -1L,
+        postTeardownFrames: Long = -1L,
+        postTeardownUs: Long = -1L,
+        poller: PresentationClockPollerMetrics? = null,
     ) {
         val fmt = final.format ?: return
         val sink = final.sink ?: return
@@ -305,6 +336,14 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         out.metrics["afterRecoveryClockEpochBase"] = arClock?.epochBaseOffsetFrames ?: -1L
         out.metrics["afterRecoveryClockPosition"] = arClock?.positionFrames ?: -1L
         out.metrics["afterRecoveryClockTimestampSuccessCount"] = arClock?.timestampSuccessCount ?: -1L
+        out.metrics["afterRecoveryQueryFrames"] = afterRecoveryQueryFrames
+        out.metrics["afterRecoveryQueryUs"] = afterRecoveryQueryUs
+        out.metrics["postTeardownCurrentPositionFrames"] = postTeardownFrames
+        out.metrics["postTeardownCurrentPositionUs"] = postTeardownUs
+        if (poller != null) {
+            out.metrics["pollerRegressionCount"] = poller.regressionCount
+            out.metrics["pollerValidCount"] = poller.validCount
+        }
 
         out.lanes[LANE_PLAYTHROUGH_ACCOUNTING] = playthroughAccountingOk(final, stateAtCompletion)
         out.lanes[LANE_CHECKSUM_IDENTITY] = checksumIdentityOk(final)
@@ -347,6 +386,17 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             sink.deadObjectFramesReadAtRecovery >= sink.deadObjectFramesWrittenBeforeRecovery &&
             sink.deadObjectFramesReadAtRecovery <= declared &&
             sink.framesWrittenToSink == declared && sink.framesReadFromTransport == declared
+
+        val preRecoveryPos = sink.deadObjectPositionBeforeRecovery
+        out.lanes[LANE_POSITION_QUERY_DEAD_OBJECT_REBASE] = (poller == null || poller.regressionCount == 0L) &&
+            afterRecoveryQueryFrames >= 0L &&
+            afterRecoveryQueryUs >= 0L &&
+            preRecoveryPos >= 0L &&
+            afterRecoveryQueryFrames >= preRecoveryPos &&
+            postTeardownFrames >= 0L &&
+            postTeardownUs >= 0L &&
+            postTeardownFrames >= clock.positionFrames &&
+            postTeardownUs >= clock.positionUs
     }
 
     // Base-step decomposition (A-prime). With W = frames written before
@@ -405,6 +455,9 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         stateAtCompletion: VanguardRealtimeAudioPlaybackSession.State,
         config: SmokeConfig,
         out: ScenarioOutcome,
+        afterSeekQueryFrames: Long = -1L,
+        afterSeekQueryUs: Long = -1L,
+        poller: PresentationClockPollerMetrics? = null,
     ) {
         val fmt = final.format ?: return
         val sink = final.sink ?: return
@@ -446,6 +499,12 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         out.metrics["afterSeekClockLastBaseAdvanceFrames"] = asClock?.lastBaseAdvanceFrames ?: -1L
         out.metrics["afterSeekTransportGeneration"] = afterSeek.transportGeneration
         out.metrics["finalTransportGeneration"] = final.transportGeneration
+        out.metrics["afterSeekQueryFrames"] = afterSeekQueryFrames
+        out.metrics["afterSeekQueryUs"] = afterSeekQueryUs
+        if (poller != null) {
+            out.metrics["pollerRegressionCount"] = poller.regressionCount
+            out.metrics["pollerValidCount"] = poller.validCount
+        }
 
         // Decoder landing assertions (paired with checksum identity): the
         // previous-sync seat landed at or before the target, the first
@@ -553,6 +612,11 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             reply.positionFrame == declared && reply.eosDrained &&
             final.transportCompletedCallbacks == 1 && final.transportFailedCallbacks == 0 && final.failureReason.isBlank() &&
             stateAtCompletion == VanguardRealtimeAudioPlaybackSession.State.COMPLETED
+        out.lanes[LANE_POSITION_QUERY_SEEK_BASE_ADVANCE] = afterSeekQueryFrames >= 0L &&
+            afterSeekQueryUs >= 0L &&
+            target > 0L &&
+            afterSeekQueryFrames >= target &&
+            (poller == null || poller.regressionCount == 0L)
     }
 
     // Y10b lanes: two ordered forward seeks (T1 then T2) followed by a third
@@ -569,6 +633,13 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         stateAtCompletion: VanguardRealtimeAudioPlaybackSession.State,
         config: SmokeConfig,
         out: ScenarioOutcome,
+        afterSeek1QueryFrames: Long = -1L,
+        afterSeek1QueryUs: Long = -1L,
+        afterSeek2QueryFrames: Long = -1L,
+        afterSeek2QueryUs: Long = -1L,
+        afterSeek3QueryFrames: Long = -1L,
+        afterSeek3QueryUs: Long = -1L,
+        poller: PresentationClockPollerMetrics? = null,
     ) {
         val fmt = final.format ?: return
         val sink = final.sink ?: return
@@ -604,6 +675,16 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         out.metrics["afterThirdSeekTransportState"] = afterThirdSeek.transportState?.name ?: "none"
         out.metrics["thirdSeekCount"] = afterThirdSeek.seek.seekCount
         out.metrics["finalSeekCount"] = final.seek.seekCount
+        out.metrics["afterSeek1QueryFrames"] = afterSeek1QueryFrames
+        out.metrics["afterSeek1QueryUs"] = afterSeek1QueryUs
+        out.metrics["afterSeek2QueryFrames"] = afterSeek2QueryFrames
+        out.metrics["afterSeek2QueryUs"] = afterSeek2QueryUs
+        out.metrics["afterSeek3QueryFrames"] = afterSeek3QueryFrames
+        out.metrics["afterSeek3QueryUs"] = afterSeek3QueryUs
+        if (poller != null) {
+            out.metrics["pollerRegressionCount"] = poller.regressionCount
+            out.metrics["pollerValidCount"] = poller.validCount
+        }
 
         val gapPolicyOk = d != null && d.gapPaddedFrames == d.gapObservedFrames &&
             d.gapPaddedFrames <= d.maxSeekGapFrames &&
@@ -658,6 +739,18 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
             atSink.phase == VanguardRealtimeAudioPlaybackSinkBridge.Phase.RUNNING &&
             atSink.seekParkCount == 2 && atSink.flushCount == 2 && atSink.unparkCount == 2 &&
             !afterThirdSeek.cancelled
+        out.lanes[LANE_POSITION_QUERY_REPEATED_SEEK_BASE_ADVANCE] = afterSeek1QueryFrames >= 0L &&
+            afterSeek1QueryUs >= 0L &&
+            afterSeek2QueryFrames >= 0L &&
+            afterSeek2QueryUs >= 0L &&
+            afterSeek3QueryFrames >= 0L &&
+            afterSeek3QueryUs >= 0L &&
+            t1 > 0L && t2 > t1 &&
+            afterSeek1QueryFrames >= t1 &&
+            afterSeek2QueryFrames >= t2 &&
+            afterSeek3QueryFrames >= afterSeek2QueryFrames &&
+            afterSeek3QueryUs >= afterSeek2QueryUs &&
+            (poller == null || poller.regressionCount == 0L)
     }
 
     // Y11b lanes: focus duck -> gain restore -> transient pause ->
@@ -1124,6 +1217,8 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         stateAtCompletion: VanguardRealtimeAudioPlaybackSession.State,
         config: SmokeConfig,
         out: ScenarioOutcome,
+        postTeardownFrames: Long = -1L,
+        postTeardownUs: Long = -1L,
     ) {
         val fmt = final.format ?: return
         val sink = final.sink ?: return
@@ -1145,6 +1240,8 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         out.metrics["pollerThreadId"] = poller.threadId
         out.metrics["pollerJoined"] = poller.joined
         out.metrics["pollerError"] = poller.error
+        out.metrics["postTeardownCurrentPositionFrames"] = postTeardownFrames
+        out.metrics["postTeardownCurrentPositionUs"] = postTeardownUs
         out.metrics["presentationLagSampleCount"] = sink.presentationLagSampleCount
         out.metrics["presentationLagBoundedSampleCount"] = sink.presentationLagBoundedSampleCount
         out.metrics["presentationLagExcludedSampleCount"] = sink.presentationLagExcludedSampleCount
@@ -1201,6 +1298,13 @@ object AndroidRealtimeAudioPlaybackProductionLaneEvaluator {
         out.lanes[LANE_POSITION_AT_EOS_NO_RUNAWAY] = sink.positionAtEosFrames >= 0L &&
             sink.positionAtEosUs >= 0L &&
             sink.positionAtEosFrames <= maxAllowedEosFrames
+
+        out.lanes[LANE_POSITION_QUERY_POST_TEARDOWN_LATCHED] = postTeardownFrames >= 0L &&
+            postTeardownUs >= 0L &&
+            clock.positionFrames >= 0L &&
+            clock.positionUs >= 0L &&
+            postTeardownFrames >= clock.positionFrames &&
+            postTeardownUs >= clock.positionUs
     }
 
     // A lane holds only when every scenario that evaluated it passed and at

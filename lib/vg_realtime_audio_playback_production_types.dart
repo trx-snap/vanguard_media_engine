@@ -158,6 +158,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     required this.presentationLagTelemetryOk,
     required this.presentationLagBoundedOk,
     required this.positionAtEosNoRunawayOk,
+    required this.positionQueryPauseHoldFrozenOk,
+    required this.positionQueryDeadObjectRebaseOk,
+    required this.positionQuerySeekBaseAdvanceOk,
+    required this.positionQueryRepeatedSeekBaseAdvanceOk,
+    required this.positionQueryPostTeardownLatchedOk,
     required this.canonical,
     required this.lanes,
     required this.metrics,
@@ -186,7 +191,7 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
 
   /// Canonical proof boundary string emitted by the native harness.
   static const String proofBoundaryConstant =
-      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
+      'production_engine_component_diagnostic_route_real_mediaextractor_mediacodec_to_y5a_external_ingest_to_y1_transport_to_nonzero_gain_audiotrack_sink_thread_owned_audiotrack_and_presentation_clock_bounded_pause_resume_closes_reopens_clock_epoch_at_last_published_position_synthetic_armed_dead_object_recovered_once_on_sink_thread_same_parameter_audiotrack_epoch_rebase_real_or_repeated_dead_object_fails_closed_one_forward_mid_stream_seek_while_paused_feed_held_at_window_aligned_anchor_quiescent_audiotrack_flush_once_on_sink_thread_before_transport_seek_seek_clock_epoch_based_at_target_deliberate_discontinuity_stale_generation_rejected_before_jni_two_ordered_forward_seeks_and_third_rejected_without_teardown_production_focus_response_focus_monitor_single_consumer_audiomanager_focus_request_becoming_noisy_receiver_sink_thread_gain_duck_restore_request_ack_transient_pause_auto_resume_user_intent_gated_noisy_terminal_pause_no_auto_resume_permanent_loss_pause_no_auto_resume_production_route_change_response_routing_monitor_single_consumer_audiotrack_routing_listener_attach_detach_route_change_observed_no_transport_mutation_route_disconnect_terminal_pause_no_resume_focus_gain_after_route_disconnect_no_auto_resume_presentation_clock_query_surface_off_thread_current_position_poller_monotonic_current_position_read_counter_isolation_epoch_relative_presentation_lag_bounded_position_at_eos_no_runaway_position_query_lifecycle_pause_seek_dead_object_teardown_stop_dispose_release_once_no_product_no_editor_no_app_no_connectsapp_no_ios_no_streaming_no_cache_no_cpp_no_jni';
 
   /// All required non-canonical native lane keys that must be evaluated and true.
   static const List<String> requiredNonCanonicalLanes = <String>[
@@ -238,6 +243,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     'presentationLagTelemetryOk',
     'presentationLagBoundedOk',
     'positionAtEosNoRunawayOk',
+    'positionQueryPauseHoldFrozenOk',
+    'positionQueryDeadObjectRebaseOk',
+    'positionQuerySeekBaseAdvanceOk',
+    'positionQueryRepeatedSeekBaseAdvanceOk',
+    'positionQueryPostTeardownLatchedOk',
   ];
 
   /// All required native lane keys including canonical.
@@ -413,6 +423,21 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
   /// Whether position reported at EOS was non-negative and bounded without runaway.
   final bool positionAtEosNoRunawayOk;
 
+  /// Whether position query remained strictly frozen and non-regressing during bounded pause hold.
+  final bool positionQueryPauseHoldFrozenOk;
+
+  /// Whether position query rebased monotonically across dead-object recovery and latched post-teardown.
+  final bool positionQueryDeadObjectRebaseOk;
+
+  /// Whether position query advanced at or beyond target after forward seek with no regression.
+  final bool positionQuerySeekBaseAdvanceOk;
+
+  /// Whether position query advanced at or beyond targets across repeated seeks with third rejected seek not regressing.
+  final bool positionQueryRepeatedSeekBaseAdvanceOk;
+
+  /// Whether position query read post-stop/dispose latched cleanly and remained >= final clock envelope.
+  final bool positionQueryPostTeardownLatchedOk;
+
   /// Canonical pass indicator.
   final bool canonical;
 
@@ -485,7 +510,18 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       routeChangeObservationOk &&
       routeDisconnectTerminalPauseOk &&
       routeDisconnectResumeBlockedOk &&
-      routingMonitorTeardownOk;
+      routingMonitorTeardownOk &&
+      currentPositionQuerySurfaceOk &&
+      currentPositionPollerMonotonicOk &&
+      currentPositionReadCounterIsolationOk &&
+      presentationLagTelemetryOk &&
+      presentationLagBoundedOk &&
+      positionAtEosNoRunawayOk &&
+      positionQueryPauseHoldFrozenOk &&
+      positionQueryDeadObjectRebaseOk &&
+      positionQuerySeekBaseAdvanceOk &&
+      positionQueryRepeatedSeekBaseAdvanceOk &&
+      positionQueryPostTeardownLatchedOk;
 
   /// Whether this report meets all verification criteria for a passing smoke run.
   bool get isVerifiedPass =>
@@ -558,6 +594,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         presentationLagTelemetryOk: false,
         presentationLagBoundedOk: false,
         positionAtEosNoRunawayOk: false,
+        positionQueryPauseHoldFrozenOk: false,
+        positionQueryDeadObjectRebaseOk: false,
+        positionQuerySeekBaseAdvanceOk: false,
+        positionQueryRepeatedSeekBaseAdvanceOk: false,
+        positionQueryPostTeardownLatchedOk: false,
         canonical: false,
         lanes: <String, Object?>{
           'status': 'FAIL',
@@ -715,6 +756,21 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     final presentationLagTelemetryOk = parseBool('presentationLagTelemetryOk');
     final presentationLagBoundedOk = parseBool('presentationLagBoundedOk');
     final positionAtEosNoRunawayOk = parseBool('positionAtEosNoRunawayOk');
+    final positionQueryPauseHoldFrozenOk = parseBool(
+      'positionQueryPauseHoldFrozenOk',
+    );
+    final positionQueryDeadObjectRebaseOk = parseBool(
+      'positionQueryDeadObjectRebaseOk',
+    );
+    final positionQuerySeekBaseAdvanceOk = parseBool(
+      'positionQuerySeekBaseAdvanceOk',
+    );
+    final positionQueryRepeatedSeekBaseAdvanceOk = parseBool(
+      'positionQueryRepeatedSeekBaseAdvanceOk',
+    );
+    final positionQueryPostTeardownLatchedOk = parseBool(
+      'positionQueryPostTeardownLatchedOk',
+    );
     final canonical = parseBool('canonical', rawPass && missingLanes.isEmpty);
 
     final hasValidProofBoundary =
@@ -771,7 +827,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         currentPositionReadCounterIsolationOk &&
         presentationLagTelemetryOk &&
         presentationLagBoundedOk &&
-        positionAtEosNoRunawayOk;
+        positionAtEosNoRunawayOk &&
+        positionQueryPauseHoldFrozenOk &&
+        positionQueryDeadObjectRebaseOk &&
+        positionQuerySeekBaseAdvanceOk &&
+        positionQueryRepeatedSeekBaseAdvanceOk &&
+        positionQueryPostTeardownLatchedOk;
 
     final allRequiredLanesPresent = missingLanes.isEmpty;
     final explicitLastError = parseString('lastError');
@@ -881,6 +942,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'presentationLagTelemetryOk': presentationLagTelemetryOk,
       'presentationLagBoundedOk': presentationLagBoundedOk,
       'positionAtEosNoRunawayOk': positionAtEosNoRunawayOk,
+      'positionQueryPauseHoldFrozenOk': positionQueryPauseHoldFrozenOk,
+      'positionQueryDeadObjectRebaseOk': positionQueryDeadObjectRebaseOk,
+      'positionQuerySeekBaseAdvanceOk': positionQuerySeekBaseAdvanceOk,
+      'positionQueryRepeatedSeekBaseAdvanceOk':
+          positionQueryRepeatedSeekBaseAdvanceOk,
+      'positionQueryPostTeardownLatchedOk': positionQueryPostTeardownLatchedOk,
       'canonical': canonical,
       ...parsedLanes,
     };
@@ -942,6 +1009,12 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       presentationLagTelemetryOk: presentationLagTelemetryOk,
       presentationLagBoundedOk: presentationLagBoundedOk,
       positionAtEosNoRunawayOk: positionAtEosNoRunawayOk,
+      positionQueryPauseHoldFrozenOk: positionQueryPauseHoldFrozenOk,
+      positionQueryDeadObjectRebaseOk: positionQueryDeadObjectRebaseOk,
+      positionQuerySeekBaseAdvanceOk: positionQuerySeekBaseAdvanceOk,
+      positionQueryRepeatedSeekBaseAdvanceOk:
+          positionQueryRepeatedSeekBaseAdvanceOk,
+      positionQueryPostTeardownLatchedOk: positionQueryPostTeardownLatchedOk,
       canonical: canonical,
       lanes: Map<String, Object?>.unmodifiable(finalLanes),
       metrics: Map<String, Object?>.unmodifiable(parsedMetrics),
@@ -1040,6 +1113,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       presentationLagTelemetryOk: false,
       presentationLagBoundedOk: false,
       positionAtEosNoRunawayOk: false,
+      positionQueryPauseHoldFrozenOk: false,
+      positionQueryDeadObjectRebaseOk: false,
+      positionQuerySeekBaseAdvanceOk: false,
+      positionQueryRepeatedSeekBaseAdvanceOk: false,
+      positionQueryPostTeardownLatchedOk: false,
       canonical: false,
       lanes: Map<String, Object?>.unmodifiable(lanes),
       metrics: Map<String, Object?>.unmodifiable(metrics),
@@ -1185,6 +1263,24 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
         other.routeDisconnectResumeBlockedOk ==
             routeDisconnectResumeBlockedOk &&
         other.routingMonitorTeardownOk == routingMonitorTeardownOk &&
+        other.currentPositionQuerySurfaceOk == currentPositionQuerySurfaceOk &&
+        other.currentPositionPollerMonotonicOk ==
+            currentPositionPollerMonotonicOk &&
+        other.currentPositionReadCounterIsolationOk ==
+            currentPositionReadCounterIsolationOk &&
+        other.presentationLagTelemetryOk == presentationLagTelemetryOk &&
+        other.presentationLagBoundedOk == presentationLagBoundedOk &&
+        other.positionAtEosNoRunawayOk == positionAtEosNoRunawayOk &&
+        other.positionQueryPauseHoldFrozenOk ==
+            positionQueryPauseHoldFrozenOk &&
+        other.positionQueryDeadObjectRebaseOk ==
+            positionQueryDeadObjectRebaseOk &&
+        other.positionQuerySeekBaseAdvanceOk ==
+            positionQuerySeekBaseAdvanceOk &&
+        other.positionQueryRepeatedSeekBaseAdvanceOk ==
+            positionQueryRepeatedSeekBaseAdvanceOk &&
+        other.positionQueryPostTeardownLatchedOk ==
+            positionQueryPostTeardownLatchedOk &&
         other.canonical == canonical &&
         other.lastError == lastError;
   }
@@ -1240,6 +1336,17 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
     routeDisconnectTerminalPauseOk,
     routeDisconnectResumeBlockedOk,
     routingMonitorTeardownOk,
+    currentPositionQuerySurfaceOk,
+    currentPositionPollerMonotonicOk,
+    currentPositionReadCounterIsolationOk,
+    presentationLagTelemetryOk,
+    presentationLagBoundedOk,
+    positionAtEosNoRunawayOk,
+    positionQueryPauseHoldFrozenOk,
+    positionQueryDeadObjectRebaseOk,
+    positionQuerySeekBaseAdvanceOk,
+    positionQueryRepeatedSeekBaseAdvanceOk,
+    positionQueryPostTeardownLatchedOk,
     canonical,
   ]);
 
@@ -1282,6 +1389,11 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
       'presentationLagTelemetryOk: $presentationLagTelemetryOk, '
       'presentationLagBoundedOk: $presentationLagBoundedOk, '
       'positionAtEosNoRunawayOk: $positionAtEosNoRunawayOk, '
+      'positionQueryPauseHoldFrozenOk: $positionQueryPauseHoldFrozenOk, '
+      'positionQueryDeadObjectRebaseOk: $positionQueryDeadObjectRebaseOk, '
+      'positionQuerySeekBaseAdvanceOk: $positionQuerySeekBaseAdvanceOk, '
+      'positionQueryRepeatedSeekBaseAdvanceOk: $positionQueryRepeatedSeekBaseAdvanceOk, '
+      'positionQueryPostTeardownLatchedOk: $positionQueryPostTeardownLatchedOk, '
       'canonical: $canonical, '
       'failureReason: $failureReason, lastError: $lastError)';
 
@@ -1501,4 +1613,70 @@ class VGRealtimeAudioPlaybackProductionSmokeReport {
 
   /// Error string reported by the off-thread poller, if any.
   String get pollerError => metrics['pollerError']?.toString() ?? '';
+
+  // ---- Position Query Lifecycle Discontinuity Getters (Y14) ----------------
+
+  /// Frame position queried at start of pause hold.
+  int get pauseStartQueryFrames =>
+      (metrics['pauseStartQueryFrames'] as num?)?.toInt() ?? -1;
+
+  /// Microsecond position queried at start of pause hold.
+  int get pauseStartQueryUs =>
+      (metrics['pauseStartQueryUs'] as num?)?.toInt() ?? -1;
+
+  /// Frame position queried at end of pause hold.
+  int get pauseEndQueryFrames =>
+      (metrics['pauseEndQueryFrames'] as num?)?.toInt() ?? -1;
+
+  /// Microsecond position queried at end of pause hold.
+  int get pauseEndQueryUs =>
+      (metrics['pauseEndQueryUs'] as num?)?.toInt() ?? -1;
+
+  /// Frame position queried after synthetic dead-object recovery.
+  int get afterRecoveryQueryFrames =>
+      (metrics['afterRecoveryQueryFrames'] as num?)?.toInt() ?? -1;
+
+  /// Microsecond position queried after synthetic dead-object recovery.
+  int get afterRecoveryQueryUs =>
+      (metrics['afterRecoveryQueryUs'] as num?)?.toInt() ?? -1;
+
+  /// Frame position queried after forward seek.
+  int get afterSeekQueryFrames =>
+      (metrics['afterSeekQueryFrames'] as num?)?.toInt() ?? -1;
+
+  /// Microsecond position queried after forward seek.
+  int get afterSeekQueryUs =>
+      (metrics['afterSeekQueryUs'] as num?)?.toInt() ?? -1;
+
+  /// Frame position queried after repeated seek T1.
+  int get afterSeek1QueryFrames =>
+      (metrics['afterSeek1QueryFrames'] as num?)?.toInt() ?? -1;
+
+  /// Microsecond position queried after repeated seek T1.
+  int get afterSeek1QueryUs =>
+      (metrics['afterSeek1QueryUs'] as num?)?.toInt() ?? -1;
+
+  /// Frame position queried after repeated seek T2.
+  int get afterSeek2QueryFrames =>
+      (metrics['afterSeek2QueryFrames'] as num?)?.toInt() ?? -1;
+
+  /// Microsecond position queried after repeated seek T2.
+  int get afterSeek2QueryUs =>
+      (metrics['afterSeek2QueryUs'] as num?)?.toInt() ?? -1;
+
+  /// Frame position queried after rejected 3rd seek.
+  int get afterSeek3QueryFrames =>
+      (metrics['afterSeek3QueryFrames'] as num?)?.toInt() ?? -1;
+
+  /// Microsecond position queried after rejected 3rd seek.
+  int get afterSeek3QueryUs =>
+      (metrics['afterSeek3QueryUs'] as num?)?.toInt() ?? -1;
+
+  /// Post-teardown latched currentPositionFrames read.
+  int get postTeardownCurrentPositionFrames =>
+      (metrics['postTeardownCurrentPositionFrames'] as num?)?.toInt() ?? -1;
+
+  /// Post-teardown latched currentPositionUs read.
+  int get postTeardownCurrentPositionUs =>
+      (metrics['postTeardownCurrentPositionUs'] as num?)?.toInt() ?? -1;
 }
