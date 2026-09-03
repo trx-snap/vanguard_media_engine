@@ -85,6 +85,10 @@ add_library(vanguard_render_gles STATIC
     # P5-OVERLAYS-TRANS (GLES-RENDER): private multi-layer overlay helper
     # (mat3 transform, per-layer opacity, source-over blend, state restore).
     "render/gles/src/gles_overlay_compositor.cpp"
+    # P5-BEAUTY-V2-GLES-RENDER: private 3-pass bilateral beauty smoothing
+    # helper (blur_h, blur_v, composite; fused highpass, adaptive smoothing
+    # gate, tone compression, midtone lift, detail add-back, state restore).
+    "render/gles/src/gles_beauty_v2_compositor.cpp"
 )
 target_include_directories(vanguard_render_gles PUBLIC "render/gles/include")
 target_link_libraries(vanguard_render_gles PRIVATE vanguard_render_shared vanguard_core)
@@ -171,6 +175,11 @@ if (ANDROID)
     "platform/android/src/android_phase5_timeline_overlay_vulkan_render_jni.cpp"
     "platform/android/src/android_phase5_timeline_dual_decoder_sync_jni.cpp"
     "platform/android/src/android_phase5_timeline_dual_decoder_sync_vulkan_support.cpp"
+    # P5-BEAUTY-V2-GLES-RENDER: GlesBeautyV2Compositor shader/raster + CPU
+    # reference parity diagnostic proof (lane execution extracted into the
+    # probe translation unit per Constitution modularity pre-authorization).
+    "platform/android/src/android_phase5_beauty_v2_gles_render_probe.cpp"
+    "platform/android/src/android_phase5_beauty_v2_gles_render_jni.cpp"
   )
   target_include_directories(vanguard_media_engine PRIVATE "platform/android/include")
   # P5-COMPOSITOR-TRANS (GLES-RENDER): the diagnostic JNI drives the private

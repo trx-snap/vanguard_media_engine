@@ -1916,6 +1916,23 @@ class VanguardNativeBridge(
     // no export session, no product UI.
     external fun runAndroidDagPhase5TimelineOverlayGlesRenderSmoke(): String
 
+    // ── P5-BEAUTY-V2-GLES-RENDER: GlesBeautyV2Compositor 3-pass bilateral ────
+    // beauty smoothing shader/raster + CPU-reference-parity proof diagnostic.
+    // Native creates its own temporary 64x64 EGL pbuffer context (OpenGL ES
+    // 3.0+ only, no ES2 fallback) and synthetic GL_TEXTURE_2D probe textures
+    // on the calling thread, runs the None/Soft/Strong/Max intensity presets
+    // through the private GLES beauty helper (blur_h, blur_v, composite:
+    // fused highpass, adaptive smoothing gate, tone compression, midtone
+    // lift, detail add-back, alpha preservation), reads pixels back,
+    // compares against a pure CPU reference that quantizes Pass 1/2
+    // intermediates to 8-bit UNORM (mirroring the GL_RGBA8 intermediate
+    // FBOs), verifies GL state restoration and per-call resource lifecycle,
+    // and tears everything down before returning a JSON object string. Must
+    // be called from a thread with no EGL context current (the smoke
+    // coordinator's executor). No Vulkan, no MediaCodec/decode, no
+    // SurfaceTexture/OES frame proof, no export session, no product UI.
+    external fun runAndroidDagPhase5BeautyV2GlesRenderSmoke(): String
+
     // ── P5-COMPOSITOR-TRANS (VULKAN-RENDER): VulkanTimelineTransitionCompositor ──
     // shader/raster proof diagnostic. Native creates its own temporary
     // VkInstance/VkDevice/VkQueue/VkCommandPool, synthetic RGBA8 sampled images,
