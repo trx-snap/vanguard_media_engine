@@ -19,11 +19,13 @@
 #include "vulkan_graphics_pipeline.h"
 #include "vulkan_surface_swapchain.h"
 #include "vulkan_hardware_buffer_imports.h"
+#include "vulkan_overlay_frame_renderer.h"
 #include "vulkan_shader_module.h"
 #include "vulkan_transition_frame_renderer.h"
 #include "vanguard/render/render_transform.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <unistd.h>
 
@@ -62,6 +64,200 @@ static inline uint64_t vkHandleToU64(VkHandle h) {
     // NOLINTNEXTLINE(bugprone-undefined-memory-manipulation)
     std::memcpy(&v, &h, sizeof(VkHandle));
     return v;
+}
+
+// P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A native renderer
+// integration sub-slice N2: mirrors VulkanGraphicsCommandRecorder::
+// recordGraphicsPass's validate + record body (vulkan_graphics_command_
+// recorder.cpp) exactly, except it never calls vkCmdEndRenderPass, so a
+// caller can record additional draws (overlays) into the SAME open render
+// pass before ending it -- recordCompletePass/recordGraphicsPass cannot be
+// reused directly for that because they end the render pass themselves.
+// commandBuffer must already be in the recording state (vkBeginCommandBuffer
+// already called); this function never begins/ends the command buffer and
+// never ends the render pass it begins.
+bool recordBaseFramePassKeepOpen(const VulkanGraphicsPassParams& params) {
+    if (params.commandBuffer == VK_NULL_HANDLE || params.renderPass == VK_NULL_HANDLE ||
+        params.framebuffer == VK_NULL_HANDLE || params.pipelineLayout == VK_NULL_HANDLE ||
+        params.descriptorSet == VK_NULL_HANDLE || params.pipeline == VK_NULL_HANDLE ||
+        params.extentWidth == 0 || params.extentHeight == 0) {
+        return false;
+    }
+    if (params.transitionSourceImage &&
+        (params.sourceImage == nullptr || params.sourceImage->image == VK_NULL_HANDLE)) {
+        return false;
+    }
+    const bool hasDestinationRect =
+        params.destinationX != 0 || params.destinationY != 0 ||
+        params.destinationWidth != 0 || params.destinationHeight != 0;
+    if (hasDestinationRect) {
+        if (params.destinationWidth == 0 || params.destinationHeight == 0 ||
+            params.destinationX < 0 || params.destinationY < 0) {
+            return false;
+        }
+        const uint64_t right =
+            static_cast<uint64_t>(params.destinationX) + static_cast<uint64_t>(params.destinationWidth);
+        const uint64_t bottom =
+            static_cast<uint64_t>(params.destinationY) + static_cast<uint64_t>(params.destinationHeight);
+        if (right > params.extentWidth || bottom > params.extentHeight) {
+            return false;
+        }
+    }
+
+    if (params.transitionSourceImage) {
+        params.sourceImage->recordLayoutTransition(
+            params.commandBuffer,
+            params.sourceOldLayout,
+            params.sourceNewLayout,
+            params.srcStageMask,
+            params.dstStageMask,
+            params.srcAccessMask,
+            params.dstAccessMask,
+            params.srcQueueFamilyIndex,
+            params.dstQueueFamilyIndex);
+    }
+
+    VkClearValue clearValue{};
+    clearValue.color = params.clearColor;
+
+    VkRenderPassBeginInfo renderPassBeginInfo{};
+    renderPassBeginInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    renderPassBeginInfo.pNext = nullptr;
+    renderPassBeginInfo.renderPass = params.renderPass;
+    renderPassBeginInfo.framebuffer = params.framebuffer;
+    renderPassBeginInfo.renderArea.offset = {0, 0};
+    renderPassBeginInfo.renderArea.extent = {params.extentWidth, params.extentHeight};
+    renderPassBeginInfo.clearValueCount = 1;
+    renderPassBeginInfo.pClearValues = &clearValue;
+
+    vkCmdBeginRenderPass(params.commandBuffer, &renderPassBeginInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+    // Aspect-fit destination sub-rect: mirrors recordGraphicsPass exactly.
+    const int32_t destX = hasDestinationRect ? params.destinationX : 0;
+    const int32_t destY = hasDestinationRect ? params.destinationY : 0;
+    const uint32_t destWidth = hasDestinationRect ? params.destinationWidth : params.extentWidth;
+    const uint32_t destHeight = hasDestinationRect ? params.destinationHeight : params.extentHeight;
+
+    VkViewport viewport{};
+    viewport.x = static_cast<float>(destX);
+    viewport.y = static_cast<float>(destY);
+    viewport.width = static_cast<float>(destWidth);
+    viewport.height = static_cast<float>(destHeight);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(params.commandBuffer, 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {destX, destY};
+    scissor.extent = {destWidth, destHeight};
+    vkCmdSetScissor(params.commandBuffer, 0, 1, &scissor);
+
+    vkCmdBindPipeline(params.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, params.pipeline);
+
+    vkCmdBindDescriptorSets(
+        params.commandBuffer,
+        VK_PIPELINE_BIND_POINT_GRAPHICS,
+        params.pipelineLayout,
+        0,
+        1,
+        &params.descriptorSet,
+        0,
+        nullptr);
+
+    vkCmdPushConstants(
+        params.commandBuffer,
+        params.pipelineLayout,
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        0,
+        sizeof(params.pushConstants),
+        &params.pushConstants);
+
+    vkCmdDraw(params.commandBuffer, 3, 1, 0, 0);
+
+    return true; // Render pass intentionally left open for the caller to append draws.
+}
+
+// P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A native renderer
+// integration sub-slice N2 correction 1: mirrors VulkanOverlayFrameRenderer::
+// recordOverlayDraws's own pre-Vulkan caller-data validation
+// (vulkan_overlay_frame_renderer.cpp: DrawFieldsFinite / DrawScissorValid and
+// the per-draw imageViewHandle/samplerHandle/opacity checks) exactly, but
+// runs here BEFORE the swapchain is even acquired and before
+// recordBaseFramePassKeepOpen begins the command buffer / opens the render
+// pass -- not just before recordOverlayDraws is reached with the base frame's
+// render pass already open. This is intentional duplication: it lets invalid
+// caller-supplied overlay data fail closed without ever touching the
+// swapchain or base frame, while recordOverlayDraws keeps its own defense in
+// depth for direct callers. draws must be non-null and overlayCount > 0 (the
+// overlayCount == 0 no-op and the null-draws-with-nonzero-count case are
+// both handled by the caller before this is reached).
+bool overlayFrameDrawsValid(const VulkanOverlayFrameDraw* draws,
+                             uint32_t overlayCount,
+                             uint32_t canvasWidth,
+                             uint32_t canvasHeight) {
+    if (draws == nullptr || canvasWidth == 0 || canvasHeight == 0) {
+        return false;
+    }
+    for (uint32_t i = 0; i < overlayCount; ++i) {
+        const VulkanOverlayFrameDraw& d = draws[i];
+        if (d.imageViewHandle == 0 || d.samplerHandle == 0) {
+            return false;
+        }
+        for (int j = 0; j < 4; ++j) {
+            if (!std::isfinite(d.uvRow0[j]) || !std::isfinite(d.uvRow1[j])) {
+                return false;
+            }
+        }
+        if (!std::isfinite(d.opacity) || d.opacity < 0.0f || d.opacity > 1.0f) {
+            return false;
+        }
+        if (d.scissorWidth == 0 || d.scissorHeight == 0) {
+            return false;
+        }
+        if (d.scissorX < 0 || d.scissorY < 0) {
+            return false;
+        }
+        const uint64_t right =
+            static_cast<uint64_t>(d.scissorX) + static_cast<uint64_t>(d.scissorWidth);
+        const uint64_t bottom =
+            static_cast<uint64_t>(d.scissorY) + static_cast<uint64_t>(d.scissorHeight);
+        if (right > static_cast<uint64_t>(canvasWidth) ||
+            bottom > static_cast<uint64_t>(canvasHeight)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A native renderer
+// integration sub-slice N2 correction 1: best-effort close of the base
+// frame's already-open render pass and already-recording command buffer on a
+// failure path that must never submit or present -- used only when
+// recordOverlayDraws() fails AFTER recordBaseFramePassKeepOpen has already
+// begun the command buffer and opened the render pass (e.g. a descriptor
+// pool allocation failure), since overlayFrameDrawsValid() above has already
+// ruled out invalid caller data before that point. vkCmdEndRenderPass never
+// fails (void); vkEndCommandBuffer's result is intentionally ignored since
+// the command buffer is left in a non-recording state either way and is
+// about to be reset/destroyed by failClosed() regardless.
+void abandonOpenRenderPass(VkCommandBuffer commandBuffer) {
+    vkCmdEndRenderPass(commandBuffer);
+    vkEndCommandBuffer(commandBuffer);
+}
+
+// P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A native renderer
+// integration sub-slice N2 correction 2: best-effort close of an
+// already-recording command buffer that never got as far as opening a render
+// pass -- used only when recordBaseFramePassKeepOpen() itself returns false,
+// which today only happens during its own validation phase (e.g. an invalid
+// destination rect) before it ever calls vkCmdBeginRenderPass. Unlike
+// abandonOpenRenderPass() above, this must NOT call vkCmdEndRenderPass, since
+// no render pass was opened on this path. vkEndCommandBuffer's result is
+// intentionally ignored since the command buffer is left in a non-recording
+// state either way and is about to be reset/destroyed by failClosed()
+// regardless.
+void abandonRecordingCommandBuffer(VkCommandBuffer commandBuffer) {
+    vkEndCommandBuffer(commandBuffer);
 }
 
 } // anonymous namespace
@@ -111,6 +307,19 @@ struct VulkanFrameRenderer::Impl {
     std::unique_ptr<VulkanBeautyFrameRenderer> beautyRendererFrom;
     std::unique_ptr<VulkanBeautyFrameRenderer> beautyRendererTo;
 
+    // P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A native
+    // renderer integration sub-slice N2: lazily constructed on the first
+    // overlay-enabled renderFrame() call. Unlike beautyRenderer above, its
+    // render-pass-bound pipeline is built against the SAME swapchain render
+    // pass as graphicsPipeline (the overlay draws are recorded into the base
+    // frame's own render pass, not a separate one), so it is invalidated in
+    // lockstep with graphicsPipeline by the routine invalidatePipeline()
+    // below rather than surviving until shutdown()/failClosed() like
+    // beauty's separately-cached placement pipeline. Its descriptor set
+    // layout / pipeline layout / descriptor pool are still destroyed only on
+    // shutdown()/failClosed() (see shutdownOverlay() below).
+    std::unique_ptr<VulkanOverlayFrameRenderer> overlayRenderer;
+
     // Torn down only on shutdown()/failClosed() (never from the routine
     // invalidatePipeline() hot path) so beauty's cached geometry/pipelines
     // survive ordinary per-frame pipeline-layout churn.
@@ -126,6 +335,18 @@ struct VulkanFrameRenderer::Impl {
         if (beautyRendererTo) {
             beautyRendererTo->shutdown(device);
             beautyRendererTo.reset();
+        }
+    }
+
+    // Torn down only on shutdown()/failClosed(), mirroring shutdownBeauty()
+    // above; the render-pass-bound pipeline piece is already invalidated in
+    // lockstep with graphicsPipeline by invalidatePipeline() below, so this
+    // only needs to run once more per full teardown to release the
+    // remaining cached descriptor objects.
+    void shutdownOverlay() {
+        if (overlayRenderer) {
+            overlayRenderer->shutdown(device);
+            overlayRenderer.reset();
         }
     }
 
@@ -160,6 +381,12 @@ struct VulkanFrameRenderer::Impl {
         activePipelineLayout = VK_NULL_HANDLE;
         activeRenderPassHandle = 0;
         invalidateTransitionPipelines();
+        // The overlay helper's cached pipeline is built against the same
+        // render pass as graphicsPipeline above, so it must be invalidated
+        // here too rather than left dangling until shutdown().
+        if (overlayRenderer) {
+            overlayRenderer->invalidate(device);
+        }
     }
 
     // Phase 2P2: failClosed receives ahbImports so it can drainAllRetired()
@@ -182,6 +409,10 @@ struct VulkanFrameRenderer::Impl {
         // may be referenced by beauty's cached placement pipeline; tear the
         // whole beauty cache down rather than leave it dangling.
         shutdownBeauty();
+        // The overlay helper's pipeline was already invalidated above (see
+        // invalidatePipeline()); this releases its remaining cached
+        // descriptor objects while device is still valid.
+        shutdownOverlay();
         pfnGetSemaphoreFd = nullptr; // fail-closed: clear export capability
         initialized = false;
         currentFrameIndex = 0;
@@ -256,6 +487,10 @@ void VulkanFrameRenderer::shutdown() {
     // while s.device is still valid, before the device itself is torn down
     // by the owning VulkanBackend.
     s.shutdownBeauty();
+    // P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A: release
+    // cached overlay resources while s.device is still valid, same rationale
+    // as shutdownBeauty() above.
+    s.shutdownOverlay();
 
     if (s.frameSync) {
         s.frameSync->shutdown(s.device, s.commandPool);
@@ -582,6 +817,367 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     }
 
     // Phase 2O2B4: Mark layout as SHADER_READ_ONLY_OPTIMAL only after vkQueueSubmit returns VK_SUCCESS.
+    if (!ahbImports.setImageLayout(handle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    const SwapchainResult presentResult = swapchain.presentImage(
+        queueHandle,
+        presentReadySemaphoreHandle,
+        imageIndex);
+    s.currentFrameIndex = (s.currentFrameIndex + 1) % frameCount;
+
+    switch (presentResult) {
+        case SwapchainResult::kSuccess:
+            return acquireResult == SwapchainResult::kSuboptimal
+                ? RenderFrameResult::kSuboptimal
+                : RenderFrameResult::kSuccess;
+        case SwapchainResult::kSuboptimal:
+            return RenderFrameResult::kSuboptimal;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kDeviceLost);
+        case SwapchainResult::kError:
+            return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+}
+
+// ---------------------------------------------------------------------------
+// P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A native renderer
+// integration sub-slice N2: renderFrame with an optional set of
+// already-resolved overlay draws recorded into the SAME render pass as the
+// base decoded frame, immediately after it. Mirrors the transform-only
+// overload above's entire acquire / frame-fence / pending-AHB-semaphore /
+// release-fence-export / present protocol exactly; the only difference is
+// that the base frame draw and the render pass are recorded manually here
+// (via recordBaseFramePassKeepOpen above) instead of through
+// VulkanGraphicsCommandRecorder::recordCompletePass, because recordCompletePass
+// ends the render pass itself before overlays could be appended. When
+// overlayCount == 0 this delegates directly to the transform-only overload
+// with zero additional Vulkan calls, so non-overlay behavior (including the
+// solo pipeline cache in s.graphicsPipeline) is completely unaffected by this
+// overload's existence.
+// ---------------------------------------------------------------------------
+
+RenderFrameResult VulkanFrameRenderer::renderFrame(
+    void* queueHandle,
+    VulkanSurfaceSwapchain& swapchain,
+    VulkanHardwareBufferImports& ahbImports,
+    VulkanCoreShaderModules& coreShaders,
+    HardwareBufferHandle handle,
+    const VideoFrameTransform& transform,
+    const VulkanOverlayFrameDraw* overlayDraws,
+    uint32_t overlayCount) {
+    if (overlayCount == 0) {
+        return renderFrame(queueHandle, swapchain, ahbImports, coreShaders, handle, transform);
+    }
+    if (overlayDraws == nullptr) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    Impl& s = *impl_;
+    if (queueHandle == nullptr || s.device == VK_NULL_HANDLE ||
+        s.commandPool == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    if (!swapchain.hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    const VulkanHardwareBufferImage* srcImage = ahbImports.getImage(handle);
+    if (!ahbImports.hasBuffer(handle) || srcImage == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (srcImage->image == VK_NULL_HANDLE ||
+        coreShaders.vertex.get() == VK_NULL_HANDLE ||
+        coreShaders.fragment.get() == VK_NULL_HANDLE ||
+        !s.frameSync || !s.frameSync->isInitialized()) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint32_t frameCount = s.frameSync->getFrameCount();
+    if (frameCount == 0 || s.currentFrameIndex >= frameCount) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VulkanFrameSyncResources* frame =
+        s.frameSync->getFrame(s.currentFrameIndex);
+    if (frame == nullptr || frame->commandBuffer == VK_NULL_HANDLE ||
+        frame->imageAvailableSemaphore == VK_NULL_HANDLE ||
+        frame->inFlightFence == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t renderPassHandle = swapchain.getRenderPassHandle();
+    const uint32_t extentWidth = swapchain.getExtentWidth();
+    const uint32_t extentHeight = swapchain.getExtentHeight();
+    VkPipelineLayout pipelineLayout =
+        srcImage->descriptorResources.pipelineLayout;
+    VkDescriptorSet descriptorSet = srcImage->descriptorResources.descriptorSet;
+    if (renderPassHandle == 0 || extentWidth == 0 || extentHeight == 0 ||
+        pipelineLayout == VK_NULL_HANDLE || descriptorSet == VK_NULL_HANDLE) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    const VkRenderPass renderPass =
+        u64ToVkHandle<VkRenderPass>(renderPassHandle);
+
+    // Correction 1: validate every overlay draw against the canvas extent
+    // now -- before the swapchain is acquired and before any Vulkan call
+    // below (pipeline (re)creation, fence wait, acquire) -- so invalid
+    // caller-supplied overlay data fails closed without ever opening the
+    // base frame's render pass.
+    if (!overlayFrameDrawsValid(overlayDraws, overlayCount, extentWidth, extentHeight)) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+
+    if (!s.overlayRenderer) {
+        s.overlayRenderer = std::make_unique<VulkanOverlayFrameRenderer>();
+    }
+
+    const bool hasActivePipeline =
+        s.graphicsPipeline && s.graphicsPipeline->isValid();
+    const bool pipelineCompatibilityMismatch =
+        hasActivePipeline &&
+        (s.activePipelineLayout != pipelineLayout ||
+         s.activeRenderPassHandle != renderPassHandle);
+    const bool pipelineMismatch =
+        !hasActivePipeline || pipelineCompatibilityMismatch;
+    if (pipelineMismatch) {
+        // A previous transition frame's pipelines may still be in flight on
+        // the other frame slot; they are destroyed by invalidatePipeline()
+        // below, so the device must be idle first in that case too.
+        if ((pipelineCompatibilityMismatch || s.hasTransitionPipelines()) &&
+            vkDeviceWaitIdle(s.device) != VK_SUCCESS) {
+            return RenderFrameResult::kVulkanFailure;
+        }
+        s.invalidatePipeline();
+        s.graphicsPipeline = std::make_unique<VulkanGraphicsPipeline>();
+        if (!s.graphicsPipeline->create(
+                s.device,
+                pipelineLayout,
+                renderPass,
+                coreShaders.vertex.get(),
+                coreShaders.fragment.get())) {
+            s.invalidatePipeline();
+            return RenderFrameResult::kVulkanFailure;
+        }
+        s.activePipelineLayout = pipelineLayout;
+        s.activeRenderPassHandle = renderPassHandle;
+    }
+
+    if (!s.frameSync->waitForFrameFence(s.currentFrameIndex)) {
+        return RenderFrameResult::kVulkanFailure;
+    }
+    ahbImports.drainRetiredForFrame(s.currentFrameIndex);
+
+    uint32_t imageIndex = 0;
+    const SwapchainResult acquireResult = swapchain.acquireNextImage(
+        vkHandleToU64(frame->imageAvailableSemaphore),
+        0,
+        &imageIndex,
+        UINT64_MAX);
+    switch (acquireResult) {
+        case SwapchainResult::kSuccess:
+        case SwapchainResult::kSuboptimal:
+            break;
+        case SwapchainResult::kOutOfDate:
+            return RenderFrameResult::kOutOfDate;
+        case SwapchainResult::kSurfaceLost:
+            return RenderFrameResult::kSurfaceLost;
+        case SwapchainResult::kDeviceLost:
+            return RenderFrameResult::kDeviceLost;
+        case SwapchainResult::kError:
+            return RenderFrameResult::kVulkanFailure;
+    }
+
+    const uint64_t framebufferHandle =
+        swapchain.getFramebufferHandle(imageIndex);
+    if (framebufferHandle == 0) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    const VkFramebuffer framebuffer =
+        u64ToVkHandle<VkFramebuffer>(framebufferHandle);
+
+    const uint64_t presentReadySemaphoreHandle =
+        swapchain.getPresentReadySemaphoreHandle(imageIndex);
+    if (presentReadySemaphoreHandle == 0) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+    const VkSemaphore presentReadySemaphore =
+        u64ToVkHandle<VkSemaphore>(presentReadySemaphoreHandle);
+
+    if (!s.frameSync->resetCommandBuffer(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    const VkImageLayout currentLayout =
+        static_cast<VkImageLayout>(ahbImports.getImageLayout(handle));
+
+    VulkanGraphicsPassParams passParams{};
+    passParams.commandBuffer = frame->commandBuffer;
+    passParams.renderPass = renderPass;
+    passParams.framebuffer = framebuffer;
+    passParams.extentWidth = extentWidth;
+    passParams.extentHeight = extentHeight;
+    passParams.pipelineLayout = pipelineLayout;
+    passParams.descriptorSet = descriptorSet;
+    passParams.pipeline = s.graphicsPipeline->get();
+    passParams.sourceImage = srcImage;
+    passParams.pushConstants = makeVideoTransformFullPushConstants(transform);
+    passParams.destinationX = transform.destinationRect.x;
+    passParams.destinationY = transform.destinationRect.y;
+    passParams.destinationWidth = static_cast<uint32_t>(transform.destinationRect.width);
+    passParams.destinationHeight = static_cast<uint32_t>(transform.destinationRect.height);
+    if (currentLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+        passParams.transitionSourceImage = true;
+        passParams.sourceOldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        passParams.sourceNewLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    } else {
+        passParams.transitionSourceImage = false;
+        passParams.sourceOldLayout = currentLayout;
+        passParams.sourceNewLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    if (vkBeginCommandBuffer(frame->commandBuffer, &beginInfo) != VK_SUCCESS) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    if (!recordBaseFramePassKeepOpen(passParams)) {
+        // vkBeginCommandBuffer already succeeded above, but
+        // recordBaseFramePassKeepOpen validates its params BEFORE opening the
+        // render pass, so a false return here (e.g. an invalid destination
+        // rect) leaves the command buffer recording with no render pass ever
+        // opened. Close it best-effort before failClosed -- never
+        // vkCmdEndRenderPass on this path since none was opened.
+        abandonRecordingCommandBuffer(frame->commandBuffer);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    std::string overlayFailureReason;
+    const bool overlayOk = s.overlayRenderer->recordOverlayDraws(
+        static_cast<void*>(s.device),
+        static_cast<void*>(frame->commandBuffer),
+        reinterpret_cast<void*>(coreShaders.vertex.get()),
+        reinterpret_cast<void*>(coreShaders.fragment.get()),
+        renderPassHandle,
+        extentWidth,
+        extentHeight,
+        overlayDraws,
+        overlayCount,
+        &overlayFailureReason);
+    if (!overlayOk) {
+        VGLOG_VFR("overlay recordOverlayDraws failed: %s", overlayFailureReason.c_str());
+        // recordBaseFramePassKeepOpen already began the command buffer and
+        // opened the render pass above; overlayFrameDrawsValid() already
+        // ruled out invalid caller data before either happened, so this is a
+        // genuine resource failure (e.g. descriptor pool allocation). Close
+        // the open render pass / command buffer best-effort before
+        // failClosed -- never submit or present on this path.
+        abandonOpenRenderPass(frame->commandBuffer);
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    vkCmdEndRenderPass(frame->commandBuffer);
+    if (vkEndCommandBuffer(frame->commandBuffer) != VK_SUCCESS) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    if (!s.frameSync->resetFrameFence(s.currentFrameIndex)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    VkSemaphore waitSemaphores[2] = {
+        frame->imageAvailableSemaphore,
+        VK_NULL_HANDLE,
+    };
+    VkPipelineStageFlags waitStages[2] = {
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+    };
+    uint32_t waitSemaphoreCount = 1;
+    const uint64_t pendingAcquireSemaphoreHandle =
+        ahbImports.getPendingAcquireSemaphoreHandle(handle);
+    if (pendingAcquireSemaphoreHandle != 0) {
+        waitSemaphores[waitSemaphoreCount++] =
+            u64ToVkHandle<VkSemaphore>(pendingAcquireSemaphoreHandle);
+    }
+
+    const bool canExportRelease =
+        (frame->releaseFenceSemaphore != VK_NULL_HANDLE) && (s.pfnGetSemaphoreFd != nullptr);
+
+    VkSemaphore signalSemaphores[2] = {
+        presentReadySemaphore,
+        VK_NULL_HANDLE,
+    };
+    uint32_t signalSemaphoreCount = 1;
+    if (canExportRelease) {
+        signalSemaphores[signalSemaphoreCount++] = frame->releaseFenceSemaphore;
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = waitSemaphoreCount;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &frame->commandBuffer;
+    submitInfo.signalSemaphoreCount = signalSemaphoreCount;
+    submitInfo.pSignalSemaphores = signalSemaphores;
+
+    const VkQueue queue = static_cast<VkQueue>(queueHandle);
+    const VkResult submitResult =
+        vkQueueSubmit(queue, 1, &submitInfo, frame->inFlightFence);
+    if (submitResult != VK_SUCCESS) {
+        const RenderFrameResult result =
+            (submitResult == VK_ERROR_DEVICE_LOST)
+                ? RenderFrameResult::kDeviceLost
+                : RenderFrameResult::kVulkanFailure;
+        return s.failClosed(swapchain, ahbImports, result);
+    }
+
+    if (!ahbImports.markBufferSubmitted(handle, s.currentFrameIndex)) {
+        VGLOG_VFR("overlay markBufferSubmitted failed for handle=%" PRIu64 "; failing closed",
+                  static_cast<uint64_t>(handle));
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
+    {
+        if (canExportRelease) {
+            int exportedFd = -1;
+            VkSemaphoreGetFdInfoKHR semGetFdInfo{};
+            semGetFdInfo.sType      = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+            semGetFdInfo.pNext      = nullptr;
+            semGetFdInfo.semaphore  = frame->releaseFenceSemaphore;
+            semGetFdInfo.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+            const VkResult exportResult =
+                s.pfnGetSemaphoreFd(s.device, &semGetFdInfo, &exportedFd);
+            if (exportResult != VK_SUCCESS) {
+                VGLOG_VFR("overlay vkGetSemaphoreFdKHR failed: %d; clearing stored release fd",
+                          static_cast<int>(exportResult));
+                if (exportedFd >= 0) {
+                    ::close(exportedFd);
+                }
+                ahbImports.setLatestReleaseFenceFd(handle, -1);
+                return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+            }
+            ahbImports.setLatestReleaseFenceFd(handle, exportedFd);
+        } else {
+            ahbImports.setLatestReleaseFenceFd(handle, -1);
+        }
+    }
+
+    if (pendingAcquireSemaphoreHandle != 0 &&
+        !ahbImports.markAcquireSemaphoreSubmitted(handle)) {
+        return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
+    }
+
     if (!ahbImports.setImageLayout(handle, static_cast<uint32_t>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL))) {
         return s.failClosed(swapchain, ahbImports, RenderFrameResult::kVulkanFailure);
     }
@@ -1465,6 +2061,35 @@ RenderFrameResult VulkanFrameRenderer::renderFrame(
     }
     if (!ahbImports.hasBuffer(handle) || ahbImports.getImage(handle) == nullptr) {
         return RenderFrameResult::kInvalidBufferHandle;
+    }
+    return RenderFrameResult::kUnavailable;
+}
+
+// P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A native renderer
+// integration sub-slice N2: host-build stub for renderFrame with optional
+// overlay draws. Matches the existing host renderFrame overloads' pattern:
+// no Vulkan is available on host, so this always reports unavailable once
+// past the same argument validation as the Android overload above.
+RenderFrameResult VulkanFrameRenderer::renderFrame(
+    void* /*queueHandle*/,
+    VulkanSurfaceSwapchain& swapchain,
+    VulkanHardwareBufferImports& ahbImports,
+    VulkanCoreShaderModules& /*coreShaders*/,
+    HardwareBufferHandle handle,
+    const VideoFrameTransform& /*transform*/,
+    const VulkanOverlayFrameDraw* overlayDraws,
+    uint32_t overlayCount) {
+    if (!impl_ || !impl_->initialized) {
+        return RenderFrameResult::kBackendNotInitialized;
+    }
+    if (!swapchain.hasSurface()) {
+        return RenderFrameResult::kNoSurface;
+    }
+    if (!ahbImports.hasBuffer(handle) || ahbImports.getImage(handle) == nullptr) {
+        return RenderFrameResult::kInvalidBufferHandle;
+    }
+    if (overlayCount > 0 && overlayDraws == nullptr) {
+        return RenderFrameResult::kVulkanFailure;
     }
     return RenderFrameResult::kUnavailable;
 }

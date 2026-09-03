@@ -24,6 +24,13 @@ class VulkanSurfaceSwapchain;
 class VulkanHardwareBufferImports;
 struct VulkanCoreShaderModules;
 
+// P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A: forward-declared
+// only. VulkanOverlayFrameDraw is a plain, platform-neutral data struct (see
+// vulkan_overlay_frame_renderer.h); this header never needs its definition,
+// only a pointer to it, so the Vulkan overlay helper header is included
+// solely from the .cpp translation unit.
+struct VulkanOverlayFrameDraw;
+
 class VulkanFrameRenderer {
 public:
     static constexpr uint32_t kDefaultFramesInFlight = 2;
@@ -72,6 +79,29 @@ public:
         VulkanCoreShaderModules& coreShaders,
         HardwareBufferHandle handle,
         const VideoFrameTransform& transform);
+
+    // P5-OVERLAYS-TRANS / P5-OVERLAYS-PRODUCTION-EXPORT-ROUTE-A native
+    // renderer integration sub-slice N2: renderFrame with an optional set of
+    // already-resolved overlay draws recorded via
+    // VulkanOverlayFrameRenderer::recordOverlayDraws immediately after the
+    // base decoded frame, inside the SAME render pass (VulkanGraphicsCommand
+    // Recorder::recordCompletePass cannot be reused here since it ends the
+    // render pass itself before returning). When overlayCount == 0 this
+    // delegates directly to the transform-only overload above with zero
+    // additional Vulkan calls -- byte-identical to existing non-overlay
+    // behavior. overlayDraws may be null only when overlayCount is 0; a
+    // non-null overlayCount with a null overlayDraws fails closed with
+    // kVulkanFailure before the swapchain is touched. On any overlay record
+    // failure the whole frame fails closed -- no partial present.
+    RenderFrameResult renderFrame(
+        void* queueHandle,
+        VulkanSurfaceSwapchain& swapchain,
+        VulkanHardwareBufferImports& ahbImports,
+        VulkanCoreShaderModules& coreShaders,
+        HardwareBufferHandle handle,
+        const VideoFrameTransform& transform,
+        const VulkanOverlayFrameDraw* overlayDraws,
+        uint32_t overlayCount);
 
     // P5-BEAUTY-V2-PRODUCTION-EXPORT-ROUTE-A: renderFrame with an optional
     // Vulkan-only Beauty V2 pre-composite recorded via VulkanBeautyFrameRenderer
